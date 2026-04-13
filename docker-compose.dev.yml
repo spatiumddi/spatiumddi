@@ -1,0 +1,46 @@
+# Development overrides — hot-reload backend, Vite dev server for frontend
+# Usage: docker compose -f docker-compose.yml -f docker-compose.dev.yml up
+
+name: spatiumddi
+
+services:
+
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.dev
+    networks:
+      - spatiumddi
+    volumes:
+      - ./backend:/app
+    ports:
+      - "8000:8000"
+    environment:
+      DEBUG: "true"
+      LOG_FORMAT: "console"
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.dev
+    networks:
+      - spatiumddi
+    volumes:
+      - ./backend:/app
+
+  frontend:
+    image: node:20-alpine
+    working_dir: /app
+    networks:
+      - spatiumddi
+    command: npm run dev -- --host
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    ports:
+      - "5173:5173"
+    environment:
+      VITE_API_BASE_URL: http://localhost:8000/api/v1
+
+networks:
+  spatiumddi:

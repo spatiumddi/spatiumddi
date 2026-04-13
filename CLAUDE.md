@@ -1,11 +1,12 @@
-# CLAUDE.md — SpatiumDDI Master Index
+# CLAUDE.md
+
+This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 > **GitHub Org:** https://github.com/spatiumddi  
 > **Docs:** https://spatiumddi.github.io (custom domain: https://spatiumddi.org — pending)  
 > **License:** Apache 2.0  
 > **Package:** `spatiumddi` on PyPI  
 > **Container registry:** `ghcr.io/spatiumddi/*`  
-
 
 > **Read this file first.** This is the entry point for all Claude Code sessions on the SpatiumDDI project. It defines the project scope, the document map, and the non-negotiable conventions every generated file must follow.
 
@@ -89,6 +90,32 @@ These rules apply to every file Claude Code generates. No exceptions.
 | 3 | DNS views, server groups, blocking lists, VLAN/VXLAN, system admin panel, health dashboard |
 | 4 | OS appliance image, Terraform/Ansible providers, SAML, notifications, backup/restore |
 | 5 | Multi-tenancy, IP request workflows, import/export, advanced reporting |
+
+---
+
+## Development Commands
+
+> The project is in pre-alpha. Commands below reflect the intended setup; a `Makefile` and full Docker Compose stack are being built out.
+
+```bash
+# Initial setup
+cp .env.example .env
+docker compose up -d
+
+# Linting (Python: ruff + black + mypy; TypeScript: eslint + prettier)
+make lint
+
+# Run all tests
+make test
+```
+
+For Python backend work:
+- Formatter/linter: `ruff`, `black`, `mypy` (all enforced in CI)
+- Migrations: Alembic (`alembic upgrade head`, `alembic revision --autogenerate -m "..."`)
+
+For frontend work:
+- Linter/formatter: `eslint`, `prettier` (all enforced in CI)
+- Dev server: `vite` (inside the frontend container or locally with Node 20+)
 
 ---
 *See individual docs for full specifications.*
