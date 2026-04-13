@@ -2,7 +2,7 @@ import { useState } from "react";
 import { NavLink } from "react-router-dom";
 import {
   Network, Globe, LayoutDashboard, Server, Clock,
-  Github, Users, ChevronsLeft, ChevronsRight,
+  Github, Users, ClipboardList, ChevronsLeft, ChevronsRight,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import logoIcon from "@/assets/logo-icon.svg";
@@ -17,6 +17,7 @@ const mainNav = [
 
 const adminNav = [
   { label: "Users", icon: Users, to: "/admin/users" },
+  { label: "Audit Log", icon: ClipboardList, to: "/admin/audit" },
 ];
 
 function NavItem({

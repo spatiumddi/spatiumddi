@@ -11,6 +11,8 @@ import {
   RefreshCw,
   X,
   Search,
+  Copy,
+  Check,
 } from "lucide-react";
 import { ipamApi, type IPSpace, type Subnet, type IPAddress } from "@/lib/api";
 import { cn } from "@/lib/utils";
@@ -61,6 +63,44 @@ function UtilizationBar({ percent }: { percent: number }) {
         {percent.toFixed(0)}%
       </span>
     </div>
+  );
+}
+
+function UtilizationDot({ percent }: { percent: number }) {
+  const color =
+    percent >= 95
+      ? "bg-red-500"
+      : percent >= 80
+        ? "bg-amber-400"
+        : "bg-green-500";
+  return (
+    <span
+      title={`${percent.toFixed(0)}% utilized`}
+      className={cn("inline-block h-2 w-2 flex-shrink-0 rounded-full", color)}
+    />
+  );
+}
+
+function CopyButton({ text }: { text: string }) {
+  const [copied, setCopied] = useState(false);
+  function handleCopy(e: React.MouseEvent) {
+    e.stopPropagation();
+    navigator.clipboard.writeText(text).then(() => {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    });
+  }
+  return (
+    <button
+      onClick={handleCopy}
+      title="Copy to clipboard"
+      className="ml-1 rounded p-0.5 text-muted-foreground/0 hover:text-muted-foreground group-hover/addr:text-muted-foreground/60 hover:!text-foreground transition-colors"
+    >
+      {copied
+        ? <Check className="h-3 w-3 text-green-500" />
+        : <Copy className="h-3 w-3" />
+      }
+    </button>
   );
 }
 
@@ -562,11 +602,16 @@ function SubnetDetail({
                 <tr
                   key={addr.id}
                   className={cn(
-                    "border-b last:border-0 hover:bg-muted/20",
+                    "group/addr border-b last:border-0 hover:bg-muted/20",
                     isReadOnly(addr.status) && "opacity-60"
                   )}
                 >
-                  <td className="px-4 py-2 font-mono font-medium">{addr.address}</td>
+                  <td className="px-4 py-2 font-mono font-medium">
+                    <span className="inline-flex items-center gap-0.5">
+                      {addr.address}
+                      <CopyButton text={addr.address} />
+                    </span>
+                  </td>
                   <td className="px-4 py-2 text-muted-foreground">
                     {addr.hostname ?? <span className="text-muted-foreground/40">—</span>}
                   </td>
@@ -868,6 +913,7 @@ function SubnetRow({
             <span className="truncate text-xs text-muted-foreground/60">{subnet.name}</span>
           )}
         </div>
+        <UtilizationDot percent={subnet.utilization_percent} />
         <button
           onClick={(e) => { e.stopPropagation(); setShowEdit(true); }}
           className="hidden rounded p-0.5 text-muted-foreground hover:text-foreground group-hover:flex"

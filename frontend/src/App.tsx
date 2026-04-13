@@ -6,6 +6,7 @@ import { ChangePasswordPage } from "@/pages/ChangePasswordPage";
 import { DashboardPage } from "@/pages/DashboardPage";
 import { IPAMPage } from "@/pages/ipam/IPAMPage";
 import { UsersPage } from "@/pages/admin/UsersPage";
+import { AuditPage } from "@/pages/admin/AuditPage";
 import { useAuth } from "@/hooks/useAuth";
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
@@ -30,6 +31,7 @@ export default function App() {
         <Route path="dashboard" element={<DashboardPage />} />
         <Route path="ipam" element={<IPAMPage />} />
         <Route path="admin/users" element={<UsersPage />} />
+        <Route path="admin/audit" element={<AuditPage />} />
       </Route>
     </Routes>
   );

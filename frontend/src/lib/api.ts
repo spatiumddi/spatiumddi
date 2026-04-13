@@ -159,6 +159,34 @@ export const usersApi = {
   delete: (id: string) => api.delete(`/users/${id}`),
 };
 
+export interface AuditLogEntry {
+  id: string;
+  timestamp: string;
+  user_display_name: string;
+  auth_source: string;
+  action: string;
+  resource_type: string;
+  resource_id: string;
+  resource_display: string;
+  result: string;
+  source_ip: string | null;
+}
+
+export interface AuditLogPage {
+  total: number;
+  items: AuditLogEntry[];
+}
+
+export const auditApi = {
+  list: (params?: {
+    limit?: number;
+    offset?: number;
+    action?: string;
+    resource_type?: string;
+    user_display_name?: string;
+  }) => api.get<AuditLogPage>("/audit", { params }).then((r) => r.data),
+};
+
 export const authApi = {
   login: (username: string, password: string) =>
     api.post<LoginResponse>("/auth/login", { username, password }).then((r) => r.data),

@@ -464,20 +464,18 @@ Example row:
 
 ## 14. UI Backlog (Tracked Items)
 
-The following features have been identified as planned UI improvements. They have not yet been implemented.
+Items marked ✅ are implemented. Remaining items are planned but not yet built.
 
-### 14.1 Network and Broadcast Address Display
+### ✅ 14.1 Network and Broadcast Address Display
 
-In the subnet IP address table, the **network address** (e.g., `10.0.1.0`) and **broadcast address** (e.g., `10.0.1.255`) must be displayed as distinct rows with a non-allocatable status badge (e.g., `network` and `broadcast`). These addresses must be pre-populated in the address table when a subnet is created and must not be selectable for allocation via the "next available" or manual allocation flows. The `/31` and `/32` special cases (RFC 3021) are exempt — they have no traditional network/broadcast addresses.
+**Implemented.** When a subnet is created, `network` and `broadcast` address records are automatically inserted. They appear in the IP address table with distinct grey `network` / `broadcast` status badges, are rendered at reduced opacity, have no edit or delete buttons, and are excluded from allocation (next-available and manual). `/31` and `/32` subnets are exempt per RFC 3021.
 
-### 14.2 Inline Editing of IP Spaces, Subnets, and IP Addresses
+### ✅ 14.2 Inline Editing of IP Spaces, Subnets, and IP Addresses
 
-All three resource types require edit capability in the UI:
-- **IP Space**: edit name and description via an edit modal or inline form (calls `PUT /ipam/spaces/{id}`)
-- **Subnet**: edit name, description, gateway, VLAN ID, VXLAN ID, status, DNS servers, domain name, NTP servers (calls `PUT /ipam/subnets/{id}`)
-- **IP Address**: edit hostname, description, status, MAC address, tags (calls `PUT /ipam/addresses/{id}`)
-
-Edit buttons should appear in the detail panel header (subnet) and on each row (IP address). The IP space edit button goes on the space header in the tree.
+**Implemented.**
+- **IP Space**: pencil icon on space header → edit modal (name, description). Delete is accessible from within the edit modal via a two-step confirmation (warning → checkbox confirm).
+- **Subnet**: pencil icon on subnet row (hover) and in detail panel header → edit modal (name, description, gateway, VLAN ID, status).
+- **IP Address**: pencil icon on each address row → edit modal (hostname, description, MAC, status). `network` and `broadcast` rows are not editable.
 
 ### 14.3 Table View as Default; Tree View as Optional
 
@@ -511,12 +509,9 @@ IP Spaces > Corporate > 10.0.0.0/8 > 10.1.0.0/16 > Subnets
 
 Each segment is a clickable link that navigates back to that level. The breadcrumb state is reflected in the URL (e.g., `/ipam/spaces/{id}/subnets`) to support deep-linking and browser back/forward.
 
-### 14.6 Collapsible Left Sidebar
+### ✅ 14.6 Collapsible Left Sidebar
 
-The application sidebar (IPAM, DHCP, DNS, NTP, Settings) should support collapse to icon-only mode:
-- A toggle button (e.g., `«` / `»` chevron) at the bottom of the sidebar collapses it to ~48px width showing only icons
-- Tooltips appear on hover in collapsed mode
-- The collapsed state is persisted to `localStorage`
+**Implemented.** A `«` / `»` chevron button at the sidebar footer collapses the sidebar to 56px icon-only mode. Nav items show tooltips on hover when collapsed. State is persisted to `localStorage` and restored on page load.
 
 ### 14.7 Settings Page Link
 

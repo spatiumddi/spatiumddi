@@ -91,13 +91,37 @@ These rules apply to every file Claude Code generates. No exceptions.
 
 ## Project Phase Roadmap
 
-| Phase | Focus |
-|---|---|
-| 1 | Core IPAM, local auth, LDAP/OIDC, permissions, audit, Docker Compose |
-| 2 | DHCP (Kea + ISC), DNS (PowerDNS + BIND9), DDNS, NTP, zone/subnet tree UI |
-| 3 | DNS views, server groups, blocking lists, VLAN/VXLAN, system admin panel, health dashboard |
-| 4 | OS appliance image, Terraform/Ansible providers, SAML, notifications, backup/restore |
-| 5 | Multi-tenancy, IP request workflows, import/export, advanced reporting |
+| Phase | Focus | Status |
+|---|---|---|
+| 1 | Core IPAM, local auth, user management, audit log, Docker Compose | **In Progress** |
+| 2 | DHCP (Kea + ISC), DNS (PowerDNS + BIND9), DDNS, NTP, zone/subnet tree UI | Not started |
+| 3 | DNS views, server groups, blocking lists, VLAN/VXLAN, system admin panel, health dashboard | Not started |
+| 4 | OS appliance image, Terraform/Ansible providers, SAML, notifications, backup/restore | Not started |
+| 5 | Multi-tenancy, IP request workflows, import/export, advanced reporting | Not started |
+
+### Phase 1 — Implemented So Far
+
+- ✅ Full IPAM CRUD: IP spaces, blocks, subnets (with network/broadcast auto-creation), IP addresses
+- ✅ IP address allocation: next-available (sequential/random) and manual
+- ✅ Local auth: login, logout, JWT tokens, forced password change
+- ✅ User management API (`/api/v1/users/`): create, edit, reset password, delete (superadmin only)
+- ✅ Audit log table (written on every mutation)
+- ✅ IPAM tree view UI (Space → Subnet → IP address, collapsible sidebar)
+- ✅ Full CRUD UI for spaces, subnets, IP addresses with edit/delete modals
+- ✅ Dashboard with utilization stats and top-subnets table
+- ✅ Users admin page
+- ✅ Audit log viewer UI (`/admin/audit`) — paginated table, action/result badges, filters
+- ✅ Utilization dots on subnet tree rows (green/amber/red)
+- ✅ Copy-to-clipboard on IP address column
+
+### Phase 1 — Remaining
+
+- ⬜ LDAP / OIDC authentication
+- ⬜ Group-based RBAC enforcement on API routes
+- ⬜ Settings page (`/settings`) — `PlatformSettings` singleton
+- ⬜ Table view + breadcrumbs for IPAM (see `docs/features/IPAM.md §14.3–14.5`)
+- ⬜ Block vs Subnet distinction in create flow (see `docs/features/IPAM.md §14.4`)
+- ⬜ Soft-delete (orphaned) IP addresses (see `docs/features/IPAM.md §14.8`)
 
 ---
 
