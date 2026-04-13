@@ -1,0 +1,21 @@
+SpatiumDDI
+Copyright 2024 SpatiumDDI Contributors
+
+This product bundles or integrates with the following open source components:
+
+- Linux Kernel — GPL v2 — https://kernel.org
+- Python — PSF License — https://python.org
+- FastAPI — MIT — https://fastapi.tiangolo.com
+- SQLAlchemy — MIT — https://sqlalchemy.org
+- PostgreSQL — PostgreSQL License — https://postgresql.org
+- Redis — BSD 3-Clause — https://redis.io
+- Celery — BSD — https://celeryproject.org
+- React — MIT — https://react.dev
+- ISC Kea DHCP — MPL 2.0 — https://kea.isc.org
+- ISC BIND9 — MPL 2.0 — https://isc.org/bind
+- PowerDNS Authoritative Server — GPL v2 — https://powerdns.com
+- Chrony — GPL v2 — https://chrony-project.org
+- Alpine Linux — MIT + GPL v2 (kernel) — https://alpinelinux.org
+- Debian — DFSG — https://debian.org
+
+Full license texts are available in the LICENSES/ directory.
