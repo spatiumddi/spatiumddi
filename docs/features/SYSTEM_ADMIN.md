@@ -380,4 +380,80 @@ PlatformSettings (singleton table)
   utilization_warn_threshold: int (default 80)
   utilization_critical_threshold: int (default 95)
   subnet_tree_default_expanded_depth: int (default 2)
+  auto_logout_minutes: int (default 60)   -- idle session timeout; 0 = disabled
+  github_release_check_enabled: bool (default true)
+  github_release_check_interval_hours: int (default 24)
 ```
+
+---
+
+## 7. Version and Release Management
+
+### Current Version Display
+
+The current application version is displayed in the UI header bar and on the System Admin → About page. The version string follows **CalVer** format: `YYYY.MM.DD-N` where N is the release number for that date (starting at 1).
+
+Examples: `2026.04.13-1`, `2026.04.13-2` (hotfix same day)
+
+The version is injected at build time and exposed via:
+- UI header (e.g., `v2026.04.13-1`)
+- `GET /api/v1/version` — returns `{ "version": "...", "commit": "..." }`
+
+### GitHub Release Check
+
+When `github_release_check_enabled` is true, SpatiumDDI periodically polls the GitHub Releases API for the latest release tag. If a newer version is available:
+- A banner appears in the admin UI: "SpatiumDDI 2026.05.01-1 is available — view changelog"
+- A notification is sent to configured notification channels if `notify_on_new_release` is enabled
+- Superadmins can dismiss the banner or snooze for N days
+
+The check is performed by the Celery beat scheduler (task: `system.check_github_release`). No personal data is sent — only a GET request to the public GitHub API.
+
+```python
+# API model
+GET /api/v1/version
+→ {
+    "version": "2026.04.13-1",
+    "commit": "abc1234",
+    "update_available": true,          # null if check is disabled or failed
+    "latest_version": "2026.05.01-1",  # null if up to date or check failed
+    "latest_release_url": "https://github.com/spatiumddi/spatiumddi/releases/tag/2026.05.01-1"
+  }
+```
+
+---
+
+## 8. Metrics Export
+
+### Prometheus (built-in)
+
+Available at `/metrics` when `prometheus_metrics_enabled=true`. Scraped by any Prometheus-compatible tool including Grafana Cloud.
+
+### InfluxDB Export
+
+SpatiumDDI can push metrics to InfluxDB (v1.x and v2.x) for Grafana dashboards:
+
+```
+InfluxDBTarget
+  id, name
+  version: enum(v1, v2)
+  url: str                   -- e.g., http://influxdb:8086
+  -- v1 fields:
+  database: str
+  username, password_ref
+  -- v2 fields:
+  org: str
+  bucket: str
+  token_ref: str             -- reference to encrypted secret
+  measurement_prefix: str (default "spatiumddi_")
+  push_interval_seconds: int (default 60)
+  is_enabled: bool
+```
+
+**Metrics pushed to InfluxDB:**
+- IP space/subnet utilization (current allocation %)
+- DHCP lease counts per scope
+- DNS query rates per server
+- API request rates and latencies
+- System health status per component
+
+Multiple InfluxDB targets can be configured simultaneously (e.g., local InfluxDB + remote InfluxCloud).

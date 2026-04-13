@@ -1,0 +1,145 @@
+# Redis HA via Sentinel (3 replicas + 3 sentinel processes)
+# Uses the Bitnami Redis Helm chart pattern without Helm, for plain manifests.
+# For production, strongly prefer the Bitnami Helm chart or Redis Operator:
+#   helm repo add bitnami https://charts.bitnami.com/bitnami
+#   helm install redis bitnami/redis -n spatiumddi \
+#     --set auth.password=CHANGEME \
+#     --set sentinel.enabled=true \
+#     --set replica.replicaCount=2
+#
+# The manifests below provide a minimal working sentinel setup.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: redis-config
+  namespace: spatiumddi
+data:
+  redis.conf: |
+    maxmemory 256mb
+    maxmemory-policy allkeys-lru
+    appendonly yes
+    requirepass CHANGEME
+    masterauth CHANGEME
+
+  sentinel.conf: |
+    sentinel resolve-hostnames yes
+    sentinel announce-hostnames yes
+    sentinel monitor mymaster redis-0.redis-headless.spatiumddi.svc.cluster.local 6379 2
+    sentinel auth-pass mymaster CHANGEME
+    sentinel down-after-milliseconds mymaster 5000
+    sentinel failover-timeout mymaster 60000
+    sentinel parallel-syncs mymaster 1
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: redis
+  namespace: spatiumddi
+spec:
+  serviceName: redis-headless
+  replicas: 3
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      initContainers:
+        # Set replica-of on non-primary pods
+        - name: init-redis
+          image: redis:7-alpine
+          command:
+            - sh
+            - -c
+            - |
+              if [ "${HOSTNAME}" = "redis-0" ]; then
+                cp /config/redis.conf /data/redis.conf
+              else
+                cp /config/redis.conf /data/redis.conf
+                echo "replicaof redis-0.redis-headless.spatiumddi.svc.cluster.local 6379" >> /data/redis.conf
+              fi
+              cp /config/sentinel.conf /data/sentinel.conf
+          volumeMounts:
+            - name: config
+              mountPath: /config
+            - name: data
+              mountPath: /data
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          command: ["redis-server", "/data/redis.conf"]
+          ports:
+            - containerPort: 6379
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          livenessProbe:
+            exec:
+              command: ["redis-cli", "-a", "CHANGEME", "ping"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+
+        - name: sentinel
+          image: redis:7-alpine
+          command: ["redis-sentinel", "/data/sentinel.conf"]
+          ports:
+            - containerPort: 26379
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+      volumes:
+        - name: config
+          configMap:
+            name: redis-config
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: 2Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-headless
+  namespace: spatiumddi
+spec:
+  clusterIP: None
+  selector:
+    app: redis
+  ports:
+    - name: redis
+      port: 6379
+    - name: sentinel
+      port: 26379
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis
+  namespace: spatiumddi
+spec:
+  selector:
+    app: redis
+  ports:
+    - name: redis
+      port: 6379

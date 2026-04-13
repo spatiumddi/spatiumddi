@@ -1,0 +1,36 @@
+# Run migrations before deploying a new version:
+#   kubectl apply -f k8s/base/migrate-job.yaml
+#   kubectl wait --for=condition=complete job/spatiumddi-migrate -n spatiumddi --timeout=120s
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: spatiumddi-migrate
+  namespace: spatiumddi
+  labels:
+    app.kubernetes.io/name: spatiumddi
+    app.kubernetes.io/component: migrate
+spec:
+  backoffLimit: 3
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: migrate
+          image: ghcr.io/spatiumddi/spatiumddi-api:latest
+          imagePullPolicy: Always
+          command: ["alembic", "upgrade", "head"]
+          env:
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: spatiumddi-secrets
+                  key: postgres-password
+            - name: DATABASE_URL
+              value: "postgresql+asyncpg://spatiumddi:$(POSTGRES_PASSWORD)@postgres-primary:5432/spatiumddi"
+          resources:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi

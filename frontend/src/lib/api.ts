@@ -45,6 +45,16 @@ export interface IPSpace {
   tags: Record<string, unknown>;
 }
 
+export interface IPBlock {
+  id: string;
+  space_id: string;
+  parent_block_id: string | null;
+  network: string;
+  name: string;
+  description: string;
+  tags: Record<string, unknown>;
+}
+
 export interface Subnet {
   id: string;
   space_id: string;
@@ -63,21 +73,53 @@ export interface Subnet {
   custom_fields: Record<string, unknown>;
 }
 
+export interface IPAddress {
+  id: string;
+  subnet_id: string;
+  address: string;
+  status: string;
+  hostname: string | null;
+  description: string | null;
+  mac_address: string | null;
+  tags: Record<string, unknown>;
+  custom_fields: Record<string, unknown>;
+}
+
 export const ipamApi = {
   listSpaces: () => api.get<IPSpace[]>("/ipam/spaces").then((r) => r.data),
   getSpace: (id: string) => api.get<IPSpace>(`/ipam/spaces/${id}`).then((r) => r.data),
   createSpace: (data: Partial<IPSpace>) =>
     api.post<IPSpace>("/ipam/spaces", data).then((r) => r.data),
+  updateSpace: (id: string, data: Partial<IPSpace>) =>
+    api.put<IPSpace>(`/ipam/spaces/${id}`, data).then((r) => r.data),
   deleteSpace: (id: string) => api.delete(`/ipam/spaces/${id}`),
 
-  listSubnets: (spaceId?: string) =>
+  listBlocks: (spaceId?: string) =>
     api
-      .get<Subnet[]>("/ipam/subnets", { params: spaceId ? { space_id: spaceId } : undefined })
+      .get<IPBlock[]>("/ipam/blocks", { params: spaceId ? { space_id: spaceId } : undefined })
       .then((r) => r.data),
+  createBlock: (data: Partial<IPBlock>) =>
+    api.post<IPBlock>("/ipam/blocks", data).then((r) => r.data),
+  deleteBlock: (id: string) => api.delete(`/ipam/blocks/${id}`),
+
+  listSubnets: (params?: { space_id?: string; block_id?: string }) =>
+    api.get<Subnet[]>("/ipam/subnets", { params }).then((r) => r.data),
   getSubnet: (id: string) => api.get<Subnet>(`/ipam/subnets/${id}`).then((r) => r.data),
   createSubnet: (data: Partial<Subnet>) =>
     api.post<Subnet>("/ipam/subnets", data).then((r) => r.data),
+  updateSubnet: (id: string, data: Partial<Subnet>) =>
+    api.put<Subnet>(`/ipam/subnets/${id}`, data).then((r) => r.data),
   deleteSubnet: (id: string) => api.delete(`/ipam/subnets/${id}`),
+
+  listAddresses: (subnetId: string) =>
+    api.get<IPAddress[]>(`/ipam/subnets/${subnetId}/addresses`).then((r) => r.data),
+  createAddress: (data: Partial<IPAddress>) =>
+    api.post<IPAddress>(`/ipam/subnets/${data.subnet_id}/addresses`, data).then((r) => r.data),
+  updateAddress: (id: string, data: Partial<IPAddress>) =>
+    api.put<IPAddress>(`/ipam/addresses/${id}`, data).then((r) => r.data),
+  deleteAddress: (id: string) => api.delete(`/ipam/addresses/${id}`),
+  nextAddress: (subnetId: string, data?: { hostname?: string; description?: string }) =>
+    api.post<IPAddress>(`/ipam/subnets/${subnetId}/next`, data ?? {}).then((r) => r.data),
 };
 
 export interface LoginResponse {

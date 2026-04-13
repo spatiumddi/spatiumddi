@@ -8,6 +8,18 @@ import { queryClient } from "@/lib/queryClient";
 import App from "./App";
 import "./index.css";
 
+// Apply saved theme before first render to prevent flash
+(function () {
+  const saved = localStorage.getItem("theme") ?? "system";
+  const resolved =
+    saved === "system"
+      ? window.matchMedia("(prefers-color-scheme: dark)").matches
+        ? "dark"
+        : "light"
+      : saved;
+  document.documentElement.classList.toggle("dark", resolved === "dark");
+})();
+
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
     <BrowserRouter>

@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spatiumddi-config
+  namespace: spatiumddi
+data:
+  DATABASE_URL: "postgresql+asyncpg://spatiumddi:$(POSTGRES_PASSWORD)@postgres-primary:5432/spatiumddi"
+  REDIS_URL: "redis://redis-headless:6379/0"
+  CELERY_BROKER_URL: "redis://redis-headless:6379/1"
+  CELERY_RESULT_BACKEND: "redis://redis-headless:6379/2"
+  DEBUG: "false"
+  LOG_LEVEL: "info"

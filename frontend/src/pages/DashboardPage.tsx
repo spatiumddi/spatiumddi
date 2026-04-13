@@ -14,11 +14,13 @@ export function DashboardPage() {
   });
 
   return (
-    <div className="space-y-6">
-      <h1 className="text-2xl font-bold tracking-tight">Dashboard</h1>
-      <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-        <StatCard label="IP Spaces" value={spaces?.length ?? "—"} icon={Network} />
-        <StatCard label="Subnets" value={subnets?.length ?? "—"} icon={Network} />
+    <div className="h-full overflow-auto p-6">
+      <div className="space-y-6">
+        <h1 className="text-2xl font-bold tracking-tight">Dashboard</h1>
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+          <StatCard label="IP Spaces" value={spaces?.length ?? "—"} icon={Network} />
+          <StatCard label="Subnets" value={subnets?.length ?? "—"} icon={Network} />
+        </div>
       </div>
     </div>
   );

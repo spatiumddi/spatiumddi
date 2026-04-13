@@ -309,3 +309,103 @@ DHCP_CONFIG_CACHE_PATH=/var/cache/spatiumddi/dhcp-config.json
 DHCP_AGENT_RECONNECT_INTERVAL=60    # Seconds between reconnect attempts
 DHCP_AGENT_MAX_CACHE_AGE_HOURS=72   # Alert if cache older than this
 ```
+
+---
+
+## 11. DHCP Options Reference
+
+The following standard DHCP options can be configured at the scope, pool, or host level. All options are configurable in the UI and via API. Parent scope options are inherited by child pools unless overridden.
+
+| Option Code | Name | Description |
+|---|---|---|
+| 1 | Subnet Mask | Auto-computed from subnet prefix |
+| 3 | Router | Default gateway IP(s) |
+| 6 | Domain Name Server | DNS server IPs (up to 3) |
+| 12 | Host Name | Override hostname sent to client |
+| 15 | Domain Name | DNS search domain (e.g., corp.example.com) |
+| 28 | Broadcast Address | Auto-computed |
+| 42 | NTP Servers | NTP server IPs |
+| 43 | Vendor Specific | Raw hex or vendor-specific encapsulated options |
+| 51 | IP Address Lease Time | Seconds; default lease time |
+| 58 | Renewal Time | T1 (default: 50% of lease time) |
+| 59 | Rebinding Time | T2 (default: 87.5% of lease time) |
+| 66 | TFTP Server Name | Boot server hostname (PXE) |
+| 67 | Bootfile Name | PXE bootfile path |
+| 119 | Domain Search | Multiple search domains |
+| 150 | TFTP Server Address | Cisco VoIP boot server IP |
+
+**Min/Max lease times**: Configured as `min_lease_time` / `max_lease_time` on the DHCPScope. Clients requesting shorter/longer leases are clamped to this range.
+
+---
+
+## 12. Parent/Child Setting Inheritance
+
+DHCP options follow the same inheritance model as IPAM:
+
+```
+IPSpace → IPBlock → Subnet → DHCPScope → DHCPPool → DHCPStaticAssignment
+```
+
+At each level, options can be:
+- **Inherited** (not set → use parent's value)
+- **Overridden** (set → use this level's value, ignoring parent)
+- **Extended** (for list-type options like domain-search: append to parent list)
+
+Example:
+```
+IPSpace: Corporate
+  domain-name: corp.example.com
+  ntp-servers: 10.0.0.123
+
+  Subnet: 10.1.2.0/24 (HR VLAN)
+    domain-name: hr.corp.example.com   ← overrides parent
+    ntp-servers: (inherited)           ← 10.0.0.123 still applies
+
+    DHCPPool: Guest
+      domain-name: guest.corp.example.com  ← overrides subnet
+      lease-time: 7200                      ← 2-hour lease for guest
+```
+
+---
+
+## 13. Hostname → IPAM Sync (Configurable)
+
+When a DHCP client receives a lease, the hostname provided by the client can be automatically written back into the IPAM module (setting `IPAddress.hostname`).
+
+```
+DHCPScope.hostname_to_ipam_sync: enum(disabled, on_lease, on_static_only)
+```
+
+| Mode | Behavior |
+|---|---|
+| `disabled` | No hostname sync — IPAM hostname is managed manually |
+| `on_lease` | Hostname from every new DHCP lease is written to IPAM |
+| `on_static_only` | Only static DHCP assignments sync hostname to IPAM |
+
+**Recommendation**: Set to `disabled` or `on_static_only` for large dynamic subnets (e.g., WiFi /16) where lease hostname data is noisy. Set to `on_lease` for server subnets where every IP should have a known hostname.
+
+---
+
+## 14. DHCP Pool Coordination Between Multiple Containers
+
+When multiple DHCP server containers serve the same pool (for HA), they must not assign the same IP to different MAC addresses. SpatiumDDI handles this via:
+
+### Kea HA (preferred)
+
+Kea's built-in `HA hook library` handles pool coordination natively:
+
+- **Load-balancing mode**: Each server handles 50% of the pool range (split by hash of client MAC). If one server fails, the other takes the full range.
+- **Hot-standby mode**: Primary handles all requests; secondary takes over on primary failure.
+- The two Kea nodes communicate directly via the Kea Control Agent API — no SpatiumDDI coordination needed.
+
+Configuration pushed by SpatiumDDI to both nodes in a server group includes the HA section automatically.
+
+### ISC DHCP Failover
+
+ISC DHCP uses the native failover protocol (RFC 3074). SpatiumDDI pushes matching `failover peer` config to both servers.
+
+### SpatiumDDI-level coordination (future)
+
+For non-HA architectures serving different subnets from multiple containers:
+- Each container serves non-overlapping subnets (managed by SpatiumDDI scope assignments)
+- Scope assignments are never duplicated across servers without an explicit HA group

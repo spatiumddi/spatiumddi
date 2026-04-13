@@ -1,0 +1,142 @@
+# PostgreSQL HA for Docker Compose using Patroni
+# This is a SEPARATE compose file for HA Postgres.
+# It replaces the single `postgres` service in docker-compose.yml.
+#
+# Usage:
+#   docker compose -f docker-compose.yml -f k8s/ha/postgres-docker-compose.yaml up -d
+#
+# Architecture:
+#   - 3 PostgreSQL nodes managed by Patroni (1 leader + 2 replicas)
+#   - etcd cluster for distributed consensus (3 nodes)
+#   - HAProxy for transparent primary discovery (port 5000 = read/write, 5001 = read-only)
+#   - Application connects to HAProxy:5000 — no code changes needed
+
+name: spatiumddi-ha
+
+services:
+  # ── etcd cluster (Patroni consensus) ────────────────────────────────────────
+  etcd1:
+    image: bitnami/etcd:3.5
+    networks: [spatiumddi]
+    environment:
+      ALLOW_NONE_AUTHENTICATION: "yes"
+      ETCD_NAME: etcd1
+      ETCD_INITIAL_ADVERTISE_PEER_URLS: http://etcd1:2380
+      ETCD_LISTEN_PEER_URLS: http://0.0.0.0:2380
+      ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+      ETCD_ADVERTISE_CLIENT_URLS: http://etcd1:2379
+      ETCD_INITIAL_CLUSTER: etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
+      ETCD_INITIAL_CLUSTER_TOKEN: spatiumddi-etcd
+      ETCD_INITIAL_CLUSTER_STATE: new
+    volumes: [etcd1_data:/bitnami/etcd]
+
+  etcd2:
+    image: bitnami/etcd:3.5
+    networks: [spatiumddi]
+    environment:
+      ALLOW_NONE_AUTHENTICATION: "yes"
+      ETCD_NAME: etcd2
+      ETCD_INITIAL_ADVERTISE_PEER_URLS: http://etcd2:2380
+      ETCD_LISTEN_PEER_URLS: http://0.0.0.0:2380
+      ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+      ETCD_ADVERTISE_CLIENT_URLS: http://etcd2:2379
+      ETCD_INITIAL_CLUSTER: etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
+      ETCD_INITIAL_CLUSTER_TOKEN: spatiumddi-etcd
+      ETCD_INITIAL_CLUSTER_STATE: new
+    volumes: [etcd2_data:/bitnami/etcd]
+
+  etcd3:
+    image: bitnami/etcd:3.5
+    networks: [spatiumddi]
+    environment:
+      ALLOW_NONE_AUTHENTICATION: "yes"
+      ETCD_NAME: etcd3
+      ETCD_INITIAL_ADVERTISE_PEER_URLS: http://etcd3:2380
+      ETCD_LISTEN_PEER_URLS: http://0.0.0.0:2380
+      ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
+      ETCD_ADVERTISE_CLIENT_URLS: http://etcd3:2379
+      ETCD_INITIAL_CLUSTER: etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
+      ETCD_INITIAL_CLUSTER_TOKEN: spatiumddi-etcd
+      ETCD_INITIAL_CLUSTER_STATE: new
+    volumes: [etcd3_data:/bitnami/etcd]
+
+  # ── Patroni PostgreSQL nodes ─────────────────────────────────────────────────
+  pg1:
+    image: patroni-spatiumddi:latest
+    build:
+      context: .
+      dockerfile_inline: |
+        FROM postgres:16-alpine
+        RUN apk add --no-cache python3 py3-pip
+        RUN pip3 install --break-system-packages patroni[etcd3] psycopg2-binary
+    networks: [spatiumddi]
+    environment:
+      PATRONI_NAME: pg1
+      PATRONI_POSTGRESQL_CONNECT_ADDRESS: pg1:5432
+      PATRONI_RESTAPI_CONNECT_ADDRESS: pg1:8008
+      PATRONI_ETCD3_HOSTS: etcd1:2379,etcd2:2379,etcd3:2379
+      PATRONI_SUPERUSER_USERNAME: postgres
+      PATRONI_SUPERUSER_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD:-supersecret}
+      PATRONI_REPLICATION_USERNAME: replicator
+      PATRONI_REPLICATION_PASSWORD: ${POSTGRES_REPLICATION_PASSWORD:-replicasecret}
+      PATRONI_SCOPE: spatiumddi
+      POSTGRES_USER: spatiumddi
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+      POSTGRES_DB: spatiumddi
+    volumes: [pg1_data:/var/lib/postgresql/data]
+    depends_on: [etcd1, etcd2, etcd3]
+
+  pg2:
+    image: patroni-spatiumddi:latest
+    networks: [spatiumddi]
+    environment:
+      PATRONI_NAME: pg2
+      PATRONI_POSTGRESQL_CONNECT_ADDRESS: pg2:5432
+      PATRONI_RESTAPI_CONNECT_ADDRESS: pg2:8008
+      PATRONI_ETCD3_HOSTS: etcd1:2379,etcd2:2379,etcd3:2379
+      PATRONI_SUPERUSER_USERNAME: postgres
+      PATRONI_SUPERUSER_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD:-supersecret}
+      PATRONI_REPLICATION_USERNAME: replicator
+      PATRONI_REPLICATION_PASSWORD: ${POSTGRES_REPLICATION_PASSWORD:-replicasecret}
+      PATRONI_SCOPE: spatiumddi
+    volumes: [pg2_data:/var/lib/postgresql/data]
+    depends_on: [etcd1, etcd2, etcd3]
+
+  pg3:
+    image: patroni-spatiumddi:latest
+    networks: [spatiumddi]
+    environment:
+      PATRONI_NAME: pg3
+      PATRONI_POSTGRESQL_CONNECT_ADDRESS: pg3:5432
+      PATRONI_RESTAPI_CONNECT_ADDRESS: pg3:8008
+      PATRONI_ETCD3_HOSTS: etcd1:2379,etcd2:2379,etcd3:2379
+      PATRONI_SUPERUSER_USERNAME: postgres
+      PATRONI_SUPERUSER_PASSWORD: ${POSTGRES_SUPERUSER_PASSWORD:-supersecret}
+      PATRONI_REPLICATION_USERNAME: replicator
+      PATRONI_REPLICATION_PASSWORD: ${POSTGRES_REPLICATION_PASSWORD:-replicasecret}
+      PATRONI_SCOPE: spatiumddi
+    volumes: [pg3_data:/var/lib/postgresql/data]
+    depends_on: [etcd1, etcd2, etcd3]
+
+  # ── HAProxy (transparent primary routing) ───────────────────────────────────
+  haproxy:
+    image: haproxy:2.9-alpine
+    networks: [spatiumddi]
+    ports:
+      - "5000:5000"   # read/write → primary only
+      - "5001:5001"   # read-only → all replicas
+    volumes:
+      - ./haproxy.cfg:/usr/local/etc/haproxy/haproxy.cfg:ro
+    depends_on: [pg1, pg2, pg3]
+
+networks:
+  spatiumddi:
+    external: true
+
+volumes:
+  etcd1_data:
+  etcd2_data:
+  etcd3_data:
+  pg1_data:
+  pg2_data:
+  pg3_data:

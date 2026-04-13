@@ -14,7 +14,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What Is SpatiumDDI?
 
-SpatiumDDI is a production-grade, open-source **IP Address Management (IPAM)** platform with integrated **DHCP**, **DNS**, and **NTP** service management. It can be deployed as individual containers, a full Docker Compose stack, a Kubernetes application, or as a **self-contained OS appliance image**.
+SpatiumDDI is a production-grade, open-source **all-in-one DDI (DNS, DHCP, IPAM)** platform. It does not merely configure external DDI servers — it manages and runs the DHCP, DNS, and NTP service containers directly. The control plane (FastAPI + PostgreSQL) is the source of truth; all managed service containers (Kea, BIND9/PowerDNS, chrony) are deployed and configured by SpatiumDDI.
+
+It can be deployed as individual containers, a full Docker Compose stack, a Kubernetes application, or as a **self-contained OS appliance image**. Supported on `linux/amd64` and `linux/arm64` (all Docker images must be built multi-arch).
 
 It is designed to serve both power users (network engineers) and delegated department admins via a granular, group-based permission system. Every feature available in the UI is also available via REST API.
 
@@ -39,9 +41,12 @@ Always read the relevant spec doc(s) before writing code for a feature area.
 | `docs/features/AUTH.md` | Authentication, LDAP/OIDC/SAML, roles, group-scoped permissions, API tokens |
 | `docs/features/SYSTEM_ADMIN.md` | System config, health dashboard, notifications, backup/restore, service control |
 | `docs/deployment/APPLIANCE.md` | OS appliance build, base OS selection, licensing |
-| `docs/deployment/DOCKER.md` | Docker Compose, local config caching on agents |
+| `docs/deployment/DOCKER.md` | Docker Compose setup, ports, first-time setup, TLS, HA, password reset |
 | `docs/deployment/KUBERNETES.md` | Helm chart, operators, HPA, Ingress |
 | `docs/deployment/BAREMETAL.md` | Ansible playbooks, systemd services, Patroni |
+| `k8s/README.md` | Kubernetes manifest usage, HA PostgreSQL (CloudNativePG), Redis Sentinel |
+| `k8s/base/` | Core K8s manifests (namespace, API, worker, frontend, migrate job) |
+| `k8s/ha/` | HA add-ons: CloudNativePG cluster, Redis Sentinel, Patroni Compose |
 | `docs/drivers/DHCP_DRIVERS.md` | Kea, ISC DHCP driver implementation specs |
 | `docs/drivers/DNS_DRIVERS.md` | BIND9, PowerDNS driver specs, incremental update strategy |
 
@@ -58,9 +63,10 @@ Always read the relevant spec doc(s) before writing code for a feature area.
 | Cache / Sessions | Redis 7 |
 | Auth | python-jose, authlib (OIDC), python-ldap |
 | Logging | structlog → JSON → centralized log store (Loki / Elasticsearch) |
-| Metrics | Prometheus + Grafana |
-| Containerization | Docker (multi-stage), Docker Compose, Kubernetes + Helm |
+| Metrics | Prometheus + Grafana; InfluxDB v1/v2 push export |
+| Containerization | Docker (multi-stage, amd64+arm64), Docker Compose, Kubernetes + Helm |
 | Appliance OS | Alpine Linux (containers/appliance), Debian Stable (bare-metal ISO) |
+| Logo / Assets | `docs/assets/logo.svg`, `docs/assets/logo-icon.svg` — also copied to `frontend/src/assets/` |
 
 ---
 
@@ -78,6 +84,8 @@ These rules apply to every file Claude Code generates. No exceptions.
 8. **Incremental DNS updates**: DNS record changes use RFC 2136 DDNS or driver API — never a full server restart
 9. **Idempotent tasks**: All Celery tasks must be safe to retry
 10. **Driver abstraction**: DHCP and DNS backend logic never leaks into the service layer
+11. **Multi-arch builds**: All Docker images must support `linux/amd64` and `linux/arm64`
+12. **K8s manifests stay current**: When adding or changing services, update `k8s/base/` manifests and `k8s/README.md` to reflect the change
 
 ---
 
@@ -93,29 +101,65 @@ These rules apply to every file Claude Code generates. No exceptions.
 
 ---
 
-## Development Commands
+## Version Scheme
 
-> The project is in pre-alpha. Commands below reflect the intended setup; a `Makefile` and full Docker Compose stack are being built out.
+SpatiumDDI uses **CalVer**: `YYYY.MM.DD-N` where N is the release number for that date (starting at 1).
+
+- `2026.04.13-1` — first release on April 13, 2026
+- `2026.04.13-2` — hotfix on the same day
+- Git tags and Docker image tags follow this scheme exactly
+- Release is triggered by pushing a tag matching `[0-9]{4}.[0-9]{2}.[0-9]{2}-*` (see `.github/workflows/release.yml`)
+
+---
+
+## Development Commands
 
 ```bash
 # Initial setup
 cp .env.example .env
-docker compose up -d
+# Edit .env: set POSTGRES_PASSWORD and SECRET_KEY (openssl rand -hex 32)
+docker compose build
+docker compose run --rm migrate      # run Alembic migrations
+docker compose up -d                 # start all services
+
+# Default admin: username=admin, password=admin (force_password_change=True)
+
+# Generate a new migration after model changes
+make migration MSG="describe the change"
 
 # Linting (Python: ruff + black + mypy; TypeScript: eslint + prettier)
 make lint
 
 # Run all tests
 make test
+
+# Run a single test
+make test-one T=tests/test_health.py::test_liveness
+
+# Reset admin password (if locked out)
+docker compose exec api python - <<'EOF'
+from app.core.security import hash_password
+import asyncio
+from sqlalchemy import update
+from app.db import AsyncSessionLocal
+from app.models.auth import User
+async def reset():
+    async with AsyncSessionLocal() as db:
+        await db.execute(update(User).where(User.username == "admin")
+            .values(hashed_password=hash_password("NewPass!"), force_password_change=True))
+        await db.commit()
+asyncio.run(reset())
+EOF
 ```
 
 For Python backend work:
 - Formatter/linter: `ruff`, `black`, `mypy` (all enforced in CI)
-- Migrations: Alembic (`alembic upgrade head`, `alembic revision --autogenerate -m "..."`)
+- Migrations: `make migration MSG="..."` generates; `make migrate` applies
 
 For frontend work:
 - Linter/formatter: `eslint`, `prettier` (all enforced in CI)
 - Dev server: `vite` (inside the frontend container or locally with Node 20+)
+- Theme: dark/light/system toggle; CSS vars in `src/index.css`; toggle in Header component
 
 ---
 *See individual docs for full specifications.*

@@ -1,0 +1,62 @@
+# PostgreSQL HA via CloudNativePG operator
+# Install operator first: https://cloudnative-pg.io/documentation/current/installation_upgrade/
+#   kubectl apply --server-side -f \
+#     https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/release-1.24/releases/cnpg-1.24.0.yaml
+#
+# This creates a 3-node PostgreSQL cluster with:
+# - 1 primary (read/write)  → DNS: postgres-primary.spatiumddi.svc
+# - 2 replicas (read-only)  → DNS: postgres-replica.spatiumddi.svc
+# - Continuous WAL archiving to a PVC
+# - Automatic failover via CloudNativePG
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: postgres
+  namespace: spatiumddi
+spec:
+  instances: 3
+  imageName: ghcr.io/cloudnative-pg/postgresql:16
+
+  postgresql:
+    parameters:
+      max_connections: "200"
+      shared_buffers: "256MB"
+      work_mem: "16MB"
+
+  bootstrap:
+    initdb:
+      database: spatiumddi
+      owner: spatiumddi
+      secret:
+        name: spatiumddi-postgres-credentials
+
+  storage:
+    size: 20Gi
+    storageClass: standard  # replace with your storage class
+
+  monitoring:
+    enablePodMonitor: true  # requires Prometheus Operator
+
+  backup:
+    barmanObjectStore:
+      # Uncomment and configure for S3/GCS/Azure backup:
+      # destinationPath: s3://your-bucket/spatiumddi/wal
+      # s3Credentials:
+      #   accessKeyId:
+      #     name: s3-credentials
+      #     key: ACCESS_KEY_ID
+      #   secretAccessKey:
+      #     name: s3-credentials
+      #     key: SECRET_ACCESS_KEY
+    retentionPolicy: "30d"
+---
+# Credentials secret for CloudNativePG bootstrap
+apiVersion: v1
+kind: Secret
+metadata:
+  name: spatiumddi-postgres-credentials
+  namespace: spatiumddi
+type: kubernetes.io/basic-auth
+stringData:
+  username: spatiumddi
+  password: "CHANGEME"  # match spatiumddi-secrets postgres-password
