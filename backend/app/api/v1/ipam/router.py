@@ -560,38 +560,54 @@ async def create_subnet(body: SubnetCreate, current_user: CurrentUser, db: DB) -
     db.add(subnet)
     await db.flush()
 
-    # Auto-assign gateway as a reserved IP (first usable host, prefixlen < 31)
-    auto_gateway_ip: str | None = None
+    # For standard subnets (prefixlen < 31), create network, broadcast, and gateway records.
+    # /31 and /32 subnets (RFC 3021 / host routes) have no traditional network/broadcast.
+    auto_created: list[str] = []
     if net.prefixlen < 31:
-        if body.gateway:
-            gw_addr = body.gateway
-        else:
-            gw_addr = str(net.network_address + 1)
+        # Network address (e.g. 10.0.1.0)
+        db.add(IPAddress(
+            subnet_id=subnet.id,
+            address=str(net.network_address),
+            status="network",
+            description="Network address",
+            created_by_user_id=current_user.id,
+        ))
+        auto_created.append(str(net.network_address))
 
-        gw_record = IPAddress(
+        # Broadcast address (e.g. 10.0.1.255)
+        db.add(IPAddress(
+            subnet_id=subnet.id,
+            address=str(net.broadcast_address),
+            status="broadcast",
+            description="Broadcast address",
+            created_by_user_id=current_user.id,
+        ))
+        auto_created.append(str(net.broadcast_address))
+
+        # Gateway — use provided or default to first usable host
+        gw_addr = body.gateway or str(net.network_address + 1)
+        db.add(IPAddress(
             subnet_id=subnet.id,
             address=gw_addr,
             status="reserved",
             description="Gateway",
             hostname="gateway",
             created_by_user_id=current_user.id,
-        )
-        db.add(gw_record)
+        ))
         subnet.gateway = gw_addr
-        auto_gateway_ip = gw_addr
+        auto_created.append(gw_addr)
 
     db.add(_audit(current_user, "create", "subnet", str(subnet.id),
                   f"{canonical} ({body.name})", new_value={**body.model_dump(mode="json"), "network": canonical}))
     await db.flush()
 
-    # Update utilization to reflect auto-created gateway record
-    if auto_gateway_ip:
+    if auto_created:
         await _update_utilization(db, subnet.id)
 
     await db.commit()
     await db.refresh(subnet)
     logger.info("subnet_created", subnet_id=str(subnet.id), network=canonical,
-                gateway=auto_gateway_ip)
+                gateway=subnet.gateway)
     return subnet
 
 

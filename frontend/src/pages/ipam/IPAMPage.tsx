@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   ChevronRight,
@@ -10,6 +10,7 @@ import {
   Pencil,
   RefreshCw,
   X,
+  Search,
 } from "lucide-react";
 import { ipamApi, type IPSpace, type Subnet, type IPAddress } from "@/lib/api";
 import { cn } from "@/lib/utils";
@@ -26,6 +27,8 @@ function StatusBadge({ status }: { status: string }) {
     available: "bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400",
     dhcp: "bg-cyan-100 text-cyan-800 dark:bg-cyan-900/30 dark:text-cyan-400",
     static_dhcp: "bg-teal-100 text-teal-800 dark:bg-teal-900/30 dark:text-teal-400",
+    network: "bg-zinc-100 text-zinc-500 dark:bg-zinc-800/50 dark:text-zinc-400",
+    broadcast: "bg-zinc-100 text-zinc-500 dark:bg-zinc-800/50 dark:text-zinc-400",
   };
   return (
     <span
@@ -388,14 +391,38 @@ function AddAddressModal({
 
 // ─── Subnet Detail Panel (right pane) ────────────────────────────────────────
 
-function SubnetDetail({ subnet }: { subnet: Subnet }) {
+function SubnetDetail({
+  subnet,
+  onSubnetEdited,
+}: {
+  subnet: Subnet;
+  onSubnetEdited: (updated: Subnet) => void;
+}) {
   const qc = useQueryClient();
   const [showAddModal, setShowAddModal] = useState(false);
+  const [showEditSubnet, setShowEditSubnet] = useState(false);
+  const [editingAddress, setEditingAddress] = useState<IPAddress | null>(null);
+  const [filter, setFilter] = useState("");
+
+  // Clear filter whenever the viewed subnet changes
+  useEffect(() => { setFilter(""); }, [subnet.id]);
 
   const { data: addresses, isLoading } = useQuery({
     queryKey: ["addresses", subnet.id],
     queryFn: () => ipamApi.listAddresses(subnet.id),
   });
+
+  const q = filter.trim().toLowerCase();
+  const filteredAddresses = q
+    ? addresses?.filter(
+        (a) =>
+          a.address.includes(q) ||
+          a.hostname?.toLowerCase().includes(q) ||
+          a.description?.toLowerCase().includes(q) ||
+          a.status.toLowerCase().includes(q) ||
+          (a.mac_address?.toLowerCase().includes(q) ?? false)
+      )
+    : addresses;
 
   const deleteAddr = useMutation({
     mutationFn: (id: string) => ipamApi.deleteAddress(id),
@@ -404,6 +431,9 @@ function SubnetDetail({ subnet }: { subnet: Subnet }) {
       qc.invalidateQueries({ queryKey: ["subnets"] });
     },
   });
+
+  // Non-editable statuses (network/broadcast infrastructure addresses)
+  const isReadOnly = (status: string) => status === "network" || status === "broadcast";
 
   return (
     <div className="flex flex-1 flex-col overflow-hidden">
@@ -414,6 +444,13 @@ function SubnetDetail({ subnet }: { subnet: Subnet }) {
             <div className="flex items-center gap-2">
               <span className="font-mono text-lg font-semibold">{subnet.network}</span>
               <StatusBadge status={subnet.status} />
+              <button
+                onClick={() => setShowEditSubnet(true)}
+                className="rounded p-1 text-muted-foreground hover:text-foreground"
+                title="Edit subnet"
+              >
+                <Pencil className="h-3.5 w-3.5" />
+              </button>
             </div>
             {subnet.name && (
               <p className="mt-0.5 text-sm text-muted-foreground">{subnet.name}</p>
@@ -461,6 +498,30 @@ function SubnetDetail({ subnet }: { subnet: Subnet }) {
         </div>
       </div>
 
+      {/* Search bar */}
+      {addresses && addresses.length > 0 && (
+        <div className="border-b px-6 py-2">
+          <div className="relative">
+            <Search className="absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+            <input
+              type="text"
+              value={filter}
+              onChange={(e) => setFilter(e.target.value)}
+              placeholder="Filter by address, hostname, MAC, status…"
+              className="w-full rounded-md border bg-background py-1.5 pl-8 pr-8 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+            />
+            {filter && (
+              <button
+                onClick={() => setFilter("")}
+                className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
       {/* IP Address table */}
       <div className="flex-1 overflow-auto">
         {isLoading ? (
@@ -490,10 +551,20 @@ function SubnetDetail({ subnet }: { subnet: Subnet }) {
               </tr>
             </thead>
             <tbody>
-              {addresses.map((addr: IPAddress) => (
+              {filteredAddresses?.length === 0 && (
+                <tr>
+                  <td colSpan={6} className="px-4 py-6 text-center text-sm text-muted-foreground">
+                    No addresses match <strong>{filter}</strong>
+                  </td>
+                </tr>
+              )}
+              {filteredAddresses?.map((addr: IPAddress) => (
                 <tr
                   key={addr.id}
-                  className="border-b last:border-0 hover:bg-muted/20"
+                  className={cn(
+                    "border-b last:border-0 hover:bg-muted/20",
+                    isReadOnly(addr.status) && "opacity-60"
+                  )}
                 >
                   <td className="px-4 py-2 font-mono font-medium">{addr.address}</td>
                   <td className="px-4 py-2 text-muted-foreground">
@@ -509,13 +580,27 @@ function SubnetDetail({ subnet }: { subnet: Subnet }) {
                     {addr.description ?? <span className="text-muted-foreground/40">—</span>}
                   </td>
                   <td className="px-4 py-2 text-right">
-                    <button
-                      onClick={() => deleteAddr.mutate(addr.id)}
-                      disabled={deleteAddr.isPending}
-                      className="rounded p-1 text-muted-foreground hover:text-destructive"
-                    >
-                      <Trash2 className="h-3.5 w-3.5" />
-                    </button>
+                    <div className="flex items-center justify-end gap-1">
+                      {!isReadOnly(addr.status) && (
+                        <button
+                          onClick={() => setEditingAddress(addr)}
+                          className="rounded p-1 text-muted-foreground hover:text-foreground"
+                          title="Edit"
+                        >
+                          <Pencil className="h-3.5 w-3.5" />
+                        </button>
+                      )}
+                      {!isReadOnly(addr.status) && (
+                        <button
+                          onClick={() => deleteAddr.mutate(addr.id)}
+                          disabled={deleteAddr.isPending}
+                          className="rounded p-1 text-muted-foreground hover:text-destructive"
+                          title="Delete"
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </button>
+                      )}
+                    </div>
                   </td>
                 </tr>
               ))}
@@ -527,7 +612,223 @@ function SubnetDetail({ subnet }: { subnet: Subnet }) {
       {showAddModal && (
         <AddAddressModal subnetId={subnet.id} onClose={() => setShowAddModal(false)} />
       )}
+      {showEditSubnet && (
+        <EditSubnetModal
+          subnet={subnet}
+          onClose={(updated) => {
+            setShowEditSubnet(false);
+            if (updated) onSubnetEdited(updated);
+          }}
+        />
+      )}
+      {editingAddress && (
+        <EditAddressModal
+          address={editingAddress}
+          onClose={() => setEditingAddress(null)}
+        />
+      )}
     </div>
+  );
+}
+
+// ─── Edit Subnet Modal ────────────────────────────────────────────────────────
+
+const SUBNET_STATUSES = ["active", "reserved", "deprecated", "quarantine"] as const;
+
+function EditSubnetModal({
+  subnet,
+  onClose,
+}: {
+  subnet: Subnet;
+  onClose: (updated?: Subnet) => void;
+}) {
+  const qc = useQueryClient();
+  const [name, setName] = useState(subnet.name ?? "");
+  const [description, setDescription] = useState(subnet.description ?? "");
+  const [gateway, setGateway] = useState(subnet.gateway ?? "");
+  const [vlanId, setVlanId] = useState(subnet.vlan_id?.toString() ?? "");
+  const [status, setStatus] = useState(subnet.status);
+  const [error, setError] = useState<string | null>(null);
+
+  const mutation = useMutation({
+    mutationFn: () =>
+      ipamApi.updateSubnet(subnet.id, {
+        name: name || undefined,
+        description,
+        gateway: gateway || undefined,
+        vlan_id: vlanId ? parseInt(vlanId) : null,
+        status,
+      }),
+    onSuccess: (updated) => {
+      qc.invalidateQueries({ queryKey: ["subnets", subnet.space_id] });
+      onClose(updated);
+    },
+    onError: (err: unknown) => {
+      const msg =
+        (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail ??
+        "Failed to save";
+      setError(typeof msg === "string" ? msg : JSON.stringify(msg));
+    },
+  });
+
+  return (
+    <Modal title={`Edit ${subnet.network}`} onClose={() => onClose()}>
+      <div className="space-y-3">
+        <Field label="Name">
+          <input
+            className={inputCls}
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            placeholder="Optional"
+            autoFocus
+          />
+        </Field>
+        <Field label="Description">
+          <input
+            className={inputCls}
+            value={description}
+            onChange={(e) => setDescription(e.target.value)}
+            placeholder="Optional"
+          />
+        </Field>
+        <Field label="Gateway">
+          <input
+            className={inputCls}
+            value={gateway}
+            onChange={(e) => setGateway(e.target.value)}
+            placeholder="e.g. 10.0.1.1"
+          />
+        </Field>
+        <Field label="VLAN ID">
+          <input
+            className={inputCls}
+            value={vlanId}
+            onChange={(e) => setVlanId(e.target.value)}
+            type="number"
+            placeholder="Optional"
+          />
+        </Field>
+        <Field label="Status">
+          <select
+            className={inputCls}
+            value={status}
+            onChange={(e) => setStatus(e.target.value)}
+          >
+            {SUBNET_STATUSES.map((s) => (
+              <option key={s} value={s}>{s}</option>
+            ))}
+          </select>
+        </Field>
+        {error && <p className="text-xs text-destructive">{error}</p>}
+        <div className="flex justify-end gap-2 pt-2">
+          <button onClick={() => onClose()} className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted">
+            Cancel
+          </button>
+          <button
+            onClick={() => { setError(null); mutation.mutate(); }}
+            disabled={mutation.isPending}
+            className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+          >
+            {mutation.isPending ? "Saving…" : "Save"}
+          </button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+// ─── Edit Address Modal ───────────────────────────────────────────────────────
+
+const ADDRESS_STATUSES = ["allocated", "reserved", "deprecated", "static_dhcp", "dhcp"] as const;
+
+function EditAddressModal({
+  address,
+  onClose,
+}: {
+  address: IPAddress;
+  onClose: () => void;
+}) {
+  const qc = useQueryClient();
+  const [hostname, setHostname] = useState(address.hostname ?? "");
+  const [description, setDescription] = useState(address.description ?? "");
+  const [macAddress, setMacAddress] = useState(address.mac_address ?? "");
+  const [status, setStatus] = useState(address.status);
+  const [error, setError] = useState<string | null>(null);
+
+  const mutation = useMutation({
+    mutationFn: () =>
+      ipamApi.updateAddress(address.id, {
+        hostname: hostname || undefined,
+        description: description || undefined,
+        mac_address: macAddress || undefined,
+        status,
+      }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["addresses", address.subnet_id] });
+      onClose();
+    },
+    onError: (err: unknown) => {
+      const msg =
+        (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail ??
+        "Failed to save";
+      setError(typeof msg === "string" ? msg : JSON.stringify(msg));
+    },
+  });
+
+  return (
+    <Modal title={`Edit ${address.address}`} onClose={onClose}>
+      <div className="space-y-3">
+        <Field label="Hostname">
+          <input
+            className={inputCls}
+            value={hostname}
+            onChange={(e) => setHostname(e.target.value)}
+            placeholder="Optional"
+            autoFocus
+          />
+        </Field>
+        <Field label="Description">
+          <input
+            className={inputCls}
+            value={description}
+            onChange={(e) => setDescription(e.target.value)}
+            placeholder="Optional"
+          />
+        </Field>
+        <Field label="MAC Address">
+          <input
+            className={inputCls}
+            value={macAddress}
+            onChange={(e) => setMacAddress(e.target.value)}
+            placeholder="e.g. 00:1a:2b:3c:4d:5e"
+          />
+        </Field>
+        <Field label="Status">
+          <select
+            className={inputCls}
+            value={status}
+            onChange={(e) => setStatus(e.target.value)}
+          >
+            {ADDRESS_STATUSES.map((s) => (
+              <option key={s} value={s}>{s}</option>
+            ))}
+          </select>
+        </Field>
+        {error && <p className="text-xs text-destructive">{error}</p>}
+        <div className="flex justify-end gap-2 pt-2">
+          <button onClick={onClose} className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted">
+            Cancel
+          </button>
+          <button
+            onClick={() => { setError(null); mutation.mutate(); }}
+            disabled={mutation.isPending}
+            className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+          >
+            {mutation.isPending ? "Saving…" : "Save"}
+          </button>
+        </div>
+      </div>
+    </Modal>
   );
 }
 
@@ -538,40 +839,60 @@ function SubnetRow({
   isSelected,
   onSelect,
   onDelete,
+  onEdited,
 }: {
   subnet: Subnet;
   isSelected: boolean;
   onSelect: () => void;
   onDelete: () => void;
+  onEdited: (updated: Subnet) => void;
 }) {
+  const [showEdit, setShowEdit] = useState(false);
+
   return (
-    <div
-      onClick={onSelect}
-      className={cn(
-        "group flex cursor-pointer items-center gap-1.5 rounded-md px-2 py-1.5 text-sm",
-        isSelected
-          ? "bg-primary/10 text-primary font-medium"
-          : "text-muted-foreground hover:bg-muted/50 hover:text-foreground"
-      )}
-    >
-      <div className="w-3.5 flex-shrink-0" />
-      <Network className="h-3.5 w-3.5 flex-shrink-0" />
-      <div className="flex min-w-0 flex-1 flex-col">
-        <span className="truncate font-mono text-xs">{subnet.network}</span>
-        {subnet.name && (
-          <span className="truncate text-xs text-muted-foreground/60">{subnet.name}</span>
+    <>
+      <div
+        onClick={onSelect}
+        className={cn(
+          "group flex cursor-pointer items-center gap-1.5 rounded-md px-2 py-1.5 text-sm",
+          isSelected
+            ? "bg-primary/10 text-primary font-medium"
+            : "text-muted-foreground hover:bg-muted/50 hover:text-foreground"
         )}
-      </div>
-      <button
-        onClick={(e) => {
-          e.stopPropagation();
-          onDelete();
-        }}
-        className="hidden rounded p-0.5 text-muted-foreground hover:text-destructive group-hover:flex"
       >
-        <Trash2 className="h-3 w-3" />
-      </button>
-    </div>
+        <div className="w-3.5 flex-shrink-0" />
+        <Network className="h-3.5 w-3.5 flex-shrink-0" />
+        <div className="flex min-w-0 flex-1 flex-col">
+          <span className="truncate font-mono text-xs">{subnet.network}</span>
+          {subnet.name && (
+            <span className="truncate text-xs text-muted-foreground/60">{subnet.name}</span>
+          )}
+        </div>
+        <button
+          onClick={(e) => { e.stopPropagation(); setShowEdit(true); }}
+          className="hidden rounded p-0.5 text-muted-foreground hover:text-foreground group-hover:flex"
+          title="Edit subnet"
+        >
+          <Pencil className="h-3 w-3" />
+        </button>
+        <button
+          onClick={(e) => { e.stopPropagation(); onDelete(); }}
+          className="hidden rounded p-0.5 text-muted-foreground hover:text-destructive group-hover:flex"
+          title="Delete subnet"
+        >
+          <Trash2 className="h-3 w-3" />
+        </button>
+      </div>
+      {showEdit && (
+        <EditSubnetModal
+          subnet={subnet}
+          onClose={(updated) => {
+            setShowEdit(false);
+            if (updated) onEdited(updated);
+          }}
+        />
+      )}
+    </>
   );
 }
 
@@ -852,6 +1173,7 @@ function SpaceSection({
               isSelected={selectedSubnetId === subnet.id}
               onSelect={() => onSelectSubnet(subnet)}
               onDelete={() => setSubnetToDelete(subnet)}
+              onEdited={(updated) => onSelectSubnet(updated)}
             />
           ))}
         </div>
@@ -957,7 +1279,10 @@ export function IPAMPage() {
       {/* ── Right detail panel ── */}
       <div className="flex flex-1 flex-col overflow-hidden">
         {selectedSubnet ? (
-          <SubnetDetail subnet={selectedSubnet} />
+          <SubnetDetail
+            subnet={selectedSubnet}
+            onSubnetEdited={(updated) => setSelectedSubnet(updated)}
+          />
         ) : (
           <div className="flex flex-1 flex-col items-center justify-center text-center">
             <Network className="mb-3 h-12 w-12 text-muted-foreground/20" />

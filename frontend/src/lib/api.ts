@@ -129,6 +129,36 @@ export interface LoginResponse {
   force_password_change: boolean;
 }
 
+export interface AppUser {
+  id: string;
+  username: string;
+  email: string;
+  display_name: string;
+  is_active: boolean;
+  is_superadmin: boolean;
+  force_password_change: boolean;
+  auth_source: string;
+  last_login_at: string | null;
+}
+
+export const usersApi = {
+  list: () => api.get<AppUser[]>("/users").then((r) => r.data),
+  get: (id: string) => api.get<AppUser>(`/users/${id}`).then((r) => r.data),
+  create: (data: {
+    username: string;
+    email: string;
+    display_name: string;
+    password: string;
+    is_superadmin: boolean;
+    force_password_change: boolean;
+  }) => api.post<AppUser>("/users", data).then((r) => r.data),
+  update: (id: string, data: Partial<Pick<AppUser, "display_name" | "email" | "is_active" | "is_superadmin" | "force_password_change">>) =>
+    api.put<AppUser>(`/users/${id}`, data).then((r) => r.data),
+  resetPassword: (id: string, newPassword: string) =>
+    api.post(`/users/${id}/reset-password`, { new_password: newPassword }),
+  delete: (id: string) => api.delete(`/users/${id}`),
+};
+
 export const authApi = {
   login: (username: string, password: string) =>
     api.post<LoginResponse>("/auth/login", { username, password }).then((r) => r.data),

@@ -5,6 +5,7 @@ import { LoginPage } from "@/pages/LoginPage";
 import { ChangePasswordPage } from "@/pages/ChangePasswordPage";
 import { DashboardPage } from "@/pages/DashboardPage";
 import { IPAMPage } from "@/pages/ipam/IPAMPage";
+import { UsersPage } from "@/pages/admin/UsersPage";
 import { useAuth } from "@/hooks/useAuth";
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
@@ -28,6 +29,7 @@ export default function App() {
         <Route index element={<Navigate to="/dashboard" replace />} />
         <Route path="dashboard" element={<DashboardPage />} />
         <Route path="ipam" element={<IPAMPage />} />
+        <Route path="admin/users" element={<UsersPage />} />
       </Route>
     </Routes>
   );
