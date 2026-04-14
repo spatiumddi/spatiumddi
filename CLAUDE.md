@@ -129,15 +129,19 @@ These rules apply to every file Claude Code generates. No exceptions.
 - ✅ Tree toggles as boxed `[+]`/`[-]` buttons — replaces chevron arrows; vertical `border-l` connecting lines show tree structure
 - ✅ Block detail tree-table — clicking a block shows the same hierarchical tree-table as the space view, scoped to that block's subtree; uses the same columns and rendering
 - ✅ Breadcrumb pill labels show `network (name)` format — e.g. `10.0.0.0/8 (rfc1918)` when a name is set; subnet pill also includes name
+- ✅ Block utilization rollup — `_update_block_utilization()` in `ipam/router.py` uses a recursive CTE to sum allocated IPs from all descendant subnets; walks ancestor chain after every subnet/address mutation
+- ✅ Settings page (`/settings`) — `PlatformSettings` singleton; branding, allocation strategy, session timeout, utilization thresholds, discovery, release check
+- ✅ Global search (Cmd+K / Ctrl+K) — modal with debounced search across IPs, hostnames, MACs, subnets, blocks, spaces; keyboard navigation; deep-links into IPAM tree
+- ✅ Custom field definitions UI (`/admin/custom-fields`) — admin defines `CustomFieldDefinition` records per resource type; custom fields shown on create/edit forms for blocks, subnets, IP addresses; custom field columns rendered in BlockDetailView and SpaceTableView tables
+- ✅ EditBlockModal — name, description, custom fields editable post-creation
+- ✅ Per-column subnet address filters — address, hostname, MAC, status, description columns each have independent filter inputs; replaces old single global filter bar
+- ✅ Network/broadcast records toggle in EditSubnetModal — detects current state from loaded addresses; sends `manage_auto_addresses` flag to add or permanently remove network/broadcast records post-creation
+- ✅ `/auth/me` UUID serialization fix — `UserResponse.id` changed from `str` to `uuid.UUID` (Pydantic v2 `from_attributes=True` does not auto-coerce)
 
 ### Phase 1 — Remaining
 
 - ⬜ LDAP / OIDC authentication
 - ⬜ Group-based RBAC enforcement on API routes
-- ⬜ Settings page (`/settings`) — `PlatformSettings` singleton; default allocation strategy, session timeout, utilization thresholds
-- ⬜ IP search — global search across addresses/subnets/blocks by IP, hostname, MAC, custom field (see `docs/features/IPAM.md §10`)
-- ✅ Block utilization rollup — `_update_block_utilization()` in `ipam/router.py` uses a recursive CTE to sum allocated IPs from all descendant subnets; walks ancestor chain after every subnet/address mutation
-- ⬜ Custom field definitions UI — admin can define `CustomFieldDefinition` records; shown on subnet + IP address forms (see `docs/features/IPAM.md §6`)
 - ⬜ Full IPv6 support in IPAM (address storage, CIDR validation, UI rendering)
 - ⬜ Mobile-responsive UI
 

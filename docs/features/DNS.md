@@ -88,7 +88,190 @@ DNSView
 
 ---
 
-## 3. DNS Zone Tree
+## 3. DNS Server Options & ACLs
+
+Server-level options control how each DNS server (or server group) behaves globally — independent of any individual zone. These map to BIND9 `options {}` / `view {}` blocks and PowerDNS `recursor.conf` / `pdns.conf` directives. All settings are stored in the `DNSServerOptions` model and pushed to the server by the driver on change.
+
+### 3.1 Forwarders
+
+Forwarders are upstream resolvers used when the server cannot answer from its own zones.
+
+```
+DNSServerOptions.forwarders: list[str]          -- e.g. ["1.1.1.1", "8.8.8.8"]
+DNSServerOptions.forward_policy: enum(
+  first,     -- try forwarders first, fall back to recursion (BIND9 "forward first")
+  only,      -- send all queries to forwarders, never recurse (BIND9 "forward only")
+)
+```
+
+- **BIND9:** `forwarders { 1.1.1.1; 8.8.8.8; }; forward first|only;` in `options {}` or per-view
+- **PowerDNS Recursor:** `forward-zones-recurse=.=1.1.1.1;8.8.8.8`
+- Per-zone forward overrides (stub/forward zone type) take precedence over global forwarders
+
+### 3.2 Recursion
+
+Controls whether the server will follow referrals to resolve names it is not authoritative for.
+
+```
+DNSServerOptions.recursion_enabled: bool        -- default true for internal resolvers
+DNSServerOptions.allow_recursion: list[str]     -- CIDR list; who may use this server as a resolver
+                                                --   e.g. ["10.0.0.0/8", "192.168.0.0/16"]
+                                                --   "any" or "none" are also valid literals
+```
+
+- **BIND9:** `recursion yes|no;` + `allow-recursion { <acl>; };` in `options {}` or per-view
+- **PowerDNS Recursor:** recursion is always on; `allow-from=10.0.0.0/8,192.168.0.0/16`
+- Authoritative-only servers must have `recursion_enabled: false` + `allow_recursion: ["none"]`
+
+### 3.3 DNSSEC Resolution
+
+Controls whether the server validates DNSSEC signatures when resolving.
+
+```
+DNSServerOptions.dnssec_validation: enum(
+  auto,      -- validate using built-in / managed-keys (recommended)
+  yes,       -- validate; trust anchors must be manually configured
+  no,        -- do not validate DNSSEC
+)
+
+DNSServerOptions.trust_anchors: list[DNSTrustAnchor]
+
+DNSTrustAnchor
+  id, server_options_id
+  zone_name: str          -- e.g. "." for root, "example.com." for island trust
+  algorithm: int          -- DNSKEY algorithm number (e.g. 13 = ECDSAP256SHA256)
+  key_tag: int
+  public_key: str         -- base64-encoded DNSKEY public key
+  is_initial_key: bool    -- true = initial-key (RFC 5011 managed), false = static-key
+  added_at, added_by
+```
+
+- **BIND9:** `dnssec-validation auto|yes|no;` in `options {}` or per-view; trust anchors go in `managed-keys {}` or `trust-anchors {}`
+- **PowerDNS Recursor:** `dnssec=validate|off|process`; trust anchors via `lua-config-file` with `addTA()`
+- The root DNSSEC trust anchor (ICANN KSK) is pre-loaded automatically when `dnssec_validation: auto`
+- UI shows DNSSEC chain validation status for each zone
+
+### 3.4 GSS-TSIG
+
+GSS-TSIG enables Kerberos-based authentication for secure DNS updates, used primarily with Active Directory / Windows DNS integration.
+
+```
+DNSServerOptions.gss_tsig_enabled: bool        -- default false
+DNSServerOptions.gss_tsig_keytab_path: str     -- path to keytab on DNS server host
+DNSServerOptions.gss_tsig_realm: str           -- e.g. "CORP.EXAMPLE.COM"
+DNSServerOptions.gss_tsig_principal: str       -- e.g. "DNS/ns1.corp.example.com@CORP.EXAMPLE.COM"
+```
+
+- **BIND9:** `tkey-gssapi-keytab "/etc/bind/dns.keytab";` + `tkey-domain "CORP.EXAMPLE.COM";`
+- **PowerDNS:** GSS-TSIG support via the `gssx` module (experimental); keytab configured in `pdns.conf`
+- When enabled, DDNS updates from Windows clients use Kerberos tickets rather than HMAC-TSIG keys
+- The keytab file is deployed to the DNS server host by the SpatiumDDI agent; the path is stored (not the keytab content itself)
+- Required for seamless AD/DNS integration and Windows Secure Dynamic Update
+
+### 3.5 Notify
+
+Controls whether the primary server notifies secondaries when a zone changes.
+
+```
+DNSServerOptions.notify_enabled: bool | enum(explicit, master-only, yes, no)
+                                                -- "explicit" = only servers in also-notify list
+DNSServerOptions.also_notify: list[str]         -- extra IPs to notify beyond NS records
+                                                --   e.g. ["10.0.0.53", "10.0.1.53"]
+DNSServerOptions.allow_notify: list[str]        -- who may send NOTIFY to this server
+                                                --   (for secondary servers receiving notifies)
+                                                --   e.g. ["10.0.0.1", "10.0.0.2"]
+```
+
+- **BIND9:** `notify yes|explicit|master-only|no;` + `also-notify { ... };` + `allow-notify { ... };`
+- Notify settings can be overridden per-zone (the zone model inherits from server defaults)
+- `also_notify` is useful when secondaries are stealth (not listed in zone NS records)
+- `allow_notify` on secondaries controls which primaries are trusted to trigger a zone transfer
+
+### 3.6 Query & Transfer Access Controls
+
+Fine-grained controls over who can query, use the cache, transfer zones, and what gets blackholed.
+
+```
+DNSServerOptions.allow_query: list[str]         -- who may submit DNS queries
+                                                --   default: ["any"]
+DNSServerOptions.allow_query_cache: list[str]   -- who may use the recursive cache
+                                                --   default: ["localhost", "localnets"]
+DNSServerOptions.allow_transfer: list[str]      -- who may receive full zone transfers (AXFR/IXFR)
+                                                --   default: ["none"]
+DNSServerOptions.blackhole: list[str]           -- queries from these addresses are dropped silently
+                                                --   e.g. ["192.0.2.0/24", "198.51.100.0/24"]
+```
+
+- **BIND9:** `allow-query { <acl>; };`, `allow-query-cache { <acl>; };`, `allow-transfer { <acl>; };`, `blackhole { <acl>; };` in `options {}` or per-view
+- **PowerDNS Authoritative:** `allow-axfr-ips=...`; `allow-dnsupdate-from=...`
+- All values accept BIND9 ACL names (see §3.7), CIDRs, or literals (`any`, `none`, `localhost`, `localnets`)
+- Can be overridden at the **view** level and further overridden at the **zone** level
+- `blackhole` is applied before any ACL processing — matching queries receive no response (useful for DoS mitigation)
+- `allow_query_cache` should be restricted to internal clients on authoritative-only servers (`none`)
+
+### 3.7 DNS ACLs (Named Access Control Lists)
+
+Named ACLs are reusable address match lists that can be referenced in any option above. They avoid repeating long CIDR lists across multiple settings.
+
+```
+DNSAcl
+  id, server_group_id (nullable — global ACLs apply to all groups in the server group)
+  name: str             -- e.g. "internal-clients", "trusted-secondaries"
+  description: str
+  entries: list[DNSAclEntry]
+
+DNSAclEntry
+  id, acl_id
+  value: str            -- CIDR, IP, key name (e.g. "!10.0.0.5", "key my-tsig-key")
+  negate: bool          -- if true, prefix with ! in generated config
+  order: int            -- entries evaluated in order; first match wins
+```
+
+**Predefined ACL literals (no definition needed):**
+
+| Literal | Meaning |
+|---|---|
+| `any` | All addresses |
+| `none` | No addresses |
+| `localhost` | All loopback addresses on the server |
+| `localnets` | All directly attached networks |
+
+**Example usage:**
+
+```
+ACL "internal-clients": 10.0.0.0/8, 192.168.0.0/16, 172.16.0.0/12
+ACL "trusted-secondaries": 10.0.0.53, 10.0.1.53
+
+allow_query:       ["internal-clients", "any"]   -- queries from anywhere allowed (auth server)
+allow_query_cache: ["internal-clients"]           -- only internal clients use cache
+allow_transfer:    ["trusted-secondaries"]        -- only known secondaries get AXFR
+blackhole:         ["198.51.100.0/24"]            -- silently drop known bad actor range
+```
+
+- **BIND9:** ACLs are emitted as `acl "<name>" { ... };` blocks at the top of `named.conf`, before `options {}` and `view {}` blocks
+- **PowerDNS:** Does not have a native ACL abstraction; SpatiumDDI expands ACL names into explicit CIDR lists when generating PowerDNS config
+- ACLs are managed at the **server group** level; views and zones within that group reference them by name
+- UI: ACL editor under DNS Server Group settings — list of named ACLs, each with an ordered entry list; drag-to-reorder entries; inline negation toggle
+
+### 3.8 Options Precedence
+
+Settings can be defined at three levels and are evaluated from most-specific to least-specific:
+
+```
+Zone override  (per-zone notify, allow-transfer, also-notify)
+    ↓
+View override  (per-view recursion, allow-query, allow-query-cache, forwarders)
+    ↓
+Server default (DNSServerOptions — applies to all views/zones on that server)
+```
+
+The driver is responsible for generating the correct BIND9 / PowerDNS config that reflects this layered precedence. Service-layer code must not hard-code driver specifics.
+
+---
+
+## 4. DNS Zone Tree
+
+
 
 Zones are displayed and managed in a **tree hierarchy** that mirrors the DNS namespace naturally.
 
@@ -133,7 +316,7 @@ When a subnet is created or edited, the UI prompts: *"Auto-create reverse zone f
 
 ---
 
-## 4. DNS Records
+## 5. DNS Records
 
 ### Supported Record Types
 
@@ -159,7 +342,7 @@ DNSRecord
 
 ---
 
-## 5. Incremental DNS Updates (No Restarts)
+## 6. Incremental DNS Updates (No Restarts)
 
 **BIND9:**
 - Record add/modify/delete → RFC 2136 `nsupdate` via `dnspython`
@@ -190,7 +373,7 @@ async def apply_record_change(
 
 ---
 
-## 6. Dynamic DNS (DDNS) — DHCP Lease → DNS Record
+## 7. Dynamic DNS (DDNS) — DHCP Lease → DNS Record
 
 When a DHCP lease is issued, SpatiumDDI automatically creates or updates:
 1. An **A record** (or AAAA for IPv6) in the subnet's forward zone
@@ -240,7 +423,7 @@ Subnet.ddns_ttl: int                 -- TTL for auto-created records (default: 3
 
 ---
 
-## 7. DNS Blocking Lists
+## 8. DNS Blocking Lists
 
 Inspired by Pi-hole, SpatiumDDI can configure DNS servers to **block domains** by responding with `NXDOMAIN` or a configurable sinkhole IP.
 
@@ -302,7 +485,7 @@ DNSBlockListException
 
 ---
 
-## 8. DNS UI Features
+## 9. DNS UI Features
 
 ### Zone Tree View
 - Collapsible namespace tree (same as the file explorer metaphor)
@@ -328,7 +511,7 @@ DNSBlockListException
 
 ---
 
-## 9. Permissions on DNS Resources
+## 10. Permissions on DNS Resources
 
 DNS zones inherit the standard permission model:
 
@@ -343,7 +526,7 @@ Zone permissions are assignable to groups via the standard Permission model, sam
 
 ---
 
-## 10. Environment Variables for DNS
+## 11. Environment Variables for DNS
 
 ```bash
 # DDNS defaults

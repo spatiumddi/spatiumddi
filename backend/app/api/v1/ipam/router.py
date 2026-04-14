@@ -270,6 +270,9 @@ class SubnetUpdate(BaseModel):
     ntp_servers: list[str] | None = None
     tags: dict[str, Any] | None = None
     custom_fields: dict[str, Any] | None = None
+    # When True: remove network/broadcast/gateway auto records.
+    # When False: create them if not already present.
+    manage_auto_addresses: bool | None = None
 
     @field_validator("status")
     @classmethod
@@ -706,9 +709,50 @@ async def update_subnet(
         "gateway": str(subnet.gateway) if subnet.gateway else None,
         "status": subnet.status, "vlan_id": subnet.vlan_id,
     }
-    changes = body.model_dump(exclude_none=True)
+    changes = body.model_dump(exclude_none=True, exclude={"manage_auto_addresses"})
     for field, value in changes.items():
         setattr(subnet, field, value)
+
+    # Handle add/remove of auto-created network/broadcast/gateway records
+    if body.manage_auto_addresses is not None:
+        net = _parse_network(str(subnet.network))
+        if net.prefixlen < 31:
+            auto_statuses = {"network", "broadcast"}
+            existing_result = await db.execute(
+                select(IPAddress).where(
+                    IPAddress.subnet_id == subnet.id,
+                    IPAddress.status.in_(auto_statuses),
+                )
+            )
+            existing_auto = existing_result.scalars().all()
+
+            if body.manage_auto_addresses is False:
+                # Add: create records that are missing
+                existing_addrs = {str(a.address) for a in existing_auto}
+                if str(net.network_address) not in existing_addrs:
+                    db.add(IPAddress(
+                        subnet_id=subnet.id,
+                        address=str(net.network_address),
+                        status="network",
+                        description="Network address",
+                        created_by_user_id=current_user.id,
+                    ))
+                if str(net.broadcast_address) not in existing_addrs:
+                    db.add(IPAddress(
+                        subnet_id=subnet.id,
+                        address=str(net.broadcast_address),
+                        status="broadcast",
+                        description="Broadcast address",
+                        created_by_user_id=current_user.id,
+                    ))
+                await db.flush()
+                await _update_utilization(db, subnet.id)
+            else:
+                # Remove: permanently delete network/broadcast records
+                for addr in existing_auto:
+                    await db.delete(addr)
+                await db.flush()
+                await _update_utilization(db, subnet.id)
 
     db.add(_audit(current_user, "update", "subnet", str(subnet.id),
                   f"{subnet.network} ({subnet.name})", old_value=old, new_value=changes))

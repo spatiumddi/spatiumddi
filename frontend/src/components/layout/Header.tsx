@@ -15,7 +15,7 @@ export function Header() {
   }
 
   return (
-    <header className="flex h-14 items-center justify-between border-b bg-card px-6">
+    <header className="flex h-14 items-center justify-end border-b bg-card px-6 gap-3">
       <GlobalSearch />
       <div className="flex items-center gap-1">
         <button

@@ -42,3 +42,13 @@ class PlatformSettings(Base):
     github_release_check_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True
     )
+
+    # DNS defaults
+    dns_default_ttl: Mapped[int] = mapped_column(Integer, nullable=False, default=3600)
+    dns_default_zone_type: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="primary"
+    )
+    dns_default_dnssec_validation: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="auto"
+    )
+    dns_recursive_by_default: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)

@@ -32,6 +32,10 @@ class SettingsResponse(BaseModel):
     discovery_scan_enabled: bool
     discovery_scan_interval_minutes: int
     github_release_check_enabled: bool
+    dns_default_ttl: int
+    dns_default_zone_type: str
+    dns_default_dnssec_validation: str
+    dns_recursive_by_default: bool
 
     model_config = {"from_attributes": True}
 
@@ -47,6 +51,10 @@ class SettingsUpdate(BaseModel):
     discovery_scan_enabled: bool | None = None
     discovery_scan_interval_minutes: int | None = None
     github_release_check_enabled: bool | None = None
+    dns_default_ttl: int | None = None
+    dns_default_zone_type: str | None = None
+    dns_default_dnssec_validation: str | None = None
+    dns_recursive_by_default: bool | None = None
 
     @field_validator("ip_allocation_strategy")
     @classmethod
@@ -55,7 +63,14 @@ class SettingsUpdate(BaseModel):
             raise ValueError("ip_allocation_strategy must be 'sequential' or 'random'")
         return v
 
-    @field_validator("session_timeout_minutes", "discovery_scan_interval_minutes")
+    @field_validator("session_timeout_minutes")
+    @classmethod
+    def validate_session_timeout(cls, v: int | None) -> int | None:
+        if v is not None and v < 0:
+            raise ValueError("Must be >= 0 (0 = no timeout)")
+        return v
+
+    @field_validator("discovery_scan_interval_minutes")
     @classmethod
     def validate_positive(cls, v: int | None) -> int | None:
         if v is not None and v < 1:

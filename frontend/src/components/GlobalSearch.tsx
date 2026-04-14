@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { useNavigate } from "react-router-dom";
-import { Search, Network, Layers, Globe, MapPin, X } from "lucide-react";
+import { Search, Network, Layers, Globe, MapPin, X, Server, FileText } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { searchApi, type SearchResult } from "@/lib/api";
 import { cn } from "@/lib/utils";
@@ -19,6 +19,9 @@ const TYPE_LABELS: Record<SearchResult["type"], string> = {
   subnet: "Subnet",
   block: "Block",
   space: "Space",
+  dns_group: "DNS Group",
+  dns_zone: "DNS Zone",
+  dns_record: "DNS Record",
 };
 
 const TYPE_ICONS: Record<SearchResult["type"], React.ElementType> = {
@@ -26,6 +29,9 @@ const TYPE_ICONS: Record<SearchResult["type"], React.ElementType> = {
   subnet: Network,
   block: Layers,
   space: Globe,
+  dns_group: Server,
+  dns_zone: Globe,
+  dns_record: FileText,
 };
 
 const TYPE_COLORS: Record<SearchResult["type"], string> = {
@@ -33,6 +39,9 @@ const TYPE_COLORS: Record<SearchResult["type"], string> = {
   subnet: "text-blue-500",
   block: "text-violet-500",
   space: "text-orange-500",
+  dns_group: "text-sky-500",
+  dns_zone: "text-cyan-500",
+  dns_record: "text-teal-500",
 };
 
 function ResultRow({
@@ -68,7 +77,10 @@ function ResultRow({
           <span className="rounded bg-muted px-1 py-0.5 text-[10px] font-medium">
             {TYPE_LABELS[result.type]}
           </span>
-          {result.space_name && <span>{result.space_name}</span>}
+          {/* IPAM context */}
+          {result.space_name && result.type !== "dns_group" && result.type !== "dns_zone" && result.type !== "dns_record" && (
+            <span>{result.space_name}</span>
+          )}
           {result.subnet_network && result.type === "ip_address" && (
             <span>{result.subnet_network}</span>
           )}
@@ -76,7 +88,7 @@ function ResultRow({
             <span>{result.hostname}</span>
           )}
           {result.mac_address && <span className="font-mono">{result.mac_address}</span>}
-          {result.status && (
+          {result.status && result.type !== "dns_zone" && result.type !== "dns_record" && (
             <span
               className={cn(
                 "rounded px-1 py-0.5 text-[10px] font-medium",
@@ -85,6 +97,27 @@ function ResultRow({
                 result.status === "orphan" && "bg-red-500/10 text-red-600"
               )}
             >
+              {result.status}
+            </span>
+          )}
+          {/* DNS context */}
+          {result.dns_group_name && result.type !== "dns_group" && (
+            <span>{result.dns_group_name}</span>
+          )}
+          {result.dns_zone_name && result.type === "dns_record" && (
+            <span>{result.dns_zone_name}</span>
+          )}
+          {result.dns_record_type && (
+            <span className="rounded bg-sky-500/10 px-1 py-0.5 text-[10px] font-medium text-sky-600">
+              {result.dns_record_type}
+            </span>
+          )}
+          {result.dns_record_value && (
+            <span className="truncate font-mono">{result.dns_record_value}</span>
+          )}
+          {/* DNS zone type badge */}
+          {result.type === "dns_zone" && result.status && (
+            <span className="rounded bg-cyan-500/10 px-1 py-0.5 text-[10px] font-medium text-cyan-600">
               {result.status}
             </span>
           )}
@@ -151,6 +184,12 @@ export function GlobalSearch() {
         navigate("/ipam", { state: { selectBlock: result.id } });
       } else if (result.type === "space") {
         navigate("/ipam", { state: { selectSpace: result.id } });
+      } else if (result.type === "dns_group") {
+        navigate("/dns", { state: { selectGroup: result.dns_group_id } });
+      } else if (result.type === "dns_zone") {
+        navigate("/dns", { state: { selectGroup: result.dns_group_id, selectZone: result.dns_zone_id } });
+      } else if (result.type === "dns_record") {
+        navigate("/dns", { state: { selectGroup: result.dns_group_id, selectZone: result.dns_zone_id } });
       }
     },
     [navigate]
@@ -175,11 +214,11 @@ export function GlobalSearch() {
       {/* Trigger button */}
       <button
         onClick={() => setOpen(true)}
-        className="flex items-center gap-2 rounded-md border border-border/50 bg-muted/30 px-3 py-1.5 text-sm text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground"
+        className="flex items-center gap-2 rounded-md border border-border/50 bg-muted/30 px-3 py-1.5 text-sm text-muted-foreground transition-colors hover:bg-accent hover:text-accent-foreground w-80"
       >
-        <Search className="h-3.5 w-3.5" />
-        <span>Search…</span>
-        <kbd className="ml-1 hidden rounded bg-muted px-1 py-0.5 text-[10px] font-mono sm:inline-block">
+        <Search className="h-3.5 w-3.5 flex-shrink-0" />
+        <span className="flex-1 text-left">Search IP, zone, record…</span>
+        <kbd className="hidden rounded bg-muted px-1 py-0.5 text-[10px] font-mono sm:inline-block flex-shrink-0">
           ⌘K
         </kbd>
       </button>
@@ -206,7 +245,7 @@ export function GlobalSearch() {
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
                 onKeyDown={handleKeyDown}
-                placeholder="Search IP, hostname, MAC, subnet, CIDR…"
+                placeholder="Search IP, hostname, MAC, subnet, zone, record…"
                 className="flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground"
               />
               {query && (
@@ -223,7 +262,7 @@ export function GlobalSearch() {
             <div className="max-h-96 overflow-y-auto">
               {!query && (
                 <p className="px-4 py-6 text-center text-sm text-muted-foreground">
-                  Type to search across IP addresses, subnets, blocks, and spaces.
+                  Type to search across IP addresses, subnets, DNS zones, records, and more.
                 </p>
               )}
               {query && isFetching && results.length === 0 && (

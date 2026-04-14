@@ -1,4 +1,4 @@
-"""Global search — IPAM (Phase 1); DNS/DHCP added in later phases."""
+"""Global search — IPAM + DNS resources."""
 
 from __future__ import annotations
 
@@ -14,6 +14,7 @@ from sqlalchemy import or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, DB
+from app.models.dns import DNSRecord, DNSServerGroup, DNSZone
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
 
 logger = structlog.get_logger(__name__)
@@ -64,11 +65,11 @@ def _normalize_mac(q: str) -> str:
 class SearchResult(BaseModel):
     """One hit from any resource type."""
 
-    type: str               # "ip_address" | "subnet" | "block" | "space"
+    type: str               # "ip_address"|"subnet"|"block"|"space"|"dns_zone"|"dns_record"|"dns_group"
     id: str
 
     # Primary display
-    display: str            # e.g. "10.0.0.42" or "10.0.0.0/24"
+    display: str            # e.g. "10.0.0.42" or "example.com."
     name: str | None        # human name if set
 
     # Status / detail
@@ -79,12 +80,20 @@ class SearchResult(BaseModel):
     hostname: str | None
     mac_address: str | None
 
-    # Breadcrumb context
+    # Breadcrumb context (IPAM)
     subnet_id: str | None
     subnet_network: str | None
     block_id: str | None
     space_id: str | None
     space_name: str | None
+
+    # DNS context
+    dns_group_id: str | None = None
+    dns_group_name: str | None = None
+    dns_zone_id: str | None = None
+    dns_zone_name: str | None = None
+    dns_record_type: str | None = None
+    dns_record_value: str | None = None
 
 
 class SearchResponse(BaseModel):
@@ -291,6 +300,118 @@ async def _search_spaces(
     return out
 
 
+async def _search_dns_groups(
+    db: AsyncSession, q: str, limit: int
+) -> list[SearchResult]:
+    stmt = select(DNSServerGroup).where(
+        or_(
+            DNSServerGroup.name.ilike(f"%{q}%"),
+            DNSServerGroup.description.ilike(f"%{q}%"),
+        )
+    )
+    result = await db.execute(stmt.limit(limit))
+    groups = result.scalars().all()
+
+    return [
+        SearchResult(
+            type="dns_group",
+            id=str(g.id),
+            display=g.name,
+            name=g.name,
+            status=None,
+            description=g.description or None,
+            hostname=None,
+            mac_address=None,
+            subnet_id=None,
+            subnet_network=None,
+            block_id=None,
+            space_id=None,
+            space_name=None,
+            dns_group_id=str(g.id),
+            dns_group_name=g.name,
+        )
+        for g in groups
+    ]
+
+
+async def _search_dns_zones(
+    db: AsyncSession, q: str, limit: int
+) -> list[SearchResult]:
+    stmt = (
+        select(DNSZone, DNSServerGroup)
+        .join(DNSServerGroup, DNSZone.group_id == DNSServerGroup.id)
+        .where(DNSZone.name.ilike(f"%{q}%"))
+    )
+    result = await db.execute(stmt.limit(limit))
+    rows = result.all()
+
+    return [
+        SearchResult(
+            type="dns_zone",
+            id=str(z.id),
+            display=z.name,
+            name=z.name,
+            status=z.zone_type,
+            description=None,
+            hostname=None,
+            mac_address=None,
+            subnet_id=None,
+            subnet_network=None,
+            block_id=None,
+            space_id=None,
+            space_name=None,
+            dns_group_id=str(g.id),
+            dns_group_name=g.name,
+            dns_zone_id=str(z.id),
+            dns_zone_name=z.name,
+        )
+        for z, g in rows
+    ]
+
+
+async def _search_dns_records(
+    db: AsyncSession, q: str, limit: int
+) -> list[SearchResult]:
+    stmt = (
+        select(DNSRecord, DNSZone, DNSServerGroup)
+        .join(DNSZone, DNSRecord.zone_id == DNSZone.id)
+        .join(DNSServerGroup, DNSZone.group_id == DNSServerGroup.id)
+        .where(
+            or_(
+                DNSRecord.fqdn.ilike(f"%{q}%"),
+                DNSRecord.value.ilike(f"%{q}%"),
+            )
+        )
+    )
+    result = await db.execute(stmt.limit(limit))
+    rows = result.all()
+
+    return [
+        SearchResult(
+            type="dns_record",
+            id=str(r.id),
+            display=r.fqdn,
+            name=r.fqdn,
+            status=r.record_type,
+            description=None,
+            hostname=None,
+            mac_address=None,
+            subnet_id=None,
+            subnet_network=None,
+            block_id=None,
+            space_id=None,
+            space_name=None,
+            dns_group_id=str(g.id),
+            dns_group_name=g.name,
+            dns_zone_id=str(z.id),
+            dns_zone_name=z.name,
+            dns_record_type=r.record_type,
+            dns_record_value=r.value,
+        )
+        for r, z, g in rows
+    ]
+
+
 # ── Endpoint ───────────────────────────────────────────────────────────────────
 
 
@@ -301,17 +422,17 @@ async def global_search(
     q: str = Query(..., min_length=1, max_length=200, description="Search query"),
     types: str | None = Query(
         default=None,
-        description="Comma-separated resource types to search: ip_address,subnet,block,space",
+        description="Comma-separated resource types: ip_address,subnet,block,space,dns_group,dns_zone,dns_record",
     ),
     limit: int = Query(default=25, ge=1, le=100),
 ) -> SearchResponse:
-    """Search across IPAM resources by IP, CIDR, hostname, MAC, or name.
+    """Search across IPAM and DNS resources.
 
     Query interpretation:
     - Valid IP (e.g. 10.0.0.1) → exact IP match + subnets/blocks containing it
     - CIDR (e.g. 10.0.0.0/24) → subnets/blocks matching the range
     - MAC address → IP addresses with that MAC
-    - Text → hostname, name, description prefix/substring match
+    - Text → hostname, name, FQDN, record value, description substring match
     """
     q = q.strip()
     requested = {t.strip() for t in types.split(",")} if types else None
@@ -330,6 +451,15 @@ async def global_search(
 
     if not requested or "space" in requested:
         results.extend(await _search_spaces(db, q, per_type_limit))
+
+    if not requested or "dns_group" in requested:
+        results.extend(await _search_dns_groups(db, q, per_type_limit))
+
+    if not requested or "dns_zone" in requested:
+        results.extend(await _search_dns_zones(db, q, per_type_limit))
+
+    if not requested or "dns_record" in requested:
+        results.extend(await _search_dns_records(db, q, per_type_limit))
 
     # De-duplicate (same id can appear in multiple passes when q is an IP)
     seen: set[str] = set()

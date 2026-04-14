@@ -13,7 +13,7 @@ import {
   Copy,
   Check,
 } from "lucide-react";
-import { ipamApi, type IPSpace, type IPBlock, type Subnet, type IPAddress } from "@/lib/api";
+import { ipamApi, customFieldsApi, type IPSpace, type IPBlock, type Subnet, type IPAddress, type CustomField } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
 // ─── Status Badge ────────────────────────────────────────────────────────────
@@ -101,6 +101,73 @@ function CopyButton({ text }: { text: string }) {
         : <Copy className="h-3 w-3" />
       }
     </button>
+  );
+}
+
+// ─── Custom Fields Section ───────────────────────────────────────────────────
+
+function CustomFieldsSection({
+  definitions,
+  values,
+  onChange,
+}: {
+  definitions: CustomField[];
+  values: Record<string, unknown>;
+  onChange: (key: string, value: unknown) => void;
+}) {
+  if (definitions.length === 0) return null;
+  return (
+    <>
+      <div className="border-t pt-3">
+        <p className="mb-2 text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+          Custom Fields
+        </p>
+        <div className="space-y-3">
+          {definitions.map((def) => {
+            const val = values[def.name] ?? def.default_value ?? "";
+            return (
+              <Field key={def.name} label={`${def.label}${def.is_required ? " *" : ""}`}>
+                {def.description && (
+                  <p className="mb-1 text-xs text-muted-foreground">{def.description}</p>
+                )}
+                {def.field_type === "boolean" ? (
+                  <input
+                    type="checkbox"
+                    className="rounded"
+                    checked={!!val}
+                    onChange={(e) => onChange(def.name, e.target.checked)}
+                  />
+                ) : def.field_type === "select" && def.options ? (
+                  <select
+                    className={inputCls}
+                    value={String(val)}
+                    onChange={(e) => onChange(def.name, e.target.value)}
+                  >
+                    {!def.is_required && <option value="">— None —</option>}
+                    {def.options.map((opt) => (
+                      <option key={opt} value={opt}>{opt}</option>
+                    ))}
+                  </select>
+                ) : (
+                  <input
+                    className={inputCls}
+                    type={
+                      def.field_type === "number" ? "number"
+                      : def.field_type === "email" ? "email"
+                      : def.field_type === "url" ? "url"
+                      : "text"
+                    }
+                    value={String(val)}
+                    onChange={(e) => onChange(def.name, e.target.value)}
+                    placeholder={def.is_required ? "Required" : "Optional"}
+                  />
+                )}
+              </Field>
+            );
+          })}
+        </div>
+      </div>
+    </>
   );
 }
 
@@ -222,11 +289,17 @@ function CreateSubnetModal({
   const [gateway, setGateway] = useState("");
   const [vlanId, setVlanId] = useState("");
   const [skipAuto, setSkipAuto] = useState(false);
+  const [customFields, setCustomFields] = useState<Record<string, unknown>>({});
   const [error, setError] = useState<string | null>(null);
 
   const { data: blocks } = useQuery({
     queryKey: ["blocks", spaceId],
     queryFn: () => ipamApi.listBlocks(spaceId),
+  });
+
+  const { data: cfDefs = [] } = useQuery({
+    queryKey: ["custom-fields", "subnet"],
+    queryFn: () => customFieldsApi.list("subnet"),
   });
 
   // Auto-select if only one block
@@ -245,6 +318,7 @@ function CreateSubnetModal({
         vlan_id: vlanId ? parseInt(vlanId) : undefined,
         status: "active",
         skip_auto_addresses: skipAuto,
+        custom_fields: customFields,
       }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["subnets", spaceId] });
@@ -319,6 +393,11 @@ function CreateSubnetModal({
           />
           Skip network / broadcast / gateway records (loopback, P2P)
         </label>
+        <CustomFieldsSection
+          definitions={cfDefs}
+          values={customFields}
+          onChange={(k, v) => setCustomFields((prev) => ({ ...prev, [k]: v }))}
+        />
         {error && <p className="text-xs text-destructive">{error}</p>}
         <div className="flex justify-end gap-2 pt-2">
           <button
@@ -358,7 +437,13 @@ function AddAddressModal({
   const [mac, setMac] = useState("");
   const [description, setDescription] = useState("");
   const [ipStatus, setIpStatus] = useState("allocated");
+  const [customFields, setCustomFields] = useState<Record<string, unknown>>({});
   const [error, setError] = useState<string | null>(null);
+
+  const { data: cfDefs = [] } = useQuery({
+    queryKey: ["custom-fields", "ip_address"],
+    queryFn: () => customFieldsApi.list("ip_address"),
+  });
 
   const mutation = useMutation({
     mutationFn: () => {
@@ -368,6 +453,7 @@ function AddAddressModal({
           status: ipStatus,
           mac_address: mac || undefined,
           description: description || undefined,
+          custom_fields: customFields,
         });
       }
       return ipamApi.createAddress({
@@ -377,6 +463,7 @@ function AddAddressModal({
         mac_address: mac || undefined,
         description: description || undefined,
         status: ipStatus,
+        custom_fields: customFields,
       });
     },
     onSuccess: () => {
@@ -462,6 +549,11 @@ function AddAddressModal({
             placeholder="Optional"
           />
         </Field>
+        <CustomFieldsSection
+          definitions={cfDefs}
+          values={customFields}
+          onChange={(k, v) => setCustomFields((prev) => ({ ...prev, [k]: v }))}
+        />
         {error && <p className="text-xs text-destructive">{error}</p>}
         <div className="flex justify-end gap-2 pt-2">
           <button
@@ -690,6 +782,17 @@ function SubnetDetail({
             </div>
           </div>
         </div>
+        {/* Custom field values */}
+        {Object.keys(subnet.custom_fields ?? {}).length > 0 && (
+          <div className="mt-3 flex flex-wrap gap-4 border-t pt-3">
+            {Object.entries(subnet.custom_fields).map(([k, v]) => (
+              <div key={k}>
+                <span className="text-xs text-muted-foreground">{k}</span>
+                <p className="text-xs font-medium">{String(v)}</p>
+              </div>
+            ))}
+          </div>
+        )}
       </div>
 
       {/* Per-column filter cleared button */}
@@ -898,17 +1001,44 @@ function EditSubnetModal({
   const [gateway, setGateway] = useState(subnet.gateway ?? "");
   const [vlanId, setVlanId] = useState(subnet.vlan_id?.toString() ?? "");
   const [status, setStatus] = useState(subnet.status);
+  const [customFields, setCustomFields] = useState<Record<string, unknown>>(
+    (subnet.custom_fields as Record<string, unknown>) ?? {}
+  );
   const [error, setError] = useState<string | null>(null);
 
+  // Detect whether network/broadcast records currently exist
+  const { data: addresses } = useQuery({
+    queryKey: ["addresses", subnet.id],
+    queryFn: () => ipamApi.listAddresses(subnet.id),
+  });
+  const hasAutoAddresses = addresses?.some(
+    (a) => a.status === "network" || a.status === "broadcast"
+  ) ?? true;
+  const [autoAddresses, setAutoAddresses] = useState<boolean | null>(null);
+  // Use detected value as the default; allow override
+  const effectiveAutoAddresses = autoAddresses !== null ? autoAddresses : hasAutoAddresses;
+
+  const { data: cfDefs = [] } = useQuery({
+    queryKey: ["custom-fields", "subnet"],
+    queryFn: () => customFieldsApi.list("subnet"),
+  });
+
   const mutation = useMutation({
-    mutationFn: () =>
-      ipamApi.updateSubnet(subnet.id, {
+    mutationFn: () => {
+      const manageAuto =
+        autoAddresses !== null && autoAddresses !== hasAutoAddresses
+          ? !autoAddresses  // True = remove, False = add
+          : undefined;
+      return ipamApi.updateSubnet(subnet.id, {
         name: name || undefined,
         description,
         gateway: gateway || undefined,
         vlan_id: vlanId ? parseInt(vlanId) : null,
         status,
-      }),
+        custom_fields: customFields,
+        ...(manageAuto !== undefined ? { manage_auto_addresses: manageAuto } : {}),
+      });
+    },
     onSuccess: (updated) => {
       qc.invalidateQueries({ queryKey: ["subnets", subnet.space_id] });
       onClose(updated);
@@ -969,6 +1099,29 @@ function EditSubnetModal({
             ))}
           </select>
         </Field>
+        <div className="border-t pt-3">
+          <label className="flex items-start gap-3">
+            <input
+              type="checkbox"
+              className="mt-0.5 h-4 w-4 rounded"
+              checked={effectiveAutoAddresses}
+              onChange={(e) => setAutoAddresses(e.target.checked)}
+            />
+            <div>
+              <span className="text-sm font-medium">Network / Broadcast records</span>
+              <p className="text-xs text-muted-foreground">
+                {effectiveAutoAddresses
+                  ? "Network and broadcast addresses are present. Uncheck to remove them (e.g. for loopbacks or P2P links)."
+                  : "Network and broadcast addresses are not present. Check to add them."}
+              </p>
+            </div>
+          </label>
+        </div>
+        <CustomFieldsSection
+          definitions={cfDefs}
+          values={customFields}
+          onChange={(k, v) => setCustomFields((prev) => ({ ...prev, [k]: v }))}
+        />
         {error && <p className="text-xs text-destructive">{error}</p>}
         <div className="flex justify-end gap-2 pt-2">
           <button onClick={() => onClose()} className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted">
@@ -1003,7 +1156,15 @@ function EditAddressModal({
   const [description, setDescription] = useState(address.description ?? "");
   const [macAddress, setMacAddress] = useState(address.mac_address ?? "");
   const [status, setStatus] = useState(address.status);
+  const [customFields, setCustomFields] = useState<Record<string, unknown>>(
+    (address.custom_fields as Record<string, unknown>) ?? {}
+  );
   const [error, setError] = useState<string | null>(null);
+
+  const { data: cfDefs = [] } = useQuery({
+    queryKey: ["custom-fields", "ip_address"],
+    queryFn: () => customFieldsApi.list("ip_address"),
+  });
 
   const mutation = useMutation({
     mutationFn: () =>
@@ -1012,6 +1173,7 @@ function EditAddressModal({
         description: description || undefined,
         mac_address: macAddress || undefined,
         status,
+        custom_fields: customFields,
       }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["addresses", address.subnet_id] });
@@ -1064,6 +1226,11 @@ function EditAddressModal({
             ))}
           </select>
         </Field>
+        <CustomFieldsSection
+          definitions={cfDefs}
+          values={customFields}
+          onChange={(k, v) => setCustomFields((prev) => ({ ...prev, [k]: v }))}
+        />
         {error && <p className="text-xs text-destructive">{error}</p>}
         <div className="flex justify-end gap-2 pt-2">
           <button onClick={onClose} className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted">
@@ -1388,12 +1555,19 @@ function CreateBlockModal({
   const qc = useQueryClient();
   const [network, setNetwork] = useState("");
   const [name, setName] = useState("");
+  const [description, setDescription] = useState("");
   const [parentBlockId, setParentBlockId] = useState(defaultParentBlockId ?? "");
+  const [customFields, setCustomFields] = useState<Record<string, unknown>>({});
   const [error, setError] = useState<string | null>(null);
 
   const { data: existingBlocks } = useQuery({
     queryKey: ["blocks", spaceId],
     queryFn: () => ipamApi.listBlocks(spaceId),
+  });
+
+  const { data: cfDefs = [] } = useQuery({
+    queryKey: ["custom-fields", "ip_block"],
+    queryFn: () => customFieldsApi.list("ip_block"),
   });
 
   const flatBlocks = existingBlocks
@@ -1406,10 +1580,13 @@ function CreateBlockModal({
         space_id: spaceId,
         network,
         name: name || undefined,
+        description: description || undefined,
         parent_block_id: parentBlockId || undefined,
+        custom_fields: customFields,
       }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["blocks", spaceId] });
+      qc.invalidateQueries({ queryKey: ["blocks"] });
       onClose();
     },
     onError: (err: unknown) => {
@@ -1427,6 +1604,9 @@ function CreateBlockModal({
         <Field label="Name">
           <input className={inputCls} value={name} onChange={(e) => setName(e.target.value)} placeholder="Optional" />
         </Field>
+        <Field label="Description">
+          <input className={inputCls} value={description} onChange={(e) => setDescription(e.target.value)} placeholder="Optional" />
+        </Field>
         {flatBlocks.length > 0 && (
           <Field label="Parent Block (optional)">
             <select className={inputCls} value={parentBlockId} onChange={(e) => setParentBlockId(e.target.value)}>
@@ -1437,11 +1617,101 @@ function CreateBlockModal({
             </select>
           </Field>
         )}
+        <CustomFieldsSection
+          definitions={cfDefs}
+          values={customFields}
+          onChange={(k, v) => setCustomFields((prev) => ({ ...prev, [k]: v }))}
+        />
         {error && <p className="text-xs text-destructive">{error}</p>}
         <div className="flex justify-end gap-2 pt-2">
           <button onClick={onClose} className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted">Cancel</button>
           <button onClick={() => { setError(null); mutation.mutate(); }} disabled={!network || mutation.isPending} className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50">
             {mutation.isPending ? "Creating…" : "Create Block"}
+          </button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+// ─── Edit Block Modal ─────────────────────────────────────────────────────────
+
+function EditBlockModal({
+  block,
+  onClose,
+}: {
+  block: IPBlock;
+  onClose: (updated?: IPBlock) => void;
+}) {
+  const qc = useQueryClient();
+  const [name, setName] = useState(block.name ?? "");
+  const [description, setDescription] = useState(block.description ?? "");
+  const [customFields, setCustomFields] = useState<Record<string, unknown>>(
+    (block.custom_fields as Record<string, unknown>) ?? {}
+  );
+  const [error, setError] = useState<string | null>(null);
+
+  const { data: cfDefs = [] } = useQuery({
+    queryKey: ["custom-fields", "ip_block"],
+    queryFn: () => customFieldsApi.list("ip_block"),
+  });
+
+  const mutation = useMutation({
+    mutationFn: () =>
+      ipamApi.updateBlock(block.id, {
+        name: name || undefined,
+        description,
+        custom_fields: customFields,
+      }),
+    onSuccess: (updated) => {
+      qc.invalidateQueries({ queryKey: ["blocks", block.space_id] });
+      qc.invalidateQueries({ queryKey: ["blocks"] });
+      onClose(updated);
+    },
+    onError: (err: unknown) => {
+      const msg =
+        (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail ??
+        "Failed to save";
+      setError(typeof msg === "string" ? msg : JSON.stringify(msg));
+    },
+  });
+
+  return (
+    <Modal title={`Edit ${block.network}`} onClose={() => onClose()}>
+      <div className="space-y-3">
+        <Field label="Name">
+          <input
+            className={inputCls}
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            placeholder="Optional"
+            autoFocus
+          />
+        </Field>
+        <Field label="Description">
+          <input
+            className={inputCls}
+            value={description}
+            onChange={(e) => setDescription(e.target.value)}
+            placeholder="Optional"
+          />
+        </Field>
+        <CustomFieldsSection
+          definitions={cfDefs}
+          values={customFields}
+          onChange={(k, v) => setCustomFields((prev) => ({ ...prev, [k]: v }))}
+        />
+        {error && <p className="text-xs text-destructive">{error}</p>}
+        <div className="flex justify-end gap-2 pt-2">
+          <button onClick={() => onClose()} className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted">
+            Cancel
+          </button>
+          <button
+            onClick={() => { setError(null); mutation.mutate(); }}
+            disabled={mutation.isPending}
+            className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+          >
+            {mutation.isPending ? "Saving…" : "Save"}
           </button>
         </div>
       </div>
@@ -1571,7 +1841,7 @@ function BlockTreeRow({
 // ─── Block Detail View (right panel when block is selected) ──────────────────
 
 function BlockDetailView({
-  block,
+  block: initialBlock,
   spaceName,
   ancestors,
   allBlocks,
@@ -1589,6 +1859,17 @@ function BlockDetailView({
   onSelectBlock: (b: IPBlock) => void;
   onSelectSubnet: (s: Subnet) => void;
 }) {
+  const [block, setBlock] = useState(initialBlock);
+  const [showEdit, setShowEdit] = useState(false);
+
+  // Sync if parent passes a new block object (e.g. after deep-link navigation)
+  useEffect(() => { setBlock(initialBlock); }, [initialBlock.id]);
+
+  const { data: subnetCfDefs = [] } = useQuery({
+    queryKey: ["custom-fields", "subnet"],
+    queryFn: () => customFieldsApi.list("subnet"),
+  });
+
   const directSubnets = allSubnets.filter((s) => s.block_id === block.id);
 
   const crumbs: BreadcrumbItem[] = [
@@ -1605,15 +1886,46 @@ function BlockDetailView({
     <div className="flex flex-1 flex-col overflow-hidden">
       <div className="border-b px-6 py-3">
         <BreadcrumbPills items={crumbs} />
-        <div className="flex items-center gap-2">
-          <Layers className="h-4 w-4 text-muted-foreground" />
-          <span className="font-mono text-lg font-semibold">{block.network}</span>
-          {block.name && <span className="text-sm text-muted-foreground">{block.name}</span>}
+        <div className="flex items-start justify-between">
+          <div>
+            <div className="flex items-center gap-2">
+              <Layers className="h-4 w-4 text-muted-foreground" />
+              <span className="font-mono text-lg font-semibold">{block.network}</span>
+              {block.name && <span className="text-sm text-muted-foreground">{block.name}</span>}
+              <button
+                onClick={() => setShowEdit(true)}
+                className="rounded p-1 text-muted-foreground hover:text-foreground"
+                title="Edit block"
+              >
+                <Pencil className="h-3.5 w-3.5" />
+              </button>
+            </div>
+            {block.description && (
+              <p className="mt-0.5 text-xs text-muted-foreground">{block.description}</p>
+            )}
+          </div>
         </div>
-        {block.description && (
-          <p className="mt-0.5 text-xs text-muted-foreground">{block.description}</p>
+        {/* Custom field values */}
+        {Object.keys(block.custom_fields ?? {}).length > 0 && (
+          <div className="mt-2 flex flex-wrap gap-3">
+            {Object.entries(block.custom_fields).map(([k, v]) => (
+              <div key={k}>
+                <span className="text-xs text-muted-foreground">{k}</span>
+                <p className="text-xs font-medium">{String(v)}</p>
+              </div>
+            ))}
+          </div>
         )}
       </div>
+      {showEdit && (
+        <EditBlockModal
+          block={block}
+          onClose={(updated) => {
+            if (updated) setBlock(updated);
+            setShowEdit(false);
+          }}
+        />
+      )}
       <div className="flex-1 overflow-auto">
         {(() => {
           // Build a synthetic BlockNode for the current block so flattenToTableRows
@@ -1649,6 +1961,9 @@ function BlockDetailView({
                   <th className="px-4 py-2 text-left font-medium text-muted-foreground">Utilization</th>
                   <th className="px-4 py-2 text-right font-medium text-muted-foreground">Size</th>
                   <th className="px-4 py-2 text-left font-medium text-muted-foreground">Status</th>
+                  {subnetCfDefs.map((def) => (
+                    <th key={def.name} className="px-4 py-2 text-left font-medium text-muted-foreground">{def.label}</th>
+                  ))}
                 </tr>
               </thead>
               <tbody>
@@ -1673,6 +1988,9 @@ function BlockDetailView({
                         </td>
                         <td className="px-4 py-2 text-right tabular-nums text-muted-foreground">{cidrSize(b.network).toLocaleString()}</td>
                         <td className="px-4 py-2 text-muted-foreground/40">—</td>
+                        {subnetCfDefs.map((def) => (
+                          <td key={def.name} className="px-4 py-2 text-muted-foreground/40">—</td>
+                        ))}
                       </tr>
                     );
                   }
@@ -1691,6 +2009,13 @@ function BlockDetailView({
                         <td className="px-4 py-2"><UtilizationBar percent={s.utilization_percent} /></td>
                         <td className="px-4 py-2 text-right tabular-nums text-muted-foreground">{s.total_ips.toLocaleString()}</td>
                         <td className="px-4 py-2"><StatusBadge status={s.status} /></td>
+                        {subnetCfDefs.map((def) => (
+                          <td key={def.name} className="px-4 py-2 text-muted-foreground">
+                            {s.custom_fields?.[def.name] != null
+                              ? String(s.custom_fields[def.name])
+                              : <span className="text-muted-foreground/40">—</span>}
+                          </td>
+                        ))}
                       </tr>
                     );
                   }
@@ -1753,6 +2078,11 @@ function SpaceTableView({
     queryFn: () => ipamApi.listSubnets({ space_id: space.id }),
   });
 
+  const { data: subnetCfDefs = [] } = useQuery({
+    queryKey: ["custom-fields", "subnet"],
+    queryFn: () => customFieldsApi.list("subnet"),
+  });
+
   const isLoading = blocksLoading || subnetsLoading;
   const rows =
     blocks && subnets ? flattenToTableRows(buildBlockTree(blocks, subnets, null)) : [];
@@ -1795,6 +2125,9 @@ function SpaceTableView({
                 </th>
                 <th className="px-4 py-2 text-right font-medium text-muted-foreground">Size</th>
                 <th className="px-4 py-2 text-left font-medium text-muted-foreground">Status</th>
+                {subnetCfDefs.map((def) => (
+                  <th key={def.name} className="px-4 py-2 text-left font-medium text-muted-foreground">{def.label}</th>
+                ))}
               </tr>
             </thead>
             <tbody>
@@ -1831,6 +2164,9 @@ function SpaceTableView({
                         {size.toLocaleString()}
                       </td>
                       <td className="px-4 py-2 text-muted-foreground/40">—</td>
+                      {subnetCfDefs.map((def) => (
+                        <td key={def.name} className="px-4 py-2 text-muted-foreground/40">—</td>
+                      ))}
                     </tr>
                   );
                 }
@@ -1866,6 +2202,13 @@ function SpaceTableView({
                       <td className="px-4 py-2">
                         <StatusBadge status={s.status} />
                       </td>
+                      {subnetCfDefs.map((def) => (
+                        <td key={def.name} className="px-4 py-2 text-muted-foreground">
+                          {s.custom_fields?.[def.name] != null
+                            ? String(s.custom_fields[def.name])
+                            : <span className="text-muted-foreground/40">—</span>}
+                        </td>
+                      ))}
                     </tr>
                   );
                 }

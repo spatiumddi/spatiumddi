@@ -1,5 +1,6 @@
 """Authentication endpoints: login, refresh, logout, current user."""
 
+import uuid
 import structlog
 from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel, field_validator
@@ -33,7 +34,7 @@ class TokenResponse(BaseModel):
 
 
 class UserResponse(BaseModel):
-    id: str
+    id: uuid.UUID
     username: str
     email: str
     display_name: str

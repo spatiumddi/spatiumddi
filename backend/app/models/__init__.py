@@ -1,6 +1,17 @@
 from app.models.audit import AuditLog
 from app.models.auth import APIToken, Group, Role, User, UserSession, user_group
 from app.models.base import Base
+from app.models.dns import (
+    DNSAcl,
+    DNSAclEntry,
+    DNSRecord,
+    DNSServer,
+    DNSServerGroup,
+    DNSServerOptions,
+    DNSTrustAnchor,
+    DNSView,
+    DNSZone,
+)
 from app.models.ipam import (
     CustomFieldDefinition,
     IPAddress,
@@ -29,4 +40,13 @@ __all__ = [
     "CustomFieldDefinition",
     "VLANMapping",
     "PlatformSettings",
+    "DNSServerGroup",
+    "DNSServer",
+    "DNSServerOptions",
+    "DNSTrustAnchor",
+    "DNSAcl",
+    "DNSAclEntry",
+    "DNSView",
+    "DNSZone",
+    "DNSRecord",
 ]

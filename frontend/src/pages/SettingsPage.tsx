@@ -256,6 +256,72 @@ export function SettingsPage() {
           </button>
         </Field>
       </Section>
+
+      <Section title="DNS Defaults">
+        <Field label="Default Zone TTL" description="Default TTL (seconds) applied to new zones.">
+          <div className="flex items-center gap-2">
+            <input
+              type="number"
+              min={60}
+              value={values.dns_default_ttl ?? 3600}
+              onChange={(e) => set("dns_default_ttl", Number(e.target.value))}
+              disabled={!isSuperadmin}
+              className="rounded-md border bg-background px-3 py-1.5 text-sm w-28 disabled:opacity-60"
+            />
+            <span className="text-xs text-muted-foreground">sec</span>
+          </div>
+        </Field>
+        <Field label="Default Zone Type" description="Pre-selected zone type when creating a new zone.">
+          <select
+            value={values.dns_default_zone_type ?? "primary"}
+            onChange={(e) => set("dns_default_zone_type", e.target.value)}
+            disabled={!isSuperadmin}
+            className="rounded-md border bg-background px-3 py-1.5 text-sm disabled:opacity-60"
+          >
+            <option value="primary">Primary</option>
+            <option value="secondary">Secondary</option>
+            <option value="stub">Stub</option>
+            <option value="forward">Forward</option>
+          </select>
+        </Field>
+        <Field label="Default DNSSEC Validation" description="Default DNSSEC validation mode for new server groups.">
+          <select
+            value={values.dns_default_dnssec_validation ?? "auto"}
+            onChange={(e) => set("dns_default_dnssec_validation", e.target.value)}
+            disabled={!isSuperadmin}
+            className="rounded-md border bg-background px-3 py-1.5 text-sm disabled:opacity-60"
+          >
+            <option value="auto">auto (recommended)</option>
+            <option value="yes">yes — manual trust anchors</option>
+            <option value="no">no — disabled</option>
+          </select>
+        </Field>
+        <Field label="Recursive by Default" description="Enable recursion when creating new server groups.">
+          <button
+            role="switch"
+            aria-checked={values.dns_recursive_by_default}
+            onClick={() => isSuperadmin && set("dns_recursive_by_default", !values.dns_recursive_by_default)}
+            disabled={!isSuperadmin}
+            className={`relative inline-flex h-5 w-9 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors focus:outline-none disabled:opacity-60 ${
+              values.dns_recursive_by_default ? "bg-primary" : "bg-muted-foreground/30"
+            }`}
+          >
+            <span
+              className={`pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform ${
+                values.dns_recursive_by_default ? "translate-x-4" : "translate-x-0"
+              }`}
+            />
+          </button>
+        </Field>
+        <Field
+          label="DNS Agent Key"
+          description="Pre-shared key for DNS agent container auto-registration. Set DNS_AGENT_KEY env var on both the control plane and agent containers."
+        >
+          <span className="rounded bg-muted px-2 py-1 text-xs font-mono text-muted-foreground">
+            configured via DNS_AGENT_KEY env var
+          </span>
+        </Field>
+      </Section>
     </div>
     </div>
   );
