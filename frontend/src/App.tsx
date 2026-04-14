@@ -7,6 +7,8 @@ import { DashboardPage } from "@/pages/DashboardPage";
 import { IPAMPage } from "@/pages/ipam/IPAMPage";
 import { UsersPage } from "@/pages/admin/UsersPage";
 import { AuditPage } from "@/pages/admin/AuditPage";
+import { CustomFieldsPage } from "@/pages/admin/CustomFieldsPage";
+import { SettingsPage } from "@/pages/SettingsPage";
 import { useAuth } from "@/hooks/useAuth";
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
@@ -32,6 +34,8 @@ export default function App() {
         <Route path="ipam" element={<IPAMPage />} />
         <Route path="admin/users" element={<UsersPage />} />
         <Route path="admin/audit" element={<AuditPage />} />
+        <Route path="admin/custom-fields" element={<CustomFieldsPage />} />
+        <Route path="settings" element={<SettingsPage />} />
       </Route>
     </Routes>
   );

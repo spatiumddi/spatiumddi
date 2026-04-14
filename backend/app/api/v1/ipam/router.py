@@ -6,7 +6,7 @@ from datetime import datetime
 from typing import Any
 
 import structlog
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, HTTPException, Query, status
 from pydantic import BaseModel, field_validator
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -77,6 +77,43 @@ async def _update_utilization(db: AsyncSession, subnet_id: uuid.UUID) -> None:
         subnet.utilization_percent = (
             round(allocated / subnet.total_ips * 100, 2) if subnet.total_ips > 0 else 0.0
         )
+
+
+async def _update_block_utilization(db: AsyncSession, block_id: uuid.UUID) -> None:
+    """Recompute utilization_percent for a block by summing allocated IPs across all
+    descendant subnets (recursive), expressed as a fraction of the block's CIDR size.
+    Also updates all ancestor blocks up the tree.
+    """
+    block = await db.get(IPBlock, block_id)
+    if block is None:
+        return
+
+    # Sum allocated_ips for all subnets in this block and all descendant blocks
+    result = await db.execute(
+        text("""
+            WITH RECURSIVE descendants AS (
+                SELECT id FROM ip_block WHERE id = CAST(:block_id AS uuid)
+                UNION ALL
+                SELECT b.id FROM ip_block b
+                    INNER JOIN descendants d ON b.parent_block_id = d.id
+            )
+            SELECT COALESCE(SUM(s.allocated_ips), 0)
+            FROM subnet s
+            WHERE s.block_id IN (SELECT id FROM descendants)
+        """),
+        {"block_id": str(block_id)},
+    )
+    allocated = result.scalar() or 0
+
+    net = ipaddress.ip_network(str(block.network), strict=False)
+    block_total = net.num_addresses
+    block.utilization_percent = (
+        round(float(allocated) / block_total * 100, 2) if block_total > 0 else 0.0
+    )
+
+    # Walk up the tree and update each ancestor
+    if block.parent_block_id:
+        await _update_block_utilization(db, block.parent_block_id)
 
 
 def _audit(
@@ -179,7 +216,7 @@ class IPBlockResponse(BaseModel):
 
 class SubnetCreate(BaseModel):
     space_id: uuid.UUID
-    block_id: uuid.UUID | None = None
+    block_id: uuid.UUID
     network: str
     name: str = ""
     description: str = ""
@@ -187,6 +224,7 @@ class SubnetCreate(BaseModel):
     vxlan_id: int | None = None
     gateway: str | None = None          # None → auto-assign first usable IP
     status: str = "active"
+    skip_auto_addresses: bool = False   # True for loopbacks/P2P — skips network/broadcast/gateway records
     dns_servers: list[str] | None = None
     domain_name: str | None = None
     ntp_servers: list[str] | None = None
@@ -197,10 +235,18 @@ class SubnetCreate(BaseModel):
     @classmethod
     def validate_network(cls, v: str) -> str:
         try:
-            ipaddress.ip_network(v, strict=False)
+            ipaddress.ip_network(v, strict=True)
+            return v
         except ValueError:
+            pass
+        # If strict fails, check whether host bits are the problem
+        try:
+            canonical = str(ipaddress.ip_network(v, strict=False))
+            raise ValueError(f"Host bits are set in '{v}'. Did you mean {canonical}?")
+        except ValueError as e:
+            if "Did you mean" in str(e):
+                raise
             raise ValueError(f"Invalid CIDR notation: {v}")
-        return v
 
     @field_validator("status")
     @classmethod
@@ -239,7 +285,7 @@ class SubnetUpdate(BaseModel):
 class SubnetResponse(BaseModel):
     id: uuid.UUID
     space_id: uuid.UUID
-    block_id: uuid.UUID | None
+    block_id: uuid.UUID
     network: str
     name: str
     description: str
@@ -269,28 +315,30 @@ class SubnetResponse(BaseModel):
 class IPAddressCreate(BaseModel):
     address: str
     status: str = "allocated"
-    hostname: str | None = None
+    hostname: str
     mac_address: str | None = None
     description: str = ""
     owner_user_id: uuid.UUID | None = None
     custom_fields: dict[str, Any] = {}
     tags: dict[str, Any] = {}
 
+    @field_validator("hostname")
+    @classmethod
+    def hostname_nonempty(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("Hostname is required")
+        return v
+
     @field_validator("status")
     @classmethod
     def validate_status(cls, v: str) -> str:
-        allowed = {"allocated", "reserved", "static_dhcp", "deprecated"}
+        allowed = {"allocated", "reserved", "dhcp", "static_dhcp", "deprecated"}
         if v not in allowed:
             raise ValueError(
                 f"status must be one of: {', '.join(sorted(allowed))}. "
                 "Use 'reserved' for gateway/infrastructure IPs."
             )
-        return v
-
-    @field_validator("mac_address")
-    @classmethod
-    def mac_required_for_static_dhcp(cls, v: str | None, info: Any) -> str | None:
-        # Cross-field validation happens at model level; checked in route handler
         return v
 
 
@@ -342,11 +390,19 @@ class IPAddressResponse(BaseModel):
 class NextIPRequest(BaseModel):
     strategy: str = "sequential"
     status: str = "allocated"
-    hostname: str | None = None
+    hostname: str
     mac_address: str | None = None
     description: str = ""
     custom_fields: dict[str, Any] = {}
     tags: dict[str, Any] = {}
+
+    @field_validator("hostname")
+    @classmethod
+    def hostname_nonempty(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("Hostname is required")
+        return v
 
     @field_validator("strategy")
     @classmethod
@@ -358,7 +414,7 @@ class NextIPRequest(BaseModel):
     @field_validator("status")
     @classmethod
     def validate_status(cls, v: str) -> str:
-        allowed = {"allocated", "reserved", "static_dhcp"}
+        allowed = {"allocated", "reserved", "dhcp", "static_dhcp"}
         if v not in allowed:
             raise ValueError(f"status must be one of: {', '.join(sorted(allowed))}")
         return v
@@ -532,6 +588,10 @@ async def create_subnet(body: SubnetCreate, current_user: CurrentUser, db: DB) -
     if await db.get(IPSpace, body.space_id) is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP space not found")
 
+    block = await db.get(IPBlock, body.block_id)
+    if block is None or block.space_id != body.space_id:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Block not found in this space")
+
     net = _parse_network(body.network)
     canonical = str(net)  # normalise e.g. "10.0.0.1/24" → "10.0.0.0/24"
 
@@ -552,7 +612,7 @@ async def create_subnet(body: SubnetCreate, current_user: CurrentUser, db: DB) -
     total = _total_ips(net)
 
     subnet = Subnet(
-        **{**body.model_dump(), "network": canonical},
+        **{**body.model_dump(exclude={"skip_auto_addresses"}), "network": canonical},
         total_ips=total,
         utilization_percent=0.0,
         allocated_ips=0,
@@ -560,10 +620,10 @@ async def create_subnet(body: SubnetCreate, current_user: CurrentUser, db: DB) -
     db.add(subnet)
     await db.flush()
 
-    # For standard subnets (prefixlen < 31), create network, broadcast, and gateway records.
-    # /31 and /32 subnets (RFC 3021 / host routes) have no traditional network/broadcast.
+    # For standard subnets (prefixlen < 31), create network, broadcast, and gateway records
+    # unless skip_auto_addresses is set (e.g. loopbacks, point-to-point links).
     auto_created: list[str] = []
-    if net.prefixlen < 31:
+    if net.prefixlen < 31 and not body.skip_auto_addresses:
         # Network address (e.g. 10.0.1.0)
         db.add(IPAddress(
             subnet_id=subnet.id,
@@ -604,6 +664,7 @@ async def create_subnet(body: SubnetCreate, current_user: CurrentUser, db: DB) -
     if auto_created:
         await _update_utilization(db, subnet.id)
 
+    await _update_block_utilization(db, subnet.block_id)
     await db.commit()
     await db.refresh(subnet)
     logger.info("subnet_created", subnet_id=str(subnet.id), network=canonical,
@@ -662,10 +723,13 @@ async def delete_subnet(subnet_id: uuid.UUID, current_user: CurrentUser, db: DB)
     if subnet is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
 
+    block_id = subnet.block_id
     db.add(_audit(current_user, "delete", "subnet", str(subnet.id),
                   f"{subnet.network} ({subnet.name})",
                   old_value={"network": str(subnet.network), "name": subnet.name}))
     await db.delete(subnet)
+    await db.flush()
+    await _update_block_utilization(db, block_id)
     await db.commit()
 
 
@@ -746,6 +810,7 @@ async def create_address(
                   body.address, new_value=body.model_dump()))
     await db.flush()
     await _update_utilization(db, subnet_id)
+    await _update_block_utilization(db, subnet.block_id)
     await db.commit()
     await db.refresh(ip)
     logger.info("ip_address_created", ip_id=str(ip.id), address=body.address,
@@ -792,7 +857,10 @@ async def update_address(
     status_now_available = ip.status == "available"
     if status_was_available != status_now_available:
         await db.flush()
+        subnet = await db.get(Subnet, ip.subnet_id)
         await _update_utilization(db, ip.subnet_id)
+        if subnet:
+            await _update_block_utilization(db, subnet.block_id)
 
     await db.commit()
     await db.refresh(ip)
@@ -800,17 +868,36 @@ async def update_address(
 
 
 @router.delete("/addresses/{address_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_address(address_id: uuid.UUID, current_user: CurrentUser, db: DB) -> None:
+async def delete_address(
+    address_id: uuid.UUID,
+    current_user: CurrentUser,
+    db: DB,
+    permanent: bool = Query(default=False, description="Permanently delete instead of marking orphan"),
+) -> None:
     ip = await db.get(IPAddress, address_id)
     if ip is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP address not found")
 
-    subnet_id = ip.subnet_id
-    db.add(_audit(current_user, "delete", "ip_address", str(ip.id),
-                  str(ip.address), old_value={"address": str(ip.address), "status": ip.status}))
-    await db.delete(ip)
-    await db.flush()
-    await _update_utilization(db, subnet_id)
+    subnet = await db.get(Subnet, ip.subnet_id)
+    if permanent:
+        subnet_id = ip.subnet_id
+        db.add(_audit(current_user, "delete", "ip_address", str(ip.id),
+                      str(ip.address), old_value={"address": str(ip.address), "status": ip.status}))
+        await db.delete(ip)
+        await db.flush()
+        await _update_utilization(db, subnet_id)
+        if subnet:
+            await _update_block_utilization(db, subnet.block_id)
+    else:
+        # Soft-delete: mark as orphan, keep the record
+        old_status = ip.status
+        ip.status = "orphan"
+        db.add(_audit(current_user, "update", "ip_address", str(ip.id),
+                      str(ip.address), old_value={"status": old_status}, new_value={"status": "orphan"}))
+        await db.flush()
+        await _update_utilization(db, ip.subnet_id)
+        if subnet:
+            await _update_block_utilization(db, subnet.block_id)
     await db.commit()
 
 
@@ -886,6 +973,7 @@ async def allocate_next_ip(
                   str(chosen), new_value={**body.model_dump(), "address": str(chosen)}))
     await db.flush()
     await _update_utilization(db, subnet_id)
+    await _update_block_utilization(db, subnet.block_id)
     await db.commit()
     await db.refresh(ip)
     logger.info("ip_allocated", ip_id=str(ip.id), address=str(chosen),

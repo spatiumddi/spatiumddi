@@ -10,6 +10,7 @@ from app.core.security import (
     create_access_token,
     create_refresh_token,
     hash_password,
+    hash_refresh_token,
     verify_password,
 )
 from app.models.audit import AuditLog
@@ -99,6 +100,57 @@ async def login(body: LoginRequest, request: Request, db: DB) -> TokenResponse:
     await db.commit()
 
     logger.info("login_success", user_id=str(user.id), username=user.username)
+    return TokenResponse(
+        access_token=access_token,
+        refresh_token=raw_refresh,
+        force_password_change=user.force_password_change,
+    )
+
+
+class RefreshRequest(BaseModel):
+    refresh_token: str
+
+
+@router.post("/refresh", response_model=TokenResponse)
+async def refresh_token_endpoint(body: RefreshRequest, db: DB) -> TokenResponse:
+    """Exchange a valid refresh token for a new access token (with token rotation)."""
+    from datetime import UTC, datetime, timedelta
+
+    from app.config import settings
+
+    token_hash = hash_refresh_token(body.refresh_token)
+
+    result = await db.execute(
+        select(UserSession)
+        .where(UserSession.refresh_token_hash == token_hash)
+        .where(UserSession.revoked.is_(False))
+        .where(UserSession.expires_at > datetime.now(UTC))
+    )
+    session = result.scalar_one_or_none()
+    if session is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired refresh token")
+
+    user = await db.get(User, session.user_id)
+    if user is None or not user.is_active:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found or inactive")
+
+    # Rotate: revoke old session, issue new tokens
+    session.revoked = True
+    access_token = create_access_token(str(user.id))
+    raw_refresh, refresh_hash = create_refresh_token(str(user.id))
+
+    new_session = UserSession(
+        user_id=user.id,
+        refresh_token_hash=refresh_hash,
+        source_ip=session.source_ip,
+        user_agent=session.user_agent,
+        created_at=datetime.now(UTC),
+        expires_at=datetime.now(UTC) + timedelta(days=settings.refresh_token_expire_days),
+    )
+    db.add(new_session)
+    await db.commit()
+
+    logger.info("token_refreshed", user_id=str(user.id))
     return TokenResponse(
         access_token=access_token,
         refresh_token=raw_refresh,

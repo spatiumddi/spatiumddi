@@ -97,8 +97,8 @@ class Subnet(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     space_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("ip_space.id", ondelete="RESTRICT"), nullable=False, index=True
     )
-    block_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("ip_block.id", ondelete="SET NULL"), nullable=True
+    block_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("ip_block.id", ondelete="RESTRICT"), nullable=False
     )
     router_zone_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("router_zone.id", ondelete="SET NULL"), nullable=True

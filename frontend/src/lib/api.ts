@@ -17,14 +17,50 @@ function createClient(): AxiosInstance {
     return config;
   });
 
-  // On 401, clear auth and redirect to login
+  // On 401, attempt token refresh once then redirect to login
+  let isRefreshing = false;
+  let refreshQueue: Array<(token: string) => void> = [];
+
   client.interceptors.response.use(
     (res) => res,
-    (err: AxiosError) => {
-      if (err.response?.status === 401) {
-        localStorage.removeItem("access_token");
-        localStorage.removeItem("refresh_token");
-        window.location.href = "/login";
+    async (err: AxiosError) => {
+      const originalRequest = err.config as typeof err.config & { _retry?: boolean };
+      if (err.response?.status === 401 && !originalRequest?._retry) {
+        const refreshToken = localStorage.getItem("refresh_token");
+        if (!refreshToken) {
+          localStorage.removeItem("access_token");
+          window.location.href = "/login";
+          return Promise.reject(err);
+        }
+
+        if (isRefreshing) {
+          return new Promise((resolve) => {
+            refreshQueue.push((token: string) => {
+              if (originalRequest?.headers) originalRequest.headers.Authorization = `Bearer ${token}`;
+              resolve(client(originalRequest!));
+            });
+          });
+        }
+
+        originalRequest._retry = true;
+        isRefreshing = true;
+        try {
+          const res = await client.post("/auth/refresh", { refresh_token: refreshToken });
+          const { access_token, refresh_token: newRefresh } = res.data;
+          localStorage.setItem("access_token", access_token);
+          localStorage.setItem("refresh_token", newRefresh);
+          refreshQueue.forEach((cb) => cb(access_token));
+          refreshQueue = [];
+          if (originalRequest?.headers) originalRequest.headers.Authorization = `Bearer ${access_token}`;
+          return client(originalRequest!);
+        } catch {
+          localStorage.removeItem("access_token");
+          localStorage.removeItem("refresh_token");
+          window.location.href = "/login";
+          return Promise.reject(err);
+        } finally {
+          isRefreshing = false;
+        }
       }
       return Promise.reject(err);
     }
@@ -52,13 +88,14 @@ export interface IPBlock {
   network: string;
   name: string;
   description: string;
+  utilization_percent: number;
   tags: Record<string, unknown>;
 }
 
 export interface Subnet {
   id: string;
   space_id: string;
-  block_id: string | null;
+  block_id: string;
   network: string;
   name: string;
   description: string;
@@ -66,6 +103,7 @@ export interface Subnet {
   vxlan_id: number | null;
   gateway: string | null;
   status: string;
+  skip_auto_addresses?: boolean;
   utilization_percent: number;
   total_ips: number;
   allocated_ips: number;
@@ -113,13 +151,14 @@ export const ipamApi = {
 
   listAddresses: (subnetId: string) =>
     api.get<IPAddress[]>(`/ipam/subnets/${subnetId}/addresses`).then((r) => r.data),
-  createAddress: (data: Partial<IPAddress>) =>
+  createAddress: (data: Partial<IPAddress> & { hostname: string }) =>
     api.post<IPAddress>(`/ipam/subnets/${data.subnet_id}/addresses`, data).then((r) => r.data),
   updateAddress: (id: string, data: Partial<IPAddress>) =>
     api.put<IPAddress>(`/ipam/addresses/${id}`, data).then((r) => r.data),
-  deleteAddress: (id: string) => api.delete(`/ipam/addresses/${id}`),
-  nextAddress: (subnetId: string, data?: { hostname?: string; description?: string }) =>
-    api.post<IPAddress>(`/ipam/subnets/${subnetId}/next`, data ?? {}).then((r) => r.data),
+  deleteAddress: (id: string, permanent = false) =>
+    api.delete(`/ipam/addresses/${id}`, { params: permanent ? { permanent: true } : undefined }),
+  nextAddress: (subnetId: string, data: { hostname: string; status?: string; mac_address?: string; description?: string }) =>
+    api.post<IPAddress>(`/ipam/subnets/${subnetId}/next`, data).then((r) => r.data),
 };
 
 export interface LoginResponse {
@@ -187,10 +226,92 @@ export const auditApi = {
   }) => api.get<AuditLogPage>("/audit", { params }).then((r) => r.data),
 };
 
+// ── Search ─────────────────────────────────────────────────────────────────────
+
+export interface SearchResult {
+  type: "ip_address" | "subnet" | "block" | "space";
+  id: string;
+  display: string;
+  name: string | null;
+  status: string | null;
+  description: string | null;
+  hostname: string | null;
+  mac_address: string | null;
+  subnet_id: string | null;
+  subnet_network: string | null;
+  block_id: string | null;
+  space_id: string | null;
+  space_name: string | null;
+}
+
+export interface SearchResponse {
+  query: string;
+  total: number;
+  results: SearchResult[];
+}
+
+export const searchApi = {
+  search: (q: string, types?: string, limit = 25) =>
+    api
+      .get<SearchResponse>("/search", { params: { q, types, limit } })
+      .then((r) => r.data),
+};
+
+// ── Settings ───────────────────────────────────────────────────────────────────
+
+export interface PlatformSettings {
+  app_title: string;
+  ip_allocation_strategy: string;
+  session_timeout_minutes: number;
+  auto_logout_minutes: number;
+  utilization_warn_threshold: number;
+  utilization_critical_threshold: number;
+  subnet_tree_default_expanded_depth: number;
+  discovery_scan_enabled: boolean;
+  discovery_scan_interval_minutes: number;
+  github_release_check_enabled: boolean;
+}
+
+export const settingsApi = {
+  get: () => api.get<PlatformSettings>("/settings").then((r) => r.data),
+  update: (data: Partial<PlatformSettings>) =>
+    api.put<PlatformSettings>("/settings", data).then((r) => r.data),
+};
+
+// ── Custom Fields ──────────────────────────────────────────────────────────────
+
+export interface CustomField {
+  id: string;
+  resource_type: string;
+  name: string;
+  label: string;
+  field_type: string;
+  options: string[] | null;
+  is_required: boolean;
+  is_searchable: boolean;
+  default_value: string | null;
+  display_order: number;
+  description: string;
+}
+
+export const customFieldsApi = {
+  list: (resource_type?: string) =>
+    api
+      .get<CustomField[]>("/custom-fields", { params: resource_type ? { resource_type } : undefined })
+      .then((r) => r.data),
+  create: (data: Omit<CustomField, "id">) =>
+    api.post<CustomField>("/custom-fields", data).then((r) => r.data),
+  update: (id: string, data: Partial<Omit<CustomField, "id" | "resource_type" | "name" | "field_type">>) =>
+    api.put<CustomField>(`/custom-fields/${id}`, data).then((r) => r.data),
+  delete: (id: string) => api.delete(`/custom-fields/${id}`),
+};
+
 export const authApi = {
   login: (username: string, password: string) =>
     api.post<LoginResponse>("/auth/login", { username, password }).then((r) => r.data),
   logout: () => api.post("/auth/logout"),
+  refresh: (refreshToken: string) =>
+    api.post<LoginResponse>("/auth/refresh", { refresh_token: refreshToken }).then((r) => r.data),
   changePassword: (currentPassword: string, newPassword: string) =>
     api.post("/auth/change-password", {
       current_password: currentPassword,

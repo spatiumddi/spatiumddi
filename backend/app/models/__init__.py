@@ -10,6 +10,7 @@ from app.models.ipam import (
     Subnet,
     VLANMapping,
 )
+from app.models.settings import PlatformSettings
 
 __all__ = [
     "Base",
@@ -27,4 +28,5 @@ __all__ = [
     "IPAddress",
     "CustomFieldDefinition",
     "VLANMapping",
+    "PlatformSettings",
 ]

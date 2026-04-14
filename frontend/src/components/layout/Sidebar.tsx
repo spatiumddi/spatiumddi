@@ -3,6 +3,7 @@ import { NavLink } from "react-router-dom";
 import {
   Network, Globe, LayoutDashboard, Server, Clock,
   Github, Users, ClipboardList, ChevronsLeft, ChevronsRight,
+  Settings, Tags,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import logoIcon from "@/assets/logo-icon.svg";
@@ -16,8 +17,10 @@ const mainNav = [
 ];
 
 const adminNav = [
-  { label: "Users", icon: Users, to: "/admin/users" },
-  { label: "Audit Log", icon: ClipboardList, to: "/admin/audit" },
+  { label: "Users",         icon: Users,         to: "/admin/users" },
+  { label: "Audit Log",     icon: ClipboardList, to: "/admin/audit" },
+  { label: "Custom Fields", icon: Tags,          to: "/admin/custom-fields" },
+  { label: "Settings",      icon: Settings,      to: "/settings" },
 ];
 
 function NavItem({

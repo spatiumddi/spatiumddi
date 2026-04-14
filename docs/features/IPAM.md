@@ -477,37 +477,22 @@ Items marked ✅ are implemented. Remaining items are planned but not yet built.
 - **Subnet**: pencil icon on subnet row (hover) and in detail panel header → edit modal (name, description, gateway, VLAN ID, status).
 - **IP Address**: pencil icon on each address row → edit modal (hostname, description, MAC, status). `network` and `broadcast` rows are not editable.
 
-### 14.3 Table View as Default; Tree View as Optional
+### ✅ 14.3 Space Tree-Table View
 
-The current default view is a left-panel tree (Space → Subnet) with the subnet IP list on the right. The preferred UX is:
+**Implemented.** Clicking an IP Space in the left tree now shows a hierarchical flat table in the right panel. The table renders all blocks and subnets in the space in order, with depth-based indentation showing the tree structure. Block rows use a violet `Layers` icon and appear with a subtle background; subnet rows use a blue `Network` icon. Columns: Network, Name, VLAN, Used IPs, Utilization bar, Size (total IPs), Status. Clicking a block row navigates to `BlockDetailView`; clicking a subnet row opens the subnet IP address list.
 
-**Default view: table listing**
-- Clicking an IP Space in the left tree navigates to a full-width table listing all subnets in that space
-- Clicking a subnet row in that table navigates into the subnet IP address list
-- Breadcrumbs at the top track the navigation path: `IP Spaces > Corporate > 10.0.2.0/24`
-- Users can navigate backwards via breadcrumb links
+### ✅ 14.4 Blocks vs Subnets Distinction in Create Flow
 
-**Optional tree view**
-- A toggle button (table icon / tree icon) in the panel header switches between the flat table view and the current split-pane tree view
-- The preference is persisted to `localStorage`
+**Implemented.** Separate "Add block" (Layers icon) and "Add subnet" (+ icon) buttons appear on the space header and on each block row. `CreateBlockModal` has no gateway/VLAN/DHCP fields. Blocks appear with a `Layers` icon; subnets with a `Network` icon throughout the tree and table views.
 
-### 14.4 Blocks vs Subnets Distinction in Create Flow
+### ✅ 14.5 Breadcrumbs as Colored Pills
 
-When adding a network range inside an IP Space, the user should choose between:
-- **Block**: an aggregate/supernet range used for organizational grouping only — no IP addresses can be directly assigned to a block. Displayed with a distinct icon in the tree (e.g., folder-like).
-- **Subnet**: a routable network range where individual IP addresses are managed. Displayed with the current network icon.
+**Implemented.** A `BreadcrumbPills` component renders clickable colored pills above all detail panels:
+- **Blue pill** = IP Space (navigates to space tree-table)
+- **Violet pill** = Block or ancestor blocks (navigates to `BlockDetailView`)
+- **Emerald pill** = current Subnet (non-interactive, marks current position)
 
-The "Create" dialog should present a type selector (`Block` / `Subnet`) at the top, then show the appropriate fields. Blocks do not have gateway, VLAN, or DHCP scope fields.
-
-### 14.5 Breadcrumbs in Table View
-
-When drilling into IP Spaces → Blocks → Subnets in table view, a breadcrumb bar must appear above the table:
-
-```
-IP Spaces > Corporate > 10.0.0.0/8 > 10.1.0.0/16 > Subnets
-```
-
-Each segment is a clickable link that navigates back to that level. The breadcrumb state is reflected in the URL (e.g., `/ipam/spaces/{id}/subnets`) to support deep-linking and browser back/forward.
+When the path is deeper than 4 levels, middle items are compressed to `…`. Pills appear in `SubnetDetail`, `BlockDetailView`, and `SpaceTableView`.
 
 ### ✅ 14.6 Collapsible Left Sidebar
 
@@ -524,19 +509,16 @@ A **Settings** entry should be added to the left sidebar nav, pointing to `/sett
 
 This maps to the `PlatformSettings` singleton model defined in `SYSTEM_ADMIN.md §6`.
 
-### 14.8 Orphaned (Soft-Deleted) IP Addresses
+### ✅ 14.8 Orphaned (Soft-Deleted) IP Addresses
 
-When an IP address is deleted via the UI or API, it should be **soft-deleted** rather than hard-deleted from the database:
+**Implemented** (using status field rather than `deleted_at`). When an IP address is deleted via the UI, `DELETE /ipam/addresses/{id}` sets `status = "orphan"` rather than issuing a SQL DELETE. Orphaned addresses:
+- Appear in the IP list at reduced opacity with an orange "orphan" status badge
+- Show a **Restore** (RefreshCw) button that sets status back to `allocated`
+- Show a **Purge** (Trash) button that permanently deletes after a confirmation modal
+- `DELETE /ipam/addresses/{id}?permanent=true` hard-deletes immediately
 
-- Add `deleted_at: timestamp (nullable)` to the `IPAddress` model
-- A deleted address is excluded from all normal list queries (default `deleted_at IS NULL` filter)
-- If the same IP address (`subnet_id` + `address` combination) is re-created after a soft-delete, the existing record is **restored** (set `deleted_at = NULL`) and the historical hostname, MAC, and description are brought back
-- A separate "Recycle bin" or "Show deleted" toggle in the subnet IP list reveals soft-deleted addresses
-- Addresses in `deleted` state do not count toward utilization
-- Hard-delete (permanent) is available to superadmins only via a separate confirmation
+Note: the current implementation uses `status = "orphan"` instead of a `deleted_at` column. The spec's "Show deleted toggle" and "recycle bin" concept can be revisited in a future density pass.
 
-Implementation note: the `DELETE /ipam/addresses/{id}` endpoint should set `deleted_at` instead of issuing a SQL `DELETE`. A separate `POST /ipam/addresses/{id}/restore` endpoint un-deletes. The `POST /ipam/subnets/{id}/next` allocator must check `deleted_at IS NULL` when scanning for available IPs.
+### ✅ 14.9 IP Space Table View (Click-Through)
 
-### 14.9 IP Space Table View (Click-Through)
-
-Clicking on an IP Space in the left tree should navigate to a table view (right pane) that lists all subnets in that space — not just expand the tree. The table should show network, name, gateway, VLAN, status, allocated/total, and utilization bar. Clicking a subnet row in this table opens the subnet IP address detail (current right-pane view). This becomes the primary navigation flow (see §14.3).
+**Implemented.** See §14.3 above. The space view now shows a hierarchical tree-table with both blocks and subnets, not just subnets.

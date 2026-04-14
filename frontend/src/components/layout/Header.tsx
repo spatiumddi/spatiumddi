@@ -2,6 +2,7 @@ import { useAuth } from "@/hooks/useAuth";
 import { useTheme } from "@/hooks/useTheme";
 import { useNavigate } from "react-router-dom";
 import { LogOut, Moon, Sun } from "lucide-react";
+import { GlobalSearch } from "@/components/GlobalSearch";
 
 export function Header() {
   const { logout } = useAuth();
@@ -14,7 +15,8 @@ export function Header() {
   }
 
   return (
-    <header className="flex h-14 items-center justify-end border-b bg-card px-6">
+    <header className="flex h-14 items-center justify-between border-b bg-card px-6">
+      <GlobalSearch />
       <div className="flex items-center gap-1">
         <button
           onClick={toggleTheme}

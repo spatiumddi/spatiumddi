@@ -106,22 +106,48 @@ These rules apply to every file Claude Code generates. No exceptions.
 - ✅ Local auth: login, logout, JWT tokens, forced password change
 - ✅ User management API (`/api/v1/users/`): create, edit, reset password, delete (superadmin only)
 - ✅ Audit log table (written on every mutation)
-- ✅ IPAM tree view UI (Space → Subnet → IP address, collapsible sidebar)
-- ✅ Full CRUD UI for spaces, subnets, IP addresses with edit/delete modals
+- ✅ IPAM tree view UI (Space → Block → Subnet → IP address, collapsible sidebar)
+- ✅ Full CRUD UI for spaces, blocks, subnets, IP addresses with edit/delete modals
 - ✅ Dashboard with utilization stats and top-subnets table
 - ✅ Users admin page
 - ✅ Audit log viewer UI (`/admin/audit`) — paginated table, action/result badges, filters
 - ✅ Utilization dots on subnet tree rows (green/amber/red)
 - ✅ Copy-to-clipboard on IP address column
+- ✅ Subnet CIDR strict validation — rejects host-bits-set input with "Did you mean X?" hint
+- ✅ Subnet creation `skip_auto_addresses` flag — skips network/broadcast/gateway records (loopbacks, P2P)
+- ✅ IP allocation form: hostname required, MAC address field, status/type selector for all modes
+- ✅ Soft-delete IP addresses — DELETE marks as `orphan`; purge button permanently removes
+- ✅ JWT token refresh endpoint (`POST /api/v1/auth/refresh`) with token rotation; frontend auto-retries on 401
+- ✅ UI density pass — base font 14 px
+- ✅ Delete IP address confirmation modal (soft-delete → orphan, with separate purge confirmation)
+- ✅ Restore orphaned IPs — RefreshCw button sets status back to `allocated`
+- ✅ Blocks required for subnets — `block_id` is now non-nullable; subnets must belong to a block
+- ✅ Nested blocks (blocks within blocks) — full recursive tree; `parent_block_id` supported at API and UI
+- ✅ Block click navigation — clicking a block in the tree opens `BlockDetailView` (child blocks table + direct subnets table)
+- ✅ Space tree-table view — clicking an IP Space shows all blocks and subnets in a hierarchical flat table with indentation, icons, size/utilization columns; blocks are violet, subnets are blue
+- ✅ Breadcrumbs as colored pills — Space = blue, Block = violet, Subnet = emerald; all levels clickable; compresses to `first > … > last two` when > 4 levels deep
+- ✅ Tree toggles as boxed `[+]`/`[-]` buttons — replaces chevron arrows; vertical `border-l` connecting lines show tree structure
+- ✅ Block detail tree-table — clicking a block shows the same hierarchical tree-table as the space view, scoped to that block's subtree; uses the same columns and rendering
+- ✅ Breadcrumb pill labels show `network (name)` format — e.g. `10.0.0.0/8 (rfc1918)` when a name is set; subnet pill also includes name
 
 ### Phase 1 — Remaining
 
 - ⬜ LDAP / OIDC authentication
 - ⬜ Group-based RBAC enforcement on API routes
-- ⬜ Settings page (`/settings`) — `PlatformSettings` singleton
-- ⬜ Table view + breadcrumbs for IPAM (see `docs/features/IPAM.md §14.3–14.5`)
-- ⬜ Block vs Subnet distinction in create flow (see `docs/features/IPAM.md §14.4`)
-- ⬜ Soft-delete (orphaned) IP addresses (see `docs/features/IPAM.md §14.8`)
+- ⬜ Settings page (`/settings`) — `PlatformSettings` singleton; default allocation strategy, session timeout, utilization thresholds
+- ⬜ IP search — global search across addresses/subnets/blocks by IP, hostname, MAC, custom field (see `docs/features/IPAM.md §10`)
+- ✅ Block utilization rollup — `_update_block_utilization()` in `ipam/router.py` uses a recursive CTE to sum allocated IPs from all descendant subnets; walks ancestor chain after every subnet/address mutation
+- ⬜ Custom field definitions UI — admin can define `CustomFieldDefinition` records; shown on subnet + IP address forms (see `docs/features/IPAM.md §6`)
+- ⬜ Full IPv6 support in IPAM (address storage, CIDR validation, UI rendering)
+- ⬜ Mobile-responsive UI
+
+### Future Phases — Tracked Items
+
+- ⬜ Windows DNS / DHCP server integration — read-only visibility and basic management of existing Windows Server DNS/DHCP via WinRM or REST (see `docs/features/DNS.md`, `docs/features/DHCP.md`)
+- ⬜ IP discovery — ping sweep + ARP scan Celery task; flags `discovered` status; reconciliation report (see `docs/features/IPAM.md §8`)
+- ⬜ Import/export — CSV/JSON/Excel subnet import with dry-run preview; export a block/space (see `docs/features/IPAM.md §7`)
+- ⬜ OUI/vendor lookup — IEEE OUI database loaded into `oui_vendor` table; shown next to MAC addresses (see `docs/features/IPAM.md §12`)
+- ⬜ SNMP polling / network device management — ARP table polling for IP discovery (see `docs/features/IPAM.md §13`)
 
 ---
 

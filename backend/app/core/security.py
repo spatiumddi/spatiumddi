@@ -65,5 +65,9 @@ def hash_api_token(raw: str) -> str:
     return _hash_token(raw)
 
 
+def hash_refresh_token(raw: str) -> str:
+    return _hash_token(raw)
+
+
 def _hash_token(raw: str) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()
