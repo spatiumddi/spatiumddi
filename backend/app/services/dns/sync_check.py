@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import ipaddress
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -199,7 +200,7 @@ async def compute_space_dns_drift(db: AsyncSession, space_id: uuid.UUID) -> Drif
     return await _aggregate(db, sn_ids)
 
 
-async def _aggregate(db: AsyncSession, subnet_ids: list[uuid.UUID]) -> DriftReport:
+async def _aggregate(db: AsyncSession, subnet_ids: Sequence[uuid.UUID]) -> DriftReport:
     agg = DriftReport(
         subnet_id=uuid.UUID(int=0),
         forward_zone_id=None,

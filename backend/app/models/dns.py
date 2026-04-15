@@ -29,7 +29,7 @@ class DNSServerGroup(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     name: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
     description: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    # type: internal | external | dmz | custom
+    # group_type values: internal | external | dmz | custom
     group_type: Mapped[str] = mapped_column(String(50), nullable=False, default="internal")
     default_view: Mapped[str | None] = mapped_column(String(255), nullable=True)
     is_recursive: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
@@ -327,7 +327,7 @@ class DNSZone(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
     # name: FQDN with trailing dot, e.g. "example.com."
     name: Mapped[str] = mapped_column(String(255), nullable=False)
-    # type: primary | secondary | stub | forward
+    # zone_type values: primary | secondary | stub | forward
     zone_type: Mapped[str] = mapped_column(String(20), nullable=False, default="primary")
     # kind: forward | reverse
     kind: Mapped[str] = mapped_column(String(10), nullable=False, default="forward")
@@ -385,7 +385,7 @@ class DNSRecord(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     # fqdn: computed + stored for search
     fqdn: Mapped[str] = mapped_column(String(511), nullable=False, default="")
-    # type: A | AAAA | CNAME | MX | TXT | NS | PTR | SRV | CAA | TLSA | SSHFP | NAPTR | LOC
+    # record_type values: A | AAAA | CNAME | MX | TXT | NS | PTR | SRV | CAA | TLSA | SSHFP | NAPTR | LOC
     record_type: Mapped[str] = mapped_column(String(10), nullable=False)
     value: Mapped[str] = mapped_column(Text, nullable=False)
     ttl: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -516,7 +516,7 @@ class DNSBlockListEntry(UUIDPrimaryKeyMixin, Base):
         index=True,
     )
     domain: Mapped[str] = mapped_column(String(512), nullable=False)
-    # type: block | redirect | nxdomain
+    # block_mode values: block | redirect | nxdomain
     entry_type: Mapped[str] = mapped_column(String(20), nullable=False, default="block")
     # target: for redirect entries, the IP/hostname to return instead
     target: Mapped[str | None] = mapped_column(String(512), nullable=True)

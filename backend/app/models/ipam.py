@@ -45,7 +45,7 @@ class RouterZone(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     description: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    # type: site | vrf_lite | mpls_domain | data_center | custom
+    # zone_type values: site | vrf_lite | mpls_domain | data_center | custom
     zone_type: Mapped[str] = mapped_column(String(50), nullable=False, default="site")
     parent_zone_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("router_zone.id", ondelete="SET NULL"), nullable=True

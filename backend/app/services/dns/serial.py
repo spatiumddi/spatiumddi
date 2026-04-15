@@ -9,6 +9,10 @@ as wrap-around, which breaks AXFR/IXFR.
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from app.models.dns import DNSZone
 
 
 def compute_next_serial(current: int, *, now: datetime | None = None) -> int:
@@ -43,7 +47,7 @@ def compute_next_serial(current: int, *, now: datetime | None = None) -> int:
     return current + 1
 
 
-def bump_zone_serial(zone: DNSZone, *, now: datetime | None = None) -> int:  # noqa: F821
+def bump_zone_serial(zone: DNSZone, *, now: datetime | None = None) -> int:
     """Mutate ``zone.last_serial`` to the next serial and return it.
 
     Forward reference is used to keep this module import-cheap (no ORM
