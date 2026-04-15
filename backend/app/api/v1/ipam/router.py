@@ -735,7 +735,7 @@ class SubnetResponse(BaseModel):
                     "vlan": {
                         "id": vref.id,
                         "router_id": vref.router_id,
-                        "router_name": None,
+                        "router_name": getattr(getattr(vref, "router", None), "name", None),
                         "vlan_id": vref.vlan_id,
                         "name": vref.name,
                     },
@@ -1554,15 +1554,18 @@ async def update_subnet(
         "vlan_id": subnet.vlan_id,
         "vlan_ref_id": str(subnet.vlan_ref_id) if subnet.vlan_ref_id else None,
     }
-    changes = body.model_dump(
-        exclude_none=True,
-        exclude={
-            "manage_auto_addresses",
-            "dns_group_ids",
-            "dns_zone_id",
-            "dns_additional_zone_ids",
-            "dns_inherit_settings",
-        },
+    # setattr uses the raw Python values (UUID stays a UUID for the FK);
+    # the audit log needs a JSON-safe projection so uuid.UUID → str.
+    exclude_fields = {
+        "manage_auto_addresses",
+        "dns_group_ids",
+        "dns_zone_id",
+        "dns_additional_zone_ids",
+        "dns_inherit_settings",
+    }
+    changes = body.model_dump(exclude_none=True, exclude=exclude_fields)
+    changes_for_audit = body.model_dump(
+        mode="json", exclude_none=True, exclude=exclude_fields
     )
     for field, value in changes.items():
         setattr(subnet, field, value)
@@ -1624,7 +1627,7 @@ async def update_subnet(
             str(subnet.id),
             f"{subnet.network} ({subnet.name})",
             old_value=old,
-            new_value=changes,
+            new_value=changes_for_audit,
         )
     )
     await db.flush()
@@ -2101,7 +2104,7 @@ async def create_address(
             "ip_address",
             str(ip.id),
             body.address,
-            new_value=body.model_dump(exclude={"dns_zone_id"}),
+            new_value=body.model_dump(mode="json", exclude={"dns_zone_id"}),
         )
     )
     await db.flush()
@@ -2147,6 +2150,9 @@ async def update_address(
     }
     old_status = ip.status
     changes = body.model_dump(exclude_none=True, exclude={"dns_zone_id"})
+    changes_for_audit = body.model_dump(
+        mode="json", exclude_none=True, exclude={"dns_zone_id"}
+    )
     for field, value in changes.items():
         setattr(ip, field, value)
 
@@ -2175,7 +2181,7 @@ async def update_address(
             str(ip.id),
             str(ip.address),
             old_value=old,
-            new_value=changes,
+            new_value=changes_for_audit,
         )
     )
 
@@ -2331,7 +2337,7 @@ async def allocate_next_ip(
             "ip_address",
             str(ip.id),
             str(chosen),
-            new_value={**body.model_dump(exclude={"dns_zone_id"}), "address": str(chosen)},
+            new_value={**body.model_dump(mode="json", exclude={"dns_zone_id"}), "address": str(chosen)},
         )
     )
     await db.flush()

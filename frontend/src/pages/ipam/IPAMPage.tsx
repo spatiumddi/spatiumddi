@@ -862,6 +862,8 @@ function CreateSubnetModal({
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["subnets", spaceId] });
       qc.invalidateQueries({ queryKey: ["spaces"] });
+      // Refresh the VLAN detail page's "Subnets using this VLAN" list
+      qc.invalidateQueries({ queryKey: ["subnets-by-vlan"] });
       onClose();
     },
     onError: (err: unknown) => {
@@ -1625,12 +1627,33 @@ function SubnetDetail({
               </span>
             </div>
           )}
-          {subnet.vlan_id != null && (
+          {subnet.vlan?.router_name && (
             <div className="flex items-center gap-1.5">
-              <span className="text-xs text-muted-foreground">VLAN</span>
-              <span className="text-xs font-medium">{subnet.vlan_id}</span>
+              <span className="text-xs text-muted-foreground">Router</span>
+              <span className="text-xs font-medium">{subnet.vlan.router_name}</span>
             </div>
           )}
+          {subnet.vlan ? (
+            <div className="flex items-center gap-1.5">
+              <span className="text-xs text-muted-foreground">VLAN</span>
+              <span className="text-xs font-medium">
+                {subnet.vlan.vlan_id}
+                {subnet.vlan.name && (
+                  <span className="ml-1 text-muted-foreground">({subnet.vlan.name})</span>
+                )}
+              </span>
+            </div>
+          ) : subnet.vlan_id != null ? (
+            <div className="flex items-center gap-1.5">
+              <span className="text-xs text-muted-foreground">VLAN</span>
+              <span
+                className="text-xs font-medium"
+                title="Legacy tag — assign a Router/VLAN from the Edit modal to manage"
+              >
+                {subnet.vlan_id}
+              </span>
+            </div>
+          ) : null}
           <div className="flex items-center gap-1.5">
             <span className="text-xs text-muted-foreground">Total IPs</span>
             <span className="text-xs font-medium">{subnet.total_ips}</span>
@@ -2621,6 +2644,8 @@ function EditSubnetModal({
       qc.invalidateQueries({ queryKey: ["subnets", subnet.space_id] });
       // Invalidate addresses so network/broadcast changes are reflected immediately
       qc.invalidateQueries({ queryKey: ["addresses", subnet.id] });
+      // Refresh "Subnets using this VLAN" lists on the VLANs page
+      qc.invalidateQueries({ queryKey: ["subnets-by-vlan"] });
       onClose(updated);
     },
     onError: (err: unknown) => {
@@ -4063,6 +4088,7 @@ function BlockDetailView({
   const [blockFilter, setBlockFilter] = useState({
     network: "",
     name: "",
+    router: "",
     vlan: "",
     status: "",
   });
@@ -4338,8 +4364,20 @@ function BlockDetailView({
                 )
                   return false;
                 if (
+                  blockFilter.router &&
+                  !(s.vlan?.router_name ?? "")
+                    .toLowerCase()
+                    .includes(blockFilter.router.toLowerCase())
+                )
+                  return false;
+                if (
                   blockFilter.vlan &&
-                  !String(s.vlan_id ?? "").includes(blockFilter.vlan)
+                  !(
+                    String(s.vlan_id ?? "").includes(blockFilter.vlan) ||
+                    (s.vlan?.name ?? "")
+                      .toLowerCase()
+                      .includes(blockFilter.vlan.toLowerCase())
+                  )
                 )
                   return false;
                 if (blockFilter.status && s.status !== blockFilter.status)
@@ -4393,6 +4431,7 @@ function BlockDetailView({
                     [
                       "Network",
                       "Name",
+                      "Router",
                       "VLAN",
                       "Used IPs",
                       "Utilization",
@@ -4405,11 +4444,13 @@ function BlockDetailView({
                         ? "network"
                         : col === "Name"
                           ? "name"
-                          : col === "VLAN"
-                            ? "vlan"
-                            : col === "Status"
-                              ? "status"
-                              : null;
+                          : col === "Router"
+                            ? "router"
+                            : col === "VLAN"
+                              ? "vlan"
+                              : col === "Status"
+                                ? "status"
+                                : null;
                     const hasFilter = filterKey
                       ? !!blockFilter[filterKey as keyof typeof blockFilter]
                       : false;
@@ -4460,6 +4501,7 @@ function BlockDetailView({
                           setBlockFilter({
                             network: "",
                             name: "",
+                            router: "",
                             vlan: "",
                             status: "",
                           })
@@ -4479,6 +4521,7 @@ function BlockDetailView({
                       [
                         "Network",
                         "Name",
+                        "Router",
                         "VLAN",
                         "Used IPs",
                         "Utilization",
@@ -4491,11 +4534,13 @@ function BlockDetailView({
                           ? "network"
                           : col === "Name"
                             ? "name"
-                            : col === "VLAN"
-                              ? "vlan"
-                              : col === "Status"
-                                ? "status"
-                                : null;
+                            : col === "Router"
+                              ? "router"
+                              : col === "VLAN"
+                                ? "vlan"
+                                : col === "Status"
+                                  ? "status"
+                                  : null;
                       if (!filterKey) return <td key={col} />;
                       if (filterKey === "status") {
                         return (
@@ -4583,6 +4628,9 @@ function BlockDetailView({
                         <td className="px-4 py-2 text-muted-foreground/40">
                           —
                         </td>
+                        <td className="px-4 py-2 text-muted-foreground/40">
+                          —
+                        </td>
                         <td className="px-4 py-2">
                           {b.utilization_percent > 0 ? (
                             <UtilizationBar percent={b.utilization_percent} />
@@ -4652,7 +4700,28 @@ function BlockDetailView({
                           )}
                         </td>
                         <td className="px-4 py-2 text-muted-foreground">
-                          {s.vlan_id ?? (
+                          {s.vlan?.router_name ?? (
+                            <span className="text-muted-foreground/40">—</span>
+                          )}
+                        </td>
+                        <td className="px-4 py-2 text-muted-foreground">
+                          {s.vlan ? (
+                            <span>
+                              {s.vlan.vlan_id}
+                              {s.vlan.name && (
+                                <span className="ml-1 text-muted-foreground/70">
+                                  ({s.vlan.name})
+                                </span>
+                              )}
+                            </span>
+                          ) : s.vlan_id != null ? (
+                            <span
+                              className="text-muted-foreground/70"
+                              title="Legacy tag — assign a Router/VLAN from the Edit modal"
+                            >
+                              {s.vlan_id}
+                            </span>
+                          ) : (
                             <span className="text-muted-foreground/40">—</span>
                           )}
                         </td>
@@ -4770,6 +4839,7 @@ function SpaceTableView({
   const [spaceFilter, setSpaceFilter] = useState({
     network: "",
     name: "",
+    router: "",
     vlan: "",
     status: "",
   });
@@ -4826,8 +4896,20 @@ function SpaceTableView({
           )
             return false;
           if (
+            spaceFilter.router &&
+            !(s.vlan?.router_name ?? "")
+              .toLowerCase()
+              .includes(spaceFilter.router.toLowerCase())
+          )
+            return false;
+          if (
             spaceFilter.vlan &&
-            !String(s.vlan_id ?? "").includes(spaceFilter.vlan)
+            !(
+              String(s.vlan_id ?? "").includes(spaceFilter.vlan) ||
+              (s.vlan?.name ?? "")
+                .toLowerCase()
+                .includes(spaceFilter.vlan.toLowerCase())
+            )
           )
             return false;
           if (spaceFilter.status && s.status !== spaceFilter.status)
@@ -4934,6 +5016,7 @@ function SpaceTableView({
                   [
                     "Network",
                     "Name",
+                    "Router",
                     "VLAN",
                     "Used IPs",
                     "Utilization",
@@ -4946,11 +5029,13 @@ function SpaceTableView({
                       ? "network"
                       : col === "Name"
                         ? "name"
-                        : col === "VLAN"
-                          ? "vlan"
-                          : col === "Status"
-                            ? "status"
-                            : null;
+                        : col === "Router"
+                          ? "router"
+                          : col === "VLAN"
+                            ? "vlan"
+                            : col === "Status"
+                              ? "status"
+                              : null;
                   const hasFilter = filterKey
                     ? !!spaceFilter[filterKey as keyof typeof spaceFilter]
                     : false;
@@ -5000,6 +5085,7 @@ function SpaceTableView({
                         setSpaceFilter({
                           network: "",
                           name: "",
+                          router: "",
                           vlan: "",
                           status: "",
                         })
@@ -5019,6 +5105,7 @@ function SpaceTableView({
                     [
                       "Network",
                       "Name",
+                      "Router",
                       "VLAN",
                       "Used IPs",
                       "Utilization",
@@ -5031,11 +5118,13 @@ function SpaceTableView({
                         ? "network"
                         : col === "Name"
                           ? "name"
-                          : col === "VLAN"
-                            ? "vlan"
-                            : col === "Status"
-                              ? "status"
-                              : null;
+                          : col === "Router"
+                            ? "router"
+                            : col === "VLAN"
+                              ? "vlan"
+                              : col === "Status"
+                                ? "status"
+                                : null;
                     if (!filterKey) return <td key={col} />;
                     if (filterKey === "status") {
                       return (
@@ -5115,6 +5204,7 @@ function SpaceTableView({
                       </td>
                       <td className="px-4 py-2 text-muted-foreground/40">—</td>
                       <td className="px-4 py-2 text-muted-foreground/40">—</td>
+                      <td className="px-4 py-2 text-muted-foreground/40">—</td>
                       <td className="px-4 py-2">
                         {b.utilization_percent > 0 ? (
                           <UtilizationBar percent={b.utilization_percent} />
@@ -5171,7 +5261,28 @@ function SpaceTableView({
                         )}
                       </td>
                       <td className="px-4 py-2 text-muted-foreground">
-                        {s.vlan_id ?? (
+                        {s.vlan?.router_name ?? (
+                          <span className="text-muted-foreground/40">—</span>
+                        )}
+                      </td>
+                      <td className="px-4 py-2 text-muted-foreground">
+                        {s.vlan ? (
+                          <span>
+                            {s.vlan.vlan_id}
+                            {s.vlan.name && (
+                              <span className="ml-1 text-muted-foreground/70">
+                                ({s.vlan.name})
+                              </span>
+                            )}
+                          </span>
+                        ) : s.vlan_id != null ? (
+                          <span
+                            className="text-muted-foreground/70"
+                            title="Legacy tag — assign a Router/VLAN from the Edit modal"
+                          >
+                            {s.vlan_id}
+                          </span>
+                        ) : (
                           <span className="text-muted-foreground/40">—</span>
                         )}
                       </td>

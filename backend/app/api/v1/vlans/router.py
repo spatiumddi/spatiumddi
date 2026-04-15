@@ -7,7 +7,7 @@ from typing import Any
 import structlog
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, field_validator
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import DB, CurrentUser
@@ -218,6 +218,24 @@ async def delete_router(router_id: uuid.UUID, current_user: CurrentUser, db: DB)
     r = await db.get(Router, router_id)
     if r is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Router not found")
+    # Block delete if any VLAN under this router still has subnets referencing it.
+    # Deleting the router would CASCADE to the VLANs and SET NULL the subnet
+    # references, silently orphaning operational data — refuse instead and let
+    # the user reassign first.
+    used = await db.scalar(
+        select(func.count(Subnet.id))
+        .join(VLAN, Subnet.vlan_ref_id == VLAN.id)
+        .where(VLAN.router_id == router_id)
+    )
+    if used:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"Cannot delete router '{r.name}': {used} subnet"
+                f"{'s' if used != 1 else ''} still reference VLANs on this router. "
+                "Reassign or clear the VLAN on those subnets first."
+            ),
+        )
     name = r.name
     db.add(
         _audit(
@@ -359,6 +377,18 @@ async def delete_vlan(vlan_id: uuid.UUID, current_user: CurrentUser, db: DB) -> 
     v = await db.get(VLAN, vlan_id)
     if v is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="VLAN not found")
+    used = await db.scalar(
+        select(func.count(Subnet.id)).where(Subnet.vlan_ref_id == vlan_id)
+    )
+    if used:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"Cannot delete VLAN {v.vlan_id} ({v.name}): {used} subnet"
+                f"{'s' if used != 1 else ''} still reference it. "
+                "Reassign or clear the VLAN on those subnets first."
+            ),
+        )
     display = f"VLAN {v.vlan_id} ({v.name})"
     db.add(
         _audit(

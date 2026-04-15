@@ -46,4 +46,6 @@ class VLAN(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[str] = mapped_column(Text, nullable=False, default="")
 
-    router: Mapped[Router] = relationship("Router", back_populates="vlans")
+    # Eager-load the parent Router so SubnetResponse.vlan.router_name can be
+    # filled without an extra round-trip per subnet row.
+    router: Mapped[Router] = relationship("Router", back_populates="vlans", lazy="joined")

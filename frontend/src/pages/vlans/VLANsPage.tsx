@@ -288,12 +288,19 @@ function RouterDetail({
     queryFn: () => vlansApi.listVlans(routerId),
   });
 
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const deleteMut = useMutation({
     mutationFn: () => vlansApi.deleteRouter(routerId),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["vlans", "routers"] });
       qc.invalidateQueries({ queryKey: ["vlans", routerId] });
       onDeleted();
+    },
+    onError: (err: unknown) => {
+      const msg =
+        (err as { response?: { data?: { detail?: string } } })?.response?.data
+          ?.detail ?? "Failed to delete router";
+      setDeleteError(typeof msg === "string" ? msg : JSON.stringify(msg));
     },
   });
 
@@ -389,17 +396,29 @@ function RouterDetail({
       {confirmDelete && (
         <Modal
           title="Delete Router"
-          onClose={() => setConfirmDelete(false)}
+          onClose={() => {
+            setConfirmDelete(false);
+            setDeleteError(null);
+          }}
         >
           <div className="space-y-3">
             <p className="text-sm">
-              Delete <strong>{router.name}</strong>? All VLANs under this
-              router will be deleted; subnets referencing those VLANs will have
-              their VLAN reference cleared (the raw VLAN tag is preserved).
+              Delete <strong>{router.name}</strong>? All {vlans.length} VLAN
+              {vlans.length === 1 ? "" : "s"} under this router will be deleted.
+              Deletion is blocked if any subnet still references a VLAN on this
+              router — reassign those subnets first.
             </p>
+            {deleteError && (
+              <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+                {deleteError}
+              </div>
+            )}
             <div className="flex justify-end gap-2">
               <button
-                onClick={() => setConfirmDelete(false)}
+                onClick={() => {
+                  setConfirmDelete(false);
+                  setDeleteError(null);
+                }}
                 className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
               >
                 Cancel
@@ -465,12 +484,19 @@ function VLANDetail({
     queryFn: () => ipamApi.listSubnets({ vlan_ref_id: vlanId }),
   });
 
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const deleteMut = useMutation({
     mutationFn: () => vlansApi.deleteVlan(vlanId),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["vlans", routerId] });
       qc.invalidateQueries({ queryKey: ["subnets-by-vlan", vlanId] });
       onDeleted();
+    },
+    onError: (err: unknown) => {
+      const msg =
+        (err as { response?: { data?: { detail?: string } } })?.response?.data
+          ?.detail ?? "Failed to delete VLAN";
+      setDeleteError(typeof msg === "string" ? msg : JSON.stringify(msg));
     },
   });
 
@@ -559,28 +585,61 @@ function VLANDetail({
       {confirmDelete && (
         <Modal
           title="Delete VLAN"
-          onClose={() => setConfirmDelete(false)}
+          onClose={() => {
+            setConfirmDelete(false);
+            setDeleteError(null);
+          }}
         >
           <div className="space-y-3">
-            <p className="text-sm">
-              Delete VLAN <strong>{vlan.vlan_id}</strong> ({vlan.name})?
-              Subnets that reference it will have their VLAN reference
-              cleared. The raw VLAN tag value on each subnet is preserved.
-            </p>
+            {subnets.length > 0 ? (
+              <div className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-sm">
+                <p className="font-medium">
+                  Cannot delete: {subnets.length} subnet
+                  {subnets.length === 1 ? "" : "s"} still reference this VLAN.
+                </p>
+                <p className="mt-1 text-xs text-muted-foreground">
+                  Reassign or clear the VLAN on the subnets below first, then
+                  try again.
+                </p>
+                <ul className="mt-2 max-h-32 list-disc overflow-auto pl-5 text-xs">
+                  {subnets.map((s) => (
+                    <li key={s.id} className="font-mono">
+                      {s.network}
+                      {s.name && (
+                        <span className="text-muted-foreground"> — {s.name}</span>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            ) : (
+              <p className="text-sm">
+                Delete VLAN <strong>{vlan.vlan_id}</strong> ({vlan.name})? No
+                subnets currently reference it.
+              </p>
+            )}
+            {deleteError && (
+              <p className="text-sm text-destructive">{deleteError}</p>
+            )}
             <div className="flex justify-end gap-2">
               <button
-                onClick={() => setConfirmDelete(false)}
+                onClick={() => {
+                  setConfirmDelete(false);
+                  setDeleteError(null);
+                }}
                 className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
               >
-                Cancel
+                {subnets.length > 0 ? "Close" : "Cancel"}
               </button>
-              <button
-                onClick={() => deleteMut.mutate()}
-                disabled={deleteMut.isPending}
-                className="rounded-md bg-destructive px-3 py-1.5 text-sm text-destructive-foreground hover:bg-destructive/90 disabled:opacity-50"
-              >
-                {deleteMut.isPending ? "Deleting…" : "Delete"}
-              </button>
+              {subnets.length === 0 && (
+                <button
+                  onClick={() => deleteMut.mutate()}
+                  disabled={deleteMut.isPending}
+                  className="rounded-md bg-destructive px-3 py-1.5 text-sm text-destructive-foreground hover:bg-destructive/90 disabled:opacity-50"
+                >
+                  {deleteMut.isPending ? "Deleting…" : "Delete"}
+                </button>
+              )}
             </div>
           </div>
         </Modal>
