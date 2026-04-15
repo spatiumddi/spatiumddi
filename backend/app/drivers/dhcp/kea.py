@@ -1,0 +1,184 @@
+"""Kea DHCP driver.
+
+Renders the SpatiumDDI ``ConfigBundle`` into a Kea Dhcp4 JSON config
+structure (see https://kea.readthedocs.io/). The agent container pushes
+that config via the Kea control-agent HTTP API (config-set + config-reload)
+or by writing ``/etc/kea/kea-dhcp4.conf`` + restarting the daemon.
+
+Only a minimal control-channel implementation is included here — heavy
+lifting happens in the agent runtime. The control plane is responsible
+for *shape* (valid JSON) and *auditing*, not daemon transport.
+"""
+
+from __future__ import annotations
+
+import json
+from typing import Any
+
+import structlog
+
+from app.drivers.dhcp.base import (
+    ClientClassDef,
+    ConfigBundle,
+    DHCPDriver,
+    PoolDef,
+    ScopeDef,
+    StaticAssignmentDef,
+)
+
+logger = structlog.get_logger(__name__)
+
+
+# Map of SpatiumDDI option-name → Kea option-data ``name`` and ``space``.
+# Kea accepts standard DHCPv4 options by their IANA names in the default
+# ``dhcp4`` option space.
+_KEA_OPTION_NAMES: dict[str, str] = {
+    "routers": "routers",
+    "dns-servers": "domain-name-servers",
+    "domain-name": "domain-name",
+    "broadcast-address": "broadcast-address",
+    "ntp-servers": "ntp-servers",
+    "tftp-server-name": "tftp-server-name",
+    "bootfile-name": "boot-file-name",
+    "tftp-server-address": "tftp-server-address",
+    "domain-search": "domain-search",
+    "mtu": "interface-mtu",
+    "time-offset": "time-offset",
+}
+
+
+def _render_option_data(options: dict[str, Any]) -> list[dict[str, Any]]:
+    """Translate a {name: value} options map into Kea's ``option-data`` list."""
+    out: list[dict[str, Any]] = []
+    for key, val in options.items():
+        kea_name = _KEA_OPTION_NAMES.get(key, key)
+        if isinstance(val, list):
+            data = ", ".join(str(x) for x in val)
+        else:
+            data = str(val)
+        out.append({"name": kea_name, "data": data})
+    return out
+
+
+def _render_pool(pool: PoolDef) -> dict[str, Any]:
+    # Kea expresses "excluded" / "reserved" pools indirectly via
+    # reservations + pool boundaries. We emit dynamic pools only; excluded
+    # ranges are conveyed to the agent as metadata for boundary splitting.
+    d: dict[str, Any] = {"pool": f"{pool.start_ip} - {pool.end_ip}"}
+    if pool.class_restriction:
+        d["client-class"] = pool.class_restriction
+    if pool.options_override:
+        d["option-data"] = _render_option_data(pool.options_override)
+    return d
+
+
+def _render_reservation(s: StaticAssignmentDef) -> dict[str, Any]:
+    r: dict[str, Any] = {
+        "hw-address": s.mac_address,
+        "ip-address": s.ip_address,
+    }
+    if s.hostname:
+        r["hostname"] = s.hostname
+    if s.client_id:
+        r["client-id"] = s.client_id
+    if s.options_override:
+        r["option-data"] = _render_option_data(s.options_override)
+    return r
+
+
+def _render_scope(scope: ScopeDef) -> dict[str, Any]:
+    dynamic_pools = [p for p in scope.pools if p.pool_type == "dynamic"]
+    out: dict[str, Any] = {
+        "subnet": scope.subnet_cidr,
+        "pools": [_render_pool(p) for p in dynamic_pools],
+        "reservations": [_render_reservation(s) for s in scope.statics],
+        "valid-lifetime": scope.lease_time,
+    }
+    if scope.min_lease_time is not None:
+        out["min-valid-lifetime"] = scope.min_lease_time
+    if scope.max_lease_time is not None:
+        out["max-valid-lifetime"] = scope.max_lease_time
+    if scope.options:
+        out["option-data"] = _render_option_data(scope.options)
+    return out
+
+
+def _render_client_class(c: ClientClassDef) -> dict[str, Any]:
+    d: dict[str, Any] = {"name": c.name}
+    if c.match_expression:
+        d["test"] = c.match_expression
+    if c.options:
+        d["option-data"] = _render_option_data(c.options)
+    return d
+
+
+class KeaDriver(DHCPDriver):
+    """Kea DHCPv4 driver — emits a ``Dhcp4`` JSON config structure."""
+
+    name = "kea"
+
+    def render_config(self, bundle: ConfigBundle) -> str:
+        dhcp4: dict[str, Any] = {
+            "valid-lifetime": bundle.options.lease_time,
+            "interfaces-config": {"interfaces": ["*"]},
+            "lease-database": {
+                "type": "memfile",
+                "persist": True,
+                "name": "/var/lib/kea/kea-leases4.csv",
+            },
+            "subnet4": [_render_scope(s) for s in bundle.scopes if s.is_active],
+            "client-classes": [_render_client_class(c) for c in bundle.client_classes],
+            "option-data": _render_option_data(bundle.options.options),
+        }
+        return json.dumps({"Dhcp4": dhcp4}, indent=2, sort_keys=True)
+
+    async def apply_config(self, server: Any, bundle: ConfigBundle) -> None:
+        logger.info(
+            "kea_apply_config",
+            server_id=str(getattr(server, "id", "?")),
+            etag=bundle.etag,
+        )
+        # Agent-side: POST to Kea control-agent. Control plane just logs +
+        # enqueues; the real call happens in the agent runtime.
+
+    async def reload(self, server: Any) -> None:
+        logger.info("kea_reload", server_id=str(getattr(server, "id", "?")))
+
+    async def restart(self, server: Any) -> None:
+        logger.info("kea_restart", server_id=str(getattr(server, "id", "?")))
+
+    async def get_leases(self, server: Any) -> list[dict[str, Any]]:
+        # Agent pushes leases via /agents/lease-events; control plane read
+        # goes through the lease table, not the driver.
+        return []
+
+    async def health_check(self, server: Any) -> tuple[bool, str]:
+        return True, "ok"
+
+    def validate_config(self, bundle: ConfigBundle) -> tuple[bool, list[str]]:
+        errors: list[str] = []
+        seen_subnets: set[str] = set()
+        for s in bundle.scopes:
+            if s.subnet_cidr in seen_subnets:
+                errors.append(f"duplicate subnet: {s.subnet_cidr}")
+            seen_subnets.add(s.subnet_cidr)
+            for p in s.pools:
+                if not p.start_ip or not p.end_ip:
+                    errors.append(f"pool in {s.subnet_cidr} missing start/end")
+        return (not errors), errors
+
+    def capabilities(self) -> dict[str, Any]:
+        return {
+            "name": "kea",
+            "version": "2.x",
+            "options": sorted(_KEA_OPTION_NAMES.keys()),
+            "features": {
+                "client_classes": True,
+                "reservations": True,
+                "ddns": True,
+                "ha": True,
+            },
+        }
+
+
+__all__ = ["KeaDriver"]

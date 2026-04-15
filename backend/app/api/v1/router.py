@@ -3,6 +3,7 @@ from fastapi import APIRouter
 from app.api.v1.audit.router import router as audit_router
 from app.api.v1.auth.router import router as auth_router
 from app.api.v1.custom_fields.router import router as custom_fields_router
+from app.api.v1.dhcp import router as dhcp_router
 from app.api.v1.dns.agents import router as dns_agents_router
 from app.api.v1.dns.blocklist_router import router as dns_blocklist_router
 from app.api.v1.dns.router import router as dns_router
@@ -19,6 +20,7 @@ api_v1_router.include_router(ipam_router, prefix="/ipam", tags=["ipam"])
 api_v1_router.include_router(dns_router, prefix="/dns", tags=["dns"])
 api_v1_router.include_router(dns_blocklist_router, prefix="/dns", tags=["dns-blocklists"])
 api_v1_router.include_router(dns_agents_router, prefix="/dns", tags=["dns-agents"])
+api_v1_router.include_router(dhcp_router, prefix="/dhcp", tags=["dhcp"])
 api_v1_router.include_router(users_router, prefix="/users", tags=["users"])
 api_v1_router.include_router(audit_router, prefix="/audit", tags=["audit"])
 api_v1_router.include_router(search_router, prefix="/search", tags=["search"])
