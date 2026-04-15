@@ -161,6 +161,10 @@ async def test_commit_overwrite(db_session: AsyncSession) -> None:
         db_session, payload, current_user=user, space_id=space.id, strategy="overwrite"
     )
     assert result.updated_subnets == 1
+    # Flush the pending UPDATE before refresh. Session.refresh() issues a SELECT
+    # without auto-flushing first, so without this it reads the unchanged row
+    # and overwrites the in-memory mutation we're about to assert on.
+    await db_session.flush()
     await db_session.refresh(subnet)
     assert subnet.name == "new"
     assert subnet.description == "new-desc"

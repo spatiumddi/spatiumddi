@@ -1154,6 +1154,43 @@ async def create_zone(
     return zone
 
 
+@router.get("/groups/{group_id}/zones/export")
+async def export_all_zones(
+    group_id: uuid.UUID,
+    db: DB,
+    _: CurrentUser,
+    view_id: uuid.UUID | None = None,
+) -> StreamingResponse:
+    """Return all zones in a group (optionally filtered by view) as a zip.
+
+    Registered *before* the parametric ``/zones/{zone_id}`` routes below so
+    FastAPI matches the static ``export`` literal; otherwise the request
+    falls into the UUID-typed ``{zone_id}`` route and returns 422.
+    """
+    await _require_group(group_id, db)
+
+    stmt = select(DNSZone).where(DNSZone.group_id == group_id)
+    if view_id is not None:
+        stmt = stmt.where(DNSZone.view_id == view_id)
+    result = await db.execute(stmt.order_by(DNSZone.name))
+    zones = list(result.scalars().all())
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for zone in zones:
+            records = await _load_zone_records(zone.id, db)
+            text = write_zone_file(zone, records)
+            zf.writestr(zone.name.rstrip(".") + ".zone", text)
+    buf.seek(0)
+
+    filename = f"dns-zones-{group_id}.zip"
+    return StreamingResponse(
+        buf,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @router.get("/groups/{group_id}/zones/{zone_id}", response_model=ZoneResponse)
 async def get_zone(group_id: uuid.UUID, zone_id: uuid.UUID, db: DB, _: CurrentUser) -> DNSZone:
     return await _require_zone(group_id, zone_id, db)
@@ -1630,38 +1667,6 @@ async def import_zone_commit(
         deleted=deleted,
         unchanged=unchanged_count,
         conflict_strategy=body.conflict_strategy,
-    )
-
-
-@router.get("/groups/{group_id}/zones/export")
-async def export_all_zones(
-    group_id: uuid.UUID,
-    db: DB,
-    _: CurrentUser,
-    view_id: uuid.UUID | None = None,
-) -> StreamingResponse:
-    """Return all zones in a group (optionally filtered by view) as a zip."""
-    await _require_group(group_id, db)
-
-    stmt = select(DNSZone).where(DNSZone.group_id == group_id)
-    if view_id is not None:
-        stmt = stmt.where(DNSZone.view_id == view_id)
-    result = await db.execute(stmt.order_by(DNSZone.name))
-    zones = list(result.scalars().all())
-
-    buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-        for zone in zones:
-            records = await _load_zone_records(zone.id, db)
-            text = write_zone_file(zone, records)
-            zf.writestr(zone.name.rstrip(".") + ".zone", text)
-    buf.seek(0)
-
-    filename = f"dns-zones-{group_id}.zip"
-    return StreamingResponse(
-        buf,
-        media_type="application/zip",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
 

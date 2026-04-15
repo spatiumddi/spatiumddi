@@ -35,12 +35,19 @@ _TestSessionLocal = async_sessionmaker(_test_engine, class_=AsyncSession, expire
 
 @pytest_asyncio.fixture(scope="session", autouse=True)
 async def create_test_schema() -> AsyncGenerator[None, None]:
+    # Tear down any prior schema with CASCADE so circular FKs don't block the
+    # drop (dns_record ↔ ip_address has a cycle that Base.metadata.drop_all
+    # can't untangle). Easiest is to nuke the public schema wholesale.
     async with _test_engine.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
+        await conn.execute(text("DROP SCHEMA public CASCADE"))
+        await conn.execute(text("CREATE SCHEMA public"))
         await conn.run_sync(Base.metadata.create_all)
     yield
+    # Teardown: same trick in reverse. No-op for CI (ephemeral DB) but keeps
+    # local runs clean.
     async with _test_engine.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
+        await conn.execute(text("DROP SCHEMA public CASCADE"))
+        await conn.execute(text("CREATE SCHEMA public"))
 
 
 @pytest_asyncio.fixture(autouse=True)
