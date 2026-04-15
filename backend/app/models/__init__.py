@@ -26,6 +26,7 @@ from app.models.ipam import (
     VLANMapping,
 )
 from app.models.settings import PlatformSettings
+from app.models.vlans import VLAN, Router
 
 __all__ = [
     "Base",
@@ -57,4 +58,6 @@ __all__ = [
     "DNSBlockList",
     "DNSBlockListEntry",
     "DNSBlockListException",
+    "Router",
+    "VLAN",
 ]

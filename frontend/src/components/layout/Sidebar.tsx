@@ -6,6 +6,7 @@ import {
   LayoutDashboard,
   Server,
   Clock,
+  Router as RouterIcon,
   Github,
   Users,
   ClipboardList,
@@ -20,6 +21,7 @@ import logoIcon from "@/assets/logo-icon.svg";
 const mainNav = [
   { label: "Dashboard", icon: LayoutDashboard, to: "/dashboard" },
   { label: "IPAM", icon: Network, to: "/ipam" },
+  { label: "VLANs", icon: RouterIcon, to: "/vlans" },
   { label: "DHCP", icon: Server, to: "/dhcp", disabled: true },
   { label: "DNS", icon: Globe, to: "/dns" },
   { label: "NTP", icon: Clock, to: "/ntp", disabled: true },

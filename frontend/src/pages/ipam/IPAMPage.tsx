@@ -34,6 +34,7 @@ import {
   ipamApi,
   dnsApi,
   customFieldsApi,
+  vlansApi,
   type IPSpace,
   type IPBlock,
   type Subnet,
@@ -41,6 +42,8 @@ import {
   type CustomField,
   type DNSZone,
   type FreeCidrRange,
+  type Router as NetworkRouter,
+  type VLAN,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { useStickyLocation } from "@/lib/stickyLocation";
@@ -598,6 +601,169 @@ function DnsSettingsSection({
   );
 }
 
+// ─── VLAN Picker (Router + VLAN selects with inline create) ───────────────────
+
+function VlanPicker({
+  vlanRefId,
+  onChange,
+}: {
+  vlanRefId: string | null;
+  onChange: (vlanRefId: string | null) => void;
+}) {
+  const qc = useQueryClient();
+  const { data: routers = [] } = useQuery({
+    queryKey: ["vlans", "routers"],
+    queryFn: vlansApi.listRouters,
+  });
+
+  // Seed the router from the selected VLAN, if any.
+  const [routerId, setRouterId] = useState<string>("");
+  const { data: selectedVlan } = useQuery({
+    queryKey: ["vlans", "vlan", vlanRefId],
+    queryFn: () => vlansApi.getVlan(vlanRefId as string),
+    enabled: !!vlanRefId && !routerId,
+  });
+  useEffect(() => {
+    if (selectedVlan && !routerId) setRouterId(selectedVlan.router_id);
+  }, [selectedVlan, routerId]);
+
+  const { data: vlans = [] } = useQuery({
+    queryKey: ["vlans", routerId],
+    queryFn: () => vlansApi.listVlans(routerId),
+    enabled: !!routerId,
+  });
+
+  const [showInline, setShowInline] = useState(false);
+  const [inlineTag, setInlineTag] = useState("");
+  const [inlineName, setInlineName] = useState("");
+  const [inlineError, setInlineError] = useState<string | null>(null);
+  const [creating, setCreating] = useState(false);
+
+  async function handleInlineCreate() {
+    const n = parseInt(inlineTag, 10);
+    if (Number.isNaN(n) || n < 1 || n > 4094) {
+      setInlineError("VLAN tag must be 1–4094");
+      return;
+    }
+    if (!inlineName.trim()) {
+      setInlineError("Name is required");
+      return;
+    }
+    setCreating(true);
+    setInlineError(null);
+    try {
+      const created = await vlansApi.createVlan(routerId, {
+        vlan_id: n,
+        name: inlineName.trim(),
+      });
+      qc.invalidateQueries({ queryKey: ["vlans", routerId] });
+      onChange(created.id);
+      setShowInline(false);
+      setInlineTag("");
+      setInlineName("");
+    } catch (e: unknown) {
+      const msg =
+        (e as { response?: { data?: { detail?: string } } })?.response?.data
+          ?.detail ?? "Failed to create VLAN";
+      setInlineError(typeof msg === "string" ? msg : JSON.stringify(msg));
+    } finally {
+      setCreating(false);
+    }
+  }
+
+  return (
+    <div className="space-y-2">
+      <div className="grid grid-cols-2 gap-2">
+        <Field label="Router">
+          <select
+            className={inputCls}
+            value={routerId}
+            onChange={(e) => {
+              setRouterId(e.target.value);
+              onChange(null);
+              setShowInline(false);
+            }}
+          >
+            <option value="">— None —</option>
+            {routers.map((r: NetworkRouter) => (
+              <option key={r.id} value={r.id}>
+                {r.name}
+              </option>
+            ))}
+          </select>
+        </Field>
+        <Field label="VLAN">
+          <select
+            className={inputCls}
+            value={vlanRefId ?? ""}
+            onChange={(e) => onChange(e.target.value || null)}
+            disabled={!routerId}
+          >
+            <option value="">— None —</option>
+            {vlans.map((v: VLAN) => (
+              <option key={v.id} value={v.id}>
+                {v.vlan_id} — {v.name}
+              </option>
+            ))}
+          </select>
+        </Field>
+      </div>
+      {routerId && !showInline && (
+        <button
+          type="button"
+          onClick={() => setShowInline(true)}
+          className="text-xs text-primary hover:underline"
+        >
+          + Create VLAN
+        </button>
+      )}
+      {routerId && showInline && (
+        <div className="rounded-md border p-2 space-y-2 bg-muted/30">
+          <div className="grid grid-cols-[80px_1fr] gap-2">
+            <input
+              className={inputCls}
+              type="number"
+              placeholder="Tag"
+              value={inlineTag}
+              onChange={(e) => setInlineTag(e.target.value)}
+              autoFocus
+            />
+            <input
+              className={inputCls}
+              placeholder="Name"
+              value={inlineName}
+              onChange={(e) => setInlineName(e.target.value)}
+            />
+          </div>
+          {inlineError && (
+            <p className="text-[11px] text-destructive">{inlineError}</p>
+          )}
+          <div className="flex justify-end gap-2">
+            <button
+              type="button"
+              onClick={() => {
+                setShowInline(false);
+                setInlineError(null);
+              }}
+              className="rounded-md border px-2 py-0.5 text-xs hover:bg-muted"
+            >
+              Cancel
+            </button>
+            <button
+              type="button"
+              onClick={handleInlineCreate}
+              disabled={creating}
+              className="rounded-md bg-primary px-2 py-0.5 text-xs text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+            >
+              {creating ? "Adding…" : "Add VLAN"}
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ─── Create Subnet Modal ──────────────────────────────────────────────────────
 
 // Prefix options shown in the "Find by size" picker
@@ -620,7 +786,7 @@ function CreateSubnetModal({
   const [name, setName] = useState("");
   const [blockId, setBlockId] = useState(defaultBlockId ?? "");
   const [gateway, setGateway] = useState("");
-  const [vlanId, setVlanId] = useState("");
+  const [vlanRefId, setVlanRefId] = useState<string | null>(null);
   const [skipAuto, setSkipAuto] = useState(false);
   const [customFields, setCustomFields] = useState<Record<string, unknown>>({});
   const [error, setError] = useState<string | null>(null);
@@ -679,7 +845,7 @@ function CreateSubnetModal({
         network: effectiveNetwork,
         name: name || undefined,
         gateway: gateway || undefined,
-        vlan_id: vlanId ? parseInt(vlanId) : undefined,
+        vlan_ref_id: vlanRefId ?? undefined,
         status: "active",
         skip_auto_addresses: skipAuto,
         custom_fields: customFields,
@@ -843,15 +1009,7 @@ function CreateSubnetModal({
             disabled={skipAuto}
           />
         </Field>
-        <Field label="VLAN ID">
-          <input
-            className={inputCls}
-            value={vlanId}
-            onChange={(e) => setVlanId(e.target.value)}
-            placeholder="Optional"
-            type="number"
-          />
-        </Field>
+        <VlanPicker vlanRefId={vlanRefId} onChange={setVlanRefId} />
         <label className="flex items-center gap-2 text-xs text-muted-foreground cursor-pointer">
           <input
             type="checkbox"
@@ -2353,7 +2511,9 @@ function EditSubnetModal({
   const [name, setName] = useState(subnet.name ?? "");
   const [description, setDescription] = useState(subnet.description ?? "");
   const [gateway, setGateway] = useState(subnet.gateway ?? "");
-  const [vlanId, setVlanId] = useState(subnet.vlan_id?.toString() ?? "");
+  const [vlanRefId, setVlanRefId] = useState<string | null>(
+    subnet.vlan_ref_id ?? null,
+  );
   const [status, setStatus] = useState(subnet.status);
   const [customFields, setCustomFields] = useState<Record<string, unknown>>(
     (subnet.custom_fields as Record<string, unknown>) ?? {},
@@ -2405,7 +2565,7 @@ function EditSubnetModal({
         name: name || undefined,
         description,
         gateway: gateway || undefined,
-        vlan_id: vlanId ? parseInt(vlanId) : null,
+        vlan_ref_id: vlanRefId,
         status,
         custom_fields: customFields,
         dns_inherit_settings: dnsInherit,
@@ -2548,15 +2708,13 @@ function EditSubnetModal({
             placeholder="e.g. 10.0.1.1"
           />
         </Field>
-        <Field label="VLAN ID">
-          <input
-            className={inputCls}
-            value={vlanId}
-            onChange={(e) => setVlanId(e.target.value)}
-            type="number"
-            placeholder="Optional"
-          />
-        </Field>
+        <VlanPicker vlanRefId={vlanRefId} onChange={setVlanRefId} />
+        {subnet.vlan_id != null && !vlanRefId && (
+          <p className="text-[11px] text-muted-foreground italic">
+            Current VLAN tag: {subnet.vlan_id} (unassigned — create a Router /
+            VLAN to manage).
+          </p>
+        )}
         <Field label="Status">
           <select
             className={inputCls}

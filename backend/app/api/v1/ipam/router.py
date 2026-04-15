@@ -7,7 +7,7 @@ from typing import Any
 
 import structlog
 from fastapi import APIRouter, HTTPException, Query, status
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, model_validator
 from sqlalchemy import delete, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -17,6 +17,7 @@ from app.api.v1.ipam.io_router import router as io_router
 from app.models.audit import AuditLog
 from app.models.dns import DNSRecord, DNSZone
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet, SubnetDomain
+from app.models.vlans import VLAN
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()
@@ -598,6 +599,7 @@ class SubnetCreate(BaseModel):
     description: str = ""
     vlan_id: int | None = None
     vxlan_id: int | None = None
+    vlan_ref_id: uuid.UUID | None = None
     gateway: str | None = None  # None → auto-assign first usable IP
     status: str = "active"
     skip_auto_addresses: bool = (
@@ -652,6 +654,7 @@ class SubnetUpdate(BaseModel):
     block_id: uuid.UUID | None = None
     vlan_id: int | None = None
     vxlan_id: int | None = None
+    vlan_ref_id: uuid.UUID | None = None
     gateway: str | None = None
     status: str | None = None
     dns_servers: list[str] | None = None
@@ -678,6 +681,16 @@ class SubnetUpdate(BaseModel):
         return v
 
 
+class SubnetVLANRef(BaseModel):
+    id: uuid.UUID
+    router_id: uuid.UUID
+    router_name: str | None = None
+    vlan_id: int
+    name: str
+
+    model_config = {"from_attributes": True}
+
+
 class SubnetResponse(BaseModel):
     id: uuid.UUID
     space_id: uuid.UUID
@@ -687,6 +700,8 @@ class SubnetResponse(BaseModel):
     description: str
     vlan_id: int | None
     vxlan_id: int | None
+    vlan_ref_id: uuid.UUID | None = None
+    vlan: SubnetVLANRef | None = None
     gateway: str | None
     status: str
     utilization_percent: float
@@ -710,6 +725,26 @@ class SubnetResponse(BaseModel):
     @classmethod
     def coerce_inet(cls, v: Any) -> Any:
         return str(v) if v is not None else v
+
+    @model_validator(mode="before")
+    @classmethod
+    def _attach_vlan(cls, data: Any) -> Any:
+        # When serializing a Subnet ORM instance, enrich with nested `vlan` from `vlan_ref`.
+        if isinstance(data, Subnet):
+            vref = getattr(data, "vlan_ref", None)
+            if vref is not None:
+                return {
+                    **{c.name: getattr(data, c.name) for c in data.__table__.columns},
+                    "vlan": {
+                        "id": vref.id,
+                        "router_id": vref.router_id,
+                        "router_name": None,
+                        "vlan_id": vref.vlan_id,
+                        "name": vref.name,
+                    },
+                }
+        return data
+
 
 
 class EffectiveDnsResponse(BaseModel):
@@ -1239,12 +1274,15 @@ async def list_subnets(
     db: DB,
     space_id: uuid.UUID | None = None,
     block_id: uuid.UUID | None = None,
+    vlan_ref_id: uuid.UUID | None = None,
 ) -> list[Subnet]:
     query = select(Subnet).order_by(Subnet.network)
     if space_id:
         query = query.where(Subnet.space_id == space_id)
     if block_id:
         query = query.where(Subnet.block_id == block_id)
+    if vlan_ref_id:
+        query = query.where(Subnet.vlan_ref_id == vlan_ref_id)
     result = await db.execute(query)
     return list(result.scalars().all())
 
@@ -1278,6 +1316,24 @@ async def create_subnet(body: SubnetCreate, current_user: CurrentUser, db: DB) -
             )
 
     total = _total_ips(net)
+
+    # Resolve vlan_ref_id → authoritative vlan_id tag
+    if body.vlan_ref_id is not None:
+        vlan_obj = await db.get(VLAN, body.vlan_ref_id)
+        if vlan_obj is None:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND, detail="Referenced VLAN not found"
+            )
+        if body.vlan_id is not None and body.vlan_id != vlan_obj.vlan_id:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=(
+                    f"vlan_id ({body.vlan_id}) does not match the tag of the "
+                    f"referenced VLAN ({vlan_obj.vlan_id})"
+                ),
+            )
+        # Override to enforce consistency
+        body.vlan_id = vlan_obj.vlan_id
 
     subnet = Subnet(
         **{
@@ -1468,12 +1524,38 @@ async def update_subnet(
                 detail=f"Gateway {body.gateway} is not within subnet {subnet.network}",
             )
 
+    # If vlan_ref_id is being set, derive/validate the integer vlan_id tag.
+    if "vlan_ref_id" in body.model_fields_set:
+        if body.vlan_ref_id is None:
+            # Clearing the FK — leave vlan_id alone unless caller also sent it
+            pass
+        else:
+            vlan_obj = await db.get(VLAN, body.vlan_ref_id)
+            if vlan_obj is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND, detail="Referenced VLAN not found"
+                )
+            if (
+                "vlan_id" in body.model_fields_set
+                and body.vlan_id is not None
+                and body.vlan_id != vlan_obj.vlan_id
+            ):
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=(
+                        f"vlan_id ({body.vlan_id}) does not match the tag of the "
+                        f"referenced VLAN ({vlan_obj.vlan_id})"
+                    ),
+                )
+            body.vlan_id = vlan_obj.vlan_id
+
     old = {
         "name": subnet.name,
         "description": subnet.description,
         "gateway": str(subnet.gateway) if subnet.gateway else None,
         "status": subnet.status,
         "vlan_id": subnet.vlan_id,
+        "vlan_ref_id": str(subnet.vlan_ref_id) if subnet.vlan_ref_id else None,
     }
     changes = body.model_dump(
         exclude_none=True,
