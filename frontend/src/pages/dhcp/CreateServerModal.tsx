@@ -22,7 +22,7 @@ export function CreateServerModal({
     server?.api_port != null ? String(server.api_port) : "",
   );
   const [groupId, setGroupId] = useState<string>(
-    server?.group_id ?? defaultGroupId ?? "",
+    server?.server_group_id ?? defaultGroupId ?? "",
   );
   const [notes, setNotes] = useState(server?.notes ?? "");
   const [apiKey, setApiKey] = useState("");
@@ -41,7 +41,7 @@ export function CreateServerModal({
         host,
         port: parseInt(port, 10) || 67,
         api_port: apiPort ? parseInt(apiPort, 10) : null,
-        group_id: groupId || null,
+        server_group_id: groupId || null,
         notes,
         ...(apiKey ? { api_key: apiKey } : {}),
       };

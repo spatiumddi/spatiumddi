@@ -120,7 +120,7 @@ function GroupSidebar({
           const isExpanded = expanded.has(g.id);
           const selected =
             selection?.type === "group" && selection.group.id === g.id;
-          const serversInGroup = ungrouped.filter((s) => s.group_id === g.id);
+          const serversInGroup = ungrouped.filter((s) => s.server_group_id === g.id);
 
           return (
             <div key={g.id}>
@@ -196,13 +196,13 @@ function GroupSidebar({
         })}
 
         {/* Ungrouped servers */}
-        {ungrouped.some((s) => !s.group_id) && (
+        {ungrouped.some((s) => !s.server_group_id) && (
           <div className="mt-3 border-t pt-2">
             <p className="px-4 pb-1 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground/60">
               Ungrouped Servers
             </p>
             {ungrouped
-              .filter((s) => !s.group_id)
+              .filter((s) => !s.server_group_id)
               .map((s) => {
                 const active =
                   selection?.type === "server" &&
@@ -399,7 +399,7 @@ function ServerScopesTab({ server }: { server: DHCPServer }) {
     .filter(
       (sc) =>
         sc.server_id === server.id ||
-        (sc.server_id === null && server.group_id),
+        (sc.server_id === null && server.server_group_id),
     );
 
   const [createForSubnet, setCreateForSubnet] = useState<string | null>(null);

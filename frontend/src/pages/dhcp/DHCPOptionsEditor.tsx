@@ -136,17 +136,8 @@ export function DHCPOptionsEditor({
       {STANDARD_OPTIONS.map((def) => {
         const current = byCode.get(def.code);
         const rendered = joinList(current?.value);
-        // Make NTP visually prominent — it's a headline feature.
-        const isNtp = def.code === 42;
         return (
-          <div
-            key={def.code}
-            className={
-              isNtp
-                ? "rounded-md border border-primary/30 bg-primary/5 p-2.5"
-                : ""
-            }
-          >
+          <div key={def.code}>
             <Field label={def.label} hint={def.hint}>
               <input
                 className={inputCls}
@@ -185,7 +176,7 @@ export function DHCPOptionsEditor({
               <div key={idx} className="flex items-center gap-2">
                 <input
                   type="number"
-                  className={`${inputCls} w-24`}
+                  className="w-20 shrink-0 rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
                   placeholder="code"
                   value={opt.code}
                   onChange={(e) => {
@@ -199,7 +190,7 @@ export function DHCPOptionsEditor({
                   }}
                 />
                 <input
-                  className={`${inputCls} flex-1`}
+                  className="min-w-0 flex-1 rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
                   placeholder="value"
                   value={typeof opt.value === "string" ? opt.value : opt.value.join(", ")}
                   onChange={(e) => {

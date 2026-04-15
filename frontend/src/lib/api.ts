@@ -1268,7 +1268,7 @@ export interface DHCPServerGroup {
 
 export interface DHCPServer {
   id: string;
-  group_id: string | null;
+  server_group_id: string | null;
   name: string;
   driver: string;
   host: string;
