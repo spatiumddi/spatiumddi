@@ -12,9 +12,11 @@ import {
   X,
   Copy,
   Check,
+  Upload,
 } from "lucide-react";
 import { ipamApi, customFieldsApi, type IPSpace, type IPBlock, type Subnet, type IPAddress, type CustomField } from "@/lib/api";
 import { cn } from "@/lib/utils";
+import { ImportModal, ExportButton } from "./ImportExportModals";
 
 // ─── Status Badge ────────────────────────────────────────────────────────────
 
@@ -2389,6 +2391,7 @@ export function IPAMPage() {
   const [selectedSpace, setSelectedSpace] = useState<IPSpace | null>(null);
   const [selectedBlock, setSelectedBlock] = useState<IPBlock | null>(null);
   const [showCreateSpace, setShowCreateSpace] = useState(false);
+  const [showImport, setShowImport] = useState(false);
   const qc = useQueryClient();
   const location = useLocation();
   const deepLinkHandled = useRef(false);
@@ -2489,6 +2492,17 @@ export function IPAMPage() {
               <RefreshCw className="h-3.5 w-3.5" />
             </button>
             <button
+              onClick={() => setShowImport(true)}
+              disabled={!spaces || spaces.length === 0}
+              className="rounded p-1 text-muted-foreground hover:text-foreground disabled:opacity-40"
+              title="Import subnets"
+            >
+              <Upload className="h-3.5 w-3.5" />
+            </button>
+            {selectedSpace && (
+              <ExportButton scope={{ space_id: selectedSpace.id }} label="" />
+            )}
+            <button
               onClick={() => setShowCreateSpace(true)}
               className="rounded p-1 text-muted-foreground hover:text-foreground"
               title="New IP Space"
@@ -2576,6 +2590,18 @@ export function IPAMPage() {
 
       {showCreateSpace && (
         <CreateSpaceModal onClose={() => setShowCreateSpace(false)} />
+      )}
+      {showImport && spaces && (
+        <ImportModal
+          spaces={spaces}
+          defaultSpaceId={selectedSpace?.id ?? selectedBlock?.space_id ?? selectedSubnet?.space_id}
+          onClose={() => setShowImport(false)}
+          onCommitted={() => {
+            qc.invalidateQueries({ queryKey: ["spaces"] });
+            qc.invalidateQueries({ queryKey: ["blocks"] });
+            qc.invalidateQueries({ queryKey: ["subnets"] });
+          }}
+        />
       )}
     </div>
   );

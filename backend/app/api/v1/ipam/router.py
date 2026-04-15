@@ -12,11 +12,13 @@ from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, DB
+from app.api.v1.ipam.io_router import router as io_router
 from app.models.audit import AuditLog
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()
+router.include_router(io_router)
 
 # ── Internal helpers ───────────────────────────────────────────────────────────
 

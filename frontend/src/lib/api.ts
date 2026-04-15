@@ -164,6 +164,110 @@ export const ipamApi = {
     api.post<IPAddress>(`/ipam/subnets/${subnetId}/next`, data).then((r) => r.data),
 };
 
+// ── IPAM Import / Export ───────────────────────────────────────────────────────
+
+export interface ImportDiffRow {
+  kind: "subnet" | "block" | "address";
+  action: "create" | "update" | "conflict" | "skip" | "error";
+  network: string;
+  name?: string;
+  reason?: string | null;
+  details?: Record<string, unknown>;
+}
+
+export interface ImportPreviewResponse {
+  space_id: string;
+  space_name: string;
+  summary: {
+    creates: number;
+    updates: number;
+    conflicts: number;
+    errors: number;
+  };
+  creates: ImportDiffRow[];
+  updates: ImportDiffRow[];
+  conflicts: ImportDiffRow[];
+  errors: ImportDiffRow[];
+}
+
+export interface ImportCommitResponse {
+  space_id: string;
+  created_subnets: number;
+  updated_subnets: number;
+  skipped: number;
+  auto_created_blocks: number;
+  errors: string[];
+}
+
+export type ImportStrategy = "skip" | "overwrite" | "fail";
+
+function _buildImportForm(
+  file: File,
+  opts: { space_id?: string; space_name?: string; strategy: ImportStrategy },
+): FormData {
+  const form = new FormData();
+  form.append("file", file);
+  if (opts.space_id) form.append("space_id", opts.space_id);
+  if (opts.space_name) form.append("space_name", opts.space_name);
+  form.append("strategy", opts.strategy);
+  return form;
+}
+
+export const ipamIoApi = {
+  preview: (file: File, opts: { space_id?: string; space_name?: string; strategy: ImportStrategy }) =>
+    api
+      .post<ImportPreviewResponse>("/ipam/import/preview", _buildImportForm(file, opts), {
+        headers: { "Content-Type": "multipart/form-data" },
+      })
+      .then((r) => r.data),
+
+  commit: (file: File, opts: { space_id?: string; space_name?: string; strategy: ImportStrategy }) =>
+    api
+      .post<ImportCommitResponse>("/ipam/import/commit", _buildImportForm(file, opts), {
+        headers: { "Content-Type": "multipart/form-data" },
+      })
+      .then((r) => r.data),
+
+  exportUrl: (params: {
+    space_id?: string;
+    block_id?: string;
+    subnet_id?: string;
+    format: "csv" | "json" | "xlsx";
+    include_addresses?: boolean;
+  }) => {
+    const qs = new URLSearchParams();
+    if (params.space_id) qs.set("space_id", params.space_id);
+    if (params.block_id) qs.set("block_id", params.block_id);
+    if (params.subnet_id) qs.set("subnet_id", params.subnet_id);
+    qs.set("format", params.format);
+    if (params.include_addresses) qs.set("include_addresses", "true");
+    return `/ipam/export?${qs.toString()}`;
+  },
+
+  /** Download an export using the caller's auth token. */
+  download: async (params: {
+    space_id?: string;
+    block_id?: string;
+    subnet_id?: string;
+    format: "csv" | "json" | "xlsx";
+    include_addresses?: boolean;
+  }) => {
+    const res = await api.get(ipamIoApi.exportUrl(params), { responseType: "blob" });
+    const disp = (res.headers["content-disposition"] as string) || "";
+    const match = disp.match(/filename="?([^";]+)"?/i);
+    const filename = match ? match[1] : `ipam-export.${params.format}`;
+    const blob = new Blob([res.data as BlobPart]);
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  },
+};
+
 export interface LoginResponse {
   access_token: string;
   refresh_token: string;
