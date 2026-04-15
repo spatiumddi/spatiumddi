@@ -134,8 +134,15 @@ class SyncLoop:
         if resp.status_code == 304:
             self._record_success()
             return
-        if resp.status_code == 401:
-            log.warning("sync_token_expired_will_rebootstrap")
+        if resp.status_code in (401, 404):
+            # 401 = token expired/invalid. 404 = server row was deleted on the
+            # control plane (user removed it in the UI); re-register to create
+            # a fresh row rather than 404-looping forever.
+            log.warning(
+                "sync_will_rebootstrap",
+                status=resp.status_code,
+                reason="token_invalid" if resp.status_code == 401 else "server_missing",
+            )
             from .cache import save_token
 
             save_token(self.cfg.state_dir, "")

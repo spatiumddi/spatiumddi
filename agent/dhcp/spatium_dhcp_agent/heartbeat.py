@@ -66,6 +66,12 @@ class HeartbeatClient:
                     self.token_ref[0] = rotated
                     save_token(self.cfg.state_dir, rotated)
                     log.info("dhcp_agent_token_rotated")
+            elif resp.status_code in (401, 404):
+                # Token invalidated or server row deleted — clear token and
+                # exit so supervisor restarts the container (→ re-bootstrap).
+                log.warning("heartbeat_will_rebootstrap", status=resp.status_code)
+                save_token(self.cfg.state_dir, "")
+                self._stop.set()
             else:
                 log.warning("heartbeat_failed", status=resp.status_code)
         except httpx.HTTPError as e:

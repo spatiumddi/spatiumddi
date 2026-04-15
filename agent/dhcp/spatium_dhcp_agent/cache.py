@@ -59,9 +59,13 @@ def save_token(state_dir: Path, token: str) -> None:
     tmp.write_text(token)
     try:
         os.chmod(tmp, 0o600)
-    except PermissionError:
+    except (PermissionError, FileNotFoundError):
         pass
-    tmp.replace(path)
+    try:
+        tmp.replace(path)
+    except FileNotFoundError:
+        # Another thread already moved our tmp (concurrent save_token).
+        pass
 
 
 def load_config(state_dir: Path) -> tuple[dict[str, Any] | None, str | None]:
