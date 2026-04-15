@@ -1278,7 +1278,7 @@ export interface DHCPServer {
   last_sync_at: string | null;
   last_health_check_at: string | null;
   notes: string;
-  approved: boolean;
+  agent_approved: boolean;
   created_at: string;
   modified_at: string;
 }

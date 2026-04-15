@@ -897,7 +897,7 @@ function ServerDetailView({
               <span className="rounded-full bg-muted px-2 py-0.5 text-xs">
                 {server.driver}
               </span>
-              {!server.approved && (
+              {!server.agent_approved && (
                 <span className="rounded-full bg-amber-100 px-2 py-0.5 text-xs text-amber-800 dark:bg-amber-900/30 dark:text-amber-400">
                   pending approval
                 </span>
@@ -916,7 +916,7 @@ function ServerDetailView({
             </div>
           </div>
           <div className="flex items-center gap-2">
-            {!server.approved && (
+            {!server.agent_approved && (
               <button
                 onClick={() => approveMut.mutate()}
                 className="rounded-md bg-emerald-600 px-3 py-1.5 text-xs text-white hover:bg-emerald-700"
