@@ -630,7 +630,83 @@ export const dnsApi = {
     api.put<DNSRecord>(`/dns/groups/${groupId}/zones/${zoneId}/records/${recordId}`, data).then((r) => r.data),
   deleteRecord: (groupId: string, zoneId: string, recordId: string) =>
     api.delete(`/dns/groups/${groupId}/zones/${zoneId}/records/${recordId}`),
+
+  // Bulk zone file import / export
+  importZonePreview: (
+    groupId: string,
+    zoneId: string,
+    data: { zone_file: string; zone_name?: string; view_id?: string | null },
+  ) =>
+    api
+      .post<DNSImportPreview>(
+        `/dns/groups/${groupId}/zones/${zoneId}/import/preview`,
+        data,
+      )
+      .then((r) => r.data),
+  importZoneCommit: (
+    groupId: string,
+    zoneId: string,
+    data: {
+      zone_file: string;
+      zone_name?: string;
+      view_id?: string | null;
+      conflict_strategy: "merge" | "replace" | "append";
+    },
+  ) =>
+    api
+      .post<DNSImportCommit>(
+        `/dns/groups/${groupId}/zones/${zoneId}/import/commit`,
+        data,
+      )
+      .then((r) => r.data),
+  exportZone: (groupId: string, zoneId: string) =>
+    api
+      .get<string>(`/dns/groups/${groupId}/zones/${zoneId}/export`, {
+        responseType: "text",
+        transformResponse: (d) => d,
+      })
+      .then((r) => r.data),
+  exportAllZones: (groupId: string, viewId?: string | null) =>
+    api
+      .get<Blob>(`/dns/groups/${groupId}/zones/export`, {
+        params: viewId ? { view_id: viewId } : {},
+        responseType: "blob",
+      })
+      .then((r) => r.data),
 };
+
+export interface DNSRecordChange {
+  op: "create" | "update" | "delete" | "unchanged";
+  name: string;
+  record_type: string;
+  value: string;
+  ttl: number | null;
+  priority: number | null;
+  weight: number | null;
+  port: number | null;
+  existing_id: string | null;
+}
+
+export interface DNSImportPreview {
+  zone_id: string | null;
+  zone_name: string;
+  to_create: DNSRecordChange[];
+  to_update: DNSRecordChange[];
+  to_delete: DNSRecordChange[];
+  unchanged: DNSRecordChange[];
+  soa_detected: boolean;
+  record_count: number;
+}
+
+export interface DNSImportCommit {
+  zone_id: string;
+  batch_id: string;
+  created: number;
+  updated: number;
+  deleted: number;
+  unchanged: number;
+  conflict_strategy: string;
+}
 
 export const authApi = {
   login: (username: string, password: string) =>

@@ -27,6 +27,7 @@ dependencies = [
     "httpx>=0.28.0",
     "cryptography>=43.0.0",
     "openpyxl>=3.1.5",
+    "dnspython>=2.7.0",
 ]
 
 [project.optional-dependencies]

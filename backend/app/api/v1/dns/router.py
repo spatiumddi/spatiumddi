@@ -1,12 +1,14 @@
 """DNS API: server groups, servers, server options, views, ACLs, zones, records."""
 
+import io
 import os
 import uuid
+import zipfile
 from datetime import UTC, datetime
-from typing import Any
 
 import structlog
 from fastapi import APIRouter, Header, HTTPException, status
+from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, field_validator
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
@@ -23,6 +25,13 @@ from app.models.dns import (
     DNSTrustAnchor,
     DNSView,
     DNSZone,
+)
+from app.services.dns_io import (
+    RecordChange,
+    ZoneParseError,
+    diff_records,
+    parse_zone_file,
+    write_zone_file,
 )
 
 logger = structlog.get_logger(__name__)
@@ -1081,6 +1090,346 @@ async def delete_record(
     ))
     await db.delete(record)
     await db.commit()
+
+
+# ── Bulk zone import / export ───────────────────────────────────────────────
+# Zone-file parsing and rendering live in app.services.dns_io so this router
+# stays thin (CLAUDE.md non-negotiable #10: driver / service logic does not
+# leak into the API layer).
+
+
+VALID_CONFLICT_STRATEGIES = {"merge", "replace", "append"}
+
+
+class ImportPreviewRequest(BaseModel):
+    """Zone-file import preview payload.
+
+    ``zone_name`` is used as the $ORIGIN if the zone file does not set one.
+    Either ``zone_id`` (import into existing zone) or (``group_id`` + zone_name
+    for a zone that does not exist yet) must be resolvable from the URL path.
+    """
+
+    zone_file: str
+    zone_name: str | None = None
+    view_id: uuid.UUID | None = None
+
+
+class ImportCommitRequest(ImportPreviewRequest):
+    conflict_strategy: str = "merge"
+
+    @field_validator("conflict_strategy")
+    @classmethod
+    def validate_strategy(cls, v: str) -> str:
+        if v not in VALID_CONFLICT_STRATEGIES:
+            raise ValueError(
+                f"conflict_strategy must be one of {sorted(VALID_CONFLICT_STRATEGIES)}"
+            )
+        return v
+
+
+class RecordChangeResponse(BaseModel):
+    op: str
+    name: str
+    record_type: str
+    value: str
+    ttl: int | None = None
+    priority: int | None = None
+    weight: int | None = None
+    port: int | None = None
+    existing_id: str | None = None
+
+
+class ImportPreviewResponse(BaseModel):
+    zone_id: uuid.UUID | None
+    zone_name: str
+    to_create: list[RecordChangeResponse]
+    to_update: list[RecordChangeResponse]
+    to_delete: list[RecordChangeResponse]
+    unchanged: list[RecordChangeResponse]
+    soa_detected: bool
+    record_count: int
+
+
+class ImportCommitResponse(BaseModel):
+    zone_id: uuid.UUID
+    batch_id: uuid.UUID
+    created: int
+    updated: int
+    deleted: int
+    unchanged: int
+    conflict_strategy: str
+
+
+def _resolve_zone_name(
+    body: ImportPreviewRequest, existing_zone: DNSZone | None
+) -> str:
+    if existing_zone is not None:
+        return existing_zone.name
+    if not body.zone_name:
+        raise HTTPException(
+            status_code=422,
+            detail="zone_name is required when importing into a zone that does not exist yet",
+        )
+    return body.zone_name if body.zone_name.endswith(".") else body.zone_name + "."
+
+
+async def _load_zone_records(zone_id: uuid.UUID, db: DB) -> list[DNSRecord]:
+    result = await db.execute(select(DNSRecord).where(DNSRecord.zone_id == zone_id))
+    return list(result.scalars().all())
+
+
+def _change_to_response(c: RecordChange) -> RecordChangeResponse:
+    return RecordChangeResponse(
+        op=c.op,
+        name=c.name,
+        record_type=c.record_type,
+        value=c.value,
+        ttl=c.ttl,
+        priority=c.priority,
+        weight=c.weight,
+        port=c.port,
+        existing_id=c.existing_id,
+    )
+
+
+@router.post(
+    "/groups/{group_id}/zones/{zone_id}/import/preview",
+    response_model=ImportPreviewResponse,
+)
+async def import_zone_preview(
+    group_id: uuid.UUID,
+    zone_id: uuid.UUID,
+    body: ImportPreviewRequest,
+    db: DB,
+    _: CurrentUser,
+) -> ImportPreviewResponse:
+    """Parse a zone file and return the diff against an existing zone.
+
+    Non-mutating: this endpoint never writes to the database.
+    """
+    zone = await _require_zone(group_id, zone_id, db)
+    zone_name = _resolve_zone_name(body, zone)
+
+    try:
+        parsed = parse_zone_file(body.zone_file, zone_name)
+    except ZoneParseError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    existing = await _load_zone_records(zone_id, db)
+    diff = diff_records(parsed.records, existing)
+
+    return ImportPreviewResponse(
+        zone_id=zone.id,
+        zone_name=zone.name,
+        to_create=[_change_to_response(c) for c in diff.to_create],
+        to_update=[_change_to_response(c) for c in diff.to_update],
+        to_delete=[_change_to_response(c) for c in diff.to_delete],
+        unchanged=[_change_to_response(c) for c in diff.unchanged],
+        soa_detected=parsed.soa is not None,
+        record_count=len(parsed.records),
+    )
+
+
+@router.post(
+    "/groups/{group_id}/zones/{zone_id}/import/commit",
+    response_model=ImportCommitResponse,
+)
+async def import_zone_commit(
+    group_id: uuid.UUID,
+    zone_id: uuid.UUID,
+    body: ImportCommitRequest,
+    db: DB,
+    current_user: SuperAdmin,
+) -> ImportCommitResponse:
+    """Apply a parsed zone file to the existing zone in a single transaction.
+
+    ``conflict_strategy`` controls how conflicts are resolved:
+
+    * ``merge``   — create new, update changed, keep records that are absent
+                    from the zone file (additive)
+    * ``replace`` — create new, update changed, delete records absent from the
+                    zone file (make the zone match the file exactly)
+    * ``append``  — only create new records; existing records are left alone
+
+    Auditing: one summary ``AuditLog`` entry is written under
+    ``resource_type='dns_zone_import'`` tagged with a ``batch_id``.
+    Per-record changes are encoded in the ``new_value`` JSONB payload so
+    per-record history is recoverable without generating N audit rows.
+    """
+    zone = await _require_zone(group_id, zone_id, db)
+    zone_name = _resolve_zone_name(body, zone)
+
+    try:
+        parsed = parse_zone_file(body.zone_file, zone_name)
+    except ZoneParseError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    existing = await _load_zone_records(zone_id, db)
+    diff = diff_records(parsed.records, existing)
+
+    batch_id = uuid.uuid4()
+    created = 0
+    updated = 0
+    deleted = 0
+    unchanged_count = len(diff.unchanged)
+
+    existing_by_id: dict[str, DNSRecord] = {str(r.id): r for r in existing}
+
+    # Creates run under merge, replace, and append.
+    for change in diff.to_create:
+        fqdn = (
+            f"{change.name}.{zone.name}" if change.name != "@" else zone.name
+        )
+        db.add(
+            DNSRecord(
+                zone_id=zone.id,
+                name=change.name,
+                fqdn=fqdn,
+                record_type=change.record_type,
+                value=change.value,
+                ttl=change.ttl,
+                priority=change.priority,
+                weight=change.weight,
+                port=change.port,
+                created_by_user_id=current_user.id,
+            )
+        )
+        created += 1
+
+    # Updates only under merge + replace.
+    if body.conflict_strategy in {"merge", "replace"}:
+        for change in diff.to_update:
+            row = existing_by_id.get(change.existing_id or "")
+            if row is None:
+                continue
+            row.ttl = change.ttl
+            row.priority = change.priority
+            row.weight = change.weight
+            row.port = change.port
+            updated += 1
+
+    # Deletes only under replace.
+    if body.conflict_strategy == "replace":
+        for change in diff.to_delete:
+            row = existing_by_id.get(change.existing_id or "")
+            if row is None:
+                continue
+            await db.delete(row)
+            deleted += 1
+
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="import",
+            resource_type="dns_zone_import",
+            resource_id=str(zone.id),
+            resource_display=zone.name,
+            new_value={
+                "batch_id": str(batch_id),
+                "conflict_strategy": body.conflict_strategy,
+                "created": created,
+                "updated": updated,
+                "deleted": deleted,
+                "unchanged": unchanged_count,
+                "changes": {
+                    "create": [
+                        {"name": c.name, "type": c.record_type, "value": c.value}
+                        for c in diff.to_create
+                    ],
+                    "update": [
+                        {"name": c.name, "type": c.record_type, "value": c.value}
+                        for c in diff.to_update
+                    ]
+                    if body.conflict_strategy in {"merge", "replace"}
+                    else [],
+                    "delete": [
+                        {"name": c.name, "type": c.record_type, "value": c.value}
+                        for c in diff.to_delete
+                    ]
+                    if body.conflict_strategy == "replace"
+                    else [],
+                },
+            },
+            result="success",
+        )
+    )
+
+    await db.commit()
+
+    logger.info(
+        "dns_zone_import",
+        batch_id=str(batch_id),
+        zone_id=str(zone.id),
+        zone_name=zone.name,
+        conflict_strategy=body.conflict_strategy,
+        created=created,
+        updated=updated,
+        deleted=deleted,
+        unchanged=unchanged_count,
+    )
+
+    return ImportCommitResponse(
+        zone_id=zone.id,
+        batch_id=batch_id,
+        created=created,
+        updated=updated,
+        deleted=deleted,
+        unchanged=unchanged_count,
+        conflict_strategy=body.conflict_strategy,
+    )
+
+
+@router.get("/groups/{group_id}/zones/{zone_id}/export")
+async def export_zone(
+    group_id: uuid.UUID,
+    zone_id: uuid.UUID,
+    db: DB,
+    _: CurrentUser,
+) -> Response:
+    """Return the zone as an RFC 1035 zone file."""
+    zone = await _require_zone(group_id, zone_id, db)
+    records = await _load_zone_records(zone_id, db)
+    text = write_zone_file(zone, records)
+    filename = zone.name.rstrip(".") + ".zone"
+    return Response(
+        content=text,
+        media_type="text/dns",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get("/groups/{group_id}/zones/export")
+async def export_all_zones(
+    group_id: uuid.UUID,
+    db: DB,
+    _: CurrentUser,
+    view_id: uuid.UUID | None = None,
+) -> StreamingResponse:
+    """Return all zones in a group (optionally filtered by view) as a zip."""
+    await _require_group(group_id, db)
+
+    stmt = select(DNSZone).where(DNSZone.group_id == group_id)
+    if view_id is not None:
+        stmt = stmt.where(DNSZone.view_id == view_id)
+    result = await db.execute(stmt.order_by(DNSZone.name))
+    zones = list(result.scalars().all())
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+        for zone in zones:
+            records = await _load_zone_records(zone.id, db)
+            text = write_zone_file(zone, records)
+            zf.writestr(zone.name.rstrip(".") + ".zone", text)
+    buf.seek(0)
+
+    filename = f"dns-zones-{group_id}.zip"
+    return StreamingResponse(
+        buf,
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 # ── Helper functions ────────────────────────────────────────────────────────

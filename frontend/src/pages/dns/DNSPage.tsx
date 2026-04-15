@@ -4,11 +4,12 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   Globe, Plus, Trash2, Pencil, ChevronDown, ChevronRight,
   Settings2, Shield, Eye, FileText, Layers, RefreshCw, X, Cpu,
-  FolderOpen, Folder,
+  FolderOpen, Folder, Upload, Download,
 } from "lucide-react";
 import {
   dnsApi,
   type DNSServerGroup, type DNSServer, type DNSZone, type DNSView, type DNSRecord,
+  type DNSImportPreview, type DNSRecordChange,
 } from "@/lib/api";
 
 // ── Shared primitives ─────────────────────────────────────────────────────────
@@ -109,6 +110,177 @@ function ConfirmDestroyModal({
             className="rounded-md bg-destructive px-3 py-1.5 text-sm text-destructive-foreground hover:bg-destructive/90 disabled:opacity-50"
           >
             {isPending ? "Deleting…" : "Delete"}
+          </button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+// ── Download helper ──────────────────────────────────────────────────────────
+
+function downloadBlob(data: Blob | string, filename: string, mime = "text/plain") {
+  const blob = data instanceof Blob ? data : new Blob([data], { type: mime });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
+// ── Import Zone Modal ────────────────────────────────────────────────────────
+
+function ImportZoneModal({
+  groupId,
+  zone,
+  onClose,
+}: {
+  groupId: string;
+  zone: DNSZone;
+  onClose: () => void;
+}) {
+  const qc = useQueryClient();
+  const [zoneFile, setZoneFile] = useState("");
+  const [strategy, setStrategy] = useState<"merge" | "replace" | "append">("merge");
+  const [preview, setPreview] = useState<DNSImportPreview | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  const previewMut = useMutation({
+    mutationFn: () =>
+      dnsApi.importZonePreview(groupId, zone.id, {
+        zone_file: zoneFile,
+        zone_name: zone.name,
+      }),
+    onSuccess: (data) => {
+      setPreview(data);
+      setError(null);
+    },
+    onError: (err: ApiError) => {
+      setPreview(null);
+      setError(err.response?.data?.detail ?? "Failed to parse zone file");
+    },
+  });
+
+  const commitMut = useMutation({
+    mutationFn: () =>
+      dnsApi.importZoneCommit(groupId, zone.id, {
+        zone_file: zoneFile,
+        zone_name: zone.name,
+        conflict_strategy: strategy,
+      }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["dns-records", zone.id] });
+      qc.invalidateQueries({ queryKey: ["dns-zones", groupId] });
+      onClose();
+    },
+    onError: (err: ApiError) => {
+      setError(err.response?.data?.detail ?? "Import failed");
+    },
+  });
+
+  const onFileChosen = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    const text = await file.text();
+    setZoneFile(text);
+    setPreview(null);
+  };
+
+  const renderChanges = (label: string, items: DNSRecordChange[], color: string) =>
+    items.length > 0 && (
+      <details className="rounded border" open={items.length <= 10}>
+        <summary className={`cursor-pointer px-2 py-1 text-xs font-medium ${color}`}>
+          {label} ({items.length})
+        </summary>
+        <div className="max-h-40 overflow-auto">
+          <table className="w-full text-xs">
+            <tbody>
+              {items.map((c, i) => (
+                <tr key={i} className="border-t">
+                  <td className="px-2 py-0.5 font-mono">{c.name}</td>
+                  <td className="px-2 py-0.5">{c.record_type}</td>
+                  <td className="px-2 py-0.5 font-mono text-muted-foreground truncate max-w-xs">
+                    {c.value}
+                  </td>
+                  <td className="px-2 py-0.5 text-muted-foreground">{c.ttl ?? "—"}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </details>
+    );
+
+  return (
+    <Modal title={`Import Zone File — ${zone.name}`} onClose={onClose} wide>
+      <div className="space-y-3">
+        <Field label="Zone file (RFC 1035 format)">
+          <input type="file" accept=".zone,.db,.txt,text/plain,text/dns" onChange={onFileChosen} className="text-xs" />
+        </Field>
+        <Field label="…or paste contents">
+          <textarea
+            className={`${inputCls} font-mono text-xs`}
+            rows={8}
+            value={zoneFile}
+            onChange={(e) => {
+              setZoneFile(e.target.value);
+              setPreview(null);
+            }}
+            placeholder="$ORIGIN example.com.&#10;$TTL 3600&#10;@ IN SOA ns1 hostmaster ( 1 86400 7200 3600000 3600 )"
+          />
+        </Field>
+
+        <Field label="Conflict strategy">
+          <select
+            className={inputCls}
+            value={strategy}
+            onChange={(e) => setStrategy(e.target.value as "merge" | "replace" | "append")}
+          >
+            <option value="merge">Merge — add new, update changed, keep existing</option>
+            <option value="replace">Replace — make the zone match the file exactly</option>
+            <option value="append">Append — only add records that do not exist</option>
+          </select>
+        </Field>
+
+        {error && (
+          <div className="rounded border border-destructive/40 bg-destructive/10 px-3 py-2 text-xs text-destructive">
+            {error}
+          </div>
+        )}
+
+        {preview && (
+          <div className="space-y-2">
+            <div className="text-xs text-muted-foreground">
+              Parsed {preview.record_count} record{preview.record_count !== 1 ? "s" : ""}
+              {preview.soa_detected && " (SOA detected — zone SOA will not be changed)"}
+            </div>
+            {renderChanges("Create", preview.to_create, "text-emerald-600")}
+            {renderChanges("Update", preview.to_update, "text-amber-600")}
+            {renderChanges("Delete (only with Replace)", preview.to_delete, "text-destructive")}
+            {renderChanges("Unchanged", preview.unchanged, "text-muted-foreground")}
+          </div>
+        )}
+
+        <div className="flex justify-end gap-2 pt-2">
+          <button onClick={onClose} className="rounded-md border px-3 py-1.5 text-sm hover:bg-accent">
+            Cancel
+          </button>
+          <button
+            onClick={() => previewMut.mutate()}
+            disabled={!zoneFile || previewMut.isPending}
+            className="rounded-md border px-3 py-1.5 text-sm hover:bg-accent disabled:opacity-50"
+          >
+            {previewMut.isPending ? "Parsing…" : "Preview"}
+          </button>
+          <button
+            onClick={() => commitMut.mutate()}
+            disabled={!preview || commitMut.isPending}
+            className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+          >
+            {commitMut.isPending ? "Importing…" : "Import"}
           </button>
         </div>
       </div>
@@ -414,6 +586,12 @@ function ZoneDetailView({ group, zone, onDeleted }: { group: DNSServerGroup; zon
   const [showEditZone, setShowEditZone] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [typeFilter, setTypeFilter] = useState("");
+  const [showImport, setShowImport] = useState(false);
+
+  const handleExport = async () => {
+    const text = await dnsApi.exportZone(group.id, zone.id);
+    downloadBlob(text, `${zone.name.replace(/\.$/, "")}.zone`, "text/dns");
+  };
 
   const { data: views = [] } = useQuery({
     queryKey: ["dns-views", group.id],
@@ -467,6 +645,12 @@ function ZoneDetailView({ group, zone, onDeleted }: { group: DNSServerGroup; zon
           </p>
         </div>
         <div className="flex items-center gap-2">
+          <button className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent" onClick={() => setShowImport(true)}>
+            <Upload className="h-3 w-3" /> Import
+          </button>
+          <button className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent" onClick={handleExport}>
+            <Download className="h-3 w-3" /> Export
+          </button>
           <button className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent" onClick={() => setShowEditZone(true)}>
             <Pencil className="h-3 w-3" /> Edit Zone
           </button>
@@ -562,6 +746,7 @@ function ZoneDetailView({ group, zone, onDeleted }: { group: DNSServerGroup; zon
       {showAddRecord && <RecordModal groupId={group.id} zoneId={zone.id} onClose={() => setShowAddRecord(false)} />}
       {editRecord    && <RecordModal groupId={group.id} zoneId={zone.id} record={editRecord} onClose={() => setEditRecord(null)} />}
       {showEditZone  && <ZoneModal groupId={group.id} views={views} zone={zone} onClose={() => setShowEditZone(false)} />}
+      {showImport    && <ImportZoneModal groupId={group.id} zone={zone} onClose={() => setShowImport(false)} />}
       {confirmDelete && (
         <ConfirmDestroyModal
           title="Delete DNS Zone"
@@ -1006,12 +1191,24 @@ function ZonesTab({ group, onSelectZone }: { group: DNSServerGroup; onSelectZone
         <span className="text-xs font-medium text-muted-foreground uppercase tracking-wider">
           {zones.length} zone{zones.length !== 1 ? "s" : ""}
         </span>
-        <button
-          className="flex items-center gap-1 rounded-md bg-primary px-2 py-1 text-xs text-primary-foreground hover:bg-primary/90"
-          onClick={() => setShowAdd(true)}
-        >
-          <Plus className="h-3 w-3" /> Add Zone
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent disabled:opacity-50"
+            disabled={zones.length === 0}
+            onClick={async () => {
+              const blob = await dnsApi.exportAllZones(group.id);
+              downloadBlob(blob, `dns-zones-${group.id}.zip`, "application/zip");
+            }}
+          >
+            <Download className="h-3 w-3" /> Export All
+          </button>
+          <button
+            className="flex items-center gap-1 rounded-md bg-primary px-2 py-1 text-xs text-primary-foreground hover:bg-primary/90"
+            onClick={() => setShowAdd(true)}
+          >
+            <Plus className="h-3 w-3" /> Add Zone
+          </button>
+        </div>
       </div>
 
       {isFetching && zones.length === 0 && (
