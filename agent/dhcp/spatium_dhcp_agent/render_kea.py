@@ -171,7 +171,10 @@ def render(
     interfaces = server.get("interfaces") or ["*"]
 
     dhcp4: dict[str, Any] = {
-        "interfaces-config": {"interfaces": list(interfaces)},
+        "interfaces-config": {
+            "interfaces": list(interfaces),
+            "dhcp-socket-type": server.get("dhcp_socket_type", "udp"),
+        },
         "control-socket": {
             "socket-type": "unix",
             "socket-name": control_socket,
