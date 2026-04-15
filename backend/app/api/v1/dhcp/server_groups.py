@@ -15,7 +15,7 @@ from app.models.dhcp import DHCPServerGroup
 
 router = APIRouter(prefix="/server-groups", tags=["dhcp"])
 
-VALID_MODES = {"load-balancing", "hot-standby"}
+VALID_MODES = {"standalone", "load-balancing", "hot-standby"}
 
 
 class GroupCreate(BaseModel):
