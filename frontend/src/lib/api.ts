@@ -1362,12 +1362,14 @@ export const dhcpApi = {
 
   listScopesBySubnet: (subnetId: string) =>
     api
-      .get<DHCPScope[]>(`/dhcp/subnets/${subnetId}/scopes`)
+      .get<DHCPScope[]>(`/dhcp/subnets/${subnetId}/dhcp-scopes`)
       .then((r) => r.data),
   getScope: (id: string) =>
     api.get<DHCPScope>(`/dhcp/scopes/${id}`).then((r) => r.data),
   createScope: (subnetId: string, data: Partial<DHCPScope>) =>
-    api.post<DHCPScope>(`/dhcp/scopes/${subnetId}`, data).then((r) => r.data),
+    api
+      .post<DHCPScope>(`/dhcp/subnets/${subnetId}/dhcp-scopes`, data)
+      .then((r) => r.data),
   updateScope: (id: string, data: Partial<DHCPScope>) =>
     api.put<DHCPScope>(`/dhcp/scopes/${id}`, data).then((r) => r.data),
   deleteScope: (id: string) => api.delete(`/dhcp/scopes/${id}`),
@@ -1378,12 +1380,10 @@ export const dhcpApi = {
     api
       .post<DHCPPool>(`/dhcp/scopes/${scopeId}/pools`, data)
       .then((r) => r.data),
-  updatePool: (scopeId: string, poolId: string, data: Partial<DHCPPool>) =>
-    api
-      .put<DHCPPool>(`/dhcp/scopes/${scopeId}/pools/${poolId}`, data)
-      .then((r) => r.data),
-  deletePool: (scopeId: string, poolId: string) =>
-    api.delete(`/dhcp/scopes/${scopeId}/pools/${poolId}`),
+  updatePool: (_scopeId: string, poolId: string, data: Partial<DHCPPool>) =>
+    api.put<DHCPPool>(`/dhcp/pools/${poolId}`, data).then((r) => r.data),
+  deletePool: (_scopeId: string, poolId: string) =>
+    api.delete(`/dhcp/pools/${poolId}`),
 
   listStatics: (scopeId: string) =>
     api
@@ -1394,18 +1394,15 @@ export const dhcpApi = {
       .post<DHCPStaticAssignment>(`/dhcp/scopes/${scopeId}/statics`, data)
       .then((r) => r.data),
   updateStatic: (
-    scopeId: string,
+    _scopeId: string,
     staticId: string,
     data: Partial<DHCPStaticAssignment>,
   ) =>
     api
-      .put<DHCPStaticAssignment>(
-        `/dhcp/scopes/${scopeId}/statics/${staticId}`,
-        data,
-      )
+      .put<DHCPStaticAssignment>(`/dhcp/statics/${staticId}`, data)
       .then((r) => r.data),
-  deleteStatic: (scopeId: string, staticId: string) =>
-    api.delete(`/dhcp/scopes/${scopeId}/statics/${staticId}`),
+  deleteStatic: (_scopeId: string, staticId: string) =>
+    api.delete(`/dhcp/statics/${staticId}`),
 
   listClientClasses: (serverId: string) =>
     api
