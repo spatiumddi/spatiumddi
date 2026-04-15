@@ -1,4 +1,5 @@
 from sqlalchemy import Boolean, Integer, String
+from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base
@@ -52,3 +53,20 @@ class PlatformSettings(Base):
         String(20), nullable=False, default="auto"
     )
     dns_recursive_by_default: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+    # DHCP defaults — applied as the initial values when creating a new DHCP scope
+    dhcp_default_dns_servers: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, default=list
+    )
+    dhcp_default_domain_name: Mapped[str] = mapped_column(
+        String(255), nullable=False, default=""
+    )
+    dhcp_default_domain_search: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, default=list
+    )
+    dhcp_default_ntp_servers: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, default=list
+    )
+    dhcp_default_lease_time: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=86400
+    )

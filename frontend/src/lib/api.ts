@@ -715,6 +715,11 @@ export interface PlatformSettings {
   dns_default_zone_type: string;
   dns_default_dnssec_validation: string;
   dns_recursive_by_default: boolean;
+  dhcp_default_dns_servers: string[];
+  dhcp_default_domain_name: string;
+  dhcp_default_domain_search: string[];
+  dhcp_default_ntp_servers: string[];
+  dhcp_default_lease_time: number;
 }
 
 export const settingsApi = {

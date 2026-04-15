@@ -33,6 +33,11 @@ class SettingsResponse(BaseModel):
     dns_default_zone_type: str
     dns_default_dnssec_validation: str
     dns_recursive_by_default: bool
+    dhcp_default_dns_servers: list[str]
+    dhcp_default_domain_name: str
+    dhcp_default_domain_search: list[str]
+    dhcp_default_ntp_servers: list[str]
+    dhcp_default_lease_time: int
 
     model_config = {"from_attributes": True}
 
@@ -52,6 +57,11 @@ class SettingsUpdate(BaseModel):
     dns_default_zone_type: str | None = None
     dns_default_dnssec_validation: str | None = None
     dns_recursive_by_default: bool | None = None
+    dhcp_default_dns_servers: list[str] | None = None
+    dhcp_default_domain_name: str | None = None
+    dhcp_default_domain_search: list[str] | None = None
+    dhcp_default_ntp_servers: list[str] | None = None
+    dhcp_default_lease_time: int | None = None
 
     @field_validator("ip_allocation_strategy")
     @classmethod

@@ -1,8 +1,9 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   dhcpApi,
   ipamApi,
+  settingsApi,
   type DHCPScope,
   type DHCPOption,
 } from "@/lib/api";
@@ -57,6 +58,38 @@ export function CreateScopeModal({
     queryKey: ["dhcp-servers"],
     queryFn: () => dhcpApi.listServers(),
   });
+  // Settings + specific subnet feed the auto-prefill for new scopes.
+  const { data: settings } = useQuery({
+    queryKey: ["settings"],
+    queryFn: settingsApi.get,
+    enabled: !editing,
+  });
+  const { data: subnetDetail } = useQuery({
+    queryKey: ["subnet", subnetId],
+    queryFn: () => ipamApi.getSubnet(subnetId),
+    enabled: !editing && !!subnetId,
+  });
+
+  const [prefilled, setPrefilled] = useState(false);
+  useEffect(() => {
+    if (editing || prefilled) return;
+    if (!settings && !subnetDetail) return;
+    const next: DHCPOption[] = [];
+    const gw = subnetDetail?.gateway;
+    if (gw) next.push({ code: 3, value: [gw] });
+    if (settings?.dhcp_default_dns_servers?.length)
+      next.push({ code: 6, value: settings.dhcp_default_dns_servers });
+    if (settings?.dhcp_default_domain_name)
+      next.push({ code: 15, value: settings.dhcp_default_domain_name });
+    if (settings?.dhcp_default_domain_search?.length)
+      next.push({ code: 119, value: settings.dhcp_default_domain_search });
+    if (settings?.dhcp_default_ntp_servers?.length)
+      next.push({ code: 42, value: settings.dhcp_default_ntp_servers });
+    if (next.length) setOptions(next);
+    if (settings?.dhcp_default_lease_time)
+      setLeaseTime(String(settings.dhcp_default_lease_time));
+    setPrefilled(true);
+  }, [editing, prefilled, settings, subnetDetail]);
 
   const mut = useMutation({
     mutationFn: () => {

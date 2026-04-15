@@ -17,10 +17,12 @@ import {
 import {
   ipamApi,
   dnsApi,
+  dhcpApi,
   vlansApi,
   auditApi,
   type Subnet,
   type DNSServer,
+  type DHCPServer,
   type VLAN,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
@@ -171,6 +173,29 @@ export function DashboardPage() {
   const unhealthyServers =
     (serverCounts.unreachable ?? 0) + (serverCounts.error ?? 0);
 
+  // DHCP
+  const { data: dhcpServers = [] } = useQuery<DHCPServer[]>({
+    queryKey: ["dhcp-servers"],
+    queryFn: () => dhcpApi.listServers(),
+    refetchInterval: 30_000,
+  });
+  const { data: dhcpGroups = [] } = useQuery({
+    queryKey: ["dhcp-groups"],
+    queryFn: dhcpApi.listGroups,
+    staleTime: 60_000,
+  });
+  const dhcpCounts = dhcpServers.reduce(
+    (acc, s) => {
+      acc[s.status] = (acc[s.status] ?? 0) + 1;
+      return acc;
+    },
+    {} as Record<string, number>,
+  );
+  const dhcpActive = dhcpCounts.active ?? 0;
+  const dhcpUnhealthy =
+    (dhcpCounts.unreachable ?? 0) + (dhcpCounts.error ?? 0);
+  const dhcpPending = dhcpServers.filter((s) => !s.agent_approved).length;
+
   // Recent activity
   const { data: recent } = useQuery({
     queryKey: ["audit", "recent"],
@@ -313,6 +338,27 @@ export function DashboardPage() {
                     : `${activeServers} active`
               }
               tone={unhealthyServers > 0 ? "bad" : undefined}
+            />
+            <StatCard
+              label="DHCP Servers"
+              value={dhcpServers.length}
+              icon={Server}
+              sub={
+                dhcpServers.length === 0
+                  ? "none registered"
+                  : dhcpPending > 0
+                    ? `${dhcpActive} active, ${dhcpPending} pending approval`
+                    : dhcpUnhealthy > 0
+                      ? `${dhcpActive} active, ${dhcpUnhealthy} unhealthy`
+                      : `${dhcpActive} active`
+              }
+              tone={
+                dhcpUnhealthy > 0
+                  ? "bad"
+                  : dhcpPending > 0
+                    ? "warn"
+                    : undefined
+              }
             />
             <StatCard
               label="Allocated IPs"
@@ -482,6 +528,87 @@ export function DashboardPage() {
                         {s.last_health_check_at
                           ? `checked ${new Date(s.last_health_check_at).toLocaleTimeString()}`
                           : "never checked"}
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          </section>
+        )}
+
+        {/* ── DHCP ──────────────────────────────────────────────────────── */}
+        {dhcpServers.length > 0 && (
+          <section>
+            <SectionHeader
+              title="DHCP — Server Status"
+              icon={Server}
+              hint={
+                <>
+                  {(
+                    ["active", "syncing", "unreachable", "error"] as const
+                  ).map((s) =>
+                    dhcpCounts[s] ? (
+                      <span
+                        key={s}
+                        className="mr-3 inline-flex items-center gap-1.5"
+                      >
+                        <span
+                          className={cn(
+                            "inline-block h-2 w-2 rounded-full",
+                            DOT_CLS[s],
+                          )}
+                        />
+                        {dhcpCounts[s]} {s}
+                      </span>
+                    ) : null,
+                  )}
+                  {dhcpPending > 0 && (
+                    <span className="mr-3 inline-flex items-center gap-1.5 text-amber-600">
+                      <span className="inline-block h-2 w-2 rounded-full bg-amber-500" />
+                      {dhcpPending} pending approval
+                    </span>
+                  )}
+                </>
+              }
+            />
+            <div className="rounded-lg border">
+              <div className="divide-y">
+                {dhcpServers.map((s) => {
+                  const group = dhcpGroups.find(
+                    (g) => g.id === s.server_group_id,
+                  );
+                  const dotCls = DOT_CLS[s.status] ?? "bg-muted";
+                  return (
+                    <div
+                      key={s.id}
+                      className="flex items-center gap-4 px-4 py-2.5"
+                    >
+                      <span
+                        className={cn(
+                          "inline-block h-2 w-2 rounded-full flex-shrink-0",
+                          dotCls,
+                        )}
+                        title={s.status}
+                      />
+                      <span className="w-48 truncate text-xs font-medium">
+                        {s.name}
+                      </span>
+                      <span className="w-56 truncate font-mono text-xs text-muted-foreground">
+                        {s.host}:{s.port}
+                      </span>
+                      <span className="w-40 truncate text-xs text-muted-foreground">
+                        {group?.name ?? "ungrouped"}
+                      </span>
+                      <span className="w-20 text-xs text-muted-foreground">
+                        {s.driver}
+                      </span>
+                      <span className="flex-1 text-right text-xs text-muted-foreground">
+                        {!s.agent_approved
+                          ? "pending approval"
+                          : s.last_health_check_at
+                            ? `checked ${new Date(s.last_health_check_at).toLocaleTimeString()}`
+                            : "never checked"}
                       </span>
                     </div>
                   );

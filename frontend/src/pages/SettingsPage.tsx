@@ -60,6 +60,7 @@ type SectionId =
   | "branding"
   | "discovery"
   | "dns"
+  | "dhcp"
   | "ip-allocation"
   | "session"
   | "subnet-tree"
@@ -93,6 +94,21 @@ const SECTIONS: SectionDef[] = [
     title: "DNS Defaults",
     description: "Default values applied to new zones and server groups.",
     keywords: ["zone", "ttl", "dnssec", "recursion", "agent", "key"],
+  },
+  {
+    id: "dhcp",
+    title: "DHCP Defaults",
+    description:
+      "Default DNS servers, domain, NTP, and lease time pre-filled when creating a new scope.",
+    keywords: [
+      "dns",
+      "domain",
+      "search",
+      "ntp",
+      "lease",
+      "option 42",
+      "scope",
+    ],
   },
   {
     id: "ip-allocation",
@@ -389,6 +405,107 @@ export function SettingsPage() {
                   <span className="rounded bg-muted px-2 py-1 text-xs font-mono text-muted-foreground">
                     configured via DNS_AGENT_KEY env var
                   </span>
+                </Field>
+              </>
+            )}
+
+            {activeId === "dhcp" && (
+              <>
+                <Field
+                  label="Default DNS Servers"
+                  description="Comma-separated IPs. Pre-filled as option 6 on new scopes."
+                >
+                  <input
+                    type="text"
+                    value={(values.dhcp_default_dns_servers ?? []).join(", ")}
+                    onChange={(e) =>
+                      set(
+                        "dhcp_default_dns_servers",
+                        e.target.value
+                          .split(",")
+                          .map((s) => s.trim())
+                          .filter(Boolean),
+                      )
+                    }
+                    placeholder="10.0.0.53, 10.0.0.54"
+                    disabled={!isSuperadmin}
+                    className={inputCls}
+                  />
+                </Field>
+                <Field
+                  label="Default Domain Name"
+                  description="DHCP option 15 — the DNS domain clients should append."
+                >
+                  <input
+                    type="text"
+                    value={values.dhcp_default_domain_name ?? ""}
+                    onChange={(e) =>
+                      set("dhcp_default_domain_name", e.target.value)
+                    }
+                    placeholder="corp.example.com"
+                    disabled={!isSuperadmin}
+                    className={inputCls}
+                  />
+                </Field>
+                <Field
+                  label="Default Domain Search List"
+                  description="DHCP option 119 — comma-separated search suffixes."
+                >
+                  <input
+                    type="text"
+                    value={(values.dhcp_default_domain_search ?? []).join(", ")}
+                    onChange={(e) =>
+                      set(
+                        "dhcp_default_domain_search",
+                        e.target.value
+                          .split(",")
+                          .map((s) => s.trim())
+                          .filter(Boolean),
+                      )
+                    }
+                    placeholder="corp.example.com, example.com"
+                    disabled={!isSuperadmin}
+                    className={inputCls}
+                  />
+                </Field>
+                <Field
+                  label="Default NTP Servers"
+                  description="DHCP option 42 — comma-separated NTP server IPs."
+                >
+                  <input
+                    type="text"
+                    value={(values.dhcp_default_ntp_servers ?? []).join(", ")}
+                    onChange={(e) =>
+                      set(
+                        "dhcp_default_ntp_servers",
+                        e.target.value
+                          .split(",")
+                          .map((s) => s.trim())
+                          .filter(Boolean),
+                      )
+                    }
+                    placeholder="10.0.0.10, 10.0.0.11"
+                    disabled={!isSuperadmin}
+                    className={inputCls}
+                  />
+                </Field>
+                <Field
+                  label="Default Lease Time"
+                  description="Initial lease time (seconds) for new scopes."
+                >
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="number"
+                      min={60}
+                      value={values.dhcp_default_lease_time ?? 86400}
+                      onChange={(e) =>
+                        set("dhcp_default_lease_time", Number(e.target.value))
+                      }
+                      disabled={!isSuperadmin}
+                      className={cn(inputCls, "w-32")}
+                    />
+                    <span className="text-xs text-muted-foreground">sec</span>
+                  </div>
                 </Field>
               </>
             )}
