@@ -10,6 +10,33 @@ import {
 import { Modal, Field, Btns, inputCls, errMsg } from "./_shared";
 import { DHCPOptionsEditor } from "./DHCPOptionsEditor";
 
+// Suggest a dynamic pool range for a v4 subnet: skip the first 10 hosts
+// (reserve for infra / static) and the last host (broadcast). Returns null
+// for IPv6 or subnets too small to be useful.
+function suggestRange(
+  subnet: { network?: string | null } | undefined,
+): { start: string; end: string } | null {
+  if (!subnet?.network) return null;
+  const [cidr, prefixStr] = subnet.network.split("/");
+  if (!cidr || !prefixStr || cidr.includes(":")) return null;
+  const prefix = parseInt(prefixStr, 10);
+  if (prefix < 8 || prefix > 30) return null;
+  const parts = cidr.split(".").map((n) => parseInt(n, 10));
+  if (parts.length !== 4 || parts.some((n) => isNaN(n))) return null;
+  const netInt =
+    ((parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]) >>> 0;
+  const mask = prefix === 0 ? 0 : (0xffffffff << (32 - prefix)) >>> 0;
+  const base = (netInt & mask) >>> 0;
+  const hostBits = 32 - prefix;
+  const total = hostBits >= 32 ? 0 : 1 << hostBits;
+  if (total < 16) return null;
+  const startInt = (base + 10) >>> 0;
+  const endInt = (base + total - 2) >>> 0;
+  const fmt = (n: number) =>
+    `${(n >>> 24) & 0xff}.${(n >>> 16) & 0xff}.${(n >>> 8) & 0xff}.${n & 0xff}`;
+  return { start: fmt(startInt), end: fmt(endInt) };
+}
+
 export function CreateScopeModal({
   scope,
   subnetId: fixedSubnetId,
@@ -47,6 +74,9 @@ export function CreateScopeModal({
     scope?.hostname_sync_mode ?? "ipam",
   );
   const [options, setOptions] = useState<DHCPOption[]>(scope?.options ?? []);
+  // Initial pool — only used when creating; edits happen in the Pools tab.
+  const [poolStart, setPoolStart] = useState("");
+  const [poolEnd, setPoolEnd] = useState("");
   const [error, setError] = useState("");
 
   const { data: subnets = [] } = useQuery({
@@ -88,6 +118,13 @@ export function CreateScopeModal({
     if (next.length) setOptions(next);
     if (settings?.dhcp_default_lease_time)
       setLeaseTime(String(settings.dhcp_default_lease_time));
+    // Suggest a pool range: skip the first 10 and last 1 host of the subnet.
+    // User can freely edit or clear.
+    const range = suggestRange(subnetDetail);
+    if (range) {
+      setPoolStart(range.start);
+      setPoolEnd(range.end);
+    }
     setPrefilled(true);
   }, [editing, prefilled, settings, subnetDetail]);
 
@@ -108,7 +145,17 @@ export function CreateScopeModal({
         options,
       };
       if (editing) return dhcpApi.updateScope(scope!.id, data);
-      return dhcpApi.createScope(subnetId, data);
+      return dhcpApi.createScope(subnetId, data).then(async (created) => {
+        if (poolStart && poolEnd) {
+          await dhcpApi.createPool(created.id, {
+            name: "default",
+            start_ip: poolStart,
+            end_ip: poolEnd,
+            pool_type: "dynamic",
+          });
+        }
+        return created;
+      });
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["dhcp-scopes"] });
@@ -205,6 +252,38 @@ export function CreateScopeModal({
             />
           </Field>
         </div>
+
+        {!editing && (
+          <div className="rounded-md border bg-muted/30 p-3">
+            <div className="mb-2 flex items-baseline justify-between">
+              <span className="text-sm font-medium">Initial pool</span>
+              <span className="text-xs text-muted-foreground">
+                Address range DHCP will hand out. Leave blank to add pools
+                later from the Pools tab.
+              </span>
+            </div>
+            <div className="grid grid-cols-2 gap-3">
+              <Field label="Start IP">
+                <input
+                  type="text"
+                  className={inputCls}
+                  placeholder="10.0.0.10"
+                  value={poolStart}
+                  onChange={(e) => setPoolStart(e.target.value)}
+                />
+              </Field>
+              <Field label="End IP">
+                <input
+                  type="text"
+                  className={inputCls}
+                  placeholder="10.0.0.254"
+                  value={poolEnd}
+                  onChange={(e) => setPoolEnd(e.target.value)}
+                />
+              </Field>
+            </div>
+          </div>
+        )}
 
         <label className="flex items-center gap-2 text-sm">
           <input
