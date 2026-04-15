@@ -203,7 +203,7 @@ async def create_scope(
             DHCPScope.server_id == server_id, DHCPScope.subnet_id == subnet_id
         )
     )
-    if existing.scalar_one_or_none():
+    if existing.unique().scalar_one_or_none():
         raise HTTPException(
             status_code=409, detail="A scope for this server+subnet already exists"
         )
