@@ -1,0 +1,40 @@
+# Per-server external Service.
+# NOTE: in production DHCP clients normally reach the server via a relay
+# agent (option 82) — expose UDP/67 via LoadBalancer/NodePort only for lab
+# setups or where the pod is on the client broadcast domain.
+apiVersion: v1
+kind: Service
+metadata:
+  name: dhcp-kea-dhcp1
+  namespace: spatiumddi
+  labels:
+    app.kubernetes.io/name: spatium-dhcp
+    app.kubernetes.io/instance: dhcp1
+spec:
+  type: NodePort
+  selector:
+    app.kubernetes.io/name: spatium-dhcp
+    app.kubernetes.io/instance: dhcp1
+  ports:
+    - name: dhcp-udp
+      port: 67
+      targetPort: 67
+      protocol: UDP
+    - name: ctrl-http
+      port: 8000
+      targetPort: 8000
+      protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dhcp-kea-dhcp1-headless
+  namespace: spatiumddi
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: spatium-dhcp
+    app.kubernetes.io/instance: dhcp1
+  ports:
+    - { name: dhcp-udp,  port: 67,   protocol: UDP }
+    - { name: ctrl-http, port: 8000, protocol: TCP }

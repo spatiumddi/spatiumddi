@@ -5,8 +5,31 @@
 ```
 k8s/
 ├── base/              # Core application manifests (namespace, API, worker, frontend, migrations)
+├── dns/               # Managed DNS server StatefulSets (bind9)
+├── dhcp/              # Managed DHCP server StatefulSets (kea)
 └── ha/                # High-availability add-ons (PostgreSQL Patroni/CloudNativePG, Redis Sentinel)
 ```
+
+## Managed DHCP servers (Kea)
+
+One StatefulSet per DHCP server row, matching the DNS-agent topology.
+
+```bash
+# Create the agent PSK secret (must match DHCP_AGENT_KEY on the control plane)
+kubectl create secret generic spatium-dhcp-agent-key \
+  --from-literal=SPATIUM_AGENT_KEY=$(openssl rand -hex 32) \
+  -n spatiumddi
+
+# Duplicate kea-statefulset.yaml / service-dhcp.yaml per server (dhcp1, dhcp2, ...)
+kubectl apply -f k8s/dhcp/kea-statefulset.yaml
+kubectl apply -f k8s/dhcp/service-dhcp.yaml
+```
+
+DHCPv4 requires broadcast reception on the client LAN. In most clusters you
+either run the pod with `hostNetwork: true` or front it with a DHCP relay
+(option 82). The stock manifests expose UDP/67 via `NodePort` for lab use
+only.
+
 
 ## Quick Start (single-node / dev)
 

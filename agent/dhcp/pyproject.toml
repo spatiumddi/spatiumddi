@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "spatium-dhcp-agent"
+version = "2026.04.15.1"
+description = "SpatiumDDI sidecar agent for managed Kea DHCP containers"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Apache-2.0" }
+authors = [{ name = "SpatiumDDI Contributors" }]
+dependencies = [
+  "httpx>=0.27",
+  "structlog>=24.1",
+  "pydantic>=2.6",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "pytest-asyncio>=0.23", "ruff>=0.4", "mypy>=1.10"]
+
+[project.scripts]
+spatium-dhcp-agent = "spatium_dhcp_agent.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["spatium_dhcp_agent*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
