@@ -61,6 +61,11 @@ class PoolResponse(BaseModel):
 
     model_config = {"from_attributes": True}
 
+    @field_validator("start_ip", "end_ip", mode="before")
+    @classmethod
+    def _inet_to_str(cls, v: Any) -> Any:
+        return str(v) if v is not None else v
+
 
 @router.get("/scopes/{scope_id}/pools", response_model=list[PoolResponse])
 async def list_pools(scope_id: uuid.UUID, db: DB, _: CurrentUser) -> list[DHCPPool]:

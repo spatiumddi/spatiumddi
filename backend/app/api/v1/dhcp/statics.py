@@ -8,7 +8,7 @@ from datetime import datetime
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, status
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
@@ -52,6 +52,11 @@ class StaticResponse(BaseModel):
     modified_at: datetime
 
     model_config = {"from_attributes": True}
+
+    @field_validator("ip_address", "mac_address", mode="before")
+    @classmethod
+    def _inet_mac_to_str(cls, v: Any) -> Any:
+        return str(v) if v is not None else v
 
 
 async def _conflict_check(
