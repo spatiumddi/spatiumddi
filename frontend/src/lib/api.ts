@@ -708,6 +708,99 @@ export interface DNSImportCommit {
   conflict_strategy: string;
 }
 
+// ── DNS Blocking Lists ─────────────────────────────────────────────────────
+
+export interface DNSBlockList {
+  id: string;
+  name: string;
+  description: string;
+  category: string;
+  source_type: string;
+  feed_url: string | null;
+  feed_format: string;
+  update_interval_hours: number;
+  block_mode: string;
+  sinkhole_ip: string | null;
+  enabled: boolean;
+  last_synced_at: string | null;
+  last_sync_status: string | null;
+  last_sync_error: string | null;
+  entry_count: number;
+  created_at: string;
+  modified_at: string;
+  applied_group_ids: string[];
+  applied_view_ids: string[];
+}
+
+export interface DNSBlockListEntry {
+  id: string;
+  list_id: string;
+  domain: string;
+  entry_type: string;
+  target: string | null;
+  source: string;
+  is_wildcard: boolean;
+  added_at: string;
+}
+
+export interface DNSBlockListEntryPage {
+  total: number;
+  items: DNSBlockListEntry[];
+}
+
+export interface DNSBlockListException {
+  id: string;
+  list_id: string;
+  domain: string;
+  reason: string;
+  created_at: string;
+}
+
+export const dnsBlocklistApi = {
+  list: () => api.get<DNSBlockList[]>("/dns/blocklists").then((r) => r.data),
+  get: (id: string) => api.get<DNSBlockList>(`/dns/blocklists/${id}`).then((r) => r.data),
+  create: (data: Partial<DNSBlockList>) =>
+    api.post<DNSBlockList>("/dns/blocklists", data).then((r) => r.data),
+  update: (id: string, data: Partial<DNSBlockList>) =>
+    api.put<DNSBlockList>(`/dns/blocklists/${id}`, data).then((r) => r.data),
+  delete: (id: string) => api.delete(`/dns/blocklists/${id}`),
+
+  updateAssignments: (
+    id: string,
+    data: { server_group_ids?: string[]; view_ids?: string[] }
+  ) => api.put<DNSBlockList>(`/dns/blocklists/${id}/assignments`, data).then((r) => r.data),
+
+  refresh: (id: string) =>
+    api
+      .post<{ list_id: string; task_id: string | null; status: string }>(
+        `/dns/blocklists/${id}/refresh`
+      )
+      .then((r) => r.data),
+
+  listEntries: (id: string, params?: { q?: string; limit?: number; offset?: number }) =>
+    api
+      .get<DNSBlockListEntryPage>(`/dns/blocklists/${id}/entries`, { params })
+      .then((r) => r.data),
+  addEntry: (id: string, data: Partial<DNSBlockListEntry>) =>
+    api.post<DNSBlockListEntry>(`/dns/blocklists/${id}/entries`, data).then((r) => r.data),
+  bulkAddEntries: (id: string, domains: string[]) =>
+    api
+      .post<{ added: number; skipped: number; total: number }>(
+        `/dns/blocklists/${id}/entries/bulk`,
+        { domains }
+      )
+      .then((r) => r.data),
+  deleteEntry: (id: string, entryId: string) =>
+    api.delete(`/dns/blocklists/${id}/entries/${entryId}`),
+
+  listExceptions: (id: string) =>
+    api.get<DNSBlockListException[]>(`/dns/blocklists/${id}/exceptions`).then((r) => r.data),
+  addException: (id: string, data: { domain: string; reason?: string }) =>
+    api.post<DNSBlockListException>(`/dns/blocklists/${id}/exceptions`, data).then((r) => r.data),
+  deleteException: (id: string, exceptionId: string) =>
+    api.delete(`/dns/blocklists/${id}/exceptions/${exceptionId}`),
+};
+
 export const authApi = {
   login: (username: string, password: string) =>
     api.post<LoginResponse>("/auth/login", { username, password }).then((r) => r.data),

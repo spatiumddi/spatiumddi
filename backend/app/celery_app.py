@@ -8,6 +8,7 @@ celery_app = Celery(
     backend=settings.celery_result_backend,
     include=[
         "app.tasks.ipam",
+        "app.tasks.dns",
     ],
 )
 
@@ -22,5 +23,6 @@ celery_app.conf.update(
     worker_prefetch_multiplier=1,
     task_routes={
         "app.tasks.ipam.*": {"queue": "ipam"},
+        "app.tasks.dns.*": {"queue": "dns"},
     },
 )

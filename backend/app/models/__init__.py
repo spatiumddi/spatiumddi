@@ -4,6 +4,9 @@ from app.models.base import Base
 from app.models.dns import (
     DNSAcl,
     DNSAclEntry,
+    DNSBlockList,
+    DNSBlockListEntry,
+    DNSBlockListException,
     DNSRecord,
     DNSServer,
     DNSServerGroup,
@@ -49,4 +52,7 @@ __all__ = [
     "DNSView",
     "DNSZone",
     "DNSRecord",
+    "DNSBlockList",
+    "DNSBlockListEntry",
+    "DNSBlockListException",
 ]

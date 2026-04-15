@@ -4,12 +4,14 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   Globe, Plus, Trash2, Pencil, ChevronDown, ChevronRight,
   Settings2, Shield, Eye, FileText, Layers, RefreshCw, X, Cpu,
-  FolderOpen, Folder, Upload, Download,
+  FolderOpen, Folder, Upload, Download, Ban,
 } from "lucide-react";
 import {
   dnsApi,
+  dnsBlocklistApi,
   type DNSServerGroup, type DNSServer, type DNSZone, type DNSView, type DNSRecord,
   type DNSImportPreview, type DNSRecordChange,
+  type DNSBlockList, type DNSBlockListEntry, type DNSBlockListException,
 } from "@/lib/api";
 
 // ── Shared primitives ─────────────────────────────────────────────────────────
@@ -1288,9 +1290,508 @@ function ZonesTab({ group, onSelectZone }: { group: DNSServerGroup; onSelectZone
   );
 }
 
+// ── Blocklists Tab ────────────────────────────────────────────────────────────
+
+function BlocklistsTab({ group }: { group: DNSServerGroup }) {
+  const qc = useQueryClient();
+  const [selected, setSelected] = useState<DNSBlockList | null>(null);
+  const [showCreate, setShowCreate] = useState(false);
+  const [editList, setEditList] = useState<DNSBlockList | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState<DNSBlockList | null>(null);
+
+  const { data: lists = [], isFetching } = useQuery({
+    queryKey: ["dns-blocklists"],
+    queryFn: () => dnsBlocklistApi.list(),
+  });
+
+  // Filter by lists applied to this group (or not yet applied anywhere)
+  const applied = lists.filter((l) => l.applied_group_ids.includes(group.id));
+  const other   = lists.filter((l) => !l.applied_group_ids.includes(group.id));
+
+  const deleteMut = useMutation({
+    mutationFn: (id: string) => dnsBlocklistApi.delete(id),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["dns-blocklists"] });
+      setConfirmDelete(null);
+      if (selected && confirmDelete && selected.id === confirmDelete.id) setSelected(null);
+    },
+  });
+
+  const toggleAssignment = useMutation({
+    mutationFn: async ({ list, assign }: { list: DNSBlockList; assign: boolean }) => {
+      const ids = new Set(list.applied_group_ids);
+      if (assign) ids.add(group.id); else ids.delete(group.id);
+      return dnsBlocklistApi.updateAssignments(list.id, { server_group_ids: Array.from(ids) });
+    },
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["dns-blocklists"] }),
+  });
+
+  const refreshMut = useMutation({
+    mutationFn: (id: string) => dnsBlocklistApi.refresh(id),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["dns-blocklists"] }),
+  });
+
+  if (selected) {
+    return (
+      <BlocklistDetail
+        list={selected}
+        onBack={() => { setSelected(null); qc.invalidateQueries({ queryKey: ["dns-blocklists"] }); }}
+      />
+    );
+  }
+
+  return (
+    <div className="space-y-6">
+      <div className="flex items-center justify-between">
+        <span className="text-xs font-medium text-muted-foreground uppercase tracking-wider">
+          {lists.length} blocking list{lists.length !== 1 ? "s" : ""}
+        </span>
+        <button
+          className="flex items-center gap-1 rounded-md bg-primary px-2 py-1 text-xs text-primary-foreground hover:bg-primary/90"
+          onClick={() => setShowCreate(true)}
+        >
+          <Plus className="h-3 w-3" /> New Blocking List
+        </button>
+      </div>
+
+      {isFetching && lists.length === 0 && (
+        <p className="text-sm text-muted-foreground">Loading…</p>
+      )}
+
+      {[
+        { label: "Applied to this group", rows: applied, assigned: true },
+        { label: "Available (not applied)", rows: other, assigned: false },
+      ].map((section) => (
+        <div key={section.label}>
+          <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-2">
+            {section.label}
+          </h4>
+          {section.rows.length === 0 && (
+            <p className="text-xs text-muted-foreground italic">None.</p>
+          )}
+          <div className="space-y-1">
+            {section.rows.map((l) => (
+              <div
+                key={l.id}
+                className="flex items-center gap-2 rounded-md border bg-card px-3 py-2 group hover:bg-accent/30 cursor-pointer"
+                onClick={() => setSelected(l)}
+              >
+                <Ban className="h-3.5 w-3.5 text-muted-foreground flex-shrink-0" />
+                <span className="font-mono text-sm truncate">{l.name}</span>
+                <span className="inline-flex items-center rounded px-1.5 py-0.5 text-xs bg-muted text-muted-foreground">
+                  {l.category}
+                </span>
+                <span className="inline-flex items-center rounded px-1.5 py-0.5 text-xs bg-muted text-muted-foreground">
+                  {l.block_mode}
+                </span>
+                {l.source_type === "url" && l.feed_url && (
+                  <span className="inline-flex items-center rounded px-1.5 py-0.5 text-xs bg-blue-500/15 text-blue-600">
+                    feed
+                  </span>
+                )}
+                {!l.enabled && (
+                  <span className="inline-flex items-center rounded px-1.5 py-0.5 text-xs bg-amber-500/15 text-amber-600">
+                    disabled
+                  </span>
+                )}
+                <span className="ml-auto text-xs text-muted-foreground">
+                  {l.entry_count} entries
+                </span>
+                <div
+                  className="flex items-center gap-1 opacity-0 group-hover:opacity-100"
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  <button
+                    title={section.assigned ? "Detach from this group" : "Apply to this group"}
+                    className={`rounded border px-2 py-0.5 text-xs ${section.assigned ? "text-amber-600 border-amber-400" : "text-emerald-600 border-emerald-400"}`}
+                    onClick={() => toggleAssignment.mutate({ list: l, assign: !section.assigned })}
+                  >
+                    {section.assigned ? "Detach" : "Apply"}
+                  </button>
+                  {l.source_type === "url" && l.feed_url && (
+                    <button
+                      title="Refresh from feed"
+                      className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-foreground"
+                      onClick={() => refreshMut.mutate(l.id)}
+                    >
+                      <RefreshCw className="h-3 w-3" />
+                    </button>
+                  )}
+                  <button
+                    className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-foreground"
+                    onClick={() => setEditList(l)}
+                  >
+                    <Pencil className="h-3 w-3" />
+                  </button>
+                  <button
+                    className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-destructive"
+                    onClick={() => setConfirmDelete(l)}
+                  >
+                    <Trash2 className="h-3 w-3" />
+                  </button>
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      ))}
+
+      {showCreate && <BlocklistModal onClose={() => setShowCreate(false)} />}
+      {editList && <BlocklistModal list={editList} onClose={() => setEditList(null)} />}
+      {confirmDelete && (
+        <ConfirmDestroyModal
+          title="Delete Blocking List"
+          description={`Permanently delete "${confirmDelete.name}" and all its entries/exceptions?`}
+          checkLabel={`I understand all entries in "${confirmDelete.name}" will be permanently deleted.`}
+          onConfirm={() => deleteMut.mutate(confirmDelete.id)}
+          onClose={() => setConfirmDelete(null)}
+          isPending={deleteMut.isPending}
+        />
+      )}
+    </div>
+  );
+}
+
+function BlocklistModal({ list, onClose }: { list?: DNSBlockList; onClose: () => void }) {
+  const qc = useQueryClient();
+  const [name, setName] = useState(list?.name ?? "");
+  const [description, setDescription] = useState(list?.description ?? "");
+  const [category, setCategory] = useState(list?.category ?? "custom");
+  const [sourceType, setSourceType] = useState(list?.source_type ?? "manual");
+  const [feedUrl, setFeedUrl] = useState(list?.feed_url ?? "");
+  const [feedFormat, setFeedFormat] = useState(list?.feed_format ?? "hosts");
+  const [blockMode, setBlockMode] = useState(list?.block_mode ?? "nxdomain");
+  const [sinkholeIp, setSinkholeIp] = useState(list?.sinkhole_ip ?? "");
+  const [updateHours, setUpdateHours] = useState(list?.update_interval_hours ?? 24);
+  const [enabled, setEnabled] = useState(list?.enabled ?? true);
+  const [error, setError] = useState("");
+
+  const mut = useMutation({
+    mutationFn: (d: Partial<DNSBlockList>) =>
+      list ? dnsBlocklistApi.update(list.id, d) : dnsBlocklistApi.create(d),
+    onSuccess: () => { qc.invalidateQueries({ queryKey: ["dns-blocklists"] }); onClose(); },
+    onError: (e: ApiError) => setError(e.response?.data?.detail ?? "Failed"),
+  });
+
+  return (
+    <Modal title={list ? "Edit Blocking List" : "New Blocking List"} onClose={onClose} wide>
+      <form
+        className="space-y-3"
+        onSubmit={(e) => {
+          e.preventDefault();
+          mut.mutate({
+            name,
+            description,
+            category,
+            source_type: sourceType,
+            feed_url: sourceType === "url" ? feedUrl || null : null,
+            feed_format: feedFormat,
+            block_mode: blockMode,
+            sinkhole_ip: blockMode === "sinkhole" ? (sinkholeIp || null) : null,
+            update_interval_hours: updateHours,
+            enabled,
+          });
+        }}
+      >
+        <Field label="Name">
+          <input className={inputCls} value={name} onChange={(e) => setName(e.target.value)} required />
+        </Field>
+        <Field label="Description">
+          <input className={inputCls} value={description} onChange={(e) => setDescription(e.target.value)} />
+        </Field>
+        <div className="grid grid-cols-2 gap-3">
+          <Field label="Category">
+            <input className={inputCls} value={category} onChange={(e) => setCategory(e.target.value)} placeholder="ads | malware | tracking | ..." />
+          </Field>
+          <Field label="Block mode">
+            <select className={inputCls} value={blockMode} onChange={(e) => setBlockMode(e.target.value)}>
+              <option value="nxdomain">nxdomain</option>
+              <option value="sinkhole">sinkhole</option>
+              <option value="refused">refused</option>
+            </select>
+          </Field>
+        </div>
+        {blockMode === "sinkhole" && (
+          <Field label="Sinkhole IP">
+            <input className={inputCls} value={sinkholeIp} onChange={(e) => setSinkholeIp(e.target.value)} placeholder="0.0.0.0" />
+          </Field>
+        )}
+        <div className="grid grid-cols-2 gap-3">
+          <Field label="Source type">
+            <select className={inputCls} value={sourceType} onChange={(e) => setSourceType(e.target.value)}>
+              <option value="manual">manual</option>
+              <option value="url">url (feed)</option>
+              <option value="file_upload">file_upload</option>
+            </select>
+          </Field>
+          <Field label="Feed format">
+            <select className={inputCls} value={feedFormat} onChange={(e) => setFeedFormat(e.target.value)}>
+              <option value="hosts">hosts</option>
+              <option value="domains">domains</option>
+              <option value="adblock">adblock</option>
+            </select>
+          </Field>
+        </div>
+        {sourceType === "url" && (
+          <>
+            <Field label="Feed URL">
+              <input className={inputCls} value={feedUrl} onChange={(e) => setFeedUrl(e.target.value)} placeholder="https://example.com/list.txt" />
+            </Field>
+            <Field label="Update interval (hours, 0 = manual)">
+              <input type="number" min={0} className={inputCls} value={updateHours} onChange={(e) => setUpdateHours(Number(e.target.value))} />
+            </Field>
+          </>
+        )}
+        <label className="flex items-center gap-2 text-sm">
+          <input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} />
+          Enabled
+        </label>
+        {error && <p className="text-xs text-destructive">{error}</p>}
+        <Btns onClose={onClose} pending={mut.isPending} />
+      </form>
+    </Modal>
+  );
+}
+
+function BlocklistDetail({ list, onBack }: { list: DNSBlockList; onBack: () => void }) {
+  const qc = useQueryClient();
+  const [q, setQ] = useState("");
+  const [limit] = useState(50);
+  const [offset, setOffset] = useState(0);
+  const [newDomain, setNewDomain] = useState("");
+  const [bulkText, setBulkText] = useState("");
+  const [showBulk, setShowBulk] = useState(false);
+  const [excDomain, setExcDomain] = useState("");
+  const [excReason, setExcReason] = useState("");
+
+  const { data: page } = useQuery({
+    queryKey: ["dns-blocklist-entries", list.id, q, limit, offset],
+    queryFn: () => dnsBlocklistApi.listEntries(list.id, { q: q || undefined, limit, offset }),
+  });
+  const { data: exceptions = [] } = useQuery({
+    queryKey: ["dns-blocklist-exceptions", list.id],
+    queryFn: () => dnsBlocklistApi.listExceptions(list.id),
+  });
+
+  const addEntry = useMutation({
+    mutationFn: () => dnsBlocklistApi.addEntry(list.id, { domain: newDomain }),
+    onSuccess: () => { setNewDomain(""); qc.invalidateQueries({ queryKey: ["dns-blocklist-entries", list.id] }); },
+  });
+  const bulkAdd = useMutation({
+    mutationFn: () =>
+      dnsBlocklistApi.bulkAddEntries(
+        list.id,
+        bulkText.split(/\r?\n/).map((s) => s.trim()).filter(Boolean)
+      ),
+    onSuccess: () => {
+      setBulkText(""); setShowBulk(false);
+      qc.invalidateQueries({ queryKey: ["dns-blocklist-entries", list.id] });
+    },
+  });
+  const deleteEntry = useMutation({
+    mutationFn: (id: string) => dnsBlocklistApi.deleteEntry(list.id, id),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["dns-blocklist-entries", list.id] }),
+  });
+  const addException = useMutation({
+    mutationFn: () => dnsBlocklistApi.addException(list.id, { domain: excDomain, reason: excReason }),
+    onSuccess: () => {
+      setExcDomain(""); setExcReason("");
+      qc.invalidateQueries({ queryKey: ["dns-blocklist-exceptions", list.id] });
+    },
+  });
+  const deleteException = useMutation({
+    mutationFn: (id: string) => dnsBlocklistApi.deleteException(list.id, id),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["dns-blocklist-exceptions", list.id] }),
+  });
+  const refresh = useMutation({
+    mutationFn: () => dnsBlocklistApi.refresh(list.id),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["dns-blocklists"] }),
+  });
+
+  const total = page?.total ?? 0;
+  const items = page?.items ?? [];
+
+  return (
+    <div className="space-y-5">
+      <div className="flex items-center gap-3">
+        <button className="text-xs text-muted-foreground hover:text-foreground" onClick={onBack}>
+          <ChevronRight className="h-3 w-3 rotate-180 inline mr-1" />Back
+        </button>
+        <h3 className="font-semibold text-sm">{list.name}</h3>
+        <span className="text-xs text-muted-foreground">{total} entries · {exceptions.length} exceptions</span>
+        {list.feed_url && (
+          <button
+            className="ml-auto flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent"
+            onClick={() => refresh.mutate()}
+            disabled={refresh.isPending}
+          >
+            <RefreshCw className="h-3 w-3" />
+            {refresh.isPending ? "Queuing…" : "Refresh from feed"}
+          </button>
+        )}
+      </div>
+
+      {list.last_synced_at && (
+        <p className="text-xs text-muted-foreground">
+          Last synced: {new Date(list.last_synced_at).toLocaleString()}
+          {list.last_sync_status && <> — {list.last_sync_status}</>}
+          {list.last_sync_error && <span className="text-destructive"> ({list.last_sync_error})</span>}
+        </p>
+      )}
+
+      {/* Entries */}
+      <div className="rounded-md border">
+        <div className="flex items-center gap-2 border-b p-2">
+          <input
+            className={`${inputCls} flex-1`}
+            placeholder="Search entries…"
+            value={q}
+            onChange={(e) => { setQ(e.target.value); setOffset(0); }}
+          />
+          <input
+            className={inputCls}
+            placeholder="Add single domain"
+            value={newDomain}
+            onChange={(e) => setNewDomain(e.target.value)}
+            onKeyDown={(e) => { if (e.key === "Enter" && newDomain) { e.preventDefault(); addEntry.mutate(); } }}
+          />
+          <button
+            className="rounded-md border px-2 py-1 text-xs hover:bg-accent"
+            onClick={() => addEntry.mutate()}
+            disabled={!newDomain}
+          >
+            Add
+          </button>
+          <button
+            className="rounded-md border px-2 py-1 text-xs hover:bg-accent"
+            onClick={() => setShowBulk(true)}
+          >
+            Bulk add
+          </button>
+        </div>
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="text-left text-xs text-muted-foreground">
+              <th className="px-3 py-1.5">Domain</th>
+              <th className="px-3 py-1.5">Type</th>
+              <th className="px-3 py-1.5">Source</th>
+              <th className="px-3 py-1.5 w-8"></th>
+            </tr>
+          </thead>
+          <tbody>
+            {items.length === 0 && (
+              <tr><td colSpan={4} className="px-3 py-4 text-center text-xs text-muted-foreground italic">No entries</td></tr>
+            )}
+            {items.map((e: DNSBlockListEntry) => (
+              <tr key={e.id} className="border-t hover:bg-accent/30">
+                <td className="px-3 py-1 font-mono text-xs">{e.domain}</td>
+                <td className="px-3 py-1 text-xs">{e.entry_type}</td>
+                <td className="px-3 py-1 text-xs">{e.source}</td>
+                <td className="px-3 py-1 text-right">
+                  <button
+                    className="text-muted-foreground hover:text-destructive"
+                    onClick={() => deleteEntry.mutate(e.id)}
+                  >
+                    <Trash2 className="h-3 w-3" />
+                  </button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+        {total > limit && (
+          <div className="flex items-center justify-between border-t px-3 py-1.5 text-xs">
+            <span className="text-muted-foreground">{offset + 1}–{Math.min(offset + limit, total)} of {total}</span>
+            <div className="flex gap-1">
+              <button className="rounded border px-2 py-0.5 disabled:opacity-40" disabled={offset === 0} onClick={() => setOffset(Math.max(0, offset - limit))}>Prev</button>
+              <button className="rounded border px-2 py-0.5 disabled:opacity-40" disabled={offset + limit >= total} onClick={() => setOffset(offset + limit)}>Next</button>
+            </div>
+          </div>
+        )}
+      </div>
+
+      {/* Exceptions */}
+      <div className="rounded-md border">
+        <div className="flex items-center justify-between border-b p-2">
+          <span className="text-xs font-medium text-muted-foreground uppercase tracking-wider">Exceptions (allow-list)</span>
+        </div>
+        <div className="flex items-center gap-2 border-b p-2">
+          <input
+            className={inputCls}
+            placeholder="domain"
+            value={excDomain}
+            onChange={(e) => setExcDomain(e.target.value)}
+          />
+          <input
+            className={`${inputCls} flex-1`}
+            placeholder="reason (optional)"
+            value={excReason}
+            onChange={(e) => setExcReason(e.target.value)}
+          />
+          <button
+            className="rounded-md border px-2 py-1 text-xs hover:bg-accent"
+            onClick={() => addException.mutate()}
+            disabled={!excDomain}
+          >
+            Add
+          </button>
+        </div>
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="text-left text-xs text-muted-foreground">
+              <th className="px-3 py-1.5">Domain</th>
+              <th className="px-3 py-1.5">Reason</th>
+              <th className="px-3 py-1.5 w-8"></th>
+            </tr>
+          </thead>
+          <tbody>
+            {exceptions.length === 0 && (
+              <tr><td colSpan={3} className="px-3 py-4 text-center text-xs text-muted-foreground italic">No exceptions</td></tr>
+            )}
+            {exceptions.map((ex: DNSBlockListException) => (
+              <tr key={ex.id} className="border-t hover:bg-accent/30">
+                <td className="px-3 py-1 font-mono text-xs">{ex.domain}</td>
+                <td className="px-3 py-1 text-xs">{ex.reason}</td>
+                <td className="px-3 py-1 text-right">
+                  <button
+                    className="text-muted-foreground hover:text-destructive"
+                    onClick={() => deleteException.mutate(ex.id)}
+                  >
+                    <Trash2 className="h-3 w-3" />
+                  </button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      {showBulk && (
+        <Modal title="Bulk Add Domains" onClose={() => setShowBulk(false)} wide>
+          <form
+            className="space-y-3"
+            onSubmit={(e) => { e.preventDefault(); bulkAdd.mutate(); }}
+          >
+            <p className="text-xs text-muted-foreground">
+              One domain per line. Duplicates and invalid entries are skipped.
+            </p>
+            <textarea
+              className={`${inputCls} font-mono text-xs`}
+              rows={12}
+              value={bulkText}
+              onChange={(e) => setBulkText(e.target.value)}
+            />
+            <Btns onClose={() => setShowBulk(false)} pending={bulkAdd.isPending} label="Add Domains" />
+          </form>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
 // ── Group Detail View ─────────────────────────────────────────────────────────
 
-type GroupTab = "zones" | "servers" | "views" | "acls" | "options";
+type GroupTab = "zones" | "servers" | "views" | "acls" | "blocklists" | "options";
 
 function GroupDetailView({ group, onSelectZone }: { group: DNSServerGroup; onSelectZone: (z: DNSZone) => void }) {
   const [tab, setTab] = useState<GroupTab>("zones");
@@ -1300,6 +1801,7 @@ function GroupDetailView({ group, onSelectZone }: { group: DNSServerGroup; onSel
     { id: "servers", label: "Servers", icon: Cpu },
     { id: "views",   label: "Views",   icon: Eye },
     { id: "acls",    label: "ACLs",    icon: Shield },
+    { id: "blocklists", label: "Blocking Lists", icon: Ban },
     { id: "options", label: "Options", icon: Settings2 },
   ];
 
@@ -1337,6 +1839,7 @@ function GroupDetailView({ group, onSelectZone }: { group: DNSServerGroup; onSel
         {tab === "servers" && <ServersTab group={group} />}
         {tab === "views"   && <ViewsTab group={group} />}
         {tab === "acls"    && <AclsTab groupId={group.id} />}
+        {tab === "blocklists" && <BlocklistsTab group={group} />}
         {tab === "options" && <OptionsTab groupId={group.id} />}
       </div>
     </div>

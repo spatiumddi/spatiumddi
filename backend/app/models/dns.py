@@ -5,13 +5,16 @@ from datetime import datetime
 
 from sqlalchemy import (
     Boolean,
+    Column,
     DateTime,
     ForeignKey,
     Index,
     Integer,
     String,
+    Table,
     Text,
     UniqueConstraint,
+    func,
 )
 from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -45,6 +48,11 @@ class DNSServerGroup(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
     options: Mapped["DNSServerOptions | None"] = relationship(
         "DNSServerOptions", back_populates="group", uselist=False, cascade="all, delete-orphan"
+    )
+    blocklists: Mapped[list["DNSBlockList"]] = relationship(
+        "DNSBlockList",
+        secondary="dns_blocklist_group_assoc",
+        back_populates="server_groups",
     )
 
 
@@ -215,6 +223,11 @@ class DNSView(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     group: Mapped["DNSServerGroup"] = relationship("DNSServerGroup", back_populates="views")
     zones: Mapped[list["DNSZone"]] = relationship("DNSZone", back_populates="view")
+    blocklists: Mapped[list["DNSBlockList"]] = relationship(
+        "DNSBlockList",
+        secondary="dns_blocklist_view_assoc",
+        back_populates="views",
+    )
 
 
 class DNSZone(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -305,3 +318,158 @@ class DNSRecord(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
 
     zone: Mapped["DNSZone"] = relationship("DNSZone", back_populates="records")
+
+
+# ── Blocking Lists / RPZ ────────────────────────────────────────────────────
+
+# Association tables: a blocklist can be applied to many server groups and/or
+# many views. A view or group can reference many blocklists.
+dns_blocklist_group_assoc = Table(
+    "dns_blocklist_group_assoc",
+    Base.metadata,
+    Column(
+        "blocklist_id",
+        UUID(as_uuid=True),
+        ForeignKey("dns_blocklist.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    Column(
+        "group_id",
+        UUID(as_uuid=True),
+        ForeignKey("dns_server_group.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+)
+
+
+dns_blocklist_view_assoc = Table(
+    "dns_blocklist_view_assoc",
+    Base.metadata,
+    Column(
+        "blocklist_id",
+        UUID(as_uuid=True),
+        ForeignKey("dns_blocklist.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+    Column(
+        "view_id",
+        UUID(as_uuid=True),
+        ForeignKey("dns_view.id", ondelete="CASCADE"),
+        primary_key=True,
+    ),
+)
+
+
+class DNSBlockList(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """A named collection of domains to be blocked via RPZ or equivalent backend mechanism.
+
+    A blocklist is backend-neutral: the DNS driver consumes an effective list
+    of entries + exceptions via the service layer and emits the appropriate
+    BIND9 RPZ zone or PowerDNS Lua/recursor config. No driver specifics live on
+    this model.
+    """
+
+    __tablename__ = "dns_blocklist"
+
+    name: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    # category: ads | malware | tracking | adult | custom | ...
+    category: Mapped[str] = mapped_column(String(50), nullable=False, default="custom")
+    # source_type: manual | url | file_upload
+    source_type: Mapped[str] = mapped_column(String(20), nullable=False, default="manual")
+    feed_url: Mapped[str | None] = mapped_column(String(1024), nullable=True)
+    # format: hosts | domains | adblock
+    feed_format: Mapped[str] = mapped_column(String(20), nullable=False, default="hosts")
+    # 0 = manual refresh only
+    update_interval_hours: Mapped[int] = mapped_column(Integer, nullable=False, default=24)
+    # block_mode: nxdomain | sinkhole | refused
+    block_mode: Mapped[str] = mapped_column(String(20), nullable=False, default="nxdomain")
+    sinkhole_ip: Mapped[str | None] = mapped_column(String(45), nullable=True)
+
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+    last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_sync_status: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    last_sync_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    entry_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    entries: Mapped[list["DNSBlockListEntry"]] = relationship(
+        "DNSBlockListEntry",
+        back_populates="blocklist",
+        cascade="all, delete-orphan",
+    )
+    exceptions: Mapped[list["DNSBlockListException"]] = relationship(
+        "DNSBlockListException",
+        back_populates="blocklist",
+        cascade="all, delete-orphan",
+    )
+
+    server_groups: Mapped[list["DNSServerGroup"]] = relationship(
+        "DNSServerGroup",
+        secondary=dns_blocklist_group_assoc,
+        back_populates="blocklists",
+    )
+    views: Mapped[list["DNSView"]] = relationship(
+        "DNSView",
+        secondary=dns_blocklist_view_assoc,
+        back_populates="blocklists",
+    )
+
+
+class DNSBlockListEntry(UUIDPrimaryKeyMixin, Base):
+    """A single domain entry within a blocklist."""
+
+    __tablename__ = "dns_blocklist_entry"
+    __table_args__ = (
+        UniqueConstraint("list_id", "domain", name="uq_dns_blocklist_entry_list_domain"),
+        Index("ix_dns_blocklist_entry_list_domain", "list_id", "domain"),
+        Index("ix_dns_blocklist_entry_domain", "domain"),
+    )
+
+    list_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dns_blocklist.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    domain: Mapped[str] = mapped_column(String(512), nullable=False)
+    # type: block | redirect | nxdomain
+    entry_type: Mapped[str] = mapped_column(String(20), nullable=False, default="block")
+    # target: for redirect entries, the IP/hostname to return instead
+    target: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    # source: manual | feed
+    source: Mapped[str] = mapped_column(String(20), nullable=False, default="manual")
+    is_wildcard: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    source_line: Mapped[str | None] = mapped_column(Text, nullable=True)
+    added_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    blocklist: Mapped["DNSBlockList"] = relationship("DNSBlockList", back_populates="entries")
+
+
+class DNSBlockListException(UUIDPrimaryKeyMixin, Base):
+    """Allow-list exception — domain is never blocked by the parent list."""
+
+    __tablename__ = "dns_blocklist_exception"
+    __table_args__ = (
+        UniqueConstraint("list_id", "domain", name="uq_dns_blocklist_exception_list_domain"),
+        Index("ix_dns_blocklist_exception_list_domain", "list_id", "domain"),
+    )
+
+    list_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dns_blocklist.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    domain: Mapped[str] = mapped_column(String(512), nullable=False)
+    reason: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("user.id", ondelete="SET NULL"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    blocklist: Mapped["DNSBlockList"] = relationship("DNSBlockList", back_populates="exceptions")
