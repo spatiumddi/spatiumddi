@@ -1,6 +1,17 @@
 from app.models.audit import AuditLog
 from app.models.auth import APIToken, Group, Role, User, UserSession, user_group
 from app.models.base import Base
+from app.models.dhcp import (
+    DHCPClientClass,
+    DHCPConfigOp,
+    DHCPLease,
+    DHCPPool,
+    DHCPRecordOp,
+    DHCPScope,
+    DHCPServer,
+    DHCPServerGroup,
+    DHCPStaticAssignment,
+)
 from app.models.dns import (
     DNSAcl,
     DNSAclEntry,
@@ -57,4 +68,13 @@ __all__ = [
     "DNSBlockList",
     "DNSBlockListEntry",
     "DNSBlockListException",
+    "DHCPServerGroup",
+    "DHCPServer",
+    "DHCPScope",
+    "DHCPPool",
+    "DHCPStaticAssignment",
+    "DHCPClientClass",
+    "DHCPLease",
+    "DHCPConfigOp",
+    "DHCPRecordOp",
 ]

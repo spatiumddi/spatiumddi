@@ -56,6 +56,14 @@ class Settings(BaseSettings):
     dns_agent_longpoll_timeout: int = 30
     dns_require_agent_approval: bool = False
 
+    # DHCP agent
+    dhcp_agent_key: str = ""
+    dhcp_agent_token_ttl_hours: int = 24
+    dhcp_agent_longpoll_timeout: int = 30
+    dhcp_require_agent_approval: bool = False
+    dhcp_sync_interval_seconds: int = 60
+    dhcp_lease_sync_interval_minutes: int = 5
+
     # App
     app_title: str = "SpatiumDDI"
     debug: bool = False

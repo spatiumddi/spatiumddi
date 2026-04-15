@@ -10,6 +10,7 @@ celery_app = Celery(
     include=[
         "app.tasks.ipam",
         "app.tasks.dns",
+        "app.tasks.dhcp_health",
     ],
 )
 
@@ -32,11 +33,17 @@ celery_app.conf.update(
     task_routes={
         "app.tasks.ipam.*": {"queue": "ipam"},
         "app.tasks.dns.*": {"queue": "dns"},
+        "app.tasks.dhcp_health.*": {"queue": "dhcp"},
     },
     beat_schedule={
         # Every 60s, fan-out health checks to every registered DNS server.
         "dns-health-sweep": {
             "task": "app.tasks.dns.check_all_dns_servers_health",
+            "schedule": schedule(run_every=60.0),
+        },
+        # Every 60s, fan-out health checks to every registered DHCP server.
+        "dhcp-health-sweep": {
+            "task": "app.tasks.dhcp_health.check_all_dhcp_servers_health",
             "schedule": schedule(run_every=60.0),
         },
     },

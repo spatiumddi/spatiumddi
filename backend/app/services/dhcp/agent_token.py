@@ -1,0 +1,60 @@
+"""JWT mint/verify/rotate for DHCP agents. Mirrors app.services.dns.agent_token."""
+
+from __future__ import annotations
+
+import hashlib
+from datetime import UTC, datetime, timedelta
+from typing import Any
+
+from jose import JWTError, jwt
+
+from app.config import settings
+
+ALGORITHM = "HS256"
+DEFAULT_TTL_HOURS = 24
+ROTATION_WINDOW_HOURS = 12
+
+
+def mint_agent_token(
+    server_id: str,
+    agent_id: str,
+    fingerprint: str,
+    ttl_hours: int = DEFAULT_TTL_HOURS,
+) -> tuple[str, datetime]:
+    expire = datetime.now(UTC) + timedelta(hours=ttl_hours)
+    payload: dict[str, Any] = {
+        "sub": server_id,
+        "agent_id": agent_id,
+        "fingerprint": fingerprint,
+        "typ": "dhcp_agent",
+        "exp": expire,
+    }
+    token = jwt.encode(payload, settings.secret_key, algorithm=ALGORITHM)
+    return token, expire
+
+
+def verify_agent_token(token: str) -> dict[str, Any]:
+    payload = jwt.decode(token, settings.secret_key, algorithms=[ALGORITHM])
+    if payload.get("typ") != "dhcp_agent":
+        raise JWTError("Not a DHCP agent token")
+    return payload
+
+
+def needs_rotation(payload: dict[str, Any]) -> bool:
+    exp = payload.get("exp")
+    if not exp:
+        return True
+    expire = datetime.fromtimestamp(int(exp), UTC)
+    return (expire - datetime.now(UTC)) < timedelta(hours=ROTATION_WINDOW_HOURS)
+
+
+def hash_token(token: str) -> str:
+    return hashlib.sha256(token.encode()).hexdigest()
+
+
+__all__ = [
+    "mint_agent_token",
+    "verify_agent_token",
+    "needs_rotation",
+    "hash_token",
+]
