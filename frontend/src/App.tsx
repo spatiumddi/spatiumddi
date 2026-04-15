@@ -7,6 +7,7 @@ import { DashboardPage } from "@/pages/DashboardPage";
 import { IPAMPage } from "@/pages/ipam/IPAMPage";
 import { DNSPage } from "@/pages/dns/DNSPage";
 import { VLANsPage } from "@/pages/vlans/VLANsPage";
+import { DHCPPage } from "@/pages/dhcp/DHCPPage";
 import { UsersPage } from "@/pages/admin/UsersPage";
 import { AuditPage } from "@/pages/admin/AuditPage";
 import { CustomFieldsPage } from "@/pages/admin/CustomFieldsPage";
@@ -36,6 +37,7 @@ export default function App() {
         <Route path="ipam" element={<IPAMPage />} />
         <Route path="dns" element={<DNSPage />} />
         <Route path="vlans" element={<VLANsPage />} />
+        <Route path="dhcp" element={<DHCPPage />} />
         <Route path="admin/users" element={<UsersPage />} />
         <Route path="admin/audit" element={<AuditPage />} />
         <Route path="admin/custom-fields" element={<CustomFieldsPage />} />

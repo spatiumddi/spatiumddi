@@ -8,7 +8,14 @@ import {
   FileText,
   Cpu,
 } from "lucide-react";
-import { ipamApi, dnsApi, type Subnet, type DNSServer } from "@/lib/api";
+import {
+  ipamApi,
+  dnsApi,
+  dhcpApi,
+  type Subnet,
+  type DNSServer,
+  type DHCPServer,
+} from "@/lib/api";
 import { cn } from "@/lib/utils";
 
 function StatCard({
@@ -104,6 +111,23 @@ export function DashboardPage() {
   const unhealthyServers =
     (serverCounts.unreachable ?? 0) + (serverCounts.error ?? 0);
 
+  // DHCP servers
+  const { data: dhcpServers = [] } = useQuery({
+    queryKey: ["dhcp-servers", "all"],
+    queryFn: () => dhcpApi.listServers(),
+    refetchInterval: 30_000,
+  });
+  const dhcpCounts = dhcpServers.reduce(
+    (acc: Record<string, number>, s: DHCPServer) => {
+      acc[s.status] = (acc[s.status] ?? 0) + 1;
+      return acc;
+    },
+    {},
+  );
+  const dhcpActive = dhcpCounts.active ?? 0;
+  const dhcpUnhealthy =
+    (dhcpCounts.unreachable ?? 0) + (dhcpCounts.error ?? 0);
+
   const totalIPs = subnets?.reduce((s, n) => s + n.total_ips, 0) ?? 0;
   const allocatedIPs = subnets?.reduce((s, n) => s + n.allocated_ips, 0) ?? 0;
   const overallUtil = totalIPs > 0 ? (allocatedIPs / totalIPs) * 100 : 0;
@@ -185,7 +209,89 @@ export function DashboardPage() {
                   : `${activeServers} active`
             }
           />
+          <StatCard
+            label="DHCP Servers"
+            value={dhcpServers.length}
+            icon={Server}
+            sub={
+              dhcpServers.length === 0
+                ? "none registered"
+                : dhcpUnhealthy > 0
+                  ? `${dhcpActive} active, ${dhcpUnhealthy} unhealthy`
+                  : `${dhcpActive} active`
+            }
+          />
         </div>
+
+        {/* DHCP server health */}
+        {dhcpServers.length > 0 && (
+          <div className="rounded-lg border">
+            <div className="flex items-center justify-between border-b px-4 py-3">
+              <h2 className="text-sm font-semibold">DHCP Server Status</h2>
+              <div className="flex items-center gap-3 text-xs">
+                {(["active", "syncing", "unreachable", "error"] as const).map(
+                  (s) =>
+                    dhcpCounts[s] ? (
+                      <span key={s} className="flex items-center gap-1.5">
+                        <span
+                          className={cn(
+                            "inline-block h-2 w-2 rounded-full",
+                            {
+                              active: "bg-emerald-500",
+                              syncing: "bg-blue-500",
+                              unreachable: "bg-red-500",
+                              error: "bg-red-500",
+                            }[s],
+                          )}
+                        />
+                        {dhcpCounts[s]} {s}
+                      </span>
+                    ) : null,
+                )}
+              </div>
+            </div>
+            <div className="divide-y">
+              {dhcpServers.map((s: DHCPServer) => {
+                const dotCls =
+                  {
+                    active: "bg-emerald-500",
+                    syncing: "bg-blue-500",
+                    unreachable: "bg-red-500",
+                    error: "bg-red-500",
+                    pending: "bg-amber-500",
+                  }[s.status] ?? "bg-muted";
+                return (
+                  <div
+                    key={s.id}
+                    className="flex items-center gap-4 px-4 py-2.5"
+                  >
+                    <span
+                      className={cn(
+                        "inline-block h-2 w-2 rounded-full flex-shrink-0",
+                        dotCls,
+                      )}
+                      title={s.status}
+                    />
+                    <span className="w-48 truncate text-xs font-medium">
+                      {s.name}
+                    </span>
+                    <span className="w-56 truncate font-mono text-xs text-muted-foreground">
+                      {s.host}:{s.port}
+                    </span>
+                    <span className="w-20 text-xs text-muted-foreground">
+                      {s.driver}
+                    </span>
+                    <span className="flex-1 text-right text-xs text-muted-foreground">
+                      {s.last_sync_at
+                        ? `synced ${new Date(s.last_sync_at).toLocaleTimeString()}`
+                        : "never synced"}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
 
         {/* DNS server health */}
         {allServers.length > 0 && (

@@ -21,7 +21,7 @@ const mainNav = [
   { label: "Dashboard", icon: LayoutDashboard, to: "/dashboard" },
   { label: "IPAM", icon: Network, to: "/ipam" },
   { label: "VLANs", icon: RouterIcon, to: "/vlans" },
-  { label: "DHCP", icon: Server, to: "/dhcp", disabled: true },
+  { label: "DHCP", icon: Server, to: "/dhcp" },
   { label: "DNS", icon: Globe, to: "/dns" },
 ];
 
