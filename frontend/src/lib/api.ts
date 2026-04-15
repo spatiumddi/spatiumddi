@@ -173,6 +173,14 @@ export interface DnsSyncCommitResult {
   errors: string[];
 }
 
+export interface SubnetVLANRef {
+  id: string;
+  router_id: string;
+  router_name: string | null;
+  vlan_id: number;
+  name: string;
+}
+
 export interface Subnet {
   id: string;
   space_id: string;
@@ -182,6 +190,8 @@ export interface Subnet {
   description: string;
   vlan_id: number | null;
   vxlan_id: number | null;
+  vlan_ref_id?: string | null;
+  vlan?: SubnetVLANRef | null;
   gateway: string | null;
   status: string;
   skip_auto_addresses?: boolean;
@@ -305,8 +315,11 @@ export const ipamApi = {
       .get<EffectiveDns>(`/ipam/spaces/${spaceId}/effective-dns`)
       .then((r) => r.data),
 
-  listSubnets: (params?: { space_id?: string; block_id?: string }) =>
-    api.get<Subnet[]>("/ipam/subnets", { params }).then((r) => r.data),
+  listSubnets: (params?: {
+    space_id?: string;
+    block_id?: string;
+    vlan_ref_id?: string;
+  }) => api.get<Subnet[]>("/ipam/subnets", { params }).then((r) => r.data),
   getSubnet: (id: string) =>
     api.get<Subnet>(`/ipam/subnets/${id}`).then((r) => r.data),
   createSubnet: (data: Partial<Subnet>) =>
@@ -1187,6 +1200,59 @@ export const dnsBlocklistApi = {
       .then((r) => r.data),
   deleteException: (id: string, exceptionId: string) =>
     api.delete(`/dns/blocklists/${id}/exceptions/${exceptionId}`),
+};
+
+// ── VLANs ────────────────────────────────────────────────────────────────────
+
+export interface Router {
+  id: string;
+  name: string;
+  description: string;
+  location: string;
+  management_ip: string | null;
+  vendor: string | null;
+  model: string | null;
+  notes: string;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface VLAN {
+  id: string;
+  router_id: string;
+  vlan_id: number;
+  name: string;
+  description: string;
+  created_at: string;
+  modified_at: string;
+}
+
+export const vlansApi = {
+  listRouters: () =>
+    api.get<Router[]>("/vlans/routers").then((r) => r.data),
+  getRouter: (id: string) =>
+    api.get<Router>(`/vlans/routers/${id}`).then((r) => r.data),
+  createRouter: (data: Partial<Router>) =>
+    api.post<Router>("/vlans/routers", data).then((r) => r.data),
+  updateRouter: (id: string, data: Partial<Router>) =>
+    api.put<Router>(`/vlans/routers/${id}`, data).then((r) => r.data),
+  deleteRouter: (id: string) => api.delete(`/vlans/routers/${id}`),
+
+  listVlans: (routerId: string) =>
+    api.get<VLAN[]>(`/vlans/routers/${routerId}/vlans`).then((r) => r.data),
+  createVlan: (
+    routerId: string,
+    data: { vlan_id: number; name: string; description?: string },
+  ) =>
+    api
+      .post<VLAN>(`/vlans/routers/${routerId}/vlans`, data)
+      .then((r) => r.data),
+  getVlan: (id: string) => api.get<VLAN>(`/vlans/vlans/${id}`).then((r) => r.data),
+  updateVlan: (
+    id: string,
+    data: { vlan_id?: number; name?: string; description?: string },
+  ) => api.put<VLAN>(`/vlans/vlans/${id}`, data).then((r) => r.data),
+  deleteVlan: (id: string) => api.delete(`/vlans/vlans/${id}`),
 };
 
 export const authApi = {

@@ -120,6 +120,9 @@ class Subnet(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     router_zone_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("router_zone.id", ondelete="SET NULL"), nullable=True
     )
+    vlan_ref_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("vlan.id", ondelete="SET NULL"), nullable=True, index=True
+    )
 
     network: Mapped[str] = mapped_column(CIDR, nullable=False)
     name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
@@ -156,6 +159,7 @@ class Subnet(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     space: Mapped[IPSpace] = relationship("IPSpace", back_populates="subnets")
     block: Mapped[IPBlock | None] = relationship("IPBlock", back_populates="subnets")
     router_zone: Mapped[RouterZone | None] = relationship("RouterZone", back_populates="subnets")
+    vlan_ref: Mapped["VLAN | None"] = relationship("VLAN", lazy="joined", foreign_keys=[vlan_ref_id])  # noqa: F821
     addresses: Mapped[list["IPAddress"]] = relationship(
         "IPAddress", back_populates="subnet", cascade="all, delete-orphan"
     )
