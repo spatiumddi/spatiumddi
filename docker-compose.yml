@@ -187,6 +187,11 @@ services:
     depends_on:
       api:
         condition: service_started
+    # Kea runs as non-root and needs to bind UDP/67. No NET_RAW/NET_ADMIN —
+    # this server accepts relayed DHCP (unicast from relay agents), it does
+    # NOT need to listen for L2 broadcasts on the host LAN.
+    cap_add:
+      - NET_BIND_SERVICE
 
 networks:
   spatiumddi:
