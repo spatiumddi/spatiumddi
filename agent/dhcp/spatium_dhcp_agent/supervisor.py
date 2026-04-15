@@ -1,0 +1,74 @@
+"""Supervisor — runs sync + heartbeat + lease-watcher threads.
+
+kea-dhcp4 itself runs as a sibling process under tini in the container; the
+agent supervises its own tasks and reloads Kea via the control socket. If any
+thread crashes (and doesn't recover), the process exits non-zero so the
+container orchestrator restarts us.
+"""
+
+from __future__ import annotations
+
+import signal
+import sys
+import threading
+import time
+
+import structlog
+
+from .bootstrap import ensure_token
+from .config import AgentConfig
+from .heartbeat import HeartbeatClient
+from .leases import LeaseWatcher
+from .sync import SyncLoop
+
+log = structlog.get_logger(__name__)
+
+
+def run(cfg: AgentConfig) -> int:
+    _agent_id, token = ensure_token(cfg)
+    token_ref = [token]
+
+    heartbeat = HeartbeatClient(cfg, token_ref)
+    syncer = SyncLoop(cfg, token_ref, heartbeat)
+    leases = LeaseWatcher(cfg, token_ref, heartbeat)
+
+    threads = [
+        threading.Thread(target=syncer.run, name="sync", daemon=True),
+        threading.Thread(target=heartbeat.run, name="heartbeat", daemon=True),
+        threading.Thread(target=leases.run, name="leases", daemon=True),
+    ]
+    for t in threads:
+        t.start()
+
+    stopping = threading.Event()
+
+    def _sig(_signum, _frame):  # noqa: ANN001
+        log.info("dhcp_agent_signal_received")
+        stopping.set()
+        heartbeat.stop()
+        syncer.stop()
+        leases.stop()
+
+    signal.signal(signal.SIGTERM, _sig)
+    signal.signal(signal.SIGINT, _sig)
+
+    while not stopping.is_set():
+        time.sleep(1.0)
+        # If any critical thread died, bubble up so the container restarts.
+        dead = [t.name for t in threads if not t.is_alive()]
+        if dead:
+            log.error("dhcp_agent_thread_died", threads=dead)
+            return 2
+
+    log.info("dhcp_agent_exiting")
+    return 0
+
+
+def main_entry() -> int:
+    cfg = AgentConfig.from_env()
+    cfg.state_dir.mkdir(parents=True, exist_ok=True)
+    return run(cfg)
+
+
+if __name__ == "__main__":
+    sys.exit(main_entry())

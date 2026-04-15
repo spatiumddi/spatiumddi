@@ -1,0 +1,85 @@
+# One StatefulSet per DHCPServer row (mirrors docs/deployment/DNS_AGENT.md §8).
+# Duplicate & rename for each server (dhcp1, dhcp2, ...); scale stays at replicas=1.
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: dhcp-kea-dhcp1
+  namespace: spatiumddi
+  labels:
+    app.kubernetes.io/name: spatium-dhcp
+    app.kubernetes.io/instance: dhcp1
+    spatiumddi.org/dhcp-flavor: kea
+    spatiumddi.org/dhcp-role: primary
+spec:
+  serviceName: dhcp-kea-dhcp1-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: spatium-dhcp
+      app.kubernetes.io/instance: dhcp1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: spatium-dhcp
+        app.kubernetes.io/instance: dhcp1
+        spatiumddi.org/dhcp-flavor: kea
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: spatium-dhcp
+                topologyKey: kubernetes.io/hostname
+      containers:
+        - name: dhcp
+          image: ghcr.io/spatiumddi/dhcp-kea:latest
+          imagePullPolicy: IfNotPresent
+          # DHCPv4 broadcast reception requires hostNetwork in most clusters;
+          # if your CNI can proxy UDP/67 use a plain ClusterIP + relay instead.
+          env:
+            - name: SPATIUM_API_URL
+              value: http://spatiumddi-api.spatiumddi.svc.cluster.local:8000
+            - name: SPATIUM_SERVER_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: AGENT_GROUP
+              value: default
+            - name: AGENT_ROLES
+              value: primary
+            - name: SPATIUM_AGENT_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: spatium-dhcp-agent-key
+                  key: SPATIUM_AGENT_KEY
+          ports:
+            - name: dhcp-udp
+              containerPort: 67
+              protocol: UDP
+            - name: ctrl-http
+              containerPort: 8000
+              protocol: TCP
+          resources:
+            requests: { cpu: 100m, memory: 128Mi }
+            limits:   { cpu: 500m, memory: 512Mi }
+          volumeMounts:
+            - name: agent-state
+              mountPath: /var/lib/spatium-dhcp-agent
+            - name: kea-state
+              mountPath: /var/lib/kea
+          readinessProbe:
+            tcpSocket: { port: 8000 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+  volumeClaimTemplates:
+    - metadata: { name: agent-state }
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources: { requests: { storage: 1Gi } }
+    - metadata: { name: kea-state }
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources: { requests: { storage: 2Gi } }

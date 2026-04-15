@@ -158,6 +158,36 @@ services:
       api:
         condition: service_started
 
+  # ── DHCP agent ────────────────────────────────────────────────────────
+  # Enable with: docker compose --profile dhcp up -d
+  dhcp-kea:
+    profiles: ["dhcp"]
+    build:
+      context: .
+      dockerfile: agent/dhcp/images/kea/Dockerfile
+    restart: unless-stopped
+    networks:
+      - spatiumddi
+    environment:
+      SPATIUM_API_URL: http://api:8000
+      SPATIUM_AGENT_KEY: ${DHCP_AGENT_KEY:-changeme-dhcp-agent-key}
+      SPATIUM_SERVER_NAME: dhcp-kea
+      AGENT_GROUP: default
+      AGENT_ROLES: primary
+      SPATIUM_INSECURE_SKIP_TLS_VERIFY: "1"
+    volumes:
+      - dhcp_kea_state:/var/lib/spatium-dhcp-agent
+      - dhcp_kea_leases:/var/lib/kea
+    ports:
+      # Host 6767/udp → container 67/udp (DHCPv4 is hard to expose without host
+      # networking; use `network_mode: host` for real lab use). :8000 is the
+      # Kea control agent REST port — remapped to avoid clashing with the API.
+      - "6767:67/udp"
+      - "8001:8000/tcp"
+    depends_on:
+      api:
+        condition: service_started
+
 networks:
   spatiumddi:
     driver: bridge
@@ -167,3 +197,5 @@ volumes:
   redis_data:
   dns_bind9_state:
   dns_bind9_cache:
+  dhcp_kea_state:
+  dhcp_kea_leases:
