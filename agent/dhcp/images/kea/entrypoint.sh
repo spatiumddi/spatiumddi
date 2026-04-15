@@ -9,6 +9,8 @@ set -eu
 # Ensure state + runtime dirs are writable by the agent user.
 mkdir -p /var/lib/spatium-dhcp-agent /var/lib/kea /run/kea /var/log/kea
 chown -R spatium:spatium /var/lib/spatium-dhcp-agent /var/lib/kea /run/kea /var/log/kea || true
+# Kea 2.6+ requires socket parent dir to be exactly mode 0750.
+chmod 0750 /run/kea
 
 # Start kea-dhcp4 in the background. It will pick up config at KEA_CONFIG_PATH;
 # the first sync from the control plane overwrites that file and the agent
