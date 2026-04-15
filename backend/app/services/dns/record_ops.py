@@ -42,7 +42,7 @@ async def enqueue_record_op(
         return None
     op_row = DNSRecordOp(
         server_id=primary.id,
-        zone_name=getattr(zone, "name", None) or getattr(zone, "fqdn", ""),
+        zone_name=zone.name,
         op=op,
         record=record,
         target_serial=target_serial,
