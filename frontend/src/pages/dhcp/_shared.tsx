@@ -84,11 +84,23 @@ export function Btns({
   );
 }
 
-export type ApiError = { response?: { data?: { detail?: string } } };
+export type ApiError = { response?: { data?: { detail?: unknown } } };
 
 export function errMsg(e: unknown, fallback = "Request failed"): string {
   const ae = e as ApiError;
-  return ae?.response?.data?.detail ?? fallback;
+  const d = ae?.response?.data?.detail;
+  if (typeof d === "string") return d;
+  if (Array.isArray(d)) {
+    // Pydantic 422 — array of { type, loc, msg, input }.
+    return (d as Array<{ loc?: (string | number)[]; msg?: string }>)
+      .map((err) => {
+        const field = (err.loc ?? []).filter((p) => p !== "body").join(".");
+        return field ? `${field}: ${err.msg}` : err.msg;
+      })
+      .filter(Boolean)
+      .join("; ") || fallback;
+  }
+  return fallback;
 }
 
 /** Shared destructive-confirm modal (single-step with optional references block). */
