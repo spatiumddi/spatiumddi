@@ -20,7 +20,7 @@ import logoIcon from "@/assets/logo-icon.svg";
 const mainNav = [
   { label: "Dashboard", icon: LayoutDashboard, to: "/dashboard" },
   { label: "IPAM", icon: Network, to: "/ipam" },
-  { label: "DHCP", icon: Server, to: "/dhcp", disabled: true },
+  { label: "DHCP", icon: Server, to: "/dhcp" },
   { label: "DNS", icon: Globe, to: "/dns" },
   { label: "NTP", icon: Clock, to: "/ntp", disabled: true },
 ];

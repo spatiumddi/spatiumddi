@@ -1189,6 +1189,242 @@ export const dnsBlocklistApi = {
     api.delete(`/dns/blocklists/${id}/exceptions/${exceptionId}`),
 };
 
+// ── DHCP ───────────────────────────────────────────────────────────────────
+
+export interface DHCPServerGroup {
+  id: string;
+  name: string;
+  description: string;
+  mode: string; // "load-balancing" | "hot-standby" | "standalone"
+  created_at: string;
+  modified_at: string;
+}
+
+export interface DHCPServer {
+  id: string;
+  group_id: string | null;
+  name: string;
+  driver: string; // "kea" | "isc" | "windows"
+  host: string;
+  port: number;
+  api_port: number | null;
+  status: string; // "active" | "syncing" | "unreachable" | "error" | "pending"
+  last_sync_at: string | null;
+  last_health_check_at: string | null;
+  notes: string;
+  approved: boolean;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface DHCPOption {
+  code: number;
+  name?: string;
+  value: string | string[];
+}
+
+export interface DHCPScope {
+  id: string;
+  subnet_id: string;
+  server_id: string | null;
+  name: string;
+  description: string;
+  enabled: boolean;
+  lease_time: number;
+  min_lease_time: number | null;
+  max_lease_time: number | null;
+  ddns_enabled: boolean;
+  ddns_hostname_policy: string | null;
+  ddns_domain_override: string | null;
+  hostname_sync_mode: string; // "none" | "ipam" | "learned"
+  options: DHCPOption[];
+  created_at: string;
+  modified_at: string;
+}
+
+export interface DHCPPool {
+  id: string;
+  scope_id: string;
+  name: string;
+  start_ip: string;
+  end_ip: string;
+  pool_type: string; // "dynamic" | "excluded" | "reserved"
+  client_class_id: string | null;
+  lease_time_override: number | null;
+  options: DHCPOption[];
+  created_at: string;
+  modified_at: string;
+}
+
+export interface DHCPStaticAssignment {
+  id: string;
+  scope_id: string;
+  mac: string;
+  ip: string;
+  hostname: string;
+  description: string;
+  client_class_id: string | null;
+  options: DHCPOption[];
+  created_at: string;
+  modified_at: string;
+}
+
+export interface DHCPClientClass {
+  id: string;
+  server_id: string;
+  name: string;
+  description: string;
+  match_expression: string;
+  options: DHCPOption[];
+  created_at: string;
+  modified_at: string;
+}
+
+export interface DHCPLease {
+  ip: string;
+  mac: string;
+  hostname: string | null;
+  state: string; // "active" | "expired" | "released" | "declined"
+  expires_at: string | null;
+  last_seen: string | null;
+  subnet_id: string | null;
+  scope_id: string | null;
+  client_class: string | null;
+}
+
+export interface DHCPLeasePage {
+  total: number;
+  items: DHCPLease[];
+}
+
+export const dhcpApi = {
+  // Server groups
+  listGroups: () =>
+    api.get<DHCPServerGroup[]>("/dhcp/server-groups").then((r) => r.data),
+  getGroup: (id: string) =>
+    api.get<DHCPServerGroup>(`/dhcp/server-groups/${id}`).then((r) => r.data),
+  createGroup: (data: Partial<DHCPServerGroup>) =>
+    api.post<DHCPServerGroup>("/dhcp/server-groups", data).then((r) => r.data),
+  updateGroup: (id: string, data: Partial<DHCPServerGroup>) =>
+    api
+      .put<DHCPServerGroup>(`/dhcp/server-groups/${id}`, data)
+      .then((r) => r.data),
+  deleteGroup: (id: string) => api.delete(`/dhcp/server-groups/${id}`),
+
+  // Servers
+  listServers: (groupId?: string) =>
+    api
+      .get<DHCPServer[]>("/dhcp/servers", {
+        params: groupId ? { group_id: groupId } : undefined,
+      })
+      .then((r) => r.data),
+  getServer: (id: string) =>
+    api.get<DHCPServer>(`/dhcp/servers/${id}`).then((r) => r.data),
+  createServer: (data: Partial<DHCPServer> & { api_key?: string }) =>
+    api.post<DHCPServer>("/dhcp/servers", data).then((r) => r.data),
+  updateServer: (
+    id: string,
+    data: Partial<DHCPServer> & { api_key?: string },
+  ) => api.put<DHCPServer>(`/dhcp/servers/${id}`, data).then((r) => r.data),
+  deleteServer: (id: string) => api.delete(`/dhcp/servers/${id}`),
+  syncServer: (id: string) =>
+    api.post<{ task_id: string | null; status: string }>(
+      `/dhcp/servers/${id}/sync`,
+    ).then((r) => r.data),
+  approveServer: (id: string) =>
+    api.post<DHCPServer>(`/dhcp/servers/${id}/approve`).then((r) => r.data),
+  getLeases: (
+    id: string,
+    params?: {
+      state?: string;
+      subnet_id?: string;
+      limit?: number;
+      offset?: number;
+    },
+  ) =>
+    api
+      .get<DHCPLeasePage>(`/dhcp/servers/${id}/leases`, { params })
+      .then((r) => r.data),
+
+  // Scopes
+  listScopesBySubnet: (subnetId: string) =>
+    api
+      .get<DHCPScope[]>(`/dhcp/subnets/${subnetId}/scopes`)
+      .then((r) => r.data),
+  getScope: (id: string) =>
+    api.get<DHCPScope>(`/dhcp/scopes/${id}`).then((r) => r.data),
+  createScope: (subnetId: string, data: Partial<DHCPScope>) =>
+    api
+      .post<DHCPScope>(`/dhcp/scopes/${subnetId}`, data)
+      .then((r) => r.data),
+  updateScope: (id: string, data: Partial<DHCPScope>) =>
+    api.put<DHCPScope>(`/dhcp/scopes/${id}`, data).then((r) => r.data),
+  deleteScope: (id: string) => api.delete(`/dhcp/scopes/${id}`),
+
+  // Pools
+  listPools: (scopeId: string) =>
+    api.get<DHCPPool[]>(`/dhcp/scopes/${scopeId}/pools`).then((r) => r.data),
+  createPool: (scopeId: string, data: Partial<DHCPPool>) =>
+    api
+      .post<DHCPPool>(`/dhcp/scopes/${scopeId}/pools`, data)
+      .then((r) => r.data),
+  updatePool: (scopeId: string, poolId: string, data: Partial<DHCPPool>) =>
+    api
+      .put<DHCPPool>(`/dhcp/scopes/${scopeId}/pools/${poolId}`, data)
+      .then((r) => r.data),
+  deletePool: (scopeId: string, poolId: string) =>
+    api.delete(`/dhcp/scopes/${scopeId}/pools/${poolId}`),
+
+  // Static assignments
+  listStatics: (scopeId: string) =>
+    api
+      .get<DHCPStaticAssignment[]>(`/dhcp/scopes/${scopeId}/statics`)
+      .then((r) => r.data),
+  createStatic: (scopeId: string, data: Partial<DHCPStaticAssignment>) =>
+    api
+      .post<DHCPStaticAssignment>(`/dhcp/scopes/${scopeId}/statics`, data)
+      .then((r) => r.data),
+  updateStatic: (
+    scopeId: string,
+    staticId: string,
+    data: Partial<DHCPStaticAssignment>,
+  ) =>
+    api
+      .put<DHCPStaticAssignment>(
+        `/dhcp/scopes/${scopeId}/statics/${staticId}`,
+        data,
+      )
+      .then((r) => r.data),
+  deleteStatic: (scopeId: string, staticId: string) =>
+    api.delete(`/dhcp/scopes/${scopeId}/statics/${staticId}`),
+
+  // Client classes
+  listClientClasses: (serverId: string) =>
+    api
+      .get<DHCPClientClass[]>(`/dhcp/servers/${serverId}/client-classes`)
+      .then((r) => r.data),
+  createClientClass: (serverId: string, data: Partial<DHCPClientClass>) =>
+    api
+      .post<DHCPClientClass>(
+        `/dhcp/servers/${serverId}/client-classes`,
+        data,
+      )
+      .then((r) => r.data),
+  updateClientClass: (
+    serverId: string,
+    classId: string,
+    data: Partial<DHCPClientClass>,
+  ) =>
+    api
+      .put<DHCPClientClass>(
+        `/dhcp/servers/${serverId}/client-classes/${classId}`,
+        data,
+      )
+      .then((r) => r.data),
+  deleteClientClass: (serverId: string, classId: string) =>
+    api.delete(`/dhcp/servers/${serverId}/client-classes/${classId}`),
+};
+
 export const authApi = {
   login: (username: string, password: string) =>
     api

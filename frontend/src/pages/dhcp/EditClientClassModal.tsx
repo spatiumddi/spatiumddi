@@ -1,0 +1,1 @@
+export { EditClientClassModal } from "./CreateClientClassModal";

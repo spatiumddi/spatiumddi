@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from "react";
+import { DHCPSubnetPanel } from "@/pages/dhcp/DHCPSubnetPanel";
 import {
   useQuery,
   useQueries,
@@ -1234,6 +1235,9 @@ function SubnetDetail({
   const [showDnsSync, setShowDnsSync] = useState(false);
   const [editingAddress, setEditingAddress] = useState<IPAddress | null>(null);
   const [showFilters, setShowFilters] = useState(false);
+  const [activeSubnetTab, setActiveSubnetTab] = useState<"addresses" | "dhcp">(
+    "addresses",
+  );
 
   type FilterMode = "contains" | "begins" | "ends" | "regex";
   const [colFilters, setColFilters] = useState({
@@ -1492,7 +1496,42 @@ function SubnetDetail({
         </div>
       </div>
 
+      {/* Tabs: Addresses | DHCP */}
+      <div className="border-b bg-card px-4">
+        <div className="flex gap-1">
+          <button
+            onClick={() => setActiveSubnetTab("addresses")}
+            className={cn(
+              "px-3 py-2 text-xs font-medium border-b-2 -mb-px transition-colors",
+              activeSubnetTab === "addresses"
+                ? "border-primary text-foreground"
+                : "border-transparent text-muted-foreground hover:text-foreground",
+            )}
+          >
+            IP Addresses
+          </button>
+          <button
+            onClick={() => setActiveSubnetTab("dhcp")}
+            className={cn(
+              "px-3 py-2 text-xs font-medium border-b-2 -mb-px transition-colors",
+              activeSubnetTab === "dhcp"
+                ? "border-primary text-foreground"
+                : "border-transparent text-muted-foreground hover:text-foreground",
+            )}
+          >
+            DHCP
+          </button>
+        </div>
+      </div>
+
+      {activeSubnetTab === "dhcp" && (
+        <div className="flex-1 overflow-auto">
+          <DHCPSubnetPanel subnetId={subnet.id} />
+        </div>
+      )}
+
       {/* IP Address table */}
+      {activeSubnetTab === "addresses" && (
       <div className="flex-1 overflow-auto">
         {isLoading ? (
           <p className="p-6 text-sm text-muted-foreground">
@@ -1829,6 +1868,7 @@ function SubnetDetail({
           </table>
         )}
       </div>
+      )}
 
       {showAddModal && (
         <AddAddressModal
