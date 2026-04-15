@@ -271,6 +271,14 @@ async def agent_config_longpoll(
         ]
 
         if etag != if_none_match or pending_ops:
+            logger.info(
+                "dhcp_agent_config_200",
+                server_id=str(server.id),
+                etag=etag,
+                if_none_match=if_none_match,
+                etag_match=(etag == if_none_match),
+                pending_ops=len(pending_ops),
+            )
             server.config_etag = etag
             await db.commit()
             response.headers["ETag"] = etag

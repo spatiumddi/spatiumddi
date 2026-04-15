@@ -181,6 +181,18 @@ class SyncLoop:
         self._record_success()
         log.info("dhcp_config_applied", etag=etag)
 
+        # Ack any pending ops included in the bundle so the control plane
+        # stops re-delivering them on the next long-poll.
+        for op in bundle.get("pending_ops") or []:
+            op_id = op.get("op_id")
+            if op_id:
+                self.heartbeat.pending_acks.append({"op_id": op_id, "result": "ok"})
+
     def run(self) -> None:
         while not self._stop.is_set():
             self._poll_once()
+            # Safety net: cap poll rate even if the server returns 200s
+            # back-to-back (bad bundle state, clock skew, etc.). The long-poll
+            # blocks ~30s when etag matches, so this doesn't add latency in
+            # the normal case.
+            self._stop.wait(1.0)

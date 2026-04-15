@@ -24,6 +24,7 @@ class HeartbeatClient:
         self._stop = threading.Event()
         self.daemon_status: dict[str, Any] = {}
         self.lease_count_since_start = 0
+        self.pending_acks: list[dict] = []
 
     def stop(self) -> None:
         self._stop.set()
@@ -37,12 +38,19 @@ class HeartbeatClient:
         return httpx.Client(base_url=self.cfg.control_plane_url, verify=verify, timeout=15.0)
 
     def send_once(self) -> None:
+        # Drain queued op acks (queued by SyncLoop when bundle includes pending_ops).
+        acks = getattr(self, "pending_acks", None)
+        ops_ack: list[dict] = []
+        if acks is not None:
+            while acks:
+                ops_ack.append(acks.pop(0))
         body = {
             "agent_version": __version__,
             "pid": os.getpid(),
             "status": self.daemon_status.get("status", "ok"),
             "daemon": self.daemon_status,
             "lease_count_since_start": self.lease_count_since_start,
+            "ops_ack": ops_ack,
         }
         try:
             with self._client() as c:
