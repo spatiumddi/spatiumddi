@@ -306,15 +306,15 @@ function GroupDetailView({
             </button>
             <button
               onClick={onEdit}
-              className="text-muted-foreground hover:text-foreground"
+              className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent"
             >
-              Edit Group
+              <Pencil className="h-3 w-3" /> Edit Group
             </button>
             <button
               onClick={onDelete}
-              className="text-destructive hover:underline"
+              className="flex items-center gap-1 rounded-md border border-destructive/40 px-2 py-1 text-xs text-destructive hover:bg-destructive/10"
             >
-              Delete Group
+              <Trash2 className="h-3 w-3" /> Delete Group
             </button>
           </div>
         </div>
