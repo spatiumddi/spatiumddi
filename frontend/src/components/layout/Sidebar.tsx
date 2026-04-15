@@ -5,7 +5,6 @@ import {
   Globe,
   LayoutDashboard,
   Server,
-  Clock,
   Github,
   Users,
   ClipboardList,
@@ -22,7 +21,6 @@ const mainNav = [
   { label: "IPAM", icon: Network, to: "/ipam" },
   { label: "DHCP", icon: Server, to: "/dhcp", disabled: true },
   { label: "DNS", icon: Globe, to: "/dns" },
-  { label: "NTP", icon: Clock, to: "/ntp", disabled: true },
 ];
 
 const adminNav = [

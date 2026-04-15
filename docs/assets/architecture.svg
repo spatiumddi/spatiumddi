@@ -114,13 +114,7 @@
     <text x="470" y="500" text-anchor="middle" class="sub">same agent pattern</text>
     <text x="470" y="518" text-anchor="middle" class="sub">HA failover</text>
   </g>
-  <g>
-    <rect x="360" y="542" width="220" height="100" class="box" fill="url(#g-svc)" fill-opacity="0.75"/>
-    <text x="470" y="570" text-anchor="middle" class="title">ntp (chrony)</text>
-    <text x="470" y="592" text-anchor="middle" class="sub">Phase 2 — planned</text>
-    <text x="470" y="610" text-anchor="middle" class="sub">time sync for pool</text>
-  </g>
-  <g>
+<g>
     <rect x="600" y="432" width="220" height="210" class="box" fill="#e2e8f0" fill-opacity="0.6" stroke="#94a3b8" stroke-dasharray="4,4"/>
     <text x="710" y="462" text-anchor="middle" font-size="14" font-weight="700" fill="#475569">Deployment shapes</text>
     <text x="710" y="488" text-anchor="middle" font-size="12" fill="#475569">• docker compose (dev)</text>

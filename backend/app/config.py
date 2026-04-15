@@ -43,7 +43,6 @@ class Settings(BaseSettings):
     feature_discovery_enabled: bool = True
     feature_dhcp_enabled: bool = True
     feature_dns_enabled: bool = True
-    feature_ntp_enabled: bool = True
 
     # Observability
     log_level: str = "INFO"

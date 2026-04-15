@@ -14,7 +14,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What Is SpatiumDDI?
 
-SpatiumDDI is a production-grade, open-source **all-in-one DDI (DNS, DHCP, IPAM)** platform. It does not merely configure external DDI servers — it manages and runs the DHCP, DNS, and NTP service containers directly. The control plane (FastAPI + PostgreSQL) is the source of truth; all managed service containers (Kea, BIND9, chrony) are deployed and configured by SpatiumDDI.
+SpatiumDDI is a production-grade, open-source **all-in-one DDI (DNS, DHCP, IPAM)** platform. It does not merely configure external DDI servers — it manages and runs the DHCP and DNS service containers directly. The control plane (FastAPI + PostgreSQL) is the source of truth; all managed service containers (Kea, BIND9) are deployed and configured by SpatiumDDI.
 
 It can be deployed as individual containers, a full Docker Compose stack, a Kubernetes application, or as a **self-contained OS appliance image**. Supported on `linux/amd64` and `linux/arm64` (all Docker images must be built multi-arch).
 
@@ -37,7 +37,6 @@ Always read the relevant spec doc(s) before writing code for a feature area.
 | `docs/features/IPAM.md` | IP Space/Block/Subnet/Address management, VLAN/VXLAN, custom fields, import/export, tree UI |
 | `docs/features/DHCP.md` | DHCP servers, scopes, pools, static assignments, DDNS, caching |
 | `docs/features/DNS.md` | DNS servers, zones, records, views, server groups, blocking lists, DDNS, zone tree |
-| `docs/features/NTP.md` | NTP server management and client configuration |
 | `docs/features/AUTH.md` | Authentication, LDAP/OIDC/SAML, roles, group-scoped permissions, API tokens |
 | `docs/features/SYSTEM_ADMIN.md` | System config, health dashboard, notifications, backup/restore, service control |
 | `docs/deployment/APPLIANCE.md` | OS appliance build, base OS selection, licensing |
@@ -95,7 +94,7 @@ These rules apply to every file Claude Code generates. No exceptions.
 | Phase | Focus | Status |
 |---|---|---|
 | 1 | Core IPAM, local auth, user management, audit log, Docker Compose | **In Progress** |
-| 2 | DHCP (Kea + ISC), DNS (BIND9), DDNS, NTP, zone/subnet tree UI | **In Progress** (DNS core + driver + agent runtime landed; DHCP/DDNS/NTP pending) |
+| 2 | DHCP (Kea + ISC), DNS (BIND9), DDNS, zone/subnet tree UI | **In Progress** (DNS core + driver + agent runtime landed; DHCP/DDNS pending) |
 | 3 | DNS views, server groups, blocking lists, VLAN/VXLAN, system admin panel, health dashboard | **In Progress** (DNS views, groups, blocklists, health checks landed) |
 | 4 | OS appliance image, Terraform/Ansible providers, SAML, notifications, backup/restore | Not started |
 | 5 | Multi-tenancy, IP request workflows, import/export, advanced reporting | Not started |
@@ -247,7 +246,6 @@ These rules apply to every file Claude Code generates. No exceptions.
 
 - ⬜ DHCP (Kea + ISC) drivers, models, UI
 - ⬜ DDNS pipeline (needs DHCP first) — subnet `ddns_enabled`/`ddns_hostname_policy`/`ddns_domain_override`/`ddns_ttl`; DHCP-lease → DNS A/PTR Celery task
-- ⬜ NTP server/client management
 - ⬜ Per-server zone serial reporting (currently all servers in a group share `DNSZone.serial`; once agents report back, surface per-server drift)
 - ⬜ Trivy-clean + kind-AXFR acceptance tests for the agent images (stubs marked `@pytest.mark.e2e` in `agent/dns/tests/`)
 

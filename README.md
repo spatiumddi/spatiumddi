@@ -24,12 +24,11 @@
 
 SpatiumDDI is a production-grade, open-source **DDI platform** — DNS, DHCP, and IP Address Management — built for teams that need real control over their network infrastructure without paying enterprise licensing fees.
 
-It is designed as a modern alternative to commercial DDI platforms like EfficientIP and Infoblox. Unlike most open-source alternatives, SpatiumDDI **manages and runs its own DNS/DHCP/NTP containers** — it is not a pretty front end over an external BIND9. The control plane is the source of truth; the service containers auto-register, pull their config, and keep serving even if the control plane goes down.
+It is designed as a modern alternative to commercial DDI platforms like EfficientIP and Infoblox. Unlike most open-source alternatives, SpatiumDDI **manages and runs its own DNS/DHCP containers** — it is not a pretty front end over an external BIND9. The control plane is the source of truth; the service containers auto-register, pull their config, and keep serving even if the control plane goes down.
 
 - 🗂 **Hierarchical IP management** — spaces, blocks, subnets, addresses in a visual tree
 - 🌐 **Built-in DNS server** — BIND9 container that auto-registers and syncs via RFC 2136
 - 🔄 **DHCP server management** — ISC Kea / ISC DHCP with HA failover (Phase 2)
-- ⏱ **NTP server management** — chrony (Phase 2)
 - 🔒 **Granular permissions** — delegate IP ranges and zones via LDAP / OIDC / SAML
 - 📋 **Full audit trail** — every mutation logged, append-only, viewable in the UI
 - 🚀 **Flexible deployment** — Docker Compose, Kubernetes (Helm), bare metal, or OS appliance
@@ -44,7 +43,7 @@ It is designed as a modern alternative to commercial DDI platforms like Efficien
 
 **Control plane** — FastAPI + PostgreSQL + Redis + Celery. Single source of truth for everything (IPAM tree, DNS records, auth, audit log). Exposes a REST API; the web UI and any Terraform / Ansible / CLI integration all speak the same API.
 
-**Data plane** — one container per DNS server (Phase 2 adds DHCP + NTP). Each container bakes in a sidecar `spatium-dns-agent` that:
+**Data plane** — one container per DNS server (Phase 2 adds DHCP). Each container bakes in a sidecar `spatium-dns-agent` that:
 
 1. **Bootstraps** on first start using a shared `DNS_AGENT_KEY` (PSK) → gets a per-server rotating JWT.
 2. **Long-polls** `/api/v1/dns/agents/config` with ETag. Server holds the connection until config changes or the timer expires.
@@ -159,7 +158,6 @@ Full docs at **[spatiumddi.org](https://spatiumddi.org)** (GitHub Pages — comi
 | [IPAM Features](docs/features/IPAM.md) | IP space, block, subnet, address management |
 | [DHCP Features](docs/features/DHCP.md) | DHCP server management (Phase 2) |
 | [DNS Features](docs/features/DNS.md) | DNS zones, views, server groups, blocking lists |
-| [NTP Features](docs/features/NTP.md) | NTP server management (Phase 2) |
 | [Auth & Permissions](docs/features/AUTH.md) | LDAP, OIDC, roles, scoped permissions |
 | [System Admin](docs/features/SYSTEM_ADMIN.md) | Health dashboard, backup, notifications |
 | [Observability](docs/OBSERVABILITY.md) | Logging, metrics, alerting |
@@ -174,7 +172,7 @@ Full docs at **[spatiumddi.org](https://spatiumddi.org)** (GitHub Pages — comi
 | Phase | Focus | Status |
 |---|---|---|
 | Phase 1 | Core IPAM, auth, user management, audit log, Docker Compose | 🔄 In progress |
-| Phase 2 | DHCP (Kea + ISC), DNS (BIND9), DDNS, NTP, zone/subnet tree UI | 🔄 DNS landed; DHCP/DDNS/NTP pending |
+| Phase 2 | DHCP (Kea + ISC), DNS (BIND9), DDNS, zone/subnet tree UI | 🔄 DNS landed; DHCP/DDNS pending |
 | Phase 3 | DNS views, server groups, blocking lists, VLAN/VXLAN, system admin | 🔄 DNS features landed |
 | Phase 4 | OS appliance, Terraform provider, SAML, backup/restore | 📋 Planned |
 | Phase 5 | Multi-tenancy, IP request workflows, advanced reporting | 📋 Planned |
@@ -197,7 +195,7 @@ Contributions are welcome.
 
 Released under the [Apache 2.0 License](LICENSE).
 
-Bundled components (BIND9, ISC Kea, chrony) are distributed under their own licenses. See [NOTICE](NOTICE) for the full list.
+Bundled components (BIND9, ISC Kea) are distributed under their own licenses. See [NOTICE](NOTICE) for the full list.
 
 ---
 

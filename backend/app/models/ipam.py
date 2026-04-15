@@ -136,9 +136,6 @@ class Subnet(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     dns_servers: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
     domain_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
-    # NTP
-    ntp_servers: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
-
     # DNS assignment (mirrors ip_block fields; inherits from parent block unless overridden)
     dns_group_ids: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
     dns_zone_id: Mapped[str | None] = mapped_column(Text, nullable=True)
