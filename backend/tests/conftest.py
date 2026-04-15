@@ -10,6 +10,7 @@ from collections.abc import AsyncGenerator
 
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
 
@@ -40,6 +41,25 @@ async def create_test_schema() -> AsyncGenerator[None, None]:
     yield
     async with _test_engine.begin() as conn:
         await conn.run_sync(Base.metadata.drop_all)
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _isolate_db() -> AsyncGenerator[None, None]:
+    """Truncate every table after each test so state doesn't leak.
+
+    ``db_session`` alone isn't enough: HTTP tests go through FastAPI
+    handlers that commit via the dependency-overridden session, so
+    rolling back the fixture's session doesn't undo the inserts. A
+    TRUNCATE … CASCADE on all mapped tables keeps the schema intact
+    (much cheaper than drop_all + create_all) and is loop-safe because
+    NullPool gives us a fresh connection.
+    """
+    yield
+    tables = ", ".join(f'"{t.name}"' for t in reversed(Base.metadata.sorted_tables))
+    if not tables:
+        return
+    async with _test_engine.begin() as conn:
+        await conn.execute(text(f"TRUNCATE {tables} RESTART IDENTITY CASCADE"))
 
 
 @pytest_asyncio.fixture
