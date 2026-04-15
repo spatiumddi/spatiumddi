@@ -91,6 +91,25 @@ export interface IPBlock {
   utilization_percent: number;
   tags: Record<string, unknown>;
   custom_fields: Record<string, unknown>;
+  dns_group_ids: string[] | null;
+  dns_zone_id: string | null;
+  dns_additional_zone_ids: string[] | null;
+  dns_inherit_settings: boolean;
+}
+
+export interface FreeCidrRange {
+  network: string;
+  first: string;
+  last: string;
+  size: number;
+  prefix_len: number;
+}
+
+export interface EffectiveDns {
+  dns_group_ids: string[];
+  dns_zone_id: string | null;
+  dns_additional_zone_ids: string[];
+  inherited_from_block_id: string | null;
 }
 
 export interface Subnet {
@@ -110,6 +129,10 @@ export interface Subnet {
   allocated_ips: number;
   tags: Record<string, unknown>;
   custom_fields: Record<string, unknown>;
+  dns_group_ids: string[] | null;
+  dns_zone_id: string | null;
+  dns_additional_zone_ids: string[] | null;
+  dns_inherit_settings: boolean;
 }
 
 export interface IPAddress {
@@ -118,6 +141,7 @@ export interface IPAddress {
   address: string;
   status: string;
   hostname: string | null;
+  fqdn: string | null;
   description: string | null;
   mac_address: string | null;
   tags: Record<string, unknown>;
@@ -139,9 +163,17 @@ export const ipamApi = {
       .then((r) => r.data),
   createBlock: (data: Partial<IPBlock>) =>
     api.post<IPBlock>("/ipam/blocks", data).then((r) => r.data),
-  updateBlock: (id: string, data: Partial<Pick<IPBlock, "name" | "description" | "tags" | "custom_fields">>) =>
+  updateBlock: (id: string, data: Partial<Pick<IPBlock, "name" | "description" | "parent_block_id" | "tags" | "custom_fields" | "dns_group_ids" | "dns_zone_id" | "dns_additional_zone_ids" | "dns_inherit_settings">>) =>
     api.put<IPBlock>(`/ipam/blocks/${id}`, data).then((r) => r.data),
   deleteBlock: (id: string) => api.delete(`/ipam/blocks/${id}`),
+  availableSubnets: (blockId: string, prefixLen: number) =>
+    api.get<string[]>(`/ipam/blocks/${blockId}/available-subnets`, { params: { prefix_len: prefixLen } }).then((r) => r.data),
+  blockFreeSpace: (blockId: string) =>
+    api.get<FreeCidrRange[]>(`/ipam/blocks/${blockId}/free-space`).then((r) => r.data),
+  getEffectiveBlockDns: (blockId: string) =>
+    api.get<EffectiveDns>(`/ipam/blocks/${blockId}/effective-dns`).then((r) => r.data),
+  getEffectiveSubnetDns: (subnetId: string) =>
+    api.get<EffectiveDns>(`/ipam/subnets/${subnetId}/effective-dns`).then((r) => r.data),
 
   listSubnets: (params?: { space_id?: string; block_id?: string }) =>
     api.get<Subnet[]>("/ipam/subnets", { params }).then((r) => r.data),
@@ -154,13 +186,13 @@ export const ipamApi = {
 
   listAddresses: (subnetId: string) =>
     api.get<IPAddress[]>(`/ipam/subnets/${subnetId}/addresses`).then((r) => r.data),
-  createAddress: (data: Partial<IPAddress> & { hostname: string }) =>
+  createAddress: (data: Partial<IPAddress> & { hostname: string; dns_zone_id?: string | null }) =>
     api.post<IPAddress>(`/ipam/subnets/${data.subnet_id}/addresses`, data).then((r) => r.data),
-  updateAddress: (id: string, data: Partial<IPAddress>) =>
+  updateAddress: (id: string, data: Partial<IPAddress> & { dns_zone_id?: string | null }) =>
     api.put<IPAddress>(`/ipam/addresses/${id}`, data).then((r) => r.data),
   deleteAddress: (id: string, permanent = false) =>
     api.delete(`/ipam/addresses/${id}`, { params: permanent ? { permanent: true } : undefined }),
-  nextAddress: (subnetId: string, data: { hostname: string; status?: string; mac_address?: string; description?: string; custom_fields?: Record<string, unknown> }) =>
+  nextAddress: (subnetId: string, data: { hostname: string; status?: string; mac_address?: string; description?: string; custom_fields?: Record<string, unknown>; dns_zone_id?: string | null }) =>
     api.post<IPAddress>(`/ipam/subnets/${subnetId}/next`, data).then((r) => r.data),
 };
 

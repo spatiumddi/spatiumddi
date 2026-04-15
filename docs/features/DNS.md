@@ -344,6 +344,11 @@ DNSRecord
 
 ## 6. Incremental DNS Updates (No Restarts)
 
+> See also: [`docs/deployment/DNS_AGENT.md`](../deployment/DNS_AGENT.md) for
+> how the SpatiumDDI-shipped agent applies record ops over loopback and
+> reports zone-serial telemetry back to the control plane.
+
+
 **BIND9:**
 - Record add/modify/delete → RFC 2136 `nsupdate` via `dnspython`
 - Zone creation/deletion → `rndc addzone` / `rndc delzone`

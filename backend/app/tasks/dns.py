@@ -115,3 +115,50 @@ def refresh_blocklist_feed(self: object, list_id: str) -> dict[str, int | str]: 
     """
     logger.info("refresh_blocklist_feed_started", list_id=list_id)
     return asyncio.run(_refresh_blocklist_feed_async(list_id))
+
+
+# ── Agent stale-sweep ──────────────────────────────────────────────────────────
+
+AGENT_STALE_AFTER_SECONDS = 90  # 3× heartbeat interval per DNS_AGENT.md §4
+
+
+async def _dns_agent_stale_sweep_async() -> dict[str, int]:
+    """Mark agents stale when no heartbeat seen for AGENT_STALE_AFTER_SECONDS.
+
+    Idempotent — only flips status for servers whose status is currently
+    'active' but whose last_seen_at is beyond the threshold.
+    """
+    from datetime import timedelta
+
+    from sqlalchemy import update
+
+    from app.models.dns import DNSServer
+
+    engine = create_async_engine(settings.database_url, future=True)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with session_factory() as db:
+            cutoff = datetime.now(UTC) - timedelta(seconds=AGENT_STALE_AFTER_SECONDS)
+            res = await db.execute(
+                update(DNSServer)
+                .where(
+                    DNSServer.status == "active",
+                    DNSServer.last_seen_at.isnot(None),
+                    DNSServer.last_seen_at < cutoff,
+                )
+                .values(status="unreachable")
+                .returning(DNSServer.id)
+            )
+            changed = len(res.all())
+            await db.commit()
+            if changed:
+                logger.info("dns_agent_stale_sweep", marked_unreachable=changed)
+            return {"marked_unreachable": changed}
+    finally:
+        await engine.dispose()
+
+
+@celery_app.task(name="app.tasks.dns.agent_stale_sweep")
+def agent_stale_sweep() -> dict[str, int]:
+    """Celery beat task — runs every 60s, flips stale agents to 'unreachable'."""
+    return asyncio.run(_dns_agent_stale_sweep_async())

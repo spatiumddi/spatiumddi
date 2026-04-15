@@ -26,6 +26,7 @@ from app.models.dns import (
     DNSView,
     DNSZone,
 )
+from app.services.dns.serial import bump_zone_serial
 from app.services.dns_io import (
     RecordChange,
     ZoneParseError,
@@ -628,6 +629,98 @@ async def delete_server(
     await db.commit()
 
 
+# ── Incremental record push (per DNS_AGENT.md §3) ──────────────────────────
+#
+# The control plane records the intent (serial bump + last_pushed_at) and
+# returns 202. Actual loopback nsupdate to ``named`` happens inside the
+# agent when it pulls the ConfigBundle — the control plane never speaks
+# RFC 2136 over the network itself.
+
+
+class ApplyRecordRequest(BaseModel):
+    zone_id: uuid.UUID
+    record_id: uuid.UUID
+    op: str  # create | update | delete
+
+    @field_validator("op")
+    @classmethod
+    def _validate_op(cls, v: str) -> str:
+        if v not in {"create", "update", "delete"}:
+            raise ValueError("op must be one of create|update|delete")
+        return v
+
+
+class ApplyRecordResponse(BaseModel):
+    server_id: uuid.UUID
+    zone_id: uuid.UUID
+    record_id: uuid.UUID
+    op: str
+    target_serial: int
+    accepted_at: datetime
+
+
+@router.post(
+    "/servers/{server_id}/apply-record",
+    response_model=ApplyRecordResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def apply_record(
+    server_id: uuid.UUID,
+    body: ApplyRecordRequest,
+    db: DB,
+    current_user: SuperAdmin,
+) -> ApplyRecordResponse:
+    """Record a per-record push intent for a DNS server.
+
+    The control plane bumps the zone serial, marks the zone ``last_pushed_at``
+    now, and returns 202. The agent running alongside the daemon picks this up
+    through its long-poll config channel and executes the matching loopback
+    nsupdate (BIND9) / REST call (PowerDNS).
+    """
+    server = await db.get(DNSServer, server_id)
+    if server is None:
+        raise HTTPException(status_code=404, detail="DNS server not found")
+    zone = await db.get(DNSZone, body.zone_id)
+    if zone is None or zone.group_id != server.group_id:
+        raise HTTPException(status_code=404, detail="Zone not found on this server's group")
+
+    if body.op != "delete":
+        record = await db.get(DNSRecord, body.record_id)
+        if record is None or record.zone_id != zone.id:
+            raise HTTPException(status_code=404, detail="Record not found in zone")
+
+    now = datetime.now(UTC)
+    target_serial = bump_zone_serial(zone)
+    zone.last_pushed_at = now
+
+    db.add(AuditLog(
+        user_id=current_user.id,
+        user_display_name=current_user.display_name,
+        auth_source=current_user.auth_source,
+        action="apply_record",
+        resource_type="dns_zone",
+        resource_id=str(zone.id),
+        resource_display=zone.name,
+        new_value={
+            "server_id": str(server.id),
+            "record_id": str(body.record_id),
+            "op": body.op,
+            "target_serial": target_serial,
+        },
+        result="success",
+    ))
+    await db.commit()
+
+    return ApplyRecordResponse(
+        server_id=server.id,
+        zone_id=zone.id,
+        record_id=body.record_id,
+        op=body.op,
+        target_serial=target_serial,
+        accepted_at=now,
+    )
+
+
 # ── Server Options endpoints ────────────────────────────────────────────────
 
 
@@ -1025,6 +1118,7 @@ async def create_record(
         **body.model_dump(),
     )
     db.add(record)
+    bump_zone_serial(zone)
     db.add(AuditLog(
         user_id=current_user.id,
         user_display_name=current_user.display_name,
@@ -1056,6 +1150,8 @@ async def update_record(
         setattr(record, k, v)
     if "name" in changes and zone:
         record.fqdn = f"{record.name}.{zone.name}" if record.name != "@" else zone.name
+    if zone is not None:
+        bump_zone_serial(zone)
 
     db.add(AuditLog(
         user_id=current_user.id,
@@ -1078,6 +1174,7 @@ async def delete_record(
     group_id: uuid.UUID, zone_id: uuid.UUID, record_id: uuid.UUID, db: DB, current_user: CurrentUser
 ) -> None:
     record = await _require_record(group_id, zone_id, record_id, db)
+    zone = await db.get(DNSZone, record.zone_id)
     db.add(AuditLog(
         user_id=current_user.id,
         user_display_name=current_user.display_name,
@@ -1089,6 +1186,8 @@ async def delete_record(
         result="success",
     ))
     await db.delete(record)
+    if zone is not None:
+        bump_zone_serial(zone)
     await db.commit()
 
 

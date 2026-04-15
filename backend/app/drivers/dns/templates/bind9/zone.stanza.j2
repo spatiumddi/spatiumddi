@@ -1,0 +1,16 @@
+zone "{{ zone.name }}" {
+    type {{ "master" if zone.zone_type == "primary" else zone.zone_type }};
+    file "/var/cache/bind/zones/{{ zone.name }}db";
+    {%- if zone.allow_query %}
+    allow-query { {% for a in zone.allow_query %}{{ a }}; {% endfor %}};
+    {%- endif %}
+    {%- if zone.allow_transfer %}
+    allow-transfer { {% for a in zone.allow_transfer %}{{ a }}; {% endfor %}};
+    {%- endif %}
+    {%- if zone.also_notify %}
+    also-notify { {% for a in zone.also_notify %}{{ a }}; {% endfor %}};
+    {%- endif %}
+    {%- if zone.notify_enabled %}
+    notify {{ zone.notify_enabled }};
+    {%- endif %}
+};

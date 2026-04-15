@@ -1,0 +1,68 @@
+{{- $root := . -}}
+{{- range $server := .Values.servers }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: dns-{{ $server.flavor }}-{{ $server.name }}
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    {{- include "spatium-dns.labels" (dict "Release" $root.Release "Chart" $root.Chart "server" $server "instance" $server.name) | nindent 4 }}
+spec:
+  serviceName: dns-{{ $server.flavor }}-{{ $server.name }}-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: spatium-dns
+      app.kubernetes.io/instance: {{ $server.name }}
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: spatium-dns
+        app.kubernetes.io/instance: {{ $server.name }}
+        spatiumddi.org/dns-flavor: {{ $server.flavor }}
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels: { app.kubernetes.io/name: spatium-dns }
+                topologyKey: kubernetes.io/hostname
+      containers:
+        - name: dns
+          image: {{ $server.image }}
+          env:
+            - { name: CONTROL_PLANE_URL, value: {{ $root.Values.controlPlaneUrl | quote }} }
+            - { name: SERVER_NAME, valueFrom: { fieldRef: { fieldPath: metadata.name } } }
+            - { name: AGENT_GROUP,  value: {{ $server.group | default "default" | quote }} }
+            - { name: AGENT_ROLES,  value: "authoritative" }
+            - name: DNS_AGENT_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ default $root.Values.agentKey.secretName $root.Values.agentKey.existingSecret }}
+                  key: DNS_AGENT_KEY
+          ports:
+            - { name: dns-udp, containerPort: 53, protocol: UDP }
+            - { name: dns-tcp, containerPort: 53, protocol: TCP }
+          {{- with $server.resources }}
+          resources: {{- toYaml . | nindent 12 }}
+          {{- end }}
+          volumeMounts:
+            - { name: agent-state, mountPath: /var/lib/spatium-dns-agent }
+            {{- if eq $server.flavor "bind9" }}
+            - { name: dns-state,   mountPath: /var/cache/bind }
+            {{- else }}
+            - { name: dns-state,   mountPath: /var/lib/powerdns }
+            {{- end }}
+  volumeClaimTemplates:
+    - metadata: { name: agent-state }
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources: { requests: { storage: {{ default "1Gi" (get (default dict $server.storage) "agentState") }} } }
+    - metadata: { name: dns-state }
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources: { requests: { storage: {{ default "2Gi" (get (default dict $server.storage) "dnsState") }} } }
+{{- end }}

@@ -12,6 +12,13 @@ celery_app = Celery(
     ],
 )
 
+celery_app.conf.beat_schedule = {
+    "dns-agent-stale-sweep": {
+        "task": "app.tasks.dns.agent_stale_sweep",
+        "schedule": 60.0,
+    },
+}
+
 celery_app.conf.update(
     task_serializer="json",
     accept_content=["json"],

@@ -131,6 +131,33 @@ services:
         condition: service_healthy
     restart: "no"
 
+  # ── DNS agent (dev) ─────────────────────────────────────────────────────────
+  # Enable with: docker compose --profile dns up
+  dns-bind9-dev:
+    profiles: ["dns"]
+    build:
+      context: .
+      dockerfile: agent/dns/images/bind9/Dockerfile
+    restart: unless-stopped
+    networks:
+      - spatiumddi
+    environment:
+      CONTROL_PLANE_URL: http://api:8000
+      DNS_AGENT_KEY: ${DNS_AGENT_KEY:-changeme-dns-agent-key}
+      SERVER_NAME: dns-bind9-dev
+      AGENT_GROUP: default
+      AGENT_ROLES: authoritative
+      SPATIUM_INSECURE_SKIP_TLS_VERIFY: "1"
+    volumes:
+      - dns_bind9_state:/var/lib/spatium-dns-agent
+      - dns_bind9_cache:/var/cache/bind
+    ports:
+      - "5353:53/udp"
+      - "5353:53/tcp"
+    depends_on:
+      api:
+        condition: service_started
+
 networks:
   spatiumddi:
     driver: bridge
@@ -138,3 +165,5 @@ networks:
 volumes:
   postgres_data:
   redis_data:
+  dns_bind9_state:
+  dns_bind9_cache:

@@ -50,6 +50,12 @@ class Settings(BaseSettings):
     log_format: str = "json"
     prometheus_metrics_enabled: bool = True
 
+    # DNS agent
+    dns_agent_key: str = ""
+    dns_agent_token_ttl_hours: int = 24
+    dns_agent_longpoll_timeout: int = 30
+    dns_require_agent_approval: bool = False
+
     # App
     app_title: str = "SpatiumDDI"
     debug: bool = False

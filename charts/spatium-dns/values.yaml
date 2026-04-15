@@ -1,0 +1,30 @@
+controlPlaneUrl: http://spatiumddi-api.spatiumddi.svc.cluster.local:8000
+
+# Create/reference the Secret carrying DNS_AGENT_KEY.
+# If existingSecret is set, value is used verbatim.
+agentKey:
+  existingSecret: ""          # prefer pre-existing secret
+  secretName: spatium-dns-agent-key
+  value: ""                   # ONLY for dev; prefer --set-file
+
+# Declare each DNSServer row as an entry below.
+# The chart renders one StatefulSet + Service pair per entry.
+servers:
+  - name: ns1
+    flavor: bind9             # bind9 | powerdns
+    role: primary             # primary | secondary
+    group: internal-resolvers
+    image: ghcr.io/spatiumddi/dns-bind9:latest
+    resources:
+      requests: { cpu: 100m, memory: 128Mi }
+      limits:   { cpu: 500m, memory: 512Mi }
+    storage:
+      agentState: 1Gi
+      dnsState: 2Gi
+    service:
+      type: LoadBalancer      # LoadBalancer | NodePort | ClusterIP
+  - name: ns2
+    flavor: bind9
+    role: secondary
+    group: internal-resolvers
+    image: ghcr.io/spatiumddi/dns-bind9:latest

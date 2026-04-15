@@ -41,6 +41,7 @@ Always read the relevant spec doc(s) before writing code for a feature area.
 | `docs/features/AUTH.md` | Authentication, LDAP/OIDC/SAML, roles, group-scoped permissions, API tokens |
 | `docs/features/SYSTEM_ADMIN.md` | System config, health dashboard, notifications, backup/restore, service control |
 | `docs/deployment/APPLIANCE.md` | OS appliance build, base OS selection, licensing |
+| `docs/deployment/DNS_AGENT.md` | DNS agent/container architecture — image layout, auto-registration, config sync, K8s shape |
 | `docs/deployment/DOCKER.md` | Docker Compose setup, ports, first-time setup, TLS, HA, password reset |
 | `docs/deployment/KUBERNETES.md` | Helm chart, operators, HPA, Ingress |
 | `docs/deployment/BAREMETAL.md` | Ansible playbooks, systemd services, Patroni |
@@ -137,6 +138,18 @@ These rules apply to every file Claude Code generates. No exceptions.
 - ✅ Per-column subnet address filters — address, hostname, MAC, status, description columns each have independent filter inputs; replaces old single global filter bar
 - ✅ Network/broadcast records toggle in EditSubnetModal — detects current state from loaded addresses; sends `manage_auto_addresses` flag to add or permanently remove network/broadcast records post-creation
 - ✅ `/auth/me` UUID serialization fix — `UserResponse.id` changed from `str` to `uuid.UUID` (Pydantic v2 `from_attributes=True` does not auto-coerce)
+- ✅ DNS server groups, servers, zones, records — full CRUD UI and API; server group sidebar with expandable zone tree
+- ✅ DNS zone tree — nested sub-zone display (`com → example.com → sub.example.com`); `buildDnsTree` builds recursive `DnsTreeNode` structure from zone FQDNs
+- ✅ DNS Settings section — default zone TTL, zone type, DNSSEC validation mode, recursive-by-default toggle; DNS agent key info field
+- ✅ DNS Server Options tab — forwarders, DNSSEC validation, recursion, trust anchors
+- ✅ DNS ACLs and Views tabs — full CRUD
+- ✅ Settings page DNS defaults section — `dns_default_ttl`, `dns_default_zone_type`, `dns_default_dnssec_validation`, `dns_recursive_by_default` backed by migration `5d2a8f91c4e6`
+- ✅ Session timeout = 0 fix — `session_timeout_minutes` now uses `validate_session_timeout` (≥ 0) instead of `validate_positive` (> 0)
+- ✅ Dashboard DNS stat cards — DNS Server Groups and DNS Zones counts shown alongside IPAM stats
+- ✅ BlockDetailView "New Subnet" button — opens `CreateSubnetModal` pre-filled with `space_id` and `block_id`
+- ✅ Block delete with double confirmation — two-step modal in `EditBlockModal`; first confirms intent, second requires checkbox before permanent deletion
+- ✅ Subnet-by-size search — "Find by size" mode toggle in `CreateSubnetModal`; prefix dropdown (`/8`–`/32`); queries `GET /ipam/blocks/{id}/available-subnets?prefix_len=N`; results as clickable CIDR pills
+- ✅ DNS assignment on blocks/subnets — `dns_group_ids`, `dns_zone_id`, `dns_additional_zone_ids`, `dns_inherit_settings` fields on `IPBlock` and `Subnet` (migration `a1b2c3d4e5f6`); `DnsSettingsSection` component with "Inherit from parent" toggle shown in Create/Edit modals for blocks and subnets; effective DNS resolved by walking ancestor chain
 
 ### Phase 1 — Remaining
 

@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from "react";
-import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { useLocation } from "react-router-dom";
+import { useQuery, useQueries, useMutation, useQueryClient } from "@tanstack/react-query";
+import { useLocation, useSearchParams } from "react-router-dom";
 import {
   ChevronRight,
   Network,
@@ -13,10 +13,30 @@ import {
   Copy,
   Check,
   Upload,
+  Globe2,
 } from "lucide-react";
-import { ipamApi, customFieldsApi, type IPSpace, type IPBlock, type Subnet, type IPAddress, type CustomField } from "@/lib/api";
+import {
+  DndContext,
+  PointerSensor,
+  useSensor,
+  useSensors,
+  useDraggable,
+  useDroppable,
+  type DragEndEvent,
+} from "@dnd-kit/core";
+import { ipamApi, dnsApi, customFieldsApi, type IPSpace, type IPBlock, type Subnet, type IPAddress, type CustomField, type DNSZone, type FreeCidrRange } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { ImportModal, ExportButton } from "./ImportExportModals";
+import { cidrContains } from "@/lib/cidr";
+import { FreeSpaceBand } from "@/components/ipam/FreeSpaceBand";
+import {
+  ContextMenu,
+  ContextMenuContent,
+  ContextMenuItem,
+  ContextMenuSeparator,
+  ContextMenuTrigger,
+  ContextMenuLabel,
+} from "@/components/ui/context-menu";
 
 // ─── Status Badge ────────────────────────────────────────────────────────────
 
@@ -273,19 +293,212 @@ function CreateSpaceModal({ onClose }: { onClose: () => void }) {
   );
 }
 
+// ─── DNS Settings Section (reused in block & subnet modals) ──────────────────
+
+/**
+ * Shows DNS group / zone assignment with an "Inherit from parent" toggle.
+ * When inheriting the fields are grayed out showing what would be inherited.
+ * parentBlockId: pass the parent block's id to fetch effective inherited values.
+ */
+function DnsSettingsSection({
+  inherit,
+  groupIds,
+  zoneId,
+  additionalZoneIds,
+  onInheritChange,
+  onGroupIdsChange,
+  onZoneIdChange,
+  onAdditionalZoneIdsChange,
+  parentBlockId,
+}: {
+  inherit: boolean;
+  groupIds: string[];
+  zoneId: string | null;
+  additionalZoneIds: string[];
+  onInheritChange: (v: boolean) => void;
+  onGroupIdsChange: (v: string[]) => void;
+  onZoneIdChange: (v: string | null) => void;
+  onAdditionalZoneIdsChange: (v: string[]) => void;
+  parentBlockId?: string | null;
+}) {
+  const { data: allGroups = [] } = useQuery({
+    queryKey: ["dns-groups"],
+    queryFn: dnsApi.listGroups,
+    staleTime: 60_000,
+  });
+
+  // Fetch effective inherited DNS settings (only when parentBlockId is set)
+  const { data: effectiveDns } = useQuery({
+    queryKey: ["effective-dns-block", parentBlockId],
+    queryFn: () => ipamApi.getEffectiveBlockDns(parentBlockId!),
+    enabled: !!parentBlockId,
+    staleTime: 30_000,
+  });
+
+  // The group IDs to drive zone loading (own or inherited depending on mode)
+  const activeGroupIds = inherit ? (effectiveDns?.dns_group_ids ?? []) : groupIds;
+
+  const zoneQueries = useQueries({
+    queries: (activeGroupIds as string[]).map((gId: string) => ({
+      queryKey: ["dns-zones", gId],
+      queryFn: () => dnsApi.listZones(gId),
+      staleTime: 60_000,
+    })),
+  });
+  const availableZones: DNSZone[] = zoneQueries.flatMap((q: { data?: DNSZone[] }) => q.data ?? []);
+
+  // Displayed values when inheriting
+  const displayGroupIds = inherit ? (effectiveDns?.dns_group_ids ?? []) : groupIds;
+  const displayZoneId = inherit ? (effectiveDns?.dns_zone_id ?? null) : zoneId;
+  const displayAdditionalIds = inherit ? (effectiveDns?.dns_additional_zone_ids ?? []) : additionalZoneIds;
+
+  function toggleGroup(gId: string) {
+    if (groupIds.includes(gId)) {
+      onGroupIdsChange(groupIds.filter((id) => id !== gId));
+      // clear zones from this group if needed
+      const groupZoneIds = (zoneQueries.find((_: unknown, i: number) => activeGroupIds[i] === gId)?.data as DNSZone[] | undefined ?? []).map((z: DNSZone) => z.id);
+      if (zoneId && groupZoneIds.includes(zoneId)) onZoneIdChange(null);
+      onAdditionalZoneIdsChange(additionalZoneIds.filter((id) => !groupZoneIds.includes(id)));
+    } else {
+      onGroupIdsChange([...groupIds, gId]);
+    }
+  }
+
+  function toggleAdditionalZone(zId: string) {
+    if (additionalZoneIds.includes(zId)) {
+      onAdditionalZoneIdsChange(additionalZoneIds.filter((id) => id !== zId));
+    } else {
+      onAdditionalZoneIdsChange([...additionalZoneIds, zId]);
+    }
+  }
+
+  const inheritedFrom = effectiveDns?.inherited_from_block_id
+    ? "a parent block"
+    : null;
+
+  return (
+    <div className="border-t pt-3 space-y-2">
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-1.5">
+          <Globe2 className="h-3.5 w-3.5 text-muted-foreground" />
+          <span className="text-xs font-medium">DNS Settings</span>
+        </div>
+        <label className="flex items-center gap-1.5 text-xs cursor-pointer select-none">
+          <input
+            type="checkbox"
+            checked={inherit}
+            onChange={(e) => onInheritChange(e.target.checked)}
+            className="h-3.5 w-3.5"
+          />
+          Inherit from parent
+        </label>
+      </div>
+
+      {inherit && (
+        <p className="text-xs text-muted-foreground italic">
+          {effectiveDns && (effectiveDns.dns_group_ids.length > 0 || effectiveDns.dns_zone_id)
+            ? `Inheriting from ${inheritedFrom ?? "parent"}: ${effectiveDns.dns_group_ids.length} group(s), zone: ${effectiveDns.dns_zone_id ? availableZones.find(z => z.id === effectiveDns.dns_zone_id)?.name ?? effectiveDns.dns_zone_id : "none"}`
+            : "No DNS settings configured in parent chain."}
+        </p>
+      )}
+
+      <fieldset disabled={inherit} className="space-y-2 disabled:opacity-50">
+        {/* DNS Server Groups */}
+        <div>
+          <p className="text-xs text-muted-foreground mb-1">DNS Server Groups</p>
+          {allGroups.length === 0 ? (
+            <p className="text-xs text-muted-foreground italic">No groups configured.</p>
+          ) : (
+            <div className="flex flex-wrap gap-1.5">
+              {allGroups.map((g) => {
+                const selected = displayGroupIds.includes(g.id);
+                return (
+                  <button
+                    key={g.id}
+                    type="button"
+                    onClick={() => !inherit && toggleGroup(g.id)}
+                    className={`px-2 py-0.5 rounded-full border text-xs transition-colors ${
+                      selected
+                        ? "bg-primary text-primary-foreground border-primary"
+                        : "bg-background text-muted-foreground border-border hover:border-primary/50"
+                    }`}
+                  >
+                    {g.name}
+                  </button>
+                );
+              })}
+            </div>
+          )}
+        </div>
+
+        {/* Primary Zone */}
+        {availableZones.length > 0 && (
+          <div>
+            <p className="text-xs text-muted-foreground mb-1">Primary Zone</p>
+            <select
+              value={displayZoneId ?? ""}
+              onChange={(e) => !inherit && onZoneIdChange(e.target.value || null)}
+              className={`${inputCls} w-full`}
+            >
+              <option value="">— None —</option>
+              {availableZones.map((z) => (
+                <option key={z.id} value={z.id}>{z.name}</option>
+              ))}
+            </select>
+          </div>
+        )}
+
+        {/* Additional Zones */}
+        {availableZones.length > 1 && (
+          <div>
+            <p className="text-xs text-muted-foreground mb-1">Additional Zones</p>
+            <div className="flex flex-wrap gap-1.5">
+              {availableZones
+                .filter((z) => z.id !== displayZoneId)
+                .map((z) => {
+                  const selected = displayAdditionalIds.includes(z.id);
+                  return (
+                    <button
+                      key={z.id}
+                      type="button"
+                      onClick={() => !inherit && toggleAdditionalZone(z.id)}
+                      className={`px-2 py-0.5 rounded-full border text-xs transition-colors ${
+                        selected
+                          ? "bg-sky-500/20 text-sky-700 border-sky-500/50 dark:text-sky-400"
+                          : "bg-background text-muted-foreground border-border hover:border-sky-500/30"
+                      }`}
+                    >
+                      {z.name}
+                    </button>
+                  );
+                })}
+            </div>
+          </div>
+        )}
+      </fieldset>
+    </div>
+  );
+}
+
 // ─── Create Subnet Modal ──────────────────────────────────────────────────────
+
+// Prefix options shown in the "Find by size" picker
+const PREFIX_OPTIONS = Array.from({ length: 25 }, (_, i) => i + 8); // /8 – /32
 
 function CreateSubnetModal({
   spaceId,
   defaultBlockId,
+  defaultNetwork,
   onClose,
 }: {
   spaceId: string;
   defaultBlockId?: string;
+  defaultNetwork?: string;
   onClose: () => void;
 }) {
   const qc = useQueryClient();
-  const [network, setNetwork] = useState("");
+  const [subnetMode, setSubnetMode] = useState<"manual" | "size">("manual");
+  const [network, setNetwork] = useState(defaultNetwork ?? "");
   const [name, setName] = useState("");
   const [blockId, setBlockId] = useState(defaultBlockId ?? "");
   const [gateway, setGateway] = useState("");
@@ -293,6 +506,16 @@ function CreateSubnetModal({
   const [skipAuto, setSkipAuto] = useState(false);
   const [customFields, setCustomFields] = useState<Record<string, unknown>>({});
   const [error, setError] = useState<string | null>(null);
+
+  // "Find by size" state
+  const [prefixLen, setPrefixLen] = useState("24");
+  const [selectedNet, setSelectedNet] = useState("");
+
+  // DNS state
+  const [dnsInherit, setDnsInherit] = useState(true);
+  const [dnsGroupIds, setDnsGroupIds] = useState<string[]>([]);
+  const [dnsZoneId, setDnsZoneId] = useState<string | null>(null);
+  const [dnsAdditionalZoneIds, setDnsAdditionalZoneIds] = useState<string[]>([]);
 
   const { data: blocks } = useQuery({
     queryKey: ["blocks", spaceId],
@@ -304,23 +527,48 @@ function CreateSubnetModal({
     queryFn: () => customFieldsApi.list("subnet"),
   });
 
+  // Available subnets query (only active when in size mode and block + prefix are set)
+  const { data: availableNets = [], isFetching: searchingNets } = useQuery({
+    queryKey: ["available-subnets", blockId, prefixLen],
+    queryFn: () => ipamApi.availableSubnets(blockId, parseInt(prefixLen)),
+    enabled: subnetMode === "size" && !!blockId && !!prefixLen,
+    staleTime: 15_000,
+  });
+
   // Auto-select if only one block
   useEffect(() => {
     if (!blockId && blocks?.length === 1) setBlockId(blocks[0].id);
   }, [blocks, blockId]);
+
+  // When switching to size mode, clear manually typed network
+  function switchMode(m: "manual" | "size") {
+    setSubnetMode(m);
+    setNetwork("");
+    setSelectedNet("");
+    setError(null);
+  }
+
+  // The actual network to submit — typed value in manual mode, selected in size mode
+  const effectiveNetwork = subnetMode === "manual" ? network : selectedNet;
 
   const mutation = useMutation({
     mutationFn: () =>
       ipamApi.createSubnet({
         space_id: spaceId,
         block_id: blockId,
-        network,
+        network: effectiveNetwork,
         name: name || undefined,
         gateway: gateway || undefined,
         vlan_id: vlanId ? parseInt(vlanId) : undefined,
         status: "active",
         skip_auto_addresses: skipAuto,
         custom_fields: customFields,
+        dns_inherit_settings: dnsInherit,
+        ...(dnsInherit ? {} : {
+          dns_group_ids: dnsGroupIds,
+          dns_zone_id: dnsZoneId,
+          dns_additional_zone_ids: dnsAdditionalZoneIds,
+        }),
       }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["subnets", spaceId] });
@@ -338,8 +586,27 @@ function CreateSubnetModal({
   return (
     <Modal title="New Subnet" onClose={onClose}>
       <div className="space-y-3">
+        {/* Mode toggle */}
+        <div className="flex gap-2">
+          {(["manual", "size"] as const).map((m) => (
+            <button
+              key={m}
+              type="button"
+              onClick={() => switchMode(m)}
+              className={cn(
+                "flex-1 rounded-md border px-3 py-1.5 text-sm",
+                subnetMode === m
+                  ? "bg-primary text-primary-foreground border-primary"
+                  : "hover:bg-muted"
+              )}
+            >
+              {m === "manual" ? "Manual CIDR" : "Find by size"}
+            </button>
+          ))}
+        </div>
+
         <Field label="Block *">
-          <select className={inputCls} value={blockId} onChange={(e) => setBlockId(e.target.value)}>
+          <select className={inputCls} value={blockId} onChange={(e) => { setBlockId(e.target.value); setSelectedNet(""); }}>
             <option value="">Select a block…</option>
             {blocks?.map((b: IPBlock) => (
               <option key={b.id} value={b.id}>
@@ -351,15 +618,70 @@ function CreateSubnetModal({
             <p className="text-xs text-amber-600 mt-1">No blocks in this space. Create a block first.</p>
           )}
         </Field>
-        <Field label="Network (CIDR)">
-          <input
-            className={inputCls}
-            value={network}
-            onChange={(e) => { setNetwork(e.target.value); setError(null); }}
-            placeholder="e.g. 10.0.1.0/24"
-            autoFocus
-          />
-        </Field>
+
+        {subnetMode === "manual" ? (
+          <Field label="Network (CIDR)">
+            <input
+              className={inputCls}
+              value={network}
+              onChange={(e) => { setNetwork(e.target.value); setError(null); }}
+              placeholder="e.g. 10.0.1.0/24"
+              autoFocus
+            />
+          </Field>
+        ) : (
+          <div className="space-y-2">
+            <div className="flex items-center gap-2">
+              <Field label="Prefix size">
+                <select
+                  className={inputCls}
+                  value={prefixLen}
+                  onChange={(e) => { setPrefixLen(e.target.value); setSelectedNet(""); }}
+                >
+                  {PREFIX_OPTIONS.map((n) => (
+                    <option key={n} value={String(n)}>/{n}</option>
+                  ))}
+                </select>
+              </Field>
+            </div>
+            {!blockId ? (
+              <p className="text-xs text-muted-foreground italic">Select a block first.</p>
+            ) : searchingNets ? (
+              <p className="text-xs text-muted-foreground italic">Searching…</p>
+            ) : availableNets.length === 0 ? (
+              <p className="text-xs text-amber-600 italic">No available /{prefixLen} subnets in this block.</p>
+            ) : (
+              <div>
+                <p className="text-xs text-muted-foreground mb-1">
+                  Available /{prefixLen} subnets (click to select):
+                </p>
+                <div className="flex flex-wrap gap-1.5 max-h-36 overflow-y-auto">
+                  {availableNets.map((net: string) => (
+                    <button
+                      key={net}
+                      type="button"
+                      onClick={() => setSelectedNet(net)}
+                      className={cn(
+                        "font-mono rounded border px-2 py-0.5 text-xs transition-colors",
+                        selectedNet === net
+                          ? "bg-primary text-primary-foreground border-primary"
+                          : "bg-background hover:border-primary/50"
+                      )}
+                    >
+                      {net}
+                    </button>
+                  ))}
+                </div>
+                {selectedNet && (
+                  <p className="text-xs text-emerald-600 dark:text-emerald-400 mt-1">
+                    Selected: <span className="font-mono">{selectedNet}</span>
+                  </p>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+
         <Field label="Name">
           <input
             className={inputCls}
@@ -400,6 +722,17 @@ function CreateSubnetModal({
           values={customFields}
           onChange={(k, v) => setCustomFields((prev) => ({ ...prev, [k]: v }))}
         />
+        <DnsSettingsSection
+          inherit={dnsInherit}
+          groupIds={dnsGroupIds}
+          zoneId={dnsZoneId}
+          additionalZoneIds={dnsAdditionalZoneIds}
+          onInheritChange={setDnsInherit}
+          onGroupIdsChange={setDnsGroupIds}
+          onZoneIdChange={setDnsZoneId}
+          onAdditionalZoneIdsChange={setDnsAdditionalZoneIds}
+          parentBlockId={blockId || null}
+        />
         {error && <p className="text-xs text-destructive">{error}</p>}
         <div className="flex justify-end gap-2 pt-2">
           <button
@@ -410,7 +743,7 @@ function CreateSubnetModal({
           </button>
           <button
             onClick={() => { setError(null); mutation.mutate(); }}
-            disabled={!network || !blockId || mutation.isPending}
+            disabled={!effectiveNetwork || !blockId || mutation.isPending}
             className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
             {mutation.isPending ? "Creating…" : "Create"}
@@ -440,6 +773,7 @@ function AddAddressModal({
   const [description, setDescription] = useState("");
   const [ipStatus, setIpStatus] = useState("allocated");
   const [customFields, setCustomFields] = useState<Record<string, unknown>>({});
+  const [dnsZoneId, setDnsZoneId] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
 
   const { data: cfDefs = [] } = useQuery({
@@ -447,8 +781,35 @@ function AddAddressModal({
     queryFn: () => customFieldsApi.list("ip_address"),
   });
 
+  // Fetch effective DNS for this subnet to know which zones are available
+  const { data: effectiveDns } = useQuery({
+    queryKey: ["effective-dns-subnet", subnetId],
+    queryFn: () => ipamApi.getEffectiveSubnetDns(subnetId),
+    staleTime: 30_000,
+  });
+
+  // Load zones from all effective group IDs
+  const zoneGroupIds: string[] = effectiveDns?.dns_group_ids ?? [];
+  const zoneQueries = useQueries({
+    queries: (zoneGroupIds as string[]).map((gId: string) => ({
+      queryKey: ["dns-zones", gId],
+      queryFn: () => dnsApi.listZones(gId),
+      staleTime: 60_000,
+    })),
+  });
+  const availableZones: DNSZone[] = zoneQueries.flatMap((q: { data?: DNSZone[] }) => q.data ?? []);
+
+  // Pre-select the primary zone (dns_zone_id) or first zone when there's only one
+  useEffect(() => {
+    if (!dnsZoneId && availableZones.length > 0) {
+      const primary = effectiveDns?.dns_zone_id;
+      setDnsZoneId(primary && availableZones.some((z: DNSZone) => z.id === primary) ? primary : availableZones[0].id);
+    }
+  }, [availableZones.length, effectiveDns?.dns_zone_id]); // eslint-disable-line react-hooks/exhaustive-deps
+
   const mutation = useMutation({
     mutationFn: () => {
+      const zoneParam = dnsZoneId || undefined;
       if (mode === "next") {
         return ipamApi.nextAddress(subnetId, {
           hostname,
@@ -456,6 +817,7 @@ function AddAddressModal({
           mac_address: mac || undefined,
           description: description || undefined,
           custom_fields: customFields,
+          dns_zone_id: zoneParam,
         });
       }
       return ipamApi.createAddress({
@@ -466,6 +828,7 @@ function AddAddressModal({
         description: description || undefined,
         status: ipStatus,
         custom_fields: customFields,
+        dns_zone_id: zoneParam,
       });
     },
     onSuccess: () => {
@@ -482,6 +845,12 @@ function AddAddressModal({
   });
 
   const canSubmit = !!hostname.trim() && (mode === "next" || !!address);
+
+  // Compute preview FQDN
+  const selectedZone = availableZones.find((z: DNSZone) => z.id === dnsZoneId);
+  const fqdnPreview = hostname && selectedZone
+    ? `${hostname}.${selectedZone.name.replace(/\.$/, "")}`
+    : null;
 
   return (
     <Modal title="Allocate IP Address" onClose={onClose}>
@@ -522,6 +891,40 @@ function AddAddressModal({
             autoFocus={mode === "next"}
           />
         </Field>
+        {/* DNS zone selector — only shown when zones are available */}
+        {availableZones.length > 0 && (
+          <Field label="DNS Zone">
+            {availableZones.length === 1 ? (
+              <p className="text-xs text-muted-foreground py-1">
+                <Globe2 className="inline h-3 w-3 mr-1" />
+                {availableZones[0].name.replace(/\.$/, "")}
+                {fqdnPreview && (
+                  <span className="ml-2 font-mono text-emerald-600 dark:text-emerald-400">
+                    → {fqdnPreview}
+                  </span>
+                )}
+              </p>
+            ) : (
+              <div className="space-y-1">
+                <select
+                  className={inputCls}
+                  value={dnsZoneId}
+                  onChange={(e) => setDnsZoneId(e.target.value)}
+                >
+                  <option value="">— None (no DNS record) —</option>
+                  {availableZones.map((z: DNSZone) => (
+                    <option key={z.id} value={z.id}>{z.name.replace(/\.$/, "")}</option>
+                  ))}
+                </select>
+                {fqdnPreview && (
+                  <p className="text-xs font-mono text-emerald-600 dark:text-emerald-400">
+                    → {fqdnPreview}
+                  </p>
+                )}
+              </div>
+            )}
+          </Field>
+        )}
         <div className="grid grid-cols-2 gap-2">
           <Field label="MAC Address">
             <input
@@ -885,8 +1288,14 @@ function SubnetDetail({
                       <CopyButton text={addr.address} />
                     </span>
                   </td>
-                  <td className="px-4 py-2 text-muted-foreground">
-                    {addr.hostname ?? <span className="text-muted-foreground/40">—</span>}
+                  <td className="px-4 py-2">
+                    {addr.fqdn ? (
+                      <span className="font-mono text-xs">{addr.fqdn}</span>
+                    ) : addr.hostname ? (
+                      <span className="text-muted-foreground">{addr.hostname}</span>
+                    ) : (
+                      <span className="text-muted-foreground/40">—</span>
+                    )}
                   </td>
                   <td className="px-4 py-2 font-mono text-xs">
                     {addr.mac_address ?? <span className="text-muted-foreground/40">—</span>}
@@ -1008,6 +1417,12 @@ function EditSubnetModal({
   );
   const [error, setError] = useState<string | null>(null);
 
+  // DNS state — initialized from subnet
+  const [dnsInherit, setDnsInherit] = useState(subnet.dns_inherit_settings ?? true);
+  const [dnsGroupIds, setDnsGroupIds] = useState<string[]>(subnet.dns_group_ids ?? []);
+  const [dnsZoneId, setDnsZoneId] = useState<string | null>(subnet.dns_zone_id ?? null);
+  const [dnsAdditionalZoneIds, setDnsAdditionalZoneIds] = useState<string[]>(subnet.dns_additional_zone_ids ?? []);
+
   // Detect whether network/broadcast records currently exist
   const { data: addresses } = useQuery({
     queryKey: ["addresses", subnet.id],
@@ -1038,11 +1453,17 @@ function EditSubnetModal({
         vlan_id: vlanId ? parseInt(vlanId) : null,
         status,
         custom_fields: customFields,
+        dns_inherit_settings: dnsInherit,
+        dns_group_ids: dnsInherit ? null : dnsGroupIds,
+        dns_zone_id: dnsInherit ? null : dnsZoneId,
+        dns_additional_zone_ids: dnsInherit ? null : dnsAdditionalZoneIds,
         ...(manageAuto !== undefined ? { manage_auto_addresses: manageAuto } : {}),
       });
     },
     onSuccess: (updated) => {
       qc.invalidateQueries({ queryKey: ["subnets", subnet.space_id] });
+      // Invalidate addresses so network/broadcast changes are reflected immediately
+      qc.invalidateQueries({ queryKey: ["addresses", subnet.id] });
       onClose(updated);
     },
     onError: (err: unknown) => {
@@ -1124,6 +1545,17 @@ function EditSubnetModal({
           values={customFields}
           onChange={(k, v) => setCustomFields((prev) => ({ ...prev, [k]: v }))}
         />
+        <DnsSettingsSection
+          inherit={dnsInherit}
+          groupIds={dnsGroupIds}
+          zoneId={dnsZoneId}
+          additionalZoneIds={dnsAdditionalZoneIds}
+          onInheritChange={setDnsInherit}
+          onGroupIdsChange={setDnsGroupIds}
+          onZoneIdChange={setDnsZoneId}
+          onAdditionalZoneIdsChange={setDnsAdditionalZoneIds}
+          parentBlockId={subnet.block_id}
+        />
         {error && <p className="text-xs text-destructive">{error}</p>}
         <div className="flex justify-end gap-2 pt-2">
           <button onClick={() => onClose()} className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted">
@@ -1161,12 +1593,43 @@ function EditAddressModal({
   const [customFields, setCustomFields] = useState<Record<string, unknown>>(
     (address.custom_fields as Record<string, unknown>) ?? {}
   );
+  const [dnsZoneId, setDnsZoneId] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
 
   const { data: cfDefs = [] } = useQuery({
     queryKey: ["custom-fields", "ip_address"],
     queryFn: () => customFieldsApi.list("ip_address"),
   });
+
+  // Fetch effective DNS for the subnet this IP belongs to
+  const { data: effectiveDns } = useQuery({
+    queryKey: ["effective-dns-subnet", address.subnet_id],
+    queryFn: () => ipamApi.getEffectiveSubnetDns(address.subnet_id),
+    staleTime: 30_000,
+  });
+
+  const zoneGroupIds: string[] = effectiveDns?.dns_group_ids ?? [];
+  const zoneQueries = useQueries({
+    queries: (zoneGroupIds as string[]).map((gId: string) => ({
+      queryKey: ["dns-zones", gId],
+      queryFn: () => dnsApi.listZones(gId),
+      staleTime: 60_000,
+    })),
+  });
+  const availableZones: DNSZone[] = zoneQueries.flatMap((q: { data?: DNSZone[] }) => q.data ?? []);
+
+  // Pre-select zone from current FQDN or primary zone
+  useEffect(() => {
+    if (!dnsZoneId && availableZones.length > 0) {
+      const primary = effectiveDns?.dns_zone_id;
+      setDnsZoneId(primary && availableZones.some((z: DNSZone) => z.id === primary) ? primary : availableZones[0].id);
+    }
+  }, [availableZones.length, effectiveDns?.dns_zone_id]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const selectedZone = availableZones.find((z: DNSZone) => z.id === dnsZoneId);
+  const fqdnPreview = hostname && selectedZone
+    ? `${hostname}.${selectedZone.name.replace(/\.$/, "")}`
+    : null;
 
   const mutation = useMutation({
     mutationFn: () =>
@@ -1176,6 +1639,7 @@ function EditAddressModal({
         mac_address: macAddress || undefined,
         status,
         custom_fields: customFields,
+        dns_zone_id: dnsZoneId || undefined,
       }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["addresses", address.subnet_id] });
@@ -1201,6 +1665,32 @@ function EditAddressModal({
             autoFocus
           />
         </Field>
+        {/* DNS zone — only shown when zones are available */}
+        {availableZones.length > 0 && (
+          <Field label="DNS Zone">
+            {availableZones.length === 1 ? (
+              <p className="text-xs text-muted-foreground py-1">
+                <Globe2 className="inline h-3 w-3 mr-1" />
+                {availableZones[0].name.replace(/\.$/, "")}
+                {fqdnPreview && (
+                  <span className="ml-2 font-mono text-emerald-600 dark:text-emerald-400">→ {fqdnPreview}</span>
+                )}
+              </p>
+            ) : (
+              <div className="space-y-1">
+                <select className={inputCls} value={dnsZoneId} onChange={(e) => setDnsZoneId(e.target.value)}>
+                  <option value="">— None (remove DNS record) —</option>
+                  {availableZones.map((z: DNSZone) => (
+                    <option key={z.id} value={z.id}>{z.name.replace(/\.$/, "")}</option>
+                  ))}
+                </select>
+                {fqdnPreview && (
+                  <p className="text-xs font-mono text-emerald-600 dark:text-emerald-400">→ {fqdnPreview}</p>
+                )}
+              </div>
+            )}
+          </Field>
+        )}
         <Field label="Description">
           <input
             className={inputCls}
@@ -1259,24 +1749,35 @@ function SubnetRow({
   onSelect,
   onDelete,
   onEdited,
+  onAllocateIp,
 }: {
   subnet: Subnet;
   isSelected: boolean;
   onSelect: () => void;
   onDelete: () => void;
   onEdited: (updated: Subnet) => void;
+  onAllocateIp?: (s: Subnet) => void;
 }) {
   const [showEdit, setShowEdit] = useState(false);
+  const { attributes, listeners, setNodeRef, isDragging } = useDraggable({
+    id: `subnet:${subnet.id}`,
+    data: { kind: "subnet", subnet },
+  });
 
   return (
-    <>
+    <ContextMenu>
+      <ContextMenuTrigger asChild>
       <div
+        ref={setNodeRef}
+        {...attributes}
+        {...listeners}
         onClick={onSelect}
         className={cn(
           "group flex cursor-pointer items-center gap-1.5 rounded-md px-2 py-1.5 text-sm",
           isSelected
             ? "bg-primary/10 text-primary font-medium"
-            : "text-muted-foreground hover:bg-muted/50 hover:text-foreground"
+            : "text-muted-foreground hover:bg-muted/50 hover:text-foreground",
+          isDragging && "opacity-40",
         )}
       >
         {/* leaf node box indicator */}
@@ -1306,6 +1807,18 @@ function SubnetRow({
           <Trash2 className="h-3 w-3" />
         </button>
       </div>
+      </ContextMenuTrigger>
+      <ContextMenuContent>
+        <ContextMenuLabel>{subnet.network}</ContextMenuLabel>
+        <ContextMenuSeparator />
+        {onAllocateIp && (
+          <ContextMenuItem onSelect={() => onAllocateIp(subnet)}>
+            Allocate IP
+          </ContextMenuItem>
+        )}
+        <ContextMenuItem onSelect={() => setShowEdit(true)}>Edit…</ContextMenuItem>
+        <ContextMenuItem destructive onSelect={() => onDelete()}>Delete…</ContextMenuItem>
+      </ContextMenuContent>
       {showEdit && (
         <EditSubnetModal
           subnet={subnet}
@@ -1315,7 +1828,7 @@ function SubnetRow({
           }}
         />
       )}
-    </>
+    </ContextMenu>
   );
 }
 
@@ -1355,6 +1868,65 @@ function ConfirmDeleteModal({
             className="rounded-md bg-destructive px-3 py-1.5 text-sm text-destructive-foreground hover:bg-destructive/90 disabled:opacity-50"
           >
             {isPending ? "…" : confirmLabel}
+          </button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+/** Two-step destruction modal: step 1 confirms intent, step 2 requires checkbox. */
+function ConfirmDestroyModal({
+  title,
+  description,
+  checkLabel,
+  onConfirm,
+  onClose,
+  isPending,
+}: {
+  title: string;
+  description: string;
+  checkLabel: string;
+  onConfirm: () => void;
+  onClose: () => void;
+  isPending?: boolean;
+}) {
+  const [step, setStep] = useState<1 | 2>(1);
+  const [checked, setChecked] = useState(false);
+
+  if (step === 1) {
+    return (
+      <Modal title={title} onClose={onClose}>
+        <div className="space-y-4">
+          <p className="text-sm text-muted-foreground">{description}</p>
+          <div className="flex justify-end gap-2">
+            <button onClick={onClose} className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted">Cancel</button>
+            <button onClick={() => setStep(2)} className="rounded-md bg-destructive px-3 py-1.5 text-sm text-destructive-foreground hover:bg-destructive/90">
+              Continue
+            </button>
+          </div>
+        </div>
+      </Modal>
+    );
+  }
+
+  return (
+    <Modal title="Confirm Permanent Deletion" onClose={onClose}>
+      <div className="space-y-4">
+        <p className="text-sm font-medium text-destructive">This action cannot be undone.</p>
+        <p className="text-sm text-muted-foreground">{description}</p>
+        <label className="flex cursor-pointer items-start gap-2 text-sm">
+          <input type="checkbox" className="mt-0.5" checked={checked} onChange={() => setChecked(!checked)} />
+          {checkLabel}
+        </label>
+        <div className="flex justify-end gap-2">
+          <button onClick={onClose} className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted">Cancel</button>
+          <button
+            onClick={onConfirm}
+            disabled={!checked || isPending}
+            className="rounded-md bg-destructive px-3 py-1.5 text-sm text-destructive-foreground hover:bg-destructive/90 disabled:opacity-50"
+          >
+            {isPending ? "Deleting…" : "Delete permanently"}
           </button>
         </div>
       </div>
@@ -1562,6 +2134,12 @@ function CreateBlockModal({
   const [customFields, setCustomFields] = useState<Record<string, unknown>>({});
   const [error, setError] = useState<string | null>(null);
 
+  // DNS state
+  const [dnsInherit, setDnsInherit] = useState(true);
+  const [dnsGroupIds, setDnsGroupIds] = useState<string[]>([]);
+  const [dnsZoneId, setDnsZoneId] = useState<string | null>(null);
+  const [dnsAdditionalZoneIds, setDnsAdditionalZoneIds] = useState<string[]>([]);
+
   const { data: existingBlocks } = useQuery({
     queryKey: ["blocks", spaceId],
     queryFn: () => ipamApi.listBlocks(spaceId),
@@ -1585,6 +2163,12 @@ function CreateBlockModal({
         description: description || undefined,
         parent_block_id: parentBlockId || undefined,
         custom_fields: customFields,
+        dns_inherit_settings: dnsInherit,
+        ...(dnsInherit ? {} : {
+          dns_group_ids: dnsGroupIds,
+          dns_zone_id: dnsZoneId,
+          dns_additional_zone_ids: dnsAdditionalZoneIds,
+        }),
       }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["blocks", spaceId] });
@@ -1624,6 +2208,17 @@ function CreateBlockModal({
           values={customFields}
           onChange={(k, v) => setCustomFields((prev) => ({ ...prev, [k]: v }))}
         />
+        <DnsSettingsSection
+          inherit={dnsInherit}
+          groupIds={dnsGroupIds}
+          zoneId={dnsZoneId}
+          additionalZoneIds={dnsAdditionalZoneIds}
+          onInheritChange={setDnsInherit}
+          onGroupIdsChange={setDnsGroupIds}
+          onZoneIdChange={setDnsZoneId}
+          onAdditionalZoneIdsChange={setDnsAdditionalZoneIds}
+          parentBlockId={parentBlockId || null}
+        />
         {error && <p className="text-xs text-destructive">{error}</p>}
         <div className="flex justify-end gap-2 pt-2">
           <button onClick={onClose} className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted">Cancel</button>
@@ -1641,9 +2236,11 @@ function CreateBlockModal({
 function EditBlockModal({
   block,
   onClose,
+  onDeleted,
 }: {
   block: IPBlock;
   onClose: (updated?: IPBlock) => void;
+  onDeleted?: () => void;
 }) {
   const qc = useQueryClient();
   const [name, setName] = useState(block.name ?? "");
@@ -1652,6 +2249,14 @@ function EditBlockModal({
     (block.custom_fields as Record<string, unknown>) ?? {}
   );
   const [error, setError] = useState<string | null>(null);
+  const [deleteStep, setDeleteStep] = useState<0 | 1 | 2>(0);
+  const [deleteChecked, setDeleteChecked] = useState(false);
+
+  // DNS state — initialized from block
+  const [dnsInherit, setDnsInherit] = useState(block.dns_inherit_settings ?? true);
+  const [dnsGroupIds, setDnsGroupIds] = useState<string[]>(block.dns_group_ids ?? []);
+  const [dnsZoneId, setDnsZoneId] = useState<string | null>(block.dns_zone_id ?? null);
+  const [dnsAdditionalZoneIds, setDnsAdditionalZoneIds] = useState<string[]>(block.dns_additional_zone_ids ?? []);
 
   const { data: cfDefs = [] } = useQuery({
     queryKey: ["custom-fields", "ip_block"],
@@ -1664,6 +2269,10 @@ function EditBlockModal({
         name: name || undefined,
         description,
         custom_fields: customFields,
+        dns_inherit_settings: dnsInherit,
+        dns_group_ids: dnsInherit ? null : dnsGroupIds,
+        dns_zone_id: dnsInherit ? null : dnsZoneId,
+        dns_additional_zone_ids: dnsInherit ? null : dnsAdditionalZoneIds,
       }),
     onSuccess: (updated) => {
       qc.invalidateQueries({ queryKey: ["blocks", block.space_id] });
@@ -1678,6 +2287,80 @@ function EditBlockModal({
     },
   });
 
+  const deleteMutation = useMutation({
+    mutationFn: () => ipamApi.deleteBlock(block.id),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["blocks", block.space_id] });
+      qc.invalidateQueries({ queryKey: ["blocks"] });
+      onDeleted?.();
+    },
+  });
+
+  // ── Delete step 1 ──
+  if (deleteStep === 1) {
+    return (
+      <Modal title="Delete Block" onClose={() => setDeleteStep(0)}>
+        <div className="space-y-4">
+          <p className="text-sm text-muted-foreground">
+            Are you sure you want to delete block{" "}
+            <strong className="text-foreground font-mono">{block.network}</strong>
+            {block.name ? ` (${block.name})` : ""}? This will permanently delete all
+            subnets and IP addresses within it.
+          </p>
+          <div className="flex justify-end gap-2">
+            <button onClick={() => setDeleteStep(0)} className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted">
+              Cancel
+            </button>
+            <button
+              onClick={() => setDeleteStep(2)}
+              className="rounded-md bg-destructive px-3 py-1.5 text-sm text-destructive-foreground hover:bg-destructive/90"
+            >
+              Continue
+            </button>
+          </div>
+        </div>
+      </Modal>
+    );
+  }
+
+  // ── Delete step 2 ──
+  if (deleteStep === 2) {
+    return (
+      <Modal title="Confirm Permanent Deletion" onClose={() => setDeleteStep(0)}>
+        <div className="space-y-4">
+          <p className="text-sm font-medium text-destructive">This action cannot be undone.</p>
+          <p className="text-sm text-muted-foreground">
+            All subnets and IP address records within{" "}
+            <strong className="text-foreground font-mono">{block.network}</strong> will be
+            permanently removed from the database.
+          </p>
+          <label className="flex cursor-pointer items-start gap-2 text-sm">
+            <input
+              type="checkbox"
+              className="mt-0.5"
+              checked={deleteChecked}
+              onChange={(e) => setDeleteChecked(e.target.checked)}
+            />
+            I understand this will permanently delete all data in this block.
+          </label>
+          <div className="flex justify-end gap-2">
+            <button onClick={() => setDeleteStep(0)} className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted">
+              Cancel
+            </button>
+            <button
+              onClick={() => deleteMutation.mutate()}
+              disabled={!deleteChecked || deleteMutation.isPending}
+              className="rounded-md bg-destructive px-3 py-1.5 text-sm text-destructive-foreground hover:bg-destructive/90 disabled:opacity-50"
+            >
+              {deleteMutation.isPending ? "Deleting…" : "Delete permanently"}
+            </button>
+          </div>
+        </div>
+      </Modal>
+    );
+  }
+
+  // ── Normal edit view ──
   return (
     <Modal title={`Edit ${block.network}`} onClose={() => onClose()}>
       <div className="space-y-3">
@@ -1703,6 +2386,17 @@ function EditBlockModal({
           values={customFields}
           onChange={(k, v) => setCustomFields((prev) => ({ ...prev, [k]: v }))}
         />
+        <DnsSettingsSection
+          inherit={dnsInherit}
+          groupIds={dnsGroupIds}
+          zoneId={dnsZoneId}
+          additionalZoneIds={dnsAdditionalZoneIds}
+          onInheritChange={setDnsInherit}
+          onGroupIdsChange={setDnsGroupIds}
+          onZoneIdChange={setDnsZoneId}
+          onAdditionalZoneIdsChange={setDnsAdditionalZoneIds}
+          parentBlockId={block.parent_block_id}
+        />
         {error && <p className="text-xs text-destructive">{error}</p>}
         <div className="flex justify-end gap-2 pt-2">
           <button onClick={() => onClose()} className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted">
@@ -1714,6 +2408,14 @@ function EditBlockModal({
             className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
             {mutation.isPending ? "Saving…" : "Save"}
+          </button>
+        </div>
+        <div className="mt-2 border-t pt-3">
+          <button
+            onClick={() => setDeleteStep(1)}
+            className="text-xs text-destructive hover:underline"
+          >
+            Delete this block…
           </button>
         </div>
       </div>
@@ -1730,8 +2432,11 @@ function BlockTreeRow({
   onSelectBlock,
   onSelectSubnet,
   onDeleteSubnet,
+  onDeleteBlock,
+  onEditBlock,
   onCreateSubnet,
   onCreateChildBlock,
+  onAllocateIp,
   depth,
 }: {
   node: BlockNode;
@@ -1740,21 +2445,44 @@ function BlockTreeRow({
   onSelectBlock: (b: IPBlock) => void;
   onSelectSubnet: (s: Subnet) => void;
   onDeleteSubnet: (s: Subnet) => void;
+  onDeleteBlock?: (b: IPBlock) => void;
+  onEditBlock?: (b: IPBlock) => void;
   onCreateSubnet: (blockId: string) => void;
   onCreateChildBlock: (parentBlockId: string) => void;
+  onAllocateIp?: (s: Subnet) => void;
   depth: number;
 }) {
   const [expanded, setExpanded] = useState(true);
   const hasContent = node.children.length > 0 || node.subnets.length > 0;
   const isSelected = selectedBlockId === node.block.id;
+  const { attributes: dragAttrs, listeners: dragListeners, setNodeRef: setDragRef, isDragging } = useDraggable({
+    id: `block:${node.block.id}`,
+    data: { kind: "block", block: node.block },
+  });
+  const { setNodeRef: setDropRef, isOver } = useDroppable({
+    id: `block-drop:${node.block.id}`,
+    data: { kind: "block", block: node.block },
+  });
+
+  const setRefs = (el: HTMLDivElement | null) => {
+    setDragRef(el);
+    setDropRef(el);
+  };
 
   return (
     <div>
       {/* Block header row */}
+      <ContextMenu>
+        <ContextMenuTrigger asChild>
       <div
+        ref={setRefs}
+        {...dragAttrs}
+        {...dragListeners}
         className={cn(
           "group flex items-center gap-1 rounded-md px-2 py-1 text-xs hover:bg-muted/30 cursor-pointer",
-          isSelected && "bg-primary/10"
+          isSelected && "bg-primary/10",
+          isOver && "ring-1 ring-primary/60 bg-primary/5",
+          isDragging && "opacity-40",
         )}
       >
         {/* [+] / [-] toggle box */}
@@ -1803,6 +2531,27 @@ function BlockTreeRow({
           <Plus className="h-3 w-3" />
         </button>
       </div>
+        </ContextMenuTrigger>
+        <ContextMenuContent>
+          <ContextMenuLabel>{node.block.network}</ContextMenuLabel>
+          <ContextMenuSeparator />
+          <ContextMenuItem onSelect={() => onCreateChildBlock(node.block.id)}>
+            New child block…
+          </ContextMenuItem>
+          <ContextMenuItem onSelect={() => onCreateSubnet(node.block.id)}>
+            New subnet…
+          </ContextMenuItem>
+          <ContextMenuSeparator />
+          {onEditBlock && (
+            <ContextMenuItem onSelect={() => onEditBlock(node.block)}>Edit…</ContextMenuItem>
+          )}
+          {onDeleteBlock && (
+            <ContextMenuItem destructive onSelect={() => onDeleteBlock(node.block)}>
+              Delete…
+            </ContextMenuItem>
+          )}
+        </ContextMenuContent>
+      </ContextMenu>
 
       {/* Children with vertical tree line */}
       {expanded && hasContent && (
@@ -1816,8 +2565,11 @@ function BlockTreeRow({
               onSelectBlock={onSelectBlock}
               onSelectSubnet={onSelectSubnet}
               onDeleteSubnet={onDeleteSubnet}
+              onDeleteBlock={onDeleteBlock}
+              onEditBlock={onEditBlock}
               onCreateSubnet={onCreateSubnet}
               onCreateChildBlock={onCreateChildBlock}
+              onAllocateIp={onAllocateIp}
               depth={depth + 1}
             />
           ))}
@@ -1829,6 +2581,7 @@ function BlockTreeRow({
               onSelect={() => onSelectSubnet(subnet)}
               onDelete={() => onDeleteSubnet(subnet)}
               onEdited={(updated) => onSelectSubnet(updated)}
+              onAllocateIp={onAllocateIp}
             />
           ))}
           {node.children.length === 0 && node.subnets.length === 0 && (
@@ -1863,6 +2616,7 @@ function BlockDetailView({
 }) {
   const [block, setBlock] = useState(initialBlock);
   const [showEdit, setShowEdit] = useState(false);
+  const [showCreateSubnet, setShowCreateSubnet] = useState(false);
 
   // Sync if parent passes a new block object (e.g. after deep-link navigation)
   useEffect(() => { setBlock(initialBlock); }, [initialBlock.id]);
@@ -1873,6 +2627,8 @@ function BlockDetailView({
   });
 
   const directSubnets = allSubnets.filter((s) => s.block_id === block.id);
+  const directChildBlocks = allBlocks.filter((b) => b.parent_block_id === block.id);
+  const [freeRangePreset, setFreeRangePreset] = useState<FreeCidrRange | null>(null);
 
   const crumbs: BreadcrumbItem[] = [
     { label: spaceName, variant: "space", onClick: onSelectSpace },
@@ -1906,6 +2662,28 @@ function BlockDetailView({
               <p className="mt-0.5 text-xs text-muted-foreground">{block.description}</p>
             )}
           </div>
+          <button
+            onClick={() => setShowCreateSubnet(true)}
+            className="flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground hover:bg-primary/90"
+          >
+            <Plus className="h-3.5 w-3.5" />
+            New Subnet
+          </button>
+        </div>
+        {/* Free-space band */}
+        <div className="mt-3">
+          <p className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+            Allocation map
+          </p>
+          <FreeSpaceBand
+            block={block}
+            directSubnets={directSubnets}
+            childBlocks={directChildBlocks}
+            onSelectFree={(range) => {
+              setFreeRangePreset(range);
+              setShowCreateSubnet(true);
+            }}
+          />
         </div>
         {/* Custom field values */}
         {Object.keys(block.custom_fields ?? {}).length > 0 && (
@@ -1925,6 +2703,18 @@ function BlockDetailView({
           onClose={(updated) => {
             if (updated) setBlock(updated);
             setShowEdit(false);
+          }}
+          onDeleted={onSelectSpace}
+        />
+      )}
+      {showCreateSubnet && (
+        <CreateSubnetModal
+          spaceId={block.space_id}
+          defaultBlockId={block.id}
+          defaultNetwork={freeRangePreset?.network}
+          onClose={() => {
+            setShowCreateSubnet(false);
+            setFreeRangePreset(null);
           }}
         />
       )}
@@ -2247,8 +3037,12 @@ function SpaceSection({
   const [showCreateSubnet, setShowCreateSubnet] = useState<string | true | false>(false); // string = default block_id
   const [showCreateBlock, setShowCreateBlock] = useState<string | true | false>(false); // string = parent block_id
   const [showEditSpace, setShowEditSpace] = useState(false);
+  const [editBlock, setEditBlock] = useState<IPBlock | null>(null);
   const [subnetToDelete, setSubnetToDelete] = useState<Subnet | null>(null);
+  const [blockToDelete, setBlockToDelete] = useState<IPBlock | null>(null);
+  const [dndError, setDndError] = useState<string | null>(null);
   const qc = useQueryClient();
+  const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 6 } }));
 
   const { data: subnets, isLoading } = useQuery({
     queryKey: ["subnets", space.id],
@@ -2269,6 +3063,96 @@ function SpaceSection({
       setSubnetToDelete(null);
     },
   });
+
+  const deleteBlockMut = useMutation({
+    mutationFn: (id: string) => ipamApi.deleteBlock(id),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["blocks", space.id] });
+      qc.invalidateQueries({ queryKey: ["subnets", space.id] });
+      setBlockToDelete(null);
+    },
+    onError: (err: unknown) => {
+      const msg = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
+      setDndError(typeof msg === "string" ? msg : "Failed to delete block");
+    },
+  });
+
+  const moveSubnet = useMutation({
+    mutationFn: ({ id, block_id }: { id: string; block_id: string }) =>
+      ipamApi.updateSubnet(id, { block_id } as Partial<Subnet>),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["subnets", space.id] });
+      qc.invalidateQueries({ queryKey: ["blocks", space.id] });
+    },
+    onError: (err: unknown) => {
+      const msg = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
+      setDndError(typeof msg === "string" ? msg : "Move failed");
+    },
+  });
+
+  const moveBlock = useMutation({
+    mutationFn: ({ id, parent_block_id }: { id: string; parent_block_id: string | null }) =>
+      ipamApi.updateBlock(id, { parent_block_id }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["blocks", space.id] });
+    },
+    onError: (err: unknown) => {
+      const msg = (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail;
+      setDndError(typeof msg === "string" ? msg : "Move failed");
+    },
+  });
+
+  function handleDragEnd(event: DragEndEvent) {
+    const { active, over } = event;
+    if (!over) return;
+    const srcData = active.data.current as { kind: "block" | "subnet"; block?: IPBlock; subnet?: Subnet } | undefined;
+    const dstData = over.data.current as { kind: "block"; block: IPBlock } | undefined;
+    if (!srcData || !dstData) return;
+    const targetBlock = dstData.block;
+
+    if (srcData.kind === "subnet" && srcData.subnet) {
+      const sn = srcData.subnet;
+      if (sn.block_id === targetBlock.id) return;
+      if (sn.space_id !== targetBlock.space_id) {
+        setDndError("Cannot move subnet across IP spaces");
+        return;
+      }
+      if (!cidrContains(targetBlock.network, sn.network)) {
+        setDndError(`${sn.network} does not fit inside ${targetBlock.network}`);
+        return;
+      }
+      moveSubnet.mutate({ id: sn.id, block_id: targetBlock.id });
+      return;
+    }
+
+    if (srcData.kind === "block" && srcData.block) {
+      const b = srcData.block;
+      if (b.id === targetBlock.id) return;
+      if (b.parent_block_id === targetBlock.id) return;
+      if (b.space_id !== targetBlock.space_id) {
+        setDndError("Cannot move block across IP spaces");
+        return;
+      }
+      if (!cidrContains(targetBlock.network, b.network)) {
+        setDndError(`${b.network} does not fit inside ${targetBlock.network}`);
+        return;
+      }
+      // Prevent making a block a descendant of itself (client-side; backend also checks)
+      if (blocks) {
+        let cursor: IPBlock | undefined = targetBlock;
+        while (cursor) {
+          if (cursor.id === b.id) {
+            setDndError("Cannot move a block into its own descendant");
+            return;
+          }
+          cursor = cursor.parent_block_id
+            ? blocks.find((bl) => bl.id === cursor!.parent_block_id)
+            : undefined;
+        }
+      }
+      moveBlock.mutate({ id: b.id, parent_block_id: targetBlock.id });
+    }
+  }
 
   // (block_id is now required; all subnets appear under their block)
 
@@ -2306,29 +3190,65 @@ function SpaceSection({
 
       {/* Tree with vertical connecting line */}
       {expanded && (
-        <div className="ml-[9px] pl-2 border-l border-border/40 space-y-0.5">
-          {isLoading && <p className="py-1 pl-2 text-xs text-muted-foreground">Loading…</p>}
+        <DndContext sensors={sensors} onDragEnd={handleDragEnd}>
+          <div className="ml-[9px] pl-2 border-l border-border/40 space-y-0.5">
+            {isLoading && <p className="py-1 pl-2 text-xs text-muted-foreground">Loading…</p>}
 
-          {/* Block tree (recursive) */}
-          {blocks && subnets && buildBlockTree(blocks, subnets, null).map((node) => (
-            <BlockTreeRow
-              key={node.block.id}
-              node={node}
-              selectedSubnetId={selectedSubnetId}
-              selectedBlockId={selectedBlockId}
-              onSelectBlock={onSelectBlock}
-              onSelectSubnet={onSelectSubnet}
-              onDeleteSubnet={(s) => setSubnetToDelete(s)}
-              onCreateSubnet={(blockId) => setShowCreateSubnet(blockId)}
-              onCreateChildBlock={(parentId) => setShowCreateBlock(parentId)}
-              depth={0}
-            />
-          ))}
+            {/* Block tree (recursive) */}
+            {blocks && subnets && buildBlockTree(blocks, subnets, null).map((node) => (
+              <BlockTreeRow
+                key={node.block.id}
+                node={node}
+                selectedSubnetId={selectedSubnetId}
+                selectedBlockId={selectedBlockId}
+                onSelectBlock={onSelectBlock}
+                onSelectSubnet={onSelectSubnet}
+                onDeleteSubnet={(s) => setSubnetToDelete(s)}
+                onDeleteBlock={(b) => setBlockToDelete(b)}
+                onEditBlock={(b) => setEditBlock(b)}
+                onCreateSubnet={(blockId) => setShowCreateSubnet(blockId)}
+                onCreateChildBlock={(parentId) => setShowCreateBlock(parentId)}
+                onAllocateIp={(s) => onSelectSubnet(s)}
+                depth={0}
+              />
+            ))}
 
-          {!isLoading && !subnets?.length && !blocks?.length && (
-            <p className="py-1 pl-2 text-xs text-muted-foreground">No blocks yet.</p>
-          )}
+            {!isLoading && !subnets?.length && !blocks?.length && (
+              <p className="py-1 pl-2 text-xs text-muted-foreground">No blocks yet.</p>
+            )}
+          </div>
+        </DndContext>
+      )}
+
+      {dndError && (
+        <div className="mx-2 mt-2 flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/10 px-2 py-1.5 text-xs text-destructive">
+          <span className="flex-1">{dndError}</span>
+          <button onClick={() => setDndError(null)} className="text-destructive hover:opacity-70">
+            <X className="h-3 w-3" />
+          </button>
         </div>
+      )}
+
+      {editBlock && (
+        <EditBlockModal
+          block={editBlock}
+          onClose={(updated) => {
+            setEditBlock(null);
+            if (updated) qc.invalidateQueries({ queryKey: ["blocks", space.id] });
+          }}
+          onDeleted={() => setEditBlock(null)}
+        />
+      )}
+
+      {blockToDelete && (
+        <ConfirmDestroyModal
+          title="Delete Block"
+          description={`Delete block ${blockToDelete.network}${blockToDelete.name ? ` (${blockToDelete.name})` : ""}? All nested blocks and subnets inside it will be permanently deleted.`}
+          checkLabel={`I understand everything inside ${blockToDelete.network} will be permanently deleted.`}
+          isPending={deleteBlockMut.isPending}
+          onClose={() => setBlockToDelete(null)}
+          onConfirm={() => deleteBlockMut.mutate(blockToDelete.id)}
+        />
       )}
 
       {showCreateSubnet && (
@@ -2355,9 +3275,10 @@ function SpaceSection({
       )}
 
       {subnetToDelete && (
-        <ConfirmDeleteModal
+        <ConfirmDestroyModal
           title="Delete Subnet"
-          message={`Delete subnet ${subnetToDelete.network}${subnetToDelete.name ? ` (${subnetToDelete.name})` : ""}? All IP address records within it will be permanently deleted.`}
+          description={`Delete subnet ${subnetToDelete.network}${subnetToDelete.name ? ` (${subnetToDelete.name})` : ""}? All IP address records within it will be permanently deleted.`}
+          checkLabel={`I understand all IP addresses in ${subnetToDelete.network} will be permanently deleted.`}
           isPending={deleteSubnet.isPending}
           onClose={() => setSubnetToDelete(null)}
           onConfirm={() => {
@@ -2394,7 +3315,9 @@ export function IPAMPage() {
   const [showImport, setShowImport] = useState(false);
   const qc = useQueryClient();
   const location = useLocation();
+  const [searchParams, setSearchParams] = useSearchParams();
   const deepLinkHandled = useRef(false);
+  const urlRestored = useRef(false);
 
   const { data: spaces, isLoading } = useQuery({
     queryKey: ["spaces"],
@@ -2425,15 +3348,38 @@ export function IPAMPage() {
     if (!state) return;
     if (state.selectSpace && spaces) {
       const sp = spaces.find((s) => s.id === state.selectSpace);
-      if (sp) { selectSpace(sp); deepLinkHandled.current = true; }
+      if (sp) { selectSpace(sp); deepLinkHandled.current = true; urlRestored.current = true; }
     } else if (state.selectBlock && allBlocks) {
       const bl = allBlocks.find((b) => b.id === state.selectBlock);
-      if (bl) { selectBlock(bl); deepLinkHandled.current = true; }
+      if (bl) { selectBlock(bl); deepLinkHandled.current = true; urlRestored.current = true; }
     } else if (state.selectSubnet && allSubnets) {
       const sn = allSubnets.find((s) => s.id === state.selectSubnet);
-      if (sn) { selectSubnet(sn); deepLinkHandled.current = true; }
+      if (sn) { selectSubnet(sn); deepLinkHandled.current = true; urlRestored.current = true; }
     }
   }, [location.state, spaces, allBlocks, allSubnets]);
+
+  // URL-state restore: reopen last-visited space/block/subnet on back-navigation
+  useEffect(() => {
+    if (urlRestored.current) return;
+    if (!spaces || !allBlocks || !allSubnets) return;
+    urlRestored.current = true;
+    const subnetId = searchParams.get("subnet");
+    const blockId  = searchParams.get("block");
+    const spaceId  = searchParams.get("space");
+    if (subnetId) {
+      const sn = allSubnets.find((s: Subnet) => s.id === subnetId);
+      if (sn) { setSelectedSubnet(sn); setSelectedBlock(null); setSelectedSpace(null); return; }
+    }
+    if (blockId) {
+      const bl = allBlocks.find((b) => b.id === blockId);
+      if (bl) { setSelectedBlock(bl); setSelectedSubnet(null); setSelectedSpace(null); return; }
+    }
+    if (spaceId) {
+      const sp = spaces.find((s) => s.id === spaceId);
+      if (sp) { setSelectedSpace(sp); setSelectedSubnet(null); setSelectedBlock(null); }
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [spaces, allBlocks, allSubnets]);
 
   // Fetch blocks + subnets for whichever space the selected item belongs to
   const activeSpaceId =
@@ -2455,18 +3401,21 @@ export function IPAMPage() {
     setSelectedSubnet(subnet);
     setSelectedBlock(null);
     if (subnet) setSelectedSpace(null);
+    setSearchParams(subnet ? { subnet: subnet.id } : {}, { replace: true });
   }
 
   function selectSpace(space: IPSpace) {
     setSelectedSpace(space);
     setSelectedSubnet(null);
     setSelectedBlock(null);
+    setSearchParams({ space: space.id }, { replace: true });
   }
 
   function selectBlock(block: IPBlock) {
     setSelectedBlock(block);
     setSelectedSubnet(null);
     setSelectedSpace(null);
+    setSearchParams({ block: block.id }, { replace: true });
   }
 
   const selectedSubnetBlock = detailBlocks?.find((b) => b.id === selectedSubnet?.block_id);

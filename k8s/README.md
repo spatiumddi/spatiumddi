@@ -88,6 +88,53 @@ The Ingress in `k8s/base/frontend.yaml` uses `ingressClassName: nginx`. For TLS:
 2. Create a `ClusterIssuer` for Let's Encrypt
 3. Uncomment the `tls` and `cert-manager.io/cluster-issuer` annotations in `frontend.yaml`
 
+## DNS server deployment
+
+SpatiumDDI ships managed DNS containers (BIND9, PowerDNS) that auto-register
+with the control plane. One `StatefulSet` per `DNSServer` row — see
+[`docs/deployment/DNS_AGENT.md`](../docs/deployment/DNS_AGENT.md).
+
+### Secret
+
+```bash
+# Shared bootstrap PSK (must match DNS_AGENT_KEY on the control plane)
+kubectl create secret generic spatium-dns-agent-key \
+  --from-literal=DNS_AGENT_KEY=$(openssl rand -hex 32) -n spatiumddi
+```
+
+### Option A: static manifests
+
+```bash
+kubectl apply -f k8s/dns/bind9-statefulset.yaml
+kubectl apply -f k8s/dns/service-dns.yaml
+```
+
+Duplicate the StatefulSet/Service pair per server (rename `ns1` → `ns2`, etc.).
+
+### Option B: Helm chart (recommended)
+
+```bash
+helm install spatium-dns charts/spatium-dns -n spatiumddi \
+  --set controlPlaneUrl=https://api.spatiumddi.example \
+  --set agentKey.existingSecret=spatium-dns-agent-key
+```
+
+Declare each server in `values.yaml` under `.servers[]`. The chart renders a
+StatefulSet + LoadBalancer Service per entry.
+
+### How servers register
+
+On first boot each agent:
+
+1. Reads `CONTROL_PLANE_URL` and `DNS_AGENT_KEY` (from the secret).
+2. `POST /api/v1/dns/agents/register` with a generated `agent_id` + SHA-256
+   fingerprint.
+3. Receives a per-server JWT (24h, rotated on heartbeat).
+4. Long-polls `GET /api/v1/dns/agents/config` and applies the bundle.
+
+If `dns_require_agent_approval=true` the server appears in the DNS Server
+Group UI with `pending_approval=true` until an admin approves it.
+
 ## Image Tags
 
 All manifests default to `:latest`. Pin to a specific version tag (e.g., `2026.04.13-1`) for production:

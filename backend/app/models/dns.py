@@ -80,9 +80,43 @@ class DNSServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     last_health_check_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     notes: Mapped[str] = mapped_column(Text, nullable=False, default="")
 
+    # Agent bookkeeping (see docs/deployment/DNS_AGENT.md §2, §6)
+    agent_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True, unique=True)
+    agent_jwt_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    agent_fingerprint: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_config_etag: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    pending_approval: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    is_primary: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
     group: Mapped["DNSServerGroup"] = relationship("DNSServerGroup", back_populates="servers")
 
     __table_args__ = (UniqueConstraint("group_id", "name", name="uq_dns_server_group_name"),)
+
+
+class DNSRecordOp(UUIDPrimaryKeyMixin, Base):
+    """Per-record mutation queued for an agent to apply via RFC 2136 / pdns API."""
+
+    __tablename__ = "dns_record_op"
+
+    server_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("dns_server.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    zone_name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    op: Mapped[str] = mapped_column(String(20), nullable=False)  # create | update | delete
+    record: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    target_serial: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    state: Mapped[str] = mapped_column(String(20), nullable=False, default="pending", index=True)
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class DNSServerOptions(UUIDPrimaryKeyMixin, TimestampMixin, Base):

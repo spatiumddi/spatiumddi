@@ -1,10 +1,10 @@
-import { useState, useEffect } from "react";
-import { useLocation } from "react-router-dom";
+import { useState, useEffect, useRef } from "react";
+import { useLocation, useSearchParams } from "react-router-dom";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   Globe, Plus, Trash2, Pencil, ChevronDown, ChevronRight,
   Settings2, Shield, Eye, FileText, Layers, RefreshCw, X, Cpu,
-  FolderOpen, Folder, Upload, Download, Ban,
+  FolderOpen, Folder, Upload, Download, Ban, Lock, Info,
 } from "lucide-react";
 import {
   dnsApi,
@@ -290,23 +290,62 @@ function ImportZoneModal({
   );
 }
 
-// ── Zone TLD tree helper ──────────────────────────────────────────────────────
+// ── DNS zone tree builder (recursive: com → test.com → sub.test.com) ─────────
 
-interface TldGroup { tld: string; zones: DNSZone[] }
-
-function buildTldTree(zones: DNSZone[]): TldGroup[] {
-  const map = new Map<string, DNSZone[]>();
-  for (const z of zones) {
-    const name = z.name.replace(/\.$/, "");
-    const parts = name.split(".");
-    const tld = parts[parts.length - 1];
-    if (!map.has(tld)) map.set(tld, []);
-    map.get(tld)!.push(z);
-  }
-  return Array.from(map.entries())
-    .sort(([a], [b]) => a.localeCompare(b))
-    .map(([tld, zs]) => ({ tld, zones: zs.sort((a, b) => a.name.localeCompare(b.name)) }));
+interface DnsTreeNode {
+  domain: string;       // full domain name at this level, e.g. "test.com"
+  zone?: DNSZone;       // set if this node corresponds to a registered zone
+  children: DnsTreeNode[];
 }
+
+function buildDnsTree(zones: DNSZone[]): DnsTreeNode[] {
+  const nodeMap = new Map<string, DnsTreeNode>();
+
+  function getOrCreate(domain: string): DnsTreeNode {
+    if (!nodeMap.has(domain)) nodeMap.set(domain, { domain, children: [] });
+    return nodeMap.get(domain)!;
+  }
+
+  const tldSet = new Set<string>();
+
+  for (const z of zones) {
+    const name = z.name.replace(/\.$/, ""); // strip trailing dot
+    const parts = name.split(".");          // ["sub", "test", "com"]
+
+    tldSet.add(parts[parts.length - 1]);
+
+    // Build ancestor chain from TLD down to zone
+    for (let level = 0; level < parts.length; level++) {
+      const startIdx = parts.length - 1 - level;
+      const domain = parts.slice(startIdx).join(".");
+      getOrCreate(domain);
+
+      if (level > 0) {
+        const parentDomain = parts.slice(startIdx + 1).join(".");
+        const parent = getOrCreate(parentDomain);
+        const child = getOrCreate(domain);
+        if (!parent.children.find((c) => c.domain === domain)) {
+          parent.children.push(child);
+        }
+      }
+    }
+
+    getOrCreate(name).zone = z;
+  }
+
+  function sortNode(n: DnsTreeNode) {
+    n.children.sort((a, b) => a.domain.localeCompare(b.domain));
+    n.children.forEach(sortNode);
+  }
+
+  const roots = [...tldSet]
+    .sort()
+    .map((tld) => nodeMap.get(tld)!)
+    .filter(Boolean);
+  roots.forEach(sortNode);
+  return roots;
+}
+
 
 // ── Group Modal (create / edit) ───────────────────────────────────────────────
 
@@ -724,19 +763,35 @@ function ZoneDetailView({ group, zone, onDeleted }: { group: DNSServerGroup; zon
                   <td className="py-1.5 text-xs text-muted-foreground">{r.ttl ?? "—"}</td>
                   <td className="py-1.5 text-xs text-muted-foreground">{r.priority ?? "—"}</td>
                   <td className="py-1.5 pr-3">
-                    <div className="flex items-center justify-end gap-1 opacity-0 group-hover:opacity-100">
-                      {!r.auto_generated && (
+                    {r.auto_generated ? (
+                      <div className="flex items-center justify-end gap-1">
+                        <span
+                          title="This record was created automatically by IPAM. Edit the IP address in IPAM to change it."
+                          className="flex items-center gap-1 rounded border border-amber-300/60 bg-amber-50 px-1.5 py-0.5 text-xs text-amber-700 dark:border-amber-700/40 dark:bg-amber-900/20 dark:text-amber-400"
+                        >
+                          <Lock className="h-2.5 w-2.5" />
+                          IPAM
+                        </span>
+                        <span
+                          title="Managed by IPAM — changes made here will be overwritten. To edit, update the IP address record in IPAM."
+                          className="flex h-5 w-5 cursor-help items-center justify-center rounded text-muted-foreground/60 hover:text-muted-foreground"
+                        >
+                          <Info className="h-3 w-3" />
+                        </span>
+                      </div>
+                    ) : (
+                      <div className="flex items-center justify-end gap-1 opacity-0 group-hover:opacity-100">
                         <button className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-foreground" onClick={() => setEditRecord(r)}>
                           <Pencil className="h-3 w-3" />
                         </button>
-                      )}
-                      <button
-                        className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-destructive"
-                        onClick={() => { if (confirm(`Delete record ${r.name} ${r.record_type}?`)) deleteRecord.mutate(r); }}
-                      >
-                        <Trash2 className="h-3 w-3" />
-                      </button>
-                    </div>
+                        <button
+                          className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-destructive"
+                          onClick={() => { if (confirm(`Delete record ${r.name} ${r.record_type}?`)) deleteRecord.mutate(r); }}
+                        >
+                          <Trash2 className="h-3 w-3" />
+                        </button>
+                      </div>
+                    )}
                   </td>
                 </tr>
               ))}
@@ -1178,7 +1233,7 @@ function ZonesTab({ group, onSelectZone }: { group: DNSServerGroup; onSelectZone
     },
   });
 
-  const tree = buildTldTree(zones);
+  const tree = buildDnsTree(zones);
 
   const typeBadge: Record<string, string> = {
     primary:   "bg-blue-500/15 text-blue-600",
@@ -1186,6 +1241,60 @@ function ZonesTab({ group, onSelectZone }: { group: DNSServerGroup; onSelectZone
     stub:      "bg-amber-500/15 text-amber-600",
     forward:   "bg-muted text-muted-foreground",
   };
+
+  function renderZoneNode(node: DnsTreeNode, depth: number): React.ReactNode {
+    const indent = depth * 16;
+    return (
+      <div key={node.domain}>
+        {/* If this node has a zone, render it as a clickable card */}
+        {node.zone ? (
+          <div
+            className="flex items-center justify-between rounded-md border bg-card px-3 py-2 group hover:bg-accent/30 cursor-pointer mb-1"
+            style={{ marginLeft: indent }}
+            onClick={() => onSelectZone(node.zone!)}
+          >
+            <div className="flex items-center gap-2 min-w-0">
+              <FileText className="h-3.5 w-3.5 text-muted-foreground flex-shrink-0" />
+              <span className="font-mono text-sm truncate">{node.zone.name}</span>
+              <span className={`inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium flex-shrink-0 ${typeBadge[node.zone.zone_type] ?? "bg-muted text-muted-foreground"}`}>
+                {node.zone.zone_type}
+              </span>
+              {node.zone.dnssec_enabled && (
+                <Shield className="h-3 w-3 text-emerald-500 flex-shrink-0" />
+              )}
+            </div>
+            <div
+              className="flex items-center gap-1 opacity-0 group-hover:opacity-100 flex-shrink-0"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <button
+                className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-foreground"
+                onClick={() => setEditZone(node.zone!)}
+              >
+                <Pencil className="h-3 w-3" />
+              </button>
+              <button
+                className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-destructive"
+                onClick={() => setConfirmDeleteZone(node.zone!)}
+              >
+                <Trash2 className="h-3 w-3" />
+              </button>
+            </div>
+          </div>
+        ) : (
+          /* Folder-only node (intermediate domain level with no zone registered) */
+          <div className="flex items-center gap-1.5 mb-1" style={{ marginLeft: indent }}>
+            <Folder className="h-3.5 w-3.5 text-muted-foreground flex-shrink-0" />
+            <span className="text-xs font-semibold text-muted-foreground">.{node.domain}</span>
+          </div>
+        )}
+        {/* Recurse into children */}
+        {node.children.length > 0 && (
+          <div>{node.children.map((child) => renderZoneNode(child, depth + 1))}</div>
+        )}
+      </div>
+    );
+  }
 
   return (
     <div>
@@ -1222,53 +1331,7 @@ function ZonesTab({ group, onSelectZone }: { group: DNSServerGroup; onSelectZone
         </p>
       )}
 
-      {tree.map(({ tld, zones: tzones }) => (
-        <div key={tld} className="mb-3">
-          {/* TLD header */}
-          <div className="flex items-center gap-1.5 mb-1">
-            <Folder className="h-3.5 w-3.5 text-muted-foreground flex-shrink-0" />
-            <span className="text-xs font-semibold text-muted-foreground">.{tld}</span>
-          </div>
-          {/* Zone rows */}
-          <div className="ml-4 space-y-1">
-            {tzones.map((z) => (
-              <div
-                key={z.id}
-                className="flex items-center justify-between rounded-md border bg-card px-3 py-2 group hover:bg-accent/30 cursor-pointer"
-                onClick={() => onSelectZone(z)}
-              >
-                <div className="flex items-center gap-2 min-w-0">
-                  <FileText className="h-3.5 w-3.5 text-muted-foreground flex-shrink-0" />
-                  <span className="font-mono text-sm truncate">{z.name}</span>
-                  <span className={`inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium flex-shrink-0 ${typeBadge[z.zone_type] ?? "bg-muted text-muted-foreground"}`}>
-                    {z.zone_type}
-                  </span>
-                  {z.dnssec_enabled && (
-                    <Shield className="h-3 w-3 text-emerald-500 flex-shrink-0" />
-                  )}
-                </div>
-                <div
-                  className="flex items-center gap-1 opacity-0 group-hover:opacity-100 flex-shrink-0"
-                  onClick={(e) => e.stopPropagation()}
-                >
-                  <button
-                    className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-foreground"
-                    onClick={() => setEditZone(z)}
-                  >
-                    <Pencil className="h-3 w-3" />
-                  </button>
-                  <button
-                    className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-destructive"
-                    onClick={() => setConfirmDeleteZone(z)}
-                  >
-                    <Trash2 className="h-3 w-3" />
-                  </button>
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
-      ))}
+      {tree.map((root) => renderZoneNode(root, 0))}
 
       {showAdd && (
         <ZoneModal groupId={group.id} views={views} onClose={() => setShowAdd(false)} />
@@ -1794,7 +1857,13 @@ function BlocklistDetail({ list, onBack }: { list: DNSBlockList; onBack: () => v
 type GroupTab = "zones" | "servers" | "views" | "acls" | "blocklists" | "options";
 
 function GroupDetailView({ group, onSelectZone }: { group: DNSServerGroup; onSelectZone: (z: DNSZone) => void }) {
-  const [tab, setTab] = useState<GroupTab>("zones");
+  const [searchParams, setSearchParams] = useSearchParams();
+  const tab = (searchParams.get("tab") as GroupTab) || "zones";
+  const setTab = (t: GroupTab) => setSearchParams((prev: URLSearchParams) => {
+    const next = new URLSearchParams(prev);
+    next.set("tab", t);
+    return next;
+  }, { replace: true });
 
   const tabs: { id: GroupTab; label: string; icon: React.ElementType }[] = [
     { id: "zones",   label: "Zones",   icon: FileText },
@@ -1857,63 +1926,106 @@ function ZoneTreeRows({
   selectedZoneId: string | null;
   onSelectZone: (z: DNSZone) => void;
 }) {
-  const [expandedTlds, setExpandedTlds] = useState<Set<string>>(new Set());
+  const [expandedNodes, setExpandedNodes] = useState<Set<string>>(new Set());
 
   const { data: zones = [] } = useQuery({
     queryKey: ["dns-zones", groupId],
     queryFn: () => dnsApi.listZones(groupId),
   });
 
-  const tree = buildTldTree(zones);
+  const tree = buildDnsTree(zones);
 
   if (tree.length === 0) return (
     <p className="px-3 py-1.5 text-xs text-muted-foreground italic">No zones</p>
   );
 
-  function toggleTld(tld: string) {
-    setExpandedTlds((prev) => {
+  function toggleNode(domain: string) {
+    setExpandedNodes((prev: Set<string>) => {
       const next = new Set(prev);
-      next.has(tld) ? next.delete(tld) : next.add(tld);
+      next.has(domain) ? next.delete(domain) : next.add(domain);
       return next;
     });
   }
 
-  return (
-    <div>
-      {tree.map(({ tld, zones: tzones }) => {
-        const expanded = expandedTlds.has(tld);
-        return (
-          <div key={tld}>
-            {/* TLD row */}
+  function renderNode(node: DnsTreeNode, depth: number): React.ReactNode {
+    const paddingLeft = 12 + depth * 14;
+    const hasChildren = node.children.length > 0;
+    const expanded = expandedNodes.has(node.domain);
+
+    return (
+      <div key={node.domain}>
+        {hasChildren ? (
+          /* Node with children — split expand toggle from zone select */
+          <div className="flex items-center" style={{ paddingLeft }}>
             <button
-              className="flex w-full items-center gap-1.5 rounded px-3 py-1 text-xs text-muted-foreground hover:bg-accent hover:text-foreground"
-              onClick={() => toggleTld(tld)}
+              className="flex items-center justify-center w-5 h-6 flex-shrink-0 text-muted-foreground hover:text-foreground"
+              onClick={() => toggleNode(node.domain)}
+              title={expanded ? "Collapse" : "Expand"}
             >
               {expanded
-                ? <FolderOpen className="h-3 w-3 flex-shrink-0" />
-                : <Folder className="h-3 w-3 flex-shrink-0" />}
-              <span className="font-medium">{tld}</span>
-              <span className="ml-auto text-muted-foreground/50">{tzones.length}</span>
+                ? <FolderOpen className="h-3 w-3" />
+                : <Folder className="h-3 w-3" />}
             </button>
-            {/* Zone rows */}
-            {expanded && tzones.map((z) => (
+            {node.zone ? (
+              /* This node is also a registered zone — make label clickable */
               <button
-                key={z.id}
-                className={`flex w-full items-center gap-1.5 rounded py-1 pl-7 pr-2 text-xs ${
-                  selectedZoneId === z.id
+                className={`flex flex-1 items-center gap-1.5 rounded py-1 pr-2 text-xs ${
+                  selectedZoneId === node.zone.id
                     ? "bg-primary text-primary-foreground"
                     : "text-muted-foreground hover:bg-accent hover:text-foreground"
                 }`}
-                onClick={() => onSelectZone(z)}
+                onClick={() => onSelectZone(node.zone!)}
               >
                 <FileText className="h-3 w-3 flex-shrink-0" />
-                <span className="font-mono truncate">{z.name}</span>
-                {z.dnssec_enabled && <Shield className="h-2.5 w-2.5 ml-auto flex-shrink-0 text-emerald-500" />}
+                <span className="font-mono truncate">{node.zone.name}</span>
+                {node.zone.dnssec_enabled && <Shield className="h-2.5 w-2.5 ml-auto flex-shrink-0 text-emerald-500" />}
               </button>
-            ))}
+            ) : (
+              /* Intermediate folder with no zone — clicking label also toggles */
+              <button
+                className="flex flex-1 items-center gap-1 rounded py-1 pr-2 text-xs font-medium font-mono text-muted-foreground hover:bg-accent hover:text-foreground"
+                onClick={() => toggleNode(node.domain)}
+              >
+                {node.domain}
+              </button>
+            )}
           </div>
-        );
-      })}
+        ) : node.zone ? (
+          /* Leaf zone node */
+          <button
+            className={`flex w-full items-center gap-1.5 rounded py-1 pr-2 text-xs ${
+              selectedZoneId === node.zone.id
+                ? "bg-primary text-primary-foreground"
+                : "text-muted-foreground hover:bg-accent hover:text-foreground"
+            }`}
+            style={{ paddingLeft }}
+            onClick={() => onSelectZone(node.zone!)}
+          >
+            <FileText className="h-3 w-3 flex-shrink-0" />
+            <span className="font-mono truncate">{node.zone.name}</span>
+            {node.zone.dnssec_enabled && <Shield className="h-2.5 w-2.5 ml-auto flex-shrink-0 text-emerald-500" />}
+          </button>
+        ) : (
+          /* Intermediate domain with no zone */
+          <div
+            className="flex w-full items-center gap-1.5 rounded px-3 py-1 text-xs text-muted-foreground"
+            style={{ paddingLeft }}
+          >
+            <Folder className="h-3 w-3 flex-shrink-0" />
+            <span className="font-medium font-mono">{node.domain}</span>
+          </div>
+        )}
+        {/* Children */}
+        {hasChildren && expanded && (
+          <div>{node.children.map((child) => renderNode(child, depth + 1))}</div>
+        )}
+      </div>
+    );
+  }
+
+  return (
+    <div>
+      {tree.map((root) => renderNode(root, 0))}
     </div>
   );
 }
@@ -1927,11 +2039,35 @@ type Selection =
 export function DNSPage() {
   const qc = useQueryClient();
   const location = useLocation();
-  const [selection, setSelection] = useState<Selection | null>(null);
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [selection, setSelectionState] = useState<Selection | null>(null);
   const [showCreateGroup, setShowCreateGroup] = useState(false);
   const [editGroup, setEditGroup] = useState<DNSServerGroup | null>(null);
   const [confirmDeleteGroup, setConfirmDeleteGroup] = useState<DNSServerGroup | null>(null);
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
+  const urlRestored = useRef(false);
+
+  // Update selection state + URL search params together. Preserves `tab`
+  // when staying within the same group; clears it when switching groups.
+  function setSelection(sel: Selection | null) {
+    setSelectionState(sel);
+    setSearchParams((prev: URLSearchParams) => {
+      const next = new URLSearchParams(prev);
+      const prevGroupId = next.get("group");
+      if (!sel) {
+        next.delete("group"); next.delete("zone"); next.delete("tab");
+      } else if (sel.type === "group") {
+        next.set("group", sel.group.id);
+        next.delete("zone");
+        if (prevGroupId !== sel.group.id) next.delete("tab");
+      } else {
+        next.set("group", sel.group.id);
+        next.set("zone", sel.zone.id);
+        if (prevGroupId !== sel.group.id) next.delete("tab");
+      }
+      return next;
+    }, { replace: true });
+  }
 
   const { data: groups = [], isLoading } = useQuery({
     queryKey: ["dns-groups"],
@@ -1957,7 +2093,30 @@ export function DNSPage() {
     }
     // Clear state so re-renders don't re-trigger
     window.history.replaceState({}, "");
+    urlRestored.current = true;
   }, [location.state, groups]);
+
+  // URL-state restore: reopen last-visited group/zone on back-navigation
+  useEffect(() => {
+    if (urlRestored.current) return;
+    if (groups.length === 0) return;
+    urlRestored.current = true;
+    const groupId = searchParams.get("group");
+    const zoneId  = searchParams.get("zone");
+    if (!groupId) return;
+    const group = groups.find((g: DNSServerGroup) => g.id === groupId);
+    if (!group) return;
+    setExpandedGroups((prev) => new Set([...prev, group.id]));
+    if (zoneId) {
+      dnsApi.listZones(group.id).then((zones: DNSZone[]) => {
+        const zone = zones.find((z: DNSZone) => z.id === zoneId);
+        setSelectionState(zone ? { type: "zone", group, zone } : { type: "group", group });
+      });
+    } else {
+      setSelectionState({ type: "group", group });
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [groups]);
 
   const deleteGroup = useMutation({
     mutationFn: (id: string) => dnsApi.deleteGroup(id),

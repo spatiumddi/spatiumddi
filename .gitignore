@@ -37,3 +37,4 @@ backend/alembic/versions/*.py
 # OS
 .DS_Store
 Thumbs.db
+.claude/

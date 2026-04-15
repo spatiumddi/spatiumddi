@@ -14,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.api.deps import CurrentUser, DB
 from app.api.v1.ipam.io_router import router as io_router
 from app.models.audit import AuditLog
+from app.models.dns import DNSRecord, DNSZone
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
 
 logger = structlog.get_logger(__name__)
@@ -118,6 +119,148 @@ async def _update_block_utilization(db: AsyncSession, block_id: uuid.UUID) -> No
         await _update_block_utilization(db, block.parent_block_id)
 
 
+async def _resolve_effective_zone(db: AsyncSession, subnet: Subnet) -> uuid.UUID | None:
+    """Return the effective DNS zone UUID for a subnet, walking the block ancestor chain."""
+    if not subnet.dns_inherit_settings and subnet.dns_zone_id:
+        return uuid.UUID(subnet.dns_zone_id)
+    block_id = subnet.block_id
+    while block_id:
+        block = await db.get(IPBlock, block_id)
+        if block is None:
+            break
+        if not block.dns_inherit_settings and block.dns_zone_id:
+            return uuid.UUID(block.dns_zone_id)
+        block_id = block.parent_block_id
+    return None
+
+
+async def _sync_dns_record(
+    db: AsyncSession,
+    ip: IPAddress,
+    subnet: Subnet,
+    zone_id: uuid.UUID | None = None,
+    action: str = "create",  # create | update | delete
+) -> None:
+    """Create, update, or delete the auto-generated A record in DNS for this IP address."""
+    if action == "delete":
+        result = await db.execute(
+            select(DNSRecord).where(
+                DNSRecord.ip_address_id == ip.id,
+                DNSRecord.auto_generated.is_(True),
+            )
+        )
+        for record in result.scalars().all():
+            await db.delete(record)
+        ip.fqdn = None
+        return
+
+    effective_zone_id = zone_id or await _resolve_effective_zone(db, subnet)
+    if not effective_zone_id:
+        return
+
+    zone = await db.get(DNSZone, effective_zone_id)
+    if not zone or not ip.hostname:
+        return
+
+    zone_domain = zone.name.rstrip(".")
+    fqdn = f"{ip.hostname}.{zone_domain}"
+    ip.fqdn = fqdn
+
+    # Find existing auto-generated records for this IP
+    result = await db.execute(
+        select(DNSRecord).where(
+            DNSRecord.ip_address_id == ip.id,
+            DNSRecord.auto_generated.is_(True),
+        )
+    )
+    existing = result.scalars().all()
+
+    if not existing:
+        db.add(DNSRecord(
+            zone_id=effective_zone_id,
+            name=ip.hostname,
+            fqdn=fqdn,
+            record_type="A",
+            value=str(ip.address),
+            auto_generated=True,
+            ip_address_id=ip.id,
+            created_by_user_id=ip.created_by_user_id,
+        ))
+    else:
+        for record in existing:
+            if record.zone_id != effective_zone_id:
+                # Zone changed: swap
+                await db.delete(record)
+                db.add(DNSRecord(
+                    zone_id=effective_zone_id,
+                    name=ip.hostname,
+                    fqdn=fqdn,
+                    record_type="A",
+                    value=str(ip.address),
+                    auto_generated=True,
+                    ip_address_id=ip.id,
+                    created_by_user_id=ip.created_by_user_id,
+                ))
+            else:
+                record.name = ip.hostname
+                record.fqdn = fqdn
+                record.value = str(ip.address)
+
+
+def _compute_free_cidrs(
+    block_network: str,
+    child_networks: list[str],
+    max_results: int = 200,
+) -> list[dict[str, Any]]:
+    """Return a sorted list of free CIDR ranges inside ``block_network``.
+
+    Each entry has ``network`` (CIDR), ``first``, ``last`` (string IPs),
+    and ``size`` (usable address count for the free gap, counted as raw
+    addresses — network/broadcast are not excluded because a free gap
+    is not a routable subnet yet).
+
+    The algorithm subtracts each existing child network from the block
+    using ``ipaddress.Network.address_exclude`` repeatedly. This is
+    correct for arbitrary combinations of child sizes and does not
+    require them to be aligned.
+    """
+    block = ipaddress.ip_network(block_network, strict=False)
+
+    # Start with a single working set containing the block itself.
+    working: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = [block]
+
+    # Sort children by prefixlen desc so smaller ones excluded first is fine —
+    # address_exclude handles either ordering. We just iterate.
+    for raw in child_networks:
+        child = ipaddress.ip_network(raw, strict=False)
+        next_working: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+        for net in working:
+            if child == net:
+                # fully consumed
+                continue
+            if child.subnet_of(net):  # type: ignore[arg-type]
+                next_working.extend(net.address_exclude(child))  # type: ignore[arg-type]
+            elif net.subnet_of(child):  # type: ignore[arg-type]
+                # net is fully covered by child → drop
+                continue
+            else:
+                next_working.append(net)
+        working = next_working
+
+    # Sort by network address and build result
+    working.sort(key=lambda n: int(n.network_address))
+    out: list[dict[str, Any]] = []
+    for net in working[:max_results]:
+        out.append({
+            "network": str(net),
+            "first": str(net.network_address),
+            "last": str(net.broadcast_address),
+            "size": net.num_addresses,
+            "prefix_len": net.prefixlen,
+        })
+    return out
+
+
 def _audit(
     user: Any,
     action: str,
@@ -177,6 +320,10 @@ class IPBlockCreate(BaseModel):
     description: str = ""
     tags: dict[str, Any] = {}
     custom_fields: dict[str, Any] = {}
+    dns_group_ids: list[str] = []
+    dns_zone_id: str | None = None
+    dns_additional_zone_ids: list[str] = []
+    dns_inherit_settings: bool = True
 
     @field_validator("network")
     @classmethod
@@ -191,8 +338,13 @@ class IPBlockCreate(BaseModel):
 class IPBlockUpdate(BaseModel):
     name: str | None = None
     description: str | None = None
+    parent_block_id: uuid.UUID | None = None
     tags: dict[str, Any] | None = None
     custom_fields: dict[str, Any] | None = None
+    dns_group_ids: list[str] | None = None
+    dns_zone_id: str | None = None
+    dns_additional_zone_ids: list[str] | None = None
+    dns_inherit_settings: bool | None = None
 
 
 class IPBlockResponse(BaseModel):
@@ -205,6 +357,10 @@ class IPBlockResponse(BaseModel):
     utilization_percent: float
     tags: dict[str, Any]
     custom_fields: dict[str, Any]
+    dns_group_ids: list[str] | None
+    dns_zone_id: str | None
+    dns_additional_zone_ids: list[str] | None
+    dns_inherit_settings: bool
     created_at: datetime
     modified_at: datetime
 
@@ -232,6 +388,10 @@ class SubnetCreate(BaseModel):
     ntp_servers: list[str] | None = None
     tags: dict[str, Any] = {}
     custom_fields: dict[str, Any] = {}
+    dns_group_ids: list[str] = []
+    dns_zone_id: str | None = None
+    dns_additional_zone_ids: list[str] = []
+    dns_inherit_settings: bool = True
 
     @field_validator("network")
     @classmethod
@@ -275,6 +435,10 @@ class SubnetUpdate(BaseModel):
     # When True: remove network/broadcast/gateway auto records.
     # When False: create them if not already present.
     manage_auto_addresses: bool | None = None
+    dns_group_ids: list[str] | None = None
+    dns_zone_id: str | None = None
+    dns_additional_zone_ids: list[str] | None = None
+    dns_inherit_settings: bool | None = None
 
     @field_validator("status")
     @classmethod
@@ -306,6 +470,10 @@ class SubnetResponse(BaseModel):
     ntp_servers: list[str] | None
     tags: dict[str, Any]
     custom_fields: dict[str, Any]
+    dns_group_ids: list[str] | None
+    dns_zone_id: str | None
+    dns_additional_zone_ids: list[str] | None
+    dns_inherit_settings: bool
     created_at: datetime
     modified_at: datetime
 
@@ -317,6 +485,13 @@ class SubnetResponse(BaseModel):
         return str(v) if v is not None else v
 
 
+class EffectiveDnsResponse(BaseModel):
+    dns_group_ids: list[str]
+    dns_zone_id: str | None
+    dns_additional_zone_ids: list[str]
+    inherited_from_block_id: str | None
+
+
 class IPAddressCreate(BaseModel):
     address: str
     status: str = "allocated"
@@ -326,6 +501,7 @@ class IPAddressCreate(BaseModel):
     owner_user_id: uuid.UUID | None = None
     custom_fields: dict[str, Any] = {}
     tags: dict[str, Any] = {}
+    dns_zone_id: str | None = None  # explicit zone override; falls back to subnet's effective DNS
 
     @field_validator("hostname")
     @classmethod
@@ -355,6 +531,7 @@ class IPAddressUpdate(BaseModel):
     owner_user_id: uuid.UUID | None = None
     custom_fields: dict[str, Any] | None = None
     tags: dict[str, Any] | None = None
+    dns_zone_id: str | None = None  # explicit zone override for DNS record
 
     @field_validator("status")
     @classmethod
@@ -400,6 +577,7 @@ class NextIPRequest(BaseModel):
     description: str = ""
     custom_fields: dict[str, Any] = {}
     tags: dict[str, Any] = {}
+    dns_zone_id: str | None = None  # explicit zone override; falls back to subnet's effective DNS
 
     @field_validator("hostname")
     @classmethod
@@ -546,13 +724,73 @@ async def update_block(
     if block is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP block not found")
 
-    old = {"name": block.name, "description": block.description}
-    changes = body.model_dump(exclude_none=True)
+    old = {
+        "name": block.name,
+        "description": block.description,
+        "parent_block_id": str(block.parent_block_id) if block.parent_block_id else None,
+    }
+
+    # Handle parent_block_id (reparent) separately so we can run validation and
+    # rollups. `parent_block_id` appearing in `model_fields_set` means the caller
+    # set it explicitly (including to null for "move to top level").
+    old_parent_id = block.parent_block_id
+    reparent_requested = "parent_block_id" in body.model_fields_set
+    if reparent_requested:
+        new_parent_id = body.parent_block_id
+        if new_parent_id is not None:
+            if new_parent_id == block.id:
+                raise HTTPException(status_code=422, detail="A block cannot be its own parent")
+            new_parent = await db.get(IPBlock, new_parent_id)
+            if new_parent is None or new_parent.space_id != block.space_id:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail="Target parent block not found in this space",
+                )
+            # CIDR containment
+            child_net = _parse_network(str(block.network))
+            parent_net = _parse_network(str(new_parent.network))
+            if not child_net.subnet_of(parent_net):  # type: ignore[arg-type]
+                raise HTTPException(
+                    status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    detail=f"{block.network} is not contained within target parent {new_parent.network}",
+                )
+            # Cycle detection: walk new_parent's ancestry and ensure we don't find block.id
+            cursor: IPBlock | None = new_parent
+            while cursor is not None:
+                if cursor.id == block.id:
+                    raise HTTPException(
+                        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                        detail="Reparenting would create a cycle",
+                    )
+                if cursor.parent_block_id is None:
+                    break
+                cursor = await db.get(IPBlock, cursor.parent_block_id)
+        block.parent_block_id = new_parent_id
+
+    changes = body.model_dump(exclude_none=True, exclude={"dns_group_ids", "dns_zone_id", "dns_additional_zone_ids", "dns_inherit_settings", "parent_block_id"})
     for field, value in changes.items():
         setattr(block, field, value)
+    # Handle DNS fields explicitly so boolean False and explicit null are preserved
+    dns_fields = {"dns_group_ids", "dns_zone_id", "dns_additional_zone_ids", "dns_inherit_settings"}
+    for field in dns_fields & body.model_fields_set:
+        setattr(block, field, getattr(body, field))
+        changes[field] = getattr(body, field)
+    if reparent_requested:
+        changes["parent_block_id"] = (
+            str(body.parent_block_id) if body.parent_block_id else None
+        )
 
     db.add(_audit(current_user, "update", "ip_block", str(block.id),
                   f"{block.network} ({block.name})", old_value=old, new_value=changes))
+    await db.flush()
+
+    # Update utilization rollups for old and new ancestor chains
+    if reparent_requested and old_parent_id != block.parent_block_id:
+        if old_parent_id:
+            await _update_block_utilization(db, old_parent_id)
+        if block.parent_block_id:
+            await _update_block_utilization(db, block.parent_block_id)
+
     await db.commit()
     await db.refresh(block)
     return block
@@ -568,6 +806,109 @@ async def delete_block(block_id: uuid.UUID, current_user: CurrentUser, db: DB) -
                   f"{block.network} ({block.name})", old_value={"network": str(block.network)}))
     await db.delete(block)
     await db.commit()
+
+
+@router.get("/blocks/{block_id}/available-subnets", response_model=list[str])
+async def get_available_subnets(
+    block_id: uuid.UUID,
+    prefix_len: int = Query(..., ge=1, le=32, description="Desired prefix length (IPv4 only)"),
+    limit: int = Query(20, ge=1, le=50),
+    current_user: CurrentUser = ...,  # type: ignore[assignment]
+    db: DB = ...,  # type: ignore[assignment]
+) -> list[str]:
+    """Return available /prefix_len subnets within this block, sorted sequentially."""
+    block = await db.get(IPBlock, block_id)
+    if block is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Block not found")
+
+    block_net = ipaddress.ip_network(str(block.network), strict=False)
+    if prefix_len <= block_net.prefixlen:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"prefix_len {prefix_len} must be greater than block prefix length {block_net.prefixlen}",
+        )
+
+    result = await db.execute(
+        text(
+            "SELECT network FROM subnet "
+            "WHERE space_id = CAST(:sid AS uuid) AND network && CAST(:net AS cidr)"
+        ),
+        {"sid": str(block.space_id), "net": str(block.network)},
+    )
+    existing = [ipaddress.ip_network(str(row[0]), strict=False) for row in result.fetchall()]
+
+    available: list[str] = []
+    scanned = 0
+    max_scan = limit * 200  # cap iterations to avoid runaway loops on large sparse blocks
+    for candidate in block_net.subnets(new_prefix=prefix_len):
+        if len(available) >= limit or scanned >= max_scan:
+            break
+        scanned += 1
+        if not any(candidate.overlaps(ex) for ex in existing):
+            available.append(str(candidate))
+
+    return available
+
+
+class FreeCidrRange(BaseModel):
+    network: str
+    first: str
+    last: str
+    size: int
+    prefix_len: int
+
+
+@router.get("/blocks/{block_id}/free-space", response_model=list[FreeCidrRange])
+async def get_block_free_space(
+    block_id: uuid.UUID, current_user: CurrentUser, db: DB
+) -> list[FreeCidrRange]:
+    """Return free CIDR ranges inside this block.
+
+    Free space is computed by subtracting all direct-child blocks and direct-child
+    subnets from the block's CIDR. (Nested blocks' own children are accounted for
+    inside those nested blocks, not here.)
+    """
+    block = await db.get(IPBlock, block_id)
+    if block is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Block not found")
+
+    child_blocks = await db.execute(
+        select(IPBlock.network).where(IPBlock.parent_block_id == block.id)
+    )
+    child_subnets = await db.execute(
+        select(Subnet.network).where(Subnet.block_id == block.id)
+    )
+    occupied = [str(n) for (n,) in child_blocks.all()] + [str(n) for (n,) in child_subnets.all()]
+    ranges = _compute_free_cidrs(str(block.network), occupied)
+    return [FreeCidrRange(**r) for r in ranges]
+
+
+@router.get("/blocks/{block_id}/effective-dns", response_model=EffectiveDnsResponse)
+async def get_effective_block_dns(
+    block_id: uuid.UUID, current_user: CurrentUser, db: DB
+) -> EffectiveDnsResponse:
+    """Resolve effective DNS settings for a block by walking up the ancestor chain."""
+    block = await db.get(IPBlock, block_id)
+    if block is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Block not found")
+
+    current = block
+    while current is not None:
+        if not current.dns_inherit_settings:
+            return EffectiveDnsResponse(
+                dns_group_ids=current.dns_group_ids or [],
+                dns_zone_id=current.dns_zone_id,
+                dns_additional_zone_ids=current.dns_additional_zone_ids or [],
+                inherited_from_block_id=str(current.id) if current.id != block_id else None,
+            )
+        if current.parent_block_id:
+            current = await db.get(IPBlock, current.parent_block_id)
+        else:
+            current = None
+
+    return EffectiveDnsResponse(
+        dns_group_ids=[], dns_zone_id=None, dns_additional_zone_ids=[], inherited_from_block_id=None
+    )
 
 
 # ── Subnets ────────────────────────────────────────────────────────────────────
@@ -685,6 +1026,42 @@ async def get_subnet(subnet_id: uuid.UUID, current_user: CurrentUser, db: DB) ->
     return subnet
 
 
+@router.get("/subnets/{subnet_id}/effective-dns", response_model=EffectiveDnsResponse)
+async def get_effective_subnet_dns(
+    subnet_id: uuid.UUID, current_user: CurrentUser, db: DB
+) -> EffectiveDnsResponse:
+    """Resolve effective DNS settings for a subnet, walking up its block ancestry."""
+    subnet = await db.get(Subnet, subnet_id)
+    if subnet is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
+
+    if not subnet.dns_inherit_settings:
+        return EffectiveDnsResponse(
+            dns_group_ids=subnet.dns_group_ids or [],
+            dns_zone_id=subnet.dns_zone_id,
+            dns_additional_zone_ids=subnet.dns_additional_zone_ids or [],
+            inherited_from_block_id=None,
+        )
+
+    current = await db.get(IPBlock, subnet.block_id) if subnet.block_id else None
+    while current is not None:
+        if not current.dns_inherit_settings:
+            return EffectiveDnsResponse(
+                dns_group_ids=current.dns_group_ids or [],
+                dns_zone_id=current.dns_zone_id,
+                dns_additional_zone_ids=current.dns_additional_zone_ids or [],
+                inherited_from_block_id=str(current.id),
+            )
+        if current.parent_block_id:
+            current = await db.get(IPBlock, current.parent_block_id)
+        else:
+            current = None
+
+    return EffectiveDnsResponse(
+        dns_group_ids=[], dns_zone_id=None, dns_additional_zone_ids=[], inherited_from_block_id=None
+    )
+
+
 @router.put("/subnets/{subnet_id}", response_model=SubnetResponse)
 async def update_subnet(
     subnet_id: uuid.UUID, body: SubnetUpdate, current_user: CurrentUser, db: DB
@@ -692,6 +1069,25 @@ async def update_subnet(
     subnet = await db.get(Subnet, subnet_id)
     if subnet is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
+
+    old_block_id = subnet.block_id
+
+    # Validate reparent (block_id change): the target block must be in the same
+    # space and the subnet CIDR must fit inside the target block's CIDR.
+    if body.block_id is not None and body.block_id != subnet.block_id:
+        target = await db.get(IPBlock, body.block_id)
+        if target is None or target.space_id != subnet.space_id:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Target block not found in this space",
+            )
+        subnet_net = _parse_network(str(subnet.network))
+        target_net = _parse_network(str(target.network))
+        if not subnet_net.subnet_of(target_net):  # type: ignore[arg-type]
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Subnet {subnet.network} is not contained within block {target.network}",
+            )
 
     # Validate new gateway is within the subnet
     if body.gateway is not None:
@@ -711,9 +1107,13 @@ async def update_subnet(
         "gateway": str(subnet.gateway) if subnet.gateway else None,
         "status": subnet.status, "vlan_id": subnet.vlan_id,
     }
-    changes = body.model_dump(exclude_none=True, exclude={"manage_auto_addresses"})
+    changes = body.model_dump(exclude_none=True, exclude={"manage_auto_addresses", "dns_group_ids", "dns_zone_id", "dns_additional_zone_ids", "dns_inherit_settings"})
     for field, value in changes.items():
         setattr(subnet, field, value)
+    # Handle DNS fields explicitly so boolean False and explicit null are preserved
+    dns_fields = {"dns_group_ids", "dns_zone_id", "dns_additional_zone_ids", "dns_inherit_settings"}
+    for field in dns_fields & body.model_fields_set:
+        setattr(subnet, field, getattr(body, field))
 
     # Handle add/remove of auto-created network/broadcast/gateway records
     if body.manage_auto_addresses is not None:
@@ -758,6 +1158,13 @@ async def update_subnet(
 
     db.add(_audit(current_user, "update", "subnet", str(subnet.id),
                   f"{subnet.network} ({subnet.name})", old_value=old, new_value=changes))
+    await db.flush()
+
+    # Reparent: recalc utilization for both the old and the new block chains
+    if old_block_id != subnet.block_id:
+        await _update_block_utilization(db, old_block_id)
+        await _update_block_utilization(db, subnet.block_id)
+
     await db.commit()
     await db.refresh(subnet)
     return subnet
@@ -847,13 +1254,17 @@ async def create_address(
     ip = IPAddress(
         subnet_id=subnet_id,
         created_by_user_id=current_user.id,
-        **body.model_dump(),
+        **body.model_dump(exclude={"dns_zone_id"}),
     )
     db.add(ip)
     await db.flush()
 
+    # Sync DNS A record
+    zone_id = uuid.UUID(body.dns_zone_id) if body.dns_zone_id else None
+    await _sync_dns_record(db, ip, subnet, zone_id=zone_id, action="create")
+
     db.add(_audit(current_user, "create", "ip_address", str(ip.id),
-                  body.address, new_value=body.model_dump()))
+                  body.address, new_value=body.model_dump(exclude={"dns_zone_id"})))
     await db.flush()
     await _update_utilization(db, subnet_id)
     await _update_block_utilization(db, subnet.block_id)
@@ -891,9 +1302,15 @@ async def update_address(
 
     old = {"status": ip.status, "hostname": ip.hostname, "mac_address": str(ip.mac_address) if ip.mac_address else None}
     old_status = ip.status
-    changes = body.model_dump(exclude_none=True)
+    changes = body.model_dump(exclude_none=True, exclude={"dns_zone_id"})
     for field, value in changes.items():
         setattr(ip, field, value)
+
+    # Sync DNS record if hostname or zone changed
+    subnet = await db.get(Subnet, ip.subnet_id)
+    if subnet and ("hostname" in changes or body.dns_zone_id is not None):
+        zone_id = uuid.UUID(body.dns_zone_id) if body.dns_zone_id else None
+        await _sync_dns_record(db, ip, subnet, zone_id=zone_id, action="update")
 
     db.add(_audit(current_user, "update", "ip_address", str(ip.id),
                   str(ip.address), old_value=old, new_value=changes))
@@ -903,9 +1320,8 @@ async def update_address(
     status_now_available = ip.status == "available"
     if status_was_available != status_now_available:
         await db.flush()
-        subnet = await db.get(Subnet, ip.subnet_id)
-        await _update_utilization(db, ip.subnet_id)
         if subnet:
+            await _update_utilization(db, ip.subnet_id)
             await _update_block_utilization(db, subnet.block_id)
 
     await db.commit()
@@ -927,6 +1343,10 @@ async def delete_address(
     subnet = await db.get(Subnet, ip.subnet_id)
     if permanent:
         subnet_id = ip.subnet_id
+        # Remove auto-generated DNS record before deleting the IP (FK would null it anyway,
+        # but we want a clean delete and fqdn cleared)
+        if subnet:
+            await _sync_dns_record(db, ip, subnet, action="delete")
         db.add(_audit(current_user, "delete", "ip_address", str(ip.id),
                       str(ip.address), old_value={"address": str(ip.address), "status": ip.status}))
         await db.delete(ip)
@@ -935,7 +1355,9 @@ async def delete_address(
         if subnet:
             await _update_block_utilization(db, subnet.block_id)
     else:
-        # Soft-delete: mark as orphan, keep the record
+        # Soft-delete: mark as orphan; remove DNS record since the name is being released
+        if subnet:
+            await _sync_dns_record(db, ip, subnet, action="delete")
         old_status = ip.status
         ip.status = "orphan"
         db.add(_audit(current_user, "update", "ip_address", str(ip.id),
@@ -1015,8 +1437,12 @@ async def allocate_next_ip(
     db.add(ip)
     await db.flush()
 
+    # Sync DNS A record
+    zone_id = uuid.UUID(body.dns_zone_id) if body.dns_zone_id else None
+    await _sync_dns_record(db, ip, subnet, zone_id=zone_id, action="create")
+
     db.add(_audit(current_user, "create", "ip_address", str(ip.id),
-                  str(chosen), new_value={**body.model_dump(), "address": str(chosen)}))
+                  str(chosen), new_value={**body.model_dump(exclude={"dns_zone_id"}), "address": str(chosen)}))
     await db.flush()
     await _update_utilization(db, subnet_id)
     await _update_block_utilization(db, subnet.block_id)

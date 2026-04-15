@@ -1,6 +1,6 @@
-import { useQuery } from "@tanstack/react-query";
-import { Network, Layers, Server, Globe } from "lucide-react";
-import { ipamApi, type Subnet } from "@/lib/api";
+import { useQuery, useQueries } from "@tanstack/react-query";
+import { Network, Layers, Server, Globe, Globe2, FileText } from "lucide-react";
+import { ipamApi, dnsApi, type Subnet } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
 function StatCard({
@@ -55,6 +55,21 @@ export function DashboardPage() {
     queryFn: () => ipamApi.listSubnets(),
   });
 
+  const { data: dnsGroups = [] } = useQuery({
+    queryKey: ["dns-groups"],
+    queryFn: dnsApi.listGroups,
+    staleTime: 30_000,
+  });
+
+  const zoneQueries = useQueries({
+    queries: dnsGroups.map((g) => ({
+      queryKey: ["dns-zones", g.id],
+      queryFn: () => dnsApi.listZones(g.id),
+      staleTime: 30_000,
+    })),
+  });
+  const totalZones = zoneQueries.reduce((sum, q) => sum + (q.data?.length ?? 0), 0);
+
   const totalIPs = subnets?.reduce((s, n) => s + n.total_ips, 0) ?? 0;
   const allocatedIPs = subnets?.reduce((s, n) => s + n.allocated_ips, 0) ?? 0;
   const overallUtil = totalIPs > 0 ? (allocatedIPs / totalIPs) * 100 : 0;
@@ -75,7 +90,7 @@ export function DashboardPage() {
         <h1 className="text-2xl font-bold tracking-tight">Dashboard</h1>
 
         {/* Stat cards */}
-        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+        <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
           <StatCard
             label="IP Spaces"
             value={spaces?.length ?? "—"}
@@ -104,6 +119,17 @@ export function DashboardPage() {
             value={`${overallUtil.toFixed(1)}%`}
             icon={Globe}
             sub={`${allocatedIPs.toLocaleString()} allocated`}
+          />
+          <StatCard
+            label="DNS Server Groups"
+            value={dnsGroups.length}
+            icon={Globe2}
+          />
+          <StatCard
+            label="DNS Zones"
+            value={totalZones}
+            icon={FileText}
+            sub={dnsGroups.length > 0 ? `across ${dnsGroups.length} group${dnsGroups.length !== 1 ? "s" : ""}` : undefined}
           />
         </div>
 

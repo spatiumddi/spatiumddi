@@ -274,3 +274,32 @@ Pre-built Prometheus alerting rules (in `deploy/prometheus/alerts/`):
 | `DBReplicationLag` | `replication_lag > 30` | warning |
 | `CeleryQueueBacklog` | `queue_length > 100` for 5m | warning |
 | `BackupFailed` | Checked via Celery task failure metric | critical |
+
+
+## DNS Agent Telemetry
+
+See [`docs/deployment/DNS_AGENT.md`](deployment/DNS_AGENT.md) §4 for the full protocol.
+
+### Metrics (scraped from the control plane)
+
+| Metric | Type | Labels | Purpose |
+|---|---|---|---|
+| `spatium_dns_agent_up` | gauge | `server_id`, `flavor` | 1 if last heartbeat within 90s |
+| `spatium_dns_agent_config_lag_seconds` | gauge | `server_id` | Age of the applied config etag |
+| `spatium_dns_zone_serial` | gauge | `server_id`, `zone` | Last reported SOA serial |
+| `spatium_dns_failed_ops_total` | counter | `server_id` | RecordOps that exhausted retries |
+| `spatium_dns_agent_token_rotations_total` | counter | `server_id` | JWT rotations per server |
+
+Agents are egress-only and do **not** expose a scrape endpoint — all metrics
+are derived from the heartbeat body on the control plane.
+
+### Logs
+
+Agent logs are structured JSON (non-negotiable #7) and include the canonical
+`service=spatium-dns-agent` binding. Notable events:
+
+- `dns_agent_registered` — bootstrap complete
+- `dns_agent_token_rotated` — JWT rotation
+- `dns_agent_config_applied` — new config etag applied
+- `dns_agent_op_failed` — RecordOp failed (attempt <= 5)
+- `dns_agent_stale_sweep` — control-plane Celery task marked servers unreachable

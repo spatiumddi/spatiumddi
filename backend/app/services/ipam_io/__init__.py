@@ -11,9 +11,9 @@ from app.services.ipam_io.importer import (
     ImportPreview,
     ImportResult,
     commit_import,
-    parse_payload,
     preview_import,
 )
+from app.services.ipam_io.parser import parse_payload
 
 __all__ = [
     "ImportPreview",

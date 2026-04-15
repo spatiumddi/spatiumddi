@@ -1,0 +1,38 @@
+# Per-server external Service (LoadBalancer) exposing UDP+TCP 53.
+# Duplicate per StatefulSet so each ns1/ns2/... gets its own VIP.
+apiVersion: v1
+kind: Service
+metadata:
+  name: dns-bind9-ns1
+  namespace: spatiumddi
+  labels:
+    app.kubernetes.io/name: spatium-dns
+    app.kubernetes.io/instance: ns1
+spec:
+  type: LoadBalancer
+  selector:
+    app.kubernetes.io/name: spatium-dns
+    app.kubernetes.io/instance: ns1
+  ports:
+    - name: dns-udp
+      port: 53
+      targetPort: 53
+      protocol: UDP
+    - name: dns-tcp
+      port: 53
+      targetPort: 53
+      protocol: TCP
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: dns-bind9-ns1-headless
+  namespace: spatiumddi
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: spatium-dns
+    app.kubernetes.io/instance: ns1
+  ports:
+    - { name: dns-udp, port: 53, protocol: UDP }
+    - { name: dns-tcp, port: 53, protocol: TCP }

@@ -79,6 +79,12 @@ class IPBlock(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     tags: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     custom_fields: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
 
+    # DNS assignment (propagates to child blocks and subnets unless overridden)
+    dns_group_ids: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
+    dns_zone_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    dns_additional_zone_ids: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
+    dns_inherit_settings: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
     space: Mapped[IPSpace] = relationship("IPSpace", back_populates="blocks")
     parent: Mapped["IPBlock | None"] = relationship("IPBlock", remote_side="IPBlock.id")
     children: Mapped[list["IPBlock"]] = relationship("IPBlock", back_populates="parent")
@@ -121,6 +127,12 @@ class Subnet(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     # NTP
     ntp_servers: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
+
+    # DNS assignment (mirrors ip_block fields; inherits from parent block unless overridden)
+    dns_group_ids: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
+    dns_zone_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    dns_additional_zone_ids: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
+    dns_inherit_settings: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
     # Status: active | deprecated | reserved | quarantine
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="active", index=True)
