@@ -1,5 +1,7 @@
 # DHCP Feature Specification
 
+> **Implementation status (2026-04-15):** Kea driver, agent runtime, container image, backend API, and frontend UI landed. ISC DHCP driver, HA hook library coordination, DDNS pipeline, and reconciliation report are deferred. NTP (DHCP option 42) is supported as a first-class option.
+
 ## Overview
 
 SpatiumDDI manages DHCP servers as authoritative configuration sources. The IPAM database is the **source of truth** — DHCP server configs are pushed from IPAM, not read from the servers. DHCP servers are configured to report lease events back to SpatiumDDI for real-time IP status tracking and DDNS updates.

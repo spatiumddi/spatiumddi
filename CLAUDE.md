@@ -94,7 +94,7 @@ These rules apply to every file Claude Code generates. No exceptions.
 | Phase | Focus | Status |
 |---|---|---|
 | 1 | Core IPAM, local auth, user management, audit log, Docker Compose | **In Progress** |
-| 2 | DHCP (Kea + ISC), DNS (BIND9), DDNS, zone/subnet tree UI | **In Progress** (DNS core + driver + agent runtime landed; DHCP/DDNS pending) |
+| 2 | DHCP (Kea + ISC), DNS (BIND9), DDNS, zone/subnet tree UI | **In Progress** (DNS core landed; DHCP Kea driver + agent + UI landed; ISC DHCP + DDNS pending) |
 | 3 | DNS views, server groups, blocking lists, VLAN/VXLAN, system admin panel, health dashboard | **In Progress** (DNS views, groups, blocklists, health checks landed) |
 | 4 | OS appliance image, Terraform/Ansible providers, SAML, notifications, backup/restore | Not started |
 | 5 | Multi-tenancy, IP request workflows, import/export, advanced reporting | Not started |
@@ -233,6 +233,36 @@ These rules apply to every file Claude Code generates. No exceptions.
 - ✅ DNS agent image bumped Alpine 3.20 → 3.22 (latest with default Python 3.12 — moving to 3.23 would also require retemplating `PYTHONPATH`).
 - ✅ Forwarders + blocklist push to BIND verified end-to-end (no fix needed — confirmed `config_bundle.py:90-91` → `named.conf.j2:31-34` for forwarders and ETag inclusion at `base.py:166-173` for blocklists).
 
+### DHCP Wave 1 (2026-04-15)
+
+**Backend**
+- ✅ Models `DHCPServerGroup`, `DHCPServer`, `DHCPScope`, `DHCPPool`, `DHCPStaticAssignment`, `DHCPClientClass`, `DHCPLease`, `DHCPConfigOp` (alias `DHCPRecordOp`) in `backend/app/models/dhcp.py`; migration `d9a4c3b7e812_add_dhcp_models.py`.
+- ✅ Driver abstraction at `backend/app/drivers/dhcp/` — `base.py` (ABC + neutral dataclasses: `ScopeDef`, `PoolDef`, `StaticAssignmentDef`, `ClientClassDef`, `ServerOptionsDef`, `ConfigBundle` with sha256 ETag); `kea.py` (renders Kea `Dhcp4` JSON with `subnet4`, `pools`, `reservations`, `client-classes`, `option-data`). `STANDARD_OPTION_NAMES` includes `ntp-servers` (option 42) as a first-class DHCP option. ISC DHCP driver deferred.
+- ✅ ConfigBundle service `backend/app/services/dhcp/config_bundle.py` + agent-token service `agent_token.py`.
+- ✅ API routes under `backend/app/api/v1/dhcp/`: `server_groups`, `servers` (+ `/sync`, `/approve`, `/leases`), `scopes`, `pools`, `statics` (with MAC-dup and pool-membership conflict checks), `client_classes`, `agents` (register, heartbeat, `/config` long-poll with ETag, `/lease-events` bulk upsert, `/ops/{id}/ack`).
+- ✅ Celery `check_dhcp_server_health` + beat fan-out every 60s (`backend/app/tasks/dhcp_health.py`).
+- ✅ Env vars in `.env.example` + `Settings`: `DHCP_AGENT_KEY`, `DHCP_AGENT_TOKEN_TTL_HOURS`, `DHCP_AGENT_LONGPOLL_TIMEOUT`, `DHCP_REQUIRE_AGENT_APPROVAL`, `DHCP_SYNC_INTERVAL_SECONDS`, `DHCP_LEASE_SYNC_INTERVAL_MINUTES`.
+
+**Agent runtime + container**
+- ✅ Python package `agent/dhcp/spatium_dhcp_agent/` — bootstrap (PSK → rotating JWT), long-poll config sync with ETag, on-disk cache at `/var/lib/spatium-dhcp-agent/`, Kea control-socket reload, lease tail from Kea memfile CSV, heartbeat, supervisor (tini).
+- ✅ `render_kea.py` converts neutral bundle → Kea `Dhcp4` JSON with option 42 (ntp-servers) emitted at global and per-subnet scope, `lease_cmds` hook enabled.
+- ✅ Container image `agent/dhcp/images/kea/Dockerfile` — Alpine 3.22 multi-arch; GH Actions `.github/workflows/build-dhcp-images.yml` → `ghcr.io/spatiumddi/dhcp-kea`.
+- ✅ Kubernetes `k8s/dhcp/kea-statefulset.yaml` + `service-dhcp.yaml` (one STS per server, two PVCs); Compose `dhcp` profile with `dhcp-kea` service (host ports `6767:67/udp`, `8001:8000/tcp` to avoid API-port clash).
+
+**Frontend**
+- ✅ `/dhcp` route; sidebar entry enabled; `frontend/src/pages/dhcp/DHCPPage.tsx` with server-group sidebar + tabs (Scopes, Pools, Static Assignments, Client Classes, Leases, Server Options).
+- ✅ Full CRUD modals for server groups, servers, scopes, pools, static assignments, client classes.
+- ✅ `DHCPOptionsEditor` with NTP (option 42) as a prominent labeled field alongside routers, DNS, domain-name, TFTP, bootfile; custom-options expandable section.
+- ✅ `DHCPSubnetPanel` — DHCP tab inside IPAM `SubnetDetail` showing per-server scope cards with pool/static sub-tables.
+- ✅ `dhcpApi` client in `frontend/src/lib/api.ts`.
+
+**Deferred**
+- ⬜ ISC DHCP driver (registry only knows `kea`)
+- ⬜ Kea HA hook library (load-balancing / hot-standby coordination)
+- ⬜ DDNS pipeline (lease → DNS A/PTR)
+- ⬜ Reconciliation report, lease import, dashboard DHCP stat card (DHCP dashboard integration was dropped during VLAN/Dashboard merge — re-add)
+- ⬜ Trivy-clean + e2e acceptance tests for Kea image (stubs in `agent/dhcp/tests/`)
+
 ### Phase 1 — Remaining
 
 - ⬜ LDAP / OIDC authentication
@@ -244,8 +274,8 @@ These rules apply to every file Claude Code generates. No exceptions.
 
 ### Phase 2/3 — Remaining
 
-- ⬜ DHCP (Kea + ISC) drivers, models, UI
-- ⬜ DDNS pipeline (needs DHCP first) — subnet `ddns_enabled`/`ddns_hostname_policy`/`ddns_domain_override`/`ddns_ttl`; DHCP-lease → DNS A/PTR Celery task
+- ⬜ ISC DHCP driver (Kea driver + agent + UI landed in DHCP Wave 1)
+- ⬜ DDNS pipeline (needs DHCP lease events flowing) — subnet `ddns_enabled`/`ddns_hostname_policy`/`ddns_domain_override`/`ddns_ttl`; DHCP-lease → DNS A/PTR Celery task
 - ⬜ Per-server zone serial reporting (currently all servers in a group share `DNSZone.serial`; once agents report back, surface per-server drift)
 - ⬜ Trivy-clean + kind-AXFR acceptance tests for the agent images (stubs marked `@pytest.mark.e2e` in `agent/dns/tests/`)
 

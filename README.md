@@ -28,7 +28,7 @@ It is designed as a modern alternative to commercial DDI platforms like Efficien
 
 - 🗂 **Hierarchical IP management** — spaces, blocks, subnets, addresses in a visual tree
 - 🌐 **Built-in DNS server** — BIND9 container that auto-registers and syncs via RFC 2136
-- 🔄 **DHCP server management** — ISC Kea / ISC DHCP with HA failover (Phase 2)
+- 🔄 **DHCP server management** — Kea container + agent with lease tracking (Phase 2); ISC DHCP + HA hook pending
 - 🔒 **Granular permissions** — delegate IP ranges and zones via LDAP / OIDC / SAML
 - 📋 **Full audit trail** — every mutation logged, append-only, viewable in the UI
 - 🚀 **Flexible deployment** — Docker Compose, Kubernetes (Helm), bare metal, or OS appliance
@@ -172,7 +172,7 @@ Full docs at **[spatiumddi.org](https://spatiumddi.org)** (GitHub Pages — comi
 | Phase | Focus | Status |
 |---|---|---|
 | Phase 1 | Core IPAM, auth, user management, audit log, Docker Compose | 🔄 In progress |
-| Phase 2 | DHCP (Kea + ISC), DNS (BIND9), DDNS, zone/subnet tree UI | 🔄 DNS landed; DHCP/DDNS pending |
+| Phase 2 | DHCP (Kea + ISC), DNS (BIND9), DDNS, zone/subnet tree UI | 🔄 DNS + Kea DHCP landed; ISC DHCP + DDNS pending |
 | Phase 3 | DNS views, server groups, blocking lists, VLAN/VXLAN, system admin | 🔄 DNS features landed |
 | Phase 4 | OS appliance, Terraform provider, SAML, backup/restore | 📋 Planned |
 | Phase 5 | Multi-tenancy, IP request workflows, advanced reporting | 📋 Planned |
