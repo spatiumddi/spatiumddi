@@ -34,11 +34,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8.3.0",
-    # Pinned <1.0: pytest-asyncio 1.x changed loop scoping in a way that breaks
-    # the session-scoped engine in tests/conftest.py (cross-loop "another
-    # operation in progress" / "attached to a different loop" errors). Stay
-    # on the 0.x line until the conftest gets a per-test engine fixture.
-    "pytest-asyncio>=0.24.0,<1.0",
+    "pytest-asyncio>=0.24.0",
     "pytest-cov>=6.0.0",
     "httpx>=0.28.0",
     "ruff>=0.8.0",
@@ -77,5 +73,13 @@ disable_error_code = ["assignment", "no-redef", "attr-defined", "index", "operat
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# Force every async fixture and test onto a single session-scoped event loop.
+# `tests/conftest.py` builds the SQLAlchemy async engine at import time and
+# its session-scoped schema-create fixture pulls the first connection on the
+# session loop. Without this, function-scoped tests get a fresh per-test loop
+# and asyncpg blows up with "another operation in progress" / "attached to a
+# different loop" the moment a test reuses the pooled connection.
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
 testpaths = ["tests"]
 addopts = "--cov=app --cov-report=term-missing"

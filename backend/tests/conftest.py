@@ -11,6 +11,7 @@ from collections.abc import AsyncGenerator
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.pool import NullPool
 
 from app.db import get_db
 from app.main import app
@@ -21,7 +22,13 @@ TEST_DATABASE_URL = os.getenv(
     "postgresql+asyncpg://spatiumddi:changeme@localhost:5432/spatiumddi_test",
 )
 
-_test_engine = create_async_engine(TEST_DATABASE_URL, echo=False)
+# NullPool: open a fresh asyncpg connection on every checkout and drop it on
+# release. The default QueuePool keeps connections bound to the loop they
+# were opened on, which collides with pytest-asyncio's per-test loops and
+# produces "another operation in progress" / "attached to a different loop"
+# errors. This is the cheap, safe fix; tests are I/O-bound on Postgres
+# anyway so pool reuse buys nothing here.
+_test_engine = create_async_engine(TEST_DATABASE_URL, echo=False, poolclass=NullPool)
 _TestSessionLocal = async_sessionmaker(_test_engine, class_=AsyncSession, expire_on_commit=False)
 
 
