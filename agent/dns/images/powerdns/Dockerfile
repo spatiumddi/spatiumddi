@@ -10,7 +10,7 @@ RUN python3 -m pip install --prefix=/install --no-cache-dir --break-system-packa
 FROM alpine:3.20 AS runtime
 RUN apk add --no-cache \
       pdns pdns-backend-sqlite3 pdns-backend-lmdb pdns-recursor \
-      tini python3 py3-pip \
+      tini su-exec python3 py3-pip \
       ca-certificates tzdata \
  && addgroup -S spatium \
  && adduser -S -G spatium spatium \
@@ -24,6 +24,7 @@ RUN chmod +x /usr/local/bin/spatium-dns-entrypoint
 ENV AGENT_DRIVER=powerdns \
     PDNS_FLAVOR=auth \
     AGENT_STATE_DIR=/var/lib/spatium-dns-agent \
+    PYTHONPATH=/usr/local/lib/python3.12/site-packages \
     LOG_LEVEL=INFO
 
 VOLUME ["/var/lib/spatium-dns-agent", "/var/lib/powerdns"]

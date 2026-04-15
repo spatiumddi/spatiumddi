@@ -1,13 +1,12 @@
 """DNS API: server groups, servers, server options, views, ACLs, zones, records."""
 
 import io
-import os
 import uuid
 import zipfile
 from datetime import UTC, datetime
 
 import structlog
-from fastapi import APIRouter, Header, HTTPException, status
+from fastapi import APIRouter, HTTPException, status
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, field_validator
 from sqlalchemy import select
@@ -26,6 +25,7 @@ from app.models.dns import (
     DNSView,
     DNSZone,
 )
+from app.services.dns.record_ops import enqueue_record_op
 from app.services.dns.serial import bump_zone_serial
 from app.services.dns_io import (
     RecordChange,
@@ -1142,7 +1142,13 @@ async def create_record(
         **body.model_dump(),
     )
     db.add(record)
-    bump_zone_serial(zone)
+    target_serial = bump_zone_serial(zone)
+    await db.flush()
+    await enqueue_record_op(
+        db, zone, "create",
+        {"name": record.name, "type": record.record_type, "value": record.value, "ttl": record.ttl},
+        target_serial=target_serial,
+    )
     db.add(AuditLog(
         user_id=current_user.id,
         user_display_name=current_user.display_name,
@@ -1174,8 +1180,13 @@ async def update_record(
         setattr(record, k, v)
     if "name" in changes and zone:
         record.fqdn = f"{record.name}.{zone.name}" if record.name != "@" else zone.name
+    target_serial = bump_zone_serial(zone) if zone is not None else None
     if zone is not None:
-        bump_zone_serial(zone)
+        await enqueue_record_op(
+            db, zone, "update",
+            {"name": record.name, "type": record.record_type, "value": record.value, "ttl": record.ttl},
+            target_serial=target_serial,
+        )
 
     db.add(AuditLog(
         user_id=current_user.id,
@@ -1209,9 +1220,16 @@ async def delete_record(
         resource_display=record.fqdn,
         result="success",
     ))
+    rec_snapshot = {
+        "name": record.name,
+        "type": record.record_type,
+        "value": record.value,
+        "ttl": record.ttl,
+    }
     await db.delete(record)
     if zone is not None:
-        bump_zone_serial(zone)
+        target_serial = bump_zone_serial(zone)
+        await enqueue_record_op(db, zone, "delete", rec_snapshot, target_serial=target_serial)
     await db.commit()
 
 
@@ -1504,25 +1522,6 @@ async def import_zone_commit(
     )
 
 
-@router.get("/groups/{group_id}/zones/{zone_id}/export")
-async def export_zone(
-    group_id: uuid.UUID,
-    zone_id: uuid.UUID,
-    db: DB,
-    _: CurrentUser,
-) -> Response:
-    """Return the zone as an RFC 1035 zone file."""
-    zone = await _require_zone(group_id, zone_id, db)
-    records = await _load_zone_records(zone_id, db)
-    text = write_zone_file(zone, records)
-    filename = zone.name.rstrip(".") + ".zone"
-    return Response(
-        content=text,
-        media_type="text/dns",
-        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
-    )
-
-
 @router.get("/groups/{group_id}/zones/export")
 async def export_all_zones(
     group_id: uuid.UUID,
@@ -1551,6 +1550,25 @@ async def export_all_zones(
     return StreamingResponse(
         buf,
         media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get("/groups/{group_id}/zones/{zone_id}/export")
+async def export_zone(
+    group_id: uuid.UUID,
+    zone_id: uuid.UUID,
+    db: DB,
+    _: CurrentUser,
+) -> Response:
+    """Return the zone as an RFC 1035 zone file."""
+    zone = await _require_zone(group_id, zone_id, db)
+    records = await _load_zone_records(zone_id, db)
+    text = write_zone_file(zone, records)
+    filename = zone.name.rstrip(".") + ".zone"
+    return Response(
+        content=text,
+        media_type="text/dns",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
 
@@ -1616,186 +1634,3 @@ async def _require_record(
     return record
 
 
-# ── Agent auto-registration ─────────────────────────────────────────────────
-# DNS agent containers (BIND9, PowerDNS) call POST /dns/agents/register on
-# startup using the shared DNS_AGENT_KEY environment variable. This creates or
-# updates the DNSServer record so manual registration is not required.
-
-
-class AgentRegisterRequest(BaseModel):
-    """Payload sent by a DNS agent container on startup."""
-    name: str
-    driver: str = "bind9"
-    host: str
-    port: int = 53
-    api_port: int | None = None
-    group_name: str | None = None   # registers into named group, or first available
-    roles: list[str] = ["authoritative"]
-    version: str | None = None      # agent software version
-
-
-class AgentRegisterResponse(BaseModel):
-    server_id: str
-    group_id: str
-    registered: bool   # True = newly created, False = updated existing
-
-
-class AgentHeartbeatResponse(BaseModel):
-    server_id: str
-    status: str
-    acknowledged_at: datetime
-
-
-def _require_agent_key(x_dns_agent_key: str | None = Header(default=None, alias="X-DNS-Agent-Key")) -> str:
-    """Dependency that validates the agent pre-shared key from env."""
-    expected = os.environ.get("DNS_AGENT_KEY", "")
-    if not expected:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="DNS_AGENT_KEY is not configured on the control plane — agent registration disabled",
-        )
-    if x_dns_agent_key != expected:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or missing X-DNS-Agent-Key header",
-        )
-    return x_dns_agent_key
-
-
-@router.post("/agents/register", response_model=AgentRegisterResponse, status_code=200)
-async def agent_register(
-    body: AgentRegisterRequest,
-    db: DB,
-    _key: str = status.HTTP_200_OK,  # placeholder; dependency injected below
-    x_dns_agent_key: str | None = Header(default=None, alias="X-DNS-Agent-Key"),
-) -> AgentRegisterResponse:
-    """Called by DNS agent containers on startup to self-register.
-
-    The container must set the X-DNS-Agent-Key header equal to the
-    DNS_AGENT_KEY environment variable configured on both the container and
-    the SpatiumDDI control plane.
-
-    If a server with the same (group_id, name) or (host, port) already exists
-    it is updated rather than duplicated.
-    """
-    expected = os.environ.get("DNS_AGENT_KEY", "")
-    if not expected:
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail="DNS_AGENT_KEY is not configured on the control plane — agent registration disabled",
-        )
-    if x_dns_agent_key != expected:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or missing X-DNS-Agent-Key header",
-        )
-
-    if body.driver not in VALID_DRIVERS:
-        raise HTTPException(status_code=422, detail=f"driver must be one of {sorted(VALID_DRIVERS)}")
-
-    # Resolve or create server group
-    if body.group_name:
-        result = await db.execute(
-            select(DNSServerGroup).where(DNSServerGroup.name == body.group_name)
-        )
-        group = result.scalar_one_or_none()
-        if not group:
-            group = DNSServerGroup(name=body.group_name, description="Auto-created by agent registration")
-            db.add(group)
-            await db.flush()
-    else:
-        # Use first group, or create a default one
-        result = await db.execute(select(DNSServerGroup).order_by(DNSServerGroup.created_at).limit(1))
-        group = result.scalar_one_or_none()
-        if not group:
-            group = DNSServerGroup(name="default", description="Auto-created by agent registration")
-            db.add(group)
-            await db.flush()
-
-    # Check for existing server by host+port within the group
-    result = await db.execute(
-        select(DNSServer).where(
-            DNSServer.group_id == group.id,
-            DNSServer.host == body.host,
-            DNSServer.port == body.port,
-        )
-    )
-    server = result.scalar_one_or_none()
-    registered = server is None
-
-    if server:
-        # Update existing registration
-        server.name = body.name
-        server.driver = body.driver
-        server.api_port = body.api_port
-        server.roles = body.roles
-        server.status = "active"
-        server.last_health_check_at = datetime.now(UTC)
-        if body.version:
-            server.notes = f"agent version: {body.version}"
-    else:
-        server = DNSServer(
-            group_id=group.id,
-            name=body.name,
-            driver=body.driver,
-            host=body.host,
-            port=body.port,
-            api_port=body.api_port,
-            roles=body.roles,
-            status="active",
-            last_health_check_at=datetime.now(UTC),
-            notes=f"agent version: {body.version}" if body.version else "auto-registered",
-        )
-        db.add(server)
-        await db.flush()
-
-    await db.commit()
-    await db.refresh(server)
-
-    logger.info(
-        "dns_agent_registered",
-        server_id=str(server.id),
-        group_id=str(group.id),
-        host=body.host,
-        driver=body.driver,
-        new=registered,
-    )
-
-    return AgentRegisterResponse(
-        server_id=str(server.id),
-        group_id=str(group.id),
-        registered=registered,
-    )
-
-
-@router.post("/agents/{server_id}/heartbeat", response_model=AgentHeartbeatResponse)
-async def agent_heartbeat(
-    server_id: uuid.UUID,
-    db: DB,
-    x_dns_agent_key: str | None = Header(default=None, alias="X-DNS-Agent-Key"),
-) -> AgentHeartbeatResponse:
-    """Periodic heartbeat from a registered DNS agent.
-
-    Updates last_health_check_at and marks the server as active.
-    The container must include the X-DNS-Agent-Key header.
-    """
-    expected = os.environ.get("DNS_AGENT_KEY", "")
-    if not expected:
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="DNS_AGENT_KEY not configured")
-    if x_dns_agent_key != expected:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or missing X-DNS-Agent-Key header")
-
-    server = await db.get(DNSServer, server_id)
-    if not server:
-        raise HTTPException(status_code=404, detail="Server not found")
-
-    now = datetime.now(UTC)
-    server.last_health_check_at = now
-    server.status = "active"
-    await db.commit()
-
-    return AgentHeartbeatResponse(
-        server_id=str(server.id),
-        status=server.status,
-        acknowledged_at=now,
-    )

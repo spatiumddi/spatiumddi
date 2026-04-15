@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import signal
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -35,10 +36,10 @@ options {{
     recursion {recursion};
     allow-query {{ {allow_query}; }};
     dnssec-validation {dnssec};
+    check-integrity no;
 {forwarders}
 }};
-include "/var/lib/spatium-dns-agent/tsig/ddns.key";
-"""
+{tsig_include}"""
 
 
 class Bind9Driver(DriverBase):
@@ -64,34 +65,48 @@ class Bind9Driver(DriverBase):
                 fs="; ".join(forwarders)
             )
 
+        tsig_keys = bundle.get("tsig_keys") or []
+        tsig_key_name = tsig_keys[0]["name"] if tsig_keys else None
+        tsig_include = (
+            'include "/var/lib/spatium-dns-agent/tsig/ddns.key";\n' if tsig_keys else ""
+        )
+
         conf = NAMED_CONF_SKELETON.format(
             recursion=recursion,
             allow_query=allow_query,
             dnssec=dnssec,
             forwarders=fwd_block,
+            tsig_include=tsig_include,
         )
 
         for zone in bundle.get("zones", []):
             zname = zone.get("name") or ""
             if not zname:
                 continue
-            zfile = f"zones/{zname.rstrip('.')}.db"
+            # Relative path used inside the rendered tree; absolute path
+            # written into named.conf so BIND9 doesn't resolve against its
+            # `directory` (which is /var/cache/bind, not our rendered tree).
+            rel_zfile = f"zones/{zname.rstrip('.')}.db"
+            current_dir = self.state_dir / self.rendered_dir_name
+            abs_zfile = current_dir / rel_zfile
             zone_type = zone.get("type", "primary")
             bind_type = "master" if zone_type in {"primary", "master"} else "slave"
+            allow_update = (
+                f'allow-update {{ key "{tsig_key_name}"; }}; ' if tsig_key_name else ""
+            )
             conf += (
-                f'zone "{zname}" {{ type {bind_type}; file "{zfile}"; '
-                'allow-update { key "ddns-key"; }; };\n'
+                f'zone "{zname}" {{ type {bind_type}; file "{abs_zfile}"; '
+                f'{allow_update}}};\n'
             )
             if zone_type in {"primary", "master"}:
-                self._write_zone_file(new_dir / zfile, zone)
+                self._write_zone_file(new_dir / rel_zfile, zone)
 
         (new_dir / "named.conf").write_text(conf)
 
         # TSIG key — written to tsig/ddns.key (stable path)
-        tsig_dir = self.state_dir / "tsig"
-        tsig_dir.mkdir(parents=True, exist_ok=True)
-        tsig_keys = bundle.get("tsig_keys") or []
         if tsig_keys:
+            tsig_dir = self.state_dir / "tsig"
+            tsig_dir.mkdir(parents=True, exist_ok=True)
             k = tsig_keys[0]
             tsig_file = tsig_dir / "ddns.key"
             tsig_file.write_text(
@@ -105,14 +120,21 @@ class Bind9Driver(DriverBase):
         name = zone.get("name") or ""
         ttl = zone.get("ttl", 3600)
         serial = zone.get("serial") or 1
+        # Auto-emit a self-referential glue A record so BIND9 accepts the
+        # zone even when the user didn't explicitly add `ns1 IN A …`.
+        # 127.0.0.1 is fine for dev; production should set primary_ns + glue
+        # explicitly via the zone create form.
         lines = [
             f"$TTL {ttl}",
             f"@ IN SOA ns1.{name} admin.{name} ( {serial} 3600 600 86400 300 )",
             f"@ IN NS ns1.{name}",
+            f"ns1 IN A 127.0.0.1",
         ]
         for rec in zone.get("records", []) or []:
+            rec_ttl = rec.get("ttl") or ttl
+            name_field = rec.get("name") or "@"
             lines.append(
-                f"{rec.get('name', '@')} {rec.get('ttl', ttl)} IN {rec['type']} {rec['value']}"
+                f"{name_field} {rec_ttl} IN {rec['type']} {rec['value']}"
             )
         path.write_text("\n".join(lines) + "\n")
 
@@ -137,11 +159,22 @@ class Bind9Driver(DriverBase):
                 shutil.rmtree(backup)
             current.rename(backup)
         new_dir.rename(current)
-        # Signal daemon
+        # Signal daemon. Try rndc first; if it isn't configured (no rndc.key),
+        # fall back to SIGHUP which named handles as a config + zone reload.
+        rndc_ok = False
         if shutil.which("rndc"):
-            subprocess.run(["rndc", "reconfig"], check=False)
-        else:
-            log.warning("rndc_missing_cannot_reload")
+            res = subprocess.run(
+                ["rndc", "reconfig"], capture_output=True, text=True, check=False
+            )
+            rndc_ok = res.returncode == 0
+            if not rndc_ok:
+                log.warning("rndc_failed_falling_back_to_sighup", stderr=res.stderr.strip())
+        if not rndc_ok and self.daemon_pid:
+            try:
+                os.kill(self.daemon_pid, signal.SIGHUP)
+                log.info("named_sighup_sent", pid=self.daemon_pid)
+            except OSError as e:
+                log.error("named_sighup_failed", error=str(e))
 
     # ── Record ops (RFC 2136 over loopback) ─────────────────────────────────
 
@@ -153,7 +186,9 @@ class Bind9Driver(DriverBase):
         name = rec.get("name") or "@"
         rtype = rec["type"]
         value = rec["value"]
-        ttl = rec.get("ttl", 3600)
+        # rec.get returns None when the field exists with null value (which
+        # is the common case from JSON), so fall back explicitly.
+        ttl = rec.get("ttl") or 3600
 
         tsig_path = self.state_dir / "tsig" / "ddns.key"
         keyring = None
@@ -184,9 +219,11 @@ class Bind9Driver(DriverBase):
         if not conf_path.exists():
             log.warning("named_conf_missing_startup_deferred")
             return
-        # -g: foreground, log to stderr; -u named: drop privs
+        # -g: foreground, log to stderr. We're already running unprivileged
+        # as 'spatium' (entrypoint dropped privs via su-exec), so don't pass
+        # -u — named would try to setgid() to a different user and fail.
         self.daemon_pid = subprocess.Popen(
-            ["named", "-g", "-u", "named", "-c", str(conf_path)]
+            ["named", "-g", "-c", str(conf_path)]
         ).pid
         log.info("named_started", pid=self.daemon_pid)
 

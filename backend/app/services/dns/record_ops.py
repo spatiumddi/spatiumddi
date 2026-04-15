@@ -69,4 +69,7 @@ async def ack_op(db: AsyncSession, op_id: str, result: str, message: str | None 
         op.last_error = message
         if op.attempts >= 5:
             op.state = "failed"
+        else:
+            # Reset to pending so it gets re-shipped in the next bundle.
+            op.state = "pending"
     await db.flush()

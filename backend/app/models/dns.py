@@ -34,6 +34,15 @@ class DNSServerGroup(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     default_view: Mapped[str | None] = mapped_column(String(255), nullable=True)
     is_recursive: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
+    # TSIG key shared by all servers in this group, used to authenticate
+    # RFC 2136 dynamic updates from the agent over loopback. Auto-generated
+    # on first server registration.
+    tsig_key_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    tsig_key_secret: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    tsig_key_algorithm: Mapped[str] = mapped_column(
+        String(50), nullable=False, default="hmac-sha256"
+    )
+
     servers: Mapped[list["DNSServer"]] = relationship(
         "DNSServer", back_populates="group", cascade="all, delete-orphan"
     )

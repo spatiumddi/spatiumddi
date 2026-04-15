@@ -29,6 +29,12 @@ class SyncLoop:
         self.heartbeat = heartbeat
         self._stop = threading.Event()
         self._current_etag: str | None = None
+        # Tracks the structural-only fingerprint of the last applied bundle.
+        # We re-render config + reload the daemon only when this changes.
+        # Record-only changes rotate the full etag (so we get 200 not 304)
+        # but leave structural_etag alone — the agent then drains record ops
+        # via RFC 2136 over loopback without bouncing the daemon.
+        self._current_structural_etag: str | None = None
 
         # Preload cached bundle (offline-operation guarantee)
         bundle, etag = load_config(self.cfg.state_dir)
@@ -36,6 +42,7 @@ class SyncLoop:
             self._current_etag = etag
             try:
                 self.driver.apply_config(bundle)
+                self._current_structural_etag = bundle.get("structural_etag")
                 log.info("dns_agent_bootstrap_from_cache", etag=etag)
             except Exception:
                 log.exception("bootstrap_cache_apply_failed")
@@ -89,27 +96,36 @@ class SyncLoop:
             log.warning("sync_bundle_missing_etag")
             return
 
-        # Atomic-swap cache, then apply
+        # Atomic-swap cache always (cache is the source of truth for restarts)
         save_config(self.cfg.state_dir, bundle, etag)
-        try:
-            self.driver.apply_config(bundle)
-        except Exception as e:
-            log.exception("sync_apply_failed")
-            # keep previous daemon state running, report via heartbeat
-            self.heartbeat.daemon_status = {
-                **self.heartbeat.daemon_status,
-                "status": "degraded",
-                "reason": f"config_validation_failed: {e}",
-            }
-            return
+
+        # Re-render + reload daemon ONLY when structural fingerprint changes.
+        # Record CRUD bumps the full etag but not structural_etag, so the
+        # daemon stays running and ops are applied incrementally below.
+        new_structural = bundle.get("structural_etag")
+        if new_structural != self._current_structural_etag:
+            try:
+                self.driver.apply_config(bundle)
+            except Exception as e:
+                log.exception("sync_apply_failed")
+                self.heartbeat.daemon_status = {
+                    **self.heartbeat.daemon_status,
+                    "status": "degraded",
+                    "reason": f"config_validation_failed: {e}",
+                }
+                return
+            self._current_structural_etag = new_structural
+            log.info("structural_reload_applied", structural_etag=new_structural)
 
         self._current_etag = etag
 
-        # Drain pending record ops
+        # Drain pending record ops via RFC 2136 (no daemon reload)
         for op in bundle.get("pending_record_ops", []) or []:
             try:
                 self.driver.apply_record_op(op)
                 self.heartbeat.pending_acks.append({"op_id": op["op_id"], "result": "ok"})
+                log.info("record_op_applied", op_id=op["op_id"], op=op.get("op"),
+                         zone=op.get("zone_name"))
             except Exception as e:
                 log.exception("op_apply_failed", op_id=op.get("op_id"))
                 self.heartbeat.pending_acks.append(

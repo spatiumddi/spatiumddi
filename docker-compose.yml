@@ -131,9 +131,9 @@ services:
         condition: service_healthy
     restart: "no"
 
-  # ── DNS agent (dev) ─────────────────────────────────────────────────────────
-  # Enable with: docker compose --profile dns up
-  dns-bind9-dev:
+  # ── DNS agent ─────────────────────────────────────────────────────────
+  # Enable with: docker compose --profile dns up -d
+  dns-bind9:
     profiles: ["dns"]
     build:
       context: .
@@ -144,7 +144,7 @@ services:
     environment:
       CONTROL_PLANE_URL: http://api:8000
       DNS_AGENT_KEY: ${DNS_AGENT_KEY:-changeme-dns-agent-key}
-      SERVER_NAME: dns-bind9-dev
+      SERVER_NAME: dns-bind9
       AGENT_GROUP: default
       AGENT_ROLES: authoritative
       SPATIUM_INSECURE_SKIP_TLS_VERIFY: "1"

@@ -10,6 +10,7 @@ from fastapi import APIRouter, HTTPException, Query, status
 from pydantic import BaseModel, field_validator
 from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import selectinload
 
 from app.api.deps import CurrentUser, DB
 from app.api.v1.ipam.io_router import router as io_router
@@ -134,6 +135,59 @@ async def _resolve_effective_zone(db: AsyncSession, subnet: Subnet) -> uuid.UUID
     return None
 
 
+async def _resolve_reverse_zone(
+    db: AsyncSession, subnet: Subnet, ip_addr: ipaddress.IPv4Address | ipaddress.IPv6Address
+) -> DNSZone | None:
+    """Find the reverse zone covering this IP. Prefers a zone linked to the
+    subnet; falls back to any reverse zone in the subnet's DNS group whose
+    name is a suffix of the IP's reverse_pointer."""
+    rev_pointer = ip_addr.reverse_pointer + "."
+    # 1. Subnet-linked reverse zone
+    res = await db.execute(
+        select(DNSZone).where(
+            DNSZone.linked_subnet_id == subnet.id,
+            DNSZone.kind == "reverse",
+        )
+    )
+    z = res.scalar_one_or_none()
+    if z and rev_pointer.endswith("." + z.name.rstrip(".") + "."):
+        return z
+    # 2. Walk effective DNS group(s) for the subnet
+    group_ids = subnet.dns_group_ids or []
+    if not group_ids:
+        return None
+    res = await db.execute(
+        select(DNSZone).where(
+            DNSZone.group_id.in_(group_ids),
+            DNSZone.kind == "reverse",
+        )
+    )
+    candidates = list(res.scalars().all())
+    # Choose the longest matching suffix (most specific)
+    best: DNSZone | None = None
+    for z in candidates:
+        zname = z.name.rstrip(".") + "."
+        if rev_pointer.endswith("." + zname) or rev_pointer == zname:
+            if best is None or len(z.name) > len(best.name):
+                best = z
+    return best
+
+
+async def _enqueue_dns_op(
+    db: AsyncSession, zone: DNSZone, op: str, name: str, rtype: str, value: str, ttl: int | None
+) -> None:
+    """Wrapper to enqueue a record op against the zone's primary server.
+    Imported lazily to avoid circular import."""
+    from app.services.dns.record_ops import enqueue_record_op
+    from app.services.dns.serial import bump_zone_serial
+    target_serial = bump_zone_serial(zone)
+    await enqueue_record_op(
+        db, zone, op,
+        {"name": name, "type": rtype, "value": value, "ttl": ttl},
+        target_serial=target_serial,
+    )
+
+
 async def _sync_dns_record(
     db: AsyncSession,
     ip: IPAddress,
@@ -141,42 +195,57 @@ async def _sync_dns_record(
     zone_id: uuid.UUID | None = None,
     action: str = "create",  # create | update | delete
 ) -> None:
-    """Create, update, or delete the auto-generated A record in DNS for this IP address."""
+    """Create, update, or delete the auto-generated A + PTR records for this IP.
+
+    Forward A goes in the subnet's DNS zone (or explicitly passed zone_id);
+    reverse PTR goes in the matching `kind=reverse` zone. Both records are
+    pushed to the agent via RFC 2136 dynamic update through the record_op queue.
+    """
     if action == "delete":
         result = await db.execute(
             select(DNSRecord).where(
                 DNSRecord.ip_address_id == ip.id,
                 DNSRecord.auto_generated.is_(True),
-            )
+            ).options(selectinload(DNSRecord.zone))
         )
         for record in result.scalars().all():
+            zone = record.zone
+            if zone is not None:
+                await _enqueue_dns_op(
+                    db, zone, "delete",
+                    record.name, record.record_type, record.value, record.ttl,
+                )
             await db.delete(record)
         ip.fqdn = None
+        ip.dns_record_id = None
+        # Preserve forward_zone_id / reverse_zone_id so a later restore knows
+        # which zones to put the records back into.
         return
 
     effective_zone_id = zone_id or await _resolve_effective_zone(db, subnet)
-    if not effective_zone_id:
+    if not effective_zone_id or not ip.hostname:
         return
 
     zone = await db.get(DNSZone, effective_zone_id)
-    if not zone or not ip.hostname:
+    if not zone:
         return
 
     zone_domain = zone.name.rstrip(".")
     fqdn = f"{ip.hostname}.{zone_domain}"
     ip.fqdn = fqdn
 
-    # Find existing auto-generated records for this IP
+    # ── Forward A ───────────────────────────────────────────────────────────
     result = await db.execute(
         select(DNSRecord).where(
             DNSRecord.ip_address_id == ip.id,
             DNSRecord.auto_generated.is_(True),
+            DNSRecord.record_type == "A",
         )
     )
-    existing = result.scalars().all()
+    existing_a = result.scalars().all()
 
-    if not existing:
-        db.add(DNSRecord(
+    if not existing_a:
+        a_rec = DNSRecord(
             zone_id=effective_zone_id,
             name=ip.hostname,
             fqdn=fqdn,
@@ -185,13 +254,21 @@ async def _sync_dns_record(
             auto_generated=True,
             ip_address_id=ip.id,
             created_by_user_id=ip.created_by_user_id,
-        ))
+        )
+        db.add(a_rec)
+        await db.flush()
+        ip.dns_record_id = a_rec.id
+        ip.forward_zone_id = effective_zone_id
+        await _enqueue_dns_op(db, zone, "create", ip.hostname, "A", str(ip.address), None)
     else:
-        for record in existing:
+        for record in existing_a:
             if record.zone_id != effective_zone_id:
-                # Zone changed: swap
+                old_zone = await db.get(DNSZone, record.zone_id)
+                if old_zone is not None:
+                    await _enqueue_dns_op(db, old_zone, "delete",
+                                          record.name, "A", record.value, record.ttl)
                 await db.delete(record)
-                db.add(DNSRecord(
+                new_a = DNSRecord(
                     zone_id=effective_zone_id,
                     name=ip.hostname,
                     fqdn=fqdn,
@@ -200,11 +277,92 @@ async def _sync_dns_record(
                     auto_generated=True,
                     ip_address_id=ip.id,
                     created_by_user_id=ip.created_by_user_id,
-                ))
+                )
+                db.add(new_a)
+                await db.flush()
+                ip.dns_record_id = new_a.id
+                ip.forward_zone_id = effective_zone_id
+                await _enqueue_dns_op(db, zone, "create", ip.hostname, "A", str(ip.address), None)
             else:
+                changed = (
+                    record.name != ip.hostname
+                    or record.value != str(ip.address)
+                )
                 record.name = ip.hostname
                 record.fqdn = fqdn
                 record.value = str(ip.address)
+                if changed:
+                    await _enqueue_dns_op(db, zone, "update", ip.hostname, "A", str(ip.address), record.ttl)
+
+    # ── Reverse PTR ─────────────────────────────────────────────────────────
+    try:
+        ip_obj = ipaddress.ip_address(str(ip.address))
+    except ValueError:
+        return
+    rev_zone = await _resolve_reverse_zone(db, subnet, ip_obj)
+    if rev_zone is None:
+        return  # No reverse zone covers this IP — quietly skip
+
+    rev_pointer_full = ip_obj.reverse_pointer + "."
+    rev_zone_name = rev_zone.name.rstrip(".") + "."
+    # PTR record name is the leading labels stripped of the zone suffix
+    if rev_pointer_full == rev_zone_name:
+        ptr_name = "@"
+    else:
+        ptr_name = rev_pointer_full[: -(len(rev_zone_name) + 1)]
+    ptr_value = fqdn + "."
+
+    result = await db.execute(
+        select(DNSRecord).where(
+            DNSRecord.ip_address_id == ip.id,
+            DNSRecord.auto_generated.is_(True),
+            DNSRecord.record_type == "PTR",
+        )
+    )
+    existing_ptr = result.scalars().all()
+
+    if not existing_ptr:
+        ptr_rec = DNSRecord(
+            zone_id=rev_zone.id,
+            name=ptr_name,
+            fqdn=rev_pointer_full,
+            record_type="PTR",
+            value=ptr_value,
+            auto_generated=True,
+            ip_address_id=ip.id,
+            created_by_user_id=ip.created_by_user_id,
+        )
+        db.add(ptr_rec)
+        ip.reverse_zone_id = rev_zone.id
+        await _enqueue_dns_op(db, rev_zone, "create", ptr_name, "PTR", ptr_value, None)
+    else:
+        for record in existing_ptr:
+            if record.zone_id != rev_zone.id:
+                old_zone = await db.get(DNSZone, record.zone_id)
+                if old_zone is not None:
+                    await _enqueue_dns_op(db, old_zone, "delete",
+                                          record.name, "PTR", record.value, record.ttl)
+                await db.delete(record)
+                new_ptr = DNSRecord(
+                    zone_id=rev_zone.id,
+                    name=ptr_name,
+                    fqdn=rev_pointer_full,
+                    record_type="PTR",
+                    value=ptr_value,
+                    auto_generated=True,
+                    ip_address_id=ip.id,
+                    created_by_user_id=ip.created_by_user_id,
+                )
+                db.add(new_ptr)
+                ip.reverse_zone_id = rev_zone.id
+                await _enqueue_dns_op(db, rev_zone, "create", ptr_name, "PTR", ptr_value, None)
+            else:
+                changed = record.value != ptr_value or record.name != ptr_name
+                record.name = ptr_name
+                record.fqdn = rev_pointer_full
+                record.value = ptr_value
+                if changed:
+                    await _enqueue_dns_op(db, rev_zone, "update", ptr_name, "PTR", ptr_value, record.ttl)
 
 
 def _compute_free_cidrs(
@@ -1348,11 +1506,24 @@ async def update_address(
     for field, value in changes.items():
         setattr(ip, field, value)
 
-    # Sync DNS record if hostname or zone changed
+    # Sync DNS:
+    # - hostname or dns_zone_id changed → update
+    # - status flipped from 'orphan' to a live state AND we have a remembered
+    #   forward_zone_id from before the soft-delete → restore the records
     subnet = await db.get(Subnet, ip.subnet_id)
+    restoring = (
+        old_status == "orphan"
+        and ip.status != "orphan"
+        and ip.hostname
+        and ip.forward_zone_id is not None
+    )
     if subnet and ("hostname" in changes or body.dns_zone_id is not None):
         zone_id = uuid.UUID(body.dns_zone_id) if body.dns_zone_id else None
         await _sync_dns_record(db, ip, subnet, zone_id=zone_id, action="update")
+    elif subnet and restoring:
+        await _sync_dns_record(
+            db, ip, subnet, zone_id=ip.forward_zone_id, action="create"
+        )
 
     db.add(_audit(current_user, "update", "ip_address", str(ip.id),
                   str(ip.address), old_value=old, new_value=changes))

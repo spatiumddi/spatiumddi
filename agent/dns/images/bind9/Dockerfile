@@ -13,14 +13,13 @@ RUN python3 -m pip install --prefix=/install --no-cache-dir --break-system-packa
 FROM alpine:3.20 AS runtime
 RUN apk add --no-cache \
       bind bind-tools \
-      tini \
+      tini su-exec \
       python3 py3-pip \
       ca-certificates tzdata \
  && addgroup -S spatium \
  && adduser -S -G spatium spatium \
- && mkdir -p /var/lib/spatium-dns-agent /var/cache/bind \
- && chown -R spatium:spatium /var/lib/spatium-dns-agent \
- && chown -R named:named /var/cache/bind
+ && mkdir -p /var/lib/spatium-dns-agent /var/cache/bind /var/run/named \
+ && chown -R spatium:spatium /var/lib/spatium-dns-agent /var/cache/bind /var/run/named
 
 COPY --from=agent-build /install /usr/local
 COPY agent/dns/images/bind9/entrypoint.sh /usr/local/bin/spatium-dns-entrypoint
@@ -28,6 +27,7 @@ RUN chmod +x /usr/local/bin/spatium-dns-entrypoint
 
 ENV AGENT_DRIVER=bind9 \
     AGENT_STATE_DIR=/var/lib/spatium-dns-agent \
+    PYTHONPATH=/usr/local/lib/python3.12/site-packages \
     LOG_LEVEL=INFO
 
 VOLUME ["/var/lib/spatium-dns-agent", "/var/cache/bind"]

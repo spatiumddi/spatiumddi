@@ -161,6 +161,24 @@ async def agent_register(
         )
         server = res.scalar_one_or_none()
 
+    # Auto-generate group TSIG key on first registration if not set.
+    # Used by the agent's RFC 2136 dynamic update path over loopback.
+    if not group.tsig_key_secret:
+        import base64
+        import secrets
+        group.tsig_key_name = f"spatium-{group.name}".replace(" ", "-").lower()
+        group.tsig_key_secret = base64.b64encode(secrets.token_bytes(32)).decode()
+        group.tsig_key_algorithm = "hmac-sha256"
+
+    # First server in the group is auto-elected primary so DDNS ops have
+    # somewhere to land. Operator can flip later via API.
+    primary_res = await db.execute(
+        select(DNSServer).where(
+            DNSServer.group_id == group.id, DNSServer.is_primary.is_(True)
+        ).limit(1)
+    )
+    has_primary = primary_res.scalar_one_or_none() is not None
+
     pending_approval = False
     if server is None:
         agent_id = uuid.UUID(body.agent_id) if body.agent_id else uuid.uuid4()
@@ -175,6 +193,7 @@ async def agent_register(
             agent_id=agent_id,
             agent_fingerprint=body.fingerprint,
             pending_approval=False,
+            is_primary=not has_primary,
             notes=f"agent v{body.version}" if body.version else "auto-registered",
         )
         db.add(server)
