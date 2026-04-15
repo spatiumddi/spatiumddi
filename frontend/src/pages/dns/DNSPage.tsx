@@ -561,7 +561,13 @@ function RecordModal({ groupId, zoneId, record, onClose }: { groupId: string; zo
   const [value, setValue] = useState(record?.value ?? "");
   const [ttl, setTtl] = useState(String(record?.ttl ?? ""));
   const [priority, setPriority] = useState(String(record?.priority ?? ""));
+  const [viewId, setViewId] = useState<string>(record?.view_id ?? "");
   const [error, setError] = useState("");
+
+  const { data: views = [] } = useQuery({
+    queryKey: ["dns-views", groupId],
+    queryFn: () => dnsApi.listViews(groupId),
+  });
 
   const showPriority = ["MX", "SRV"].includes(type);
 
@@ -582,6 +588,7 @@ function RecordModal({ groupId, zoneId, record, onClose }: { groupId: string; zo
       value,
       ttl: ttl ? parseInt(ttl, 10) : null,
       priority: priority ? parseInt(priority, 10) : null,
+      view_id: viewId || null,
     });
   }
 
@@ -611,6 +618,14 @@ function RecordModal({ groupId, zoneId, record, onClose }: { groupId: string; zo
             </Field>
           )}
         </div>
+        <Field label="View (optional — scope record to a split-horizon view)">
+          <select className={inputCls} value={viewId} onChange={(e) => setViewId(e.target.value)}>
+            <option value="">All views (default)</option>
+            {views.map((v) => (
+              <option key={v.id} value={v.id}>{v.name}</option>
+            ))}
+          </select>
+        </Field>
         {error && <p className="text-sm text-destructive">{error}</p>}
         <Btns onClose={onClose} pending={mut.isPending} label={record ? "Save" : "Add Record"} />
       </form>
@@ -829,7 +844,22 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
   const { data: servers = [], isFetching } = useQuery({
     queryKey: ["dns-servers", group.id],
     queryFn: () => dnsApi.listServers(group.id),
+    // Refetch frequently so the health dot stays fresh as the Celery
+    // Beat-scheduled dns-health-sweep task updates server rows.
+    refetchInterval: 30_000,
   });
+  const { data: zones = [] } = useQuery({
+    queryKey: ["dns-zones", group.id],
+    queryFn: () => dnsApi.listZones(group.id),
+  });
+
+  const healthCounts = servers.reduce(
+    (acc, s) => {
+      acc[s.status] = (acc[s.status] ?? 0) + 1;
+      return acc;
+    },
+    {} as Record<string, number>,
+  );
 
   const del = useMutation({
     mutationFn: (s: DNSServer) => dnsApi.deleteServer(group.id, s.id),
@@ -842,9 +872,35 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
     syncing: "bg-blue-500/15 text-blue-600",
     error: "bg-red-500/15 text-red-600",
   };
+  const dotCls: Record<string, string> = {
+    active: "bg-emerald-500",
+    unreachable: "bg-red-500",
+    syncing: "bg-blue-500",
+    error: "bg-red-500",
+  };
 
   return (
     <div>
+      {servers.length > 0 && (
+        <div className="mb-4 rounded-md border bg-card p-3">
+          <div className="flex items-center gap-4 flex-wrap text-xs">
+            <span className="font-medium text-muted-foreground uppercase tracking-wider">Health</span>
+            {(["active", "unreachable", "syncing", "error"] as const).map((s) =>
+              healthCounts[s] ? (
+                <span key={s} className="flex items-center gap-1.5">
+                  <span className={`inline-block h-2 w-2 rounded-full ${dotCls[s]}`} />
+                  {healthCounts[s]} {s}
+                </span>
+              ) : null,
+            )}
+            <span className="ml-auto text-muted-foreground">
+              Zone serials: {zones.length === 0
+                ? "no zones"
+                : `${zones.length} zone${zones.length === 1 ? "" : "s"} · all servers assumed consistent (per-server serials arrive in Wave 3)`}
+            </span>
+          </div>
+        </div>
+      )}
       <div className="flex items-center justify-between mb-4">
         <div>
           <span className="text-xs font-medium text-muted-foreground uppercase tracking-wider">DNS Servers</span>
@@ -867,6 +923,10 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
               <Cpu className="h-4 w-4 text-muted-foreground flex-shrink-0" />
               <div>
                 <div className="flex items-center gap-2">
+                  <span
+                    className={`inline-block h-2 w-2 rounded-full ${dotCls[s.status] ?? "bg-muted"}`}
+                    title={`status: ${s.status}${s.last_health_check_at ? ` · last check: ${new Date(s.last_health_check_at).toLocaleString()}` : " · never checked"}`}
+                  />
                   <span className="text-sm font-medium">{s.name}</span>
                   <span className={`inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium ${statusCls[s.status] ?? "bg-muted text-muted-foreground"}`}>{s.status}</span>
                   <span className="inline-flex items-center rounded border px-1.5 py-0.5 text-xs">{s.driver}</span>
@@ -875,6 +935,7 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
                   {s.host}:{s.port}
                   {s.roles.length > 0 && ` · ${s.roles.join(", ")}`}
                   {s.last_sync_at && ` · synced ${new Date(s.last_sync_at).toLocaleDateString()}`}
+                  {s.last_health_check_at && ` · health ${new Date(s.last_health_check_at).toLocaleTimeString()}`}
                 </p>
               </div>
             </div>

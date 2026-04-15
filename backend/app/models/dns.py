@@ -255,6 +255,10 @@ class DNSView(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # evaluation order (lower = first match)
     order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
+    # View-level query control overrides — fall back to server options when null
+    allow_query: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+    allow_query_cache: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+
     group: Mapped["DNSServerGroup"] = relationship("DNSServerGroup", back_populates="views")
     zones: Mapped[list["DNSZone"]] = relationship("DNSZone", back_populates="view")
     blocklists: Mapped[list["DNSBlockList"]] = relationship(

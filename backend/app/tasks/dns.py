@@ -1,9 +1,11 @@
-"""DNS background tasks (blocklist feed refresh, zone push, etc.)."""
+"""DNS background tasks (blocklist feed refresh, agent stale sweep, health checks)."""
 
 from __future__ import annotations
 
 import asyncio
-from datetime import UTC, datetime
+import socket
+import uuid
+from datetime import UTC, datetime, timedelta
 
 import httpx
 import structlog
@@ -12,8 +14,14 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.celery_app import celery_app
 from app.config import settings
-from app.models.dns import DNSBlockList, DNSBlockListEntry
+from app.db import AsyncSessionLocal
+from app.models.dns import DNSBlockList, DNSBlockListEntry, DNSServer
 from app.services.dns_blocklist import parse_feed
+
+# If an agent hasn't heartbeat'd in this long, we fall back to an active probe.
+AGENT_STALE_AFTER = timedelta(seconds=120)
+# Timeout for a SOA probe against the server.
+DNS_PROBE_TIMEOUT = 3.0
 
 logger = structlog.get_logger(__name__)
 
@@ -162,3 +170,92 @@ async def _dns_agent_stale_sweep_async() -> dict[str, int]:
 def agent_stale_sweep() -> dict[str, int]:
     """Celery beat task — runs every 60s, flips stale agents to 'unreachable'."""
     return asyncio.run(_dns_agent_stale_sweep_async())
+async def _probe_server_soa(host: str, port: int) -> bool:
+    """Send an SOA query for "." to ``host:port`` using ``dnspython``.
+
+    Returns True if any response is received, False otherwise. Kept deliberately
+    minimal — a deep health driver for BIND9/PowerDNS lives in the Wave 2
+    driver abstraction layer.
+    """
+    try:
+        import dns.asyncquery
+        import dns.message
+        import dns.rdatatype
+    except ImportError:  # dnspython optional — treat as unreachable
+        logger.warning("dns_probe_dnspython_missing")
+        return False
+
+    try:
+        msg = dns.message.make_query(".", dns.rdatatype.SOA)
+        # Resolve hostname if needed (a.k.a. "10.0.0.5" also works)
+        try:
+            ip = socket.gethostbyname(host)
+        except OSError:
+            ip = host
+        await dns.asyncquery.udp(msg, ip, port=port, timeout=DNS_PROBE_TIMEOUT)
+        return True
+    except Exception as exc:  # noqa: BLE001 — any failure = unreachable
+        logger.debug("dns_probe_failed", host=host, port=port, error=str(exc))
+        return False
+
+
+async def _check_health(server_id: uuid.UUID) -> None:
+    async with AsyncSessionLocal() as db:
+        server = await db.get(DNSServer, server_id)
+        if server is None:
+            logger.info("dns_health_server_missing", server_id=str(server_id))
+            return
+
+        now = datetime.now(UTC)
+        new_status: str
+
+        # If the agent heartbeat is fresh, trust it.
+        last_seen = server.last_health_check_at
+        if last_seen is not None and (now - last_seen) <= AGENT_STALE_AFTER and server.status == "active":
+            new_status = "active"
+        else:
+            reachable = await _probe_server_soa(server.host, server.port)
+            new_status = "active" if reachable else "unreachable"
+
+        server.status = new_status
+        server.last_health_check_at = now
+        await db.commit()
+
+        logger.info(
+            "dns_health_checked",
+            server_id=str(server_id),
+            status=new_status,
+            host=server.host,
+        )
+
+
+@celery_app.task(
+    name="app.tasks.dns.check_dns_server_health",
+    bind=True,
+    max_retries=3,
+    acks_late=True,
+)
+def check_dns_server_health(self: object, server_id: str) -> None:  # type: ignore[type-arg]
+    """Celery entry point for a single-server health check. Idempotent."""
+    try:
+        asyncio.run(_check_health(uuid.UUID(server_id)))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("dns_health_check_error", server_id=server_id, error=str(exc))
+        raise self.retry(exc=exc, countdown=30) from exc  # type: ignore[attr-defined]
+
+
+async def _enqueue_all() -> None:
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(select(DNSServer.id))
+        ids = [str(row[0]) for row in result.all()]
+    for sid in ids:
+        check_dns_server_health.delay(sid)
+
+
+@celery_app.task(name="app.tasks.dns.check_all_dns_servers_health", bind=True)
+def check_all_dns_servers_health(self: object) -> None:  # type: ignore[type-arg]
+    """Fan-out task: enqueue one health check per registered DNS server.
+
+    Scheduled every 60s by Celery Beat — see ``app.celery_app.beat_schedule``.
+    """
+    asyncio.run(_enqueue_all())

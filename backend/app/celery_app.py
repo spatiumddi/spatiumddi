@@ -1,4 +1,5 @@
 from celery import Celery
+from celery.schedules import schedule
 
 from app.config import settings
 
@@ -31,5 +32,12 @@ celery_app.conf.update(
     task_routes={
         "app.tasks.ipam.*": {"queue": "ipam"},
         "app.tasks.dns.*": {"queue": "dns"},
+    },
+    beat_schedule={
+        # Every 60s, fan-out health checks to every registered DNS server.
+        "dns-health-sweep": {
+            "task": "app.tasks.dns.check_all_dns_servers_health",
+            "schedule": schedule(run_every=60.0),
+        },
     },
 )

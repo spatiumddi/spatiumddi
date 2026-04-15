@@ -383,6 +383,13 @@ class SubnetCreate(BaseModel):
     gateway: str | None = None          # None → auto-assign first usable IP
     status: str = "active"
     skip_auto_addresses: bool = False   # True for loopbacks/P2P — skips network/broadcast/gateway records
+    # Reverse-zone auto-create controls (see services/dns/reverse_zone.py).
+    # The matching reverse zone is created automatically when dns_group_id or
+    # dns_zone_id is supplied (or inherited via a future IPAM column); opt out
+    # with skip_reverse_zone=True.
+    dns_group_id: uuid.UUID | None = None
+    dns_zone_id: uuid.UUID | None = None
+    skip_reverse_zone: bool = False
     dns_servers: list[str] | None = None
     domain_name: str | None = None
     ntp_servers: list[str] | None = None
@@ -964,7 +971,17 @@ async def create_subnet(body: SubnetCreate, current_user: CurrentUser, db: DB) -
     total = _total_ips(net)
 
     subnet = Subnet(
-        **{**body.model_dump(exclude={"skip_auto_addresses"}), "network": canonical},
+        **{
+            **body.model_dump(
+                exclude={
+                    "skip_auto_addresses",
+                    "skip_reverse_zone",
+                    "dns_group_id",
+                    "dns_zone_id",
+                }
+            ),
+            "network": canonical,
+        },
         total_ips=total,
         utilization_percent=0.0,
         allocated_ips=0,
@@ -1017,6 +1034,25 @@ async def create_subnet(body: SubnetCreate, current_user: CurrentUser, db: DB) -
         await _update_utilization(db, subnet.id)
 
     await _update_block_utilization(db, subnet.block_id)
+
+    # Auto-create the matching reverse zone if a DNS assignment was supplied
+    # (or will be inherited, once the IPAM model carries dns_group_ids).
+    if not body.skip_reverse_zone and (
+        body.dns_group_id
+        or body.dns_zone_id
+        or getattr(subnet, "dns_zone_id", None)
+        or getattr(subnet, "dns_group_ids", None)
+    ):
+        from app.services.dns.reverse_zone import ensure_reverse_zone_for_subnet
+
+        await ensure_reverse_zone_for_subnet(
+            db,
+            subnet,
+            current_user,
+            dns_group_id=body.dns_group_id,
+            dns_zone_id=body.dns_zone_id,
+        )
+
     await db.commit()
     await db.refresh(subnet)
     logger.info("subnet_created", subnet_id=str(subnet.id), network=canonical,

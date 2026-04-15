@@ -602,6 +602,8 @@ export interface DNSView {
   match_destinations: string[];
   recursion: boolean;
   order: number;
+  allow_query: string[] | null;
+  allow_query_cache: string[] | null;
   created_at: string;
   modified_at: string;
 }

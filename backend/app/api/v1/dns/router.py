@@ -292,6 +292,9 @@ class ViewCreate(BaseModel):
     match_destinations: list[str] = []
     recursion: bool = True
     order: int = 0
+    # View-level query control overrides (fall back to server-group options if null)
+    allow_query: list[str] | None = None
+    allow_query_cache: list[str] | None = None
 
 
 class ViewUpdate(BaseModel):
@@ -301,6 +304,8 @@ class ViewUpdate(BaseModel):
     match_destinations: list[str] | None = None
     recursion: bool | None = None
     order: int | None = None
+    allow_query: list[str] | None = None
+    allow_query_cache: list[str] | None = None
 
 
 class ViewResponse(BaseModel):
@@ -312,6 +317,8 @@ class ViewResponse(BaseModel):
     match_destinations: list[str]
     recursion: bool
     order: int
+    allow_query: list[str] | None = None
+    allow_query_cache: list[str] | None = None
     created_at: datetime
     modified_at: datetime
 
@@ -357,6 +364,7 @@ class ZoneUpdate(BaseModel):
     name: str | None = None
     view_id: uuid.UUID | None = None
     zone_type: str | None = None
+    kind: str | None = None
     ttl: int | None = None
     refresh: int | None = None
     retry: int | None = None
@@ -365,10 +373,25 @@ class ZoneUpdate(BaseModel):
     primary_ns: str | None = None
     admin_email: str | None = None
     dnssec_enabled: bool | None = None
+    linked_subnet_id: uuid.UUID | None = None
     allow_query: list[str] | None = None
     allow_transfer: list[str] | None = None
     also_notify: list[str] | None = None
     notify_enabled: str | None = None
+
+    @field_validator("zone_type")
+    @classmethod
+    def validate_zone_type(cls, v: str | None) -> str | None:
+        if v is not None and v not in VALID_ZONE_TYPES:
+            raise ValueError(f"zone_type must be one of {sorted(VALID_ZONE_TYPES)}")
+        return v
+
+    @field_validator("notify_enabled")
+    @classmethod
+    def validate_notify(cls, v: str | None) -> str | None:
+        if v is not None and v not in VALID_NOTIFY:
+            raise ValueError(f"notify_enabled must be one of {sorted(VALID_NOTIFY)}")
+        return v
 
 
 class ZoneResponse(BaseModel):
@@ -429,6 +452,7 @@ class RecordUpdate(BaseModel):
     priority: int | None = None
     weight: int | None = None
     port: int | None = None
+    view_id: uuid.UUID | None = None
 
 
 class RecordResponse(BaseModel):
