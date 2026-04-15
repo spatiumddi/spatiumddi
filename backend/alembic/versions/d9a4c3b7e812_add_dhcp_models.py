@@ -13,9 +13,7 @@ from alembic import op
 from sqlalchemy.dialects import postgresql
 
 revision = "d9a4c3b7e812"
-# This worktree has no prior revisions on disk; set at apply time to the
-# current head of the target environment (use `alembic history` to confirm).
-down_revision: str | None = None
+down_revision: str | None = "a9b3c7d5e2f1"
 branch_labels = None
 depends_on = None
 
