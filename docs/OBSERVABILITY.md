@@ -37,7 +37,7 @@ All services use `structlog` configured to emit **newline-delimited JSON** (NDJS
 |---|---|
 | `timestamp` | ISO 8601 UTC with milliseconds |
 | `level` | `debug`, `info`, `warning`, `error`, `critical` |
-| `service` | `api`, `worker`, `beat`, `agent`, `dhcp`, `dns`, `ntp` |
+| `service` | `api`, `worker`, `beat`, `agent`, `dhcp`, `dns` |
 | `instance` | Hostname or pod name |
 | `request_id` | UUID, passed through as `X-Request-ID` header |
 
@@ -56,7 +56,7 @@ All service logs are shipped to a central log store. The log store is configurab
 ### Log Pipeline
 
 ```
-Each service (API, Worker, Agents, DHCP, DNS, NTP)
+Each service (API, Worker, Agents, DHCP, DNS)
         ↓ stdout (NDJSON)
 Log Collector (Vector / Promtail / Fluentd — one sidecar or DaemonSet)
         ↓
@@ -93,7 +93,7 @@ The admin UI includes a **Log Explorer** page at `/admin/logs`.
 ### Features
 
 **Filtering:**
-- Service filter (multi-select: api, worker, agent, dhcp, dns, ntp)
+- Service filter (multi-select: api, worker, agent, dhcp, dns)
 - Level filter (debug/info/warning/error/critical)
 - Time range picker (preset: last 15m, 1h, 6h, 24h, 7d — or custom range)
 - Free-text search (searches `event` and all string fields)

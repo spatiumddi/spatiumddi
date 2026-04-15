@@ -2,7 +2,7 @@
 
 ## Overview
 
-The IPAM module is the core of SpatiumDDI. It manages the hierarchy of IP space from broad routing domains down to individual IP addresses. All other modules (DHCP, DNS, NTP) reference IPAM resources.
+The IPAM module is the core of SpatiumDDI. It manages the hierarchy of IP space from broad routing domains down to individual IP addresses. All other modules (DHCP, DNS) reference IPAM resources.
 
 ---
 
@@ -87,9 +87,6 @@ Subnet
   -- DHCP
   dhcp_scope_id (FK → DHCPScope, nullable)
   dhcp_server_group_id (FK → DHCPServerGroup, nullable)
-  
-  -- NTP
-  ntp_servers: inet[] (nullable)              -- pushed to DHCP clients
   
   -- Status / Metadata
   status: enum(active, deprecated, reserved, quarantine)
@@ -357,7 +354,6 @@ Settings can be defined at the **IPSpace** or **IPBlock** level and inherited by
 |---|---|
 | `domain_name` | Yes — subnet inherits space/block domain, can override |
 | `dns_servers` | Yes |
-| `ntp_servers` | Yes |
 | `dhcp_server_group_id` | Yes |
 | `tags` | Merged (parent tags + subnet tags) |
 | `custom_fields` | Merged (parent defaults + subnet overrides) |

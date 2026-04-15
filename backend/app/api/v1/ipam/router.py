@@ -612,7 +612,6 @@ class SubnetCreate(BaseModel):
     skip_reverse_zone: bool = False
     dns_servers: list[str] | None = None
     domain_name: str | None = None
-    ntp_servers: list[str] | None = None
     tags: dict[str, Any] = {}
     custom_fields: dict[str, Any] = {}
     dns_group_ids: list[str] = []
@@ -656,7 +655,6 @@ class SubnetUpdate(BaseModel):
     status: str | None = None
     dns_servers: list[str] | None = None
     domain_name: str | None = None
-    ntp_servers: list[str] | None = None
     tags: dict[str, Any] | None = None
     custom_fields: dict[str, Any] | None = None
     # When True: remove network/broadcast/gateway auto records.
@@ -694,7 +692,6 @@ class SubnetResponse(BaseModel):
     allocated_ips: int
     dns_servers: list[str] | None
     domain_name: str | None
-    ntp_servers: list[str] | None
     tags: dict[str, Any]
     custom_fields: dict[str, Any]
     dns_group_ids: list[str] | None

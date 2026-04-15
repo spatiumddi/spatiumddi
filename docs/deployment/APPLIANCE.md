@@ -52,7 +52,7 @@ SpatiumDDI can be shipped as a **self-contained OS appliance image** — a boota
 - `glibc` — full compatibility with all Python C extensions
 - `systemd` — industry standard, best documentation
 - `apt` with `stable` channel — predictable, LTS lifecycle
-- ISC Kea, BIND9, Chrony all have well-maintained `.deb` packages
+- ISC Kea and BIND9 both have well-maintained `.deb` packages
 - Debian itself is 100% free software (DFSG-compliant)
 
 **Cons:**
@@ -159,7 +159,6 @@ On first boot, the appliance runs an interactive **first-boot wizard** (served v
 **Step 4: Optional Services**
 - Enable DHCP server on this appliance?
 - Enable DNS server on this appliance?
-- Enable NTP server on this appliance?
 
 **Step 5: TLS**
 - Generate self-signed certificate
@@ -233,7 +232,7 @@ Applied to both Alpine and Debian appliance images:
 - Core dumps disabled
 - `/tmp` mounted as `tmpfs` (no-exec, no-suid)
 - SSH: `PermitRootLogin no`, `PasswordAuthentication no` (key-only), `Protocol 2`
-- All services run as non-root system users (`spatiumddi`, `kea`, `named`, `chrony`)
+- All services run as non-root system users (`spatiumddi`, `kea`, `named`)
 - AppArmor profiles (Debian) or seccomp profiles (Docker) for service isolation
 - CIS Benchmark hardening script applied at image build time
 - Image signed with GPG; checksum published

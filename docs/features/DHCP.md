@@ -64,7 +64,6 @@ DHCPScope
     "routers": ["10.1.2.1"],
     "domain-name-servers": ["10.0.0.53", "10.0.0.54"],
     "domain-name": "internal.example.com",
-    "ntp-servers": ["10.0.0.123"],
     "domain-search": ["internal.example.com", "example.com"],
     "tftp-server-name": "10.0.0.10",   -- for PXE
     "bootfile-name": "pxelinux.0",
@@ -324,7 +323,6 @@ The following standard DHCP options can be configured at the scope, pool, or hos
 | 12 | Host Name | Override hostname sent to client |
 | 15 | Domain Name | DNS search domain (e.g., corp.example.com) |
 | 28 | Broadcast Address | Auto-computed |
-| 42 | NTP Servers | NTP server IPs |
 | 43 | Vendor Specific | Raw hex or vendor-specific encapsulated options |
 | 51 | IP Address Lease Time | Seconds; default lease time |
 | 58 | Renewal Time | T1 (default: 50% of lease time) |
@@ -355,11 +353,9 @@ Example:
 ```
 IPSpace: Corporate
   domain-name: corp.example.com
-  ntp-servers: 10.0.0.123
 
   Subnet: 10.1.2.0/24 (HR VLAN)
     domain-name: hr.corp.example.com   ← overrides parent
-    ntp-servers: (inherited)           ← 10.0.0.123 still applies
 
     DHCPPool: Guest
       domain-name: guest.corp.example.com  ← overrides subnet

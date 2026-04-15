@@ -22,9 +22,9 @@ Each managed component shows a status card:
 │  ● ONLINE    │  ● PRIMARY   │  ● ONLINE    │  ● 3 workers  │
 │  3 replicas  │  + 2 replicas│  Sentinel ✓  │  0 pending    │
 ├──────────────┼──────────────┼──────────────┼───────────────┤
-│ DHCP Servers │ DNS Servers  │  NTP Servers │  Log Store    │
-│  2/2 online  │  3/4 online  │  2/2 online  │  ● ONLINE     │
-│  ⚠ kea-02   │  ⚠ bind-03  │              │  12.4 GB used │
+│ DHCP Servers │ DNS Servers  │  Log Store    │               │
+│  2/2 online  │  3/4 online  │  ● ONLINE     │               │
+│  ⚠ kea-02   │  ⚠ bind-03  │  12.4 GB used │               │
 └──────────────┴──────────────┴──────────────┴───────────────┘
 ```
 
@@ -60,7 +60,7 @@ Clicking any component opens a detail panel:
 ### Service Start / Stop / Restart
 
 From the Health Dashboard, superadmins can:
-- **Start / Stop / Restart** any managed service (DHCP daemon, DNS daemon, NTP daemon, Celery workers, API)
+- **Start / Stop / Restart** any managed service (DHCP daemon, DNS daemon, Celery workers, API)
 - **Force sync** any DHCP or DNS server (push current config immediately)
 - **Test connectivity** to any backend server
 
@@ -126,18 +126,6 @@ Default ruleset (enforced, cannot be deleted):
 - Allow: all established/related
 - Deny: all other inbound
 
-### 2.3 Time and Date Configuration
-
-```
-TimeConfig
-  node_id (nullable — null = global default)
-  timezone: str          -- IANA timezone, e.g., "America/New_York"
-  ntp_servers: str[]     -- upstream NTP servers for the node itself
-  ntp_sync_enabled: bool
-```
-
-Also shows current time on each node and NTP sync status (stratum, offset, jitter).
-
 ### 2.4 Users and Groups (Platform-Level)
 
 Separate from IP-range-scoped permissions — this section manages:
@@ -183,7 +171,7 @@ SyslogTarget
   severity_filter: enum(debug, info, warning, error, critical)
   tls_ca_cert: text (nullable)
   is_enabled: bool
-  applies_to: [enum(api, agent, dhcp, dns, ntp, audit)]
+  applies_to: [enum(api, agent, dhcp, dns, audit)]
 ```
 
 Multiple syslog targets can be configured simultaneously (e.g., local Loki + remote SIEM).
@@ -329,7 +317,7 @@ A physical or virtual server can run **multiple SpatiumDDI service roles simulta
 ```
 ManagedServer
   id, name, hostname, ip_address
-  roles: [enum(api, worker, dhcp, dns, ntp, agent)]
+  roles: [enum(api, worker, dhcp, dns, agent)]
   platform: enum(bare_metal, vm, docker, kubernetes_pod)
   os_info: JSONB         -- populated by agent heartbeat
   agent_version: str
@@ -347,7 +335,7 @@ From the UI, a managed server card shows:
 - Link to per-role configuration
 - Start/stop individual roles
 
-This allows a small deployment where one VM runs DHCP + DNS + NTP agent simultaneously, and the UI correctly represents that.
+This allows a small deployment where one VM runs DHCP + DNS agents simultaneously, and the UI correctly represents that.
 
 ---
 
