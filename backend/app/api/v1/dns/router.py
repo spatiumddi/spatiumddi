@@ -38,7 +38,7 @@ from app.services.dns_io import (
 logger = structlog.get_logger(__name__)
 router = APIRouter()
 
-VALID_DRIVERS = {"bind9", "powerdns"}
+VALID_DRIVERS = {"bind9"}
 VALID_GROUP_TYPES = {"internal", "external", "dmz", "custom"}
 VALID_ZONE_TYPES = {"primary", "secondary", "stub", "forward"}
 VALID_RECORD_TYPES = {"A", "AAAA", "CNAME", "MX", "TXT", "NS", "PTR", "SRV", "CAA", "TLSA", "SSHFP", "NAPTR", "LOC"}
@@ -192,6 +192,13 @@ class ServerOptionsUpdate(BaseModel):
     allow_query_cache: list[str] | None = None
     allow_transfer: list[str] | None = None
     blackhole: list[str] | None = None
+    query_log_enabled: bool | None = None
+    query_log_channel: str | None = None
+    query_log_file: str | None = None
+    query_log_severity: str | None = None
+    query_log_print_category: bool | None = None
+    query_log_print_severity: bool | None = None
+    query_log_print_time: bool | None = None
 
     @field_validator("forward_policy")
     @classmethod
@@ -234,6 +241,13 @@ class ServerOptionsResponse(BaseModel):
     allow_query_cache: list[str]
     allow_transfer: list[str]
     blackhole: list[str]
+    query_log_enabled: bool
+    query_log_channel: str
+    query_log_file: str
+    query_log_severity: str
+    query_log_print_category: bool
+    query_log_print_severity: bool
+    query_log_print_time: bool
     trust_anchors: list[TrustAnchorResponse]
     modified_at: datetime
 
@@ -699,7 +713,7 @@ async def apply_record(
     The control plane bumps the zone serial, marks the zone ``last_pushed_at``
     now, and returns 202. The agent running alongside the daemon picks this up
     through its long-poll config channel and executes the matching loopback
-    nsupdate (BIND9) / REST call (PowerDNS).
+    nsupdate via RFC 2136.
     """
     server = await db.get(DNSServer, server_id)
     if server is None:

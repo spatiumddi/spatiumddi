@@ -1,10 +1,12 @@
 import { useState, useEffect, useRef } from "react";
 import { useLocation, useSearchParams } from "react-router-dom";
+import { useStickyLocation } from "@/lib/stickyLocation";
+import { useSessionState } from "@/lib/useSessionState";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   Globe, Plus, Trash2, Pencil, ChevronDown, ChevronRight,
   Settings2, Shield, Eye, FileText, Layers, RefreshCw, X, Cpu,
-  FolderOpen, Folder, Upload, Download, Ban, Lock, Info,
+  FolderOpen, Folder, Upload, Download, Ban, Lock, Info, Filter,
 } from "lucide-react";
 import {
   dnsApi,
@@ -434,7 +436,6 @@ function ServerModal({ groupId, server, onClose }: { groupId: string; server?: D
           <Field label="Driver">
             <select className={inputCls} value={driver} onChange={(e) => setDriver(e.target.value)}>
               <option value="bind9">BIND9</option>
-              <option value="powerdns">PowerDNS</option>
             </select>
           </Field>
         </div>
@@ -554,10 +555,11 @@ function ZoneModal({ groupId, views, zone, onClose }: { groupId: string; views: 
 
 const RECORD_TYPES = ["A", "AAAA", "CNAME", "MX", "TXT", "NS", "PTR", "SRV", "CAA", "TLSA", "SSHFP", "NAPTR", "LOC"];
 
-function RecordModal({ groupId, zoneId, record, onClose }: { groupId: string; zoneId: string; record?: DNSRecord; onClose: () => void }) {
+function RecordModal({ groupId, zoneId, zoneName, record, onClose }: { groupId: string; zoneId: string; zoneName?: string; record?: DNSRecord; onClose: () => void }) {
   const qc = useQueryClient();
+  const isReverseZone = !!zoneName && /\.(in-addr|ip6)\.arpa\.?$/i.test(zoneName);
   const [name, setName] = useState(record?.name ?? "");
-  const [type, setType] = useState(record?.record_type ?? "A");
+  const [type, setType] = useState(record?.record_type ?? (isReverseZone ? "PTR" : "A"));
   const [value, setValue] = useState(record?.value ?? "");
   const [ttl, setTtl] = useState(String(record?.ttl ?? ""));
   const [priority, setPriority] = useState(String(record?.priority ?? ""));
@@ -606,7 +608,7 @@ function RecordModal({ groupId, zoneId, record, onClose }: { groupId: string; zo
           </Field>
         </div>
         <Field label="Value">
-          <input className={inputCls} value={value} onChange={(e) => setValue(e.target.value)} placeholder={type === "A" ? "10.0.0.1" : type === "CNAME" ? "other.example.com." : "record value"} required />
+          <input className={inputCls} value={value} onChange={(e) => setValue(e.target.value)} placeholder={type === "A" ? "10.0.0.1" : type === "CNAME" ? "other.example.com." : type === "PTR" ? "host.example.com." : "record value"} required />
         </Field>
         <div className="grid grid-cols-2 gap-3">
           <Field label="TTL (leave blank for zone default)">
@@ -641,8 +643,9 @@ function ZoneDetailView({ group, zone, onDeleted }: { group: DNSServerGroup; zon
   const [editRecord, setEditRecord] = useState<DNSRecord | null>(null);
   const [showEditZone, setShowEditZone] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
-  const [typeFilter, setTypeFilter] = useState("");
   const [showImport, setShowImport] = useState(false);
+  const [showRecFilters, setShowRecFilters] = useState(false);
+  const [recFilter, setRecFilter] = useState({ name: "", type: "", value: "" });
 
   const handleExport = async () => {
     const text = await dnsApi.exportZone(group.id, zone.id);
@@ -668,8 +671,14 @@ function ZoneDetailView({ group, zone, onDeleted }: { group: DNSServerGroup; zon
     onSuccess: () => qc.invalidateQueries({ queryKey: ["dns-records", zone.id] }),
   });
 
-  const filtered = typeFilter ? records.filter((r) => r.record_type === typeFilter) : records;
   const recordTypes = [...new Set(records.map((r) => r.record_type))].sort();
+  const hasRecFilter = Object.values(recFilter).some(Boolean);
+  const filtered = records.filter((r) => {
+    if (recFilter.name && !r.name.toLowerCase().includes(recFilter.name.toLowerCase())) return false;
+    if (recFilter.type && r.record_type !== recFilter.type) return false;
+    if (recFilter.value && !r.value.toLowerCase().includes(recFilter.value.toLowerCase())) return false;
+    return true;
+  });
 
   const typeBadge: Record<string, string> = {
     A: "bg-blue-500/15 text-blue-600",
@@ -719,51 +728,85 @@ function ZoneDetailView({ group, zone, onDeleted }: { group: DNSServerGroup; zon
         </div>
       </div>
 
-      {/* Filter bar */}
-      <div className="flex items-center gap-2 border-b px-5 py-2">
-        <span className="text-xs text-muted-foreground">{records.length} record{records.length !== 1 ? "s" : ""}</span>
-        {recordTypes.length > 0 && (
-          <div className="flex items-center gap-1 ml-2">
-            <button
-              onClick={() => setTypeFilter("")}
-              className={`rounded px-2 py-0.5 text-xs ${!typeFilter ? "bg-primary text-primary-foreground" : "hover:bg-accent"}`}
-            >
-              All
-            </button>
-            {recordTypes.map((t) => (
-              <button
-                key={t}
-                onClick={() => setTypeFilter(typeFilter === t ? "" : t)}
-                className={`rounded px-2 py-0.5 text-xs ${typeFilter === t ? "bg-primary text-primary-foreground" : "hover:bg-accent"}`}
-              >
-                {t}
-              </button>
-            ))}
-          </div>
-        )}
-      </div>
-
       {/* Records table */}
       <div className="flex-1 overflow-auto">
         {isFetching && records.length === 0 && <p className="px-5 py-4 text-sm text-muted-foreground">Loading…</p>}
         {filtered.length === 0 && !isFetching && (
           <div className="flex flex-col items-center justify-center h-40">
             <p className="text-sm text-muted-foreground italic">
-              {typeFilter ? `No ${typeFilter} records.` : "No records yet. Click \"Add Record\" to create one."}
+              {hasRecFilter ? "No records match the current filter." : "No records yet. Click \"Add Record\" to create one."}
             </p>
           </div>
         )}
-        {filtered.length > 0 && (
+        {(filtered.length > 0 || showRecFilters) && (
           <table className="w-full text-sm">
             <thead className="sticky top-0 bg-card">
               <tr className="border-b text-xs text-muted-foreground">
-                <th className="py-2 pl-5 text-left font-medium">Name</th>
-                <th className="py-2 text-left font-medium">Type</th>
-                <th className="py-2 text-left font-medium">Value</th>
-                <th className="py-2 text-left font-medium">TTL</th>
-                <th className="py-2 text-left font-medium">Pri</th>
-                <th className="py-2 pr-3" />
+                {(["Name", "Type", "Value", "TTL", "Pri"] as const).map((col) => {
+                  const filterKey = col === "Name" ? "name" : col === "Type" ? "type" : col === "Value" ? "value" : null;
+                  const hasFilter = filterKey ? !!recFilter[filterKey as keyof typeof recFilter] : false;
+                  return (
+                    <th key={col} className={col === "Name" ? "py-2 pl-5 text-left font-medium" : "py-2 text-left font-medium"}>
+                      <span className="inline-flex items-center gap-1">
+                        {col}
+                        {filterKey && (
+                          <button
+                            onClick={() => setShowRecFilters((v) => !v)}
+                            title={`Filter by ${col}`}
+                            className={`rounded p-0.5 hover:bg-accent ${hasFilter ? "text-primary" : (showRecFilters || hasRecFilter) ? "text-primary/50" : "text-muted-foreground/40 hover:text-muted-foreground"}`}
+                          >
+                            <Filter className="h-2.5 w-2.5" />
+                          </button>
+                        )}
+                      </span>
+                    </th>
+                  );
+                })}
+                <th className="py-2 pr-3 text-right">
+                  {hasRecFilter && (
+                    <button
+                      onClick={() => setRecFilter({ name: "", type: "", value: "" })}
+                      title="Clear filters"
+                      className="rounded p-0.5 text-primary hover:text-destructive"
+                    >
+                      <X className="h-3 w-3" />
+                    </button>
+                  )}
+                </th>
               </tr>
+              {showRecFilters && (
+                <tr className="border-b bg-muted/10 text-xs">
+                  <td className="px-2 py-1 pl-5">
+                    <input
+                      type="text"
+                      value={recFilter.name}
+                      onChange={(e) => setRecFilter((f) => ({ ...f, name: e.target.value }))}
+                      placeholder="Filter…"
+                      className="w-full rounded border border-border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
+                    />
+                  </td>
+                  <td className="px-2 py-1">
+                    <select
+                      value={recFilter.type}
+                      onChange={(e) => setRecFilter((f) => ({ ...f, type: e.target.value }))}
+                      className="w-full rounded border border-border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
+                    >
+                      <option value="">All</option>
+                      {recordTypes.map((t) => <option key={t} value={t}>{t}</option>)}
+                    </select>
+                  </td>
+                  <td className="px-2 py-1">
+                    <input
+                      type="text"
+                      value={recFilter.value}
+                      onChange={(e) => setRecFilter((f) => ({ ...f, value: e.target.value }))}
+                      placeholder="Filter…"
+                      className="w-full rounded border border-border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
+                    />
+                  </td>
+                  <td /><td /><td />
+                </tr>
+              )}
             </thead>
             <tbody>
               {filtered.map((r) => (
@@ -815,8 +858,8 @@ function ZoneDetailView({ group, zone, onDeleted }: { group: DNSServerGroup; zon
         )}
       </div>
 
-      {showAddRecord && <RecordModal groupId={group.id} zoneId={zone.id} onClose={() => setShowAddRecord(false)} />}
-      {editRecord    && <RecordModal groupId={group.id} zoneId={zone.id} record={editRecord} onClose={() => setEditRecord(null)} />}
+      {showAddRecord && <RecordModal groupId={group.id} zoneId={zone.id} zoneName={zone.name} onClose={() => setShowAddRecord(false)} />}
+      {editRecord    && <RecordModal groupId={group.id} zoneId={zone.id} zoneName={zone.name} record={editRecord} onClose={() => setEditRecord(null)} />}
       {showEditZone  && <ZoneModal groupId={group.id} views={views} zone={zone} onClose={() => setShowEditZone(false)} />}
       {showImport    && <ImportZoneModal groupId={group.id} zone={zone} onClose={() => setShowImport(false)} />}
       {confirmDelete && (
@@ -905,7 +948,7 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
         <div>
           <span className="text-xs font-medium text-muted-foreground uppercase tracking-wider">DNS Servers</span>
           <p className="text-xs text-muted-foreground mt-0.5">
-            Servers can also be auto-registered by BIND9/PowerDNS agent containers using the <code className="font-mono">DNS_AGENT_KEY</code> env var.
+            Servers can also be auto-registered by BIND9 agent containers using the <code className="font-mono">DNS_AGENT_KEY</code> env var.
           </p>
         </div>
         <button className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent" onClick={() => setShowAdd(true)}>
@@ -1122,6 +1165,10 @@ function OptionsTab({ groupId }: { groupId: string }) {
   const [notifyEnabled, setNotifyEnabled] = useState("yes");
   const [allowQuery, setAllowQuery] = useState("any");
   const [allowTransfer, setAllowTransfer] = useState("none");
+  const [queryLogEnabled, setQueryLogEnabled] = useState(false);
+  const [queryLogChannel, setQueryLogChannel] = useState("file");
+  const [queryLogFile, setQueryLogFile] = useState("/var/log/named/queries.log");
+  const [queryLogSeverity, setQueryLogSeverity] = useState("info");
   const [dirty, setDirty] = useState(false);
   const [saved, setSaved] = useState(false);
   const [initialized, setInitialized] = useState(false);
@@ -1136,6 +1183,10 @@ function OptionsTab({ groupId }: { groupId: string }) {
     setNotifyEnabled(opts.notify_enabled);
     setAllowQuery(opts.allow_query.join(", "));
     setAllowTransfer(opts.allow_transfer.join(", "));
+    setQueryLogEnabled(opts.query_log_enabled);
+    setQueryLogChannel(opts.query_log_channel);
+    setQueryLogFile(opts.query_log_file);
+    setQueryLogSeverity(opts.query_log_severity);
     setInitialized(true);
   }
 
@@ -1159,6 +1210,10 @@ function OptionsTab({ groupId }: { groupId: string }) {
       notify_enabled: notifyEnabled,
       allow_query: list(allowQuery),
       allow_transfer: list(allowTransfer),
+      query_log_enabled: queryLogEnabled,
+      query_log_channel: queryLogChannel,
+      query_log_file: queryLogFile,
+      query_log_severity: queryLogSeverity,
     });
   }
 
@@ -1264,6 +1319,56 @@ function OptionsTab({ groupId }: { groupId: string }) {
           <input className={inputCls} value={allowTransfer} onChange={(e) => { setAllowTransfer(e.target.value); setDirty(true); }} placeholder="none" />
         </Field>
       </div>
+
+      <div className={card}>
+        <div className="flex items-center justify-between">
+          <h4 className={cardTitle}><FileText className="h-4 w-4 text-muted-foreground" /> Query Logging</h4>
+          <label className="flex items-center gap-2 cursor-pointer text-sm">
+            <input
+              type="checkbox"
+              checked={queryLogEnabled}
+              onChange={(e) => { setQueryLogEnabled(e.target.checked); setDirty(true); }}
+              className="h-4 w-4"
+            />
+            Enable
+          </label>
+        </div>
+        {!queryLogEnabled && (
+          <p className="text-xs text-muted-foreground">
+            DNS query logs are disabled. Enable to record every query received by BIND for debugging or audit purposes (high volume — large file growth).
+          </p>
+        )}
+        {queryLogEnabled && (
+          <>
+            <Field label="Log channel">
+              <select className={selCls} value={queryLogChannel} onChange={(e) => { setQueryLogChannel(e.target.value); setDirty(true); }}>
+                <option value="file">file — write to a log file (rotated by BIND)</option>
+                <option value="syslog">syslog — send to local syslog (daemon facility)</option>
+                <option value="stderr">stderr — write to container stderr (visible via docker logs)</option>
+              </select>
+            </Field>
+            {queryLogChannel === "file" && (
+              <Field label="Log file path (inside container)">
+                <input className={inputCls} value={queryLogFile} onChange={(e) => { setQueryLogFile(e.target.value); setDirty(true); }} placeholder="/var/log/named/queries.log" />
+              </Field>
+            )}
+            <Field label="Severity">
+              <select className={selCls} value={queryLogSeverity} onChange={(e) => { setQueryLogSeverity(e.target.value); setDirty(true); }}>
+                <option value="info">info — normal queries (recommended)</option>
+                <option value="debug">debug — very verbose; for troubleshooting only</option>
+                <option value="notice">notice — only notable events</option>
+                <option value="warning">warning — warnings and above</option>
+                <option value="error">error — errors only</option>
+              </select>
+            </Field>
+            <p className="text-xs text-muted-foreground">
+              Logs the <code>queries</code> and <code>query-errors</code> categories. View with{" "}
+              <code className="font-mono">docker logs</code> (stderr) or{" "}
+              <code className="font-mono">docker exec &lt;dns-container&gt; tail -f {queryLogFile}</code> (file).
+            </p>
+          </>
+        )}
+      </div>
     </div>
   );
 }
@@ -1271,10 +1376,10 @@ function OptionsTab({ groupId }: { groupId: string }) {
 // ── Zones Tab ─────────────────────────────────────────────────────────────────
 
 function ZonesTab({ group, onSelectZone }: { group: DNSServerGroup; onSelectZone: (z: DNSZone) => void }) {
-  const qc = useQueryClient();
   const [showAdd, setShowAdd] = useState(false);
-  const [editZone, setEditZone] = useState<DNSZone | null>(null);
-  const [confirmDeleteZone, setConfirmDeleteZone] = useState<DNSZone | null>(null);
+  const [showZoneFilters, setShowZoneFilters] = useState(false);
+  const [zoneNameFilter, setZoneNameFilter] = useState("");
+  const [zoneTypeFilter, setZoneTypeFilter] = useState("");
 
   const { data: zones = [], isFetching } = useQuery({
     queryKey: ["dns-zones", group.id],
@@ -1286,15 +1391,15 @@ function ZonesTab({ group, onSelectZone }: { group: DNSServerGroup; onSelectZone
     queryFn: () => dnsApi.listViews(group.id),
   });
 
-  const deleteZone = useMutation({
-    mutationFn: (z: DNSZone) => dnsApi.deleteZone(group.id, z.id),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["dns-zones", group.id] });
-      setConfirmDeleteZone(null);
-    },
-  });
-
-  const tree = buildDnsTree(zones);
+  const hasZoneFilter = !!(zoneNameFilter || zoneTypeFilter);
+  const filteredZones = hasZoneFilter
+    ? zones.filter((z) => {
+        if (zoneNameFilter && !z.name.toLowerCase().includes(zoneNameFilter.toLowerCase())) return false;
+        if (zoneTypeFilter && z.zone_type !== zoneTypeFilter) return false;
+        return true;
+      })
+    : zones;
+  const tree = buildDnsTree(filteredZones);
 
   const typeBadge: Record<string, string> = {
     primary:   "bg-blue-500/15 text-blue-600",
@@ -1324,23 +1429,6 @@ function ZonesTab({ group, onSelectZone }: { group: DNSServerGroup; onSelectZone
                 <Shield className="h-3 w-3 text-emerald-500 flex-shrink-0" />
               )}
             </div>
-            <div
-              className="flex items-center gap-1 opacity-0 group-hover:opacity-100 flex-shrink-0"
-              onClick={(e) => e.stopPropagation()}
-            >
-              <button
-                className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-foreground"
-                onClick={() => setEditZone(node.zone!)}
-              >
-                <Pencil className="h-3 w-3" />
-              </button>
-              <button
-                className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-destructive"
-                onClick={() => setConfirmDeleteZone(node.zone!)}
-              >
-                <Trash2 className="h-3 w-3" />
-              </button>
-            </div>
           </div>
         ) : (
           /* Folder-only node (intermediate domain level with no zone registered) */
@@ -1359,11 +1447,19 @@ function ZonesTab({ group, onSelectZone }: { group: DNSServerGroup; onSelectZone
 
   return (
     <div>
-      <div className="flex items-center justify-between mb-4">
+      <div className="flex items-center justify-between mb-2">
         <span className="text-xs font-medium text-muted-foreground uppercase tracking-wider">
-          {zones.length} zone{zones.length !== 1 ? "s" : ""}
+          {hasZoneFilter ? `${filteredZones.length} / ${zones.length}` : zones.length} zone{zones.length !== 1 ? "s" : ""}
         </span>
         <div className="flex items-center gap-2">
+          <button
+            onClick={() => setShowZoneFilters((v) => !v)}
+            title="Toggle filters"
+            className={`flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent ${showZoneFilters ? "bg-muted" : ""}`}
+          >
+            <Filter className="h-3 w-3" />
+            {hasZoneFilter && <span className="h-1.5 w-1.5 rounded-full bg-primary" />}
+          </button>
           <button
             className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent disabled:opacity-50"
             disabled={zones.length === 0}
@@ -1383,6 +1479,37 @@ function ZonesTab({ group, onSelectZone }: { group: DNSServerGroup; onSelectZone
         </div>
       </div>
 
+      {showZoneFilters && (
+        <div className="mb-3 flex items-center gap-2 rounded-md border bg-muted/10 px-3 py-2">
+          <input
+            type="text"
+            value={zoneNameFilter}
+            onChange={(e) => setZoneNameFilter(e.target.value)}
+            placeholder="Filter by name…"
+            className="flex-1 rounded border border-border bg-background px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
+          />
+          <select
+            value={zoneTypeFilter}
+            onChange={(e) => setZoneTypeFilter(e.target.value)}
+            className="rounded border border-border bg-background px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
+          >
+            <option value="">All types</option>
+            {["primary", "secondary", "stub", "forward"].map((t) => (
+              <option key={t} value={t}>{t}</option>
+            ))}
+          </select>
+          {hasZoneFilter && (
+            <button
+              onClick={() => { setZoneNameFilter(""); setZoneTypeFilter(""); }}
+              className="text-xs text-muted-foreground hover:text-foreground"
+              title="Clear filters"
+            >
+              <X className="h-3.5 w-3.5" />
+            </button>
+          )}
+        </div>
+      )}
+
       {isFetching && zones.length === 0 && (
         <p className="text-sm text-muted-foreground">Loading…</p>
       )}
@@ -1391,24 +1518,14 @@ function ZonesTab({ group, onSelectZone }: { group: DNSServerGroup; onSelectZone
           No zones yet. Click "Add Zone" to create one.
         </p>
       )}
+      {hasZoneFilter && filteredZones.length === 0 && zones.length > 0 && (
+        <p className="text-sm text-muted-foreground italic">No zones match the current filter.</p>
+      )}
 
       {tree.map((root) => renderZoneNode(root, 0))}
 
       {showAdd && (
         <ZoneModal groupId={group.id} views={views} onClose={() => setShowAdd(false)} />
-      )}
-      {editZone && (
-        <ZoneModal groupId={group.id} views={views} zone={editZone} onClose={() => setEditZone(null)} />
-      )}
-      {confirmDeleteZone && (
-        <ConfirmDestroyModal
-          title="Delete DNS Zone"
-          description={`Permanently delete zone "${confirmDeleteZone.name}" and all its records?`}
-          checkLabel={`I understand all records in "${confirmDeleteZone.name}" will be permanently deleted.`}
-          onConfirm={() => deleteZone.mutate(confirmDeleteZone)}
-          onClose={() => setConfirmDeleteZone(null)}
-          isPending={deleteZone.isPending}
-        />
       )}
     </div>
   );
@@ -1917,7 +2034,7 @@ function BlocklistDetail({ list, onBack }: { list: DNSBlockList; onBack: () => v
 
 type GroupTab = "zones" | "servers" | "views" | "acls" | "blocklists" | "options";
 
-function GroupDetailView({ group, onSelectZone }: { group: DNSServerGroup; onSelectZone: (z: DNSZone) => void }) {
+function GroupDetailView({ group, onSelectZone, onEdit, onDelete }: { group: DNSServerGroup; onSelectZone: (z: DNSZone) => void; onEdit: () => void; onDelete: () => void }) {
   const [searchParams, setSearchParams] = useSearchParams();
   const tab = (searchParams.get("tab") as GroupTab) || "zones";
   const setTab = (t: GroupTab) => setSearchParams((prev: URLSearchParams) => {
@@ -1945,11 +2062,21 @@ function GroupDetailView({ group, onSelectZone }: { group: DNSServerGroup; onSel
   return (
     <div className="flex flex-col h-full">
       <div className="border-b px-5 py-3">
-        <div className="flex items-center gap-2">
-          <Globe className="h-4 w-4 text-muted-foreground" />
-          <h2 className="font-semibold text-base">{group.name}</h2>
-          <span className={`inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium ${typeBadge[group.group_type] ?? "bg-muted text-muted-foreground"}`}>{group.group_type}</span>
-          {group.is_recursive && <span className="inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium bg-emerald-500/15 text-emerald-600">recursive</span>}
+        <div className="flex items-center justify-between gap-3">
+          <div className="flex items-center gap-2 min-w-0">
+            <Globe className="h-4 w-4 text-muted-foreground flex-shrink-0" />
+            <h2 className="font-semibold text-base truncate">{group.name}</h2>
+            <span className={`inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium flex-shrink-0 ${typeBadge[group.group_type] ?? "bg-muted text-muted-foreground"}`}>{group.group_type}</span>
+            {group.is_recursive && <span className="inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium bg-emerald-500/15 text-emerald-600 flex-shrink-0">recursive</span>}
+          </div>
+          <div className="flex items-center gap-2 flex-shrink-0">
+            <button className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent" onClick={onEdit}>
+              <Pencil className="h-3 w-3" /> Edit Group
+            </button>
+            <button className="flex items-center gap-1 rounded-md border border-destructive/40 px-2 py-1 text-xs text-destructive hover:bg-destructive/10" onClick={onDelete}>
+              <Trash2 className="h-3 w-3" /> Delete Group
+            </button>
+          </div>
         </div>
         {group.description && <p className="text-xs text-muted-foreground mt-0.5">{group.description}</p>}
       </div>
@@ -1987,7 +2114,10 @@ function ZoneTreeRows({
   selectedZoneId: string | null;
   onSelectZone: (z: DNSZone) => void;
 }) {
-  const [expandedNodes, setExpandedNodes] = useState<Set<string>>(new Set());
+  const [expandedNodes, setExpandedNodes] = useSessionState<Set<string>>(
+    `spatium.dns.expandedZones.${groupId}`,
+    new Set(),
+  );
 
   const { data: zones = [] } = useQuery({
     queryKey: ["dns-zones", groupId],
@@ -2098,6 +2228,7 @@ type Selection =
   | { type: "zone"; group: DNSServerGroup; zone: DNSZone };
 
 export function DNSPage() {
+  useStickyLocation("spatium.lastUrl.dns");
   const qc = useQueryClient();
   const location = useLocation();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -2105,7 +2236,10 @@ export function DNSPage() {
   const [showCreateGroup, setShowCreateGroup] = useState(false);
   const [editGroup, setEditGroup] = useState<DNSServerGroup | null>(null);
   const [confirmDeleteGroup, setConfirmDeleteGroup] = useState<DNSServerGroup | null>(null);
-  const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
+  const [expandedGroups, setExpandedGroups] = useSessionState<Set<string>>(
+    "spatium.dns.expandedGroups",
+    new Set(),
+  );
   const urlRestored = useRef(false);
 
   // Update selection state + URL search params together. Preserves `tab`
@@ -2250,24 +2384,6 @@ export function DNSPage() {
                     <span className={`h-2 w-2 rounded-full flex-shrink-0 ${groupTypeDot[g.group_type] ?? "bg-muted-foreground"}`} />
                     <span className="text-sm font-medium truncate">{g.name}</span>
                   </button>
-                  {/* Edit / delete */}
-                  <div className="flex items-center gap-0.5 px-1 opacity-0 group-hover:opacity-100 flex-shrink-0" style={{ opacity: groupSelected ? 1 : undefined }}>
-                    <button
-                      className={`h-5 w-5 flex items-center justify-center rounded ${groupSelected ? "hover:bg-primary-foreground/20 text-primary-foreground" : "hover:bg-accent text-muted-foreground"}`}
-                      onClick={(e) => { e.stopPropagation(); setEditGroup(g); }}
-                    >
-                      <Pencil className="h-3 w-3" />
-                    </button>
-                    <button
-                      className={`h-5 w-5 flex items-center justify-center rounded ${groupSelected ? "hover:bg-primary-foreground/20 text-primary-foreground" : "hover:bg-accent text-muted-foreground"}`}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        setConfirmDeleteGroup(g);
-                      }}
-                    >
-                      <Trash2 className="h-3 w-3" />
-                    </button>
-                  </div>
                 </div>
 
                 {/* Zone tree (when group expanded) */}
@@ -2304,6 +2420,8 @@ export function DNSPage() {
           <GroupDetailView
             group={selection.group}
             onSelectZone={(z) => setSelection({ type: "zone", group: selection.group, zone: z })}
+            onEdit={() => setEditGroup(selection.group)}
+            onDelete={() => setConfirmDeleteGroup(selection.group)}
           />
         )}
         {selection?.type === "zone"  && (

@@ -14,7 +14,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What Is SpatiumDDI?
 
-SpatiumDDI is a production-grade, open-source **all-in-one DDI (DNS, DHCP, IPAM)** platform. It does not merely configure external DDI servers — it manages and runs the DHCP, DNS, and NTP service containers directly. The control plane (FastAPI + PostgreSQL) is the source of truth; all managed service containers (Kea, BIND9/PowerDNS, chrony) are deployed and configured by SpatiumDDI.
+SpatiumDDI is a production-grade, open-source **all-in-one DDI (DNS, DHCP, IPAM)** platform. It does not merely configure external DDI servers — it manages and runs the DHCP, DNS, and NTP service containers directly. The control plane (FastAPI + PostgreSQL) is the source of truth; all managed service containers (Kea, BIND9, chrony) are deployed and configured by SpatiumDDI.
 
 It can be deployed as individual containers, a full Docker Compose stack, a Kubernetes application, or as a **self-contained OS appliance image**. Supported on `linux/amd64` and `linux/arm64` (all Docker images must be built multi-arch).
 
@@ -49,7 +49,7 @@ Always read the relevant spec doc(s) before writing code for a feature area.
 | `k8s/base/` | Core K8s manifests (namespace, API, worker, frontend, migrate job) |
 | `k8s/ha/` | HA add-ons: CloudNativePG cluster, Redis Sentinel, Patroni Compose |
 | `docs/drivers/DHCP_DRIVERS.md` | Kea, ISC DHCP driver implementation specs |
-| `docs/drivers/DNS_DRIVERS.md` | BIND9, PowerDNS driver specs, incremental update strategy |
+| `docs/drivers/DNS_DRIVERS.md` | BIND9 driver spec, incremental update strategy |
 
 ---
 
@@ -95,7 +95,7 @@ These rules apply to every file Claude Code generates. No exceptions.
 | Phase | Focus | Status |
 |---|---|---|
 | 1 | Core IPAM, local auth, user management, audit log, Docker Compose | **In Progress** |
-| 2 | DHCP (Kea + ISC), DNS (PowerDNS + BIND9), DDNS, NTP, zone/subnet tree UI | **In Progress** (DNS core + driver + agent runtime landed; DHCP/DDNS/NTP pending) |
+| 2 | DHCP (Kea + ISC), DNS (BIND9), DDNS, NTP, zone/subnet tree UI | **In Progress** (DNS core + driver + agent runtime landed; DHCP/DDNS/NTP pending) |
 | 3 | DNS views, server groups, blocking lists, VLAN/VXLAN, system admin panel, health dashboard | **In Progress** (DNS views, groups, blocklists, health checks landed) |
 | 4 | OS appliance image, Terraform/Ansible providers, SAML, notifications, backup/restore | Not started |
 | 5 | Multi-tenancy, IP request workflows, import/export, advanced reporting | Not started |
@@ -159,6 +159,21 @@ These rules apply to every file Claude Code generates. No exceptions.
 - ✅ DNS Settings section — default zone TTL, zone type, DNSSEC validation mode, recursive-by-default; DNS agent key info field
 - ✅ Settings page DNS defaults — `dns_default_ttl`, `dns_default_zone_type`, `dns_default_dnssec_validation`, `dns_recursive_by_default` (migration `5d2a8f91c4e6`)
 
+### Wave 3 additions (2026-04-15)
+
+**IPAM**
+- ✅ DNS assignment at IP space level — `dns_group_ids`, `dns_zone_id`, `dns_additional_zone_ids` added to `IPSpace` model (migration `e7f3a1c9b5d8`); space DNS propagates down via `get_effective_block_dns` fallthrough after root block; `EditSpaceModal` has `DnsSettingsSection` with `hideInheritToggle`
+- ✅ `GET /ipam/spaces/{id}/effective-dns` endpoint returns space-level DNS settings for UI preview
+- ✅ Subnet header redesigned — breadcrumb + actions bar up top; identity row (network, status, name, Edit text link); stats tray (gateway, VLAN, total/allocated, utilization, custom fields) as horizontal band with `bg-muted/30` background
+- ✅ Block detail header redesigned — same pattern as subnet; Export button at block level; "Edit" text link instead of pencil icon
+- ✅ IP address table filters — hidden by default; toggled by Filter icon (top-right of table header); filter bar shows per-column inputs; status column uses dropdown select; text columns have mode picker (contains/begins with/ends with/regex); clear button when any filter active
+- ✅ Block detail table filters — same pattern: hidden by default, filter icon toggle, network/name/status filters
+- ✅ Export button added to subnet and block detail headers (in addition to space level); filename fallback is now `ipam-export-YYYY-MM-DD.{format}`
+- ✅ Zone selectors in all IPAM modals exclude `in-addr.arpa` / `ip6.arpa` reverse zones from primary and additional pickers; additional zones picker already excluded the selected primary
+- ✅ Allocation map dark mode — hatch pattern uses `zinc.400/500` instead of `zinc.300`; band background darker in dark mode
+- ✅ `CreateSubnetModal` is now scrollable (`max-h-[75vh] overflow-y-auto`) — form no longer clips when "Find by size" is open
+- ✅ `useSessionState` hook — drop-in replacement for `useState` that persists to `sessionStorage`; handles `Set<string>` serialization; used for `expandedGroups` in DNS sidebar, `expandedZones.<groupId>` per zone tree, and `expandedSpace.<spaceId>` per IPAM space section
+
 ### Wave 1 + Wave 2 additions (2026-04-14/15)
 
 **IPAM**
@@ -171,13 +186,13 @@ These rules apply to every file Claude Code generates. No exceptions.
 - ✅ Custom-field search — `is_searchable` definitions flow into `/search`; results carry `matched_field` hint, shown as pill in Cmd+K
 
 **DNS**
-- ✅ Driver abstraction — `backend/app/drivers/dns/base.py` `DNSDriver` ABC + neutral dataclasses; `BIND9Driver` with Jinja templates (named.conf, zone files, RPZ), TSIG-signed RFC 2136 via `dnspython`; PowerDNS stub
+- ✅ Driver abstraction — `backend/app/drivers/dns/base.py` `DNSDriver` ABC + neutral dataclasses; `BIND9Driver` with Jinja templates (named.conf, zone files, RPZ), TSIG-signed RFC 2136 via `dnspython`. BIND9 is the only supported backend — registry kept for future custom drivers.
 - ✅ ConfigBundle service — `backend/app/services/dns/config_bundle.py` assembles server options/zones/records/views/ACLs/blocklists/trust-anchors/TSIG; SHA-256 ETag for agent long-poll
 - ✅ Serial bumping — RFC 1912 `YYYYMMDDNN` convention wired into record CUD; `POST /dns/servers/{id}/apply-record` records intent + bumps serial
-- ✅ Agent runtime — `agent/dns/spatium_dns_agent/` Python package; bootstrap (pre-shared key → rotating JWT), long-poll config sync with ETag, on-disk cache at `/var/lib/spatium-dns-agent/`, loopback nsupdate over TSIG, heartbeat, supervisor (tini); BIND9 driver live, PowerDNS stub
+- ✅ Agent runtime — `agent/dns/spatium_dns_agent/` Python package; bootstrap (pre-shared key → rotating JWT), long-poll config sync with ETag, on-disk cache at `/var/lib/spatium-dns-agent/`, loopback nsupdate over TSIG, heartbeat, supervisor (tini); BIND9 driver
 - ✅ Agent backend endpoints — `backend/app/api/v1/dns/agents.py` (`/register`, `/heartbeat`, `/config` long-poll, `/record-ops`, `/ops/{id}/ack`); `DNSRecordOp` model + `DNSServer` agent fields (migration `b7e3a1f4c8d2`); stale-sweep Celery task
-- ✅ Container images — `agent/dns/images/{bind9,powerdns}/Dockerfile` Alpine 3.20 multi-arch; GH Actions workflow `.github/workflows/build-dns-images.yml` → `ghcr.io/spatiumddi/dns-{bind9,powerdns}`
-- ✅ Kubernetes — `k8s/dns/{bind9,powerdns}-statefulset.yaml` (one STS per server), `service-dns.yaml`; Helm chart scaffolding at `charts/spatium-dns/`
+- ✅ Container image — `agent/dns/images/bind9/Dockerfile` Alpine 3.20 multi-arch; GH Actions workflow `.github/workflows/build-dns-images.yml` → `ghcr.io/spatiumddi/dns-bind9`
+- ✅ Kubernetes — `k8s/dns/bind9-statefulset.yaml` (one STS per server), `service-dns.yaml`; Helm chart scaffolding at `charts/spatium-dns/`
 - ✅ Docker Compose `dns` profile with `dns-bind9-dev` service; `.env.example` adds `DNS_AGENT_KEY`, `DNS_AGENT_TOKEN_TTL_HOURS`, `DNS_AGENT_LONGPOLL_TIMEOUT`, `DNS_REQUIRE_AGENT_APPROVAL`
 - ✅ Blocking lists (RPZ) — `DNSBlockList`/`Entry`/`Exception` models with group + view assignment junctions (migration `c3f1e7b92a5d`); bulk-add with dedupe; feed refresh Celery task (hosts/domains/adblock parsers); "Blocklists" tab on DNS group detail; backend-neutral `EffectiveBlocklist` service consumed by BIND9 driver for RPZ rendering
 - ✅ Zone import/export (RFC 1035) — dnspython parser/differ/writer at `backend/app/services/dns_io/`; endpoints for preview/commit/export plus multi-zone zip export; `ImportZoneModal` UI with color-coded diff
@@ -186,6 +201,38 @@ These rules apply to every file Claude Code generates. No exceptions.
 - ✅ Server health checks — `check_dns_server_health` Celery task (agent heartbeat staleness → SOA probe fallback); `check_all_dns_servers_health` fan-out scheduled every 60s via beat; status dots + health widget on DNS group detail
 
 **Design doc:** `docs/deployment/DNS_AGENT.md` — agent topology, auto-reg protocol, config sync model, K8s shape, deliverables.
+
+### Wave 4 additions (2026-04-15)
+
+**IPAM ↔ DNS reconcile**
+- ✅ Drift-detection service `backend/app/services/dns/sync_check.py` — compares IPAM-expected A/PTR records against the DB and classifies drift into three buckets: `missing` (IP has hostname + effective zone but no record), `mismatched` (record exists but differs from what IPAM would create today), `stale` (auto-generated record whose IP was deleted, orphaned, lost its hostname, or whose hostname is the default `gateway` placeholder).
+- ✅ Six new endpoints: `GET/POST /ipam/{subnets|blocks|spaces}/{id}/dns-sync/{preview|commit}`. Subnet endpoint scopes commits to that subnet; block walks the subtree; space spans every subnet. All share `_apply_dns_sync` which routes create/update through `_sync_dns_record` (so RFC 2136 nsupdate + serial bump fire normally) and deletes stale records via `_enqueue_dns_op`. Commit logs one audit entry per reconcile.
+- ✅ `DnsSyncModal` (subnet/block/space scope) — three checkbox-list buckets, default-select-all, mismatched rows render `current → expected` inline, single Apply button. "Re-check" re-runs preview without closing. When there's no drift the footer shows a single primary "Close" button instead of a greyed-out Apply.
+- ✅ "Check DNS Sync" button on `SubnetDetail`, `BlockDetailView`, and `SpaceTableView` headers.
+- ✅ DNS sync indicator column on the IP address table — green dot/"in sync", amber dot/"out of sync", or "—" (no DNS configured / system row / no hostname / default `gateway`). Filterable via dropdown. Address-table column order: address · hostname · MAC · description · status · DNS · actions.
+- ✅ Default-`gateway` hostname rule — `_sync_dns_record` skips forward A creation when `ip.hostname == "gateway"` (and tears down any existing auto A so renaming back to default cleans up). PTR is still created so reverse lookups for the gateway IP work. Drift detector mirrors the rule (no missing-A false positives) and surfaces stale A records as `reason: "default-gateway-name"`.
+- ✅ Subnet delete cleanup — `delete_subnet` in `backend/app/api/v1/ipam/router.py` now removes auto-generated `DNSRecord` rows (collected via `IPAddress.dns_record_id`) and `DNSZone` rows where `is_auto_generated=True AND linked_subnet_id=subnet.id` before the cascade fires. Previously these were left orphaned because the FKs are `ON DELETE SET NULL`.
+- ✅ Orphan visual — soft-delete preserves `IPAddress.fqdn` (only `dns_record_id` is cleared) so orphaned rows keep showing the FQDN that was published, greyed out at `opacity-40`. Restore re-runs sync to refresh the value.
+
+**DNS query logging**
+- ✅ Seven new fields on `DNSServerOptions` (group-level): `query_log_enabled`, `query_log_channel` (file/syslog/stderr), `query_log_file`, `query_log_severity`, `query_log_print_{category,severity,time}`. Migration `f8a3c1e7d925`.
+- ✅ Wired through the full pipeline: `ServerOptions` dataclass → `config_bundle.py` → `named.conf.j2` (renders a `logging { channel queries_channel ...; category queries; category query-errors; }` stanza). ETag picks up changes automatically since `asdict(options)` already covers the new fields.
+- ✅ "Query Logging" card in the Group Options tab with channel/path/severity controls. BIND9 image now creates `/var/log/named` so the `file` channel works out of the box.
+
+**Dashboard**
+- ✅ "DNS Servers" stat card + per-server status table (health dot, name, host:port, group, driver, last-check timestamp). Refreshed every 30s.
+
+**Settings page reorganization**
+- ✅ Replaced the single scrolling form with a sidebar layout. Eight alphabetical sections (Branding, Discovery, DNS Defaults, IP Allocation, Session & Security, Subnet Tree UI, Updates, Utilization Thresholds) with a search/filter that matches title, description, or keywords.
+
+**DNS UX polish**
+- ✅ Tree-action cleanup — removed sidebar group hover-edit/trash; `GroupDetailView` header now has Edit Group / Delete Group text buttons. Removed zone-card hover-edit/trash from the Zones tab; `ZoneDetailView` keeps its own buttons.
+- ✅ `RecordModal` defaults to PTR when the parent zone matches `*.in-addr.arpa` / `*.ip6.arpa`; placeholder reflects the type.
+- ✅ Inline column-header filters with Filter icons on `SpaceTableView` and on the DNS Zones tab; DNS zones show `filtered/total` count when active.
+
+**Container / infra**
+- ✅ DNS agent image bumped Alpine 3.20 → 3.22 (latest with default Python 3.12 — moving to 3.23 would also require retemplating `PYTHONPATH`).
+- ✅ Forwarders + blocklist push to BIND verified end-to-end (no fix needed — confirmed `config_bundle.py:90-91` → `named.conf.j2:31-34` for forwarders and ETag inclusion at `base.py:166-173` for blocklists).
 
 ### Phase 1 — Remaining
 
@@ -200,7 +247,6 @@ These rules apply to every file Claude Code generates. No exceptions.
 
 - ⬜ DHCP (Kea + ISC) drivers, models, UI
 - ⬜ DDNS pipeline (needs DHCP first) — subnet `ddns_enabled`/`ddns_hostname_policy`/`ddns_domain_override`/`ddns_ttl`; DHCP-lease → DNS A/PTR Celery task
-- ⬜ PowerDNS driver (BIND9 is live; PowerDNS stub raises `NotImplementedError`)
 - ⬜ NTP server/client management
 - ⬜ Per-server zone serial reporting (currently all servers in a group share `DNSZone.serial`; once agents report back, surface per-server drift)
 - ⬜ Trivy-clean + kind-AXFR acceptance tests for the agent images (stubs marked `@pytest.mark.e2e` in `agent/dns/tests/`)

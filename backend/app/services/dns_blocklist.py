@@ -2,10 +2,10 @@
 
 Produces a backend-neutral representation (`EffectiveBlocklist`) of the set of
 blocked domains + exceptions that apply to a given DNS view or server group.
-The DNS driver layer (BIND9 RPZ emitter, PowerDNS Lua emitter, etc.) consumes
+The DNS driver layer (BIND9 RPZ emitter Lua emitter, etc.) consumes
 this structure to generate actual server config.
 
-Driver-abstraction rule (CLAUDE.md #10): no BIND9 / PowerDNS specifics live in
+Driver-abstraction rule (CLAUDE.md #10): no BIND9 specifics live in
 this module.
 """
 

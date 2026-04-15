@@ -1,7 +1,7 @@
 # DNS Agent / Container Architecture
 
 > Design spec for how SpatiumDDI ships, enrolls, configures, and operates the
-> managed DNS service containers (BIND9, PowerDNS) that sit on the data plane.
+> managed DNS service containers (BIND9) that sit on the data plane.
 >
 > **Status:** Design — no implementation yet. This document is the handoff
 > contract for Wave 2 implementation agents.
@@ -17,7 +17,7 @@
 | Term | Meaning |
 |---|---|
 | **Control plane** | The SpatiumDDI FastAPI + PostgreSQL + Celery stack. Source of truth. |
-| **Data plane** | Running DNS daemons (BIND9 / PowerDNS) that actually answer queries. |
+| **Data plane** | Running DNS daemons (BIND9) that actually answer queries. |
 | **Agent** | The SpatiumDDI-shipped sidecar process that supervises a DNS daemon, renders configs, applies records, and talks to the control plane. |
 | **DNS container** | A container image containing both the DNS daemon and the agent. |
 | **Driver** | Server-side (control-plane) Python code implementing `DNSDriverBase` per daemon flavor (see `docs/drivers/DNS_DRIVERS.md`). |
@@ -35,15 +35,14 @@ Two images ship in Phase 2:
 | Image | Processes | Purpose |
 |---|---|---|
 | `ghcr.io/spatiumddi/dns-bind9` | `named` + `spatium-dns-agent` | Authoritative and/or recursive BIND9 |
-| `ghcr.io/spatiumddi/dns-powerdns` | `pdns_server` **or** `pdns_recursor` + `spatium-dns-agent` | PowerDNS auth or recursor (flavor chosen by env var `PDNS_FLAVOR=auth|recursor`) |
 
 The **agent is the same Python codebase** (`spatium_dns_agent`) in both images; the DNS daemon differs. The agent abstracts daemon specifics internally (symmetric to the control-plane driver, but on the container side).
 
 ### Rationale
 
-- **Single image per flavor** keeps operational surface small and lets the agent run `rndc`, write `named.conf`, manage the pdns SQLite/pgsql backend, and own the daemon lifecycle locally — none of which a detached sidecar can do without shared volumes and ambient capabilities.
+- **Single image per flavor** keeps operational surface small and lets the agent run `rndc`, write `named.conf`, manage the  SQLite/pgsql backend, and own the daemon lifecycle locally — none of which a detached sidecar can do without shared volumes and ambient capabilities.
 - **Not a standalone sidecar** because BIND9 config-file edits + `rndc reconfig` require filesystem and UNIX socket co-location. A sidecar model adds complexity (shared PID namespace, shared volumes) with no benefit at our scale.
-- **Not a single universal image** because BIND9 and PowerDNS have wildly different footprints (Alpine `bind` + `bind-tools` ≈ 30 MB; PowerDNS auth + backends ≈ 80 MB). Bundling both bloats images and attack surface.
+- **Not a single universal image** because BIND9 have wildly different footprints (Alpine `bind` + `bind-tools` ≈ 30 MB; Bundling both bloats images and attack surface.
 
 ### Alternatives considered
 
@@ -127,7 +126,6 @@ Three channels:
 |---|---|---|---|
 | **Config long-poll** | Agent → CP | `GET /dns/agents/{id}/config?etag=<current>` (30 s hold) | Full config bundle (views, ACLs, options, zone list). Returns `304` if unchanged, `200` with new bundle + new etag on change. |
 | **Heartbeat** | Agent → CP | `POST /dns/agents/{id}/heartbeat` (30 s interval) | Liveness, daemon status, version, queued-change ACK, token rotation. |
-| **Record fast-path** | CP → Agent (logically, but still agent-pulls) | Config long-poll response carries `pending_record_ops[]`; agent ACKs each op-id on heartbeat. | Per-record RFC 2136 / pdns-API changes delivered near-real-time via the long-poll's early return. |
 
 **Why not push / webhook from control plane to agent?**
 - Requires agent to expose an HTTPS listener, open an inbound port, and obtain a valid TLS cert. Non-negotiable #6 and general operational cost.
@@ -146,12 +144,12 @@ Three channels:
 
 1. Control plane computes the record delta and writes `pending_record_ops` rows.
 2. The agent pulls them via config long-poll.
-3. The agent invokes `nsupdate` (or the PowerDNS local API on `127.0.0.1:8081`) **against its own daemon over loopback**.
+3. The agent invokes `nsupdate` (or the 0.0.1:8081`) **against its own daemon over loopback**.
 4. The agent ACKs success/failure per-op on the next heartbeat.
 
 Rationale: loopback `nsupdate` is simpler, never traverses the network as a TSIG-sensitive payload, and makes the agent the single enforcer of the local daemon state. The TSIG key lives only on the container.
 
-The control-plane `DNSDriverBase` implementations become **thin**: they translate the DB model into a canonical `AgentConfigBundle` + `RecordOp` list. They do not speak `nsupdate` or pdns-API directly.
+The control-plane `DNSDriverBase` implementations become **thin**: they translate the DB model into a canonical `AgentConfigBundle` + `RecordOp` list. They do not speak `nsupdate via RFC 2136 directly.
 
 ### Local disk cache (non-negotiable #5)
 
@@ -166,7 +164,6 @@ config/
   current.etag
   previous.json                  # rollback copy
 rendered/
-  named.conf                     # BIND9 — or pdns.conf, recursor.conf
   zones/
     example.com.db
     10.in-addr.arpa.db
@@ -181,7 +178,6 @@ ops/
 
 **Offline operation**: if the control plane is unreachable on boot, the agent loads `config/current.json`, renders configs if not already rendered, starts the daemon, and continues serving DNS. It enters a retry loop and resumes sync when the control plane returns. No query path ever depends on control-plane reachability.
 
-**Atomic apply**: new configs are rendered to `rendered.new/`, validated (`named-checkconf`, `pdnsutil check-all-zones`), swapped by rename, then `rndc reconfig` / `pdns_control reload` is issued. On validation failure the daemon keeps serving the previous config and the agent reports `status=degraded, reason=config_validation_failed`.
 
 ---
 
@@ -255,7 +251,6 @@ Agents holding a long-poll on /config are released with op list.
         ▼
 Agent executes via loopback:
   BIND9   → nsupdate ‹signed with local TSIG›
-  PowerDNS→ PATCH /api/v1/servers/localhost/zones/<z>  (127.0.0.1:8081)
         │
         ▼
 Agent ACKs on next heartbeat → RecordOp.state = applied
@@ -266,8 +261,8 @@ If failed after N retries (default 5, expo-backoff): state=failed, alert.
 
 - **Control plane bumps the logical serial** when constructing the op: `YYYYMMDDNN` format, monotonically increasing per zone, persisted on `DNSZone.last_serial`.
 - The op carries the target serial. The agent's `nsupdate` script explicitly deletes + re-adds the SOA with the target serial in the same update transaction (atomic under RFC 2136).
-- For PowerDNS, the API zone `PATCH` includes the `serial` field.
-- **Secondary servers** (same group, different `DNSServer` rows) do **not** receive record ops — the primary notifies them natively (BIND9 `notify` or PowerDNS AXFR). The agent on a secondary only syncs config (ACLs, views, zone definitions), never individual records.
+- F, the API zone `PATCH` includes the `serial` field.
+- **Secondary servers** (same group, different `DNSServer` rows) do **not** receive record ops — the primary notifies them natively (BIND9 `notify`. The agent on a secondary only syncs config (ACLs, views, zone definitions), never individual records.
 
 ### Primary/secondary coordination
 
@@ -284,11 +279,8 @@ If failed after N retries (default 5, expo-backoff): state=failed, alert.
 | **Bootstrap PSK** | `DNS_AGENT_KEY` env var on both control plane and agent. 32-byte random (`openssl rand -hex 32`). Rotatable. Compared with `hmac.compare_digest`. |
 | **Agent token** | JWT (HS256) signed by control-plane `SECRET_KEY`, 24 h lifetime, rotated silently via heartbeat response if within 12 h of expiry. Claims: `sub=server_id`, `agent_id`, `fingerprint`, `exp`. |
 | **TSIG keys** | Generated by control plane on zone bind, stored encrypted at rest (Fernet, `SECRET_KEY`-derived). Transmitted to agent inside the config bundle over TLS. Agent writes to `tsig/ddns.key` at 0600, referenced by `named.conf` via `include`. |
-| **PowerDNS API key** | Per-server, generated at registration, written to `pdns.conf` with `api-key=` and `webserver-address=127.0.0.1`. Never exposed externally. |
-| **Network exposure** | Agent is **egress-only**. Daemon listens on 53/udp+tcp (+ 853/tcp for DoT in Phase 3). No agent management port. DNS daemon's control socket (`rndc`, `pdns_control`) is a UNIX socket inside the container. |
 | **TLS** | Agent↔CP is HTTPS-only. CP cert verified against the system CA bundle (+ optional `CA_BUNDLE_PATH` env for private CAs). Self-signed dev certs only when `SPATIUM_INSECURE_SKIP_TLS_VERIFY=1` (dev only). |
 | **RBAC between agents** | An agent's JWT is scoped to its `server_id`. Config endpoint rejects requests for any other server. Record ops are likewise `server_id`-scoped; an agent cannot fetch another server's TSIG keys. |
-| **Secret storage in container** | All secrets on a tmpfs-backed writable volume (`/var/lib/spatium-dns-agent`). Agent drops privileges after startup; runs as UID `spatium` (non-root). DNS daemon runs as its own unprivileged user (`named`, `pdns`). |
 | **Audit** | Every config apply, op-apply, token rotation, and failed auth is audit-logged on the control plane. Agent-local audit is kept on disk for 7 days (rotated) and surfaced via `/agents/{id}/diagnostics`. |
 
 ---
@@ -322,25 +314,21 @@ Entrypoint (`entrypoint.py`) responsibilities:
 4. Validate with `named-checkconf`.
 5. `exec` a supervisor that runs two children: `named -g -u named` and the agent's sync loop. If either exits, kill the other and exit non-zero (let the orchestrator restart the container).
 
-### `dns-powerdns` image
 
 ```
 FROM alpine:3.20
-RUN apk add --no-cache pdns pdns-backend-sqlite3 pdns-backend-lmdb pdns-recursor \
                       tini python3 py3-pip ca-certificates tzdata
 # ... agent install same as above ...
 EXPOSE 53/udp 53/tcp 8081/tcp  # 8081 bound to 127.0.0.1 only
 ```
 
-`PDNS_FLAVOR=auth|recursor` selects which binary the supervisor starts.
 
 ### Volumes
 
 | Path | Purpose | Typical size |
 |---|---|---|
 | `/var/lib/spatium-dns-agent` | Agent state, config cache, TSIG, tokens | <10 MB |
-| `/var/cache/bind` (bind9 image) | Zone files, journals | grows with zone count |
-| `/var/lib/powerdns` (pdns auth image) | SQLite/LMDB backend | grows with zone count |
+| `/var/cache/bind` (bind9image) | Zone files, journals | grows with zone count |
 
 All three must survive restarts → named volumes in Compose / PVCs in K8s.
 
@@ -437,9 +425,7 @@ dns-bind9-primary:
 | `agent/dns/spatium_dns_agent/sync.py` | Long-poll loop, config apply, op execution. |
 | `agent/dns/spatium_dns_agent/cache.py` | Disk-cache read/write, atomic swap, rollback. |
 | `agent/dns/spatium_dns_agent/drivers/bind9.py` | Render `named.conf`, zone files, RPZ; `nsupdate` loopback; `rndc reconfig`. |
-| `agent/dns/spatium_dns_agent/drivers/powerdns.py` | Render `pdns.conf`; local REST API calls. |
 | `agent/dns/spatium_dns_agent/heartbeat.py` | Heartbeat body, token rotation. |
-| `agent/dns/tests/` | Unit + integration (testcontainers with real `named`/`pdns`). |
 
 ### Container images
 
@@ -447,8 +433,6 @@ dns-bind9-primary:
 |---|---|
 | `agent/dns/images/bind9/Dockerfile` | Alpine + BIND9 + agent, multi-arch. |
 | `agent/dns/images/bind9/entrypoint.py` | Process-1 entrypoint. |
-| `agent/dns/images/powerdns/Dockerfile` | Alpine + PowerDNS auth + recursor + agent. |
-| `agent/dns/images/powerdns/entrypoint.py` | Entrypoint; reads `PDNS_FLAVOR`. |
 | `.github/workflows/build-dns-images.yml` | buildx, amd64+arm64, push to `ghcr.io/spatiumddi/*`. |
 
 ### Kubernetes
@@ -456,7 +440,6 @@ dns-bind9-primary:
 | Path | Purpose |
 |---|---|
 | `k8s/dns/bind9-statefulset.yaml` | Reference StatefulSet. |
-| `k8s/dns/powerdns-statefulset.yaml` | Reference StatefulSet. |
 | `k8s/dns/service-dns.yaml` | Example LoadBalancer service (UDP+TCP 53). |
 | `charts/spatium-dns/` | Helm chart (Phase 2.5). |
 | `k8s/README.md` | Add "DNS server deployment" section. |
@@ -493,4 +476,4 @@ dns-bind9-primary:
 - **mTLS vs JWT**: reconsider in Phase 4 once we have an internal CA story.
 - **IPv6-only deployments**: agent must support AAAA-only control-plane URL; fine in theory, test in Phase 3.
 - **Windows DNS integration**: explicitly out of scope for the agent model — Windows servers are managed via WinRM from the control plane (different driver branch, see roadmap).
-- **DNSSEC signing (online vs bump-in-the-wire)**: BIND9 inline-signing is assumed; PowerDNS pdnsutil-driven. Key storage and rotation design is a separate doc (`docs/features/DNS_DNSSEC.md`, Phase 3).
+- **DNSSEC signing (online vs bump-in-the-wire)**: BIND9 inline-signing is assumed; Key storage and rotation design is a separate doc (`docs/features/DNS_DNSSEC.md`, Phase 3).

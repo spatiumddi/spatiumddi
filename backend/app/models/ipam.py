@@ -27,6 +27,11 @@ class IPSpace(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     is_default: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     tags: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
 
+    # DNS assignment — propagates down to child blocks/subnets that inherit
+    dns_group_ids: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
+    dns_zone_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    dns_additional_zone_ids: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
+
     blocks: Mapped[list["IPBlock"]] = relationship("IPBlock", back_populates="space", cascade="all, delete-orphan")
     subnets: Mapped[list["Subnet"]] = relationship("Subnet", back_populates="space")
 

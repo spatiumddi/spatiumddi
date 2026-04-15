@@ -1,6 +1,6 @@
 import { useQuery, useQueries } from "@tanstack/react-query";
-import { Network, Layers, Server, Globe, Globe2, FileText } from "lucide-react";
-import { ipamApi, dnsApi, type Subnet } from "@/lib/api";
+import { Network, Layers, Server, Globe, Globe2, FileText, Cpu } from "lucide-react";
+import { ipamApi, dnsApi, type Subnet, type DNSServer } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
 function StatCard({
@@ -70,6 +70,24 @@ export function DashboardPage() {
   });
   const totalZones = zoneQueries.reduce((sum, q) => sum + (q.data?.length ?? 0), 0);
 
+  const serverQueries = useQueries({
+    queries: dnsGroups.map((g) => ({
+      queryKey: ["dns-servers", g.id],
+      queryFn: () => dnsApi.listServers(g.id),
+      refetchInterval: 30_000,
+    })),
+  });
+  const allServers: DNSServer[] = serverQueries.flatMap((q) => q.data ?? []);
+  const serverCounts = allServers.reduce(
+    (acc, s) => {
+      acc[s.status] = (acc[s.status] ?? 0) + 1;
+      return acc;
+    },
+    {} as Record<string, number>,
+  );
+  const activeServers = serverCounts.active ?? 0;
+  const unhealthyServers = (serverCounts.unreachable ?? 0) + (serverCounts.error ?? 0);
+
   const totalIPs = subnets?.reduce((s, n) => s + n.total_ips, 0) ?? 0;
   const allocatedIPs = subnets?.reduce((s, n) => s + n.allocated_ips, 0) ?? 0;
   const overallUtil = totalIPs > 0 ? (allocatedIPs / totalIPs) * 100 : 0;
@@ -131,7 +149,75 @@ export function DashboardPage() {
             icon={FileText}
             sub={dnsGroups.length > 0 ? `across ${dnsGroups.length} group${dnsGroups.length !== 1 ? "s" : ""}` : undefined}
           />
+          <StatCard
+            label="DNS Servers"
+            value={allServers.length}
+            icon={Cpu}
+            sub={
+              allServers.length === 0
+                ? "none registered"
+                : unhealthyServers > 0
+                  ? `${activeServers} active, ${unhealthyServers} unhealthy`
+                  : `${activeServers} active`
+            }
+          />
         </div>
+
+        {/* DNS server health */}
+        {allServers.length > 0 && (
+          <div className="rounded-lg border">
+            <div className="flex items-center justify-between border-b px-4 py-3">
+              <h2 className="text-sm font-semibold">DNS Server Status</h2>
+              <div className="flex items-center gap-3 text-xs">
+                {(["active", "syncing", "unreachable", "error"] as const).map((s) =>
+                  serverCounts[s] ? (
+                    <span key={s} className="flex items-center gap-1.5">
+                      <span className={cn("inline-block h-2 w-2 rounded-full", {
+                        active: "bg-emerald-500",
+                        syncing: "bg-blue-500",
+                        unreachable: "bg-red-500",
+                        error: "bg-red-500",
+                      }[s])} />
+                      {serverCounts[s]} {s}
+                    </span>
+                  ) : null,
+                )}
+              </div>
+            </div>
+            <div className="divide-y">
+              {allServers.map((s) => {
+                const group = dnsGroups.find((g) => g.id === s.group_id);
+                const dotCls = {
+                  active: "bg-emerald-500",
+                  syncing: "bg-blue-500",
+                  unreachable: "bg-red-500",
+                  error: "bg-red-500",
+                }[s.status] ?? "bg-muted";
+                return (
+                  <div key={s.id} className="flex items-center gap-4 px-4 py-2.5">
+                    <span
+                      className={cn("inline-block h-2 w-2 rounded-full flex-shrink-0", dotCls)}
+                      title={s.status}
+                    />
+                    <span className="w-48 truncate text-xs font-medium">{s.name}</span>
+                    <span className="w-56 truncate font-mono text-xs text-muted-foreground">
+                      {s.host}:{s.port}
+                    </span>
+                    <span className="w-40 truncate text-xs text-muted-foreground">
+                      {group?.name ?? "—"}
+                    </span>
+                    <span className="w-20 text-xs text-muted-foreground">{s.driver}</span>
+                    <span className="flex-1 text-right text-xs text-muted-foreground">
+                      {s.last_health_check_at
+                        ? `checked ${new Date(s.last_health_check_at).toLocaleTimeString()}`
+                        : "never checked"}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
 
         {/* Top subnets by utilization */}
         {topSubnets.length > 0 && (

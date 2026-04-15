@@ -24,112 +24,42 @@
 
 SpatiumDDI is a production-grade, open-source **DDI platform** — DNS, DHCP, and IP Address Management — built for teams that need real control over their network infrastructure without paying enterprise licensing fees.
 
-It is designed as a modern alternative to commercial DDI platforms like EfficientIP and Infoblox, with first-class support for:
+It is designed as a modern alternative to commercial DDI platforms like EfficientIP and Infoblox. Unlike most open-source alternatives, SpatiumDDI **manages and runs its own DNS/DHCP/NTP containers** — it is not a pretty front end over an external BIND9. The control plane is the source of truth; the service containers auto-register, pull their config, and keep serving even if the control plane goes down.
 
-- 🗂 **Hierarchical IP management** — spaces, blocks, subnets, and addresses in a visual tree
-- 🔄 **DHCP server management** — ISC Kea and ISC DHCP, with HA failover support
-- 🌐 **DNS server management** — BIND9 and PowerDNS, with views, zones, and blocking lists
-- ⏱ **NTP server management** — Chrony and ntpd integration
-- 🔒 **Granular permissions** — delegate IP ranges to groups via LDAP, Entra ID, or OIDC
-- 📋 **Full audit trail** — every change logged, append-only, viewable from the UI
-- 🚀 **Flexible deployment** — Docker Compose, Kubernetes (Helm), bare metal, or OS appliance image
-
----
-
-## Features
-
-### IP Address Management
-- Hierarchical IP space → block → subnet → address tree
-- Visual subnet utilization with threshold alerting
-- Next available IP allocation (sequential or random)
-- VLAN / VXLAN assignment per subnet
-- Custom fields on all resources (owner, contact, ticket number, etc.)
-- Discovery scanning — reconcile live network vs. IPAM records
-- Import/export: CSV, JSON, vendor formats
-
-### DHCP
-- Manage ISC Kea and ISC DHCP servers from one UI
-- Multiple pools per subnet (dynamic, reserved, excluded)
-- Static assignments by MAC address
-- DHCP client classes and per-pool options
-- HA server pairs (Kea HA hook, ISC DHCP failover)
-- **Local config caching** — DHCP servers keep serving if control plane is unreachable
-- Real-time lease tracking and reconciliation
-
-### DNS
-- BIND9 and PowerDNS support
-- **Incremental updates** — RFC 2136 DDNS and PowerDNS API, never a full restart
-- DNS views (split-horizon) for internal/external/DMZ zones
-- Server groups — manage clusters of DNS servers as a unit
-- Zone tree — navigate the full namespace hierarchy
-- **Dynamic DNS** — DHCP lease → A + PTR record automatically
-- **Blocking lists** — Pi-hole-style ad/malware blocking via BIND9 RPZ
-- Zone import/export (RFC 1035 zone file format)
-
-### Security & Access Control
-- Local accounts, LDAP/Active Directory, Entra ID (Azure AD), Okta, Keycloak
-- TOTP multi-factor authentication
-- Group-based permissions scoped to specific IP ranges or DNS zones
-- Permissions inherit downward through the hierarchy
-- Global and per-user API tokens with optional scope restriction
-
-### Operations
-- Centralized log viewer built into the admin UI
-- Prometheus metrics on all components
-- Pre-built Grafana dashboards
-- Health dashboard — all services at a glance
-- Service start/stop/restart from the UI
-- Backup and restore with S3/SFTP/Azure Blob support
-- Email, webhook, Slack, and PagerDuty notifications
+- 🗂 **Hierarchical IP management** — spaces, blocks, subnets, addresses in a visual tree
+- 🌐 **Built-in DNS server** — BIND9 container that auto-registers and syncs via RFC 2136
+- 🔄 **DHCP server management** — ISC Kea / ISC DHCP with HA failover (Phase 2)
+- ⏱ **NTP server management** — chrony (Phase 2)
+- 🔒 **Granular permissions** — delegate IP ranges and zones via LDAP / OIDC / SAML
+- 📋 **Full audit trail** — every mutation logged, append-only, viewable in the UI
+- 🚀 **Flexible deployment** — Docker Compose, Kubernetes (Helm), bare metal, or OS appliance
 
 ---
 
 ## Architecture
 
-```
-                        ┌─────────────────────┐
-                        │   React Frontend     │
-                        │   (SPA via nginx)    │
-                        └──────────┬──────────┘
-                                   │ HTTPS
-                        ┌──────────▼──────────┐
-                        │   FastAPI Backend    │
-                        │   (Python 3.12+)     │
-                        └──┬──────────────┬───┘
-                           │              │
-              ┌────────────▼───┐    ┌─────▼──────────┐
-              │  PostgreSQL    │    │  Redis          │
-              │  (HA via       │    │  (Cache +       │
-              │   Patroni)     │    │   Celery broker)│
-              └────────────────┘    └─────────────────┘
-                           │
-         ┌─────────────────┼──────────────────┐
-         │                 │                  │
-┌────────▼──────┐  ┌───────▼───────┐  ┌──────▼───────┐
-│ DHCP Servers  │  │  DNS Servers  │  │  NTP Servers │
-│ Kea / ISC     │  │  BIND9 /      │  │  Chrony /    │
-│ (with agent)  │  │  PowerDNS     │  │  ntpd        │
-└───────────────┘  └───────────────┘  └──────────────┘
-```
+<p align="center">
+  <img src="docs/assets/architecture.svg" alt="SpatiumDDI architecture" width="900"/>
+</p>
 
-**Tech stack:** Python 3.12 · FastAPI · SQLAlchemy · PostgreSQL · Redis · Celery · React 18 · TypeScript · Tailwind CSS · Docker · Kubernetes
+**Control plane** — FastAPI + PostgreSQL + Redis + Celery. Single source of truth for everything (IPAM tree, DNS records, auth, audit log). Exposes a REST API; the web UI and any Terraform / Ansible / CLI integration all speak the same API.
 
----
+**Data plane** — one container per DNS server (Phase 2 adds DHCP + NTP). Each container bakes in a sidecar `spatium-dns-agent` that:
 
-## Deployment Options
+1. **Bootstraps** on first start using a shared `DNS_AGENT_KEY` (PSK) → gets a per-server rotating JWT.
+2. **Long-polls** `/api/v1/dns/agents/config` with ETag. Server holds the connection until config changes or the timer expires.
+3. **Caches** the last-known-good config bundle on disk. If the control plane is unreachable, named keeps serving.
+4. **Drains record ops** over loopback via `nsupdate` + TSIG (RFC 2136). Structural changes reload named; record changes do not.
 
-| Method | Use Case |
-|---|---|
-| **Docker Compose** | Development, small production |
-| **Kubernetes (Helm)** | Production, scalable |
-| **Bare metal / VM (Ansible)** | On-premises without containers |
-| **OS Appliance (ISO / qcow2)** | Air-gapped, zero-dependency deployments |
+The control-plane driver abstraction emits a backend-neutral config bundle. BIND9 is the only supported backend in v1.
+
+**Tech stack**: Python 3.12 · FastAPI · SQLAlchemy 2.x (async) · PostgreSQL 16 · Redis 7 · Celery · React 18 · TypeScript · Tailwind · shadcn/ui · Docker · Kubernetes + Helm
 
 ---
 
 ## Getting Started
 
-> ⚠️ SpatiumDDI is in early development. The instructions below will be updated as the project matures.
+> ⚠️ SpatiumDDI is pre-alpha. Commands and APIs may shift before the first tagged release.
 
 ### Quick start with Docker Compose
 
@@ -137,67 +67,137 @@ It is designed as a modern alternative to commercial DDI platforms like Efficien
 git clone https://github.com/spatiumddi/spatiumddi.git
 cd spatiumddi
 cp .env.example .env
+# Required env vars in .env:
+#   POSTGRES_PASSWORD=<set this>
+#   SECRET_KEY=$(openssl rand -hex 32)
+#   DNS_AGENT_KEY=$(openssl rand -hex 32)   # needed if running the DNS container
+docker compose build
+docker compose run --rm migrate
 docker compose up -d
 ```
 
-Then open `http://localhost` and complete the first-run setup wizard.
+Open `http://localhost:8077` and log in with `admin` / `admin` (you're forced to change the password on first login).
+
+### Running the built-in BIND9 container
+
+The DNS server container is under the `dns` Compose profile — opt in when you want it:
+
+```bash
+docker compose --profile dns up -d
+```
+
+That starts `dns-bind9` bound to host port `5353` (udp + tcp). The agent registers with the control plane automatically using `DNS_AGENT_KEY` from your `.env` and appears in the UI under **DNS → Server Groups → default**.
+
+Create a zone + record in the UI, then verify with `dig`:
+
+```bash
+dig @127.0.0.1 -p 5353 <your-record>.<your-zone> A +short
+dig @127.0.0.1 -p 5353 -x <your-ip> +short    # reverse (PTR)
+```
+
+Record changes propagate to BIND9 via RFC 2136 — typically sub-second, no daemon restart. Zone / ACL / view changes trigger a config reload.
+
+**Production**: point the agent at your real control plane, expose `53/udp` + `53/tcp`, and run one container per DNS server you want in the cluster. All servers in a group share the same TSIG key for dynamic updates.
+
+### API & interactive docs
+
+The FastAPI backend auto-generates OpenAPI / Swagger:
+
+| Path | What |
+|---|---|
+| `http://localhost:8077/api/docs` | Swagger UI — try endpoints directly from the browser |
+| `http://localhost:8077/api/redoc` | ReDoc — cleaner reference layout |
+| `http://localhost:8077/api/openapi.json` | Raw OpenAPI 3 spec (for code generators) |
+
+Every UI action is a REST call, so anything you do in the UI you can do via `curl`, Terraform, or your own client. Log in to the UI first to obtain a bearer token, then use `Authorization: Bearer <token>`.
+
+### Reset the admin password
+
+```bash
+docker compose exec api python - <<'EOF'
+import asyncio
+from sqlalchemy import update
+from app.core.security import hash_password
+from app.db import AsyncSessionLocal
+from app.models.auth import User
+
+async def reset():
+    async with AsyncSessionLocal() as db:
+        await db.execute(update(User).where(User.username == "admin")
+            .values(hashed_password=hash_password("NewPass!"), force_password_change=True))
+        await db.commit()
+
+asyncio.run(reset())
+EOF
+```
 
 ### Requirements
 
 - Docker 24+ and Docker Compose v2, **or**
 - Kubernetes 1.27+ with Helm 3, **or**
-- Ubuntu 22.04 / Debian 12 / Alpine 3.18+ for bare metal
+- Ubuntu 22.04 / Debian 12 / Alpine 3.20+ for bare metal
+
+---
+
+## Deployment Options
+
+| Method | Use case | Status |
+|---|---|---|
+| **Docker Compose** | Dev, small single-host production | ✅ Supported |
+| **Kubernetes + Helm** | Multi-node production, scalable | 🔄 Chart scaffolded (`charts/spatium-dns`) |
+| **Bare metal / VM (Ansible)** | On-prem without containers | 📋 Planned |
+| **OS Appliance (ISO / qcow2)** | Air-gapped, zero-dependency | 📋 Planned |
 
 ---
 
 ## Documentation
 
-Full documentation is at **[spatiumddi.org](https://spatiumddi.org)** (coming soon — hosted on GitHub Pages).
+Full docs at **[spatiumddi.org](https://spatiumddi.org)** (GitHub Pages — coming soon).
 
 | Document | Description |
 |---|---|
-| [Architecture](docs/ARCHITECTURE.md) | System design and component overview |
-| [IPAM Features](docs/features/IPAM.md) | IP space, block, subnet, and address management |
-| [DHCP Features](docs/features/DHCP.md) | DHCP server management, pools, static assignments |
+| [IPAM Features](docs/features/IPAM.md) | IP space, block, subnet, address management |
+| [DHCP Features](docs/features/DHCP.md) | DHCP server management (Phase 2) |
 | [DNS Features](docs/features/DNS.md) | DNS zones, views, server groups, blocking lists |
-| [NTP Features](docs/features/NTP.md) | NTP server management |
-| [Auth & Permissions](docs/features/AUTH.md) | LDAP, OIDC, roles, and scoped permissions |
+| [NTP Features](docs/features/NTP.md) | NTP server management (Phase 2) |
+| [Auth & Permissions](docs/features/AUTH.md) | LDAP, OIDC, roles, scoped permissions |
 | [System Admin](docs/features/SYSTEM_ADMIN.md) | Health dashboard, backup, notifications |
 | [Observability](docs/OBSERVABILITY.md) | Logging, metrics, alerting |
+| [DNS Agent Design](docs/deployment/DNS_AGENT.md) | Agent protocol, auto-registration, config sync |
+| [DNS Driver Spec](docs/drivers/DNS_DRIVERS.md) | BIND9 driver internals |
 | [Appliance Deployment](docs/deployment/APPLIANCE.md) | OS image build and licensing |
-| [DNS Drivers](docs/drivers/DNS_DRIVERS.md) | BIND9 and PowerDNS driver specs |
 
 ---
 
 ## Project Status
 
-SpatiumDDI is currently in the **design and scaffolding phase**. We are actively working toward a first usable release.
-
-| Phase | Status | Focus |
+| Phase | Focus | Status |
 |---|---|---|
-| Phase 1 | 🔄 In progress | Core IPAM, auth, permissions, Docker Compose |
-| Phase 2 | 📋 Planned | DHCP + DNS integration, DDNS, NTP |
-| Phase 3 | 📋 Planned | DNS views, blocking lists, system admin panel |
-| Phase 4 | 📋 Planned | OS appliance, Terraform provider, SAML |
-| Phase 5 | 📋 Planned | Import/export, multi-tenancy, advanced reporting |
+| Phase 1 | Core IPAM, auth, user management, audit log, Docker Compose | 🔄 In progress |
+| Phase 2 | DHCP (Kea + ISC), DNS (BIND9), DDNS, NTP, zone/subnet tree UI | 🔄 DNS landed; DHCP/DDNS/NTP pending |
+| Phase 3 | DNS views, server groups, blocking lists, VLAN/VXLAN, system admin | 🔄 DNS features landed |
+| Phase 4 | OS appliance, Terraform provider, SAML, backup/restore | 📋 Planned |
+| Phase 5 | Multi-tenancy, IP request workflows, advanced reporting | 📋 Planned |
+
+See [CLAUDE.md](CLAUDE.md) for the authoritative feature list.
 
 ---
 
 ## Contributing
 
-Contributions are welcome! SpatiumDDI is an open project and we want to build it in the open.
+Contributions are welcome.
 
-- Read [CONTRIBUTING.md](CONTRIBUTING.md) before submitting a PR
-- Check the [open issues](https://github.com/spatiumddi/spatiumddi/issues) for good first tasks
-- Join the discussion in [GitHub Discussions](https://github.com/spatiumddi/spatiumddi/discussions)
+- Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a PR
+- Good first tasks are tagged on the [issue tracker](https://github.com/spatiumddi/spatiumddi/issues)
+- Design discussion happens in [GitHub Discussions](https://github.com/spatiumddi/spatiumddi/discussions)
 
 ---
 
 ## License
 
-SpatiumDDI is released under the [Apache 2.0 License](LICENSE).
+Released under the [Apache 2.0 License](LICENSE).
 
-Bundled components (BIND9, ISC Kea, PowerDNS, Chrony) are distributed under their own licenses. See [NOTICE](NOTICE) for the full list.
+Bundled components (BIND9, ISC Kea, chrony) are distributed under their own licenses. See [NOTICE](NOTICE) for the full list.
 
 ---
 

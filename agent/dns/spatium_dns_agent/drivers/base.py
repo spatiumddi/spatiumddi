@@ -2,7 +2,7 @@
 
 Mirrors the control-plane DNSDriverBase but on the container side — the agent
 asks its driver to render configs, reload the daemon, and apply RFC 2136 /
-pdns-API record ops over loopback.
+RFC 2136 record ops over loopback.
 """
 
 from __future__ import annotations
@@ -30,7 +30,7 @@ class DriverBase(ABC):
 
     @abstractmethod
     def apply_record_op(self, op: dict[str, Any]) -> None:
-        """Apply a RecordOp via loopback nsupdate / pdns API."""
+        """Apply a RecordOp via loopback nsupdate via RFC 2136."""
 
     @abstractmethod
     def start_daemon(self) -> None:

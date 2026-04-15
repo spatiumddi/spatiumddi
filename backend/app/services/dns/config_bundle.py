@@ -101,6 +101,13 @@ async def build_config_bundle(
             ),
             allow_transfer=tuple(opts_row.allow_transfer or ("none",)),
             blackhole=tuple(opts_row.blackhole or ()),
+            query_log_enabled=opts_row.query_log_enabled,
+            query_log_channel=opts_row.query_log_channel,
+            query_log_file=opts_row.query_log_file,
+            query_log_severity=opts_row.query_log_severity,
+            query_log_print_category=opts_row.query_log_print_category,
+            query_log_print_severity=opts_row.query_log_print_severity,
+            query_log_print_time=opts_row.query_log_print_time,
             trust_anchors=tuple(
                 TrustAnchorData(
                     zone_name=ta.zone_name,

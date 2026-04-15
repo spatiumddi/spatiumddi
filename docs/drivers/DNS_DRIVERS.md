@@ -156,11 +156,9 @@ class BIND9DriverConfig:
 
 ---
 
-## 3. PowerDNS Driver
-
 ### Update Strategy: REST API (all operations, no restarts)
 
-PowerDNS has a native REST API for all operations. No SSH, no config file management, no restarts for any normal operation.
+No SSH, no config file management, no restarts for any normal operation.
 
 | Operation | API Call | Notes |
 |---|---|---|
@@ -171,8 +169,6 @@ PowerDNS has a native REST API for all operations. No SSH, no config file manage
 | Delete zone | `DELETE /api/v1/servers/localhost/zones/{zone}` | |
 | Notify secondaries | `PUT /api/v1/servers/localhost/zones/{zone}/notify` | Triggers AXFR to secondaries |
 | Get zone info | `GET /api/v1/servers/localhost/zones/{zone}` | |
-
-### PowerDNS Record Update Example
 
 ```python
 async def update_record(self, zone_name: str, record: DNSRecordData) -> None:
@@ -192,22 +188,15 @@ async def update_record(self, zone_name: str, record: DNSRecordData) -> None:
         resp.raise_for_status()
 ```
 
-### PowerDNS Views
+Options:
 
-PowerDNS Authoritative Server does not natively support views like BIND9. Options:
-
-1. **Multiple instances** (recommended): Run separate PowerDNS instances per view (e.g., `pdns-internal` on port 5353, `pdns-external` on port 53). Each has its own API endpoint. The driver connects to the appropriate instance based on the view.
+1. **Multiple instances** (recommended): Run separate g.,  on port 5353,  on port 53). Each has its own API endpoint. The driver connects to the appropriate instance based on the view.
 
 2. **GeoIP backend**: For geolocation-based routing (more complex, Phase 3).
 
-The driver's `view_id` parameter selects which PowerDNS instance API to call.
-
-### PowerDNS Driver Configuration
-
+The driver's `view_id` parameter selects which 
 ```python
 @dataclass
-class PowerDNSDriverConfig:
-    api_url: str                  # e.g., "http://pdns-host:8081/api/v1/servers/localhost"
     api_key: str                  # Encrypted in DB (X-API-Key header)
     timeout_seconds: int = 10
     verify_ssl: bool = True
@@ -223,7 +212,6 @@ Drivers are registered by name and instantiated by the service layer:
 # app/drivers/dns/__init__.py
 DNS_DRIVERS: dict[str, type[DNSDriverBase]] = {
     "bind9": BIND9Driver,
-    "powerdns": PowerDNSDriver,
 }
 
 def get_dns_driver(server: DNSServer) -> DNSDriverBase:
@@ -255,7 +243,7 @@ Same agent caching model as DHCP (see DHCP spec). For DNS:
 
 - Cached config includes: all zones + all records the server is authoritative for
 - On control plane outage: DNS server continues serving from its own zone data (it always does — DNS servers are not stateless)
-- The agent ensures the **last-known-good config** (zone files / PowerDNS DB) is preserved
+- The agent ensures the **last-known-good config** (zone files DB) is preserved
 - On reconnect: agent fetches diff of changes made during outage and applies incrementally
 
 ### BIND9 Cache
@@ -263,6 +251,3 @@ Same agent caching model as DHCP (see DHCP spec). For DNS:
 - Agent tracks which zone file versions were last pushed by SpatiumDDI
 - On reconnect: compare SpatiumDDI DB serial vs. zone file serial; apply missing changes
 
-### PowerDNS Cache
-- PowerDNS uses its own database (SQLite or MySQL) — inherently local cache
-- Agent monitors API connectivity; on reconnect, pushes diff via REST API

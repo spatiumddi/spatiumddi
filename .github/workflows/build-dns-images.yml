@@ -21,7 +21,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        flavor: [bind9, powerdns]
+        flavor: [bind9]
     steps:
       - uses: actions/checkout@v4
 

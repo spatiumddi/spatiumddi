@@ -174,7 +174,7 @@ async def _probe_server_soa(host: str, port: int) -> bool:
     """Send an SOA query for "." to ``host:port`` using ``dnspython``.
 
     Returns True if any response is received, False otherwise. Kept deliberately
-    minimal — a deep health driver for BIND9/PowerDNS lives in the Wave 2
+    minimal — a deep health driver for BIND9 lives in the Wave 2
     driver abstraction layer.
     """
     try:

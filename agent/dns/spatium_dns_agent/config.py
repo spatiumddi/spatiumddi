@@ -12,7 +12,7 @@ class AgentConfig:
     control_plane_url: str
     dns_agent_key: str
     server_name: str
-    driver: str  # bind9 | powerdns
+    driver: str  # bind9 (only supported backend)
     roles: list[str]
     group_name: str | None
     tls_ca_path: str | None

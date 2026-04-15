@@ -13,7 +13,6 @@ This product bundles or integrates with the following open source components:
 - React — MIT — https://react.dev
 - ISC Kea DHCP — MPL 2.0 — https://kea.isc.org
 - ISC BIND9 — MPL 2.0 — https://isc.org/bind
-- PowerDNS Authoritative Server — GPL v2 — https://powerdns.com
 - Chrony — GPL v2 — https://chrony-project.org
 - Alpine Linux — MIT + GPL v2 (kernel) — https://alpinelinux.org
 - Debian — DFSG — https://debian.org

@@ -3,14 +3,14 @@
 # Multi-arch: linux/amd64, linux/arm64 (non-negotiable #11)
 ARG PYTHON_VERSION=3.12
 
-FROM alpine:3.20 AS agent-build
+FROM alpine:3.22 AS agent-build
 RUN apk add --no-cache python3 py3-pip py3-wheel
 WORKDIR /src
 COPY agent/dns/pyproject.toml /src/pyproject.toml
 COPY agent/dns/spatium_dns_agent /src/spatium_dns_agent
 RUN python3 -m pip install --prefix=/install --no-cache-dir --break-system-packages .
 
-FROM alpine:3.20 AS runtime
+FROM alpine:3.22 AS runtime
 RUN apk add --no-cache \
       bind bind-tools \
       tini su-exec \
@@ -18,8 +18,8 @@ RUN apk add --no-cache \
       ca-certificates tzdata \
  && addgroup -S spatium \
  && adduser -S -G spatium spatium \
- && mkdir -p /var/lib/spatium-dns-agent /var/cache/bind /var/run/named \
- && chown -R spatium:spatium /var/lib/spatium-dns-agent /var/cache/bind /var/run/named
+ && mkdir -p /var/lib/spatium-dns-agent /var/cache/bind /var/run/named /var/log/named \
+ && chown -R spatium:spatium /var/lib/spatium-dns-agent /var/cache/bind /var/run/named /var/log/named
 
 COPY --from=agent-build /install /usr/local
 COPY agent/dns/images/bind9/entrypoint.sh /usr/local/bin/spatium-dns-entrypoint

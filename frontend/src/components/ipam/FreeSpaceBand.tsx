@@ -94,7 +94,7 @@ export function FreeSpaceBand({
 
   return (
     <div className="space-y-1">
-      <div className="relative h-5 w-full overflow-hidden rounded-sm border border-border bg-muted/20">
+      <div className="relative h-5 w-full overflow-hidden rounded-sm border border-border bg-muted/30 dark:bg-muted/50">
         {segments.map((seg, i) => (
           <button
             key={`${seg.kind}-${seg.network ?? i}`}
@@ -114,7 +114,7 @@ export function FreeSpaceBand({
               seg.kind === "block" && "bg-violet-500/70 hover:bg-violet-500",
               seg.kind === "subnet" && "bg-blue-500/70 hover:bg-blue-500",
               seg.kind === "free" &&
-                "cursor-pointer bg-[repeating-linear-gradient(45deg,theme(colors.zinc.300/.4)_0_4px,transparent_4px_8px)] hover:bg-[repeating-linear-gradient(45deg,theme(colors.emerald.400/.5)_0_4px,transparent_4px_8px)]",
+                "cursor-pointer bg-[repeating-linear-gradient(45deg,theme(colors.zinc.400/.5)_0_4px,transparent_4px_8px)] dark:bg-[repeating-linear-gradient(45deg,theme(colors.zinc.500/.6)_0_4px,transparent_4px_8px)] hover:bg-[repeating-linear-gradient(45deg,theme(colors.emerald.500/.6)_0_4px,transparent_4px_8px)] dark:hover:bg-[repeating-linear-gradient(45deg,theme(colors.emerald.400/.5)_0_4px,transparent_4px_8px)]",
             )}
             aria-label={seg.label}
             disabled={seg.kind !== "free"}
@@ -124,7 +124,7 @@ export function FreeSpaceBand({
       <div className="flex items-center gap-3 text-[10px] text-muted-foreground">
         <Legend color="bg-violet-500/70" label="Child blocks" />
         <Legend color="bg-blue-500/70" label="Subnets" />
-        <Legend color="bg-[repeating-linear-gradient(45deg,theme(colors.zinc.300/.6)_0_4px,transparent_4px_8px)]" label="Free" />
+        <Legend color="bg-[repeating-linear-gradient(45deg,theme(colors.zinc.400/.6)_0_4px,transparent_4px_8px)] dark:bg-[repeating-linear-gradient(45deg,theme(colors.zinc.500/.7)_0_4px,transparent_4px_8px)]" label="Free" />
         {hovered && (
           <span className="ml-auto font-mono text-foreground">{hovered.label}</span>
         )}

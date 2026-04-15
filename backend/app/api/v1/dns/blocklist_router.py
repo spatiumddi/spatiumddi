@@ -9,7 +9,7 @@ Manages:
   - /blocklists/effective/view/{view_id}
   - /blocklists/effective/group/{group_id}
 
-All mutations are audited. No backend-specific logic (BIND9 RPZ / PowerDNS)
+All mutations are audited. No backend-specific logic (BIND9 RPZ)
 lives in this module — the driver will consume the effective representation
 produced by `app.services.dns_blocklist`.
 """

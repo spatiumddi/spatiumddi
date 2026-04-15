@@ -11,7 +11,7 @@ agentKey:
 # The chart renders one StatefulSet + Service pair per entry.
 servers:
   - name: ns1
-    flavor: bind9             # bind9 | powerdns
+    flavor: bind9             # bind9 (only supported backend)
     role: primary             # primary | secondary
     group: internal-resolvers
     image: ghcr.io/spatiumddi/dns-bind9:latest

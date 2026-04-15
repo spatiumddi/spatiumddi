@@ -1,6 +1,6 @@
 apiVersion: v2
 name: spatium-dns
-description: SpatiumDDI managed DNS servers (BIND9 / PowerDNS) with sidecar agent
+description: SpatiumDDI managed BIND9 DNS servers with sidecar agent
 type: application
 version: 0.1.0
 appVersion: "2026.04.14.1"

@@ -90,8 +90,8 @@ The Ingress in `k8s/base/frontend.yaml` uses `ingressClassName: nginx`. For TLS:
 
 ## DNS server deployment
 
-SpatiumDDI ships managed DNS containers (BIND9, PowerDNS) that auto-register
-with the control plane. One `StatefulSet` per `DNSServer` row — see
+SpatiumDDI ships a managed BIND9 DNS container that auto-registers with
+the control plane. One `StatefulSet` per `DNSServer` row — see
 [`docs/deployment/DNS_AGENT.md`](../docs/deployment/DNS_AGENT.md).
 
 ### Secret

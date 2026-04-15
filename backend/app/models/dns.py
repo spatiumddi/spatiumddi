@@ -74,11 +74,11 @@ class DNSServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         UUID(as_uuid=True), ForeignKey("dns_server_group.id", ondelete="CASCADE"), nullable=False, index=True
     )
     name: Mapped[str] = mapped_column(String(255), nullable=False)
-    # driver: bind9 | powerdns
+    # driver: bind9 (only supported backend)
     driver: Mapped[str] = mapped_column(String(50), nullable=False, default="bind9")
     host: Mapped[str] = mapped_column(String(255), nullable=False)
     port: Mapped[int] = mapped_column(Integer, nullable=False, default=53)
-    # api_port: used for rndc (BIND9) or REST API (PowerDNS)
+    # api_port: used for rndc (BIND9)
     api_port: Mapped[int | None] = mapped_column(Integer, nullable=True)
     api_key_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
     # roles: authoritative | recursive | forwarder (JSON array of strings)
@@ -104,7 +104,7 @@ class DNSServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
 
 class DNSRecordOp(UUIDPrimaryKeyMixin, Base):
-    """Per-record mutation queued for an agent to apply via RFC 2136 / pdns API."""
+    """Per-record mutation queued for an agent to apply via RFC 2136."""
 
     __tablename__ = "dns_record_op"
 
@@ -171,6 +171,20 @@ class DNSServerOptions(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
     allow_transfer: Mapped[list] = mapped_column(JSONB, nullable=False, default=lambda: ["none"])
     blackhole: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+
+    # Query logging
+    query_log_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # channel: file | syslog | stderr
+    query_log_channel: Mapped[str] = mapped_column(String(20), nullable=False, default="file")
+    query_log_file: Mapped[str] = mapped_column(
+        String(500), nullable=False, default="/var/log/named/queries.log"
+    )
+    # severity: info | debug | notice | warning | error
+    query_log_severity: Mapped[str] = mapped_column(String(20), nullable=False, default="info")
+    # print-category / print-severity / print-time in `channel` block
+    query_log_print_category: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    query_log_print_severity: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    query_log_print_time: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
     group: Mapped["DNSServerGroup"] = relationship("DNSServerGroup", back_populates="options")
     trust_anchors: Mapped[list["DNSTrustAnchor"]] = relationship(
@@ -412,7 +426,7 @@ class DNSBlockList(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     A blocklist is backend-neutral: the DNS driver consumes an effective list
     of entries + exceptions via the service layer and emits the appropriate
-    BIND9 RPZ zone or PowerDNS Lua/recursor config. No driver specifics live on
+    BIND9 RPZ zone or BIND9 RPZ config. No driver specifics live on
     this model.
     """
 

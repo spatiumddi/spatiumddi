@@ -17,7 +17,6 @@ from .bootstrap import ensure_token
 from .config import AgentConfig
 from .drivers.base import DriverBase
 from .drivers.bind9 import Bind9Driver
-from .drivers.powerdns import PowerDNSDriver
 from .heartbeat import HeartbeatClient
 from .sync import SyncLoop
 
@@ -27,8 +26,6 @@ log = structlog.get_logger(__name__)
 def _select_driver(cfg: AgentConfig) -> DriverBase:
     if cfg.driver == "bind9":
         return Bind9Driver(state_dir=cfg.state_dir)
-    if cfg.driver == "powerdns":
-        return PowerDNSDriver(state_dir=cfg.state_dir)
     raise RuntimeError(f"Unknown driver: {cfg.driver}")
 
 

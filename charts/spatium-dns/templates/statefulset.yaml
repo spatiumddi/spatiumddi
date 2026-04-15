@@ -51,11 +51,7 @@ spec:
           {{- end }}
           volumeMounts:
             - { name: agent-state, mountPath: /var/lib/spatium-dns-agent }
-            {{- if eq $server.flavor "bind9" }}
             - { name: dns-state,   mountPath: /var/cache/bind }
-            {{- else }}
-            - { name: dns-state,   mountPath: /var/lib/powerdns }
-            {{- end }}
   volumeClaimTemplates:
     - metadata: { name: agent-state }
       spec:

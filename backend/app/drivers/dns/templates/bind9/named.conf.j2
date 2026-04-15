@@ -34,6 +34,26 @@ options {
     {%- endif %}
 };
 
+{%- if options.query_log_enabled %}
+logging {
+    channel queries_channel {
+        {%- if options.query_log_channel == "file" %}
+        file "{{ options.query_log_file }}" versions 5 size 50m;
+        {%- elif options.query_log_channel == "syslog" %}
+        syslog daemon;
+        {%- else %}
+        stderr;
+        {%- endif %}
+        severity {{ options.query_log_severity }};
+        print-category {{ "yes" if options.query_log_print_category else "no" }};
+        print-severity {{ "yes" if options.query_log_print_severity else "no" }};
+        print-time {{ "yes" if options.query_log_print_time else "no" }};
+    };
+    category queries { queries_channel; };
+    category query-errors { queries_channel; };
+};
+{%- endif %}
+
 {%- for ta in options.trust_anchors %}
 {%- if loop.first %}
 trust-anchors {

@@ -79,6 +79,9 @@ export interface IPSpace {
   description: string;
   is_default: boolean;
   tags: Record<string, unknown>;
+  dns_group_ids: string[];
+  dns_zone_id: string | null;
+  dns_additional_zone_ids: string[];
 }
 
 export interface IPBlock {
@@ -110,6 +113,58 @@ export interface EffectiveDns {
   dns_zone_id: string | null;
   dns_additional_zone_ids: string[];
   inherited_from_block_id: string | null;
+}
+
+export interface DnsSyncMissing {
+  ip_id: string;
+  ip_address: string;
+  hostname: string;
+  record_type: "A" | "PTR";
+  expected_name: string;
+  expected_value: string;
+  zone_id: string;
+  zone_name: string;
+}
+
+export interface DnsSyncMismatch {
+  record_id: string;
+  ip_id: string;
+  ip_address: string;
+  record_type: "A" | "PTR";
+  zone_id: string;
+  zone_name: string;
+  current_name: string;
+  current_value: string;
+  expected_name: string;
+  expected_value: string;
+}
+
+export interface DnsSyncStale {
+  record_id: string;
+  record_type: string;
+  zone_id: string;
+  zone_name: string;
+  name: string;
+  value: string;
+  reason: string;
+}
+
+export interface DnsSyncPreview {
+  subnet_id: string;
+  forward_zone_id: string | null;
+  forward_zone_name: string | null;
+  reverse_zone_id: string | null;
+  reverse_zone_name: string | null;
+  missing: DnsSyncMissing[];
+  mismatched: DnsSyncMismatch[];
+  stale: DnsSyncStale[];
+}
+
+export interface DnsSyncCommitResult {
+  created: number;
+  updated: number;
+  deleted: number;
+  errors: string[];
 }
 
 export interface Subnet {
@@ -211,6 +266,8 @@ export const ipamApi = {
     api.get<EffectiveDns>(`/ipam/blocks/${blockId}/effective-dns`).then((r) => r.data),
   getEffectiveSubnetDns: (subnetId: string) =>
     api.get<EffectiveDns>(`/ipam/subnets/${subnetId}/effective-dns`).then((r) => r.data),
+  getEffectiveSpaceDns: (spaceId: string) =>
+    api.get<EffectiveDns>(`/ipam/spaces/${spaceId}/effective-dns`).then((r) => r.data),
 
   listSubnets: (params?: { space_id?: string; block_id?: string }) =>
     api.get<Subnet[]>("/ipam/subnets", { params }).then((r) => r.data),
@@ -220,6 +277,34 @@ export const ipamApi = {
   updateSubnet: (id: string, data: Partial<Subnet> & { manage_auto_addresses?: boolean }) =>
     api.put<Subnet>(`/ipam/subnets/${id}`, data).then((r) => r.data),
   deleteSubnet: (id: string) => api.delete(`/ipam/subnets/${id}`),
+
+  dnsSyncPreview: (subnetId: string) =>
+    api.get<DnsSyncPreview>(`/ipam/subnets/${subnetId}/dns-sync/preview`).then((r) => r.data),
+  dnsSyncCommit: (
+    subnetId: string,
+    body: {
+      create_for_ip_ids?: string[];
+      update_record_ids?: string[];
+      delete_stale_record_ids?: string[];
+    },
+  ) =>
+    api.post<DnsSyncCommitResult>(`/ipam/subnets/${subnetId}/dns-sync/commit`, body).then((r) => r.data),
+
+  dnsSyncPreviewBlock: (blockId: string) =>
+    api.get<DnsSyncPreview>(`/ipam/blocks/${blockId}/dns-sync/preview`).then((r) => r.data),
+  dnsSyncCommitBlock: (
+    blockId: string,
+    body: { create_for_ip_ids?: string[]; update_record_ids?: string[]; delete_stale_record_ids?: string[] },
+  ) =>
+    api.post<DnsSyncCommitResult>(`/ipam/blocks/${blockId}/dns-sync/commit`, body).then((r) => r.data),
+
+  dnsSyncPreviewSpace: (spaceId: string) =>
+    api.get<DnsSyncPreview>(`/ipam/spaces/${spaceId}/dns-sync/preview`).then((r) => r.data),
+  dnsSyncCommitSpace: (
+    spaceId: string,
+    body: { create_for_ip_ids?: string[]; update_record_ids?: string[]; delete_stale_record_ids?: string[] },
+  ) =>
+    api.post<DnsSyncCommitResult>(`/ipam/spaces/${spaceId}/dns-sync/commit`, body).then((r) => r.data),
 
   listAddresses: (subnetId: string) =>
     api.get<IPAddress[]>(`/ipam/subnets/${subnetId}/addresses`).then((r) => r.data),
@@ -342,7 +427,8 @@ export const ipamIoApi = {
     const res = await api.get(ipamIoApi.exportUrl(params), { responseType: "blob" });
     const disp = (res.headers["content-disposition"] as string) || "";
     const match = disp.match(/filename="?([^";]+)"?/i);
-    const filename = match ? match[1] : `ipam-export.${params.format}`;
+    const date = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+    const filename = match ? match[1] : `ipam-export-${date}.${params.format}`;
     const blob = new Blob([res.data as BlobPart]);
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -562,6 +648,13 @@ export interface DNSServerOptions {
   allow_query_cache: string[];
   allow_transfer: string[];
   blackhole: string[];
+  query_log_enabled: boolean;
+  query_log_channel: string;
+  query_log_file: string;
+  query_log_severity: string;
+  query_log_print_category: boolean;
+  query_log_print_severity: boolean;
+  query_log_print_time: boolean;
   trust_anchors: DNSTrustAnchor[];
   modified_at: string;
 }

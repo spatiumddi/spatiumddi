@@ -116,26 +116,6 @@ def test_registry_returns_bind9() -> None:
     assert drv.capabilities()["name"] == "bind9"
 
 
-def test_registry_powerdns_stub_raises() -> None:
-    drv = get_driver("powerdns")
-    with pytest.raises(NotImplementedError):
-        drv.render_zone_config(
-            ZoneData(
-                name="x.",
-                zone_type="primary",
-                kind="forward",
-                ttl=60,
-                refresh=60,
-                retry=60,
-                expire=60,
-                minimum=60,
-                primary_ns="",
-                admin_email="",
-                serial=1,
-            )
-        )
-
-
 def test_registry_unknown_driver_raises() -> None:
     with pytest.raises(ValueError):
         get_driver("djbdns")

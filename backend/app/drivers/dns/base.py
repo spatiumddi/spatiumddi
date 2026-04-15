@@ -2,8 +2,8 @@
 
 The control-plane DNS driver is a *thin* translator: it takes SpatiumDDI DB
 models and emits a canonical, backend-neutral `ConfigBundle` (plus per-record
-`RecordChange` ops). The actual daemon lifecycle (nsupdate, rndc, pdns API)
-runs inside the agent container — see ``docs/deployment/DNS_AGENT.md`` §3.
+`RecordChange` ops). The actual daemon lifecycle (nsupdate, rndc) runs
+inside the agent container — see ``docs/deployment/DNS_AGENT.md`` §3.
 
 CLAUDE.md non-negotiable #10: no daemon specifics leak into the service
 layer. The service layer calls ``get_driver(server.driver)`` and receives a
@@ -97,6 +97,13 @@ class ServerOptions:
     allow_transfer: tuple[str, ...] = ("none",)
     blackhole: tuple[str, ...] = ()
     trust_anchors: tuple[TrustAnchorData, ...] = ()
+    query_log_enabled: bool = False
+    query_log_channel: str = "file"
+    query_log_file: str = "/var/log/named/queries.log"
+    query_log_severity: str = "info"
+    query_log_print_category: bool = True
+    query_log_print_severity: bool = True
+    query_log_print_time: bool = True
 
 
 @dataclass(frozen=True)
@@ -120,7 +127,7 @@ class BlocklistEntry:
 class EffectiveBlocklistData:
     """Neutral projection of ``app.services.dns_blocklist.EffectiveBlocklist``.
 
-    Drivers consume this to render backend-specific output (BIND9 RPZ, PowerDNS
+    Drivers consume this to render backend-specific output (BIND9 RPZ
     Lua, etc.). The service-layer builder converts the service dataclass into
     this driver-neutral dataclass so drivers never import service modules.
     """
@@ -140,7 +147,7 @@ class ConfigBundle:
 
     server_id: str
     server_name: str
-    driver: str                       # bind9 | powerdns
+    driver: str                       # bind9
     roles: tuple[str, ...]
     options: ServerOptions
     acls: tuple[AclData, ...]
@@ -176,7 +183,7 @@ class ConfigBundle:
         return "sha256:" + hashlib.sha256(blob).hexdigest()
 
 
-# ── Per-record incremental ops (agent loopback nsupdate / pdns API) ────────
+# ── Per-record incremental ops (agent loopback nsupdate over TSIG) ─────────
 
 
 @dataclass(frozen=True)

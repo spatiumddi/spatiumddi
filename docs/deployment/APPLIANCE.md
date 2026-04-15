@@ -52,7 +52,7 @@ SpatiumDDI can be shipped as a **self-contained OS appliance image** — a boota
 - `glibc` — full compatibility with all Python C extensions
 - `systemd` — industry standard, best documentation
 - `apt` with `stable` channel — predictable, LTS lifecycle
-- ISC Kea, BIND9, PowerDNS, Chrony all have well-maintained `.deb` packages
+- ISC Kea, BIND9, Chrony all have well-maintained `.deb` packages
 - Debian itself is 100% free software (DFSG-compliant)
 
 **Cons:**
@@ -206,16 +206,13 @@ UpdateConfig
 | FastAPI, SQLAlchemy, etc. | MIT / BSD | Include license notices in NOTICE file |
 | BIND9 | MPL 2.0 | File-level copyleft; modifications to BIND source must be MPL |
 | ISC Kea | MPL 2.0 | Same as BIND9 |
-| PowerDNS Authoritative | GPL v2 | If shipping the binary: must provide source (link acceptable) |
-| PowerDNS Recursor | GPL v2 | Same |
 | React, shadcn/ui | MIT | No copyleft restrictions |
 | **SpatiumDDI itself** | Apache 2.0 | Permissive; compatible with all above |
 
 ### Key Conclusions:
 1. You are **not required** to open-source the SpatiumDDI application code due to GPL components — GPL applies to the GPL'd components themselves, not to user-space applications running on top.
 2. You **must** include a `NOTICE` file listing all bundled open-source components and their licenses.
-3. PowerDNS GPL v2 means if you **modify PowerDNS source code**, those modifications must be GPL v2. If you just ship the binary unmodified (which is the plan), you must make the source available — linking to the upstream PowerDNS GitHub repository is sufficient.
-4. ISC Kea and BIND9 are MPL 2.0 — same situation: modifications to those files must be MPL, but unmodified shipping just requires source availability (upstream link is fine).
+3. If you just ship the binary unmodified (which is the plan), you must make the source available — linking to the upstream 4. ISC Kea and BIND9 are MPL 2.0 — same situation: modifications to those files must be MPL, but unmodified shipping just requires source availability (upstream link is fine).
 
 ### Required Files in Appliance
 - `NOTICE` — lists all bundled components + licenses
