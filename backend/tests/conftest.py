@@ -5,18 +5,16 @@ ORM/query issues early. Set TEST_DATABASE_URL in the environment or
 docker-compose.test.yml.
 """
 
-import asyncio
 import os
 from collections.abc import AsyncGenerator
 
-import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
+from app.db import get_db
 from app.main import app
 from app.models.base import Base
-from app.db import get_db
 
 TEST_DATABASE_URL = os.getenv(
     "TEST_DATABASE_URL",

@@ -1,26 +1,35 @@
 import { useState } from "react";
 import { NavLink } from "react-router-dom";
 import {
-  Network, Globe, LayoutDashboard, Server, Clock,
-  Github, Users, ClipboardList, ChevronsLeft, ChevronsRight,
-  Settings, Tags,
+  Network,
+  Globe,
+  LayoutDashboard,
+  Server,
+  Clock,
+  Github,
+  Users,
+  ClipboardList,
+  ChevronsLeft,
+  ChevronsRight,
+  Settings,
+  Tags,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import logoIcon from "@/assets/logo-icon.svg";
 
 const mainNav = [
   { label: "Dashboard", icon: LayoutDashboard, to: "/dashboard" },
-  { label: "IPAM",      icon: Network,          to: "/ipam" },
-  { label: "DHCP",      icon: Server,           to: "/dhcp", disabled: true },
-  { label: "DNS",       icon: Globe,            to: "/dns" },
-  { label: "NTP",       icon: Clock,            to: "/ntp",  disabled: true },
+  { label: "IPAM", icon: Network, to: "/ipam" },
+  { label: "DHCP", icon: Server, to: "/dhcp", disabled: true },
+  { label: "DNS", icon: Globe, to: "/dns" },
+  { label: "NTP", icon: Clock, to: "/ntp", disabled: true },
 ];
 
 const adminNav = [
-  { label: "Users",         icon: Users,         to: "/admin/users" },
-  { label: "Audit Log",     icon: ClipboardList, to: "/admin/audit" },
-  { label: "Custom Fields", icon: Tags,          to: "/admin/custom-fields" },
-  { label: "Settings",      icon: Settings,      to: "/settings" },
+  { label: "Users", icon: Users, to: "/admin/users" },
+  { label: "Audit Log", icon: ClipboardList, to: "/admin/audit" },
+  { label: "Custom Fields", icon: Tags, to: "/admin/custom-fields" },
+  { label: "Settings", icon: Settings, to: "/settings" },
 ];
 
 function NavItem({
@@ -49,7 +58,7 @@ function NavItem({
           isActive
             ? "bg-primary text-primary-foreground"
             : "text-muted-foreground hover:bg-accent hover:text-accent-foreground",
-          disabled && "pointer-events-none opacity-40"
+          disabled && "pointer-events-none opacity-40",
         )
       }
     >
@@ -61,7 +70,7 @@ function NavItem({
 
 export function Sidebar() {
   const [collapsed, setCollapsed] = useState(
-    () => localStorage.getItem("sidebar-collapsed") === "true"
+    () => localStorage.getItem("sidebar-collapsed") === "true",
   );
 
   function toggle() {
@@ -76,18 +85,24 @@ export function Sidebar() {
     <aside
       className={cn(
         "flex flex-shrink-0 flex-col border-r bg-card transition-all duration-200",
-        collapsed ? "w-14" : "w-56"
+        collapsed ? "w-14" : "w-56",
       )}
     >
       {/* Logo */}
       <div
         className={cn(
           "flex h-14 items-center border-b",
-          collapsed ? "justify-center px-0" : "gap-2 px-4"
+          collapsed ? "justify-center px-0" : "gap-2 px-4",
         )}
       >
-        <img src={logoIcon} alt="SpatiumDDI" className="h-7 w-7 flex-shrink-0" />
-        {!collapsed && <span className="font-semibold tracking-tight">SpatiumDDI</span>}
+        <img
+          src={logoIcon}
+          alt="SpatiumDDI"
+          className="h-7 w-7 flex-shrink-0"
+        />
+        {!collapsed && (
+          <span className="font-semibold tracking-tight">SpatiumDDI</span>
+        )}
       </div>
 
       {/* Nav */}
@@ -114,10 +129,17 @@ export function Sidebar() {
       </nav>
 
       {/* Footer */}
-      <div className={cn("border-t p-2 space-y-1", collapsed && "flex flex-col items-center")}>
+      <div
+        className={cn(
+          "border-t p-2 space-y-1",
+          collapsed && "flex flex-col items-center",
+        )}
+      >
         {!collapsed && (
           <div className="px-3 py-1">
-            <span className="text-xs font-mono text-muted-foreground/60">v{__APP_VERSION__}</span>
+            <span className="text-xs font-mono text-muted-foreground/60">
+              v{__APP_VERSION__}
+            </span>
           </div>
         )}
 
@@ -128,7 +150,7 @@ export function Sidebar() {
           title={collapsed ? "GitHub" : undefined}
           className={cn(
             "flex items-center rounded-md px-3 py-2 text-sm font-medium text-muted-foreground hover:bg-accent hover:text-accent-foreground transition-colors",
-            collapsed ? "justify-center" : "gap-3"
+            collapsed ? "justify-center" : "gap-3",
           )}
         >
           <Github className="h-4 w-4 flex-shrink-0" />
@@ -141,13 +163,17 @@ export function Sidebar() {
           title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
           className={cn(
             "flex w-full items-center rounded-md px-3 py-2 text-sm text-muted-foreground hover:bg-accent hover:text-accent-foreground transition-colors",
-            collapsed ? "justify-center" : "gap-3"
+            collapsed ? "justify-center" : "gap-3",
           )}
         >
-          {collapsed
-            ? <ChevronsRight className="h-4 w-4 flex-shrink-0" />
-            : <><ChevronsLeft className="h-4 w-4 flex-shrink-0" /><span>Collapse</span></>
-          }
+          {collapsed ? (
+            <ChevronsRight className="h-4 w-4 flex-shrink-0" />
+          ) : (
+            <>
+              <ChevronsLeft className="h-4 w-4 flex-shrink-0" />
+              <span>Collapse</span>
+            </>
+          )}
         </button>
       </div>
     </aside>

@@ -24,7 +24,9 @@ function createClient(): AxiosInstance {
   client.interceptors.response.use(
     (res) => res,
     async (err: AxiosError) => {
-      const originalRequest = err.config as typeof err.config & { _retry?: boolean };
+      const originalRequest = err.config as typeof err.config & {
+        _retry?: boolean;
+      };
       if (err.response?.status === 401 && !originalRequest?._retry) {
         const refreshToken = localStorage.getItem("refresh_token");
         if (!refreshToken) {
@@ -36,7 +38,8 @@ function createClient(): AxiosInstance {
         if (isRefreshing) {
           return new Promise((resolve) => {
             refreshQueue.push((token: string) => {
-              if (originalRequest?.headers) originalRequest.headers.Authorization = `Bearer ${token}`;
+              if (originalRequest?.headers)
+                originalRequest.headers.Authorization = `Bearer ${token}`;
               resolve(client(originalRequest!));
             });
           });
@@ -45,13 +48,16 @@ function createClient(): AxiosInstance {
         originalRequest._retry = true;
         isRefreshing = true;
         try {
-          const res = await client.post("/auth/refresh", { refresh_token: refreshToken });
+          const res = await client.post("/auth/refresh", {
+            refresh_token: refreshToken,
+          });
           const { access_token, refresh_token: newRefresh } = res.data;
           localStorage.setItem("access_token", access_token);
           localStorage.setItem("refresh_token", newRefresh);
           refreshQueue.forEach((cb) => cb(access_token));
           refreshQueue = [];
-          if (originalRequest?.headers) originalRequest.headers.Authorization = `Bearer ${access_token}`;
+          if (originalRequest?.headers)
+            originalRequest.headers.Authorization = `Bearer ${access_token}`;
           return client(originalRequest!);
         } catch {
           localStorage.removeItem("access_token");
@@ -63,7 +69,7 @@ function createClient(): AxiosInstance {
         }
       }
       return Promise.reject(err);
-    }
+    },
   );
 
   return client;
@@ -242,7 +248,8 @@ export interface SubnetBulkEditResponse {
 
 export const ipamApi = {
   listSpaces: () => api.get<IPSpace[]>("/ipam/spaces").then((r) => r.data),
-  getSpace: (id: string) => api.get<IPSpace>(`/ipam/spaces/${id}`).then((r) => r.data),
+  getSpace: (id: string) =>
+    api.get<IPSpace>(`/ipam/spaces/${id}`).then((r) => r.data),
   createSpace: (data: Partial<IPSpace>) =>
     api.post<IPSpace>("/ipam/spaces", data).then((r) => r.data),
   updateSpace: (id: string, data: Partial<IPSpace>) =>
@@ -251,35 +258,69 @@ export const ipamApi = {
 
   listBlocks: (spaceId?: string) =>
     api
-      .get<IPBlock[]>("/ipam/blocks", { params: spaceId ? { space_id: spaceId } : undefined })
+      .get<
+        IPBlock[]
+      >("/ipam/blocks", { params: spaceId ? { space_id: spaceId } : undefined })
       .then((r) => r.data),
   createBlock: (data: Partial<IPBlock>) =>
     api.post<IPBlock>("/ipam/blocks", data).then((r) => r.data),
-  updateBlock: (id: string, data: Partial<Pick<IPBlock, "name" | "description" | "parent_block_id" | "tags" | "custom_fields" | "dns_group_ids" | "dns_zone_id" | "dns_additional_zone_ids" | "dns_inherit_settings">>) =>
-    api.put<IPBlock>(`/ipam/blocks/${id}`, data).then((r) => r.data),
+  updateBlock: (
+    id: string,
+    data: Partial<
+      Pick<
+        IPBlock,
+        | "name"
+        | "description"
+        | "parent_block_id"
+        | "tags"
+        | "custom_fields"
+        | "dns_group_ids"
+        | "dns_zone_id"
+        | "dns_additional_zone_ids"
+        | "dns_inherit_settings"
+      >
+    >,
+  ) => api.put<IPBlock>(`/ipam/blocks/${id}`, data).then((r) => r.data),
   deleteBlock: (id: string) => api.delete(`/ipam/blocks/${id}`),
   availableSubnets: (blockId: string, prefixLen: number) =>
-    api.get<string[]>(`/ipam/blocks/${blockId}/available-subnets`, { params: { prefix_len: prefixLen } }).then((r) => r.data),
+    api
+      .get<
+        string[]
+      >(`/ipam/blocks/${blockId}/available-subnets`, { params: { prefix_len: prefixLen } })
+      .then((r) => r.data),
   blockFreeSpace: (blockId: string) =>
-    api.get<FreeCidrRange[]>(`/ipam/blocks/${blockId}/free-space`).then((r) => r.data),
+    api
+      .get<FreeCidrRange[]>(`/ipam/blocks/${blockId}/free-space`)
+      .then((r) => r.data),
   getEffectiveBlockDns: (blockId: string) =>
-    api.get<EffectiveDns>(`/ipam/blocks/${blockId}/effective-dns`).then((r) => r.data),
+    api
+      .get<EffectiveDns>(`/ipam/blocks/${blockId}/effective-dns`)
+      .then((r) => r.data),
   getEffectiveSubnetDns: (subnetId: string) =>
-    api.get<EffectiveDns>(`/ipam/subnets/${subnetId}/effective-dns`).then((r) => r.data),
+    api
+      .get<EffectiveDns>(`/ipam/subnets/${subnetId}/effective-dns`)
+      .then((r) => r.data),
   getEffectiveSpaceDns: (spaceId: string) =>
-    api.get<EffectiveDns>(`/ipam/spaces/${spaceId}/effective-dns`).then((r) => r.data),
+    api
+      .get<EffectiveDns>(`/ipam/spaces/${spaceId}/effective-dns`)
+      .then((r) => r.data),
 
   listSubnets: (params?: { space_id?: string; block_id?: string }) =>
     api.get<Subnet[]>("/ipam/subnets", { params }).then((r) => r.data),
-  getSubnet: (id: string) => api.get<Subnet>(`/ipam/subnets/${id}`).then((r) => r.data),
+  getSubnet: (id: string) =>
+    api.get<Subnet>(`/ipam/subnets/${id}`).then((r) => r.data),
   createSubnet: (data: Partial<Subnet>) =>
     api.post<Subnet>("/ipam/subnets", data).then((r) => r.data),
-  updateSubnet: (id: string, data: Partial<Subnet> & { manage_auto_addresses?: boolean }) =>
-    api.put<Subnet>(`/ipam/subnets/${id}`, data).then((r) => r.data),
+  updateSubnet: (
+    id: string,
+    data: Partial<Subnet> & { manage_auto_addresses?: boolean },
+  ) => api.put<Subnet>(`/ipam/subnets/${id}`, data).then((r) => r.data),
   deleteSubnet: (id: string) => api.delete(`/ipam/subnets/${id}`),
 
   dnsSyncPreview: (subnetId: string) =>
-    api.get<DnsSyncPreview>(`/ipam/subnets/${subnetId}/dns-sync/preview`).then((r) => r.data),
+    api
+      .get<DnsSyncPreview>(`/ipam/subnets/${subnetId}/dns-sync/preview`)
+      .then((r) => r.data),
   dnsSyncCommit: (
     subnetId: string,
     body: {
@@ -288,51 +329,115 @@ export const ipamApi = {
       delete_stale_record_ids?: string[];
     },
   ) =>
-    api.post<DnsSyncCommitResult>(`/ipam/subnets/${subnetId}/dns-sync/commit`, body).then((r) => r.data),
+    api
+      .post<DnsSyncCommitResult>(
+        `/ipam/subnets/${subnetId}/dns-sync/commit`,
+        body,
+      )
+      .then((r) => r.data),
 
   dnsSyncPreviewBlock: (blockId: string) =>
-    api.get<DnsSyncPreview>(`/ipam/blocks/${blockId}/dns-sync/preview`).then((r) => r.data),
+    api
+      .get<DnsSyncPreview>(`/ipam/blocks/${blockId}/dns-sync/preview`)
+      .then((r) => r.data),
   dnsSyncCommitBlock: (
     blockId: string,
-    body: { create_for_ip_ids?: string[]; update_record_ids?: string[]; delete_stale_record_ids?: string[] },
+    body: {
+      create_for_ip_ids?: string[];
+      update_record_ids?: string[];
+      delete_stale_record_ids?: string[];
+    },
   ) =>
-    api.post<DnsSyncCommitResult>(`/ipam/blocks/${blockId}/dns-sync/commit`, body).then((r) => r.data),
+    api
+      .post<DnsSyncCommitResult>(
+        `/ipam/blocks/${blockId}/dns-sync/commit`,
+        body,
+      )
+      .then((r) => r.data),
 
   dnsSyncPreviewSpace: (spaceId: string) =>
-    api.get<DnsSyncPreview>(`/ipam/spaces/${spaceId}/dns-sync/preview`).then((r) => r.data),
+    api
+      .get<DnsSyncPreview>(`/ipam/spaces/${spaceId}/dns-sync/preview`)
+      .then((r) => r.data),
   dnsSyncCommitSpace: (
     spaceId: string,
-    body: { create_for_ip_ids?: string[]; update_record_ids?: string[]; delete_stale_record_ids?: string[] },
+    body: {
+      create_for_ip_ids?: string[];
+      update_record_ids?: string[];
+      delete_stale_record_ids?: string[];
+    },
   ) =>
-    api.post<DnsSyncCommitResult>(`/ipam/spaces/${spaceId}/dns-sync/commit`, body).then((r) => r.data),
+    api
+      .post<DnsSyncCommitResult>(
+        `/ipam/spaces/${spaceId}/dns-sync/commit`,
+        body,
+      )
+      .then((r) => r.data),
 
   listAddresses: (subnetId: string) =>
-    api.get<IPAddress[]>(`/ipam/subnets/${subnetId}/addresses`).then((r) => r.data),
-  createAddress: (data: Partial<IPAddress> & { hostname: string; dns_zone_id?: string | null }) =>
-    api.post<IPAddress>(`/ipam/subnets/${data.subnet_id}/addresses`, data).then((r) => r.data),
-  updateAddress: (id: string, data: Partial<IPAddress> & { dns_zone_id?: string | null }) =>
-    api.put<IPAddress>(`/ipam/addresses/${id}`, data).then((r) => r.data),
+    api
+      .get<IPAddress[]>(`/ipam/subnets/${subnetId}/addresses`)
+      .then((r) => r.data),
+  createAddress: (
+    data: Partial<IPAddress> & {
+      hostname: string;
+      dns_zone_id?: string | null;
+    },
+  ) =>
+    api
+      .post<IPAddress>(`/ipam/subnets/${data.subnet_id}/addresses`, data)
+      .then((r) => r.data),
+  updateAddress: (
+    id: string,
+    data: Partial<IPAddress> & { dns_zone_id?: string | null },
+  ) => api.put<IPAddress>(`/ipam/addresses/${id}`, data).then((r) => r.data),
   deleteAddress: (id: string, permanent = false) =>
-    api.delete(`/ipam/addresses/${id}`, { params: permanent ? { permanent: true } : undefined }),
-  nextAddress: (subnetId: string, data: { hostname: string; status?: string; mac_address?: string; description?: string; custom_fields?: Record<string, unknown>; dns_zone_id?: string | null }) =>
-    api.post<IPAddress>(`/ipam/subnets/${subnetId}/next`, data).then((r) => r.data),
+    api.delete(`/ipam/addresses/${id}`, {
+      params: permanent ? { permanent: true } : undefined,
+    }),
+  nextAddress: (
+    subnetId: string,
+    data: {
+      hostname: string;
+      status?: string;
+      mac_address?: string;
+      description?: string;
+      custom_fields?: Record<string, unknown>;
+      dns_zone_id?: string | null;
+    },
+  ) =>
+    api
+      .post<IPAddress>(`/ipam/subnets/${subnetId}/next`, data)
+      .then((r) => r.data),
 
   // Subnet ↔ DNS domain associations (§11)
   listSubnetDomains: (subnetId: string) =>
-    api.get<SubnetDomain[]>(`/ipam/subnets/${subnetId}/domains`).then((r) => r.data),
-  addSubnetDomain: (subnetId: string, data: { dns_zone_id: string; is_primary?: boolean }) =>
-    api.post<SubnetDomain>(`/ipam/subnets/${subnetId}/domains`, data).then((r) => r.data),
+    api
+      .get<SubnetDomain[]>(`/ipam/subnets/${subnetId}/domains`)
+      .then((r) => r.data),
+  addSubnetDomain: (
+    subnetId: string,
+    data: { dns_zone_id: string; is_primary?: boolean },
+  ) =>
+    api
+      .post<SubnetDomain>(`/ipam/subnets/${subnetId}/domains`, data)
+      .then((r) => r.data),
   removeSubnetDomain: (subnetId: string, domainId: string) =>
     api.delete(`/ipam/subnets/${subnetId}/domains/${domainId}`),
 
   // Effective (inherited) tags + custom_fields (§11)
   effectiveFields: (subnetId: string) =>
-    api.get<EffectiveFields>(`/ipam/subnets/${subnetId}/effective-fields`).then((r) => r.data),
+    api
+      .get<EffectiveFields>(`/ipam/subnets/${subnetId}/effective-fields`)
+      .then((r) => r.data),
 
   // Bulk edit multiple subnets in one transaction (§11)
   bulkEditSubnets: (subnet_ids: string[], changes: SubnetBulkEditChanges) =>
     api
-      .post<SubnetBulkEditResponse>("/ipam/subnets/bulk-edit", { subnet_ids, changes })
+      .post<SubnetBulkEditResponse>("/ipam/subnets/bulk-edit", {
+        subnet_ids,
+        changes,
+      })
       .then((r) => r.data),
 };
 
@@ -386,18 +491,32 @@ function _buildImportForm(
 }
 
 export const ipamIoApi = {
-  preview: (file: File, opts: { space_id?: string; space_name?: string; strategy: ImportStrategy }) =>
+  preview: (
+    file: File,
+    opts: { space_id?: string; space_name?: string; strategy: ImportStrategy },
+  ) =>
     api
-      .post<ImportPreviewResponse>("/ipam/import/preview", _buildImportForm(file, opts), {
-        headers: { "Content-Type": "multipart/form-data" },
-      })
+      .post<ImportPreviewResponse>(
+        "/ipam/import/preview",
+        _buildImportForm(file, opts),
+        {
+          headers: { "Content-Type": "multipart/form-data" },
+        },
+      )
       .then((r) => r.data),
 
-  commit: (file: File, opts: { space_id?: string; space_name?: string; strategy: ImportStrategy }) =>
+  commit: (
+    file: File,
+    opts: { space_id?: string; space_name?: string; strategy: ImportStrategy },
+  ) =>
     api
-      .post<ImportCommitResponse>("/ipam/import/commit", _buildImportForm(file, opts), {
-        headers: { "Content-Type": "multipart/form-data" },
-      })
+      .post<ImportCommitResponse>(
+        "/ipam/import/commit",
+        _buildImportForm(file, opts),
+        {
+          headers: { "Content-Type": "multipart/form-data" },
+        },
+      )
       .then((r) => r.data),
 
   exportUrl: (params: {
@@ -424,7 +543,9 @@ export const ipamIoApi = {
     format: "csv" | "json" | "xlsx";
     include_addresses?: boolean;
   }) => {
-    const res = await api.get(ipamIoApi.exportUrl(params), { responseType: "blob" });
+    const res = await api.get(ipamIoApi.exportUrl(params), {
+      responseType: "blob",
+    });
     const disp = (res.headers["content-disposition"] as string) || "";
     const match = disp.match(/filename="?([^";]+)"?/i);
     const date = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
@@ -471,8 +592,19 @@ export const usersApi = {
     is_superadmin: boolean;
     force_password_change: boolean;
   }) => api.post<AppUser>("/users", data).then((r) => r.data),
-  update: (id: string, data: Partial<Pick<AppUser, "display_name" | "email" | "is_active" | "is_superadmin" | "force_password_change">>) =>
-    api.put<AppUser>(`/users/${id}`, data).then((r) => r.data),
+  update: (
+    id: string,
+    data: Partial<
+      Pick<
+        AppUser,
+        | "display_name"
+        | "email"
+        | "is_active"
+        | "is_superadmin"
+        | "force_password_change"
+      >
+    >,
+  ) => api.put<AppUser>(`/users/${id}`, data).then((r) => r.data),
   resetPassword: (id: string, newPassword: string) =>
     api.post(`/users/${id}/reset-password`, { new_password: newPassword }),
   delete: (id: string) => api.delete(`/users/${id}`),
@@ -509,7 +641,14 @@ export const auditApi = {
 // ── Search ─────────────────────────────────────────────────────────────────────
 
 export interface SearchResult {
-  type: "ip_address" | "subnet" | "block" | "space" | "dns_group" | "dns_zone" | "dns_record";
+  type:
+    | "ip_address"
+    | "subnet"
+    | "block"
+    | "space"
+    | "dns_group"
+    | "dns_zone"
+    | "dns_record";
   id: string;
   display: string;
   name: string | null;
@@ -590,12 +729,18 @@ export interface CustomField {
 export const customFieldsApi = {
   list: (resource_type?: string) =>
     api
-      .get<CustomField[]>("/custom-fields", { params: resource_type ? { resource_type } : undefined })
+      .get<
+        CustomField[]
+      >("/custom-fields", { params: resource_type ? { resource_type } : undefined })
       .then((r) => r.data),
   create: (data: Omit<CustomField, "id">) =>
     api.post<CustomField>("/custom-fields", data).then((r) => r.data),
-  update: (id: string, data: Partial<Omit<CustomField, "id" | "resource_type" | "name" | "field_type">>) =>
-    api.put<CustomField>(`/custom-fields/${id}`, data).then((r) => r.data),
+  update: (
+    id: string,
+    data: Partial<
+      Omit<CustomField, "id" | "resource_type" | "name" | "field_type">
+    >,
+  ) => api.put<CustomField>(`/custom-fields/${id}`, data).then((r) => r.data),
   delete: (id: string) => api.delete(`/custom-fields/${id}`),
 };
 
@@ -747,7 +892,8 @@ export interface DNSRecord {
 
 export const dnsApi = {
   // Server groups
-  listGroups: () => api.get<DNSServerGroup[]>("/dns/groups").then((r) => r.data),
+  listGroups: () =>
+    api.get<DNSServerGroup[]>("/dns/groups").then((r) => r.data),
   createGroup: (data: Partial<DNSServerGroup>) =>
     api.post<DNSServerGroup>("/dns/groups", data).then((r) => r.data),
   updateGroup: (id: string, data: Partial<DNSServerGroup>) =>
@@ -757,20 +903,43 @@ export const dnsApi = {
   // Servers
   listServers: (groupId: string) =>
     api.get<DNSServer[]>(`/dns/groups/${groupId}/servers`).then((r) => r.data),
-  createServer: (groupId: string, data: Partial<DNSServer> & { api_key?: string }) =>
-    api.post<DNSServer>(`/dns/groups/${groupId}/servers`, data).then((r) => r.data),
-  updateServer: (groupId: string, serverId: string, data: Partial<DNSServer> & { api_key?: string }) =>
-    api.put<DNSServer>(`/dns/groups/${groupId}/servers/${serverId}`, data).then((r) => r.data),
+  createServer: (
+    groupId: string,
+    data: Partial<DNSServer> & { api_key?: string },
+  ) =>
+    api
+      .post<DNSServer>(`/dns/groups/${groupId}/servers`, data)
+      .then((r) => r.data),
+  updateServer: (
+    groupId: string,
+    serverId: string,
+    data: Partial<DNSServer> & { api_key?: string },
+  ) =>
+    api
+      .put<DNSServer>(`/dns/groups/${groupId}/servers/${serverId}`, data)
+      .then((r) => r.data),
   deleteServer: (groupId: string, serverId: string) =>
     api.delete(`/dns/groups/${groupId}/servers/${serverId}`),
 
   // Server options
   getOptions: (groupId: string) =>
-    api.get<DNSServerOptions>(`/dns/groups/${groupId}/options`).then((r) => r.data),
+    api
+      .get<DNSServerOptions>(`/dns/groups/${groupId}/options`)
+      .then((r) => r.data),
   updateOptions: (groupId: string, data: Partial<DNSServerOptions>) =>
-    api.put<DNSServerOptions>(`/dns/groups/${groupId}/options`, data).then((r) => r.data),
-  addTrustAnchor: (groupId: string, data: Omit<DNSTrustAnchor, "id" | "added_at">) =>
-    api.post<DNSTrustAnchor>(`/dns/groups/${groupId}/options/trust-anchors`, data).then((r) => r.data),
+    api
+      .put<DNSServerOptions>(`/dns/groups/${groupId}/options`, data)
+      .then((r) => r.data),
+  addTrustAnchor: (
+    groupId: string,
+    data: Omit<DNSTrustAnchor, "id" | "added_at">,
+  ) =>
+    api
+      .post<DNSTrustAnchor>(
+        `/dns/groups/${groupId}/options/trust-anchors`,
+        data,
+      )
+      .then((r) => r.data),
   deleteTrustAnchor: (groupId: string, anchorId: string) =>
     api.delete(`/dns/groups/${groupId}/options/trust-anchors/${anchorId}`),
 
@@ -780,7 +949,9 @@ export const dnsApi = {
   createAcl: (groupId: string, data: Partial<DNSAcl>) =>
     api.post<DNSAcl>(`/dns/groups/${groupId}/acls`, data).then((r) => r.data),
   updateAcl: (groupId: string, aclId: string, data: Partial<DNSAcl>) =>
-    api.put<DNSAcl>(`/dns/groups/${groupId}/acls/${aclId}`, data).then((r) => r.data),
+    api
+      .put<DNSAcl>(`/dns/groups/${groupId}/acls/${aclId}`, data)
+      .then((r) => r.data),
   deleteAcl: (groupId: string, aclId: string) =>
     api.delete(`/dns/groups/${groupId}/acls/${aclId}`),
 
@@ -790,7 +961,9 @@ export const dnsApi = {
   createView: (groupId: string, data: Partial<DNSView>) =>
     api.post<DNSView>(`/dns/groups/${groupId}/views`, data).then((r) => r.data),
   updateView: (groupId: string, viewId: string, data: Partial<DNSView>) =>
-    api.put<DNSView>(`/dns/groups/${groupId}/views/${viewId}`, data).then((r) => r.data),
+    api
+      .put<DNSView>(`/dns/groups/${groupId}/views/${viewId}`, data)
+      .then((r) => r.data),
   deleteView: (groupId: string, viewId: string) =>
     api.delete(`/dns/groups/${groupId}/views/${viewId}`),
 
@@ -800,17 +973,33 @@ export const dnsApi = {
   createZone: (groupId: string, data: Partial<DNSZone>) =>
     api.post<DNSZone>(`/dns/groups/${groupId}/zones`, data).then((r) => r.data),
   updateZone: (groupId: string, zoneId: string, data: Partial<DNSZone>) =>
-    api.put<DNSZone>(`/dns/groups/${groupId}/zones/${zoneId}`, data).then((r) => r.data),
+    api
+      .put<DNSZone>(`/dns/groups/${groupId}/zones/${zoneId}`, data)
+      .then((r) => r.data),
   deleteZone: (groupId: string, zoneId: string) =>
     api.delete(`/dns/groups/${groupId}/zones/${zoneId}`),
 
   // Records
   listRecords: (groupId: string, zoneId: string) =>
-    api.get<DNSRecord[]>(`/dns/groups/${groupId}/zones/${zoneId}/records`).then((r) => r.data),
+    api
+      .get<DNSRecord[]>(`/dns/groups/${groupId}/zones/${zoneId}/records`)
+      .then((r) => r.data),
   createRecord: (groupId: string, zoneId: string, data: Partial<DNSRecord>) =>
-    api.post<DNSRecord>(`/dns/groups/${groupId}/zones/${zoneId}/records`, data).then((r) => r.data),
-  updateRecord: (groupId: string, zoneId: string, recordId: string, data: Partial<DNSRecord>) =>
-    api.put<DNSRecord>(`/dns/groups/${groupId}/zones/${zoneId}/records/${recordId}`, data).then((r) => r.data),
+    api
+      .post<DNSRecord>(`/dns/groups/${groupId}/zones/${zoneId}/records`, data)
+      .then((r) => r.data),
+  updateRecord: (
+    groupId: string,
+    zoneId: string,
+    recordId: string,
+    data: Partial<DNSRecord>,
+  ) =>
+    api
+      .put<DNSRecord>(
+        `/dns/groups/${groupId}/zones/${zoneId}/records/${recordId}`,
+        data,
+      )
+      .then((r) => r.data),
   deleteRecord: (groupId: string, zoneId: string, recordId: string) =>
     api.delete(`/dns/groups/${groupId}/zones/${zoneId}/records/${recordId}`),
 
@@ -941,7 +1130,8 @@ export interface DNSBlockListException {
 
 export const dnsBlocklistApi = {
   list: () => api.get<DNSBlockList[]>("/dns/blocklists").then((r) => r.data),
-  get: (id: string) => api.get<DNSBlockList>(`/dns/blocklists/${id}`).then((r) => r.data),
+  get: (id: string) =>
+    api.get<DNSBlockList>(`/dns/blocklists/${id}`).then((r) => r.data),
   create: (data: Partial<DNSBlockList>) =>
     api.post<DNSBlockList>("/dns/blocklists", data).then((r) => r.data),
   update: (id: string, data: Partial<DNSBlockList>) =>
@@ -950,46 +1140,65 @@ export const dnsBlocklistApi = {
 
   updateAssignments: (
     id: string,
-    data: { server_group_ids?: string[]; view_ids?: string[] }
-  ) => api.put<DNSBlockList>(`/dns/blocklists/${id}/assignments`, data).then((r) => r.data),
+    data: { server_group_ids?: string[]; view_ids?: string[] },
+  ) =>
+    api
+      .put<DNSBlockList>(`/dns/blocklists/${id}/assignments`, data)
+      .then((r) => r.data),
 
   refresh: (id: string) =>
     api
-      .post<{ list_id: string; task_id: string | null; status: string }>(
-        `/dns/blocklists/${id}/refresh`
-      )
+      .post<{
+        list_id: string;
+        task_id: string | null;
+        status: string;
+      }>(`/dns/blocklists/${id}/refresh`)
       .then((r) => r.data),
 
-  listEntries: (id: string, params?: { q?: string; limit?: number; offset?: number }) =>
+  listEntries: (
+    id: string,
+    params?: { q?: string; limit?: number; offset?: number },
+  ) =>
     api
       .get<DNSBlockListEntryPage>(`/dns/blocklists/${id}/entries`, { params })
       .then((r) => r.data),
   addEntry: (id: string, data: Partial<DNSBlockListEntry>) =>
-    api.post<DNSBlockListEntry>(`/dns/blocklists/${id}/entries`, data).then((r) => r.data),
+    api
+      .post<DNSBlockListEntry>(`/dns/blocklists/${id}/entries`, data)
+      .then((r) => r.data),
   bulkAddEntries: (id: string, domains: string[]) =>
     api
-      .post<{ added: number; skipped: number; total: number }>(
-        `/dns/blocklists/${id}/entries/bulk`,
-        { domains }
-      )
+      .post<{
+        added: number;
+        skipped: number;
+        total: number;
+      }>(`/dns/blocklists/${id}/entries/bulk`, { domains })
       .then((r) => r.data),
   deleteEntry: (id: string, entryId: string) =>
     api.delete(`/dns/blocklists/${id}/entries/${entryId}`),
 
   listExceptions: (id: string) =>
-    api.get<DNSBlockListException[]>(`/dns/blocklists/${id}/exceptions`).then((r) => r.data),
+    api
+      .get<DNSBlockListException[]>(`/dns/blocklists/${id}/exceptions`)
+      .then((r) => r.data),
   addException: (id: string, data: { domain: string; reason?: string }) =>
-    api.post<DNSBlockListException>(`/dns/blocklists/${id}/exceptions`, data).then((r) => r.data),
+    api
+      .post<DNSBlockListException>(`/dns/blocklists/${id}/exceptions`, data)
+      .then((r) => r.data),
   deleteException: (id: string, exceptionId: string) =>
     api.delete(`/dns/blocklists/${id}/exceptions/${exceptionId}`),
 };
 
 export const authApi = {
   login: (username: string, password: string) =>
-    api.post<LoginResponse>("/auth/login", { username, password }).then((r) => r.data),
+    api
+      .post<LoginResponse>("/auth/login", { username, password })
+      .then((r) => r.data),
   logout: () => api.post("/auth/logout"),
   refresh: (refreshToken: string) =>
-    api.post<LoginResponse>("/auth/refresh", { refresh_token: refreshToken }).then((r) => r.data),
+    api
+      .post<LoginResponse>("/auth/refresh", { refresh_token: refreshToken })
+      .then((r) => r.data),
   changePassword: (currentPassword: string, newPassword: string) =>
     api.post("/auth/change-password", {
       current_password: currentPassword,

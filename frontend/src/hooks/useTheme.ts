@@ -10,7 +10,9 @@ function initialTheme(): Theme {
   const saved = localStorage.getItem("theme");
   if (saved === "light" || saved === "dark") return saved;
   // Fall back to OS preference on first visit
-  return window.matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light";
+  return window.matchMedia("(prefers-color-scheme: dark)").matches
+    ? "dark"
+    : "light";
 }
 
 export function useTheme() {
@@ -22,7 +24,8 @@ export function useTheme() {
   }, [theme]);
 
   const setTheme = (t: Theme) => setThemeState(t);
-  const toggleTheme = () => setThemeState((t) => (t === "light" ? "dark" : "light"));
+  const toggleTheme = () =>
+    setThemeState((t) => (t === "light" ? "dark" : "light"));
 
   return { theme, setTheme, toggleTheme };
 }

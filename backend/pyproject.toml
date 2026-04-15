@@ -48,7 +48,10 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W", "UP"]
-ignore = ["N818"]
+# E501 is owned by black (also configured at 100 chars). Ruff's E501 fires on
+# long string literals / URLs that black can't wrap, which produces noise
+# without value. N818 (exception suffix) doesn't fit the existing API schema names.
+ignore = ["E501", "N818"]
 
 [tool.black]
 line-length = 100

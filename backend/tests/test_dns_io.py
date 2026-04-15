@@ -142,7 +142,7 @@ def test_write_zone_file_round_trip() -> None:
     assert "SOA" in text
     assert "192.0.2.1" in text
     assert "10 60 5060" in text  # SRV
-    assert "\"v=spf1 -all\"" in text  # TXT quoted
+    assert '"v=spf1 -all"' in text  # TXT quoted
 
     # Re-parse the output and confirm we get back the same records.
     reparsed = parse_zone_file(text, "example.com")

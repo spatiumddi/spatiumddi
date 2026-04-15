@@ -1,6 +1,15 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { useNavigate } from "react-router-dom";
-import { Search, Network, Layers, Globe, MapPin, X, Server, FileText } from "lucide-react";
+import {
+  Search,
+  Network,
+  Layers,
+  Globe,
+  MapPin,
+  X,
+  Server,
+  FileText,
+} from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import { searchApi, type SearchResult } from "@/lib/api";
 import { cn } from "@/lib/utils";
@@ -58,19 +67,25 @@ function ResultRow({
     <button
       className={cn(
         "flex w-full items-start gap-3 px-4 py-2.5 text-left transition-colors",
-        isActive ? "bg-accent" : "hover:bg-accent/50"
+        isActive ? "bg-accent" : "hover:bg-accent/50",
       )}
       onMouseDown={(e) => {
         e.preventDefault();
         onSelect(result);
       }}
     >
-      <Icon className={cn("mt-0.5 h-4 w-4 flex-shrink-0", TYPE_COLORS[result.type])} />
+      <Icon
+        className={cn("mt-0.5 h-4 w-4 flex-shrink-0", TYPE_COLORS[result.type])}
+      />
       <div className="min-w-0 flex-1">
         <div className="flex items-baseline gap-2">
-          <span className="font-mono text-sm font-medium">{result.display}</span>
+          <span className="font-mono text-sm font-medium">
+            {result.display}
+          </span>
           {result.name && result.name !== result.display && (
-            <span className="truncate text-xs text-muted-foreground">{result.name}</span>
+            <span className="truncate text-xs text-muted-foreground">
+              {result.name}
+            </span>
           )}
         </div>
         <div className="flex items-center gap-2 text-xs text-muted-foreground">
@@ -78,28 +93,37 @@ function ResultRow({
             {TYPE_LABELS[result.type]}
           </span>
           {/* IPAM context */}
-          {result.space_name && result.type !== "dns_group" && result.type !== "dns_zone" && result.type !== "dns_record" && (
-            <span>{result.space_name}</span>
-          )}
+          {result.space_name &&
+            result.type !== "dns_group" &&
+            result.type !== "dns_zone" &&
+            result.type !== "dns_record" && <span>{result.space_name}</span>}
           {result.subnet_network && result.type === "ip_address" && (
             <span>{result.subnet_network}</span>
           )}
-          {result.hostname && result.type === "ip_address" && result.hostname !== result.display && (
-            <span>{result.hostname}</span>
+          {result.hostname &&
+            result.type === "ip_address" &&
+            result.hostname !== result.display && (
+              <span>{result.hostname}</span>
+            )}
+          {result.mac_address && (
+            <span className="font-mono">{result.mac_address}</span>
           )}
-          {result.mac_address && <span className="font-mono">{result.mac_address}</span>}
-          {result.status && result.type !== "dns_zone" && result.type !== "dns_record" && (
-            <span
-              className={cn(
-                "rounded px-1 py-0.5 text-[10px] font-medium",
-                result.status === "allocated" && "bg-green-500/10 text-green-600",
-                result.status === "reserved" && "bg-yellow-500/10 text-yellow-600",
-                result.status === "orphan" && "bg-red-500/10 text-red-600"
-              )}
-            >
-              {result.status}
-            </span>
-          )}
+          {result.status &&
+            result.type !== "dns_zone" &&
+            result.type !== "dns_record" && (
+              <span
+                className={cn(
+                  "rounded px-1 py-0.5 text-[10px] font-medium",
+                  result.status === "allocated" &&
+                    "bg-green-500/10 text-green-600",
+                  result.status === "reserved" &&
+                    "bg-yellow-500/10 text-yellow-600",
+                  result.status === "orphan" && "bg-red-500/10 text-red-600",
+                )}
+              >
+                {result.status}
+              </span>
+            )}
           {/* DNS context */}
           {result.dns_group_name && result.type !== "dns_group" && (
             <span>{result.dns_group_name}</span>
@@ -113,7 +137,9 @@ function ResultRow({
             </span>
           )}
           {result.dns_record_value && (
-            <span className="truncate font-mono">{result.dns_record_value}</span>
+            <span className="truncate font-mono">
+              {result.dns_record_value}
+            </span>
           )}
           {/* DNS zone type badge */}
           {result.type === "dns_zone" && result.status && (
@@ -185,7 +211,10 @@ export function GlobalSearch() {
       setOpen(false);
       if (result.type === "ip_address") {
         navigate("/ipam", {
-          state: { selectSubnet: result.subnet_id, highlightAddress: result.id },
+          state: {
+            selectSubnet: result.subnet_id,
+            highlightAddress: result.id,
+          },
         });
       } else if (result.type === "subnet") {
         navigate("/ipam", { state: { selectSubnet: result.id } });
@@ -196,12 +225,22 @@ export function GlobalSearch() {
       } else if (result.type === "dns_group") {
         navigate("/dns", { state: { selectGroup: result.dns_group_id } });
       } else if (result.type === "dns_zone") {
-        navigate("/dns", { state: { selectGroup: result.dns_group_id, selectZone: result.dns_zone_id } });
+        navigate("/dns", {
+          state: {
+            selectGroup: result.dns_group_id,
+            selectZone: result.dns_zone_id,
+          },
+        });
       } else if (result.type === "dns_record") {
-        navigate("/dns", { state: { selectGroup: result.dns_group_id, selectZone: result.dns_zone_id } });
+        navigate("/dns", {
+          state: {
+            selectGroup: result.dns_group_id,
+            selectZone: result.dns_zone_id,
+          },
+        });
       }
     },
-    [navigate]
+    [navigate],
   );
 
   function handleKeyDown(e: React.KeyboardEvent) {
@@ -258,7 +297,10 @@ export function GlobalSearch() {
                 className="flex-1 bg-transparent text-sm outline-none placeholder:text-muted-foreground"
               />
               {query && (
-                <button onClick={() => setQuery("")} className="text-muted-foreground hover:text-foreground">
+                <button
+                  onClick={() => setQuery("")}
+                  className="text-muted-foreground hover:text-foreground"
+                >
                   <X className="h-4 w-4" />
                 </button>
               )}
@@ -271,17 +313,26 @@ export function GlobalSearch() {
             <div className="max-h-96 overflow-y-auto">
               {!query && (
                 <p className="px-4 py-6 text-center text-sm text-muted-foreground">
-                  Type to search across IP addresses, subnets, DNS zones, records, and more.
+                  Type to search across IP addresses, subnets, DNS zones,
+                  records, and more.
                 </p>
               )}
               {query && isFetching && results.length === 0 && (
-                <p className="px-4 py-6 text-center text-sm text-muted-foreground">Searching…</p>
-              )}
-              {query && !isFetching && results.length === 0 && debouncedQuery.length > 0 && (
                 <p className="px-4 py-6 text-center text-sm text-muted-foreground">
-                  No results for <span className="font-mono font-medium">"{debouncedQuery}"</span>
+                  Searching…
                 </p>
               )}
+              {query &&
+                !isFetching &&
+                results.length === 0 &&
+                debouncedQuery.length > 0 && (
+                  <p className="px-4 py-6 text-center text-sm text-muted-foreground">
+                    No results for{" "}
+                    <span className="font-mono font-medium">
+                      "{debouncedQuery}"
+                    </span>
+                  </p>
+                )}
               {results.map((r, i) => (
                 <ResultRow
                   key={`${r.type}:${r.id}`}
@@ -294,7 +345,9 @@ export function GlobalSearch() {
 
             {results.length > 0 && (
               <div className="flex items-center justify-between border-t px-4 py-2 text-xs text-muted-foreground">
-                <span>{data?.total ?? 0} result{(data?.total ?? 0) !== 1 ? "s" : ""}</span>
+                <span>
+                  {data?.total ?? 0} result{(data?.total ?? 0) !== 1 ? "s" : ""}
+                </span>
                 <span className="flex items-center gap-2">
                   <span>↑↓ navigate</span>
                   <span>↵ select</span>

@@ -32,7 +32,9 @@ class IPSpace(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     dns_zone_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     dns_additional_zone_ids: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
 
-    blocks: Mapped[list["IPBlock"]] = relationship("IPBlock", back_populates="space", cascade="all, delete-orphan")
+    blocks: Mapped[list["IPBlock"]] = relationship(
+        "IPBlock", back_populates="space", cascade="all, delete-orphan"
+    )
     subnets: Mapped[list["Subnet"]] = relationship("Subnet", back_populates="space")
 
 
@@ -63,12 +65,13 @@ class IPBlock(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     """
 
     __tablename__ = "ip_block"
-    __table_args__ = (
-        Index("ix_ip_block_network", "network"),
-    )
+    __table_args__ = (Index("ix_ip_block_network", "network"),)
 
     space_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("ip_space.id", ondelete="CASCADE"), nullable=False, index=True
+        UUID(as_uuid=True),
+        ForeignKey("ip_space.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     parent_block_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("ip_block.id", ondelete="CASCADE"), nullable=True
@@ -106,7 +109,10 @@ class Subnet(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
 
     space_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("ip_space.id", ondelete="RESTRICT"), nullable=False, index=True
+        UUID(as_uuid=True),
+        ForeignKey("ip_space.id", ondelete="RESTRICT"),
+        nullable=False,
+        index=True,
     )
     block_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("ip_block.id", ondelete="RESTRICT"), nullable=False
@@ -272,12 +278,13 @@ class VLANMapping(UUIDPrimaryKeyMixin, Base):
     """Reference table tracking VLAN → VXLAN mappings."""
 
     __tablename__ = "vlan_mapping"
-    __table_args__ = (
-        UniqueConstraint("space_id", "vlan_id", name="uq_vlan_mapping_space_vlan"),
-    )
+    __table_args__ = (UniqueConstraint("space_id", "vlan_id", name="uq_vlan_mapping_space_vlan"),)
 
     space_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("ip_space.id", ondelete="CASCADE"), nullable=False, index=True
+        UUID(as_uuid=True),
+        ForeignKey("ip_space.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     vlan_id: Mapped[int] = mapped_column(Integer, nullable=False)
     vxlan_id: Mapped[int | None] = mapped_column(Integer, nullable=True)

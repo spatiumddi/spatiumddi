@@ -12,7 +12,7 @@ from pydantic import BaseModel, field_validator
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
-from app.api.deps import CurrentUser, DB, SuperAdmin
+from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.models.audit import AuditLog
 from app.models.dns import (
     DNSAcl,
@@ -41,7 +41,21 @@ router = APIRouter()
 VALID_DRIVERS = {"bind9"}
 VALID_GROUP_TYPES = {"internal", "external", "dmz", "custom"}
 VALID_ZONE_TYPES = {"primary", "secondary", "stub", "forward"}
-VALID_RECORD_TYPES = {"A", "AAAA", "CNAME", "MX", "TXT", "NS", "PTR", "SRV", "CAA", "TLSA", "SSHFP", "NAPTR", "LOC"}
+VALID_RECORD_TYPES = {
+    "A",
+    "AAAA",
+    "CNAME",
+    "MX",
+    "TXT",
+    "NS",
+    "PTR",
+    "SRV",
+    "CAA",
+    "TLSA",
+    "SSHFP",
+    "NAPTR",
+    "LOC",
+}
 VALID_FORWARD_POLICIES = {"first", "only"}
 VALID_DNSSEC = {"auto", "yes", "no"}
 VALID_NOTIFY = {"yes", "no", "explicit", "master-only"}
@@ -510,16 +524,18 @@ async def create_group(body: ServerGroupCreate, db: DB, current_user: SuperAdmin
     options = DNSServerOptions(group=group)
     db.add(options)
 
-    db.add(AuditLog(
-        user_id=current_user.id,
-        user_display_name=current_user.display_name,
-        auth_source=current_user.auth_source,
-        action="create",
-        resource_type="dns_server_group",
-        resource_id=str(group.id),
-        resource_display=group.name,
-        result="success",
-    ))
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="create",
+            resource_type="dns_server_group",
+            resource_id=str(group.id),
+            resource_display=group.name,
+            result="success",
+        )
+    )
     await db.commit()
     await db.refresh(group)
     logger.info("dns_group_created", group_id=str(group.id), name=group.name)
@@ -535,7 +551,9 @@ async def get_group(group_id: uuid.UUID, db: DB, _: CurrentUser) -> DNSServerGro
 
 
 @router.put("/groups/{group_id}", response_model=ServerGroupResponse)
-async def update_group(group_id: uuid.UUID, body: ServerGroupUpdate, db: DB, current_user: SuperAdmin) -> DNSServerGroup:
+async def update_group(
+    group_id: uuid.UUID, body: ServerGroupUpdate, db: DB, current_user: SuperAdmin
+) -> DNSServerGroup:
     group = await db.get(DNSServerGroup, group_id)
     if not group:
         raise HTTPException(status_code=404, detail="Server group not found")
@@ -544,17 +562,19 @@ async def update_group(group_id: uuid.UUID, body: ServerGroupUpdate, db: DB, cur
     for k, v in changes.items():
         setattr(group, k, v)
 
-    db.add(AuditLog(
-        user_id=current_user.id,
-        user_display_name=current_user.display_name,
-        auth_source=current_user.auth_source,
-        action="update",
-        resource_type="dns_server_group",
-        resource_id=str(group.id),
-        resource_display=group.name,
-        changed_fields=list(changes.keys()),
-        result="success",
-    ))
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="update",
+            resource_type="dns_server_group",
+            resource_id=str(group.id),
+            resource_display=group.name,
+            changed_fields=list(changes.keys()),
+            result="success",
+        )
+    )
     await db.commit()
     await db.refresh(group)
     return group
@@ -566,16 +586,18 @@ async def delete_group(group_id: uuid.UUID, db: DB, current_user: SuperAdmin) ->
     if not group:
         raise HTTPException(status_code=404, detail="Server group not found")
 
-    db.add(AuditLog(
-        user_id=current_user.id,
-        user_display_name=current_user.display_name,
-        auth_source=current_user.auth_source,
-        action="delete",
-        resource_type="dns_server_group",
-        resource_id=str(group.id),
-        resource_display=group.name,
-        result="success",
-    ))
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="delete",
+            resource_type="dns_server_group",
+            resource_id=str(group.id),
+            resource_display=group.name,
+            result="success",
+        )
+    )
     await db.delete(group)
     await db.commit()
 
@@ -586,18 +608,26 @@ async def delete_group(group_id: uuid.UUID, db: DB, current_user: SuperAdmin) ->
 @router.get("/groups/{group_id}/servers", response_model=list[ServerResponse])
 async def list_servers(group_id: uuid.UUID, db: DB, _: CurrentUser) -> list[DNSServer]:
     await _require_group(group_id, db)
-    result = await db.execute(select(DNSServer).where(DNSServer.group_id == group_id).order_by(DNSServer.name))
+    result = await db.execute(
+        select(DNSServer).where(DNSServer.group_id == group_id).order_by(DNSServer.name)
+    )
     return list(result.scalars().all())
 
 
-@router.post("/groups/{group_id}/servers", response_model=ServerResponse, status_code=status.HTTP_201_CREATED)
-async def create_server(group_id: uuid.UUID, body: ServerCreate, db: DB, current_user: SuperAdmin) -> DNSServer:
+@router.post(
+    "/groups/{group_id}/servers", response_model=ServerResponse, status_code=status.HTTP_201_CREATED
+)
+async def create_server(
+    group_id: uuid.UUID, body: ServerCreate, db: DB, current_user: SuperAdmin
+) -> DNSServer:
     await _require_group(group_id, db)
     existing = await db.execute(
         select(DNSServer).where(DNSServer.group_id == group_id, DNSServer.name == body.name)
     )
     if existing.scalar_one_or_none():
-        raise HTTPException(status_code=409, detail="A server with that name already exists in this group")
+        raise HTTPException(
+            status_code=409, detail="A server with that name already exists in this group"
+        )
 
     data = body.model_dump(exclude={"api_key"})
     data["group_id"] = group_id
@@ -607,16 +637,18 @@ async def create_server(group_id: uuid.UUID, body: ServerCreate, db: DB, current
 
     server = DNSServer(**data)
     db.add(server)
-    db.add(AuditLog(
-        user_id=current_user.id,
-        user_display_name=current_user.display_name,
-        auth_source=current_user.auth_source,
-        action="create",
-        resource_type="dns_server",
-        resource_id=str(server.id),
-        resource_display=server.name,
-        result="success",
-    ))
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="create",
+            resource_type="dns_server",
+            resource_id=str(server.id),
+            resource_display=server.name,
+            result="success",
+        )
+    )
     await db.commit()
     await db.refresh(server)
     return server
@@ -632,17 +664,19 @@ async def update_server(
         changes["api_key_encrypted"] = body.api_key  # TODO: encrypt
     for k, v in changes.items():
         setattr(server, k, v)
-    db.add(AuditLog(
-        user_id=current_user.id,
-        user_display_name=current_user.display_name,
-        auth_source=current_user.auth_source,
-        action="update",
-        resource_type="dns_server",
-        resource_id=str(server.id),
-        resource_display=server.name,
-        changed_fields=list(changes.keys()),
-        result="success",
-    ))
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="update",
+            resource_type="dns_server",
+            resource_id=str(server.id),
+            resource_display=server.name,
+            changed_fields=list(changes.keys()),
+            result="success",
+        )
+    )
     await db.commit()
     await db.refresh(server)
     return server
@@ -653,16 +687,18 @@ async def delete_server(
     group_id: uuid.UUID, server_id: uuid.UUID, db: DB, current_user: SuperAdmin
 ) -> None:
     server = await _require_server(group_id, server_id, db)
-    db.add(AuditLog(
-        user_id=current_user.id,
-        user_display_name=current_user.display_name,
-        auth_source=current_user.auth_source,
-        action="delete",
-        resource_type="dns_server",
-        resource_id=str(server.id),
-        resource_display=server.name,
-        result="success",
-    ))
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="delete",
+            resource_type="dns_server",
+            resource_id=str(server.id),
+            resource_display=server.name,
+            result="success",
+        )
+    )
     await db.delete(server)
     await db.commit()
 
@@ -731,22 +767,24 @@ async def apply_record(
     target_serial = bump_zone_serial(zone)
     zone.last_pushed_at = now
 
-    db.add(AuditLog(
-        user_id=current_user.id,
-        user_display_name=current_user.display_name,
-        auth_source=current_user.auth_source,
-        action="apply_record",
-        resource_type="dns_zone",
-        resource_id=str(zone.id),
-        resource_display=zone.name,
-        new_value={
-            "server_id": str(server.id),
-            "record_id": str(body.record_id),
-            "op": body.op,
-            "target_serial": target_serial,
-        },
-        result="success",
-    ))
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="apply_record",
+            resource_type="dns_zone",
+            resource_id=str(zone.id),
+            resource_display=zone.name,
+            new_value={
+                "server_id": str(server.id),
+                "record_id": str(body.record_id),
+                "op": body.op,
+                "target_serial": target_serial,
+            },
+            result="success",
+        )
+    )
     await db.commit()
 
     return ApplyRecordResponse(
@@ -798,30 +836,32 @@ async def update_options(
     for k, v in changes.items():
         setattr(opts, k, v)
 
-    db.add(AuditLog(
-        user_id=current_user.id,
-        user_display_name=current_user.display_name,
-        auth_source=current_user.auth_source,
-        action="update",
-        resource_type="dns_server_options",
-        resource_id=str(opts.id) if opts.id else "new",
-        resource_display=f"options for group {group_id}",
-        changed_fields=list(changes.keys()),
-        result="success",
-    ))
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="update",
+            resource_type="dns_server_options",
+            resource_id=str(opts.id) if opts.id else "new",
+            resource_display=f"options for group {group_id}",
+            changed_fields=list(changes.keys()),
+            result="success",
+        )
+    )
     await db.commit()
     reloaded = await _load_options(group_id, db)
     return reloaded  # type: ignore[return-value]
 
 
-@router.post("/groups/{group_id}/options/trust-anchors", response_model=TrustAnchorResponse, status_code=201)
+@router.post(
+    "/groups/{group_id}/options/trust-anchors", response_model=TrustAnchorResponse, status_code=201
+)
 async def add_trust_anchor(
     group_id: uuid.UUID, body: TrustAnchorCreate, db: DB, current_user: SuperAdmin
 ) -> DNSTrustAnchor:
     await _require_group(group_id, db)
-    result = await db.execute(
-        select(DNSServerOptions).where(DNSServerOptions.group_id == group_id)
-    )
+    result = await db.execute(select(DNSServerOptions).where(DNSServerOptions.group_id == group_id))
     opts = result.scalar_one_or_none()
     if not opts:
         opts = DNSServerOptions(group_id=group_id)
@@ -886,13 +926,17 @@ async def list_acls(group_id: uuid.UUID, db: DB, _: CurrentUser) -> list[DNSAcl]
 
 
 @router.post("/groups/{group_id}/acls", response_model=AclResponse, status_code=201)
-async def create_acl(group_id: uuid.UUID, body: AclCreate, db: DB, current_user: SuperAdmin) -> DNSAcl:
+async def create_acl(
+    group_id: uuid.UUID, body: AclCreate, db: DB, current_user: SuperAdmin
+) -> DNSAcl:
     await _require_group(group_id, db)
     existing = await db.execute(
         select(DNSAcl).where(DNSAcl.group_id == group_id, DNSAcl.name == body.name)
     )
     if existing.scalar_one_or_none():
-        raise HTTPException(status_code=409, detail="An ACL with that name already exists in this group")
+        raise HTTPException(
+            status_code=409, detail="An ACL with that name already exists in this group"
+        )
 
     acl = DNSAcl(group_id=group_id, name=body.name, description=body.description)
     db.add(acl)
@@ -901,16 +945,18 @@ async def create_acl(group_id: uuid.UUID, body: AclCreate, db: DB, current_user:
     for e in body.entries:
         db.add(DNSAclEntry(acl_id=acl.id, **e.model_dump()))
 
-    db.add(AuditLog(
-        user_id=current_user.id,
-        user_display_name=current_user.display_name,
-        auth_source=current_user.auth_source,
-        action="create",
-        resource_type="dns_acl",
-        resource_id=str(acl.id),
-        resource_display=acl.name,
-        result="success",
-    ))
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="create",
+            resource_type="dns_acl",
+            resource_id=str(acl.id),
+            resource_display=acl.name,
+            result="success",
+        )
+    )
     await db.commit()
     return await _load_acl(group_id, acl.id, db)  # type: ignore[return-value]
 
@@ -932,33 +978,39 @@ async def update_acl(
         for e in body.entries:
             db.add(DNSAclEntry(acl_id=acl.id, **e.model_dump()))
 
-    db.add(AuditLog(
-        user_id=current_user.id,
-        user_display_name=current_user.display_name,
-        auth_source=current_user.auth_source,
-        action="update",
-        resource_type="dns_acl",
-        resource_id=str(acl.id),
-        resource_display=acl.name,
-        result="success",
-    ))
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="update",
+            resource_type="dns_acl",
+            resource_id=str(acl.id),
+            resource_display=acl.name,
+            result="success",
+        )
+    )
     await db.commit()
     return await _load_acl(group_id, acl_id, db)  # type: ignore[return-value]
 
 
 @router.delete("/groups/{group_id}/acls/{acl_id}", status_code=204)
-async def delete_acl(group_id: uuid.UUID, acl_id: uuid.UUID, db: DB, current_user: SuperAdmin) -> None:
+async def delete_acl(
+    group_id: uuid.UUID, acl_id: uuid.UUID, db: DB, current_user: SuperAdmin
+) -> None:
     acl = await _require_acl(group_id, acl_id, db)
-    db.add(AuditLog(
-        user_id=current_user.id,
-        user_display_name=current_user.display_name,
-        auth_source=current_user.auth_source,
-        action="delete",
-        resource_type="dns_acl",
-        resource_id=str(acl.id),
-        resource_display=acl.name,
-        result="success",
-    ))
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="delete",
+            resource_type="dns_acl",
+            resource_id=str(acl.id),
+            resource_display=acl.name,
+            result="success",
+        )
+    )
     await db.delete(acl)
     await db.commit()
 
@@ -976,26 +1028,32 @@ async def list_views(group_id: uuid.UUID, db: DB, _: CurrentUser) -> list[DNSVie
 
 
 @router.post("/groups/{group_id}/views", response_model=ViewResponse, status_code=201)
-async def create_view(group_id: uuid.UUID, body: ViewCreate, db: DB, current_user: SuperAdmin) -> DNSView:
+async def create_view(
+    group_id: uuid.UUID, body: ViewCreate, db: DB, current_user: SuperAdmin
+) -> DNSView:
     await _require_group(group_id, db)
     existing = await db.execute(
         select(DNSView).where(DNSView.group_id == group_id, DNSView.name == body.name)
     )
     if existing.scalar_one_or_none():
-        raise HTTPException(status_code=409, detail="A view with that name already exists in this group")
+        raise HTTPException(
+            status_code=409, detail="A view with that name already exists in this group"
+        )
 
     view = DNSView(group_id=group_id, **body.model_dump())
     db.add(view)
-    db.add(AuditLog(
-        user_id=current_user.id,
-        user_display_name=current_user.display_name,
-        auth_source=current_user.auth_source,
-        action="create",
-        resource_type="dns_view",
-        resource_id=str(view.id),
-        resource_display=view.name,
-        result="success",
-    ))
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="create",
+            resource_type="dns_view",
+            resource_id=str(view.id),
+            resource_display=view.name,
+            result="success",
+        )
+    )
     await db.commit()
     await db.refresh(view)
     return view
@@ -1009,35 +1067,41 @@ async def update_view(
     changes = body.model_dump(exclude_none=True)
     for k, v in changes.items():
         setattr(view, k, v)
-    db.add(AuditLog(
-        user_id=current_user.id,
-        user_display_name=current_user.display_name,
-        auth_source=current_user.auth_source,
-        action="update",
-        resource_type="dns_view",
-        resource_id=str(view.id),
-        resource_display=view.name,
-        changed_fields=list(changes.keys()),
-        result="success",
-    ))
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="update",
+            resource_type="dns_view",
+            resource_id=str(view.id),
+            resource_display=view.name,
+            changed_fields=list(changes.keys()),
+            result="success",
+        )
+    )
     await db.commit()
     await db.refresh(view)
     return view
 
 
 @router.delete("/groups/{group_id}/views/{view_id}", status_code=204)
-async def delete_view(group_id: uuid.UUID, view_id: uuid.UUID, db: DB, current_user: SuperAdmin) -> None:
+async def delete_view(
+    group_id: uuid.UUID, view_id: uuid.UUID, db: DB, current_user: SuperAdmin
+) -> None:
     view = await _require_view(group_id, view_id, db)
-    db.add(AuditLog(
-        user_id=current_user.id,
-        user_display_name=current_user.display_name,
-        auth_source=current_user.auth_source,
-        action="delete",
-        resource_type="dns_view",
-        resource_id=str(view.id),
-        resource_display=view.name,
-        result="success",
-    ))
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="delete",
+            resource_type="dns_view",
+            resource_id=str(view.id),
+            resource_display=view.name,
+            result="success",
+        )
+    )
     await db.delete(view)
     await db.commit()
 
@@ -1055,7 +1119,9 @@ async def list_zones(group_id: uuid.UUID, db: DB, _: CurrentUser) -> list[DNSZon
 
 
 @router.post("/groups/{group_id}/zones", response_model=ZoneResponse, status_code=201)
-async def create_zone(group_id: uuid.UUID, body: ZoneCreate, db: DB, current_user: SuperAdmin) -> DNSZone:
+async def create_zone(
+    group_id: uuid.UUID, body: ZoneCreate, db: DB, current_user: SuperAdmin
+) -> DNSZone:
     await _require_group(group_id, db)
     existing = await db.execute(
         select(DNSZone).where(
@@ -1065,20 +1131,24 @@ async def create_zone(group_id: uuid.UUID, body: ZoneCreate, db: DB, current_use
         )
     )
     if existing.scalar_one_or_none():
-        raise HTTPException(status_code=409, detail="A zone with that name already exists in this group/view")
+        raise HTTPException(
+            status_code=409, detail="A zone with that name already exists in this group/view"
+        )
 
     zone = DNSZone(group_id=group_id, **body.model_dump())
     db.add(zone)
-    db.add(AuditLog(
-        user_id=current_user.id,
-        user_display_name=current_user.display_name,
-        auth_source=current_user.auth_source,
-        action="create",
-        resource_type="dns_zone",
-        resource_id=str(zone.id),
-        resource_display=zone.name,
-        result="success",
-    ))
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="create",
+            resource_type="dns_zone",
+            resource_id=str(zone.id),
+            resource_display=zone.name,
+            result="success",
+        )
+    )
     await db.commit()
     await db.refresh(zone)
     return zone
@@ -1097,35 +1167,41 @@ async def update_zone(
     changes = body.model_dump(exclude_none=True)
     for k, v in changes.items():
         setattr(zone, k, v)
-    db.add(AuditLog(
-        user_id=current_user.id,
-        user_display_name=current_user.display_name,
-        auth_source=current_user.auth_source,
-        action="update",
-        resource_type="dns_zone",
-        resource_id=str(zone.id),
-        resource_display=zone.name,
-        changed_fields=list(changes.keys()),
-        result="success",
-    ))
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="update",
+            resource_type="dns_zone",
+            resource_id=str(zone.id),
+            resource_display=zone.name,
+            changed_fields=list(changes.keys()),
+            result="success",
+        )
+    )
     await db.commit()
     await db.refresh(zone)
     return zone
 
 
 @router.delete("/groups/{group_id}/zones/{zone_id}", status_code=204)
-async def delete_zone(group_id: uuid.UUID, zone_id: uuid.UUID, db: DB, current_user: SuperAdmin) -> None:
+async def delete_zone(
+    group_id: uuid.UUID, zone_id: uuid.UUID, db: DB, current_user: SuperAdmin
+) -> None:
     zone = await _require_zone(group_id, zone_id, db)
-    db.add(AuditLog(
-        user_id=current_user.id,
-        user_display_name=current_user.display_name,
-        auth_source=current_user.auth_source,
-        action="delete",
-        resource_type="dns_zone",
-        resource_id=str(zone.id),
-        resource_display=zone.name,
-        result="success",
-    ))
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="delete",
+            resource_type="dns_zone",
+            resource_id=str(zone.id),
+            resource_display=zone.name,
+            result="success",
+        )
+    )
     await db.delete(zone)
     await db.commit()
 
@@ -1134,15 +1210,21 @@ async def delete_zone(group_id: uuid.UUID, zone_id: uuid.UUID, db: DB, current_u
 
 
 @router.get("/groups/{group_id}/zones/{zone_id}/records", response_model=list[RecordResponse])
-async def list_records(group_id: uuid.UUID, zone_id: uuid.UUID, db: DB, _: CurrentUser) -> list[DNSRecord]:
+async def list_records(
+    group_id: uuid.UUID, zone_id: uuid.UUID, db: DB, _: CurrentUser
+) -> list[DNSRecord]:
     await _require_zone(group_id, zone_id, db)
     result = await db.execute(
-        select(DNSRecord).where(DNSRecord.zone_id == zone_id).order_by(DNSRecord.name, DNSRecord.record_type)
+        select(DNSRecord)
+        .where(DNSRecord.zone_id == zone_id)
+        .order_by(DNSRecord.name, DNSRecord.record_type)
     )
     return list(result.scalars().all())
 
 
-@router.post("/groups/{group_id}/zones/{zone_id}/records", response_model=RecordResponse, status_code=201)
+@router.post(
+    "/groups/{group_id}/zones/{zone_id}/records", response_model=RecordResponse, status_code=201
+)
 async def create_record(
     group_id: uuid.UUID, zone_id: uuid.UUID, body: RecordCreate, db: DB, current_user: CurrentUser
 ) -> DNSRecord:
@@ -1159,20 +1241,24 @@ async def create_record(
     target_serial = bump_zone_serial(zone)
     await db.flush()
     await enqueue_record_op(
-        db, zone, "create",
+        db,
+        zone,
+        "create",
         {"name": record.name, "type": record.record_type, "value": record.value, "ttl": record.ttl},
         target_serial=target_serial,
     )
-    db.add(AuditLog(
-        user_id=current_user.id,
-        user_display_name=current_user.display_name,
-        auth_source=current_user.auth_source,
-        action="create",
-        resource_type="dns_record",
-        resource_id=str(record.id),
-        resource_display=fqdn,
-        result="success",
-    ))
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="create",
+            resource_type="dns_record",
+            resource_id=str(record.id),
+            resource_display=fqdn,
+            result="success",
+        )
+    )
     await db.commit()
     await db.refresh(record)
     return record
@@ -1197,22 +1283,31 @@ async def update_record(
     target_serial = bump_zone_serial(zone) if zone is not None else None
     if zone is not None:
         await enqueue_record_op(
-            db, zone, "update",
-            {"name": record.name, "type": record.record_type, "value": record.value, "ttl": record.ttl},
+            db,
+            zone,
+            "update",
+            {
+                "name": record.name,
+                "type": record.record_type,
+                "value": record.value,
+                "ttl": record.ttl,
+            },
             target_serial=target_serial,
         )
 
-    db.add(AuditLog(
-        user_id=current_user.id,
-        user_display_name=current_user.display_name,
-        auth_source=current_user.auth_source,
-        action="update",
-        resource_type="dns_record",
-        resource_id=str(record.id),
-        resource_display=record.fqdn,
-        changed_fields=list(changes.keys()),
-        result="success",
-    ))
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="update",
+            resource_type="dns_record",
+            resource_id=str(record.id),
+            resource_display=record.fqdn,
+            changed_fields=list(changes.keys()),
+            result="success",
+        )
+    )
     await db.commit()
     await db.refresh(record)
     return record
@@ -1224,16 +1319,18 @@ async def delete_record(
 ) -> None:
     record = await _require_record(group_id, zone_id, record_id, db)
     zone = await db.get(DNSZone, record.zone_id)
-    db.add(AuditLog(
-        user_id=current_user.id,
-        user_display_name=current_user.display_name,
-        auth_source=current_user.auth_source,
-        action="delete",
-        resource_type="dns_record",
-        resource_id=str(record.id),
-        resource_display=record.fqdn,
-        result="success",
-    ))
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="delete",
+            resource_type="dns_record",
+            resource_id=str(record.id),
+            resource_display=record.fqdn,
+            result="success",
+        )
+    )
     rec_snapshot = {
         "name": record.name,
         "type": record.record_type,
@@ -1315,9 +1412,7 @@ class ImportCommitResponse(BaseModel):
     conflict_strategy: str
 
 
-def _resolve_zone_name(
-    body: ImportPreviewRequest, existing_zone: DNSZone | None
-) -> str:
+def _resolve_zone_name(body: ImportPreviewRequest, existing_zone: DNSZone | None) -> str:
     if existing_zone is not None:
         return existing_zone.name
     if not body.zone_name:
@@ -1432,9 +1527,7 @@ async def import_zone_commit(
 
     # Creates run under merge, replace, and append.
     for change in diff.to_create:
-        fqdn = (
-            f"{change.name}.{zone.name}" if change.name != "@" else zone.name
-        )
+        fqdn = f"{change.name}.{zone.name}" if change.name != "@" else zone.name
         db.add(
             DNSRecord(
                 zone_id=zone.id,
@@ -1493,18 +1586,22 @@ async def import_zone_commit(
                         {"name": c.name, "type": c.record_type, "value": c.value}
                         for c in diff.to_create
                     ],
-                    "update": [
-                        {"name": c.name, "type": c.record_type, "value": c.value}
-                        for c in diff.to_update
-                    ]
-                    if body.conflict_strategy in {"merge", "replace"}
-                    else [],
-                    "delete": [
-                        {"name": c.name, "type": c.record_type, "value": c.value}
-                        for c in diff.to_delete
-                    ]
-                    if body.conflict_strategy == "replace"
-                    else [],
+                    "update": (
+                        [
+                            {"name": c.name, "type": c.record_type, "value": c.value}
+                            for c in diff.to_update
+                        ]
+                        if body.conflict_strategy in {"merge", "replace"}
+                        else []
+                    ),
+                    "delete": (
+                        [
+                            {"name": c.name, "type": c.record_type, "value": c.value}
+                            for c in diff.to_delete
+                        ]
+                        if body.conflict_strategy == "replace"
+                        else []
+                    ),
                 },
             },
             result="success",
@@ -1646,5 +1743,3 @@ async def _require_record(
     if not record:
         raise HTTPException(status_code=404, detail="Record not found")
     return record
-
-

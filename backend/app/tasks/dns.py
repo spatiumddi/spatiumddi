@@ -56,9 +56,7 @@ async def _refresh_blocklist_feed_async(list_id: str) -> dict[str, int | str]:
                 bl.last_sync_error = f"Fetch failed: {e}"
                 bl.last_synced_at = datetime.now(UTC)
                 await db.commit()
-                logger.exception(
-                    "blocklist_feed_fetch_failed", list_id=list_id, error=str(e)
-                )
+                logger.exception("blocklist_feed_fetch_failed", list_id=list_id, error=str(e))
                 return {"status": "error", "added": 0, "removed": 0}
 
             domains = set(parse_feed(text, bl.feed_format))
@@ -170,6 +168,8 @@ async def _dns_agent_stale_sweep_async() -> dict[str, int]:
 def agent_stale_sweep() -> dict[str, int]:
     """Celery beat task — runs every 60s, flips stale agents to 'unreachable'."""
     return asyncio.run(_dns_agent_stale_sweep_async())
+
+
 async def _probe_server_soa(host: str, port: int) -> bool:
     """Send an SOA query for "." to ``host:port`` using ``dnspython``.
 
@@ -211,7 +211,11 @@ async def _check_health(server_id: uuid.UUID) -> None:
 
         # If the agent heartbeat is fresh, trust it.
         last_seen = server.last_health_check_at
-        if last_seen is not None and (now - last_seen) <= AGENT_STALE_AFTER and server.status == "active":
+        if (
+            last_seen is not None
+            and (now - last_seen) <= AGENT_STALE_AFTER
+            and server.status == "active"
+        ):
             new_status = "active"
         else:
             reachable = await _probe_server_soa(server.host, server.port)

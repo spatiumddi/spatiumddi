@@ -16,7 +16,7 @@ from sqlalchemy import (
     UniqueConstraint,
     func,
 )
-from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
@@ -71,7 +71,10 @@ class DNSServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __tablename__ = "dns_server"
 
     group_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("dns_server_group.id", ondelete="CASCADE"), nullable=False, index=True
+        UUID(as_uuid=True),
+        ForeignKey("dns_server_group.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     # driver: bind9 (only supported backend)
@@ -86,11 +89,15 @@ class DNSServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # status: active | unreachable | syncing | error
     status: Mapped[str] = mapped_column(String(50), nullable=False, default="active")
     last_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    last_health_check_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_health_check_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     notes: Mapped[str] = mapped_column(Text, nullable=False, default="")
 
     # Agent bookkeeping (see docs/deployment/DNS_AGENT.md §2, §6)
-    agent_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True, unique=True)
+    agent_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), nullable=True, unique=True
+    )
     agent_jwt_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
     agent_fingerprint: Mapped[str | None] = mapped_column(String(128), nullable=True)
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -109,8 +116,10 @@ class DNSRecordOp(UUIDPrimaryKeyMixin, Base):
     __tablename__ = "dns_record_op"
 
     server_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("dns_server.id", ondelete="CASCADE"),
-        nullable=False, index=True,
+        UUID(as_uuid=True),
+        ForeignKey("dns_server.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     zone_name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     op: Mapped[str] = mapped_column(String(20), nullable=False)  # create | update | delete
@@ -208,9 +217,7 @@ class DNSTrustAnchor(UUIDPrimaryKeyMixin, Base):
     key_tag: Mapped[int] = mapped_column(Integer, nullable=False)
     public_key: Mapped[str] = mapped_column(Text, nullable=False)
     is_initial_key: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
-    added_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False
-    )
+    added_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     added_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("user.id", ondelete="SET NULL"), nullable=True
     )
@@ -237,7 +244,10 @@ class DNSAcl(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     group: Mapped["DNSServerGroup | None"] = relationship("DNSServerGroup", back_populates="acls")
     entries: Mapped[list["DNSAclEntry"]] = relationship(
-        "DNSAclEntry", back_populates="acl", cascade="all, delete-orphan", order_by="DNSAclEntry.order"
+        "DNSAclEntry",
+        back_populates="acl",
+        cascade="all, delete-orphan",
+        order_by="DNSAclEntry.order",
     )
 
 
@@ -267,7 +277,10 @@ class DNSView(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     __table_args__ = (UniqueConstraint("group_id", "name", name="uq_dns_view_group_name"),)
 
     group_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("dns_server_group.id", ondelete="CASCADE"), nullable=False, index=True
+        UUID(as_uuid=True),
+        ForeignKey("dns_server_group.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     description: Mapped[str] = mapped_column(Text, nullable=False, default="")
@@ -301,10 +314,16 @@ class DNSZone(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
 
     group_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("dns_server_group.id", ondelete="CASCADE"), nullable=False, index=True
+        UUID(as_uuid=True),
+        ForeignKey("dns_server_group.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     view_id: Mapped[uuid.UUID | None] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("dns_view.id", ondelete="SET NULL"), nullable=True, index=True
+        UUID(as_uuid=True),
+        ForeignKey("dns_view.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
     )
     # name: FQDN with trailing dot, e.g. "example.com."
     name: Mapped[str] = mapped_column(String(255), nullable=False)
@@ -353,7 +372,10 @@ class DNSRecord(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
 
     zone_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), ForeignKey("dns_zone.id", ondelete="CASCADE"), nullable=False, index=True
+        UUID(as_uuid=True),
+        ForeignKey("dns_zone.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     view_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("dns_view.id", ondelete="SET NULL"), nullable=True

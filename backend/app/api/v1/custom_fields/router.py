@@ -3,14 +3,13 @@
 from __future__ import annotations
 
 import uuid
-from typing import Any
 
 import structlog
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, field_validator
 from sqlalchemy import select
 
-from app.api.deps import CurrentUser, DB
+from app.api.deps import DB, CurrentUser
 from app.models.ipam import CustomFieldDefinition
 
 logger = structlog.get_logger(__name__)
@@ -39,7 +38,7 @@ class CustomFieldResponse(BaseModel):
     model_config = {"from_attributes": True}
 
     @classmethod
-    def from_orm(cls, obj: CustomFieldDefinition) -> "CustomFieldResponse":
+    def from_orm(cls, obj: CustomFieldDefinition) -> CustomFieldResponse:
         return cls(
             id=str(obj.id),
             resource_type=obj.resource_type,
@@ -71,7 +70,9 @@ class CustomFieldCreate(BaseModel):
     @classmethod
     def validate_resource_type(cls, v: str) -> str:
         if v not in _VALID_RESOURCE_TYPES:
-            raise ValueError(f"resource_type must be one of: {', '.join(sorted(_VALID_RESOURCE_TYPES))}")
+            raise ValueError(
+                f"resource_type must be one of: {', '.join(sorted(_VALID_RESOURCE_TYPES))}"
+            )
         return v
 
     @field_validator("field_type")
@@ -85,8 +86,11 @@ class CustomFieldCreate(BaseModel):
     @classmethod
     def validate_name(cls, v: str) -> str:
         import re
-        if not re.match(r'^[a-z][a-z0-9_]*$', v):
-            raise ValueError("name must be lowercase letters, digits, and underscores, starting with a letter")
+
+        if not re.match(r"^[a-z][a-z0-9_]*$", v):
+            raise ValueError(
+                "name must be lowercase letters, digits, and underscores, starting with a letter"
+            )
         return v
 
 
@@ -161,7 +165,13 @@ async def create_custom_field(
     db.add(field)
     await db.commit()
     await db.refresh(field)
-    logger.info("custom_field_created", user=current_user.username, id=str(field.id), name=field.name, resource_type=field.resource_type)
+    logger.info(
+        "custom_field_created",
+        user=current_user.username,
+        id=str(field.id),
+        name=field.name,
+        resource_type=field.resource_type,
+    )
     return CustomFieldResponse.from_orm(field)
 
 
@@ -200,7 +210,9 @@ async def update_custom_field(
 
     await db.commit()
     await db.refresh(field)
-    logger.info("custom_field_updated", user=current_user.username, id=str(field.id), changes=changes)
+    logger.info(
+        "custom_field_updated", user=current_user.username, id=str(field.id), changes=changes
+    )
     return CustomFieldResponse.from_orm(field)
 
 

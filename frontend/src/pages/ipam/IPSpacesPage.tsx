@@ -34,9 +34,14 @@ export function IPSpacesPage() {
           </thead>
           <tbody>
             {spaces?.map((space: IPSpace) => (
-              <tr key={space.id} className="border-b last:border-0 hover:bg-muted/30">
+              <tr
+                key={space.id}
+                className="border-b last:border-0 hover:bg-muted/30"
+              >
                 <td className="px-4 py-3 font-medium">{space.name}</td>
-                <td className="px-4 py-3 text-muted-foreground">{space.description}</td>
+                <td className="px-4 py-3 text-muted-foreground">
+                  {space.description}
+                </td>
                 <td className="px-4 py-3">{space.is_default ? "Yes" : "—"}</td>
                 <td className="px-4 py-3 text-right">
                   <button

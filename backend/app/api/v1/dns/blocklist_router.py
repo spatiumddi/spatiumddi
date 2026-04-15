@@ -26,7 +26,7 @@ from pydantic import BaseModel, field_validator
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
-from app.api.deps import CurrentUser, DB, SuperAdmin
+from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.models.audit import AuditLog
 from app.models.dns import (
     DNSBlockList,
@@ -353,9 +353,7 @@ async def create_blocklist(
 
 
 @router.get("/blocklists/{list_id}", response_model=BlockListResponse)
-async def get_blocklist(
-    list_id: uuid.UUID, db: DB, _: CurrentUser
-) -> BlockListResponse:
+async def get_blocklist(list_id: uuid.UUID, db: DB, _: CurrentUser) -> BlockListResponse:
     bl = await _require_list(list_id, db)
     return _to_response(bl)
 
@@ -384,9 +382,7 @@ async def update_blocklist(
 
 
 @router.delete("/blocklists/{list_id}", status_code=204)
-async def delete_blocklist(
-    list_id: uuid.UUID, db: DB, current_user: SuperAdmin
-) -> None:
+async def delete_blocklist(list_id: uuid.UUID, db: DB, current_user: SuperAdmin) -> None:
     bl = await _require_list(list_id, db)
     db.add(_audit(current_user, "delete", "dns_blocklist", str(bl.id), bl.name))
     await db.delete(bl)
@@ -423,11 +419,7 @@ async def update_assignments(
 
     if body.view_ids is not None:
         views = list(
-            (
-                await db.execute(select(DNSView).where(DNSView.id.in_(body.view_ids)))
-            )
-            .scalars()
-            .all()
+            (await db.execute(select(DNSView).where(DNSView.id.in_(body.view_ids)))).scalars().all()
         )
         if len(views) != len(set(body.view_ids)):
             raise HTTPException(status_code=404, detail="One or more views not found")
@@ -612,9 +604,7 @@ async def delete_entry(
 # ── Exceptions ─────────────────────────────────────────────────────────────
 
 
-@router.get(
-    "/blocklists/{list_id}/exceptions", response_model=list[ExceptionResponse]
-)
+@router.get("/blocklists/{list_id}/exceptions", response_model=list[ExceptionResponse])
 async def list_exceptions(
     list_id: uuid.UUID, db: DB, _: CurrentUser
 ) -> list[DNSBlockListException]:
@@ -673,9 +663,7 @@ async def add_exception(
     return ex
 
 
-@router.delete(
-    "/blocklists/{list_id}/exceptions/{exception_id}", status_code=204
-)
+@router.delete("/blocklists/{list_id}/exceptions/{exception_id}", status_code=204)
 async def delete_exception(
     list_id: uuid.UUID,
     exception_id: uuid.UUID,

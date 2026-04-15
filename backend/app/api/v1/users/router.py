@@ -18,6 +18,7 @@ router = APIRouter()
 
 # ── Schemas ───────────────────────────────────────────────────────────────────
 
+
 class UserResponse(BaseModel):
     id: str
     username: str
@@ -98,6 +99,7 @@ def _audit(actor: User, action: str, resource_id: str, summary: str) -> AuditLog
 
 # ── Routes ────────────────────────────────────────────────────────────────────
 
+
 @router.get("", response_model=list[UserResponse])
 async def list_users(current_user: SuperAdmin, db: DB) -> list[User]:
     result = await db.execute(select(User).order_by(User.username))
@@ -108,9 +110,7 @@ async def list_users(current_user: SuperAdmin, db: DB) -> list[User]:
 async def create_user(body: CreateUserRequest, current_user: SuperAdmin, db: DB) -> User:
     # Check uniqueness
     existing = await db.execute(
-        select(User).where(
-            (User.username == body.username) | (User.email == body.email)
-        )
+        select(User).where((User.username == body.username) | (User.email == body.email))
     )
     if existing.scalar_one_or_none():
         raise HTTPException(
@@ -194,7 +194,9 @@ async def reset_password(
 
     user.hashed_password = bcrypt.hashpw(body.new_password.encode(), bcrypt.gensalt()).decode()
     user.force_password_change = True
-    db.add(_audit(current_user, "reset_password", str(user.id), f"Reset password for {user.username}"))
+    db.add(
+        _audit(current_user, "reset_password", str(user.id), f"Reset password for {user.username}")
+    )
     await db.commit()
     logger.info("password_reset", target=user.username, by=current_user.username)
 

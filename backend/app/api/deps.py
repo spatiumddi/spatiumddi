@@ -1,6 +1,5 @@
 """Shared FastAPI dependencies injected into route handlers."""
 
-from collections.abc import AsyncGenerator
 from typing import Annotated
 
 import structlog
@@ -39,6 +38,7 @@ async def get_current_user(
         )
 
     from sqlalchemy import select
+
     from app.models.auth import User as UserModel
 
     result = await db.execute(select(UserModel).where(UserModel.id == user_id))
@@ -48,7 +48,9 @@ async def get_current_user(
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
 
     if not user.is_active:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="User account is disabled")
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="User account is disabled"
+        )
 
     return user
 

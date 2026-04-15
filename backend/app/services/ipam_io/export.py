@@ -75,9 +75,7 @@ async def _collect(
     if subnet_id:
         subnet = await db.get(Subnet, subnet_id)
         if subnet is None:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found"
-            )
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
         space = await db.get(IPSpace, subnet.space_id)
         subnets = [subnet]
         blocks_raw = []
@@ -87,38 +85,24 @@ async def _collect(
     elif block_id:
         block = await db.get(IPBlock, block_id)
         if block is None:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND, detail="Block not found"
-            )
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Block not found")
         space = await db.get(IPSpace, block.space_id)
-        all_blocks_res = await db.execute(
-            select(IPBlock).where(IPBlock.space_id == block.space_id)
-        )
+        all_blocks_res = await db.execute(select(IPBlock).where(IPBlock.space_id == block.space_id))
         all_blocks = list(all_blocks_res.scalars().all())
         block_net = ipaddress.ip_network(str(block.network), strict=False)
         blocks_raw = [
-            b
-            for b in all_blocks
-            if _is_subnet_of(str(b.network), block_net) or b.id == block.id
+            b for b in all_blocks if _is_subnet_of(str(b.network), block_net) or b.id == block.id
         ]
         block_ids = {b.id for b in blocks_raw}
-        subnets_res = await db.execute(
-            select(Subnet).where(Subnet.block_id.in_(block_ids))
-        )
+        subnets_res = await db.execute(select(Subnet).where(Subnet.block_id.in_(block_ids)))
         subnets = list(subnets_res.scalars().all())
     else:
         space = await db.get(IPSpace, space_id)
         if space is None:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND, detail="IP space not found"
-            )
-        blocks_res = await db.execute(
-            select(IPBlock).where(IPBlock.space_id == space.id)
-        )
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP space not found")
+        blocks_res = await db.execute(select(IPBlock).where(IPBlock.space_id == space.id))
         blocks_raw = list(blocks_res.scalars().all())
-        subnets_res = await db.execute(
-            select(Subnet).where(Subnet.space_id == space.id)
-        )
+        subnets_res = await db.execute(select(Subnet).where(Subnet.space_id == space.id))
         subnets = list(subnets_res.scalars().all())
 
     if space is None:
@@ -144,9 +128,7 @@ async def _collect(
     subnets_payload = [
         {
             "space": space_name,
-            "block": str(block_by_id[s.block_id].network)
-            if s.block_id in block_by_id
-            else None,
+            "block": str(block_by_id[s.block_id].network) if s.block_id in block_by_id else None,
             "network": str(s.network),
             "name": s.name,
             "description": s.description,
@@ -165,9 +147,7 @@ async def _collect(
     addresses_payload: list[dict[str, Any]] = []
     if include_addresses and subnets:
         subnet_ids = [s.id for s in subnets]
-        addrs_res = await db.execute(
-            select(IPAddress).where(IPAddress.subnet_id.in_(subnet_ids))
-        )
+        addrs_res = await db.execute(select(IPAddress).where(IPAddress.subnet_id.in_(subnet_ids)))
         subnet_nets = {s.id: str(s.network) for s in subnets}
         for a in addrs_res.scalars().all():
             addresses_payload.append(

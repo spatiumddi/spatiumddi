@@ -1,6 +1,14 @@
 import { useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { Plus, Pencil, Trash2, KeyRound, X, ShieldCheck, ShieldOff } from "lucide-react";
+import {
+  Plus,
+  Pencil,
+  Trash2,
+  KeyRound,
+  X,
+  ShieldCheck,
+  ShieldOff,
+} from "lucide-react";
 import { usersApi, type AppUser } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
@@ -9,10 +17,18 @@ import { cn } from "@/lib/utils";
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
 
-function Field({ label, children }: { label: string; children: React.ReactNode }) {
+function Field({
+  label,
+  children,
+}: {
+  label: string;
+  children: React.ReactNode;
+}) {
   return (
     <div className="space-y-1">
-      <label className="text-xs font-medium text-muted-foreground">{label}</label>
+      <label className="text-xs font-medium text-muted-foreground">
+        {label}
+      </label>
       {children}
     </div>
   );
@@ -32,7 +48,10 @@ function Modal({
       <div className="w-full max-w-md rounded-lg border bg-card p-6 shadow-lg">
         <div className="mb-4 flex items-center justify-between">
           <h2 className="text-base font-semibold">{title}</h2>
-          <button onClick={onClose} className="rounded p-1 text-muted-foreground hover:text-foreground">
+          <button
+            onClick={onClose}
+            className="rounded p-1 text-muted-foreground hover:text-foreground"
+          >
             <X className="h-4 w-4" />
           </button>
         </div>
@@ -70,8 +89,8 @@ function CreateUserModal({ onClose }: { onClose: () => void }) {
     },
     onError: (err: unknown) => {
       const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail ??
-        "Failed to create user";
+        (err as { response?: { data?: { detail?: string } } })?.response?.data
+          ?.detail ?? "Failed to create user";
       setError(typeof msg === "string" ? msg : JSON.stringify(msg));
     },
   });
@@ -80,32 +99,67 @@ function CreateUserModal({ onClose }: { onClose: () => void }) {
     <Modal title="New User" onClose={onClose}>
       <div className="space-y-3">
         <Field label="Username">
-          <input className={inputCls} value={username} onChange={(e) => setUsername(e.target.value)} autoFocus />
+          <input
+            className={inputCls}
+            value={username}
+            onChange={(e) => setUsername(e.target.value)}
+            autoFocus
+          />
         </Field>
         <Field label="Display Name">
-          <input className={inputCls} value={displayName} onChange={(e) => setDisplayName(e.target.value)} />
+          <input
+            className={inputCls}
+            value={displayName}
+            onChange={(e) => setDisplayName(e.target.value)}
+          />
         </Field>
         <Field label="Email">
-          <input className={inputCls} type="email" value={email} onChange={(e) => setEmail(e.target.value)} />
+          <input
+            className={inputCls}
+            type="email"
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+          />
         </Field>
         <Field label="Password">
-          <input className={inputCls} type="password" value={password} onChange={(e) => setPassword(e.target.value)} />
+          <input
+            className={inputCls}
+            type="password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+          />
         </Field>
         <div className="flex flex-col gap-2">
           <label className="flex cursor-pointer items-center gap-2 text-sm">
-            <input type="checkbox" checked={isSuperadmin} onChange={(e) => setIsSuperadmin(e.target.checked)} />
+            <input
+              type="checkbox"
+              checked={isSuperadmin}
+              onChange={(e) => setIsSuperadmin(e.target.checked)}
+            />
             Superadmin
           </label>
           <label className="flex cursor-pointer items-center gap-2 text-sm">
-            <input type="checkbox" checked={forceChange} onChange={(e) => setForceChange(e.target.checked)} />
+            <input
+              type="checkbox"
+              checked={forceChange}
+              onChange={(e) => setForceChange(e.target.checked)}
+            />
             Require password change on first login
           </label>
         </div>
         {error && <p className="text-xs text-destructive">{error}</p>}
         <div className="flex justify-end gap-2 pt-2">
-          <button onClick={onClose} className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted">Cancel</button>
           <button
-            onClick={() => { setError(null); mutation.mutate(); }}
+            onClick={onClose}
+            className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={() => {
+              setError(null);
+              mutation.mutate();
+            }}
             disabled={!username || !email || !password || mutation.isPending}
             className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
@@ -119,7 +173,13 @@ function CreateUserModal({ onClose }: { onClose: () => void }) {
 
 // ── Edit User Modal ───────────────────────────────────────────────────────────
 
-function EditUserModal({ user, onClose }: { user: AppUser; onClose: () => void }) {
+function EditUserModal({
+  user,
+  onClose,
+}: {
+  user: AppUser;
+  onClose: () => void;
+}) {
   const qc = useQueryClient();
   const [displayName, setDisplayName] = useState(user.display_name);
   const [email, setEmail] = useState(user.email);
@@ -129,15 +189,20 @@ function EditUserModal({ user, onClose }: { user: AppUser; onClose: () => void }
 
   const mutation = useMutation({
     mutationFn: () =>
-      usersApi.update(user.id, { display_name: displayName, email, is_superadmin: isSuperadmin, is_active: isActive }),
+      usersApi.update(user.id, {
+        display_name: displayName,
+        email,
+        is_superadmin: isSuperadmin,
+        is_active: isActive,
+      }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["users"] });
       onClose();
     },
     onError: (err: unknown) => {
       const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail ??
-        "Failed to update";
+        (err as { response?: { data?: { detail?: string } } })?.response?.data
+          ?.detail ?? "Failed to update";
       setError(typeof msg === "string" ? msg : JSON.stringify(msg));
     },
   });
@@ -146,26 +211,52 @@ function EditUserModal({ user, onClose }: { user: AppUser; onClose: () => void }
     <Modal title={`Edit ${user.username}`} onClose={onClose}>
       <div className="space-y-3">
         <Field label="Display Name">
-          <input className={inputCls} value={displayName} onChange={(e) => setDisplayName(e.target.value)} autoFocus />
+          <input
+            className={inputCls}
+            value={displayName}
+            onChange={(e) => setDisplayName(e.target.value)}
+            autoFocus
+          />
         </Field>
         <Field label="Email">
-          <input className={inputCls} type="email" value={email} onChange={(e) => setEmail(e.target.value)} />
+          <input
+            className={inputCls}
+            type="email"
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+          />
         </Field>
         <div className="flex flex-col gap-2">
           <label className="flex cursor-pointer items-center gap-2 text-sm">
-            <input type="checkbox" checked={isSuperadmin} onChange={(e) => setIsSuperadmin(e.target.checked)} />
+            <input
+              type="checkbox"
+              checked={isSuperadmin}
+              onChange={(e) => setIsSuperadmin(e.target.checked)}
+            />
             Superadmin
           </label>
           <label className="flex cursor-pointer items-center gap-2 text-sm">
-            <input type="checkbox" checked={isActive} onChange={(e) => setIsActive(e.target.checked)} />
+            <input
+              type="checkbox"
+              checked={isActive}
+              onChange={(e) => setIsActive(e.target.checked)}
+            />
             Active
           </label>
         </div>
         {error && <p className="text-xs text-destructive">{error}</p>}
         <div className="flex justify-end gap-2 pt-2">
-          <button onClick={onClose} className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted">Cancel</button>
           <button
-            onClick={() => { setError(null); mutation.mutate(); }}
+            onClick={onClose}
+            className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={() => {
+              setError(null);
+              mutation.mutate();
+            }}
             disabled={mutation.isPending}
             className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
@@ -179,7 +270,13 @@ function EditUserModal({ user, onClose }: { user: AppUser; onClose: () => void }
 
 // ── Reset Password Modal ──────────────────────────────────────────────────────
 
-function ResetPasswordModal({ user, onClose }: { user: AppUser; onClose: () => void }) {
+function ResetPasswordModal({
+  user,
+  onClose,
+}: {
+  user: AppUser;
+  onClose: () => void;
+}) {
   const [password, setPassword] = useState("");
   const [confirm, setConfirm] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -189,8 +286,8 @@ function ResetPasswordModal({ user, onClose }: { user: AppUser; onClose: () => v
     onSuccess: onClose,
     onError: (err: unknown) => {
       const msg =
-        (err as { response?: { data?: { detail?: string } } })?.response?.data?.detail ??
-        "Failed to reset password";
+        (err as { response?: { data?: { detail?: string } } })?.response?.data
+          ?.detail ?? "Failed to reset password";
       setError(typeof msg === "string" ? msg : JSON.stringify(msg));
     },
   });
@@ -201,7 +298,13 @@ function ResetPasswordModal({ user, onClose }: { user: AppUser; onClose: () => v
     <Modal title={`Reset password — ${user.username}`} onClose={onClose}>
       <div className="space-y-3">
         <Field label="New Password">
-          <input className={inputCls} type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoFocus />
+          <input
+            className={inputCls}
+            type="password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            autoFocus
+          />
         </Field>
         <Field label="Confirm Password">
           <input
@@ -210,16 +313,26 @@ function ResetPasswordModal({ user, onClose }: { user: AppUser; onClose: () => v
             value={confirm}
             onChange={(e) => setConfirm(e.target.value)}
           />
-          {mismatch && <p className="text-xs text-destructive">Passwords do not match</p>}
+          {mismatch && (
+            <p className="text-xs text-destructive">Passwords do not match</p>
+          )}
         </Field>
         <p className="text-xs text-muted-foreground">
           The user will be required to change their password on next login.
         </p>
         {error && <p className="text-xs text-destructive">{error}</p>}
         <div className="flex justify-end gap-2 pt-2">
-          <button onClick={onClose} className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted">Cancel</button>
           <button
-            onClick={() => { setError(null); mutation.mutate(); }}
+            onClick={onClose}
+            className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={() => {
+              setError(null);
+              mutation.mutate();
+            }}
             disabled={!password || mismatch || mutation.isPending}
             className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
@@ -233,7 +346,13 @@ function ResetPasswordModal({ user, onClose }: { user: AppUser; onClose: () => v
 
 // ── Delete Confirm Modal ──────────────────────────────────────────────────────
 
-function DeleteUserModal({ user, onClose }: { user: AppUser; onClose: () => void }) {
+function DeleteUserModal({
+  user,
+  onClose,
+}: {
+  user: AppUser;
+  onClose: () => void;
+}) {
   const qc = useQueryClient();
   const mutation = useMutation({
     mutationFn: () => usersApi.delete(user.id),
@@ -247,10 +366,17 @@ function DeleteUserModal({ user, onClose }: { user: AppUser; onClose: () => void
     <Modal title="Delete User" onClose={onClose}>
       <div className="space-y-4">
         <p className="text-sm text-muted-foreground">
-          Delete user <strong className="text-foreground">{user.username}</strong>? This cannot be undone.
+          Delete user{" "}
+          <strong className="text-foreground">{user.username}</strong>? This
+          cannot be undone.
         </p>
         <div className="flex justify-end gap-2">
-          <button onClick={onClose} className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted">Cancel</button>
+          <button
+            onClick={onClose}
+            className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
+          >
+            Cancel
+          </button>
           <button
             onClick={() => mutation.mutate()}
             disabled={mutation.isPending}
@@ -296,7 +422,9 @@ export function UsersPage() {
             <thead>
               <tr className="border-b bg-muted/50 text-xs">
                 <th className="px-4 py-3 text-left font-medium">Username</th>
-                <th className="px-4 py-3 text-left font-medium">Display Name</th>
+                <th className="px-4 py-3 text-left font-medium">
+                  Display Name
+                </th>
                 <th className="px-4 py-3 text-left font-medium">Email</th>
                 <th className="px-4 py-3 text-left font-medium">Source</th>
                 <th className="px-4 py-3 text-left font-medium">Role</th>
@@ -308,18 +436,30 @@ export function UsersPage() {
             <tbody>
               {isLoading && (
                 <tr>
-                  <td colSpan={8} className="px-4 py-6 text-center text-muted-foreground">
+                  <td
+                    colSpan={8}
+                    className="px-4 py-6 text-center text-muted-foreground"
+                  >
                     Loading…
                   </td>
                 </tr>
               )}
               {users?.map((user) => (
-                <tr key={user.id} className="border-b last:border-0 hover:bg-muted/20">
-                  <td className="px-4 py-3 font-mono font-medium">{user.username}</td>
+                <tr
+                  key={user.id}
+                  className="border-b last:border-0 hover:bg-muted/20"
+                >
+                  <td className="px-4 py-3 font-mono font-medium">
+                    {user.username}
+                  </td>
                   <td className="px-4 py-3">{user.display_name}</td>
-                  <td className="px-4 py-3 text-muted-foreground">{user.email}</td>
+                  <td className="px-4 py-3 text-muted-foreground">
+                    {user.email}
+                  </td>
                   <td className="px-4 py-3">
-                    <span className="rounded-full bg-muted px-2 py-0.5 text-xs">{user.auth_source}</span>
+                    <span className="rounded-full bg-muted px-2 py-0.5 text-xs">
+                      {user.auth_source}
+                    </span>
                   </td>
                   <td className="px-4 py-3">
                     {user.is_superadmin ? (
@@ -338,16 +478,18 @@ export function UsersPage() {
                         "rounded-full px-2 py-0.5 text-xs font-medium",
                         user.is_active
                           ? "bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400"
-                          : "bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400"
+                          : "bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-400",
                       )}
                     >
                       {user.is_active ? "active" : "disabled"}
                     </span>
                   </td>
                   <td className="px-4 py-3 text-xs text-muted-foreground">
-                    {user.last_login_at
-                      ? new Date(user.last_login_at).toLocaleString()
-                      : <span className="text-muted-foreground/40">never</span>}
+                    {user.last_login_at ? (
+                      new Date(user.last_login_at).toLocaleString()
+                    ) : (
+                      <span className="text-muted-foreground/40">never</span>
+                    )}
                   </td>
                   <td className="px-4 py-3">
                     <div className="flex items-center justify-end gap-1">
@@ -382,9 +524,21 @@ export function UsersPage() {
       </div>
 
       {showCreate && <CreateUserModal onClose={() => setShowCreate(false)} />}
-      {editUser && <EditUserModal user={editUser} onClose={() => setEditUser(null)} />}
-      {resetUser && <ResetPasswordModal user={resetUser} onClose={() => setResetUser(null)} />}
-      {deleteUser && <DeleteUserModal user={deleteUser} onClose={() => setDeleteUser(null)} />}
+      {editUser && (
+        <EditUserModal user={editUser} onClose={() => setEditUser(null)} />
+      )}
+      {resetUser && (
+        <ResetPasswordModal
+          user={resetUser}
+          onClose={() => setResetUser(null)}
+        />
+      )}
+      {deleteUser && (
+        <DeleteUserModal
+          user={deleteUser}
+          onClose={() => setDeleteUser(null)}
+        />
+      )}
     </div>
   );
 }

@@ -1,5 +1,13 @@
 import { useQuery, useQueries } from "@tanstack/react-query";
-import { Network, Layers, Server, Globe, Globe2, FileText, Cpu } from "lucide-react";
+import {
+  Network,
+  Layers,
+  Server,
+  Globe,
+  Globe2,
+  FileText,
+  Cpu,
+} from "lucide-react";
 import { ipamApi, dnsApi, type Subnet, type DNSServer } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
@@ -28,7 +36,11 @@ function StatCard({
 
 function UtilizationBar({ percent }: { percent: number }) {
   const color =
-    percent >= 95 ? "bg-red-500" : percent >= 80 ? "bg-amber-400" : "bg-green-500";
+    percent >= 95
+      ? "bg-red-500"
+      : percent >= 80
+        ? "bg-amber-400"
+        : "bg-green-500";
   return (
     <div className="flex items-center gap-2">
       <div className="h-1.5 flex-1 rounded-full bg-muted">
@@ -68,7 +80,10 @@ export function DashboardPage() {
       staleTime: 30_000,
     })),
   });
-  const totalZones = zoneQueries.reduce((sum, q) => sum + (q.data?.length ?? 0), 0);
+  const totalZones = zoneQueries.reduce(
+    (sum, q) => sum + (q.data?.length ?? 0),
+    0,
+  );
 
   const serverQueries = useQueries({
     queries: dnsGroups.map((g) => ({
@@ -86,7 +101,8 @@ export function DashboardPage() {
     {} as Record<string, number>,
   );
   const activeServers = serverCounts.active ?? 0;
-  const unhealthyServers = (serverCounts.unreachable ?? 0) + (serverCounts.error ?? 0);
+  const unhealthyServers =
+    (serverCounts.unreachable ?? 0) + (serverCounts.error ?? 0);
 
   const totalIPs = subnets?.reduce((s, n) => s + n.total_ips, 0) ?? 0;
   const allocatedIPs = subnets?.reduce((s, n) => s + n.allocated_ips, 0) ?? 0;
@@ -99,8 +115,12 @@ export function DashboardPage() {
         .slice(0, 8)
     : [];
 
-  const critical = subnets?.filter((s) => s.utilization_percent >= 95).length ?? 0;
-  const warning = subnets?.filter((s) => s.utilization_percent >= 80 && s.utilization_percent < 95).length ?? 0;
+  const critical =
+    subnets?.filter((s) => s.utilization_percent >= 95).length ?? 0;
+  const warning =
+    subnets?.filter(
+      (s) => s.utilization_percent >= 80 && s.utilization_percent < 95,
+    ).length ?? 0;
 
   return (
     <div className="h-full overflow-auto p-6">
@@ -147,7 +167,11 @@ export function DashboardPage() {
             label="DNS Zones"
             value={totalZones}
             icon={FileText}
-            sub={dnsGroups.length > 0 ? `across ${dnsGroups.length} group${dnsGroups.length !== 1 ? "s" : ""}` : undefined}
+            sub={
+              dnsGroups.length > 0
+                ? `across ${dnsGroups.length} group${dnsGroups.length !== 1 ? "s" : ""}`
+                : undefined
+            }
           />
           <StatCard
             label="DNS Servers"
@@ -169,44 +193,61 @@ export function DashboardPage() {
             <div className="flex items-center justify-between border-b px-4 py-3">
               <h2 className="text-sm font-semibold">DNS Server Status</h2>
               <div className="flex items-center gap-3 text-xs">
-                {(["active", "syncing", "unreachable", "error"] as const).map((s) =>
-                  serverCounts[s] ? (
-                    <span key={s} className="flex items-center gap-1.5">
-                      <span className={cn("inline-block h-2 w-2 rounded-full", {
-                        active: "bg-emerald-500",
-                        syncing: "bg-blue-500",
-                        unreachable: "bg-red-500",
-                        error: "bg-red-500",
-                      }[s])} />
-                      {serverCounts[s]} {s}
-                    </span>
-                  ) : null,
+                {(["active", "syncing", "unreachable", "error"] as const).map(
+                  (s) =>
+                    serverCounts[s] ? (
+                      <span key={s} className="flex items-center gap-1.5">
+                        <span
+                          className={cn(
+                            "inline-block h-2 w-2 rounded-full",
+                            {
+                              active: "bg-emerald-500",
+                              syncing: "bg-blue-500",
+                              unreachable: "bg-red-500",
+                              error: "bg-red-500",
+                            }[s],
+                          )}
+                        />
+                        {serverCounts[s]} {s}
+                      </span>
+                    ) : null,
                 )}
               </div>
             </div>
             <div className="divide-y">
               {allServers.map((s) => {
                 const group = dnsGroups.find((g) => g.id === s.group_id);
-                const dotCls = {
-                  active: "bg-emerald-500",
-                  syncing: "bg-blue-500",
-                  unreachable: "bg-red-500",
-                  error: "bg-red-500",
-                }[s.status] ?? "bg-muted";
+                const dotCls =
+                  {
+                    active: "bg-emerald-500",
+                    syncing: "bg-blue-500",
+                    unreachable: "bg-red-500",
+                    error: "bg-red-500",
+                  }[s.status] ?? "bg-muted";
                 return (
-                  <div key={s.id} className="flex items-center gap-4 px-4 py-2.5">
+                  <div
+                    key={s.id}
+                    className="flex items-center gap-4 px-4 py-2.5"
+                  >
                     <span
-                      className={cn("inline-block h-2 w-2 rounded-full flex-shrink-0", dotCls)}
+                      className={cn(
+                        "inline-block h-2 w-2 rounded-full flex-shrink-0",
+                        dotCls,
+                      )}
                       title={s.status}
                     />
-                    <span className="w-48 truncate text-xs font-medium">{s.name}</span>
+                    <span className="w-48 truncate text-xs font-medium">
+                      {s.name}
+                    </span>
                     <span className="w-56 truncate font-mono text-xs text-muted-foreground">
                       {s.host}:{s.port}
                     </span>
                     <span className="w-40 truncate text-xs text-muted-foreground">
                       {group?.name ?? "—"}
                     </span>
-                    <span className="w-20 text-xs text-muted-foreground">{s.driver}</span>
+                    <span className="w-20 text-xs text-muted-foreground">
+                      {s.driver}
+                    </span>
                     <span className="flex-1 text-right text-xs text-muted-foreground">
                       {s.last_health_check_at
                         ? `checked ${new Date(s.last_health_check_at).toLocaleTimeString()}`
@@ -223,14 +264,23 @@ export function DashboardPage() {
         {topSubnets.length > 0 && (
           <div className="rounded-lg border">
             <div className="border-b px-4 py-3">
-              <h2 className="text-sm font-semibold">Top Subnets by Utilization</h2>
+              <h2 className="text-sm font-semibold">
+                Top Subnets by Utilization
+              </h2>
             </div>
             <div className="divide-y">
               {topSubnets.map((subnet: Subnet) => (
-                <div key={subnet.id} className="flex items-center gap-4 px-4 py-2.5">
-                  <span className="w-36 flex-shrink-0 font-mono text-xs">{subnet.network}</span>
+                <div
+                  key={subnet.id}
+                  className="flex items-center gap-4 px-4 py-2.5"
+                >
+                  <span className="w-36 flex-shrink-0 font-mono text-xs">
+                    {subnet.network}
+                  </span>
                   <span className="w-40 truncate text-xs text-muted-foreground">
-                    {subnet.name || <span className="text-muted-foreground/40">—</span>}
+                    {subnet.name || (
+                      <span className="text-muted-foreground/40">—</span>
+                    )}
                   </span>
                   <div className="flex-1">
                     <UtilizationBar percent={subnet.utilization_percent} />
@@ -243,7 +293,7 @@ export function DashboardPage() {
                       "rounded-full px-2 py-0.5 text-xs font-medium",
                       subnet.status === "active"
                         ? "bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400"
-                        : "bg-muted text-muted-foreground"
+                        : "bg-muted text-muted-foreground",
                     )}
                   >
                     {subnet.status}

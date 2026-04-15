@@ -33,6 +33,7 @@ from app.models.dns import (
 try:  # pragma: no cover - seam with parallel driver-abstraction agent
     from app.services.dns.config_bundle import ConfigBundle  # type: ignore[assignment]
 except ImportError:  # fallback local adapter — same shape as canonical type
+
     class ConfigBundle(TypedDict, total=False):  # type: ignore[no-redef]
         etag: str
         server_id: str
@@ -45,6 +46,7 @@ except ImportError:  # fallback local adapter — same shape as canonical type
         forwarders: list[str]
         blocklists: list[dict[str, Any]]
         pending_record_ops: list[dict[str, Any]]
+
 
 if TYPE_CHECKING:
     pass
@@ -70,22 +72,19 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
     opts = opts_res.scalar_one_or_none()
 
     # Views
-    views_res = await db.execute(
-        select(DNSView).where(DNSView.group_id == server.group_id)
-    )
+    views_res = await db.execute(select(DNSView).where(DNSView.group_id == server.group_id))
     views = views_res.scalars().all()
 
     # ACLs
     acls_res = await db.execute(
-        select(DNSAcl).where(DNSAcl.group_id == server.group_id)
+        select(DNSAcl)
+        .where(DNSAcl.group_id == server.group_id)
         .options(selectinload(DNSAcl.entries))  # type: ignore[attr-defined]
     )
     acls = acls_res.scalars().all()
 
     # Zones (+ records for primary only)
-    zones_res = await db.execute(
-        select(DNSZone).where(DNSZone.group_id == server.group_id)
-    )
+    zones_res = await db.execute(select(DNSZone).where(DNSZone.group_id == server.group_id))
     zones = zones_res.scalars().all()
 
     zone_payload: list[dict[str, Any]] = []
@@ -145,11 +144,13 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
     grp = await db.get(DNSServerGroup, server.group_id)
     tsig_keys: list[dict[str, Any]] = []
     if grp and grp.tsig_key_name and grp.tsig_key_secret:
-        tsig_keys.append({
-            "name": grp.tsig_key_name,
-            "secret": grp.tsig_key_secret,
-            "algorithm": grp.tsig_key_algorithm,
-        })
+        tsig_keys.append(
+            {
+                "name": grp.tsig_key_name,
+                "secret": grp.tsig_key_secret,
+                "algorithm": grp.tsig_key_algorithm,
+            }
+        )
 
     options_block = {
         "forwarders": getattr(opts, "forwarders", []) if opts else [],
@@ -187,9 +188,7 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
         "views": views_block,
         "acls": acls_block,
         "tsig_keys": tsig_keys,
-        "zones_structural": [
-            {k: v for k, v in z.items() if k != "records"} for z in zone_payload
-        ],
+        "zones_structural": [{k: v for k, v in z.items() if k != "records"} for z in zone_payload],
     }
     structural_etag = _compute_etag(structural)
     bundle_body["structural_etag"] = structural_etag

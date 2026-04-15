@@ -9,7 +9,7 @@ import structlog
 from fastapi import APIRouter, Body, File, Form, HTTPException, Query, UploadFile, status
 from fastapi.responses import Response
 
-from app.api.deps import CurrentUser, DB
+from app.api.deps import DB, CurrentUser
 from app.services.ipam_io import (
     commit_import,
     export_subtree,

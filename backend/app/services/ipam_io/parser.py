@@ -181,11 +181,7 @@ def parse_xlsx(data: bytes) -> ParsedPayload:
 
     # The primary / single-sheet case: use the first sheet as subnets
     subnet_sheet = (
-        "subnets"
-        if "subnets" in wb.sheetnames
-        else wb.sheetnames[0]
-        if wb.sheetnames
-        else None
+        "subnets" if "subnets" in wb.sheetnames else wb.sheetnames[0] if wb.sheetnames else None
     )
     if subnet_sheet:
         for row in _sheet_rows(subnet_sheet):

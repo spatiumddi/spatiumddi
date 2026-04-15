@@ -36,7 +36,8 @@ export const ContextMenuItem = React.forwardRef<
     className={cn(
       "relative flex cursor-pointer select-none items-center gap-2 rounded-sm px-2 py-1.5 text-xs outline-none",
       "focus:bg-accent focus:text-accent-foreground data-[disabled]:pointer-events-none data-[disabled]:opacity-50",
-      destructive && "text-destructive focus:bg-destructive/10 focus:text-destructive",
+      destructive &&
+        "text-destructive focus:bg-destructive/10 focus:text-destructive",
       className,
     )}
     {...props}
@@ -62,7 +63,10 @@ export const ContextMenuLabel = React.forwardRef<
 >(({ className, ...props }, ref) => (
   <ContextMenuPrimitive.Label
     ref={ref}
-    className={cn("px-2 py-1 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground", className)}
+    className={cn(
+      "px-2 py-1 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground",
+      className,
+    )}
     {...props}
   />
 ));

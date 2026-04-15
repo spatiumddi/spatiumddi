@@ -4,14 +4,13 @@ from __future__ import annotations
 
 import io
 import json
-from typing import Any
 
 import pytest
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.security import hash_password
 from app.models.auth import User
 from app.models.ipam import IPBlock, IPSpace, Subnet
-from app.core.security import hash_password
 from app.services.ipam_io import (
     commit_import,
     export_subtree,
@@ -187,9 +186,7 @@ async def test_export_csv_contains_subnets(db_session: AsyncSession) -> None:
     )
     await db_session.flush()
 
-    data, ctype, filename = await export_subtree(
-        db_session, space_id=space.id, format="csv"
-    )
+    data, ctype, filename = await export_subtree(db_session, space_id=space.id, format="csv")
     assert ctype == "text/csv"
     assert filename.endswith(".csv")
     text = data.decode()

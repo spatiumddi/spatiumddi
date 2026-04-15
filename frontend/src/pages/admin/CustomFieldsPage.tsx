@@ -76,8 +76,13 @@ function FieldModal({
       <div className="absolute inset-0 bg-black/50" onClick={onClose} />
       <div className="relative z-10 w-full max-w-lg rounded-xl border bg-card shadow-2xl">
         <div className="flex items-center justify-between border-b px-5 py-4">
-          <h2 className="font-semibold">{mode === "create" ? "New Custom Field" : "Edit Custom Field"}</h2>
-          <button onClick={onClose} className="text-muted-foreground hover:text-foreground">
+          <h2 className="font-semibold">
+            {mode === "create" ? "New Custom Field" : "Edit Custom Field"}
+          </h2>
+          <button
+            onClick={onClose}
+            className="text-muted-foreground hover:text-foreground"
+          >
             <X className="h-4 w-4" />
           </button>
         </div>
@@ -89,7 +94,9 @@ function FieldModal({
           )}
           <div className="grid grid-cols-2 gap-4">
             <div>
-              <label className="mb-1 block text-xs font-medium text-muted-foreground">Resource Type</label>
+              <label className="mb-1 block text-xs font-medium text-muted-foreground">
+                Resource Type
+              </label>
               <select
                 value={form.resource_type}
                 onChange={(e) => set("resource_type", e.target.value)}
@@ -97,12 +104,16 @@ function FieldModal({
                 className="w-full rounded-md border bg-background px-3 py-1.5 text-sm disabled:opacity-60"
               >
                 {RESOURCE_TYPES.map((t) => (
-                  <option key={t} value={t}>{RESOURCE_LABELS[t]}</option>
+                  <option key={t} value={t}>
+                    {RESOURCE_LABELS[t]}
+                  </option>
                 ))}
               </select>
             </div>
             <div>
-              <label className="mb-1 block text-xs font-medium text-muted-foreground">Field Type</label>
+              <label className="mb-1 block text-xs font-medium text-muted-foreground">
+                Field Type
+              </label>
               <select
                 value={form.field_type}
                 onChange={(e) => set("field_type", e.target.value)}
@@ -110,7 +121,9 @@ function FieldModal({
                 className="w-full rounded-md border bg-background px-3 py-1.5 text-sm disabled:opacity-60"
               >
                 {FIELD_TYPES.map((t) => (
-                  <option key={t} value={t}>{FIELD_TYPE_LABELS[t]}</option>
+                  <option key={t} value={t}>
+                    {FIELD_TYPE_LABELS[t]}
+                  </option>
                 ))}
               </select>
             </div>
@@ -119,11 +132,19 @@ function FieldModal({
           {mode === "create" && (
             <div>
               <label className="mb-1 block text-xs font-medium text-muted-foreground">
-                Name <span className="text-muted-foreground/60">(lowercase, underscores)</span>
+                Name{" "}
+                <span className="text-muted-foreground/60">
+                  (lowercase, underscores)
+                </span>
               </label>
               <input
                 value={form.name}
-                onChange={(e) => set("name", e.target.value.toLowerCase().replace(/[^a-z0-9_]/g, "_"))}
+                onChange={(e) =>
+                  set(
+                    "name",
+                    e.target.value.toLowerCase().replace(/[^a-z0-9_]/g, "_"),
+                  )
+                }
                 placeholder="e.g. location_code"
                 className="w-full rounded-md border bg-background px-3 py-1.5 text-sm font-mono"
               />
@@ -131,7 +152,9 @@ function FieldModal({
           )}
 
           <div>
-            <label className="mb-1 block text-xs font-medium text-muted-foreground">Label</label>
+            <label className="mb-1 block text-xs font-medium text-muted-foreground">
+              Label
+            </label>
             <input
               value={form.label}
               onChange={(e) => set("label", e.target.value)}
@@ -141,7 +164,9 @@ function FieldModal({
           </div>
 
           <div>
-            <label className="mb-1 block text-xs font-medium text-muted-foreground">Description</label>
+            <label className="mb-1 block text-xs font-medium text-muted-foreground">
+              Description
+            </label>
             <input
               value={form.description}
               onChange={(e) => set("description", e.target.value)}
@@ -150,10 +175,13 @@ function FieldModal({
             />
           </div>
 
-          {(form.field_type === "select") && (
+          {form.field_type === "select" && (
             <div>
               <label className="mb-1 block text-xs font-medium text-muted-foreground">
-                Options <span className="text-muted-foreground/60">(comma-separated)</span>
+                Options{" "}
+                <span className="text-muted-foreground/60">
+                  (comma-separated)
+                </span>
               </label>
               <input
                 value={form.options}
@@ -166,7 +194,9 @@ function FieldModal({
 
           <div className="grid grid-cols-2 gap-4">
             <div>
-              <label className="mb-1 block text-xs font-medium text-muted-foreground">Default Value</label>
+              <label className="mb-1 block text-xs font-medium text-muted-foreground">
+                Default Value
+              </label>
               <input
                 value={form.default_value}
                 onChange={(e) => set("default_value", e.target.value)}
@@ -175,7 +205,9 @@ function FieldModal({
               />
             </div>
             <div>
-              <label className="mb-1 block text-xs font-medium text-muted-foreground">Display Order</label>
+              <label className="mb-1 block text-xs font-medium text-muted-foreground">
+                Display Order
+              </label>
               <input
                 type="number"
                 value={form.display_order}
@@ -233,9 +265,13 @@ function formToPayload(form: FieldForm): Omit<CustomField, "id"> {
     name: form.name,
     label: form.label,
     field_type: form.field_type,
-    options: form.field_type === "select"
-      ? form.options.split(",").map((s) => s.trim()).filter(Boolean)
-      : null,
+    options:
+      form.field_type === "select"
+        ? form.options
+            .split(",")
+            .map((s) => s.trim())
+            .filter(Boolean)
+        : null,
     is_required: form.is_required,
     is_searchable: form.is_searchable,
     default_value: form.default_value || null,
@@ -261,11 +297,18 @@ function fieldToForm(field: CustomField): FieldForm {
 
 export function CustomFieldsPage() {
   const qc = useQueryClient();
-  const { data: me } = useQuery({ queryKey: ["me"], queryFn: authApi.me, staleTime: 60_000 });
+  const { data: me } = useQuery({
+    queryKey: ["me"],
+    queryFn: authApi.me,
+    staleTime: 60_000,
+  });
   const isSuperadmin = me?.is_superadmin ?? false;
 
   const [filterType, setFilterType] = useState<string>("all");
-  const [modal, setModal] = useState<{ mode: ModalMode; field?: CustomField } | null>(null);
+  const [modal, setModal] = useState<{
+    mode: ModalMode;
+    field?: CustomField;
+  } | null>(null);
   const [deleteConfirm, setDeleteConfirm] = useState<CustomField | null>(null);
   const [modalError, setModalError] = useState<string>("");
 
@@ -282,21 +325,30 @@ export function CustomFieldsPage() {
       setModalError("");
     },
     onError: (e: unknown) => {
-      const msg = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail ?? "Failed to create field";
+      const msg =
+        (e as { response?: { data?: { detail?: string } } })?.response?.data
+          ?.detail ?? "Failed to create field";
       setModalError(msg);
     },
   });
 
   const updateMutation = useMutation({
-    mutationFn: ({ id, data }: { id: string; data: Parameters<typeof customFieldsApi.update>[1] }) =>
-      customFieldsApi.update(id, data),
+    mutationFn: ({
+      id,
+      data,
+    }: {
+      id: string;
+      data: Parameters<typeof customFieldsApi.update>[1];
+    }) => customFieldsApi.update(id, data),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["custom-fields"] });
       setModal(null);
       setModalError("");
     },
     onError: (e: unknown) => {
-      const msg = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail ?? "Failed to update field";
+      const msg =
+        (e as { response?: { data?: { detail?: string } } })?.response?.data
+          ?.detail ?? "Failed to update field";
       setModalError(msg);
     },
   });
@@ -314,17 +366,28 @@ export function CustomFieldsPage() {
     if (modal?.mode === "create") {
       createMutation.mutate(formToPayload(form));
     } else if (modal?.mode === "edit" && modal.field) {
-      const { resource_type: _rt, name: _n, field_type: _ft, ...editable } = formToPayload(form);
+      const {
+        resource_type: _rt,
+        name: _n,
+        field_type: _ft,
+        ...editable
+      } = formToPayload(form);
       updateMutation.mutate({ id: modal.field.id, data: editable });
     }
   }
 
-  const displayed = filterType === "all" ? fields : fields.filter((f) => f.resource_type === filterType);
+  const displayed =
+    filterType === "all"
+      ? fields
+      : fields.filter((f) => f.resource_type === filterType);
 
-  const grouped = RESOURCE_TYPES.reduce<Record<string, CustomField[]>>((acc, rt) => {
-    acc[rt] = displayed.filter((f) => f.resource_type === rt);
-    return acc;
-  }, {});
+  const grouped = RESOURCE_TYPES.reduce<Record<string, CustomField[]>>(
+    (acc, rt) => {
+      acc[rt] = displayed.filter((f) => f.resource_type === rt);
+      return acc;
+    },
+    {},
+  );
 
   if (isLoading) {
     return <div className="p-8 text-sm text-muted-foreground">Loading…</div>;
@@ -341,7 +404,10 @@ export function CustomFieldsPage() {
         </div>
         {isSuperadmin && (
           <button
-            onClick={() => { setModal({ mode: "create" }); setModalError(""); }}
+            onClick={() => {
+              setModal({ mode: "create" });
+              setModalError("");
+            }}
             className="flex items-center gap-2 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90"
           >
             <Plus className="h-4 w-4" />
@@ -391,17 +457,24 @@ export function CustomFieldsPage() {
                   <th className="px-5 py-2 text-left font-medium">Label</th>
                   <th className="px-5 py-2 text-left font-medium">Type</th>
                   <th className="px-5 py-2 text-left font-medium">Flags</th>
-                  {isSuperadmin && <th className="px-5 py-2 text-right font-medium">Actions</th>}
+                  {isSuperadmin && (
+                    <th className="px-5 py-2 text-right font-medium">
+                      Actions
+                    </th>
+                  )}
                 </tr>
               </thead>
               <tbody className="divide-y">
                 {items.map((field) => (
                   <tr key={field.id} className="hover:bg-muted/30">
-                    <td className="px-5 py-2 font-mono text-xs">{field.name}</td>
+                    <td className="px-5 py-2 font-mono text-xs">
+                      {field.name}
+                    </td>
                     <td className="px-5 py-2">{field.label}</td>
                     <td className="px-5 py-2">
                       <span className="rounded bg-muted px-1.5 py-0.5 text-xs">
-                        {FIELD_TYPE_LABELS[field.field_type] ?? field.field_type}
+                        {FIELD_TYPE_LABELS[field.field_type] ??
+                          field.field_type}
                       </span>
                     </td>
                     <td className="px-5 py-2">
@@ -422,7 +495,10 @@ export function CustomFieldsPage() {
                       <td className="px-5 py-2 text-right">
                         <div className="flex justify-end gap-1">
                           <button
-                            onClick={() => { setModal({ mode: "edit", field }); setModalError(""); }}
+                            onClick={() => {
+                              setModal({ mode: "edit", field });
+                              setModalError("");
+                            }}
                             className="rounded p-1 text-muted-foreground hover:bg-accent hover:text-foreground"
                             title="Edit"
                           >
@@ -461,12 +537,19 @@ export function CustomFieldsPage() {
       {/* Delete confirm */}
       {deleteConfirm && (
         <div className="fixed inset-0 z-50 flex items-center justify-center">
-          <div className="absolute inset-0 bg-black/50" onClick={() => setDeleteConfirm(null)} />
+          <div
+            className="absolute inset-0 bg-black/50"
+            onClick={() => setDeleteConfirm(null)}
+          />
           <div className="relative z-10 w-full max-w-sm rounded-xl border bg-card p-6 shadow-2xl">
             <h2 className="font-semibold">Delete Custom Field?</h2>
             <p className="mt-2 text-sm text-muted-foreground">
-              Delete <span className="font-mono font-medium">{deleteConfirm.name}</span> from{" "}
-              {RESOURCE_LABELS[deleteConfirm.resource_type]}? Existing data stored in this field will be lost.
+              Delete{" "}
+              <span className="font-mono font-medium">
+                {deleteConfirm.name}
+              </span>{" "}
+              from {RESOURCE_LABELS[deleteConfirm.resource_type]}? Existing data
+              stored in this field will be lost.
             </p>
             <div className="mt-4 flex justify-end gap-2">
               <button

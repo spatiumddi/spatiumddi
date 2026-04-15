@@ -13,7 +13,6 @@ from app.core.security import create_access_token, hash_password
 from app.models.auth import User
 from app.models.dns import DNSServerGroup, DNSZone
 
-
 ZONE_TEXT = """\
 $ORIGIN example.com.
 $TTL 3600
@@ -60,9 +59,7 @@ async def _make_zone(db: AsyncSession) -> tuple[DNSServerGroup, DNSZone]:
 
 
 @pytest.mark.asyncio
-async def test_import_preview_reports_diff(
-    client: AsyncClient, db_session: AsyncSession
-) -> None:
+async def test_import_preview_reports_diff(client: AsyncClient, db_session: AsyncSession) -> None:
     headers = await _admin_auth(db_session)
     group, zone = await _make_zone(db_session)
 
@@ -81,9 +78,7 @@ async def test_import_preview_reports_diff(
 
 
 @pytest.mark.asyncio
-async def test_import_malformed_returns_422(
-    client: AsyncClient, db_session: AsyncSession
-) -> None:
+async def test_import_malformed_returns_422(client: AsyncClient, db_session: AsyncSession) -> None:
     headers = await _admin_auth(db_session)
     group, zone = await _make_zone(db_session)
 
@@ -182,9 +177,7 @@ $TTL 3600
 
 
 @pytest.mark.asyncio
-async def test_export_all_zones_returns_zip(
-    client: AsyncClient, db_session: AsyncSession
-) -> None:
+async def test_export_all_zones_returns_zip(client: AsyncClient, db_session: AsyncSession) -> None:
     headers = await _admin_auth(db_session)
     group, zone = await _make_zone(db_session)
 

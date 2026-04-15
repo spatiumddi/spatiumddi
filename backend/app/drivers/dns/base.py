@@ -15,10 +15,9 @@ from __future__ import annotations
 import hashlib
 import json
 from abc import ABC, abstractmethod
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from datetime import datetime
 from typing import Any, Literal
-
 
 # ── Neutral record / zone data shapes ──────────────────────────────────────
 
@@ -27,8 +26,8 @@ from typing import Any, Literal
 class RecordData:
     """A single DNS resource record, relative to its zone."""
 
-    name: str              # relative label ("@" = apex)
-    record_type: str       # A | AAAA | CNAME | MX | TXT | NS | PTR | SRV | CAA | ...
+    name: str  # relative label ("@" = apex)
+    record_type: str  # A | AAAA | CNAME | MX | TXT | NS | PTR | SRV | CAA | ...
     value: str
     ttl: int | None = None
     priority: int | None = None
@@ -38,9 +37,9 @@ class RecordData:
 
 @dataclass(frozen=True)
 class ZoneData:
-    name: str              # FQDN with trailing dot, e.g. "example.com."
-    zone_type: str         # primary | secondary | stub | forward
-    kind: str              # forward | reverse
+    name: str  # FQDN with trailing dot, e.g. "example.com."
+    zone_type: str  # primary | secondary | stub | forward
+    kind: str  # forward | reverse
     ttl: int
     refresh: int
     retry: int
@@ -109,15 +108,15 @@ class ServerOptions:
 @dataclass(frozen=True)
 class TsigKey:
     name: str
-    algorithm: str    # e.g. "hmac-sha256"
-    secret: str       # base64
+    algorithm: str  # e.g. "hmac-sha256"
+    secret: str  # base64
 
 
 @dataclass(frozen=True)
 class BlocklistEntry:
     domain: str
-    action: str        # block | redirect | nxdomain
-    block_mode: str    # nxdomain | sinkhole | refused
+    action: str  # block | redirect | nxdomain
+    block_mode: str  # nxdomain | sinkhole | refused
     sinkhole_ip: str | None
     target: str | None
     is_wildcard: bool
@@ -132,7 +131,7 @@ class EffectiveBlocklistData:
     this driver-neutral dataclass so drivers never import service modules.
     """
 
-    rpz_zone_name: str               # e.g. "spatium-blocklist.rpz."
+    rpz_zone_name: str  # e.g. "spatium-blocklist.rpz."
     entries: tuple[BlocklistEntry, ...]
     exceptions: frozenset[str]
 
@@ -147,7 +146,7 @@ class ConfigBundle:
 
     server_id: str
     server_name: str
-    driver: str                       # bind9
+    driver: str  # bind9
     roles: tuple[str, ...]
     options: ServerOptions
     acls: tuple[AclData, ...]
@@ -198,7 +197,7 @@ class RecordChange:
     record: RecordData
     target_serial: int
     tsig_key_name: str | None = None
-    op_id: str = ""                    # caller-supplied UUID for ACK tracking
+    op_id: str = ""  # caller-supplied UUID for ACK tracking
 
 
 # ── Driver abstract base ──────────────────────────────────────────────────

@@ -15,6 +15,7 @@ ALGORITHM = "HS256"
 
 # ── Passwords ──────────────────────────────────────────────────────────────────
 
+
 def hash_password(password: str) -> str:
     return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
 
@@ -24,6 +25,7 @@ def verify_password(plain: str, hashed: str) -> bool:
 
 
 # ── JWT ────────────────────────────────────────────────────────────────────────
+
 
 def create_access_token(subject: str, extra: dict[str, Any] | None = None) -> str:
     expire = datetime.now(UTC) + timedelta(minutes=settings.access_token_expire_minutes)
@@ -49,6 +51,7 @@ def decode_access_token(token: str) -> dict[str, Any]:
 
 
 # ── API Tokens ─────────────────────────────────────────────────────────────────
+
 
 def generate_api_token() -> tuple[str, str, str]:
     """

@@ -95,9 +95,7 @@ async def _collect_lists(
     return entries, exceptions, list_ids
 
 
-async def build_effective_for_view(
-    db: AsyncSession, view_id: uuid.UUID
-) -> EffectiveBlocklist:
+async def build_effective_for_view(db: AsyncSession, view_id: uuid.UUID) -> EffectiveBlocklist:
     """Compute the effective blocklist for a DNS view.
 
     Combines:
@@ -133,9 +131,7 @@ async def build_effective_for_view(
     )
 
 
-async def build_effective_for_group(
-    db: AsyncSession, group_id: uuid.UUID
-) -> EffectiveBlocklist:
+async def build_effective_for_group(db: AsyncSession, group_id: uuid.UUID) -> EffectiveBlocklist:
     """Compute the effective blocklist for a DNS server group (all views)."""
     group = (
         await db.execute(

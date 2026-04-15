@@ -19,12 +19,10 @@ from app.drivers.dns.base import (
     ServerOptions,
     TrustAnchorData,
     TsigKey,
-    ViewData,
     ZoneData,
 )
 from app.drivers.dns.bind9 import BIND9Driver
 from app.services.dns.serial import bump_zone_serial, compute_next_serial
-
 
 # ── Fixtures ──────────────────────────────────────────────────────────────
 
@@ -54,9 +52,7 @@ def records() -> list[RecordData]:
         RecordData(name="www", record_type="A", value="10.0.0.1", ttl=300),
         RecordData(name="ipv6", record_type="AAAA", value="2001:db8::1", ttl=300),
         RecordData(name="alias", record_type="CNAME", value="www.example.com.", ttl=300),
-        RecordData(
-            name="@", record_type="MX", value="mail.example.com.", ttl=3600, priority=10
-        ),
+        RecordData(name="@", record_type="MX", value="mail.example.com.", ttl=3600, priority=10),
         RecordData(name="@", record_type="TXT", value="v=spf1 -all", ttl=3600),
         RecordData(
             name="_sip._tcp",
@@ -90,9 +86,7 @@ def bundle(zone: ZoneData) -> ConfigBundle:
         driver="bind9",
         roles=("authoritative",),
         options=opts,
-        acls=(
-            AclData(name="trusted", entries=(("10.0.0.0/8", False), ("1.2.3.4", True))),
-        ),
+        acls=(AclData(name="trusted", entries=(("10.0.0.0/8", False), ("1.2.3.4", True))),),
         views=(),
         zones=(zone,),
         tsig_keys=(
@@ -139,9 +133,7 @@ def test_render_zone_config_primary(zone: ZoneData) -> None:
     assert 'file "/var/cache/bind/zones/example.com.db"' in out
 
 
-def test_render_zone_file_mixed_records(
-    zone: ZoneData, records: list[RecordData]
-) -> None:
+def test_render_zone_file_mixed_records(zone: ZoneData, records: list[RecordData]) -> None:
     out = BIND9Driver().render_zone_file(zone, records)
     assert "$TTL 3600" in out
     assert "example.com. IN SOA ns1.example.com." in out
@@ -155,9 +147,7 @@ def test_render_zone_file_mixed_records(
     assert "_sip._tcp 3600 IN SRV 10 20 5060 sip.example.com." in out
 
 
-def test_render_zone_file_is_idempotent(
-    zone: ZoneData, records: list[RecordData]
-) -> None:
+def test_render_zone_file_is_idempotent(zone: ZoneData, records: list[RecordData]) -> None:
     drv = BIND9Driver()
     assert drv.render_zone_file(zone, records) == drv.render_zone_file(zone, records)
 

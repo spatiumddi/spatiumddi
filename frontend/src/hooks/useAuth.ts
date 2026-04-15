@@ -3,7 +3,7 @@ import { authApi } from "@/lib/api";
 
 export function useAuth() {
   const [isAuthenticated, setIsAuthenticated] = useState(
-    () => !!localStorage.getItem("access_token")
+    () => !!localStorage.getItem("access_token"),
   );
 
   const login = useCallback(async (username: string, password: string) => {

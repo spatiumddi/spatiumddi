@@ -80,7 +80,9 @@ class AgentHeartbeatResponseV2(BaseModel):
 # ── Auth dependencies ──────────────────────────────────────────────────────────
 
 
-def _require_bootstrap_key(x_dns_agent_key: str | None = Header(default=None, alias="X-DNS-Agent-Key")) -> str:
+def _require_bootstrap_key(
+    x_dns_agent_key: str | None = Header(default=None, alias="X-DNS-Agent-Key")
+) -> str:
     expected = os.environ.get("DNS_AGENT_KEY", "")
     if not expected:
         raise HTTPException(
@@ -132,7 +134,9 @@ async def agent_register(
         res = await db.execute(select(DNSServerGroup).where(DNSServerGroup.name == body.group_name))
         group = res.scalar_one_or_none()
         if group is None:
-            group = DNSServerGroup(name=body.group_name, description="Auto-created by agent registration")
+            group = DNSServerGroup(
+                name=body.group_name, description="Auto-created by agent registration"
+            )
             db.add(group)
             await db.flush()
     else:
@@ -155,9 +159,7 @@ async def agent_register(
 
     if server is None:
         res = await db.execute(
-            select(DNSServer).where(
-                DNSServer.group_id == group.id, DNSServer.name == body.hostname
-            )
+            select(DNSServer).where(DNSServer.group_id == group.id, DNSServer.name == body.hostname)
         )
         server = res.scalar_one_or_none()
 
@@ -166,6 +168,7 @@ async def agent_register(
     if not group.tsig_key_secret:
         import base64
         import secrets
+
         group.tsig_key_name = f"spatium-{group.name}".replace(" ", "-").lower()
         group.tsig_key_secret = base64.b64encode(secrets.token_bytes(32)).decode()
         group.tsig_key_algorithm = "hmac-sha256"
@@ -173,9 +176,9 @@ async def agent_register(
     # First server in the group is auto-elected primary so DDNS ops have
     # somewhere to land. Operator can flip later via API.
     primary_res = await db.execute(
-        select(DNSServer).where(
-            DNSServer.group_id == group.id, DNSServer.is_primary.is_(True)
-        ).limit(1)
+        select(DNSServer)
+        .where(DNSServer.group_id == group.id, DNSServer.is_primary.is_(True))
+        .limit(1)
     )
     has_primary = primary_res.scalar_one_or_none() is not None
 
@@ -220,21 +223,28 @@ async def agent_register(
     server.agent_jwt_hash = hash_token(token)
     server.last_seen_at = datetime.now(UTC)
 
-    db.add(AuditLog(
-        user_display_name="system:dns-agent",
-        auth_source="system",
-        action="dns.agent.register",
-        resource_type="dns_server",
-        resource_id=str(server.id),
-        resource_display=body.hostname,
-        new_value={"driver": body.driver, "version": body.version, "roles": body.roles},
-        result="success",
-    ))
+    db.add(
+        AuditLog(
+            user_display_name="system:dns-agent",
+            auth_source="system",
+            action="dns.agent.register",
+            resource_type="dns_server",
+            resource_id=str(server.id),
+            resource_display=body.hostname,
+            new_value={"driver": body.driver, "version": body.version, "roles": body.roles},
+            result="success",
+        )
+    )
     await db.commit()
     await db.refresh(server)
 
-    logger.info("dns_agent_registered", server_id=str(server.id), hostname=body.hostname,
-                driver=body.driver, pending_approval=pending_approval)
+    logger.info(
+        "dns_agent_registered",
+        server_id=str(server.id),
+        hostname=body.hostname,
+        driver=body.driver,
+        pending_approval=pending_approval,
+    )
 
     return AgentRegisterResponseV2(
         server_id=str(server.id),

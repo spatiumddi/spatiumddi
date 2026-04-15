@@ -1,6 +1,12 @@
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { ClipboardList, ChevronLeft, ChevronRight, Search, X } from "lucide-react";
+import {
+  ClipboardList,
+  ChevronLeft,
+  ChevronRight,
+  Search,
+  X,
+} from "lucide-react";
 import { auditApi, type AuditLogEntry } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
@@ -16,9 +22,15 @@ const ACTION_COLORS: Record<string, string> = {
 };
 
 function ActionBadge({ action }: { action: string }) {
-  const cls = ACTION_COLORS[action] ?? "bg-zinc-500/15 text-zinc-600 dark:text-zinc-400";
+  const cls =
+    ACTION_COLORS[action] ?? "bg-zinc-500/15 text-zinc-600 dark:text-zinc-400";
   return (
-    <span className={cn("inline-flex rounded px-1.5 py-0.5 text-xs font-medium font-mono", cls)}>
+    <span
+      className={cn(
+        "inline-flex rounded px-1.5 py-0.5 text-xs font-medium font-mono",
+        cls,
+      )}
+    >
       {action}
     </span>
   );
@@ -32,7 +44,7 @@ function ResultBadge({ result }: { result: string }) {
         "inline-flex rounded px-1.5 py-0.5 text-xs font-medium",
         ok
           ? "bg-green-500/15 text-green-600 dark:text-green-400"
-          : "bg-red-500/15 text-red-600 dark:text-red-400"
+          : "bg-red-500/15 text-red-600 dark:text-red-400",
       )}
     >
       {result}
@@ -107,13 +119,19 @@ export function AuditPage() {
             <Search className="absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
             <input
               value={userFilter}
-              onChange={(e) => { setUserFilter(e.target.value); setPage(0); }}
+              onChange={(e) => {
+                setUserFilter(e.target.value);
+                setPage(0);
+              }}
               placeholder="Filter by user…"
               className="h-8 rounded-md border bg-background pl-8 pr-3 text-sm focus:outline-none focus:ring-2 focus:ring-ring w-44"
             />
             {userFilter && (
               <button
-                onClick={() => { setUserFilter(""); setPage(0); }}
+                onClick={() => {
+                  setUserFilter("");
+                  setPage(0);
+                }}
                 className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
               >
                 <X className="h-3.5 w-3.5" />
@@ -123,7 +141,10 @@ export function AuditPage() {
 
           <select
             value={actionFilter}
-            onChange={(e) => { setActionFilter(e.target.value); setPage(0); }}
+            onChange={(e) => {
+              setActionFilter(e.target.value);
+              setPage(0);
+            }}
             className="h-8 rounded-md border bg-background px-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
           >
             <option value="">All actions</option>
@@ -137,7 +158,10 @@ export function AuditPage() {
 
           <select
             value={resourceTypeFilter}
-            onChange={(e) => { setResourceTypeFilter(e.target.value); setPage(0); }}
+            onChange={(e) => {
+              setResourceTypeFilter(e.target.value);
+              setPage(0);
+            }}
             className="h-8 rounded-md border bg-background px-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
           >
             <option value="">All resource types</option>
@@ -168,36 +192,61 @@ export function AuditPage() {
           <table className="w-full text-sm">
             <thead>
               <tr className="border-b bg-muted/40">
-                <th className="px-3 py-2 text-left font-medium text-muted-foreground">Timestamp</th>
-                <th className="px-3 py-2 text-left font-medium text-muted-foreground">User</th>
-                <th className="px-3 py-2 text-left font-medium text-muted-foreground">Action</th>
-                <th className="px-3 py-2 text-left font-medium text-muted-foreground">Resource</th>
-                <th className="px-3 py-2 text-left font-medium text-muted-foreground">Summary</th>
-                <th className="px-3 py-2 text-left font-medium text-muted-foreground">Result</th>
-                <th className="px-3 py-2 text-left font-medium text-muted-foreground">IP</th>
+                <th className="px-3 py-2 text-left font-medium text-muted-foreground">
+                  Timestamp
+                </th>
+                <th className="px-3 py-2 text-left font-medium text-muted-foreground">
+                  User
+                </th>
+                <th className="px-3 py-2 text-left font-medium text-muted-foreground">
+                  Action
+                </th>
+                <th className="px-3 py-2 text-left font-medium text-muted-foreground">
+                  Resource
+                </th>
+                <th className="px-3 py-2 text-left font-medium text-muted-foreground">
+                  Summary
+                </th>
+                <th className="px-3 py-2 text-left font-medium text-muted-foreground">
+                  Result
+                </th>
+                <th className="px-3 py-2 text-left font-medium text-muted-foreground">
+                  IP
+                </th>
               </tr>
             </thead>
             <tbody>
               {isLoading ? (
                 <tr>
-                  <td colSpan={7} className="px-3 py-8 text-center text-muted-foreground">
+                  <td
+                    colSpan={7}
+                    className="px-3 py-8 text-center text-muted-foreground"
+                  >
                     Loading…
                   </td>
                 </tr>
               ) : items.length === 0 ? (
                 <tr>
-                  <td colSpan={7} className="px-3 py-8 text-center text-muted-foreground">
+                  <td
+                    colSpan={7}
+                    className="px-3 py-8 text-center text-muted-foreground"
+                  >
                     No audit events found
                   </td>
                 </tr>
               ) : (
                 items.map((entry: AuditLogEntry) => (
-                  <tr key={entry.id} className="border-b last:border-0 hover:bg-muted/30">
+                  <tr
+                    key={entry.id}
+                    className="border-b last:border-0 hover:bg-muted/30"
+                  >
                     <td className="px-3 py-2 font-mono text-xs text-muted-foreground whitespace-nowrap">
                       {formatTs(entry.timestamp)}
                     </td>
                     <td className="px-3 py-2 whitespace-nowrap">
-                      <span className="font-medium">{entry.user_display_name}</span>
+                      <span className="font-medium">
+                        {entry.user_display_name}
+                      </span>
                       {entry.auth_source !== "local" && (
                         <span className="ml-1.5 text-xs text-muted-foreground">
                           ({entry.auth_source})
@@ -208,7 +257,9 @@ export function AuditPage() {
                       <ActionBadge action={entry.action} />
                     </td>
                     <td className="px-3 py-2 whitespace-nowrap">
-                      <span className="text-xs text-muted-foreground">{entry.resource_type}</span>
+                      <span className="text-xs text-muted-foreground">
+                        {entry.resource_type}
+                      </span>
                     </td>
                     <td className="px-3 py-2 text-muted-foreground max-w-xs truncate">
                       {entry.resource_display}

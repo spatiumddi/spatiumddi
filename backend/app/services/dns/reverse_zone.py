@@ -53,9 +53,7 @@ def compute_reverse_zone_name(network: str) -> str:
             aligned_prefix = 24
         else:
             aligned_prefix = 24  # zones at /24 cover sub-prefixes
-        aligned = ipaddress.ip_network(
-            f"{net.network_address}/{aligned_prefix}", strict=False
-        )
+        aligned = ipaddress.ip_network(f"{net.network_address}/{aligned_prefix}", strict=False)
         name = aligned.network_address.reverse_pointer
         # reverse_pointer for 10.0.0.0 returns "0.0.0.10.in-addr.arpa"
         # We need to drop leading octets outside the /aligned_prefix.
@@ -70,9 +68,7 @@ def compute_reverse_zone_name(network: str) -> str:
         # IPv6 — reverse_pointer already yields a full nibble-aligned name.
         # For prefixes that aren't nibble-aligned, round up to the next nibble.
         aligned_prefix = ((net.prefixlen + 3) // 4) * 4
-        aligned = ipaddress.ip_network(
-            f"{net.network_address}/{aligned_prefix}", strict=False
-        )
+        aligned = ipaddress.ip_network(f"{net.network_address}/{aligned_prefix}", strict=False)
         name = aligned.network_address.reverse_pointer
         nibbles_kept = aligned_prefix // 4
         parts = name.split(".")
@@ -84,9 +80,9 @@ def compute_reverse_zone_name(network: str) -> str:
 
 
 async def ensure_reverse_zone_for_subnet(
-    db: "AsyncSession",
-    subnet: "Subnet",
-    current_user: "User",
+    db: AsyncSession,
+    subnet: Subnet,
+    current_user: User,
     *,
     dns_group_id: uuid.UUID | None = None,
     dns_zone_id: uuid.UUID | None = None,

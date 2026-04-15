@@ -9,15 +9,15 @@ Public API:
     write_zone_file(zone, records) -> str
 """
 
-from app.services.dns_io.parser import (
-    ParsedRecord,
-    ZoneParseError,
-    parse_zone_file,
-)
 from app.services.dns_io.diff import (
     RecordChange,
     ZoneDiff,
     diff_records,
+)
+from app.services.dns_io.parser import (
+    ParsedRecord,
+    ZoneParseError,
+    parse_zone_file,
 )
 from app.services.dns_io.writer import write_zone_file
 

@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import ipaddress
 import re
-import uuid
-from typing import Any
 
 import structlog
 from fastapi import APIRouter, Query
@@ -13,7 +11,7 @@ from pydantic import BaseModel
 from sqlalchemy import or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import CurrentUser, DB
+from app.api.deps import DB, CurrentUser
 from app.models.dns import DNSRecord, DNSServerGroup, DNSZone
 from app.models.ipam import CustomFieldDefinition, IPAddress, IPBlock, IPSpace, Subnet
 
@@ -65,15 +63,15 @@ def _normalize_mac(q: str) -> str:
 class SearchResult(BaseModel):
     """One hit from any resource type."""
 
-    type: str               # "ip_address"|"subnet"|"block"|"space"|"dns_zone"|"dns_record"|"dns_group"
+    type: str  # "ip_address"|"subnet"|"block"|"space"|"dns_zone"|"dns_record"|"dns_group"
     id: str
 
     # Primary display
-    display: str            # e.g. "10.0.0.42" or "example.com."
-    name: str | None        # human name if set
+    display: str  # e.g. "10.0.0.42" or "example.com."
+    name: str | None  # human name if set
 
     # Status / detail
-    status: str | None      # ip or subnet status
+    status: str | None  # ip or subnet status
     description: str | None
 
     # IP-address specific
@@ -110,9 +108,7 @@ class SearchResponse(BaseModel):
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
 
-async def _search_addresses(
-    db: AsyncSession, q: str, limit: int
-) -> list[SearchResult]:
+async def _search_addresses(db: AsyncSession, q: str, limit: int) -> list[SearchResult]:
     is_ip = _is_ip(q)
     is_mac = _is_mac(q)
 
@@ -123,13 +119,13 @@ async def _search_addresses(
     )
 
     if is_ip:
-        stmt = stmt.where(
-            text("CAST(ip_address.address AS inet) = CAST(:q AS inet)")
-        ).params(q=q)
+        stmt = stmt.where(text("CAST(ip_address.address AS inet) = CAST(:q AS inet)")).params(q=q)
     elif is_mac:
         norm = _normalize_mac(q)
         stmt = stmt.where(
-            text("REPLACE(REPLACE(REPLACE(CAST(ip_address.mac_address AS text), ':', ''), '-', ''), '.', '') ILIKE :norm")
+            text(
+                "REPLACE(REPLACE(REPLACE(CAST(ip_address.mac_address AS text), ':', ''), '-', ''), '.', '') ILIKE :norm"
+            )
         ).params(norm=f"%{norm}%")
     else:
         stmt = stmt.where(
@@ -165,27 +161,18 @@ async def _search_addresses(
     return out
 
 
-async def _search_subnets(
-    db: AsyncSession, q: str, limit: int
-) -> list[SearchResult]:
+async def _search_subnets(db: AsyncSession, q: str, limit: int) -> list[SearchResult]:
     is_ip = _is_ip(q)
     is_cidr = _is_cidr(q)
 
-    stmt = (
-        select(Subnet, IPSpace)
-        .join(IPSpace, Subnet.space_id == IPSpace.id)
-    )
+    stmt = select(Subnet, IPSpace).join(IPSpace, Subnet.space_id == IPSpace.id)
 
     if is_cidr:
         # Subnets that are within or equal to the query CIDR
-        stmt = stmt.where(
-            text("CAST(subnet.network AS cidr) <<= CAST(:q AS cidr)").params(q=q)
-        )
+        stmt = stmt.where(text("CAST(subnet.network AS cidr) <<= CAST(:q AS cidr)").params(q=q))
     elif is_ip:
         # Subnets containing this IP
-        stmt = stmt.where(
-            text("CAST(subnet.network AS cidr) >> CAST(:q AS inet)").params(q=q)
-        )
+        stmt = stmt.where(text("CAST(subnet.network AS cidr) >> CAST(:q AS inet)").params(q=q))
     else:
         stmt = stmt.where(
             or_(
@@ -219,25 +206,16 @@ async def _search_subnets(
     return out
 
 
-async def _search_blocks(
-    db: AsyncSession, q: str, limit: int
-) -> list[SearchResult]:
+async def _search_blocks(db: AsyncSession, q: str, limit: int) -> list[SearchResult]:
     is_cidr = _is_cidr(q)
     is_ip = _is_ip(q)
 
-    stmt = (
-        select(IPBlock, IPSpace)
-        .join(IPSpace, IPBlock.space_id == IPSpace.id)
-    )
+    stmt = select(IPBlock, IPSpace).join(IPSpace, IPBlock.space_id == IPSpace.id)
 
     if is_cidr:
-        stmt = stmt.where(
-            text("CAST(ip_block.network AS cidr) <<= CAST(:q AS cidr)").params(q=q)
-        )
+        stmt = stmt.where(text("CAST(ip_block.network AS cidr) <<= CAST(:q AS cidr)").params(q=q))
     elif is_ip:
-        stmt = stmt.where(
-            text("CAST(ip_block.network AS cidr) >> CAST(:q AS inet)").params(q=q)
-        )
+        stmt = stmt.where(text("CAST(ip_block.network AS cidr) >> CAST(:q AS inet)").params(q=q))
     else:
         stmt = stmt.where(
             or_(
@@ -271,9 +249,7 @@ async def _search_blocks(
     return out
 
 
-async def _search_spaces(
-    db: AsyncSession, q: str, limit: int
-) -> list[SearchResult]:
+async def _search_spaces(db: AsyncSession, q: str, limit: int) -> list[SearchResult]:
     stmt = select(IPSpace).where(
         or_(
             IPSpace.name.ilike(f"%{q}%"),
@@ -305,9 +281,7 @@ async def _search_spaces(
     return out
 
 
-async def _search_dns_groups(
-    db: AsyncSession, q: str, limit: int
-) -> list[SearchResult]:
+async def _search_dns_groups(db: AsyncSession, q: str, limit: int) -> list[SearchResult]:
     stmt = select(DNSServerGroup).where(
         or_(
             DNSServerGroup.name.ilike(f"%{q}%"),
@@ -339,9 +313,7 @@ async def _search_dns_groups(
     ]
 
 
-async def _search_dns_zones(
-    db: AsyncSession, q: str, limit: int
-) -> list[SearchResult]:
+async def _search_dns_zones(db: AsyncSession, q: str, limit: int) -> list[SearchResult]:
     stmt = (
         select(DNSZone, DNSServerGroup)
         .join(DNSServerGroup, DNSZone.group_id == DNSServerGroup.id)
@@ -374,9 +346,7 @@ async def _search_dns_zones(
     ]
 
 
-async def _search_dns_records(
-    db: AsyncSession, q: str, limit: int
-) -> list[SearchResult]:
+async def _search_dns_records(db: AsyncSession, q: str, limit: int) -> list[SearchResult]:
     stmt = (
         select(DNSRecord, DNSZone, DNSServerGroup)
         .join(DNSZone, DNSRecord.zone_id == DNSZone.id)
@@ -417,9 +387,7 @@ async def _search_dns_records(
     ]
 
 
-async def _searchable_field_names(
-    db: AsyncSession, resource_type: str
-) -> list[str]:
+async def _searchable_field_names(db: AsyncSession, resource_type: str) -> list[str]:
     """Return the list of custom-field names flagged searchable for the given
     resource_type ('ip_address', 'subnet', 'ip_block', 'ip_space')."""
     result = await db.execute(
@@ -431,9 +399,7 @@ async def _searchable_field_names(
     return [row[0] for row in result.all()]
 
 
-async def _search_custom_fields(
-    db: AsyncSession, q: str, limit: int
-) -> list[SearchResult]:
+async def _search_custom_fields(db: AsyncSession, q: str, limit: int) -> list[SearchResult]:
     """Substring-match any searchable custom-field value on blocks, subnets
     and IP addresses.  Returns a `matched_field` hint like
     `custom_field:owner=alice` so the UI can show WHY each row matched."""
@@ -444,9 +410,9 @@ async def _search_custom_fields(
     block_fields = await _searchable_field_names(db, "ip_block")
     if block_fields:
         clauses = [
-            text(
-                f"ip_block.custom_fields ->> :k_{i} ILIKE :q"
-            ).bindparams(**{f"k_{i}": name}, q=like)
+            text(f"ip_block.custom_fields ->> :k_{i} ILIKE :q").bindparams(
+                **{f"k_{i}": name}, q=like
+            )
             for i, name in enumerate(block_fields)
         ]
         stmt = (
@@ -489,9 +455,7 @@ async def _search_custom_fields(
     subnet_fields = await _searchable_field_names(db, "subnet")
     if subnet_fields:
         clauses = [
-            text(
-                f"subnet.custom_fields ->> :k_{i} ILIKE :q"
-            ).bindparams(**{f"k_{i}": name}, q=like)
+            text(f"subnet.custom_fields ->> :k_{i} ILIKE :q").bindparams(**{f"k_{i}": name}, q=like)
             for i, name in enumerate(subnet_fields)
         ]
         stmt = (
@@ -534,9 +498,9 @@ async def _search_custom_fields(
     addr_fields = await _searchable_field_names(db, "ip_address")
     if addr_fields:
         clauses = [
-            text(
-                f"ip_address.custom_fields ->> :k_{i} ILIKE :q"
-            ).bindparams(**{f"k_{i}": name}, q=like)
+            text(f"ip_address.custom_fields ->> :k_{i} ILIKE :q").bindparams(
+                **{f"k_{i}": name}, q=like
+            )
             for i, name in enumerate(addr_fields)
         ]
         stmt = (

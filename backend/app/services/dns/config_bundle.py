@@ -31,7 +31,6 @@ from app.drivers.dns.base import (
 )
 from app.models.dns import (
     DNSAcl,
-    DNSRecord,
     DNSServer,
     DNSServerOptions,
     DNSView,
@@ -50,9 +49,7 @@ def _tuple_or_none(v: list | None) -> tuple[str, ...] | None:
     return tuple(str(x) for x in v)
 
 
-def _to_blocklist_data(
-    eff: EffectiveBlocklist, rpz_name: str
-) -> EffectiveBlocklistData:
+def _to_blocklist_data(eff: EffectiveBlocklist, rpz_name: str) -> EffectiveBlocklistData:
     return EffectiveBlocklistData(
         rpz_zone_name=rpz_name,
         entries=tuple(
@@ -70,9 +67,7 @@ def _to_blocklist_data(
     )
 
 
-async def build_config_bundle(
-    db: AsyncSession, server: DNSServer
-) -> ConfigBundle:
+async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBundle:
     """Build a fully-populated ``ConfigBundle`` for the given server."""
     # Options (group-level)
     opts_row = (
@@ -96,9 +91,7 @@ async def build_config_bundle(
             also_notify=tuple(opts_row.also_notify or ()),
             allow_notify=tuple(opts_row.allow_notify or ()),
             allow_query=tuple(opts_row.allow_query or ("any",)),
-            allow_query_cache=tuple(
-                opts_row.allow_query_cache or ("localhost", "localnets")
-            ),
+            allow_query_cache=tuple(opts_row.allow_query_cache or ("localhost", "localnets")),
             allow_transfer=tuple(opts_row.allow_transfer or ("none",)),
             blackhole=tuple(opts_row.blackhole or ()),
             query_log_enabled=opts_row.query_log_enabled,
@@ -122,18 +115,21 @@ async def build_config_bundle(
 
     # ACLs
     acls_rows = (
-        await db.execute(
-            select(DNSAcl)
-            .where(DNSAcl.group_id == server.group_id)
-            .options(selectinload(DNSAcl.entries))
+        (
+            await db.execute(
+                select(DNSAcl)
+                .where(DNSAcl.group_id == server.group_id)
+                .options(selectinload(DNSAcl.entries))
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
     acls = tuple(
         AclData(
             name=a.name,
             entries=tuple(
-                (e.value, bool(e.negate))
-                for e in sorted(a.entries, key=lambda x: x.order)
+                (e.value, bool(e.negate)) for e in sorted(a.entries, key=lambda x: x.order)
             ),
         )
         for a in acls_rows
@@ -141,8 +137,10 @@ async def build_config_bundle(
 
     # Views
     view_rows = (
-        await db.execute(select(DNSView).where(DNSView.group_id == server.group_id))
-    ).scalars().all()
+        (await db.execute(select(DNSView).where(DNSView.group_id == server.group_id)))
+        .scalars()
+        .all()
+    )
     views = tuple(
         ViewData(
             name=v.name,
@@ -157,12 +155,16 @@ async def build_config_bundle(
 
     # Zones + records
     zone_rows = (
-        await db.execute(
-            select(DNSZone)
-            .where(DNSZone.group_id == server.group_id)
-            .options(selectinload(DNSZone.records))
+        (
+            await db.execute(
+                select(DNSZone)
+                .where(DNSZone.group_id == server.group_id)
+                .options(selectinload(DNSZone.records))
+            )
         )
-    ).scalars().all()
+        .scalars()
+        .all()
+    )
 
     zones: list[ZoneData] = []
     for z in zone_rows:
@@ -207,17 +209,11 @@ async def build_config_bundle(
         for v in view_rows:
             eff = await build_effective_for_view(db, v.id)
             if eff.entries:
-                blocklists.append(
-                    _to_blocklist_data(
-                        eff, f"spatium-blocklist-{v.name}.rpz."
-                    )
-                )
+                blocklists.append(_to_blocklist_data(eff, f"spatium-blocklist-{v.name}.rpz."))
     else:
         eff = await build_effective_for_group(db, server.group_id)
         if eff.entries:
-            blocklists.append(
-                _to_blocklist_data(eff, "spatium-blocklist.rpz.")
-            )
+            blocklists.append(_to_blocklist_data(eff, "spatium-blocklist.rpz."))
 
     # TSIG keys: optional; not yet modelled on DNSServer. Drivers handle empty.
     tsig_keys: tuple[TsigKey, ...] = ()

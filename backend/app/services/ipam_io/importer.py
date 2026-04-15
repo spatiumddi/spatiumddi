@@ -122,16 +122,12 @@ async def _resolve_space(
     )
 
 
-async def _load_existing_blocks(
-    db: AsyncSession, space_id: uuid.UUID
-) -> list[IPBlock]:
+async def _load_existing_blocks(db: AsyncSession, space_id: uuid.UUID) -> list[IPBlock]:
     result = await db.execute(select(IPBlock).where(IPBlock.space_id == space_id))
     return list(result.scalars().all())
 
 
-async def _load_existing_subnets(
-    db: AsyncSession, space_id: uuid.UUID
-) -> dict[str, Subnet]:
+async def _load_existing_subnets(db: AsyncSession, space_id: uuid.UUID) -> dict[str, Subnet]:
     result = await db.execute(select(Subnet).where(Subnet.space_id == space_id))
     return {str(s.network): s for s in result.scalars().all()}
 
@@ -301,7 +297,9 @@ async def preview_import(
 # ── Commit ─────────────────────────────────────────────────────────────────────
 
 
-def _audit_entry(user: Any, action: str, resource_id: str, display: str, new_value: dict) -> AuditLog:
+def _audit_entry(
+    user: Any, action: str, resource_id: str, display: str, new_value: dict
+) -> AuditLog:
     return AuditLog(
         user_id=user.id,
         user_display_name=user.display_name,
@@ -450,9 +448,7 @@ async def commit_import(
             )
 
         total = (
-            subnet_net.num_addresses
-            if subnet_net.prefixlen >= 31
-            else subnet_net.num_addresses - 2
+            subnet_net.num_addresses if subnet_net.prefixlen >= 31 else subnet_net.num_addresses - 2
         )
         subnet = Subnet(
             space_id=space.id,

@@ -1,19 +1,18 @@
 import uuid
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 
 import structlog
 import structlog.contextvars
-from contextlib import asynccontextmanager
-from collections.abc import AsyncGenerator
-
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.middleware.base import BaseHTTPMiddleware
 
+from app.api.health import router as health_router
+from app.api.v1.router import api_v1_router
 from app.config import settings
 from app.log import configure_logging
 from app.metrics import PrometheusMiddleware, metrics_endpoint
-from app.api.health import router as health_router
-from app.api.v1.router import api_v1_router
 
 logger = structlog.get_logger(__name__)
 
@@ -21,6 +20,7 @@ logger = structlog.get_logger(__name__)
 async def _seed_default_admin() -> None:
     """Create the default admin user if no users exist yet."""
     from sqlalchemy import func, select
+
     from app.core.security import hash_password
     from app.db import AsyncSessionLocal
     from app.models.auth import User

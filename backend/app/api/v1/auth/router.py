@@ -1,12 +1,13 @@
 """Authentication endpoints: login, refresh, logout, current user."""
 
 import uuid
+
 import structlog
 from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel, field_validator
 from sqlalchemy import select, update
 
-from app.api.deps import CurrentUser, DB
+from app.api.deps import DB, CurrentUser
 from app.core.security import (
     create_access_token,
     create_refresh_token,
@@ -62,8 +63,16 @@ async def login(body: LoginRequest, request: Request, db: DB) -> TokenResponse:
     result = await db.execute(select(User).where(User.username == body.username))
     user = result.scalar_one_or_none()
 
-    if user is None or not user.hashed_password or not verify_password(body.password, user.hashed_password):
-        logger.warning("login_failed", username=body.username, source_ip=request.client.host if request.client else None)
+    if (
+        user is None
+        or not user.hashed_password
+        or not verify_password(body.password, user.hashed_password)
+    ):
+        logger.warning(
+            "login_failed",
+            username=body.username,
+            source_ip=request.client.host if request.client else None,
+        )
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
 
     if not user.is_active:
@@ -73,6 +82,7 @@ async def login(body: LoginRequest, request: Request, db: DB) -> TokenResponse:
     raw_refresh, refresh_hash = create_refresh_token(str(user.id))
 
     from datetime import UTC, datetime, timedelta
+
     from app.config import settings
 
     session = UserSession(
@@ -129,11 +139,15 @@ async def refresh_token_endpoint(body: RefreshRequest, db: DB) -> TokenResponse:
     )
     session = result.scalar_one_or_none()
     if session is None:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired refresh token")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid or expired refresh token"
+        )
 
     user = await db.get(User, session.user_id)
     if user is None or not user.is_active:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found or inactive")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found or inactive"
+        )
 
     # Rotate: revoke old session, issue new tokens
     session.revoked = True
@@ -165,8 +179,12 @@ async def change_password(
     current_user: CurrentUser,
     db: DB,
 ) -> None:
-    if not current_user.hashed_password or not verify_password(body.current_password, current_user.hashed_password):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Current password is incorrect")
+    if not current_user.hashed_password or not verify_password(
+        body.current_password, current_user.hashed_password
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="Current password is incorrect"
+        )
 
     await db.execute(
         update(User)

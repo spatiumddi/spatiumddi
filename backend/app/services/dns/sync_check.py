@@ -19,6 +19,7 @@ Drift buckets:
 The compute function is read-only. Apply happens via ``_sync_dns_record`` in
 the IPAM router (for create/update) or direct row delete (for stale).
 """
+
 from __future__ import annotations
 
 import ipaddress
@@ -31,7 +32,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.dns import DNSRecord, DNSZone
 from app.models.ipam import IPAddress, IPBlock, Subnet
-
 
 # ── Drift report dataclasses ─────────────────────────────────────────────────
 
@@ -104,9 +104,7 @@ async def _effective_forward_zone_id(db: AsyncSession, subnet: Subnet) -> uuid.U
     return None
 
 
-async def _effective_reverse_zone(
-    db: AsyncSession, subnet: Subnet
-) -> DNSZone | None:
+async def _effective_reverse_zone(db: AsyncSession, subnet: Subnet) -> DNSZone | None:
     """Find the reverse zone for this subnet — first by ``linked_subnet_id``,
     then by longest-suffix match against the subnet's DNS group(s)."""
     res = await db.execute(
@@ -177,31 +175,37 @@ async def compute_block_dns_drift(db: AsyncSession, block_id: uuid.UUID) -> Drif
     while queue:
         bid = queue.pop()
         descendant_ids.append(bid)
-        kids = (await db.execute(
-            select(IPBlock.id).where(IPBlock.parent_block_id == bid)
-        )).scalars().all()
+        kids = (
+            (await db.execute(select(IPBlock.id).where(IPBlock.parent_block_id == bid)))
+            .scalars()
+            .all()
+        )
         queue.extend(kids)
 
-    sn_ids = (await db.execute(
-        select(Subnet.id).where(Subnet.block_id.in_(descendant_ids))
-    )).scalars().all()
+    sn_ids = (
+        (await db.execute(select(Subnet.id).where(Subnet.block_id.in_(descendant_ids))))
+        .scalars()
+        .all()
+    )
 
     return await _aggregate(db, sn_ids)
 
 
 async def compute_space_dns_drift(db: AsyncSession, space_id: uuid.UUID) -> DriftReport:
     """Aggregate drift across every subnet in the space."""
-    sn_ids = (await db.execute(
-        select(Subnet.id).where(Subnet.space_id == space_id)
-    )).scalars().all()
+    sn_ids = (
+        (await db.execute(select(Subnet.id).where(Subnet.space_id == space_id))).scalars().all()
+    )
     return await _aggregate(db, sn_ids)
 
 
 async def _aggregate(db: AsyncSession, subnet_ids: list[uuid.UUID]) -> DriftReport:
     agg = DriftReport(
         subnet_id=uuid.UUID(int=0),
-        forward_zone_id=None, forward_zone_name=None,
-        reverse_zone_id=None, reverse_zone_name=None,
+        forward_zone_id=None,
+        forward_zone_name=None,
+        reverse_zone_id=None,
+        reverse_zone_name=None,
     )
     for sid in subnet_ids:
         sub_report = await compute_subnet_dns_drift(db, sid)
@@ -229,11 +233,8 @@ async def compute_subnet_dns_drift(db: AsyncSession, subnet_id: uuid.UUID) -> Dr
     )
 
     # All live IPs in the subnet.
-    ips_res = await db.execute(
-        select(IPAddress).where(IPAddress.subnet_id == subnet_id)
-    )
+    ips_res = await db.execute(select(IPAddress).where(IPAddress.subnet_id == subnet_id))
     ips = list(ips_res.scalars().all())
-    ip_by_id = {ip.id: ip for ip in ips}
 
     # All auto-generated DNS records that point at IPs in this subnet.
     if ips:
@@ -265,19 +266,21 @@ async def compute_subnet_dns_drift(db: AsyncSession, subnet_id: uuid.UUID) -> Dr
         )
         for r in orphan_res.scalars().all():
             zone_name = (
-                forward_zone.name if forward_zone and r.zone_id == forward_zone.id
-                else reverse_zone.name if reverse_zone and r.zone_id == reverse_zone.id
-                else ""
+                forward_zone.name
+                if forward_zone and r.zone_id == forward_zone.id
+                else reverse_zone.name if reverse_zone and r.zone_id == reverse_zone.id else ""
             )
-            report.stale.append(StaleItem(
-                record_id=r.id,
-                record_type=r.record_type,
-                zone_id=r.zone_id,
-                zone_name=zone_name,
-                name=r.name,
-                value=r.value,
-                reason="ip-deleted",
-            ))
+            report.stale.append(
+                StaleItem(
+                    record_id=r.id,
+                    record_type=r.record_type,
+                    zone_id=r.zone_id,
+                    zone_name=zone_name,
+                    name=r.name,
+                    value=r.value,
+                    reason="ip-deleted",
+                )
+            )
 
     # Walk each live IP and classify.
     for ip in ips:
@@ -291,15 +294,17 @@ async def compute_subnet_dns_drift(db: AsyncSession, subnet_id: uuid.UUID) -> Dr
                     zone_name = forward_zone.name
                 elif reverse_zone and r.zone_id == reverse_zone.id:
                     zone_name = reverse_zone.name
-                report.stale.append(StaleItem(
-                    record_id=r.id,
-                    record_type=r.record_type,
-                    zone_id=r.zone_id,
-                    zone_name=zone_name,
-                    name=r.name,
-                    value=r.value,
-                    reason=("ip-orphan" if ip.status == "orphan" else "no-hostname"),
-                ))
+                report.stale.append(
+                    StaleItem(
+                        record_id=r.id,
+                        record_type=r.record_type,
+                        zone_id=r.zone_id,
+                        zone_name=zone_name,
+                        name=r.name,
+                        value=r.value,
+                        reason=("ip-orphan" if ip.status == "orphan" else "no-hostname"),
+                    )
+                )
             continue
 
         ip_a_records = [r for r in recs_by_ip.get(ip.id, []) if r.record_type == "A"]
@@ -314,45 +319,55 @@ async def compute_subnet_dns_drift(db: AsyncSession, subnet_id: uuid.UUID) -> Dr
         if forward_zone and not is_default_gateway:
             exp_name, exp_value = _expected_a(ip.hostname, str(ip.address), forward_zone.name)
             if not ip_a_records:
-                report.missing.append(MissingItem(
-                    ip_id=ip.id,
-                    ip_address=str(ip.address),
-                    hostname=ip.hostname,
-                    record_type="A",
-                    expected_name=exp_name,
-                    expected_value=exp_value,
-                    zone_id=forward_zone.id,
-                    zone_name=forward_zone.name,
-                ))
+                report.missing.append(
+                    MissingItem(
+                        ip_id=ip.id,
+                        ip_address=str(ip.address),
+                        hostname=ip.hostname,
+                        record_type="A",
+                        expected_name=exp_name,
+                        expected_value=exp_value,
+                        zone_id=forward_zone.id,
+                        zone_name=forward_zone.name,
+                    )
+                )
             else:
                 for r in ip_a_records:
                     if r.zone_id != forward_zone.id or r.name != exp_name or r.value != exp_value:
-                        report.mismatched.append(MismatchItem(
-                            record_id=r.id,
-                            ip_id=ip.id,
-                            ip_address=str(ip.address),
-                            record_type="A",
-                            zone_id=r.zone_id,
-                            zone_name=forward_zone.name if r.zone_id == forward_zone.id else "",
-                            current_name=r.name,
-                            current_value=r.value,
-                            expected_name=exp_name,
-                            expected_value=exp_value,
-                        ))
+                        report.mismatched.append(
+                            MismatchItem(
+                                record_id=r.id,
+                                ip_id=ip.id,
+                                ip_address=str(ip.address),
+                                record_type="A",
+                                zone_id=r.zone_id,
+                                zone_name=forward_zone.name if r.zone_id == forward_zone.id else "",
+                                current_name=r.name,
+                                current_value=r.value,
+                                expected_name=exp_name,
+                                expected_value=exp_value,
+                            )
+                        )
         elif is_default_gateway:
             # Forward A records for default-gateway-named IPs are stale by
             # definition (see _sync_dns_record). Surface them so the user
             # can clean up.
             for r in ip_a_records:
-                report.stale.append(StaleItem(
-                    record_id=r.id,
-                    record_type="A",
-                    zone_id=r.zone_id,
-                    zone_name=forward_zone.name if forward_zone and r.zone_id == forward_zone.id else "",
-                    name=r.name,
-                    value=r.value,
-                    reason="default-gateway-name",
-                ))
+                report.stale.append(
+                    StaleItem(
+                        record_id=r.id,
+                        record_type="A",
+                        zone_id=r.zone_id,
+                        zone_name=(
+                            forward_zone.name
+                            if forward_zone and r.zone_id == forward_zone.id
+                            else ""
+                        ),
+                        name=r.name,
+                        value=r.value,
+                        reason="default-gateway-name",
+                    )
+                )
 
         # ── Reverse PTR ──────────────────────────────────────────────────────
         if reverse_zone:
@@ -365,30 +380,34 @@ async def compute_subnet_dns_drift(db: AsyncSession, subnet_id: uuid.UUID) -> Dr
                 continue
 
             if not ip_ptr_records:
-                report.missing.append(MissingItem(
-                    ip_id=ip.id,
-                    ip_address=str(ip.address),
-                    hostname=ip.hostname,
-                    record_type="PTR",
-                    expected_name=exp_label,
-                    expected_value=exp_value,
-                    zone_id=reverse_zone.id,
-                    zone_name=reverse_zone.name,
-                ))
+                report.missing.append(
+                    MissingItem(
+                        ip_id=ip.id,
+                        ip_address=str(ip.address),
+                        hostname=ip.hostname,
+                        record_type="PTR",
+                        expected_name=exp_label,
+                        expected_value=exp_value,
+                        zone_id=reverse_zone.id,
+                        zone_name=reverse_zone.name,
+                    )
+                )
             else:
                 for r in ip_ptr_records:
                     if r.zone_id != reverse_zone.id or r.name != exp_label or r.value != exp_value:
-                        report.mismatched.append(MismatchItem(
-                            record_id=r.id,
-                            ip_id=ip.id,
-                            ip_address=str(ip.address),
-                            record_type="PTR",
-                            zone_id=r.zone_id,
-                            zone_name=reverse_zone.name if r.zone_id == reverse_zone.id else "",
-                            current_name=r.name,
-                            current_value=r.value,
-                            expected_name=exp_label,
-                            expected_value=exp_value,
-                        ))
+                        report.mismatched.append(
+                            MismatchItem(
+                                record_id=r.id,
+                                ip_id=ip.id,
+                                ip_address=str(ip.address),
+                                record_type="PTR",
+                                zone_id=r.zone_id,
+                                zone_name=reverse_zone.name if r.zone_id == reverse_zone.id else "",
+                                current_name=r.name,
+                                current_value=r.value,
+                                expected_name=exp_label,
+                                expected_value=exp_value,
+                            )
+                        )
 
     return report

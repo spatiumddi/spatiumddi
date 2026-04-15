@@ -38,7 +38,9 @@ async def _make_user(
 
 @pytest.mark.asyncio
 async def test_blocklist_model_roundtrip(db_session: AsyncSession) -> None:
-    bl = DNSBlockList(name="ads", description="Ads list", feed_url="http://x/y", feed_format="hosts")
+    bl = DNSBlockList(
+        name="ads", description="Ads list", feed_url="http://x/y", feed_format="hosts"
+    )
     db_session.add(bl)
     await db_session.flush()
 
@@ -99,9 +101,7 @@ def test_dedupe_domains() -> None:
 
 
 @pytest.mark.asyncio
-async def test_blocklist_crud_flow(
-    client: AsyncClient, db_session: AsyncSession
-) -> None:
+async def test_blocklist_crud_flow(client: AsyncClient, db_session: AsyncSession) -> None:
     _, token = await _make_user(db_session, superadmin=True, username="blcrud")
     headers = {"Authorization": f"Bearer {token}"}
 
@@ -134,9 +134,7 @@ async def test_blocklist_crud_flow(
 
 
 @pytest.mark.asyncio
-async def test_bulk_add_entries_dedupes(
-    client: AsyncClient, db_session: AsyncSession
-) -> None:
+async def test_bulk_add_entries_dedupes(client: AsyncClient, db_session: AsyncSession) -> None:
     _, token = await _make_user(db_session, superadmin=True, username="blbulk")
     headers = {"Authorization": f"Bearer {token}"}
 
@@ -154,11 +152,11 @@ async def test_bulk_add_entries_dedupes(
         json={
             "domains": [
                 "a.example.com",
-                "A.example.com",   # case-dup
-                "a.example.com",   # dup
+                "A.example.com",  # case-dup
+                "a.example.com",  # dup
                 "b.example.com",
-                "invalid",         # no dot → skipped
-                "",                # empty → skipped
+                "invalid",  # no dot → skipped
+                "",  # empty → skipped
             ]
         },
         headers=headers,
@@ -177,23 +175,17 @@ async def test_bulk_add_entries_dedupes(
     assert resp.json()["skipped"] >= 2
 
     # Verify paginated list
-    resp = await client.get(
-        f"/api/v1/dns/blocklists/{bl_id}/entries", headers=headers
-    )
+    resp = await client.get(f"/api/v1/dns/blocklists/{bl_id}/entries", headers=headers)
     assert resp.status_code == 200
     assert resp.json()["total"] == 3
 
 
 @pytest.mark.asyncio
-async def test_exception_crud(
-    client: AsyncClient, db_session: AsyncSession
-) -> None:
+async def test_exception_crud(client: AsyncClient, db_session: AsyncSession) -> None:
     _, token = await _make_user(db_session, superadmin=True, username="blexc")
     headers = {"Authorization": f"Bearer {token}"}
 
-    resp = await client.post(
-        "/api/v1/dns/blocklists", json={"name": "exc-test"}, headers=headers
-    )
+    resp = await client.post("/api/v1/dns/blocklists", json={"name": "exc-test"}, headers=headers)
     bl_id = resp.json()["id"]
 
     resp = await client.post(
@@ -204,9 +196,7 @@ async def test_exception_crud(
     assert resp.status_code == 201
     ex_id = resp.json()["id"]
 
-    resp = await client.get(
-        f"/api/v1/dns/blocklists/{bl_id}/exceptions", headers=headers
-    )
+    resp = await client.get(f"/api/v1/dns/blocklists/{bl_id}/exceptions", headers=headers)
     assert resp.status_code == 200
     assert any(x["id"] == ex_id for x in resp.json())
 
@@ -235,19 +225,10 @@ async def test_feed_sync_adds_and_prunes(
     db_session.add(bl)
     await db_session.flush()
     # Pre-existing feed entry that will no longer be in the feed
-    db_session.add(
-        DNSBlockListEntry(
-            list_id=bl.id, domain="stale.example.com", source="feed"
-        )
-    )
+    db_session.add(DNSBlockListEntry(list_id=bl.id, domain="stale.example.com", source="feed"))
     # Manual entry: must NOT be touched
-    db_session.add(
-        DNSBlockListEntry(
-            list_id=bl.id, domain="manual.example.com", source="manual"
-        )
-    )
+    db_session.add(DNSBlockListEntry(list_id=bl.id, domain="manual.example.com", source="manual"))
     await db_session.commit()
-    list_id = str(bl.id)
 
     fake_body = "0.0.0.0 new.example.com\n0.0.0.0 another.example.com\n"
 
@@ -258,9 +239,7 @@ async def test_feed_sync_adds_and_prunes(
 
         from app.services.dns_blocklist import parse_feed as _pf
 
-        result = await db_session.execute(
-            select(DNSBlockList).where(DNSBlockList.id == bl.id)
-        )
+        result = await db_session.execute(select(DNSBlockList).where(DNSBlockList.id == bl.id))
         current = result.scalar_one()
         domains = set(_pf(fake_body, current.feed_format))
         existing_res = await db_session.execute(
@@ -274,9 +253,7 @@ async def test_feed_sync_adds_and_prunes(
         to_remove = set(existing.keys()) - domains
         for d in to_add:
             db_session.add(
-                DNSBlockListEntry(
-                    list_id=current.id, domain=d, entry_type="block", source="feed"
-                )
+                DNSBlockListEntry(list_id=current.id, domain=d, entry_type="block", source="feed")
             )
         for d in to_remove:
             await db_session.delete(existing[d])
@@ -317,12 +294,8 @@ async def test_effective_blocklist_for_group(db_session: AsyncSession) -> None:
     db_session.add_all([group, bl])
     await db_session.flush()
 
-    db_session.add(
-        DNSBlockListEntry(list_id=bl.id, domain="bad.example.com", source="manual")
-    )
-    db_session.add(
-        DNSBlockListException(list_id=bl.id, domain="good.example.com")
-    )
+    db_session.add(DNSBlockListEntry(list_id=bl.id, domain="bad.example.com", source="manual"))
+    db_session.add(DNSBlockListException(list_id=bl.id, domain="good.example.com"))
     await db_session.commit()
 
     eff = await build_effective_for_group(db_session, group.id)

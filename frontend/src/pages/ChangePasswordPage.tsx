@@ -28,7 +28,9 @@ export function ChangePasswordPage() {
       await authApi.changePassword(currentPassword, newPassword);
       navigate("/dashboard");
     } catch {
-      setError("Failed to change password. Check your current password and try again.");
+      setError(
+        "Failed to change password. Check your current password and try again.",
+      );
     } finally {
       setLoading(false);
     }

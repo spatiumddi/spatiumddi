@@ -41,5 +41,5 @@ export function cidrContains(parent: string, child: string): boolean {
   const c = parseCidr(child);
   if (!p || !c) return false;
   if (c.prefix < p.prefix) return false;
-  return ((c.base & p.mask) >>> 0) === p.base;
+  return (c.base & p.mask) >>> 0 === p.base;
 }

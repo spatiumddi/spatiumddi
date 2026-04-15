@@ -1,6 +1,11 @@
 import { useQuery } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
-import { ipamApi, type FreeCidrRange, type IPBlock, type Subnet } from "@/lib/api";
+import {
+  ipamApi,
+  type FreeCidrRange,
+  type IPBlock,
+  type Subnet,
+} from "@/lib/api";
 import { parseCidr } from "@/lib/cidr";
 import { cn } from "@/lib/utils";
 
@@ -35,7 +40,12 @@ export function FreeSpaceBand({
   onSelectFree: (range: FreeCidrRange) => void;
 }) {
   const { data: freeRanges = [], isLoading } = useQuery({
-    queryKey: ["block-free-space", block.id, directSubnets.length, childBlocks.length],
+    queryKey: [
+      "block-free-space",
+      block.id,
+      directSubnets.length,
+      childBlocks.length,
+    ],
     queryFn: () => ipamApi.blockFreeSpace(block.id),
   });
 
@@ -44,7 +54,11 @@ export function FreeSpaceBand({
     if (!parent) return [];
     const parentSize = Math.pow(2, 32 - parent.prefix);
 
-    const mapRange = (net: string, kind: Segment["kind"], label: string): Segment | null => {
+    const mapRange = (
+      net: string,
+      kind: Segment["kind"],
+      label: string,
+    ): Segment | null => {
       const p = parseCidr(net);
       if (!p) return null;
       const size = Math.pow(2, 32 - p.prefix);
@@ -61,15 +75,27 @@ export function FreeSpaceBand({
 
     const out: Segment[] = [];
     for (const b of childBlocks) {
-      const s = mapRange(b.network, "block", `${b.network}${b.name ? ` (${b.name})` : ""}`);
+      const s = mapRange(
+        b.network,
+        "block",
+        `${b.network}${b.name ? ` (${b.name})` : ""}`,
+      );
       if (s) out.push(s);
     }
     for (const sn of directSubnets) {
-      const s = mapRange(sn.network, "subnet", `${sn.network}${sn.name ? ` (${sn.name})` : ""}`);
+      const s = mapRange(
+        sn.network,
+        "subnet",
+        `${sn.network}${sn.name ? ` (${sn.name})` : ""}`,
+      );
       if (s) out.push(s);
     }
     for (const fr of freeRanges) {
-      const s = mapRange(fr.network, "free", `Free ${fr.network} (${fr.size.toLocaleString()} addrs)`);
+      const s = mapRange(
+        fr.network,
+        "free",
+        `Free ${fr.network} (${fr.size.toLocaleString()} addrs)`,
+      );
       if (s) out.push(s);
     }
     out.sort((a, b) => a.start - b.start);
@@ -79,9 +105,7 @@ export function FreeSpaceBand({
   const [hovered, setHovered] = useState<Segment | null>(null);
 
   if (isLoading) {
-    return (
-      <div className="h-5 w-full animate-pulse rounded-sm bg-muted/40" />
-    );
+    return <div className="h-5 w-full animate-pulse rounded-sm bg-muted/40" />;
   }
 
   if (segments.length === 0) {
@@ -108,7 +132,10 @@ export function FreeSpaceBand({
               }
             }}
             title={seg.label}
-            style={{ left: `${seg.start * 100}%`, width: `${Math.max(seg.width * 100, 0.25)}%` }}
+            style={{
+              left: `${seg.start * 100}%`,
+              width: `${Math.max(seg.width * 100, 0.25)}%`,
+            }}
             className={cn(
               "absolute top-0 h-full border-r border-background/60 last:border-r-0",
               seg.kind === "block" && "bg-violet-500/70 hover:bg-violet-500",
@@ -124,9 +151,14 @@ export function FreeSpaceBand({
       <div className="flex items-center gap-3 text-[10px] text-muted-foreground">
         <Legend color="bg-violet-500/70" label="Child blocks" />
         <Legend color="bg-blue-500/70" label="Subnets" />
-        <Legend color="bg-[repeating-linear-gradient(45deg,theme(colors.zinc.400/.6)_0_4px,transparent_4px_8px)] dark:bg-[repeating-linear-gradient(45deg,theme(colors.zinc.500/.7)_0_4px,transparent_4px_8px)]" label="Free" />
+        <Legend
+          color="bg-[repeating-linear-gradient(45deg,theme(colors.zinc.400/.6)_0_4px,transparent_4px_8px)] dark:bg-[repeating-linear-gradient(45deg,theme(colors.zinc.500/.7)_0_4px,transparent_4px_8px)]"
+          label="Free"
+        />
         {hovered && (
-          <span className="ml-auto font-mono text-foreground">{hovered.label}</span>
+          <span className="ml-auto font-mono text-foreground">
+            {hovered.label}
+          </span>
         )}
       </div>
     </div>
@@ -136,7 +168,12 @@ export function FreeSpaceBand({
 function Legend({ color, label }: { color: string; label: string }) {
   return (
     <span className="inline-flex items-center gap-1">
-      <span className={cn("inline-block h-2 w-3 rounded-sm border border-border/60", color)} />
+      <span
+        className={cn(
+          "inline-block h-2 w-3 rounded-sm border border-border/60",
+          color,
+        )}
+      />
       {label}
     </span>
   );

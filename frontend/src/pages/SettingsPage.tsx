@@ -17,7 +17,9 @@ function Field({
     <div className="flex items-center justify-between gap-8 py-3">
       <div>
         <div className="text-sm font-medium">{label}</div>
-        {description && <div className="text-xs text-muted-foreground">{description}</div>}
+        {description && (
+          <div className="text-xs text-muted-foreground">{description}</div>
+        )}
       </div>
       <div className="flex-shrink-0">{children}</div>
     </div>
@@ -126,7 +128,11 @@ const SECTIONS: SectionDef[] = [
 
 export function SettingsPage() {
   const qc = useQueryClient();
-  const { data: me } = useQuery({ queryKey: ["me"], queryFn: authApi.me, staleTime: 60_000 });
+  const { data: me } = useQuery({
+    queryKey: ["me"],
+    queryFn: authApi.me,
+    staleTime: 60_000,
+  });
   const isSuperadmin = me?.is_superadmin ?? false;
 
   const { data, isLoading } = useQuery({
@@ -139,7 +145,10 @@ export function SettingsPage() {
   const [activeId, setActiveId] = useState<SectionId>("branding");
   const [search, setSearch] = useState("");
 
-  const values: PlatformSettings = { ...(data ?? ({} as PlatformSettings)), ...form };
+  const values: PlatformSettings = {
+    ...(data ?? ({} as PlatformSettings)),
+    ...form,
+  };
 
   const mutation = useMutation({
     mutationFn: (patch: Partial<PlatformSettings>) => settingsApi.update(patch),
@@ -151,7 +160,10 @@ export function SettingsPage() {
     },
   });
 
-  function set<K extends keyof PlatformSettings>(key: K, value: PlatformSettings[K]) {
+  function set<K extends keyof PlatformSettings>(
+    key: K,
+    value: PlatformSettings[K],
+  ) {
     setForm((prev) => ({ ...prev, [key]: value }));
     setSaved(false);
   }
@@ -161,7 +173,9 @@ export function SettingsPage() {
   }
 
   if (isLoading) {
-    return <div className="p-8 text-sm text-muted-foreground">Loading settings…</div>;
+    return (
+      <div className="p-8 text-sm text-muted-foreground">Loading settings…</div>
+    );
   }
 
   const dirty = Object.keys(form).length > 0;
@@ -186,7 +200,9 @@ export function SettingsPage() {
         <div className="border-b px-4 py-3">
           <h1 className="text-sm font-semibold">Settings</h1>
           <p className="text-xs text-muted-foreground">
-            {isSuperadmin ? "Configure SpatiumDDI." : "View-only — superadmin required to edit."}
+            {isSuperadmin
+              ? "Configure SpatiumDDI."
+              : "View-only — superadmin required to edit."}
           </p>
         </div>
         <div className="border-b p-3">
@@ -203,7 +219,9 @@ export function SettingsPage() {
         </div>
         <nav className="p-2">
           {filteredSections.length === 0 && (
-            <p className="px-2 py-3 text-xs text-muted-foreground italic">No sections match.</p>
+            <p className="px-2 py-3 text-xs text-muted-foreground italic">
+              No sections match.
+            </p>
           )}
           {filteredSections.map((s) => (
             <button
@@ -226,7 +244,9 @@ export function SettingsPage() {
           <div className="flex items-start justify-between gap-4">
             <div>
               <h2 className="text-lg font-semibold">{active.title}</h2>
-              <p className="text-sm text-muted-foreground">{active.description}</p>
+              <p className="text-sm text-muted-foreground">
+                {active.description}
+              </p>
             </div>
             {isSuperadmin && (
               <button
@@ -248,7 +268,10 @@ export function SettingsPage() {
 
           <div className="rounded-lg border bg-card divide-y px-5">
             {activeId === "branding" && (
-              <Field label="Application Title" description="Shown in the browser tab and header.">
+              <Field
+                label="Application Title"
+                description="Shown in the browser tab and header."
+              >
                 <input
                   value={values.app_title ?? ""}
                   onChange={(e) => set("app_title", e.target.value)}
@@ -260,20 +283,31 @@ export function SettingsPage() {
 
             {activeId === "discovery" && (
               <>
-                <Field label="Enable Discovery Scans" description="Periodically ping subnets to detect active hosts.">
+                <Field
+                  label="Enable Discovery Scans"
+                  description="Periodically ping subnets to detect active hosts."
+                >
                   <Toggle
                     checked={!!values.discovery_scan_enabled}
                     onChange={(v) => set("discovery_scan_enabled", v)}
                     disabled={!isSuperadmin}
                   />
                 </Field>
-                <Field label="Scan Interval" description="How often to run discovery scans.">
+                <Field
+                  label="Scan Interval"
+                  description="How often to run discovery scans."
+                >
                   <div className="flex items-center gap-2">
                     <input
                       type="number"
                       min={1}
                       value={values.discovery_scan_interval_minutes ?? 60}
-                      onChange={(e) => set("discovery_scan_interval_minutes", Number(e.target.value))}
+                      onChange={(e) =>
+                        set(
+                          "discovery_scan_interval_minutes",
+                          Number(e.target.value),
+                        )
+                      }
                       disabled={!isSuperadmin || !values.discovery_scan_enabled}
                       className={cn(inputCls, "w-24")}
                     />
@@ -285,23 +319,33 @@ export function SettingsPage() {
 
             {activeId === "dns" && (
               <>
-                <Field label="Default Zone TTL" description="Default TTL (seconds) applied to new zones.">
+                <Field
+                  label="Default Zone TTL"
+                  description="Default TTL (seconds) applied to new zones."
+                >
                   <div className="flex items-center gap-2">
                     <input
                       type="number"
                       min={60}
                       value={values.dns_default_ttl ?? 3600}
-                      onChange={(e) => set("dns_default_ttl", Number(e.target.value))}
+                      onChange={(e) =>
+                        set("dns_default_ttl", Number(e.target.value))
+                      }
                       disabled={!isSuperadmin}
                       className={cn(inputCls, "w-28")}
                     />
                     <span className="text-xs text-muted-foreground">sec</span>
                   </div>
                 </Field>
-                <Field label="Default Zone Type" description="Pre-selected zone type when creating a new zone.">
+                <Field
+                  label="Default Zone Type"
+                  description="Pre-selected zone type when creating a new zone."
+                >
                   <select
                     value={values.dns_default_zone_type ?? "primary"}
-                    onChange={(e) => set("dns_default_zone_type", e.target.value)}
+                    onChange={(e) =>
+                      set("dns_default_zone_type", e.target.value)
+                    }
                     disabled={!isSuperadmin}
                     className={inputCls}
                   >
@@ -311,10 +355,15 @@ export function SettingsPage() {
                     <option value="forward">Forward</option>
                   </select>
                 </Field>
-                <Field label="Default DNSSEC Validation" description="Default DNSSEC validation mode for new server groups.">
+                <Field
+                  label="Default DNSSEC Validation"
+                  description="Default DNSSEC validation mode for new server groups."
+                >
                   <select
                     value={values.dns_default_dnssec_validation ?? "auto"}
-                    onChange={(e) => set("dns_default_dnssec_validation", e.target.value)}
+                    onChange={(e) =>
+                      set("dns_default_dnssec_validation", e.target.value)
+                    }
                     disabled={!isSuperadmin}
                     className={inputCls}
                   >
@@ -323,7 +372,10 @@ export function SettingsPage() {
                     <option value="no">no — disabled</option>
                   </select>
                 </Field>
-                <Field label="Recursive by Default" description="Enable recursion when creating new server groups.">
+                <Field
+                  label="Recursive by Default"
+                  description="Enable recursion when creating new server groups."
+                >
                   <Toggle
                     checked={!!values.dns_recursive_by_default}
                     onChange={(v) => set("dns_recursive_by_default", v)}
@@ -342,10 +394,15 @@ export function SettingsPage() {
             )}
 
             {activeId === "ip-allocation" && (
-              <Field label="Allocation Strategy" description="Strategy used when auto-allocating the next IP.">
+              <Field
+                label="Allocation Strategy"
+                description="Strategy used when auto-allocating the next IP."
+              >
                 <select
                   value={values.ip_allocation_strategy ?? "sequential"}
-                  onChange={(e) => set("ip_allocation_strategy", e.target.value)}
+                  onChange={(e) =>
+                    set("ip_allocation_strategy", e.target.value)
+                  }
                   disabled={!isSuperadmin}
                   className={inputCls}
                 >
@@ -357,26 +414,36 @@ export function SettingsPage() {
 
             {activeId === "session" && (
               <>
-                <Field label="Session Timeout" description="Minutes of inactivity before session expires (0 = disabled).">
+                <Field
+                  label="Session Timeout"
+                  description="Minutes of inactivity before session expires (0 = disabled)."
+                >
                   <div className="flex items-center gap-2">
                     <input
                       type="number"
                       min={0}
                       value={values.session_timeout_minutes ?? 60}
-                      onChange={(e) => set("session_timeout_minutes", Number(e.target.value))}
+                      onChange={(e) =>
+                        set("session_timeout_minutes", Number(e.target.value))
+                      }
                       disabled={!isSuperadmin}
                       className={cn(inputCls, "w-24")}
                     />
                     <span className="text-xs text-muted-foreground">min</span>
                   </div>
                 </Field>
-                <Field label="Auto-Logout Warning" description="Minutes before expiry to show a logout warning (0 = disabled).">
+                <Field
+                  label="Auto-Logout Warning"
+                  description="Minutes before expiry to show a logout warning (0 = disabled)."
+                >
                   <div className="flex items-center gap-2">
                     <input
                       type="number"
                       min={0}
                       value={values.auto_logout_minutes ?? 0}
-                      onChange={(e) => set("auto_logout_minutes", Number(e.target.value))}
+                      onChange={(e) =>
+                        set("auto_logout_minutes", Number(e.target.value))
+                      }
                       disabled={!isSuperadmin}
                       className={cn(inputCls, "w-24")}
                     />
@@ -387,13 +454,21 @@ export function SettingsPage() {
             )}
 
             {activeId === "subnet-tree" && (
-              <Field label="Default Expanded Depth" description="How many levels of the tree are expanded by default.">
+              <Field
+                label="Default Expanded Depth"
+                description="How many levels of the tree are expanded by default."
+              >
                 <input
                   type="number"
                   min={0}
                   max={10}
                   value={values.subnet_tree_default_expanded_depth ?? 2}
-                  onChange={(e) => set("subnet_tree_default_expanded_depth", Number(e.target.value))}
+                  onChange={(e) =>
+                    set(
+                      "subnet_tree_default_expanded_depth",
+                      Number(e.target.value),
+                    )
+                  }
                   disabled={!isSuperadmin}
                   className={cn(inputCls, "w-20")}
                 />
@@ -401,7 +476,10 @@ export function SettingsPage() {
             )}
 
             {activeId === "updates" && (
-              <Field label="Check for GitHub Releases" description="Periodically check GitHub for new SpatiumDDI releases.">
+              <Field
+                label="Check for GitHub Releases"
+                description="Periodically check GitHub for new SpatiumDDI releases."
+              >
                 <Toggle
                   checked={!!values.github_release_check_enabled}
                   onChange={(v) => set("github_release_check_enabled", v)}
@@ -412,28 +490,44 @@ export function SettingsPage() {
 
             {activeId === "utilization" && (
               <>
-                <Field label="Warning Threshold" description="Utilization percentage to show amber warning.">
+                <Field
+                  label="Warning Threshold"
+                  description="Utilization percentage to show amber warning."
+                >
                   <div className="flex items-center gap-2">
                     <input
                       type="number"
                       min={0}
                       max={100}
                       value={values.utilization_warn_threshold ?? 80}
-                      onChange={(e) => set("utilization_warn_threshold", Number(e.target.value))}
+                      onChange={(e) =>
+                        set(
+                          "utilization_warn_threshold",
+                          Number(e.target.value),
+                        )
+                      }
                       disabled={!isSuperadmin}
                       className={cn(inputCls, "w-20")}
                     />
                     <span className="text-xs text-muted-foreground">%</span>
                   </div>
                 </Field>
-                <Field label="Critical Threshold" description="Utilization percentage to show red critical indicator.">
+                <Field
+                  label="Critical Threshold"
+                  description="Utilization percentage to show red critical indicator."
+                >
                   <div className="flex items-center gap-2">
                     <input
                       type="number"
                       min={0}
                       max={100}
                       value={values.utilization_critical_threshold ?? 95}
-                      onChange={(e) => set("utilization_critical_threshold", Number(e.target.value))}
+                      onChange={(e) =>
+                        set(
+                          "utilization_critical_threshold",
+                          Number(e.target.value),
+                        )
+                      }
                       disabled={!isSuperadmin}
                       className={cn(inputCls, "w-20")}
                     />

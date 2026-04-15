@@ -1,5 +1,12 @@
 import { useState } from "react";
-import { Upload, Download, X, AlertCircle, CheckCircle2, FileWarning } from "lucide-react";
+import {
+  Upload,
+  Download,
+  X,
+  AlertCircle,
+  CheckCircle2,
+  FileWarning,
+} from "lucide-react";
 import {
   ipamIoApi,
   type ImportPreviewResponse,
@@ -22,7 +29,9 @@ export function ImportModal({
   onCommitted: () => void;
 }) {
   const [file, setFile] = useState<File | null>(null);
-  const [spaceId, setSpaceId] = useState<string>(defaultSpaceId ?? spaces[0]?.id ?? "");
+  const [spaceId, setSpaceId] = useState<string>(
+    defaultSpaceId ?? spaces[0]?.id ?? "",
+  );
   const [strategy, setStrategy] = useState<ImportStrategy>("fail");
   const [preview, setPreview] = useState<ImportPreviewResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -40,10 +49,16 @@ export function ImportModal({
     setError(null);
     setPreview(null);
     try {
-      const result = await ipamIoApi.preview(file, { space_id: spaceId, strategy });
+      const result = await ipamIoApi.preview(file, {
+        space_id: spaceId,
+        strategy,
+      });
       setPreview(result);
     } catch (e) {
-      const err = e as { response?: { data?: { detail?: string } }; message?: string };
+      const err = e as {
+        response?: { data?: { detail?: string } };
+        message?: string;
+      };
       setError(err.response?.data?.detail ?? err.message ?? "Preview failed");
     } finally {
       setBusy(false);
@@ -55,7 +70,10 @@ export function ImportModal({
     setBusy(true);
     setError(null);
     try {
-      const result = await ipamIoApi.commit(file, { space_id: spaceId, strategy });
+      const result = await ipamIoApi.commit(file, {
+        space_id: spaceId,
+        strategy,
+      });
       setCommitted({
         created: result.created_subnets,
         updated: result.updated_subnets,
@@ -64,7 +82,10 @@ export function ImportModal({
       });
       onCommitted();
     } catch (e) {
-      const err = e as { response?: { data?: { detail?: string } }; message?: string };
+      const err = e as {
+        response?: { data?: { detail?: string } };
+        message?: string;
+      };
       setError(err.response?.data?.detail ?? err.message ?? "Import failed");
     } finally {
       setBusy(false);
@@ -78,7 +99,10 @@ export function ImportModal({
           <h2 className="flex items-center gap-2 text-base font-semibold">
             <Upload className="h-4 w-4" /> Import IPAM data
           </h2>
-          <button onClick={onClose} className="text-muted-foreground hover:text-foreground">
+          <button
+            onClick={onClose}
+            className="text-muted-foreground hover:text-foreground"
+          >
             <X className="h-4 w-4" />
           </button>
         </div>
@@ -100,7 +124,9 @@ export function ImportModal({
             <>
               <div className="grid grid-cols-2 gap-3">
                 <div>
-                  <label className="mb-1 block text-xs font-medium">Target IP Space</label>
+                  <label className="mb-1 block text-xs font-medium">
+                    Target IP Space
+                  </label>
                   <select
                     value={spaceId}
                     onChange={(e) => setSpaceId(e.target.value)}
@@ -114,10 +140,14 @@ export function ImportModal({
                   </select>
                 </div>
                 <div>
-                  <label className="mb-1 block text-xs font-medium">Conflict strategy</label>
+                  <label className="mb-1 block text-xs font-medium">
+                    Conflict strategy
+                  </label>
                   <select
                     value={strategy}
-                    onChange={(e) => setStrategy(e.target.value as ImportStrategy)}
+                    onChange={(e) =>
+                      setStrategy(e.target.value as ImportStrategy)
+                    }
                     className="w-full rounded border bg-background px-2 py-1 text-sm"
                   >
                     <option value="fail">Fail on conflict</option>
@@ -216,9 +246,11 @@ function PreviewTable({ preview }: { preview: ImportPreviewResponse }) {
                 key={i}
                 className={cn(
                   "border-t",
-                  r._class === "create" && "bg-green-50/60 dark:bg-green-900/10",
+                  r._class === "create" &&
+                    "bg-green-50/60 dark:bg-green-900/10",
                   r._class === "update" && "bg-blue-50/60 dark:bg-blue-900/10",
-                  r._class === "conflict" && "bg-amber-50/60 dark:bg-amber-900/10",
+                  r._class === "conflict" &&
+                    "bg-amber-50/60 dark:bg-amber-900/10",
                   r._class === "error" && "bg-red-50/60 dark:bg-red-900/10",
                 )}
               >
@@ -230,8 +262,12 @@ function PreviewTable({ preview }: { preview: ImportPreviewResponse }) {
             ))}
             {rows.length === 0 && (
               <tr>
-                <td colSpan={4} className="px-2 py-3 text-center text-muted-foreground">
-                  <FileWarning className="mr-1 inline h-3.5 w-3.5" /> No rows in payload
+                <td
+                  colSpan={4}
+                  className="px-2 py-3 text-center text-muted-foreground"
+                >
+                  <FileWarning className="mr-1 inline h-3.5 w-3.5" /> No rows in
+                  payload
                 </td>
               </tr>
             )}
@@ -242,14 +278,26 @@ function PreviewTable({ preview }: { preview: ImportPreviewResponse }) {
   );
 }
 
-function Badge({ color, label }: { color: "green" | "blue" | "amber" | "red"; label: string }) {
+function Badge({
+  color,
+  label,
+}: {
+  color: "green" | "blue" | "amber" | "red";
+  label: string;
+}) {
   const c = {
-    green: "bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400",
+    green:
+      "bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400",
     blue: "bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400",
-    amber: "bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-300",
+    amber:
+      "bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-300",
     red: "bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300",
   }[color];
-  return <span className={cn("rounded-full px-2 py-0.5 font-medium", c)}>{label}</span>;
+  return (
+    <span className={cn("rounded-full px-2 py-0.5 font-medium", c)}>
+      {label}
+    </span>
+  );
 }
 
 // ─── Export Button ───────────────────────────────────────────────────────────
@@ -268,7 +316,11 @@ export function ExportButton({
   async function run(format: "csv" | "json" | "xlsx") {
     setBusy(true);
     try {
-      await ipamIoApi.download({ ...scope, format, include_addresses: includeAddrs });
+      await ipamIoApi.download({
+        ...scope,
+        format,
+        include_addresses: includeAddrs,
+      });
       setOpen(false);
     } finally {
       setBusy(false);

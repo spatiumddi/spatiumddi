@@ -195,15 +195,11 @@ class BIND9Driver(DNSDriver):
         tsig_secret = getattr(server, "tsig_key_secret", None)
         tsig_algorithm = getattr(server, "tsig_key_algorithm", "hmac-sha256")
         if not tsig_name or not tsig_secret:
-            raise RuntimeError(
-                "BIND9Driver.apply_record_change requires a TSIG key on the server"
-            )
+            raise RuntimeError("BIND9Driver.apply_record_change requires a TSIG key on the server")
 
         keyring = dns.tsigkeyring.from_text({tsig_name: tsig_secret})
         algo = dns.name.from_text(tsig_algorithm)
-        update = dns.update.Update(
-            change.zone_name, keyring=keyring, keyalgorithm=algo
-        )
+        update = dns.update.Update(change.zone_name, keyring=keyring, keyalgorithm=algo)
 
         rr = change.record
         rel_name = "@" if rr.name in ("", "@") else rr.name
@@ -247,9 +243,7 @@ class BIND9Driver(DNSDriver):
         logger.info("bind9.reload_config", server=str(getattr(server, "id", "")))
 
     async def reload_zone(self, server: Any, zone_name: str) -> None:
-        logger.info(
-            "bind9.reload_zone", server=str(getattr(server, "id", "")), zone=zone_name
-        )
+        logger.info("bind9.reload_zone", server=str(getattr(server, "id", "")), zone=zone_name)
 
     # ── Validation / capabilities ─────────────────────────────────────────
 
@@ -281,8 +275,19 @@ class BIND9Driver(DNSDriver):
             "incremental_updates": "rfc2136",
             "zone_types": ["primary", "secondary", "stub", "forward"],
             "record_types": [
-                "A", "AAAA", "CNAME", "MX", "TXT", "NS", "PTR",
-                "SRV", "CAA", "TLSA", "SSHFP", "NAPTR", "LOC",
+                "A",
+                "AAAA",
+                "CNAME",
+                "MX",
+                "TXT",
+                "NS",
+                "PTR",
+                "SRV",
+                "CAA",
+                "TLSA",
+                "SSHFP",
+                "NAPTR",
+                "LOC",
             ],
         }
 
