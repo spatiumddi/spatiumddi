@@ -169,7 +169,7 @@ async def list_scopes_for_subnet(
     subnet_id: uuid.UUID, db: DB, _: CurrentUser
 ) -> list[ScopeResponse]:
     res = await db.execute(select(DHCPScope).where(DHCPScope.subnet_id == subnet_id))
-    return [_scope_to_response(s) for s in res.scalars().all()]
+    return [_scope_to_response(s) for s in res.unique().scalars().all()]
 
 
 @router.post(
