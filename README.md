@@ -77,13 +77,16 @@ docker compose up -d
 
 Open `http://localhost:8077` and log in with `admin` / `admin` (you're forced to change the password on first login).
 
-### Running the built-in BIND9 container
+### Running the built-in BIND9 / Kea containers
 
-The DNS server container is under the `dns` Compose profile — opt in when you want it:
+The managed-service containers ship under Compose profiles — opt in when you want them:
 
 ```bash
-docker compose --profile dns up -d
+docker compose --profile dns up -d                 # DNS only
+docker compose --profile dns --profile dhcp up -d  # DNS + DHCP
 ```
+
+Or set `COMPOSE_PROFILES=dns,dhcp` in your `.env` so plain `docker compose up -d` enables both automatically.
 
 That starts `dns-bind9` bound to host port `5353` (udp + tcp). The agent registers with the control plane automatically using `DNS_AGENT_KEY` from your `.env` and appears in the UI under **DNS → Server Groups → default**.
 
