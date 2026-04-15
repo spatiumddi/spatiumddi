@@ -15,7 +15,7 @@ from app.api.deps import CurrentUser, DB
 from app.api.v1.ipam.io_router import router as io_router
 from app.models.audit import AuditLog
 from app.models.dns import DNSRecord, DNSZone
-from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
+from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet, SubnetDomain
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()
@@ -558,6 +558,12 @@ class IPAddressResponse(BaseModel):
     last_seen_method: str | None
     custom_fields: dict[str, Any]
     tags: dict[str, Any]
+    # Linkage (§3) — populated by Wave 3 DDNS/DHCP integration.
+    forward_zone_id: uuid.UUID | None = None
+    reverse_zone_id: uuid.UUID | None = None
+    dns_record_id: uuid.UUID | None = None
+    dhcp_lease_id: str | None = None
+    static_assignment_id: str | None = None
     created_at: datetime
     modified_at: datetime
 
@@ -1451,3 +1457,350 @@ async def allocate_next_ip(
     logger.info("ip_allocated", ip_id=str(ip.id), address=str(chosen),
                 subnet_id=str(subnet_id), strategy=body.strategy)
     return ip
+
+
+# ── Subnet ↔ DNS Domain associations (§11) ────────────────────────────────────
+
+
+class SubnetDomainCreate(BaseModel):
+    dns_zone_id: uuid.UUID
+    is_primary: bool = False
+
+
+class SubnetDomainResponse(BaseModel):
+    id: uuid.UUID
+    subnet_id: uuid.UUID
+    dns_zone_id: uuid.UUID
+    is_primary: bool
+    zone_name: str | None = None
+
+    model_config = {"from_attributes": True}
+
+
+async def _sync_primary_zone_pointer(db: AsyncSession, subnet_id: uuid.UUID) -> None:
+    """Keep `subnet.dns_zone_id` pointing at the row flagged `is_primary` (if any).
+
+    If no row is primary, sets the pointer to NULL.  The column exists on
+    `subnet` as a text convenience pointer (see migration a1b2c3d4e5f6); we
+    write it via raw SQL because it is not declared on the ORM model.
+    """
+    result = await db.execute(
+        select(SubnetDomain.dns_zone_id)
+        .where(SubnetDomain.subnet_id == subnet_id)
+        .where(SubnetDomain.is_primary.is_(True))
+        .limit(1)
+    )
+    primary = result.scalar_one_or_none()
+    await db.execute(
+        text("UPDATE subnet SET dns_zone_id = :zid WHERE id = CAST(:sid AS uuid)"),
+        {"zid": str(primary) if primary else None, "sid": str(subnet_id)},
+    )
+
+
+@router.get("/subnets/{subnet_id}/domains", response_model=list[SubnetDomainResponse])
+async def list_subnet_domains(
+    subnet_id: uuid.UUID, current_user: CurrentUser, db: DB
+) -> list[SubnetDomainResponse]:
+    subnet = await db.get(Subnet, subnet_id)
+    if subnet is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
+
+    result = await db.execute(
+        select(SubnetDomain, DNSZone)
+        .join(DNSZone, SubnetDomain.dns_zone_id == DNSZone.id)
+        .where(SubnetDomain.subnet_id == subnet_id)
+        .order_by(SubnetDomain.is_primary.desc(), DNSZone.name)
+    )
+    out: list[SubnetDomainResponse] = []
+    for sd, zone in result.all():
+        out.append(
+            SubnetDomainResponse(
+                id=sd.id,
+                subnet_id=sd.subnet_id,
+                dns_zone_id=sd.dns_zone_id,
+                is_primary=sd.is_primary,
+                zone_name=zone.name,
+            )
+        )
+    return out
+
+
+@router.post(
+    "/subnets/{subnet_id}/domains",
+    response_model=SubnetDomainResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def add_subnet_domain(
+    subnet_id: uuid.UUID,
+    body: SubnetDomainCreate,
+    current_user: CurrentUser,
+    db: DB,
+) -> SubnetDomainResponse:
+    subnet = await db.get(Subnet, subnet_id)
+    if subnet is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
+
+    zone = await db.get(DNSZone, body.dns_zone_id)
+    if zone is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="DNS zone not found")
+
+    existing = await db.execute(
+        select(SubnetDomain).where(
+            SubnetDomain.subnet_id == subnet_id,
+            SubnetDomain.dns_zone_id == body.dns_zone_id,
+        )
+    )
+    if existing.scalar_one_or_none() is not None:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="This DNS zone is already associated with this subnet",
+        )
+
+    # Only one primary per subnet: demote others if this one is primary.
+    if body.is_primary:
+        await db.execute(
+            text(
+                "UPDATE subnet_domain SET is_primary = false "
+                "WHERE subnet_id = CAST(:sid AS uuid)"
+            ),
+            {"sid": str(subnet_id)},
+        )
+
+    sd = SubnetDomain(
+        subnet_id=subnet_id,
+        dns_zone_id=body.dns_zone_id,
+        is_primary=body.is_primary,
+    )
+    db.add(sd)
+    await db.flush()
+
+    await _sync_primary_zone_pointer(db, subnet_id)
+
+    db.add(
+        _audit(
+            current_user,
+            "create",
+            "subnet_domain",
+            str(sd.id),
+            f"{subnet.network} → {zone.name}",
+            new_value={
+                "subnet_id": str(subnet_id),
+                "dns_zone_id": str(body.dns_zone_id),
+                "is_primary": body.is_primary,
+            },
+        )
+    )
+    await db.commit()
+    await db.refresh(sd)
+    return SubnetDomainResponse(
+        id=sd.id,
+        subnet_id=sd.subnet_id,
+        dns_zone_id=sd.dns_zone_id,
+        is_primary=sd.is_primary,
+        zone_name=zone.name,
+    )
+
+
+@router.delete(
+    "/subnets/{subnet_id}/domains/{domain_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def remove_subnet_domain(
+    subnet_id: uuid.UUID,
+    domain_id: uuid.UUID,
+    current_user: CurrentUser,
+    db: DB,
+) -> None:
+    sd = await db.get(SubnetDomain, domain_id)
+    if sd is None or sd.subnet_id != subnet_id:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Subnet domain not found"
+        )
+
+    db.add(
+        _audit(
+            current_user,
+            "delete",
+            "subnet_domain",
+            str(sd.id),
+            f"subnet={subnet_id} zone={sd.dns_zone_id}",
+            old_value={
+                "subnet_id": str(sd.subnet_id),
+                "dns_zone_id": str(sd.dns_zone_id),
+                "is_primary": sd.is_primary,
+            },
+        )
+    )
+    await db.delete(sd)
+    await db.flush()
+    await _sync_primary_zone_pointer(db, subnet_id)
+    await db.commit()
+
+
+# ── Subnet bulk edit (§11) ────────────────────────────────────────────────────
+
+
+_BULK_ALLOWED_STATUSES = {"active", "deprecated", "reserved", "quarantine"}
+
+
+class SubnetBulkChanges(BaseModel):
+    name: str | None = None
+    description: str | None = None
+    status: str | None = None
+    vlan_id: int | None = None
+    tags: dict[str, Any] | None = None
+    custom_fields: dict[str, Any] | None = None
+
+    @field_validator("status")
+    @classmethod
+    def _validate_status(cls, v: str | None) -> str | None:
+        if v is not None and v not in _BULK_ALLOWED_STATUSES:
+            raise ValueError(
+                f"status must be one of: {', '.join(sorted(_BULK_ALLOWED_STATUSES))}"
+            )
+        return v
+
+
+class SubnetBulkEditRequest(BaseModel):
+    subnet_ids: list[uuid.UUID]
+    changes: SubnetBulkChanges
+
+
+class SubnetBulkEditResponse(BaseModel):
+    batch_id: uuid.UUID
+    updated_count: int
+    not_found: list[uuid.UUID] = []
+
+
+@router.post("/subnets/bulk-edit", response_model=SubnetBulkEditResponse)
+async def bulk_edit_subnets(
+    body: SubnetBulkEditRequest,
+    current_user: CurrentUser,
+    db: DB,
+) -> SubnetBulkEditResponse:
+    """Apply the same set of changes to multiple subnets atomically.
+
+    All mutations happen in a single transaction; one audit row per
+    successfully-updated subnet shares a `batch_id` in `new_value`.
+    """
+    changes = body.changes.model_dump(exclude_none=True)
+    if not changes:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="At least one field must be provided in changes",
+        )
+    if not body.subnet_ids:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="subnet_ids must not be empty",
+        )
+
+    batch_id = uuid.uuid4()
+    updated = 0
+    not_found: list[uuid.UUID] = []
+
+    for sid in body.subnet_ids:
+        subnet = await db.get(Subnet, sid)
+        if subnet is None:
+            not_found.append(sid)
+            continue
+
+        old = {k: getattr(subnet, k, None) for k in changes.keys()}
+        for field, value in changes.items():
+            setattr(subnet, field, value)
+
+        db.add(
+            _audit(
+                current_user,
+                "update",
+                "subnet",
+                str(subnet.id),
+                f"{subnet.network} ({subnet.name})",
+                old_value={**{k: (str(v) if v is not None else None) for k, v in old.items()}},
+                new_value={**changes, "batch_id": str(batch_id)},
+            )
+        )
+        updated += 1
+
+    await db.commit()
+    logger.info(
+        "subnet_bulk_edit",
+        user=current_user.username,
+        batch_id=str(batch_id),
+        requested=len(body.subnet_ids),
+        updated=updated,
+        not_found=len(not_found),
+    )
+    return SubnetBulkEditResponse(
+        batch_id=batch_id, updated_count=updated, not_found=not_found
+    )
+
+
+# ── Effective fields (tags + custom_fields inheritance, §11) ──────────────────
+
+
+class EffectiveFieldsResponse(BaseModel):
+    subnet_id: uuid.UUID
+    tags: dict[str, Any]
+    custom_fields: dict[str, Any]
+    # Per-key source trail: "subnet" | "block:<id>" | "space:<id>"
+    tag_sources: dict[str, str]
+    custom_field_sources: dict[str, str]
+
+
+@router.get(
+    "/subnets/{subnet_id}/effective-fields",
+    response_model=EffectiveFieldsResponse,
+)
+async def get_effective_fields(
+    subnet_id: uuid.UUID, current_user: CurrentUser, db: DB
+) -> EffectiveFieldsResponse:
+    """Merge tags + custom_fields up the Subnet → Block(s) → Space chain.
+
+    Closer-to-leaf values override farther-from-leaf; storage is NOT modified.
+    """
+    subnet = await db.get(Subnet, subnet_id)
+    if subnet is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
+
+    # Collect the chain, leaf-last: [space, block_root, ..., block_leaf, subnet]
+    chain: list[tuple[str, str, dict, dict]] = []
+
+    space = await db.get(IPSpace, subnet.space_id)
+    if space is not None:
+        # IPSpace has tags but no custom_fields column.
+        chain.append((f"space:{space.id}", "space", space.tags or {}, {}))
+
+    # Walk block ancestors (root → leaf).
+    block_path: list[IPBlock] = []
+    cur: IPBlock | None = await db.get(IPBlock, subnet.block_id)
+    while cur is not None:
+        block_path.append(cur)
+        if cur.parent_block_id is None:
+            break
+        cur = await db.get(IPBlock, cur.parent_block_id)
+    for b in reversed(block_path):
+        chain.append((f"block:{b.id}", "block", b.tags or {}, b.custom_fields or {}))
+
+    chain.append(("subnet", "subnet", subnet.tags or {}, subnet.custom_fields or {}))
+
+    tags: dict[str, Any] = {}
+    custom_fields: dict[str, Any] = {}
+    tag_sources: dict[str, str] = {}
+    custom_field_sources: dict[str, str] = {}
+
+    for src, _kind, tmap, cmap in chain:
+        for k, v in tmap.items():
+            tags[k] = v
+            tag_sources[k] = src
+        for k, v in cmap.items():
+            custom_fields[k] = v
+            custom_field_sources[k] = src
+
+    return EffectiveFieldsResponse(
+        subnet_id=subnet.id,
+        tags=tags,
+        custom_fields=custom_fields,
+        tag_sources=tag_sources,
+        custom_field_sources=custom_field_sources,
+    )

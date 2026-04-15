@@ -146,6 +146,43 @@ export interface IPAddress {
   mac_address: string | null;
   tags: Record<string, unknown>;
   custom_fields: Record<string, unknown>;
+  // Linkage (§3) — populated by Wave 3 DDNS/DHCP integration.
+  forward_zone_id?: string | null;
+  reverse_zone_id?: string | null;
+  dns_record_id?: string | null;
+  dhcp_lease_id?: string | null;
+  static_assignment_id?: string | null;
+}
+
+export interface SubnetDomain {
+  id: string;
+  subnet_id: string;
+  dns_zone_id: string;
+  is_primary: boolean;
+  zone_name: string | null;
+}
+
+export interface EffectiveFields {
+  subnet_id: string;
+  tags: Record<string, unknown>;
+  custom_fields: Record<string, unknown>;
+  tag_sources: Record<string, string>;
+  custom_field_sources: Record<string, string>;
+}
+
+export interface SubnetBulkEditChanges {
+  name?: string;
+  description?: string;
+  status?: string;
+  vlan_id?: number;
+  tags?: Record<string, unknown>;
+  custom_fields?: Record<string, unknown>;
+}
+
+export interface SubnetBulkEditResponse {
+  batch_id: string;
+  updated_count: number;
+  not_found: string[];
 }
 
 export const ipamApi = {
@@ -194,6 +231,24 @@ export const ipamApi = {
     api.delete(`/ipam/addresses/${id}`, { params: permanent ? { permanent: true } : undefined }),
   nextAddress: (subnetId: string, data: { hostname: string; status?: string; mac_address?: string; description?: string; custom_fields?: Record<string, unknown>; dns_zone_id?: string | null }) =>
     api.post<IPAddress>(`/ipam/subnets/${subnetId}/next`, data).then((r) => r.data),
+
+  // Subnet ↔ DNS domain associations (§11)
+  listSubnetDomains: (subnetId: string) =>
+    api.get<SubnetDomain[]>(`/ipam/subnets/${subnetId}/domains`).then((r) => r.data),
+  addSubnetDomain: (subnetId: string, data: { dns_zone_id: string; is_primary?: boolean }) =>
+    api.post<SubnetDomain>(`/ipam/subnets/${subnetId}/domains`, data).then((r) => r.data),
+  removeSubnetDomain: (subnetId: string, domainId: string) =>
+    api.delete(`/ipam/subnets/${subnetId}/domains/${domainId}`),
+
+  // Effective (inherited) tags + custom_fields (§11)
+  effectiveFields: (subnetId: string) =>
+    api.get<EffectiveFields>(`/ipam/subnets/${subnetId}/effective-fields`).then((r) => r.data),
+
+  // Bulk edit multiple subnets in one transaction (§11)
+  bulkEditSubnets: (subnet_ids: string[], changes: SubnetBulkEditChanges) =>
+    api
+      .post<SubnetBulkEditResponse>("/ipam/subnets/bulk-edit", { subnet_ids, changes })
+      .then((r) => r.data),
 };
 
 // ── IPAM Import / Export ───────────────────────────────────────────────────────
@@ -389,6 +444,7 @@ export interface SearchResult {
   dns_zone_name: string | null;
   dns_record_type: string | null;
   dns_record_value: string | null;
+  matched_field?: string | null;
 }
 
 export interface SearchResponse {

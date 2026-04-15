@@ -15,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import CurrentUser, DB
 from app.models.dns import DNSRecord, DNSServerGroup, DNSZone
-from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
+from app.models.ipam import CustomFieldDefinition, IPAddress, IPBlock, IPSpace, Subnet
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()
@@ -94,6 +94,11 @@ class SearchResult(BaseModel):
     dns_zone_name: str | None = None
     dns_record_type: str | None = None
     dns_record_value: str | None = None
+
+    # Hint showing WHY this row matched (e.g. "custom_field:owner=alice" or
+    # "hostname"); populated for custom-field hits and reserved for future
+    # per-column match annotations.
+    matched_field: str | None = None
 
 
 class SearchResponse(BaseModel):
@@ -412,6 +417,168 @@ async def _search_dns_records(
     ]
 
 
+async def _searchable_field_names(
+    db: AsyncSession, resource_type: str
+) -> list[str]:
+    """Return the list of custom-field names flagged searchable for the given
+    resource_type ('ip_address', 'subnet', 'ip_block', 'ip_space')."""
+    result = await db.execute(
+        select(CustomFieldDefinition.name).where(
+            CustomFieldDefinition.resource_type == resource_type,
+            CustomFieldDefinition.is_searchable.is_(True),
+        )
+    )
+    return [row[0] for row in result.all()]
+
+
+async def _search_custom_fields(
+    db: AsyncSession, q: str, limit: int
+) -> list[SearchResult]:
+    """Substring-match any searchable custom-field value on blocks, subnets
+    and IP addresses.  Returns a `matched_field` hint like
+    `custom_field:owner=alice` so the UI can show WHY each row matched."""
+    out: list[SearchResult] = []
+    like = f"%{q}%"
+
+    # ── IPBlock ──
+    block_fields = await _searchable_field_names(db, "ip_block")
+    if block_fields:
+        clauses = [
+            text(
+                f"ip_block.custom_fields ->> :k_{i} ILIKE :q"
+            ).bindparams(**{f"k_{i}": name}, q=like)
+            for i, name in enumerate(block_fields)
+        ]
+        stmt = (
+            select(IPBlock, IPSpace)
+            .join(IPSpace, IPBlock.space_id == IPSpace.id)
+            .where(or_(*clauses))
+            .limit(limit)
+        )
+        for block, space in (await db.execute(stmt)).all():
+            hit_field, hit_value = None, None
+            for name in block_fields:
+                val = (block.custom_fields or {}).get(name)
+                if val is not None and q.lower() in str(val).lower():
+                    hit_field, hit_value = name, val
+                    break
+            out.append(
+                SearchResult(
+                    type="block",
+                    id=str(block.id),
+                    display=str(block.network),
+                    name=block.name or None,
+                    status=None,
+                    description=block.description or None,
+                    hostname=None,
+                    mac_address=None,
+                    subnet_id=None,
+                    subnet_network=None,
+                    block_id=str(block.id),
+                    space_id=str(space.id),
+                    space_name=space.name,
+                    matched_field=(
+                        f"custom_field:{hit_field}={hit_value}"
+                        if hit_field is not None
+                        else "custom_field"
+                    ),
+                )
+            )
+
+    # ── Subnet ──
+    subnet_fields = await _searchable_field_names(db, "subnet")
+    if subnet_fields:
+        clauses = [
+            text(
+                f"subnet.custom_fields ->> :k_{i} ILIKE :q"
+            ).bindparams(**{f"k_{i}": name}, q=like)
+            for i, name in enumerate(subnet_fields)
+        ]
+        stmt = (
+            select(Subnet, IPSpace)
+            .join(IPSpace, Subnet.space_id == IPSpace.id)
+            .where(or_(*clauses))
+            .limit(limit)
+        )
+        for subnet, space in (await db.execute(stmt)).all():
+            hit_field, hit_value = None, None
+            for name in subnet_fields:
+                val = (subnet.custom_fields or {}).get(name)
+                if val is not None and q.lower() in str(val).lower():
+                    hit_field, hit_value = name, val
+                    break
+            out.append(
+                SearchResult(
+                    type="subnet",
+                    id=str(subnet.id),
+                    display=str(subnet.network),
+                    name=subnet.name or None,
+                    status=subnet.status,
+                    description=subnet.description or None,
+                    hostname=None,
+                    mac_address=None,
+                    subnet_id=str(subnet.id),
+                    subnet_network=str(subnet.network),
+                    block_id=str(subnet.block_id) if subnet.block_id else None,
+                    space_id=str(space.id),
+                    space_name=space.name,
+                    matched_field=(
+                        f"custom_field:{hit_field}={hit_value}"
+                        if hit_field is not None
+                        else "custom_field"
+                    ),
+                )
+            )
+
+    # ── IPAddress ──
+    addr_fields = await _searchable_field_names(db, "ip_address")
+    if addr_fields:
+        clauses = [
+            text(
+                f"ip_address.custom_fields ->> :k_{i} ILIKE :q"
+            ).bindparams(**{f"k_{i}": name}, q=like)
+            for i, name in enumerate(addr_fields)
+        ]
+        stmt = (
+            select(IPAddress, Subnet, IPSpace)
+            .join(Subnet, IPAddress.subnet_id == Subnet.id)
+            .join(IPSpace, Subnet.space_id == IPSpace.id)
+            .where(or_(*clauses))
+            .limit(limit)
+        )
+        for ip, subnet, space in (await db.execute(stmt)).all():
+            hit_field, hit_value = None, None
+            for name in addr_fields:
+                val = (ip.custom_fields or {}).get(name)
+                if val is not None and q.lower() in str(val).lower():
+                    hit_field, hit_value = name, val
+                    break
+            out.append(
+                SearchResult(
+                    type="ip_address",
+                    id=str(ip.id),
+                    display=str(ip.address),
+                    name=ip.hostname,
+                    status=ip.status,
+                    description=ip.description or None,
+                    hostname=ip.hostname,
+                    mac_address=str(ip.mac_address) if ip.mac_address else None,
+                    subnet_id=str(ip.subnet_id),
+                    subnet_network=str(subnet.network),
+                    block_id=str(subnet.block_id) if subnet.block_id else None,
+                    space_id=str(space.id),
+                    space_name=space.name,
+                    matched_field=(
+                        f"custom_field:{hit_field}={hit_value}"
+                        if hit_field is not None
+                        else "custom_field"
+                    ),
+                )
+            )
+
+    return out
+
+
 # ── Endpoint ───────────────────────────────────────────────────────────────────
 
 
@@ -461,14 +628,22 @@ async def global_search(
     if not requested or "dns_record" in requested:
         results.extend(await _search_dns_records(db, q, per_type_limit))
 
-    # De-duplicate (same id can appear in multiple passes when q is an IP)
-    seen: set[str] = set()
-    deduped: list[SearchResult] = []
+    # Custom-field substring hits across IPAM resources.
+    if not requested or requested & {"ip_address", "subnet", "block"}:
+        results.extend(await _search_custom_fields(db, q, per_type_limit))
+
+    # De-duplicate (same id can appear in multiple passes when q is an IP or
+    # when both a direct field and a custom-field match fire). Prefer entries
+    # that carry a `matched_field` hint so the UI can explain the match.
+    by_key: dict[str, SearchResult] = {}
     for r in results:
         key = f"{r.type}:{r.id}"
-        if key not in seen:
-            seen.add(key)
-            deduped.append(r)
+        existing = by_key.get(key)
+        if existing is None:
+            by_key[key] = r
+        elif existing.matched_field is None and r.matched_field is not None:
+            by_key[key] = r
+    deduped = list(by_key.values())
 
     logger.info(
         "search_executed",

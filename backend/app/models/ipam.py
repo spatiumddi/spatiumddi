@@ -198,7 +198,47 @@ class IPAddress(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     custom_fields: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     tags: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
 
+    # ── Linkage fields (written by Wave 3 DDNS / DHCP integration) ──
+    # Forward zone hosting the A/AAAA record for this IP's FQDN.
+    forward_zone_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("dns_zone.id", ondelete="SET NULL"), nullable=True
+    )
+    # Reverse zone hosting the PTR record for this IP.
+    reverse_zone_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("dns_zone.id", ondelete="SET NULL"), nullable=True
+    )
+    # Linked DNS record (A/AAAA).
+    dns_record_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("dns_record.id", ondelete="SET NULL"), nullable=True
+    )
+    # DHCP linkage: stored as strings (DHCP models don't exist yet).
+    dhcp_lease_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    static_assignment_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
     subnet: Mapped[Subnet] = relationship("Subnet", back_populates="addresses")
+
+
+class SubnetDomain(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """Junction table linking a Subnet to one or more DNS zones.
+
+    The subnet keeps a convenience `dns_zone_id` pointer to its primary
+    domain; the SubnetDomain rows are the source of truth for the full set.
+    """
+
+    __tablename__ = "subnet_domain"
+    __table_args__ = (
+        UniqueConstraint("subnet_id", "dns_zone_id", name="uq_subnet_domain_subnet_zone"),
+        Index("ix_subnet_domain_subnet_id", "subnet_id"),
+        Index("ix_subnet_domain_dns_zone_id", "dns_zone_id"),
+    )
+
+    subnet_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("subnet.id", ondelete="CASCADE"), nullable=False
+    )
+    dns_zone_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("dns_zone.id", ondelete="CASCADE"), nullable=False
+    )
+    is_primary: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
 
 class CustomFieldDefinition(UUIDPrimaryKeyMixin, TimestampMixin, Base):

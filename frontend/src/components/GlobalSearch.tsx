@@ -121,6 +121,15 @@ function ResultRow({
               {result.status}
             </span>
           )}
+          {/* Match hint (e.g. custom_field:owner=alice) */}
+          {result.matched_field && (
+            <span
+              className="truncate rounded bg-amber-500/10 px-1 py-0.5 text-[10px] font-medium text-amber-600"
+              title="Matched field"
+            >
+              {result.matched_field}
+            </span>
+          )}
         </div>
       </div>
     </button>

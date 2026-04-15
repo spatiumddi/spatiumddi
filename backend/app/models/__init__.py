@@ -22,6 +22,7 @@ from app.models.ipam import (
     IPSpace,
     RouterZone,
     Subnet,
+    SubnetDomain,
     VLANMapping,
 )
 from app.models.settings import PlatformSettings
@@ -39,6 +40,7 @@ __all__ = [
     "IPBlock",
     "RouterZone",
     "Subnet",
+    "SubnetDomain",
     "IPAddress",
     "CustomFieldDefinition",
     "VLANMapping",

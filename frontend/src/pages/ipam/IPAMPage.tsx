@@ -2875,10 +2875,29 @@ function SpaceTableView({
     queryFn: () => customFieldsApi.list("subnet"),
   });
 
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [bulkOpen, setBulkOpen] = useState(false);
+
+  const toggleOne = (id: string) =>
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+
   const isLoading = blocksLoading || subnetsLoading;
   const rows =
     blocks && subnets ? flattenToTableRows(buildBlockTree(blocks, subnets, null)) : [];
   const isEmpty = !isLoading && rows.length === 0;
+
+  const subnetIdsInView = rows
+    .filter((r) => r.type === "subnet" && r.subnet)
+    .map((r) => r.subnet!.id);
+  const allSelected =
+    subnetIdsInView.length > 0 && subnetIdsInView.every((id) => selected.has(id));
+  const toggleAll = () =>
+    setSelected(allSelected ? new Set() : new Set(subnetIdsInView));
 
   return (
     <div className="flex flex-1 flex-col overflow-hidden">
@@ -2888,10 +2907,22 @@ function SpaceTableView({
             items={[{ label: space.name, variant: "space" }]}
           />
         </div>
-        <h2 className="text-base font-semibold">{space.name}</h2>
-        {space.description && (
-          <p className="text-xs text-muted-foreground">{space.description}</p>
-        )}
+        <div className="flex items-center justify-between">
+          <div>
+            <h2 className="text-base font-semibold">{space.name}</h2>
+            {space.description && (
+              <p className="text-xs text-muted-foreground">{space.description}</p>
+            )}
+          </div>
+          {selected.size > 0 && (
+            <button
+              onClick={() => setBulkOpen(true)}
+              className="rounded border border-border bg-primary px-3 py-1 text-xs font-medium text-primary-foreground hover:opacity-90"
+            >
+              Bulk Edit ({selected.size})
+            </button>
+          )}
+        </div>
       </div>
       <div className="flex-1 overflow-auto">
         {isLoading ? (
@@ -2904,6 +2935,14 @@ function SpaceTableView({
           <table className="w-full text-sm">
             <thead>
               <tr className="border-b bg-muted/40 text-xs">
+                <th className="w-8 px-2 py-2 text-left">
+                  <input
+                    type="checkbox"
+                    aria-label="Select all subnets"
+                    checked={allSelected}
+                    onChange={toggleAll}
+                  />
+                </th>
                 <th className="px-4 py-2 text-left font-medium text-muted-foreground">
                   Network
                 </th>
@@ -2934,6 +2973,7 @@ function SpaceTableView({
                       onClick={() => onSelectBlock(b)}
                       className="border-b last:border-0 cursor-pointer hover:bg-muted/30 bg-muted/10"
                     >
+                      <td className="w-8 px-2 py-2" />
                       <td className="py-2 pr-4" style={{ paddingLeft: `${indent + 16}px` }}>
                         <span className="inline-flex items-center gap-1.5 font-mono font-semibold text-foreground">
                           <Layers className="h-3.5 w-3.5 flex-shrink-0 text-violet-500" />
@@ -2970,6 +3010,17 @@ function SpaceTableView({
                       onClick={() => onSelectSubnet(s)}
                       className="border-b last:border-0 cursor-pointer hover:bg-muted/30"
                     >
+                      <td
+                        className="w-8 px-2 py-2"
+                        onClick={(e) => e.stopPropagation()}
+                      >
+                        <input
+                          type="checkbox"
+                          aria-label={`Select ${s.network}`}
+                          checked={selected.has(s.id)}
+                          onChange={() => toggleOne(s.id)}
+                        />
+                      </td>
                       <td className="py-2 pr-4" style={{ paddingLeft: `${indent + 16}px` }}>
                         <span className="inline-flex items-center gap-1.5 font-mono font-medium">
                           <Network className="h-3.5 w-3.5 flex-shrink-0 text-blue-500" />
@@ -3009,6 +3060,134 @@ function SpaceTableView({
             </tbody>
           </table>
         )}
+      </div>
+      {bulkOpen && (
+        <BulkEditSubnetsModal
+          subnetIds={Array.from(selected)}
+          onClose={() => setBulkOpen(false)}
+          onDone={() => {
+            setBulkOpen(false);
+            setSelected(new Set());
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+// ─── Bulk-edit Modal ─────────────────────────────────────────────────────────
+
+function BulkEditSubnetsModal({
+  subnetIds,
+  onClose,
+  onDone,
+}: {
+  subnetIds: string[];
+  onClose: () => void;
+  onDone: () => void;
+}) {
+  const qc = useQueryClient();
+  const [name, setName] = useState("");
+  const [description, setDescription] = useState("");
+  const [statusVal, setStatusVal] = useState("");
+  const [vlanId, setVlanId] = useState("");
+  const [error, setError] = useState<string | null>(null);
+
+  const mut = useMutation({
+    mutationFn: () => {
+      const changes: Record<string, unknown> = {};
+      if (name.trim()) changes.name = name.trim();
+      if (description.trim()) changes.description = description.trim();
+      if (statusVal) changes.status = statusVal;
+      if (vlanId.trim()) {
+        const n = Number(vlanId);
+        if (Number.isNaN(n)) throw new Error("VLAN ID must be a number");
+        changes.vlan_id = n;
+      }
+      if (Object.keys(changes).length === 0) {
+        throw new Error("Set at least one field to apply");
+      }
+      return ipamApi.bulkEditSubnets(subnetIds, changes);
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["subnets"] });
+      qc.invalidateQueries({ queryKey: ["blocks"] });
+      onDone();
+    },
+    onError: (e: Error) => setError(e.message),
+  });
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/70">
+      <div className="w-full max-w-md rounded-lg border bg-card p-6 shadow-lg">
+        <h3 className="mb-3 text-base font-semibold">
+          Bulk edit {subnetIds.length} subnet{subnetIds.length === 1 ? "" : "s"}
+        </h3>
+        <p className="mb-3 text-xs text-muted-foreground">
+          Leave a field blank to keep it unchanged.
+        </p>
+        <div className="space-y-3 text-sm">
+          <label className="block">
+            <span className="mb-1 block text-xs text-muted-foreground">Name</span>
+            <input
+              className="w-full rounded border bg-background px-2 py-1"
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+            />
+          </label>
+          <label className="block">
+            <span className="mb-1 block text-xs text-muted-foreground">Description</span>
+            <input
+              className="w-full rounded border bg-background px-2 py-1"
+              value={description}
+              onChange={(e) => setDescription(e.target.value)}
+            />
+          </label>
+          <label className="block">
+            <span className="mb-1 block text-xs text-muted-foreground">Status</span>
+            <select
+              className="w-full rounded border bg-background px-2 py-1"
+              value={statusVal}
+              onChange={(e) => setStatusVal(e.target.value)}
+            >
+              <option value="">—</option>
+              <option value="active">active</option>
+              <option value="deprecated">deprecated</option>
+              <option value="reserved">reserved</option>
+              <option value="quarantine">quarantine</option>
+            </select>
+          </label>
+          <label className="block">
+            <span className="mb-1 block text-xs text-muted-foreground">VLAN ID</span>
+            <input
+              className="w-full rounded border bg-background px-2 py-1"
+              value={vlanId}
+              onChange={(e) => setVlanId(e.target.value)}
+              inputMode="numeric"
+            />
+          </label>
+        </div>
+        {error && (
+          <p className="mt-2 text-xs text-red-600">{error}</p>
+        )}
+        <div className="mt-4 flex justify-end gap-2">
+          <button
+            onClick={onClose}
+            className="rounded border px-3 py-1 text-xs hover:bg-muted"
+          >
+            Cancel
+          </button>
+          <button
+            disabled={mut.isPending}
+            onClick={() => {
+              setError(null);
+              mut.mutate();
+            }}
+            className="rounded bg-primary px-3 py-1 text-xs font-medium text-primary-foreground disabled:opacity-50"
+          >
+            {mut.isPending ? "Applying…" : "Apply"}
+          </button>
+        </div>
       </div>
     </div>
   );
