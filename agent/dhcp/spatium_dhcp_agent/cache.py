@@ -42,6 +42,7 @@ def load_or_create_agent_id(state_dir: Path) -> str:
         os.chmod(path, 0o600)
     except PermissionError:
         # Volume-mount owner may differ; best-effort only.
+        # Volume-mount owner may differ; best-effort only.
         pass
     return aid
 
