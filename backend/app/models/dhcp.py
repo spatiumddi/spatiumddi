@@ -61,7 +61,7 @@ class DHCPServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     host: Mapped[str] = mapped_column(String(255), nullable=False)
     port: Mapped[int] = mapped_column(Integer, nullable=False, default=67)
     # roles: primary | secondary | standalone (JSON array of strings)
-    roles: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    roles: Mapped[list] = mapped_column(JSONB, nullable=False, default=lambda: [])
 
     server_group_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
