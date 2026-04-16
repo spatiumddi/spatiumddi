@@ -29,6 +29,9 @@ export function CreatePoolModal({
     pool?.lease_time_override != null ? String(pool.lease_time_override) : "",
   );
   const [error, setError] = useState("");
+  const [existingWarning, setExistingWarning] = useState<
+    { address: string; status: string; hostname: string }[] | null
+  >(null);
 
   const { data: classes = [] } = useQuery({
     queryKey: ["dhcp-client-classes", scope.server_id],
@@ -53,9 +56,14 @@ export function CreatePoolModal({
         ? dhcpApi.updatePool(scope.id, pool!.id, data)
         : dhcpApi.createPool(scope.id, data);
     },
-    onSuccess: () => {
+    onSuccess: (result) => {
       qc.invalidateQueries({ queryKey: ["dhcp-pools", scope.id] });
-      onClose();
+      const existing = (result as any)?.existing_ips_in_range;
+      if (existing && existing.length > 0) {
+        setExistingWarning(existing);
+      } else {
+        onClose();
+      }
     },
     onError: (e) => setError(errMsg(e, "Failed to save pool")),
   });
@@ -128,7 +136,31 @@ export function CreatePoolModal({
           </Field>
         </div>
         {error && <p className="text-xs text-destructive">{error}</p>}
-        <Btns onClose={onClose} pending={mut.isPending} />
+        {existingWarning && (
+          <div className="rounded-md border border-amber-500/40 bg-amber-500/10 p-3 space-y-2">
+            <p className="text-sm font-medium text-amber-700 dark:text-amber-400">
+              Pool created — {existingWarning.length} existing IP{existingWarning.length !== 1 ? "s" : ""} in this range:
+            </p>
+            <ul className="text-xs space-y-0.5 max-h-32 overflow-y-auto">
+              {existingWarning.map((ip) => (
+                <li key={ip.address} className="font-mono">
+                  {ip.address} <span className="text-muted-foreground">({ip.status}){ip.hostname ? ` — ${ip.hostname}` : ""}</span>
+                </li>
+              ))}
+            </ul>
+            <p className="text-xs text-muted-foreground">
+              These IPs may conflict with dynamic DHCP leases. Consider marking them as excluded or reserved.
+            </p>
+            <button
+              type="button"
+              onClick={onClose}
+              className="rounded-md bg-primary px-3 py-1.5 text-xs text-primary-foreground hover:bg-primary/90"
+            >
+              OK
+            </button>
+          </div>
+        )}
+        {!existingWarning && <Btns onClose={onClose} pending={mut.isPending} />}
       </form>
     </Modal>
   );

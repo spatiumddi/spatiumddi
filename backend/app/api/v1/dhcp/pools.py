@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ipaddress
 import uuid
 from datetime import datetime
 from typing import Any
@@ -9,10 +10,12 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, field_validator
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.v1.dhcp._audit import write_audit
 from app.models.dhcp import DHCPPool, DHCPScope
+from app.models.ipam import IPAddress
 
 router = APIRouter(tags=["dhcp"])
 
@@ -56,6 +59,7 @@ class PoolResponse(BaseModel):
     class_restriction: str | None
     lease_time_override: int | None
     options_override: dict[str, Any] | None
+    existing_ips_in_range: list[dict[str, str]] | None = None
     created_at: datetime
     modified_at: datetime
 
@@ -65,6 +69,54 @@ class PoolResponse(BaseModel):
     @classmethod
     def _inet_to_str(cls, v: Any) -> Any:
         return str(v) if v is not None else v
+
+
+def _ip_int(ip_str: str) -> int:
+    return int(ipaddress.IPv4Address(ip_str))
+
+
+async def _check_pool_overlap(
+    db: AsyncSession,
+    scope_id: uuid.UUID,
+    start: str,
+    end: str,
+    exclude_id: uuid.UUID | None = None,
+) -> str | None:
+    """Return an error message if the given range overlaps any existing pool in the scope."""
+    new_start, new_end = _ip_int(start), _ip_int(end)
+    if new_start > new_end:
+        return f"start_ip ({start}) must be <= end_ip ({end})"
+    res = await db.execute(select(DHCPPool).where(DHCPPool.scope_id == scope_id))
+    for p in res.scalars().all():
+        if exclude_id and p.id == exclude_id:
+            continue
+        ps, pe = _ip_int(str(p.start_ip)), _ip_int(str(p.end_ip))
+        if new_start <= pe and new_end >= ps:
+            return (
+                f"Range {start}–{end} overlaps existing pool "
+                f"'{p.name or p.id}' ({p.start_ip}–{p.end_ip})"
+            )
+    return None
+
+
+async def _existing_ips_in_range(
+    db: AsyncSession, subnet_id: uuid.UUID, start: str, end: str
+) -> list[dict[str, str]]:
+    """Return IPAM addresses that fall inside the given range and aren't 'available'."""
+    res = await db.execute(
+        select(IPAddress).where(IPAddress.subnet_id == subnet_id)
+    )
+    s, e = _ip_int(start), _ip_int(end)
+    hits: list[dict[str, str]] = []
+    for ip in res.scalars().all():
+        v = _ip_int(str(ip.address))
+        if s <= v <= e and ip.status not in ("available", "network", "broadcast"):
+            hits.append({
+                "address": str(ip.address),
+                "status": ip.status,
+                "hostname": ip.hostname or "",
+            })
+    return hits
 
 
 @router.get("/scopes/{scope_id}/pools", response_model=list[PoolResponse])
@@ -80,10 +132,13 @@ async def list_pools(scope_id: uuid.UUID, db: DB, _: CurrentUser) -> list[DHCPPo
 )
 async def create_pool(
     scope_id: uuid.UUID, body: PoolCreate, db: DB, user: SuperAdmin
-) -> DHCPPool:
+) -> PoolResponse:
     scope = await db.get(DHCPScope, scope_id)
     if scope is None:
         raise HTTPException(status_code=404, detail="Scope not found")
+    overlap = await _check_pool_overlap(db, scope_id, body.start_ip, body.end_ip)
+    if overlap:
+        raise HTTPException(status_code=409, detail=overlap)
     pool = DHCPPool(scope_id=scope_id, **body.model_dump())
     db.add(pool)
     await db.flush()
@@ -98,7 +153,10 @@ async def create_pool(
     )
     await db.commit()
     await db.refresh(pool)
-    return pool
+    existing = await _existing_ips_in_range(db, scope.subnet_id, body.start_ip, body.end_ip)
+    resp = PoolResponse.model_validate(pool, from_attributes=True)
+    resp.existing_ips_in_range = existing or None
+    return resp
 
 
 @router.put("/pools/{pool_id}", response_model=PoolResponse)
@@ -108,6 +166,12 @@ async def update_pool(
     pool = await db.get(DHCPPool, pool_id)
     if pool is None:
         raise HTTPException(status_code=404, detail="Pool not found")
+    new_start = body.start_ip or str(pool.start_ip)
+    new_end = body.end_ip or str(pool.end_ip)
+    if body.start_ip or body.end_ip:
+        overlap = await _check_pool_overlap(db, pool.scope_id, new_start, new_end, exclude_id=pool.id)
+        if overlap:
+            raise HTTPException(status_code=409, detail=overlap)
     changes = body.model_dump(exclude_none=True)
     for k, v in changes.items():
         setattr(pool, k, v)

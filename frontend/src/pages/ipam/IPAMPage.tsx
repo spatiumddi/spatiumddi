@@ -1464,6 +1464,7 @@ function SubnetDetail({
     description: "",
     status: "",
     dns: "",
+    pool: "",
   });
   const [filterModes, setFilterModes] = useState<Record<string, FilterMode>>(
     {},
@@ -1479,6 +1480,7 @@ function SubnetDetail({
       description: "",
       status: "",
       dns: "",
+      pool: "",
     });
     setFilterModes({});
     setShowFilters(false);
@@ -1492,6 +1494,35 @@ function SubnetDetail({
   // Per-IP DNS sync state derived from the same drift report the sync modal
   // uses. Refreshed alongside addresses; stale-while-revalidate is fine since
   // the column is informational.
+  // DHCP pool membership — derive which pool (if any) each IP falls within.
+  const { data: dhcpScopes = [] } = useQuery({
+    queryKey: ["dhcp-scopes-subnet", subnet.id],
+    queryFn: () => dhcpApi.listScopesBySubnet(subnet.id),
+  });
+  const allPoolQueries = useQueries({
+    queries: dhcpScopes.map((sc) => ({
+      queryKey: ["dhcp-pools", sc.id],
+      queryFn: () => dhcpApi.listPools(sc.id),
+      staleTime: 60_000,
+    })),
+  });
+  const allPools = allPoolQueries.flatMap((q) => q.data ?? []);
+
+  function ipPoolInfo(addr: IPAddress): { type: string; name: string } | null {
+    const ipParts = String(addr.address).split(".").map(Number);
+    if (ipParts.length !== 4) return null;
+    const ipInt =
+      ((ipParts[0] << 24) | (ipParts[1] << 16) | (ipParts[2] << 8) | ipParts[3]) >>> 0;
+    for (const p of allPools) {
+      const sParts = p.start_ip.split(".").map(Number);
+      const eParts = p.end_ip.split(".").map(Number);
+      const sInt = ((sParts[0] << 24) | (sParts[1] << 16) | (sParts[2] << 8) | sParts[3]) >>> 0;
+      const eInt = ((eParts[0] << 24) | (eParts[1] << 16) | (eParts[2] << 8) | eParts[3]) >>> 0;
+      if (ipInt >= sInt && ipInt <= eInt) return { type: p.pool_type, name: p.name || p.pool_type };
+    }
+    return null;
+  }
+
   const { data: dnsDrift } = useQuery({
     queryKey: ["dns-sync-preview", "subnet", subnet.id],
     queryFn: () => ipamApi.dnsSyncPreview(subnet.id),
@@ -1808,11 +1839,12 @@ function SubnetDetail({
                     "mac",
                     "description",
                     "status",
+                    "pool",
                     "dns",
                   ] as const
                 ).map((col) => {
                   const label =
-                    col === "mac" ? "MAC" : col === "dns" ? "DNS" : col;
+                    col === "mac" ? "MAC" : col === "dns" ? "DNS" : col === "pool" ? "DHCP Pool" : col;
                   return (
                     <th key={col} className="px-4 py-2 text-left font-medium">
                       <span className="inline-flex items-center gap-1">
@@ -1846,6 +1878,7 @@ function SubnetDetail({
                           description: "",
                           status: "",
                           dns: "",
+                          pool: "",
                         });
                         setFilterModes({});
                       }}
@@ -1866,6 +1899,7 @@ function SubnetDetail({
                       "mac",
                       "description",
                       "status",
+                      "pool",
                       "dns",
                     ] as const
                   ).map((col) => (
@@ -2045,6 +2079,23 @@ function SubnetDetail({
                     </td>
                     <td className="px-4 py-2">
                       <StatusBadge status={addr.status} />
+                    </td>
+                    <td className="px-4 py-2">
+                      {(() => {
+                        const pi = ipPoolInfo(addr);
+                        if (!pi) return <span className="text-muted-foreground/40">—</span>;
+                        const cls =
+                          pi.type === "dynamic"
+                            ? "bg-cyan-100 text-cyan-800 dark:bg-cyan-900/30 dark:text-cyan-400"
+                            : pi.type === "reserved"
+                              ? "bg-violet-100 text-violet-800 dark:bg-violet-900/30 dark:text-violet-400"
+                              : "bg-zinc-100 text-zinc-600 dark:bg-zinc-800/30 dark:text-zinc-400";
+                        return (
+                          <span className={`inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium ${cls}`}>
+                            {pi.name}
+                          </span>
+                        );
+                      })()}
                     </td>
                     <td className="px-4 py-2">
                       {dnsState === "in-sync" ? (
