@@ -1249,6 +1249,9 @@ function AddAddressModal({
   const [customFields, setCustomFields] = useState<Record<string, unknown>>({});
   const [dnsZoneId, setDnsZoneId] = useState<string>("");
   const [dhcpScopeId, setDhcpScopeId] = useState<string>("");
+  const [aliases, setAliases] = useState<
+    { name: string; record_type: "CNAME" | "A" }[]
+  >([]);
   const [error, setError] = useState<string | null>(null);
   const needsDhcpScope = ipStatus === "dhcp" || ipStatus === "static_dhcp";
 
@@ -1303,6 +1306,9 @@ function AddAddressModal({
   const mutation = useMutation({
     mutationFn: async () => {
       const zoneParam = dnsZoneId || undefined;
+      const cleanedAliases = aliases
+        .map((a) => ({ ...a, name: a.name.trim() }))
+        .filter((a) => a.name.length > 0);
       const created =
         mode === "next"
           ? await ipamApi.nextAddress(subnetId, {
@@ -1312,6 +1318,7 @@ function AddAddressModal({
               description: description || undefined,
               custom_fields: customFields,
               dns_zone_id: zoneParam,
+              aliases: cleanedAliases.length ? cleanedAliases : undefined,
             })
           : await ipamApi.createAddress({
               subnet_id: subnetId,
@@ -1322,6 +1329,7 @@ function AddAddressModal({
               status: ipStatus,
               custom_fields: customFields,
               dns_zone_id: zoneParam,
+              aliases: cleanedAliases.length ? cleanedAliases : undefined,
             });
       // If the user picked a static_dhcp status and a scope, mirror the row
       // into the DHCP side so the two stay in sync (the backend
@@ -1494,6 +1502,74 @@ function AddAddressModal({
             placeholder="Optional"
           />
         </Field>
+        {dnsZoneId && hostname && (
+          <Field label="DNS Aliases">
+            <div className="space-y-1.5">
+              <p className="text-[11px] text-muted-foreground -mt-0.5">
+                Extra records pointing to this IP. CNAMEs point to{" "}
+                <span className="font-mono">{hostname}</span>; A records point to
+                the IP. Deleted automatically when the IP is purged.
+              </p>
+              {aliases.map((a, idx) => (
+                <div key={idx} className="flex items-center gap-2">
+                  <select
+                    className={cn(inputCls, "w-24")}
+                    value={a.record_type}
+                    onChange={(e) =>
+                      setAliases((prev) =>
+                        prev.map((x, i) =>
+                          i === idx
+                            ? {
+                                ...x,
+                                record_type: e.target.value as "CNAME" | "A",
+                              }
+                            : x,
+                        ),
+                      )
+                    }
+                  >
+                    <option value="CNAME">CNAME</option>
+                    <option value="A">A</option>
+                  </select>
+                  <input
+                    className={cn(inputCls, "flex-1 min-w-0")}
+                    placeholder="alias (e.g. www, mail)"
+                    value={a.name}
+                    onChange={(e) =>
+                      setAliases((prev) =>
+                        prev.map((x, i) =>
+                          i === idx ? { ...x, name: e.target.value } : x,
+                        ),
+                      )
+                    }
+                  />
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setAliases((prev) => prev.filter((_, i) => i !== idx))
+                    }
+                    className="flex-shrink-0 rounded p-1 text-muted-foreground hover:text-destructive"
+                    title="Remove alias"
+                  >
+                    <X className="h-4 w-4" />
+                  </button>
+                </div>
+              ))}
+              <button
+                type="button"
+                onClick={() =>
+                  setAliases((prev) => [
+                    ...prev,
+                    { name: "", record_type: "CNAME" },
+                  ])
+                }
+                className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent"
+              >
+                <Plus className="h-3 w-3" /> Add alias
+              </button>
+            </div>
+          </Field>
+        )}
         <CustomFieldsSection
           definitions={cfDefs}
           values={customFields}

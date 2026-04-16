@@ -408,6 +408,7 @@ export const ipamApi = {
     data: Partial<IPAddress> & {
       hostname: string;
       dns_zone_id?: string | null;
+      aliases?: { name: string; record_type: "CNAME" | "A" }[];
     },
   ) =>
     api
@@ -436,6 +437,7 @@ export const ipamApi = {
       description?: string;
       custom_fields?: Record<string, unknown>;
       dns_zone_id?: string | null;
+      aliases?: { name: string; record_type: "CNAME" | "A" }[];
     },
   ) =>
     api

@@ -196,6 +196,64 @@ async def _enqueue_dns_op(
     )
 
 
+async def _create_alias_records(
+    db: AsyncSession,
+    ip: IPAddress,
+    subnet: Subnet,
+    aliases: list[Any],
+    zone_id: uuid.UUID | None = None,
+) -> None:
+    """Create user-specified alias DNS records tied to this IP.
+
+    Aliases are marked ``auto_generated=True`` + ``ip_address_id=ip.id`` so
+    the existing delete-path in ``_sync_dns_record(action='delete')`` cleans
+    them up automatically when the IP is purged.
+
+    Value inference:
+      - CNAME → points to the IP's FQDN (<hostname>.<zone>).
+      - A     → points to the IP itself (secondary name → same IP).
+    """
+    if not aliases or not ip.hostname:
+        return
+    effective_zone_id = zone_id or await _resolve_effective_zone(db, subnet)
+    if not effective_zone_id:
+        return
+    zone = await db.get(DNSZone, effective_zone_id)
+    if zone is None:
+        return
+    zone_domain = zone.name.rstrip(".")
+    primary_fqdn = f"{ip.hostname}.{zone_domain}."
+    for al in aliases:
+        rtype = (getattr(al, "record_type", None) or al.get("record_type") or "CNAME").upper()
+        name = (getattr(al, "name", None) or al.get("name") or "").strip().rstrip(".")
+        if not name or rtype not in {"CNAME", "A"}:
+            continue
+        # Skip if a conflicting record already exists for (zone, name, type)
+        dup = await db.execute(
+            select(DNSRecord).where(
+                DNSRecord.zone_id == effective_zone_id,
+                DNSRecord.name == name,
+                DNSRecord.record_type == rtype,
+            )
+        )
+        if dup.scalar_one_or_none():
+            continue
+        value = primary_fqdn if rtype == "CNAME" else str(ip.address)
+        rec = DNSRecord(
+            zone_id=effective_zone_id,
+            name=name,
+            fqdn=f"{name}.{zone_domain}",
+            record_type=rtype,
+            value=value,
+            auto_generated=True,
+            ip_address_id=ip.id,
+            created_by_user_id=ip.created_by_user_id,
+        )
+        db.add(rec)
+        await db.flush()
+        await _enqueue_dns_op(db, zone, "create", name, rtype, value, None)
+
+
 async def _sync_dns_record(
     db: AsyncSession,
     ip: IPAddress,
@@ -750,6 +808,27 @@ class EffectiveDnsResponse(BaseModel):
     inherited_from_block_id: str | None
 
 
+class AliasInput(BaseModel):
+    name: str  # label within the zone (e.g. "www", "mail")
+    record_type: str = "CNAME"  # CNAME → points to the IP's FQDN; A → points to the IP
+
+    @field_validator("record_type")
+    @classmethod
+    def _rt(cls, v: str) -> str:
+        v = v.upper()
+        if v not in {"CNAME", "A"}:
+            raise ValueError("alias record_type must be CNAME or A")
+        return v
+
+    @field_validator("name")
+    @classmethod
+    def _n(cls, v: str) -> str:
+        v = v.strip().rstrip(".")
+        if not v:
+            raise ValueError("alias name is required")
+        return v
+
+
 class IPAddressCreate(BaseModel):
     address: str
     status: str = "allocated"
@@ -760,6 +839,7 @@ class IPAddressCreate(BaseModel):
     custom_fields: dict[str, Any] = {}
     tags: dict[str, Any] = {}
     dns_zone_id: str | None = None  # explicit zone override; falls back to subnet's effective DNS
+    aliases: list[AliasInput] = []
 
     @field_validator("hostname")
     @classmethod
@@ -842,6 +922,7 @@ class NextIPRequest(BaseModel):
     custom_fields: dict[str, Any] = {}
     tags: dict[str, Any] = {}
     dns_zone_id: str | None = None  # explicit zone override; falls back to subnet's effective DNS
+    aliases: list[AliasInput] = []
 
     @field_validator("hostname")
     @classmethod
@@ -2093,6 +2174,9 @@ async def create_address(
     # Sync DNS A record
     zone_id = uuid.UUID(body.dns_zone_id) if body.dns_zone_id else None
     await _sync_dns_record(db, ip, subnet, zone_id=zone_id, action="create")
+    # User-specified alias records (CNAME / A) tied to this IP
+    if body.aliases:
+        await _create_alias_records(db, ip, subnet, body.aliases, zone_id=zone_id)
 
     db.add(
         _audit(
@@ -2383,6 +2467,9 @@ async def allocate_next_ip(
     # Sync DNS A record
     zone_id = uuid.UUID(body.dns_zone_id) if body.dns_zone_id else None
     await _sync_dns_record(db, ip, subnet, zone_id=zone_id, action="create")
+    # User-specified alias records (CNAME / A) tied to this IP
+    if body.aliases:
+        await _create_alias_records(db, ip, subnet, body.aliases, zone_id=zone_id)
 
     db.add(
         _audit(
