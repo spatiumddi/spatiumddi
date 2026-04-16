@@ -249,7 +249,7 @@ class DHCPClientClass(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     match_expression: Mapped[str] = mapped_column(Text, nullable=False, default="")
     description: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    options: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    options: Mapped[dict] = mapped_column(JSONB, nullable=False, default=lambda: {})
 
     server: Mapped["DHCPServer"] = relationship("DHCPServer", back_populates="client_classes")
 
