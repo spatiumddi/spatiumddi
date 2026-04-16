@@ -2906,6 +2906,7 @@ function BlocklistDetail({
   const [offset, setOffset] = useState(0);
   const [newDomain, setNewDomain] = useState("");
   const [newReason, setNewReason] = useState("");
+  const [newWildcard, setNewWildcard] = useState(true);
   const [bulkText, setBulkText] = useState("");
   const [showBulk, setShowBulk] = useState(false);
   const [excDomain, setExcDomain] = useState("");
@@ -2930,10 +2931,12 @@ function BlocklistDetail({
       dnsBlocklistApi.addEntry(list.id, {
         domain: newDomain,
         reason: newReason || undefined,
+        is_wildcard: newWildcard,
       }),
     onSuccess: () => {
       setNewDomain("");
       setNewReason("");
+      setNewWildcard(true);
       qc.invalidateQueries({ queryKey: ["dns-blocklist-entries", list.id] });
     },
   });
@@ -2960,11 +2963,13 @@ function BlocklistDetail({
   const [editEntry, setEditEntry] = useState<DNSBlockListEntry | null>(null);
   const [editDomain, setEditDomain] = useState("");
   const [editEntryReason, setEditEntryReason] = useState("");
+  const [editEntryWildcard, setEditEntryWildcard] = useState(true);
   const updateEntry = useMutation({
     mutationFn: () =>
       dnsBlocklistApi.updateEntry(list.id, editEntry!.id, {
         domain: editDomain,
         reason: editEntryReason,
+        is_wildcard: editEntryWildcard,
       }),
     onSuccess: () => {
       setEditEntry(null);
@@ -3110,6 +3115,14 @@ function BlocklistDetail({
               Bulk add
             </button>
           </div>
+          <label className="flex items-center gap-1.5 text-xs text-muted-foreground cursor-pointer">
+            <input
+              type="checkbox"
+              checked={newWildcard}
+              onChange={(e) => setNewWildcard(e.target.checked)}
+            />
+            Block subdomains too (e.g. <code className="font-mono">*.test.com</code>)
+          </label>
         </div>
         <table className="w-full text-sm">
           <thead>
@@ -3134,7 +3147,17 @@ function BlocklistDetail({
             )}
             {items.map((e: DNSBlockListEntry) => (
               <tr key={e.id} className="border-t hover:bg-accent/30">
-                <td className="px-3 py-1 font-mono text-xs">{e.domain}</td>
+                <td className="px-3 py-1 font-mono text-xs">
+                  {e.domain}
+                  {e.is_wildcard && (
+                    <span
+                      className="ml-1.5 inline-flex items-center rounded bg-muted px-1 py-0 text-[10px] font-medium text-muted-foreground"
+                      title="Also blocks all subdomains"
+                    >
+                      +subdomains
+                    </span>
+                  )}
+                </td>
                 <td className="px-3 py-1 text-xs">{e.entry_type}</td>
                 <td className="px-3 py-1 text-xs text-muted-foreground">
                   {e.reason || (
@@ -3151,6 +3174,7 @@ function BlocklistDetail({
                           setEditEntry(e);
                           setEditDomain(e.domain);
                           setEditEntryReason(e.reason ?? "");
+                          setEditEntryWildcard(e.is_wildcard);
                         }}
                         title="Edit domain"
                       >
@@ -3340,6 +3364,14 @@ function BlocklistDetail({
                 placeholder="Optional"
               />
             </Field>
+            <label className="flex items-center gap-2 text-sm cursor-pointer">
+              <input
+                type="checkbox"
+                checked={editEntryWildcard}
+                onChange={(ev) => setEditEntryWildcard(ev.target.checked)}
+              />
+              Block subdomains too (<code className="font-mono text-xs">*.{editDomain || "domain"}</code>)
+            </label>
             <div className="flex justify-end gap-2">
               <button
                 onClick={() => setEditEntry(null)}

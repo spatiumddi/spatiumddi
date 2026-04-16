@@ -29,6 +29,10 @@ from app.models.dns import (
     DNSView,
     DNSZone,
 )
+from app.services.dns_blocklist import (
+    build_effective_for_group,
+    build_effective_for_view,
+)
 
 try:  # pragma: no cover - seam with parallel driver-abstraction agent
     from app.services.dns.config_bundle import ConfigBundle  # type: ignore[assignment]
@@ -166,6 +170,43 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
     ]
     acls_block = [{"id": str(a.id), "name": a.name} for a in acls]
 
+    # Blocklists: one RPZ zone per view (if any) + one group-level zone.
+    # Each assembled list has its entries resolved against view/group scope
+    # with exceptions already applied by `build_effective_for_{view,group}`.
+    def _entries_payload(eff_entries: list[Any]) -> list[dict[str, Any]]:
+        return [
+            {
+                "domain": e.domain,
+                "action": e.action,
+                "block_mode": e.block_mode,
+                "target": e.target,
+                "is_wildcard": e.is_wildcard,
+            }
+            for e in eff_entries
+        ]
+
+    blocklists_payload: list[dict[str, Any]] = []
+    if views:
+        for v in views:
+            eff_v = await build_effective_for_view(db, v.id)
+            if eff_v.entries:
+                blocklists_payload.append(
+                    {
+                        "rpz_zone_name": f"spatium-blocklist-{v.name}.rpz.",
+                        "entries": _entries_payload(eff_v.entries),
+                        "exceptions": sorted(eff_v.exceptions),
+                    }
+                )
+    eff_g = await build_effective_for_group(db, server.group_id)
+    if eff_g.entries:
+        blocklists_payload.append(
+            {
+                "rpz_zone_name": "spatium-blocklist.rpz.",
+                "entries": _entries_payload(eff_g.entries),
+                "exceptions": sorted(eff_g.exceptions),
+            }
+        )
+
     bundle_body: dict[str, Any] = {
         "server_id": str(server.id),
         "driver": server.driver,
@@ -175,7 +216,7 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
         "zones": zone_payload,
         "tsig_keys": tsig_keys,
         "forwarders": options_block["forwarders"],
-        "blocklists": [],
+        "blocklists": blocklists_payload,
         "pending_record_ops": pending_ops,
     }
 
@@ -189,6 +230,9 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
         "acls": acls_block,
         "tsig_keys": tsig_keys,
         "zones_structural": [{k: v for k, v in z.items() if k != "records"} for z in zone_payload],
+        # Blocklists affect named.conf (response-policy block) + RPZ zone
+        # files, so a change MUST trigger a daemon reload.
+        "blocklists": blocklists_payload,
     }
     structural_etag = _compute_etag(structural)
     bundle_body["structural_etag"] = structural_etag

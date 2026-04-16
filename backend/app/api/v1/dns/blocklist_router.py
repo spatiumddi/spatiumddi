@@ -150,7 +150,10 @@ class EntryCreate(BaseModel):
     domain: str
     entry_type: str = "block"
     target: str | None = None
-    is_wildcard: bool = False
+    # Default on: matches Pi-hole / uBlock expectations where adding a
+    # domain blocks it AND every subdomain. The operator can uncheck to
+    # block only the apex.
+    is_wildcard: bool = True
     reason: str = ""
 
     @field_validator("entry_type")

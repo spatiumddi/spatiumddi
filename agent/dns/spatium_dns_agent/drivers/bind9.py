@@ -37,7 +37,7 @@ options {{
     allow-query {{ {allow_query}; }};
     dnssec-validation {dnssec};
     check-integrity no;
-{forwarders}
+{forwarders}{response_policy}
 }};
 {tsig_include}"""
 
@@ -59,6 +59,13 @@ class Bind9Driver(DriverBase):
         recursion = "yes" if opts.get("recursion_enabled", True) else "no"
         allow_query = "; ".join(opts.get("allow_query") or ["any"])
         dnssec = opts.get("dnssec_validation", "auto")
+        # RPZ rewrites break DNSSEC chain validation: even with
+        # `break-dnssec yes`, BIND9 returns SERVFAIL to clients that set the
+        # DO bit on DNSSEC-signed domains being blocked. For a blocking
+        # appliance the user intent is "block, don't validate", so silently
+        # disable validation when blocklists are present.
+        if bundle.get("blocklists"):
+            dnssec = "no"
         fwd_block = ""
         if forwarders:
             fwd_block = "    forwarders {{ {fs}; }};\n".format(
@@ -71,11 +78,28 @@ class Bind9Driver(DriverBase):
             'include "/var/lib/spatium-dns-agent/tsig/ddns.key";\n' if tsig_keys else ""
         )
 
+        # Response-policy block needs to list every RPZ zone we're about to
+        # declare, otherwise BIND9 won't consult them on lookups.
+        blocklists = bundle.get("blocklists") or []
+        response_policy_block = ""
+        if blocklists:
+            zones_list = "; ".join(
+                f'zone "{bl["rpz_zone_name"].rstrip(".")}"' for bl in blocklists
+            )
+            # break-dnssec lets RPZ rewrite responses from DNSSEC-signed zones
+            # (otherwise BIND9 returns SERVFAIL on a DNSSEC conflict). For a
+            # blocking use-case this is what you want: the user intent is to
+            # block, not to preserve validation integrity.
+            response_policy_block = (
+                f"    response-policy {{ {zones_list}; }} break-dnssec yes;\n"
+            )
+
         conf = NAMED_CONF_SKELETON.format(
             recursion=recursion,
             allow_query=allow_query,
             dnssec=dnssec,
             forwarders=fwd_block,
+            response_policy=response_policy_block,
             tsig_include=tsig_include,
         )
 
@@ -100,6 +124,22 @@ class Bind9Driver(DriverBase):
             )
             if zone_type in {"primary", "master"}:
                 self._write_zone_file(new_dir / rel_zfile, zone)
+
+        # RPZ zones for blocklists. Each blocklist becomes a master zone named
+        # after its rpz_zone_name. Entries are rendered as CNAME records:
+        # - nxdomain     → CNAME .                  (synthesize NXDOMAIN)
+        # - sinkhole     → CNAME rpz-drop.          (drop silently)
+        # - redirect     → CNAME <target>.          (CNAME to target)
+        # Exceptions (allow-list) are CNAME rpz-passthru.  (explicit bypass)
+        for bl in blocklists:
+            zname = bl["rpz_zone_name"]
+            rel = f"zones/{zname.rstrip('.')}.db"
+            abs_zfile = self.state_dir / self.rendered_dir_name / rel
+            conf += (
+                f'zone "{zname}" {{ type master; file "{abs_zfile}"; '
+                f"allow-query {{ localhost; }}; }};\n"
+            )
+            self._write_rpz_zone_file(new_dir / rel, bl)
 
         (new_dir / "named.conf").write_text(conf)
 
@@ -137,6 +177,48 @@ class Bind9Driver(DriverBase):
                 f"{name_field} {rec_ttl} IN {rec['type']} {rec['value']}"
             )
         path.write_text("\n".join(lines) + "\n")
+
+    def _write_rpz_zone_file(self, path: Path, bl: dict[str, Any]) -> None:
+        """Render an RPZ zone file.
+
+        RPZ uses CNAME trigger records to tell BIND9 how to rewrite responses:
+          - CNAME .            → synthesize NXDOMAIN
+          - CNAME *.           → synthesize NODATA
+          - CNAME rpz-drop.    → drop the query (no response)
+          - CNAME rpz-passthru → explicit bypass (used for exceptions)
+          - CNAME <target>.    → rewrite response to CNAME target
+
+        Wildcard entries are emitted as `*.<domain>` to catch subdomains.
+        """
+        path.parent.mkdir(parents=True, exist_ok=True)
+        zname = bl["rpz_zone_name"]
+        lines = [
+            "$TTL 60",
+            f"@ IN SOA localhost. root.localhost. ( 1 3600 600 86400 60 )",
+            "@ IN NS localhost.",
+        ]
+        for e in bl.get("entries") or []:
+            domain = e["domain"].rstrip(".")
+            action = e.get("action") or "block"
+            block_mode = e.get("block_mode") or "nxdomain"
+            is_wildcard = bool(e.get("is_wildcard"))
+            target = e.get("target")
+            if action == "redirect" and target:
+                rhs = f"{target.rstrip('.')}."
+            elif block_mode == "sinkhole":
+                rhs = "rpz-drop."
+            else:  # default: nxdomain
+                rhs = "."
+            lines.append(f"{domain} CNAME {rhs}")
+            if is_wildcard:
+                lines.append(f"*.{domain} CNAME {rhs}")
+        # Exceptions → passthrough (never blocked even if a broader rule matches).
+        for exc in bl.get("exceptions") or []:
+            d = exc.rstrip(".")
+            lines.append(f"{d} CNAME rpz-passthru.")
+            lines.append(f"*.{d} CNAME rpz-passthru.")
+        path.write_text("\n".join(lines) + "\n")
+        log.info("bind9_rpz_written", zone=zname, entries=len(bl.get("entries") or []))
 
     def validate(self) -> None:
         new_dir = self.state_dir / "rendered.new"
