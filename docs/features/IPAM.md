@@ -1,5 +1,7 @@
 # IPAM Feature Specification
 
+> **Implementation status (2026-04-16):** Full hierarchical CRUD (spaces, blocks with nesting, subnets, addresses); next-available allocation; orphan soft-delete + bulk orphan purge modal; block utilization rollup via recursive CTE; DNS assignment inheritance (space → block → subnet) with dual-listbox picker for additional zones; DNS sync check (subnet / block / space scope) reconciling missing, mismatched, and stale records; reverse-zone auto-create + backfill; IP aliases (CNAME/A tied to the IP, auto-cleaned on purge); VLAN association (router + VLAN columns); DHCP scope/pool/static linkage with per-IP pool-membership badge; static DHCP creation flow integrated into Allocate IP; drag-drop reparenting; bulk-edit subnets; import/export (CSV/JSON/XLSX); custom fields per resource type; global search (Cmd+K). **Deferred:** full IPv6 UI (storage works), mobile responsive.
+
 ## Overview
 
 The IPAM module is the core of SpatiumDDI. It manages the hierarchy of IP space from broad routing domains down to individual IP addresses. All other modules (DHCP, DNS) reference IPAM resources.

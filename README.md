@@ -78,7 +78,7 @@ The control-plane driver abstraction emits a backend-neutral config bundle. BIND
 
 ## Getting Started
 
-> ⚠️ SpatiumDDI is pre-alpha. Commands and APIs may shift before the first tagged release.
+> ⚠️ SpatiumDDI is **alpha** (first release: `2026.04.16-1`). Commands and APIs may still shift between releases.
 
 ### Quick start with Docker Compose
 

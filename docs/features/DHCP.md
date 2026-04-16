@@ -1,6 +1,6 @@
 # DHCP Feature Specification
 
-> **Implementation status (2026-04-15):** Kea driver, agent runtime, container image, backend API, and frontend UI landed. ISC DHCP driver, HA hook library coordination, DDNS pipeline, and reconciliation report are deferred. NTP (DHCP option 42) is supported as a first-class option.
+> **Implementation status (2026-04-16):** Kea driver, agent runtime, container image, backend API, and frontend UI shipped in the `2026.04.16-1` release. Pool overlap validation, existing-IP warning, resize, static ↔ IPAM sync (including DNS forward/reverse), lease → IPAM mirror (with auto-cleanup on expiry), DHCP Pool membership column in the IPAM subnet view, per-scope DHCP defaults prefilled from Settings. **Still deferred:** ISC DHCP driver, Kea HA hook coordination, DDNS pipeline (dynamic leases → DNS A/PTR), reconciliation report, lease import. NTP (DHCP option 42) is a first-class option.
 
 ## Overview
 

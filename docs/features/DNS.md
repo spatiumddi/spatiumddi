@@ -1,5 +1,7 @@
 # DNS Feature Specification
 
+> **Implementation status (2026-04-16):** Full CRUD for groups / servers / zones / records / views / ACLs / trust anchors; BIND9 driver with TSIG + RFC 2136 dynamic updates; agent auto-registration and long-poll config sync with ETag; RPZ blocklists actively rendered by the agent (nxdomain / sinkhole / redirect / passthru; wildcard + exceptions); per-entry `reason` and `is_wildcard` toggles; zone import/export (RFC 1035); query logging; health checks; IPAM ↔ DNS drift detection & reconciliation (`Check DNS Sync` on subnet/block/space); reverse-zone auto-create + backfill. **Deferred:** secondary-zone (AXFR/IXFR) full support, per-server zone serial reporting.
+
 ## Overview
 
 SpatiumDDI manages DNS servers as first-class resources. It acts as the **authoritative source of truth** for all DNS configuration, pushing changes to backend DNS servers (BIND9) via their respective drivers. The DNS subsystem supports:

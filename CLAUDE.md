@@ -259,9 +259,55 @@ These rules apply to every file Claude Code generates. No exceptions.
 **Deferred**
 - ⬜ ISC DHCP driver (registry only knows `kea`)
 - ⬜ Kea HA hook library (load-balancing / hot-standby coordination)
-- ⬜ DDNS pipeline (lease → DNS A/PTR)
-- ⬜ Reconciliation report, lease import, dashboard DHCP stat card (DHCP dashboard integration was dropped during VLAN/Dashboard merge — re-add)
+- ⬜ DDNS pipeline (lease → DNS A/PTR automatic update — currently static DHCP triggers DNS sync, but dynamic leases do not)
+- ⬜ Reconciliation report, lease import
 - ⬜ Trivy-clean + e2e acceptance tests for Kea image (stubs in `agent/dhcp/tests/`)
+
+### Wave 5 — post-alpha iteration (2026-04-16)
+
+First public release was `2026.04.16-1`. Changes since:
+
+**IPAM**
+- ✅ IP aliases — allocate-IP modal has a repeater for extra DNS records (CNAME → IP's FQDN, A → IP itself). Aliases are `DNSRecord` rows tagged with `auto_generated=true` + `ip_address_id=ip.id`, so the existing delete-path in `_sync_dns_record(action="delete")` cleans them up on IP purge. Edit-Address modal lists existing aliases with live add/remove (`GET/POST/DELETE /ipam/addresses/{id}/aliases`).
+- ✅ Reverse-zone backfill — `POST /ipam/{subnets|blocks|spaces}/{id}/reverse-zones/backfill` creates missing `in-addr.arpa`/`ip6.arpa` zones for subnets that had DNS assigned after creation. Button next to "Check DNS Sync" on each scope header. Also runs opportunistically on every IP allocation via `_sync_dns_record` so new allocations self-heal. `ensure_reverse_zone_for_subnet` now accepts `current_user=None` for system-triggered calls.
+- ✅ Dual-listbox picker for additional zones in `DnsSettingsSection` — replaces chip grid that didn't scale past ~20 zones. Stacked vertically (Available top, Selected bottom) with per-list filter + move buttons. Stays visible even when primary zone is set.
+- ✅ Bulk orphan cleanup modal on subnet header (`POST /ipam/subnets/{id}/orphans/purge` with checkbox list).
+- ✅ DHCP Pool membership column on IP address table — derives pool type client-side from `dhcpApi.listPools` per scope and shows cyan/violet/zinc badge per IP.
+- ✅ `IPAddress.auto_from_lease` column (migration `e2a6f3b8c1d4`) distinguishes DHCP-lease-mirrored rows from manually allocated ones.
+
+**DNS**
+- ✅ Real RPZ blocklist rendering in BIND9 agent — `named.conf` gets `response-policy { ... } break-dnssec yes;`, per-list zone file with CNAME trigger records (`nxdomain → CNAME .`, `sinkhole → CNAME rpz-drop.`, `redirect → CNAME target.`, exceptions → `rpz-passthru.`). Wildcards emit both apex + `*.domain` lines. DNSSEC validation auto-disabled when blocklists present (chain breaks on rewrite).
+- ✅ `agent_config.build_config_bundle` now populates blocklists (was hardcoded `[]`); blocklists included in `structural_etag` so attach/detach triggers re-render.
+- ✅ `DNSBlockListEntry.reason` column (migration `b4d1c9e2f3a7`) with per-entry "Block subdomains too" toggle (`is_wildcard`, defaults true = Pi-hole semantics). Inline Subdomains column with checkbox that saves immediately (no edit modal).
+- ✅ Blocklist page reorganized into clearly-labeled red **Blocked Domains** and green **Allow-list (Exceptions)** cards with Ban/Shield icons and explanatory taglines.
+- ✅ `PUT /dns/blocklists/{id}/entries/{entry_id}` and `PUT /dns/blocklists/{id}/exceptions/{exception_id}` for inline editing (manual entries only — feed entries would be overwritten on refresh).
+- ✅ DNS records table: always-visible Pencil/Trash buttons, clickable record name to edit, single-step delete confirm (reserve two-step for group/zone deletes), multi-select checkbox column with bulk delete (IPAM-managed records auto-excluded).
+- ✅ Agent re-bootstraps on 401 AND 404 (stale server row in control plane no longer causes 404-loop forever).
+- ✅ BIND9 `nsupdate` delete uses `(name, rtype)` not `(name, rtype, value)` — tolerant to drift between running daemon and zone file.
+
+**DHCP**
+- ✅ Pool overlap validation on create + update; 409 with conflicting-pool name.
+- ✅ Existing-IP-in-range warning on pool create — response includes `existing_ips_in_range` with status/hostname.
+- ✅ DHCP Pool resize via Edit modal (same `start_ip`/`end_ip` fields; backend validates non-overlap with `exclude_id`).
+- ✅ Lease → IPAM mirror: active leases create `status="dhcp"` rows flagged `auto_from_lease=True`. Never clobbers manually allocated or `static_dhcp`. Expired/released leases remove only `auto_from_lease` rows.
+- ✅ Celery `sweep_expired_leases` task (every 5min, 5min grace) catches missed events.
+- ✅ Static DHCP → IPAM sync (`status="static_dhcp"`, `static_assignment_id` back-link, DNS sync fires on create/update/delete).
+- ✅ DHCP force-sync coalesces — repeated clicks reuse pending `apply_config` op instead of queueing N reloads.
+- ✅ Kea agent runs in UDP socket mode (`dhcp-socket-type: udp`, `NET_BIND_SERVICE` cap) for relay-only / datacenter deployments — no `NET_RAW`, no broadcast interference.
+- ✅ Kea `/run/kea` perms fix (chmod 0750 required by Kea 2.6 for socket dir).
+- ✅ DHCP agent acks pending ops via heartbeat (was never sending ack list) + 1s safety floor between polls.
+- ✅ Static assignments moved from DHCP Pools tab to IPAM Allocate IP flow — pick `status=static_dhcp` + choose a scope from the dropdown. Subnet DHCP tab renamed to **DHCP Pools**.
+
+**Platform / infra**
+- ✅ First public release `2026.04.16-1` — `api`, `frontend`, `dns-bind9`, `dhcp-kea` images on GHCR (multi-arch amd64+arm64).
+- ✅ Jekyll docs site scaffolding at `docs/_config.yml` + `docs/index.md`; `docs/sitemap.xml` + `docs/robots.txt` pointing to `spatiumddi.github.io/spatiumddi/`.
+- ✅ CHANGELOG.md; alpha banner in README; clickable thumbnail screenshots in 2-row table layout; `scripts/seed_demo.py`.
+- ✅ GH workflows: CI permissions hardened (CodeQL alerts resolved); DNS + DHCP image workflows trigger on CalVer tags in addition to main pushes.
+- ✅ Migration chain recovered — `backend/alembic/versions/*.py` were `.gitignore`d, CI couldn't run migrations; now all tracked.
+- ✅ `COMPOSE_PROFILES` documented in `.env.example` + README (set to `dns,dhcp` to run both service containers).
+
+**API contract audit**
+- ✅ Parallel audit of IPAM / VLANs / DNS / DHCP frontend ↔ backend — fixed 9 DHCP mismatches (client-class URL, lease envelope, pool/static field drift, `server_group_id` vs `group_id`, `agent_approved` vs `approved`, driver enum, `syncServer` response) + IPAM missing response fields.
 
 ### Phase 1 — Remaining
 

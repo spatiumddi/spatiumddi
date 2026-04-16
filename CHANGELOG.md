@@ -5,6 +5,50 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versioning uses 
 
 ---
 
+## Unreleased
+
+### Added
+
+**IPAM**
+- IP aliases — Allocate/Edit IP modal supports extra CNAME/A records tied to the IP. Auto-deleted on IP purge.
+- Reverse-zone backfill — dedicated button on Space / Block / Subnet headers (`POST /ipam/{scope}/{id}/reverse-zones/backfill`). Also backfills opportunistically on every IP allocation.
+- DHCP Pool membership column on subnet IP table — cyan/violet/zinc badge per IP shows which pool (dynamic/reserved/excluded) it falls in.
+- Bulk orphan cleanup modal on subnet header.
+- `IPAddress.auto_from_lease` column distinguishes DHCP-lease-mirrored rows from manual allocations (migration `e2a6f3b8c1d4`).
+
+**DNS**
+- Real RPZ blocklist rendering in the BIND9 agent — `response-policy { } break-dnssec yes`, CNAME trigger zone files (nxdomain/sinkhole/redirect/passthru). Wildcards block both apex and subdomains.
+- Blocklist entries get a `reason` column (migration `b4d1c9e2f3a7`) and per-entry `is_wildcard` toggle (defaults true).
+- Inline edit for blocklist entries + exceptions (`PUT .../entries/{id}`, `PUT .../exceptions/{id}`).
+- Blocklist page reorganized into red **Blocked Domains** and green **Allow-list** sections.
+- DNS records table: always-visible edit/delete, clickable record name, single-step delete confirm, multi-select bulk delete (IPAM records excluded).
+- DNS agent re-bootstraps on 404 (not just 401) — recovers from stale server rows.
+
+**DHCP**
+- Pool overlap validation + existing-IP warning on pool create.
+- Static DHCP ↔ IPAM sync (creates `status=static_dhcp` rows, fires DNS sync on create/update/delete).
+- Lease → IPAM mirror: active leases create `dhcp` rows; expired leases remove them (`auto_from_lease` flag only).
+- Celery `sweep_expired_leases` task (every 5min) catches missed lease events.
+- Force-sync coalesces repeated clicks into one pending op.
+- Kea agent: UDP socket mode for relay-only deployments; `/run/kea` perms; lease op acks via heartbeat.
+- DHCP scope options default-prefill from Settings (DNS/NTP/domain/lease-time).
+- Static assignments moved from DHCP Pools tab into IPAM Allocate IP flow.
+
+**Platform**
+- Jekyll docs site config (`docs/_config.yml`, `docs/index.md`).
+- CHANGELOG; alpha banner; clickable screenshot thumbnails in README.
+- Seed script (`scripts/seed_demo.py`).
+- Alembic migrations now tracked in git (were `.gitignore`d — CI was broken).
+- `COMPOSE_PROFILES` documented.
+
+### Fixed
+
+- Full audit of IPAM/VLANs/DNS/DHCP frontend ↔ backend API contracts; 10+ mismatches fixed.
+- `allocate_next_ip` — `FOR UPDATE` on outer join, now `of=Subnet` + `.unique()`.
+- Workflow permissions hardened (CodeQL alerts resolved).
+
+---
+
 ## 2026.04.16-1 — Alpha
 
 First public release. **Alpha quality** — expect rough edges and breaking changes between releases.
