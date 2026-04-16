@@ -1,12 +1,6 @@
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import {
-  ClipboardList,
-  ChevronLeft,
-  ChevronRight,
-  Filter,
-  X,
-} from "lucide-react";
+import { ClipboardList, ChevronLeft, ChevronRight, X } from "lucide-react";
 import { auditApi, type AuditLogEntry } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
@@ -108,7 +102,6 @@ const EMPTY_FILTERS: Record<ColKey, string> = {
 
 export function AuditPage() {
   const [page, setPage] = useState(0);
-  const [showFilters, setShowFilters] = useState(false);
   const [colFilters, setColFilters] =
     useState<Record<ColKey, string>>(EMPTY_FILTERS);
 
@@ -185,23 +178,7 @@ export function AuditPage() {
                   Result
                 </th>
                 <th className="px-3 py-2 text-left font-medium text-muted-foreground">
-                  <span className="inline-flex items-center gap-1.5">
-                    IP
-                    <button
-                      onClick={() => setShowFilters((v) => !v)}
-                      title={showFilters ? "Hide filters" : "Show filters"}
-                      className={cn(
-                        "rounded p-0.5 hover:bg-accent",
-                        hasActiveFilter
-                          ? "text-primary"
-                          : showFilters
-                            ? "text-primary/40"
-                            : "text-muted-foreground/40 hover:text-muted-foreground",
-                      )}
-                    >
-                      <Filter className="h-3 w-3" />
-                    </button>
-                  </span>
+                  IP
                 </th>
                 <th className="px-2 py-2 text-right">
                   {hasActiveFilter && (
@@ -215,95 +192,93 @@ export function AuditPage() {
                   )}
                 </th>
               </tr>
-              {showFilters && (
-                <tr className="border-b bg-muted/10 text-xs">
-                  {/* Timestamp — no filter */}
-                  <td className="px-2 py-1" />
+              <tr className="border-b bg-muted/10 text-xs">
+                {/* Timestamp — no filter */}
+                <td className="px-2 py-1" />
 
-                  {/* User */}
-                  <td className="px-2 py-1">
-                    <input
-                      type="text"
-                      value={colFilters.user}
-                      onChange={(e) => setFilter("user", e.target.value)}
-                      placeholder="Filter…"
-                      className="w-full rounded border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
-                    />
-                  </td>
+                {/* User */}
+                <td className="px-2 py-1">
+                  <input
+                    type="text"
+                    value={colFilters.user}
+                    onChange={(e) => setFilter("user", e.target.value)}
+                    placeholder="Filter…"
+                    className="w-full rounded border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
+                  />
+                </td>
 
-                  {/* Action — dropdown */}
-                  <td className="px-2 py-1">
-                    <select
-                      value={colFilters.action}
-                      onChange={(e) => setFilter("action", e.target.value)}
-                      className="w-full rounded border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
-                    >
-                      <option value="">All</option>
-                      {ACTION_OPTIONS.map((a) => (
-                        <option key={a} value={a}>
-                          {a}
-                        </option>
-                      ))}
-                    </select>
-                  </td>
+                {/* Action — dropdown */}
+                <td className="px-2 py-1">
+                  <select
+                    value={colFilters.action}
+                    onChange={(e) => setFilter("action", e.target.value)}
+                    className="w-full rounded border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
+                  >
+                    <option value="">All</option>
+                    {ACTION_OPTIONS.map((a) => (
+                      <option key={a} value={a}>
+                        {a}
+                      </option>
+                    ))}
+                  </select>
+                </td>
 
-                  {/* Resource — dropdown */}
-                  <td className="px-2 py-1">
-                    <select
-                      value={colFilters.resource}
-                      onChange={(e) => setFilter("resource", e.target.value)}
-                      className="w-full rounded border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
-                    >
-                      <option value="">All</option>
-                      {RESOURCE_TYPE_OPTIONS.map((r) => (
-                        <option key={r} value={r}>
-                          {r}
-                        </option>
-                      ))}
-                    </select>
-                  </td>
+                {/* Resource — dropdown */}
+                <td className="px-2 py-1">
+                  <select
+                    value={colFilters.resource}
+                    onChange={(e) => setFilter("resource", e.target.value)}
+                    className="w-full rounded border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
+                  >
+                    <option value="">All</option>
+                    {RESOURCE_TYPE_OPTIONS.map((r) => (
+                      <option key={r} value={r}>
+                        {r}
+                      </option>
+                    ))}
+                  </select>
+                </td>
 
-                  {/* Summary */}
-                  <td className="px-2 py-1">
-                    <input
-                      type="text"
-                      value={colFilters.summary}
-                      onChange={(e) => setFilter("summary", e.target.value)}
-                      placeholder="Filter…"
-                      className="w-full rounded border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
-                    />
-                  </td>
+                {/* Summary */}
+                <td className="px-2 py-1">
+                  <input
+                    type="text"
+                    value={colFilters.summary}
+                    onChange={(e) => setFilter("summary", e.target.value)}
+                    placeholder="Filter…"
+                    className="w-full rounded border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
+                  />
+                </td>
 
-                  {/* Result — dropdown */}
-                  <td className="px-2 py-1">
-                    <select
-                      value={colFilters.result}
-                      onChange={(e) => setFilter("result", e.target.value)}
-                      className="w-full rounded border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
-                    >
-                      <option value="">All</option>
-                      {RESULT_OPTIONS.map((r) => (
-                        <option key={r} value={r}>
-                          {r}
-                        </option>
-                      ))}
-                    </select>
-                  </td>
+                {/* Result — dropdown */}
+                <td className="px-2 py-1">
+                  <select
+                    value={colFilters.result}
+                    onChange={(e) => setFilter("result", e.target.value)}
+                    className="w-full rounded border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
+                  >
+                    <option value="">All</option>
+                    {RESULT_OPTIONS.map((r) => (
+                      <option key={r} value={r}>
+                        {r}
+                      </option>
+                    ))}
+                  </select>
+                </td>
 
-                  {/* IP */}
-                  <td className="px-2 py-1">
-                    <input
-                      type="text"
-                      value={colFilters.ip}
-                      onChange={(e) => setFilter("ip", e.target.value)}
-                      placeholder="Filter…"
-                      className="w-full rounded border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
-                    />
-                  </td>
+                {/* IP */}
+                <td className="px-2 py-1">
+                  <input
+                    type="text"
+                    value={colFilters.ip}
+                    onChange={(e) => setFilter("ip", e.target.value)}
+                    placeholder="Filter…"
+                    className="w-full rounded border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
+                  />
+                </td>
 
-                  <td />
-                </tr>
-              )}
+                <td />
+              </tr>
             </thead>
             <tbody>
               {isLoading ? (
