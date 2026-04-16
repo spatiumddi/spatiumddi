@@ -11,6 +11,7 @@ celery_app = Celery(
         "app.tasks.ipam",
         "app.tasks.dns",
         "app.tasks.dhcp_health",
+        "app.tasks.dhcp_lease_cleanup",
     ],
 )
 
@@ -34,6 +35,7 @@ celery_app.conf.update(
         "app.tasks.ipam.*": {"queue": "ipam"},
         "app.tasks.dns.*": {"queue": "dns"},
         "app.tasks.dhcp_health.*": {"queue": "dhcp"},
+        "app.tasks.dhcp_lease_cleanup.*": {"queue": "dhcp"},
     },
     beat_schedule={
         # Every 60s, fan-out health checks to every registered DNS server.
@@ -45,6 +47,12 @@ celery_app.conf.update(
         "dhcp-health-sweep": {
             "task": "app.tasks.dhcp_health.check_all_dhcp_servers_health",
             "schedule": schedule(run_every=60.0),
+        },
+        # Every 5 min, sweep DHCP leases whose expires_at has passed the grace
+        # window and remove their mirrored IPAM rows (auto_from_lease=True).
+        "dhcp-lease-cleanup": {
+            "task": "app.tasks.dhcp_lease_cleanup.sweep_expired_leases",
+            "schedule": schedule(run_every=300.0),
         },
     },
 )

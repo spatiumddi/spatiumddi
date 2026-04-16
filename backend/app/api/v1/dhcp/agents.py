@@ -383,7 +383,24 @@ async def agent_lease_events(
     db: DB,
     auth: tuple[DHCPServer, dict[str, Any]] = Depends(_auth_agent),
 ) -> dict[str, int]:
-    """Bulk lease ingestion from the agent. Upsert-by-(server, ip)."""
+    """Bulk lease ingestion from the agent.
+
+    In addition to upserting the DHCPLease row, we mirror live leases into
+    IPAM as ``status='dhcp'`` rows (flagged ``auto_from_lease=True``) so the
+    subnet view shows actively-leased addresses alongside manual ones.
+
+    Policy:
+      - Active lease + no IPAM row → create row with status='dhcp'.
+      - Active lease + existing IPAM row that's 'available' or already
+        auto_from_lease → overwrite hostname/MAC and flip to 'dhcp'.
+      - Active lease + existing row that's manually allocated / static_dhcp
+        / reserved → leave alone (operator owns that row; lease just
+        co-exists in DHCPLease).
+      - Released/expired lease → if the IPAM row is auto_from_lease, remove it.
+    """
+    from app.models.ipam import IPAddress, Subnet
+    from sqlalchemy import func as sa_func
+
     server, _ = auth
     now = datetime.now(UTC)
     upserted = 0
@@ -421,6 +438,48 @@ async def agent_lease_events(
             lease.expires_at = ev.expires_at
             lease.last_seen_at = now
         upserted += 1
+
+        # ── IPAM mirror ────────────────────────────────────────────────────
+        # Find the subnet whose CIDR contains this IP (server-side via PG).
+        subnet_res = await db.execute(
+            select(Subnet).where(Subnet.network.op(">>=")(sa_func.inet(ev.ip_address)))
+        )
+        subnet = subnet_res.scalars().first()
+        if subnet is None:
+            continue  # IP not in any known subnet — can't mirror
+
+        ipam_res = await db.execute(
+            select(IPAddress).where(
+                IPAddress.subnet_id == subnet.id,
+                IPAddress.address == ev.ip_address,
+            )
+        )
+        ipam_row = ipam_res.scalar_one_or_none()
+
+        is_active = ev.state == "active"
+        if is_active:
+            if ipam_row is None:
+                ipam_row = IPAddress(
+                    subnet_id=subnet.id,
+                    address=ev.ip_address,
+                    hostname=(ev.hostname or "")[:253],
+                    mac_address=ev.mac_address,
+                    status="dhcp",
+                    auto_from_lease=True,
+                    dhcp_lease_id=str(lease.id) if lease.id else None,
+                )
+                db.add(ipam_row)
+            elif ipam_row.status in ("available",) or ipam_row.auto_from_lease:
+                ipam_row.hostname = (ev.hostname or ipam_row.hostname or "")[:253]
+                ipam_row.mac_address = ev.mac_address
+                ipam_row.status = "dhcp"
+                ipam_row.auto_from_lease = True
+                ipam_row.dhcp_lease_id = str(lease.id) if lease.id else None
+            # else: manual/static — leave it alone
+        else:  # expired / released / declined
+            if ipam_row is not None and ipam_row.auto_from_lease:
+                await db.delete(ipam_row)
+
     await db.commit()
     return {"upserted": upserted}
 

@@ -10,6 +10,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text as sa_text,
 )
 from sqlalchemy.dialects.postgresql import CIDR, INET, JSONB, MACADDR, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -228,6 +229,13 @@ class IPAddress(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # DHCP linkage: stored as strings (DHCP models don't exist yet).
     dhcp_lease_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     static_assignment_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # True if the row was auto-created from a live DHCP lease (as opposed to
+    # being manually allocated or from a static assignment). When the lease
+    # expires the row is removed automatically; a manually-allocated row
+    # with the same IP wouldn't be.
+    auto_from_lease: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
 
     subnet: Mapped[Subnet] = relationship("Subnet", back_populates="addresses")
 
