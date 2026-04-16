@@ -3638,13 +3638,22 @@ function ZoneTreeRows({
                 )}
               </button>
             ) : (
-              /* Intermediate folder with no zone — click label to create a
-                 zone at this level. Folder icon on the left still toggles
-                 expand/collapse without opening the modal. */
+              /* Intermediate folder with no zone. TLD-level nodes (no dot,
+                 like "org" or "com") just toggle; you never create a zone
+                 literally at the TLD. Deeper folders (e.g. "example.com")
+                 open the Create Zone modal on click. */
               <button
                 className="flex flex-1 items-center gap-1 rounded py-1 pr-2 text-xs font-medium font-mono text-muted-foreground hover:bg-accent hover:text-foreground"
-                onClick={() => setCreateZoneName(node.domain)}
-                title={`Create zone "${node.domain}" here`}
+                onClick={() =>
+                  node.domain.includes(".")
+                    ? setCreateZoneName(node.domain)
+                    : toggleNode(node.domain)
+                }
+                title={
+                  node.domain.includes(".")
+                    ? `Create zone "${node.domain}" here`
+                    : "Expand / collapse"
+                }
               >
                 {node.domain}
               </button>
