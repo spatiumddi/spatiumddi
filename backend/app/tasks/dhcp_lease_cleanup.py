@@ -6,6 +6,7 @@ agents can miss events (container restart, lease_cmds hook drop), so we also
 run a periodic sweep: any lease whose ``expires_at < now - grace`` gets marked
 expired and its IPAM row (if auto_from_lease) removed.
 """
+
 from __future__ import annotations
 
 import asyncio

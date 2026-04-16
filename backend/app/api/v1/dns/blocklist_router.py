@@ -637,9 +637,7 @@ async def update_entry(
                 )
             )
             if dup.scalar_one_or_none():
-                raise HTTPException(
-                    status_code=409, detail="Domain already in this blocklist"
-                )
+                raise HTTPException(status_code=409, detail="Domain already in this blocklist")
         changes["domain"] = domain
     for k, v in changes.items():
         setattr(entry, k, v)

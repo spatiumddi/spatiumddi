@@ -2,7 +2,7 @@
 
 import ipaddress
 import uuid
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Any
 
 import structlog
@@ -2135,9 +2135,7 @@ async def _backfill_reverse_zones(
             resp.skipped += 1
             continue
         pre = await db.execute(
-            select(DNSZone).where(
-                DNSZone.name == expected_name, DNSZone.kind == "reverse"
-            )
+            select(DNSZone).where(DNSZone.name == expected_name, DNSZone.kind == "reverse")
         )
         if pre.scalar_one_or_none() is not None:
             resp.skipped += 1
@@ -2406,9 +2404,7 @@ class AliasResponse(BaseModel):
 
 
 @router.get("/addresses/{address_id}/aliases", response_model=list[AliasResponse])
-async def list_aliases(
-    address_id: uuid.UUID, current_user: CurrentUser, db: DB
-) -> list[DNSRecord]:
+async def list_aliases(address_id: uuid.UUID, current_user: CurrentUser, db: DB) -> list[DNSRecord]:
     ip = await db.get(IPAddress, address_id)
     if ip is None:
         raise HTTPException(status_code=404, detail="IP address not found")
@@ -2505,9 +2501,7 @@ async def delete_alias(
         )
     zone = await db.get(DNSZone, rec.zone_id)
     if zone is not None:
-        await _enqueue_dns_op(
-            db, zone, "delete", rec.name, rec.record_type, rec.value, rec.ttl
-        )
+        await _enqueue_dns_op(db, zone, "delete", rec.name, rec.record_type, rec.value, rec.ttl)
     db.add(
         _audit(
             current_user,

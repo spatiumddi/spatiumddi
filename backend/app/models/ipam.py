@@ -10,6 +10,8 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+)
+from sqlalchemy import (
     text as sa_text,
 )
 from sqlalchemy.dialects.postgresql import CIDR, INET, JSONB, MACADDR, UUID

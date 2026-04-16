@@ -1144,10 +1144,11 @@ function ZoneDetailView({
     onSuccess: () =>
       qc.invalidateQueries({ queryKey: ["dns-records", zone.id] }),
   });
-  const [confirmDeleteRecord, setConfirmDeleteRecord] = useState<DNSRecord | null>(
-    null,
+  const [confirmDeleteRecord, setConfirmDeleteRecord] =
+    useState<DNSRecord | null>(null);
+  const [selectedRecords, setSelectedRecords] = useState<Set<string>>(
+    new Set(),
   );
-  const [selectedRecords, setSelectedRecords] = useState<Set<string>>(new Set());
   const [confirmBulkDelete, setConfirmBulkDelete] = useState(false);
   const bulkDeleteRecords = useMutation({
     mutationFn: async (ids: string[]) => {
@@ -1308,7 +1309,8 @@ function ZoneDetailView({
                         onChange={() => {
                           setSelectedRecords((prev) => {
                             const next = new Set(prev);
-                            if (allSel) manualIds.forEach((id) => next.delete(id));
+                            if (allSel)
+                              manualIds.forEach((id) => next.delete(id));
                             else manualIds.forEach((id) => next.add(id));
                             return next;
                           });
@@ -3005,9 +3007,8 @@ function BlocklistDetail({
     onSuccess: () =>
       qc.invalidateQueries({ queryKey: ["dns-blocklist-exceptions", list.id] }),
   });
-  const [editException, setEditException] = useState<DNSBlockListException | null>(
-    null,
-  );
+  const [editException, setEditException] =
+    useState<DNSBlockListException | null>(null);
   const [editExcDomain, setEditExcDomain] = useState("");
   const [editExcReason, setEditExcReason] = useState("");
   const updateException = useMutation({
@@ -3247,7 +3248,8 @@ function BlocklistDetail({
             <Shield className="h-3.5 w-3.5" /> Allow-list (Exceptions)
           </div>
           <span className="text-xs text-muted-foreground">
-            Domains added here are never blocked, even if they match a blocked entry.
+            Domains added here are never blocked, even if they match a blocked
+            entry.
           </span>
         </div>
         <div className="flex items-center gap-2 border-b p-2">
@@ -3323,10 +3325,7 @@ function BlocklistDetail({
       </div>
 
       {editException && (
-        <Modal
-          title="Edit Exception"
-          onClose={() => setEditException(null)}
-        >
+        <Modal title="Edit Exception" onClose={() => setEditException(null)}>
           <div className="space-y-3">
             <Field label="Domain">
               <input
@@ -3387,7 +3386,11 @@ function BlocklistDetail({
                 checked={editEntryWildcard}
                 onChange={(ev) => setEditEntryWildcard(ev.target.checked)}
               />
-              Block subdomains too (<code className="font-mono text-xs">*.{editDomain || "domain"}</code>)
+              Block subdomains too (
+              <code className="font-mono text-xs">
+                *.{editDomain || "domain"}
+              </code>
+              )
             </label>
             <div className="flex justify-end gap-2">
               <button
@@ -3672,8 +3675,8 @@ function ZoneTreeRows({
           >
             <FileText className="h-3 w-3 flex-shrink-0" />
             <span className="font-mono truncate">
-                  {node.zone.name.replace(/\.$/, "")}
-                </span>
+              {node.zone.name.replace(/\.$/, "")}
+            </span>
             {node.zone.dnssec_enabled && (
               <Shield className="h-2.5 w-2.5 ml-auto flex-shrink-0 text-emerald-500" />
             )}

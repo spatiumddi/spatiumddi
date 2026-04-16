@@ -179,9 +179,7 @@ async def ensure_reverse_zone_for_subnet(
     db.add(
         AuditLog(
             user_id=current_user.id if current_user else None,
-            user_display_name=(
-                current_user.display_name if current_user else "system"
-            ),
+            user_display_name=(current_user.display_name if current_user else "system"),
             auth_source=current_user.auth_source if current_user else "system",
             action="create",
             resource_type="dns_zone",

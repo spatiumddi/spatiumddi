@@ -627,9 +627,12 @@ function BackfillReverseZonesButton({
         >
           <div className="space-y-3">
             <p className="text-sm">
-              Created <span className="font-medium">{result.created.length}</span>{" "}
-              new reverse zone{result.created.length !== 1 ? "s" : ""};{" "}
-              <span className="text-muted-foreground">{result.skipped} skipped</span>{" "}
+              Created{" "}
+              <span className="font-medium">{result.created.length}</span> new
+              reverse zone{result.created.length !== 1 ? "s" : ""};{" "}
+              <span className="text-muted-foreground">
+                {result.skipped} skipped
+              </span>{" "}
               (already existed or no DNS group configured).
             </p>
             {result.created.length > 0 && (
@@ -1605,65 +1608,65 @@ function AddAddressModal({
                 </span>
               )}
             </p>
-              {aliases.map((a, idx) => (
-                <div key={idx} className="flex items-center gap-2">
-                  <select
-                    className={cn(inputCls, "w-24")}
-                    value={a.record_type}
-                    onChange={(e) =>
-                      setAliases((prev) =>
-                        prev.map((x, i) =>
-                          i === idx
-                            ? {
-                                ...x,
-                                record_type: e.target.value as "CNAME" | "A",
-                              }
-                            : x,
-                        ),
-                      )
-                    }
-                  >
-                    <option value="CNAME">CNAME</option>
-                    <option value="A">A</option>
-                  </select>
-                  <input
-                    className={cn(inputCls, "flex-1 min-w-0")}
-                    placeholder="alias (e.g. www, mail)"
-                    value={a.name}
-                    onChange={(e) =>
-                      setAliases((prev) =>
-                        prev.map((x, i) =>
-                          i === idx ? { ...x, name: e.target.value } : x,
-                        ),
-                      )
-                    }
-                  />
-                  <button
-                    type="button"
-                    onClick={() =>
-                      setAliases((prev) => prev.filter((_, i) => i !== idx))
-                    }
-                    className="flex-shrink-0 rounded p-1 text-muted-foreground hover:text-destructive"
-                    title="Remove alias"
-                  >
-                    <X className="h-4 w-4" />
-                  </button>
-                </div>
-              ))}
-              <button
-                type="button"
-                onClick={() =>
-                  setAliases((prev) => [
-                    ...prev,
-                    { name: "", record_type: "CNAME" },
-                  ])
-                }
-                disabled={!hostname || !dnsZoneId}
-                className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent disabled:opacity-40"
-              >
-                <Plus className="h-3 w-3" /> Add alias
-              </button>
-            </div>
+            {aliases.map((a, idx) => (
+              <div key={idx} className="flex items-center gap-2">
+                <select
+                  className={cn(inputCls, "w-24")}
+                  value={a.record_type}
+                  onChange={(e) =>
+                    setAliases((prev) =>
+                      prev.map((x, i) =>
+                        i === idx
+                          ? {
+                              ...x,
+                              record_type: e.target.value as "CNAME" | "A",
+                            }
+                          : x,
+                      ),
+                    )
+                  }
+                >
+                  <option value="CNAME">CNAME</option>
+                  <option value="A">A</option>
+                </select>
+                <input
+                  className={cn(inputCls, "flex-1 min-w-0")}
+                  placeholder="alias (e.g. www, mail)"
+                  value={a.name}
+                  onChange={(e) =>
+                    setAliases((prev) =>
+                      prev.map((x, i) =>
+                        i === idx ? { ...x, name: e.target.value } : x,
+                      ),
+                    )
+                  }
+                />
+                <button
+                  type="button"
+                  onClick={() =>
+                    setAliases((prev) => prev.filter((_, i) => i !== idx))
+                  }
+                  className="flex-shrink-0 rounded p-1 text-muted-foreground hover:text-destructive"
+                  title="Remove alias"
+                >
+                  <X className="h-4 w-4" />
+                </button>
+              </div>
+            ))}
+            <button
+              type="button"
+              onClick={() =>
+                setAliases((prev) => [
+                  ...prev,
+                  { name: "", record_type: "CNAME" },
+                ])
+              }
+              disabled={!hostname || !dnsZoneId}
+              className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent disabled:opacity-40"
+            >
+              <Plus className="h-3 w-3" /> Add alias
+            </button>
+          </div>
         </Field>
         <CustomFieldsSection
           definitions={cfDefs}

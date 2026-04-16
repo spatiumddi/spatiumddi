@@ -398,8 +398,9 @@ async def agent_lease_events(
         co-exists in DHCPLease).
       - Released/expired lease → if the IPAM row is auto_from_lease, remove it.
     """
-    from app.models.ipam import IPAddress, Subnet
     from sqlalchemy import func as sa_func
+
+    from app.models.ipam import IPAddress, Subnet
 
     server, _ = auth
     now = datetime.now(UTC)
