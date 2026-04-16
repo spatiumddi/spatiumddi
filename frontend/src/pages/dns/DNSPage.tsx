@@ -2906,7 +2906,6 @@ function BlocklistDetail({
   const [offset, setOffset] = useState(0);
   const [newDomain, setNewDomain] = useState("");
   const [newReason, setNewReason] = useState("");
-  const [newWildcard, setNewWildcard] = useState(true);
   const [bulkText, setBulkText] = useState("");
   const [showBulk, setShowBulk] = useState(false);
   const [excDomain, setExcDomain] = useState("");
@@ -2927,16 +2926,16 @@ function BlocklistDetail({
   });
 
   const addEntry = useMutation({
+    // is_wildcard defaults to true server-side (Pi-hole semantics); toggle
+    // per-entry via the Subdomains column after adding.
     mutationFn: () =>
       dnsBlocklistApi.addEntry(list.id, {
         domain: newDomain,
         reason: newReason || undefined,
-        is_wildcard: newWildcard,
       }),
     onSuccess: () => {
       setNewDomain("");
       setNewReason("");
-      setNewWildcard(true);
       qc.invalidateQueries({ queryKey: ["dns-blocklist-entries", list.id] });
     },
   });
@@ -3122,14 +3121,6 @@ function BlocklistDetail({
               Bulk add
             </button>
           </div>
-          <label className="flex items-center gap-1.5 text-xs text-muted-foreground cursor-pointer">
-            <input
-              type="checkbox"
-              checked={newWildcard}
-              onChange={(e) => setNewWildcard(e.target.checked)}
-            />
-            Block subdomains too (e.g. <code className="font-mono">*.test.com</code>)
-          </label>
         </div>
         <table className="w-full text-sm">
           <thead>
