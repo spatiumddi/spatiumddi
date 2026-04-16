@@ -2964,6 +2964,13 @@ function BlocklistDetail({
   const [editDomain, setEditDomain] = useState("");
   const [editEntryReason, setEditEntryReason] = useState("");
   const [editEntryWildcard, setEditEntryWildcard] = useState(true);
+  // Inline toggle — fires immediately from the row checkbox, no Save button.
+  const toggleEntryWildcard = useMutation({
+    mutationFn: ({ id, value }: { id: string; value: boolean }) =>
+      dnsBlocklistApi.updateEntry(list.id, id, { is_wildcard: value }),
+    onSuccess: () =>
+      qc.invalidateQueries({ queryKey: ["dns-blocklist-entries", list.id] }),
+  });
   const updateEntry = useMutation({
     mutationFn: () =>
       dnsBlocklistApi.updateEntry(list.id, editEntry!.id, {
@@ -3129,6 +3136,7 @@ function BlocklistDetail({
             <tr className="text-left text-xs text-muted-foreground">
               <th className="px-3 py-1.5">Domain</th>
               <th className="px-3 py-1.5">Type</th>
+              <th className="px-3 py-1.5">Subdomains</th>
               <th className="px-3 py-1.5">Reason</th>
               <th className="px-3 py-1.5">Source</th>
               <th className="px-3 py-1.5 w-8"></th>
@@ -3138,7 +3146,7 @@ function BlocklistDetail({
             {items.length === 0 && (
               <tr>
                 <td
-                  colSpan={5}
+                  colSpan={6}
                   className="px-3 py-4 text-center text-xs text-muted-foreground italic"
                 >
                   No entries
@@ -3147,18 +3155,30 @@ function BlocklistDetail({
             )}
             {items.map((e: DNSBlockListEntry) => (
               <tr key={e.id} className="border-t hover:bg-accent/30">
-                <td className="px-3 py-1 font-mono text-xs">
-                  {e.domain}
-                  {e.is_wildcard && (
-                    <span
-                      className="ml-1.5 inline-flex items-center rounded bg-muted px-1 py-0 text-[10px] font-medium text-muted-foreground"
-                      title="Also blocks all subdomains"
-                    >
-                      +subdomains
-                    </span>
-                  )}
-                </td>
+                <td className="px-3 py-1 font-mono text-xs">{e.domain}</td>
                 <td className="px-3 py-1 text-xs">{e.entry_type}</td>
+                <td className="px-3 py-1">
+                  <input
+                    type="checkbox"
+                    checked={e.is_wildcard}
+                    disabled={
+                      e.source !== "manual" ||
+                      (toggleEntryWildcard.isPending &&
+                        toggleEntryWildcard.variables?.id === e.id)
+                    }
+                    onChange={(ev) =>
+                      toggleEntryWildcard.mutate({
+                        id: e.id,
+                        value: ev.target.checked,
+                      })
+                    }
+                    title={
+                      e.source === "manual"
+                        ? "Also block *.<domain>. Saves immediately."
+                        : "Feed-sourced entries can't be toggled."
+                    }
+                  />
+                </td>
                 <td className="px-3 py-1 text-xs text-muted-foreground">
                   {e.reason || (
                     <span className="text-muted-foreground/40">—</span>
