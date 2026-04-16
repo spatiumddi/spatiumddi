@@ -21,9 +21,9 @@ node_modules/
 frontend/dist/
 frontend/.vite/
 
-# Alembic
-backend/alembic/versions/*.py
-!backend/alembic/versions/.gitkeep
+# Alembic — migrations MUST be tracked (CI needs them for the test DB).
+# Only ignore Alembic's auto-generated __pycache__.
+backend/alembic/versions/__pycache__/
 
 # Editor
 .vscode/

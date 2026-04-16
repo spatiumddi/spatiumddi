@@ -26,7 +26,6 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
 
-
 # ── Server Group / Server ────────────────────────────────────────────────────
 
 
@@ -40,7 +39,7 @@ class DHCPServerGroup(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # mode: load-balancing | hot-standby
     mode: Mapped[str] = mapped_column(String(20), nullable=False, default="hot-standby")
 
-    servers: Mapped[list["DHCPServer"]] = relationship(
+    servers: Mapped[list[DHCPServer]] = relationship(
         "DHCPServer", back_populates="group", cascade="all, delete-orphan"
     )
 
@@ -91,16 +90,16 @@ class DHCPServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         DateTime(timezone=True), nullable=True
     )
 
-    group: Mapped["DHCPServerGroup | None"] = relationship(
+    group: Mapped[DHCPServerGroup | None] = relationship(
         "DHCPServerGroup", back_populates="servers", lazy="joined"
     )
-    scopes: Mapped[list["DHCPScope"]] = relationship(
+    scopes: Mapped[list[DHCPScope]] = relationship(
         "DHCPScope", back_populates="server", cascade="all, delete-orphan"
     )
-    client_classes: Mapped[list["DHCPClientClass"]] = relationship(
+    client_classes: Mapped[list[DHCPClientClass]] = relationship(
         "DHCPClientClass", back_populates="server", cascade="all, delete-orphan"
     )
-    leases: Mapped[list["DHCPLease"]] = relationship(
+    leases: Mapped[list[DHCPLease]] = relationship(
         "DHCPLease", back_populates="server", cascade="all, delete-orphan"
     )
 
@@ -155,14 +154,14 @@ class DHCPScope(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     last_pushed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
-    server: Mapped["DHCPServer"] = relationship("DHCPServer", back_populates="scopes")
-    pools: Mapped[list["DHCPPool"]] = relationship(
+    server: Mapped[DHCPServer] = relationship("DHCPServer", back_populates="scopes")
+    pools: Mapped[list[DHCPPool]] = relationship(
         "DHCPPool",
         back_populates="scope",
         cascade="all, delete-orphan",
         lazy="joined",
     )
-    statics: Mapped[list["DHCPStaticAssignment"]] = relationship(
+    statics: Mapped[list[DHCPStaticAssignment]] = relationship(
         "DHCPStaticAssignment",
         back_populates="scope",
         cascade="all, delete-orphan",
@@ -190,7 +189,7 @@ class DHCPPool(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     lease_time_override: Mapped[int | None] = mapped_column(Integer, nullable=True)
     options_override: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
-    scope: Mapped["DHCPScope"] = relationship("DHCPScope", back_populates="pools")
+    scope: Mapped[DHCPScope] = relationship("DHCPScope", back_populates="pools")
 
 
 class DHCPStaticAssignment(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -229,7 +228,7 @@ class DHCPStaticAssignment(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         nullable=True,
     )
 
-    scope: Mapped["DHCPScope"] = relationship("DHCPScope", back_populates="statics")
+    scope: Mapped[DHCPScope] = relationship("DHCPScope", back_populates="statics")
 
 
 class DHCPClientClass(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -251,7 +250,7 @@ class DHCPClientClass(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     description: Mapped[str] = mapped_column(Text, nullable=False, default="")
     options: Mapped[dict] = mapped_column(JSONB, nullable=False, default=lambda: {})
 
-    server: Mapped["DHCPServer"] = relationship("DHCPServer", back_populates="client_classes")
+    server: Mapped[DHCPServer] = relationship("DHCPServer", back_populates="client_classes")
 
 
 # ── Leases ──────────────────────────────────────────────────────────────────
@@ -293,7 +292,7 @@ class DHCPLease(UUIDPrimaryKeyMixin, Base):
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
 
-    server: Mapped["DHCPServer"] = relationship("DHCPServer", back_populates="leases")
+    server: Mapped[DHCPServer] = relationship("DHCPServer", back_populates="leases")
 
 
 # ── Agent op queue ──────────────────────────────────────────────────────────

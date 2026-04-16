@@ -86,6 +86,7 @@ export function Btns({
 
 export type ApiError = { response?: { data?: { detail?: unknown } } };
 
+// eslint-disable-next-line react-refresh/only-export-components
 export function errMsg(e: unknown, fallback = "Request failed"): string {
   const ae = e as ApiError;
   const d = ae?.response?.data?.detail;
