@@ -437,7 +437,8 @@ function ServerScopesTab({ server }: { server: DHCPServer }) {
             No scopes on this server.
           </p>
         ) : (
-          <table className="w-full text-sm">
+          <div className="overflow-x-auto">
+          <table className="w-full min-w-[720px] text-sm">
             <thead>
               <tr className="border-b bg-muted/30 text-xs">
                 <th className="px-3 py-2 text-left font-medium">Subnet</th>
@@ -478,6 +479,7 @@ function ServerScopesTab({ server }: { server: DHCPServer }) {
               ))}
             </tbody>
           </table>
+          </div>
         )}
       </div>
 
@@ -551,7 +553,8 @@ function ServerPoolsOrStaticsTab({
           No {kind === "pools" ? "pools" : "static assignments"} yet.
         </p>
       ) : kind === "pools" ? (
-        <table className="w-full text-sm">
+        <div className="overflow-x-auto">
+        <table className="w-full min-w-[640px] text-sm">
           <thead>
             <tr className="border-b bg-muted/30 text-xs">
               <th className="px-3 py-2 text-left font-medium">Scope</th>
@@ -580,8 +583,10 @@ function ServerPoolsOrStaticsTab({
             })}
           </tbody>
         </table>
+        </div>
       ) : (
-        <table className="w-full text-sm">
+        <div className="overflow-x-auto">
+        <table className="w-full min-w-[640px] text-sm">
           <thead>
             <tr className="border-b bg-muted/30 text-xs">
               <th className="px-3 py-2 text-left font-medium">Scope</th>
@@ -608,6 +613,7 @@ function ServerPoolsOrStaticsTab({
             })}
           </tbody>
         </table>
+        </div>
       )}
     </div>
   );
@@ -648,7 +654,8 @@ function ClientClassesTab({ server }: { server: DHCPServer }) {
             No client classes defined.
           </p>
         ) : (
-          <table className="w-full text-sm">
+          <div className="overflow-x-auto">
+          <table className="w-full min-w-[640px] text-sm">
             <thead>
               <tr className="border-b bg-muted/30 text-xs">
                 <th className="px-3 py-2 text-left font-medium">Name</th>
@@ -685,6 +692,7 @@ function ClientClassesTab({ server }: { server: DHCPServer }) {
               ))}
             </tbody>
           </table>
+          </div>
         )}
       </div>
 

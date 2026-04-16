@@ -93,8 +93,8 @@ export function ImportModal({
   }
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
-      <div className="flex max-h-[90vh] w-[760px] flex-col rounded-lg bg-background shadow-xl">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-2 sm:p-4">
+      <div className="flex max-h-[90vh] w-full max-w-[95vw] sm:max-w-[760px] flex-col rounded-lg bg-background shadow-xl">
         <div className="flex items-center justify-between border-b p-4">
           <h2 className="flex items-center gap-2 text-base font-semibold">
             <Upload className="h-4 w-4" /> Import IPAM data

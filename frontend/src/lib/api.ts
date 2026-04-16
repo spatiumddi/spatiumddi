@@ -268,6 +268,14 @@ export interface EffectiveFields {
   custom_field_sources: Record<string, string>;
 }
 
+export interface BlockEffectiveFields {
+  block_id: string;
+  tags: Record<string, unknown>;
+  custom_fields: Record<string, unknown>;
+  tag_sources: Record<string, string>;
+  custom_field_sources: Record<string, string>;
+}
+
 export interface SubnetBulkEditChanges {
   name?: string;
   description?: string;
@@ -556,6 +564,10 @@ export const ipamApi = {
   effectiveFields: (subnetId: string) =>
     api
       .get<EffectiveFields>(`/ipam/subnets/${subnetId}/effective-fields`)
+      .then((r) => r.data),
+  effectiveBlockFields: (blockId: string) =>
+    api
+      .get<BlockEffectiveFields>(`/ipam/blocks/${blockId}/effective-fields`)
       .then((r) => r.data),
 
   // Bulk edit multiple subnets in one transaction (§11)
@@ -1450,6 +1462,8 @@ export interface DHCPScope {
   ddns_hostname_policy: string | null;
   ddns_domain_override: string | null;
   hostname_sync_mode: string;
+  // "ipv4" → Kea Dhcp4; "ipv6" → Kea Dhcp6. Inferred from subnet CIDR.
+  address_family?: "ipv4" | "ipv6";
   options: DHCPOption[];
   created_at: string;
   modified_at: string;

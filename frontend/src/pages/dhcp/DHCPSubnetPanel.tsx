@@ -163,7 +163,8 @@ function ScopeCard({ scope }: { scope: DHCPScope }) {
           </button>
         </div>
         {showPools && pools.length > 0 && (
-          <table className="w-full">
+          <div className="overflow-x-auto">
+          <table className="w-full min-w-[560px]">
             <thead>
               <tr className="border-b bg-muted/20 text-xs">
                 <th className="px-3 py-1.5 text-left font-medium">Name</th>
@@ -179,6 +180,7 @@ function ScopeCard({ scope }: { scope: DHCPScope }) {
               ))}
             </tbody>
           </table>
+          </div>
         )}
       </div>
 

@@ -118,19 +118,53 @@ class KeaDriver(DHCPDriver):
     name = "kea"
 
     def render_config(self, bundle: ConfigBundle) -> str:
-        dhcp4: dict[str, Any] = {
-            "valid-lifetime": bundle.options.lease_time,
-            "interfaces-config": {"interfaces": ["*"]},
-            "lease-database": {
-                "type": "memfile",
-                "persist": True,
-                "name": "/var/lib/kea/kea-leases4.csv",
-            },
-            "subnet4": [_render_scope(s) for s in bundle.scopes if s.is_active],
-            "client-classes": [_render_client_class(c) for c in bundle.client_classes],
-            "option-data": _render_option_data(bundle.options.options),
-        }
-        return json.dumps({"Dhcp4": dhcp4}, indent=2, sort_keys=True)
+        # Split scopes by address family. The Kea daemons Dhcp4 and Dhcp6
+        # are separate processes; the agent runs whichever process(es) it
+        # has scopes for. We emit both top-level blocks so the agent can
+        # consume a single bundle regardless of family mix.
+        v4_scopes = [
+            s for s in bundle.scopes if s.is_active and s.address_family != "ipv6"
+        ]
+        v6_scopes = [
+            s for s in bundle.scopes if s.is_active and s.address_family == "ipv6"
+        ]
+
+        out: dict[str, Any] = {}
+        if v4_scopes or not v6_scopes:
+            out["Dhcp4"] = {
+                "valid-lifetime": bundle.options.lease_time,
+                "interfaces-config": {"interfaces": ["*"]},
+                "lease-database": {
+                    "type": "memfile",
+                    "persist": True,
+                    "name": "/var/lib/kea/kea-leases4.csv",
+                },
+                "subnet4": [_render_scope(s) for s in v4_scopes],
+                "client-classes": [
+                    _render_client_class(c) for c in bundle.client_classes
+                ],
+                "option-data": _render_option_data(bundle.options.options),
+            }
+        if v6_scopes:
+            out["Dhcp6"] = {
+                "valid-lifetime": bundle.options.lease_time,
+                "interfaces-config": {"interfaces": ["*"]},
+                "lease-database": {
+                    "type": "memfile",
+                    "persist": True,
+                    "name": "/var/lib/kea/kea-leases6.csv",
+                },
+                # Kea names the subnet list "subnet6" in Dhcp6 mode.
+                "subnet6": [_render_scope(s) for s in v6_scopes],
+                # Kea Dhcp6 uses different option names; for the common cases
+                # (dns-servers → dns6-servers) the agent / operator will
+                # translate at config-apply time. We pass a best-effort list
+                # through here — the driver will grow a Dhcp6-specific option
+                # map once DHCPv6-specific fields (e.g. preferred-lifetime)
+                # are added. TODO(wave-D.4): Dhcp6 option-name translation.
+                "option-data": _render_option_data(bundle.options.options),
+            }
+        return json.dumps(out, indent=2, sort_keys=True)
 
     async def apply_config(self, server: Any, bundle: ConfigBundle) -> None:
         logger.info(

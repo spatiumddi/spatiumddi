@@ -77,9 +77,9 @@ function Modal({
   wide?: boolean;
 }) {
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-2 sm:p-4">
       <div
-        className={`w-full ${wide ? "max-w-2xl" : "max-w-md"} rounded-lg border bg-card p-6 shadow-lg max-h-[90vh] overflow-y-auto`}
+        className={`w-full max-w-[95vw] ${wide ? "sm:max-w-2xl" : "sm:max-w-md"} rounded-lg border bg-card p-4 sm:p-6 shadow-lg max-h-[90vh] overflow-y-auto`}
       >
         <div className="mb-4 flex items-center justify-between">
           <h2 className="text-base font-semibold">{title}</h2>
@@ -1290,7 +1290,8 @@ function ZoneDetailView({
           </div>
         )}
         {(filtered.length > 0 || showRecFilters) && (
-          <table className="w-full text-sm">
+          <div className="overflow-x-auto">
+          <table className="w-full min-w-[720px] text-sm">
             <thead className="sticky top-0 bg-card">
               <tr className="border-b text-xs text-muted-foreground">
                 <th className="w-8 py-2 pl-3">
@@ -1510,6 +1511,7 @@ function ZoneDetailView({
               ))}
             </tbody>
           </table>
+          </div>
         )}
       </div>
 
@@ -3129,7 +3131,8 @@ function BlocklistDetail({
             </button>
           </div>
         </div>
-        <table className="w-full text-sm">
+        <div className="overflow-x-auto">
+        <table className="w-full min-w-[720px] text-sm">
           <thead>
             <tr className="text-left text-xs text-muted-foreground">
               <th className="px-3 py-1.5">Domain</th>
@@ -3216,6 +3219,7 @@ function BlocklistDetail({
             ))}
           </tbody>
         </table>
+        </div>
         {total > limit && (
           <div className="flex items-center justify-between border-t px-3 py-1.5 text-xs">
             <span className="text-muted-foreground">
@@ -3273,7 +3277,8 @@ function BlocklistDetail({
             Add
           </button>
         </div>
-        <table className="w-full text-sm">
+        <div className="overflow-x-auto">
+        <table className="w-full min-w-[480px] text-sm">
           <thead>
             <tr className="text-left text-xs text-muted-foreground">
               <th className="px-3 py-1.5">Domain</th>
@@ -3322,6 +3327,7 @@ function BlocklistDetail({
             ))}
           </tbody>
         </table>
+        </div>
       </div>
 
       {editException && (

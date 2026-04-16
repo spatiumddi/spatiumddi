@@ -165,10 +165,26 @@ function CustomFieldsSection({
   definitions,
   values,
   onChange,
+  inherited,
+  inheritedLabels,
 }: {
   definitions: CustomField[];
   values: Record<string, unknown>;
   onChange: (key: string, value: unknown) => void;
+  /**
+   * Optional effective-field values inherited from ancestors (block/space).
+   * When a key is present here but missing (or empty) from ``values``, the
+   * field is rendered with the inherited value as a placeholder plus an
+   * "inherited from …" badge. Typing replaces the inherited value; clearing
+   * the input reveals the placeholder again.
+   */
+  inherited?: Record<string, unknown>;
+  /**
+   * Optional human-friendly label per inherited key (e.g. "block Corp" /
+   * "IP Space Corporate"). Keyed by the custom-field name. Missing entries
+   * fall back to a generic "inherited".
+   */
+  inheritedLabels?: Record<string, string>;
 }) {
   if (definitions.length === 0) return null;
   return (
@@ -179,16 +195,47 @@ function CustomFieldsSection({
         </p>
         <div className="space-y-3">
           {definitions.map((def) => {
-            const val = values[def.name] ?? def.default_value ?? "";
+            const rawLocal = values[def.name];
+            const localUnset =
+              rawLocal === undefined || rawLocal === null || rawLocal === "";
+            const inheritedVal = inherited?.[def.name];
+            const hasInherited =
+              inheritedVal !== undefined &&
+              inheritedVal !== null &&
+              inheritedVal !== "";
+            const effectivePlaceholder =
+              localUnset && hasInherited
+                ? String(inheritedVal)
+                : def.is_required
+                  ? "Required"
+                  : "Optional";
+            // Displayed value: local if set, else empty (so the inherited
+            // value shows through the HTML placeholder). We never pre-fill
+            // the input with the inherited value — that would flip it from
+            // "inherited" to "locally set" the moment the user saves.
+            const val = rawLocal ?? def.default_value ?? "";
+            const inheritedBadge =
+              localUnset && hasInherited ? (
+                <span className="inline-flex items-center rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
+                  inherited from {inheritedLabels?.[def.name] ?? "ancestor"}
+                </span>
+              ) : null;
             return (
               <Field
                 key={def.name}
                 label={`${def.label}${def.is_required ? " *" : ""}`}
               >
-                {def.description && (
-                  <p className="mb-1 text-xs text-muted-foreground">
-                    {def.description}
-                  </p>
+                {(def.description || inheritedBadge) && (
+                  <div className="mb-1 flex items-center justify-between gap-2">
+                    {def.description ? (
+                      <p className="text-xs text-muted-foreground">
+                        {def.description}
+                      </p>
+                    ) : (
+                      <span />
+                    )}
+                    {inheritedBadge}
+                  </div>
                 )}
                 {def.field_type === "boolean" ? (
                   <input
@@ -203,7 +250,13 @@ function CustomFieldsSection({
                     value={String(val)}
                     onChange={(e) => onChange(def.name, e.target.value)}
                   >
-                    {!def.is_required && <option value="">— None —</option>}
+                    {!def.is_required && (
+                      <option value="">
+                        {localUnset && hasInherited
+                          ? `— inherited: ${String(inheritedVal)} —`
+                          : "— None —"}
+                      </option>
+                    )}
                     {def.options.map((opt) => (
                       <option key={opt} value={opt}>
                         {opt}
@@ -224,7 +277,7 @@ function CustomFieldsSection({
                     }
                     value={String(val)}
                     onChange={(e) => onChange(def.name, e.target.value)}
-                    placeholder={def.is_required ? "Required" : "Optional"}
+                    placeholder={effectivePlaceholder}
                   />
                 )}
               </Field>
@@ -250,9 +303,14 @@ function Modal({
   wide?: boolean;
 }) {
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-2 sm:p-4">
       <div
-        className={`w-full ${wide ? "max-w-2xl" : "max-w-md"} rounded-lg border bg-card p-6 shadow-lg max-h-[90vh] overflow-y-auto`}
+        className={cn(
+          "w-full rounded-lg border bg-card p-4 sm:p-6 shadow-lg max-h-[90vh] overflow-y-auto",
+          // Desktop caps, but always fit in the viewport on mobile.
+          wide ? "sm:max-w-2xl" : "sm:max-w-md",
+          "max-w-[95vw]",
+        )}
       >
         <div className="mb-4 flex items-center justify-between">
           <h2 className="text-base font-semibold">{title}</h2>
@@ -2231,7 +2289,8 @@ function SubnetDetail({
             </div>
           ) : (
             <>
-              <table className="w-full text-sm">
+              <div className="overflow-x-auto">
+              <table className="w-full min-w-[640px] text-sm">
                 <thead>
                   <tr className="border-b bg-muted/40 text-xs">
                     <th className="w-8 px-2 py-2">
@@ -2649,6 +2708,7 @@ function SubnetDetail({
                   })}
                 </tbody>
               </table>
+              </div>
             </>
           )}
         </div>
@@ -2855,8 +2915,8 @@ function DnsSyncModal({
   }
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
-      <div className="w-full max-w-3xl rounded-lg border bg-card shadow-lg flex flex-col max-h-[85vh]">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-2 sm:p-4">
+      <div className="w-full max-w-[95vw] sm:max-w-3xl rounded-lg border bg-card shadow-lg flex flex-col max-h-[85vh]">
         <div className="flex items-center justify-between border-b px-5 py-3">
           <div>
             <h2 className="text-base font-semibold">
@@ -3375,6 +3435,55 @@ function EditSubnetModal({
     queryFn: () => customFieldsApi.list("subnet"),
   });
 
+  // Effective (inherited) tags + custom_fields from the Block/Space ancestor
+  // chain — used to render inherited values as placeholders on any local
+  // fields the subnet hasn't overridden.
+  const { data: effectiveFields } = useQuery({
+    queryKey: ["effective-fields", subnet.id],
+    queryFn: () => ipamApi.effectiveFields(subnet.id),
+    staleTime: 30_000,
+  });
+  const { data: allSpaces = [] } = useQuery({
+    queryKey: ["spaces"],
+    queryFn: ipamApi.listSpaces,
+    staleTime: 60_000,
+  });
+  const { data: allBlocksForLabels = [] } = useQuery({
+    queryKey: ["blocks"],
+    queryFn: () => ipamApi.listBlocks(),
+    staleTime: 60_000,
+  });
+  // Build human labels for each inherited custom-field key. Only include
+  // keys whose source is NOT the subnet itself — those are the ones we want
+  // to surface as inherited placeholders.
+  const cfInheritedLabels: Record<string, string> = {};
+  const cfInheritedValues: Record<string, unknown> = {};
+  if (effectiveFields) {
+    for (const [key, src] of Object.entries(
+      effectiveFields.custom_field_sources,
+    )) {
+      if (src === "subnet") continue;
+      cfInheritedValues[key] = effectiveFields.custom_fields[key];
+      if (src.startsWith("block:")) {
+        const bid = src.slice("block:".length);
+        const b = allBlocksForLabels.find((x) => x.id === bid);
+        cfInheritedLabels[key] = b?.name
+          ? `block ${b.name}`
+          : b?.network
+            ? `block ${b.network}`
+            : "parent block";
+      } else if (src.startsWith("space:")) {
+        const sid = src.slice("space:".length);
+        const s = allSpaces.find((x) => x.id === sid);
+        cfInheritedLabels[key] = s?.name
+          ? `IP Space ${s.name}`
+          : "IP Space";
+      } else {
+        cfInheritedLabels[key] = src;
+      }
+    }
+  }
+
   const mutation = useMutation({
     mutationFn: () => {
       const manageAuto =
@@ -3574,6 +3683,8 @@ function EditSubnetModal({
           definitions={cfDefs}
           values={customFields}
           onChange={(k, v) => setCustomFields((prev) => ({ ...prev, [k]: v }))}
+          inherited={cfInheritedValues}
+          inheritedLabels={cfInheritedLabels}
         />
         <div className="border-t pt-3">
           <DnsSettingsSection
@@ -3968,7 +4079,8 @@ function AliasesSubnetPanel({ subnetId }: { subnetId: string }) {
   }
 
   return (
-    <table className="w-full text-sm">
+    <div className="overflow-x-auto">
+    <table className="w-full min-w-[640px] text-sm">
       <thead>
         <tr className="border-b bg-muted/40 text-xs">
           <th className="px-4 py-2 text-left font-medium">Alias</th>
@@ -4013,6 +4125,7 @@ function AliasesSubnetPanel({ subnetId }: { subnetId: string }) {
         ))}
       </tbody>
     </table>
+    </div>
   );
 }
 
@@ -4034,8 +4147,15 @@ function BulkEditAddressesModal({
   const [status, setStatus] = useState<string>("allocated");
   const [editDescription, setEditDescription] = useState(false);
   const [description, setDescription] = useState("");
-  const [tagRows, setTagRows] = useState<{ k: string; v: string }[]>([]);
+  const [editTags, setEditTags] = useState(false);
+  const [replaceAllTags, setReplaceAllTags] = useState(false);
+  // Each row: k = key, v = value, remove = true means delete that key on all IPs.
+  const [tagRows, setTagRows] = useState<
+    { k: string; v: string; remove: boolean }[]
+  >([]);
   const [customFields, setCustomFields] = useState<Record<string, unknown>>({});
+  // Per-custom-field opt-in: only keys set here are sent in the merge payload.
+  const [cfOptIn, setCfOptIn] = useState<Record<string, boolean>>({});
   const [editCustomFields, setEditCustomFields] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -4043,6 +4163,20 @@ function BulkEditAddressesModal({
     queryKey: ["custom-fields", "ip_address"],
     queryFn: () => customFieldsApi.list("ip_address"),
   });
+
+  // Needed for "replace all tags" mode: we need the union of existing keys
+  // across the selected IPs so we can null them out server-side.
+  const { data: subnetAddresses = [] } = useQuery({
+    queryKey: ["addresses", subnetId],
+    queryFn: () => ipamApi.listAddresses(subnetId),
+  });
+  const selectedIpSet = new Set(ipIds);
+  const existingTagKeys = new Set<string>();
+  for (const ip of subnetAddresses) {
+    if (!selectedIpSet.has(ip.id)) continue;
+    const t = (ip.tags as Record<string, unknown> | null) ?? {};
+    for (const k of Object.keys(t)) existingTagKeys.add(k);
+  }
 
   const mutation = useMutation({
     mutationFn: () => {
@@ -4054,15 +4188,41 @@ function BulkEditAddressesModal({
       } = {};
       if (editStatus) changes.status = status;
       if (editDescription) changes.description = description;
-      const tagsObj: Record<string, unknown> = {};
-      for (const row of tagRows) {
-        const k = row.k.trim();
-        if (!k) continue;
-        tagsObj[k] = row.v;
+
+      if (editTags) {
+        const tagsObj: Record<string, unknown> = {};
+        const keptKeys = new Set<string>();
+        for (const row of tagRows) {
+          const k = row.k.trim();
+          if (!k) continue;
+          if (row.remove) {
+            tagsObj[k] = null;
+          } else {
+            tagsObj[k] = row.v;
+            keptKeys.add(k);
+          }
+        }
+        if (replaceAllTags) {
+          // Null-out every pre-existing key the user didn't explicitly keep —
+          // turns the default "merge" semantic into "replace" via the
+          // backend's null-removes rule, without needing a new backend flag.
+          for (const k of existingTagKeys) {
+            if (!keptKeys.has(k)) tagsObj[k] = null;
+          }
+        }
+        if (Object.keys(tagsObj).length > 0) changes.tags = tagsObj;
       }
-      if (Object.keys(tagsObj).length > 0) changes.tags = tagsObj;
-      if (editCustomFields && Object.keys(customFields).length > 0) {
-        changes.custom_fields = customFields;
+
+      if (editCustomFields) {
+        const cfObj: Record<string, unknown> = {};
+        for (const [key, optedIn] of Object.entries(cfOptIn)) {
+          if (!optedIn) continue;
+          const v = customFields[key];
+          // Treat explicitly empty as a removal (null). Without this the
+          // backend would store "" and the field would still look "set".
+          cfObj[key] = v === "" || v === undefined ? null : v;
+        }
+        if (Object.keys(cfObj).length > 0) changes.custom_fields = cfObj;
       }
       return ipamApi.bulkEditAddresses({ ip_ids: ipIds, changes });
     },
@@ -4086,19 +4246,23 @@ function BulkEditAddressesModal({
     },
   });
 
+  const hasTagChanges =
+    editTags &&
+    (tagRows.some((r) => r.k.trim() !== "") ||
+      (replaceAllTags && existingTagKeys.size > 0));
+  const hasCfChanges =
+    editCustomFields && Object.values(cfOptIn).some(Boolean);
   const hasChanges =
-    editStatus ||
-    editDescription ||
-    tagRows.some((r) => r.k.trim() !== "") ||
-    (editCustomFields && Object.keys(customFields).length > 0);
+    editStatus || editDescription || hasTagChanges || hasCfChanges;
 
   return (
     <Modal title={`Bulk edit ${ipIds.length} IP addresses`} onClose={onClose}>
       <div className="space-y-3">
         <p className="text-xs text-muted-foreground">
-          Only fields you tick will be applied. Tags and custom fields are
-          merged into existing values — set a tag value to empty to keep
-          existing, or remove the row.
+          Only fields you tick will be touched. Tags and custom fields are
+          merged by default — enable <em>Replace all tags</em> to overwrite
+          everything, or mark a tag row as <em>remove</em> to delete just that
+          key.
         </p>
 
         <div className="rounded-md border p-3 space-y-2">
@@ -4151,54 +4315,108 @@ function BulkEditAddressesModal({
         </div>
 
         <div className="rounded-md border p-3 space-y-2">
-          <p className="text-sm font-medium">Tags (merge)</p>
-          <p className="text-[11px] text-muted-foreground -mt-1">
-            Each row is a key/value pair that will be set on every selected IP.
-            Leave value empty to delete that key.
-          </p>
-          {tagRows.map((row, i) => (
-            <div key={i} className="flex items-center gap-2">
-              <input
-                className={cn(inputCls, "flex-1")}
-                value={row.k}
-                onChange={(e) =>
-                  setTagRows((p) =>
-                    p.map((r, j) =>
-                      i === j ? { ...r, k: e.target.value } : r,
-                    ),
-                  )
-                }
-                placeholder="key"
-              />
-              <input
-                className={cn(inputCls, "flex-1")}
-                value={row.v}
-                onChange={(e) =>
-                  setTagRows((p) =>
-                    p.map((r, j) =>
-                      i === j ? { ...r, v: e.target.value } : r,
-                    ),
-                  )
-                }
-                placeholder="value (empty = remove)"
-              />
+          <label className="flex items-center gap-2 text-sm font-medium">
+            <input
+              type="checkbox"
+              checked={editTags}
+              onChange={(e) => setEditTags(e.target.checked)}
+            />
+            Tags
+          </label>
+          {editTags && (
+            <>
+              <label className="flex items-center gap-2 text-xs text-muted-foreground">
+                <input
+                  type="checkbox"
+                  checked={replaceAllTags}
+                  onChange={(e) => setReplaceAllTags(e.target.checked)}
+                />
+                Replace all tags (clear existing keys that aren't listed below)
+              </label>
+              <p className="text-[11px] text-muted-foreground">
+                {replaceAllTags ? (
+                  <>
+                    Selected IPs currently have {existingTagKeys.size} distinct
+                    tag keys — any key not listed below will be removed.
+                  </>
+                ) : (
+                  <>
+                    Each row adds or updates one key on every selected IP.
+                    Toggle <em>remove</em> to delete that key instead.
+                  </>
+                )}
+              </p>
+              {tagRows.map((row, i) => (
+                <div key={i} className="flex items-center gap-2">
+                  <input
+                    className={cn(inputCls, "flex-1")}
+                    value={row.k}
+                    onChange={(e) =>
+                      setTagRows((p) =>
+                        p.map((r, j) =>
+                          i === j ? { ...r, k: e.target.value } : r,
+                        ),
+                      )
+                    }
+                    placeholder="key"
+                  />
+                  <input
+                    className={cn(
+                      inputCls,
+                      "flex-1",
+                      row.remove && "opacity-40",
+                    )}
+                    value={row.v}
+                    disabled={row.remove}
+                    onChange={(e) =>
+                      setTagRows((p) =>
+                        p.map((r, j) =>
+                          i === j ? { ...r, v: e.target.value } : r,
+                        ),
+                      )
+                    }
+                    placeholder={row.remove ? "(will remove key)" : "value"}
+                  />
+                  <label
+                    className="flex flex-shrink-0 items-center gap-1 text-[11px] text-muted-foreground"
+                    title="If checked, this key is removed from all selected IPs."
+                  >
+                    <input
+                      type="checkbox"
+                      checked={row.remove}
+                      onChange={(e) =>
+                        setTagRows((p) =>
+                          p.map((r, j) =>
+                            i === j ? { ...r, remove: e.target.checked } : r,
+                          ),
+                        )
+                      }
+                    />
+                    remove
+                  </label>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setTagRows((p) => p.filter((_, j) => j !== i))
+                    }
+                    className="rounded p-1 text-muted-foreground hover:text-destructive"
+                    title="Discard row"
+                  >
+                    <X className="h-3.5 w-3.5" />
+                  </button>
+                </div>
+              ))}
               <button
                 type="button"
-                onClick={() => setTagRows((p) => p.filter((_, j) => j !== i))}
-                className="rounded p-1 text-muted-foreground hover:text-destructive"
-                title="Remove row"
+                onClick={() =>
+                  setTagRows((p) => [...p, { k: "", v: "", remove: false }])
+                }
+                className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent"
               >
-                <X className="h-3.5 w-3.5" />
+                <Plus className="h-3 w-3" /> Add tag
               </button>
-            </div>
-          ))}
-          <button
-            type="button"
-            onClick={() => setTagRows((p) => [...p, { k: "", v: "" }])}
-            className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent"
-          >
-            <Plus className="h-3 w-3" /> Add tag
-          </button>
+            </>
+          )}
         </div>
 
         {cfDefs.length > 0 && (
@@ -4212,13 +4430,97 @@ function BulkEditAddressesModal({
               Custom fields (merge)
             </label>
             {editCustomFields && (
-              <CustomFieldsSection
-                definitions={cfDefs}
-                values={customFields}
-                onChange={(k, v) =>
-                  setCustomFields((prev) => ({ ...prev, [k]: v }))
-                }
-              />
+              <>
+                <p className="text-[11px] text-muted-foreground -mt-1">
+                  Tick the box next to each field you want to change — only
+                  ticked fields are written to selected IPs. Leaving a ticked
+                  field empty clears it on every selected IP.
+                </p>
+                <div className="space-y-3">
+                  {cfDefs.map((def) => {
+                    const checked = !!cfOptIn[def.name];
+                    const val = customFields[def.name] ?? "";
+                    return (
+                      <div key={def.name} className="space-y-1">
+                        <label className="flex items-center gap-2 text-xs font-medium">
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            onChange={(e) =>
+                              setCfOptIn((prev) => ({
+                                ...prev,
+                                [def.name]: e.target.checked,
+                              }))
+                            }
+                          />
+                          {def.label}
+                        </label>
+                        {checked && (
+                          <div className="pl-5">
+                            {def.description && (
+                              <p className="mb-1 text-xs text-muted-foreground">
+                                {def.description}
+                              </p>
+                            )}
+                            {def.field_type === "boolean" ? (
+                              <input
+                                type="checkbox"
+                                className="rounded"
+                                checked={!!val}
+                                onChange={(e) =>
+                                  setCustomFields((prev) => ({
+                                    ...prev,
+                                    [def.name]: e.target.checked,
+                                  }))
+                                }
+                              />
+                            ) : def.field_type === "select" && def.options ? (
+                              <select
+                                className={inputCls}
+                                value={String(val)}
+                                onChange={(e) =>
+                                  setCustomFields((prev) => ({
+                                    ...prev,
+                                    [def.name]: e.target.value,
+                                  }))
+                                }
+                              >
+                                <option value="">— Clear value —</option>
+                                {def.options.map((opt) => (
+                                  <option key={opt} value={opt}>
+                                    {opt}
+                                  </option>
+                                ))}
+                              </select>
+                            ) : (
+                              <input
+                                className={inputCls}
+                                type={
+                                  def.field_type === "number"
+                                    ? "number"
+                                    : def.field_type === "email"
+                                      ? "email"
+                                      : def.field_type === "url"
+                                        ? "url"
+                                        : "text"
+                                }
+                                value={String(val)}
+                                onChange={(e) =>
+                                  setCustomFields((prev) => ({
+                                    ...prev,
+                                    [def.name]: e.target.value,
+                                  }))
+                                }
+                                placeholder="(empty clears field)"
+                              />
+                            )}
+                          </div>
+                        )}
+                      </div>
+                    );
+                  })}
+                </div>
+              </>
             )}
           </div>
         )}
@@ -4984,6 +5286,52 @@ function EditBlockModal({
     queryFn: () => customFieldsApi.list("ip_block"),
   });
 
+  // Effective (inherited) custom_fields from parent block(s) + space.
+  const { data: effectiveFields } = useQuery({
+    queryKey: ["block-effective-fields", block.id],
+    queryFn: () => ipamApi.effectiveBlockFields(block.id),
+    staleTime: 30_000,
+  });
+  const { data: allSpaces = [] } = useQuery({
+    queryKey: ["spaces"],
+    queryFn: ipamApi.listSpaces,
+    staleTime: 60_000,
+  });
+  const { data: allBlocksForLabels = [] } = useQuery({
+    queryKey: ["blocks"],
+    queryFn: () => ipamApi.listBlocks(),
+    staleTime: 60_000,
+  });
+  const cfInheritedLabels: Record<string, string> = {};
+  const cfInheritedValues: Record<string, unknown> = {};
+  if (effectiveFields) {
+    for (const [key, src] of Object.entries(
+      effectiveFields.custom_field_sources,
+    )) {
+      // The endpoint includes the block itself in the chain; skip those —
+      // we only want ancestor-sourced values to surface as placeholders.
+      if (src === `block:${block.id}`) continue;
+      cfInheritedValues[key] = effectiveFields.custom_fields[key];
+      if (src.startsWith("block:")) {
+        const bid = src.slice("block:".length);
+        const b = allBlocksForLabels.find((x) => x.id === bid);
+        cfInheritedLabels[key] = b?.name
+          ? `block ${b.name}`
+          : b?.network
+            ? `block ${b.network}`
+            : "parent block";
+      } else if (src.startsWith("space:")) {
+        const sid = src.slice("space:".length);
+        const s = allSpaces.find((x) => x.id === sid);
+        cfInheritedLabels[key] = s?.name
+          ? `IP Space ${s.name}`
+          : "IP Space";
+      } else {
+        cfInheritedLabels[key] = src;
+      }
+    }
+  }
+
   const mutation = useMutation({
     mutationFn: () =>
       ipamApi.updateBlock(block.id, {
@@ -5121,6 +5469,8 @@ function EditBlockModal({
           definitions={cfDefs}
           values={customFields}
           onChange={(k, v) => setCustomFields((prev) => ({ ...prev, [k]: v }))}
+          inherited={cfInheritedValues}
+          inheritedLabels={cfInheritedLabels}
         />
         <div className="border-t pt-3">
           <DnsSettingsSection
@@ -5685,7 +6035,8 @@ function BlockDetailView({
           }
 
           return (
-            <table className="w-full text-sm">
+            <div className="overflow-x-auto">
+            <table className="w-full min-w-[720px] text-sm">
               <thead>
                 <tr className="border-b bg-muted/40 text-xs">
                   <th className="w-8 px-2 py-2 text-left">
@@ -6042,6 +6393,7 @@ function BlockDetailView({
                 })}
               </tbody>
             </table>
+            </div>
           );
         })()}
       </div>
@@ -6285,7 +6637,8 @@ function SpaceTableView({
             No blocks or subnets in this space yet.
           </p>
         ) : (
-          <table className="w-full text-sm">
+          <div className="overflow-x-auto">
+          <table className="w-full min-w-[720px] text-sm">
             <thead>
               <tr className="border-b bg-muted/40 text-xs">
                 <th className="w-8 px-2 py-2 text-left">
@@ -6601,6 +6954,7 @@ function SpaceTableView({
               })}
             </tbody>
           </table>
+          </div>
         )}
       </div>
       {bulkOpen && (
@@ -6701,8 +7055,8 @@ function BulkEditSubnetsModal({
   });
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/70">
-      <div className="w-full max-w-md rounded-lg border bg-card p-6 shadow-lg">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-background/70 p-2 sm:p-4">
+      <div className="w-full max-w-[95vw] sm:max-w-md rounded-lg border bg-card p-4 sm:p-6 shadow-lg">
         <h3 className="mb-3 text-base font-semibold">
           Bulk edit {subnetIds.length} subnet{subnetIds.length === 1 ? "" : "s"}
         </h3>

@@ -34,11 +34,11 @@ function Modal({
   wide?: boolean;
 }) {
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-2 sm:p-4">
       <div
         className={cn(
-          "w-full rounded-lg border bg-card p-6 shadow-lg max-h-[90vh] overflow-y-auto",
-          wide ? "max-w-2xl" : "max-w-md",
+          "w-full rounded-lg border bg-card p-4 sm:p-6 shadow-lg max-h-[90vh] overflow-y-auto max-w-[95vw]",
+          wide ? "sm:max-w-2xl" : "sm:max-w-md",
         )}
       >
         <div className="mb-4 flex items-center justify-between">
@@ -343,7 +343,8 @@ function RouterDetail({
             <Plus className="h-3 w-3 inline mr-1" /> New VLAN
           </button>
         </div>
-        <table className="w-full text-xs">
+        <div className="overflow-x-auto">
+        <table className="w-full min-w-[560px] text-xs">
           <thead className="text-muted-foreground bg-muted/30">
             <tr>
               <th className="text-left px-3 py-1.5 w-16">Tag</th>
@@ -372,6 +373,7 @@ function RouterDetail({
             ))}
           </tbody>
         </table>
+        </div>
       </div>
 
       {showEdit && (
@@ -530,7 +532,8 @@ function VLANDetail({
             <span className="text-muted-foreground">({subnets.length})</span>
           </h3>
         </div>
-        <table className="w-full text-xs">
+        <div className="overflow-x-auto">
+        <table className="w-full min-w-[560px] text-xs">
           <thead className="text-muted-foreground bg-muted/30">
             <tr>
               <th className="text-left px-3 py-1.5">Network</th>
@@ -560,6 +563,7 @@ function VLANDetail({
             ))}
           </tbody>
         </table>
+        </div>
       </div>
 
       {showEdit && (

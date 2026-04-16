@@ -36,9 +36,9 @@ export function Modal({
   wide?: boolean;
 }) {
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-2 sm:p-4">
       <div
-        className={`w-full ${wide ? "max-w-2xl" : "max-w-md"} rounded-lg border bg-card p-6 shadow-lg max-h-[90vh] overflow-y-auto`}
+        className={`w-full max-w-[95vw] ${wide ? "sm:max-w-2xl" : "sm:max-w-md"} rounded-lg border bg-card p-4 sm:p-6 shadow-lg max-h-[90vh] overflow-y-auto`}
       >
         <div className="mb-4 flex items-center justify-between">
           <h2 className="text-base font-semibold">{title}</h2>

@@ -130,6 +130,8 @@ class ScopeResponse(BaseModel):
     ddns_hostname_policy: str | None
     ddns_domain_override: str | None = None
     hostname_sync_mode: str
+    # "ipv4" → Kea Dhcp4 rendering, "ipv6" → Kea Dhcp6 rendering.
+    address_family: str = "ipv4"
     last_pushed_at: datetime | None
     created_at: datetime
     modified_at: datetime
@@ -158,6 +160,7 @@ def _scope_to_response(scope: DHCPScope) -> ScopeResponse:
         ddns_hostname_policy=scope.ddns_hostname_policy,
         ddns_domain_override=None,
         hostname_sync_mode=scope.hostname_to_ipam_sync,
+        address_family=getattr(scope, "address_family", "ipv4") or "ipv4",
         last_pushed_at=scope.last_pushed_at,
         created_at=scope.created_at,
         modified_at=scope.modified_at,
@@ -207,6 +210,15 @@ async def create_scope(
     if sync_mode not in VALID_SYNC_MODES - {"ipam", "learned"}:
         raise HTTPException(status_code=422, detail=f"invalid hostname sync mode: {sync_mode}")
     is_active = body.enabled if body.enabled is not None else body.is_active
+    # Infer the address family from the subnet's CIDR so the Kea driver can
+    # emit Dhcp4 vs Dhcp6 without needing the frontend to specify it.
+    import ipaddress as _ipaddr
+
+    try:
+        _net = _ipaddr.ip_network(str(subnet.network), strict=False)
+        address_family = "ipv6" if isinstance(_net, _ipaddr.IPv6Network) else "ipv4"
+    except ValueError:
+        address_family = "ipv4"
     scope = DHCPScope(
         subnet_id=subnet_id,
         server_id=server_id,
@@ -218,6 +230,7 @@ async def create_scope(
         ddns_enabled=body.ddns_enabled,
         ddns_hostname_policy=body.ddns_hostname_policy or "client",
         hostname_to_ipam_sync=sync_mode,
+        address_family=address_family,
     )
     db.add(scope)
     await db.flush()
