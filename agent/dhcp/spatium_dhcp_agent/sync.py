@@ -169,7 +169,7 @@ class SyncLoop:
         etag = bundle.get("etag") or resp.headers.get("ETag")
         if not etag:
             log.warning("sync_bundle_missing_etag")
-            self._record_success()
+            self._record_failure("missing_etag")
             return
 
         save_config(self.cfg.state_dir, bundle, etag)
