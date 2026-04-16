@@ -13,10 +13,14 @@
   <a href="https://github.com/spatiumddi/spatiumddi/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License"/></a>
   <a href="https://github.com/spatiumddi/spatiumddi/issues"><img src="https://img.shields.io/github/issues/spatiumddi/spatiumddi" alt="Issues"/></a>
   <a href="https://spatiumddi.org"><img src="https://img.shields.io/badge/docs-spatiumddi.org-informational" alt="Docs"/></a>
-  <img src="https://img.shields.io/badge/status-pre--alpha-orange" alt="Status"/>
+  <img src="https://img.shields.io/badge/status-alpha-orange" alt="Status"/>
   <img src="https://img.shields.io/badge/python-3.12+-green" alt="Python"/>
   <img src="https://img.shields.io/badge/react-18+-61DAFB" alt="React"/>
 </p>
+
+---
+
+> ⚠️ **Alpha software.** SpatiumDDI is under active development and has not yet been battle-tested in production. Expect rough edges, breaking schema changes between releases (Phase 1), and features listed in the roadmap that are still in flight. Run it in a lab, file bugs, and please don't put it in front of DHCP clients you care about until Phase 2 is complete. Early adopter feedback is very welcome — open an issue or start a discussion on GitHub.
 
 ---
 
@@ -32,6 +36,27 @@ It is designed as a modern alternative to commercial DDI platforms like Efficien
 - 🔒 **Granular permissions** — delegate IP ranges and zones via LDAP / OIDC / SAML
 - 📋 **Full audit trail** — every mutation logged, append-only, viewable in the UI
 - 🚀 **Flexible deployment** — Docker Compose, Kubernetes (Helm), bare metal, or OS appliance
+
+---
+
+## Screenshots
+
+<p align="center">
+  <img src="docs/assets/screenshots/01-dashboard.png" alt="Dashboard"/><br/>
+  <em>Dashboard — utilisation, VLAN, DNS &amp; DHCP status at a glance</em>
+</p>
+
+<p align="center">
+  <img src="docs/assets/screenshots/02-ipam-tree.png" alt="IPAM tree"/><br/>
+  <em>IPAM — hierarchical space / block / subnet tree</em>
+</p>
+
+<p align="center">
+  <img src="docs/assets/screenshots/03-dns.png" alt="DNS"/>
+  <img src="docs/assets/screenshots/04-dhcp.png" alt="DHCP"/>
+</p>
+
+> Regenerate: run `scripts/seed_demo.py` then `scripts/take_screenshots.py` against a local stack.
 
 ---
 
