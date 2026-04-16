@@ -474,14 +474,6 @@ function DnsSettingsSection({
     }
   }
 
-  function toggleAdditionalZone(zId: string) {
-    if (additionalZoneIds.includes(zId)) {
-      onAdditionalZoneIdsChange(additionalZoneIds.filter((id) => id !== zId));
-    } else {
-      onAdditionalZoneIdsChange([...additionalZoneIds, zId]);
-    }
-  }
-
   const inheritedFrom = effectiveDns?.inherited_from_block_id
     ? "a parent block"
     : null;
@@ -569,36 +561,197 @@ function DnsSettingsSection({
           </div>
         )}
 
-        {/* Additional Zones — excludes primary and arpa zones (filtered above) */}
+        {/* Additional Zones — dual listbox scales better than chips for many zones */}
         {availableZones.filter((z) => z.id !== displayZoneId).length > 0 && (
           <div>
             <p className="text-xs text-muted-foreground mb-1">
               Additional Zones
             </p>
-            <div className="flex flex-wrap gap-1.5">
-              {availableZones
-                .filter((z) => z.id !== displayZoneId)
-                .map((z) => {
-                  const selected = displayAdditionalIds.includes(z.id);
-                  return (
-                    <button
-                      key={z.id}
-                      type="button"
-                      onClick={() => !inherit && toggleAdditionalZone(z.id)}
-                      className={`px-2 py-0.5 rounded-full border text-xs transition-colors ${
-                        selected
-                          ? "bg-sky-500/20 text-sky-700 border-sky-500/50 dark:text-sky-400"
-                          : "bg-background text-muted-foreground border-border hover:border-sky-500/30"
-                      }`}
-                    >
-                      {z.name}
-                    </button>
-                  );
-                })}
-            </div>
+            <AdditionalZonesPicker
+              allZones={availableZones.filter((z) => z.id !== displayZoneId)}
+              selectedIds={displayAdditionalIds}
+              onChange={(ids) => !inherit && onAdditionalZoneIdsChange(ids)}
+              disabled={inherit}
+            />
           </div>
         )}
       </fieldset>
+    </div>
+  );
+}
+
+// ─── Additional Zones dual-listbox ──────────────────────────────────────────
+
+function AdditionalZonesPicker({
+  allZones,
+  selectedIds,
+  onChange,
+  disabled,
+}: {
+  allZones: DNSZone[];
+  selectedIds: string[];
+  onChange: (ids: string[]) => void;
+  disabled: boolean;
+}) {
+  const [leftFilter, setLeftFilter] = useState("");
+  const [rightFilter, setRightFilter] = useState("");
+  const [leftPick, setLeftPick] = useState<Set<string>>(new Set());
+  const [rightPick, setRightPick] = useState<Set<string>>(new Set());
+
+  const selected = allZones.filter((z) => selectedIds.includes(z.id));
+  const available = allZones.filter((z) => !selectedIds.includes(z.id));
+
+  const leftFiltered = available.filter((z) =>
+    z.name.toLowerCase().includes(leftFilter.toLowerCase()),
+  );
+  const rightFiltered = selected.filter((z) =>
+    z.name.toLowerCase().includes(rightFilter.toLowerCase()),
+  );
+
+  const moveRight = () => {
+    if (leftPick.size === 0) return;
+    onChange([...selectedIds, ...Array.from(leftPick)]);
+    setLeftPick(new Set());
+  };
+  const moveLeft = () => {
+    if (rightPick.size === 0) return;
+    onChange(selectedIds.filter((id) => !rightPick.has(id)));
+    setRightPick(new Set());
+  };
+  const moveAllRight = () =>
+    onChange([...selectedIds, ...leftFiltered.map((z) => z.id)]);
+  const moveAllLeft = () =>
+    onChange(
+      selectedIds.filter((id) => !rightFiltered.some((z) => z.id === id)),
+    );
+
+  function List({
+    label,
+    items,
+    filter,
+    onFilter,
+    picks,
+    onPicks,
+    onDouble,
+  }: {
+    label: string;
+    items: DNSZone[];
+    filter: string;
+    onFilter: (v: string) => void;
+    picks: Set<string>;
+    onPicks: (s: Set<string>) => void;
+    onDouble: (id: string) => void;
+  }) {
+    return (
+      <div className="flex-1 min-w-0">
+        <div className="flex items-center justify-between mb-1">
+          <span className="text-[11px] font-medium text-muted-foreground">
+            {label}
+          </span>
+          <span className="text-[11px] text-muted-foreground/70">
+            {items.length}
+          </span>
+        </div>
+        <input
+          type="text"
+          value={filter}
+          onChange={(e) => onFilter(e.target.value)}
+          placeholder="Filter…"
+          disabled={disabled}
+          className="w-full rounded-t-md border border-b-0 bg-background px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-ring disabled:opacity-50"
+        />
+        <div className="h-40 overflow-y-auto rounded-b-md border bg-background">
+          {items.length === 0 ? (
+            <p className="p-2 text-center text-[11px] text-muted-foreground italic">
+              —
+            </p>
+          ) : (
+            items.map((z) => {
+              const on = picks.has(z.id);
+              return (
+                <button
+                  key={z.id}
+                  type="button"
+                  disabled={disabled}
+                  onDoubleClick={() => onDouble(z.id)}
+                  onClick={() => {
+                    const next = new Set(picks);
+                    if (on) next.delete(z.id);
+                    else next.add(z.id);
+                    onPicks(next);
+                  }}
+                  className={`block w-full truncate px-2 py-0.5 text-left text-xs ${
+                    on ? "bg-primary/20" : "hover:bg-muted/50"
+                  } disabled:opacity-50`}
+                >
+                  {z.name}
+                </button>
+              );
+            })
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex items-stretch gap-2">
+      <List
+        label="Available"
+        items={leftFiltered}
+        filter={leftFilter}
+        onFilter={setLeftFilter}
+        picks={leftPick}
+        onPicks={setLeftPick}
+        onDouble={(id) => onChange([...selectedIds, id])}
+      />
+      <div className="flex flex-col justify-center gap-1 pt-5">
+        <button
+          type="button"
+          onClick={moveRight}
+          disabled={disabled || leftPick.size === 0}
+          title="Add selected"
+          className="rounded border px-1.5 py-0.5 text-xs hover:bg-accent disabled:opacity-40"
+        >
+          &gt;
+        </button>
+        <button
+          type="button"
+          onClick={moveAllRight}
+          disabled={disabled || leftFiltered.length === 0}
+          title="Add all (filtered)"
+          className="rounded border px-1.5 py-0.5 text-xs hover:bg-accent disabled:opacity-40"
+        >
+          &gt;&gt;
+        </button>
+        <button
+          type="button"
+          onClick={moveLeft}
+          disabled={disabled || rightPick.size === 0}
+          title="Remove selected"
+          className="rounded border px-1.5 py-0.5 text-xs hover:bg-accent disabled:opacity-40"
+        >
+          &lt;
+        </button>
+        <button
+          type="button"
+          onClick={moveAllLeft}
+          disabled={disabled || rightFiltered.length === 0}
+          title="Remove all (filtered)"
+          className="rounded border px-1.5 py-0.5 text-xs hover:bg-accent disabled:opacity-40"
+        >
+          &lt;&lt;
+        </button>
+      </div>
+      <List
+        label="Selected"
+        items={rightFiltered}
+        filter={rightFilter}
+        onFilter={setRightFilter}
+        picks={rightPick}
+        onPicks={setRightPick}
+        onDouble={(id) => onChange(selectedIds.filter((x) => x !== id))}
+      />
     </div>
   );
 }
