@@ -289,6 +289,72 @@ function Field({
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
 
+/**
+ * Shared DNS-zone dropdown options renderer.
+ *
+ * When the subnet/block has explicit zone assignments, shows the primary
+ * zone at the top as a flat option, then an <optgroup label="Additional
+ * zones"> containing the rest. Otherwise renders a flat list.
+ */
+function ZoneOptions({
+  zones,
+  primaryId,
+  additionalIds,
+  noneOption,
+}: {
+  zones: DNSZone[];
+  primaryId: string | null | undefined;
+  additionalIds: string[];
+  /** When set, render a leading "— <label> —" option with empty value. */
+  noneOption?: string;
+}) {
+  const fmt = (z: DNSZone) => z.name.replace(/\.$/, "");
+  const primary = primaryId ? zones.find((z) => z.id === primaryId) : null;
+  const additional = zones.filter(
+    (z) => additionalIds.includes(z.id) && z.id !== primaryId,
+  );
+  const others = zones.filter(
+    (z) => z.id !== primaryId && !additionalIds.includes(z.id),
+  );
+  return (
+    <>
+      {noneOption && <option value="">— {noneOption} —</option>}
+      {primary && (
+        <option value={primary.id}>{fmt(primary)} (primary)</option>
+      )}
+      {additional.length > 0 && (
+        <optgroup label="Additional zones">
+          {additional.map((z) => (
+            <option key={z.id} value={z.id}>
+              {fmt(z)}
+            </option>
+          ))}
+        </optgroup>
+      )}
+      {/* Zones neither pinned nor additional — only surfaces when the
+          subnet's groups expose extras (e.g. nothing explicitly pinned). */}
+      {others.length > 0 && !primary && additional.length === 0 && (
+        <>
+          {others.map((z) => (
+            <option key={z.id} value={z.id}>
+              {fmt(z)}
+            </option>
+          ))}
+        </>
+      )}
+      {others.length > 0 && (primary || additional.length > 0) && (
+        <optgroup label="Other">
+          {others.map((z) => (
+            <option key={z.id} value={z.id}>
+              {fmt(z)}
+            </option>
+          ))}
+        </optgroup>
+      )}
+    </>
+  );
+}
+
 // ─── Create Space Modal ───────────────────────────────────────────────────────
 
 function CreateSpaceModal({ onClose }: { onClose: () => void }) {
@@ -1380,9 +1446,22 @@ function AddAddressModal({
       staleTime: 60_000,
     })),
   });
-  const availableZones: DNSZone[] = zoneQueries
+  const allGroupZones: DNSZone[] = zoneQueries
     .flatMap((q: { data?: DNSZone[] }) => q.data ?? [])
     .filter((z: DNSZone) => !z.name.toLowerCase().includes("arpa"));
+
+  // When the block/subnet has an explicit primary zone and/or additional
+  // zones, restrict the picker to just those. Falling back to every zone in
+  // the group only happens when the admin picked a group without pinning
+  // specific zones.
+  const explicitZoneIds = [
+    ...(effectiveDns?.dns_zone_id ? [effectiveDns.dns_zone_id] : []),
+    ...(effectiveDns?.dns_additional_zone_ids ?? []),
+  ];
+  const availableZones: DNSZone[] =
+    explicitZoneIds.length > 0
+      ? allGroupZones.filter((z: DNSZone) => explicitZoneIds.includes(z.id))
+      : allGroupZones;
 
   // Pre-select the primary zone (dns_zone_id) or first zone when there's only one
   useEffect(() => {
@@ -1519,12 +1598,12 @@ function AddAddressModal({
                   value={dnsZoneId}
                   onChange={(e) => setDnsZoneId(e.target.value)}
                 >
-                  <option value="">— None (no DNS record) —</option>
-                  {availableZones.map((z: DNSZone) => (
-                    <option key={z.id} value={z.id}>
-                      {z.name.replace(/\.$/, "")}
-                    </option>
-                  ))}
+                  <ZoneOptions
+                    zones={availableZones}
+                    primaryId={effectiveDns?.dns_zone_id}
+                    additionalIds={effectiveDns?.dns_additional_zone_ids ?? []}
+                    noneOption="None (no DNS record)"
+                  />
                 </select>
                 {fqdnPreview && (
                   <p className="text-xs font-mono text-emerald-600 dark:text-emerald-400">
@@ -3702,9 +3781,22 @@ function EditAddressModal({
       staleTime: 60_000,
     })),
   });
-  const availableZones: DNSZone[] = zoneQueries
+  const allGroupZones: DNSZone[] = zoneQueries
     .flatMap((q: { data?: DNSZone[] }) => q.data ?? [])
     .filter((z: DNSZone) => !z.name.toLowerCase().includes("arpa"));
+
+  // When the block/subnet has an explicit primary zone and/or additional
+  // zones, restrict the picker to just those. Falling back to every zone in
+  // the group only happens when the admin picked a group without pinning
+  // specific zones.
+  const explicitZoneIds = [
+    ...(effectiveDns?.dns_zone_id ? [effectiveDns.dns_zone_id] : []),
+    ...(effectiveDns?.dns_additional_zone_ids ?? []),
+  ];
+  const availableZones: DNSZone[] =
+    explicitZoneIds.length > 0
+      ? allGroupZones.filter((z: DNSZone) => explicitZoneIds.includes(z.id))
+      : allGroupZones;
 
   // Pre-select zone from current FQDN or primary zone
   useEffect(() => {
@@ -3778,12 +3870,12 @@ function EditAddressModal({
                   value={dnsZoneId}
                   onChange={(e) => setDnsZoneId(e.target.value)}
                 >
-                  <option value="">— None (remove DNS record) —</option>
-                  {availableZones.map((z: DNSZone) => (
-                    <option key={z.id} value={z.id}>
-                      {z.name.replace(/\.$/, "")}
-                    </option>
-                  ))}
+                  <ZoneOptions
+                    zones={availableZones}
+                    primaryId={effectiveDns?.dns_zone_id}
+                    additionalIds={effectiveDns?.dns_additional_zone_ids ?? []}
+                    noneOption="None (remove DNS record)"
+                  />
                 </select>
                 {fqdnPreview && (
                   <p className="text-xs font-mono text-emerald-600 dark:text-emerald-400">
@@ -4037,12 +4129,53 @@ function BulkEditAddressesModal({
   const [tagRows, setTagRows] = useState<{ k: string; v: string }[]>([]);
   const [customFields, setCustomFields] = useState<Record<string, unknown>>({});
   const [editCustomFields, setEditCustomFields] = useState(false);
+  const [editDnsZone, setEditDnsZone] = useState(false);
+  const [dnsZoneId, setDnsZoneId] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
 
   const { data: cfDefs = [] } = useQuery({
     queryKey: ["custom-fields", "ip_address"],
     queryFn: () => customFieldsApi.list("ip_address"),
   });
+
+  // Same shape the single-address modal uses: load the effective DNS config
+  // for the subnet, then restrict the picker to explicit primary + additional
+  // zones. Falling back to all group zones only when nothing is pinned.
+  const { data: effectiveDns } = useQuery({
+    queryKey: ["effective-dns-subnet", subnetId],
+    queryFn: () => ipamApi.getEffectiveSubnetDns(subnetId),
+    staleTime: 30_000,
+  });
+  const zoneGroupIds: string[] = effectiveDns?.dns_group_ids ?? [];
+  const zoneQueries = useQueries({
+    queries: zoneGroupIds.map((gId: string) => ({
+      queryKey: ["dns-zones", gId],
+      queryFn: () => dnsApi.listZones(gId),
+      staleTime: 60_000,
+    })),
+  });
+  const allGroupZones: DNSZone[] = zoneQueries
+    .flatMap((q: { data?: DNSZone[] }) => q.data ?? [])
+    .filter((z: DNSZone) => !z.name.toLowerCase().includes("arpa"));
+  const explicitZoneIds = [
+    ...(effectiveDns?.dns_zone_id ? [effectiveDns.dns_zone_id] : []),
+    ...(effectiveDns?.dns_additional_zone_ids ?? []),
+  ];
+  const availableZones: DNSZone[] =
+    explicitZoneIds.length > 0
+      ? allGroupZones.filter((z: DNSZone) => explicitZoneIds.includes(z.id))
+      : allGroupZones;
+
+  useEffect(() => {
+    if (editDnsZone && !dnsZoneId && availableZones.length > 0) {
+      const primary = effectiveDns?.dns_zone_id;
+      setDnsZoneId(
+        primary && availableZones.some((z: DNSZone) => z.id === primary)
+          ? primary
+          : availableZones[0].id,
+      );
+    }
+  }, [editDnsZone, availableZones.length, effectiveDns?.dns_zone_id]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const mutation = useMutation({
     mutationFn: () => {
@@ -4051,6 +4184,7 @@ function BulkEditAddressesModal({
         description?: string;
         tags?: Record<string, unknown>;
         custom_fields?: Record<string, unknown>;
+        dns_zone_id?: string;
       } = {};
       if (editStatus) changes.status = status;
       if (editDescription) changes.description = description;
@@ -4064,6 +4198,7 @@ function BulkEditAddressesModal({
       if (editCustomFields && Object.keys(customFields).length > 0) {
         changes.custom_fields = customFields;
       }
+      if (editDnsZone) changes.dns_zone_id = dnsZoneId; // "" clears the zone
       return ipamApi.bulkEditAddresses({ ip_ids: ipIds, changes });
     },
     onSuccess: (res) => {
@@ -4090,7 +4225,8 @@ function BulkEditAddressesModal({
     editStatus ||
     editDescription ||
     tagRows.some((r) => r.k.trim() !== "") ||
-    (editCustomFields && Object.keys(customFields).length > 0);
+    (editCustomFields && Object.keys(customFields).length > 0) ||
+    editDnsZone;
 
   return (
     <Modal title={`Bulk edit ${ipIds.length} IP addresses`} onClose={onClose}>
@@ -4149,6 +4285,40 @@ function BulkEditAddressesModal({
             />
           )}
         </div>
+
+        {availableZones.length > 0 && (
+          <div className="rounded-md border p-3 space-y-2">
+            <label className="flex items-center gap-2 text-sm font-medium">
+              <input
+                type="checkbox"
+                checked={editDnsZone}
+                onChange={(e) => setEditDnsZone(e.target.checked)}
+              />
+              DNS Zone
+            </label>
+            {editDnsZone && (
+              <div className="space-y-1">
+                <select
+                  className={inputCls}
+                  value={dnsZoneId}
+                  onChange={(e) => setDnsZoneId(e.target.value)}
+                >
+                  <ZoneOptions
+                    zones={availableZones}
+                    primaryId={effectiveDns?.dns_zone_id}
+                    additionalIds={effectiveDns?.dns_additional_zone_ids ?? []}
+                    noneOption="None (remove DNS records)"
+                  />
+                </select>
+                <p className="text-[11px] text-muted-foreground">
+                  Moves every selected IP's forward record to this zone (and
+                  deletes the old record if present). Picking
+                  &ldquo;None&rdquo; removes the DNS record entirely.
+                </p>
+              </div>
+            )}
+          </div>
+        )}
 
         <div className="rounded-md border p-3 space-y-2">
           <p className="text-sm font-medium">Tags (merge)</p>

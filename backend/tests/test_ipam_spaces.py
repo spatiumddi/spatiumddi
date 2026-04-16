@@ -8,7 +8,9 @@ from app.core.security import create_access_token, hash_password
 from app.models.auth import User
 
 
-async def _make_user(db: AsyncSession, superadmin: bool = False) -> tuple[User, str]:
+async def _make_user(db: AsyncSession, superadmin: bool = True) -> tuple[User, str]:
+    """Default is superadmin=True for IPAM tests because they exercise POST routes
+    that require IPAM write permissions (see app/core/permissions.py)."""
     user = User(
         username="testuser",
         email="test@example.com",

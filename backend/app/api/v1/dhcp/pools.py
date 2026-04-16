@@ -7,17 +7,20 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, field_validator
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.v1.dhcp._audit import write_audit
+from app.core.permissions import require_resource_permission
 from app.models.dhcp import DHCPPool, DHCPScope
 from app.models.ipam import IPAddress
 
-router = APIRouter(tags=["dhcp"])
+router = APIRouter(
+    tags=["dhcp"], dependencies=[Depends(require_resource_permission("dhcp_pool"))]
+)
 
 VALID_POOL_TYPES = {"dynamic", "excluded", "reserved"}
 

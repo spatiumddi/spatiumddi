@@ -484,6 +484,8 @@ export const ipamApi = {
       description?: string;
       tags?: Record<string, unknown>;
       custom_fields?: Record<string, unknown>;
+      /** New forward-zone for every selected IP. Empty string clears. */
+      dns_zone_id?: string;
     };
   }) =>
     api
@@ -819,6 +821,11 @@ export const searchApi = {
 
 export interface PlatformSettings {
   app_title: string;
+  app_base_url: string;
+  dns_auto_sync_enabled: boolean;
+  dns_auto_sync_interval_minutes: number;
+  dns_auto_sync_delete_stale: boolean;
+  dns_auto_sync_last_run_at: string | null;
   ip_allocation_strategy: string;
   session_timeout_minutes: number;
   auto_logout_minutes: number;
@@ -843,6 +850,200 @@ export const settingsApi = {
   get: () => api.get<PlatformSettings>("/settings").then((r) => r.data),
   update: (data: Partial<PlatformSettings>) =>
     api.put<PlatformSettings>("/settings", data).then((r) => r.data),
+};
+
+// ── Auth Providers ─────────────────────────────────────────────────────────────
+
+export type AuthProviderType =
+  | "ldap"
+  | "oidc"
+  | "saml"
+  | "radius"
+  | "tacacs";
+
+export interface AuthProvider {
+  id: string;
+  name: string;
+  type: AuthProviderType;
+  is_enabled: boolean;
+  priority: number;
+  config: Record<string, unknown>;
+  has_secrets: boolean;
+  auto_create_users: boolean;
+  auto_update_users: boolean;
+  mapping_count: number;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface AuthProviderCreate {
+  name: string;
+  type: AuthProviderType;
+  is_enabled?: boolean;
+  priority?: number;
+  config?: Record<string, unknown>;
+  secrets?: Record<string, unknown> | null;
+  auto_create_users?: boolean;
+  auto_update_users?: boolean;
+}
+
+export interface AuthProviderUpdate {
+  name?: string;
+  is_enabled?: boolean;
+  priority?: number;
+  config?: Record<string, unknown>;
+  /** undefined = leave stored secrets untouched. {} = clear. */
+  secrets?: Record<string, unknown> | null;
+  auto_create_users?: boolean;
+  auto_update_users?: boolean;
+}
+
+export interface AuthGroupMapping {
+  id: string;
+  provider_id: string;
+  external_group: string;
+  internal_group_id: string;
+  internal_group_name: string;
+  priority: number;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface AuthGroupMappingCreate {
+  external_group: string;
+  internal_group_id: string;
+  priority?: number;
+}
+
+export interface AuthGroupMappingUpdate {
+  external_group?: string;
+  internal_group_id?: string;
+  priority?: number;
+}
+
+export interface AuthProviderTestResult {
+  ok: boolean;
+  message: string;
+  details: Record<string, unknown>;
+}
+
+export interface InternalGroup {
+  id: string;
+  name: string;
+  description: string;
+  auth_source: string;
+  external_dn?: string | null;
+  role_ids?: string[];
+  user_ids?: string[];
+}
+
+export interface InternalGroupCreate {
+  name: string;
+  description?: string;
+  auth_source?: string;
+  external_dn?: string | null;
+  role_ids?: string[];
+  user_ids?: string[];
+}
+
+export interface InternalGroupUpdate {
+  name?: string;
+  description?: string;
+  external_dn?: string | null;
+  role_ids?: string[];
+  user_ids?: string[];
+}
+
+export const groupsApi = {
+  list: () => api.get<InternalGroup[]>("/groups").then((r) => r.data),
+  get: (id: string) =>
+    api.get<InternalGroup>(`/groups/${id}`).then((r) => r.data),
+  create: (body: InternalGroupCreate) =>
+    api.post<InternalGroup>("/groups", body).then((r) => r.data),
+  update: (id: string, body: InternalGroupUpdate) =>
+    api.put<InternalGroup>(`/groups/${id}`, body).then((r) => r.data),
+  delete: (id: string) => api.delete(`/groups/${id}`),
+};
+
+// ── Roles ─────────────────────────────────────────────────────────────────────
+
+export interface PermissionEntry {
+  action: string;
+  resource_type: string;
+  resource_id?: string | null;
+}
+
+export interface AppRole {
+  id: string;
+  name: string;
+  description: string;
+  is_builtin: boolean;
+  permissions: PermissionEntry[];
+}
+
+export interface RoleCreate {
+  name: string;
+  description?: string;
+  permissions?: PermissionEntry[];
+}
+
+export interface RoleUpdate {
+  name?: string;
+  description?: string;
+  permissions?: PermissionEntry[];
+}
+
+export const rolesApi = {
+  list: () => api.get<AppRole[]>("/roles").then((r) => r.data),
+  get: (id: string) => api.get<AppRole>(`/roles/${id}`).then((r) => r.data),
+  create: (body: RoleCreate) =>
+    api.post<AppRole>("/roles", body).then((r) => r.data),
+  update: (id: string, body: RoleUpdate) =>
+    api.put<AppRole>(`/roles/${id}`, body).then((r) => r.data),
+  delete: (id: string) => api.delete(`/roles/${id}`),
+  clone: (id: string, name: string) =>
+    api.post<AppRole>(`/roles/${id}/clone`, { name }).then((r) => r.data),
+};
+
+export const authProvidersApi = {
+  list: () =>
+    api.get<AuthProvider[]>("/auth-providers").then((r) => r.data),
+  test: (id: string, body: { username?: string; password?: string }) =>
+    api
+      .post<AuthProviderTestResult>(`/auth-providers/${id}/test`, body)
+      .then((r) => r.data),
+  get: (id: string) =>
+    api.get<AuthProvider>(`/auth-providers/${id}`).then((r) => r.data),
+  create: (body: AuthProviderCreate) =>
+    api.post<AuthProvider>("/auth-providers", body).then((r) => r.data),
+  update: (id: string, body: AuthProviderUpdate) =>
+    api.put<AuthProvider>(`/auth-providers/${id}`, body).then((r) => r.data),
+  delete: (id: string) => api.delete(`/auth-providers/${id}`),
+  revealSecrets: (id: string) =>
+    api
+      .get<Record<string, unknown>>(`/auth-providers/${id}/secrets`)
+      .then((r) => r.data),
+  listMappings: (id: string) =>
+    api
+      .get<AuthGroupMapping[]>(`/auth-providers/${id}/mappings`)
+      .then((r) => r.data),
+  createMapping: (id: string, body: AuthGroupMappingCreate) =>
+    api
+      .post<AuthGroupMapping>(`/auth-providers/${id}/mappings`, body)
+      .then((r) => r.data),
+  updateMapping: (
+    id: string,
+    mappingId: string,
+    body: AuthGroupMappingUpdate,
+  ) =>
+    api
+      .put<AuthGroupMapping>(
+        `/auth-providers/${id}/mappings/${mappingId}`,
+        body,
+      )
+      .then((r) => r.data),
+  deleteMapping: (id: string, mappingId: string) =>
+    api.delete(`/auth-providers/${id}/mappings/${mappingId}`),
 };
 
 // ── Custom Fields ──────────────────────────────────────────────────────────────
@@ -1025,6 +1226,25 @@ export interface DNSRecord {
   modified_at: string;
 }
 
+export interface DNSGroupRecord {
+  id: string;
+  zone_id: string;
+  zone_name: string;
+  view_id: string | null;
+  view_name: string | null;
+  name: string;
+  fqdn: string;
+  record_type: string;
+  value: string;
+  ttl: number | null;
+  priority: number | null;
+  weight: number | null;
+  port: number | null;
+  auto_generated: boolean;
+  created_at: string;
+  modified_at: string;
+}
+
 export const dnsApi = {
   // Server groups
   listGroups: () =>
@@ -1115,6 +1335,10 @@ export const dnsApi = {
     api.delete(`/dns/groups/${groupId}/zones/${zoneId}`),
 
   // Records
+  listGroupRecords: (groupId: string) =>
+    api
+      .get<DNSGroupRecord[]>(`/dns/groups/${groupId}/records`)
+      .then((r) => r.data),
   listRecords: (groupId: string, zoneId: string) =>
     api
       .get<DNSRecord[]>(`/dns/groups/${groupId}/zones/${zoneId}/records`)
@@ -1613,10 +1837,20 @@ export interface DHCPLease {
   last_seen_at: string;
 }
 
+export interface PublicAuthProvider {
+  id: string;
+  name: string;
+  type: AuthProviderType;
+}
+
 export const authApi = {
   login: (username: string, password: string) =>
     api
       .post<LoginResponse>("/auth/login", { username, password })
+      .then((r) => r.data),
+  publicProviders: () =>
+    api
+      .get<PublicAuthProvider[]>("/auth/providers")
       .then((r) => r.data),
   logout: () => api.post("/auth/logout"),
   refresh: (refreshToken: string) =>

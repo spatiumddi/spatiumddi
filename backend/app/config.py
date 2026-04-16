@@ -18,22 +18,10 @@ class Settings(BaseSettings):
     refresh_token_expire_days: int = 7
     credential_encryption_key: str = ""
 
-    # Auth: LDAP
-    ldap_enabled: bool = False
-    ldap_host: str = ""
-    ldap_port: int = 636
-    ldap_use_ssl: bool = True
-    ldap_bind_dn: str = ""
-    ldap_bind_password: str = ""
-    ldap_user_base_dn: str = ""
-    ldap_group_base_dn: str = ""
-
-    # Auth: OIDC
-    oidc_enabled: bool = False
-    oidc_provider_name: str = ""
-    oidc_discovery_url: str = ""
-    oidc_client_id: str = ""
-    oidc_client_secret: str = ""
+    # External auth providers (LDAP / OIDC / SAML) are configured via the GUI at
+    # /admin/auth-providers — see backend/app/models/auth_provider.py. Secrets are
+    # encrypted with the Fernet helper in app.core.crypto using
+    # credential_encryption_key (or falling back to secret_key).
 
     # Celery
     celery_broker_url: str = "redis://redis:6379/1"

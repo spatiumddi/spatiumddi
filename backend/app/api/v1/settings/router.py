@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from datetime import datetime
+
 import structlog
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, field_validator
 
 from app.api.deps import DB, CurrentUser
+from app.core.permissions import user_has_permission
 from app.models.settings import PlatformSettings
 
 logger = structlog.get_logger(__name__)
@@ -20,6 +23,7 @@ _SINGLETON_ID = 1
 
 class SettingsResponse(BaseModel):
     app_title: str
+    app_base_url: str
     ip_allocation_strategy: str
     session_timeout_minutes: int
     auto_logout_minutes: int
@@ -33,6 +37,10 @@ class SettingsResponse(BaseModel):
     dns_default_zone_type: str
     dns_default_dnssec_validation: str
     dns_recursive_by_default: bool
+    dns_auto_sync_enabled: bool
+    dns_auto_sync_interval_minutes: int
+    dns_auto_sync_delete_stale: bool
+    dns_auto_sync_last_run_at: datetime | None
     dhcp_default_dns_servers: list[str]
     dhcp_default_domain_name: str
     dhcp_default_domain_search: list[str]
@@ -44,6 +52,7 @@ class SettingsResponse(BaseModel):
 
 class SettingsUpdate(BaseModel):
     app_title: str | None = None
+    app_base_url: str | None = None
     ip_allocation_strategy: str | None = None
     session_timeout_minutes: int | None = None
     auto_logout_minutes: int | None = None
@@ -57,6 +66,9 @@ class SettingsUpdate(BaseModel):
     dns_default_zone_type: str | None = None
     dns_default_dnssec_validation: str | None = None
     dns_recursive_by_default: bool | None = None
+    dns_auto_sync_enabled: bool | None = None
+    dns_auto_sync_interval_minutes: int | None = None
+    dns_auto_sync_delete_stale: bool | None = None
     dhcp_default_dns_servers: list[str] | None = None
     dhcp_default_domain_name: str | None = None
     dhcp_default_domain_search: list[str] | None = None
@@ -77,7 +89,7 @@ class SettingsUpdate(BaseModel):
             raise ValueError("Must be >= 0 (0 = no timeout)")
         return v
 
-    @field_validator("discovery_scan_interval_minutes")
+    @field_validator("discovery_scan_interval_minutes", "dns_auto_sync_interval_minutes")
     @classmethod
     def validate_positive(cls, v: int | None) -> int | None:
         if v is not None and v < 1:
@@ -117,10 +129,12 @@ async def get_settings(current_user: CurrentUser, db: DB) -> PlatformSettings:
 async def update_settings(
     body: SettingsUpdate, current_user: CurrentUser, db: DB
 ) -> PlatformSettings:
-    if not current_user.is_superadmin:
+    # Superadmin passes via user_has_permission shortcut; users with an
+    # explicit `write`/`admin` grant on `settings` also pass.
+    if not user_has_permission(current_user, "write", "settings"):
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only superadmins can change platform settings",
+            detail="Permission denied: need 'write' on 'settings'",
         )
 
     settings = await _get_or_create(db)

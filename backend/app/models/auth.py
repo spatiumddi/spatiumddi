@@ -64,8 +64,12 @@ class User(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_login_ip: Mapped[str | None] = mapped_column(String(45), nullable=True)
 
+    # lazy="selectin" so `user.groups` is always populated when the User is
+    # fetched via `db.get(User, ...)` in `get_current_user`. The permissions
+    # helper walks user.groups → group.roles on every request and cannot do
+    # an async lazy-load from the sync code path.
     groups: Mapped[list["Group"]] = relationship(
-        "Group", secondary=user_group, back_populates="users"
+        "Group", secondary=user_group, back_populates="users", lazy="selectin"
     )
     sessions: Mapped[list["UserSession"]] = relationship(
         "UserSession", back_populates="user", cascade="all, delete-orphan"
@@ -87,8 +91,9 @@ class Group(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     external_dn: Mapped[str | None] = mapped_column(String(1000), nullable=True)  # LDAP DN
 
     users: Mapped[list[User]] = relationship("User", secondary=user_group, back_populates="groups")
+    # lazy="selectin" so `group.roles` loads alongside the Group — see comment on User.groups.
     roles: Mapped[list["Role"]] = relationship(
-        "Role", secondary=group_role, back_populates="groups"
+        "Role", secondary=group_role, back_populates="groups", lazy="selectin"
     )
 
 
@@ -104,8 +109,14 @@ class Role(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     description: Mapped[str] = mapped_column(String(1000), nullable=False, default="")
     is_builtin: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
-    # Permissions stored as JSONB: list of {action, resource_type, resource_id}
-    # e.g., [{"action": "ipam:subnet:write", "resource_type": "ip_space", "resource_id": "<uuid>"}]
+    # Permissions stored as JSONB: list of {action, resource_type, resource_id?}.
+    # Full grammar is documented in docs/PERMISSIONS.md — keep the two in sync
+    # when extending. Examples:
+    #   {"action": "*",      "resource_type": "*"}            # superadmin-style
+    #   {"action": "read",   "resource_type": "*"}            # viewer
+    #   {"action": "admin",  "resource_type": "subnet"}       # CRUD on all subnets
+    #   {"action": "write",  "resource_type": "subnet",
+    #    "resource_id": "c3f1e7b9-2a5d-…"}                    # scoped to one subnet
     permissions: Mapped[list[dict]] = mapped_column(JSONB, nullable=False, default=list)
 
     groups: Mapped[list[Group]] = relationship(

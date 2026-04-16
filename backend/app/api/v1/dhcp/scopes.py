@@ -6,16 +6,19 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, field_validator
 from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.v1.dhcp._audit import write_audit
+from app.core.permissions import require_resource_permission
 from app.models.dhcp import DHCPScope, DHCPServer
 from app.models.ipam import Subnet
 
-router = APIRouter(tags=["dhcp"])
+router = APIRouter(
+    tags=["dhcp"], dependencies=[Depends(require_resource_permission("dhcp_scope"))]
+)
 
 VALID_HOSTNAME_POLICIES = {"client", "server_name", "derived", "none"}
 VALID_SYNC_MODES = {"disabled", "on_lease", "on_static_only", "ipam", "learned"}
@@ -71,6 +74,8 @@ class ScopeCreate(BaseModel):
     model_config = {"extra": "ignore"}
 
     server_id: uuid.UUID | None = None
+    name: str = ""
+    description: str = ""
     # Accept both is_active and the frontend's `enabled`.
     is_active: bool = True
     enabled: bool | None = None
@@ -100,6 +105,8 @@ class ScopeCreate(BaseModel):
 class ScopeUpdate(BaseModel):
     model_config = {"extra": "ignore"}
 
+    name: str | None = None
+    description: str | None = None
     is_active: bool | None = None
     enabled: bool | None = None
     lease_time: int | None = None
@@ -148,8 +155,8 @@ def _scope_to_response(scope: DHCPScope) -> ScopeResponse:
         server_id=scope.server_id,
         subnet_id=scope.subnet_id,
         enabled=scope.is_active,
-        name="",
-        description="",
+        name=scope.name or "",
+        description=scope.description or "",
         lease_time=scope.lease_time,
         min_lease_time=scope.min_lease_time,
         max_lease_time=scope.max_lease_time,
@@ -210,6 +217,8 @@ async def create_scope(
     scope = DHCPScope(
         subnet_id=subnet_id,
         server_id=server_id,
+        name=(body.name or "").strip(),
+        description=(body.description or "").strip(),
         is_active=is_active,
         lease_time=body.lease_time,
         min_lease_time=body.min_lease_time,

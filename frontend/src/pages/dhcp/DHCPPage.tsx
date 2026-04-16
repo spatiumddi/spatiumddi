@@ -28,6 +28,7 @@ import {
 } from "@/lib/api";
 import { useSessionState } from "@/lib/useSessionState";
 import { cn } from "@/lib/utils";
+import { useTableSort, SortableTh } from "@/lib/useTableSort";
 import { CreateServerGroupModal } from "./CreateServerGroupModal";
 import { CreateServerModal } from "./CreateServerModal";
 import { CreateScopeModal } from "./CreateScopeModal";
@@ -544,6 +545,55 @@ function ServerPoolsOrStaticsTab({
     (q.data ?? []).map((item) => ({ scope: allScopes[i]!, item })),
   );
 
+  type PoolRow = { scope: DHCPScope; item: DHCPPool };
+  type StaticRow = { scope: DHCPScope; item: DHCPStaticAssignment };
+
+  const ipToInt = (s: string | null | undefined) => {
+    if (!s) return -1;
+    const parts = s.split(".").map(Number);
+    if (parts.length !== 4 || parts.some(Number.isNaN)) return s;
+    return (
+      ((parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]) >>> 0
+    );
+  };
+
+  // Both sort hooks run on every render (hooks can't be conditional), but
+  // `rows` is homogeneous per `kind` — when kind=="pools", rows are all
+  // DHCPPool, so the static-row sort sees undefined fields. Guards below
+  // keep the comparator null-safe either way.
+  const {
+    sorted: poolRows,
+    sort: poolSort,
+    toggle: togglePoolSort,
+  } = useTableSort<PoolRow, "scope" | "name" | "start" | "end" | "type">(
+    rows as PoolRow[],
+    { key: "start", dir: "asc" },
+    (row, key) => {
+      if (key === "scope") return row.scope?.name ?? "";
+      if (key === "name") return row.item?.name ?? "";
+      if (key === "start") return ipToInt(row.item?.start_ip);
+      if (key === "end") return ipToInt(row.item?.end_ip);
+      if (key === "type") return row.item?.pool_type ?? "";
+      return "";
+    },
+  );
+
+  const {
+    sorted: staticRows,
+    sort: staticSort,
+    toggle: toggleStaticSort,
+  } = useTableSort<StaticRow, "scope" | "mac" | "ip" | "hostname">(
+    rows as StaticRow[],
+    { key: "ip", dir: "asc" },
+    (row, key) => {
+      if (key === "scope") return row.scope?.name ?? "";
+      if (key === "mac") return row.item?.mac_address ?? "";
+      if (key === "ip") return ipToInt(row.item?.ip_address);
+      if (key === "hostname") return row.item?.hostname ?? "";
+      return "";
+    },
+  );
+
   return (
     <div className="rounded-lg border">
       {rows.length === 0 ? (
@@ -554,16 +604,51 @@ function ServerPoolsOrStaticsTab({
         <table className="w-full text-sm">
           <thead>
             <tr className="border-b bg-muted/30 text-xs">
-              <th className="px-3 py-2 text-left font-medium">Scope</th>
-              <th className="px-3 py-2 text-left font-medium">Name</th>
-              <th className="px-3 py-2 text-left font-medium">Start</th>
-              <th className="px-3 py-2 text-left font-medium">End</th>
-              <th className="px-3 py-2 text-left font-medium">Type</th>
+              <SortableTh
+                sortKey="scope"
+                sort={poolSort}
+                onSort={togglePoolSort}
+                className="px-3 py-2"
+              >
+                Scope
+              </SortableTh>
+              <SortableTh
+                sortKey="name"
+                sort={poolSort}
+                onSort={togglePoolSort}
+                className="px-3 py-2"
+              >
+                Name
+              </SortableTh>
+              <SortableTh
+                sortKey="start"
+                sort={poolSort}
+                onSort={togglePoolSort}
+                className="px-3 py-2"
+              >
+                Start
+              </SortableTh>
+              <SortableTh
+                sortKey="end"
+                sort={poolSort}
+                onSort={togglePoolSort}
+                className="px-3 py-2"
+              >
+                End
+              </SortableTh>
+              <SortableTh
+                sortKey="type"
+                sort={poolSort}
+                onSort={togglePoolSort}
+                className="px-3 py-2"
+              >
+                Type
+              </SortableTh>
             </tr>
           </thead>
           <tbody>
-            {rows.map(({ scope, item }) => {
-              const p = item as DHCPPool;
+            {poolRows.map(({ scope, item }) => {
+              const p = item;
               return (
                 <tr key={p.id} className="border-b last:border-0">
                   <td className="px-3 py-2 text-xs">{scope.name}</td>
@@ -584,15 +669,43 @@ function ServerPoolsOrStaticsTab({
         <table className="w-full text-sm">
           <thead>
             <tr className="border-b bg-muted/30 text-xs">
-              <th className="px-3 py-2 text-left font-medium">Scope</th>
-              <th className="px-3 py-2 text-left font-medium">MAC</th>
-              <th className="px-3 py-2 text-left font-medium">IP</th>
-              <th className="px-3 py-2 text-left font-medium">Hostname</th>
+              <SortableTh
+                sortKey="scope"
+                sort={staticSort}
+                onSort={toggleStaticSort}
+                className="px-3 py-2"
+              >
+                Scope
+              </SortableTh>
+              <SortableTh
+                sortKey="mac"
+                sort={staticSort}
+                onSort={toggleStaticSort}
+                className="px-3 py-2"
+              >
+                MAC
+              </SortableTh>
+              <SortableTh
+                sortKey="ip"
+                sort={staticSort}
+                onSort={toggleStaticSort}
+                className="px-3 py-2"
+              >
+                IP
+              </SortableTh>
+              <SortableTh
+                sortKey="hostname"
+                sort={staticSort}
+                onSort={toggleStaticSort}
+                className="px-3 py-2"
+              >
+                Hostname
+              </SortableTh>
             </tr>
           </thead>
           <tbody>
-            {rows.map(({ scope, item }) => {
-              const s = item as DHCPStaticAssignment;
+            {staticRows.map(({ scope, item }) => {
+              const s = item;
               return (
                 <tr key={s.id} className="border-b last:border-0">
                   <td className="px-3 py-2 text-xs">{scope.name}</td>

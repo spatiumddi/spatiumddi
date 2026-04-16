@@ -5,18 +5,19 @@ from datetime import datetime
 from typing import Any
 
 import structlog
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, field_validator
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import DB, CurrentUser
+from app.core.permissions import require_resource_permission
 from app.models.audit import AuditLog
 from app.models.ipam import Subnet
 from app.models.vlans import VLAN, Router
 
 logger = structlog.get_logger(__name__)
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_resource_permission("vlan"))])
 
 
 # ── helpers ────────────────────────────────────────────────────────────────────

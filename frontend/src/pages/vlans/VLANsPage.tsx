@@ -18,6 +18,7 @@ import {
   type Subnet,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
+import { useTableSort, SortableTh } from "@/lib/useTableSort";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -280,6 +281,22 @@ function RouterDetail({
     queryFn: () => vlansApi.listVlans(routerId),
   });
 
+  type VlanCol = "tag" | "name" | "description";
+  const {
+    sorted: sortedVlans,
+    sort,
+    toggle,
+  } = useTableSort<VLAN, VlanCol>(
+    vlans,
+    { key: "tag", dir: "asc" },
+    (row, key) => {
+      if (key === "tag") return row.vlan_id;
+      if (key === "name") return row.name ?? "";
+      if (key === "description") return row.description ?? "";
+      return "";
+    },
+  );
+
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const deleteMut = useMutation({
     mutationFn: () => vlansApi.deleteRouter(routerId),
@@ -346,10 +363,33 @@ function RouterDetail({
         <table className="w-full text-xs">
           <thead className="text-muted-foreground bg-muted/30">
             <tr>
-              <th className="text-left px-3 py-1.5 w-16">Tag</th>
-              <th className="text-left px-3 py-1.5">Name</th>
-              <th className="text-left px-3 py-1.5">Description</th>
-              <th className="text-right px-3 py-1.5 w-24">Subnets</th>
+              <SortableTh
+                sortKey="tag"
+                sort={sort}
+                onSort={toggle}
+                className="w-16 px-3 py-1.5"
+              >
+                Tag
+              </SortableTh>
+              <SortableTh
+                sortKey="name"
+                sort={sort}
+                onSort={toggle}
+                className="px-3 py-1.5"
+              >
+                Name
+              </SortableTh>
+              <SortableTh
+                sortKey="description"
+                sort={sort}
+                onSort={toggle}
+                className="px-3 py-1.5"
+              >
+                Description
+              </SortableTh>
+              <th className="text-right px-3 py-1.5 w-24 font-medium">
+                Subnets
+              </th>
             </tr>
           </thead>
           <tbody>
@@ -363,7 +403,7 @@ function RouterDetail({
                 </td>
               </tr>
             )}
-            {vlans.map((v) => (
+            {sortedVlans.map((v) => (
               <VLANRow
                 key={v.id}
                 vlan={v}

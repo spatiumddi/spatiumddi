@@ -3,6 +3,16 @@ FROM python:3.12-slim AS builder
 
 WORKDIR /build
 
+# System dev deps for compiled Python packages: asyncpg (libpq), python3-saml
+# (libxml2 + xmlsec).
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    pkg-config \
+    libxml2-dev \
+    libxmlsec1-dev \
+    libxmlsec1-openssl \
+    && rm -rf /var/lib/apt/lists/*
+
 # Copy only the dependency manifest first so this layer is cached independently
 # of source code changes.
 COPY pyproject.toml .
@@ -22,9 +32,11 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# Install only runtime system deps
+# Runtime system deps: libpq5 for asyncpg, libxmlsec1 for python3-saml.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq5 \
+    libxml2 \
+    libxmlsec1-openssl \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /install /usr/local

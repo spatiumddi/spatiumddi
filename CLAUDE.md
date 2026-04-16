@@ -147,7 +147,7 @@ SpatiumDDI cut its alpha release `2026.04.16-1` on 2026-04-16 with IPAM, DNS (BI
 ### Phase 1 — Remaining
 
 - ⬜ LDAP / OIDC authentication
-- ⬜ Group-based RBAC enforcement on API routes
+- ✅ Group-based RBAC enforcement on API routes (Wave C — `backend/app/core/permissions.py`, built-in roles seeded on boot, Roles/Groups admin pages)
 - ⬜ Full IPv6 support in IPAM, DHCP, DNS (address storage, CIDR validation, UI rendering)
 - ⬜ Mobile-responsive UI
 - ⬜ Bulk-edit UI for `tags` + `custom_fields` (API supports it; only scalar fields in modal today)

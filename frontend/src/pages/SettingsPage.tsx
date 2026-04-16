@@ -60,6 +60,7 @@ type SectionId =
   | "branding"
   | "discovery"
   | "dns"
+  | "dns-auto-sync"
   | "dhcp"
   | "ip-allocation"
   | "session"
@@ -79,9 +80,9 @@ interface SectionDef {
 const SECTIONS: SectionDef[] = [
   {
     id: "branding",
-    title: "Branding",
-    description: "Application title and visual identity.",
-    keywords: ["title", "name", "logo", "header"],
+    title: "Branding & URL",
+    description: "Application title, external URL, and visual identity.",
+    keywords: ["title", "name", "logo", "header", "url", "base", "saml", "oidc"],
   },
   {
     id: "discovery",
@@ -94,6 +95,13 @@ const SECTIONS: SectionDef[] = [
     title: "DNS Defaults",
     description: "Default values applied to new zones and server groups.",
     keywords: ["zone", "ttl", "dnssec", "recursion", "agent", "key"],
+  },
+  {
+    id: "dns-auto-sync",
+    title: "DNS Auto-Sync",
+    description:
+      "Periodic background reconciliation of IPAM-managed DNS records.",
+    keywords: ["dns", "ipam", "sync", "reconcile", "drift", "auto", "job"],
   },
   {
     id: "dhcp",
@@ -276,17 +284,31 @@ export function SettingsPage() {
 
           <div className="rounded-lg border bg-card divide-y px-5">
             {activeId === "branding" && (
-              <Field
-                label="Application Title"
-                description="Shown in the browser tab and header."
-              >
-                <input
-                  value={values.app_title ?? ""}
-                  onChange={(e) => set("app_title", e.target.value)}
-                  disabled={!isSuperadmin}
-                  className={cn(inputCls, "w-48")}
-                />
-              </Field>
+              <>
+                <Field
+                  label="Application Title"
+                  description="Shown in the browser tab and header."
+                >
+                  <input
+                    value={values.app_title ?? ""}
+                    onChange={(e) => set("app_title", e.target.value)}
+                    disabled={!isSuperadmin}
+                    className={cn(inputCls, "w-48")}
+                  />
+                </Field>
+                <Field
+                  label="External URL"
+                  description="Public-facing URL (no trailing slash) used to build OIDC/SAML redirect + callback URLs. Leave blank to derive from the incoming request."
+                >
+                  <input
+                    value={values.app_base_url ?? ""}
+                    onChange={(e) => set("app_base_url", e.target.value)}
+                    placeholder="https://ddi.example.com"
+                    disabled={!isSuperadmin}
+                    className={cn(inputCls, "w-72")}
+                  />
+                </Field>
+              </>
             )}
 
             {activeId === "discovery" && (
@@ -396,6 +418,68 @@ export function SettingsPage() {
                 >
                   <span className="rounded bg-muted px-2 py-1 text-xs font-mono text-muted-foreground">
                     configured via DNS_AGENT_KEY env var
+                  </span>
+                </Field>
+              </>
+            )}
+
+            {activeId === "dns-auto-sync" && (
+              <>
+                <Field
+                  label="Enable Auto-Sync"
+                  description="Periodically reconcile IPAM-expected DNS records against what actually exists. Creates missing A/AAAA/PTR records and updates mismatched ones."
+                >
+                  <Toggle
+                    checked={!!values.dns_auto_sync_enabled}
+                    onChange={(v) => set("dns_auto_sync_enabled", v)}
+                    disabled={!isSuperadmin}
+                  />
+                </Field>
+                <Field
+                  label="Sync Interval"
+                  description="How often the auto-sync job runs."
+                >
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="number"
+                      min={1}
+                      value={values.dns_auto_sync_interval_minutes ?? 60}
+                      onChange={(e) =>
+                        set(
+                          "dns_auto_sync_interval_minutes",
+                          Number(e.target.value),
+                        )
+                      }
+                      disabled={
+                        !isSuperadmin || !values.dns_auto_sync_enabled
+                      }
+                      className={cn(inputCls, "w-24")}
+                    />
+                    <span className="text-xs text-muted-foreground">min</span>
+                  </div>
+                </Field>
+                <Field
+                  label="Delete Stale Records"
+                  description="Also remove auto-generated DNS records whose IP has been deleted. Off by default — stale records are conservative to keep while you confirm the drift report."
+                >
+                  <Toggle
+                    checked={!!values.dns_auto_sync_delete_stale}
+                    onChange={(v) => set("dns_auto_sync_delete_stale", v)}
+                    disabled={
+                      !isSuperadmin || !values.dns_auto_sync_enabled
+                    }
+                  />
+                </Field>
+                <Field
+                  label="Last Run"
+                  description="Timestamp of the most recent auto-sync pass."
+                >
+                  <span className="rounded bg-muted px-2 py-1 text-xs font-mono text-muted-foreground">
+                    {values.dns_auto_sync_last_run_at
+                      ? new Date(
+                          values.dns_auto_sync_last_run_at,
+                        ).toLocaleString()
+                      : "never"}
                   </span>
                 </Field>
               </>

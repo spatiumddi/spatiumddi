@@ -2,6 +2,7 @@ import { Routes, Route, Navigate } from "react-router-dom";
 
 import { AppLayout } from "@/components/layout/AppLayout";
 import { LoginPage } from "@/pages/LoginPage";
+import { LoginCallbackPage } from "@/pages/LoginCallbackPage";
 import { ChangePasswordPage } from "@/pages/ChangePasswordPage";
 import { DashboardPage } from "@/pages/DashboardPage";
 import { IPAMPage } from "@/pages/ipam/IPAMPage";
@@ -11,6 +12,9 @@ import { DHCPPage } from "@/pages/dhcp/DHCPPage";
 import { UsersPage } from "@/pages/admin/UsersPage";
 import { AuditPage } from "@/pages/admin/AuditPage";
 import { CustomFieldsPage } from "@/pages/admin/CustomFieldsPage";
+import { AuthProvidersPage } from "@/pages/admin/AuthProvidersPage";
+import { GroupsPage } from "@/pages/admin/GroupsPage";
+import { RolesPage } from "@/pages/admin/RolesPage";
 import { SettingsPage } from "@/pages/SettingsPage";
 import { useAuth } from "@/hooks/useAuth";
 
@@ -23,6 +27,7 @@ export default function App() {
   return (
     <Routes>
       <Route path="/login" element={<LoginPage />} />
+      <Route path="/login/callback" element={<LoginCallbackPage />} />
       <Route path="/change-password" element={<ChangePasswordPage />} />
       <Route
         path="/"
@@ -39,8 +44,11 @@ export default function App() {
         <Route path="vlans" element={<VLANsPage />} />
         <Route path="dhcp" element={<DHCPPage />} />
         <Route path="admin/users" element={<UsersPage />} />
+        <Route path="admin/groups" element={<GroupsPage />} />
+        <Route path="admin/roles" element={<RolesPage />} />
         <Route path="admin/audit" element={<AuditPage />} />
         <Route path="admin/custom-fields" element={<CustomFieldsPage />} />
+        <Route path="admin/auth-providers" element={<AuthProvidersPage />} />
         <Route path="settings" element={<SettingsPage />} />
       </Route>
     </Routes>

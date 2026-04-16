@@ -8,11 +8,14 @@ import {
   Router as RouterIcon,
   Github,
   Users,
+  UsersRound,
+  KeyRound,
   ClipboardList,
   ChevronsLeft,
   ChevronsRight,
   Settings,
   Tags,
+  ShieldCheck,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import logoIcon from "@/assets/logo-icon.svg";
@@ -20,16 +23,19 @@ import logoIcon from "@/assets/logo-icon.svg";
 const mainNav = [
   { label: "Dashboard", icon: LayoutDashboard, to: "/dashboard" },
   { label: "IPAM", icon: Network, to: "/ipam" },
-  { label: "VLANs", icon: RouterIcon, to: "/vlans" },
   { label: "DHCP", icon: Server, to: "/dhcp" },
   { label: "DNS", icon: Globe, to: "/dns" },
+  { label: "VLANs", icon: RouterIcon, to: "/vlans" },
 ];
 
 const adminNav = [
-  { label: "Users", icon: Users, to: "/admin/users" },
   { label: "Audit Log", icon: ClipboardList, to: "/admin/audit" },
+  { label: "Auth Providers", icon: ShieldCheck, to: "/admin/auth-providers" },
   { label: "Custom Fields", icon: Tags, to: "/admin/custom-fields" },
+  { label: "Groups", icon: UsersRound, to: "/admin/groups" },
+  { label: "Roles", icon: KeyRound, to: "/admin/roles" },
   { label: "Settings", icon: Settings, to: "/settings" },
+  { label: "Users", icon: Users, to: "/admin/users" },
 ];
 
 function NavItem({

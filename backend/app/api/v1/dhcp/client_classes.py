@@ -6,15 +6,18 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.v1.dhcp._audit import write_audit
+from app.core.permissions import require_resource_permission
 from app.models.dhcp import DHCPClientClass, DHCPServer
 
-router = APIRouter(tags=["dhcp"])
+router = APIRouter(
+    tags=["dhcp"], dependencies=[Depends(require_resource_permission("dhcp_client_class"))]
+)
 
 
 class ClientClassCreate(BaseModel):

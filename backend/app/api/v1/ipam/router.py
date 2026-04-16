@@ -6,7 +6,7 @@ from datetime import datetime
 from typing import Any
 
 import structlog
-from fastapi import APIRouter, HTTPException, Query, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, field_validator, model_validator
 from sqlalchemy import delete, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -14,13 +14,29 @@ from sqlalchemy.orm import selectinload
 
 from app.api.deps import DB, CurrentUser
 from app.api.v1.ipam.io_router import router as io_router
+from app.core.permissions import require_any_resource_permission
 from app.models.audit import AuditLog
 from app.models.dns import DNSRecord, DNSZone
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet, SubnetDomain
 from app.models.vlans import VLAN
 
 logger = structlog.get_logger(__name__)
-router = APIRouter()
+
+# Router-level permission gate: GET → `read`, POST/PUT/PATCH → `write`,
+# DELETE → `delete`. Endpoints under /ipam manipulate IPAM resources, so we
+# accept any of the four IPAM resource types (an "IPAM Editor" role grants all
+# four; a scoped Subnet-writer role would be matched here for subnet routes
+# and fail for space routes — which is intended). Per-row scoping happens
+# inline in the handlers via `user_has_permission`.
+router = APIRouter(
+    dependencies=[
+        Depends(
+            require_any_resource_permission(
+                "ip_space", "ip_block", "subnet", "ip_address", "custom_field"
+            )
+        )
+    ]
+)
 router.include_router(io_router)
 
 # ── Internal helpers ───────────────────────────────────────────────────────────
@@ -65,6 +81,45 @@ async def _assert_no_overlap(
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=f"Network {network} overlaps with existing subnet {row[0]}",
+        )
+
+
+async def _assert_no_block_overlap(
+    db: AsyncSession,
+    space_id: uuid.UUID,
+    network: str,
+    parent_block_id: uuid.UUID | None,
+    exclude_id: uuid.UUID | None = None,
+) -> None:
+    """Raise 409 if the proposed block overlaps (or exactly duplicates) any
+    existing sibling block — i.e. another block in the same space at the
+    same level of the tree (top-level, or sharing ``parent_block_id``).
+
+    Parent/child relationships across levels are intentionally allowed: a
+    child explicitly declaring its parent is expected to be contained within
+    that parent. The sibling-only check catches the common mistake of
+    duplicating a block at the same level without triggering false positives
+    for a legitimate reparent / nesting.
+    """
+    q = (
+        "SELECT network FROM ip_block "
+        "WHERE space_id = CAST(:space_id AS uuid) "
+        "AND network && CAST(:network AS cidr)"
+    )
+    params: dict[str, Any] = {"space_id": str(space_id), "network": network}
+    if parent_block_id is None:
+        q += " AND parent_block_id IS NULL"
+    else:
+        q += " AND parent_block_id = CAST(:parent_id AS uuid)"
+        params["parent_id"] = str(parent_block_id)
+    if exclude_id:
+        q += " AND id != CAST(:exclude_id AS uuid)"
+        params["exclude_id"] = str(exclude_id)
+    row = (await db.execute(text(q), params)).fetchone()
+    if row:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Block {network} overlaps with existing block {row[0]}",
         )
 
 
@@ -1102,6 +1157,12 @@ async def create_block(body: IPBlockCreate, current_user: CurrentUser, db: DB) -
                 detail=f"{body.network} is not contained within parent block {parent.network}",
             )
 
+    # Reject duplicates / overlaps at the same tree level.
+    canonical = str(_parse_network(body.network))
+    await _assert_no_block_overlap(
+        db, body.space_id, canonical, body.parent_block_id
+    )
+
     block = IPBlock(**body.model_dump())
     db.add(block)
     await db.flush()
@@ -1178,6 +1239,15 @@ async def update_block(
                 if cursor.parent_block_id is None:
                     break
                 cursor = await db.get(IPBlock, cursor.parent_block_id)
+        # Reject overlap with future siblings under the new parent (or with
+        # top-level blocks when moving to the root).
+        await _assert_no_block_overlap(
+            db,
+            block.space_id,
+            str(block.network),
+            new_parent_id,
+            exclude_id=block.id,
+        )
         block.parent_block_id = new_parent_id
 
     changes = body.model_dump(
@@ -3291,6 +3361,10 @@ class IPAddressBulkChanges(BaseModel):
     # Merged into existing dicts (set key=null to remove).
     tags: dict[str, Any] | None = None
     custom_fields: dict[str, Any] | None = None
+    # Apply a forward DNS zone change to every selected IP. Triggers per-row
+    # record reconciliation (create / move / delete) via _sync_dns_record.
+    # Use the empty string ``""`` to clear a zone assignment.
+    dns_zone_id: str | None = None
 
     @field_validator("status")
     @classmethod
@@ -3352,6 +3426,19 @@ async def bulk_edit_addresses(
     tags_patch = body.changes.tags
     cf_patch = body.changes.custom_fields
     scalar_changes = {k: v for k, v in changes.items() if k in ("status", "description")}
+    apply_zone = body.changes.dns_zone_id is not None
+    new_zone_id: uuid.UUID | None = None
+    if apply_zone and body.changes.dns_zone_id:
+        try:
+            new_zone_id = uuid.UUID(body.changes.dns_zone_id)
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="dns_zone_id must be a valid UUID or the empty string to clear",
+            ) from None
+
+    # Cache the subnet rows so per-IP DNS sync doesn't re-query for every row.
+    subnet_cache: dict[uuid.UUID, Subnet] = {}
 
     for ip in rows:
         if ip.status in ("network", "broadcast", "orphan"):
@@ -3382,6 +3469,16 @@ async def bulk_edit_addresses(
                     merged_cf[k] = v
             old["custom_fields"] = ip.custom_fields or {}
             ip.custom_fields = merged_cf
+
+        if apply_zone:
+            subnet = subnet_cache.get(ip.subnet_id)
+            if subnet is None:
+                subnet = await db.get(Subnet, ip.subnet_id)
+                if subnet is not None:
+                    subnet_cache[ip.subnet_id] = subnet
+            if subnet is not None:
+                old["forward_zone_id"] = str(ip.forward_zone_id) if ip.forward_zone_id else None
+                await _sync_dns_record(db, ip, subnet, zone_id=new_zone_id, action="update")
 
         db.add(
             _audit(

@@ -51,11 +51,92 @@ async def _seed_default_admin() -> None:
             logger.debug("default_admin_seed_skipped", reason=str(exc))
 
 
+# Built-in roles installed on first boot. Shape matches docs/PERMISSIONS.md.
+# Keys are the role names; the tuple is (description, permissions).
+_BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
+    "Superadmin": (
+        "Full control — wildcard on all actions and resources.",
+        [{"action": "*", "resource_type": "*"}],
+    ),
+    "Viewer": (
+        "Read-only access to every resource.",
+        [{"action": "read", "resource_type": "*"}],
+    ),
+    "IPAM Editor": (
+        "Full CRUD on IPAM objects (spaces, blocks, subnets, addresses, VLANs, custom fields).",
+        [
+            {"action": "admin", "resource_type": "ip_space"},
+            {"action": "admin", "resource_type": "ip_block"},
+            {"action": "admin", "resource_type": "subnet"},
+            {"action": "admin", "resource_type": "ip_address"},
+            {"action": "admin", "resource_type": "vlan"},
+            {"action": "admin", "resource_type": "custom_field"},
+        ],
+    ),
+    "DNS Editor": (
+        "Full CRUD on DNS zones, records, server groups and blocklists.",
+        [
+            {"action": "admin", "resource_type": "dns_group"},
+            {"action": "admin", "resource_type": "dns_zone"},
+            {"action": "admin", "resource_type": "dns_record"},
+            {"action": "admin", "resource_type": "dns_blocklist"},
+        ],
+    ),
+    "DHCP Editor": (
+        "Full CRUD on DHCP servers, scopes, pools, statics and client classes.",
+        [
+            {"action": "admin", "resource_type": "dhcp_server"},
+            {"action": "admin", "resource_type": "dhcp_scope"},
+            {"action": "admin", "resource_type": "dhcp_pool"},
+            {"action": "admin", "resource_type": "dhcp_static"},
+            {"action": "admin", "resource_type": "dhcp_client_class"},
+        ],
+    ),
+}
+
+
+async def _seed_builtin_roles() -> None:
+    """Insert built-in roles on first start; refresh their permissions on every boot.
+
+    The permissions on built-in roles are owned by the code, not the admin UI —
+    if the role already exists we still overwrite `permissions` and `description`
+    so upgrades ship new resource types without a manual edit. `name` is used
+    as the stable identity; admins who want to tweak built-in permission sets
+    should clone the role first.
+    """
+    from sqlalchemy import select
+
+    from app.db import AsyncSessionLocal
+    from app.models.auth import Role
+
+    async with AsyncSessionLocal() as session:
+        try:
+            for name, (description, perms) in _BUILTIN_ROLES.items():
+                existing = await session.scalar(select(Role).where(Role.name == name))
+                if existing is None:
+                    session.add(
+                        Role(
+                            name=name,
+                            description=description,
+                            is_builtin=True,
+                            permissions=perms,
+                        )
+                    )
+                else:
+                    existing.description = description
+                    existing.permissions = perms
+                    existing.is_builtin = True
+            await session.commit()
+        except Exception as exc:
+            logger.debug("builtin_roles_seed_skipped", reason=str(exc))
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     configure_logging()
     logger.info("startup", service="api", version="0.1.0", debug=settings.debug)
     await _seed_default_admin()
+    await _seed_builtin_roles()
     yield
     logger.info("shutdown", service="api")
 

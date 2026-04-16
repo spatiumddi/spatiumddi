@@ -1,4 +1,6 @@
-from sqlalchemy import Boolean, Integer, String
+from datetime import datetime
+
+from sqlalchemy import Boolean, DateTime, Integer, String
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -14,6 +16,10 @@ class PlatformSettings(Base):
 
     # Branding
     app_title: Mapped[str] = mapped_column(String(255), nullable=False, default="SpatiumDDI")
+
+    # External-facing URL (used for OIDC / SAML redirect + callback URLs). Empty
+    # means "derive from the incoming request" at runtime.
+    app_base_url: Mapped[str] = mapped_column(String(500), nullable=False, default="")
 
     # IP allocation
     ip_allocation_strategy: Mapped[str] = mapped_column(
@@ -53,6 +59,20 @@ class PlatformSettings(Base):
         String(20), nullable=False, default="auto"
     )
     dns_recursive_by_default: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+    # IPAM ↔ DNS auto-sync (Celery beat fires every 60s, task gates on these).
+    dns_auto_sync_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    dns_auto_sync_interval_minutes: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=60
+    )
+    # When False (default), auto-sync only creates/updates records; stale records
+    # (auto-generated rows pointing at deleted IPs) are left for manual cleanup.
+    dns_auto_sync_delete_stale: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+    dns_auto_sync_last_run_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     # DHCP defaults — applied as the initial values when creating a new DHCP scope
     dhcp_default_dns_servers: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)

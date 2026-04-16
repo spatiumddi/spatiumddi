@@ -9,6 +9,7 @@ celery_app = Celery(
     backend=settings.celery_result_backend,
     include=[
         "app.tasks.ipam",
+        "app.tasks.ipam_dns_sync",
         "app.tasks.dns",
         "app.tasks.dhcp_health",
         "app.tasks.dhcp_lease_cleanup",
@@ -33,6 +34,7 @@ celery_app.conf.update(
     worker_prefetch_multiplier=1,
     task_routes={
         "app.tasks.ipam.*": {"queue": "ipam"},
+        "app.tasks.ipam_dns_sync.*": {"queue": "ipam"},
         "app.tasks.dns.*": {"queue": "dns"},
         "app.tasks.dhcp_health.*": {"queue": "dhcp"},
         "app.tasks.dhcp_lease_cleanup.*": {"queue": "dhcp"},
@@ -53,6 +55,14 @@ celery_app.conf.update(
         "dhcp-lease-cleanup": {
             "task": "app.tasks.dhcp_lease_cleanup.sweep_expired_leases",
             "schedule": schedule(run_every=300.0),
+        },
+        # Every 60 s, tick the IPAM↔DNS auto-sync task. The task itself
+        # checks ``PlatformSettings.dns_auto_sync_enabled`` and the per-run
+        # interval, so changing cadence in the UI takes effect without
+        # restarting celery-beat.
+        "ipam-dns-auto-sync": {
+            "task": "app.tasks.ipam_dns_sync.auto_sync_ipam_dns",
+            "schedule": schedule(run_every=60.0),
         },
     },
 )

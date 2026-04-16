@@ -27,6 +27,7 @@ import {
   Info,
   Filter,
   Search,
+  ListTree,
 } from "lucide-react";
 import {
   dnsApi,
@@ -36,12 +37,15 @@ import {
   type DNSZone,
   type DNSView,
   type DNSRecord,
+  type DNSGroupRecord,
   type DNSImportPreview,
   type DNSRecordChange,
   type DNSBlockList,
   type DNSBlockListEntry,
   type DNSBlockListException,
 } from "@/lib/api";
+import { useTableSort, SortableTh } from "@/lib/useTableSort";
+import { cn } from "@/lib/utils";
 
 // ── Shared primitives ─────────────────────────────────────────────────────────
 
@@ -2354,6 +2358,518 @@ function OptionsTab({ groupId }: { groupId: string }) {
   );
 }
 
+// ── Records Tab ───────────────────────────────────────────────────────────────
+// Group-wide view of every record across every zone. Mirrors the IPAM subnet
+// address-table filter pattern: per-column inputs with a contains/begins/ends
+// /regex mode picker for text columns, dropdowns for Type / Zone / View /
+// Source, click-to-sort on every header.
+
+type RecordFilterMode = "contains" | "begins" | "ends" | "regex";
+
+function applyTextFilter(
+  value: string | null | undefined,
+  filter: string,
+  mode: RecordFilterMode,
+): boolean {
+  if (!filter) return true;
+  const v = (value ?? "").toLowerCase();
+  const f = filter.toLowerCase();
+  if (mode === "begins") return v.startsWith(f);
+  if (mode === "ends") return v.endsWith(f);
+  if (mode === "regex") {
+    try {
+      return new RegExp(filter, "i").test(value ?? "");
+    } catch {
+      return true;
+    }
+  }
+  return v.includes(f);
+}
+
+function RecordsTab({
+  group,
+  onSelectZone,
+}: {
+  group: DNSServerGroup;
+  onSelectZone: (z: DNSZone) => void;
+}) {
+  const qc = useQueryClient();
+  const { data: records = [], isLoading } = useQuery({
+    queryKey: ["dns-group-records", group.id],
+    queryFn: () => dnsApi.listGroupRecords(group.id),
+  });
+  const { data: zones = [] } = useQuery({
+    queryKey: ["dns-zones", group.id],
+    queryFn: () => dnsApi.listZones(group.id),
+  });
+  const { data: views = [] } = useQuery({
+    queryKey: ["dns-views", group.id],
+    queryFn: () => dnsApi.listViews(group.id),
+  });
+
+  type ColKey = "name" | "type" | "zone" | "value" | "ttl" | "view" | "source";
+
+  const [colFilters, setColFilters] = useState<Record<ColKey, string>>({
+    name: "",
+    type: "",
+    zone: "",
+    value: "",
+    ttl: "",
+    view: "",
+    source: "",
+  });
+  const [filterModes, setFilterModes] = useState<
+    Partial<Record<ColKey, RecordFilterMode>>
+  >({});
+  const [openFilterMenu, setOpenFilterMenu] = useState<ColKey | null>(null);
+  const [editing, setEditing] = useState<DNSGroupRecord | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState<DNSGroupRecord | null>(
+    null,
+  );
+
+  const uniqueTypes = Array.from(
+    new Set(records.map((r) => r.record_type)),
+  ).sort();
+
+  const filtered = records.filter((r) => {
+    if (
+      !applyTextFilter(
+        r.name || "@",
+        colFilters.name,
+        filterModes.name ?? "contains",
+      )
+    )
+      return false;
+    if (colFilters.type && r.record_type !== colFilters.type) return false;
+    if (
+      !applyTextFilter(
+        r.zone_name,
+        colFilters.zone,
+        filterModes.zone ?? "contains",
+      )
+    )
+      return false;
+    if (
+      !applyTextFilter(
+        r.value,
+        colFilters.value,
+        filterModes.value ?? "contains",
+      )
+    )
+      return false;
+    if (colFilters.ttl) {
+      const ttlStr = r.ttl === null ? "" : String(r.ttl);
+      if (!ttlStr.includes(colFilters.ttl)) return false;
+    }
+    if (colFilters.view) {
+      if (colFilters.view === "__none__") {
+        if (r.view_id) return false;
+      } else if (r.view_id !== colFilters.view) {
+        return false;
+      }
+    }
+    if (colFilters.source) {
+      const src = r.auto_generated ? "auto" : "user";
+      if (src !== colFilters.source) return false;
+    }
+    return true;
+  });
+
+  const { sorted, sort, toggle } = useTableSort<DNSGroupRecord, ColKey>(
+    filtered,
+    { key: "name", dir: "asc" },
+    (row, key) => {
+      if (key === "name") return row.fqdn;
+      if (key === "type") return row.record_type;
+      if (key === "zone") return row.zone_name;
+      if (key === "value") return row.value;
+      if (key === "ttl") return row.ttl ?? -1;
+      if (key === "view") return row.view_name ?? "";
+      if (key === "source") return row.auto_generated ? "auto" : "user";
+      return "";
+    },
+  );
+
+  const deleteMut = useMutation({
+    mutationFn: (rec: DNSGroupRecord) =>
+      dnsApi.deleteRecord(group.id, rec.zone_id, rec.id),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["dns-group-records", group.id] });
+      qc.invalidateQueries({ queryKey: ["dns-records"] });
+      setConfirmDelete(null);
+    },
+  });
+
+  const hasActiveFilter = Object.values(colFilters).some(Boolean);
+  function clearFilters() {
+    setColFilters({
+      name: "",
+      type: "",
+      zone: "",
+      value: "",
+      ttl: "",
+      view: "",
+      source: "",
+    });
+    setFilterModes({});
+  }
+
+  const TEXT_COLS: ColKey[] = ["name", "zone", "value", "ttl"];
+
+  function renderFilterCell(col: ColKey) {
+    if (col === "type") {
+      return (
+        <select
+          value={colFilters.type}
+          onChange={(e) =>
+            setColFilters((p) => ({ ...p, type: e.target.value }))
+          }
+          className="w-full rounded border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
+        >
+          <option value="">All</option>
+          {uniqueTypes.map((t) => (
+            <option key={t} value={t}>
+              {t}
+            </option>
+          ))}
+        </select>
+      );
+    }
+    if (col === "view") {
+      return (
+        <select
+          value={colFilters.view}
+          onChange={(e) =>
+            setColFilters((p) => ({ ...p, view: e.target.value }))
+          }
+          className="w-full rounded border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
+        >
+          <option value="">All</option>
+          <option value="__none__">— none —</option>
+          {views.map((v) => (
+            <option key={v.id} value={v.id}>
+              {v.name}
+            </option>
+          ))}
+        </select>
+      );
+    }
+    if (col === "source") {
+      return (
+        <select
+          value={colFilters.source}
+          onChange={(e) =>
+            setColFilters((p) => ({ ...p, source: e.target.value }))
+          }
+          className="w-full rounded border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
+        >
+          <option value="">All</option>
+          <option value="user">User</option>
+          <option value="auto">Auto (IPAM/DHCP)</option>
+        </select>
+      );
+    }
+    if (!TEXT_COLS.includes(col)) return null;
+    const mode = filterModes[col] ?? "contains";
+    return (
+      <div className="flex items-center">
+        <input
+          type="text"
+          value={colFilters[col]}
+          onChange={(e) =>
+            setColFilters((p) => ({ ...p, [col]: e.target.value }))
+          }
+          placeholder="Filter…"
+          className="w-full min-w-0 rounded-l border border-r-0 bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
+        />
+        <div className="relative">
+          <button
+            type="button"
+            onClick={() =>
+              setOpenFilterMenu(openFilterMenu === col ? null : col)
+            }
+            className="rounded-r border bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground hover:bg-accent"
+            title="Filter mode"
+          >
+            {mode === "begins"
+              ? "^"
+              : mode === "ends"
+                ? "$"
+                : mode === "regex"
+                  ? ".*"
+                  : "⊂"}
+          </button>
+          {openFilterMenu === col && (
+            <div className="absolute left-0 top-full z-30 mt-0.5 w-32 rounded-md border bg-popover shadow-md">
+              {(
+                [
+                  ["contains", "⊂ Contains"],
+                  ["begins", "^ Begins"],
+                  ["ends", "$ Ends"],
+                  ["regex", ".* Regex"],
+                ] as const
+              ).map(([m, label]) => (
+                <button
+                  key={m}
+                  type="button"
+                  onClick={() => {
+                    setFilterModes((p) => ({ ...p, [col]: m }));
+                    setOpenFilterMenu(null);
+                  }}
+                  className={cn(
+                    "w-full px-3 py-1.5 text-left text-xs hover:bg-accent",
+                    mode === m && "font-semibold text-primary",
+                  )}
+                >
+                  {label}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  if (isLoading) {
+    return <p className="text-sm text-muted-foreground">Loading records…</p>;
+  }
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center justify-between">
+        <p className="text-xs text-muted-foreground">
+          {filtered.length.toLocaleString()} of{" "}
+          {records.length.toLocaleString()}{" "}
+          {records.length === 1 ? "record" : "records"}
+        </p>
+        {hasActiveFilter && (
+          <button
+            onClick={clearFilters}
+            className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs text-muted-foreground hover:bg-accent"
+          >
+            <X className="h-3 w-3" />
+            Clear filters
+          </button>
+        )}
+      </div>
+
+      <div className="overflow-hidden rounded-lg border">
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="border-b bg-muted/40 text-xs">
+              <SortableTh sortKey="name" sort={sort} onSort={toggle}>
+                Name
+              </SortableTh>
+              <SortableTh sortKey="type" sort={sort} onSort={toggle}>
+                Type
+              </SortableTh>
+              <SortableTh sortKey="zone" sort={sort} onSort={toggle}>
+                Zone
+              </SortableTh>
+              <SortableTh sortKey="value" sort={sort} onSort={toggle}>
+                Value
+              </SortableTh>
+              <SortableTh
+                sortKey="ttl"
+                sort={sort}
+                onSort={toggle}
+                align="right"
+              >
+                TTL
+              </SortableTh>
+              <SortableTh sortKey="view" sort={sort} onSort={toggle}>
+                View
+              </SortableTh>
+              <SortableTh sortKey="source" sort={sort} onSort={toggle}>
+                Source
+              </SortableTh>
+              <th className="px-2 py-2 text-right" />
+            </tr>
+            <tr className="border-b bg-muted/10 text-xs">
+              {(
+                [
+                  "name",
+                  "type",
+                  "zone",
+                  "value",
+                  "ttl",
+                  "view",
+                  "source",
+                ] as ColKey[]
+              ).map((col) => (
+                <td key={col} className="px-2 py-1">
+                  {renderFilterCell(col)}
+                </td>
+              ))}
+              <td />
+            </tr>
+          </thead>
+          <tbody>
+            {sorted.length === 0 ? (
+              <tr>
+                <td
+                  colSpan={8}
+                  className="px-4 py-8 text-center text-sm text-muted-foreground"
+                >
+                  {records.length === 0
+                    ? "No records in this group yet."
+                    : "No records match the active filters."}
+                </td>
+              </tr>
+            ) : (
+              sorted.map((rec) => {
+                const zone = zones.find((z) => z.id === rec.zone_id);
+                return (
+                  <tr
+                    key={rec.id}
+                    className="border-b last:border-0 hover:bg-muted/20"
+                  >
+                    <td className="px-4 py-2 font-mono text-xs">
+                      <button
+                        onClick={() => zone && onSelectZone(zone)}
+                        className="hover:underline"
+                        title="Open zone"
+                      >
+                        {rec.fqdn}
+                      </button>
+                    </td>
+                    <td className="px-4 py-2">
+                      <span className="inline-flex items-center rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium">
+                        {rec.record_type}
+                      </span>
+                    </td>
+                    <td className="px-4 py-2 font-mono text-xs text-muted-foreground">
+                      {rec.zone_name}
+                    </td>
+                    <td className="px-4 py-2 font-mono text-xs text-muted-foreground">
+                      {rec.value}
+                    </td>
+                    <td className="px-4 py-2 text-right text-xs tabular-nums text-muted-foreground">
+                      {rec.ttl ?? (
+                        <span className="text-muted-foreground/40">—</span>
+                      )}
+                    </td>
+                    <td className="px-4 py-2 text-xs text-muted-foreground">
+                      {rec.view_name ?? (
+                        <span className="text-muted-foreground/40">—</span>
+                      )}
+                    </td>
+                    <td className="px-4 py-2">
+                      {rec.auto_generated ? (
+                        <span
+                          className="inline-flex items-center rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 dark:bg-amber-900/30 dark:text-amber-400"
+                          title="Auto-managed by IPAM or DHCP"
+                        >
+                          auto
+                        </span>
+                      ) : (
+                        <span className="inline-flex items-center rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium text-muted-foreground">
+                          user
+                        </span>
+                      )}
+                    </td>
+                    <td className="px-2 py-2 text-right">
+                      <div className="flex items-center justify-end gap-1">
+                        <button
+                          onClick={() => setEditing(rec)}
+                          disabled={rec.auto_generated}
+                          className="rounded p-1 text-muted-foreground hover:text-foreground disabled:opacity-30 disabled:pointer-events-none"
+                          title={
+                            rec.auto_generated
+                              ? "Auto-managed — edit the source IP/lease"
+                              : "Edit"
+                          }
+                        >
+                          <Pencil className="h-3.5 w-3.5" />
+                        </button>
+                        <button
+                          onClick={() => setConfirmDelete(rec)}
+                          disabled={rec.auto_generated}
+                          className="rounded p-1 text-muted-foreground hover:text-destructive disabled:opacity-30 disabled:pointer-events-none"
+                          title={
+                            rec.auto_generated
+                              ? "Auto-managed — delete the source IP/lease"
+                              : "Delete"
+                          }
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </button>
+                      </div>
+                    </td>
+                  </tr>
+                );
+              })
+            )}
+          </tbody>
+        </table>
+      </div>
+
+      {editing && (
+        <RecordModal
+          groupId={group.id}
+          zoneId={editing.zone_id}
+          zoneName={editing.zone_name}
+          record={{
+            id: editing.id,
+            zone_id: editing.zone_id,
+            view_id: editing.view_id,
+            name: editing.name,
+            fqdn: editing.fqdn,
+            record_type: editing.record_type,
+            value: editing.value,
+            ttl: editing.ttl,
+            priority: editing.priority,
+            weight: editing.weight,
+            port: editing.port,
+            auto_generated: editing.auto_generated,
+            created_at: editing.created_at,
+            modified_at: editing.modified_at,
+          }}
+          onClose={() => {
+            setEditing(null);
+            qc.invalidateQueries({
+              queryKey: ["dns-group-records", group.id],
+            });
+          }}
+        />
+      )}
+
+      {confirmDelete && (
+        <Modal title="Delete DNS record" onClose={() => setConfirmDelete(null)}>
+          <div className="space-y-3">
+            <p className="text-sm">
+              Delete{" "}
+              <span className="font-mono font-medium">
+                {confirmDelete.fqdn}
+              </span>{" "}
+              <span className="inline-flex items-center rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium">
+                {confirmDelete.record_type}
+              </span>
+              ? This cannot be undone.
+            </p>
+            <div className="flex justify-end gap-2">
+              <button
+                onClick={() => setConfirmDelete(null)}
+                className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => deleteMut.mutate(confirmDelete)}
+                disabled={deleteMut.isPending}
+                className="rounded-md bg-destructive px-3 py-1.5 text-sm text-destructive-foreground hover:bg-destructive/90 disabled:opacity-50"
+              >
+                {deleteMut.isPending ? "Deleting…" : "Delete"}
+              </button>
+            </div>
+          </div>
+        </Modal>
+      )}
+    </div>
+  );
+}
+
 // ── Zones Tab ─────────────────────────────────────────────────────────────────
 
 function ZonesTab({
@@ -3444,6 +3960,7 @@ function BlocklistDetail({
 
 type GroupTab =
   | "zones"
+  | "records"
   | "servers"
   | "views"
   | "acls"
@@ -3475,6 +3992,7 @@ function GroupDetailView({
 
   const tabs: { id: GroupTab; label: string; icon: React.ElementType }[] = [
     { id: "zones", label: "Zones", icon: FileText },
+    { id: "records", label: "Records", icon: ListTree },
     { id: "servers", label: "Servers", icon: Cpu },
     { id: "views", label: "Views", icon: Eye },
     { id: "acls", label: "ACLs", icon: Shield },
@@ -3545,6 +4063,9 @@ function GroupDetailView({
       <div className="flex-1 overflow-auto p-5">
         {tab === "zones" && (
           <ZonesTab group={group} onSelectZone={onSelectZone} />
+        )}
+        {tab === "records" && (
+          <RecordsTab group={group} onSelectZone={onSelectZone} />
         )}
         {tab === "servers" && <ServersTab group={group} />}
         {tab === "views" && <ViewsTab group={group} />}

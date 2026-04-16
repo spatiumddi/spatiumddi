@@ -5,15 +5,16 @@ from __future__ import annotations
 import uuid
 
 import structlog
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, field_validator
 from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser
+from app.core.permissions import require_resource_permission
 from app.models.ipam import CustomFieldDefinition
 
 logger = structlog.get_logger(__name__)
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_resource_permission("custom_field"))])
 
 _VALID_RESOURCE_TYPES = {"ip_space", "ip_block", "subnet", "ip_address"}
 _VALID_FIELD_TYPES = {"text", "number", "boolean", "select", "url", "email"}
@@ -131,12 +132,7 @@ async def create_custom_field(
     current_user: CurrentUser,
     db: DB,
 ) -> CustomFieldResponse:
-    if not current_user.is_superadmin:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only superadmins can create custom field definitions",
-        )
-
+    # Permission check happens at router-level (custom_field write).
     # Check uniqueness
     existing = await db.execute(
         select(CustomFieldDefinition).where(
@@ -194,12 +190,7 @@ async def update_custom_field(
     current_user: CurrentUser,
     db: DB,
 ) -> CustomFieldResponse:
-    if not current_user.is_superadmin:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only superadmins can modify custom field definitions",
-        )
-
+    # Permission check happens at router-level (custom_field write).
     field = await db.get(CustomFieldDefinition, field_id)
     if field is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Custom field not found")
@@ -222,12 +213,7 @@ async def delete_custom_field(
     current_user: CurrentUser,
     db: DB,
 ) -> None:
-    if not current_user.is_superadmin:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN,
-            detail="Only superadmins can delete custom field definitions",
-        )
-
+    # Permission check happens at router-level (custom_field delete).
     field = await db.get(CustomFieldDefinition, field_id)
     if field is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Custom field not found")

@@ -6,13 +6,14 @@ import zipfile
 from datetime import UTC, datetime
 
 import structlog
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, field_validator
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
+from app.core.permissions import require_any_resource_permission
 from app.models.audit import AuditLog
 from app.models.dns import (
     DNSAcl,
@@ -36,7 +37,18 @@ from app.services.dns_io import (
 )
 
 logger = structlog.get_logger(__name__)
-router = APIRouter()
+
+# Router-level RBAC: GET=read, POST/PUT/PATCH=write, DELETE=delete. The DNS
+# router covers server groups, servers, views, ACLs, zones and records, so a
+# user with `admin` on any of (dns_group, dns_zone, dns_record) passes the
+# router gate. Handlers that need finer scoping (e.g. "record write permitted
+# only when dns_zone permits write") can do inline checks with
+# `user_has_permission`.
+router = APIRouter(
+    dependencies=[
+        Depends(require_any_resource_permission("dns_group", "dns_zone", "dns_record"))
+    ]
+)
 
 VALID_DRIVERS = {"bind9"}
 VALID_GROUP_TYPES = {"internal", "external", "dmz", "custom"}
@@ -1244,6 +1256,92 @@ async def delete_zone(
 
 
 # ── Record endpoints ────────────────────────────────────────────────────────
+
+
+class GroupRecordResponse(BaseModel):
+    """Record list item for the group-wide Records tab.
+
+    Includes zone + view name context so the UI doesn't have to join, and
+    all DNSRecord fields so the existing RecordModal can edit in place.
+    """
+
+    id: uuid.UUID
+    zone_id: uuid.UUID
+    zone_name: str
+    view_id: uuid.UUID | None
+    view_name: str | None
+    name: str
+    fqdn: str
+    record_type: str
+    value: str
+    ttl: int | None
+    priority: int | None
+    weight: int | None
+    port: int | None
+    auto_generated: bool
+    created_at: datetime
+    modified_at: datetime
+
+
+@router.get(
+    "/groups/{group_id}/records",
+    response_model=list[GroupRecordResponse],
+)
+async def list_group_records(
+    group_id: uuid.UUID, db: DB, _: CurrentUser
+) -> list[GroupRecordResponse]:
+    """Every record across every zone in the group, with zone + view context."""
+    await _require_group(group_id, db)
+
+    zones = list(
+        (await db.execute(select(DNSZone).where(DNSZone.group_id == group_id))).scalars().all()
+    )
+    if not zones:
+        return []
+    zone_by_id = {z.id: z for z in zones}
+
+    views = list(
+        (await db.execute(select(DNSView).where(DNSView.group_id == group_id))).scalars().all()
+    )
+    view_name_by_id = {v.id: v.name for v in views}
+
+    records = list(
+        (
+            await db.execute(
+                select(DNSRecord)
+                .where(DNSRecord.zone_id.in_(list(zone_by_id.keys())))
+                .order_by(DNSRecord.fqdn, DNSRecord.record_type)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    out: list[GroupRecordResponse] = []
+    for rec in records:
+        zone = zone_by_id.get(rec.zone_id)
+        if zone is None:
+            continue
+        out.append(
+            GroupRecordResponse(
+                id=rec.id,
+                zone_id=zone.id,
+                zone_name=zone.name.rstrip("."),
+                view_id=rec.view_id,
+                view_name=(view_name_by_id.get(rec.view_id) if rec.view_id else None),
+                name=rec.name,
+                fqdn=rec.fqdn,
+                record_type=rec.record_type,
+                value=rec.value,
+                ttl=rec.ttl,
+                priority=rec.priority,
+                weight=rec.weight,
+                port=rec.port,
+                auto_generated=rec.auto_generated,
+                created_at=rec.created_at,
+                modified_at=rec.modified_at,
+            )
+        )
+    return out
 
 
 @router.get("/groups/{group_id}/zones/{zone_id}/records", response_model=list[RecordResponse])

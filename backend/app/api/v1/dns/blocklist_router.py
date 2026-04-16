@@ -21,12 +21,13 @@ from datetime import datetime
 from typing import Any
 
 import structlog
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, field_validator
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
+from app.core.permissions import require_resource_permission
 from app.models.audit import AuditLog
 from app.models.dns import (
     DNSBlockList,
@@ -42,7 +43,7 @@ from app.services.dns_blocklist import (
 )
 
 logger = structlog.get_logger(__name__)
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_resource_permission("dns_blocklist"))])
 
 
 VALID_SOURCE_TYPES = {"manual", "url", "file_upload"}

@@ -5,15 +5,20 @@ from __future__ import annotations
 import uuid
 from datetime import datetime
 
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, field_validator
 from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.v1.dhcp._audit import write_audit
+from app.core.permissions import require_resource_permission
 from app.models.dhcp import DHCPServerGroup
 
-router = APIRouter(prefix="/server-groups", tags=["dhcp"])
+router = APIRouter(
+    prefix="/server-groups",
+    tags=["dhcp"],
+    dependencies=[Depends(require_resource_permission("dhcp_server"))],
+)
 
 VALID_MODES = {"standalone", "load-balancing", "hot-standby"}
 

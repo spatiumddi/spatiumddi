@@ -130,6 +130,12 @@ class DHCPScope(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
+    # Human label for the scope (optional, not unique). Useful when the same
+    # subnet is served by multiple scope rows (HA pair) and you want to tell
+    # them apart in the UI.
+    name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+
     lease_time: Mapped[int] = mapped_column(Integer, nullable=False, default=86400)
     min_lease_time: Mapped[int | None] = mapped_column(Integer, nullable=True)
     max_lease_time: Mapped[int | None] = mapped_column(Integer, nullable=True)

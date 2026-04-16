@@ -1,15 +1,16 @@
-"""Audit log read endpoints (superadmin only)."""
+"""Audit log read endpoints (superadmin or users with `read:audit_log`)."""
 
 from datetime import datetime
 
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Depends, Query
 from pydantic import BaseModel, field_validator
 from sqlalchemy import func, select
 
-from app.api.deps import DB, SuperAdmin
+from app.api.deps import DB
+from app.core.permissions import require_permission
 from app.models.audit import AuditLog
 
-router = APIRouter()
+router = APIRouter(dependencies=[Depends(require_permission("read", "audit_log"))])
 
 
 class AuditLogResponse(BaseModel):
@@ -46,7 +47,6 @@ class AuditLogPage(BaseModel):
 
 @router.get("", response_model=AuditLogPage)
 async def list_audit_log(
-    current_user: SuperAdmin,
     db: DB,
     limit: int = Query(default=50, ge=1, le=500),
     offset: int = Query(default=0, ge=0),
