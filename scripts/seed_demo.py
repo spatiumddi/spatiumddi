@@ -151,28 +151,28 @@ def main(base: str, user: str, pw: str):
 
     # ── DNS ───────────────────────────────────────────────────────────────
     print("Creating DNS group + zone + records…")
-    a.call("POST", "/api/v1/dns/server-groups", json={
+    a.call("POST", "/api/v1/dns/groups", json={
         "name": "default", "description": "Main DNS cluster",
-        "mode": "authoritative",
+        "group_type": "internal", "is_recursive": True,
     })
-    groups = a.call("GET", "/api/v1/dns/server-groups") or []
+    groups = a.call("GET", "/api/v1/dns/groups") or []
     g = find(groups, "name", "default")
     if g:
-        a.call("POST", f"/api/v1/dns/server-groups/{g['id']}/zones", json={
+        a.call("POST", f"/api/v1/dns/groups/{g['id']}/zones", json={
             "name": "corp.example.com", "zone_type": "primary",
-            "description": "Main internal zone",
+            "kind": "forward",
         })
-        zones = a.call("GET", f"/api/v1/dns/server-groups/{g['id']}/zones") or []
+        zones = a.call("GET", f"/api/v1/dns/groups/{g['id']}/zones") or []
         z = find(zones, "name", "corp.example.com")
         if z:
             for rec in [
-                {"name": "www", "type": "A", "value": "10.10.10.20", "ttl": 3600},
-                {"name": "mail", "type": "A", "value": "10.10.10.25", "ttl": 3600},
-                {"name": "@", "type": "MX", "value": "10 mail.corp.example.com.", "ttl": 3600},
-                {"name": "_sip._tcp", "type": "SRV", "value": "10 10 5060 voip.corp.example.com.", "ttl": 3600},
-                {"name": "office", "type": "TXT", "value": '"v=spf1 ip4:10.1.0.0/16 -all"', "ttl": 3600},
+                {"name": "www", "record_type": "A", "value": "10.10.10.20", "ttl": 3600},
+                {"name": "mail", "record_type": "A", "value": "10.10.10.25", "ttl": 3600},
+                {"name": "@", "record_type": "MX", "value": "10 mail.corp.example.com.", "ttl": 3600, "priority": 10},
+                {"name": "_sip._tcp", "record_type": "SRV", "value": "10 10 5060 voip.corp.example.com.", "ttl": 3600},
+                {"name": "office", "record_type": "TXT", "value": '"v=spf1 ip4:10.1.0.0/16 -all"', "ttl": 3600},
             ]:
-                a.call("POST", f"/api/v1/dns/zones/{z['id']}/records", json=rec)
+                a.call("POST", f"/api/v1/dns/groups/{g['id']}/zones/{z['id']}/records", json=rec)
 
     print("\n✓ Seed complete.")
 

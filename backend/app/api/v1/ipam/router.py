@@ -2324,9 +2324,14 @@ async def allocate_next_ip(
     subnet_id: uuid.UUID, body: NextIPRequest, current_user: CurrentUser, db: DB
 ) -> IPAddress:
     """Atomically allocate the next available IP in the subnet."""
-    # Lock the subnet row to serialise concurrent allocations
-    result = await db.execute(select(Subnet).where(Subnet.id == subnet_id).with_for_update())
-    subnet = result.scalar_one_or_none()
+    # Lock the subnet row to serialise concurrent allocations. `of=Subnet`
+    # restricts the FOR UPDATE to the base table; Subnet has joined-eager
+    # relationships (vlan, etc.) and Postgres rejects FOR UPDATE on the
+    # nullable side of an outer join.
+    result = await db.execute(
+        select(Subnet).where(Subnet.id == subnet_id).with_for_update(of=Subnet)
+    )
+    subnet = result.unique().scalar_one_or_none()
     if subnet is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
 
