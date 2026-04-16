@@ -26,6 +26,7 @@ import {
   Lock,
   Info,
   Filter,
+  Search,
 } from "lucide-react";
 import {
   dnsApi,
@@ -3039,28 +3040,32 @@ function BlocklistDetail({
 
       {/* Entries */}
       <div className="rounded-md border">
-        <div className="flex items-center gap-2 border-b p-2">
-          <input
-            className={`${inputCls} flex-1`}
-            placeholder="Search entries…"
-            value={q}
-            onChange={(e) => {
-              setQ(e.target.value);
-              setOffset(0);
-            }}
-          />
-          <input
-            className={inputCls}
-            placeholder="Add single domain"
-            value={newDomain}
-            onChange={(e) => setNewDomain(e.target.value)}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" && newDomain) {
-                e.preventDefault();
-                addEntry.mutate();
-              }
-            }}
-          />
+        <div className="space-y-2 border-b p-2">
+          <div className="relative">
+            <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+            <input
+              className={`${inputCls} w-full pl-8`}
+              placeholder="Search entries…"
+              value={q}
+              onChange={(e) => {
+                setQ(e.target.value);
+                setOffset(0);
+              }}
+            />
+          </div>
+          <div className="flex items-center gap-2">
+            <input
+              className={`${inputCls} flex-1`}
+              placeholder="Add single domain"
+              value={newDomain}
+              onChange={(e) => setNewDomain(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && newDomain) {
+                  e.preventDefault();
+                  addEntry.mutate();
+                }
+              }}
+            />
           <button
             className="rounded-md border px-2 py-1 text-xs hover:bg-accent"
             onClick={() => addEntry.mutate()}
@@ -3074,6 +3079,7 @@ function BlocklistDetail({
           >
             Bulk add
           </button>
+          </div>
         </div>
         <table className="w-full text-sm">
           <thead>
@@ -3165,19 +3171,19 @@ function BlocklistDetail({
         </div>
         <div className="flex items-center gap-2 border-b p-2">
           <input
-            className={inputCls}
+            className={`${inputCls} flex-1 min-w-0`}
             placeholder="domain"
             value={excDomain}
             onChange={(e) => setExcDomain(e.target.value)}
           />
           <input
-            className={`${inputCls} flex-1`}
+            className={`${inputCls} flex-1 min-w-0`}
             placeholder="reason (optional)"
             value={excReason}
             onChange={(e) => setExcReason(e.target.value)}
           />
           <button
-            className="rounded-md border px-2 py-1 text-xs hover:bg-accent"
+            className="flex-shrink-0 rounded-md border px-2 py-1 text-xs hover:bg-accent"
             onClick={() => addException.mutate()}
             disabled={!excDomain}
           >
