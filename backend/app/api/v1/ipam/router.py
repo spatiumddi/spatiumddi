@@ -2,7 +2,7 @@
 
 import ipaddress
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 import structlog
@@ -2102,6 +2102,112 @@ async def dns_sync_commit_space(
         )
     await db.commit()
     return DnsSyncCommitResponse(created=created, updated=updated, deleted=deleted, errors=errors)
+
+
+# ── Reverse-zone backfill ──────────────────────────────────────────────────────
+#
+# Subnets created before DNS was assigned never had their matching in-addr.arpa
+# / ip6.arpa zone auto-created. Rather than delete+recreate the subnet, the
+# operator can call these endpoints to create any missing reverse zones in
+# bulk. Idempotent — skips subnets whose reverse zone already exists.
+
+
+class BackfillReverseZonesResponse(BaseModel):
+    created: list[dict[str, str]] = []  # [{"subnet": "10.1.0.0/24", "zone": "0.1.10.in-addr.arpa"}]
+    skipped: int = 0  # subnets that already had a reverse zone or no DNS group
+
+
+async def _backfill_reverse_zones(
+    db: AsyncSession, subnets: list[Subnet], user: Any
+) -> BackfillReverseZonesResponse:
+    from app.services.dns.reverse_zone import (
+        compute_reverse_zone_name,
+        ensure_reverse_zone_for_subnet,
+    )
+
+    resp = BackfillReverseZonesResponse()
+    for s in subnets:
+        # Pre-check: does a reverse zone already exist for this network in
+        # any group? If so, it's not a candidate for backfill.
+        try:
+            expected_name = compute_reverse_zone_name(str(s.network))
+        except Exception:  # noqa: BLE001
+            resp.skipped += 1
+            continue
+        pre = await db.execute(
+            select(DNSZone).where(
+                DNSZone.name == expected_name, DNSZone.kind == "reverse"
+            )
+        )
+        if pre.scalar_one_or_none() is not None:
+            resp.skipped += 1
+            continue
+        try:
+            zone = await ensure_reverse_zone_for_subnet(db, s, user)
+        except Exception:  # noqa: BLE001
+            resp.skipped += 1
+            continue
+        if zone is not None:
+            resp.created.append({"subnet": str(s.network), "zone": zone.name})
+        else:
+            # Subnet has no effective DNS group → nothing to do.
+            resp.skipped += 1
+    return resp
+
+
+@router.post(
+    "/subnets/{subnet_id}/reverse-zones/backfill",
+    response_model=BackfillReverseZonesResponse,
+)
+async def backfill_reverse_zones_subnet(
+    subnet_id: uuid.UUID, current_user: CurrentUser, db: DB
+) -> BackfillReverseZonesResponse:
+    s = await db.get(Subnet, subnet_id)
+    if s is None:
+        raise HTTPException(status_code=404, detail="Subnet not found")
+    resp = await _backfill_reverse_zones(db, [s], current_user)
+    await db.commit()
+    return resp
+
+
+@router.post(
+    "/blocks/{block_id}/reverse-zones/backfill",
+    response_model=BackfillReverseZonesResponse,
+)
+async def backfill_reverse_zones_block(
+    block_id: uuid.UUID, current_user: CurrentUser, db: DB
+) -> BackfillReverseZonesResponse:
+    # Walk the block subtree (block + descendant blocks' subnets)
+    block_ids: set[uuid.UUID] = {block_id}
+    pending = [block_id]
+    while pending:
+        parent = pending.pop()
+        res = await db.execute(select(IPBlock).where(IPBlock.parent_block_id == parent))
+        for b in res.scalars().all():
+            block_ids.add(b.id)
+            pending.append(b.id)
+    subs_res = await db.execute(select(Subnet).where(Subnet.block_id.in_(block_ids)))
+    subnets = list(subs_res.scalars().all())
+    resp = await _backfill_reverse_zones(db, subnets, current_user)
+    await db.commit()
+    return resp
+
+
+@router.post(
+    "/spaces/{space_id}/reverse-zones/backfill",
+    response_model=BackfillReverseZonesResponse,
+)
+async def backfill_reverse_zones_space(
+    space_id: uuid.UUID, current_user: CurrentUser, db: DB
+) -> BackfillReverseZonesResponse:
+    space = await db.get(IPSpace, space_id)
+    if space is None:
+        raise HTTPException(status_code=404, detail="Space not found")
+    subs_res = await db.execute(select(Subnet).where(Subnet.space_id == space_id))
+    subnets = list(subs_res.scalars().all())
+    resp = await _backfill_reverse_zones(db, subnets, current_user)
+    await db.commit()
+    return resp
 
 
 # ── IP Addresses ───────────────────────────────────────────────────────────────

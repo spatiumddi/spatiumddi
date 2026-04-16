@@ -581,6 +581,96 @@ function DnsSettingsSection({
   );
 }
 
+// ─── Backfill Reverse Zones button ─────────────────────────────────────────
+
+function BackfillReverseZonesButton({
+  scope,
+  id,
+}: {
+  scope: "space" | "block" | "subnet";
+  id: string;
+}) {
+  const qc = useQueryClient();
+  const [result, setResult] = useState<{
+    created: { subnet: string; zone: string }[];
+    skipped: number;
+  } | null>(null);
+  const mut = useMutation({
+    mutationFn: () => {
+      if (scope === "space") return ipamApi.backfillReverseZonesSpace(id);
+      if (scope === "block") return ipamApi.backfillReverseZonesBlock(id);
+      return ipamApi.backfillReverseZonesSubnet(id);
+    },
+    onSuccess: (data) => {
+      setResult(data);
+      qc.invalidateQueries({ queryKey: ["dns-zones"] });
+    },
+  });
+  return (
+    <>
+      <button
+        onClick={() => mut.mutate()}
+        disabled={mut.isPending}
+        title="Create missing in-addr.arpa / ip6.arpa zones for every subnet with a DNS group (idempotent)"
+        className="flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm hover:bg-muted disabled:opacity-50"
+      >
+        <RefreshCw
+          className={cn("h-3.5 w-3.5", mut.isPending && "animate-spin")}
+        />
+        Backfill Reverse Zones
+      </button>
+      {result && (
+        <Modal
+          title="Reverse Zone Backfill"
+          onClose={() => setResult(null)}
+          wide
+        >
+          <div className="space-y-3">
+            <p className="text-sm">
+              Created <span className="font-medium">{result.created.length}</span>{" "}
+              new reverse zone{result.created.length !== 1 ? "s" : ""};{" "}
+              <span className="text-muted-foreground">{result.skipped} skipped</span>{" "}
+              (already existed or no DNS group configured).
+            </p>
+            {result.created.length > 0 && (
+              <div className="max-h-64 overflow-y-auto rounded-md border">
+                <table className="w-full text-sm">
+                  <thead className="bg-muted/40 text-xs">
+                    <tr>
+                      <th className="px-3 py-1.5 text-left">Subnet</th>
+                      <th className="px-3 py-1.5 text-left">Reverse Zone</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {result.created.map((c) => (
+                      <tr key={c.zone} className="border-t">
+                        <td className="px-3 py-1 font-mono text-xs">
+                          {c.subnet}
+                        </td>
+                        <td className="px-3 py-1 font-mono text-xs">
+                          {c.zone}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+            <div className="flex justify-end">
+              <button
+                onClick={() => setResult(null)}
+                className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </Modal>
+      )}
+    </>
+  );
+}
+
 // ─── Additional Zones dual-listbox ──────────────────────────────────────────
 
 function AdditionalZonesPicker({
@@ -1930,6 +2020,7 @@ function SubnetDetail({
               <Globe2 className="h-3.5 w-3.5" />
               Check DNS Sync
             </button>
+            <BackfillReverseZonesButton scope="subnet" id={subnet.id} />
             <button
               onClick={() => setShowOrphans(true)}
               title="List orphaned IPs in this subnet and permanently delete selected rows"
@@ -4814,6 +4905,7 @@ function BlockDetailView({
                   <Globe2 className="h-3.5 w-3.5" />
                   Check DNS Sync
                 </button>
+                <BackfillReverseZonesButton scope="block" id={block.id} />
                 <ExportButton scope={{ block_id: block.id }} label="Export" />
                 <button
                   onClick={() => setShowEdit(true)}
@@ -5589,6 +5681,7 @@ function SpaceTableView({
               <Globe2 className="h-3.5 w-3.5" />
               Check DNS Sync
             </button>
+            <BackfillReverseZonesButton scope="space" id={space.id} />
             <ExportButton scope={{ space_id: space.id }} label="Export" />
             <button
               onClick={() => setShowEditSpace(true)}

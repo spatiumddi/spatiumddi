@@ -451,6 +451,24 @@ export const ipamApi = {
       .then((r) => r.data),
   deleteAlias: (addressId: string, recordId: string) =>
     api.delete(`/ipam/addresses/${addressId}/aliases/${recordId}`),
+  backfillReverseZonesSpace: (spaceId: string) =>
+    api
+      .post<{ created: { subnet: string; zone: string }[]; skipped: number }>(
+        `/ipam/spaces/${spaceId}/reverse-zones/backfill`,
+      )
+      .then((r) => r.data),
+  backfillReverseZonesBlock: (blockId: string) =>
+    api
+      .post<{ created: { subnet: string; zone: string }[]; skipped: number }>(
+        `/ipam/blocks/${blockId}/reverse-zones/backfill`,
+      )
+      .then((r) => r.data),
+  backfillReverseZonesSubnet: (subnetId: string) =>
+    api
+      .post<{ created: { subnet: string; zone: string }[]; skipped: number }>(
+        `/ipam/subnets/${subnetId}/reverse-zones/backfill`,
+      )
+      .then((r) => r.data),
   purgeOrphans: (subnetId: string, ipIds: string[]) =>
     api
       .post<{ purged: number }>(`/ipam/subnets/${subnetId}/orphans/purge`, {
