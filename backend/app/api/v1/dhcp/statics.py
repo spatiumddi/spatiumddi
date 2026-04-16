@@ -14,6 +14,7 @@ from sqlalchemy import select
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.v1.dhcp._audit import write_audit
 from app.models.dhcp import DHCPPool, DHCPScope, DHCPStaticAssignment
+from app.models.ipam import IPAddress, Subnet
 
 router = APIRouter(tags=["dhcp"])
 
@@ -57,6 +58,55 @@ class StaticResponse(BaseModel):
     @classmethod
     def _inet_mac_to_str(cls, v: Any) -> Any:
         return str(v) if v is not None else v
+
+
+async def _upsert_ipam_for_static(
+    db, scope: DHCPScope, st: DHCPStaticAssignment
+) -> None:
+    """Create or update the IPAM row mirroring a static DHCP assignment.
+
+    The static is the source of truth for hostname/MAC; IPAM reflects it with
+    ``status='static_dhcp'`` and a back-link via ``static_assignment_id`` so the
+    subnet view shows the reservation alongside regular addresses.
+    """
+    ip_str = str(st.ip_address)
+    # Detach any previous IPAM row that was pointing at this static (IP change).
+    prior = await db.execute(
+        select(IPAddress).where(IPAddress.static_assignment_id == str(st.id))
+    )
+    for row in prior.scalars().all():
+        if str(row.address) == ip_str:
+            continue
+        row.static_assignment_id = None
+        if row.status == "static_dhcp":
+            row.status = "allocated"
+    # Find or create the IPAM row for this IP within the scope's subnet.
+    res = await db.execute(
+        select(IPAddress).where(
+            IPAddress.subnet_id == scope.subnet_id, IPAddress.address == ip_str
+        )
+    )
+    row = res.scalar_one_or_none()
+    if row is None:
+        row = IPAddress(subnet_id=scope.subnet_id, address=ip_str, status="static_dhcp")
+        db.add(row)
+    row.hostname = st.hostname or row.hostname
+    row.mac_address = str(st.mac_address)
+    row.status = "static_dhcp"
+    row.static_assignment_id = str(st.id)
+    await db.flush()
+    st.ip_address_id = row.id
+
+
+async def _detach_ipam_for_static(db, st: DHCPStaticAssignment) -> None:
+    """Release the IPAM row back to `allocated` when the static is removed."""
+    res = await db.execute(
+        select(IPAddress).where(IPAddress.static_assignment_id == str(st.id))
+    )
+    for row in res.scalars().all():
+        row.static_assignment_id = None
+        if row.status == "static_dhcp":
+            row.status = "allocated"
 
 
 async def _conflict_check(
@@ -128,6 +178,7 @@ async def create_static(
     )
     db.add(st)
     await db.flush()
+    await _upsert_ipam_for_static(db, scope, st)
     write_audit(
         db,
         user=user,
@@ -159,6 +210,8 @@ async def update_static(
         await _conflict_check(db, scope, new_ip, new_mac, exclude_id=st.id)
     for k, v in changes.items():
         setattr(st, k, v)
+    await db.flush()
+    await _upsert_ipam_for_static(db, scope, st)
     write_audit(
         db,
         user=user,
@@ -179,6 +232,7 @@ async def delete_static(static_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
     st = await db.get(DHCPStaticAssignment, static_id)
     if st is None:
         raise HTTPException(status_code=404, detail="Static assignment not found")
+    await _detach_ipam_for_static(db, st)
     write_audit(
         db,
         user=user,
