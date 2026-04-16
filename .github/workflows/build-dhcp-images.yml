@@ -3,6 +3,8 @@ name: Build DHCP Agent Images
 on:
   push:
     branches: [main]
+    tags:
+      - "[0-9][0-9][0-9][0-9].[0-9][0-9].[0-9][0-9]-*"
     paths:
       - "agent/dhcp/**"
       - ".github/workflows/build-dhcp-images.yml"
@@ -42,8 +44,8 @@ jobs:
           images: ghcr.io/spatiumddi/dhcp-${{ matrix.flavor }}
           tags: |
             type=ref,event=branch
+            type=ref,event=tag
             type=sha,format=short
-            type=semver,pattern={{version}}
 
       - name: Build and push
         uses: docker/build-push-action@v5

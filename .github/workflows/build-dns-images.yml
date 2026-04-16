@@ -3,6 +3,8 @@ name: Build DNS Agent Images
 on:
   push:
     branches: [main]
+    tags:
+      - "[0-9][0-9][0-9][0-9].[0-9][0-9].[0-9][0-9]-*"
     paths:
       - "agent/dns/**"
       - ".github/workflows/build-dns-images.yml"
@@ -42,8 +44,8 @@ jobs:
           images: ghcr.io/spatiumddi/dns-${{ matrix.flavor }}
           tags: |
             type=ref,event=branch
+            type=ref,event=tag
             type=sha,format=short
-            type=semver,pattern={{version}}
 
       - name: Build and push
         uses: docker/build-push-action@v5
