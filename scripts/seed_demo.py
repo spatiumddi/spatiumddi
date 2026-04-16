@@ -33,7 +33,11 @@ class Api:
         )
 
     def call(self, method: str, path: str, **kwargs):
-        r = self.c.request(method, path, **kwargs)
+        try:
+            r = self.c.request(method, path, **kwargs)
+        except httpx.HTTPError as e:
+            print(f"  ! {method} {path} transport error: {e}")
+            return None
         if r.status_code == 409:
             return None
         if r.status_code >= 400:
@@ -89,13 +93,18 @@ def main(base: str, user: str, pw: str):
     ]
     for block_id, name, net, desc in subnet_specs:
         a.call("POST", "/api/v1/ipam/subnets", json={
-            "block_id": block_id, "name": name, "network": net,
-            "description": desc, "gateway": net.rsplit(".", 1)[0] + ".1",
+            "space_id": space_id, "block_id": block_id, "name": name,
+            "network": net, "description": desc,
+            "gateway": net.rsplit(".", 1)[0] + ".1",
         })
 
-    subnets = a.call("GET", "/api/v1/ipam/subnets") or []
+    all_subnets = a.call("GET", "/api/v1/ipam/subnets") or []
+    # Only allocate into the subnets this seed created (by name) — avoids
+    # poking stale test subnets that may already be in a broken state.
+    seeded_names = {name for _, name, _, _ in subnet_specs}
+    subnets = [s for s in all_subnets if s["name"] in seeded_names]
 
-    print("Allocating IPs…")
+    print(f"Allocating IPs into {len(subnets)} subnet(s)…")
     hostname_pool = [
         "web01", "web02", "db-primary", "db-replica", "app-api", "app-worker",
         "mail", "git", "jenkins", "grafana", "prometheus", "vault", "consul",
@@ -107,7 +116,7 @@ def main(base: str, user: str, pw: str):
         if "Wireless" in subnet["name"] or "Lab" in subnet["name"]:
             continue
         for _ in range(random.randint(3, 8)):
-            hn = random.choice(hostname_pool)
+            hn = random.choice(hostname_pool) + f"-{random.randint(100, 999)}"
             mac = ":".join(f"{random.randint(0, 255):02x}" for _ in range(6))
             a.call("POST", f"/api/v1/ipam/subnets/{subnet['id']}/next", json={
                 "hostname": hn, "mac_address": mac,
