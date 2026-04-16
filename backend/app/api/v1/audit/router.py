@@ -53,6 +53,9 @@ async def list_audit_log(
     action: str | None = Query(default=None),
     resource_type: str | None = Query(default=None),
     user_display_name: str | None = Query(default=None),
+    resource_display: str | None = Query(default=None),
+    result: str | None = Query(default=None),
+    source_ip: str | None = Query(default=None),
 ) -> AuditLogPage:
     q = select(AuditLog)
 
@@ -62,6 +65,12 @@ async def list_audit_log(
         q = q.where(AuditLog.resource_type == resource_type)
     if user_display_name:
         q = q.where(AuditLog.user_display_name.ilike(f"%{user_display_name}%"))
+    if resource_display:
+        q = q.where(AuditLog.resource_display.ilike(f"%{resource_display}%"))
+    if result:
+        q = q.where(AuditLog.result == result)
+    if source_ip:
+        q = q.where(AuditLog.source_ip.ilike(f"%{source_ip}%"))
 
     count_q = select(func.count()).select_from(q.subquery())
     total = (await db.execute(count_q)).scalar_one()

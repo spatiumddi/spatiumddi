@@ -453,21 +453,24 @@ export const ipamApi = {
     api.delete(`/ipam/addresses/${addressId}/aliases/${recordId}`),
   backfillReverseZonesSpace: (spaceId: string) =>
     api
-      .post<{ created: { subnet: string; zone: string }[]; skipped: number }>(
-        `/ipam/spaces/${spaceId}/reverse-zones/backfill`,
-      )
+      .post<{
+        created: { subnet: string; zone: string }[];
+        skipped: number;
+      }>(`/ipam/spaces/${spaceId}/reverse-zones/backfill`)
       .then((r) => r.data),
   backfillReverseZonesBlock: (blockId: string) =>
     api
-      .post<{ created: { subnet: string; zone: string }[]; skipped: number }>(
-        `/ipam/blocks/${blockId}/reverse-zones/backfill`,
-      )
+      .post<{
+        created: { subnet: string; zone: string }[];
+        skipped: number;
+      }>(`/ipam/blocks/${blockId}/reverse-zones/backfill`)
       .then((r) => r.data),
   backfillReverseZonesSubnet: (subnetId: string) =>
     api
-      .post<{ created: { subnet: string; zone: string }[]; skipped: number }>(
-        `/ipam/subnets/${subnetId}/reverse-zones/backfill`,
-      )
+      .post<{
+        created: { subnet: string; zone: string }[];
+        skipped: number;
+      }>(`/ipam/subnets/${subnetId}/reverse-zones/backfill`)
       .then((r) => r.data),
   purgeOrphans: (subnetId: string, ipIds: string[]) =>
     api
@@ -716,6 +719,9 @@ export const auditApi = {
     action?: string;
     resource_type?: string;
     user_display_name?: string;
+    resource_display?: string;
+    result?: string;
+    source_ip?: string;
   }) => api.get<AuditLogPage>("/audit", { params }).then((r) => r.data),
 };
 

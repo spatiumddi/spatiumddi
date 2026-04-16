@@ -4,7 +4,7 @@ import {
   ClipboardList,
   ChevronLeft,
   ChevronRight,
-  Search,
+  Filter,
   X,
 } from "lucide-react";
 import { auditApi, type AuditLogEntry } from "@/lib/api";
@@ -20,6 +20,33 @@ const ACTION_COLORS: Record<string, string> = {
   login: "bg-purple-500/15 text-purple-600 dark:text-purple-400",
   logout: "bg-zinc-500/15 text-zinc-600 dark:text-zinc-400",
 };
+
+const ACTION_OPTIONS = [
+  "create",
+  "update",
+  "delete",
+  "reset_password",
+  "login",
+  "logout",
+];
+
+const RESOURCE_TYPE_OPTIONS = [
+  "user",
+  "ip_space",
+  "ip_block",
+  "subnet",
+  "ip_address",
+  "dns_group",
+  "dns_zone",
+  "dns_record",
+  "dhcp_server_group",
+  "dhcp_server",
+  "dhcp_scope",
+  "dhcp_pool",
+  "dhcp_static_assignment",
+];
+
+const RESULT_OPTIONS = ["success", "denied", "error"];
 
 function ActionBadge({ action }: { action: string }) {
   const cls =
@@ -68,36 +95,54 @@ function formatTs(ts: string) {
   }
 }
 
+type ColKey = "user" | "action" | "resource" | "summary" | "result" | "ip";
+
+const EMPTY_FILTERS: Record<ColKey, string> = {
+  user: "",
+  action: "",
+  resource: "",
+  summary: "",
+  result: "",
+  ip: "",
+};
+
 export function AuditPage() {
   const [page, setPage] = useState(0);
-  const [actionFilter, setActionFilter] = useState("");
-  const [resourceTypeFilter, setResourceTypeFilter] = useState("");
-  const [userFilter, setUserFilter] = useState("");
+  const [showFilters, setShowFilters] = useState(false);
+  const [colFilters, setColFilters] =
+    useState<Record<ColKey, string>>(EMPTY_FILTERS);
+
+  const hasActiveFilter = Object.values(colFilters).some(Boolean);
+
+  const queryParams = {
+    limit: PAGE_SIZE,
+    offset: page * PAGE_SIZE,
+    user_display_name: colFilters.user || undefined,
+    action: colFilters.action || undefined,
+    resource_type: colFilters.resource || undefined,
+    resource_display: colFilters.summary || undefined,
+    result: colFilters.result || undefined,
+    source_ip: colFilters.ip || undefined,
+  };
 
   const { data, isLoading } = useQuery({
-    queryKey: ["audit", page, actionFilter, resourceTypeFilter, userFilter],
-    queryFn: () =>
-      auditApi.list({
-        limit: PAGE_SIZE,
-        offset: page * PAGE_SIZE,
-        action: actionFilter || undefined,
-        resource_type: resourceTypeFilter || undefined,
-        user_display_name: userFilter || undefined,
-      }),
+    queryKey: ["audit", queryParams],
+    queryFn: () => auditApi.list(queryParams),
   });
 
   const total = data?.total ?? 0;
   const items = data?.items ?? [];
   const totalPages = Math.ceil(total / PAGE_SIZE);
 
-  function resetFilters() {
-    setActionFilter("");
-    setResourceTypeFilter("");
-    setUserFilter("");
+  function setFilter(col: ColKey, value: string) {
+    setColFilters((p) => ({ ...p, [col]: value }));
     setPage(0);
   }
 
-  const hasFilters = actionFilter || resourceTypeFilter || userFilter;
+  function clearFilters() {
+    setColFilters(EMPTY_FILTERS);
+    setPage(0);
+  }
 
   return (
     <div className="h-full overflow-auto p-6">
@@ -105,94 +150,23 @@ export function AuditPage() {
         {/* Header */}
         <div className="flex items-center gap-3">
           <ClipboardList className="h-6 w-6 text-muted-foreground" />
-          <div>
+          <div className="flex-1">
             <h1 className="text-xl font-semibold">Audit Log</h1>
             <p className="text-sm text-muted-foreground">
               All administrative actions recorded by the system
             </p>
           </div>
-        </div>
-
-        {/* Filters */}
-        <div className="flex flex-wrap items-center gap-3">
-          <div className="relative">
-            <Search className="absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
-            <input
-              value={userFilter}
-              onChange={(e) => {
-                setUserFilter(e.target.value);
-                setPage(0);
-              }}
-              placeholder="Filter by user…"
-              className="h-8 rounded-md border bg-background pl-8 pr-3 text-sm focus:outline-none focus:ring-2 focus:ring-ring w-44"
-            />
-            {userFilter && (
-              <button
-                onClick={() => {
-                  setUserFilter("");
-                  setPage(0);
-                }}
-                className="absolute right-2 top-1/2 -translate-y-1/2 text-muted-foreground hover:text-foreground"
-              >
-                <X className="h-3.5 w-3.5" />
-              </button>
-            )}
-          </div>
-
-          <select
-            value={actionFilter}
-            onChange={(e) => {
-              setActionFilter(e.target.value);
-              setPage(0);
-            }}
-            className="h-8 rounded-md border bg-background px-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
-          >
-            <option value="">All actions</option>
-            <option value="create">create</option>
-            <option value="update">update</option>
-            <option value="delete">delete</option>
-            <option value="reset_password">reset_password</option>
-            <option value="login">login</option>
-            <option value="logout">logout</option>
-          </select>
-
-          <select
-            value={resourceTypeFilter}
-            onChange={(e) => {
-              setResourceTypeFilter(e.target.value);
-              setPage(0);
-            }}
-            className="h-8 rounded-md border bg-background px-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
-          >
-            <option value="">All resource types</option>
-            <option value="user">user</option>
-            <option value="ip_space">ip_space</option>
-            <option value="ip_block">ip_block</option>
-            <option value="subnet">subnet</option>
-            <option value="ip_address">ip_address</option>
-          </select>
-
-          {hasFilters && (
-            <button
-              onClick={resetFilters}
-              className="flex h-8 items-center gap-1.5 rounded-md border px-2.5 text-sm text-muted-foreground hover:bg-accent hover:text-accent-foreground"
-            >
-              <X className="h-3.5 w-3.5" />
-              Clear
-            </button>
-          )}
-
-          <span className="ml-auto text-sm text-muted-foreground">
+          <span className="text-sm text-muted-foreground">
             {total.toLocaleString()} {total === 1 ? "event" : "events"}
           </span>
         </div>
 
         {/* Table */}
-        <div className="rounded-lg border overflow-hidden">
+        <div className="overflow-hidden rounded-lg border">
           <table className="w-full text-sm">
             <thead>
               <tr className="border-b bg-muted/40">
-                <th className="px-3 py-2 text-left font-medium text-muted-foreground">
+                <th className="px-3 py-2 text-left font-medium text-muted-foreground whitespace-nowrap">
                   Timestamp
                 </th>
                 <th className="px-3 py-2 text-left font-medium text-muted-foreground">
@@ -211,15 +185,131 @@ export function AuditPage() {
                   Result
                 </th>
                 <th className="px-3 py-2 text-left font-medium text-muted-foreground">
-                  IP
+                  <span className="inline-flex items-center gap-1.5">
+                    IP
+                    <button
+                      onClick={() => setShowFilters((v) => !v)}
+                      title={showFilters ? "Hide filters" : "Show filters"}
+                      className={cn(
+                        "rounded p-0.5 hover:bg-accent",
+                        hasActiveFilter
+                          ? "text-primary"
+                          : showFilters
+                            ? "text-primary/40"
+                            : "text-muted-foreground/40 hover:text-muted-foreground",
+                      )}
+                    >
+                      <Filter className="h-3 w-3" />
+                    </button>
+                  </span>
+                </th>
+                <th className="px-2 py-2 text-right">
+                  {hasActiveFilter && (
+                    <button
+                      onClick={clearFilters}
+                      title="Clear all filters"
+                      className="rounded p-0.5 text-primary hover:text-destructive"
+                    >
+                      <X className="h-3.5 w-3.5" />
+                    </button>
+                  )}
                 </th>
               </tr>
+              {showFilters && (
+                <tr className="border-b bg-muted/10 text-xs">
+                  {/* Timestamp — no filter */}
+                  <td className="px-2 py-1" />
+
+                  {/* User */}
+                  <td className="px-2 py-1">
+                    <input
+                      type="text"
+                      value={colFilters.user}
+                      onChange={(e) => setFilter("user", e.target.value)}
+                      placeholder="Filter…"
+                      className="w-full rounded border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
+                    />
+                  </td>
+
+                  {/* Action — dropdown */}
+                  <td className="px-2 py-1">
+                    <select
+                      value={colFilters.action}
+                      onChange={(e) => setFilter("action", e.target.value)}
+                      className="w-full rounded border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
+                    >
+                      <option value="">All</option>
+                      {ACTION_OPTIONS.map((a) => (
+                        <option key={a} value={a}>
+                          {a}
+                        </option>
+                      ))}
+                    </select>
+                  </td>
+
+                  {/* Resource — dropdown */}
+                  <td className="px-2 py-1">
+                    <select
+                      value={colFilters.resource}
+                      onChange={(e) => setFilter("resource", e.target.value)}
+                      className="w-full rounded border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
+                    >
+                      <option value="">All</option>
+                      {RESOURCE_TYPE_OPTIONS.map((r) => (
+                        <option key={r} value={r}>
+                          {r}
+                        </option>
+                      ))}
+                    </select>
+                  </td>
+
+                  {/* Summary */}
+                  <td className="px-2 py-1">
+                    <input
+                      type="text"
+                      value={colFilters.summary}
+                      onChange={(e) => setFilter("summary", e.target.value)}
+                      placeholder="Filter…"
+                      className="w-full rounded border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
+                    />
+                  </td>
+
+                  {/* Result — dropdown */}
+                  <td className="px-2 py-1">
+                    <select
+                      value={colFilters.result}
+                      onChange={(e) => setFilter("result", e.target.value)}
+                      className="w-full rounded border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
+                    >
+                      <option value="">All</option>
+                      {RESULT_OPTIONS.map((r) => (
+                        <option key={r} value={r}>
+                          {r}
+                        </option>
+                      ))}
+                    </select>
+                  </td>
+
+                  {/* IP */}
+                  <td className="px-2 py-1">
+                    <input
+                      type="text"
+                      value={colFilters.ip}
+                      onChange={(e) => setFilter("ip", e.target.value)}
+                      placeholder="Filter…"
+                      className="w-full rounded border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
+                    />
+                  </td>
+
+                  <td />
+                </tr>
+              )}
             </thead>
             <tbody>
               {isLoading ? (
                 <tr>
                   <td
-                    colSpan={7}
+                    colSpan={8}
                     className="px-3 py-8 text-center text-muted-foreground"
                   >
                     Loading…
@@ -228,7 +318,7 @@ export function AuditPage() {
               ) : items.length === 0 ? (
                 <tr>
                   <td
-                    colSpan={7}
+                    colSpan={8}
                     className="px-3 py-8 text-center text-muted-foreground"
                   >
                     No audit events found
@@ -267,7 +357,10 @@ export function AuditPage() {
                     <td className="px-3 py-2 whitespace-nowrap">
                       <ResultBadge result={entry.result} />
                     </td>
-                    <td className="px-3 py-2 font-mono text-xs text-muted-foreground whitespace-nowrap">
+                    <td
+                      className="px-3 py-2 font-mono text-xs text-muted-foreground whitespace-nowrap"
+                      colSpan={2}
+                    >
                       {entry.source_ip ?? "—"}
                     </td>
                   </tr>
