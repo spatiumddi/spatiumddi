@@ -1198,7 +1198,9 @@ function ZoneDetailView({
         <div>
           <div className="flex items-center gap-2">
             <FileText className="h-4 w-4 text-muted-foreground" />
-            <h2 className="font-semibold text-base font-mono">{zone.name}</h2>
+            <h2 className="font-semibold text-base font-mono">
+              {zone.name.replace(/\.$/, "")}
+            </h2>
             <span className="inline-flex items-center rounded border px-1.5 py-0.5 text-xs">
               {zone.zone_type}
             </span>
@@ -2409,7 +2411,7 @@ function ZonesTab({
             <div className="flex items-center gap-2 min-w-0">
               <FileText className="h-3.5 w-3.5 text-muted-foreground flex-shrink-0" />
               <span className="font-mono text-sm truncate">
-                {node.zone.name}
+                {node.zone.name.replace(/\.$/, "")}
               </span>
               <span
                 className={`inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium flex-shrink-0 ${typeBadge[node.zone.zone_type] ?? "bg-muted text-muted-foreground"}`}
@@ -3628,31 +3630,24 @@ function ZoneTreeRows({
                 onClick={() => onSelectZone(node.zone!)}
               >
                 <FileText className="h-3 w-3 flex-shrink-0" />
-                <span className="font-mono truncate">{node.zone.name}</span>
+                <span className="font-mono truncate">
+                  {node.zone.name.replace(/\.$/, "")}
+                </span>
                 {node.zone.dnssec_enabled && (
                   <Shield className="h-2.5 w-2.5 ml-auto flex-shrink-0 text-emerald-500" />
                 )}
               </button>
             ) : (
-              /* Intermediate folder with no zone — label toggles, + creates a zone here */
-              <div className="flex flex-1 items-center gap-1 group/folder">
-                <button
-                  className="flex flex-1 items-center gap-1 rounded py-1 pr-2 text-xs font-medium font-mono text-muted-foreground hover:bg-accent hover:text-foreground"
-                  onClick={() => toggleNode(node.domain)}
-                >
-                  {node.domain}
-                </button>
-                <button
-                  className="flex h-5 w-5 items-center justify-center rounded opacity-0 group-hover/folder:opacity-100 text-muted-foreground hover:text-foreground"
-                  onClick={(e) => {
-                    e.stopPropagation();
-                    setCreateZoneName(node.domain);
-                  }}
-                  title={`Create zone "${node.domain}" here`}
-                >
-                  <Plus className="h-3 w-3" />
-                </button>
-              </div>
+              /* Intermediate folder with no zone — click label to create a
+                 zone at this level. Folder icon on the left still toggles
+                 expand/collapse without opening the modal. */
+              <button
+                className="flex flex-1 items-center gap-1 rounded py-1 pr-2 text-xs font-medium font-mono text-muted-foreground hover:bg-accent hover:text-foreground"
+                onClick={() => setCreateZoneName(node.domain)}
+                title={`Create zone "${node.domain}" here`}
+              >
+                {node.domain}
+              </button>
             )}
           </div>
         ) : node.zone ? (
@@ -3667,7 +3662,9 @@ function ZoneTreeRows({
             onClick={() => onSelectZone(node.zone!)}
           >
             <FileText className="h-3 w-3 flex-shrink-0" />
-            <span className="font-mono truncate">{node.zone.name}</span>
+            <span className="font-mono truncate">
+                  {node.zone.name.replace(/\.$/, "")}
+                </span>
             {node.zone.dnssec_enabled && (
               <Shield className="h-2.5 w-2.5 ml-auto flex-shrink-0 text-emerald-500" />
             )}
