@@ -37,9 +37,7 @@ services:
 
   # ── API Backend ─────────────────────────────────────────────────────────────
   api:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
+    image: ghcr.io/spatiumddi/spatiumddi-api:${SPATIUMDDI_VERSION:-latest}
     restart: unless-stopped
     networks:
       - spatiumddi
@@ -65,9 +63,7 @@ services:
 
   # ── Celery Worker ───────────────────────────────────────────────────────────
   worker:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
+    image: ghcr.io/spatiumddi/spatiumddi-api:${SPATIUMDDI_VERSION:-latest}
     restart: unless-stopped
     networks:
       - spatiumddi
@@ -86,9 +82,7 @@ services:
 
   # ── Celery Beat (Scheduler) ─────────────────────────────────────────────────
   beat:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
+    image: ghcr.io/spatiumddi/spatiumddi-api:${SPATIUMDDI_VERSION:-latest}
     restart: unless-stopped
     networks:
       - spatiumddi
@@ -104,9 +98,7 @@ services:
 
   # ── Frontend (nginx + Vite build) ───────────────────────────────────────────
   frontend:
-    build:
-      context: ./frontend
-      dockerfile: Dockerfile
+    image: ghcr.io/spatiumddi/spatiumddi-frontend:${SPATIUMDDI_VERSION:-latest}
     restart: unless-stopped
     networks:
       - spatiumddi
@@ -117,9 +109,7 @@ services:
 
   # ── Migrations (runs once at startup) ──────────────────────────────────────
   migrate:
-    build:
-      context: ./backend
-      dockerfile: Dockerfile
+    image: ghcr.io/spatiumddi/spatiumddi-api:${SPATIUMDDI_VERSION:-latest}
     networks:
       - spatiumddi
     command: alembic upgrade head
@@ -135,9 +125,7 @@ services:
   # Enable with: docker compose --profile dns up -d
   dns-bind9:
     profiles: ["dns"]
-    build:
-      context: .
-      dockerfile: agent/dns/images/bind9/Dockerfile
+    image: ghcr.io/spatiumddi/dns-bind9:${SPATIUMDDI_VERSION:-latest}
     restart: unless-stopped
     networks:
       - spatiumddi
@@ -162,9 +150,7 @@ services:
   # Enable with: docker compose --profile dhcp up -d
   dhcp-kea:
     profiles: ["dhcp"]
-    build:
-      context: .
-      dockerfile: agent/dhcp/images/kea/Dockerfile
+    image: ghcr.io/spatiumddi/dhcp-kea:${SPATIUMDDI_VERSION:-latest}
     restart: unless-stopped
     networks:
       - spatiumddi
