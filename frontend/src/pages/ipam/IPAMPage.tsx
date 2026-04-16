@@ -561,8 +561,9 @@ function DnsSettingsSection({
           </div>
         )}
 
-        {/* Additional Zones — dual listbox scales better than chips for many zones */}
-        {availableZones.filter((z) => z.id !== displayZoneId).length > 0 && (
+        {/* Additional Zones — always shown (even with just a primary picked)
+            so the user can push A records into extra zones. */}
+        {availableZones.length > 0 && (
           <div>
             <p className="text-xs text-muted-foreground mb-1">
               Additional Zones
@@ -695,7 +696,7 @@ function AdditionalZonesPicker({
   }
 
   return (
-    <div className="flex items-stretch gap-2">
+    <div className="flex flex-col gap-2">
       <List
         label="Available"
         items={leftFiltered}
@@ -705,42 +706,45 @@ function AdditionalZonesPicker({
         onPicks={setLeftPick}
         onDouble={(id) => onChange([...selectedIds, id])}
       />
-      <div className="flex flex-col justify-center gap-1 pt-5">
+      <div className="flex items-center justify-center gap-1">
         <button
           type="button"
-          onClick={moveRight}
-          disabled={disabled || leftPick.size === 0}
-          title="Add selected"
-          className="rounded border px-1.5 py-0.5 text-xs hover:bg-accent disabled:opacity-40"
+          onClick={moveAllLeft}
+          disabled={disabled || rightFiltered.length === 0}
+          title="Remove all (filtered)"
+          className="rounded border px-2 py-0.5 text-xs hover:bg-accent disabled:opacity-40"
         >
-          &gt;
-        </button>
-        <button
-          type="button"
-          onClick={moveAllRight}
-          disabled={disabled || leftFiltered.length === 0}
-          title="Add all (filtered)"
-          className="rounded border px-1.5 py-0.5 text-xs hover:bg-accent disabled:opacity-40"
-        >
-          &gt;&gt;
+          ▲▲
         </button>
         <button
           type="button"
           onClick={moveLeft}
           disabled={disabled || rightPick.size === 0}
           title="Remove selected"
-          className="rounded border px-1.5 py-0.5 text-xs hover:bg-accent disabled:opacity-40"
+          className="rounded border px-2 py-0.5 text-xs hover:bg-accent disabled:opacity-40"
         >
-          &lt;
+          ▲
+        </button>
+        <span className="mx-2 text-xs text-muted-foreground">
+          {selectedIds.length} selected
+        </span>
+        <button
+          type="button"
+          onClick={moveRight}
+          disabled={disabled || leftPick.size === 0}
+          title="Add selected"
+          className="rounded border px-2 py-0.5 text-xs hover:bg-accent disabled:opacity-40"
+        >
+          ▼
         </button>
         <button
           type="button"
-          onClick={moveAllLeft}
-          disabled={disabled || rightFiltered.length === 0}
-          title="Remove all (filtered)"
-          className="rounded border px-1.5 py-0.5 text-xs hover:bg-accent disabled:opacity-40"
+          onClick={moveAllRight}
+          disabled={disabled || leftFiltered.length === 0}
+          title="Add all (filtered)"
+          className="rounded border px-2 py-0.5 text-xs hover:bg-accent disabled:opacity-40"
         >
-          &lt;&lt;
+          ▼▼
         </button>
       </div>
       <List
