@@ -1502,14 +1502,19 @@ function AddAddressModal({
             placeholder="Optional"
           />
         </Field>
-        {dnsZoneId && hostname && (
-          <Field label="DNS Aliases">
-            <div className="space-y-1.5">
-              <p className="text-[11px] text-muted-foreground -mt-0.5">
-                Extra records pointing to this IP. CNAMEs point to{" "}
-                <span className="font-mono">{hostname}</span>; A records point to
-                the IP. Deleted automatically when the IP is purged.
-              </p>
+        <Field label="DNS Aliases">
+          <div className="space-y-1.5">
+            <p className="text-[11px] text-muted-foreground -mt-0.5">
+              Extra records pointing to this IP. CNAMEs point to{" "}
+              <span className="font-mono">{hostname || "<hostname>"}</span>; A
+              records point to the IP. Deleted automatically when the IP is
+              purged.
+              {!dnsZoneId && (
+                <span className="ml-1 text-amber-600">
+                  Requires a DNS zone on this subnet.
+                </span>
+              )}
+            </p>
               {aliases.map((a, idx) => (
                 <div key={idx} className="flex items-center gap-2">
                   <select
@@ -1563,13 +1568,13 @@ function AddAddressModal({
                     { name: "", record_type: "CNAME" },
                   ])
                 }
-                className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent"
+                disabled={!hostname || !dnsZoneId}
+                className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent disabled:opacity-40"
               >
                 <Plus className="h-3 w-3" /> Add alias
               </button>
             </div>
-          </Field>
-        )}
+        </Field>
         <CustomFieldsSection
           definitions={cfDefs}
           values={customFields}
@@ -3418,6 +3423,38 @@ function EditAddressModal({
     staleTime: 30_000,
   });
 
+  // Aliases live in the DNS zone but are owned by this IP (auto-deleted on purge).
+  const { data: existingAliases = [] } = useQuery({
+    queryKey: ["ip-aliases", address.id],
+    queryFn: () => ipamApi.listAliases(address.id),
+  });
+  const [newAliasName, setNewAliasName] = useState("");
+  const [newAliasType, setNewAliasType] = useState<"CNAME" | "A">("CNAME");
+  const addAliasMut = useMutation({
+    mutationFn: () =>
+      ipamApi.addAlias(address.id, {
+        name: newAliasName.trim(),
+        record_type: newAliasType,
+      }),
+    onSuccess: () => {
+      setNewAliasName("");
+      qc.invalidateQueries({ queryKey: ["ip-aliases", address.id] });
+      qc.invalidateQueries({ queryKey: ["addresses", address.subnet_id] });
+    },
+    onError: (e: unknown) => {
+      const err = e as {
+        response?: { data?: { detail?: unknown } };
+      };
+      const d = err?.response?.data?.detail;
+      setError(typeof d === "string" ? d : "Failed to add alias");
+    },
+  });
+  const delAliasMut = useMutation({
+    mutationFn: (rid: string) => ipamApi.deleteAlias(address.id, rid),
+    onSuccess: () =>
+      qc.invalidateQueries({ queryKey: ["ip-aliases", address.id] }),
+  });
+
   const zoneGroupIds: string[] = effectiveDns?.dns_group_ids ?? [];
   const zoneQueries = useQueries({
     queries: (zoneGroupIds as string[]).map((gId: string) => ({
@@ -3547,6 +3584,84 @@ function EditAddressModal({
             ))}
           </select>
         </Field>
+
+        <Field label="DNS Aliases">
+          <div className="space-y-1.5">
+            <p className="text-[11px] text-muted-foreground -mt-0.5">
+              Extra records pointing to this IP. Added records are removed
+              automatically when the IP is purged.
+            </p>
+            {existingAliases.length === 0 ? (
+              <p className="text-xs text-muted-foreground/60 italic">
+                No aliases.
+              </p>
+            ) : (
+              <div className="space-y-1">
+                {existingAliases.map((a) => (
+                  <div
+                    key={a.id}
+                    className="flex items-center gap-2 rounded-md border bg-muted/30 px-2 py-1"
+                  >
+                    <span className="rounded bg-background px-1.5 py-0.5 text-[10px] font-medium">
+                      {a.record_type}
+                    </span>
+                    <span className="flex-1 truncate font-mono text-xs">
+                      {a.fqdn}
+                    </span>
+                    <span className="text-[11px] text-muted-foreground truncate">
+                      → {a.value}
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => delAliasMut.mutate(a.id)}
+                      className="flex-shrink-0 rounded p-0.5 text-muted-foreground hover:text-destructive"
+                      title="Delete alias"
+                    >
+                      <X className="h-3.5 w-3.5" />
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+            <div className="flex items-center gap-2 pt-1">
+              <select
+                className={cn(inputCls, "w-24")}
+                value={newAliasType}
+                onChange={(e) =>
+                  setNewAliasType(e.target.value as "CNAME" | "A")
+                }
+              >
+                <option value="CNAME">CNAME</option>
+                <option value="A">A</option>
+              </select>
+              <input
+                className={cn(inputCls, "flex-1 min-w-0")}
+                placeholder="alias name (e.g. www, mail)"
+                value={newAliasName}
+                onChange={(e) => setNewAliasName(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && newAliasName.trim()) {
+                    e.preventDefault();
+                    addAliasMut.mutate();
+                  }
+                }}
+              />
+              <button
+                type="button"
+                onClick={() => addAliasMut.mutate()}
+                disabled={
+                  !newAliasName.trim() ||
+                  addAliasMut.isPending ||
+                  !(address.forward_zone_id || effectiveDns?.dns_zone_id)
+                }
+                className="flex-shrink-0 rounded-md border px-2 py-1 text-xs hover:bg-accent disabled:opacity-40"
+              >
+                <Plus className="h-3 w-3 inline" /> Add
+              </button>
+            </div>
+          </div>
+        </Field>
+
         <CustomFieldsSection
           definitions={cfDefs}
           values={customFields}

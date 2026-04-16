@@ -2278,6 +2278,134 @@ async def update_address(
     return ip
 
 
+class AliasResponse(BaseModel):
+    id: uuid.UUID
+    name: str
+    record_type: str
+    value: str
+    zone_id: uuid.UUID
+    fqdn: str
+
+    model_config = {"from_attributes": True}
+
+
+@router.get("/addresses/{address_id}/aliases", response_model=list[AliasResponse])
+async def list_aliases(
+    address_id: uuid.UUID, current_user: CurrentUser, db: DB
+) -> list[DNSRecord]:
+    ip = await db.get(IPAddress, address_id)
+    if ip is None:
+        raise HTTPException(status_code=404, detail="IP address not found")
+    # Aliases are auto-generated records linked to this IP that aren't the
+    # primary forward A (which is stored separately on ip.dns_record_id).
+    res = await db.execute(
+        select(DNSRecord).where(
+            DNSRecord.ip_address_id == ip.id,
+            DNSRecord.auto_generated.is_(True),
+            DNSRecord.record_type.in_(["CNAME", "A"]),
+        )
+    )
+    out = []
+    for r in res.scalars().all():
+        if ip.dns_record_id is not None and r.id == ip.dns_record_id:
+            continue  # exclude the primary A
+        out.append(r)
+    return out
+
+
+@router.post(
+    "/addresses/{address_id}/aliases",
+    response_model=AliasResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def add_alias(
+    address_id: uuid.UUID, body: AliasInput, current_user: CurrentUser, db: DB
+) -> DNSRecord:
+    ip = await db.get(IPAddress, address_id)
+    if ip is None:
+        raise HTTPException(status_code=404, detail="IP address not found")
+    subnet = await db.get(Subnet, ip.subnet_id)
+    if subnet is None:
+        raise HTTPException(status_code=404, detail="Subnet not found")
+    zone_id = ip.forward_zone_id or await _resolve_effective_zone(db, subnet)
+    if not zone_id:
+        raise HTTPException(
+            status_code=409,
+            detail="No DNS zone configured for this subnet — add one first.",
+        )
+    await _create_alias_records(db, ip, subnet, [body], zone_id=zone_id)
+    # Find the just-created record
+    res = await db.execute(
+        select(DNSRecord).where(
+            DNSRecord.zone_id == zone_id,
+            DNSRecord.name == body.name,
+            DNSRecord.record_type == body.record_type,
+            DNSRecord.ip_address_id == ip.id,
+        )
+    )
+    rec = res.scalar_one_or_none()
+    if rec is None:
+        raise HTTPException(status_code=409, detail="Alias already exists or failed to create")
+    db.add(
+        _audit(
+            current_user,
+            "create",
+            "dns_record",
+            str(rec.id),
+            rec.fqdn,
+            new_value={
+                "name": rec.name,
+                "record_type": rec.record_type,
+                "value": rec.value,
+                "alias_of": str(ip.id),
+            },
+        )
+    )
+    await db.commit()
+    await db.refresh(rec)
+    return rec
+
+
+@router.delete(
+    "/addresses/{address_id}/aliases/{record_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+)
+async def delete_alias(
+    address_id: uuid.UUID,
+    record_id: uuid.UUID,
+    current_user: CurrentUser,
+    db: DB,
+) -> None:
+    ip = await db.get(IPAddress, address_id)
+    if ip is None:
+        raise HTTPException(status_code=404, detail="IP address not found")
+    rec = await db.get(DNSRecord, record_id)
+    if rec is None or rec.ip_address_id != ip.id:
+        raise HTTPException(status_code=404, detail="Alias not found")
+    if ip.dns_record_id == rec.id:
+        raise HTTPException(
+            status_code=409,
+            detail="Can't delete the primary A record — change the IP's hostname or delete the IP instead.",
+        )
+    zone = await db.get(DNSZone, rec.zone_id)
+    if zone is not None:
+        await _enqueue_dns_op(
+            db, zone, "delete", rec.name, rec.record_type, rec.value, rec.ttl
+        )
+    db.add(
+        _audit(
+            current_user,
+            "delete",
+            "dns_record",
+            str(rec.id),
+            rec.fqdn,
+            old_value={"name": rec.name, "record_type": rec.record_type, "value": rec.value},
+        )
+    )
+    await db.delete(rec)
+    await db.commit()
+
+
 @router.delete("/addresses/{address_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_address(
     address_id: uuid.UUID,

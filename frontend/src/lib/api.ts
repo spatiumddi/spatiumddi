@@ -422,6 +422,35 @@ export const ipamApi = {
     api.delete(`/ipam/addresses/${id}`, {
       params: permanent ? { permanent: true } : undefined,
     }),
+  listAliases: (addressId: string) =>
+    api
+      .get<
+        {
+          id: string;
+          name: string;
+          record_type: string;
+          value: string;
+          zone_id: string;
+          fqdn: string;
+        }[]
+      >(`/ipam/addresses/${addressId}/aliases`)
+      .then((r) => r.data),
+  addAlias: (
+    addressId: string,
+    data: { name: string; record_type: "CNAME" | "A" },
+  ) =>
+    api
+      .post<{
+        id: string;
+        name: string;
+        record_type: string;
+        value: string;
+        zone_id: string;
+        fqdn: string;
+      }>(`/ipam/addresses/${addressId}/aliases`, data)
+      .then((r) => r.data),
+  deleteAlias: (addressId: string, recordId: string) =>
+    api.delete(`/ipam/addresses/${addressId}/aliases/${recordId}`),
   purgeOrphans: (subnetId: string, ipIds: string[]) =>
     api
       .post<{ purged: number }>(`/ipam/subnets/${subnetId}/orphans/purge`, {
