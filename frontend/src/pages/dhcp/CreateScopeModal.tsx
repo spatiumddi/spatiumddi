@@ -160,6 +160,11 @@ export function CreateScopeModal({
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["dhcp-scopes"] });
       qc.invalidateQueries({ queryKey: ["dhcp-scopes-subnet", subnetId] });
+      if (editing && scope?.subnet_id && scope.subnet_id !== subnetId) {
+        qc.invalidateQueries({
+          queryKey: ["dhcp-scopes-subnet", scope.subnet_id],
+        });
+      }
       onClose();
     },
     onError: (e) => setError(errMsg(e, "Failed to save scope")),
