@@ -1230,6 +1230,17 @@ export const dnsBlocklistApi = {
     api
       .post<DNSBlockListException>(`/dns/blocklists/${id}/exceptions`, data)
       .then((r) => r.data),
+  updateException: (
+    id: string,
+    exceptionId: string,
+    data: { domain?: string; reason?: string },
+  ) =>
+    api
+      .put<DNSBlockListException>(
+        `/dns/blocklists/${id}/exceptions/${exceptionId}`,
+        data,
+      )
+      .then((r) => r.data),
   deleteException: (id: string, exceptionId: string) =>
     api.delete(`/dns/blocklists/${id}/exceptions/${exceptionId}`),
 };

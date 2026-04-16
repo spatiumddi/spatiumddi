@@ -217,6 +217,11 @@ class ExceptionCreate(BaseModel):
     reason: str = ""
 
 
+class ExceptionUpdate(BaseModel):
+    domain: str | None = None
+    reason: str | None = None
+
+
 class ExceptionResponse(BaseModel):
     id: uuid.UUID
     list_id: uuid.UUID
@@ -731,6 +736,59 @@ async def add_exception(
             "dns_blocklist_exception",
             str(ex.id),
             f"{domain} ({bl.name})",
+        )
+    )
+    await db.commit()
+    await db.refresh(ex)
+    return ex
+
+
+@router.put(
+    "/blocklists/{list_id}/exceptions/{exception_id}",
+    response_model=ExceptionResponse,
+)
+async def update_exception(
+    list_id: uuid.UUID,
+    exception_id: uuid.UUID,
+    body: ExceptionUpdate,
+    db: DB,
+    current_user: SuperAdmin,
+) -> DNSBlockListException:
+    bl = await _require_list(list_id, db)
+    result = await db.execute(
+        select(DNSBlockListException).where(
+            DNSBlockListException.id == exception_id,
+            DNSBlockListException.list_id == list_id,
+        )
+    )
+    ex = result.scalar_one_or_none()
+    if not ex:
+        raise HTTPException(status_code=404, detail="Exception not found")
+    changes = body.model_dump(exclude_none=True)
+    if "domain" in changes:
+        domain = changes["domain"].strip().lower().strip(".")
+        if not domain or "." not in domain:
+            raise HTTPException(status_code=422, detail="Invalid domain")
+        if domain != ex.domain:
+            dup = await db.execute(
+                select(DNSBlockListException).where(
+                    DNSBlockListException.list_id == list_id,
+                    DNSBlockListException.domain == domain,
+                    DNSBlockListException.id != exception_id,
+                )
+            )
+            if dup.scalar_one_or_none():
+                raise HTTPException(status_code=409, detail="Exception already exists")
+        changes["domain"] = domain
+    for k, v in changes.items():
+        setattr(ex, k, v)
+    db.add(
+        _audit(
+            current_user,
+            "update",
+            "dns_blocklist_exception",
+            str(ex.id),
+            f"{ex.domain} ({bl.name})",
         )
     )
     await db.commit()

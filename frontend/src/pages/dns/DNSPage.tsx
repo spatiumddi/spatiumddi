@@ -2977,6 +2977,22 @@ function BlocklistDetail({
     onSuccess: () =>
       qc.invalidateQueries({ queryKey: ["dns-blocklist-exceptions", list.id] }),
   });
+  const [editException, setEditException] = useState<DNSBlockListException | null>(
+    null,
+  );
+  const [editExcDomain, setEditExcDomain] = useState("");
+  const [editExcReason, setEditExcReason] = useState("");
+  const updateException = useMutation({
+    mutationFn: () =>
+      dnsBlocklistApi.updateException(list.id, editException!.id, {
+        domain: editExcDomain,
+        reason: editExcReason,
+      }),
+    onSuccess: () => {
+      setEditException(null);
+      qc.invalidateQueries({ queryKey: ["dns-blocklist-exceptions", list.id] });
+    },
+  });
   const refresh = useMutation({
     mutationFn: () => dnsBlocklistApi.refresh(list.id),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["dns-blocklists"] }),
@@ -3192,12 +3208,26 @@ function BlocklistDetail({
                 <td className="px-3 py-1 font-mono text-xs">{ex.domain}</td>
                 <td className="px-3 py-1 text-xs">{ex.reason}</td>
                 <td className="px-3 py-1 text-right">
-                  <button
-                    className="text-muted-foreground hover:text-destructive"
-                    onClick={() => deleteException.mutate(ex.id)}
-                  >
-                    <Trash2 className="h-3 w-3" />
-                  </button>
+                  <div className="flex items-center justify-end gap-1">
+                    <button
+                      className="text-muted-foreground hover:text-foreground"
+                      onClick={() => {
+                        setEditException(ex);
+                        setEditExcDomain(ex.domain);
+                        setEditExcReason(ex.reason ?? "");
+                      }}
+                      title="Edit exception"
+                    >
+                      <Pencil className="h-3 w-3" />
+                    </button>
+                    <button
+                      className="text-muted-foreground hover:text-destructive"
+                      onClick={() => deleteException.mutate(ex.id)}
+                      title="Remove exception"
+                    >
+                      <Trash2 className="h-3 w-3" />
+                    </button>
+                  </div>
                 </td>
               </tr>
             ))}
@@ -3205,6 +3235,46 @@ function BlocklistDetail({
         </table>
       </div>
 
+      {editException && (
+        <Modal
+          title="Edit Exception"
+          onClose={() => setEditException(null)}
+        >
+          <div className="space-y-3">
+            <Field label="Domain">
+              <input
+                className={inputCls}
+                value={editExcDomain}
+                onChange={(ev) => setEditExcDomain(ev.target.value)}
+                autoFocus
+              />
+            </Field>
+            <Field label="Reason">
+              <input
+                className={inputCls}
+                value={editExcReason}
+                onChange={(ev) => setEditExcReason(ev.target.value)}
+                placeholder="Optional"
+              />
+            </Field>
+            <div className="flex justify-end gap-2">
+              <button
+                onClick={() => setEditException(null)}
+                className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => updateException.mutate()}
+                disabled={!editExcDomain.trim() || updateException.isPending}
+                className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+              >
+                {updateException.isPending ? "Saving…" : "Save"}
+              </button>
+            </div>
+          </div>
+        </Modal>
+      )}
       {editEntry && (
         <Modal title="Edit Blocklist Entry" onClose={() => setEditEntry(null)}>
           <div className="space-y-3">
