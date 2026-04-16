@@ -773,15 +773,19 @@ function ZoneModal({
   groupId,
   views,
   zone,
+  initialName,
   onClose,
 }: {
   groupId: string;
   views: DNSView[];
   zone?: DNSZone;
+  initialName?: string;
   onClose: () => void;
 }) {
   const qc = useQueryClient();
-  const [name, setName] = useState(zone?.name?.replace(/\.$/, "") ?? "");
+  const [name, setName] = useState(
+    zone?.name?.replace(/\.$/, "") ?? initialName ?? "",
+  );
   const [zoneType, setZoneType] = useState(zone?.zone_type ?? "primary");
   const [kind, setKind] = useState(zone?.kind ?? "forward");
   const [viewId, setViewId] = useState(zone?.view_id ?? "");
@@ -3562,10 +3566,16 @@ function ZoneTreeRows({
     `spatium.dns.expandedZones.${groupId}`,
     new Set(),
   );
+  const [createZoneName, setCreateZoneName] = useState<string | null>(null);
 
   const { data: zones = [] } = useQuery({
     queryKey: ["dns-zones", groupId],
     queryFn: () => dnsApi.listZones(groupId),
+  });
+  const { data: views = [] } = useQuery({
+    queryKey: ["dns-views", groupId],
+    queryFn: () => dnsApi.listViews(groupId),
+    staleTime: 30_000,
   });
 
   const tree = buildDnsTree(zones);
@@ -3624,13 +3634,25 @@ function ZoneTreeRows({
                 )}
               </button>
             ) : (
-              /* Intermediate folder with no zone — clicking label also toggles */
-              <button
-                className="flex flex-1 items-center gap-1 rounded py-1 pr-2 text-xs font-medium font-mono text-muted-foreground hover:bg-accent hover:text-foreground"
-                onClick={() => toggleNode(node.domain)}
-              >
-                {node.domain}
-              </button>
+              /* Intermediate folder with no zone — label toggles, + creates a zone here */
+              <div className="flex flex-1 items-center gap-1 group/folder">
+                <button
+                  className="flex flex-1 items-center gap-1 rounded py-1 pr-2 text-xs font-medium font-mono text-muted-foreground hover:bg-accent hover:text-foreground"
+                  onClick={() => toggleNode(node.domain)}
+                >
+                  {node.domain}
+                </button>
+                <button
+                  className="flex h-5 w-5 items-center justify-center rounded opacity-0 group-hover/folder:opacity-100 text-muted-foreground hover:text-foreground"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setCreateZoneName(node.domain);
+                  }}
+                  title={`Create zone "${node.domain}" here`}
+                >
+                  <Plus className="h-3 w-3" />
+                </button>
+              </div>
             )}
           </div>
         ) : node.zone ? (
@@ -3670,7 +3692,19 @@ function ZoneTreeRows({
     );
   }
 
-  return <div>{tree.map((root) => renderNode(root, 0))}</div>;
+  return (
+    <>
+      <div>{tree.map((root) => renderNode(root, 0))}</div>
+      {createZoneName && (
+        <ZoneModal
+          groupId={groupId}
+          views={views}
+          initialName={createZoneName}
+          onClose={() => setCreateZoneName(null)}
+        />
+      )}
+    </>
+  );
 }
 
 // ── Main DNS Page ─────────────────────────────────────────────────────────────
