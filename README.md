@@ -42,21 +42,15 @@ It is designed as a modern alternative to commercial DDI platforms like Efficien
 ## Screenshots
 
 <p align="center">
-  <img src="docs/assets/screenshots/01-dashboard.png" alt="Dashboard"/><br/>
-  <em>Dashboard — utilisation, VLAN, DNS &amp; DHCP status at a glance</em>
+  <a href="docs/assets/screenshots/dashboard.png"><img src="docs/assets/screenshots/dashboard.png" alt="Dashboard" width="420"/></a>
+  <a href="docs/assets/screenshots/ipam.png"><img src="docs/assets/screenshots/ipam.png" alt="IPAM" width="420"/></a>
 </p>
-
 <p align="center">
-  <img src="docs/assets/screenshots/02-ipam-tree.png" alt="IPAM tree"/><br/>
-  <em>IPAM — hierarchical space / block / subnet tree</em>
+  <a href="docs/assets/screenshots/dns.png"><img src="docs/assets/screenshots/dns.png" alt="DNS" width="280"/></a>
+  <a href="docs/assets/screenshots/dhcp.png"><img src="docs/assets/screenshots/dhcp.png" alt="DHCP" width="280"/></a>
+  <a href="docs/assets/screenshots/vlans.png"><img src="docs/assets/screenshots/vlans.png" alt="VLANs" width="280"/></a>
 </p>
-
-<p align="center">
-  <img src="docs/assets/screenshots/03-dns.png" alt="DNS"/>
-  <img src="docs/assets/screenshots/04-dhcp.png" alt="DHCP"/>
-</p>
-
-> Regenerate: run `scripts/seed_demo.py` then `scripts/take_screenshots.py` against a local stack.
+<p align="center"><em>Dashboard · IPAM tree · DNS · DHCP · VLANs — click any image to enlarge</em></p>
 
 ---
 

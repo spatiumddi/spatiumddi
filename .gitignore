@@ -38,3 +38,4 @@ backend/alembic/versions/*.py
 .DS_Store
 Thumbs.db
 .claude/
+scripts/take_screenshots.py
