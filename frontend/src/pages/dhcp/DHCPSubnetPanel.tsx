@@ -12,11 +12,9 @@ import {
   dhcpApi,
   type DHCPPool,
   type DHCPScope,
-  type DHCPStaticAssignment,
 } from "@/lib/api";
 import { CreateScopeModal } from "./CreateScopeModal";
 import { CreatePoolModal } from "./CreatePoolModal";
-import { CreateStaticAssignmentModal } from "./CreateStaticAssignmentModal";
 import { DeleteConfirmModal } from "./_shared";
 
 function PoolRow({ pool, scope }: { pool: DHCPPool; scope: DHCPScope }) {
@@ -70,83 +68,16 @@ function PoolRow({ pool, scope }: { pool: DHCPPool; scope: DHCPScope }) {
   );
 }
 
-function StaticRow({
-  row,
-  scope,
-}: {
-  row: DHCPStaticAssignment;
-  scope: DHCPScope;
-}) {
-  const qc = useQueryClient();
-  const [edit, setEdit] = useState(false);
-  const [del, setDel] = useState(false);
-  const mut = useMutation({
-    mutationFn: () => dhcpApi.deleteStatic(scope.id, row.id),
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["dhcp-statics", scope.id] });
-      qc.invalidateQueries({ queryKey: ["addresses", scope.subnet_id] });
-      qc.invalidateQueries({ queryKey: ["subnet-dns-sync", scope.subnet_id] });
-      setDel(false);
-    },
-  });
-  return (
-    <tr className="border-b last:border-0 text-sm">
-      <td className="px-3 py-1.5 font-mono text-xs">{row.mac_address}</td>
-      <td className="px-3 py-1.5 font-mono text-xs">{row.ip_address}</td>
-      <td className="px-3 py-1.5">{row.hostname || "—"}</td>
-      <td className="px-3 py-1.5 text-muted-foreground truncate max-w-xs">
-        {row.description}
-      </td>
-      <td className="px-3 py-1.5 text-right">
-        <button
-          onClick={() => setEdit(true)}
-          className="rounded p-1 text-muted-foreground hover:text-foreground"
-        >
-          <Pencil className="h-3.5 w-3.5" />
-        </button>
-        <button
-          onClick={() => setDel(true)}
-          className="rounded p-1 text-muted-foreground hover:text-destructive"
-        >
-          <Trash2 className="h-3.5 w-3.5" />
-        </button>
-      </td>
-      {edit && (
-        <CreateStaticAssignmentModal
-          staticAssignment={row}
-          scope={scope}
-          onClose={() => setEdit(false)}
-        />
-      )}
-      {del && (
-        <DeleteConfirmModal
-          title="Delete Static Assignment"
-          description={`Delete static for ${row.mac_address} → ${row.ip_address}?`}
-          onConfirm={() => mut.mutate()}
-          onClose={() => setDel(false)}
-          isPending={mut.isPending}
-        />
-      )}
-    </tr>
-  );
-}
-
 function ScopeCard({ scope }: { scope: DHCPScope }) {
   const qc = useQueryClient();
   const [showPools, setShowPools] = useState(true);
-  const [showStatics, setShowStatics] = useState(false);
   const [showAddPool, setShowAddPool] = useState(false);
-  const [showAddStatic, setShowAddStatic] = useState(false);
   const [editScope, setEditScope] = useState(false);
   const [deleteScope, setDeleteScope] = useState(false);
 
   const { data: pools = [] } = useQuery({
     queryKey: ["dhcp-pools", scope.id],
     queryFn: () => dhcpApi.listPools(scope.id),
-  });
-  const { data: statics = [] } = useQuery({
-    queryKey: ["dhcp-statics", scope.id],
-    queryFn: () => dhcpApi.listStatics(scope.id),
   });
 
   const toggleEnabled = useMutation({
@@ -175,8 +106,7 @@ function ScopeCard({ scope }: { scope: DHCPScope }) {
               {scope.name || `Scope ${scope.id.slice(0, 8)}`}
             </p>
             <p className="text-xs text-muted-foreground">
-              Lease {scope.lease_time}s · {pools.length} pool{pools.length !== 1 ? "s" : ""} ·{" "}
-              {statics.length} static{statics.length !== 1 ? "s" : ""}
+              Lease {scope.lease_time}s · {pools.length} pool{pools.length !== 1 ? "s" : ""}
               {scope.ddns_enabled && " · DDNS"}
             </p>
           </div>
@@ -246,53 +176,10 @@ function ScopeCard({ scope }: { scope: DHCPScope }) {
           </table>
         )}
 
-        <div className="flex items-center justify-between px-4 py-2 border-b bg-muted/30">
-          <button
-            onClick={() => setShowStatics((v) => !v)}
-            className="flex items-center gap-1 text-xs font-semibold"
-          >
-            {showStatics ? (
-              <ChevronDown className="h-3.5 w-3.5" />
-            ) : (
-              <ChevronRight className="h-3.5 w-3.5" />
-            )}
-            Static Assignments ({statics.length})
-          </button>
-          <button
-            onClick={() => setShowAddStatic(true)}
-            className="flex items-center gap-1 text-xs text-primary hover:underline"
-          >
-            <Plus className="h-3 w-3" /> Add Static
-          </button>
-        </div>
-        {showStatics && statics.length > 0 && (
-          <table className="w-full">
-            <thead>
-              <tr className="border-b bg-muted/20 text-xs">
-                <th className="px-3 py-1.5 text-left font-medium">MAC</th>
-                <th className="px-3 py-1.5 text-left font-medium">IP</th>
-                <th className="px-3 py-1.5 text-left font-medium">Hostname</th>
-                <th className="px-3 py-1.5 text-left font-medium">Description</th>
-                <th className="px-3 py-1.5"></th>
-              </tr>
-            </thead>
-            <tbody>
-              {statics.map((s) => (
-                <StaticRow key={s.id} row={s} scope={scope} />
-              ))}
-            </tbody>
-          </table>
-        )}
       </div>
 
       {showAddPool && (
         <CreatePoolModal scope={scope} onClose={() => setShowAddPool(false)} />
-      )}
-      {showAddStatic && (
-        <CreateStaticAssignmentModal
-          scope={scope}
-          onClose={() => setShowAddStatic(false)}
-        />
       )}
       {editScope && (
         <CreateScopeModal scope={scope} onClose={() => setEditScope(false)} />
@@ -300,10 +187,9 @@ function ScopeCard({ scope }: { scope: DHCPScope }) {
       {deleteScope && (
         <DeleteConfirmModal
           title="Delete DHCP Scope"
-          description={`Delete scope "${scope.name}" and all its pools and static assignments?`}
+          description={`Delete scope "${scope.name}" and all its pools?`}
           references={[
             `${pools.length} pool${pools.length !== 1 ? "s" : ""}`,
-            `${statics.length} static assignment${statics.length !== 1 ? "s" : ""}`,
           ]}
           onConfirm={() => delMut.mutate()}
           onClose={() => setDeleteScope(false)}

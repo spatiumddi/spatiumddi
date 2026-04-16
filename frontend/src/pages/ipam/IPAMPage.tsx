@@ -34,6 +34,7 @@ import {
 import {
   ipamApi,
   dnsApi,
+  dhcpApi,
   customFieldsApi,
   vlansApi,
   type IPSpace,
@@ -1090,7 +1091,20 @@ function AddAddressModal({
   const [ipStatus, setIpStatus] = useState("allocated");
   const [customFields, setCustomFields] = useState<Record<string, unknown>>({});
   const [dnsZoneId, setDnsZoneId] = useState<string>("");
+  const [dhcpScopeId, setDhcpScopeId] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
+  const needsDhcpScope = ipStatus === "dhcp" || ipStatus === "static_dhcp";
+
+  const { data: dhcpScopes = [] } = useQuery({
+    queryKey: ["dhcp-scopes-subnet", subnetId],
+    queryFn: () => dhcpApi.listScopesBySubnet(subnetId),
+    enabled: needsDhcpScope,
+  });
+  useEffect(() => {
+    if (needsDhcpScope && !dhcpScopeId && dhcpScopes.length > 0) {
+      setDhcpScopeId(dhcpScopes[0].id);
+    }
+  }, [needsDhcpScope, dhcpScopes.length]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const { data: cfDefs = [] } = useQuery({
     queryKey: ["custom-fields", "ip_address"],
@@ -1130,28 +1144,41 @@ function AddAddressModal({
   }, [availableZones.length, effectiveDns?.dns_zone_id]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const mutation = useMutation({
-    mutationFn: () => {
+    mutationFn: async () => {
       const zoneParam = dnsZoneId || undefined;
-      if (mode === "next") {
-        return ipamApi.nextAddress(subnetId, {
-          hostname,
-          status: ipStatus,
-          mac_address: mac || undefined,
-          description: description || undefined,
-          custom_fields: customFields,
-          dns_zone_id: zoneParam,
+      const created =
+        mode === "next"
+          ? await ipamApi.nextAddress(subnetId, {
+              hostname,
+              status: ipStatus,
+              mac_address: mac || undefined,
+              description: description || undefined,
+              custom_fields: customFields,
+              dns_zone_id: zoneParam,
+            })
+          : await ipamApi.createAddress({
+              subnet_id: subnetId,
+              address,
+              hostname,
+              mac_address: mac || undefined,
+              description: description || undefined,
+              status: ipStatus,
+              custom_fields: customFields,
+              dns_zone_id: zoneParam,
+            });
+      // If the user picked a static_dhcp status and a scope, mirror the row
+      // into the DHCP side so the two stay in sync (the backend
+      // `_upsert_ipam_for_static` helper will find the existing IPAM row and
+      // just link / update it — no duplicate is created).
+      if (ipStatus === "static_dhcp" && dhcpScopeId && mac) {
+        await dhcpApi.createStatic(dhcpScopeId, {
+          ip_address: String(created.address),
+          mac_address: mac,
+          hostname: hostname || "",
+          description: description || "",
         });
       }
-      return ipamApi.createAddress({
-        subnet_id: subnetId,
-        address,
-        hostname,
-        mac_address: mac || undefined,
-        description: description || undefined,
-        status: ipStatus,
-        custom_fields: customFields,
-        dns_zone_id: zoneParam,
-      });
+      return created;
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["addresses", subnetId] });
@@ -1273,6 +1300,35 @@ function AddAddressModal({
             </select>
           </Field>
         </div>
+        {needsDhcpScope && (
+          <Field label="DHCP Scope">
+            {dhcpScopes.length === 0 ? (
+              <div className="rounded-md border bg-amber-500/10 border-amber-500/40 px-3 py-2 text-xs">
+                No DHCP scope exists for this subnet. Create one from the{" "}
+                <span className="font-medium">DHCP Pools</span> tab first.
+              </div>
+            ) : (
+              <select
+                className={inputCls}
+                value={dhcpScopeId}
+                onChange={(e) => setDhcpScopeId(e.target.value)}
+              >
+                {dhcpScopes.map((sc) => (
+                  <option key={sc.id} value={sc.id}>
+                    {sc.name || `Scope ${sc.id.slice(0, 8)}`}
+                    {" — server "}
+                    {sc.server_id?.slice(0, 8) ?? "unassigned"}
+                  </option>
+                ))}
+              </select>
+            )}
+            {ipStatus === "static_dhcp" && !mac && (
+              <p className="mt-1 text-xs text-amber-600">
+                MAC address required to create a static DHCP reservation.
+              </p>
+            )}
+          </Field>
+        )}
         <Field label="Description">
           <input
             className={inputCls}
@@ -1709,7 +1765,7 @@ function SubnetDetail({
                 : "border-transparent text-muted-foreground hover:text-foreground",
             )}
           >
-            DHCP
+            DHCP Pools
           </button>
         </div>
       </div>
