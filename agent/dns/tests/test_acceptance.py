@@ -23,6 +23,11 @@ from spatium_dns_agent.cache import (
 # ── Unit-ish (no external deps) ────────────────────────────────────────────────
 
 
+@pytest.fixture
+def tmp_state(tmp_path):
+    return tmp_path
+
+
 def test_cache_roundtrip(tmp_state) -> None:
     """#3 (CP-outage resilience) smoke: bundle round-trips through disk cache."""
     ensure_layout(tmp_state)
