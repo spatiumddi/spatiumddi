@@ -120,15 +120,39 @@ jobs:
       - name: Generate changelog
         id: changelog
         run: |
+          VERSION="${{ needs.meta.outputs.version }}"
+
+          # Extract the "## <VERSION>" section from CHANGELOG.md (up to the
+          # next "## " heading). Use awk index() so dots in the version are
+          # treated literally, not as regex wildcards.
+          NOTES=$(awk -v v="$VERSION" '
+            index($0, "## " v) == 1 { found = 1; next }
+            found && index($0, "## ") == 1 { exit }
+            found { print }
+          ' CHANGELOG.md)
+
+          # Fall back to a commit shortlog if the CHANGELOG section is empty
+          # or missing (e.g. forgot to update it before tagging).
+          if [ -z "$(printf '%s' "$NOTES" | tr -d '[:space:]')" ]; then
+            echo "::notice::No CHANGELOG section for $VERSION — using commit shortlog"
+            PREV_TAG=$(git tag --sort=-version:refname | grep -E '^[0-9]{4}\.' | sed -n '2p')
+            if [ -n "$PREV_TAG" ]; then
+              NOTES=$(git log "${PREV_TAG}..HEAD" --oneline --no-merges)
+            else
+              NOTES=$(git log HEAD --oneline --no-merges | head -30)
+            fi
+          fi
+
+          {
+            echo "CHANGELOG<<CHANGELOG_EOF"
+            printf '%s\n' "$NOTES"
+            echo "CHANGELOG_EOF"
+          } >> "$GITHUB_ENV"
+
           PREV_TAG=$(git tag --sort=-version:refname | grep -E '^[0-9]{4}\.' | sed -n '2p')
           if [ -n "$PREV_TAG" ]; then
-            LOG=$(git log "${PREV_TAG}..HEAD" --oneline --no-merges)
-          else
-            LOG=$(git log HEAD --oneline --no-merges | head -30)
+            echo "PREV_TAG=$PREV_TAG" >> "$GITHUB_ENV"
           fi
-          echo "CHANGELOG<<EOF" >> "$GITHUB_ENV"
-          echo "$LOG" >> "$GITHUB_ENV"
-          echo "EOF" >> "$GITHUB_ENV"
 
       - uses: softprops/action-gh-release@v2
         with:
@@ -146,5 +170,5 @@ jobs:
             ```
 
             ## Full Changelog
-            https://github.com/${{ github.repository }}/compare/${{ needs.meta.outputs.version }}...HEAD
+            ${{ env.PREV_TAG && format('https://github.com/{0}/compare/{1}...{2}', github.repository, env.PREV_TAG, needs.meta.outputs.version) || format('https://github.com/{0}/commits/{1}', github.repository, needs.meta.outputs.version) }}
           generate_release_notes: false
