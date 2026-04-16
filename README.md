@@ -41,16 +41,17 @@ It is designed as a modern alternative to commercial DDI platforms like Efficien
 
 ## Screenshots
 
-<p align="center">
-  <a href="docs/assets/screenshots/dashboard.png"><img src="docs/assets/screenshots/dashboard.png" alt="Dashboard" width="420"/></a>
-  <a href="docs/assets/screenshots/ipam.png"><img src="docs/assets/screenshots/ipam.png" alt="IPAM" width="420"/></a>
-</p>
-<p align="center">
-  <a href="docs/assets/screenshots/dns.png"><img src="docs/assets/screenshots/dns.png" alt="DNS" width="280"/></a>
-  <a href="docs/assets/screenshots/dhcp.png"><img src="docs/assets/screenshots/dhcp.png" alt="DHCP" width="280"/></a>
-  <a href="docs/assets/screenshots/vlans.png"><img src="docs/assets/screenshots/vlans.png" alt="VLANs" width="280"/></a>
-</p>
-<p align="center"><em>Dashboard · IPAM tree · DNS · DHCP · VLANs — click any image to enlarge</em></p>
+_Click any image to open the full-size version._
+
+| [Dashboard](docs/assets/screenshots/dashboard.png) | [IPAM](docs/assets/screenshots/ipam.png) |
+| :---: | :---: |
+| [<img src="docs/assets/screenshots/dashboard.png" alt="Dashboard" width="450"/>](docs/assets/screenshots/dashboard.png) | [<img src="docs/assets/screenshots/ipam.png" alt="IPAM" width="450"/>](docs/assets/screenshots/ipam.png) |
+| Utilisation, VLAN, DNS &amp; DHCP status at a glance | Hierarchical space / block / subnet tree with per-IP DNS sync |
+
+| [DNS](docs/assets/screenshots/dns.png) | [DHCP](docs/assets/screenshots/dhcp.png) | [VLANs](docs/assets/screenshots/vlans.png) |
+| :---: | :---: | :---: |
+| [<img src="docs/assets/screenshots/dns.png" alt="DNS" width="300"/>](docs/assets/screenshots/dns.png) | [<img src="docs/assets/screenshots/dhcp.png" alt="DHCP" width="300"/>](docs/assets/screenshots/dhcp.png) | [<img src="docs/assets/screenshots/vlans.png" alt="VLANs" width="300"/>](docs/assets/screenshots/vlans.png) |
+| Zones, records, server groups | Scopes, pools, static reservations | Routers &amp; VLANs linked to subnets |
 
 ---
 
