@@ -318,7 +318,7 @@ class DHCPConfigOp(UUIDPrimaryKeyMixin, Base):
     )
     # op_type: apply_config | restart | reload
     op_type: Mapped[str] = mapped_column(String(30), nullable=False)
-    payload: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False, default=lambda: {})
     # status: pending | acked | failed
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
