@@ -7,10 +7,23 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versioning uses 
 
 ## Unreleased
 
+---
+
+## 2026.04.16-2 — 2026-04-16
+
+First post-alpha iteration — same-day follow-up to the alpha. Adds IP
+aliases across the stack, multi-select/bulk ops on the IP address table,
+an always-visible per-column filter row on the audit log, a DNS zone
+tree that can create sub-zones with a click, and switches the base
+Compose file to pull release images from GHCR.
+
 ### Added
 
 **IPAM**
 - IP aliases — Allocate/Edit IP modal supports extra CNAME/A records tied to the IP. Auto-deleted on IP purge.
+- `+N aliases` pill next to the hostname in the subnet IP table when an IP has user-added aliases (new `alias_count` on `IPAddressResponse`).
+- New "Aliases" subnet tab listing every CNAME/A alias in the subnet (name · type · target · IP · host · delete). `GET /ipam/subnets/{id}/aliases`.
+- Multi-select on the subnet IP table with a bulk-action bar inline on the tab row (no banner push-down). `POST /ipam/addresses/bulk-delete` (soft → orphan or permanent) and `POST /ipam/addresses/bulk-edit` (status, description, tags *merge*, custom_fields *merge*). System rows auto-excluded.
 - Reverse-zone backfill — dedicated button on Space / Block / Subnet headers (`POST /ipam/{scope}/{id}/reverse-zones/backfill`). Also backfills opportunistically on every IP allocation.
 - DHCP Pool membership column on subnet IP table — cyan/violet/zinc badge per IP shows which pool (dynamic/reserved/excluded) it falls in.
 - Bulk orphan cleanup modal on subnet header.
@@ -22,6 +35,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versioning uses 
 - Inline edit for blocklist entries + exceptions (`PUT .../entries/{id}`, `PUT .../exceptions/{id}`).
 - Blocklist page reorganized into red **Blocked Domains** and green **Allow-list** sections.
 - DNS records table: always-visible edit/delete, clickable record name, single-step delete confirm, multi-select bulk delete (IPAM records excluded).
+- Zone tree folder click → Create-Zone modal pre-filled with the parent suffix (e.g. clicking `example.com` opens "New zone `*.example.com`"). TLD folders (org/com/net/…) just toggle, don't prompt. Zone names in the tree render without the trailing dot.
 - DNS agent re-bootstraps on 404 (not just 401) — recovers from stale server rows.
 
 **DHCP**
@@ -34,18 +48,28 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versioning uses 
 - DHCP scope options default-prefill from Settings (DNS/NTP/domain/lease-time).
 - Static assignments moved from DHCP Pools tab into IPAM Allocate IP flow.
 
+**Audit log**
+- Per-column filter row on `/admin/audit` — User/Summary/IP text inputs, Action/Resource/Result dropdowns, always visible, Clear-all X in the actions column. Backend adds `resource_display` / `result` / `source_ip` query params.
+
 **Platform**
+- Base `docker-compose.yml` now pulls release images from GHCR (`ghcr.io/spatiumddi/spatiumddi-{api,frontend}`, `ghcr.io/spatiumddi/dns-bind9`, `ghcr.io/spatiumddi/dhcp-kea`); pin with `SPATIUMDDI_VERSION=<tag>` in `.env`.
+- `docker-compose.dev.yml` is a standalone self-contained file that keeps `build:` stanzas for local dev builds — use `docker compose -f docker-compose.dev.yml …` or `export COMPOSE_FILE=docker-compose.dev.yml`.
 - Jekyll docs site config (`docs/_config.yml`, `docs/index.md`).
 - CHANGELOG; alpha banner; clickable screenshot thumbnails in README.
 - Seed script (`scripts/seed_demo.py`).
 - Alembic migrations now tracked in git (were `.gitignore`d — CI was broken).
 - `COMPOSE_PROFILES` documented.
 
+### Changed
+
+- `CLAUDE.md` slimmed to a navigational entry point — Phase 1 / Waves 1–5 / DHCP Wave 1 implemented-lists moved to this CHANGELOG; added a Repo Layout section and a Cross-cutting Patterns section (driver abstraction, ConfigBundle+ETag long-poll, agent bootstrap/reconnection).
+
 ### Fixed
 
 - Full audit of IPAM/VLANs/DNS/DHCP frontend ↔ backend API contracts; 10+ mismatches fixed.
 - `allocate_next_ip` — `FOR UPDATE` on outer join, now `of=Subnet` + `.unique()`.
 - Workflow permissions hardened (CodeQL alerts resolved).
+- Ruff (import sort, unused `datetime.UTC`), Black (4 files), Prettier (3 files) — unblocked CI.
 
 ---
 
