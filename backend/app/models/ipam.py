@@ -159,7 +159,7 @@ class Subnet(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     space: Mapped[IPSpace] = relationship("IPSpace", back_populates="subnets")
     block: Mapped[IPBlock | None] = relationship("IPBlock", back_populates="subnets")
     router_zone: Mapped[RouterZone | None] = relationship("RouterZone", back_populates="subnets")
-    vlan_ref: Mapped["VLAN | None"] = relationship(  # noqa: F821
+    vlan_ref: Mapped["VLAN | None"] = relationship(  # type: ignore[name-defined]  # noqa: F821
         "VLAN", lazy="joined", foreign_keys=[vlan_ref_id]
     )
     addresses: Mapped[list["IPAddress"]] = relationship(

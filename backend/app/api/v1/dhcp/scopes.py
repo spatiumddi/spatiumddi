@@ -64,7 +64,7 @@ def _normalize_sync_mode(v: str | None) -> str:
         return "on_static_only"
     if v == "learned":
         return "on_lease"
-    return v
+    return v or "on_static_only"
 
 
 class ScopeCreate(BaseModel):
@@ -179,7 +179,7 @@ async def list_scopes_for_subnet(
 )
 async def create_scope(
     subnet_id: uuid.UUID, body: ScopeCreate, db: DB, user: SuperAdmin
-) -> DHCPScope:
+) -> ScopeResponse:
     subnet = await db.get(Subnet, subnet_id)
     if subnet is None:
         raise HTTPException(status_code=404, detail="Subnet not found")
