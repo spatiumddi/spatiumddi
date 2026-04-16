@@ -9,6 +9,10 @@ env:
   REGISTRY: ghcr.io
   IMAGE_PREFIX: ghcr.io/${{ github.repository_owner }}
 
+# Default to read-only; individual jobs widen with packages:write / contents:write.
+permissions:
+  contents: read
+
 jobs:
   # ── Extract version metadata ───────────────────────────────────────────────
   meta:
