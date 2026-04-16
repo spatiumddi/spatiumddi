@@ -163,7 +163,6 @@ class SyncLoop:
         if bundle.get("pending_approval"):
             log.info("sync_pending_approval_waiting")
             self._stop.wait(10.0)
-            self._record_success()
             return
 
         etag = bundle.get("etag") or resp.headers.get("ETag")
