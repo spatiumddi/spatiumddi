@@ -188,7 +188,8 @@ class Bind9Driver(DriverBase):
         value = rec["value"]
         # rec.get returns None when the field exists with null value (which
         # is the common case from JSON), so fall back explicitly.
-        ttl = rec.get("ttl") or 3600
+        ttl_value = rec.get("ttl")
+        ttl = ttl_value if ttl_value is not None else 3600
 
         tsig_path = self.state_dir / "tsig" / "ddns.key"
         keyring = None
