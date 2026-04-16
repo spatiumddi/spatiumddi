@@ -158,6 +158,7 @@ class SyncLoop:
         except ValueError:
             self._record_failure("invalid_json")
             log.warning("sync_invalid_json")
+            self._stop.wait(_OFFLINE_RETRY_SECONDS if self._offline else 5.0)
             return
 
         if bundle.get("pending_approval"):
