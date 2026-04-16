@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Iterator
 
 import pytest
 
@@ -11,12 +10,7 @@ from spatium_dns_agent.config import AgentConfig
 
 
 @pytest.fixture
-def tmp_state(tmp_path: Path) -> Iterator[Path]:
-    yield tmp_path
-
-
-@pytest.fixture
-def agent_cfg(tmp_state: Path) -> AgentConfig:
+def agent_cfg(tmp_path: Path) -> AgentConfig:
     return AgentConfig(
         control_plane_url="http://localhost:8000",
         dns_agent_key="test-key",
@@ -26,5 +20,5 @@ def agent_cfg(tmp_state: Path) -> AgentConfig:
         group_name="default",
         tls_ca_path=None,
         insecure_skip_tls_verify=True,
-        state_dir=tmp_state,
+        state_dir=tmp_path,
     )
