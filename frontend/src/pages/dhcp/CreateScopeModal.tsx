@@ -230,6 +230,8 @@ export function CreateScopeModal({
           <Field label="Lease Time (sec)">
             <input
               type="number"
+              min="0"
+              step="1"
               className={inputCls}
               value={leaseTime}
               onChange={(e) => setLeaseTime(e.target.value)}
@@ -238,6 +240,8 @@ export function CreateScopeModal({
           <Field label="Min Lease (sec)">
             <input
               type="number"
+              min="0"
+              step="1"
               className={inputCls}
               value={minLease}
               onChange={(e) => setMinLease(e.target.value)}
@@ -246,6 +250,8 @@ export function CreateScopeModal({
           <Field label="Max Lease (sec)">
             <input
               type="number"
+              min="0"
+              step="1"
               className={inputCls}
               value={maxLease}
               onChange={(e) => setMaxLease(e.target.value)}
