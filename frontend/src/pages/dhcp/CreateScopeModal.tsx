@@ -130,14 +130,32 @@ export function CreateScopeModal({
 
   const mut = useMutation({
     mutationFn: () => {
+      const parsedLeaseTime = parseInt(leaseTime, 10) || 86400;
+      const parsedMinLease = minLease ? parseInt(minLease, 10) : null;
+      const parsedMaxLease = maxLease ? parseInt(maxLease, 10) : null;
+
+      if (parsedMinLease !== null && parsedMinLease > parsedLeaseTime) {
+        throw new Error("Minimum lease time must be less than or equal to lease time.");
+      }
+      if (parsedMaxLease !== null && parsedLeaseTime > parsedMaxLease) {
+        throw new Error("Lease time must be less than or equal to maximum lease time.");
+      }
+      if (
+        parsedMinLease !== null &&
+        parsedMaxLease !== null &&
+        parsedMinLease > parsedMaxLease
+      ) {
+        throw new Error("Minimum lease time must be less than or equal to maximum lease time.");
+      }
+
       const data: Partial<DHCPScope> = {
         server_id: serverId || null,
         name,
         description,
         enabled,
-        lease_time: parseInt(leaseTime, 10) || 86400,
-        min_lease_time: minLease ? parseInt(minLease, 10) : null,
-        max_lease_time: maxLease ? parseInt(maxLease, 10) : null,
+        lease_time: parsedLeaseTime,
+        min_lease_time: parsedMinLease,
+        max_lease_time: parsedMaxLease,
         ddns_enabled: ddnsEnabled,
         ddns_hostname_policy: ddnsEnabled ? ddnsPolicy : null,
         ddns_domain_override: ddnsDomain || null,
