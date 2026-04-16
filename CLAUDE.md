@@ -38,6 +38,7 @@ Always read the relevant spec doc(s) before writing code for a feature area.
 | `docs/features/DHCP.md` | DHCP servers, scopes, pools, static assignments, DDNS, caching |
 | `docs/features/DNS.md` | DNS servers, zones, records, views, server groups, blocking lists, DDNS, zone tree |
 | `docs/features/AUTH.md` | Authentication, LDAP/OIDC/SAML, roles, group-scoped permissions, API tokens |
+| `docs/PERMISSIONS.md` | RBAC permission grammar (`{action, resource_type, resource_id?}`), builtin roles, wildcards |
 | `docs/features/SYSTEM_ADMIN.md` | System config, health dashboard, notifications, backup/restore, service control |
 | `docs/deployment/APPLIANCE.md` | OS appliance build, base OS selection, licensing |
 | `docs/deployment/DNS_AGENT.md` | DNS agent/container architecture — image layout, auto-registration, config sync, K8s shape |
@@ -61,7 +62,7 @@ Always read the relevant spec doc(s) before writing code for a feature area.
 | Frontend | React 18 + TypeScript, Vite, shadcn/ui, Tailwind, React Query |
 | Database | PostgreSQL 16 (HA via Patroni or CloudNativePG) |
 | Cache / Sessions | Redis 7 |
-| Auth | python-jose, authlib (OIDC), python-ldap |
+| Auth | python-jose + bcrypt (local), ldap3 (LDAP), authlib (OIDC), python3-saml (SAML), pyrad (RADIUS), tacacs_plus (TACACS+); Fernet for secrets at rest |
 | Logging | structlog → JSON → centralized log store (Loki / Elasticsearch) |
 | Metrics | Prometheus + Grafana; InfluxDB v1/v2 push export |
 | Containerization | Docker (multi-stage, amd64+arm64), Docker Compose, Kubernetes + Helm |
@@ -134,24 +135,46 @@ Three patterns recur across the DNS and DHCP subsystems. Know these before addin
 
 | Phase | Focus | Status |
 |---|---|---|
-| 1 | Core IPAM, local auth, user management, audit log, Docker Compose | **In Progress** |
+| 1 | Core IPAM, local auth, user management, audit log, Docker Compose | **Mostly done** — LDAP/OIDC/SAML + RADIUS/TACACS+ auth, group-based RBAC enforcement, bulk-edit tags/CF, inherited-field placeholders, and mobile-responsive UI all landed; IPv6 partial |
 | 2 | DHCP (Kea + ISC), DNS (BIND9), DDNS, zone/subnet tree UI | **In Progress** (DNS core landed; DHCP Kea driver + agent + UI landed; ISC DHCP + DDNS pending) |
 | 3 | DNS views, server groups, blocking lists, VLAN/VXLAN, system admin panel, health dashboard | **In Progress** (DNS views, groups, blocklists, health checks landed) |
-| 4 | OS appliance image, Terraform/Ansible providers, SAML, notifications, backup/restore | Not started |
+| 4 | OS appliance image, Terraform/Ansible providers, SAML, notifications, backup/restore | **In Progress** (SAML SP landed in Wave A.4; appliance, providers, backup still pending) |
 | 5 | Multi-tenancy, IP request workflows, import/export, advanced reporting | Not started |
 
 ### Current state
 
 SpatiumDDI cut its alpha release `2026.04.16-1` on 2026-04-16 with IPAM, DNS (BIND9), and DHCP (Kea) all shipping. For the full list of what has landed — Phase 1 core, Waves 1–5, DHCP Wave 1 — see `CHANGELOG.md`. The forward-looking work is below.
 
+### Auth waves A–D (landed after `2026.04.16-2`)
+
+**Wave A — external auth providers.** GUI-configured LDAP / OIDC / SAML replacing the old env-var stubs.
+- `AuthProvider` + `AuthGroupMapping` tables; Fernet-encrypted secrets (`backend/app/core/crypto.py`).
+- Admin CRUD at `/api/v1/auth-providers` with per-type structured forms.
+- **LDAP** — `ldap3`-based auth in `backend/app/core/auth/ldap.py`; wired into `/auth/login` as a password-grant fallthrough.
+- **OIDC** — authorize / callback redirect flow with signed state+nonce cookie, discovery + JWKS caching, `authlib.jose` ID-token validation; login page lists enabled providers as "Sign in with …" buttons.
+- **SAML** — `python3-saml` SP-side flow with HTTP-Redirect AuthnRequest, ACS POST binding, SP-metadata endpoint.
+- Unified user sync at `backend/app/core/auth/user_sync.py`: creates/updates Users, replaces group membership with mapped groups, **rejects logins with no mapping match**.
+
+**Wave B — RADIUS + TACACS+.** `pyrad` and `tacacs_plus` drivers added; share the same password-grant fallthrough as LDAP via `PASSWORD_PROVIDER_TYPES`. Admin test-connection probe for each.
+
+**Wave C — group-based RBAC enforcement.** Permission model (`{action, resource_type, resource_id?}`) with wildcard support; `user_has_permission()` / `require_permission()` / `require_any_permission()` / `require_resource_permission()` helpers in `backend/app/core/permissions.py`. Five builtin roles seeded at startup (Superadmin, Viewer, IPAM / DNS / DHCP Editor). `/api/v1/roles` CRUD + expanded `/api/v1/groups` CRUD with role/user assignment. Router-level gates applied across IPAM / DNS / DHCP / VLANs / custom-fields / settings / audit. Superadmin always bypasses. `RolesPage` + `GroupsPage` admin UI. See `docs/PERMISSIONS.md`.
+
+**Wave D — UX polish + partial IPv6.**
+- Per-field opt-in toggles on bulk-edit IPs (status/description/tags/CF/DNS zone individually) plus a "replace all tags" mode.
+- `EditSubnetModal` + `EditBlockModal` now show inherited custom-field values as HTML `placeholder` with "inherited from block/space `<name>`" badges; `/api/v1/ipam/blocks/{id}/effective-fields` added for parity with the subnet endpoint.
+- Mobile responsive — sidebar becomes a drawer on `<md` with backdrop, `Header` hamburger toggle, 10+ data tables wrapped in `overflow-x-auto` with `min-w`, all modals sized `max-w-[95vw]` on `<sm`.
+- IPv6 partial — `DHCPScope.address_family` column + Kea driver `Dhcp6` branch; subnet create skips the v6 broadcast row; `_sync_dns_record` emits AAAA + PTR in `ip6.arpa`; `/next-address` returns 409 on v6 (EUI-64/hash allocation is a future enhancement). Dhcp6 option-name translation is marked TODO in `backend/app/drivers/dhcp/kea.py`.
+
+### IPAM polish (shipped alongside the waves)
+
+- **Block overlap validation** — `_assert_no_block_overlap` rejects same-level duplicates and CIDR overlaps in `create_block` + the reparent path in `update_block`.
+- **Scheduled IPAM ↔ DNS auto-sync** — opt-in Celery beat task `app.tasks.ipam_dns_sync.auto_sync_ipam_dns`. Beat fires every 60 s; the task itself gates on `PlatformSettings.dns_auto_sync_enabled` + `dns_auto_sync_interval_minutes`, so cadence changes in the UI take effect without restarting beat. Optionally deletes stale auto-generated records.
+- **Shared `ZoneOptions` dropdown** (`frontend/src/pages/ipam/IPAMPage.tsx`) — renders primary zone first, `<optgroup label="Additional zones">` below; applied in Create / Edit / Bulk-edit IP modals. Zone picker is restricted to the subnet's explicit primary + additional zones when any are pinned.
+- **Bulk-edit DNS zone** — new `dns_zone_id` field on `IPAddressBulkChanges`; each selected IP routes through `_sync_dns_record` for move / create / delete.
+
 ### Phase 1 — Remaining
 
-- ⬜ LDAP / OIDC authentication
-- ✅ Group-based RBAC enforcement on API routes (Wave C — `backend/app/core/permissions.py`, built-in roles seeded on boot, Roles/Groups admin pages)
-- ⬜ Full IPv6 support in IPAM, DHCP, DNS (address storage, CIDR validation, UI rendering)
-- ⬜ Mobile-responsive UI
-- ⬜ Bulk-edit UI for `tags` + `custom_fields` (API supports it; only scalar fields in modal today)
-- ⬜ Wire inherited-field placeholders into `EditSubnetModal` / `EditBlockModal` (API `/effective-fields` is ready)
+- ⬜ Finish full IPv6 — Dhcp6 option-name translation in `backend/app/drivers/dhcp/kea.py`, EUI-64 / hash-based /128 allocation for `/next-address`, v6-specific test coverage
 
 ### Phase 2/3 — Remaining
 
