@@ -28,7 +28,7 @@ function suggestRange(
   const mask = prefix === 0 ? 0 : (0xffffffff << (32 - prefix)) >>> 0;
   const base = (netInt & mask) >>> 0;
   const hostBits = 32 - prefix;
-  const total = hostBits >= 32 ? 0 : 1 << hostBits;
+  const total = 1 << hostBits;
   if (total < 16) return null;
   const startInt = (base + 10) >>> 0;
   const endInt = (base + total - 2) >>> 0;
