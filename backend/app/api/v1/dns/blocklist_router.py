@@ -151,6 +151,7 @@ class EntryCreate(BaseModel):
     entry_type: str = "block"
     target: str | None = None
     is_wildcard: bool = False
+    reason: str = ""
 
     @field_validator("entry_type")
     @classmethod
@@ -165,6 +166,7 @@ class EntryUpdate(BaseModel):
     entry_type: str | None = None
     target: str | None = None
     is_wildcard: bool | None = None
+    reason: str | None = None
 
     @field_validator("entry_type")
     @classmethod
@@ -182,6 +184,7 @@ class EntryResponse(BaseModel):
     target: str | None
     source: str
     is_wildcard: bool
+    reason: str
     added_at: datetime
 
     model_config = {"from_attributes": True}
@@ -515,6 +518,7 @@ async def add_entry(
         target=body.target,
         source="manual",
         is_wildcard=body.is_wildcard,
+        reason=body.reason,
     )
     db.add(entry)
     bl.entry_count = bl.entry_count + 1

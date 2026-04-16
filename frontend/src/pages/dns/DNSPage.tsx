@@ -2905,6 +2905,7 @@ function BlocklistDetail({
   const [limit] = useState(50);
   const [offset, setOffset] = useState(0);
   const [newDomain, setNewDomain] = useState("");
+  const [newReason, setNewReason] = useState("");
   const [bulkText, setBulkText] = useState("");
   const [showBulk, setShowBulk] = useState(false);
   const [excDomain, setExcDomain] = useState("");
@@ -2925,9 +2926,14 @@ function BlocklistDetail({
   });
 
   const addEntry = useMutation({
-    mutationFn: () => dnsBlocklistApi.addEntry(list.id, { domain: newDomain }),
+    mutationFn: () =>
+      dnsBlocklistApi.addEntry(list.id, {
+        domain: newDomain,
+        reason: newReason || undefined,
+      }),
     onSuccess: () => {
       setNewDomain("");
+      setNewReason("");
       qc.invalidateQueries({ queryKey: ["dns-blocklist-entries", list.id] });
     },
   });
@@ -2953,9 +2959,13 @@ function BlocklistDetail({
   });
   const [editEntry, setEditEntry] = useState<DNSBlockListEntry | null>(null);
   const [editDomain, setEditDomain] = useState("");
+  const [editEntryReason, setEditEntryReason] = useState("");
   const updateEntry = useMutation({
     mutationFn: () =>
-      dnsBlocklistApi.updateEntry(list.id, editEntry!.id, { domain: editDomain }),
+      dnsBlocklistApi.updateEntry(list.id, editEntry!.id, {
+        domain: editDomain,
+        reason: editEntryReason,
+      }),
     onSuccess: () => {
       setEditEntry(null);
       qc.invalidateQueries({ queryKey: ["dns-blocklist-entries", list.id] });
@@ -3038,8 +3048,16 @@ function BlocklistDetail({
         </p>
       )}
 
-      {/* Entries */}
-      <div className="rounded-md border">
+      {/* Blocked domains (the list itself) */}
+      <div className="rounded-md border-2 border-destructive/30">
+        <div className="flex items-center justify-between border-b border-destructive/30 bg-destructive/5 px-3 py-1.5">
+          <div className="flex items-center gap-2 text-xs font-semibold uppercase text-destructive">
+            <Ban className="h-3.5 w-3.5" /> Blocked Domains
+          </div>
+          <span className="text-xs text-muted-foreground">
+            Domains added here are blocked by the DNS server.
+          </span>
+        </div>
         <div className="space-y-2 border-b p-2">
           <div className="relative">
             <Search className="pointer-events-none absolute left-2.5 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
@@ -3055,8 +3073,8 @@ function BlocklistDetail({
           </div>
           <div className="flex items-center gap-2">
             <input
-              className={`${inputCls} flex-1`}
-              placeholder="Add single domain"
+              className={`${inputCls} flex-1 min-w-0`}
+              placeholder="Domain to block"
               value={newDomain}
               onChange={(e) => setNewDomain(e.target.value)}
               onKeyDown={(e) => {
@@ -3066,19 +3084,31 @@ function BlocklistDetail({
                 }
               }}
             />
-          <button
-            className="rounded-md border px-2 py-1 text-xs hover:bg-accent"
-            onClick={() => addEntry.mutate()}
-            disabled={!newDomain}
-          >
-            Add
-          </button>
-          <button
-            className="rounded-md border px-2 py-1 text-xs hover:bg-accent"
-            onClick={() => setShowBulk(true)}
-          >
-            Bulk add
-          </button>
+            <input
+              className={`${inputCls} flex-1 min-w-0`}
+              placeholder="Reason (optional)"
+              value={newReason}
+              onChange={(e) => setNewReason(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter" && newDomain) {
+                  e.preventDefault();
+                  addEntry.mutate();
+                }
+              }}
+            />
+            <button
+              className="flex-shrink-0 rounded-md border px-2 py-1 text-xs hover:bg-accent"
+              onClick={() => addEntry.mutate()}
+              disabled={!newDomain}
+            >
+              Add
+            </button>
+            <button
+              className="flex-shrink-0 rounded-md border px-2 py-1 text-xs hover:bg-accent"
+              onClick={() => setShowBulk(true)}
+            >
+              Bulk add
+            </button>
           </div>
         </div>
         <table className="w-full text-sm">
@@ -3086,6 +3116,7 @@ function BlocklistDetail({
             <tr className="text-left text-xs text-muted-foreground">
               <th className="px-3 py-1.5">Domain</th>
               <th className="px-3 py-1.5">Type</th>
+              <th className="px-3 py-1.5">Reason</th>
               <th className="px-3 py-1.5">Source</th>
               <th className="px-3 py-1.5 w-8"></th>
             </tr>
@@ -3094,7 +3125,7 @@ function BlocklistDetail({
             {items.length === 0 && (
               <tr>
                 <td
-                  colSpan={4}
+                  colSpan={5}
                   className="px-3 py-4 text-center text-xs text-muted-foreground italic"
                 >
                   No entries
@@ -3105,6 +3136,11 @@ function BlocklistDetail({
               <tr key={e.id} className="border-t hover:bg-accent/30">
                 <td className="px-3 py-1 font-mono text-xs">{e.domain}</td>
                 <td className="px-3 py-1 text-xs">{e.entry_type}</td>
+                <td className="px-3 py-1 text-xs text-muted-foreground">
+                  {e.reason || (
+                    <span className="text-muted-foreground/40">—</span>
+                  )}
+                </td>
                 <td className="px-3 py-1 text-xs">{e.source}</td>
                 <td className="px-3 py-1 text-right">
                   <div className="flex items-center justify-end gap-1">
@@ -3114,6 +3150,7 @@ function BlocklistDetail({
                         onClick={() => {
                           setEditEntry(e);
                           setEditDomain(e.domain);
+                          setEditEntryReason(e.reason ?? "");
                         }}
                         title="Edit domain"
                       >
@@ -3162,23 +3199,26 @@ function BlocklistDetail({
         )}
       </div>
 
-      {/* Exceptions */}
-      <div className="rounded-md border">
-        <div className="flex items-center justify-between border-b p-2">
-          <span className="text-xs font-medium text-muted-foreground uppercase tracking-wider">
-            Exceptions (allow-list)
+      {/* Exceptions (allow-list) */}
+      <div className="rounded-md border-2 border-emerald-500/30">
+        <div className="flex items-center justify-between border-b border-emerald-500/30 bg-emerald-500/5 px-3 py-1.5">
+          <div className="flex items-center gap-2 text-xs font-semibold uppercase text-emerald-700 dark:text-emerald-400">
+            <Shield className="h-3.5 w-3.5" /> Allow-list (Exceptions)
+          </div>
+          <span className="text-xs text-muted-foreground">
+            Domains added here are never blocked, even if they match a blocked entry.
           </span>
         </div>
         <div className="flex items-center gap-2 border-b p-2">
           <input
             className={`${inputCls} flex-1 min-w-0`}
-            placeholder="domain"
+            placeholder="Domain to allow"
             value={excDomain}
             onChange={(e) => setExcDomain(e.target.value)}
           />
           <input
             className={`${inputCls} flex-1 min-w-0`}
-            placeholder="reason (optional)"
+            placeholder="Reason (optional)"
             value={excReason}
             onChange={(e) => setExcReason(e.target.value)}
           />
@@ -3282,7 +3322,7 @@ function BlocklistDetail({
         </Modal>
       )}
       {editEntry && (
-        <Modal title="Edit Blocklist Entry" onClose={() => setEditEntry(null)}>
+        <Modal title="Edit Blocked Domain" onClose={() => setEditEntry(null)}>
           <div className="space-y-3">
             <Field label="Domain">
               <input
@@ -3290,6 +3330,14 @@ function BlocklistDetail({
                 value={editDomain}
                 onChange={(ev) => setEditDomain(ev.target.value)}
                 autoFocus
+              />
+            </Field>
+            <Field label="Reason">
+              <input
+                className={inputCls}
+                value={editEntryReason}
+                onChange={(ev) => setEditEntryReason(ev.target.value)}
+                placeholder="Optional"
               />
             </Field>
             <div className="flex justify-end gap-2">

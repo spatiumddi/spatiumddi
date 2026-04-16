@@ -1149,6 +1149,7 @@ export interface DNSBlockListEntry {
   target: string | null;
   source: string;
   is_wildcard: boolean;
+  reason: string;
   added_at: string;
 }
 

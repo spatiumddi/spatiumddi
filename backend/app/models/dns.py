@@ -524,6 +524,9 @@ class DNSBlockListEntry(UUIDPrimaryKeyMixin, Base):
     source: Mapped[str] = mapped_column(String(20), nullable=False, default="manual")
     is_wildcard: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     source_line: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Operator note — parallels DNSBlockListException.reason. Only meaningful
+    # for manual entries; feed-sourced entries would overwrite it on refresh.
+    reason: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default="")
     added_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
