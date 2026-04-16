@@ -61,7 +61,7 @@ class DHCPServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     host: Mapped[str] = mapped_column(String(255), nullable=False)
     port: Mapped[int] = mapped_column(Integer, nullable=False, default=67)
     # roles: primary | secondary | standalone (JSON array of strings)
-    roles: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    roles: Mapped[list] = mapped_column(JSONB, nullable=False, default=lambda: [])
 
     server_group_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
@@ -140,7 +140,7 @@ class DHCPScope(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # DHCP options (JSONB map keyed by option name: routers, dns-servers,
     # domain-name, ntp-servers, tftp-server-name, bootfile-name,
     # tftp-server-address (150), etc.)
-    options: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    options: Mapped[dict] = mapped_column(JSONB, nullable=False, default=lambda: {})
 
     # DDNS
     ddns_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
@@ -249,7 +249,7 @@ class DHCPClientClass(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     match_expression: Mapped[str] = mapped_column(Text, nullable=False, default="")
     description: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    options: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    options: Mapped[dict] = mapped_column(JSONB, nullable=False, default=lambda: {})
 
     server: Mapped["DHCPServer"] = relationship("DHCPServer", back_populates="client_classes")
 
@@ -318,7 +318,7 @@ class DHCPConfigOp(UUIDPrimaryKeyMixin, Base):
     )
     # op_type: apply_config | restart | reload
     op_type: Mapped[str] = mapped_column(String(30), nullable=False)
-    payload: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    payload: Mapped[dict] = mapped_column(JSONB, nullable=False, default=lambda: {})
     # status: pending | acked | failed
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
