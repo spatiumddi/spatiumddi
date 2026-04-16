@@ -120,7 +120,7 @@ class SyncLoop:
         self._current_etag = etag
 
         # Drain pending record ops via RFC 2136 (no daemon reload)
-        for op in bundle.get("pending_record_ops", []) or []:
+        for op in bundle.get("pending_record_ops", []):
             try:
                 self.driver.apply_record_op(op)
                 self.heartbeat.pending_acks.append({"op_id": op["op_id"], "result": "ok"})
