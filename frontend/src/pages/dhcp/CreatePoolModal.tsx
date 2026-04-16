@@ -3,11 +3,9 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   dhcpApi,
   type DHCPPool,
-  type DHCPOption,
   type DHCPScope,
 } from "@/lib/api";
 import { Modal, Field, Btns, inputCls, errMsg } from "./_shared";
-import { DHCPOptionsEditor } from "./DHCPOptionsEditor";
 
 export function CreatePoolModal({
   pool,
@@ -24,13 +22,12 @@ export function CreatePoolModal({
   const [startIp, setStartIp] = useState(pool?.start_ip ?? "");
   const [endIp, setEndIp] = useState(pool?.end_ip ?? "");
   const [poolType, setPoolType] = useState(pool?.pool_type ?? "dynamic");
-  const [clientClassId, setClientClassId] = useState(
-    pool?.client_class_id ?? "",
+  const [classRestriction, setClassRestriction] = useState(
+    pool?.class_restriction ?? "",
   );
   const [leaseOverride, setLeaseOverride] = useState(
     pool?.lease_time_override != null ? String(pool.lease_time_override) : "",
   );
-  const [options, setOptions] = useState<DHCPOption[]>(pool?.options ?? []);
   const [error, setError] = useState("");
 
   const { data: classes = [] } = useQuery({
@@ -49,9 +46,8 @@ export function CreatePoolModal({
         start_ip: startIp,
         end_ip: endIp,
         pool_type: poolType,
-        client_class_id: clientClassId || null,
+        class_restriction: classRestriction || null,
         lease_time_override: leaseOverride ? parseInt(leaseOverride, 10) : null,
-        options,
       };
       return editing
         ? dhcpApi.updatePool(scope.id, pool!.id, data)
@@ -119,21 +115,17 @@ export function CreatePoolModal({
           <Field label="Restrict to Client Class">
             <select
               className={inputCls}
-              value={clientClassId}
-              onChange={(e) => setClientClassId(e.target.value)}
+              value={classRestriction}
+              onChange={(e) => setClassRestriction(e.target.value)}
             >
               <option value="">— No restriction —</option>
               {classes.map((c) => (
-                <option key={c.id} value={c.id}>
+                <option key={c.id} value={c.name}>
                   {c.name}
                 </option>
               ))}
             </select>
           </Field>
-        </div>
-        <div className="border-t pt-3">
-          <h3 className="text-sm font-semibold mb-2">Options Override</h3>
-          <DHCPOptionsEditor value={options} onChange={setOptions} />
         </div>
         {error && <p className="text-xs text-destructive">{error}</p>}
         <Btns onClose={onClose} pending={mut.isPending} />

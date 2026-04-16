@@ -1275,15 +1275,20 @@ export interface DHCPServer {
   id: string;
   server_group_id: string | null;
   name: string;
+  description: string;
   driver: string;
   host: string;
   port: number;
-  api_port: number | null;
+  roles: string[];
   status: string;
   last_sync_at: string | null;
   last_health_check_at: string | null;
-  notes: string;
+  agent_registered: boolean;
   agent_approved: boolean;
+  agent_last_seen: string | null;
+  agent_version: string | null;
+  config_etag: string | null;
+  config_pushed_at: string | null;
   created_at: string;
   modified_at: string;
 }
@@ -1328,36 +1333,28 @@ export const dhcpApi = {
 
   listServers: (groupId?: string) =>
     api
-      .get<DHCPServer[]>("/dhcp/servers", {
-        params: groupId ? { group_id: groupId } : undefined,
-      })
-      .then((r) => r.data),
+      .get<DHCPServer[]>("/dhcp/servers")
+      .then((r) =>
+        groupId
+          ? r.data.filter((s) => s.server_group_id === groupId)
+          : r.data,
+      ),
   getServer: (id: string) =>
     api.get<DHCPServer>(`/dhcp/servers/${id}`).then((r) => r.data),
-  createServer: (data: Partial<DHCPServer> & { api_key?: string }) =>
+  createServer: (data: Partial<DHCPServer>) =>
     api.post<DHCPServer>("/dhcp/servers", data).then((r) => r.data),
-  updateServer: (
-    id: string,
-    data: Partial<DHCPServer> & { api_key?: string },
-  ) => api.put<DHCPServer>(`/dhcp/servers/${id}`, data).then((r) => r.data),
+  updateServer: (id: string, data: Partial<DHCPServer>) =>
+    api.put<DHCPServer>(`/dhcp/servers/${id}`, data).then((r) => r.data),
   deleteServer: (id: string) => api.delete(`/dhcp/servers/${id}`),
   syncServer: (id: string) =>
-    api.post<{ task_id: string | null; status: string }>(
+    api.post<{ status: string; op_id: string; etag: string }>(
       `/dhcp/servers/${id}/sync`,
     ).then((r) => r.data),
   approveServer: (id: string) =>
     api.post<DHCPServer>(`/dhcp/servers/${id}/approve`).then((r) => r.data),
-  getLeases: (
-    id: string,
-    params?: {
-      state?: string;
-      subnet_id?: string;
-      limit?: number;
-      offset?: number;
-    },
-  ) =>
+  getLeases: (id: string, params?: { limit?: number }) =>
     api
-      .get<DHCPLeasePage>(`/dhcp/servers/${id}/leases`, { params })
+      .get<DHCPLease[]>(`/dhcp/servers/${id}/leases`, { params })
       .then((r) => r.data),
 
   listScopesBySubnet: (subnetId: string) =>
@@ -1416,18 +1413,15 @@ export const dhcpApi = {
       )
       .then((r) => r.data),
   updateClientClass: (
-    serverId: string,
+    _serverId: string,
     classId: string,
     data: Partial<DHCPClientClass>,
   ) =>
     api
-      .put<DHCPClientClass>(
-        `/dhcp/servers/${serverId}/client-classes/${classId}`,
-        data,
-      )
+      .put<DHCPClientClass>(`/dhcp/client-classes/${classId}`, data)
       .then((r) => r.data),
-  deleteClientClass: (serverId: string, classId: string) =>
-    api.delete(`/dhcp/servers/${serverId}/client-classes/${classId}`),
+  deleteClientClass: (_serverId: string, classId: string) =>
+    api.delete(`/dhcp/client-classes/${classId}`),
 };
 
 export interface DHCPPool {
@@ -1437,9 +1431,9 @@ export interface DHCPPool {
   start_ip: string;
   end_ip: string;
   pool_type: string; // "dynamic" | "excluded" | "reserved"
-  client_class_id: string | null;
+  class_restriction: string | null;
   lease_time_override: number | null;
-  options: DHCPOption[];
+  options_override: Record<string, unknown> | null;
   created_at: string;
   modified_at: string;
 }
@@ -1447,12 +1441,13 @@ export interface DHCPPool {
 export interface DHCPStaticAssignment {
   id: string;
   scope_id: string;
-  mac: string;
-  ip: string;
+  ip_address: string;
+  mac_address: string;
   hostname: string;
   description: string;
-  client_class_id: string | null;
-  options: DHCPOption[];
+  client_id: string | null;
+  options_override: Record<string, unknown> | null;
+  ip_address_id: string | null;
   created_at: string;
   modified_at: string;
 }
@@ -1463,26 +1458,23 @@ export interface DHCPClientClass {
   name: string;
   description: string;
   match_expression: string;
-  options: DHCPOption[];
+  options: Record<string, unknown>;
   created_at: string;
   modified_at: string;
 }
 
 export interface DHCPLease {
-  ip: string;
-  mac: string;
-  hostname: string | null;
-  state: string; // "active" | "expired" | "released" | "declined"
-  expires_at: string | null;
-  last_seen: string | null;
-  subnet_id: string | null;
+  id: string;
+  server_id: string;
   scope_id: string | null;
-  client_class: string | null;
-}
-
-export interface DHCPLeasePage {
-  total: number;
-  items: DHCPLease[];
+  ip_address: string;
+  mac_address: string;
+  hostname: string | null;
+  state: string; // "active" | "expired" | "released" | "abandoned"
+  starts_at: string | null;
+  ends_at: string | null;
+  expires_at: string | null;
+  last_seen_at: string;
 }
 
 
