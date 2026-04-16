@@ -1393,6 +1393,7 @@ function SubnetDetail({
   const [showAddModal, setShowAddModal] = useState(false);
   const [showEditSubnet, setShowEditSubnet] = useState(false);
   const [showDnsSync, setShowDnsSync] = useState(false);
+  const [showOrphans, setShowOrphans] = useState(false);
   const [editingAddress, setEditingAddress] = useState<IPAddress | null>(null);
   const [showFilters, setShowFilters] = useState(false);
   const [activeSubnetTab, setActiveSubnetTab] = useState<"addresses" | "dhcp">(
@@ -1588,6 +1589,14 @@ function SubnetDetail({
             >
               <Globe2 className="h-3.5 w-3.5" />
               Check DNS Sync
+            </button>
+            <button
+              onClick={() => setShowOrphans(true)}
+              title="List orphaned IPs in this subnet and permanently delete selected rows"
+              className="flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
+            >
+              <Trash2 className="h-3.5 w-3.5" />
+              Clean Orphans
             </button>
             <ExportButton scope={{ subnet_id: subnet.id }} label="Export" />
             <button
@@ -2076,6 +2085,13 @@ function SubnetDetail({
           onClose={() => setShowDnsSync(false)}
         />
       )}
+      {showOrphans && (
+        <OrphansModal
+          subnetId={subnet.id}
+          subnetLabel={subnet.network}
+          onClose={() => setShowOrphans(false)}
+        />
+      )}
       {editingAddress && (
         <EditAddressModal
           address={editingAddress}
@@ -2465,6 +2481,135 @@ function DnsSyncModal({
         </div>
       </div>
     </div>
+  );
+}
+
+function OrphansModal({
+  subnetId,
+  subnetLabel,
+  onClose,
+}: {
+  subnetId: string;
+  subnetLabel: string;
+  onClose: () => void;
+}) {
+  const qc = useQueryClient();
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const { data: addrs, isLoading } = useQuery({
+    queryKey: ["addresses", subnetId],
+    queryFn: () => ipamApi.listAddresses(subnetId),
+  });
+  const orphans = (addrs ?? []).filter((a) => a.status === "orphan");
+
+  const mut = useMutation({
+    mutationFn: () => ipamApi.purgeOrphans(subnetId, Array.from(selected)),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["addresses", subnetId] });
+      qc.invalidateQueries({ queryKey: ["subnets"] });
+      onClose();
+    },
+  });
+
+  const toggle = (id: string) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+  const toggleAll = () => {
+    if (selected.size === orphans.length) setSelected(new Set());
+    else setSelected(new Set(orphans.map((o) => o.id)));
+  };
+
+  return (
+    <Modal
+      title={`Clean Orphans — ${subnetLabel}`}
+      onClose={onClose}
+      wide
+    >
+      <div className="space-y-3">
+        <p className="text-sm text-muted-foreground">
+          Orphans are IP addresses that were soft-deleted. Selected rows will be
+          <span className="font-medium"> permanently removed</span> and their
+          auto-generated DNS records torn down.
+        </p>
+        {isLoading ? (
+          <div className="py-6 text-center text-sm text-muted-foreground">
+            Loading…
+          </div>
+        ) : orphans.length === 0 ? (
+          <div className="rounded-md border bg-muted/30 py-6 text-center text-sm">
+            No orphans in this subnet.
+          </div>
+        ) : (
+          <div className="rounded-md border">
+            <div className="flex items-center gap-3 border-b px-3 py-2 bg-muted/30 text-xs">
+              <input
+                type="checkbox"
+                checked={selected.size === orphans.length}
+                onChange={toggleAll}
+              />
+              <span className="flex-1 font-medium">
+                {selected.size} of {orphans.length} selected
+              </span>
+            </div>
+            <div className="max-h-80 overflow-y-auto divide-y">
+              {orphans.map((o) => (
+                <label
+                  key={o.id}
+                  className="flex items-center gap-3 px-3 py-2 text-sm hover:bg-muted/40 cursor-pointer"
+                >
+                  <input
+                    type="checkbox"
+                    checked={selected.has(o.id)}
+                    onChange={() => toggle(o.id)}
+                  />
+                  <span className="font-mono text-xs w-36 truncate">
+                    {o.address}
+                  </span>
+                  <span className="flex-1 truncate text-xs text-muted-foreground">
+                    {o.fqdn || o.hostname || "—"}
+                  </span>
+                  {o.mac_address && (
+                    <span className="font-mono text-xs text-muted-foreground">
+                      {o.mac_address}
+                    </span>
+                  )}
+                </label>
+              ))}
+            </div>
+          </div>
+        )}
+        <div className="flex justify-end gap-2 pt-2">
+          {orphans.length === 0 ? (
+            <button
+              onClick={onClose}
+              className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90"
+            >
+              Close
+            </button>
+          ) : (
+            <>
+              <button
+                onClick={onClose}
+                className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
+              >
+                Cancel
+              </button>
+              <button
+                disabled={selected.size === 0 || mut.isPending}
+                onClick={() => mut.mutate()}
+                className="rounded-md bg-destructive px-3 py-1.5 text-sm text-destructive-foreground hover:bg-destructive/90 disabled:opacity-40"
+              >
+                {mut.isPending ? "Purging…" : `Purge ${selected.size}`}
+              </button>
+            </>
+          )}
+        </div>
+      </div>
+    </Modal>
   );
 }
 

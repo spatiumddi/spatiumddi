@@ -421,6 +421,12 @@ export const ipamApi = {
     api.delete(`/ipam/addresses/${id}`, {
       params: permanent ? { permanent: true } : undefined,
     }),
+  purgeOrphans: (subnetId: string, ipIds: string[]) =>
+    api
+      .post<{ purged: number }>(`/ipam/subnets/${subnetId}/orphans/purge`, {
+        ip_ids: ipIds,
+      })
+      .then((r) => r.data),
   nextAddress: (
     subnetId: string,
     data: {

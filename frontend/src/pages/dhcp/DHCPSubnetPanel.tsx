@@ -84,6 +84,8 @@ function StaticRow({
     mutationFn: () => dhcpApi.deleteStatic(scope.id, row.id),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["dhcp-statics", scope.id] });
+      qc.invalidateQueries({ queryKey: ["addresses", scope.subnet_id] });
+      qc.invalidateQueries({ queryKey: ["subnet-dns-sync", scope.subnet_id] });
       setDel(false);
     },
   });

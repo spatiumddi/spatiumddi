@@ -61,7 +61,7 @@ class StaticResponse(BaseModel):
 
 
 async def _upsert_ipam_for_static(
-    db, scope: DHCPScope, st: DHCPStaticAssignment
+    db, scope: DHCPScope, st: DHCPStaticAssignment, *, action: str = "create"
 ) -> None:
     """Create or update the IPAM row mirroring a static DHCP assignment.
 
@@ -96,14 +96,34 @@ async def _upsert_ipam_for_static(
     row.static_assignment_id = str(st.id)
     await db.flush()
     st.ip_address_id = row.id
+    # Fire DNS sync so forward/reverse records follow the static.
+    from app.api.v1.ipam.router import _sync_dns_record
+
+    subnet_row = await db.get(Subnet, scope.subnet_id)
+    if subnet_row is not None and row.hostname:
+        try:
+            await _sync_dns_record(db, row, subnet_row, action=action)
+        except Exception:  # noqa: BLE001 — DNS sync is best-effort
+            pass
 
 
 async def _detach_ipam_for_static(db, st: DHCPStaticAssignment) -> None:
-    """Release the IPAM row back to `allocated` when the static is removed."""
+    """Release the IPAM row back to `allocated` when the static is removed.
+
+    Also tears down the forward A (DNS sync with action=delete).
+    """
+    from app.api.v1.ipam.router import _sync_dns_record
+
     res = await db.execute(
         select(IPAddress).where(IPAddress.static_assignment_id == str(st.id))
     )
     for row in res.scalars().all():
+        subnet_row = await db.get(Subnet, row.subnet_id)
+        if subnet_row is not None:
+            try:
+                await _sync_dns_record(db, row, subnet_row, action="delete")
+            except Exception:  # noqa: BLE001
+                pass
         row.static_assignment_id = None
         if row.status == "static_dhcp":
             row.status = "allocated"
@@ -211,7 +231,7 @@ async def update_static(
     for k, v in changes.items():
         setattr(st, k, v)
     await db.flush()
-    await _upsert_ipam_for_static(db, scope, st)
+    await _upsert_ipam_for_static(db, scope, st, action="update")
     write_audit(
         db,
         user=user,

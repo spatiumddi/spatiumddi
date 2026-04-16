@@ -2258,6 +2258,60 @@ async def delete_address(
     await db.commit()
 
 
+class PurgeOrphansRequest(BaseModel):
+    ip_ids: list[uuid.UUID]
+
+
+@router.post("/subnets/{subnet_id}/orphans/purge")
+async def purge_orphans(
+    subnet_id: uuid.UUID,
+    body: PurgeOrphansRequest,
+    current_user: CurrentUser,
+    db: DB,
+) -> dict[str, int]:
+    """Permanently delete the given orphan IPs in this subnet.
+
+    The UI lists orphans from `GET /subnets/{id}/addresses?status=orphan` (client-
+    side filter) and passes the chosen ids here. We scope by subnet so a stale UI
+    can't purge rows from a different subnet.
+    """
+    subnet = await db.get(Subnet, subnet_id)
+    if subnet is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
+    if not body.ip_ids:
+        return {"purged": 0}
+    res = await db.execute(
+        select(IPAddress).where(
+            IPAddress.subnet_id == subnet_id,
+            IPAddress.id.in_(body.ip_ids),
+            IPAddress.status == "orphan",
+        )
+    )
+    rows = list(res.scalars().all())
+    for ip in rows:
+        # Best-effort DNS teardown (the FK would null it, but be explicit).
+        try:
+            await _sync_dns_record(db, ip, subnet, action="delete")
+        except Exception:  # noqa: BLE001
+            pass
+        db.add(
+            _audit(
+                current_user,
+                "delete",
+                "ip_address",
+                str(ip.id),
+                str(ip.address),
+                old_value={"address": str(ip.address), "status": "orphan"},
+            )
+        )
+        await db.delete(ip)
+    await db.flush()
+    await _update_utilization(db, subnet_id)
+    await _update_block_utilization(db, subnet.block_id)
+    await db.commit()
+    return {"purged": len(rows)}
+
+
 # ── Next available IP ──────────────────────────────────────────────────────────
 
 

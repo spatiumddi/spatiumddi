@@ -53,6 +53,9 @@ export function CreateStaticAssignmentModal({
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["dhcp-statics", scope.id] });
+      // Static upserts an IPAM row (status=static_dhcp) — refresh IPAM views.
+      qc.invalidateQueries({ queryKey: ["addresses", scope.subnet_id] });
+      qc.invalidateQueries({ queryKey: ["subnet-dns-sync", scope.subnet_id] });
       onClose();
     },
     onError: (e) => setError(errMsg(e, "Conflict or validation error")),
