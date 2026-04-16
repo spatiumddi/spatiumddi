@@ -1,10 +1,10 @@
 import { useAuth } from "@/hooks/useAuth";
 import { useTheme } from "@/hooks/useTheme";
 import { useNavigate } from "react-router-dom";
-import { LogOut, Moon, Sun } from "lucide-react";
+import { LogOut, Menu, Moon, Sun } from "lucide-react";
 import { GlobalSearch } from "@/components/GlobalSearch";
 
-export function Header() {
+export function Header({ onMobileMenu }: { onMobileMenu?: () => void }) {
   const { logout } = useAuth();
   const { theme, toggleTheme } = useTheme();
   const navigate = useNavigate();
@@ -15,7 +15,17 @@ export function Header() {
   }
 
   return (
-    <header className="flex h-14 items-center justify-end border-b bg-card px-6 gap-3">
+    <header className="flex h-14 items-center border-b bg-card px-3 sm:px-6 gap-2 sm:gap-3">
+      {/* Hamburger — only shown below md breakpoint */}
+      <button
+        type="button"
+        onClick={onMobileMenu}
+        aria-label="Open navigation"
+        className="md:hidden rounded-md p-2 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+      >
+        <Menu className="h-5 w-5" />
+      </button>
+      <div className="flex-1" />
       <GlobalSearch />
       <div className="flex items-center gap-1">
         <button
@@ -33,10 +43,10 @@ export function Header() {
         </button>
         <button
           onClick={handleLogout}
-          className="flex items-center gap-2 rounded-md px-3 py-1.5 text-sm text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+          className="flex items-center gap-2 rounded-md px-2 sm:px-3 py-1.5 text-sm text-muted-foreground hover:bg-accent hover:text-accent-foreground"
         >
           <LogOut className="h-4 w-4" />
-          Sign out
+          <span className="hidden sm:inline">Sign out</span>
         </button>
       </div>
     </header>

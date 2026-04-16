@@ -86,6 +86,9 @@ class ScopeDef:
     ddns_enabled: bool = False
     ddns_hostname_policy: str = "client"
     is_active: bool = True
+    # "ipv4" → Dhcp4 rendering, "ipv6" → Dhcp6 rendering. Defaults to "ipv4"
+    # so legacy bundles (before address_family existed) keep working.
+    address_family: str = "ipv4"
 
 
 @dataclass(frozen=True)

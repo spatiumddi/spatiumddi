@@ -91,6 +91,7 @@ async def build_config_bundle(db: AsyncSession, server: DHCPServer) -> ConfigBun
                 ddns_enabled=sc.ddns_enabled,
                 ddns_hostname_policy=sc.ddns_hostname_policy,
                 is_active=sc.is_active,
+                address_family=getattr(sc, "address_family", "ipv4") or "ipv4",
             )
         )
 

@@ -136,6 +136,13 @@ class DHCPScope(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     description: Mapped[str] = mapped_column(Text, nullable=False, default="")
 
+    # Address family: "ipv4" (Dhcp4) or "ipv6" (Dhcp6). Populated from the
+    # bound subnet's prefix at create time; Kea driver branches on this
+    # value when rendering a ConfigBundle (Dhcp4 vs Dhcp6).
+    address_family: Mapped[str] = mapped_column(
+        String(4), nullable=False, default="ipv4", server_default="ipv4"
+    )
+
     lease_time: Mapped[int] = mapped_column(Integer, nullable=False, default=86400)
     min_lease_time: Mapped[int | None] = mapped_column(Integer, nullable=True)
     max_lease_time: Mapped[int | None] = mapped_column(Integer, nullable=True)

@@ -155,8 +155,8 @@ export function AuditPage() {
         </div>
 
         {/* Table */}
-        <div className="overflow-hidden rounded-lg border">
-          <table className="w-full text-sm">
+        <div className="overflow-x-auto rounded-lg border">
+          <table className="w-full min-w-[720px] text-sm">
             <thead>
               <tr className="border-b bg-muted/40">
                 <th className="px-3 py-2 text-left font-medium text-muted-foreground whitespace-nowrap">

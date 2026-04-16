@@ -450,7 +450,8 @@ export function CustomFieldsPage() {
             <div className="border-b px-5 py-3">
               <h2 className="text-sm font-semibold">{RESOURCE_LABELS[rt]}</h2>
             </div>
-            <table className="w-full text-sm">
+            <div className="overflow-x-auto">
+            <table className="w-full min-w-[640px] text-sm">
               <thead>
                 <tr className="border-b text-xs text-muted-foreground">
                   <th className="px-5 py-2 text-left font-medium">Name</th>
@@ -518,6 +519,7 @@ export function CustomFieldsPage() {
                 ))}
               </tbody>
             </table>
+            </div>
           </div>
         );
       })}

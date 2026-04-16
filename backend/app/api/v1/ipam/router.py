@@ -278,10 +278,19 @@ async def _create_alias_records(
         return
     zone_domain = zone.name.rstrip(".")
     primary_fqdn = f"{ip.hostname}.{zone_domain}."
+    # Pick the correct default for secondary-A aliases based on the IP family.
+    try:
+        addr_obj = ipaddress.ip_address(str(ip.address))
+    except ValueError:
+        addr_obj = None
+    is_v6 = isinstance(addr_obj, ipaddress.IPv6Address)
     for al in aliases:
         rtype = (getattr(al, "record_type", None) or al.get("record_type") or "CNAME").upper()
+        # Callers using "A" on an IPv6 primary really mean AAAA; normalise.
+        if rtype == "A" and is_v6:
+            rtype = "AAAA"
         name = (getattr(al, "name", None) or al.get("name") or "").strip().rstrip(".")
-        if not name or rtype not in {"CNAME", "A"}:
+        if not name or rtype not in {"CNAME", "A", "AAAA"}:
             continue
         # Skip if a conflicting record already exists for (zone, name, type)
         dup = await db.execute(
@@ -373,7 +382,18 @@ async def _sync_dns_record(
     fqdn = f"{ip.hostname}.{zone_domain}"
     ip.fqdn = fqdn
 
-    # ── Forward A ───────────────────────────────────────────────────────────
+    # Forward record type depends on the address family: AAAA for IPv6, A for IPv4.
+    try:
+        addr_obj = ipaddress.ip_address(str(ip.address))
+    except ValueError:
+        addr_obj = None
+    forward_rtype = (
+        "AAAA"
+        if isinstance(addr_obj, ipaddress.IPv6Address)
+        else "A"
+    )
+
+    # ── Forward A/AAAA ──────────────────────────────────────────────────────
     # Skip forward DNS for the default gateway placeholder hostname.
     # Every subnet has one, so syncing them all would create N copies of
     # `gateway.example.com` that resolve to different IPs — useless and noisy.
@@ -382,18 +402,20 @@ async def _sync_dns_record(
     # created below since reverse lookups for the gateway IP are useful.
     is_default_gateway_name = ip.hostname == "gateway"
 
+    # Fetch any pre-existing auto-generated A **or** AAAA for this IP — if the
+    # address family changed we want to catch the stale record.
     result = await db.execute(
         select(DNSRecord).where(
             DNSRecord.ip_address_id == ip.id,
             DNSRecord.auto_generated.is_(True),
-            DNSRecord.record_type == "A",
+            DNSRecord.record_type.in_(["A", "AAAA"]),
         )
     )
     existing_a = result.scalars().all()
 
     if is_default_gateway_name:
-        # Tear down any A record that may have been published before the user
-        # renamed the IP back to the default. PTR continues below.
+        # Tear down any A/AAAA record that may have been published before the
+        # user renamed the IP back to the default. PTR continues below.
         for record in existing_a:
             old_zone = await db.get(DNSZone, record.zone_id)
             if old_zone is not None:
@@ -402,7 +424,7 @@ async def _sync_dns_record(
                     old_zone,
                     "delete",
                     record.name,
-                    "A",
+                    record.record_type,
                     record.value,
                     record.ttl,
                 )
@@ -413,7 +435,7 @@ async def _sync_dns_record(
             zone_id=effective_zone_id,
             name=ip.hostname,
             fqdn=fqdn,
-            record_type="A",
+            record_type=forward_rtype,
             value=str(ip.address),
             auto_generated=True,
             ip_address_id=ip.id,
@@ -423,21 +445,35 @@ async def _sync_dns_record(
         await db.flush()
         ip.dns_record_id = a_rec.id
         ip.forward_zone_id = effective_zone_id
-        await _enqueue_dns_op(db, zone, "create", ip.hostname, "A", str(ip.address), None)
+        await _enqueue_dns_op(
+            db, zone, "create", ip.hostname, forward_rtype, str(ip.address), None
+        )
     else:
         for record in existing_a:
-            if record.zone_id != effective_zone_id:
+            # If the zone changed OR the record_type changed (v4↔v6 swap),
+            # rewrite: delete the stale record and create a fresh one.
+            needs_rewrite = (
+                record.zone_id != effective_zone_id
+                or record.record_type != forward_rtype
+            )
+            if needs_rewrite:
                 old_zone = await db.get(DNSZone, record.zone_id)
                 if old_zone is not None:
                     await _enqueue_dns_op(
-                        db, old_zone, "delete", record.name, "A", record.value, record.ttl
+                        db,
+                        old_zone,
+                        "delete",
+                        record.name,
+                        record.record_type,
+                        record.value,
+                        record.ttl,
                     )
                 await db.delete(record)
                 new_a = DNSRecord(
                     zone_id=effective_zone_id,
                     name=ip.hostname,
                     fqdn=fqdn,
-                    record_type="A",
+                    record_type=forward_rtype,
                     value=str(ip.address),
                     auto_generated=True,
                     ip_address_id=ip.id,
@@ -447,7 +483,9 @@ async def _sync_dns_record(
                 await db.flush()
                 ip.dns_record_id = new_a.id
                 ip.forward_zone_id = effective_zone_id
-                await _enqueue_dns_op(db, zone, "create", ip.hostname, "A", str(ip.address), None)
+                await _enqueue_dns_op(
+                    db, zone, "create", ip.hostname, forward_rtype, str(ip.address), None
+                )
             else:
                 changed = record.name != ip.hostname or record.value != str(ip.address)
                 record.name = ip.hostname
@@ -455,7 +493,13 @@ async def _sync_dns_record(
                 record.value = str(ip.address)
                 if changed:
                     await _enqueue_dns_op(
-                        db, zone, "update", ip.hostname, "A", str(ip.address), record.ttl
+                        db,
+                        zone,
+                        "update",
+                        ip.hostname,
+                        forward_rtype,
+                        str(ip.address),
+                        record.ttl,
                     )
 
     # ── Reverse PTR ─────────────────────────────────────────────────────────
@@ -1516,9 +1560,12 @@ async def create_subnet(body: SubnetCreate, current_user: CurrentUser, db: DB) -
 
     # For standard subnets (prefixlen < 31), create network, broadcast, and gateway records
     # unless skip_auto_addresses is set (e.g. loopbacks, point-to-point links).
+    # IPv6 has no broadcast; the network address itself is usable, but we
+    # still create a "network" pseudo-row (same UX) plus the gateway row.
     auto_created: list[str] = []
+    is_v6 = isinstance(net, ipaddress.IPv6Network)
     if net.prefixlen < 31 and not body.skip_auto_addresses:
-        # Network address (e.g. 10.0.1.0)
+        # Network address (e.g. 10.0.1.0 / 2001:db8::)
         db.add(
             IPAddress(
                 subnet_id=subnet.id,
@@ -1530,17 +1577,18 @@ async def create_subnet(body: SubnetCreate, current_user: CurrentUser, db: DB) -
         )
         auto_created.append(str(net.network_address))
 
-        # Broadcast address (e.g. 10.0.1.255)
-        db.add(
-            IPAddress(
-                subnet_id=subnet.id,
-                address=str(net.broadcast_address),
-                status="broadcast",
-                description="Broadcast address",
-                created_by_user_id=current_user.id,
+        if not is_v6:
+            # Broadcast address (IPv4 only — IPv6 has no broadcast)
+            db.add(
+                IPAddress(
+                    subnet_id=subnet.id,
+                    address=str(net.broadcast_address),
+                    status="broadcast",
+                    description="Broadcast address",
+                    created_by_user_id=current_user.id,
+                )
             )
-        )
-        auto_created.append(str(net.broadcast_address))
+            auto_created.append(str(net.broadcast_address))
 
         # Gateway — use provided or default to first usable host
         gw_addr = body.gateway or str(net.network_address + 1)
@@ -1739,6 +1787,7 @@ async def update_subnet(
     if body.manage_auto_addresses is not None:
         net = _parse_network(str(subnet.network))
         if net.prefixlen < 31:
+            is_v6 = isinstance(net, ipaddress.IPv6Network)
             auto_statuses = {"network", "broadcast"}
             existing_result = await db.execute(
                 select(IPAddress).where(
@@ -1761,7 +1810,8 @@ async def update_subnet(
                             created_by_user_id=current_user.id,
                         )
                     )
-                if str(net.broadcast_address) not in existing_addrs:
+                # IPv6 has no broadcast — skip.
+                if not is_v6 and str(net.broadcast_address) not in existing_addrs:
                     db.add(
                         IPAddress(
                             subnet_id=subnet.id,
@@ -2764,7 +2814,20 @@ async def allocate_next_ip(
     # Normalise to string set; asyncpg returns INET as str
     used: set[str] = {str(row[0]) for row in used_result}
 
-    # For large subnets, cap the search at first 65536 hosts
+    # IPv6 subnets are typically /64 or larger — enumerating 2^64 addresses
+    # is impossible, and even "random" would need a hash-based scheme with
+    # duplicate checks. Rather than misbehave, surface a clear 409 and make
+    # the UI side fall back to manual allocation (per the IPv6 roadmap item).
+    if isinstance(net, ipaddress.IPv6Network):
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "IPv6 subnets do not support auto-allocation. "
+                "Please specify an explicit address."
+            ),
+        )
+
+    # For large IPv4 subnets, cap the linear search at 65k hosts.
     max_search = 65536
     hosts = list(net.hosts()) if net.prefixlen >= 16 else list(net.hosts())[:max_search]
 
@@ -3168,6 +3231,71 @@ async def get_effective_fields(
 
     return EffectiveFieldsResponse(
         subnet_id=subnet.id,
+        tags=tags,
+        custom_fields=custom_fields,
+        tag_sources=tag_sources,
+        custom_field_sources=custom_field_sources,
+    )
+
+
+class BlockEffectiveFieldsResponse(BaseModel):
+    block_id: uuid.UUID
+    tags: dict[str, Any]
+    custom_fields: dict[str, Any]
+    # Per-key source trail: "block:<id>" | "space:<id>"
+    tag_sources: dict[str, str]
+    custom_field_sources: dict[str, str]
+
+
+@router.get(
+    "/blocks/{block_id}/effective-fields",
+    response_model=BlockEffectiveFieldsResponse,
+)
+async def get_block_effective_fields(
+    block_id: uuid.UUID, current_user: CurrentUser, db: DB
+) -> BlockEffectiveFieldsResponse:
+    """Merge tags + custom_fields up the Block → parent Block(s) → Space chain.
+
+    Closer-to-leaf values override farther-from-leaf; storage is NOT modified.
+    The ``sources`` maps let callers tell which key came from which ancestor,
+    so the edit modal can render inherited values as placeholders with a
+    "inherited from <ancestor>" badge.
+    """
+    block = await db.get(IPBlock, block_id)
+    if block is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Block not found")
+
+    # Collect the chain, leaf-last: [space, root_block, ..., this_block]
+    chain: list[tuple[str, dict, dict]] = []
+
+    space = await db.get(IPSpace, block.space_id)
+    if space is not None:
+        chain.append((f"space:{space.id}", space.tags or {}, {}))
+
+    block_path: list[IPBlock] = []
+    cur: IPBlock | None = block
+    while cur is not None:
+        block_path.append(cur)
+        if cur.parent_block_id is None:
+            break
+        cur = await db.get(IPBlock, cur.parent_block_id)
+    for b in reversed(block_path):
+        chain.append((f"block:{b.id}", b.tags or {}, b.custom_fields or {}))
+
+    tags: dict[str, Any] = {}
+    custom_fields: dict[str, Any] = {}
+    tag_sources: dict[str, str] = {}
+    custom_field_sources: dict[str, str] = {}
+    for src, tmap, cmap in chain:
+        for k, v in tmap.items():
+            tags[k] = v
+            tag_sources[k] = src
+        for k, v in cmap.items():
+            custom_fields[k] = v
+            custom_field_sources[k] = src
+
+    return BlockEffectiveFieldsResponse(
+        block_id=block.id,
         tags=tags,
         custom_fields=custom_fields,
         tag_sources=tag_sources,
