@@ -88,6 +88,8 @@ export interface IPSpace {
   dns_group_ids: string[];
   dns_zone_id: string | null;
   dns_additional_zone_ids: string[];
+  created_at?: string;
+  modified_at?: string;
 }
 
 export interface IPBlock {
@@ -104,6 +106,8 @@ export interface IPBlock {
   dns_zone_id: string | null;
   dns_additional_zone_ids: string[] | null;
   dns_inherit_settings: boolean;
+  created_at?: string;
+  modified_at?: string;
 }
 
 export interface FreeCidrRange {
@@ -204,6 +208,10 @@ export interface Subnet {
   dns_zone_id: string | null;
   dns_additional_zone_ids: string[] | null;
   dns_inherit_settings: boolean;
+  dns_servers?: string[] | null;
+  domain_name?: string | null;
+  created_at?: string;
+  modified_at?: string;
 }
 
 export interface IPAddress {
@@ -213,8 +221,11 @@ export interface IPAddress {
   status: string;
   hostname: string | null;
   fqdn: string | null;
-  description: string | null;
+  description: string;
   mac_address: string | null;
+  owner_user_id?: string | null;
+  last_seen_at?: string | null;
+  last_seen_method?: string | null;
   tags: Record<string, unknown>;
   custom_fields: Record<string, unknown>;
   // Linkage (§3) — populated by Wave 3 DDNS/DHCP integration.
@@ -223,6 +234,8 @@ export interface IPAddress {
   dns_record_id?: string | null;
   dhcp_lease_id?: string | null;
   static_assignment_id?: string | null;
+  created_at?: string;
+  modified_at?: string;
 }
 
 export interface SubnetDomain {
