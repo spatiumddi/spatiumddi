@@ -8,8 +8,6 @@ Tests that require a live kind cluster / docker daemon are marked
 
 from __future__ import annotations
 
-import json
-
 import pytest
 
 from spatium_dns_agent.cache import (
