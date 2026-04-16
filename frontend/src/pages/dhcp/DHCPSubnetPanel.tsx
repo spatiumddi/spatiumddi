@@ -89,8 +89,8 @@ function StaticRow({
   });
   return (
     <tr className="border-b last:border-0 text-sm">
-      <td className="px-3 py-1.5 font-mono text-xs">{row.mac}</td>
-      <td className="px-3 py-1.5 font-mono text-xs">{row.ip}</td>
+      <td className="px-3 py-1.5 font-mono text-xs">{row.mac_address}</td>
+      <td className="px-3 py-1.5 font-mono text-xs">{row.ip_address}</td>
       <td className="px-3 py-1.5">{row.hostname || "—"}</td>
       <td className="px-3 py-1.5 text-muted-foreground truncate max-w-xs">
         {row.description}
@@ -119,7 +119,7 @@ function StaticRow({
       {del && (
         <DeleteConfirmModal
           title="Delete Static Assignment"
-          description={`Delete static for ${row.mac} → ${row.ip}?`}
+          description={`Delete static for ${row.mac_address} → ${row.ip_address}?`}
           onConfirm={() => mut.mutate()}
           onClose={() => setDel(false)}
           isPending={mut.isPending}

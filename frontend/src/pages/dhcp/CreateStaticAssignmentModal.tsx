@@ -3,11 +3,9 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   dhcpApi,
   type DHCPStaticAssignment,
-  type DHCPOption,
   type DHCPScope,
 } from "@/lib/api";
 import { Modal, Field, Btns, inputCls, errMsg } from "./_shared";
-import { DHCPOptionsEditor } from "./DHCPOptionsEditor";
 
 export function CreateStaticAssignmentModal({
   staticAssignment,
@@ -20,28 +18,16 @@ export function CreateStaticAssignmentModal({
 }) {
   const qc = useQueryClient();
   const editing = !!staticAssignment;
-  const [mac, setMac] = useState(staticAssignment?.mac ?? "");
-  const [ip, setIp] = useState(staticAssignment?.ip ?? "");
+  const [mac, setMac] = useState(staticAssignment?.mac_address ?? "");
+  const [ip, setIp] = useState(staticAssignment?.ip_address ?? "");
   const [hostname, setHostname] = useState(staticAssignment?.hostname ?? "");
   const [description, setDescription] = useState(
     staticAssignment?.description ?? "",
   );
-  const [clientClassId, setClientClassId] = useState(
-    staticAssignment?.client_class_id ?? "",
-  );
-  const [options, setOptions] = useState<DHCPOption[]>(
-    staticAssignment?.options ?? [],
+  const [clientId, setClientId] = useState(
+    staticAssignment?.client_id ?? "",
   );
   const [error, setError] = useState("");
-
-  const { data: classes = [] } = useQuery({
-    queryKey: ["dhcp-client-classes", scope.server_id],
-    queryFn: () =>
-      scope.server_id
-        ? dhcpApi.listClientClasses(scope.server_id)
-        : Promise.resolve([]),
-    enabled: !!scope.server_id,
-  });
 
   const { data: pools = [] } = useQuery({
     queryKey: ["dhcp-pools", scope.id],
@@ -55,12 +41,11 @@ export function CreateStaticAssignmentModal({
   const mut = useMutation({
     mutationFn: () => {
       const data: Partial<DHCPStaticAssignment> = {
-        mac,
-        ip,
+        mac_address: mac,
+        ip_address: ip,
         hostname,
         description,
-        client_class_id: clientClassId || null,
-        options,
+        client_id: clientId || null,
       };
       return editing
         ? dhcpApi.updateStatic(scope.id, staticAssignment!.id, data)
@@ -128,19 +113,12 @@ export function CreateStaticAssignmentModal({
               onChange={(e) => setHostname(e.target.value)}
             />
           </Field>
-          <Field label="Client Class">
-            <select
+          <Field label="Client ID" hint="Optional DHCP client identifier override">
+            <input
               className={inputCls}
-              value={clientClassId}
-              onChange={(e) => setClientClassId(e.target.value)}
-            >
-              <option value="">— None —</option>
-              {classes.map((c) => (
-                <option key={c.id} value={c.id}>
-                  {c.name}
-                </option>
-              ))}
-            </select>
+              value={clientId}
+              onChange={(e) => setClientId(e.target.value)}
+            />
           </Field>
         </div>
         <Field label="Description">
@@ -150,10 +128,6 @@ export function CreateStaticAssignmentModal({
             onChange={(e) => setDescription(e.target.value)}
           />
         </Field>
-        <div className="border-t pt-3">
-          <h3 className="text-sm font-semibold mb-2">Options Override</h3>
-          <DHCPOptionsEditor value={options} onChange={setOptions} />
-        </div>
         {error && (
           <p className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
             {error}

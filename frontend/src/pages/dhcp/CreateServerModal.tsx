@@ -18,14 +18,10 @@ export function CreateServerModal({
   const [driver, setDriver] = useState(server?.driver ?? "kea");
   const [host, setHost] = useState(server?.host ?? "");
   const [port, setPort] = useState(String(server?.port ?? 67));
-  const [apiPort, setApiPort] = useState(
-    server?.api_port != null ? String(server.api_port) : "",
-  );
   const [groupId, setGroupId] = useState<string>(
     server?.server_group_id ?? defaultGroupId ?? "",
   );
-  const [notes, setNotes] = useState(server?.notes ?? "");
-  const [apiKey, setApiKey] = useState("");
+  const [description, setDescription] = useState(server?.description ?? "");
   const [error, setError] = useState("");
 
   const { data: groups = [] } = useQuery({
@@ -35,15 +31,13 @@ export function CreateServerModal({
 
   const mut = useMutation({
     mutationFn: () => {
-      const data: Partial<DHCPServer> & { api_key?: string } = {
+      const data: Partial<DHCPServer> = {
         name,
         driver,
         host,
         port: parseInt(port, 10) || 67,
-        api_port: apiPort ? parseInt(apiPort, 10) : null,
         server_group_id: groupId || null,
-        notes,
-        ...(apiKey ? { api_key: apiKey } : {}),
+        description,
       };
       return editing
         ? dhcpApi.updateServer(server!.id, data)
@@ -82,8 +76,7 @@ export function CreateServerModal({
               onChange={(e) => setDriver(e.target.value)}
             >
               <option value="kea">Kea</option>
-              <option value="isc">ISC DHCP</option>
-              <option value="windows">Windows Server</option>
+              <option value="isc_dhcp">ISC DHCP</option>
             </select>
           </Field>
           <Field label="Host">
@@ -103,14 +96,6 @@ export function CreateServerModal({
               onChange={(e) => setPort(e.target.value)}
             />
           </Field>
-          <Field label="Management API Port" hint="Optional; blank for defaults.">
-            <input
-              type="number"
-              className={inputCls}
-              value={apiPort}
-              onChange={(e) => setApiPort(e.target.value)}
-            />
-          </Field>
           <Field label="Server Group">
             <select
               className={inputCls}
@@ -126,23 +111,12 @@ export function CreateServerModal({
             </select>
           </Field>
         </div>
-        <Field label="Notes">
+        <Field label="Description">
           <textarea
             className={inputCls}
             rows={2}
-            value={notes}
-            onChange={(e) => setNotes(e.target.value)}
-          />
-        </Field>
-        <Field
-          label={editing ? "Rotate Agent Key (optional)" : "Agent Pre-Shared Key (optional)"}
-          hint="Leave blank to auto-generate on create."
-        >
-          <input
-            className={inputCls}
-            type="password"
-            value={apiKey}
-            onChange={(e) => setApiKey(e.target.value)}
+            value={description}
+            onChange={(e) => setDescription(e.target.value)}
           />
         </Field>
         {error && <p className="text-xs text-destructive">{error}</p>}

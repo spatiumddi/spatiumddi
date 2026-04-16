@@ -599,8 +599,8 @@ function ServerPoolsOrStaticsTab({
               return (
                 <tr key={s.id} className="border-b last:border-0">
                   <td className="px-3 py-2 text-xs">{scope.name}</td>
-                  <td className="px-3 py-2 font-mono text-xs">{s.mac}</td>
-                  <td className="px-3 py-2 font-mono text-xs">{s.ip}</td>
+                  <td className="px-3 py-2 font-mono text-xs">{s.mac_address}</td>
+                  <td className="px-3 py-2 font-mono text-xs">{s.ip_address}</td>
                   <td className="px-3 py-2">{s.hostname || "—"}</td>
                 </tr>
               );
@@ -716,8 +716,7 @@ function ClientClassesTab({ server }: { server: DHCPServer }) {
 function LeasesTab({ server }: { server: DHCPServer }) {
   const [state, setState] = useState<string>("");
   const [subnetId, setSubnetId] = useState<string>("");
-  const [offset, setOffset] = useState(0);
-  const limit = 50;
+  const limit = 500;
 
   const { data: subnets = [] } = useQuery({
     queryKey: ["subnets"],
@@ -725,18 +724,16 @@ function LeasesTab({ server }: { server: DHCPServer }) {
   });
 
   const { data, isFetching, refetch } = useQuery({
-    queryKey: ["dhcp-leases", server.id, state, subnetId, offset],
-    queryFn: () =>
-      dhcpApi.getLeases(server.id, {
-        state: state || undefined,
-        subnet_id: subnetId || undefined,
-        limit,
-        offset,
-      }),
+    queryKey: ["dhcp-leases", server.id, limit],
+    queryFn: () => dhcpApi.getLeases(server.id, { limit }),
   });
 
-  const leases = data?.items ?? [];
-  const total = data?.total ?? 0;
+  const allLeases = data ?? [];
+  const leases = allLeases.filter((l) => {
+    if (state && l.state !== state) return false;
+    if (subnetId && l.scope_id !== subnetId) return false;
+    return true;
+  });
 
   return (
     <div className="space-y-3">
@@ -744,10 +741,7 @@ function LeasesTab({ server }: { server: DHCPServer }) {
         <select
           className="rounded-md border bg-background px-2 py-1 text-xs"
           value={state}
-          onChange={(e) => {
-            setOffset(0);
-            setState(e.target.value);
-          }}
+          onChange={(e) => setState(e.target.value)}
         >
           <option value="">All states</option>
           <option value="active">Active</option>
@@ -758,10 +752,7 @@ function LeasesTab({ server }: { server: DHCPServer }) {
         <select
           className="rounded-md border bg-background px-2 py-1 text-xs"
           value={subnetId}
-          onChange={(e) => {
-            setOffset(0);
-            setSubnetId(e.target.value);
-          }}
+          onChange={(e) => setSubnetId(e.target.value)}
         >
           <option value="">All subnets</option>
           {subnets.map((s) => (
@@ -805,9 +796,9 @@ function LeasesTab({ server }: { server: DHCPServer }) {
               </tr>
             )}
             {leases.map((l: DHCPLease) => (
-              <tr key={`${l.ip}-${l.mac}`} className="border-b last:border-0">
-                <td className="px-3 py-1.5 font-mono text-xs">{l.ip}</td>
-                <td className="px-3 py-1.5 font-mono text-xs">{l.mac}</td>
+              <tr key={l.id} className="border-b last:border-0">
+                <td className="px-3 py-1.5 font-mono text-xs">{l.ip_address}</td>
+                <td className="px-3 py-1.5 font-mono text-xs">{l.mac_address}</td>
                 <td className="px-3 py-1.5">{l.hostname || "—"}</td>
                 <td className="px-3 py-1.5">
                   <span
@@ -827,8 +818,8 @@ function LeasesTab({ server }: { server: DHCPServer }) {
                     : "—"}
                 </td>
                 <td className="px-3 py-1.5 text-xs text-muted-foreground">
-                  {l.last_seen
-                    ? new Date(l.last_seen).toLocaleString()
+                  {l.last_seen_at
+                    ? new Date(l.last_seen_at).toLocaleString()
                     : "—"}
                 </td>
               </tr>
@@ -836,28 +827,10 @@ function LeasesTab({ server }: { server: DHCPServer }) {
           </tbody>
         </table>
       </div>
-      {total > limit && (
-        <div className="flex items-center justify-between text-xs">
-          <span className="text-muted-foreground">
-            {offset + 1}–{Math.min(offset + limit, total)} of {total}
-          </span>
-          <div className="flex gap-2">
-            <button
-              onClick={() => setOffset(Math.max(0, offset - limit))}
-              disabled={offset === 0}
-              className="rounded-md border px-2 py-1 hover:bg-accent disabled:opacity-50"
-            >
-              Prev
-            </button>
-            <button
-              onClick={() => setOffset(offset + limit)}
-              disabled={offset + limit >= total}
-              className="rounded-md border px-2 py-1 hover:bg-accent disabled:opacity-50"
-            >
-              Next
-            </button>
-          </div>
-        </div>
+      {allLeases.length >= limit && (
+        <p className="text-xs text-muted-foreground">
+          Showing first {limit} leases — narrow filters to refine.
+        </p>
       )}
     </div>
   );
