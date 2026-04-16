@@ -23,17 +23,17 @@ from typing import Any
 # Standard options use their RFC 2132 / IANA names; Kea names map 1:1.
 STANDARD_OPTION_NAMES: frozenset[str] = frozenset(
     {
-        "routers",              # option 3
-        "dns-servers",          # option 6  (domain-name-servers)
-        "domain-name",          # option 15
-        "broadcast-address",    # option 28
-        "ntp-servers",          # option 42  (NTP servers — requested explicitly)
-        "tftp-server-name",     # option 66
-        "bootfile-name",        # option 67
+        "routers",  # option 3
+        "dns-servers",  # option 6  (domain-name-servers)
+        "domain-name",  # option 15
+        "broadcast-address",  # option 28
+        "ntp-servers",  # option 42  (NTP servers — requested explicitly)
+        "tftp-server-name",  # option 66
+        "bootfile-name",  # option 67
         "tftp-server-address",  # option 150 (TFTP via address, Cisco IP phones)
-        "domain-search",        # option 119
-        "mtu",                  # option 26
-        "time-offset",          # option 2
+        "domain-search",  # option 119
+        "mtu",  # option 26
+        "time-offset",  # option 2
     }
 )
 

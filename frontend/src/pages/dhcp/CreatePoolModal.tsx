@@ -1,10 +1,6 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import {
-  dhcpApi,
-  type DHCPPool,
-  type DHCPScope,
-} from "@/lib/api";
+import { dhcpApi, type DHCPPool, type DHCPScope } from "@/lib/api";
 import { Modal, Field, Btns, inputCls, errMsg } from "./_shared";
 
 export function CreatePoolModal({
@@ -139,17 +135,22 @@ export function CreatePoolModal({
         {existingWarning && (
           <div className="rounded-md border border-amber-500/40 bg-amber-500/10 p-3 space-y-2">
             <p className="text-sm font-medium text-amber-700 dark:text-amber-400">
-              Pool created — {existingWarning.length} existing IP{existingWarning.length !== 1 ? "s" : ""} in this range:
+              Pool created — {existingWarning.length} existing IP
+              {existingWarning.length !== 1 ? "s" : ""} in this range:
             </p>
             <ul className="text-xs space-y-0.5 max-h-32 overflow-y-auto">
               {existingWarning.map((ip) => (
                 <li key={ip.address} className="font-mono">
-                  {ip.address} <span className="text-muted-foreground">({ip.status}){ip.hostname ? ` — ${ip.hostname}` : ""}</span>
+                  {ip.address}{" "}
+                  <span className="text-muted-foreground">
+                    ({ip.status}){ip.hostname ? ` — ${ip.hostname}` : ""}
+                  </span>
                 </li>
               ))}
             </ul>
             <p className="text-xs text-muted-foreground">
-              These IPs may conflict with dynamic DHCP leases. Consider marking them as excluded or reserved.
+              These IPs may conflict with dynamic DHCP leases. Consider marking
+              them as excluded or reserved.
             </p>
             <button
               type="button"

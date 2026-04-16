@@ -1,10 +1,6 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import {
-  dhcpApi,
-  type DHCPStaticAssignment,
-  type DHCPScope,
-} from "@/lib/api";
+import { dhcpApi, type DHCPStaticAssignment, type DHCPScope } from "@/lib/api";
 import { Modal, Field, Btns, inputCls, errMsg } from "./_shared";
 
 export function CreateStaticAssignmentModal({
@@ -24,9 +20,7 @@ export function CreateStaticAssignmentModal({
   const [description, setDescription] = useState(
     staticAssignment?.description ?? "",
   );
-  const [clientId, setClientId] = useState(
-    staticAssignment?.client_id ?? "",
-  );
+  const [clientId, setClientId] = useState(staticAssignment?.client_id ?? "");
   const [error, setError] = useState("");
 
   const { data: pools = [] } = useQuery({
@@ -116,7 +110,10 @@ export function CreateStaticAssignmentModal({
               onChange={(e) => setHostname(e.target.value)}
             />
           </Field>
-          <Field label="Client ID" hint="Optional DHCP client identifier override">
+          <Field
+            label="Client ID"
+            hint="Optional DHCP client identifier override"
+          >
             <input
               className={inputCls}
               value={clientId}

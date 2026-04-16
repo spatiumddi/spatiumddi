@@ -79,9 +79,7 @@ class DHCPServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     agent_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
     agent_registered: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     agent_token_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
-    agent_last_seen: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    agent_last_seen: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     agent_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
     agent_approved: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     agent_fingerprint: Mapped[str | None] = mapped_column(String(128), nullable=True)
@@ -144,9 +142,7 @@ class DHCPScope(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # DDNS
     ddns_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     # ddns_hostname_policy: client | server_name | derived | none
-    ddns_hostname_policy: Mapped[str] = mapped_column(
-        String(30), nullable=False, default="client"
-    )
+    ddns_hostname_policy: Mapped[str] = mapped_column(String(30), nullable=False, default="client")
     # hostname_to_ipam_sync: disabled | on_lease | on_static_only
     hostname_to_ipam_sync: Mapped[str] = mapped_column(
         String(30), nullable=False, default="on_static_only"
@@ -306,9 +302,7 @@ class DHCPConfigOp(UUIDPrimaryKeyMixin, Base):
     """
 
     __tablename__ = "dhcp_config_op"
-    __table_args__ = (
-        Index("ix_dhcp_config_op_server_status", "server_id", "status"),
-    )
+    __table_args__ = (Index("ix_dhcp_config_op_server_status", "server_id", "status"),)
 
     server_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),

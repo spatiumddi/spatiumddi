@@ -8,11 +8,7 @@ import {
   Server,
   Trash2,
 } from "lucide-react";
-import {
-  dhcpApi,
-  type DHCPPool,
-  type DHCPScope,
-} from "@/lib/api";
+import { dhcpApi, type DHCPPool, type DHCPScope } from "@/lib/api";
 import { CreateScopeModal } from "./CreateScopeModal";
 import { CreatePoolModal } from "./CreatePoolModal";
 import { DeleteConfirmModal } from "./_shared";
@@ -53,7 +49,11 @@ function PoolRow({ pool, scope }: { pool: DHCPPool; scope: DHCPScope }) {
         </button>
       </td>
       {edit && (
-        <CreatePoolModal pool={pool} scope={scope} onClose={() => setEdit(false)} />
+        <CreatePoolModal
+          pool={pool}
+          scope={scope}
+          onClose={() => setEdit(false)}
+        />
       )}
       {del && (
         <DeleteConfirmModal
@@ -84,14 +84,18 @@ function ScopeCard({ scope }: { scope: DHCPScope }) {
     mutationFn: (enabled: boolean) =>
       dhcpApi.updateScope(scope.id, { enabled }),
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["dhcp-scopes-subnet", scope.subnet_id] });
+      qc.invalidateQueries({
+        queryKey: ["dhcp-scopes-subnet", scope.subnet_id],
+      });
     },
   });
 
   const delMut = useMutation({
     mutationFn: () => dhcpApi.deleteScope(scope.id),
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["dhcp-scopes-subnet", scope.subnet_id] });
+      qc.invalidateQueries({
+        queryKey: ["dhcp-scopes-subnet", scope.subnet_id],
+      });
       setDeleteScope(false);
     },
   });
@@ -106,7 +110,8 @@ function ScopeCard({ scope }: { scope: DHCPScope }) {
               {scope.name || `Scope ${scope.id.slice(0, 8)}`}
             </p>
             <p className="text-xs text-muted-foreground">
-              Lease {scope.lease_time}s · {pools.length} pool{pools.length !== 1 ? "s" : ""}
+              Lease {scope.lease_time}s · {pools.length} pool
+              {pools.length !== 1 ? "s" : ""}
               {scope.ddns_enabled && " · DDNS"}
             </p>
           </div>
@@ -175,7 +180,6 @@ function ScopeCard({ scope }: { scope: DHCPScope }) {
             </tbody>
           </table>
         )}
-
       </div>
 
       {showAddPool && (
@@ -188,9 +192,7 @@ function ScopeCard({ scope }: { scope: DHCPScope }) {
         <DeleteConfirmModal
           title="Delete DHCP Scope"
           description={`Delete scope "${scope.name}" and all its pools?`}
-          references={[
-            `${pools.length} pool${pools.length !== 1 ? "s" : ""}`,
-          ]}
+          references={[`${pools.length} pool${pools.length !== 1 ? "s" : ""}`]}
           onConfirm={() => delMut.mutate()}
           onClose={() => setDeleteScope(false)}
           isPending={delMut.isPending}
@@ -229,9 +231,7 @@ export function DHCPSubnetPanel({ subnetId }: { subnetId: string }) {
         </button>
       </div>
 
-      {isLoading && (
-        <p className="text-sm text-muted-foreground">Loading…</p>
-      )}
+      {isLoading && <p className="text-sm text-muted-foreground">Loading…</p>}
 
       {!isLoading && scopes.length === 0 && (
         <div className="rounded-lg border border-dashed p-10 text-center">

@@ -1,9 +1,5 @@
 import { useState } from "react";
-import {
-  useQuery,
-  useMutation,
-  useQueryClient,
-} from "@tanstack/react-query";
+import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   Router as RouterIcon,
   Plus,
@@ -192,8 +188,7 @@ function RouterSidebarItem({
     queryFn: () => vlansApi.listVlans(router.id),
     enabled: expanded,
   });
-  const isActive =
-    selection?.kind === "router" && selection.id === router.id;
+  const isActive = selection?.kind === "router" && selection.id === router.id;
   return (
     <div>
       <div
@@ -236,8 +231,7 @@ function RouterSidebarItem({
             </p>
           )}
           {vlans.map((v) => {
-            const isVSel =
-              selection?.kind === "vlan" && selection.id === v.id;
+            const isVSel = selection?.kind === "vlan" && selection.id === v.id;
             return (
               <button
                 key={v.id}
@@ -253,9 +247,7 @@ function RouterSidebarItem({
               >
                 <Tag className="h-3 w-3 flex-shrink-0 text-emerald-600 dark:text-emerald-400" />
                 <span className="font-mono">{v.vlan_id}</span>
-                <span className="truncate text-muted-foreground">
-                  {v.name}
-                </span>
+                <span className="truncate text-muted-foreground">{v.name}</span>
               </button>
             );
           })}
@@ -341,7 +333,8 @@ function RouterDetail({
       <div className="border rounded-md">
         <div className="flex items-center justify-between border-b px-3 py-2">
           <h3 className="text-sm font-semibold">
-            VLANs <span className="text-muted-foreground">({vlans.length})</span>
+            VLANs{" "}
+            <span className="text-muted-foreground">({vlans.length})</span>
           </h3>
           <button
             onClick={() => setShowCreateVlan(true)}
@@ -382,10 +375,7 @@ function RouterDetail({
       </div>
 
       {showEdit && (
-        <EditRouterModal
-          router={router}
-          onClose={() => setShowEdit(false)}
-        />
+        <EditRouterModal router={router} onClose={() => setShowEdit(false)} />
       )}
       {showCreateVlan && (
         <CreateVLANModal
@@ -444,10 +434,7 @@ function VLANRow({ vlan, onClick }: { vlan: VLAN; onClick: () => void }) {
     queryFn: () => ipamApi.listSubnets({ vlan_ref_id: vlan.id }),
   });
   return (
-    <tr
-      onClick={onClick}
-      className="border-t cursor-pointer hover:bg-muted/40"
-    >
+    <tr onClick={onClick} className="border-t cursor-pointer hover:bg-muted/40">
       <td className="px-3 py-1.5 font-mono">{vlan.vlan_id}</td>
       <td className="px-3 py-1.5">{vlan.name}</td>
       <td className="px-3 py-1.5 text-muted-foreground">
@@ -606,7 +593,10 @@ function VLANDetail({
                     <li key={s.id} className="font-mono">
                       {s.network}
                       {s.name && (
-                        <span className="text-muted-foreground"> — {s.name}</span>
+                        <span className="text-muted-foreground">
+                          {" "}
+                          — {s.name}
+                        </span>
                       )}
                     </li>
                   ))}
@@ -722,9 +712,7 @@ function RouterFormModal({
   const [name, setName] = useState(initial.name ?? "");
   const [description, setDescription] = useState(initial.description ?? "");
   const [location, setLocation] = useState(initial.location ?? "");
-  const [managementIp, setManagementIp] = useState(
-    initial.management_ip ?? "",
-  );
+  const [managementIp, setManagementIp] = useState(initial.management_ip ?? "");
   const [vendor, setVendor] = useState(initial.vendor ?? "");
   const [model, setModel] = useState(initial.model ?? "");
   const [notes, setNotes] = useState(initial.notes ?? "");

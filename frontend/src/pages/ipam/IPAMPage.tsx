@@ -1512,13 +1512,28 @@ function SubnetDetail({
     const ipParts = String(addr.address).split(".").map(Number);
     if (ipParts.length !== 4) return null;
     const ipInt =
-      ((ipParts[0] << 24) | (ipParts[1] << 16) | (ipParts[2] << 8) | ipParts[3]) >>> 0;
+      ((ipParts[0] << 24) |
+        (ipParts[1] << 16) |
+        (ipParts[2] << 8) |
+        ipParts[3]) >>>
+      0;
     for (const p of allPools) {
       const sParts = p.start_ip.split(".").map(Number);
       const eParts = p.end_ip.split(".").map(Number);
-      const sInt = ((sParts[0] << 24) | (sParts[1] << 16) | (sParts[2] << 8) | sParts[3]) >>> 0;
-      const eInt = ((eParts[0] << 24) | (eParts[1] << 16) | (eParts[2] << 8) | eParts[3]) >>> 0;
-      if (ipInt >= sInt && ipInt <= eInt) return { type: p.pool_type, name: p.name || p.pool_type };
+      const sInt =
+        ((sParts[0] << 24) |
+          (sParts[1] << 16) |
+          (sParts[2] << 8) |
+          sParts[3]) >>>
+        0;
+      const eInt =
+        ((eParts[0] << 24) |
+          (eParts[1] << 16) |
+          (eParts[2] << 8) |
+          eParts[3]) >>>
+        0;
+      if (ipInt >= sInt && ipInt <= eInt)
+        return { type: p.pool_type, name: p.name || p.pool_type };
     }
     return null;
   }
@@ -1726,7 +1741,9 @@ function SubnetDetail({
           {subnet.vlan?.router_name && (
             <div className="flex items-center gap-1.5">
               <span className="text-xs text-muted-foreground">Router</span>
-              <span className="text-xs font-medium">{subnet.vlan.router_name}</span>
+              <span className="text-xs font-medium">
+                {subnet.vlan.router_name}
+              </span>
             </div>
           )}
           {subnet.vlan ? (
@@ -1735,7 +1752,9 @@ function SubnetDetail({
               <span className="text-xs font-medium">
                 {subnet.vlan.vlan_id}
                 {subnet.vlan.name && (
-                  <span className="ml-1 text-muted-foreground">({subnet.vlan.name})</span>
+                  <span className="ml-1 text-muted-foreground">
+                    ({subnet.vlan.name})
+                  </span>
                 )}
               </span>
             </div>
@@ -1809,89 +1828,29 @@ function SubnetDetail({
 
       {/* IP Address table */}
       {activeSubnetTab === "addresses" && (
-      <div className="flex-1 overflow-auto">
-        {isLoading ? (
-          <p className="p-6 text-sm text-muted-foreground">
-            Loading addresses…
-          </p>
-        ) : !addresses?.length ? (
-          <div className="flex flex-col items-center justify-center py-16 text-center">
-            <Network className="mb-3 h-10 w-10 text-muted-foreground/30" />
-            <p className="text-sm text-muted-foreground">
-              No IP addresses allocated yet.
+        <div className="flex-1 overflow-auto">
+          {isLoading ? (
+            <p className="p-6 text-sm text-muted-foreground">
+              Loading addresses…
             </p>
-            <button
-              onClick={() => setShowAddModal(true)}
-              className="mt-3 flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90"
-            >
-              <Plus className="h-3.5 w-3.5" />
-              Allocate first IP
-            </button>
-          </div>
-        ) : (
-          <table className="w-full text-sm">
-            <thead>
-              <tr className="border-b bg-muted/40 text-xs">
-                {(
-                  [
-                    "address",
-                    "hostname",
-                    "mac",
-                    "description",
-                    "status",
-                    "pool",
-                    "dns",
-                  ] as const
-                ).map((col) => {
-                  const label =
-                    col === "mac" ? "MAC" : col === "dns" ? "DNS" : col === "pool" ? "DHCP Pool" : col;
-                  return (
-                    <th key={col} className="px-4 py-2 text-left font-medium">
-                      <span className="inline-flex items-center gap-1">
-                        <span className="capitalize">{label}</span>
-                        <button
-                          onClick={() => setShowFilters((v) => !v)}
-                          title={`Filter by ${label}`}
-                          className={cn(
-                            "rounded p-0.5 hover:bg-accent",
-                            colFilters[col]
-                              ? "text-primary"
-                              : showFilters
-                                ? "text-primary/40"
-                                : "text-muted-foreground/30 hover:text-muted-foreground",
-                          )}
-                        >
-                          <Filter className="h-2.5 w-2.5" />
-                        </button>
-                      </span>
-                    </th>
-                  );
-                })}
-                <th className="px-4 py-2 text-right">
-                  {hasActiveFilter && (
-                    <button
-                      onClick={() => {
-                        setColFilters({
-                          address: "",
-                          hostname: "",
-                          mac: "",
-                          description: "",
-                          status: "",
-                          dns: "",
-                          pool: "",
-                        });
-                        setFilterModes({});
-                      }}
-                      title="Clear all filters"
-                      className="rounded p-0.5 text-primary hover:text-destructive"
-                    >
-                      <X className="h-3 w-3" />
-                    </button>
-                  )}
-                </th>
-              </tr>
-              {showFilters && (
-                <tr className="border-b bg-muted/10 text-xs">
+          ) : !addresses?.length ? (
+            <div className="flex flex-col items-center justify-center py-16 text-center">
+              <Network className="mb-3 h-10 w-10 text-muted-foreground/30" />
+              <p className="text-sm text-muted-foreground">
+                No IP addresses allocated yet.
+              </p>
+              <button
+                onClick={() => setShowAddModal(true)}
+                className="mt-3 flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90"
+              >
+                <Plus className="h-3.5 w-3.5" />
+                Allocate first IP
+              </button>
+            </div>
+          ) : (
+            <table className="w-full text-sm">
+              <thead>
+                <tr className="border-b bg-muted/40 text-xs">
                   {(
                     [
                       "address",
@@ -1902,269 +1861,342 @@ function SubnetDetail({
                       "pool",
                       "dns",
                     ] as const
-                  ).map((col) => (
-                    <td key={col} className="px-2 py-1">
-                      {col === "status" ? (
-                        <select
-                          value={colFilters.status}
-                          onChange={(e) =>
-                            setColFilters((p) => ({
-                              ...p,
-                              status: e.target.value,
-                            }))
-                          }
-                          className="w-full rounded border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
-                        >
-                          <option value="">All</option>
-                          {[
-                            "allocated",
-                            "available",
-                            "reserved",
-                            "dhcp",
-                            "static_dhcp",
-                            "network",
-                            "broadcast",
-                            "orphan",
-                          ].map((s) => (
-                            <option key={s} value={s}>
-                              {s}
-                            </option>
-                          ))}
-                        </select>
-                      ) : col === "dns" ? (
-                        <select
-                          value={colFilters.dns}
-                          onChange={(e) =>
-                            setColFilters((p) => ({
-                              ...p,
-                              dns: e.target.value,
-                            }))
-                          }
-                          className="w-full rounded border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
-                        >
-                          <option value="">All</option>
-                          <option value="in-sync">In sync</option>
-                          <option value="out-of-sync">Out of sync</option>
-                          <option value="n/a">N/A</option>
-                        </select>
-                      ) : (
-                        <div className="flex items-center">
-                          <input
-                            type="text"
-                            value={colFilters[col]}
+                  ).map((col) => {
+                    const label =
+                      col === "mac"
+                        ? "MAC"
+                        : col === "dns"
+                          ? "DNS"
+                          : col === "pool"
+                            ? "DHCP Pool"
+                            : col;
+                    return (
+                      <th key={col} className="px-4 py-2 text-left font-medium">
+                        <span className="inline-flex items-center gap-1">
+                          <span className="capitalize">{label}</span>
+                          <button
+                            onClick={() => setShowFilters((v) => !v)}
+                            title={`Filter by ${label}`}
+                            className={cn(
+                              "rounded p-0.5 hover:bg-accent",
+                              colFilters[col]
+                                ? "text-primary"
+                                : showFilters
+                                  ? "text-primary/40"
+                                  : "text-muted-foreground/30 hover:text-muted-foreground",
+                            )}
+                          >
+                            <Filter className="h-2.5 w-2.5" />
+                          </button>
+                        </span>
+                      </th>
+                    );
+                  })}
+                  <th className="px-4 py-2 text-right">
+                    {hasActiveFilter && (
+                      <button
+                        onClick={() => {
+                          setColFilters({
+                            address: "",
+                            hostname: "",
+                            mac: "",
+                            description: "",
+                            status: "",
+                            dns: "",
+                            pool: "",
+                          });
+                          setFilterModes({});
+                        }}
+                        title="Clear all filters"
+                        className="rounded p-0.5 text-primary hover:text-destructive"
+                      >
+                        <X className="h-3 w-3" />
+                      </button>
+                    )}
+                  </th>
+                </tr>
+                {showFilters && (
+                  <tr className="border-b bg-muted/10 text-xs">
+                    {(
+                      [
+                        "address",
+                        "hostname",
+                        "mac",
+                        "description",
+                        "status",
+                        "pool",
+                        "dns",
+                      ] as const
+                    ).map((col) => (
+                      <td key={col} className="px-2 py-1">
+                        {col === "status" ? (
+                          <select
+                            value={colFilters.status}
                             onChange={(e) =>
                               setColFilters((p) => ({
                                 ...p,
-                                [col]: e.target.value,
+                                status: e.target.value,
                               }))
                             }
-                            placeholder="Filter…"
-                            className="w-full min-w-0 rounded-l border border-r-0 bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
-                          />
-                          <div className="relative">
-                            <button
-                              type="button"
-                              onClick={() =>
-                                setOpenFilterMenu(
-                                  openFilterMenu === col ? null : col,
-                                )
+                            className="w-full rounded border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
+                          >
+                            <option value="">All</option>
+                            {[
+                              "allocated",
+                              "available",
+                              "reserved",
+                              "dhcp",
+                              "static_dhcp",
+                              "network",
+                              "broadcast",
+                              "orphan",
+                            ].map((s) => (
+                              <option key={s} value={s}>
+                                {s}
+                              </option>
+                            ))}
+                          </select>
+                        ) : col === "dns" ? (
+                          <select
+                            value={colFilters.dns}
+                            onChange={(e) =>
+                              setColFilters((p) => ({
+                                ...p,
+                                dns: e.target.value,
+                              }))
+                            }
+                            className="w-full rounded border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
+                          >
+                            <option value="">All</option>
+                            <option value="in-sync">In sync</option>
+                            <option value="out-of-sync">Out of sync</option>
+                            <option value="n/a">N/A</option>
+                          </select>
+                        ) : (
+                          <div className="flex items-center">
+                            <input
+                              type="text"
+                              value={colFilters[col]}
+                              onChange={(e) =>
+                                setColFilters((p) => ({
+                                  ...p,
+                                  [col]: e.target.value,
+                                }))
                               }
-                              className="rounded-r border bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground hover:bg-accent"
-                              title="Filter mode"
-                            >
-                              {filterModes[col] === "begins"
-                                ? "^"
-                                : filterModes[col] === "ends"
-                                  ? "$"
-                                  : filterModes[col] === "regex"
-                                    ? ".*"
-                                    : "⊂"}
-                            </button>
-                            {openFilterMenu === col && (
-                              <div className="absolute left-0 top-full z-30 mt-0.5 w-32 rounded-md border bg-popover shadow-md">
-                                {(
-                                  [
-                                    "contains",
-                                    "begins",
-                                    "ends",
-                                    "regex",
-                                  ] as const
-                                ).map((m) => (
-                                  <button
-                                    key={m}
-                                    type="button"
-                                    onClick={() => {
-                                      setFilterModes((p) => ({
-                                        ...p,
-                                        [col]: m,
-                                      }));
-                                      setOpenFilterMenu(null);
-                                    }}
-                                    className={cn(
-                                      "w-full px-3 py-1.5 text-left text-xs hover:bg-accent",
-                                      filterModes[col] === m &&
-                                        "font-semibold text-primary",
-                                    )}
-                                  >
-                                    {m === "contains"
-                                      ? "⊂ Contains"
-                                      : m === "begins"
-                                        ? "^ Begins"
-                                        : m === "ends"
-                                          ? "$ Ends"
-                                          : ".* Regex"}
-                                  </button>
-                                ))}
-                              </div>
-                            )}
+                              placeholder="Filter…"
+                              className="w-full min-w-0 rounded-l border border-r-0 bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
+                            />
+                            <div className="relative">
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setOpenFilterMenu(
+                                    openFilterMenu === col ? null : col,
+                                  )
+                                }
+                                className="rounded-r border bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground hover:bg-accent"
+                                title="Filter mode"
+                              >
+                                {filterModes[col] === "begins"
+                                  ? "^"
+                                  : filterModes[col] === "ends"
+                                    ? "$"
+                                    : filterModes[col] === "regex"
+                                      ? ".*"
+                                      : "⊂"}
+                              </button>
+                              {openFilterMenu === col && (
+                                <div className="absolute left-0 top-full z-30 mt-0.5 w-32 rounded-md border bg-popover shadow-md">
+                                  {(
+                                    [
+                                      "contains",
+                                      "begins",
+                                      "ends",
+                                      "regex",
+                                    ] as const
+                                  ).map((m) => (
+                                    <button
+                                      key={m}
+                                      type="button"
+                                      onClick={() => {
+                                        setFilterModes((p) => ({
+                                          ...p,
+                                          [col]: m,
+                                        }));
+                                        setOpenFilterMenu(null);
+                                      }}
+                                      className={cn(
+                                        "w-full px-3 py-1.5 text-left text-xs hover:bg-accent",
+                                        filterModes[col] === m &&
+                                          "font-semibold text-primary",
+                                      )}
+                                    >
+                                      {m === "contains"
+                                        ? "⊂ Contains"
+                                        : m === "begins"
+                                          ? "^ Begins"
+                                          : m === "ends"
+                                            ? "$ Ends"
+                                            : ".* Regex"}
+                                    </button>
+                                  ))}
+                                </div>
+                              )}
+                            </div>
                           </div>
-                        </div>
-                      )}
-                    </td>
-                  ))}
-                  <td />
-                </tr>
-              )}
-            </thead>
-            <tbody>
-              {filteredAddresses?.length === 0 && (
-                <tr>
-                  <td
-                    colSpan={7}
-                    className="px-4 py-6 text-center text-sm text-muted-foreground"
-                  >
-                    No addresses match the active filters.
-                  </td>
-                </tr>
-              )}
-              {filteredAddresses?.map((addr: IPAddress) => {
-                const dnsState = ipDnsState(addr);
-                return (
-                  <tr
-                    key={addr.id}
-                    className={cn(
-                      "group/addr border-b last:border-0 hover:bg-muted/20",
-                      (addr.status === "network" ||
-                        addr.status === "broadcast") &&
-                        "opacity-50",
-                      addr.status === "orphan" && "opacity-40",
-                    )}
-                  >
-                    <td className="px-4 py-2 font-mono font-medium">
-                      <span className="inline-flex items-center gap-0.5">
-                        {addr.address}
-                        <CopyButton text={addr.address} />
-                      </span>
-                    </td>
-                    <td className="px-4 py-2">
-                      {addr.fqdn ? (
-                        <span className="font-mono text-xs">{addr.fqdn}</span>
-                      ) : addr.hostname ? (
-                        <span className="text-muted-foreground">
-                          {addr.hostname}
-                        </span>
-                      ) : (
-                        <span className="text-muted-foreground/40">—</span>
-                      )}
-                    </td>
-                    <td className="px-4 py-2 font-mono text-xs">
-                      {addr.mac_address ?? (
-                        <span className="text-muted-foreground/40">—</span>
-                      )}
-                    </td>
-                    <td className="px-4 py-2 text-muted-foreground">
-                      {addr.description ?? (
-                        <span className="text-muted-foreground/40">—</span>
-                      )}
-                    </td>
-                    <td className="px-4 py-2">
-                      <StatusBadge status={addr.status} />
-                    </td>
-                    <td className="px-4 py-2">
-                      {(() => {
-                        const pi = ipPoolInfo(addr);
-                        if (!pi) return <span className="text-muted-foreground/40">—</span>;
-                        const cls =
-                          pi.type === "dynamic"
-                            ? "bg-cyan-100 text-cyan-800 dark:bg-cyan-900/30 dark:text-cyan-400"
-                            : pi.type === "reserved"
-                              ? "bg-violet-100 text-violet-800 dark:bg-violet-900/30 dark:text-violet-400"
-                              : "bg-zinc-100 text-zinc-600 dark:bg-zinc-800/30 dark:text-zinc-400";
-                        return (
-                          <span className={`inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium ${cls}`}>
-                            {pi.name}
-                          </span>
-                        );
-                      })()}
-                    </td>
-                    <td className="px-4 py-2">
-                      {dnsState === "in-sync" ? (
-                        <span
-                          className="inline-flex items-center gap-1 text-xs text-emerald-600"
-                          title="DNS records match IPAM"
-                        >
-                          <span className="inline-block h-1.5 w-1.5 rounded-full bg-emerald-500" />
-                          in sync
-                        </span>
-                      ) : dnsState === "out-of-sync" ? (
-                        <span
-                          className="inline-flex items-center gap-1 text-xs text-amber-600"
-                          title="DNS records are missing or differ — open Check DNS Sync to reconcile"
-                        >
-                          <span className="inline-block h-1.5 w-1.5 rounded-full bg-amber-500" />
-                          out of sync
-                        </span>
-                      ) : (
-                        <span className="text-muted-foreground/40">—</span>
-                      )}
-                    </td>
-                    <td className="px-4 py-2 text-right">
-                      <div className="flex items-center justify-end gap-1">
-                        {addr.status === "orphan" ? (
-                          <>
-                            <button
-                              onClick={() => restoreAddr.mutate(addr.id)}
-                              disabled={restoreAddr.isPending}
-                              className="rounded p-1 text-xs text-muted-foreground hover:text-green-600"
-                              title="Restore (mark as allocated)"
-                            >
-                              <RefreshCw className="h-3.5 w-3.5" />
-                            </button>
-                            <button
-                              onClick={() => setConfirmPurgeAddr(addr)}
-                              className="rounded p-1 text-muted-foreground hover:text-destructive"
-                              title="Permanently delete"
-                            >
-                              <Trash2 className="h-3.5 w-3.5" />
-                            </button>
-                          </>
-                        ) : !isReadOnly(addr.status) ? (
-                          <>
-                            <button
-                              onClick={() => setEditingAddress(addr)}
-                              className="rounded p-1 text-muted-foreground hover:text-foreground"
-                              title="Edit"
-                            >
-                              <Pencil className="h-3.5 w-3.5" />
-                            </button>
-                            <button
-                              onClick={() => setConfirmDeleteAddr(addr)}
-                              className="rounded p-1 text-muted-foreground hover:text-destructive"
-                              title="Delete"
-                            >
-                              <Trash2 className="h-3.5 w-3.5" />
-                            </button>
-                          </>
-                        ) : null}
-                      </div>
+                        )}
+                      </td>
+                    ))}
+                    <td />
+                  </tr>
+                )}
+              </thead>
+              <tbody>
+                {filteredAddresses?.length === 0 && (
+                  <tr>
+                    <td
+                      colSpan={7}
+                      className="px-4 py-6 text-center text-sm text-muted-foreground"
+                    >
+                      No addresses match the active filters.
                     </td>
                   </tr>
-                );
-              })}
-            </tbody>
-          </table>
-        )}
-      </div>
+                )}
+                {filteredAddresses?.map((addr: IPAddress) => {
+                  const dnsState = ipDnsState(addr);
+                  return (
+                    <tr
+                      key={addr.id}
+                      className={cn(
+                        "group/addr border-b last:border-0 hover:bg-muted/20",
+                        (addr.status === "network" ||
+                          addr.status === "broadcast") &&
+                          "opacity-50",
+                        addr.status === "orphan" && "opacity-40",
+                      )}
+                    >
+                      <td className="px-4 py-2 font-mono font-medium">
+                        <span className="inline-flex items-center gap-0.5">
+                          {addr.address}
+                          <CopyButton text={addr.address} />
+                        </span>
+                      </td>
+                      <td className="px-4 py-2">
+                        {addr.fqdn ? (
+                          <span className="font-mono text-xs">{addr.fqdn}</span>
+                        ) : addr.hostname ? (
+                          <span className="text-muted-foreground">
+                            {addr.hostname}
+                          </span>
+                        ) : (
+                          <span className="text-muted-foreground/40">—</span>
+                        )}
+                      </td>
+                      <td className="px-4 py-2 font-mono text-xs">
+                        {addr.mac_address ?? (
+                          <span className="text-muted-foreground/40">—</span>
+                        )}
+                      </td>
+                      <td className="px-4 py-2 text-muted-foreground">
+                        {addr.description ?? (
+                          <span className="text-muted-foreground/40">—</span>
+                        )}
+                      </td>
+                      <td className="px-4 py-2">
+                        <StatusBadge status={addr.status} />
+                      </td>
+                      <td className="px-4 py-2">
+                        {(() => {
+                          const pi = ipPoolInfo(addr);
+                          if (!pi)
+                            return (
+                              <span className="text-muted-foreground/40">
+                                —
+                              </span>
+                            );
+                          const cls =
+                            pi.type === "dynamic"
+                              ? "bg-cyan-100 text-cyan-800 dark:bg-cyan-900/30 dark:text-cyan-400"
+                              : pi.type === "reserved"
+                                ? "bg-violet-100 text-violet-800 dark:bg-violet-900/30 dark:text-violet-400"
+                                : "bg-zinc-100 text-zinc-600 dark:bg-zinc-800/30 dark:text-zinc-400";
+                          return (
+                            <span
+                              className={`inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium ${cls}`}
+                            >
+                              {pi.name}
+                            </span>
+                          );
+                        })()}
+                      </td>
+                      <td className="px-4 py-2">
+                        {dnsState === "in-sync" ? (
+                          <span
+                            className="inline-flex items-center gap-1 text-xs text-emerald-600"
+                            title="DNS records match IPAM"
+                          >
+                            <span className="inline-block h-1.5 w-1.5 rounded-full bg-emerald-500" />
+                            in sync
+                          </span>
+                        ) : dnsState === "out-of-sync" ? (
+                          <span
+                            className="inline-flex items-center gap-1 text-xs text-amber-600"
+                            title="DNS records are missing or differ — open Check DNS Sync to reconcile"
+                          >
+                            <span className="inline-block h-1.5 w-1.5 rounded-full bg-amber-500" />
+                            out of sync
+                          </span>
+                        ) : (
+                          <span className="text-muted-foreground/40">—</span>
+                        )}
+                      </td>
+                      <td className="px-4 py-2 text-right">
+                        <div className="flex items-center justify-end gap-1">
+                          {addr.status === "orphan" ? (
+                            <>
+                              <button
+                                onClick={() => restoreAddr.mutate(addr.id)}
+                                disabled={restoreAddr.isPending}
+                                className="rounded p-1 text-xs text-muted-foreground hover:text-green-600"
+                                title="Restore (mark as allocated)"
+                              >
+                                <RefreshCw className="h-3.5 w-3.5" />
+                              </button>
+                              <button
+                                onClick={() => setConfirmPurgeAddr(addr)}
+                                className="rounded p-1 text-muted-foreground hover:text-destructive"
+                                title="Permanently delete"
+                              >
+                                <Trash2 className="h-3.5 w-3.5" />
+                              </button>
+                            </>
+                          ) : !isReadOnly(addr.status) ? (
+                            <>
+                              <button
+                                onClick={() => setEditingAddress(addr)}
+                                className="rounded p-1 text-muted-foreground hover:text-foreground"
+                                title="Edit"
+                              >
+                                <Pencil className="h-3.5 w-3.5" />
+                              </button>
+                              <button
+                                onClick={() => setConfirmDeleteAddr(addr)}
+                                className="rounded p-1 text-muted-foreground hover:text-destructive"
+                                title="Delete"
+                              >
+                                <Trash2 className="h-3.5 w-3.5" />
+                              </button>
+                            </>
+                          ) : null}
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          )}
+        </div>
       )}
 
       {showAddModal && (
@@ -2631,11 +2663,7 @@ function OrphansModal({
   };
 
   return (
-    <Modal
-      title={`Clean Orphans — ${subnetLabel}`}
-      onClose={onClose}
-      wide
-    >
+    <Modal title={`Clean Orphans — ${subnetLabel}`} onClose={onClose} wide>
       <div className="space-y-3">
         <p className="text-sm text-muted-foreground">
           Orphans are IP addresses that were soft-deleted. Selected rows will be

@@ -743,7 +743,6 @@ class SubnetResponse(BaseModel):
         return data
 
 
-
 class EffectiveDnsResponse(BaseModel):
     dns_group_ids: list[str]
     dns_zone_id: str | None
@@ -1564,9 +1563,7 @@ async def update_subnet(
         "dns_inherit_settings",
     }
     changes = body.model_dump(exclude_none=True, exclude=exclude_fields)
-    changes_for_audit = body.model_dump(
-        mode="json", exclude_none=True, exclude=exclude_fields
-    )
+    changes_for_audit = body.model_dump(mode="json", exclude_none=True, exclude=exclude_fields)
     for field, value in changes.items():
         setattr(subnet, field, value)
     # Handle DNS fields explicitly so boolean False and explicit null are preserved
@@ -2150,9 +2147,7 @@ async def update_address(
     }
     old_status = ip.status
     changes = body.model_dump(exclude_none=True, exclude={"dns_zone_id"})
-    changes_for_audit = body.model_dump(
-        mode="json", exclude_none=True, exclude={"dns_zone_id"}
-    )
+    changes_for_audit = body.model_dump(mode="json", exclude_none=True, exclude={"dns_zone_id"})
     for field, value in changes.items():
         setattr(ip, field, value)
 
@@ -2396,7 +2391,10 @@ async def allocate_next_ip(
             "ip_address",
             str(ip.id),
             str(chosen),
-            new_value={**body.model_dump(mode="json", exclude={"dns_zone_id"}), "address": str(chosen)},
+            new_value={
+                **body.model_dump(mode="json", exclude={"dns_zone_id"}),
+                "address": str(chosen),
+            },
         )
     )
     await db.flush()

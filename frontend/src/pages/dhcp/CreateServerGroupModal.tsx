@@ -32,7 +32,10 @@ export function CreateServerGroupModal({
   });
 
   return (
-    <Modal title={editing ? "Edit Server Group" : "New DHCP Server Group"} onClose={onClose}>
+    <Modal
+      title={editing ? "Edit Server Group" : "New DHCP Server Group"}
+      onClose={onClose}
+    >
       <form
         onSubmit={(e) => {
           e.preventDefault();

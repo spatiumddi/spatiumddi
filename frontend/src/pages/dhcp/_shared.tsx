@@ -93,13 +93,15 @@ export function errMsg(e: unknown, fallback = "Request failed"): string {
   if (typeof d === "string") return d;
   if (Array.isArray(d)) {
     // Pydantic 422 — array of { type, loc, msg, input }.
-    return (d as Array<{ loc?: (string | number)[]; msg?: string }>)
-      .map((err) => {
-        const field = (err.loc ?? []).filter((p) => p !== "body").join(".");
-        return field ? `${field}: ${err.msg}` : err.msg;
-      })
-      .filter(Boolean)
-      .join("; ") || fallback;
+    return (
+      (d as Array<{ loc?: (string | number)[]; msg?: string }>)
+        .map((err) => {
+          const field = (err.loc ?? []).filter((p) => p !== "body").join(".");
+          return field ? `${field}: ${err.msg}` : err.msg;
+        })
+        .filter(Boolean)
+        .join("; ") || fallback
+    );
   }
   return fallback;
 }

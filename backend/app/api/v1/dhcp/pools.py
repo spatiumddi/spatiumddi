@@ -103,19 +103,19 @@ async def _existing_ips_in_range(
     db: AsyncSession, subnet_id: uuid.UUID, start: str, end: str
 ) -> list[dict[str, str]]:
     """Return IPAM addresses that fall inside the given range and aren't 'available'."""
-    res = await db.execute(
-        select(IPAddress).where(IPAddress.subnet_id == subnet_id)
-    )
+    res = await db.execute(select(IPAddress).where(IPAddress.subnet_id == subnet_id))
     s, e = _ip_int(start), _ip_int(end)
     hits: list[dict[str, str]] = []
     for ip in res.scalars().all():
         v = _ip_int(str(ip.address))
         if s <= v <= e and ip.status not in ("available", "network", "broadcast"):
-            hits.append({
-                "address": str(ip.address),
-                "status": ip.status,
-                "hostname": ip.hostname or "",
-            })
+            hits.append(
+                {
+                    "address": str(ip.address),
+                    "status": ip.status,
+                    "hostname": ip.hostname or "",
+                }
+            )
     return hits
 
 
@@ -160,16 +160,16 @@ async def create_pool(
 
 
 @router.put("/pools/{pool_id}", response_model=PoolResponse)
-async def update_pool(
-    pool_id: uuid.UUID, body: PoolUpdate, db: DB, user: SuperAdmin
-) -> DHCPPool:
+async def update_pool(pool_id: uuid.UUID, body: PoolUpdate, db: DB, user: SuperAdmin) -> DHCPPool:
     pool = await db.get(DHCPPool, pool_id)
     if pool is None:
         raise HTTPException(status_code=404, detail="Pool not found")
     new_start = body.start_ip or str(pool.start_ip)
     new_end = body.end_ip or str(pool.end_ip)
     if body.start_ip or body.end_ip:
-        overlap = await _check_pool_overlap(db, pool.scope_id, new_start, new_end, exclude_id=pool.id)
+        overlap = await _check_pool_overlap(
+            db, pool.scope_id, new_start, new_end, exclude_id=pool.id
+        )
         if overlap:
             raise HTTPException(status_code=409, detail=overlap)
     changes = body.model_dump(exclude_none=True)

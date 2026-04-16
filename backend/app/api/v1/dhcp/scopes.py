@@ -91,7 +91,9 @@ class ScopeCreate(BaseModel):
         if v in (None, ""):
             return "client"
         if v not in VALID_HOSTNAME_POLICIES:
-            raise ValueError(f"ddns_hostname_policy must be one of {sorted(VALID_HOSTNAME_POLICIES)}")
+            raise ValueError(
+                f"ddns_hostname_policy must be one of {sorted(VALID_HOSTNAME_POLICIES)}"
+            )
         return v
 
 
@@ -138,9 +140,7 @@ def _scope_to_response(scope: DHCPScope) -> ScopeResponse:
     opts: list[dict[str, Any]] = []
     if isinstance(raw, dict):
         for name, val in raw.items():
-            opts.append(
-                {"code": _NAME_TO_CODE.get(name, 0), "name": name, "value": val}
-            )
+            opts.append({"code": _NAME_TO_CODE.get(name, 0), "name": name, "value": val})
     elif isinstance(raw, list):
         opts = list(raw)
     return ScopeResponse(
@@ -199,14 +199,10 @@ async def create_scope(
     if srv is None:
         raise HTTPException(status_code=404, detail="DHCP server not found")
     existing = await db.execute(
-        select(DHCPScope).where(
-            DHCPScope.server_id == server_id, DHCPScope.subnet_id == subnet_id
-        )
+        select(DHCPScope).where(DHCPScope.server_id == server_id, DHCPScope.subnet_id == subnet_id)
     )
     if existing.unique().scalar_one_or_none():
-        raise HTTPException(
-            status_code=409, detail="A scope for this server+subnet already exists"
-        )
+        raise HTTPException(status_code=409, detail="A scope for this server+subnet already exists")
     sync_mode = _normalize_sync_mode(body.hostname_sync_mode or body.hostname_to_ipam_sync)
     if sync_mode not in VALID_SYNC_MODES - {"ipam", "learned"}:
         raise HTTPException(status_code=422, detail=f"invalid hostname sync mode: {sync_mode}")
@@ -259,13 +255,9 @@ async def update_scope(
     if "enabled" in changes:
         changes["is_active"] = changes.pop("enabled")
     if "hostname_sync_mode" in changes:
-        changes["hostname_to_ipam_sync"] = _normalize_sync_mode(
-            changes.pop("hostname_sync_mode")
-        )
+        changes["hostname_to_ipam_sync"] = _normalize_sync_mode(changes.pop("hostname_sync_mode"))
     elif "hostname_to_ipam_sync" in changes:
-        changes["hostname_to_ipam_sync"] = _normalize_sync_mode(
-            changes["hostname_to_ipam_sync"]
-        )
+        changes["hostname_to_ipam_sync"] = _normalize_sync_mode(changes["hostname_to_ipam_sync"])
     if "options" in changes:
         changes["options"] = _normalize_options(changes["options"])
     for k, v in changes.items():

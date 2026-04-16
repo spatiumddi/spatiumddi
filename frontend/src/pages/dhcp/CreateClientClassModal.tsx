@@ -1,10 +1,6 @@
 import { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import {
-  dhcpApi,
-  type DHCPClientClass,
-  type DHCPOption,
-} from "@/lib/api";
+import { dhcpApi, type DHCPClientClass, type DHCPOption } from "@/lib/api";
 import { Modal, Field, Btns, inputCls, errMsg } from "./_shared";
 import { DHCPOptionsEditor } from "./DHCPOptionsEditor";
 

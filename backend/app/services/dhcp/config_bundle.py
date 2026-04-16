@@ -96,11 +96,7 @@ async def build_config_bundle(db: AsyncSession, server: DHCPServer) -> ConfigBun
 
     # Client classes
     cc_rows = (
-        (
-            await db.execute(
-                select(DHCPClientClass).where(DHCPClientClass.server_id == server.id)
-            )
-        )
+        (await db.execute(select(DHCPClientClass).where(DHCPClientClass.server_id == server.id)))
         .scalars()
         .all()
     )

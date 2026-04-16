@@ -39,13 +39,7 @@ type Selection =
   | { type: "server"; group: DHCPServerGroup | null; server: DHCPServer }
   | null;
 
-type Tab =
-  | "scopes"
-  | "pools"
-  | "statics"
-  | "classes"
-  | "leases"
-  | "options";
+type Tab = "scopes" | "pools" | "statics" | "classes" | "leases" | "options";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Sidebar
@@ -120,7 +114,9 @@ function GroupSidebar({
           const isExpanded = expanded.has(g.id);
           const selected =
             selection?.type === "group" && selection.group.id === g.id;
-          const serversInGroup = ungrouped.filter((s) => s.server_group_id === g.id);
+          const serversInGroup = ungrouped.filter(
+            (s) => s.server_group_id === g.id,
+          );
 
           return (
             <div key={g.id}>
@@ -205,8 +201,7 @@ function GroupSidebar({
               .filter((s) => !s.server_group_id)
               .map((s) => {
                 const active =
-                  selection?.type === "server" &&
-                  selection.server.id === s.id;
+                  selection?.type === "server" && selection.server.id === s.id;
                 return (
                   <button
                     key={s.id}
@@ -340,10 +335,7 @@ function GroupDetailView({
           ) : (
             <div className="divide-y">
               {servers.map((s) => (
-                <div
-                  key={s.id}
-                  className="flex items-center gap-3 px-4 py-2.5"
-                >
+                <div key={s.id} className="flex items-center gap-3 px-4 py-2.5">
                   <StatusDot status={s.status} />
                   <span className="w-48 truncate text-sm font-medium">
                     {s.name}
@@ -418,7 +410,8 @@ function ServerScopesTab({ server }: { server: DHCPServer }) {
     <div className="space-y-3">
       <div className="flex items-center justify-between">
         <p className="text-xs text-muted-foreground">
-          {allScopes.length} scope{allScopes.length !== 1 ? "s" : ""} served by this server.
+          {allScopes.length} scope{allScopes.length !== 1 ? "s" : ""} served by
+          this server.
         </p>
         <div className="flex items-center gap-2">
           <select
@@ -464,7 +457,9 @@ function ServerScopesTab({ server }: { server: DHCPServer }) {
                   <td className="px-3 py-2">{sc.name}</td>
                   <td className="px-3 py-2">{sc.enabled ? "yes" : "no"}</td>
                   <td className="px-3 py-2 tabular-nums">{sc.lease_time}</td>
-                  <td className="px-3 py-2">{sc.ddns_enabled ? "on" : "off"}</td>
+                  <td className="px-3 py-2">
+                    {sc.ddns_enabled ? "on" : "off"}
+                  </td>
                   <td className="px-3 py-2 text-right">
                     <button
                       onClick={() => setEditScope(sc)}
@@ -536,7 +531,9 @@ function ServerPoolsOrStaticsTab({
     queries: allScopes.map((sc) => ({
       queryKey: [kind === "pools" ? "dhcp-pools" : "dhcp-statics", sc.id],
       queryFn: () =>
-        kind === "pools" ? dhcpApi.listPools(sc.id) : dhcpApi.listStatics(sc.id),
+        kind === "pools"
+          ? dhcpApi.listPools(sc.id)
+          : dhcpApi.listStatics(sc.id),
     })),
   });
 
@@ -599,8 +596,12 @@ function ServerPoolsOrStaticsTab({
               return (
                 <tr key={s.id} className="border-b last:border-0">
                   <td className="px-3 py-2 text-xs">{scope.name}</td>
-                  <td className="px-3 py-2 font-mono text-xs">{s.mac_address}</td>
-                  <td className="px-3 py-2 font-mono text-xs">{s.ip_address}</td>
+                  <td className="px-3 py-2 font-mono text-xs">
+                    {s.mac_address}
+                  </td>
+                  <td className="px-3 py-2 font-mono text-xs">
+                    {s.ip_address}
+                  </td>
                   <td className="px-3 py-2">{s.hostname || "—"}</td>
                 </tr>
               );
@@ -766,9 +767,7 @@ function LeasesTab({ server }: { server: DHCPServer }) {
           className="ml-auto flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent"
           disabled={isFetching}
         >
-          <RefreshCw
-            className={cn("h-3 w-3", isFetching && "animate-spin")}
-          />
+          <RefreshCw className={cn("h-3 w-3", isFetching && "animate-spin")} />
           Refresh
         </button>
       </div>
@@ -797,8 +796,12 @@ function LeasesTab({ server }: { server: DHCPServer }) {
             )}
             {leases.map((l: DHCPLease) => (
               <tr key={l.id} className="border-b last:border-0">
-                <td className="px-3 py-1.5 font-mono text-xs">{l.ip_address}</td>
-                <td className="px-3 py-1.5 font-mono text-xs">{l.mac_address}</td>
+                <td className="px-3 py-1.5 font-mono text-xs">
+                  {l.ip_address}
+                </td>
+                <td className="px-3 py-1.5 font-mono text-xs">
+                  {l.mac_address}
+                </td>
                 <td className="px-3 py-1.5">{l.hostname || "—"}</td>
                 <td className="px-3 py-1.5">
                   <span
@@ -813,9 +816,7 @@ function LeasesTab({ server }: { server: DHCPServer }) {
                   </span>
                 </td>
                 <td className="px-3 py-1.5 text-xs text-muted-foreground">
-                  {l.expires_at
-                    ? new Date(l.expires_at).toLocaleString()
-                    : "—"}
+                  {l.expires_at ? new Date(l.expires_at).toLocaleString() : "—"}
                 </td>
                 <td className="px-3 py-1.5 text-xs text-muted-foreground">
                   {l.last_seen_at
@@ -851,8 +852,7 @@ function ServerDetailView({
   const [tab, setTab] = useState<Tab>("scopes");
   const syncMut = useMutation({
     mutationFn: () => dhcpApi.syncServer(server.id),
-    onSuccess: () =>
-      qc.invalidateQueries({ queryKey: ["dhcp-servers"] }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["dhcp-servers"] }),
   });
   const approveMut = useMutation({
     mutationFn: () => dhcpApi.approveServer(server.id),
@@ -904,10 +904,7 @@ function ServerDetailView({
               disabled={syncMut.isPending}
             >
               <RefreshCw
-                className={cn(
-                  "h-3 w-3",
-                  syncMut.isPending && "animate-spin",
-                )}
+                className={cn("h-3 w-3", syncMut.isPending && "animate-spin")}
               />
               Force Sync
             </button>

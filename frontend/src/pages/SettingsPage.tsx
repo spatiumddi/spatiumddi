@@ -100,15 +100,7 @@ const SECTIONS: SectionDef[] = [
     title: "DHCP Defaults",
     description:
       "Default DNS servers, domain, NTP, and lease time pre-filled when creating a new scope.",
-    keywords: [
-      "dns",
-      "domain",
-      "search",
-      "ntp",
-      "lease",
-      "option 42",
-      "scope",
-    ],
+    keywords: ["dns", "domain", "search", "ntp", "lease", "option 42", "scope"],
   },
   {
     id: "ip-allocation",

@@ -71,9 +71,7 @@ async def _upsert_ipam_for_static(
     """
     ip_str = str(st.ip_address)
     # Detach any previous IPAM row that was pointing at this static (IP change).
-    prior = await db.execute(
-        select(IPAddress).where(IPAddress.static_assignment_id == str(st.id))
-    )
+    prior = await db.execute(select(IPAddress).where(IPAddress.static_assignment_id == str(st.id)))
     for row in prior.scalars().all():
         if str(row.address) == ip_str:
             continue
@@ -82,9 +80,7 @@ async def _upsert_ipam_for_static(
             row.status = "allocated"
     # Find or create the IPAM row for this IP within the scope's subnet.
     res = await db.execute(
-        select(IPAddress).where(
-            IPAddress.subnet_id == scope.subnet_id, IPAddress.address == ip_str
-        )
+        select(IPAddress).where(IPAddress.subnet_id == scope.subnet_id, IPAddress.address == ip_str)
     )
     row = res.scalar_one_or_none()
     if row is None:
@@ -114,9 +110,7 @@ async def _detach_ipam_for_static(db, st: DHCPStaticAssignment) -> None:
     """
     from app.api.v1.ipam.router import _sync_dns_record
 
-    res = await db.execute(
-        select(IPAddress).where(IPAddress.static_assignment_id == str(st.id))
-    )
+    res = await db.execute(select(IPAddress).where(IPAddress.static_assignment_id == str(st.id)))
     for row in res.scalars().all():
         subnet_row = await db.get(Subnet, row.subnet_id)
         if subnet_row is not None:
@@ -170,9 +164,7 @@ async def _conflict_check(
 
 
 @router.get("/scopes/{scope_id}/statics", response_model=list[StaticResponse])
-async def list_statics(
-    scope_id: uuid.UUID, db: DB, _: CurrentUser
-) -> list[DHCPStaticAssignment]:
+async def list_statics(scope_id: uuid.UUID, db: DB, _: CurrentUser) -> list[DHCPStaticAssignment]:
     res = await db.execute(
         select(DHCPStaticAssignment).where(DHCPStaticAssignment.scope_id == scope_id)
     )

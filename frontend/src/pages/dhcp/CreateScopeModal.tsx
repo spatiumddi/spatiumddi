@@ -56,7 +56,9 @@ export function CreateScopeModal({
   const [name, setName] = useState(scope?.name ?? "");
   const [description, setDescription] = useState(scope?.description ?? "");
   const [enabled, setEnabled] = useState(scope?.enabled ?? true);
-  const [leaseTime, setLeaseTime] = useState(String(scope?.lease_time ?? 86400));
+  const [leaseTime, setLeaseTime] = useState(
+    String(scope?.lease_time ?? 86400),
+  );
   const [minLease, setMinLease] = useState(
     scope?.min_lease_time != null ? String(scope.min_lease_time) : "",
   );
@@ -135,17 +137,23 @@ export function CreateScopeModal({
       const parsedMaxLease = maxLease ? parseInt(maxLease, 10) : null;
 
       if (parsedMinLease !== null && parsedMinLease > parsedLeaseTime) {
-        throw new Error("Minimum lease time must be less than or equal to lease time.");
+        throw new Error(
+          "Minimum lease time must be less than or equal to lease time.",
+        );
       }
       if (parsedMaxLease !== null && parsedLeaseTime > parsedMaxLease) {
-        throw new Error("Lease time must be less than or equal to maximum lease time.");
+        throw new Error(
+          "Lease time must be less than or equal to maximum lease time.",
+        );
       }
       if (
         parsedMinLease !== null &&
         parsedMaxLease !== null &&
         parsedMinLease > parsedMaxLease
       ) {
-        throw new Error("Minimum lease time must be less than or equal to maximum lease time.");
+        throw new Error(
+          "Minimum lease time must be less than or equal to maximum lease time.",
+        );
       }
 
       const data: Partial<DHCPScope> = {
@@ -287,8 +295,8 @@ export function CreateScopeModal({
             <div className="mb-2 flex items-baseline justify-between">
               <span className="text-sm font-medium">Initial pool</span>
               <span className="text-xs text-muted-foreground">
-                Address range DHCP will hand out. Leave blank to add pools
-                later from the Pools tab.
+                Address range DHCP will hand out. Leave blank to add pools later
+                from the Pools tab.
               </span>
             </div>
             <div className="grid grid-cols-2 gap-3">
@@ -345,7 +353,10 @@ export function CreateScopeModal({
                   <option value="generate">Generate</option>
                 </select>
               </Field>
-              <Field label="Domain Override" hint="Blank = use subnet DNS zone.">
+              <Field
+                label="Domain Override"
+                hint="Blank = use subnet DNS zone."
+              >
                 <input
                   className={inputCls}
                   value={ddnsDomain}

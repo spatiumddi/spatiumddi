@@ -192,8 +192,7 @@ export function DashboardPage() {
     {} as Record<string, number>,
   );
   const dhcpActive = dhcpCounts.active ?? 0;
-  const dhcpUnhealthy =
-    (dhcpCounts.unreachable ?? 0) + (dhcpCounts.error ?? 0);
+  const dhcpUnhealthy = (dhcpCounts.unreachable ?? 0) + (dhcpCounts.error ?? 0);
   const dhcpPending = dhcpServers.filter((s) => !s.agent_approved).length;
 
   // Recent activity
@@ -225,8 +224,8 @@ export function DashboardPage() {
   const subnetsWithVlan =
     subnets?.filter((s) => s.vlan_ref_id != null).length ?? 0;
   const subnetsWithRawTagOnly =
-    subnets?.filter((s) => s.vlan_id != null && s.vlan_ref_id == null)
-      .length ?? 0;
+    subnets?.filter((s) => s.vlan_id != null && s.vlan_ref_id == null).length ??
+    0;
   // Aggregate per-router: vlan_count + subnet_count (derived from the
   // already-cached `subnets` list and per-router vlan queries — no extra
   // requests beyond what the VLANs page would make anyway).
@@ -353,11 +352,7 @@ export function DashboardPage() {
                       : `${dhcpActive} active`
               }
               tone={
-                dhcpUnhealthy > 0
-                  ? "bad"
-                  : dhcpPending > 0
-                    ? "warn"
-                    : undefined
+                dhcpUnhealthy > 0 ? "bad" : dhcpPending > 0 ? "warn" : undefined
               }
             />
             <StatCard
@@ -474,23 +469,22 @@ export function DashboardPage() {
               icon={Cpu}
               hint={
                 <>
-                  {(
-                    ["active", "syncing", "unreachable", "error"] as const
-                  ).map((s) =>
-                    serverCounts[s] ? (
-                      <span
-                        key={s}
-                        className="mr-3 inline-flex items-center gap-1.5"
-                      >
+                  {(["active", "syncing", "unreachable", "error"] as const).map(
+                    (s) =>
+                      serverCounts[s] ? (
                         <span
-                          className={cn(
-                            "inline-block h-2 w-2 rounded-full",
-                            DOT_CLS[s],
-                          )}
-                        />
-                        {serverCounts[s]} {s}
-                      </span>
-                    ) : null,
+                          key={s}
+                          className="mr-3 inline-flex items-center gap-1.5"
+                        >
+                          <span
+                            className={cn(
+                              "inline-block h-2 w-2 rounded-full",
+                              DOT_CLS[s],
+                            )}
+                          />
+                          {serverCounts[s]} {s}
+                        </span>
+                      ) : null,
                   )}
                 </>
               }
@@ -545,23 +539,22 @@ export function DashboardPage() {
               icon={Server}
               hint={
                 <>
-                  {(
-                    ["active", "syncing", "unreachable", "error"] as const
-                  ).map((s) =>
-                    dhcpCounts[s] ? (
-                      <span
-                        key={s}
-                        className="mr-3 inline-flex items-center gap-1.5"
-                      >
+                  {(["active", "syncing", "unreachable", "error"] as const).map(
+                    (s) =>
+                      dhcpCounts[s] ? (
                         <span
-                          className={cn(
-                            "inline-block h-2 w-2 rounded-full",
-                            DOT_CLS[s],
-                          )}
-                        />
-                        {dhcpCounts[s]} {s}
-                      </span>
-                    ) : null,
+                          key={s}
+                          className="mr-3 inline-flex items-center gap-1.5"
+                        >
+                          <span
+                            className={cn(
+                              "inline-block h-2 w-2 rounded-full",
+                              DOT_CLS[s],
+                            )}
+                          />
+                          {dhcpCounts[s]} {s}
+                        </span>
+                      ) : null,
                   )}
                   {dhcpPending > 0 && (
                     <span className="mr-3 inline-flex items-center gap-1.5 text-amber-600">
@@ -646,7 +639,9 @@ export function DashboardPage() {
                       key={entry.id}
                       className="flex items-center gap-4 px-4 py-2.5"
                     >
-                      <Icon className={cn("h-3.5 w-3.5 flex-shrink-0", iconCls)} />
+                      <Icon
+                        className={cn("h-3.5 w-3.5 flex-shrink-0", iconCls)}
+                      />
                       <span className="w-24 text-xs text-muted-foreground">
                         {new Date(entry.timestamp).toLocaleTimeString()}
                       </span>

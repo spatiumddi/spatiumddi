@@ -52,7 +52,11 @@ export function CreateServerModal({
   });
 
   return (
-    <Modal title={editing ? "Edit DHCP Server" : "New DHCP Server"} onClose={onClose} wide>
+    <Modal
+      title={editing ? "Edit DHCP Server" : "New DHCP Server"}
+      onClose={onClose}
+      wide
+    >
       <form
         onSubmit={(e) => {
           e.preventDefault();

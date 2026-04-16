@@ -186,7 +186,9 @@ async def agent_register(
             agent_approved=not require_approval,
             agent_fingerprint=body.fingerprint,
             agent_version=body.version,
-            description=f"auto-registered agent v{body.version}" if body.version else "auto-registered",
+            description=(
+                f"auto-registered agent v{body.version}" if body.version else "auto-registered"
+            ),
         )
         pending_approval = require_approval
         db.add(server)
@@ -315,7 +317,11 @@ async def agent_config_longpoll(
                         for s in bundle.scopes
                     ],
                     "client_classes": [
-                        {"name": c.name, "match_expression": c.match_expression, "options": c.options}
+                        {
+                            "name": c.name,
+                            "match_expression": c.match_expression,
+                            "options": c.options,
+                        }
                         for c in bundle.client_classes
                     ],
                 },

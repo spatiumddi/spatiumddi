@@ -45,12 +45,8 @@ class ClientClassResponse(BaseModel):
 
 
 @router.get("/servers/{server_id}/client-classes", response_model=list[ClientClassResponse])
-async def list_classes(
-    server_id: uuid.UUID, db: DB, _: CurrentUser
-) -> list[DHCPClientClass]:
-    res = await db.execute(
-        select(DHCPClientClass).where(DHCPClientClass.server_id == server_id)
-    )
+async def list_classes(server_id: uuid.UUID, db: DB, _: CurrentUser) -> list[DHCPClientClass]:
+    res = await db.execute(select(DHCPClientClass).where(DHCPClientClass.server_id == server_id))
     return list(res.scalars().all())
 
 

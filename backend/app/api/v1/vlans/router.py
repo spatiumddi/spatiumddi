@@ -207,7 +207,11 @@ async def update_router(
             )
     for field, value in changes.items():
         setattr(r, field, value)
-    db.add(_audit(current_user, "update", "router", str(r.id), r.name, old_value=old, new_value=changes))
+    db.add(
+        _audit(
+            current_user, "update", "router", str(r.id), r.name, old_value=old, new_value=changes
+        )
+    )
     await db.commit()
     await db.refresh(r)
     return r
@@ -377,9 +381,7 @@ async def delete_vlan(vlan_id: uuid.UUID, current_user: CurrentUser, db: DB) -> 
     v = await db.get(VLAN, vlan_id)
     if v is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="VLAN not found")
-    used = await db.scalar(
-        select(func.count(Subnet.id)).where(Subnet.vlan_ref_id == vlan_id)
-    )
+    used = await db.scalar(select(func.count(Subnet.id)).where(Subnet.vlan_ref_id == vlan_id))
     if used:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,

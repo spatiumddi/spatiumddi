@@ -167,7 +167,8 @@ export function DHCPOptionsEditor({
           ) : (
             <ChevronRight className="h-3.5 w-3.5" />
           )}
-          Custom options {customOptions.length > 0 && `(${customOptions.length})`}
+          Custom options{" "}
+          {customOptions.length > 0 && `(${customOptions.length})`}
         </button>
 
         {showCustom && (
@@ -183,7 +184,9 @@ export function DHCPOptionsEditor({
                     const code = parseInt(e.target.value, 10) || 0;
                     const next = [...value];
                     const fullIdx = next.findIndex(
-                      (o) => o === opt || (o.code === opt.code && o.value === opt.value),
+                      (o) =>
+                        o === opt ||
+                        (o.code === opt.code && o.value === opt.value),
                     );
                     if (fullIdx >= 0) next[fullIdx] = { ...opt, code };
                     onChange(next);
@@ -192,11 +195,17 @@ export function DHCPOptionsEditor({
                 <input
                   className="min-w-0 flex-1 rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
                   placeholder="value"
-                  value={typeof opt.value === "string" ? opt.value : opt.value.join(", ")}
+                  value={
+                    typeof opt.value === "string"
+                      ? opt.value
+                      : opt.value.join(", ")
+                  }
                   onChange={(e) => {
                     const next = [...value];
                     const fullIdx = next.findIndex(
-                      (o) => o === opt || (o.code === opt.code && o.value === opt.value),
+                      (o) =>
+                        o === opt ||
+                        (o.code === opt.code && o.value === opt.value),
                     );
                     if (fullIdx >= 0)
                       next[fullIdx] = { ...opt, value: e.target.value };
@@ -214,9 +223,7 @@ export function DHCPOptionsEditor({
             ))}
             <button
               type="button"
-              onClick={() =>
-                onChange([...value, { code: 0, value: "" }])
-              }
+              onClick={() => onChange([...value, { code: 0, value: "" }])}
               className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent"
             >
               <Plus className="h-3 w-3" /> Add custom option

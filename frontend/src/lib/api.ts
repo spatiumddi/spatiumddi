@@ -1252,8 +1252,7 @@ export interface VLAN {
 }
 
 export const vlansApi = {
-  listRouters: () =>
-    api.get<Router[]>("/vlans/routers").then((r) => r.data),
+  listRouters: () => api.get<Router[]>("/vlans/routers").then((r) => r.data),
   getRouter: (id: string) =>
     api.get<Router>(`/vlans/routers/${id}`).then((r) => r.data),
   createRouter: (data: Partial<Router>) =>
@@ -1271,7 +1270,8 @@ export const vlansApi = {
     api
       .post<VLAN>(`/vlans/routers/${routerId}/vlans`, data)
       .then((r) => r.data),
-  getVlan: (id: string) => api.get<VLAN>(`/vlans/vlans/${id}`).then((r) => r.data),
+  getVlan: (id: string) =>
+    api.get<VLAN>(`/vlans/vlans/${id}`).then((r) => r.data),
   updateVlan: (
     id: string,
     data: { vlan_id?: number; name?: string; description?: string },
@@ -1354,9 +1354,7 @@ export const dhcpApi = {
     api
       .get<DHCPServer[]>("/dhcp/servers")
       .then((r) =>
-        groupId
-          ? r.data.filter((s) => s.server_group_id === groupId)
-          : r.data,
+        groupId ? r.data.filter((s) => s.server_group_id === groupId) : r.data,
       ),
   getServer: (id: string) =>
     api.get<DHCPServer>(`/dhcp/servers/${id}`).then((r) => r.data),
@@ -1366,9 +1364,13 @@ export const dhcpApi = {
     api.put<DHCPServer>(`/dhcp/servers/${id}`, data).then((r) => r.data),
   deleteServer: (id: string) => api.delete(`/dhcp/servers/${id}`),
   syncServer: (id: string) =>
-    api.post<{ status: string; op_id: string; etag: string }>(
-      `/dhcp/servers/${id}/sync`,
-    ).then((r) => r.data),
+    api
+      .post<{
+        status: string;
+        op_id: string;
+        etag: string;
+      }>(`/dhcp/servers/${id}/sync`)
+      .then((r) => r.data),
   approveServer: (id: string) =>
     api.post<DHCPServer>(`/dhcp/servers/${id}/approve`).then((r) => r.data),
   getLeases: (id: string, params?: { limit?: number }) =>
@@ -1426,10 +1428,7 @@ export const dhcpApi = {
       .then((r) => r.data),
   createClientClass: (serverId: string, data: Partial<DHCPClientClass>) =>
     api
-      .post<DHCPClientClass>(
-        `/dhcp/servers/${serverId}/client-classes`,
-        data,
-      )
+      .post<DHCPClientClass>(`/dhcp/servers/${serverId}/client-classes`, data)
       .then((r) => r.data),
   updateClientClass: (
     _serverId: string,
@@ -1495,7 +1494,6 @@ export interface DHCPLease {
   expires_at: string | null;
   last_seen_at: string;
 }
-
 
 export const authApi = {
   login: (username: string, password: string) =>
