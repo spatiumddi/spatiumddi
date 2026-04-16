@@ -25,7 +25,7 @@ function suggestRange(
   if (parts.length !== 4 || parts.some((n) => isNaN(n))) return null;
   const netInt =
     ((parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3]) >>> 0;
-  const mask = prefix === 0 ? 0 : (0xffffffff << (32 - prefix)) >>> 0;
+  const mask = (0xffffffff << (32 - prefix)) >>> 0;
   const base = (netInt & mask) >>> 0;
   const hostBits = 32 - prefix;
   const total = 1 << hostBits;
