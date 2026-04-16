@@ -12,7 +12,7 @@
 <p align="center">
   <a href="https://github.com/spatiumddi/spatiumddi/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License"/></a>
   <a href="https://github.com/spatiumddi/spatiumddi/issues"><img src="https://img.shields.io/github/issues/spatiumddi/spatiumddi" alt="Issues"/></a>
-  <a href="https://spatiumddi.org"><img src="https://img.shields.io/badge/docs-spatiumddi.org-informational" alt="Docs"/></a>
+  <a href="https://spatiumddi.github.io"><img src="https://img.shields.io/badge/docs-github.io-informational" alt="Docs"/></a>
   <img src="https://img.shields.io/badge/status-alpha-orange" alt="Status"/>
   <img src="https://img.shields.io/badge/python-3.12+-green" alt="Python"/>
   <img src="https://img.shields.io/badge/react-18+-61DAFB" alt="React"/>
@@ -179,7 +179,7 @@ EOF
 
 ## Documentation
 
-Full docs at **[spatiumddi.org](https://spatiumddi.org)** (GitHub Pages — coming soon).
+Full docs at **[spatiumddi.github.io](https://spatiumddi.github.io)** (coming soon).
 
 | Document | Description |
 |---|---|
@@ -228,5 +228,5 @@ Bundled components (BIND9, ISC Kea) are distributed under their own licenses. Se
 ---
 
 <p align="center">
-  Built with ❤️ by the SpatiumDDI community · <a href="https://spatiumddi.org">spatiumddi.org</a>
+  Built with ❤️ by the SpatiumDDI community · <a href="https://spatiumddi.github.io">spatiumddi.github.io</a>
 </p>

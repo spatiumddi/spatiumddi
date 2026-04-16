@@ -3,7 +3,7 @@
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 > **GitHub Org:** https://github.com/spatiumddi  
-> **Docs:** https://spatiumddi.github.io (custom domain: https://spatiumddi.org — pending)  
+> **Docs:** https://spatiumddi.github.io  
 > **License:** Apache 2.0  
 > **Package:** `spatiumddi` on PyPI  
 > **Container registry:** `ghcr.io/spatiumddi/*`  

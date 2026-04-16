@@ -12,7 +12,7 @@
 
 **Do not report security vulnerabilities through public GitHub issues.**
 
-Please report security vulnerabilities by emailing **security@spatiumddi.org** (or open a [GitHub Security Advisory](https://github.com/spatiumddi/spatiumddi/security/advisories/new) on the repository).
+Please report security vulnerabilities by opening a [GitHub Security Advisory](https://github.com/spatiumddi/spatiumddi/security/advisories/new) on the repository.
 
 Include in your report:
 - Description of the vulnerability

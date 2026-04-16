@@ -1,3 +1,3 @@
 User-agent: *
 Allow: /
-Sitemap: https://spatiumddi.org/sitemap.xml
+Sitemap: https://spatiumddi.github.io/sitemap.xml
