@@ -140,7 +140,7 @@ class DHCPScope(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # DHCP options (JSONB map keyed by option name: routers, dns-servers,
     # domain-name, ntp-servers, tftp-server-name, bootfile-name,
     # tftp-server-address (150), etc.)
-    options: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    options: Mapped[dict] = mapped_column(JSONB, nullable=False, default=lambda: {})
 
     # DDNS
     ddns_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
