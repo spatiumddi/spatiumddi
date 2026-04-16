@@ -62,6 +62,8 @@ def save_token(state_dir: Path, token: str) -> None:
     except (PermissionError, FileNotFoundError):
         # Best-effort only: chmod may fail due to mount ownership/permissions,
         # or tmp may disappear under concurrent saves.
+        # Best-effort only: chmod may fail due to mount ownership/permissions,
+        # or tmp may disappear under concurrent saves.
         pass
     try:
         tmp.replace(path)
