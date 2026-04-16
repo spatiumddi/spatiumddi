@@ -912,6 +912,9 @@ class IPAddressResponse(BaseModel):
     dns_record_id: uuid.UUID | None = None
     dhcp_lease_id: str | None = None
     static_assignment_id: str | None = None
+    # Number of user-added CNAME/A alias records on this IP (excludes the primary A).
+    # Populated in list/get endpoints via a bulk lookup; defaults to 0 on other paths.
+    alias_count: int = 0
     created_at: datetime
     modified_at: datetime
 
@@ -2211,6 +2214,27 @@ async def backfill_reverse_zones_space(
 # ── IP Addresses ───────────────────────────────────────────────────────────────
 
 
+async def _alias_counts_for(db: AsyncSession, ips: list[IPAddress]) -> dict[uuid.UUID, int]:
+    """Return {ip_id: alias_count} excluding each IP's primary A record."""
+    if not ips:
+        return {}
+    ip_ids = [ip.id for ip in ips]
+    primary_ids = {ip.dns_record_id for ip in ips if ip.dns_record_id is not None}
+    conds = [
+        DNSRecord.ip_address_id.in_(ip_ids),
+        DNSRecord.auto_generated.is_(True),
+        DNSRecord.record_type.in_(["CNAME", "A"]),
+    ]
+    if primary_ids:
+        conds.append(DNSRecord.id.notin_(primary_ids))
+    q = (
+        select(DNSRecord.ip_address_id, func.count(DNSRecord.id))
+        .where(*conds)
+        .group_by(DNSRecord.ip_address_id)
+    )
+    return {row[0]: row[1] for row in (await db.execute(q)).all()}
+
+
 @router.get("/subnets/{subnet_id}/addresses", response_model=list[IPAddressResponse])
 async def list_addresses(
     subnet_id: uuid.UUID,
@@ -2228,8 +2252,11 @@ async def list_addresses(
     )
     if status_filter:
         query = query.where(IPAddress.status == status_filter)
-    result = await db.execute(query)
-    return list(result.scalars().all())
+    rows = list((await db.execute(query)).scalars().all())
+    counts = await _alias_counts_for(db, rows)
+    for ip in rows:
+        ip.alias_count = counts.get(ip.id, 0)  # type: ignore[attr-defined]
+    return rows
 
 
 @router.post(
@@ -3075,4 +3102,311 @@ async def get_effective_fields(
         custom_fields=custom_fields,
         tag_sources=tag_sources,
         custom_field_sources=custom_field_sources,
+    )
+
+
+# ── Subnet aliases (aggregate CNAME/A records for every IP in the subnet) ─────
+
+
+class SubnetAliasResponse(BaseModel):
+    id: uuid.UUID
+    zone_id: uuid.UUID
+    name: str
+    record_type: str
+    value: str
+    fqdn: str
+    ip_address_id: uuid.UUID
+    ip_address: str
+    ip_hostname: str | None
+
+    model_config = {"from_attributes": True}
+
+
+@router.get("/subnets/{subnet_id}/aliases", response_model=list[SubnetAliasResponse])
+async def list_subnet_aliases(
+    subnet_id: uuid.UUID,
+    current_user: CurrentUser,
+    db: DB,
+) -> list[SubnetAliasResponse]:
+    """List every user-added DNS alias (CNAME or secondary A) for IPs in this subnet.
+
+    Primary A records (pointed to by ``IPAddress.dns_record_id``) are excluded.
+    """
+    if await db.get(Subnet, subnet_id) is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
+
+    ips = list(
+        (await db.execute(select(IPAddress).where(IPAddress.subnet_id == subnet_id)))
+        .scalars()
+        .all()
+    )
+    if not ips:
+        return []
+    ip_by_id = {ip.id: ip for ip in ips}
+    primary_ids = {ip.dns_record_id for ip in ips if ip.dns_record_id is not None}
+    conds = [
+        DNSRecord.ip_address_id.in_(list(ip_by_id.keys())),
+        DNSRecord.auto_generated.is_(True),
+        DNSRecord.record_type.in_(["CNAME", "A"]),
+    ]
+    if primary_ids:
+        conds.append(DNSRecord.id.notin_(primary_ids))
+    records = list((await db.execute(select(DNSRecord).where(*conds))).scalars().all())
+    out: list[SubnetAliasResponse] = []
+    for rec in records:
+        ip = ip_by_id.get(rec.ip_address_id) if rec.ip_address_id else None
+        if ip is None:
+            continue
+        out.append(
+            SubnetAliasResponse(
+                id=rec.id,
+                zone_id=rec.zone_id,
+                name=rec.name,
+                record_type=rec.record_type,
+                value=rec.value,
+                fqdn=rec.fqdn,
+                ip_address_id=ip.id,
+                ip_address=str(ip.address),
+                ip_hostname=ip.hostname,
+            )
+        )
+    out.sort(key=lambda a: (a.ip_address, a.record_type, a.name))
+    return out
+
+
+# ── IP address bulk delete / bulk edit ────────────────────────────────────────
+
+
+class IPAddressBulkDeleteRequest(BaseModel):
+    ip_ids: list[uuid.UUID]
+    permanent: bool = False
+
+
+class IPAddressBulkDeleteResponse(BaseModel):
+    deleted_count: int
+    not_found: list[uuid.UUID] = []
+    skipped: list[uuid.UUID] = []  # system rows (network/broadcast) or already-orphaned
+
+
+@router.post("/addresses/bulk-delete", response_model=IPAddressBulkDeleteResponse)
+async def bulk_delete_addresses(
+    body: IPAddressBulkDeleteRequest,
+    current_user: CurrentUser,
+    db: DB,
+) -> IPAddressBulkDeleteResponse:
+    """Soft-delete (→ orphan) or permanently delete multiple IPs in one call.
+
+    System rows (``network``/``broadcast``) are always skipped. When
+    ``permanent=False``, rows already in ``orphan`` are skipped; when
+    ``permanent=True``, any row is purged.
+    """
+    if not body.ip_ids:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="ip_ids must not be empty",
+        )
+    batch_id = uuid.uuid4()
+    rows = list(
+        (await db.execute(select(IPAddress).where(IPAddress.id.in_(body.ip_ids)))).scalars().all()
+    )
+    found_ids = {ip.id for ip in rows}
+    not_found = [i for i in body.ip_ids if i not in found_ids]
+    deleted = 0
+    skipped: list[uuid.UUID] = []
+    subnets_touched: set[uuid.UUID] = set()
+
+    for ip in rows:
+        if ip.status in ("network", "broadcast"):
+            skipped.append(ip.id)
+            continue
+        if not body.permanent and ip.status == "orphan":
+            skipped.append(ip.id)
+            continue
+        subnet = await db.get(Subnet, ip.subnet_id)
+        if subnet is not None:
+            try:
+                await _sync_dns_record(db, ip, subnet, action="delete")
+            except Exception:  # noqa: BLE001
+                pass
+        if body.permanent:
+            db.add(
+                _audit(
+                    current_user,
+                    "delete",
+                    "ip_address",
+                    str(ip.id),
+                    str(ip.address),
+                    old_value={"address": str(ip.address), "status": ip.status},
+                    new_value={"batch_id": str(batch_id)},
+                )
+            )
+            await db.delete(ip)
+        else:
+            old_status = ip.status
+            ip.status = "orphan"
+            db.add(
+                _audit(
+                    current_user,
+                    "update",
+                    "ip_address",
+                    str(ip.id),
+                    str(ip.address),
+                    old_value={"status": old_status},
+                    new_value={"status": "orphan", "batch_id": str(batch_id)},
+                )
+            )
+        subnets_touched.add(ip.subnet_id)
+        deleted += 1
+
+    await db.flush()
+    for sid in subnets_touched:
+        await _update_utilization(db, sid)
+        s = await db.get(Subnet, sid)
+        if s is not None:
+            await _update_block_utilization(db, s.block_id)
+    await db.commit()
+    logger.info(
+        "ip_address_bulk_delete",
+        user=current_user.username,
+        batch_id=str(batch_id),
+        requested=len(body.ip_ids),
+        deleted=deleted,
+        permanent=body.permanent,
+    )
+    return IPAddressBulkDeleteResponse(deleted_count=deleted, not_found=not_found, skipped=skipped)
+
+
+_IP_BULK_ALLOWED_STATUSES = {
+    "available",
+    "allocated",
+    "reserved",
+    "static_dhcp",
+    "deprecated",
+}
+
+
+class IPAddressBulkChanges(BaseModel):
+    status: str | None = None
+    description: str | None = None
+    # Merged into existing dicts (set key=null to remove).
+    tags: dict[str, Any] | None = None
+    custom_fields: dict[str, Any] | None = None
+
+    @field_validator("status")
+    @classmethod
+    def _validate_status(cls, v: str | None) -> str | None:
+        if v is not None and v not in _IP_BULK_ALLOWED_STATUSES:
+            raise ValueError(
+                f"status must be one of: {', '.join(sorted(_IP_BULK_ALLOWED_STATUSES))}"
+            )
+        return v
+
+
+class IPAddressBulkEditRequest(BaseModel):
+    ip_ids: list[uuid.UUID]
+    changes: IPAddressBulkChanges
+
+
+class IPAddressBulkEditResponse(BaseModel):
+    batch_id: uuid.UUID
+    updated_count: int
+    not_found: list[uuid.UUID] = []
+    skipped: list[uuid.UUID] = []
+
+
+@router.post("/addresses/bulk-edit", response_model=IPAddressBulkEditResponse)
+async def bulk_edit_addresses(
+    body: IPAddressBulkEditRequest,
+    current_user: CurrentUser,
+    db: DB,
+) -> IPAddressBulkEditResponse:
+    """Apply the same change set to multiple IPs.
+
+    * ``status`` and ``description`` replace the existing value.
+    * ``tags`` and ``custom_fields`` are **merged** into the existing dicts —
+      set a key to ``null`` to remove it. This matches UX expectations when
+      bulk-tagging a set of IPs.
+    * System rows (``network``/``broadcast``/``orphan``) are skipped.
+    """
+    changes = body.changes.model_dump(exclude_none=True)
+    if not changes:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="At least one field must be provided in changes",
+        )
+    if not body.ip_ids:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="ip_ids must not be empty",
+        )
+
+    batch_id = uuid.uuid4()
+    rows = list(
+        (await db.execute(select(IPAddress).where(IPAddress.id.in_(body.ip_ids)))).scalars().all()
+    )
+    found_ids = {ip.id for ip in rows}
+    not_found = [i for i in body.ip_ids if i not in found_ids]
+    updated = 0
+    skipped: list[uuid.UUID] = []
+
+    tags_patch = body.changes.tags
+    cf_patch = body.changes.custom_fields
+    scalar_changes = {k: v for k, v in changes.items() if k in ("status", "description")}
+
+    for ip in rows:
+        if ip.status in ("network", "broadcast", "orphan"):
+            skipped.append(ip.id)
+            continue
+
+        old: dict[str, Any] = {}
+        for k in scalar_changes:
+            old[k] = getattr(ip, k, None)
+        for k, v in scalar_changes.items():
+            setattr(ip, k, v)
+
+        if tags_patch is not None:
+            merged = dict(ip.tags or {})
+            for k, v in tags_patch.items():
+                if v is None:
+                    merged.pop(k, None)
+                else:
+                    merged[k] = v
+            old["tags"] = ip.tags or {}
+            ip.tags = merged
+        if cf_patch is not None:
+            merged_cf = dict(ip.custom_fields or {})
+            for k, v in cf_patch.items():
+                if v is None:
+                    merged_cf.pop(k, None)
+                else:
+                    merged_cf[k] = v
+            old["custom_fields"] = ip.custom_fields or {}
+            ip.custom_fields = merged_cf
+
+        db.add(
+            _audit(
+                current_user,
+                "update",
+                "ip_address",
+                str(ip.id),
+                str(ip.address),
+                old_value={k: (str(v) if isinstance(v, uuid.UUID) else v) for k, v in old.items()},
+                new_value={**changes, "batch_id": str(batch_id)},
+            )
+        )
+        updated += 1
+
+    await db.commit()
+    logger.info(
+        "ip_address_bulk_edit",
+        user=current_user.username,
+        batch_id=str(batch_id),
+        requested=len(body.ip_ids),
+        updated=updated,
+    )
+    return IPAddressBulkEditResponse(
+        batch_id=batch_id,
+        updated_count=updated,
+        not_found=not_found,
+        skipped=skipped,
     )

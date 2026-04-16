@@ -1783,9 +1783,12 @@ function SubnetDetail({
   const [showOrphans, setShowOrphans] = useState(false);
   const [editingAddress, setEditingAddress] = useState<IPAddress | null>(null);
   const [showFilters, setShowFilters] = useState(false);
-  const [activeSubnetTab, setActiveSubnetTab] = useState<"addresses" | "dhcp">(
-    "addresses",
-  );
+  const [activeSubnetTab, setActiveSubnetTab] = useState<
+    "addresses" | "dhcp" | "aliases"
+  >("addresses");
+  const [selectedIpIds, setSelectedIpIds] = useState<Set<string>>(new Set());
+  const [showBulkEdit, setShowBulkEdit] = useState(false);
+  const [showBulkDelete, setShowBulkDelete] = useState(false);
 
   type FilterMode = "contains" | "begins" | "ends" | "regex";
   const [colFilters, setColFilters] = useState({
@@ -1815,6 +1818,7 @@ function SubnetDetail({
     });
     setFilterModes({});
     setShowFilters(false);
+    setSelectedIpIds(new Set());
   }, [subnet.id]);
 
   const { data: addresses, isLoading } = useQuery({
@@ -2124,9 +2128,9 @@ function SubnetDetail({
         </div>
       </div>
 
-      {/* Tabs: Addresses | DHCP */}
+      {/* Tabs: Addresses | DHCP | Aliases — bulk actions appear inline when IPs selected */}
       <div className="border-b bg-card px-4">
-        <div className="flex gap-1">
+        <div className="flex items-center gap-1">
           <button
             onClick={() => setActiveSubnetTab("addresses")}
             className={cn(
@@ -2149,12 +2153,58 @@ function SubnetDetail({
           >
             DHCP Pools
           </button>
+          <button
+            onClick={() => setActiveSubnetTab("aliases")}
+            className={cn(
+              "px-3 py-2 text-xs font-medium border-b-2 -mb-px transition-colors",
+              activeSubnetTab === "aliases"
+                ? "border-primary text-foreground"
+                : "border-transparent text-muted-foreground hover:text-foreground",
+            )}
+          >
+            Aliases
+          </button>
+          {activeSubnetTab === "addresses" && selectedIpIds.size > 0 && (
+            <div className="ml-auto flex items-center gap-2 py-1">
+              <span className="text-xs font-medium text-muted-foreground">
+                {selectedIpIds.size} {selectedIpIds.size === 1 ? "IP" : "IPs"}{" "}
+                selected
+              </span>
+              <button
+                onClick={() => setShowBulkEdit(true)}
+                className="flex items-center gap-1.5 rounded-md border bg-background px-2.5 py-1 text-xs hover:bg-accent"
+              >
+                <Pencil className="h-3 w-3" />
+                Bulk edit
+              </button>
+              <button
+                onClick={() => setShowBulkDelete(true)}
+                className="flex items-center gap-1.5 rounded-md border border-destructive/40 bg-background px-2.5 py-1 text-xs text-destructive hover:bg-destructive/10"
+              >
+                <Trash2 className="h-3 w-3" />
+                Bulk delete
+              </button>
+              <button
+                onClick={() => setSelectedIpIds(new Set())}
+                className="rounded-md p-1 text-muted-foreground hover:text-foreground"
+                title="Clear selection"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            </div>
+          )}
         </div>
       </div>
 
       {activeSubnetTab === "dhcp" && (
         <div className="flex-1 overflow-auto">
           <DHCPSubnetPanel subnetId={subnet.id} />
+        </div>
+      )}
+
+      {activeSubnetTab === "aliases" && (
+        <div className="flex-1 overflow-auto">
+          <AliasesSubnetPanel subnetId={subnet.id} />
         </div>
       )}
 
@@ -2180,75 +2230,41 @@ function SubnetDetail({
               </button>
             </div>
           ) : (
-            <table className="w-full text-sm">
-              <thead>
-                <tr className="border-b bg-muted/40 text-xs">
-                  {(
-                    [
-                      "address",
-                      "hostname",
-                      "mac",
-                      "description",
-                      "status",
-                      "pool",
-                      "dns",
-                    ] as const
-                  ).map((col) => {
-                    const label =
-                      col === "mac"
-                        ? "MAC"
-                        : col === "dns"
-                          ? "DNS"
-                          : col === "pool"
-                            ? "DHCP Pool"
-                            : col;
-                    return (
-                      <th key={col} className="px-4 py-2 text-left font-medium">
-                        <span className="inline-flex items-center gap-1">
-                          <span className="capitalize">{label}</span>
-                          <button
-                            onClick={() => setShowFilters((v) => !v)}
-                            title={`Filter by ${label}`}
-                            className={cn(
-                              "rounded p-0.5 hover:bg-accent",
-                              colFilters[col]
-                                ? "text-primary"
-                                : showFilters
-                                  ? "text-primary/40"
-                                  : "text-muted-foreground/30 hover:text-muted-foreground",
-                            )}
-                          >
-                            <Filter className="h-2.5 w-2.5" />
-                          </button>
-                        </span>
-                      </th>
-                    );
-                  })}
-                  <th className="px-4 py-2 text-right">
-                    {hasActiveFilter && (
-                      <button
-                        onClick={() => {
-                          setColFilters({
-                            address: "",
-                            hostname: "",
-                            mac: "",
-                            description: "",
-                            status: "",
-                            dns: "",
-                            pool: "",
-                          });
-                          setFilterModes({});
-                        }}
-                        title="Clear all filters"
-                        className="rounded p-0.5 text-primary hover:text-destructive"
-                      >
-                        <X className="h-3 w-3" />
-                      </button>
-                    )}
-                  </th>
-                </tr>
-                {showFilters && (
-                  <tr className="border-b bg-muted/10 text-xs">
+            <>
+              <table className="w-full text-sm">
+                <thead>
+                  <tr className="border-b bg-muted/40 text-xs">
+                    <th className="w-8 px-2 py-2">
+                      {(() => {
+                        const selectable = (filteredAddresses ?? []).filter(
+                          (a: IPAddress) =>
+                            a.status !== "network" && a.status !== "broadcast",
+                        );
+                        const allSelected =
+                          selectable.length > 0 &&
+                          selectable.every((a: IPAddress) =>
+                            selectedIpIds.has(a.id),
+                          );
+                        return (
+                          <input
+                            type="checkbox"
+                            checked={allSelected}
+                            aria-label="Select all"
+                            onChange={(e) => {
+                              if (e.target.checked) {
+                                setSelectedIpIds(
+                                  new Set(
+                                    selectable.map((a: IPAddress) => a.id),
+                                  ),
+                                );
+                              } else {
+                                setSelectedIpIds(new Set());
+                              }
+                            }}
+                          />
+                        );
+                      })()}
+                    </th>
                     {(
                       [
                         "address",
@@ -2259,274 +2275,381 @@ function SubnetDetail({
                         "pool",
                         "dns",
                       ] as const
-                    ).map((col) => (
-                      <td key={col} className="px-2 py-1">
-                        {col === "status" ? (
-                          <select
-                            value={colFilters.status}
-                            onChange={(e) =>
-                              setColFilters((p) => ({
-                                ...p,
-                                status: e.target.value,
-                              }))
-                            }
-                            className="w-full rounded border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
-                          >
-                            <option value="">All</option>
-                            {[
-                              "allocated",
-                              "available",
-                              "reserved",
-                              "dhcp",
-                              "static_dhcp",
-                              "network",
-                              "broadcast",
-                              "orphan",
-                            ].map((s) => (
-                              <option key={s} value={s}>
-                                {s}
-                              </option>
-                            ))}
-                          </select>
-                        ) : col === "dns" ? (
-                          <select
-                            value={colFilters.dns}
-                            onChange={(e) =>
-                              setColFilters((p) => ({
-                                ...p,
-                                dns: e.target.value,
-                              }))
-                            }
-                            className="w-full rounded border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
-                          >
-                            <option value="">All</option>
-                            <option value="in-sync">In sync</option>
-                            <option value="out-of-sync">Out of sync</option>
-                            <option value="n/a">N/A</option>
-                          </select>
-                        ) : (
-                          <div className="flex items-center">
-                            <input
-                              type="text"
-                              value={colFilters[col]}
+                    ).map((col) => {
+                      const label =
+                        col === "mac"
+                          ? "MAC"
+                          : col === "dns"
+                            ? "DNS"
+                            : col === "pool"
+                              ? "DHCP Pool"
+                              : col;
+                      return (
+                        <th
+                          key={col}
+                          className="px-4 py-2 text-left font-medium"
+                        >
+                          <span className="inline-flex items-center gap-1">
+                            <span className="capitalize">{label}</span>
+                            <button
+                              onClick={() => setShowFilters((v) => !v)}
+                              title={`Filter by ${label}`}
+                              className={cn(
+                                "rounded p-0.5 hover:bg-accent",
+                                colFilters[col]
+                                  ? "text-primary"
+                                  : showFilters
+                                    ? "text-primary/40"
+                                    : "text-muted-foreground/30 hover:text-muted-foreground",
+                              )}
+                            >
+                              <Filter className="h-2.5 w-2.5" />
+                            </button>
+                          </span>
+                        </th>
+                      );
+                    })}
+                    <th className="px-4 py-2 text-right">
+                      {hasActiveFilter && (
+                        <button
+                          onClick={() => {
+                            setColFilters({
+                              address: "",
+                              hostname: "",
+                              mac: "",
+                              description: "",
+                              status: "",
+                              dns: "",
+                              pool: "",
+                            });
+                            setFilterModes({});
+                          }}
+                          title="Clear all filters"
+                          className="rounded p-0.5 text-primary hover:text-destructive"
+                        >
+                          <X className="h-3 w-3" />
+                        </button>
+                      )}
+                    </th>
+                  </tr>
+                  {showFilters && (
+                    <tr className="border-b bg-muted/10 text-xs">
+                      <td />
+                      {(
+                        [
+                          "address",
+                          "hostname",
+                          "mac",
+                          "description",
+                          "status",
+                          "pool",
+                          "dns",
+                        ] as const
+                      ).map((col) => (
+                        <td key={col} className="px-2 py-1">
+                          {col === "status" ? (
+                            <select
+                              value={colFilters.status}
                               onChange={(e) =>
                                 setColFilters((p) => ({
                                   ...p,
-                                  [col]: e.target.value,
+                                  status: e.target.value,
                                 }))
                               }
-                              placeholder="Filter…"
-                              className="w-full min-w-0 rounded-l border border-r-0 bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
-                            />
-                            <div className="relative">
-                              <button
-                                type="button"
-                                onClick={() =>
-                                  setOpenFilterMenu(
-                                    openFilterMenu === col ? null : col,
-                                  )
+                              className="w-full rounded border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
+                            >
+                              <option value="">All</option>
+                              {[
+                                "allocated",
+                                "available",
+                                "reserved",
+                                "dhcp",
+                                "static_dhcp",
+                                "network",
+                                "broadcast",
+                                "orphan",
+                              ].map((s) => (
+                                <option key={s} value={s}>
+                                  {s}
+                                </option>
+                              ))}
+                            </select>
+                          ) : col === "dns" ? (
+                            <select
+                              value={colFilters.dns}
+                              onChange={(e) =>
+                                setColFilters((p) => ({
+                                  ...p,
+                                  dns: e.target.value,
+                                }))
+                              }
+                              className="w-full rounded border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
+                            >
+                              <option value="">All</option>
+                              <option value="in-sync">In sync</option>
+                              <option value="out-of-sync">Out of sync</option>
+                              <option value="n/a">N/A</option>
+                            </select>
+                          ) : (
+                            <div className="flex items-center">
+                              <input
+                                type="text"
+                                value={colFilters[col]}
+                                onChange={(e) =>
+                                  setColFilters((p) => ({
+                                    ...p,
+                                    [col]: e.target.value,
+                                  }))
                                 }
-                                className="rounded-r border bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground hover:bg-accent"
-                                title="Filter mode"
-                              >
-                                {filterModes[col] === "begins"
-                                  ? "^"
-                                  : filterModes[col] === "ends"
-                                    ? "$"
-                                    : filterModes[col] === "regex"
-                                      ? ".*"
-                                      : "⊂"}
-                              </button>
-                              {openFilterMenu === col && (
-                                <div className="absolute left-0 top-full z-30 mt-0.5 w-32 rounded-md border bg-popover shadow-md">
-                                  {(
-                                    [
-                                      "contains",
-                                      "begins",
-                                      "ends",
-                                      "regex",
-                                    ] as const
-                                  ).map((m) => (
-                                    <button
-                                      key={m}
-                                      type="button"
-                                      onClick={() => {
-                                        setFilterModes((p) => ({
-                                          ...p,
-                                          [col]: m,
-                                        }));
-                                        setOpenFilterMenu(null);
-                                      }}
-                                      className={cn(
-                                        "w-full px-3 py-1.5 text-left text-xs hover:bg-accent",
-                                        filterModes[col] === m &&
-                                          "font-semibold text-primary",
-                                      )}
-                                    >
-                                      {m === "contains"
-                                        ? "⊂ Contains"
-                                        : m === "begins"
-                                          ? "^ Begins"
-                                          : m === "ends"
-                                            ? "$ Ends"
-                                            : ".* Regex"}
-                                    </button>
-                                  ))}
-                                </div>
-                              )}
+                                placeholder="Filter…"
+                                className="w-full min-w-0 rounded-l border border-r-0 bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
+                              />
+                              <div className="relative">
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    setOpenFilterMenu(
+                                      openFilterMenu === col ? null : col,
+                                    )
+                                  }
+                                  className="rounded-r border bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground hover:bg-accent"
+                                  title="Filter mode"
+                                >
+                                  {filterModes[col] === "begins"
+                                    ? "^"
+                                    : filterModes[col] === "ends"
+                                      ? "$"
+                                      : filterModes[col] === "regex"
+                                        ? ".*"
+                                        : "⊂"}
+                                </button>
+                                {openFilterMenu === col && (
+                                  <div className="absolute left-0 top-full z-30 mt-0.5 w-32 rounded-md border bg-popover shadow-md">
+                                    {(
+                                      [
+                                        "contains",
+                                        "begins",
+                                        "ends",
+                                        "regex",
+                                      ] as const
+                                    ).map((m) => (
+                                      <button
+                                        key={m}
+                                        type="button"
+                                        onClick={() => {
+                                          setFilterModes((p) => ({
+                                            ...p,
+                                            [col]: m,
+                                          }));
+                                          setOpenFilterMenu(null);
+                                        }}
+                                        className={cn(
+                                          "w-full px-3 py-1.5 text-left text-xs hover:bg-accent",
+                                          filterModes[col] === m &&
+                                            "font-semibold text-primary",
+                                        )}
+                                      >
+                                        {m === "contains"
+                                          ? "⊂ Contains"
+                                          : m === "begins"
+                                            ? "^ Begins"
+                                            : m === "ends"
+                                              ? "$ Ends"
+                                              : ".* Regex"}
+                                      </button>
+                                    ))}
+                                  </div>
+                                )}
+                              </div>
                             </div>
-                          </div>
+                          )}
+                        </td>
+                      ))}
+                      <td />
+                    </tr>
+                  )}
+                </thead>
+                <tbody>
+                  {filteredAddresses?.length === 0 && (
+                    <tr>
+                      <td
+                        colSpan={9}
+                        className="px-4 py-6 text-center text-sm text-muted-foreground"
+                      >
+                        No addresses match the active filters.
+                      </td>
+                    </tr>
+                  )}
+                  {filteredAddresses?.map((addr: IPAddress) => {
+                    const dnsState = ipDnsState(addr);
+                    const systemRow =
+                      addr.status === "network" || addr.status === "broadcast";
+                    const rowSelected = selectedIpIds.has(addr.id);
+                    return (
+                      <tr
+                        key={addr.id}
+                        className={cn(
+                          "group/addr border-b last:border-0 hover:bg-muted/20",
+                          (addr.status === "network" ||
+                            addr.status === "broadcast") &&
+                            "opacity-50",
+                          addr.status === "orphan" && "opacity-40",
+                          rowSelected && "bg-primary/5",
                         )}
-                      </td>
-                    ))}
-                    <td />
-                  </tr>
-                )}
-              </thead>
-              <tbody>
-                {filteredAddresses?.length === 0 && (
-                  <tr>
-                    <td
-                      colSpan={7}
-                      className="px-4 py-6 text-center text-sm text-muted-foreground"
-                    >
-                      No addresses match the active filters.
-                    </td>
-                  </tr>
-                )}
-                {filteredAddresses?.map((addr: IPAddress) => {
-                  const dnsState = ipDnsState(addr);
-                  return (
-                    <tr
-                      key={addr.id}
-                      className={cn(
-                        "group/addr border-b last:border-0 hover:bg-muted/20",
-                        (addr.status === "network" ||
-                          addr.status === "broadcast") &&
-                          "opacity-50",
-                        addr.status === "orphan" && "opacity-40",
-                      )}
-                    >
-                      <td className="px-4 py-2 font-mono font-medium">
-                        <span className="inline-flex items-center gap-0.5">
-                          {addr.address}
-                          <CopyButton text={addr.address} />
-                        </span>
-                      </td>
-                      <td className="px-4 py-2">
-                        {addr.fqdn ? (
-                          <span className="font-mono text-xs">{addr.fqdn}</span>
-                        ) : addr.hostname ? (
-                          <span className="text-muted-foreground">
-                            {addr.hostname}
+                      >
+                        <td className="w-8 px-2 py-2">
+                          {!systemRow && (
+                            <input
+                              type="checkbox"
+                              checked={rowSelected}
+                              aria-label={`Select ${addr.address}`}
+                              onChange={(e) => {
+                                setSelectedIpIds((prev) => {
+                                  const next = new Set(prev);
+                                  if (e.target.checked) next.add(addr.id);
+                                  else next.delete(addr.id);
+                                  return next;
+                                });
+                              }}
+                            />
+                          )}
+                        </td>
+                        <td className="px-4 py-2 font-mono font-medium">
+                          <span className="inline-flex items-center gap-0.5">
+                            {addr.address}
+                            <CopyButton text={addr.address} />
                           </span>
-                        ) : (
-                          <span className="text-muted-foreground/40">—</span>
-                        )}
-                      </td>
-                      <td className="px-4 py-2 font-mono text-xs">
-                        {addr.mac_address ?? (
-                          <span className="text-muted-foreground/40">—</span>
-                        )}
-                      </td>
-                      <td className="px-4 py-2 text-muted-foreground">
-                        {addr.description ?? (
-                          <span className="text-muted-foreground/40">—</span>
-                        )}
-                      </td>
-                      <td className="px-4 py-2">
-                        <StatusBadge status={addr.status} />
-                      </td>
-                      <td className="px-4 py-2">
-                        {(() => {
-                          const pi = ipPoolInfo(addr);
-                          if (!pi)
-                            return (
+                        </td>
+                        <td className="px-4 py-2">
+                          <span className="inline-flex items-center gap-1.5">
+                            {addr.fqdn ? (
+                              <span className="font-mono text-xs">
+                                {addr.fqdn}
+                              </span>
+                            ) : addr.hostname ? (
+                              <span className="text-muted-foreground">
+                                {addr.hostname}
+                              </span>
+                            ) : (
                               <span className="text-muted-foreground/40">
                                 —
                               </span>
+                            )}
+                            {(addr.alias_count ?? 0) > 0 && (
+                              <span
+                                className="inline-flex items-center rounded bg-indigo-100 px-1.5 py-0.5 text-[10px] font-medium text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-400"
+                                title={`${addr.alias_count} alias${(addr.alias_count ?? 0) === 1 ? "" : "es"} — edit IP to view`}
+                              >
+                                +{addr.alias_count}{" "}
+                                {addr.alias_count === 1 ? "alias" : "aliases"}
+                              </span>
+                            )}
+                          </span>
+                        </td>
+                        <td className="px-4 py-2 font-mono text-xs">
+                          {addr.mac_address ?? (
+                            <span className="text-muted-foreground/40">—</span>
+                          )}
+                        </td>
+                        <td className="px-4 py-2 text-muted-foreground">
+                          {addr.description ?? (
+                            <span className="text-muted-foreground/40">—</span>
+                          )}
+                        </td>
+                        <td className="px-4 py-2">
+                          <StatusBadge status={addr.status} />
+                        </td>
+                        <td className="px-4 py-2">
+                          {(() => {
+                            const pi = ipPoolInfo(addr);
+                            if (!pi)
+                              return (
+                                <span className="text-muted-foreground/40">
+                                  —
+                                </span>
+                              );
+                            const cls =
+                              pi.type === "dynamic"
+                                ? "bg-cyan-100 text-cyan-800 dark:bg-cyan-900/30 dark:text-cyan-400"
+                                : pi.type === "reserved"
+                                  ? "bg-violet-100 text-violet-800 dark:bg-violet-900/30 dark:text-violet-400"
+                                  : "bg-zinc-100 text-zinc-600 dark:bg-zinc-800/30 dark:text-zinc-400";
+                            return (
+                              <span
+                                className={`inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium ${cls}`}
+                              >
+                                {pi.name}
+                              </span>
                             );
-                          const cls =
-                            pi.type === "dynamic"
-                              ? "bg-cyan-100 text-cyan-800 dark:bg-cyan-900/30 dark:text-cyan-400"
-                              : pi.type === "reserved"
-                                ? "bg-violet-100 text-violet-800 dark:bg-violet-900/30 dark:text-violet-400"
-                                : "bg-zinc-100 text-zinc-600 dark:bg-zinc-800/30 dark:text-zinc-400";
-                          return (
+                          })()}
+                        </td>
+                        <td className="px-4 py-2">
+                          {dnsState === "in-sync" ? (
                             <span
-                              className={`inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium ${cls}`}
+                              className="inline-flex items-center gap-1 text-xs text-emerald-600"
+                              title="DNS records match IPAM"
                             >
-                              {pi.name}
+                              <span className="inline-block h-1.5 w-1.5 rounded-full bg-emerald-500" />
+                              in sync
                             </span>
-                          );
-                        })()}
-                      </td>
-                      <td className="px-4 py-2">
-                        {dnsState === "in-sync" ? (
-                          <span
-                            className="inline-flex items-center gap-1 text-xs text-emerald-600"
-                            title="DNS records match IPAM"
-                          >
-                            <span className="inline-block h-1.5 w-1.5 rounded-full bg-emerald-500" />
-                            in sync
-                          </span>
-                        ) : dnsState === "out-of-sync" ? (
-                          <span
-                            className="inline-flex items-center gap-1 text-xs text-amber-600"
-                            title="DNS records are missing or differ — open Check DNS Sync to reconcile"
-                          >
-                            <span className="inline-block h-1.5 w-1.5 rounded-full bg-amber-500" />
-                            out of sync
-                          </span>
-                        ) : (
-                          <span className="text-muted-foreground/40">—</span>
-                        )}
-                      </td>
-                      <td className="px-4 py-2 text-right">
-                        <div className="flex items-center justify-end gap-1">
-                          {addr.status === "orphan" ? (
-                            <>
-                              <button
-                                onClick={() => restoreAddr.mutate(addr.id)}
-                                disabled={restoreAddr.isPending}
-                                className="rounded p-1 text-xs text-muted-foreground hover:text-green-600"
-                                title="Restore (mark as allocated)"
-                              >
-                                <RefreshCw className="h-3.5 w-3.5" />
-                              </button>
-                              <button
-                                onClick={() => setConfirmPurgeAddr(addr)}
-                                className="rounded p-1 text-muted-foreground hover:text-destructive"
-                                title="Permanently delete"
-                              >
-                                <Trash2 className="h-3.5 w-3.5" />
-                              </button>
-                            </>
-                          ) : !isReadOnly(addr.status) ? (
-                            <>
-                              <button
-                                onClick={() => setEditingAddress(addr)}
-                                className="rounded p-1 text-muted-foreground hover:text-foreground"
-                                title="Edit"
-                              >
-                                <Pencil className="h-3.5 w-3.5" />
-                              </button>
-                              <button
-                                onClick={() => setConfirmDeleteAddr(addr)}
-                                className="rounded p-1 text-muted-foreground hover:text-destructive"
-                                title="Delete"
-                              >
-                                <Trash2 className="h-3.5 w-3.5" />
-                              </button>
-                            </>
-                          ) : null}
-                        </div>
-                      </td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
+                          ) : dnsState === "out-of-sync" ? (
+                            <span
+                              className="inline-flex items-center gap-1 text-xs text-amber-600"
+                              title="DNS records are missing or differ — open Check DNS Sync to reconcile"
+                            >
+                              <span className="inline-block h-1.5 w-1.5 rounded-full bg-amber-500" />
+                              out of sync
+                            </span>
+                          ) : (
+                            <span className="text-muted-foreground/40">—</span>
+                          )}
+                        </td>
+                        <td className="px-4 py-2 text-right">
+                          <div className="flex items-center justify-end gap-1">
+                            {addr.status === "orphan" ? (
+                              <>
+                                <button
+                                  onClick={() => restoreAddr.mutate(addr.id)}
+                                  disabled={restoreAddr.isPending}
+                                  className="rounded p-1 text-xs text-muted-foreground hover:text-green-600"
+                                  title="Restore (mark as allocated)"
+                                >
+                                  <RefreshCw className="h-3.5 w-3.5" />
+                                </button>
+                                <button
+                                  onClick={() => setConfirmPurgeAddr(addr)}
+                                  className="rounded p-1 text-muted-foreground hover:text-destructive"
+                                  title="Permanently delete"
+                                >
+                                  <Trash2 className="h-3.5 w-3.5" />
+                                </button>
+                              </>
+                            ) : !isReadOnly(addr.status) ? (
+                              <>
+                                <button
+                                  onClick={() => setEditingAddress(addr)}
+                                  className="rounded p-1 text-muted-foreground hover:text-foreground"
+                                  title="Edit"
+                                >
+                                  <Pencil className="h-3.5 w-3.5" />
+                                </button>
+                                <button
+                                  onClick={() => setConfirmDeleteAddr(addr)}
+                                  className="rounded p-1 text-muted-foreground hover:text-destructive"
+                                  title="Delete"
+                                >
+                                  <Trash2 className="h-3.5 w-3.5" />
+                                </button>
+                              </>
+                            ) : null}
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </>
           )}
         </div>
       )}
@@ -2587,6 +2710,28 @@ function SubnetDetail({
           onConfirm={() => purgeAddr.mutate(confirmPurgeAddr.id)}
           onClose={() => setConfirmPurgeAddr(null)}
           isPending={purgeAddr.isPending}
+        />
+      )}
+      {showBulkEdit && (
+        <BulkEditAddressesModal
+          ipIds={[...selectedIpIds]}
+          subnetId={subnet.id}
+          onClose={() => setShowBulkEdit(false)}
+          onDone={() => {
+            setShowBulkEdit(false);
+            setSelectedIpIds(new Set());
+          }}
+        />
+      )}
+      {showBulkDelete && (
+        <BulkDeleteAddressesModal
+          ipIds={[...selectedIpIds]}
+          subnetId={subnet.id}
+          onClose={() => setShowBulkDelete(false)}
+          onDone={() => {
+            setShowBulkDelete(false);
+            setSelectedIpIds(new Set());
+          }}
         />
       )}
     </div>
@@ -3778,6 +3923,421 @@ function EditAddressModal({
             className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
             {mutation.isPending ? "Saving…" : "Save"}
+          </button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+// ─── Aliases Subnet Panel ────────────────────────────────────────────────────
+
+function AliasesSubnetPanel({ subnetId }: { subnetId: string }) {
+  const qc = useQueryClient();
+  const { data: aliases = [], isLoading } = useQuery({
+    queryKey: ["subnet-aliases", subnetId],
+    queryFn: () => ipamApi.listSubnetAliases(subnetId),
+  });
+
+  const delAlias = useMutation({
+    mutationFn: (a: { ip_address_id: string; id: string }) =>
+      ipamApi.deleteAlias(a.ip_address_id, a.id),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["subnet-aliases", subnetId] });
+      qc.invalidateQueries({ queryKey: ["addresses", subnetId] });
+    },
+  });
+
+  if (isLoading) {
+    return (
+      <p className="p-6 text-sm text-muted-foreground">Loading aliases…</p>
+    );
+  }
+  if (aliases.length === 0) {
+    return (
+      <div className="flex flex-col items-center justify-center py-16 text-center">
+        <Globe2 className="mb-3 h-10 w-10 text-muted-foreground/30" />
+        <p className="text-sm text-muted-foreground">
+          No aliases in this subnet.
+        </p>
+        <p className="mt-1 text-xs text-muted-foreground/70">
+          Add aliases from the IP address edit or allocate modal.
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <table className="w-full text-sm">
+      <thead>
+        <tr className="border-b bg-muted/40 text-xs">
+          <th className="px-4 py-2 text-left font-medium">Alias</th>
+          <th className="px-4 py-2 text-left font-medium">Type</th>
+          <th className="px-4 py-2 text-left font-medium">Target</th>
+          <th className="px-4 py-2 text-left font-medium">IP</th>
+          <th className="px-4 py-2 text-left font-medium">Host</th>
+          <th className="px-4 py-2" />
+        </tr>
+      </thead>
+      <tbody>
+        {aliases.map((a) => (
+          <tr key={a.id} className="border-b last:border-0 hover:bg-muted/20">
+            <td className="px-4 py-2 font-mono text-xs">{a.fqdn}</td>
+            <td className="px-4 py-2">
+              <span className="inline-flex items-center rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium">
+                {a.record_type}
+              </span>
+            </td>
+            <td className="px-4 py-2 font-mono text-xs text-muted-foreground">
+              {a.value}
+            </td>
+            <td className="px-4 py-2 font-mono text-xs">{a.ip_address}</td>
+            <td className="px-4 py-2 text-muted-foreground">
+              {a.ip_hostname ?? (
+                <span className="text-muted-foreground/40">—</span>
+              )}
+            </td>
+            <td className="px-4 py-2 text-right">
+              <button
+                onClick={() =>
+                  delAlias.mutate({ ip_address_id: a.ip_address_id, id: a.id })
+                }
+                disabled={delAlias.isPending}
+                className="rounded p-1 text-muted-foreground hover:text-destructive"
+                title="Delete alias"
+              >
+                <Trash2 className="h-3.5 w-3.5" />
+              </button>
+            </td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
+// ─── Bulk Edit / Bulk Delete modals ──────────────────────────────────────────
+
+function BulkEditAddressesModal({
+  ipIds,
+  subnetId,
+  onClose,
+  onDone,
+}: {
+  ipIds: string[];
+  subnetId: string;
+  onClose: () => void;
+  onDone: () => void;
+}) {
+  const qc = useQueryClient();
+  const [editStatus, setEditStatus] = useState(false);
+  const [status, setStatus] = useState<string>("allocated");
+  const [editDescription, setEditDescription] = useState(false);
+  const [description, setDescription] = useState("");
+  const [tagRows, setTagRows] = useState<{ k: string; v: string }[]>([]);
+  const [customFields, setCustomFields] = useState<Record<string, unknown>>({});
+  const [editCustomFields, setEditCustomFields] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const { data: cfDefs = [] } = useQuery({
+    queryKey: ["custom-fields", "ip_address"],
+    queryFn: () => customFieldsApi.list("ip_address"),
+  });
+
+  const mutation = useMutation({
+    mutationFn: () => {
+      const changes: {
+        status?: string;
+        description?: string;
+        tags?: Record<string, unknown>;
+        custom_fields?: Record<string, unknown>;
+      } = {};
+      if (editStatus) changes.status = status;
+      if (editDescription) changes.description = description;
+      const tagsObj: Record<string, unknown> = {};
+      for (const row of tagRows) {
+        const k = row.k.trim();
+        if (!k) continue;
+        tagsObj[k] = row.v;
+      }
+      if (Object.keys(tagsObj).length > 0) changes.tags = tagsObj;
+      if (editCustomFields && Object.keys(customFields).length > 0) {
+        changes.custom_fields = customFields;
+      }
+      return ipamApi.bulkEditAddresses({ ip_ids: ipIds, changes });
+    },
+    onSuccess: (res) => {
+      qc.invalidateQueries({ queryKey: ["addresses", subnetId] });
+      qc.invalidateQueries({ queryKey: ["subnet-aliases", subnetId] });
+      if (res.skipped.length > 0) {
+        setError(
+          `${res.updated_count} updated; ${res.skipped.length} skipped (system/orphan rows).`,
+        );
+        setTimeout(onDone, 1200);
+      } else {
+        onDone();
+      }
+    },
+    onError: (err: unknown) => {
+      const msg =
+        (err as { response?: { data?: { detail?: string } } })?.response?.data
+          ?.detail ?? "Failed to apply bulk edit";
+      setError(typeof msg === "string" ? msg : JSON.stringify(msg));
+    },
+  });
+
+  const hasChanges =
+    editStatus ||
+    editDescription ||
+    tagRows.some((r) => r.k.trim() !== "") ||
+    (editCustomFields && Object.keys(customFields).length > 0);
+
+  return (
+    <Modal title={`Bulk edit ${ipIds.length} IP addresses`} onClose={onClose}>
+      <div className="space-y-3">
+        <p className="text-xs text-muted-foreground">
+          Only fields you tick will be applied. Tags and custom fields are
+          merged into existing values — set a tag value to empty to keep
+          existing, or remove the row.
+        </p>
+
+        <div className="rounded-md border p-3 space-y-2">
+          <label className="flex items-center gap-2 text-sm font-medium">
+            <input
+              type="checkbox"
+              checked={editStatus}
+              onChange={(e) => setEditStatus(e.target.checked)}
+            />
+            Status
+          </label>
+          {editStatus && (
+            <select
+              className={inputCls}
+              value={status}
+              onChange={(e) => setStatus(e.target.value)}
+            >
+              {[
+                "available",
+                "allocated",
+                "reserved",
+                "static_dhcp",
+                "deprecated",
+              ].map((s) => (
+                <option key={s} value={s}>
+                  {s}
+                </option>
+              ))}
+            </select>
+          )}
+        </div>
+
+        <div className="rounded-md border p-3 space-y-2">
+          <label className="flex items-center gap-2 text-sm font-medium">
+            <input
+              type="checkbox"
+              checked={editDescription}
+              onChange={(e) => setEditDescription(e.target.checked)}
+            />
+            Description
+          </label>
+          {editDescription && (
+            <input
+              className={inputCls}
+              value={description}
+              onChange={(e) => setDescription(e.target.value)}
+              placeholder="Replace description with…"
+            />
+          )}
+        </div>
+
+        <div className="rounded-md border p-3 space-y-2">
+          <p className="text-sm font-medium">Tags (merge)</p>
+          <p className="text-[11px] text-muted-foreground -mt-1">
+            Each row is a key/value pair that will be set on every selected IP.
+            Leave value empty to delete that key.
+          </p>
+          {tagRows.map((row, i) => (
+            <div key={i} className="flex items-center gap-2">
+              <input
+                className={cn(inputCls, "flex-1")}
+                value={row.k}
+                onChange={(e) =>
+                  setTagRows((p) =>
+                    p.map((r, j) =>
+                      i === j ? { ...r, k: e.target.value } : r,
+                    ),
+                  )
+                }
+                placeholder="key"
+              />
+              <input
+                className={cn(inputCls, "flex-1")}
+                value={row.v}
+                onChange={(e) =>
+                  setTagRows((p) =>
+                    p.map((r, j) =>
+                      i === j ? { ...r, v: e.target.value } : r,
+                    ),
+                  )
+                }
+                placeholder="value (empty = remove)"
+              />
+              <button
+                type="button"
+                onClick={() => setTagRows((p) => p.filter((_, j) => j !== i))}
+                className="rounded p-1 text-muted-foreground hover:text-destructive"
+                title="Remove row"
+              >
+                <X className="h-3.5 w-3.5" />
+              </button>
+            </div>
+          ))}
+          <button
+            type="button"
+            onClick={() => setTagRows((p) => [...p, { k: "", v: "" }])}
+            className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent"
+          >
+            <Plus className="h-3 w-3" /> Add tag
+          </button>
+        </div>
+
+        {cfDefs.length > 0 && (
+          <div className="rounded-md border p-3 space-y-2">
+            <label className="flex items-center gap-2 text-sm font-medium">
+              <input
+                type="checkbox"
+                checked={editCustomFields}
+                onChange={(e) => setEditCustomFields(e.target.checked)}
+              />
+              Custom fields (merge)
+            </label>
+            {editCustomFields && (
+              <CustomFieldsSection
+                definitions={cfDefs}
+                values={customFields}
+                onChange={(k, v) =>
+                  setCustomFields((prev) => ({ ...prev, [k]: v }))
+                }
+              />
+            )}
+          </div>
+        )}
+
+        {error && <p className="text-xs text-destructive">{error}</p>}
+        <div className="flex justify-end gap-2 pt-2">
+          <button
+            onClick={onClose}
+            className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={() => {
+              setError(null);
+              mutation.mutate();
+            }}
+            disabled={!hasChanges || mutation.isPending}
+            className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+          >
+            {mutation.isPending ? "Applying…" : "Apply to all"}
+          </button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+function BulkDeleteAddressesModal({
+  ipIds,
+  subnetId,
+  onClose,
+  onDone,
+}: {
+  ipIds: string[];
+  subnetId: string;
+  onClose: () => void;
+  onDone: () => void;
+}) {
+  const qc = useQueryClient();
+  const [permanent, setPermanent] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const mutation = useMutation({
+    mutationFn: () => ipamApi.bulkDeleteAddresses({ ip_ids: ipIds, permanent }),
+    onSuccess: (res) => {
+      qc.invalidateQueries({ queryKey: ["addresses", subnetId] });
+      qc.invalidateQueries({ queryKey: ["subnet-aliases", subnetId] });
+      if (res.skipped.length > 0) {
+        setError(
+          `${res.deleted_count} deleted; ${res.skipped.length} skipped (system rows).`,
+        );
+        setTimeout(onDone, 1200);
+      } else {
+        onDone();
+      }
+    },
+    onError: (err: unknown) => {
+      const msg =
+        (err as { response?: { data?: { detail?: string } } })?.response?.data
+          ?.detail ?? "Failed to delete";
+      setError(typeof msg === "string" ? msg : JSON.stringify(msg));
+    },
+  });
+
+  return (
+    <Modal title={`Delete ${ipIds.length} IP addresses`} onClose={onClose}>
+      <div className="space-y-3">
+        <p className="text-sm">
+          {permanent ? (
+            <span className="text-destructive">
+              Permanently delete {ipIds.length} IP
+              {ipIds.length === 1 ? "" : "s"}? This cannot be undone.
+            </span>
+          ) : (
+            <>
+              Mark {ipIds.length} IP{ipIds.length === 1 ? "" : "s"} as{" "}
+              <span className="font-medium">orphan</span>. They can be restored
+              later.
+            </>
+          )}
+        </p>
+        <label className="flex items-center gap-2 text-xs">
+          <input
+            type="checkbox"
+            checked={permanent}
+            onChange={(e) => setPermanent(e.target.checked)}
+          />
+          Permanently delete instead of soft-delete
+        </label>
+        <p className="text-[11px] text-muted-foreground">
+          System rows (network, broadcast) are always skipped.
+        </p>
+        {error && <p className="text-xs text-destructive">{error}</p>}
+        <div className="flex justify-end gap-2 pt-2">
+          <button
+            onClick={onClose}
+            className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={() => {
+              setError(null);
+              mutation.mutate();
+            }}
+            disabled={mutation.isPending}
+            className={cn(
+              "rounded-md px-3 py-1.5 text-sm text-primary-foreground disabled:opacity-50",
+              permanent
+                ? "bg-destructive hover:bg-destructive/90"
+                : "bg-primary hover:bg-primary/90",
+            )}
+          >
+            {mutation.isPending
+              ? "Deleting…"
+              : permanent
+                ? "Delete forever"
+                : "Mark as orphan"}
           </button>
         </div>
       </div>

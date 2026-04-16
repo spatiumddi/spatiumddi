@@ -234,8 +234,22 @@ export interface IPAddress {
   dns_record_id?: string | null;
   dhcp_lease_id?: string | null;
   static_assignment_id?: string | null;
+  // User-added CNAME/A aliases on this IP (excludes the primary A).
+  alias_count?: number;
   created_at?: string;
   modified_at?: string;
+}
+
+export interface SubnetAlias {
+  id: string;
+  zone_id: string;
+  name: string;
+  record_type: string;
+  value: string;
+  fqdn: string;
+  ip_address_id: string;
+  ip_address: string;
+  ip_hostname: string | null;
 }
 
 export interface SubnetDomain {
@@ -451,6 +465,35 @@ export const ipamApi = {
       .then((r) => r.data),
   deleteAlias: (addressId: string, recordId: string) =>
     api.delete(`/ipam/addresses/${addressId}/aliases/${recordId}`),
+  listSubnetAliases: (subnetId: string) =>
+    api
+      .get<SubnetAlias[]>(`/ipam/subnets/${subnetId}/aliases`)
+      .then((r) => r.data),
+  bulkDeleteAddresses: (data: { ip_ids: string[]; permanent?: boolean }) =>
+    api
+      .post<{
+        deleted_count: number;
+        not_found: string[];
+        skipped: string[];
+      }>(`/ipam/addresses/bulk-delete`, data)
+      .then((r) => r.data),
+  bulkEditAddresses: (data: {
+    ip_ids: string[];
+    changes: {
+      status?: string;
+      description?: string;
+      tags?: Record<string, unknown>;
+      custom_fields?: Record<string, unknown>;
+    };
+  }) =>
+    api
+      .post<{
+        batch_id: string;
+        updated_count: number;
+        not_found: string[];
+        skipped: string[];
+      }>(`/ipam/addresses/bulk-edit`, data)
+      .then((r) => r.data),
   backfillReverseZonesSpace: (spaceId: string) =>
     api
       .post<{
