@@ -206,6 +206,48 @@ function ConfirmDestroyModal({
   );
 }
 
+/** Single-step destructive confirm (no checkbox). Used for low-stakes deletes
+ * like individual DNS records — the two-step modal above stays for group /
+ * blocklist deletes where the blast radius is much larger. */
+function ConfirmSingleModal({
+  title,
+  description,
+  onConfirm,
+  onClose,
+  isPending,
+  confirmLabel = "Delete",
+}: {
+  title: string;
+  description: React.ReactNode;
+  onConfirm: () => void;
+  onClose: () => void;
+  isPending?: boolean;
+  confirmLabel?: string;
+}) {
+  return (
+    <Modal title={title} onClose={onClose}>
+      <div className="space-y-4">
+        <p className="text-sm text-muted-foreground">{description}</p>
+        <div className="flex justify-end gap-2">
+          <button
+            onClick={onClose}
+            className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={onConfirm}
+            disabled={isPending}
+            className="rounded-md bg-destructive px-3 py-1.5 text-sm text-destructive-foreground hover:bg-destructive/90 disabled:opacity-50"
+          >
+            {isPending ? "Deleting…" : confirmLabel}
+          </button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
 // ── Download helper ──────────────────────────────────────────────────────────
 
 function downloadBlob(
@@ -1097,6 +1139,25 @@ function ZoneDetailView({
     onSuccess: () =>
       qc.invalidateQueries({ queryKey: ["dns-records", zone.id] }),
   });
+  const [confirmDeleteRecord, setConfirmDeleteRecord] = useState<DNSRecord | null>(
+    null,
+  );
+  const [selectedRecords, setSelectedRecords] = useState<Set<string>>(new Set());
+  const [confirmBulkDelete, setConfirmBulkDelete] = useState(false);
+  const bulkDeleteRecords = useMutation({
+    mutationFn: async (ids: string[]) => {
+      // No server-side bulk endpoint yet — fan out. Ignore individual failures
+      // so one bad row doesn't strand the rest (each has its own DDNS op).
+      await Promise.allSettled(
+        ids.map((id) => dnsApi.deleteRecord(group.id, zone.id, id)),
+      );
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["dns-records", zone.id] });
+      setSelectedRecords(new Set());
+      setConfirmBulkDelete(false);
+    },
+  });
 
   const recordTypes = [...new Set(records.map((r) => r.record_type))].sort();
   const hasRecFilter = Object.values(recFilter).some(Boolean);
@@ -1182,6 +1243,30 @@ function ZoneDetailView({
         </div>
       </div>
 
+      {/* Bulk actions — shown when any manual records are selected. */}
+      {selectedRecords.size > 0 && (
+        <div className="flex items-center justify-between border-b bg-amber-50 px-5 py-1.5 text-xs dark:bg-amber-900/10">
+          <span>
+            {selectedRecords.size} record
+            {selectedRecords.size !== 1 ? "s" : ""} selected
+          </span>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setSelectedRecords(new Set())}
+              className="rounded-md border px-2 py-1 hover:bg-muted"
+            >
+              Clear
+            </button>
+            <button
+              onClick={() => setConfirmBulkDelete(true)}
+              className="flex items-center gap-1 rounded-md border border-destructive/40 px-2 py-1 text-destructive hover:bg-destructive/10"
+            >
+              <Trash2 className="h-3 w-3" /> Delete selected
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Records table */}
       <div className="flex-1 overflow-auto">
         {isFetching && records.length === 0 && (
@@ -1200,6 +1285,32 @@ function ZoneDetailView({
           <table className="w-full text-sm">
             <thead className="sticky top-0 bg-card">
               <tr className="border-b text-xs text-muted-foreground">
+                <th className="w-8 py-2 pl-3">
+                  {(() => {
+                    const manualIds = filtered
+                      .filter((r) => !r.auto_generated)
+                      .map((r) => r.id);
+                    const allSel =
+                      manualIds.length > 0 &&
+                      manualIds.every((id) => selectedRecords.has(id));
+                    return (
+                      <input
+                        type="checkbox"
+                        disabled={manualIds.length === 0}
+                        checked={allSel}
+                        onChange={() => {
+                          setSelectedRecords((prev) => {
+                            const next = new Set(prev);
+                            if (allSel) manualIds.forEach((id) => next.delete(id));
+                            else manualIds.forEach((id) => next.add(id));
+                            return next;
+                          });
+                        }}
+                        title="Select all manual records (IPAM-managed records are skipped)"
+                      />
+                    );
+                  })()}
+                </th>
                 {(["Name", "Type", "Value", "TTL", "Pri"] as const).map(
                   (col) => {
                     const filterKey =
@@ -1254,6 +1365,7 @@ function ZoneDetailView({
               </tr>
               {showRecFilters && (
                 <tr className="border-b bg-muted/10 text-xs">
+                  <td />
                   <td className="px-2 py-1 pl-5">
                     <input
                       type="text"
@@ -1304,8 +1416,34 @@ function ZoneDetailView({
                   key={r.id}
                   className="border-b last:border-0 hover:bg-muted/40 group"
                 >
+                  <td className="w-8 py-1.5 pl-3">
+                    {!r.auto_generated && (
+                      <input
+                        type="checkbox"
+                        checked={selectedRecords.has(r.id)}
+                        onChange={() =>
+                          setSelectedRecords((prev) => {
+                            const next = new Set(prev);
+                            if (next.has(r.id)) next.delete(r.id);
+                            else next.add(r.id);
+                            return next;
+                          })
+                        }
+                      />
+                    )}
+                  </td>
                   <td className="py-1.5 pl-5 font-mono text-xs font-medium">
-                    {r.name}
+                    {r.auto_generated ? (
+                      r.name
+                    ) : (
+                      <button
+                        onClick={() => setEditRecord(r)}
+                        className="hover:text-primary hover:underline"
+                        title="Edit record"
+                      >
+                        {r.name}
+                      </button>
+                    )}
                   </td>
                   <td className="py-1.5">
                     <span
@@ -1341,23 +1479,18 @@ function ZoneDetailView({
                         </span>
                       </div>
                     ) : (
-                      <div className="flex items-center justify-end gap-1 opacity-0 group-hover:opacity-100">
+                      <div className="flex items-center justify-end gap-1">
                         <button
                           className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-foreground"
                           onClick={() => setEditRecord(r)}
+                          title="Edit record"
                         >
                           <Pencil className="h-3 w-3" />
                         </button>
                         <button
                           className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-destructive"
-                          onClick={() => {
-                            if (
-                              confirm(
-                                `Delete record ${r.name} ${r.record_type}?`,
-                              )
-                            )
-                              deleteRecord.mutate(r);
-                          }}
+                          onClick={() => setConfirmDeleteRecord(r)}
+                          title="Delete record"
                         >
                           <Trash2 className="h-3 w-3" />
                         </button>
@@ -1386,6 +1519,45 @@ function ZoneDetailView({
           zoneName={zone.name}
           record={editRecord}
           onClose={() => setEditRecord(null)}
+        />
+      )}
+      {confirmDeleteRecord && (
+        <ConfirmSingleModal
+          title="Delete Record"
+          description={
+            <>
+              Delete{" "}
+              <span className="font-mono">
+                {confirmDeleteRecord.name} {confirmDeleteRecord.record_type}
+              </span>
+              ? This will remove the record from the zone and fire an RFC 2136
+              update.
+            </>
+          }
+          isPending={deleteRecord.isPending}
+          onConfirm={() =>
+            deleteRecord.mutate(confirmDeleteRecord, {
+              onSuccess: () => setConfirmDeleteRecord(null),
+            })
+          }
+          onClose={() => setConfirmDeleteRecord(null)}
+        />
+      )}
+      {confirmBulkDelete && (
+        <ConfirmSingleModal
+          title={`Delete ${selectedRecords.size} records`}
+          description={
+            <>
+              Delete the{" "}
+              <span className="font-medium">{selectedRecords.size}</span>{" "}
+              selected records? IPAM-managed records are excluded automatically.
+            </>
+          }
+          isPending={bulkDeleteRecords.isPending}
+          onConfirm={() =>
+            bulkDeleteRecords.mutate(Array.from(selectedRecords))
+          }
+          onClose={() => setConfirmBulkDelete(false)}
         />
       )}
       {showEditZone && (
@@ -2778,6 +2950,16 @@ function BlocklistDetail({
     onSuccess: () =>
       qc.invalidateQueries({ queryKey: ["dns-blocklist-entries", list.id] }),
   });
+  const [editEntry, setEditEntry] = useState<DNSBlockListEntry | null>(null);
+  const [editDomain, setEditDomain] = useState("");
+  const updateEntry = useMutation({
+    mutationFn: () =>
+      dnsBlocklistApi.updateEntry(list.id, editEntry!.id, { domain: editDomain }),
+    onSuccess: () => {
+      setEditEntry(null);
+      qc.invalidateQueries({ queryKey: ["dns-blocklist-entries", list.id] });
+    },
+  });
   const addException = useMutation({
     mutationFn: () =>
       dnsBlocklistApi.addException(list.id, {
@@ -2903,12 +3085,31 @@ function BlocklistDetail({
                 <td className="px-3 py-1 text-xs">{e.entry_type}</td>
                 <td className="px-3 py-1 text-xs">{e.source}</td>
                 <td className="px-3 py-1 text-right">
-                  <button
-                    className="text-muted-foreground hover:text-destructive"
-                    onClick={() => deleteEntry.mutate(e.id)}
-                  >
-                    <Trash2 className="h-3 w-3" />
-                  </button>
+                  <div className="flex items-center justify-end gap-1">
+                    {e.source === "manual" && (
+                      <button
+                        className="text-muted-foreground hover:text-foreground"
+                        onClick={() => {
+                          setEditEntry(e);
+                          setEditDomain(e.domain);
+                        }}
+                        title="Edit domain"
+                      >
+                        <Pencil className="h-3 w-3" />
+                      </button>
+                    )}
+                    <button
+                      className="text-muted-foreground hover:text-destructive"
+                      onClick={() => deleteEntry.mutate(e.id)}
+                      title={
+                        e.source === "manual"
+                          ? "Remove entry"
+                          : "Remove (will return on next feed refresh)"
+                      }
+                    >
+                      <Trash2 className="h-3 w-3" />
+                    </button>
+                  </div>
                 </td>
               </tr>
             ))}
@@ -3004,6 +3205,35 @@ function BlocklistDetail({
         </table>
       </div>
 
+      {editEntry && (
+        <Modal title="Edit Blocklist Entry" onClose={() => setEditEntry(null)}>
+          <div className="space-y-3">
+            <Field label="Domain">
+              <input
+                className={inputCls}
+                value={editDomain}
+                onChange={(ev) => setEditDomain(ev.target.value)}
+                autoFocus
+              />
+            </Field>
+            <div className="flex justify-end gap-2">
+              <button
+                onClick={() => setEditEntry(null)}
+                className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => updateEntry.mutate()}
+                disabled={!editDomain.trim() || updateEntry.isPending}
+                className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+              >
+                {updateEntry.isPending ? "Saving…" : "Save"}
+              </button>
+            </div>
+          </div>
+        </Modal>
+      )}
       {showBulk && (
         <Modal title="Bulk Add Domains" onClose={() => setShowBulk(false)} wide>
           <form

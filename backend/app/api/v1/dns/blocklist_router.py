@@ -160,6 +160,20 @@ class EntryCreate(BaseModel):
         return v
 
 
+class EntryUpdate(BaseModel):
+    domain: str | None = None
+    entry_type: str | None = None
+    target: str | None = None
+    is_wildcard: bool | None = None
+
+    @field_validator("entry_type")
+    @classmethod
+    def _v_et_upd(cls, v: str | None) -> str | None:
+        if v is not None and v not in VALID_ENTRY_TYPES:
+            raise ValueError(f"entry_type must be one of {sorted(VALID_ENTRY_TYPES)}")
+        return v
+
+
 class EntryResponse(BaseModel):
     id: uuid.UUID
     list_id: uuid.UUID
@@ -568,6 +582,67 @@ async def bulk_add_entries(
     )
     await db.commit()
     return BulkAddResponse(added=added, skipped=skipped, total=len(body.domains))
+
+
+@router.put(
+    "/blocklists/{list_id}/entries/{entry_id}",
+    response_model=EntryResponse,
+)
+async def update_entry(
+    list_id: uuid.UUID,
+    entry_id: uuid.UUID,
+    body: EntryUpdate,
+    db: DB,
+    current_user: SuperAdmin,
+) -> EntryResponse:
+    bl = await _require_list(list_id, db)
+    result = await db.execute(
+        select(DNSBlockListEntry).where(
+            DNSBlockListEntry.id == entry_id, DNSBlockListEntry.list_id == list_id
+        )
+    )
+    entry = result.scalar_one_or_none()
+    if not entry:
+        raise HTTPException(status_code=404, detail="Entry not found")
+    # Editing is only meaningful for manual entries; feed-sourced entries are
+    # overwritten on the next refresh so silent edits would be lost.
+    if entry.source != "manual":
+        raise HTTPException(
+            status_code=409,
+            detail="Only manual entries can be edited; feed-sourced entries are refreshed from source.",
+        )
+    changes = body.model_dump(exclude_none=True)
+    if "domain" in changes:
+        domain = changes["domain"].strip().lower().strip(".")
+        if not domain or "." not in domain:
+            raise HTTPException(status_code=422, detail="Invalid domain")
+        if domain != entry.domain:
+            dup = await db.execute(
+                select(DNSBlockListEntry).where(
+                    DNSBlockListEntry.list_id == list_id,
+                    DNSBlockListEntry.domain == domain,
+                    DNSBlockListEntry.id != entry_id,
+                )
+            )
+            if dup.scalar_one_or_none():
+                raise HTTPException(
+                    status_code=409, detail="Domain already in this blocklist"
+                )
+        changes["domain"] = domain
+    for k, v in changes.items():
+        setattr(entry, k, v)
+    db.add(
+        _audit(
+            current_user,
+            "update",
+            "dns_blocklist_entry",
+            str(entry.id),
+            f"{entry.domain} ({bl.name})",
+        )
+    )
+    await db.commit()
+    await db.refresh(entry)
+    return EntryResponse.model_validate(entry)
 
 
 @router.delete("/blocklists/{list_id}/entries/{entry_id}", status_code=204)

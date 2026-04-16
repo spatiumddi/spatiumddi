@@ -1211,6 +1211,14 @@ export const dnsBlocklistApi = {
         total: number;
       }>(`/dns/blocklists/${id}/entries/bulk`, { domains })
       .then((r) => r.data),
+  updateEntry: (
+    id: string,
+    entryId: string,
+    data: Partial<DNSBlockListEntry>,
+  ) =>
+    api
+      .put<DNSBlockListEntry>(`/dns/blocklists/${id}/entries/${entryId}`, data)
+      .then((r) => r.data),
   deleteEntry: (id: string, entryId: string) =>
     api.delete(`/dns/blocklists/${id}/entries/${entryId}`),
 
