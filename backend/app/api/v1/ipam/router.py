@@ -304,6 +304,16 @@ async def _sync_dns_record(
     if not zone:
         return
 
+    # Backfill the reverse zone if missing. Subnets created before DNS was
+    # assigned won't have had `ensure_reverse_zone_for_subnet` run at create
+    # time, so every IP allocation is an opportunity to catch up.
+    try:
+        from app.services.dns.reverse_zone import ensure_reverse_zone_for_subnet
+
+        await ensure_reverse_zone_for_subnet(db, subnet, None)
+    except Exception:  # noqa: BLE001 — best-effort, don't block IP allocation
+        pass
+
     zone_domain = zone.name.rstrip(".")
     fqdn = f"{ip.hostname}.{zone_domain}"
     ip.fqdn = fqdn

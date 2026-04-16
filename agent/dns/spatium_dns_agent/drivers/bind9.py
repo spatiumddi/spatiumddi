@@ -287,13 +287,20 @@ class Bind9Driver(DriverBase):
         if op["op"] in ("create", "update"):
             upd.replace(name, ttl, rtype, value)
         elif op["op"] == "delete":
-            upd.delete(name, rtype, value)
+            # Some BIND configurations reject the RR-specific delete form
+            # (value must exactly match a live RR) when the running daemon
+            # has drifted from the zone file. Delete by (name, rtype) so any
+            # matching RR gets cleared. Idempotent.
+            upd.delete(name, rtype)
         else:
             raise ValueError(f"unknown op: {op['op']}")
         resp = dns.query.tcp(upd, "127.0.0.1", timeout=10)
         rcode = resp.rcode()
         if rcode != 0:  # NOERROR
-            raise RuntimeError(f"nsupdate returned rcode={rcode}")
+            raise RuntimeError(
+                f"nsupdate returned rcode={rcode} "
+                f"(zone={zone} op={op['op']} name={name} type={rtype})"
+            )
 
     # ── Lifecycle ───────────────────────────────────────────────────────────
 

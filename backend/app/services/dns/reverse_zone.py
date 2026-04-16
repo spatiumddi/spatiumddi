@@ -82,7 +82,7 @@ def compute_reverse_zone_name(network: str) -> str:
 async def ensure_reverse_zone_for_subnet(
     db: AsyncSession,
     subnet: Subnet,
-    current_user: User,
+    current_user: User | None,
     *,
     dns_group_id: uuid.UUID | None = None,
     dns_zone_id: uuid.UUID | None = None,
@@ -178,9 +178,11 @@ async def ensure_reverse_zone_for_subnet(
 
     db.add(
         AuditLog(
-            user_id=current_user.id,
-            user_display_name=current_user.display_name,
-            auth_source=current_user.auth_source,
+            user_id=current_user.id if current_user else None,
+            user_display_name=(
+                current_user.display_name if current_user else "system"
+            ),
+            auth_source=current_user.auth_source if current_user else "system",
             action="create",
             resource_type="dns_zone",
             resource_id=str(zone.id),

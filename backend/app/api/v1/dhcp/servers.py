@@ -174,20 +174,36 @@ async def delete_server(server_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
 
 @router.post("/{server_id}/sync", status_code=status.HTTP_202_ACCEPTED)
 async def sync_server(server_id: uuid.UUID, db: DB, user: SuperAdmin) -> dict[str, str]:
-    """Force a config push: rebuild the bundle, enqueue an apply_config op."""
+    """Force a config push: rebuild the bundle, enqueue an apply_config op.
+
+    Coalesces consecutive clicks: if an ``apply_config`` op is already
+    pending for this server, reuse it instead of queueing another reload.
+    """
     s = await db.get(DHCPServer, server_id)
     if s is None:
         raise HTTPException(status_code=404, detail="Server not found")
     bundle = await build_config_bundle(db, s)
     s.config_etag = bundle.etag
-    op = DHCPConfigOp(
-        server_id=s.id,
-        op_type="apply_config",
-        payload={"etag": bundle.etag},
-        status="pending",
+    existing = await db.execute(
+        select(DHCPConfigOp).where(
+            DHCPConfigOp.server_id == s.id,
+            DHCPConfigOp.op_type == "apply_config",
+            DHCPConfigOp.status == "pending",
+        )
     )
-    db.add(op)
-    await db.flush()
+    op = existing.scalar_one_or_none()
+    if op is None:
+        op = DHCPConfigOp(
+            server_id=s.id,
+            op_type="apply_config",
+            payload={"etag": bundle.etag},
+            status="pending",
+        )
+        db.add(op)
+        await db.flush()
+    else:
+        op.payload = {"etag": bundle.etag}
+        await db.flush()
     write_audit(
         db,
         user=user,
