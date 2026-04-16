@@ -3,7 +3,7 @@
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
 > **GitHub Org:** https://github.com/spatiumddi  
-> **Docs:** https://spatiumddi.github.io  
+> **Docs:** https://spatiumddi.github.io/spatiumddi/  
 > **License:** Apache 2.0  
 > **Package:** `spatiumddi` on PyPI  
 > **Container registry:** `ghcr.io/spatiumddi/*`  
@@ -148,7 +148,7 @@ SpatiumDDI cut its alpha release `2026.04.16-1` on 2026-04-16 with IPAM, DNS (BI
 
 - ⬜ LDAP / OIDC authentication
 - ⬜ Group-based RBAC enforcement on API routes
-- ⬜ Full IPv6 support in IPAM (address storage, CIDR validation, UI rendering)
+- ⬜ Full IPv6 support in IPAM, DHCP, DNS (address storage, CIDR validation, UI rendering)
 - ⬜ Mobile-responsive UI
 - ⬜ Bulk-edit UI for `tags` + `custom_fields` (API supports it; only scalar fields in modal today)
 - ⬜ Wire inherited-field placeholders into `EditSubnetModal` / `EditBlockModal` (API `/effective-fields` is ready)
