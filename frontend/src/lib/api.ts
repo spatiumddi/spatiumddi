@@ -1018,6 +1018,18 @@ export const authProvidersApi = {
     api
       .post<AuthProviderTestResult>(`/auth-providers/${id}/test`, body)
       .then((r) => r.data),
+  // Dry-run test against an unsaved provider config. Nothing is persisted —
+  // lets admins iterate on config + secrets before committing a row.
+  testUnsaved: (body: {
+    type: AuthProviderType;
+    config: Record<string, unknown>;
+    secrets: Record<string, unknown>;
+    username?: string;
+    password?: string;
+  }) =>
+    api
+      .post<AuthProviderTestResult>("/auth-providers/test", body)
+      .then((r) => r.data),
   get: (id: string) =>
     api.get<AuthProvider>(`/auth-providers/${id}`).then((r) => r.data),
   create: (body: AuthProviderCreate) =>

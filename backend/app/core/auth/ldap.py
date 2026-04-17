@@ -79,6 +79,11 @@ class LDAPConfig:
     attr_member_of: str
     # Optional CA cert file for TLS validation (container path). None = system store.
     tls_ca_cert_file: str | None = None
+    # Skip TLS certificate validation entirely. Useful when connecting by IP
+    # (cert CN mismatch) or against a self-signed cert in a lab. Still encrypts
+    # the channel — but does NOT authenticate the server, so don't enable this
+    # in production.
+    tls_insecure: bool = False
 
     @classmethod
     def from_provider(cls, provider: AuthProvider) -> LDAPConfig:
@@ -129,12 +134,22 @@ class LDAPConfig:
             attr_display_name=str(cfg.get("attr_display_name") or "displayName"),
             attr_member_of=str(cfg.get("attr_member_of") or "memberOf"),
             tls_ca_cert_file=(cfg.get("tls_ca_cert_file") or None),
+            tls_insecure=bool(cfg.get("tls_insecure", False)),
         )
 
 
 def _tls(cfg: LDAPConfig) -> Tls | None:
     if not (cfg.use_ssl or cfg.start_tls):
         return None
+    if cfg.tls_insecure:
+        # Channel is still encrypted; server identity is not verified. Flagged
+        # as a warning so admins can see this in the logs if they forgot to
+        # re-enable validation after a lab test.
+        logger.warning("ldap_tls_validation_disabled", host=cfg.host)
+        return Tls(
+            validate=ssl.CERT_NONE,
+            version=ssl.PROTOCOL_TLS_CLIENT,
+        )
     return Tls(
         validate=ssl.CERT_REQUIRED,
         ca_certs_file=cfg.tls_ca_cert_file,

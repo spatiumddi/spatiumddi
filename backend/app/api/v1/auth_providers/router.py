@@ -319,10 +319,114 @@ class TestConnectionRequest(BaseModel):
     password: str | None = None
 
 
+class TestUnsavedRequest(BaseModel):
+    """Dry-run form for the "Test connection" button BEFORE saving the
+    provider, so admins can iterate on config + secrets without creating
+    a broken row. Body mirrors ``ProviderCreate`` plus optional probe
+    credentials for the LDAP "Test as user" path."""
+
+    model_config = {"extra": "ignore"}
+
+    type: str
+    config: dict[str, Any] = Field(default_factory=dict)
+    secrets: dict[str, Any] = Field(default_factory=dict)
+    username: str | None = None
+    password: str | None = None
+
+    @field_validator("type")
+    @classmethod
+    def _check_type(cls, v: str) -> str:
+        if v not in PROVIDER_TYPES:
+            raise ValueError(f"invalid provider type: {v!r}")
+        return v
+
+
 class TestConnectionResponse(BaseModel):
     ok: bool
     message: str
     details: dict[str, Any] = Field(default_factory=dict)
+
+
+async def _run_probe(
+    provider: AuthProvider,
+    body_username: str | None,
+    body_password: str | None,
+    db: DB,
+) -> dict[str, Any]:
+    """Dispatch a test probe for an in-memory or persisted provider. Returns
+    the raw ``{ok, message, details}`` dict from the per-type probe."""
+    if provider.type == "ldap":
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(ldap_test_connection, provider, body_username, body_password),
+                timeout=20,
+            )
+        except TimeoutError:
+            return {"ok": False, "message": "LDAP probe timed out", "details": {}}
+    if provider.type == "oidc":
+        try:
+            return await asyncio.wait_for(oidc_probe_discovery(provider), timeout=15)
+        except TimeoutError:
+            return {"ok": False, "message": "OIDC discovery probe timed out", "details": {}}
+    if provider.type == "saml":
+        settings_row = await db.get(PlatformSettings, 1)
+        base_url = (settings_row.app_base_url if settings_row else "").rstrip("/")
+        try:
+            return await asyncio.wait_for(
+                saml_probe_metadata(provider, base_url or "http://localhost"),
+                timeout=15,
+            )
+        except TimeoutError:
+            return {"ok": False, "message": "SAML metadata probe timed out", "details": {}}
+    if provider.type == "radius":
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(radius_test_connection, provider),
+                timeout=20,
+            )
+        except TimeoutError:
+            return {"ok": False, "message": "RADIUS probe timed out", "details": {}}
+    if provider.type == "tacacs":
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(tacacs_test_connection, provider),
+                timeout=20,
+            )
+        except TimeoutError:
+            return {"ok": False, "message": "TACACS+ probe timed out", "details": {}}
+    raise HTTPException(
+        status_code=400,
+        detail=(f"Testing is not yet implemented for provider type {provider.type!r}"),
+    )
+
+
+@router.post("/test", response_model=TestConnectionResponse)
+async def test_unsaved_provider(
+    body: TestUnsavedRequest,
+    db: DB,
+    user: SuperAdmin,
+) -> TestConnectionResponse:
+    """Dry-run "Test connection" against an unsaved provider config. Builds
+    an in-memory ``AuthProvider`` from the request body — **nothing is
+    persisted**, no audit row is written (caller has no resource id to bind
+    to), and the encrypted-secrets blob is discarded after the probe runs.
+    """
+    transient = AuthProvider(
+        name="__dry_run__",
+        type=body.type,
+        is_enabled=True,
+        priority=0,
+        config=body.config,
+        secrets_encrypted=encrypt_dict(body.secrets) if body.secrets else None,
+        auto_create_users=False,
+        auto_update_users=False,
+    )
+    report = await _run_probe(transient, body.username, body.password, db)
+    return TestConnectionResponse(
+        ok=bool(report.get("ok", False)),
+        message=str(report.get("message", "")),
+        details=dict(report.get("details") or {}),
+    )
 
 
 @router.post("/{provider_id}/test", response_model=TestConnectionResponse)
@@ -333,68 +437,7 @@ async def test_provider(
     user: SuperAdmin,
 ) -> TestConnectionResponse:
     provider = await _get_provider_or_404(db, provider_id)
-
-    report: dict[str, Any]
-    if provider.type == "ldap":
-        try:
-            report = await asyncio.wait_for(
-                asyncio.to_thread(ldap_test_connection, provider, body.username, body.password),
-                timeout=20,
-            )
-        except TimeoutError:
-            report = {"ok": False, "message": "LDAP probe timed out", "details": {}}
-    elif provider.type == "oidc":
-        try:
-            report = await asyncio.wait_for(oidc_probe_discovery(provider), timeout=15)
-        except TimeoutError:
-            report = {
-                "ok": False,
-                "message": "OIDC discovery probe timed out",
-                "details": {},
-            }
-    elif provider.type == "saml":
-        settings_row = await db.get(PlatformSettings, 1)
-        base_url = (settings_row.app_base_url if settings_row else "").rstrip("/")
-        try:
-            report = await asyncio.wait_for(
-                saml_probe_metadata(provider, base_url or "http://localhost"),
-                timeout=15,
-            )
-        except TimeoutError:
-            report = {
-                "ok": False,
-                "message": "SAML metadata probe timed out",
-                "details": {},
-            }
-    elif provider.type == "radius":
-        try:
-            report = await asyncio.wait_for(
-                asyncio.to_thread(radius_test_connection, provider),
-                timeout=20,
-            )
-        except TimeoutError:
-            report = {
-                "ok": False,
-                "message": "RADIUS probe timed out",
-                "details": {},
-            }
-    elif provider.type == "tacacs":
-        try:
-            report = await asyncio.wait_for(
-                asyncio.to_thread(tacacs_test_connection, provider),
-                timeout=20,
-            )
-        except TimeoutError:
-            report = {
-                "ok": False,
-                "message": "TACACS+ probe timed out",
-                "details": {},
-            }
-    else:
-        raise HTTPException(
-            status_code=400,
-            detail=(f"Testing is not yet implemented for provider type {provider.type!r}"),
-        )
+    report = await _run_probe(provider, body.username, body.password, db)
 
     db.add(
         AuditLog(

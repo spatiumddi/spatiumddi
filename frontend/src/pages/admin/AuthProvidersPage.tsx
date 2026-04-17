@@ -117,6 +117,7 @@ const LDAP_DEFAULTS = {
   backup_hosts: "",
   use_ssl: true,
   start_tls: false,
+  tls_insecure: false,
   bind_dn: "",
   user_base_dn: "",
   user_filter: "(&(objectClass=user)(sAMAccountName={username}))",
@@ -198,7 +199,7 @@ function emptyForm(): ProviderForm {
   return {
     name: "",
     type: "ldap",
-    is_enabled: false,
+    is_enabled: true,
     priority: 100,
     auto_create_users: true,
     auto_update_users: true,
@@ -211,6 +212,36 @@ function emptyForm(): ProviderForm {
     radius_secret: "",
     tacacs_secret: "",
   };
+}
+
+// Build the payload for the dry-run `/auth-providers/test` endpoint from
+// the live form state. Only the secret for the selected provider type is
+// included; empty secrets are sent as an empty dict so the backend's probe
+// fails fast with "missing secret" rather than bouncing off a Fernet error.
+function buildDryRunPayload(form: ProviderForm): {
+  type: AuthProviderType;
+  config: Record<string, unknown>;
+  secrets: Record<string, unknown>;
+} {
+  let config: Record<string, unknown> = {};
+  try {
+    config = JSON.parse(form.config_json || "{}");
+  } catch {
+    config = {};
+  }
+  const secrets: Record<string, unknown> = {};
+  if (form.type === "ldap" && form.bind_password) {
+    secrets.bind_password = form.bind_password;
+  } else if (form.type === "oidc" && form.oidc_client_secret) {
+    secrets.client_secret = form.oidc_client_secret;
+  } else if (form.type === "saml" && form.saml_sp_private_key) {
+    secrets.sp_private_key = form.saml_sp_private_key;
+  } else if (form.type === "radius" && form.radius_secret) {
+    secrets.secret = form.radius_secret;
+  } else if (form.type === "tacacs" && form.tacacs_secret) {
+    secrets.secret = form.tacacs_secret;
+  }
+  return { type: form.type, config, secrets };
 }
 
 // ── LDAP structured form ──────────────────────────────────────────────────────
@@ -304,6 +335,24 @@ function LdapConfigFields({
           StartTLS
         </label>
       </div>
+      {(cfg.use_ssl || cfg.start_tls) && (
+        <div>
+          <label className="flex items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              checked={!!cfg.tls_insecure}
+              onChange={(e) => setCfg({ tls_insecure: e.target.checked })}
+            />
+            Ignore TLS certificate errors (insecure)
+          </label>
+          <p className="mt-1 text-[11px] text-muted-foreground">
+            Accepts self-signed certs and hostname mismatches. Useful when
+            connecting by IP or against a lab cert that isn't trusted locally.
+            Channel is still encrypted — but the server identity is not
+            verified. <strong>Do not enable in production.</strong>
+          </p>
+        </div>
+      )}
 
       <div>
         <label className={label}>Service bind DN</label>
@@ -949,22 +998,51 @@ function TacacsConfigFields({
   );
 }
 
-// ── Test connection panel (LDAP + OIDC + SAML + RADIUS + TACACS+, edit mode only) ───
+// ── Test connection panel (works in both create and edit mode) ──────────────
+//
+// In edit mode we call `POST /auth-providers/{id}/test` with the stored,
+// already-encrypted secrets. In create mode (or when the form has dirty
+// secrets that haven't been saved yet) we call the dry-run endpoint
+// `POST /auth-providers/test` with the current form's plaintext config +
+// secrets — nothing is persisted.
+//
+// The dry-run version is what lets admins iterate on LDAP TLS settings,
+// bind DN, backup hosts, etc. without polluting the database with broken
+// provider rows.
+
+type DryRunTestPayload = {
+  type: AuthProviderType;
+  config: Record<string, unknown>;
+  secrets: Record<string, unknown>;
+};
 
 function TestConnectionPanel({
   providerId,
   providerType,
+  dryRunPayload,
 }: {
-  providerId: string;
+  providerId?: string;
   providerType: AuthProviderType;
+  /** If provided, the panel always uses the dry-run endpoint with this
+   * snapshot of the form (overrides `providerId`). Pass this from create
+   * mode, or from edit mode when secrets are dirty. */
+  dryRunPayload?: () => DryRunTestPayload;
 }) {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [result, setResult] = useState<AuthProviderTestResult | null>(null);
   const [showUser, setShowUser] = useState(false);
   const mut = useMutation({
-    mutationFn: (body: { username?: string; password?: string }) =>
-      authProvidersApi.test(providerId, body),
+    mutationFn: (body: { username?: string; password?: string }) => {
+      if (dryRunPayload) {
+        const snapshot = dryRunPayload();
+        return authProvidersApi.testUnsaved({ ...snapshot, ...body });
+      }
+      if (providerId) {
+        return authProvidersApi.test(providerId, body);
+      }
+      throw new Error("no providerId and no dryRunPayload — cannot test");
+    },
     onSuccess: (r) => setResult(r),
     onError: (err: Error & { response?: { data?: { detail?: string } } }) =>
       setResult({
@@ -1641,15 +1719,20 @@ function ProviderModal({
             )}
           </div>
 
-          {/* Test connection — all provider types, edit mode only */}
-          {mode === "edit" && initialProvider && (
-            <div className="border-t pt-4">
-              <TestConnectionPanel
-                providerId={initialProvider.id}
-                providerType={form.type}
-              />
-            </div>
-          )}
+          {/* Test connection — all provider types, both create and edit.
+              In create mode (or edit mode with dirty secrets) we pass a
+              dryRunPayload so the backend uses the unsaved form state. */}
+          <div className="border-t pt-4">
+            <TestConnectionPanel
+              providerId={mode === "edit" ? initialProvider?.id : undefined}
+              providerType={form.type}
+              dryRunPayload={
+                mode === "create" || form.secrets_dirty
+                  ? () => buildDryRunPayload(form)
+                  : undefined
+              }
+            />
+          </div>
 
           {/* Group mappings — edit mode only */}
           {mode === "edit" && initialProvider && (
@@ -1706,13 +1789,10 @@ export function AuthProvidersPage() {
 
   const createMut = useMutation({
     mutationFn: authProvidersApi.create,
-    onSuccess: (provider) => {
+    onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["auth-providers"] });
-      // Reopen the modal in edit mode so the user can immediately add mappings
-      // and run the test-connection probe (both require a saved provider).
-      setEditing(provider);
-      setModalMode("edit");
-      setInitialForm(initialFormFromProvider(provider));
+      setModalMode(null);
+      setEditing(null);
       setMutateError("");
     },
     onError: (err: Error & { response?: { data?: { detail?: string } } }) => {
@@ -1727,12 +1807,10 @@ export function AuthProvidersPage() {
       id: string;
       body: Parameters<typeof authProvidersApi.update>[1];
     }) => authProvidersApi.update(id, body),
-    onSuccess: (provider) => {
+    onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["auth-providers"] });
-      // Keep the modal open in edit mode after save — users often save and
-      // then immediately test or adjust mappings.
-      setEditing(provider);
-      setInitialForm(initialFormFromProvider(provider));
+      setModalMode(null);
+      setEditing(null);
       setMutateError("");
     },
     onError: (err: Error & { response?: { data?: { detail?: string } } }) => {
