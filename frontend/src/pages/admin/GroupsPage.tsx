@@ -383,9 +383,7 @@ export function GroupsPage() {
                 >
                   <td className="px-4 py-3 font-medium">{group.name}</td>
                   <td className="px-4 py-3 text-muted-foreground">
-                    {group.description || (
-                      <span className="opacity-40">—</span>
-                    )}
+                    {group.description || <span className="opacity-40">—</span>}
                   </td>
                   <td className="px-4 py-3">
                     <span className="rounded-full bg-muted px-2 py-0.5 text-xs">
@@ -453,10 +451,7 @@ export function GroupsPage() {
         />
       )}
       {deleteGroup && (
-        <DeleteModal
-          group={deleteGroup}
-          onClose={() => setDeleteGroup(null)}
-        />
+        <DeleteModal group={deleteGroup} onClose={() => setDeleteGroup(null)} />
       )}
     </div>
   );

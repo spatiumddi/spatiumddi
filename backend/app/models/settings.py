@@ -62,14 +62,10 @@ class PlatformSettings(Base):
 
     # IPAM ↔ DNS auto-sync (Celery beat fires every 60s, task gates on these).
     dns_auto_sync_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    dns_auto_sync_interval_minutes: Mapped[int] = mapped_column(
-        Integer, nullable=False, default=60
-    )
+    dns_auto_sync_interval_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=60)
     # When False (default), auto-sync only creates/updates records; stale records
     # (auto-generated rows pointing at deleted IPs) are left for manual cleanup.
-    dns_auto_sync_delete_stale: Mapped[bool] = mapped_column(
-        Boolean, nullable=False, default=False
-    )
+    dns_auto_sync_delete_stale: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     dns_auto_sync_last_run_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )

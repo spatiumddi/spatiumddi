@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import structlog
-from ldap3 import ALL, SUBTREE, Connection, Server, Tls
+from ldap3 import ALL, FIRST, SUBTREE, Connection, Server, ServerPool, Tls
 from ldap3.core.exceptions import (
     LDAPBindError,
     LDAPException,
@@ -33,10 +33,39 @@ class LDAPServiceError(Exception):
     misconfigured — distinct from a user password being wrong."""
 
 
+def _parse_host_port(entry: str, default_port: int) -> tuple[str, int]:
+    """Parse ``host`` or ``host:port`` into (host, port). Bracketed IPv6
+    literals like ``[::1]:389`` are also supported."""
+    s = entry.strip()
+    if not s:
+        raise ValueError("empty host entry")
+    # Bracketed IPv6: [::1]:389 or [::1]
+    if s.startswith("["):
+        end = s.find("]")
+        if end == -1:
+            raise ValueError(f"unterminated '[' in host entry: {entry!r}")
+        host = s[1:end]
+        rest = s[end + 1 :]
+        if not rest:
+            return host, default_port
+        if not rest.startswith(":"):
+            raise ValueError(f"expected ':port' after ']' in host entry: {entry!r}")
+        return host, int(rest[1:])
+    # host or host:port (plain)
+    if s.count(":") == 1:
+        host, _, port_s = s.partition(":")
+        return host.strip(), int(port_s)
+    return s, default_port
+
+
 @dataclass
 class LDAPConfig:
     host: str
     port: int
+    # Additional LDAP hosts to try when the primary is unreachable.
+    # Each entry is ``"host"`` or ``"host:port"``. Backups reuse the primary's
+    # port when no ``:port`` is provided.
+    backup_hosts: list[str]
     use_ssl: bool
     start_tls: bool
     bind_dn: str
@@ -52,11 +81,9 @@ class LDAPConfig:
     tls_ca_cert_file: str | None = None
 
     @classmethod
-    def from_provider(cls, provider: AuthProvider) -> "LDAPConfig":
+    def from_provider(cls, provider: AuthProvider) -> LDAPConfig:
         cfg = provider.config or {}
-        secrets = (
-            decrypt_dict(provider.secrets_encrypted) if provider.secrets_encrypted else {}
-        )
+        secrets = decrypt_dict(provider.secrets_encrypted) if provider.secrets_encrypted else {}
 
         host = str(cfg.get("host") or "").strip()
         if not host:
@@ -70,17 +97,26 @@ class LDAPConfig:
             raise LDAPServiceError("config.user_base_dn is required")
         user_filter = str(cfg.get("user_filter") or "").strip()
         if "{username}" not in user_filter:
-            raise LDAPServiceError(
-                "config.user_filter must contain the {username} placeholder"
-            )
+            raise LDAPServiceError("config.user_filter must contain the {username} placeholder")
 
         use_ssl = bool(cfg.get("use_ssl", True))
         port_raw = cfg.get("port")
         port = int(port_raw) if port_raw is not None else (636 if use_ssl else 389)
 
+        backup_raw = cfg.get("backup_hosts") or []
+        backup_hosts: list[str] = []
+        if isinstance(backup_raw, list):
+            backup_hosts = [str(h).strip() for h in backup_raw if str(h).strip()]
+        elif isinstance(backup_raw, str):
+            # Accept a comma-or-newline-separated string for convenience.
+            backup_hosts = [
+                tok.strip() for tok in backup_raw.replace("\n", ",").split(",") if tok.strip()
+            ]
+
         return cls(
             host=host,
             port=port,
+            backup_hosts=backup_hosts,
             use_ssl=use_ssl,
             start_tls=bool(cfg.get("start_tls", False)),
             bind_dn=bind_dn,
@@ -96,29 +132,52 @@ class LDAPConfig:
         )
 
 
-def _server(cfg: LDAPConfig) -> Server:
-    tls: Tls | None = None
-    if cfg.use_ssl or cfg.start_tls:
-        tls = Tls(
-            validate=ssl.CERT_REQUIRED,
-            ca_certs_file=cfg.tls_ca_cert_file,
-            version=ssl.PROTOCOL_TLS_CLIENT,
-        )
+def _tls(cfg: LDAPConfig) -> Tls | None:
+    if not (cfg.use_ssl or cfg.start_tls):
+        return None
+    return Tls(
+        validate=ssl.CERT_REQUIRED,
+        ca_certs_file=cfg.tls_ca_cert_file,
+        version=ssl.PROTOCOL_TLS_CLIENT,
+    )
+
+
+def _build_server(cfg: LDAPConfig, host: str, port: int) -> Server:
     return Server(
-        cfg.host,
-        port=cfg.port,
+        host,
+        port=port,
         use_ssl=cfg.use_ssl,
-        tls=tls,
+        tls=_tls(cfg),
         get_info=ALL,
         connect_timeout=5,
     )
+
+
+def _server_target(cfg: LDAPConfig) -> Server | ServerPool:
+    """Return a single Server if no backups are configured, otherwise a
+    ServerPool that fails over to the next host on connect failure."""
+    primary = _build_server(cfg, cfg.host, cfg.port)
+    if not cfg.backup_hosts:
+        return primary
+    servers: list[Server] = [primary]
+    for entry in cfg.backup_hosts:
+        try:
+            host, port = _parse_host_port(entry, cfg.port)
+        except ValueError:
+            logger.warning("ldap_backup_host_invalid", entry=entry)
+            continue
+        servers.append(_build_server(cfg, host, port))
+    # active=True → check reachability before issuing operations.
+    # exhaust=True → after a server fails, remove it for the pool's lifetime
+    # so subsequent binds in this Connection don't keep retrying a dead host.
+    return ServerPool(servers, pool_strategy=FIRST, active=True, exhaust=True)
 
 
 def _open(cfg: LDAPConfig, user: str, password: str) -> Connection:
     """Open + bind a connection. Raises LDAPBindError on credential failure,
     LDAPSocketOpenError / LDAPException on infrastructure failure."""
     conn = Connection(
-        _server(cfg),
+        _server_target(cfg),
         user=user,
         password=password,
         auto_bind=False,
@@ -266,12 +325,18 @@ def test_connection(
 
     try:
         if username is None:
+            # When a ServerPool is in use, ldap3 exposes the currently-bound
+            # server via service.server. Fall back to the configured primary
+            # if unavailable (single-host case).
+            bound_host = getattr(getattr(service, "server", None), "host", cfg.host)
+            bound_port = getattr(getattr(service, "server", None), "port", cfg.port)
             return {
                 "ok": True,
                 "message": "service bind OK",
                 "details": {
-                    "server": f"{cfg.host}:{cfg.port}",
+                    "server": f"{bound_host}:{bound_port}",
                     "tls": "ssl" if cfg.use_ssl else ("starttls" if cfg.start_tls else "plain"),
+                    "backups_configured": len(cfg.backup_hosts),
                 },
             }
 

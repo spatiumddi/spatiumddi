@@ -13,7 +13,6 @@ from app.core.permissions import user_has_permission
 from app.core.security import create_access_token, hash_password
 from app.models.auth import Group, Role, User
 
-
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 
@@ -50,9 +49,7 @@ async def _persist_user_with_role(
     username: str = "rbac-user",
     superadmin: bool = False,
 ) -> tuple[User, str]:
-    role = Role(
-        name=role_name, description="", is_builtin=False, permissions=permissions
-    )
+    role = Role(name=role_name, description="", is_builtin=False, permissions=permissions)
     group = Group(name=f"{role_name}-grp", description="")
     user = User(
         username=username,
@@ -196,9 +193,7 @@ async def test_viewer_can_get_but_not_post_subnets(
 
 
 @pytest.mark.asyncio
-async def test_ipam_editor_can_post_subnets(
-    client: AsyncClient, db_session: AsyncSession
-) -> None:
+async def test_ipam_editor_can_post_subnets(client: AsyncClient, db_session: AsyncSession) -> None:
     _, token = await _persist_user_with_role(
         db_session,
         role_name="IPAM-Editor-T",
@@ -220,9 +215,7 @@ async def test_ipam_editor_can_post_subnets(
 
 
 @pytest.mark.asyncio
-async def test_no_permissions_user_is_denied(
-    client: AsyncClient, db_session: AsyncSession
-) -> None:
+async def test_no_permissions_user_is_denied(client: AsyncClient, db_session: AsyncSession) -> None:
     user = User(
         username="no-perms",
         email="np@t.io",
@@ -239,16 +232,12 @@ async def test_no_permissions_user_is_denied(
     r = await client.get("/api/v1/ipam/spaces", headers=headers)
     assert r.status_code == 403
     # POST is write → denied.
-    r = await client.post(
-        "/api/v1/ipam/spaces", json={"name": "X"}, headers=headers
-    )
+    r = await client.post("/api/v1/ipam/spaces", json={"name": "X"}, headers=headers)
     assert r.status_code == 403
 
 
 @pytest.mark.asyncio
-async def test_dns_editor_cannot_touch_ipam(
-    client: AsyncClient, db_session: AsyncSession
-) -> None:
+async def test_dns_editor_cannot_touch_ipam(client: AsyncClient, db_session: AsyncSession) -> None:
     _, token = await _persist_user_with_role(
         db_session,
         role_name="DNS-Editor-T",

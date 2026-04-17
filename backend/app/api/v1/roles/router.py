@@ -162,9 +162,7 @@ async def list_roles(db: DB, _: CurrentUser) -> list[RoleResponse]:
 async def create_role(body: RoleCreate, current_user: CurrentUser, db: DB) -> RoleResponse:
     existing = await db.scalar(select(Role).where(Role.name == body.name))
     if existing is not None:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT, detail="Role name already in use"
-        )
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Role name already in use")
     r = Role(
         name=body.name,
         description=body.description,
@@ -256,9 +254,7 @@ async def clone_role(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Role not found")
     existing = await db.scalar(select(Role).where(Role.name == body.name))
     if existing is not None:
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT, detail="Role name already in use"
-        )
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Role name already in use")
     clone = Role(
         name=body.name,
         description=f"Cloned from '{src.name}'",

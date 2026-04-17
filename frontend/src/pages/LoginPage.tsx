@@ -21,14 +21,20 @@ function humanizeError(code: string | null): string {
   }
   if (code === "oidc_exchange_failed")
     return "OIDC token exchange failed. Check provider configuration.";
-  if (code === "oidc_state_missing" || code === "oidc_state_invalid" || code === "oidc_state_mismatch")
+  if (
+    code === "oidc_state_missing" ||
+    code === "oidc_state_invalid" ||
+    code === "oidc_state_mismatch"
+  )
     return "OIDC flow state was invalid or expired. Please try again.";
-  if (code === "oidc_no_code") return "OIDC provider returned no authorization code.";
+  if (code === "oidc_no_code")
+    return "OIDC provider returned no authorization code.";
   if (code === "oidc_discovery_failed")
     return "OIDC discovery failed — the provider's metadata URL is unreachable.";
   if (code === "oidc_misconfigured")
     return "OIDC provider is misconfigured. Contact an administrator.";
-  if (code.startsWith("oidc_idp_")) return `Identity provider returned: ${code.slice(9)}`;
+  if (code.startsWith("oidc_idp_"))
+    return `Identity provider returned: ${code.slice(9)}`;
   return "Login failed.";
 }
 

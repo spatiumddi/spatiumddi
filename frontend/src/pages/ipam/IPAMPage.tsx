@@ -344,8 +344,12 @@ function Field({
   );
 }
 
+// `focus:ring-inset` draws the focus ring inside the element, which prevents
+// the left/right edges of the ring from being clipped by the modal's
+// `overflow-y-auto` container (browsers default `overflow-x` to `auto` too
+// when `overflow-y` is set).
 const inputCls =
-  "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
+  "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-inset focus:ring-ring";
 
 /**
  * Shared DNS-zone dropdown options renderer.
@@ -377,9 +381,7 @@ function ZoneOptions({
   return (
     <>
       {noneOption && <option value="">— {noneOption} —</option>}
-      {primary && (
-        <option value={primary.id}>{fmt(primary)} (primary)</option>
-      )}
+      {primary && <option value={primary.id}>{fmt(primary)} (primary)</option>}
       {additional.length > 0 && (
         <optgroup label="Additional zones">
           {additional.map((z) => (
@@ -1337,7 +1339,7 @@ function CreateSubnetModal({
                 setNetwork(e.target.value);
                 setError(null);
               }}
-              placeholder="e.g. 10.0.1.0/24"
+              placeholder="e.g. 10.0.1.0/24 or 2001:db8:1::/64"
               autoFocus
             />
           </Field>
@@ -1610,6 +1612,7 @@ function AddAddressModal({
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["addresses", subnetId] });
+      qc.invalidateQueries({ queryKey: ["subnet-aliases", subnetId] });
       qc.invalidateQueries({ queryKey: ["subnets"] });
       onClose();
     },
@@ -2402,110 +2405,41 @@ function SubnetDetail({
           ) : (
             <>
               <div className="overflow-x-auto">
-              <table className="w-full min-w-[640px] text-sm">
-                <thead>
-                  <tr className="border-b bg-muted/40 text-xs">
-                    <th className="w-8 px-2 py-2">
-                      {(() => {
-                        const selectable = (filteredAddresses ?? []).filter(
-                          (a: IPAddress) =>
-                            a.status !== "network" && a.status !== "broadcast",
-                        );
-                        const allSelected =
-                          selectable.length > 0 &&
-                          selectable.every((a: IPAddress) =>
-                            selectedIpIds.has(a.id),
+                <table className="w-full min-w-[640px] text-sm">
+                  <thead>
+                    <tr className="border-b bg-muted/40 text-xs">
+                      <th className="w-8 px-2 py-2">
+                        {(() => {
+                          const selectable = (filteredAddresses ?? []).filter(
+                            (a: IPAddress) =>
+                              a.status !== "network" &&
+                              a.status !== "broadcast",
                           );
-                        return (
-                          <input
-                            type="checkbox"
-                            checked={allSelected}
-                            aria-label="Select all"
-                            onChange={(e) => {
-                              if (e.target.checked) {
-                                setSelectedIpIds(
-                                  new Set(
-                                    selectable.map((a: IPAddress) => a.id),
-                                  ),
-                                );
-                              } else {
-                                setSelectedIpIds(new Set());
-                              }
-                            }}
-                          />
-                        );
-                      })()}
-                    </th>
-                    {(
-                      [
-                        "address",
-                        "hostname",
-                        "mac",
-                        "description",
-                        "status",
-                        "pool",
-                        "dns",
-                      ] as const
-                    ).map((col) => {
-                      const label =
-                        col === "mac"
-                          ? "MAC"
-                          : col === "dns"
-                            ? "DNS"
-                            : col === "pool"
-                              ? "DHCP Pool"
-                              : col;
-                      return (
-                        <th
-                          key={col}
-                          className="px-4 py-2 text-left font-medium"
-                        >
-                          <span className="inline-flex items-center gap-1">
-                            <span className="capitalize">{label}</span>
-                            <button
-                              onClick={() => setShowFilters((v) => !v)}
-                              title={`Filter by ${label}`}
-                              className={cn(
-                                "rounded p-0.5 hover:bg-accent",
-                                colFilters[col]
-                                  ? "text-primary"
-                                  : showFilters
-                                    ? "text-primary/40"
-                                    : "text-muted-foreground/30 hover:text-muted-foreground",
-                              )}
-                            >
-                              <Filter className="h-2.5 w-2.5" />
-                            </button>
-                          </span>
-                        </th>
-                      );
-                    })}
-                    <th className="px-4 py-2 text-right">
-                      {hasActiveFilter && (
-                        <button
-                          onClick={() => {
-                            setColFilters({
-                              address: "",
-                              hostname: "",
-                              mac: "",
-                              description: "",
-                              status: "",
-                              dns: "",
-                              pool: "",
-                            });
-                            setFilterModes({});
-                          }}
-                          title="Clear all filters"
-                          className="rounded p-0.5 text-primary hover:text-destructive"
-                        >
-                          <X className="h-3 w-3" />
-                        </button>
-                      )}
-                    </th>
-                  </tr>
-                  {showFilters && (
-                    <tr className="border-b bg-muted/10 text-xs">
-                      <td />
+                          const allSelected =
+                            selectable.length > 0 &&
+                            selectable.every((a: IPAddress) =>
+                              selectedIpIds.has(a.id),
+                            );
+                          return (
+                            <input
+                              type="checkbox"
+                              checked={allSelected}
+                              aria-label="Select all"
+                              onChange={(e) => {
+                                if (e.target.checked) {
+                                  setSelectedIpIds(
+                                    new Set(
+                                      selectable.map((a: IPAddress) => a.id),
+                                    ),
+                                  );
+                                } else {
+                                  setSelectedIpIds(new Set());
+                                }
+                              }}
+                            />
+                          );
+                        })()}
+                      </th>
                       {(
                         [
                           "address",
@@ -2516,310 +2450,387 @@ function SubnetDetail({
                           "pool",
                           "dns",
                         ] as const
-                      ).map((col) => (
-                        <td key={col} className="px-2 py-1">
-                          {col === "status" ? (
-                            <select
-                              value={colFilters.status}
-                              onChange={(e) =>
-                                setColFilters((p) => ({
-                                  ...p,
-                                  status: e.target.value,
-                                }))
-                              }
-                              className="w-full rounded border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
-                            >
-                              <option value="">All</option>
-                              {[
-                                "allocated",
-                                "available",
-                                "reserved",
-                                "dhcp",
-                                "static_dhcp",
-                                "network",
-                                "broadcast",
-                                "orphan",
-                              ].map((s) => (
-                                <option key={s} value={s}>
-                                  {s}
-                                </option>
-                              ))}
-                            </select>
-                          ) : col === "dns" ? (
-                            <select
-                              value={colFilters.dns}
-                              onChange={(e) =>
-                                setColFilters((p) => ({
-                                  ...p,
-                                  dns: e.target.value,
-                                }))
-                              }
-                              className="w-full rounded border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
-                            >
-                              <option value="">All</option>
-                              <option value="in-sync">In sync</option>
-                              <option value="out-of-sync">Out of sync</option>
-                              <option value="n/a">N/A</option>
-                            </select>
-                          ) : (
-                            <div className="flex items-center">
-                              <input
-                                type="text"
-                                value={colFilters[col]}
+                      ).map((col) => {
+                        const label =
+                          col === "mac"
+                            ? "MAC"
+                            : col === "dns"
+                              ? "DNS"
+                              : col === "pool"
+                                ? "DHCP Pool"
+                                : col;
+                        return (
+                          <th
+                            key={col}
+                            className="px-4 py-2 text-left font-medium"
+                          >
+                            <span className="inline-flex items-center gap-1">
+                              <span className="capitalize">{label}</span>
+                              <button
+                                onClick={() => setShowFilters((v) => !v)}
+                                title={`Filter by ${label}`}
+                                className={cn(
+                                  "rounded p-0.5 hover:bg-accent",
+                                  colFilters[col]
+                                    ? "text-primary"
+                                    : showFilters
+                                      ? "text-primary/40"
+                                      : "text-muted-foreground/30 hover:text-muted-foreground",
+                                )}
+                              >
+                                <Filter className="h-2.5 w-2.5" />
+                              </button>
+                            </span>
+                          </th>
+                        );
+                      })}
+                      <th className="px-4 py-2 text-right">
+                        {hasActiveFilter && (
+                          <button
+                            onClick={() => {
+                              setColFilters({
+                                address: "",
+                                hostname: "",
+                                mac: "",
+                                description: "",
+                                status: "",
+                                dns: "",
+                                pool: "",
+                              });
+                              setFilterModes({});
+                            }}
+                            title="Clear all filters"
+                            className="rounded p-0.5 text-primary hover:text-destructive"
+                          >
+                            <X className="h-3 w-3" />
+                          </button>
+                        )}
+                      </th>
+                    </tr>
+                    {showFilters && (
+                      <tr className="border-b bg-muted/10 text-xs">
+                        <td />
+                        {(
+                          [
+                            "address",
+                            "hostname",
+                            "mac",
+                            "description",
+                            "status",
+                            "pool",
+                            "dns",
+                          ] as const
+                        ).map((col) => (
+                          <td key={col} className="px-2 py-1">
+                            {col === "status" ? (
+                              <select
+                                value={colFilters.status}
                                 onChange={(e) =>
                                   setColFilters((p) => ({
                                     ...p,
-                                    [col]: e.target.value,
+                                    status: e.target.value,
                                   }))
                                 }
-                                placeholder="Filter…"
-                                className="w-full min-w-0 rounded-l border border-r-0 bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
-                              />
-                              <div className="relative">
-                                <button
-                                  type="button"
-                                  onClick={() =>
-                                    setOpenFilterMenu(
-                                      openFilterMenu === col ? null : col,
-                                    )
+                                className="w-full rounded border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
+                              >
+                                <option value="">All</option>
+                                {[
+                                  "allocated",
+                                  "available",
+                                  "reserved",
+                                  "dhcp",
+                                  "static_dhcp",
+                                  "network",
+                                  "broadcast",
+                                  "orphan",
+                                ].map((s) => (
+                                  <option key={s} value={s}>
+                                    {s}
+                                  </option>
+                                ))}
+                              </select>
+                            ) : col === "dns" ? (
+                              <select
+                                value={colFilters.dns}
+                                onChange={(e) =>
+                                  setColFilters((p) => ({
+                                    ...p,
+                                    dns: e.target.value,
+                                  }))
+                                }
+                                className="w-full rounded border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
+                              >
+                                <option value="">All</option>
+                                <option value="in-sync">In sync</option>
+                                <option value="out-of-sync">Out of sync</option>
+                                <option value="n/a">N/A</option>
+                              </select>
+                            ) : (
+                              <div className="flex items-center">
+                                <input
+                                  type="text"
+                                  value={colFilters[col]}
+                                  onChange={(e) =>
+                                    setColFilters((p) => ({
+                                      ...p,
+                                      [col]: e.target.value,
+                                    }))
                                   }
-                                  className="rounded-r border bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground hover:bg-accent"
-                                  title="Filter mode"
-                                >
-                                  {filterModes[col] === "begins"
-                                    ? "^"
-                                    : filterModes[col] === "ends"
-                                      ? "$"
-                                      : filterModes[col] === "regex"
-                                        ? ".*"
-                                        : "⊂"}
-                                </button>
-                                {openFilterMenu === col && (
-                                  <div className="absolute left-0 top-full z-30 mt-0.5 w-32 rounded-md border bg-popover shadow-md">
-                                    {(
-                                      [
-                                        "contains",
-                                        "begins",
-                                        "ends",
-                                        "regex",
-                                      ] as const
-                                    ).map((m) => (
-                                      <button
-                                        key={m}
-                                        type="button"
-                                        onClick={() => {
-                                          setFilterModes((p) => ({
-                                            ...p,
-                                            [col]: m,
-                                          }));
-                                          setOpenFilterMenu(null);
-                                        }}
-                                        className={cn(
-                                          "w-full px-3 py-1.5 text-left text-xs hover:bg-accent",
-                                          filterModes[col] === m &&
-                                            "font-semibold text-primary",
-                                        )}
-                                      >
-                                        {m === "contains"
-                                          ? "⊂ Contains"
-                                          : m === "begins"
-                                            ? "^ Begins"
-                                            : m === "ends"
-                                              ? "$ Ends"
-                                              : ".* Regex"}
-                                      </button>
-                                    ))}
-                                  </div>
-                                )}
+                                  placeholder="Filter…"
+                                  className="w-full min-w-0 rounded-l border border-r-0 bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
+                                />
+                                <div className="relative">
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      setOpenFilterMenu(
+                                        openFilterMenu === col ? null : col,
+                                      )
+                                    }
+                                    className="rounded-r border bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground hover:bg-accent"
+                                    title="Filter mode"
+                                  >
+                                    {filterModes[col] === "begins"
+                                      ? "^"
+                                      : filterModes[col] === "ends"
+                                        ? "$"
+                                        : filterModes[col] === "regex"
+                                          ? ".*"
+                                          : "⊂"}
+                                  </button>
+                                  {openFilterMenu === col && (
+                                    <div className="absolute left-0 top-full z-30 mt-0.5 w-32 rounded-md border bg-popover shadow-md">
+                                      {(
+                                        [
+                                          "contains",
+                                          "begins",
+                                          "ends",
+                                          "regex",
+                                        ] as const
+                                      ).map((m) => (
+                                        <button
+                                          key={m}
+                                          type="button"
+                                          onClick={() => {
+                                            setFilterModes((p) => ({
+                                              ...p,
+                                              [col]: m,
+                                            }));
+                                            setOpenFilterMenu(null);
+                                          }}
+                                          className={cn(
+                                            "w-full px-3 py-1.5 text-left text-xs hover:bg-accent",
+                                            filterModes[col] === m &&
+                                              "font-semibold text-primary",
+                                          )}
+                                        >
+                                          {m === "contains"
+                                            ? "⊂ Contains"
+                                            : m === "begins"
+                                              ? "^ Begins"
+                                              : m === "ends"
+                                                ? "$ Ends"
+                                                : ".* Regex"}
+                                        </button>
+                                      ))}
+                                    </div>
+                                  )}
+                                </div>
                               </div>
-                            </div>
+                            )}
+                          </td>
+                        ))}
+                        <td />
+                      </tr>
+                    )}
+                  </thead>
+                  <tbody>
+                    {filteredAddresses?.length === 0 && (
+                      <tr>
+                        <td
+                          colSpan={9}
+                          className="px-4 py-6 text-center text-sm text-muted-foreground"
+                        >
+                          No addresses match the active filters.
+                        </td>
+                      </tr>
+                    )}
+                    {filteredAddresses?.map((addr: IPAddress) => {
+                      const dnsState = ipDnsState(addr);
+                      const systemRow =
+                        addr.status === "network" ||
+                        addr.status === "broadcast";
+                      const rowSelected = selectedIpIds.has(addr.id);
+                      return (
+                        <tr
+                          key={addr.id}
+                          className={cn(
+                            "group/addr border-b last:border-0 hover:bg-muted/20",
+                            (addr.status === "network" ||
+                              addr.status === "broadcast") &&
+                              "opacity-50",
+                            addr.status === "orphan" && "opacity-40",
+                            rowSelected && "bg-primary/5",
                           )}
-                        </td>
-                      ))}
-                      <td />
-                    </tr>
-                  )}
-                </thead>
-                <tbody>
-                  {filteredAddresses?.length === 0 && (
-                    <tr>
-                      <td
-                        colSpan={9}
-                        className="px-4 py-6 text-center text-sm text-muted-foreground"
-                      >
-                        No addresses match the active filters.
-                      </td>
-                    </tr>
-                  )}
-                  {filteredAddresses?.map((addr: IPAddress) => {
-                    const dnsState = ipDnsState(addr);
-                    const systemRow =
-                      addr.status === "network" || addr.status === "broadcast";
-                    const rowSelected = selectedIpIds.has(addr.id);
-                    return (
-                      <tr
-                        key={addr.id}
-                        className={cn(
-                          "group/addr border-b last:border-0 hover:bg-muted/20",
-                          (addr.status === "network" ||
-                            addr.status === "broadcast") &&
-                            "opacity-50",
-                          addr.status === "orphan" && "opacity-40",
-                          rowSelected && "bg-primary/5",
-                        )}
-                      >
-                        <td className="w-8 px-2 py-2">
-                          {!systemRow && (
-                            <input
-                              type="checkbox"
-                              checked={rowSelected}
-                              aria-label={`Select ${addr.address}`}
-                              onChange={(e) => {
-                                setSelectedIpIds((prev) => {
-                                  const next = new Set(prev);
-                                  if (e.target.checked) next.add(addr.id);
-                                  else next.delete(addr.id);
-                                  return next;
-                                });
-                              }}
-                            />
-                          )}
-                        </td>
-                        <td className="px-4 py-2 font-mono font-medium">
-                          <span className="inline-flex items-center gap-0.5">
-                            {addr.address}
-                            <CopyButton text={addr.address} />
-                          </span>
-                        </td>
-                        <td className="px-4 py-2">
-                          <span className="inline-flex items-center gap-1.5">
-                            {addr.fqdn ? (
-                              <span className="font-mono text-xs">
-                                {addr.fqdn}
+                        >
+                          <td className="w-8 px-2 py-2">
+                            {!systemRow && (
+                              <input
+                                type="checkbox"
+                                checked={rowSelected}
+                                aria-label={`Select ${addr.address}`}
+                                onChange={(e) => {
+                                  setSelectedIpIds((prev) => {
+                                    const next = new Set(prev);
+                                    if (e.target.checked) next.add(addr.id);
+                                    else next.delete(addr.id);
+                                    return next;
+                                  });
+                                }}
+                              />
+                            )}
+                          </td>
+                          <td className="px-4 py-2 font-mono font-medium">
+                            <span className="inline-flex items-center gap-0.5">
+                              {addr.address}
+                              <CopyButton text={addr.address} />
+                            </span>
+                          </td>
+                          <td className="px-4 py-2">
+                            <span className="inline-flex items-center gap-1.5">
+                              {addr.fqdn ? (
+                                <span className="font-mono text-xs">
+                                  {addr.fqdn}
+                                </span>
+                              ) : addr.hostname ? (
+                                <span className="text-muted-foreground">
+                                  {addr.hostname}
+                                </span>
+                              ) : (
+                                <span className="text-muted-foreground/40">
+                                  —
+                                </span>
+                              )}
+                              {(addr.alias_count ?? 0) > 0 && (
+                                <span
+                                  className="inline-flex items-center rounded bg-indigo-100 px-1.5 py-0.5 text-[10px] font-medium text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-400"
+                                  title={`${addr.alias_count} alias${(addr.alias_count ?? 0) === 1 ? "" : "es"} — edit IP to view`}
+                                >
+                                  +{addr.alias_count}{" "}
+                                  {addr.alias_count === 1 ? "alias" : "aliases"}
+                                </span>
+                              )}
+                            </span>
+                          </td>
+                          <td className="px-4 py-2 font-mono text-xs">
+                            {addr.mac_address ?? (
+                              <span className="text-muted-foreground/40">
+                                —
                               </span>
-                            ) : addr.hostname ? (
-                              <span className="text-muted-foreground">
-                                {addr.hostname}
+                            )}
+                          </td>
+                          <td className="px-4 py-2 text-muted-foreground">
+                            {addr.description ?? (
+                              <span className="text-muted-foreground/40">
+                                —
+                              </span>
+                            )}
+                          </td>
+                          <td className="px-4 py-2">
+                            <StatusBadge status={addr.status} />
+                          </td>
+                          <td className="px-4 py-2">
+                            {(() => {
+                              const pi = ipPoolInfo(addr);
+                              if (!pi)
+                                return (
+                                  <span className="text-muted-foreground/40">
+                                    —
+                                  </span>
+                                );
+                              const cls =
+                                pi.type === "dynamic"
+                                  ? "bg-cyan-100 text-cyan-800 dark:bg-cyan-900/30 dark:text-cyan-400"
+                                  : pi.type === "reserved"
+                                    ? "bg-violet-100 text-violet-800 dark:bg-violet-900/30 dark:text-violet-400"
+                                    : "bg-zinc-100 text-zinc-600 dark:bg-zinc-800/30 dark:text-zinc-400";
+                              return (
+                                <span
+                                  className={`inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium ${cls}`}
+                                >
+                                  {pi.name}
+                                </span>
+                              );
+                            })()}
+                          </td>
+                          <td className="px-4 py-2">
+                            {dnsState === "in-sync" ? (
+                              <span
+                                className="inline-flex items-center gap-1 text-xs text-emerald-600"
+                                title="DNS records match IPAM"
+                              >
+                                <span className="inline-block h-1.5 w-1.5 rounded-full bg-emerald-500" />
+                                in sync
+                              </span>
+                            ) : dnsState === "out-of-sync" ? (
+                              <span
+                                className="inline-flex items-center gap-1 text-xs text-amber-600"
+                                title="DNS records are missing or differ — open Check DNS Sync to reconcile"
+                              >
+                                <span className="inline-block h-1.5 w-1.5 rounded-full bg-amber-500" />
+                                out of sync
                               </span>
                             ) : (
                               <span className="text-muted-foreground/40">
                                 —
                               </span>
                             )}
-                            {(addr.alias_count ?? 0) > 0 && (
-                              <span
-                                className="inline-flex items-center rounded bg-indigo-100 px-1.5 py-0.5 text-[10px] font-medium text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-400"
-                                title={`${addr.alias_count} alias${(addr.alias_count ?? 0) === 1 ? "" : "es"} — edit IP to view`}
-                              >
-                                +{addr.alias_count}{" "}
-                                {addr.alias_count === 1 ? "alias" : "aliases"}
-                              </span>
-                            )}
-                          </span>
-                        </td>
-                        <td className="px-4 py-2 font-mono text-xs">
-                          {addr.mac_address ?? (
-                            <span className="text-muted-foreground/40">—</span>
-                          )}
-                        </td>
-                        <td className="px-4 py-2 text-muted-foreground">
-                          {addr.description ?? (
-                            <span className="text-muted-foreground/40">—</span>
-                          )}
-                        </td>
-                        <td className="px-4 py-2">
-                          <StatusBadge status={addr.status} />
-                        </td>
-                        <td className="px-4 py-2">
-                          {(() => {
-                            const pi = ipPoolInfo(addr);
-                            if (!pi)
-                              return (
-                                <span className="text-muted-foreground/40">
-                                  —
-                                </span>
-                              );
-                            const cls =
-                              pi.type === "dynamic"
-                                ? "bg-cyan-100 text-cyan-800 dark:bg-cyan-900/30 dark:text-cyan-400"
-                                : pi.type === "reserved"
-                                  ? "bg-violet-100 text-violet-800 dark:bg-violet-900/30 dark:text-violet-400"
-                                  : "bg-zinc-100 text-zinc-600 dark:bg-zinc-800/30 dark:text-zinc-400";
-                            return (
-                              <span
-                                className={`inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium ${cls}`}
-                              >
-                                {pi.name}
-                              </span>
-                            );
-                          })()}
-                        </td>
-                        <td className="px-4 py-2">
-                          {dnsState === "in-sync" ? (
-                            <span
-                              className="inline-flex items-center gap-1 text-xs text-emerald-600"
-                              title="DNS records match IPAM"
-                            >
-                              <span className="inline-block h-1.5 w-1.5 rounded-full bg-emerald-500" />
-                              in sync
-                            </span>
-                          ) : dnsState === "out-of-sync" ? (
-                            <span
-                              className="inline-flex items-center gap-1 text-xs text-amber-600"
-                              title="DNS records are missing or differ — open Check DNS Sync to reconcile"
-                            >
-                              <span className="inline-block h-1.5 w-1.5 rounded-full bg-amber-500" />
-                              out of sync
-                            </span>
-                          ) : (
-                            <span className="text-muted-foreground/40">—</span>
-                          )}
-                        </td>
-                        <td className="px-4 py-2 text-right">
-                          <div className="flex items-center justify-end gap-1">
-                            {addr.status === "orphan" ? (
-                              <>
-                                <button
-                                  onClick={() => restoreAddr.mutate(addr.id)}
-                                  disabled={restoreAddr.isPending}
-                                  className="rounded p-1 text-xs text-muted-foreground hover:text-green-600"
-                                  title="Restore (mark as allocated)"
-                                >
-                                  <RefreshCw className="h-3.5 w-3.5" />
-                                </button>
-                                <button
-                                  onClick={() => setConfirmPurgeAddr(addr)}
-                                  className="rounded p-1 text-muted-foreground hover:text-destructive"
-                                  title="Permanently delete"
-                                >
-                                  <Trash2 className="h-3.5 w-3.5" />
-                                </button>
-                              </>
-                            ) : !isReadOnly(addr.status) ? (
-                              <>
-                                <button
-                                  onClick={() => setEditingAddress(addr)}
-                                  className="rounded p-1 text-muted-foreground hover:text-foreground"
-                                  title="Edit"
-                                >
-                                  <Pencil className="h-3.5 w-3.5" />
-                                </button>
-                                <button
-                                  onClick={() => setConfirmDeleteAddr(addr)}
-                                  className="rounded p-1 text-muted-foreground hover:text-destructive"
-                                  title="Delete"
-                                >
-                                  <Trash2 className="h-3.5 w-3.5" />
-                                </button>
-                              </>
-                            ) : null}
-                          </div>
-                        </td>
-                      </tr>
-                    );
-                  })}
-                </tbody>
-              </table>
+                          </td>
+                          <td className="px-4 py-2 text-right">
+                            <div className="flex items-center justify-end gap-1">
+                              {addr.status === "orphan" ? (
+                                <>
+                                  <button
+                                    onClick={() => restoreAddr.mutate(addr.id)}
+                                    disabled={restoreAddr.isPending}
+                                    className="rounded p-1 text-xs text-muted-foreground hover:text-green-600"
+                                    title="Restore (mark as allocated)"
+                                  >
+                                    <RefreshCw className="h-3.5 w-3.5" />
+                                  </button>
+                                  <button
+                                    onClick={() => setConfirmPurgeAddr(addr)}
+                                    className="rounded p-1 text-muted-foreground hover:text-destructive"
+                                    title="Permanently delete"
+                                  >
+                                    <Trash2 className="h-3.5 w-3.5" />
+                                  </button>
+                                </>
+                              ) : !isReadOnly(addr.status) ? (
+                                <>
+                                  <button
+                                    onClick={() => setEditingAddress(addr)}
+                                    className="rounded p-1 text-muted-foreground hover:text-foreground"
+                                    title="Edit"
+                                  >
+                                    <Pencil className="h-3.5 w-3.5" />
+                                  </button>
+                                  <button
+                                    onClick={() => setConfirmDeleteAddr(addr)}
+                                    className="rounded p-1 text-muted-foreground hover:text-destructive"
+                                    title="Delete"
+                                  >
+                                    <Trash2 className="h-3.5 w-3.5" />
+                                  </button>
+                                </>
+                              ) : null}
+                            </div>
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
               </div>
             </>
           )}
@@ -3587,9 +3598,7 @@ function EditSubnetModal({
       } else if (src.startsWith("space:")) {
         const sid = src.slice("space:".length);
         const s = allSpaces.find((x) => x.id === sid);
-        cfInheritedLabels[key] = s?.name
-          ? `IP Space ${s.name}`
-          : "IP Space";
+        cfInheritedLabels[key] = s?.name ? `IP Space ${s.name}` : "IP Space";
       } else {
         cfInheritedLabels[key] = src;
       }
@@ -3902,6 +3911,7 @@ function EditAddressModal({
       setNewAliasName("");
       qc.invalidateQueries({ queryKey: ["ip-aliases", address.id] });
       qc.invalidateQueries({ queryKey: ["addresses", address.subnet_id] });
+      qc.invalidateQueries({ queryKey: ["subnet-aliases", address.subnet_id] });
     },
     onError: (e: unknown) => {
       const err = e as {
@@ -3913,8 +3923,10 @@ function EditAddressModal({
   });
   const delAliasMut = useMutation({
     mutationFn: (rid: string) => ipamApi.deleteAlias(address.id, rid),
-    onSuccess: () =>
-      qc.invalidateQueries({ queryKey: ["ip-aliases", address.id] }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["ip-aliases", address.id] });
+      qc.invalidateQueries({ queryKey: ["subnet-aliases", address.subnet_id] });
+    },
   });
 
   const zoneGroupIds: string[] = effectiveDns?.dns_group_ids ?? [];
@@ -4174,6 +4186,11 @@ function AliasesSubnetPanel({ subnetId }: { subnetId: string }) {
     queryKey: ["subnet-aliases", subnetId],
     queryFn: () => ipamApi.listSubnetAliases(subnetId),
   });
+  const [confirmDel, setConfirmDel] = useState<{
+    ip_address_id: string;
+    id: string;
+    fqdn: string;
+  } | null>(null);
 
   const delAlias = useMutation({
     mutationFn: (a: { ip_address_id: string; id: string }) =>
@@ -4181,6 +4198,7 @@ function AliasesSubnetPanel({ subnetId }: { subnetId: string }) {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["subnet-aliases", subnetId] });
       qc.invalidateQueries({ queryKey: ["addresses", subnetId] });
+      setConfirmDel(null);
     },
   });
 
@@ -4205,51 +4223,68 @@ function AliasesSubnetPanel({ subnetId }: { subnetId: string }) {
 
   return (
     <div className="overflow-x-auto">
-    <table className="w-full min-w-[640px] text-sm">
-      <thead>
-        <tr className="border-b bg-muted/40 text-xs">
-          <th className="px-4 py-2 text-left font-medium">Alias</th>
-          <th className="px-4 py-2 text-left font-medium">Type</th>
-          <th className="px-4 py-2 text-left font-medium">Target</th>
-          <th className="px-4 py-2 text-left font-medium">IP</th>
-          <th className="px-4 py-2 text-left font-medium">Host</th>
-          <th className="px-4 py-2" />
-        </tr>
-      </thead>
-      <tbody>
-        {aliases.map((a) => (
-          <tr key={a.id} className="border-b last:border-0 hover:bg-muted/20">
-            <td className="px-4 py-2 font-mono text-xs">{a.fqdn}</td>
-            <td className="px-4 py-2">
-              <span className="inline-flex items-center rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium">
-                {a.record_type}
-              </span>
-            </td>
-            <td className="px-4 py-2 font-mono text-xs text-muted-foreground">
-              {a.value}
-            </td>
-            <td className="px-4 py-2 font-mono text-xs">{a.ip_address}</td>
-            <td className="px-4 py-2 text-muted-foreground">
-              {a.ip_hostname ?? (
-                <span className="text-muted-foreground/40">—</span>
-              )}
-            </td>
-            <td className="px-4 py-2 text-right">
-              <button
-                onClick={() =>
-                  delAlias.mutate({ ip_address_id: a.ip_address_id, id: a.id })
-                }
-                disabled={delAlias.isPending}
-                className="rounded p-1 text-muted-foreground hover:text-destructive"
-                title="Delete alias"
-              >
-                <Trash2 className="h-3.5 w-3.5" />
-              </button>
-            </td>
+      <table className="w-full min-w-[640px] text-sm">
+        <thead>
+          <tr className="border-b bg-muted/40 text-xs">
+            <th className="px-4 py-2 text-left font-medium">Alias</th>
+            <th className="px-4 py-2 text-left font-medium">Type</th>
+            <th className="px-4 py-2 text-left font-medium">Target</th>
+            <th className="px-4 py-2 text-left font-medium">IP</th>
+            <th className="px-4 py-2 text-left font-medium">Host</th>
+            <th className="px-4 py-2" />
           </tr>
-        ))}
-      </tbody>
-    </table>
+        </thead>
+        <tbody>
+          {aliases.map((a) => (
+            <tr key={a.id} className="border-b last:border-0 hover:bg-muted/20">
+              <td className="px-4 py-2 font-mono text-xs">{a.fqdn}</td>
+              <td className="px-4 py-2">
+                <span className="inline-flex items-center rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium">
+                  {a.record_type}
+                </span>
+              </td>
+              <td className="px-4 py-2 font-mono text-xs text-muted-foreground">
+                {a.value}
+              </td>
+              <td className="px-4 py-2 font-mono text-xs">{a.ip_address}</td>
+              <td className="px-4 py-2 text-muted-foreground">
+                {a.ip_hostname ?? (
+                  <span className="text-muted-foreground/40">—</span>
+                )}
+              </td>
+              <td className="px-4 py-2 text-right">
+                <button
+                  onClick={() =>
+                    setConfirmDel({
+                      ip_address_id: a.ip_address_id,
+                      id: a.id,
+                      fqdn: a.fqdn,
+                    })
+                  }
+                  className="rounded p-1 text-muted-foreground hover:text-destructive"
+                  title="Delete alias"
+                >
+                  <Trash2 className="h-3.5 w-3.5" />
+                </button>
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      {confirmDel && (
+        <ConfirmDeleteModal
+          title="Delete alias"
+          message={`Delete alias ${confirmDel.fqdn}? The DNS record will be removed.`}
+          onConfirm={() =>
+            delAlias.mutate({
+              ip_address_id: confirmDel.ip_address_id,
+              id: confirmDel.id,
+            })
+          }
+          onClose={() => setConfirmDel(null)}
+          isPending={delAlias.isPending}
+        />
+      )}
     </div>
   );
 }
@@ -4418,8 +4453,7 @@ function BulkEditAddressesModal({
     editTags &&
     (tagRows.some((r) => r.k.trim() !== "") ||
       (replaceAllTags && existingTagKeys.size > 0));
-  const hasCfChanges =
-    editCustomFields && Object.values(cfOptIn).some(Boolean);
+  const hasCfChanges = editCustomFields && Object.values(cfOptIn).some(Boolean);
   const hasChanges =
     editStatus ||
     editDescription ||
@@ -4512,8 +4546,8 @@ function BulkEditAddressesModal({
                 </select>
                 <p className="text-[11px] text-muted-foreground">
                   Moves every selected IP's forward record to this zone (and
-                  deletes the old record if present). Picking
-                  &ldquo;None&rdquo; removes the DNS record entirely.
+                  deletes the old record if present). Picking &ldquo;None&rdquo;
+                  removes the DNS record entirely.
                 </p>
               </div>
             )}
@@ -5373,7 +5407,7 @@ function CreateBlockModal({
               setNetwork(e.target.value);
               setError(null);
             }}
-            placeholder="e.g. 10.0.0.0/8"
+            placeholder="e.g. 10.0.0.0/8 or 2001:db8::/32"
             autoFocus
           />
         </Field>
@@ -5529,9 +5563,7 @@ function EditBlockModal({
       } else if (src.startsWith("space:")) {
         const sid = src.slice("space:".length);
         const s = allSpaces.find((x) => x.id === sid);
-        cfInheritedLabels[key] = s?.name
-          ? `IP Space ${s.name}`
-          : "IP Space";
+        cfInheritedLabels[key] = s?.name ? `IP Space ${s.name}` : "IP Space";
       } else {
         cfInheritedLabels[key] = src;
       }
@@ -6242,121 +6274,31 @@ function BlockDetailView({
 
           return (
             <div className="overflow-x-auto">
-            <table className="w-full min-w-[720px] text-sm">
-              <thead>
-                <tr className="border-b bg-muted/40 text-xs">
-                  <th className="w-8 px-2 py-2 text-left">
-                    {(() => {
-                      const subnetIds = allRows
-                        .filter((r) => r.type === "subnet" && r.subnet)
-                        .map((r) => r.subnet!.id);
-                      const allSelected =
-                        subnetIds.length > 0 &&
-                        subnetIds.every((id) => selectedSubnets.has(id));
-                      return (
-                        <input
-                          type="checkbox"
-                          aria-label="Select all subnets"
-                          checked={allSelected}
-                          onChange={() =>
-                            setSelectedSubnets(
-                              allSelected ? new Set() : new Set(subnetIds),
-                            )
-                          }
-                        />
-                      );
-                    })()}
-                  </th>
-                  {(
-                    [
-                      "Network",
-                      "Name",
-                      "Router",
-                      "VLAN",
-                      "Used IPs",
-                      "Utilization",
-                      "Size",
-                      "Status",
-                    ] as const
-                  ).map((col) => {
-                    const filterKey =
-                      col === "Network"
-                        ? "network"
-                        : col === "Name"
-                          ? "name"
-                          : col === "Router"
-                            ? "router"
-                            : col === "VLAN"
-                              ? "vlan"
-                              : col === "Status"
-                                ? "status"
-                                : null;
-                    const hasFilter = filterKey
-                      ? !!blockFilter[filterKey as keyof typeof blockFilter]
-                      : false;
-                    const isFilterable = filterKey !== null;
-                    return (
-                      <th
-                        key={col}
-                        className={cn(
-                          "px-4 py-2 font-medium text-muted-foreground",
-                          col === "Size" ? "text-right" : "text-left",
-                        )}
-                      >
-                        <span className="inline-flex items-center gap-1">
-                          {col}
-                          {isFilterable && (
-                            <button
-                              onClick={() => setShowBlockFilters((v) => !v)}
-                              title={`Filter by ${col}`}
-                              className={cn(
-                                "rounded p-0.5 hover:bg-accent",
-                                hasFilter
-                                  ? "text-primary"
-                                  : showBlockFilters ||
-                                      Object.values(blockFilter).some(Boolean)
-                                    ? "text-primary/50"
-                                    : "text-muted-foreground/40 hover:text-muted-foreground",
-                              )}
-                            >
-                              <Filter className="h-2.5 w-2.5" />
-                            </button>
-                          )}
-                        </span>
-                      </th>
-                    );
-                  })}
-                  {subnetCfDefs.map((def) => (
-                    <th
-                      key={def.name}
-                      className="px-4 py-2 text-left font-medium text-muted-foreground"
-                    >
-                      {def.label}
+              <table className="w-full min-w-[720px] text-sm">
+                <thead>
+                  <tr className="border-b bg-muted/40 text-xs">
+                    <th className="w-8 px-2 py-2 text-left">
+                      {(() => {
+                        const subnetIds = allRows
+                          .filter((r) => r.type === "subnet" && r.subnet)
+                          .map((r) => r.subnet!.id);
+                        const allSelected =
+                          subnetIds.length > 0 &&
+                          subnetIds.every((id) => selectedSubnets.has(id));
+                        return (
+                          <input
+                            type="checkbox"
+                            aria-label="Select all subnets"
+                            checked={allSelected}
+                            onChange={() =>
+                              setSelectedSubnets(
+                                allSelected ? new Set() : new Set(subnetIds),
+                              )
+                            }
+                          />
+                        );
+                      })()}
                     </th>
-                  ))}
-                  <th className="px-4 py-2 text-right">
-                    {Object.values(blockFilter).some(Boolean) && (
-                      <button
-                        onClick={() =>
-                          setBlockFilter({
-                            network: "",
-                            name: "",
-                            router: "",
-                            vlan: "",
-                            status: "",
-                          })
-                        }
-                        title="Clear all filters"
-                        className="rounded p-0.5 text-primary hover:text-destructive"
-                      >
-                        <X className="h-3 w-3" />
-                      </button>
-                    )}
-                  </th>
-                </tr>
-                {showBlockFilters && (
-                  <tr className="border-b bg-muted/10 text-xs">
-                    <td />
                     {(
                       [
                         "Network",
@@ -6381,224 +6323,326 @@ function BlockDetailView({
                                 : col === "Status"
                                   ? "status"
                                   : null;
-                      if (!filterKey) return <td key={col} />;
-                      if (filterKey === "status") {
-                        return (
-                          <td key={col} className="px-2 py-1">
-                            <select
-                              value={blockFilter.status}
-                              onChange={(e) =>
-                                setBlockFilter((p) => ({
-                                  ...p,
-                                  status: e.target.value,
-                                }))
-                              }
-                              className="w-full rounded border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
-                            >
-                              <option value="">All</option>
-                              {[
-                                "active",
-                                "reserved",
-                                "deprecated",
-                                "quarantine",
-                              ].map((s) => (
-                                <option key={s} value={s}>
-                                  {s}
-                                </option>
-                              ))}
-                            </select>
-                          </td>
-                        );
-                      }
+                      const hasFilter = filterKey
+                        ? !!blockFilter[filterKey as keyof typeof blockFilter]
+                        : false;
+                      const isFilterable = filterKey !== null;
                       return (
-                        <td key={col} className="px-2 py-1">
-                          <input
-                            type="text"
-                            value={
-                              blockFilter[filterKey as keyof typeof blockFilter]
-                            }
-                            onChange={(e) =>
-                              setBlockFilter((p) => ({
-                                ...p,
-                                [filterKey]: e.target.value,
-                              }))
-                            }
-                            placeholder="Filter…"
-                            className="w-full rounded border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
-                          />
-                        </td>
+                        <th
+                          key={col}
+                          className={cn(
+                            "px-4 py-2 font-medium text-muted-foreground",
+                            col === "Size" ? "text-right" : "text-left",
+                          )}
+                        >
+                          <span className="inline-flex items-center gap-1">
+                            {col}
+                            {isFilterable && (
+                              <button
+                                onClick={() => setShowBlockFilters((v) => !v)}
+                                title={`Filter by ${col}`}
+                                className={cn(
+                                  "rounded p-0.5 hover:bg-accent",
+                                  hasFilter
+                                    ? "text-primary"
+                                    : showBlockFilters ||
+                                        Object.values(blockFilter).some(Boolean)
+                                      ? "text-primary/50"
+                                      : "text-muted-foreground/40 hover:text-muted-foreground",
+                                )}
+                              >
+                                <Filter className="h-2.5 w-2.5" />
+                              </button>
+                            )}
+                          </span>
+                        </th>
                       );
                     })}
                     {subnetCfDefs.map((def) => (
-                      <td key={def.name} />
-                    ))}
-                    <td />
-                  </tr>
-                )}
-              </thead>
-              <tbody>
-                {allRows.map((item) => {
-                  const indent = item.depth * 20;
-                  if (item.type === "block" && item.block) {
-                    const b = item.block;
-                    return (
-                      <tr
-                        key={item.key}
-                        onClick={() => onSelectBlock(b)}
-                        className="border-b last:border-0 cursor-pointer hover:bg-muted/30 bg-muted/10"
+                      <th
+                        key={def.name}
+                        className="px-4 py-2 text-left font-medium text-muted-foreground"
                       >
-                        <td className="w-8 px-2 py-2" />
-                        <td
-                          className="py-2 pr-4"
-                          style={{ paddingLeft: `${indent + 16}px` }}
+                        {def.label}
+                      </th>
+                    ))}
+                    <th className="px-4 py-2 text-right">
+                      {Object.values(blockFilter).some(Boolean) && (
+                        <button
+                          onClick={() =>
+                            setBlockFilter({
+                              network: "",
+                              name: "",
+                              router: "",
+                              vlan: "",
+                              status: "",
+                            })
+                          }
+                          title="Clear all filters"
+                          className="rounded p-0.5 text-primary hover:text-destructive"
                         >
-                          <span className="inline-flex items-center gap-1.5 font-mono font-semibold text-foreground">
-                            <Layers className="h-3.5 w-3.5 flex-shrink-0 text-violet-500" />
-                            {b.network}
-                          </span>
-                        </td>
-                        <td className="px-4 py-2 text-muted-foreground">
-                          {b.name || (
-                            <span className="text-muted-foreground/40">—</span>
-                          )}
-                        </td>
-                        <td className="px-4 py-2 text-muted-foreground/40">
-                          —
-                        </td>
-                        <td className="px-4 py-2 text-muted-foreground/40">
-                          —
-                        </td>
-                        <td className="px-4 py-2 text-muted-foreground/40">
-                          —
-                        </td>
-                        <td className="px-4 py-2">
-                          {b.utilization_percent > 0 ? (
-                            <UtilizationBar percent={b.utilization_percent} />
-                          ) : (
-                            <span className="text-muted-foreground/40">—</span>
-                          )}
-                        </td>
-                        <td className="px-4 py-2 text-right tabular-nums text-muted-foreground">
-                          {cidrSize(b.network).toLocaleString()}
-                        </td>
-                        <td className="px-4 py-2 text-muted-foreground/40">
-                          —
-                        </td>
-                        {subnetCfDefs.map((def) => (
+                          <X className="h-3 w-3" />
+                        </button>
+                      )}
+                    </th>
+                  </tr>
+                  {showBlockFilters && (
+                    <tr className="border-b bg-muted/10 text-xs">
+                      <td />
+                      {(
+                        [
+                          "Network",
+                          "Name",
+                          "Router",
+                          "VLAN",
+                          "Used IPs",
+                          "Utilization",
+                          "Size",
+                          "Status",
+                        ] as const
+                      ).map((col) => {
+                        const filterKey =
+                          col === "Network"
+                            ? "network"
+                            : col === "Name"
+                              ? "name"
+                              : col === "Router"
+                                ? "router"
+                                : col === "VLAN"
+                                  ? "vlan"
+                                  : col === "Status"
+                                    ? "status"
+                                    : null;
+                        if (!filterKey) return <td key={col} />;
+                        if (filterKey === "status") {
+                          return (
+                            <td key={col} className="px-2 py-1">
+                              <select
+                                value={blockFilter.status}
+                                onChange={(e) =>
+                                  setBlockFilter((p) => ({
+                                    ...p,
+                                    status: e.target.value,
+                                  }))
+                                }
+                                className="w-full rounded border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
+                              >
+                                <option value="">All</option>
+                                {[
+                                  "active",
+                                  "reserved",
+                                  "deprecated",
+                                  "quarantine",
+                                ].map((s) => (
+                                  <option key={s} value={s}>
+                                    {s}
+                                  </option>
+                                ))}
+                              </select>
+                            </td>
+                          );
+                        }
+                        return (
+                          <td key={col} className="px-2 py-1">
+                            <input
+                              type="text"
+                              value={
+                                blockFilter[
+                                  filterKey as keyof typeof blockFilter
+                                ]
+                              }
+                              onChange={(e) =>
+                                setBlockFilter((p) => ({
+                                  ...p,
+                                  [filterKey]: e.target.value,
+                                }))
+                              }
+                              placeholder="Filter…"
+                              className="w-full rounded border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
+                            />
+                          </td>
+                        );
+                      })}
+                      {subnetCfDefs.map((def) => (
+                        <td key={def.name} />
+                      ))}
+                      <td />
+                    </tr>
+                  )}
+                </thead>
+                <tbody>
+                  {allRows.map((item) => {
+                    const indent = item.depth * 20;
+                    if (item.type === "block" && item.block) {
+                      const b = item.block;
+                      return (
+                        <tr
+                          key={item.key}
+                          onClick={() => onSelectBlock(b)}
+                          className="border-b last:border-0 cursor-pointer hover:bg-muted/30 bg-muted/10"
+                        >
+                          <td className="w-8 px-2 py-2" />
                           <td
-                            key={def.name}
-                            className="px-4 py-2 text-muted-foreground/40"
+                            className="py-2 pr-4"
+                            style={{ paddingLeft: `${indent + 16}px` }}
                           >
+                            <span className="inline-flex items-center gap-1.5 font-mono font-semibold text-foreground">
+                              <Layers className="h-3.5 w-3.5 flex-shrink-0 text-violet-500" />
+                              {b.network}
+                            </span>
+                          </td>
+                          <td className="px-4 py-2 text-muted-foreground">
+                            {b.name || (
+                              <span className="text-muted-foreground/40">
+                                —
+                              </span>
+                            )}
+                          </td>
+                          <td className="px-4 py-2 text-muted-foreground/40">
                             —
                           </td>
-                        ))}
-                        <td />
-                      </tr>
-                    );
-                  }
-                  if (item.type === "subnet" && item.subnet) {
-                    const s = item.subnet;
-                    return (
-                      <tr
-                        key={item.key}
-                        onClick={() => onSelectSubnet(s)}
-                        className={cn(
-                          "border-b last:border-0 cursor-pointer hover:bg-muted/30",
-                          selectedSubnets.has(s.id) && "bg-primary/5",
-                        )}
-                      >
-                        <td
-                          className="w-8 px-2 py-2"
-                          onClick={(e) => e.stopPropagation()}
-                        >
-                          <input
-                            type="checkbox"
-                            aria-label={`Select ${s.network}`}
-                            checked={selectedSubnets.has(s.id)}
-                            onChange={() =>
-                              setSelectedSubnets((prev) => {
-                                const next = new Set(prev);
-                                if (next.has(s.id)) next.delete(s.id);
-                                else next.add(s.id);
-                                return next;
-                              })
-                            }
-                          />
-                        </td>
-                        <td
-                          className="py-2 pr-4"
-                          style={{ paddingLeft: `${indent + 16}px` }}
-                        >
-                          <span className="inline-flex items-center gap-1.5 font-mono font-medium">
-                            <Network className="h-3.5 w-3.5 flex-shrink-0 text-blue-500" />
-                            {s.network}
-                          </span>
-                        </td>
-                        <td className="px-4 py-2 text-muted-foreground">
-                          {s.name || (
-                            <span className="text-muted-foreground/40">—</span>
-                          )}
-                        </td>
-                        <td className="px-4 py-2 text-muted-foreground">
-                          {s.vlan?.router_name ?? (
-                            <span className="text-muted-foreground/40">—</span>
-                          )}
-                        </td>
-                        <td className="px-4 py-2 text-muted-foreground">
-                          {s.vlan ? (
-                            <span>
-                              {s.vlan.vlan_id}
-                              {s.vlan.name && (
-                                <span className="ml-1 text-muted-foreground/70">
-                                  ({s.vlan.name})
-                                </span>
-                              )}
-                            </span>
-                          ) : s.vlan_id != null ? (
-                            <span
-                              className="text-muted-foreground/70"
-                              title="Legacy tag — assign a Router/VLAN from the Edit modal"
-                            >
-                              {s.vlan_id}
-                            </span>
-                          ) : (
-                            <span className="text-muted-foreground/40">—</span>
-                          )}
-                        </td>
-                        <td className="px-4 py-2 tabular-nums text-muted-foreground">
-                          {s.allocated_ips} / {s.total_ips}
-                        </td>
-                        <td className="px-4 py-2">
-                          <UtilizationBar percent={s.utilization_percent} />
-                        </td>
-                        <td className="px-4 py-2 text-right tabular-nums text-muted-foreground">
-                          {s.total_ips.toLocaleString()}
-                        </td>
-                        <td className="px-4 py-2">
-                          <StatusBadge status={s.status} />
-                        </td>
-                        {subnetCfDefs.map((def) => (
-                          <td
-                            key={def.name}
-                            className="px-4 py-2 text-muted-foreground"
-                          >
-                            {s.custom_fields?.[def.name] != null ? (
-                              String(s.custom_fields[def.name])
+                          <td className="px-4 py-2 text-muted-foreground/40">
+                            —
+                          </td>
+                          <td className="px-4 py-2 text-muted-foreground/40">
+                            —
+                          </td>
+                          <td className="px-4 py-2">
+                            {b.utilization_percent > 0 ? (
+                              <UtilizationBar percent={b.utilization_percent} />
                             ) : (
                               <span className="text-muted-foreground/40">
                                 —
                               </span>
                             )}
                           </td>
-                        ))}
-                        <td />
-                      </tr>
-                    );
-                  }
-                  return null;
-                })}
-              </tbody>
-            </table>
+                          <td className="px-4 py-2 text-right tabular-nums text-muted-foreground">
+                            {cidrSize(b.network).toLocaleString()}
+                          </td>
+                          <td className="px-4 py-2 text-muted-foreground/40">
+                            —
+                          </td>
+                          {subnetCfDefs.map((def) => (
+                            <td
+                              key={def.name}
+                              className="px-4 py-2 text-muted-foreground/40"
+                            >
+                              —
+                            </td>
+                          ))}
+                          <td />
+                        </tr>
+                      );
+                    }
+                    if (item.type === "subnet" && item.subnet) {
+                      const s = item.subnet;
+                      return (
+                        <tr
+                          key={item.key}
+                          onClick={() => onSelectSubnet(s)}
+                          className={cn(
+                            "border-b last:border-0 cursor-pointer hover:bg-muted/30",
+                            selectedSubnets.has(s.id) && "bg-primary/5",
+                          )}
+                        >
+                          <td
+                            className="w-8 px-2 py-2"
+                            onClick={(e) => e.stopPropagation()}
+                          >
+                            <input
+                              type="checkbox"
+                              aria-label={`Select ${s.network}`}
+                              checked={selectedSubnets.has(s.id)}
+                              onChange={() =>
+                                setSelectedSubnets((prev) => {
+                                  const next = new Set(prev);
+                                  if (next.has(s.id)) next.delete(s.id);
+                                  else next.add(s.id);
+                                  return next;
+                                })
+                              }
+                            />
+                          </td>
+                          <td
+                            className="py-2 pr-4"
+                            style={{ paddingLeft: `${indent + 16}px` }}
+                          >
+                            <span className="inline-flex items-center gap-1.5 font-mono font-medium">
+                              <Network className="h-3.5 w-3.5 flex-shrink-0 text-blue-500" />
+                              {s.network}
+                            </span>
+                          </td>
+                          <td className="px-4 py-2 text-muted-foreground">
+                            {s.name || (
+                              <span className="text-muted-foreground/40">
+                                —
+                              </span>
+                            )}
+                          </td>
+                          <td className="px-4 py-2 text-muted-foreground">
+                            {s.vlan?.router_name ?? (
+                              <span className="text-muted-foreground/40">
+                                —
+                              </span>
+                            )}
+                          </td>
+                          <td className="px-4 py-2 text-muted-foreground">
+                            {s.vlan ? (
+                              <span>
+                                {s.vlan.vlan_id}
+                                {s.vlan.name && (
+                                  <span className="ml-1 text-muted-foreground/70">
+                                    ({s.vlan.name})
+                                  </span>
+                                )}
+                              </span>
+                            ) : s.vlan_id != null ? (
+                              <span
+                                className="text-muted-foreground/70"
+                                title="Legacy tag — assign a Router/VLAN from the Edit modal"
+                              >
+                                {s.vlan_id}
+                              </span>
+                            ) : (
+                              <span className="text-muted-foreground/40">
+                                —
+                              </span>
+                            )}
+                          </td>
+                          <td className="px-4 py-2 tabular-nums text-muted-foreground">
+                            {s.allocated_ips} / {s.total_ips}
+                          </td>
+                          <td className="px-4 py-2">
+                            <UtilizationBar percent={s.utilization_percent} />
+                          </td>
+                          <td className="px-4 py-2 text-right tabular-nums text-muted-foreground">
+                            {s.total_ips.toLocaleString()}
+                          </td>
+                          <td className="px-4 py-2">
+                            <StatusBadge status={s.status} />
+                          </td>
+                          {subnetCfDefs.map((def) => (
+                            <td
+                              key={def.name}
+                              className="px-4 py-2 text-muted-foreground"
+                            >
+                              {s.custom_fields?.[def.name] != null ? (
+                                String(s.custom_fields[def.name])
+                              ) : (
+                                <span className="text-muted-foreground/40">
+                                  —
+                                </span>
+                              )}
+                            </td>
+                          ))}
+                          <td />
+                        </tr>
+                      );
+                    }
+                    return null;
+                  })}
+                </tbody>
+              </table>
             </div>
           );
         })()}
@@ -6844,106 +6888,17 @@ function SpaceTableView({
           </p>
         ) : (
           <div className="overflow-x-auto">
-          <table className="w-full min-w-[720px] text-sm">
-            <thead>
-              <tr className="border-b bg-muted/40 text-xs">
-                <th className="w-8 px-2 py-2 text-left">
-                  <input
-                    type="checkbox"
-                    aria-label="Select all subnets"
-                    checked={allSelected}
-                    onChange={toggleAll}
-                  />
-                </th>
-                {(
-                  [
-                    "Network",
-                    "Name",
-                    "Router",
-                    "VLAN",
-                    "Used IPs",
-                    "Utilization",
-                    "Size",
-                    "Status",
-                  ] as const
-                ).map((col) => {
-                  const filterKey =
-                    col === "Network"
-                      ? "network"
-                      : col === "Name"
-                        ? "name"
-                        : col === "Router"
-                          ? "router"
-                          : col === "VLAN"
-                            ? "vlan"
-                            : col === "Status"
-                              ? "status"
-                              : null;
-                  const hasFilter = filterKey
-                    ? !!spaceFilter[filterKey as keyof typeof spaceFilter]
-                    : false;
-                  const isFilterable = filterKey !== null;
-                  return (
-                    <th
-                      key={col}
-                      className={cn(
-                        "px-4 py-2 font-medium text-muted-foreground",
-                        col === "Size" ? "text-right" : "text-left",
-                      )}
-                    >
-                      <span className="inline-flex items-center gap-1">
-                        {col}
-                        {isFilterable && (
-                          <button
-                            onClick={() => setShowSpaceFilters((v) => !v)}
-                            title={`Filter by ${col}`}
-                            className={cn(
-                              "rounded p-0.5 hover:bg-accent",
-                              hasFilter
-                                ? "text-primary"
-                                : showSpaceFilters || hasSpaceFilter
-                                  ? "text-primary/50"
-                                  : "text-muted-foreground/40 hover:text-muted-foreground",
-                            )}
-                          >
-                            <Filter className="h-2.5 w-2.5" />
-                          </button>
-                        )}
-                      </span>
-                    </th>
-                  );
-                })}
-                {subnetCfDefs.map((def) => (
-                  <th
-                    key={def.name}
-                    className="px-4 py-2 text-left font-medium text-muted-foreground"
-                  >
-                    {def.label}
+            <table className="w-full min-w-[720px] text-sm">
+              <thead>
+                <tr className="border-b bg-muted/40 text-xs">
+                  <th className="w-8 px-2 py-2 text-left">
+                    <input
+                      type="checkbox"
+                      aria-label="Select all subnets"
+                      checked={allSelected}
+                      onChange={toggleAll}
+                    />
                   </th>
-                ))}
-                <th className="px-4 py-2 text-right">
-                  {hasSpaceFilter && (
-                    <button
-                      onClick={() =>
-                        setSpaceFilter({
-                          network: "",
-                          name: "",
-                          router: "",
-                          vlan: "",
-                          status: "",
-                        })
-                      }
-                      title="Clear all filters"
-                      className="rounded p-0.5 text-primary hover:text-destructive"
-                    >
-                      <X className="h-3 w-3" />
-                    </button>
-                  )}
-                </th>
-              </tr>
-              {showSpaceFilters && (
-                <tr className="border-b bg-muted/10 text-xs">
-                  <td />
                   {(
                     [
                       "Network",
@@ -6968,198 +6923,297 @@ function SpaceTableView({
                               : col === "Status"
                                 ? "status"
                                 : null;
-                    if (!filterKey) return <td key={col} />;
-                    if (filterKey === "status") {
-                      return (
-                        <td key={col} className="px-2 py-1">
-                          <select
-                            value={spaceFilter.status}
-                            onChange={(e) =>
-                              setSpaceFilter((f) => ({
-                                ...f,
-                                status: e.target.value,
-                              }))
-                            }
-                            className="w-full rounded border border-border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
-                          >
-                            <option value="">All</option>
-                            {["active", "reserved", "deprecated"].map((s) => (
-                              <option key={s} value={s}>
-                                {s}
-                              </option>
-                            ))}
-                          </select>
-                        </td>
-                      );
-                    }
+                    const hasFilter = filterKey
+                      ? !!spaceFilter[filterKey as keyof typeof spaceFilter]
+                      : false;
+                    const isFilterable = filterKey !== null;
                     return (
-                      <td key={col} className="px-2 py-1">
-                        <input
-                          type="text"
-                          value={
-                            spaceFilter[filterKey as keyof typeof spaceFilter]
-                          }
-                          onChange={(e) =>
-                            setSpaceFilter((f) => ({
-                              ...f,
-                              [filterKey]: e.target.value,
-                            }))
-                          }
-                          placeholder="Filter…"
-                          className="w-full rounded border border-border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
-                        />
-                      </td>
+                      <th
+                        key={col}
+                        className={cn(
+                          "px-4 py-2 font-medium text-muted-foreground",
+                          col === "Size" ? "text-right" : "text-left",
+                        )}
+                      >
+                        <span className="inline-flex items-center gap-1">
+                          {col}
+                          {isFilterable && (
+                            <button
+                              onClick={() => setShowSpaceFilters((v) => !v)}
+                              title={`Filter by ${col}`}
+                              className={cn(
+                                "rounded p-0.5 hover:bg-accent",
+                                hasFilter
+                                  ? "text-primary"
+                                  : showSpaceFilters || hasSpaceFilter
+                                    ? "text-primary/50"
+                                    : "text-muted-foreground/40 hover:text-muted-foreground",
+                              )}
+                            >
+                              <Filter className="h-2.5 w-2.5" />
+                            </button>
+                          )}
+                        </span>
+                      </th>
                     );
                   })}
                   {subnetCfDefs.map((def) => (
-                    <td key={def.name} />
-                  ))}
-                  <td />
-                </tr>
-              )}
-            </thead>
-            <tbody>
-              {filteredSpaceRows.map((item) => {
-                const indent = item.depth * 20;
-                if (item.type === "block" && item.block) {
-                  const b = item.block;
-                  const size = cidrSize(b.network);
-                  return (
-                    <tr
-                      key={item.key}
-                      onClick={() => onSelectBlock(b)}
-                      className="border-b last:border-0 cursor-pointer hover:bg-muted/30 bg-muted/10"
+                    <th
+                      key={def.name}
+                      className="px-4 py-2 text-left font-medium text-muted-foreground"
                     >
-                      <td className="w-8 px-2 py-2" />
-                      <td
-                        className="py-2 pr-4"
-                        style={{ paddingLeft: `${indent + 16}px` }}
+                      {def.label}
+                    </th>
+                  ))}
+                  <th className="px-4 py-2 text-right">
+                    {hasSpaceFilter && (
+                      <button
+                        onClick={() =>
+                          setSpaceFilter({
+                            network: "",
+                            name: "",
+                            router: "",
+                            vlan: "",
+                            status: "",
+                          })
+                        }
+                        title="Clear all filters"
+                        className="rounded p-0.5 text-primary hover:text-destructive"
                       >
-                        <span className="inline-flex items-center gap-1.5 font-mono font-semibold text-foreground">
-                          <Layers className="h-3.5 w-3.5 flex-shrink-0 text-violet-500" />
-                          {b.network}
-                        </span>
-                      </td>
-                      <td className="px-4 py-2 text-muted-foreground">
-                        {b.name || (
-                          <span className="text-muted-foreground/40">—</span>
-                        )}
-                      </td>
-                      <td className="px-4 py-2 text-muted-foreground/40">—</td>
-                      <td className="px-4 py-2 text-muted-foreground/40">—</td>
-                      <td className="px-4 py-2 text-muted-foreground/40">—</td>
-                      <td className="px-4 py-2">
-                        {b.utilization_percent > 0 ? (
-                          <UtilizationBar percent={b.utilization_percent} />
-                        ) : (
-                          <span className="text-muted-foreground/40">—</span>
-                        )}
-                      </td>
-                      <td className="px-4 py-2 text-right tabular-nums text-muted-foreground">
-                        {size.toLocaleString()}
-                      </td>
-                      <td className="px-4 py-2 text-muted-foreground/40">—</td>
-                      {subnetCfDefs.map((def) => (
+                        <X className="h-3 w-3" />
+                      </button>
+                    )}
+                  </th>
+                </tr>
+                {showSpaceFilters && (
+                  <tr className="border-b bg-muted/10 text-xs">
+                    <td />
+                    {(
+                      [
+                        "Network",
+                        "Name",
+                        "Router",
+                        "VLAN",
+                        "Used IPs",
+                        "Utilization",
+                        "Size",
+                        "Status",
+                      ] as const
+                    ).map((col) => {
+                      const filterKey =
+                        col === "Network"
+                          ? "network"
+                          : col === "Name"
+                            ? "name"
+                            : col === "Router"
+                              ? "router"
+                              : col === "VLAN"
+                                ? "vlan"
+                                : col === "Status"
+                                  ? "status"
+                                  : null;
+                      if (!filterKey) return <td key={col} />;
+                      if (filterKey === "status") {
+                        return (
+                          <td key={col} className="px-2 py-1">
+                            <select
+                              value={spaceFilter.status}
+                              onChange={(e) =>
+                                setSpaceFilter((f) => ({
+                                  ...f,
+                                  status: e.target.value,
+                                }))
+                              }
+                              className="w-full rounded border border-border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
+                            >
+                              <option value="">All</option>
+                              {["active", "reserved", "deprecated"].map((s) => (
+                                <option key={s} value={s}>
+                                  {s}
+                                </option>
+                              ))}
+                            </select>
+                          </td>
+                        );
+                      }
+                      return (
+                        <td key={col} className="px-2 py-1">
+                          <input
+                            type="text"
+                            value={
+                              spaceFilter[filterKey as keyof typeof spaceFilter]
+                            }
+                            onChange={(e) =>
+                              setSpaceFilter((f) => ({
+                                ...f,
+                                [filterKey]: e.target.value,
+                              }))
+                            }
+                            placeholder="Filter…"
+                            className="w-full rounded border border-border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
+                          />
+                        </td>
+                      );
+                    })}
+                    {subnetCfDefs.map((def) => (
+                      <td key={def.name} />
+                    ))}
+                    <td />
+                  </tr>
+                )}
+              </thead>
+              <tbody>
+                {filteredSpaceRows.map((item) => {
+                  const indent = item.depth * 20;
+                  if (item.type === "block" && item.block) {
+                    const b = item.block;
+                    const size = cidrSize(b.network);
+                    return (
+                      <tr
+                        key={item.key}
+                        onClick={() => onSelectBlock(b)}
+                        className="border-b last:border-0 cursor-pointer hover:bg-muted/30 bg-muted/10"
+                      >
+                        <td className="w-8 px-2 py-2" />
                         <td
-                          key={def.name}
-                          className="px-4 py-2 text-muted-foreground/40"
+                          className="py-2 pr-4"
+                          style={{ paddingLeft: `${indent + 16}px` }}
                         >
+                          <span className="inline-flex items-center gap-1.5 font-mono font-semibold text-foreground">
+                            <Layers className="h-3.5 w-3.5 flex-shrink-0 text-violet-500" />
+                            {b.network}
+                          </span>
+                        </td>
+                        <td className="px-4 py-2 text-muted-foreground">
+                          {b.name || (
+                            <span className="text-muted-foreground/40">—</span>
+                          )}
+                        </td>
+                        <td className="px-4 py-2 text-muted-foreground/40">
                           —
                         </td>
-                      ))}
-                    </tr>
-                  );
-                }
-                if (item.type === "subnet" && item.subnet) {
-                  const s = item.subnet;
-                  return (
-                    <tr
-                      key={item.key}
-                      onClick={() => onSelectSubnet(s)}
-                      className="border-b last:border-0 cursor-pointer hover:bg-muted/30"
-                    >
-                      <td
-                        className="w-8 px-2 py-2"
-                        onClick={(e) => e.stopPropagation()}
-                      >
-                        <input
-                          type="checkbox"
-                          aria-label={`Select ${s.network}`}
-                          checked={selected.has(s.id)}
-                          onChange={() => toggleOne(s.id)}
-                        />
-                      </td>
-                      <td
-                        className="py-2 pr-4"
-                        style={{ paddingLeft: `${indent + 16}px` }}
-                      >
-                        <span className="inline-flex items-center gap-1.5 font-mono font-medium">
-                          <Network className="h-3.5 w-3.5 flex-shrink-0 text-blue-500" />
-                          {s.network}
-                        </span>
-                      </td>
-                      <td className="px-4 py-2 text-muted-foreground">
-                        {s.name || (
-                          <span className="text-muted-foreground/40">—</span>
-                        )}
-                      </td>
-                      <td className="px-4 py-2 text-muted-foreground">
-                        {s.vlan?.router_name ?? (
-                          <span className="text-muted-foreground/40">—</span>
-                        )}
-                      </td>
-                      <td className="px-4 py-2 text-muted-foreground">
-                        {s.vlan ? (
-                          <span>
-                            {s.vlan.vlan_id}
-                            {s.vlan.name && (
-                              <span className="ml-1 text-muted-foreground/70">
-                                ({s.vlan.name})
-                              </span>
-                            )}
-                          </span>
-                        ) : s.vlan_id != null ? (
-                          <span
-                            className="text-muted-foreground/70"
-                            title="Legacy tag — assign a Router/VLAN from the Edit modal"
-                          >
-                            {s.vlan_id}
-                          </span>
-                        ) : (
-                          <span className="text-muted-foreground/40">—</span>
-                        )}
-                      </td>
-                      <td className="px-4 py-2 tabular-nums text-muted-foreground">
-                        {s.allocated_ips} / {s.total_ips}
-                      </td>
-                      <td className="px-4 py-2">
-                        <UtilizationBar percent={s.utilization_percent} />
-                      </td>
-                      <td className="px-4 py-2 text-right tabular-nums text-muted-foreground">
-                        {s.total_ips.toLocaleString()}
-                      </td>
-                      <td className="px-4 py-2">
-                        <StatusBadge status={s.status} />
-                      </td>
-                      {subnetCfDefs.map((def) => (
-                        <td
-                          key={def.name}
-                          className="px-4 py-2 text-muted-foreground"
-                        >
-                          {s.custom_fields?.[def.name] != null ? (
-                            String(s.custom_fields[def.name])
+                        <td className="px-4 py-2 text-muted-foreground/40">
+                          —
+                        </td>
+                        <td className="px-4 py-2 text-muted-foreground/40">
+                          —
+                        </td>
+                        <td className="px-4 py-2">
+                          {b.utilization_percent > 0 ? (
+                            <UtilizationBar percent={b.utilization_percent} />
                           ) : (
                             <span className="text-muted-foreground/40">—</span>
                           )}
                         </td>
-                      ))}
-                    </tr>
-                  );
-                }
-                return null;
-              })}
-            </tbody>
-          </table>
+                        <td className="px-4 py-2 text-right tabular-nums text-muted-foreground">
+                          {size.toLocaleString()}
+                        </td>
+                        <td className="px-4 py-2 text-muted-foreground/40">
+                          —
+                        </td>
+                        {subnetCfDefs.map((def) => (
+                          <td
+                            key={def.name}
+                            className="px-4 py-2 text-muted-foreground/40"
+                          >
+                            —
+                          </td>
+                        ))}
+                      </tr>
+                    );
+                  }
+                  if (item.type === "subnet" && item.subnet) {
+                    const s = item.subnet;
+                    return (
+                      <tr
+                        key={item.key}
+                        onClick={() => onSelectSubnet(s)}
+                        className="border-b last:border-0 cursor-pointer hover:bg-muted/30"
+                      >
+                        <td
+                          className="w-8 px-2 py-2"
+                          onClick={(e) => e.stopPropagation()}
+                        >
+                          <input
+                            type="checkbox"
+                            aria-label={`Select ${s.network}`}
+                            checked={selected.has(s.id)}
+                            onChange={() => toggleOne(s.id)}
+                          />
+                        </td>
+                        <td
+                          className="py-2 pr-4"
+                          style={{ paddingLeft: `${indent + 16}px` }}
+                        >
+                          <span className="inline-flex items-center gap-1.5 font-mono font-medium">
+                            <Network className="h-3.5 w-3.5 flex-shrink-0 text-blue-500" />
+                            {s.network}
+                          </span>
+                        </td>
+                        <td className="px-4 py-2 text-muted-foreground">
+                          {s.name || (
+                            <span className="text-muted-foreground/40">—</span>
+                          )}
+                        </td>
+                        <td className="px-4 py-2 text-muted-foreground">
+                          {s.vlan?.router_name ?? (
+                            <span className="text-muted-foreground/40">—</span>
+                          )}
+                        </td>
+                        <td className="px-4 py-2 text-muted-foreground">
+                          {s.vlan ? (
+                            <span>
+                              {s.vlan.vlan_id}
+                              {s.vlan.name && (
+                                <span className="ml-1 text-muted-foreground/70">
+                                  ({s.vlan.name})
+                                </span>
+                              )}
+                            </span>
+                          ) : s.vlan_id != null ? (
+                            <span
+                              className="text-muted-foreground/70"
+                              title="Legacy tag — assign a Router/VLAN from the Edit modal"
+                            >
+                              {s.vlan_id}
+                            </span>
+                          ) : (
+                            <span className="text-muted-foreground/40">—</span>
+                          )}
+                        </td>
+                        <td className="px-4 py-2 tabular-nums text-muted-foreground">
+                          {s.allocated_ips} / {s.total_ips}
+                        </td>
+                        <td className="px-4 py-2">
+                          <UtilizationBar percent={s.utilization_percent} />
+                        </td>
+                        <td className="px-4 py-2 text-right tabular-nums text-muted-foreground">
+                          {s.total_ips.toLocaleString()}
+                        </td>
+                        <td className="px-4 py-2">
+                          <StatusBadge status={s.status} />
+                        </td>
+                        {subnetCfDefs.map((def) => (
+                          <td
+                            key={def.name}
+                            className="px-4 py-2 text-muted-foreground"
+                          >
+                            {s.custom_fields?.[def.name] != null ? (
+                              String(s.custom_fields[def.name])
+                            ) : (
+                              <span className="text-muted-foreground/40">
+                                —
+                              </span>
+                            )}
+                          </td>
+                        ))}
+                      </tr>
+                    );
+                  }
+                  return null;
+                })}
+              </tbody>
+            </table>
           </div>
         )}
       </div>

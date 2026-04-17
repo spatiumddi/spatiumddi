@@ -52,13 +52,16 @@ class SAMLConfig:
     idp_metadata_url: str | None
 
     @classmethod
-    def from_provider(cls, provider: AuthProvider, base_url: str) -> "SAMLConfig":
+    def from_provider(cls, provider: AuthProvider, base_url: str) -> SAMLConfig:
         cfg = provider.config or {}
         secrets_data = (
             decrypt_dict(provider.secrets_encrypted) if provider.secrets_encrypted else {}
         )
 
-        sp_entity_id = str(cfg.get("sp_entity_id") or "").strip() or f"{base_url.rstrip('/')}/saml/{provider.id}"
+        sp_entity_id = (
+            str(cfg.get("sp_entity_id") or "").strip()
+            or f"{base_url.rstrip('/')}/saml/{provider.id}"
+        )
         sp_acs_url = f"{base_url.rstrip('/')}/api/v1/auth/{provider.id}/callback"
         sp_slo_url = f"{base_url.rstrip('/')}/api/v1/auth/{provider.id}/slo"
 
@@ -166,9 +169,7 @@ class SAMLConsumeResult:
     attributes: dict[str, Any]
 
 
-def consume_assertion(
-    cfg: SAMLConfig, base_url: str, post_data: dict
-) -> SAMLConsumeResult:
+def consume_assertion(cfg: SAMLConfig, base_url: str, post_data: dict) -> SAMLConsumeResult:
     """Validate a signed SAML Response and extract claims.
 
     ``post_data`` is the form body from the ACS POST (``SAMLResponse`` +

@@ -41,7 +41,7 @@ class OIDCConfig:
     claim_groups: str
 
     @classmethod
-    def from_provider(cls, provider: AuthProvider) -> "OIDCConfig":
+    def from_provider(cls, provider: AuthProvider) -> OIDCConfig:
         cfg = provider.config or {}
         secrets_data = (
             decrypt_dict(provider.secrets_encrypted) if provider.secrets_encrypted else {}

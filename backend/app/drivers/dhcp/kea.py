@@ -122,12 +122,8 @@ class KeaDriver(DHCPDriver):
         # are separate processes; the agent runs whichever process(es) it
         # has scopes for. We emit both top-level blocks so the agent can
         # consume a single bundle regardless of family mix.
-        v4_scopes = [
-            s for s in bundle.scopes if s.is_active and s.address_family != "ipv6"
-        ]
-        v6_scopes = [
-            s for s in bundle.scopes if s.is_active and s.address_family == "ipv6"
-        ]
+        v4_scopes = [s for s in bundle.scopes if s.is_active and s.address_family != "ipv6"]
+        v6_scopes = [s for s in bundle.scopes if s.is_active and s.address_family == "ipv6"]
 
         out: dict[str, Any] = {}
         if v4_scopes or not v6_scopes:
@@ -140,9 +136,7 @@ class KeaDriver(DHCPDriver):
                     "name": "/var/lib/kea/kea-leases4.csv",
                 },
                 "subnet4": [_render_scope(s) for s in v4_scopes],
-                "client-classes": [
-                    _render_client_class(c) for c in bundle.client_classes
-                ],
+                "client-classes": [_render_client_class(c) for c in bundle.client_classes],
                 "option-data": _render_option_data(bundle.options.options),
             }
         if v6_scopes:

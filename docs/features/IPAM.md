@@ -1,6 +1,6 @@
 # IPAM Feature Specification
 
-> **Implementation status (2026-04-16):** Full hierarchical CRUD (spaces, blocks with nesting, subnets, addresses); next-available allocation; orphan soft-delete + bulk orphan purge modal; block utilization rollup via recursive CTE; DNS assignment inheritance (space → block → subnet) with dual-listbox picker for additional zones; DNS sync check (subnet / block / space scope) reconciling missing, mismatched, and stale records; reverse-zone auto-create + backfill; IP aliases (CNAME/A tied to the IP, auto-cleaned on purge); VLAN association (router + VLAN columns); DHCP scope/pool/static linkage with per-IP pool-membership badge; static DHCP creation flow integrated into Allocate IP; drag-drop reparenting; bulk-edit subnets; import/export (CSV/JSON/XLSX); custom fields per resource type; global search (Cmd+K). **Deferred:** full IPv6 UI (storage works), mobile responsive.
+> **Implementation status (Unreleased, post-`2026.04.16-2`):** Full hierarchical CRUD (spaces, blocks with nesting, subnets, addresses); next-available allocation; orphan soft-delete + bulk orphan purge modal; block utilization rollup via recursive CTE; block/subnet overlap validation via PostgreSQL `cidr &&` operator; DNS assignment inheritance (space → block → subnet) with dual-listbox picker for additional zones and shared `ZoneOptions` primary/additional separator across Create / Edit / Bulk-edit flows; DNS sync check (subnet / block / space scope) reconciling missing, mismatched, and stale records; **scheduled IPAM ↔ DNS auto-sync** (opt-in Celery beat task gated on `PlatformSettings.dns_auto_sync_enabled`); reverse-zone auto-create + backfill; IP aliases (CNAME/A tied to the IP, auto-cleaned on purge) with single-step delete confirmation + query-invalidation fix for the subnet Aliases tab; VLAN association (router + VLAN columns); DHCP scope/pool/static linkage with per-IP pool-membership badge; static DHCP creation flow integrated into Allocate IP; drag-drop reparenting; **bulk-edit IPs with per-field opt-in toggles** (status, description, tags-merge-or-replace, custom-fields merge, DNS zone); import/export (CSV/JSON/XLSX); custom fields per resource type with inherited-value placeholders on Edit Subnet / Edit Block modals; global search (Cmd+K); **mobile-responsive layout** (sidebar drawer, horizontally scrollable tables, modals cap at `95vw`). **Partial IPv6:** storage, UI, subnet create, AAAA/PTR sync, `/blocks/{id}/available-subnets` up to `/128`, and per-block "Find by size" with family-aware prefix options all land — remaining TODOs are EUI-64 / hash-based `/128` allocation for `/next-address` (returns 409 on v6 today) and Kea Dhcp6 option-name translation.
 
 ## Overview
 
@@ -520,3 +520,149 @@ Note: the current implementation uses `status = "orphan"` instead of a `deleted_
 ### ✅ 14.9 IP Space Table View (Click-Through)
 
 **Implemented.** See §14.3 above. The space view now shows a hierarchical tree-table with both blocks and subnets, not just subnets.
+
+---
+
+## 15. Post-Alpha Additions (Unreleased)
+
+Features that landed after the `2026.04.16-2` cut but before the next tag.
+
+### ✅ 15.1 Block / Subnet Overlap Validation
+
+`_assert_no_block_overlap()` in `backend/app/api/v1/ipam/router.py` rejects
+two failure modes at create time and on the reparent path of
+`update_block`:
+- **Same-level duplicates** — creating `10.0.0.0/8` twice under the same
+  parent (or at the space root) fails with `409 Conflict`.
+- **Overlapping CIDRs** — creating `10.0.0.0/16` when a sibling
+  `10.0.0.0/8` already exists at the same level fails with the same status.
+
+Implementation is a single PostgreSQL query using the `cidr &&` operator:
+
+```sql
+SELECT network FROM ip_block
+WHERE space_id = :space_id
+  AND network && CAST(:network AS cidr)
+  AND (parent_block_id IS NOT DISTINCT FROM :parent_block_id)
+  AND (:exclude_id IS NULL OR id <> :exclude_id)
+```
+
+Subnet overlap within a parent block is already enforced by existing
+`Subnet` validation.
+
+### ✅ 15.2 Scheduled IPAM ↔ DNS Auto-Sync
+
+Celery beat task `app.tasks.ipam_dns_sync.auto_sync_ipam_dns` runs every
+60 s unconditionally; the task itself gates on three `PlatformSettings`
+columns:
+- `dns_auto_sync_enabled` — master on/off (default off).
+- `dns_auto_sync_interval_minutes` — how often the task actually syncs
+  (default 30 min). The task last-run timestamp is persisted so the
+  cadence can be changed from the Settings UI without restarting beat.
+- `dns_auto_sync_delete_stale` — opt-in deletion of auto-generated DNS
+  records that no longer match an IPAM row.
+
+The task iterates every subnet with `dns_zone_id` set and delegates the
+per-subnet reconciliation to
+`app.services.dns.sync_check.compute_subnet_dns_drift` +
+`app.api.v1.ipam.router._apply_dns_sync` — the same code paths that power
+the manual "Sync now" button, so results are identical.
+
+Admin UI: new **DNS Auto-Sync** section in `/admin/settings` with
+enable-toggle, interval input, and delete-stale checkbox.
+
+### ✅ 15.3 Shared Zone Picker + Bulk-Edit DNS Zone
+
+`ZoneOptions` is a shared React component that renders a DNS-zone
+`<select>` dropdown with the subnet's primary zone first and an
+`<optgroup label="Additional zones">` separator for the rest. Used in:
+
+- **Allocate IP** modal (CreateAddressModal).
+- **Edit IP** modal (EditAddressModal).
+- **Bulk-edit IPs** modal (when the "DNS zone" opt-in toggle is enabled).
+
+The picker is restricted to the subnet's explicit primary + additional
+zones when any are pinned. If the subnet only has a DNS group assigned
+(no per-zone pinning), the picker falls back to every forward zone in the
+group (reverse zones are filtered out).
+
+`IPAddressBulkChanges.dns_zone_id` on
+`POST /api/v1/ipam/addresses/bulk-edit` routes each selected IP through
+`_sync_dns_record` for move / create / delete, so bulk re-homing an IP
+range to a different zone updates DNS in the same request.
+
+### ✅ 15.4 Bulk-Edit per-field opt-in
+
+Every field on the bulk-edit-IPs modal has a sibling checkbox. Unchecked
+fields are left untouched for every selected row; checked fields are
+applied. Tags support both a **merge** mode (union with existing) and a
+**replace-all** mode selected via a radio underneath the tags input. This
+replaces the earlier behaviour where any modified field applied to every
+selected row regardless of intent.
+
+### ✅ 15.5 Inherited-Field Placeholders
+
+`EditSubnetModal` and `EditBlockModal` show every custom-field input with
+an HTML `placeholder` sourced from the first ancestor that defines the
+field. A small "inherited from block `<name>`" or "inherited from space
+`<name>`" badge appears next to the input. Typing a value overrides the
+inheritance; clearing the input restores it.
+
+Backed by:
+- `GET /api/v1/ipam/subnets/{id}/effective-fields` (existing).
+- `GET /api/v1/ipam/blocks/{id}/effective-fields` (new — parity endpoint
+  added in Wave D).
+
+### ✅ 15.6 Partial IPv6 Support
+
+Storage and most UI paths support IPv6 today. Specifically:
+
+- `Subnet.total_ips` widened to `BigInteger` (migration `e3c7b91f2a45`)
+  so a `/64` (`2⁶⁴` addresses) fits; `_total_ips()` clamps at `2⁶³ − 1`
+  for anything larger.
+- `DHCPScope.address_family` column (migration `d7a2b6e9f134`). The Kea
+  driver renders either a `Dhcp4` or `Dhcp6` config block from the same
+  scope rows. Dhcp6 option-name translation is still a TODO.
+- Subnet create skips the v6 broadcast row; `_sync_dns_record` emits AAAA
+  forward records + PTR in `ip6.arpa` reverse zones.
+- `GET /api/v1/ipam/blocks/{id}/available-subnets` accepts `/8`–`/128`
+  with an address-family guard; the frontend's "Find by size" splits the
+  prefix pool into v4 (`/8–/32`) and v6 (`/32, /40, /44, /48, /52, /56,
+  /60, /64, /72, /80, /96, /112, /120, /124, /127, /128`) and filters to
+  prefixes strictly longer than the selected block's prefix.
+- Create-block and create-subnet placeholder text includes an IPv6
+  example (`e.g. 10.0.0.0/8 or 2001:db8::/32`).
+
+**Remaining IPv6 TODOs:**
+- `POST /api/v1/ipam/addresses/next-address` returns 409 on v6 subnets.
+  Still needs an EUI-64 / hash-based `/128` allocation strategy.
+- Kea Dhcp6 option-name translation in `backend/app/drivers/dhcp/kea.py`.
+- Automated v6-specific test coverage.
+
+### ✅ 15.7 IP Alias Refresh + Delete Confirmation
+
+Two smaller UX fixes on the subnet **Aliases** tab:
+
+- Adding or deleting an alias from the IP Edit modal now invalidates
+  `["subnet-aliases", subnet_id]` in addition to the per-IP cache, so
+  switching tabs no longer shows a stale alias list.
+- The trash icon in the subnet Aliases tab now pops a
+  `ConfirmDeleteModal` ("Delete alias `<fqdn>`? The DNS record will be
+  removed.") — matching the single-step confirmation used elsewhere in
+  IPAM rather than firing an unconfirmed delete.
+
+### ✅ 15.8 Modal Focus-Ring Fix
+
+IPAM form inputs now use `focus:ring-inset` so the 2px focus ring renders
+inside the rounded border. Prevents the left / right edges of the ring
+from being clipped by the modal wrapper's `overflow-y-auto`, which
+browsers treat as `overflow-x: auto` in practice.
+
+### ✅ 15.9 Mobile-Responsive Layout
+
+- Sidebar converts to a drawer with a backdrop at `<md` breakpoints; a
+  hamburger toggle appears in the `Header` component.
+- All data tables in IPAM / DNS / DHCP / VLANs / admin are wrapped in
+  `overflow-x-auto` with a `min-w` so wide columns scroll horizontally
+  instead of overflowing the viewport.
+- All modals use `max-w-[95vw]` on `<sm` so they always fit the screen.

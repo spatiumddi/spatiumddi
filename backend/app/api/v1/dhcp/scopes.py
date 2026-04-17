@@ -16,9 +16,7 @@ from app.core.permissions import require_resource_permission
 from app.models.dhcp import DHCPScope, DHCPServer
 from app.models.ipam import Subnet
 
-router = APIRouter(
-    tags=["dhcp"], dependencies=[Depends(require_resource_permission("dhcp_scope"))]
-)
+router = APIRouter(tags=["dhcp"], dependencies=[Depends(require_resource_permission("dhcp_scope"))])
 
 VALID_HOSTNAME_POLICIES = {"client", "server_name", "derived", "none"}
 VALID_SYNC_MODES = {"disabled", "on_lease", "on_static_only", "ipam", "learned"}

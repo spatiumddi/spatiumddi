@@ -1,0 +1,53 @@
+name: Feature request
+description: Suggest a new feature or enhancement
+title: "[feat] "
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - IPAM
+        - DNS
+        - DHCP
+        - Auth / Providers
+        - Permissions / RBAC
+        - Audit / Observability
+        - Frontend / UI
+        - API
+        - Deployment (Compose / K8s / Appliance)
+        - Docs
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: Describe the user or workflow pain. Feature requests with a clear motivation get prioritized faster.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: How should it behave? Include API shape, UI sketch, or CLI syntax if useful.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What workarounds exist today? Why aren't they enough?
+
+  - type: checkboxes
+    id: contribution
+    attributes:
+      label: Would you be willing to help?
+      options:
+        - label: I'd be open to submitting a PR for this
+        - label: I can help test a prototype

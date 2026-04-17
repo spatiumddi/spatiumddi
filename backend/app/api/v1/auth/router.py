@@ -4,8 +4,8 @@ plus OIDC redirect flow (authorize + callback + provider listing)."""
 import asyncio
 import secrets as py_secrets
 import uuid
+from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
-from typing import Callable
 from urllib.parse import urlencode
 
 import structlog
@@ -26,9 +26,13 @@ from app.core.auth.radius import RADIUSServiceError, authenticate_radius
 from app.core.auth.saml import (
     SAMLConfig,
     SAMLServiceError,
-    build_authorize_url as saml_authorize_url,
-    consume_assertion as saml_consume_assertion,
     sp_metadata_xml,
+)
+from app.core.auth.saml import (
+    build_authorize_url as saml_authorize_url,
+)
+from app.core.auth.saml import (
+    consume_assertion as saml_consume_assertion,
 )
 from app.core.auth.tacacs import TACACSServiceError, authenticate_tacacs
 from app.core.auth.user_sync import (
@@ -92,9 +96,7 @@ def _client_ip(request: Request) -> str | None:
     return request.client.host if request.client else None
 
 
-async def _issue_tokens(
-    db: DB, request: Request, user: User, auth_source: str
-) -> TokenResponse:
+async def _issue_tokens(db: DB, request: Request, user: User, auth_source: str) -> TokenResponse:
     """Issue access + refresh tokens, create session, write success audit."""
     access_token = create_access_token(str(user.id))
     raw_refresh, refresh_hash = create_refresh_token(str(user.id))
@@ -177,9 +179,7 @@ async def _audit_login_failure(
 # (invoked on a worker thread) plus the provider-type-specific ServiceError
 # it may raise. All three functions share the shape
 #   (provider, username, password) -> ExternalAuthResult | None
-_PasswordAuthFn = Callable[
-    [AuthProvider, str, str], ExternalAuthResult | None
-]
+_PasswordAuthFn = Callable[[AuthProvider, str, str], ExternalAuthResult | None]
 _PASSWORD_AUTH_DISPATCH: dict[str, tuple[_PasswordAuthFn, type[Exception]]] = {
     "ldap": (authenticate_ldap, LDAPServiceError),
     "radius": (authenticate_radius, RADIUSServiceError),
@@ -249,7 +249,7 @@ async def _try_external_password_login(
             )
             await db.commit()
             continue
-        except asyncio.TimeoutError:
+        except TimeoutError:
             logger.warning(f"{provider.type}_timeout", provider=provider.name)
             db.add(
                 AuditLog(
@@ -300,12 +300,8 @@ async def login(body: LoginRequest, request: Request, db: DB) -> TokenResponse:
 
     # ── Local-first ─────────────────────────────────────────────────────────
     if user is not None and user.auth_source == "local":
-        if not user.hashed_password or not verify_password(
-            body.password, user.hashed_password
-        ):
-            await _audit_login_failure(
-                db, request, body.username, reason="bad_password", user=user
-            )
+        if not user.hashed_password or not verify_password(body.password, user.hashed_password):
+            await _audit_login_failure(db, request, body.username, reason="bad_password", user=user)
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid credentials",
@@ -314,9 +310,7 @@ async def login(body: LoginRequest, request: Request, db: DB) -> TokenResponse:
             await _audit_login_failure(
                 db, request, body.username, reason="account_disabled", user=user
             )
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN, detail="Account disabled"
-            )
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account disabled")
         return await _issue_tokens(db, request, user, auth_source="local")
 
     # ── External provider fallthrough (LDAP / RADIUS / TACACS+) ─────────────
@@ -336,9 +330,7 @@ async def login(body: LoginRequest, request: Request, db: DB) -> TokenResponse:
         user=user,
         auth_source=user.auth_source if user else "local",
     )
-    raise HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials"
-    )
+    raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
 
 
 class RefreshRequest(BaseModel):
@@ -474,8 +466,7 @@ async def list_public_providers(db: DB) -> list[PublicProviderInfo]:
         .order_by(AuthProvider.priority, AuthProvider.name)
     )
     return [
-        PublicProviderInfo(id=p.id, name=p.name, type=p.type)
-        for p in res.unique().scalars().all()
+        PublicProviderInfo(id=p.id, name=p.name, type=p.type) for p in res.unique().scalars().all()
     ]
 
 
@@ -511,15 +502,22 @@ def _verify_flow_token(token: str) -> dict:
         raise ValueError("invalid flow token") from exc
 
 
+def _safe_error_suffix(value: str) -> str:
+    """Strip a provider-supplied error code down to ``[a-z0-9_]`` (max 40 chars)
+    so it is safe to embed in our fixed-path login redirect. Values from the
+    IdP (e.g. OIDC ``error`` query param, SAML StatusCode) should never flow
+    into a redirect URL verbatim — see CWE-601."""
+    cleaned = "".join(c for c in (value or "").lower() if c.isalnum() or c == "_")
+    return cleaned[:40] or "unknown"
+
+
 def _login_error_redirect(reason: str) -> RedirectResponse:
     url = f"{_LOGIN_ERROR_PATH}?{urlencode({'error': reason})}"
     return RedirectResponse(url, status_code=302)
 
 
 @router.get("/{provider_id}/authorize")
-async def authorize(
-    provider_id: uuid.UUID, request: Request, db: DB
-) -> RedirectResponse:
+async def authorize(provider_id: uuid.UUID, request: Request, db: DB) -> RedirectResponse:
     provider = await db.get(AuthProvider, provider_id)
     if provider is None or not provider.is_enabled:
         raise HTTPException(status_code=404, detail="Provider not found")
@@ -533,9 +531,7 @@ async def authorize(
     )
 
 
-async def _oidc_start(
-    provider: AuthProvider, request: Request, db: DB
-) -> RedirectResponse:
+async def _oidc_start(provider: AuthProvider, request: Request, db: DB) -> RedirectResponse:
     try:
         cfg = OIDCConfig.from_provider(provider)
     except OIDCServiceError as exc:
@@ -548,9 +544,7 @@ async def _oidc_start(
     redirect_uri = _oidc_callback_url(base, provider.id)
 
     try:
-        authorize_url = await oidc_authorize_url(
-            cfg, str(provider.id), state, nonce, redirect_uri
-        )
+        authorize_url = await oidc_authorize_url(cfg, str(provider.id), state, nonce, redirect_uri)
     except OIDCServiceError as exc:
         logger.warning("oidc_authorize_build_error", provider=provider.name, error=str(exc))
         return _login_error_redirect("oidc_discovery_failed")
@@ -576,9 +570,7 @@ async def _oidc_start(
     return response
 
 
-async def _saml_start(
-    provider: AuthProvider, request: Request, db: DB
-) -> RedirectResponse:
+async def _saml_start(provider: AuthProvider, request: Request, db: DB) -> RedirectResponse:
     base = await _app_base_url(db, request)
     try:
         cfg = SAMLConfig.from_provider(provider, base)
@@ -639,7 +631,7 @@ async def oidc_callback(
         return _login_error_redirect("oidc_state_mismatch")
     if error:
         logger.warning("oidc_idp_error", provider=provider.name, error=error)
-        return _login_error_redirect(f"oidc_idp_{error}")
+        return _login_error_redirect(f"oidc_idp_{_safe_error_suffix(error)}")
     if not code:
         return _login_error_redirect("oidc_no_code")
 
@@ -647,9 +639,7 @@ async def oidc_callback(
         cfg = OIDCConfig.from_provider(provider)
         base = await _app_base_url(db, request)
         redirect_uri = _oidc_callback_url(base, provider.id)
-        result = await oidc_exchange_code(
-            cfg, str(provider.id), code, redirect_uri, flow["nonce"]
-        )
+        result = await oidc_exchange_code(cfg, str(provider.id), code, redirect_uri, flow["nonce"])
     except OIDCServiceError as exc:
         logger.warning("oidc_exchange_failed", provider=provider.name, error=str(exc))
         db.add(
@@ -679,7 +669,7 @@ async def oidc_callback(
             reason=exc.reason,
             auth_source=provider.name,
         )
-        return _login_error_redirect(f"oidc_rejected_{exc.reason}")
+        return _login_error_redirect(f"oidc_rejected_{_safe_error_suffix(exc.reason)}")
 
     tokens = await _issue_tokens(db, request, user, auth_source=provider.name)
 
@@ -700,8 +690,8 @@ async def saml_callback(
     provider_id: uuid.UUID,
     request: Request,
     db: DB,
-    SAMLResponse: str = Form(...),
-    RelayState: str | None = Form(default=None),
+    SAMLResponse: str = Form(...),  # noqa: N803 - SAML spec mandates this casing
+    RelayState: str | None = Form(default=None),  # noqa: N803 - SAML spec mandates this casing
 ) -> RedirectResponse:
     provider = await db.get(AuthProvider, provider_id)
     if provider is None or provider.type != "saml":
@@ -754,7 +744,7 @@ async def saml_callback(
             reason=exc.reason,
             auth_source=provider.name,
         )
-        return _login_error_redirect(f"saml_rejected_{exc.reason}")
+        return _login_error_redirect(f"saml_rejected_{_safe_error_suffix(exc.reason)}")
 
     tokens = await _issue_tokens(db, request, user, auth_source=provider.name)
     frag = urlencode(
@@ -770,9 +760,7 @@ async def saml_callback(
 
 
 @router.get("/{provider_id}/metadata")
-async def saml_metadata(
-    provider_id: uuid.UUID, request: Request, db: DB
-) -> Response:
+async def saml_metadata(provider_id: uuid.UUID, request: Request, db: DB) -> Response:
     """Expose the SP metadata XML so admins can register SpatiumDDI with
     their IdP. Superadmin gate is not required: metadata is not sensitive and
     many IdPs fetch it unauthenticated."""

@@ -164,22 +164,22 @@ function ScopeCard({ scope }: { scope: DHCPScope }) {
         </div>
         {showPools && pools.length > 0 && (
           <div className="overflow-x-auto">
-          <table className="w-full min-w-[560px]">
-            <thead>
-              <tr className="border-b bg-muted/20 text-xs">
-                <th className="px-3 py-1.5 text-left font-medium">Name</th>
-                <th className="px-3 py-1.5 text-left font-medium">Start</th>
-                <th className="px-3 py-1.5 text-left font-medium">End</th>
-                <th className="px-3 py-1.5 text-left font-medium">Type</th>
-                <th className="px-3 py-1.5"></th>
-              </tr>
-            </thead>
-            <tbody>
-              {pools.map((p) => (
-                <PoolRow key={p.id} pool={p} scope={scope} />
-              ))}
-            </tbody>
-          </table>
+            <table className="w-full min-w-[560px]">
+              <thead>
+                <tr className="border-b bg-muted/20 text-xs">
+                  <th className="px-3 py-1.5 text-left font-medium">Name</th>
+                  <th className="px-3 py-1.5 text-left font-medium">Start</th>
+                  <th className="px-3 py-1.5 text-left font-medium">End</th>
+                  <th className="px-3 py-1.5 text-left font-medium">Type</th>
+                  <th className="px-3 py-1.5"></th>
+                </tr>
+              </thead>
+              <tbody>
+                {pools.map((p) => (
+                  <PoolRow key={p.id} pool={p} scope={scope} />
+                ))}
+              </tbody>
+            </table>
           </div>
         )}
       </div>

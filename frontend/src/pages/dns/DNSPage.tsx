@@ -1295,226 +1295,226 @@ function ZoneDetailView({
         )}
         {(filtered.length > 0 || showRecFilters) && (
           <div className="overflow-x-auto">
-          <table className="w-full min-w-[720px] text-sm">
-            <thead className="sticky top-0 bg-card">
-              <tr className="border-b text-xs text-muted-foreground">
-                <th className="w-8 py-2 pl-3">
-                  {(() => {
-                    const manualIds = filtered
-                      .filter((r) => !r.auto_generated)
-                      .map((r) => r.id);
-                    const allSel =
-                      manualIds.length > 0 &&
-                      manualIds.every((id) => selectedRecords.has(id));
-                    return (
-                      <input
-                        type="checkbox"
-                        disabled={manualIds.length === 0}
-                        checked={allSel}
-                        onChange={() => {
-                          setSelectedRecords((prev) => {
-                            const next = new Set(prev);
-                            if (allSel)
-                              manualIds.forEach((id) => next.delete(id));
-                            else manualIds.forEach((id) => next.add(id));
-                            return next;
-                          });
-                        }}
-                        title="Select all manual records (IPAM-managed records are skipped)"
-                      />
-                    );
-                  })()}
-                </th>
-                {(["Name", "Type", "Value", "TTL", "Pri"] as const).map(
-                  (col) => {
-                    const filterKey =
-                      col === "Name"
-                        ? "name"
-                        : col === "Type"
-                          ? "type"
-                          : col === "Value"
-                            ? "value"
-                            : null;
-                    const hasFilter = filterKey
-                      ? !!recFilter[filterKey as keyof typeof recFilter]
-                      : false;
-                    return (
-                      <th
-                        key={col}
-                        className={
-                          col === "Name"
-                            ? "py-2 pl-5 text-left font-medium"
-                            : "py-2 text-left font-medium"
-                        }
-                      >
-                        <span className="inline-flex items-center gap-1">
-                          {col}
-                          {filterKey && (
-                            <button
-                              onClick={() => setShowRecFilters((v) => !v)}
-                              title={`Filter by ${col}`}
-                              className={`rounded p-0.5 hover:bg-accent ${hasFilter ? "text-primary" : showRecFilters || hasRecFilter ? "text-primary/50" : "text-muted-foreground/40 hover:text-muted-foreground"}`}
-                            >
-                              <Filter className="h-2.5 w-2.5" />
-                            </button>
-                          )}
-                        </span>
-                      </th>
-                    );
-                  },
-                )}
-                <th className="py-2 pr-3 text-right">
-                  {hasRecFilter && (
-                    <button
-                      onClick={() =>
-                        setRecFilter({ name: "", type: "", value: "" })
-                      }
-                      title="Clear filters"
-                      className="rounded p-0.5 text-primary hover:text-destructive"
-                    >
-                      <X className="h-3 w-3" />
-                    </button>
+            <table className="w-full min-w-[720px] text-sm">
+              <thead className="sticky top-0 bg-card">
+                <tr className="border-b text-xs text-muted-foreground">
+                  <th className="w-8 py-2 pl-3">
+                    {(() => {
+                      const manualIds = filtered
+                        .filter((r) => !r.auto_generated)
+                        .map((r) => r.id);
+                      const allSel =
+                        manualIds.length > 0 &&
+                        manualIds.every((id) => selectedRecords.has(id));
+                      return (
+                        <input
+                          type="checkbox"
+                          disabled={manualIds.length === 0}
+                          checked={allSel}
+                          onChange={() => {
+                            setSelectedRecords((prev) => {
+                              const next = new Set(prev);
+                              if (allSel)
+                                manualIds.forEach((id) => next.delete(id));
+                              else manualIds.forEach((id) => next.add(id));
+                              return next;
+                            });
+                          }}
+                          title="Select all manual records (IPAM-managed records are skipped)"
+                        />
+                      );
+                    })()}
+                  </th>
+                  {(["Name", "Type", "Value", "TTL", "Pri"] as const).map(
+                    (col) => {
+                      const filterKey =
+                        col === "Name"
+                          ? "name"
+                          : col === "Type"
+                            ? "type"
+                            : col === "Value"
+                              ? "value"
+                              : null;
+                      const hasFilter = filterKey
+                        ? !!recFilter[filterKey as keyof typeof recFilter]
+                        : false;
+                      return (
+                        <th
+                          key={col}
+                          className={
+                            col === "Name"
+                              ? "py-2 pl-5 text-left font-medium"
+                              : "py-2 text-left font-medium"
+                          }
+                        >
+                          <span className="inline-flex items-center gap-1">
+                            {col}
+                            {filterKey && (
+                              <button
+                                onClick={() => setShowRecFilters((v) => !v)}
+                                title={`Filter by ${col}`}
+                                className={`rounded p-0.5 hover:bg-accent ${hasFilter ? "text-primary" : showRecFilters || hasRecFilter ? "text-primary/50" : "text-muted-foreground/40 hover:text-muted-foreground"}`}
+                              >
+                                <Filter className="h-2.5 w-2.5" />
+                              </button>
+                            )}
+                          </span>
+                        </th>
+                      );
+                    },
                   )}
-                </th>
-              </tr>
-              {showRecFilters && (
-                <tr className="border-b bg-muted/10 text-xs">
-                  <td />
-                  <td className="px-2 py-1 pl-5">
-                    <input
-                      type="text"
-                      value={recFilter.name}
-                      onChange={(e) =>
-                        setRecFilter((f) => ({ ...f, name: e.target.value }))
-                      }
-                      placeholder="Filter…"
-                      className="w-full rounded border border-border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
-                    />
-                  </td>
-                  <td className="px-2 py-1">
-                    <select
-                      value={recFilter.type}
-                      onChange={(e) =>
-                        setRecFilter((f) => ({ ...f, type: e.target.value }))
-                      }
-                      className="w-full rounded border border-border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
-                    >
-                      <option value="">All</option>
-                      {recordTypes.map((t) => (
-                        <option key={t} value={t}>
-                          {t}
-                        </option>
-                      ))}
-                    </select>
-                  </td>
-                  <td className="px-2 py-1">
-                    <input
-                      type="text"
-                      value={recFilter.value}
-                      onChange={(e) =>
-                        setRecFilter((f) => ({ ...f, value: e.target.value }))
-                      }
-                      placeholder="Filter…"
-                      className="w-full rounded border border-border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
-                    />
-                  </td>
-                  <td />
-                  <td />
-                  <td />
-                </tr>
-              )}
-            </thead>
-            <tbody>
-              {filtered.map((r) => (
-                <tr
-                  key={r.id}
-                  className="border-b last:border-0 hover:bg-muted/40 group"
-                >
-                  <td className="w-8 py-1.5 pl-3">
-                    {!r.auto_generated && (
-                      <input
-                        type="checkbox"
-                        checked={selectedRecords.has(r.id)}
-                        onChange={() =>
-                          setSelectedRecords((prev) => {
-                            const next = new Set(prev);
-                            if (next.has(r.id)) next.delete(r.id);
-                            else next.add(r.id);
-                            return next;
-                          })
-                        }
-                      />
-                    )}
-                  </td>
-                  <td className="py-1.5 pl-5 font-mono text-xs font-medium">
-                    {r.auto_generated ? (
-                      r.name
-                    ) : (
+                  <th className="py-2 pr-3 text-right">
+                    {hasRecFilter && (
                       <button
-                        onClick={() => setEditRecord(r)}
-                        className="hover:text-primary hover:underline"
-                        title="Edit record"
+                        onClick={() =>
+                          setRecFilter({ name: "", type: "", value: "" })
+                        }
+                        title="Clear filters"
+                        className="rounded p-0.5 text-primary hover:text-destructive"
                       >
-                        {r.name}
+                        <X className="h-3 w-3" />
                       </button>
                     )}
-                  </td>
-                  <td className="py-1.5">
-                    <span
-                      className={`inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium ${typeBadge[r.record_type] ?? "bg-muted text-muted-foreground"}`}
-                    >
-                      {r.record_type}
-                    </span>
-                  </td>
-                  <td className="py-1.5 font-mono text-xs text-muted-foreground max-w-xs truncate">
-                    {r.value}
-                  </td>
-                  <td className="py-1.5 text-xs text-muted-foreground">
-                    {r.ttl ?? "—"}
-                  </td>
-                  <td className="py-1.5 text-xs text-muted-foreground">
-                    {r.priority ?? "—"}
-                  </td>
-                  <td className="py-1.5 pr-3">
-                    {r.auto_generated ? (
-                      <div className="flex items-center justify-end gap-1">
-                        <span
-                          title="This record was created automatically by IPAM. Edit the IP address in IPAM to change it."
-                          className="flex items-center gap-1 rounded border border-amber-300/60 bg-amber-50 px-1.5 py-0.5 text-xs text-amber-700 dark:border-amber-700/40 dark:bg-amber-900/20 dark:text-amber-400"
-                        >
-                          <Lock className="h-2.5 w-2.5" />
-                          IPAM
-                        </span>
-                        <span
-                          title="Managed by IPAM — changes made here will be overwritten. To edit, update the IP address record in IPAM."
-                          className="flex h-5 w-5 cursor-help items-center justify-center rounded text-muted-foreground/60 hover:text-muted-foreground"
-                        >
-                          <Info className="h-3 w-3" />
-                        </span>
-                      </div>
-                    ) : (
-                      <div className="flex items-center justify-end gap-1">
+                  </th>
+                </tr>
+                {showRecFilters && (
+                  <tr className="border-b bg-muted/10 text-xs">
+                    <td />
+                    <td className="px-2 py-1 pl-5">
+                      <input
+                        type="text"
+                        value={recFilter.name}
+                        onChange={(e) =>
+                          setRecFilter((f) => ({ ...f, name: e.target.value }))
+                        }
+                        placeholder="Filter…"
+                        className="w-full rounded border border-border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
+                      />
+                    </td>
+                    <td className="px-2 py-1">
+                      <select
+                        value={recFilter.type}
+                        onChange={(e) =>
+                          setRecFilter((f) => ({ ...f, type: e.target.value }))
+                        }
+                        className="w-full rounded border border-border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
+                      >
+                        <option value="">All</option>
+                        {recordTypes.map((t) => (
+                          <option key={t} value={t}>
+                            {t}
+                          </option>
+                        ))}
+                      </select>
+                    </td>
+                    <td className="px-2 py-1">
+                      <input
+                        type="text"
+                        value={recFilter.value}
+                        onChange={(e) =>
+                          setRecFilter((f) => ({ ...f, value: e.target.value }))
+                        }
+                        placeholder="Filter…"
+                        className="w-full rounded border border-border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
+                      />
+                    </td>
+                    <td />
+                    <td />
+                    <td />
+                  </tr>
+                )}
+              </thead>
+              <tbody>
+                {filtered.map((r) => (
+                  <tr
+                    key={r.id}
+                    className="border-b last:border-0 hover:bg-muted/40 group"
+                  >
+                    <td className="w-8 py-1.5 pl-3">
+                      {!r.auto_generated && (
+                        <input
+                          type="checkbox"
+                          checked={selectedRecords.has(r.id)}
+                          onChange={() =>
+                            setSelectedRecords((prev) => {
+                              const next = new Set(prev);
+                              if (next.has(r.id)) next.delete(r.id);
+                              else next.add(r.id);
+                              return next;
+                            })
+                          }
+                        />
+                      )}
+                    </td>
+                    <td className="py-1.5 pl-5 font-mono text-xs font-medium">
+                      {r.auto_generated ? (
+                        r.name
+                      ) : (
                         <button
-                          className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-foreground"
                           onClick={() => setEditRecord(r)}
+                          className="hover:text-primary hover:underline"
                           title="Edit record"
                         >
-                          <Pencil className="h-3 w-3" />
+                          {r.name}
                         </button>
-                        <button
-                          className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-destructive"
-                          onClick={() => setConfirmDeleteRecord(r)}
-                          title="Delete record"
-                        >
-                          <Trash2 className="h-3 w-3" />
-                        </button>
-                      </div>
-                    )}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
+                      )}
+                    </td>
+                    <td className="py-1.5">
+                      <span
+                        className={`inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium ${typeBadge[r.record_type] ?? "bg-muted text-muted-foreground"}`}
+                      >
+                        {r.record_type}
+                      </span>
+                    </td>
+                    <td className="py-1.5 font-mono text-xs text-muted-foreground max-w-xs truncate">
+                      {r.value}
+                    </td>
+                    <td className="py-1.5 text-xs text-muted-foreground">
+                      {r.ttl ?? "—"}
+                    </td>
+                    <td className="py-1.5 text-xs text-muted-foreground">
+                      {r.priority ?? "—"}
+                    </td>
+                    <td className="py-1.5 pr-3">
+                      {r.auto_generated ? (
+                        <div className="flex items-center justify-end gap-1">
+                          <span
+                            title="This record was created automatically by IPAM. Edit the IP address in IPAM to change it."
+                            className="flex items-center gap-1 rounded border border-amber-300/60 bg-amber-50 px-1.5 py-0.5 text-xs text-amber-700 dark:border-amber-700/40 dark:bg-amber-900/20 dark:text-amber-400"
+                          >
+                            <Lock className="h-2.5 w-2.5" />
+                            IPAM
+                          </span>
+                          <span
+                            title="Managed by IPAM — changes made here will be overwritten. To edit, update the IP address record in IPAM."
+                            className="flex h-5 w-5 cursor-help items-center justify-center rounded text-muted-foreground/60 hover:text-muted-foreground"
+                          >
+                            <Info className="h-3 w-3" />
+                          </span>
+                        </div>
+                      ) : (
+                        <div className="flex items-center justify-end gap-1">
+                          <button
+                            className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-foreground"
+                            onClick={() => setEditRecord(r)}
+                            title="Edit record"
+                          >
+                            <Pencil className="h-3 w-3" />
+                          </button>
+                          <button
+                            className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-destructive"
+                            onClick={() => setConfirmDeleteRecord(r)}
+                            title="Delete record"
+                          >
+                            <Trash2 className="h-3 w-3" />
+                          </button>
+                        </div>
+                      )}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
         )}
       </div>
@@ -3648,93 +3648,93 @@ function BlocklistDetail({
           </div>
         </div>
         <div className="overflow-x-auto">
-        <table className="w-full min-w-[720px] text-sm">
-          <thead>
-            <tr className="text-left text-xs text-muted-foreground">
-              <th className="px-3 py-1.5">Domain</th>
-              <th className="px-3 py-1.5">Type</th>
-              <th className="px-3 py-1.5">Subdomains</th>
-              <th className="px-3 py-1.5">Reason</th>
-              <th className="px-3 py-1.5">Source</th>
-              <th className="px-3 py-1.5 w-8"></th>
-            </tr>
-          </thead>
-          <tbody>
-            {items.length === 0 && (
-              <tr>
-                <td
-                  colSpan={6}
-                  className="px-3 py-4 text-center text-xs text-muted-foreground italic"
-                >
-                  No entries
-                </td>
+          <table className="w-full min-w-[720px] text-sm">
+            <thead>
+              <tr className="text-left text-xs text-muted-foreground">
+                <th className="px-3 py-1.5">Domain</th>
+                <th className="px-3 py-1.5">Type</th>
+                <th className="px-3 py-1.5">Subdomains</th>
+                <th className="px-3 py-1.5">Reason</th>
+                <th className="px-3 py-1.5">Source</th>
+                <th className="px-3 py-1.5 w-8"></th>
               </tr>
-            )}
-            {items.map((e: DNSBlockListEntry) => (
-              <tr key={e.id} className="border-t hover:bg-accent/30">
-                <td className="px-3 py-1 font-mono text-xs">{e.domain}</td>
-                <td className="px-3 py-1 text-xs">{e.entry_type}</td>
-                <td className="px-3 py-1">
-                  <input
-                    type="checkbox"
-                    checked={e.is_wildcard}
-                    disabled={
-                      e.source !== "manual" ||
-                      (toggleEntryWildcard.isPending &&
-                        toggleEntryWildcard.variables?.id === e.id)
-                    }
-                    onChange={(ev) =>
-                      toggleEntryWildcard.mutate({
-                        id: e.id,
-                        value: ev.target.checked,
-                      })
-                    }
-                    title={
-                      e.source === "manual"
-                        ? "Also block *.<domain>. Saves immediately."
-                        : "Feed-sourced entries can't be toggled."
-                    }
-                  />
-                </td>
-                <td className="px-3 py-1 text-xs text-muted-foreground">
-                  {e.reason || (
-                    <span className="text-muted-foreground/40">—</span>
-                  )}
-                </td>
-                <td className="px-3 py-1 text-xs">{e.source}</td>
-                <td className="px-3 py-1 text-right">
-                  <div className="flex items-center justify-end gap-1">
-                    {e.source === "manual" && (
-                      <button
-                        className="text-muted-foreground hover:text-foreground"
-                        onClick={() => {
-                          setEditEntry(e);
-                          setEditDomain(e.domain);
-                          setEditEntryReason(e.reason ?? "");
-                          setEditEntryWildcard(e.is_wildcard);
-                        }}
-                        title="Edit domain"
-                      >
-                        <Pencil className="h-3 w-3" />
-                      </button>
-                    )}
-                    <button
-                      className="text-muted-foreground hover:text-destructive"
-                      onClick={() => deleteEntry.mutate(e.id)}
+            </thead>
+            <tbody>
+              {items.length === 0 && (
+                <tr>
+                  <td
+                    colSpan={6}
+                    className="px-3 py-4 text-center text-xs text-muted-foreground italic"
+                  >
+                    No entries
+                  </td>
+                </tr>
+              )}
+              {items.map((e: DNSBlockListEntry) => (
+                <tr key={e.id} className="border-t hover:bg-accent/30">
+                  <td className="px-3 py-1 font-mono text-xs">{e.domain}</td>
+                  <td className="px-3 py-1 text-xs">{e.entry_type}</td>
+                  <td className="px-3 py-1">
+                    <input
+                      type="checkbox"
+                      checked={e.is_wildcard}
+                      disabled={
+                        e.source !== "manual" ||
+                        (toggleEntryWildcard.isPending &&
+                          toggleEntryWildcard.variables?.id === e.id)
+                      }
+                      onChange={(ev) =>
+                        toggleEntryWildcard.mutate({
+                          id: e.id,
+                          value: ev.target.checked,
+                        })
+                      }
                       title={
                         e.source === "manual"
-                          ? "Remove entry"
-                          : "Remove (will return on next feed refresh)"
+                          ? "Also block *.<domain>. Saves immediately."
+                          : "Feed-sourced entries can't be toggled."
                       }
-                    >
-                      <Trash2 className="h-3 w-3" />
-                    </button>
-                  </div>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+                    />
+                  </td>
+                  <td className="px-3 py-1 text-xs text-muted-foreground">
+                    {e.reason || (
+                      <span className="text-muted-foreground/40">—</span>
+                    )}
+                  </td>
+                  <td className="px-3 py-1 text-xs">{e.source}</td>
+                  <td className="px-3 py-1 text-right">
+                    <div className="flex items-center justify-end gap-1">
+                      {e.source === "manual" && (
+                        <button
+                          className="text-muted-foreground hover:text-foreground"
+                          onClick={() => {
+                            setEditEntry(e);
+                            setEditDomain(e.domain);
+                            setEditEntryReason(e.reason ?? "");
+                            setEditEntryWildcard(e.is_wildcard);
+                          }}
+                          title="Edit domain"
+                        >
+                          <Pencil className="h-3 w-3" />
+                        </button>
+                      )}
+                      <button
+                        className="text-muted-foreground hover:text-destructive"
+                        onClick={() => deleteEntry.mutate(e.id)}
+                        title={
+                          e.source === "manual"
+                            ? "Remove entry"
+                            : "Remove (will return on next feed refresh)"
+                        }
+                      >
+                        <Trash2 className="h-3 w-3" />
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </div>
         {total > limit && (
           <div className="flex items-center justify-between border-t px-3 py-1.5 text-xs">
@@ -3794,55 +3794,55 @@ function BlocklistDetail({
           </button>
         </div>
         <div className="overflow-x-auto">
-        <table className="w-full min-w-[480px] text-sm">
-          <thead>
-            <tr className="text-left text-xs text-muted-foreground">
-              <th className="px-3 py-1.5">Domain</th>
-              <th className="px-3 py-1.5">Reason</th>
-              <th className="px-3 py-1.5 w-8"></th>
-            </tr>
-          </thead>
-          <tbody>
-            {exceptions.length === 0 && (
-              <tr>
-                <td
-                  colSpan={3}
-                  className="px-3 py-4 text-center text-xs text-muted-foreground italic"
-                >
-                  No exceptions
-                </td>
+          <table className="w-full min-w-[480px] text-sm">
+            <thead>
+              <tr className="text-left text-xs text-muted-foreground">
+                <th className="px-3 py-1.5">Domain</th>
+                <th className="px-3 py-1.5">Reason</th>
+                <th className="px-3 py-1.5 w-8"></th>
               </tr>
-            )}
-            {exceptions.map((ex: DNSBlockListException) => (
-              <tr key={ex.id} className="border-t hover:bg-accent/30">
-                <td className="px-3 py-1 font-mono text-xs">{ex.domain}</td>
-                <td className="px-3 py-1 text-xs">{ex.reason}</td>
-                <td className="px-3 py-1 text-right">
-                  <div className="flex items-center justify-end gap-1">
-                    <button
-                      className="text-muted-foreground hover:text-foreground"
-                      onClick={() => {
-                        setEditException(ex);
-                        setEditExcDomain(ex.domain);
-                        setEditExcReason(ex.reason ?? "");
-                      }}
-                      title="Edit exception"
-                    >
-                      <Pencil className="h-3 w-3" />
-                    </button>
-                    <button
-                      className="text-muted-foreground hover:text-destructive"
-                      onClick={() => deleteException.mutate(ex.id)}
-                      title="Remove exception"
-                    >
-                      <Trash2 className="h-3 w-3" />
-                    </button>
-                  </div>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              {exceptions.length === 0 && (
+                <tr>
+                  <td
+                    colSpan={3}
+                    className="px-3 py-4 text-center text-xs text-muted-foreground italic"
+                  >
+                    No exceptions
+                  </td>
+                </tr>
+              )}
+              {exceptions.map((ex: DNSBlockListException) => (
+                <tr key={ex.id} className="border-t hover:bg-accent/30">
+                  <td className="px-3 py-1 font-mono text-xs">{ex.domain}</td>
+                  <td className="px-3 py-1 text-xs">{ex.reason}</td>
+                  <td className="px-3 py-1 text-right">
+                    <div className="flex items-center justify-end gap-1">
+                      <button
+                        className="text-muted-foreground hover:text-foreground"
+                        onClick={() => {
+                          setEditException(ex);
+                          setEditExcDomain(ex.domain);
+                          setEditExcReason(ex.reason ?? "");
+                        }}
+                        title="Edit exception"
+                      >
+                        <Pencil className="h-3 w-3" />
+                      </button>
+                      <button
+                        className="text-muted-foreground hover:text-destructive"
+                        onClick={() => deleteException.mutate(ex.id)}
+                        title="Remove exception"
+                      >
+                        <Trash2 className="h-3 w-3" />
+                      </button>
+                    </div>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </div>
       </div>
 

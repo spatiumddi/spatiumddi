@@ -216,7 +216,11 @@ function RoleModal({
   const readOnly = role?.is_builtin ?? false;
 
   return (
-    <Modal title={role ? `Edit role — ${role.name}` : "New Role"} onClose={onClose} wide>
+    <Modal
+      title={role ? `Edit role — ${role.name}` : "New Role"}
+      onClose={onClose}
+      wide
+    >
       <div className="space-y-3">
         {readOnly && (
           <p className="rounded-md bg-muted px-3 py-2 text-xs text-muted-foreground">
@@ -270,13 +274,7 @@ function RoleModal({
   );
 }
 
-function CloneModal({
-  role,
-  onClose,
-}: {
-  role: AppRole;
-  onClose: () => void;
-}) {
+function CloneModal({ role, onClose }: { role: AppRole; onClose: () => void }) {
   const qc = useQueryClient();
   const [name, setName] = useState(`${role.name} (copy)`);
   const [error, setError] = useState<string | null>(null);
@@ -412,9 +410,7 @@ export function RolesPage() {
               <tr className="border-b bg-muted/50 text-xs">
                 <th className="px-4 py-3 text-left font-medium">Name</th>
                 <th className="px-4 py-3 text-left font-medium">Description</th>
-                <th className="px-4 py-3 text-left font-medium">
-                  Permissions
-                </th>
+                <th className="px-4 py-3 text-left font-medium">Permissions</th>
                 <th className="px-4 py-3 text-left font-medium">Built-in</th>
                 <th className="px-4 py-3" />
               </tr>

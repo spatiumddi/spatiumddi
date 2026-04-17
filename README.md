@@ -30,11 +30,11 @@ SpatiumDDI is a production-grade, open-source **DDI platform** — DNS, DHCP, an
 
 It is designed as a modern alternative to commercial DDI platforms like EfficientIP and Infoblox. Unlike most open-source alternatives, SpatiumDDI **manages and runs its own DNS/DHCP containers** — it is not a pretty front end over an external BIND9. The control plane is the source of truth; the service containers auto-register, pull their config, and keep serving even if the control plane goes down.
 
-- 🗂 **Hierarchical IP management** — spaces, blocks, subnets, addresses in a visual tree
+- 🗂 **Hierarchical IP management** — spaces, blocks, subnets, addresses in a visual tree (IPv4 + partial IPv6)
 - 🌐 **Built-in DNS server** — BIND9 container that auto-registers and syncs via RFC 2136
-- 🔄 **DHCP server management** — Kea container + agent with lease tracking (Phase 2); ISC DHCP + HA hook pending
-- 🔒 **Granular permissions** — delegate IP ranges and zones via LDAP / OIDC / SAML
-- 📋 **Full audit trail** — every mutation logged, append-only, viewable in the UI
+- 🔄 **DHCP server management** — Kea container + agent with lease tracking (DHCPv4 shipping; Dhcp6 + ISC DHCP in progress)
+- 🔒 **Group-based RBAC + external identity** — LDAP, OIDC, SAML, RADIUS, TACACS+ with backup-server failover; delegate IP ranges and zones by role
+- 📋 **Full audit trail** — every mutation logged, append-only, viewable in the UI with per-column filters
 - 🚀 **Flexible deployment** — Docker Compose, Kubernetes (Helm), bare metal, or OS appliance
 
 ---
@@ -194,13 +194,14 @@ Full docs at **[spatiumddi.github.io](https://spatiumddi.github.io)** (coming so
 
 | Phase | Focus | Status |
 |---|---|---|
-| Phase 1 | Core IPAM, auth, user management, audit log, Docker Compose | 🔄 In progress |
-| Phase 2 | DHCP (Kea + ISC), DNS (BIND9), DDNS, zone/subnet tree UI | 🔄 DNS + Kea DHCP landed; ISC DHCP + DDNS pending |
+| Phase 1 | Core IPAM, auth, user management, audit log, Docker Compose | 🔄 Mostly done — LDAP/OIDC/SAML + RADIUS/TACACS+ + group-based RBAC landed; IPv6 partial |
+| Phase 2 | DHCP (Kea + ISC), DNS (BIND9), DDNS, zone/subnet tree UI | 🔄 DNS + Kea DHCPv4 landed; ISC DHCP + DDNS pending |
 | Phase 3 | DNS views, server groups, blocking lists, VLAN/VXLAN, system admin | 🔄 DNS features landed |
-| Phase 4 | OS appliance, Terraform provider, SAML, backup/restore | 📋 Planned |
+| Phase 4 | OS appliance, Terraform provider, SAML, backup/restore | 🔄 SAML landed; appliance + providers + backup pending |
 | Phase 5 | Multi-tenancy, IP request workflows, advanced reporting | 📋 Planned |
 
-See [CLAUDE.md](CLAUDE.md) for the authoritative feature list.
+See [CHANGELOG.md](CHANGELOG.md) for the per-release feature list and
+[CLAUDE.md](CLAUDE.md) for the authoritative spec.
 
 ---
 

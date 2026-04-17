@@ -28,17 +28,27 @@ docker compose up -d
 
 1. Fork the repo and create a branch from `main`
 2. Make your changes, including tests
-3. Run `make lint` and `make test` locally before pushing
-4. Open a PR with a clear description of what changed and why
-5. Link any related issues
+3. Run `make ci` locally before pushing — it executes the exact three
+   lint jobs GitHub Actions runs (`backend-lint`: ruff + black + mypy;
+   `frontend-lint`: eslint + prettier + tsc; `frontend-build`) so you
+   catch the same failures locally that would otherwise show up on your
+   PR. For the full test run, use `make test` separately (needs a
+   dedicated `spatiumddi_test` database).
+4. Open a PR using the repository's PR template — it asks for area, test
+   plan, and migration notes. Fill those in, don't leave them blank.
+5. Link any related issues (`Closes #123`, `Refs #456`).
 
 ## Reporting Bugs
 
-Use the [GitHub Issues](https://github.com/spatiumddi/spatiumddi/issues) tracker. Include:
-- SpatiumDDI version / commit hash
-- Deployment method (Docker, Kubernetes, bare metal)
-- Steps to reproduce
-- Expected vs. actual behaviour
+Use the [GitHub Issues](https://github.com/spatiumddi/spatiumddi/issues)
+tracker — the "Bug report" issue template will prompt you for everything
+that's needed (version, deployment method, area, repro steps, logs,
+environment details). The "Feature request" template has separate fields
+for the problem, the proposed solution, and alternatives considered.
+
+Security vulnerabilities should **not** be filed as issues — please use
+[GitHub Security Advisories](https://github.com/spatiumddi/spatiumddi/security/advisories/new)
+for private disclosure.
 
 ## License
 

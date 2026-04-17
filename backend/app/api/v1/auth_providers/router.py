@@ -28,7 +28,6 @@ from app.core.auth.radius import test_connection as radius_test_connection
 from app.core.auth.saml import probe_metadata as saml_probe_metadata
 from app.core.auth.tacacs import test_connection as tacacs_test_connection
 from app.core.crypto import decrypt_dict, encrypt_dict
-from app.models.settings import PlatformSettings
 from app.models.audit import AuditLog
 from app.models.auth import Group
 from app.models.auth_provider import (
@@ -36,6 +35,7 @@ from app.models.auth_provider import (
     AuthGroupMapping,
     AuthProvider,
 )
+from app.models.settings import PlatformSettings
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()
@@ -183,9 +183,7 @@ async def list_providers(db: DB, _: SuperAdmin) -> list[ProviderResponse]:
 
 
 @router.post("", response_model=ProviderResponse, status_code=status.HTTP_201_CREATED)
-async def create_provider(
-    body: ProviderCreate, db: DB, user: SuperAdmin
-) -> ProviderResponse:
+async def create_provider(body: ProviderCreate, db: DB, user: SuperAdmin) -> ProviderResponse:
     existing = await db.execute(select(AuthProvider).where(AuthProvider.name == body.name))
     if existing.scalar_one_or_none() is not None:
         raise HTTPException(status_code=409, detail="A provider with that name already exists")
@@ -222,7 +220,9 @@ async def create_provider(
     )
     await db.commit()
     await db.refresh(provider)
-    logger.info("auth_provider_created", id=str(provider.id), name=provider.name, type=provider.type)
+    logger.info(
+        "auth_provider_created", id=str(provider.id), name=provider.name, type=provider.type
+    )
     return _to_response(provider, 0)
 
 
@@ -338,17 +338,15 @@ async def test_provider(
     if provider.type == "ldap":
         try:
             report = await asyncio.wait_for(
-                asyncio.to_thread(
-                    ldap_test_connection, provider, body.username, body.password
-                ),
+                asyncio.to_thread(ldap_test_connection, provider, body.username, body.password),
                 timeout=20,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             report = {"ok": False, "message": "LDAP probe timed out", "details": {}}
     elif provider.type == "oidc":
         try:
             report = await asyncio.wait_for(oidc_probe_discovery(provider), timeout=15)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             report = {
                 "ok": False,
                 "message": "OIDC discovery probe timed out",
@@ -362,7 +360,7 @@ async def test_provider(
                 saml_probe_metadata(provider, base_url or "http://localhost"),
                 timeout=15,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             report = {
                 "ok": False,
                 "message": "SAML metadata probe timed out",
@@ -374,7 +372,7 @@ async def test_provider(
                 asyncio.to_thread(radius_test_connection, provider),
                 timeout=20,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             report = {
                 "ok": False,
                 "message": "RADIUS probe timed out",
@@ -386,7 +384,7 @@ async def test_provider(
                 asyncio.to_thread(tacacs_test_connection, provider),
                 timeout=20,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             report = {
                 "ok": False,
                 "message": "TACACS+ probe timed out",
@@ -395,9 +393,7 @@ async def test_provider(
     else:
         raise HTTPException(
             status_code=400,
-            detail=(
-                f"Testing is not yet implemented for provider type {provider.type!r}"
-            ),
+            detail=(f"Testing is not yet implemented for provider type {provider.type!r}"),
         )
 
     db.add(
@@ -428,9 +424,7 @@ async def test_provider(
 # Debug-only: decrypt + return secrets. Kept out of GET to avoid accidental exposure.
 # Used by the admin UI's "Reveal" button (explicit action).
 @router.get("/{provider_id}/secrets", response_model=dict[str, Any])
-async def reveal_secrets(
-    provider_id: uuid.UUID, db: DB, user: SuperAdmin
-) -> dict[str, Any]:
+async def reveal_secrets(provider_id: uuid.UUID, db: DB, user: SuperAdmin) -> dict[str, Any]:
     provider = await _get_provider_or_404(db, provider_id)
     if provider.secrets_encrypted is None:
         return {}
@@ -462,17 +456,13 @@ async def reveal_secrets(
 # ── Mapping endpoints ─────────────────────────────────────────────────────────
 
 
-async def _mapping_with_group_name(
-    db: DB, mapping: AuthGroupMapping
-) -> MappingResponse:
+async def _mapping_with_group_name(db: DB, mapping: AuthGroupMapping) -> MappingResponse:
     group = await db.get(Group, mapping.internal_group_id)
     return _mapping_to_response(mapping, group.name if group else "")
 
 
 @router.get("/{provider_id}/mappings", response_model=list[MappingResponse])
-async def list_mappings(
-    provider_id: uuid.UUID, db: DB, _: SuperAdmin
-) -> list[MappingResponse]:
+async def list_mappings(provider_id: uuid.UUID, db: DB, _: SuperAdmin) -> list[MappingResponse]:
     await _get_provider_or_404(db, provider_id)
     res = await db.execute(
         select(AuthGroupMapping)
@@ -587,9 +577,7 @@ async def update_mapping(
     return await _mapping_with_group_name(db, mapping)
 
 
-@router.delete(
-    "/{provider_id}/mappings/{mapping_id}", status_code=status.HTTP_204_NO_CONTENT
-)
+@router.delete("/{provider_id}/mappings/{mapping_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_mapping(
     provider_id: uuid.UUID, mapping_id: uuid.UUID, db: DB, user: SuperAdmin
 ) -> None:

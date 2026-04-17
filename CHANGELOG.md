@@ -7,6 +7,184 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versioning uses 
 
 ## Unreleased
 
+First wave of substantive post-alpha work. External auth providers (LDAP /
+OIDC / SAML + RADIUS / TACACS+ with backup-server failover), group-based
+RBAC enforced across every API router, partial IPv6 (storage + UI + Kea
+Dhcp6), inherited-field placeholders on edit modals, mobile-responsive
+layout, IPAM block/subnet overlap validation, scheduled IPAM↔DNS auto-sync,
+bulk-edit DNS zone assignment, shared zone-picker dropdown with primary /
+additional grouping, and a `make ci` target that mirrors GitHub Actions
+locally.
+
+### Added
+
+**Auth — Wave A (external identity providers)**
+- `AuthProvider` + `AuthGroupMapping` models with Fernet-encrypted secrets
+  (`backend/app/core/crypto.py`). Admin CRUD at `/api/v1/auth-providers`
+  with per-type structured forms on `AuthProvidersPage`.
+- **LDAP** — `ldap3`-based auth (`backend/app/core/auth/ldap.py`).
+  Password-grant fallthrough from `/auth/login`. TLS / LDAPS / StartTLS
+  support with optional CA cert path.
+- **OIDC** — authorize / callback redirect flow with signed-JWT state+nonce
+  cookie, discovery + JWKS caching, `authlib.jose` ID-token validation.
+  Login page renders enabled providers as "Sign in with …" buttons.
+- **SAML** — `python3-saml` SP flow: HTTP-Redirect AuthnRequest, ACS POST
+  binding, `GET /auth/{provider_id}/metadata` for IdP-side SP metadata.
+- Unified user sync (`backend/app/core/auth/user_sync.py`) creates / updates
+  `User` rows, replaces group membership from group mappings, and
+  **rejects logins with no mapping match** (configurable per provider).
+
+**Auth — Wave B (network-device protocols)**
+- **RADIUS** — `pyrad` driver (`backend/app/core/auth/radius.py`).
+  Built-in minimal dictionary; extra vendor dicts via `dictionary_path`.
+  Group info from `Filter-Id` / `Class` by default.
+- **TACACS+** — `tacacs_plus` driver (`backend/app/core/auth/tacacs.py`).
+  Separate `authorize()` round-trip pulls AV pairs; numeric `priv-lvl`
+  values are surfaced as `priv-lvl:N` for group mapping.
+- Both share the same password-grant fallthrough as LDAP via
+  `PASSWORD_PROVIDER_TYPES = ("ldap", "radius", "tacacs")`.
+- Per-provider "Test connection" probe in the admin UI returns
+  `{ok, message, details}` for all five provider types.
+
+**Auth — backup-server failover (LDAP / RADIUS / TACACS+)**
+- Each password provider's config now accepts an optional list of backup
+  hosts (`config.backup_hosts` for LDAP, `config.backup_servers` for
+  RADIUS/TACACS+). Entries can be `"host"` or `"host:port"`; bracketed
+  IPv6 literals (`[::1]:389`) are supported. The UI adds a "Backup hosts /
+  servers" textarea (one per line).
+- LDAP uses `ldap3.ServerPool(pool_strategy=FIRST, active=True,
+  exhaust=True)` — dead hosts are skipped for the pool's lifetime.
+- RADIUS and TACACS+ iterate primary → backups manually. A definitive
+  auth answer (Accept / Reject, `valid=True/False`) stops iteration;
+  network / timeout / protocol errors fail over to the next server.
+- All backups share the primary's shared secret and timeout settings.
+
+**Auth — Wave C (group-based RBAC enforcement)**
+- Permission grammar `{action, resource_type, resource_id?}` with wildcard
+  support; helpers in `backend/app/core/permissions.py`
+  (`user_has_permission`, `require_permission`, `require_any_permission`,
+  `require_resource_permission`).
+- Five builtin roles seeded at startup: Superadmin, Viewer, IPAM Editor,
+  DNS Editor, DHCP Editor.
+- `/api/v1/roles` CRUD + expanded `/api/v1/groups` CRUD with role/user
+  assignment. Router-level gates applied across IPAM / DNS / DHCP / VLANs
+  / custom-fields / settings / audit. Superadmin always bypasses.
+- `RolesPage` + `GroupsPage` admin UI. See `docs/PERMISSIONS.md`.
+
+**Auth — Wave D UX polish**
+- Per-field opt-in toggles on bulk-edit IPs (status / description / tags /
+  custom-fields / DNS zone individually) plus a "replace all tags" mode.
+- `EditSubnetModal` + `EditBlockModal` now surface inherited custom-field
+  values as HTML `placeholder` with "inherited from block/space `<name>`"
+  badges. New `/api/v1/ipam/blocks/{id}/effective-fields` endpoint for
+  parity with the existing subnet endpoint.
+
+**IPv6 (partial)**
+- `DHCPScope.address_family` column (migration `d7a2b6e9f134`) + Kea
+  driver `Dhcp6` branch renders a v6 config bundle from the same scope
+  rows. Dhcp6 option-name translation TODO is flagged in
+  `backend/app/drivers/dhcp/kea.py`.
+- `Subnet.total_ips` widened to `BigInteger` (migration `e3c7b91f2a45`)
+  so a `/64` (`2^64` addresses) fits. `_total_ips()` clamps at `2^63 − 1`.
+- Subnet create skips the v6 broadcast row; `_sync_dns_record` emits AAAA
+  + PTR in `ip6.arpa`.
+- `/blocks/{id}/available-subnets` accepts `/8–/128` (was `le=32`) with
+  an explicit address-family guard. Frontend "Find by size" splits the
+  prefix pool into v4 (`/8–/32`) and v6 (`/32, /40, /44, /48, /52, /56,
+  /60, /64, /72, /80, /96, /112, /120, /124, /127, /128`) and dynamically
+  filters to prefixes strictly longer than the selected block's prefix.
+- `/ipam/addresses/next-address` returns 409 on v6 subnets (EUI-64 / hash
+  allocation is a future enhancement).
+- IPAM create-block / create-subnet placeholders now include an IPv6
+  example next to the IPv4 one (`e.g. 10.0.0.0/8 or 2001:db8::/32`).
+
+**IPAM — block / subnet overlap validation**
+- `_assert_no_block_overlap()` rejects same-level duplicates and CIDR
+  overlaps in `create_block` and in the reparent path of `update_block`.
+  Uses PostgreSQL's `cidr &&` operator for a single-query overlap check.
+
+**IPAM — scheduled IPAM ↔ DNS auto-sync**
+- Opt-in Celery beat task `app.tasks.ipam_dns_sync.auto_sync_ipam_dns`
+  (`backend/app/tasks/ipam_dns_sync.py`). Beat fires every 60 s; the task
+  gates on `PlatformSettings.dns_auto_sync_enabled` +
+  `dns_auto_sync_interval_minutes`, so cadence changes in the UI take
+  effect without restarting beat. Optional deletion of stale auto-
+  generated records (`dns_auto_sync_delete_stale`).
+- Settings UI: new **DNS Auto-Sync** section on `/admin/settings`
+  (enable / interval / delete-stale toggle).
+
+**IPAM — shared zone picker + bulk-edit DNS zone**
+- New `ZoneOptions` component (`frontend/src/pages/ipam/IPAMPage.tsx`)
+  renders the primary zone first, then an `<optgroup label="Additional
+  zones">` separator. Used in Create / Edit / Bulk-edit IP modals.
+- Zone picker is restricted to the subnet's explicit primary + additional
+  zones when any are pinned; falls back to every zone in the group only
+  when the admin picked a group without pinning specific zones.
+- `IPAddressBulkChanges.dns_zone_id` — bulk-editing a set of IPs routes
+  every selected address through `_sync_dns_record` for move / create /
+  delete.
+
+**IPAM — mobile responsive**
+- Sidebar becomes a drawer on `<md` with backdrop + `Header` hamburger
+  toggle.
+- 10+ data tables wrapped in `overflow-x-auto` with `min-w` so wide
+  columns scroll horizontally instead of overflowing the viewport.
+- All modals sized `max-w-[95vw]` on `<sm`.
+
+**IPAM — IP aliases polish**
+- Adding or deleting an alias now also invalidates
+  `["subnet-aliases", subnet_id]`, so switching to the Aliases tab after
+  an add/delete no longer shows a stale list.
+- Delete alias from the subnet Aliases tab now pops a single-step
+  `ConfirmDeleteModal` ("Delete alias `<fqdn>`? The DNS record will be
+  removed.") matching the standard IPAM delete flow.
+
+**Developer tooling**
+- `make ci` — new Makefile target that runs the exact three lint jobs
+  CI runs (`backend-lint`: ruff + black + mypy; `frontend-lint`: eslint +
+  prettier + tsc; `frontend-build`: `npm run build`). Backend checks run
+  inside the running `api` container; ruff/black/mypy are installed on
+  first run if missing.
+- `.github/ISSUE_TEMPLATE/{bug_report,feature_request,config}.yml` and
+  `.github/pull_request_template.md` — structured issue + PR templates
+  with dropdown areas (IPAM / DNS / DHCP / Auth / RBAC / Audit / UI / API
+  / Deployment / Docs), repro steps, a private Security Advisory link,
+  and a test-plan checklist.
+
+### Changed
+
+- IPAM modal input focus ring switched to `focus:ring-inset` so the 2px
+  ring draws inside the border. Prevents horizontal clipping by the
+  modal's `overflow-y-auto` container (browsers clamp `overflow-x` when
+  `overflow-y` is set), which previously cut the left edge of any focused
+  box in the Create / Edit Block / Subnet forms.
+- `CLAUDE.md` phase roadmap updated to reflect Waves A–D. Tech-stack Auth
+  row now lists actual deps (`python-jose + bcrypt`, `ldap3`, `authlib`,
+  `python3-saml`, `pyrad`, `tacacs_plus`, `Fernet`).
+
+### Fixed
+
+- `user_sync._matched_internal_groups` used one `res` variable name for
+  two `db.execute()` calls with different result types, tripping mypy
+  after the dev extras finally ran in `make ci`. Renamed to `map_res` /
+  `group_res`.
+- CI lint was still failing on `main` after `f38d533` — residual ruff
+  warnings (20) and prettier issues (12 files). Now clean; `make ci`
+  passes end-to-end.
+- SAML ACS handler: `SAMLResponse` / `RelayState` form fields kept their
+  spec-mandated casing; added `# noqa: N803` so ruff stops complaining.
+
+### Security
+
+- CodeQL alert #13 (CWE-601, URL redirection from remote source): the
+  OIDC callback interpolated the IdP-provided `error` query parameter
+  directly into the `/login?error=…` redirect. The redirect target was
+  already a relative path (so no open-redirect in practice) but the
+  tainted value still flowed into the URL. Added `_safe_error_suffix()`
+  to strip any provider-supplied error code down to `[a-z0-9_]` (max 40
+  chars) and applied it at every `f"…_{error}"` / `f"…_{exc.reason}"`
+  site in the OIDC and SAML callback handlers.
+
 ---
 
 ## 2026.04.16-2 — 2026-04-16

@@ -41,8 +41,10 @@ async def _run_auto_sync() -> dict[str, Any]:
     # Imports are intentionally deferred so loading this module from the
     # Celery worker doesn't drag in the full FastAPI router graph at import
     # time — the router has its own side-effectful imports.
-    from app.api.v1.ipam.router import _apply_dns_sync  # noqa: PLC0415
-    from app.api.v1.ipam.router import DnsSyncCommitRequest  # noqa: PLC0415
+    from app.api.v1.ipam.router import (
+        DnsSyncCommitRequest,  # noqa: PLC0415
+        _apply_dns_sync,  # noqa: PLC0415
+    )
     from app.services.dns.sync_check import compute_subnet_dns_drift  # noqa: PLC0415
 
     engine = create_async_engine(settings.database_url, future=True)
@@ -65,9 +67,7 @@ async def _run_auto_sync() -> dict[str, Any]:
                         "wait_seconds": int((interval - elapsed).total_seconds()),
                     }
 
-            subnets = list(
-                (await db.execute(select(Subnet.id))).scalars().all()
-            )
+            subnets = list((await db.execute(select(Subnet.id))).scalars().all())
 
             total_created = 0
             total_updated = 0
@@ -93,9 +93,7 @@ async def _run_auto_sync() -> dict[str, Any]:
                     create_for_ip_ids=[m.ip_id for m in report.missing],
                     update_record_ids=[m.record_id for m in report.mismatched],
                     delete_stale_record_ids=(
-                        [s.record_id for s in report.stale]
-                        if ps.dns_auto_sync_delete_stale
-                        else []
+                        [s.record_id for s in report.stale] if ps.dns_auto_sync_delete_stale else []
                     ),
                 )
                 try:

@@ -52,16 +52,16 @@ async def _matched_internal_groups(
     matching case-insensitively against the provider's mapping table."""
     if not user_group_identifiers:
         return []
-    res = await db.execute(
+    map_res = await db.execute(
         select(AuthGroupMapping).where(AuthGroupMapping.provider_id == provider_id)
     )
-    mappings = res.unique().scalars().all()
+    mappings = map_res.unique().scalars().all()
     wanted = {g.lower() for g in user_group_identifiers}
     matched_ids = [m.internal_group_id for m in mappings if m.external_group.lower() in wanted]
     if not matched_ids:
         return []
-    res = await db.execute(select(Group).where(Group.id.in_(matched_ids)))
-    return list(res.unique().scalars().all())
+    group_res = await db.execute(select(Group).where(Group.id.in_(matched_ids)))
+    return list(group_res.unique().scalars().all())
 
 
 async def sync_external_user(
@@ -75,9 +75,7 @@ async def sync_external_user(
     """
     key = (result.external_id or "").strip()
     if not key:
-        raise ExternalSyncRejected(
-            "invalid_external_response", "IdP returned empty external id"
-        )
+        raise ExternalSyncRejected("invalid_external_response", "IdP returned empty external id")
 
     # 1) Group-mapping resolution — fail closed.
     groups = await _matched_internal_groups(db, provider.id, result.groups)

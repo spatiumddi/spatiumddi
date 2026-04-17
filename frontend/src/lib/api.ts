@@ -866,12 +866,7 @@ export const settingsApi = {
 
 // ── Auth Providers ─────────────────────────────────────────────────────────────
 
-export type AuthProviderType =
-  | "ldap"
-  | "oidc"
-  | "saml"
-  | "radius"
-  | "tacacs";
+export type AuthProviderType = "ldap" | "oidc" | "saml" | "radius" | "tacacs";
 
 export interface AuthProvider {
   id: string;
@@ -1018,8 +1013,7 @@ export const rolesApi = {
 };
 
 export const authProvidersApi = {
-  list: () =>
-    api.get<AuthProvider[]>("/auth-providers").then((r) => r.data),
+  list: () => api.get<AuthProvider[]>("/auth-providers").then((r) => r.data),
   test: (id: string, body: { username?: string; password?: string }) =>
     api
       .post<AuthProviderTestResult>(`/auth-providers/${id}/test`, body)
@@ -1863,9 +1857,7 @@ export const authApi = {
       .post<LoginResponse>("/auth/login", { username, password })
       .then((r) => r.data),
   publicProviders: () =>
-    api
-      .get<PublicAuthProvider[]>("/auth/providers")
-      .then((r) => r.data),
+    api.get<PublicAuthProvider[]>("/auth/providers").then((r) => r.data),
   logout: () => api.post("/auth/logout"),
   refresh: (refreshToken: string) =>
     api

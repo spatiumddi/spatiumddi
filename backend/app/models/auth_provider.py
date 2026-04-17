@@ -38,7 +38,7 @@ class AuthProvider(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # On subsequent logins: refresh email / display_name from the IdP?
     auto_update_users: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
-    mappings: Mapped[list["AuthGroupMapping"]] = relationship(
+    mappings: Mapped[list[AuthGroupMapping]] = relationship(
         "AuthGroupMapping",
         back_populates="provider",
         cascade="all, delete-orphan",

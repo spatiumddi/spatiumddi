@@ -45,9 +45,7 @@ logger = structlog.get_logger(__name__)
 # only when dns_zone permits write") can do inline checks with
 # `user_has_permission`.
 router = APIRouter(
-    dependencies=[
-        Depends(require_any_resource_permission("dns_group", "dns_zone", "dns_record"))
-    ]
+    dependencies=[Depends(require_any_resource_permission("dns_group", "dns_zone", "dns_record"))]
 )
 
 VALID_DRIVERS = {"bind9"}

@@ -82,7 +82,16 @@ const SECTIONS: SectionDef[] = [
     id: "branding",
     title: "Branding & URL",
     description: "Application title, external URL, and visual identity.",
-    keywords: ["title", "name", "logo", "header", "url", "base", "saml", "oidc"],
+    keywords: [
+      "title",
+      "name",
+      "logo",
+      "header",
+      "url",
+      "base",
+      "saml",
+      "oidc",
+    ],
   },
   {
     id: "discovery",
@@ -450,9 +459,7 @@ export function SettingsPage() {
                           Number(e.target.value),
                         )
                       }
-                      disabled={
-                        !isSuperadmin || !values.dns_auto_sync_enabled
-                      }
+                      disabled={!isSuperadmin || !values.dns_auto_sync_enabled}
                       className={cn(inputCls, "w-24")}
                     />
                     <span className="text-xs text-muted-foreground">min</span>
@@ -465,9 +472,7 @@ export function SettingsPage() {
                   <Toggle
                     checked={!!values.dns_auto_sync_delete_stale}
                     onChange={(v) => set("dns_auto_sync_delete_stale", v)}
-                    disabled={
-                      !isSuperadmin || !values.dns_auto_sync_enabled
-                    }
+                    disabled={!isSuperadmin || !values.dns_auto_sync_enabled}
                   />
                 </Field>
                 <Field

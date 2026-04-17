@@ -361,58 +361,58 @@ function RouterDetail({
           </button>
         </div>
         <div className="overflow-x-auto">
-        <table className="w-full min-w-[560px] text-xs">
-          <thead className="text-muted-foreground bg-muted/30">
-            <tr>
-              <SortableTh
-                sortKey="tag"
-                sort={sort}
-                onSort={toggle}
-                className="w-16 px-3 py-1.5"
-              >
-                Tag
-              </SortableTh>
-              <SortableTh
-                sortKey="name"
-                sort={sort}
-                onSort={toggle}
-                className="px-3 py-1.5"
-              >
-                Name
-              </SortableTh>
-              <SortableTh
-                sortKey="description"
-                sort={sort}
-                onSort={toggle}
-                className="px-3 py-1.5"
-              >
-                Description
-              </SortableTh>
-              <th className="text-right px-3 py-1.5 w-24 font-medium">
-                Subnets
-              </th>
-            </tr>
-          </thead>
-          <tbody>
-            {vlans.length === 0 && (
+          <table className="w-full min-w-[560px] text-xs">
+            <thead className="text-muted-foreground bg-muted/30">
               <tr>
-                <td
-                  colSpan={4}
-                  className="px-3 py-3 text-center text-muted-foreground italic"
+                <SortableTh
+                  sortKey="tag"
+                  sort={sort}
+                  onSort={toggle}
+                  className="w-16 px-3 py-1.5"
                 >
-                  No VLANs yet.
-                </td>
+                  Tag
+                </SortableTh>
+                <SortableTh
+                  sortKey="name"
+                  sort={sort}
+                  onSort={toggle}
+                  className="px-3 py-1.5"
+                >
+                  Name
+                </SortableTh>
+                <SortableTh
+                  sortKey="description"
+                  sort={sort}
+                  onSort={toggle}
+                  className="px-3 py-1.5"
+                >
+                  Description
+                </SortableTh>
+                <th className="text-right px-3 py-1.5 w-24 font-medium">
+                  Subnets
+                </th>
               </tr>
-            )}
-            {sortedVlans.map((v) => (
-              <VLANRow
-                key={v.id}
-                vlan={v}
-                onClick={() => onSelectVlan(v.id, routerId)}
-              />
-            ))}
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              {vlans.length === 0 && (
+                <tr>
+                  <td
+                    colSpan={4}
+                    className="px-3 py-3 text-center text-muted-foreground italic"
+                  >
+                    No VLANs yet.
+                  </td>
+                </tr>
+              )}
+              {sortedVlans.map((v) => (
+                <VLANRow
+                  key={v.id}
+                  vlan={v}
+                  onClick={() => onSelectVlan(v.id, routerId)}
+                />
+              ))}
+            </tbody>
+          </table>
         </div>
       </div>
 
@@ -573,36 +573,36 @@ function VLANDetail({
           </h3>
         </div>
         <div className="overflow-x-auto">
-        <table className="w-full min-w-[560px] text-xs">
-          <thead className="text-muted-foreground bg-muted/30">
-            <tr>
-              <th className="text-left px-3 py-1.5">Network</th>
-              <th className="text-left px-3 py-1.5">Name</th>
-              <th className="text-left px-3 py-1.5">Status</th>
-            </tr>
-          </thead>
-          <tbody>
-            {subnets.length === 0 && (
+          <table className="w-full min-w-[560px] text-xs">
+            <thead className="text-muted-foreground bg-muted/30">
               <tr>
-                <td
-                  colSpan={3}
-                  className="px-3 py-3 text-center text-muted-foreground italic"
-                >
-                  No subnets reference this VLAN.
-                </td>
+                <th className="text-left px-3 py-1.5">Network</th>
+                <th className="text-left px-3 py-1.5">Name</th>
+                <th className="text-left px-3 py-1.5">Status</th>
               </tr>
-            )}
-            {subnets.map((s: Subnet) => (
-              <tr key={s.id} className="border-t">
-                <td className="px-3 py-1.5 font-mono">{s.network}</td>
-                <td className="px-3 py-1.5">{s.name || "—"}</td>
-                <td className="px-3 py-1.5 text-muted-foreground">
-                  {s.status}
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+            </thead>
+            <tbody>
+              {subnets.length === 0 && (
+                <tr>
+                  <td
+                    colSpan={3}
+                    className="px-3 py-3 text-center text-muted-foreground italic"
+                  >
+                    No subnets reference this VLAN.
+                  </td>
+                </tr>
+              )}
+              {subnets.map((s: Subnet) => (
+                <tr key={s.id} className="border-t">
+                  <td className="px-3 py-1.5 font-mono">{s.network}</td>
+                  <td className="px-3 py-1.5">{s.name || "—"}</td>
+                  <td className="px-3 py-1.5 text-muted-foreground">
+                    {s.status}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
         </div>
       </div>
 

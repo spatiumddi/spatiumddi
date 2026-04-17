@@ -114,6 +114,7 @@ const SECRETS_EXAMPLES: Record<AuthProviderType, string> = {
 const LDAP_DEFAULTS = {
   host: "",
   port: 636,
+  backup_hosts: "",
   use_ssl: true,
   start_tls: false,
   bind_dn: "",
@@ -153,6 +154,7 @@ const SAML_DEFAULTS = {
 const RADIUS_DEFAULTS = {
   server: "",
   port: 1812,
+  backup_servers: "",
   timeout: 5,
   retries: 3,
   nas_identifier: "spatiumddi",
@@ -163,6 +165,7 @@ const RADIUS_DEFAULTS = {
 const TACACS_DEFAULTS = {
   server: "",
   port: 49,
+  backup_servers: "",
   timeout: 5,
   attr_groups: "priv-lvl",
 };
@@ -221,7 +224,16 @@ function LdapConfigFields({
 }) {
   const cfg = useMemo(() => {
     try {
-      return { ...LDAP_DEFAULTS, ...JSON.parse(form.config_json || "{}") };
+      const parsed = {
+        ...LDAP_DEFAULTS,
+        ...JSON.parse(form.config_json || "{}"),
+      };
+      // Older configs (and the API round-trip) may store backup_hosts as an
+      // array. Normalise to a newline-separated string for the textarea.
+      if (Array.isArray(parsed.backup_hosts)) {
+        parsed.backup_hosts = parsed.backup_hosts.join("\n");
+      }
+      return parsed;
     } catch {
       return { ...LDAP_DEFAULTS };
     }
@@ -229,7 +241,10 @@ function LdapConfigFields({
 
   function setCfg(patch: Partial<typeof LDAP_DEFAULTS>) {
     const next = { ...cfg, ...patch };
-    setForm((prev) => ({ ...prev, config_json: JSON.stringify(next, null, 2) }));
+    setForm((prev) => ({
+      ...prev,
+      config_json: JSON.stringify(next, null, 2),
+    }));
   }
 
   const label = "block text-xs font-medium text-muted-foreground";
@@ -256,6 +271,20 @@ function LdapConfigFields({
             className={input}
           />
         </div>
+      </div>
+      <div>
+        <label className={label}>Backup hosts</label>
+        <textarea
+          value={cfg.backup_hosts}
+          onChange={(e) => setCfg({ backup_hosts: e.target.value })}
+          placeholder="dc2.example.com&#10;dc3.example.com:636"
+          rows={2}
+          className={input}
+        />
+        <p className="mt-1 text-[11px] text-muted-foreground">
+          Optional failover DCs — one per line, <code>host</code> or{" "}
+          <code>host:port</code>. Tried in order if the primary is unreachable.
+        </p>
       </div>
       <div className="flex gap-4">
         <label className="flex items-center gap-2 text-sm">
@@ -309,7 +338,8 @@ function LdapConfigFields({
 
       <div>
         <label className={label}>
-          User filter <span className="opacity-60">— must contain {"{username}"}</span>
+          User filter{" "}
+          <span className="opacity-60">— must contain {"{username}"}</span>
         </label>
         <input
           value={cfg.user_filter}
@@ -392,7 +422,10 @@ function OidcConfigFields({
 
   function setCfg(patch: Partial<typeof OIDC_DEFAULTS>) {
     const next = { ...cfg, ...patch };
-    setForm((prev) => ({ ...prev, config_json: JSON.stringify(next, null, 2) }));
+    setForm((prev) => ({
+      ...prev,
+      config_json: JSON.stringify(next, null, 2),
+    }));
   }
 
   const label = "block text-xs font-medium text-muted-foreground";
@@ -414,8 +447,8 @@ function OidcConfigFields({
           className={cn(input, "font-mono text-xs")}
         />
         <p className="mt-1 text-xs text-muted-foreground">
-          The IdP's OIDC metadata URL. Fetched at provider save + cached for
-          one hour.
+          The IdP's OIDC metadata URL. Fetched at provider save + cached for one
+          hour.
         </p>
       </div>
 
@@ -476,9 +509,7 @@ function OidcConfigFields({
             <label className={label}>Display-name claim</label>
             <input
               value={cfg.claim_display_name}
-              onChange={(e) =>
-                setCfg({ claim_display_name: e.target.value })
-              }
+              onChange={(e) => setCfg({ claim_display_name: e.target.value })}
               className={input}
             />
           </div>
@@ -517,7 +548,10 @@ function SamlConfigFields({
 
   function setCfg(patch: Partial<typeof SAML_DEFAULTS>) {
     const next = { ...cfg, ...patch };
-    setForm((prev) => ({ ...prev, config_json: JSON.stringify(next, null, 2) }));
+    setForm((prev) => ({
+      ...prev,
+      config_json: JSON.stringify(next, null, 2),
+    }));
   }
 
   const label = "block text-xs font-medium text-muted-foreground";
@@ -673,7 +707,14 @@ function RadiusConfigFields({
 }) {
   const cfg = useMemo(() => {
     try {
-      return { ...RADIUS_DEFAULTS, ...JSON.parse(form.config_json || "{}") };
+      const parsed = {
+        ...RADIUS_DEFAULTS,
+        ...JSON.parse(form.config_json || "{}"),
+      };
+      if (Array.isArray(parsed.backup_servers)) {
+        parsed.backup_servers = parsed.backup_servers.join("\n");
+      }
+      return parsed;
     } catch {
       return { ...RADIUS_DEFAULTS };
     }
@@ -681,7 +722,10 @@ function RadiusConfigFields({
 
   function setCfg(patch: Partial<typeof RADIUS_DEFAULTS>) {
     const next = { ...cfg, ...patch };
-    setForm((prev) => ({ ...prev, config_json: JSON.stringify(next, null, 2) }));
+    setForm((prev) => ({
+      ...prev,
+      config_json: JSON.stringify(next, null, 2),
+    }));
   }
 
   const label = "block text-xs font-medium text-muted-foreground";
@@ -709,6 +753,20 @@ function RadiusConfigFields({
             className={input}
           />
         </div>
+      </div>
+      <div>
+        <label className={label}>Backup servers</label>
+        <textarea
+          value={cfg.backup_servers}
+          onChange={(e) => setCfg({ backup_servers: e.target.value })}
+          placeholder="radius2.example.com&#10;radius3.example.com:1812"
+          rows={2}
+          className={input}
+        />
+        <p className="mt-1 text-[11px] text-muted-foreground">
+          Optional failover servers — one per line, <code>host</code> or{" "}
+          <code>host:port</code>. Share the shared secret with the primary.
+        </p>
       </div>
 
       <div className="grid grid-cols-2 gap-3">
@@ -792,7 +850,14 @@ function TacacsConfigFields({
 }) {
   const cfg = useMemo(() => {
     try {
-      return { ...TACACS_DEFAULTS, ...JSON.parse(form.config_json || "{}") };
+      const parsed = {
+        ...TACACS_DEFAULTS,
+        ...JSON.parse(form.config_json || "{}"),
+      };
+      if (Array.isArray(parsed.backup_servers)) {
+        parsed.backup_servers = parsed.backup_servers.join("\n");
+      }
+      return parsed;
     } catch {
       return { ...TACACS_DEFAULTS };
     }
@@ -800,7 +865,10 @@ function TacacsConfigFields({
 
   function setCfg(patch: Partial<typeof TACACS_DEFAULTS>) {
     const next = { ...cfg, ...patch };
-    setForm((prev) => ({ ...prev, config_json: JSON.stringify(next, null, 2) }));
+    setForm((prev) => ({
+      ...prev,
+      config_json: JSON.stringify(next, null, 2),
+    }));
   }
 
   const label = "block text-xs font-medium text-muted-foreground";
@@ -829,6 +897,20 @@ function TacacsConfigFields({
           />
         </div>
       </div>
+      <div>
+        <label className={label}>Backup servers</label>
+        <textarea
+          value={cfg.backup_servers}
+          onChange={(e) => setCfg({ backup_servers: e.target.value })}
+          placeholder="tacacs2.example.com&#10;tacacs3.example.com:49"
+          rows={2}
+          className={input}
+        />
+        <p className="mt-1 text-[11px] text-muted-foreground">
+          Optional failover servers — one per line, <code>host</code> or{" "}
+          <code>host:port</code>. Share the shared secret with the primary.
+        </p>
+      </div>
 
       <div>
         <label className={label}>Timeout (seconds)</label>
@@ -856,9 +938,9 @@ function TacacsConfigFields({
             <p className="mt-1 text-xs text-muted-foreground">
               When set to <code>priv-lvl</code> (the default), numeric values
               are emitted as <code>priv-lvl:N</code> so you can map e.g.{" "}
-              <code>priv-lvl:15</code> → Admins in the group-mapping table.
-              Use a custom AV-pair name (e.g. <code>group</code>) if your
-              TACACS+ server supplies one.
+              <code>priv-lvl:15</code> → Admins in the group-mapping table. Use
+              a custom AV-pair name (e.g. <code>group</code>) if your TACACS+
+              server supplies one.
             </p>
           </div>
         </div>
@@ -1079,8 +1161,8 @@ function MappingsSection({ providerId }: { providerId: string }) {
         <h3 className="text-sm font-semibold">Group mappings</h3>
         <p className="text-xs text-muted-foreground">
           Match an LDAP/AD group DN to an internal SpatiumDDI group. On login,
-          the user's group memberships are replaced by the mapped groups.
-          Users with no matching mapping are rejected.
+          the user's group memberships are replaced by the mapped groups. Users
+          with no matching mapping are rejected.
         </p>
       </div>
 
@@ -1092,8 +1174,12 @@ function MappingsSection({ providerId }: { providerId: string }) {
         <table className="w-full text-sm">
           <thead className="text-xs uppercase tracking-wider text-muted-foreground">
             <tr>
-              <th className="px-2 py-1 text-left font-medium">External group</th>
-              <th className="px-2 py-1 text-left font-medium">Internal group</th>
+              <th className="px-2 py-1 text-left font-medium">
+                External group
+              </th>
+              <th className="px-2 py-1 text-left font-medium">
+                Internal group
+              </th>
               <th className="w-20 px-2 py-1"></th>
             </tr>
           </thead>
@@ -1184,8 +1270,8 @@ function MappingsSection({ providerId }: { providerId: string }) {
 
       {groups.length === 0 ? (
         <p className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-800 dark:text-amber-300">
-          No internal groups exist yet. Group CRUD UI ships with Wave C
-          (RBAC); for now you can insert rows directly into the <code>group</code>{" "}
+          No internal groups exist yet. Group CRUD UI ships with Wave C (RBAC);
+          for now you can insert rows directly into the <code>group</code>{" "}
           table.
         </p>
       ) : (
@@ -1226,9 +1312,7 @@ function MappingsSection({ providerId }: { providerId: string }) {
               })
             }
             disabled={
-              !draftExternal.trim() ||
-              !draftGroupId ||
-              createMut.isPending
+              !draftExternal.trim() || !draftGroupId || createMut.isPending
             }
             className="rounded-md bg-primary px-3 py-1 text-xs font-medium text-primary-foreground disabled:opacity-50"
           >
@@ -1657,8 +1741,7 @@ export function AuthProvidersPage() {
   });
   const deleteMut = useMutation({
     mutationFn: authProvidersApi.delete,
-    onSuccess: () =>
-      qc.invalidateQueries({ queryKey: ["auth-providers"] }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["auth-providers"] }),
   });
 
   function initialFormFromProvider(p: AuthProvider): ProviderForm {

@@ -18,9 +18,7 @@ from app.core.permissions import require_resource_permission
 from app.models.dhcp import DHCPPool, DHCPScope
 from app.models.ipam import IPAddress
 
-router = APIRouter(
-    tags=["dhcp"], dependencies=[Depends(require_resource_permission("dhcp_pool"))]
-)
+router = APIRouter(tags=["dhcp"], dependencies=[Depends(require_resource_permission("dhcp_pool"))])
 
 VALID_POOL_TYPES = {"dynamic", "excluded", "reserved"}
 

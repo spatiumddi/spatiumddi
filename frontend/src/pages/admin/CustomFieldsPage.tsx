@@ -451,74 +451,74 @@ export function CustomFieldsPage() {
               <h2 className="text-sm font-semibold">{RESOURCE_LABELS[rt]}</h2>
             </div>
             <div className="overflow-x-auto">
-            <table className="w-full min-w-[640px] text-sm">
-              <thead>
-                <tr className="border-b text-xs text-muted-foreground">
-                  <th className="px-5 py-2 text-left font-medium">Name</th>
-                  <th className="px-5 py-2 text-left font-medium">Label</th>
-                  <th className="px-5 py-2 text-left font-medium">Type</th>
-                  <th className="px-5 py-2 text-left font-medium">Flags</th>
-                  {isSuperadmin && (
-                    <th className="px-5 py-2 text-right font-medium">
-                      Actions
-                    </th>
-                  )}
-                </tr>
-              </thead>
-              <tbody className="divide-y">
-                {items.map((field) => (
-                  <tr key={field.id} className="hover:bg-muted/30">
-                    <td className="px-5 py-2 font-mono text-xs">
-                      {field.name}
-                    </td>
-                    <td className="px-5 py-2">{field.label}</td>
-                    <td className="px-5 py-2">
-                      <span className="rounded bg-muted px-1.5 py-0.5 text-xs">
-                        {FIELD_TYPE_LABELS[field.field_type] ??
-                          field.field_type}
-                      </span>
-                    </td>
-                    <td className="px-5 py-2">
-                      <div className="flex gap-1">
-                        {field.is_required && (
-                          <span className="rounded bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium text-amber-600">
-                            required
-                          </span>
-                        )}
-                        {field.is_searchable && (
-                          <span className="rounded bg-blue-500/10 px-1.5 py-0.5 text-[10px] font-medium text-blue-600">
-                            searchable
-                          </span>
-                        )}
-                      </div>
-                    </td>
+              <table className="w-full min-w-[640px] text-sm">
+                <thead>
+                  <tr className="border-b text-xs text-muted-foreground">
+                    <th className="px-5 py-2 text-left font-medium">Name</th>
+                    <th className="px-5 py-2 text-left font-medium">Label</th>
+                    <th className="px-5 py-2 text-left font-medium">Type</th>
+                    <th className="px-5 py-2 text-left font-medium">Flags</th>
                     {isSuperadmin && (
-                      <td className="px-5 py-2 text-right">
-                        <div className="flex justify-end gap-1">
-                          <button
-                            onClick={() => {
-                              setModal({ mode: "edit", field });
-                              setModalError("");
-                            }}
-                            className="rounded p-1 text-muted-foreground hover:bg-accent hover:text-foreground"
-                            title="Edit"
-                          >
-                            <Pencil className="h-3.5 w-3.5" />
-                          </button>
-                          <button
-                            onClick={() => setDeleteConfirm(field)}
-                            className="rounded p-1 text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
-                            title="Delete"
-                          >
-                            <Trash2 className="h-3.5 w-3.5" />
-                          </button>
-                        </div>
-                      </td>
+                      <th className="px-5 py-2 text-right font-medium">
+                        Actions
+                      </th>
                     )}
                   </tr>
-                ))}
-              </tbody>
-            </table>
+                </thead>
+                <tbody className="divide-y">
+                  {items.map((field) => (
+                    <tr key={field.id} className="hover:bg-muted/30">
+                      <td className="px-5 py-2 font-mono text-xs">
+                        {field.name}
+                      </td>
+                      <td className="px-5 py-2">{field.label}</td>
+                      <td className="px-5 py-2">
+                        <span className="rounded bg-muted px-1.5 py-0.5 text-xs">
+                          {FIELD_TYPE_LABELS[field.field_type] ??
+                            field.field_type}
+                        </span>
+                      </td>
+                      <td className="px-5 py-2">
+                        <div className="flex gap-1">
+                          {field.is_required && (
+                            <span className="rounded bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium text-amber-600">
+                              required
+                            </span>
+                          )}
+                          {field.is_searchable && (
+                            <span className="rounded bg-blue-500/10 px-1.5 py-0.5 text-[10px] font-medium text-blue-600">
+                              searchable
+                            </span>
+                          )}
+                        </div>
+                      </td>
+                      {isSuperadmin && (
+                        <td className="px-5 py-2 text-right">
+                          <div className="flex justify-end gap-1">
+                            <button
+                              onClick={() => {
+                                setModal({ mode: "edit", field });
+                                setModalError("");
+                              }}
+                              className="rounded p-1 text-muted-foreground hover:bg-accent hover:text-foreground"
+                              title="Edit"
+                            >
+                              <Pencil className="h-3.5 w-3.5" />
+                            </button>
+                            <button
+                              onClick={() => setDeleteConfirm(field)}
+                              className="rounded p-1 text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+                              title="Delete"
+                            >
+                              <Trash2 className="h-3.5 w-3.5" />
+                            </button>
+                          </div>
+                        </td>
+                      )}
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
             </div>
           </div>
         );

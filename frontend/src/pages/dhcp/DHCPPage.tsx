@@ -439,47 +439,47 @@ function ServerScopesTab({ server }: { server: DHCPServer }) {
           </p>
         ) : (
           <div className="overflow-x-auto">
-          <table className="w-full min-w-[720px] text-sm">
-            <thead>
-              <tr className="border-b bg-muted/30 text-xs">
-                <th className="px-3 py-2 text-left font-medium">Subnet</th>
-                <th className="px-3 py-2 text-left font-medium">Name</th>
-                <th className="px-3 py-2 text-left font-medium">Enabled</th>
-                <th className="px-3 py-2 text-left font-medium">Lease (s)</th>
-                <th className="px-3 py-2 text-left font-medium">DDNS</th>
-                <th className="px-3 py-2"></th>
-              </tr>
-            </thead>
-            <tbody>
-              {allScopes.map((sc) => (
-                <tr key={sc.id} className="border-b last:border-0">
-                  <td className="px-3 py-2 font-mono text-xs">
-                    {sc.subnet_network ?? "—"}
-                  </td>
-                  <td className="px-3 py-2">{sc.name}</td>
-                  <td className="px-3 py-2">{sc.enabled ? "yes" : "no"}</td>
-                  <td className="px-3 py-2 tabular-nums">{sc.lease_time}</td>
-                  <td className="px-3 py-2">
-                    {sc.ddns_enabled ? "on" : "off"}
-                  </td>
-                  <td className="px-3 py-2 text-right">
-                    <button
-                      onClick={() => setEditScope(sc)}
-                      className="rounded p-1 text-muted-foreground hover:text-foreground"
-                    >
-                      <Pencil className="h-3.5 w-3.5" />
-                    </button>
-                    <button
-                      onClick={() => setDelScope(sc)}
-                      className="rounded p-1 text-muted-foreground hover:text-destructive"
-                    >
-                      <Trash2 className="h-3.5 w-3.5" />
-                    </button>
-                  </td>
+            <table className="w-full min-w-[720px] text-sm">
+              <thead>
+                <tr className="border-b bg-muted/30 text-xs">
+                  <th className="px-3 py-2 text-left font-medium">Subnet</th>
+                  <th className="px-3 py-2 text-left font-medium">Name</th>
+                  <th className="px-3 py-2 text-left font-medium">Enabled</th>
+                  <th className="px-3 py-2 text-left font-medium">Lease (s)</th>
+                  <th className="px-3 py-2 text-left font-medium">DDNS</th>
+                  <th className="px-3 py-2"></th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {allScopes.map((sc) => (
+                  <tr key={sc.id} className="border-b last:border-0">
+                    <td className="px-3 py-2 font-mono text-xs">
+                      {sc.subnet_network ?? "—"}
+                    </td>
+                    <td className="px-3 py-2">{sc.name}</td>
+                    <td className="px-3 py-2">{sc.enabled ? "yes" : "no"}</td>
+                    <td className="px-3 py-2 tabular-nums">{sc.lease_time}</td>
+                    <td className="px-3 py-2">
+                      {sc.ddns_enabled ? "on" : "off"}
+                    </td>
+                    <td className="px-3 py-2 text-right">
+                      <button
+                        onClick={() => setEditScope(sc)}
+                        className="rounded p-1 text-muted-foreground hover:text-foreground"
+                      >
+                        <Pencil className="h-3.5 w-3.5" />
+                      </button>
+                      <button
+                        onClick={() => setDelScope(sc)}
+                        className="rounded p-1 text-muted-foreground hover:text-destructive"
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
         )}
       </div>
@@ -604,128 +604,130 @@ function ServerPoolsOrStaticsTab({
         </p>
       ) : kind === "pools" ? (
         <div className="overflow-x-auto">
-        <table className="w-full min-w-[640px] text-sm">
-          <thead>
-            <tr className="border-b bg-muted/30 text-xs">
-              <SortableTh
-                sortKey="scope"
-                sort={poolSort}
-                onSort={togglePoolSort}
-                className="px-3 py-2"
-              >
-                Scope
-              </SortableTh>
-              <SortableTh
-                sortKey="name"
-                sort={poolSort}
-                onSort={togglePoolSort}
-                className="px-3 py-2"
-              >
-                Name
-              </SortableTh>
-              <SortableTh
-                sortKey="start"
-                sort={poolSort}
-                onSort={togglePoolSort}
-                className="px-3 py-2"
-              >
-                Start
-              </SortableTh>
-              <SortableTh
-                sortKey="end"
-                sort={poolSort}
-                onSort={togglePoolSort}
-                className="px-3 py-2"
-              >
-                End
-              </SortableTh>
-              <SortableTh
-                sortKey="type"
-                sort={poolSort}
-                onSort={togglePoolSort}
-                className="px-3 py-2"
-              >
-                Type
-              </SortableTh>
-            </tr>
-          </thead>
-          <tbody>
-            {poolRows.map(({ scope, item }) => {
-              const p = item;
-              return (
-                <tr key={p.id} className="border-b last:border-0">
-                  <td className="px-3 py-2 text-xs">{scope.name}</td>
-                  <td className="px-3 py-2">{p.name || "—"}</td>
-                  <td className="px-3 py-2 font-mono text-xs">{p.start_ip}</td>
-                  <td className="px-3 py-2 font-mono text-xs">{p.end_ip}</td>
-                  <td className="px-3 py-2">
-                    <span className="rounded-full bg-muted px-2 py-0.5 text-xs">
-                      {p.pool_type}
-                    </span>
-                  </td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
+          <table className="w-full min-w-[640px] text-sm">
+            <thead>
+              <tr className="border-b bg-muted/30 text-xs">
+                <SortableTh
+                  sortKey="scope"
+                  sort={poolSort}
+                  onSort={togglePoolSort}
+                  className="px-3 py-2"
+                >
+                  Scope
+                </SortableTh>
+                <SortableTh
+                  sortKey="name"
+                  sort={poolSort}
+                  onSort={togglePoolSort}
+                  className="px-3 py-2"
+                >
+                  Name
+                </SortableTh>
+                <SortableTh
+                  sortKey="start"
+                  sort={poolSort}
+                  onSort={togglePoolSort}
+                  className="px-3 py-2"
+                >
+                  Start
+                </SortableTh>
+                <SortableTh
+                  sortKey="end"
+                  sort={poolSort}
+                  onSort={togglePoolSort}
+                  className="px-3 py-2"
+                >
+                  End
+                </SortableTh>
+                <SortableTh
+                  sortKey="type"
+                  sort={poolSort}
+                  onSort={togglePoolSort}
+                  className="px-3 py-2"
+                >
+                  Type
+                </SortableTh>
+              </tr>
+            </thead>
+            <tbody>
+              {poolRows.map(({ scope, item }) => {
+                const p = item;
+                return (
+                  <tr key={p.id} className="border-b last:border-0">
+                    <td className="px-3 py-2 text-xs">{scope.name}</td>
+                    <td className="px-3 py-2">{p.name || "—"}</td>
+                    <td className="px-3 py-2 font-mono text-xs">
+                      {p.start_ip}
+                    </td>
+                    <td className="px-3 py-2 font-mono text-xs">{p.end_ip}</td>
+                    <td className="px-3 py-2">
+                      <span className="rounded-full bg-muted px-2 py-0.5 text-xs">
+                        {p.pool_type}
+                      </span>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
         </div>
       ) : (
         <div className="overflow-x-auto">
-        <table className="w-full min-w-[640px] text-sm">
-          <thead>
-            <tr className="border-b bg-muted/30 text-xs">
-              <SortableTh
-                sortKey="scope"
-                sort={staticSort}
-                onSort={toggleStaticSort}
-                className="px-3 py-2"
-              >
-                Scope
-              </SortableTh>
-              <SortableTh
-                sortKey="mac"
-                sort={staticSort}
-                onSort={toggleStaticSort}
-                className="px-3 py-2"
-              >
-                MAC
-              </SortableTh>
-              <SortableTh
-                sortKey="ip"
-                sort={staticSort}
-                onSort={toggleStaticSort}
-                className="px-3 py-2"
-              >
-                IP
-              </SortableTh>
-              <SortableTh
-                sortKey="hostname"
-                sort={staticSort}
-                onSort={toggleStaticSort}
-                className="px-3 py-2"
-              >
-                Hostname
-              </SortableTh>
-            </tr>
-          </thead>
-          <tbody>
-            {staticRows.map(({ scope, item }) => {
-              const s = item;
-              return (
-                <tr key={s.id} className="border-b last:border-0">
-                  <td className="px-3 py-2 text-xs">{scope.name}</td>
-                  <td className="px-3 py-2 font-mono text-xs">
-                    {s.mac_address}
-                  </td>
-                  <td className="px-3 py-2 font-mono text-xs">
-                    {s.ip_address}
-                  </td>
-                  <td className="px-3 py-2">{s.hostname || "—"}</td>
-                </tr>
-              );
-            })}
-          </tbody>
-        </table>
+          <table className="w-full min-w-[640px] text-sm">
+            <thead>
+              <tr className="border-b bg-muted/30 text-xs">
+                <SortableTh
+                  sortKey="scope"
+                  sort={staticSort}
+                  onSort={toggleStaticSort}
+                  className="px-3 py-2"
+                >
+                  Scope
+                </SortableTh>
+                <SortableTh
+                  sortKey="mac"
+                  sort={staticSort}
+                  onSort={toggleStaticSort}
+                  className="px-3 py-2"
+                >
+                  MAC
+                </SortableTh>
+                <SortableTh
+                  sortKey="ip"
+                  sort={staticSort}
+                  onSort={toggleStaticSort}
+                  className="px-3 py-2"
+                >
+                  IP
+                </SortableTh>
+                <SortableTh
+                  sortKey="hostname"
+                  sort={staticSort}
+                  onSort={toggleStaticSort}
+                  className="px-3 py-2"
+                >
+                  Hostname
+                </SortableTh>
+              </tr>
+            </thead>
+            <tbody>
+              {staticRows.map(({ scope, item }) => {
+                const s = item;
+                return (
+                  <tr key={s.id} className="border-b last:border-0">
+                    <td className="px-3 py-2 text-xs">{scope.name}</td>
+                    <td className="px-3 py-2 font-mono text-xs">
+                      {s.mac_address}
+                    </td>
+                    <td className="px-3 py-2 font-mono text-xs">
+                      {s.ip_address}
+                    </td>
+                    <td className="px-3 py-2">{s.hostname || "—"}</td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
         </div>
       )}
     </div>
@@ -768,43 +770,45 @@ function ClientClassesTab({ server }: { server: DHCPServer }) {
           </p>
         ) : (
           <div className="overflow-x-auto">
-          <table className="w-full min-w-[640px] text-sm">
-            <thead>
-              <tr className="border-b bg-muted/30 text-xs">
-                <th className="px-3 py-2 text-left font-medium">Name</th>
-                <th className="px-3 py-2 text-left font-medium">Description</th>
-                <th className="px-3 py-2 text-left font-medium">Match</th>
-                <th className="px-3 py-2"></th>
-              </tr>
-            </thead>
-            <tbody>
-              {classes.map((c) => (
-                <tr key={c.id} className="border-b last:border-0">
-                  <td className="px-3 py-2 font-medium">{c.name}</td>
-                  <td className="px-3 py-2 text-muted-foreground">
-                    {c.description}
-                  </td>
-                  <td className="px-3 py-2 font-mono text-xs truncate max-w-md">
-                    {c.match_expression}
-                  </td>
-                  <td className="px-3 py-2 text-right">
-                    <button
-                      onClick={() => setEdit(c)}
-                      className="rounded p-1 text-muted-foreground hover:text-foreground"
-                    >
-                      <Pencil className="h-3.5 w-3.5" />
-                    </button>
-                    <button
-                      onClick={() => setDel(c)}
-                      className="rounded p-1 text-muted-foreground hover:text-destructive"
-                    >
-                      <Trash2 className="h-3.5 w-3.5" />
-                    </button>
-                  </td>
+            <table className="w-full min-w-[640px] text-sm">
+              <thead>
+                <tr className="border-b bg-muted/30 text-xs">
+                  <th className="px-3 py-2 text-left font-medium">Name</th>
+                  <th className="px-3 py-2 text-left font-medium">
+                    Description
+                  </th>
+                  <th className="px-3 py-2 text-left font-medium">Match</th>
+                  <th className="px-3 py-2"></th>
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {classes.map((c) => (
+                  <tr key={c.id} className="border-b last:border-0">
+                    <td className="px-3 py-2 font-medium">{c.name}</td>
+                    <td className="px-3 py-2 text-muted-foreground">
+                      {c.description}
+                    </td>
+                    <td className="px-3 py-2 font-mono text-xs truncate max-w-md">
+                      {c.match_expression}
+                    </td>
+                    <td className="px-3 py-2 text-right">
+                      <button
+                        onClick={() => setEdit(c)}
+                        className="rounded p-1 text-muted-foreground hover:text-foreground"
+                      >
+                        <Pencil className="h-3.5 w-3.5" />
+                      </button>
+                      <button
+                        onClick={() => setDel(c)}
+                        className="rounded p-1 text-muted-foreground hover:text-destructive"
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
           </div>
         )}
       </div>

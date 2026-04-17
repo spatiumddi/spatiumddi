@@ -400,11 +400,7 @@ async def _sync_dns_record(
         addr_obj = ipaddress.ip_address(str(ip.address))
     except ValueError:
         addr_obj = None
-    forward_rtype = (
-        "AAAA"
-        if isinstance(addr_obj, ipaddress.IPv6Address)
-        else "A"
-    )
+    forward_rtype = "AAAA" if isinstance(addr_obj, ipaddress.IPv6Address) else "A"
 
     # ── Forward A/AAAA ──────────────────────────────────────────────────────
     # Skip forward DNS for the default gateway placeholder hostname.
@@ -458,16 +454,13 @@ async def _sync_dns_record(
         await db.flush()
         ip.dns_record_id = a_rec.id
         ip.forward_zone_id = effective_zone_id
-        await _enqueue_dns_op(
-            db, zone, "create", ip.hostname, forward_rtype, str(ip.address), None
-        )
+        await _enqueue_dns_op(db, zone, "create", ip.hostname, forward_rtype, str(ip.address), None)
     else:
         for record in existing_a:
             # If the zone changed OR the record_type changed (v4↔v6 swap),
             # rewrite: delete the stale record and create a fresh one.
             needs_rewrite = (
-                record.zone_id != effective_zone_id
-                or record.record_type != forward_rtype
+                record.zone_id != effective_zone_id or record.record_type != forward_rtype
             )
             if needs_rewrite:
                 old_zone = await db.get(DNSZone, record.zone_id)
@@ -1216,9 +1209,7 @@ async def create_block(body: IPBlockCreate, current_user: CurrentUser, db: DB) -
 
     # Reject duplicates / overlaps at the same tree level.
     canonical = str(_parse_network(body.network))
-    await _assert_no_block_overlap(
-        db, body.space_id, canonical, body.parent_block_id
-    )
+    await _assert_no_block_overlap(db, body.space_id, canonical, body.parent_block_id)
 
     block = IPBlock(**body.model_dump())
     db.add(block)
