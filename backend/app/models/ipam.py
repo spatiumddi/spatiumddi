@@ -2,6 +2,7 @@ import uuid
 from datetime import datetime
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     DateTime,
     ForeignKey,
@@ -151,9 +152,13 @@ class Subnet(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # Status: active | deprecated | reserved | quarantine
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="active", index=True)
 
-    # Computed / cached
+    # Computed / cached. ``total_ips`` is BigInteger because IPv6 subnets can
+    # be as large as 2^64 addresses (a /64 — the standard LAN size) which
+    # overflows INT4. We still clamp at the BIGINT max (2^63 − 1) to keep
+    # the math simple; utilization_percent remains a fraction and is
+    # meaningless for /64s anyway.
     utilization_percent: Mapped[float] = mapped_column(nullable=False, default=0.0)
-    total_ips: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    total_ips: Mapped[int] = mapped_column(BigInteger, nullable=False, default=0)
     allocated_ips: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
     custom_fields: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)

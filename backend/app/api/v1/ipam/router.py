@@ -53,8 +53,21 @@ def _parse_network(network: str) -> ipaddress.IPv4Network | ipaddress.IPv6Networ
         )
 
 
+_BIGINT_MAX = 2**63 - 1
+
+
 def _total_ips(net: ipaddress.IPv4Network | ipaddress.IPv6Network) -> int:
-    """Usable host count (excludes network/broadcast for prefixlen < 31)."""
+    """Usable host count (excludes network/broadcast for IPv4 prefixlen < 31).
+
+    IPv6 subnets can be up to 2^64 addresses (a /64), which overflows the
+    BIGINT column backing ``Subnet.total_ips``. We clamp at BIGINT max —
+    utilization_percent is effectively always 0 for a /64 regardless.
+    """
+    if isinstance(net, ipaddress.IPv6Network):
+        # IPv6 has no broadcast. The network address is conventionally reserved
+        # in many stacks (anycast subnet-router) but still addressable, so we
+        # keep the full count and clamp to BIGINT.
+        return min(net.num_addresses, _BIGINT_MAX)
     if net.prefixlen >= 31:
         return net.num_addresses
     return net.num_addresses - 2
@@ -1362,17 +1375,35 @@ async def delete_block(block_id: uuid.UUID, current_user: CurrentUser, db: DB) -
 @router.get("/blocks/{block_id}/available-subnets", response_model=list[str])
 async def get_available_subnets(
     block_id: uuid.UUID,
-    prefix_len: int = Query(..., ge=1, le=32, description="Desired prefix length (IPv4 only)"),
+    prefix_len: int = Query(
+        ...,
+        ge=1,
+        le=128,
+        description="Desired prefix length — /1-/32 for IPv4 blocks, /1-/128 for IPv6",
+    ),
     limit: int = Query(20, ge=1, le=50),
     current_user: CurrentUser = ...,  # type: ignore[assignment]
     db: DB = ...,  # type: ignore[assignment]
 ) -> list[str]:
-    """Return available /prefix_len subnets within this block, sorted sequentially."""
+    """Return available /prefix_len subnets within this block, sorted sequentially.
+
+    Accepts both IPv4 (/1-/32) and IPv6 (/1-/128) prefix lengths — the block's
+    own family is inferred from its CIDR.
+    """
     block = await db.get(IPBlock, block_id)
     if block is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Block not found")
 
     block_net = ipaddress.ip_network(str(block.network), strict=False)
+    max_prefix = 32 if isinstance(block_net, ipaddress.IPv4Network) else 128
+    if prefix_len > max_prefix:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"prefix_len {prefix_len} exceeds max {max_prefix} for "
+                f"{'IPv4' if max_prefix == 32 else 'IPv6'} block"
+            ),
+        )
     if prefix_len <= block_net.prefixlen:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,

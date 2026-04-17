@@ -1142,8 +1142,17 @@ function VlanPicker({
 
 // ─── Create Subnet Modal ──────────────────────────────────────────────────────
 
-// Prefix options shown in the "Find by size" picker
-const PREFIX_OPTIONS = Array.from({ length: 25 }, (_, i) => i + 8); // /8 – /32
+// Prefix options for the "Find by size" picker. We offer the full IPv4 range
+// (/8-/32) plus the common IPv6 sizes. The CreateSubnetModal filters this
+// list to just the values larger than the selected block's prefix.
+const PREFIX_OPTIONS_V4 = Array.from({ length: 25 }, (_, i) => i + 8); // /8 – /32
+const PREFIX_OPTIONS_V6 = [
+  32, 40, 44, 48, 52, 56, 60, 64, 72, 80, 96, 112, 120, 124, 127, 128,
+];
+
+function isIPv6Cidr(cidr: string): boolean {
+  return cidr.includes(":");
+}
 
 function CreateSubnetModal({
   spaceId,
@@ -1183,6 +1192,30 @@ function CreateSubnetModal({
     queryKey: ["blocks", spaceId],
     queryFn: () => ipamApi.listBlocks(spaceId),
   });
+
+  // Narrow the prefix picker to values valid for the selected block's family
+  // and larger than the block's own prefix. /24 stays the default for IPv4,
+  // /64 for IPv6.
+  const selectedBlock = blocks?.find((b) => b.id === blockId);
+  const blockIsV6 = selectedBlock ? isIPv6Cidr(selectedBlock.network) : false;
+  const blockPrefixOptions = (() => {
+    if (!selectedBlock) return PREFIX_OPTIONS_V4;
+    const own = parseInt(selectedBlock.network.split("/")[1] ?? "0", 10);
+    const pool = blockIsV6 ? PREFIX_OPTIONS_V6 : PREFIX_OPTIONS_V4;
+    return pool.filter((p) => p > own);
+  })();
+  useEffect(() => {
+    if (blockPrefixOptions.length === 0) return;
+    const current = parseInt(prefixLen, 10);
+    if (!blockPrefixOptions.includes(current)) {
+      const preferred = blockIsV6 ? 64 : 24;
+      const next = blockPrefixOptions.includes(preferred)
+        ? preferred
+        : blockPrefixOptions[0];
+      setPrefixLen(String(next));
+      setSelectedNet("");
+    }
+  }, [blockId, blockIsV6]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const { data: cfDefs = [] } = useQuery({
     queryKey: ["custom-fields", "subnet"],
@@ -1320,7 +1353,7 @@ function CreateSubnetModal({
                     setSelectedNet("");
                   }}
                 >
-                  {PREFIX_OPTIONS.map((n) => (
+                  {blockPrefixOptions.map((n) => (
                     <option key={n} value={String(n)}>
                       /{n}
                     </option>
