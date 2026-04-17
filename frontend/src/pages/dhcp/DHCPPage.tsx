@@ -1,4 +1,6 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useSearchParams } from "react-router-dom";
+import { useStickyLocation } from "@/lib/stickyLocation";
 import {
   useMutation,
   useQueries,
@@ -1107,14 +1109,85 @@ function ServerDetailView({
 // ─────────────────────────────────────────────────────────────────────────────
 
 export function DHCPPage() {
+  useStickyLocation("spatium.lastUrl.dhcp");
   const qc = useQueryClient();
-  const [selection, setSelection] = useState<Selection>(null);
+  const [searchParams, setSearchParams] = useSearchParams();
+  const [selectionState, setSelectionState] = useState<Selection>(null);
   const [showCreateGroup, setShowCreateGroup] = useState(false);
   const [editGroup, setEditGroup] = useState<DHCPServerGroup | null>(null);
   const [delGroup, setDelGroup] = useState<DHCPServerGroup | null>(null);
   const [addServerFor, setAddServerFor] = useState<string | null>(null);
   const [editServer, setEditServer] = useState<DHCPServer | null>(null);
   const [delServer, setDelServer] = useState<DHCPServer | null>(null);
+  const urlRestored = useRef(false);
+
+  // Pull cached group + server lists (populated by the sidebar query) so we
+  // can resolve the selection from URL params on first mount.
+  const { data: allGroups } = useQuery({
+    queryKey: ["dhcp-groups"],
+    queryFn: dhcpApi.listGroups,
+  });
+  const { data: allServers } = useQuery({
+    queryKey: ["dhcp-servers", "all"],
+    queryFn: () => dhcpApi.listServers(),
+  });
+
+  // Update selection state + URL search params together so tab-switching away
+  // and back reopens whatever the user last had selected. Uses `replace` to
+  // avoid polluting browser history with every click.
+  function setSelection(sel: Selection) {
+    setSelectionState(sel);
+    setSearchParams(
+      (prev: URLSearchParams) => {
+        const next = new URLSearchParams(prev);
+        if (!sel) {
+          next.delete("group");
+          next.delete("server");
+        } else if (sel.type === "group") {
+          next.set("group", sel.group.id);
+          next.delete("server");
+        } else {
+          if (sel.group) next.set("group", sel.group.id);
+          else next.delete("group");
+          next.set("server", sel.server.id);
+        }
+        return next;
+      },
+      { replace: true },
+    );
+  }
+
+  const selection = selectionState;
+
+  // URL-state restore: reopen last-visited group/server on back-navigation.
+  // Depends on searchParams so that when `useStickyLocation` navigates from
+  // bare `/dhcp` → `/dhcp?group=…` after mount, this effect re-runs and picks
+  // up the now-populated params. The `urlRestored` guard is only set once
+  // we've actually matched a param, so an early run with empty searchParams
+  // doesn't latch us into "nothing to restore".
+  useEffect(() => {
+    if (urlRestored.current) return;
+    if (!allGroups || !allServers) return;
+    const groupId = searchParams.get("group");
+    const serverId = searchParams.get("server");
+    if (!groupId && !serverId) return;
+    urlRestored.current = true;
+    if (serverId) {
+      const server = allServers.find((s: DHCPServer) => s.id === serverId);
+      if (server) {
+        const group =
+          allGroups.find(
+            (g: DHCPServerGroup) => g.id === server.server_group_id,
+          ) ?? null;
+        setSelectionState({ type: "server", group, server });
+        return;
+      }
+    }
+    if (groupId) {
+      const group = allGroups.find((g: DHCPServerGroup) => g.id === groupId);
+      if (group) setSelectionState({ type: "group", group });
+    }
+  }, [allGroups, allServers, searchParams]);
 
   const deleteGroupMut = useMutation({
     mutationFn: (id: string) => dhcpApi.deleteGroup(id),

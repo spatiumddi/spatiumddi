@@ -7796,13 +7796,19 @@ export function IPAMPage() {
   }, [location.state, spaces, allBlocks, allSubnets]);
 
   // URL-state restore: reopen last-visited space/block/subnet on back-navigation
+  // Depends on searchParams so that when `useStickyLocation` navigates from
+  // bare `/ipam` → `/ipam?subnet=…` after mount, this effect re-runs and picks
+  // up the now-populated params. The `urlRestored` guard is only set once
+  // we've actually matched a param, so an early run with empty searchParams
+  // doesn't latch us into "nothing to restore".
   useEffect(() => {
     if (urlRestored.current) return;
     if (!spaces || !allBlocks || !allSubnets) return;
-    urlRestored.current = true;
     const subnetId = searchParams.get("subnet");
     const blockId = searchParams.get("block");
     const spaceId = searchParams.get("space");
+    if (!subnetId && !blockId && !spaceId) return;
+    urlRestored.current = true;
     if (subnetId) {
       const sn = allSubnets.find((s: Subnet) => s.id === subnetId);
       if (sn) {
@@ -7830,7 +7836,7 @@ export function IPAMPage() {
       }
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [spaces, allBlocks, allSubnets]);
+  }, [spaces, allBlocks, allSubnets, searchParams]);
 
   // Fetch blocks + subnets for whichever space the selected item belongs to
   const activeSpaceId =

@@ -4324,14 +4324,19 @@ export function DNSPage() {
     urlRestored.current = true;
   }, [location.state, groups]);
 
-  // URL-state restore: reopen last-visited group/zone on back-navigation
+  // URL-state restore: reopen last-visited group/zone on back-navigation.
+  // Depends on searchParams so that when `useStickyLocation` navigates from
+  // bare `/dns` → `/dns?group=…` after mount, this effect re-runs and picks
+  // up the now-populated params. The `urlRestored` guard is only set once
+  // we've actually matched a param, so an early run with empty searchParams
+  // doesn't latch us into "nothing to restore".
   useEffect(() => {
     if (urlRestored.current) return;
     if (groups.length === 0) return;
-    urlRestored.current = true;
     const groupId = searchParams.get("group");
     const zoneId = searchParams.get("zone");
     if (!groupId) return;
+    urlRestored.current = true;
     const group = groups.find((g: DNSServerGroup) => g.id === groupId);
     if (!group) return;
     setExpandedGroups((prev) => new Set([...prev, group.id]));
@@ -4346,7 +4351,7 @@ export function DNSPage() {
       setSelectionState({ type: "group", group });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [groups]);
+  }, [groups, searchParams]);
 
   const deleteGroup = useMutation({
     mutationFn: (id: string) => dnsApi.deleteGroup(id),
