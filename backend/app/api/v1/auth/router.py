@@ -6,7 +6,7 @@ import secrets as py_secrets
 import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 
 import structlog
 from fastapi import APIRouter, Form, HTTPException, Query, Request, status
@@ -512,7 +512,24 @@ def _safe_error_suffix(value: str) -> str:
 
 
 def _login_error_redirect(reason: str) -> RedirectResponse:
+    """Redirect to the login page with ``?error=<reason>``.
+
+    Defence against CWE-601 (open redirect) even though ``_LOGIN_ERROR_PATH``
+    is hardcoded: after building the final URL, verify via ``urlparse`` that
+    it has no scheme and no netloc — i.e. it is a same-origin relative path.
+    If a future caller accidentally threads an attacker-controlled value into
+    ``reason`` such that it escapes ``urlencode``, we'll still refuse to
+    redirect off-site and fall back to the plain login URL. This is the
+    sanitizer pattern CodeQL documents for this rule.
+    """
     url = f"{_LOGIN_ERROR_PATH}?{urlencode({'error': reason})}"
+    parsed = urlparse(url)
+    if parsed.scheme or parsed.netloc:
+        # Should be unreachable since _LOGIN_ERROR_PATH starts with "/" and
+        # urlencode escapes every character that could introduce a netloc or
+        # scheme. Treat it as a bug — drop the query string entirely.
+        logger.warning("login_error_redirect_blocked_non_relative", url=url)
+        return RedirectResponse(_LOGIN_ERROR_PATH, status_code=302)
     return RedirectResponse(url, status_code=302)
 
 
