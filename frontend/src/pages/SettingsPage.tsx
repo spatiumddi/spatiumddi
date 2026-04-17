@@ -61,6 +61,7 @@ type SectionId =
   | "discovery"
   | "dns"
   | "dns-auto-sync"
+  | "dns-pull-from-server"
   | "dhcp"
   | "ip-allocation"
   | "session"
@@ -111,6 +112,26 @@ const SECTIONS: SectionDef[] = [
     description:
       "Periodic background reconciliation of IPAM-managed DNS records.",
     keywords: ["dns", "ipam", "sync", "reconcile", "drift", "auto", "job"],
+  },
+  {
+    id: "dns-pull-from-server",
+    title: "DNS Server Sync",
+    description:
+      "Periodically reconcile each zone with its primary authoritative server (Windows DNS today). AXFR pulls in missing records; whatever's left in our DB gets pushed back to the server. Additive only — never deletes.",
+    keywords: [
+      "dns",
+      "sync",
+      "pull",
+      "push",
+      "axfr",
+      "rfc 2136",
+      "windows",
+      "import",
+      "export",
+      "additive",
+      "bidirectional",
+      "auto",
+    ],
   },
   {
     id: "dhcp",
@@ -483,6 +504,56 @@ export function SettingsPage() {
                     {values.dns_auto_sync_last_run_at
                       ? new Date(
                           values.dns_auto_sync_last_run_at,
+                        ).toLocaleString()
+                      : "never"}
+                  </span>
+                </Field>
+              </>
+            )}
+
+            {activeId === "dns-pull-from-server" && (
+              <>
+                <Field
+                  label="Enable Server Sync"
+                  description="Periodically reconcile each zone with its primary authoritative server in both directions. AXFR imports records on the wire but not in SpatiumDDI; any DB record not on the wire is pushed back via RFC 2136. Additive only — never deletes on either side. Only fires against drivers that support AXFR pull (Windows DNS today)."
+                >
+                  <Toggle
+                    checked={!!values.dns_pull_from_server_enabled}
+                    onChange={(v) => set("dns_pull_from_server_enabled", v)}
+                    disabled={!isSuperadmin}
+                  />
+                </Field>
+                <Field
+                  label="Sync Interval"
+                  description="How often the sync job runs. AXFR + potential RFC 2136 updates are heavier than a simple API poll — 30 minutes is a reasonable default for a lab; lower it if you expect frequent out-of-band edits in Windows DNS Manager."
+                >
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="number"
+                      min={1}
+                      value={values.dns_pull_from_server_interval_minutes ?? 30}
+                      onChange={(e) =>
+                        set(
+                          "dns_pull_from_server_interval_minutes",
+                          Number(e.target.value),
+                        )
+                      }
+                      disabled={
+                        !isSuperadmin || !values.dns_pull_from_server_enabled
+                      }
+                      className={cn(inputCls, "w-24")}
+                    />
+                    <span className="text-xs text-muted-foreground">min</span>
+                  </div>
+                </Field>
+                <Field
+                  label="Last Run"
+                  description="Timestamp of the most recent pull pass."
+                >
+                  <span className="rounded bg-muted px-2 py-1 text-xs font-mono text-muted-foreground">
+                    {values.dns_pull_from_server_last_run_at
+                      ? new Date(
+                          values.dns_pull_from_server_last_run_at,
                         ).toLocaleString()
                       : "never"}
                   </span>

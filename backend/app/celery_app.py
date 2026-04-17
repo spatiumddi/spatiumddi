@@ -11,6 +11,7 @@ celery_app = Celery(
         "app.tasks.ipam",
         "app.tasks.ipam_dns_sync",
         "app.tasks.dns",
+        "app.tasks.dns_pull",
         "app.tasks.dhcp_health",
         "app.tasks.dhcp_lease_cleanup",
     ],
@@ -36,6 +37,7 @@ celery_app.conf.update(
         "app.tasks.ipam.*": {"queue": "ipam"},
         "app.tasks.ipam_dns_sync.*": {"queue": "ipam"},
         "app.tasks.dns.*": {"queue": "dns"},
+        "app.tasks.dns_pull.*": {"queue": "dns"},
         "app.tasks.dhcp_health.*": {"queue": "dhcp"},
         "app.tasks.dhcp_lease_cleanup.*": {"queue": "dhcp"},
     },
@@ -62,6 +64,15 @@ celery_app.conf.update(
         # restarting celery-beat.
         "ipam-dns-auto-sync": {
             "task": "app.tasks.ipam_dns_sync.auto_sync_ipam_dns",
+            "schedule": schedule(run_every=60.0),
+        },
+        # Every 60 s, tick the DNS pull-from-server task. The task itself
+        # checks ``PlatformSettings.dns_pull_from_server_enabled`` and the
+        # per-run interval, so cadence changes in the UI take effect without
+        # restarting celery-beat. Additive-only — never deletes existing
+        # DB rows.
+        "dns-pull-from-server": {
+            "task": "app.tasks.dns_pull.auto_pull_dns_from_servers",
             "schedule": schedule(run_every=60.0),
         },
     },

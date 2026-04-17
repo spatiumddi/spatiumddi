@@ -187,7 +187,24 @@ SpatiumDDI cut its alpha release `2026.04.16-1` on 2026-04-16 with IPAM, DNS (BI
 
 ### Future Phases — Tracked Items
 
-- ⬜ Windows DNS / DHCP server integration — read-only visibility and basic management of existing Windows Server DNS/DHCP via WinRM or REST (see `docs/features/DNS.md`, `docs/features/DHCP.md`)
+- ✅ **Windows DNS — Path A (RFC 2136, agentless)** — `WindowsDNSDriver`
+  in `backend/app/drivers/dns/windows.py`. Record CRUD only (A / AAAA /
+  CNAME / MX / TXT / PTR / SRV / NS / TLSA) via dnspython over RFC 2136;
+  zones are managed externally in Windows DNS Manager. Optional TSIG
+  signing; GSS-TSIG and SIG(0) are Path B. Control plane sends updates
+  directly; `record_ops.enqueue_record_op` short-circuits the agent queue
+  for servers whose driver is in `AGENTLESS_DRIVERS`.
+- ⬜ **Windows DNS — Path B (WinRM + PowerShell, full CRUD)** — zone
+  creation / edit / delete, view config, server-level options. Uses
+  `pypsrp`/`pywinrm` to invoke the `DnsServer` PowerShell module on the
+  DC. Requires WinRM-over-HTTPS, a service account in `DnsAdmins`, and a
+  credential-handling UI in the server form. Secure-only DDNS zones
+  become manageable via GSS-TSIG once Kerberos ticket acquisition lands.
+- ⬜ **Windows DHCP — WinRM + PowerShell** — scope / reservation / lease
+  read-and-CRUD via the `DhcpServer` PowerShell module. New driver
+  `backend/app/drivers/dhcp/windows.py` implementing the DHCP driver ABC.
+  Service account in `DHCP Administrators`. Much bigger scope than DNS
+  since there's no wire-level admin protocol at all.
 - ⬜ IP discovery — ping sweep + ARP scan Celery task; flags `discovered` status; reconciliation report (see `docs/features/IPAM.md §8`)
 - ⬜ OUI/vendor lookup — IEEE OUI database loaded into `oui_vendor` table; shown next to MAC addresses (see `docs/features/IPAM.md §12`)
 - ⬜ SNMP polling / network device management — ARP table polling for IP discovery (see `docs/features/IPAM.md §13`)

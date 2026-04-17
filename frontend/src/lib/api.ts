@@ -77,6 +77,55 @@ function createClient(): AxiosInstance {
 
 export const api = createClient();
 
+/**
+ * Normalise whatever shape an API error arrives in into a single string
+ * suitable for React children.
+ *
+ * FastAPI returns three common shapes:
+ *   - 4xx HTTPException:   `{"detail": "some message"}`
+ *   - 422 validation:      `{"detail": [{"type", "loc", "msg", "input", "ctx"}, ...]}`
+ *   - Unhandled 500:       `{"detail": "Internal Server Error"}` or no body
+ *
+ * Passing the raw `detail` into `setError(...)` was crashing React with
+ * error #31 ("Objects are not valid as a React child") when a 422 hit a
+ * code path that assumed it was always a string. Use this helper instead
+ * of a naive `err.response?.data?.detail ?? "Error"`.
+ */
+export function formatApiError(err: unknown, fallback = "Error"): string {
+  const anyErr = err as {
+    response?: { data?: { detail?: unknown } };
+    message?: string;
+  };
+  const detail = anyErr?.response?.data?.detail;
+  if (typeof detail === "string" && detail.trim()) return detail;
+  if (Array.isArray(detail)) {
+    // Pydantic v2 validation errors.
+    const parts = detail
+      .map((e) => {
+        if (!e || typeof e !== "object") return String(e);
+        const rec = e as { msg?: unknown; loc?: unknown };
+        const loc = Array.isArray(rec.loc)
+          ? rec.loc.filter((s) => s !== "body").join(".")
+          : "";
+        const msg = typeof rec.msg === "string" ? rec.msg : JSON.stringify(e);
+        return loc ? `${loc}: ${msg}` : msg;
+      })
+      .filter(Boolean);
+    if (parts.length) return parts.join("; ");
+  }
+  if (detail && typeof detail === "object") {
+    // Unexpected shape — stringify defensively so we never render an object.
+    try {
+      return JSON.stringify(detail);
+    } catch {
+      return fallback;
+    }
+  }
+  if (typeof anyErr?.message === "string" && anyErr.message)
+    return anyErr.message;
+  return fallback;
+}
+
 // Typed API helpers
 
 export interface IPSpace {
@@ -838,6 +887,9 @@ export interface PlatformSettings {
   dns_auto_sync_interval_minutes: number;
   dns_auto_sync_delete_stale: boolean;
   dns_auto_sync_last_run_at: string | null;
+  dns_pull_from_server_enabled: boolean;
+  dns_pull_from_server_interval_minutes: number;
+  dns_pull_from_server_last_run_at: string | null;
   ip_allocation_strategy: string;
   session_timeout_minutes: number;
   auto_logout_minutes: number;
@@ -1414,6 +1466,32 @@ export const dnsApi = {
         responseType: "text",
         transformResponse: (d) => d,
       })
+      .then((r) => r.data),
+  syncZoneWithServer: (groupId: string, zoneId: string, apply = true) =>
+    api
+      .post<{
+        server_records: number;
+        existing_in_db: number;
+        imported: number;
+        skipped_unsupported: number;
+        imported_records: {
+          name: string;
+          fqdn: string;
+          record_type: string;
+          value: string;
+          ttl: number | null;
+        }[];
+        push_candidates: number;
+        pushed: number;
+        pushed_records: {
+          name: string;
+          fqdn: string;
+          record_type: string;
+          value: string;
+          ttl: number | null;
+        }[];
+        push_errors: string[];
+      }>(`/dns/groups/${groupId}/zones/${zoneId}/sync-with-server`, { apply })
       .then((r) => r.data),
   exportAllZones: (groupId: string, viewId?: string | null) =>
     api

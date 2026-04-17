@@ -14,6 +14,7 @@ from sqlalchemy.orm import selectinload
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.core.permissions import require_any_resource_permission
+from app.drivers.dns import _DRIVERS as _DNS_DRIVERS
 from app.models.audit import AuditLog
 from app.models.dns import (
     DNSAcl,
@@ -48,7 +49,9 @@ router = APIRouter(
     dependencies=[Depends(require_any_resource_permission("dns_group", "dns_zone", "dns_record"))]
 )
 
-VALID_DRIVERS = {"bind9"}
+# Sourced from the driver registry so new drivers (e.g. ``windows_dns``)
+# don't also need a schema edit to be accepted on create/update.
+VALID_DRIVERS = frozenset(_DNS_DRIVERS.keys())
 VALID_GROUP_TYPES = {"internal", "external", "dmz", "custom"}
 VALID_ZONE_TYPES = {"primary", "secondary", "stub", "forward"}
 VALID_RECORD_TYPES = {
@@ -644,6 +647,16 @@ async def create_server(
     if body.api_key:
         # TODO: encrypt before storing
         data["api_key_encrypted"] = body.api_key
+
+    # Auto-mark this server as primary if the group has no primary yet.
+    # Prevents the footgun where a freshly-created group has zero primaries
+    # and `enqueue_record_op` silently drops every write targeting its zones.
+    # Admins can still flip the flag later via PUT; this only fires on create.
+    has_primary = await db.execute(
+        select(DNSServer).where(DNSServer.group_id == group_id, DNSServer.is_primary.is_(True))
+    )
+    if has_primary.first() is None:
+        data["is_primary"] = True
 
     server = DNSServer(**data)
     db.add(server)
@@ -1763,6 +1776,104 @@ async def import_zone_commit(
         deleted=deleted,
         unchanged=unchanged_count,
         conflict_strategy=body.conflict_strategy,
+    )
+
+
+class SyncWithServerRequest(BaseModel):
+    """Body for the zone's ``sync-with-server`` action. ``apply=False`` runs
+    preview-only (neither the DB nor the authoritative server is touched)."""
+
+    apply: bool = True
+
+
+class SyncWithServerResponse(BaseModel):
+    # Pull (server → DB)
+    server_records: int
+    existing_in_db: int
+    imported: int
+    skipped_unsupported: int
+    imported_records: list[dict]
+    # Push (DB → server)
+    push_candidates: int
+    pushed: int
+    pushed_records: list[dict]
+    push_errors: list[str]
+
+
+@router.post(
+    "/groups/{group_id}/zones/{zone_id}/sync-with-server",
+    response_model=SyncWithServerResponse,
+)
+async def sync_zone_with_server_endpoint(
+    group_id: uuid.UUID,
+    zone_id: uuid.UUID,
+    body: SyncWithServerRequest,
+    db: DB,
+    current_user: CurrentUser,
+) -> SyncWithServerResponse:
+    """Bi-directional additive sync between SpatiumDDI's DB and the zone's
+    primary authoritative server.
+
+    Phase 1 (pull): AXFR the server, create DB rows for anything present
+    on the wire but missing from our DB.
+    Phase 2 (push): for every DB row that isn't on the wire, send an RFC
+    2136 add so it lands on the server.
+
+    Never deletes on either side. Destructive reconciliation is a future
+    iteration.
+    """
+    from app.services.dns.pull_from_server import sync_zone_with_server
+
+    zone = await _require_zone(group_id, zone_id, db)
+    try:
+        result = await sync_zone_with_server(db, zone, apply=body.apply)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        logger.warning(
+            "dns.sync_with_server_failed",
+            zone=zone.name,
+            error=str(exc),
+        )
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"Sync with authoritative server failed: {exc}. "
+                "Check that the server allows zone transfers and dynamic "
+                "updates from this host."
+            ),
+        ) from exc
+
+    if body.apply and (result.pull.imported or result.push.pushed or result.push.push_errors):
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                user_display_name=current_user.display_name,
+                auth_source=current_user.auth_source,
+                action="sync_with_server",
+                resource_type="dns_zone",
+                resource_id=str(zone.id),
+                resource_display=zone.name,
+                result="error" if result.push.push_errors else "success",
+                new_value={
+                    "imported": result.pull.imported,
+                    "pushed": result.push.pushed,
+                    "push_errors": len(result.push.push_errors),
+                    "server_records": result.pull.server_records,
+                },
+            )
+        )
+        await db.commit()
+    return SyncWithServerResponse(
+        server_records=result.pull.server_records,
+        existing_in_db=result.pull.existing_in_db,
+        imported=result.pull.imported,
+        skipped_unsupported=result.pull.skipped_unsupported,
+        imported_records=result.pull.imported_records,
+        push_candidates=result.push.candidates,
+        pushed=result.push.pushed,
+        pushed_records=result.push.pushed_records,
+        push_errors=result.push.push_errors,
     )
 
 

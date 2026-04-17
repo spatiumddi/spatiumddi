@@ -21,10 +21,23 @@ from app.drivers.dns.base import (
     ZoneData,
 )
 from app.drivers.dns.bind9 import BIND9Driver
+from app.drivers.dns.windows import WindowsDNSDriver
 
 _DRIVERS: dict[str, type[DNSDriver]] = {
     "bind9": BIND9Driver,
+    "windows_dns": WindowsDNSDriver,
 }
+
+# Drivers whose record ops run from the control plane directly, with no
+# agent co-located with the daemon. The record_ops service short-circuits
+# the queue for these — applying the change synchronously and writing a
+# DNSRecordOp row as ``applied`` / ``failed`` for audit purposes.
+AGENTLESS_DRIVERS: frozenset[str] = frozenset({"windows_dns"})
+
+
+def is_agentless(driver_name: str) -> bool:
+    """True if the driver runs from the control plane without an agent."""
+    return driver_name in AGENTLESS_DRIVERS
 
 
 def get_driver(server_type: str) -> DNSDriver:

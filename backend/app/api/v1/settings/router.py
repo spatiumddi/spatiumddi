@@ -41,6 +41,9 @@ class SettingsResponse(BaseModel):
     dns_auto_sync_interval_minutes: int
     dns_auto_sync_delete_stale: bool
     dns_auto_sync_last_run_at: datetime | None
+    dns_pull_from_server_enabled: bool
+    dns_pull_from_server_interval_minutes: int
+    dns_pull_from_server_last_run_at: datetime | None
     dhcp_default_dns_servers: list[str]
     dhcp_default_domain_name: str
     dhcp_default_domain_search: list[str]
@@ -69,6 +72,8 @@ class SettingsUpdate(BaseModel):
     dns_auto_sync_enabled: bool | None = None
     dns_auto_sync_interval_minutes: int | None = None
     dns_auto_sync_delete_stale: bool | None = None
+    dns_pull_from_server_enabled: bool | None = None
+    dns_pull_from_server_interval_minutes: int | None = None
     dhcp_default_dns_servers: list[str] | None = None
     dhcp_default_domain_name: str | None = None
     dhcp_default_domain_search: list[str] | None = None
@@ -89,7 +94,11 @@ class SettingsUpdate(BaseModel):
             raise ValueError("Must be >= 0 (0 = no timeout)")
         return v
 
-    @field_validator("discovery_scan_interval_minutes", "dns_auto_sync_interval_minutes")
+    @field_validator(
+        "discovery_scan_interval_minutes",
+        "dns_auto_sync_interval_minutes",
+        "dns_pull_from_server_interval_minutes",
+    )
     @classmethod
     def validate_positive(cls, v: int | None) -> int | None:
         if v is not None and v < 1:

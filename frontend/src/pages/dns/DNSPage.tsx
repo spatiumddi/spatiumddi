@@ -32,6 +32,7 @@ import {
 import {
   dnsApi,
   dnsBlocklistApi,
+  formatApiError,
   type DNSServerGroup,
   type DNSServer,
   type DNSZone,
@@ -302,7 +303,7 @@ function ImportZoneModal({
     },
     onError: (err: ApiError) => {
       setPreview(null);
-      setError(err.response?.data?.detail ?? "Failed to parse zone file");
+      setError(formatApiError(err, "Failed to parse zone file"));
     },
   });
 
@@ -319,7 +320,7 @@ function ImportZoneModal({
       onClose();
     },
     onError: (err: ApiError) => {
-      setError(err.response?.data?.detail ?? "Import failed");
+      setError(formatApiError(err, "Import failed"));
     },
   });
 
@@ -543,7 +544,7 @@ function GroupModal({
       qc.invalidateQueries({ queryKey: ["dns-groups"] });
       onClose();
     },
-    onError: (e: ApiError) => setError(e?.response?.data?.detail ?? "Error"),
+    onError: (e: ApiError) => setError(formatApiError(e)),
   });
 
   return (
@@ -649,7 +650,7 @@ function ServerModal({
       qc.invalidateQueries({ queryKey: ["dns-servers", groupId] });
       onClose();
     },
-    onError: (e: ApiError) => setError(e?.response?.data?.detail ?? "Error"),
+    onError: (e: ApiError) => setError(formatApiError(e)),
   });
 
   function submit(e: React.FormEvent) {
@@ -694,10 +695,22 @@ function ServerModal({
               value={driver}
               onChange={(e) => setDriver(e.target.value)}
             >
-              <option value="bind9">BIND9</option>
+              <option value="bind9">BIND9 (agent-managed)</option>
+              <option value="windows_dns">
+                Windows DNS (RFC 2136, agentless)
+              </option>
             </select>
           </Field>
         </div>
+        {driver === "windows_dns" && (
+          <div className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-800 dark:text-amber-300">
+            <strong>Windows DNS (agentless):</strong> record CRUD only, via RFC
+            2136. Zones must already exist in Windows DNS Manager and have
+            <em> Nonsecure and secure</em> dynamic updates enabled on each
+            target zone. No agent container is required — the control plane
+            sends updates directly to <code>host:53</code>.
+          </div>
+        )}
         <div className="grid grid-cols-2 gap-3">
           <Field label="Host / IP">
             <input
@@ -808,7 +821,7 @@ function ZoneModal({
       qc.invalidateQueries({ queryKey: ["dns-zones", groupId] });
       onClose();
     },
-    onError: (e: ApiError) => setError(e?.response?.data?.detail ?? "Error"),
+    onError: (e: ApiError) => setError(formatApiError(e)),
   });
 
   function submit(e: React.FormEvent) {
@@ -995,7 +1008,7 @@ function RecordModal({
       qc.invalidateQueries({ queryKey: ["dns-records", zoneId] });
       onClose();
     },
-    onError: (e: ApiError) => setError(e?.response?.data?.detail ?? "Error"),
+    onError: (e: ApiError) => setError(formatApiError(e)),
   });
 
   function submit(e: React.FormEvent) {
@@ -1126,6 +1139,25 @@ function ZoneDetailView({
     downloadBlob(text, `${zone.name.replace(/\.$/, "")}.zone`, "text/dns");
   };
 
+  // "Sync with server" — bi-directional additive sync against the zone's
+  // primary authoritative server (today: Windows DNS). AXFR imports missing
+  // records into our DB, then every DB record not already on the wire is
+  // pushed back via RFC 2136. Never deletes. Result shown in <SyncResultModal/>.
+  const [syncResult, setSyncResult] = useState<SyncResultPayload | null>(null);
+  const syncMut = useMutation({
+    mutationFn: () => dnsApi.syncZoneWithServer(group.id, zone.id, true),
+    onSuccess: (res) => {
+      qc.invalidateQueries({ queryKey: ["dns-records", zone.id] });
+      setSyncResult({ ok: true, ...res });
+    },
+    onError: (err) => {
+      setSyncResult({
+        ok: false,
+        error: formatApiError(err, "Sync with server failed"),
+      });
+    },
+  });
+
   const { data: views = [] } = useQuery({
     queryKey: ["dns-views", group.id],
     queryFn: () => dnsApi.listViews(group.id),
@@ -1233,6 +1265,17 @@ function ZoneDetailView({
             onClick={handleExport}
           >
             <Download className="h-3 w-3" /> Export
+          </button>
+          <button
+            className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent disabled:opacity-50"
+            onClick={() => syncMut.mutate()}
+            disabled={syncMut.isPending}
+            title="Two-way additive sync with the zone's authoritative server: AXFR missing records into SpatiumDDI, then push anything in our DB that isn't on the wire. Never deletes."
+          >
+            <RefreshCw
+              className={`h-3 w-3 ${syncMut.isPending ? "animate-spin" : ""}`}
+            />
+            {syncMut.isPending ? "Syncing…" : "Sync with server"}
           </button>
           <button
             className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent"
@@ -1600,6 +1643,265 @@ function ZoneDetailView({
           isPending={deleteZone.isPending}
         />
       )}
+      {syncResult && (
+        <SyncResultModal
+          zoneName={zone.name}
+          result={syncResult}
+          onClose={() => setSyncResult(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+// ── Sync-with-server result modal ─────────────────────────────────────────────
+//
+// Surfaces the per-run summary from POST /dns/groups/{id}/zones/{id}/sync-with-server
+// — counts for both directions (pulled from server → DB, pushed from DB → server)
+// plus per-record lists and any push errors that came back.
+
+type SyncRecord = {
+  name: string;
+  fqdn: string;
+  record_type: string;
+  value: string;
+  ttl: number | null;
+};
+
+type SyncResultPayload =
+  | {
+      ok: true;
+      // pull direction
+      server_records: number;
+      existing_in_db: number;
+      imported: number;
+      skipped_unsupported: number;
+      imported_records: SyncRecord[];
+      // push direction
+      push_candidates: number;
+      pushed: number;
+      pushed_records: SyncRecord[];
+      push_errors: string[];
+    }
+  | { ok: false; error: string };
+
+function SyncResultModal({
+  zoneName,
+  result,
+  onClose,
+}: {
+  zoneName: string;
+  result: SyncResultPayload;
+  onClose: () => void;
+}) {
+  if (!result.ok) {
+    return (
+      <Modal title="Sync with server — failed" onClose={onClose}>
+        <div className="space-y-3">
+          <div className="rounded-md border border-destructive/30 bg-destructive/10 p-3 text-xs text-destructive">
+            {result.error}
+          </div>
+          <p className="text-xs text-muted-foreground">
+            Common causes: zone transfers not allowed from this host (DNS
+            Manager → zone → Properties → Zone Transfers), dynamic updates not
+            permitted, primary server unreachable, or the driver does not
+            support AXFR pull (only Windows DNS does today).
+          </p>
+          <div className="flex justify-end pt-1">
+            <button
+              onClick={onClose}
+              className="rounded-md border px-3 py-1.5 text-sm hover:bg-accent"
+            >
+              Close
+            </button>
+          </div>
+        </div>
+      </Modal>
+    );
+  }
+
+  const {
+    server_records,
+    existing_in_db,
+    imported,
+    skipped_unsupported,
+    imported_records,
+    pushed,
+    pushed_records,
+    push_errors,
+  } = result;
+  const somethingHappened =
+    imported > 0 || pushed > 0 || push_errors.length > 0;
+  const wide = imported_records.length > 0 || pushed_records.length > 0;
+
+  return (
+    <Modal
+      title={`Sync with server — ${zoneName.replace(/\.$/, "")}`}
+      onClose={onClose}
+      wide={wide}
+    >
+      <div className="space-y-4">
+        {/* Pull direction */}
+        <div>
+          <div className="mb-2 text-xs font-medium text-muted-foreground">
+            ⬇ Server → SpatiumDDI (pull)
+          </div>
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+            <Stat label="On server" value={server_records} />
+            <Stat label="Already in DB" value={existing_in_db} />
+            <Stat
+              label="Imported"
+              value={imported}
+              highlight={imported > 0 ? "good" : undefined}
+            />
+            <Stat
+              label="Skipped"
+              value={skipped_unsupported}
+              hint="unsupported record type"
+            />
+          </div>
+          {imported > 0 && (
+            <RecordTable
+              records={imported_records}
+              heading="New records added to SpatiumDDI"
+            />
+          )}
+        </div>
+
+        {/* Push direction */}
+        <div>
+          <div className="mb-2 text-xs font-medium text-muted-foreground">
+            ⬆ SpatiumDDI → Server (push)
+          </div>
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+            <Stat
+              label="Pushed"
+              value={pushed}
+              highlight={
+                pushed > 0 && push_errors.length === 0 ? "good" : undefined
+              }
+            />
+            <Stat
+              label="Errors"
+              value={push_errors.length}
+              highlight={push_errors.length > 0 ? "bad" : undefined}
+            />
+            <Stat label="Skipped" value={0} hint="DB already matches server" />
+          </div>
+          {pushed > 0 && (
+            <RecordTable
+              records={pushed_records}
+              heading="Records applied to the server"
+            />
+          )}
+          {push_errors.length > 0 && (
+            <div className="mt-2 rounded-md border border-destructive/30 bg-destructive/10 p-3">
+              <div className="mb-1 text-xs font-medium text-destructive">
+                Push errors ({push_errors.length})
+              </div>
+              <ul className="list-disc space-y-0.5 pl-4 text-xs text-destructive">
+                {push_errors.map((e, i) => (
+                  <li key={i} className="font-mono break-all">
+                    {e}
+                  </li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>
+
+        {!somethingHappened && (
+          <p className="text-xs text-muted-foreground">
+            Already in sync — the DB and the authoritative server hold the same
+            records.
+          </p>
+        )}
+
+        <div className="flex justify-end pt-1">
+          <button
+            onClick={onClose}
+            className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90"
+          >
+            Done
+          </button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+function RecordTable({
+  records,
+  heading,
+}: {
+  records: SyncRecord[];
+  heading: string;
+}) {
+  return (
+    <div className="mt-2 rounded-md border">
+      <div className="border-b px-3 py-2 text-xs font-medium text-muted-foreground">
+        {heading}
+      </div>
+      <div className="max-h-60 overflow-auto">
+        <table className="w-full text-xs">
+          <thead className="bg-muted/40">
+            <tr className="text-left">
+              <th className="px-3 py-1.5 font-medium">Name</th>
+              <th className="px-3 py-1.5 font-medium">Type</th>
+              <th className="px-3 py-1.5 font-medium">Value</th>
+              <th className="px-3 py-1.5 font-medium">TTL</th>
+            </tr>
+          </thead>
+          <tbody>
+            {records.map((r, i) => (
+              <tr key={i} className="border-t">
+                <td className="px-3 py-1 font-mono">{r.name}</td>
+                <td className="px-3 py-1">
+                  <span className="inline-flex items-center rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium">
+                    {r.record_type}
+                  </span>
+                </td>
+                <td className="px-3 py-1 font-mono break-all">{r.value}</td>
+                <td className="px-3 py-1 text-muted-foreground">
+                  {r.ttl ?? "—"}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function Stat({
+  label,
+  value,
+  highlight,
+  hint,
+}: {
+  label: string;
+  value: number;
+  highlight?: "good" | "bad";
+  hint?: string;
+}) {
+  return (
+    <div
+      className={cn(
+        "rounded-md border p-3",
+        highlight === "good" &&
+          "border-emerald-500/30 bg-emerald-500/5 dark:bg-emerald-500/10",
+        highlight === "bad" &&
+          "border-destructive/30 bg-destructive/5 dark:bg-destructive/10",
+      )}
+    >
+      <div className="text-xs text-muted-foreground">{label}</div>
+      <div className="text-xl font-semibold tabular-nums">{value}</div>
+      {hint && (
+        <div className="mt-0.5 text-[10px] text-muted-foreground/70">
+          {hint}
+        </div>
+      )}
     </div>
   );
 }
@@ -1853,7 +2155,7 @@ function AclsTab({ groupId }: { groupId: string }) {
       setNewDesc("");
       setNewEntries("");
     },
-    onError: (e: ApiError) => setError(e?.response?.data?.detail ?? "Error"),
+    onError: (e: ApiError) => setError(formatApiError(e)),
   });
   const delMut = useMutation({
     mutationFn: (id: string) => dnsApi.deleteAcl(groupId, id),
@@ -4438,12 +4740,15 @@ export function DNSPage() {
                       <ChevronRight className="h-3.5 w-3.5" />
                     )}
                   </button>
-                  {/* Group name — click to select */}
+                  {/* Group name — click to select AND toggle expand/collapse.
+                      The chevron button still works on its own; having the
+                      row click also toggle removes the footgun where the
+                      only way to collapse is via a 24px-wide chevron. */}
                   <button
                     className="flex flex-1 items-center gap-2 py-1.5 pr-1 min-w-0"
                     onClick={() => {
                       setSelection({ type: "group", group: g });
-                      if (!expanded) toggleGroup(g.id);
+                      toggleGroup(g.id);
                     }}
                   >
                     <span

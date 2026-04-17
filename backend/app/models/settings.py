@@ -70,6 +70,22 @@ class PlatformSettings(Base):
         DateTime(timezone=True), nullable=True
     )
 
+    # Scheduled "pull from authoritative server" (AXFR → additive import).
+    # Complements the IPAM→DNS push direction above; together they keep
+    # SpatiumDDI's DB in sync with both its own intent (IPAM) and the live
+    # state on the authoritative DNS server (e.g. a Windows DC).
+    # Beat fires every 60s; task gates on these so the UI can change cadence
+    # without restarting celery-beat.
+    dns_pull_from_server_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+    dns_pull_from_server_interval_minutes: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=30
+    )
+    dns_pull_from_server_last_run_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
     # DHCP defaults — applied as the initial values when creating a new DHCP scope
     dhcp_default_dns_servers: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
     dhcp_default_domain_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
