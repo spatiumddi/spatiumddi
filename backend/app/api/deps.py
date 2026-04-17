@@ -56,9 +56,31 @@ async def get_current_user(
 
 
 def require_superadmin(current_user: Annotated[User, Depends(get_current_user)]) -> User:
-    if not current_user.is_superadmin:
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Superadmin required")
-    return current_user
+    """Admit users who are either
+    (a) the legacy ``User.is_superadmin=True`` (seeded ``admin`` / anyone
+        explicitly flagged), OR
+    (b) granted a Wave-C RBAC wildcard permission (`action=*`,
+        `resource_type=*`) via a group → role, i.e. the built-in ``Superadmin``
+        role or a custom clone of it.
+
+    Without (b), users provisioned via LDAP / OIDC / SAML and mapped to the
+    ``Superadmins`` internal group could pass RBAC-gated checks but still get
+    403 on ``SuperAdmin``-gated endpoints (users / groups / roles / auth
+    providers / settings) — a split-brain between the legacy flag and the
+    RBAC model. This unifies them.
+    """
+    if current_user.is_superadmin:
+        return current_user
+    # Lazy import: `app.core.permissions` imports ``CurrentUser`` / ``get_db``
+    # from this module at top-level, so an eager import here triggers a
+    # circular-import crash at uvicorn startup. Local import side-steps it
+    # because by the time this function is called the module graph is fully
+    # initialised.
+    from app.core.permissions import user_has_permission
+
+    if user_has_permission(current_user, "*", "*"):
+        return current_user
+    raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Superadmin required")
 
 
 # Type aliases for injection
