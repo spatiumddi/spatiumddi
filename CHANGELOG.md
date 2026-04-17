@@ -7,14 +7,18 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versioning uses 
 
 ## Unreleased
 
-First wave of substantive post-alpha work. External auth providers (LDAP /
-OIDC / SAML + RADIUS / TACACS+ with backup-server failover), group-based
-RBAC enforced across every API router, partial IPv6 (storage + UI + Kea
-Dhcp6), inherited-field placeholders on edit modals, mobile-responsive
-layout, IPAM block/subnet overlap validation, scheduled IPAM↔DNS auto-sync,
-bulk-edit DNS zone assignment, shared zone-picker dropdown with primary /
-additional grouping, and a `make ci` target that mirrors GitHub Actions
-locally.
+---
+
+## 2026.04.16-3 — 2026-04-16
+
+Third same-day iteration. First wave of substantive post-alpha work:
+external auth providers (LDAP / OIDC / SAML + RADIUS / TACACS+ with
+backup-server failover), group-based RBAC enforced across every API
+router, partial IPv6 (storage + UI + Kea Dhcp6), inherited-field
+placeholders on edit modals, mobile-responsive layout, IPAM block/subnet
+overlap validation, scheduled IPAM↔DNS auto-sync, bulk-edit DNS zone
+assignment, shared zone-picker dropdown with primary / additional
+grouping, and a `make ci` target that mirrors GitHub Actions locally.
 
 ### Added
 
