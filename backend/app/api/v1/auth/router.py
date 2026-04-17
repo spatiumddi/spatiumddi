@@ -6,7 +6,7 @@ import secrets as py_secrets
 import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
-from urllib.parse import urlencode, urlparse
+from urllib.parse import urlencode
 
 import structlog
 from fastapi import APIRouter, Form, HTTPException, Query, Request, status
@@ -502,34 +502,53 @@ def _verify_flow_token(token: str) -> dict:
         raise ValueError("invalid flow token") from exc
 
 
-def _safe_error_suffix(value: str) -> str:
-    """Strip a provider-supplied error code down to ``[a-z0-9_]`` (max 40 chars)
-    so it is safe to embed in our fixed-path login redirect. Values from the
-    IdP (e.g. OIDC ``error`` query param, SAML StatusCode) should never flow
-    into a redirect URL verbatim — see CWE-601."""
-    cleaned = "".join(c for c in (value or "").lower() if c.isalnum() or c == "_")
-    return cleaned[:40] or "unknown"
+# Closed set of reason codes used in the /login?error=... redirect. Anything
+# outside this set gets mapped to "unknown" before the redirect URL is built,
+# so IdP-supplied / exception-supplied values never flow into the URL — the
+# redirect target is always assembled from a literal in this set. Prevents
+# CWE-601 (open-redirect) at the source: if a CodeQL taint trace ever reports
+# user input reaching `RedirectResponse` from this helper, the trace is
+# wrong.
+_LOGIN_ERROR_REASONS = frozenset(
+    {
+        # OIDC
+        "oidc_misconfigured",
+        "oidc_discovery_failed",
+        "oidc_state_missing",
+        "oidc_state_invalid",
+        "oidc_state_mismatch",
+        "oidc_no_code",
+        "oidc_exchange_failed",
+        "oidc_idp_error",
+        "oidc_rejected",
+        # SAML
+        "saml_misconfigured",
+        "saml_build_failed",
+        "saml_state_missing",
+        "saml_state_invalid",
+        "saml_state_mismatch",
+        "saml_assertion_rejected",
+        "saml_rejected",
+        # Fallback
+        "unknown",
+    }
+)
 
 
 def _login_error_redirect(reason: str) -> RedirectResponse:
     """Redirect to the login page with ``?error=<reason>``.
 
-    Defence against CWE-601 (open redirect) even though ``_LOGIN_ERROR_PATH``
-    is hardcoded: after building the final URL, verify via ``urlparse`` that
-    it has no scheme and no netloc — i.e. it is a same-origin relative path.
-    If a future caller accidentally threads an attacker-controlled value into
-    ``reason`` such that it escapes ``urlencode``, we'll still refuse to
-    redirect off-site and fall back to the plain login URL. This is the
-    sanitizer pattern CodeQL documents for this rule.
+    ``reason`` MUST be one of the allowlisted values in
+    ``_LOGIN_ERROR_REASONS``; anything else is coerced to ``"unknown"``.
+    Since the redirect URL is assembled from a literal path plus a value
+    selected from a closed set of literals, no user- or provider-supplied
+    string ever flows into the URL — CWE-601 sanitization by construction.
+    The actual IdP error is preserved in the server log and audit row.
     """
+    if reason not in _LOGIN_ERROR_REASONS:
+        logger.warning("login_error_redirect_unknown_reason", reason=reason)
+        reason = "unknown"
     url = f"{_LOGIN_ERROR_PATH}?{urlencode({'error': reason})}"
-    parsed = urlparse(url)
-    if parsed.scheme or parsed.netloc:
-        # Should be unreachable since _LOGIN_ERROR_PATH starts with "/" and
-        # urlencode escapes every character that could introduce a netloc or
-        # scheme. Treat it as a bug — drop the query string entirely.
-        logger.warning("login_error_redirect_blocked_non_relative", url=url)
-        return RedirectResponse(_LOGIN_ERROR_PATH, status_code=302)
     return RedirectResponse(url, status_code=302)
 
 
@@ -648,7 +667,7 @@ async def oidc_callback(
         return _login_error_redirect("oidc_state_mismatch")
     if error:
         logger.warning("oidc_idp_error", provider=provider.name, error=error)
-        return _login_error_redirect(f"oidc_idp_{_safe_error_suffix(error)}")
+        return _login_error_redirect("oidc_idp_error")
     if not code:
         return _login_error_redirect("oidc_no_code")
 
@@ -686,7 +705,7 @@ async def oidc_callback(
             reason=exc.reason,
             auth_source=provider.name,
         )
-        return _login_error_redirect(f"oidc_rejected_{_safe_error_suffix(exc.reason)}")
+        return _login_error_redirect("oidc_rejected")
 
     tokens = await _issue_tokens(db, request, user, auth_source=provider.name)
 
@@ -761,7 +780,7 @@ async def saml_callback(
             reason=exc.reason,
             auth_source=provider.name,
         )
-        return _login_error_redirect(f"saml_rejected_{_safe_error_suffix(exc.reason)}")
+        return _login_error_redirect("saml_rejected")
 
     tokens = await _issue_tokens(db, request, user, auth_source=provider.name)
     frag = urlencode(
