@@ -142,6 +142,12 @@ async def sync_external_user(
                 user.display_name = result.display_name
 
     # 5) Replace group membership with the mapped set.
+    # SQLAlchemy's collection setter computes a diff against the currently
+    # loaded collection, which triggers a lazy-load if we haven't touched
+    # `user.groups` yet. Under an AsyncSession that lazy-load raises
+    # MissingGreenlet. `awaitable_attrs` is the async-safe way to force the
+    # load in an await-context; after this, the plain assignment is safe.
+    await user.awaitable_attrs.groups
     user.groups = groups
 
     return user

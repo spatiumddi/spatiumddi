@@ -3,11 +3,16 @@ from datetime import datetime
 
 from sqlalchemy import DateTime, func
 from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.ext.asyncio import AsyncAttrs
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
-class Base(DeclarativeBase):
-    pass
+class Base(AsyncAttrs, DeclarativeBase):
+    """All models inherit ``AsyncAttrs`` so ``await row.awaitable_attrs.<rel>``
+    is available — the async-safe way to force a lazy-load under an
+    AsyncSession without tripping MissingGreenlet. Purely additive; existing
+    sync-style access still works everywhere relationships are eagerly loaded
+    (e.g. via ``selectinload``)."""
 
 
 class UUIDPrimaryKeyMixin:
