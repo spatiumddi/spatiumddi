@@ -9,7 +9,7 @@ import structlog
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import Response, StreamingResponse
 from pydantic import BaseModel, field_validator
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import selectinload
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
@@ -601,6 +601,36 @@ async def delete_group(group_id: uuid.UUID, db: DB, current_user: SuperAdmin) ->
     group = await db.get(DNSServerGroup, group_id)
     if not group:
         raise HTTPException(status_code=404, detail="Server group not found")
+
+    # The ORM-level ``cascade="all, delete-orphan"`` on zones/servers/views will
+    # happily wipe a populated group, which is an easy foot-gun — the user can
+    # accidentally nuke a group that still has live zones and registered
+    # servers. Pre-check and return 409 with counts so the UI gets a clear
+    # error instead of a silent cascade. Matches the IP space / block pattern.
+    server_count = (
+        await db.execute(
+            select(func.count()).select_from(DNSServer).where(DNSServer.group_id == group_id)
+        )
+    ).scalar_one()
+    zone_count = (
+        await db.execute(
+            select(func.count()).select_from(DNSZone).where(DNSZone.group_id == group_id)
+        )
+    ).scalar_one()
+    if server_count or zone_count:
+        parts = []
+        if server_count:
+            parts.append(f"{server_count} server(s)")
+        if zone_count:
+            parts.append(f"{zone_count} zone(s)")
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"DNS server group {group.name!r} still contains "
+                f"{' and '.join(parts)}. Delete or move them before deleting "
+                "the group."
+            ),
+        )
 
     db.add(
         AuditLog(

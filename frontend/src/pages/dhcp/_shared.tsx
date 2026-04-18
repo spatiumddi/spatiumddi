@@ -115,6 +115,7 @@ export function DeleteConfirmModal({
   onConfirm,
   onClose,
   isPending,
+  error,
 }: {
   title: string;
   description: string;
@@ -123,6 +124,7 @@ export function DeleteConfirmModal({
   onConfirm: () => void;
   onClose: () => void;
   isPending?: boolean;
+  error?: string | null;
 }) {
   const [checked, setChecked] = useState(false);
   return (
@@ -150,6 +152,11 @@ export function DeleteConfirmModal({
           />
           <span>I understand this action cannot be undone.</span>
         </label>
+        {error && (
+          <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+            {error}
+          </div>
+        )}
         <div className="flex justify-end gap-2">
           <button
             onClick={onClose}

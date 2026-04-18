@@ -17,6 +17,14 @@ import {
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { useTableSort, SortableTh } from "@/lib/useTableSort";
+import {
+  ContextMenu,
+  ContextMenuContent,
+  ContextMenuItem,
+  ContextMenuLabel,
+  ContextMenuSeparator,
+  ContextMenuTrigger,
+} from "@/components/ui/context-menu";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -265,7 +273,8 @@ function RouterDetail({
   const qc = useQueryClient();
   const [showEdit, setShowEdit] = useState(false);
   const [showCreateVlan, setShowCreateVlan] = useState(false);
-  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [deleteStep, setDeleteStep] = useState<0 | 1 | 2>(0);
+  const [deleteChecked, setDeleteChecked] = useState(false);
 
   const { data: router } = useQuery({
     queryKey: ["vlans", "router", routerId],
@@ -325,7 +334,11 @@ function RouterDetail({
             <Pencil className="h-3 w-3 inline mr-1" /> Edit
           </button>
           <button
-            onClick={() => setConfirmDelete(true)}
+            onClick={() => {
+              setDeleteChecked(false);
+              setDeleteError(null);
+              setDeleteStep(1);
+            }}
             className="rounded-md border px-3 py-1 text-xs text-destructive hover:bg-destructive/10"
           >
             <Trash2 className="h-3 w-3 inline mr-1" /> Delete
@@ -420,30 +433,69 @@ function RouterDetail({
           onClose={() => setShowCreateVlan(false)}
         />
       )}
-      {confirmDelete && (
-        <Modal
-          title="Delete Router"
-          onClose={() => {
-            setConfirmDelete(false);
-            setDeleteError(null);
-          }}
-        >
-          <div className="space-y-3">
-            <p className="text-sm">
-              Delete <strong>{router.name}</strong>? All {vlans.length} VLAN
-              {vlans.length === 1 ? "" : "s"} under this router will be deleted.
+      {deleteStep === 1 && (
+        <Modal title="Delete Router" onClose={() => setDeleteStep(0)}>
+          <div className="space-y-4">
+            <p className="text-sm text-muted-foreground">
+              Delete <strong className="text-foreground">{router.name}</strong>?
+              All {vlans.length} VLAN
+              {vlans.length === 1 ? "" : "s"} under this router will be removed.
               Deletion is blocked if any subnet still references a VLAN on this
               router — reassign those subnets first.
             </p>
+            <div className="flex justify-end gap-2">
+              <button
+                onClick={() => setDeleteStep(0)}
+                className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => setDeleteStep(2)}
+                className="rounded-md bg-destructive px-3 py-1.5 text-sm text-destructive-foreground hover:bg-destructive/90"
+              >
+                Continue
+              </button>
+            </div>
+          </div>
+        </Modal>
+      )}
+      {deleteStep === 2 && (
+        <Modal
+          title="Confirm Permanent Deletion"
+          onClose={() => {
+            setDeleteStep(0);
+            setDeleteError(null);
+          }}
+        >
+          <div className="space-y-4">
+            <p className="text-sm font-medium text-destructive">
+              This action cannot be undone.
+            </p>
+            <p className="text-sm text-muted-foreground">
+              <strong className="text-foreground">{router.name}</strong> and all{" "}
+              {vlans.length} VLAN{vlans.length === 1 ? "" : "s"} it contains
+              will be permanently deleted.
+            </p>
+            <label className="flex cursor-pointer items-start gap-2 text-sm">
+              <input
+                type="checkbox"
+                className="mt-0.5"
+                checked={deleteChecked}
+                onChange={(e) => setDeleteChecked(e.target.checked)}
+              />
+              I understand this will permanently delete{" "}
+              <strong>{router.name}</strong> and all its VLANs.
+            </label>
             {deleteError && (
-              <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+              <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
                 {deleteError}
               </div>
             )}
             <div className="flex justify-end gap-2">
               <button
                 onClick={() => {
-                  setConfirmDelete(false);
+                  setDeleteStep(0);
                   setDeleteError(null);
                 }}
                 className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
@@ -451,11 +503,14 @@ function RouterDetail({
                 Cancel
               </button>
               <button
-                onClick={() => deleteMut.mutate()}
-                disabled={deleteMut.isPending}
+                onClick={() => {
+                  setDeleteError(null);
+                  deleteMut.mutate();
+                }}
+                disabled={!deleteChecked || deleteMut.isPending}
                 className="rounded-md bg-destructive px-3 py-1.5 text-sm text-destructive-foreground hover:bg-destructive/90 disabled:opacity-50"
               >
-                {deleteMut.isPending ? "Deleting…" : "Delete"}
+                {deleteMut.isPending ? "Deleting…" : "Delete permanently"}
               </button>
             </div>
           </div>
@@ -471,14 +526,38 @@ function VLANRow({ vlan, onClick }: { vlan: VLAN; onClick: () => void }) {
     queryFn: () => ipamApi.listSubnets({ vlan_ref_id: vlan.id }),
   });
   return (
-    <tr onClick={onClick} className="border-t cursor-pointer hover:bg-muted/40">
-      <td className="px-3 py-1.5 font-mono">{vlan.vlan_id}</td>
-      <td className="px-3 py-1.5">{vlan.name}</td>
-      <td className="px-3 py-1.5 text-muted-foreground">
-        {vlan.description || "—"}
-      </td>
-      <td className="px-3 py-1.5 text-right">{subnets.length}</td>
-    </tr>
+    <ContextMenu>
+      <ContextMenuTrigger asChild>
+        <tr
+          onClick={onClick}
+          className="border-t cursor-pointer hover:bg-muted/40"
+        >
+          <td className="px-3 py-1.5 font-mono">{vlan.vlan_id}</td>
+          <td className="px-3 py-1.5">{vlan.name}</td>
+          <td className="px-3 py-1.5 text-muted-foreground">
+            {vlan.description || "—"}
+          </td>
+          <td className="px-3 py-1.5 text-right">{subnets.length}</td>
+        </tr>
+      </ContextMenuTrigger>
+      <ContextMenuContent>
+        <ContextMenuLabel>
+          VLAN {vlan.vlan_id} — {vlan.name}
+        </ContextMenuLabel>
+        <ContextMenuSeparator />
+        <ContextMenuItem onSelect={onClick}>Open…</ContextMenuItem>
+        <ContextMenuItem
+          onSelect={() => navigator.clipboard.writeText(String(vlan.vlan_id))}
+        >
+          Copy VLAN ID
+        </ContextMenuItem>
+        <ContextMenuItem
+          onSelect={() => navigator.clipboard.writeText(vlan.name)}
+        >
+          Copy Name
+        </ContextMenuItem>
+      </ContextMenuContent>
+    </ContextMenu>
   );
 }
 

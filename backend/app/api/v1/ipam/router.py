@@ -15,12 +15,14 @@ from sqlalchemy.orm import selectinload
 from app.api.deps import DB, CurrentUser
 from app.api.v1.ipam.io_router import router as io_router
 from app.core.permissions import require_any_resource_permission
+from app.drivers.dhcp import is_agentless
 from app.models.audit import AuditLog
-from app.models.dhcp import DHCPStaticAssignment
+from app.models.dhcp import DHCPConfigOp, DHCPScope, DHCPServer, DHCPStaticAssignment
 from app.models.dns import DNSRecord, DNSZone
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet, SubnetDomain
 from app.models.vlans import VLAN
-from app.services.dhcp.windows_writethrough import push_static_change
+from app.services.dhcp.config_bundle import build_config_bundle
+from app.services.dhcp.windows_writethrough import push_scope_delete, push_static_change
 
 logger = structlog.get_logger(__name__)
 
@@ -880,7 +882,11 @@ class SubnetVLANRef(BaseModel):
 class SubnetResponse(BaseModel):
     id: uuid.UUID
     space_id: uuid.UUID
-    block_id: uuid.UUID
+    # Nullable because the DB column is ``NULL``-able even though the ORM
+    # model declares it non-null — historical schema drift. A subnet with
+    # ``block_id IS NULL`` is an orphan from before blocks were mandatory;
+    # surface it rather than 500 the whole list endpoint.
+    block_id: uuid.UUID | None
     network: str
     name: str
     description: str
@@ -1222,6 +1228,33 @@ async def delete_space(space_id: uuid.UUID, current_user: CurrentUser, db: DB) -
     if space is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP space not found")
 
+    # Subnet.space_id is ondelete=RESTRICT so a naive delete bubbles as 500
+    # when anything is still anchored here. Pre-check blocks and subnets so
+    # the UI gets a clear 409 with a count instead of an opaque server error.
+    subnet_count = (
+        await db.execute(
+            select(func.count()).select_from(Subnet).where(Subnet.space_id == space_id)
+        )
+    ).scalar_one()
+    block_count = (
+        await db.execute(
+            select(func.count()).select_from(IPBlock).where(IPBlock.space_id == space_id)
+        )
+    ).scalar_one()
+    if subnet_count or block_count:
+        parts = []
+        if block_count:
+            parts.append(f"{block_count} block(s)")
+        if subnet_count:
+            parts.append(f"{subnet_count} subnet(s)")
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"IP space {space.name!r} still contains {' and '.join(parts)}. "
+                "Delete or move them before deleting the space."
+            ),
+        )
+
     db.add(
         _audit(
             current_user,
@@ -1423,6 +1456,38 @@ async def delete_block(block_id: uuid.UUID, current_user: CurrentUser, db: DB) -
     block = await db.get(IPBlock, block_id)
     if block is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP block not found")
+
+    # Refuse if anything is anchored below this block. Child blocks cascade,
+    # which would silently nuke a chunk of the tree. Subnet.block_id is
+    # RESTRICT at the DB level so a subnet-having block would bubble a 500
+    # anyway — but the DB column is also historically nullable (schema
+    # drift), so a naive delete can end up orphaning subnets with
+    # ``block_id=NULL``. Check explicitly and return a useful 409.
+    subnet_count = (
+        await db.execute(
+            select(func.count()).select_from(Subnet).where(Subnet.block_id == block_id)
+        )
+    ).scalar_one()
+    child_block_count = (
+        await db.execute(
+            select(func.count())
+            .select_from(IPBlock)
+            .where(IPBlock.parent_block_id == block_id)
+        )
+    ).scalar_one()
+    if subnet_count or child_block_count:
+        parts = []
+        if child_block_count:
+            parts.append(f"{child_block_count} child block(s)")
+        if subnet_count:
+            parts.append(f"{subnet_count} subnet(s)")
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"Block {block.network} still contains {' and '.join(parts)}. "
+                "Delete or move them before deleting the block."
+            ),
+        )
 
     db.add(
         _audit(
@@ -2052,6 +2117,35 @@ async def delete_subnet(subnet_id: uuid.UUID, current_user: CurrentUser, db: DB)
 
     block_id = subnet.block_id
 
+    # Clean up DHCP artifacts first so downstream servers don't keep
+    # serving leases for a range that no longer exists in IPAM.
+    #
+    #   * windows_dhcp (agentless) → push a remove-scope via WinRM before
+    #     the DB row disappears; failure bubbles as 502 and rolls back.
+    #   * kea / isc-dhcp (agent-based) → we can't actually reconfigure
+    #     from the DB delete alone. Mark their config_etag dirty and
+    #     enqueue an ``apply_config`` op so the next agent poll rebuilds
+    #     the bundle without the removed scope.
+    #
+    # DHCPScope.subnet_id is ``ondelete=CASCADE`` so the rows themselves
+    # (+ pools / statics via ORM cascade) will be cleaned automatically
+    # when the subnet is deleted.
+    scope_rows = (
+        await db.execute(
+            select(DHCPScope, DHCPServer)
+            .join(DHCPServer, DHCPScope.server_id == DHCPServer.id, isouter=True)
+            .where(DHCPScope.subnet_id == subnet_id)
+        )
+    ).all()
+    agent_servers_to_refresh: dict[uuid.UUID, DHCPServer] = {}
+    for scope, server in scope_rows:
+        if server is None:
+            continue
+        if is_agentless(server.driver):
+            await push_scope_delete(db, scope)
+        else:
+            agent_servers_to_refresh[server.id] = server
+
     # Clean up DNS artifacts so we don't leave orphaned records/zones behind.
     # IPAddress rows cascade-delete with the subnet, but DNSRecord.ip_address_id
     # is ON DELETE SET NULL, and auto-generated reverse zones keep linked_subnet_id
@@ -2086,6 +2180,31 @@ async def delete_subnet(subnet_id: uuid.UUID, current_user: CurrentUser, db: DB)
     await db.delete(subnet)
     await db.flush()
     await _update_block_utilization(db, block_id)
+
+    # Rebuild bundles for any agent-based servers that lost a scope. Done
+    # after the delete so the fresh bundle reflects the post-delete state.
+    for server in agent_servers_to_refresh.values():
+        bundle = await build_config_bundle(db, server)
+        server.config_etag = bundle.etag
+        existing = (
+            await db.execute(
+                select(DHCPConfigOp).where(
+                    DHCPConfigOp.server_id == server.id,
+                    DHCPConfigOp.op_type == "apply_config",
+                    DHCPConfigOp.status == "pending",
+                )
+            )
+        ).scalar_one_or_none()
+        if existing is None:
+            db.add(
+                DHCPConfigOp(
+                    server_id=server.id,
+                    op_type="apply_config",
+                    payload={"etag": bundle.etag},
+                    status="pending",
+                )
+            )
+
     await db.commit()
 
 

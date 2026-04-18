@@ -600,23 +600,6 @@ function DnsSettingsSection({
     ? (effectiveDns?.dns_additional_zone_ids ?? [])
     : additionalZoneIds;
 
-  function toggleGroup(gId: string) {
-    if (groupIds.includes(gId)) {
-      onGroupIdsChange(groupIds.filter((id) => id !== gId));
-      // clear zones from this group if needed
-      const groupZoneIds = (
-        (zoneQueries.find((_: unknown, i: number) => activeGroupIds[i] === gId)
-          ?.data as DNSZone[] | undefined) ?? []
-      ).map((z: DNSZone) => z.id);
-      if (zoneId && groupZoneIds.includes(zoneId)) onZoneIdChange(null);
-      onAdditionalZoneIdsChange(
-        additionalZoneIds.filter((id) => !groupZoneIds.includes(id)),
-      );
-    } else {
-      onGroupIdsChange([...groupIds, gId]);
-    }
-  }
-
   const inheritedFrom = effectiveDns?.inherited_from_block_id
     ? "a parent block"
     : null;
@@ -651,35 +634,36 @@ function DnsSettingsSection({
       )}
 
       <fieldset disabled={inherit} className="space-y-2 disabled:opacity-50">
-        {/* DNS Server Groups */}
+        {/* DNS Server Group — single-select dropdown to match the DHCP
+            picker visually. The API still stores a list for backwards
+            compatibility; we round-trip through a single-element array. */}
         <div>
-          <p className="text-xs text-muted-foreground mb-1">
-            DNS Server Groups
-          </p>
+          <p className="text-xs text-muted-foreground mb-1">DNS Server Group</p>
           {allGroups.length === 0 ? (
             <p className="text-xs text-muted-foreground italic">
               No groups configured.
             </p>
           ) : (
-            <div className="flex flex-wrap gap-1.5">
-              {allGroups.map((g) => {
-                const selected = displayGroupIds.includes(g.id);
-                return (
-                  <button
-                    key={g.id}
-                    type="button"
-                    onClick={() => !inherit && toggleGroup(g.id)}
-                    className={`px-2 py-0.5 rounded-full border text-xs transition-colors ${
-                      selected
-                        ? "bg-primary text-primary-foreground border-primary"
-                        : "bg-background text-muted-foreground border-border hover:border-primary/50"
-                    }`}
-                  >
-                    {g.name}
-                  </button>
-                );
-              })}
-            </div>
+            <select
+              value={displayGroupIds[0] ?? ""}
+              onChange={(e) => {
+                if (inherit) return;
+                const id = e.target.value;
+                // Switching groups invalidates zone picks from the old
+                // group — clear primary and additional zones.
+                onGroupIdsChange(id ? [id] : []);
+                onZoneIdChange(null);
+                onAdditionalZoneIdsChange([]);
+              }}
+              className={`${inputCls} w-full`}
+            >
+              <option value="">— None —</option>
+              {allGroups.map((g) => (
+                <option key={g.id} value={g.id}>
+                  {g.name}
+                </option>
+              ))}
+            </select>
           )}
         </div>
 
@@ -704,22 +688,38 @@ function DnsSettingsSection({
           </div>
         )}
 
-        {/* Additional Zones — hidden when inheriting (the dual-listbox is
-            bulky and there's nothing to do with it when the parent
-            chooses). The effective value is still shown implicitly by
-            the "inheriting from ..." text elsewhere in the modal. */}
+        {/* Additional Zones — collapsed by default. The dual-listbox is
+            bulky so we hide it behind a <details> expander; most users
+            don't need to override the primary zone's sibling zones. When
+            inheriting we skip it entirely. */}
         {availableZones.length > 0 && !inherit && (
-          <div>
-            <p className="text-xs text-muted-foreground mb-1">
-              Additional Zones
-            </p>
-            <AdditionalZonesPicker
-              allZones={availableZones.filter((z) => z.id !== displayZoneId)}
-              selectedIds={displayAdditionalIds}
-              onChange={(ids) => onAdditionalZoneIdsChange(ids)}
-              disabled={false}
-            />
-          </div>
+          <details className="group rounded-md border border-primary/40 bg-primary/[0.03]">
+            <summary className="flex cursor-pointer select-none items-center justify-between gap-2 rounded-md px-2 py-1.5 text-xs font-medium text-foreground hover:bg-primary/10 [&::-webkit-details-marker]:hidden">
+              <span className="flex items-center gap-1.5">
+                <svg
+                  className="h-3.5 w-3.5 shrink-0 text-primary transition-transform group-open:rotate-90"
+                  fill="none"
+                  stroke="currentColor"
+                  strokeWidth="2.5"
+                  viewBox="0 0 24 24"
+                >
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
+                </svg>
+                <span>Additional Zones</span>
+              </span>
+              <span className="rounded bg-primary/15 px-1.5 py-0.5 text-[10px] font-medium text-primary">
+                {displayAdditionalIds.length} selected
+              </span>
+            </summary>
+            <div className="border-t border-primary/20 px-2 py-2">
+              <AdditionalZonesPicker
+                allZones={availableZones.filter((z) => z.id !== displayZoneId)}
+                selectedIds={displayAdditionalIds}
+                onChange={(ids) => onAdditionalZoneIdsChange(ids)}
+                disabled={false}
+              />
+            </div>
+          </details>
         )}
       </fieldset>
     </div>
@@ -2833,9 +2833,14 @@ function SubnetDetail({
                         addr.status === "broadcast" ||
                         !!addr.auto_from_lease;
                       const rowSelected = selectedIpIds.has(addr.id);
+                      const canEdit =
+                        !systemRow &&
+                        addr.status !== "orphan" &&
+                        !isReadOnly(addr.status);
                       return (
+                        <ContextMenu key={addr.id}>
+                          <ContextMenuTrigger asChild>
                         <tr
-                          key={addr.id}
                           className={cn(
                             "group/addr border-b last:border-0 hover:bg-muted/20",
                             (addr.status === "network" ||
@@ -3049,6 +3054,79 @@ function SubnetDetail({
                             </div>
                           </td>
                         </tr>
+                          </ContextMenuTrigger>
+                          <ContextMenuContent>
+                            <ContextMenuLabel>{addr.address}</ContextMenuLabel>
+                            <ContextMenuSeparator />
+                            <ContextMenuItem
+                              onSelect={() =>
+                                navigator.clipboard.writeText(addr.address)
+                              }
+                            >
+                              Copy IP
+                            </ContextMenuItem>
+                            {addr.fqdn && (
+                              <ContextMenuItem
+                                onSelect={() =>
+                                  navigator.clipboard.writeText(addr.fqdn!)
+                                }
+                              >
+                                Copy FQDN
+                              </ContextMenuItem>
+                            )}
+                            {addr.mac_address && (
+                              <ContextMenuItem
+                                onSelect={() =>
+                                  navigator.clipboard.writeText(
+                                    addr.mac_address!,
+                                  )
+                                }
+                              >
+                                Copy MAC
+                              </ContextMenuItem>
+                            )}
+                            {canEdit && (
+                              <>
+                                <ContextMenuSeparator />
+                                <ContextMenuItem
+                                  onSelect={() => setEditingAddress(addr)}
+                                >
+                                  Edit…
+                                </ContextMenuItem>
+                                <ContextMenuItem
+                                  destructive
+                                  onSelect={() => setConfirmDeleteAddr(addr)}
+                                >
+                                  Delete…
+                                </ContextMenuItem>
+                              </>
+                            )}
+                            {addr.status === "orphan" && (
+                              <>
+                                <ContextMenuSeparator />
+                                <ContextMenuItem
+                                  onSelect={() => restoreAddr.mutate(addr.id)}
+                                >
+                                  Restore
+                                </ContextMenuItem>
+                                <ContextMenuItem
+                                  destructive
+                                  onSelect={() => setConfirmPurgeAddr(addr)}
+                                >
+                                  Delete Forever…
+                                </ContextMenuItem>
+                              </>
+                            )}
+                            {addr.auto_from_lease && (
+                              <>
+                                <ContextMenuSeparator />
+                                <ContextMenuItem disabled>
+                                  Managed by DHCP — read-only
+                                </ContextMenuItem>
+                              </>
+                            )}
+                          </ContextMenuContent>
+                        </ContextMenu>
                       );
                     })}
                   </tbody>
@@ -5380,11 +5458,23 @@ function EditSpaceModal({
     },
   });
 
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const deleteMutation = useMutation({
     mutationFn: () => ipamApi.deleteSpace(space.id),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["spaces"] });
       onDeleted();
+    },
+    onError: (err: unknown) => {
+      const detail = (err as { response?: { data?: { detail?: unknown } } })
+        ?.response?.data?.detail;
+      setDeleteError(
+        typeof detail === "string"
+          ? detail
+          : detail
+            ? JSON.stringify(detail)
+            : "Failed to delete IP space.",
+      );
     },
   });
 
@@ -5442,6 +5532,11 @@ function EditSpaceModal({
             />
             I understand this will permanently delete all data in this IP space.
           </label>
+          {deleteError && (
+            <p className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+              {deleteError}
+            </p>
+          )}
           <div className="flex justify-end gap-2">
             <button
               onClick={() => setDeleteStep(0)}
@@ -5450,7 +5545,10 @@ function EditSpaceModal({
               Cancel
             </button>
             <button
-              onClick={() => deleteMutation.mutate()}
+              onClick={() => {
+                setDeleteError(null);
+                deleteMutation.mutate();
+              }}
               disabled={!deleteChecked || deleteMutation.isPending}
               className="rounded-md bg-destructive px-3 py-1.5 text-sm text-destructive-foreground hover:bg-destructive/90 disabled:opacity-50"
             >
@@ -5879,12 +5977,24 @@ function EditBlockModal({
     },
   });
 
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const deleteMutation = useMutation({
     mutationFn: () => ipamApi.deleteBlock(block.id),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["blocks", block.space_id] });
       qc.invalidateQueries({ queryKey: ["blocks"] });
       onDeleted?.();
+    },
+    onError: (err: unknown) => {
+      const detail = (err as { response?: { data?: { detail?: unknown } } })
+        ?.response?.data?.detail;
+      setDeleteError(
+        typeof detail === "string"
+          ? detail
+          : detail
+            ? JSON.stringify(detail)
+            : "Failed to delete block.",
+      );
     },
   });
 
@@ -5947,6 +6057,11 @@ function EditBlockModal({
             />
             I understand this will permanently delete all data in this block.
           </label>
+          {deleteError && (
+            <p className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+              {deleteError}
+            </p>
+          )}
           <div className="flex justify-end gap-2">
             <button
               onClick={() => setDeleteStep(0)}
@@ -5955,7 +6070,10 @@ function EditBlockModal({
               Cancel
             </button>
             <button
-              onClick={() => deleteMutation.mutate()}
+              onClick={() => {
+                setDeleteError(null);
+                deleteMutation.mutate();
+              }}
               disabled={!deleteChecked || deleteMutation.isPending}
               className="rounded-md bg-destructive px-3 py-1.5 text-sm text-destructive-foreground hover:bg-destructive/90 disabled:opacity-50"
             >
@@ -7011,6 +7129,10 @@ function SpaceTableView({
     queryFn: () => customFieldsApi.list("subnet"),
   });
 
+  // Selection holds either ``subnet:<id>`` or ``block:<id>`` so a single
+  // bulk action can delete a mixed set. Only *leaf* blocks (no child blocks
+  // or subnets) get a checkbox — deleting a non-leaf block would cascade
+  // unpredictably or hit the FK RESTRICT on subnet.block_id.
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [bulkOpen, setBulkOpen] = useState(false);
   const [showBulkDelete, setShowBulkDelete] = useState(false);
@@ -7028,8 +7150,20 @@ function SpaceTableView({
   const [showDnsSync, setShowDnsSync] = useState(false);
 
   const bulkDeleteMut = useMutation({
-    mutationFn: () =>
-      Promise.all(Array.from(selected).map((id) => ipamApi.deleteSubnet(id))),
+    mutationFn: async () => {
+      // Delete subnets first — a subnet hanging off a leaf block would
+      // otherwise block the block delete via its RESTRICT FK.
+      const subnetIds: string[] = [];
+      const blockIds: string[] = [];
+      for (const key of selected) {
+        if (key.startsWith("subnet:"))
+          subnetIds.push(key.slice("subnet:".length));
+        else if (key.startsWith("block:"))
+          blockIds.push(key.slice("block:".length));
+      }
+      await Promise.all(subnetIds.map((id) => ipamApi.deleteSubnet(id)));
+      await Promise.all(blockIds.map((id) => ipamApi.deleteBlock(id)));
+    },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["subnets", space.id] });
       qc.invalidateQueries({ queryKey: ["blocks", space.id] });
@@ -7038,11 +7172,11 @@ function SpaceTableView({
     },
   });
 
-  const toggleOne = (id: string) =>
+  const toggleOne = (key: string) =>
     setSelected((prev) => {
       const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
       return next;
     });
 
@@ -7051,6 +7185,24 @@ function SpaceTableView({
     blocks && subnets
       ? flattenToTableRows(buildBlockTree(blocks, subnets, null))
       : [];
+
+  // A block is a "leaf" when nothing else is anchored to it. Safe to delete
+  // directly; the FK RESTRICT on child subnets and the CASCADE on child
+  // blocks both stay dormant when the set is empty.
+  const leafBlockIds = new Set<string>();
+  if (blocks && subnets) {
+    const subnetBlockParents = new Set(subnets.map((s) => s.block_id));
+    const blockParents = new Set(
+      blocks.map((b) => b.parent_block_id).filter((p): p is string => !!p),
+    );
+    for (const b of blocks) {
+      if (!subnetBlockParents.has(b.id) && !blockParents.has(b.id)) {
+        leafBlockIds.add(b.id);
+      }
+    }
+  }
+  const selectedCount = selected.size;
+  const hasBlocksSelected = [...selected].some((k) => k.startsWith("block:"));
 
   const hasSpaceFilter = Object.values(spaceFilter).some(Boolean);
   const filteredSpaceRows = hasSpaceFilter
@@ -7104,14 +7256,21 @@ function SpaceTableView({
 
   const isEmpty = !isLoading && filteredSpaceRows.length === 0;
 
-  const subnetIdsInView = filteredSpaceRows
-    .filter((r) => r.type === "subnet" && r.subnet)
-    .map((r) => r.subnet!.id);
+  const selectableKeysInView = [
+    ...filteredSpaceRows
+      .filter((r) => r.type === "subnet" && r.subnet)
+      .map((r) => `subnet:${r.subnet!.id}`),
+    ...filteredSpaceRows
+      .filter(
+        (r) => r.type === "block" && r.block && leafBlockIds.has(r.block.id),
+      )
+      .map((r) => `block:${r.block!.id}`),
+  ];
   const allSelected =
-    subnetIdsInView.length > 0 &&
-    subnetIdsInView.every((id) => selected.has(id));
+    selectableKeysInView.length > 0 &&
+    selectableKeysInView.every((k) => selected.has(k));
   const toggleAll = () =>
-    setSelected(allSelected ? new Set() : new Set(subnetIdsInView));
+    setSelected(allSelected ? new Set() : new Set(selectableKeysInView));
 
   return (
     <div className="flex flex-1 flex-col overflow-hidden">
@@ -7121,17 +7280,20 @@ function SpaceTableView({
           <div className="flex flex-shrink-0 items-center gap-2">
             {selected.size > 0 && (
               <>
-                <button
-                  onClick={() => setBulkOpen(true)}
-                  className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
-                >
-                  Bulk Edit ({selected.size})
-                </button>
+                {!hasBlocksSelected && (
+                  <button
+                    onClick={() => setBulkOpen(true)}
+                    className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
+                    title="Bulk-edit applies to subnets only"
+                  >
+                    Bulk Edit ({selectedCount})
+                  </button>
+                )}
                 <button
                   onClick={() => setShowBulkDelete(true)}
                   className="rounded-md border border-destructive/50 px-3 py-1.5 text-sm text-destructive hover:bg-destructive/10"
                 >
-                  Delete ({selected.size})
+                  Delete ({selectedCount})
                 </button>
               </>
             )}
@@ -7191,9 +7353,10 @@ function SpaceTableView({
                   <th className="w-8 px-2 py-2 text-left">
                     <input
                       type="checkbox"
-                      aria-label="Select all subnets"
+                      aria-label="Select all selectable rows"
                       checked={allSelected}
                       onChange={toggleAll}
+                      disabled={selectableKeysInView.length === 0}
                     />
                   </th>
                   {(
@@ -7365,13 +7528,32 @@ function SpaceTableView({
                   if (item.type === "block" && item.block) {
                     const b = item.block;
                     const size = cidrSize(b.network);
+                    const isLeaf = leafBlockIds.has(b.id);
+                    const key = `block:${b.id}`;
                     return (
                       <tr
                         key={item.key}
                         onClick={() => onSelectBlock(b)}
                         className="border-b last:border-0 cursor-pointer hover:bg-muted/30 bg-muted/10"
                       >
-                        <td className="w-8 px-2 py-2" />
+                        <td
+                          className="w-8 px-2 py-2"
+                          onClick={(e) => e.stopPropagation()}
+                        >
+                          {isLeaf ? (
+                            <input
+                              type="checkbox"
+                              aria-label={`Select block ${b.network}`}
+                              checked={selected.has(key)}
+                              onChange={() => toggleOne(key)}
+                            />
+                          ) : (
+                            <span
+                              className="inline-block h-3.5 w-3.5"
+                              title="Block has child blocks or subnets — delete those first"
+                            />
+                          )}
+                        </td>
                         <td
                           className="py-2 pr-4"
                           style={{ paddingLeft: `${indent + 16}px` }}
@@ -7421,6 +7603,7 @@ function SpaceTableView({
                   }
                   if (item.type === "subnet" && item.subnet) {
                     const s = item.subnet;
+                    const key = `subnet:${s.id}`;
                     return (
                       <tr
                         key={item.key}
@@ -7434,8 +7617,8 @@ function SpaceTableView({
                           <input
                             type="checkbox"
                             aria-label={`Select ${s.network}`}
-                            checked={selected.has(s.id)}
-                            onChange={() => toggleOne(s.id)}
+                            checked={selected.has(key)}
+                            onChange={() => toggleOne(key)}
                           />
                         </td>
                         <td
@@ -7516,7 +7699,9 @@ function SpaceTableView({
       </div>
       {bulkOpen && (
         <BulkEditSubnetsModal
-          subnetIds={Array.from(selected)}
+          subnetIds={Array.from(selected)
+            .filter((k) => k.startsWith("subnet:"))
+            .map((k) => k.slice("subnet:".length))}
           onClose={() => setBulkOpen(false)}
           onDone={() => {
             setBulkOpen(false);
@@ -7549,16 +7734,35 @@ function SpaceTableView({
           onClose={() => setShowCreateSubnet(false)}
         />
       )}
-      {showBulkDelete && (
-        <ConfirmDestroyModal
-          title={`Delete ${selected.size} Subnet${selected.size === 1 ? "" : "s"}`}
-          description={`This will permanently delete ${selected.size} subnet${selected.size === 1 ? "" : "s"} and all IP address records within them.`}
-          checkLabel={`I understand all IP addresses in these subnets will be permanently deleted.`}
-          isPending={bulkDeleteMut.isPending}
-          onClose={() => setShowBulkDelete(false)}
-          onConfirm={() => bulkDeleteMut.mutate()}
-        />
-      )}
+      {showBulkDelete &&
+        (() => {
+          const subnetCount = [...selected].filter((k) =>
+            k.startsWith("subnet:"),
+          ).length;
+          const blockCount = [...selected].filter((k) =>
+            k.startsWith("block:"),
+          ).length;
+          const parts: string[] = [];
+          if (subnetCount)
+            parts.push(`${subnetCount} subnet${subnetCount === 1 ? "" : "s"}`);
+          if (blockCount)
+            parts.push(`${blockCount} block${blockCount === 1 ? "" : "s"}`);
+          const summary = parts.join(" + ");
+          return (
+            <ConfirmDestroyModal
+              title={`Delete ${summary}`}
+              description={`This will permanently delete ${summary}${
+                subnetCount
+                  ? " and all IP address records within the selected subnets"
+                  : ""
+              }. Only leaf blocks (no child blocks or subnets) are selectable.`}
+              checkLabel={`I understand this is permanent.`}
+              isPending={bulkDeleteMut.isPending}
+              onClose={() => setShowBulkDelete(false)}
+              onConfirm={() => bulkDeleteMut.mutate()}
+            />
+          );
+        })()}
       {showDnsSync && (
         <DnsSyncModal
           scope={{ kind: "space", id: space.id, label: space.name }}
@@ -7859,34 +8063,57 @@ function SpaceSection({
   return (
     <div>
       {/* Space header */}
-      <div
-        className={cn(
-          "group flex items-center gap-1 rounded-md px-1 py-1.5 hover:bg-muted/50",
-          isSpaceSelected && "bg-primary/5",
-        )}
-      >
-        <button
-          onClick={() => setExpanded((v) => !v)}
-          className="flex h-4 w-4 flex-shrink-0 items-center justify-center rounded-sm border border-border bg-background text-[10px] font-bold text-muted-foreground hover:border-primary hover:text-primary"
-          title={expanded ? "Collapse" : "Expand"}
-        >
-          {expanded ? "−" : "+"}
-        </button>
-        <button
-          onClick={onSelectSpace}
-          className="flex flex-1 items-center gap-1 min-w-0"
-        >
-          <Layers className="h-3.5 w-3.5 flex-shrink-0 text-muted-foreground" />
-          <span
+      <ContextMenu>
+        <ContextMenuTrigger asChild>
+          <div
             className={cn(
-              "flex-1 truncate text-left text-sm font-medium",
-              isSpaceSelected && "text-primary",
+              "group flex items-center gap-1 rounded-md px-1 py-1.5 hover:bg-muted/50",
+              isSpaceSelected && "bg-primary/5",
             )}
           >
-            {space.name}
-          </span>
-        </button>
-      </div>
+            <button
+              onClick={() => setExpanded((v) => !v)}
+              className="flex h-4 w-4 flex-shrink-0 items-center justify-center rounded-sm border border-border bg-background text-[10px] font-bold text-muted-foreground hover:border-primary hover:text-primary"
+              title={expanded ? "Collapse" : "Expand"}
+            >
+              {expanded ? "−" : "+"}
+            </button>
+            <button
+              onClick={onSelectSpace}
+              className="flex flex-1 items-center gap-1 min-w-0"
+            >
+              <Layers className="h-3.5 w-3.5 flex-shrink-0 text-muted-foreground" />
+              <span
+                className={cn(
+                  "flex-1 truncate text-left text-sm font-medium",
+                  isSpaceSelected && "text-primary",
+                )}
+              >
+                {space.name}
+              </span>
+            </button>
+          </div>
+        </ContextMenuTrigger>
+        <ContextMenuContent>
+          <ContextMenuLabel>{space.name}</ContextMenuLabel>
+          <ContextMenuSeparator />
+          <ContextMenuItem onSelect={() => setShowCreateBlock(true)}>
+            New Block…
+          </ContextMenuItem>
+          <ContextMenuItem onSelect={() => setShowCreateSubnet(true)}>
+            New Subnet…
+          </ContextMenuItem>
+          <ContextMenuSeparator />
+          <ContextMenuItem
+            onSelect={() => setExpanded((v) => !v)}
+          >
+            {expanded ? "Collapse" : "Expand"}
+          </ContextMenuItem>
+          <ContextMenuItem onSelect={() => setShowEditSpace(true)}>
+            Edit Space…
+          </ContextMenuItem>
+        </ContextMenuContent>
+      </ContextMenu>
 
       {/* Tree with vertical connecting line */}
       {expanded && (
@@ -8192,7 +8419,14 @@ export function IPAMPage() {
           <span className="text-sm font-semibold">IP Spaces</span>
           <div className="flex gap-1">
             <button
-              onClick={() => qc.invalidateQueries({ queryKey: ["spaces"] })}
+              onClick={() => {
+                // Force refetch — bare invalidate only marks queries stale,
+                // which isn't enough when the user pressed Refresh after
+                // creating resources via the API directly.
+                qc.refetchQueries({ queryKey: ["spaces"] });
+                qc.refetchQueries({ queryKey: ["blocks"] });
+                qc.refetchQueries({ queryKey: ["subnets"] });
+              }}
               className="rounded p-1 text-muted-foreground hover:text-foreground"
               title="Refresh"
             >

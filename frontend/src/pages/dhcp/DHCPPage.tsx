@@ -22,6 +22,14 @@ import {
 import { useSessionState } from "@/lib/useSessionState";
 import { cn } from "@/lib/utils";
 import { useTableSort, SortableTh } from "@/lib/useTableSort";
+import {
+  ContextMenu,
+  ContextMenuContent,
+  ContextMenuItem,
+  ContextMenuLabel,
+  ContextMenuSeparator,
+  ContextMenuTrigger,
+} from "@/components/ui/context-menu";
 import { CreateServerGroupModal } from "./CreateServerGroupModal";
 import { CreateServerModal } from "./CreateServerModal";
 import { CreateScopeModal } from "./CreateScopeModal";
@@ -136,7 +144,7 @@ function GroupSidebar({
                   {isExpanded ? "−" : "+"}
                 </button>
                 <button
-                  className="flex flex-1 items-center gap-2 py-1.5 pr-1 min-w-0"
+                  className="flex flex-1 items-center gap-2 py-1.5 pl-2 pr-1 min-w-0"
                   onClick={() => {
                     onSelect({ type: "group", group: g });
                     if (!isExpanded) toggle(g.id);
@@ -506,31 +514,69 @@ function ServerScopesTab({ server }: { server: DHCPServer }) {
               </thead>
               <tbody>
                 {allScopes.map((sc) => (
-                  <tr key={sc.id} className="border-b last:border-0">
-                    <td className="px-3 py-2 font-mono text-xs">
-                      {sc.subnet_network ?? "—"}
-                    </td>
-                    <td className="px-3 py-2">{sc.name}</td>
-                    <td className="px-3 py-2">{sc.enabled ? "yes" : "no"}</td>
-                    <td className="px-3 py-2 tabular-nums">{sc.lease_time}</td>
-                    <td className="px-3 py-2">
-                      {sc.ddns_enabled ? "on" : "off"}
-                    </td>
-                    <td className="px-3 py-2 text-right">
-                      <button
-                        onClick={() => setEditScope(sc)}
-                        className="rounded p-1 text-muted-foreground hover:text-foreground"
+                  <ContextMenu key={sc.id}>
+                    <ContextMenuTrigger asChild>
+                      <tr className="border-b last:border-0">
+                        <td className="px-3 py-2 font-mono text-xs">
+                          {sc.subnet_network ?? "—"}
+                        </td>
+                        <td className="px-3 py-2">{sc.name}</td>
+                        <td className="px-3 py-2">
+                          {sc.enabled ? "yes" : "no"}
+                        </td>
+                        <td className="px-3 py-2 tabular-nums">
+                          {sc.lease_time}
+                        </td>
+                        <td className="px-3 py-2">
+                          {sc.ddns_enabled ? "on" : "off"}
+                        </td>
+                        <td className="px-3 py-2 text-right">
+                          <button
+                            onClick={() => setEditScope(sc)}
+                            className="rounded p-1 text-muted-foreground hover:text-foreground"
+                          >
+                            <Pencil className="h-3.5 w-3.5" />
+                          </button>
+                          <button
+                            onClick={() => setDelScope(sc)}
+                            className="rounded p-1 text-muted-foreground hover:text-destructive"
+                          >
+                            <Trash2 className="h-3.5 w-3.5" />
+                          </button>
+                        </td>
+                      </tr>
+                    </ContextMenuTrigger>
+                    <ContextMenuContent>
+                      <ContextMenuLabel>{sc.name}</ContextMenuLabel>
+                      <ContextMenuSeparator />
+                      <ContextMenuItem onSelect={() => setEditScope(sc)}>
+                        Edit Scope…
+                      </ContextMenuItem>
+                      <ContextMenuItem
+                        destructive
+                        onSelect={() => setDelScope(sc)}
                       >
-                        <Pencil className="h-3.5 w-3.5" />
-                      </button>
-                      <button
-                        onClick={() => setDelScope(sc)}
-                        className="rounded p-1 text-muted-foreground hover:text-destructive"
+                        Delete Scope…
+                      </ContextMenuItem>
+                      <ContextMenuSeparator />
+                      <ContextMenuItem
+                        onSelect={() =>
+                          navigator.clipboard.writeText(sc.name)
+                        }
                       >
-                        <Trash2 className="h-3.5 w-3.5" />
-                      </button>
-                    </td>
-                  </tr>
+                        Copy Scope Name
+                      </ContextMenuItem>
+                      {sc.subnet_network && (
+                        <ContextMenuItem
+                          onSelect={() =>
+                            navigator.clipboard.writeText(sc.subnet_network!)
+                          }
+                        >
+                          Copy Subnet CIDR
+                        </ContextMenuItem>
+                      )}
+                    </ContextMenuContent>
+                  </ContextMenu>
                 ))}
               </tbody>
             </table>
@@ -769,16 +815,47 @@ function ServerPoolsOrStaticsTab({
               {staticRows.map(({ scope, item }) => {
                 const s = item;
                 return (
-                  <tr key={s.id} className="border-b last:border-0">
-                    <td className="px-3 py-2 text-xs">{scope.name}</td>
-                    <td className="px-3 py-2 font-mono text-xs">
-                      {s.mac_address}
-                    </td>
-                    <td className="px-3 py-2 font-mono text-xs">
-                      {s.ip_address}
-                    </td>
-                    <td className="px-3 py-2">{s.hostname || "—"}</td>
-                  </tr>
+                  <ContextMenu key={s.id}>
+                    <ContextMenuTrigger asChild>
+                      <tr className="border-b last:border-0">
+                        <td className="px-3 py-2 text-xs">{scope.name}</td>
+                        <td className="px-3 py-2 font-mono text-xs">
+                          {s.mac_address}
+                        </td>
+                        <td className="px-3 py-2 font-mono text-xs">
+                          {s.ip_address}
+                        </td>
+                        <td className="px-3 py-2">{s.hostname || "—"}</td>
+                      </tr>
+                    </ContextMenuTrigger>
+                    <ContextMenuContent>
+                      <ContextMenuLabel>{s.ip_address}</ContextMenuLabel>
+                      <ContextMenuSeparator />
+                      <ContextMenuItem
+                        onSelect={() =>
+                          navigator.clipboard.writeText(s.ip_address)
+                        }
+                      >
+                        Copy IP
+                      </ContextMenuItem>
+                      <ContextMenuItem
+                        onSelect={() =>
+                          navigator.clipboard.writeText(s.mac_address)
+                        }
+                      >
+                        Copy MAC
+                      </ContextMenuItem>
+                      {s.hostname && (
+                        <ContextMenuItem
+                          onSelect={() =>
+                            navigator.clipboard.writeText(s.hostname!)
+                          }
+                        >
+                          Copy Hostname
+                        </ContextMenuItem>
+                      )}
+                    </ContextMenuContent>
+                  </ContextMenu>
                 );
               })}
             </tbody>
@@ -975,35 +1052,68 @@ function LeasesTab({ server }: { server: DHCPServer }) {
               </tr>
             )}
             {leases.map((l: DHCPLease) => (
-              <tr key={l.id} className="border-b last:border-0">
-                <td className="px-3 py-1.5 font-mono text-xs">
-                  {l.ip_address}
-                </td>
-                <td className="px-3 py-1.5 font-mono text-xs">
-                  {l.mac_address}
-                </td>
-                <td className="px-3 py-1.5">{l.hostname || "—"}</td>
-                <td className="px-3 py-1.5">
-                  <span
-                    className={cn(
-                      "rounded-full px-2 py-0.5 text-xs",
-                      l.state === "active"
-                        ? "bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400"
-                        : "bg-muted text-muted-foreground",
-                    )}
+              <ContextMenu key={l.id}>
+                <ContextMenuTrigger asChild>
+                  <tr className="border-b last:border-0">
+                    <td className="px-3 py-1.5 font-mono text-xs">
+                      {l.ip_address}
+                    </td>
+                    <td className="px-3 py-1.5 font-mono text-xs">
+                      {l.mac_address}
+                    </td>
+                    <td className="px-3 py-1.5">{l.hostname || "—"}</td>
+                    <td className="px-3 py-1.5">
+                      <span
+                        className={cn(
+                          "rounded-full px-2 py-0.5 text-xs",
+                          l.state === "active"
+                            ? "bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-400"
+                            : "bg-muted text-muted-foreground",
+                        )}
+                      >
+                        {l.state}
+                      </span>
+                    </td>
+                    <td className="px-3 py-1.5 text-xs text-muted-foreground">
+                      {l.expires_at
+                        ? new Date(l.expires_at).toLocaleString()
+                        : "—"}
+                    </td>
+                    <td className="px-3 py-1.5 text-xs text-muted-foreground">
+                      {l.last_seen_at
+                        ? new Date(l.last_seen_at).toLocaleString()
+                        : "—"}
+                    </td>
+                  </tr>
+                </ContextMenuTrigger>
+                <ContextMenuContent>
+                  <ContextMenuLabel>{l.ip_address}</ContextMenuLabel>
+                  <ContextMenuSeparator />
+                  <ContextMenuItem
+                    onSelect={() =>
+                      navigator.clipboard.writeText(l.ip_address)
+                    }
                   >
-                    {l.state}
-                  </span>
-                </td>
-                <td className="px-3 py-1.5 text-xs text-muted-foreground">
-                  {l.expires_at ? new Date(l.expires_at).toLocaleString() : "—"}
-                </td>
-                <td className="px-3 py-1.5 text-xs text-muted-foreground">
-                  {l.last_seen_at
-                    ? new Date(l.last_seen_at).toLocaleString()
-                    : "—"}
-                </td>
-              </tr>
+                    Copy IP
+                  </ContextMenuItem>
+                  <ContextMenuItem
+                    onSelect={() =>
+                      navigator.clipboard.writeText(l.mac_address)
+                    }
+                  >
+                    Copy MAC
+                  </ContextMenuItem>
+                  {l.hostname && (
+                    <ContextMenuItem
+                      onSelect={() =>
+                        navigator.clipboard.writeText(l.hostname!)
+                      }
+                    >
+                      Copy Hostname
+                    </ContextMenuItem>
+                  )}
+                </ContextMenuContent>
+              </ContextMenu>
             ))}
           </tbody>
         </table>
@@ -1338,6 +1448,11 @@ export function DHCPPage() {
       setDelGroup(null);
     },
   });
+  const deleteGroupError =
+    deleteGroupMut.error &&
+    (((deleteGroupMut.error as { response?: { data?: { detail?: string } } })
+      ?.response?.data?.detail as string | undefined) ??
+      (deleteGroupMut.error as Error).message);
   const deleteServerMut = useMutation({
     mutationFn: (id: string) => dhcpApi.deleteServer(id),
     onSuccess: (_, id) => {
@@ -1412,10 +1527,14 @@ export function DHCPPage() {
       {delGroup && (
         <DeleteConfirmModal
           title="Delete Server Group"
-          description={`Permanently delete group "${delGroup.name}"?`}
+          description={`Permanently delete group "${delGroup.name}"? The group must be empty — move or delete its servers first.`}
           onConfirm={() => deleteGroupMut.mutate(delGroup.id)}
-          onClose={() => setDelGroup(null)}
+          onClose={() => {
+            setDelGroup(null);
+            deleteGroupMut.reset();
+          }}
           isPending={deleteGroupMut.isPending}
+          error={deleteGroupError || null}
         />
       )}
       {addServerFor && (

@@ -7,12 +7,12 @@ from datetime import datetime
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, field_validator
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.v1.dhcp._audit import write_audit
 from app.core.permissions import require_resource_permission
-from app.models.dhcp import DHCPServerGroup
+from app.models.dhcp import DHCPServer, DHCPServerGroup
 
 router = APIRouter(
     prefix="/server-groups",
@@ -126,6 +126,29 @@ async def delete_group(group_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
     g = await db.get(DHCPServerGroup, group_id)
     if g is None:
         raise HTTPException(status_code=404, detail="Server group not found")
+
+    # ORM ``cascade="all, delete-orphan"`` on ``servers`` will silently nuke
+    # every DHCPServer (and its scopes / leases / client classes) under this
+    # group. Pre-check and return 409 so the user can't wipe a populated
+    # group by mistake — they have to remove or reassign the servers first.
+    # Matches the DNS-group + IP-space pattern.
+    server_count = (
+        await db.execute(
+            select(func.count())
+            .select_from(DHCPServer)
+            .where(DHCPServer.server_group_id == group_id)
+        )
+    ).scalar_one()
+    if server_count:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"DHCP server group {g.name!r} still contains "
+                f"{server_count} server(s). Move them to another group "
+                "(or standalone) before deleting the group."
+            ),
+        )
+
     write_audit(
         db,
         user=user,

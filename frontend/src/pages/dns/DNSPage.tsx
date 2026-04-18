@@ -46,6 +46,14 @@ import {
 } from "@/lib/api";
 import { useTableSort, SortableTh } from "@/lib/useTableSort";
 import { cn } from "@/lib/utils";
+import {
+  ContextMenu,
+  ContextMenuContent,
+  ContextMenuItem,
+  ContextMenuLabel,
+  ContextMenuSeparator,
+  ContextMenuTrigger,
+} from "@/components/ui/context-menu";
 
 // ── Shared primitives ─────────────────────────────────────────────────────────
 
@@ -140,13 +148,15 @@ function ConfirmDestroyModal({
   onConfirm,
   onClose,
   isPending,
+  error,
 }: {
   title: string;
-  description: string;
+  description: React.ReactNode;
   checkLabel: string;
   onConfirm: () => void;
   onClose: () => void;
   isPending?: boolean;
+  error?: string | null;
 }) {
   const [step, setStep] = useState<1 | 2>(1);
   const [checked, setChecked] = useState(false);
@@ -156,6 +166,11 @@ function ConfirmDestroyModal({
       <Modal title={title} onClose={onClose}>
         <div className="space-y-4">
           <p className="text-sm text-muted-foreground">{description}</p>
+          {error && (
+            <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+              {error}
+            </div>
+          )}
           <div className="flex justify-end gap-2">
             <button
               onClick={onClose}
@@ -191,6 +206,11 @@ function ConfirmDestroyModal({
           />
           {checkLabel}
         </label>
+        {error && (
+          <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+            {error}
+          </div>
+        )}
         <div className="flex justify-end gap-2">
           <button
             onClick={onClose}
@@ -1487,8 +1507,9 @@ function ZoneDetailView({
               </thead>
               <tbody>
                 {filtered.map((r) => (
+                  <ContextMenu key={r.id}>
+                    <ContextMenuTrigger asChild>
                   <tr
-                    key={r.id}
                     className="border-b last:border-0 hover:bg-muted/40 group"
                   >
                     <td className="w-8 py-1.5 pl-3">
@@ -1573,6 +1594,51 @@ function ZoneDetailView({
                       )}
                     </td>
                   </tr>
+                    </ContextMenuTrigger>
+                    <ContextMenuContent>
+                      <ContextMenuLabel>
+                        {r.name} {r.record_type}
+                      </ContextMenuLabel>
+                      <ContextMenuSeparator />
+                      <ContextMenuItem
+                        onSelect={() =>
+                          navigator.clipboard.writeText(r.name)
+                        }
+                      >
+                        Copy Name
+                      </ContextMenuItem>
+                      <ContextMenuItem
+                        onSelect={() =>
+                          navigator.clipboard.writeText(r.value)
+                        }
+                      >
+                        Copy Value
+                      </ContextMenuItem>
+                      {r.auto_generated ? (
+                        <>
+                          <ContextMenuSeparator />
+                          <ContextMenuItem disabled>
+                            Managed by IPAM — read-only
+                          </ContextMenuItem>
+                        </>
+                      ) : (
+                        <>
+                          <ContextMenuSeparator />
+                          <ContextMenuItem
+                            onSelect={() => setEditRecord(r)}
+                          >
+                            Edit…
+                          </ContextMenuItem>
+                          <ContextMenuItem
+                            destructive
+                            onSelect={() => setConfirmDeleteRecord(r)}
+                          >
+                            Delete…
+                          </ContextMenuItem>
+                        </>
+                      )}
+                    </ContextMenuContent>
+                  </ContextMenu>
                 ))}
               </tbody>
             </table>
@@ -3203,10 +3269,13 @@ function ZonesTab({
   group: DNSServerGroup;
   onSelectZone: (z: DNSZone) => void;
 }) {
+  const qc = useQueryClient();
   const [showAdd, setShowAdd] = useState(false);
   const [showZoneFilters, setShowZoneFilters] = useState(false);
   const [zoneNameFilter, setZoneNameFilter] = useState("");
   const [zoneTypeFilter, setZoneTypeFilter] = useState("");
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [confirmBulkDelete, setConfirmBulkDelete] = useState(false);
 
   const { data: zones = [], isFetching } = useQuery({
     queryKey: ["dns-zones", group.id],
@@ -3239,64 +3308,211 @@ function ZonesTab({
     forward: "bg-muted text-muted-foreground",
   };
 
-  function renderZoneNode(node: DnsTreeNode, depth: number): React.ReactNode {
-    const indent = depth * 16;
-    return (
-      <div key={node.domain}>
-        {/* If this node has a zone, render it as a clickable card */}
-        {node.zone ? (
-          <div
-            className="flex items-center justify-between rounded-md border bg-card px-3 py-2 group hover:bg-accent/30 cursor-pointer mb-1"
-            style={{ marginLeft: indent }}
-            onClick={() => onSelectZone(node.zone!)}
-          >
-            <div className="flex items-center gap-2 min-w-0">
-              <FileText className="h-3.5 w-3.5 text-muted-foreground flex-shrink-0" />
-              <span className="font-mono text-sm truncate">
-                {node.zone.name.replace(/\.$/, "")}
-              </span>
-              <span
-                className={`inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium flex-shrink-0 ${typeBadge[node.zone.zone_type] ?? "bg-muted text-muted-foreground"}`}
-              >
-                {node.zone.zone_type}
-              </span>
-              {node.zone.dnssec_enabled && (
-                <Shield className="h-3 w-3 text-emerald-500 flex-shrink-0" />
+  const filteredIds = filteredZones.map((z) => z.id);
+  const allFilteredSelected =
+    filteredIds.length > 0 && filteredIds.every((id) => selected.has(id));
+  const someFilteredSelected =
+    !allFilteredSelected && filteredIds.some((id) => selected.has(id));
+
+  function toggleAll() {
+    if (allFilteredSelected) {
+      setSelected((prev) => {
+        const next = new Set(prev);
+        for (const id of filteredIds) next.delete(id);
+        return next;
+      });
+    } else {
+      setSelected((prev) => {
+        const next = new Set(prev);
+        for (const id of filteredIds) next.add(id);
+        return next;
+      });
+    }
+  }
+  function toggleOne(id: string) {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  const bulkDeleteZones = useMutation({
+    mutationFn: async (ids: string[]) => {
+      await Promise.allSettled(
+        ids.map((id) => dnsApi.deleteZone(group.id, id)),
+      );
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["dns-zones", group.id] });
+      setSelected(new Set());
+      setConfirmBulkDelete(false);
+    },
+  });
+
+  function renderZoneRows(
+    node: DnsTreeNode,
+    depth: number,
+  ): React.ReactNode[] {
+    const rows: React.ReactNode[] = [];
+    const indent = depth * 14;
+    if (node.zone) {
+      const z = node.zone;
+      const sel = selected.has(z.id);
+      rows.push(
+        <ContextMenu key={z.id}>
+          <ContextMenuTrigger asChild>
+            <tr
+              className={cn(
+                "border-b last:border-0 hover:bg-muted/30",
+                sel && "bg-primary/5",
               )}
-            </div>
-          </div>
-        ) : (
-          /* Folder-only node (intermediate domain level with no zone registered) */
-          <div
-            className="flex items-center gap-1.5 mb-1"
-            style={{ marginLeft: indent }}
-          >
-            <Folder className="h-3.5 w-3.5 text-muted-foreground flex-shrink-0" />
-            <span className="text-xs font-semibold text-muted-foreground">
-              .{node.domain}
+            >
+              <td className="w-8 px-2 py-1">
+                <input
+                  type="checkbox"
+                  checked={sel}
+                  onChange={() => toggleOne(z.id)}
+                  onClick={(e) => e.stopPropagation()}
+                />
+              </td>
+              <td
+                className="py-1 pr-2 cursor-pointer"
+                onClick={() => onSelectZone(z)}
+              >
+                <span
+                  className="inline-flex items-center gap-1.5"
+                  style={{ paddingLeft: indent }}
+                >
+                  <FileText className="h-3 w-3 text-muted-foreground flex-shrink-0" />
+                  <span className="font-mono text-xs">
+                    {z.name.replace(/\.$/, "")}
+                  </span>
+                </span>
+              </td>
+              <td className="py-1">
+                <span
+                  className={`inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium ${typeBadge[z.zone_type] ?? "bg-muted text-muted-foreground"}`}
+                >
+                  {z.zone_type}
+                </span>
+              </td>
+              <td className="py-1 tabular-nums text-xs text-muted-foreground">
+                {z.ttl}
+              </td>
+              <td className="py-1 text-xs">
+                {z.dnssec_enabled ? (
+                  <span className="inline-flex items-center gap-1 text-emerald-600">
+                    <Shield className="h-3 w-3" /> on
+                  </span>
+                ) : (
+                  <span className="text-muted-foreground/50">—</span>
+                )}
+              </td>
+              <td className="py-1 text-xs text-muted-foreground">
+                {z.last_pushed_at
+                  ? new Date(z.last_pushed_at).toLocaleString()
+                  : "—"}
+              </td>
+              <td className="py-1 pr-2 text-right">
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onSelectZone(z);
+                  }}
+                  className="inline-flex h-5 w-5 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground"
+                  title="Open zone"
+                >
+                  <Pencil className="h-3 w-3" />
+                </button>
+              </td>
+            </tr>
+          </ContextMenuTrigger>
+          <ContextMenuContent>
+            <ContextMenuLabel>{z.name.replace(/\.$/, "")}</ContextMenuLabel>
+            <ContextMenuSeparator />
+            <ContextMenuItem onSelect={() => onSelectZone(z)}>
+              Open Zone
+            </ContextMenuItem>
+            <ContextMenuItem
+              onSelect={() =>
+                navigator.clipboard.writeText(z.name.replace(/\.$/, ""))
+              }
+            >
+              Copy Name
+            </ContextMenuItem>
+            <ContextMenuItem
+              onSelect={async () => {
+                const text = await dnsApi.exportZone(group.id, z.id);
+                downloadBlob(
+                  text,
+                  `${z.name.replace(/\.$/, "")}.zone`,
+                  "text/dns",
+                );
+              }}
+            >
+              Export Zone File
+            </ContextMenuItem>
+          </ContextMenuContent>
+        </ContextMenu>,
+      );
+    } else {
+      rows.push(
+        <tr
+          key={`folder:${node.domain}`}
+          className="bg-muted/10 border-b last:border-0"
+        >
+          <td />
+          <td colSpan={6} className="py-0.5">
+            <span
+              className="inline-flex items-center gap-1.5 text-[11px] text-muted-foreground/70"
+              style={{ paddingLeft: indent }}
+            >
+              <Folder className="h-3 w-3" />.{node.domain}
             </span>
-          </div>
-        )}
-        {/* Recurse into children */}
-        {node.children.length > 0 && (
-          <div>
-            {node.children.map((child) => renderZoneNode(child, depth + 1))}
-          </div>
-        )}
-      </div>
-    );
+          </td>
+        </tr>,
+      );
+    }
+    for (const child of node.children) {
+      rows.push(...renderZoneRows(child, depth + 1));
+    }
+    return rows;
   }
 
   return (
     <div>
-      <div className="flex items-center justify-between mb-2">
+      <div className="flex items-center justify-between mb-2 gap-2 flex-wrap">
         <span className="text-xs font-medium text-muted-foreground uppercase tracking-wider">
           {hasZoneFilter
             ? `${filteredZones.length} / ${zones.length}`
             : zones.length}{" "}
           zone{zones.length !== 1 ? "s" : ""}
+          {selected.size > 0 && (
+            <span className="ml-2 text-primary normal-case tracking-normal">
+              {selected.size} selected
+            </span>
+          )}
         </span>
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap">
+          {selected.size > 0 && (
+            <>
+              <button
+                onClick={() => setConfirmBulkDelete(true)}
+                className="flex items-center gap-1 rounded-md bg-destructive px-2 py-1 text-xs text-destructive-foreground hover:bg-destructive/90"
+              >
+                <Trash2 className="h-3 w-3" /> Delete {selected.size}
+              </button>
+              <button
+                onClick={() => setSelected(new Set())}
+                className="rounded-md border px-2 py-1 text-xs hover:bg-accent"
+              >
+                Clear
+              </button>
+              <span className="h-4 w-px bg-border" />
+            </>
+          )}
           <button
             onClick={() => setShowZoneFilters((v) => !v)}
             title="Toggle filters"
@@ -3380,13 +3596,58 @@ function ZonesTab({
         </p>
       )}
 
-      {tree.map((root) => renderZoneNode(root, 0))}
+      {zones.length > 0 && (
+        <div className="rounded-md border overflow-x-auto">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="border-b bg-muted/30 text-left text-[10px] uppercase tracking-wider text-muted-foreground">
+                <th className="w-8 px-2 py-1.5">
+                  <input
+                    type="checkbox"
+                    checked={allFilteredSelected}
+                    ref={(el) => {
+                      if (el) el.indeterminate = someFilteredSelected;
+                    }}
+                    onChange={toggleAll}
+                    aria-label="Select all filtered zones"
+                  />
+                </th>
+                <th className="py-1.5 font-medium">Name</th>
+                <th className="py-1.5 font-medium">Type</th>
+                <th className="py-1.5 font-medium">TTL</th>
+                <th className="py-1.5 font-medium">DNSSEC</th>
+                <th className="py-1.5 font-medium">Last Push</th>
+                <th className="py-1.5" />
+              </tr>
+            </thead>
+            <tbody>{tree.flatMap((root) => renderZoneRows(root, 0))}</tbody>
+          </table>
+        </div>
+      )}
 
       {showAdd && (
         <ZoneModal
           groupId={group.id}
           views={views}
           onClose={() => setShowAdd(false)}
+        />
+      )}
+
+      {confirmBulkDelete && (
+        <ConfirmDestroyModal
+          title={`Delete ${selected.size} zone${selected.size === 1 ? "" : "s"}`}
+          description={
+            <>
+              Permanently delete the{" "}
+              <span className="font-medium">{selected.size}</span> selected
+              zone{selected.size === 1 ? "" : "s"} and all their records from
+              SpatiumDDI? This cannot be undone.
+            </>
+          }
+          checkLabel={`I understand ${selected.size} zone${selected.size === 1 ? "" : "s"} and all their records will be permanently deleted.`}
+          isPending={bulkDeleteZones.isPending}
+          onClose={() => setConfirmBulkDelete(false)}
+          onConfirm={() => bulkDeleteZones.mutate(Array.from(selected))}
         />
       )}
     </div>
@@ -4684,6 +4945,11 @@ export function DNSPage() {
       setConfirmDeleteGroup(null);
     },
   });
+  const deleteGroupError =
+    deleteGroup.error &&
+    (((deleteGroup.error as { response?: { data?: { detail?: string } } })
+      ?.response?.data?.detail as string | undefined) ??
+      (deleteGroup.error as Error).message);
 
   function toggleGroup(id: string) {
     setExpandedGroups((prev) => {
@@ -4852,11 +5118,15 @@ export function DNSPage() {
       {confirmDeleteGroup && (
         <ConfirmDestroyModal
           title="Delete Server Group"
-          description={`Permanently delete group "${confirmDeleteGroup.name}" and all its servers, zones, ACLs, and options?`}
-          checkLabel={`I understand all data in "${confirmDeleteGroup.name}" will be permanently deleted.`}
+          description={`Permanently delete group "${confirmDeleteGroup.name}"? The group must be empty — move or delete its servers and zones first.`}
+          checkLabel={`I understand the group "${confirmDeleteGroup.name}" will be deleted.`}
           onConfirm={() => deleteGroup.mutate(confirmDeleteGroup.id)}
-          onClose={() => setConfirmDeleteGroup(null)}
+          onClose={() => {
+            setConfirmDeleteGroup(null);
+            deleteGroup.reset();
+          }}
           isPending={deleteGroup.isPending}
+          error={deleteGroupError || null}
         />
       )}
     </div>
