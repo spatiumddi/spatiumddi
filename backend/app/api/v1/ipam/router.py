@@ -197,27 +197,72 @@ async def _update_block_utilization(db: AsyncSession, block_id: uuid.UUID) -> No
         await _update_block_utilization(db, block.parent_block_id)
 
 
+async def _resolve_effective_dns(
+    db: AsyncSession, subnet: Subnet
+) -> tuple[list[str], uuid.UUID | None, list[str]]:
+    """Return ``(dns_group_ids, dns_zone_id, dns_additional_zone_ids)`` for a
+    subnet, walking subnet → block ancestors → space.
+
+    Every caller that needs to route DNS ops for a subnet MUST go through
+    this helper — reading ``subnet.dns_group_ids`` / ``subnet.dns_zone_id``
+    directly ignores the ``dns_inherit_settings`` toggle and will keep
+    pushing to the previously-assigned server after the operator has
+    flipped the subnet back to inherit (real bug, not hypothetical).
+
+    Semantics mirror ``GET /subnets/{id}/effective-dns`` — that HTTP
+    endpoint is the UI's source of truth; the two used to drift when
+    this was a per-level ad-hoc walk.
+    """
+    # Subnet override wins if inherit is off.
+    if not subnet.dns_inherit_settings:
+        zone_id = uuid.UUID(subnet.dns_zone_id) if subnet.dns_zone_id else None
+        return (
+            list(subnet.dns_group_ids or []),
+            zone_id,
+            list(subnet.dns_additional_zone_ids or []),
+        )
+    # Walk up the block chain.
+    current = await db.get(IPBlock, subnet.block_id) if subnet.block_id else None
+    while current is not None:
+        if not current.dns_inherit_settings:
+            zone_id = uuid.UUID(current.dns_zone_id) if current.dns_zone_id else None
+            return (
+                list(current.dns_group_ids or []),
+                zone_id,
+                list(current.dns_additional_zone_ids or []),
+            )
+        if current.parent_block_id:
+            current = await db.get(IPBlock, current.parent_block_id)
+        else:
+            # Reached the root block — fall through to the space. The
+            # space has no ``inherit`` flag; it's always the root.
+            space = await db.get(IPSpace, current.space_id)
+            if space is None:
+                break
+            zone_id = uuid.UUID(space.dns_zone_id) if space.dns_zone_id else None
+            return (
+                list(space.dns_group_ids or []),
+                zone_id,
+                list(space.dns_additional_zone_ids or []),
+            )
+    return ([], None, [])
+
+
 async def _resolve_effective_zone(db: AsyncSession, subnet: Subnet) -> uuid.UUID | None:
-    """Return the effective DNS zone UUID for a subnet, walking the block ancestor chain."""
-    if not subnet.dns_inherit_settings and subnet.dns_zone_id:
-        return uuid.UUID(subnet.dns_zone_id)
-    block_id = subnet.block_id
-    while block_id:
-        block = await db.get(IPBlock, block_id)
-        if block is None:
-            break
-        if not block.dns_inherit_settings and block.dns_zone_id:
-            return uuid.UUID(block.dns_zone_id)
-        block_id = block.parent_block_id
-    return None
+    """Return the effective forward DNS zone UUID for a subnet."""
+    _, zone_id, _ = await _resolve_effective_dns(db, subnet)
+    return zone_id
 
 
 async def _resolve_reverse_zone(
     db: AsyncSession, subnet: Subnet, ip_addr: ipaddress.IPv4Address | ipaddress.IPv6Address
 ) -> DNSZone | None:
     """Find the reverse zone covering this IP. Prefers a zone linked to the
-    subnet; falls back to any reverse zone in the subnet's DNS group whose
-    name is a suffix of the IP's reverse_pointer."""
+    subnet; falls back to any reverse zone in the subnet's *effective* DNS
+    group whose name is a suffix of the IP's reverse_pointer.
+
+    "Effective" is load-bearing here — see ``_resolve_effective_dns``.
+    """
     rev_pointer = ip_addr.reverse_pointer + "."
     # 1. Subnet-linked reverse zone
     res = await db.execute(
@@ -229,13 +274,13 @@ async def _resolve_reverse_zone(
     z = res.scalar_one_or_none()
     if z and rev_pointer.endswith("." + z.name.rstrip(".") + "."):
         return z
-    # 2. Walk effective DNS group(s) for the subnet
-    group_ids = subnet.dns_group_ids or []
-    if not group_ids:
+    # 2. Walk effective DNS group(s) for the subnet — inheritance-aware.
+    effective_group_ids, _, _ = await _resolve_effective_dns(db, subnet)
+    if not effective_group_ids:
         return None
     res = await db.execute(
         select(DNSZone).where(
-            DNSZone.group_id.in_(group_ids),
+            DNSZone.group_id.in_(effective_group_ids),
             DNSZone.kind == "reverse",
         )
     )

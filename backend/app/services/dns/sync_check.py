@@ -32,7 +32,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.dns import DNSRecord, DNSZone
-from app.models.ipam import IPAddress, IPBlock, Subnet
+from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
 
 # ── Drift report dataclasses ─────────────────────────────────────────────────
 
@@ -89,25 +89,46 @@ class DriftReport:
 # ── Effective DNS resolution (duplicated minimally to avoid a router import) ─
 
 
+async def _effective_dns(
+    db: AsyncSession, subnet: Subnet
+) -> tuple[list[str], uuid.UUID | None]:
+    """Walk subnet → block ancestors → space, return
+    ``(effective_dns_group_ids, effective_forward_zone_id)``.
+
+    Ignoring the inherit flag here causes silent drift: a subnet flipped
+    back to "inherit from parent" keeps pushing records to the server
+    that was previously pinned on it. Don't bypass this helper.
+    """
+    if not subnet.dns_inherit_settings:
+        zone_id = uuid.UUID(subnet.dns_zone_id) if subnet.dns_zone_id else None
+        return (list(subnet.dns_group_ids or []), zone_id)
+
+    current = await db.get(IPBlock, subnet.block_id) if subnet.block_id else None
+    while current is not None:
+        if not current.dns_inherit_settings:
+            zone_id = uuid.UUID(current.dns_zone_id) if current.dns_zone_id else None
+            return (list(current.dns_group_ids or []), zone_id)
+        if current.parent_block_id:
+            current = await db.get(IPBlock, current.parent_block_id)
+        else:
+            space = await db.get(IPSpace, current.space_id)
+            if space is None:
+                break
+            zone_id = uuid.UUID(space.dns_zone_id) if space.dns_zone_id else None
+            return (list(space.dns_group_ids or []), zone_id)
+    return ([], None)
+
+
 async def _effective_forward_zone_id(db: AsyncSession, subnet: Subnet) -> uuid.UUID | None:
-    """Walk subnet → block ancestors → space, return the first explicit
-    forward zone. Mirrors ``_resolve_effective_zone`` in the IPAM router."""
-    if not subnet.dns_inherit_settings and subnet.dns_zone_id:
-        return uuid.UUID(subnet.dns_zone_id)
-    block_id = subnet.block_id
-    while block_id:
-        block = await db.get(IPBlock, block_id)
-        if block is None:
-            break
-        if not block.dns_inherit_settings and block.dns_zone_id:
-            return uuid.UUID(block.dns_zone_id)
-        block_id = block.parent_block_id
-    return None
+    """Return the effective forward DNS zone UUID for a subnet."""
+    _, zone_id = await _effective_dns(db, subnet)
+    return zone_id
 
 
 async def _effective_reverse_zone(db: AsyncSession, subnet: Subnet) -> DNSZone | None:
     """Find the reverse zone for this subnet — first by ``linked_subnet_id``,
-    then by longest-suffix match against the subnet's DNS group(s)."""
+    then by longest-suffix match against the subnet's *effective* DNS group(s).
+    """
     res = await db.execute(
         select(DNSZone).where(
             DNSZone.linked_subnet_id == subnet.id,
@@ -118,7 +139,7 @@ async def _effective_reverse_zone(db: AsyncSession, subnet: Subnet) -> DNSZone |
     if z:
         return z
 
-    group_ids = subnet.dns_group_ids or []
+    group_ids, _ = await _effective_dns(db, subnet)
     if not group_ids:
         return None
 

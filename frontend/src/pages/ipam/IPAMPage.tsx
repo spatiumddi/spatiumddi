@@ -1635,6 +1635,15 @@ const IP_STATUS_OPTIONS = [
   "deprecated",
 ] as const;
 
+// IP allocate/edit/delete cascades into DNS via ``_sync_dns_record``
+// (auto A + PTR) and can land a DHCP static when ``status='static_dhcp'``.
+// Every mutation that invalidates ``["addresses", ...]`` below also
+// invalidates ``["dns-records"]`` / ``["dns-group-records"]`` /
+// ``["dns-zones"]`` so a PTR created from IPAM appears in the Windows
+// reverse zone's record list immediately instead of after a full page
+// reload. Partial keys match hierarchically in react-query, so the
+// unkeyed variants catch every per-zone and per-group query in one pass.
+
 function AddAddressModal({
   subnetId,
   onClose,
@@ -1763,6 +1772,9 @@ function AddAddressModal({
     },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["addresses", subnetId] });
+      qc.invalidateQueries({ queryKey: ["dns-records"] });
+      qc.invalidateQueries({ queryKey: ["dns-group-records"] });
+      qc.invalidateQueries({ queryKey: ["dns-zones"] });
       qc.invalidateQueries({ queryKey: ["subnet-aliases", subnetId] });
       qc.invalidateQueries({ queryKey: ["subnets"] });
       onClose();
@@ -2286,6 +2298,9 @@ function SubnetDetail({
     onSuccess: () => {
       setConfirmDeleteAddr(null);
       qc.invalidateQueries({ queryKey: ["addresses", subnet.id] });
+      qc.invalidateQueries({ queryKey: ["dns-records"] });
+      qc.invalidateQueries({ queryKey: ["dns-group-records"] });
+      qc.invalidateQueries({ queryKey: ["dns-zones"] });
       qc.invalidateQueries({ queryKey: ["subnets"] });
     },
   });
@@ -2293,8 +2308,16 @@ function SubnetDetail({
   const purgeAddr = useMutation({
     mutationFn: (id: string) => ipamApi.deleteAddress(id, true), // permanent
     onSuccess: () => {
+      // Purge can be triggered from either modal: the orphan-row trash
+      // icon (``confirmPurgeAddr``) or the allocated-row delete-modal's
+      // "Delete Permanently" button (``confirmDeleteAddr``). Clear both
+      // so whichever one is open closes cleanly.
       setConfirmPurgeAddr(null);
+      setConfirmDeleteAddr(null);
       qc.invalidateQueries({ queryKey: ["addresses", subnet.id] });
+      qc.invalidateQueries({ queryKey: ["dns-records"] });
+      qc.invalidateQueries({ queryKey: ["dns-group-records"] });
+      qc.invalidateQueries({ queryKey: ["dns-zones"] });
       qc.invalidateQueries({ queryKey: ["subnets"] });
     },
   });
@@ -2304,6 +2327,9 @@ function SubnetDetail({
       ipamApi.updateAddress(id, { status: "allocated" }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["addresses", subnet.id] });
+      qc.invalidateQueries({ queryKey: ["dns-records"] });
+      qc.invalidateQueries({ queryKey: ["dns-group-records"] });
+      qc.invalidateQueries({ queryKey: ["dns-zones"] });
       qc.invalidateQueries({ queryKey: ["subnets"] });
     },
   });
@@ -3176,13 +3202,13 @@ function SubnetDetail({
         />
       )}
       {confirmDeleteAddr && (
-        <ConfirmDeleteModal
-          title="Delete IP Address"
-          message={`Mark ${confirmDeleteAddr.address} as orphaned? The record will be kept and can be restored or permanently deleted later.`}
-          confirmLabel="Mark as Orphan"
-          onConfirm={() => deleteAddr.mutate(confirmDeleteAddr.id)}
+        <DeleteOrOrphanModal
+          address={confirmDeleteAddr}
+          onOrphan={() => deleteAddr.mutate(confirmDeleteAddr.id)}
+          onPurge={() => purgeAddr.mutate(confirmDeleteAddr.id)}
           onClose={() => setConfirmDeleteAddr(null)}
-          isPending={deleteAddr.isPending}
+          isOrphanPending={deleteAddr.isPending}
+          isPurgePending={purgeAddr.isPending}
         />
       )}
       {confirmPurgeAddr && (
@@ -3309,11 +3335,20 @@ function DnsSyncModal({
     },
     onSuccess: (res) => {
       setResult(res);
-      qc.invalidateQueries({
-        queryKey: ["dns-sync-preview", scope.kind, scope.id],
-      });
       qc.invalidateQueries({ queryKey: ["addresses"] });
       qc.invalidateQueries({ queryKey: ["dns-records"] });
+      qc.invalidateQueries({ queryKey: ["dns-group-records"] });
+      qc.invalidateQueries({ queryKey: ["dns-zones"] });
+      qc.invalidateQueries({ queryKey: ["dns-records"] });
+      // Invalidate alone only marks stale — the modal's useQuery doesn't
+      // pick that up while the component stays mounted. Force a refetch
+      // so the missing/mismatched/stale lists reflect the new DB state.
+      // Also clear the selections since the old keys (ip_id / record_id)
+      // no longer match rows in the refreshed preview.
+      setSelMissing(new Set());
+      setSelMismatched(new Set());
+      setSelStale(new Set());
+      refetch();
     },
   });
 
@@ -3604,6 +3639,9 @@ function OrphansModal({
     mutationFn: () => ipamApi.purgeOrphans(subnetId, Array.from(selected)),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["addresses", subnetId] });
+      qc.invalidateQueries({ queryKey: ["dns-records"] });
+      qc.invalidateQueries({ queryKey: ["dns-group-records"] });
+      qc.invalidateQueries({ queryKey: ["dns-zones"] });
       qc.invalidateQueries({ queryKey: ["subnets"] });
       onClose();
     },
@@ -3940,6 +3978,9 @@ function EditSubnetModal({
       qc.invalidateQueries({ queryKey: ["subnets", subnet.space_id] });
       // Invalidate addresses so network/broadcast changes are reflected immediately
       qc.invalidateQueries({ queryKey: ["addresses", subnet.id] });
+      qc.invalidateQueries({ queryKey: ["dns-records"] });
+      qc.invalidateQueries({ queryKey: ["dns-group-records"] });
+      qc.invalidateQueries({ queryKey: ["dns-zones"] });
       // Refresh "Subnets using this VLAN" lists on the VLANs page
       qc.invalidateQueries({ queryKey: ["subnets-by-vlan"] });
       onClose(updated);
@@ -4230,6 +4271,9 @@ function EditAddressModal({
       setNewAliasName("");
       qc.invalidateQueries({ queryKey: ["ip-aliases", address.id] });
       qc.invalidateQueries({ queryKey: ["addresses", address.subnet_id] });
+      qc.invalidateQueries({ queryKey: ["dns-records"] });
+      qc.invalidateQueries({ queryKey: ["dns-group-records"] });
+      qc.invalidateQueries({ queryKey: ["dns-zones"] });
       qc.invalidateQueries({ queryKey: ["subnet-aliases", address.subnet_id] });
     },
     onError: (e: unknown) => {
@@ -4303,6 +4347,9 @@ function EditAddressModal({
       }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["addresses", address.subnet_id] });
+      qc.invalidateQueries({ queryKey: ["dns-records"] });
+      qc.invalidateQueries({ queryKey: ["dns-group-records"] });
+      qc.invalidateQueries({ queryKey: ["dns-zones"] });
       onClose();
     },
     onError: (err: unknown) => {
@@ -4517,6 +4564,9 @@ function AliasesSubnetPanel({ subnetId }: { subnetId: string }) {
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["subnet-aliases", subnetId] });
       qc.invalidateQueries({ queryKey: ["addresses", subnetId] });
+      qc.invalidateQueries({ queryKey: ["dns-records"] });
+      qc.invalidateQueries({ queryKey: ["dns-group-records"] });
+      qc.invalidateQueries({ queryKey: ["dns-zones"] });
       setConfirmDel(null);
     },
   });
@@ -4750,6 +4800,9 @@ function BulkEditAddressesModal({
     },
     onSuccess: (res) => {
       qc.invalidateQueries({ queryKey: ["addresses", subnetId] });
+      qc.invalidateQueries({ queryKey: ["dns-records"] });
+      qc.invalidateQueries({ queryKey: ["dns-group-records"] });
+      qc.invalidateQueries({ queryKey: ["dns-zones"] });
       qc.invalidateQueries({ queryKey: ["subnet-aliases", subnetId] });
       if (res.skipped.length > 0) {
         setError(
@@ -5127,6 +5180,9 @@ function BulkDeleteAddressesModal({
     mutationFn: () => ipamApi.bulkDeleteAddresses({ ip_ids: ipIds, permanent }),
     onSuccess: (res) => {
       qc.invalidateQueries({ queryKey: ["addresses", subnetId] });
+      qc.invalidateQueries({ queryKey: ["dns-records"] });
+      qc.invalidateQueries({ queryKey: ["dns-group-records"] });
+      qc.invalidateQueries({ queryKey: ["dns-zones"] });
       qc.invalidateQueries({ queryKey: ["subnet-aliases", subnetId] });
       if (res.skipped.length > 0) {
         setError(
@@ -5325,6 +5381,80 @@ function ConfirmDeleteModal({
             className="rounded-md bg-destructive px-3 py-1.5 text-sm text-destructive-foreground hover:bg-destructive/90 disabled:opacity-50"
           >
             {isPending ? "…" : confirmLabel}
+          </button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+/** Delete-an-allocated-IP flow: two choices in one modal — mark as orphan
+ * (amber, reversible; DNS / DHCP cascades still happen but the IPAM row
+ * stays so the address can be restored) or permanently delete (red, irreversible).
+ * The two colors distinguish the tradeoff at a glance. */
+function DeleteOrOrphanModal({
+  address,
+  onOrphan,
+  onPurge,
+  onClose,
+  isOrphanPending,
+  isPurgePending,
+}: {
+  address: IPAddress;
+  onOrphan: () => void;
+  onPurge: () => void;
+  onClose: () => void;
+  isOrphanPending?: boolean;
+  isPurgePending?: boolean;
+}) {
+  return (
+    <Modal title="Delete IP Address" onClose={onClose}>
+      <div className="space-y-4">
+        <p className="text-sm text-muted-foreground">
+          What should happen to{" "}
+          <span className="font-mono font-medium">{address.address}</span>?
+        </p>
+        <div className="rounded-md border border-amber-500/40 bg-amber-500/5 p-3">
+          <div className="text-xs font-medium text-amber-700 dark:text-amber-400">
+            Mark as Orphan (reversible)
+          </div>
+          <p className="mt-1 text-xs text-muted-foreground">
+            The row is kept but marked <code>orphan</code>, greyed out in the
+            list, and excluded from next-free allocation. DNS and DHCP
+            cascades still run. You can restore or permanently delete it
+            later from the orphans view.
+          </p>
+        </div>
+        <div className="rounded-md border border-destructive/40 bg-destructive/5 p-3">
+          <div className="text-xs font-medium text-destructive">
+            Delete Permanently (irreversible)
+          </div>
+          <p className="mt-1 text-xs text-muted-foreground">
+            The IPAM row is removed immediately. DNS records and DHCP static
+            assignments tied to this IP are also cascaded. There's no undo
+            — skip the orphan state entirely.
+          </p>
+        </div>
+        <div className="flex flex-wrap justify-end gap-2">
+          <button
+            onClick={onClose}
+            className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
+          >
+            Cancel
+          </button>
+          <button
+            onClick={onPurge}
+            disabled={isOrphanPending || isPurgePending}
+            className="rounded-md bg-destructive px-3 py-1.5 text-sm font-medium text-destructive-foreground hover:bg-destructive/90 disabled:opacity-50"
+          >
+            {isPurgePending ? "…" : "Delete Permanently"}
+          </button>
+          <button
+            onClick={onOrphan}
+            disabled={isOrphanPending || isPurgePending}
+            className="rounded-md bg-amber-500 px-3 py-1.5 text-sm font-medium text-white hover:bg-amber-600 disabled:opacity-50 dark:bg-amber-600 dark:hover:bg-amber-700"
+          >
+            {isOrphanPending ? "…" : "Mark as Orphan"}
           </button>
         </div>
       </div>

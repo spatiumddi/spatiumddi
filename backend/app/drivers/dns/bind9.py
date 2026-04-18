@@ -245,6 +245,28 @@ class BIND9Driver(DNSDriver):
     async def reload_zone(self, server: Any, zone_name: str) -> None:
         logger.info("bind9.reload_zone", server=str(getattr(server, "id", "")), zone=zone_name)
 
+    async def pull_zone_records(self, server: Any, zone_name: str) -> list[RecordData]:
+        """AXFR the zone from the BIND9 host.
+
+        The server must have ``allow-transfer`` permitting the SpatiumDDI
+        control plane — configured via the zone's ACL or a global
+        ``allow-transfer`` in ``named.conf`` options. If transfers are
+        denied the AXFR raises and the caller surfaces the error.
+        """
+        from app.drivers.dns._axfr import axfr_zone_records  # noqa: PLC0415
+
+        host = getattr(server, "host", None)
+        if not host:
+            raise RuntimeError("BIND9Driver.pull_zone_records: server.host is required")
+        port = getattr(server, "port", None) or 53
+        return await axfr_zone_records(
+            host=host,
+            port=port,
+            zone_name=zone_name,
+            log_driver="bind9",
+            server_id=str(getattr(server, "id", "")),
+        )
+
     # ── Validation / capabilities ─────────────────────────────────────────
 
     def validate_config(self, bundle: ConfigBundle) -> tuple[bool, list[str]]:

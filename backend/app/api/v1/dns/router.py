@@ -1,9 +1,12 @@
 """DNS API: server groups, servers, server options, views, ACLs, zones, records."""
 
+from __future__ import annotations
+
 import io
 import uuid
 import zipfile
 from datetime import UTC, datetime
+from typing import Any
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -13,8 +16,11 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import selectinload
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
+from app.core.crypto import decrypt_dict, encrypt_dict
 from app.core.permissions import require_any_resource_permission
 from app.drivers.dns import _DRIVERS as _DNS_DRIVERS
+from app.drivers.dns import is_agentless
+from app.drivers.dns.windows import test_winrm_credentials
 from app.models.audit import AuditLog
 from app.models.dns import (
     DNSAcl,
@@ -123,6 +129,29 @@ class ServerGroupResponse(BaseModel):
 # ── Server schemas ──────────────────────────────────────────────────────────
 
 
+class WindowsCredentialsInput(BaseModel):
+    """Windows DNS admin credentials (for driver='windows_dns' Path B).
+
+    Stored Fernet-encrypted on ``DNSServer.credentials_encrypted``.
+    Server never returns the password back — responses only expose
+    ``has_credentials``.
+
+    Mirrors the DHCP-side shape. All fields are optional to support
+    **partial updates**: sending ``{"transport": "kerberos"}`` on an
+    existing server decrypts the stored blob, merges the transport
+    change, and re-encrypts. On first-time set, ``username`` + ``password``
+    are still required — the endpoint validates that explicitly.
+    """
+
+    username: str | None = None
+    password: str | None = None
+    winrm_port: int | None = None
+    # transport: ntlm | kerberos | basic | credssp
+    transport: str | None = None
+    use_tls: bool | None = None
+    verify_tls: bool | None = None
+
+
 class ServerCreate(BaseModel):
     name: str
     driver: str = "bind9"
@@ -133,6 +162,11 @@ class ServerCreate(BaseModel):
     roles: list[str] = []
     notes: str = ""
     is_enabled: bool = True
+    # Only meaningful when driver='windows_dns' (Path B). Ignored
+    # otherwise. Leaving this null on windows_dns is fine — the server
+    # falls back to Path A (RFC 2136 record CRUD only, no zone topology
+    # management).
+    windows_credentials: WindowsCredentialsInput | None = None
 
     @field_validator("driver")
     @classmethod
@@ -153,6 +187,12 @@ class ServerUpdate(BaseModel):
     status: str | None = None
     notes: str | None = None
     is_enabled: bool | None = None
+    # Same contract as the DHCP side:
+    #   * None → leave stored creds alone
+    #   * {}   → clear stored creds (revert to Path A only)
+    #   * dict → partial patch if server already has creds (decrypt-merge-
+    #            reencrypt), full username+password if it doesn't
+    windows_credentials: WindowsCredentialsInput | dict[str, Any] | None = None
 
     @field_validator("driver")
     @classmethod
@@ -176,10 +216,62 @@ class ServerResponse(BaseModel):
     last_sync_at: datetime | None
     last_health_check_at: datetime | None
     notes: str
+    # Surface capability flags so the UI can conditionally render the
+    # Windows-specific affordances (credential form, Test Connection
+    # button, Sync Zones from Server action) without hardcoding driver
+    # names client-side.
+    has_credentials: bool
+    is_agentless: bool
     created_at: datetime
     modified_at: datetime
 
     model_config = {"from_attributes": True}
+
+    @classmethod
+    def from_model(cls, s: DNSServer) -> ServerResponse:
+        return cls(
+            id=s.id,
+            group_id=s.group_id,
+            name=s.name,
+            driver=s.driver,
+            host=s.host,
+            port=s.port,
+            api_port=s.api_port,
+            roles=list(s.roles or []),
+            status=s.status,
+            is_enabled=s.is_enabled,
+            last_sync_at=s.last_sync_at,
+            last_health_check_at=s.last_health_check_at,
+            notes=s.notes,
+            has_credentials=bool(s.credentials_encrypted),
+            is_agentless=is_agentless(s.driver),
+            created_at=s.created_at,
+            modified_at=s.modified_at,
+        )
+
+
+class TestWindowsCredentialsRequest(BaseModel):
+    """Pre-save dry-run: test a host + creds without writing them to the DB.
+
+    For editing an existing server, omit ``credentials`` and pass the
+    ``server_id`` — the endpoint decrypts the stored credentials and runs
+    the same probe. If both are omitted, the request is rejected.
+    """
+
+    host: str
+    credentials: WindowsCredentialsInput | None = None
+    server_id: uuid.UUID | None = None
+
+
+class TestResult(BaseModel):
+    ok: bool
+    message: str
+
+
+class PullZonesResult(BaseModel):
+    """Neutral shape for ``WindowsDNSDriver.pull_zones_from_server`` output."""
+
+    zones: list[dict[str, Any]]
 
 
 # ── Server options schemas ──────────────────────────────────────────────────
@@ -652,12 +744,12 @@ async def delete_group(group_id: uuid.UUID, db: DB, current_user: SuperAdmin) ->
 
 
 @router.get("/groups/{group_id}/servers", response_model=list[ServerResponse])
-async def list_servers(group_id: uuid.UUID, db: DB, _: CurrentUser) -> list[DNSServer]:
+async def list_servers(group_id: uuid.UUID, db: DB, _: CurrentUser) -> list[ServerResponse]:
     await _require_group(group_id, db)
     result = await db.execute(
         select(DNSServer).where(DNSServer.group_id == group_id).order_by(DNSServer.name)
     )
-    return list(result.scalars().all())
+    return [ServerResponse.from_model(s) for s in result.scalars().all()]
 
 
 @router.post(
@@ -665,7 +757,7 @@ async def list_servers(group_id: uuid.UUID, db: DB, _: CurrentUser) -> list[DNSS
 )
 async def create_server(
     group_id: uuid.UUID, body: ServerCreate, db: DB, current_user: SuperAdmin
-) -> DNSServer:
+) -> ServerResponse:
     await _require_group(group_id, db)
     existing = await db.execute(
         select(DNSServer).where(DNSServer.group_id == group_id, DNSServer.name == body.name)
@@ -675,7 +767,7 @@ async def create_server(
             status_code=409, detail="A server with that name already exists in this group"
         )
 
-    data = body.model_dump(exclude={"api_key"})
+    data = body.model_dump(exclude={"api_key", "windows_credentials"})
     data["group_id"] = group_id
     if body.api_key:
         # TODO: encrypt before storing
@@ -692,6 +784,22 @@ async def create_server(
         data["is_primary"] = True
 
     server = DNSServer(**data)
+
+    # Windows-only optional credential block. Driver-check + both-fields
+    # required on first set — mirror DHCP.
+    if body.driver == "windows_dns" and body.windows_credentials is not None:
+        creds = body.windows_credentials.model_dump(exclude_none=True)
+        if not creds.get("username") or not creds.get("password"):
+            raise HTTPException(
+                status_code=400,
+                detail="windows_dns create with credentials requires both username and password",
+            )
+        creds.setdefault("winrm_port", 5985)
+        creds.setdefault("transport", "ntlm")
+        creds.setdefault("use_tls", False)
+        creds.setdefault("verify_tls", False)
+        server.credentials_encrypted = encrypt_dict(creds)
+
     db.add(server)
     db.add(
         AuditLog(
@@ -707,15 +815,15 @@ async def create_server(
     )
     await db.commit()
     await db.refresh(server)
-    return server
+    return ServerResponse.from_model(server)
 
 
 @router.put("/groups/{group_id}/servers/{server_id}", response_model=ServerResponse)
 async def update_server(
     group_id: uuid.UUID, server_id: uuid.UUID, body: ServerUpdate, db: DB, current_user: SuperAdmin
-) -> DNSServer:
+) -> ServerResponse:
     server = await _require_server(group_id, server_id, db)
-    changes = body.model_dump(exclude_none=True, exclude={"api_key"})
+    changes = body.model_dump(exclude_none=True, exclude={"api_key", "windows_credentials"})
     if body.api_key is not None:
         changes["api_key_encrypted"] = body.api_key  # TODO: encrypt
     # When the user flips is_enabled, reflect it in status immediately so
@@ -731,6 +839,38 @@ async def update_server(
             changes["status"] = "disabled"
     for k, v in changes.items():
         setattr(server, k, v)
+
+    # Credentials contract matches DHCP:
+    #   None → leave alone, {} → clear, partial dict → decrypt-merge-reencrypt
+    if body.windows_credentials is not None:
+        if isinstance(body.windows_credentials, WindowsCredentialsInput):
+            patch = body.windows_credentials.model_dump(exclude_none=True)
+            if not patch:
+                pass  # empty WindowsCredentialsInput — no-op
+            elif server.credentials_encrypted:
+                existing = decrypt_dict(server.credentials_encrypted)
+                existing.update(patch)
+                server.credentials_encrypted = encrypt_dict(existing)
+                changes["windows_credentials_updated"] = sorted(patch.keys())
+            else:
+                if not patch.get("username") or not patch.get("password"):
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            "First-time credentials require both username and "
+                            "password (other fields are optional)."
+                        ),
+                    )
+                patch.setdefault("winrm_port", 5985)
+                patch.setdefault("transport", "ntlm")
+                patch.setdefault("use_tls", False)
+                patch.setdefault("verify_tls", False)
+                server.credentials_encrypted = encrypt_dict(patch)
+                changes["windows_credentials_set"] = True
+        elif body.windows_credentials == {}:
+            server.credentials_encrypted = None
+            changes["windows_credentials_cleared"] = True
+
     db.add(
         AuditLog(
             user_id=current_user.id,
@@ -746,7 +886,7 @@ async def update_server(
     )
     await db.commit()
     await db.refresh(server)
-    return server
+    return ServerResponse.from_model(server)
 
 
 @router.delete("/groups/{group_id}/servers/{server_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -768,6 +908,549 @@ async def delete_server(
     )
     await db.delete(server)
     await db.commit()
+
+
+# ── Windows DNS (Path B) — WinRM helpers ────────────────────────────────────
+
+
+@router.post("/test-windows-credentials", response_model=TestResult)
+async def test_windows_credentials_endpoint(
+    body: TestWindowsCredentialsRequest, db: DB, _user: SuperAdmin
+) -> TestResult:
+    """Dry-run WinRM probe — reach the host, run ``Get-DnsServerSetting``.
+
+    Two modes (mirrors the DHCP-side endpoint):
+      * **Pre-save** (create/edit form) — pass plaintext ``credentials``
+        and the typed ``host``. Nothing is written to the DB.
+      * **Post-save** (existing server) — pass ``server_id`` only;
+        stored Fernet-encrypted credentials are decrypted and used.
+    """
+    if body.credentials is not None:
+        creds = body.credentials.model_dump(exclude_none=True)
+        if not creds.get("username") or not creds.get("password"):
+            # Partial patch (e.g. transport-only) → merge with stored
+            # credentials if a server_id was also sent, else reject as
+            # ambiguous. Same behaviour as the DHCP test endpoint.
+            if body.server_id is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Partial credentials require 'server_id' to merge with stored",
+                )
+            srv = await db.get(DNSServer, body.server_id)
+            if srv is None:
+                raise HTTPException(status_code=404, detail="Server not found")
+            if not srv.credentials_encrypted:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Server has no stored credentials to merge against",
+                )
+            existing = decrypt_dict(srv.credentials_encrypted)
+            existing.update(creds)
+            creds = existing
+        creds.setdefault("winrm_port", 5985)
+        creds.setdefault("transport", "ntlm")
+        creds.setdefault("use_tls", False)
+        creds.setdefault("verify_tls", False)
+        host = body.host
+    elif body.server_id is not None:
+        srv = await db.get(DNSServer, body.server_id)
+        if srv is None:
+            raise HTTPException(status_code=404, detail="Server not found")
+        if not srv.credentials_encrypted:
+            raise HTTPException(
+                status_code=400, detail="Server has no stored credentials to test"
+            )
+        creds = decrypt_dict(srv.credentials_encrypted)
+        host = body.host or srv.host
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide either 'credentials' (dry-run) or 'server_id' (stored)",
+        )
+
+    ok, msg = await test_winrm_credentials(host, creds)
+    return TestResult(ok=ok, message=msg)
+
+
+@router.post(
+    "/groups/{group_id}/servers/{server_id}/pull-zones-from-server",
+    response_model=PullZonesResult,
+)
+async def pull_zones_from_server(
+    group_id: uuid.UUID,
+    server_id: uuid.UUID,
+    db: DB,
+    current_user: SuperAdmin,
+) -> PullZonesResult:
+    """List the zones hosted on a Windows DNS server over WinRM.
+
+    Requires ``driver='windows_dns'`` and stored credentials on the
+    server row. Returns the raw zone topology as PowerShell reported it
+    — caller decides what to do next (show in UI, import, reconcile).
+    """
+    server = await _require_server(group_id, server_id, db)
+    if server.driver != "windows_dns":
+        raise HTTPException(
+            status_code=400,
+            detail=f"pull-zones is only supported on windows_dns (got {server.driver!r})",
+        )
+    if not server.credentials_encrypted:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "This server has no Windows credentials configured. "
+                "Add credentials on the server to enable WinRM zone topology reads."
+            ),
+        )
+
+    from app.drivers.dns.windows import WindowsDNSDriver  # noqa: PLC0415
+
+    driver = WindowsDNSDriver()
+    try:
+        zones = await driver.pull_zones_from_server(server)
+    except Exception as exc:  # noqa: BLE001 — surface PS / WinRM errors verbatim
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="dns.server.pull_zones",
+            resource_type="dns_server",
+            resource_id=str(server.id),
+            resource_display=server.name,
+            result="success",
+        )
+    )
+    await db.commit()
+    return PullZonesResult(zones=zones)
+
+
+class ZoneSyncItem(BaseModel):
+    """Per-zone result entry in ``SyncFromServerResponse``."""
+
+    zone: str
+    imported: int
+    pushed: int
+    server_records: int
+    push_errors: list[str]
+    error: str | None = None
+
+
+class SyncFromServerResponse(BaseModel):
+    zones_attempted: int
+    zones_succeeded: int
+    zones_failed: int
+    total_imported: int
+    total_pushed: int
+    total_push_errors: int
+    # Zones listed by the server over WinRM (windows_dns Path B only).
+    # Empty for BIND9 and Windows DNS without credentials — the caller can
+    # still act on the imported-records count.
+    zones_on_server: list[str]
+    # Zones present on the server but not tracked in SpatiumDDI. With
+    # ``import_new_zones=True`` (the default) these are auto-created in
+    # the DB before the AXFR loop runs, so records land in one pass.
+    new_zones_on_server: list[str]
+    zones_imported: list[str]
+    zones_skipped_system: list[str]
+    # Zones present in SpatiumDDI but not on the server, that we pushed
+    # over WinRM during this sync. Only populated for windows_dns+creds —
+    # closes the "I created a zone in SpatiumDDI before the write-through
+    # was wired up" drift loop on the first sync after the fact.
+    zones_pushed_to_server: list[str] = []
+    zones_push_to_server_errors: list[str] = []
+    items: list[ZoneSyncItem]
+
+
+class ServerSyncItem(BaseModel):
+    """Per-server result in ``GroupSyncWithServersResponse``."""
+
+    server_id: uuid.UUID
+    server_name: str
+    driver: str
+    error: str | None = None
+    result: SyncFromServerResponse | None = None
+
+
+class GroupSyncWithServersResponse(BaseModel):
+    servers_attempted: int
+    servers_succeeded: int
+    total_imported: int
+    total_pushed: int
+    total_push_errors: int
+    total_zones_imported: int
+    total_zones_pushed_to_server: int
+    items: list[ServerSyncItem]
+
+
+# Windows-internal zone names we never want to auto-import. ``TrustAnchors``
+# is the DNSSEC trust-anchor store; ``RootHints`` and ``Cache`` are also
+# Windows internal. Anything without a dot in the name is suspicious too
+# — a real DNS zone always has at least one label separator.
+_WINDOWS_SYSTEM_ZONE_NAMES: frozenset[str] = frozenset(
+    {"TrustAnchors", "RootHints", "Cache", ".", ""}
+)
+
+
+def _is_system_zone_name(name: str) -> bool:
+    bare = (name or "").rstrip(".")
+    if bare in _WINDOWS_SYSTEM_ZONE_NAMES:
+        return True
+    # No-dot "zones" like ``TrustAnchors`` were caught above; this guards
+    # future weirdness without blocking single-label experimental setups
+    # that operators intentionally added to their DB.
+    return "." not in bare
+
+
+def _infer_zone_kind(name: str, is_reverse: bool | None) -> str:
+    bare = (name or "").rstrip(".").lower()
+    if is_reverse:
+        return "reverse"
+    if bare.endswith(".in-addr.arpa") or bare.endswith(".ip6.arpa"):
+        return "reverse"
+    return "forward"
+
+
+async def _sync_single_server(
+    db: DB,
+    server: DNSServer,
+    current_user: CurrentUser,
+    *,
+    import_new_zones: bool = True,
+    commit: bool = True,
+) -> SyncFromServerResponse:
+    """Bi-directional additive sync against a single server.
+
+    Shared core used by both the per-server and group-level endpoints.
+    ``commit=False`` lets the group-level caller batch many servers into
+    one DB transaction; ``commit=True`` mirrors the classic one-shot
+    per-server flow.
+
+    Ordering is load-bearing:
+      1. List zones on the server over WinRM (windows_dns Path B only).
+      2. Import new zones server→DB if any are missing from our DB.
+      3. **Push missing zones DB→server** for windows_dns+creds. Without
+         this step, records queued in SpatiumDDI against a zone the
+         Windows server has never heard of fail with "zone not found"
+         on the first record-push — exactly the joe.com drift we hit.
+      4. Run the existing bi-directional per-zone sync for records.
+    """
+    from app.drivers.dns.windows import WindowsDNSDriver  # noqa: PLC0415
+    from app.services.dns.pull_from_server import sync_zone_with_server  # noqa: PLC0415
+
+    group_id = server.group_id
+
+    # 1. Path B discovery.
+    zones_on_server: list[str] = []
+    zone_meta_by_name: dict[str, dict[str, Any]] = {}
+    if server.driver == "windows_dns" and server.credentials_encrypted:
+        try:
+            winrm_zones = await WindowsDNSDriver().pull_zones_from_server(server)
+            for z in winrm_zones:
+                name = str(z.get("name") or "").rstrip(".")
+                if not name:
+                    continue
+                zones_on_server.append(name)
+                zone_meta_by_name[name] = z
+        except Exception as exc:  # noqa: BLE001 — informational, keep going
+            logger.warning(
+                "dns.sync_from_server.pull_zones_winrm_failed",
+                server=str(server.id),
+                error=str(exc),
+            )
+
+    existing_res = await db.execute(
+        select(DNSZone.name).where(DNSZone.group_id == group_id)
+    )
+    existing_names = {str(n).rstrip(".") for n in existing_res.scalars().all()}
+    new_zones = sorted({n for n in zones_on_server if n not in existing_names})
+
+    # 2. Auto-import server→DB.
+    zones_imported: list[str] = []
+    zones_skipped_system: list[str] = []
+    if import_new_zones and new_zones:
+        for name in new_zones:
+            if _is_system_zone_name(name):
+                zones_skipped_system.append(name)
+                continue
+            meta = zone_meta_by_name.get(name, {})
+            is_reverse = bool(meta.get("is_reverse_lookup"))
+            kind = _infer_zone_kind(name, is_reverse)
+            zone = DNSZone(
+                group_id=group_id,
+                name=name if name.endswith(".") else name + ".",
+                zone_type="primary",
+                kind=kind,
+                ttl=3600,
+                refresh=86400,
+                retry=7200,
+                expire=3600000,
+                minimum=3600,
+                primary_ns="",
+                admin_email="",
+                dnssec_enabled=False,
+            )
+            db.add(zone)
+            zones_imported.append(name)
+            db.add(
+                AuditLog(
+                    user_id=current_user.id,
+                    user_display_name=current_user.display_name,
+                    auth_source=current_user.auth_source,
+                    action="dns.zone.auto_import_from_server",
+                    resource_type="dns_zone",
+                    resource_id=str(zone.id),
+                    resource_display=zone.name,
+                    result="success",
+                    new_value={
+                        "server_id": str(server.id),
+                        "kind": kind,
+                        "windows_zone_type": meta.get("zone_type"),
+                    },
+                )
+            )
+        if zones_imported:
+            await db.flush()
+
+    # 3. Push missing zones DB→server (windows_dns+creds only).
+    zones_pushed_to_server: list[str] = []
+    zones_push_to_server_errors: list[str] = []
+    if server.driver == "windows_dns" and server.credentials_encrypted:
+        server_zone_set = {n for n in zones_on_server}
+        driver = WindowsDNSDriver()
+        # Re-query zones after the import step so newly-imported rows
+        # are excluded from the "missing on server" set automatically.
+        db_zones_res = await db.execute(
+            select(DNSZone).where(DNSZone.group_id == group_id)
+        )
+        for zone in db_zones_res.scalars().all():
+            bare = zone.name.rstrip(".")
+            if bare in server_zone_set:
+                continue
+            try:
+                await driver.apply_zone_change(server, zone, "create")
+                zones_pushed_to_server.append(bare)
+                db.add(
+                    AuditLog(
+                        user_id=current_user.id,
+                        user_display_name=current_user.display_name,
+                        auth_source=current_user.auth_source,
+                        action="dns.zone.push_missing_to_server",
+                        resource_type="dns_zone",
+                        resource_id=str(zone.id),
+                        resource_display=zone.name,
+                        result="success",
+                        new_value={"server_id": str(server.id)},
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 — per-zone isolation
+                zones_push_to_server_errors.append(f"{bare}: {exc}")
+                logger.warning(
+                    "dns.sync_from_server.zone_push_failed",
+                    server=str(server.id),
+                    zone=zone.name,
+                    error=str(exc),
+                )
+
+    # 4. Per-zone record sync.
+    zones_res = await db.execute(
+        select(DNSZone).where(DNSZone.group_id == group_id).order_by(DNSZone.name)
+    )
+    zones = list(zones_res.scalars().all())
+
+    items: list[ZoneSyncItem] = []
+    zones_succeeded = 0
+    total_imported = 0
+    total_pushed = 0
+    total_push_errors = 0
+
+    for zone in zones:
+        try:
+            result = await sync_zone_with_server(db, zone, apply=True)
+            zones_succeeded += 1
+            total_imported += result.pull.imported
+            total_pushed += result.push.pushed
+            total_push_errors += len(result.push.push_errors)
+            items.append(
+                ZoneSyncItem(
+                    zone=zone.name.rstrip("."),
+                    imported=result.pull.imported,
+                    pushed=result.push.pushed,
+                    server_records=result.pull.server_records,
+                    push_errors=result.push.push_errors,
+                )
+            )
+        except Exception as exc:  # noqa: BLE001 — per-zone isolation
+            items.append(
+                ZoneSyncItem(
+                    zone=zone.name.rstrip("."),
+                    imported=0,
+                    pushed=0,
+                    server_records=0,
+                    push_errors=[],
+                    error=str(exc),
+                )
+            )
+            logger.warning(
+                "dns.sync_from_server.zone_failed",
+                server=str(server.id),
+                zone=zone.name,
+                error=str(exc),
+            )
+
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="dns.server.sync_from_server",
+            resource_type="dns_server",
+            resource_id=str(server.id),
+            resource_display=server.name,
+            result="error"
+            if total_push_errors or zones_push_to_server_errors or any(i.error for i in items)
+            else "success",
+            new_value={
+                "zones_attempted": len(zones),
+                "zones_succeeded": zones_succeeded,
+                "zones_auto_imported": zones_imported,
+                "zones_skipped_system": zones_skipped_system,
+                "zones_pushed_to_server": zones_pushed_to_server,
+                "zones_push_to_server_errors": zones_push_to_server_errors,
+                "total_imported": total_imported,
+                "total_pushed": total_pushed,
+                "total_push_errors": total_push_errors,
+                "new_zones_on_server": new_zones,
+            },
+        )
+    )
+    if commit:
+        await db.commit()
+
+    return SyncFromServerResponse(
+        zones_attempted=len(zones),
+        zones_succeeded=zones_succeeded,
+        zones_failed=len(zones) - zones_succeeded,
+        total_imported=total_imported,
+        total_pushed=total_pushed,
+        total_push_errors=total_push_errors,
+        zones_on_server=sorted(set(zones_on_server)),
+        new_zones_on_server=new_zones,
+        zones_imported=zones_imported,
+        zones_skipped_system=zones_skipped_system,
+        zones_pushed_to_server=zones_pushed_to_server,
+        zones_push_to_server_errors=zones_push_to_server_errors,
+        items=items,
+    )
+
+
+@router.post(
+    "/groups/{group_id}/servers/{server_id}/sync-from-server",
+    response_model=SyncFromServerResponse,
+)
+async def sync_server_from_server(
+    group_id: uuid.UUID,
+    server_id: uuid.UUID,
+    db: DB,
+    current_user: SuperAdmin,
+    import_new_zones: bool = True,
+) -> SyncFromServerResponse:
+    """Bi-directional sync with a single server. See ``_sync_single_server``."""
+    server = await _require_server(group_id, server_id, db)
+    return await _sync_single_server(
+        db, server, current_user, import_new_zones=import_new_zones, commit=True
+    )
+
+
+@router.post(
+    "/groups/{group_id}/sync-with-servers",
+    response_model=GroupSyncWithServersResponse,
+)
+async def sync_group_with_servers(
+    group_id: uuid.UUID,
+    db: DB,
+    current_user: SuperAdmin,
+    import_new_zones: bool = True,
+) -> GroupSyncWithServersResponse:
+    """Bi-directional sync against every enabled server in a group.
+
+    One button, one round-trip per server. Per-server failure is isolated
+    — a bad DC doesn't abort the sync for the other DCs in the group —
+    and the response carries a per-server breakdown.
+
+    The same write-through contract applies: windows_dns+creds servers
+    get their missing zones auto-pushed from SpatiumDDI, so zones
+    created here before credentials landed still converge on this click.
+    """
+    await _require_group(group_id, db)
+    servers_res = await db.execute(
+        select(DNSServer)
+        .where(DNSServer.group_id == group_id, DNSServer.is_enabled.is_(True))
+        .order_by(DNSServer.name)
+    )
+    servers = list(servers_res.scalars().all())
+
+    items: list[ServerSyncItem] = []
+    servers_succeeded = 0
+    total_imported = 0
+    total_pushed = 0
+    total_push_errors = 0
+    total_zones_imported = 0
+    total_zones_pushed_to_server = 0
+
+    for server in servers:
+        try:
+            result = await _sync_single_server(
+                db,
+                server,
+                current_user,
+                import_new_zones=import_new_zones,
+                commit=False,
+            )
+            items.append(
+                ServerSyncItem(
+                    server_id=server.id,
+                    server_name=server.name,
+                    driver=server.driver,
+                    result=result,
+                )
+            )
+            servers_succeeded += 1
+            total_imported += result.total_imported
+            total_pushed += result.total_pushed
+            total_push_errors += result.total_push_errors
+            total_zones_imported += len(result.zones_imported)
+            total_zones_pushed_to_server += len(result.zones_pushed_to_server)
+        except Exception as exc:  # noqa: BLE001 — per-server isolation
+            items.append(
+                ServerSyncItem(
+                    server_id=server.id,
+                    server_name=server.name,
+                    driver=server.driver,
+                    error=str(exc),
+                )
+            )
+            logger.warning(
+                "dns.group.sync_with_servers.server_failed",
+                group=str(group_id),
+                server=str(server.id),
+                error=str(exc),
+            )
+
+    await db.commit()
+
+    return GroupSyncWithServersResponse(
+        servers_attempted=len(servers),
+        servers_succeeded=servers_succeeded,
+        total_imported=total_imported,
+        total_pushed=total_pushed,
+        total_push_errors=total_push_errors,
+        total_zones_imported=total_zones_imported,
+        total_zones_pushed_to_server=total_zones_pushed_to_server,
+        items=items,
+    )
 
 
 # ── Incremental record push (per DNS_AGENT.md §3) ──────────────────────────
@@ -1204,6 +1887,14 @@ async def create_zone(
 
     zone = DNSZone(group_id=group_id, **body.model_dump())
     db.add(zone)
+
+    # Write-through: push the create to any windows_dns-with-creds server
+    # in this group *before* we commit. If the Windows push fails we don't
+    # want an orphan DB row claiming a zone the authoritative server has
+    # never heard of. BIND9 zones still get applied via the agent's next
+    # ConfigBundle poll — that's a separate path and untouched here.
+    await _push_zone_to_agentless_servers(db, zone, "create")
+
     db.add(
         AuditLog(
             user_id=current_user.id,
@@ -1294,6 +1985,9 @@ async def delete_zone(
     group_id: uuid.UUID, zone_id: uuid.UUID, db: DB, current_user: SuperAdmin
 ) -> None:
     zone = await _require_zone(group_id, zone_id, db)
+    # Same write-through contract as create: push the delete first, only
+    # drop the DB row if the Windows side agreed.
+    await _push_zone_to_agentless_servers(db, zone, "delete")
     db.add(
         AuditLog(
             user_id=current_user.id,
@@ -1308,6 +2002,57 @@ async def delete_zone(
     )
     await db.delete(zone)
     await db.commit()
+
+
+async def _push_zone_to_agentless_servers(db: DB, zone: DNSZone, op: str) -> None:
+    """Push ``create`` / ``delete`` to every agentless-with-creds server.
+
+    "Agentless" today means ``windows_dns``; "with creds" means Path B
+    (WinRM). Those are the only servers that have an admin channel the
+    control plane can use directly — agent-based drivers (bind9) get
+    zone changes through the ConfigBundle long-poll, not here.
+
+    Failure surfaces as a 502 so the caller's ``db.commit()`` never runs
+    — the DB row stays in an uncommitted state and the session rollback
+    cleans it up. Matches the DHCP write-through pattern.
+    """
+    from app.drivers.dns import get_driver, is_agentless  # noqa: PLC0415
+
+    servers_res = await db.execute(
+        select(DNSServer).where(
+            DNSServer.group_id == zone.group_id,
+            DNSServer.credentials_encrypted.isnot(None),
+        )
+    )
+    targets = [s for s in servers_res.scalars().all() if is_agentless(s.driver)]
+    if not targets:
+        return
+
+    errors: list[str] = []
+    for server in targets:
+        driver = get_driver(server.driver)
+        if not hasattr(driver, "apply_zone_change"):
+            continue
+        try:
+            await driver.apply_zone_change(server, zone, op)
+        except Exception as exc:  # noqa: BLE001 — surface error verbatim to user
+            errors.append(f"{server.name}: {exc}")
+            logger.warning(
+                "dns.zone.push_agentless_failed",
+                server=str(server.id),
+                zone=zone.name,
+                op=op,
+                error=str(exc),
+            )
+
+    if errors:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                f"Failed to {op} zone on Windows DNS: {'; '.join(errors)}. "
+                "Zone state in SpatiumDDI was not changed."
+            ),
+        )
 
 
 # ── Record endpoints ────────────────────────────────────────────────────────

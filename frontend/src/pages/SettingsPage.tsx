@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { settingsApi, authApi, type PlatformSettings } from "@/lib/api";
-import { Save, Search } from "lucide-react";
+import { ArrowRight, ArrowLeftRight, RotateCcw, Save, Search } from "lucide-react";
 import { cn } from "@/lib/utils";
 
 function Field({
@@ -78,6 +78,73 @@ interface SectionDef {
   keywords: string[];
 }
 
+// Which PlatformSettings keys each section owns — drives the per-section
+// "Reset to defaults" button so it only overwrites that section's fields.
+const SECTION_FIELDS: Record<SectionId, (keyof PlatformSettings)[]> = {
+  branding: ["app_title", "app_base_url"],
+  discovery: ["discovery_scan_enabled", "discovery_scan_interval_minutes"],
+  dns: [
+    "dns_default_ttl",
+    "dns_default_zone_type",
+    "dns_default_dnssec_validation",
+    "dns_recursive_by_default",
+  ],
+  "dns-auto-sync": [
+    "dns_auto_sync_enabled",
+    "dns_auto_sync_interval_minutes",
+    "dns_auto_sync_delete_stale",
+  ],
+  "dns-pull-from-server": [
+    "dns_pull_from_server_enabled",
+    "dns_pull_from_server_interval_minutes",
+  ],
+  dhcp: [
+    "dhcp_default_dns_servers",
+    "dhcp_default_domain_name",
+    "dhcp_default_domain_search",
+    "dhcp_default_ntp_servers",
+    "dhcp_default_lease_time",
+  ],
+  "dhcp-lease-sync": [
+    "dhcp_pull_leases_enabled",
+    "dhcp_pull_leases_interval_minutes",
+  ],
+  "ip-allocation": ["ip_allocation_strategy"],
+  session: ["session_timeout_minutes", "auto_logout_minutes"],
+  "subnet-tree": ["subnet_tree_default_expanded_depth"],
+  updates: ["github_release_check_enabled"],
+  utilization: [
+    "utilization_warn_threshold",
+    "utilization_critical_threshold",
+  ],
+};
+
+/** Three-tier horizontal flow with one arrow highlighted to indicate which
+ *  boundary this particular reconciliation job crosses. */
+function LayerDiagram({
+  highlight,
+}: {
+  highlight: "ipam-to-db" | "db-to-server";
+}) {
+  const pill =
+    "rounded-md border bg-background px-3 py-1.5 text-xs font-medium whitespace-nowrap";
+  const arrowIdle = "h-4 w-4 text-muted-foreground/50";
+  const arrowActive = "h-4 w-4 text-primary";
+  return (
+    <div className="flex items-center gap-2 rounded-md border border-dashed bg-muted/30 px-3 py-2 text-xs">
+      <span className={pill}>IPAM</span>
+      <ArrowRight
+        className={highlight === "ipam-to-db" ? arrowActive : arrowIdle}
+      />
+      <span className={pill}>SpatiumDDI DNS</span>
+      <ArrowLeftRight
+        className={highlight === "db-to-server" ? arrowActive : arrowIdle}
+      />
+      <span className={pill}>Windows / BIND9</span>
+    </div>
+  );
+}
+
 // Alphabetically sorted by `title`.
 const SECTIONS: SectionDef[] = [
   {
@@ -109,18 +176,28 @@ const SECTIONS: SectionDef[] = [
   },
   {
     id: "dns-auto-sync",
-    title: "DNS Auto-Sync",
+    title: "IPAM → DNS Reconciliation",
     description:
-      "Periodic background reconciliation of IPAM-managed DNS records.",
-    keywords: ["dns", "ipam", "sync", "reconcile", "drift", "auto", "job"],
+      "Catches drift between IPAM's expected records (hostname + IP) and SpatiumDDI's DNS DB. Fills in missing A/AAAA/PTR when the live sync missed one — e.g. bulk imports or a previously failed push.",
+    keywords: [
+      "dns",
+      "ipam",
+      "sync",
+      "reconcile",
+      "drift",
+      "auto",
+      "job",
+      "auto-sync",
+    ],
   },
   {
     id: "dns-pull-from-server",
-    title: "DNS Server Sync",
+    title: "Zone ↔ Server Reconciliation",
     description:
-      "Periodically reconcile each zone with its primary authoritative server (Windows DNS today). AXFR pulls in missing records; whatever's left in our DB gets pushed back to the server. Additive only — never deletes.",
+      "Catches drift between SpatiumDDI's DNS DB and the authoritative server's wire (Windows DNS today). AXFR imports out-of-band edits; any DB-only records get pushed back via RFC 2136. Additive only — never deletes.",
     keywords: [
       "dns",
+      "server",
       "sync",
       "pull",
       "push",
@@ -204,6 +281,12 @@ export function SettingsPage() {
     queryFn: settingsApi.get,
   });
 
+  const { data: defaults } = useQuery({
+    queryKey: ["settings-defaults"],
+    queryFn: settingsApi.getDefaults,
+    staleTime: Infinity,
+  });
+
   const [form, setForm] = useState<Partial<PlatformSettings>>({});
   const [saved, setSaved] = useState(false);
   const [activeId, setActiveId] = useState<SectionId>("branding");
@@ -234,6 +317,40 @@ export function SettingsPage() {
 
   function handleSave() {
     if (Object.keys(form).length > 0) mutation.mutate(form);
+  }
+
+  function handleReset() {
+    if (!defaults) return;
+    const keys = SECTION_FIELDS[activeId];
+    const patch: Partial<PlatformSettings> = {};
+    for (const k of keys) {
+      if (k in defaults) {
+        // Copy arrays so the form holds its own reference.
+        const v = defaults[k];
+        (patch as Record<string, unknown>)[k] = Array.isArray(v) ? [...v] : v;
+      }
+    }
+    setForm((prev) => ({ ...prev, ...patch }));
+    setSaved(false);
+  }
+
+  function sectionIsDefault(): boolean {
+    if (!defaults) return true;
+    for (const k of SECTION_FIELDS[activeId]) {
+      if (!(k in defaults)) continue;
+      const current = values[k];
+      const def = defaults[k];
+      if (Array.isArray(def) && Array.isArray(current)) {
+        if (
+          def.length !== current.length ||
+          def.some((v, i) => v !== current[i])
+        )
+          return false;
+      } else if (current !== def) {
+        return false;
+      }
+    }
+    return true;
   }
 
   if (isLoading) {
@@ -313,16 +430,34 @@ export function SettingsPage() {
               </p>
             </div>
             {isSuperadmin && (
-              <button
-                onClick={handleSave}
-                disabled={!dirty || mutation.isPending}
-                className="flex flex-shrink-0 items-center gap-2 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-40"
-              >
-                <Save className="h-4 w-4" />
-                {saved ? "Saved!" : mutation.isPending ? "Saving…" : "Save"}
-              </button>
+              <div className="flex flex-shrink-0 items-center gap-2">
+                <button
+                  onClick={handleReset}
+                  disabled={!defaults || sectionIsDefault()}
+                  title="Populate this section's fields with their default values — still requires Save to apply."
+                  className="flex items-center gap-1.5 rounded-md border px-3 py-2 text-xs font-medium hover:bg-accent disabled:opacity-40"
+                >
+                  <RotateCcw className="h-3.5 w-3.5" />
+                  Reset to defaults
+                </button>
+                <button
+                  onClick={handleSave}
+                  disabled={!dirty || mutation.isPending}
+                  className="flex items-center gap-2 rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-40"
+                >
+                  <Save className="h-4 w-4" />
+                  {saved ? "Saved!" : mutation.isPending ? "Saving…" : "Save"}
+                </button>
+              </div>
             )}
           </div>
+
+          {activeId === "dns-auto-sync" && (
+            <LayerDiagram highlight="ipam-to-db" />
+          )}
+          {activeId === "dns-pull-from-server" && (
+            <LayerDiagram highlight="db-to-server" />
+          )}
 
           {mutation.isError && (
             <div className="rounded-md border border-destructive/30 bg-destructive/10 px-4 py-2 text-sm text-destructive">
@@ -491,7 +626,7 @@ export function SettingsPage() {
                     <input
                       type="number"
                       min={1}
-                      value={values.dns_auto_sync_interval_minutes ?? 60}
+                      value={values.dns_auto_sync_interval_minutes ?? 5}
                       onChange={(e) =>
                         set(
                           "dns_auto_sync_interval_minutes",

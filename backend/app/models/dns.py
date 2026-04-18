@@ -10,6 +10,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    LargeBinary,
     String,
     Table,
     Text,
@@ -112,6 +113,15 @@ class DNSServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     last_config_etag: Mapped[str | None] = mapped_column(String(128), nullable=True)
     pending_approval: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     is_primary: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+    # Fernet-encrypted JSON blob for driver-specific admin credentials.
+    # windows_dns Path B stores a dict:
+    #   {"username", "password", "winrm_port", "transport", "use_tls",
+    #    "verify_tls"}
+    # Agent-based drivers (bind9) leave this NULL — they authenticate via
+    # the agent JWT. Path A (RFC 2136 record CRUD) also leaves this NULL
+    # and signs updates with the group-level TSIG key instead.
+    credentials_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
 
     group: Mapped["DNSServerGroup"] = relationship("DNSServerGroup", back_populates="servers")
 

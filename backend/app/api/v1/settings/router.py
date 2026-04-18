@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from typing import Any
 
 import structlog
 from fastapi import APIRouter, HTTPException, status
@@ -132,12 +133,44 @@ async def _get_or_create(db: DB) -> PlatformSettings:
     return settings
 
 
+_USER_SETTABLE_FIELDS = set(SettingsUpdate.model_fields.keys())
+
+
+def _column_defaults() -> dict[str, Any]:
+    """Introspect the model's `default=` kwargs so the UI has a single source
+    of truth for "reset to defaults" — the same values Postgres would insert
+    for a fresh row. Only user-settable fields (those present on
+    `SettingsUpdate`) are returned; server-managed columns like
+    `*_last_run_at` are omitted."""
+    out: dict[str, Any] = {}
+    for col in PlatformSettings.__table__.columns:
+        if col.name not in _USER_SETTABLE_FIELDS:
+            continue
+        d = col.default
+        if d is None:
+            continue
+        arg = d.arg
+        if callable(arg):
+            try:
+                out[col.name] = arg({})
+            except TypeError:
+                out[col.name] = arg()
+        else:
+            out[col.name] = arg
+    return out
+
+
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 
 
 @router.get("", response_model=SettingsResponse)
 async def get_settings(current_user: CurrentUser, db: DB) -> PlatformSettings:
     return await _get_or_create(db)
+
+
+@router.get("/defaults")
+async def get_settings_defaults(current_user: CurrentUser) -> dict[str, Any]:
+    return _column_defaults()
 
 
 @router.put("", response_model=SettingsResponse)

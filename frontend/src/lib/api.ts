@@ -946,6 +946,10 @@ export const settingsApi = {
   get: () => api.get<PlatformSettings>("/settings").then((r) => r.data),
   update: (data: Partial<PlatformSettings>) =>
     api.put<PlatformSettings>("/settings", data).then((r) => r.data),
+  getDefaults: () =>
+    api
+      .get<Partial<PlatformSettings>>("/settings/defaults")
+      .then((r) => r.data),
 };
 
 // ── Auth Providers ─────────────────────────────────────────────────────────────
@@ -1195,6 +1199,69 @@ export interface DNSServerGroup {
   modified_at: string;
 }
 
+export interface WindowsDNSCredentials {
+  username: string;
+  password: string;
+  winrm_port?: number;
+  transport?: "ntlm" | "kerberos" | "basic" | "credssp";
+  use_tls?: boolean;
+  verify_tls?: boolean;
+}
+
+export interface DNSZoneSyncItem {
+  zone: string;
+  imported: number;
+  pushed: number;
+  server_records: number;
+  push_errors: string[];
+  error: string | null;
+}
+
+export interface DNSServerSyncResult {
+  zones_attempted: number;
+  zones_succeeded: number;
+  zones_failed: number;
+  total_imported: number;
+  total_pushed: number;
+  total_push_errors: number;
+  /** Zones listed on the server via WinRM — windows_dns Path B only.
+   * Empty for BIND9 and windows_dns without credentials. */
+  zones_on_server: string[];
+  /** Subset of zones_on_server that aren't tracked in SpatiumDDI yet. */
+  new_zones_on_server: string[];
+  /** Zones that were auto-imported into SpatiumDDI during this sync
+   * (when the caller passed import_new_zones=true, the default). */
+  zones_imported: string[];
+  /** Zones on the server that were skipped because they look like a
+   * Windows system zone (TrustAnchors, single-label names, …). */
+  zones_skipped_system: string[];
+  /** Zones that existed in SpatiumDDI but not on the Windows server
+   * — pushed over WinRM during this sync. */
+  zones_pushed_to_server: string[];
+  /** Per-zone error strings when the DB→server zone push failed. */
+  zones_push_to_server_errors: string[];
+  items: DNSZoneSyncItem[];
+}
+
+export interface DNSPerServerSyncItem {
+  server_id: string;
+  server_name: string;
+  driver: string;
+  error: string | null;
+  result: DNSServerSyncResult | null;
+}
+
+export interface DNSGroupSyncResult {
+  servers_attempted: number;
+  servers_succeeded: number;
+  total_imported: number;
+  total_pushed: number;
+  total_push_errors: number;
+  total_zones_imported: number;
+  total_zones_pushed_to_server: number;
+  items: DNSPerServerSyncItem[];
+}
+
 export interface DNSServer {
   id: string;
   group_id: string;
@@ -1212,6 +1279,13 @@ export interface DNSServer {
   last_sync_at: string | null;
   last_health_check_at: string | null;
   notes: string;
+  /** True when stored Fernet-encrypted WinRM credentials exist. Used by
+   * the UI to show "Credentials set" / "Clear" and gate the Path B
+   * affordances without exposing the password. */
+  has_credentials: boolean;
+  /** True when the driver runs from the control plane (no agent). Used
+   * by the UI to hide approval / agent-registration affordances. */
+  is_agentless: boolean;
   created_at: string;
   modified_at: string;
 }
@@ -1366,7 +1440,10 @@ export const dnsApi = {
     api.get<DNSServer[]>(`/dns/groups/${groupId}/servers`).then((r) => r.data),
   createServer: (
     groupId: string,
-    data: Partial<DNSServer> & { api_key?: string },
+    data: Partial<DNSServer> & {
+      api_key?: string;
+      windows_credentials?: WindowsDNSCredentials | Record<string, never>;
+    },
   ) =>
     api
       .post<DNSServer>(`/dns/groups/${groupId}/servers`, data)
@@ -1374,13 +1451,49 @@ export const dnsApi = {
   updateServer: (
     groupId: string,
     serverId: string,
-    data: Partial<DNSServer> & { api_key?: string },
+    data: Partial<DNSServer> & {
+      api_key?: string;
+      windows_credentials?:
+        | Partial<WindowsDNSCredentials>
+        | Record<string, never>;
+    },
   ) =>
     api
       .put<DNSServer>(`/dns/groups/${groupId}/servers/${serverId}`, data)
       .then((r) => r.data),
   deleteServer: (groupId: string, serverId: string) =>
     api.delete(`/dns/groups/${groupId}/servers/${serverId}`),
+
+  testWindowsCredentials: (body: {
+    host: string;
+    credentials?: Partial<WindowsDNSCredentials>;
+    server_id?: string;
+  }) =>
+    api
+      .post<{ ok: boolean; message: string }>(
+        "/dns/test-windows-credentials",
+        body,
+      )
+      .then((r) => r.data),
+
+  pullZonesFromServer: (groupId: string, serverId: string) =>
+    api
+      .post<{ zones: Array<Record<string, unknown>> }>(
+        `/dns/groups/${groupId}/servers/${serverId}/pull-zones-from-server`,
+      )
+      .then((r) => r.data),
+
+  syncFromServer: (groupId: string, serverId: string) =>
+    api
+      .post<DNSServerSyncResult>(
+        `/dns/groups/${groupId}/servers/${serverId}/sync-from-server`,
+      )
+      .then((r) => r.data),
+
+  syncGroupWithServers: (groupId: string) =>
+    api
+      .post<DNSGroupSyncResult>(`/dns/groups/${groupId}/sync-with-servers`)
+      .then((r) => r.data),
 
   // Server options
   getOptions: (groupId: string) =>

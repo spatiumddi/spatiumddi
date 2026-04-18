@@ -43,6 +43,8 @@ import {
   type DNSBlockList,
   type DNSBlockListEntry,
   type DNSBlockListException,
+  type WindowsDNSCredentials,
+  type DNSGroupSyncResult,
 } from "@/lib/api";
 import { useTableSort, SortableTh } from "@/lib/useTableSort";
 import { cn } from "@/lib/utils";
@@ -650,6 +652,7 @@ function ServerModal({
   onClose: () => void;
 }) {
   const qc = useQueryClient();
+  const editing = !!server;
   const [name, setName] = useState(server?.name ?? "");
   const [driver, setDriver] = useState(server?.driver ?? "bind9");
   const [host, setHost] = useState(server?.host ?? "");
@@ -660,6 +663,52 @@ function ServerModal({
   const [apiKey, setApiKey] = useState("");
   const [isEnabled, setIsEnabled] = useState(server?.is_enabled ?? true);
   const [error, setError] = useState("");
+
+  // Windows credential state — same contract as the DHCP modal:
+  //   * On edit with creds: leave blank to keep, type to replace.
+  //   * Always send the creds block on windows_dns so transport / port /
+  //     TLS toggles reach the backend (backend merges with stored blob).
+  const [winUsername, setWinUsername] = useState("");
+  const [winPassword, setWinPassword] = useState("");
+  const [winPort, setWinPort] = useState("5985");
+  const [winTransport, setWinTransport] =
+    useState<WindowsDNSCredentials["transport"]>("ntlm");
+  const [winUseTLS, setWinUseTLS] = useState(false);
+  const [winVerifyTLS, setWinVerifyTLS] = useState(false);
+  const [winClearCreds, setWinClearCreds] = useState(false);
+  const [testResult, setTestResult] = useState<{
+    ok: boolean;
+    message: string;
+  } | null>(null);
+
+  const hasExistingCreds = !!server?.has_credentials;
+
+  const testMut = useMutation({
+    mutationFn: () => {
+      const useStored =
+        editing && hasExistingCreds && !winPassword && !winUsername;
+      if (useStored) {
+        return dnsApi.testWindowsCredentials({
+          host,
+          server_id: server!.id,
+        });
+      }
+      return dnsApi.testWindowsCredentials({
+        host,
+        credentials: {
+          username: winUsername,
+          password: winPassword,
+          winrm_port: parseInt(winPort, 10) || 5985,
+          transport: winTransport,
+          use_tls: winUseTLS,
+          verify_tls: winVerifyTLS,
+        },
+      });
+    },
+    onSuccess: setTestResult,
+    onError: (e: ApiError) =>
+      setTestResult({ ok: false, message: formatApiError(e, "Test failed") }),
+  });
 
   const mut = useMutation({
     mutationFn: (d: Record<string, unknown>) =>
@@ -680,7 +729,8 @@ function ServerModal({
       .split(/[,\s]+/)
       .map((r) => r.trim())
       .filter(Boolean);
-    mut.mutate({
+
+    const payload: Record<string, unknown> = {
       name,
       driver,
       host,
@@ -690,7 +740,42 @@ function ServerModal({
       notes,
       is_enabled: isEnabled,
       ...(apiKey ? { api_key: apiKey } : {}),
-    });
+    };
+
+    if (driver === "windows_dns") {
+      if (winClearCreds) {
+        payload.windows_credentials = {};
+      } else if (winUsername || winPassword || editing) {
+        // Path B is opt-in: only send a creds block if the user entered
+        // something, or if we're editing a server that may already have
+        // creds (lets them flip transport / port without re-typing).
+        const creds: Partial<WindowsDNSCredentials> = {
+          winrm_port: parseInt(winPort, 10) || 5985,
+          transport: winTransport,
+          use_tls: winUseTLS,
+          verify_tls: winVerifyTLS,
+        };
+        if (winUsername) creds.username = winUsername;
+        if (winPassword) creds.password = winPassword;
+        // First-time set requires both. Edit path is merge — backend
+        // checks "have stored creds" before accepting partials.
+        if (
+          !editing &&
+          (winUsername || winPassword) &&
+          (!winUsername || !winPassword)
+        ) {
+          setError(
+            "Windows DNS Path B requires both username and password to enable WinRM. Leave both blank for Path A only (RFC 2136).",
+          );
+          return;
+        }
+        if (winUsername || winPassword || (editing && hasExistingCreds)) {
+          payload.windows_credentials = creds;
+        }
+      }
+    }
+
+    mut.mutate(payload);
   }
 
   return (
@@ -718,18 +803,21 @@ function ServerModal({
             >
               <option value="bind9">BIND9 (agent-managed)</option>
               <option value="windows_dns">
-                Windows DNS (RFC 2136, agentless)
+                Windows DNS (agentless, RFC 2136 + optional WinRM)
               </option>
             </select>
           </Field>
         </div>
         {driver === "windows_dns" && (
           <div className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-800 dark:text-amber-300">
-            <strong>Windows DNS (agentless):</strong> record CRUD only, via RFC
-            2136. Zones must already exist in Windows DNS Manager and have
-            <em> Nonsecure and secure</em> dynamic updates enabled on each
-            target zone. No agent container is required — the control plane
-            sends updates directly to <code>host:53</code>.
+            <strong>Windows DNS:</strong>{" "}
+            <span className="font-medium">Path A</span> (always on): record
+            CRUD via RFC 2136 — zones must exist in Windows DNS Manager with
+            <em> Nonsecure and secure</em> dynamic updates enabled.{" "}
+            <span className="font-medium">Path B</span> (optional, configure
+            credentials below): adds WinRM-backed zone topology reads so you
+            can import existing zones into SpatiumDDI. No agent container
+            required either way.
           </div>
         )}
         <div className="grid grid-cols-2 gap-3">
@@ -805,6 +893,196 @@ function ServerModal({
             </span>
           </span>
         </label>
+
+        {driver === "windows_dns" && (
+          <div className="rounded-md border border-sky-500/40 bg-sky-500/5 p-3 space-y-3">
+            <div className="text-xs">
+              <div className="font-medium text-sky-600 dark:text-sky-400">
+                Path B — WinRM / PowerShell (optional)
+              </div>
+              <p className="mt-1 text-muted-foreground">
+                Fill the fields below to unlock zone-topology reads (import
+                existing Windows DNS zones into SpatiumDDI). Credentials are
+                stored Fernet-encrypted and never returned by the API. Leave
+                blank to stay on Path A only (record CRUD via RFC 2136).
+              </p>
+            </div>
+
+            <details className="rounded border bg-background/40 text-xs">
+              <summary className="cursor-pointer px-3 py-2 font-medium select-none">
+                Windows setup checklist — click to expand
+              </summary>
+              <div className="space-y-3 border-t px-3 py-2.5 text-muted-foreground">
+                <div>
+                  <div className="font-medium text-foreground">
+                    1. Enable WinRM on the DNS server
+                  </div>
+                  <pre className="mt-1 rounded bg-muted p-2 font-mono text-[11px] whitespace-pre-wrap">
+                    Enable-PSRemoting -Force
+                  </pre>
+                </div>
+                <div>
+                  <div className="font-medium text-foreground">
+                    2. Grant the service account access
+                  </div>
+                  <p>
+                    Add the account to{" "}
+                    <code className="font-mono">Remote Management Users</code>{" "}
+                    (transport) and to{" "}
+                    <code className="font-mono">DnsAdmins</code> for zone CRUD
+                    (read-only needs only the first). DCs have the same domain
+                    group quirks as Windows DHCP — see the DHCP server checklist
+                    if you hit <code>0x80080005</code>.
+                  </p>
+                </div>
+                <div>
+                  <div className="font-medium text-foreground">
+                    3. Verify from another host
+                  </div>
+                  <pre className="mt-1 rounded bg-muted p-2 font-mono text-[11px] whitespace-pre-wrap">
+                    {
+                      "Invoke-Command <host> { Get-DnsServerZone } -Credential (Get-Credential)"
+                    }
+                  </pre>
+                </div>
+              </div>
+            </details>
+
+            {hasExistingCreds && !winClearCreds && (
+              <div className="flex items-center justify-between rounded border bg-background/50 px-3 py-2 text-xs">
+                <span>
+                  <span className="font-medium">Credentials set.</span> Leave
+                  fields blank to keep them, or enter new values to replace.
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setWinClearCreds(true)}
+                  className="rounded border px-2 py-0.5 text-[11px] hover:bg-muted"
+                >
+                  Clear
+                </button>
+              </div>
+            )}
+            {winClearCreds && (
+              <div className="flex items-center justify-between rounded border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs">
+                <span className="text-destructive">
+                  Credentials will be removed on save (Path A only afterward).
+                </span>
+                <button
+                  type="button"
+                  onClick={() => setWinClearCreds(false)}
+                  className="rounded border px-2 py-0.5 text-[11px] hover:bg-muted"
+                >
+                  Undo
+                </button>
+              </div>
+            )}
+
+            <div
+              className={`grid grid-cols-2 gap-3 ${winClearCreds ? "opacity-40 pointer-events-none" : ""}`}
+            >
+              <Field label="Username">
+                <input
+                  className={inputCls}
+                  value={winUsername}
+                  onChange={(e) => setWinUsername(e.target.value)}
+                  placeholder={"CORP\\dnsreader"}
+                  autoComplete="off"
+                />
+              </Field>
+              <Field label="Password">
+                <input
+                  type="password"
+                  className={inputCls}
+                  value={winPassword}
+                  onChange={(e) => setWinPassword(e.target.value)}
+                  placeholder={hasExistingCreds ? "(unchanged)" : "optional"}
+                  autoComplete="off"
+                />
+              </Field>
+              <Field label="WinRM Port">
+                <input
+                  type="number"
+                  className={inputCls}
+                  value={winPort}
+                  onChange={(e) => setWinPort(e.target.value)}
+                />
+              </Field>
+              <Field label="Auth Transport">
+                <select
+                  className={inputCls}
+                  value={winTransport}
+                  onChange={(e) =>
+                    setWinTransport(
+                      e.target.value as WindowsDNSCredentials["transport"],
+                    )
+                  }
+                >
+                  <option value="ntlm">NTLM</option>
+                  <option value="kerberos">Kerberos</option>
+                  <option value="basic">Basic</option>
+                  <option value="credssp">CredSSP</option>
+                </select>
+              </Field>
+              <Field label="Use HTTPS (port 5986)">
+                <input
+                  type="checkbox"
+                  checked={winUseTLS}
+                  onChange={(e) => {
+                    setWinUseTLS(e.target.checked);
+                    if (e.target.checked && winPort === "5985")
+                      setWinPort("5986");
+                    if (!e.target.checked && winPort === "5986")
+                      setWinPort("5985");
+                  }}
+                />
+              </Field>
+              <Field label="Verify TLS certificate">
+                <input
+                  type="checkbox"
+                  checked={winVerifyTLS}
+                  disabled={!winUseTLS}
+                  onChange={(e) => setWinVerifyTLS(e.target.checked)}
+                />
+              </Field>
+            </div>
+
+            <div
+              className={`flex items-center gap-3 ${winClearCreds ? "opacity-40 pointer-events-none" : ""}`}
+            >
+              <button
+                type="button"
+                onClick={() => {
+                  setTestResult(null);
+                  testMut.mutate();
+                }}
+                disabled={
+                  testMut.isPending ||
+                  !host ||
+                  (!winUsername &&
+                    !(editing && hasExistingCreds && !winPassword))
+                }
+                className="rounded-md border px-3 py-1.5 text-xs hover:bg-accent disabled:opacity-50"
+              >
+                {testMut.isPending ? "Testing…" : "Test Connection"}
+              </button>
+              {editing && hasExistingCreds && !winUsername && !winPassword && (
+                <span className="text-[11px] text-muted-foreground">
+                  will use stored credentials
+                </span>
+              )}
+              {testResult && (
+                <span
+                  className={`text-xs ${testResult.ok ? "text-emerald-600 dark:text-emerald-400" : "text-destructive"}`}
+                >
+                  {testResult.ok ? "✓ " : "✗ "}
+                  {testResult.message}
+                </span>
+              )}
+            </div>
+          </div>
+        )}
+
         {server && (
           <p className="text-xs text-muted-foreground">
             Servers can also be auto-registered by the DNS agent container — see{" "}
@@ -2166,6 +2444,33 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
           isPending={del.isPending}
         />
       )}
+    </div>
+  );
+}
+
+function SyncStat({
+  label,
+  value,
+  accent,
+}: {
+  label: string;
+  value: number | string;
+  accent?: "good" | "bad";
+}) {
+  const color =
+    accent === "good"
+      ? "text-emerald-600 dark:text-emerald-400"
+      : accent === "bad"
+        ? "text-destructive"
+        : "text-foreground";
+  return (
+    <div className="rounded-md border bg-card px-2.5 py-1.5">
+      <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
+        {label}
+      </div>
+      <div className={`text-lg font-semibold tabular-nums ${color}`}>
+        {value}
+      </div>
     </div>
   );
 }
@@ -4567,6 +4872,32 @@ function GroupDetailView({
   onEdit: () => void;
   onDelete: () => void;
 }) {
+  const qc = useQueryClient();
+  const [syncing, setSyncing] = useState(false);
+  const [groupSyncResult, setGroupSyncResult] = useState<{
+    result: DNSGroupSyncResult | null;
+    error: string | null;
+  } | null>(null);
+
+  async function runGroupSync() {
+    setSyncing(true);
+    setGroupSyncResult({ result: null, error: null });
+    try {
+      const result = await dnsApi.syncGroupWithServers(group.id);
+      setGroupSyncResult({ result, error: null });
+      qc.invalidateQueries({ queryKey: ["dns-zones", group.id] });
+      qc.invalidateQueries({ queryKey: ["dns-group-records", group.id] });
+      qc.invalidateQueries({ queryKey: ["dns-servers", group.id] });
+    } catch (e) {
+      setGroupSyncResult({
+        result: null,
+        error: formatApiError(e as ApiError, "Sync with servers failed"),
+      });
+    } finally {
+      setSyncing(false);
+    }
+  }
+
   const [searchParams, setSearchParams] = useSearchParams();
   const tab = (searchParams.get("tab") as GroupTab) || "zones";
   const setTab = (t: GroupTab) =>
@@ -4616,6 +4947,17 @@ function GroupDetailView({
           </div>
           <div className="flex items-center gap-2 flex-shrink-0">
             <button
+              className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent disabled:opacity-50"
+              onClick={runGroupSync}
+              disabled={syncing}
+              title="Bi-directional additive sync against every enabled server in this group. Pulls missing zones and records from the servers (imports into SpatiumDDI), and pushes any SpatiumDDI zones / records not yet on the servers."
+            >
+              <RefreshCw
+                className={cn("h-3 w-3", syncing && "animate-spin")}
+              />
+              {syncing ? "Syncing…" : "Sync with Servers"}
+            </button>
+            <button
               className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent"
               onClick={onEdit}
             >
@@ -4662,7 +5004,256 @@ function GroupDetailView({
         {tab === "blocklists" && <BlocklistsTab group={group} />}
         {tab === "options" && <OptionsTab groupId={group.id} />}
       </div>
+
+      {groupSyncResult && (
+        <SyncWithServersResultModal
+          group={group}
+          result={groupSyncResult.result}
+          error={groupSyncResult.error}
+          onClose={() => setGroupSyncResult(null)}
+        />
+      )}
     </div>
+  );
+}
+
+function SyncWithServersResultModal({
+  group,
+  result,
+  error,
+  onClose,
+}: {
+  group: DNSServerGroup;
+  result: DNSGroupSyncResult | null;
+  error: string | null;
+  onClose: () => void;
+}) {
+  return (
+    <Modal title={`Sync result — ${group.name}`} onClose={onClose} wide>
+      <div className="space-y-3 text-sm">
+        {error && (
+          <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+            {error}
+          </div>
+        )}
+        {result && (
+          <>
+            <div className="grid grid-cols-2 gap-2 sm:grid-cols-4 text-xs">
+              <SyncStat
+                label="Servers"
+                value={`${result.servers_succeeded}/${result.servers_attempted}`}
+              />
+              <SyncStat
+                label="Zones imported"
+                value={result.total_zones_imported}
+                accent={result.total_zones_imported ? "good" : undefined}
+              />
+              <SyncStat
+                label="Zones pushed"
+                value={result.total_zones_pushed_to_server}
+                accent={result.total_zones_pushed_to_server ? "good" : undefined}
+              />
+              <SyncStat
+                label="Records imported"
+                value={result.total_imported}
+                accent={result.total_imported ? "good" : undefined}
+              />
+            </div>
+            <div className="grid grid-cols-2 gap-2 sm:grid-cols-2 text-xs">
+              <SyncStat
+                label="Records pushed"
+                value={result.total_pushed}
+                accent={result.total_pushed ? "good" : undefined}
+              />
+              <SyncStat
+                label="Push errors"
+                value={result.total_push_errors}
+                accent={result.total_push_errors ? "bad" : undefined}
+              />
+            </div>
+
+            {result.items.length === 0 && (
+              <p className="text-sm text-muted-foreground italic">
+                No enabled servers in this group.
+              </p>
+            )}
+
+            {result.items.map((srv) => (
+              <details
+                key={srv.server_id}
+                className="rounded-md border"
+                open={
+                  !!srv.error ||
+                  (srv.result?.zones_pushed_to_server?.length ?? 0) > 0 ||
+                  (srv.result?.zones_imported?.length ?? 0) > 0 ||
+                  (srv.result?.zones_push_to_server_errors?.length ?? 0) > 0
+                }
+              >
+                <summary className="cursor-pointer select-none border-b bg-muted/20 px-3 py-1.5 text-xs font-medium flex items-center justify-between">
+                  <span className="flex items-center gap-2">
+                    <Cpu className="h-3 w-3" />
+                    {srv.server_name}
+                    <span className="rounded bg-muted px-1 py-0 text-[10px] text-muted-foreground">
+                      {srv.driver}
+                    </span>
+                  </span>
+                  <span
+                    className={
+                      srv.error
+                        ? "text-destructive"
+                        : "text-muted-foreground"
+                    }
+                  >
+                    {srv.error
+                      ? "failed"
+                      : srv.result
+                        ? `${srv.result.zones_attempted} zone${srv.result.zones_attempted === 1 ? "" : "s"}`
+                        : "—"}
+                  </span>
+                </summary>
+                <div className="px-3 py-2 space-y-2">
+                  {srv.error && (
+                    <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+                      {srv.error}
+                    </div>
+                  )}
+                  {srv.result && (
+                    <>
+                      {srv.result.zones_pushed_to_server.length > 0 && (
+                        <div className="rounded-md border border-sky-500/40 bg-sky-500/5 px-3 py-2 text-xs">
+                          <div className="font-medium text-sky-700 dark:text-sky-300">
+                            Pushed {srv.result.zones_pushed_to_server.length}{" "}
+                            zone
+                            {srv.result.zones_pushed_to_server.length === 1
+                              ? ""
+                              : "s"}{" "}
+                            to the server
+                          </div>
+                          <ul className="mt-1 ml-4 list-disc text-muted-foreground">
+                            {srv.result.zones_pushed_to_server.map((z) => (
+                              <li key={z} className="font-mono">
+                                {z}
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
+                      {srv.result.zones_imported.length > 0 && (
+                        <div className="rounded-md border border-emerald-500/40 bg-emerald-500/5 px-3 py-2 text-xs">
+                          <div className="font-medium text-emerald-700 dark:text-emerald-400">
+                            Imported {srv.result.zones_imported.length} new
+                            zone
+                            {srv.result.zones_imported.length === 1 ? "" : "s"}
+                          </div>
+                          <ul className="mt-1 ml-4 list-disc text-muted-foreground">
+                            {srv.result.zones_imported.map((z) => (
+                              <li key={z} className="font-mono">
+                                {z}
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
+                      {srv.result.zones_push_to_server_errors.length > 0 && (
+                        <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs">
+                          <div className="font-medium text-destructive">
+                            Zone push errors
+                          </div>
+                          <ul className="mt-1 ml-4 list-disc text-muted-foreground">
+                            {srv.result.zones_push_to_server_errors.map(
+                              (e, i) => (
+                                <li key={i} className="font-mono text-[11px]">
+                                  {e}
+                                </li>
+                              ),
+                            )}
+                          </ul>
+                        </div>
+                      )}
+                      {srv.result.zones_skipped_system.length > 0 && (
+                        <div className="text-[11px] text-muted-foreground">
+                          Skipped Windows system zones:{" "}
+                          <span className="font-mono">
+                            {srv.result.zones_skipped_system.join(", ")}
+                          </span>
+                        </div>
+                      )}
+                      {srv.result.items.length > 0 && (
+                        <div className="rounded border">
+                          <table className="w-full text-xs">
+                            <thead>
+                              <tr className="border-b bg-muted/10 text-left">
+                                <th className="px-3 py-1 font-medium">Zone</th>
+                                <th className="px-3 py-1 font-medium tabular-nums">
+                                  On server
+                                </th>
+                                <th className="px-3 py-1 font-medium tabular-nums">
+                                  Imported
+                                </th>
+                                <th className="px-3 py-1 font-medium tabular-nums">
+                                  Pushed
+                                </th>
+                                <th className="px-3 py-1 font-medium">
+                                  Status
+                                </th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              {srv.result.items.map((item) => (
+                                <tr
+                                  key={item.zone}
+                                  className="border-b last:border-0"
+                                >
+                                  <td className="px-3 py-1 font-mono">
+                                    {item.zone}
+                                  </td>
+                                  <td className="px-3 py-1 tabular-nums">
+                                    {item.server_records}
+                                  </td>
+                                  <td className="px-3 py-1 tabular-nums text-emerald-600">
+                                    {item.imported || "—"}
+                                  </td>
+                                  <td className="px-3 py-1 tabular-nums text-emerald-600">
+                                    {item.pushed || "—"}
+                                  </td>
+                                  <td className="px-3 py-1">
+                                    {item.error ? (
+                                      <span className="text-destructive">
+                                        {item.error}
+                                      </span>
+                                    ) : item.push_errors.length > 0 ? (
+                                      <span className="text-amber-600">
+                                        {item.push_errors.length} push err
+                                      </span>
+                                    ) : (
+                                      <span className="text-muted-foreground">
+                                        ok
+                                      </span>
+                                    )}
+                                  </td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                        </div>
+                      )}
+                    </>
+                  )}
+                </div>
+              </details>
+            ))}
+          </>
+        )}
+        <div className="flex justify-end">
+          <button
+            onClick={onClose}
+            className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
+          >
+            Close
+          </button>
+        </div>
+      </div>
+    </Modal>
   );
 }
 
@@ -4975,12 +5566,29 @@ export function DNSPage() {
           <span className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
             DNS Server Groups
           </span>
-          <button
-            className="flex h-6 w-6 items-center justify-center rounded hover:bg-accent"
-            onClick={() => setShowCreateGroup(true)}
-          >
-            <Plus className="h-3.5 w-3.5" />
-          </button>
+          <div className="flex gap-1">
+            <button
+              className="flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:bg-accent hover:text-foreground"
+              onClick={() => {
+                // Force refetch — bare invalidate only marks queries
+                // stale, which isn't enough when the user pressed
+                // Refresh after external changes (API, another tab).
+                qc.refetchQueries({ queryKey: ["dns-groups"] });
+                qc.refetchQueries({ queryKey: ["dns-servers"] });
+                qc.refetchQueries({ queryKey: ["dns-zones"] });
+              }}
+              title="Refresh"
+            >
+              <RefreshCw className="h-3.5 w-3.5" />
+            </button>
+            <button
+              className="flex h-6 w-6 items-center justify-center rounded hover:bg-accent"
+              onClick={() => setShowCreateGroup(true)}
+              title="New server group"
+            >
+              <Plus className="h-3.5 w-3.5" />
+            </button>
+          </div>
         </div>
 
         <div className="flex-1 overflow-y-auto py-1">
