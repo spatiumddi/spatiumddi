@@ -40,6 +40,21 @@ SUBNET_COLUMNS = [
     "utilization_percent",
 ]
 
+# Column order used by the address CSV / XLSX. Matches the field names the
+# subnet-scoped importer recognises so a subnet export with
+# ``include_addresses=true`` round-trips cleanly back through
+# ``POST /ipam/import/addresses/commit``.
+ADDRESS_COLUMNS = [
+    "subnet",
+    "address",
+    "status",
+    "hostname",
+    "fqdn",
+    "mac_address",
+    "description",
+    "last_seen_at",
+]
+
 
 @dataclass
 class ExportBundle:
@@ -188,9 +203,38 @@ def _is_subnet_of(
 # ── Serialisers ────────────────────────────────────────────────────────────────
 
 
-def _to_csv(bundle: ExportBundle) -> bytes:
+def _addresses_to_csv(addresses: list[dict[str, Any]]) -> bytes:
     buf = io.StringIO()
-    # Collect any custom field keys so each gets its own column.
+    cf_keys: list[str] = []
+    seen: set[str] = set()
+    for row in addresses:
+        for k in (row.get("custom_fields") or {}).keys():
+            if k not in seen:
+                seen.add(k)
+                cf_keys.append(k)
+    headers = ADDRESS_COLUMNS + cf_keys
+    writer = csv.DictWriter(buf, fieldnames=headers, extrasaction="ignore")
+    writer.writeheader()
+    for row in addresses:
+        out = {k: row.get(k) for k in ADDRESS_COLUMNS}
+        for k in cf_keys:
+            out[k] = (row.get("custom_fields") or {}).get(k)
+        writer.writerow(out)
+    return buf.getvalue().encode("utf-8")
+
+
+def _to_csv(bundle: ExportBundle) -> bytes:
+    # When the caller asked for addresses, emit an addresses-only CSV.
+    # CSV is a single-table format, so we pick the table that carries the
+    # data the user was after — and crucially this matches the header
+    # shape accepted by ``POST /ipam/import/addresses/commit`` so the
+    # export round-trips through the importer without column renaming.
+    # Broader scopes (block / space) should use JSON or XLSX if they
+    # need both subnet metadata *and* addresses in the same file.
+    if bundle.addresses:
+        return _addresses_to_csv(bundle.addresses)
+
+    buf = io.StringIO()
     cf_keys: list[str] = []
     seen: set[str] = set()
     for row in bundle.subnets:
@@ -263,34 +307,22 @@ def _to_xlsx(bundle: ExportBundle) -> bytes:
             ]
         )
 
-    # Addresses sheet
+    # Addresses sheet — column order matches ADDRESS_COLUMNS so a
+    # subnet XLSX export can be fed straight back into the importer.
     if bundle.addresses:
         addr_ws = wb.create_sheet("addresses")
-        addr_ws.append(
-            [
-                "subnet",
-                "address",
-                "status",
-                "hostname",
-                "fqdn",
-                "mac_address",
-                "description",
-                "last_seen_at",
-            ]
-        )
+        addr_cf_keys: list[str] = []
+        addr_seen: set[str] = set()
+        for row in bundle.addresses:
+            for k in (row.get("custom_fields") or {}).keys():
+                if k not in addr_seen:
+                    addr_seen.add(k)
+                    addr_cf_keys.append(k)
+        addr_ws.append(ADDRESS_COLUMNS + addr_cf_keys)
         for a in bundle.addresses:
-            addr_ws.append(
-                [
-                    a.get("subnet"),
-                    a.get("address"),
-                    a.get("status"),
-                    a.get("hostname"),
-                    a.get("fqdn"),
-                    a.get("mac_address"),
-                    a.get("description"),
-                    a.get("last_seen_at"),
-                ]
-            )
+            base = [a.get(k) for k in ADDRESS_COLUMNS]
+            cf = a.get("custom_fields") or {}
+            addr_ws.append(base + [cf.get(k) for k in addr_cf_keys])
 
     buf = io.BytesIO()
     wb.save(buf)
@@ -318,15 +350,19 @@ async def export_subtree(
     )
     scope_name = bundle.space["name"] if bundle.space else "export"
     safe_name = str(scope_name).replace("/", "_").replace(" ", "_")
+    # UTC timestamp in the filename so multiple exports on the same day
+    # don't overwrite each other and file managers sort them in order.
+    ts = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
+    base = f"ipam-{safe_name}-{ts}"
     if format == "csv":
-        return _to_csv(bundle), "text/csv", f"ipam-{safe_name}.csv"
+        return _to_csv(bundle), "text/csv", f"{base}.csv"
     if format == "json":
-        return _to_json(bundle), "application/json", f"ipam-{safe_name}.json"
+        return _to_json(bundle), "application/json", f"{base}.json"
     if format == "xlsx":
         return (
             _to_xlsx(bundle),
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            f"ipam-{safe_name}.xlsx",
+            f"{base}.xlsx",
         )
     raise HTTPException(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,

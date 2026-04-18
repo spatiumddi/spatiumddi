@@ -706,6 +706,15 @@ export interface ImportCommitResponse {
   errors: string[];
 }
 
+export interface AddressImportCommitResponse {
+  subnet_id: string;
+  created: number;
+  updated: number;
+  skipped: number;
+  dns_synced: number;
+  errors: string[];
+}
+
 export type ImportStrategy = "skip" | "overwrite" | "fail";
 
 function _buildImportForm(
@@ -748,6 +757,40 @@ export const ipamIoApi = {
         },
       )
       .then((r) => r.data),
+
+  previewAddresses: (
+    file: File,
+    opts: { subnet_id: string; strategy: ImportStrategy },
+  ) => {
+    const form = new FormData();
+    form.append("file", file);
+    form.append("subnet_id", opts.subnet_id);
+    form.append("strategy", opts.strategy);
+    return api
+      .post<ImportPreviewResponse>("/ipam/import/addresses/preview", form, {
+        headers: { "Content-Type": "multipart/form-data" },
+      })
+      .then((r) => r.data);
+  },
+
+  commitAddresses: (
+    file: File,
+    opts: { subnet_id: string; strategy: ImportStrategy },
+  ) => {
+    const form = new FormData();
+    form.append("file", file);
+    form.append("subnet_id", opts.subnet_id);
+    form.append("strategy", opts.strategy);
+    return api
+      .post<AddressImportCommitResponse>(
+        "/ipam/import/addresses/commit",
+        form,
+        {
+          headers: { "Content-Type": "multipart/form-data" },
+        },
+      )
+      .then((r) => r.data);
+  },
 
   exportUrl: (params: {
     space_id?: string;

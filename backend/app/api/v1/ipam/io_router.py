@@ -11,9 +11,11 @@ from fastapi.responses import Response
 
 from app.api.deps import DB, CurrentUser
 from app.services.ipam_io import (
+    commit_address_import,
     commit_import,
     export_subtree,
     parse_payload,
+    preview_address_import,
     preview_import,
 )
 
@@ -128,6 +130,67 @@ async def import_preview_json(
         strategy=body.get("strategy", "fail"),
     )
     return preview.as_dict()
+
+
+@router.post("/import/addresses/preview")
+async def import_addresses_preview(
+    current_user: CurrentUser,
+    db: DB,
+    file: UploadFile = File(...),
+    subnet_id: uuid.UUID = Form(...),
+    strategy: Literal["skip", "overwrite", "fail"] = Form(default="fail"),
+) -> dict:
+    """Dry-run a subnet-scoped IP address import.
+
+    Accepts CSV / JSON / XLSX with an ``address`` (or ``ip``) column plus
+    any of ``hostname``, ``mac_address``, ``description``, ``status``,
+    ``tags``, ``custom_fields``. Any unrecognised columns become
+    ``custom_fields`` entries so migrations from other DDI tools don't
+    need column renaming.
+    """
+    data = await _read_upload(file)
+    payload = parse_payload(data, file.filename or "", file.content_type)
+    preview = await preview_address_import(
+        db,
+        payload,
+        subnet_id=subnet_id,
+        strategy=strategy,
+    )
+    logger.info(
+        "ipam_address_import_preview",
+        subnet_id=str(subnet_id),
+        creates=len(preview.creates),
+        updates=len(preview.updates),
+        conflicts=len(preview.conflicts),
+        errors=len(preview.errors),
+        user=current_user.display_name,
+    )
+    return preview.as_dict()
+
+
+@router.post("/import/addresses/commit")
+async def import_addresses_commit(
+    current_user: CurrentUser,
+    db: DB,
+    file: UploadFile = File(...),
+    subnet_id: uuid.UUID = Form(...),
+    strategy: Literal["skip", "overwrite", "fail"] = Form(default="fail"),
+) -> dict:
+    """Commit a subnet-scoped IP address import. Same transaction as the
+    audit trail it writes — a DNS-sync failure on a single row surfaces
+    as a non-fatal error in the response, not a rolled-back import.
+    """
+    data = await _read_upload(file)
+    payload = parse_payload(data, file.filename or "", file.content_type)
+    result = await commit_address_import(
+        db,
+        payload,
+        current_user=current_user,
+        subnet_id=subnet_id,
+        strategy=strategy,
+    )
+    await db.commit()
+    return result.as_dict()
 
 
 @router.get("/export")

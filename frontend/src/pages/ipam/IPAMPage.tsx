@@ -51,7 +51,11 @@ import {
 import { cn } from "@/lib/utils";
 import { useStickyLocation } from "@/lib/stickyLocation";
 import { useSessionState } from "@/lib/useSessionState";
-import { ImportModal, ExportButton } from "./ImportExportModals";
+import {
+  ImportModal,
+  ExportButton,
+  SubnetImportExportButton,
+} from "./ImportExportModals";
 import { cidrContains } from "@/lib/cidr";
 import { FreeSpaceBand } from "@/components/ipam/FreeSpaceBand";
 import {
@@ -1000,99 +1004,6 @@ function DdnsSettingsSection({
         </div>
       )}
     </div>
-  );
-}
-
-// ─── Backfill Reverse Zones button ─────────────────────────────────────────
-
-function BackfillReverseZonesButton({
-  scope,
-  id,
-}: {
-  scope: "space" | "block" | "subnet";
-  id: string;
-}) {
-  const qc = useQueryClient();
-  const [result, setResult] = useState<{
-    created: { subnet: string; zone: string }[];
-    skipped: number;
-  } | null>(null);
-  const mut = useMutation({
-    mutationFn: () => {
-      if (scope === "space") return ipamApi.backfillReverseZonesSpace(id);
-      if (scope === "block") return ipamApi.backfillReverseZonesBlock(id);
-      return ipamApi.backfillReverseZonesSubnet(id);
-    },
-    onSuccess: (data) => {
-      setResult(data);
-      qc.invalidateQueries({ queryKey: ["dns-zones"] });
-    },
-  });
-  return (
-    <>
-      <button
-        onClick={() => mut.mutate()}
-        disabled={mut.isPending}
-        title="Create missing in-addr.arpa / ip6.arpa zones for every subnet with a DNS group (idempotent)"
-        className="flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm hover:bg-muted disabled:opacity-50"
-      >
-        <RefreshCw
-          className={cn("h-3.5 w-3.5", mut.isPending && "animate-spin")}
-        />
-        Backfill Reverse Zones
-      </button>
-      {result && (
-        <Modal
-          title="Reverse Zone Backfill"
-          onClose={() => setResult(null)}
-          wide
-        >
-          <div className="space-y-3">
-            <p className="text-sm">
-              Created{" "}
-              <span className="font-medium">{result.created.length}</span> new
-              reverse zone{result.created.length !== 1 ? "s" : ""};{" "}
-              <span className="text-muted-foreground">
-                {result.skipped} skipped
-              </span>{" "}
-              (already existed or no DNS group configured).
-            </p>
-            {result.created.length > 0 && (
-              <div className="max-h-64 overflow-y-auto rounded-md border">
-                <table className="w-full text-sm">
-                  <thead className="bg-muted/40 text-xs">
-                    <tr>
-                      <th className="px-3 py-1.5 text-left">Subnet</th>
-                      <th className="px-3 py-1.5 text-left">Reverse Zone</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {result.created.map((c) => (
-                      <tr key={c.zone} className="border-t">
-                        <td className="px-3 py-1 font-mono text-xs">
-                          {c.subnet}
-                        </td>
-                        <td className="px-3 py-1 font-mono text-xs">
-                          {c.zone}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
-            )}
-            <div className="flex justify-end">
-              <button
-                onClick={() => setResult(null)}
-                className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90"
-              >
-                Close
-              </button>
-            </div>
-          </div>
-        </Modal>
-      )}
-    </>
   );
 }
 
@@ -2579,9 +2490,8 @@ function SubnetDetail({
               className="flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
             >
               <Globe2 className="h-3.5 w-3.5" />
-              Check DNS Sync
+              Sync DNS
             </button>
-            <BackfillReverseZonesButton scope="subnet" id={subnet.id} />
             <button
               onClick={() => setShowOrphans(true)}
               title="List orphaned IPs in this subnet and permanently delete selected rows"
@@ -2590,7 +2500,13 @@ function SubnetDetail({
               <Trash2 className="h-3.5 w-3.5" />
               Clean Orphans
             </button>
-            <ExportButton scope={{ subnet_id: subnet.id }} label="Export" />
+            <SubnetImportExportButton
+              subnet={subnet}
+              onCommitted={() => {
+                qc.invalidateQueries({ queryKey: ["addresses"] });
+                qc.invalidateQueries({ queryKey: ["subnets"] });
+              }}
+            />
             <button
               onClick={() => setShowEditSubnet(true)}
               className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
@@ -3209,7 +3125,7 @@ function SubnetDetail({
                                 ) : dnsState === "out-of-sync" ? (
                                   <span
                                     className="inline-flex items-center gap-1 text-xs text-amber-600"
-                                    title="DNS records are missing or differ — open Check DNS Sync to reconcile"
+                                    title="DNS records are missing or differ — open Sync DNS to reconcile"
                                   >
                                     <span className="inline-block h-1.5 w-1.5 rounded-full bg-amber-500" />
                                     out of sync
@@ -3486,10 +3402,34 @@ function DnsSyncModal({
         ? ipamApi.dnsSyncCommitBlock(scope.id, body)
         : ipamApi.dnsSyncCommitSpace(scope.id, body);
 
+  // Before we compute drift, make sure every subnet's reverse zone exists —
+  // otherwise "missing PTR" rows will show for subnets whose reverse zone
+  // hasn't been created yet, and the commit will fail. Backfill is
+  // idempotent, so it's safe to run on every modal open.
+  const [backfillDone, setBackfillDone] = useState(false);
+  const [backfillResult, setBackfillResult] = useState<{
+    created: { subnet: string; zone: string }[];
+    skipped: number;
+  } | null>(null);
+  const [backfillError, setBackfillError] = useState<string | null>(null);
+  useEffect(() => {
+    const fn =
+      scope.kind === "subnet"
+        ? ipamApi.backfillReverseZonesSubnet
+        : scope.kind === "block"
+          ? ipamApi.backfillReverseZonesBlock
+          : ipamApi.backfillReverseZonesSpace;
+    fn(scope.id)
+      .then((r) => setBackfillResult(r))
+      .catch((e: Error) => setBackfillError(e.message || "Backfill failed"))
+      .finally(() => setBackfillDone(true));
+  }, [scope.id, scope.kind]);
+
   const { data, isLoading, error, refetch, isFetching } = useQuery({
     queryKey: ["dns-sync-preview", scope.kind, scope.id],
     queryFn: fetchPreview,
     refetchOnMount: "always",
+    enabled: backfillDone,
   });
 
   // Per-row selection. Empty Set = nothing chosen → Apply disabled.
@@ -3594,7 +3534,28 @@ function DnsSyncModal({
         </div>
 
         <div className="flex-1 overflow-auto px-5 py-4 space-y-5">
-          {isLoading && (
+          {!backfillDone && (
+            <p className="text-sm text-muted-foreground">
+              Backfilling missing reverse zones…
+            </p>
+          )}
+          {backfillDone &&
+            backfillResult &&
+            backfillResult.created.length > 0 && (
+              <div className="rounded-md border border-blue-500/40 bg-blue-500/10 px-3 py-2 text-xs">
+                Backfill created {backfillResult.created.length} reverse zone
+                {backfillResult.created.length === 1 ? "" : "s"}:{" "}
+                <span className="font-mono">
+                  {backfillResult.created.map((c) => c.zone).join(", ")}
+                </span>
+              </div>
+            )}
+          {backfillError && (
+            <div className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs">
+              Reverse-zone backfill skipped: {backfillError}
+            </div>
+          )}
+          {backfillDone && isLoading && (
             <p className="text-sm text-muted-foreground">Computing drift…</p>
           )}
           {error && (
@@ -6825,9 +6786,8 @@ function BlockDetailView({
                   className="flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
                 >
                   <Globe2 className="h-3.5 w-3.5" />
-                  Check DNS Sync
+                  Sync DNS
                 </button>
-                <BackfillReverseZonesButton scope="block" id={block.id} />
                 <ExportButton scope={{ block_id: block.id }} label="Export" />
                 <button
                   onClick={() => setShowEdit(true)}
@@ -7659,9 +7619,8 @@ function SpaceTableView({
               className="flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
             >
               <Globe2 className="h-3.5 w-3.5" />
-              Check DNS Sync
+              Sync DNS
             </button>
-            <BackfillReverseZonesButton scope="space" id={space.id} />
             <ExportButton scope={{ space_id: space.id }} label="Export" />
             <button
               onClick={() => setShowEditSpace(true)}

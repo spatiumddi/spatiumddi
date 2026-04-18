@@ -6,12 +6,15 @@ import {
   AlertCircle,
   CheckCircle2,
   FileWarning,
+  ChevronDown,
 } from "lucide-react";
 import {
   ipamIoApi,
+  type AddressImportCommitResponse,
   type ImportPreviewResponse,
   type ImportStrategy,
   type IPSpace,
+  type Subnet,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
@@ -361,5 +364,280 @@ export function ExportButton({
         </div>
       )}
     </div>
+  );
+}
+
+// ─── Address Import Modal (subnet-scoped) ────────────────────────────────────
+
+export function AddressImportModal({
+  subnet,
+  onClose,
+  onCommitted,
+}: {
+  subnet: Subnet;
+  onClose: () => void;
+  onCommitted: () => void;
+}) {
+  const [file, setFile] = useState<File | null>(null);
+  const [strategy, setStrategy] = useState<ImportStrategy>("fail");
+  const [preview, setPreview] = useState<ImportPreviewResponse | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [committed, setCommitted] =
+    useState<AddressImportCommitResponse | null>(null);
+
+  async function handlePreview() {
+    if (!file) return;
+    setBusy(true);
+    setError(null);
+    setPreview(null);
+    try {
+      const result = await ipamIoApi.previewAddresses(file, {
+        subnet_id: subnet.id,
+        strategy,
+      });
+      setPreview(result);
+    } catch (e) {
+      const err = e as {
+        response?: { data?: { detail?: string } };
+        message?: string;
+      };
+      setError(err.response?.data?.detail ?? err.message ?? "Preview failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleCommit() {
+    if (!file) return;
+    setBusy(true);
+    setError(null);
+    try {
+      const result = await ipamIoApi.commitAddresses(file, {
+        subnet_id: subnet.id,
+        strategy,
+      });
+      setCommitted(result);
+      onCommitted();
+    } catch (e) {
+      const err = e as {
+        response?: { data?: { detail?: string } };
+        message?: string;
+      };
+      setError(err.response?.data?.detail ?? err.message ?? "Import failed");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-2 sm:p-4">
+      <div className="flex max-h-[90vh] w-full max-w-[95vw] sm:max-w-[760px] flex-col rounded-lg bg-background shadow-xl">
+        <div className="flex items-center justify-between border-b p-4">
+          <h2 className="flex items-center gap-2 text-base font-semibold">
+            <Upload className="h-4 w-4" /> Import IP addresses into{" "}
+            <span className="font-mono text-sm">{subnet.network}</span>
+          </h2>
+          <button
+            onClick={onClose}
+            className="text-muted-foreground hover:text-foreground"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+
+        <div className="flex-1 overflow-y-auto p-4 space-y-4">
+          {committed ? (
+            <div className="rounded border border-green-300 bg-green-50 p-4 dark:border-green-900 dark:bg-green-900/20">
+              <div className="flex items-center gap-2 font-medium text-green-800 dark:text-green-300">
+                <CheckCircle2 className="h-4 w-4" /> Import complete
+              </div>
+              <ul className="mt-2 text-xs text-green-900 dark:text-green-200 space-y-0.5">
+                <li>Created: {committed.created} addresses</li>
+                <li>Updated: {committed.updated} addresses</li>
+                <li>Skipped: {committed.skipped}</li>
+                <li>DNS records published: {committed.dns_synced}</li>
+                {committed.errors.length > 0 && (
+                  <li className="mt-1 text-amber-700 dark:text-amber-400">
+                    {committed.errors.length} non-fatal error
+                    {committed.errors.length === 1 ? "" : "s"} — first:{" "}
+                    {committed.errors[0]}
+                  </li>
+                )}
+              </ul>
+            </div>
+          ) : (
+            <>
+              <div className="rounded border bg-muted/30 p-3 text-xs text-muted-foreground">
+                <p className="mb-1 font-medium text-foreground">
+                  Expected columns
+                </p>
+                <code className="font-mono text-[11px]">
+                  address, hostname, mac_address, description, status, tags
+                </code>
+                <p className="mt-2">
+                  <strong>address</strong> (or <strong>ip</strong>) is required;
+                  anything else is optional. Unrecognised columns become custom
+                  fields. All rows must fall within {subnet.network}.
+                </p>
+              </div>
+              <div>
+                <label className="mb-1 block text-xs font-medium">
+                  Conflict strategy
+                </label>
+                <select
+                  value={strategy}
+                  onChange={(e) =>
+                    setStrategy(e.target.value as ImportStrategy)
+                  }
+                  className="w-full rounded border bg-background px-2 py-1 text-sm"
+                >
+                  <option value="fail">Fail if any IP already exists</option>
+                  <option value="skip">Skip existing IPs</option>
+                  <option value="overwrite">Overwrite existing IPs</option>
+                </select>
+              </div>
+              <div>
+                <label className="mb-1 block text-xs font-medium">
+                  File (CSV, JSON, or XLSX)
+                </label>
+                <input
+                  type="file"
+                  accept=".csv,.json,.xlsx,text/csv,application/json"
+                  onChange={(e) => {
+                    setFile(e.target.files?.[0] ?? null);
+                    setPreview(null);
+                  }}
+                  className="w-full text-sm"
+                />
+              </div>
+
+              {error && (
+                <div className="flex items-start gap-2 rounded border border-red-300 bg-red-50 p-2 text-xs text-red-800 dark:border-red-900 dark:bg-red-900/20 dark:text-red-300">
+                  <AlertCircle className="mt-0.5 h-3.5 w-3.5 flex-shrink-0" />
+                  <span>{error}</span>
+                </div>
+              )}
+
+              {preview && <PreviewTable preview={preview} />}
+            </>
+          )}
+        </div>
+
+        <div className="flex justify-end gap-2 border-t p-3">
+          <button
+            onClick={onClose}
+            className="rounded border px-3 py-1.5 text-xs hover:bg-muted"
+          >
+            Close
+          </button>
+          {!committed && (
+            <>
+              <button
+                disabled={!file || busy}
+                onClick={handlePreview}
+                className="rounded border bg-muted px-3 py-1.5 text-xs font-medium hover:bg-accent disabled:opacity-50"
+              >
+                {busy ? "Working…" : "Preview"}
+              </button>
+              <button
+                disabled={!preview || busy || preview.summary.errors > 0}
+                onClick={handleCommit}
+                className="rounded bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+              >
+                {busy ? "Importing…" : "Commit import"}
+              </button>
+            </>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ─── Combined Import/Export Button (subnet-scoped) ───────────────────────────
+
+export function SubnetImportExportButton({
+  subnet,
+  onCommitted,
+}: {
+  subnet: Subnet;
+  onCommitted: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [includeAddrs, setIncludeAddrs] = useState(true);
+  const [showImport, setShowImport] = useState(false);
+
+  async function download(format: "csv" | "json" | "xlsx") {
+    setBusy(true);
+    try {
+      await ipamIoApi.download({
+        subnet_id: subnet.id,
+        format,
+        include_addresses: includeAddrs,
+      });
+      setOpen(false);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  return (
+    <>
+      <div className="relative">
+        <button
+          onClick={() => setOpen((o) => !o)}
+          className="flex items-center gap-1 rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
+          title="Import or export IP addresses"
+        >
+          Import / Export
+          <ChevronDown className="h-3.5 w-3.5" />
+        </button>
+        {open && (
+          <div className="absolute right-0 z-40 mt-1 w-64 rounded border bg-background p-2 shadow-lg">
+            <button
+              onClick={() => {
+                setShowImport(true);
+                setOpen(false);
+              }}
+              className="flex w-full items-center gap-2 rounded px-2 py-1.5 text-left text-xs hover:bg-muted"
+            >
+              <Upload className="h-3.5 w-3.5" />
+              Import IP addresses…
+            </button>
+            <div className="my-1 border-t" />
+            <label className="mb-1 flex items-center gap-2 px-2 text-xs">
+              <input
+                type="checkbox"
+                checked={includeAddrs}
+                onChange={(e) => setIncludeAddrs(e.target.checked)}
+              />
+              Include IP addresses
+            </label>
+            <div className="space-y-0.5">
+              {(["csv", "json", "xlsx"] as const).map((fmt) => (
+                <button
+                  key={fmt}
+                  disabled={busy}
+                  onClick={() => download(fmt)}
+                  className="flex w-full items-center gap-2 rounded px-2 py-1 text-left text-xs hover:bg-muted disabled:opacity-50"
+                >
+                  <Download className="h-3.5 w-3.5" />
+                  Export .{fmt}
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+      </div>
+      {showImport && (
+        <AddressImportModal
+          subnet={subnet}
+          onClose={() => setShowImport(false)}
+          onCommitted={onCommitted}
+        />
+      )}
+    </>
   );
 }

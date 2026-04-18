@@ -50,6 +50,21 @@ _KNOWN_SUBNET_COLUMNS = {
 }
 
 
+_KNOWN_ADDRESS_COLUMNS = {
+    "address",
+    "ip",
+    "ip_address",
+    "hostname",
+    "fqdn",
+    "mac",
+    "mac_address",
+    "description",
+    "status",
+    "tags",
+    "subnet",
+}
+
+
 def _coerce_int(v: Any) -> int | None:
     if v is None or v == "":
         return None
@@ -91,16 +106,75 @@ def _row_to_subnet(row: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _row_to_address(row: dict[str, Any]) -> dict[str, Any]:
+    """Coerce a generic row dict into an IPAddress dict with custom_fields.
+
+    Recognises ``address`` / ``ip`` / ``ip_address`` as the canonical
+    address column so exports from other DDI tools map cleanly. Tags
+    and custom_fields are passed through unchanged when already dicts
+    and preserved verbatim on pass-through exports from our own
+    exporter. Unrecognised columns become ``custom_fields`` entries —
+    same pattern as the subnet coercer — so a CSV like
+    ``address,hostname,department,cost_center`` Just Works.
+    """
+    out: dict[str, Any] = {}
+    custom: dict[str, Any] = {}
+    for raw_key, value in row.items():
+        if raw_key is None:
+            continue
+        key = raw_key.strip()
+        if not key:
+            continue
+        norm = key.lower().replace(" ", "_")
+        if value == "":
+            value = None
+        if norm in ("ip", "ip_address"):
+            out["address"] = value
+        elif norm == "mac":
+            out["mac_address"] = value
+        elif norm in _KNOWN_ADDRESS_COLUMNS:
+            out[norm] = value
+        elif norm in ("custom_fields", "customfields"):
+            # Pass-through from our exporter — value is already a dict.
+            if isinstance(value, dict):
+                custom.update(value)
+        else:
+            custom[key] = value
+    if custom:
+        out["custom_fields"] = custom
+    return out
+
+
+def _csv_is_address_payload(headers: list[str]) -> bool:
+    """Detect an address-upload CSV by header row.
+
+    Subnet imports must have ``network``; address imports must have
+    ``address`` / ``ip`` / ``ip_address``. When both are present (the
+    ``network`` column wins and the row is treated as a subnet) — the
+    two formats shouldn't mix in a single file.
+    """
+    norm = {h.strip().lower() for h in headers if h}
+    if "network" in norm:
+        return False
+    return bool({"address", "ip", "ip_address"} & norm)
+
+
 def parse_csv(data: bytes) -> ParsedPayload:
     text = data.decode("utf-8-sig", errors="replace")
     reader = csv.DictReader(io.StringIO(text))
     payload = ParsedPayload()
+    is_addresses = _csv_is_address_payload(list(reader.fieldnames or []))
     for row in reader:
         if not any((v or "").strip() for v in row.values() if isinstance(v, str)):
             continue
-        if not row.get("network") and not row.get("Network"):
-            continue
-        payload.subnets.append(_row_to_subnet(row))
+        if is_addresses:
+            if not any(row.get(k) for k in ("address", "ip", "ip_address")):
+                continue
+            payload.addresses.append(_row_to_address(row))
+        else:
+            if not row.get("network") and not row.get("Network"):
+                continue
+            payload.subnets.append(_row_to_subnet(row))
     return payload
 
 
@@ -115,10 +189,19 @@ def parse_json(data: bytes) -> ParsedPayload:
 
     payload = ParsedPayload()
     if isinstance(decoded, list):
+        # List form is ambiguous — sniff the first row for an address key
+        # and route accordingly. Mixed lists aren't supported (don't do that).
+        first = next((x for x in decoded if isinstance(x, dict)), None)
+        is_addresses = first is not None and any(
+            k.lower() in ("address", "ip", "ip_address") for k in first.keys()
+        )
         for item in decoded:
             if not isinstance(item, dict):
                 continue
-            payload.subnets.append(_row_to_subnet(item))
+            if is_addresses:
+                payload.addresses.append(_row_to_address(item))
+            else:
+                payload.subnets.append(_row_to_subnet(item))
         return payload
 
     if isinstance(decoded, dict):
@@ -131,6 +214,8 @@ def parse_json(data: bytes) -> ParsedPayload:
                     continue
                 if key == "subnets":
                     payload.subnets.append(_row_to_subnet(item))
+                elif key == "addresses":
+                    payload.addresses.append(_row_to_address(item))
                 else:
                     getattr(payload, key).append(dict(item))
         return payload
@@ -179,17 +264,43 @@ def parse_xlsx(data: bytes) -> ParsedPayload:
             out.append(row)
         return out
 
-    # The primary / single-sheet case: use the first sheet as subnets
-    subnet_sheet = (
-        "subnets" if "subnets" in wb.sheetnames else wb.sheetnames[0] if wb.sheetnames else None
-    )
-    if subnet_sheet:
-        for row in _sheet_rows(subnet_sheet):
+    # Primary sheet routing — a workbook with only an ``addresses`` sheet
+    # (or ``subnets``) is the common shape for a per-resource upload; a
+    # workbook with both sheets is our own exporter's output and all
+    # sheets are loaded.
+    if "subnets" in wb.sheetnames:
+        for row in _sheet_rows("subnets"):
             if not row.get("network") and not row.get("Network"):
                 continue
             payload.subnets.append(_row_to_subnet(row))
+    elif "addresses" not in wb.sheetnames and wb.sheetnames:
+        # Single-sheet workbook with neither well-known name — sniff the
+        # first row's headers to decide whether it's subnets or addresses.
+        first_sheet = wb.sheetnames[0]
+        ws = wb[first_sheet]
+        headers_iter = ws.iter_rows(min_row=1, max_row=1, values_only=True)
+        first_row = next(iter(headers_iter), ())
+        headers_norm = {(str(h).strip().lower() if h is not None else "") for h in first_row}
+        is_addresses = bool({"address", "ip", "ip_address"} & headers_norm) and (
+            "network" not in headers_norm
+        )
+        for row in _sheet_rows(first_sheet):
+            if is_addresses:
+                if not any(row.get(k) for k in ("address", "ip", "ip_address")):
+                    continue
+                payload.addresses.append(_row_to_address(row))
+            else:
+                if not row.get("network") and not row.get("Network"):
+                    continue
+                payload.subnets.append(_row_to_subnet(row))
 
-    for key in ("spaces", "blocks", "addresses"):
+    if "addresses" in wb.sheetnames:
+        for row in _sheet_rows("addresses"):
+            if not any(row.get(k) for k in ("address", "ip", "ip_address")):
+                continue
+            payload.addresses.append(_row_to_address(row))
+
+    for key in ("spaces", "blocks"):
         for row in _sheet_rows(key):
             getattr(payload, key).append(dict(row))
 

@@ -8,18 +8,24 @@ lives here.
 
 from app.services.ipam_io.export import export_subtree
 from app.services.ipam_io.importer import (
+    AddressImportResult,
     ImportPreview,
     ImportResult,
+    commit_address_import,
     commit_import,
+    preview_address_import,
     preview_import,
 )
 from app.services.ipam_io.parser import parse_payload
 
 __all__ = [
+    "AddressImportResult",
     "ImportPreview",
     "ImportResult",
+    "commit_address_import",
     "commit_import",
     "export_subtree",
     "parse_payload",
+    "preview_address_import",
     "preview_import",
 ]
