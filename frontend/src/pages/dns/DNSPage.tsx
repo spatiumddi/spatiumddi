@@ -8,7 +8,6 @@ import {
   Plus,
   Trash2,
   Pencil,
-  ChevronDown,
   ChevronRight,
   Settings2,
   Shield,
@@ -639,6 +638,7 @@ function ServerModal({
   const [roles, setRoles] = useState((server?.roles ?? []).join(", "));
   const [notes, setNotes] = useState(server?.notes ?? "");
   const [apiKey, setApiKey] = useState("");
+  const [isEnabled, setIsEnabled] = useState(server?.is_enabled ?? true);
   const [error, setError] = useState("");
 
   const mut = useMutation({
@@ -668,6 +668,7 @@ function ServerModal({
       api_port: apiPort ? parseInt(apiPort, 10) : null,
       roles: roleList,
       notes,
+      is_enabled: isEnabled,
       ...(apiKey ? { api_key: apiKey } : {}),
     });
   }
@@ -767,6 +768,23 @@ function ServerModal({
             placeholder="Optional notes"
           />
         </Field>
+        <label className="flex items-start gap-2 text-sm">
+          <input
+            type="checkbox"
+            className="mt-0.5"
+            checked={isEnabled}
+            onChange={(e) => setIsEnabled(e.target.checked)}
+          />
+          <span>
+            <span className="font-medium">Enabled</span>
+            <span className="block text-xs text-muted-foreground">
+              Uncheck to pause this server — SpatiumDDI will skip it in the
+              health probe, the bi-directional sync task, and record-op writes.
+              Useful during Windows DNS / DC maintenance. Status will read{" "}
+              <code>disabled</code> until re-enabled.
+            </span>
+          </span>
+        </label>
         {server && (
           <p className="text-xs text-muted-foreground">
             Servers can also be auto-registered by the DNS agent container — see{" "}
@@ -1948,12 +1966,14 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
     unreachable: "bg-red-500/15 text-red-600",
     syncing: "bg-blue-500/15 text-blue-600",
     error: "bg-red-500/15 text-red-600",
+    disabled: "bg-muted text-muted-foreground",
   };
   const dotCls: Record<string, string> = {
     active: "bg-emerald-500",
     unreachable: "bg-red-500",
     syncing: "bg-blue-500",
     error: "bg-red-500",
+    disabled: "bg-muted-foreground/40",
   };
 
   return (
@@ -2043,7 +2063,7 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
                 </p>
               </div>
             </div>
-            <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100">
+            <div className="flex items-center gap-1">
               <button
                 className="h-7 w-7 flex items-center justify-center rounded text-muted-foreground hover:text-foreground"
                 onClick={() => setEditServer(s)}
@@ -4720,8 +4740,6 @@ export function DNSPage() {
             const expanded = expandedGroups.has(g.id);
             const groupSelected =
               selection?.type === "group" && selection.group.id === g.id;
-            const zoneInGroup =
-              selection?.type === "zone" && selection.group.id === g.id;
 
             return (
               <div key={g.id}>
@@ -4731,21 +4749,25 @@ export function DNSPage() {
                 >
                   {/* Expand toggle */}
                   <button
-                    className={`flex h-7 w-6 items-center justify-center flex-shrink-0 ${groupSelected ? "text-primary-foreground" : "text-muted-foreground hover:text-foreground"}`}
-                    onClick={() => toggleGroup(g.id)}
+                    className={`ml-1 flex h-4 w-4 flex-shrink-0 items-center justify-center rounded-sm border text-[10px] font-bold ${
+                      groupSelected
+                        ? "border-primary-foreground/60 bg-primary text-primary-foreground"
+                        : "border-border bg-background text-muted-foreground hover:border-primary hover:text-primary"
+                    }`}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      toggleGroup(g.id);
+                    }}
+                    title={expanded ? "Collapse" : "Expand"}
                   >
-                    {expanded ? (
-                      <ChevronDown className="h-3.5 w-3.5" />
-                    ) : (
-                      <ChevronRight className="h-3.5 w-3.5" />
-                    )}
+                    {expanded ? "−" : "+"}
                   </button>
                   {/* Group name — click to select AND toggle expand/collapse.
                       The chevron button still works on its own; having the
                       row click also toggle removes the footgun where the
                       only way to collapse is via a 24px-wide chevron. */}
                   <button
-                    className="flex flex-1 items-center gap-2 py-1.5 pr-1 min-w-0"
+                    className="flex flex-1 items-center gap-2 py-1.5 pl-2 pr-1 min-w-0"
                     onClick={() => {
                       setSelection({ type: "group", group: g });
                       toggleGroup(g.id);
@@ -4760,8 +4782,14 @@ export function DNSPage() {
                   </button>
                 </div>
 
-                {/* Zone tree (when group expanded) */}
-                {(expanded || zoneInGroup) && (
+                {/* Zone tree (when group expanded). `expandedGroups` is the
+                    sole source of truth — URL/location restore effects add
+                    the group to the set when navigating to a zone, so a
+                    zone can't be "selected inside a collapsed group" in
+                    practice. Overriding with a zone-in-group check made
+                    the [+]/[−] toggle appear broken when a zone was selected:
+                    the state flipped but the tree stayed visible. */}
+                {expanded && (
                   <div className="ml-4 mb-1">
                     <ZoneTreeRows
                       groupId={g.id}

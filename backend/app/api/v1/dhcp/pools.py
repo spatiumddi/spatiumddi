@@ -17,6 +17,7 @@ from app.api.v1.dhcp._audit import write_audit
 from app.core.permissions import require_resource_permission
 from app.models.dhcp import DHCPPool, DHCPScope
 from app.models.ipam import IPAddress
+from app.services.dhcp.windows_writethrough import push_pool_change
 
 router = APIRouter(tags=["dhcp"], dependencies=[Depends(require_resource_permission("dhcp_pool"))])
 
@@ -143,6 +144,7 @@ async def create_pool(
     pool = DHCPPool(scope_id=scope_id, **body.model_dump())
     db.add(pool)
     await db.flush()
+    await push_pool_change(db, pool, action="create")
     write_audit(
         db,
         user=user,
@@ -165,8 +167,12 @@ async def update_pool(pool_id: uuid.UUID, body: PoolUpdate, db: DB, user: SuperA
     pool = await db.get(DHCPPool, pool_id)
     if pool is None:
         raise HTTPException(status_code=404, detail="Pool not found")
-    new_start = body.start_ip or str(pool.start_ip)
-    new_end = body.end_ip or str(pool.end_ip)
+    # Snapshot the old range BEFORE mutating, so we can remove the old
+    # exclusion from Windows if it shifted.
+    prev_start = str(pool.start_ip)
+    prev_end = str(pool.end_ip)
+    new_start = body.start_ip or prev_start
+    new_end = body.end_ip or prev_end
     if body.start_ip or body.end_ip:
         overlap = await _check_pool_overlap(
             db, pool.scope_id, new_start, new_end, exclude_id=pool.id
@@ -176,6 +182,8 @@ async def update_pool(pool_id: uuid.UUID, body: PoolUpdate, db: DB, user: SuperA
     changes = body.model_dump(exclude_none=True)
     for k, v in changes.items():
         setattr(pool, k, v)
+    await db.flush()
+    await push_pool_change(db, pool, action="update", prev_start=prev_start, prev_end=prev_end)
     write_audit(
         db,
         user=user,
@@ -196,6 +204,7 @@ async def delete_pool(pool_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
     pool = await db.get(DHCPPool, pool_id)
     if pool is None:
         raise HTTPException(status_code=404, detail="Pool not found")
+    await push_pool_change(db, pool, action="delete")
     write_audit(
         db,
         user=user,

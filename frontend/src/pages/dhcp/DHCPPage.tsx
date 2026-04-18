@@ -7,16 +7,7 @@ import {
   useQuery,
   useQueryClient,
 } from "@tanstack/react-query";
-import {
-  ChevronDown,
-  ChevronRight,
-  Pencil,
-  Plus,
-  RefreshCw,
-  Server,
-  Trash2,
-  Wifi,
-} from "lucide-react";
+import { Pencil, Plus, RefreshCw, Server, Trash2, Wifi } from "lucide-react";
 import {
   dhcpApi,
   ipamApi,
@@ -131,18 +122,18 @@ function GroupSidebar({
               >
                 <button
                   className={cn(
-                    "flex h-7 w-6 items-center justify-center flex-shrink-0",
+                    "ml-1 flex h-4 w-4 flex-shrink-0 items-center justify-center rounded-sm border text-[10px] font-bold",
                     selected
-                      ? "text-primary-foreground"
-                      : "text-muted-foreground hover:text-foreground",
+                      ? "border-primary-foreground/60 bg-primary text-primary-foreground"
+                      : "border-border bg-background text-muted-foreground hover:border-primary hover:text-primary",
                   )}
-                  onClick={() => toggle(g.id)}
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    toggle(g.id);
+                  }}
+                  title={isExpanded ? "Collapse" : "Expand"}
                 >
-                  {isExpanded ? (
-                    <ChevronDown className="h-3.5 w-3.5" />
-                  ) : (
-                    <ChevronRight className="h-3.5 w-3.5" />
-                  )}
+                  {isExpanded ? "−" : "+"}
                 </button>
                 <button
                   className="flex flex-1 items-center gap-2 py-1.5 pr-1 min-w-0"
@@ -368,6 +359,63 @@ function GroupDetailView({
 // Server detail view
 // ─────────────────────────────────────────────────────────────────────────────
 
+/** Scope delete — always shows the shared ``DeleteConfirmModal`` (so the
+ *  user must tick the "I understand" checkbox before the Delete button
+ *  enables), but enriches the payload with dependent object counts and a
+ *  windows_dhcp-specific warning so the user knows exactly what the
+ *  delete will take down with it.
+ */
+function ScopeDeleteModal({
+  scope,
+  server,
+  onConfirm,
+  onClose,
+  isPending,
+}: {
+  scope: DHCPScope;
+  server: DHCPServer;
+  onConfirm: () => void;
+  onClose: () => void;
+  isPending: boolean;
+}) {
+  const { data: pools = [] } = useQuery({
+    queryKey: ["dhcp-pools", scope.id],
+    queryFn: () => dhcpApi.listPools(scope.id),
+  });
+  const { data: statics = [] } = useQuery({
+    queryKey: ["dhcp-statics", scope.id],
+    queryFn: () => dhcpApi.listStatics(scope.id),
+  });
+  const references: string[] = [];
+  if (pools.length)
+    references.push(`${pools.length} pool${pools.length === 1 ? "" : "s"}`);
+  if (statics.length)
+    references.push(
+      `${statics.length} reservation${statics.length === 1 ? "" : "s"}`,
+    );
+  const windowsNote =
+    server.driver === "windows_dhcp"
+      ? " The scope will also be removed from the Windows DHCP server via WinRM."
+      : "";
+  return (
+    <DeleteConfirmModal
+      title="Delete DHCP Scope"
+      description={
+        `Delete scope "${scope.name || scope.id.slice(0, 8)}"? ` +
+        "All its pools and reservations will be removed as well." +
+        windowsNote
+      }
+      referencesTitle={
+        references.length ? "This scope currently has:" : undefined
+      }
+      references={references.length ? references : undefined}
+      onConfirm={onConfirm}
+      onClose={onClose}
+      isPending={isPending}
+    />
+  );
+}
+
 function ServerScopesTab({ server }: { server: DHCPServer }) {
   const qc = useQueryClient();
   const { data: subnets = [] } = useQuery({
@@ -424,13 +472,17 @@ function ServerScopesTab({ server }: { server: DHCPServer }) {
               if (e.target.value) setCreateForSubnet(e.target.value);
               e.target.value = "";
             }}
+            title="Pick the IPAM subnet you want this DHCP server to serve leases from."
           >
-            <option value="">+ New Scope on subnet…</option>
-            {subnets.map((s) => (
-              <option key={s.id} value={s.id}>
-                {s.network}
-              </option>
-            ))}
+            <option value="">+ Serve leases on subnet…</option>
+            {subnets
+              .filter((s) => !allScopes.some((sc) => sc.subnet_id === s.id))
+              .map((s) => (
+                <option key={s.id} value={s.id}>
+                  {s.network}
+                  {s.name ? ` — ${s.name}` : ""}
+                </option>
+              ))}
           </select>
         </div>
       </div>
@@ -489,6 +541,7 @@ function ServerScopesTab({ server }: { server: DHCPServer }) {
       {createForSubnet && (
         <CreateScopeModal
           subnetId={createForSubnet}
+          defaultServerId={server.id}
           onClose={() => setCreateForSubnet(null)}
         />
       )}
@@ -499,9 +552,9 @@ function ServerScopesTab({ server }: { server: DHCPServer }) {
         />
       )}
       {delScope && (
-        <DeleteConfirmModal
-          title="Delete DHCP Scope"
-          description={`Delete scope "${delScope.name}"?`}
+        <ScopeDeleteModal
+          scope={delScope}
+          server={server}
           onConfirm={() => delMut.mutate(delScope.id)}
           onClose={() => setDelScope(null)}
           isPending={delMut.isPending}
@@ -977,9 +1030,57 @@ function ServerDetailView({
 }) {
   const qc = useQueryClient();
   const [tab, setTab] = useState<Tab>("scopes");
+  const [syncBanner, setSyncBanner] = useState<string | null>(null);
   const syncMut = useMutation({
     mutationFn: () => dhcpApi.syncServer(server.id),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["dhcp-servers"] }),
+  });
+  const leaseSyncMut = useMutation({
+    mutationFn: () => dhcpApi.syncLeasesNow(server.id),
+    onSuccess: (result) => {
+      qc.invalidateQueries({ queryKey: ["dhcp-servers"] });
+      qc.invalidateQueries({ queryKey: ["dhcp-leases", server.id] });
+      qc.invalidateQueries({ queryKey: ["ipam-addresses"] });
+      // Also invalidate subnet-level scope queries so the DHCP topology
+      // views refresh once scopes / pools / statics get imported.
+      qc.invalidateQueries({ queryKey: ["dhcp-scopes"] });
+      const parts: string[] = [];
+      // Topology line first — only shown when the driver imports scopes.
+      if (
+        result.scopes_imported ||
+        result.scopes_refreshed ||
+        result.scopes_skipped_no_subnet
+      ) {
+        const scopeBits: string[] = [];
+        if (result.scopes_imported)
+          scopeBits.push(`${result.scopes_imported} scopes imported`);
+        if (result.scopes_refreshed)
+          scopeBits.push(`${result.scopes_refreshed} refreshed`);
+        if (result.scopes_skipped_no_subnet)
+          scopeBits.push(
+            `${result.scopes_skipped_no_subnet} skipped (no matching IPAM subnet)`,
+          );
+        if (result.pools_synced) scopeBits.push(`${result.pools_synced} pools`);
+        if (result.statics_synced)
+          scopeBits.push(`${result.statics_synced} reservations`);
+        parts.push(scopeBits.join(" / "));
+      }
+      parts.push(`${result.server_leases} leases on wire`);
+      if (result.imported) parts.push(`${result.imported} imported`);
+      if (result.refreshed) parts.push(`${result.refreshed} refreshed`);
+      if (result.ipam_created || result.ipam_refreshed)
+        parts.push(`IPAM ${result.ipam_created}+ / ${result.ipam_refreshed}~`);
+      if (result.out_of_scope)
+        parts.push(`${result.out_of_scope} out-of-scope`);
+      if (result.errors.length)
+        parts.push(`${result.errors.length} error(s): ${result.errors[0]}`);
+      setSyncBanner(parts.join(" · "));
+    },
+    onError: (e) =>
+      setSyncBanner(
+        (e as { response?: { data?: { detail?: string } } })?.response?.data
+          ?.detail ?? "Sync leases failed",
+      ),
   });
   const approveMut = useMutation({
     mutationFn: () => dhcpApi.approveServer(server.id),
@@ -997,7 +1098,7 @@ function ServerDetailView({
               <span className="rounded-full bg-muted px-2 py-0.5 text-xs">
                 {server.driver}
               </span>
-              {!server.agent_approved && (
+              {!server.agent_approved && !server.is_agentless && (
                 <span className="rounded-full bg-amber-100 px-2 py-0.5 text-xs text-amber-800 dark:bg-amber-900/30 dark:text-amber-400">
                   pending approval
                 </span>
@@ -1016,7 +1117,7 @@ function ServerDetailView({
             </div>
           </div>
           <div className="flex items-center gap-2">
-            {!server.agent_approved && (
+            {!server.agent_approved && !server.is_agentless && (
               <button
                 onClick={() => approveMut.mutate()}
                 className="rounded-md bg-emerald-600 px-3 py-1.5 text-xs text-white hover:bg-emerald-700"
@@ -1025,16 +1126,36 @@ function ServerDetailView({
                 Approve
               </button>
             )}
-            <button
-              onClick={() => syncMut.mutate()}
-              className="flex items-center gap-1 rounded-md border px-3 py-1.5 text-xs hover:bg-accent"
-              disabled={syncMut.isPending}
-            >
-              <RefreshCw
-                className={cn("h-3 w-3", syncMut.isPending && "animate-spin")}
-              />
-              Force Sync
-            </button>
+            {server.is_read_only ? (
+              <button
+                onClick={() => {
+                  setSyncBanner(null);
+                  leaseSyncMut.mutate();
+                }}
+                className="flex items-center gap-1 rounded-md border px-3 py-1.5 text-xs hover:bg-accent"
+                disabled={leaseSyncMut.isPending}
+                title="Poll this server for active leases and mirror them into DHCP + IPAM"
+              >
+                <RefreshCw
+                  className={cn(
+                    "h-3 w-3",
+                    leaseSyncMut.isPending && "animate-spin",
+                  )}
+                />
+                Sync Leases
+              </button>
+            ) : (
+              <button
+                onClick={() => syncMut.mutate()}
+                className="flex items-center gap-1 rounded-md border px-3 py-1.5 text-xs hover:bg-accent"
+                disabled={syncMut.isPending}
+              >
+                <RefreshCw
+                  className={cn("h-3 w-3", syncMut.isPending && "animate-spin")}
+                />
+                Force Sync
+              </button>
+            )}
             <button
               onClick={onEdit}
               className="rounded-md border px-3 py-1.5 text-xs hover:bg-accent"
@@ -1049,6 +1170,25 @@ function ServerDetailView({
             </button>
           </div>
         </div>
+        {server.driver === "windows_dhcp" && (
+          <div className="mt-3 rounded border border-sky-500/30 bg-sky-500/5 px-3 py-1.5 text-[11px] text-sky-700 dark:text-sky-400">
+            Scope / pool / reservation edits on this server push to Windows DHCP
+            via WinRM as you save. Source of truth lives on the DC; SpatiumDDI
+            is a controller + mirror.
+          </div>
+        )}
+        {syncBanner && (
+          <div className="mt-3 flex items-center justify-between gap-2 rounded border bg-muted/40 px-3 py-1.5 text-xs">
+            <span className="truncate">{syncBanner}</span>
+            <button
+              type="button"
+              onClick={() => setSyncBanner(null)}
+              className="rounded border px-1.5 py-0.5 text-[10px] hover:bg-accent"
+            >
+              dismiss
+            </button>
+          </div>
+        )}
       </div>
 
       <div className="border-b px-6 bg-card">

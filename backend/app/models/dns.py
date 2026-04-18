@@ -86,7 +86,15 @@ class DNSServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     api_key_encrypted: Mapped[str | None] = mapped_column(Text, nullable=True)
     # roles: authoritative | recursive | forwarder (JSON array of strings)
     roles: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
-    # status: active | unreachable | syncing | error
+    # User-controlled "pause" — when False, this server is skipped by the
+    # health-check sweep, the bi-directional sync task, and the record-op
+    # dispatcher. Separate from ``status`` (which tracks reachability —
+    # derived, not user-editable). Default True so existing rows keep
+    # their current behaviour post-migration.
+    is_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default="true"
+    )
+    # status: active | unreachable | syncing | error | disabled
     status: Mapped[str] = mapped_column(String(50), nullable=False, default="active")
     last_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_health_check_at: Mapped[datetime | None] = mapped_column(

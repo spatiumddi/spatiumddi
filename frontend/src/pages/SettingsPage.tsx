@@ -63,6 +63,7 @@ type SectionId =
   | "dns-auto-sync"
   | "dns-pull-from-server"
   | "dhcp"
+  | "dhcp-lease-sync"
   | "ip-allocation"
   | "session"
   | "subnet-tree"
@@ -139,6 +140,23 @@ const SECTIONS: SectionDef[] = [
     description:
       "Default DNS servers, domain, NTP, and lease time pre-filled when creating a new scope.",
     keywords: ["dns", "domain", "search", "ntp", "lease", "option 42", "scope"],
+  },
+  {
+    id: "dhcp-lease-sync",
+    title: "DHCP Lease Sync",
+    description:
+      "Poll agentless DHCP servers (Windows DHCP today) for active leases and mirror them into DHCP + IPAM. Additive only; expiry is handled by the existing lease cleanup sweep.",
+    keywords: [
+      "dhcp",
+      "lease",
+      "windows",
+      "winrm",
+      "poll",
+      "ipam",
+      "mirror",
+      "additive",
+      "auto",
+    ],
   },
   {
     id: "ip-allocation",
@@ -554,6 +572,56 @@ export function SettingsPage() {
                     {values.dns_pull_from_server_last_run_at
                       ? new Date(
                           values.dns_pull_from_server_last_run_at,
+                        ).toLocaleString()
+                      : "never"}
+                  </span>
+                </Field>
+              </>
+            )}
+
+            {activeId === "dhcp-lease-sync" && (
+              <>
+                <Field
+                  label="Enable Lease Sync"
+                  description="Periodically poll agentless DHCP servers (Windows DHCP today) and upsert their active leases into SpatiumDDI. Each lease also mirrors into IPAM as an auto-from-lease row when the IP lives in a known subnet. Expiry is handled by the existing lease-cleanup sweep, not here."
+                >
+                  <Toggle
+                    checked={!!values.dhcp_pull_leases_enabled}
+                    onChange={(v) => set("dhcp_pull_leases_enabled", v)}
+                    disabled={!isSuperadmin}
+                  />
+                </Field>
+                <Field
+                  label="Poll Interval"
+                  description="How often the sync job polls each agentless server. WinRM round-trips are cheap; 5 minutes is a reasonable default. Lower it if your lease TTLs are short and you want fresher IPAM mirroring."
+                >
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="number"
+                      min={1}
+                      value={values.dhcp_pull_leases_interval_minutes ?? 5}
+                      onChange={(e) =>
+                        set(
+                          "dhcp_pull_leases_interval_minutes",
+                          Number(e.target.value),
+                        )
+                      }
+                      disabled={
+                        !isSuperadmin || !values.dhcp_pull_leases_enabled
+                      }
+                      className={cn(inputCls, "w-24")}
+                    />
+                    <span className="text-xs text-muted-foreground">min</span>
+                  </div>
+                </Field>
+                <Field
+                  label="Last Run"
+                  description="Timestamp of the most recent poll pass."
+                >
+                  <span className="rounded bg-muted px-2 py-1 text-xs font-mono text-muted-foreground">
+                    {values.dhcp_pull_leases_last_run_at
+                      ? new Date(
+                          values.dhcp_pull_leases_last_run_at,
                         ).toLocaleString()
                       : "never"}
                   </span>

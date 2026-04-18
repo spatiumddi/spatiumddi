@@ -16,9 +16,11 @@ from app.api.deps import DB, CurrentUser
 from app.api.v1.ipam.io_router import router as io_router
 from app.core.permissions import require_any_resource_permission
 from app.models.audit import AuditLog
+from app.models.dhcp import DHCPStaticAssignment
 from app.models.dns import DNSRecord, DNSZone
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet, SubnetDomain
 from app.models.vlans import VLAN
+from app.services.dhcp.windows_writethrough import push_static_change
 
 logger = structlog.get_logger(__name__)
 
@@ -672,6 +674,7 @@ class IPSpaceCreate(BaseModel):
     dns_group_ids: list[str] = []
     dns_zone_id: str | None = None
     dns_additional_zone_ids: list[str] = []
+    dhcp_server_group_id: uuid.UUID | None = None
 
 
 class IPSpaceUpdate(BaseModel):
@@ -682,6 +685,7 @@ class IPSpaceUpdate(BaseModel):
     dns_group_ids: list[str] | None = None
     dns_zone_id: str | None = None
     dns_additional_zone_ids: list[str] | None = None
+    dhcp_server_group_id: uuid.UUID | None = None
 
 
 class IPSpaceResponse(BaseModel):
@@ -693,6 +697,7 @@ class IPSpaceResponse(BaseModel):
     dns_group_ids: list[str] = []
     dns_zone_id: str | None = None
     dns_additional_zone_ids: list[str] = []
+    dhcp_server_group_id: uuid.UUID | None = None
     created_at: datetime
     modified_at: datetime
 
@@ -716,6 +721,8 @@ class IPBlockCreate(BaseModel):
     dns_zone_id: str | None = None
     dns_additional_zone_ids: list[str] = []
     dns_inherit_settings: bool = True
+    dhcp_server_group_id: uuid.UUID | None = None
+    dhcp_inherit_settings: bool = True
 
     @field_validator("network")
     @classmethod
@@ -737,6 +744,8 @@ class IPBlockUpdate(BaseModel):
     dns_zone_id: str | None = None
     dns_additional_zone_ids: list[str] | None = None
     dns_inherit_settings: bool | None = None
+    dhcp_server_group_id: uuid.UUID | None = None
+    dhcp_inherit_settings: bool | None = None
 
 
 class IPBlockResponse(BaseModel):
@@ -753,6 +762,8 @@ class IPBlockResponse(BaseModel):
     dns_zone_id: str | None
     dns_additional_zone_ids: list[str] | None
     dns_inherit_settings: bool
+    dhcp_server_group_id: uuid.UUID | None = None
+    dhcp_inherit_settings: bool = True
     created_at: datetime
     modified_at: datetime
 
@@ -793,6 +804,8 @@ class SubnetCreate(BaseModel):
     dns_zone_id: str | None = None
     dns_additional_zone_ids: list[str] = []
     dns_inherit_settings: bool = True
+    dhcp_server_group_id: uuid.UUID | None = None
+    dhcp_inherit_settings: bool = True
 
     @field_validator("network")
     @classmethod
@@ -840,6 +853,8 @@ class SubnetUpdate(BaseModel):
     dns_zone_id: str | None = None
     dns_additional_zone_ids: list[str] | None = None
     dns_inherit_settings: bool | None = None
+    dhcp_server_group_id: uuid.UUID | None = None
+    dhcp_inherit_settings: bool | None = None
 
     @field_validator("status")
     @classmethod
@@ -886,6 +901,8 @@ class SubnetResponse(BaseModel):
     dns_zone_id: str | None
     dns_additional_zone_ids: list[str] | None
     dns_inherit_settings: bool
+    dhcp_server_group_id: uuid.UUID | None = None
+    dhcp_inherit_settings: bool = True
     created_at: datetime
     modified_at: datetime
 
@@ -921,6 +938,20 @@ class EffectiveDnsResponse(BaseModel):
     dns_zone_id: str | None
     dns_additional_zone_ids: list[str]
     inherited_from_block_id: str | None
+
+
+class EffectiveDhcpResponse(BaseModel):
+    """Effective DHCP server-group resolution for a space/block/subnet.
+
+    Walks the hierarchy until it finds a level that explicitly sets a server
+    group (or opts out of inheritance). ``inherited_from_block_id`` is set
+    when the value came from an ancestor block; None when it came from the
+    level itself or the space.
+    """
+
+    dhcp_server_group_id: str | None
+    inherited_from_block_id: str | None
+    inherited_from_space: bool = False
 
 
 class AliasInput(BaseModel):
@@ -1017,6 +1048,11 @@ class IPAddressResponse(BaseModel):
     dns_record_id: uuid.UUID | None = None
     dhcp_lease_id: str | None = None
     static_assignment_id: str | None = None
+    # True when this IPAM row was auto-created by the DHCP lease-pull task
+    # mirroring a dynamic lease. Surfaced so the UI can suppress the per-IP
+    # edit/delete actions — the row reflects server state, not user intent,
+    # and any edit would be overwritten on the next pull cycle.
+    auto_from_lease: bool = False
     # Number of user-added CNAME/A alias records on this IP (excludes the primary A).
     # Populated in list/get endpoints via a bulk lookup; defaults to 0 on other paths.
     alias_count: int = 0
@@ -1113,9 +1149,15 @@ async def update_space(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP space not found")
 
     old = {"name": space.name, "description": space.description, "tags": space.tags}
-    changes = body.model_dump(exclude_none=True)
+    changes = body.model_dump(exclude_none=True, exclude={"dhcp_server_group_id"})
     for field, value in changes.items():
         setattr(space, field, value)
+    # Handle DHCP fields explicitly so explicit null (clear) is preserved.
+    if "dhcp_server_group_id" in body.model_fields_set:
+        space.dhcp_server_group_id = body.dhcp_server_group_id
+        changes["dhcp_server_group_id"] = (
+            str(body.dhcp_server_group_id) if body.dhcp_server_group_id else None
+        )
 
     db.add(
         _audit(
@@ -1146,6 +1188,23 @@ async def get_effective_space_dns(
         dns_zone_id=space.dns_zone_id,
         dns_additional_zone_ids=space.dns_additional_zone_ids or [],
         inherited_from_block_id=None,
+    )
+
+
+@router.get("/spaces/{space_id}/effective-dhcp", response_model=EffectiveDhcpResponse)
+async def get_effective_space_dhcp(
+    space_id: uuid.UUID, current_user: CurrentUser, db: DB
+) -> EffectiveDhcpResponse:
+    """Return the DHCP server group set directly on the space."""
+    space = await db.get(IPSpace, space_id)
+    if space is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP space not found")
+    return EffectiveDhcpResponse(
+        dhcp_server_group_id=(
+            str(space.dhcp_server_group_id) if space.dhcp_server_group_id else None
+        ),
+        inherited_from_block_id=None,
+        inherited_from_space=False,
     )
 
 
@@ -1305,6 +1364,8 @@ async def update_block(
             "dns_zone_id",
             "dns_additional_zone_ids",
             "dns_inherit_settings",
+            "dhcp_server_group_id",
+            "dhcp_inherit_settings",
             "parent_block_id",
         },
     )
@@ -1315,6 +1376,12 @@ async def update_block(
     for field in dns_fields & body.model_fields_set:
         setattr(block, field, getattr(body, field))
         changes[field] = getattr(body, field)
+    # Same treatment for the DHCP fields.
+    dhcp_fields = {"dhcp_server_group_id", "dhcp_inherit_settings"}
+    for field in dhcp_fields & body.model_fields_set:
+        val = getattr(body, field)
+        setattr(block, field, val)
+        changes[field] = str(val) if isinstance(val, uuid.UUID) else val
     if reparent_requested:
         changes["parent_block_id"] = str(body.parent_block_id) if body.parent_block_id else None
 
@@ -1488,6 +1555,43 @@ async def get_effective_block_dns(
 
     return EffectiveDnsResponse(
         dns_group_ids=[], dns_zone_id=None, dns_additional_zone_ids=[], inherited_from_block_id=None
+    )
+
+
+@router.get("/blocks/{block_id}/effective-dhcp", response_model=EffectiveDhcpResponse)
+async def get_effective_block_dhcp(
+    block_id: uuid.UUID, current_user: CurrentUser, db: DB
+) -> EffectiveDhcpResponse:
+    """Resolve effective DHCP server group by walking block ancestors then the space."""
+    block = await db.get(IPBlock, block_id)
+    if block is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Block not found")
+
+    current = block
+    while current is not None:
+        if not current.dhcp_inherit_settings:
+            return EffectiveDhcpResponse(
+                dhcp_server_group_id=(
+                    str(current.dhcp_server_group_id) if current.dhcp_server_group_id else None
+                ),
+                inherited_from_block_id=str(current.id) if current.id != block_id else None,
+                inherited_from_space=False,
+            )
+        if current.parent_block_id:
+            current = await db.get(IPBlock, current.parent_block_id)
+        else:
+            # Root block → fall through to the space-level default.
+            space = await db.get(IPSpace, current.space_id)
+            if space and space.dhcp_server_group_id:
+                return EffectiveDhcpResponse(
+                    dhcp_server_group_id=str(space.dhcp_server_group_id),
+                    inherited_from_block_id=None,
+                    inherited_from_space=True,
+                )
+            break
+
+    return EffectiveDhcpResponse(
+        dhcp_server_group_id=None, inherited_from_block_id=None, inherited_from_space=False
     )
 
 
@@ -1714,6 +1818,53 @@ async def get_effective_subnet_dns(
     )
 
 
+@router.get("/subnets/{subnet_id}/effective-dhcp", response_model=EffectiveDhcpResponse)
+async def get_effective_subnet_dhcp(
+    subnet_id: uuid.UUID, current_user: CurrentUser, db: DB
+) -> EffectiveDhcpResponse:
+    """Resolve effective DHCP server group for a subnet, walking up block ancestors
+    and finally the space."""
+    subnet = await db.get(Subnet, subnet_id)
+    if subnet is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
+
+    if not subnet.dhcp_inherit_settings:
+        return EffectiveDhcpResponse(
+            dhcp_server_group_id=(
+                str(subnet.dhcp_server_group_id) if subnet.dhcp_server_group_id else None
+            ),
+            inherited_from_block_id=None,
+            inherited_from_space=False,
+        )
+
+    current = await db.get(IPBlock, subnet.block_id) if subnet.block_id else None
+    while current is not None:
+        if not current.dhcp_inherit_settings:
+            return EffectiveDhcpResponse(
+                dhcp_server_group_id=(
+                    str(current.dhcp_server_group_id) if current.dhcp_server_group_id else None
+                ),
+                inherited_from_block_id=str(current.id),
+                inherited_from_space=False,
+            )
+        if current.parent_block_id:
+            current = await db.get(IPBlock, current.parent_block_id)
+        else:
+            # Fall through to space-level default when no block overrides.
+            space = await db.get(IPSpace, current.space_id)
+            if space and space.dhcp_server_group_id:
+                return EffectiveDhcpResponse(
+                    dhcp_server_group_id=str(space.dhcp_server_group_id),
+                    inherited_from_block_id=None,
+                    inherited_from_space=True,
+                )
+            current = None
+
+    return EffectiveDhcpResponse(
+        dhcp_server_group_id=None, inherited_from_block_id=None, inherited_from_space=False
+    )
+
+
 @router.put("/subnets/{subnet_id}", response_model=SubnetResponse)
 async def update_subnet(
     subnet_id: uuid.UUID, body: SubnetUpdate, current_user: CurrentUser, db: DB
@@ -1795,6 +1946,8 @@ async def update_subnet(
         "dns_zone_id",
         "dns_additional_zone_ids",
         "dns_inherit_settings",
+        "dhcp_server_group_id",
+        "dhcp_inherit_settings",
     }
     changes = body.model_dump(exclude_none=True, exclude=exclude_fields)
     changes_for_audit = body.model_dump(mode="json", exclude_none=True, exclude=exclude_fields)
@@ -1804,6 +1957,12 @@ async def update_subnet(
     dns_fields = {"dns_group_ids", "dns_zone_id", "dns_additional_zone_ids", "dns_inherit_settings"}
     for field in dns_fields & body.model_fields_set:
         setattr(subnet, field, getattr(body, field))
+    # Same treatment for DHCP fields.
+    dhcp_fields = {"dhcp_server_group_id", "dhcp_inherit_settings"}
+    for field in dhcp_fields & body.model_fields_set:
+        val = getattr(body, field)
+        setattr(subnet, field, val)
+        changes_for_audit[field] = str(val) if isinstance(val, uuid.UUID) else val
 
     # Handle add/remove of auto-created network/broadcast/gateway records
     if body.manage_auto_addresses is not None:
@@ -2498,6 +2657,19 @@ async def update_address(
     if ip is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP address not found")
 
+    # Dynamic-lease mirrors are owned by the DHCP server, not IPAM. Any edit
+    # here would be overwritten on the next pull cycle, so refuse outright —
+    # the user needs to edit the lease / reservation at the source.
+    if ip.auto_from_lease:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "This IP mirrors a dynamic DHCP lease and is managed by the "
+                "DHCP server. Edit the lease or convert it to a reservation "
+                "at the source."
+            ),
+        )
+
     # MAC required if transitioning to static_dhcp
     new_status = body.status or ip.status
     new_mac = body.mac_address if body.mac_address is not None else ip.mac_address
@@ -2698,7 +2870,35 @@ async def delete_address(
     if ip is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP address not found")
 
+    # Dynamic-lease mirrors are owned by the DHCP server. Deleting one here
+    # would just get recreated on the next pull cycle — block it so the user
+    # sees why and goes to release the lease at the source. (The lease-pull
+    # task deletes these rows via its own SessionLocal, not this endpoint.)
+    if ip.auto_from_lease:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                "This IP mirrors a dynamic DHCP lease. Release or convert "
+                "the lease at the DHCP server; the IPAM row will be removed "
+                "automatically on the next pull cycle."
+            ),
+        )
+
     subnet = await db.get(Subnet, ip.subnet_id)
+
+    # Clean up any DHCP static reservations tied to this IP. The FK is
+    # ``ondelete=SET NULL`` (so a stray orphan row can't block an IP delete),
+    # but without this step a reservation stays on Windows / Kea forever and
+    # the DB row lingers with a null ip_address_id. Push the delete through
+    # the write-through first — if Windows refuses, we raise 502 before
+    # committing and no drift is introduced.
+    statics_res = await db.execute(
+        select(DHCPStaticAssignment).where(DHCPStaticAssignment.ip_address_id == address_id)
+    )
+    for static in statics_res.scalars().all():
+        await push_static_change(db, static, action="delete")
+        await db.delete(static)
+
     if permanent:
         subnet_id = ip.subnet_id
         # Remove auto-generated DNS record before deleting the IP (FK would null it anyway,
@@ -2780,6 +2980,15 @@ async def purge_orphans(
             await _sync_dns_record(db, ip, subnet, action="delete")
         except Exception:  # noqa: BLE001
             pass
+        # Clean up any lingering DHCP static reservations. Normally the
+        # orphan-transition in ``delete_address`` already removed these; this
+        # catches older orphans created before that code existed.
+        stat_res = await db.execute(
+            select(DHCPStaticAssignment).where(DHCPStaticAssignment.ip_address_id == ip.id)
+        )
+        for static in stat_res.scalars().all():
+            await push_static_change(db, static, action="delete")
+            await db.delete(static)
         db.add(
             _audit(
                 current_user,
@@ -3592,6 +3801,12 @@ async def bulk_edit_addresses(
 
     for ip in rows:
         if ip.status in ("network", "broadcast", "orphan"):
+            skipped.append(ip.id)
+            continue
+        # Skip dynamic-lease mirrors — DHCP server owns their state and any
+        # edit here would be overwritten on the next pull. The UI already
+        # blocks these from being selected; this is defence-in-depth.
+        if ip.auto_from_lease:
             skipped.append(ip.id)
             continue
 

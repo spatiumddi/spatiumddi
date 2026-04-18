@@ -6,8 +6,6 @@ import {
   Pencil,
   Trash2,
   X,
-  ChevronRight,
-  ChevronDown,
   Tag,
 } from "lucide-react";
 import {
@@ -205,13 +203,10 @@ function RouterSidebarItem({
             e.stopPropagation();
             onToggle();
           }}
-          className="rounded p-0.5 hover:bg-muted flex-shrink-0"
+          className="flex h-4 w-4 flex-shrink-0 items-center justify-center rounded-sm border border-border bg-background text-[10px] font-bold text-muted-foreground hover:border-primary hover:text-primary"
+          title={expanded ? "Collapse" : "Expand"}
         >
-          {expanded ? (
-            <ChevronDown className="h-3.5 w-3.5" />
-          ) : (
-            <ChevronRight className="h-3.5 w-3.5" />
-          )}
+          {expanded ? "−" : "+"}
         </button>
         <button
           onClick={() => onSelect({ kind: "router", id: router.id })}

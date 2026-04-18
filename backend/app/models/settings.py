@@ -86,6 +86,20 @@ class PlatformSettings(Base):
         DateTime(timezone=True), nullable=True
     )
 
+    # Scheduled "pull leases from DHCP server" — counterpart to the DNS
+    # pull-from-server setting above, but for lease reads (Windows DHCP
+    # WinRM today). Beat fires every 60s; task gates on these so the UI can
+    # change cadence without restarting celery-beat. Additive-only: lease
+    # rows are upserted by (server_id, ip_address); mirrored IPAM rows are
+    # removed by the existing lease-cleanup sweep when expires_at passes.
+    dhcp_pull_leases_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    dhcp_pull_leases_interval_minutes: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=5
+    )
+    dhcp_pull_leases_last_run_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
     # DHCP defaults — applied as the initial values when creating a new DHCP scope
     dhcp_default_dns_servers: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
     dhcp_default_domain_name: Mapped[str] = mapped_column(String(255), nullable=False, default="")

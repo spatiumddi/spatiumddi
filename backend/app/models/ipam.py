@@ -36,6 +36,15 @@ class IPSpace(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     dns_zone_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     dns_additional_zone_ids: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
 
+    # DHCP server group — parallels the DNS inheritance path. A space-level
+    # default is picked up by any child block/subnet that has
+    # dhcp_inherit_settings=True and no override of its own.
+    dhcp_server_group_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dhcp_server_group.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
     blocks: Mapped[list["IPBlock"]] = relationship(
         "IPBlock", back_populates="space", cascade="all, delete-orphan"
     )
@@ -97,6 +106,18 @@ class IPBlock(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     dns_additional_zone_ids: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
     dns_inherit_settings: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
+    # DHCP assignment — same inherit-from-parent semantics as DNS. When
+    # ``dhcp_inherit_settings`` is True we walk up the block chain (and
+    # finally the space) for the effective server group.
+    dhcp_server_group_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dhcp_server_group.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    dhcp_inherit_settings: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=sa_text("true")
+    )
+
     space: Mapped[IPSpace] = relationship("IPSpace", back_populates="blocks")
     parent: Mapped["IPBlock | None"] = relationship("IPBlock", remote_side="IPBlock.id")
     children: Mapped[list["IPBlock"]] = relationship("IPBlock", back_populates="parent")
@@ -148,6 +169,16 @@ class Subnet(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     dns_zone_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     dns_additional_zone_ids: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
     dns_inherit_settings: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+    # DHCP assignment — same inherit-from-parent semantics as DNS.
+    dhcp_server_group_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dhcp_server_group.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    dhcp_inherit_settings: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=sa_text("true")
+    )
 
     # Status: active | deprecated | reserved | quarantine
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="active", index=True)

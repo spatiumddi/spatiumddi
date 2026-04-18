@@ -1,4 +1,24 @@
-"""DHCP server health check Celery tasks. Mirrors app.tasks.dns.check_dns_server_health."""
+"""DHCP server health check Celery tasks.
+
+Two code paths:
+
+* **Agent-based drivers** (``kea``, ``isc-dhcp``): trust the agent heartbeat.
+  ``agent_last_seen`` is stamped by ``POST /api/v1/dhcp/servers/{id}/heartbeat``;
+  if it's fresh we flip status to ``active``, otherwise ``unreachable``.
+* **Agentless drivers** (``windows_dhcp``): the control plane has to do the
+  poking itself. We call ``driver.health_check(server)`` which runs a small
+  WinRM round-trip (``Get-DhcpServerVersion``) and flip status based on the
+  boolean result.
+
+Either way, ``last_health_check_at`` is always stamped so the dashboard shows
+an up-to-date timestamp instead of the "never checked" placeholder.
+
+Uses a per-task async engine + session factory (see
+``app.tasks.dhcp_pull_leases`` for the same pattern). Re-using the shared
+``AsyncSessionLocal`` from worker code ties its asyncpg connections to the
+first event loop that touches it, which causes "Future attached to a
+different loop" errors across concurrent Celery tasks.
+"""
 
 from __future__ import annotations
 
@@ -8,9 +28,11 @@ from datetime import UTC, datetime, timedelta
 
 import structlog
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.celery_app import celery_app
-from app.db import AsyncSessionLocal
+from app.config import settings
+from app.drivers.dhcp import get_driver, is_agentless
 from app.models.dhcp import DHCPServer
 
 # If agent hasn't heartbeat'd in this long, mark unreachable.
@@ -20,26 +42,55 @@ logger = structlog.get_logger(__name__)
 
 
 async def _check_health(server_id: uuid.UUID) -> None:
-    async with AsyncSessionLocal() as db:
-        server = await db.get(DHCPServer, server_id)
-        if server is None:
-            return
-        now = datetime.now(UTC)
-        last_seen = server.agent_last_seen
-        if last_seen is not None and (now - last_seen) <= AGENT_STALE_AFTER:
-            server.status = "active"
-        else:
-            # No agent heartbeat — mark unreachable. (Driver-level health probe
-            # could be added here for non-agent deployments.)
-            server.status = "unreachable"
-        server.last_health_check_at = now
-        await db.commit()
-        logger.info(
-            "dhcp_health_checked",
-            server_id=str(server_id),
-            status=server.status,
-            host=server.host,
-        )
+    engine = create_async_engine(settings.database_url, future=True)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with session_factory() as db:
+            server = await db.get(DHCPServer, server_id)
+            if server is None:
+                return
+
+            now = datetime.now(UTC)
+
+            if is_agentless(server.driver):
+                # Agentless: ask the driver to round-trip against the server.
+                # Any exception from get_driver / health_check is caught and
+                # surfaced as status="unreachable" — we still stamp the check
+                # timestamp so the dashboard reflects that we did try.
+                try:
+                    driver = get_driver(server.driver)
+                    ok, _msg = await driver.health_check(server)
+                    server.status = "active" if ok else "unreachable"
+                except Exception as exc:  # noqa: BLE001 — surface any driver error
+                    server.status = "unreachable"
+                    logger.warning(
+                        "dhcp_health_driver_probe_failed",
+                        server_id=str(server_id),
+                        driver=server.driver,
+                        host=server.host,
+                        error=str(exc),
+                    )
+            else:
+                # Agent-based: trust the heartbeat.
+                last_seen = server.agent_last_seen
+                if last_seen is not None and (now - last_seen) <= AGENT_STALE_AFTER:
+                    server.status = "active"
+                else:
+                    server.status = "unreachable"
+
+            server.last_health_check_at = now
+            await db.commit()
+
+            logger.info(
+                "dhcp_health_checked",
+                server_id=str(server_id),
+                driver=server.driver,
+                agentless=is_agentless(server.driver),
+                status=server.status,
+                host=server.host,
+            )
+    finally:
+        await engine.dispose()
 
 
 @celery_app.task(
@@ -58,9 +109,14 @@ def check_dhcp_server_health(self: object, server_id: str) -> None:  # type: ign
 
 
 async def _enqueue_all() -> None:
-    async with AsyncSessionLocal() as db:
-        result = await db.execute(select(DHCPServer.id))
-        ids = [str(row[0]) for row in result.all()]
+    engine = create_async_engine(settings.database_url, future=True)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with session_factory() as db:
+            result = await db.execute(select(DHCPServer.id))
+            ids = [str(row[0]) for row in result.all()]
+    finally:
+        await engine.dispose()
     for sid in ids:
         check_dhcp_server_health.delay(sid)
 

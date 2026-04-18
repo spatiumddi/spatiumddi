@@ -132,6 +132,7 @@ class ServerCreate(BaseModel):
     api_key: str | None = None
     roles: list[str] = []
     notes: str = ""
+    is_enabled: bool = True
 
     @field_validator("driver")
     @classmethod
@@ -151,6 +152,7 @@ class ServerUpdate(BaseModel):
     roles: list[str] | None = None
     status: str | None = None
     notes: str | None = None
+    is_enabled: bool | None = None
 
     @field_validator("driver")
     @classmethod
@@ -170,6 +172,7 @@ class ServerResponse(BaseModel):
     api_port: int | None
     roles: list[str]
     status: str
+    is_enabled: bool
     last_sync_at: datetime | None
     last_health_check_at: datetime | None
     notes: str
@@ -685,6 +688,17 @@ async def update_server(
     changes = body.model_dump(exclude_none=True, exclude={"api_key"})
     if body.api_key is not None:
         changes["api_key_encrypted"] = body.api_key  # TODO: encrypt
+    # When the user flips is_enabled, reflect it in status immediately so
+    # the UI pill updates without waiting for the next 60s health-sweep
+    # tick. The sweep then re-asserts on schedule.
+    if body.is_enabled is not None and body.is_enabled != server.is_enabled:
+        if body.is_enabled:
+            # Re-enabling → transitional "syncing" state. Next sweep tick
+            # will probe and set active/unreachable.
+            if server.status == "disabled":
+                changes["status"] = "syncing"
+        else:
+            changes["status"] = "disabled"
     for k, v in changes.items():
         setattr(server, k, v)
     db.add(

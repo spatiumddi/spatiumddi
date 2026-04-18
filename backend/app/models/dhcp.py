@@ -16,6 +16,7 @@ from sqlalchemy import (
     ForeignKey,
     Index,
     Integer,
+    LargeBinary,
     String,
     Text,
     UniqueConstraint,
@@ -87,6 +88,12 @@ class DHCPServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     config_pushed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+
+    # Fernet-encrypted JSON blob for driver-specific admin credentials.
+    # windows_dhcp stores a dict: {"username", "password", "winrm_port",
+    # "transport", "use_tls", "verify_tls"}. Agent-based drivers (kea,
+    # isc_dhcp) leave this NULL — they authenticate via agent JWT.
+    credentials_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
 
     group: Mapped[DHCPServerGroup | None] = relationship(
         "DHCPServerGroup", back_populates="servers", lazy="joined"

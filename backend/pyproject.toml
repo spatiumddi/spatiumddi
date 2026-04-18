@@ -33,6 +33,7 @@ dependencies = [
     "openpyxl>=3.1.5",
     "dnspython>=2.7.0",
     "jinja2>=3.1.4",
+    "pywinrm>=0.4.3",
 ]
 
 [project.optional-dependencies]

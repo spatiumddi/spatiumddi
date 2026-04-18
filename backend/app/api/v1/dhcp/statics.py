@@ -16,6 +16,7 @@ from app.api.v1.dhcp._audit import write_audit
 from app.core.permissions import require_resource_permission
 from app.models.dhcp import DHCPPool, DHCPScope, DHCPStaticAssignment
 from app.models.ipam import IPAddress, Subnet
+from app.services.dhcp.windows_writethrough import push_static_change
 
 router = APIRouter(
     tags=["dhcp"], dependencies=[Depends(require_resource_permission("dhcp_static"))]
@@ -193,6 +194,7 @@ async def create_static(
     )
     db.add(st)
     await db.flush()
+    await push_static_change(db, st, action="create")
     await _upsert_ipam_for_static(db, scope, st)
     write_audit(
         db,
@@ -218,6 +220,9 @@ async def update_static(
     scope = await db.get(DHCPScope, st.scope_id)
     if scope is None:
         raise HTTPException(status_code=404, detail="Scope not found")
+    # Capture the old MAC before mutating so the write-through can
+    # remove the old reservation from Windows if the MAC changed.
+    prev_mac = str(st.mac_address)
     changes = body.model_dump(exclude_none=True)
     new_ip = changes.get("ip_address", str(st.ip_address))
     new_mac = changes.get("mac_address", str(st.mac_address))
@@ -226,6 +231,7 @@ async def update_static(
     for k, v in changes.items():
         setattr(st, k, v)
     await db.flush()
+    await push_static_change(db, st, action="update", prev_mac=prev_mac)
     await _upsert_ipam_for_static(db, scope, st, action="update")
     write_audit(
         db,
@@ -247,6 +253,7 @@ async def delete_static(static_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
     st = await db.get(DHCPStaticAssignment, static_id)
     if st is None:
         raise HTTPException(status_code=404, detail="Static assignment not found")
+    await push_static_change(db, st, action="delete")
     await _detach_ipam_for_static(db, st)
     write_audit(
         db,

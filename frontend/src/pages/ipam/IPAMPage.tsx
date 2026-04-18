@@ -21,6 +21,7 @@ import {
   Upload,
   Globe2,
   Filter,
+  Lock,
 } from "lucide-react";
 import {
   DndContext,
@@ -426,6 +427,9 @@ function CreateSpaceModal({ onClose }: { onClose: () => void }) {
   const [dnsAdditionalZoneIds, setDnsAdditionalZoneIds] = useState<string[]>(
     [],
   );
+  const [dhcpServerGroupId, setDhcpServerGroupId] = useState<string | null>(
+    null,
+  );
 
   const mutation = useMutation({
     mutationFn: () =>
@@ -436,6 +440,7 @@ function CreateSpaceModal({ onClose }: { onClose: () => void }) {
         dns_group_ids: dnsGroupIds,
         dns_zone_id: dnsZoneId,
         dns_additional_zone_ids: dnsAdditionalZoneIds,
+        dhcp_server_group_id: dhcpServerGroupId,
       }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["spaces"] });
@@ -476,6 +481,18 @@ function CreateSpaceModal({ onClose }: { onClose: () => void }) {
             onGroupIdsChange={setDnsGroupIds}
             onZoneIdChange={setDnsZoneId}
             onAdditionalZoneIdsChange={setDnsAdditionalZoneIds}
+          />
+        </div>
+        <div className="border-t pt-3">
+          <p className="mb-2 text-xs font-semibold text-muted-foreground uppercase tracking-wide">
+            DHCP Defaults (inherited by child blocks and subnets)
+          </p>
+          <DhcpSettingsSection
+            inherit={false}
+            hideInheritToggle
+            serverGroupId={dhcpServerGroupId}
+            onInheritChange={() => {}}
+            onServerGroupIdChange={setDhcpServerGroupId}
           />
         </div>
         <div className="flex justify-end gap-2 pt-2">
@@ -687,9 +704,11 @@ function DnsSettingsSection({
           </div>
         )}
 
-        {/* Additional Zones — always shown (even with just a primary picked)
-            so the user can push A records into extra zones. */}
-        {availableZones.length > 0 && (
+        {/* Additional Zones — hidden when inheriting (the dual-listbox is
+            bulky and there's nothing to do with it when the parent
+            chooses). The effective value is still shown implicitly by
+            the "inheriting from ..." text elsewhere in the modal. */}
+        {availableZones.length > 0 && !inherit && (
           <div>
             <p className="text-xs text-muted-foreground mb-1">
               Additional Zones
@@ -697,11 +716,126 @@ function DnsSettingsSection({
             <AdditionalZonesPicker
               allZones={availableZones.filter((z) => z.id !== displayZoneId)}
               selectedIds={displayAdditionalIds}
-              onChange={(ids) => !inherit && onAdditionalZoneIdsChange(ids)}
-              disabled={inherit}
+              onChange={(ids) => onAdditionalZoneIdsChange(ids)}
+              disabled={false}
             />
           </div>
         )}
+      </fieldset>
+    </div>
+  );
+}
+
+// ─── DHCP Settings Section (reused in space/block/subnet modals) ────────────
+
+/**
+ * Parallels DnsSettingsSection for DHCP. Picks a single server group that
+ * cascades down the IPAM hierarchy. When ``inherit`` is true the dropdown
+ * shows the effective group from the parent chain and is disabled. The
+ * space variant skips the inherit toggle (the space is the root).
+ */
+function DhcpSettingsSection({
+  inherit,
+  serverGroupId,
+  onInheritChange,
+  onServerGroupIdChange,
+  parentBlockId,
+  fallbackSpaceId,
+  hideInheritToggle,
+}: {
+  inherit: boolean;
+  serverGroupId: string | null;
+  onInheritChange: (v: boolean) => void;
+  onServerGroupIdChange: (v: string | null) => void;
+  parentBlockId?: string | null;
+  fallbackSpaceId?: string | null;
+  hideInheritToggle?: boolean;
+}) {
+  const { data: allGroups = [] } = useQuery({
+    queryKey: ["dhcp-groups"],
+    queryFn: () => dhcpApi.listGroups(),
+    staleTime: 60_000,
+  });
+
+  const { data: blockDhcp } = useQuery({
+    queryKey: ["effective-dhcp-block", parentBlockId],
+    queryFn: () => ipamApi.getEffectiveBlockDhcp(parentBlockId!),
+    enabled: !!parentBlockId,
+    staleTime: 30_000,
+  });
+  const { data: spaceDhcp } = useQuery({
+    queryKey: ["effective-dhcp-space", fallbackSpaceId],
+    queryFn: () => ipamApi.getEffectiveSpaceDhcp(fallbackSpaceId!),
+    enabled: !parentBlockId && !!fallbackSpaceId,
+    staleTime: 30_000,
+  });
+  const effectiveDhcp = blockDhcp ?? spaceDhcp ?? null;
+
+  const displayGroupId = inherit
+    ? (effectiveDhcp?.dhcp_server_group_id ?? null)
+    : serverGroupId;
+  const displayGroup = allGroups.find((g) => g.id === displayGroupId);
+
+  const inheritedFrom = effectiveDhcp?.inherited_from_block_id
+    ? "a parent block"
+    : effectiveDhcp?.inherited_from_space
+      ? "the space"
+      : null;
+
+  return (
+    <div className="space-y-2">
+      {!hideInheritToggle && (
+        <div className="flex items-center justify-between">
+          <div className="flex items-center gap-1.5">
+            <Network className="h-3.5 w-3.5 text-muted-foreground" />
+            <span className="text-xs font-medium">DHCP Settings</span>
+          </div>
+          <label className="flex items-center gap-1.5 text-xs cursor-pointer select-none">
+            <input
+              type="checkbox"
+              checked={inherit}
+              onChange={(e) => onInheritChange(e.target.checked)}
+              className="h-3.5 w-3.5"
+            />
+            Inherit from parent
+          </label>
+        </div>
+      )}
+
+      {inherit && (
+        <p className="text-xs text-muted-foreground italic">
+          {effectiveDhcp?.dhcp_server_group_id
+            ? `Inheriting from ${inheritedFrom ?? "parent"}: group "${displayGroup?.name ?? "unknown"}".`
+            : "No DHCP group configured in parent chain."}
+        </p>
+      )}
+
+      <fieldset disabled={inherit} className="space-y-2 disabled:opacity-50">
+        <div>
+          <p className="text-xs text-muted-foreground mb-1">
+            DHCP Server Group
+          </p>
+          {allGroups.length === 0 ? (
+            <p className="text-xs text-muted-foreground italic">
+              No DHCP server groups configured.
+            </p>
+          ) : (
+            <select
+              value={displayGroupId ?? ""}
+              onChange={(e) =>
+                !inherit && onServerGroupIdChange(e.target.value || null)
+              }
+              className={`${inputCls} w-full`}
+            >
+              <option value="">— None —</option>
+              {allGroups.map((g) => (
+                <option key={g.id} value={g.id}>
+                  {g.name}
+                </option>
+              ))}
+            </select>
+          )}
+        </div>
       </fieldset>
     </div>
   );
@@ -880,7 +1014,7 @@ function AdditionalZonesPicker({
           disabled={disabled}
           className="w-full rounded-t-md border border-b-0 bg-background px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-ring disabled:opacity-50"
         />
-        <div className="h-40 overflow-y-auto rounded-b-md border bg-background">
+        <div className="h-28 min-h-[5rem] max-h-[24rem] resize-y overflow-y-auto rounded-b-md border bg-background">
           {items.length === 0 ? (
             <p className="p-2 text-center text-[11px] text-muted-foreground italic">
               —
@@ -1189,6 +1323,11 @@ function CreateSubnetModal({
   const [dnsAdditionalZoneIds, setDnsAdditionalZoneIds] = useState<string[]>(
     [],
   );
+  // DHCP state
+  const [dhcpInherit, setDhcpInherit] = useState(true);
+  const [dhcpServerGroupId, setDhcpServerGroupId] = useState<string | null>(
+    null,
+  );
 
   const { data: blocks } = useQuery({
     queryKey: ["blocks", spaceId],
@@ -1268,6 +1407,8 @@ function CreateSubnetModal({
               dns_zone_id: dnsZoneId,
               dns_additional_zone_ids: dnsAdditionalZoneIds,
             }),
+        dhcp_inherit_settings: dhcpInherit,
+        ...(dhcpInherit ? {} : { dhcp_server_group_id: dhcpServerGroupId }),
       }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["subnets", spaceId] });
@@ -1448,6 +1589,16 @@ function CreateSubnetModal({
             onZoneIdChange={setDnsZoneId}
             onAdditionalZoneIdsChange={setDnsAdditionalZoneIds}
             parentBlockId={blockId || null}
+          />
+        </div>
+        <div className="border-t pt-3">
+          <DhcpSettingsSection
+            inherit={dhcpInherit}
+            serverGroupId={dhcpServerGroupId}
+            onInheritChange={setDhcpInherit}
+            onServerGroupIdChange={setDhcpServerGroupId}
+            parentBlockId={blockId || null}
+            fallbackSpaceId={spaceId}
           />
         </div>
         {error && <p className="text-xs text-destructive">{error}</p>}
@@ -1969,6 +2120,7 @@ function SubnetDetail({
     hostname: "",
     mac: "",
     description: "",
+    tags: "",
     status: "",
     dns: "",
     pool: "",
@@ -1985,6 +2137,7 @@ function SubnetDetail({
       hostname: "",
       mac: "",
       description: "",
+      tags: "",
       status: "",
       dns: "",
       pool: "",
@@ -2101,6 +2254,20 @@ function SubnetDetail({
     if (!applyFilter(macNorm, macFilter, fm.mac)) return false;
     if (!applyFilter(a.description ?? "", cf.description, fm.description))
       return false;
+    if (cf.tags) {
+      // Tag filter matches either `key`, `value`, or `key=value`. Clicking a
+      // chip in the row fills in the exact `key=value` form for an exact hit.
+      const t = (a.tags as Record<string, unknown> | null) ?? {};
+      const entries = Object.entries(t).map(
+        ([k, v]) => `${k}=${v == null ? "" : String(v)}`,
+      );
+      const hay = [
+        ...Object.keys(t),
+        ...Object.values(t).map((v) => (v == null ? "" : String(v))),
+        ...entries,
+      ].join("\n");
+      if (!applyFilter(hay, cf.tags, fm.tags)) return false;
+    }
     if (cf.status && a.status !== cf.status) return false;
     if (cf.dns && ipDnsState(a) !== cf.dns) return false;
     return true;
@@ -2413,7 +2580,8 @@ function SubnetDetail({
                           const selectable = (filteredAddresses ?? []).filter(
                             (a: IPAddress) =>
                               a.status !== "network" &&
-                              a.status !== "broadcast",
+                              a.status !== "broadcast" &&
+                              !a.auto_from_lease,
                           );
                           const allSelected =
                             selectable.length > 0 &&
@@ -2446,6 +2614,7 @@ function SubnetDetail({
                           "hostname",
                           "mac",
                           "description",
+                          "tags",
                           "status",
                           "pool",
                           "dns",
@@ -2493,6 +2662,7 @@ function SubnetDetail({
                                 hostname: "",
                                 mac: "",
                                 description: "",
+                                tags: "",
                                 status: "",
                                 dns: "",
                                 pool: "",
@@ -2516,6 +2686,7 @@ function SubnetDetail({
                             "hostname",
                             "mac",
                             "description",
+                            "tags",
                             "status",
                             "pool",
                             "dns",
@@ -2648,7 +2819,7 @@ function SubnetDetail({
                     {filteredAddresses?.length === 0 && (
                       <tr>
                         <td
-                          colSpan={9}
+                          colSpan={10}
                           className="px-4 py-6 text-center text-sm text-muted-foreground"
                         >
                           No addresses match the active filters.
@@ -2659,7 +2830,8 @@ function SubnetDetail({
                       const dnsState = ipDnsState(addr);
                       const systemRow =
                         addr.status === "network" ||
-                        addr.status === "broadcast";
+                        addr.status === "broadcast" ||
+                        !!addr.auto_from_lease;
                       const rowSelected = selectedIpIds.has(addr.id);
                       return (
                         <tr
@@ -2737,6 +2909,45 @@ function SubnetDetail({
                             )}
                           </td>
                           <td className="px-4 py-2">
+                            {(() => {
+                              const t =
+                                (addr.tags as Record<string, unknown> | null) ??
+                                {};
+                              const entries = Object.entries(t);
+                              if (entries.length === 0)
+                                return (
+                                  <span className="text-muted-foreground/40">
+                                    —
+                                  </span>
+                                );
+                              return (
+                                <div className="flex flex-wrap gap-1">
+                                  {entries.map(([k, v]) => {
+                                    const vStr = v == null ? "" : String(v);
+                                    const label = vStr ? `${k}=${vStr}` : k;
+                                    return (
+                                      <button
+                                        key={k}
+                                        type="button"
+                                        onClick={() => {
+                                          setColFilters((p) => ({
+                                            ...p,
+                                            tags: label,
+                                          }));
+                                          setShowFilters(true);
+                                        }}
+                                        title={`Filter by ${label}`}
+                                        className="inline-flex max-w-[14rem] items-center truncate rounded border border-sky-200 bg-sky-50 px-1.5 py-0.5 text-[10px] font-medium text-sky-700 hover:border-sky-300 hover:bg-sky-100 dark:border-sky-900/60 dark:bg-sky-900/30 dark:text-sky-300 dark:hover:bg-sky-900/50"
+                                      >
+                                        {label}
+                                      </button>
+                                    );
+                                  })}
+                                </div>
+                              );
+                            })()}
+                          </td>
+                          <td className="px-4 py-2">
                             <StatusBadge status={addr.status} />
                           </td>
                           <td className="px-4 py-2">
@@ -2806,6 +3017,17 @@ function SubnetDetail({
                                     <Trash2 className="h-3.5 w-3.5" />
                                   </button>
                                 </>
+                              ) : addr.auto_from_lease ? (
+                                // Mirror of a dynamic DHCP lease — the DHCP
+                                // server owns the state; editing or deleting
+                                // from IPAM would just get overwritten on
+                                // the next pull. Show a lock hint instead.
+                                <span
+                                  className="inline-flex items-center rounded p-1 text-muted-foreground/60"
+                                  title="Managed by DHCP server — edit the lease or reservation at the source. This row is refreshed by the lease-pull task."
+                                >
+                                  <Lock className="h-3.5 w-3.5" />
+                                </span>
                               ) : !isReadOnly(addr.status) ? (
                                 <>
                                   <button
@@ -3538,6 +3760,13 @@ function EditSubnetModal({
   const [dnsAdditionalZoneIds, setDnsAdditionalZoneIds] = useState<string[]>(
     subnet.dns_additional_zone_ids ?? [],
   );
+  // DHCP state — initialized from subnet
+  const [dhcpInherit, setDhcpInherit] = useState(
+    subnet.dhcp_inherit_settings ?? true,
+  );
+  const [dhcpServerGroupId, setDhcpServerGroupId] = useState<string | null>(
+    subnet.dhcp_server_group_id ?? null,
+  );
 
   // Detect whether network/broadcast records currently exist
   const { data: addresses } = useQuery({
@@ -3622,6 +3851,8 @@ function EditSubnetModal({
         dns_group_ids: dnsInherit ? null : dnsGroupIds,
         dns_zone_id: dnsInherit ? null : dnsZoneId,
         dns_additional_zone_ids: dnsInherit ? null : dnsAdditionalZoneIds,
+        dhcp_inherit_settings: dhcpInherit,
+        dhcp_server_group_id: dhcpInherit ? null : dhcpServerGroupId,
         ...(manageAuto !== undefined
           ? { manage_auto_addresses: manageAuto }
           : {}),
@@ -3818,6 +4049,16 @@ function EditSubnetModal({
             onZoneIdChange={setDnsZoneId}
             onAdditionalZoneIdsChange={setDnsAdditionalZoneIds}
             parentBlockId={subnet.block_id}
+          />
+        </div>
+        <div className="border-t pt-3">
+          <DhcpSettingsSection
+            inherit={dhcpInherit}
+            serverGroupId={dhcpServerGroupId}
+            onInheritChange={setDhcpInherit}
+            onServerGroupIdChange={setDhcpServerGroupId}
+            parentBlockId={subnet.block_id}
+            fallbackSpaceId={subnet.space_id}
           />
         </div>
         {error && <p className="text-xs text-destructive">{error}</p>}
@@ -5119,6 +5360,9 @@ function EditSpaceModal({
   const [dnsAdditionalZoneIds, setDnsAdditionalZoneIds] = useState<string[]>(
     space.dns_additional_zone_ids ?? [],
   );
+  const [dhcpServerGroupId, setDhcpServerGroupId] = useState<string | null>(
+    space.dhcp_server_group_id ?? null,
+  );
 
   const saveMutation = useMutation({
     mutationFn: () =>
@@ -5128,6 +5372,7 @@ function EditSpaceModal({
         dns_group_ids: dnsGroupIds,
         dns_zone_id: dnsZoneId,
         dns_additional_zone_ids: dnsAdditionalZoneIds,
+        dhcp_server_group_id: dhcpServerGroupId,
       }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["spaces"] });
@@ -5256,6 +5501,20 @@ function EditSpaceModal({
           />
         </div>
 
+        {/* DHCP defaults — inherited by child blocks / subnets */}
+        <div className="border-t pt-3">
+          <p className="mb-2 text-xs font-semibold text-muted-foreground uppercase tracking-wide">
+            DHCP Defaults (inherited by child blocks and subnets)
+          </p>
+          <DhcpSettingsSection
+            inherit={false}
+            hideInheritToggle
+            serverGroupId={dhcpServerGroupId}
+            onInheritChange={() => {}}
+            onServerGroupIdChange={setDhcpServerGroupId}
+          />
+        </div>
+
         <div className="flex justify-end gap-2 pt-2">
           <button
             onClick={onClose}
@@ -5350,6 +5609,11 @@ function CreateBlockModal({
   const [dnsAdditionalZoneIds, setDnsAdditionalZoneIds] = useState<string[]>(
     [],
   );
+  // DHCP state
+  const [dhcpInherit, setDhcpInherit] = useState(true);
+  const [dhcpServerGroupId, setDhcpServerGroupId] = useState<string | null>(
+    null,
+  );
 
   const { data: existingBlocks } = useQuery({
     queryKey: ["blocks", spaceId],
@@ -5382,6 +5646,8 @@ function CreateBlockModal({
               dns_zone_id: dnsZoneId,
               dns_additional_zone_ids: dnsAdditionalZoneIds,
             }),
+        dhcp_inherit_settings: dhcpInherit,
+        ...(dhcpInherit ? {} : { dhcp_server_group_id: dhcpServerGroupId }),
       }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["blocks", spaceId] });
@@ -5462,6 +5728,16 @@ function CreateBlockModal({
             fallbackSpaceId={!parentBlockId ? spaceId : null}
           />
         </div>
+        <div className="border-t pt-3">
+          <DhcpSettingsSection
+            inherit={dhcpInherit}
+            serverGroupId={dhcpServerGroupId}
+            onInheritChange={setDhcpInherit}
+            onServerGroupIdChange={setDhcpServerGroupId}
+            parentBlockId={parentBlockId || null}
+            fallbackSpaceId={!parentBlockId ? spaceId : null}
+          />
+        </div>
         {error && <p className="text-xs text-destructive">{error}</p>}
         <div className="flex justify-end gap-2 pt-2">
           <button
@@ -5519,6 +5795,13 @@ function EditBlockModal({
   );
   const [dnsAdditionalZoneIds, setDnsAdditionalZoneIds] = useState<string[]>(
     block.dns_additional_zone_ids ?? [],
+  );
+  // DHCP state — initialized from block
+  const [dhcpInherit, setDhcpInherit] = useState(
+    block.dhcp_inherit_settings ?? true,
+  );
+  const [dhcpServerGroupId, setDhcpServerGroupId] = useState<string | null>(
+    block.dhcp_server_group_id ?? null,
   );
 
   const { data: cfDefs = [] } = useQuery({
@@ -5580,6 +5863,8 @@ function EditBlockModal({
         dns_group_ids: dnsInherit ? null : dnsGroupIds,
         dns_zone_id: dnsInherit ? null : dnsZoneId,
         dns_additional_zone_ids: dnsInherit ? null : dnsAdditionalZoneIds,
+        dhcp_inherit_settings: dhcpInherit,
+        dhcp_server_group_id: dhcpInherit ? null : dhcpServerGroupId,
       }),
     onSuccess: (updated) => {
       qc.invalidateQueries({ queryKey: ["blocks", block.space_id] });
@@ -5721,6 +6006,18 @@ function EditBlockModal({
             onZoneIdChange={setDnsZoneId}
             onAdditionalZoneIdsChange={setDnsAdditionalZoneIds}
             parentBlockId={block.parent_block_id}
+          />
+        </div>
+        <div className="border-t pt-3">
+          <DhcpSettingsSection
+            inherit={dhcpInherit}
+            serverGroupId={dhcpServerGroupId}
+            onInheritChange={setDhcpInherit}
+            onServerGroupIdChange={setDhcpServerGroupId}
+            parentBlockId={block.parent_block_id}
+            fallbackSpaceId={
+              !block.parent_block_id ? block.space_id : undefined
+            }
           />
         </div>
         {error && <p className="text-xs text-destructive">{error}</p>}

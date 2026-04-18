@@ -144,6 +144,22 @@ async def enqueue_record_op(
         )
         return None
 
+    # User flipped the primary off — don't push live writes at a paused
+    # server. Record ops will queue silently for agent-based primaries
+    # (and flush when it's re-enabled); for agentless, we drop the op
+    # with a warning rather than hang on a dead WinRM/nsupdate socket.
+    if not primary.is_enabled:
+        logger.warning(
+            "record_op_dropped_server_disabled",
+            zone=zone.name,
+            server=str(primary.id),
+            driver=primary.driver,
+            op=op,
+            name=record.get("name"),
+            type=record.get("type"),
+        )
+        return None
+
     if is_agentless(primary.driver):
         return await _apply_agentless(db, primary, zone, op, record, target_serial)
 

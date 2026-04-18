@@ -15,6 +15,10 @@ from app.api.v1.dhcp._audit import write_audit
 from app.core.permissions import require_resource_permission
 from app.models.dhcp import DHCPScope, DHCPServer
 from app.models.ipam import Subnet
+from app.services.dhcp.windows_writethrough import (
+    push_scope_delete,
+    push_scope_upsert,
+)
 
 router = APIRouter(tags=["dhcp"], dependencies=[Depends(require_resource_permission("dhcp_scope"))])
 
@@ -241,6 +245,10 @@ async def create_scope(
     )
     db.add(scope)
     await db.flush()
+    # Push to Windows BEFORE commit so a WinRM failure rolls the DB row
+    # back and the user sees a 502 instead of silent drift between DB
+    # and server.
+    await push_scope_upsert(db, scope)
     write_audit(
         db,
         user=user,
@@ -282,6 +290,8 @@ async def update_scope(
         changes["options"] = _normalize_options(changes["options"])
     for k, v in changes.items():
         setattr(scope, k, v)
+    await db.flush()
+    await push_scope_upsert(db, scope)
     write_audit(
         db,
         user=user,
@@ -302,6 +312,9 @@ async def delete_scope(scope_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
     scope = await db.get(DHCPScope, scope_id)
     if scope is None:
         raise HTTPException(status_code=404, detail="Scope not found")
+    # Push the delete to Windows first; if that fails, don't orphan the
+    # row in our DB.
+    await push_scope_delete(db, scope)
     write_audit(
         db,
         user=user,

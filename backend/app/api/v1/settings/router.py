@@ -44,6 +44,9 @@ class SettingsResponse(BaseModel):
     dns_pull_from_server_enabled: bool
     dns_pull_from_server_interval_minutes: int
     dns_pull_from_server_last_run_at: datetime | None
+    dhcp_pull_leases_enabled: bool
+    dhcp_pull_leases_interval_minutes: int
+    dhcp_pull_leases_last_run_at: datetime | None
     dhcp_default_dns_servers: list[str]
     dhcp_default_domain_name: str
     dhcp_default_domain_search: list[str]
@@ -74,6 +77,8 @@ class SettingsUpdate(BaseModel):
     dns_auto_sync_delete_stale: bool | None = None
     dns_pull_from_server_enabled: bool | None = None
     dns_pull_from_server_interval_minutes: int | None = None
+    dhcp_pull_leases_enabled: bool | None = None
+    dhcp_pull_leases_interval_minutes: int | None = None
     dhcp_default_dns_servers: list[str] | None = None
     dhcp_default_domain_name: str | None = None
     dhcp_default_domain_search: list[str] | None = None
@@ -98,6 +103,7 @@ class SettingsUpdate(BaseModel):
         "discovery_scan_interval_minutes",
         "dns_auto_sync_interval_minutes",
         "dns_pull_from_server_interval_minutes",
+        "dhcp_pull_leases_interval_minutes",
     )
     @classmethod
     def validate_positive(cls, v: int | None) -> int | None:

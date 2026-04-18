@@ -371,9 +371,7 @@ async def sync_zone_with_server(
     if apply and pull_result.imported:
         await db.flush()
 
-    push_result = await _additive_push(
-        db, primary, driver, zone, on_wire, db_rows, apply=apply
-    )
+    push_result = await _additive_push(db, primary, driver, zone, on_wire, db_rows, apply=apply)
 
     logger.info(
         "dns.sync_with_server",

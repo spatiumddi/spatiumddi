@@ -14,6 +14,7 @@ celery_app = Celery(
         "app.tasks.dns_pull",
         "app.tasks.dhcp_health",
         "app.tasks.dhcp_lease_cleanup",
+        "app.tasks.dhcp_pull_leases",
     ],
 )
 
@@ -40,6 +41,7 @@ celery_app.conf.update(
         "app.tasks.dns_pull.*": {"queue": "dns"},
         "app.tasks.dhcp_health.*": {"queue": "dhcp"},
         "app.tasks.dhcp_lease_cleanup.*": {"queue": "dhcp"},
+        "app.tasks.dhcp_pull_leases.*": {"queue": "dhcp"},
     },
     beat_schedule={
         # Every 60s, fan-out health checks to every registered DNS server.
@@ -73,6 +75,16 @@ celery_app.conf.update(
         # DB rows.
         "dns-pull-from-server": {
             "task": "app.tasks.dns_pull.auto_pull_dns_from_servers",
+            "schedule": schedule(run_every=60.0),
+        },
+        # Every 60 s, tick the DHCP lease-pull task. The task itself checks
+        # ``PlatformSettings.dhcp_pull_leases_enabled`` and the per-run
+        # interval, so cadence changes in the UI take effect without
+        # restarting celery-beat. Only applies to agentless drivers
+        # (windows_dhcp). Additive-only — the existing lease-cleanup sweep
+        # handles stale expiry.
+        "dhcp-pull-leases": {
+            "task": "app.tasks.dhcp_pull_leases.auto_pull_dhcp_leases",
             "schedule": schedule(run_every=60.0),
         },
     },

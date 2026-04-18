@@ -92,6 +92,9 @@ async def _run_sync() -> dict[str, Any]:
                 primary = primary_res.scalar_one_or_none()
                 if primary is None:
                     continue
+                # User flipped the server off in the UI — don't sync it.
+                if not primary.is_enabled:
+                    continue
                 driver = get_driver(primary.driver)
                 if not hasattr(driver, "pull_zone_records"):
                     continue
@@ -128,9 +131,7 @@ async def _run_sync() -> dict[str, Any]:
                         resource_type="platform",
                         resource_id=str(_SINGLETON_ID),
                         resource_display="auto-sync",
-                        result=(
-                            "error" if (errors or total_push_errors) else "success"
-                        ),
+                        result=("error" if (errors or total_push_errors) else "success"),
                         new_value={
                             "imported": total_imported,
                             "pushed": total_pushed,

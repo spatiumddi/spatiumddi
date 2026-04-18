@@ -4,11 +4,16 @@ Usage (with the compose stack running):
     python scripts/seed_demo.py http://localhost:8000 admin admin
 
 Creates:
-- 1 IP space with 2 blocks and a handful of subnets at different utilisation levels
-- ~30 IP addresses with hostnames / MACs / DNS / orphan states
+- 1 DNS server group + forward zone + records
+- 1 DHCP server group (members auto-register themselves when an agent connects)
+- 1 IP space pointing at the DNS group/zone + DHCP group so child blocks and
+  subnets inherit both automatically
+- 2 blocks and a handful of subnets at different utilisation levels
+- ~30 IP addresses with hostnames / MACs / DNS states
 - 2 routers + 6 VLANs, wired up to subnets
-- 1 DNS server group + zone + records
-- 1 DHCP server group (the agent already auto-registered the real server if it's running)
+
+The space's DNS + DHCP settings cascade down — all blocks and subnets keep
+``*_inherit_settings=True`` unless you want to override at that level.
 
 Safe to re-run — every create swallows 409 (already exists).
 """
@@ -56,9 +61,62 @@ def main(base: str, user: str, pw: str):
     token = login(base, user, pw)
     a = Api(base, token)
 
+    # ── DNS ───────────────────────────────────────────────────────────────
+    # Create DNS first so the IPSpace can point at the group + zone and have
+    # every child block/subnet inherit automatically.
+    print("Creating DNS group + zone + records…")
+    a.call("POST", "/api/v1/dns/groups", json={
+        "name": "default", "description": "Main DNS cluster",
+        "group_type": "internal", "is_recursive": True,
+    })
+    groups = a.call("GET", "/api/v1/dns/groups") or []
+    g = find(groups, "name", "default")
+    dns_group_id = g["id"] if g else None
+    dns_zone_id: str | None = None
+    if g:
+        a.call("POST", f"/api/v1/dns/groups/{g['id']}/zones", json={
+            "name": "corp.example.com", "zone_type": "primary",
+            "kind": "forward",
+        })
+        zones = a.call("GET", f"/api/v1/dns/groups/{g['id']}/zones") or []
+        z = find(zones, "name", "corp.example.com")
+        if z:
+            dns_zone_id = z["id"]
+            for rec in [
+                {"name": "www", "record_type": "A", "value": "10.10.10.20", "ttl": 3600},
+                {"name": "mail", "record_type": "A", "value": "10.10.10.25", "ttl": 3600},
+                {"name": "@", "record_type": "MX", "value": "10 mail.corp.example.com.", "ttl": 3600, "priority": 10},
+                {"name": "_sip._tcp", "record_type": "SRV", "value": "10 10 5060 voip.corp.example.com.", "ttl": 3600},
+                {"name": "office", "record_type": "TXT", "value": '"v=spf1 ip4:10.1.0.0/16 -all"', "ttl": 3600},
+            ]:
+                a.call("POST", f"/api/v1/dns/groups/{g['id']}/zones/{z['id']}/records", json=rec)
+
+    # ── DHCP server group ─────────────────────────────────────────────────
+    # A group is driver-agnostic — individual agents (Kea, Windows) attach
+    # themselves when they connect. We wire the space to this group so any
+    # scope created from within IPAM inherits it.
+    print("Creating DHCP server group…")
+    a.call("POST", "/api/v1/dhcp/server-groups", json={
+        "name": "default", "description": "Default DHCP group",
+        "mode": "hot-standby",
+    })
+    dhcp_groups = a.call("GET", "/api/v1/dhcp/server-groups") or []
+    dg = find(dhcp_groups, "name", "default")
+    dhcp_group_id = dg["id"] if dg else None
+
     # ── IPAM ──────────────────────────────────────────────────────────────
     print("Creating IP space…")
-    a.call("POST", "/api/v1/ipam/spaces", json={"name": "Corporate", "description": "Primary office network"})
+    space_payload: dict = {
+        "name": "Corporate",
+        "description": "Primary office network",
+    }
+    if dns_group_id:
+        space_payload["dns_group_ids"] = [dns_group_id]
+    if dns_zone_id:
+        space_payload["dns_zone_id"] = dns_zone_id
+    if dhcp_group_id:
+        space_payload["dhcp_server_group_id"] = dhcp_group_id
+    a.call("POST", "/api/v1/ipam/spaces", json=space_payload)
     spaces = a.call("GET", "/api/v1/ipam/spaces") or []
     corp = find(spaces, "name", "Corporate")
     if not corp:
@@ -66,6 +124,21 @@ def main(base: str, user: str, pw: str):
         return
     space_id = corp["id"]
 
+    # If the space existed from a previous run (409 swallowed) its DNS/DHCP
+    # pointers might be stale or unset. Patch them so re-running the seed
+    # converges on the inheritance we want here.
+    patch: dict = {}
+    if dns_group_id and corp.get("dns_group_ids") != [dns_group_id]:
+        patch["dns_group_ids"] = [dns_group_id]
+    if dns_zone_id and corp.get("dns_zone_id") != dns_zone_id:
+        patch["dns_zone_id"] = dns_zone_id
+    if dhcp_group_id and corp.get("dhcp_server_group_id") != dhcp_group_id:
+        patch["dhcp_server_group_id"] = dhcp_group_id
+    if patch:
+        a.call("PUT", f"/api/v1/ipam/spaces/{space_id}", json=patch)
+
+    # Blocks and subnets leave ``dhcp_inherit_settings`` / ``dns_inherit_settings``
+    # at their default of True so the values cascade down from the space.
     print("Creating blocks…")
     a.call("POST", "/api/v1/ipam/blocks", json={
         "space_id": space_id, "name": "HQ 10.0.0.0/8", "network": "10.0.0.0/8",
@@ -148,31 +221,6 @@ def main(base: str, user: str, pw: str):
             a.call("POST", f"/api/v1/vlans/routers/{dmz_sw['id']}/vlans", json={
                 "vlan_id": vid, "name": name, "description": "",
             })
-
-    # ── DNS ───────────────────────────────────────────────────────────────
-    print("Creating DNS group + zone + records…")
-    a.call("POST", "/api/v1/dns/groups", json={
-        "name": "default", "description": "Main DNS cluster",
-        "group_type": "internal", "is_recursive": True,
-    })
-    groups = a.call("GET", "/api/v1/dns/groups") or []
-    g = find(groups, "name", "default")
-    if g:
-        a.call("POST", f"/api/v1/dns/groups/{g['id']}/zones", json={
-            "name": "corp.example.com", "zone_type": "primary",
-            "kind": "forward",
-        })
-        zones = a.call("GET", f"/api/v1/dns/groups/{g['id']}/zones") or []
-        z = find(zones, "name", "corp.example.com")
-        if z:
-            for rec in [
-                {"name": "www", "record_type": "A", "value": "10.10.10.20", "ttl": 3600},
-                {"name": "mail", "record_type": "A", "value": "10.10.10.25", "ttl": 3600},
-                {"name": "@", "record_type": "MX", "value": "10 mail.corp.example.com.", "ttl": 3600, "priority": 10},
-                {"name": "_sip._tcp", "record_type": "SRV", "value": "10 10 5060 voip.corp.example.com.", "ttl": 3600},
-                {"name": "office", "record_type": "TXT", "value": '"v=spf1 ip4:10.1.0.0/16 -all"', "ttl": 3600},
-            ]:
-                a.call("POST", f"/api/v1/dns/groups/{g['id']}/zones/{z['id']}/records", json=rec)
 
     print("\n✓ Seed complete.")
 

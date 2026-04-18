@@ -137,6 +137,7 @@ export interface IPSpace {
   dns_group_ids: string[];
   dns_zone_id: string | null;
   dns_additional_zone_ids: string[];
+  dhcp_server_group_id?: string | null;
   created_at?: string;
   modified_at?: string;
 }
@@ -155,6 +156,8 @@ export interface IPBlock {
   dns_zone_id: string | null;
   dns_additional_zone_ids: string[] | null;
   dns_inherit_settings: boolean;
+  dhcp_server_group_id?: string | null;
+  dhcp_inherit_settings?: boolean;
   created_at?: string;
   modified_at?: string;
 }
@@ -172,6 +175,12 @@ export interface EffectiveDns {
   dns_zone_id: string | null;
   dns_additional_zone_ids: string[];
   inherited_from_block_id: string | null;
+}
+
+export interface EffectiveDhcp {
+  dhcp_server_group_id: string | null;
+  inherited_from_block_id: string | null;
+  inherited_from_space: boolean;
 }
 
 export interface DnsSyncMissing {
@@ -257,6 +266,8 @@ export interface Subnet {
   dns_zone_id: string | null;
   dns_additional_zone_ids: string[] | null;
   dns_inherit_settings: boolean;
+  dhcp_server_group_id?: string | null;
+  dhcp_inherit_settings?: boolean;
   dns_servers?: string[] | null;
   domain_name?: string | null;
   created_at?: string;
@@ -283,6 +294,10 @@ export interface IPAddress {
   dns_record_id?: string | null;
   dhcp_lease_id?: string | null;
   static_assignment_id?: string | null;
+  // True when this row is a dynamic-lease mirror created by the DHCP
+  // lease-pull task. Such rows are read-only in the UI — the DHCP server
+  // owns their state and any edit would get overwritten on the next pull.
+  auto_from_lease?: boolean;
   // User-added CNAME/A aliases on this IP (excludes the primary A).
   alias_count?: number;
   created_at?: string;
@@ -397,6 +412,18 @@ export const ipamApi = {
   getEffectiveSpaceDns: (spaceId: string) =>
     api
       .get<EffectiveDns>(`/ipam/spaces/${spaceId}/effective-dns`)
+      .then((r) => r.data),
+  getEffectiveBlockDhcp: (blockId: string) =>
+    api
+      .get<EffectiveDhcp>(`/ipam/blocks/${blockId}/effective-dhcp`)
+      .then((r) => r.data),
+  getEffectiveSubnetDhcp: (subnetId: string) =>
+    api
+      .get<EffectiveDhcp>(`/ipam/subnets/${subnetId}/effective-dhcp`)
+      .then((r) => r.data),
+  getEffectiveSpaceDhcp: (spaceId: string) =>
+    api
+      .get<EffectiveDhcp>(`/ipam/spaces/${spaceId}/effective-dhcp`)
       .then((r) => r.data),
 
   listSubnets: (params?: {
@@ -890,6 +917,9 @@ export interface PlatformSettings {
   dns_pull_from_server_enabled: boolean;
   dns_pull_from_server_interval_minutes: number;
   dns_pull_from_server_last_run_at: string | null;
+  dhcp_pull_leases_enabled: boolean;
+  dhcp_pull_leases_interval_minutes: number;
+  dhcp_pull_leases_last_run_at: string | null;
   ip_allocation_strategy: string;
   session_timeout_minutes: number;
   auto_logout_minutes: number;
@@ -1173,6 +1203,10 @@ export interface DNSServer {
   api_port: number | null;
   roles: string[];
   status: string;
+  /** User-controlled pause. When false, health sweeps, the bi-directional
+   * sync job, and record-op writes all skip this server. Separate from
+   * ``status`` which is automatically set by the health probe. */
+  is_enabled: boolean;
   last_sync_at: string | null;
   last_health_check_at: string | null;
   notes: string;
@@ -1746,8 +1780,41 @@ export interface DHCPServer {
   agent_version: string | null;
   config_etag: string | null;
   config_pushed_at: string | null;
+  // True once Windows admin credentials have been stored on this server.
+  // The password itself is never returned — set via `windows_credentials`
+  // on the create/update body.
+  has_credentials: boolean;
+  // Driver runs from the control plane without a co-located agent
+  // (windows_dhcp). Drives lease-pull visibility.
+  is_agentless: boolean;
+  // Driver only supports reads — UI hides config-push actions.
+  is_read_only: boolean;
   created_at: string;
   modified_at: string;
+}
+
+export interface WindowsDHCPCredentials {
+  username: string;
+  password: string;
+  winrm_port?: number;
+  transport?: "ntlm" | "kerberos" | "basic" | "credssp";
+  use_tls?: boolean;
+  verify_tls?: boolean;
+}
+
+export interface DHCPLeaseSyncResult {
+  server_leases: number;
+  imported: number;
+  refreshed: number;
+  ipam_created: number;
+  ipam_refreshed: number;
+  out_of_scope: number;
+  scopes_imported: number;
+  scopes_refreshed: number;
+  scopes_skipped_no_subnet: number;
+  pools_synced: number;
+  statics_synced: number;
+  errors: string[];
 }
 
 export interface DHCPOption {
@@ -1810,6 +1877,21 @@ export const dhcpApi = {
         op_id: string;
         etag: string;
       }>(`/dhcp/servers/${id}/sync`)
+      .then((r) => r.data),
+  syncLeasesNow: (id: string) =>
+    api
+      .post<DHCPLeaseSyncResult>(`/dhcp/servers/${id}/sync-leases`)
+      .then((r) => r.data),
+  testWindowsCredentials: (body: {
+    host: string;
+    credentials?: WindowsDHCPCredentials;
+    server_id?: string;
+  }) =>
+    api
+      .post<{
+        ok: boolean;
+        message: string;
+      }>("/dhcp/servers/test-windows-credentials", body)
       .then((r) => r.data),
   approveServer: (id: string) =>
     api.post<DHCPServer>(`/dhcp/servers/${id}/approve`).then((r) => r.data),

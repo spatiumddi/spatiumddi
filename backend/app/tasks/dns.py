@@ -14,7 +14,6 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.celery_app import celery_app
 from app.config import settings
-from app.db import AsyncSessionLocal
 from app.models.dns import DNSBlockList, DNSBlockListEntry, DNSServer
 from app.services.dns_blocklist import parse_feed
 
@@ -200,37 +199,83 @@ async def _probe_server_soa(host: str, port: int) -> bool:
 
 
 async def _check_health(server_id: uuid.UUID) -> None:
-    async with AsyncSessionLocal() as db:
-        server = await db.get(DNSServer, server_id)
-        if server is None:
-            logger.info("dns_health_server_missing", server_id=str(server_id))
-            return
+    # Per-task engine — the shared AsyncSessionLocal binds to the first event
+    # loop that touches it, which turns into "Future attached to a different
+    # loop" errors when multiple Celery tasks share a worker. See the matching
+    # pattern in ``app.tasks.dns_pull`` / ``app.tasks.dhcp_pull_leases``.
+    engine = create_async_engine(settings.database_url, future=True)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with session_factory() as db:
+            from app.drivers.dns import get_driver, is_agentless  # noqa: PLC0415
 
-        now = datetime.now(UTC)
-        new_status: str
+            server = await db.get(DNSServer, server_id)
+            if server is None:
+                logger.info("dns_health_server_missing", server_id=str(server_id))
+                return
 
-        # If the agent heartbeat is fresh, trust it.
-        last_seen = server.last_health_check_at
-        if (
-            last_seen is not None
-            and (now - last_seen) <= AGENT_STALE_AFTER
-            and server.status == "active"
-        ):
-            new_status = "active"
-        else:
-            reachable = await _probe_server_soa(server.host, server.port)
-            new_status = "active" if reachable else "unreachable"
+            now = datetime.now(UTC)
 
-        server.status = new_status
-        server.last_health_check_at = now
-        await db.commit()
+            # User-disabled servers don't get probed — we set status="disabled"
+            # so the UI can surface the explicit "not our doing" state instead
+            # of flapping to "unreachable" because we stopped poking it.
+            if not server.is_enabled:
+                server.status = "disabled"
+                server.last_health_check_at = now
+                await db.commit()
+                return
 
-        logger.info(
-            "dns_health_checked",
-            server_id=str(server_id),
-            status=new_status,
-            host=server.host,
-        )
+            new_status: str
+
+            if is_agentless(server.driver):
+                # Agentless drivers (windows_dns) have no heartbeat — the
+                # control plane has to do the poking. Falls back to the raw
+                # SOA probe since the Windows driver doesn't yet implement a
+                # dedicated health_check(); either way answer is the same.
+                try:
+                    driver = get_driver(server.driver)
+                    health_check = getattr(driver, "health_check", None)
+                    if callable(health_check):
+                        ok, _msg = await health_check(server)
+                    else:
+                        ok = await _probe_server_soa(server.host, server.port)
+                    new_status = "active" if ok else "unreachable"
+                except Exception as exc:  # noqa: BLE001 — surface any driver error
+                    new_status = "unreachable"
+                    logger.warning(
+                        "dns_health_driver_probe_failed",
+                        server_id=str(server_id),
+                        driver=server.driver,
+                        host=server.host,
+                        error=str(exc),
+                    )
+            else:
+                # Agent-based: trust a fresh heartbeat; otherwise SOA probe.
+                last_seen = server.last_health_check_at
+                if (
+                    last_seen is not None
+                    and (now - last_seen) <= AGENT_STALE_AFTER
+                    and server.status == "active"
+                ):
+                    new_status = "active"
+                else:
+                    reachable = await _probe_server_soa(server.host, server.port)
+                    new_status = "active" if reachable else "unreachable"
+
+            server.status = new_status
+            server.last_health_check_at = now
+            await db.commit()
+
+            logger.info(
+                "dns_health_checked",
+                server_id=str(server_id),
+                driver=server.driver,
+                agentless=is_agentless(server.driver),
+                status=new_status,
+                host=server.host,
+            )
+    finally:
+        await engine.dispose()
 
 
 @celery_app.task(
@@ -249,9 +294,14 @@ def check_dns_server_health(self: object, server_id: str) -> None:  # type: igno
 
 
 async def _enqueue_all() -> None:
-    async with AsyncSessionLocal() as db:
-        result = await db.execute(select(DNSServer.id))
-        ids = [str(row[0]) for row in result.all()]
+    engine = create_async_engine(settings.database_url, future=True)
+    session_factory = async_sessionmaker(engine, expire_on_commit=False)
+    try:
+        async with session_factory() as db:
+            result = await db.execute(select(DNSServer.id))
+            ids = [str(row[0]) for row in result.all()]
+    finally:
+        await engine.dispose()
     for sid in ids:
         check_dns_server_health.delay(sid)
 

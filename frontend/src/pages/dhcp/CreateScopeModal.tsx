@@ -40,11 +40,15 @@ function suggestRange(
 export function CreateScopeModal({
   scope,
   subnetId: fixedSubnetId,
+  defaultServerId,
   onClose,
 }: {
   scope?: DHCPScope;
   /** When creating from a subnet, pin the subnet; otherwise show a picker. */
   subnetId?: string;
+  /** When opened from within a specific server's view, pin the server so
+   * the user isn't re-picking it from a list of all DHCP servers. */
+  defaultServerId?: string;
   onClose: () => void;
 }) {
   const qc = useQueryClient();
@@ -52,7 +56,9 @@ export function CreateScopeModal({
   const [subnetId, setSubnetId] = useState<string>(
     scope?.subnet_id ?? fixedSubnetId ?? "",
   );
-  const [serverId, setServerId] = useState<string>(scope?.server_id ?? "");
+  const [serverId, setServerId] = useState<string>(
+    scope?.server_id ?? defaultServerId ?? "",
+  );
   const [name, setName] = useState(scope?.name ?? "");
   const [description, setDescription] = useState(scope?.description ?? "");
   const [enabled, setEnabled] = useState(scope?.enabled ?? true);
@@ -90,6 +96,63 @@ export function CreateScopeModal({
     queryKey: ["dhcp-servers"],
     queryFn: () => dhcpApi.listServers(),
   });
+  const { data: dhcpGroups = [] } = useQuery({
+    queryKey: ["dhcp-groups"],
+    queryFn: () => dhcpApi.listGroups(),
+    enabled: !editing && !defaultServerId,
+  });
+  // Effective DHCP group for this subnet, resolved up the IPAM hierarchy
+  // (subnet → block ancestry → space). If set, we prefilter the server
+  // dropdown to just that group and default to its first server, so the
+  // scope lands on whatever DHCP was configured at the IPAM level.
+  const { data: effectiveDhcp } = useQuery({
+    queryKey: ["subnet-effective-dhcp", subnetId],
+    queryFn: () => ipamApi.getEffectiveSubnetDhcp(subnetId),
+    enabled: !editing && !defaultServerId && !!subnetId,
+  });
+  const effectiveGroupId = effectiveDhcp?.dhcp_server_group_id ?? null;
+  const effectiveGroup = dhcpGroups.find((g) => g.id === effectiveGroupId);
+  const inheritSource = effectiveDhcp?.inherited_from_block_id
+    ? "a parent block"
+    : effectiveDhcp?.inherited_from_space
+      ? "the space"
+      : "this subnet";
+  const [overrideGroup, setOverrideGroup] = useState(false);
+  const serverOptions =
+    effectiveGroupId && !overrideGroup
+      ? servers.filter((s) => s.server_group_id === effectiveGroupId)
+      : servers;
+
+  // Auto-select a server from the effective group on first load / group
+  // change, unless the user has already picked one explicitly.
+  const [serverAutoPicked, setServerAutoPicked] = useState(!!serverId);
+  useEffect(() => {
+    if (editing || defaultServerId) return;
+    if (serverAutoPicked) return;
+    if (overrideGroup) return;
+    if (!effectiveGroupId) return;
+    const first = servers.find((s) => s.server_group_id === effectiveGroupId);
+    if (first) {
+      setServerId(first.id);
+      setServerAutoPicked(true);
+    }
+  }, [
+    editing,
+    defaultServerId,
+    serverAutoPicked,
+    overrideGroup,
+    effectiveGroupId,
+    servers,
+  ]);
+  // When the parent already chose the subnet (the "+ New Scope on subnet"
+  // dropdown), the modal hides the subnet picker but we still need the
+  // network label + gateway for the pinned display and for prefill.
+  const { data: pinnedSubnet } = useQuery({
+    queryKey: ["subnet", fixedSubnetId ?? ""],
+    queryFn: () => ipamApi.getSubnet(fixedSubnetId!),
+    enabled: !!fixedSubnetId,
+  });
+  const pinnedServer = servers.find((s) => s.id === defaultServerId);
   // Settings + specific subnet feed the auto-prefill for new scopes.
   const { data: settings } = useQuery({
     queryKey: ["settings"],
@@ -209,23 +272,50 @@ export function CreateScopeModal({
         }}
         className="space-y-3"
       >
-        {!fixedSubnetId && !editing && (
-          <Field label="Subnet">
-            <select
-              className={inputCls}
-              value={subnetId}
-              onChange={(e) => setSubnetId(e.target.value)}
-              required
-            >
-              <option value="">— Pick a subnet —</option>
-              {subnets.map((s) => (
-                <option key={s.id} value={s.id}>
-                  {s.network} {s.name ? `— ${s.name}` : ""}
-                </option>
-              ))}
-            </select>
-          </Field>
+        {!editing && (
+          <p className="rounded border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+            A DHCP scope binds an <strong>IPAM subnet</strong> to a{" "}
+            <strong>DHCP server</strong> so that server hands out leases from
+            the subnet&apos;s address range. The subnet must exist in IPAM first
+            — create it under IPAM → Subnets if it doesn&apos;t.
+          </p>
         )}
+
+        {/* Subnet — pin as a read-only pill when passed from the parent
+            (the "+ New Scope on subnet" dropdown picked it already), else
+            show a picker. */}
+        {!editing &&
+          (fixedSubnetId ? (
+            <Field label="Subnet (IPAM)">
+              <div className="flex items-center gap-2 rounded-md border bg-muted/30 px-3 py-1.5 text-sm">
+                <span className="font-mono">
+                  {pinnedSubnet?.network ?? "…"}
+                </span>
+                {pinnedSubnet?.name && (
+                  <span className="text-muted-foreground">
+                    — {pinnedSubnet.name}
+                  </span>
+                )}
+              </div>
+            </Field>
+          ) : (
+            <Field label="Subnet (IPAM)">
+              <select
+                className={inputCls}
+                value={subnetId}
+                onChange={(e) => setSubnetId(e.target.value)}
+                required
+              >
+                <option value="">— Pick a subnet —</option>
+                {subnets.map((s) => (
+                  <option key={s.id} value={s.id}>
+                    {s.network} {s.name ? `— ${s.name}` : ""}
+                  </option>
+                ))}
+              </select>
+            </Field>
+          ))}
+
         <div className="grid grid-cols-2 gap-3">
           <Field label="Name">
             <input
@@ -235,20 +325,68 @@ export function CreateScopeModal({
               required
             />
           </Field>
-          <Field label="Server (optional)">
-            <select
-              className={inputCls}
-              value={serverId}
-              onChange={(e) => setServerId(e.target.value)}
+          {/* Server — pin as a read-only pill when the parent already
+              picked one (e.g. opened from inside a server's Scopes tab),
+              else show a picker. The picker is filtered to the DHCP group
+              inherited from the subnet / block / space unless the user
+              flips the override. This enforces the "DHCP is configured on
+              the IPAM hierarchy, not ad-hoc per scope" UX. */}
+          {defaultServerId && pinnedServer ? (
+            <Field label="DHCP Server">
+              <div className="flex items-center gap-2 rounded-md border bg-muted/30 px-3 py-1.5 text-sm">
+                <span className="font-medium">{pinnedServer.name}</span>
+                <span className="rounded-full bg-muted px-2 py-0.5 text-[10px] text-muted-foreground">
+                  {pinnedServer.driver}
+                </span>
+              </div>
+            </Field>
+          ) : (
+            <Field
+              label={
+                effectiveGroupId && !overrideGroup
+                  ? `DHCP Server (in group "${effectiveGroup?.name ?? "…"}")`
+                  : "DHCP Server (optional)"
+              }
+              hint={
+                effectiveGroupId && !overrideGroup && effectiveGroup
+                  ? `Inherited group "${effectiveGroup.name}" from ${inheritSource}.`
+                  : effectiveGroupId === null && subnetId && !editing
+                    ? "No DHCP group set on this subnet's space/block. Edit the subnet to set one, or pick any server below."
+                    : undefined
+              }
             >
-              <option value="">— Any in group —</option>
-              {servers.map((s) => (
-                <option key={s.id} value={s.id}>
-                  {s.name} ({s.driver})
-                </option>
-              ))}
-            </select>
-          </Field>
+              <select
+                className={inputCls}
+                value={serverId}
+                onChange={(e) => {
+                  setServerId(e.target.value);
+                  setServerAutoPicked(true);
+                }}
+              >
+                <option value="">— Any in group —</option>
+                {serverOptions.map((s) => (
+                  <option key={s.id} value={s.id}>
+                    {s.name} ({s.driver})
+                  </option>
+                ))}
+              </select>
+              {effectiveGroupId && (
+                <label className="mt-1 flex items-center gap-1.5 text-xs text-muted-foreground">
+                  <input
+                    type="checkbox"
+                    checked={overrideGroup}
+                    onChange={(e) => {
+                      setOverrideGroup(e.target.checked);
+                      setServerAutoPicked(true);
+                    }}
+                  />
+                  <span>
+                    Override — pick a server outside the inherited group
+                  </span>
+                </label>
+              )}
+            </Field>
+          )}
         </div>
         <Field label="Description">
           <input
