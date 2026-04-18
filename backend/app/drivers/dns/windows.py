@@ -62,6 +62,12 @@ _SUPPORTED_RECORD_TYPES = (
     "TLSA",
 )
 
+# Record types older ``DnsServer`` PowerShell modules don't expose a
+# cmdlet for. These types always go over RFC 2136 even when WinRM
+# credentials are configured — dispatching to Path B for them would
+# raise ``ValueError`` at write time.
+_WINRM_UNSUPPORTED_RECORD_TYPES = frozenset({"TLSA"})
+
 
 def _format_rdata(r: RecordData) -> str:
     """Render ``RecordData`` into the wire-format string dnspython expects."""
@@ -131,7 +137,13 @@ class WindowsDNSDriver(DNSDriver):
                 f"supported: {_SUPPORTED_RECORD_TYPES}"
             )
 
-        if getattr(server, "credentials_encrypted", None):
+        # Dispatch: WinRM (Path B) when credentials are configured AND the
+        # record type has a DnsServer cmdlet. Otherwise RFC 2136 (Path A).
+        use_winrm = (
+            getattr(server, "credentials_encrypted", None)
+            and rtype not in _WINRM_UNSUPPORTED_RECORD_TYPES
+        )
+        if use_winrm:
             await self._apply_record_change_winrm(server, change)
             return
 
@@ -674,11 +686,10 @@ def _ps_apply_record(change: RecordChange) -> str:
             f"-DescriptiveText '{value}' -TimeToLive ([TimeSpan]::FromSeconds({ttl})) "
             "-ErrorAction Stop"
         )
-    elif rtype == "TLSA":
-        # TLSA doesn't have a dedicated cmdlet in older DnsServer modules;
-        # surface this cleanly rather than silently dropping the write.
-        raise ValueError("windows_dns: TLSA writes over WinRM are not implemented")
     else:
+        # TLSA + other WinRM-unsupported types are routed to RFC 2136 in
+        # ``apply_record_change`` before reaching this method; anything
+        # that still lands here is a bug in dispatch.
         raise ValueError(f"windows_dns._ps_apply_record: unsupported type {rtype!r}")
 
     # Delete is idempotent: no-op if the zone or the record is already

@@ -1146,7 +1146,9 @@ function ServerDetailView({
     onSuccess: (result) => {
       qc.invalidateQueries({ queryKey: ["dhcp-servers"] });
       qc.invalidateQueries({ queryKey: ["dhcp-leases", server.id] });
-      qc.invalidateQueries({ queryKey: ["ipam-addresses"] });
+      // Lease sync mirrors leases into IPAM as status=dhcp rows; broad
+      // invalidation refreshes any ["addresses", subnetId] subquery.
+      qc.invalidateQueries({ queryKey: ["addresses"] });
       // Also invalidate subnet-level scope queries so the DHCP topology
       // views refresh once scopes / pools / statics get imported.
       qc.invalidateQueries({ queryKey: ["dhcp-scopes"] });

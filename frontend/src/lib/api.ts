@@ -2089,6 +2089,15 @@ export interface DHCPPool {
   class_restriction: string | null;
   lease_time_override: number | null;
   options_override: Record<string, unknown> | null;
+  // Populated by create/update only: IPs already allocated inside this
+  // range, so the modal can surface a confirmation before overwriting.
+  existing_ips_in_range?:
+    | {
+        address: string;
+        status: string;
+        hostname: string;
+      }[]
+    | null;
   created_at: string;
   modified_at: string;
 }

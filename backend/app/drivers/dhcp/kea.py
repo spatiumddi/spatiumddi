@@ -29,9 +29,9 @@ from app.drivers.dhcp.base import (
 logger = structlog.get_logger(__name__)
 
 
-# Map of SpatiumDDI option-name → Kea option-data ``name`` and ``space``.
-# Kea accepts standard DHCPv4 options by their IANA names in the default
-# ``dhcp4`` option space.
+# Map of SpatiumDDI option-name → Kea option-data ``name`` in the default
+# ``dhcp4`` option space. Kea accepts standard DHCPv4 options by their
+# IANA names here.
 _KEA_OPTION_NAMES: dict[str, str] = {
     "routers": "routers",
     "dns-servers": "domain-name-servers",
@@ -46,12 +46,49 @@ _KEA_OPTION_NAMES: dict[str, str] = {
     "time-offset": "time-offset",
 }
 
+# Map of SpatiumDDI option-name → Kea Dhcp6 ``option-data`` name. DHCPv6
+# uses a different option-code space + cmdlet names; only options that
+# have a true v6 equivalent are forwarded. Options with no v6 analogue
+# (``routers`` — v6 uses Router Advertisements; ``broadcast-address`` —
+# no broadcast in v6; ``mtu`` / ``time-offset`` — no native option) are
+# dropped from v6 scopes with a warning log so the operator can spot
+# misconfigured inheritance rather than Kea silently rejecting the
+# config on reload.
+_KEA_OPTION_NAMES_V6: dict[str, str] = {
+    "dns-servers": "dns-servers",         # DHCPv6 option 23
+    "domain-search": "domain-search",     # DHCPv6 option 24
+    "ntp-servers": "sntp-servers",        # DHCPv6 option 31 (SNTP)
+    "bootfile-name": "bootfile-url",      # DHCPv6 option 59 (URL form)
+}
 
-def _render_option_data(options: dict[str, Any]) -> list[dict[str, Any]]:
-    """Translate a {name: value} options map into Kea's ``option-data`` list."""
+# Options that have no DHCPv6 equivalent — dropped from v6 scopes.
+_DHCP4_ONLY_OPTION_NAMES: frozenset[str] = frozenset(
+    {"routers", "broadcast-address", "mtu", "time-offset",
+     "domain-name", "tftp-server-name", "tftp-server-address"}
+)
+
+
+def _render_option_data(
+    options: dict[str, Any], *, address_family: str = "ipv4"
+) -> list[dict[str, Any]]:
+    """Translate a {name: value} options map into Kea's ``option-data`` list.
+
+    ``address_family="ipv6"`` routes through the Dhcp6 name map and
+    drops options that don't exist in DHCPv6 — emitting a v4 option
+    under the Dhcp6 block would make Kea reject the config on reload.
+    """
+    is_v6 = address_family == "ipv6"
+    name_map = _KEA_OPTION_NAMES_V6 if is_v6 else _KEA_OPTION_NAMES
     out: list[dict[str, Any]] = []
     for key, val in options.items():
-        kea_name = _KEA_OPTION_NAMES.get(key, key)
+        if is_v6 and key in _DHCP4_ONLY_OPTION_NAMES:
+            logger.warning(
+                "kea_option_skipped_v6_no_equivalent",
+                option=key,
+                reason="no DHCPv6 equivalent",
+            )
+            continue
+        kea_name = name_map.get(key, key)
         if isinstance(val, list):
             data = ", ".join(str(x) for x in val)
         else:
@@ -60,7 +97,7 @@ def _render_option_data(options: dict[str, Any]) -> list[dict[str, Any]]:
     return out
 
 
-def _render_pool(pool: PoolDef) -> dict[str, Any]:
+def _render_pool(pool: PoolDef, *, address_family: str = "ipv4") -> dict[str, Any]:
     # Kea expresses "excluded" / "reserved" pools indirectly via
     # reservations + pool boundaries. We emit dynamic pools only; excluded
     # ranges are conveyed to the agent as metadata for boundary splitting.
@@ -68,30 +105,50 @@ def _render_pool(pool: PoolDef) -> dict[str, Any]:
     if pool.class_restriction:
         d["client-class"] = pool.class_restriction
     if pool.options_override:
-        d["option-data"] = _render_option_data(pool.options_override)
+        d["option-data"] = _render_option_data(
+            pool.options_override, address_family=address_family
+        )
     return d
 
 
-def _render_reservation(s: StaticAssignmentDef) -> dict[str, Any]:
-    r: dict[str, Any] = {
-        "hw-address": s.mac_address,
-        "ip-address": s.ip_address,
-    }
+def _render_reservation(
+    s: StaticAssignmentDef, *, address_family: str = "ipv4"
+) -> dict[str, Any]:
+    # Dhcp6 reservations use ``ip-addresses`` (plural, list) and don't
+    # accept ``hw-address`` as the match key by default — ``duid`` /
+    # ``hw-address`` is configured per-subnet in real deployments. Emit
+    # the minimum viable v6 shape and let the agent / operator layer on
+    # ``host-reservation-identifiers`` via server options.
+    if address_family == "ipv6":
+        r: dict[str, Any] = {
+            "hw-address": s.mac_address,
+            "ip-addresses": [s.ip_address],
+        }
+    else:
+        r = {
+            "hw-address": s.mac_address,
+            "ip-address": s.ip_address,
+        }
     if s.hostname:
         r["hostname"] = s.hostname
     if s.client_id:
         r["client-id"] = s.client_id
     if s.options_override:
-        r["option-data"] = _render_option_data(s.options_override)
+        r["option-data"] = _render_option_data(
+            s.options_override, address_family=address_family
+        )
     return r
 
 
 def _render_scope(scope: ScopeDef) -> dict[str, Any]:
+    af = scope.address_family  # "ipv4" | "ipv6"
     dynamic_pools = [p for p in scope.pools if p.pool_type == "dynamic"]
+    subnet_key = "subnet"  # Kea names the CIDR field "subnet" for both families
+    pools_key = "pools" if af != "ipv6" else "pools"  # same in both
     out: dict[str, Any] = {
-        "subnet": scope.subnet_cidr,
-        "pools": [_render_pool(p) for p in dynamic_pools],
-        "reservations": [_render_reservation(s) for s in scope.statics],
+        subnet_key: scope.subnet_cidr,
+        pools_key: [_render_pool(p, address_family=af) for p in dynamic_pools],
+        "reservations": [_render_reservation(s, address_family=af) for s in scope.statics],
         "valid-lifetime": scope.lease_time,
     }
     if scope.min_lease_time is not None:
@@ -99,16 +156,18 @@ def _render_scope(scope: ScopeDef) -> dict[str, Any]:
     if scope.max_lease_time is not None:
         out["max-valid-lifetime"] = scope.max_lease_time
     if scope.options:
-        out["option-data"] = _render_option_data(scope.options)
+        out["option-data"] = _render_option_data(scope.options, address_family=af)
     return out
 
 
-def _render_client_class(c: ClientClassDef) -> dict[str, Any]:
+def _render_client_class(
+    c: ClientClassDef, *, address_family: str = "ipv4"
+) -> dict[str, Any]:
     d: dict[str, Any] = {"name": c.name}
     if c.match_expression:
         d["test"] = c.match_expression
     if c.options:
-        d["option-data"] = _render_option_data(c.options)
+        d["option-data"] = _render_option_data(c.options, address_family=address_family)
     return d
 
 
@@ -136,10 +195,19 @@ class KeaDriver(DHCPDriver):
                     "name": "/var/lib/kea/kea-leases4.csv",
                 },
                 "subnet4": [_render_scope(s) for s in v4_scopes],
-                "client-classes": [_render_client_class(c) for c in bundle.client_classes],
-                "option-data": _render_option_data(bundle.options.options),
+                "client-classes": [
+                    _render_client_class(c, address_family="ipv4")
+                    for c in bundle.client_classes
+                ],
+                "option-data": _render_option_data(
+                    bundle.options.options, address_family="ipv4"
+                ),
             }
         if v6_scopes:
+            # Kea names the subnet list "subnet6" in Dhcp6 mode. Options /
+            # client-class options render through the Dhcp6 name map;
+            # v4-only options (routers, mtu, …) are dropped with a
+            # warning log rather than emitted under the wrong space.
             out["Dhcp6"] = {
                 "valid-lifetime": bundle.options.lease_time,
                 "interfaces-config": {"interfaces": ["*"]},
@@ -148,15 +216,14 @@ class KeaDriver(DHCPDriver):
                     "persist": True,
                     "name": "/var/lib/kea/kea-leases6.csv",
                 },
-                # Kea names the subnet list "subnet6" in Dhcp6 mode.
                 "subnet6": [_render_scope(s) for s in v6_scopes],
-                # Kea Dhcp6 uses different option names; for the common cases
-                # (dns-servers → dns6-servers) the agent / operator will
-                # translate at config-apply time. We pass a best-effort list
-                # through here — the driver will grow a Dhcp6-specific option
-                # map once DHCPv6-specific fields (e.g. preferred-lifetime)
-                # are added. TODO(wave-D.4): Dhcp6 option-name translation.
-                "option-data": _render_option_data(bundle.options.options),
+                "client-classes": [
+                    _render_client_class(c, address_family="ipv6")
+                    for c in bundle.client_classes
+                ],
+                "option-data": _render_option_data(
+                    bundle.options.options, address_family="ipv6"
+                ),
             }
         return json.dumps(out, indent=2, sort_keys=True)
 

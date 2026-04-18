@@ -54,7 +54,7 @@ export function CreatePoolModal({
     },
     onSuccess: (result) => {
       qc.invalidateQueries({ queryKey: ["dhcp-pools", scope.id] });
-      const existing = (result as any)?.existing_ips_in_range;
+      const existing = result.existing_ips_in_range;
       if (existing && existing.length > 0) {
         setExistingWarning(existing);
       } else {
