@@ -2283,6 +2283,298 @@ async def delete_subnet(subnet_id: uuid.UUID, current_user: CurrentUser, db: DB)
     await db.commit()
 
 
+# ── Subnet + Block Resize (grow-only) ─────────────────────────────────────────
+#
+# Two endpoints per resource: ``/resize/preview`` (read-only blast-radius
+# calculator) and ``/resize`` (commit under an advisory lock). The heavy
+# lifting lives in ``app.services.ipam.resize``; handlers stay thin — parse
+# the request, call the service, write the audit, commit, return.
+
+
+class _ResizePlaceholderRow(BaseModel):
+    ip: str
+    hostname: str
+
+
+class SubnetResizePreviewRequest(BaseModel):
+    new_cidr: str
+    # Included on preview so the service can surface a conflict when the
+    # user asks to move the gateway on a CIDR with no usable host range
+    # (/31/32/127/128). The UI forwards its checkbox state so "commit is
+    # disabled because the ask is impossible" is visible before commit.
+    move_gateway_to_first_usable: bool = False
+
+
+class SubnetResizePreviewResponse(BaseModel):
+    old_cidr: str
+    new_cidr: str
+    network_address_shifts: bool
+    old_network_ip: str
+    new_network_ip: str
+    old_broadcast_ip: str | None
+    new_broadcast_ip: str | None
+    total_ips_before: int
+    total_ips_after: int
+    gateway_current: str | None
+    gateway_suggested_new_first_usable: str | None
+    placeholders_default_named: list[_ResizePlaceholderRow]
+    placeholders_renamed: list[_ResizePlaceholderRow]
+    affected_ip_addresses_total: int
+    affected_dhcp_scopes: int
+    affected_dhcp_pools: int
+    affected_dhcp_static_assignments: int
+    affected_dns_records_auto: int
+    affected_active_leases: int
+    reverse_zones_existing: list[str]
+    reverse_zones_will_be_created: list[str]
+    conflicts: list[dict[str, str]]
+    warnings: list[str]
+
+
+class SubnetResizeCommitRequest(BaseModel):
+    new_cidr: str
+    move_gateway_to_first_usable: bool = False
+    replace_default_placeholders: bool = True
+
+
+class SubnetResizeCommitResponse(BaseModel):
+    subnet: SubnetResponse
+    old_cidr: str
+    new_cidr: str
+    placeholders_deleted: int
+    placeholders_created: int
+    dhcp_servers_notified: int
+    summary: list[str]
+
+
+class BlockResizePreviewRequest(BaseModel):
+    new_cidr: str
+
+
+class _BlockResizeChildRow(BaseModel):
+    id: str
+    network: str
+    name: str
+
+
+class BlockResizePreviewResponse(BaseModel):
+    old_cidr: str
+    new_cidr: str
+    network_address_shifts: bool
+    old_network_ip: str
+    new_network_ip: str
+    total_ips_before: int
+    total_ips_after: int
+    child_blocks_count: int
+    child_blocks: list[_BlockResizeChildRow]
+    child_subnets_count: int
+    child_subnets: list[_BlockResizeChildRow]
+    descendant_ip_addresses_total: int
+    conflicts: list[dict[str, str]]
+    warnings: list[str]
+
+
+class BlockResizeCommitRequest(BaseModel):
+    new_cidr: str
+
+
+class BlockResizeCommitResponse(BaseModel):
+    block: IPBlockResponse
+    old_cidr: str
+    new_cidr: str
+    summary: list[str]
+
+
+@router.post(
+    "/subnets/{subnet_id}/resize/preview",
+    response_model=SubnetResizePreviewResponse,
+)
+async def resize_subnet_preview(
+    subnet_id: uuid.UUID,
+    body: SubnetResizePreviewRequest,
+    current_user: CurrentUser,
+    db: DB,
+) -> SubnetResizePreviewResponse:
+    from app.services.ipam.resize import preview_subnet_resize
+
+    subnet = await db.get(Subnet, subnet_id)
+    if subnet is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
+    preview = await preview_subnet_resize(
+        db,
+        subnet,
+        body.new_cidr,
+        move_gateway_to_first_usable=body.move_gateway_to_first_usable,
+    )
+    return SubnetResizePreviewResponse(
+        old_cidr=preview.old_cidr,
+        new_cidr=preview.new_cidr,
+        network_address_shifts=preview.network_address_shifts,
+        old_network_ip=preview.old_network_ip,
+        new_network_ip=preview.new_network_ip,
+        old_broadcast_ip=preview.old_broadcast_ip,
+        new_broadcast_ip=preview.new_broadcast_ip,
+        total_ips_before=preview.total_ips_before,
+        total_ips_after=preview.total_ips_after,
+        gateway_current=preview.gateway_current,
+        gateway_suggested_new_first_usable=preview.gateway_suggested_new_first_usable,
+        placeholders_default_named=[
+            _ResizePlaceholderRow(**p) for p in preview.placeholders_default_named
+        ],
+        placeholders_renamed=[_ResizePlaceholderRow(**p) for p in preview.placeholders_renamed],
+        affected_ip_addresses_total=preview.affected_ip_addresses_total,
+        affected_dhcp_scopes=preview.affected_dhcp_scopes,
+        affected_dhcp_pools=preview.affected_dhcp_pools,
+        affected_dhcp_static_assignments=preview.affected_dhcp_static_assignments,
+        affected_dns_records_auto=preview.affected_dns_records_auto,
+        affected_active_leases=preview.affected_active_leases,
+        reverse_zones_existing=preview.reverse_zones_existing,
+        reverse_zones_will_be_created=preview.reverse_zones_will_be_created,
+        conflicts=[{"type": c.type, "detail": c.detail} for c in preview.conflicts],
+        warnings=preview.warnings,
+    )
+
+
+@router.post("/subnets/{subnet_id}/resize", response_model=SubnetResizeCommitResponse)
+async def resize_subnet_commit(
+    subnet_id: uuid.UUID,
+    body: SubnetResizeCommitRequest,
+    current_user: CurrentUser,
+    db: DB,
+) -> SubnetResizeCommitResponse:
+    from app.services.ipam.resize import ResizeError, commit_subnet_resize
+
+    subnet = await db.get(Subnet, subnet_id)
+    if subnet is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
+
+    old_snapshot = {
+        "network": str(subnet.network),
+        "gateway": str(subnet.gateway) if subnet.gateway else None,
+        "total_ips": subnet.total_ips,
+    }
+
+    try:
+        result = await commit_subnet_resize(
+            db,
+            subnet,
+            body.new_cidr,
+            move_gateway_to_first_usable=body.move_gateway_to_first_usable,
+            replace_default_placeholders=body.replace_default_placeholders,
+            current_user=current_user,
+        )
+    except ResizeError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+    db.add(
+        _audit(
+            current_user,
+            "resize",
+            "subnet",
+            str(subnet.id),
+            f"{result.old_cidr} → {result.new_cidr}",
+            old_value=old_snapshot,
+            new_value={
+                "network": result.new_cidr,
+                "gateway": str(subnet.gateway) if subnet.gateway else None,
+                "total_ips": subnet.total_ips,
+                "reason": "user_resize",
+                "placeholders_deleted": result.placeholders_deleted,
+                "placeholders_created": result.placeholders_created,
+                "dhcp_servers_notified": result.dhcp_servers_notified,
+            },
+        )
+    )
+
+    await db.commit()
+    await db.refresh(subnet)
+    return SubnetResizeCommitResponse(
+        subnet=SubnetResponse.model_validate(subnet),
+        old_cidr=result.old_cidr,
+        new_cidr=result.new_cidr,
+        placeholders_deleted=result.placeholders_deleted,
+        placeholders_created=result.placeholders_created,
+        dhcp_servers_notified=result.dhcp_servers_notified,
+        summary=result.summary,
+    )
+
+
+@router.post(
+    "/blocks/{block_id}/resize/preview",
+    response_model=BlockResizePreviewResponse,
+)
+async def resize_block_preview(
+    block_id: uuid.UUID,
+    body: BlockResizePreviewRequest,
+    current_user: CurrentUser,
+    db: DB,
+) -> BlockResizePreviewResponse:
+    from app.services.ipam.resize import preview_block_resize
+
+    block = await db.get(IPBlock, block_id)
+    if block is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP block not found")
+    preview = await preview_block_resize(db, block, body.new_cidr)
+    return BlockResizePreviewResponse(
+        old_cidr=preview.old_cidr,
+        new_cidr=preview.new_cidr,
+        network_address_shifts=preview.network_address_shifts,
+        old_network_ip=preview.old_network_ip,
+        new_network_ip=preview.new_network_ip,
+        total_ips_before=preview.total_ips_before,
+        total_ips_after=preview.total_ips_after,
+        child_blocks_count=preview.child_blocks_count,
+        child_blocks=[_BlockResizeChildRow(**c) for c in preview.child_blocks],
+        child_subnets_count=preview.child_subnets_count,
+        child_subnets=[_BlockResizeChildRow(**c) for c in preview.child_subnets],
+        descendant_ip_addresses_total=preview.descendant_ip_addresses_total,
+        conflicts=[{"type": c.type, "detail": c.detail} for c in preview.conflicts],
+        warnings=preview.warnings,
+    )
+
+
+@router.post("/blocks/{block_id}/resize", response_model=BlockResizeCommitResponse)
+async def resize_block_commit(
+    block_id: uuid.UUID,
+    body: BlockResizeCommitRequest,
+    current_user: CurrentUser,
+    db: DB,
+) -> BlockResizeCommitResponse:
+    from app.services.ipam.resize import ResizeError, commit_block_resize
+
+    block = await db.get(IPBlock, block_id)
+    if block is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP block not found")
+
+    old_snapshot = {"network": str(block.network)}
+
+    try:
+        result = await commit_block_resize(db, block, body.new_cidr, current_user=current_user)
+    except ResizeError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+    db.add(
+        _audit(
+            current_user,
+            "resize",
+            "ip_block",
+            str(block.id),
+            f"{result.old_cidr} → {result.new_cidr}",
+            old_value=old_snapshot,
+            new_value={"network": result.new_cidr, "reason": "user_resize"},
+        )
+    )
+
+    await db.commit()
+    await db.refresh(block)
+    return BlockResizeCommitResponse(
+        block=IPBlockResponse.model_validate(block),
+        old_cidr=result.old_cidr,
+        new_cidr=result.new_cidr,
+        summary=result.summary,
+    )
+
+
 # ── Subnet ↔ DNS sync (drift detection + reconcile) ───────────────────────────
 
 

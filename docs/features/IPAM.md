@@ -666,3 +666,125 @@ browsers treat as `overflow-x: auto` in practice.
   `overflow-x-auto` with a `min-w` so wide columns scroll horizontally
   instead of overflowing the viewport.
 - All modals use `max-w-[95vw]` on `<sm` so they always fit the screen.
+
+### ✅ 15.10 Subnet / Block Resize (grow-only)
+
+**Why this and not arbitrary CIDR edit.** A network engineer's source of
+truth is the CIDR stored in SpatiumDDI. A bad edit silently orphans IP
+records, breaks DHCP scopes, and invalidates reverse-zone coverage.
+Resize is a **restricted, validated, audited** operation with two
+explicit guarantees:
+
+1. The new CIDR is strictly **larger** than the old (smaller prefix
+   length). Shrinking is rejected with a 422 that explains the workflow
+   (delete + recreate is the safer path).
+2. The old CIDR is a **sub-network** of the new CIDR (``old.subnet_of(new)``
+   in Python ``ipaddress`` semantics). A "resize" that would move the
+   network address to an entirely different range is really a recreate
+   and is rejected.
+
+**Endpoints** (under the standard IPAM router-level permission gate —
+POST requires ``write`` on subnet / ip_block):
+
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/api/v1/ipam/subnets/{id}/resize/preview` | Blast-radius dry-run |
+| POST | `/api/v1/ipam/subnets/{id}/resize` | Commit under advisory lock |
+| POST | `/api/v1/ipam/blocks/{id}/resize/preview` | Same for blocks |
+| POST | `/api/v1/ipam/blocks/{id}/resize` | Same for blocks |
+
+**Validation rules** (every rule re-run at commit time — TOCTOU guard):
+
+- Grow-only, same address family (v4 ↔ v6 is a recreate, not a resize).
+- Old CIDR ⊂ new CIDR.
+- New CIDR must fit inside the **parent block** (for subnets) or **parent
+  block** (for child blocks). If the parent is too small we return 422
+  with "resize the parent block first" — we do **not** chain-resize the
+  parent. A silent recursive resize is how a network tree gets a hole
+  punched through it.
+- No overlap with siblings or cousins anywhere in the same ``IPSpace``.
+- Block resize: every descendant block + subnet must still fit inside
+  the new CIDR. Mathematically redundant given rule 2 but re-checked.
+- ``space_id`` is invariant — resize never moves a resource across spaces.
+
+**Preview response** (``SubnetResizePreviewResponse``) surfaces the
+"blast radius" so the operator knows what they're about to touch:
+
+- Old vs. new network / broadcast IPs + total IP count delta.
+- Current gateway + suggested new first-usable (caller decides whether
+  to move it).
+- Placeholders split into two buckets:
+  - ``placeholders_default_named`` — the ``network`` / ``broadcast`` rows
+    with no user-set hostname. These are the rows the commit can safely
+    recycle to the new boundaries.
+  - ``placeholders_renamed`` — rows at old boundaries where the user has
+    set a hostname (e.g. ``anycast-vip``). **Always preserved**; the
+    commit never touches them regardless of
+    ``replace_default_placeholders``.
+- Affected counts: IPs in subnet, DHCP scopes / pools / static
+  assignments, auto-generated DNS records, active leases.
+- Reverse zones: which already exist for the old CIDR, which will be
+  created for the new CIDR (``ensure_reverse_zone_for_subnet`` is
+  called idempotently on commit).
+- ``conflicts`` — non-empty means the commit will 4xx; the UI disables
+  the confirm button.
+- ``warnings`` — non-blocking items (DHCP pools won't auto-expand, the
+  netmask change, and for any network-address shift a dedicated "update
+  your ACLs / router docs" reminder).
+
+**Commit request** (``SubnetResizeCommitRequest``):
+
+| Field | Default | Effect |
+|---|---|---|
+| ``new_cidr`` | *required* | The target CIDR. |
+| ``move_gateway_to_first_usable`` | ``false`` | If true, set gateway to the new first-usable IP (``new_net.network_address + 1`` for v4 ≤/30, v6 ≤/126). Otherwise leave gateway untouched — the old gateway IP is guaranteed to be inside the new CIDR because old ⊂ new. |
+| ``replace_default_placeholders`` | ``true`` | Delete the unchanged "network"/"broadcast" rows at the old boundaries and re-create them at the new boundaries. Renamed rows are preserved regardless. |
+
+**Concurrency.** Commit wraps the full mutation in
+``pg_try_advisory_xact_lock(ns, crc32(id))``; a concurrent resize on the
+same resource returns **423 Locked**. The preview does *not* take the
+lock — it is read-only and would only serialise legitimate parallel
+read load.
+
+**Audit.** One ``AuditLog(action="resize")`` row per commit, with
+``old_value`` ``{network, gateway, total_ips}`` and ``new_value``
+``{network, gateway, total_ips, reason: "user_resize",
+placeholders_deleted, placeholders_created, dhcp_servers_notified}``,
+and ``resource_display`` ``"{old_cidr} → {new_cidr}"``.
+
+**DHCP / DNS side-effects.**
+
+- For every agent-based DHCP server with a scope on the resized subnet,
+  the control plane rebuilds the ``ConfigBundle``, bumps
+  ``config_etag``, and enqueues a pending ``apply_config`` op (mirroring
+  the subnet-delete path). Agentless drivers (Windows DHCP read-only)
+  are skipped — they have no write surface.
+- ``ensure_reverse_zone_for_subnet`` runs after the CIDR mutation so any
+  new reverse-zone coverage is created. Idempotent when the zone
+  already exists.
+- Forward A/AAAA and PTR records for IPs inside the old CIDR are *not*
+  touched — their values and names are unchanged by a grow.
+
+**UI.** A new **Resize…** button sits next to **Edit** on both the
+subnet header (``IPAMPage.tsx`` subnet detail) and the block header.
+The modal (``frontend/src/pages/ipam/ResizeModals.tsx``) runs a
+preview → confirm flow with:
+- Live preview of old → new network / broadcast / gateway / IP count.
+- Collapsible lists of affected DHCP scopes / DNS records / leases.
+- A big yellow banner reminding the operator that clients, routers,
+  and documentation outside SpatiumDDI need to be updated by hand.
+- A **type-to-confirm** gate: the confirm button only enables after the
+  user has typed the new CIDR exactly into a text input. Conflicts
+  surfaced by the preview hide the confirm button entirely; there is
+  no force-commit.
+
+**Out of scope** (deliberate non-goals):
+
+- Shrinking — explicit 422 rejection with guidance.
+- Cross-space moves — rejected; space is invariant.
+- Chain-resizing parent blocks — rejected; the operator must resize the
+  parent first.
+- Auto-expanding DHCP pools into the new address space — pools stay
+  where they are; the preview flags this as a warning.
+- DNS record value mutations — a grow doesn't change any record's
+  ``name``/``value``; only new reverse-zone coverage is backfilled.

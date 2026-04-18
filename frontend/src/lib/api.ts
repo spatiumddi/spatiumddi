@@ -366,6 +366,108 @@ export interface SubnetBulkEditResponse {
   not_found: string[];
 }
 
+// ── Resize (grow-only) ─────────────────────────────────────────────────────
+//
+// Two-phase contract (preview → commit). Preview is a pure read; commit
+// takes a pg advisory lock and re-validates before mutating. Shrinking is
+// explicitly out of scope — the backend returns 422 if the new prefix
+// length is >= the current one.
+
+export interface ResizeConflict {
+  type: string;
+  detail: string;
+}
+
+export interface SubnetResizePlaceholder {
+  ip: string;
+  hostname: string;
+}
+
+export interface SubnetResizePreviewRequest {
+  new_cidr: string;
+  move_gateway_to_first_usable?: boolean;
+}
+
+export interface SubnetResizePreviewResponse {
+  old_cidr: string;
+  new_cidr: string;
+  network_address_shifts: boolean;
+  old_network_ip: string;
+  new_network_ip: string;
+  old_broadcast_ip: string | null;
+  new_broadcast_ip: string | null;
+  total_ips_before: number;
+  total_ips_after: number;
+  gateway_current: string | null;
+  gateway_suggested_new_first_usable: string | null;
+  placeholders_default_named: SubnetResizePlaceholder[];
+  placeholders_renamed: SubnetResizePlaceholder[];
+  affected_ip_addresses_total: number;
+  affected_dhcp_scopes: number;
+  affected_dhcp_pools: number;
+  affected_dhcp_static_assignments: number;
+  affected_dns_records_auto: number;
+  affected_active_leases: number;
+  reverse_zones_existing: string[];
+  reverse_zones_will_be_created: string[];
+  conflicts: ResizeConflict[];
+  warnings: string[];
+}
+
+export interface SubnetResizeCommitRequest {
+  new_cidr: string;
+  move_gateway_to_first_usable?: boolean;
+  replace_default_placeholders?: boolean;
+}
+
+export interface SubnetResizeCommitResponse {
+  subnet: Subnet;
+  old_cidr: string;
+  new_cidr: string;
+  placeholders_deleted: number;
+  placeholders_created: number;
+  dhcp_servers_notified: number;
+  summary: string[];
+}
+
+export interface BlockResizeChildRow {
+  id: string;
+  network: string;
+  name: string;
+}
+
+export interface BlockResizePreviewRequest {
+  new_cidr: string;
+}
+
+export interface BlockResizePreviewResponse {
+  old_cidr: string;
+  new_cidr: string;
+  network_address_shifts: boolean;
+  old_network_ip: string;
+  new_network_ip: string;
+  total_ips_before: number;
+  total_ips_after: number;
+  child_blocks_count: number;
+  child_blocks: BlockResizeChildRow[];
+  child_subnets_count: number;
+  child_subnets: BlockResizeChildRow[];
+  descendant_ip_addresses_total: number;
+  conflicts: ResizeConflict[];
+  warnings: string[];
+}
+
+export interface BlockResizeCommitRequest {
+  new_cidr: string;
+}
+
+export interface BlockResizeCommitResponse {
+  block: IPBlock;
+  old_cidr: string;
+  new_cidr: string;
+  summary: string[];
+}
+
 export const ipamApi = {
   listSpaces: () => api.get<IPSpace[]>("/ipam/spaces").then((r) => r.data),
   getSpace: (id: string) =>
@@ -453,6 +555,35 @@ export const ipamApi = {
     data: Partial<Subnet> & { manage_auto_addresses?: boolean },
   ) => api.put<Subnet>(`/ipam/subnets/${id}`, data).then((r) => r.data),
   deleteSubnet: (id: string) => api.delete(`/ipam/subnets/${id}`),
+
+  // Resize (grow-only) — preview is a pure read; commit takes a pg
+  // advisory lock and returns 423 Locked if another resize is in flight
+  // for the same subnet / block.
+  resizeSubnetPreview: (subnetId: string, body: SubnetResizePreviewRequest) =>
+    api
+      .post<SubnetResizePreviewResponse>(
+        `/ipam/subnets/${subnetId}/resize/preview`,
+        body,
+      )
+      .then((r) => r.data),
+  resizeSubnetCommit: (subnetId: string, body: SubnetResizeCommitRequest) =>
+    api
+      .post<SubnetResizeCommitResponse>(
+        `/ipam/subnets/${subnetId}/resize`,
+        body,
+      )
+      .then((r) => r.data),
+  resizeBlockPreview: (blockId: string, body: BlockResizePreviewRequest) =>
+    api
+      .post<BlockResizePreviewResponse>(
+        `/ipam/blocks/${blockId}/resize/preview`,
+        body,
+      )
+      .then((r) => r.data),
+  resizeBlockCommit: (blockId: string, body: BlockResizeCommitRequest) =>
+    api
+      .post<BlockResizeCommitResponse>(`/ipam/blocks/${blockId}/resize`, body)
+      .then((r) => r.data),
 
   dnsSyncPreview: (subnetId: string) =>
     api

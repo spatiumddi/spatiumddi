@@ -56,6 +56,7 @@ import {
   ExportButton,
   SubnetImportExportButton,
 } from "./ImportExportModals";
+import { ResizeBlockModal, ResizeSubnetModal } from "./ResizeModals";
 import { cidrContains } from "@/lib/cidr";
 import { FreeSpaceBand } from "@/components/ipam/FreeSpaceBand";
 import {
@@ -2214,6 +2215,7 @@ function SubnetDetail({
   const qc = useQueryClient();
   const [showAddModal, setShowAddModal] = useState(false);
   const [showEditSubnet, setShowEditSubnet] = useState(false);
+  const [showResizeSubnet, setShowResizeSubnet] = useState(false);
   const [showDnsSync, setShowDnsSync] = useState(false);
   const [showOrphans, setShowOrphans] = useState(false);
   const [editingAddress, setEditingAddress] = useState<IPAddress | null>(null);
@@ -2512,6 +2514,13 @@ function SubnetDetail({
               className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
             >
               Edit
+            </button>
+            <button
+              onClick={() => setShowResizeSubnet(true)}
+              title="Grow this subnet to a larger CIDR (e.g. /24 → /23). Shrinking is not supported."
+              className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
+            >
+              Resize…
             </button>
             <button
               onClick={() => setShowAddModal(true)}
@@ -3293,6 +3302,17 @@ function SubnetDetail({
           onDeleted={() => {
             setShowEditSubnet(false);
             onSubnetDeleted?.();
+          }}
+        />
+      )}
+      {showResizeSubnet && (
+        <ResizeSubnetModal
+          subnet={subnet}
+          onClose={() => setShowResizeSubnet(false)}
+          onCommitted={(result) => {
+            // Refresh the subnet in-place so the header reflects the new
+            // CIDR without remounting the whole view.
+            onSubnetEdited(result.subnet);
           }}
         />
       )}
@@ -6685,6 +6705,7 @@ function BlockDetailView({
 }) {
   const [block, setBlock] = useState(initialBlock);
   const [showEdit, setShowEdit] = useState(false);
+  const [showResizeBlock, setShowResizeBlock] = useState(false);
   const [showCreateSubnet, setShowCreateSubnet] = useState(false);
   const [showCreateChildBlock, setShowCreateChildBlock] = useState(false);
   const [blockFilter, setBlockFilter] = useState({
@@ -6796,6 +6817,13 @@ function BlockDetailView({
                   Edit
                 </button>
                 <button
+                  onClick={() => setShowResizeBlock(true)}
+                  title="Grow this block to a larger CIDR (e.g. /16 → /15). Shrinking is not supported."
+                  className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
+                >
+                  Resize…
+                </button>
+                <button
                   onClick={() => setShowCreateChildBlock(true)}
                   className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
                 >
@@ -6865,6 +6893,13 @@ function BlockDetailView({
             setShowEdit(false);
           }}
           onDeleted={onSelectSpace}
+        />
+      )}
+      {showResizeBlock && (
+        <ResizeBlockModal
+          block={block}
+          onClose={() => setShowResizeBlock(false)}
+          onCommitted={(result) => setBlock(result.block)}
         />
       )}
       {showCreateSubnet && (
