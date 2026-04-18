@@ -9,6 +9,272 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versioning uses 
 
 ---
 
+## 2026.04.18-1 — 2026-04-18
+
+The **Windows Server integration** release. Adds agentless drivers for
+Windows DNS (Path A — RFC 2136, always available; Path B — WinRM +
+PowerShell for zone CRUD and AXFR-free record pulls) and Windows DHCP
+(Path A — WinRM lease mirroring + per-object scope / pool / reservation
+write-through). IPAM gains full DHCP server-group inheritance parallel to
+the existing DNS model, a two-action delete (Mark as Orphan / Delete
+Permanently), and a right-click context menu across every top-level
+module. Settings gets a per-section "Reset to defaults" button, the two
+DNS sync sections were renamed with a layer diagram showing which
+boundary each one reconciles, and three new doc sets (Getting Started,
+Windows Server setup, DHCP driver spec) land alongside a redrawn
+architecture SVG.
+
+### Added
+
+**DNS — Windows Server driver (agentless, Path A + B)**
+- `WindowsDNSDriver` (`backend/app/drivers/dns/windows.py`) implementing
+  record CRUD for `A / AAAA / CNAME / MX / TXT / PTR / SRV / NS / TLSA`
+  over RFC 2136 via `dnspython`. Optional TSIG; GSS-TSIG and SIG(0) are
+  Path B follow-ups.
+- `AGENTLESS_DRIVERS` frozenset + `is_agentless()` in the DNS driver
+  registry. `record_ops.enqueue_record_op` short-circuits straight to the
+  driver for agentless servers instead of queueing for a non-existent
+  agent; logs a warning when a record op is dropped for lack of a
+  primary.
+- **Path B (credentials required)** — `DNSServer.credentials_encrypted`
+  (Fernet-encrypted WinRM dict, same shape as Windows DHCP) unlocks
+  `Add-DnsServerPrimaryZone` / `Remove-DnsServerZone` for zone CRUD and
+  `Get-DnsServerResourceRecord`-based record pulls that sidestep the
+  AD-integrated zone AXFR ACL which otherwise returns REFUSED. All
+  PowerShell paths are idempotent — guard on `Get-DnsServerZone
+  -ErrorAction SilentlyContinue` before acting. Record writes still ride
+  RFC 2136 to avoid paying the PowerShell-per-record cost.
+- **Write-through for zones** — `_push_zone_to_agentless_servers` pushes
+  zone create / delete to Windows *before* the DB commit; a WinRM
+  failure surfaces as HTTP 502 and rolls back, so DB and server never
+  drift. Mirrors the Windows DHCP write-through pattern.
+- **Shared AXFR helper** — `app/drivers/dns/_axfr.py` now used by both
+  BIND9 and the Windows RFC path. Filters SOA + apex NS and absolutises
+  `CNAME / NS / PTR / MX / SRV` targets.
+- `POST /dns/test-windows-credentials` — runs
+  `(Get-DnsServerSetting -All).BuildNumber` as a cheap probe; wired into
+  the server create modal's "Test Connection" button.
+- Migration `d3f1ab7c8e02_windows_dns_credentials.py`.
+
+**DHCP — Windows Server driver (agentless, Path A)**
+- `WindowsDHCPReadOnlyDriver` (`backend/app/drivers/dhcp/windows.py`)
+  speaks WinRM / PowerShell against the `DhcpServer` module. Reads:
+  `Get-DhcpServerv4Lease` for lease monitoring,
+  `Get-DhcpServerv4Scope` + options + exclusions + reservations for
+  scope topology pulls. Writes (per-object, idempotent): `apply_scope`
+  / `remove_scope` / `apply_reservation` / `remove_reservation` /
+  `apply_exclusion` / `remove_exclusion`.
+- `services/dhcp/windows_writethrough.py` pushes scope / pool / static
+  edits to Windows before DB commit — same rollback guarantee as the
+  Windows DNS path.
+- `AGENTLESS_DRIVERS` + `READ_ONLY_DRIVERS` sets on the DHCP driver
+  registry. The `/sync` bundle-push endpoint rejects read-only drivers;
+  the UI hides "Sync / Push config" and substitutes "Sync Leases" +
+  per-object CRUD instead.
+- Scheduled Celery beat task `app.tasks.dhcp_pull_leases` (60 s cadence;
+  gates on `PlatformSettings.dhcp_pull_leases_enabled` /
+  `_interval_minutes`). Upserts leases by `(server_id, ip_address)` and
+  mirrors each lease into IPAM as `status="dhcp"` + `auto_from_lease=
+  True` when the IP falls inside a known subnet. The existing lease-
+  cleanup sweep handles expiry uniformly.
+- Admin UX: transport picker (`ntlm` / `kerberos` / `basic` / `credssp`),
+  "Test WinRM" button, Windows setup checklist (security group + WinRM
+  enablement), partial credential updates that preserve the stored blob
+  across transport changes. Agentless servers auto-approve on create.
+- Migration `b71d9ae34c50_windows_dhcp_support.py`.
+
+**IPAM → DHCP server-group inheritance**
+- New `dhcp_server_group_id` on `IPSpace` / `IPBlock` / `Subnet`, plus
+  `dhcp_inherit_settings` on Block / Subnet — mirrors the existing DNS
+  pattern.
+- Three `/effective-dhcp` endpoints walk Space → Block → Subnet; subnet
+  resolution falls through to the space when no block overrides.
+- `CreateScopeModal` prefills the server from the effective group,
+  restricts the dropdown to that group, and exposes an override
+  checkbox. Space / Block / Subnet modals gain a DHCP section parallel
+  to `DnsSettingsSection`.
+- Migration `a92f317b5d08_ipam_dhcp_server_group_inheritance.py`.
+
+**DNS — bi-directional zone reconciliation**
+- Group-level "Sync with Servers" button iterates every enabled server,
+  auto-imports zones found on the wire but missing from SpatiumDDI
+  (skipping system zones TrustAnchors / RootHints / Cache), pushes
+  DB-only zones back via `apply_zone_change`, then pulls records
+  (AXFR for BIND9 / Windows Path A, `Get-DnsServerResourceRecord` for
+  Path B) and reconciles against DB state. Additive-only — never
+  deletes on either side.
+- Dedup keys fold `CNAME / NS / PTR / MX / SRV` to canonical absolute
+  FQDNs so IPAM-written (FQDN-with-dot) and AXFR-read (bare label)
+  values no longer duplicate. Out-of-zone glue records are filtered.
+
+**DNS server enable/disable**
+- `DNSServer.is_enabled` — user-controlled pause flag separate from
+  health-derived `status`. Disabled servers are skipped by the health
+  sweep, bi-directional sync, and the record-op dispatcher.
+- Migration `c4e8f1a25d93_dns_server_is_enabled.py`.
+- `dhcp_health` + `dns` health tasks refactored to per-task async
+  engines (fixes "Future attached to a different loop" when the worker
+  queue is widened) and now call `driver.health_check()` for agentless
+  drivers so the dashboard stops showing "never checked" for Windows
+  DHCP / DNS. Compose worker queues re-widened to
+  `ipam,dns,dhcp,default`.
+
+**IPAM — two-action delete + cache propagation**
+- Allocated-IP delete now offers two distinct actions: **Mark as
+  Orphan** (amber — keeps the row, clears ownership metadata) and
+  **Delete Permanently** (destructive). No double-confirm — the two
+  coloured buttons are the confirmation.
+- Every IPAM mutation that invalidates `["addresses", …]` now also
+  invalidates `["dns-records"]`, `["dns-group-records"]`, and
+  `["dns-zones"]`. A newly-created PTR shows up in the reverse-zone
+  record list without a full page reload.
+
+**Settings — per-section reset + DNS sync renames**
+- `GET /settings/defaults` introspects column defaults from the
+  `PlatformSettings` model (single source of truth — no frontend drift).
+- Per-section **Reset to defaults** button populates only that section's
+  fields; Save is still required so the user can back out.
+- Renamed *DNS Auto-Sync* → **IPAM → DNS Reconciliation** and
+  *DNS Server Sync* → **Zone ↔ Server Reconciliation**. Each gets a
+  three-pill layer diagram (IPAM → SpatiumDDI DNS ↔ Windows / BIND9)
+  with the relevant arrow highlighted.
+
+**Delete guards + bulk actions + right-click menus**
+- IP space, IP block, DNS server group, DHCP server group: **409** on
+  delete if populated (plain text error with count).
+- Subnet delete now cascades DHCP scope cleanup to Windows
+  (`push_scope_delete`) and Kea (`config_etag` bump + `DHCPConfigOp`).
+- DNS ZonesTab: compact table replaces card-per-zone; checkbox column
+  + bulk delete toolbar. IPAM space table: bulk-select leaf blocks.
+- Right-click context menus across IPAM IP rows, IPAM space headers,
+  DNS zone tree + record rows, DHCP scope / static / lease rows, VLAN
+  rows.
+- DNS group picker: single-select dropdown; Additional Zones hidden
+  behind a themed `<details>` expander.
+- VLAN router delete: two-step confirmation with checkbox.
+- `ConfirmDestroyModal` / `DeleteConfirmModal` surface 409 errors
+  inline.
+- Space-table refresh button: `forceRefetch` instead of invalidate.
+- Migration `e5b831f02db9` enforces `subnet.block_id NOT NULL` and
+  fixes FK drift from SET NULL to RESTRICT.
+
+**Auth — provider form UX**
+- Auth-provider form defaults to `is_enabled=True` and
+  `tls_insecure=False`. Pre-save "Test Connection" probe validates
+  before creation (instead of after a save that might fail at login
+  time). Applies to all five provider types.
+
+**UI — selection persistence**
+- IPAM / DNS / DHCP selection (subnet / zone / server) now survives tab
+  switches. IPAM + DNS had a race in `useStickyLocation`'s restore
+  effect; DHCP had no URL backing at all and was pure in-memory state.
+  Both fixed; DHCP gets `spatium.lastUrl.dhcp` + a `setSelection()`
+  wrapper that mirrors into `?group=…&server=…`.
+
+**Documentation**
+- [`docs/GETTING_STARTED.md`](docs/GETTING_STARTED.md) — recommended
+  setup order from fresh install to allocating the first IP, with three
+  topology recipes (all-SpatiumDDI / hybrid Windows DNS / hybrid
+  Windows DNS + DHCP).
+- [`docs/deployment/WINDOWS.md`](docs/deployment/WINDOWS.md) — shared
+  Windows-side checklist: WinRM enablement, transport / port matrix,
+  firewall rules, service accounts (`DnsAdmins` / `DHCP Users`), zone
+  dynamic-update settings, diagnosis recipe with a pywinrm snippet,
+  hardening checklist.
+- [`docs/drivers/DHCP_DRIVERS.md`](docs/drivers/DHCP_DRIVERS.md) —
+  filled in the driver spec CLAUDE.md was already pointing at. Kea
+  agented + Windows DHCP agentless, with `AGENTLESS_DRIVERS` /
+  `READ_ONLY_DRIVERS` classification.
+- README — Windows Server DNS/DHCP feature bullet; Architecture
+  section reframed around agented vs agentless split; doc-index
+  refreshed.
+- [`docs/assets/architecture.svg`](docs/assets/architecture.svg) —
+  redrawn. Two-lane data-plane split: agented (`dns-bind9` + `dhcp-kea`
+  with sidecar-agent pills) vs agentless (Windows DNS Path A/B,
+  Windows DHCP Path A read-only); scheduled-sync arrow from Beat →
+  agentless lane.
+- [`features/DNS.md`](docs/features/DNS.md) — new §12 "Sync with
+  Servers" reconciliation, §13 Windows DNS Path A + B, §14 scheduled
+  reconciliation jobs.
+- [`features/DHCP.md`](docs/features/DHCP.md) — new §15 Windows DHCP
+  Path A.
+- [`drivers/DNS_DRIVERS.md`](docs/drivers/DNS_DRIVERS.md) — removed
+  orphaned PowerDNS stub. New §3 Windows DNS driver with both paths,
+  write-through pattern, shared AXFR helper. Section numbering cleaned
+  up (1–6).
+- `docs/index.md`, `CLAUDE.md` — document maps point at the new files.
+
+### Fixed
+
+- `ipam.create_space` — return 409 on duplicate `ip_space` name instead
+  of letting `UniqueViolationError` surface as a bare 500. Matches the
+  pre-check pattern already in DHCP server-group CRUD; demo-seed
+  retries are idempotent again.
+- `frontend/src/lib/api.ts` — `ipamApi.updateBlock`'s Pick was missing
+  `dhcp_server_group_id` and `dhcp_inherit_settings`, so the prod
+  `tsc -b && vite build` failed even though dev `tsc --noEmit` passed.
+- **Subnet inheritance editing bug** — editing a subnet back to
+  "inherit from parent" used to still push records to the previously-
+  pinned server. The inheritance walk now goes subnet → block
+  ancestors → space and respects `dns_inherit_settings` at every level.
+  Same walk applied in `services/dns/sync_check.py`.
+- **Login crash on external user group assignment** — LDAP / OIDC /
+  SAML logins were throwing `MissingGreenlet` during the group-
+  membership replace step of `sync_external_user`. Fixed by:
+  (1) adding `AsyncAttrs` mixin to `Base` so models expose
+  `awaitable_attrs`; (2) awaiting `user.awaitable_attrs.groups` before
+  assigning `user.groups = groups` in
+  `backend/app/core/auth/user_sync.py` — SQLAlchemy's collection
+  setter computes a diff against the currently-loaded collection, and
+  that lazy-load under AsyncSession would otherwise raise.
+- **`is_superadmin` vs RBAC wildcard mismatch** —
+  externally-provisioned users with the built-in Superadmin role got
+  403 from every `require_superadmin`-gated endpoint because the
+  legacy `User.is_superadmin` flag defaults False and
+  `sync_external_user` never flipped it. `require_superadmin` now
+  admits either the legacy flag *or* any user whose groups → roles
+  include an `action=*, resource_type=*` permission. Function-local
+  import of `user_has_permission` dodges the circular import against
+  `app.api.deps`.
+- **Dynamic-lease mirrors are read-only** — `auto_from_lease=true` IPs
+  now return 409 from update / delete endpoints and are skipped by
+  bulk-edit. Prevents manual edits from being overwritten on the next
+  lease pull.
+- **IP delete cascades to DHCP static reservation** — on Windows the
+  FK was set to NULL, orphaning the reservation. Now cascades
+  correctly.
+- **Tree chevrons** — DHCP / DNS server-group sidebars + VLANs tree
+  swapped to the IPAM `[+] / [−]` boxed toggle for consistency. DNS
+  zone-tree folder icons left alone.
+- **DNS group expand-stuck** — selecting a zone no longer latches its
+  group's expanded state.
+- **IPAM address list** gains a `tags` column rendering clickable chips
+  that populate the tag filter.
+- **`seed_demo.py`** creates DNS group + zone and DHCP server group
+  *first*, then wires both into the IP Space so blocks/subnets inherit
+  by default.
+
+### Security
+
+- **CodeQL alert #13 (CWE-601, URL redirection from remote source)**
+  closed. Previous attempts added `_safe_error_suffix()` and then a
+  `urlparse`-based sanitiser defence, neither of which CodeQL's taint
+  tracker recognises as sanitisers. Replaced with a closed-set
+  allowlist: all redirect reasons are now selected from
+  `_LOGIN_ERROR_REASONS` (a frozenset of literals); anything else
+  becomes `"unknown"`. The three interpolation sites that previously
+  threaded IdP error codes / exception reason fields into f-strings
+  now pass fixed literals. Actual IdP error strings still land in the
+  server log + audit row — only the URL-visible part is generic.
+
+### Changed
+
+- Backend + frontend: `make lint` now mandatory before push —
+  CI-mirroring `make ci` target (added in 2026.04.16-3) catches
+  formatter drift before it hits GitHub Actions.
+
+---
+
 ## 2026.04.16-3 — 2026-04-16
 
 Third same-day iteration. First wave of substantive post-alpha work:
