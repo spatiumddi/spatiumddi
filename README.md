@@ -200,7 +200,7 @@ Full docs at **[spatiumddi.github.io](https://spatiumddi.github.io)** (coming so
 | Phase | Focus | Status |
 |---|---|---|
 | Phase 1 | Core IPAM, auth, user management, audit log, Docker Compose | 🔄 Mostly done — LDAP/OIDC/SAML + RADIUS/TACACS+ + group-based RBAC landed; IPv6 partial |
-| Phase 2 | DHCP (Kea + ISC), DNS (BIND9), DDNS, zone/subnet tree UI | 🔄 DNS + Kea DHCPv4 landed; ISC DHCP + DDNS pending |
+| Phase 2 | DHCP (Kea + ISC), DNS (BIND9), DDNS, zone/subnet tree UI | 🔄 DNS + Kea DHCPv4 + DDNS (agentless path) landed; ISC DHCP + agent-side lease-event DDNS pending |
 | Phase 3 | DNS views, server groups, blocking lists, VLAN/VXLAN, system admin | 🔄 DNS features landed |
 | Phase 4 | OS appliance, Terraform provider, SAML, backup/restore | 🔄 SAML landed; appliance + providers + backup pending |
 | Phase 5 | Multi-tenancy, IP request workflows, advanced reporting | 📋 Planned |

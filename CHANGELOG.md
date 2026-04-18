@@ -7,6 +7,74 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versioning uses 
 
 ## Unreleased
 
+Post-2026.04.18-1 audit sweep + the DDNS pipeline.
+
+### Added
+
+**DDNS — DHCP lease → DNS A/PTR reconciliation**
+- Migration `e1f2a3b4c5d6` adds four subnet-level DDNS control fields:
+  `ddns_enabled` (default False — opt-in),
+  `ddns_hostname_policy` (`client_provided` | `client_or_generated` |
+  `always_generate` | `disabled`),
+  `ddns_domain_override` (publish into a different zone), and
+  `ddns_ttl` (override the zone's TTL for auto-generated records).
+  Independent of `DHCPScope.ddns_enabled` — that pair still drives
+  Kea's native DDNS hook.
+- New service `app/services/dns/ddns.py` with `resolve_ddns_hostname`,
+  `apply_ddns_for_lease`, and `revoke_ddns_for_lease`. Static-assignment
+  hostnames always win over policy; client hostnames are sanitised to
+  RFC 1035 labels and truncated at 63 chars; generated hostnames use
+  the last two IPv4 octets (`dhcp-20-5` for `10.1.20.5`) or the low
+  32 bits hex for IPv6.
+- Integration points: `services/dhcp/pull_leases.py` fires DDNS after
+  each mirrored IPAM row (agentless lease-pull path);
+  `tasks/dhcp_lease_cleanup.py` calls `revoke_ddns_for_lease` before
+  deleting the mirrored row.
+- Idempotent — repeat polls over the same lease state are a no-op.
+- `_sync_dns_record` is lazy-imported from the IPAM router at call
+  time to dodge a module-load cycle.
+- `SubnetCreate` / `SubnetUpdate` / `SubnetResponse` + `Subnet`
+  frontend type gain the four DDNS fields.
+- New `DdnsSettingsSection` React component — enable toggle, policy
+  dropdown, domain-override input, TTL input, live preview of what
+  `always_generate` would produce for the subnet's first IP. Wired
+  into `CreateSubnetModal` and `EditSubnetModal`.
+- Docs: `features/DNS.md §7` rewritten to describe the shipped
+  implementation (architecture diagram, subnet fields, policy
+  semantics, static override, idempotency, enable walkthrough).
+
+### Fixed
+
+- K8s worker queue mismatch — `k8s/base/worker.yaml` listed
+  `ipam,default`; compose widened to `ipam,dns,dhcp,default` in the
+  Windows release. DNS + DHCP health sweeps + scheduled sync tasks
+  were silently hanging on K8s.
+- Windows DNS TLSA dispatch — `_SUPPORTED_RECORD_TYPES` listed TLSA
+  (RFC 2136 handles it fine via dnspython) but `_ps_apply_record`
+  raised ValueError for TLSA, so creating a TLSA record on a
+  Windows server with credentials failed unpredictably. Added
+  `_WINRM_UNSUPPORTED_RECORD_TYPES`; `apply_record_change` now falls
+  back to RFC 2136 for those types even when credentials are set.
+- `DHCPPage.tsx` lease-sync handler was invalidating
+  `["ipam-addresses"]` which matches nothing; changed to
+  `["addresses"]` (broad match) so the subnet-level address list
+  refreshes after lease sync mirrors new rows.
+- Frontend `DHCPPool` type now declares optional
+  `existing_ips_in_range` so `CreatePoolModal` no longer needs an
+  `as any` cast.
+
+### Changed
+
+- Kea driver gains **Dhcp6 option-name translation** — new
+  `_KEA_OPTION_NAMES_V6` map + `_DHCP4_ONLY_OPTION_NAMES` set;
+  `_render_option_data` takes `address_family` and routes
+  accordingly. v4-only options (`routers`, `broadcast-address`,
+  `mtu`, `time-offset`, `domain-name`, tftp-*) are dropped from v6
+  scopes with a warning log instead of being emitted under the
+  wrong space (which Kea would reject on reload). Scope / pool /
+  reservation / client-class renderers all thread `address_family`
+  through. Closes the Phase 1 Dhcp6 TODO.
+
 ---
 
 ## 2026.04.18-1 — 2026-04-18

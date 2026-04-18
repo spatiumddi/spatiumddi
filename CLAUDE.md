@@ -138,7 +138,7 @@ Three patterns recur across the DNS and DHCP subsystems. Know these before addin
 | Phase | Focus | Status |
 |---|---|---|
 | 1 | Core IPAM, local auth, user management, audit log, Docker Compose | **Mostly done** — LDAP/OIDC/SAML + RADIUS/TACACS+ auth, group-based RBAC enforcement, bulk-edit tags/CF, inherited-field placeholders, and mobile-responsive UI all landed; IPv6 partial |
-| 2 | DHCP (Kea + ISC), DNS (BIND9), DDNS, zone/subnet tree UI | **In Progress** (DNS core landed; DHCP Kea driver + agent + UI landed; ISC DHCP + DDNS pending) |
+| 2 | DHCP (Kea + ISC), DNS (BIND9), DDNS, zone/subnet tree UI | **In Progress** (DNS core landed; DHCP Kea driver + agent + UI landed; DDNS pipeline shipped for agentless lease path 2026-04-18; ISC DHCP + agent-side lease-event DDNS pending) |
 | 3 | DNS views, server groups, blocking lists, VLAN/VXLAN, system admin panel, health dashboard | **In Progress** (DNS views, groups, blocklists, health checks landed) |
 | 4 | OS appliance image, Terraform/Ansible providers, SAML, notifications, backup/restore | **In Progress** (SAML SP landed in Wave A.4; appliance, providers, backup still pending) |
 | 5 | Multi-tenancy, IP request workflows, import/export, advanced reporting | Not started |
@@ -183,7 +183,9 @@ SpatiumDDI cut its alpha release `2026.04.16-1` on 2026-04-16 with IPAM, DNS (BI
 ### Phase 2/3 — Remaining
 
 - ⬜ ISC DHCP driver (Kea driver + agent + UI landed in DHCP Wave 1)
-- ⬜ DDNS pipeline (needs DHCP lease events flowing) — subnet `ddns_enabled`/`ddns_hostname_policy`/`ddns_domain_override`/`ddns_ttl`; DHCP-lease → DNS A/PTR Celery task
+- ✅ DDNS pipeline (subnet-level, shipped 2026-04-18 in `feat(ddns)`) — `Subnet.ddns_enabled` / `ddns_hostname_policy` / `ddns_domain_override` / `ddns_ttl`; `services/dns/ddns.py` resolves hostname per policy and calls the same `_sync_dns_record` path static allocations use; `pull_leases.py` + `dhcp_lease_cleanup.py` are the two integration points. Agentless lease-pull path only today — agent-side (Kea) lease-event DDNS is the remaining piece.
+- ⬜ Agent-side lease-event DDNS for Kea — wire `apply_ddns_for_lease` into the agent's lease-event handler (~10 lines in `agent/dhcp/`). IPAM mirroring already happens; only the DDNS call is missing.
+- ⬜ Block/space inheritance for DDNS settings — today subnet-only. Would mirror the DNS-group / DHCP-group inheritance pattern.
 - ⬜ Per-server zone serial reporting (currently all servers in a group share `DNSZone.serial`; once agents report back, surface per-server drift)
 - ⬜ Trivy-clean + kind-AXFR acceptance tests for the agent images (stubs marked `@pytest.mark.e2e` in `agent/dns/tests/`)
 

@@ -367,50 +367,91 @@ async def apply_record_change(
 
 ## 7. Dynamic DNS (DDNS) — DHCP Lease → DNS Record
 
-When a DHCP lease is issued, SpatiumDDI automatically creates or updates:
-1. An **A record** (or AAAA for IPv6) in the subnet's forward zone
-2. A **PTR record** in the subnet's reverse zone
+> **Implementation status (2026-04-18, post 2026.04.18-1):** Subnet-level opt-in DDNS has shipped. When a lease lands via the agentless pull path (Windows DHCP today), SpatiumDDI resolves a hostname per the subnet's policy and publishes A/AAAA + PTR via the same RFC 2136 / WinRM path static allocations use. Agent-side lease-event DDNS (Kea) is the planned follow-up.
 
-### DDNS Flow
+### Architecture
 
-```
-DHCP client obtains lease
-        ↓
-DHCP driver emits lease event → Celery task: ddns_update
-        ↓
-ddns_update task:
-  1. Look up subnet → find forward zone + reverse zone
-  2. Determine hostname:
-     a. From DHCP client hostname option (option 12) if provided
-     b. From static DHCP assignment hostname
-     c. Auto-generated: dhcp-<last-two-octets>.<zone>
-  3. Create/update A record in forward zone (RFC 2136
-  4. Create/update PTR record in reverse zone
-  5. Update IPAddress record in IPAM DB: status=dhcp, hostname=<name>
-  6. Write audit log entry
-        ↓
-On lease expiry / release:
-  1. Delete A record (or set TTL very low for grace period)
-  2. Delete PTR record
-  3. Update IPAddress status back to available
-```
-
-### DDNS Configuration per Subnet
+DDNS is a thin layer on top of the IPAM → DNS sync pipeline. The DNS side is identical to what a static allocation produces; the only DDNS-specific logic is picking a hostname from the lease.
 
 ```
-Subnet.ddns_enabled: bool            (default: true if zone is assigned)
-Subnet.ddns_hostname_policy: enum(
-  client_provided,     -- trust the client's hostname option
-  client_or_generated, -- use client's if present, else auto-generate
-  always_generate,     -- always generate, ignore client option
-  disabled             -- no DDNS for this subnet
-)
-Subnet.ddns_domain_override: str     -- use a different domain than zone name
-Subnet.ddns_ttl: int                 -- TTL for auto-created records (default: 300)
+┌──────────────────────────┐
+│  Lease source            │
+│  ─ agentless pull        │  → upserts DHCPLease + mirrors into IPAM
+│    (Windows DHCP)         │    as auto_from_lease=True
+│  ─ agent lease event      │
+│    (Kea — planned)        │
+└───────────┬──────────────┘
+            │ ipam_row
+            ▼
+┌──────────────────────────┐
+│  services/dns/ddns.py    │
+│  apply_ddns_for_lease()  │  → resolves hostname per subnet policy,
+│                          │    writes it onto ipam_row.hostname,
+│                          │    calls _sync_dns_record(..., "create")
+└───────────┬──────────────┘
+            │
+            ▼
+┌──────────────────────────┐
+│  _sync_dns_record        │  → unchanged — drives A/AAAA + PTR via
+│  (IPAM router)           │    RFC 2136 for BIND9 / Windows Path A,
+│                          │    or WinRM for Windows Path B
+└──────────────────────────┘
 ```
+
+On lease expiry, `dhcp_lease_cleanup` sweeps the DHCPLease row past its grace period; before deleting the mirrored `auto_from_lease` IPAM row it calls `revoke_ddns_for_lease`, which fires `_sync_dns_record(..., action="delete")` to tear down the A/AAAA + PTR.
+
+### Subnet-level configuration
+
+DDNS is opt-in per subnet — there's no inheritance from block / space (by design for MVP; the knob is usually different per subnet anyway).
+
+| Field | Default | Purpose |
+|---|---|---|
+| `ddns_enabled` | `False` | Master toggle. When off, leases on the subnet don't publish DNS. |
+| `ddns_hostname_policy` | `client_or_generated` | See below. Only read when `ddns_enabled`. |
+| `ddns_domain_override` | `NULL` | Publish into a different zone than the subnet's primary forward zone (e.g. `dhcp.corp.example.com` while manual allocations stay in `corp.example.com`). |
+| `ddns_ttl` | `NULL` | Override the zone's default TTL for auto-generated records. |
+
+### Hostname policies
+
+| Policy | Behaviour |
+|---|---|
+| `client_provided` | Publish only if the lease has a client hostname. Skip if empty. |
+| `client_or_generated` | Use client hostname if present, else generate `dhcp-<tail>`. **Default**. |
+| `always_generate` | Ignore client hostname, always synthesise. |
+| `disabled` | Never publish, even if `ddns_enabled`. (Useful for temporarily parking DDNS without losing your config.) |
+
+**Generated hostnames:**
+- IPv4 — `dhcp-<third-octet>-<fourth-octet>`. So `10.1.20.5` → `dhcp-20-5`.
+- IPv6 — `dhcp-<low-32-bits-hex>`. Rare path; the format is ugly but unique.
+
+**Static assignment override:** if the lease IP matches a `DHCPStaticAssignment` that has a hostname set, that hostname always wins — regardless of policy, including `always_generate`. Rationale: a static hostname is an explicit admin choice.
+
+**Sanitisation:** all hostnames (client-provided or static) are folded to lower-case, non-`[a-z0-9-]` characters collapse to `-`, leading/trailing hyphens strip, and the result truncates at RFC 1035's 63-character label limit.
+
+### Idempotency
+
+DDNS is safe to call repeatedly. If the resolved hostname matches what's already on the `IPAddress` row and there's already a linked auto-generated DNS record, no ops are enqueued. The agentless lease-pull loop hits this path every poll; post-steady-state it's effectively a no-op.
 
 ### Security
-- DDNS updates to BIND9 use TSIG-signed RFC 2136 updates (key stored encrypted)
+
+- RFC 2136 updates to BIND9 use TSIG signing (key stored Fernet-encrypted).
+- WinRM calls to Windows DNS go over HTTPS with cert validation by default.
+- The DDNS service itself never touches manual IPAM allocations (it gates on `auto_from_lease=True` before doing anything).
+
+### Enabling DDNS (quick walkthrough)
+
+1. **Pick a subnet** with a DNS forward + reverse zone already assigned.
+2. Open the subnet editor → **Dynamic DNS (from DHCP)** section → toggle **Enabled**, pick a policy, optionally set a domain override or TTL. Save.
+3. Make sure the subnet's DNS group has at least one healthy server (BIND9 via agent, or Windows DNS — Path A or B).
+4. Ensure **Settings → DHCP Lease Sync** is enabled (the agentless poll loop — currently the only lease source that fires DDNS).
+5. Issue a lease on the Windows DHCP scope covering the subnet. Wait for the next poll (default 5 min) or hit **Sync Leases** on the server detail page.
+6. The IPAM subnet page shows the IP with its hostname; the DNS zone shows the matching A + PTR.
+
+### Not-yet (planned follow-ups)
+
+- **Kea lease-event DDNS.** Today the agent mirrors leases into IPAM but doesn't call `apply_ddns_for_lease`. Wiring ~10 lines in the agent's lease-event handler is the next piece.
+- **Block/space inheritance** of DDNS settings (matches the DNS-group / DHCP-group inheritance pattern).
+- **Grace period** on revoke — today we delete A + PTR immediately when the lease-cleanup sweep removes the IPAM row. A short grace where we drop the TTL to 30 s first would help mid-transition clients.
 
 ---
 
