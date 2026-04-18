@@ -1113,6 +1113,14 @@ async def list_spaces(current_user: CurrentUser, db: DB) -> list[IPSpace]:
 
 @router.post("/spaces", response_model=IPSpaceResponse, status_code=status.HTTP_201_CREATED)
 async def create_space(body: IPSpaceCreate, current_user: CurrentUser, db: DB) -> IPSpace:
+    # Pre-check the unique-name constraint so we can return a clean 409
+    # instead of letting the DB raise an IntegrityError (→ 500).
+    existing = await db.execute(select(IPSpace).where(IPSpace.name == body.name))
+    if existing.scalar_one_or_none():
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"An IP space named {body.name!r} already exists",
+        )
     space = IPSpace(**body.model_dump())
     db.add(space)
     await db.flush()
