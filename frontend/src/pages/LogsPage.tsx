@@ -1,24 +1,18 @@
-import { useMemo, useState } from "react";
-import { useMutation, useQuery } from "@tanstack/react-query";
+import { useEffect, useMemo, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 import {
   AlertTriangle,
   Ban,
+  Calendar,
   ChevronDown,
   ChevronRight,
-  Globe2,
   Info,
   RefreshCw,
   Search,
-  Server,
   ScrollText,
   XCircle,
 } from "lucide-react";
-import {
-  logsApi,
-  type LogEventRow,
-  type LogQueryRequest,
-  type LogSource,
-} from "@/lib/api";
+import { logsApi, type LogEventRow, type LogSource } from "@/lib/api";
 import { cn } from "@/lib/utils";
 
 /**
@@ -28,10 +22,16 @@ import { cn } from "@/lib/utils";
  * DHCP servers. Future sources (agent logs, control-plane service
  * logs, audit streaming) drop into the same source picker.
  *
- * The UI is deliberately read-only and polling-free by default:
- * `Get-WinEvent` is cheap but not free, and bursting it every 15 s
- * against a production DC for every open tab is antisocial. User
- * hits Refresh to re-fetch.
+ * Events are keyed into a react-query, so changing any filter
+ * (server / log / level / max / since) fires a re-fetch
+ * automatically. Initial render on tab entry also fetches the first
+ * viable combination. The manual **Refresh** button calls
+ * ``refetch()`` — useful after you know something just happened on
+ * the DC and want to bypass the staleTime cache.
+ *
+ * Polling is off by default: ``Get-WinEvent`` is cheap but not free,
+ * and bursting it every 15 s against a production DC from every open
+ * tab is antisocial.
  */
 export function LogsPage() {
   // Discovery — who can we pull logs from?
@@ -50,15 +50,19 @@ export function LogsPage() {
   const [logName, setLogName] = useState<string | null>(null);
   const [maxEvents, setMaxEvents] = useState(100);
   const [level, setLevel] = useState<number | "">("");
+  const [since, setSince] = useState<string>(""); // datetime-local value
   const [search, setSearch] = useState("");
 
-  // Pick an initial selection once sources land.
-  const firstSource = sources?.[0];
-  if (!selectedKey && firstSource) {
-    const key = `${firstSource.server_kind}:${firstSource.server_id}`;
-    setSelectedKey(key);
-    if (firstSource.logs.length > 0) setLogName(firstSource.logs[0].name);
-  }
+  // Pick an initial selection once sources land. Effect, not inline
+  // setState during render — the latter works but trips the React
+  // "strict mode" warning and double-fires in dev.
+  useEffect(() => {
+    if (!sources || sources.length === 0) return;
+    if (selectedKey) return;
+    const first = sources[0];
+    setSelectedKey(`${first.server_kind}:${first.server_id}`);
+    if (first.logs.length > 0) setLogName(first.logs[0].name);
+  }, [sources, selectedKey]);
 
   const selected: LogSource | undefined = useMemo(() => {
     if (!selectedKey || !sources) return undefined;
@@ -68,30 +72,51 @@ export function LogsPage() {
   }, [selectedKey, sources]);
 
   // Keep the log_name picker valid when the server changes.
-  const firstLogName = selected?.logs?.[0]?.name;
-  if (selected && logName && !selected.logs.some((l) => l.name === logName)) {
-    setLogName(firstLogName ?? null);
-  }
+  useEffect(() => {
+    if (!selected) return;
+    if (!logName || !selected.logs.some((l) => l.name === logName)) {
+      setLogName(selected.logs[0]?.name ?? null);
+    }
+  }, [selected, logName]);
 
-  // Query mutation — fired on button press, not on auto-poll.
-  const queryMut = useMutation({
-    mutationFn: (body: LogQueryRequest) => logsApi.query(body),
+  // Convert the datetime-local string to ISO for the backend.
+  // datetime-local has no timezone; treat as the user's local time
+  // then send as ISO. Empty string → null (no time filter).
+  const sinceIso = since ? new Date(since).toISOString() : null;
+
+  // Events query — keyed on every filter so any change triggers a
+  // re-fetch. ``enabled`` gates the query until we have a viable
+  // server + log combination.
+  const enabled = !!selected && !!logName;
+  const eventsQuery = useQuery({
+    queryKey: [
+      "logs-query",
+      selected?.server_id,
+      selected?.server_kind,
+      logName,
+      level,
+      maxEvents,
+      sinceIso,
+    ],
+    queryFn: () =>
+      logsApi.query({
+        server_id: selected!.server_id,
+        server_kind: selected!.server_kind,
+        log_name: logName!,
+        max_events: maxEvents,
+        level: level === "" ? null : level,
+        since: sinceIso,
+        event_id: null,
+      }),
+    enabled,
+    // staleTime: Infinity so switching tabs + back doesn't re-hit the
+    // DC until the user actually changes a filter or hits Refresh.
+    staleTime: Infinity,
+    gcTime: 5 * 60_000,
+    retry: false,
   });
 
-  function runQuery() {
-    if (!selected || !logName) return;
-    queryMut.mutate({
-      server_id: selected.server_id,
-      server_kind: selected.server_kind,
-      log_name: logName,
-      max_events: maxEvents,
-      level: level === "" ? null : level,
-      since: null,
-      event_id: null,
-    });
-  }
-
-  const events = queryMut.data?.events ?? [];
+  const events = eventsQuery.data?.events ?? [];
   const filteredEvents = useMemo(() => {
     if (!search.trim()) return events;
     const q = search.trim().toLowerCase();
@@ -173,7 +198,6 @@ export function LogsPage() {
                   `${src.server_kind}:${src.server_id}` === e.target.value,
               );
               setLogName(s?.logs?.[0]?.name ?? null);
-              queryMut.reset();
             }}
             className="rounded-md border bg-background px-2 py-1 text-sm"
           >
@@ -194,10 +218,7 @@ export function LogsPage() {
             <span className="text-muted-foreground">Log</span>
             <select
               value={logName ?? ""}
-              onChange={(e) => {
-                setLogName(e.target.value);
-                queryMut.reset();
-              }}
+              onChange={(e) => setLogName(e.target.value)}
               className="min-w-[240px] rounded-md border bg-background px-2 py-1 text-sm"
             >
               {selected.logs.map((l) => (
@@ -230,6 +251,31 @@ export function LogsPage() {
           </select>
         </label>
 
+        {/* Since filter — native datetime-local picker so we don't
+            drag in react-datepicker. Blank = no lower bound. */}
+        <label className="flex items-center gap-1.5 text-xs">
+          <span className="inline-flex items-center gap-1 text-muted-foreground">
+            <Calendar className="h-3 w-3" />
+            Since
+          </span>
+          <input
+            type="datetime-local"
+            value={since}
+            onChange={(e) => setSince(e.target.value)}
+            className="rounded-md border bg-background px-2 py-1 text-sm"
+          />
+          {since && (
+            <button
+              type="button"
+              onClick={() => setSince("")}
+              title="Clear since filter"
+              className="rounded text-[11px] text-muted-foreground hover:text-foreground"
+            >
+              ✕
+            </button>
+          )}
+        </label>
+
         {/* Max */}
         <label className="flex items-center gap-1.5 text-xs">
           <span className="text-muted-foreground">Max</span>
@@ -258,49 +304,52 @@ export function LogsPage() {
         </div>
 
         <button
-          onClick={runQuery}
-          disabled={queryMut.isPending || !logName}
+          onClick={() => eventsQuery.refetch()}
+          disabled={!enabled || eventsQuery.isFetching}
+          title="Re-run the query (bypasses cache)"
           className="flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
         >
           <RefreshCw
-            className={cn("h-3.5 w-3.5", queryMut.isPending && "animate-spin")}
+            className={cn(
+              "h-3.5 w-3.5",
+              eventsQuery.isFetching && "animate-spin",
+            )}
           />
-          {queryMut.isPending ? "Querying…" : "Fetch events"}
+          {eventsQuery.isFetching ? "Querying…" : "Refresh"}
         </button>
       </div>
 
       {/* Results */}
       <div className="flex-1 overflow-auto">
-        {queryMut.isError && (
+        {eventsQuery.isError && (
           <div className="m-6 rounded-lg border border-destructive/30 bg-destructive/10 p-4 text-sm text-destructive">
             <p className="font-medium">Query failed</p>
-            <p className="mt-1 text-xs">
-              {(queryMut.error as any)?.response?.data?.detail ??
-                String(queryMut.error)}
+            <p className="mt-1 whitespace-pre-wrap break-words text-xs">
+              {(
+                eventsQuery.error as {
+                  response?: { data?: { detail?: string } };
+                }
+              )?.response?.data?.detail ?? String(eventsQuery.error)}
             </p>
           </div>
         )}
 
-        {!queryMut.data && !queryMut.isPending && !queryMut.isError && (
+        {enabled && eventsQuery.isLoading && (
           <div className="flex h-full items-center justify-center">
-            <div className="max-w-md rounded-lg border border-dashed p-10 text-center">
-              <ServerIcon source={selected} />
-              <p className="mt-3 text-sm font-medium">
-                Ready — pick a log and click Fetch.
-              </p>
-              <p className="mt-1 text-xs text-muted-foreground">
-                Events are pulled on demand (no auto-refresh). This keeps
-                PowerShell round-trips off the DC when the tab is idle.
-              </p>
+            <div className="flex items-center gap-2 text-sm text-muted-foreground">
+              <RefreshCw className="h-4 w-4 animate-spin" />
+              Querying {selected?.host}…
             </div>
           </div>
         )}
 
-        {queryMut.data && events.length === 0 && (
+        {eventsQuery.data && events.length === 0 && !eventsQuery.isError && (
           <div className="m-6 rounded-lg border border-dashed p-8 text-center">
             <p className="text-sm font-medium">No events match your filter.</p>
             <p className="mt-1 text-xs text-muted-foreground">
-              Try widening the level filter or raising Max.
+              {since
+                ? "Try widening the time window or raising Max."
+                : "Try widening the level filter or raising Max."}
             </p>
           </div>
         )}
@@ -317,7 +366,7 @@ export function LogsPage() {
             {filteredEvents.map((ev, idx) => (
               <EventRow key={`${ev.time}-${ev.id}-${idx}`} ev={ev} />
             ))}
-            {queryMut.data?.truncated && (
+            {eventsQuery.data?.truncated && (
               <div className="bg-amber-50/40 px-6 py-2 text-xs text-amber-700 dark:bg-amber-950/20 dark:text-amber-400">
                 Result limit reached ({maxEvents}). Raise Max or narrow the
                 level / time filters to see older events.
@@ -328,15 +377,6 @@ export function LogsPage() {
       </div>
     </div>
   );
-}
-
-function ServerIcon({ source }: { source: LogSource | undefined }) {
-  if (!source)
-    return (
-      <ScrollText className="mx-auto h-10 w-10 text-muted-foreground/30" />
-    );
-  const Icon = source.server_kind === "dns" ? Globe2 : Server;
-  return <Icon className="mx-auto h-10 w-10 text-muted-foreground/40" />;
 }
 
 function levelStyling(level: string): {

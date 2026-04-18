@@ -58,10 +58,33 @@ def _build_filter_script(
         parts.append(f"StartTime = [datetime]::Parse({_ps_single_quote(since_iso)})")
     filter_str = "; ".join(parts)
     capped = max(1, min(int(max_events), 500))
+    # ``Get-WinEvent`` throws a ``System.Diagnostics.Eventing.Reader
+    # .EventLogException`` when:
+    #   * the log name doesn't exist on this host ("There is not an
+    #     event log on the computer named X"),
+    #   * zero events match ("No events were found"), or
+    #   * a FilterHashtable key doesn't apply to the log ("The
+    #     parameter is incorrect" — Win32 error 87).
+    # ``-ErrorAction SilentlyContinue`` covers the non-terminating
+    # error cases, but terminating exceptions from the .NET provider
+    # still bubble up — so we wrap in try/catch and normalise any
+    # "no data / bad log" variant into an empty result.
     return f"""
 $ErrorActionPreference = 'Stop'
-$events = Get-WinEvent -FilterHashtable @{{ {filter_str} }} `
-    -MaxEvents {capped} -ErrorAction SilentlyContinue
+$events = $null
+try {{
+    $events = Get-WinEvent -FilterHashtable @{{ {filter_str} }} -MaxEvents {capped}
+}} catch [System.Diagnostics.Eventing.Reader.EventLogException] {{
+    Write-Output '[]'
+    exit 0
+}} catch {{
+    $msg = $_.Exception.Message
+    if ($msg -match 'No events were found|not an event log|parameter is incorrect|does not exist') {{
+        Write-Output '[]'
+        exit 0
+    }}
+    throw
+}}
 if (-not $events) {{ Write-Output '[]'; exit 0 }}
 $events | Select-Object `
     @{{N='time';E={{$_.TimeCreated.ToString('o')}}}}, `

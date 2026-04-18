@@ -421,14 +421,12 @@ Remove-DhcpServerv4ExclusionRange -ScopeId {_ps_literal(scope_id)} `
 
         Returns ``[(log_name, display)]``. The ``log_name`` is what
         ``Get-WinEvent -LogName`` takes; ``display`` is what the UI
-        shows in the source picker. Operational + AdminEvents are
-        the two any stock Windows DHCP role has enabled by default;
-        FilterNotifications is optional (firewall / MAC filter
-        plumbing) and empty on most DCs, but cheap to expose.
+        shows in the source picker. Both logs are cheap to expose:
+        any missing log returns ``[]`` via the shared helper's
+        try/catch around ``EventLogException``.
         """
         return [
             ("Microsoft-Windows-Dhcp-Server/Operational", "DHCP Server — Operational"),
-            ("Microsoft-Windows-Dhcp-Server/AdminEvents", "DHCP Server — Admin Events"),
             (
                 "Microsoft-Windows-Dhcp-Server/FilterNotifications",
                 "DHCP Server — Filter Notifications",
