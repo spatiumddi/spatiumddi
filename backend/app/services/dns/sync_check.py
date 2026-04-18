@@ -89,9 +89,7 @@ class DriftReport:
 # ── Effective DNS resolution (duplicated minimally to avoid a router import) ─
 
 
-async def _effective_dns(
-    db: AsyncSession, subnet: Subnet
-) -> tuple[list[str], uuid.UUID | None]:
+async def _effective_dns(db: AsyncSession, subnet: Subnet) -> tuple[list[str], uuid.UUID | None]:
     """Walk subnet → block ancestors → space, return
     ``(effective_dns_group_ids, effective_forward_zone_id)``.
 

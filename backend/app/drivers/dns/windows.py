@@ -137,9 +137,7 @@ class WindowsDNSDriver(DNSDriver):
 
         await self._apply_record_change_rfc2136(server, change)
 
-    async def _apply_record_change_rfc2136(
-        self, server: Any, change: RecordChange
-    ) -> None:
+    async def _apply_record_change_rfc2136(self, server: Any, change: RecordChange) -> None:
         import dns.message  # noqa: PLC0415
         import dns.name  # noqa: PLC0415
         import dns.query  # noqa: PLC0415
@@ -192,9 +190,7 @@ class WindowsDNSDriver(DNSDriver):
         )
         await asyncio.to_thread(dns.query.tcp, update, host, port=port, timeout=10)
 
-    async def _apply_record_change_winrm(
-        self, server: Any, change: RecordChange
-    ) -> None:
+    async def _apply_record_change_winrm(self, server: Any, change: RecordChange) -> None:
         """Record create/update/delete via ``*-DnsServerResourceRecord``."""
         creds = _load_credentials(server)
         script = _ps_apply_record(change)
@@ -277,9 +273,7 @@ class WindowsDNSDriver(DNSDriver):
             server_id=str(getattr(server, "id", "")),
         )
 
-    async def _pull_zone_records_winrm(
-        self, server: Any, zone_name: str
-    ) -> list[RecordData]:
+    async def _pull_zone_records_winrm(self, server: Any, zone_name: str) -> list[RecordData]:
         """Pull records via ``Get-DnsServerResourceRecord`` over WinRM."""
         creds = _load_credentials(server)
         script = _ps_list_records(zone_name)

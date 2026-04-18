@@ -957,9 +957,7 @@ async def test_windows_credentials_endpoint(
         if srv is None:
             raise HTTPException(status_code=404, detail="Server not found")
         if not srv.credentials_encrypted:
-            raise HTTPException(
-                status_code=400, detail="Server has no stored credentials to test"
-            )
+            raise HTTPException(status_code=400, detail="Server has no stored credentials to test")
         creds = decrypt_dict(srv.credentials_encrypted)
         host = body.host or srv.host
     else:
@@ -1161,9 +1159,7 @@ async def _sync_single_server(
                 error=str(exc),
             )
 
-    existing_res = await db.execute(
-        select(DNSZone.name).where(DNSZone.group_id == group_id)
-    )
+    existing_res = await db.execute(select(DNSZone.name).where(DNSZone.group_id == group_id))
     existing_names = {str(n).rstrip(".") for n in existing_res.scalars().all()}
     new_zones = sorted({n for n in zones_on_server if n not in existing_names})
 
@@ -1222,9 +1218,7 @@ async def _sync_single_server(
         driver = WindowsDNSDriver()
         # Re-query zones after the import step so newly-imported rows
         # are excluded from the "missing on server" set automatically.
-        db_zones_res = await db.execute(
-            select(DNSZone).where(DNSZone.group_id == group_id)
-        )
+        db_zones_res = await db.execute(select(DNSZone).where(DNSZone.group_id == group_id))
         for zone in db_zones_res.scalars().all():
             bare = zone.name.rstrip(".")
             if bare in server_zone_set:
@@ -1309,9 +1303,11 @@ async def _sync_single_server(
             resource_type="dns_server",
             resource_id=str(server.id),
             resource_display=server.name,
-            result="error"
-            if total_push_errors or zones_push_to_server_errors or any(i.error for i in items)
-            else "success",
+            result=(
+                "error"
+                if total_push_errors or zones_push_to_server_errors or any(i.error for i in items)
+                else "success"
+            ),
             new_value={
                 "zones_attempted": len(zones),
                 "zones_succeeded": zones_succeeded,

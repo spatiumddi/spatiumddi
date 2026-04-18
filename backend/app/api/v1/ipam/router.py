@@ -1515,9 +1515,7 @@ async def delete_block(block_id: uuid.UUID, current_user: CurrentUser, db: DB) -
     ).scalar_one()
     child_block_count = (
         await db.execute(
-            select(func.count())
-            .select_from(IPBlock)
-            .where(IPBlock.parent_block_id == block_id)
+            select(func.count()).select_from(IPBlock).where(IPBlock.parent_block_id == block_id)
         )
     ).scalar_one()
     if subnet_count or child_block_count:

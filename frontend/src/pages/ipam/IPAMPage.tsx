@@ -703,7 +703,11 @@ function DnsSettingsSection({
                   strokeWidth="2.5"
                   viewBox="0 0 24 24"
                 >
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M9 5l7 7-7 7" />
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    d="M9 5l7 7-7 7"
+                  />
                 </svg>
                 <span>Additional Zones</span>
               </span>
@@ -2866,220 +2870,230 @@ function SubnetDetail({
                       return (
                         <ContextMenu key={addr.id}>
                           <ContextMenuTrigger asChild>
-                        <tr
-                          className={cn(
-                            "group/addr border-b last:border-0 hover:bg-muted/20",
-                            (addr.status === "network" ||
-                              addr.status === "broadcast") &&
-                              "opacity-50",
-                            addr.status === "orphan" && "opacity-40",
-                            rowSelected && "bg-primary/5",
-                          )}
-                        >
-                          <td className="w-8 px-2 py-2">
-                            {!systemRow && (
-                              <input
-                                type="checkbox"
-                                checked={rowSelected}
-                                aria-label={`Select ${addr.address}`}
-                                onChange={(e) => {
-                                  setSelectedIpIds((prev) => {
-                                    const next = new Set(prev);
-                                    if (e.target.checked) next.add(addr.id);
-                                    else next.delete(addr.id);
-                                    return next;
-                                  });
-                                }}
-                              />
-                            )}
-                          </td>
-                          <td className="px-4 py-2 font-mono font-medium">
-                            <span className="inline-flex items-center gap-0.5">
-                              {addr.address}
-                              <CopyButton text={addr.address} />
-                            </span>
-                          </td>
-                          <td className="px-4 py-2">
-                            <span className="inline-flex items-center gap-1.5">
-                              {addr.fqdn ? (
-                                <span className="font-mono text-xs">
-                                  {addr.fqdn}
-                                </span>
-                              ) : addr.hostname ? (
-                                <span className="text-muted-foreground">
-                                  {addr.hostname}
-                                </span>
-                              ) : (
-                                <span className="text-muted-foreground/40">
-                                  —
-                                </span>
+                            <tr
+                              className={cn(
+                                "group/addr border-b last:border-0 hover:bg-muted/20",
+                                (addr.status === "network" ||
+                                  addr.status === "broadcast") &&
+                                  "opacity-50",
+                                addr.status === "orphan" && "opacity-40",
+                                rowSelected && "bg-primary/5",
                               )}
-                              {(addr.alias_count ?? 0) > 0 && (
-                                <span
-                                  className="inline-flex items-center rounded bg-indigo-100 px-1.5 py-0.5 text-[10px] font-medium text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-400"
-                                  title={`${addr.alias_count} alias${(addr.alias_count ?? 0) === 1 ? "" : "es"} — edit IP to view`}
-                                >
-                                  +{addr.alias_count}{" "}
-                                  {addr.alias_count === 1 ? "alias" : "aliases"}
+                            >
+                              <td className="w-8 px-2 py-2">
+                                {!systemRow && (
+                                  <input
+                                    type="checkbox"
+                                    checked={rowSelected}
+                                    aria-label={`Select ${addr.address}`}
+                                    onChange={(e) => {
+                                      setSelectedIpIds((prev) => {
+                                        const next = new Set(prev);
+                                        if (e.target.checked) next.add(addr.id);
+                                        else next.delete(addr.id);
+                                        return next;
+                                      });
+                                    }}
+                                  />
+                                )}
+                              </td>
+                              <td className="px-4 py-2 font-mono font-medium">
+                                <span className="inline-flex items-center gap-0.5">
+                                  {addr.address}
+                                  <CopyButton text={addr.address} />
                                 </span>
-                              )}
-                            </span>
-                          </td>
-                          <td className="px-4 py-2 font-mono text-xs">
-                            {addr.mac_address ?? (
-                              <span className="text-muted-foreground/40">
-                                —
-                              </span>
-                            )}
-                          </td>
-                          <td className="px-4 py-2 text-muted-foreground">
-                            {addr.description ?? (
-                              <span className="text-muted-foreground/40">
-                                —
-                              </span>
-                            )}
-                          </td>
-                          <td className="px-4 py-2">
-                            {(() => {
-                              const t =
-                                (addr.tags as Record<string, unknown> | null) ??
-                                {};
-                              const entries = Object.entries(t);
-                              if (entries.length === 0)
-                                return (
+                              </td>
+                              <td className="px-4 py-2">
+                                <span className="inline-flex items-center gap-1.5">
+                                  {addr.fqdn ? (
+                                    <span className="font-mono text-xs">
+                                      {addr.fqdn}
+                                    </span>
+                                  ) : addr.hostname ? (
+                                    <span className="text-muted-foreground">
+                                      {addr.hostname}
+                                    </span>
+                                  ) : (
+                                    <span className="text-muted-foreground/40">
+                                      —
+                                    </span>
+                                  )}
+                                  {(addr.alias_count ?? 0) > 0 && (
+                                    <span
+                                      className="inline-flex items-center rounded bg-indigo-100 px-1.5 py-0.5 text-[10px] font-medium text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-400"
+                                      title={`${addr.alias_count} alias${(addr.alias_count ?? 0) === 1 ? "" : "es"} — edit IP to view`}
+                                    >
+                                      +{addr.alias_count}{" "}
+                                      {addr.alias_count === 1
+                                        ? "alias"
+                                        : "aliases"}
+                                    </span>
+                                  )}
+                                </span>
+                              </td>
+                              <td className="px-4 py-2 font-mono text-xs">
+                                {addr.mac_address ?? (
                                   <span className="text-muted-foreground/40">
                                     —
                                   </span>
-                                );
-                              return (
-                                <div className="flex flex-wrap gap-1">
-                                  {entries.map(([k, v]) => {
-                                    const vStr = v == null ? "" : String(v);
-                                    const label = vStr ? `${k}=${vStr}` : k;
+                                )}
+                              </td>
+                              <td className="px-4 py-2 text-muted-foreground">
+                                {addr.description ?? (
+                                  <span className="text-muted-foreground/40">
+                                    —
+                                  </span>
+                                )}
+                              </td>
+                              <td className="px-4 py-2">
+                                {(() => {
+                                  const t =
+                                    (addr.tags as Record<
+                                      string,
+                                      unknown
+                                    > | null) ?? {};
+                                  const entries = Object.entries(t);
+                                  if (entries.length === 0)
                                     return (
-                                      <button
-                                        key={k}
-                                        type="button"
-                                        onClick={() => {
-                                          setColFilters((p) => ({
-                                            ...p,
-                                            tags: label,
-                                          }));
-                                          setShowFilters(true);
-                                        }}
-                                        title={`Filter by ${label}`}
-                                        className="inline-flex max-w-[14rem] items-center truncate rounded border border-sky-200 bg-sky-50 px-1.5 py-0.5 text-[10px] font-medium text-sky-700 hover:border-sky-300 hover:bg-sky-100 dark:border-sky-900/60 dark:bg-sky-900/30 dark:text-sky-300 dark:hover:bg-sky-900/50"
-                                      >
-                                        {label}
-                                      </button>
+                                      <span className="text-muted-foreground/40">
+                                        —
+                                      </span>
                                     );
-                                  })}
-                                </div>
-                              );
-                            })()}
-                          </td>
-                          <td className="px-4 py-2">
-                            <StatusBadge status={addr.status} />
-                          </td>
-                          <td className="px-4 py-2">
-                            {(() => {
-                              const pi = ipPoolInfo(addr);
-                              if (!pi)
-                                return (
+                                  return (
+                                    <div className="flex flex-wrap gap-1">
+                                      {entries.map(([k, v]) => {
+                                        const vStr = v == null ? "" : String(v);
+                                        const label = vStr ? `${k}=${vStr}` : k;
+                                        return (
+                                          <button
+                                            key={k}
+                                            type="button"
+                                            onClick={() => {
+                                              setColFilters((p) => ({
+                                                ...p,
+                                                tags: label,
+                                              }));
+                                              setShowFilters(true);
+                                            }}
+                                            title={`Filter by ${label}`}
+                                            className="inline-flex max-w-[14rem] items-center truncate rounded border border-sky-200 bg-sky-50 px-1.5 py-0.5 text-[10px] font-medium text-sky-700 hover:border-sky-300 hover:bg-sky-100 dark:border-sky-900/60 dark:bg-sky-900/30 dark:text-sky-300 dark:hover:bg-sky-900/50"
+                                          >
+                                            {label}
+                                          </button>
+                                        );
+                                      })}
+                                    </div>
+                                  );
+                                })()}
+                              </td>
+                              <td className="px-4 py-2">
+                                <StatusBadge status={addr.status} />
+                              </td>
+                              <td className="px-4 py-2">
+                                {(() => {
+                                  const pi = ipPoolInfo(addr);
+                                  if (!pi)
+                                    return (
+                                      <span className="text-muted-foreground/40">
+                                        —
+                                      </span>
+                                    );
+                                  const cls =
+                                    pi.type === "dynamic"
+                                      ? "bg-cyan-100 text-cyan-800 dark:bg-cyan-900/30 dark:text-cyan-400"
+                                      : pi.type === "reserved"
+                                        ? "bg-violet-100 text-violet-800 dark:bg-violet-900/30 dark:text-violet-400"
+                                        : "bg-zinc-100 text-zinc-600 dark:bg-zinc-800/30 dark:text-zinc-400";
+                                  return (
+                                    <span
+                                      className={`inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium ${cls}`}
+                                    >
+                                      {pi.name}
+                                    </span>
+                                  );
+                                })()}
+                              </td>
+                              <td className="px-4 py-2">
+                                {dnsState === "in-sync" ? (
+                                  <span
+                                    className="inline-flex items-center gap-1 text-xs text-emerald-600"
+                                    title="DNS records match IPAM"
+                                  >
+                                    <span className="inline-block h-1.5 w-1.5 rounded-full bg-emerald-500" />
+                                    in sync
+                                  </span>
+                                ) : dnsState === "out-of-sync" ? (
+                                  <span
+                                    className="inline-flex items-center gap-1 text-xs text-amber-600"
+                                    title="DNS records are missing or differ — open Check DNS Sync to reconcile"
+                                  >
+                                    <span className="inline-block h-1.5 w-1.5 rounded-full bg-amber-500" />
+                                    out of sync
+                                  </span>
+                                ) : (
                                   <span className="text-muted-foreground/40">
                                     —
                                   </span>
-                                );
-                              const cls =
-                                pi.type === "dynamic"
-                                  ? "bg-cyan-100 text-cyan-800 dark:bg-cyan-900/30 dark:text-cyan-400"
-                                  : pi.type === "reserved"
-                                    ? "bg-violet-100 text-violet-800 dark:bg-violet-900/30 dark:text-violet-400"
-                                    : "bg-zinc-100 text-zinc-600 dark:bg-zinc-800/30 dark:text-zinc-400";
-                              return (
-                                <span
-                                  className={`inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium ${cls}`}
-                                >
-                                  {pi.name}
-                                </span>
-                              );
-                            })()}
-                          </td>
-                          <td className="px-4 py-2">
-                            {dnsState === "in-sync" ? (
-                              <span
-                                className="inline-flex items-center gap-1 text-xs text-emerald-600"
-                                title="DNS records match IPAM"
-                              >
-                                <span className="inline-block h-1.5 w-1.5 rounded-full bg-emerald-500" />
-                                in sync
-                              </span>
-                            ) : dnsState === "out-of-sync" ? (
-                              <span
-                                className="inline-flex items-center gap-1 text-xs text-amber-600"
-                                title="DNS records are missing or differ — open Check DNS Sync to reconcile"
-                              >
-                                <span className="inline-block h-1.5 w-1.5 rounded-full bg-amber-500" />
-                                out of sync
-                              </span>
-                            ) : (
-                              <span className="text-muted-foreground/40">
-                                —
-                              </span>
-                            )}
-                          </td>
-                          <td className="px-4 py-2 text-right">
-                            <div className="flex items-center justify-end gap-1">
-                              {addr.status === "orphan" ? (
-                                <>
-                                  <button
-                                    onClick={() => restoreAddr.mutate(addr.id)}
-                                    disabled={restoreAddr.isPending}
-                                    className="rounded p-1 text-xs text-muted-foreground hover:text-green-600"
-                                    title="Restore (mark as allocated)"
-                                  >
-                                    <RefreshCw className="h-3.5 w-3.5" />
-                                  </button>
-                                  <button
-                                    onClick={() => setConfirmPurgeAddr(addr)}
-                                    className="rounded p-1 text-muted-foreground hover:text-destructive"
-                                    title="Permanently delete"
-                                  >
-                                    <Trash2 className="h-3.5 w-3.5" />
-                                  </button>
-                                </>
-                              ) : addr.auto_from_lease ? (
-                                // Mirror of a dynamic DHCP lease — the DHCP
-                                // server owns the state; editing or deleting
-                                // from IPAM would just get overwritten on
-                                // the next pull. Show a lock hint instead.
-                                <span
-                                  className="inline-flex items-center rounded p-1 text-muted-foreground/60"
-                                  title="Managed by DHCP server — edit the lease or reservation at the source. This row is refreshed by the lease-pull task."
-                                >
-                                  <Lock className="h-3.5 w-3.5" />
-                                </span>
-                              ) : !isReadOnly(addr.status) ? (
-                                <>
-                                  <button
-                                    onClick={() => setEditingAddress(addr)}
-                                    className="rounded p-1 text-muted-foreground hover:text-foreground"
-                                    title="Edit"
-                                  >
-                                    <Pencil className="h-3.5 w-3.5" />
-                                  </button>
-                                  <button
-                                    onClick={() => setConfirmDeleteAddr(addr)}
-                                    className="rounded p-1 text-muted-foreground hover:text-destructive"
-                                    title="Delete"
-                                  >
-                                    <Trash2 className="h-3.5 w-3.5" />
-                                  </button>
-                                </>
-                              ) : null}
-                            </div>
-                          </td>
-                        </tr>
+                                )}
+                              </td>
+                              <td className="px-4 py-2 text-right">
+                                <div className="flex items-center justify-end gap-1">
+                                  {addr.status === "orphan" ? (
+                                    <>
+                                      <button
+                                        onClick={() =>
+                                          restoreAddr.mutate(addr.id)
+                                        }
+                                        disabled={restoreAddr.isPending}
+                                        className="rounded p-1 text-xs text-muted-foreground hover:text-green-600"
+                                        title="Restore (mark as allocated)"
+                                      >
+                                        <RefreshCw className="h-3.5 w-3.5" />
+                                      </button>
+                                      <button
+                                        onClick={() =>
+                                          setConfirmPurgeAddr(addr)
+                                        }
+                                        className="rounded p-1 text-muted-foreground hover:text-destructive"
+                                        title="Permanently delete"
+                                      >
+                                        <Trash2 className="h-3.5 w-3.5" />
+                                      </button>
+                                    </>
+                                  ) : addr.auto_from_lease ? (
+                                    // Mirror of a dynamic DHCP lease — the DHCP
+                                    // server owns the state; editing or deleting
+                                    // from IPAM would just get overwritten on
+                                    // the next pull. Show a lock hint instead.
+                                    <span
+                                      className="inline-flex items-center rounded p-1 text-muted-foreground/60"
+                                      title="Managed by DHCP server — edit the lease or reservation at the source. This row is refreshed by the lease-pull task."
+                                    >
+                                      <Lock className="h-3.5 w-3.5" />
+                                    </span>
+                                  ) : !isReadOnly(addr.status) ? (
+                                    <>
+                                      <button
+                                        onClick={() => setEditingAddress(addr)}
+                                        className="rounded p-1 text-muted-foreground hover:text-foreground"
+                                        title="Edit"
+                                      >
+                                        <Pencil className="h-3.5 w-3.5" />
+                                      </button>
+                                      <button
+                                        onClick={() =>
+                                          setConfirmDeleteAddr(addr)
+                                        }
+                                        className="rounded p-1 text-muted-foreground hover:text-destructive"
+                                        title="Delete"
+                                      >
+                                        <Trash2 className="h-3.5 w-3.5" />
+                                      </button>
+                                    </>
+                                  ) : null}
+                                </div>
+                              </td>
+                            </tr>
                           </ContextMenuTrigger>
                           <ContextMenuContent>
                             <ContextMenuLabel>{addr.address}</ContextMenuLabel>
@@ -5420,9 +5434,9 @@ function DeleteOrOrphanModal({
           </div>
           <p className="mt-1 text-xs text-muted-foreground">
             The row is kept but marked <code>orphan</code>, greyed out in the
-            list, and excluded from next-free allocation. DNS and DHCP
-            cascades still run. You can restore or permanently delete it
-            later from the orphans view.
+            list, and excluded from next-free allocation. DNS and DHCP cascades
+            still run. You can restore or permanently delete it later from the
+            orphans view.
           </p>
         </div>
         <div className="rounded-md border border-destructive/40 bg-destructive/5 p-3">
@@ -5431,8 +5445,8 @@ function DeleteOrOrphanModal({
           </div>
           <p className="mt-1 text-xs text-muted-foreground">
             The IPAM row is removed immediately. DNS records and DHCP static
-            assignments tied to this IP are also cascaded. There's no undo
-            — skip the orphan state entirely.
+            assignments tied to this IP are also cascaded. There's no undo —
+            skip the orphan state entirely.
           </p>
         </div>
         <div className="flex flex-wrap justify-end gap-2">
@@ -8234,9 +8248,7 @@ function SpaceSection({
             New Subnet…
           </ContextMenuItem>
           <ContextMenuSeparator />
-          <ContextMenuItem
-            onSelect={() => setExpanded((v) => !v)}
-          >
+          <ContextMenuItem onSelect={() => setExpanded((v) => !v)}>
             {expanded ? "Collapse" : "Expand"}
           </ContextMenuItem>
           <ContextMenuItem onSelect={() => setShowEditSpace(true)}>

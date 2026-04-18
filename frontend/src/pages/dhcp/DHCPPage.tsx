@@ -560,9 +560,7 @@ function ServerScopesTab({ server }: { server: DHCPServer }) {
                       </ContextMenuItem>
                       <ContextMenuSeparator />
                       <ContextMenuItem
-                        onSelect={() =>
-                          navigator.clipboard.writeText(sc.name)
-                        }
+                        onSelect={() => navigator.clipboard.writeText(sc.name)}
                       >
                         Copy Scope Name
                       </ContextMenuItem>
@@ -1090,9 +1088,7 @@ function LeasesTab({ server }: { server: DHCPServer }) {
                   <ContextMenuLabel>{l.ip_address}</ContextMenuLabel>
                   <ContextMenuSeparator />
                   <ContextMenuItem
-                    onSelect={() =>
-                      navigator.clipboard.writeText(l.ip_address)
-                    }
+                    onSelect={() => navigator.clipboard.writeText(l.ip_address)}
                   >
                     Copy IP
                   </ContextMenuItem>

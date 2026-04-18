@@ -1470,17 +1470,17 @@ export const dnsApi = {
     server_id?: string;
   }) =>
     api
-      .post<{ ok: boolean; message: string }>(
-        "/dns/test-windows-credentials",
-        body,
-      )
+      .post<{
+        ok: boolean;
+        message: string;
+      }>("/dns/test-windows-credentials", body)
       .then((r) => r.data),
 
   pullZonesFromServer: (groupId: string, serverId: string) =>
     api
-      .post<{ zones: Array<Record<string, unknown>> }>(
-        `/dns/groups/${groupId}/servers/${serverId}/pull-zones-from-server`,
-      )
+      .post<{
+        zones: Array<Record<string, unknown>>;
+      }>(`/dns/groups/${groupId}/servers/${serverId}/pull-zones-from-server`)
       .then((r) => r.data),
 
   syncFromServer: (groupId: string, serverId: string) =>

@@ -811,13 +811,13 @@ function ServerModal({
         {driver === "windows_dns" && (
           <div className="rounded-md border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-800 dark:text-amber-300">
             <strong>Windows DNS:</strong>{" "}
-            <span className="font-medium">Path A</span> (always on): record
-            CRUD via RFC 2136 — zones must exist in Windows DNS Manager with
+            <span className="font-medium">Path A</span> (always on): record CRUD
+            via RFC 2136 — zones must exist in Windows DNS Manager with
             <em> Nonsecure and secure</em> dynamic updates enabled.{" "}
             <span className="font-medium">Path B</span> (optional, configure
-            credentials below): adds WinRM-backed zone topology reads so you
-            can import existing zones into SpatiumDDI. No agent container
-            required either way.
+            credentials below): adds WinRM-backed zone topology reads so you can
+            import existing zones into SpatiumDDI. No agent container required
+            either way.
           </div>
         )}
         <div className="grid grid-cols-2 gap-3">
@@ -1787,91 +1787,89 @@ function ZoneDetailView({
                 {filtered.map((r) => (
                   <ContextMenu key={r.id}>
                     <ContextMenuTrigger asChild>
-                  <tr
-                    className="border-b last:border-0 hover:bg-muted/40 group"
-                  >
-                    <td className="w-8 py-1.5 pl-3">
-                      {!r.auto_generated && (
-                        <input
-                          type="checkbox"
-                          checked={selectedRecords.has(r.id)}
-                          onChange={() =>
-                            setSelectedRecords((prev) => {
-                              const next = new Set(prev);
-                              if (next.has(r.id)) next.delete(r.id);
-                              else next.add(r.id);
-                              return next;
-                            })
-                          }
-                        />
-                      )}
-                    </td>
-                    <td className="py-1.5 pl-5 font-mono text-xs font-medium">
-                      {r.auto_generated ? (
-                        r.name
-                      ) : (
-                        <button
-                          onClick={() => setEditRecord(r)}
-                          className="hover:text-primary hover:underline"
-                          title="Edit record"
-                        >
-                          {r.name}
-                        </button>
-                      )}
-                    </td>
-                    <td className="py-1.5">
-                      <span
-                        className={`inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium ${typeBadge[r.record_type] ?? "bg-muted text-muted-foreground"}`}
-                      >
-                        {r.record_type}
-                      </span>
-                    </td>
-                    <td className="py-1.5 font-mono text-xs text-muted-foreground max-w-xs truncate">
-                      {r.value}
-                    </td>
-                    <td className="py-1.5 text-xs text-muted-foreground">
-                      {r.ttl ?? "—"}
-                    </td>
-                    <td className="py-1.5 text-xs text-muted-foreground">
-                      {r.priority ?? "—"}
-                    </td>
-                    <td className="py-1.5 pr-3">
-                      {r.auto_generated ? (
-                        <div className="flex items-center justify-end gap-1">
+                      <tr className="border-b last:border-0 hover:bg-muted/40 group">
+                        <td className="w-8 py-1.5 pl-3">
+                          {!r.auto_generated && (
+                            <input
+                              type="checkbox"
+                              checked={selectedRecords.has(r.id)}
+                              onChange={() =>
+                                setSelectedRecords((prev) => {
+                                  const next = new Set(prev);
+                                  if (next.has(r.id)) next.delete(r.id);
+                                  else next.add(r.id);
+                                  return next;
+                                })
+                              }
+                            />
+                          )}
+                        </td>
+                        <td className="py-1.5 pl-5 font-mono text-xs font-medium">
+                          {r.auto_generated ? (
+                            r.name
+                          ) : (
+                            <button
+                              onClick={() => setEditRecord(r)}
+                              className="hover:text-primary hover:underline"
+                              title="Edit record"
+                            >
+                              {r.name}
+                            </button>
+                          )}
+                        </td>
+                        <td className="py-1.5">
                           <span
-                            title="This record was created automatically by IPAM. Edit the IP address in IPAM to change it."
-                            className="flex items-center gap-1 rounded border border-amber-300/60 bg-amber-50 px-1.5 py-0.5 text-xs text-amber-700 dark:border-amber-700/40 dark:bg-amber-900/20 dark:text-amber-400"
+                            className={`inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium ${typeBadge[r.record_type] ?? "bg-muted text-muted-foreground"}`}
                           >
-                            <Lock className="h-2.5 w-2.5" />
-                            IPAM
+                            {r.record_type}
                           </span>
-                          <span
-                            title="Managed by IPAM — changes made here will be overwritten. To edit, update the IP address record in IPAM."
-                            className="flex h-5 w-5 cursor-help items-center justify-center rounded text-muted-foreground/60 hover:text-muted-foreground"
-                          >
-                            <Info className="h-3 w-3" />
-                          </span>
-                        </div>
-                      ) : (
-                        <div className="flex items-center justify-end gap-1">
-                          <button
-                            className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-foreground"
-                            onClick={() => setEditRecord(r)}
-                            title="Edit record"
-                          >
-                            <Pencil className="h-3 w-3" />
-                          </button>
-                          <button
-                            className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-destructive"
-                            onClick={() => setConfirmDeleteRecord(r)}
-                            title="Delete record"
-                          >
-                            <Trash2 className="h-3 w-3" />
-                          </button>
-                        </div>
-                      )}
-                    </td>
-                  </tr>
+                        </td>
+                        <td className="py-1.5 font-mono text-xs text-muted-foreground max-w-xs truncate">
+                          {r.value}
+                        </td>
+                        <td className="py-1.5 text-xs text-muted-foreground">
+                          {r.ttl ?? "—"}
+                        </td>
+                        <td className="py-1.5 text-xs text-muted-foreground">
+                          {r.priority ?? "—"}
+                        </td>
+                        <td className="py-1.5 pr-3">
+                          {r.auto_generated ? (
+                            <div className="flex items-center justify-end gap-1">
+                              <span
+                                title="This record was created automatically by IPAM. Edit the IP address in IPAM to change it."
+                                className="flex items-center gap-1 rounded border border-amber-300/60 bg-amber-50 px-1.5 py-0.5 text-xs text-amber-700 dark:border-amber-700/40 dark:bg-amber-900/20 dark:text-amber-400"
+                              >
+                                <Lock className="h-2.5 w-2.5" />
+                                IPAM
+                              </span>
+                              <span
+                                title="Managed by IPAM — changes made here will be overwritten. To edit, update the IP address record in IPAM."
+                                className="flex h-5 w-5 cursor-help items-center justify-center rounded text-muted-foreground/60 hover:text-muted-foreground"
+                              >
+                                <Info className="h-3 w-3" />
+                              </span>
+                            </div>
+                          ) : (
+                            <div className="flex items-center justify-end gap-1">
+                              <button
+                                className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-foreground"
+                                onClick={() => setEditRecord(r)}
+                                title="Edit record"
+                              >
+                                <Pencil className="h-3 w-3" />
+                              </button>
+                              <button
+                                className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-destructive"
+                                onClick={() => setConfirmDeleteRecord(r)}
+                                title="Delete record"
+                              >
+                                <Trash2 className="h-3 w-3" />
+                              </button>
+                            </div>
+                          )}
+                        </td>
+                      </tr>
                     </ContextMenuTrigger>
                     <ContextMenuContent>
                       <ContextMenuLabel>
@@ -1879,16 +1877,12 @@ function ZoneDetailView({
                       </ContextMenuLabel>
                       <ContextMenuSeparator />
                       <ContextMenuItem
-                        onSelect={() =>
-                          navigator.clipboard.writeText(r.name)
-                        }
+                        onSelect={() => navigator.clipboard.writeText(r.name)}
                       >
                         Copy Name
                       </ContextMenuItem>
                       <ContextMenuItem
-                        onSelect={() =>
-                          navigator.clipboard.writeText(r.value)
-                        }
+                        onSelect={() => navigator.clipboard.writeText(r.value)}
                       >
                         Copy Value
                       </ContextMenuItem>
@@ -1902,9 +1896,7 @@ function ZoneDetailView({
                       ) : (
                         <>
                           <ContextMenuSeparator />
-                          <ContextMenuItem
-                            onSelect={() => setEditRecord(r)}
-                          >
+                          <ContextMenuItem onSelect={() => setEditRecord(r)}>
                             Edit…
                           </ContextMenuItem>
                           <ContextMenuItem
@@ -3656,10 +3648,7 @@ function ZonesTab({
     },
   });
 
-  function renderZoneRows(
-    node: DnsTreeNode,
-    depth: number,
-  ): React.ReactNode[] {
+  function renderZoneRows(node: DnsTreeNode, depth: number): React.ReactNode[] {
     const rows: React.ReactNode[] = [];
     const indent = depth * 14;
     if (node.zone) {
@@ -3944,8 +3933,8 @@ function ZonesTab({
           description={
             <>
               Permanently delete the{" "}
-              <span className="font-medium">{selected.size}</span> selected
-              zone{selected.size === 1 ? "" : "s"} and all their records from
+              <span className="font-medium">{selected.size}</span> selected zone
+              {selected.size === 1 ? "" : "s"} and all their records from
               SpatiumDDI? This cannot be undone.
             </>
           }
@@ -4952,9 +4941,7 @@ function GroupDetailView({
               disabled={syncing}
               title="Bi-directional additive sync against every enabled server in this group. Pulls missing zones and records from the servers (imports into SpatiumDDI), and pushes any SpatiumDDI zones / records not yet on the servers."
             >
-              <RefreshCw
-                className={cn("h-3 w-3", syncing && "animate-spin")}
-              />
+              <RefreshCw className={cn("h-3 w-3", syncing && "animate-spin")} />
               {syncing ? "Syncing…" : "Sync with Servers"}
             </button>
             <button
@@ -5051,7 +5038,9 @@ function SyncWithServersResultModal({
               <SyncStat
                 label="Zones pushed"
                 value={result.total_zones_pushed_to_server}
-                accent={result.total_zones_pushed_to_server ? "good" : undefined}
+                accent={
+                  result.total_zones_pushed_to_server ? "good" : undefined
+                }
               />
               <SyncStat
                 label="Records imported"
@@ -5099,9 +5088,7 @@ function SyncWithServersResultModal({
                   </span>
                   <span
                     className={
-                      srv.error
-                        ? "text-destructive"
-                        : "text-muted-foreground"
+                      srv.error ? "text-destructive" : "text-muted-foreground"
                     }
                   >
                     {srv.error
@@ -5141,8 +5128,7 @@ function SyncWithServersResultModal({
                       {srv.result.zones_imported.length > 0 && (
                         <div className="rounded-md border border-emerald-500/40 bg-emerald-500/5 px-3 py-2 text-xs">
                           <div className="font-medium text-emerald-700 dark:text-emerald-400">
-                            Imported {srv.result.zones_imported.length} new
-                            zone
+                            Imported {srv.result.zones_imported.length} new zone
                             {srv.result.zones_imported.length === 1 ? "" : "s"}
                           </div>
                           <ul className="mt-1 ml-4 list-disc text-muted-foreground">

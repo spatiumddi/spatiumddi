@@ -1,7 +1,13 @@
 import { useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { settingsApi, authApi, type PlatformSettings } from "@/lib/api";
-import { ArrowRight, ArrowLeftRight, RotateCcw, Save, Search } from "lucide-react";
+import {
+  ArrowRight,
+  ArrowLeftRight,
+  RotateCcw,
+  Save,
+  Search,
+} from "lucide-react";
 import { cn } from "@/lib/utils";
 
 function Field({
@@ -113,10 +119,7 @@ const SECTION_FIELDS: Record<SectionId, (keyof PlatformSettings)[]> = {
   session: ["session_timeout_minutes", "auto_logout_minutes"],
   "subnet-tree": ["subnet_tree_default_expanded_depth"],
   updates: ["github_release_check_enabled"],
-  utilization: [
-    "utilization_warn_threshold",
-    "utilization_critical_threshold",
-  ],
+  utilization: ["utilization_warn_threshold", "utilization_critical_threshold"],
 };
 
 /** Three-tier horizontal flow with one arrow highlighted to indicate which
