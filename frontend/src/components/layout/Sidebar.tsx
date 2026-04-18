@@ -16,6 +16,7 @@ import {
   Settings,
   Tags,
   ShieldCheck,
+  ScrollText,
   X,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -27,6 +28,7 @@ const mainNav = [
   { label: "DHCP", icon: Server, to: "/dhcp" },
   { label: "DNS", icon: Globe, to: "/dns" },
   { label: "VLANs", icon: RouterIcon, to: "/vlans" },
+  { label: "Logs", icon: ScrollText, to: "/logs" },
 ];
 
 const adminNav = [

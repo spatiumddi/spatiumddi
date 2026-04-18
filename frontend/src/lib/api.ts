@@ -2188,3 +2188,52 @@ export const authApi = {
       }>("/auth/me")
       .then((r) => r.data),
 };
+
+// ── Logs ──────────────────────────────────────────────────────────────────
+
+export interface LogNameOption {
+  name: string; // e.g. "Microsoft-Windows-Dhcp-Server/Operational"
+  display: string; // what the UI shows in the picker
+}
+
+export interface LogSource {
+  server_id: string;
+  server_name: string;
+  server_kind: "dns" | "dhcp";
+  driver: string;
+  host: string;
+  logs: LogNameOption[];
+}
+
+export interface LogEventRow {
+  time: string; // ISO 8601
+  id: number;
+  level: string; // "Error" | "Warning" | "Information" | "Verbose" | "Critical"
+  provider: string;
+  machine: string;
+  message: string;
+}
+
+export interface LogQueryRequest {
+  server_id: string;
+  server_kind: "dns" | "dhcp";
+  log_name: string;
+  max_events?: number; // 1..500, default 100
+  level?: number | null; // 1=Critical, 2=Error, 3=Warning, 4=Info, 5=Verbose
+  since?: string | null; // ISO 8601
+  event_id?: number | null;
+}
+
+export interface LogQueryResponse {
+  server_id: string;
+  server_kind: "dns" | "dhcp";
+  log_name: string;
+  events: LogEventRow[];
+  truncated: boolean;
+}
+
+export const logsApi = {
+  listSources: () => api.get<LogSource[]>("/logs/sources").then((r) => r.data),
+  query: (body: LogQueryRequest) =>
+    api.post<LogQueryResponse>("/logs/query", body).then((r) => r.data),
+};

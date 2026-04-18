@@ -414,6 +414,57 @@ Remove-DhcpServerv4ExclusionRange -ScopeId {_ps_literal(scope_id)} `
         except Exception as exc:  # noqa: BLE001 — surface any WinRM error
             return False, f"windows_dhcp health-check failed: {exc}"
 
+    # ── Logs — Windows Event Log reads ────────────────────────────────
+
+    def available_log_names(self) -> list[tuple[str, str]]:
+        """Surface the event logs this driver knows about.
+
+        Returns ``[(log_name, display)]``. The ``log_name`` is what
+        ``Get-WinEvent -LogName`` takes; ``display`` is what the UI
+        shows in the source picker. Operational + AdminEvents are
+        the two any stock Windows DHCP role has enabled by default;
+        FilterNotifications is optional (firewall / MAC filter
+        plumbing) and empty on most DCs, but cheap to expose.
+        """
+        return [
+            ("Microsoft-Windows-Dhcp-Server/Operational", "DHCP Server — Operational"),
+            ("Microsoft-Windows-Dhcp-Server/AdminEvents", "DHCP Server — Admin Events"),
+            (
+                "Microsoft-Windows-Dhcp-Server/FilterNotifications",
+                "DHCP Server — Filter Notifications",
+            ),
+        ]
+
+    async def get_events(
+        self,
+        server: Any,
+        *,
+        log_name: str,
+        max_events: int = 100,
+        level: int | None = None,
+        since: Any = None,
+        event_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Query a Windows Event Log over WinRM.
+
+        Thin wrapper around :func:`app.drivers.windows_events.fetch_events`
+        — exists so the Logs API can call the driver abstraction instead
+        of importing the helper directly (CLAUDE.md non-negotiable #10).
+        """
+        from app.drivers.windows_events import fetch_events  # noqa: PLC0415
+
+        creds = _load_credentials(server)
+        return await fetch_events(
+            server,
+            creds,
+            run_ps=_run_ps,
+            log_name=log_name,
+            max_events=max_events,
+            level=level,
+            since=since,
+            event_id=event_id,
+        )
+
     def capabilities(self) -> dict[str, Any]:
         return {
             # No full-bundle config push (render_config / apply_config /

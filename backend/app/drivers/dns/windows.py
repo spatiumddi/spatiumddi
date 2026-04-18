@@ -350,6 +350,49 @@ class WindowsDNSDriver(DNSDriver):
         raw = await asyncio.to_thread(_run_ps, server, creds, _PS_LIST_ZONES)
         return _parse_zones(raw)
 
+    # ── Logs — Windows Event Log reads ────────────────────────────────
+
+    def available_log_names(self) -> list[tuple[str, str]]:
+        """Event logs this driver surfaces in the Logs UI.
+
+        ``DNS Server`` is the classic log — always present on a Windows
+        DNS role and captures zone loads, transfer successes/failures,
+        SOA updates. ``Microsoft-Windows-DNSServer/Audit`` is the
+        modern audit log (config changes like Add-DnsServerZone). The
+        Analytical log is deliberately omitted — it's per-query and
+        noisy, and the operator usually wants Windows DNS Manager for
+        that view rather than a slow WinRM pull.
+        """
+        return [
+            ("DNS Server", "DNS Server — Classic Log"),
+            ("Microsoft-Windows-DNSServer/Audit", "DNS Server — Audit"),
+        ]
+
+    async def get_events(
+        self,
+        server: Any,
+        *,
+        log_name: str,
+        max_events: int = 100,
+        level: int | None = None,
+        since: Any = None,
+        event_id: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Query a Windows Event Log over WinRM. Requires credentials."""
+        from app.drivers.windows_events import fetch_events  # noqa: PLC0415
+
+        creds = _load_credentials(server)
+        return await fetch_events(
+            server,
+            creds,
+            run_ps=_run_ps,
+            log_name=log_name,
+            max_events=max_events,
+            level=level,
+            since=since,
+            event_id=event_id,
+        )
+
 
 # ── WinRM helpers (Path B) ────────────────────────────────────────────
 

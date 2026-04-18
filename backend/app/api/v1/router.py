@@ -10,6 +10,7 @@ from app.api.v1.dns.blocklist_router import router as dns_blocklist_router
 from app.api.v1.dns.router import router as dns_router
 from app.api.v1.groups.router import router as groups_router
 from app.api.v1.ipam.router import router as ipam_router
+from app.api.v1.logs import logs_router
 from app.api.v1.roles.router import router as roles_router
 from app.api.v1.search.router import router as search_router
 from app.api.v1.settings.router import router as settings_router
@@ -35,3 +36,4 @@ api_v1_router.include_router(search_router, prefix="/search", tags=["search"])
 api_v1_router.include_router(settings_router, prefix="/settings", tags=["settings"])
 api_v1_router.include_router(custom_fields_router, prefix="/custom-fields", tags=["custom-fields"])
 api_v1_router.include_router(vlans_router, prefix="/vlans", tags=["vlans"])
+api_v1_router.include_router(logs_router, prefix="/logs", tags=["logs"])
