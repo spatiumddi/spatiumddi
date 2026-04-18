@@ -29,14 +29,15 @@ Always read the relevant spec doc(s) before writing code for a feature area.
 | Document | What It Covers |
 |---|---|
 | `CLAUDE.md` | Index, conventions, non-negotiables |
+| `docs/GETTING_STARTED.md` | Recommended setup order — server groups → zones / scopes → subnets → addresses |
 | `docs/ARCHITECTURE.md` | System topology, component relationships, HA design |
 | `docs/DATA_MODEL.md` | All database models, relationships, field definitions |
 | `docs/API.md` | REST API conventions, pagination, error format, versioning |
 | `docs/DEVELOPMENT.md` | Coding standards, test requirements, CI pipeline |
 | `docs/OBSERVABILITY.md` | Logging (centralized + UI viewer), metrics, health dashboard, alerting |
 | `docs/features/IPAM.md` | IP Space/Block/Subnet/Address management, VLAN/VXLAN, custom fields, import/export, tree UI |
-| `docs/features/DHCP.md` | DHCP servers, scopes, pools, static assignments, DDNS, caching |
-| `docs/features/DNS.md` | DNS servers, zones, records, views, server groups, blocking lists, DDNS, zone tree |
+| `docs/features/DHCP.md` | DHCP servers, scopes, pools, static assignments, DDNS, caching, Windows DHCP (Path A) |
+| `docs/features/DNS.md` | DNS servers, zones, records, views, server groups, blocking lists, DDNS, zone tree, Windows DNS (Path A + B), sync-with-servers reconciliation |
 | `docs/features/AUTH.md` | Authentication, LDAP/OIDC/SAML, roles, group-scoped permissions, API tokens |
 | `docs/PERMISSIONS.md` | RBAC permission grammar (`{action, resource_type, resource_id?}`), builtin roles, wildcards |
 | `docs/features/SYSTEM_ADMIN.md` | System config, health dashboard, notifications, backup/restore, service control |
@@ -45,11 +46,12 @@ Always read the relevant spec doc(s) before writing code for a feature area.
 | `docs/deployment/DOCKER.md` | Docker Compose setup, ports, first-time setup, TLS, HA, password reset |
 | `docs/deployment/KUBERNETES.md` | Helm chart, operators, HPA, Ingress |
 | `docs/deployment/BAREMETAL.md` | Ansible playbooks, systemd services, Patroni |
+| `docs/deployment/WINDOWS.md` | Windows Server prerequisites — WinRM, service accounts (DnsAdmins / DHCP Users), firewall, zone dynamic-updates; shared by Windows DNS + Windows DHCP |
 | `k8s/README.md` | Kubernetes manifest usage, HA PostgreSQL (CloudNativePG), Redis Sentinel |
 | `k8s/base/` | Core K8s manifests (namespace, API, worker, frontend, migrate job) |
 | `k8s/ha/` | HA add-ons: CloudNativePG cluster, Redis Sentinel, Patroni Compose |
-| `docs/drivers/DHCP_DRIVERS.md` | Kea, ISC DHCP driver implementation specs |
-| `docs/drivers/DNS_DRIVERS.md` | BIND9 driver spec, incremental update strategy |
+| `docs/drivers/DHCP_DRIVERS.md` | Kea + Windows DHCP driver internals; ISC DHCP planned |
+| `docs/drivers/DNS_DRIVERS.md` | BIND9 + Windows DNS (Path A + B) driver internals, incremental update strategy |
 
 ---
 

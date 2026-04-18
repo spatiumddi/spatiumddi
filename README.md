@@ -33,6 +33,7 @@ It is designed as a modern alternative to commercial DDI platforms like Efficien
 - 🗂 **Hierarchical IP management** — spaces, blocks, subnets, addresses in a visual tree (IPv4 + partial IPv6)
 - 🌐 **Built-in DNS server** — BIND9 container that auto-registers and syncs via RFC 2136
 - 🔄 **DHCP server management** — Kea container + agent with lease tracking (DHCPv4 shipping; Dhcp6 + ISC DHCP in progress)
+- 🪟 **Windows Server DNS + DHCP** — agentless management of existing Windows DCs (RFC 2136 + WinRM for DNS; WinRM lease-mirroring for DHCP). No software installed on the Windows side.
 - 🔒 **Group-based RBAC + external identity** — LDAP, OIDC, SAML, RADIUS, TACACS+ with backup-server failover; delegate IP ranges and zones by role
 - 📋 **Full audit trail** — every mutation logged, append-only, viewable in the UI with per-column filters
 - 🚀 **Flexible deployment** — Docker Compose, Kubernetes (Helm), bare metal, or OS appliance
@@ -63,22 +64,23 @@ _Click any image to open the full-size version._
 
 **Control plane** — FastAPI + PostgreSQL + Redis + Celery. Single source of truth for everything (IPAM tree, DNS records, auth, audit log). Exposes a REST API; the web UI and any Terraform / Ansible / CLI integration all speak the same API.
 
-**Data plane** — one container per DNS server (Phase 2 adds DHCP). Each container bakes in a sidecar `spatium-dns-agent` that:
+**Data plane — two shapes:**
 
-1. **Bootstraps** on first start using a shared `DNS_AGENT_KEY` (PSK) → gets a per-server rotating JWT.
-2. **Long-polls** `/api/v1/dns/agents/config` with ETag. Server holds the connection until config changes or the timer expires.
-3. **Caches** the last-known-good config bundle on disk. If the control plane is unreachable, named keeps serving.
-4. **Drains record ops** over loopback via `nsupdate` + TSIG (RFC 2136). Structural changes reload named; record changes do not.
+- **Agented** (BIND9, Kea) — one container per service. Each bakes in a sidecar agent (`spatium-dns-agent` / `spatium-dhcp-agent`) that (1) bootstraps with a PSK → rotating JWT, (2) long-polls `/config` with an ETag, (3) caches the last-known-good bundle on disk so the service keeps serving if the control plane is unreachable, (4) drains record / config ops over loopback (nsupdate + TSIG for BIND9; Kea Control Agent API for Kea). Structural changes reload named / kea-dhcp4; record changes do not.
 
-The control-plane driver abstraction emits a backend-neutral config bundle. BIND9 is the only supported backend in v1.
+- **Agentless** (Windows DNS, Windows DHCP) — no software on the Windows side. The control plane speaks directly: RFC 2136 over UDP/TCP 53 (DNS record writes + AXFR), WinRM + PowerShell over 5985/5986 (DNS zone CRUD, DHCP lease / scope reads). Credentials are Fernet-encrypted on the server row.
 
-**Tech stack**: Python 3.12 · FastAPI · SQLAlchemy 2.x (async) · PostgreSQL 16 · Redis 7 · Celery · React 18 · TypeScript · Tailwind · shadcn/ui · Docker · Kubernetes + Helm
+The driver abstraction is backend-neutral — services speak to `DNSDriver` / `DHCPDriver`, never to BIND9 / Kea / PowerShell specifics.
+
+**Tech stack**: Python 3.12 · FastAPI · SQLAlchemy 2.x (async) · PostgreSQL 16 · Redis 7 · Celery · React 18 · TypeScript · Tailwind · shadcn/ui · pywinrm · dnspython · Docker · Kubernetes + Helm
 
 ---
 
 ## Getting Started
 
 > ⚠️ SpatiumDDI is **alpha** (first release: `2026.04.16-1`). Commands and APIs may still shift between releases.
+
+> 📘 For the full setup order (servers → zones/scopes → subnets → addresses) see **[docs/GETTING_STARTED.md](docs/GETTING_STARTED.md)**. For Windows DC integration see **[docs/deployment/WINDOWS.md](docs/deployment/WINDOWS.md)**.
 
 ### Quick start with Docker Compose
 
@@ -178,14 +180,17 @@ Full docs at **[spatiumddi.github.io](https://spatiumddi.github.io)** (coming so
 
 | Document | Description |
 |---|---|
+| [Getting Started](docs/GETTING_STARTED.md) | Recommended setup order — from server groups down to allocating an IP |
 | [IPAM Features](docs/features/IPAM.md) | IP space, block, subnet, address management |
-| [DHCP Features](docs/features/DHCP.md) | DHCP server management (Phase 2) |
-| [DNS Features](docs/features/DNS.md) | DNS zones, views, server groups, blocking lists |
-| [Auth & Permissions](docs/features/AUTH.md) | LDAP, OIDC, roles, scoped permissions |
+| [DHCP Features](docs/features/DHCP.md) | DHCP server management — Kea, Windows DHCP |
+| [DNS Features](docs/features/DNS.md) | DNS zones, views, server groups, blocking lists, Windows DNS |
+| [Auth & Permissions](docs/features/AUTH.md) | LDAP, OIDC, SAML, RADIUS, TACACS+, roles, scoped permissions |
 | [System Admin](docs/features/SYSTEM_ADMIN.md) | Health dashboard, backup, notifications |
 | [Observability](docs/OBSERVABILITY.md) | Logging, metrics, alerting |
+| [Windows Server Setup](docs/deployment/WINDOWS.md) | WinRM, service accounts, firewall — Windows-side checklist |
 | [DNS Agent Design](docs/deployment/DNS_AGENT.md) | Agent protocol, auto-registration, config sync |
-| [DNS Driver Spec](docs/drivers/DNS_DRIVERS.md) | BIND9 driver internals |
+| [DNS Driver Spec](docs/drivers/DNS_DRIVERS.md) | BIND9 + Windows DNS driver internals |
+| [DHCP Driver Spec](docs/drivers/DHCP_DRIVERS.md) | Kea + Windows DHCP driver internals |
 | [Appliance Deployment](docs/deployment/APPLIANCE.md) | OS image build and licensing |
 
 ---

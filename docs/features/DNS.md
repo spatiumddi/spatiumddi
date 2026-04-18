@@ -1,6 +1,6 @@
 # DNS Feature Specification
 
-> **Implementation status (2026-04-16):** Full CRUD for groups / servers / zones / records / views / ACLs / trust anchors; BIND9 driver with TSIG + RFC 2136 dynamic updates; agent auto-registration and long-poll config sync with ETag; RPZ blocklists actively rendered by the agent (nxdomain / sinkhole / redirect / passthru; wildcard + exceptions); per-entry `reason` and `is_wildcard` toggles; zone import/export (RFC 1035); query logging; health checks; IPAM ↔ DNS drift detection & reconciliation (`Check DNS Sync` on subnet/block/space); reverse-zone auto-create + backfill. **Deferred:** secondary-zone (AXFR/IXFR) full support, per-server zone serial reporting.
+> **Implementation status (2026-04-18):** Full CRUD for groups / servers / zones / records / views / ACLs / trust anchors; BIND9 driver with TSIG + RFC 2136 dynamic updates; agent auto-registration and long-poll config sync with ETag; RPZ blocklists actively rendered by the agent (nxdomain / sinkhole / redirect / passthru; wildcard + exceptions); per-entry `reason` and `is_wildcard` toggles; zone import/export (RFC 1035); query logging; health checks; IPAM ↔ DNS drift detection & reconciliation (`Check DNS Sync` on subnet/block/space); reverse-zone auto-create + backfill; **Windows DNS driver shipped** — Path A (agentless, RFC 2136) and Path B (agentless, WinRM + PowerShell for zone CRUD and zone-record pull that sidesteps AXFR); group-level "Sync with Servers" button performs bi-directional zone reconciliation. **Deferred:** secondary-zone (AXFR/IXFR) full support, per-server zone serial reporting, GSS-TSIG (Kerberos-signed RFC 2136), Windows DNS Path B record-level writes.
 
 ## Overview
 
@@ -526,4 +526,129 @@ BLOCKLIST_SINKHOLE_IP=0.0.0.0
 
 # BIND9 TSIG (global default — per-server keys stored in DB encrypted)
 BIND_TSIG_ALGORITHM=hmac-sha256
+```
+
+---
+
+## 12. "Sync with Servers" — group-level bi-directional reconciliation
+
+Every DNS server group has a **Sync with Servers** button on its detail header. It iterates every enabled server in the group and runs a four-step reconciliation per server:
+
+1. **List zones on the wire** — for Windows servers with credentials, `Get-DnsServerZone | Where { -not $_.IsAutoCreated }` over WinRM; for BIND9, the server's zone list from the agent's last-known config.
+2. **Auto-import server-only zones** — any zone present on the wire but missing from SpatiumDDI is created as `is_auto_generated=False`. System-only zones (TrustAnchors, RootHints, Cache, anything without a dot) are skipped.
+3. **Push DB-only zones back to the server** — any SpatiumDDI zone not present on the wire is created via the driver's `apply_zone_change`. For Windows Path B, this is `Add-DnsServerPrimaryZone -ReplicationScope Domain -DynamicUpdate Secure`.
+4. **Per-zone record sync** — for each zone, pull all records (AXFR for BIND9 or RFC 2136-capable servers, `Get-DnsServerResourceRecord` over WinRM for Windows Path B), reconcile against DB records, and apply the delta. Additive-only — never deletes.
+
+The UI surfaces per-server results with zones-imported / zones-pushed / errors, plus a per-zone table.
+
+Manual drift checks from the subnet / block / space side use **Check DNS Sync** which only covers IPAM-managed records (A/AAAA/PTR). The group-level reconciliation covers everything in a zone.
+
+---
+
+## 13. Windows DNS — Path A & B
+
+SpatiumDDI supports Windows Server DNS as an **agentless** backend in two tiers that coexist on the same driver class. Which one applies at runtime depends on whether the server has WinRM credentials configured.
+
+| Tier | Activation | Capabilities | Protocol |
+|---|---|---|---|
+| **Path A** | Always available | Record CRUD, AXFR pull | RFC 2136 + dnspython over UDP/TCP 53 |
+| **Path B** | `DNSServer.credentials_encrypted` set | Zone create / delete, `Get-DnsServerResourceRecord`-based pull (AXFR-free), server-level probes | WinRM + `DnsServer` PowerShell module over 5985/5986 |
+
+Record writes always ride RFC 2136 — Path B is not used for per-record writes (to avoid paying the PowerShell-per-record cost on hot writes). Zone topology writes use Path B when credentials are present, otherwise SpatiumDDI can't create zones on Windows (create them manually in DNS Manager, then click **Sync with Servers**).
+
+### 13.1 When to choose which
+
+| Situation | Recommendation |
+|---|---|
+| Existing AD environment, you want the full SpatiumDDI experience | **Path B** — register the DC with WinRM credentials. |
+| Existing AD environment, you only need record writes and don't want to provision a WinRM service account | **Path A** — make sure zones are "Nonsecure and secure" dynamic updates. |
+| "Secure only" AD-integrated zone that can't be changed | **Path B for zone management; record writes fail** until GSS-TSIG lands. Treat it as zone-only for now. |
+| Greenfield, no AD | Use the built-in BIND9 container instead. |
+
+### 13.2 Credentials shape
+
+Windows DNS credentials match the Windows DHCP shape — same Fernet-encrypted dict, same transport options:
+
+```json
+{
+  "username": "CORP\\spatium-dns",
+  "password": "…",
+  "winrm_port": 5986,
+  "transport": "ntlm",
+  "use_tls": true,
+  "verify_tls": true
+}
+```
+
+Stored on `DNSServer.credentials_encrypted`. The server create modal in the UI renders these fields when `driver=windows_dns`, with a **Test Connection** button that runs `(Get-DnsServerSetting -All).BuildNumber` as a cheap probe.
+
+### 13.3 What Path B unlocks
+
+**Zone create / delete:**
+
+```powershell
+Add-DnsServerPrimaryZone -Name "corp.example.com" -ReplicationScope Domain -DynamicUpdate Secure
+Remove-DnsServerZone -Name "corp.example.com" -Force
+```
+
+Both are idempotent — the driver guards with `Get-DnsServerZone -ErrorAction SilentlyContinue` before acting, so a missing zone on delete is a no-op.
+
+**Zone record pull (AXFR-free):**
+
+When AD-integrated zones refuse AXFR (the default ACL), Path B pulls records via `Get-DnsServerResourceRecord -ZoneName "…"`. The driver normalises the output (`HostName`, `Type`, `TTL`, `Value`, optional `Priority` / `Weight` / `Port`) into the neutral `RecordData` shape. SOA and apex NS are filtered out.
+
+**Zone list:**
+
+`Get-DnsServerZone | Where { -not $_.IsAutoCreated }` returns every non-system zone. Feeds the group-level "Sync with Servers" step 1.
+
+### 13.4 What Path B does *not* do (yet)
+
+| Not yet | Reason |
+|---|---|
+| Per-record writes via WinRM | Paying a PowerShell round-trip per record is too slow for hot writes. RFC 2136 stays the write path. |
+| GSS-TSIG (Kerberos-signed RFC 2136) | Lets Path A work against "Secure only" zones without changing them. On the roadmap. |
+| SIG(0) authentication | Niche; not prioritised. |
+| Server-level options (forwarders, recursion, allow-query) | Out of scope for agentless Windows — Windows manages these via Registry + DNS MMC. |
+
+### 13.5 Zone transfer / AXFR for Path A
+
+For Path A to pull records, AXFR from the SpatiumDDI host must be allowed. In Windows DNS Manager:
+
+1. Right-click the zone → **Properties** → **Zone Transfers** tab.
+2. **Allow zone transfers** → **Only to the following servers** → add the SpatiumDDI host IP.
+
+If AXFR is refused, the per-zone sync in step 4 of "Sync with Servers" shows `Zone transfer error: REFUSED`. Switching that server to Path B (adding WinRM credentials) bypasses AXFR entirely.
+
+See [WINDOWS.md](../deployment/WINDOWS.md) for full Windows-side prerequisites including WinRM enablement, service account creation, and firewall rules.
+
+---
+
+## 14. IPAM ↔ DNS synchronization jobs
+
+Two scheduled reconciliation jobs complement the live sync path (`_sync_dns_record` runs on every IP mutation):
+
+### 14.1 IPAM → DNS Reconciliation
+
+Catches drift between IPAM's expected records (every IP with a hostname + DNS zone pinned) and SpatiumDDI's DNS DB. Creates missing A/AAAA/PTR records and (optionally) updates mismatched ones.
+
+| Setting | Default | Description |
+|---|---|---|
+| `dns_auto_sync_enabled` | off | Master toggle. |
+| `dns_auto_sync_interval_minutes` | 60 | How often the task runs. |
+| `dns_auto_sync_delete_stale` | off | Also delete auto-generated records whose IP was deleted. Conservative default — leaves stale rows so you can review. |
+
+Implementation: `app.tasks.ipam_dns_sync.auto_sync_ipam_dns` (Celery beat fires every 60s, task gates on the `enabled` flag + interval).
+
+### 14.2 Zone ↔ Server Reconciliation
+
+Catches drift between SpatiumDDI's DNS DB and the authoritative server's wire. Identical to pressing "Sync with Servers" on every group, on a timer. AXFR imports out-of-band edits, then any DB-only records are pushed back via RFC 2136. Additive only.
+
+| Setting | Default | Description |
+|---|---|---|
+| `dns_pull_from_server_enabled` | off | Master toggle. |
+| `dns_pull_from_server_interval_minutes` | 30 | AXFR + RFC 2136 is heavier than a DB diff; a low cadence is usually wrong. |
+
+Implementation: `app.tasks.dns_pull.auto_pull_dns_from_server`.
+
+Both jobs have **Last Run** indicators in Settings so you can confirm they're firing.
 

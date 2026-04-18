@@ -1,12 +1,12 @@
 # DHCP Feature Specification
 
-> **Implementation status (2026-04-16):** Kea driver, agent runtime, container image, backend API, and frontend UI shipped in the `2026.04.16-1` release. Pool overlap validation, existing-IP warning, resize, static ↔ IPAM sync (including DNS forward/reverse), lease → IPAM mirror (with auto-cleanup on expiry), DHCP Pool membership column in the IPAM subnet view, per-scope DHCP defaults prefilled from Settings. **Still deferred:** ISC DHCP driver, Kea HA hook coordination, DDNS pipeline (dynamic leases → DNS A/PTR), reconciliation report, lease import. NTP (DHCP option 42) is a first-class option.
+> **Implementation status (2026-04-18):** Kea driver, agent runtime, container image, backend API, and frontend UI shipped in the `2026.04.16-1` release. Pool overlap validation, existing-IP warning, resize, static ↔ IPAM sync (including DNS forward/reverse), lease → IPAM mirror (with auto-cleanup on expiry), DHCP Pool membership column in the IPAM subnet view, per-scope DHCP defaults prefilled from Settings. **Windows DHCP driver shipped** — Path A (agentless, WinRM + PowerShell, read-only lease monitoring + per-object scope / pool / reservation CRUD). **Still deferred:** ISC DHCP driver, Kea HA hook coordination, DDNS pipeline (dynamic leases → DNS A/PTR), reconciliation report, lease import. NTP (DHCP option 42) is a first-class option.
 
 ## Overview
 
 SpatiumDDI manages DHCP servers as authoritative configuration sources. The IPAM database is the **source of truth** — DHCP server configs are pushed from IPAM, not read from the servers. DHCP servers are configured to report lease events back to SpatiumDDI for real-time IP status tracking and DDNS updates.
 
-Supported backends: **ISC Kea DHCP** (preferred), **ISC DHCP v4** (legacy).
+Supported backends: **ISC Kea DHCP** (preferred), **Windows Server DHCP** (agentless), **ISC DHCP v4** (planned).
 
 ---
 
@@ -407,3 +407,80 @@ ISC DHCP uses the native failover protocol (RFC 3074). SpatiumDDI pushes matchin
 For non-HA architectures serving different subnets from multiple containers:
 - Each container serves non-overlapping subnets (managed by SpatiumDDI scope assignments)
 - Scope assignments are never duplicated across servers without an explicit HA group
+
+---
+
+## 15. Windows DHCP — Path A (read-only)
+
+SpatiumDDI supports Windows Server DHCP as an **agentless** backend. Today's implementation (Path A) is WinRM-driven and focused on **lease mirroring** — SpatiumDDI polls the Windows server for its active leases and reflects them into IPAM, but does not push config bundles. Path B (full scope/reservation CRUD via WinRM) is on the roadmap.
+
+### 15.1 What's implemented
+
+| Capability | Status | Mechanism |
+|---|---|---|
+| Read leases | ✅ | `Get-DhcpServerv4Scope` + `Get-DhcpServerv4Lease` per scope, JSON-serialised back. |
+| Read scopes | ✅ | `Get-DhcpServerv4Scope` + options + exclusions + reservations in one PowerShell call. |
+| Per-object scope CRUD | ✅ | `Add-DhcpServerv4Scope` / `Remove-DhcpServerv4Scope`. |
+| Per-object reservation CRUD | ✅ | `Add-DhcpServerv4Reservation` / `Remove-DhcpServerv4Reservation`. |
+| Per-object exclusion CRUD | ✅ | `Add-DhcpServerv4ExclusionRange` / `Remove-DhcpServerv4ExclusionRange`. |
+| Bundle push (`/sync`) | ❌ | `READ_ONLY_DRIVERS` — rejected by the API. Windows DHCP is cmdlet-driven, not config-file-driven. |
+| `reload` / `restart` / `validate_config` | ❌ | Not applicable to Windows; raise `NotImplementedError`. |
+
+The driver lives at [`app/drivers/dhcp/windows.py`](../../backend/app/drivers/dhcp/windows.py) (class `WindowsDHCPReadOnlyDriver`). See [DHCP_DRIVERS.md](../drivers/DHCP_DRIVERS.md#4-windows-dhcp-driver-agentless--read-only-path-a) for internals.
+
+### 15.2 Credentials
+
+Stored on `DHCPServer.credentials_encrypted` as a Fernet-encrypted JSON dict:
+
+```json
+{
+  "username": "CORP\\spatium-dhcp",
+  "password": "…",
+  "winrm_port": 5985,
+  "transport": "ntlm",
+  "use_tls": false,
+  "verify_tls": false
+}
+```
+
+Service account requirements:
+- **Read-only lease mirroring**: member of the Windows `DHCP Users` local group.
+- **Per-object scope/reservation/exclusion CRUD**: member of `DHCP Administrators`.
+
+See [WINDOWS.md](../deployment/WINDOWS.md) for the WinRM + account setup.
+
+### 15.3 Scheduled lease pull
+
+Scheduled Celery beat task: [`app.tasks.dhcp_pull_leases.auto_pull_dhcp_leases`](../../backend/app/tasks/dhcp_pull_leases.py). Beat fires every 60s; the task gates on platform settings so the UI can change cadence without restarting beat.
+
+| Setting | Default | Description |
+|---|---|---|
+| `dhcp_pull_leases_enabled` | off | Master toggle. |
+| `dhcp_pull_leases_interval_minutes` | 5 | How often to poll each agentless server. |
+| `dhcp_pull_leases_last_run_at` | — | Populated after each pass; visible in Settings. |
+
+Per poll:
+
+1. Enumerate agentless DHCP servers (`DHCPServer.driver in AGENTLESS_DRIVERS`).
+2. For each, call `driver.get_leases(server)` over WinRM.
+3. Upsert the lease into `DHCPLease` by `(server_id, ip_address)`.
+4. If the lease's IP falls inside a known subnet, mirror it into `IPAddress` with `status="dhcp"` and `auto_from_lease=True`.
+5. The existing lease-cleanup sweep handles expiry — no special handling.
+
+### 15.4 Manual "Sync Leases" button
+
+Agentless DHCP servers have a **Sync Leases** button on the server detail header that runs the same lease pull immediately without waiting for the scheduled task. Useful after adding a new server, or when debugging a new lease.
+
+### 15.5 Scope auto-import
+
+The first lease pull against a Windows DHCP server also imports its scopes — scopes found on the server but not in SpatiumDDI are created with their options, exclusions, and reservations. This mirrors the auto-import pattern from the DNS "Sync with Servers" flow.
+
+### 15.6 Not yet (Path B full CRUD)
+
+Full config-push to Windows DHCP (analogous to Windows DNS Path B) would unlock:
+
+- Scope options pushed from SpatiumDDI instead of being managed in the Windows DHCP MMC.
+- Client class / policy rendering.
+- DHCP failover pair configuration from SpatiumDDI.
+
+The per-object CRUD methods are already in place (`apply_scope`, `apply_reservation`, `apply_exclusion`) — what's missing is the API-side wiring that routes write events from the scope / pool / static endpoints into those methods for agentless drivers. Expected before ISC DHCP lands.

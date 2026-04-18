@@ -156,51 +156,76 @@ class BIND9DriverConfig:
 
 ---
 
-### Update Strategy: REST API (all operations, no restarts)
+## 3. Windows DNS Driver
 
-No SSH, no config file management, no restarts for any normal operation.
+Located at [`app/drivers/dns/windows.py`](../../backend/app/drivers/dns/windows.py). Class: `WindowsDNSDriver`. Two capability tiers coexist on the same driver class; which one applies at runtime depends on whether `DNSServer.credentials_encrypted` is set.
 
-| Operation | API Call | Notes |
+### 3.1 Path A — RFC 2136 (always available)
+
+| Operation | Mechanism | Notes |
 |---|---|---|
-| Add record | `PATCH /api/v1/servers/localhost/zones/{zone}` | Atomic RRset update |
-| Update record | `PATCH /api/v1/servers/localhost/zones/{zone}` | Same endpoint |
-| Delete record | `PATCH /api/v1/servers/localhost/zones/{zone}` with `changetype: DELETE` | |
-| Create zone | `POST /api/v1/servers/localhost/zones` | |
-| Delete zone | `DELETE /api/v1/servers/localhost/zones/{zone}` | |
-| Notify secondaries | `PUT /api/v1/servers/localhost/zones/{zone}/notify` | Triggers AXFR to secondaries |
-| Get zone info | `GET /api/v1/servers/localhost/zones/{zone}` | |
+| Add / update / delete record | RFC 2136 via `dnspython` (`dns.update.Update`) | TSIG-signed when configured, unsigned when allowed. |
+| Zone record pull | AXFR via `dns.query.xfr` + `dns.zone.from_xfr` | Requires AXFR ACL on the Windows zone. |
+| Create / delete zone | Not available in Path A | Zones must be created in Windows DNS Manager (or via Path B when credentials are set). |
+| Rendering (`render_server_config`, etc.) | Returns empty string | SpatiumDDI does not write named.conf-style config for Windows DNS. |
+| `reload_*` | No-op | AD replication handles zone propagation across DCs. |
 
-```python
-async def update_record(self, zone_name: str, record: DNSRecordData) -> None:
-    payload = {
-        "rrsets": [{
-            "name": f"{record.name}.{zone_name}",
-            "type": record.record_type,
-            "ttl": record.ttl,
-            "changetype": "REPLACE",
-            "records": [{"content": record.value, "disabled": False}]
-        }]
-    }
-    async with self.session.patch(
-        f"{self.api_url}/zones/{zone_name}",
-        json=payload
-    ) as resp:
-        resp.raise_for_status()
+Supported record types: `A`, `AAAA`, `CNAME`, `MX`, `TXT`, `PTR`, `SRV`, `NS`, `TLSA`.
+
+### 3.2 Path B — WinRM + PowerShell (credentials required)
+
+Activated when `DNSServer.credentials_encrypted` is set. Does **not** replace Path A for record writes; it complements it.
+
+| Operation | Mechanism | Notes |
+|---|---|---|
+| List zones | `Get-DnsServerZone \| Where { -not $_.IsAutoCreated }` | Feeds the group-level "Sync with Servers" step 1. |
+| Create zone | `Add-DnsServerPrimaryZone -Name <n> -ReplicationScope Domain -DynamicUpdate Secure` | Guarded with `Get-DnsServerZone -ErrorAction SilentlyContinue` — idempotent. |
+| Delete zone | `Remove-DnsServerZone -Name <n> -Force` | Same idempotent guard — no-op when zone already absent. |
+| Pull records | `Get-DnsServerResourceRecord -ZoneName <n>` | Sidesteps AXFR ACLs on AD-integrated zones. Returns JSON that the driver normalises into `RecordData`. |
+| Test connection | `(Get-DnsServerSetting -All).BuildNumber` | Cheap probe used by the `POST /dns/test-windows-credentials` endpoint and the UI's Test button. |
+| Record writes | **Still RFC 2136** | PowerShell-per-record would be too slow for hot writes. |
+
+### 3.3 Credentials
+
+Fernet-encrypted JSON dict, same shape as Windows DHCP:
+
+```json
+{
+  "username": "CORP\\spatium-dns",
+  "password": "…",
+  "winrm_port": 5986,
+  "transport": "ntlm",
+  "use_tls": true,
+  "verify_tls": true
+}
 ```
 
-Options:
+Required security group for the service account: `DnsAdmins` on the domain (or a delegated group with equivalent rights). See [WINDOWS.md](../deployment/WINDOWS.md).
 
-1. **Multiple instances** (recommended): Run separate g.,  on port 5353,  on port 53). Each has its own API endpoint. The driver connects to the appropriate instance based on the view.
+### 3.4 Driver registry classification
 
-2. **GeoIP backend**: For geolocation-based routing (more complex, Phase 3).
+In [`app/drivers/dns/registry.py`](../../backend/app/drivers/dns/registry.py):
 
-The driver's `view_id` parameter selects which 
 ```python
-@dataclass
-    api_key: str                  # Encrypted in DB (X-API-Key header)
-    timeout_seconds: int = 10
-    verify_ssl: bool = True
+AGENTLESS_DRIVERS: frozenset[str] = frozenset({"windows_dns"})
 ```
+
+Agentless drivers don't emit a `ConfigBundle`; the API's `record_ops.enqueue_record_op` short-circuits them and calls `apply_record_change` directly instead of queueing for a co-located agent.
+
+### 3.5 Write-through pattern
+
+Zone CRUD is pushed through the Windows server **before** the SpatiumDDI DB commit:
+
+```python
+await _push_zone_to_agentless_servers(db, zone, op="create")
+await db.commit()
+```
+
+If the push fails, the 502 response prevents the DB commit — the Windows DNS state and SpatiumDDI state stay consistent. Record ops follow the same pattern via the agent-side op queue for agented drivers and direct calls for agentless.
+
+### 3.6 Shared AXFR helper
+
+[`drivers/dns/_axfr.py`](../../backend/app/drivers/dns/_axfr.py) extracts the AXFR → `RecordData` logic used by both BIND9 and Windows Path A. Filters SOA + apex NS; absolutises CNAME / NS / PTR / MX / SRV targets.
 
 ---
 
@@ -209,17 +234,19 @@ The driver's `view_id` parameter selects which
 Drivers are registered by name and instantiated by the service layer:
 
 ```python
-# app/drivers/dns/__init__.py
-DNS_DRIVERS: dict[str, type[DNSDriverBase]] = {
+# app/drivers/dns/registry.py
+_DRIVERS: dict[str, type[DNSDriver]] = {
     "bind9": BIND9Driver,
+    "windows_dns": WindowsDNSDriver,
 }
 
-def get_dns_driver(server: DNSServer) -> DNSDriverBase:
-    driver_class = DNS_DRIVERS.get(server.driver)
-    if not driver_class:
-        raise ValueError(f"Unknown DNS driver: {server.driver}")
-    config = decrypt_server_credentials(server)
-    return driver_class(config)
+AGENTLESS_DRIVERS: frozenset[str] = frozenset({"windows_dns"})
+
+def get_driver(server_type: str) -> DNSDriver:
+    cls = _DRIVERS.get(server_type)
+    if cls is None:
+        raise ValueError(f"Unknown DNS driver: {server_type!r}")
+    return cls()
 ```
 
 ---
