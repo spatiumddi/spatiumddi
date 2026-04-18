@@ -180,6 +180,38 @@ class Subnet(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         Boolean, nullable=False, default=True, server_default=sa_text("true")
     )
 
+    # DDNS — dynamic DNS from DHCP leases. Independent of Kea's own DDNS
+    # hook (which lives on ``DHCPScope``): this set of fields drives
+    # SpatiumDDI's reconciliation layer — when a lease lands (via agent
+    # push or the agentless lease pull), the DDNS service resolves a
+    # hostname per ``ddns_hostname_policy`` and calls the same
+    # ``_sync_dns_record`` path that static allocations use.
+    #
+    # Policy values:
+    #   ``client_provided``      — only write if the lease has a hostname
+    #   ``client_or_generated``  — use client hostname if present, else
+    #                              generate ``dhcp-<hyphenated-ip>``
+    #   ``always_generate``      — always synthesise, ignore client hostname
+    #   ``disabled``             — never fire DDNS on this subnet
+    #
+    # ``ddns_enabled`` is the master toggle; the policy is only read when
+    # enabled. ``ddns_ttl`` overrides the zone-level TTL for
+    # auto-generated records. ``ddns_domain_override`` lets the operator
+    # publish DDNS into a different zone (e.g. ``dhcp.corp.example.com``
+    # rather than ``corp.example.com``) without affecting manual IPAM
+    # allocations.
+    ddns_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
+    ddns_hostname_policy: Mapped[str] = mapped_column(
+        String(30),
+        nullable=False,
+        default="client_or_generated",
+        server_default=sa_text("'client_or_generated'"),
+    )
+    ddns_domain_override: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    ddns_ttl: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
     # Status: active | deprecated | reserved | quarantine
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="active", index=True)
 

@@ -14,6 +14,7 @@ from datetime import UTC, datetime, timedelta
 
 import structlog
 from sqlalchemy import select
+from sqlalchemy.orm import selectinload
 
 from app.celery_app import celery_app
 from app.db import AsyncSessionLocal
@@ -39,16 +40,33 @@ async def _sweep() -> int:
             )
         )
         cleaned = 0
+        # Lazy-import the DDNS revoke to keep this task light when
+        # DDNS is off. The helper itself no-ops when the subnet is not
+        # ddns_enabled, so calling it unconditionally is cheap.
+        from app.services.dns.ddns import revoke_ddns_for_lease  # noqa: PLC0415
+
         for lease in res.scalars().all():
             lease.state = "expired"
             # Remove mirrored IPAM row if auto_from_lease.
             ipam_res = await db.execute(
-                select(IPAddress).where(
+                select(IPAddress)
+                .where(
                     IPAddress.address == lease.ip_address,
                     IPAddress.auto_from_lease.is_(True),
                 )
+                .options(selectinload(IPAddress.subnet))
             )
             for row in ipam_res.scalars().all():
+                subnet = row.subnet
+                if subnet is not None:
+                    try:
+                        await revoke_ddns_for_lease(db, subnet=subnet, ipam_row=row)
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning(
+                            "dhcp_lease_cleanup_ddns_revoke_failed",
+                            ip=str(row.address),
+                            error=str(exc),
+                        )
                 await db.delete(row)
                 cleaned += 1
         await db.commit()

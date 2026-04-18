@@ -202,18 +202,18 @@ async def pull_leases_from_server(
 
         if ipam_row is None:
             if apply:
-                db.add(
-                    IPAddress(
-                        subnet_id=containing.id,
-                        address=ip,
-                        status="dhcp",
-                        hostname=lease.get("hostname"),
-                        mac_address=mac,
-                        last_seen_at=now,
-                        last_seen_method="dhcp",
-                        auto_from_lease=True,
-                    )
+                ipam_row = IPAddress(
+                    subnet_id=containing.id,
+                    address=ip,
+                    status="dhcp",
+                    hostname=lease.get("hostname"),
+                    mac_address=mac,
+                    last_seen_at=now,
+                    last_seen_method="dhcp",
+                    auto_from_lease=True,
                 )
+                db.add(ipam_row)
+                await db.flush()  # assign PK so _sync_dns_record can reference it
             result.ipam_created += 1
         elif ipam_row.auto_from_lease:
             # Only refresh rows we own. Manually-allocated rows are left
@@ -225,6 +225,33 @@ async def pull_leases_from_server(
                 ipam_row.last_seen_at = now
                 ipam_row.last_seen_method = "dhcp"
             result.ipam_refreshed += 1
+        else:
+            # Manual allocation — skip DDNS entirely. Whatever hostname
+            # the operator set stays put.
+            continue
+
+        # Fire DDNS off the freshly-mirrored row. Gate-keeping lives
+        # inside the service (subnet.ddns_enabled, policy, static
+        # override, idempotency); we just pass through and let it
+        # decide. Any exception is logged but doesn't break the
+        # lease-pull pass — DNS will reconcile next tick either way.
+        if apply and ipam_row is not None:
+            try:
+                from app.services.dns.ddns import apply_ddns_for_lease  # noqa: PLC0415
+
+                await apply_ddns_for_lease(
+                    db,
+                    subnet=containing,
+                    ipam_row=ipam_row,
+                    client_hostname=lease.get("hostname"),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning(
+                    "dhcp_pull_leases_ddns_failed",
+                    server=str(server.id),
+                    ip=ip,
+                    error=str(exc),
+                )
 
     if apply:
         server.last_sync_at = now

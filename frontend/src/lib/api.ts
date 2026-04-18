@@ -268,6 +268,17 @@ export interface Subnet {
   dns_inherit_settings: boolean;
   dhcp_server_group_id?: string | null;
   dhcp_inherit_settings?: boolean;
+  // DDNS — dynamic DNS reconciliation from DHCP leases. Subnet-level
+  // opt-in; when enabled, lease-mirrored IPAM rows get an A/AAAA + PTR
+  // per ``ddns_hostname_policy``. See docs/features/DNS.md §7.
+  ddns_enabled?: boolean;
+  ddns_hostname_policy?:
+    | "client_provided"
+    | "client_or_generated"
+    | "always_generate"
+    | "disabled";
+  ddns_domain_override?: string | null;
+  ddns_ttl?: number | null;
   dns_servers?: string[] | null;
   domain_name?: string | null;
   created_at?: string;

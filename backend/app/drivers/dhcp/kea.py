@@ -55,16 +55,23 @@ _KEA_OPTION_NAMES: dict[str, str] = {
 # misconfigured inheritance rather than Kea silently rejecting the
 # config on reload.
 _KEA_OPTION_NAMES_V6: dict[str, str] = {
-    "dns-servers": "dns-servers",         # DHCPv6 option 23
-    "domain-search": "domain-search",     # DHCPv6 option 24
-    "ntp-servers": "sntp-servers",        # DHCPv6 option 31 (SNTP)
-    "bootfile-name": "bootfile-url",      # DHCPv6 option 59 (URL form)
+    "dns-servers": "dns-servers",  # DHCPv6 option 23
+    "domain-search": "domain-search",  # DHCPv6 option 24
+    "ntp-servers": "sntp-servers",  # DHCPv6 option 31 (SNTP)
+    "bootfile-name": "bootfile-url",  # DHCPv6 option 59 (URL form)
 }
 
 # Options that have no DHCPv6 equivalent — dropped from v6 scopes.
 _DHCP4_ONLY_OPTION_NAMES: frozenset[str] = frozenset(
-    {"routers", "broadcast-address", "mtu", "time-offset",
-     "domain-name", "tftp-server-name", "tftp-server-address"}
+    {
+        "routers",
+        "broadcast-address",
+        "mtu",
+        "time-offset",
+        "domain-name",
+        "tftp-server-name",
+        "tftp-server-address",
+    }
 )
 
 
@@ -105,15 +112,11 @@ def _render_pool(pool: PoolDef, *, address_family: str = "ipv4") -> dict[str, An
     if pool.class_restriction:
         d["client-class"] = pool.class_restriction
     if pool.options_override:
-        d["option-data"] = _render_option_data(
-            pool.options_override, address_family=address_family
-        )
+        d["option-data"] = _render_option_data(pool.options_override, address_family=address_family)
     return d
 
 
-def _render_reservation(
-    s: StaticAssignmentDef, *, address_family: str = "ipv4"
-) -> dict[str, Any]:
+def _render_reservation(s: StaticAssignmentDef, *, address_family: str = "ipv4") -> dict[str, Any]:
     # Dhcp6 reservations use ``ip-addresses`` (plural, list) and don't
     # accept ``hw-address`` as the match key by default — ``duid`` /
     # ``hw-address`` is configured per-subnet in real deployments. Emit
@@ -134,9 +137,7 @@ def _render_reservation(
     if s.client_id:
         r["client-id"] = s.client_id
     if s.options_override:
-        r["option-data"] = _render_option_data(
-            s.options_override, address_family=address_family
-        )
+        r["option-data"] = _render_option_data(s.options_override, address_family=address_family)
     return r
 
 
@@ -160,9 +161,7 @@ def _render_scope(scope: ScopeDef) -> dict[str, Any]:
     return out
 
 
-def _render_client_class(
-    c: ClientClassDef, *, address_family: str = "ipv4"
-) -> dict[str, Any]:
+def _render_client_class(c: ClientClassDef, *, address_family: str = "ipv4") -> dict[str, Any]:
     d: dict[str, Any] = {"name": c.name}
     if c.match_expression:
         d["test"] = c.match_expression
@@ -196,12 +195,9 @@ class KeaDriver(DHCPDriver):
                 },
                 "subnet4": [_render_scope(s) for s in v4_scopes],
                 "client-classes": [
-                    _render_client_class(c, address_family="ipv4")
-                    for c in bundle.client_classes
+                    _render_client_class(c, address_family="ipv4") for c in bundle.client_classes
                 ],
-                "option-data": _render_option_data(
-                    bundle.options.options, address_family="ipv4"
-                ),
+                "option-data": _render_option_data(bundle.options.options, address_family="ipv4"),
             }
         if v6_scopes:
             # Kea names the subnet list "subnet6" in Dhcp6 mode. Options /
@@ -218,12 +214,9 @@ class KeaDriver(DHCPDriver):
                 },
                 "subnet6": [_render_scope(s) for s in v6_scopes],
                 "client-classes": [
-                    _render_client_class(c, address_family="ipv6")
-                    for c in bundle.client_classes
+                    _render_client_class(c, address_family="ipv6") for c in bundle.client_classes
                 ],
-                "option-data": _render_option_data(
-                    bundle.options.options, address_family="ipv6"
-                ),
+                "option-data": _render_option_data(bundle.options.options, address_family="ipv6"),
             }
         return json.dumps(out, indent=2, sort_keys=True)
 

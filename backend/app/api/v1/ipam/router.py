@@ -853,6 +853,20 @@ class SubnetCreate(BaseModel):
     dns_inherit_settings: bool = True
     dhcp_server_group_id: uuid.UUID | None = None
     dhcp_inherit_settings: bool = True
+    # DDNS — see Subnet model. Defaults mirror the DB: off by default,
+    # policy ``client_or_generated`` only takes effect when enabled.
+    ddns_enabled: bool = False
+    ddns_hostname_policy: str = "client_or_generated"
+    ddns_domain_override: str | None = None
+    ddns_ttl: int | None = None
+
+    @field_validator("ddns_hostname_policy")
+    @classmethod
+    def validate_ddns_policy_create(cls, v: str) -> str:
+        allowed = {"client_provided", "client_or_generated", "always_generate", "disabled"}
+        if v not in allowed:
+            raise ValueError(f"ddns_hostname_policy must be one of: {', '.join(sorted(allowed))}")
+        return v
 
     @field_validator("network")
     @classmethod
@@ -902,6 +916,10 @@ class SubnetUpdate(BaseModel):
     dns_inherit_settings: bool | None = None
     dhcp_server_group_id: uuid.UUID | None = None
     dhcp_inherit_settings: bool | None = None
+    ddns_enabled: bool | None = None
+    ddns_hostname_policy: str | None = None
+    ddns_domain_override: str | None = None
+    ddns_ttl: int | None = None
 
     @field_validator("status")
     @classmethod
@@ -911,6 +929,16 @@ class SubnetUpdate(BaseModel):
         allowed = {"active", "deprecated", "reserved", "quarantine"}
         if v not in allowed:
             raise ValueError(f"status must be one of: {', '.join(sorted(allowed))}")
+        return v
+
+    @field_validator("ddns_hostname_policy")
+    @classmethod
+    def validate_ddns_policy_update(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        allowed = {"client_provided", "client_or_generated", "always_generate", "disabled"}
+        if v not in allowed:
+            raise ValueError(f"ddns_hostname_policy must be one of: {', '.join(sorted(allowed))}")
         return v
 
 
@@ -954,6 +982,10 @@ class SubnetResponse(BaseModel):
     dns_inherit_settings: bool
     dhcp_server_group_id: uuid.UUID | None = None
     dhcp_inherit_settings: bool = True
+    ddns_enabled: bool = False
+    ddns_hostname_policy: str = "client_or_generated"
+    ddns_domain_override: str | None = None
+    ddns_ttl: int | None = None
     created_at: datetime
     modified_at: datetime
 

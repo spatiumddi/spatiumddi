@@ -845,6 +845,164 @@ function DhcpSettingsSection({
   );
 }
 
+/**
+ * DDNS — dynamic DNS from DHCP leases. Subnet-only setting (unlike DNS /
+ * DHCP which inherit through space → block → subnet). Four knobs:
+ *
+ *   ``enabled``       — master toggle. When off, leases on this subnet
+ *                       don't publish A/AAAA/PTR regardless of policy.
+ *   ``policy``        — ``client_provided`` | ``client_or_generated`` |
+ *                       ``always_generate`` | ``disabled`` — governs
+ *                       how the DDNS service picks a hostname when the
+ *                       lease's client hostname is missing / unwanted.
+ *   ``domainOverride`` — optional different zone for DDNS writes.
+ *   ``ttl``            — optional TTL override for auto-generated records.
+ *
+ * The preview row shows what hostname the ``always_generate`` path
+ * would produce for the subnet's first usable IP, so the operator can
+ * sanity-check the pattern before enabling.
+ */
+type DdnsPolicy =
+  | "client_provided"
+  | "client_or_generated"
+  | "always_generate"
+  | "disabled";
+
+function DdnsSettingsSection({
+  enabled,
+  policy,
+  domainOverride,
+  ttl,
+  subnetNetwork,
+  onEnabledChange,
+  onPolicyChange,
+  onDomainOverrideChange,
+  onTtlChange,
+}: {
+  enabled: boolean;
+  policy: DdnsPolicy;
+  domainOverride: string | null;
+  ttl: number | null;
+  subnetNetwork?: string;
+  onEnabledChange: (v: boolean) => void;
+  onPolicyChange: (v: DdnsPolicy) => void;
+  onDomainOverrideChange: (v: string | null) => void;
+  onTtlChange: (v: number | null) => void;
+}) {
+  // Preview: synthesise what ``dhcp-<tail>`` would look like for the
+  // first host IP in this subnet. Mirrors the Python implementation in
+  // ``backend/app/services/dns/ddns.py::_generate_hostname`` — keep in
+  // sync when policy generators change.
+  const preview = (() => {
+    if (!subnetNetwork) return null;
+    const match = subnetNetwork.match(/^([\d.]+)\/(\d+)$/);
+    if (!match) return null;
+    const octets = match[1].split(".").map((s) => parseInt(s, 10));
+    if (octets.length !== 4 || octets.some((n) => isNaN(n))) return null;
+    const prefix = parseInt(match[2], 10);
+    if (prefix < 16) return null;
+    // First usable: network + 1 for /30 and shorter, + 1 for /31 / /32
+    octets[3] = (octets[3] + 1) & 0xff;
+    return `dhcp-${octets[2]}-${octets[3]}`;
+  })();
+
+  const disabled = !enabled;
+
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-1.5">
+          <Network className="h-3.5 w-3.5 text-muted-foreground" />
+          <span className="text-xs font-medium">Dynamic DNS (from DHCP)</span>
+        </div>
+        <label className="flex items-center gap-1.5 text-xs cursor-pointer select-none">
+          <input
+            type="checkbox"
+            checked={enabled}
+            onChange={(e) => onEnabledChange(e.target.checked)}
+            className="h-3.5 w-3.5"
+          />
+          Enabled
+        </label>
+      </div>
+      {!enabled && (
+        <p className="text-xs text-muted-foreground italic">
+          When enabled, DHCP leases in this subnet will publish A/AAAA + PTR
+          records into the subnet's forward / reverse zones.
+        </p>
+      )}
+      {enabled && (
+        <div className="space-y-2 pl-5 border-l-2 border-muted">
+          <label className="block text-xs">
+            <span className="block text-muted-foreground mb-0.5">
+              Hostname policy
+            </span>
+            <select
+              value={policy}
+              onChange={(e) => onPolicyChange(e.target.value as DdnsPolicy)}
+              disabled={disabled}
+              className="w-full rounded-md border bg-background px-2 py-1 text-sm disabled:opacity-60"
+            >
+              <option value="client_or_generated">
+                client_or_generated — use client hostname else generate
+              </option>
+              <option value="client_provided">
+                client_provided — skip if no client hostname
+              </option>
+              <option value="always_generate">
+                always_generate — ignore client, always synthesise
+              </option>
+              <option value="disabled">disabled — no DDNS records</option>
+            </select>
+          </label>
+          {preview && policy !== "client_provided" && policy !== "disabled" && (
+            <p className="text-[11px] text-muted-foreground">
+              Generated names look like{" "}
+              <code className="rounded bg-muted px-1">{preview}</code>.
+            </p>
+          )}
+          <label className="block text-xs">
+            <span className="block text-muted-foreground mb-0.5">
+              Domain override (optional)
+            </span>
+            <input
+              type="text"
+              value={domainOverride ?? ""}
+              onChange={(e) =>
+                onDomainOverrideChange(e.target.value.trim() || null)
+              }
+              placeholder="dhcp.corp.example.com"
+              disabled={disabled}
+              className="w-full rounded-md border bg-background px-2 py-1 text-sm disabled:opacity-60"
+            />
+            <span className="mt-0.5 block text-[11px] text-muted-foreground">
+              Publish DDNS records into this zone instead of the subnet's
+              primary forward zone. Leave blank to use the subnet's zone.
+            </span>
+          </label>
+          <label className="block text-xs">
+            <span className="block text-muted-foreground mb-0.5">
+              TTL override (seconds, optional)
+            </span>
+            <input
+              type="number"
+              min={30}
+              value={ttl ?? ""}
+              onChange={(e) => {
+                const v = e.target.value.trim();
+                onTtlChange(v ? parseInt(v, 10) : null);
+              }}
+              placeholder="300"
+              disabled={disabled}
+              className="w-full rounded-md border bg-background px-2 py-1 text-sm disabled:opacity-60"
+            />
+          </label>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ─── Backfill Reverse Zones button ─────────────────────────────────────────
 
 function BackfillReverseZonesButton({
@@ -1332,6 +1490,15 @@ function CreateSubnetModal({
   const [dhcpServerGroupId, setDhcpServerGroupId] = useState<string | null>(
     null,
   );
+  // DDNS state — subnet-only, no inheritance for MVP
+  const [ddnsEnabled, setDdnsEnabled] = useState(false);
+  const [ddnsPolicy, setDdnsPolicy] = useState<DdnsPolicy>(
+    "client_or_generated",
+  );
+  const [ddnsDomainOverride, setDdnsDomainOverride] = useState<string | null>(
+    null,
+  );
+  const [ddnsTtl, setDdnsTtl] = useState<number | null>(null);
 
   const { data: blocks } = useQuery({
     queryKey: ["blocks", spaceId],
@@ -1413,6 +1580,10 @@ function CreateSubnetModal({
             }),
         dhcp_inherit_settings: dhcpInherit,
         ...(dhcpInherit ? {} : { dhcp_server_group_id: dhcpServerGroupId }),
+        ddns_enabled: ddnsEnabled,
+        ddns_hostname_policy: ddnsPolicy,
+        ddns_domain_override: ddnsDomainOverride,
+        ddns_ttl: ddnsTtl,
       }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["subnets", spaceId] });
@@ -1603,6 +1774,19 @@ function CreateSubnetModal({
             onServerGroupIdChange={setDhcpServerGroupId}
             parentBlockId={blockId || null}
             fallbackSpaceId={spaceId}
+          />
+        </div>
+        <div className="border-t pt-3">
+          <DdnsSettingsSection
+            enabled={ddnsEnabled}
+            policy={ddnsPolicy}
+            domainOverride={ddnsDomainOverride}
+            ttl={ddnsTtl}
+            subnetNetwork={effectiveNetwork}
+            onEnabledChange={setDdnsEnabled}
+            onPolicyChange={setDdnsPolicy}
+            onDomainOverrideChange={setDdnsDomainOverride}
+            onTtlChange={setDdnsTtl}
           />
         </div>
         {error && <p className="text-xs text-destructive">{error}</p>}
@@ -3897,6 +4081,17 @@ function EditSubnetModal({
   const [dhcpServerGroupId, setDhcpServerGroupId] = useState<string | null>(
     subnet.dhcp_server_group_id ?? null,
   );
+  // DDNS state — initialised from subnet
+  const [ddnsEnabled, setDdnsEnabled] = useState(subnet.ddns_enabled ?? false);
+  const [ddnsPolicy, setDdnsPolicy] = useState<DdnsPolicy>(
+    subnet.ddns_hostname_policy ?? "client_or_generated",
+  );
+  const [ddnsDomainOverride, setDdnsDomainOverride] = useState<string | null>(
+    subnet.ddns_domain_override ?? null,
+  );
+  const [ddnsTtl, setDdnsTtl] = useState<number | null>(
+    subnet.ddns_ttl ?? null,
+  );
 
   // Detect whether network/broadcast records currently exist
   const { data: addresses } = useQuery({
@@ -3983,6 +4178,10 @@ function EditSubnetModal({
         dns_additional_zone_ids: dnsInherit ? null : dnsAdditionalZoneIds,
         dhcp_inherit_settings: dhcpInherit,
         dhcp_server_group_id: dhcpInherit ? null : dhcpServerGroupId,
+        ddns_enabled: ddnsEnabled,
+        ddns_hostname_policy: ddnsPolicy,
+        ddns_domain_override: ddnsDomainOverride,
+        ddns_ttl: ddnsTtl,
         ...(manageAuto !== undefined
           ? { manage_auto_addresses: manageAuto }
           : {}),
@@ -4192,6 +4391,19 @@ function EditSubnetModal({
             onServerGroupIdChange={setDhcpServerGroupId}
             parentBlockId={subnet.block_id}
             fallbackSpaceId={subnet.space_id}
+          />
+        </div>
+        <div className="border-t pt-3">
+          <DdnsSettingsSection
+            enabled={ddnsEnabled}
+            policy={ddnsPolicy}
+            domainOverride={ddnsDomainOverride}
+            ttl={ddnsTtl}
+            subnetNetwork={subnet.network}
+            onEnabledChange={setDdnsEnabled}
+            onPolicyChange={setDdnsPolicy}
+            onDomainOverrideChange={setDdnsDomainOverride}
+            onTtlChange={setDdnsTtl}
           />
         </div>
         {error && <p className="text-xs text-destructive">{error}</p>}
