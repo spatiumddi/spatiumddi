@@ -387,6 +387,8 @@ export const ipamApi = {
         | "dns_zone_id"
         | "dns_additional_zone_ids"
         | "dns_inherit_settings"
+        | "dhcp_server_group_id"
+        | "dhcp_inherit_settings"
       >
     >,
   ) => api.put<IPBlock>(`/ipam/blocks/${id}`, data).then((r) => r.data),
