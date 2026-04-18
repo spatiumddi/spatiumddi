@@ -2232,8 +2232,45 @@ export interface LogQueryResponse {
   truncated: boolean;
 }
 
+export interface DhcpAuditRow {
+  time: string;
+  event_code: number;
+  event_label: string;
+  description: string;
+  ip_address: string;
+  hostname: string;
+  mac_address: string;
+  user_name: string;
+  transaction_id: string;
+  q_result: string;
+}
+
+export type DhcpAuditDay =
+  | "Mon"
+  | "Tue"
+  | "Wed"
+  | "Thu"
+  | "Fri"
+  | "Sat"
+  | "Sun";
+
+export interface DhcpAuditRequest {
+  server_id: string;
+  day?: DhcpAuditDay | null;
+  max_events?: number;
+}
+
+export interface DhcpAuditResponse {
+  server_id: string;
+  day: DhcpAuditDay;
+  events: DhcpAuditRow[];
+  truncated: boolean;
+}
+
 export const logsApi = {
   listSources: () => api.get<LogSource[]>("/logs/sources").then((r) => r.data),
   query: (body: LogQueryRequest) =>
     api.post<LogQueryResponse>("/logs/query", body).then((r) => r.data),
+  dhcpAudit: (body: DhcpAuditRequest) =>
+    api.post<DhcpAuditResponse>("/logs/dhcp-audit", body).then((r) => r.data),
 };

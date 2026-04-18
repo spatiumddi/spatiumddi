@@ -463,6 +463,34 @@ Remove-DhcpServerv4ExclusionRange -ScopeId {_ps_literal(scope_id)} `
             event_id=event_id,
         )
 
+    # ── DHCP audit log (per-lease events) ──────────────────────────────
+
+    async def get_dhcp_audit_events(
+        self,
+        server: Any,
+        *,
+        day: str | None = None,
+        max_events: int = 500,
+    ) -> list[dict[str, Any]]:
+        """Read the Windows DHCP audit log for ``day``.
+
+        The audit log (``C:\\Windows\\System32\\dhcp\\DhcpSrvLog-<Day>.log``)
+        is the per-lease event trail — grants, renewals, releases,
+        conflict detections, DNS update results. Different schema
+        from the Windows Event Log (which only covers service-level
+        events), so this is exposed as a separate endpoint.
+        """
+        from app.drivers.windows_dhcp_audit import fetch_dhcp_audit_events  # noqa: PLC0415
+
+        creds = _load_credentials(server)
+        return await fetch_dhcp_audit_events(
+            server,
+            creds,
+            run_ps=_run_ps,
+            day=day,
+            max_events=max_events,
+        )
+
     def capabilities(self) -> dict[str, Any]:
         return {
             # No full-bundle config push (render_config / apply_config /

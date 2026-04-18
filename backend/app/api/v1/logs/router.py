@@ -95,6 +95,50 @@ class LogQueryResponse(BaseModel):
     truncated: bool  # True when result count == max_events (more may exist)
 
 
+# ── DHCP audit log ───────────────────────────────────────────────────────────
+
+
+class DhcpAuditRow(BaseModel):
+    """One row from a Windows DHCP server's ``DhcpSrvLog-<Day>.log``.
+
+    Different schema from ``LogEventRow`` because the audit log is
+    per-lease — so it's richer (IP / MAC / hostname are first-class
+    columns, not buried in a Message blob).
+    """
+
+    time: str
+    event_code: int
+    event_label: str
+    description: str
+    ip_address: str
+    hostname: str
+    mac_address: str
+    user_name: str
+    transaction_id: str
+    q_result: str
+
+
+_WEEKDAYS: tuple[str, ...] = ("Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat")
+
+
+class DhcpAuditRequest(BaseModel):
+    server_id: uuid.UUID
+    day: str | None = Field(
+        default=None,
+        description=(
+            "Three-letter weekday (Mon / Tue / Wed / Thu / Fri / Sat / Sun). " "Null = today."
+        ),
+    )
+    max_events: int = Field(default=500, ge=1, le=2000)
+
+
+class DhcpAuditResponse(BaseModel):
+    server_id: uuid.UUID
+    day: str  # the day actually queried
+    events: list[DhcpAuditRow]
+    truncated: bool
+
+
 # ── Endpoints ────────────────────────────────────────────────────────────────
 
 
@@ -263,6 +307,80 @@ async def query_logs(body: LogQueryRequest, db: DB) -> LogQueryResponse:
         server_id=body.server_id,
         server_kind=body.server_kind,
         log_name=body.log_name,
+        events=events,
+        truncated=len(events) >= body.max_events,
+    )
+
+
+@router.post("/dhcp-audit", response_model=DhcpAuditResponse)
+async def query_dhcp_audit(body: DhcpAuditRequest, db: DB) -> DhcpAuditResponse:
+    """Read + parse a Windows DHCP server's audit log for the given day.
+
+    The DHCP audit log (``DhcpSrvLog-<Day>.log``) is Windows' per-lease
+    trail — grants, renewals, releases, conflict detections, DNS
+    update outcomes. Separate endpoint from ``/query`` because the
+    shape is different (IP / MAC / hostname are columns, not buried
+    inside a Message blob).
+
+    ``day`` is the three-letter weekday (``Mon`` / ``Tue`` / … /
+    ``Sun``). Null = today's log (server-local time, resolved by the
+    driver's PowerShell).
+    """
+    server, driver_name = await _resolve_server(db, "dhcp", body.server_id)
+
+    if body.day is not None and body.day not in _WEEKDAYS:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"day must be one of {list(_WEEKDAYS)} (or null for today), " f"got {body.day!r}"
+            ),
+        )
+
+    driver = get_dhcp_driver(driver_name)
+    get_audit_fn = getattr(driver, "get_dhcp_audit_events", None)
+    if not callable(get_audit_fn):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Driver {driver_name!r} does not expose a DHCP audit log "
+                "reader. Only agentless Windows DHCP supports this today."
+            ),
+        )
+
+    try:
+        raw_events = await get_audit_fn(
+            server,
+            day=body.day,
+            max_events=body.max_events,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "dhcp_audit_query_upstream_failed",
+            server_id=str(body.server_id),
+            day=body.day,
+            error=str(exc),
+        )
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"DHCP audit log query failed on {server.host}: {exc}",
+        )
+
+    # The driver returns today's weekday when ``day`` was null — we
+    # don't have it in scope here, so recompute from the response's
+    # perspective: if body.day was set, echo it; otherwise best-effort
+    # from local time (close enough for UI display; the server side
+    # used its own local time which may differ by a timezone, but the
+    # weekday is stable within ±6 hours of midnight).
+    from datetime import date as _date  # noqa: PLC0415
+
+    resolved_day = body.day or _WEEKDAYS[(_date.today().weekday() + 1) % 7]
+
+    events = [DhcpAuditRow(**e) for e in raw_events]
+    return DhcpAuditResponse(
+        server_id=body.server_id,
+        day=resolved_day,
         events=events,
         truncated=len(events) >= body.max_events,
     )
