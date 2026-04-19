@@ -5,8 +5,8 @@
 <h1 align="center">SpatiumDDI</h1>
 
 <p align="center">
-  <strong>Open-source DDI — DNS, DHCP, and IP Address Management</strong><br/>
-  Manage your entire network address space from one unified platform.
+  <strong>Self-hosted DNS, DHCP, and IPAM — one control plane, real servers underneath.</strong><br/>
+  A modern, open-source alternative to commercial DDI platforms.
 </p>
 
 <p align="center">
@@ -24,11 +24,19 @@
 
 ---
 
-## What is SpatiumDDI?
+## Why SpatiumDDI
 
-SpatiumDDI is a production-grade, open-source **DDI platform** — DNS, DHCP, and IP Address Management — built for teams that need real control over their network infrastructure without paying enterprise licensing fees.
+**It runs DNS and DHCP — not just configures them.** A modern alternative to Infoblox and EfficientIP: most open-source IPAM tools are pretty dashboards over someone else's `/etc/bind/named.conf`. SpatiumDDI bundles BIND9 and Kea as first-class service containers; the control plane owns their config, they auto-register, and they keep serving if the control plane is down.
 
-It is designed as a modern alternative to commercial DDI platforms like EfficientIP and Infoblox. Unlike most open-source alternatives, SpatiumDDI **manages and runs its own DNS/DHCP containers** — it is not a pretty front end over an external BIND9. The control plane is the source of truth; the service containers auto-register, pull their config, and keep serving even if the control plane goes down.
+**One platform, three surfaces.** IPAM tree, DNS zones, DHCP scopes — one UI, one REST API, one source of truth. Hostname changes in IPAM propagate to DNS; reservations propagate to DHCP. No more three-tab reconciliation.
+
+**Bring your own servers — or ours.** Use the bundled Kea and BIND9, or point SpatiumDDI at your existing Windows DCs and DHCP servers via WinRM. Agentless in both directions — nothing installed on the Windows side.
+
+**Built for delegation.** Group-based RBAC with LDAP, OIDC, SAML, RADIUS, and TACACS+ (with backup-server failover). Hand a subnet or a zone to a department without handing over root.
+
+**API-first.** Every UI action is a REST call. Terraform, Ansible, and ad-hoc scripts all speak the same surface. If you can click it, you can automate it.
+
+## What's in the box
 
 - 🗂 **Hierarchical IP management** — spaces, blocks, subnets, addresses in a visual tree (IPv4 + partial IPv6)
 - 🌐 **Built-in DNS server** — BIND9 container that auto-registers and syncs via RFC 2136
