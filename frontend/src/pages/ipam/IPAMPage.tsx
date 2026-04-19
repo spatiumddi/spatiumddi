@@ -8,10 +8,12 @@ import {
 } from "@tanstack/react-query";
 import { useLocation, useSearchParams } from "react-router-dom";
 import {
+  ChevronDown,
   ChevronRight,
   Network,
   Layers,
   Plus,
+  Server,
   Trash2,
   Pencil,
   RefreshCw,
@@ -2292,6 +2294,98 @@ function BreadcrumbPills({ items }: { items: BreadcrumbItem[] }) {
   );
 }
 
+// ─── Sync dropdown — DNS / DHCP / All ────────────────────────────────────────
+//
+// Replaces the per-surface "Sync DNS" button with a single ``[Sync ▾]`` menu
+// at the subnet level, where the subnet may have both a DNS zone AND one or
+// more DHCP scopes attached. DHCP + "All" entries are gated on
+// ``hasDhcp`` — blocks/spaces don't carry scopes and keep the old single
+// button. Closes on outside click via a mousedown listener on the document.
+function SyncMenu({
+  onSyncDns,
+  onSyncDhcp,
+  onSyncAll,
+  hasDhcp,
+  isPending,
+}: {
+  onSyncDns: () => void;
+  onSyncDhcp: () => void;
+  onSyncAll: () => void;
+  hasDhcp: boolean;
+  isPending: boolean;
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDocMouseDown = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) {
+        setOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", onDocMouseDown);
+    return () => document.removeEventListener("mousedown", onDocMouseDown);
+  }, [open]);
+
+  const itemCls =
+    "flex w-full items-center gap-2 px-3 py-2 text-left text-sm hover:bg-muted disabled:opacity-50";
+
+  return (
+    <div ref={ref} className="relative">
+      <button
+        onClick={() => setOpen((v) => !v)}
+        disabled={isPending}
+        title="Sync IPAM with DNS and/or DHCP servers"
+        className="flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm hover:bg-muted disabled:opacity-50"
+      >
+        <RefreshCw className={cn("h-3.5 w-3.5", isPending && "animate-spin")} />
+        Sync
+        <ChevronDown className="h-3.5 w-3.5" />
+      </button>
+      {open && (
+        <div className="absolute right-0 z-20 mt-1 w-44 overflow-hidden rounded-md border bg-popover shadow-md">
+          <button
+            type="button"
+            onClick={() => {
+              setOpen(false);
+              onSyncDns();
+            }}
+            className={itemCls}
+          >
+            <Globe2 className="h-3.5 w-3.5" /> DNS
+          </button>
+          {hasDhcp && (
+            <>
+              <button
+                type="button"
+                onClick={() => {
+                  setOpen(false);
+                  onSyncDhcp();
+                }}
+                className={itemCls}
+              >
+                <Server className="h-3.5 w-3.5" /> DHCP
+              </button>
+              <div className="border-t" />
+              <button
+                type="button"
+                onClick={() => {
+                  setOpen(false);
+                  onSyncAll();
+                }}
+                className={itemCls}
+              >
+                <RefreshCw className="h-3.5 w-3.5" /> All
+              </button>
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ─── Subnet Detail Panel (right pane) ────────────────────────────────────────
 
 function SubnetDetail({
@@ -2391,6 +2485,59 @@ function SubnetDetail({
     })),
   });
   const allPools = allPoolQueries.flatMap((q) => q.data ?? []);
+
+  // Sync leases for every unique DHCP server that backs a scope in this
+  // subnet. Multiple scopes on the same server are deduped so we don't
+  // round-trip the same WinRM target twice. Errors are aggregated so one
+  // failing server doesn't mask the others.
+  const syncDhcpMut = useMutation({
+    mutationFn: async () => {
+      const serverIds = Array.from(
+        new Set(
+          dhcpScopes
+            .map((sc) => sc.server_id)
+            .filter((id): id is string => typeof id === "string"),
+        ),
+      );
+      const results = await Promise.allSettled(
+        serverIds.map((id) => dhcpApi.syncLeasesNow(id)),
+      );
+      const errors: string[] = [];
+      let removed = 0;
+      let ipamRevoked = 0;
+      for (const r of results) {
+        if (r.status === "fulfilled") {
+          removed += r.value.removed ?? 0;
+          ipamRevoked += r.value.ipam_revoked ?? 0;
+        } else {
+          errors.push(String((r.reason as Error)?.message ?? r.reason));
+        }
+      }
+      return { removed, ipamRevoked, errors };
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["addresses", subnet.id] });
+      qc.invalidateQueries({ queryKey: ["dhcp-leases"] });
+      qc.invalidateQueries({ queryKey: ["dhcp-scopes-subnet", subnet.id] });
+      qc.invalidateQueries({ queryKey: ["dns-sync-summary", subnet.id] });
+    },
+  });
+
+  // Manual refresh — bust every query the subnet panel consumes. Broad
+  // keys (``dhcp-pools``, ``dhcp-leases``) match all per-scope variants
+  // by prefix and are cheap to re-run.
+  const refreshSubnet = () => {
+    qc.invalidateQueries({ queryKey: ["addresses", subnet.id] });
+    qc.invalidateQueries({ queryKey: ["dhcp-scopes-subnet", subnet.id] });
+    qc.invalidateQueries({ queryKey: ["dhcp-pools"] });
+    qc.invalidateQueries({ queryKey: ["dhcp-leases"] });
+    qc.invalidateQueries({ queryKey: ["dns-sync-summary", subnet.id] });
+    qc.invalidateQueries({
+      queryKey: ["dns-sync-preview", "subnet", subnet.id],
+    });
+    qc.invalidateQueries({ queryKey: ["effective-dns-subnet", subnet.id] });
+    qc.invalidateQueries({ queryKey: ["subnet-aliases", subnet.id] });
+  };
 
   function ipPoolInfo(addr: IPAddress): { type: string; name: string } | null {
     const ipParts = String(addr.address).split(".").map(Number);
@@ -2596,13 +2743,23 @@ function SubnetDetail({
               })()}
           </div>
           <div className="flex flex-shrink-0 items-center gap-2">
+            <SyncMenu
+              hasDhcp={dhcpScopes.length > 0}
+              isPending={syncDhcpMut.isPending}
+              onSyncDns={() => setShowDnsSync(true)}
+              onSyncDhcp={() => syncDhcpMut.mutate()}
+              onSyncAll={() => {
+                setShowDnsSync(true);
+                syncDhcpMut.mutate();
+              }}
+            />
             <button
-              onClick={() => setShowDnsSync(true)}
-              title="Compare IPAM-managed DNS records against the actual DB and reconcile any drift"
+              onClick={refreshSubnet}
+              title="Refresh address list, DHCP scopes, and DNS drift status"
               className="flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
             >
-              <Globe2 className="h-3.5 w-3.5" />
-              Sync DNS
+              <RefreshCw className="h-3.5 w-3.5" />
+              Refresh
             </button>
             <button
               onClick={() => setShowOrphans(true)}

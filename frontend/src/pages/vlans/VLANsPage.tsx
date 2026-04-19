@@ -4,6 +4,7 @@ import {
   Router as RouterIcon,
   Plus,
   Pencil,
+  RefreshCw,
   Trash2,
   X,
   Tag,
@@ -86,14 +87,27 @@ type Selection =
   | null;
 
 export function VLANsPage() {
+  const qc = useQueryClient();
   const [selection, setSelection] = useState<Selection>(null);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [showCreateRouter, setShowCreateRouter] = useState(false);
 
-  const { data: routers = [], isLoading } = useQuery({
+  const {
+    data: routers = [],
+    isLoading,
+    isFetching,
+  } = useQuery({
     queryKey: ["vlans", "routers"],
     queryFn: vlansApi.listRouters,
   });
+
+  // Broad invalidate — ``["vlans"]`` is a prefix for router list,
+  // per-router vlan lists, and per-vlan detail queries. Also clears
+  // subnet-by-vlan so the VLAN detail pane re-fetches.
+  const refreshVlans = () => {
+    qc.invalidateQueries({ queryKey: ["vlans"] });
+    qc.invalidateQueries({ queryKey: ["subnets-by-vlan"] });
+  };
 
   function toggleExpand(id: string) {
     setExpanded((prev) => {
@@ -110,13 +124,25 @@ export function VLANsPage() {
       <aside className="w-72 flex-shrink-0 border-r bg-card overflow-y-auto">
         <div className="flex items-center justify-between px-3 py-2 border-b">
           <h2 className="text-sm font-semibold">Routers</h2>
-          <button
-            onClick={() => setShowCreateRouter(true)}
-            title="New Router"
-            className="rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
-          >
-            <Plus className="h-4 w-4" />
-          </button>
+          <div className="flex items-center gap-1">
+            <button
+              onClick={refreshVlans}
+              disabled={isFetching}
+              title="Refresh routers, VLANs, and subnet-by-VLAN data"
+              className="rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground disabled:opacity-50"
+            >
+              <RefreshCw
+                className={cn("h-4 w-4", isFetching && "animate-spin")}
+              />
+            </button>
+            <button
+              onClick={() => setShowCreateRouter(true)}
+              title="New Router"
+              className="rounded p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+            >
+              <Plus className="h-4 w-4" />
+            </button>
+          </div>
         </div>
         <div className="p-2 space-y-1">
           {isLoading && (

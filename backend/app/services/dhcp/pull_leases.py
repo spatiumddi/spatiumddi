@@ -4,7 +4,7 @@ Today this path is exercised by the Windows DHCP read-only driver (Path
 A — WinRM + PowerShell), but the shape is driver-agnostic: any driver
 that implements ``get_leases`` can plug in.
 
-**Semantics — additive + refresh only:**
+**Semantics — set-reconcile (upsert + absence-delete):**
 
  * Upsert one ``DHCPLease`` row per ``(server_id, ip_address)`` seen on
    the wire. New rows are marked ``state="active"``; existing active
@@ -14,10 +14,18 @@ that implements ``get_leases`` can plug in.
    ``status="dhcp"`` and ``auto_from_lease=True`` — but only if the
    lease IP falls within a known ``Subnet.network``. IPs outside any
    managed subnet are tracked as leases but not mirrored.
- * **Never deletes anything.** The existing ``dhcp_lease_cleanup`` beat
-   task handles stale expiry (``state="active"`` + ``expires_at`` past
-   grace → ``expired`` + auto_from_lease IPAM row removed). That sweep
-   covers both agent-reported and poll-imported leases uniformly.
+ * **Any active lease we previously tracked for this server that did
+   NOT appear in the wire response is gone from the DHCP server** —
+   an admin deleted it, or it was released + cleaned up on the server
+   before we polled. Delete the ``DHCPLease`` row and, if we created
+   the IPAM mirror (``auto_from_lease=True``), drop that too. The
+   driver's ``get_leases`` is the ground truth; absence means deleted.
+
+The time-based ``dhcp_lease_cleanup`` sweep continues to handle leases
+that drift past ``expires_at`` without being polled (e.g., between
+polls, or when lease pull is disabled). The two mechanisms overlap
+harmlessly: expiry sweeps anything the pull missed, pull deletes
+anything the sweep hasn't seen yet.
 
 Per CLAUDE.md non-negotiable #9, the whole operation is idempotent: a
 second run over the same wire state is a no-op (the dedup key is
@@ -53,8 +61,10 @@ class PullLeasesResult:
     server_leases: int = 0  # count returned by the driver
     imported: int = 0  # new DHCPLease rows inserted
     refreshed: int = 0  # existing DHCPLease rows updated in place
+    removed: int = 0  # DHCPLease rows dropped because they vanished from the wire
     ipam_created: int = 0  # new IPAddress rows mirrored
     ipam_refreshed: int = 0  # existing auto_from_lease rows bumped
+    ipam_revoked: int = 0  # auto_from_lease IPAddress rows deleted alongside removed leases
     out_of_scope: int = 0  # leases whose IP isn't in any subnet
     # Topology counters (populated when the driver supports get_scopes).
     scopes_imported: int = 0  # new DHCPScope rows added
@@ -131,11 +141,6 @@ async def pull_leases_from_server(
         return result
 
     result.server_leases = len(wire)
-    if not wire:
-        if apply:
-            server.last_sync_at = datetime.now(UTC)
-            await db.flush()
-        return result
 
     scope_cache = await _load_scope_cache(db, server.id)
 
@@ -252,6 +257,38 @@ async def pull_leases_from_server(
                     ip=ip,
                     error=str(exc),
                 )
+
+    # Absence-delete: any active lease we have for this server that did
+    # NOT appear in the wire response was removed on the DHCP server
+    # (admin purge, manual release, etc). Drop the DB row and any IPAM
+    # mirror we created. Manually-allocated IPAM rows (auto_from_lease
+    # False) are intentionally left alone — the operator owns those.
+    wire_ips = {
+        lease.get("ip_address") for lease in wire if lease.get("ip_address")
+    }
+    stale_q = select(DHCPLease).where(
+        DHCPLease.server_id == server.id,
+        DHCPLease.state == "active",
+    )
+    if wire_ips:
+        stale_q = stale_q.where(~DHCPLease.ip_address.in_(wire_ips))
+    stale_leases = list((await db.execute(stale_q)).scalars().all())
+    for stale in stale_leases:
+        mirror = (
+            await db.execute(
+                select(IPAddress).where(
+                    IPAddress.address == stale.ip_address,
+                    IPAddress.auto_from_lease.is_(True),
+                )
+            )
+        ).scalar_one_or_none()
+        if mirror is not None:
+            if apply:
+                await db.delete(mirror)
+            result.ipam_revoked += 1
+        if apply:
+            await db.delete(stale)
+        result.removed += 1
 
     if apply:
         server.last_sync_at = now

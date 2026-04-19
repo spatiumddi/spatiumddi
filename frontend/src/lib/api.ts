@@ -2163,8 +2163,10 @@ export interface DHCPLeaseSyncResult {
   server_leases: number;
   imported: number;
   refreshed: number;
+  removed: number;
   ipam_created: number;
   ipam_refreshed: number;
+  ipam_revoked: number;
   out_of_scope: number;
   scopes_imported: number;
   scopes_refreshed: number;

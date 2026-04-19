@@ -82,8 +82,10 @@ async def _run_pull() -> dict[str, Any]:
             total_server_leases = 0
             total_imported = 0
             total_refreshed = 0
+            total_removed = 0
             total_ipam_created = 0
             total_ipam_refreshed = 0
+            total_ipam_revoked = 0
             total_out_of_scope = 0
             total_scopes_imported = 0
             total_scopes_refreshed = 0
@@ -112,8 +114,10 @@ async def _run_pull() -> dict[str, Any]:
                 total_server_leases += result.server_leases
                 total_imported += result.imported
                 total_refreshed += result.refreshed
+                total_removed += result.removed
                 total_ipam_created += result.ipam_created
                 total_ipam_refreshed += result.ipam_refreshed
+                total_ipam_revoked += result.ipam_revoked
                 total_out_of_scope += result.out_of_scope
                 total_scopes_imported += result.scopes_imported
                 total_scopes_refreshed += result.scopes_refreshed
@@ -124,7 +128,14 @@ async def _run_pull() -> dict[str, Any]:
 
             ps.dhcp_pull_leases_last_run_at = now
 
-            if total_imported or total_refreshed or total_ipam_created or errors:
+            if (
+                total_imported
+                or total_refreshed
+                or total_removed
+                or total_ipam_created
+                or total_ipam_revoked
+                or errors
+            ):
                 db.add(
                     AuditLog(
                         user_display_name="<system>",
@@ -139,8 +150,10 @@ async def _run_pull() -> dict[str, Any]:
                             "server_leases": total_server_leases,
                             "imported": total_imported,
                             "refreshed": total_refreshed,
+                            "removed": total_removed,
                             "ipam_created": total_ipam_created,
                             "ipam_refreshed": total_ipam_refreshed,
+                            "ipam_revoked": total_ipam_revoked,
                             "out_of_scope": total_out_of_scope,
                             "scopes_imported": total_scopes_imported,
                             "scopes_refreshed": total_scopes_refreshed,
@@ -159,8 +172,10 @@ async def _run_pull() -> dict[str, Any]:
                 server_leases=total_server_leases,
                 imported=total_imported,
                 refreshed=total_refreshed,
+                removed=total_removed,
                 ipam_created=total_ipam_created,
                 ipam_refreshed=total_ipam_refreshed,
+                ipam_revoked=total_ipam_revoked,
                 out_of_scope=total_out_of_scope,
                 scopes_imported=total_scopes_imported,
                 scopes_refreshed=total_scopes_refreshed,
@@ -175,8 +190,10 @@ async def _run_pull() -> dict[str, Any]:
                 "server_leases": total_server_leases,
                 "imported": total_imported,
                 "refreshed": total_refreshed,
+                "removed": total_removed,
                 "ipam_created": total_ipam_created,
                 "ipam_refreshed": total_ipam_refreshed,
+                "ipam_revoked": total_ipam_revoked,
                 "out_of_scope": total_out_of_scope,
                 "scopes_imported": total_scopes_imported,
                 "scopes_refreshed": total_scopes_refreshed,

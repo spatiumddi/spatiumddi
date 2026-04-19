@@ -1584,6 +1584,19 @@ function ZoneDetailView({
         <div className="flex items-center gap-2">
           <button
             className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-muted"
+            onClick={() =>
+              qc.invalidateQueries({ queryKey: ["dns-records", zone.id] })
+            }
+            disabled={isFetching}
+            title="Reload the record list from SpatiumDDI (does not re-query the DNS server)"
+          >
+            <RefreshCw
+              className={`h-3.5 w-3.5 ${isFetching ? "animate-spin" : ""}`}
+            />{" "}
+            Refresh
+          </button>
+          <button
+            className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-muted"
             onClick={() => setShowImport(true)}
           >
             <Upload className="h-3.5 w-3.5" /> Import

@@ -202,8 +202,10 @@ class SyncLeasesResponse(BaseModel):
     server_leases: int
     imported: int
     refreshed: int
+    removed: int = 0
     ipam_created: int
     ipam_refreshed: int
+    ipam_revoked: int = 0
     out_of_scope: int
     scopes_imported: int = 0
     scopes_refreshed: int = 0
@@ -497,8 +499,10 @@ async def sync_leases_now(server_id: uuid.UUID, db: DB, user: SuperAdmin) -> Syn
             "server_leases": result.server_leases,
             "imported": result.imported,
             "refreshed": result.refreshed,
+            "removed": result.removed,
             "ipam_created": result.ipam_created,
             "ipam_refreshed": result.ipam_refreshed,
+            "ipam_revoked": result.ipam_revoked,
             "out_of_scope": result.out_of_scope,
             "scopes_imported": result.scopes_imported,
             "scopes_refreshed": result.scopes_refreshed,
@@ -513,8 +517,10 @@ async def sync_leases_now(server_id: uuid.UUID, db: DB, user: SuperAdmin) -> Syn
         server_leases=result.server_leases,
         imported=result.imported,
         refreshed=result.refreshed,
+        removed=result.removed,
         ipam_created=result.ipam_created,
         ipam_refreshed=result.ipam_refreshed,
+        ipam_revoked=result.ipam_revoked,
         out_of_scope=result.out_of_scope,
         scopes_imported=result.scopes_imported,
         scopes_refreshed=result.scopes_refreshed,

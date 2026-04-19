@@ -3467,9 +3467,7 @@ async def update_address(
             new_zone_id = uuid.UUID(body.dns_zone_id) if body.dns_zone_id else None
         else:
             new_zone_id = ip.forward_zone_id or (
-                await _resolve_effective_zone(db, subnet_for_check)
-                if subnet_for_check
-                else None
+                await _resolve_effective_zone(db, subnet_for_check) if subnet_for_check else None
             )
         warnings = await _check_ip_collisions(
             db,
