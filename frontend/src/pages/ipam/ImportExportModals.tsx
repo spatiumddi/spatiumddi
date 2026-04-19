@@ -17,6 +17,10 @@ import {
   type Subnet,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
+import {
+  MODAL_BACKDROP_CLS,
+  useDraggableModal,
+} from "@/components/ui/use-draggable-modal";
 
 // ─── Import Modal ────────────────────────────────────────────────────────────
 
@@ -45,6 +49,8 @@ export function ImportModal({
     skipped: number;
     blocks: number;
   } | null>(null);
+
+  const { dialogStyle, dragHandleProps } = useDraggableModal(onClose);
 
   async function handlePreview() {
     if (!file || !spaceId) return;
@@ -96,9 +102,18 @@ export function ImportModal({
   }
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-2 sm:p-4">
-      <div className="flex max-h-[90vh] w-full max-w-[95vw] sm:max-w-[760px] flex-col rounded-lg bg-background shadow-xl">
-        <div className="flex items-center justify-between border-b p-4">
+    <div className={MODAL_BACKDROP_CLS}>
+      <div
+        className="flex max-h-[90vh] w-full max-w-[95vw] sm:max-w-[760px] flex-col rounded-lg bg-background shadow-xl"
+        style={dialogStyle}
+      >
+        <div
+          {...dragHandleProps}
+          className={cn(
+            "flex items-center justify-between border-b p-4",
+            dragHandleProps.className,
+          )}
+        >
           <h2 className="flex items-center gap-2 text-base font-semibold">
             <Upload className="h-4 w-4" /> Import IPAM data
           </h2>
@@ -386,6 +401,8 @@ export function AddressImportModal({
   const [committed, setCommitted] =
     useState<AddressImportCommitResponse | null>(null);
 
+  const { dialogStyle, dragHandleProps } = useDraggableModal(onClose);
+
   async function handlePreview() {
     if (!file) return;
     setBusy(true);
@@ -431,9 +448,18 @@ export function AddressImportModal({
   }
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-2 sm:p-4">
-      <div className="flex max-h-[90vh] w-full max-w-[95vw] sm:max-w-[760px] flex-col rounded-lg bg-background shadow-xl">
-        <div className="flex items-center justify-between border-b p-4">
+    <div className={MODAL_BACKDROP_CLS}>
+      <div
+        className="flex max-h-[90vh] w-full max-w-[95vw] sm:max-w-[760px] flex-col rounded-lg bg-background shadow-xl"
+        style={dialogStyle}
+      >
+        <div
+          {...dragHandleProps}
+          className={cn(
+            "flex items-center justify-between border-b p-4",
+            dragHandleProps.className,
+          )}
+        >
           <h2 className="flex items-center gap-2 text-base font-semibold">
             <Upload className="h-4 w-4" /> Import IP addresses into{" "}
             <span className="font-mono text-sm">{subnet.network}</span>

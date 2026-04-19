@@ -55,6 +55,11 @@ import {
 import { cn } from "@/lib/utils";
 import { useStickyLocation } from "@/lib/stickyLocation";
 import { useSessionState } from "@/lib/useSessionState";
+import { Modal } from "@/components/ui/modal";
+import {
+  MODAL_BACKDROP_CLS,
+  useDraggableModal,
+} from "@/components/ui/use-draggable-modal";
 import {
   ImportModal,
   ExportButton,
@@ -300,42 +305,6 @@ function CustomFieldsSection({
 }
 
 // ─── Modal helpers ────────────────────────────────────────────────────────────
-
-function Modal({
-  title,
-  onClose,
-  children,
-  wide,
-}: {
-  title: string;
-  onClose: () => void;
-  children: React.ReactNode;
-  wide?: boolean;
-}) {
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-2 sm:p-4">
-      <div
-        className={cn(
-          "w-full rounded-lg border bg-card p-4 sm:p-6 shadow-lg max-h-[90vh] overflow-y-auto",
-          // Desktop caps, but always fit in the viewport on mobile.
-          wide ? "sm:max-w-2xl" : "sm:max-w-md",
-          "max-w-[95vw]",
-        )}
-      >
-        <div className="mb-4 flex items-center justify-between">
-          <h2 className="text-base font-semibold">{title}</h2>
-          <button
-            onClick={onClose}
-            className="rounded p-1 text-muted-foreground hover:text-foreground"
-          >
-            <X className="h-4 w-4" />
-          </button>
-        </div>
-        {children}
-      </div>
-    </div>
-  );
-}
 
 function Field({
   label,
@@ -4029,10 +3998,21 @@ function DnsSyncModal({
     setter(items.every((k) => set.has(k)) ? new Set() : new Set(items));
   }
 
+  const { dialogStyle, dragHandleProps } = useDraggableModal(onClose);
+
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-2 sm:p-4">
-      <div className="w-full max-w-[95vw] sm:max-w-3xl rounded-lg border bg-card shadow-lg flex flex-col max-h-[85vh]">
-        <div className="flex items-center justify-between border-b px-5 py-3">
+    <div className={MODAL_BACKDROP_CLS}>
+      <div
+        className="w-full max-w-[95vw] sm:max-w-3xl rounded-lg border bg-card shadow-lg flex flex-col max-h-[85vh]"
+        style={dialogStyle}
+      >
+        <div
+          {...dragHandleProps}
+          className={cn(
+            "flex items-center justify-between border-b px-5 py-3",
+            dragHandleProps.className,
+          )}
+        >
           <div>
             <h2 className="text-base font-semibold">
               DNS Sync — {scope.label}

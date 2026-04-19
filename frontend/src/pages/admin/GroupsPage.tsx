@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Pencil, Plus, Trash2, X } from "lucide-react";
+import { Pencil, Plus, Trash2 } from "lucide-react";
 import {
   groupsApi,
   rolesApi,
@@ -12,6 +12,7 @@ import {
   type InternalGroupUpdate,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
+import { Modal } from "@/components/ui/modal";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -29,40 +30,6 @@ function Field({
         {label}
       </label>
       {children}
-    </div>
-  );
-}
-
-function Modal({
-  title,
-  onClose,
-  children,
-  wide,
-}: {
-  title: string;
-  onClose: () => void;
-  children: React.ReactNode;
-  wide?: boolean;
-}) {
-  return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40">
-      <div
-        className={cn(
-          "w-full rounded-lg border bg-card p-6 shadow-lg",
-          wide ? "max-w-2xl" : "max-w-md",
-        )}
-      >
-        <div className="mb-4 flex items-center justify-between">
-          <h2 className="text-base font-semibold">{title}</h2>
-          <button
-            onClick={onClose}
-            className="rounded p-1 text-muted-foreground hover:text-foreground"
-          >
-            <X className="h-4 w-4" />
-          </button>
-        </div>
-        {children}
-      </div>
     </div>
   );
 }

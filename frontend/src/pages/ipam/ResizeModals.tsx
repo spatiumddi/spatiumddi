@@ -20,6 +20,11 @@ import { useMemo, useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { AlertCircle, AlertTriangle, CheckCircle2, X } from "lucide-react";
 import {
+  MODAL_BACKDROP_CLS,
+  useDraggableModal,
+} from "@/components/ui/use-draggable-modal";
+import { cn } from "@/lib/utils";
+import {
   formatApiError,
   ipamApi,
   type BlockResizeCommitResponse,
@@ -140,10 +145,20 @@ function ModalShell({
   children: React.ReactNode;
   footer: React.ReactNode;
 }) {
+  const { dialogStyle, dragHandleProps } = useDraggableModal(onClose);
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-2 sm:p-4">
-      <div className="flex max-h-[90vh] w-full max-w-[95vw] sm:max-w-[760px] flex-col rounded-lg bg-background shadow-xl">
-        <div className="flex items-center justify-between border-b p-4">
+    <div className={MODAL_BACKDROP_CLS}>
+      <div
+        className="flex max-h-[90vh] w-full max-w-[95vw] sm:max-w-[760px] flex-col rounded-lg bg-background shadow-xl"
+        style={dialogStyle}
+      >
+        <div
+          {...dragHandleProps}
+          className={cn(
+            "flex items-center justify-between border-b p-4",
+            dragHandleProps.className,
+          )}
+        >
           <h2 className="text-base font-semibold">{title}</h2>
           <button
             onClick={onClose}

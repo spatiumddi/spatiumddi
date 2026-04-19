@@ -401,9 +401,7 @@ async def _load_dynamic_pool_ranges(
     return out
 
 
-def _ip_int_in_dynamic_pool(
-    ip_int: int, ranges: list[tuple[int, int]]
-) -> bool:
+def _ip_int_in_dynamic_pool(ip_int: int, ranges: list[tuple[int, int]]) -> bool:
     return any(s <= ip_int <= e for s, e in ranges)
 
 
