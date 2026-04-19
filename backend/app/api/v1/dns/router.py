@@ -2357,19 +2357,38 @@ async def bulk_delete_records(
         for r in targets
     ]
 
-    # One driver round trip for agentless; N queued rows for agent-based
-    # (the agent flushes them on its next long-poll).
+    # One driver round trip per chunk for agentless; N queued rows for
+    # agent-based (the agent flushes them on its next long-poll).
     try:
-        await enqueue_record_ops_batch(db, zone, ops)
-    except Exception as exc:  # noqa: BLE001 — wire / auth failure on the whole batch
+        op_rows = await enqueue_record_ops_batch(db, zone, ops)
+    except Exception as exc:  # noqa: BLE001 — whole-batch wire / auth failure
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail=f"Bulk delete dispatch failed on zone {zone.name}: {exc}",
         ) from exc
 
-    # One audit row per deleted record — same granularity as the singular
-    # path, so the audit log stays complete.
-    for rec in targets:
+    # Per-op state determines the DB delete. A wire delete that came back
+    # failed must NOT remove the DB row — if we delete blindly the user
+    # sees "deleted" in the UI but the record is still published, and
+    # the next "Sync with server" pulls the zombie back.
+    deleted = 0
+    for rec, op_row in zip(targets, op_rows, strict=True):
+        if op_row is None:
+            skipped.append(
+                {
+                    "record_id": str(rec.id),
+                    "reason": "no primary configured for zone — wire delete skipped",
+                }
+            )
+            continue
+        if op_row.state != "applied":
+            skipped.append(
+                {
+                    "record_id": str(rec.id),
+                    "reason": f"wire delete failed: {op_row.last_error or 'unknown'}",
+                }
+            )
+            continue
         db.add(
             AuditLog(
                 user_id=current_user.id,
@@ -2383,9 +2402,10 @@ async def bulk_delete_records(
             )
         )
         await db.delete(rec)
+        deleted += 1
 
     await db.commit()
-    return BulkDeleteRecordsResponse(deleted=len(targets), skipped=skipped)
+    return BulkDeleteRecordsResponse(deleted=deleted, skipped=skipped)
 
 
 # ── Bulk zone import / export ───────────────────────────────────────────────

@@ -2839,11 +2839,30 @@ async def _apply_dns_sync(
                 for r in recs
             ]
             try:
-                await enqueue_record_ops_batch(db, zone, ops)
-            except Exception as exc:  # noqa: BLE001 — surface as per-record errors
+                op_rows = await enqueue_record_ops_batch(db, zone, ops)
+            except Exception as exc:  # noqa: BLE001 — whole-batch failure
                 errors.append(f"batch delete on {zone.name}: {exc}")
                 continue
-            for r in recs:
+
+            # Honor per-op state. A failed wire op must NOT remove the
+            # DB row — otherwise the UI tells the user "deleted" but the
+            # record is still published on the DNS server, and a later
+            # "Sync with server" pulls the zombie back into IPAM. Only
+            # state=="applied" (or a zone-less orphan with no wire op to
+            # begin with) is safe to delete locally.
+            for r, op_row in zip(recs, op_rows, strict=True):
+                if op_row is None:
+                    errors.append(
+                        f"{r.record_type} {r.name}.{zone.name}: "
+                        "no primary configured for zone — wire delete skipped"
+                    )
+                    continue
+                if op_row.state != "applied":
+                    errors.append(
+                        f"{r.record_type} {r.name}.{zone.name}: "
+                        f"wire delete failed — {op_row.last_error or 'unknown'}"
+                    )
+                    continue
                 try:
                     linked_ip = (
                         ips_by_id.get(r.ip_address_id) if r.ip_address_id is not None else None

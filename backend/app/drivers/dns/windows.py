@@ -75,12 +75,22 @@ _WINRM_UNSUPPORTED_RECORD_TYPES = frozenset({"TLSA"})
 # Upper bound on ops bundled into a single WinRM round-trip in the batch
 # dispatcher (``apply_record_changes``). WinRM HTTP ``MaxEnvelopeSize``
 # defaults to 500KB (500 000 bytes, half a megabyte-ish). At ~1KB per
-# emitted PowerShell op (zone guard + cmdlet + try/catch + JSON result
-# entry) 200 ops fits comfortably, with plenty of headroom for pathological
-# zone / record names. Bumping this is safe on an admin-reconfigured Windows
-# host (``winrm set winrm/config @{MaxEnvelopeSizekb="2048"}``) but keep
-# the shipped default conservative.
-_WINRM_BATCH_SIZE = 200
+# WinRM constraint: ``pywinrm.run_ps`` dispatches via ``powershell
+# -encodedcommand <base64>`` as a single CMD.EXE command line, capped
+# at 8191 chars by Windows. The minified wrapper below measures ~2000
+# raw chars (all eight record types + op dispatch), which costs ~5350
+# chars of cmdline budget before any ops. Each op adds ~160 raw chars
+# (~430 cmdline chars) once JSON-escaped + UTF-16-LE + base64'd.
+# Empirically **6 ops fit with realistic data**; 7 trips the CMD limit
+# ("The command line is too long"). Measured via
+# ``_ps_apply_record_batch(...)`` in the dev container.
+#
+# For 40 records that's 7 round trips — 6× faster than singular
+# dispatch with minimal added complexity. **To go higher**, switch
+# pywinrm for pypsrp: PSRP uses the WSMan Runspace protocol instead
+# of CMD.EXE and removes the 8K ceiling entirely. Tracked as a
+# follow-up (would yield ~100 ops/batch on the same envelope settings).
+_WINRM_BATCH_SIZE = 6
 
 
 def _format_rdata(r: RecordData) -> str:
@@ -910,73 +920,105 @@ if (-not (Get-DnsServerZone -Name '{zone}' -ErrorAction SilentlyContinue)) {{
 
 
 def _ps_apply_record_batch(changes: Sequence[RecordChange]) -> str:
-    """Render a single PowerShell script that applies every change in ``changes``.
+    """Render one PowerShell script that applies every change in ``changes``.
 
-    Each input ``RecordChange`` is serialised into a small object
-    ``{change_index, script}`` where ``script`` is the exact PowerShell
-    snippet the singular path would run (``_ps_apply_record``). We then
-    base64-encode the list as JSON (same escape-sidestep trick the DHCP
-    ``apply_scope`` path uses), loop over it in PS with a ``try / catch``
-    per op, and emit one JSON-per-op to a result array. The final script
-    emits the results via ``ConvertTo-Json -Compress``.
+    The earlier version of this function embedded a full per-op PS
+    snippet inside the JSON payload. That bloated each op to ~700 chars
+    and, once JSON-escaped + base64'd + UTF-16-LE-encoded + base64'd
+    again for ``powershell.exe -EncodedCommand``, a 30-op batch blew
+    through the Windows command-line length cap ("The filename or
+    extension is too long" / ``wsmanfault_code: 2147942606``).
 
-    Why one script per chunk (not per op): the PowerShell parser cost
-    and the WinRM setup/teardown are both per-invocation. One invocation
-    carrying 200 ops is orders of magnitude faster than 200 invocations
-    carrying one.
+    This version keeps the payload to data only (~120 chars per op):
+    short-key JSON with ``{i, op, z, n, t, v, ttl, pr, w, p}``. The
+    wrapper holds **one** copy of the per-type cmdlet dispatch and calls
+    it in a loop. That brings a 30-op batch to ~4KB raw / ~12KB encoded
+    — well under any Windows cmdline limit — and makes 100+ op batches
+    feasible on a stock host.
 
     ``$ErrorActionPreference = 'Continue'`` at the top ensures a per-op
-    throw from one cmdlet doesn't abort the enclosing script — the
-    try/catch records the error into the result array, the loop moves
-    on. Chunk-wide script errors (syntax, base64 decode) still raise
-    from ``_run_ps`` and propagate to the caller.
+    throw from one cmdlet doesn't abort the enclosing script: the
+    try/catch records the error into the result array and the loop
+    moves on. Chunk-wide script errors (syntax, base64 decode) still
+    raise from ``_run_ps`` and propagate.
     """
     ops: list[dict[str, Any]] = []
     for i, change in enumerate(changes):
+        rtype = change.record.record_type.upper()
+        name = change.record.name if change.record.name not in ("", "@") else "@"
         ops.append(
             {
-                "change_index": i,
-                "name": change.record.name or "@",
-                "type": change.record.record_type.upper(),
+                "i": i,
                 "op": change.op,
-                "script": _ps_apply_record(change),
+                "z": (change.zone_name or "").rstrip("."),
+                "n": name,
+                "t": rtype,
+                "v": change.record.value or "",
+                "ttl": int(change.record.ttl or 3600),
+                "pr": int(change.record.priority or 0),
+                "w": int(change.record.weight or 0),
+                "p": int(change.record.port or 0),
             }
         )
-    blob = json.dumps(ops).encode("utf-8")
+    blob = json.dumps(ops, separators=(",", ":")).encode("utf-8")
     payload_b64 = base64.b64encode(blob).decode("ascii")
 
-    # The PS outer script: decode JSON, iterate, capture per-op result.
-    # Each iteration runs the inline snippet via ``Invoke-Expression`` on
-    # a here-string — the snippet itself already has its own ``Get-...
-    # -ErrorAction Stop`` flows for failure, which we catch at this outer
-    # level. That keeps the per-op script generator (``_ps_apply_record``)
-    # unchanged: it works identically in singular and batch paths.
-    return f"""
-$ErrorActionPreference = 'Continue'
-$payload = [System.Text.Encoding]::UTF8.GetString(
-    [System.Convert]::FromBase64String('{payload_b64}'))
-$ops = $payload | ConvertFrom-Json
-$results = @()
-foreach ($op in $ops) {{
-    $entry = [ordered]@{{
-        change_index = [int]$op.change_index
-        name         = "$($op.name)"
-        type         = "$($op.type)"
-        op           = "$($op.op)"
-        ok           = $false
-        error        = $null
-    }}
-    try {{
-        Invoke-Expression -Command $op.script | Out-Null
-        $entry.ok = $true
-    }} catch {{
-        $entry.ok = $false
-        $entry.error = "$($_.Exception.Message)"
-    }}
-    $results += (New-Object PSObject -Property $entry)
-}}
-$results | ConvertTo-Json -Compress -Depth 3
-""".strip()
+    # Script aggressively minified. ``pywinrm.run_ps`` base64-encodes
+    # with UTF-16-LE then sends via ``powershell -encodedcommand <b64>``
+    # as a single CMD.EXE command line — hard-capped at 8191 chars by
+    # Windows. Base64 costs ×1.33, UTF-16-LE costs ×2, so each raw
+    # script char eats ~2.67 chars of command-line budget. Budget works
+    # out to ~3050 raw chars total. The wrapper below is ~1000 chars;
+    # with ~130 chars per op in JSON that leaves room for ~15 ops per
+    # batch on stock Windows. Set ``_WINRM_BATCH_SIZE`` accordingly.
+    return (
+        "$E='Continue'\n"
+        "$p=[Text.Encoding]::UTF8.GetString("
+        f"[Convert]::FromBase64String('{payload_b64}'))\n"
+        "$r=@()\n"
+        "($p|ConvertFrom-Json)|%{\n"
+        ' $e=[ordered]@{change_index=[int]$_.i;name="$($_.n)";'
+        'type="$($_.t)";op="$($_.op)";ok=$false;error=$null}\n'
+        " try{\n"
+        "  $z=$_.z;$n=$_.n;$t=$_.t;$v=$_.v;"
+        "$tl=[TimeSpan]::FromSeconds([int]$_.ttl)\n"
+        "  $ze=[bool](Get-DnsServerZone -Name $z -EA SilentlyContinue)\n"
+        "  if($_.op -eq 'delete'){\n"
+        "   if($ze){$x=Get-DnsServerResourceRecord -ZoneName $z -Name $n"
+        " -RRType $t -EA SilentlyContinue;"
+        "if($x){$x|Remove-DnsServerResourceRecord -ZoneName $z -Force -EA Stop}}\n"
+        "  }elseif($_.op -eq 'create' -or $_.op -eq 'update'){\n"
+        '   if(!$ze){throw "Zone $z not found"}\n'
+        "   if($_.op -eq 'update'){$x=Get-DnsServerResourceRecord -ZoneName $z"
+        " -Name $n -RRType $t -EA SilentlyContinue;"
+        "if($x){$x|Remove-DnsServerResourceRecord -ZoneName $z -Force -EA Stop}}\n"
+        "   switch($t){\n"
+        "    'A'{Add-DnsServerResourceRecordA -ZoneName $z -Name $n"
+        " -IPv4Address $v -TimeToLive $tl -EA Stop}\n"
+        "    'AAAA'{Add-DnsServerResourceRecordAAAA -ZoneName $z -Name $n"
+        " -IPv6Address $v -TimeToLive $tl -EA Stop}\n"
+        "    'CNAME'{Add-DnsServerResourceRecordCName -ZoneName $z -Name $n"
+        " -HostNameAlias $v -TimeToLive $tl -EA Stop}\n"
+        "    'PTR'{Add-DnsServerResourceRecordPtr -ZoneName $z -Name $n"
+        " -PtrDomainName $v -TimeToLive $tl -EA Stop}\n"
+        "    'MX'{Add-DnsServerResourceRecordMX -ZoneName $z -Name $n"
+        " -MailExchange $v -Preference([int]$_.pr) -TimeToLive $tl -EA Stop}\n"
+        "    'SRV'{Add-DnsServerResourceRecord -ZoneName $z -Name $n -Srv"
+        " -DomainName $v -Priority([int]$_.pr) -Weight([int]$_.w)"
+        " -Port([int]$_.p) -TimeToLive $tl -EA Stop}\n"
+        "    'NS'{Add-DnsServerResourceRecord -ZoneName $z -Name $n -NS"
+        " -NameServer $v -TimeToLive $tl -EA Stop}\n"
+        "    'TXT'{Add-DnsServerResourceRecord -ZoneName $z -Name $n -Txt"
+        " -DescriptiveText $v -TimeToLive $tl -EA Stop}\n"
+        '    default{throw "Unsupported type $t"}\n'
+        "   }\n"
+        '  }else{throw "Unsupported op"}\n'
+        "  $e.ok=$true\n"
+        ' }catch{$e.error="$($_.Exception.Message)"}\n'
+        " $r+=(New-Object PSObject -Property $e)\n"
+        "}\n"
+        "$r|ConvertTo-Json -Compress -Depth 3"
+    )
 
 
 def _parse_record_batch_results(

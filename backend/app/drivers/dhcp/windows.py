@@ -165,13 +165,14 @@ $result | ConvertTo-Json -Compress -Depth 5
 
 # Upper bound on ops bundled into one WinRM round-trip in the batch
 # dispatchers (``apply_reservations`` / ``remove_reservations`` /
-# ``apply_exclusions``). WinRM HTTP ``MaxEnvelopeSize`` defaults to
-# 500KB; each DHCP op serialises to well under 1KB of embedded JSON
-# (scope id + MAC + IP + hostname + description), so 200 fits with
-# headroom. Matches the DNS-side constant so operators have one knob
-# to tune for site-specific WinRM configs. See
-# ``backend/app/drivers/dns/windows.py`` for the reasoning.
-_WINRM_BATCH_SIZE = 200
+# ``apply_exclusions``). The real limit isn't WinRM's envelope (500KB
+# default) but PowerShell's ``-EncodedCommand`` command-line length cap,
+# which trips at ~40-60KB of base64 on stock Windows. DHCP ops serialise
+# to ~1KB of embedded JSON + PS snippet per op (scope id + MAC + IP +
+# hostname + description + cmdlet wrapper), so 30 ops × 1KB fits the
+# cmdline cap with headroom. Matches the DNS-side constant; see
+# ``backend/app/drivers/dns/windows.py`` for the full reasoning.
+_WINRM_BATCH_SIZE = 30
 
 
 # Windows option IDs → canonical SpatiumDDI option names (matches
