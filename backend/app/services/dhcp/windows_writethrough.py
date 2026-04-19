@@ -24,6 +24,8 @@ path and never hit these helpers.
 from __future__ import annotations
 
 import ipaddress
+from collections import defaultdict
+from collections.abc import Sequence
 from typing import Any
 
 import structlog
@@ -32,6 +34,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.drivers.dhcp import get_driver
+from app.drivers.dhcp.base import RemoveReservationItem
 from app.models.dhcp import DHCPPool, DHCPScope, DHCPServer, DHCPStaticAssignment
 from app.models.ipam import Subnet
 
@@ -285,10 +288,85 @@ async def push_static_change(
         raise WindowsPushError(str(exc)) from exc
 
 
+async def push_statics_bulk_delete(
+    db: AsyncSession, statics: Sequence[DHCPStaticAssignment]
+) -> None:
+    """Batch-delete many reservations on Windows DHCP in one round-trip per server.
+
+    Groups ``statics`` by ``(server, scope)`` and calls the driver's
+    plural ``remove_reservations`` once per group. Non-Windows servers
+    fall through to the ABC's sequential default which loops over the
+    singular ``remove_reservation`` — so Kea / ISC / any future driver
+    handle this call identically to the loop-of-singular pattern they
+    already support.
+
+    Per-op failures on Windows surface as one ``WindowsPushError`` with
+    all per-op errors concatenated — the caller rolls back the whole DB
+    transaction rather than letting partial success slip through (same
+    contract as ``push_static_change``).
+    """
+    if not statics:
+        return
+
+    # Group by (server, scope) so each driver call is against one server.
+    # Keyed on IDs; collect the actual objects on the side so we can
+    # resolve the CIDR once per scope.
+    grouped: dict[tuple[Any, Any], list[DHCPStaticAssignment]] = defaultdict(list)
+    scope_cache: dict[Any, DHCPScope] = {}
+    server_cache: dict[Any, DHCPServer] = {}
+
+    for st in statics:
+        scope = scope_cache.get(st.scope_id)
+        if scope is None:
+            scope = await db.get(DHCPScope, st.scope_id)
+            if scope is None:
+                continue
+            scope_cache[st.scope_id] = scope
+        server = server_cache.get(scope.server_id)
+        if server is None:
+            server = await _load_server(db, scope.server_id)
+            if server is None:
+                continue
+            server_cache[scope.server_id] = server
+        if not await _is_windows(server):
+            continue
+        grouped[(server.id, scope.id)].append(st)
+
+    for (server_id, scope_id), rows in grouped.items():
+        server = server_cache[server_id]
+        scope = scope_cache[scope_id]
+        net = await _scope_cidr(db, scope)
+        driver = get_driver(server.driver)
+        items = [
+            RemoveReservationItem(
+                scope_id=str(net.network_address),
+                mac_address=str(st.mac_address),
+            )
+            for st in rows
+        ]
+        try:
+            results = await driver.remove_reservations(server, items=items)  # type: ignore[attr-defined]
+        except Exception as exc:  # noqa: BLE001 — whole-batch failure
+            logger.warning(
+                "windows_dhcp_bulk_delete_batch_failed",
+                server=str(server.id),
+                scope=str(scope.id),
+                count=len(items),
+                error=str(exc),
+            )
+            raise WindowsPushError(str(exc)) from exc
+        errors = [r.error for r in results if not r.ok and r.error]
+        if errors:
+            first = errors[0]
+            more = f" (+{len(errors) - 1} more)" if len(errors) > 1 else ""
+            raise WindowsPushError(f"{first}{more}")
+
+
 __all__ = [
     "WindowsPushError",
     "push_pool_change",
     "push_scope_delete",
     "push_scope_upsert",
     "push_static_change",
+    "push_statics_bulk_delete",
 ]

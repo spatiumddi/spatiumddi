@@ -30,7 +30,9 @@ Not yet (follow-up work):
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
+from collections.abc import Sequence
 from typing import Any
 
 import structlog
@@ -41,6 +43,7 @@ from app.drivers.dns.base import (
     DNSDriver,
     EffectiveBlocklistData,
     RecordChange,
+    RecordChangeResult,
     RecordData,
     ServerOptions,
     ZoneData,
@@ -67,6 +70,17 @@ _SUPPORTED_RECORD_TYPES = (
 # credentials are configured — dispatching to Path B for them would
 # raise ``ValueError`` at write time.
 _WINRM_UNSUPPORTED_RECORD_TYPES = frozenset({"TLSA"})
+
+
+# Upper bound on ops bundled into a single WinRM round-trip in the batch
+# dispatcher (``apply_record_changes``). WinRM HTTP ``MaxEnvelopeSize``
+# defaults to 500KB (500 000 bytes, half a megabyte-ish). At ~1KB per
+# emitted PowerShell op (zone guard + cmdlet + try/catch + JSON result
+# entry) 200 ops fits comfortably, with plenty of headroom for pathological
+# zone / record names. Bumping this is safe on an admin-reconfigured Windows
+# host (``winrm set winrm/config @{MaxEnvelopeSizekb="2048"}``) but keep
+# the shipped default conservative.
+_WINRM_BATCH_SIZE = 200
 
 
 def _format_rdata(r: RecordData) -> str:
@@ -216,6 +230,119 @@ class WindowsDNSDriver(DNSDriver):
             name=change.record.name,
             type=change.record.record_type,
         )
+
+    async def apply_record_changes(
+        self, server: Any, changes: Sequence[RecordChange]
+    ) -> list[RecordChangeResult]:
+        """Batched WinRM dispatch for many record changes against one server.
+
+        The singular ``apply_record_change`` path opens a fresh WinRM
+        session, ships one PowerShell cmdlet, and tears the session down
+        — roughly 1.5s of overhead per op. An 81-record "Sync with
+        servers" reconcile racks up to ~3 minutes that way. Batched
+        dispatch groups up to ``_WINRM_BATCH_SIZE`` ops into one
+        PowerShell script with ``$ErrorActionPreference = 'Continue'``
+        plus per-op ``try / catch``, sends it in a single round trip,
+        and parses per-op ``{ok, error}`` back out. Same 81 ops → one
+        round trip, ~5–10s.
+
+        Routing matches the singular path:
+
+        * WinRM-eligible ops (server has credentials AND record type is
+          not in ``_WINRM_UNSUPPORTED_RECORD_TYPES``) are partitioned
+          into chunks of ``_WINRM_BATCH_SIZE`` and dispatched as a
+          single script per chunk.
+        * Everything else (TLSA on any server, or any record on a
+          credentials-less server) falls through to the RFC 2136 path.
+          RFC 2136 ops are small and independent — we run them
+          concurrently with ``asyncio.gather`` instead of trying to
+          batch the wire protocol.
+
+        Per-op failures surface as ``RecordChangeResult(ok=False)`` —
+        the caller decides whether to treat that as a hard error. Only
+        whole-batch failures (WinRM auth, connection refused,
+        PowerShell parse error in our generated script) raise.
+        """
+        if not changes:
+            return []
+
+        winrm_eligible: list[tuple[int, RecordChange]] = []
+        rfc2136_ops: list[tuple[int, RecordChange]] = []
+
+        has_creds = bool(getattr(server, "credentials_encrypted", None))
+        for idx, change in enumerate(changes):
+            rtype = change.record.record_type.upper()
+            if rtype not in _SUPPORTED_RECORD_TYPES:
+                # Preserve the singular-path error semantics for the
+                # unsupported case: a hard failure on the whole op, not a
+                # silent skip. Surface it as a per-op failed result so the
+                # rest of the batch still runs.
+                rfc2136_ops.append((idx, change))
+                continue
+            if has_creds and rtype not in _WINRM_UNSUPPORTED_RECORD_TYPES:
+                winrm_eligible.append((idx, change))
+            else:
+                rfc2136_ops.append((idx, change))
+
+        # Pre-size the result list so we can splat batch results back by
+        # original index without caring about dispatch order.
+        results: list[RecordChangeResult | None] = [None] * len(changes)
+
+        # RFC 2136 dispatch — run in parallel. Each op is its own socket
+        # to port 53 and a small, independent nsupdate; there's nothing
+        # to batch at the wire level.
+        async def _one_rfc2136(idx: int, change: RecordChange) -> None:
+            try:
+                await self._apply_record_change_rfc2136(server, change)
+                results[idx] = RecordChangeResult(ok=True, change=change)
+            except Exception as exc:  # noqa: BLE001 — per-op isolation
+                results[idx] = RecordChangeResult(ok=False, change=change, error=str(exc))
+
+        if rfc2136_ops:
+            await asyncio.gather(*(_one_rfc2136(i, c) for i, c in rfc2136_ops))
+
+        # WinRM dispatch — chunked into single-script round trips.
+        if winrm_eligible:
+            creds = _load_credentials(server)
+            chunks = [
+                winrm_eligible[i : i + _WINRM_BATCH_SIZE]
+                for i in range(0, len(winrm_eligible), _WINRM_BATCH_SIZE)
+            ]
+            total_chunks = len(chunks)
+            for chunk_index, chunk in enumerate(chunks):
+                batch_changes = [c for _, c in chunk]
+                script = _ps_apply_record_batch(batch_changes)
+                raw = await asyncio.to_thread(_run_ps, server, creds, script)
+                batch_results = _parse_record_batch_results(raw, batch_changes)
+                ok_count = sum(1 for r in batch_results if r.ok)
+                failed_count = len(batch_results) - ok_count
+                logger.info(
+                    "dns_apply_record_changes_batch",
+                    server=str(getattr(server, "id", "")),
+                    count=len(batch_results),
+                    ok_count=ok_count,
+                    failed_count=failed_count,
+                    chunk_index=chunk_index,
+                    chunks=total_chunks,
+                )
+                for (orig_idx, _), res in zip(chunk, batch_results, strict=True):
+                    results[orig_idx] = res
+
+        # Any ``None`` at this point is a bug — defensively coerce to a
+        # failure result so we never return a list with holes.
+        final: list[RecordChangeResult] = []
+        for idx, entry in enumerate(results):
+            if entry is None:
+                final.append(
+                    RecordChangeResult(
+                        ok=False,
+                        change=changes[idx],
+                        error="internal: result slot not populated",
+                    )
+                )
+            else:
+                final.append(entry)
+        return final
 
     async def apply_zone_change(self, server: Any, zone: Any, op: str) -> None:
         """Create / delete a zone on the Windows DC over WinRM.
@@ -780,6 +907,144 @@ if (-not (Get-DnsServerZone -Name '{zone}' -ErrorAction SilentlyContinue)) {{
         # the RFC 2136 path does with update.delete(...) + update.add(...).
         return f"{delete}\n{create_with_zone_guard}"
     raise ValueError(f"windows_dns._ps_apply_record: bad op {change.op!r}")
+
+
+def _ps_apply_record_batch(changes: Sequence[RecordChange]) -> str:
+    """Render a single PowerShell script that applies every change in ``changes``.
+
+    Each input ``RecordChange`` is serialised into a small object
+    ``{change_index, script}`` where ``script`` is the exact PowerShell
+    snippet the singular path would run (``_ps_apply_record``). We then
+    base64-encode the list as JSON (same escape-sidestep trick the DHCP
+    ``apply_scope`` path uses), loop over it in PS with a ``try / catch``
+    per op, and emit one JSON-per-op to a result array. The final script
+    emits the results via ``ConvertTo-Json -Compress``.
+
+    Why one script per chunk (not per op): the PowerShell parser cost
+    and the WinRM setup/teardown are both per-invocation. One invocation
+    carrying 200 ops is orders of magnitude faster than 200 invocations
+    carrying one.
+
+    ``$ErrorActionPreference = 'Continue'`` at the top ensures a per-op
+    throw from one cmdlet doesn't abort the enclosing script — the
+    try/catch records the error into the result array, the loop moves
+    on. Chunk-wide script errors (syntax, base64 decode) still raise
+    from ``_run_ps`` and propagate to the caller.
+    """
+    ops: list[dict[str, Any]] = []
+    for i, change in enumerate(changes):
+        ops.append(
+            {
+                "change_index": i,
+                "name": change.record.name or "@",
+                "type": change.record.record_type.upper(),
+                "op": change.op,
+                "script": _ps_apply_record(change),
+            }
+        )
+    blob = json.dumps(ops).encode("utf-8")
+    payload_b64 = base64.b64encode(blob).decode("ascii")
+
+    # The PS outer script: decode JSON, iterate, capture per-op result.
+    # Each iteration runs the inline snippet via ``Invoke-Expression`` on
+    # a here-string — the snippet itself already has its own ``Get-...
+    # -ErrorAction Stop`` flows for failure, which we catch at this outer
+    # level. That keeps the per-op script generator (``_ps_apply_record``)
+    # unchanged: it works identically in singular and batch paths.
+    return f"""
+$ErrorActionPreference = 'Continue'
+$payload = [System.Text.Encoding]::UTF8.GetString(
+    [System.Convert]::FromBase64String('{payload_b64}'))
+$ops = $payload | ConvertFrom-Json
+$results = @()
+foreach ($op in $ops) {{
+    $entry = [ordered]@{{
+        change_index = [int]$op.change_index
+        name         = "$($op.name)"
+        type         = "$($op.type)"
+        op           = "$($op.op)"
+        ok           = $false
+        error        = $null
+    }}
+    try {{
+        Invoke-Expression -Command $op.script | Out-Null
+        $entry.ok = $true
+    }} catch {{
+        $entry.ok = $false
+        $entry.error = "$($_.Exception.Message)"
+    }}
+    $results += (New-Object PSObject -Property $entry)
+}}
+$results | ConvertTo-Json -Compress -Depth 3
+""".strip()
+
+
+def _parse_record_batch_results(
+    raw: str, batch_changes: Sequence[RecordChange]
+) -> list[RecordChangeResult]:
+    """Zip PS per-op output back onto ``batch_changes`` by ``change_index``.
+
+    Windows' ``ConvertTo-Json -Compress`` emits:
+
+    * empty string when the results array is empty (no ops ran),
+    * a single JSON object when exactly one op ran,
+    * a JSON array otherwise.
+
+    Normalise to a list keyed by ``change_index`` so duplicates in the
+    input batch (same name/type/op appearing twice — possible if the
+    upstream dispatcher doesn't dedup) match by position and not by
+    ambiguous identity. Missing indices become failed results with a
+    synthetic error so the output is always the same length as the
+    input batch.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return [
+            RecordChangeResult(ok=False, change=c, error="batch returned no output")
+            for c in batch_changes
+        ]
+
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        logger.warning("windows_dns_record_batch_parse_failed", raw=text[:400], error=str(exc))
+        return [
+            RecordChangeResult(ok=False, change=c, error=f"batch result parse failed: {exc}")
+            for c in batch_changes
+        ]
+
+    items: list[dict[str, Any]] = parsed if isinstance(parsed, list) else [parsed]
+
+    by_index: dict[int, RecordChangeResult] = {}
+    for item in items:
+        raw_idx = item.get("change_index")
+        if raw_idx is None:
+            continue
+        try:
+            idx = int(raw_idx)
+        except (TypeError, ValueError):
+            continue
+        if not (0 <= idx < len(batch_changes)):
+            continue
+        ok = bool(item.get("ok"))
+        error_raw = item.get("error")
+        by_index[idx] = RecordChangeResult(
+            ok=ok,
+            change=batch_changes[idx],
+            error=None if ok or error_raw in (None, "") else str(error_raw),
+        )
+
+    return [
+        by_index.get(
+            i,
+            RecordChangeResult(
+                ok=False,
+                change=change,
+                error="internal: no result returned for op",
+            ),
+        )
+        for i, change in enumerate(batch_changes)
+    ]
 
 
 async def test_winrm_credentials(host: str, credentials: dict[str, Any]) -> tuple[bool, str]:

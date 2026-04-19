@@ -15,6 +15,7 @@ from __future__ import annotations
 import hashlib
 import json
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from typing import Any, Literal
@@ -200,6 +201,27 @@ class RecordChange:
     op_id: str = ""  # caller-supplied UUID for ACK tracking
 
 
+@dataclass(frozen=True)
+class RecordChangeResult:
+    """Per-op outcome returned by ``DNSDriver.apply_record_changes``.
+
+    Batch dispatch never raises for a single failed record — one bad
+    record shouldn't poison the rest of the batch. Instead, each op gets
+    a ``RecordChangeResult`` with ``ok=False`` and ``error`` populated;
+    the caller decides whether to surface as a 500, a partial success, or
+    to ignore (e.g. an idempotent delete that the server reports as
+    no-op). Whole-batch failures (connection refused, auth, malformed
+    script) still raise from the driver.
+
+    ``change`` is the original input echoed back verbatim so callers can
+    zip results with their source list without re-tracking identity.
+    """
+
+    ok: bool
+    change: RecordChange
+    error: str | None = None
+
+
 # ── Driver abstract base ──────────────────────────────────────────────────
 
 
@@ -239,6 +261,30 @@ class DNSDriver(ABC):
     async def apply_record_change(self, server: Any, change: RecordChange) -> None:
         """Apply a single record change to the daemon (loopback RFC 2136 / API)."""
 
+    async def apply_record_changes(
+        self, server: Any, changes: Sequence[RecordChange]
+    ) -> list[RecordChangeResult]:
+        """Apply many record changes to the same server.
+
+        Default implementation: sequential loop calling ``apply_record_change``
+        for each op. Per-op exceptions are caught and surfaced as
+        ``RecordChangeResult(ok=False)`` so one failure doesn't abort the
+        batch. Agent-based drivers (BIND9) inherit this unchanged — there's
+        no connection setup to amortise, so the loop is just fine.
+
+        Agentless drivers that pay a per-call connection cost (Windows DNS
+        over WinRM) override this to ship the whole batch in one round
+        trip; see ``WindowsDNSDriver.apply_record_changes``.
+        """
+        results: list[RecordChangeResult] = []
+        for change in changes:
+            try:
+                await self.apply_record_change(server, change)
+                results.append(RecordChangeResult(ok=True, change=change))
+            except Exception as exc:  # noqa: BLE001 — per-op isolation
+                results.append(RecordChangeResult(ok=False, change=change, error=str(exc)))
+        return results
+
     @abstractmethod
     async def reload_config(self, server: Any) -> None:
         """Instruct the daemon to re-read its full config (e.g. ``rndc reconfig``)."""
@@ -265,6 +311,7 @@ __all__ = [
     "DNSDriver",
     "EffectiveBlocklistData",
     "RecordChange",
+    "RecordChangeResult",
     "RecordData",
     "ServerOptions",
     "TrustAnchorData",

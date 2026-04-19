@@ -261,43 +261,62 @@ async def _additive_push(
     apply: bool,
 ) -> PushResult:
     """For every DB row whose key isn't on the wire, send a create op via
-    the driver's ``apply_record_change``. Errors are collected, not raised,
-    so one bad record doesn't abort the whole sync."""
+    the driver. Errors are collected, not raised, so one bad record
+    doesn't abort the whole sync.
+
+    Dispatch uses ``apply_record_changes`` (plural) so agentless drivers
+    (Windows DNS) can ship the whole batch in one WinRM round trip
+    instead of one per record. The ABC default falls back to a
+    sequential loop for agent-based drivers (BIND9) where the control
+    plane never calls the record writer anyway.
+    """
     on_wire_keys = {_key(r, zone.name) for r in on_wire}
 
-    candidates = 0
-    pushed = 0
     pushed_records: list[dict[str, Any]] = []
     push_errors: list[str] = []
 
     target_serial = bump_zone_serial(zone) if apply else 0
 
+    # Build the candidate list — DB rows whose (name, type, value) isn't
+    # already on the wire. Keeping this as a list (not a generator) so we
+    # can zip the driver's per-op results back onto the source rows by
+    # index after dispatch.
+    candidate_rows: list[DNSRecord] = []
     for row in db_rows:
         rtype = row.record_type.upper()
         if rtype not in _PUSHABLE_TYPES:
             continue
         if _key(row, zone.name) in on_wire_keys:
             continue
-        candidates += 1
-        if not apply:
-            pushed += 1
+        candidate_rows.append(row)
+
+    candidates = len(candidate_rows)
+
+    if not apply:
+        for row in candidate_rows:
             pushed_records.append(
                 {
                     "name": row.name,
                     "fqdn": row.fqdn,
-                    "record_type": rtype,
+                    "record_type": row.record_type.upper(),
                     "value": row.value,
                     "ttl": row.ttl,
                 }
             )
-            continue
+        return PushResult(
+            candidates=candidates,
+            pushed=candidates,
+            pushed_records=pushed_records,
+            push_errors=push_errors,
+        )
 
-        change = RecordChange(
+    changes: list[RecordChange] = [
+        RecordChange(
             op="create",
             zone_name=zone.name,
             record=RecordData(
                 name=row.name,
-                record_type=rtype,
+                record_type=row.record_type.upper(),
                 value=row.value,
                 ttl=row.ttl,
                 priority=row.priority,
@@ -306,8 +325,35 @@ async def _additive_push(
             ),
             target_serial=target_serial,
         )
-        try:
-            await driver.apply_record_change(primary, change)
+        for row in candidate_rows
+    ]
+
+    if not changes:
+        return PushResult(
+            candidates=0, pushed=0, pushed_records=pushed_records, push_errors=push_errors
+        )
+
+    try:
+        results = await driver.apply_record_changes(primary, changes)
+    except Exception as exc:  # noqa: BLE001 — whole-batch failure, surface once
+        logger.warning(
+            "dns.push_drift_batch_failed",
+            zone=zone.name,
+            server=str(primary.id),
+            count=len(changes),
+            error=str(exc),
+        )
+        return PushResult(
+            candidates=candidates,
+            pushed=0,
+            pushed_records=pushed_records,
+            push_errors=[f"batch failed: {exc}"],
+        )
+
+    pushed = 0
+    for row, result in zip(candidate_rows, results, strict=True):
+        rtype = row.record_type.upper()
+        if result.ok:
             pushed += 1
             pushed_records.append(
                 {
@@ -318,18 +364,18 @@ async def _additive_push(
                     "ttl": row.ttl,
                 }
             )
-        except Exception as exc:  # noqa: BLE001 — one bad record shouldn't poison the run
-            err = f"{row.name} {rtype}: {exc}"
-            logger.warning(
-                "dns.push_drift_failed",
-                zone=zone.name,
-                server=str(primary.id),
-                name=row.name,
-                record_type=rtype,
-                error=str(exc),
-            )
-            if len(push_errors) < 10:
-                push_errors.append(err)
+            continue
+        err = f"{row.name} {rtype}: {result.error}"
+        logger.warning(
+            "dns.push_drift_failed",
+            zone=zone.name,
+            server=str(primary.id),
+            name=row.name,
+            record_type=rtype,
+            error=result.error,
+        )
+        if len(push_errors) < 10:
+            push_errors.append(err)
 
     return PushResult(
         candidates=candidates,

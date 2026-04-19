@@ -47,13 +47,22 @@ import asyncio
 import base64
 import json
 import re
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from typing import Any
 
 import structlog
 
 from app.core.crypto import decrypt_dict
-from app.drivers.dhcp.base import ConfigBundle, DHCPDriver
+from app.drivers.dhcp.base import (
+    ConfigBundle,
+    DHCPDriver,
+    ExclusionItem,
+    ExclusionResult,
+    RemoveReservationItem,
+    ReservationItem,
+    ReservationResult,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -152,6 +161,17 @@ foreach ($s in $scopes) {
 }
 $result | ConvertTo-Json -Compress -Depth 5
 """
+
+
+# Upper bound on ops bundled into one WinRM round-trip in the batch
+# dispatchers (``apply_reservations`` / ``remove_reservations`` /
+# ``apply_exclusions``). WinRM HTTP ``MaxEnvelopeSize`` defaults to
+# 500KB; each DHCP op serialises to well under 1KB of embedded JSON
+# (scope id + MAC + IP + hostname + description), so 200 fits with
+# headroom. Matches the DNS-side constant so operators have one knob
+# to tune for site-specific WinRM configs. See
+# ``backend/app/drivers/dns/windows.py`` for the reasoning.
+_WINRM_BATCH_SIZE = 200
 
 
 # Windows option IDs → canonical SpatiumDDI option names (matches
@@ -399,6 +419,74 @@ Remove-DhcpServerv4ExclusionRange -ScopeId {_ps_literal(scope_id)} `
 """
         creds = _load_credentials(server)
         await asyncio.to_thread(_run_ps, server, creds, script)
+
+    # ── batch writes ───────────────────────────────────────────────────
+    #
+    # The singular ``apply_reservation`` / ``remove_reservation`` /
+    # ``apply_exclusion`` methods open a fresh WinRM session and ship
+    # one cmdlet per call — perfect for one-off UI edits but punishing
+    # for many-at-once paths (initial scope import, bulk static
+    # conversion, pool rewrites). These batch methods chunk up to
+    # ``_WINRM_BATCH_SIZE`` ops into a single PowerShell script per
+    # WinRM round trip and parse per-op ``{ok, error}`` back out.
+    #
+    # Per-op failures surface as ``ReservationResult(ok=False)`` — the
+    # caller decides whether to 500 or partial-success. Whole-batch
+    # errors (auth, connection refused, PS parse error) raise.
+    #
+    # Not offering ``apply_scopes`` (plural): scope edits arrive from
+    # the UI one at a time and the singular ``apply_scope`` already
+    # resets all options for that scope in one round-trip. The payoff
+    # for a plural would be marginal and the single-scope-per-UI-edit
+    # pattern makes per-scope error attribution cleaner.
+
+    async def apply_reservations(
+        self, server: Any, *, items: Sequence[ReservationItem]
+    ) -> list[ReservationResult]:
+        if not items:
+            return []
+        creds = _load_credentials(server)
+        return await _dispatch_dhcp_batch(
+            server=server,
+            creds=creds,
+            items=items,
+            op_name="apply_reservations",
+            per_op_ps=_ps_apply_reservation_snippet,
+            result_ctor=lambda ok, item, error: ReservationResult(ok=ok, item=item, error=error),
+            chunk_log="dhcp_apply_reservations_batch",
+        )
+
+    async def remove_reservations(
+        self, server: Any, *, items: Sequence[RemoveReservationItem]
+    ) -> list[ReservationResult]:
+        if not items:
+            return []
+        creds = _load_credentials(server)
+        return await _dispatch_dhcp_batch(
+            server=server,
+            creds=creds,
+            items=items,
+            op_name="remove_reservations",
+            per_op_ps=_ps_remove_reservation_snippet,
+            result_ctor=lambda ok, item, error: ReservationResult(ok=ok, item=item, error=error),
+            chunk_log="dhcp_remove_reservations_batch",
+        )
+
+    async def apply_exclusions(
+        self, server: Any, *, items: Sequence[ExclusionItem]
+    ) -> list[ExclusionResult]:
+        if not items:
+            return []
+        creds = _load_credentials(server)
+        return await _dispatch_dhcp_batch(
+            server=server,
+            creds=creds,
+            items=items,
+            op_name="apply_exclusions",
+            per_op_ps=_ps_apply_exclusion_snippet,
+            result_ctor=lambda ok, item, error: ExclusionResult(ok=ok, item=item, error=error),
+            chunk_log="dhcp_apply_exclusions_batch",
+        )
 
     # ── reads ──────────────────────────────────────────────────────────
     # (health_check continues below.)
@@ -831,6 +919,187 @@ async def test_winrm_credentials(host: str, credentials: dict[str, Any]) -> tupl
         return True, f"windows_dhcp reachable ({raw.strip()})"
     except Exception as exc:  # noqa: BLE001 — surface any transport/PS error verbatim
         return False, str(exc)
+
+
+# ── batch dispatch helpers ───────────────────────────────────────────
+#
+# Shared between apply_reservations / remove_reservations /
+# apply_exclusions. Each call site passes a ``per_op_ps`` callable that
+# emits the PowerShell snippet for a single op (matching the body of
+# the existing singular method minus its outer
+# ``$ErrorActionPreference = 'Stop'`` / "OK" wrapper). The dispatcher
+# wraps those snippets in a loop with per-op ``try / catch`` and ships
+# one PS script per chunk.
+
+
+def _ps_apply_reservation_snippet(item: ReservationItem) -> str:
+    """PS body for one ``apply_reservation`` op inside a batched script.
+
+    Same logic as the singular ``apply_reservation``: upsert keyed on
+    ClientId (MAC with dashes). No outer ``$ErrorActionPreference`` —
+    the batch wrapper sets 'Continue' at top-level and catches per-op.
+    """
+    client_id = item.mac_address.lower().replace(":", "-")
+    return f"""
+$scopeId  = {_ps_literal(item.scope_id)}
+$ip       = {_ps_literal(item.ip_address)}
+$clientId = {_ps_literal(client_id)}
+$name     = {_ps_literal(item.hostname)}
+$desc     = {_ps_literal(item.description)}
+
+$existing = Get-DhcpServerv4Reservation -ScopeId $scopeId -ErrorAction SilentlyContinue |
+    Where-Object {{ $_.ClientId -eq $clientId }}
+if ($existing) {{
+    Set-DhcpServerv4Reservation -ClientId $clientId -ScopeId $scopeId `
+        -IPAddress $ip -Name $name -Description $desc -ErrorAction Stop
+}} else {{
+    Add-DhcpServerv4Reservation -ScopeId $scopeId -IPAddress $ip `
+        -ClientId $clientId -Name $name -Description $desc -ErrorAction Stop
+}}
+""".strip()
+
+
+def _ps_remove_reservation_snippet(item: RemoveReservationItem) -> str:
+    """PS body for one ``remove_reservation`` op inside a batched script."""
+    client_id = item.mac_address.lower().replace(":", "-")
+    return f"""
+Remove-DhcpServerv4Reservation -ScopeId {_ps_literal(item.scope_id)} `
+    -ClientId {_ps_literal(client_id)} -ErrorAction SilentlyContinue
+""".strip()
+
+
+def _ps_apply_exclusion_snippet(item: ExclusionItem) -> str:
+    """PS body for one ``apply_exclusion`` op inside a batched script.
+
+    Mirrors the idempotent-add behaviour of the singular path: swallow
+    the "already exists" error so re-running a batch is safe.
+    """
+    return f"""
+try {{
+    Add-DhcpServerv4ExclusionRange -ScopeId {_ps_literal(item.scope_id)} `
+        -StartRange {_ps_literal(item.start_ip)} -EndRange {_ps_literal(item.end_ip)} `
+        -ErrorAction Stop
+}} catch {{
+    if ($_.Exception.Message -notmatch 'already') {{ throw }}
+}}
+""".strip()
+
+
+async def _dispatch_dhcp_batch(
+    *,
+    server: Any,
+    creds: dict[str, Any],
+    items: Sequence[Any],
+    op_name: str,
+    per_op_ps: Any,
+    result_ctor: Any,
+    chunk_log: str,
+) -> list[Any]:
+    """Chunk ``items`` into ``_WINRM_BATCH_SIZE`` groups, dispatch one
+    PowerShell script per group, and zip per-op results back.
+
+    Each op gets a JSON record ``{index, ok, error}``; we parse those
+    back and call ``result_ctor(ok, item, error)`` to build the
+    driver-typed per-op result. Any item missing from the PS output
+    (shouldn't happen, but be defensive) becomes a failed result with a
+    synthetic error message so the returned list length always matches
+    the input length.
+    """
+    chunks = [
+        list(items[i : i + _WINRM_BATCH_SIZE]) for i in range(0, len(items), _WINRM_BATCH_SIZE)
+    ]
+    total_chunks = len(chunks)
+    all_results: list[Any] = []
+
+    for chunk_index, chunk in enumerate(chunks):
+        payload: list[dict[str, Any]] = []
+        for idx, item in enumerate(chunk):
+            payload.append({"index": idx, "script": per_op_ps(item)})
+        payload_b64 = base64.b64encode(json.dumps(payload).encode("utf-8")).decode("ascii")
+
+        script = f"""
+$ErrorActionPreference = 'Continue'
+$payload = [System.Text.Encoding]::UTF8.GetString(
+    [System.Convert]::FromBase64String('{payload_b64}'))
+$ops = $payload | ConvertFrom-Json
+$results = @()
+foreach ($op in $ops) {{
+    $entry = [ordered]@{{
+        index = [int]$op.index
+        ok    = $false
+        error = $null
+    }}
+    try {{
+        Invoke-Expression -Command $op.script | Out-Null
+        $entry.ok = $true
+    }} catch {{
+        $entry.ok = $false
+        $entry.error = "$($_.Exception.Message)"
+    }}
+    $results += (New-Object PSObject -Property $entry)
+}}
+$results | ConvertTo-Json -Compress -Depth 3
+""".strip()
+
+        raw = await asyncio.to_thread(_run_ps, server, creds, script)
+        chunk_results = _parse_dhcp_batch_results(raw, chunk, result_ctor)
+        ok_count = sum(1 for r in chunk_results if r.ok)
+        failed_count = len(chunk_results) - ok_count
+        logger.info(
+            chunk_log,
+            server=str(getattr(server, "id", "")),
+            count=len(chunk_results),
+            ok_count=ok_count,
+            failed_count=failed_count,
+            chunk_index=chunk_index,
+            chunks=total_chunks,
+            op=op_name,
+        )
+        all_results.extend(chunk_results)
+
+    return all_results
+
+
+def _parse_dhcp_batch_results(raw: str, chunk: Sequence[Any], result_ctor: Any) -> list[Any]:
+    """Parse the ``ConvertTo-Json -Compress`` output from a batch script.
+
+    Same normalisation as the DNS side (empty string → single object →
+    array) and same index-keyed matching so duplicate items in the
+    input list don't collide.
+    """
+    text = (raw or "").strip()
+    if not text:
+        return [result_ctor(False, item, "batch returned no output") for item in chunk]
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        logger.warning("windows_dhcp_batch_parse_failed", raw=text[:400], error=str(exc))
+        return [result_ctor(False, item, f"batch result parse failed: {exc}") for item in chunk]
+    items_out: list[dict[str, Any]] = parsed if isinstance(parsed, list) else [parsed]
+
+    by_index: dict[int, Any] = {}
+    for out in items_out:
+        raw_idx = out.get("index")
+        if raw_idx is None:
+            continue
+        try:
+            idx = int(raw_idx)
+        except (TypeError, ValueError):
+            continue
+        if not (0 <= idx < len(chunk)):
+            continue
+        ok = bool(out.get("ok"))
+        error_raw = out.get("error")
+        by_index[idx] = result_ctor(
+            ok,
+            chunk[idx],
+            None if ok or error_raw in (None, "") else str(error_raw),
+        )
+
+    return [
+        by_index.get(i, result_ctor(False, chunk[i], "internal: no result returned for op"))
+        for i in range(len(chunk))
+    ]
 
 
 __all__ = ["WindowsDHCPReadOnlyDriver", "test_winrm_credentials"]

@@ -388,14 +388,39 @@ async def compute_subnet_dns_drift(db: AsyncSession, subnet_id: uuid.UUID) -> Dr
                         reason="default-gateway-name",
                     )
                 )
+        elif not forward_zone and ip_a_records:
+            # Forward zone was unassigned (or inherited to null) after A
+            # records were already published. No effective zone to match
+            # against → mark them stale so the user can delete them. Same
+            # intent as the ``no-forward-zone`` PTR branch below: keeps
+            # "Sync DNS" able to clean up after a zone disassociation even
+            # though the classifier otherwise has nothing to diff against.
+            for r in ip_a_records:
+                report.stale.append(
+                    StaleItem(
+                        record_id=r.id,
+                        record_type="A",
+                        zone_id=r.zone_id,
+                        zone_name="",
+                        name=r.name,
+                        value=r.value,
+                        reason="no-forward-zone",
+                    )
+                )
 
         # ── Reverse PTR ──────────────────────────────────────────────────────
-        if reverse_zone:
+        # Require BOTH zones: a PTR value has to be an FQDN, which means we
+        # need a forward zone to supply the domain. Without a forward zone,
+        # existing PTRs are stale (→ delete) rather than mismatched, because
+        # there's no valid target to rewrite them to. See: if you only guard
+        # on ``reverse_zone``, an un-assigned forward zone produces an
+        # "expected" value of ``hostname.`` (bare label, no FQDN), and the
+        # reconciler rewrites every PTR to that broken value instead of
+        # deleting them.
+        if reverse_zone and forward_zone:
             try:
                 exp_label, _ = _expected_ptr(str(ip.address), ip.hostname, reverse_zone.name)
-                exp_value = (
-                    ip.hostname + "." + (forward_zone.name.rstrip(".") if forward_zone else "")
-                ).rstrip(".") + "."
+                exp_value = (ip.hostname + "." + forward_zone.name.rstrip(".")).rstrip(".") + "."
             except ValueError:
                 continue
 
@@ -429,5 +454,21 @@ async def compute_subnet_dns_drift(db: AsyncSession, subnet_id: uuid.UUID) -> Dr
                                 expected_value=exp_value,
                             )
                         )
+        elif reverse_zone and not forward_zone:
+            # Forward zone was unassigned after PTRs were already published.
+            # There's no valid FQDN to point them at now — mark them stale
+            # so they get cleaned up when the user applies the sync.
+            for r in ip_ptr_records:
+                report.stale.append(
+                    StaleItem(
+                        record_id=r.id,
+                        record_type="PTR",
+                        zone_id=r.zone_id,
+                        zone_name=reverse_zone.name if r.zone_id == reverse_zone.id else "",
+                        name=r.name,
+                        value=r.value,
+                        reason="no-forward-zone",
+                    )
+                )
 
     return report

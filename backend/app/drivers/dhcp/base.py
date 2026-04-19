@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from typing import Any
@@ -132,6 +133,68 @@ class ConfigBundle:
         return "sha256:" + hashlib.sha256(blob).hexdigest()
 
 
+# ── Batch write items / results ─────────────────────────────────────────────
+#
+# These mirror the DNS side (``RecordChange`` / ``RecordChangeResult``) —
+# neutral input + output shapes so the service layer can dispatch many
+# ops as one call to the driver and the driver decides whether to ship
+# them one at a time (ABC default) or as a single chunked WinRM round
+# trip (Windows DHCP override).
+
+
+@dataclass(frozen=True)
+class ReservationItem:
+    """One reservation to upsert. Matches ``apply_reservation`` args."""
+
+    scope_id: str
+    ip_address: str
+    mac_address: str
+    hostname: str = ""
+    description: str = ""
+
+
+@dataclass(frozen=True)
+class RemoveReservationItem:
+    """One reservation to delete by (scope_id, mac_address)."""
+
+    scope_id: str
+    mac_address: str
+
+
+@dataclass(frozen=True)
+class ExclusionItem:
+    """One exclusion range to add."""
+
+    scope_id: str
+    start_ip: str
+    end_ip: str
+
+
+@dataclass(frozen=True)
+class ReservationResult:
+    """Per-op result from ``apply_reservations`` / ``remove_reservations``.
+
+    ``item`` is the input echoed back so callers can zip results with
+    their source list without re-tracking identity. Per-op failures
+    surface as ``ok=False`` with ``error`` populated; whole-batch
+    failures raise from the driver (auth, connection refused, PS
+    parse error) and never land here.
+    """
+
+    ok: bool
+    item: ReservationItem | RemoveReservationItem
+    error: str | None = None
+
+
+@dataclass(frozen=True)
+class ExclusionResult:
+    """Per-op result from ``apply_exclusions``."""
+
+    ok: bool
+    item: ExclusionItem
+    error: str | None = None
+
+
 # ── Driver abstract base ────────────────────────────────────────────────────
 
 
@@ -176,13 +239,91 @@ class DHCPDriver(ABC):
     def capabilities(self) -> dict[str, Any]:
         """Return a dict describing what this driver supports."""
 
+    # ── Optional per-object write APIs (Windows DHCP today) ────────────
+    #
+    # Agent-based drivers (Kea, ISC) configure the daemon through a
+    # full-bundle ``apply_config`` — per-object CRUD doesn't apply. Only
+    # the Windows driver overrides these. The default implementations
+    # raise ``NotImplementedError`` so a caller misrouting a write
+    # against a non-Windows server surfaces a clear error instead of
+    # silently no-oping.
+    #
+    # Batch counterparts (``apply_reservations`` etc.) default to a
+    # sequential loop over the singular method — so any driver that
+    # implements the singular method automatically inherits correct (if
+    # slow) bulk behaviour. Windows overrides these to ship each chunk
+    # in one WinRM round trip.
+
+    async def apply_reservations(
+        self, server: Any, *, items: Sequence[ReservationItem]
+    ) -> list[ReservationResult]:
+        """Upsert many DHCP reservations against ``server``.
+
+        Default: sequential loop over ``apply_reservation``. Windows DHCP
+        overrides to use a single chunked PowerShell script per WinRM
+        round trip.
+        """
+        results: list[ReservationResult] = []
+        for item in items:
+            try:
+                await self.apply_reservation(  # type: ignore[attr-defined]
+                    server,
+                    scope_id=item.scope_id,
+                    ip_address=item.ip_address,
+                    mac_address=item.mac_address,
+                    hostname=item.hostname,
+                    description=item.description,
+                )
+                results.append(ReservationResult(ok=True, item=item))
+            except Exception as exc:  # noqa: BLE001 — per-op isolation
+                results.append(ReservationResult(ok=False, item=item, error=str(exc)))
+        return results
+
+    async def remove_reservations(
+        self, server: Any, *, items: Sequence[RemoveReservationItem]
+    ) -> list[ReservationResult]:
+        """Delete many DHCP reservations by (scope_id, mac_address)."""
+        results: list[ReservationResult] = []
+        for item in items:
+            try:
+                await self.remove_reservation(  # type: ignore[attr-defined]
+                    server, scope_id=item.scope_id, mac_address=item.mac_address
+                )
+                results.append(ReservationResult(ok=True, item=item))
+            except Exception as exc:  # noqa: BLE001 — per-op isolation
+                results.append(ReservationResult(ok=False, item=item, error=str(exc)))
+        return results
+
+    async def apply_exclusions(
+        self, server: Any, *, items: Sequence[ExclusionItem]
+    ) -> list[ExclusionResult]:
+        """Add many exclusion ranges."""
+        results: list[ExclusionResult] = []
+        for item in items:
+            try:
+                await self.apply_exclusion(  # type: ignore[attr-defined]
+                    server,
+                    scope_id=item.scope_id,
+                    start_ip=item.start_ip,
+                    end_ip=item.end_ip,
+                )
+                results.append(ExclusionResult(ok=True, item=item))
+            except Exception as exc:  # noqa: BLE001 — per-op isolation
+                results.append(ExclusionResult(ok=False, item=item, error=str(exc)))
+        return results
+
 
 __all__ = [
     "STANDARD_OPTION_NAMES",
     "ClientClassDef",
     "ConfigBundle",
     "DHCPDriver",
+    "ExclusionItem",
+    "ExclusionResult",
     "PoolDef",
+    "RemoveReservationItem",
+    "ReservationItem",
+    "ReservationResult",
     "ScopeDef",
     "ServerOptionsDef",
     "StaticAssignmentDef",

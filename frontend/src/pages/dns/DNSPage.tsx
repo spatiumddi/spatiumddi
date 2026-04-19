@@ -293,6 +293,17 @@ function downloadBlob(
   URL.revokeObjectURL(url);
 }
 
+// UTC timestamp suffix used when the backend didn't send a Content-Disposition
+// filename (rare — every export endpoint sets it). Matches the backend's
+// "%Y%m%d-%H%M%S" format so fallback filenames sort alongside real ones.
+function _utcTimestampSuffix(): string {
+  return new Date()
+    .toISOString()
+    .slice(0, 19)
+    .replace(/[-:]/g, "")
+    .replace("T", "-");
+}
+
 // ── Import Zone Modal ────────────────────────────────────────────────────────
 
 function ImportZoneModal({
@@ -1451,8 +1462,11 @@ function ZoneDetailView({
   const [recFilter, setRecFilter] = useState({ name: "", type: "", value: "" });
 
   const handleExport = async () => {
-    const text = await dnsApi.exportZone(group.id, zone.id);
-    downloadBlob(text, `${zone.name.replace(/\.$/, "")}.zone`, "text/dns");
+    const { data, filename } = await dnsApi.exportZone(group.id, zone.id);
+    const name =
+      filename ??
+      `${zone.name.replace(/\.$/, "")}-${_utcTimestampSuffix()}.zone`;
+    downloadBlob(data, name, "text/dns");
   };
 
   // "Sync with server" — bi-directional additive sync against the zone's
@@ -1503,13 +1517,11 @@ function ZoneDetailView({
   );
   const [confirmBulkDelete, setConfirmBulkDelete] = useState(false);
   const bulkDeleteRecords = useMutation({
-    mutationFn: async (ids: string[]) => {
-      // No server-side bulk endpoint yet — fan out. Ignore individual failures
-      // so one bad row doesn't strand the rest (each has its own DDNS op).
-      await Promise.allSettled(
-        ids.map((id) => dnsApi.deleteRecord(group.id, zone.id, id)),
-      );
-    },
+    // Server-side bulk endpoint: one WinRM round trip for agentless
+    // drivers + a single zone-serial bump instead of N. Replaces the
+    // old Promise.allSettled fan-out.
+    mutationFn: (ids: string[]) =>
+      dnsApi.bulkDeleteRecords(group.id, zone.id, ids),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["dns-records", zone.id] });
       setSelectedRecords(new Set());
@@ -1571,16 +1583,16 @@ function ZoneDetailView({
         </div>
         <div className="flex items-center gap-2">
           <button
-            className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent"
+            className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-muted"
             onClick={() => setShowImport(true)}
           >
-            <Upload className="h-3 w-3" /> Import
+            <Upload className="h-3.5 w-3.5" /> Import
           </button>
           <button
-            className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent"
+            className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-muted"
             onClick={handleExport}
           >
-            <Download className="h-3 w-3" /> Export
+            <Download className="h-3.5 w-3.5" /> Export
           </button>
           <button
             className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent disabled:opacity-50"
@@ -3738,12 +3750,14 @@ function ZonesTab({
             </ContextMenuItem>
             <ContextMenuItem
               onSelect={async () => {
-                const text = await dnsApi.exportZone(group.id, z.id);
-                downloadBlob(
-                  text,
-                  `${z.name.replace(/\.$/, "")}.zone`,
-                  "text/dns",
+                const { data, filename } = await dnsApi.exportZone(
+                  group.id,
+                  z.id,
                 );
+                const name =
+                  filename ??
+                  `${z.name.replace(/\.$/, "")}-${_utcTimestampSuffix()}.zone`;
+                downloadBlob(data, name, "text/dns");
               }}
             >
               Export Zone File
@@ -3818,18 +3832,17 @@ function ZonesTab({
             )}
           </button>
           <button
-            className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent disabled:opacity-50"
+            className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-muted disabled:opacity-50"
             disabled={zones.length === 0}
             onClick={async () => {
-              const blob = await dnsApi.exportAllZones(group.id);
-              downloadBlob(
-                blob,
-                `dns-zones-${group.id}.zip`,
-                "application/zip",
-              );
+              const { data, filename } = await dnsApi.exportAllZones(group.id);
+              const name =
+                filename ??
+                `dns-zones-${group.id}-${_utcTimestampSuffix()}.zip`;
+              downloadBlob(data, name, "application/zip");
             }}
           >
-            <Download className="h-3 w-3" /> Export All
+            <Download className="h-3.5 w-3.5" /> Export All
           </button>
           <button
             className="flex items-center gap-1 rounded-md bg-primary px-2 py-1 text-xs text-primary-foreground hover:bg-primary/90"

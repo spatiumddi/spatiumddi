@@ -176,6 +176,150 @@ async def enqueue_record_op(
     return op_row
 
 
+async def enqueue_record_ops_batch(
+    db: AsyncSession,
+    zone: DNSZone,
+    ops: list[dict[str, Any]],
+) -> list[DNSRecordOp | None]:
+    """Batch counterpart to :func:`enqueue_record_op`.
+
+    Groups all ops for a single zone into one driver call when the zone's
+    primary is agentless — cuts an N-record sync from N WinRM round trips
+    to one. Agent-based primaries fall through to the per-op path since
+    they queue in the DB and the agent batches at poll time.
+
+    ``ops`` is a list of ``{op, record, target_serial?}`` dicts matching
+    the singular ``enqueue_record_op`` arg shape.
+
+    Returns one ``DNSRecordOp`` (or None on drop) per input op, in the
+    same order as ``ops``.
+    """
+    if not ops:
+        return []
+
+    primary = await resolve_primary_server(db, zone)
+    if primary is None:
+        logger.warning(
+            "record_op_batch_dropped_no_primary",
+            zone=zone.name,
+            group_id=str(zone.group_id),
+            count=len(ops),
+        )
+        return [None] * len(ops)
+
+    if not primary.is_enabled:
+        logger.warning(
+            "record_op_batch_dropped_server_disabled",
+            zone=zone.name,
+            server=str(primary.id),
+            driver=primary.driver,
+            count=len(ops),
+        )
+        return [None] * len(ops)
+
+    if not is_agentless(primary.driver):
+        # Agent-based: DB rows only; agent will batch at poll time.
+        return [
+            await enqueue_record_op(db, zone, o["op"], o["record"], o.get("target_serial"))
+            for o in ops
+        ]
+
+    return await _apply_agentless_batch(db, primary, zone, ops)
+
+
+async def _apply_agentless_batch(
+    db: AsyncSession,
+    server: DNSServer,
+    zone: DNSZone,
+    ops: list[dict[str, Any]],
+) -> list[DNSRecordOp | None]:
+    """Apply many record ops against an agentless server in one driver call.
+
+    Writes per-op DNSRecordOp rows (applied / failed) so the audit trail
+    matches what the singular path produces. A whole-batch exception
+    (WinRM auth failure, PS parse error in the generated script) marks
+    every row failed with the same error — per-op failures (a bad
+    record type for example) only mark their own row.
+    """
+    from app.drivers.dns.base import RecordChange, RecordData  # noqa: PLC0415
+
+    op_rows: list[DNSRecordOp] = []
+    for o in ops:
+        row = DNSRecordOp(
+            server_id=server.id,
+            zone_name=zone.name,
+            op=o["op"],
+            record=o["record"],
+            target_serial=o.get("target_serial"),
+            state="pending",
+        )
+        db.add(row)
+        op_rows.append(row)
+    await db.flush()
+
+    changes = [
+        RecordChange(
+            op=o["op"],  # type: ignore[arg-type]
+            zone_name=zone.name,
+            record=RecordData(
+                name=o["record"]["name"],
+                record_type=o["record"]["type"],
+                value=o["record"]["value"],
+                ttl=o["record"].get("ttl"),
+                priority=o["record"].get("priority"),
+                weight=o["record"].get("weight"),
+                port=o["record"].get("port"),
+            ),
+            target_serial=o.get("target_serial") or 0,
+        )
+        for o in ops
+    ]
+
+    driver = get_driver(server.driver)
+    try:
+        results = await driver.apply_record_changes(server, changes)
+    except Exception as exc:  # noqa: BLE001 — whole-batch wire/auth failure
+        logger.warning(
+            "record_op_batch_failed",
+            server=str(server.id),
+            driver=server.driver,
+            zone=zone.name,
+            count=len(op_rows),
+            error=str(exc),
+        )
+        err = str(exc)[:500]
+        for row in op_rows:
+            row.state = "failed"
+            row.attempts = 1
+            row.last_error = err
+        await db.flush()
+        return list(op_rows)
+
+    applied_count = 0
+    for row, result in zip(op_rows, results, strict=True):
+        row.attempts = 1
+        if result.ok:
+            row.state = "applied"
+            row.applied_at = datetime.now(UTC)
+            row.last_error = None
+            applied_count += 1
+        else:
+            row.state = "failed"
+            row.last_error = (result.error or "unknown")[:500]
+    await db.flush()
+
+    logger.info(
+        "record_op_batch_applied_agentless",
+        server=str(server.id),
+        driver=server.driver,
+        zone=zone.name,
+        total=len(results),
+        applied=applied_count,
+        failed=len(results) - applied_count,
+    )
+    return list(op_rows)
+
+
 async def ack_op(db: AsyncSession, op_id: str, result: str, message: str | None = None) -> None:
     """Mark an op applied (ok) or failed."""
     from datetime import UTC, datetime

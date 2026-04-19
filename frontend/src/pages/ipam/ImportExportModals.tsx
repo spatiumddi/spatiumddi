@@ -334,13 +334,13 @@ export function ExportButton({
     <div className="relative">
       <button
         onClick={() => setOpen((o) => !o)}
-        className="flex items-center gap-1 rounded border px-2 py-1 text-xs hover:bg-muted"
+        className="flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
         title="Export"
       >
         <Download className="h-3.5 w-3.5" /> {label}
       </button>
       {open && (
-        <div className="absolute right-0 z-40 mt-1 w-56 rounded border bg-background p-2 shadow-lg">
+        <div className="absolute right-0 z-40 mt-1 w-56 rounded-md border bg-background p-2 shadow-lg">
           <label className="mb-2 flex items-center gap-2 text-xs">
             <input
               type="checkbox"
@@ -595,7 +595,7 @@ export function SubnetImportExportButton({
           <ChevronDown className="h-3.5 w-3.5" />
         </button>
         {open && (
-          <div className="absolute right-0 z-40 mt-1 w-64 rounded border bg-background p-2 shadow-lg">
+          <div className="absolute right-0 z-40 mt-1 w-64 rounded-md border bg-background p-2 shadow-lg">
             <button
               onClick={() => {
                 setShowImport(true);

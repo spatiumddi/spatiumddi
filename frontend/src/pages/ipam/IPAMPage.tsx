@@ -20,6 +20,7 @@ import {
   Check,
   Upload,
   Globe2,
+  AlertTriangle,
   Filter,
   Lock,
 } from "lucide-react";
@@ -2218,6 +2219,15 @@ function SubnetDetail({
   const [showResizeSubnet, setShowResizeSubnet] = useState(false);
   const [showDnsSync, setShowDnsSync] = useState(false);
   const [showOrphans, setShowOrphans] = useState(false);
+
+  // Lightweight drift count for the banner — cheap enough to refetch on
+  // every subnet detail load. Invalidated when the user applies a sync,
+  // so the banner clears without a manual refresh.
+  const { data: dnsDriftSummary } = useQuery({
+    queryKey: ["dns-sync-summary", subnet.id],
+    queryFn: () => ipamApi.dnsSyncSummary(subnet.id),
+    refetchOnMount: "always",
+  });
   const [editingAddress, setEditingAddress] = useState<IPAddress | null>(null);
   const [showFilters, setShowFilters] = useState(false);
   const [activeSubnetTab, setActiveSubnetTab] = useState<
@@ -2605,6 +2615,36 @@ function SubnetDetail({
             </div>
           ))}
         </div>
+
+        {/* DNS drift banner — only shows when records exist out-of-sync
+            with IPAM's expected state. Clicking opens the Sync DNS modal.
+            The banner clears on its own once the user applies a sync. */}
+        {dnsDriftSummary && dnsDriftSummary.has_drift && (
+          <div className="border-t border-amber-500/40 bg-amber-500/10 px-6 py-2 text-xs">
+            <div className="flex items-center justify-between gap-3">
+              <div className="flex items-center gap-2 text-amber-900 dark:text-amber-200">
+                <AlertTriangle className="h-3.5 w-3.5 flex-shrink-0" />
+                <span>
+                  {dnsDriftSummary.total} DNS record
+                  {dnsDriftSummary.total === 1 ? "" : "s"} out of sync
+                  {dnsDriftSummary.stale > 0 &&
+                    ` · ${dnsDriftSummary.stale} stale`}
+                  {dnsDriftSummary.mismatched > 0 &&
+                    ` · ${dnsDriftSummary.mismatched} mismatched`}
+                  {dnsDriftSummary.missing > 0 &&
+                    ` · ${dnsDriftSummary.missing} missing`}
+                </span>
+              </div>
+              <button
+                onClick={() => setShowDnsSync(true)}
+                className="flex items-center gap-1 rounded-md border border-amber-500/50 bg-amber-500/20 px-2 py-0.5 text-xs font-medium text-amber-900 hover:bg-amber-500/30 dark:text-amber-200"
+              >
+                <Globe2 className="h-3 w-3" />
+                Open Sync DNS
+              </button>
+            </div>
+          </div>
+        )}
       </div>
 
       {/* Tabs: Addresses | DHCP | Aliases — bulk actions appear inline when IPs selected */}
@@ -3497,7 +3537,9 @@ function DnsSyncModal({
       qc.invalidateQueries({ queryKey: ["dns-records"] });
       qc.invalidateQueries({ queryKey: ["dns-group-records"] });
       qc.invalidateQueries({ queryKey: ["dns-zones"] });
-      qc.invalidateQueries({ queryKey: ["dns-records"] });
+      // Drop the drift-banner count so the subnet header refreshes after
+      // the user applies the sync.
+      qc.invalidateQueries({ queryKey: ["dns-sync-summary"] });
       // Invalidate alone only marks stale — the modal's useQuery doesn't
       // pick that up while the component stays mounted. Force a refetch
       // so the missing/mismatched/stale lists reflect the new DB state.

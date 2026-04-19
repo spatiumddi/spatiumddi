@@ -235,6 +235,15 @@ export interface DnsSyncCommitResult {
   errors: string[];
 }
 
+export interface DnsSyncSummary {
+  subnet_id: string;
+  missing: number;
+  mismatched: number;
+  stale: number;
+  total: number;
+  has_drift: boolean;
+}
+
 export interface SubnetVLANRef {
   id: string;
   router_id: string;
@@ -588,6 +597,10 @@ export const ipamApi = {
   dnsSyncPreview: (subnetId: string) =>
     api
       .get<DnsSyncPreview>(`/ipam/subnets/${subnetId}/dns-sync/preview`)
+      .then((r) => r.data),
+  dnsSyncSummary: (subnetId: string) =>
+    api
+      .get<DnsSyncSummary>(`/ipam/subnets/${subnetId}/dns-sync/summary`)
       .then((r) => r.data),
   dnsSyncCommit: (
     subnetId: string,
@@ -952,8 +965,14 @@ export const ipamIoApi = {
     });
     const disp = (res.headers["content-disposition"] as string) || "";
     const match = disp.match(/filename="?([^";]+)"?/i);
-    const date = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
-    const filename = match ? match[1] : `ipam-export-${date}.${params.format}`;
+    // UTC YYYYMMDD-HHMMSS matches the backend's export filename convention
+    // so the fallback (no Content-Disposition) sorts alongside real exports.
+    const ts = new Date()
+      .toISOString()
+      .slice(0, 19)
+      .replace(/[-:]/g, "")
+      .replace("T", "-");
+    const filename = match ? match[1] : `ipam-export-${ts}.${params.format}`;
     const blob = new Blob([res.data as BlobPart]);
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -1766,6 +1785,16 @@ export const dnsApi = {
   deleteRecord: (groupId: string, zoneId: string, recordId: string) =>
     api.delete(`/dns/groups/${groupId}/zones/${zoneId}/records/${recordId}`),
 
+  bulkDeleteRecords: (groupId: string, zoneId: string, recordIds: string[]) =>
+    api
+      .post<{
+        deleted: number;
+        skipped: { record_id: string; reason: string }[];
+      }>(`/dns/groups/${groupId}/zones/${zoneId}/records/bulk-delete`, {
+        record_ids: recordIds,
+      })
+      .then((r) => r.data),
+
   // Bulk zone file import / export
   importZonePreview: (
     groupId: string,
@@ -1800,7 +1829,14 @@ export const dnsApi = {
         responseType: "text",
         transformResponse: (d) => d,
       })
-      .then((r) => r.data),
+      .then((r) => ({
+        data: r.data,
+        // Prefer the backend's Content-Disposition filename — it carries the
+        // UTC timestamp suffix. Callers must not fabricate their own.
+        filename: _parseContentDispositionFilename(
+          r.headers["content-disposition"],
+        ),
+      })),
   syncZoneWithServer: (groupId: string, zoneId: string, apply = true) =>
     api
       .post<{
@@ -1833,8 +1869,21 @@ export const dnsApi = {
         params: viewId ? { view_id: viewId } : {},
         responseType: "blob",
       })
-      .then((r) => r.data),
+      .then((r) => ({
+        data: r.data,
+        filename: _parseContentDispositionFilename(
+          r.headers["content-disposition"],
+        ),
+      })),
 };
+
+function _parseContentDispositionFilename(
+  header: string | undefined,
+): string | null {
+  if (!header) return null;
+  const match = header.match(/filename="?([^";]+)"?/i);
+  return match ? match[1] : null;
+}
 
 export interface DNSRecordChange {
   op: "create" | "update" | "delete" | "unchanged";

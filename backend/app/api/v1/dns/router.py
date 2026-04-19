@@ -33,7 +33,7 @@ from app.models.dns import (
     DNSView,
     DNSZone,
 )
-from app.services.dns.record_ops import enqueue_record_op
+from app.services.dns.record_ops import enqueue_record_op, enqueue_record_ops_batch
 from app.services.dns.serial import bump_zone_serial
 from app.services.dns_io import (
     RecordChange,
@@ -1937,7 +1937,10 @@ async def export_all_zones(
             zf.writestr(zone.name.rstrip(".") + ".zone", text)
     buf.seek(0)
 
-    filename = f"dns-zones-{group_id}.zip"
+    # UTC timestamp so repeated exports on the same day don't overwrite
+    # and file managers sort them in order.
+    ts = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+    filename = f"dns-zones-{group_id}-{ts}.zip"
     return StreamingResponse(
         buf,
         media_type="application/zip",
@@ -2273,6 +2276,116 @@ async def delete_record(
         target_serial = bump_zone_serial(zone)
         await enqueue_record_op(db, zone, "delete", rec_snapshot, target_serial=target_serial)
     await db.commit()
+
+
+class BulkDeleteRecordsRequest(BaseModel):
+    """IDs of auto- or manually-created records to delete in one shot.
+
+    All IDs must belong to the zone in the URL — cross-zone deletion
+    isn't allowed here (the UI scopes bulk ops to a single zone). Any
+    record ID that doesn't belong to the zone is skipped with a reason
+    so a partial payload doesn't fail the whole batch.
+    """
+
+    record_ids: list[uuid.UUID]
+
+
+class BulkDeleteRecordsResponse(BaseModel):
+    deleted: int
+    skipped: list[dict[str, str]]  # each: {record_id, reason}
+
+
+@router.post(
+    "/groups/{group_id}/zones/{zone_id}/records/bulk-delete",
+    response_model=BulkDeleteRecordsResponse,
+)
+async def bulk_delete_records(
+    group_id: uuid.UUID,
+    zone_id: uuid.UUID,
+    body: BulkDeleteRecordsRequest,
+    db: DB,
+    current_user: CurrentUser,
+) -> BulkDeleteRecordsResponse:
+    """Delete many records from one zone in a single transaction.
+
+    Avoids the N-round-trip cost of the UI fanning out N singular
+    DELETEs — groups every op into one ``enqueue_record_ops_batch`` call
+    so agentless Windows DNS sees one WinRM round trip for the whole
+    batch instead of one per record. BIND9 still writes N queued rows
+    (the agent will batch-ship on its next poll).
+    """
+    if not body.record_ids:
+        return BulkDeleteRecordsResponse(deleted=0, skipped=[])
+
+    zone = await _require_zone(group_id, zone_id, db)
+
+    res = await db.execute(select(DNSRecord).where(DNSRecord.id.in_(body.record_ids)))
+    records = list(res.scalars().all())
+    by_id = {r.id: r for r in records}
+
+    skipped: list[dict[str, str]] = []
+    targets: list[DNSRecord] = []
+    for rid in body.record_ids:
+        rec = by_id.get(rid)
+        if rec is None:
+            skipped.append({"record_id": str(rid), "reason": "not found"})
+            continue
+        if rec.zone_id != zone_id:
+            skipped.append({"record_id": str(rid), "reason": "wrong zone"})
+            continue
+        targets.append(rec)
+
+    if not targets:
+        return BulkDeleteRecordsResponse(deleted=0, skipped=skipped)
+
+    # Bump the zone serial once for the whole batch — same zone, same
+    # serial bump. N singular deletes used to bump N times, which is
+    # wasteful and produces confusing serial jumps in SOA queries.
+    target_serial = bump_zone_serial(zone)
+
+    ops = [
+        {
+            "op": "delete",
+            "record": {
+                "name": r.name,
+                "type": r.record_type,
+                "value": r.value,
+                "ttl": r.ttl,
+            },
+            "target_serial": target_serial,
+        }
+        for r in targets
+    ]
+
+    # One driver round trip for agentless; N queued rows for agent-based
+    # (the agent flushes them on its next long-poll).
+    try:
+        await enqueue_record_ops_batch(db, zone, ops)
+    except Exception as exc:  # noqa: BLE001 — wire / auth failure on the whole batch
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Bulk delete dispatch failed on zone {zone.name}: {exc}",
+        ) from exc
+
+    # One audit row per deleted record — same granularity as the singular
+    # path, so the audit log stays complete.
+    for rec in targets:
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                user_display_name=current_user.display_name,
+                auth_source=current_user.auth_source,
+                action="delete",
+                resource_type="dns_record",
+                resource_id=str(rec.id),
+                resource_display=rec.fqdn,
+                result="success",
+            )
+        )
+        await db.delete(rec)
+
+    await db.commit()
+    return BulkDeleteRecordsResponse(deleted=len(targets), skipped=skipped)
 
 
 # ── Bulk zone import / export ───────────────────────────────────────────────
@@ -2673,7 +2786,8 @@ async def export_zone(
     zone = await _require_zone(group_id, zone_id, db)
     records = await _load_zone_records(zone_id, db)
     text = write_zone_file(zone, records)
-    filename = zone.name.rstrip(".") + ".zone"
+    ts = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
+    filename = f"{zone.name.rstrip('.')}-{ts}.zone"
     return Response(
         content=text,
         media_type="text/dns",

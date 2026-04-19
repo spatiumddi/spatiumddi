@@ -22,7 +22,10 @@ from app.models.dns import DNSRecord, DNSZone
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet, SubnetDomain
 from app.models.vlans import VLAN
 from app.services.dhcp.config_bundle import build_config_bundle
-from app.services.dhcp.windows_writethrough import push_scope_delete, push_static_change
+from app.services.dhcp.windows_writethrough import (
+    push_scope_delete,
+    push_statics_bulk_delete,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -378,6 +381,34 @@ async def _create_alias_records(
         db.add(rec)
         await db.flush()
         await _enqueue_dns_op(db, zone, "create", name, rtype, value, None)
+
+
+def _invalidate_ip_dns_cache(rec: DNSRecord, ip: IPAddress | None) -> None:
+    """Clear the IP's cached DNS-linkage fields when a record is deleted
+    by the sync-reconcile stale-delete path.
+
+    ``ip.fqdn`` and ``ip.forward_zone_id`` / ``ip.reverse_zone_id``
+    behave as a cache of "what this IP is currently published as in
+    DNS." They're set at publish time by :func:`_sync_dns_record`. When
+    Sync DNS removes a stale record we also own the cache on the other
+    side — if we don't clear it, the UI keeps showing the old FQDN
+    (with the old domain suffix) even after the subnet's zone
+    assignment has been removed.
+
+    Only clears the side that matches the deleted record (forward vs
+    reverse), so deleting a stale PTR doesn't wipe the forward FQDN if
+    it still resolves.
+    """
+    if ip is None:
+        return
+    if rec.record_type == "PTR":
+        if ip.reverse_zone_id == rec.zone_id:
+            ip.reverse_zone_id = None
+    else:  # A / AAAA / CNAME
+        if ip.forward_zone_id == rec.zone_id or ip.dns_record_id == rec.id:
+            ip.fqdn = None
+            ip.forward_zone_id = None
+            ip.dns_record_id = None
 
 
 async def _sync_dns_record(
@@ -2639,6 +2670,48 @@ class DnsSyncCommitResponse(BaseModel):
     errors: list[str]
 
 
+class DnsSyncSummaryResponse(BaseModel):
+    """Compact drift counts — cheap to poll from the subnet header so the
+    UI can flag "N records out of sync" without rendering the full
+    per-row preview. Internally runs the same ``compute_subnet_dns_drift``
+    as the preview endpoint."""
+
+    subnet_id: uuid.UUID
+    missing: int
+    mismatched: int
+    stale: int
+    total: int
+    has_drift: bool
+
+
+@router.get(
+    "/subnets/{subnet_id}/dns-sync/summary",
+    response_model=DnsSyncSummaryResponse,
+)
+async def dns_sync_summary(
+    subnet_id: uuid.UUID, current_user: CurrentUser, db: DB
+) -> DnsSyncSummaryResponse:
+    """Counts-only drift report for surfacing a "you have N stale records"
+    banner on the subnet header without the per-row payload cost."""
+    from app.services.dns.sync_check import compute_subnet_dns_drift  # noqa: PLC0415
+
+    if await db.get(Subnet, subnet_id) is None:
+        raise HTTPException(status_code=404, detail="Subnet not found")
+    report = await compute_subnet_dns_drift(db, subnet_id)
+    missing = len(report.missing)
+    mismatched = len(report.mismatched)
+    stale = len(report.stale)
+    total = missing + mismatched + stale
+    return DnsSyncSummaryResponse(
+        subnet_id=subnet_id,
+        missing=missing,
+        mismatched=mismatched,
+        stale=stale,
+        total=total,
+        has_drift=total > 0,
+    )
+
+
 @router.get(
     "/subnets/{subnet_id}/dns-sync/preview",
     response_model=DnsSyncPreviewResponse,
@@ -2716,6 +2789,10 @@ async def _apply_dns_sync(
                 errors.append(f"{ip.address}: {exc}")
 
     if body.delete_stale_record_ids:
+        from app.services.dns.record_ops import (  # noqa: PLC0415
+            enqueue_record_ops_batch,
+        )
+
         stale_res = await db.execute(
             select(DNSRecord)
             .where(
@@ -2724,18 +2801,66 @@ async def _apply_dns_sync(
             )
             .options(selectinload(DNSRecord.zone))
         )
-        for rec in stale_res.scalars().all():
+        stale_records = list(stale_res.scalars().all())
+
+        # Group by zone so each zone's primary server gets a single
+        # batched driver call (critical for agentless Windows DNS — one
+        # WinRM round trip per zone instead of one per record).
+        by_zone: dict[uuid.UUID, list[DNSRecord]] = {}
+        zones_by_id: dict[uuid.UUID, Any] = {}
+        orphans: list[DNSRecord] = []  # records whose zone link is gone
+        for rec in stale_records:
+            if rec.zone is None:
+                orphans.append(rec)
+                continue
+            by_zone.setdefault(rec.zone_id, []).append(rec)
+            zones_by_id[rec.zone_id] = rec.zone
+
+        # Preload every linked IP up front so cache invalidation below
+        # doesn't fire N per-record fetches after the WinRM round trip.
+        ip_ids = {rec.ip_address_id for rec in stale_records if rec.ip_address_id is not None}
+        ips_by_id: dict[uuid.UUID, IPAddress] = {}
+        if ip_ids:
+            ips_res = await db.execute(select(IPAddress).where(IPAddress.id.in_(ip_ids)))
+            ips_by_id = {ip.id: ip for ip in ips_res.scalars().all()}
+
+        for zone_id, recs in by_zone.items():
+            zone = zones_by_id[zone_id]
+            ops = [
+                {
+                    "op": "delete",
+                    "record": {
+                        "name": r.name,
+                        "type": r.record_type,
+                        "value": r.value,
+                        "ttl": r.ttl,
+                    },
+                }
+                for r in recs
+            ]
             try:
-                if rec.zone is not None:
-                    await _enqueue_dns_op(
-                        db,
-                        rec.zone,
-                        "delete",
-                        rec.name,
-                        rec.record_type,
-                        rec.value,
-                        rec.ttl,
+                await enqueue_record_ops_batch(db, zone, ops)
+            except Exception as exc:  # noqa: BLE001 — surface as per-record errors
+                errors.append(f"batch delete on {zone.name}: {exc}")
+                continue
+            for r in recs:
+                try:
+                    linked_ip = (
+                        ips_by_id.get(r.ip_address_id) if r.ip_address_id is not None else None
                     )
+                    _invalidate_ip_dns_cache(r, linked_ip)
+                    await db.delete(r)
+                    deleted += 1
+                except Exception as exc:
+                    errors.append(f"record {r.id}: {exc}")
+
+        # Zone-less stragglers: just drop the DB row (no wire op possible).
+        for rec in orphans:
+            try:
+                linked_ip = (
+                    ips_by_id.get(rec.ip_address_id) if rec.ip_address_id is not None else None
+                )
+                _invalidate_ip_dns_cache(rec, linked_ip)
                 await db.delete(rec)
                 deleted += 1
             except Exception as exc:
@@ -3389,8 +3514,12 @@ async def delete_address(
     statics_res = await db.execute(
         select(DHCPStaticAssignment).where(DHCPStaticAssignment.ip_address_id == address_id)
     )
-    for static in statics_res.scalars().all():
-        await push_static_change(db, static, action="delete")
+    statics_rows = list(statics_res.scalars().all())
+    # Batched push on windows_dhcp servers (one WinRM round trip per
+    # server instead of one per row); ABC default loops sequentially for
+    # Kea / ISC. Typically one row — the batch overhead is negligible.
+    await push_statics_bulk_delete(db, statics_rows)
+    for static in statics_rows:
         await db.delete(static)
 
     if permanent:
@@ -3468,21 +3597,27 @@ async def purge_orphans(
         )
     )
     rows = list(res.scalars().all())
+    # Gather any lingering DHCP reservations across all orphan IPs in one
+    # query, then push-delete them in one batched WinRM round trip per
+    # server (versus one round trip per IP × one per static). Normally
+    # ``delete_address``'s orphan-transition already removed these; the
+    # loop catches older orphans created before that code existed.
+    stat_res = await db.execute(
+        select(DHCPStaticAssignment).where(
+            DHCPStaticAssignment.ip_address_id.in_([ip.id for ip in rows])
+        )
+    )
+    lingering_statics = list(stat_res.scalars().all())
+    await push_statics_bulk_delete(db, lingering_statics)
+    for static in lingering_statics:
+        await db.delete(static)
+
     for ip in rows:
         # Best-effort DNS teardown (the FK would null it, but be explicit).
         try:
             await _sync_dns_record(db, ip, subnet, action="delete")
         except Exception:  # noqa: BLE001
             pass
-        # Clean up any lingering DHCP static reservations. Normally the
-        # orphan-transition in ``delete_address`` already removed these; this
-        # catches older orphans created before that code existed.
-        stat_res = await db.execute(
-            select(DHCPStaticAssignment).where(DHCPStaticAssignment.ip_address_id == ip.id)
-        )
-        for static in stat_res.scalars().all():
-            await push_static_change(db, static, action="delete")
-            await db.delete(static)
         db.add(
             _audit(
                 current_user,

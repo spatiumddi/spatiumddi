@@ -333,9 +333,7 @@ async def _overlap_conflicts_space_subnets(
     return conflicts
 
 
-async def _ancestor_block_ids_for_subnet(
-    db: AsyncSession, subnet: Subnet
-) -> set[uuid.UUID]:
+async def _ancestor_block_ids_for_subnet(db: AsyncSession, subnet: Subnet) -> set[uuid.UUID]:
     """Walk ``block_id`` → ``parent_block_id`` → … up to the root.
 
     A subnet sits inside its parent block, which itself sits inside the
@@ -1058,8 +1056,7 @@ async def commit_subnet_resize(
 
     if not await _try_advisory_lock(db, subnet.id, _LOCK_NS_SUBNET):
         raise ResizeError(
-            "Another operation is already in progress for this subnet. "
-            "Retry once it completes.",
+            "Another operation is already in progress for this subnet. " "Retry once it completes.",
             status_code=423,
         )
 
@@ -1303,8 +1300,7 @@ async def commit_block_resize(
 
     if not await _try_advisory_lock(db, block.id, _LOCK_NS_BLOCK):
         raise ResizeError(
-            "Another operation is already in progress for this block. "
-            "Retry once it completes.",
+            "Another operation is already in progress for this block. " "Retry once it completes.",
             status_code=423,
         )
 
@@ -1326,8 +1322,7 @@ async def commit_block_resize(
     )
     if block_overlap:
         raise ResizeError(
-            "New CIDR overlaps an existing block: "
-            + "; ".join(c.detail for c in block_overlap),
+            "New CIDR overlaps an existing block: " + "; ".join(c.detail for c in block_overlap),
             status_code=409,
         )
     # Space-wide subnet overlap — a block growing can swallow a subnet
@@ -1340,8 +1335,7 @@ async def commit_block_resize(
     )
     if subnet_overlap:
         raise ResizeError(
-            "New CIDR overlaps an existing subnet: "
-            + "; ".join(c.detail for c in subnet_overlap),
+            "New CIDR overlaps an existing subnet: " + "; ".join(c.detail for c in subnet_overlap),
             status_code=409,
         )
     parent_conflicts = await _parent_containment_conflicts_block(db, block, new_net)
