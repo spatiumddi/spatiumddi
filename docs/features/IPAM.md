@@ -1,6 +1,6 @@
 # IPAM Feature Specification
 
-> **Implementation status (Unreleased, post-`2026.04.16-2`):** Full hierarchical CRUD (spaces, blocks with nesting, subnets, addresses); next-available allocation; orphan soft-delete + bulk orphan purge modal; block utilization rollup via recursive CTE; block/subnet overlap validation via PostgreSQL `cidr &&` operator; DNS assignment inheritance (space → block → subnet) with dual-listbox picker for additional zones and shared `ZoneOptions` primary/additional separator across Create / Edit / Bulk-edit flows; DNS sync check (subnet / block / space scope) reconciling missing, mismatched, and stale records; **scheduled IPAM ↔ DNS auto-sync** (opt-in Celery beat task gated on `PlatformSettings.dns_auto_sync_enabled`); reverse-zone auto-create + backfill; IP aliases (CNAME/A tied to the IP, auto-cleaned on purge) with single-step delete confirmation + query-invalidation fix for the subnet Aliases tab; VLAN association (router + VLAN columns); DHCP scope/pool/static linkage with per-IP pool-membership badge; static DHCP creation flow integrated into Allocate IP; drag-drop reparenting; **bulk-edit IPs with per-field opt-in toggles** (status, description, tags-merge-or-replace, custom-fields merge, DNS zone); import/export (CSV/JSON/XLSX); custom fields per resource type with inherited-value placeholders on Edit Subnet / Edit Block modals; global search (Cmd+K); **mobile-responsive layout** (sidebar drawer, horizontally scrollable tables, modals cap at `95vw`). **Partial IPv6:** storage, UI, subnet create, AAAA/PTR sync, `/blocks/{id}/available-subnets` up to `/128`, and per-block "Find by size" with family-aware prefix options all land — remaining TODOs are EUI-64 / hash-based `/128` allocation for `/next-address` (returns 409 on v6 today) and Kea Dhcp6 option-name translation.
+> **Implementation status (post-`2026.04.19-1`):** Full hierarchical CRUD (spaces, blocks with nesting, subnets, addresses); next-available allocation that skips dynamic DHCP pool ranges; orphan soft-delete + bulk orphan purge modal; block utilization rollup via recursive CTE; block/subnet overlap validation via PostgreSQL `cidr &&` operator; **grow-only subnet + block resize** with blast-radius preview, cross-subtree overlap scan, typed-CIDR confirmation gate, and pg advisory lock during commit; DNS assignment inheritance (space → block → subnet) with dual-listbox picker for additional zones and shared `ZoneOptions` primary/additional separator across Create / Edit / Bulk-edit flows; DNS sync check (subnet / block / space scope) reconciling missing, mismatched, and stale records, with a `[Sync ▾]` dropdown (DNS / DHCP / All) on the subnet header plus result modals for each; **scheduled IPAM ↔ DNS auto-sync** (opt-in Celery beat task gated on `PlatformSettings.dns_auto_sync_enabled`); reverse-zone auto-create + backfill; IP aliases (CNAME/A tied to the IP, auto-cleaned on purge) with single-step delete confirmation + query-invalidation fix for the subnet Aliases tab; VLAN association (router + VLAN columns); DHCP scope/pool/static linkage with per-IP pool-membership badge, **pool boundary rows in the IP listing**, and **dynamic-pool allocation gates** (422 on manual allocation, skipped by `/next-ip`); static DHCP creation flow integrated into Allocate IP; drag-drop reparenting; **bulk-edit IPs with per-field opt-in toggles** (status, description, tags-merge-or-replace, custom-fields merge, DNS zone); **IP assignment collision warnings** (FQDN + MAC collisions across any subnet; 409 with `force`-flag reconfirm); import/export (CSV/JSON/XLSX) with UTC-timestamped filenames + **subnet-scoped IP address importer**; custom fields per resource type with inherited-value placeholders on Edit Subnet / Edit Block modals; global search (Cmd+K); **mobile-responsive layout** (sidebar drawer, horizontally scrollable tables, modals cap at `95vw`); every modal is draggable (`bg-black/20` backdrop, Esc close). **Partial IPv6:** storage, UI, subnet create, AAAA/PTR sync, `/blocks/{id}/available-subnets` up to `/128`, and per-block "Find by size" with family-aware prefix options all land — remaining TODOs are EUI-64 / hash-based `/128` allocation for `/next-address` (returns 409 on v6 today).
 
 ## Overview
 
@@ -788,3 +788,142 @@ preview → confirm flow with:
   where they are; the preview flags this as a warning.
 - DNS record value mutations — a grow doesn't change any record's
   ``name``/``value``; only new reverse-zone coverage is backfilled.
+
+### ✅ 15.11 IP Assignment Collision Warnings
+
+Two non-fatal guardrails on IP create / update. Both fire at the API
+layer (so Terraform, Ansible, and ad-hoc scripts get the same
+treatment as the UI); both are confirmable — they're warnings, not
+hard rejections. The user's options either way are "fix the input" or
+"do it anyway".
+
+| Collision | Trigger |
+|---|---|
+| **FQDN** | Same ``(lower(hostname), forward_zone_id)`` on another IP anywhere in SpatiumDDI. Common accident: two people naming a host ``web``. Occasionally deliberate: round-robin A records. |
+| **MAC** | Same normalised MAC anywhere in IPAM. Usually means the MAC was cloned / moved and the old row should be decommissioned before re-use. |
+
+**Server side.** ``_normalize_mac`` canonicalises colons / dashes /
+dots / bare-hex input to 12 lowercase hex chars before comparison so
+``AA:BB:CC:DD:EE:FF`` and ``aabb.ccdd.eeff`` collide as expected.
+``_check_ip_collisions`` joins through ``DNSZone`` + ``Subnet`` to
+return a list of warning dicts with the existing IP, subnet, and
+(for FQDN collisions) the published FQDN.
+
+A ``force: bool = False`` field is added to ``IPAddressCreate`` /
+``IPAddressUpdate`` / ``NextIPRequest``. When ``force=false`` and a
+collision exists the endpoint returns **409** with
+``detail = {warnings: [...], requires_confirmation: true}``. Clients
+re-submit with ``force=true`` to proceed.
+
+On update, the check only runs for fields the client explicitly set
+(``model_dump(exclude_unset=True)``), so editing an unrelated field
+on an IP that happens to share an FQDN with another row won't surface
+a warning. ``exclude_ip_id=ip.id`` keeps the row from colliding with
+its own current state.
+
+**UI.** Shared ``CollisionWarning`` type + amber
+``CollisionWarningBanner`` in ``IPAMPage.tsx``. Both the allocate and
+edit modals parse the 409 body, render one line per collision (FQDN +
+existing IP + subnet, or MAC + existing IP + hostname + subnet), and
+flip the submit button to "Allocate anyway" / "Save anyway". Editing
+any collision-relevant field clears the pending warning so the next
+submit re-checks fresh.
+
+**What's intentionally not a collision.**
+
+- Same FQDN in different zones (e.g. ``web.corp.example.com`` vs.
+  ``web.staging.example.com``) — those are distinct records.
+- PTR collisions — every IP gets at most one PTR, handled separately
+  by the Sync DNS classifier.
+- Empty MAC / empty hostname — nothing to collide with.
+
+### ✅ 15.12 DHCP Pool Awareness in IP Listing & Allocation
+
+The subnet IP listing now shows **where DHCP pools begin and end**,
+and the allocation paths refuse to hand out IPs that live inside a
+**dynamic** pool — those are owned by the DHCP server, not IPAM.
+
+**IP listing.** The subnet table renders ▼ "Start of ``<type>`` pool"
+and ▲ "End of ``<type>`` pool" rows interleaved with the IP rows,
+computed client-side from the pool ranges. Colour by pool type:
+
+| Pool type | Accent | Meaning |
+|---|---|---|
+| ``dynamic`` | cyan | DHCP server hands these out first-come-first-served |
+| ``reserved`` | violet | Reserved for future static allocation |
+| ``excluded`` | zinc | Carved out of the dynamic range — operator may manually allocate |
+
+Pool markers render even when no IPs have been assigned inside the
+range, so the operator sees pool extents as first-class structure.
+
+**Backend gates.** Three helpers in ``backend/app/api/v1/ipam/router.py``:
+
+- ``_load_dynamic_pool_ranges(db, subnet_id)`` joins
+  ``DHCPPool → DHCPScope → Subnet`` and returns packed int ranges
+  for every ``pool_type == "dynamic"`` pool on the subnet.
+- ``_ip_int_in_dynamic_pool(ip_int, ranges)`` — cheap contains check
+  used by both the write path and the preview endpoint.
+- ``_pick_next_available_ip(db, subnet, strategy)`` — hoisted out of
+  ``allocate_next_ip`` so the commit path and the new preview
+  endpoint share the same "skip dynamic ranges" semantics.
+
+**Allocation rules.**
+
+| Path | Behaviour |
+|---|---|
+| ``POST /subnets/{id}/addresses`` (manual) | **422** if ``body.address`` lands inside a dynamic pool. Excluded / reserved pools are still allowed — they don't race with the DHCP server on lease grants. |
+| ``POST /subnets/{id}/next`` | ``_pick_next_available_ip`` skips dynamic ranges during its linear search. |
+| ``GET  /subnets/{id}/next-ip-preview?strategy=sequential\|random`` | Read-only peek. Returns ``{address, strategy}``; ``address: null`` means IPv6 (not supported) or exhausted subnet. No lock, no write. |
+
+**UI.** ``AddAddressModal`` in **next** mode fetches the preview on
+open and shows ``Next available: 10.0.1.42 (skips dynamic DHCP
+pools)`` as an emerald highlight, or a destructive "No free IPs in
+this subnet" line with submit disabled when the subnet is exhausted.
+In **manual** mode the typed address is checked client-side against
+the dynamic ranges: an inline red warning renders + the submit button
+disables. The server-side 422 is still the authoritative check — the
+client check is just a better round-trip.
+
+### ✅ 15.13 Subnet-Scoped IP Address Import
+
+The space-scoped importer (§7) creates blocks + subnets from a
+vendor export; it does not import *addresses*. The subnet-scoped
+importer handles the far more common "dump IPs out of phpIPAM /
+NetBox / Infoblox / a CSV and load them into SpatiumDDI" migration
+case.
+
+**Endpoints:**
+
+| Method | Path | Purpose |
+|---|---|---|
+| POST | `/api/v1/ipam/import/addresses/preview` | Parse + dry-run validation |
+| POST | `/api/v1/ipam/import/addresses/commit` | Apply with `fail` / `skip` / `overwrite` |
+
+**Parser.** Auto-routes CSV / JSON / XLSX rows by header — ``address``
+or ``ip`` columns make a row an **address**, ``network`` makes it a
+**subnet** (rejected by the address importer; space-scoped importer
+handles that case). Unrecognised columns drop into
+``custom_fields`` so a raw vendor export works without rename passes.
+
+**Validation per row.** Each IP must fall inside the targeted
+subnet's CIDR. Rows outside are rejected at preview. The strategy
+controls the collision behaviour when a row matches an existing IP
+by ``(subnet_id, address)``:
+
+| Strategy | On match |
+|---|---|
+| ``fail`` | Reject the whole batch (default). |
+| ``skip`` | Leave the existing row untouched, count as skipped. |
+| ``overwrite`` | Apply the import row's fields. |
+
+**DNS sync.** Rows with a ``hostname`` route through
+``_sync_dns_record(..., action="create")`` so A + PTR records publish
+through the same RFC 2136 / WinRM path the UI uses. Reverse zones
+are backfilled on commit.
+
+**Audit.** One ``AuditLog(action="import")`` row per commit with
+counts of created / updated / skipped / failed.
+
+**UI.** ``AddressImportModal`` + a combined **Import / Export**
+dropdown on the subnet header (`SubnetImportExportButton`) replacing
+the older single-purpose export button.

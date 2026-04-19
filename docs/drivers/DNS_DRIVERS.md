@@ -227,6 +227,65 @@ If the push fails, the 502 response prevents the DB commit — the Windows DNS s
 
 [`drivers/dns/_axfr.py`](../../backend/app/drivers/dns/_axfr.py) extracts the AXFR → `RecordData` logic used by both BIND9 and Windows Path A. Filters SOA + apex NS; absolutises CNAME / NS / PTR / MX / SRV targets.
 
+### 3.7 Batched WinRM dispatch
+
+Record CRUD against a Windows DNS server used to round-trip WinRM **per record** — a 40-record Sync DNS took 2-3 minutes of wall time. The driver now ships one PowerShell script per zone-chunk with every op inside: each chunk does every op server-side with a per-op `try / catch` and returns a JSON result array so one bad record doesn't abort the batch.
+
+**Driver surface.** New plural method on the ABC:
+
+```python
+class DNSDriver(ABC):
+    async def apply_record_changes(
+        self, changes: Sequence[RecordChange]
+    ) -> Sequence[RecordOpResult]:
+        """Apply many record changes in as few round trips as possible.
+
+        Default impl calls apply_record_change in a loop — BIND9
+        inherits it. Windows overrides with a real batch."""
+```
+
+BIND9 + any future driver gets the plural interface for free via the default loop.
+
+**Windows batch size — 6 ops per chunk.** The real constraint isn't WinRM's envelope cap (`MaxEnvelopeSize` defaults to 500 KB) but the way `pywinrm.run_ps` ships the script: UTF-16-LE → base64 → `powershell.exe -EncodedCommand <b64>` → **single CMD.EXE command line, hard-capped at 8191 chars by Windows**. Base64 costs ×1.33, UTF-16-LE costs ×2, so each raw script char eats ~2.67 chars of command-line budget.
+
+The minified wrapper is ~2000 raw chars (all eight supported record types + op dispatch + per-op try/catch + JSON result emit), which costs ~5350 chars of cmdline budget before any ops. Each op adds ~160 raw chars (~430 cmdline chars) once JSON-escaped + encoded. **6 ops fits; 7 trips the limit.** `_WINRM_BATCH_SIZE = 6` is empirically measured in the dev container, documented in the source.
+
+**Script layout.** One invocation carries data-only JSON with short keys (`i/op/z/n/t/v/ttl/pr/w/p`) and a single dispatch wrapper:
+
+```
+$E='Continue'
+$p = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('<b64>'))
+$r = @()
+($p | ConvertFrom-Json) | % {
+    $e = [ordered]@{change_index=[int]$_.i; ...; ok=$false}
+    try {
+        $ze = [bool](Get-DnsServerZone -Name $_.z -EA SilentlyContinue)
+        if ($_.op -eq 'delete') { ... }
+        elseif ($_.op -eq 'create' -or $_.op -eq 'update') {
+            switch ($_.t) { 'A' { ... }; 'AAAA' { ... }; 'CNAME' { ... }; ... }
+        } else { throw "Unsupported op" }
+        $e.ok = $true
+    } catch { $e.error = "$($_.Exception.Message)" }
+    $r += (New-Object PSObject -Property $e)
+}
+$r | ConvertTo-Json -Compress -Depth 3
+```
+
+`$ErrorActionPreference = 'Continue'` ensures a per-op `throw` doesn't abort the enclosing script; the try/catch per op records the error into the result array. Chunk-wide script errors (syntax, base64 decode) still raise from `_run_ps` and propagate to the caller.
+
+**Lifting the ceiling — pypsrp.** Future upgrade path: swap `pywinrm` for `pypsrp`. PSRP uses the WSMan Runspace protocol instead of CMD.EXE and removes the 8K limit entirely — would yield ~100 ops/batch on the same envelope settings. Tracked as a TODO comment in [`drivers/dns/windows.py`](../../backend/app/drivers/dns/windows.py).
+
+**RFC 2136 path — `asyncio.gather`.** The 2136 write path is cheap per-op but was still serial. Record ops now run in parallel via `asyncio.gather`; no batching needed because the dnspython update framing is already compact.
+
+**Dispatch.** `enqueue_record_ops_batch(db, zone, ops)` in [`services/dns/record_ops.py`](../../backend/app/services/dns/record_ops.py) groups pending ops by zone and calls `apply_record_changes` once per group. Zone serial bumps once per batch instead of N times. **State-aware commit**: the caller zips through the returned op rows and only deletes (or confirms success) when `state == "applied"`. A failed wire op never causes a DB delete — previous behaviour would report "deleted" to the UI while the record was still published on Windows.
+
+**Results.**
+
+| Path | Before | After |
+|---|---|---|
+| Sync DNS / 40 records | ~3 min | ~5 s |
+| Bulk delete / 80 records on one zone | 80 HTTP calls | 1 HTTP call, 14 WinRM round trips (80 / 6) |
+
 ---
 
 ## 4. Driver Selection and Registration

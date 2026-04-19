@@ -129,7 +129,87 @@ This API translates to the appropriate query language for the configured log sto
 
 ---
 
-## 4. Audit Log
+## 4. Windows Server Log Viewer
+
+Separate from the SpatiumDDI Log Explorer (section 3), there is a **Windows Server Log Viewer** at `/logs` that pulls logs directly off any Windows server SpatiumDDI has WinRM credentials for. Zero agent, no log-shipping — it's a read-through on demand, server-side filtered.
+
+Two tabs today, plumbed through the driver abstraction so future sources (agent logs streamed over the bus, control-plane service logs) can plug in via `driver.available_log_names()` + `driver.get_events()` without touching the router.
+
+### 4.1 Event Log tab
+
+Filtered read of Windows Event Log via `Get-WinEvent -FilterHashtable`. Every filter runs server-side so the full log never crosses the wire.
+
+**Inventory per driver:**
+
+| Driver | Logs exposed |
+|---|---|
+| `WindowsDNSDriver` | `DNS Server` (classic) + `Microsoft-Windows-DNSServer/Audit` |
+| `WindowsDHCPReadOnlyDriver` | `Microsoft-Windows-Dhcp-Server/Operational` + `Microsoft-Windows-Dhcp-Server/FilterNotifications` |
+
+The DNS *Analytical* log is deliberately omitted — it's per-query, noisy, and better viewed in MMC's Event Viewer.
+
+**Filters** (all optional, combined server-side):
+
+- `log_name` — one of the entries above
+- `level` — 1-5 per Windows severity codes (Critical / Error / Warning / Information / Verbose)
+- `max_events` — 1-500 (truncation notice in the UI when the cap is hit)
+- `since` — ISO datetime; frontend uses `<input type="datetime-local">` so we don't drag in a picker library
+- `event_id` — filter to a single event code
+
+**Endpoints:**
+
+```
+GET  /api/v1/logs/sources
+  → [{server_id, name, driver, available_logs: [...]}, ...]
+
+POST /api/v1/logs/query
+  body: {server_id, log_name, level?, max_events?, since?, event_id?}
+  → [{time_created, level, event_id, provider_name, message, ...}, ...]
+```
+
+**Error handling.** `Get-WinEvent` raises `System.Diagnostics.Eventing.Reader.EventLogException` when the log doesn't exist, zero events match, or a FilterHashtable key doesn't apply — it bypasses `-ErrorAction SilentlyContinue` because the exception is terminating at the .NET provider level. `fetch_events()` catches that explicitly and falls through to a generic "no data" matcher so those cases return `[]` cleanly instead of surfacing `"The parameter is incorrect"` to the UI as a 502.
+
+### 4.2 DHCP Audit tab
+
+Windows DHCP writes its **per-lease trail** to CSV-style files at `C:\Windows\System32\dhcp\DhcpSrvLog-<Day>.log` — one file per weekday (`Mon` / `Tue` / … / `Sun`), rotating, on by default on every DHCP role. These are the grants / renewals / releases / NACKs the Event Log itself does not cover.
+
+**Helper** — `backend/app/drivers/windows_dhcp_audit.py`. Reads the day's file over WinRM via `Get-Content -Raw`, skips past the header block, feeds the remainder to `ConvertFrom-Csv`, returns the last N rows. Handles both UTF-16 (Unicode BOM) and ASCII — some Windows builds write one, some the other. Event-code → human label map covers the documented codes; unknown codes come through as `Code <n>` so new Windows releases don't drop silently. Access denied / missing file / locked-by-rotation all return `[]` instead of 500.
+
+**Driver surface** — `WindowsDHCPReadOnlyDriver.get_dhcp_audit_events(day, max_events)` — thin wrapper routed through the standard `_load_credentials` + `_run_ps` path.
+
+**Endpoint:**
+
+```
+POST /api/v1/logs/dhcp-audit
+  body: {server_id, day?, max_events?}   # day: Mon..Sun, null = today
+  → [{time, event_id, event_label, ip, hostname, mac, description}, ...]
+```
+
+**UI columns** — Time / Event (code + label) / IP / Hostname / MAC / Description. Event-dot colour mirrors Windows severity families:
+
+| Colour | Event family |
+|---|---|
+| green | Grant / renew / successful ack |
+| red | Failure / conflict / NACK |
+| muted | Release / expire / scavenge |
+| blue | Auth lifecycle (server started, authorised, etc.) |
+
+The **event-code picker** shows distribution for the current day (e.g. `10 — Lease granted (238)`) so an operator can filter down to a specific outcome without knowing codes by heart.
+
+### 4.3 Dispatch & auto-fetch
+
+The frontend uses `useQuery` keyed on every filter (server / log / level / max / since), so:
+
+1. Entering the page fires the first query immediately against the first available server + log.
+2. Changing any filter (including the Since datetime picker) fires a re-fetch automatically.
+3. `staleTime: Infinity` means switching tabs + back doesn't hit the DC unless the user actually changes something.
+4. The explicit **Refresh** button calls `refetch()` to bypass the cache on demand.
+
+Shared helpers (`ServerPicker` / `MaxEventsPicker` / `FilterSearch` / `RefreshButton` / `QueryErrorBanner` / `QueryingIndicator` / `TruncatedNotice`) are reused across both tabs.
+
+---
+
+## 5. Audit Log
 
 The audit log is a separate, append-only, structured log of all **data mutations** in SpatiumDDI. It is stored in the **PostgreSQL database** (not the log store) for queryability, immutability guarantees, and compliance.
 
@@ -164,7 +244,7 @@ Available at `/admin/audit`:
 
 ---
 
-## 5. Prometheus Metrics
+## 6. Prometheus Metrics
 
 Exposed on each service at `:9090/metrics` (separate from the API port).
 
@@ -225,7 +305,7 @@ spatiumddi_db_replication_lag_seconds{replica}
 
 ---
 
-## 6. Health Endpoints
+## 7. Health Endpoints
 
 All services expose:
 
@@ -243,7 +323,7 @@ All services expose:
 
 ---
 
-## 7. Bundled Grafana Dashboards
+## 8. Bundled Grafana Dashboards
 
 Pre-built dashboards shipped with the project (in `deploy/grafana/dashboards/`):
 
@@ -258,7 +338,7 @@ Pre-built dashboards shipped with the project (in `deploy/grafana/dashboards/`):
 
 ---
 
-## 8. Alerting Rules
+## 9. Alerting Rules
 
 Pre-built Prometheus alerting rules (in `deploy/prometheus/alerts/`):
 

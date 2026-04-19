@@ -198,7 +198,35 @@ Per poll cycle:
 2. For each, call `driver.get_leases(server)`.
 3. Upsert into `DHCPLease` by `(server_id, ip_address)`.
 4. If the lease's IP falls inside a known subnet, mirror it into `IPAddress` with `status="dhcp"` and `auto_from_lease=True`.
-5. The existing lease-cleanup sweep handles expiry — no special logic here.
+5. **Absence-delete** — any active `DHCPLease` row for this server whose IP didn't come back in the wire response is deleted along with its `auto_from_lease=True` IPAM mirror. The driver's `get_leases()` returns only currently-active leases, so absence means the server deleted it (admin purged / client released / etc.). `PullLeasesResult` gains `removed` + `ipam_revoked` counters; both flow into the scheduled-task audit row and the manual sync response. See [features/DHCP.md §15.3](../features/DHCP.md) for the rationale.
+6. The time-based `dhcp_lease_cleanup` sweep still handles leases that drift past `expires_at` between polls. The two mechanisms overlap harmlessly.
+
+### 4.5 Batched WinRM writes
+
+Per-object writes against Windows DHCP used to round-trip WinRM **per reservation / exclusion** — a bulk delete of 200 reservations took minutes. The driver now groups writes into a single PowerShell script per `(server, scope)` chunk.
+
+**Driver surface.** New plural methods on the ABC:
+
+```python
+class DHCPDriver(ABC):
+    async def apply_reservations(
+        self, scope_id: str, reservations: Sequence[Reservation]
+    ) -> Sequence[OpResult]: ...
+
+    async def remove_reservations(
+        self, scope_id: str, reservations: Sequence[Reservation]
+    ) -> Sequence[OpResult]: ...
+
+    async def apply_exclusions(
+        self, scope_id: str, exclusions: Sequence[Exclusion]
+    ) -> Sequence[OpResult]: ...
+```
+
+Default ABC impls call the singular method in a loop — Kea and any future ISC driver inherit the plural interface without changes.
+
+**Windows batch size — 30 ops per chunk.** `pywinrm.run_ps` ships the script as a single CMD.EXE command line (8191-char cap, see [DNS_DRIVERS.md §3.7](DNS_DRIVERS.md#37-batched-winrm-dispatch) for the full math). DHCP payloads are leaner than DNS — each reservation / exclusion op is ~60 raw chars of JSON vs. DNS's ~160 — so the cmdline limit is farther away, but capped at 30 to stay comfortably inside it. Documented in `_WINRM_BATCH_SIZE` in [`drivers/dhcp/windows.py`](../../backend/app/drivers/dhcp/windows.py).
+
+**Dispatcher.** `push_statics_bulk_delete` groups by `(server, scope)` so the IPAM purge-orphans path went from N×M WinRM calls to one per server. Same state-aware commit pattern as DNS — only state=`applied` ops delete the DB row.
 
 ---
 
