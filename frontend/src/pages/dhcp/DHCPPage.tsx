@@ -30,6 +30,7 @@ import {
   ContextMenuSeparator,
   ContextMenuTrigger,
 } from "@/components/ui/context-menu";
+import { HeaderButton } from "@/components/ui/header-button";
 import { CreateServerGroupModal } from "./CreateServerGroupModal";
 import { CreateServerModal } from "./CreateServerModal";
 import { CreateScopeModal } from "./CreateScopeModal";
@@ -1226,56 +1227,47 @@ function ServerDetailView({
           </div>
           <div className="flex items-center gap-2">
             {!server.agent_approved && !server.is_agentless && (
-              <button
+              <HeaderButton
                 onClick={() => approveMut.mutate()}
-                className="rounded-md bg-emerald-600 px-3 py-1.5 text-xs text-white hover:bg-emerald-700"
                 disabled={approveMut.isPending}
+                className="bg-emerald-600 text-white hover:bg-emerald-700"
               >
                 Approve
-              </button>
+              </HeaderButton>
             )}
             {server.is_read_only ? (
-              <button
+              <HeaderButton
+                icon={RefreshCw}
+                iconClassName={leaseSyncMut.isPending ? "animate-spin" : ""}
                 onClick={() => {
                   setSyncBanner(null);
                   leaseSyncMut.mutate();
                 }}
-                className="flex items-center gap-1 rounded-md border px-3 py-1.5 text-xs hover:bg-accent"
                 disabled={leaseSyncMut.isPending}
                 title="Poll this server for active leases and mirror them into DHCP + IPAM"
               >
-                <RefreshCw
-                  className={cn(
-                    "h-3 w-3",
-                    leaseSyncMut.isPending && "animate-spin",
-                  )}
-                />
                 Sync Leases
-              </button>
+              </HeaderButton>
             ) : (
-              <button
+              <HeaderButton
+                icon={RefreshCw}
+                iconClassName={syncMut.isPending ? "animate-spin" : ""}
                 onClick={() => syncMut.mutate()}
-                className="flex items-center gap-1 rounded-md border px-3 py-1.5 text-xs hover:bg-accent"
                 disabled={syncMut.isPending}
               >
-                <RefreshCw
-                  className={cn("h-3 w-3", syncMut.isPending && "animate-spin")}
-                />
                 Force Sync
-              </button>
+              </HeaderButton>
             )}
-            <button
-              onClick={onEdit}
-              className="rounded-md border px-3 py-1.5 text-xs hover:bg-accent"
-            >
+            <HeaderButton icon={Pencil} onClick={onEdit}>
               Edit
-            </button>
-            <button
+            </HeaderButton>
+            <HeaderButton
+              variant="destructive"
+              icon={Trash2}
               onClick={onDelete}
-              className="rounded-md border border-destructive/40 px-3 py-1.5 text-xs text-destructive hover:bg-destructive/10"
             >
               Delete
-            </button>
+            </HeaderButton>
           </div>
         </div>
         {server.driver === "windows_dhcp" && (

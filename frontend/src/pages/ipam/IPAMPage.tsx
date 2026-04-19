@@ -60,6 +60,7 @@ import {
   MODAL_BACKDROP_CLS,
   useDraggableModal,
 } from "@/components/ui/use-draggable-modal";
+import { HeaderButton } from "@/components/ui/header-button";
 import {
   ImportModal,
   ExportButton,
@@ -2854,6 +2855,13 @@ function SubnetDetail({
               })()}
           </div>
           <div className="flex flex-shrink-0 items-center gap-2">
+            <HeaderButton
+              icon={RefreshCw}
+              onClick={refreshSubnet}
+              title="Refresh address list, DHCP scopes, and DNS drift status"
+            >
+              Refresh
+            </HeaderButton>
             <SyncMenu
               hasDhcp={dhcpScopes.length > 0}
               isPending={false}
@@ -2861,22 +2869,6 @@ function SubnetDetail({
               onSyncDhcp={() => setShowDhcpSync(true)}
               onSyncAll={() => setShowSyncAll(true)}
             />
-            <button
-              onClick={refreshSubnet}
-              title="Refresh address list, DHCP scopes, and DNS drift status"
-              className="flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
-            >
-              <RefreshCw className="h-3.5 w-3.5" />
-              Refresh
-            </button>
-            <button
-              onClick={() => setShowOrphans(true)}
-              title="List orphaned IPs in this subnet and permanently delete selected rows"
-              className="flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
-            >
-              <Trash2 className="h-3.5 w-3.5" />
-              Clean Orphans
-            </button>
             <SubnetImportExportButton
               subnet={subnet}
               onCommitted={() => {
@@ -2884,26 +2876,29 @@ function SubnetDetail({
                 qc.invalidateQueries({ queryKey: ["subnets"] });
               }}
             />
-            <button
-              onClick={() => setShowEditSubnet(true)}
-              className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
+            <HeaderButton
+              icon={Trash2}
+              onClick={() => setShowOrphans(true)}
+              title="List orphaned IPs in this subnet and permanently delete selected rows"
             >
+              Clean Orphans
+            </HeaderButton>
+            <HeaderButton icon={Pencil} onClick={() => setShowEditSubnet(true)}>
               Edit
-            </button>
-            <button
+            </HeaderButton>
+            <HeaderButton
               onClick={() => setShowResizeSubnet(true)}
               title="Grow this subnet to a larger CIDR (e.g. /24 → /23). Shrinking is not supported."
-              className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
             >
               Resize…
-            </button>
-            <button
+            </HeaderButton>
+            <HeaderButton
+              variant="primary"
+              icon={Plus}
               onClick={() => setShowAddModal(true)}
-              className="flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90"
             >
-              <Plus className="h-3.5 w-3.5" />
               Allocate IP
-            </button>
+            </HeaderButton>
           </div>
         </div>
 
@@ -7609,65 +7604,55 @@ function BlockDetailView({
           <div className="flex flex-shrink-0 items-center gap-2">
             {selectedSubnets.size > 0 ? (
               <>
-                <button
+                <HeaderButton
+                  icon={Pencil}
                   onClick={() => setShowBulkEdit(true)}
-                  className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
                 >
                   Bulk Edit ({selectedSubnets.size})
-                </button>
-                <button
+                </HeaderButton>
+                <HeaderButton
+                  variant="destructive"
+                  icon={Trash2}
                   onClick={() => setShowBulkDelete(true)}
-                  className="rounded-md border border-destructive/50 px-3 py-1.5 text-sm text-destructive hover:bg-destructive/10"
                 >
                   Delete ({selectedSubnets.size})
-                </button>
-                <button
-                  onClick={() => setSelectedSubnets(new Set())}
-                  className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
-                >
+                </HeaderButton>
+                <HeaderButton onClick={() => setSelectedSubnets(new Set())}>
                   Clear
-                </button>
+                </HeaderButton>
               </>
             ) : (
               <>
-                <button
+                <HeaderButton
+                  icon={Globe2}
                   onClick={() => setShowDnsSync(true)}
                   title="Reconcile IPAM-managed DNS records across every subnet under this block"
-                  className="flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
                 >
-                  <Globe2 className="h-3.5 w-3.5" />
                   Sync DNS
-                </button>
+                </HeaderButton>
                 <ExportButton scope={{ block_id: block.id }} label="Export" />
-                <button
-                  onClick={() => setShowEdit(true)}
-                  className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
-                >
+                <HeaderButton icon={Pencil} onClick={() => setShowEdit(true)}>
                   Edit
-                </button>
-                <button
+                </HeaderButton>
+                <HeaderButton
                   onClick={() => setShowResizeBlock(true)}
                   title="Grow this block to a larger CIDR (e.g. /16 → /15). Shrinking is not supported."
-                  className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
                 >
                   Resize…
-                </button>
-                <button
+                </HeaderButton>
+                <HeaderButton
+                  icon={Layers}
                   onClick={() => setShowCreateChildBlock(true)}
-                  className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
                 >
-                  <span className="flex items-center gap-1.5">
-                    <Layers className="h-3.5 w-3.5" />
-                    Add Block
-                  </span>
-                </button>
-                <button
+                  Add Block
+                </HeaderButton>
+                <HeaderButton
+                  variant="primary"
+                  icon={Plus}
                   onClick={() => setShowCreateSubnet(true)}
-                  className="flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground hover:bg-primary/90"
                 >
-                  <Plus className="h-3.5 w-3.5" />
                   New Subnet
-                </button>
+                </HeaderButton>
               </>
             )}
           </div>
@@ -8461,53 +8446,47 @@ function SpaceTableView({
             {selected.size > 0 && (
               <>
                 {!hasBlocksSelected && (
-                  <button
+                  <HeaderButton
+                    icon={Pencil}
                     onClick={() => setBulkOpen(true)}
-                    className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
                     title="Bulk-edit applies to subnets only"
                   >
                     Bulk Edit ({selectedCount})
-                  </button>
+                  </HeaderButton>
                 )}
-                <button
+                <HeaderButton
+                  variant="destructive"
+                  icon={Trash2}
                   onClick={() => setShowBulkDelete(true)}
-                  className="rounded-md border border-destructive/50 px-3 py-1.5 text-sm text-destructive hover:bg-destructive/10"
                 >
                   Delete ({selectedCount})
-                </button>
+                </HeaderButton>
               </>
             )}
-            <button
+            <HeaderButton
+              icon={Globe2}
               onClick={() => setShowDnsSync(true)}
               title="Reconcile IPAM-managed DNS records across every subnet in this space"
-              className="flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
             >
-              <Globe2 className="h-3.5 w-3.5" />
               Sync DNS
-            </button>
+            </HeaderButton>
             <ExportButton scope={{ space_id: space.id }} label="Export" />
-            <button
-              onClick={() => setShowEditSpace(true)}
-              className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
-            >
+            <HeaderButton icon={Pencil} onClick={() => setShowEditSpace(true)}>
               Edit Space
-            </button>
-            <button
+            </HeaderButton>
+            <HeaderButton
+              icon={Layers}
               onClick={() => setShowCreateBlock(true)}
-              className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
             >
-              <span className="flex items-center gap-1.5">
-                <Layers className="h-3.5 w-3.5" />
-                Add Block
-              </span>
-            </button>
-            <button
+              Add Block
+            </HeaderButton>
+            <HeaderButton
+              variant="primary"
+              icon={Plus}
               onClick={() => setShowCreateSubnet(true)}
-              className="flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90"
             >
-              <Plus className="h-3.5 w-3.5" />
               Add Subnet
-            </button>
+            </HeaderButton>
           </div>
         </div>
         <div>

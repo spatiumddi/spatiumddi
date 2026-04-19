@@ -29,6 +29,7 @@ import {
   ListTree,
 } from "lucide-react";
 import { Modal } from "@/components/ui/modal";
+import { HeaderButton } from "@/components/ui/header-button";
 import {
   dnsApi,
   dnsBlocklistApi,
@@ -1552,60 +1553,49 @@ function ZoneDetailView({
           </p>
         </div>
         <div className="flex items-center gap-2">
-          <button
-            className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-muted"
+          <HeaderButton
+            icon={RefreshCw}
+            iconClassName={isFetching ? "animate-spin" : ""}
             onClick={() =>
               qc.invalidateQueries({ queryKey: ["dns-records", zone.id] })
             }
             disabled={isFetching}
             title="Reload the record list from SpatiumDDI (does not re-query the DNS server)"
           >
-            <RefreshCw
-              className={`h-3.5 w-3.5 ${isFetching ? "animate-spin" : ""}`}
-            />{" "}
             Refresh
-          </button>
-          <button
-            className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-muted"
-            onClick={() => setShowImport(true)}
-          >
-            <Upload className="h-3.5 w-3.5" /> Import
-          </button>
-          <button
-            className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-muted"
-            onClick={handleExport}
-          >
-            <Download className="h-3.5 w-3.5" /> Export
-          </button>
-          <button
-            className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent disabled:opacity-50"
+          </HeaderButton>
+          <HeaderButton
+            icon={RefreshCw}
+            iconClassName={syncMut.isPending ? "animate-spin" : ""}
             onClick={() => syncMut.mutate()}
             disabled={syncMut.isPending}
             title="Two-way additive sync with the zone's authoritative server: AXFR missing records into SpatiumDDI, then push anything in our DB that isn't on the wire. Never deletes."
           >
-            <RefreshCw
-              className={`h-3 w-3 ${syncMut.isPending ? "animate-spin" : ""}`}
-            />
             {syncMut.isPending ? "Syncing…" : "Sync with server"}
-          </button>
-          <button
-            className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent"
-            onClick={() => setShowEditZone(true)}
-          >
-            <Pencil className="h-3 w-3" /> Edit Zone
-          </button>
-          <button
-            className="flex items-center gap-1 rounded-md border border-destructive/40 px-2 py-1 text-xs text-destructive hover:bg-destructive/10"
+          </HeaderButton>
+          <HeaderButton icon={Upload} onClick={() => setShowImport(true)}>
+            Import
+          </HeaderButton>
+          <HeaderButton icon={Download} onClick={handleExport}>
+            Export
+          </HeaderButton>
+          <HeaderButton icon={Pencil} onClick={() => setShowEditZone(true)}>
+            Edit Zone
+          </HeaderButton>
+          <HeaderButton
+            variant="destructive"
+            icon={Trash2}
             onClick={() => setConfirmDelete(true)}
           >
-            <Trash2 className="h-3 w-3" /> Delete Zone
-          </button>
-          <button
-            className="flex items-center gap-1 rounded-md bg-primary px-2 py-1 text-xs text-primary-foreground hover:bg-primary/90"
+            Delete Zone
+          </HeaderButton>
+          <HeaderButton
+            variant="primary"
+            icon={Plus}
             onClick={() => setShowAddRecord(true)}
           >
-            <Plus className="h-3 w-3" /> Add Record
-          </button>
+            Add Record
+          </HeaderButton>
         </div>
       </div>
 

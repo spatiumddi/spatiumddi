@@ -614,7 +614,7 @@ export function SubnetImportExportButton({
       <div className="relative">
         <button
           onClick={() => setOpen((o) => !o)}
-          className="flex items-center gap-1 rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
+          className="inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm whitespace-nowrap hover:bg-muted"
           title="Import or export IP addresses"
         >
           Import / Export

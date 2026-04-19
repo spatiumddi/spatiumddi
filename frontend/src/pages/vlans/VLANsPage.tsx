@@ -9,6 +9,7 @@ import {
   Tag,
 } from "lucide-react";
 import { Modal } from "@/components/ui/modal";
+import { HeaderButton } from "@/components/ui/header-button";
 import {
   vlansApi,
   ipamApi,
@@ -318,23 +319,21 @@ function RouterDetail({
           <RouterIcon className="h-5 w-5 text-blue-600 dark:text-blue-400" />
           <h1 className="text-lg font-semibold">{router.name}</h1>
         </div>
-        <div className="flex gap-2">
-          <button
-            onClick={() => setShowEdit(true)}
-            className="rounded-md border px-3 py-1 text-xs hover:bg-muted"
-          >
-            <Pencil className="h-3 w-3 inline mr-1" /> Edit
-          </button>
-          <button
+        <div className="flex items-center gap-2">
+          <HeaderButton icon={Pencil} onClick={() => setShowEdit(true)}>
+            Edit
+          </HeaderButton>
+          <HeaderButton
+            variant="destructive"
+            icon={Trash2}
             onClick={() => {
               setDeleteChecked(false);
               setDeleteError(null);
               setDeleteStep(1);
             }}
-            className="rounded-md border px-3 py-1 text-xs text-destructive hover:bg-destructive/10"
           >
-            <Trash2 className="h-3 w-3 inline mr-1" /> Delete
-          </button>
+            Delete
+          </HeaderButton>
         </div>
       </div>
 
@@ -609,19 +608,17 @@ function VLANDetail({
             </span>
           </h1>
         </div>
-        <div className="flex gap-2">
-          <button
-            onClick={() => setShowEdit(true)}
-            className="rounded-md border px-3 py-1 text-xs hover:bg-muted"
-          >
-            <Pencil className="h-3 w-3 inline mr-1" /> Edit
-          </button>
-          <button
+        <div className="flex items-center gap-2">
+          <HeaderButton icon={Pencil} onClick={() => setShowEdit(true)}>
+            Edit
+          </HeaderButton>
+          <HeaderButton
+            variant="destructive"
+            icon={Trash2}
             onClick={() => setConfirmDelete(true)}
-            className="rounded-md border px-3 py-1 text-xs text-destructive hover:bg-destructive/10"
           >
-            <Trash2 className="h-3 w-3 inline mr-1" /> Delete
-          </button>
+            Delete
+          </HeaderButton>
         </div>
       </div>
 
