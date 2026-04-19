@@ -18,7 +18,7 @@ from app.api.v1.ipam.io_router import router as io_router
 from app.core.permissions import require_any_resource_permission
 from app.drivers.dhcp import is_agentless
 from app.models.audit import AuditLog
-from app.models.dhcp import DHCPConfigOp, DHCPScope, DHCPServer, DHCPStaticAssignment
+from app.models.dhcp import DHCPConfigOp, DHCPPool, DHCPScope, DHCPServer, DHCPStaticAssignment
 from app.models.dns import DNSRecord, DNSZone
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet, SubnetDomain
 from app.models.vlans import VLAN
@@ -362,6 +362,90 @@ def _collision_http_exc(warnings: list[dict[str, Any]]) -> HTTPException:
         status_code=status.HTTP_409_CONFLICT,
         detail={"warnings": warnings, "requires_confirmation": True},
     )
+
+
+# ── DHCP pool awareness ───────────────────────────────────────────────────────
+#
+# An IP that falls inside a ``dynamic`` DHCP pool is handed out by the DHCP
+# server itself (first-come-first-served). IPAM must not hand it to somebody
+# else or the two will race on lease grants. ``excluded`` / ``reserved``
+# pool types are informational — allocation there is fine.
+
+
+async def _load_dynamic_pool_ranges(
+    db: AsyncSession, subnet_id: uuid.UUID
+) -> list[tuple[int, int]]:
+    """Return ``[(start_int, end_int)]`` for every dynamic pool on this subnet.
+
+    Joins through ``DHCPScope`` because pools hang off scopes, not subnets.
+    Returned as packed int tuples for cheap ``ip_int in range`` checks in
+    the hot loop of ``allocate_next_ip`` / preview. IPv6 pools are
+    represented the same way (``int(IPv6Address)`` fits in Python ints).
+    """
+    rows = await db.execute(
+        select(DHCPPool.start_ip, DHCPPool.end_ip)
+        .join(DHCPScope, DHCPScope.id == DHCPPool.scope_id)
+        .where(DHCPScope.subnet_id == subnet_id)
+        .where(DHCPPool.pool_type == "dynamic")
+    )
+    out: list[tuple[int, int]] = []
+    for start_ip, end_ip in rows.all():
+        try:
+            s = int(ipaddress.ip_address(str(start_ip)))
+            e = int(ipaddress.ip_address(str(end_ip)))
+        except (ValueError, TypeError):
+            continue
+        if s > e:
+            s, e = e, s
+        out.append((s, e))
+    return out
+
+
+def _ip_int_in_dynamic_pool(
+    ip_int: int, ranges: list[tuple[int, int]]
+) -> bool:
+    return any(s <= ip_int <= e for s, e in ranges)
+
+
+async def _pick_next_available_ip(
+    db: AsyncSession,
+    subnet: Subnet,
+    *,
+    strategy: str = "sequential",
+) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    """Return the first free host in ``subnet`` that isn't in a dynamic pool.
+
+    Shared by ``allocate_next_ip`` (which commits) and the read-only
+    preview endpoint. IPv6 isn't supported — callers check upstream and
+    fall back to manual allocation.
+    """
+    net = _parse_network(str(subnet.network))
+    if isinstance(net, ipaddress.IPv6Network):
+        return None
+
+    used_result = await db.execute(
+        select(IPAddress.address).where(IPAddress.subnet_id == subnet.id)
+    )
+    used: set[str] = {str(row[0]) for row in used_result}
+
+    dynamic_ranges = await _load_dynamic_pool_ranges(db, subnet.id)
+
+    # Cap the linear search at 65k hosts for very large IPv4 subnets.
+    max_search = 65536
+    hosts = list(net.hosts()) if net.prefixlen >= 16 else list(net.hosts())[:max_search]
+
+    if strategy == "random":
+        import random  # noqa: PLC0415 — local import mirrors the legacy site
+
+        random.shuffle(hosts)
+
+    for host in hosts:
+        if str(host) in used:
+            continue
+        if dynamic_ranges and _ip_int_in_dynamic_pool(int(host), dynamic_ranges):
+            continue
+        return host
+    return None
 
 
 async def _resolve_reverse_zone(
@@ -3338,6 +3422,20 @@ async def create_address(
             detail=f"Address {body.address} is not within subnet {subnet.network}",
         )
 
+    # Refuse allocation inside a dynamic DHCP pool — the DHCP server owns
+    # that range and will hand it out on first ``DISCOVER``. Other pool
+    # types (excluded / reserved) don't conflict with manual allocation.
+    dynamic_ranges = await _load_dynamic_pool_ranges(db, subnet_id)
+    if dynamic_ranges and _ip_int_in_dynamic_pool(int(addr), dynamic_ranges):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"{body.address} falls inside a dynamic DHCP pool — those IPs "
+                "are managed by the DHCP server. Use a static-DHCP reservation "
+                "or pick an address outside the dynamic range."
+            ),
+        )
+
     # MAC address required for static_dhcp
     if body.status == "static_dhcp" and not body.mac_address:
         raise HTTPException(
@@ -3816,6 +3914,40 @@ async def purge_orphans(
 # ── Next available IP ──────────────────────────────────────────────────────────
 
 
+class NextIPPreview(BaseModel):
+    address: str | None
+    strategy: str
+    # ``None`` when the subnet is full or IPv6 (preview isn't supported there).
+    # The UI should hide the candidate line + disable submit in that case.
+
+
+@router.get("/subnets/{subnet_id}/next-ip-preview", response_model=NextIPPreview)
+async def preview_next_ip(
+    subnet_id: uuid.UUID,
+    current_user: CurrentUser,
+    db: DB,
+    strategy: str = "sequential",
+) -> NextIPPreview:
+    """Read-only peek at the IP ``allocate_next_ip`` would hand out next.
+
+    Used by the ``Allocate IP`` modal to show the candidate without
+    committing. No lock, no write — so two users opening the modal at
+    the same time will see the same candidate and the first to submit
+    wins. The losing client gets a 409 from the commit path and can
+    re-open for the next one.
+    """
+    if strategy not in {"sequential", "random"}:
+        raise HTTPException(status_code=422, detail="strategy must be 'sequential' or 'random'")
+    subnet = await db.get(Subnet, subnet_id)
+    if subnet is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
+    net = _parse_network(str(subnet.network))
+    if isinstance(net, ipaddress.IPv6Network):
+        return NextIPPreview(address=None, strategy=strategy)
+    chosen = await _pick_next_available_ip(db, subnet, strategy=strategy)
+    return NextIPPreview(address=str(chosen) if chosen else None, strategy=strategy)
+
+
 @router.post(
     "/subnets/{subnet_id}/next",
     response_model=IPAddressResponse,
@@ -3854,20 +3986,11 @@ async def allocate_next_ip(
         if warnings:
             raise _collision_http_exc(warnings)
 
-    net = _parse_network(str(subnet.network))
-
-    # Fetch all used addresses in this subnet
-    used_result = await db.execute(
-        select(IPAddress.address).where(IPAddress.subnet_id == subnet_id)
-    )
-    # Normalise to string set; asyncpg returns INET as str
-    used: set[str] = {str(row[0]) for row in used_result}
-
     # IPv6 subnets are typically /64 or larger — enumerating 2^64 addresses
     # is impossible, and even "random" would need a hash-based scheme with
     # duplicate checks. Rather than misbehave, surface a clear 409 and make
     # the UI side fall back to manual allocation (per the IPv6 roadmap item).
-    if isinstance(net, ipaddress.IPv6Network):
+    if isinstance(_parse_network(str(subnet.network)), ipaddress.IPv6Network):
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
             detail=(
@@ -3876,25 +3999,14 @@ async def allocate_next_ip(
             ),
         )
 
-    # For large IPv4 subnets, cap the linear search at 65k hosts.
-    max_search = 65536
-    hosts = list(net.hosts()) if net.prefixlen >= 16 else list(net.hosts())[:max_search]
-
-    if body.strategy == "random":
-        import random
-
-        random.shuffle(hosts)
-
-    chosen: ipaddress.IPv4Address | ipaddress.IPv6Address | None = None
-    for host in hosts:
-        if str(host) not in used:
-            chosen = host
-            break
-
+    chosen = await _pick_next_available_ip(db, subnet, strategy=body.strategy)
     if chosen is None:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail="No available IP addresses in this subnet",
+            detail=(
+                "No available IP addresses in this subnet (every free host "
+                "is reserved or falls in a dynamic DHCP pool)."
+            ),
         )
 
     ip = IPAddress(

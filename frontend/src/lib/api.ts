@@ -787,6 +787,16 @@ export const ipamApi = {
     api
       .post<IPAddress>(`/ipam/subnets/${subnetId}/next`, data)
       .then((r) => r.data),
+  previewNextIp: (
+    subnetId: string,
+    strategy: "sequential" | "random" = "sequential",
+  ) =>
+    api
+      .get<{
+        address: string | null;
+        strategy: string;
+      }>(`/ipam/subnets/${subnetId}/next-ip-preview`, { params: { strategy } })
+      .then((r) => r.data),
 
   // Subnet ↔ DNS domain associations (§11)
   listSubnetDomains: (subnetId: string) =>

@@ -1849,16 +1849,60 @@ function AddAddressModal({
   >(null);
   const needsDhcpScope = ipStatus === "dhcp" || ipStatus === "static_dhcp";
 
+  // Scopes load unconditionally (cheap) so we can do the dynamic-pool
+  // check + pool warnings even before the user flips to ``static_dhcp``.
   const { data: dhcpScopes = [] } = useQuery({
     queryKey: ["dhcp-scopes-subnet", subnetId],
     queryFn: () => dhcpApi.listScopesBySubnet(subnetId),
-    enabled: needsDhcpScope,
   });
+  const poolQueries = useQueries({
+    queries: dhcpScopes.map((sc) => ({
+      queryKey: ["dhcp-pools", sc.id],
+      queryFn: () => dhcpApi.listPools(sc.id),
+      staleTime: 60_000,
+    })),
+  });
+  const allPools = poolQueries.flatMap((q) => q.data ?? []);
+
   useEffect(() => {
     if (needsDhcpScope && !dhcpScopeId && dhcpScopes.length > 0) {
       setDhcpScopeId(dhcpScopes[0].id);
     }
   }, [needsDhcpScope, dhcpScopes.length]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  // Which dynamic pool does the manually-entered IP fall in, if any?
+  // Server-side ``create_address`` will reject with 422 regardless, but
+  // a red inline warning + disabled submit button is friendlier.
+  const typedDynamicPool = (() => {
+    if (mode !== "manual" || !address) return null;
+    const ipInt = ipStringToInt(address);
+    if (!Number.isFinite(ipInt)) return null;
+    for (const p of allPools) {
+      if (p.pool_type !== "dynamic") continue;
+      const s = ipStringToInt(p.start_ip);
+      const e = ipStringToInt(p.end_ip);
+      if (
+        Number.isFinite(s) &&
+        Number.isFinite(e) &&
+        ipInt >= s &&
+        ipInt <= e
+      ) {
+        return p;
+      }
+    }
+    return null;
+  })();
+
+  // Preview the IP the backend would hand out on "next available". Only
+  // meaningful for IPv4; the endpoint returns ``address: null`` on v6
+  // or when the subnet is exhausted — the UI handles both.
+  const { data: nextPreview, isFetching: previewFetching } = useQuery({
+    queryKey: ["next-ip-preview", subnetId],
+    queryFn: () => ipamApi.previewNextIp(subnetId, "sequential"),
+    enabled: mode === "next",
+    refetchOnMount: "always",
+    staleTime: 0,
+  });
 
   const { data: cfDefs = [] } = useQuery({
     queryKey: ["custom-fields", "ip_address"],
@@ -1984,7 +2028,9 @@ function AddAddressModal({
     setPendingWarnings(null);
   }, [hostname, mac, dnsZoneId, address]);
 
-  const canSubmit = !!hostname.trim() && (mode === "next" || !!address);
+  const canSubmit =
+    !!hostname.trim() &&
+    (mode === "next" ? !!nextPreview?.address : !!address && !typedDynamicPool);
 
   // Compute preview FQDN
   const selectedZone = availableZones.find((z: DNSZone) => z.id === dnsZoneId);
@@ -2012,6 +2058,30 @@ function AddAddressModal({
             </button>
           ))}
         </div>
+        {mode === "next" && (
+          <div className="rounded-md border bg-muted/30 px-3 py-2 text-xs">
+            {previewFetching && !nextPreview ? (
+              <span className="text-muted-foreground">
+                Finding next available IP…
+              </span>
+            ) : nextPreview?.address ? (
+              <>
+                <span className="text-muted-foreground">Next available:</span>{" "}
+                <span className="font-mono text-sm font-semibold text-emerald-600 dark:text-emerald-400">
+                  {nextPreview.address}
+                </span>
+                <span className="ml-2 text-muted-foreground">
+                  (skips dynamic DHCP pools)
+                </span>
+              </>
+            ) : (
+              <span className="text-destructive">
+                No free IPs in this subnet (all in use or inside a dynamic
+                pool).
+              </span>
+            )}
+          </div>
+        )}
         {mode === "manual" && (
           <Field label="IP Address">
             <input
@@ -2021,6 +2091,16 @@ function AddAddressModal({
               placeholder="e.g. 10.0.1.42"
               autoFocus
             />
+            {typedDynamicPool && (
+              <p className="mt-1 rounded-md border border-destructive/40 bg-destructive/10 px-2 py-1 text-xs text-destructive">
+                {address} is inside the dynamic DHCP pool{" "}
+                <span className="font-mono">
+                  {typedDynamicPool.start_ip}–{typedDynamicPool.end_ip}
+                </span>
+                {typedDynamicPool.name ? ` (${typedDynamicPool.name})` : ""}.
+                The DHCP server owns this range — pick an address outside it.
+              </p>
+            )}
           </Field>
         )}
         <Field label="Hostname *">
@@ -2387,6 +2467,37 @@ function SyncMenu({
   );
 }
 
+// ─── IP <-> int helpers + pool-boundary row type ────────────────────────────
+//
+// IPv4-only utilities for interleaving pool markers with IP rows in the
+// subnet IP list. IPv6 pool markers are out of scope until the IPv6
+// allocation story lands.
+
+function ipStringToInt(ip: string): number {
+  const p = ip.split(".").map(Number);
+  if (p.length !== 4 || p.some((n) => Number.isNaN(n) || n < 0 || n > 255))
+    return NaN;
+  return ((p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3]) >>> 0;
+}
+
+type PoolMeta = {
+  id: string;
+  name: string;
+  pool_type: string;
+  start_ip: string;
+  end_ip: string;
+  _start: number;
+  _end: number;
+};
+
+type AddressOrPoolRow =
+  | { kind: "ip"; addr: IPAddress }
+  | {
+      kind: "pool-boundary";
+      pool: PoolMeta;
+      boundary: "start" | "end";
+    };
+
 // ─── Subnet Detail Panel (right pane) ────────────────────────────────────────
 
 function SubnetDetail({
@@ -2609,6 +2720,71 @@ function SubnetDetail({
     return true;
   });
   const hasActiveFilter = Object.values(colFilters).some(Boolean);
+
+  // Interleave DHCP pool boundary markers with the IP rows so the user
+  // can see where a pool begins / ends, even when no IPs are assigned
+  // inside it yet. Dynamic pools are the important case (they can't be
+  // manually allocated); static / excluded pools are shown for parity.
+  // IPv4-only — matches the existing ``ipPoolInfo`` helper.
+  const tableRows = (() => {
+    if (!filteredAddresses) return [] as AddressOrPoolRow[];
+    const rows: AddressOrPoolRow[] = [];
+    const sortedPools = [...allPools]
+      .map((p) => ({
+        ...p,
+        _start: ipStringToInt(p.start_ip),
+        _end: ipStringToInt(p.end_ip),
+      }))
+      .filter((p) => Number.isFinite(p._start) && Number.isFinite(p._end))
+      .sort((a, b) => a._start - b._start);
+
+    const started = new Set<string>();
+    const ended = new Set<string>();
+
+    const emitStarts = (ipInt: number) => {
+      for (const p of sortedPools) {
+        if (!started.has(p.id) && p._start <= ipInt) {
+          rows.push({ kind: "pool-boundary", pool: p, boundary: "start" });
+          started.add(p.id);
+        }
+      }
+    };
+    const emitEnds = (ipInt: number) => {
+      for (const p of sortedPools) {
+        if (started.has(p.id) && !ended.has(p.id) && p._end < ipInt) {
+          rows.push({ kind: "pool-boundary", pool: p, boundary: "end" });
+          ended.add(p.id);
+        }
+      }
+    };
+
+    for (const addr of filteredAddresses) {
+      const ipInt = ipStringToInt(String(addr.address));
+      if (!Number.isFinite(ipInt)) {
+        rows.push({ kind: "ip", addr });
+        continue;
+      }
+      emitStarts(ipInt);
+      emitEnds(ipInt);
+      rows.push({ kind: "ip", addr });
+    }
+    // Close out any pools still open, then emit markers for pools that
+    // sit entirely past the last assigned IP so the range is still
+    // visible.
+    for (const p of sortedPools) {
+      if (started.has(p.id) && !ended.has(p.id)) {
+        rows.push({ kind: "pool-boundary", pool: p, boundary: "end" });
+        ended.add(p.id);
+      }
+    }
+    for (const p of sortedPools) {
+      if (!started.has(p.id)) {
+        rows.push({ kind: "pool-boundary", pool: p, boundary: "start" });
+        rows.push({ kind: "pool-boundary", pool: p, boundary: "end" });
+      }
+    }
+    return rows;
+  })();
 
   const [confirmDeleteAddr, setConfirmDeleteAddr] = useState<IPAddress | null>(
     null,
@@ -3225,7 +3401,52 @@ function SubnetDetail({
                         </td>
                       </tr>
                     )}
-                    {filteredAddresses?.map((addr: IPAddress) => {
+                    {tableRows.map((row, rowIdx) => {
+                      if (row.kind === "pool-boundary") {
+                        const pool = row.pool;
+                        const isDynamic = pool.pool_type === "dynamic";
+                        const tint = isDynamic
+                          ? "bg-cyan-500/10 text-cyan-700 dark:text-cyan-300 border-y border-cyan-500/30"
+                          : pool.pool_type === "reserved"
+                            ? "bg-violet-500/10 text-violet-700 dark:text-violet-300 border-y border-violet-500/30"
+                            : "bg-zinc-500/10 text-zinc-700 dark:text-zinc-300 border-y border-zinc-500/30";
+                        const arrow = row.boundary === "start" ? "▼" : "▲";
+                        const label =
+                          row.boundary === "start"
+                            ? `Start of ${pool.pool_type} pool`
+                            : `End of ${pool.pool_type} pool`;
+                        const anchorIp =
+                          row.boundary === "start"
+                            ? pool.start_ip
+                            : pool.end_ip;
+                        return (
+                          <tr key={`pool-${pool.id}-${row.boundary}-${rowIdx}`}>
+                            <td
+                              colSpan={10}
+                              className={cn("px-4 py-1.5", tint)}
+                            >
+                              <span className="mr-2 font-mono text-xs">
+                                {arrow}
+                              </span>
+                              <span className="text-xs font-semibold uppercase tracking-wide">
+                                {label}
+                              </span>
+                              {pool.name && (
+                                <span className="ml-2 text-xs">
+                                  — {pool.name}
+                                </span>
+                              )}
+                              <span className="ml-2 font-mono text-xs opacity-80">
+                                {anchorIp}
+                              </span>
+                              <span className="ml-3 text-[11px] opacity-70">
+                                range {pool.start_ip} – {pool.end_ip}
+                              </span>
+                            </td>
+                          </tr>
+                        );
+                      }
+                      const addr = row.addr;
                       const dnsState = ipDnsState(addr);
                       const systemRow =
                         addr.status === "network" ||
