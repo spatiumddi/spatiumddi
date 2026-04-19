@@ -7,7 +7,25 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versioning uses 
 
 ## Unreleased
 
-Post-2026.04.18-1 audit sweep + the DDNS pipeline.
+_No unreleased changes yet._
+
+---
+
+## 2026.04.19-1 — 2026-04-19
+
+The **performance, polish, and visibility** release. Batched WinRM
+dispatch turns multi-minute Windows DNS / DHCP syncs into a handful of
+round trips. A new **Logs** surface exposes Windows Event Log + per-day
+DHCP audit files over WinRM with filter / auto-fetch / date-picker UX.
+The IPAM tree gains subnet + block **resize** with blast-radius preview,
+subnet-scoped IP **import**, **DHCP pool awareness** (pool boundary
+rows + dynamic-pool gates + next-IP preview), and **collision warnings**
+on hostname+zone / MAC. Sync menu + DHCP sync modal + combined
+Sync-All modal replace the silent lease-sync button. Dashboard rebuilt
+around a **subnet-utilization heatmap** + live activity feed. Every
+modal is now **draggable**; every detail-page header uses the same
+**`HeaderButton`** primitive. DDNS (DHCP lease → DNS A/PTR) ships for
+the agentless lease-pull path.
 
 ### Added
 
@@ -43,6 +61,268 @@ Post-2026.04.18-1 audit sweep + the DDNS pipeline.
   implementation (architecture diagram, subnet fields, policy
   semantics, static override, idempotency, enable walkthrough).
 
+**Logs surface — Windows Event Log + DHCP audit (WinRM)**
+- New top-level `/logs` page + sidebar entry. Pulls events on demand
+  over WinRM from any agentless server that has credentials set — no
+  new env vars, no migrations.
+- `app/drivers/windows_events.py` — shared helper `fetch_events()`
+  builds a `Get-WinEvent -FilterHashtable` script from neutral filters
+  (log_name, level 1-5, max_events 1-500, since datetime, event_id).
+  Filters run server-side so the full log never crosses the wire.
+- Drivers expose log inventory through
+  `available_log_names()` + `get_events()`:
+  `WindowsDNSDriver` → `DNS Server` (classic) +
+  `Microsoft-Windows-DNSServer/Audit`;
+  `WindowsDHCPReadOnlyDriver` → `Operational` +
+  `FilterNotifications`. Analytical log omitted (noisy, per-query —
+  better viewed in MMC).
+- `GET /logs/sources` — lists every server with WinRM creds + its
+  available log names for the picker.
+- `POST /logs/query` — runs the filtered `Get-WinEvent`; 400 on
+  missing creds, 502 on upstream PowerShell failure with the Windows
+  error surfaced to the UI.
+- Dispatch goes through the abstract driver interface — logs router
+  never imports `windows_events` directly (non-negotiable #10).
+- **DHCP audit tab** — separate endpoint `POST /logs/dhcp-audit`
+  reads `C:\Windows\System32\dhcp\DhcpSrvLog-<Day>.log` (the
+  CSV-style per-lease trail Windows DHCP writes by default) over
+  WinRM. Handles UTF-16 + ASCII encodings; event-code → human label
+  map covers documented codes; unknown codes come through as
+  `Code <n>` so new Windows releases don't drop silently. Access
+  denied / missing file / locked-by-rotation all return `[]` instead
+  of 500.
+- Frontend: **Event Log | DHCP Audit** tab switcher reusing shared
+  `ServerPicker` / `MaxEventsPicker` / `FilterSearch` / `RefreshButton`
+  helpers. Audit tab columns: Time / Event (code + label) / IP /
+  Hostname / MAC / Description with event-dot colours mirroring
+  Windows severity families; event-code distribution picker (e.g.
+  `10 — Lease granted (238)`) for targeted filtering; day picker
+  defaults to Today with Mon-Sun backfill.
+- Auto-fetch via `useQuery` keyed on every filter so page entry +
+  filter changes trigger refetch; `staleTime: Infinity` means
+  tab-switch doesn't spam the DC. Explicit **Refresh** button calls
+  `refetch()` to bypass cache.
+- Date picker uses native `<input type="datetime-local">` + `since`
+  on `LogQueryRequest`; `×` clear button inline.
+
+**IPAM — subnet + block resize (grow-only, preview + commit)**
+- `POST /ipam/subnets/{id}/resize/preview` + `POST /ipam/subnets/{id}/resize`;
+  parallel endpoints at `/ipam/blocks/{id}/resize/...`. Shrinking is
+  explicitly out of scope — it silently orphans addresses.
+- Preview returns a blast-radius summary (affected IPs, DHCP scopes,
+  pools, static assignments, DNS records, reverse zones to create)
+  + a `conflicts[]` list that disables the commit button when
+  non-empty.
+- Rules enforced server-side: grow only; same address family; old
+  CIDR ⊂ new CIDR; new CIDR fits inside the parent block; no overlap
+  with any subnet or block anywhere in the space (cross-subtree
+  scan); block children must still fit; per-resource pg advisory
+  lock during commit; commit re-runs every validation (TOCTOU guard)
+  before mutating; optional gateway-to-first-usable move; rejects at
+  preview when the new CIDR has no usable range
+  (`/31 /32 /127 /128`).
+- Renamed or DNS-bearing placeholder rows are preserved across
+  resize; only default-named network/broadcast rows get recreated at
+  the new boundaries.
+- Reverse-zone backfill runs on commit so `/24 → /23` creates the
+  second reverse zone automatically.
+- Single audit entry per resize with old → new CIDR + counts.
+- UI `ResizeSubnetModal` / `ResizeBlockModal` with typed-CIDR
+  confirmation gate. Commit button hidden (not just disabled) on
+  conflict so the user has no false sense they can force-commit.
+
+**IPAM — subnet-scoped IP address import**
+- Space-scoped importer already existed; the new subnet-scoped flow
+  handles the common "export IPs from vendor X, load into
+  SpatiumDDI" migration. `POST /ipam/import/addresses/preview` +
+  `/commit`.
+- Parser auto-routes CSV / JSON / XLSX rows by header:
+  `address` / `ip` → addresses, `network` → subnets. Unrecognised
+  columns drop into `custom_fields` so other-vendor exports work
+  without rename passes.
+- Validates each IP falls inside the subnet CIDR; respects
+  fail / skip / overwrite strategies; writes audit rows; calls
+  `_sync_dns_record` so rows with hostnames publish A + PTR through
+  the same RFC 2136 path the UI uses.
+- Frontend `AddressImportModal` + a combined `Import / Export`
+  dropdown on the subnet header.
+
+**IPAM — IP assignment collision warnings**
+- Two non-fatal guardrails on IP create / update:
+  **FQDN collision** on same `(lower(hostname), forward_zone_id)`
+  across any subnet, and **MAC collision** on same MAC anywhere in
+  IPAM.
+- Server: new `_normalize_mac` + `_check_ip_collisions` helpers in
+  `backend/app/api/v1/ipam/router.py`; `force: bool = False` added
+  to `IPAddressCreate` / `IPAddressUpdate` / `NextIPRequest`. When
+  `force=false` and the pending assignment collides, the endpoint
+  returns 409 with
+  `detail = {warnings: [...], requires_confirmation: true}`. Clients
+  re-submit with `force=true` to proceed.
+- Update path only checks fields the client explicitly set
+  (`model_dump(exclude_unset=True)`), so unchanged rows never
+  surface a pre-existing collision on unrelated edits;
+  `exclude_ip_id` keeps the row from colliding with its own current
+  state.
+- UI: shared `CollisionWarning` type + amber
+  `CollisionWarningBanner` in `IPAMPage.tsx`. Allocate and edit
+  modals parse the 409, render one line per collision, and flip the
+  submit button to "Allocate anyway" / "Save anyway". Editing any
+  collision-relevant field clears the pending warning so the next
+  submit re-checks fresh.
+
+**IPAM — DHCP pool awareness**
+- IP listing interleaves ▼ start / ▲ end pool boundary rows with
+  existing IP rows. Dynamic pools tint cyan, reserved violet,
+  excluded zinc. Each marker shows pool name + full range so the
+  user sees pool extents even when no IP is assigned inside.
+- `create_address` rejects with 422 when `body.address` lands inside
+  a **dynamic** pool — the DHCP server owns that range. Excluded /
+  reserved pools still allow manual allocation.
+- `allocate_next_ip` uses a hoisted `_pick_next_available_ip` helper
+  that skips dynamic ranges during its linear search.
+- New `GET /ipam/subnets/{id}/next-ip-preview?strategy=...` returns
+  `{address, strategy}` without committing.
+- `AddAddressModal` "next" mode loads the preview on open and shows
+  `Next available: 10.0.1.42 (skips dynamic DHCP pools)` in emerald
+  — or a destructive "no free IPs" line with submit disabled when
+  exhausted. Manual mode renders an inline red warning + disables
+  submit when the typed IP falls in a dynamic range.
+
+**IPAM — Sync menu + DHCP sync modals**
+- `[Sync ▾]` dropdown in the subnet detail header with **DNS**,
+  **DHCP** (gated on scope presence), and **All** entries. DHCP fans
+  out `POST /dhcp/servers/{id}/sync-leases` across every unique
+  server backing a scope in this subnet (deduped,
+  `Promise.allSettled` so one bad server doesn't mask the others).
+- `DhcpSyncModal` — per-server result cards (pending spinner → Done
+  / Failed) with a counter grid: active leases, refreshed, new,
+  **removed** (deleted on server), IPAM created, **IPAM revoked**.
+  `removed` + `ipam_revoked` highlight amber when non-zero —
+  they're the rows the stale-lease fix cleaned up. Close disabled
+  until every server reports.
+- `SyncAllModal` — one modal, two sections. DHCP panel uses the
+  same `useDhcpSync` hook + body component. DNS panel fetches the
+  existing drift summary (`missing / mismatched / stale / total`)
+  and either shows "In sync" or an amber block with a "Review DNS
+  changes…" button that chains into the existing `DnsSyncModal`.
+
+**IPAM — refresh buttons**
+- `[↻ Refresh]` buttons added to DNS zone records page, IPAM subnet
+  detail, and the VLANs sidebar. Each invalidates every React Query
+  key the surface consumes.
+
+**Dashboard rewrite**
+- Six compact KPI cards (IP Spaces / Subnets / Allocated IPs /
+  Utilization / DNS Zones / Servers), tone-coloured left accent
+  stripe, hover state, most click through to their module page.
+- **Subnet Utilization Heatmap** (hero) — every managed subnet is
+  one grid cell coloured by utilization. Auto-fill flow, hover
+  tooltip (network + name + %/allocated/total), click opens the
+  subnet in IPAM. Header has a colour legend; footer shows avg /
+  p95 / hot counts.
+- Two-column split: Top Subnets by Utilization + Live Activity
+  feed (auto-refreshes every 15 s, action-family colour coding,
+  relative timestamps).
+- Services panel: two-column DNS + DHCP server list with status
+  dots (pulsing for active + enabled) + driver / group /
+  last-checked columns.
+
+### Changed
+
+**Batched WinRM dispatch** — the major perf win.
+- New `apply_record_changes` on DNSDriver and
+  `apply_reservations` / `remove_reservations` / `apply_exclusions`
+  on DHCPDriver. Default ABC impls loop the singular method, so
+  BIND9 / Kea inherit the batch interface without changes.
+- Windows drivers override with real batching. DNS driver ships
+  one PowerShell script per zone chunked at `_WINRM_BATCH_SIZE = 6`
+  ops — empirically the ceiling given `pywinrm.run_ps` encodes
+  UTF-16-LE + base64 through `powershell -EncodedCommand` as a
+  single CMD.EXE command line (8191-char cap). Each chunk ships a
+  compact data-only JSON payload (short keys
+  `i/op/z/n/t/v/ttl/pr/w/p`) + one shared wrapper that dispatches
+  per record type with per-op try / catch + JSON result array.
+  One bad record doesn't abort the batch.
+- DHCP driver batches at `_WINRM_BATCH_SIZE = 30` ops — DHCP
+  payloads are leaner so the cmdline limit is further away, but
+  capped to stay safe.
+- RFC 2136 record ops run in parallel via `asyncio.gather` — cheap
+  enough per-op that batching isn't needed but serial was still
+  slow.
+- `enqueue_record_ops_batch` in `record_ops.py` groups pending ops
+  by zone and calls the plural driver method once per group.
+- IPAM Sync-DNS stale-delete path switched to batch; DNS tab
+  bulk-delete got a real server-side endpoint
+  (`POST /dns/groups/{g}/zones/{z}/records/bulk-delete`) so the
+  frontend no longer fans out N HTTP requests + the zone serial
+  bumps once per batch instead of N times.
+- DHCP `push_statics_bulk_delete` groups by (server, scope); the
+  IPAM purge-orphans path went from N×M WinRM calls to one per
+  server.
+- 40-record Sync DNS: 2-3 min → ~5 s.
+
+**Sync menu + combined Sync All** — replaces the per-page "Sync DNS"
+button on the subnet detail (see Added). Blocks and spaces keep the
+single "Sync DNS" button since they have no DHCP scopes.
+
+**UI consolidation — draggable modals.**
+- 7 near-identical `function Modal({...})` definitions (one per
+  page) collapsed into a single `<Modal>` primitive at
+  `frontend/src/components/ui/modal.tsx`.
+- Title bar is a drag handle (`cursor-grab` /
+  `active:cursor-grabbing`). Drags starting on buttons / inputs /
+  selects / textareas / anchors are ignored — controls in the header
+  stay clickable. Backdrop dimmed to `bg-black/20` so the page
+  behind the dialog stays readable. Esc closes.
+- Custom modal shapes (header with border-b + footer slot) use
+  `useDraggableModal(onClose)` + `MODAL_BACKDROP_CLS` from
+  `components/ui/use-draggable-modal.ts` (split out so Vite's
+  fast-refresh doesn't warn about mixed component / utility
+  exports).
+- Migrated every standard modal across admin, DNS, DHCP, VLANs,
+  IPAM plus `ResizeModals`, `ImportExportModals`, and the inline
+  `DnsSyncModal`. Net ~168 lines removed.
+
+**UI consolidation — standardised header buttons.**
+- New `<HeaderButton>` primitive
+  (`frontend/src/components/ui/header-button.tsx`) with three
+  variants (`secondary` / `primary` / `destructive`) on a shared
+  `inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm`
+  base. Forwards refs + spreads `ButtonHTMLAttributes` for
+  disabled / title / onClick without ceremony.
+- Logical left → right ordering applied everywhere:
+  `[Refresh] [Sync …] [Import] [Export] [misc reads] [Edit] [Resize]
+  [Delete] [+ Primary]`. DNS was `text-xs`; DHCP was a mixed
+  `text-xs px-3 py-1.5`; VLANs was `text-xs px-3 py-1`. All bumped
+  to match IPAM's dominant `text-sm px-3 py-1.5 gap-1.5`.
+- Migrated surfaces: IPAM `SubnetDetail` / `BlockDetail` /
+  `SpaceTableView`; DNS `ZoneDetailView`; DHCP `ServerDetailView`;
+  VLANs `RouterDetail` / `VLANDetail`.
+
+**Kea driver — Dhcp6 option-name translation.** New
+`_KEA_OPTION_NAMES_V6` map + `_DHCP4_ONLY_OPTION_NAMES` set;
+`_render_option_data` takes `address_family` and routes accordingly.
+v4-only options (`routers`, `broadcast-address`, `mtu`,
+`time-offset`, `domain-name`, tftp-*) are dropped from v6 scopes with
+a warning log instead of being emitted under the wrong space (which
+Kea would reject on reload). Scope / pool / reservation /
+client-class renderers all thread `address_family` through. Closes
+the Phase 1 Dhcp6 TODO.
+
+**Architecture SVG** — added explicit `width="1200" height="820"` +
+`preserveAspectRatio="xMidYMid meet"` to the root `<svg>` element.
+GitHub's blob view was falling back to ~300px when the image was
+clicked through from the README because `viewBox` alone isn't
+enough.
+
+**README rewrite — hero + Why section.** Old two-paragraph "What is
+SpatiumDDI?" prose split into a punchy tagline ("Self-hosted DNS,
+DHCP, and IPAM — one control plane, real servers underneath"), a
+new `## Why SpatiumDDI` with 5 scannable bold claims, and a
+`## What's in the box` section holding the feature bullets.
+Architecture and Getting Started sections untouched.
+
 ### Fixed
 
 - K8s worker queue mismatch — `k8s/base/worker.yaml` listed
@@ -62,18 +342,60 @@ Post-2026.04.18-1 audit sweep + the DDNS pipeline.
 - Frontend `DHCPPool` type now declares optional
   `existing_ips_in_range` so `CreatePoolModal` no longer needs an
   `as any` cast.
-
-### Changed
-
-- Kea driver gains **Dhcp6 option-name translation** — new
-  `_KEA_OPTION_NAMES_V6` map + `_DHCP4_ONLY_OPTION_NAMES` set;
-  `_render_option_data` takes `address_family` and routes
-  accordingly. v4-only options (`routers`, `broadcast-address`,
-  `mtu`, `time-offset`, `domain-name`, tftp-*) are dropped from v6
-  scopes with a warning log instead of being emitted under the
-  wrong space (which Kea would reject on reload). Scope / pool /
-  reservation / client-class renderers all thread `address_family`
-  through. Closes the Phase 1 Dhcp6 TODO.
+- **DHCP stale-lease absence-delete.** `pull_leases` was upsert-only
+  but the Windows DHCP driver only returns *active* leases, so when
+  an admin deleted a lease on the server it silently persisted in
+  our DB + in IPAM (as `auto_from_lease=True` rows). After the
+  upsert loop, `pull_leases` now finds every active `DHCPLease` row
+  for this server whose IP wasn't in the wire response and deletes
+  both the lease row and its IPAM mirror. `PullLeasesResult` gains
+  `removed` + `ipam_revoked` counters; `SyncLeasesResponse` + the
+  scheduled-task audit / log lines follow suit. The time-based
+  `dhcp_lease_cleanup` sweep continues to handle leases that drift
+  past `expires_at` between polls — the two mechanisms overlap
+  harmlessly.
+- **Sync DNS classifier — PTR overwrite on unassigned forward zone.**
+  If a subnet had a reverse zone but the forward zone had been
+  unassigned, the classifier built an "expected" PTR value of
+  `hostname.` (bare label, no FQDN); existing PTRs got classified
+  `mismatched` and the commit rewrote them to the broken value
+  instead of deleting them. Now: when only reverse is effective,
+  existing PTRs are classified `stale` with reason
+  `no-forward-zone` so the sync deletes them.
+- **Sync DNS classifier — A-record orphans invisible.** Matching
+  bug on the A-record side. Unassigning the forward zone left A
+  records orphaned in the old zone, but the classifier's
+  `if forward_zone and not is_default_gateway` branch skipped them
+  entirely — Sync DNS reported 0 drift. Now:
+  `elif not forward_zone and ip_a_records` classifies them `stale`
+  for the same reason.
+- **Sync DNS cache invalidation.** When Sync-DNS deleted a stale
+  record linked to an IPAddress, the cached `ip.fqdn` /
+  `ip.forward_zone_id` / `ip.dns_record_id` (A/AAAA/CNAME) and
+  `ip.reverse_zone_id` (PTR) stuck around; the UI kept showing the
+  old FQDN after the records were gone. The stale-delete path now
+  clears the matching cached fields.
+- **Agentless bulk-delete silent failure.** `_apply_agentless_batch`
+  caught wire failures, marked the op rows failed, and returned
+  normally — so `_apply_dns_sync` deleted the DB rows anyway and
+  told the user "deleted" while the records were still published on
+  Windows. Same hole in `bulk_delete_records`. Both paths now zip
+  through the returned op rows and only delete when
+  `state == 'applied'`; the rest surface as per-record errors /
+  skipped entries.
+- **Logs — `EventLogException` handling.** `Get-WinEvent` raises
+  `System.Diagnostics.Eventing.Reader.EventLogException` when the
+  log name doesn't exist on the target host, when zero events match,
+  or when a FilterHashtable key doesn't apply to the log — bypasses
+  `-ErrorAction SilentlyContinue`. The shared helper now wraps the
+  cmdlet in try/catch, explicitly catches `EventLogException`, and
+  falls through to a generic catch matching common "no data / bad
+  log" patterns — any of those return `[]` cleanly instead of
+  surfacing "The parameter is incorrect" / "not an event log" to the
+  UI as a 502. Dropped the bogus
+  `Microsoft-Windows-Dhcp-Server/AdminEvents` log name (it isn't a
+  real log); remaining `Operational` + `FilterNotifications` pair is
+  reliable across Server 2016+.
 
 ---
 
