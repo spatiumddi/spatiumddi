@@ -263,9 +263,7 @@ async def pull_leases_from_server(
     # (admin purge, manual release, etc). Drop the DB row and any IPAM
     # mirror we created. Manually-allocated IPAM rows (auto_from_lease
     # False) are intentionally left alone — the operator owns those.
-    wire_ips = {
-        lease.get("ip_address") for lease in wire if lease.get("ip_address")
-    }
+    wire_ips = {lease.get("ip_address") for lease in wire if lease.get("ip_address")}
     stale_q = select(DHCPLease).where(
         DHCPLease.server_id == server.id,
         DHCPLease.state == "active",

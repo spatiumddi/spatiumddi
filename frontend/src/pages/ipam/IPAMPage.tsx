@@ -50,6 +50,7 @@ import {
   type FreeCidrRange,
   type Router as NetworkRouter,
   type VLAN,
+  type DHCPLeaseSyncResult,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { useStickyLocation } from "@/lib/stickyLocation";
@@ -2412,6 +2413,8 @@ function SubnetDetail({
   const [showEditSubnet, setShowEditSubnet] = useState(false);
   const [showResizeSubnet, setShowResizeSubnet] = useState(false);
   const [showDnsSync, setShowDnsSync] = useState(false);
+  const [showDhcpSync, setShowDhcpSync] = useState(false);
+  const [showSyncAll, setShowSyncAll] = useState(false);
   const [showOrphans, setShowOrphans] = useState(false);
 
   // Lightweight drift count for the banner — cheap enough to refetch on
@@ -2485,43 +2488,6 @@ function SubnetDetail({
     })),
   });
   const allPools = allPoolQueries.flatMap((q) => q.data ?? []);
-
-  // Sync leases for every unique DHCP server that backs a scope in this
-  // subnet. Multiple scopes on the same server are deduped so we don't
-  // round-trip the same WinRM target twice. Errors are aggregated so one
-  // failing server doesn't mask the others.
-  const syncDhcpMut = useMutation({
-    mutationFn: async () => {
-      const serverIds = Array.from(
-        new Set(
-          dhcpScopes
-            .map((sc) => sc.server_id)
-            .filter((id): id is string => typeof id === "string"),
-        ),
-      );
-      const results = await Promise.allSettled(
-        serverIds.map((id) => dhcpApi.syncLeasesNow(id)),
-      );
-      const errors: string[] = [];
-      let removed = 0;
-      let ipamRevoked = 0;
-      for (const r of results) {
-        if (r.status === "fulfilled") {
-          removed += r.value.removed ?? 0;
-          ipamRevoked += r.value.ipam_revoked ?? 0;
-        } else {
-          errors.push(String((r.reason as Error)?.message ?? r.reason));
-        }
-      }
-      return { removed, ipamRevoked, errors };
-    },
-    onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["addresses", subnet.id] });
-      qc.invalidateQueries({ queryKey: ["dhcp-leases"] });
-      qc.invalidateQueries({ queryKey: ["dhcp-scopes-subnet", subnet.id] });
-      qc.invalidateQueries({ queryKey: ["dns-sync-summary", subnet.id] });
-    },
-  });
 
   // Manual refresh — bust every query the subnet panel consumes. Broad
   // keys (``dhcp-pools``, ``dhcp-leases``) match all per-scope variants
@@ -2745,13 +2711,10 @@ function SubnetDetail({
           <div className="flex flex-shrink-0 items-center gap-2">
             <SyncMenu
               hasDhcp={dhcpScopes.length > 0}
-              isPending={syncDhcpMut.isPending}
+              isPending={false}
               onSyncDns={() => setShowDnsSync(true)}
-              onSyncDhcp={() => syncDhcpMut.mutate()}
-              onSyncAll={() => {
-                setShowDnsSync(true);
-                syncDhcpMut.mutate();
-              }}
+              onSyncDhcp={() => setShowDhcpSync(true)}
+              onSyncAll={() => setShowSyncAll(true)}
             />
             <button
               onClick={refreshSubnet}
@@ -3617,6 +3580,22 @@ function SubnetDetail({
         <DnsSyncModal
           scope={{ kind: "subnet", id: subnet.id, label: subnet.network }}
           onClose={() => setShowDnsSync(false)}
+        />
+      )}
+      {showDhcpSync && (
+        <DhcpSyncModal
+          subnetId={subnet.id}
+          onClose={() => setShowDhcpSync(false)}
+        />
+      )}
+      {showSyncAll && (
+        <SyncAllModal
+          subnet={subnet}
+          onClose={() => setShowSyncAll(false)}
+          onOpenDnsDetails={() => {
+            setShowSyncAll(false);
+            setShowDnsSync(true);
+          }}
         />
       )}
       {showOrphans && (
@@ -4715,6 +4694,334 @@ function EditSubnetModal({
             </button>
           </div>
         )}
+      </div>
+    </Modal>
+  );
+}
+
+// ─── DHCP Sync Modal ─────────────────────────────────────────────────────────
+//
+// Fires ``POST /dhcp/servers/{id}/sync-leases`` against every unique DHCP
+// server that backs a scope in this subnet. Shows per-server counters as
+// each result lands. The backend now deletes leases that vanished from
+// the wire (``removed`` / ``ipam_revoked``) so a prominent row surfaces
+// how many stale rows the sync cleaned up — the common reason a user
+// clicks the button manually.
+
+type DhcpServerSyncState =
+  | { status: "pending" }
+  | { status: "done"; result: DHCPLeaseSyncResult }
+  | { status: "error"; error: string };
+
+function useDhcpSync(subnetId: string, enabled: boolean) {
+  const qc = useQueryClient();
+  const { data: scopes = [] } = useQuery({
+    queryKey: ["dhcp-scopes-subnet", subnetId],
+    queryFn: () => dhcpApi.listScopesBySubnet(subnetId),
+    enabled,
+  });
+  const { data: servers = [] } = useQuery({
+    queryKey: ["dhcp-servers"],
+    queryFn: () => dhcpApi.listServers(),
+    enabled,
+  });
+  const serverIds = Array.from(
+    new Set(
+      scopes
+        .map((sc) => sc.server_id)
+        .filter((id): id is string => typeof id === "string"),
+    ),
+  );
+  const serverNames = new Map(servers.map((s) => [s.id, s.name]));
+  const [state, setState] = useState<Map<string, DhcpServerSyncState>>(
+    new Map(),
+  );
+  const kickedOff = useRef(false);
+
+  useEffect(() => {
+    if (!enabled || kickedOff.current || serverIds.length === 0) return;
+    kickedOff.current = true;
+    setState(
+      new Map(serverIds.map((id) => [id, { status: "pending" as const }])),
+    );
+    serverIds.forEach((serverId) => {
+      dhcpApi
+        .syncLeasesNow(serverId)
+        .then((result) => {
+          setState((prev) => {
+            const next = new Map(prev);
+            next.set(serverId, { status: "done", result });
+            return next;
+          });
+        })
+        .catch((err: Error) => {
+          setState((prev) => {
+            const next = new Map(prev);
+            next.set(serverId, {
+              status: "error",
+              error: err?.message ?? String(err),
+            });
+            return next;
+          });
+        });
+    });
+  }, [enabled, serverIds.length]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  const allDone =
+    state.size > 0 &&
+    Array.from(state.values()).every((s) => s.status !== "pending");
+
+  // When every server has reported, bust the caches that depend on
+  // lease state so stale rows drop out of the address + lease views.
+  useEffect(() => {
+    if (!allDone) return;
+    qc.invalidateQueries({ queryKey: ["addresses", subnetId] });
+    qc.invalidateQueries({ queryKey: ["dhcp-leases"] });
+    qc.invalidateQueries({ queryKey: ["dhcp-scopes-subnet", subnetId] });
+    qc.invalidateQueries({ queryKey: ["dns-sync-summary", subnetId] });
+  }, [allDone, qc, subnetId]);
+
+  return { serverIds, serverNames, state, allDone };
+}
+
+function DhcpSyncSummaryBody({
+  serverIds,
+  serverNames,
+  state,
+}: {
+  serverIds: string[];
+  serverNames: Map<string, string>;
+  state: Map<string, DhcpServerSyncState>;
+}) {
+  if (serverIds.length === 0) {
+    return (
+      <p className="text-sm text-muted-foreground">
+        No DHCP scopes are attached to this subnet — nothing to sync.
+      </p>
+    );
+  }
+  return (
+    <div className="space-y-2">
+      {serverIds.map((serverId) => {
+        const s = state.get(serverId) ?? { status: "pending" as const };
+        const name = serverNames.get(serverId) ?? serverId.slice(0, 8);
+        return (
+          <div key={serverId} className="rounded-md border p-3">
+            <div className="flex items-center justify-between">
+              <span className="text-sm font-medium">{name}</span>
+              {s.status === "pending" && (
+                <span className="flex items-center gap-1 text-xs text-muted-foreground">
+                  <RefreshCw className="h-3 w-3 animate-spin" /> Syncing…
+                </span>
+              )}
+              {s.status === "done" && (
+                <span className="text-xs text-emerald-600 dark:text-emerald-400">
+                  Done
+                </span>
+              )}
+              {s.status === "error" && (
+                <span className="text-xs text-destructive">Failed</span>
+              )}
+            </div>
+            {s.status === "done" && (
+              <dl className="mt-2 grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
+                <CounterRow
+                  label="Active leases"
+                  value={s.result.server_leases}
+                />
+                <CounterRow label="Refreshed" value={s.result.refreshed} />
+                <CounterRow label="New" value={s.result.imported} />
+                <CounterRow
+                  label="Removed (deleted on server)"
+                  value={s.result.removed}
+                  emphasis={s.result.removed > 0}
+                />
+                <CounterRow
+                  label="IPAM created"
+                  value={s.result.ipam_created}
+                />
+                <CounterRow
+                  label="IPAM revoked"
+                  value={s.result.ipam_revoked}
+                  emphasis={s.result.ipam_revoked > 0}
+                />
+                {s.result.errors.length > 0 && (
+                  <div className="col-span-2 mt-1 rounded border border-destructive/40 bg-destructive/10 p-2 text-[11px] text-destructive">
+                    {s.result.errors.length} error(s):
+                    <ul className="ml-3 list-disc">
+                      {s.result.errors.slice(0, 3).map((e, i) => (
+                        <li key={i} className="truncate">
+                          {e}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+              </dl>
+            )}
+            {s.status === "error" && (
+              <p className="mt-2 rounded border border-destructive/40 bg-destructive/10 p-2 text-[11px] text-destructive">
+                {s.error}
+              </p>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function CounterRow({
+  label,
+  value,
+  emphasis,
+}: {
+  label: string;
+  value: number;
+  emphasis?: boolean;
+}) {
+  return (
+    <div className="flex items-baseline justify-between">
+      <dt className="text-muted-foreground">{label}</dt>
+      <dd
+        className={cn(
+          "font-mono tabular-nums",
+          emphasis &&
+            value > 0 &&
+            "font-semibold text-amber-600 dark:text-amber-400",
+        )}
+      >
+        {value}
+      </dd>
+    </div>
+  );
+}
+
+function DhcpSyncModal({
+  subnetId,
+  onClose,
+}: {
+  subnetId: string;
+  onClose: () => void;
+}) {
+  const { serverIds, serverNames, state, allDone } = useDhcpSync(
+    subnetId,
+    true,
+  );
+  return (
+    <Modal title="DHCP Sync" onClose={onClose}>
+      <DhcpSyncSummaryBody
+        serverIds={serverIds}
+        serverNames={serverNames}
+        state={state}
+      />
+      <div className="mt-4 flex justify-end">
+        <button
+          onClick={onClose}
+          disabled={!allDone && serverIds.length > 0}
+          className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted disabled:opacity-50"
+        >
+          {allDone || serverIds.length === 0 ? "Close" : "Syncing…"}
+        </button>
+      </div>
+    </Modal>
+  );
+}
+
+// ─── Sync All Modal ──────────────────────────────────────────────────────────
+//
+// One modal that covers both surfaces. DHCP sync runs inline (it's a pure
+// pull — no user decisions to make). DNS sync is preview-and-apply with
+// per-row selection, so the modal just shows a drift summary and chains
+// into the full ``DnsSyncModal`` when the user clicks "Review DNS
+// changes…".
+function SyncAllModal({
+  subnet,
+  onOpenDnsDetails,
+  onClose,
+}: {
+  subnet: Subnet;
+  onOpenDnsDetails: () => void;
+  onClose: () => void;
+}) {
+  const { serverIds, serverNames, state, allDone } = useDhcpSync(
+    subnet.id,
+    true,
+  );
+  const { data: dnsSummary, isLoading: dnsLoading } = useQuery({
+    queryKey: ["dns-sync-summary", subnet.id],
+    queryFn: () => ipamApi.dnsSyncSummary(subnet.id),
+    refetchOnMount: "always",
+  });
+
+  const dhcpBusy = !allDone && serverIds.length > 0;
+
+  return (
+    <Modal title={`Sync All — ${subnet.network}`} onClose={onClose} wide>
+      <div className="space-y-4">
+        <section>
+          <h3 className="mb-2 flex items-center gap-2 text-sm font-semibold">
+            <Server className="h-4 w-4" /> DHCP
+          </h3>
+          <DhcpSyncSummaryBody
+            serverIds={serverIds}
+            serverNames={serverNames}
+            state={state}
+          />
+        </section>
+
+        <section className="border-t pt-4">
+          <h3 className="mb-2 flex items-center gap-2 text-sm font-semibold">
+            <Globe2 className="h-4 w-4" /> DNS
+          </h3>
+          {dnsLoading && (
+            <p className="text-xs text-muted-foreground">Checking drift…</p>
+          )}
+          {dnsSummary && !dnsSummary.has_drift && (
+            <p className="text-sm text-emerald-600 dark:text-emerald-400">
+              In sync — no DNS drift detected.
+            </p>
+          )}
+          {dnsSummary && dnsSummary.has_drift && (
+            <div className="rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-xs">
+              <p className="font-medium text-amber-700 dark:text-amber-400">
+                {dnsSummary.total} record
+                {dnsSummary.total === 1 ? "" : "s"} out of sync
+              </p>
+              <p className="mt-1 text-muted-foreground">
+                {dnsSummary.missing} missing · {dnsSummary.mismatched}{" "}
+                mismatched · {dnsSummary.stale} stale
+              </p>
+              <p className="mt-2 text-muted-foreground">
+                DNS sync needs per-record confirmation — open the detail view to
+                review and apply.
+              </p>
+            </div>
+          )}
+        </section>
+
+        <div className="flex items-center justify-between gap-2 border-t pt-3">
+          <button
+            onClick={onClose}
+            className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
+          >
+            Close
+          </button>
+          <button
+            onClick={onOpenDnsDetails}
+            disabled={dhcpBusy || !dnsSummary?.has_drift}
+            title={
+              dhcpBusy
+                ? "Wait for DHCP sync to finish"
+                : !dnsSummary?.has_drift
+                  ? "No DNS drift to apply"
+                  : "Review and apply DNS changes"
+            }
+            className="flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+          >
+            <Globe2 className="h-3.5 w-3.5" /> Review DNS changes…
+          </button>
+        </div>
       </div>
     </Modal>
   );
