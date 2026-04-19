@@ -1745,6 +1745,81 @@ const IP_STATUS_OPTIONS = [
 // reload. Partial keys match hierarchically in react-query, so the
 // unkeyed variants catch every per-zone and per-group query in one pass.
 
+// Non-fatal collision surfaced by the backend on IP assign / edit. The
+// server returns 409 with ``detail = { warnings: [...], requires_confirmation: true }``
+// when ``force=false`` and the pending (hostname, zone) or MAC already
+// exists on another IP. The user sees the list inline and re-submits with
+// ``force=true`` to proceed.
+type CollisionWarning =
+  | {
+      kind: "fqdn_collision";
+      fqdn: string;
+      existing_ip: string;
+      existing_subnet: string;
+      existing_ip_id: string;
+    }
+  | {
+      kind: "mac_collision";
+      mac_address: string;
+      existing_ip: string;
+      existing_hostname: string | null;
+      existing_subnet: string;
+      existing_ip_id: string;
+    };
+
+function parseCollisionWarnings(err: unknown): CollisionWarning[] | null {
+  const e = err as {
+    response?: { status?: number; data?: { detail?: unknown } };
+  };
+  if (e?.response?.status !== 409) return null;
+  const detail = e.response.data?.detail;
+  if (
+    !detail ||
+    typeof detail !== "object" ||
+    !Array.isArray((detail as { warnings?: unknown }).warnings)
+  ) {
+    return null;
+  }
+  return (detail as { warnings: CollisionWarning[] }).warnings;
+}
+
+function CollisionWarningBanner({
+  warnings,
+}: {
+  warnings: CollisionWarning[];
+}) {
+  return (
+    <div className="rounded-md border border-amber-500/60 bg-amber-500/10 p-2 text-xs">
+      <p className="mb-1 font-medium text-amber-700 dark:text-amber-400">
+        Heads up — this assignment conflicts with existing IPs:
+      </p>
+      <ul className="ml-4 list-disc space-y-0.5">
+        {warnings.map((w, i) => (
+          <li key={i}>
+            {w.kind === "fqdn_collision" ? (
+              <>
+                FQDN <span className="font-mono">{w.fqdn}</span> is already on{" "}
+                <span className="font-mono">{w.existing_ip}</span> in{" "}
+                <span className="font-mono">{w.existing_subnet}</span>
+              </>
+            ) : (
+              <>
+                MAC <span className="font-mono">{w.mac_address}</span> is
+                already on <span className="font-mono">{w.existing_ip}</span>
+                {w.existing_hostname ? ` (${w.existing_hostname})` : ""} in{" "}
+                <span className="font-mono">{w.existing_subnet}</span>
+              </>
+            )}
+          </li>
+        ))}
+      </ul>
+      <p className="mt-1 text-muted-foreground">
+        Click the button again to save anyway, or cancel to adjust.
+      </p>
+    </div>
+  );
+}
+
 function AddAddressModal({
   subnetId,
   onClose,
@@ -1766,6 +1841,9 @@ function AddAddressModal({
     { name: string; record_type: "CNAME" | "A" }[]
   >([]);
   const [error, setError] = useState<string | null>(null);
+  const [pendingWarnings, setPendingWarnings] = useState<
+    CollisionWarning[] | null
+  >(null);
   const needsDhcpScope = ipStatus === "dhcp" || ipStatus === "static_dhcp";
 
   const { data: dhcpScopes = [] } = useQuery({
@@ -1830,7 +1908,7 @@ function AddAddressModal({
   }, [availableZones.length, effectiveDns?.dns_zone_id]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const mutation = useMutation({
-    mutationFn: async () => {
+    mutationFn: async (force: boolean) => {
       const zoneParam = dnsZoneId || undefined;
       const cleanedAliases = aliases
         .map((a) => ({ ...a, name: a.name.trim() }))
@@ -1845,6 +1923,7 @@ function AddAddressModal({
               custom_fields: customFields,
               dns_zone_id: zoneParam,
               aliases: cleanedAliases.length ? cleanedAliases : undefined,
+              force,
             })
           : await ipamApi.createAddress({
               subnet_id: subnetId,
@@ -1856,6 +1935,7 @@ function AddAddressModal({
               custom_fields: customFields,
               dns_zone_id: zoneParam,
               aliases: cleanedAliases.length ? cleanedAliases : undefined,
+              force,
             });
       // If the user picked a static_dhcp status and a scope, mirror the row
       // into the DHCP side so the two stay in sync (the backend
@@ -1881,12 +1961,25 @@ function AddAddressModal({
       onClose();
     },
     onError: (err: unknown) => {
+      const warnings = parseCollisionWarnings(err);
+      if (warnings && warnings.length > 0) {
+        setPendingWarnings(warnings);
+        setError(null);
+        return;
+      }
       const msg =
         (err as { response?: { data?: { detail?: string } } })?.response?.data
           ?.detail ?? "Failed to allocate address";
       setError(typeof msg === "string" ? msg : JSON.stringify(msg));
     },
   });
+
+  // Any edit to a collision-relevant field clears the pending warning —
+  // the user has changed the assignment, so the prior warning may no
+  // longer apply and the next submit should re-run the check fresh.
+  useEffect(() => {
+    setPendingWarnings(null);
+  }, [hostname, mac, dnsZoneId, address]);
 
   const canSubmit = !!hostname.trim() && (mode === "next" || !!address);
 
@@ -2111,6 +2204,9 @@ function AddAddressModal({
           onChange={(k, v) => setCustomFields((prev) => ({ ...prev, [k]: v }))}
         />
         {error && <p className="text-xs text-destructive">{error}</p>}
+        {pendingWarnings && (
+          <CollisionWarningBanner warnings={pendingWarnings} />
+        )}
         <div className="flex justify-end gap-2 pt-2">
           <button
             onClick={onClose}
@@ -2121,12 +2217,16 @@ function AddAddressModal({
           <button
             onClick={() => {
               setError(null);
-              mutation.mutate();
+              mutation.mutate(pendingWarnings != null);
             }}
             disabled={!canSubmit || mutation.isPending}
             className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
-            {mutation.isPending ? "Allocating…" : "Allocate"}
+            {mutation.isPending
+              ? "Allocating…"
+              : pendingWarnings
+                ? "Allocate anyway"
+                : "Allocate"}
           </button>
         </div>
       </div>
@@ -4490,6 +4590,9 @@ function EditAddressModal({
   );
   const [dnsZoneId, setDnsZoneId] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
+  const [pendingWarnings, setPendingWarnings] = useState<
+    CollisionWarning[] | null
+  >(null);
 
   const { data: cfDefs = [] } = useQuery({
     queryKey: ["custom-fields", "ip_address"],
@@ -4585,7 +4688,7 @@ function EditAddressModal({
       : null;
 
   const mutation = useMutation({
-    mutationFn: () =>
+    mutationFn: (force: boolean) =>
       ipamApi.updateAddress(address.id, {
         hostname: hostname || undefined,
         description: description || undefined,
@@ -4593,6 +4696,7 @@ function EditAddressModal({
         status,
         custom_fields: customFields,
         dns_zone_id: dnsZoneId || undefined,
+        force,
       }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["addresses", address.subnet_id] });
@@ -4602,12 +4706,23 @@ function EditAddressModal({
       onClose();
     },
     onError: (err: unknown) => {
+      const warnings = parseCollisionWarnings(err);
+      if (warnings && warnings.length > 0) {
+        setPendingWarnings(warnings);
+        setError(null);
+        return;
+      }
       const msg =
         (err as { response?: { data?: { detail?: string } } })?.response?.data
           ?.detail ?? "Failed to save";
       setError(typeof msg === "string" ? msg : JSON.stringify(msg));
     },
   });
+
+  // Clear the warning when the user changes a collision-relevant field.
+  useEffect(() => {
+    setPendingWarnings(null);
+  }, [hostname, macAddress, dnsZoneId]);
 
   return (
     <Modal title={`Edit ${address.address}`} onClose={onClose}>
@@ -4770,6 +4885,9 @@ function EditAddressModal({
           onChange={(k, v) => setCustomFields((prev) => ({ ...prev, [k]: v }))}
         />
         {error && <p className="text-xs text-destructive">{error}</p>}
+        {pendingWarnings && (
+          <CollisionWarningBanner warnings={pendingWarnings} />
+        )}
         <div className="flex justify-end gap-2 pt-2">
           <button
             onClick={onClose}
@@ -4780,12 +4898,16 @@ function EditAddressModal({
           <button
             onClick={() => {
               setError(null);
-              mutation.mutate();
+              mutation.mutate(pendingWarnings != null);
             }}
             disabled={mutation.isPending}
             className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
-            {mutation.isPending ? "Saving…" : "Save"}
+            {mutation.isPending
+              ? "Saving…"
+              : pendingWarnings
+                ? "Save anyway"
+                : "Save"}
           </button>
         </div>
       </div>

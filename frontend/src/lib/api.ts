@@ -664,6 +664,8 @@ export const ipamApi = {
       hostname: string;
       dns_zone_id?: string | null;
       aliases?: { name: string; record_type: "CNAME" | "A" }[];
+      /** Re-submit flag after the user confirms a 409 collision warning. */
+      force?: boolean;
     },
   ) =>
     api
@@ -671,7 +673,11 @@ export const ipamApi = {
       .then((r) => r.data),
   updateAddress: (
     id: string,
-    data: Partial<IPAddress> & { dns_zone_id?: string | null },
+    data: Partial<IPAddress> & {
+      dns_zone_id?: string | null;
+      /** Re-submit flag after the user confirms a 409 collision warning. */
+      force?: boolean;
+    },
   ) => api.put<IPAddress>(`/ipam/addresses/${id}`, data).then((r) => r.data),
   deleteAddress: (id: string, permanent = false) =>
     api.delete(`/ipam/addresses/${id}`, {
@@ -774,6 +780,8 @@ export const ipamApi = {
       custom_fields?: Record<string, unknown>;
       dns_zone_id?: string | null;
       aliases?: { name: string; record_type: "CNAME" | "A" }[];
+      /** Re-submit flag after the user confirms a 409 collision warning. */
+      force?: boolean;
     },
   ) =>
     api

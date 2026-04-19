@@ -1,6 +1,7 @@
 """IPAM API — IP spaces, blocks, subnets, and addresses."""
 
 import ipaddress
+import re
 import uuid
 from datetime import datetime
 from typing import Any
@@ -255,6 +256,112 @@ async def _resolve_effective_zone(db: AsyncSession, subnet: Subnet) -> uuid.UUID
     """Return the effective forward DNS zone UUID for a subnet."""
     _, zone_id, _ = await _resolve_effective_dns(db, subnet)
     return zone_id
+
+
+# ── Assignment collision warnings ─────────────────────────────────────────────
+#
+# Non-fatal guardrails on IP create / update. Two kinds of collision:
+#
+#   1. FQDN  — same ``(lower(hostname), forward_zone_id)`` on another IP.
+#              Often accidental (two people naming a host "web"); occasionally
+#              deliberate (round-robin A records). Warn + let user confirm.
+#   2. MAC   — same MAC address on another IP in any subnet. Usually means
+#              the MAC was cloned / moved; the old row should be decommissioned
+#              before re-use.
+#
+# Both are *warnings*, not errors. If the client re-submits with ``force=True``
+# the write proceeds.
+
+_MAC_DELIMS = re.compile(r"[:\-.\s]")
+
+
+def _normalize_mac(raw: str | None) -> str | None:
+    """Canonicalize a user-entered MAC to 12 lowercase hex chars, or None.
+
+    Accepts ``aa:bb:cc:dd:ee:ff``, ``aa-bb-cc-dd-ee-ff``,
+    ``aabb.ccdd.eeff``, or bare ``aabbccddeeff``. Returns ``None`` when the
+    input is missing or not 12 hex chars — the caller skips the MAC check
+    and lets the DB layer surface any hard error at insert time.
+    """
+    if not raw:
+        return None
+    cleaned = _MAC_DELIMS.sub("", raw.strip()).lower()
+    if len(cleaned) != 12 or not all(c in "0123456789abcdef" for c in cleaned):
+        return None
+    return cleaned
+
+
+async def _check_ip_collisions(
+    db: AsyncSession,
+    *,
+    hostname: str | None,
+    forward_zone_id: uuid.UUID | None,
+    mac_address: str | None,
+    exclude_ip_id: uuid.UUID | None = None,
+) -> list[dict[str, Any]]:
+    """Return FQDN + MAC collision warnings for a pending IP assignment.
+
+    - FQDN check runs only when both ``hostname`` and ``forward_zone_id``
+      resolve — nothing to collide on otherwise.
+    - MAC check runs only when a well-formed MAC is supplied; Postgres's
+      MACADDR comparison normalizes canonical forms automatically, but we
+      still prefilter malformed input so the query doesn't error out.
+    - ``exclude_ip_id`` is set on update so the IP doesn't collide with
+      its own current state.
+    """
+    warnings: list[dict[str, Any]] = []
+
+    if hostname and forward_zone_id:
+        host_lower = hostname.strip().lower()
+        q = (
+            select(IPAddress, DNSZone.name, Subnet.network)
+            .join(DNSZone, DNSZone.id == IPAddress.forward_zone_id)
+            .join(Subnet, Subnet.id == IPAddress.subnet_id)
+            .where(func.lower(IPAddress.hostname) == host_lower)
+            .where(IPAddress.forward_zone_id == forward_zone_id)
+        )
+        if exclude_ip_id is not None:
+            q = q.where(IPAddress.id != exclude_ip_id)
+        for ip, zone_name, subnet_network in (await db.execute(q)).all():
+            warnings.append(
+                {
+                    "kind": "fqdn_collision",
+                    "fqdn": f"{ip.hostname}.{zone_name.rstrip('.')}",
+                    "existing_ip": str(ip.address),
+                    "existing_subnet": str(subnet_network),
+                    "existing_ip_id": str(ip.id),
+                }
+            )
+
+    mac_norm = _normalize_mac(mac_address)
+    if mac_norm and mac_address is not None:
+        q = (
+            select(IPAddress, Subnet.network)
+            .join(Subnet, Subnet.id == IPAddress.subnet_id)
+            .where(IPAddress.mac_address == mac_address)
+        )
+        if exclude_ip_id is not None:
+            q = q.where(IPAddress.id != exclude_ip_id)
+        for ip, subnet_network in (await db.execute(q)).all():
+            warnings.append(
+                {
+                    "kind": "mac_collision",
+                    "mac_address": str(ip.mac_address),
+                    "existing_ip": str(ip.address),
+                    "existing_hostname": ip.hostname,
+                    "existing_subnet": str(subnet_network),
+                    "existing_ip_id": str(ip.id),
+                }
+            )
+
+    return warnings
+
+
+def _collision_http_exc(warnings: list[dict[str, Any]]) -> HTTPException:
+    return HTTPException(
+        status_code=status.HTTP_409_CONFLICT,
+        detail={"warnings": warnings, "requires_confirmation": True},
+    )
 
 
 async def _resolve_reverse_zone(
@@ -1100,6 +1207,10 @@ class IPAddressCreate(BaseModel):
     tags: dict[str, Any] = {}
     dns_zone_id: str | None = None  # explicit zone override; falls back to subnet's effective DNS
     aliases: list[AliasInput] = []
+    # When False (default), the server returns 409 if the pending assignment
+    # collides with another IP's FQDN or MAC. Clients re-submit with True
+    # after the user confirms the warning.
+    force: bool = False
 
     @field_validator("hostname")
     @classmethod
@@ -1130,6 +1241,8 @@ class IPAddressUpdate(BaseModel):
     custom_fields: dict[str, Any] | None = None
     tags: dict[str, Any] | None = None
     dns_zone_id: str | None = None  # explicit zone override for DNS record
+    # See IPAddressCreate.force.
+    force: bool = False
 
     @field_validator("status")
     @classmethod
@@ -1191,6 +1304,8 @@ class NextIPRequest(BaseModel):
     tags: dict[str, Any] = {}
     dns_zone_id: str | None = None  # explicit zone override; falls back to subnet's effective DNS
     aliases: list[AliasInput] = []
+    # See IPAddressCreate.force.
+    force: bool = False
 
     @field_validator("hostname")
     @classmethod
@@ -3243,20 +3358,33 @@ async def create_address(
             detail=f"Address {body.address} is already allocated in this subnet",
         )
 
+    # Resolve the zone that WILL be used by _sync_dns_record so the collision
+    # check sees the same forward_zone_id that will land on the row.
+    explicit_zone = uuid.UUID(body.dns_zone_id) if body.dns_zone_id else None
+    effective_zone = explicit_zone or await _resolve_effective_zone(db, subnet)
+    if not body.force:
+        warnings = await _check_ip_collisions(
+            db,
+            hostname=body.hostname,
+            forward_zone_id=effective_zone,
+            mac_address=body.mac_address,
+        )
+        if warnings:
+            raise _collision_http_exc(warnings)
+
     ip = IPAddress(
         subnet_id=subnet_id,
         created_by_user_id=current_user.id,
-        **body.model_dump(exclude={"dns_zone_id"}),
+        **body.model_dump(exclude={"dns_zone_id", "force"}),
     )
     db.add(ip)
     await db.flush()
 
     # Sync DNS A record
-    zone_id = uuid.UUID(body.dns_zone_id) if body.dns_zone_id else None
-    await _sync_dns_record(db, ip, subnet, zone_id=zone_id, action="create")
+    await _sync_dns_record(db, ip, subnet, zone_id=explicit_zone, action="create")
     # User-specified alias records (CNAME / A) tied to this IP
     if body.aliases:
-        await _create_alias_records(db, ip, subnet, body.aliases, zone_id=zone_id)
+        await _create_alias_records(db, ip, subnet, body.aliases, zone_id=explicit_zone)
 
     db.add(
         _audit(
@@ -3265,7 +3393,7 @@ async def create_address(
             "ip_address",
             str(ip.id),
             body.address,
-            new_value=body.model_dump(mode="json", exclude={"dns_zone_id"}),
+            new_value=body.model_dump(mode="json", exclude={"dns_zone_id", "force"}),
         )
     )
     await db.flush()
@@ -3323,8 +3451,40 @@ async def update_address(
         "mac_address": str(ip.mac_address) if ip.mac_address else None,
     }
     old_status = ip.status
-    changes = body.model_dump(exclude_none=True, exclude={"dns_zone_id"})
-    changes_for_audit = body.model_dump(mode="json", exclude_none=True, exclude={"dns_zone_id"})
+
+    # Collision check — only on fields the client actually touched. We use
+    # ``exclude_unset`` rather than value-equality so an unchanged field
+    # never surfaces a warning, even if an existing cross-subnet collision
+    # would match it. The ``exclude_ip_id`` filter prevents this IP from
+    # colliding with its own current state.
+    touched = body.model_dump(exclude_unset=True)
+    hostname_or_zone_touched = "hostname" in touched or "dns_zone_id" in touched
+    mac_touched = "mac_address" in touched
+    if not body.force and (hostname_or_zone_touched or mac_touched):
+        subnet_for_check = await db.get(Subnet, ip.subnet_id)
+        new_hostname = body.hostname if body.hostname is not None else ip.hostname
+        if "dns_zone_id" in touched:
+            new_zone_id = uuid.UUID(body.dns_zone_id) if body.dns_zone_id else None
+        else:
+            new_zone_id = ip.forward_zone_id or (
+                await _resolve_effective_zone(db, subnet_for_check)
+                if subnet_for_check
+                else None
+            )
+        warnings = await _check_ip_collisions(
+            db,
+            hostname=new_hostname if hostname_or_zone_touched else None,
+            forward_zone_id=new_zone_id if hostname_or_zone_touched else None,
+            mac_address=body.mac_address if mac_touched else None,
+            exclude_ip_id=ip.id,
+        )
+        if warnings:
+            raise _collision_http_exc(warnings)
+
+    changes = body.model_dump(exclude_none=True, exclude={"dns_zone_id", "force"})
+    changes_for_audit = body.model_dump(
+        mode="json", exclude_none=True, exclude={"dns_zone_id", "force"}
+    )
     for field, value in changes.items():
         setattr(ip, field, value)
 
@@ -3684,6 +3844,18 @@ async def allocate_next_ip(
             detail="mac_address is required when status is 'static_dhcp'",
         )
 
+    explicit_zone = uuid.UUID(body.dns_zone_id) if body.dns_zone_id else None
+    effective_zone = explicit_zone or await _resolve_effective_zone(db, subnet)
+    if not body.force:
+        warnings = await _check_ip_collisions(
+            db,
+            hostname=body.hostname,
+            forward_zone_id=effective_zone,
+            mac_address=body.mac_address,
+        )
+        if warnings:
+            raise _collision_http_exc(warnings)
+
     net = _parse_network(str(subnet.network))
 
     # Fetch all used addresses in this subnet
@@ -3742,11 +3914,10 @@ async def allocate_next_ip(
     await db.flush()
 
     # Sync DNS A record
-    zone_id = uuid.UUID(body.dns_zone_id) if body.dns_zone_id else None
-    await _sync_dns_record(db, ip, subnet, zone_id=zone_id, action="create")
+    await _sync_dns_record(db, ip, subnet, zone_id=explicit_zone, action="create")
     # User-specified alias records (CNAME / A) tied to this IP
     if body.aliases:
-        await _create_alias_records(db, ip, subnet, body.aliases, zone_id=zone_id)
+        await _create_alias_records(db, ip, subnet, body.aliases, zone_id=explicit_zone)
 
     db.add(
         _audit(
@@ -3756,7 +3927,7 @@ async def allocate_next_ip(
             str(ip.id),
             str(chosen),
             new_value={
-                **body.model_dump(mode="json", exclude={"dns_zone_id"}),
+                **body.model_dump(mode="json", exclude={"dns_zone_id", "force"}),
                 "address": str(chosen),
             },
         )
