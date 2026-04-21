@@ -63,8 +63,16 @@ class DHCPServerGroup(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     max_unacked_clients: Mapped[int] = mapped_column(Integer, nullable=False, default=5)
     auto_failover: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
+    # Eager-load `servers` by default. The API's group list endpoint
+    # reads this relationship to compute `kea_member_count` + roll up
+    # the members, and it runs in an async session where an accidental
+    # sync lazy-load crashes with MissingGreenlet. selectin is one
+    # extra small query per list call; not worth the footgun.
     servers: Mapped[list[DHCPServer]] = relationship(
-        "DHCPServer", back_populates="group", cascade="all, delete-orphan"
+        "DHCPServer",
+        back_populates="group",
+        cascade="all, delete-orphan",
+        lazy="selectin",
     )
     scopes: Mapped[list[DHCPScope]] = relationship(
         "DHCPScope", back_populates="group", cascade="all, delete-orphan"
