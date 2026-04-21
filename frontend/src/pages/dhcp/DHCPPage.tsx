@@ -269,11 +269,23 @@ function GroupDetailView({
   onDelete: () => void;
   onAddServer: () => void;
 }) {
-  const { data: servers = [] } = useQuery({
+  const qc = useQueryClient();
+  const { data: servers = [], isFetching } = useQuery({
     queryKey: ["dhcp-servers", group.id],
     queryFn: () => dhcpApi.listServers(group.id),
     refetchInterval: 30_000,
   });
+
+  // Server list carries ha_state and agent_last_seen, which both
+  // change after a group mode edit (hot-standby ↔ load-balancing)
+  // once each agent re-renders and its status-get poll fires. Also
+  // invalidate dhcp-groups in case the group itself was just edited
+  // from another tab / modal and we want the HA mode pill + tuning
+  // to be fresh.
+  const handleRefresh = () => {
+    qc.invalidateQueries({ queryKey: ["dhcp-servers", group.id] });
+    qc.invalidateQueries({ queryKey: ["dhcp-groups"] });
+  };
 
   return (
     <div className="flex flex-col h-full overflow-hidden">
@@ -295,25 +307,28 @@ function GroupDetailView({
               </p>
             )}
           </div>
-          <div className="flex items-center gap-3 text-xs">
-            <button
-              onClick={onAddServer}
-              className="flex items-center gap-1 rounded-md bg-primary px-3 py-1.5 text-primary-foreground hover:bg-primary/90"
+          <div className="flex items-center gap-2">
+            <HeaderButton
+              icon={RefreshCw}
+              iconClassName={isFetching ? "animate-spin" : ""}
+              onClick={handleRefresh}
+              title="Refresh server list + HA state"
             >
-              <Plus className="h-3.5 w-3.5" /> Add Server
-            </button>
-            <button
-              onClick={onEdit}
-              className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent"
-            >
-              <Pencil className="h-3 w-3" /> Edit Group
-            </button>
-            <button
+              Refresh
+            </HeaderButton>
+            <HeaderButton icon={Pencil} onClick={onEdit}>
+              Edit
+            </HeaderButton>
+            <HeaderButton
+              variant="destructive"
+              icon={Trash2}
               onClick={onDelete}
-              className="flex items-center gap-1 rounded-md border border-destructive/40 px-2 py-1 text-xs text-destructive hover:bg-destructive/10"
             >
-              <Trash2 className="h-3 w-3" /> Delete Group
-            </button>
+              Delete
+            </HeaderButton>
+            <HeaderButton variant="primary" icon={Plus} onClick={onAddServer}>
+              Add Server
+            </HeaderButton>
           </div>
         </div>
       </div>
