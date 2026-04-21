@@ -18,6 +18,7 @@ import {
   Tags,
   ShieldCheck,
   ScrollText,
+  BellRing,
   X,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -33,6 +34,7 @@ const mainNav = [
 ];
 
 const adminNav = [
+  { label: "Alerts", icon: BellRing, to: "/admin/alerts" },
   { label: "API Tokens", icon: KeySquare, to: "/admin/api-tokens" },
   { label: "Audit Log", icon: ClipboardList, to: "/admin/audit" },
   { label: "Auth Providers", icon: ShieldCheck, to: "/admin/auth-providers" },

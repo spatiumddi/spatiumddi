@@ -15,6 +15,7 @@ celery_app = Celery(
         "app.tasks.dhcp_health",
         "app.tasks.dhcp_lease_cleanup",
         "app.tasks.dhcp_pull_leases",
+        "app.tasks.alerts",
     ],
 )
 
@@ -42,6 +43,7 @@ celery_app.conf.update(
         "app.tasks.dhcp_health.*": {"queue": "dhcp"},
         "app.tasks.dhcp_lease_cleanup.*": {"queue": "dhcp"},
         "app.tasks.dhcp_pull_leases.*": {"queue": "dhcp"},
+        "app.tasks.alerts.*": {"queue": "default"},
     },
     beat_schedule={
         # Every 60s, fan-out health checks to every registered DNS server.
@@ -89,6 +91,14 @@ celery_app.conf.update(
         "dhcp-pull-leases": {
             "task": "app.tasks.dhcp_pull_leases.auto_pull_dhcp_leases",
             "schedule": schedule(run_every=10.0),
+        },
+        # Every 60 s, evaluate every enabled AlertRule. Idempotent —
+        # opens events for fresh matches, resolves events whose
+        # subject no longer matches. Delivery reuses the
+        # audit-forward syslog + webhook targets.
+        "alerts-evaluate": {
+            "task": "app.tasks.alerts.evaluate_alerts",
+            "schedule": schedule(run_every=60.0),
         },
     },
 )

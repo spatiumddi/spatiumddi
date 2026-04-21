@@ -1,3 +1,4 @@
+from app.models.alerts import AlertEvent, AlertRule
 from app.models.audit import AuditLog
 from app.models.auth import APIToken, Group, Role, User, UserSession, user_group
 from app.models.auth_provider import AuthGroupMapping, AuthProvider
@@ -43,6 +44,8 @@ from app.models.vlans import VLAN, Router
 __all__ = [
     "Base",
     "AuditLog",
+    "AlertRule",
+    "AlertEvent",
     "User",
     "Group",
     "Role",

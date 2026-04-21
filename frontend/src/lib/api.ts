@@ -2593,3 +2593,84 @@ export const apiTokensApi = {
     api.patch<ApiToken>(`/api-tokens/${id}`, body).then((r) => r.data),
   delete: (id: string) => api.delete(`/api-tokens/${id}`),
 };
+
+// ── Alerts ─────────────────────────────────────────────────────────────────────
+
+export type AlertRuleType = "subnet_utilization" | "server_unreachable";
+export type AlertSeverity = "info" | "warning" | "critical";
+export type AlertServerType = "dns" | "dhcp" | "any";
+
+export interface AlertRule {
+  id: string;
+  name: string;
+  description: string;
+  enabled: boolean;
+  rule_type: AlertRuleType;
+  threshold_percent: number | null;
+  server_type: AlertServerType | null;
+  severity: AlertSeverity;
+  notify_syslog: boolean;
+  notify_webhook: boolean;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface AlertRuleCreate {
+  name: string;
+  description?: string;
+  enabled?: boolean;
+  rule_type: AlertRuleType;
+  threshold_percent?: number | null;
+  server_type?: AlertServerType | null;
+  severity?: AlertSeverity;
+  notify_syslog?: boolean;
+  notify_webhook?: boolean;
+}
+
+export interface AlertRuleUpdate {
+  name?: string;
+  description?: string;
+  enabled?: boolean;
+  threshold_percent?: number | null;
+  server_type?: AlertServerType | null;
+  severity?: AlertSeverity;
+  notify_syslog?: boolean;
+  notify_webhook?: boolean;
+}
+
+export interface AlertEvent {
+  id: string;
+  rule_id: string;
+  subject_type: string;
+  subject_id: string;
+  subject_display: string;
+  severity: AlertSeverity;
+  message: string;
+  fired_at: string;
+  resolved_at: string | null;
+  delivered_syslog: boolean;
+  delivered_webhook: boolean;
+}
+
+export interface AlertEvaluateResult {
+  opened: number;
+  resolved: number;
+  delivered_syslog: number;
+  delivered_webhook: number;
+}
+
+export const alertsApi = {
+  listRules: () => api.get<AlertRule[]>("/alerts/rules").then((r) => r.data),
+  createRule: (body: AlertRuleCreate) =>
+    api.post<AlertRule>("/alerts/rules", body).then((r) => r.data),
+  updateRule: (id: string, body: AlertRuleUpdate) =>
+    api.patch<AlertRule>(`/alerts/rules/${id}`, body).then((r) => r.data),
+  deleteRule: (id: string) => api.delete(`/alerts/rules/${id}`),
+  listEvents: (
+    params: { open_only?: boolean; rule_id?: string; limit?: number } = {},
+  ) => api.get<AlertEvent[]>("/alerts/events", { params }).then((r) => r.data),
+  resolveEvent: (id: string) =>
+    api.post<AlertEvent>(`/alerts/events/${id}/resolve`).then((r) => r.data),
+  evaluateNow: () =>
+    api.post<AlertEvaluateResult>("/alerts/evaluate").then((r) => r.data),
+};
