@@ -66,4 +66,10 @@ jobs:
           image-ref: ghcr.io/spatiumddi/dns-${{ matrix.flavor }}:${{ github.sha }}
           format: table
           severity: HIGH,CRITICAL
-          exit-code: "0"
+          # Fail the PR on any HIGH/CRITICAL CVE that has a fix
+          # available — `ignore-unfixed: true` keeps us unblocked on
+          # vulns that have no upstream patch yet (base image issues
+          # we can't fix locally). Flip back to "0" for a one-off
+          # ignore if a new CVE lights up without a fix release.
+          exit-code: "1"
+          ignore-unfixed: true

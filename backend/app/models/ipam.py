@@ -257,6 +257,26 @@ class Subnet(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         Boolean, nullable=False, default=True, server_default=sa_text("true")
     )
 
+    # IPv6 auto-allocation policy (ignored for IPv4 subnets — those use
+    # PlatformSettings.ip_allocation_strategy which is sequential /
+    # random only). Values:
+    #
+    #   "random"     (default) CSPRNG 64-bit host suffix + DB uniqueness
+    #                retry. Right default for /64 LAN subnets where the
+    #                host space is too large to sequentially enumerate.
+    #   "eui64"      Derive the 64-bit host suffix from the MAC address
+    #                per RFC 4291 §2.5.1 — requires a MAC on the request.
+    #                Falls back to "random" if no MAC was supplied.
+    #   "sequential" First-free linear scan (same 65k cap used for v4).
+    #                Only sane for small v6 subnets (>= /112 or so);
+    #                exposed for LAB / point-to-point /127 cases.
+    ipv6_allocation_policy: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default="random",
+        server_default=sa_text("'random'"),
+    )
+
     # Status: active | deprecated | reserved | quarantine
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="active", index=True)
 

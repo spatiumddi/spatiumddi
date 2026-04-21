@@ -405,22 +405,56 @@ def _ip_int_in_dynamic_pool(ip_int: int, ranges: list[tuple[int, int]]) -> bool:
     return any(s <= ip_int <= e for s, e in ranges)
 
 
+def _eui64_from_mac(net: ipaddress.IPv6Network, mac: str) -> ipaddress.IPv6Address | None:
+    """Derive the RFC 4291 §2.5.1 EUI-64 address for a MAC in this /64.
+
+    Returns ``None`` if the MAC is malformed or the prefix isn't /64 —
+    EUI-64 is only defined for 64-bit host parts.
+    """
+    if net.prefixlen != 64:
+        return None
+    # Normalise to 12 lowercase hex chars: "aa:bb:cc:dd:ee:ff" → "aabbccddeeff".
+    cleaned = "".join(ch for ch in mac.lower() if ch in "0123456789abcdef")
+    if len(cleaned) != 12:
+        return None
+    try:
+        mac_bytes = bytes.fromhex(cleaned)
+    except ValueError:
+        return None
+    # Modified EUI-64: flip universal/local bit on the first octet,
+    # insert FF:FE between byte 3 and byte 4.
+    first = mac_bytes[0] ^ 0x02
+    iid = bytes([first, mac_bytes[1], mac_bytes[2], 0xFF, 0xFE]) + mac_bytes[3:]
+    host_int = int.from_bytes(iid, "big")
+    return ipaddress.IPv6Address(int(net.network_address) | host_int)
+
+
 async def _pick_next_available_ip(
     db: AsyncSession,
     subnet: Subnet,
     *,
     strategy: str = "sequential",
+    mac_address: str | None = None,
 ) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
     """Return the first free host in ``subnet`` that isn't in a dynamic pool.
 
     Shared by ``allocate_next_ip`` (which commits) and the read-only
-    preview endpoint. IPv6 isn't supported — callers check upstream and
-    fall back to manual allocation.
+    preview endpoint.
+
+    For IPv6 the ``strategy`` argument is honoured but also falls back
+    to ``Subnet.ipv6_allocation_policy`` when the caller doesn't know
+    which v6 mode to pick. Three v6 modes:
+
+      * ``random`` (default) — CSPRNG suffix with collision-retry
+        against the DB + dynamic-pool ranges. Right for /64 LANs.
+      * ``eui64`` — derives from ``mac_address``; requires a /64 and a
+        well-formed MAC. Falls back to ``random`` if either is missing.
+      * ``sequential`` — first-free linear scan. Same 65k-host cap as
+        v4 — only useful for small v6 subnets (>= /112).
+
+    IPv4 keeps the existing ``sequential`` / ``random`` behaviour.
     """
     net = _parse_network(str(subnet.network))
-    if isinstance(net, ipaddress.IPv6Network):
-        return None
-
     used_result = await db.execute(
         select(IPAddress.address).where(IPAddress.subnet_id == subnet.id)
     )
@@ -428,6 +462,66 @@ async def _pick_next_available_ip(
 
     dynamic_ranges = await _load_dynamic_pool_ranges(db, subnet.id)
 
+    # ── IPv6 ──────────────────────────────────────────────────────────
+    if isinstance(net, ipaddress.IPv6Network):
+        effective = strategy
+        # Callers outside the "next-IP" endpoint pass strategy="sequential"
+        # as a default — upgrade that to the subnet's configured policy
+        # so bulk-create flows honour the v6 setting automatically.
+        if effective == "sequential" and subnet.ipv6_allocation_policy in (
+            "random",
+            "eui64",
+        ):
+            effective = subnet.ipv6_allocation_policy
+
+        if effective == "eui64":
+            candidate = _eui64_from_mac(net, mac_address or "")
+            if candidate is not None and str(candidate) not in used:
+                return candidate
+            # Fall through to random if EUI-64 can't be honoured (bad
+            # MAC, non-/64, or collision with an existing row).
+            effective = "random"
+
+        if effective == "sequential":
+            # Same 65k cap as v4 — safe for /112+ subnets, essentially
+            # useless for /64 but surface the result so the UI can tell
+            # the user "no free hosts" rather than spin forever.
+            max_search = 65536
+            for host in list(net.hosts())[:max_search]:
+                if str(host) in used:
+                    continue
+                if dynamic_ranges and _ip_int_in_dynamic_pool(int(host), dynamic_ranges):
+                    continue
+                return host
+            return None
+
+        # random — CSPRNG with up to 32 retries against the used set.
+        # At /64 the birthday collision probability is astronomical;
+        # the loop exists to be correct under degenerate cases (tiny v6
+        # subnets) rather than because we expect it to iterate.
+        import secrets  # noqa: PLC0415
+
+        host_bits = net.max_prefixlen - net.prefixlen
+        if host_bits <= 0:
+            return None  # /128 — network IS the address
+        network_int = int(net.network_address)
+        mask = (1 << host_bits) - 1
+        for _ in range(32):
+            suffix = secrets.randbits(host_bits)
+            # Skip the all-zero suffix — convention reserves it for the
+            # subnet-router anycast address (RFC 4291 §2.6.1).
+            if suffix == 0:
+                continue
+            candidate_int = network_int | (suffix & mask)
+            candidate = ipaddress.IPv6Address(candidate_int)
+            if str(candidate) in used:
+                continue
+            if dynamic_ranges and _ip_int_in_dynamic_pool(candidate_int, dynamic_ranges):
+                continue
+            return candidate
+        return None
+
+    # ── IPv4 (unchanged) ──────────────────────────────────────────────
     # Cap the linear search at 65k hosts for very large IPv4 subnets.
     max_search = 65536
     hosts = list(net.hosts()) if net.prefixlen >= 16 else list(net.hosts())[:max_search]
@@ -1184,6 +1278,15 @@ class SubnetCreate(BaseModel):
     ddns_domain_override: str | None = None
     ddns_ttl: int | None = None
     ddns_inherit_settings: bool = True
+    ipv6_allocation_policy: str = "random"
+
+    @field_validator("ipv6_allocation_policy")
+    @classmethod
+    def validate_ipv6_alloc_create(cls, v: str) -> str:
+        allowed = {"sequential", "random", "eui64"}
+        if v not in allowed:
+            raise ValueError(f"ipv6_allocation_policy must be one of: {', '.join(sorted(allowed))}")
+        return v
 
     @field_validator("ddns_hostname_policy")
     @classmethod
@@ -1246,6 +1349,17 @@ class SubnetUpdate(BaseModel):
     ddns_domain_override: str | None = None
     ddns_ttl: int | None = None
     ddns_inherit_settings: bool | None = None
+    ipv6_allocation_policy: str | None = None
+
+    @field_validator("ipv6_allocation_policy")
+    @classmethod
+    def validate_ipv6_alloc_update(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        allowed = {"sequential", "random", "eui64"}
+        if v not in allowed:
+            raise ValueError(f"ipv6_allocation_policy must be one of: {', '.join(sorted(allowed))}")
+        return v
 
     @field_validator("status")
     @classmethod
@@ -1313,6 +1427,7 @@ class SubnetResponse(BaseModel):
     ddns_domain_override: str | None = None
     ddns_ttl: int | None = None
     ddns_inherit_settings: bool = True
+    ipv6_allocation_policy: str = "random"
     created_at: datetime
     modified_at: datetime
 
@@ -1507,8 +1622,8 @@ class NextIPRequest(BaseModel):
     @field_validator("strategy")
     @classmethod
     def validate_strategy(cls, v: str) -> str:
-        if v not in {"sequential", "random"}:
-            raise ValueError("strategy must be 'sequential' or 'random'")
+        if v not in {"sequential", "random", "eui64"}:
+            raise ValueError("strategy must be 'sequential', 'random', or 'eui64'")
         return v
 
     @field_validator("status")
@@ -4078,6 +4193,7 @@ async def preview_next_ip(
     current_user: CurrentUser,
     db: DB,
     strategy: str = "sequential",
+    mac_address: str | None = None,
 ) -> NextIPPreview:
     """Read-only peek at the IP ``allocate_next_ip`` would hand out next.
 
@@ -4086,16 +4202,19 @@ async def preview_next_ip(
     the same time will see the same candidate and the first to submit
     wins. The losing client gets a 409 from the commit path and can
     re-open for the next one.
+
+    ``mac_address`` is only consulted when ``strategy=eui64`` (IPv6);
+    ignored otherwise.
     """
-    if strategy not in {"sequential", "random"}:
-        raise HTTPException(status_code=422, detail="strategy must be 'sequential' or 'random'")
+    if strategy not in {"sequential", "random", "eui64"}:
+        raise HTTPException(
+            status_code=422,
+            detail="strategy must be 'sequential', 'random', or 'eui64'",
+        )
     subnet = await db.get(Subnet, subnet_id)
     if subnet is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
-    net = _parse_network(str(subnet.network))
-    if isinstance(net, ipaddress.IPv6Network):
-        return NextIPPreview(address=None, strategy=strategy)
-    chosen = await _pick_next_available_ip(db, subnet, strategy=strategy)
+    chosen = await _pick_next_available_ip(db, subnet, strategy=strategy, mac_address=mac_address)
     return NextIPPreview(address=str(chosen) if chosen else None, strategy=strategy)
 
 
@@ -4137,20 +4256,12 @@ async def allocate_next_ip(
         if warnings:
             raise _collision_http_exc(warnings)
 
-    # IPv6 subnets are typically /64 or larger — enumerating 2^64 addresses
-    # is impossible, and even "random" would need a hash-based scheme with
-    # duplicate checks. Rather than misbehave, surface a clear 409 and make
-    # the UI side fall back to manual allocation (per the IPv6 roadmap item).
-    if isinstance(_parse_network(str(subnet.network)), ipaddress.IPv6Network):
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=(
-                "IPv6 subnets do not support auto-allocation. "
-                "Please specify an explicit address."
-            ),
-        )
-
-    chosen = await _pick_next_available_ip(db, subnet, strategy=body.strategy)
+    chosen = await _pick_next_available_ip(
+        db,
+        subnet,
+        strategy=body.strategy,
+        mac_address=body.mac_address,
+    )
     if chosen is None:
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
