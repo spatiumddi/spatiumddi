@@ -1,0 +1,158 @@
+name: Agent E2E (kind)
+
+# Spins up a kind cluster, installs the umbrella Helm chart with a DNS
+# agent enabled, and verifies:
+#   1. Every deployment + statefulset reaches Ready.
+#   2. The API's /health/live returns 200 via a port-forward.
+#   3. The DNS agent container registers and named answers dig for
+#      ``version.bind CH TXT`` — a cheap "daemon is alive" probe that
+#      doesn't require pre-seeded zone data.
+#
+# Uses the ghcr.io/spatiumddi/*:latest images built by the dns /
+# dhcp / release workflows on main, so this exercises what a real
+# operator would pull down today. Changes to any of those pipelines
+# should trigger this workflow so a broken image gets caught in PR
+# review instead of by a user's first `helm install`.
+
+on:
+  pull_request:
+    paths:
+      - "agent/**"
+      - "charts/spatiumddi/**"
+      - "backend/**"
+      - "frontend/**"
+      - ".github/workflows/agent-e2e.yml"
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Image tag to deploy (defaults to 'latest')"
+        required: false
+        default: "latest"
+
+jobs:
+  e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.14.0
+
+      - name: Create kind cluster
+        uses: helm/kind-action@v1
+        with:
+          version: v0.22.0
+          cluster_name: spatium-e2e
+          wait: 120s
+
+      - name: Pull chart subcharts
+        run: helm dependency update charts/spatiumddi
+
+      - name: Install chart
+        id: install
+        run: |
+          TAG="${{ github.event.inputs.image_tag || 'latest' }}"
+          echo "Installing chart with image.tag=${TAG}"
+          # The agent PSK has to be pre-shared with the control plane
+          # before the agent first connects — we set it explicitly so
+          # the auto-registration path can authenticate. For a real
+          # deployment operators pre-create an external secret; the
+          # inline value here is only safe because the cluster dies
+          # with the workflow run.
+          helm install ddi charts/spatiumddi \
+            --namespace spatiumddi --create-namespace \
+            --wait --timeout 10m \
+            --set image.tag="${TAG}" \
+            --set postgresql.primary.persistence.size=1Gi \
+            --set postgresql.primary.resources.requests.cpu=100m \
+            --set postgresql.primary.resources.requests.memory=128Mi \
+            --set redis.master.persistence.size=512Mi \
+            --set redis.master.resources.requests.cpu=50m \
+            --set redis.master.resources.requests.memory=64Mi \
+            --set dnsAgents.enabled=true \
+            --set dnsAgents.agentKey.value=e2e-dns-key \
+            --set dnsAgents.image.tag="${TAG}" \
+            --set-json 'dnsAgents.servers=[{"name":"ns1","role":"primary","group":"e2e","service":{"type":"ClusterIP"}}]'
+
+      - name: Dump pod state
+        if: always()
+        run: |
+          kubectl -n spatiumddi get pods -o wide
+          kubectl -n spatiumddi get svc
+          kubectl -n spatiumddi get pvc
+
+      - name: API health check
+        run: |
+          # Port-forward the API in the background; the subshell dies
+          # when the step ends. Give it 3s to establish.
+          kubectl -n spatiumddi port-forward svc/ddi-spatiumddi-api 18000:8000 &
+          PF_PID=$!
+          trap "kill $PF_PID || true" EXIT
+          sleep 3
+          for i in 1 2 3 4 5; do
+            if curl -fsS "http://127.0.0.1:18000/health/live"; then
+              echo
+              echo "API /health/live OK on attempt $i"
+              exit 0
+            fi
+            echo "attempt $i: API not ready yet; sleeping…"
+            sleep 5
+          done
+          echo "API never became healthy"
+          kubectl -n spatiumddi logs deploy/ddi-spatiumddi-api --tail=100 || true
+          exit 1
+
+      - name: DNS daemon smoke (dig version.bind)
+        run: |
+          POD=$(kubectl -n spatiumddi get pod -l app.kubernetes.io/component=dns-agent -o jsonpath='{.items[0].metadata.name}')
+          if [ -z "$POD" ]; then
+            echo "no DNS agent pod found"
+            kubectl -n spatiumddi get pods
+            exit 1
+          fi
+          echo "→ probing named in pod $POD"
+          # version.bind CH TXT is answered by BIND regardless of zone
+          # configuration — smoke-tests that the daemon loaded and is
+          # listening on :53. The agent image ships dig in its debug
+          # toolbox (confirm in agent/dns/images/bind9/Dockerfile).
+          kubectl -n spatiumddi exec "$POD" -- dig +time=5 +tries=1 +short version.bind CH TXT @127.0.0.1 || {
+            echo "dig failed — dumping logs:"
+            kubectl -n spatiumddi logs "$POD" --tail=80
+            exit 1
+          }
+
+      - name: DNS agent registered with control plane
+        run: |
+          kubectl -n spatiumddi port-forward svc/ddi-spatiumddi-api 18001:8000 &
+          PF_PID=$!
+          trap "kill $PF_PID || true" EXIT
+          sleep 3
+          # Without an admin token we can only hit unauthenticated
+          # endpoints; the agent register endpoint is open (trusts the
+          # PSK). A "server registered" signal is that the agent pod
+          # isn't restarting — crude but useful.
+          RESTARTS=$(kubectl -n spatiumddi get pod -l app.kubernetes.io/component=dns-agent \
+            -o jsonpath='{.items[0].status.containerStatuses[0].restartCount}')
+          if [ "${RESTARTS:-0}" -gt "2" ]; then
+            echo "DNS agent pod restarted ${RESTARTS} times — registration likely failing"
+            kubectl -n spatiumddi logs -l app.kubernetes.io/component=dns-agent --tail=200
+            exit 1
+          fi
+          echo "DNS agent pod stable (restarts=${RESTARTS:-0})"
+
+      - name: Collect logs on failure
+        if: failure()
+        run: |
+          echo "─── API logs ───"
+          kubectl -n spatiumddi logs deploy/ddi-spatiumddi-api --tail=200 || true
+          echo "─── Worker logs ───"
+          kubectl -n spatiumddi logs deploy/ddi-spatiumddi-worker --tail=100 || true
+          echo "─── Beat logs ───"
+          kubectl -n spatiumddi logs deploy/ddi-spatiumddi-beat --tail=100 || true
+          echo "─── DNS agent logs ───"
+          kubectl -n spatiumddi logs -l app.kubernetes.io/component=dns-agent --tail=200 || true
+          echo "─── Postgres logs ───"
+          kubectl -n spatiumddi logs statefulset/ddi-postgresql --tail=80 || true

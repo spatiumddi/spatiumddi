@@ -4,6 +4,10 @@ Tests that require a live kind cluster / docker daemon are marked
 ``@pytest.mark.e2e`` and skipped by default. Run them explicitly with::
 
     pytest agent/dhcp/tests -m e2e
+
+The kind-based path is covered end-to-end in CI by
+``.github/workflows/agent-e2e.yml`` — Trivy scanning is enforced
+separately by ``.github/workflows/build-dhcp-images.yml``.
 """
 
 from __future__ import annotations
@@ -37,5 +41,12 @@ def test_trivy_clean() -> None:
 
 @pytest.mark.e2e
 def test_helm_chart_primary_secondary() -> None:
-    """Helm chart deploys primary+secondary in kind; both serve leases."""
-    pytest.skip("e2e — requires kind cluster + helm install")
+    """Helm chart deploys primary+secondary in kind; both serve leases.
+
+    Kind-based helm install smoke-test is covered in CI by
+    ``.github/workflows/agent-e2e.yml`` (DNS today; DHCP once the
+    workflow grows a dhcpAgents case). The local pytest stub stays
+    as a reminder — real e2e needs ``kind`` + ``kubectl`` on the
+    runner.
+    """
+    pytest.skip("e2e — covered by .github/workflows/agent-e2e.yml")

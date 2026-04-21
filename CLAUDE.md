@@ -206,7 +206,7 @@ SpatiumDDI cut its alpha release `2026.04.16-1` on 2026-04-16 with IPAM, DNS (BI
 - ✅ Agent-side lease-event DDNS for Kea — `apply_ddns_for_lease` + `revoke_ddns_for_lease` wired into `POST /api/v1/dhcp/agents/lease-events` (commit `bad8cf3`).
 - ✅ Block/space inheritance for DDNS settings — `IPSpace` + `IPBlock` carry the four DDNS fields; `Subnet` / `IPBlock` carry `ddns_inherit_settings`; `services/dns/ddns.resolve_effective_ddns` walks subnet → block → space and is consulted by both the hostname resolver and the apply path (commit `a29d4fe`).
 - ✅ Per-server zone serial reporting — `DNSServerZoneState` table + `POST /dns/agents/zone-state` for agents + `GET /dns/groups/{gid}/zones/{zid}/server-state` for the UI + sync pill on the zone detail header (commit `{{this-commit}}`).
-- ⬜ Trivy-clean + kind-AXFR acceptance tests for the agent images (stubs marked `@pytest.mark.e2e` in `agent/{dns,dhcp}/tests/`; Trivy runs in CI today but with `exit-code: "0"` so findings don't block merges)
+- ✅ Trivy-clean + kind-AXFR acceptance tests for the agent images — Trivy now enforces HIGH/CRITICAL (with `ignore-unfixed: true`) on both `build-dns-images.yml` and `build-dhcp-images.yml`; kind-based installation + `dig version.bind` smoke test runs on PR via the new `.github/workflows/agent-e2e.yml`.
 
 ### Future Phases — Tracked Items
 

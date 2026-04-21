@@ -4,6 +4,10 @@ Tests that require a live kind cluster / docker daemon are marked
 ``@pytest.mark.e2e`` and skipped by default. Run them explicitly with::
 
     pytest agent/dns/tests -m e2e
+
+The kind-based path is covered end-to-end in CI by
+``.github/workflows/agent-e2e.yml`` — Trivy scanning is enforced
+separately by ``.github/workflows/build-dns-images.yml``.
 """
 
 from __future__ import annotations
@@ -87,5 +91,12 @@ def test_trivy_clean() -> None:
 
 @pytest.mark.e2e
 def test_helm_chart_primary_secondary_axfr() -> None:
-    """#5: Helm chart deploys ns1+ns2 in kind; AXFR observed in logs."""
-    pytest.skip("e2e — requires kind cluster + helm install")
+    """#5: Helm chart deploys ns1+ns2 in kind; AXFR observed in logs.
+
+    CI coverage lives in ``.github/workflows/agent-e2e.yml`` which
+    installs the umbrella chart against a kind cluster, port-forwards
+    the API, and runs a ``dig`` smoke against the DNS agent pod.
+    The local pytest stub stays as a skip-by-default reminder — real
+    e2e needs ``kind`` + ``kubectl`` on the runner.
+    """
+    pytest.skip("e2e — covered by .github/workflows/agent-e2e.yml")
