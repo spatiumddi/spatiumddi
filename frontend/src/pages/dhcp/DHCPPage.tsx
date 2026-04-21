@@ -459,6 +459,8 @@ function ServerScopesTab({ server }: { server: DHCPServer }) {
     mutationFn: (id: string) => dhcpApi.deleteScope(id),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["dhcp-scopes-subnet"] });
+      qc.invalidateQueries({ queryKey: ["dhcp-scopes-group"] });
+      qc.invalidateQueries({ queryKey: ["dhcp-pools"] });
       setDelScope(null);
     },
   });

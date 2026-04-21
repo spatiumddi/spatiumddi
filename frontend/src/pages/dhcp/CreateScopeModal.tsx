@@ -227,8 +227,17 @@ export function CreateScopeModal({
       });
     },
     onSuccess: () => {
+      // Invalidate every shape of the scope query so the DHCP page
+      // picks up the new row without a hard reload:
+      //   * ``dhcp-scopes-subnet`` — IPAM's subnet-panel list
+      //   * ``dhcp-scopes-group`` — DHCPPage's per-server lookup
+      //     (it reads via the server's group now, not the server id)
+      //   * ``dhcp-pools`` — per-scope pool query keys (broad prefix
+      //     invalidation so the seeded initial pool shows up too)
       qc.invalidateQueries({ queryKey: ["dhcp-scopes"] });
       qc.invalidateQueries({ queryKey: ["dhcp-scopes-subnet", subnetId] });
+      qc.invalidateQueries({ queryKey: ["dhcp-scopes-group"] });
+      qc.invalidateQueries({ queryKey: ["dhcp-pools"] });
       if (editing && scope?.subnet_id && scope.subnet_id !== subnetId) {
         qc.invalidateQueries({
           queryKey: ["dhcp-scopes-subnet", scope.subnet_id],
