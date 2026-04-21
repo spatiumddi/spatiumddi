@@ -117,6 +117,11 @@ class SyncLoop:
             self._current_structural_etag = new_structural
             log.info("structural_reload_applied", structural_etag=new_structural)
 
+            # Post the serials we just rendered so the control plane can
+            # show per-server drift. Best-effort — a failed POST doesn't
+            # roll back the apply (we already serve the new config).
+            self._report_zone_state(bundle)
+
         self._current_etag = etag
 
         # Drain pending record ops via RFC 2136 (no daemon reload)
@@ -132,6 +137,38 @@ class SyncLoop:
                     {"op_id": op["op_id"], "result": "error", "message": str(e)}
                 )
                 self.heartbeat.failed_ops_count += 1
+
+    def _report_zone_state(self, bundle: dict[str, Any]) -> None:
+        """POST ``{zones: [{zone_name, serial}, ...]}`` after a successful apply.
+
+        Best-effort. A dead control plane or transient 5xx never blocks
+        the daemon — the next structural reload will try again.
+        """
+        entries: list[dict[str, Any]] = []
+        for z in bundle.get("zones") or []:
+            name = z.get("name")
+            serial = z.get("serial")
+            if not name or serial is None:
+                continue
+            entries.append({"zone_name": str(name), "serial": int(serial)})
+        if not entries:
+            return
+        headers = {"Authorization": f"Bearer {self.token_ref[0]}"}
+        try:
+            with self._client() as c:
+                resp = c.post(
+                    "/api/v1/dns/agents/zone-state",
+                    headers=headers,
+                    json={"zones": entries},
+                )
+            if resp.status_code != 200:
+                log.warning(
+                    "zone_state_report_non200",
+                    status=resp.status_code,
+                    body=resp.text[:200],
+                )
+        except httpx.HTTPError as e:
+            log.warning("zone_state_report_failed", error=str(e))
 
     def run(self) -> None:
         while not self._stop.is_set():

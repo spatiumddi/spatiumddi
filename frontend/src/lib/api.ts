@@ -1646,6 +1646,27 @@ export interface DNSZone {
   modified_at: string;
 }
 
+// ── Zone server-state (per-server serial reporting) ──────────────────────────
+
+export interface ZoneServerStateEntry {
+  server_id: string;
+  server_name: string;
+  server_status: string;
+  // `null` means the agent hasn't reported back yet (freshly-registered
+  // server, or the zone was only just created).
+  current_serial: number | null;
+  reported_at: string | null;
+}
+
+export interface ZoneServerState {
+  zone_id: string;
+  zone_name: string;
+  target_serial: number;
+  servers: ZoneServerStateEntry[];
+  // `false` while any server hasn't reported or is on a different serial.
+  in_sync: boolean;
+}
+
 export interface DNSRecord {
   id: string;
   zone_id: string;
@@ -1809,6 +1830,12 @@ export const dnsApi = {
       .then((r) => r.data),
   deleteZone: (groupId: string, zoneId: string) =>
     api.delete(`/dns/groups/${groupId}/zones/${zoneId}`),
+  getZoneServerState: (groupId: string, zoneId: string) =>
+    api
+      .get<ZoneServerState>(
+        `/dns/groups/${groupId}/zones/${zoneId}/server-state`,
+      )
+      .then((r) => r.data),
 
   // Records
   listGroupRecords: (groupId: string) =>

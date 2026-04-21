@@ -37,6 +37,7 @@ import {
   type DNSServerGroup,
   type DNSServer,
   type DNSZone,
+  type ZoneServerState,
   type DNSView,
   type DNSRecord,
   type DNSGroupRecord,
@@ -1420,6 +1421,57 @@ function RecordModal({
 
 // ── Zone Detail View (records panel) ─────────────────────────────────────────
 
+/**
+ * Per-server serial-drift pill. Three display states:
+ *  - All servers on the target serial → emerald "N/N synced · serial X"
+ *  - Some servers behind / ahead      → amber "1/3 drift · target X"
+ *  - No server has reported yet       → muted "— not reported"
+ *
+ * Hover tooltip lists every server with its own serial for quick drift
+ * diagnosis (e.g. "ns2: 41 (target 42, reported 3m ago)").
+ */
+function ZoneSyncPill({ state }: { state: ZoneServerState }) {
+  const total = state.servers.length;
+  if (total === 0) return null;
+  const reported = state.servers.filter((s) => s.current_serial !== null);
+  const inSync = state.servers.filter(
+    (s) => s.current_serial === state.target_serial,
+  );
+  const tooltip = state.servers
+    .map((s) =>
+      s.current_serial === null
+        ? `${s.server_name}: not reported`
+        : `${s.server_name}: serial ${s.current_serial}` +
+          (s.current_serial !== state.target_serial ? " (drift)" : ""),
+    )
+    .join("\n");
+
+  let cls = "bg-muted/40 text-muted-foreground";
+  let label = "not reported";
+  if (reported.length === 0) {
+    // noop — keep muted
+  } else if (state.in_sync) {
+    cls =
+      "bg-emerald-500/15 text-emerald-600 dark:bg-emerald-500/20 dark:text-emerald-400";
+    label = `${inSync.length}/${total} synced · serial ${state.target_serial}`;
+  } else {
+    cls =
+      "bg-amber-500/15 text-amber-700 dark:bg-amber-500/20 dark:text-amber-400";
+    label = `${total - inSync.length}/${total} drift · target ${state.target_serial}`;
+  }
+  return (
+    <span
+      className={cn(
+        "ml-2 inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium",
+        cls,
+      )}
+      title={tooltip}
+    >
+      {label}
+    </span>
+  );
+}
+
 function ZoneDetailView({
   group,
   zone,
@@ -1445,6 +1497,15 @@ function ZoneDetailView({
       `${zone.name.replace(/\.$/, "")}-${_utcTimestampSuffix()}.zone`;
     downloadBlob(data, name, "text/dns");
   };
+
+  // Per-server zone-serial drift pill — agents POST their loaded serial
+  // to /dns/agents/zone-state after each structural apply; this endpoint
+  // joins those reports with the group's server list.
+  const { data: serverState } = useQuery({
+    queryKey: ["zone-server-state", group.id, zone.id],
+    queryFn: () => dnsApi.getZoneServerState(group.id, zone.id),
+    refetchInterval: 30_000,
+  });
 
   // "Sync with server" — bi-directional additive sync against the zone's
   // primary authoritative server (today: Windows DNS). AXFR imports missing
@@ -1566,6 +1627,7 @@ function ZoneDetailView({
           <p className="text-xs text-muted-foreground mt-0.5">
             TTL {zone.ttl}s · serial {zone.last_serial || "—"}
             {zone.primary_ns && ` · ${zone.primary_ns}`}
+            {serverState && <ZoneSyncPill state={serverState} />}
           </p>
         </div>
         <div className="flex items-center gap-2">

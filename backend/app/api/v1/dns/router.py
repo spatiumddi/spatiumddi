@@ -1987,6 +1987,89 @@ async def get_zone(group_id: uuid.UUID, zone_id: uuid.UUID, db: DB, _: CurrentUs
     return await _require_zone(group_id, zone_id, db)
 
 
+class ServerZoneStateEntry(BaseModel):
+    server_id: uuid.UUID
+    server_name: str
+    server_status: str
+    current_serial: int | None
+    reported_at: datetime | None
+
+
+class ServerZoneStateResponse(BaseModel):
+    zone_id: uuid.UUID
+    zone_name: str
+    target_serial: int
+    servers: list[ServerZoneStateEntry]
+    in_sync: bool
+
+
+@router.get(
+    "/groups/{group_id}/zones/{zone_id}/server-state",
+    response_model=ServerZoneStateResponse,
+)
+async def get_zone_server_state(
+    group_id: uuid.UUID, zone_id: uuid.UUID, db: DB, _: CurrentUser
+) -> ServerZoneStateResponse:
+    """Per-server serial snapshot for a zone.
+
+    Returns one entry per server in the zone's group, joined with the
+    latest ``DNSServerZoneState.current_serial`` that server reported.
+    Servers with no state row yet report ``current_serial=None`` — the
+    agent hasn't applied a bundle containing this zone yet. ``in_sync``
+    is True when every server that's reported matches the zone's
+    target serial (``DNSZone.serial``).
+    """
+    from app.models.dns import DNSServer, DNSServerZoneState  # noqa: PLC0415
+
+    zone = await _require_zone(group_id, zone_id, db)
+
+    # All servers in the group.
+    servers_res = await db.execute(
+        select(DNSServer).where(DNSServer.group_id == group_id).order_by(DNSServer.name)
+    )
+    servers = list(servers_res.scalars().all())
+
+    # Latest state for each server/zone pair.
+    state_res = await db.execute(
+        select(DNSServerZoneState).where(DNSServerZoneState.zone_id == zone_id)
+    )
+    state_by_server: dict[uuid.UUID, DNSServerZoneState] = {
+        s.server_id: s for s in state_res.scalars().all()
+    }
+
+    entries: list[ServerZoneStateEntry] = []
+    all_in_sync = True
+    target = int(zone.serial or 0)
+    any_reported = False
+    for srv in servers:
+        st = state_by_server.get(srv.id)
+        current = int(st.current_serial) if st else None
+        reported = st.reported_at if st else None
+        entries.append(
+            ServerZoneStateEntry(
+                server_id=srv.id,
+                server_name=srv.name,
+                server_status=srv.status,
+                current_serial=current,
+                reported_at=reported,
+            )
+        )
+        if current is None:
+            all_in_sync = False
+        else:
+            any_reported = True
+            if current != target:
+                all_in_sync = False
+
+    return ServerZoneStateResponse(
+        zone_id=zone.id,
+        zone_name=zone.name,
+        target_serial=target,
+        servers=entries,
+        in_sync=all_in_sync and any_reported,
+    )
+
+
 @router.put("/groups/{group_id}/zones/{zone_id}", response_model=ZoneResponse)
 async def update_zone(
     group_id: uuid.UUID, zone_id: uuid.UUID, body: ZoneUpdate, db: DB, current_user: SuperAdmin

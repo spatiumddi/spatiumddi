@@ -20,7 +20,7 @@ from sqlalchemy import select
 
 from app.api.deps import DB
 from app.models.audit import AuditLog
-from app.models.dns import DNSRecordOp, DNSServer, DNSServerGroup
+from app.models.dns import DNSRecordOp, DNSServer, DNSServerGroup, DNSServerZoneState, DNSZone
 from app.services.dns.agent_config import build_config_bundle
 from app.services.dns.agent_token import (
     hash_token,
@@ -380,3 +380,76 @@ async def agent_ops_ack(
     await ack_op(db, str(op_id), body.get("result", "error"), body.get("message"))
     await db.commit()
     return {"status": "ok"}
+
+
+class ZoneStateEntry(BaseModel):
+    zone_name: str
+    serial: int
+
+
+class ZoneStateReport(BaseModel):
+    zones: list[ZoneStateEntry]
+
+
+@router.post("/zone-state")
+async def agent_zone_state(
+    body: ZoneStateReport,
+    db: DB,
+    auth: tuple[DNSServer, dict[str, Any]] = Depends(_auth_agent),
+) -> dict[str, int]:
+    """Agents POST the serial they just rendered, per zone.
+
+    Called after a successful ``apply_config`` pass — the serial
+    reported here is the "ground truth" of what this particular
+    server is serving, as distinct from ``DNSZone.serial`` which is
+    the latest value the control plane *pushed*. Used for per-server
+    drift detection on the zone detail page + (future) a
+    ``zone_serial_drift`` alert-rule type.
+
+    Upsert by ``(server_id, zone_id)`` — no history, one row per
+    pair. Unknown zone names are silently skipped (zone deleted from
+    control plane but agent still serves it; the next config bundle
+    will drop it).
+    """
+    server, _ = auth
+    now = datetime.now(UTC)
+    updated = 0
+
+    # Index known zones by name for one DB round-trip on the lookup.
+    names = [e.zone_name.rstrip(".") for e in body.zones]
+    if not names:
+        return {"updated": 0}
+    res = await db.execute(select(DNSZone).where(DNSZone.name.in_(names)))
+    zones_by_name: dict[str, DNSZone] = {}
+    for z in res.scalars().all():
+        zones_by_name[z.name.rstrip(".")] = z
+
+    for entry in body.zones:
+        key = entry.zone_name.rstrip(".")
+        zone = zones_by_name.get(key)
+        if zone is None:
+            continue
+
+        # Upsert: look up existing row, update or insert.
+        existing_res = await db.execute(
+            select(DNSServerZoneState).where(
+                DNSServerZoneState.server_id == server.id,
+                DNSServerZoneState.zone_id == zone.id,
+            )
+        )
+        row = existing_res.scalar_one_or_none()
+        if row is None:
+            row = DNSServerZoneState(
+                server_id=server.id,
+                zone_id=zone.id,
+                current_serial=entry.serial,
+                reported_at=now,
+            )
+            db.add(row)
+        else:
+            row.current_serial = entry.serial
+            row.reported_at = now
+        updated += 1
+
+    await db.commit()
+    return {"updated": updated}

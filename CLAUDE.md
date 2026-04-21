@@ -198,14 +198,14 @@ SpatiumDDI cut its alpha release `2026.04.16-1` on 2026-04-16 with IPAM, DNS (BI
 
 ### Phase 1 — Remaining
 
-- ⬜ Finish full IPv6 — EUI-64 / hash-based /128 allocation for `/next-address`, v6-specific test coverage (Dhcp6 option-name translation ✅ landed 2026-04-19)
+- ✅ Full IPv6 — EUI-64 + random /128 + sequential for `/next-address` via `Subnet.ipv6_allocation_policy`; RFC 4291 Appendix A test coverage + dynamic-pool respect on v6; Dhcp6 option-name translation landed 2026-04-19.
 
 ### Phase 2/3 — Remaining
 
 - ✅ DDNS pipeline (subnet-level, shipped 2026-04-19 in `feat(ddns)`) — `Subnet.ddns_enabled` / `ddns_hostname_policy` / `ddns_domain_override` / `ddns_ttl`; `services/dns/ddns.py` resolves hostname per policy and calls the same `_sync_dns_record` path static allocations use; `pull_leases.py` + `dhcp_lease_cleanup.py` are the two integration points.
 - ✅ Agent-side lease-event DDNS for Kea — `apply_ddns_for_lease` + `revoke_ddns_for_lease` wired into `POST /api/v1/dhcp/agents/lease-events` (commit `bad8cf3`).
 - ✅ Block/space inheritance for DDNS settings — `IPSpace` + `IPBlock` carry the four DDNS fields; `Subnet` / `IPBlock` carry `ddns_inherit_settings`; `services/dns/ddns.resolve_effective_ddns` walks subnet → block → space and is consulted by both the hostname resolver and the apply path (commit `a29d4fe`).
-- ⬜ Per-server zone serial reporting (currently all servers in a group share `DNSZone.serial`; once agents report back, surface per-server drift)
+- ✅ Per-server zone serial reporting — `DNSServerZoneState` table + `POST /dns/agents/zone-state` for agents + `GET /dns/groups/{gid}/zones/{zid}/server-state` for the UI + sync pill on the zone detail header (commit `{{this-commit}}`).
 - ⬜ Trivy-clean + kind-AXFR acceptance tests for the agent images (stubs marked `@pytest.mark.e2e` in `agent/{dns,dhcp}/tests/`; Trivy runs in CI today but with `exit-code: "0"` so findings don't block merges)
 
 ### Future Phases — Tracked Items

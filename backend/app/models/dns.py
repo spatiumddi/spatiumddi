@@ -23,6 +23,48 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 from app.models.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
 
 
+class DNSServerZoneState(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """Per-server zone-loaded-serial snapshot.
+
+    Each agent posts back the serial it *actually rendered* after a
+    successful config apply — the "ground truth" of what's live on
+    that particular server, as distinct from ``DNSZone.serial`` which
+    is the value the control plane most-recently pushed.
+
+    Unique on ``(server_id, zone_id)`` so the evaluator can drive a
+    single row per pair — upserts replace the previous snapshot
+    rather than accumulating history.
+
+    Drift detection: for every zone in a group, compare each server's
+    ``current_serial`` to the others. Equal → in sync. Different →
+    surface "N of M on serial X, rest on Y" on the zone detail page
+    and (optionally, via the alerts framework) as a ``zone_serial_drift``
+    alert rule.
+    """
+
+    __tablename__ = "dns_server_zone_state"
+    __table_args__ = (
+        UniqueConstraint("server_id", "zone_id", name="uq_dns_server_zone_state"),
+        Index("ix_dns_server_zone_state_zone", "zone_id"),
+    )
+
+    server_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dns_server.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    zone_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dns_zone.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    current_serial: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    reported_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
 class DNSServerGroup(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     """Logical cluster of DNS servers sharing configuration (e.g. internal-resolvers, external-auth)."""
 
