@@ -1,0 +1,17 @@
+# Patterns to ignore when building Helm packages.
+.DS_Store
+.git/
+.gitignore
+.github/
+.idea/
+.vscode/
+# Common VCS + editor junk that might sneak in
+*.tmproj
+*.swp
+*.bak
+*.tmp
+*.orig
+# NOTE: do NOT ignore charts/*.tgz — `helm package` needs those subchart
+# tarballs in the rendered package. They ARE gitignored at the repo
+# level (see /.gitignore) so local `helm dependency update` runs don't
+# dirty the tree; CI fetches them fresh every release.

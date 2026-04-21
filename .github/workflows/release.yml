@@ -156,11 +156,68 @@ jobs:
             org.opencontainers.image.revision=${{ needs.meta.outputs.sha_short }}
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
 
+  # ── Publish Helm chart (OCI) ───────────────────────────────────────────────
+  # Packages `charts/spatiumddi` (umbrella: api + frontend + worker + beat
+  # + migrate + Postgres/Redis subcharts + optional DNS/DHCP agents) and
+  # pushes it as an OCI artifact to ghcr.io/<owner>/charts/spatiumddi:
+  # <chart_version>. Consumers then:
+  #
+  #   helm install ddi oci://ghcr.io/spatiumddi/charts/spatiumddi \
+  #     --version <chart_version>
+  #
+  # The in-repo Chart.yaml version is a placeholder; the release tag
+  # (with leading zeroes stripped for SemVer-2 compliance) is the
+  # authoritative published version.
+  publish-chart:
+    name: Publish Helm chart (OCI)
+    runs-on: ubuntu-latest
+    needs: meta
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      chart_version: ${{ steps.pkg.outputs.chart_version }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.14.0
+      - name: Log in to GHCR
+        run: |
+          echo "${{ secrets.GITHUB_TOKEN }}" \
+            | helm registry login ghcr.io \
+                -u "${{ github.actor }}" \
+                --password-stdin
+      - name: Pull chart dependencies
+        # Bitnami subcharts (postgresql, redis) are referenced by OCI
+        # URL in Chart.yaml — resolve them before packaging.
+        run: helm dependency update charts/spatiumddi
+      - id: pkg
+        name: Package + push chart
+        run: |
+          VERSION="${{ needs.meta.outputs.version }}"
+          # Helm enforces strict SemVer 2, which forbids leading zeroes
+          # in MAJOR.MINOR.PATCH. Our CalVer tag (2026.04.20-1) carries
+          # `04` and sometimes `-01`, so strip them: 2026.04.20-1 ->
+          # 2026.4.20-1. The original tag is kept as appVersion so the
+          # human-readable release identity survives on the artifact.
+          CHART_VERSION=$(echo "$VERSION" | sed -E 's/\.0([0-9])/.\1/g; s/-0([0-9]+)$/-\1/')
+          echo "chart_version=${CHART_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "→ packaging spatiumddi version=${CHART_VERSION} appVersion=${VERSION}"
+          mkdir -p dist
+          helm package charts/spatiumddi \
+            --version "$CHART_VERSION" \
+            --app-version "$VERSION" \
+            --destination ./dist
+          helm push \
+            "./dist/spatiumddi-${CHART_VERSION}.tgz" \
+            "oci://ghcr.io/${{ github.repository_owner }}/charts"
+
   # ── Create GitHub Release ──────────────────────────────────────────────────
   release:
     name: Create GitHub Release
     runs-on: ubuntu-latest
-    needs: [meta, build-api, build-frontend, build-dns, build-dhcp]
+    needs: [meta, build-api, build-frontend, build-dns, build-dhcp, publish-chart]
     permissions:
       contents: write
     steps:
@@ -220,6 +277,14 @@ jobs:
             docker pull ghcr.io/${{ github.repository_owner }}/spatiumddi-frontend:${{ needs.meta.outputs.version }}
             docker pull ghcr.io/${{ github.repository_owner }}/dns-bind9:${{ needs.meta.outputs.version }}
             docker pull ghcr.io/${{ github.repository_owner }}/dhcp-kea:${{ needs.meta.outputs.version }}
+            ```
+
+            ## Helm Chart
+
+            ```
+            helm install ddi oci://ghcr.io/${{ github.repository_owner }}/charts/spatiumddi \
+              --version ${{ needs.publish-chart.outputs.chart_version }} \
+              --namespace spatiumddi --create-namespace
             ```
 
             ## Full Changelog

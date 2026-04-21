@@ -1,0 +1,31 @@
+apiVersion: v2
+name: spatiumddi
+description: SpatiumDDI — all-in-one DDI (DNS, DHCP, IPAM) control plane + optional managed service agents
+type: application
+# version + appVersion are placeholders for local `helm lint` / `helm template`
+# runs. The release workflow overrides both via `helm package --version
+# --app-version` using the CalVer release tag.
+version: 0.1.0
+appVersion: "0.0.0-dev"
+kubeVersion: ">=1.26.0-0"
+home: https://spatiumddi.github.io/spatiumddi/
+sources:
+  - https://github.com/spatiumddi
+icon: https://spatiumddi.github.io/spatiumddi/assets/logo-icon.svg
+keywords:
+  - ipam
+  - dns
+  - dhcp
+  - ddi
+  - networking
+maintainers:
+  - name: SpatiumDDI Contributors
+dependencies:
+  - name: postgresql
+    version: "~15.5.0"
+    repository: "oci://registry-1.docker.io/bitnamicharts"
+    condition: postgresql.enabled
+  - name: redis
+    version: "~20.6.0"
+    repository: "oci://registry-1.docker.io/bitnamicharts"
+    condition: redis.enabled

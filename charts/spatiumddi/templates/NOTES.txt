@@ -1,0 +1,64 @@
+SpatiumDDI has been installed.
+
+Release:    {{ .Release.Name }}
+Namespace:  {{ .Release.Namespace }}
+Chart:      {{ .Chart.Name }}-{{ .Chart.Version }} (app {{ .Chart.AppVersion }})
+
+1. Wait for the control plane to come up:
+
+     kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ include "spatiumddi.fullname" . }}-api
+     kubectl -n {{ .Release.Namespace }} rollout status deploy/{{ include "spatiumddi.fullname" . }}-frontend
+
+2. Reach the frontend:
+
+{{- if .Values.ingress.enabled }}
+     Via Ingress:
+{{- range .Values.ingress.hosts }}
+       http{{ if $.Values.ingress.tls }}s{{ end }}://{{ .host }}
+{{- end }}
+{{- else if eq .Values.frontend.service.type "LoadBalancer" }}
+     Via LoadBalancer (watch for the external IP to get assigned):
+
+       kubectl -n {{ .Release.Namespace }} get svc {{ include "spatiumddi.fullname" . }}-frontend -w
+
+{{- else }}
+     No Ingress and ClusterIP service — port-forward for local access:
+
+       kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "spatiumddi.fullname" . }}-frontend 8080:{{ .Values.frontend.service.port }}
+       open http://localhost:8080
+{{- end }}
+
+3. Default login: admin / admin  (force_password_change=True — first login
+   will prompt you to set a new password).
+
+{{- if not .Values.auth.existingSecret }}
+
+4. The application SECRET_KEY was generated on install and persists in:
+
+     kubectl -n {{ .Release.Namespace }} get secret {{ include "spatiumddi.fullname" . }}-app -o jsonpath='{.data.secret-key}' | base64 -d
+{{- end }}
+
+{{- if .Values.postgresql.enabled }}
+
+5. Postgres password (Bitnami-managed):
+
+     kubectl -n {{ .Release.Namespace }} get secret {{ .Release.Name }}-postgresql -o jsonpath='{.data.password}' | base64 -d
+{{- end }}
+
+{{- if .Values.dnsAgents.enabled }}
+
+6. DNS agent StatefulSets:
+{{- range .Values.dnsAgents.servers }}
+     - dns-{{ .flavor | default "bind9" }}-{{ .name }}  (role={{ .role | default "primary" }}, group={{ .group | default "default" }})
+{{- end }}
+{{- end }}
+
+{{- if .Values.dhcpAgents.enabled }}
+
+7. DHCP agent StatefulSets:
+{{- range .Values.dhcpAgents.servers }}
+     - dhcp-{{ .flavor | default "kea" }}-{{ .name }}  (role={{ .role | default "primary" }}, group={{ .group | default "default" }})
+{{- end }}
+{{- end }}
+
+Docs: https://spatiumddi.github.io/spatiumddi/

@@ -361,12 +361,11 @@ DNSServerGroup "internal-resolvers"
 ### Helm chart structure (Phase 2 deliverable)
 
 ```
-charts/spatium-dns/
-  Chart.yaml
-  values.yaml                # defines servers[] with name, flavor, role, resources
+charts/spatiumddi/                 # umbrella chart — DNS agents are one optional
+  Chart.yaml                       # component under .Values.dnsAgents
+  values.yaml                      # .dnsAgents.servers[] defines name, role, group, storage
   templates/
-    statefulset.yaml         # one per item in .Values.servers
-    service-dns.yaml         # LB per server
+    dns-agent.yaml                 # StatefulSet + LB/headless Service per server
     service-headless.yaml
     pdb.yaml
     configmap-bootstrap.yaml # non-secret bootstrap config
@@ -441,7 +440,7 @@ dns-bind9-primary:
 |---|---|
 | `k8s/dns/bind9-statefulset.yaml` | Reference StatefulSet. |
 | `k8s/dns/service-dns.yaml` | Example LoadBalancer service (UDP+TCP 53). |
-| `charts/spatium-dns/` | Helm chart (Phase 2.5). |
+| `charts/spatiumddi/` | Umbrella Helm chart — DNS agents are the `dnsAgents` section. |
 | `k8s/README.md` | Add "DNS server deployment" section. |
 
 ### Docker Compose

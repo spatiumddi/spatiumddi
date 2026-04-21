@@ -176,7 +176,7 @@ EOF
 | Method | Use case | Status |
 |---|---|---|
 | **Docker Compose** | Dev, small single-host production | ✅ Supported |
-| **Kubernetes + Helm** | Multi-node production, scalable | 🔄 Chart scaffolded (`charts/spatium-dns`) |
+| **Kubernetes + Helm** | Multi-node production, scalable | ✅ Umbrella chart (`charts/spatiumddi`, published OCI to `ghcr.io/spatiumddi/charts/spatiumddi`) |
 | **Bare metal / VM (Ansible)** | On-prem without containers | 📋 Planned |
 | **OS Appliance (ISO / qcow2)** | Air-gapped, zero-dependency | 📋 Planned |
 

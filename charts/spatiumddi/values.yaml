@@ -1,0 +1,220 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# SpatiumDDI Helm values
+#
+# Layout:
+#   image                 Shared image defaults (repository prefix, tag, policy)
+#   auth                  SECRET_KEY for app; generated on first install if empty
+#   api / frontend /      Control-plane workloads
+#     worker / beat
+#   migrate               One-shot Alembic Job (Helm pre-install/pre-upgrade hook)
+#   ingress               Frontend ingress
+#   postgresql            Bitnami subchart toggle + overrides (bring-your-own via externalDatabase)
+#   redis                 Bitnami subchart toggle + overrides (bring-your-own via externalRedis)
+#   dnsAgents             Optional BIND9 agent StatefulSets (one per DNSServer row)
+#   dhcpAgents            Optional Kea agent StatefulSets (one per DHCPServer row)
+# ─────────────────────────────────────────────────────────────────────────────
+
+image:
+  registry: ghcr.io
+  repository: spatiumddi         # images are ghcr.io/spatiumddi/<name>
+  # Image tag applied to every control-plane workload. Empty → use Chart.appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+  pullSecrets: []
+
+# Cluster-wide app name override. Leave empty to use `.Release.Name`.
+fullnameOverride: ""
+nameOverride: ""
+
+# Application secret — Fernet key for at-rest encryption of auth provider
+# secrets, session tokens, etc. If empty, a 32-byte hex string is generated
+# the first time the chart is installed and persisted via `lookup` across
+# upgrades. Override only if you're consolidating secret management.
+auth:
+  secretKey: ""
+  existingSecret: ""             # must carry key `secret-key`
+
+# ── API ──────────────────────────────────────────────────────────────────────
+api:
+  replicas: 2
+  service:
+    type: ClusterIP
+    port: 8000
+  autoscaling:
+    enabled: true
+    minReplicas: 2
+    maxReplicas: 10
+    targetCPUUtilizationPercentage: 70
+    targetMemoryUtilizationPercentage: 80
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits:   { cpu: 1000m, memory: 512Mi }
+  env: []                        # extra env entries appended to container
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podAnnotations: {}
+
+# ── Frontend (nginx + Vite build) ────────────────────────────────────────────
+frontend:
+  replicas: 2
+  service:
+    type: ClusterIP
+    port: 80
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits:   { cpu: 200m, memory: 128Mi }
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podAnnotations: {}
+
+# ── Worker (Celery queues: ipam, dns, dhcp, default) ─────────────────────────
+worker:
+  replicas: 2
+  concurrency: 4
+  queues: "ipam,dns,dhcp,default"
+  resources:
+    requests: { cpu: 200m, memory: 256Mi }
+    limits:   { cpu: 2000m, memory: 1Gi }
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podAnnotations: {}
+
+# ── Beat (singleton scheduler — always 1 replica) ────────────────────────────
+beat:
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits:   { cpu: 200m, memory: 256Mi }
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podAnnotations: {}
+
+# ── Migrate (Alembic upgrade head) ───────────────────────────────────────────
+# Runs as a Helm pre-install + pre-upgrade hook. Disable if you're driving
+# migrations from CI/CD instead of Helm.
+migrate:
+  enabled: true
+  backoffLimit: 3
+  resources:
+    requests: { cpu: 50m, memory: 128Mi }
+    limits:   { cpu: 200m, memory: 256Mi }
+
+# ── Ingress (for the frontend; API is routed through the frontend nginx) ─────
+ingress:
+  enabled: false
+  className: nginx
+  annotations: {}
+    # nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
+    # cert-manager.io/cluster-issuer: letsencrypt-prod
+  hosts:
+    - host: spatiumddi.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+    # - secretName: spatiumddi-tls
+    #   hosts:
+    #     - spatiumddi.example.com
+
+# ── Postgres ─────────────────────────────────────────────────────────────────
+# Bitnami subchart. Full option surface at:
+# https://github.com/bitnami/charts/tree/main/bitnami/postgresql
+postgresql:
+  enabled: true
+  auth:
+    username: spatiumddi
+    database: spatiumddi
+    # Password for the chart-managed user. If empty we generate a random
+    # password on first install (persisted on the secret we own). Set
+    # `existingSecret` to BYO.
+    password: ""
+    existingSecret: ""           # external secret with key `password`
+  primary:
+    persistence:
+      enabled: true
+      size: 8Gi
+  # Architecture: "standalone" (default) or "replication". For HA
+  # production you probably want CloudNativePG outside the chart.
+
+# Used when postgresql.enabled=false.
+externalDatabase:
+  host: ""
+  port: 5432
+  username: spatiumddi
+  database: spatiumddi
+  password: ""
+  existingSecret: ""             # external secret; key defaults to `password`
+  existingSecretPasswordKey: "password"
+
+# ── Redis ────────────────────────────────────────────────────────────────────
+# Bitnami subchart. Full option surface at:
+# https://github.com/bitnami/charts/tree/main/bitnami/redis
+redis:
+  enabled: true
+  architecture: standalone       # "standalone" | "replication"
+  auth:
+    enabled: false               # internal cluster traffic; enable if shared
+  master:
+    persistence:
+      enabled: true
+      size: 2Gi
+
+# Used when redis.enabled=false.
+externalRedis:
+  # Full URL form, e.g. redis://:password@host:6379. If empty, composed from
+  # host/port/password fields below.
+  url: ""
+  host: ""
+  port: 6379
+  password: ""
+  existingSecret: ""
+  existingSecretPasswordKey: "password"
+
+# ── DNS agents (optional — managed BIND9 StatefulSets) ───────────────────────
+# One StatefulSet + Services pair per entry. `enabled: false` skips the
+# whole block; typical deployments run DNS agents in a separate cluster
+# closer to the network edge.
+dnsAgents:
+  enabled: false
+  image:
+    repository: ghcr.io/spatiumddi/dns-bind9
+    tag: ""                      # empty → use Chart.appVersion
+    pullPolicy: IfNotPresent
+  # PSK carrying DNS_AGENT_KEY. Prefer `existingSecret`; `value` lives here
+  # only to make lab walk-throughs runnable in one command.
+  agentKey:
+    existingSecret: ""           # external secret with key DNS_AGENT_KEY
+    value: ""
+  servers: []
+    # - name: ns1
+    #   role: primary            # primary | secondary
+    #   group: internal-resolvers
+    #   storage: { agentState: 1Gi, dnsState: 2Gi }
+    #   service: { type: LoadBalancer }
+    #   resources:
+    #     requests: { cpu: 100m, memory: 128Mi }
+    #     limits:   { cpu: 500m, memory: 512Mi }
+
+# ── DHCP agents (optional — managed Kea StatefulSets) ────────────────────────
+dhcpAgents:
+  enabled: false
+  image:
+    repository: ghcr.io/spatiumddi/dhcp-kea
+    tag: ""
+    pullPolicy: IfNotPresent
+  agentKey:
+    existingSecret: ""           # external secret with key SPATIUM_AGENT_KEY
+    value: ""
+  servers: []
+    # - name: dhcp1
+    #   role: primary
+    #   group: default
+    #   storage: { agentState: 1Gi, keaState: 2Gi }
+    #   service: { type: NodePort }
+    #   hostNetwork: false       # true required for L2 DHCP broadcast (no relay)
+    #   resources:
+    #     requests: { cpu: 100m, memory: 128Mi }
+    #     limits:   { cpu: 500m, memory: 512Mi }

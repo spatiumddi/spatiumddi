@@ -136,14 +136,24 @@ Duplicate the StatefulSet/Service pair per server (rename `ns1` → `ns2`, etc.)
 
 ### Option B: Helm chart (recommended)
 
+The umbrella chart `charts/spatiumddi` deploys the entire stack (API,
+frontend, worker, beat, migrate Job, Postgres, Redis) and can optionally
+stand up DNS and DHCP agent StatefulSets alongside it. Published to
+`oci://ghcr.io/spatiumddi/charts/spatiumddi` — see
+[charts/spatiumddi/README.md](../charts/spatiumddi/README.md) for the
+full option surface.
+
 ```bash
-helm install spatium-dns charts/spatium-dns -n spatiumddi \
-  --set controlPlaneUrl=https://api.spatiumddi.example \
-  --set agentKey.existingSecret=spatium-dns-agent-key
+helm install ddi oci://ghcr.io/spatiumddi/charts/spatiumddi \
+  --version <CHART_VERSION> \
+  --namespace spatiumddi --create-namespace \
+  --set dnsAgents.enabled=true \
+  --set dnsAgents.agentKey.existingSecret=spatium-dns-agent-key \
+  --set-json 'dnsAgents.servers=[{"name":"ns1","role":"primary","group":"internal-resolvers"}]'
 ```
 
-Declare each server in `values.yaml` under `.servers[]`. The chart renders a
-StatefulSet + LoadBalancer Service per entry.
+Declare each DNS server under `.dnsAgents.servers[]` in `values.yaml`.
+The chart renders a StatefulSet + LoadBalancer Service per entry.
 
 ### How servers register
 

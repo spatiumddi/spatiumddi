@@ -1,0 +1,140 @@
+{{- if .Values.dnsAgents.enabled }}
+{{- $root := . -}}
+{{- $tag := .Values.dnsAgents.image.tag | default .Chart.AppVersion -}}
+{{- $secretName := .Values.dnsAgents.agentKey.existingSecret | default (printf "%s-dns-agent-key" (include "spatiumddi.fullname" .)) -}}
+{{- if and (not .Values.dnsAgents.agentKey.existingSecret) .Values.dnsAgents.agentKey.value }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $secretName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" "dns-agent") .) | nindent 4 }}
+type: Opaque
+stringData:
+  DNS_AGENT_KEY: {{ .Values.dnsAgents.agentKey.value | quote }}
+---
+{{- end }}
+{{- range $server := .Values.dnsAgents.servers }}
+{{- $flavor := $server.flavor | default "bind9" -}}
+{{- $instance := printf "dns-%s-%s" $flavor $server.name -}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $instance }}
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" "dns-agent") $root) | nindent 4 }}
+    app.kubernetes.io/instance-name: {{ $server.name | quote }}
+    spatiumddi.org/dns-flavor: {{ $flavor }}
+    spatiumddi.org/dns-role: {{ $server.role | default "primary" }}
+spec:
+  serviceName: {{ $instance }}-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "spatiumddi.componentSelectorLabels" (merge (dict "component" "dns-agent") $root) | nindent 6 }}
+      app.kubernetes.io/instance-name: {{ $server.name | quote }}
+  template:
+    metadata:
+      labels:
+        {{- include "spatiumddi.componentSelectorLabels" (merge (dict "component" "dns-agent") $root) | nindent 8 }}
+        app.kubernetes.io/instance-name: {{ $server.name | quote }}
+        spatiumddi.org/dns-flavor: {{ $flavor }}
+    spec:
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: {{ include "spatiumddi.name" $root }}
+                    app.kubernetes.io/component: dns-agent
+                topologyKey: kubernetes.io/hostname
+      {{- with $root.Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: dns
+          image: "{{ $root.Values.dnsAgents.image.repository }}:{{ $tag }}"
+          imagePullPolicy: {{ $root.Values.dnsAgents.image.pullPolicy }}
+          env:
+            - name: CONTROL_PLANE_URL
+              value: "http://{{ include "spatiumddi.fullname" $root }}-api.{{ $root.Release.Namespace }}.svc.cluster.local:{{ $root.Values.api.service.port }}"
+            - name: SERVER_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: AGENT_GROUP
+              value: {{ $server.group | default "default" | quote }}
+            - name: AGENT_ROLES
+              value: {{ $server.role | default "authoritative" | quote }}
+            - name: DNS_AGENT_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secretName }}
+                  key: DNS_AGENT_KEY
+          ports:
+            - { name: dns-udp, containerPort: 53, protocol: UDP }
+            - { name: dns-tcp, containerPort: 53, protocol: TCP }
+          readinessProbe:
+            tcpSocket: { port: 53 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            {{- toYaml ($server.resources | default (dict "requests" (dict "cpu" "100m" "memory" "128Mi") "limits" (dict "cpu" "500m" "memory" "512Mi"))) | nindent 12 }}
+          volumeMounts:
+            - { name: agent-state, mountPath: /var/lib/spatium-dns-agent }
+            - { name: dns-state,   mountPath: /var/cache/bind }
+  volumeClaimTemplates:
+    - metadata: { name: agent-state }
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: {{ (get ($server.storage | default dict) "agentState") | default "1Gi" }}
+    - metadata: { name: dns-state }
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: {{ (get ($server.storage | default dict) "dnsState") | default "2Gi" }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $instance }}
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" "dns-agent") $root) | nindent 4 }}
+    app.kubernetes.io/instance-name: {{ $server.name | quote }}
+spec:
+  type: {{ (get ($server.service | default dict) "type") | default "LoadBalancer" }}
+  selector:
+    {{- include "spatiumddi.componentSelectorLabels" (merge (dict "component" "dns-agent") $root) | nindent 4 }}
+    app.kubernetes.io/instance-name: {{ $server.name | quote }}
+  ports:
+    - { name: dns-udp, port: 53, targetPort: 53, protocol: UDP }
+    - { name: dns-tcp, port: 53, targetPort: 53, protocol: TCP }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $instance }}-headless
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" "dns-agent") $root) | nindent 4 }}
+    app.kubernetes.io/instance-name: {{ $server.name | quote }}
+spec:
+  clusterIP: None
+  selector:
+    {{- include "spatiumddi.componentSelectorLabels" (merge (dict "component" "dns-agent") $root) | nindent 4 }}
+    app.kubernetes.io/instance-name: {{ $server.name | quote }}
+  ports:
+    - { name: dns-udp, port: 53, protocol: UDP }
+    - { name: dns-tcp, port: 53, protocol: TCP }
+---
+{{- end }}
+{{- end }}

@@ -34,6 +34,12 @@ backend/alembic/versions/__pycache__/
 # Docker
 .docker/
 
+# Helm — `helm dependency update` pulls subchart tarballs into charts/
+# and writes a Chart.lock. CI pulls fresh on every release, so there's
+# no value to tracking either.
+charts/**/charts/
+charts/**/Chart.lock
+
 # OS
 .DS_Store
 Thumbs.db

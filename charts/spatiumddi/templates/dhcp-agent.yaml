@@ -1,0 +1,144 @@
+{{- if .Values.dhcpAgents.enabled }}
+{{- $root := . -}}
+{{- $tag := .Values.dhcpAgents.image.tag | default .Chart.AppVersion -}}
+{{- $secretName := .Values.dhcpAgents.agentKey.existingSecret | default (printf "%s-dhcp-agent-key" (include "spatiumddi.fullname" .)) -}}
+{{- if and (not .Values.dhcpAgents.agentKey.existingSecret) .Values.dhcpAgents.agentKey.value }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $secretName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" "dhcp-agent") .) | nindent 4 }}
+type: Opaque
+stringData:
+  SPATIUM_AGENT_KEY: {{ .Values.dhcpAgents.agentKey.value | quote }}
+---
+{{- end }}
+{{- range $server := .Values.dhcpAgents.servers }}
+{{- $flavor := $server.flavor | default "kea" -}}
+{{- $instance := printf "dhcp-%s-%s" $flavor $server.name -}}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ $instance }}
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" "dhcp-agent") $root) | nindent 4 }}
+    app.kubernetes.io/instance-name: {{ $server.name | quote }}
+    spatiumddi.org/dhcp-flavor: {{ $flavor }}
+    spatiumddi.org/dhcp-role: {{ $server.role | default "primary" }}
+spec:
+  serviceName: {{ $instance }}-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "spatiumddi.componentSelectorLabels" (merge (dict "component" "dhcp-agent") $root) | nindent 6 }}
+      app.kubernetes.io/instance-name: {{ $server.name | quote }}
+  template:
+    metadata:
+      labels:
+        {{- include "spatiumddi.componentSelectorLabels" (merge (dict "component" "dhcp-agent") $root) | nindent 8 }}
+        app.kubernetes.io/instance-name: {{ $server.name | quote }}
+        spatiumddi.org/dhcp-flavor: {{ $flavor }}
+    spec:
+      {{- if $server.hostNetwork }}
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      {{- end }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: {{ include "spatiumddi.name" $root }}
+                    app.kubernetes.io/component: dhcp-agent
+                topologyKey: kubernetes.io/hostname
+      {{- with $root.Values.image.pullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: dhcp
+          image: "{{ $root.Values.dhcpAgents.image.repository }}:{{ $tag }}"
+          imagePullPolicy: {{ $root.Values.dhcpAgents.image.pullPolicy }}
+          env:
+            - name: SPATIUM_API_URL
+              value: "http://{{ include "spatiumddi.fullname" $root }}-api.{{ $root.Release.Namespace }}.svc.cluster.local:{{ $root.Values.api.service.port }}"
+            - name: SPATIUM_SERVER_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: AGENT_GROUP
+              value: {{ $server.group | default "default" | quote }}
+            - name: AGENT_ROLES
+              value: {{ $server.role | default "primary" | quote }}
+            - name: SPATIUM_AGENT_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $secretName }}
+                  key: SPATIUM_AGENT_KEY
+          ports:
+            - { name: dhcp-udp,  containerPort: 67,   protocol: UDP }
+            - { name: ctrl-http, containerPort: 8000, protocol: TCP }
+          readinessProbe:
+            tcpSocket: { port: 8000 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            {{- toYaml ($server.resources | default (dict "requests" (dict "cpu" "100m" "memory" "128Mi") "limits" (dict "cpu" "500m" "memory" "512Mi"))) | nindent 12 }}
+          volumeMounts:
+            - { name: agent-state, mountPath: /var/lib/spatium-dhcp-agent }
+            - { name: kea-state,   mountPath: /var/lib/kea }
+  volumeClaimTemplates:
+    - metadata: { name: agent-state }
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: {{ (get ($server.storage | default dict) "agentState") | default "1Gi" }}
+    - metadata: { name: kea-state }
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources:
+          requests:
+            storage: {{ (get ($server.storage | default dict) "keaState") | default "2Gi" }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $instance }}
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" "dhcp-agent") $root) | nindent 4 }}
+    app.kubernetes.io/instance-name: {{ $server.name | quote }}
+spec:
+  type: {{ (get ($server.service | default dict) "type") | default "NodePort" }}
+  selector:
+    {{- include "spatiumddi.componentSelectorLabels" (merge (dict "component" "dhcp-agent") $root) | nindent 4 }}
+    app.kubernetes.io/instance-name: {{ $server.name | quote }}
+  ports:
+    - { name: dhcp-udp,  port: 67,   targetPort: 67,   protocol: UDP }
+    - { name: ctrl-http, port: 8000, targetPort: 8000, protocol: TCP }
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $instance }}-headless
+  namespace: {{ $root.Release.Namespace }}
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" "dhcp-agent") $root) | nindent 4 }}
+    app.kubernetes.io/instance-name: {{ $server.name | quote }}
+spec:
+  clusterIP: None
+  selector:
+    {{- include "spatiumddi.componentSelectorLabels" (merge (dict "component" "dhcp-agent") $root) | nindent 4 }}
+    app.kubernetes.io/instance-name: {{ $server.name | quote }}
+  ports:
+    - { name: dhcp-udp,  port: 67,   protocol: UDP }
+    - { name: ctrl-http, port: 8000, protocol: TCP }
+---
+{{- end }}
+{{- end }}

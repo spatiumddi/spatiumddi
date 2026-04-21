@@ -96,7 +96,7 @@ agent/dhcp/             Standalone DHCP agent (Python) + Kea container image
 k8s/base/               Core manifests (api, worker, frontend, migrate)
 k8s/{dns,dhcp}/         Per-service StatefulSets + services
 k8s/ha/                 CloudNativePG, Redis Sentinel, Patroni
-charts/spatium-dns/     Helm chart
+charts/spatiumddi/      Umbrella Helm chart (API + FE + worker + beat + migrate + Postgres/Redis subcharts + optional DNS/DHCP agents)
 scripts/seed_demo.py    Demo data seeder
 docs/                   Specs + Jekyll site (served at spatiumddi.github.io)
 ```
