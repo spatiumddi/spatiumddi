@@ -927,3 +927,118 @@ counts of created / updated / skipped / failed.
 **UI.** ``AddressImportModal`` + a combined **Import / Export**
 dropdown on the subnet header (`SubnetImportExportButton`) replacing
 the older single-purpose export button.
+
+## 16. Rules & constraints
+
+Server-side validations that reject requests with a human-readable
+error. Clients should surface the response `detail` — the IPAM UI
+already wires this up for every delete / allocate / create flow.
+
+### Delete guards
+
+- **IP space delete refused when non-empty.** A space with any blocks
+  or subnets can't be dropped; clear them first. `409` at
+  `backend/app/api/v1/ipam/router.py:1592`.
+- **Block delete refused when non-empty.** A block with child blocks
+  *or* subnets returns `409` with a breakdown (*"Block 10.0.0.0/8
+  still contains 3 child block(s) and 5 subnet(s)"*).
+  `backend/app/api/v1/ipam/router.py:1824`.
+- **Subnet delete refused when non-empty.** A subnet with user-owned
+  IPs (anything other than `network`, `broadcast`, `orphan`, or
+  DHCP-lease-mirrored `auto_from_lease` rows) or any DHCP scope
+  attached is rejected with `409`. Pass `?force=true` to cascade;
+  the same pre-delete cleanup (WinRM remove-scope, Kea bundle
+  rebuild) still runs so nothing is orphaned on a running server.
+  `backend/app/api/v1/ipam/router.py:2492`.
+
+### Block hierarchy
+
+- **Block cannot be its own parent.** `parent_block_id` must not
+  equal the block's own id. `422` at
+  `backend/app/api/v1/ipam/router.py:1706`.
+- **Reparenting can't create a cycle.** Moving a block into one of
+  its own descendants is caught before commit; same rule applies via
+  drag-and-drop in the UI (checked client-side too, but the server
+  is authoritative). `422` at
+  `backend/app/api/v1/ipam/router.py:1725`.
+- **Block must fit inside its parent block.** Child CIDR must be
+  fully contained in the parent's CIDR. Enforced on create + on
+  reparent. `422` at `:1717`.
+- **Block overlap at the same level.** Sibling blocks in the same
+  space cannot have overlapping CIDRs (duplicates or otherwise).
+  Checked via `_assert_no_block_overlap`. `422` at `:1654`.
+
+### Subnets
+
+- **Subnet must fit inside its parent block.** `422` at `:2303`.
+- **Subnet overlap within a space.** Two subnets in the same IP space
+  cannot overlap, regardless of which block they sit under. Checked
+  via `_assert_no_overlap`. `422` at `:2047`.
+- **Gateway must be a valid IP inside the subnet.** Malformed IPs
+  return `422` at `:2054`; a parseable IP outside the CIDR returns
+  `422` at `:2056`.
+- **VLAN reference must resolve.** A `vlan_ref_id` that doesn't
+  point to an existing VLAN returns `404` at `:2067`.
+- **VLAN ID must match the referenced VLAN.** If both `vlan_id` and
+  `vlan_ref_id` are supplied, the tag must match the referenced
+  VLAN's tag. `422` at `:2071`.
+
+### IP allocation
+
+- **IP must be inside the subnet's CIDR.** `422` at `:3497`. Same
+  check applies in the import path.
+- **IP inside a dynamic DHCP pool is refused.** Manual allocation
+  inside an active `dynamic` pool is blocked — DHCP owns those
+  addresses. Move the pool to `reserved` / `excluded` or shrink it
+  first. `422` at `:3507`. `GET /subnets/{id}/next-ip-preview`
+  honours the same skip.
+- **IP already allocated in the subnet.** Duplicate address in the
+  same subnet returns `409` at `:3531`.
+- **Malformed IP.** Non-parseable address in create / import paths
+  returns `422` at `:3493`.
+- **`static_dhcp` status requires a MAC.** Creating an IP with
+  `status="static_dhcp"` without a `mac_address` is rejected — a
+  static reservation needs something to match on. `422` at `:3518`.
+- **Collision warnings are soft, not hard.** Duplicate hostname +
+  forward zone, or duplicate MAC across subnets, returns `409` with
+  `{"warnings": [...], "requires_confirmation": True}`; the client
+  can retry with `force=true` to override. Unlike the rules above,
+  this one isn't a permanent block.
+
+### Enum validators
+
+Pydantic field validators — all return `422` with the offending
+value and the allowed set. Kept compact because the error messages
+speak for themselves.
+
+- `IPSpace.color` → `VALID_SPACE_COLORS` (same 8 swatches as zone
+  colour). `backend/app/api/v1/ipam/router.py:965`.
+- `Subnet.status` → allowed set (`active`, `deprecated`, etc). `:1146`.
+- `Subnet.ddns_hostname_policy` → see `docs/features/DHCP.md §13`.
+  `:1121`.
+- `NextIPRequest.strategy` → `sequential` or `random`. `:1437`.
+- Alias `record_type` → `CNAME` or `A`. `:1302`. Alias rows with no
+  `name` are also rejected. `:1310`.
+
+### CIDR form
+
+- **Invalid CIDR notation.** Malformed CIDR strings are rejected at
+  `:1139`.
+- **CIDR with host bits set.** Non-strict CIDRs (e.g. `10.0.0.1/24`)
+  are rejected with a message suggesting the normalised form
+  (`10.0.0.0/24`). `:1135`.
+- **Prefix length can't exceed the address family.** `/33+` for IPv4
+  and `/129+` for IPv6 are rejected in the available-subnets query.
+  `:1871`.
+- **Available-subnets `prefix_len` must be strictly smaller than the
+  block.** Asking for a `/24` inside a `/24` returns `422` — there's
+  nothing to divide. `:1879`.
+
+### Import / DNS linkage
+
+- **IPAM import payload shape.** `POST /import/...` rejects requests
+  without a top-level `payload` object. `422` at
+  `backend/app/api/v1/ipam/io_router.py:117`.
+- **DNS zone link must resolve.** Setting `dns_zone_id` on a subnet
+  requires the zone to exist *in the subnet's configured view* —
+  linking a zone from a different view returns `404` at `:4220`.

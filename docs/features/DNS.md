@@ -693,3 +693,70 @@ Implementation: `app.tasks.dns_pull.auto_pull_dns_from_server`.
 
 Both jobs have **Last Run** indicators in Settings so you can confirm they're firing.
 
+## 15. Rules & constraints
+
+Server-side validations that reject requests with a human-readable
+error. Clients should display the response `detail` to the operator —
+most of these feed the IPAM / DNS / DHCP UI error banners directly.
+
+### Zones
+
+- **Duplicate zone name inside a group/view.** `(group_id, view_id,
+  name)` is a unique constraint; create/update returns `409` with
+  *"A zone with that name already exists in this group/view."* at
+  `backend/app/api/v1/dns/router.py:1915`.
+- **`zone_type` enum.** One of `primary` / `secondary` / `stub` /
+  `forward`. Pydantic validator at
+  `backend/app/api/v1/dns/router.py:503`.
+- **`color` enum.** Must be in `VALID_ZONE_COLORS` (`slate`, `red`,
+  `amber`, `emerald`, `cyan`, `blue`, `violet`, `pink`). Free-form
+  hex is deliberately not accepted so both themes stay legible.
+  `backend/app/api/v1/dns/router.py:512`.
+- **`notify_enabled` enum.** One of `yes` / `no` / `explicit` /
+  `master-only`. `backend/app/api/v1/dns/router.py:562`.
+- **Windows zone push-before-commit.** When a zone is created / deleted
+  on a group that has an agentless `windows_dns` server with
+  credentials, the WinRM push happens first — a WinRM failure rolls
+  back the DB transaction and returns `502` so the operator never
+  sees a SpatiumDDI zone that doesn't exist on the real DC.
+  `backend/app/api/v1/dns/router.py:2087`.
+
+### Records
+
+- **`record_type` enum.** Must be in `VALID_RECORD_TYPES` — A, AAAA,
+  CNAME, MX, TXT, NS, PTR, SRV, CAA, TLSA, SSHFP, NAPTR, LOC.
+  `backend/app/api/v1/dns/router.py:614`.
+
+### Servers & server groups
+
+- **Duplicate server-group name.** `409` at
+  `backend/app/api/v1/dns/router.py:660`.
+- **Duplicate server name within a group.** `(group_id, name)` is
+  unique — same name is fine across different groups. `409` at
+  `backend/app/api/v1/dns/router.py:801`.
+- **`group_type` enum.** `VALID_GROUP_TYPES` —
+  `backend/app/api/v1/dns/router.py:97`.
+- **`driver` enum.** Must be `bind9` or `windows_dns` (plus
+  `stub_resolver` for tests). `422` at
+  `backend/app/api/v1/dns/router.py:175`.
+- **Windows credentials must be complete on first set.** Creating a
+  `windows_dns` server with Path B credentials requires both
+  `username` and `password`; an incomplete pair returns `400`. Later
+  updates may include just one field.
+  `backend/app/api/v1/dns/router.py:827` (create) and
+  `:891` (update).
+
+### ACLs & views
+
+- **Duplicate ACL name within a group.** `(group_id, name)` unique.
+  `409` at `backend/app/api/v1/dns/router.py:1717`.
+- **Duplicate view name within a group.** Same pattern. `409` at
+  `backend/app/api/v1/dns/router.py:1819`.
+
+### Server options
+
+- **`forward_policy` enum.** `first` or `only`. Validator at
+  `backend/app/api/v1/dns/router.py:329`.
+- **`dnssec_validation` enum.** `auto`, `yes`, or `no`. Validator at
+  `backend/app/api/v1/dns/router.py:336`.
+

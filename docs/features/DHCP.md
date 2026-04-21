@@ -487,3 +487,75 @@ Full config-push to Windows DHCP (analogous to Windows DNS Path B) would unlock:
 - DHCP failover pair configuration from SpatiumDDI.
 
 The per-object CRUD methods are already in place (`apply_scope`, `apply_reservation`, `apply_exclusion`) — what's missing is the API-side wiring that routes write events from the scope / pool / static endpoints into those methods for agentless drivers. Expected before ISC DHCP lands.
+
+## 16. Rules & constraints
+
+Server-side validations that reject requests with a human-readable
+error. Clients should render the `detail` string into their UI — every
+rule here has been surfaced to an operator, not just silently logged.
+
+### Scopes
+
+- **Scope already exists for this server + subnet.** A subnet may host
+  at most one scope per server. `409` at
+  `backend/app/api/v1/dhcp/scopes.py:217`.
+- **`server_id` required when multiple servers are registered.** If
+  more than one DHCP server is defined, scope-create must name one
+  explicitly; SpatiumDDI won't guess. Single-server deployments can
+  omit the field. `422` at `backend/app/api/v1/dhcp/scopes.py:206`.
+- **Hostname sync mode must be one of the configured values.** Mode
+  picker is validated against `VALID_SYNC_MODES`; reserved / internal
+  modes are not selectable from the API. `422` at
+  `backend/app/api/v1/dhcp/scopes.py:220`.
+- **DDNS hostname policy enum.** `ddns_hostname_policy` must match one
+  of the documented values (see §13). Pydantic validator at
+  `backend/app/api/v1/dhcp/scopes.py:101`.
+
+### Pools
+
+- **Pools in the same scope cannot overlap.** Start/end ranges are
+  checked against every other pool on the scope before insert. `409`
+  at `backend/app/api/v1/dhcp/pools.py:143`.
+- **Pool type enum.** `pool_type` must be in `VALID_POOL_TYPES`
+  (`dynamic`, `reserved`, `excluded`). Validator at
+  `backend/app/api/v1/dhcp/pools.py:40`.
+
+### Static reservations
+
+- **Duplicate MAC on the same server.** A MAC can only be reserved
+  once per server, regardless of which scope it's attached to — this
+  matches how Kea and Windows DHCP both treat the MAC as a server-wide
+  identifier. `409` at `backend/app/api/v1/dhcp/statics.py:146`.
+- **Static IP inside a dynamic pool.** A static reservation whose IP
+  falls inside a `dynamic` pool is refused; delete or shrink the pool,
+  or convert the pool to `reserved` / `excluded` first. `409` at
+  `backend/app/api/v1/dhcp/statics.py:164`.
+- **Malformed IP.** Non-parseable IP strings return `422` at
+  `backend/app/api/v1/dhcp/statics.py:155`.
+
+### Servers & server groups
+
+- **Duplicate server name.** Each `DHCPServer.name` is globally unique.
+  `409` at `backend/app/api/v1/dhcp/servers.py:228`.
+- **Driver enum.** `driver` must be one of `kea`, `isc_dhcp` (planned),
+  `windows_dhcp`. `422` at `backend/app/api/v1/dhcp/servers.py:73`.
+- **Read-only drivers refuse config push.** Attempting to push a
+  config bundle to an agentless read-only driver (e.g.
+  `windows_dhcp`) returns `400` with a message directing the operator
+  to `/sync-leases` instead. `backend/app/api/v1/dhcp/servers.py:378`.
+- **Windows credentials must be complete on first set.** Setting
+  credentials on a `windows_dhcp` server requires both `username` and
+  `password` — you can't partial-update an empty credential blob.
+  Later edits may include either field alone. `400` at
+  `backend/app/api/v1/dhcp/servers.py:310`.
+- **Duplicate server-group name.** `409` at
+  `backend/app/api/v1/dhcp/server_groups.py:73`.
+- **Server-group mode enum.** `VALID_MODES` only; enforced at
+  `backend/app/api/v1/dhcp/server_groups.py:35`.
+
+### Client classes
+
+- **Duplicate client-class name per server.** Class names are scoped
+  to the server, not the group; two servers can reuse the name but
+  one server may not. `409` at
+  `backend/app/api/v1/dhcp/client_classes.py:73`.
