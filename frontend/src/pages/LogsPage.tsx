@@ -773,7 +773,7 @@ function EventRow({ ev }: { ev: LogEventRow }) {
   const firstLine = ev.message.split("\n")[0];
   const hasMore = ev.message.includes("\n") || ev.message.length > 120;
   return (
-    <div className="grid grid-cols-[140px_52px_60px_140px_1fr] items-start gap-3 px-6 py-2 text-xs hover:bg-accent/30">
+    <div className="grid grid-cols-[140px_52px_60px_140px_1fr] items-start gap-3 px-6 py-2 text-xs even:bg-muted/40 hover:bg-muted/70 even:hover:bg-muted/70">
       <span className="font-mono text-muted-foreground">
         {formatTime(ev.time)}
       </span>
@@ -837,7 +837,7 @@ function auditCodeColor(code: number): string {
 function AuditRow({ row }: { row: DhcpAuditRow }) {
   const dot = auditCodeColor(row.event_code);
   return (
-    <div className="grid grid-cols-[140px_180px_120px_160px_140px_1fr] items-center gap-3 px-6 py-1.5 text-xs hover:bg-accent/30">
+    <div className="grid grid-cols-[140px_180px_120px_160px_140px_1fr] items-center gap-3 px-6 py-1.5 text-xs even:bg-muted/40 hover:bg-muted/70 even:hover:bg-muted/70">
       <span className="font-mono text-muted-foreground">
         {formatTime(row.time)}
       </span>

@@ -1,5 +1,6 @@
 import { useQuery } from "@tanstack/react-query";
 import { ipamApi, type Subnet } from "@/lib/api";
+import { zebraBodyCls } from "@/lib/utils";
 
 export function SubnetsPage() {
   const { data: subnets, isLoading } = useQuery({
@@ -27,7 +28,7 @@ export function SubnetsPage() {
               <th className="px-4 py-3 text-left font-medium">Utilization</th>
             </tr>
           </thead>
-          <tbody>
+          <tbody className={zebraBodyCls}>
             {subnets?.map((subnet: Subnet) => (
               <tr
                 key={subnet.id}

@@ -24,6 +24,17 @@
     --input: 214.3 31.8% 91.4%;
     --ring: 222.2 84% 4.9%;
     --radius: 0.5rem;
+
+    /* Sidebar — stays dark in light mode so it doesn't blend into the page.
+       Active item: white pill with dark text. Hover: subtle lighter fill. */
+    --sidebar-background: 222.2 47.4% 11.2%;
+    --sidebar-foreground: 210 40% 96.1%;
+    --sidebar-muted-foreground: 215 20% 65%;
+    --sidebar-border: 217.2 32.6% 17.5%;
+    --sidebar-accent: 217.2 32.6% 20%;
+    --sidebar-accent-foreground: 210 40% 98%;
+    --sidebar-primary: 210 40% 98%;
+    --sidebar-primary-foreground: 222.2 47.4% 11.2%;
   }
 
   .dark {
@@ -46,6 +57,17 @@
     --border: 217.2 32.6% 17.5%;
     --input: 217.2 32.6% 17.5%;
     --ring: 212.7 26.8% 83.9%;
+
+    /* Sidebar in dark mode — slightly darker than the page background so
+       the nav still reads as a distinct surface. */
+    --sidebar-background: 222.2 84% 3%;
+    --sidebar-foreground: 210 40% 96.1%;
+    --sidebar-muted-foreground: 215 20% 55%;
+    --sidebar-border: 217.2 32.6% 14%;
+    --sidebar-accent: 217.2 32.6% 14%;
+    --sidebar-accent-foreground: 210 40% 98%;
+    --sidebar-primary: 210 40% 98%;
+    --sidebar-primary-foreground: 222.2 47.4% 11.2%;
   }
 }
 

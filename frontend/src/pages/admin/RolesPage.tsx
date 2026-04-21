@@ -8,6 +8,7 @@ import {
   type RoleCreate,
   type RoleUpdate,
 } from "@/lib/api";
+import { zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
 
 // Mirror of docs/PERMISSIONS.md — keep these in sync.
@@ -381,7 +382,7 @@ export function RolesPage() {
                 <th className="px-4 py-3" />
               </tr>
             </thead>
-            <tbody>
+            <tbody className={zebraBodyCls}>
               {isLoading && (
                 <tr>
                   <td

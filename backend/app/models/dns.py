@@ -363,6 +363,11 @@ class DNSZone(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     linked_subnet_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("subnet.id", ondelete="SET NULL"), nullable=True
     )
+    # Optional per-zone color key (from a curated swatch set) shown as a
+    # dot/stripe in zone lists + tree nodes. Free-form hex is not accepted
+    # so both light and dark themes remain legible. See API validator for
+    # the allowed keys.
+    color: Mapped[str | None] = mapped_column(String(20), nullable=True)
     dnssec_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     last_serial: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     last_pushed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

@@ -68,8 +68,8 @@ function NavItem({
           "flex items-center rounded-md px-3 py-2 text-sm font-medium transition-colors",
           collapsed ? "justify-center gap-0" : "gap-3",
           isActive
-            ? "bg-primary text-primary-foreground"
-            : "text-muted-foreground hover:bg-accent hover:text-accent-foreground",
+            ? "bg-sidebar-primary text-sidebar-primary-foreground"
+            : "text-sidebar-foreground/70 hover:bg-sidebar-accent hover:text-sidebar-accent-foreground",
           disabled && "pointer-events-none opacity-40",
         )
       }
@@ -121,7 +121,7 @@ export function Sidebar({
       )}
       <aside
         className={cn(
-          "flex flex-col border-r bg-card transition-all duration-200",
+          "flex flex-col border-r border-sidebar-border bg-sidebar text-sidebar-foreground transition-all duration-200",
           // Desktop: inline, fixed width, always visible (md+).
           "md:flex-shrink-0",
           collapsed ? "md:w-14" : "md:w-56",
@@ -134,7 +134,7 @@ export function Sidebar({
         {/* Logo + mobile close button */}
         <div
           className={cn(
-            "flex h-14 items-center border-b",
+            "flex h-14 items-center border-b border-sidebar-border",
             effectiveCollapsed ? "justify-center px-0" : "gap-2 px-4",
           )}
         >
@@ -151,7 +151,7 @@ export function Sidebar({
               type="button"
               onClick={onMobileClose}
               aria-label="Close navigation"
-              className="ml-auto rounded-md p-1 text-muted-foreground hover:bg-accent hover:text-accent-foreground md:hidden"
+              className="ml-auto rounded-md p-1 text-sidebar-foreground/70 hover:bg-sidebar-accent hover:text-sidebar-accent-foreground md:hidden"
             >
               <X className="h-4 w-4" />
             </button>
@@ -173,11 +173,13 @@ export function Sidebar({
 
           <div className="mt-4">
             {!effectiveCollapsed && (
-              <p className="mb-1 px-3 text-xs font-semibold uppercase tracking-wider text-muted-foreground/50">
+              <p className="mb-1 px-3 text-xs font-semibold uppercase tracking-wider text-sidebar-muted-foreground/70">
                 Admin
               </p>
             )}
-            {effectiveCollapsed && <div className="my-2 border-t" />}
+            {effectiveCollapsed && (
+              <div className="my-2 border-t border-sidebar-border" />
+            )}
             <div className="space-y-1">
               {adminNav.map((item) => (
                 <NavItem
@@ -194,13 +196,13 @@ export function Sidebar({
         {/* Footer */}
         <div
           className={cn(
-            "border-t p-2 space-y-1",
+            "border-t border-sidebar-border p-2 space-y-1",
             effectiveCollapsed && "flex flex-col items-center",
           )}
         >
           {!effectiveCollapsed && (
             <div className="px-3 py-1">
-              <span className="text-xs font-mono text-muted-foreground/60">
+              <span className="text-xs font-mono text-sidebar-muted-foreground/80">
                 v{__APP_VERSION__}
               </span>
             </div>
@@ -212,7 +214,7 @@ export function Sidebar({
             rel="noopener noreferrer"
             title={effectiveCollapsed ? "GitHub" : undefined}
             className={cn(
-              "flex items-center rounded-md px-3 py-2 text-sm font-medium text-muted-foreground hover:bg-accent hover:text-accent-foreground transition-colors",
+              "flex items-center rounded-md px-3 py-2 text-sm font-medium text-sidebar-foreground/70 hover:bg-sidebar-accent hover:text-sidebar-accent-foreground transition-colors",
               effectiveCollapsed ? "justify-center" : "gap-3",
             )}
           >
@@ -225,7 +227,7 @@ export function Sidebar({
             onClick={toggle}
             title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
             className={cn(
-              "hidden md:flex w-full items-center rounded-md px-3 py-2 text-sm text-muted-foreground hover:bg-accent hover:text-accent-foreground transition-colors",
+              "hidden md:flex w-full items-center rounded-md px-3 py-2 text-sm text-sidebar-foreground/70 hover:bg-sidebar-accent hover:text-sidebar-accent-foreground transition-colors",
               collapsed ? "justify-center" : "gap-3",
             )}
           >

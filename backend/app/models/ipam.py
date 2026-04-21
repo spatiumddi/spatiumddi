@@ -30,6 +30,9 @@ class IPSpace(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     description: Mapped[str] = mapped_column(Text, nullable=False, default="")
     is_default: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     tags: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    # Optional swatch key painted as a dot in the IPAM tree — same curated
+    # palette as DNSZone.color so the two feel coherent.
+    color: Mapped[str | None] = mapped_column(String(20), nullable=True)
 
     # DNS assignment — propagates down to child blocks/subnets that inherit
     dns_group_ids: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)

@@ -134,6 +134,7 @@ export interface IPSpace {
   description: string;
   is_default: boolean;
   tags: Record<string, unknown>;
+  color: string | null;
   dns_group_ids: string[];
   dns_zone_id: string | null;
   dns_additional_zone_ids: string[];
@@ -1601,6 +1602,7 @@ export interface DNSZone {
   is_auto_generated: boolean;
   linked_subnet_id: string | null;
   dnssec_enabled: boolean;
+  color: string | null;
   last_serial: number;
   last_pushed_at: string | null;
   allow_query: string[] | null;

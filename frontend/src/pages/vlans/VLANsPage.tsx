@@ -17,7 +17,7 @@ import {
   type VLAN,
   type Subnet,
 } from "@/lib/api";
-import { cn } from "@/lib/utils";
+import { cn, zebraBodyCls } from "@/lib/utils";
 import { useTableSort, SortableTh } from "@/lib/useTableSort";
 import {
   ContextMenu,
@@ -392,7 +392,7 @@ function RouterDetail({
                 </th>
               </tr>
             </thead>
-            <tbody>
+            <tbody className={zebraBodyCls}>
               {vlans.length === 0 && (
                 <tr>
                   <td
@@ -644,7 +644,7 @@ function VLANDetail({
                 <th className="text-left px-3 py-1.5">Status</th>
               </tr>
             </thead>
-            <tbody>
+            <tbody className={zebraBodyCls}>
               {subnets.length === 0 && (
                 <tr>
                   <td

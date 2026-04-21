@@ -9,7 +9,7 @@ import {
   ShieldOff,
 } from "lucide-react";
 import { usersApi, type AppUser } from "@/lib/api";
-import { cn } from "@/lib/utils";
+import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -406,7 +406,7 @@ export function UsersPage() {
                 <th className="px-4 py-3" />
               </tr>
             </thead>
-            <tbody>
+            <tbody className={zebraBodyCls}>
               {isLoading && (
                 <tr>
                   <td

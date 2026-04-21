@@ -11,7 +11,7 @@ import {
   type InternalGroupCreate,
   type InternalGroupUpdate,
 } from "@/lib/api";
-import { cn } from "@/lib/utils";
+import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
 
 const inputCls =
@@ -332,7 +332,7 @@ export function GroupsPage() {
                 <th className="px-4 py-3" />
               </tr>
             </thead>
-            <tbody>
+            <tbody className={zebraBodyCls}>
               {isLoading && (
                 <tr>
                   <td

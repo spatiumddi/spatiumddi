@@ -607,13 +607,13 @@ export function DashboardPage() {
                     <span className="w-14 flex-shrink-0 tabular-nums text-muted-foreground">
                       {humanTime(entry.timestamp)}
                     </span>
-                    <span className="w-14 flex-shrink-0">
+                    <span className="w-36 flex-shrink-0 min-w-0">
                       <ActionBadge
                         action={entry.action}
                         result={entry.result}
                       />
                     </span>
-                    <span className="w-16 flex-shrink-0 truncate text-muted-foreground">
+                    <span className="w-20 flex-shrink-0 truncate text-muted-foreground">
                       {entry.resource_type.replace(/_/g, " ")}
                     </span>
                     <span className="flex-1 truncate font-mono">

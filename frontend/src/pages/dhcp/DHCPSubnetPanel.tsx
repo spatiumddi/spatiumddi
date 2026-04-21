@@ -9,6 +9,7 @@ import {
   Trash2,
 } from "lucide-react";
 import { dhcpApi, type DHCPPool, type DHCPScope } from "@/lib/api";
+import { zebraBodyCls } from "@/lib/utils";
 import { CreateScopeModal } from "./CreateScopeModal";
 import { CreatePoolModal } from "./CreatePoolModal";
 import { DeleteConfirmModal } from "./_shared";
@@ -174,7 +175,7 @@ function ScopeCard({ scope }: { scope: DHCPScope }) {
                   <th className="px-3 py-1.5"></th>
                 </tr>
               </thead>
-              <tbody>
+              <tbody className={zebraBodyCls}>
                 {pools.map((p) => (
                   <PoolRow key={p.id} pool={p} scope={scope} />
                 ))}

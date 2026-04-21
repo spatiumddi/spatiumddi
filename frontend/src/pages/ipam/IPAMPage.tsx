@@ -52,7 +52,8 @@ import {
   type VLAN,
   type DHCPLeaseSyncResult,
 } from "@/lib/api";
-import { cn } from "@/lib/utils";
+import { cn, swatchTintCls, zebraBodyCls } from "@/lib/utils";
+import { SwatchPicker } from "@/components/ui/swatch-picker";
 import { useStickyLocation } from "@/lib/stickyLocation";
 import { useSessionState } from "@/lib/useSessionState";
 import { Modal } from "@/components/ui/modal";
@@ -401,6 +402,7 @@ function CreateSpaceModal({ onClose }: { onClose: () => void }) {
   const qc = useQueryClient();
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
+  const [color, setColor] = useState<string | null>(null);
   const [dnsGroupIds, setDnsGroupIds] = useState<string[]>([]);
   const [dnsZoneId, setDnsZoneId] = useState<string | null>(null);
   const [dnsAdditionalZoneIds, setDnsAdditionalZoneIds] = useState<string[]>(
@@ -416,6 +418,7 @@ function CreateSpaceModal({ onClose }: { onClose: () => void }) {
         name,
         description,
         is_default: false,
+        color,
         dns_group_ids: dnsGroupIds,
         dns_zone_id: dnsZoneId,
         dns_additional_zone_ids: dnsAdditionalZoneIds,
@@ -445,6 +448,9 @@ function CreateSpaceModal({ onClose }: { onClose: () => void }) {
             onChange={(e) => setDescription(e.target.value)}
             placeholder="Optional"
           />
+        </Field>
+        <Field label="Color">
+          <SwatchPicker value={color} onChange={setColor} />
         </Field>
         <div className="border-t pt-3">
           <p className="mb-2 text-xs font-semibold text-muted-foreground uppercase tracking-wide">
@@ -3354,7 +3360,7 @@ function SubnetDetail({
                       </tr>
                     )}
                   </thead>
-                  <tbody>
+                  <tbody className={zebraBodyCls}>
                     {filteredAddresses?.length === 0 && (
                       <tr>
                         <td
@@ -4661,6 +4667,7 @@ function EditSubnetModal({
     },
   });
 
+  const [deleteError, setDeleteError] = useState<string | null>(null);
   const deleteMutation = useMutation({
     mutationFn: () => ipamApi.deleteSubnet(subnet.id),
     onSuccess: () => {
@@ -4668,24 +4675,45 @@ function EditSubnetModal({
       qc.invalidateQueries({ queryKey: ["blocks", subnet.space_id] });
       onDeleted?.();
     },
+    onError: (err: unknown) => {
+      const detail = (err as { response?: { data?: { detail?: unknown } } })
+        ?.response?.data?.detail;
+      setDeleteError(
+        typeof detail === "string"
+          ? detail
+          : detail
+            ? JSON.stringify(detail)
+            : "Failed to delete subnet.",
+      );
+    },
   });
+
+  function resetDelete() {
+    setDeleteStep(0);
+    setDeleteError(null);
+    setDeleteChecked(false);
+  }
 
   // ── Delete step 1 ──
   if (deleteStep === 1) {
     return (
-      <Modal title="Delete Subnet" onClose={() => setDeleteStep(0)}>
+      <Modal title="Delete Subnet" onClose={resetDelete}>
         <div className="space-y-4">
           <p className="text-sm text-muted-foreground">
             Are you sure you want to delete subnet{" "}
             <strong className="font-mono text-foreground">
               {subnet.network}
             </strong>
-            {subnet.name ? ` (${subnet.name})` : ""}? All IP address records
-            within it will be permanently deleted.
+            {subnet.name ? ` (${subnet.name})` : ""}?
           </p>
+          {deleteError && (
+            <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+              {deleteError}
+            </div>
+          )}
           <div className="flex justify-end gap-2">
             <button
-              onClick={() => setDeleteStep(0)}
+              onClick={resetDelete}
               className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
             >
               Cancel
@@ -4705,20 +4733,16 @@ function EditSubnetModal({
   // ── Delete step 2 ──
   if (deleteStep === 2) {
     return (
-      <Modal
-        title="Confirm Permanent Deletion"
-        onClose={() => setDeleteStep(0)}
-      >
+      <Modal title="Confirm Permanent Deletion" onClose={resetDelete}>
         <div className="space-y-4">
           <p className="text-sm font-medium text-destructive">
             This action cannot be undone.
           </p>
           <p className="text-sm text-muted-foreground">
-            All IP address records within{" "}
             <strong className="font-mono text-foreground">
               {subnet.network}
             </strong>{" "}
-            will be permanently removed.
+            and all its contents will be permanently removed.
           </p>
           <label className="flex cursor-pointer items-start gap-2 text-sm">
             <input
@@ -4727,18 +4751,26 @@ function EditSubnetModal({
               checked={deleteChecked}
               onChange={(e) => setDeleteChecked(e.target.checked)}
             />
-            I understand all IP addresses in this subnet will be permanently
-            deleted.
+            I understand {subnet.network} and all its contents will be
+            permanently deleted.
           </label>
+          {deleteError && (
+            <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+              {deleteError}
+            </div>
+          )}
           <div className="flex justify-end gap-2">
             <button
-              onClick={() => setDeleteStep(0)}
+              onClick={resetDelete}
               className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
             >
               Cancel
             </button>
             <button
-              onClick={() => deleteMutation.mutate()}
+              onClick={() => {
+                setDeleteError(null);
+                deleteMutation.mutate();
+              }}
               disabled={!deleteChecked || deleteMutation.isPending}
               className="rounded-md bg-destructive px-3 py-1.5 text-sm text-destructive-foreground hover:bg-destructive/90 disabled:opacity-50"
             >
@@ -5634,7 +5666,7 @@ function AliasesSubnetPanel({ subnetId }: { subnetId: string }) {
             <th className="px-4 py-2" />
           </tr>
         </thead>
-        <tbody>
+        <tbody className={zebraBodyCls}>
           {aliases.map((a) => (
             <tr key={a.id} className="border-b last:border-0 hover:bg-muted/20">
               <td className="px-4 py-2 font-mono text-xs">{a.fqdn}</td>
@@ -6501,6 +6533,7 @@ function ConfirmDestroyModal({
   onConfirm,
   onClose,
   isPending,
+  error,
 }: {
   title: string;
   description: string;
@@ -6508,6 +6541,7 @@ function ConfirmDestroyModal({
   onConfirm: () => void;
   onClose: () => void;
   isPending?: boolean;
+  error?: string | null;
 }) {
   const [step, setStep] = useState<1 | 2>(1);
   const [checked, setChecked] = useState(false);
@@ -6517,6 +6551,11 @@ function ConfirmDestroyModal({
       <Modal title={title} onClose={onClose}>
         <div className="space-y-4">
           <p className="text-sm text-muted-foreground">{description}</p>
+          {error && (
+            <div className="max-h-48 overflow-auto whitespace-pre-line rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+              {error}
+            </div>
+          )}
           <div className="flex justify-end gap-2">
             <button
               onClick={onClose}
@@ -6552,6 +6591,11 @@ function ConfirmDestroyModal({
           />
           {checkLabel}
         </label>
+        {error && (
+          <div className="max-h-48 overflow-auto whitespace-pre-line rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+            {error}
+          </div>
+        )}
         <div className="flex justify-end gap-2">
           <button
             onClick={onClose}
@@ -6586,6 +6630,7 @@ function EditSpaceModal({
   const qc = useQueryClient();
   const [name, setName] = useState(space.name);
   const [description, setDescription] = useState(space.description ?? "");
+  const [color, setColor] = useState<string | null>(space.color ?? null);
   const [deleteStep, setDeleteStep] = useState<0 | 1 | 2>(0);
   const [deleteChecked, setDeleteChecked] = useState(false);
 
@@ -6608,6 +6653,7 @@ function EditSpaceModal({
       ipamApi.updateSpace(space.id, {
         name,
         description,
+        color,
         dns_group_ids: dnsGroupIds,
         dns_zone_id: dnsZoneId,
         dns_additional_zone_ids: dnsAdditionalZoneIds,
@@ -6740,6 +6786,9 @@ function EditSpaceModal({
             onChange={(e) => setDescription(e.target.value)}
             placeholder="Optional"
           />
+        </Field>
+        <Field label="Color">
+          <SwatchPicker value={color} onChange={setColor} />
         </Field>
 
         {/* DNS defaults — propagate down to blocks/subnets that inherit */}
@@ -7549,16 +7598,56 @@ function BlockDetailView({
 
   const qc = useQueryClient();
 
+  const [blockBulkDeleteError, setBlockBulkDeleteError] = useState<
+    string | null
+  >(null);
   const blockBulkDeleteMut = useMutation({
-    mutationFn: () =>
-      Promise.all(
-        Array.from(selectedSubnets).map((id) => ipamApi.deleteSubnet(id)),
-      ),
-    onSuccess: () => {
+    // allSettled so one 409 doesn't hide the rest. We report per-subnet
+    // failures up as a single multi-line error; successes still commit.
+    mutationFn: async () => {
+      const ids = Array.from(selectedSubnets);
+      const results = await Promise.allSettled(
+        ids.map((id) => ipamApi.deleteSubnet(id)),
+      );
+      const failures: { id: string; message: string }[] = [];
+      ids.forEach((id, i) => {
+        const r = results[i];
+        if (r.status === "rejected") {
+          const reason = r.reason as
+            | { response?: { data?: { detail?: unknown } } }
+            | undefined;
+          const detail = reason?.response?.data?.detail;
+          failures.push({
+            id,
+            message:
+              typeof detail === "string"
+                ? detail
+                : detail
+                  ? JSON.stringify(detail)
+                  : "Unknown error",
+          });
+        }
+      });
+      return { failures, total: ids.length };
+    },
+    onSuccess: ({ failures, total }) => {
       qc.invalidateQueries({ queryKey: ["subnets", block.space_id] });
       qc.invalidateQueries({ queryKey: ["blocks", block.space_id] });
-      setSelectedSubnets(new Set());
-      setShowBulkDelete(false);
+      if (failures.length === 0) {
+        setSelectedSubnets(new Set());
+        setShowBulkDelete(false);
+        setBlockBulkDeleteError(null);
+        return;
+      }
+      // Surface per-subnet messages; the modal stays open so the operator
+      // can read them and either cancel or clear the blockers and retry.
+      const lookup = new Map(allSubnets.map((s) => [s.id, s.network]));
+      const detail = failures
+        .map((f) => `• ${lookup.get(f.id) ?? f.id}: ${f.message}`)
+        .join("\n");
+      setBlockBulkDeleteError(
+        `${failures.length} of ${total} subnets could not be deleted:\n${detail}`,
+      );
     },
   });
 
@@ -7760,8 +7849,15 @@ function BlockDetailView({
           description={`This will permanently delete ${selectedSubnets.size} subnet${selectedSubnets.size === 1 ? "" : "s"} and all IP address records within them.`}
           checkLabel="I understand all IP addresses in these subnets will be permanently deleted."
           isPending={blockBulkDeleteMut.isPending}
-          onClose={() => setShowBulkDelete(false)}
-          onConfirm={() => blockBulkDeleteMut.mutate()}
+          error={blockBulkDeleteError}
+          onClose={() => {
+            setShowBulkDelete(false);
+            setBlockBulkDeleteError(null);
+          }}
+          onConfirm={() => {
+            setBlockBulkDeleteError(null);
+            blockBulkDeleteMut.mutate();
+          }}
         />
       )}
       <div className="flex-1 overflow-auto">
@@ -8050,7 +8146,7 @@ function BlockDetailView({
                     </tr>
                   )}
                 </thead>
-                <tbody>
+                <tbody className={zebraBodyCls}>
                   {allRows.map((item) => {
                     const indent = item.depth * 20;
                     if (item.type === "block" && item.block) {
@@ -8314,10 +8410,14 @@ function SpaceTableView({
   });
   const [showDnsSync, setShowDnsSync] = useState(false);
 
+  const [spaceBulkDeleteError, setSpaceBulkDeleteError] = useState<
+    string | null
+  >(null);
   const bulkDeleteMut = useMutation({
+    // allSettled on both phases so a single 409 (non-empty subnet/block)
+    // doesn't hide the rest. Subnets first — a subnet hanging off a leaf
+    // block would otherwise trip the block's RESTRICT FK.
     mutationFn: async () => {
-      // Delete subnets first — a subnet hanging off a leaf block would
-      // otherwise block the block delete via its RESTRICT FK.
       const subnetIds: string[] = [];
       const blockIds: string[] = [];
       for (const key of selected) {
@@ -8326,14 +8426,61 @@ function SpaceTableView({
         else if (key.startsWith("block:"))
           blockIds.push(key.slice("block:".length));
       }
-      await Promise.all(subnetIds.map((id) => ipamApi.deleteSubnet(id)));
-      await Promise.all(blockIds.map((id) => ipamApi.deleteBlock(id)));
+      const subnetResults = await Promise.allSettled(
+        subnetIds.map((id) => ipamApi.deleteSubnet(id)),
+      );
+      const blockResults = await Promise.allSettled(
+        blockIds.map((id) => ipamApi.deleteBlock(id)),
+      );
+      type Fail = { id: string; kind: "subnet" | "block"; message: string };
+      const failures: Fail[] = [];
+      const collect = (
+        ids: string[],
+        results: PromiseSettledResult<unknown>[],
+        kind: "subnet" | "block",
+      ) => {
+        ids.forEach((id, i) => {
+          const r = results[i];
+          if (r.status === "rejected") {
+            const reason = r.reason as
+              | { response?: { data?: { detail?: unknown } } }
+              | undefined;
+            const detail = reason?.response?.data?.detail;
+            failures.push({
+              id,
+              kind,
+              message:
+                typeof detail === "string"
+                  ? detail
+                  : detail
+                    ? JSON.stringify(detail)
+                    : "Unknown error",
+            });
+          }
+        });
+      };
+      collect(subnetIds, subnetResults, "subnet");
+      collect(blockIds, blockResults, "block");
+      return { failures, total: subnetIds.length + blockIds.length };
     },
-    onSuccess: () => {
+    onSuccess: ({ failures, total }) => {
       qc.invalidateQueries({ queryKey: ["subnets", space.id] });
       qc.invalidateQueries({ queryKey: ["blocks", space.id] });
-      setSelected(new Set());
-      setShowBulkDelete(false);
+      if (failures.length === 0) {
+        setSelected(new Set());
+        setShowBulkDelete(false);
+        setSpaceBulkDeleteError(null);
+        return;
+      }
+      const lookup = new Map<string, string>();
+      (subnets ?? []).forEach((s) => lookup.set(s.id, s.network));
+      (blocks ?? []).forEach((b) => lookup.set(b.id, b.network));
+      const detail = failures
+        .map((f) => `• ${f.kind} ${lookup.get(f.id) ?? f.id}: ${f.message}`)
+        .join("\n");
+      setSpaceBulkDeleteError(
+        `${failures.length} of ${total} items could not be deleted:\n${detail}`,
+      );
     },
   });
 
@@ -8680,7 +8827,7 @@ function SpaceTableView({
                   </tr>
                 )}
               </thead>
-              <tbody>
+              <tbody className={zebraBodyCls}>
                 {filteredSpaceRows.map((item) => {
                   const indent = item.depth * 20;
                   if (item.type === "block" && item.block) {
@@ -8916,8 +9063,15 @@ function SpaceTableView({
               }. Only leaf blocks (no child blocks or subnets) are selectable.`}
               checkLabel={`I understand this is permanent.`}
               isPending={bulkDeleteMut.isPending}
-              onClose={() => setShowBulkDelete(false)}
-              onConfirm={() => bulkDeleteMut.mutate()}
+              error={spaceBulkDeleteError}
+              onClose={() => {
+                setShowBulkDelete(false);
+                setSpaceBulkDeleteError(null);
+              }}
+              onConfirm={() => {
+                setSpaceBulkDeleteError(null);
+                bulkDeleteMut.mutate();
+              }}
             />
           );
         })()}
@@ -9106,25 +9260,48 @@ function SpaceSection({
     enabled: expanded,
   });
 
+  const [subnetDeleteError, setSubnetDeleteError] = useState<string | null>(
+    null,
+  );
   const deleteSubnet = useMutation({
     mutationFn: (id: string) => ipamApi.deleteSubnet(id),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["subnets", space.id] });
       setSubnetToDelete(null);
+      setSubnetDeleteError(null);
+    },
+    onError: (err: unknown) => {
+      const detail = (err as { response?: { data?: { detail?: unknown } } })
+        ?.response?.data?.detail;
+      setSubnetDeleteError(
+        typeof detail === "string"
+          ? detail
+          : detail
+            ? JSON.stringify(detail)
+            : "Failed to delete subnet.",
+      );
     },
   });
 
+  const [blockDeleteError, setBlockDeleteError] = useState<string | null>(null);
   const deleteBlockMut = useMutation({
     mutationFn: (id: string) => ipamApi.deleteBlock(id),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["blocks", space.id] });
       qc.invalidateQueries({ queryKey: ["subnets", space.id] });
       setBlockToDelete(null);
+      setBlockDeleteError(null);
     },
     onError: (err: unknown) => {
-      const msg = (err as { response?: { data?: { detail?: string } } })
+      const detail = (err as { response?: { data?: { detail?: unknown } } })
         ?.response?.data?.detail;
-      setDndError(typeof msg === "string" ? msg : "Failed to delete block");
+      setBlockDeleteError(
+        typeof detail === "string"
+          ? detail
+          : detail
+            ? JSON.stringify(detail)
+            : "Failed to delete block.",
+      );
     },
   });
 
@@ -9226,8 +9403,14 @@ function SpaceSection({
           <div
             className={cn(
               "group flex items-center gap-1 rounded-md px-1 py-1.5 hover:bg-muted/50",
-              isSpaceSelected && "bg-primary/5",
+              swatchTintCls(space.color),
+              // Ring lets the color tint stay visible while still marking the
+              // row as selected; fall back to bg-primary/5 only when no
+              // color is set so an uncolored space still has a selected look.
+              isSpaceSelected && !space.color && "bg-primary/5",
+              isSpaceSelected && "ring-1 ring-primary/60",
             )}
+            title={space.color ? `color: ${space.color}` : undefined}
           >
             <button
               onClick={() => setExpanded((v) => !v)}
@@ -9340,11 +9523,18 @@ function SpaceSection({
       {blockToDelete && (
         <ConfirmDestroyModal
           title="Delete Block"
-          description={`Delete block ${blockToDelete.network}${blockToDelete.name ? ` (${blockToDelete.name})` : ""}? All nested blocks and subnets inside it will be permanently deleted.`}
+          description={`Delete block ${blockToDelete.network}${blockToDelete.name ? ` (${blockToDelete.name})` : ""}?`}
           checkLabel={`I understand everything inside ${blockToDelete.network} will be permanently deleted.`}
           isPending={deleteBlockMut.isPending}
-          onClose={() => setBlockToDelete(null)}
-          onConfirm={() => deleteBlockMut.mutate(blockToDelete.id)}
+          error={blockDeleteError}
+          onClose={() => {
+            setBlockToDelete(null);
+            setBlockDeleteError(null);
+          }}
+          onConfirm={() => {
+            setBlockDeleteError(null);
+            deleteBlockMut.mutate(blockToDelete.id);
+          }}
         />
       )}
 
@@ -9381,12 +9571,17 @@ function SpaceSection({
       {subnetToDelete && (
         <ConfirmDestroyModal
           title="Delete Subnet"
-          description={`Delete subnet ${subnetToDelete.network}${subnetToDelete.name ? ` (${subnetToDelete.name})` : ""}? All IP address records within it will be permanently deleted.`}
-          checkLabel={`I understand all IP addresses in ${subnetToDelete.network} will be permanently deleted.`}
+          description={`Delete subnet ${subnetToDelete.network}${subnetToDelete.name ? ` (${subnetToDelete.name})` : ""}?`}
+          checkLabel={`I understand ${subnetToDelete.network} and all its contents will be permanently deleted.`}
           isPending={deleteSubnet.isPending}
-          onClose={() => setSubnetToDelete(null)}
+          error={subnetDeleteError}
+          onClose={() => {
+            setSubnetToDelete(null);
+            setSubnetDeleteError(null);
+          }}
           onConfirm={() => {
             if (selectedSubnetId === subnetToDelete.id) onSelectSubnet(null);
+            setSubnetDeleteError(null);
             deleteSubnet.mutate(subnetToDelete.id);
           }}
         />

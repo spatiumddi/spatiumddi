@@ -49,7 +49,8 @@ import {
   type DNSGroupSyncResult,
 } from "@/lib/api";
 import { useTableSort, SortableTh } from "@/lib/useTableSort";
-import { cn } from "@/lib/utils";
+import { cn, swatchCls, zebraBodyCls } from "@/lib/utils";
+import { SwatchPicker } from "@/components/ui/swatch-picker";
 import {
   ContextMenu,
   ContextMenuContent,
@@ -1108,6 +1109,7 @@ function ZoneModal({
   const [adminEmail, setAdminEmail] = useState(zone?.admin_email ?? "");
   const [ttl, setTtl] = useState(String(zone?.ttl ?? 3600));
   const [dnssec, setDnssec] = useState(zone?.dnssec_enabled ?? false);
+  const [color, setColor] = useState<string | null>(zone?.color ?? null);
   const [error, setError] = useState("");
 
   const mut = useMutation({
@@ -1134,6 +1136,7 @@ function ZoneModal({
       admin_email: adminEmail,
       ttl: parseInt(ttl, 10),
       dnssec_enabled: dnssec,
+      color,
     });
   }
 
@@ -1235,6 +1238,9 @@ function ZoneModal({
             </label>
           </Field>
         </div>
+        <Field label="Color">
+          <SwatchPicker value={color} onChange={setColor} />
+        </Field>
         {error && <p className="text-sm text-destructive">{error}</p>}
         <Btns
           onClose={onClose}
@@ -1533,7 +1539,17 @@ function ZoneDetailView({
       <div className="flex items-center justify-between border-b px-5 py-3">
         <div>
           <div className="flex items-center gap-2">
-            <FileText className="h-4 w-4 text-muted-foreground" />
+            {swatchCls(zone.color) ? (
+              <span
+                className={cn(
+                  "h-3 w-3 rounded-full flex-shrink-0",
+                  swatchCls(zone.color)!,
+                )}
+                title={`color: ${zone.color}`}
+              />
+            ) : (
+              <FileText className="h-4 w-4 text-muted-foreground" />
+            )}
             <h2 className="font-semibold text-base font-mono">
               {zone.name.replace(/\.$/, "")}
             </h2>
@@ -1768,7 +1784,7 @@ function ZoneDetailView({
                   </tr>
                 )}
               </thead>
-              <tbody>
+              <tbody className={zebraBodyCls}>
                 {filtered.map((r) => (
                   <ContextMenu key={r.id}>
                     <ContextMenuTrigger asChild>
@@ -2191,7 +2207,7 @@ function RecordTable({
               <th className="px-3 py-1.5 font-medium">TTL</th>
             </tr>
           </thead>
-          <tbody>
+          <tbody className={zebraBodyCls}>
             {records.map((r, i) => (
               <tr key={i} className="border-t">
                 <td className="px-3 py-1 font-mono">{r.name}</td>
@@ -3377,7 +3393,7 @@ function RecordsTab({
               <td />
             </tr>
           </thead>
-          <tbody>
+          <tbody className={zebraBodyCls}>
             {sorted.length === 0 ? (
               <tr>
                 <td
@@ -3664,7 +3680,16 @@ function ZonesTab({
                   className="inline-flex items-center gap-1.5"
                   style={{ paddingLeft: indent }}
                 >
-                  <FileText className="h-3 w-3 text-muted-foreground flex-shrink-0" />
+                  {swatchCls(z.color) ? (
+                    <span
+                      className={cn(
+                        "h-2 w-2 rounded-full flex-shrink-0",
+                        swatchCls(z.color)!,
+                      )}
+                    />
+                  ) : (
+                    <FileText className="h-3 w-3 text-muted-foreground flex-shrink-0" />
+                  )}
                   <span className="font-mono text-xs">
                     {z.name.replace(/\.$/, "")}
                   </span>
@@ -3900,7 +3925,9 @@ function ZonesTab({
                 <th className="py-1.5" />
               </tr>
             </thead>
-            <tbody>{tree.flatMap((root) => renderZoneRows(root, 0))}</tbody>
+            <tbody className={zebraBodyCls}>
+              {tree.flatMap((root) => renderZoneRows(root, 0))}
+            </tbody>
           </table>
         </div>
       )}
@@ -4522,7 +4549,7 @@ function BlocklistDetail({
                 <th className="px-3 py-1.5 w-8"></th>
               </tr>
             </thead>
-            <tbody>
+            <tbody className={zebraBodyCls}>
               {items.length === 0 && (
                 <tr>
                   <td
@@ -4665,7 +4692,7 @@ function BlocklistDetail({
                 <th className="px-3 py-1.5 w-8"></th>
               </tr>
             </thead>
-            <tbody>
+            <tbody className={zebraBodyCls}>
               {exceptions.length === 0 && (
                 <tr>
                   <td
@@ -5170,7 +5197,7 @@ function SyncWithServersResultModal({
                                 </th>
                               </tr>
                             </thead>
-                            <tbody>
+                            <tbody className={zebraBodyCls}>
                               {srv.result.items.map((item) => (
                                 <tr
                                   key={item.zone}
@@ -5305,7 +5332,16 @@ function ZoneTreeRows({
                 }`}
                 onClick={() => onSelectZone(node.zone!)}
               >
-                <FileText className="h-3 w-3 flex-shrink-0" />
+                {swatchCls(node.zone.color) ? (
+                  <span
+                    className={cn(
+                      "h-2 w-2 rounded-full flex-shrink-0",
+                      swatchCls(node.zone.color)!,
+                    )}
+                  />
+                ) : (
+                  <FileText className="h-3 w-3 flex-shrink-0" />
+                )}
                 <span className="font-mono truncate">
                   {node.zone.name.replace(/\.$/, "")}
                 </span>
@@ -5346,7 +5382,16 @@ function ZoneTreeRows({
             style={{ paddingLeft }}
             onClick={() => onSelectZone(node.zone!)}
           >
-            <FileText className="h-3 w-3 flex-shrink-0" />
+            {swatchCls(node.zone.color) ? (
+              <span
+                className={cn(
+                  "h-2 w-2 rounded-full flex-shrink-0",
+                  swatchCls(node.zone.color)!,
+                )}
+              />
+            ) : (
+              <FileText className="h-3 w-3 flex-shrink-0" />
+            )}
             <span className="font-mono truncate">
               {node.zone.name.replace(/\.$/, "")}
             </span>

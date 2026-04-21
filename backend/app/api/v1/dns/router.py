@@ -464,6 +464,18 @@ class ViewResponse(BaseModel):
 # ── Zone schemas ────────────────────────────────────────────────────────────
 
 
+VALID_ZONE_COLORS = {
+    "slate",
+    "red",
+    "amber",
+    "emerald",
+    "cyan",
+    "blue",
+    "violet",
+    "pink",
+}
+
+
 class ZoneCreate(BaseModel):
     name: str
     view_id: uuid.UUID | None = None
@@ -477,6 +489,7 @@ class ZoneCreate(BaseModel):
     primary_ns: str = ""
     admin_email: str = ""
     dnssec_enabled: bool = False
+    color: str | None = None
     linked_subnet_id: uuid.UUID | None = None
     allow_query: list[str] | None = None
     allow_transfer: list[str] | None = None
@@ -488,6 +501,15 @@ class ZoneCreate(BaseModel):
     def validate_zone_type(cls, v: str) -> str:
         if v not in VALID_ZONE_TYPES:
             raise ValueError(f"zone_type must be one of {sorted(VALID_ZONE_TYPES)}")
+        return v
+
+    @field_validator("color")
+    @classmethod
+    def validate_color(cls, v: str | None) -> str | None:
+        if v is None or v == "":
+            return None
+        if v not in VALID_ZONE_COLORS:
+            raise ValueError(f"color must be one of {sorted(VALID_ZONE_COLORS)}")
         return v
 
     @field_validator("name")
@@ -509,6 +531,7 @@ class ZoneUpdate(BaseModel):
     primary_ns: str | None = None
     admin_email: str | None = None
     dnssec_enabled: bool | None = None
+    color: str | None = None
     linked_subnet_id: uuid.UUID | None = None
     allow_query: list[str] | None = None
     allow_transfer: list[str] | None = None
@@ -520,6 +543,16 @@ class ZoneUpdate(BaseModel):
     def validate_zone_type(cls, v: str | None) -> str | None:
         if v is not None and v not in VALID_ZONE_TYPES:
             raise ValueError(f"zone_type must be one of {sorted(VALID_ZONE_TYPES)}")
+        return v
+
+    @field_validator("color")
+    @classmethod
+    def validate_color(cls, v: str | None) -> str | None:
+        # "" clears the color; any other value must be in the curated set.
+        if v is None or v == "":
+            return None
+        if v not in VALID_ZONE_COLORS:
+            raise ValueError(f"color must be one of {sorted(VALID_ZONE_COLORS)}")
         return v
 
     @field_validator("notify_enabled")
@@ -547,6 +580,7 @@ class ZoneResponse(BaseModel):
     is_auto_generated: bool
     linked_subnet_id: uuid.UUID | None
     dnssec_enabled: bool
+    color: str | None
     last_serial: int
     last_pushed_at: datetime | None
     allow_query: list[str] | None
@@ -1959,6 +1993,11 @@ async def update_zone(
 ) -> DNSZone:
     zone = await _require_zone(group_id, zone_id, db)
     changes = body.model_dump(exclude_none=True)
+    # ``color`` is the one field on this schema where NULL is a meaningful
+    # user intent ("clear the color"). Re-inject it when explicitly set to
+    # None in the incoming payload — exclude_none would otherwise drop it.
+    if "color" in body.model_fields_set and body.color is None:
+        changes["color"] = None
     for k, v in changes.items():
         setattr(zone, k, v)
     db.add(

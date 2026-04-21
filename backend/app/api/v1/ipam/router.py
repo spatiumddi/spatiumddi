@@ -933,15 +933,37 @@ def _audit(
 # ── Schemas ────────────────────────────────────────────────────────────────────
 
 
+VALID_SPACE_COLORS = {
+    "slate",
+    "red",
+    "amber",
+    "emerald",
+    "cyan",
+    "blue",
+    "violet",
+    "pink",
+}
+
+
 class IPSpaceCreate(BaseModel):
     name: str
     description: str = ""
     is_default: bool = False
     tags: dict[str, Any] = {}
+    color: str | None = None
     dns_group_ids: list[str] = []
     dns_zone_id: str | None = None
     dns_additional_zone_ids: list[str] = []
     dhcp_server_group_id: uuid.UUID | None = None
+
+    @field_validator("color")
+    @classmethod
+    def validate_color(cls, v: str | None) -> str | None:
+        if v is None or v == "":
+            return None
+        if v not in VALID_SPACE_COLORS:
+            raise ValueError(f"color must be one of {sorted(VALID_SPACE_COLORS)}")
+        return v
 
 
 class IPSpaceUpdate(BaseModel):
@@ -949,10 +971,20 @@ class IPSpaceUpdate(BaseModel):
     description: str | None = None
     is_default: bool | None = None
     tags: dict[str, Any] | None = None
+    color: str | None = None
     dns_group_ids: list[str] | None = None
     dns_zone_id: str | None = None
     dns_additional_zone_ids: list[str] | None = None
     dhcp_server_group_id: uuid.UUID | None = None
+
+    @field_validator("color")
+    @classmethod
+    def validate_color(cls, v: str | None) -> str | None:
+        if v is None or v == "":
+            return None
+        if v not in VALID_SPACE_COLORS:
+            raise ValueError(f"color must be one of {sorted(VALID_SPACE_COLORS)}")
+        return v
 
 
 class IPSpaceResponse(BaseModel):
@@ -961,6 +993,7 @@ class IPSpaceResponse(BaseModel):
     description: str
     is_default: bool
     tags: dict[str, Any]
+    color: str | None = None
     dns_group_ids: list[str] = []
     dns_zone_id: str | None = None
     dns_additional_zone_ids: list[str] = []
@@ -1469,6 +1502,10 @@ async def update_space(
 
     old = {"name": space.name, "description": space.description, "tags": space.tags}
     changes = body.model_dump(exclude_none=True, exclude={"dhcp_server_group_id"})
+    # ``color`` is nullable and NULL is a meaningful intent ("clear the
+    # color"). Re-inject when explicitly set to None in the payload.
+    if "color" in body.model_fields_set and body.color is None:
+        changes["color"] = None
     for field, value in changes.items():
         setattr(space, field, value)
     # Handle DHCP fields explicitly so explicit null (clear) is preserved.
@@ -2411,12 +2448,54 @@ async def update_subnet(
 
 
 @router.delete("/subnets/{subnet_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_subnet(subnet_id: uuid.UUID, current_user: CurrentUser, db: DB) -> None:
+async def delete_subnet(
+    subnet_id: uuid.UUID,
+    current_user: CurrentUser,
+    db: DB,
+    force: bool = False,
+) -> None:
     from app.models.dns import DNSRecord, DNSZone
 
     subnet = await db.get(Subnet, subnet_id)
     if subnet is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
+
+    # Refuse to delete a non-empty subnet unless the caller explicitly opts in
+    # via ?force=true. A subnet is considered "non-empty" if it has any user-
+    # owned IP records (anything other than the auto-generated network /
+    # broadcast placeholders, orphan rows, or DHCP-lease-mirrored rows) or a
+    # DHCP scope attached. Forcing still runs the cascade path below, so API
+    # consumers who really need it can still drop the whole subtree.
+    if not force:
+        user_ip_count = (
+            await db.execute(
+                select(func.count(IPAddress.id)).where(
+                    IPAddress.subnet_id == subnet_id,
+                    IPAddress.status.notin_(["network", "broadcast", "orphan"]),
+                    IPAddress.auto_from_lease.is_(False),
+                )
+            )
+        ).scalar_one()
+        scope_count = (
+            await db.execute(
+                select(func.count(DHCPScope.id)).where(DHCPScope.subnet_id == subnet_id)
+            )
+        ).scalar_one()
+        if user_ip_count or scope_count:
+            parts = []
+            if user_ip_count:
+                parts.append(
+                    f"{user_ip_count} allocated IP address" + ("es" if user_ip_count != 1 else "")
+                )
+            if scope_count:
+                parts.append(f"{scope_count} DHCP scope" + ("s" if scope_count != 1 else ""))
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"Subnet is not empty: {', '.join(parts)}. "
+                    "Delete the contents first, or retry with force=true to cascade."
+                ),
+            )
 
     block_id = subnet.block_id
 

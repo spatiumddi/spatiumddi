@@ -20,7 +20,7 @@ import {
   type DHCPLease,
 } from "@/lib/api";
 import { useSessionState } from "@/lib/useSessionState";
-import { cn } from "@/lib/utils";
+import { cn, zebraBodyCls } from "@/lib/utils";
 import { useTableSort, SortableTh } from "@/lib/useTableSort";
 import {
   ContextMenu,
@@ -513,7 +513,7 @@ function ServerScopesTab({ server }: { server: DHCPServer }) {
                   <th className="px-3 py-2"></th>
                 </tr>
               </thead>
-              <tbody>
+              <tbody className={zebraBodyCls}>
                 {allScopes.map((sc) => (
                   <ContextMenu key={sc.id}>
                     <ContextMenuTrigger asChild>
@@ -749,7 +749,7 @@ function ServerPoolsOrStaticsTab({
                 </SortableTh>
               </tr>
             </thead>
-            <tbody>
+            <tbody className={zebraBodyCls}>
               {poolRows.map(({ scope, item }) => {
                 const p = item;
                 return (
@@ -810,7 +810,7 @@ function ServerPoolsOrStaticsTab({
                 </SortableTh>
               </tr>
             </thead>
-            <tbody>
+            <tbody className={zebraBodyCls}>
               {staticRows.map(({ scope, item }) => {
                 const s = item;
                 return (
@@ -912,7 +912,7 @@ function ClientClassesTab({ server }: { server: DHCPServer }) {
                   <th className="px-3 py-2"></th>
                 </tr>
               </thead>
-              <tbody>
+              <tbody className={zebraBodyCls}>
                 {classes.map((c) => (
                   <tr key={c.id} className="border-b last:border-0">
                     <td className="px-3 py-2 font-medium">{c.name}</td>
@@ -1039,7 +1039,7 @@ function LeasesTab({ server }: { server: DHCPServer }) {
               <th className="px-3 py-2 text-left font-medium">Last Seen</th>
             </tr>
           </thead>
-          <tbody>
+          <tbody className={zebraBodyCls}>
             {leases.length === 0 && (
               <tr>
                 <td

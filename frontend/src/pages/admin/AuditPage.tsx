@@ -2,7 +2,7 @@ import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { ClipboardList, ChevronLeft, ChevronRight, X } from "lucide-react";
 import { auditApi, type AuditLogEntry } from "@/lib/api";
-import { cn } from "@/lib/utils";
+import { cn, zebraBodyCls } from "@/lib/utils";
 
 const PAGE_SIZE = 50;
 
@@ -280,7 +280,7 @@ export function AuditPage() {
                 <td />
               </tr>
             </thead>
-            <tbody>
+            <tbody className={zebraBodyCls}>
               {isLoading ? (
                 <tr>
                   <td

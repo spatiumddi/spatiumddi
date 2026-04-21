@@ -1,5 +1,6 @@
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { ipamApi, type IPSpace } from "@/lib/api";
+import { zebraBodyCls } from "@/lib/utils";
 import { Trash2 } from "lucide-react";
 
 export function IPSpacesPage() {
@@ -32,7 +33,7 @@ export function IPSpacesPage() {
               <th className="px-4 py-3" />
             </tr>
           </thead>
-          <tbody>
+          <tbody className={zebraBodyCls}>
             {spaces?.map((space: IPSpace) => (
               <tr
                 key={space.id}
