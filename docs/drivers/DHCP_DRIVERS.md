@@ -5,7 +5,7 @@ title: DHCP Drivers
 
 # DHCP Driver Specification
 
-DHCP drivers are the backend-specific layer that turns SpatiumDDI's internal DHCP model into operations on real DHCP servers. The service layer only ever speaks to [`DHCPDriver`](../../backend/app/drivers/dhcp/base.py) (CLAUDE.md non-negotiable #10) — no Kea / ISC DHCP / PowerShell specifics leak above this line.
+DHCP drivers are the backend-specific layer that turns SpatiumDDI's internal DHCP model into operations on real DHCP servers. The service layer only ever speaks to [`DHCPDriver`](../../backend/app/drivers/dhcp/base.py) (CLAUDE.md non-negotiable #10) — no Kea / PowerShell specifics leak above this line.
 
 The driver registry ([`registry.py`](../../backend/app/drivers/dhcp/registry.py)) classifies drivers along two axes:
 
@@ -70,7 +70,7 @@ class DHCPDriver(ABC):
     @abstractmethod
     async def get_scopes(self, server: Any) -> list[ScopeData]: ...
 
-    # Write-through (Path B / future ISC DHCP; optional).
+    # Write-through (Path B / optional per-object CRUD).
     async def apply_scope(self, server: Any, scope: ScopeDef) -> None: ...
     async def remove_scope(self, server: Any, subnet_cidr: str) -> None: ...
     async def apply_reservation(self, server: Any, subnet_cidr: str,
@@ -222,7 +222,7 @@ class DHCPDriver(ABC):
     ) -> Sequence[OpResult]: ...
 ```
 
-Default ABC impls call the singular method in a loop — Kea and any future ISC driver inherit the plural interface without changes.
+Default ABC impls call the singular method in a loop — Kea inherits the plural interface without changes.
 
 **Windows batch size — 30 ops per chunk.** `pywinrm.run_ps` ships the script as a single CMD.EXE command line (8191-char cap, see [DNS_DRIVERS.md §3.7](DNS_DRIVERS.md#37-batched-winrm-dispatch) for the full math). DHCP payloads are leaner than DNS — each reservation / exclusion op is ~60 raw chars of JSON vs. DNS's ~160 — so the cmdline limit is farther away, but capped at 30 to stay comfortably inside it. Documented in `_WINRM_BATCH_SIZE` in [`drivers/dhcp/windows.py`](../../backend/app/drivers/dhcp/windows.py).
 
@@ -230,18 +230,7 @@ Default ABC impls call the singular method in a loop — Kea and any future ISC 
 
 ---
 
-## 5. ISC DHCP driver (planned)
-
-Not yet implemented. Will follow the same agented + write shape as Kea, but:
-
-- Config rendering: `dhcpd.conf` instead of Kea JSON.
-- Reload: `omshell` or `systemctl reload isc-dhcp-server`.
-- HA: ISC DHCP failover protocol (RFC 3074) — `failover peer` config rendered matching between the pair.
-- Leases: parse `/var/lib/dhcp/dhcpd.leases`.
-
----
-
-## 6. Error handling
+## 5. Error handling
 
 All driver methods:
 

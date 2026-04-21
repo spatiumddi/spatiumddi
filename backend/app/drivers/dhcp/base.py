@@ -110,7 +110,7 @@ class ConfigBundle:
 
     server_id: str
     server_name: str
-    driver: str  # kea | isc_dhcp
+    driver: str  # kea | windows_dhcp
     roles: tuple[str, ...]
     options: ServerOptionsDef
     scopes: tuple[ScopeDef, ...]

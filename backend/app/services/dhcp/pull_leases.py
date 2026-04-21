@@ -87,8 +87,8 @@ async def pull_leases_from_server(
     dry-run previews from the UI.
 
     Only drivers registered as agentless participate; agent-based
-    drivers (kea, isc_dhcp) already stream lease events over the agent
-    channel and would double-count.
+    drivers (kea) already stream lease events over the agent channel
+    and would double-count.
     """
     result = PullLeasesResult()
 

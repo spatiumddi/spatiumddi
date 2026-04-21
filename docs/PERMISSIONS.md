@@ -46,7 +46,7 @@ Each entry in `Role.permissions` (JSONB) is an object with this shape:
 | `dns_record`      | DNS records within a zone                             |
 | `dns_group`       | DNS server groups, servers, views, ACLs, trust anchors |
 | `dns_blocklist`   | Response Policy Zones / blocking lists                |
-| `dhcp_server`     | Kea/ISC DHCP server objects and server groups         |
+| `dhcp_server`     | Kea + Windows DHCP server objects and server groups   |
 | `dhcp_scope`      | DHCP scopes / shared networks                         |
 | `dhcp_pool`       | Address pools within a scope                          |
 | `dhcp_static`     | Static / reserved leases                              |

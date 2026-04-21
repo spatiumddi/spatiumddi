@@ -56,7 +56,7 @@ class DHCPServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     description: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    # driver: kea | isc_dhcp
+    # driver: kea | windows_dhcp
     driver: Mapped[str] = mapped_column(String(50), nullable=False, default="kea")
     host: Mapped[str] = mapped_column(String(255), nullable=False)
     port: Mapped[int] = mapped_column(Integer, nullable=False, default=67)
@@ -91,8 +91,8 @@ class DHCPServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     # Fernet-encrypted JSON blob for driver-specific admin credentials.
     # windows_dhcp stores a dict: {"username", "password", "winrm_port",
-    # "transport", "use_tls", "verify_tls"}. Agent-based drivers (kea,
-    # isc_dhcp) leave this NULL — they authenticate via agent JWT.
+    # "transport", "use_tls", "verify_tls"}. Agent-based drivers (kea)
+    # leave this NULL — they authenticate via agent JWT.
     credentials_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
 
     group: Mapped[DHCPServerGroup | None] = relationship(

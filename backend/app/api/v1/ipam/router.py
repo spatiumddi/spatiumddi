@@ -2578,10 +2578,10 @@ async def delete_subnet(
     #
     #   * windows_dhcp (agentless) → push a remove-scope via WinRM before
     #     the DB row disappears; failure bubbles as 502 and rolls back.
-    #   * kea / isc-dhcp (agent-based) → we can't actually reconfigure
-    #     from the DB delete alone. Mark their config_etag dirty and
-    #     enqueue an ``apply_config`` op so the next agent poll rebuilds
-    #     the bundle without the removed scope.
+    #   * kea (agent-based) → we can't actually reconfigure from the
+    #     DB delete alone. Mark its config_etag dirty and enqueue an
+    #     ``apply_config`` op so the next agent poll rebuilds the
+    #     bundle without the removed scope.
     #
     # DHCPScope.subnet_id is ``ondelete=CASCADE`` so the rows themselves
     # (+ pools / statics via ORM cascade) will be cleaned automatically

@@ -1,12 +1,12 @@
 # DHCP Feature Specification
 
-> **Implementation status (2026-04-18):** Kea driver, agent runtime, container image, backend API, and frontend UI shipped in the `2026.04.16-1` release. Pool overlap validation, existing-IP warning, resize, static ↔ IPAM sync (including DNS forward/reverse), lease → IPAM mirror (with auto-cleanup on expiry), DHCP Pool membership column in the IPAM subnet view, per-scope DHCP defaults prefilled from Settings. **Windows DHCP driver shipped** — Path A (agentless, WinRM + PowerShell, read-only lease monitoring + per-object scope / pool / reservation CRUD). **Still deferred:** ISC DHCP driver, Kea HA hook coordination, DDNS pipeline (dynamic leases → DNS A/PTR), reconciliation report, lease import. NTP (DHCP option 42) is a first-class option.
+> **Implementation status (2026-04-18):** Kea driver, agent runtime, container image, backend API, and frontend UI shipped in the `2026.04.16-1` release. Pool overlap validation, existing-IP warning, resize, static ↔ IPAM sync (including DNS forward/reverse), lease → IPAM mirror (with auto-cleanup on expiry), DHCP Pool membership column in the IPAM subnet view, per-scope DHCP defaults prefilled from Settings. **Windows DHCP driver shipped** — Path A (agentless, WinRM + PowerShell, read-only lease monitoring + per-object scope / pool / reservation CRUD). **DDNS pipeline shipped for both paths** — agentless lease pull (2026-04-19) and agent-side Kea lease events (2026-04-21). **Still deferred:** Kea HA hook coordination, reconciliation report, lease import. NTP (DHCP option 42) is a first-class option.
 
 ## Overview
 
 SpatiumDDI manages DHCP servers as authoritative configuration sources. The IPAM database is the **source of truth** — DHCP server configs are pushed from IPAM, not read from the servers. DHCP servers are configured to report lease events back to SpatiumDDI for real-time IP status tracking and DDNS updates.
 
-Supported backends: **ISC Kea DHCP** (preferred), **Windows Server DHCP** (agentless), **ISC DHCP v4** (planned).
+Supported backends: **ISC Kea DHCP** (preferred) and **Windows Server DHCP** (agentless). ISC DHCP v4 is intentionally **not** supported — upstream declared end-of-life in 2022; Kea is the successor.
 
 ---
 
@@ -15,7 +15,7 @@ Supported backends: **ISC Kea DHCP** (preferred), **Windows Server DHCP** (agent
 ```
 DHCPServer
   id, name, description
-  driver: enum(kea, isc_dhcp)
+  driver: enum(kea, windows_dhcp)
   host, port
   credentials (encrypted Fernet)
   roles: [enum(dhcp4, dhcp6)]     -- server can run both
@@ -27,7 +27,7 @@ DHCPServer
 
 ### DHCP Server Groups
 
-For HA deployments, two DHCP servers can be placed in the same **server group** (Kea uses `HA hook library`; ISC DHCP uses `failover peer`). The SpatiumDDI driver is aware of the HA relationship and pushes config to both.
+For HA deployments, two DHCP servers can be placed in the same **server group** (Kea uses `HA hook library`). The SpatiumDDI driver is aware of the HA relationship and pushes config to both.
 
 ```
 DHCPServerGroup
@@ -91,7 +91,7 @@ DHCPPool
     -- dynamic:   IPs handed out to any eligible client
     -- excluded:  range exists in subnet but DHCP will NOT offer these IPs
     -- reserved:  range held for static assignments only (not auto-assigned)
-  class_restriction: str (nullable)   -- Kea client class or ISC DHCP "allow" class
+  class_restriction: str (nullable)   -- Kea client class
   lease_time_override: int (nullable) -- overrides scope lease_time for this pool
   options_override: JSONB (nullable)  -- additional options for this pool only
   utilization_percent: float (computed)
@@ -152,7 +152,7 @@ Client classes let you define rules for how clients are categorized and which po
 DHCPClientClass
   id, server_id
   name: str             -- e.g., "VoIPPhones"
-  match_expression: str -- Kea expression or ISC DHCP conditional
+  match_expression: str -- Kea expression
                         -- e.g., "option[60].hex == 'Cisco7960'"
   description: str
 ```
@@ -241,7 +241,7 @@ Cached config is stored in a structured JSON file:
 }
 ```
 
-The DHCP daemon config file (Kea JSON or ISC DHCP `dhcpd.conf`) is generated from this cache. On startup, the agent always checks if the cache is newer than the running daemon config and applies if so.
+The Kea daemon config file (JSON) is generated from this cache. On startup, the agent always checks if the cache is newer than the running daemon config and applies if so.
 
 ### Cache Invalidation
 
@@ -279,10 +279,9 @@ Available from the admin UI: compares IPAM DB state vs. live DHCP server state a
 
 ### Export (IPAM → file)
 - Export all DHCP scopes + pools + static assignments for a server or subnet
-- Formats: JSON (native), ISC DHCP config snippet, Kea config JSON
+- Formats: JSON (native), Kea config JSON
 
 ### Import (file → IPAM)
-- Import from ISC DHCP `dhcpd.conf` (parse scopes, ranges, hosts)
 - Import from Kea JSON config
 - Import from CSV (static assignments: IP, MAC, hostname columns)
 - Dry-run mode: shows what would be created before committing
@@ -398,10 +397,6 @@ Kea's built-in `HA hook library` handles pool coordination natively:
 
 Configuration pushed by SpatiumDDI to both nodes in a server group includes the HA section automatically.
 
-### ISC DHCP Failover
-
-ISC DHCP uses the native failover protocol (RFC 3074). SpatiumDDI pushes matching `failover peer` config to both servers.
-
 ### SpatiumDDI-level coordination (future)
 
 For non-HA architectures serving different subnets from multiple containers:
@@ -488,7 +483,7 @@ Full config-push to Windows DHCP (analogous to Windows DNS Path B) would unlock:
 - Client class / policy rendering.
 - DHCP failover pair configuration from SpatiumDDI.
 
-The per-object CRUD methods are already in place (`apply_scope`, `apply_reservation`, `apply_exclusion`) — what's missing is the API-side wiring that routes write events from the scope / pool / static endpoints into those methods for agentless drivers. Expected before ISC DHCP lands.
+The per-object CRUD methods are already in place (`apply_scope`, `apply_reservation`, `apply_exclusion`) — what's missing is the API-side wiring that routes write events from the scope / pool / static endpoints into those methods for agentless drivers.
 
 ## 16. Rules & constraints
 
@@ -539,8 +534,8 @@ rule here has been surfaced to an operator, not just silently logged.
 
 - **Duplicate server name.** Each `DHCPServer.name` is globally unique.
   `409` at `backend/app/api/v1/dhcp/servers.py:228`.
-- **Driver enum.** `driver` must be one of `kea`, `isc_dhcp` (planned),
-  `windows_dhcp`. `422` at `backend/app/api/v1/dhcp/servers.py:73`.
+- **Driver enum.** `driver` must be one of `kea`, `windows_dhcp`.
+  `422` at `backend/app/api/v1/dhcp/servers.py:73`.
 - **Read-only drivers refuse config push.** Attempting to push a
   config bundle to an agentless read-only driver (e.g.
   `windows_dhcp`) returns `400` with a message directing the operator

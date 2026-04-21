@@ -51,7 +51,7 @@ Always read the relevant spec doc(s) before writing code for a feature area.
 | `k8s/README.md` | Kubernetes manifest usage, HA PostgreSQL (CloudNativePG), Redis Sentinel |
 | `k8s/base/` | Core K8s manifests (namespace, API, worker, frontend, migrate job) |
 | `k8s/ha/` | HA add-ons: CloudNativePG cluster, Redis Sentinel, Patroni Compose |
-| `docs/drivers/DHCP_DRIVERS.md` | Kea + Windows DHCP driver internals; ISC DHCP planned |
+| `docs/drivers/DHCP_DRIVERS.md` | Kea + Windows DHCP driver internals |
 | `docs/drivers/DNS_DRIVERS.md` | BIND9 + Windows DNS (Path A + B) driver internals, incremental update strategy |
 
 ---
@@ -139,7 +139,7 @@ Three patterns recur across the DNS and DHCP subsystems. Know these before addin
 | Phase | Focus | Status |
 |---|---|---|
 | 1 | Core IPAM, local auth, user management, audit log, Docker Compose | **Mostly done** — LDAP/OIDC/SAML + RADIUS/TACACS+ auth, group-based RBAC enforcement, bulk-edit tags/CF, inherited-field placeholders, and mobile-responsive UI all landed; IPv6 partial |
-| 2 | DHCP (Kea + ISC), DNS (BIND9), DDNS, zone/subnet tree UI | **In Progress** (DNS core landed; DHCP Kea driver + agent + UI landed; DDNS pipeline shipped for agentless lease path 2026-04-19; ISC DHCP + agent-side lease-event DDNS pending) |
+| 2 | DHCP (Kea), DNS (BIND9), DDNS, zone/subnet tree UI | **Mostly done** (DNS core + Kea DHCPv4 + agent-side Kea DDNS + block/space DDNS inheritance all landed) |
 | 3 | DNS views, server groups, blocking lists, VLAN/VXLAN, system admin panel, health dashboard | **In Progress** (DNS views, groups, blocklists, health checks landed) |
 | 4 | OS appliance image, Terraform/Ansible providers, SAML, notifications, backup/restore, ACME (DNS-01 provider + embedded client) | **In Progress** (SAML SP landed in Wave A.4; alerts framework landed; appliance, providers, backup, ACME still pending) |
 | 5 | Multi-tenancy, IP request workflows, import/export, advanced reporting | Not started |
@@ -202,12 +202,11 @@ SpatiumDDI cut its alpha release `2026.04.16-1` on 2026-04-16 with IPAM, DNS (BI
 
 ### Phase 2/3 — Remaining
 
-- ⬜ ISC DHCP driver (Kea driver + agent + UI landed in DHCP Wave 1)
-- ✅ DDNS pipeline (subnet-level, shipped 2026-04-19 in `feat(ddns)`) — `Subnet.ddns_enabled` / `ddns_hostname_policy` / `ddns_domain_override` / `ddns_ttl`; `services/dns/ddns.py` resolves hostname per policy and calls the same `_sync_dns_record` path static allocations use; `pull_leases.py` + `dhcp_lease_cleanup.py` are the two integration points. Agentless lease-pull path only today — agent-side (Kea) lease-event DDNS is the remaining piece.
-- ⬜ Agent-side lease-event DDNS for Kea — wire `apply_ddns_for_lease` into the agent's lease-event handler (~10 lines in `agent/dhcp/`). IPAM mirroring already happens; only the DDNS call is missing.
-- ⬜ Block/space inheritance for DDNS settings — today subnet-only. Would mirror the DNS-group / DHCP-group inheritance pattern.
+- ✅ DDNS pipeline (subnet-level, shipped 2026-04-19 in `feat(ddns)`) — `Subnet.ddns_enabled` / `ddns_hostname_policy` / `ddns_domain_override` / `ddns_ttl`; `services/dns/ddns.py` resolves hostname per policy and calls the same `_sync_dns_record` path static allocations use; `pull_leases.py` + `dhcp_lease_cleanup.py` are the two integration points.
+- ✅ Agent-side lease-event DDNS for Kea — `apply_ddns_for_lease` + `revoke_ddns_for_lease` wired into `POST /api/v1/dhcp/agents/lease-events` (commit `bad8cf3`).
+- ✅ Block/space inheritance for DDNS settings — `IPSpace` + `IPBlock` carry the four DDNS fields; `Subnet` / `IPBlock` carry `ddns_inherit_settings`; `services/dns/ddns.resolve_effective_ddns` walks subnet → block → space and is consulted by both the hostname resolver and the apply path (commit `a29d4fe`).
 - ⬜ Per-server zone serial reporting (currently all servers in a group share `DNSZone.serial`; once agents report back, surface per-server drift)
-- ⬜ Trivy-clean + kind-AXFR acceptance tests for the agent images (stubs marked `@pytest.mark.e2e` in `agent/dns/tests/`)
+- ⬜ Trivy-clean + kind-AXFR acceptance tests for the agent images (stubs marked `@pytest.mark.e2e` in `agent/{dns,dhcp}/tests/`; Trivy runs in CI today but with `exit-code: "0"` so findings don't block merges)
 
 ### Future Phases — Tracked Items
 

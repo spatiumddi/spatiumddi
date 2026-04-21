@@ -2,7 +2,7 @@
 
 Two code paths:
 
-* **Agent-based drivers** (``kea``, ``isc-dhcp``): trust the agent heartbeat.
+* **Agent-based drivers** (``kea``): trust the agent heartbeat.
   ``agent_last_seen`` is stamped by ``POST /api/v1/dhcp/servers/{id}/heartbeat``;
   if it's fresh we flip status to ``active``, otherwise ``unreachable``.
 * **Agentless drivers** (``windows_dhcp``): the control plane has to do the

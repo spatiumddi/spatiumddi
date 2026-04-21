@@ -179,7 +179,6 @@ export function CreateServerModal({
               }}
             >
               <option value="kea">Kea</option>
-              <option value="isc_dhcp">ISC DHCP</option>
               <option value="windows_dhcp">
                 Windows DHCP (WinRM, read-only)
               </option>

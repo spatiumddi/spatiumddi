@@ -17,8 +17,8 @@ Why write-through per object (instead of a bundle push):
     ``Add/Set/Remove-DhcpServerv4*`` per user action. That keeps the
     blast radius of any failure scoped to the object being edited.
 
-No-op for non-windows_dhcp servers — Kea/ISC DHCP use the agent bundle
-path and never hit these helpers.
+No-op for non-windows_dhcp servers — Kea uses the agent bundle path
+and never hits these helpers.
 """
 
 from __future__ import annotations
