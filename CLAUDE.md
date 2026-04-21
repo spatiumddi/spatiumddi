@@ -141,7 +141,7 @@ Three patterns recur across the DNS and DHCP subsystems. Know these before addin
 | 1 | Core IPAM, local auth, user management, audit log, Docker Compose | **Mostly done** — LDAP/OIDC/SAML + RADIUS/TACACS+ auth, group-based RBAC enforcement, bulk-edit tags/CF, inherited-field placeholders, and mobile-responsive UI all landed; IPv6 partial |
 | 2 | DHCP (Kea + ISC), DNS (BIND9), DDNS, zone/subnet tree UI | **In Progress** (DNS core landed; DHCP Kea driver + agent + UI landed; DDNS pipeline shipped for agentless lease path 2026-04-19; ISC DHCP + agent-side lease-event DDNS pending) |
 | 3 | DNS views, server groups, blocking lists, VLAN/VXLAN, system admin panel, health dashboard | **In Progress** (DNS views, groups, blocklists, health checks landed) |
-| 4 | OS appliance image, Terraform/Ansible providers, SAML, notifications, backup/restore | **In Progress** (SAML SP landed in Wave A.4; appliance, providers, backup still pending) |
+| 4 | OS appliance image, Terraform/Ansible providers, SAML, notifications, backup/restore, ACME (DNS-01 provider + embedded client) | **In Progress** (SAML SP landed in Wave A.4; alerts framework landed; appliance, providers, backup, ACME still pending) |
 | 5 | Multi-tenancy, IP request workflows, import/export, advanced reporting | Not started |
 
 ### Current state
@@ -283,14 +283,18 @@ SpatiumDDI cut its alpha release `2026.04.16-1` on 2026-04-16 with IPAM, DNS (BI
   Load-Balancing / Hot-Standby). Requires agent support on both
   peers, a new `DHCPFailoverChannel` model, and UI for peer
   configuration + state-transition actions. Phase 3–4.
-- ⬜ **Alerts framework** — rule-based alerts on metrics we already
-  collect (subnet utilisation, DHCP lease exhaustion, server
-  unreachable, query rate spikes). Models: `AlertRule`,
-  `AlertHistory`. Celery-beat evaluation loop against the metrics
-  table. Delivery channels: email (SMTP), SNMP trap, syslog (reuse
-  the Phase-7-completed forwarder), webhook. UI for rule CRUD +
-  history viewer. Phase 4 — fits alongside the existing
-  "notifications" bucket.
+- ✅ **Alerts framework (v1)** — `AlertRule` + `AlertEvent` tables;
+  evaluator at `services/alerts.py:evaluate_all()` runs from
+  `app.tasks.alerts.evaluate_alerts` on a 60 s beat tick. Two rule
+  types on launch: `subnet_utilization` (honours
+  `PlatformSettings.utilization_max_prefix_*` so PTP / loopback
+  subnets can't trip the alarm) and `server_unreachable` (DNS /
+  DHCP / any). Delivery reuses the audit-forward syslog + webhook
+  send helpers against the platform-level targets; per-rule
+  override of targets deferred. Admin UI at `/admin/alerts` with
+  live events viewer + "Evaluate now". Email (SMTP) and SNMP trap
+  channels are the remaining v2 work — needs SMTP config infra that
+  doesn't exist yet, and SNMP is its own dependency footprint.
 - ⬜ **IPAM template classes** — reusable stamp templates that
   carry default tags, custom-field values, DNS / DHCP group
   assignments, and optional sub-subnet layouts. Applied to a block
@@ -298,6 +302,111 @@ SpatiumDDI cut its alpha release `2026.04.16-1` on 2026-04-16 with IPAM, DNS (BI
   template drift. Phase 5 — belongs alongside advanced reporting /
   multi-tenancy, once the base inheritance story is fully bedded
   down.
+- ⬜ **ACME / Let's Encrypt — DNS-01 provider for external clients**
+  — lets someone running certbot / lego / acme.sh on their own box
+  prove control of a FQDN hosted in a SpatiumDDI-managed zone, so
+  they can issue public certs (wildcards included) against a DNS
+  that SpatiumDDI owns. **Routes writes through our REST API, not
+  RFC 2136 to BIND9 directly** — otherwise records land outside the
+  control-plane model and get overwritten by the next ConfigBundle
+  push.
+
+  Recommended shape: implement an [acme-dns](https://github.com/joohoi/acme-dns)-compatible
+  HTTP surface (minimal, widely supported). certbot (`--dns-acme-dns`),
+  lego (`ACMEDNSProvider`), and acme.sh all speak the protocol out of
+  the box, so no custom plugin to maintain.
+
+  **Data model.** New `ACMEAccount` table: `id`, `subdomain` (a
+  UUID that the client CNAMEs `_acme-challenge.<fqdn>` to —
+  standard acme-dns delegation pattern; compromised creds can only
+  write that one subdomain), `username` + `password_hash` (scrypt),
+  `allowed_source_cidrs` (optional IP allowlist), `zone_id` FK to
+  `DNSZone`, `last_used_at`, `created_at`. Issued once on
+  registration, shown plaintext exactly once (reuse the API-token
+  reveal pattern). No "scope" field on `APIToken` — ACME creds are
+  a separate auth path with its own protocol, keeping the
+  permission surface tidy.
+
+  **Endpoints** (under `/api/v1/acme/`, rate-limited separately):
+  - `POST /register` → 201 with `{username, password, fulldomain,
+    subdomain, allowlist}`. Superadmin or user with the
+    `manage_acme` permission. Creates the `ACMEAccount` row and
+    returns the creds.
+  - `POST /update` with `X-Api-User` + `X-Api-Key` headers and
+    `{subdomain, txt}` body → writes the TXT at
+    `<subdomain>.acme.<our-apex>` with a short TTL (60 s). Record
+    goes through the normal `_sync_dns_record` path so it's
+    visible in IPAM / UI and cleaned up uniformly. **Response
+    blocks until the record is confirmed live on the primary**
+    (agent ack with new ETag) — otherwise LE polls before the
+    record propagates and the challenge fails.
+  - `DELETE /update` (or `POST` with empty `txt`) — idempotent
+    cleanup; clients call this post-validation. Stale TXT records
+    left >24 h get swept by a new janitor Celery task.
+  - `GET /accounts` / `DELETE /accounts/{id}` — admin list +
+    revocation.
+
+  **Delegation pattern, documented:** users add a `CNAME
+  _acme-challenge.foo.example.com → <subdomain>.acme.their-apex.com`
+  in their upstream zone, then delegate `acme.their-apex.com` to
+  the SpatiumDDI DNS servers. The ACME account can only write under
+  that tiny subdomain — a leaked credential can't rewrite the whole
+  zone. Walk through this in `docs/features/ACME.md` with a worked
+  example.
+
+  **Wildcards.** DNS-01 is the ONLY path LE offers for
+  `*.example.com`; most operators asking for ACME want this. Make
+  sure docs call out that the TXT on `_acme-challenge.example.com`
+  (via the CNAME delegation) also covers wildcard issuance.
+
+  **Audit + rate limit.** Every register / update / delete lands in
+  `audit_log` with the account display. Separate rate-limit bucket
+  from the main API (a broken cron on a client shouldn't DoS the
+  auth-token endpoints). Fail2Ban-style temp-ban on repeated auth
+  failures against `/update`.
+
+  **Propagation gotcha.** Our agent long-polls the ConfigBundle +
+  ETag — typical tick is sub-second, but `/update` must still block
+  until the agent acks the new bundle, otherwise LE polls stale.
+  Reuse the existing per-op ack channel (`apply_record_changes`
+  already returns async; surface the wait).
+
+  Phase 4 — pairs with the OS appliance / HA deployment story, since
+  production SpatiumDDI behind a public apex is the main "I need
+  public certs" customer.
+
+- ⬜ **ACME embedded client — certs for SpatiumDDI's own services**
+  — *separate from the DNS-01 provider above.* SpatiumDDI runs an
+  embedded ACME client (candidate libs: `acme` / `certbot-core`
+  from the certbot project, or Go's `acme/autocert` if we ever port
+  chunks; Python-native is the fit today) that issues and auto-
+  renews certs for:
+  - the frontend HTTPS listener (today configured by hand in the
+    reverse-proxy layer — appliance deployments need this turn-key);
+  - BIND9 DoT / DoH listeners on the DNS agent (when those ship);
+  - the Kea control agent TLS (if operators expose it externally);
+  - optionally, the API's own TLS when running without an upstream
+    proxy (small deployments).
+
+  Uses our **own DNS-01 provider** (the entry above) for the
+  challenge — SpatiumDDI becomes its own ACME solver, which is a
+  nice dogfooding story. Or HTTP-01 for the frontend HTTPS listener
+  if port 80 is reachable. Certs land in a new `Certificate` table
+  (`fqdn`, `san_list`, `issued_at`, `expires_at`, `pem`,
+  `chain_pem`, `private_key_pem` Fernet-encrypted) and get pushed
+  to consuming agents via the same ConfigBundle mechanism the rest
+  of the config flows through — so a DoT listener on BIND9 picks up
+  a renewed cert without a manual deploy.
+
+  Renewal task: Celery beat every 24 h, renews anything <30 days
+  from expiry. Alert rule `certificate_expiring` fires through the
+  alerts framework at <14 days (soft) and <3 days (critical) if
+  renewal has failed — reuses the framework we just shipped.
+
+  Phase 4 — natural bundle with the OS appliance item (`docs/
+  deployment/APPLIANCE.md`) since shipping a self-configuring
+  appliance means owning the cert story end-to-end.
+
 - ⬜ **Cloud DNS driver family — Route 53 / Azure DNS / Cisco DNA**
   — each is its own driver module implementing the DNS driver ABC.
   Route 53 via `boto3` is the simplest entry point (stable REST
