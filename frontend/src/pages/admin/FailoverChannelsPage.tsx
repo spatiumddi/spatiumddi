@@ -1,6 +1,6 @@
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Pencil, Plus, Trash2 } from "lucide-react";
+import { Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
 import {
   dhcpApi,
   type DHCPFailoverChannel,
@@ -9,6 +9,7 @@ import {
 } from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
+import { HeaderButton } from "@/components/ui/header-button";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -213,25 +214,48 @@ function ChannelModal({
           </Field>
         </div>
 
+        <div className="rounded-md border border-sky-500/30 bg-sky-500/5 px-3 py-2 text-xs text-sky-900 dark:text-sky-200">
+          <p className="font-medium">Peer URLs</p>
+          <p className="mt-1 text-muted-foreground">
+            Each URL is that peer's{" "}
+            <strong className="text-foreground">own</strong>{" "}
+            <code>kea-ctrl-agent</code> endpoint — the other peer calls it to
+            exchange HA state. The address must be resolvable{" "}
+            <strong className="text-foreground">
+              from the other peer's host
+            </strong>
+            . On the Docker compose bridge that's the service hostname (e.g.{" "}
+            <code>http://dhcp-kea:8000/</code>); on a routed LAN use the IP that
+            both sides can reach.
+          </p>
+        </div>
         <div className="grid grid-cols-2 gap-3">
           <Field
-            label="Primary peer URL"
-            description="What the other peer uses to reach the primary's kea-ctrl-agent."
+            label="Primary server URL"
+            description="URL of the primary's own kea-ctrl-agent. The secondary uses this to reach the primary."
           >
             <input
               className={inputCls}
-              placeholder="http://10.0.0.5:8000/"
+              placeholder="http://dhcp-kea:8000/"
               value={form.primary_peer_url ?? ""}
               onChange={(e) => set("primary_peer_url", e.target.value)}
             />
           </Field>
           <Field
-            label="Secondary peer URL"
-            description="What the other peer uses to reach the secondary."
+            label={
+              form.mode === "hot-standby"
+                ? "Standby server URL"
+                : "Secondary server URL"
+            }
+            description={
+              form.mode === "hot-standby"
+                ? "URL of the standby's own kea-ctrl-agent. The primary uses this to reach the standby."
+                : "URL of the secondary's own kea-ctrl-agent. The primary uses this to reach the secondary."
+            }
           >
             <input
               className={inputCls}
-              placeholder="http://10.0.0.6:8000/"
+              placeholder="http://dhcp-kea-2:8000/"
               value={form.secondary_peer_url ?? ""}
               onChange={(e) => set("secondary_peer_url", e.target.value)}
             />
@@ -332,7 +356,11 @@ export function FailoverChannelsPage() {
   const [creating, setCreating] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
-  const { data: channels, isLoading } = useQuery({
+  const {
+    data: channels,
+    isLoading,
+    isFetching,
+  } = useQuery({
     queryKey: ["dhcp-failover-channels"],
     queryFn: dhcpApi.listFailoverChannels,
     refetchInterval: 30_000,
@@ -341,6 +369,11 @@ export function FailoverChannelsPage() {
     queryKey: ["dhcp-servers"],
     queryFn: () => dhcpApi.listServers(),
   });
+
+  function refresh() {
+    qc.invalidateQueries({ queryKey: ["dhcp-failover-channels"] });
+    qc.invalidateQueries({ queryKey: ["dhcp-servers"] });
+  }
 
   const serverMap = useMemo(() => {
     const m = new Map<string, DHCPServer>();
@@ -410,17 +443,27 @@ export function FailoverChannelsPage() {
             server can belong to at most one channel.
           </p>
         </div>
-        <button
-          onClick={() => {
-            setEditing(null);
-            setCreating(true);
-            setErrorMsg(null);
-          }}
-          className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground hover:bg-primary/90"
-        >
-          <Plus className="h-4 w-4" />
-          New Channel
-        </button>
+        <div className="flex items-center gap-2">
+          <HeaderButton
+            icon={RefreshCw}
+            iconClassName={cn(isFetching && "animate-spin")}
+            onClick={refresh}
+            title="Refresh channels + peer HA state"
+          >
+            Refresh
+          </HeaderButton>
+          <HeaderButton
+            variant="primary"
+            icon={Plus}
+            onClick={() => {
+              setEditing(null);
+              setCreating(true);
+              setErrorMsg(null);
+            }}
+          >
+            New Channel
+          </HeaderButton>
+        </div>
       </div>
 
       <div className="rounded-lg border bg-card">

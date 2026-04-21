@@ -44,7 +44,14 @@ rely on clients receiving the NTP server list via DHCP.
 
 from __future__ import annotations
 
+import ipaddress
+import socket
 from typing import Any
+from urllib.parse import urlparse, urlunparse
+
+import structlog
+
+_log = structlog.get_logger(__name__)
 
 # Well-known DHCPv4 option codes we emit by name when present in the bundle.
 # Kea accepts ``{"name": "ntp-servers", ...}`` natively; we include explicit
@@ -160,6 +167,43 @@ def _subnet(subnet: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _resolve_peer_url(url: str) -> str:
+    """Kea's HA hook parses peer URLs with Boost asio directly, so
+    ``url`` must resolve to a literal IP address — hostnames aren't
+    looked up by Kea itself. We resolve agent-side via the container's
+    resolver (Docker DNS on compose, k8s DNS on Kubernetes) so operator-
+    friendly hostnames like ``http://dhcp-kea-2:8000/`` keep working.
+
+    Already-IP hosts are passed through unchanged. Resolution failures
+    return the original URL so Kea surfaces a readable error instead of
+    us silently swallowing a misconfig.
+    """
+    if not url:
+        return url
+    try:
+        p = urlparse(url)
+        host = p.hostname
+        if not host:
+            return url
+        # Already a valid IPv4/IPv6 literal — nothing to do.
+        try:
+            ipaddress.ip_address(host)
+            return url
+        except ValueError:
+            pass
+        ip = socket.gethostbyname(host)
+        port_part = f":{p.port}" if p.port else ""
+        netloc = f"{ip}{port_part}"
+        resolved = urlunparse(
+            (p.scheme, netloc, p.path or "/", p.params, p.query, p.fragment)
+        )
+        _log.info("ha_peer_url_resolved", hostname=host, ip=ip, url=resolved)
+        return resolved
+    except (OSError, ValueError) as exc:
+        _log.warning("ha_peer_url_resolve_failed", url=url, error=str(exc))
+        return url
+
+
 def _ha_hook(failover: dict[str, Any]) -> dict[str, Any]:
     """Render the ``libdhcp_ha.so`` hook entry from a failover payload.
 
@@ -172,7 +216,7 @@ def _ha_hook(failover: dict[str, Any]) -> dict[str, Any]:
     peers = [
         {
             "name": p["name"],
-            "url": p["url"],
+            "url": _resolve_peer_url(p["url"]),
             "role": p["role"],
             "auto-failover": bool(p.get("auto-failover", True)),
         }

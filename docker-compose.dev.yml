@@ -178,8 +178,16 @@ services:
       api:
         condition: service_started
 
-  # ── DHCP agent ────────────────────────────────────────────────────────
-  # Enable with: docker compose --profile dhcp up -d
+  # ── DHCP agent (primary) ──────────────────────────────────────────────
+  # Enable with:
+  #   docker compose -f docker-compose.yml -f docker-compose.dev.yml \
+  #     --profile dhcp up -d                                  # single node
+  #   docker compose -f docker-compose.yml -f docker-compose.dev.yml \
+  #     --profile dhcp --profile dhcp-ha up -d                # HA pair
+  #
+  # Service names, volumes, and profiles match docker-compose.yml so the
+  # dev overlay is a clean build-from-source override of the published
+  # images.
   dhcp-kea:
     profiles: ["dhcp"]
     build:
@@ -189,21 +197,46 @@ services:
     networks:
       - spatiumddi
     environment:
+      # ── Required ──────────────────────────────────────────────────
+      # Control-plane URL the agent bootstraps + long-polls against.
       SPATIUM_API_URL: http://api:8000
+      # Pre-shared key exchanged for a rotating JWT on first join.
       SPATIUM_AGENT_KEY: ${DHCP_AGENT_KEY:-changeme-dhcp-agent-key}
+
+      # ── Registration ──────────────────────────────────────────────
+      # Unique server name — becomes Kea's `this-server-name` under HA.
       SPATIUM_SERVER_NAME: dhcp-kea
       AGENT_GROUP: default
+      # Informational only — actual HA role is driven by channel membership.
       AGENT_ROLES: primary
+
+      # ── TLS ───────────────────────────────────────────────────────
       SPATIUM_INSECURE_SKIP_TLS_VERIFY: "1"
+      # TLS_CA_PATH: /etc/ssl/spatium-ca.crt
+
+      # ── Tuning (optional, defaults shown) ─────────────────────────
+      # LOG_LEVEL: INFO             # DEBUG | INFO | WARNING | ERROR
+      # HEARTBEAT_INTERVAL: "30"    # seconds between agent heartbeats
+      # LONGPOLL_TIMEOUT: "30"      # seconds the /config long-poll blocks
+      # CACHE_DIR: /var/lib/spatium-dhcp-agent   # bundle + JWT cache
+      # KEA_CONFIG_PATH: /etc/kea/kea-dhcp4.conf
+      # KEA_CONTROL_SOCKET: /run/kea/kea4-ctrl-socket
+      # KEA_LEASE_FILE: /var/lib/kea/kea-leases4.csv
     volumes:
       - dhcp_kea_state:/var/lib/spatium-dhcp-agent
       - dhcp_kea_leases:/var/lib/kea
-    ports:
-      # Host 6767/udp → container 67/udp (DHCPv4 is hard to expose without host
-      # networking; use `network_mode: host` for real lab use). :8000 is the
-      # Kea control agent REST port — remapped to avoid clashing with the API.
-      - "6767:67/udp"
-      - "8001:8000/tcp"
+    # ports:
+    #   # Host 6767/udp → container 67/udp. DHCPv4 is awkward to expose
+    #   # without host networking — use `network_mode: host` for real lab use.
+    #   - "6767:67/udp"
+    #   # HA hook peer-to-peer HTTP listener. Must stay on container :8000
+    #   # (that's the peer URL advertised to the partner). Host-side mapped
+    #   # off 8000 so the control plane API keeps :8000.
+    #   - "8001:8000/tcp"
+    #   # Optional kea-ctrl-agent REST (operator-facing). Lives on :8544
+    #   # inside the container — see agent/dhcp/images/kea/kea-ctrl-agent.conf
+    #   # for why it's deliberately not on :8000.
+    #   - "8544:8544/tcp"
     depends_on:
       api:
         condition: service_started
@@ -212,6 +245,51 @@ services:
     # NOT need to listen for L2 broadcasts on the host LAN.
     cap_add:
       - NET_BIND_SERVICE
+
+  # ── DHCP agent (secondary, HA peer) ───────────────────────────────────
+  # Only starts with `--profile dhcp-ha`. Pair dhcp-kea + dhcp-kea-2 in
+  # a DHCPFailoverChannel (Admin → Failover Channels) with per-peer URLs
+  # reachable on the spatiumddi bridge:
+  #   primary_peer_url:   http://dhcp-kea:8000/
+  #   secondary_peer_url: http://dhcp-kea-2:8000/
+  dhcp-kea-2:
+    profiles: ["dhcp-ha"]
+    build:
+      context: .
+      dockerfile: agent/dhcp/images/kea/Dockerfile
+    restart: unless-stopped
+    networks:
+      - spatiumddi
+    environment:
+      SPATIUM_API_URL: http://api:8000
+      SPATIUM_AGENT_KEY: ${DHCP_AGENT_KEY:-changeme-dhcp-agent-key}
+
+      # Unique — drives a distinct DHCPServer row + Kea HA this-server-name.
+      SPATIUM_SERVER_NAME: dhcp-kea-2
+      AGENT_GROUP: default
+      AGENT_ROLES: secondary
+
+      SPATIUM_INSECURE_SKIP_TLS_VERIFY: "1"
+      # TLS_CA_PATH: /etc/ssl/spatium-ca.crt
+
+      # Tuning (see dhcp-kea above for the full list).
+      # LOG_LEVEL: INFO
+      # HEARTBEAT_INTERVAL: "30"
+      # LONGPOLL_TIMEOUT: "30"
+    volumes:
+      - dhcp_kea_state_2:/var/lib/spatium-dhcp-agent
+      - dhcp_kea_leases_2:/var/lib/kea
+    # ports:
+    #   # Distinct host ports so both peers can listen without colliding.
+    #   - "6768:67/udp"
+    #   - "8002:8000/tcp"   # HA hook peer-to-peer HTTP
+    #   - "8545:8544/tcp"   # optional kea-ctrl-agent REST
+    depends_on:
+      api:
+        condition: service_started
+    cap_add:
+      - NET_BIND_SERVICE
+
 
 networks:
   spatiumddi:
@@ -224,3 +302,5 @@ volumes:
   dns_bind9_cache:
   dhcp_kea_state:
   dhcp_kea_leases:
+  dhcp_kea_state_2:
+  dhcp_kea_leases_2:

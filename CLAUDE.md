@@ -288,22 +288,68 @@ Phase 1 IPv6 closure + the Phase 2/3 DDNS / zone-state / CI-hardening items all 
   + UI binding on the record form. Phase 3.
 - ✅ **DHCP state failover (Kea HA) — core** — `DHCPFailoverChannel`
   model pairs two Kea DHCPServer rows with mode (`hot-standby` /
-  `load-balancing`), per-peer `kea-ctrl-agent` URL, and heartbeat /
-  max-response / max-ack / max-unacked tuning. `ConfigBundle` carries
-  a `FailoverConfig` when the server is in a channel; the agent's
+  `load-balancing`), per-peer HA URL, and heartbeat / max-response /
+  max-ack / max-unacked tuning. `ConfigBundle` carries a
+  `FailoverConfig` when the server is in a channel; the agent's
   `render_kea.py` injects `libdhcp_ha.so` + `high-availability`
-  alongside the existing `libdhcp_lease_cmds.so` hook. Agent
-  supervises an `HAStatusPoller` thread that calls `ha-status-get`
-  on the local Kea control socket every ~15s when HA is active and
-  POSTs state to `/api/v1/dhcp/agents/ha-status`; the control plane
-  stores it on `DHCPServer.ha_state` + `ha_last_heartbeat_at`. Admin
-  page at `/admin/failover-channels` does CRUD; DHCP server detail
-  header shows a live HA pill (red / amber / green by Kea state
-  name). **Deferred follow-ups:** state-transition actions
-  (`ha-maintenance-start`, `ha-continue`, force-sync) — the state
-  machine is observable today but operators can't drive it from the
-  UI; peer compatibility validation (e.g. refusing pairs without
-  overlapping subnets); per-pool HA scope tuning for load-balancing.
+  alongside the existing `libdhcp_lease_cmds.so` hook. Peer URLs are
+  resolved agent-side (`_resolve_peer_url`) before render because
+  Kea's Boost asio parser only accepts IP literals — hostnames like
+  `http://dhcp-kea-2:8000/` would otherwise fail with `bad url`.
+  Kea image splits ports: `:8000` is owned by the HA hook's
+  `CmdHttpListener` (peer-to-peer HTTP), `:8544` by the operator-
+  facing `kea-ctrl-agent`; collocating them on the same port races
+  `Address in use` on the second reload. Agent supervises an
+  `HAStatusPoller` thread that calls `status-get` (Kea 2.6 folded HA
+  state into the generic status command; pre-2.6 `ha-status-get`
+  shapes still accepted) on the local control socket every ~15s
+  when HA is active and POSTs state to
+  `/api/v1/dhcp/agents/ha-status`; the control plane stores it on
+  `DHCPServer.ha_state` + `ha_last_heartbeat_at`. Bootstrap-from-
+  cache now issues `config-reload` with retry so Kea picks up HA on
+  agent restart even when the ETag is unchanged. Admin page at
+  `/admin/failover-channels` does CRUD + Refresh; dashboard DHCP
+  column shows per-channel peer state pills when any channel exists;
+  DHCP server detail header shows a live HA pill (red / amber / green
+  by Kea state name). **Deferred follow-ups:**
+  - **Scope mirroring across an HA pair.** `DHCPScope` rows are
+    pinned to a single `server_id` today — pairing two servers in a
+    channel configures the HA hook but does **not** mirror subnets /
+    pools / statics / reservations. Both peers must have identical
+    subnet config for Kea HA to serve; operators mirror manually.
+    Two plausible shapes: (a) a "Mirror from primary" toggle on the
+    channel that keeps primary → secondary scopes in sync, (b)
+    promote scopes to the channel / server-set level so both peers
+    render from the same rows. (a) is less disruptive; (b) is cleaner
+    but a data-model migration.
+  - **Peer IP re-resolve loop.** Hostname → IP resolution happens
+    once at render time. If a peer container/pod gets a new IP
+    (compose `--force-recreate`, any k8s restart), the other peer's
+    Kea config has a stale IP and the hook drifts to
+    `communications-interrupted` / `partner-down`. Fix: background
+    loop in the agent that re-resolves peer hostnames every ~30s
+    and forces a render + reload if any IP changed. Matters most
+    on k8s where pod IPs churn; on compose bridges IPs are stable
+    across `restart`.
+  - **Kea version skew guard.** The `status-get` HA shape shifted
+    between Kea 2.4 and 2.6. Pairing peers on mismatched Kea
+    versions is accepted today. Cheap fix: ship Kea version in the
+    heartbeat, reject channel creation if peers differ.
+  - **DDNS double-write under HA.** Agent-side DDNS
+    (`apply_ddns_for_lease`) doesn't gate on HA state — if the
+    standby ever serves a lease (pre-sync window, partner-down),
+    both peers could try to write the same RR. Kea's hook
+    coordinates DHCP serving but not our DDNS pipeline.
+  - **State-transition actions** (`ha-maintenance-start`,
+    `ha-continue`, force-sync) — observable today but operators
+    can't drive the HA state machine from the UI.
+  - **Peer compatibility validation** (refuse pairs without
+    overlapping subnets), per-pool HA scope tuning for
+    load-balancing.
+  - **HA e2e test.** `.github/workflows/agent-e2e.yml` stands up
+    a single-agent DNS pair today; an HA DHCP variant would have
+    caught all the bootstrap / port-split / `status-get` regressions
+    we hit in 2026.04.21-2.
 - ✅ **Alerts framework (v1)** — `AlertRule` + `AlertEvent` tables;
   evaluator at `services/alerts.py:evaluate_all()` runs from
   `app.tasks.alerts.evaluate_alerts` on a 60 s beat tick. Two rule

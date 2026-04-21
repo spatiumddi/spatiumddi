@@ -29,14 +29,36 @@ log = structlog.get_logger(__name__)
 
 
 def _extract_state(resp: dict[str, Any]) -> str | None:
-    """Pick the local peer's state out of Kea's ha-status-get response.
+    """Pick the local peer's state out of Kea's status-get response.
 
-    Kea 2.x nests under ``arguments.ha-servers.local.state``; older
-    builds flatten to ``arguments.local.state``. Accept either and
-    fall back to None so a schema change upstream just silently
-    renders as "unknown" instead of crashing the poller.
+    Kea 2.6 exposes HA status under ``arguments.high-availability[]``
+    in the generic ``status-get`` command — the old standalone
+    ``ha-status-get`` was removed from the DHCPv4 unix socket.
+    Response shape::
+
+        {"arguments": {"high-availability": [
+            {"ha-mode": "hot-standby",
+             "ha-servers": {
+                "local": {"role": "primary", "state": "hot-standby", ...},
+                "remote": {"role": "standby", "last-state": "normal", ...}}}
+        ]}}
+
+    Older Kea (pre-2.6) replied to ``ha-status-get`` with either
+    ``arguments.ha-servers.local.state`` or ``arguments.local.state``.
+    We accept all three shapes so the same poller works across
+    versions and a schema drift upstream just renders as "unknown"
+    instead of crashing.
     """
     args = resp.get("arguments") or {}
+    ha_list = args.get("high-availability")
+    if isinstance(ha_list, list) and ha_list:
+        first = ha_list[0]
+        servers = first.get("ha-servers") if isinstance(first, dict) else None
+        local = servers.get("local") if isinstance(servers, dict) else None
+        if isinstance(local, dict):
+            state = local.get("state")
+            if isinstance(state, str) and state:
+                return state
     ha = args.get("ha-servers") or args
     local = ha.get("local") if isinstance(ha, dict) else None
     if isinstance(local, dict):
@@ -75,8 +97,10 @@ class HAStatusPoller:
         )
 
     def _poll_kea(self) -> tuple[str | None, dict[str, Any] | None]:
+        # ``status-get`` rather than ``ha-status-get``: Kea 2.6 folded
+        # HA state into the generic status response (see _extract_state).
         try:
-            resp = send_command(self.cfg.kea_control_socket, "ha-status-get")
+            resp = send_command(self.cfg.kea_control_socket, "status-get")
         except KeaCtrlError as e:
             # Kea returns an error when the HA hook isn't loaded. That's
             # the common case for standalone servers — log at debug so

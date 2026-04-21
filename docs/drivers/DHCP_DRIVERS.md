@@ -114,9 +114,15 @@ Kea's built-in `libdhcp_ha.so` hook handles pool coordination between paired ser
 
 - `_resolve_failover` in `backend/app/services/dhcp/config_bundle.py` emits a `FailoverConfig` on the `ConfigBundle` when the server belongs to a channel.
 - The agent's `render_kea.py:_ha_hook()` injects `libdhcp_ha.so` alongside the always-loaded `libdhcp_lease_cmds.so` (the HA hook depends on it).
+- **Peer URL hostname resolution** — Kea's HA hook parses peer URLs with Boost asio directly and only accepts IP literals. Hostnames like `http://dhcp-kea-2:8000/` fail with `bad url ...: Failed to convert string to address`. `render_kea._resolve_peer_url` resolves the hostname agent-side (via the container's resolver — Docker DNS on compose, k8s DNS on Kubernetes) before emitting the URL into Kea config. IPv4/v6 literals pass through unchanged.
+- **Port topology** — Kea 2.6's HA hook spins up its own `CmdHttpListener` bound to the `this-server` peer URL to receive peer-to-peer traffic. That **must not** collide with `kea-ctrl-agent`. SpatiumDDI's Kea image dedicates:
+  - `:8000` — HA hook peer-to-peer HTTP (the URL advertised to the partner).
+  - `:8544` — `kea-ctrl-agent` operator-facing REST (deliberately off 8000).
 - Each peer's `this-server-name` is derived from its `DHCPServer.name`; the `peers` array carries both entries with roles `primary` + (`standby` in hot-standby / `secondary` in load-balancing) and the shared heartbeat / max-response / max-ack / max-unacked tuning from the channel.
-- Agent-side `HAStatusPoller` (`agent/dhcp/spatium_dhcp_agent/ha_status.py`) calls `ha-status-get` every ~15 s and POSTs the state to the control plane — drives the live HA pill in the UI.
-- The driver does **not** replicate leases itself — Kea's hook talks directly to the peer's `kea-ctrl-agent`. SpatiumDDI just renders the config.
+- Agent-side `HAStatusPoller` (`agent/dhcp/spatium_dhcp_agent/ha_status.py`) calls `status-get` on the Kea unix socket every ~15 s and POSTs the state to the control plane — drives the live HA pill in the UI. Kea 2.6 moved HA state into the generic `status-get` response under `arguments.high-availability[]`; the poller also accepts pre-2.6 `ha-status-get` shapes for forward-compat.
+- **Bootstrap reload** — on agent startup the entrypoint launches `kea-dhcp4` in the background with the Dockerfile-baked config, then the agent re-renders the cached bundle and issues `config-reload` with up to 15 s of retry so Kea picks up HA even on cold starts where the control socket isn't live yet.
+- The driver does **not** replicate leases itself — Kea's hook talks directly to the peer's HA listener. SpatiumDDI just renders the config.
+- **Scope mirroring — NOT automatic.** `DHCPScope` rows are bound to a single `DHCPServer.id`. Pairing two servers in a failover channel configures the HA hook but does **not** copy scopes/pools/statics from one peer to the other. Both peers must have identical subnet config for Kea HA to serve correctly. Operators today mirror manually; automated mirroring is a tracked follow-up (`CLAUDE.md` Future Phases).
 
 ### Agent bootstrap
 

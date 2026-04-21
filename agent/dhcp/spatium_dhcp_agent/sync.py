@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 from typing import Any
 
 import httpx
@@ -34,6 +35,14 @@ log = structlog.get_logger(__name__)
 
 _FAILURE_THRESHOLD = 3  # DHCP.md §6: offline after 3 consecutive failures
 _OFFLINE_RETRY_SECONDS = 60.0
+# Bootstrap reload races Kea's own startup — entrypoint launches kea-dhcp4
+# in the background just before the agent, so the control socket may not
+# exist for up to a second or two. Retry reload until the socket answers
+# or we give up. After ``_BOOTSTRAP_RELOAD_TIMEOUT`` we let Kea keep
+# running on its pre-boot config and rely on the next real config change
+# (or an operator restart) to pick up the new render.
+_BOOTSTRAP_RELOAD_TIMEOUT = 15.0
+_BOOTSTRAP_RELOAD_INTERVAL = 1.0
 
 
 class SyncLoop:
@@ -54,11 +63,23 @@ class SyncLoop:
         self._offline = False
 
         # Preload cached bundle — offline-operation guarantee.
+        #
+        # Kea was just launched by the entrypoint with the Dockerfile-baked
+        # config and will not pick up the rendered bundle unless we issue a
+        # config-reload. Retry the reload for a few seconds to cover Kea's
+        # own startup (socket may not exist yet). Without this retry, if
+        # the control plane later returns 304 on /config, Kea would stay
+        # on its baked config forever — in particular losing HA state on
+        # any agent restart.
         bundle, etag = load_config(self.cfg.state_dir)
         if bundle is not None:
             self._current_etag = etag
             try:
-                self._apply_bundle(bundle, reload_kea=False)
+                self._apply_bundle(
+                    bundle,
+                    reload_kea=True,
+                    reload_retry_timeout=_BOOTSTRAP_RELOAD_TIMEOUT,
+                )
                 log.info("dhcp_agent_bootstrap_from_cache", etag=etag)
             except Exception:
                 log.exception("bootstrap_cache_apply_failed")
@@ -79,7 +100,13 @@ class SyncLoop:
             timeout=self.cfg.longpoll_timeout + 15.0,
         )
 
-    def _apply_bundle(self, bundle: dict[str, Any], *, reload_kea: bool) -> None:
+    def _apply_bundle(
+        self,
+        bundle: dict[str, Any],
+        *,
+        reload_kea: bool,
+        reload_retry_timeout: float = 0.0,
+    ) -> None:
         """Render bundle → write Kea config → reload daemon.
 
         The control-plane long-poll returns an envelope ``{server_id,
@@ -112,14 +139,30 @@ class SyncLoop:
             subnets=len(rendered.get("Dhcp4", {}).get("subnet4", [])),
         )
         if reload_kea:
-            try:
-                config_reload(self.cfg.kea_control_socket)
-                self.heartbeat.daemon_status = {"status": "ok"}
-            except (KeaCtrlError, OSError) as e:
-                log.warning("kea_config_reload_failed", error=str(e))
+            deadline = time.monotonic() + reload_retry_timeout
+            last_err: Exception | None = None
+            while True:
+                try:
+                    config_reload(self.cfg.kea_control_socket)
+                    self.heartbeat.daemon_status = {"status": "ok"}
+                    last_err = None
+                    break
+                except (KeaCtrlError, OSError) as e:
+                    last_err = e
+                    if time.monotonic() >= deadline:
+                        break
+                    log.debug(
+                        "kea_config_reload_retry",
+                        error=str(e),
+                        wait=_BOOTSTRAP_RELOAD_INTERVAL,
+                    )
+                    if self._stop.wait(_BOOTSTRAP_RELOAD_INTERVAL):
+                        break
+            if last_err is not None:
+                log.warning("kea_config_reload_failed", error=str(last_err))
                 self.heartbeat.daemon_status = {
                     "status": "degraded",
-                    "reason": f"reload_failed: {e}",
+                    "reason": f"reload_failed: {last_err}",
                 }
 
     def _record_failure(self, reason: str) -> None:

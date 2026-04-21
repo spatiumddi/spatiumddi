@@ -22,6 +22,7 @@ import {
   type Subnet,
   type DNSServer,
   type DHCPServer,
+  type DHCPFailoverChannel,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { includeInUtilization } from "@/lib/utilization";
@@ -361,6 +362,11 @@ export function DashboardPage() {
     queryKey: ["dhcp-groups"],
     queryFn: dhcpApi.listGroups,
     staleTime: 60_000,
+  });
+  const { data: failoverChannels = [] } = useQuery({
+    queryKey: ["dhcp-failover-channels"],
+    queryFn: dhcpApi.listFailoverChannels,
+    refetchInterval: 30_000,
   });
 
   // Audit
@@ -722,6 +728,19 @@ export function DashboardPage() {
                     })}
                   </div>
                 )}
+                {failoverChannels.length > 0 && (
+                  <>
+                    <div className="flex items-center gap-1.5 bg-muted/30 px-4 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+                      <Shield className="h-3 w-3" />
+                      Failover ({failoverChannels.length})
+                    </div>
+                    <div className="divide-y">
+                      {failoverChannels.map((c) => (
+                        <FailoverRow key={c.id} channel={c} />
+                      ))}
+                    </div>
+                  </>
+                )}
               </div>
             </div>
           </div>
@@ -816,5 +835,74 @@ function ServerRow({
         {!isEnabled ? "disabled" : lastSeen ? humanTime(lastSeen) : "never"}
       </span>
     </div>
+  );
+}
+
+// ── Failover channel row ───────────────────────────────────────────────────
+// Kea HA states: normal / hot-standby / load-balancing / ready → green;
+// waiting / syncing / communications-interrupted → amber;
+// partner-down / terminated → red; null/unknown → muted.
+function haStateDotCls(state: string | null | undefined): string {
+  if (!state) return "bg-muted-foreground/40";
+  if (
+    state === "normal" ||
+    state === "hot-standby" ||
+    state === "load-balancing" ||
+    state === "ready"
+  )
+    return "bg-emerald-500";
+  if (state === "partner-down" || state === "terminated") return "bg-red-500";
+  return "bg-amber-500";
+}
+
+function FailoverRow({ channel }: { channel: DHCPFailoverChannel }) {
+  const primaryDot = haStateDotCls(channel.primary_ha_state);
+  const secondaryDot = haStateDotCls(channel.secondary_ha_state);
+  const secondaryLabel =
+    channel.mode === "hot-standby" ? "standby" : "secondary";
+  return (
+    <Link
+      to="/admin/failover-channels"
+      className="flex items-center gap-3 px-4 py-2 text-[11px] hover:bg-muted/30"
+    >
+      <Shield className="h-3 w-3 flex-shrink-0 text-muted-foreground/60" />
+      <span className="w-28 truncate font-semibold" title={channel.name}>
+        {channel.name}
+      </span>
+      <span
+        className="w-24 truncate text-muted-foreground"
+        title={channel.mode}
+      >
+        {channel.mode}
+      </span>
+      <span className="ml-auto flex items-center gap-3">
+        <span className="flex items-center gap-1">
+          <span
+            className={cn("inline-block h-2 w-2 rounded-full", primaryDot)}
+            title={`primary: ${channel.primary_ha_state ?? "unknown"}`}
+          />
+          <span className="text-muted-foreground">
+            {channel.primary_server_name}
+            <span className="text-muted-foreground/60">
+              {" · "}
+              {channel.primary_ha_state ?? "unknown"}
+            </span>
+          </span>
+        </span>
+        <span className="flex items-center gap-1">
+          <span
+            className={cn("inline-block h-2 w-2 rounded-full", secondaryDot)}
+            title={`${secondaryLabel}: ${channel.secondary_ha_state ?? "unknown"}`}
+          />
+          <span className="text-muted-foreground">
+            {channel.secondary_server_name}
+            <span className="text-muted-foreground/60">
+              {" · "}
+              {channel.secondary_ha_state ?? "unknown"}
+            </span>
+          </span>
+        </span>
+      </span>
+    </Link>
   );
 }

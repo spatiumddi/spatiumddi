@@ -13,7 +13,8 @@ RUN python3 -m pip install --prefix=/install --no-cache-dir --break-system-packa
 
 FROM alpine:3.22 AS runtime
 RUN apk add --no-cache \
-      kea kea-dhcp4 kea-ctrl-agent kea-admin kea-hook-lease-cmds \
+      kea kea-dhcp4 kea-ctrl-agent kea-admin \
+      kea-hook-lease-cmds kea-hook-ha \
       tini su-exec \
       python3 py3-pip \
       ca-certificates tzdata \
@@ -39,8 +40,12 @@ ENV CACHE_DIR=/var/lib/spatium-dhcp-agent \
 VOLUME ["/var/lib/spatium-dhcp-agent", "/var/lib/kea"]
 # DHCPv4 server
 EXPOSE 67/udp
-# Kea control agent (REST)
+# Kea HA hook peer-to-peer HTTP listener (CmdHttpListener bound to the
+# this-server peer URL). When HA is inactive the port is unused.
 EXPOSE 8000/tcp
+# kea-ctrl-agent operator-facing REST. Deliberately NOT 8000 — the HA
+# hook owns 8000. See agent/dhcp/images/kea/kea-ctrl-agent.conf.
+EXPOSE 8544/tcp
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s \
   CMD test -S /run/kea/kea4-ctrl-socket || exit 1

@@ -11,6 +11,138 @@ _No unreleased changes yet._
 
 ---
 
+## 2026.04.21-2 — 2026-04-21
+
+Hotfix release shaking out Kea HA end-to-end. `2026.04.21-1`
+shipped the HA data model + UI; actually bringing up two Kea peers
+surfaced four distinct bugs that each made HA look wrong in a
+different way. All four are fixed here, plus UI polish (refresh
+button on failover channels, dashboard HA panel) and compose-file
+cleanups so the HA pair is now a single-flag opt-in.
+
+### Fixed
+
+- **Kea HA peer URL hostname resolution.** Kea's HA hook parses
+  peer URLs with Boost asio directly and only accepts IP literals —
+  hostnames like `http://dhcp-kea-2:8000/` failed with
+  `bad url ...: Failed to convert string to address`. Fixed in
+  `agent/dhcp/spatium_dhcp_agent/render_kea.py:_resolve_peer_url`:
+  resolves the hostname via the container's resolver (Docker DNS on
+  compose, k8s DNS on Kubernetes) before emitting into Kea config.
+  IPv4/v6 literals pass through unchanged; resolution failures log
+  a warning and return the original URL so Kea's own error is the
+  one the operator sees.
+
+- **Kea port collision between HA hook and `kea-ctrl-agent`.** Kea
+  2.6's HA hook spins up its own `CmdHttpListener` bound to the
+  `this-server` peer URL. Collocating that on port 8000 with
+  `kea-ctrl-agent` races; whichever binds second dies with
+  `Address in use`, producing the "secondary keeps reloading"
+  symptom after the first ETag shift. Fixed: `kea-ctrl-agent` now
+  listens on `:8544` (operator-facing REST), HA hook owns `:8000`
+  (peer-to-peer HTTP). Updated `kea-ctrl-agent.conf`, Dockerfile
+  `EXPOSE`, and host-side compose port maps on both production and
+  dev overlays.
+
+- **`ha-status-get` command removed in Kea 2.6.** Agent's
+  `HAStatusPoller` was calling the standalone `ha-status-get`
+  command on the unix socket; Kea 2.6 folded HA status into the
+  generic `status-get` response under
+  `arguments.high-availability[0].ha-servers.local.state`. Agent
+  now calls `status-get`; `_extract_state` accepts both new and
+  pre-2.6 shapes. Without this the DB's `ha_state` column stayed
+  null and the UI showed `unknown` on everything.
+
+- **Bootstrap-from-cache never reloads Kea.** On agent restart
+  the cached bundle was re-rendered to `/etc/kea/kea-dhcp4.conf`
+  but Kea was not told to reload, so it stayed on the Dockerfile-
+  baked (HA-less) config forever — the next long-poll returned
+  `304 Not Modified` because the ETag was unchanged, and no reload
+  followed. Fixed: bootstrap now issues `config-reload` with a 15 s
+  retry window to cover the Kea-startup race (agent and Kea launch
+  together from the entrypoint).
+
+- **PATCH `/dhcp/failover-channels/{id}` 500 on UUID fields.**
+  `body.model_dump(exclude_none=True)` produced a dict with raw
+  `uuid.UUID` values, which the audit log's JSONB serializer
+  choked on with `Object of type UUID is not JSON serializable`.
+  Switched the audit-log payload to `model_dump(mode="json", ...)`
+  so UUIDs stringify; the `setattr` loop still uses the raw dict.
+
+- **Missing `kea-hook-ha` package in the Kea image.** Dockerfile
+  installed `kea-hook-lease-cmds` but not `kea-hook-ha`; the HA
+  config referenced `libdhcp_ha.so` but the file didn't exist, so
+  every `config-reload` fataled. Added `kea-hook-ha` to the apk
+  install line.
+
+### Added
+
+**DHCP HA UX**
+
+- **Refresh button on `/admin/failover-channels`** — invalidates
+  both the channels list and the DHCP servers query so per-peer
+  HA state updates on demand instead of waiting for the 30 s
+  React Query poll. Uses the shared `HeaderButton` primitive so
+  it matches the rest of the app.
+
+- **HA panel on the dashboard DHCP column.** When any failover
+  channel exists, the DHCP column adds a `FAILOVER (N)` section
+  under the server list. Each row shows channel name + mode +
+  two colored state dots (per peer) with the live `ha_state`
+  strings. Green for `normal` / `hot-standby` /
+  `load-balancing` / `ready`; amber for `waiting` / `syncing` /
+  `communications-interrupted`; red for `partner-down` /
+  `terminated`; muted for unknown. Whole row links to
+  `/admin/failover-channels`.
+
+- **Peer URL help text overhaul on the channel form.** Old copy
+  ("What the other peer uses to reach the primary") was easy to
+  misread as "the other peer's URL". Renamed fields to "Primary
+  server URL" / "Secondary server URL", added a highlighted info
+  box explaining each URL is that peer's own `kea-ctrl-agent`
+  endpoint reachable from the other peer, and placeholder values
+  now show the compose hostnames (`http://dhcp-kea:8000/` etc.)
+  instead of generic IPs.
+
+### Changed
+
+- **Compose: DHCP HA is now a single-flag opt-in.** New `dhcp-ha`
+  profile on both `docker-compose.yml` and `docker-compose.dev.yml`
+  adds `dhcp-kea-2` as a second Kea agent. Enable with
+  `docker compose --profile dhcp --profile dhcp-ha up -d`.
+  Single-node deployments are unchanged — `--profile dhcp` alone
+  starts one peer as before. Fresh `.env` / `.env.example`
+  documentation reflects the new profile; both HA peers bootstrap
+  from the same `DHCP_AGENT_KEY` (no second secret to manage).
+
+- **`.env.example`: explicit secret-key generation commands.**
+  `SECRET_KEY` now carries an inline `openssl rand -hex 32`
+  (with a Python fallback) hint; Fernet key generation command
+  normalised from `python` → `python3` to match the host binary.
+
+- **Compose dev overlay service naming.** Renamed dev services
+  `dhcp-1` / `dhcp-2` → `dhcp-kea` / `dhcp-kea-2` so the dev
+  overlay is a clean build-from-source override of the published
+  image. Per-service volumes (`dhcp_kea_state_2`, etc.) split
+  out so the second peer isn't contending for the primary's
+  memfile lease CSV. Env vars documented inline on each service
+  (required / registration / TLS / tuning buckets).
+
+### Docs
+
+- `docs/drivers/DHCP_DRIVERS.md` — HA coordination subsection now
+  documents the port split (8000 HA / 8544 ctrl-agent), peer URL
+  resolution, `status-get` shape, bootstrap reload retry, and
+  calls out the scope-mirroring gap explicitly.
+
+- `CLAUDE.md` — Kea HA roadmap entry expanded with deferred
+  follow-ups: scope mirroring, peer IP re-resolve loop, Kea
+  version skew guard, DDNS double-write under HA, state-transition
+  actions, peer compatibility validation, and the missing HA e2e
+  test workflow.
+
+---
+
 ## 2026.04.21-1 — 2026-04-21
 
 Big feature push — Kea HA failover, OUI vendor lookup, IPv6
