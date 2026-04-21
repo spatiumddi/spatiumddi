@@ -68,7 +68,7 @@ import {
   SubnetImportExportButton,
 } from "./ImportExportModals";
 import { ResizeBlockModal, ResizeSubnetModal } from "./ResizeModals";
-import { cidrContains } from "@/lib/cidr";
+import { cidrContains, compareNetwork } from "@/lib/cidr";
 import { FreeSpaceBand } from "@/components/ipam/FreeSpaceBand";
 import {
   ContextMenu,
@@ -6871,8 +6871,46 @@ function buildBlockTree(
     .map((b) => ({
       block: b,
       children: buildBlockTree(blocks, subnets, b.id),
-      subnets: subnets.filter((s) => s.block_id === b.id),
-    }));
+      subnets: subnets
+        .filter((s) => s.block_id === b.id)
+        .slice()
+        .sort((x, y) => compareNetwork(String(x.network), String(y.network))),
+    }))
+    .sort((a, b) =>
+      compareNetwork(String(a.block.network), String(b.block.network)),
+    );
+}
+
+/**
+ * Merge a node's child blocks and direct subnets into a single list
+ * sorted by network address. Keeps the tree reading in sequential
+ * order — a supernet block with subnets nested inside it lands next
+ * to its IP-adjacent peers rather than being bucketed to the top or
+ * bottom of the sibling list.
+ */
+type TreeItem =
+  | { kind: "block"; node: BlockNode; key: string }
+  | { kind: "subnet"; subnet: Subnet; key: string };
+
+function sortedTreeItems(node: BlockNode): TreeItem[] {
+  const items: TreeItem[] = [
+    ...node.children.map(
+      (c): TreeItem => ({
+        kind: "block",
+        node: c,
+        key: String(c.block.network),
+      }),
+    ),
+    ...node.subnets.map(
+      (s): TreeItem => ({
+        kind: "subnet",
+        subnet: s,
+        key: String(s.network),
+      }),
+    ),
+  ];
+  items.sort((a, b) => compareNetwork(a.key, b.key));
+  return items;
 }
 
 // Flatten blocks into an indented label list for dropdowns
@@ -7513,37 +7551,42 @@ function BlockTreeRow({
         </ContextMenuContent>
       </ContextMenu>
 
-      {/* Children with vertical tree line */}
+      {/* Children with vertical tree line. Blocks and subnets are
+          interleaved in a single sort by network address so the tree
+          reads sequentially — a supernet block (e.g. 10.255.0.0/24)
+          with subnets inside it lands alongside its IP-adjacent peers
+          rather than being bucketed to the top or bottom. */}
       {expanded && hasContent && (
         <div className="ml-[9px] pl-3 border-l border-border/40 space-y-0.5">
-          {node.children.map((child) => (
-            <BlockTreeRow
-              key={child.block.id}
-              node={child}
-              selectedSubnetId={selectedSubnetId}
-              selectedBlockId={selectedBlockId}
-              onSelectBlock={onSelectBlock}
-              onSelectSubnet={onSelectSubnet}
-              onDeleteSubnet={onDeleteSubnet}
-              onDeleteBlock={onDeleteBlock}
-              onEditBlock={onEditBlock}
-              onCreateSubnet={onCreateSubnet}
-              onCreateChildBlock={onCreateChildBlock}
-              onAllocateIp={onAllocateIp}
-              depth={depth + 1}
-            />
-          ))}
-          {node.subnets.map((subnet) => (
-            <SubnetRow
-              key={subnet.id}
-              subnet={subnet}
-              isSelected={selectedSubnetId === subnet.id}
-              onSelect={() => onSelectSubnet(subnet)}
-              onDelete={() => onDeleteSubnet(subnet)}
-              onEdited={(updated) => onSelectSubnet(updated)}
-              onAllocateIp={onAllocateIp}
-            />
-          ))}
+          {sortedTreeItems(node).map((item) =>
+            item.kind === "block" ? (
+              <BlockTreeRow
+                key={`b:${item.node.block.id}`}
+                node={item.node}
+                selectedSubnetId={selectedSubnetId}
+                selectedBlockId={selectedBlockId}
+                onSelectBlock={onSelectBlock}
+                onSelectSubnet={onSelectSubnet}
+                onDeleteSubnet={onDeleteSubnet}
+                onDeleteBlock={onDeleteBlock}
+                onEditBlock={onEditBlock}
+                onCreateSubnet={onCreateSubnet}
+                onCreateChildBlock={onCreateChildBlock}
+                onAllocateIp={onAllocateIp}
+                depth={depth + 1}
+              />
+            ) : (
+              <SubnetRow
+                key={`s:${item.subnet.id}`}
+                subnet={item.subnet}
+                isSelected={selectedSubnetId === item.subnet.id}
+                onSelect={() => onSelectSubnet(item.subnet)}
+                onDelete={() => onDeleteSubnet(item.subnet)}
+                onEdited={(updated) => onSelectSubnet(updated)}
+                onAllocateIp={onAllocateIp}
+              />
+            ),
+          )}
           {node.children.length === 0 && node.subnets.length === 0 && (
             <p className="py-0.5 pl-2 text-xs text-muted-foreground/40">
               Empty
