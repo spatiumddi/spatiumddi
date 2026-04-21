@@ -6,6 +6,7 @@ from app.models.base import Base
 from app.models.dhcp import (
     DHCPClientClass,
     DHCPConfigOp,
+    DHCPFailoverChannel,
     DHCPLease,
     DHCPPool,
     DHCPRecordOp,
@@ -90,4 +91,5 @@ __all__ = [
     "DHCPLease",
     "DHCPConfigOp",
     "DHCPRecordOp",
+    "DHCPFailoverChannel",
 ]

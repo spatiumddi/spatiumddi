@@ -17,6 +17,7 @@ import structlog
 
 from .bootstrap import ensure_token
 from .config import AgentConfig
+from .ha_status import HAStatusPoller
 from .heartbeat import HeartbeatClient
 from .leases import LeaseWatcher
 from .sync import SyncLoop
@@ -29,13 +30,15 @@ def run(cfg: AgentConfig) -> int:
     token_ref = [token]
 
     heartbeat = HeartbeatClient(cfg, token_ref)
-    syncer = SyncLoop(cfg, token_ref, heartbeat)
+    ha_poller = HAStatusPoller(cfg, token_ref)
+    syncer = SyncLoop(cfg, token_ref, heartbeat, ha_poller=ha_poller)
     leases = LeaseWatcher(cfg, token_ref, heartbeat)
 
     threads = [
         threading.Thread(target=syncer.run, name="sync", daemon=True),
         threading.Thread(target=heartbeat.run, name="heartbeat", daemon=True),
         threading.Thread(target=leases.run, name="leases", daemon=True),
+        threading.Thread(target=ha_poller.run, name="ha-status", daemon=True),
     ]
     for t in threads:
         t.start()
@@ -48,6 +51,7 @@ def run(cfg: AgentConfig) -> int:
         heartbeat.stop()
         syncer.stop()
         leases.stop()
+        ha_poller.stop()
 
     signal.signal(signal.SIGTERM, _sig)
     signal.signal(signal.SIGINT, _sig)

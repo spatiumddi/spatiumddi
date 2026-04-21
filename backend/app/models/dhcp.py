@@ -95,6 +95,19 @@ class DHCPServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # leave this NULL — they authenticate via agent JWT.
     credentials_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
 
+    # Kea HA runtime state — populated by the agent's periodic
+    # ``ha-status-get`` poll (see ``app.tasks`` + agent supervisor).
+    # Null when the server is standalone. Values follow Kea's own
+    # state names: ``waiting`` / ``syncing`` / ``ready`` / ``normal``
+    # / ``communications-interrupted`` / ``partner-down`` /
+    # ``hot-standby`` / ``load-balancing`` / ``backup`` /
+    # ``passive-backup`` / ``terminated``. We treat this column as
+    # opaque reporting — no business logic branches on it beyond UI.
+    ha_state: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    ha_last_heartbeat_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
     group: Mapped[DHCPServerGroup | None] = relationship(
         "DHCPServerGroup", back_populates="servers", lazy="joined"
     )
@@ -106,6 +119,81 @@ class DHCPServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
     leases: Mapped[list[DHCPLease]] = relationship(
         "DHCPLease", back_populates="server", cascade="all, delete-orphan"
+    )
+
+
+# ── Failover channel (Kea HA) ────────────────────────────────────────────────
+
+
+class DHCPFailoverChannel(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """One Kea HA relationship between two DHCP servers.
+
+    Maps 1:1 to a ``libdhcp_ha.so`` hook config block on each peer.
+    A server can belong to at most one channel (unique FK constraints)
+    — Kea itself doesn't support being a member of multiple HA
+    relationships.
+
+    The channel is the config unit; each peer's role (``primary`` vs
+    ``secondary`` / ``standby``) is derived from whether its id matches
+    ``primary_server_id`` or ``secondary_server_id``. We keep the peer
+    URLs on the channel rather than on DHCPServer so that operators
+    editing the HA setup don't have to touch the server rows that
+    otherwise carry only server identity + driver state.
+
+    The ``mode`` field mirrors Kea's own terminology: ``hot-standby``
+    has one active peer + one passive standby; ``load-balancing`` has
+    both peers active and split traffic by client-identifier hash.
+    """
+
+    __tablename__ = "dhcp_failover_channel"
+    __table_args__ = (
+        UniqueConstraint("primary_server_id", name="uq_dhcp_failover_primary"),
+        UniqueConstraint("secondary_server_id", name="uq_dhcp_failover_secondary"),
+    )
+
+    name: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+
+    # mode: load-balancing | hot-standby
+    mode: Mapped[str] = mapped_column(String(20), nullable=False, default="hot-standby")
+
+    primary_server_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dhcp_server.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    secondary_server_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dhcp_server.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+
+    # Kea control-agent URLs that each peer uses to reach the other.
+    # Format: ``http://<host>:<port>/`` (typically port 8000 — the
+    # kea-ctrl-agent port shipped by the SpatiumDDI DHCP agent image).
+    primary_peer_url: Mapped[str] = mapped_column(String(512), nullable=False, default="")
+    secondary_peer_url: Mapped[str] = mapped_column(String(512), nullable=False, default="")
+
+    # HA hook tuning. Defaults mirror Kea's documented recommendations
+    # (kea-admin §5.1, "High Availability" hook). Expressed in
+    # milliseconds throughout because that's what Kea takes natively —
+    # surfacing a "seconds" alias is a UI concern, not a DB one.
+    heartbeat_delay_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=10000)
+    max_response_delay_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=60000)
+    max_ack_delay_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=10000)
+    max_unacked_clients: Mapped[int] = mapped_column(Integer, nullable=False, default=5)
+
+    # Whether a peer may autonomously transition to ``partner-down``
+    # after losing contact. Operators that want strict two-person-rule
+    # failover set this to False and use explicit maintenance /
+    # recovery commands instead.
+    auto_failover: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+    primary_server: Mapped[DHCPServer] = relationship(
+        "DHCPServer", foreign_keys=[primary_server_id], lazy="joined"
+    )
+    secondary_server: Mapped[DHCPServer] = relationship(
+        "DHCPServer", foreign_keys=[secondary_server_id], lazy="joined"
     )
 
 

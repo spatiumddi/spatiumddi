@@ -1,0 +1,119 @@
+"""HA-status poller — invokes Kea's ``ha-status-get`` and reports upstream.
+
+When the server is part of a DHCPFailoverChannel, the control plane
+emits the HA hook config and the local Kea daemon loads it. This
+module then periodically asks Kea for its HA state via the control
+socket and POSTs that state to
+``/api/v1/dhcp/agents/ha-status`` so the UI can render a live
+"HA: normal" / "HA: partner-down" pill.
+
+When the server is standalone (no failover block in the last bundle),
+the poller is a no-op. We key that off a shared flag set by the
+SyncLoop after each successful bundle apply — cheaper than re-parsing
+Kea state on every tick just to discover HA isn't configured.
+"""
+
+from __future__ import annotations
+
+import random
+import threading
+from typing import Any
+
+import httpx
+import structlog
+
+from .config import AgentConfig
+from .kea_ctrl import KeaCtrlError, send_command
+
+log = structlog.get_logger(__name__)
+
+
+def _extract_state(resp: dict[str, Any]) -> str | None:
+    """Pick the local peer's state out of Kea's ha-status-get response.
+
+    Kea 2.x nests under ``arguments.ha-servers.local.state``; older
+    builds flatten to ``arguments.local.state``. Accept either and
+    fall back to None so a schema change upstream just silently
+    renders as "unknown" instead of crashing the poller.
+    """
+    args = resp.get("arguments") or {}
+    ha = args.get("ha-servers") or args
+    local = ha.get("local") if isinstance(ha, dict) else None
+    if isinstance(local, dict):
+        state = local.get("state")
+        if isinstance(state, str) and state:
+            return state
+    return None
+
+
+class HAStatusPoller:
+    def __init__(self, cfg: AgentConfig, token_ref: list[str]):
+        self.cfg = cfg
+        self.token_ref = token_ref
+        self._stop = threading.Event()
+        # Flipped by the SyncLoop after each apply: True when the most
+        # recent bundle carried a ``failover`` block, False otherwise.
+        # Until we've seen at least one bundle we assume nothing.
+        self._enabled = False
+
+    def set_enabled(self, enabled: bool) -> None:
+        if enabled != self._enabled:
+            log.info("ha_poller_enabled_changed", enabled=enabled)
+        self._enabled = enabled
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def _client(self) -> httpx.Client:
+        verify: bool | str = True
+        if self.cfg.insecure_skip_tls_verify:
+            verify = False
+        elif self.cfg.tls_ca_path:
+            verify = self.cfg.tls_ca_path
+        return httpx.Client(
+            base_url=self.cfg.control_plane_url, verify=verify, timeout=10.0
+        )
+
+    def _poll_kea(self) -> tuple[str | None, dict[str, Any] | None]:
+        try:
+            resp = send_command(self.cfg.kea_control_socket, "ha-status-get")
+        except KeaCtrlError as e:
+            # Kea returns an error when the HA hook isn't loaded. That's
+            # the common case for standalone servers — log at debug so
+            # we don't spam the logs before an HA config gets pushed.
+            log.debug("ha_status_kea_err", error=str(e))
+            return None, None
+        except FileNotFoundError:
+            # Socket missing — Kea isn't up yet. Transient; wait.
+            return None, None
+        except Exception as e:  # noqa: BLE001 — don't let the poller die on network / JSON oddities
+            log.warning("ha_status_kea_unexpected", error=str(e))
+            return None, None
+        return _extract_state(resp), resp.get("arguments")
+
+    def _report(self, state: str, raw: dict[str, Any] | None) -> None:
+        try:
+            with self._client() as c:
+                resp = c.post(
+                    "/api/v1/dhcp/agents/ha-status",
+                    json={"state": state, "raw": raw or {}},
+                    headers={"Authorization": f"Bearer {self.token_ref[0]}"},
+                )
+            if resp.status_code not in (200, 204):
+                log.warning("ha_status_report_failed", status=resp.status_code)
+        except httpx.HTTPError as e:
+            log.warning("ha_status_report_http_error", error=str(e))
+
+    def run(self) -> None:
+        while not self._stop.is_set():
+            if self._enabled:
+                state, raw = self._poll_kea()
+                if state is not None:
+                    self._report(state, raw)
+            # 15s base cadence + small jitter so N paired peers don't
+            # hit the control plane in lockstep. HA state changes
+            # propagate as fast as heartbeats detect them (Kea's own
+            # heartbeat-delay is typically 10s), so polling faster than
+            # every 10s gains nothing.
+            interval = 15.0 + random.uniform(-2, 2)
+            self._stop.wait(timeout=max(5.0, interval))

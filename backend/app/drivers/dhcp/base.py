@@ -100,6 +100,27 @@ class ServerOptionsDef:
     lease_time: int = 86400
 
 
+@dataclass(frozen=True)
+class FailoverConfig:
+    """Kea HA (``libdhcp_ha.so``) configuration for one peer.
+
+    Carried on ``ConfigBundle.failover`` when the server belongs to a
+    ``DHCPFailoverChannel``. ``this_server_name`` tells the local peer
+    which of the two entries in ``peers`` refers to itself — Kea keys
+    HA rules off the matching ``name``.
+    """
+
+    channel_id: str
+    channel_name: str
+    mode: str  # load-balancing | hot-standby
+    this_server_name: str  # name used in the local peer's "this-server-name"
+    peers: tuple[dict[str, Any], ...]  # [{name, url, role, auto-failover}, ...]
+    heartbeat_delay_ms: int = 10000
+    max_response_delay_ms: int = 60000
+    max_ack_delay_ms: int = 10000
+    max_unacked_clients: int = 5
+
+
 @dataclass
 class ConfigBundle:
     """Everything an agent needs to configure and run a DHCP daemon.
@@ -117,6 +138,10 @@ class ConfigBundle:
     client_classes: tuple[ClientClassDef, ...]
     generated_at: datetime
     etag: str = ""
+    # Populated when the server belongs to a DHCPFailoverChannel. The
+    # agent's Kea renderer injects ``libdhcp_ha.so`` + the ``high-
+    # availability`` config block when this is present.
+    failover: FailoverConfig | None = None
 
     def compute_etag(self) -> str:
         """Compute a stable SHA-256 of the bundle contents (excluding etag/timestamp)."""
@@ -128,6 +153,7 @@ class ConfigBundle:
             "options": asdict(self.options),
             "scopes": [asdict(s) for s in self.scopes],
             "client_classes": [asdict(c) for c in self.client_classes],
+            "failover": asdict(self.failover) if self.failover else None,
         }
         blob = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
         return "sha256:" + hashlib.sha256(blob).hexdigest()

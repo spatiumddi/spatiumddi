@@ -80,6 +80,24 @@ class AgentHeartbeatResponse(BaseModel):
     rotated_expires_at: datetime | None = None
 
 
+class HAStatusReport(BaseModel):
+    """One ``ha-status-get`` observation, relayed upstream by the agent.
+
+    ``state`` matches the Kea state names verbatim so the UI can
+    present them without translation (``waiting`` / ``syncing`` /
+    ``ready`` / ``normal`` / ``communications-interrupted`` /
+    ``partner-down`` / ``hot-standby`` / ``load-balancing`` /
+    ``backup`` / ``passive-backup`` / ``terminated``).
+
+    ``raw`` carries the full Kea response so future additions like
+    ``unsent-update-count`` / ``in-touch`` show up in the UI without a
+    schema change here.
+    """
+
+    state: str
+    raw: dict[str, Any] | None = None
+
+
 class LeaseEvent(BaseModel):
     ip_address: str
     mac_address: str
@@ -324,6 +342,26 @@ async def agent_config_longpoll(
                         }
                         for c in bundle.client_classes
                     ],
+                    # Kea HA hook configuration — absent when the
+                    # server isn't part of a failover channel. The
+                    # agent's render_kea.py keys off the presence of
+                    # this ``peers`` list to decide whether to emit
+                    # ``libdhcp_ha.so``.
+                    "failover": (
+                        {
+                            "channel_id": bundle.failover.channel_id,
+                            "channel_name": bundle.failover.channel_name,
+                            "mode": bundle.failover.mode,
+                            "this_server_name": bundle.failover.this_server_name,
+                            "peers": list(bundle.failover.peers),
+                            "heartbeat_delay_ms": bundle.failover.heartbeat_delay_ms,
+                            "max_response_delay_ms": bundle.failover.max_response_delay_ms,
+                            "max_ack_delay_ms": bundle.failover.max_ack_delay_ms,
+                            "max_unacked_clients": bundle.failover.max_unacked_clients,
+                        }
+                        if bundle.failover is not None
+                        else None
+                    ),
                 },
                 "pending_ops": pending_ops,
             }
@@ -519,6 +557,27 @@ async def agent_lease_events(
 
     await db.commit()
     return {"upserted": upserted}
+
+
+@router.post("/ha-status")
+async def agent_ha_status(
+    body: HAStatusReport,
+    db: DB,
+    auth: tuple[DHCPServer, dict[str, Any]] = Depends(_auth_agent),
+) -> dict[str, str]:
+    """Update this server's Kea HA state from the agent's periodic poll.
+
+    Idempotent — the agent is free to call this as often as it wants
+    (typical cadence is every 15-30s alongside its existing heartbeat).
+    Only updates the two ``ha_*`` columns on DHCPServer; never rewrites
+    config or creates audit rows. Drift-free reporting is out of band
+    from the config push path.
+    """
+    server, _ = auth
+    server.ha_state = body.state
+    server.ha_last_heartbeat_at = datetime.now(UTC)
+    await db.commit()
+    return {"status": "ok"}
 
 
 @router.post("/ops/{op_id}/ack")

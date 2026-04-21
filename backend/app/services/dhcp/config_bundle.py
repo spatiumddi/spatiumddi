@@ -9,20 +9,83 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.drivers.dhcp.base import (
     ClientClassDef,
     ConfigBundle,
+    FailoverConfig,
     PoolDef,
     ScopeDef,
     ServerOptionsDef,
     StaticAssignmentDef,
 )
-from app.models.dhcp import DHCPClientClass, DHCPScope, DHCPServer
+from app.models.dhcp import (
+    DHCPClientClass,
+    DHCPFailoverChannel,
+    DHCPScope,
+    DHCPServer,
+)
 from app.models.ipam import Subnet
+
+
+async def _resolve_failover(db: AsyncSession, server: DHCPServer) -> FailoverConfig | None:
+    """Return the FailoverConfig for ``server`` if it's in a channel.
+
+    The HA hook requires each peer to know BOTH peer definitions, so we
+    emit the full ``peers`` array regardless of which role this server
+    plays. ``this_server_name`` tells Kea which entry is "us".
+
+    Server name is what the agent ships as ``this-server-name`` and
+    what the other peer refers to us as; we key it off
+    ``DHCPServer.name`` since that's already unique.
+    """
+    row = (
+        await db.execute(
+            select(DHCPFailoverChannel).where(
+                or_(
+                    DHCPFailoverChannel.primary_server_id == server.id,
+                    DHCPFailoverChannel.secondary_server_id == server.id,
+                )
+            )
+        )
+    ).scalar_one_or_none()
+    if row is None:
+        return None
+
+    primary = row.primary_server
+    secondary = row.secondary_server
+    # For hot-standby mode the second server is the "standby"; for
+    # load-balancing it's the "secondary" (Kea naming). The roles
+    # list Kea accepts is {primary, secondary, standby, backup}.
+    secondary_role = "standby" if row.mode == "hot-standby" else "secondary"
+    peers: list[dict] = [
+        {
+            "name": primary.name,
+            "url": row.primary_peer_url or "",
+            "role": "primary",
+            "auto-failover": row.auto_failover,
+        },
+        {
+            "name": secondary.name,
+            "url": row.secondary_peer_url or "",
+            "role": secondary_role,
+            "auto-failover": row.auto_failover,
+        },
+    ]
+    return FailoverConfig(
+        channel_id=str(row.id),
+        channel_name=row.name,
+        mode=row.mode,
+        this_server_name=server.name,
+        peers=tuple(peers),
+        heartbeat_delay_ms=row.heartbeat_delay_ms,
+        max_response_delay_ms=row.max_response_delay_ms,
+        max_ack_delay_ms=row.max_ack_delay_ms,
+        max_unacked_clients=row.max_unacked_clients,
+    )
 
 
 async def build_config_bundle(db: AsyncSession, server: DHCPServer) -> ConfigBundle:
@@ -111,6 +174,7 @@ async def build_config_bundle(db: AsyncSession, server: DHCPServer) -> ConfigBun
         for c in cc_rows
     )
 
+    failover = await _resolve_failover(db, server)
     bundle = ConfigBundle(
         server_id=str(server.id),
         server_name=server.name,
@@ -120,6 +184,7 @@ async def build_config_bundle(db: AsyncSession, server: DHCPServer) -> ConfigBun
         scopes=tuple(scopes),
         client_classes=client_classes,
         generated_at=datetime.now(UTC),
+        failover=failover,
     )
     bundle.etag = bundle.compute_etag()
     return bundle

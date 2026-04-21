@@ -160,6 +160,39 @@ def _subnet(subnet: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _ha_hook(failover: dict[str, Any]) -> dict[str, Any]:
+    """Render the ``libdhcp_ha.so`` hook entry from a failover payload.
+
+    Shape mirrors Kea's HA hook reference (ARM §14.3): the hook takes
+    a ``parameters`` dict that in turn contains a ``high-availability``
+    list with one entry per relationship. Each entry has
+    ``this-server-name``, ``mode``, a ``peers`` array, and heartbeat
+    tuning.
+    """
+    peers = [
+        {
+            "name": p["name"],
+            "url": p["url"],
+            "role": p["role"],
+            "auto-failover": bool(p.get("auto-failover", True)),
+        }
+        for p in failover["peers"]
+    ]
+    relationship = {
+        "this-server-name": failover["this_server_name"],
+        "mode": failover["mode"],
+        "heartbeat-delay": int(failover.get("heartbeat_delay_ms", 10000)),
+        "max-response-delay": int(failover.get("max_response_delay_ms", 60000)),
+        "max-ack-delay": int(failover.get("max_ack_delay_ms", 10000)),
+        "max-unacked-clients": int(failover.get("max_unacked_clients", 5)),
+        "peers": peers,
+    }
+    return {
+        "library": "/usr/lib/kea/hooks/libdhcp_ha.so",
+        "parameters": {"high-availability": [relationship]},
+    }
+
+
 def render(
     bundle: dict[str, Any],
     *,
@@ -207,6 +240,14 @@ def render(
             }
         ],
     }
+
+    # HA hook — only present when the control plane pins this server to
+    # a DHCPFailoverChannel. Kea rejects a config that references
+    # ``libdhcp_ha.so`` without matching ``libdhcp_lease_cmds.so``, so
+    # the lease_cmds hook above is load-bearing here too.
+    failover = bundle.get("failover")
+    if isinstance(failover, dict) and failover.get("peers"):
+        dhcp4["hooks-libraries"].append(_ha_hook(failover))
 
     opts = _options_from_mapping(bundle.get("global_options"))
     if opts:

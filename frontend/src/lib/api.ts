@@ -2251,6 +2251,12 @@ export interface DHCPServer {
   agent_version: string | null;
   config_etag: string | null;
   config_pushed_at: string | null;
+  // Populated by the agent's periodic ha-status-get poll. Null for
+  // standalone servers. Kea state names: waiting / syncing / ready /
+  // normal / communications-interrupted / partner-down / hot-standby
+  // / load-balancing / backup / passive-backup / terminated.
+  ha_state?: string | null;
+  ha_last_heartbeat_at?: string | null;
   // True once Windows admin credentials have been stored on this server.
   // The password itself is never returned — set via `windows_credentials`
   // on the create/update body.
@@ -2317,6 +2323,45 @@ export interface DHCPScope {
   modified_at: string;
 }
 
+export interface DHCPFailoverChannel {
+  id: string;
+  name: string;
+  description: string;
+  mode: "hot-standby" | "load-balancing";
+  primary_server_id: string;
+  secondary_server_id: string;
+  primary_server_name: string;
+  secondary_server_name: string;
+  primary_peer_url: string;
+  secondary_peer_url: string;
+  heartbeat_delay_ms: number;
+  max_response_delay_ms: number;
+  max_ack_delay_ms: number;
+  max_unacked_clients: number;
+  auto_failover: boolean;
+  primary_ha_state: string | null;
+  secondary_ha_state: string | null;
+  primary_ha_last_heartbeat_at: string | null;
+  secondary_ha_last_heartbeat_at: string | null;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface DHCPFailoverChannelCreate {
+  name: string;
+  description?: string;
+  mode?: "hot-standby" | "load-balancing";
+  primary_server_id: string;
+  secondary_server_id: string;
+  primary_peer_url?: string;
+  secondary_peer_url?: string;
+  heartbeat_delay_ms?: number;
+  max_response_delay_ms?: number;
+  max_ack_delay_ms?: number;
+  max_unacked_clients?: number;
+  auto_failover?: boolean;
+}
+
 export const dhcpApi = {
   listGroups: () =>
     api.get<DHCPServerGroup[]>("/dhcp/server-groups").then((r) => r.data),
@@ -2372,6 +2417,28 @@ export const dhcpApi = {
     api
       .get<DHCPLease[]>(`/dhcp/servers/${id}/leases`, { params })
       .then((r) => r.data),
+
+  listFailoverChannels: () =>
+    api
+      .get<DHCPFailoverChannel[]>("/dhcp/failover-channels")
+      .then((r) => r.data),
+  getFailoverChannel: (id: string) =>
+    api
+      .get<DHCPFailoverChannel>(`/dhcp/failover-channels/${id}`)
+      .then((r) => r.data),
+  createFailoverChannel: (data: DHCPFailoverChannelCreate) =>
+    api
+      .post<DHCPFailoverChannel>("/dhcp/failover-channels", data)
+      .then((r) => r.data),
+  updateFailoverChannel: (
+    id: string,
+    data: Partial<DHCPFailoverChannelCreate>,
+  ) =>
+    api
+      .patch<DHCPFailoverChannel>(`/dhcp/failover-channels/${id}`, data)
+      .then((r) => r.data),
+  deleteFailoverChannel: (id: string) =>
+    api.delete(`/dhcp/failover-channels/${id}`),
 
   listScopesBySubnet: (subnetId: string) =>
     api

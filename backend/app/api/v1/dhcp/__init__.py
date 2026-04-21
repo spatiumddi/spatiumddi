@@ -4,6 +4,7 @@ from fastapi import APIRouter
 
 from app.api.v1.dhcp.agents import router as agents_router
 from app.api.v1.dhcp.client_classes import router as client_classes_router
+from app.api.v1.dhcp.failover_channels import router as failover_channels_router
 from app.api.v1.dhcp.pools import router as pools_router
 from app.api.v1.dhcp.scopes import router as scopes_router
 from app.api.v1.dhcp.server_groups import router as server_groups_router
@@ -17,6 +18,7 @@ router.include_router(scopes_router)
 router.include_router(pools_router)
 router.include_router(statics_router)
 router.include_router(client_classes_router)
+router.include_router(failover_channels_router)
 router.include_router(agents_router)
 
 __all__ = ["router"]

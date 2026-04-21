@@ -37,10 +37,17 @@ _OFFLINE_RETRY_SECONDS = 60.0
 
 
 class SyncLoop:
-    def __init__(self, cfg: AgentConfig, token_ref: list[str], heartbeat: Any):
+    def __init__(
+        self,
+        cfg: AgentConfig,
+        token_ref: list[str],
+        heartbeat: Any,
+        ha_poller: Any | None = None,
+    ):
         self.cfg = cfg
         self.token_ref = token_ref
         self.heartbeat = heartbeat
+        self.ha_poller = ha_poller
         self._stop = threading.Event()
         self._current_etag: str | None = None
         self._consecutive_failures = 0
@@ -73,12 +80,26 @@ class SyncLoop:
         )
 
     def _apply_bundle(self, bundle: dict[str, Any], *, reload_kea: bool) -> None:
-        """Render bundle → write Kea config → reload daemon."""
+        """Render bundle → write Kea config → reload daemon.
+
+        The control-plane long-poll returns an envelope ``{server_id,
+        etag, bundle: {...}, pending_ops}``. The render expects the
+        inner dict. Fall back to the envelope if ``bundle`` isn't
+        there so cached v0 responses (pre-envelope) still render.
+        """
+        inner = bundle.get("bundle") if isinstance(bundle.get("bundle"), dict) else bundle
         rendered = render_kea(
-            bundle,
+            inner,
             control_socket=str(self.cfg.kea_control_socket),
             lease_file=str(self.cfg.kea_lease_file),
         )
+        # Keep the HA poller aligned with whether Kea is about to load
+        # the HA hook — when the bundle has no failover block the hook
+        # won't be loaded, so we don't want the poller spamming
+        # ha-status-get (and logging errors) against a daemon that
+        # won't answer.
+        if self.ha_poller is not None:
+            self.ha_poller.set_enabled(bool(inner.get("failover")))
         # Write to rendered/ (for audit) and then to the live Kea config path.
         save_rendered_kea(self.cfg.state_dir, rendered)
         tmp = self.cfg.kea_config_path.with_suffix(self.cfg.kea_config_path.suffix + ".tmp")

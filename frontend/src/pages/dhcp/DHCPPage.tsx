@@ -1212,6 +1212,31 @@ function ServerDetailView({
               <span className="rounded-full bg-muted px-2 py-0.5 text-xs">
                 {server.driver}
               </span>
+              {server.ha_state && (
+                <span
+                  title={
+                    server.ha_last_heartbeat_at
+                      ? `Last HA heartbeat ${new Date(
+                          server.ha_last_heartbeat_at,
+                        ).toLocaleString()}`
+                      : "No HA heartbeat received yet"
+                  }
+                  className={cn(
+                    "rounded-full px-2 py-0.5 text-xs font-medium",
+                    server.ha_state === "partner-down" ||
+                      server.ha_state === "terminated"
+                      ? "bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300"
+                      : server.ha_state === "normal" ||
+                          server.ha_state === "hot-standby" ||
+                          server.ha_state === "load-balancing" ||
+                          server.ha_state === "ready"
+                        ? "bg-emerald-100 text-emerald-800 dark:bg-emerald-900/30 dark:text-emerald-300"
+                        : "bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-300",
+                  )}
+                >
+                  HA: {server.ha_state}
+                </span>
+              )}
               {!server.agent_approved && !server.is_agentless && (
                 <span className="rounded-full bg-amber-100 px-2 py-0.5 text-xs text-amber-800 dark:bg-amber-900/30 dark:text-amber-400">
                   pending approval

@@ -118,6 +118,10 @@ class ServerResponse(BaseModel):
     has_credentials: bool
     is_agentless: bool
     is_read_only: bool
+    # Kea HA state — latest value reported by the agent's
+    # ``ha-status-get`` poll. Null for standalone servers.
+    ha_state: str | None = None
+    ha_last_heartbeat_at: datetime | None = None
     created_at: datetime
     modified_at: datetime
 
@@ -152,6 +156,8 @@ class ServerResponse(BaseModel):
             has_credentials=bool(s.credentials_encrypted),
             is_agentless=agentless,
             is_read_only=is_read_only(s.driver),
+            ha_state=s.ha_state,
+            ha_last_heartbeat_at=s.ha_last_heartbeat_at,
             created_at=s.created_at,
             modified_at=s.modified_at,
         )

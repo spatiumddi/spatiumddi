@@ -286,13 +286,24 @@ Phase 1 IPv6 closure + the Phase 2/3 DDNS / zone-state / CI-hardening items all 
   CRUD has no `view_id` assignment UI. The storage side is ready;
   what's missing is driver rendering + record-level view selection
   + UI binding on the record form. Phase 3.
-- ⬜ **DHCP state failover (Kea HA)** — peer-level failover
-  configuration rendered into Kea's `high-availability` hook,
-  heartbeat channel, lease-replication state machine (Normal /
-  Communications-Interrupted / Partner-Down / Recover /
-  Load-Balancing / Hot-Standby). Requires agent support on both
-  peers, a new `DHCPFailoverChannel` model, and UI for peer
-  configuration + state-transition actions. Phase 3–4.
+- ✅ **DHCP state failover (Kea HA) — core** — `DHCPFailoverChannel`
+  model pairs two Kea DHCPServer rows with mode (`hot-standby` /
+  `load-balancing`), per-peer `kea-ctrl-agent` URL, and heartbeat /
+  max-response / max-ack / max-unacked tuning. `ConfigBundle` carries
+  a `FailoverConfig` when the server is in a channel; the agent's
+  `render_kea.py` injects `libdhcp_ha.so` + `high-availability`
+  alongside the existing `libdhcp_lease_cmds.so` hook. Agent
+  supervises an `HAStatusPoller` thread that calls `ha-status-get`
+  on the local Kea control socket every ~15s when HA is active and
+  POSTs state to `/api/v1/dhcp/agents/ha-status`; the control plane
+  stores it on `DHCPServer.ha_state` + `ha_last_heartbeat_at`. Admin
+  page at `/admin/failover-channels` does CRUD; DHCP server detail
+  header shows a live HA pill (red / amber / green by Kea state
+  name). **Deferred follow-ups:** state-transition actions
+  (`ha-maintenance-start`, `ha-continue`, force-sync) — the state
+  machine is observable today but operators can't drive it from the
+  UI; peer compatibility validation (e.g. refusing pairs without
+  overlapping subnets); per-pool HA scope tuning for load-balancing.
 - ✅ **Alerts framework (v1)** — `AlertRule` + `AlertEvent` tables;
   evaluator at `services/alerts.py:evaluate_all()` runs from
   `app.tasks.alerts.evaluate_alerts` on a 60 s beat tick. Two rule
