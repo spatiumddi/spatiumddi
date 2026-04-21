@@ -20,6 +20,7 @@ from .config import AgentConfig
 from .ha_status import HAStatusPoller
 from .heartbeat import HeartbeatClient
 from .leases import LeaseWatcher
+from .peer_resolve import PeerResolveWatcher
 from .sync import SyncLoop
 
 log = structlog.get_logger(__name__)
@@ -31,7 +32,18 @@ def run(cfg: AgentConfig) -> int:
 
     heartbeat = HeartbeatClient(cfg, token_ref)
     ha_poller = HAStatusPoller(cfg, token_ref)
-    syncer = SyncLoop(cfg, token_ref, heartbeat, ha_poller=ha_poller)
+    # Placeholder watcher — we need the syncer to exist before we can
+    # give the watcher its apply callback. Construct both and wire.
+    syncer_holder: list[SyncLoop] = []
+    peer_watcher = PeerResolveWatcher(
+        apply_fn=lambda bundle, reload_kea=True: syncer_holder[0]._apply_bundle(
+            bundle, reload_kea=reload_kea
+        )
+    )
+    syncer = SyncLoop(
+        cfg, token_ref, heartbeat, ha_poller=ha_poller, peer_watcher=peer_watcher
+    )
+    syncer_holder.append(syncer)
     leases = LeaseWatcher(cfg, token_ref, heartbeat)
 
     threads = [
@@ -39,6 +51,7 @@ def run(cfg: AgentConfig) -> int:
         threading.Thread(target=heartbeat.run, name="heartbeat", daemon=True),
         threading.Thread(target=leases.run, name="leases", daemon=True),
         threading.Thread(target=ha_poller.run, name="ha-status", daemon=True),
+        threading.Thread(target=peer_watcher.run, name="peer-resolve", daemon=True),
     ]
     for t in threads:
         t.start()
@@ -52,6 +65,7 @@ def run(cfg: AgentConfig) -> int:
         syncer.stop()
         leases.stop()
         ha_poller.stop()
+        peer_watcher.stop()
 
     signal.signal(signal.SIGTERM, _sig)
     signal.signal(signal.SIGINT, _sig)

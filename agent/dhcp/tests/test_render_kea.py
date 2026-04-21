@@ -105,3 +105,100 @@ def test_lease_cmds_hook_enabled() -> None:
     out = render({"server": {}, "subnets": []})
     libs = [h["library"] for h in out["Dhcp4"]["hooks-libraries"]]
     assert any("libdhcp_lease_cmds.so" in lib for lib in libs)
+
+
+# ── Canonical wire-shape (``scopes``) — the real payload agents receive ──
+
+
+@pytest.fixture
+def wire_bundle() -> dict:
+    """Shape matches ``backend/app/api/v1/dhcp/agents.py`` serialization."""
+    return {
+        "etag": "sha256:test",
+        "server_name": "dhcp-kea",
+        "driver": "kea",
+        "roles": [],
+        "scopes": [
+            {
+                "subnet_cidr": "10.20.0.0/21",
+                "lease_time": 3600,
+                "options": {
+                    "routers": ["10.20.0.1"],
+                    "dns_servers": ["10.20.0.2"],
+                },
+                "pools": [
+                    {
+                        "start_ip": "10.20.0.10",
+                        "end_ip": "10.20.7.254",
+                        "pool_type": "dynamic",
+                    },
+                    {
+                        "start_ip": "10.20.0.100",
+                        "end_ip": "10.20.0.110",
+                        "pool_type": "excluded",
+                    },
+                ],
+                "statics": [
+                    {
+                        "ip_address": "10.20.0.50",
+                        "mac_address": "aa:bb:cc:dd:ee:ff",
+                        "hostname": "printer1",
+                    }
+                ],
+                "ddns_enabled": False,
+            }
+        ],
+        "client_classes": [
+            {
+                "name": "voip",
+                "match_expression": "substring(option[60].hex,0,12) == 'Cisco-Phone'",
+                "options": {},
+            }
+        ],
+    }
+
+
+def test_render_wire_shape_subnet_and_dynamic_pool(wire_bundle: dict) -> None:
+    out = render(wire_bundle)
+    subs = out["Dhcp4"]["subnet4"]
+    assert len(subs) == 1
+    assert subs[0]["subnet"] == "10.20.0.0/21"
+    # id is a stable positive int derived from the CIDR
+    assert isinstance(subs[0]["id"], int) and subs[0]["id"] > 0
+    # Only the dynamic pool makes it through — excluded pools are
+    # IPAM-level and must not become Kea lease pools.
+    assert subs[0]["pools"] == [{"pool": "10.20.0.10 - 10.20.7.254"}]
+
+
+def test_render_wire_shape_reservation_from_statics(wire_bundle: dict) -> None:
+    out = render(wire_bundle)
+    resv = out["Dhcp4"]["subnet4"][0]["reservations"]
+    assert resv[0]["hw-address"] == "aa:bb:cc:dd:ee:ff"
+    assert resv[0]["ip-address"] == "10.20.0.50"
+    assert resv[0]["hostname"] == "printer1"
+
+
+def test_render_wire_shape_client_class_match_expression(wire_bundle: dict) -> None:
+    out = render(wire_bundle)
+    cc = out["Dhcp4"]["client-classes"]
+    assert cc[0]["name"] == "voip"
+    assert "Cisco-Phone" in cc[0]["test"]
+
+
+def test_render_wire_shape_subnet_id_is_stable() -> None:
+    """Kea keys leases off subnet-id — the same CIDR must always hash
+    to the same id across renders, otherwise a config reload would
+    orphan every active lease."""
+    bundle = {
+        "scopes": [
+            {
+                "subnet_cidr": "192.0.2.0/24",
+                "lease_time": 3600,
+                "pools": [],
+                "statics": [],
+            }
+        ]
+    }
+    out1 = render(bundle)
+    out2 = render(bundle)
+    assert out1["Dhcp4"]["subnet4"][0]["id"] == out2["Dhcp4"]["subnet4"][0]["id"]

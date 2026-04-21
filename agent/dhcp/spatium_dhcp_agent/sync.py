@@ -52,11 +52,13 @@ class SyncLoop:
         token_ref: list[str],
         heartbeat: Any,
         ha_poller: Any | None = None,
+        peer_watcher: Any | None = None,
     ):
         self.cfg = cfg
         self.token_ref = token_ref
         self.heartbeat = heartbeat
         self.ha_poller = ha_poller
+        self.peer_watcher = peer_watcher
         self._stop = threading.Event()
         self._current_etag: str | None = None
         self._consecutive_failures = 0
@@ -164,6 +166,14 @@ class SyncLoop:
                     "status": "degraded",
                     "reason": f"reload_failed: {last_err}",
                 }
+        # Feed the peer-resolve watcher the bundle so it can track
+        # hostname → IP drift and trigger a re-render if any peer's
+        # IP changes. No-op when the bundle has no failover block.
+        if self.peer_watcher is not None:
+            try:
+                self.peer_watcher.set_bundle(bundle)
+            except Exception:  # noqa: BLE001 — defensive; never block apply
+                log.exception("peer_watcher_set_bundle_failed")
 
     def _record_failure(self, reason: str) -> None:
         self._consecutive_failures += 1

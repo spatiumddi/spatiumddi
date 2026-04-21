@@ -44,6 +44,7 @@ rely on clients receiving the NTP server list via DHCP.
 
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import socket
 from typing import Any
@@ -164,6 +165,62 @@ def _subnet(subnet: dict[str, Any]) -> dict[str, Any]:
         out["interface"] = subnet["interface"]
     if subnet.get("relay_ips"):
         out["relay"] = {"ip-addresses": list(subnet["relay_ips"])}
+    return out
+
+
+def _stable_subnet_id(cidr: str) -> int:
+    """Derive a deterministic Kea subnet-id from the CIDR.
+
+    Kea tracks leases by subnet-id and loses them if the id changes
+    between renders. The control-plane wire format carries no numeric
+    id, so we hash the CIDR into a stable uint32. Never zero (Kea
+    treats 0 as "unassigned").
+    """
+    digest = hashlib.sha256(cidr.encode("utf-8")).digest()
+    n = int.from_bytes(digest[:4], "big")
+    return n or 1
+
+
+def _scope_to_subnet(scope: dict[str, Any]) -> dict[str, Any]:
+    """Translate a wire-shape ScopeDef dict into a Kea subnet4 entry.
+
+    Wire shape (from ``backend/app/api/v1/dhcp/agents.py``):
+      {subnet_cidr, lease_time, options, pools:[{start_ip,end_ip,pool_type}],
+       statics:[{ip_address,mac_address,hostname}], ddns_enabled}
+    """
+    cidr = scope["subnet_cidr"]
+    out: dict[str, Any] = {
+        "id": _stable_subnet_id(cidr),
+        "subnet": cidr,
+    }
+    # Only dynamic pools are Kea lease pools; excluded/reserved ranges
+    # are IPAM-level bookkeeping and must NOT be offered as pools.
+    dyn = [
+        p
+        for p in (scope.get("pools") or [])
+        if (p.get("pool_type") or "dynamic") == "dynamic"
+    ]
+    if dyn:
+        out["pools"] = [{"pool": f"{p['start_ip']} - {p['end_ip']}"} for p in dyn]
+    opts = _options_from_mapping(scope.get("options"))
+    if opts:
+        out["option-data"] = opts
+    resv = [
+        _reservation(
+            {
+                "ip_address": s["ip_address"],
+                "hw_address": s["mac_address"],
+                "hostname": s.get("hostname") or "",
+                "client_id": s.get("client_id"),
+                "options": s.get("options_override"),
+            }
+        )
+        for s in (scope.get("statics") or [])
+    ]
+    if resv:
+        out["reservations"] = resv
+    if scope.get("lease_time"):
+        out["valid-lifetime"] = int(scope["lease_time"])
     return out
 
 
@@ -297,14 +354,27 @@ def render(
     if opts:
         dhcp4["option-data"] = opts
 
-    dhcp4["subnet4"] = [_subnet(s) for s in (bundle.get("subnets") or [])]
+    # Prefer the canonical control-plane wire shape (``scopes``). Fall
+    # back to the legacy pre-translated ``subnets`` shape for tests /
+    # hand-crafted bundles that still use it.
+    scopes = bundle.get("scopes")
+    if scopes is not None:
+        dhcp4["subnet4"] = [_scope_to_subnet(s) for s in scopes]
+    else:
+        dhcp4["subnet4"] = [_subnet(s) for s in (bundle.get("subnets") or [])]
 
+    # Client classes: wire carries ``match_expression``, legacy/hand-
+    # crafted fixtures carry ``test``. Accept either.
     classes = bundle.get("client_classes") or []
     if classes:
         dhcp4["client-classes"] = [
             {
                 "name": c["name"],
-                **({"test": c["test"]} if c.get("test") else {}),
+                **(
+                    {"test": c.get("test") or c.get("match_expression")}
+                    if (c.get("test") or c.get("match_expression"))
+                    else {}
+                ),
                 **(
                     {"option-data": _options_from_mapping(c.get("options"))}
                     if c.get("options")

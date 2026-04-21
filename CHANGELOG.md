@@ -7,7 +7,53 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versioning uses 
 
 ## Unreleased
 
-_No unreleased changes yet._
+### Fixed
+
+- **Kea agent: scopes + pools now actually render.** The agent's
+  `render_kea.py` has been reading `bundle["subnets"]` since the first
+  Kea commit (Apr 15), but the control plane has always shipped
+  `bundle["scopes"]` with `ScopeDef` fields (`subnet_cidr`, `pools`
+  with `{start_ip, end_ip, pool_type}`, `statics` with `{ip_address,
+  mac_address}`). The shape mismatch meant every Kea config reload
+  emitted `subnet4: []` — no scopes, no pools, no leases served. Only
+  surfaced now because HA + a real scope in the same bundle hit the
+  empty-subnet path on a fresh install. Renderer now consumes the
+  canonical wire shape natively; excluded/reserved pools filtered out
+  (those are IPAM-only bookkeeping, not Kea pools); a stable
+  sha256-derived subnet-id ensures Kea's lease database doesn't orphan
+  leases on re-render.
+- **Kea HA: peer IP drift now self-heals.** New `PeerResolveWatcher`
+  background thread re-resolves HA peer hostnames every 30s; if any
+  peer's IP has changed (compose `--force-recreate`, k8s pod restart,
+  bridge-IP reshuffle) it triggers a render + reload with the fresh
+  URL. Closes the "Peer IP re-resolve loop" deferred follow-up from
+  2026.04.21-2.
+- **Kea agent: stale PID files no longer block restart.** Kea only
+  removes its own PID file on graceful shutdown — SIGKILL and hard
+  crashes leave it behind, and `createPIDFile` refuses to start with
+  `DHCP4_ALREADY_RUNNING` / `DCTL_ALREADY_RUNNING`. Entrypoint now
+  scrubs `/run/kea/*.pid` both at container start and before each
+  supervise-loop retry, so `docker compose restart` (and any signal
+  storm) brings Kea back cleanly.
+- **Kea agent: daemons now supervised with crash-retry + signal
+  forwarding.** Both `kea-dhcp4` and `kea-ctrl-agent` run under a
+  retry loop that restarts the daemon on transient failures (bind
+  race against Docker/k8s networking during restart, partner flap).
+  Fast crashes count toward a 5-in-30s crash-loop guard; long-running
+  daemon exits reset the counter. SIGTERM traps in each supervisor
+  forward the signal to the live daemon and flip a stopping flag so
+  the loop doesn't retry during container shutdown.
+
+### Tests
+
+- `agent/dhcp/tests/test_render_kea.py` — 4 new tests pin the wire
+  shape (dynamic-only pools, reservation mapping from `statics`,
+  `match_expression` → `test` renaming, stable subnet-id invariance).
+- `agent/dhcp/tests/test_peer_resolve.py` — 7 new tests cover the
+  watcher: initial seed doesn't fire reload, IP change fires one
+  reload, unchanged IP is a no-op, transient DNS failure doesn't
+  thrash, IP-literal peers are skipped, empty failover is a no-op,
+  `apply_fn` exceptions don't kill the watcher.
 
 ---
 
