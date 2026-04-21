@@ -945,6 +945,19 @@ VALID_SPACE_COLORS = {
 }
 
 
+_DDNS_POLICIES = {"client_provided", "client_or_generated", "always_generate", "disabled"}
+
+
+def _validate_ddns_policy_optional(v: str | None) -> str | None:
+    if v is None:
+        return None
+    if v not in _DDNS_POLICIES:
+        raise ValueError(
+            f"ddns_hostname_policy must be one of: {', '.join(sorted(_DDNS_POLICIES))}"
+        )
+    return v
+
+
 class IPSpaceCreate(BaseModel):
     name: str
     description: str = ""
@@ -955,6 +968,10 @@ class IPSpaceCreate(BaseModel):
     dns_zone_id: str | None = None
     dns_additional_zone_ids: list[str] = []
     dhcp_server_group_id: uuid.UUID | None = None
+    ddns_enabled: bool = False
+    ddns_hostname_policy: str = "client_or_generated"
+    ddns_domain_override: str | None = None
+    ddns_ttl: int | None = None
 
     @field_validator("color")
     @classmethod
@@ -963,6 +980,15 @@ class IPSpaceCreate(BaseModel):
             return None
         if v not in VALID_SPACE_COLORS:
             raise ValueError(f"color must be one of {sorted(VALID_SPACE_COLORS)}")
+        return v
+
+    @field_validator("ddns_hostname_policy")
+    @classmethod
+    def _v(cls, v: str) -> str:
+        if v not in _DDNS_POLICIES:
+            raise ValueError(
+                f"ddns_hostname_policy must be one of: {', '.join(sorted(_DDNS_POLICIES))}"
+            )
         return v
 
 
@@ -976,6 +1002,10 @@ class IPSpaceUpdate(BaseModel):
     dns_zone_id: str | None = None
     dns_additional_zone_ids: list[str] | None = None
     dhcp_server_group_id: uuid.UUID | None = None
+    ddns_enabled: bool | None = None
+    ddns_hostname_policy: str | None = None
+    ddns_domain_override: str | None = None
+    ddns_ttl: int | None = None
 
     @field_validator("color")
     @classmethod
@@ -985,6 +1015,11 @@ class IPSpaceUpdate(BaseModel):
         if v not in VALID_SPACE_COLORS:
             raise ValueError(f"color must be one of {sorted(VALID_SPACE_COLORS)}")
         return v
+
+    @field_validator("ddns_hostname_policy")
+    @classmethod
+    def _v(cls, v: str | None) -> str | None:
+        return _validate_ddns_policy_optional(v)
 
 
 class IPSpaceResponse(BaseModel):
@@ -998,6 +1033,10 @@ class IPSpaceResponse(BaseModel):
     dns_zone_id: str | None = None
     dns_additional_zone_ids: list[str] = []
     dhcp_server_group_id: uuid.UUID | None = None
+    ddns_enabled: bool = False
+    ddns_hostname_policy: str = "client_or_generated"
+    ddns_domain_override: str | None = None
+    ddns_ttl: int | None = None
     created_at: datetime
     modified_at: datetime
 
@@ -1023,6 +1062,11 @@ class IPBlockCreate(BaseModel):
     dns_inherit_settings: bool = True
     dhcp_server_group_id: uuid.UUID | None = None
     dhcp_inherit_settings: bool = True
+    ddns_enabled: bool = False
+    ddns_hostname_policy: str = "client_or_generated"
+    ddns_domain_override: str | None = None
+    ddns_ttl: int | None = None
+    ddns_inherit_settings: bool = True
 
     @field_validator("network")
     @classmethod
@@ -1031,6 +1075,15 @@ class IPBlockCreate(BaseModel):
             ipaddress.ip_network(v, strict=False)
         except ValueError:
             raise ValueError(f"Invalid CIDR notation: {v}")
+        return v
+
+    @field_validator("ddns_hostname_policy")
+    @classmethod
+    def _v(cls, v: str) -> str:
+        if v not in _DDNS_POLICIES:
+            raise ValueError(
+                f"ddns_hostname_policy must be one of: {', '.join(sorted(_DDNS_POLICIES))}"
+            )
         return v
 
 
@@ -1046,6 +1099,16 @@ class IPBlockUpdate(BaseModel):
     dns_inherit_settings: bool | None = None
     dhcp_server_group_id: uuid.UUID | None = None
     dhcp_inherit_settings: bool | None = None
+    ddns_enabled: bool | None = None
+    ddns_hostname_policy: str | None = None
+    ddns_domain_override: str | None = None
+    ddns_ttl: int | None = None
+    ddns_inherit_settings: bool | None = None
+
+    @field_validator("ddns_hostname_policy")
+    @classmethod
+    def _v(cls, v: str | None) -> str | None:
+        return _validate_ddns_policy_optional(v)
 
 
 class IPBlockResponse(BaseModel):
@@ -1064,6 +1127,11 @@ class IPBlockResponse(BaseModel):
     dns_inherit_settings: bool
     dhcp_server_group_id: uuid.UUID | None = None
     dhcp_inherit_settings: bool = True
+    ddns_enabled: bool = False
+    ddns_hostname_policy: str = "client_or_generated"
+    ddns_domain_override: str | None = None
+    ddns_ttl: int | None = None
+    ddns_inherit_settings: bool = True
     created_at: datetime
     modified_at: datetime
 
@@ -1108,10 +1176,14 @@ class SubnetCreate(BaseModel):
     dhcp_inherit_settings: bool = True
     # DDNS — see Subnet model. Defaults mirror the DB: off by default,
     # policy ``client_or_generated`` only takes effect when enabled.
+    # ``ddns_inherit_settings=True`` means the four fields above are
+    # ignored in favour of the first non-inheriting ancestor (block or
+    # space) — see services/dns/ddns.resolve_effective_ddns.
     ddns_enabled: bool = False
     ddns_hostname_policy: str = "client_or_generated"
     ddns_domain_override: str | None = None
     ddns_ttl: int | None = None
+    ddns_inherit_settings: bool = True
 
     @field_validator("ddns_hostname_policy")
     @classmethod
@@ -1173,6 +1245,7 @@ class SubnetUpdate(BaseModel):
     ddns_hostname_policy: str | None = None
     ddns_domain_override: str | None = None
     ddns_ttl: int | None = None
+    ddns_inherit_settings: bool | None = None
 
     @field_validator("status")
     @classmethod
@@ -1239,6 +1312,7 @@ class SubnetResponse(BaseModel):
     ddns_hostname_policy: str = "client_or_generated"
     ddns_domain_override: str | None = None
     ddns_ttl: int | None = None
+    ddns_inherit_settings: bool = True
     created_at: datetime
     modified_at: datetime
 

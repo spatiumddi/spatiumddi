@@ -48,6 +48,22 @@ class IPSpace(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         nullable=True,
     )
 
+    # DDNS defaults — the root of the block/subnet inheritance chain.
+    # Enabling ddns_enabled here and leaving descendants on inherit mode
+    # cascades DDNS to every subnet in the space. Semantics mirror the
+    # subnet-level fields; see ``Subnet`` for the policy enum.
+    ddns_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
+    ddns_hostname_policy: Mapped[str] = mapped_column(
+        String(30),
+        nullable=False,
+        default="client_or_generated",
+        server_default=sa_text("'client_or_generated'"),
+    )
+    ddns_domain_override: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    ddns_ttl: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
     blocks: Mapped[list["IPBlock"]] = relationship(
         "IPBlock", back_populates="space", cascade="all, delete-orphan"
     )
@@ -118,6 +134,25 @@ class IPBlock(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         nullable=True,
     )
     dhcp_inherit_settings: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=sa_text("true")
+    )
+
+    # DDNS — same inherit-from-parent walk as DNS / DHCP. When
+    # ``ddns_inherit_settings`` is True we walk up the block chain (and
+    # finally the space) for the effective DDNS config. Override at any
+    # level by flipping this toggle off and setting the four fields.
+    ddns_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
+    ddns_hostname_policy: Mapped[str] = mapped_column(
+        String(30),
+        nullable=False,
+        default="client_or_generated",
+        server_default=sa_text("'client_or_generated'"),
+    )
+    ddns_domain_override: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    ddns_ttl: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    ddns_inherit_settings: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True, server_default=sa_text("true")
     )
 
@@ -214,6 +249,13 @@ class Subnet(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
     ddns_domain_override: Mapped[str | None] = mapped_column(String(255), nullable=True)
     ddns_ttl: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Inherit DDNS config from the parent block chain + space. When True,
+    # the four ddns_* fields above are ignored in favour of the first
+    # non-inheriting ancestor's values. Default True so enabling DDNS at
+    # the space level cascades automatically.
+    ddns_inherit_settings: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=sa_text("true")
+    )
 
     # Status: active | deprecated | reserved | quarantine
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="active", index=True)

@@ -49,9 +49,88 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.dhcp import DHCPScope, DHCPStaticAssignment
-from app.models.ipam import IPAddress, Subnet
+from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
 
 logger = structlog.get_logger(__name__)
+
+
+class EffectiveDDNS:
+    """Resolved DDNS config for a subnet, after walking subnet → block → space.
+
+    Uses ``__slots__`` + plain attributes instead of a dataclass so it
+    stays cheap on the hot path (every lease upsert calls this).
+    """
+
+    __slots__ = ("enabled", "hostname_policy", "domain_override", "ttl", "source")
+
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        hostname_policy: str,
+        domain_override: str | None,
+        ttl: int | None,
+        source: str,
+    ) -> None:
+        self.enabled = enabled
+        self.hostname_policy = hostname_policy
+        self.domain_override = domain_override
+        self.ttl = ttl
+        # source = "subnet" | "block:<id>" | "space:<id>" — useful for the
+        # UI (effective-fields placeholder) and for debug logging.
+        self.source = source
+
+
+async def resolve_effective_ddns(db: AsyncSession, subnet: Subnet) -> EffectiveDDNS:
+    """Return the effective DDNS config for a subnet.
+
+    Walks the same chain as ``_resolve_effective_dns`` in the IPAM router:
+    the subnet's own values win if ``ddns_inherit_settings`` is False;
+    otherwise we walk up the block chain to the first non-inheriting
+    ancestor, and finally fall back to the containing IPSpace (which has
+    no inherit toggle — it's the root).
+    """
+    if not getattr(subnet, "ddns_inherit_settings", True):
+        return EffectiveDDNS(
+            enabled=subnet.ddns_enabled,
+            hostname_policy=subnet.ddns_hostname_policy,
+            domain_override=subnet.ddns_domain_override,
+            ttl=subnet.ddns_ttl,
+            source="subnet",
+        )
+
+    current = await db.get(IPBlock, subnet.block_id) if subnet.block_id else None
+    while current is not None:
+        if not current.ddns_inherit_settings:
+            return EffectiveDDNS(
+                enabled=current.ddns_enabled,
+                hostname_policy=current.ddns_hostname_policy,
+                domain_override=current.ddns_domain_override,
+                ttl=current.ddns_ttl,
+                source=f"block:{current.id}",
+            )
+        if current.parent_block_id:
+            current = await db.get(IPBlock, current.parent_block_id)
+        else:
+            space = await db.get(IPSpace, current.space_id)
+            if space is None:
+                break
+            return EffectiveDDNS(
+                enabled=space.ddns_enabled,
+                hostname_policy=space.ddns_hostname_policy,
+                domain_override=space.ddns_domain_override,
+                ttl=space.ddns_ttl,
+                source=f"space:{space.id}",
+            )
+    # Orphan subnet with no block? Fall back to its own values (which
+    # default to disabled/client_or_generated).
+    return EffectiveDDNS(
+        enabled=subnet.ddns_enabled,
+        hostname_policy=subnet.ddns_hostname_policy,
+        domain_override=subnet.ddns_domain_override,
+        ttl=subnet.ddns_ttl,
+        source="subnet",
+    )
 
 
 _POLICIES: frozenset[str] = frozenset(
@@ -129,10 +208,14 @@ async def resolve_ddns_hostname(
 
     Static assignments override the policy — a static with a hostname
     always publishes, regardless of what the lease client sent.
+
+    Uses ``resolve_effective_ddns`` so block / space-level overrides are
+    honoured — see ``ddns_inherit_settings`` on each model.
     """
-    if not subnet.ddns_enabled:
+    eff = await resolve_effective_ddns(db, subnet)
+    if not eff.enabled:
         return None
-    policy = subnet.ddns_hostname_policy
+    policy = eff.hostname_policy
     if policy not in _POLICIES or policy == "disabled":
         return None
 
@@ -174,7 +257,8 @@ async def apply_ddns_for_lease(
     """
     if not ipam_row.auto_from_lease:
         return False
-    if not subnet.ddns_enabled:
+    eff = await resolve_effective_ddns(db, subnet)
+    if not eff.enabled:
         return False
 
     hostname = await resolve_ddns_hostname(db, subnet, str(ipam_row.address), client_hostname)
@@ -233,7 +317,9 @@ async def revoke_ddns_for_lease(
 
 
 __all__ = [
+    "EffectiveDDNS",
     "apply_ddns_for_lease",
     "resolve_ddns_hostname",
+    "resolve_effective_ddns",
     "revoke_ddns_for_lease",
 ]

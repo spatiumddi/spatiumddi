@@ -128,6 +128,12 @@ export function formatApiError(err: unknown, fallback = "Error"): string {
 
 // Typed API helpers
 
+export type DdnsHostnamePolicy =
+  | "client_provided"
+  | "client_or_generated"
+  | "always_generate"
+  | "disabled";
+
 export interface IPSpace {
   id: string;
   name: string;
@@ -139,6 +145,12 @@ export interface IPSpace {
   dns_zone_id: string | null;
   dns_additional_zone_ids: string[];
   dhcp_server_group_id?: string | null;
+  // DDNS defaults — root of the block → subnet inheritance chain. Descendants
+  // use these when their own `ddns_inherit_settings` is True.
+  ddns_enabled?: boolean;
+  ddns_hostname_policy?: DdnsHostnamePolicy;
+  ddns_domain_override?: string | null;
+  ddns_ttl?: number | null;
   created_at?: string;
   modified_at?: string;
 }
@@ -159,6 +171,14 @@ export interface IPBlock {
   dns_inherit_settings: boolean;
   dhcp_server_group_id?: string | null;
   dhcp_inherit_settings?: boolean;
+  // DDNS inheritance. When `ddns_inherit_settings` is True, the four
+  // fields above it are ignored and the effective config comes from the
+  // parent block chain → space.
+  ddns_enabled?: boolean;
+  ddns_hostname_policy?: DdnsHostnamePolicy;
+  ddns_domain_override?: string | null;
+  ddns_ttl?: number | null;
+  ddns_inherit_settings?: boolean;
   created_at?: string;
   modified_at?: string;
 }
@@ -289,6 +309,9 @@ export interface Subnet {
     | "disabled";
   ddns_domain_override?: string | null;
   ddns_ttl?: number | null;
+  // When True, the four fields above are ignored and the effective DDNS
+  // config is resolved from the containing block / space.
+  ddns_inherit_settings?: boolean;
   dns_servers?: string[] | null;
   domain_name?: string | null;
   created_at?: string;
