@@ -1158,6 +1158,8 @@ export interface PlatformSettings {
   auto_logout_minutes: number;
   utilization_warn_threshold: number;
   utilization_critical_threshold: number;
+  utilization_max_prefix_ipv4: number;
+  utilization_max_prefix_ipv6: number;
   subnet_tree_default_expanded_depth: number;
   discovery_scan_enabled: boolean;
   discovery_scan_interval_minutes: number;

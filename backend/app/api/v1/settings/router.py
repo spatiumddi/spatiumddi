@@ -30,6 +30,8 @@ class SettingsResponse(BaseModel):
     auto_logout_minutes: int
     utilization_warn_threshold: int
     utilization_critical_threshold: int
+    utilization_max_prefix_ipv4: int
+    utilization_max_prefix_ipv6: int
     subnet_tree_default_expanded_depth: int
     discovery_scan_enabled: bool
     discovery_scan_interval_minutes: int
@@ -73,6 +75,8 @@ class SettingsUpdate(BaseModel):
     auto_logout_minutes: int | None = None
     utilization_warn_threshold: int | None = None
     utilization_critical_threshold: int | None = None
+    utilization_max_prefix_ipv4: int | None = None
+    utilization_max_prefix_ipv6: int | None = None
     subnet_tree_default_expanded_depth: int | None = None
     discovery_scan_enabled: bool | None = None
     discovery_scan_interval_minutes: int | None = None
@@ -140,6 +144,20 @@ class SettingsUpdate(BaseModel):
     def validate_threshold(cls, v: int | None) -> int | None:
         if v is not None and not (0 <= v <= 100):
             raise ValueError("Threshold must be between 0 and 100")
+        return v
+
+    @field_validator("utilization_max_prefix_ipv4")
+    @classmethod
+    def validate_max_prefix_v4(cls, v: int | None) -> int | None:
+        if v is not None and not (0 <= v <= 32):
+            raise ValueError("Max IPv4 prefix must be 0–32")
+        return v
+
+    @field_validator("utilization_max_prefix_ipv6")
+    @classmethod
+    def validate_max_prefix_v6(cls, v: int | None) -> int | None:
+        if v is not None and not (0 <= v <= 128):
+            raise ValueError("Max IPv6 prefix must be 0–128")
         return v
 
     @field_validator("audit_forward_syslog_protocol")

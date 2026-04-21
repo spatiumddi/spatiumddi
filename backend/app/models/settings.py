@@ -34,6 +34,14 @@ class PlatformSettings(Base):
     utilization_warn_threshold: Mapped[int] = mapped_column(Integer, nullable=False, default=80)
     utilization_critical_threshold: Mapped[int] = mapped_column(Integer, nullable=False, default=95)
 
+    # Exclude small PTP / loopback-style subnets from utilization reporting
+    # (dashboard + alerts). A subnet is excluded when its prefix length is
+    # strictly larger than this value — i.e. at the default 29 for v4 we
+    # exclude /30, /31, /32 (PTP links, single-host); at 126 for v6 we
+    # exclude /127 (RFC 6164 PTP) and /128. Set to 32 / 128 to disable.
+    utilization_max_prefix_ipv4: Mapped[int] = mapped_column(Integer, nullable=False, default=29)
+    utilization_max_prefix_ipv6: Mapped[int] = mapped_column(Integer, nullable=False, default=126)
+
     # Subnet tree UI preference
     subnet_tree_default_expanded_depth: Mapped[int] = mapped_column(
         Integer, nullable=False, default=2

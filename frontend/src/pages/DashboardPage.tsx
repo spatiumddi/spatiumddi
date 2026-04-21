@@ -18,11 +18,13 @@ import {
   dnsApi,
   dhcpApi,
   auditApi,
+  settingsApi,
   type Subnet,
   type DNSServer,
   type DHCPServer,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
+import { includeInUtilization } from "@/lib/utilization";
 
 /**
  * Dashboard — the home page.
@@ -311,6 +313,18 @@ export function DashboardPage() {
     queryFn: () => ipamApi.listSubnets(),
   });
 
+  // Platform settings drive the utilization filter (excludes /30, /31,
+  // /127 etc.) — once loaded, derived stats below use `reportSubnets`
+  // instead of the raw list.
+  const { data: settings } = useQuery({
+    queryKey: ["settings"],
+    queryFn: settingsApi.get,
+    staleTime: 60_000,
+  });
+  const reportSubnets = subnets?.filter((s) =>
+    includeInUtilization(s, settings),
+  );
+
   // DNS
   const { data: dnsGroups = [] } = useQuery({
     queryKey: ["dns-groups"],
@@ -357,23 +371,23 @@ export function DashboardPage() {
     refetchInterval: 15_000,
   });
 
-  // Derived stats
-  const totalIPs = subnets?.reduce((s, n) => s + n.total_ips, 0) ?? 0;
-  const allocatedIPs = subnets?.reduce((s, n) => s + n.allocated_ips, 0) ?? 0;
+  // Derived stats — every utilization-driven counter reads from
+  // `reportSubnets` so small PTP / loopback subnets don't skew the
+  // dashboard. `subnets` (the unfiltered list) is still used for
+  // inventory counts like "N subnets".
+  const reporting = reportSubnets ?? [];
+  const totalIPs = reporting.reduce((s, n) => s + n.total_ips, 0);
+  const allocatedIPs = reporting.reduce((s, n) => s + n.allocated_ips, 0);
   const freeIPs = totalIPs - allocatedIPs;
   const overallUtil = totalIPs > 0 ? (allocatedIPs / totalIPs) * 100 : 0;
-  const topSubnets = subnets
-    ? [...subnets]
-        .filter((s) => s.total_ips > 0)
-        .sort((a, b) => b.utilization_percent - a.utilization_percent)
-        .slice(0, 6)
-    : [];
-  const critical =
-    subnets?.filter((s) => s.utilization_percent >= 95).length ?? 0;
-  const warning =
-    subnets?.filter(
-      (s) => s.utilization_percent >= 80 && s.utilization_percent < 95,
-    ).length ?? 0;
+  const topSubnets = [...reporting]
+    .filter((s) => s.total_ips > 0)
+    .sort((a, b) => b.utilization_percent - a.utilization_percent)
+    .slice(0, 6);
+  const critical = reporting.filter((s) => s.utilization_percent >= 95).length;
+  const warning = reporting.filter(
+    (s) => s.utilization_percent >= 80 && s.utilization_percent < 95,
+  ).length;
 
   const allServers = [
     ...allDnsServers.map((s) => ({ ...s, kind: "dns" as const })),
@@ -525,7 +539,7 @@ export function DashboardPage() {
         </div>
 
         {/* ── Heatmap (hero) ─────────────────────────────────────────── */}
-        <SubnetHeatmap subnets={subnets ?? []} />
+        <SubnetHeatmap subnets={reporting} />
 
         {/* ── Top subnets + Live activity ────────────────────────────── */}
         <div className="grid gap-5 lg:grid-cols-2">

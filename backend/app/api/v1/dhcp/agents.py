@@ -477,8 +477,44 @@ async def agent_lease_events(
                 ipam_row.auto_from_lease = True
                 ipam_row.dhcp_lease_id = str(lease.id) if lease.id else None
             # else: manual/static — leave it alone
+
+            # DDNS — mirrors services/dhcp/pull_leases.py. Only fires on
+            # auto-from-lease rows inside DDNS-enabled subnets; errors are
+            # logged but never break the lease upsert pass (DNS will
+            # reconcile on the next event or sweep).
+            if ipam_row is not None and ipam_row.auto_from_lease:
+                try:
+                    from app.services.dns.ddns import apply_ddns_for_lease
+
+                    await apply_ddns_for_lease(
+                        db,
+                        subnet=subnet,
+                        ipam_row=ipam_row,
+                        client_hostname=ev.hostname,
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "dhcp_agent_lease_ddns_failed",
+                        server=str(server.id),
+                        ip=ev.ip_address,
+                        error=str(exc),
+                    )
         else:  # expired / released / declined
             if ipam_row is not None and ipam_row.auto_from_lease:
+                # Revoke DDNS BEFORE deleting the row — revoke reads
+                # dns_record_id / hostname off the row to find what to
+                # delete, and we don't want those fields gone yet.
+                try:
+                    from app.services.dns.ddns import revoke_ddns_for_lease
+
+                    await revoke_ddns_for_lease(db, subnet=subnet, ipam_row=ipam_row)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "dhcp_agent_lease_ddns_revoke_failed",
+                        server=str(server.id),
+                        ip=ev.ip_address,
+                        error=str(exc),
+                    )
                 await db.delete(ipam_row)
 
     await db.commit()

@@ -144,7 +144,12 @@ const SECTION_FIELDS: Record<SectionId, (keyof PlatformSettings)[]> = {
   session: ["session_timeout_minutes", "auto_logout_minutes"],
   "subnet-tree": ["subnet_tree_default_expanded_depth"],
   updates: ["github_release_check_enabled"],
-  utilization: ["utilization_warn_threshold", "utilization_critical_threshold"],
+  utilization: [
+    "utilization_warn_threshold",
+    "utilization_critical_threshold",
+    "utilization_max_prefix_ipv4",
+    "utilization_max_prefix_ipv6",
+  ],
 };
 
 /** Three-tier horizontal flow with one arrow highlighted to indicate which
@@ -1281,6 +1286,50 @@ export function SettingsPage() {
                       className={cn(inputCls, "w-20")}
                     />
                     <span className="text-xs text-muted-foreground">%</span>
+                  </div>
+                </Field>
+                <Field
+                  label="IPv4 Max Prefix for Reporting"
+                  description="Exclude subnets smaller than this from dashboard heatmap + alerts. Default 29 excludes /30, /31, /32 (PTP links, single-host). Set to 32 to disable."
+                >
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs text-muted-foreground">/</span>
+                    <input
+                      type="number"
+                      min={0}
+                      max={32}
+                      value={values.utilization_max_prefix_ipv4 ?? 29}
+                      onChange={(e) =>
+                        set(
+                          "utilization_max_prefix_ipv4",
+                          Number(e.target.value),
+                        )
+                      }
+                      disabled={!isSuperadmin}
+                      className={cn(inputCls, "w-20")}
+                    />
+                  </div>
+                </Field>
+                <Field
+                  label="IPv6 Max Prefix for Reporting"
+                  description="Exclude subnets smaller than this from dashboard heatmap + alerts. Default 126 excludes /127 (RFC 6164 PTP) and /128. Set to 128 to disable."
+                >
+                  <div className="flex items-center gap-2">
+                    <span className="text-xs text-muted-foreground">/</span>
+                    <input
+                      type="number"
+                      min={0}
+                      max={128}
+                      value={values.utilization_max_prefix_ipv6 ?? 126}
+                      onChange={(e) =>
+                        set(
+                          "utilization_max_prefix_ipv6",
+                          Number(e.target.value),
+                        )
+                      }
+                      disabled={!isSuperadmin}
+                      className={cn(inputCls, "w-20")}
+                    />
                   </div>
                 </Field>
               </>
