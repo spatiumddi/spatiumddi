@@ -64,6 +64,10 @@ class ServerCreate(BaseModel):
     port: int = 67
     roles: list[str] = []
     server_group_id: uuid.UUID | None = None
+    # Kea HA listener URL (this server's own endpoint). Empty string
+    # = standalone / no HA. Only meaningful for Kea servers in a
+    # group with another Kea peer.
+    ha_peer_url: str = ""
     # Only used when driver='windows_dhcp' — ignored otherwise.
     windows_credentials: WindowsCredentialsInput | None = None
 
@@ -83,6 +87,7 @@ class ServerUpdate(BaseModel):
     port: int | None = None
     roles: list[str] | None = None
     server_group_id: uuid.UUID | None = None
+    ha_peer_url: str | None = None
     status: str | None = None
     # Pass a full ``WindowsCredentialsInput`` to replace creds; ``null``
     # (the default) leaves them untouched. To clear, set an empty dict
@@ -118,8 +123,10 @@ class ServerResponse(BaseModel):
     has_credentials: bool
     is_agentless: bool
     is_read_only: bool
-    # Kea HA state — latest value reported by the agent's
-    # ``ha-status-get`` poll. Null for standalone servers.
+    # Kea HA listener URL this server exposes to its partner.
+    ha_peer_url: str = ""
+    # Kea HA state — latest value reported by the agent's periodic
+    # ``status-get`` poll. Null for standalone servers (group size < 2).
     ha_state: str | None = None
     ha_last_heartbeat_at: datetime | None = None
     created_at: datetime
@@ -156,6 +163,7 @@ class ServerResponse(BaseModel):
             has_credentials=bool(s.credentials_encrypted),
             is_agentless=agentless,
             is_read_only=is_read_only(s.driver),
+            ha_peer_url=s.ha_peer_url or "",
             ha_state=s.ha_state,
             ha_last_heartbeat_at=s.ha_last_heartbeat_at,
             created_at=s.created_at,

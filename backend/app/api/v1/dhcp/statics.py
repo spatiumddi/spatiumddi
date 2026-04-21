@@ -130,13 +130,13 @@ async def _detach_ipam_for_static(db, st: DHCPStaticAssignment) -> None:
 async def _conflict_check(
     db, scope: DHCPScope, ip: str, mac: str, exclude_id: uuid.UUID | None = None
 ) -> None:
-    """Conflict: same MAC on same server (across scopes), IP inside a reserved/dynamic pool on another scope+server."""
-    # MAC dup across same server's scopes
+    """Conflict: same MAC on same group (across scopes), IP inside a reserved/dynamic pool on another scope+group."""
+    # MAC dup across every scope served by the same group
     same_mac = await db.execute(
         select(DHCPStaticAssignment)
         .join(DHCPScope, DHCPStaticAssignment.scope_id == DHCPScope.id)
         .where(
-            DHCPScope.server_id == scope.server_id,
+            DHCPScope.group_id == scope.group_id,
             DHCPStaticAssignment.mac_address == mac,
         )
     )
@@ -145,7 +145,7 @@ async def _conflict_check(
             continue
         raise HTTPException(
             status_code=409,
-            detail=f"MAC {mac} already reserved on this server in scope {row.scope_id}",
+            detail=f"MAC {mac} already reserved in this group in scope {row.scope_id}",
         )
 
     # IP inside existing pool of this scope — reject if dynamic

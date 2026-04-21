@@ -11,6 +11,124 @@ _No unreleased changes yet._
 
 ---
 
+## 2026.04.22-1 — 2026-04-22
+
+**Breaking** — DHCP data model refactored to be group-centric. Scopes,
+pools, statics, and client classes now belong to a `DHCPServerGroup`
+instead of an individual `DHCPServer`. HA tuning (mode, heartbeat, max-
+response / max-ack / max-unacked, auto-failover) moves onto the group;
+per-peer URL moves onto the server as `ha_peer_url`. `DHCPFailoverChannel`
+is dropped — a group with two Kea members is implicitly an HA pair.
+The `/admin/failover-channels` page and sidebar entry are gone; all HA
+configuration lives in the main DHCP tab now.
+
+Why: under the old model, scopes were pinned to one server. Pairing two
+servers in a failover channel configured the HA hook but did **not**
+mirror scope config — operators had to create every scope twice and keep
+them in sync manually. Under the new model, you configure scopes once on
+the group and every member renders the same Kea subnet4. This matches
+how every mature DDI product (Infoblox, BlueCat, Microsoft DHCP server
+groups) treats the server-group abstraction.
+
+### Breaking
+
+- **API surface.** Everything scoped at `/dhcp/servers/{id}/...` for
+  config objects moves to `/dhcp/server-groups/{id}/...`:
+  - `GET/POST /dhcp/servers/{id}/client-classes` → `/dhcp/server-groups/{id}/client-classes`
+  - The `/dhcp/failover-channels` CRUD router is **deleted**; HA fields
+    live on `PATCH /dhcp/server-groups/{id}`.
+  - `/dhcp/subnets/{id}/dhcp-scopes` still works as the IPAM-side pivot
+    (same URL), but its request body takes `group_id` instead of
+    `server_id`. A new alias `/dhcp/server-groups/{id}/scopes` exists
+    for group-first lookups.
+  - `DHCPScope.server_id` field dropped from the response; use
+    `group_id` instead.
+  - `DHCPClientClass.server_id` field dropped; use `group_id`.
+
+- **UI navigation.** The "DHCP Failover" sidebar entry under Admin is
+  removed. Old `/admin/failover-channels` URLs redirect to `/dhcp`.
+  Configure HA on the DHCP server group from its edit modal.
+
+### Migration
+
+Alembic migration `e4b9f07d25a1_dhcp_group_centric_refactor` performs
+the backfill automatically:
+
+1. Every `DHCPServer` without a `server_group_id` gets a per-server
+   singleton group named after the server (existing groupless servers
+   keep working — they just become single-member groups).
+2. `dhcp_scope.group_id` and `dhcp_client_class.group_id` are
+   populated from the owning server's group, de-duplicated when
+   multiple servers in the same group had overlapping rows (oldest
+   wins by `created_at`).
+3. Each existing `DHCPFailoverChannel` collapses into the primary
+   server's group: mode + HA tuning copy onto the group, each peer's
+   URL copies onto the matching `DHCPServer.ha_peer_url`. If the two
+   peers were in different groups, the secondary moves into the
+   primary's group (it had to be there anyway for HA to work).
+4. The `dhcp_failover_channel` table is dropped.
+
+**Downgrade is shape-only**, not semantic. Scopes / classes on multi-
+server groups collapse onto whichever server is first by `created_at`.
+Not round-trip safe for production rollback — exists for local dev
+reset.
+
+### Added
+
+- **Group-centric DHCP page.** The DHCP tab remains the single
+  navigation point; no sidebar item moves. HA tuning (heartbeat / max-
+  response / max-ack / max-unacked / auto-failover) lives in the
+  server group edit modal, shown only when the group's mode is
+  `hot-standby` or `load-balancing`. Server edit modal grows a
+  "HA Peer URL" field for Kea servers.
+- **`DHCPServerGroup.kea_member_count`** — computed on the
+  `/dhcp/server-groups` response so the UI can decide whether to
+  render the HA panel without a second round-trip. ≥ 2 means the
+  group renders `libdhcp_ha.so` on every peer.
+- **`DHCPServerGroup.servers[]`** — member servers are rolled up into
+  the group response (id, name, driver, host, status, `ha_state`,
+  `ha_peer_url`, `agent_approved`) so the dashboard's HA panel can
+  paint one network request instead of N.
+- **`GET /dhcp/server-groups/{id}/scopes`** — group-first scope list
+  endpoint.
+
+### Changed
+
+- **Dashboard HA panel** now queries `/dhcp/server-groups` instead of
+  the removed `/dhcp/failover-channels`. Each HA pair renders one
+  row with a state dot + name per Kea member. The panel only appears
+  when at least one group has ≥ 2 Kea members.
+- **`CreateScopeModal`** picks the target group (no longer a server).
+  Existing "inherited DHCP group from IPAM block / space" UX still
+  works — we just default the group picker rather than filtering a
+  server picker.
+- **Windows DHCP write-through** fans out across every Windows member
+  of the scope's group. Editing a scope in a Windows-only group with
+  two servers now pushes the cmdlet to both.
+- **`pull_leases`** keys scope lookups by `server.server_group_id`.
+  Two Windows DHCP servers in the same group pulling the same subnet
+  converge on one scope row (replace-all on pool/static state is
+  unchanged).
+- **`_bump_dhcp_bundles_for_subnet`** (subnet resize) walks every
+  group hosting a scope for the subnet and refreshes every Kea member
+  of each group.
+
+### Docs
+
+- `docs/features/DHCP.md` — rewritten data-model section + HA
+  paragraph, clarifying that scopes live on groups and HA is a
+  property of a group with two Kea members.
+- `docs/drivers/DHCP_DRIVERS.md` — HA coordination subsection now
+  describes the group-centric model + how `_resolve_failover` walks
+  the server's group to assemble peers.
+- `CLAUDE.md` — Kea HA roadmap entry flipped to explicitly "scope
+  mirroring handled by group-centric model (shipped 2026.04.22-1)";
+  deferred follow-ups pruned accordingly (peer IP re-resolve loop,
+  version skew guard, DDNS double-write, state-transition actions
+  remain).
+
+---
+
 ## 2026.04.21-2 — 2026-04-21
 
 Hotfix release shaking out Kea HA end-to-end. `2026.04.21-1`

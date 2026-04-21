@@ -104,10 +104,16 @@ class ServerOptionsDef:
 class FailoverConfig:
     """Kea HA (``libdhcp_ha.so``) configuration for one peer.
 
-    Carried on ``ConfigBundle.failover`` when the server belongs to a
-    ``DHCPFailoverChannel``. ``this_server_name`` tells the local peer
-    which of the two entries in ``peers`` refers to itself — Kea keys
-    HA rules off the matching ``name``.
+    Carried on ``ConfigBundle.failover`` when the server is a member of
+    a ``DHCPServerGroup`` that contains another Kea peer. HA tuning
+    comes from the group's columns; per-peer URLs come from each
+    ``DHCPServer.ha_peer_url``. ``this_server_name`` tells the local
+    peer which of the two entries in ``peers`` refers to itself — Kea
+    keys HA rules off the matching ``name``.
+
+    ``channel_id`` / ``channel_name`` retain their names for wire
+    compatibility with the agent, but under the group-centric model
+    they carry the group's id / name.
     """
 
     channel_id: str
@@ -138,7 +144,7 @@ class ConfigBundle:
     client_classes: tuple[ClientClassDef, ...]
     generated_at: datetime
     etag: str = ""
-    # Populated when the server belongs to a DHCPFailoverChannel. The
+    # Populated when the server's group has ≥ 2 Kea members. The
     # agent's Kea renderer injects ``libdhcp_ha.so`` + the ``high-
     # availability`` config block when this is present.
     failover: FailoverConfig | None = None

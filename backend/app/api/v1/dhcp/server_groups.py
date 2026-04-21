@@ -1,4 +1,11 @@
-"""DHCP server group CRUD."""
+"""DHCP server group CRUD.
+
+Server groups are the primary configuration container under the group-
+centric model: scopes, pools, statics, and client classes all live here,
+and HA tuning (mode, heartbeat, max-response / max-ack / max-unacked,
+auto-failover) lives on the group too. A group with two Kea members is
+implicitly a Kea HA pair; a single-member group is standalone.
+"""
 
 from __future__ import annotations
 
@@ -27,6 +34,11 @@ class GroupCreate(BaseModel):
     name: str
     description: str = ""
     mode: str = "hot-standby"
+    heartbeat_delay_ms: int = 10000
+    max_response_delay_ms: int = 60000
+    max_ack_delay_ms: int = 10000
+    max_unacked_clients: int = 5
+    auto_failover: bool = True
 
     @field_validator("mode")
     @classmethod
@@ -40,6 +52,11 @@ class GroupUpdate(BaseModel):
     name: str | None = None
     description: str | None = None
     mode: str | None = None
+    heartbeat_delay_ms: int | None = None
+    max_response_delay_ms: int | None = None
+    max_ack_delay_ms: int | None = None
+    max_unacked_clients: int | None = None
+    auto_failover: bool | None = None
 
     @field_validator("mode")
     @classmethod
@@ -49,25 +66,78 @@ class GroupUpdate(BaseModel):
         return v
 
 
+class ServerSummary(BaseModel):
+    id: uuid.UUID
+    name: str
+    driver: str
+    host: str
+    status: str
+    ha_state: str | None
+    ha_peer_url: str
+    agent_approved: bool
+
+
 class GroupResponse(BaseModel):
     id: uuid.UUID
     name: str
     description: str
     mode: str
+    heartbeat_delay_ms: int
+    max_response_delay_ms: int
+    max_ack_delay_ms: int
+    max_unacked_clients: int
+    auto_failover: bool
+    # Computed: count of Kea servers currently in the group. ≥ 2 means
+    # the group renders the libdhcp_ha.so hook on every peer.
+    kea_member_count: int = 0
+    # Member servers rolled up so the UI can render a group detail page
+    # without a second round-trip. Empty when nothing's registered.
+    servers: list[ServerSummary] = []
     created_at: datetime
     modified_at: datetime
 
     model_config = {"from_attributes": True}
 
 
+def _group_to_response(g: DHCPServerGroup) -> GroupResponse:
+    kea = [s for s in (g.servers or []) if s.driver == "kea"]
+    return GroupResponse(
+        id=g.id,
+        name=g.name,
+        description=g.description,
+        mode=g.mode,
+        heartbeat_delay_ms=g.heartbeat_delay_ms,
+        max_response_delay_ms=g.max_response_delay_ms,
+        max_ack_delay_ms=g.max_ack_delay_ms,
+        max_unacked_clients=g.max_unacked_clients,
+        auto_failover=g.auto_failover,
+        kea_member_count=len(kea),
+        servers=[
+            ServerSummary(
+                id=s.id,
+                name=s.name,
+                driver=s.driver,
+                host=s.host,
+                status=s.status,
+                ha_state=s.ha_state,
+                ha_peer_url=s.ha_peer_url or "",
+                agent_approved=s.agent_approved,
+            )
+            for s in (g.servers or [])
+        ],
+        created_at=g.created_at,
+        modified_at=g.modified_at,
+    )
+
+
 @router.get("", response_model=list[GroupResponse])
-async def list_groups(db: DB, _: CurrentUser) -> list[DHCPServerGroup]:
+async def list_groups(db: DB, _: CurrentUser) -> list[GroupResponse]:
     res = await db.execute(select(DHCPServerGroup).order_by(DHCPServerGroup.name))
-    return list(res.scalars().all())
+    return [_group_to_response(g) for g in res.unique().scalars().all()]
 
 
 @router.post("", response_model=GroupResponse, status_code=status.HTTP_201_CREATED)
-async def create_group(body: GroupCreate, db: DB, user: SuperAdmin) -> DHCPServerGroup:
+async def create_group(body: GroupCreate, db: DB, user: SuperAdmin) -> GroupResponse:
     existing = await db.execute(select(DHCPServerGroup).where(DHCPServerGroup.name == body.name))
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=409, detail="A DHCP server group with that name exists")
@@ -85,21 +155,21 @@ async def create_group(body: GroupCreate, db: DB, user: SuperAdmin) -> DHCPServe
     )
     await db.commit()
     await db.refresh(g)
-    return g
+    return _group_to_response(g)
 
 
 @router.get("/{group_id}", response_model=GroupResponse)
-async def get_group(group_id: uuid.UUID, db: DB, _: CurrentUser) -> DHCPServerGroup:
+async def get_group(group_id: uuid.UUID, db: DB, _: CurrentUser) -> GroupResponse:
     g = await db.get(DHCPServerGroup, group_id)
     if g is None:
         raise HTTPException(status_code=404, detail="Server group not found")
-    return g
+    return _group_to_response(g)
 
 
 @router.put("/{group_id}", response_model=GroupResponse)
 async def update_group(
     group_id: uuid.UUID, body: GroupUpdate, db: DB, user: SuperAdmin
-) -> DHCPServerGroup:
+) -> GroupResponse:
     g = await db.get(DHCPServerGroup, group_id)
     if g is None:
         raise HTTPException(status_code=404, detail="Server group not found")
@@ -118,7 +188,7 @@ async def update_group(
     )
     await db.commit()
     await db.refresh(g)
-    return g
+    return _group_to_response(g)
 
 
 @router.delete("/{group_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -127,11 +197,9 @@ async def delete_group(group_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
     if g is None:
         raise HTTPException(status_code=404, detail="Server group not found")
 
-    # ORM ``cascade="all, delete-orphan"`` on ``servers`` will silently nuke
-    # every DHCPServer (and its scopes / leases / client classes) under this
-    # group. Pre-check and return 409 so the user can't wipe a populated
-    # group by mistake — they have to remove or reassign the servers first.
-    # Matches the DNS-group + IP-space pattern.
+    # ORM ``cascade="all, delete-orphan"`` on ``servers``/``scopes`` will silently
+    # nuke every child row. Pre-check and return 409 so the user can't wipe a
+    # populated group by mistake.
     server_count = (
         await db.execute(
             select(func.count())

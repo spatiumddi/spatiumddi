@@ -1,7 +1,11 @@
-"""DHCP scope CRUD. Scoped under /subnets/{subnet_id}/dhcp-scopes and /scopes/{id}."""
+"""DHCP scope CRUD. Group-centric: scopes belong to DHCPServerGroup, not
+individual servers. Routes live under ``/subnets/{subnet_id}/dhcp-scopes``
+(for the IPAM-side pivot) and ``/scopes/{id}``.
+"""
 
 from __future__ import annotations
 
+import ipaddress
 import uuid
 from datetime import datetime
 from typing import Any
@@ -13,7 +17,7 @@ from sqlalchemy import select
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.v1.dhcp._audit import write_audit
 from app.core.permissions import require_resource_permission
-from app.models.dhcp import DHCPScope, DHCPServer
+from app.models.dhcp import DHCPScope, DHCPServerGroup
 from app.models.ipam import Subnet
 from app.services.dhcp.windows_writethrough import (
     push_scope_delete,
@@ -25,8 +29,6 @@ router = APIRouter(tags=["dhcp"], dependencies=[Depends(require_resource_permiss
 VALID_HOSTNAME_POLICIES = {"client", "server_name", "derived", "none"}
 VALID_SYNC_MODES = {"disabled", "on_lease", "on_static_only", "ipam", "learned"}
 
-# Frontend sends options as `[{code, value}]` (friendlier for the editor UI).
-# The DB / driver expect a `{name: value}` dict. Translate at the API boundary.
 _CODE_TO_NAME: dict[int, str] = {
     2: "time-offset",
     3: "routers",
@@ -64,7 +66,6 @@ def _normalize_options(raw: Any) -> dict[str, Any]:
 
 
 def _normalize_sync_mode(v: str | None) -> str:
-    # Accept frontend's "ipam"/"learned" shorthands.
     if v in (None, "", "ipam"):
         return "on_static_only"
     if v == "learned":
@@ -75,20 +76,17 @@ def _normalize_sync_mode(v: str | None) -> str:
 class ScopeCreate(BaseModel):
     model_config = {"extra": "ignore"}
 
-    server_id: uuid.UUID | None = None
+    group_id: uuid.UUID | None = None
     name: str = ""
     description: str = ""
-    # Accept both is_active and the frontend's `enabled`.
     is_active: bool = True
     enabled: bool | None = None
     lease_time: int = 86400
     min_lease_time: int | None = None
     max_lease_time: int | None = None
-    # Accept dict or list-of-{code,value}.
     options: Any = None
     ddns_enabled: bool = False
     ddns_hostname_policy: str | None = "client"
-    # Accept both names; frontend sends hostname_sync_mode.
     hostname_to_ipam_sync: str = "on_static_only"
     hostname_sync_mode: str | None = None
 
@@ -126,7 +124,7 @@ _NAME_TO_CODE = {v: k for k, v in _CODE_TO_NAME.items()}
 
 class ScopeResponse(BaseModel):
     id: uuid.UUID
-    server_id: uuid.UUID
+    group_id: uuid.UUID
     subnet_id: uuid.UUID
     enabled: bool
     name: str = ""
@@ -139,7 +137,6 @@ class ScopeResponse(BaseModel):
     ddns_hostname_policy: str | None
     ddns_domain_override: str | None = None
     hostname_sync_mode: str
-    # "ipv4" → Kea Dhcp4 rendering, "ipv6" → Kea Dhcp6 rendering.
     address_family: str = "ipv4"
     last_pushed_at: datetime | None
     created_at: datetime
@@ -156,7 +153,7 @@ def _scope_to_response(scope: DHCPScope) -> ScopeResponse:
         opts = list(raw)
     return ScopeResponse(
         id=scope.id,
-        server_id=scope.server_id,
+        group_id=scope.group_id,
         subnet_id=scope.subnet_id,
         enabled=scope.is_active,
         name=scope.name or "",
@@ -184,6 +181,12 @@ async def list_scopes_for_subnet(
     return [_scope_to_response(s) for s in res.unique().scalars().all()]
 
 
+@router.get("/server-groups/{group_id}/scopes", response_model=list[ScopeResponse])
+async def list_scopes_for_group(group_id: uuid.UUID, db: DB, _: CurrentUser) -> list[ScopeResponse]:
+    res = await db.execute(select(DHCPScope).where(DHCPScope.group_id == group_id))
+    return [_scope_to_response(s) for s in res.unique().scalars().all()]
+
+
 @router.post(
     "/subnets/{subnet_id}/dhcp-scopes",
     response_model=ScopeResponse,
@@ -195,42 +198,44 @@ async def create_scope(
     subnet = await db.get(Subnet, subnet_id)
     if subnet is None:
         raise HTTPException(status_code=404, detail="Subnet not found")
-    # Server is optional at create time — if only one DHCP server exists and none
-    # was specified, bind to it automatically; otherwise require an explicit pick.
-    server_id = body.server_id
-    if server_id is None:
-        all_servers = (await db.execute(select(DHCPServer))).scalars().all()
-        if len(all_servers) == 1:
-            server_id = all_servers[0].id
+
+    # Group is required. If only one group exists and none was specified,
+    # bind to it automatically; otherwise 422.
+    group_id = body.group_id
+    if group_id is None:
+        all_groups = (await db.execute(select(DHCPServerGroup))).scalars().all()
+        if len(all_groups) == 1:
+            group_id = all_groups[0].id
         else:
             raise HTTPException(
                 status_code=422,
-                detail="server_id is required when more than one DHCP server is registered",
+                detail="group_id is required when more than one DHCP server group exists",
             )
-    srv = await db.get(DHCPServer, server_id)
-    if srv is None:
-        raise HTTPException(status_code=404, detail="DHCP server not found")
+    grp = await db.get(DHCPServerGroup, group_id)
+    if grp is None:
+        raise HTTPException(status_code=404, detail="DHCP server group not found")
+
     existing = await db.execute(
-        select(DHCPScope).where(DHCPScope.server_id == server_id, DHCPScope.subnet_id == subnet_id)
+        select(DHCPScope).where(DHCPScope.group_id == group_id, DHCPScope.subnet_id == subnet_id)
     )
     if existing.unique().scalar_one_or_none():
-        raise HTTPException(status_code=409, detail="A scope for this server+subnet already exists")
+        raise HTTPException(
+            status_code=409,
+            detail="A scope for this group+subnet already exists",
+        )
+
     sync_mode = _normalize_sync_mode(body.hostname_sync_mode or body.hostname_to_ipam_sync)
     if sync_mode not in VALID_SYNC_MODES - {"ipam", "learned"}:
         raise HTTPException(status_code=422, detail=f"invalid hostname sync mode: {sync_mode}")
     is_active = body.enabled if body.enabled is not None else body.is_active
-    # Infer the address family from the subnet's CIDR so the Kea driver can
-    # emit Dhcp4 vs Dhcp6 without needing the frontend to specify it.
-    import ipaddress as _ipaddr
-
     try:
-        _net = _ipaddr.ip_network(str(subnet.network), strict=False)
-        address_family = "ipv6" if isinstance(_net, _ipaddr.IPv6Network) else "ipv4"
+        _net = ipaddress.ip_network(str(subnet.network), strict=False)
+        address_family = "ipv6" if isinstance(_net, ipaddress.IPv6Network) else "ipv4"
     except ValueError:
         address_family = "ipv4"
     scope = DHCPScope(
         subnet_id=subnet_id,
-        server_id=server_id,
+        group_id=group_id,
         name=(body.name or "").strip(),
         description=(body.description or "").strip(),
         is_active=is_active,
@@ -245,9 +250,8 @@ async def create_scope(
     )
     db.add(scope)
     await db.flush()
-    # Push to Windows BEFORE commit so a WinRM failure rolls the DB row
-    # back and the user sees a 502 instead of silent drift between DB
-    # and server.
+    # Push to every Windows DHCP member of the group BEFORE commit so a
+    # WinRM failure rolls the DB row back.
     await push_scope_upsert(db, scope)
     write_audit(
         db,
@@ -255,7 +259,7 @@ async def create_scope(
         action="create",
         resource_type="dhcp_scope",
         resource_id=str(scope.id),
-        resource_display=f"{srv.name}:{subnet.network}",
+        resource_display=f"{grp.name}:{subnet.network}",
         new_value=body.model_dump(mode="json"),
     )
     await db.commit()
@@ -279,7 +283,6 @@ async def update_scope(
     if scope is None:
         raise HTTPException(status_code=404, detail="Scope not found")
     changes = body.model_dump(exclude_none=True)
-    # Normalize the same fields the create endpoint does.
     if "enabled" in changes:
         changes["is_active"] = changes.pop("enabled")
     if "hostname_sync_mode" in changes:
@@ -312,8 +315,6 @@ async def delete_scope(scope_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
     scope = await db.get(DHCPScope, scope_id)
     if scope is None:
         raise HTTPException(status_code=404, detail="Scope not found")
-    # Push the delete to Windows first; if that fails, don't orphan the
-    # row in our DB.
     await push_scope_delete(db, scope)
     write_audit(
         db,

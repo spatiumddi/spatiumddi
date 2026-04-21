@@ -25,6 +25,7 @@ export function CreateServerModal({
   const [groupId, setGroupId] = useState<string>(
     server?.server_group_id ?? defaultGroupId ?? "",
   );
+  const [haPeerUrl, setHaPeerUrl] = useState<string>(server?.ha_peer_url ?? "");
   const [description, setDescription] = useState(server?.description ?? "");
   const [error, setError] = useState("");
 
@@ -87,12 +88,14 @@ export function CreateServerModal({
     mutationFn: () => {
       const data: Partial<DHCPServer> & {
         windows_credentials?: WindowsDHCPCredentials | Record<string, never>;
+        ha_peer_url?: string;
       } = {
         name,
         driver,
         host,
         port: parseInt(port, 10) || (driver === "windows_dhcp" ? 0 : 67),
         server_group_id: groupId || null,
+        ha_peer_url: haPeerUrl,
         description,
       };
 
@@ -220,6 +223,19 @@ export function CreateServerModal({
             </select>
           </Field>
         </div>
+        {driver === "kea" && (
+          <Field
+            label="HA Peer URL (optional)"
+            hint="This server's own kea-ctrl-agent endpoint. Required for Kea HA pairs — the partner calls this URL for heartbeats and lease updates. Leave blank for standalone servers. Example: http://dhcp-kea:8000/"
+          >
+            <input
+              className={inputCls}
+              placeholder="http://dhcp-kea:8000/"
+              value={haPeerUrl}
+              onChange={(e) => setHaPeerUrl(e.target.value)}
+            />
+          </Field>
+        )}
         <Field label="Description">
           <textarea
             className={inputCls}

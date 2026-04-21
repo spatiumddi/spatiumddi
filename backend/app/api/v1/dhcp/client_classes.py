@@ -1,4 +1,4 @@
-"""DHCP client class CRUD."""
+"""DHCP client class CRUD — group-centric."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from sqlalchemy import select
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.v1.dhcp._audit import write_audit
 from app.core.permissions import require_resource_permission
-from app.models.dhcp import DHCPClientClass, DHCPServer
+from app.models.dhcp import DHCPClientClass, DHCPServerGroup
 
 router = APIRouter(
     tags=["dhcp"], dependencies=[Depends(require_resource_permission("dhcp_client_class"))]
@@ -36,7 +36,7 @@ class ClientClassUpdate(BaseModel):
 
 class ClientClassResponse(BaseModel):
     id: uuid.UUID
-    server_id: uuid.UUID
+    group_id: uuid.UUID
     name: str
     match_expression: str
     description: str
@@ -47,31 +47,31 @@ class ClientClassResponse(BaseModel):
     model_config = {"from_attributes": True}
 
 
-@router.get("/servers/{server_id}/client-classes", response_model=list[ClientClassResponse])
-async def list_classes(server_id: uuid.UUID, db: DB, _: CurrentUser) -> list[DHCPClientClass]:
-    res = await db.execute(select(DHCPClientClass).where(DHCPClientClass.server_id == server_id))
+@router.get("/server-groups/{group_id}/client-classes", response_model=list[ClientClassResponse])
+async def list_classes(group_id: uuid.UUID, db: DB, _: CurrentUser) -> list[DHCPClientClass]:
+    res = await db.execute(select(DHCPClientClass).where(DHCPClientClass.group_id == group_id))
     return list(res.scalars().all())
 
 
 @router.post(
-    "/servers/{server_id}/client-classes",
+    "/server-groups/{group_id}/client-classes",
     response_model=ClientClassResponse,
     status_code=status.HTTP_201_CREATED,
 )
 async def create_class(
-    server_id: uuid.UUID, body: ClientClassCreate, db: DB, user: SuperAdmin
+    group_id: uuid.UUID, body: ClientClassCreate, db: DB, user: SuperAdmin
 ) -> DHCPClientClass:
-    srv = await db.get(DHCPServer, server_id)
-    if srv is None:
-        raise HTTPException(status_code=404, detail="DHCP server not found")
+    grp = await db.get(DHCPServerGroup, group_id)
+    if grp is None:
+        raise HTTPException(status_code=404, detail="DHCP server group not found")
     existing = await db.execute(
         select(DHCPClientClass).where(
-            DHCPClientClass.server_id == server_id, DHCPClientClass.name == body.name
+            DHCPClientClass.group_id == group_id, DHCPClientClass.name == body.name
         )
     )
     if existing.scalar_one_or_none():
         raise HTTPException(status_code=409, detail="A client class with that name exists")
-    cc = DHCPClientClass(server_id=server_id, **body.model_dump())
+    cc = DHCPClientClass(group_id=group_id, **body.model_dump())
     db.add(cc)
     await db.flush()
     write_audit(

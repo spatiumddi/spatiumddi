@@ -1235,18 +1235,28 @@ async def commit_subnet_resize(
 
 async def _bump_dhcp_bundles_for_subnet(db: AsyncSession, subnet_id: uuid.UUID) -> int:
     """Rebuild the DHCP ConfigBundle for every agent-based server whose
-    scope targets this subnet, and enqueue an ``apply_config`` op if one
-    isn't already pending. Returns the number of servers notified.
+    group has a scope targeting this subnet, and enqueue an
+    ``apply_config`` op if one isn't already pending. Returns the number
+    of servers notified.
+
+    Under the group-centric model, one scope change cascades to every
+    member of the scope's group — all peers render the same config.
     """
-    rows = (
-        await db.execute(
-            select(DHCPScope, DHCPServer)
-            .join(DHCPServer, DHCPScope.server_id == DHCPServer.id)
-            .where(DHCPScope.subnet_id == subnet_id)
-        )
-    ).all()
+    # scope.subnet_id → scope.group_id → servers in that group
+    scope_rows = (
+        (await db.execute(select(DHCPScope).where(DHCPScope.subnet_id == subnet_id)))
+        .scalars()
+        .all()
+    )
+    group_ids = {sc.group_id for sc in scope_rows}
+    if not group_ids:
+        return 0
+    servers_res = await db.execute(
+        select(DHCPServer).where(DHCPServer.server_group_id.in_(group_ids))
+    )
+    servers = list(servers_res.scalars().all())
     seen: set[uuid.UUID] = set()
-    for _scope, server in rows:
+    for server in servers:
         if server is None or server.id in seen:
             continue
         # Agentless (Windows DHCP read-only) has no write path — skip.

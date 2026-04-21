@@ -2163,8 +2163,8 @@ function AddAddressModal({
                 {dhcpScopes.map((sc) => (
                   <option key={sc.id} value={sc.id}>
                     {sc.name || `Scope ${sc.id.slice(0, 8)}`}
-                    {" — server "}
-                    {sc.server_id?.slice(0, 8) ?? "unassigned"}
+                    {" — group "}
+                    {sc.group_id.slice(0, 8)}
                   </option>
                 ))}
               </select>
@@ -4969,11 +4969,18 @@ function useDhcpSync(subnetId: string, enabled: boolean) {
     queryFn: () => dhcpApi.listServers(),
     enabled,
   });
+  // Under the group-centric model, a scope targets a group, and every
+  // member of that group serves the subnet. Fan the sync out to every
+  // DHCP server whose group is hosting any scope for this subnet.
+  const scopeGroupIds = new Set(scopes.map((sc) => sc.group_id));
   const serverIds = Array.from(
     new Set(
-      scopes
-        .map((sc) => sc.server_id)
-        .filter((id): id is string => typeof id === "string"),
+      servers
+        .filter(
+          (s) =>
+            s.server_group_id != null && scopeGroupIds.has(s.server_group_id),
+        )
+        .map((s) => s.id),
     ),
   );
   const serverNames = new Map(servers.map((s) => [s.id, s.name]));

@@ -2224,13 +2224,47 @@ export const vlansApi = {
 
 // ── DHCP ───────────────────────────────────────────────────────────────────
 
+export interface DHCPServerGroupMember {
+  id: string;
+  name: string;
+  driver: string;
+  host: string;
+  status: string;
+  ha_state: string | null;
+  ha_peer_url: string;
+  agent_approved: boolean;
+}
+
 export interface DHCPServerGroup {
   id: string;
   name: string;
   description: string;
+  // mode is the HA mode when the group has ≥ 2 Kea members:
+  //   "hot-standby" | "load-balancing" | "standalone".
   mode: string;
+  heartbeat_delay_ms: number;
+  max_response_delay_ms: number;
+  max_ack_delay_ms: number;
+  max_unacked_clients: number;
+  auto_failover: boolean;
+  // Number of Kea servers currently in the group. ≥ 2 means HA is
+  // rendered into every peer's Kea config via libdhcp_ha.so.
+  kea_member_count: number;
+  // Member servers (rolled up by the /server-groups response).
+  servers: DHCPServerGroupMember[];
   created_at: string;
   modified_at: string;
+}
+
+export interface DHCPServerGroupCreate {
+  name: string;
+  description?: string;
+  mode?: "standalone" | "hot-standby" | "load-balancing";
+  heartbeat_delay_ms?: number;
+  max_response_delay_ms?: number;
+  max_ack_delay_ms?: number;
+  max_unacked_clients?: number;
+  auto_failover?: boolean;
 }
 
 export interface DHCPServer {
@@ -2251,10 +2285,15 @@ export interface DHCPServer {
   agent_version: string | null;
   config_etag: string | null;
   config_pushed_at: string | null;
-  // Populated by the agent's periodic ha-status-get poll. Null for
-  // standalone servers. Kea state names: waiting / syncing / ready /
-  // normal / communications-interrupted / partner-down / hot-standby
-  // / load-balancing / backup / passive-backup / terminated.
+  // This server's OWN HA listener URL — empty for standalone servers.
+  // The partner in the same group calls this URL for heartbeats +
+  // lease updates. Rendered into the peer URL of Kea's HA hook.
+  ha_peer_url?: string;
+  // Populated by the agent's periodic status-get poll. Null for
+  // standalone servers (group size < 2). Kea state names:
+  // waiting / syncing / ready / normal / communications-interrupted /
+  // partner-down / hot-standby / load-balancing / backup /
+  // passive-backup / terminated.
   ha_state?: string | null;
   ha_last_heartbeat_at?: string | null;
   // True once Windows admin credentials have been stored on this server.
@@ -2305,7 +2344,9 @@ export interface DHCPOption {
 export interface DHCPScope {
   id: string;
   subnet_id: string;
-  server_id: string | null;
+  // Scopes belong to groups, not individual servers — every member of
+  // the group renders the same Kea subnet4 config from this row.
+  group_id: string;
   name: string;
   description: string;
   enabled: boolean;
@@ -2323,53 +2364,14 @@ export interface DHCPScope {
   modified_at: string;
 }
 
-export interface DHCPFailoverChannel {
-  id: string;
-  name: string;
-  description: string;
-  mode: "hot-standby" | "load-balancing";
-  primary_server_id: string;
-  secondary_server_id: string;
-  primary_server_name: string;
-  secondary_server_name: string;
-  primary_peer_url: string;
-  secondary_peer_url: string;
-  heartbeat_delay_ms: number;
-  max_response_delay_ms: number;
-  max_ack_delay_ms: number;
-  max_unacked_clients: number;
-  auto_failover: boolean;
-  primary_ha_state: string | null;
-  secondary_ha_state: string | null;
-  primary_ha_last_heartbeat_at: string | null;
-  secondary_ha_last_heartbeat_at: string | null;
-  created_at: string;
-  modified_at: string;
-}
-
-export interface DHCPFailoverChannelCreate {
-  name: string;
-  description?: string;
-  mode?: "hot-standby" | "load-balancing";
-  primary_server_id: string;
-  secondary_server_id: string;
-  primary_peer_url?: string;
-  secondary_peer_url?: string;
-  heartbeat_delay_ms?: number;
-  max_response_delay_ms?: number;
-  max_ack_delay_ms?: number;
-  max_unacked_clients?: number;
-  auto_failover?: boolean;
-}
-
 export const dhcpApi = {
   listGroups: () =>
     api.get<DHCPServerGroup[]>("/dhcp/server-groups").then((r) => r.data),
   getGroup: (id: string) =>
     api.get<DHCPServerGroup>(`/dhcp/server-groups/${id}`).then((r) => r.data),
-  createGroup: (data: Partial<DHCPServerGroup>) =>
+  createGroup: (data: DHCPServerGroupCreate) =>
     api.post<DHCPServerGroup>("/dhcp/server-groups", data).then((r) => r.data),
-  updateGroup: (id: string, data: Partial<DHCPServerGroup>) =>
+  updateGroup: (id: string, data: Partial<DHCPServerGroupCreate>) =>
     api
       .put<DHCPServerGroup>(`/dhcp/server-groups/${id}`, data)
       .then((r) => r.data),
@@ -2418,31 +2420,13 @@ export const dhcpApi = {
       .get<DHCPLease[]>(`/dhcp/servers/${id}/leases`, { params })
       .then((r) => r.data),
 
-  listFailoverChannels: () =>
-    api
-      .get<DHCPFailoverChannel[]>("/dhcp/failover-channels")
-      .then((r) => r.data),
-  getFailoverChannel: (id: string) =>
-    api
-      .get<DHCPFailoverChannel>(`/dhcp/failover-channels/${id}`)
-      .then((r) => r.data),
-  createFailoverChannel: (data: DHCPFailoverChannelCreate) =>
-    api
-      .post<DHCPFailoverChannel>("/dhcp/failover-channels", data)
-      .then((r) => r.data),
-  updateFailoverChannel: (
-    id: string,
-    data: Partial<DHCPFailoverChannelCreate>,
-  ) =>
-    api
-      .patch<DHCPFailoverChannel>(`/dhcp/failover-channels/${id}`, data)
-      .then((r) => r.data),
-  deleteFailoverChannel: (id: string) =>
-    api.delete(`/dhcp/failover-channels/${id}`),
-
   listScopesBySubnet: (subnetId: string) =>
     api
       .get<DHCPScope[]>(`/dhcp/subnets/${subnetId}/dhcp-scopes`)
+      .then((r) => r.data),
+  listScopesByGroup: (groupId: string) =>
+    api
+      .get<DHCPScope[]>(`/dhcp/server-groups/${groupId}/scopes`)
       .then((r) => r.data),
   getScope: (id: string) =>
     api.get<DHCPScope>(`/dhcp/scopes/${id}`).then((r) => r.data),
@@ -2484,23 +2468,26 @@ export const dhcpApi = {
   deleteStatic: (_scopeId: string, staticId: string) =>
     api.delete(`/dhcp/statics/${staticId}`),
 
-  listClientClasses: (serverId: string) =>
+  listClientClasses: (groupId: string) =>
     api
-      .get<DHCPClientClass[]>(`/dhcp/servers/${serverId}/client-classes`)
+      .get<DHCPClientClass[]>(`/dhcp/server-groups/${groupId}/client-classes`)
       .then((r) => r.data),
-  createClientClass: (serverId: string, data: Partial<DHCPClientClass>) =>
+  createClientClass: (groupId: string, data: Partial<DHCPClientClass>) =>
     api
-      .post<DHCPClientClass>(`/dhcp/servers/${serverId}/client-classes`, data)
+      .post<DHCPClientClass>(
+        `/dhcp/server-groups/${groupId}/client-classes`,
+        data,
+      )
       .then((r) => r.data),
   updateClientClass: (
-    _serverId: string,
+    _groupId: string,
     classId: string,
     data: Partial<DHCPClientClass>,
   ) =>
     api
       .put<DHCPClientClass>(`/dhcp/client-classes/${classId}`, data)
       .then((r) => r.data),
-  deleteClientClass: (_serverId: string, classId: string) =>
+  deleteClientClass: (_groupId: string, classId: string) =>
     api.delete(`/dhcp/client-classes/${classId}`),
 };
 
@@ -2543,7 +2530,9 @@ export interface DHCPStaticAssignment {
 
 export interface DHCPClientClass {
   id: string;
-  server_id: string;
+  // Under the group-centric model, classes belong to a server group —
+  // every member renders the same classes into its Kea config.
+  group_id: string;
   name: string;
   description: string;
   match_expression: string;

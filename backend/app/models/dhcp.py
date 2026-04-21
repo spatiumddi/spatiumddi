@@ -1,8 +1,16 @@
-"""DHCP data models: server groups, servers, scopes, pools, static assignments,
-client classes, leases, and agent op queue.
+"""DHCP data models — server groups, servers, scopes, pools, static
+assignments, client classes, leases, and agent op queue.
 
-Mirrors the DNS module (see app.models.dns) for agent bookkeeping so the
-DHCP agent runtime can reuse the same long-poll + ETag + op-ack patterns.
+Configuration lives on **DHCPServerGroup**: all servers in a group
+serve the same scopes / pools / statics / client classes. A group
+with a single Kea server is a standalone DHCP service; a group with
+two Kea servers is implicitly an HA pair, using the group's mode +
+tuning fields to drive the ``libdhcp_ha.so`` hook.
+
+Per-server fields stay on **DHCPServer**: registration + agent state,
+health, and the server's own HA peer URL (the listener endpoint the
+partner calls). Leases are per-server — each Kea owns its own
+memfile — and the ops queue is per-server.
 """
 
 from __future__ import annotations
@@ -31,22 +39,43 @@ from app.models.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
 
 
 class DHCPServerGroup(UUIDPrimaryKeyMixin, TimestampMixin, Base):
-    """Logical cluster of DHCP servers (HA pair / failover partners)."""
+    """Logical cluster of DHCP servers. Primary configuration container.
+
+    All servers in a group render identical config bundles (except
+    ``this-server-name`` under Kea HA). A group with two Kea members
+    is an HA pair; the group's ``mode`` + HA tuning drive the
+    ``libdhcp_ha.so`` hook. A single-member group is standalone and
+    ignores HA fields.
+    """
 
     __tablename__ = "dhcp_server_group"
 
     name: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
     description: Mapped[str] = mapped_column(Text, nullable=False, default="")
-    # mode: load-balancing | hot-standby
+    # mode: load-balancing | hot-standby (only rendered when the group has >= 2 Kea peers)
     mode: Mapped[str] = mapped_column(String(20), nullable=False, default="hot-standby")
+
+    # Kea HA hook tuning — rendered into libdhcp_ha.so config when the
+    # group is an HA pair. Defaults mirror Kea's documented recommendations.
+    heartbeat_delay_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=10000)
+    max_response_delay_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=60000)
+    max_ack_delay_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=10000)
+    max_unacked_clients: Mapped[int] = mapped_column(Integer, nullable=False, default=5)
+    auto_failover: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
     servers: Mapped[list[DHCPServer]] = relationship(
         "DHCPServer", back_populates="group", cascade="all, delete-orphan"
     )
+    scopes: Mapped[list[DHCPScope]] = relationship(
+        "DHCPScope", back_populates="group", cascade="all, delete-orphan"
+    )
+    client_classes: Mapped[list[DHCPClientClass]] = relationship(
+        "DHCPClientClass", back_populates="group", cascade="all, delete-orphan"
+    )
 
 
 class DHCPServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
-    """Individual DHCP server managed by SpatiumDDI."""
+    """Individual DHCP server (Kea instance or Windows DHCP) in a group."""
 
     __tablename__ = "dhcp_server"
     __table_args__ = (
@@ -60,7 +89,7 @@ class DHCPServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     driver: Mapped[str] = mapped_column(String(50), nullable=False, default="kea")
     host: Mapped[str] = mapped_column(String(255), nullable=False)
     port: Mapped[int] = mapped_column(Integer, nullable=False, default=67)
-    # roles: primary | secondary | standalone (JSON array of strings)
+    # roles: primary | secondary | standalone (JSON array of strings — informational)
     roles: Mapped[list] = mapped_column(JSONB, nullable=False, default=lambda: [])
 
     server_group_id: Mapped[uuid.UUID | None] = mapped_column(
@@ -95,14 +124,17 @@ class DHCPServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # leave this NULL — they authenticate via agent JWT.
     credentials_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
 
+    # Kea HA hook peer URL — this server's OWN HA listener endpoint
+    # (``http://<host>:<port>/``). The other peer in the group calls
+    # this URL for heartbeats / lease updates. Empty string for
+    # standalone servers; rendered into every peer's ``peers`` array
+    # so they know where to reach each other.
+    ha_peer_url: Mapped[str] = mapped_column(String(512), nullable=False, default="")
+
     # Kea HA runtime state — populated by the agent's periodic
-    # ``ha-status-get`` poll (see ``app.tasks`` + agent supervisor).
-    # Null when the server is standalone. Values follow Kea's own
-    # state names: ``waiting`` / ``syncing`` / ``ready`` / ``normal``
-    # / ``communications-interrupted`` / ``partner-down`` /
-    # ``hot-standby`` / ``load-balancing`` / ``backup`` /
-    # ``passive-backup`` / ``terminated``. We treat this column as
-    # opaque reporting — no business logic branches on it beyond UI.
+    # ``status-get`` poll. Null when the server is standalone. Values
+    # follow Kea's own state names (``hot-standby`` / ``normal`` /
+    # ``partner-down`` / etc). Treat as opaque reporting.
     ha_state: Mapped[str | None] = mapped_column(String(50), nullable=True)
     ha_last_heartbeat_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
@@ -111,89 +143,8 @@ class DHCPServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     group: Mapped[DHCPServerGroup | None] = relationship(
         "DHCPServerGroup", back_populates="servers", lazy="joined"
     )
-    scopes: Mapped[list[DHCPScope]] = relationship(
-        "DHCPScope", back_populates="server", cascade="all, delete-orphan"
-    )
-    client_classes: Mapped[list[DHCPClientClass]] = relationship(
-        "DHCPClientClass", back_populates="server", cascade="all, delete-orphan"
-    )
     leases: Mapped[list[DHCPLease]] = relationship(
         "DHCPLease", back_populates="server", cascade="all, delete-orphan"
-    )
-
-
-# ── Failover channel (Kea HA) ────────────────────────────────────────────────
-
-
-class DHCPFailoverChannel(UUIDPrimaryKeyMixin, TimestampMixin, Base):
-    """One Kea HA relationship between two DHCP servers.
-
-    Maps 1:1 to a ``libdhcp_ha.so`` hook config block on each peer.
-    A server can belong to at most one channel (unique FK constraints)
-    — Kea itself doesn't support being a member of multiple HA
-    relationships.
-
-    The channel is the config unit; each peer's role (``primary`` vs
-    ``secondary`` / ``standby``) is derived from whether its id matches
-    ``primary_server_id`` or ``secondary_server_id``. We keep the peer
-    URLs on the channel rather than on DHCPServer so that operators
-    editing the HA setup don't have to touch the server rows that
-    otherwise carry only server identity + driver state.
-
-    The ``mode`` field mirrors Kea's own terminology: ``hot-standby``
-    has one active peer + one passive standby; ``load-balancing`` has
-    both peers active and split traffic by client-identifier hash.
-    """
-
-    __tablename__ = "dhcp_failover_channel"
-    __table_args__ = (
-        UniqueConstraint("primary_server_id", name="uq_dhcp_failover_primary"),
-        UniqueConstraint("secondary_server_id", name="uq_dhcp_failover_secondary"),
-    )
-
-    name: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
-    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
-
-    # mode: load-balancing | hot-standby
-    mode: Mapped[str] = mapped_column(String(20), nullable=False, default="hot-standby")
-
-    primary_server_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
-        ForeignKey("dhcp_server.id", ondelete="CASCADE"),
-        nullable=False,
-    )
-    secondary_server_id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True),
-        ForeignKey("dhcp_server.id", ondelete="CASCADE"),
-        nullable=False,
-    )
-
-    # Kea control-agent URLs that each peer uses to reach the other.
-    # Format: ``http://<host>:<port>/`` (typically port 8000 — the
-    # kea-ctrl-agent port shipped by the SpatiumDDI DHCP agent image).
-    primary_peer_url: Mapped[str] = mapped_column(String(512), nullable=False, default="")
-    secondary_peer_url: Mapped[str] = mapped_column(String(512), nullable=False, default="")
-
-    # HA hook tuning. Defaults mirror Kea's documented recommendations
-    # (kea-admin §5.1, "High Availability" hook). Expressed in
-    # milliseconds throughout because that's what Kea takes natively —
-    # surfacing a "seconds" alias is a UI concern, not a DB one.
-    heartbeat_delay_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=10000)
-    max_response_delay_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=60000)
-    max_ack_delay_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=10000)
-    max_unacked_clients: Mapped[int] = mapped_column(Integer, nullable=False, default=5)
-
-    # Whether a peer may autonomously transition to ``partner-down``
-    # after losing contact. Operators that want strict two-person-rule
-    # failover set this to False and use explicit maintenance /
-    # recovery commands instead.
-    auto_failover: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
-
-    primary_server: Mapped[DHCPServer] = relationship(
-        "DHCPServer", foreign_keys=[primary_server_id], lazy="joined"
-    )
-    secondary_server: Mapped[DHCPServer] = relationship(
-        "DHCPServer", foreign_keys=[secondary_server_id], lazy="joined"
     )
 
 
@@ -201,21 +152,25 @@ class DHCPFailoverChannel(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
 
 class DHCPScope(UUIDPrimaryKeyMixin, TimestampMixin, Base):
-    """A DHCP scope — one subnet served by one DHCP server.
+    """A DHCP scope — one subnet served by one group.
 
-    Multiple servers can serve the same subnet (HA pair) via distinct scope rows.
+    Under the group-centric model, a scope belongs to a DHCPServerGroup,
+    not a single server. All servers in the group render the same scope
+    in their Kea config (Dhcp4 ``subnet4``). This mirrors what Kea HA
+    requires and replaces the pre-2026.04.22 per-server scope rows that
+    operators had to mirror manually.
     """
 
     __tablename__ = "dhcp_scope"
     __table_args__ = (
-        UniqueConstraint("server_id", "subnet_id", name="uq_dhcp_scope_server_subnet"),
-        Index("ix_dhcp_scope_server", "server_id"),
+        UniqueConstraint("group_id", "subnet_id", name="uq_dhcp_scope_group_subnet"),
+        Index("ix_dhcp_scope_group", "group_id"),
         Index("ix_dhcp_scope_subnet", "subnet_id"),
     )
 
-    server_id: Mapped[uuid.UUID] = mapped_column(
+    group_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
-        ForeignKey("dhcp_server.id", ondelete="CASCADE"),
+        ForeignKey("dhcp_server_group.id", ondelete="CASCADE"),
         nullable=False,
     )
     subnet_id: Mapped[uuid.UUID] = mapped_column(
@@ -225,15 +180,12 @@ class DHCPScope(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
 
-    # Human label for the scope (optional, not unique). Useful when the same
-    # subnet is served by multiple scope rows (HA pair) and you want to tell
-    # them apart in the UI.
+    # Human label for the scope (optional, not unique).
     name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     description: Mapped[str] = mapped_column(Text, nullable=False, default="")
 
     # Address family: "ipv4" (Dhcp4) or "ipv6" (Dhcp6). Populated from the
-    # bound subnet's prefix at create time; Kea driver branches on this
-    # value when rendering a ConfigBundle (Dhcp4 vs Dhcp6).
+    # bound subnet's prefix at create time.
     address_family: Mapped[str] = mapped_column(
         String(4), nullable=False, default="ipv4", server_default="ipv4"
     )
@@ -242,23 +194,18 @@ class DHCPScope(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     min_lease_time: Mapped[int | None] = mapped_column(Integer, nullable=True)
     max_lease_time: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
-    # DHCP options (JSONB map keyed by option name: routers, dns-servers,
-    # domain-name, ntp-servers, tftp-server-name, bootfile-name,
-    # tftp-server-address (150), etc.)
     options: Mapped[dict] = mapped_column(JSONB, nullable=False, default=lambda: {})
 
     # DDNS
     ddns_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    # ddns_hostname_policy: client | server_name | derived | none
     ddns_hostname_policy: Mapped[str] = mapped_column(String(30), nullable=False, default="client")
-    # hostname_to_ipam_sync: disabled | on_lease | on_static_only
     hostname_to_ipam_sync: Mapped[str] = mapped_column(
         String(30), nullable=False, default="on_static_only"
     )
 
     last_pushed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
-    server: Mapped[DHCPServer] = relationship("DHCPServer", back_populates="scopes")
+    group: Mapped[DHCPServerGroup] = relationship("DHCPServerGroup", back_populates="scopes")
     pools: Mapped[list[DHCPPool]] = relationship(
         "DHCPPool",
         back_populates="scope",
@@ -319,7 +266,6 @@ class DHCPStaticAssignment(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     description: Mapped[str] = mapped_column(Text, nullable=False, default="")
     options_override: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
-    # Optional backlink into IPAM (if the IP is tracked there)
     ip_address_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("ip_address.id", ondelete="SET NULL"),
@@ -336,17 +282,17 @@ class DHCPStaticAssignment(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
 
 class DHCPClientClass(UUIDPrimaryKeyMixin, TimestampMixin, Base):
-    """A named client class for conditional option delivery."""
+    """A named client class for conditional option delivery — group-wide."""
 
     __tablename__ = "dhcp_client_class"
     __table_args__ = (
-        UniqueConstraint("server_id", "name", name="uq_dhcp_client_class_server_name"),
-        Index("ix_dhcp_client_class_server", "server_id"),
+        UniqueConstraint("group_id", "name", name="uq_dhcp_client_class_group_name"),
+        Index("ix_dhcp_client_class_group", "group_id"),
     )
 
-    server_id: Mapped[uuid.UUID] = mapped_column(
+    group_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
-        ForeignKey("dhcp_server.id", ondelete="CASCADE"),
+        ForeignKey("dhcp_server_group.id", ondelete="CASCADE"),
         nullable=False,
     )
     name: Mapped[str] = mapped_column(String(255), nullable=False)
@@ -354,14 +300,23 @@ class DHCPClientClass(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     description: Mapped[str] = mapped_column(Text, nullable=False, default="")
     options: Mapped[dict] = mapped_column(JSONB, nullable=False, default=lambda: {})
 
-    server: Mapped[DHCPServer] = relationship("DHCPServer", back_populates="client_classes")
+    group: Mapped[DHCPServerGroup] = relationship(
+        "DHCPServerGroup", back_populates="client_classes"
+    )
 
 
 # ── Leases ──────────────────────────────────────────────────────────────────
 
 
 class DHCPLease(UUIDPrimaryKeyMixin, Base):
-    """An active or historical DHCP lease reported by an agent."""
+    """An active or historical DHCP lease reported by an agent.
+
+    Per-server because each Kea instance owns its own memfile. Under HA
+    the partner syncs leases via ``libdhcp_ha.so``, but the memfile is
+    still local — so one lease event arrives here twice (once from each
+    peer). The scope_id link points to the group-level scope the lease
+    matches.
+    """
 
     __tablename__ = "dhcp_lease"
     __table_args__ = (
@@ -390,7 +345,6 @@ class DHCPLease(UUIDPrimaryKeyMixin, Base):
     ends_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
-    # state: active | expired | released | abandoned
     state: Mapped[str] = mapped_column(String(20), nullable=False, default="active")
     last_seen_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
@@ -403,11 +357,7 @@ class DHCPLease(UUIDPrimaryKeyMixin, Base):
 
 
 class DHCPConfigOp(UUIDPrimaryKeyMixin, Base):
-    """Queued op for the agent to apply (config push, restart, reload).
-
-    Mirrors ``DNSRecordOp`` but broader: DHCP changes are usually whole-config
-    reconfigurations (``apply_config``) rather than per-record deltas.
-    """
+    """Queued op for the agent to apply (config push, restart, reload)."""
 
     __tablename__ = "dhcp_config_op"
     __table_args__ = (Index("ix_dhcp_config_op_server_status", "server_id", "status"),)
@@ -417,10 +367,8 @@ class DHCPConfigOp(UUIDPrimaryKeyMixin, Base):
         ForeignKey("dhcp_server.id", ondelete="CASCADE"),
         nullable=False,
     )
-    # op_type: apply_config | restart | reload
     op_type: Mapped[str] = mapped_column(String(30), nullable=False)
     payload: Mapped[dict] = mapped_column(JSONB, nullable=False, default=lambda: {})
-    # status: pending | acked | failed
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="pending")
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     error_msg: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -430,8 +378,6 @@ class DHCPConfigOp(UUIDPrimaryKeyMixin, Base):
     acked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
-# Alias: some callers use DHCPRecordOp terminology (mirroring DNSRecordOp).
-# Keep a single underlying table to avoid schema drift.
 DHCPRecordOp = DHCPConfigOp
 
 

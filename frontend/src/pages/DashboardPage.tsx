@@ -22,7 +22,7 @@ import {
   type Subnet,
   type DNSServer,
   type DHCPServer,
-  type DHCPFailoverChannel,
+  type DHCPServerGroup,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { includeInUtilization } from "@/lib/utilization";
@@ -358,16 +358,14 @@ export function DashboardPage() {
     queryFn: () => dhcpApi.listServers(),
     refetchInterval: 30_000,
   });
+  // Single groups fetch — drives both the DHCP server-row group-name
+  // lookup and the HA panel (groups with >= 2 Kea members).
   const { data: dhcpGroups = [] } = useQuery({
     queryKey: ["dhcp-groups"],
     queryFn: dhcpApi.listGroups,
-    staleTime: 60_000,
-  });
-  const { data: failoverChannels = [] } = useQuery({
-    queryKey: ["dhcp-failover-channels"],
-    queryFn: dhcpApi.listFailoverChannels,
     refetchInterval: 30_000,
   });
+  const haGroups = dhcpGroups.filter((g) => g.kea_member_count >= 2);
 
   // Audit
   const { data: recent } = useQuery({
@@ -728,15 +726,15 @@ export function DashboardPage() {
                     })}
                   </div>
                 )}
-                {failoverChannels.length > 0 && (
+                {haGroups.length > 0 && (
                   <>
                     <div className="flex items-center gap-1.5 bg-muted/30 px-4 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
                       <Shield className="h-3 w-3" />
-                      Failover ({failoverChannels.length})
+                      HA Pairs ({haGroups.length})
                     </div>
                     <div className="divide-y">
-                      {failoverChannels.map((c) => (
-                        <FailoverRow key={c.id} channel={c} />
+                      {haGroups.map((g) => (
+                        <FailoverRow key={g.id} group={g} />
                       ))}
                     </div>
                   </>
@@ -855,53 +853,42 @@ function haStateDotCls(state: string | null | undefined): string {
   return "bg-amber-500";
 }
 
-function FailoverRow({ channel }: { channel: DHCPFailoverChannel }) {
-  const primaryDot = haStateDotCls(channel.primary_ha_state);
-  const secondaryDot = haStateDotCls(channel.secondary_ha_state);
-  const secondaryLabel =
-    channel.mode === "hot-standby" ? "standby" : "secondary";
+function FailoverRow({ group }: { group: DHCPServerGroup }) {
+  // Only Kea members participate in HA. Sort by name for stable display.
+  const kea = [...(group.servers ?? [])]
+    .filter((s) => s.driver === "kea")
+    .sort((a, b) => a.name.localeCompare(b.name));
   return (
     <Link
-      to="/admin/failover-channels"
+      to="/dhcp"
       className="flex items-center gap-3 px-4 py-2 text-[11px] hover:bg-muted/30"
     >
       <Shield className="h-3 w-3 flex-shrink-0 text-muted-foreground/60" />
-      <span className="w-28 truncate font-semibold" title={channel.name}>
-        {channel.name}
+      <span className="w-28 truncate font-semibold" title={group.name}>
+        {group.name}
       </span>
-      <span
-        className="w-24 truncate text-muted-foreground"
-        title={channel.mode}
-      >
-        {channel.mode}
+      <span className="w-24 truncate text-muted-foreground" title={group.mode}>
+        {group.mode}
       </span>
       <span className="ml-auto flex items-center gap-3">
-        <span className="flex items-center gap-1">
-          <span
-            className={cn("inline-block h-2 w-2 rounded-full", primaryDot)}
-            title={`primary: ${channel.primary_ha_state ?? "unknown"}`}
-          />
-          <span className="text-muted-foreground">
-            {channel.primary_server_name}
-            <span className="text-muted-foreground/60">
-              {" · "}
-              {channel.primary_ha_state ?? "unknown"}
+        {kea.map((s) => (
+          <span key={s.id} className="flex items-center gap-1">
+            <span
+              className={cn(
+                "inline-block h-2 w-2 rounded-full",
+                haStateDotCls(s.ha_state),
+              )}
+              title={`${s.name}: ${s.ha_state ?? "unknown"}`}
+            />
+            <span className="text-muted-foreground">
+              {s.name}
+              <span className="text-muted-foreground/60">
+                {" · "}
+                {s.ha_state ?? "unknown"}
+              </span>
             </span>
           </span>
-        </span>
-        <span className="flex items-center gap-1">
-          <span
-            className={cn("inline-block h-2 w-2 rounded-full", secondaryDot)}
-            title={`${secondaryLabel}: ${channel.secondary_ha_state ?? "unknown"}`}
-          />
-          <span className="text-muted-foreground">
-            {channel.secondary_server_name}
-            <span className="text-muted-foreground/60">
-              {" · "}
-              {channel.secondary_ha_state ?? "unknown"}
-            </span>
-          </span>
-        </span>
+        ))}
       </span>
     </Link>
   );

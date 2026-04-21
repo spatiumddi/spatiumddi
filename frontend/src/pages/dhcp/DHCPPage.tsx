@@ -432,27 +432,24 @@ function ServerScopesTab({ server }: { server: DHCPServer }) {
     queryFn: () => ipamApi.listSubnets(),
   });
 
-  // For a server, we list scopes across all subnets. We fetch per-subnet then
-  // keep only scopes where server_id matches (or is null — covering "any in
-  // group" scopes when the server is in a group).
-  const scopeQueries = useQueries({
-    queries: subnets.map((s) => ({
-      queryKey: ["dhcp-scopes-subnet", s.id],
-      queryFn: () => dhcpApi.listScopesBySubnet(s.id),
-    })),
+  // Under the group-centric model, scopes belong to a server's GROUP,
+  // not the server. All servers in the group render the same scopes.
+  // We query by the server's group and join in each scope's subnet
+  // CIDR (for display) via the subnet fetch above.
+  const { data: groupScopes = [] } = useQuery({
+    queryKey: ["dhcp-scopes-group", server.server_group_id ?? ""],
+    queryFn: () =>
+      server.server_group_id
+        ? dhcpApi.listScopesByGroup(server.server_group_id)
+        : Promise.resolve([]),
+    enabled: !!server.server_group_id,
   });
-  const allScopes: (DHCPScope & { subnet_network?: string })[] = scopeQueries
-    .flatMap((q, i) =>
-      (q.data ?? []).map((sc) => ({
-        ...sc,
-        subnet_network: subnets[i]?.network,
-      })),
-    )
-    .filter(
-      (sc) =>
-        sc.server_id === server.id ||
-        (sc.server_id === null && server.server_group_id),
-    );
+  const subnetById = new Map(subnets.map((s) => [s.id, s]));
+  const allScopes: (DHCPScope & { subnet_network?: string })[] =
+    groupScopes.map((sc) => ({
+      ...sc,
+      subnet_network: subnetById.get(sc.subnet_id)?.network,
+    }));
 
   const [createForSubnet, setCreateForSubnet] = useState<string | null>(null);
   const [editScope, setEditScope] = useState<DHCPScope | null>(null);
@@ -586,7 +583,7 @@ function ServerScopesTab({ server }: { server: DHCPServer }) {
       {createForSubnet && (
         <CreateScopeModal
           subnetId={createForSubnet}
-          defaultServerId={server.id}
+          defaultGroupId={server.server_group_id ?? undefined}
           onClose={() => setCreateForSubnet(null)}
         />
       )}
@@ -616,19 +613,18 @@ function ServerPoolsOrStaticsTab({
   server: DHCPServer;
   kind: "pools" | "statics";
 }) {
-  const { data: subnets = [] } = useQuery({
-    queryKey: ["subnets"],
-    queryFn: () => ipamApi.listSubnets(),
+  // Scopes belong to the server's group — pull them from there rather
+  // than iterating every subnet. Empty when the server has no group
+  // (groupless server = nothing to serve yet).
+  const { data: groupScopes = [] } = useQuery({
+    queryKey: ["dhcp-scopes-group", server.server_group_id ?? ""],
+    queryFn: () =>
+      server.server_group_id
+        ? dhcpApi.listScopesByGroup(server.server_group_id)
+        : Promise.resolve([]),
+    enabled: !!server.server_group_id,
   });
-  const scopeQueries = useQueries({
-    queries: subnets.map((s) => ({
-      queryKey: ["dhcp-scopes-subnet", s.id],
-      queryFn: () => dhcpApi.listScopesBySubnet(s.id),
-    })),
-  });
-  const allScopes = scopeQueries
-    .flatMap((q) => q.data ?? [])
-    .filter((sc) => sc.server_id === server.id || sc.server_id === null);
+  const allScopes = groupScopes;
 
   const nestedQueries = useQueries({
     queries: allScopes.map((sc) => ({
@@ -867,22 +863,34 @@ function ServerPoolsOrStaticsTab({
 
 function ClientClassesTab({ server }: { server: DHCPServer }) {
   const qc = useQueryClient();
+  const groupId = server.server_group_id ?? "";
   const { data: classes = [] } = useQuery({
-    queryKey: ["dhcp-client-classes", server.id],
-    queryFn: () => dhcpApi.listClientClasses(server.id),
+    queryKey: ["dhcp-client-classes", groupId],
+    queryFn: () =>
+      groupId ? dhcpApi.listClientClasses(groupId) : Promise.resolve([]),
+    enabled: !!groupId,
   });
   const [showCreate, setShowCreate] = useState(false);
   const [edit, setEdit] = useState<DHCPClientClass | null>(null);
   const [del, setDel] = useState<DHCPClientClass | null>(null);
   const delMut = useMutation({
-    mutationFn: (id: string) => dhcpApi.deleteClientClass(server.id, id),
+    mutationFn: (id: string) => dhcpApi.deleteClientClass(groupId, id),
     onSuccess: () => {
       qc.invalidateQueries({
-        queryKey: ["dhcp-client-classes", server.id],
+        queryKey: ["dhcp-client-classes", groupId],
       });
       setDel(null);
     },
   });
+
+  if (!groupId) {
+    return (
+      <p className="p-6 text-center text-sm text-muted-foreground">
+        This server is not attached to a group yet. Client classes are
+        configured on the server group — assign the server to a group first.
+      </p>
+    );
+  }
 
   return (
     <div className="space-y-3">
@@ -946,14 +954,14 @@ function ClientClassesTab({ server }: { server: DHCPServer }) {
 
       {showCreate && (
         <CreateClientClassModal
-          serverId={server.id}
+          groupId={groupId}
           onClose={() => setShowCreate(false)}
         />
       )}
       {edit && (
         <CreateClientClassModal
           klass={edit}
-          serverId={server.id}
+          groupId={groupId}
           onClose={() => setEdit(null)}
         />
       )}

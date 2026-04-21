@@ -30,12 +30,12 @@ export function CreatePoolModal({
   >(null);
 
   const { data: classes = [] } = useQuery({
-    queryKey: ["dhcp-client-classes", scope.server_id],
+    queryKey: ["dhcp-client-classes", scope.group_id],
     queryFn: () =>
-      scope.server_id
-        ? dhcpApi.listClientClasses(scope.server_id)
+      scope.group_id
+        ? dhcpApi.listClientClasses(scope.group_id)
         : Promise.resolve([]),
-    enabled: !!scope.server_id,
+    enabled: !!scope.group_id,
   });
 
   const mut = useMutation({

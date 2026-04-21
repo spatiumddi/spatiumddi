@@ -286,14 +286,16 @@ Phase 1 IPv6 closure + the Phase 2/3 DDNS / zone-state / CI-hardening items all 
   CRUD has no `view_id` assignment UI. The storage side is ready;
   what's missing is driver rendering + record-level view selection
   + UI binding on the record form. Phase 3.
-- ✅ **DHCP state failover (Kea HA) — core** — `DHCPFailoverChannel`
-  model pairs two Kea DHCPServer rows with mode (`hot-standby` /
-  `load-balancing`), per-peer HA URL, and heartbeat / max-response /
-  max-ack / max-unacked tuning. `ConfigBundle` carries a
-  `FailoverConfig` when the server is in a channel; the agent's
+- ✅ **DHCP state failover (Kea HA)** — under the group-centric data
+  model (2026.04.22-1), a `DHCPServerGroup` with two Kea members is
+  implicitly an HA pair. HA tuning (mode, heartbeat / max-response /
+  max-ack / max-unacked, auto-failover) lives on the group; per-peer
+  URL lives on each `DHCPServer.ha_peer_url`. `DHCPFailoverChannel`
+  is gone — merged into the group. `ConfigBundle` carries a
+  `FailoverConfig` when the server's group is an HA pair; the agent's
   `render_kea.py` injects `libdhcp_ha.so` + `high-availability`
-  alongside the existing `libdhcp_lease_cmds.so` hook. Peer URLs are
-  resolved agent-side (`_resolve_peer_url`) before render because
+  alongside the always-loaded `libdhcp_lease_cmds.so` hook. Peer URLs
+  are resolved agent-side (`_resolve_peer_url`) before render because
   Kea's Boost asio parser only accepts IP literals — hostnames like
   `http://dhcp-kea-2:8000/` would otherwise fail with `bad url`.
   Kea image splits ports: `:8000` is owned by the HA hook's
@@ -307,21 +309,13 @@ Phase 1 IPv6 closure + the Phase 2/3 DDNS / zone-state / CI-hardening items all 
   `/api/v1/dhcp/agents/ha-status`; the control plane stores it on
   `DHCPServer.ha_state` + `ha_last_heartbeat_at`. Bootstrap-from-
   cache now issues `config-reload` with retry so Kea picks up HA on
-  agent restart even when the ETag is unchanged. Admin page at
-  `/admin/failover-channels` does CRUD + Refresh; dashboard DHCP
-  column shows per-channel peer state pills when any channel exists;
-  DHCP server detail header shows a live HA pill (red / amber / green
-  by Kea state name). **Deferred follow-ups:**
-  - **Scope mirroring across an HA pair.** `DHCPScope` rows are
-    pinned to a single `server_id` today — pairing two servers in a
-    channel configures the HA hook but does **not** mirror subnets /
-    pools / statics / reservations. Both peers must have identical
-    subnet config for Kea HA to serve; operators mirror manually.
-    Two plausible shapes: (a) a "Mirror from primary" toggle on the
-    channel that keeps primary → secondary scopes in sync, (b)
-    promote scopes to the channel / server-set level so both peers
-    render from the same rows. (a) is less disruptive; (b) is cleaner
-    but a data-model migration.
+  agent restart even when the ETag is unchanged. HA config lives in
+  the main DHCP tab's server-group edit modal; the separate
+  `/admin/failover-channels` page is gone (legacy URL redirects to
+  `/dhcp`). Dashboard shows one row per HA pair with a live state
+  dot per peer. Scope mirroring happens automatically — all servers
+  in a group render the same scopes, pools, statics, and client
+  classes. **Deferred follow-ups:**
   - **Peer IP re-resolve loop.** Hostname → IP resolution happens
     once at render time. If a peer container/pod gets a new IP
     (compose `--force-recreate`, any k8s restart), the other peer's
@@ -334,7 +328,7 @@ Phase 1 IPv6 closure + the Phase 2/3 DDNS / zone-state / CI-hardening items all 
   - **Kea version skew guard.** The `status-get` HA shape shifted
     between Kea 2.4 and 2.6. Pairing peers on mismatched Kea
     versions is accepted today. Cheap fix: ship Kea version in the
-    heartbeat, reject channel creation if peers differ.
+    heartbeat, reject group membership changes if peers differ.
   - **DDNS double-write under HA.** Agent-side DDNS
     (`apply_ddns_for_lease`) doesn't gate on HA state — if the
     standby ever serves a lease (pre-sync window, partner-down),
@@ -343,9 +337,9 @@ Phase 1 IPv6 closure + the Phase 2/3 DDNS / zone-state / CI-hardening items all 
   - **State-transition actions** (`ha-maintenance-start`,
     `ha-continue`, force-sync) — observable today but operators
     can't drive the HA state machine from the UI.
-  - **Peer compatibility validation** (refuse pairs without
-    overlapping subnets), per-pool HA scope tuning for
-    load-balancing.
+  - **Peer compatibility validation** (refuse groups with ≥ 3 Kea
+    members because `libdhcp_ha.so` only supports pairs), per-pool
+    HA scope tuning for load-balancing.
   - **HA e2e test.** `.github/workflows/agent-e2e.yml` stands up
     a single-agent DNS pair today; an HA DHCP variant would have
     caught all the bootstrap / port-split / `status-get` regressions

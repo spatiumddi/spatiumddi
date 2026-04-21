@@ -16,7 +16,6 @@ import { CustomFieldsPage } from "@/pages/admin/CustomFieldsPage";
 import { ApiTokensPage } from "@/pages/admin/ApiTokensPage";
 import { AlertsPage } from "@/pages/admin/AlertsPage";
 import { AuthProvidersPage } from "@/pages/admin/AuthProvidersPage";
-import { FailoverChannelsPage } from "@/pages/admin/FailoverChannelsPage";
 import { GroupsPage } from "@/pages/admin/GroupsPage";
 import { RolesPage } from "@/pages/admin/RolesPage";
 import { SettingsPage } from "@/pages/SettingsPage";
@@ -58,7 +57,7 @@ export default function App() {
         <Route path="admin/alerts" element={<AlertsPage />} />
         <Route
           path="admin/failover-channels"
-          element={<FailoverChannelsPage />}
+          element={<Navigate to="/dhcp" replace />}
         />
         <Route path="settings" element={<SettingsPage />} />
       </Route>

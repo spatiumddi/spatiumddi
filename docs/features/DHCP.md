@@ -27,13 +27,17 @@ DHCPServer
 
 ### DHCP Server Groups
 
-For HA deployments, two DHCP servers can be placed in the same **server group** (Kea uses `HA hook library`). The SpatiumDDI driver is aware of the HA relationship and pushes config to both.
+**DHCPServerGroup is the primary configuration container.** Scopes, pools, statics, and client classes all belong to a group — every member server renders the same Kea config. A group with one member is a standalone DHCP service; a group with two Kea members is implicitly an HA pair, driving the `libdhcp_ha.so` hook.
 
 ```
 DHCPServerGroup
-  id, name
-  mode: enum(load-balancing, hot-standby)
-  servers: [DHCPServer]          -- exactly 2 for failover/HA
+  id, name, description
+  mode: enum(standalone, hot-standby, load-balancing)
+  heartbeat_delay_ms, max_response_delay_ms, max_ack_delay_ms, max_unacked_clients
+  auto_failover: bool
+  servers: [DHCPServer]          -- 2 Kea members = HA pair
+  scopes: [DHCPScope]            -- rendered on every member
+  client_classes: [DHCPClientClass]
 ```
 
 ---
@@ -49,7 +53,7 @@ This is the most granular part of the DHCP model. Within a **subnet**, you can d
 
 ```
 Subnet
-  └── DHCPScope (one per subnet per DHCP server)
+  └── DHCPScope (one per subnet per DHCP server group)
         ├── DHCPPool (one or more dynamic ranges)
         └── DHCPStaticAssignment (zero or many)
 ```
@@ -58,7 +62,7 @@ Subnet
 
 ```
 DHCPScope
-  id, server_id, subnet_id
+  id, group_id, subnet_id
   is_active: bool
   lease_time: int (seconds, default 86400)
   max_lease_time: int
@@ -150,7 +154,7 @@ Client classes let you define rules for how clients are categorized and which po
 
 ```
 DHCPClientClass
-  id, server_id
+  id, group_id          -- all members of the group get the same classes
   name: str             -- e.g., "VoIPPhones"
   match_expression: str -- Kea expression
                         -- e.g., "option[60].hex == 'Cisco7960'"
@@ -168,7 +172,7 @@ Leases are **read-only** in SpatiumDDI — they are pulled from the DHCP server,
 ```
 DHCPLease (not persisted long-term — cached in Redis, written to DB for history)
   ip_address, mac_address, hostname
-  scope_id, server_id
+  scope_id, server_id   -- per-server (each Kea owns its own memfile)
   starts_at, ends_at, expires_at
   state: enum(active, expired, released, abandoned)
   client_id, user_class
@@ -383,15 +387,16 @@ DHCPScope.hostname_to_ipam_sync: enum(disabled, on_lease, on_static_only)
 
 ---
 
-## 14. DHCP Pool Coordination — Kea HA Failover Channels
+## 14. DHCP Pool Coordination — Kea HA on a Server Group
 
-When two DHCP server containers serve the same pool, they must not hand the same IP to different MACs. SpatiumDDI solves this by pairing the two peers in a **`DHCPFailoverChannel`** — one row in the `dhcp_failover_channel` table that renders into Kea's `libdhcp_ha.so` hook on each peer's config.
+When two DHCP server containers serve the same pool, they must not hand the same IP to different MACs. SpatiumDDI solves this by treating a **`DHCPServerGroup` with two Kea members as an implicit HA pair** — HA tuning lives on the group, per-peer URL lives on each server, and Kea's `libdhcp_ha.so` hook is rendered on every member's config. There is no separate "failover channel" row any more (that was removed in 2026.04.22-1 when scopes moved to the group).
 
 ### Data model
 
-- `DHCPFailoverChannel(id, name, mode, primary_server_id, secondary_server_id, primary_peer_url, secondary_peer_url, heartbeat_delay_ms, max_response_delay_ms, max_ack_delay_ms, max_unacked_clients, auto_failover)` — see `backend/app/models/dhcp.py`.
-- A `DHCPServer` row may belong to **at most one** channel. Unique FK constraints enforce this at the DB level; the CRUD router surfaces a friendlier 409 when you try to add a server that's already paired.
-- Only the `kea` driver is eligible — Windows DHCP has its own failover story (MS clustering) and is rejected at the CRUD layer.
+- HA config fields live on `DHCPServerGroup`: `mode`, `heartbeat_delay_ms`, `max_response_delay_ms`, `max_ack_delay_ms`, `max_unacked_clients`, `auto_failover`.
+- Each `DHCPServer` has its own `ha_peer_url` — the listener endpoint the partner calls for heartbeats + lease updates. Empty string for standalone servers.
+- A group with **one Kea member** is standalone; HA fields are ignored. A group with **two Kea members + non-empty `ha_peer_url` on both** renders HA into their configs. Three-or-more Kea members is nonsensical for `libdhcp_ha.so` (it only speaks pairs) and should be validated at the CRUD layer.
+- Mixed groups (Kea + Windows DHCP read-only) are allowed — only the Kea members participate in HA.
 
 ### Modes
 
@@ -400,7 +405,7 @@ When two DHCP server containers serve the same pool, they must not hand the same
 
 ### What the agent ships
 
-On each `ConfigBundle` long-poll, the control plane emits a `failover` block alongside scopes / client-classes when the server belongs to a channel. The agent's `render_kea.py` injects two hook entries in `Dhcp4.hooks-libraries`:
+On each `ConfigBundle` long-poll, the control plane emits a `failover` block alongside scopes / client-classes when the server's group is an HA pair. The agent's `render_kea.py` injects two hook entries in `Dhcp4.hooks-libraries`:
 
 ```json
 { "library": "/usr/lib/kea/hooks/libdhcp_lease_cmds.so" }
@@ -428,17 +433,17 @@ The `libdhcp_lease_cmds.so` hook is a hard prerequisite for HA and is loaded unc
 
 A fourth thread in the agent (`HAStatusPoller`, `agent/dhcp/spatium_dhcp_agent/ha_status.py`) calls `ha-status-get` against the local Kea control socket every ~15 s with small jitter and POSTs the result to `POST /api/v1/dhcp/agents/ha-status`. The control plane stores the state on `DHCPServer.ha_state` + `ha_last_heartbeat_at`. The poller self-disables when the most recent bundle carried no `failover` block, so standalone servers don't spam Kea with commands that return an error.
 
-Kea state names pass through verbatim (`normal` / `hot-standby` / `load-balancing` / `ready` / `waiting` / `syncing` / `communications-interrupted` / `partner-down` / `backup` / `passive-backup` / `terminated`). The DHCP server detail header renders a colored `HA: <state>` pill, and the admin page at `/admin/failover-channels` shows both peers' states side-by-side with a 30 s refetch.
+Kea state names pass through verbatim (`normal` / `hot-standby` / `load-balancing` / `ready` / `waiting` / `syncing` / `communications-interrupted` / `partner-down` / `backup` / `passive-backup` / `terminated`). The DHCP server detail header renders a colored `HA: <state>` pill. The dashboard's DHCP column lists one row per HA-paired group with a state dot per peer.
 
 ### Not yet shipped (follow-up)
 
 - **State-transition actions** — `ha-maintenance-start`, `ha-continue`, force-sync. The state machine is observable today but operators can't drive it from the UI; `kubectl exec` + manual `kea-shell` is the workaround.
-- **Peer compatibility validation** — there's nothing today that enforces both peers serve the same subnets or have compatible pool definitions. The control plane pushes whatever scopes each server has and lets Kea sort it out.
+- **Peer compatibility validation** — the control plane doesn't yet refuse groups with ≥ 3 Kea members (Kea HA only supports pairs).
 - **Per-pool HA scope tuning** — the Kea HA hook supports per-subnet scope overrides; we render the relationship globally only.
 
-### Managing channels
+### Managing HA
 
-Superadmin UI at **Admin → DHCP Failover** (`/admin/failover-channels`) does full CRUD. Create a new channel by picking two Kea-driver servers, setting the peer URLs (whatever each peer's `kea-ctrl-agent` listens on — typically `http://<host>:8000/` in the SpatiumDDI-shipped image), and optionally tuning heartbeat / max-response / max-ack / max-unacked values. Deleting a channel removes the HA hook from both peers on the next config push.
+HA is configured on the server group, not a separate page. Edit the group under the DHCP tab, pick mode (`hot-standby` / `load-balancing`), tune the heartbeat / max-response / max-ack / max-unacked fields if the defaults don't fit your network, and make sure each Kea member has its **HA Peer URL** filled in (the server-level field) — typically `http://<host>:8000/` on the SpatiumDDI-shipped image. The HA hook renders automatically once the group has two Kea peers with non-empty URLs. Removing a server from the group or clearing its URL drops the hook on the next config push.
 
 ---
 
@@ -530,20 +535,18 @@ rule here has been surfaced to an operator, not just silently logged.
 
 ### Scopes
 
-- **Scope already exists for this server + subnet.** A subnet may host
-  at most one scope per server. `409` at
-  `backend/app/api/v1/dhcp/scopes.py:217`.
-- **`server_id` required when multiple servers are registered.** If
-  more than one DHCP server is defined, scope-create must name one
-  explicitly; SpatiumDDI won't guess. Single-server deployments can
-  omit the field. `422` at `backend/app/api/v1/dhcp/scopes.py:206`.
+- **Scope already exists for this group + subnet.** A subnet may host
+  at most one scope per server group. `409` at
+  `backend/app/api/v1/dhcp/scopes.py`.
+- **`group_id` required when multiple groups are registered.** If
+  more than one DHCP server group is defined, scope-create must name
+  one explicitly; single-group deployments can omit the field.
+  `422` at `backend/app/api/v1/dhcp/scopes.py`.
 - **Hostname sync mode must be one of the configured values.** Mode
   picker is validated against `VALID_SYNC_MODES`; reserved / internal
-  modes are not selectable from the API. `422` at
-  `backend/app/api/v1/dhcp/scopes.py:220`.
+  modes are not selectable from the API. `422`.
 - **DDNS hostname policy enum.** `ddns_hostname_policy` must match one
-  of the documented values (see §13). Pydantic validator at
-  `backend/app/api/v1/dhcp/scopes.py:101`.
+  of the documented values (see §13). Pydantic validator.
 
 ### Pools
 
@@ -556,10 +559,11 @@ rule here has been surfaced to an operator, not just silently logged.
 
 ### Static reservations
 
-- **Duplicate MAC on the same server.** A MAC can only be reserved
-  once per server, regardless of which scope it's attached to — this
-  matches how Kea and Windows DHCP both treat the MAC as a server-wide
-  identifier. `409` at `backend/app/api/v1/dhcp/statics.py:146`.
+- **Duplicate MAC in the same group.** A MAC can only be reserved
+  once per server group, regardless of which scope it's attached to
+  — under the group-centric model every peer in the group serves
+  the same reservation so duplicates across scopes in the same
+  group are rejected. `409` at `backend/app/api/v1/dhcp/statics.py`.
 - **Static IP inside a dynamic pool.** A static reservation whose IP
   falls inside a `dynamic` pool is refused; delete or shrink the pool,
   or convert the pool to `reserved` / `excluded` first. `409` at
@@ -587,30 +591,24 @@ rule here has been surfaced to an operator, not just silently logged.
 - **Server-group mode enum.** `VALID_MODES` only; enforced at
   `backend/app/api/v1/dhcp/server_groups.py:35`.
 
-### Failover channels (Kea HA)
+### Kea HA (on a server group)
 
-- **At most one channel per server.** Each DHCPServer row may appear
-  in at most one `dhcp_failover_channel` (either as primary or
-  secondary). Unique FK constraints in the migration plus a
-  pre-check in the CRUD router. `409` at
-  `backend/app/api/v1/dhcp/failover_channels.py:168`.
-- **Primary and secondary must differ.** The two peers must be
-  distinct servers — obvious but still checked at both the Pydantic
-  and router layer. `422` at
-  `backend/app/api/v1/dhcp/failover_channels.py:63` (body validator)
-  and `:207` (update path).
-- **Kea driver only.** Channels refuse non-Kea drivers; Windows DHCP
-  pairing is out of scope here. `422` at
-  `backend/app/api/v1/dhcp/failover_channels.py:183`.
-- **Mode enum.** `mode` must be `hot-standby` or `load-balancing`;
-  `VALID_MODES` in `backend/app/api/v1/dhcp/failover_channels.py:34`
-  rejects anything else with `422`.
-- **Duplicate channel name.** `409` at
-  `backend/app/api/v1/dhcp/failover_channels.py:216`.
+- **At most 2 Kea members in a group.** `libdhcp_ha.so` only supports
+  pairs; adding a third Kea member makes the config ambiguous.
+  Validation is a deferred follow-up (see `CLAUDE.md`), not enforced
+  at the CRUD layer today.
+- **Group mode enum.** `mode` must be `standalone`, `hot-standby`, or
+  `load-balancing`. Enforced at `backend/app/api/v1/dhcp/server_groups.py`.
+- **HA rendering requires both peers' URLs.** If either Kea member in
+  a 2-member group has an empty `ha_peer_url`, the config bundle
+  drops the `failover` block and neither peer loads the HA hook —
+  silent fall-through to "not-yet-configured" state.
+- **Mixed driver groups are OK.** A group can contain Windows DHCP
+  servers alongside Kea; only Kea members participate in the HA
+  rendering path.
 
 ### Client classes
 
-- **Duplicate client-class name per server.** Class names are scoped
-  to the server, not the group; two servers can reuse the name but
-  one server may not. `409` at
-  `backend/app/api/v1/dhcp/client_classes.py:73`.
+- **Duplicate client-class name per group.** Class names are scoped
+  to the server group — every member renders the same classes. `409` at
+  `backend/app/api/v1/dhcp/client_classes.py`.

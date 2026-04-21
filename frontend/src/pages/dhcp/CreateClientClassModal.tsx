@@ -6,11 +6,11 @@ import { DHCPOptionsEditor } from "./DHCPOptionsEditor";
 
 export function CreateClientClassModal({
   klass,
-  serverId,
+  groupId,
   onClose,
 }: {
   klass?: DHCPClientClass;
-  serverId: string;
+  groupId: string;
   onClose: () => void;
 }) {
   const qc = useQueryClient();
@@ -42,11 +42,11 @@ export function CreateClientClassModal({
         options: optionsDict,
       };
       return editing
-        ? dhcpApi.updateClientClass(serverId, klass!.id, data)
-        : dhcpApi.createClientClass(serverId, data);
+        ? dhcpApi.updateClientClass(groupId, klass!.id, data)
+        : dhcpApi.createClientClass(groupId, data);
     },
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["dhcp-client-classes", serverId] });
+      qc.invalidateQueries({ queryKey: ["dhcp-client-classes", groupId] });
       onClose();
     },
     onError: (e) => setError(errMsg(e, "Failed to save client class")),

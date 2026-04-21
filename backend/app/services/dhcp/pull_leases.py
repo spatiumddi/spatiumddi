@@ -142,7 +142,7 @@ async def pull_leases_from_server(
 
     result.server_leases = len(wire)
 
-    scope_cache = await _load_scope_cache(db, server.id)
+    scope_cache = await _load_scope_cache(db, server.server_group_id)
 
     now = datetime.now(UTC)
 
@@ -314,16 +314,18 @@ async def _load_subnet_cache(db: AsyncSession) -> list[tuple[Subnet, ipaddress._
     return out
 
 
-async def _load_scope_cache(db: AsyncSession, server_id: Any) -> dict[Any, Any]:
-    """Map ``subnet_id -> scope_id`` for the active scopes served by this
-    DHCP server. Windows leases have no scope backlink in SpatiumDDI's
-    data model until we resolve them through the IPAM subnet — this
-    lookup wires the ``DHCPLease.scope_id`` FK when the subnet is one we
-    have a scope row for, and leaves it NULL otherwise.
+async def _load_scope_cache(db: AsyncSession, group_id: Any) -> dict[Any, Any]:
+    """Map ``subnet_id -> scope_id`` for active scopes served by this
+    server's group. Windows leases have no scope backlink until we
+    resolve through the IPAM subnet — this lookup wires the
+    ``DHCPLease.scope_id`` FK when the subnet has a scope in this group,
+    and leaves it NULL otherwise.
     """
+    if group_id is None:
+        return {}
     res = await db.execute(
         select(DHCPScope.subnet_id, DHCPScope.id).where(
-            DHCPScope.server_id == server_id,
+            DHCPScope.group_id == group_id,
             DHCPScope.is_active.is_(True),
         )
     )
@@ -384,13 +386,22 @@ async def _upsert_scope(
         result.scopes_skipped_no_subnet += 1
         return
 
+    # Scope is keyed by (group_id, subnet_id) now. If the Windows server
+    # has no group, skip — a groupless Windows server can't own scopes
+    # in the group-centric model (migration assigns every server a
+    # singleton group, but a freshly-created unpartitioned server hits
+    # this branch until an operator attaches it to a group).
+    if server.server_group_id is None:
+        result.scopes_skipped_no_subnet += 1
+        return
+
     # DHCPScope eager-loads ``pools`` and ``statics`` collections, so the
     # result iterator must be uniqued before calling scalar_one_or_none().
     existing_scope = (
         (
             await db.execute(
                 select(DHCPScope).where(
-                    DHCPScope.server_id == server.id,
+                    DHCPScope.group_id == server.server_group_id,
                     DHCPScope.subnet_id == matching_subnet.id,
                 )
             )
@@ -411,7 +422,7 @@ async def _upsert_scope(
     if existing_scope is None:
         if apply:
             existing_scope = DHCPScope(
-                server_id=server.id,
+                group_id=server.server_group_id,
                 subnet_id=matching_subnet.id,
                 **scope_fields,
             )

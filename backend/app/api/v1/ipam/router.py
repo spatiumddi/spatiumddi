@@ -2705,21 +2705,32 @@ async def delete_subnet(
     # DHCPScope.subnet_id is ``ondelete=CASCADE`` so the rows themselves
     # (+ pools / statics via ORM cascade) will be cleaned automatically
     # when the subnet is deleted.
+    # Under the group-centric model, a scope belongs to a group which
+    # may contain N servers (mixed drivers allowed). Fan out:
+    #   * push_scope_delete walks the group's Windows members and pushes
+    #     the Remove-DhcpServerv4Scope cmdlet to each of them.
+    #   * Every Kea member needs a bundle refresh so the next long-poll
+    #     drops the subnet from its rendered config.
     scope_rows = (
-        await db.execute(
-            select(DHCPScope, DHCPServer)
-            .join(DHCPServer, DHCPScope.server_id == DHCPServer.id, isouter=True)
-            .where(DHCPScope.subnet_id == subnet_id)
-        )
-    ).all()
+        (await db.execute(select(DHCPScope).where(DHCPScope.subnet_id == subnet_id)))
+        .scalars()
+        .all()
+    )
     agent_servers_to_refresh: dict[uuid.UUID, DHCPServer] = {}
-    for scope, server in scope_rows:
-        if server is None:
-            continue
-        if is_agentless(server.driver):
-            await push_scope_delete(db, scope)
-        else:
-            agent_servers_to_refresh[server.id] = server
+    for scope in scope_rows:
+        await push_scope_delete(db, scope)  # fans out over Windows members of the group
+        group_servers = (
+            (
+                await db.execute(
+                    select(DHCPServer).where(DHCPServer.server_group_id == scope.group_id)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for srv in group_servers:
+            if not is_agentless(srv.driver):
+                agent_servers_to_refresh[srv.id] = srv
 
     # Clean up DNS artifacts so we don't leave orphaned records/zones behind.
     # IPAddress rows cascade-delete with the subnet, but DNSRecord.ip_address_id
