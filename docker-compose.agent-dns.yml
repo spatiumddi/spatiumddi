@@ -1,0 +1,72 @@
+name: spatiumddi-agent-dns
+
+# ── Standalone DNS agent compose file ─────────────────────────────────
+#
+# For running a BIND9 DNS agent on a machine *without* the SpatiumDDI
+# control plane. Typical distributed deployment shape:
+#
+#   * Control plane runs on one VM (``docker-compose.yml``).
+#   * Each DNS server runs this compose file on its own VM, pointing
+#     at the control plane's API URL.
+#
+# Quickstart:
+#
+#   export CONTROL_PLANE_URL=https://spatium.example.com
+#   export DNS_AGENT_KEY=$(openssl rand -hex 32)
+#   # Register the key on the control plane first (Settings → Agent
+#   # Keys) so the agent can bootstrap.
+#
+#   docker compose -f docker-compose.agent-dns.yml up -d
+#
+# For secondary / authoritative pairs, run this compose file on each
+# additional DNS VM with DNS_HOSTNAME set to a unique server name and
+# the same AGENT_GROUP — the control plane wires them into the same
+# view / zone set automatically.
+#
+# ──────────────────────────────────────────────────────────────────────
+
+services:
+
+  dns-bind9:
+    image: ghcr.io/spatiumddi/dns-bind9:${SPATIUMDDI_VERSION:-latest}
+    restart: unless-stopped
+    hostname: ${DNS_HOSTNAME:-dns-bind9}
+    networks:
+      - spatiumddi-agent
+    environment:
+      # ── Required ──────────────────────────────────────────────────
+      # URL of the SpatiumDDI control plane API (remote).
+      CONTROL_PLANE_URL: ${CONTROL_PLANE_URL:?CONTROL_PLANE_URL required}
+      # Pre-shared key registered on the control plane first.
+      DNS_AGENT_KEY: ${DNS_AGENT_KEY:?DNS_AGENT_KEY required}
+
+      # ── Registration ──────────────────────────────────────────────
+      # Server name used for auto-registration. MUST be unique across
+      # the deployment.
+      SERVER_NAME: ${DNS_HOSTNAME:-dns-bind9}
+      AGENT_GROUP: ${DNS_AGENT_GROUP:-default}
+      AGENT_ROLES: ${DNS_AGENT_ROLES:-authoritative}
+
+      # ── TLS ───────────────────────────────────────────────────────
+      SPATIUM_INSECURE_SKIP_TLS_VERIFY: "${SPATIUM_INSECURE_SKIP_TLS_VERIFY:-1}"
+      # TLS_CA_PATH: /etc/ssl/spatium-ca.crt
+    volumes:
+      - dns_bind9_state:/var/lib/spatium-dns-agent
+      - dns_bind9_cache:/var/cache/bind
+      # Optional: mount a CA bundle to verify the control plane.
+      # - /etc/ssl/certs:/etc/ssl/certs:ro
+    ports:
+      # DNS — UDP and TCP. The host-port defaults (5353) are lab-friendly
+      # to avoid colliding with systemd-resolved on 53. For a real DNS
+      # server use port 53 directly, typically with ``network_mode:
+      # host`` so clients can reach it without DNAT.
+      - "${DNS_HOST_PORT:-5353}:53/udp"
+      - "${DNS_HOST_PORT:-5353}:53/tcp"
+
+networks:
+  spatiumddi-agent:
+    driver: bridge
+
+volumes:
+  dns_bind9_state:
+  dns_bind9_cache:

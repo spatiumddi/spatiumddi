@@ -225,3 +225,68 @@ gunzip -c backup-YYYYMMDD.sql.gz | docker compose exec -T postgres psql -U spati
 ### Redis backup
 
 Redis persistence (`appendonly yes`) is enabled. The RDB/AOF files are in the `redis_data` volume. For point-in-time backup, also copy that volume.
+
+---
+
+## 10. Distributed Agent Deployments
+
+For real production use you generally don't want the Kea DHCP agent and the BIND9 DNS agent running on the same host as the control plane. SpatiumDDI ships two standalone compose files for that shape:
+
+| File | Purpose |
+|---|---|
+| `docker-compose.agent-dhcp.yml` | Kea DHCP agent(s) only — no control plane |
+| `docker-compose.agent-dns.yml`  | BIND9 DNS agent only — no control plane |
+
+The agent containers long-poll the remote control plane's API and cache the last-known-good config locally (non-negotiable #5), so the DHCP / DNS services keep serving even if the control plane is briefly unreachable.
+
+### Prerequisites
+
+1. Control plane already running somewhere reachable (e.g. `https://spatium.example.com`).
+2. Generate an agent key and register it on the control plane before starting the agent. Settings → Agent Keys (or `POST /api/v1/agent-keys`) — the control plane rejects bootstrap attempts with an unknown key.
+3. If the control plane uses a self-signed cert, either mount a CA bundle at `/etc/ssl/certs/spatium-ca.crt` and set `TLS_CA_PATH`, or (lab-only) leave `SPATIUM_INSECURE_SKIP_TLS_VERIFY=1`.
+
+### DHCP-only VM
+
+```bash
+# On the DHCP VM (separate host from the control plane):
+export SPATIUM_API_URL=https://spatium.example.com
+export SPATIUM_AGENT_KEY=$(openssl rand -hex 32)
+export DHCP_HOSTNAME=dhcp-kea-east    # unique across the deployment
+
+# Single Kea node:
+docker compose -f docker-compose.agent-dhcp.yml up -d
+
+# Local HA pair (rare in prod — usually each peer goes on its own VM):
+docker compose -f docker-compose.agent-dhcp.yml --profile dhcp-ha up -d
+```
+
+For a **true HA pair across two VMs**, run the same compose file on each VM with a different `DHCP_HOSTNAME` (say `dhcp-kea-east` and `dhcp-kea-west`) and the same `AGENT_GROUP`. On the control plane, edit the DHCP Server Group's HA mode (hot-standby or load-balancing) and set each server's `ha_peer_url` to the other peer's reachable URL. The agent resolves peer hostnames at render time and the `PeerResolveWatcher` thread keeps them fresh if IPs change.
+
+### DNS-only VM
+
+```bash
+export CONTROL_PLANE_URL=https://spatium.example.com
+export DNS_AGENT_KEY=$(openssl rand -hex 32)
+export DNS_HOSTNAME=dns-bind9-east
+
+docker compose -f docker-compose.agent-dns.yml up -d
+```
+
+For authoritative + secondary pairs, run this on each additional DNS VM with a unique `DNS_HOSTNAME` and the same `AGENT_GROUP`. Zone assignments and view membership are configured on the control plane.
+
+### Host vs bridge networking
+
+Default ports in both files map to non-53 / non-67 host ports (5353/udp+tcp, 6767/udp) so the containers don't collide with systemd-resolved or a running dhcp client on the host.
+
+For **real DNS / DHCP serving** you want `network_mode: host` so the daemon binds 53 / 67 directly and, for DHCP, receives L2 broadcasts on the host NIC. Add to the service definition:
+
+```yaml
+services:
+  dhcp-kea:
+    network_mode: host
+    # ...remove the `networks:` + `ports:` keys when host-networked.
+```
+
+### Observability
+
+Once registered, the agent shows up on the control plane's Dashboard and in DHCP → Servers or DNS → Servers. Heartbeat / online status updates every 30s.
