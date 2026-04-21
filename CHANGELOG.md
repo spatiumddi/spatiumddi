@@ -11,6 +11,120 @@ _No unreleased changes yet._
 
 ---
 
+## 2026.04.20-2 — 2026-04-20
+
+Follow-on polish release. Dark sidebar so the nav is distinct from
+content in light mode, per-zone / per-space color tagging, zebra
+striping across every long-list table, and a batch of delete-flow
+bug fixes turning silent failures into actionable 409s. New
+troubleshooting doc + "Rules & constraints" sections in the feature
+specs so operators hitting a 409 can jump straight to the
+enforcement site.
+
+### Added
+
+**Theme + color**
+- Dark sidebar in both themes (`--sidebar-*` CSS tokens wired through
+  tailwind.config). In light mode the sidebar is dark slate with a
+  white-pill active item so it no longer blends into the page; in
+  dark mode it sits slightly darker than content for separation.
+- `DNSZone.color` (migration `f4a9c1b2d6e7`) and `IPSpace.color`
+  (migration `a5b8e9c31f42`). Curated 8-swatch set
+  (slate/red/amber/emerald/cyan/blue/violet/pink) — free-form hex
+  is deliberately rejected so every choice stays legible in both
+  themes. Zones render a colored dot on tree rows, list rows, and
+  the zone detail header. Spaces paint the tint as the *row
+  background* (since spaces sit at the top of the tree); selection
+  uses a `ring-1` so the color stays visible when the space is
+  selected. Closes [#20].
+- Shared `<SwatchPicker>` (`components/ui/swatch-picker.tsx`) + the
+  `SWATCH_COLORS` / `swatchCls` / `swatchTintCls` helpers in
+  `lib/utils.ts` so DNS and IPAM stay coherent.
+
+**Zebra striping across long-list tables**
+- `zebraBodyCls` utility applied to every substantial `<tbody>`:
+  IPAM addresses / blocks / subnets / aliases, DNS zones / records,
+  DHCP scopes / pools, VLANs, Users / Groups / Roles / Audit, and
+  the Logs grid.
+- Uses `bg-foreground/[0.05]` + hover `bg-foreground/[0.09]` instead
+  of `bg-muted/40`. The old `muted` tint in light mode was only ~4%
+  lightness darker than white and effectively invisible; the
+  foreground-based tint gives consistent contrast in both themes.
+
+**Docs**
+- New `docs/TROUBLESHOOTING.md` covering the recovery recipes that
+  aren't obvious from the feature specs: accidentally deleting a
+  DNS / DHCP server from the UI (agent auto-rebootstraps via PSK on
+  404; manual escape is wiping `agent_token.jwt` + `agent-id` and
+  restarting), admin-password reset, and the new subnet-delete 409
+  behaviour.
+- "Rules & constraints" sections added to `IPAM.md` / `DHCP.md` /
+  `DNS.md` / `AUTH.md`. Each rule: one-line intent, short
+  why-it-exists where non-obvious, and `file:line` + HTTP status so
+  operators can jump from a response `detail` to the enforcement
+  site. ~100 rules across the four domains (delete guards, overlap
+  checks, pool / collision rules, enum validators, Windows
+  push-before-commit).
+- `CLAUDE.md` doc map gains the TROUBLESHOOTING.md entry.
+
+### Changed
+
+- **Subnet delete is now refused when non-empty.** The endpoint used
+  to cascade silently (wiping IPs + scopes with the subnet); it now
+  returns `409` with a breakdown (*"Subnet is not empty: N allocated
+  IP addresses, M DHCP scopes"*) matching the existing block-delete
+  behaviour. Opt into the cascade with `?force=true`; the pre-delete
+  WinRM remove-scope + Kea bundle rebuild still run either way so
+  nothing is orphaned on a running server.
+- Dashboard live-activity column widths. Long audit action names
+  like `DHCP.SERVER.SYNC-LEASES` were breaking on the hyphen and
+  bleeding into the adjacent resource column. Action column widened
+  from `w-14` (56px) to `w-36` (144px); resource-type bumped to
+  `w-20`.
+
+### Fixed
+
+- **Silent failures across every subnet / block delete path.**
+  Single-subnet delete from the tree, single-subnet delete from the
+  Edit Subnet modal, block-level bulk subnet delete, space-level
+  bulk delete (mixed subnets + blocks), and block delete from the
+  tree context menu all now capture 409 responses and render the
+  detail inline in `ConfirmDestroyModal`. Bulk paths use
+  `Promise.allSettled` + per-item messages so one blocker doesn't
+  hide the rest; successes still commit.
+- Space color stayed invisible when the space was selected because
+  `bg-primary/5` overrode the tint. Selection now uses `ring-1
+  ring-primary/60` so the color stays visible alongside the
+  selection indicator.
+- Multi-line errors in the confirmation modal — `whitespace-pre-line`
+  + `max-h-48 overflow-auto` on the error box so long failure lists
+  from bulk deletes scroll instead of pushing the buttons off-screen.
+
+[#20]: https://github.com/spatiumddi/spatiumddi/issues/20
+
+---
+
+## 2026.04.20-1 — 2026-04-20
+
+CI-only release to fix the multi-arch build in the release workflow
+and publish the previously-missing agent images.
+
+### Fixed
+
+- Release workflow matrix was pushing each platform to the same tag
+  separately, so the second push overwrote the first — the resulting
+  images had no `linux/amd64` manifest and `docker compose pull`
+  failed on amd64 hosts. Switched to a single job with
+  `platforms: linux/amd64,linux/arm64` via QEMU so the push produces
+  a proper multi-arch manifest list.
+- Added `build-dns` and `build-dhcp` jobs so `dns-bind9` and
+  `dhcp-kea` images are actually built and published alongside
+  `spatiumddi-api` and `spatiumddi-frontend`. These images were
+  referenced by `docker-compose.yml` but never produced by the
+  release pipeline.
+
+---
+
 ## 2026.04.19-1 — 2026-04-19
 
 The **performance, polish, and visibility** release. Batched WinRM
