@@ -1,14 +1,26 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { settingsApi, authApi, type PlatformSettings } from "@/lib/api";
 import {
+  settingsApi,
+  authApi,
+  type OUITaskStatus,
+  type PlatformSettings,
+} from "@/lib/api";
+import {
+  AlertCircle,
   ArrowRight,
   ArrowLeftRight,
+  CheckCircle2,
+  Loader2,
+  RefreshCw,
   RotateCcw,
   Save,
   Search,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { Modal } from "@/components/ui/modal";
+
+const OUI_SOURCE_URL = "https://standards-oui.ieee.org/oui/oui.csv";
 
 function Field({
   label,
@@ -72,6 +84,7 @@ type SectionId =
   | "dhcp-lease-sync"
   | "audit-forward"
   | "ip-allocation"
+  | "oui-lookup"
   | "session"
   | "subnet-tree"
   | "updates"
@@ -141,6 +154,7 @@ const SECTION_FIELDS: Record<SectionId, (keyof PlatformSettings)[]> = {
     "audit_forward_webhook_auth_header",
   ],
   "ip-allocation": ["ip_allocation_strategy"],
+  "oui-lookup": ["oui_lookup_enabled", "oui_update_interval_hours"],
   session: ["session_timeout_minutes", "auto_logout_minutes"],
   "subnet-tree": ["subnet_tree_default_expanded_depth"],
   updates: ["github_release_check_enabled"],
@@ -175,6 +189,281 @@ function LayerDiagram({
       />
       <span className={pill}>Windows / BIND9</span>
     </div>
+  );
+}
+
+function OUIRefreshModal({ onClose }: { onClose: () => void }) {
+  const qc = useQueryClient();
+  // ``null`` = we haven't POSTed yet; kicked by the button below.
+  const [taskId, setTaskId] = useState<string | null>(null);
+  const [startedAt] = useState<number>(() => Date.now());
+  const [hardError, setHardError] = useState<string | null>(null);
+  // Poll the status endpoint until the task reaches a terminal state.
+  // PENDING vs STARTED aren't distinguishable up-front so we keep
+  // polling every 2s and stop as soon as ``ready`` flips true.
+  const { data: taskStatus } = useQuery<OUITaskStatus>({
+    queryKey: ["oui-refresh-task", taskId],
+    queryFn: () => settingsApi.getOUIRefreshStatus(taskId!),
+    enabled: !!taskId && !hardError,
+    refetchInterval: (q) => (q.state.data?.ready || hardError ? false : 2000),
+  });
+  const terminal =
+    taskStatus?.state === "SUCCESS" || taskStatus?.state === "FAILURE";
+  // Kick the refresh on mount. Separate effect so we can bail out
+  // cleanly if the feature's been disabled behind our back.
+  useEffect(() => {
+    let cancelled = false;
+    settingsApi
+      .refreshOUI()
+      .then((res) => {
+        if (cancelled) return;
+        if (res.status === "disabled") {
+          setHardError(
+            "OUI lookup is disabled. Enable the toggle + Save first, then try again.",
+          );
+          return;
+        }
+        if (res.task_id) setTaskId(res.task_id);
+      })
+      .catch(() =>
+        setHardError("Could not queue the refresh — check API logs."),
+      );
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+  // When the task finishes, invalidate the status query so the outer
+  // "Last Updated" + "Vendor Count" rows pick up the new numbers.
+  useEffect(() => {
+    if (terminal) qc.invalidateQueries({ queryKey: ["oui-status"] });
+  }, [terminal, qc]);
+  const elapsed = Math.max(0, Math.floor((Date.now() - startedAt) / 1000));
+  const [tick, setTick] = useState(0);
+  useEffect(() => {
+    if (terminal || hardError) return;
+    const id = setInterval(() => setTick((t) => t + 1), 1000);
+    return () => clearInterval(id);
+  }, [terminal, hardError]);
+  // Reading ``tick`` so ESLint + the compiler know the interval side-effect
+  // matters for re-rendering the elapsed-seconds counter.
+  void tick;
+
+  const result = taskStatus?.result ?? null;
+  const counters =
+    taskStatus?.state === "SUCCESS" && result?.status === "ran"
+      ? [
+          { label: "Total", value: result.total ?? 0 },
+          { label: "Added", value: result.added ?? 0 },
+          { label: "Updated", value: result.updated ?? 0 },
+          { label: "Removed", value: result.removed ?? 0 },
+          { label: "Unchanged", value: result.unchanged ?? 0 },
+        ]
+      : null;
+
+  let stageIcon: React.ReactNode;
+  let stageText: string;
+  let stageClass: string;
+  if (hardError) {
+    stageIcon = <AlertCircle className="h-5 w-5" />;
+    stageText = hardError;
+    stageClass = "text-destructive";
+  } else if (!taskStatus || !taskStatus.ready) {
+    stageIcon = <Loader2 className="h-5 w-5 animate-spin" />;
+    stageText =
+      taskStatus?.state === "STARTED"
+        ? "Fetching the IEEE CSV + applying diff…"
+        : "Queued — waiting for the worker to pick up the task…";
+    stageClass = "text-muted-foreground";
+  } else if (taskStatus.state === "SUCCESS") {
+    if (result?.status === "ran") {
+      stageIcon = <CheckCircle2 className="h-5 w-5" />;
+      stageText = `Refresh complete in ${elapsed}s.`;
+      stageClass = "text-emerald-600 dark:text-emerald-400";
+    } else if (result?.status === "skipped") {
+      stageIcon = <AlertCircle className="h-5 w-5" />;
+      stageText = `Skipped — interval not elapsed (${Math.ceil((result.wait_seconds as number | undefined) ?? 0)}s remaining).`;
+      stageClass = "text-muted-foreground";
+    } else if (result?.status === "error") {
+      stageIcon = <AlertCircle className="h-5 w-5" />;
+      stageText = `Refresh failed: ${result.reason ?? "unknown"}${result.detail ? ` — ${result.detail}` : ""}`;
+      stageClass = "text-destructive";
+    } else {
+      stageIcon = <AlertCircle className="h-5 w-5" />;
+      stageText = `Disabled — ${result?.status ?? "unknown state"}`;
+      stageClass = "text-muted-foreground";
+    }
+  } else {
+    stageIcon = <AlertCircle className="h-5 w-5" />;
+    stageText = taskStatus.error ?? "Refresh failed.";
+    stageClass = "text-destructive";
+  }
+
+  return (
+    <Modal title="Refresh OUI Vendor Database" onClose={onClose}>
+      <div className="space-y-4 text-sm">
+        <div className="rounded-md border bg-muted/30 p-3 text-xs text-muted-foreground">
+          Source:{" "}
+          <a
+            href={OUI_SOURCE_URL}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="font-mono underline decoration-dotted underline-offset-2 hover:text-foreground"
+          >
+            {OUI_SOURCE_URL}
+          </a>
+        </div>
+
+        <div className={cn("flex items-start gap-3", stageClass)}>
+          <div className="mt-0.5">{stageIcon}</div>
+          <div className="flex-1">
+            <div className="font-medium">{stageText}</div>
+            {!terminal && !hardError && (
+              <div className="mt-1 text-xs text-muted-foreground">
+                Elapsed: {elapsed}s (cold fetches can take 30–90s)
+              </div>
+            )}
+            {taskId && (
+              <div className="mt-1 font-mono text-[10px] text-muted-foreground/70">
+                task {taskId}
+              </div>
+            )}
+          </div>
+        </div>
+
+        {counters && (
+          <div className="grid grid-cols-5 gap-2 rounded-md border bg-muted/20 p-3">
+            {counters.map((c) => (
+              <div key={c.label} className="text-center">
+                <div className="text-lg font-semibold tabular-nums">
+                  {c.value.toLocaleString()}
+                </div>
+                <div className="text-[10px] uppercase tracking-wider text-muted-foreground">
+                  {c.label}
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        <div className="flex justify-end">
+          <button
+            onClick={onClose}
+            disabled={!terminal && !hardError}
+            className="rounded-md bg-primary px-4 py-1.5 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-40"
+          >
+            {terminal || hardError ? "Close" : "Please wait…"}
+          </button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+function OUILookupSection({
+  values,
+  set,
+  isSuperadmin,
+  inputCls,
+}: {
+  values: PlatformSettings;
+  set: <K extends keyof PlatformSettings>(
+    key: K,
+    value: PlatformSettings[K],
+  ) => void;
+  isSuperadmin: boolean;
+  inputCls: string;
+}) {
+  const [showRefreshModal, setShowRefreshModal] = useState(false);
+  const { data: status } = useQuery({
+    queryKey: ["oui-status"],
+    queryFn: settingsApi.getOUIStatus,
+    refetchInterval: 30_000,
+  });
+  return (
+    <>
+      <div className="py-3">
+        <div className="text-xs text-muted-foreground">
+          Source file:{" "}
+          <a
+            href={OUI_SOURCE_URL}
+            target="_blank"
+            rel="noopener noreferrer"
+            className="font-mono underline decoration-dotted underline-offset-2 hover:text-foreground"
+          >
+            {OUI_SOURCE_URL}
+          </a>
+        </div>
+        <div className="mt-1 text-xs text-muted-foreground">
+          Fetched by the control plane (not your browser). ~5 MB CSV, ~35k
+          prefixes. Stored in Postgres as the <code>oui_vendor</code> table and
+          updated incrementally — only prefixes that actually changed bump their{" "}
+          <code>updated_at</code>.
+        </div>
+      </div>
+      <Field
+        label="Enable OUI Lookup"
+        description="Turn on to render MAC addresses with their vendor name in IP tables and DHCP leases. Off by default."
+      >
+        <Toggle
+          checked={!!values.oui_lookup_enabled}
+          onChange={(v) => set("oui_lookup_enabled", v)}
+          disabled={!isSuperadmin}
+        />
+      </Field>
+      <Field
+        label="Refresh Interval"
+        description="Hours between automatic fetches. The IEEE file updates roughly daily — leave at 24 unless you're debugging loader behaviour."
+      >
+        <div className="flex items-center gap-2">
+          <input
+            type="number"
+            min={1}
+            max={168}
+            value={values.oui_update_interval_hours ?? 24}
+            onChange={(e) =>
+              set("oui_update_interval_hours", Number(e.target.value))
+            }
+            disabled={!isSuperadmin || !values.oui_lookup_enabled}
+            className={cn(inputCls, "w-24")}
+          />
+          <span className="text-xs text-muted-foreground">hours</span>
+        </div>
+      </Field>
+      <Field
+        label="Last Updated"
+        description="Timestamp of the most recent successful fetch."
+      >
+        <span className="rounded bg-muted px-2 py-1 text-xs font-mono text-muted-foreground">
+          {status?.last_updated_at
+            ? new Date(status.last_updated_at).toLocaleString()
+            : "never"}
+        </span>
+      </Field>
+      <Field
+        label="Vendor Count"
+        description="Number of OUI prefixes currently loaded."
+      >
+        <span className="rounded bg-muted px-2 py-1 text-xs font-mono text-muted-foreground">
+          {(status?.vendor_count ?? 0).toLocaleString()}
+        </span>
+      </Field>
+      <Field
+        label="Refresh Now"
+        description="Kick off a fetch immediately without waiting for the next scheduled tick. Save the settings first if you just toggled the feature on."
+      >
+        <button
+          onClick={() => setShowRefreshModal(true)}
+          disabled={!isSuperadmin || !values.oui_lookup_enabled}
+          className="flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs font-medium hover:bg-accent disabled:opacity-40"
+        >
+          <RefreshCw className="h-3.5 w-3.5" />
+          Refresh
+        </button>
+      </Field>
+      {showRefreshModal && (
+        <OUIRefreshModal onClose={() => setShowRefreshModal(false)} />
+      )}
+    </>
   );
 }
 
@@ -248,6 +537,22 @@ const SECTIONS: SectionDef[] = [
     group: "IPAM",
     description: "How the next IP is chosen during auto-allocation.",
     keywords: ["sequential", "random", "next ip", "strategy"],
+  },
+  {
+    id: "oui-lookup",
+    title: "OUI Vendor Lookup",
+    group: "IPAM",
+    description:
+      "Pull the IEEE OUI database so MAC addresses in IP tables and DHCP leases render with the vendor name alongside. Opt-in — off by default.",
+    keywords: [
+      "oui",
+      "vendor",
+      "mac",
+      "ieee",
+      "manufacturer",
+      "lookup",
+      "prefix",
+    ],
   },
   {
     id: "subnet-tree",
@@ -1164,6 +1469,15 @@ export function SettingsPage() {
                   <option value="random">Random</option>
                 </select>
               </Field>
+            )}
+
+            {activeId === "oui-lookup" && (
+              <OUILookupSection
+                values={values}
+                set={set}
+                isSuperadmin={isSuperadmin}
+                inputCls={inputCls}
+              />
             )}
 
             {activeId === "session" && (

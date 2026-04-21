@@ -2672,9 +2672,16 @@ function SubnetDetail({
     const fm = filterModes;
     if (!applyFilter(a.address, cf.address, fm.address)) return false;
     if (!applyFilter(a.hostname ?? "", cf.hostname, fm.hostname)) return false;
+    // MAC column filters either the MAC itself (with punctuation stripped
+    // so ``00:11`` and ``0011`` both match) or the OUI vendor name, so
+    // "apple" / "cisco" work when the operator knows the maker but not
+    // the prefix. Vendor only matches when OUI lookup is enabled and the
+    // row carries a vendor value.
     const macNorm = (a.mac_address ?? "").replace(/[:\-.]/g, "");
     const macFilter = cf.mac.replace(/[:\-.]/g, "");
-    if (!applyFilter(macNorm, macFilter, fm.mac)) return false;
+    const macHit = applyFilter(macNorm, macFilter, fm.mac);
+    const vendorHit = applyFilter(a.vendor ?? "", cf.mac, fm.mac);
+    if (cf.mac && !macHit && !vendorHit) return false;
     if (!applyFilter(a.description ?? "", cf.description, fm.description))
       return false;
     if (cf.tags) {
@@ -3492,7 +3499,16 @@ function SubnetDetail({
                                 </span>
                               </td>
                               <td className="px-4 py-2 font-mono text-xs">
-                                {addr.mac_address ?? (
+                                {addr.mac_address ? (
+                                  <>
+                                    {addr.mac_address}
+                                    {addr.vendor && (
+                                      <span className="ml-1 font-sans text-[11px] text-muted-foreground">
+                                        ({addr.vendor})
+                                      </span>
+                                    )}
+                                  </>
+                                ) : (
                                   <span className="text-muted-foreground/40">
                                     —
                                   </span>

@@ -152,3 +152,16 @@ class PlatformSettings(Base):
     audit_forward_webhook_auth_header: Mapped[str] = mapped_column(
         String(1024), nullable=False, default=""
     )
+
+    # IEEE OUI vendor lookup. Opt-in because the daily fetch pulls a ~5 MB
+    # CSV from standards-oui.ieee.org and a lot of deployments genuinely
+    # don't care about vendor names. When disabled the Celery task is a
+    # no-op, list endpoints skip the join, and the UI hides the vendor
+    # suffix. Interval is stored in hours — the IEEE CSV changes slowly,
+    # once a day is the right default; lab installs can crank it down if
+    # they're debugging OUI loader problems.
+    oui_lookup_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    oui_update_interval_hours: Mapped[int] = mapped_column(Integer, nullable=False, default=24)
+    oui_last_updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )

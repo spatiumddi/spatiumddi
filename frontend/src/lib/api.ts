@@ -344,6 +344,8 @@ export interface IPAddress {
   auto_from_lease?: boolean;
   // User-added CNAME/A aliases on this IP (excludes the primary A).
   alias_count?: number;
+  // IEEE OUI vendor for this MAC (populated when OUI lookup is enabled).
+  vendor?: string | null;
   created_at?: string;
   modified_at?: string;
 }
@@ -1196,6 +1198,36 @@ export interface PlatformSettings {
   dhcp_default_domain_search: string[];
   dhcp_default_ntp_servers: string[];
   dhcp_default_lease_time: number;
+  oui_lookup_enabled: boolean;
+  oui_update_interval_hours: number;
+  oui_last_updated_at: string | null;
+}
+
+export interface OUIStatus {
+  enabled: boolean;
+  interval_hours: number;
+  last_updated_at: string | null;
+  vendor_count: number;
+}
+
+export interface OUITaskStatus {
+  task_id: string;
+  state: string; // "PENDING" | "STARTED" | "SUCCESS" | "FAILURE" | "RETRY"
+  ready: boolean;
+  result:
+    | ({
+        status?: string; // "ran" | "disabled" | "skipped" | "error"
+        total?: number;
+        added?: number;
+        updated?: number;
+        removed?: number;
+        unchanged?: number;
+        forced?: boolean;
+        reason?: string;
+        detail?: string;
+      } & Record<string, unknown>)
+    | null;
+  error: string | null;
 }
 
 export const settingsApi = {
@@ -1205,6 +1237,16 @@ export const settingsApi = {
   getDefaults: () =>
     api
       .get<Partial<PlatformSettings>>("/settings/defaults")
+      .then((r) => r.data),
+  getOUIStatus: () =>
+    api.get<OUIStatus>("/settings/oui/status").then((r) => r.data),
+  refreshOUI: () =>
+    api
+      .post<{ status: string; task_id: string | null }>("/settings/oui/refresh")
+      .then((r) => r.data),
+  getOUIRefreshStatus: (taskId: string) =>
+    api
+      .get<OUITaskStatus>(`/settings/oui/refresh/${taskId}`)
       .then((r) => r.data),
 };
 
@@ -2455,6 +2497,7 @@ export interface DHCPLease {
   ends_at: string | null;
   expires_at: string | null;
   last_seen_at: string;
+  vendor?: string | null;
 }
 
 export interface PublicAuthProvider {

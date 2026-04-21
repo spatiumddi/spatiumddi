@@ -8,9 +8,11 @@ from typing import Any
 import structlog
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, field_validator
+from sqlalchemy import func, select
 
 from app.api.deps import DB, CurrentUser
 from app.core.permissions import user_has_permission
+from app.models.oui import OUIVendor
 from app.models.settings import PlatformSettings
 
 logger = structlog.get_logger(__name__)
@@ -63,6 +65,9 @@ class SettingsResponse(BaseModel):
     dhcp_default_domain_search: list[str]
     dhcp_default_ntp_servers: list[str]
     dhcp_default_lease_time: int
+    oui_lookup_enabled: bool
+    oui_update_interval_hours: int
+    oui_last_updated_at: datetime | None
 
     model_config = {"from_attributes": True}
 
@@ -105,6 +110,8 @@ class SettingsUpdate(BaseModel):
     dhcp_default_domain_search: list[str] | None = None
     dhcp_default_ntp_servers: list[str] | None = None
     dhcp_default_lease_time: int | None = None
+    oui_lookup_enabled: bool | None = None
+    oui_update_interval_hours: int | None = None
 
     @field_validator("ip_allocation_strategy")
     @classmethod
@@ -124,6 +131,7 @@ class SettingsUpdate(BaseModel):
         "discovery_scan_interval_minutes",
         "dns_auto_sync_interval_minutes",
         "dns_pull_from_server_interval_minutes",
+        "oui_update_interval_hours",
     )
     @classmethod
     def validate_positive(cls, v: int | None) -> int | None:
@@ -257,3 +265,109 @@ async def update_settings(
     await db.refresh(settings)
     logger.info("platform_settings_updated", user=current_user.username, changes=changes)
     return settings
+
+
+# ── OUI vendor database ───────────────────────────────────────────────────────
+#
+# Opt-in feature controlled by ``oui_lookup_enabled``. These endpoints let
+# the Settings UI show the vendor-count + last-updated timestamp and kick
+# off a manual refresh without waiting for the hourly beat tick.
+
+
+class OUIStatusResponse(BaseModel):
+    enabled: bool
+    interval_hours: int
+    last_updated_at: datetime | None
+    vendor_count: int
+
+
+class OUIRefreshResponse(BaseModel):
+    status: str  # "queued" | "disabled"
+    task_id: str | None = None
+
+
+class OUITaskStatusResponse(BaseModel):
+    """Shape returned by the polling endpoint the refresh modal hits.
+
+    ``state`` mirrors Celery's task states (``PENDING``, ``STARTED``,
+    ``SUCCESS``, ``FAILURE``, ``RETRY``). When ``state == "SUCCESS"`` the
+    ``result`` field carries the diff counters emitted by the task's
+    return value. When ``state == "FAILURE"`` the ``error`` field holds
+    the exception repr — enough context for the modal to display
+    without leaking internal traces to non-admin users (the endpoint is
+    already admin-scoped).
+    """
+
+    task_id: str
+    state: str
+    ready: bool
+    result: dict[str, Any] | None = None
+    error: str | None = None
+
+
+@router.get("/oui/status", response_model=OUIStatusResponse)
+async def get_oui_status(current_user: CurrentUser, db: DB) -> OUIStatusResponse:
+    ps = await _get_or_create(db)
+    count = (await db.execute(select(func.count(OUIVendor.prefix)))).scalar_one()
+    return OUIStatusResponse(
+        enabled=ps.oui_lookup_enabled,
+        interval_hours=ps.oui_update_interval_hours,
+        last_updated_at=ps.oui_last_updated_at,
+        vendor_count=int(count),
+    )
+
+
+@router.post(
+    "/oui/refresh",
+    response_model=OUIRefreshResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def trigger_oui_refresh(current_user: CurrentUser, db: DB) -> OUIRefreshResponse:
+    if not user_has_permission(current_user, "write", "settings"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Permission denied: need 'write' on 'settings'",
+        )
+
+    ps = await _get_or_create(db)
+    if not ps.oui_lookup_enabled:
+        return OUIRefreshResponse(status="disabled")
+
+    # Deferred import so the web process doesn't pull the celery task graph
+    # into its startup path.
+    from app.tasks.oui_update import update_oui_database_now  # noqa: PLC0415
+
+    result = update_oui_database_now.delay()
+    logger.info("oui_refresh_triggered", user=current_user.username, task_id=result.id)
+    return OUIRefreshResponse(status="queued", task_id=result.id)
+
+
+@router.get("/oui/refresh/{task_id}", response_model=OUITaskStatusResponse)
+async def get_oui_refresh_status(task_id: str, current_user: CurrentUser) -> OUITaskStatusResponse:
+    """Poll an in-flight OUI refresh task.
+
+    Celery's ``AsyncResult`` is backed by Redis (the configured
+    ``CELERY_RESULT_BACKEND``) and returns ``PENDING`` for unknown task
+    IDs, which is indistinguishable from "queued but not picked up
+    yet" — the UI treats both the same. A ``task_id`` from a previous
+    restart will stay ``PENDING`` forever; the modal caps its poll at
+    a timeout to cover that case.
+    """
+    # Deferred import keeps the router lightweight.
+    from celery.result import AsyncResult  # noqa: PLC0415
+
+    from app.celery_app import celery_app  # noqa: PLC0415
+
+    async_result = AsyncResult(task_id, app=celery_app)
+    state = async_result.state
+    payload = OUITaskStatusResponse(
+        task_id=task_id,
+        state=state,
+        ready=async_result.ready(),
+    )
+    if state == "SUCCESS":
+        raw = async_result.result
+        payload.result = raw if isinstance(raw, dict) else {"value": str(raw)}
+    elif state == "FAILURE":
+        payload.error = repr(async_result.result) if async_result.result else "task failed"
+    return payload

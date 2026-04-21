@@ -20,6 +20,7 @@ from app.drivers.dhcp.windows import test_winrm_credentials
 from app.models.dhcp import DHCPConfigOp, DHCPLease, DHCPServer
 from app.services.dhcp.config_bundle import build_config_bundle
 from app.services.dhcp.pull_leases import pull_leases_from_server
+from app.services.oui import bulk_lookup_vendors, normalize_mac_key
 
 router = APIRouter(
     prefix="/servers",
@@ -168,6 +169,8 @@ class LeaseResponse(BaseModel):
     ends_at: datetime | None
     expires_at: datetime | None
     last_seen_at: datetime
+    # IEEE OUI vendor for this MAC, when the feature is enabled.
+    vendor: str | None = None
 
     model_config = {"from_attributes": True}
 
@@ -563,4 +566,11 @@ async def list_leases(
         .order_by(DHCPLease.last_seen_at.desc())
         .limit(min(limit, 5000))
     )
-    return list(res.scalars().all())
+    rows = list(res.scalars().all())
+    vendors = await bulk_lookup_vendors(
+        db, [str(lease.mac_address) if lease.mac_address else None for lease in rows]
+    )
+    for lease in rows:
+        key = normalize_mac_key(str(lease.mac_address)) if lease.mac_address else None
+        lease.vendor = vendors.get(key) if key else None  # type: ignore[attr-defined]
+    return rows

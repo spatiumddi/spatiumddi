@@ -1059,6 +1059,11 @@ function LeasesTab({ server }: { server: DHCPServer }) {
                     </td>
                     <td className="px-3 py-1.5 font-mono text-xs">
                       {l.mac_address}
+                      {l.vendor && (
+                        <span className="ml-1 font-sans text-[11px] text-muted-foreground">
+                          ({l.vendor})
+                        </span>
+                      )}
                     </td>
                     <td className="px-3 py-1.5">{l.hostname || "—"}</td>
                     <td className="px-3 py-1.5">

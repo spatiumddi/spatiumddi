@@ -39,6 +39,7 @@ from app.models.ipam import (
     SubnetDomain,
     VLANMapping,
 )
+from app.models.oui import OUIVendor
 from app.models.settings import PlatformSettings
 from app.models.vlans import VLAN, Router
 
@@ -63,6 +64,7 @@ __all__ = [
     "IPAddress",
     "CustomFieldDefinition",
     "VLANMapping",
+    "OUIVendor",
     "PlatformSettings",
     "DNSServerGroup",
     "DNSServer",

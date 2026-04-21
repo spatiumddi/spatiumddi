@@ -138,9 +138,9 @@ Three patterns recur across the DNS and DHCP subsystems. Know these before addin
 
 | Phase | Focus | Status |
 |---|---|---|
-| 1 | Core IPAM, local auth, user management, audit log, Docker Compose | **Mostly done** — LDAP/OIDC/SAML + RADIUS/TACACS+ auth, group-based RBAC enforcement, bulk-edit tags/CF, inherited-field placeholders, and mobile-responsive UI all landed; IPv6 partial |
-| 2 | DHCP (Kea), DNS (BIND9), DDNS, zone/subnet tree UI | **Mostly done** (DNS core + Kea DHCPv4 + agent-side Kea DDNS + block/space DDNS inheritance all landed) |
-| 3 | DNS views, server groups, blocking lists, VLAN/VXLAN, system admin panel, health dashboard | **In Progress** (DNS views, groups, blocklists, health checks landed) |
+| 1 | Core IPAM, local auth, user management, audit log, Docker Compose | **Done** — LDAP/OIDC/SAML + RADIUS/TACACS+ auth, group-based RBAC enforcement, bulk-edit tags/CF, inherited-field placeholders, mobile-responsive UI, and full IPv6 allocation all landed |
+| 2 | DHCP (Kea), DNS (BIND9), DDNS, zone/subnet tree UI | **Done** — DNS core, Kea DHCPv4, subnet-level DDNS, agent-side Kea DDNS, block/space DDNS inheritance, and per-server zone serial reporting all landed |
+| 3 | DNS views, server groups, blocking lists, VLAN/VXLAN, system admin panel, health dashboard | **In Progress** — DNS views storage, groups, blocklists, health checks, Trivy-clean + kind-AXFR acceptance tests landed; DNS Views end-to-end split-horizon wiring still ⬜ (see Future Phases) |
 | 4 | OS appliance image, Terraform/Ansible providers, SAML, notifications, backup/restore, ACME (DNS-01 provider + embedded client) | **In Progress** (SAML SP landed in Wave A.4; alerts framework landed; appliance, providers, backup, ACME still pending) |
 | 5 | Multi-tenancy, IP request workflows, import/export, advanced reporting | Not started |
 
@@ -196,17 +196,16 @@ SpatiumDDI cut its alpha release `2026.04.16-1` on 2026-04-16 with IPAM, DNS (BI
 - **Draggable modals.** Seven per-page `function Modal({...})` copies collapsed into a single `<Modal>` at `frontend/src/components/ui/modal.tsx` + `use-draggable-modal.ts` (utility split out so Vite fast-refresh doesn't warn on mixed exports). Title bar is a drag handle; backdrop is `bg-black/20` so the page behind stays readable; Esc closes. Custom modal shapes (header with border-b + footer slot) use `useDraggableModal(onClose)` + `MODAL_BACKDROP_CLS` directly. Migrated across admin, DNS, DHCP, VLANs, IPAM + `ResizeModals` + `ImportExportModals` + inline `DnsSyncModal`.
 - **Standardised header buttons.** `<HeaderButton>` primitive with three variants (`secondary` / `primary` / `destructive`) on a shared `inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm` base. Logical left→right ordering applied everywhere: `[Refresh] [Sync …] [Import] [Export] [misc reads] [Edit] [Resize] [Delete] [+ Primary]`. DNS / DHCP / VLANs were smaller (`text-xs`); all bumped to match IPAM's dominant size.
 
-### Phase 1 — Remaining
+### 2026.04.20 roadmap completions
 
-- ✅ Full IPv6 — EUI-64 + random /128 + sequential for `/next-address` via `Subnet.ipv6_allocation_policy`; RFC 4291 Appendix A test coverage + dynamic-pool respect on v6; Dhcp6 option-name translation landed 2026-04-19.
+Phase 1 IPv6 closure + the Phase 2/3 DDNS / zone-state / CI-hardening items all landed in this window.
 
-### Phase 2/3 — Remaining
-
-- ✅ DDNS pipeline (subnet-level, shipped 2026-04-19 in `feat(ddns)`) — `Subnet.ddns_enabled` / `ddns_hostname_policy` / `ddns_domain_override` / `ddns_ttl`; `services/dns/ddns.py` resolves hostname per policy and calls the same `_sync_dns_record` path static allocations use; `pull_leases.py` + `dhcp_lease_cleanup.py` are the two integration points.
-- ✅ Agent-side lease-event DDNS for Kea — `apply_ddns_for_lease` + `revoke_ddns_for_lease` wired into `POST /api/v1/dhcp/agents/lease-events` (commit `bad8cf3`).
-- ✅ Block/space inheritance for DDNS settings — `IPSpace` + `IPBlock` carry the four DDNS fields; `Subnet` / `IPBlock` carry `ddns_inherit_settings`; `services/dns/ddns.resolve_effective_ddns` walks subnet → block → space and is consulted by both the hostname resolver and the apply path (commit `a29d4fe`).
-- ✅ Per-server zone serial reporting — `DNSServerZoneState` table + `POST /dns/agents/zone-state` for agents + `GET /dns/groups/{gid}/zones/{zid}/server-state` for the UI + sync pill on the zone detail header (commit `{{this-commit}}`).
-- ✅ Trivy-clean + kind-AXFR acceptance tests for the agent images — Trivy now enforces HIGH/CRITICAL (with `ignore-unfixed: true`) on both `build-dns-images.yml` and `build-dhcp-images.yml`; kind-based installation + `dig version.bind` smoke test runs on PR via the new `.github/workflows/agent-e2e.yml`.
+- **Full IPv6 `/next-address`** — EUI-64 + random /128 + sequential modes selected via `Subnet.ipv6_allocation_policy`; `_eui64_from_mac` in `backend/app/api/v1/ipam/router.py` implements RFC 4291 §2.5.1 Modified EUI-64 (u/l bit flip + `fffe` insertion); random /128 uses `secrets.randbits` with collision retry; dynamic-pool respect applies on v6 too. Test coverage in `backend/tests/test_ipv6_allocation.py` includes the RFC 4291 Appendix A worked example. Closes Phase 1.
+- **DDNS pipeline (subnet-level)** — `Subnet.ddns_enabled` / `ddns_hostname_policy` / `ddns_domain_override` / `ddns_ttl`; `services/dns/ddns.py` resolves hostname per policy and calls the same `_sync_dns_record` path static allocations use; `pull_leases.py` + `dhcp_lease_cleanup.py` are the two integration points.
+- **Agent-side lease-event DDNS for Kea** — `apply_ddns_for_lease` + `revoke_ddns_for_lease` wired into `POST /api/v1/dhcp/agents/lease-events` (commit `bad8cf3`), so Kea lease events drive DNS updates with the same semantics as the poll-based Windows DHCP path.
+- **Block/space inheritance for DDNS settings** — `IPSpace` + `IPBlock` carry the four DDNS fields; `Subnet` / `IPBlock` carry `ddns_inherit_settings`; `services/dns/ddns.resolve_effective_ddns` walks subnet → block → space and is consulted by both the hostname resolver and the apply path (commit `a29d4fe`).
+- **Per-server zone serial reporting** — `DNSServerZoneState` table + `POST /dns/agents/zone-state` for agents (agent reports after each successful apply in `agent/dns/spatium_dns_agent/sync.py`) + `GET /dns/groups/{gid}/zones/{zid}/server-state` for the UI + `ZoneSyncPill` on the zone detail header showing per-server convergence against the current SOA serial.
+- **Trivy-clean + kind-AXFR acceptance tests for the agent images** — Trivy now enforces HIGH/CRITICAL (with `ignore-unfixed: true`) on both `build-dns-images.yml` and `build-dhcp-images.yml`; kind-based installation + `dig version.bind CH TXT` smoke test runs on PR via the new `.github/workflows/agent-e2e.yml` — spins up a kind cluster via `helm/kind-action@v1`, installs the umbrella chart with `dnsAgents.enabled=true`, port-forwards the API for `/health/live`, and checks the DNS agent pod isn't crash-looping.
 
 ### Future Phases — Tracked Items
 
@@ -252,7 +251,19 @@ SpatiumDDI cut its alpha release `2026.04.16-1` on 2026-04-16 with IPAM, DNS (BI
   there's no wire-level admin protocol; every scope field becomes a
   cmdlet call.
 - ⬜ IP discovery — ping sweep + ARP scan Celery task; flags `discovered` status; reconciliation report (see `docs/features/IPAM.md §8`)
-- ⬜ OUI/vendor lookup — IEEE OUI database loaded into `oui_vendor` table; shown next to MAC addresses (see `docs/features/IPAM.md §12`)
+- ✅ **OUI/vendor lookup** — opt-in IEEE OUI database fetched by
+  `app.tasks.oui_update.auto_update_oui_database` (hourly beat, task
+  honours `PlatformSettings.oui_lookup_enabled` +
+  `oui_update_interval_hours`, default 24 h). `oui_vendor(prefix
+  CHAR(6) PK, vendor_name, updated_at)` replaced atomically each run
+  so lookups always see a consistent snapshot. `services/oui.py`
+  exposes `bulk_lookup_vendors` + `normalize_mac_key`; IPAM's
+  `list_addresses` and DHCP's `list_leases` use them to attach a
+  `vendor` field. Settings → IPAM → OUI Vendor Lookup carries the
+  toggle + interval + "Refresh Now" (queues
+  `update_oui_database_now`). MACs render as `aa:bb:cc:dd:ee:ff
+  (Cisco Systems)` in the IP table + DHCP leases; feature off =
+  vendor null + UI falls back to bare MAC.
 - ⬜ SNMP polling / network device management — ARP table polling for IP discovery (see `docs/features/IPAM.md §13`)
 - ✅ **API tokens with auto-expiry** (Phase 1 close-out) — `APIToken`
   model already existed; this session wires the create/list/revoke

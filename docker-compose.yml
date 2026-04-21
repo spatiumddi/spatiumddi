@@ -79,6 +79,17 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+    # The backend Dockerfile's HEALTHCHECK probes the api's
+    # ``/health/live`` endpoint — correct for the api service but wrong
+    # for worker/beat (they don't expose HTTP). Override with a Celery-
+    # native ping so ``inspect ping`` round-trips to this worker via
+    # the broker.
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.celery_app inspect ping -d celery@$$HOSTNAME --timeout 5 >/dev/null 2>&1"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
 
   # ── Celery Beat (Scheduler) ─────────────────────────────────────────────────
   beat:
@@ -95,6 +106,16 @@ services:
       CELERY_RESULT_BACKEND: redis://redis:6379/2
     depends_on:
       - redis
+    # Beat has no network listener and no broker-reachable identity, so
+    # the cheapest liveness signal is "the beat process is running".
+    # Checks pid 1 via ``/proc`` — matches the Celery process the
+    # container was started with.
+    healthcheck:
+      test: ["CMD-SHELL", "grep -q 'celery' /proc/1/cmdline"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
 
   # ── Frontend (nginx + Vite build) ───────────────────────────────────────────
   frontend:

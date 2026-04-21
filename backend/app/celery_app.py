@@ -16,6 +16,7 @@ celery_app = Celery(
         "app.tasks.dhcp_lease_cleanup",
         "app.tasks.dhcp_pull_leases",
         "app.tasks.alerts",
+        "app.tasks.oui_update",
     ],
 )
 
@@ -44,6 +45,7 @@ celery_app.conf.update(
         "app.tasks.dhcp_lease_cleanup.*": {"queue": "dhcp"},
         "app.tasks.dhcp_pull_leases.*": {"queue": "dhcp"},
         "app.tasks.alerts.*": {"queue": "default"},
+        "app.tasks.oui_update.*": {"queue": "default"},
     },
     beat_schedule={
         # Every 60s, fan-out health checks to every registered DNS server.
@@ -99,6 +101,16 @@ celery_app.conf.update(
         "alerts-evaluate": {
             "task": "app.tasks.alerts.evaluate_alerts",
             "schedule": schedule(run_every=60.0),
+        },
+        # Every hour, tick the IEEE OUI refresh. Opt-in feature — the
+        # task itself checks ``PlatformSettings.oui_lookup_enabled`` and
+        # ``oui_update_interval_hours`` (default 24h) so the effective
+        # cadence is UI-controlled. Hourly beat is the granularity knob;
+        # anyone who wants "every 4 hours" sets interval_hours=4 and the
+        # task self-skips the other 3 fires.
+        "oui-refresh": {
+            "task": "app.tasks.oui_update.auto_update_oui_database",
+            "schedule": schedule(run_every=3600.0),
         },
     },
 )

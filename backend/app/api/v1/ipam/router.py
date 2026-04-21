@@ -27,6 +27,7 @@ from app.services.dhcp.windows_writethrough import (
     push_scope_delete,
     push_statics_bulk_delete,
 )
+from app.services.oui import bulk_lookup_vendors, normalize_mac_key
 
 logger = structlog.get_logger(__name__)
 
@@ -1587,6 +1588,9 @@ class IPAddressResponse(BaseModel):
     # Number of user-added CNAME/A alias records on this IP (excludes the primary A).
     # Populated in list/get endpoints via a bulk lookup; defaults to 0 on other paths.
     alias_count: int = 0
+    # IEEE OUI vendor for this MAC, when the feature is enabled and we have
+    # the prefix in our local DB. None on writes / unknown MACs / OUI off.
+    vendor: str | None = None
     created_at: datetime
     modified_at: datetime
 
@@ -3658,8 +3662,13 @@ async def list_addresses(
         query = query.where(IPAddress.status == status_filter)
     rows = list((await db.execute(query)).scalars().all())
     counts = await _alias_counts_for(db, rows)
+    vendors = await bulk_lookup_vendors(
+        db, [str(ip.mac_address) if ip.mac_address else None for ip in rows]
+    )
     for ip in rows:
         ip.alias_count = counts.get(ip.id, 0)  # type: ignore[attr-defined]
+        key = normalize_mac_key(str(ip.mac_address)) if ip.mac_address else None
+        ip.vendor = vendors.get(key) if key else None  # type: ignore[attr-defined]
     return rows
 
 

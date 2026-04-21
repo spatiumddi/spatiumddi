@@ -382,14 +382,14 @@ Implementation: `SubnetDomain` junction table; `IPAddress.domain_id` (FK → DNS
 
 ## 12. MAC Address / OUI Vendor Lookup
 
-SpatiumDDI maintains a local copy of the IEEE OUI database to display vendor names next to MAC addresses in all IP and DHCP lease tables.
+**Opt-in feature** — configured in Settings → IPAM → OUI Vendor Lookup. Off by default. When enabled, SpatiumDDI maintains a local copy of the IEEE OUI database to display vendor names next to MAC addresses in all IP and DHCP lease tables.
 
-- **Source**: `https://standards-oui.ieee.org/oui/oui.csv`
-- **Update schedule**: Daily, via Celery beat task (`system.update_oui_database`)
-- **Storage**: `oui_vendor` table: `prefix` (first 3 octets, uppercase), `vendor_name`
-- **Display**: In the UI, MAC addresses show as `AA:BB:CC:DD:EE:FF (Cisco Systems)` with the vendor name fetched via a lightweight lookup
-
-The OUI database is ~5 MB and loaded into PostgreSQL on first install. On each daily update, the table is replaced atomically.
+- **Source**: `https://standards-oui.ieee.org/oui/oui.csv` (~5 MB, ~35k prefixes)
+- **Update schedule**: `app.tasks.oui_update.auto_update_oui_database` ticks hourly via Celery Beat; the task itself honours `PlatformSettings.oui_lookup_enabled` + `oui_update_interval_hours` (default 24 h) so cadence is UI-controlled without restarting beat.
+- **Manual refresh**: `POST /api/v1/settings/oui/refresh` queues `app.tasks.oui_update.update_oui_database_now`, bypassing the interval gate. Exposed as a "Refresh Now" button in the Settings UI.
+- **Storage**: `oui_vendor(prefix CHAR(6) PRIMARY KEY, vendor_name VARCHAR(255), updated_at TIMESTAMPTZ)`. `prefix` is the first three MAC octets as six *lowercase* hex chars (matches the canonical form `_normalize_mac` already produces).
+- **Atomic replace**: each successful run wraps `DELETE FROM oui_vendor` + bulk `INSERT` in a single transaction so lookups always see a consistent snapshot; a failed fetch or parse leaves the previous snapshot intact.
+- **Display**: MACs render as `aa:bb:cc:dd:ee:ff (Cisco Systems)` in the IP address table and DHCP leases. When OUI is disabled the `vendor` field is simply null on the wire and the UI falls back to the bare MAC.
 
 ---
 
