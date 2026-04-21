@@ -337,25 +337,49 @@ function GroupDetailView({
             </div>
           ) : (
             <div className="divide-y">
-              {servers.map((s) => (
-                <div key={s.id} className="flex items-center gap-3 px-4 py-2.5">
-                  <StatusDot status={s.status} />
-                  <span className="w-48 truncate text-sm font-medium">
-                    {s.name}
-                  </span>
-                  <span className="w-48 truncate font-mono text-xs text-muted-foreground">
-                    {s.host}:{s.port}
-                  </span>
-                  <span className="rounded-full bg-muted px-2 py-0.5 text-xs">
-                    {s.driver}
-                  </span>
-                  <span className="ml-auto text-xs text-muted-foreground">
-                    {s.last_sync_at
-                      ? `synced ${new Date(s.last_sync_at).toLocaleString()}`
-                      : "never synced"}
-                  </span>
-                </div>
-              ))}
+              {servers.map((s) => {
+                // Kea agents send heartbeats; their ``agent_last_seen`` is
+                // the right liveness signal. Windows DHCP is polled, so
+                // ``last_sync_at`` (set when lease pull completes) is
+                // meaningful. Fall back to whichever is set.
+                const seenAt =
+                  s.driver === "kea"
+                    ? (s.agent_last_seen ?? s.last_sync_at)
+                    : (s.last_sync_at ?? s.agent_last_seen);
+                const label =
+                  s.driver === "kea"
+                    ? seenAt
+                      ? `seen ${new Date(seenAt).toLocaleString()}`
+                      : "never heard from"
+                    : seenAt
+                      ? `synced ${new Date(seenAt).toLocaleString()}`
+                      : "never synced";
+                return (
+                  <div
+                    key={s.id}
+                    className="flex items-center gap-3 px-4 py-2.5"
+                  >
+                    <StatusDot status={s.status} />
+                    <span className="w-48 truncate text-sm font-medium">
+                      {s.name}
+                    </span>
+                    <span className="w-48 truncate font-mono text-xs text-muted-foreground">
+                      {s.host}:{s.port}
+                    </span>
+                    <span className="rounded-full bg-muted px-2 py-0.5 text-xs">
+                      {s.driver}
+                    </span>
+                    {s.ha_state && (
+                      <span className="rounded-full bg-muted/60 px-2 py-0.5 text-[11px] text-muted-foreground">
+                        HA: {s.ha_state}
+                      </span>
+                    )}
+                    <span className="ml-auto text-xs text-muted-foreground">
+                      {label}
+                    </span>
+                  </div>
+                );
+              })}
             </div>
           )}
         </div>
