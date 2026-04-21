@@ -1,20 +1,73 @@
 """Shared FastAPI dependencies injected into route handlers."""
 
+from datetime import UTC, datetime
 from typing import Annotated
 
 import structlog
 from fastapi import Depends, HTTPException, Security, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.security import decode_access_token
+from app.core.security import decode_access_token, hash_api_token
 from app.db import get_db
-from app.models.auth import User
+from app.models.auth import APIToken, User
 
 logger = structlog.get_logger(__name__)
 
 _bearer = HTTPBearer(auto_error=False)
+
+# API tokens issued by SpatiumDDI all carry this prefix so the auth
+# middleware can distinguish them from JWTs without an extra DB round-trip
+# on every request. See ``app.core.security.generate_api_token``.
+_API_TOKEN_PREFIX = "sddi_"
+
+
+async def _resolve_api_token(db: AsyncSession, raw: str) -> User:
+    """Validate an ``sddi_*`` bearer and return the owning user.
+
+    Raises the same 401/403 pattern as JWT auth so callers can't
+    distinguish "no token" from "expired token" from "revoked token".
+    Successful lookups also bump ``last_used_at`` so operators have a
+    single column they can glance at to see which tokens are live
+    vs. dead.
+    """
+    token_hash = hash_api_token(raw)
+    token = (
+        await db.execute(select(APIToken).where(APIToken.token_hash == token_hash))
+    ).scalar_one_or_none()
+    if token is None or not token.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or revoked API token",
+        )
+    now = datetime.now(UTC)
+    if token.expires_at is not None and token.expires_at <= now:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="API token has expired",
+        )
+    if token.user_id is None:
+        # Scope "global" isn't wired through permissions yet — reject
+        # until we add a synthetic service-account path. Today's UI
+        # only issues user-scoped tokens so this is defensive.
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Global-scope API tokens are not yet supported",
+        )
+    user = (await db.execute(select(User).where(User.id == token.user_id))).scalar_one_or_none()
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+    if not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="User account is disabled"
+        )
+    # Fire-and-forget last-used bump. Failure to write this shouldn't
+    # 500 the request — we commit on the caller's session so if the
+    # caller rolls back, the timestamp rolls with it (acceptable).
+    token.last_used_at = now
+    return user
 
 
 async def get_current_user(
@@ -22,14 +75,26 @@ async def get_current_user(
     credentials: Annotated[HTTPAuthorizationCredentials | None, Security(_bearer)],
 ) -> User:
     """
-    Validate Bearer JWT and return the authenticated User.
-    Raises 401 if missing or invalid; 403 if inactive.
+    Validate a Bearer credential and return the authenticated User.
+
+    Accepts either:
+      * a JWT access token issued by ``/auth/login`` (user sessions), or
+      * an API token issued by ``/api-tokens`` (machine / script access).
+
+    Raises 401 if missing or invalid; 403 if the user is inactive.
     """
     if credentials is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Not authenticated")
 
+    raw = credentials.credentials
+    # Fast path for API tokens — they carry a distinct prefix so we
+    # never try to JWT-decode one (which would just 401 on signature
+    # mismatch anyway, but this is cleaner error messaging).
+    if raw.startswith(_API_TOKEN_PREFIX):
+        return await _resolve_api_token(db, raw)
+
     try:
-        payload = decode_access_token(credentials.credentials)
+        payload = decode_access_token(raw)
         user_id: str = payload["sub"]
     except (JWTError, KeyError):
         raise HTTPException(
@@ -37,11 +102,7 @@ async def get_current_user(
             detail="Invalid or expired token",
         )
 
-    from sqlalchemy import select
-
-    from app.models.auth import User as UserModel
-
-    result = await db.execute(select(UserModel).where(UserModel.id == user_id))
+    result = await db.execute(select(User).where(User.id == user_id))
     user = result.scalar_one_or_none()
 
     if user is None:

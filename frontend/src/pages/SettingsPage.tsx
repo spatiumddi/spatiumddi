@@ -70,19 +70,34 @@ type SectionId =
   | "dns-pull-from-server"
   | "dhcp"
   | "dhcp-lease-sync"
+  | "audit-forward"
   | "ip-allocation"
   | "session"
   | "subnet-tree"
   | "updates"
   | "utilization";
 
+type SectionGroup = "Application" | "Security" | "IPAM" | "DNS" | "DHCP";
+
 interface SectionDef {
   id: SectionId;
   title: string;
   description: string;
+  /** Sidebar grouping — separator + label rendered between groups. */
+  group: SectionGroup;
   /** Search keywords (lowercased) so the section sidebar filter can match deeper terms. */
   keywords: string[];
 }
+
+// Group display order. Within each group, entries render in the order
+// they appear in SECTIONS below (alphabetical by title).
+const GROUP_ORDER: SectionGroup[] = [
+  "Application",
+  "Security",
+  "IPAM",
+  "DNS",
+  "DHCP",
+];
 
 // Which PlatformSettings keys each section owns — drives the per-section
 // "Reset to defaults" button so it only overwrites that section's fields.
@@ -113,7 +128,17 @@ const SECTION_FIELDS: Record<SectionId, (keyof PlatformSettings)[]> = {
   ],
   "dhcp-lease-sync": [
     "dhcp_pull_leases_enabled",
-    "dhcp_pull_leases_interval_minutes",
+    "dhcp_pull_leases_interval_seconds",
+  ],
+  "audit-forward": [
+    "audit_forward_syslog_enabled",
+    "audit_forward_syslog_host",
+    "audit_forward_syslog_port",
+    "audit_forward_syslog_protocol",
+    "audit_forward_syslog_facility",
+    "audit_forward_webhook_enabled",
+    "audit_forward_webhook_url",
+    "audit_forward_webhook_auth_header",
   ],
   "ip-allocation": ["ip_allocation_strategy"],
   session: ["session_timeout_minutes", "auto_logout_minutes"],
@@ -148,11 +173,14 @@ function LayerDiagram({
   );
 }
 
-// Alphabetically sorted by `title`.
+// Grouped, then alphabetical by title within each group. The sidebar
+// renders a section header + divider at every group boundary.
 const SECTIONS: SectionDef[] = [
+  // ── Application ──────────────────────────────────────────────────────
   {
     id: "branding",
     title: "Branding & URL",
+    group: "Application",
     description: "Application title, external URL, and visual identity.",
     keywords: [
       "title",
@@ -166,20 +194,83 @@ const SECTIONS: SectionDef[] = [
     ],
   },
   {
+    id: "updates",
+    title: "Updates",
+    group: "Application",
+    description: "Release-check behavior.",
+    keywords: ["github", "release", "version", "check"],
+  },
+
+  // ── Security ─────────────────────────────────────────────────────────
+  {
+    id: "audit-forward",
+    title: "Audit Event Forwarding",
+    group: "Security",
+    description:
+      "Ship every AuditLog commit to external systems — RFC 5424 syslog and/or a generic HTTP webhook. Both are independent and fire-and-forget: delivery failures never block the audit write.",
+    keywords: [
+      "syslog",
+      "siem",
+      "webhook",
+      "audit",
+      "forward",
+      "splunk",
+      "elastic",
+      "graylog",
+      "log",
+      "export",
+    ],
+  },
+  {
+    id: "session",
+    title: "Session & Security",
+    group: "Security",
+    description: "Login session lifetime and idle behavior.",
+    keywords: ["timeout", "logout", "expiry", "auth"],
+  },
+
+  // ── IPAM ─────────────────────────────────────────────────────────────
+  {
     id: "discovery",
     title: "Discovery",
+    group: "IPAM",
     description: "Periodic ping/scan jobs to detect active hosts.",
     keywords: ["scan", "ping", "interval", "discover"],
   },
   {
+    id: "ip-allocation",
+    title: "IP Allocation",
+    group: "IPAM",
+    description: "How the next IP is chosen during auto-allocation.",
+    keywords: ["sequential", "random", "next ip", "strategy"],
+  },
+  {
+    id: "subnet-tree",
+    title: "Subnet Tree UI",
+    group: "IPAM",
+    description: "Tree view defaults in the IPAM browser.",
+    keywords: ["expand", "collapse", "depth", "tree"],
+  },
+  {
+    id: "utilization",
+    title: "Utilization Thresholds",
+    group: "IPAM",
+    description: "Warning and critical percentages for utilization indicators.",
+    keywords: ["warn", "critical", "threshold", "color"],
+  },
+
+  // ── DNS ──────────────────────────────────────────────────────────────
+  {
     id: "dns",
     title: "DNS Defaults",
+    group: "DNS",
     description: "Default values applied to new zones and server groups.",
     keywords: ["zone", "ttl", "dnssec", "recursion", "agent", "key"],
   },
   {
     id: "dns-auto-sync",
     title: "IPAM → DNS Reconciliation",
+    group: "DNS",
     description:
       "Catches drift between IPAM's expected records (hostname + IP) and SpatiumDDI's DNS DB. Fills in missing A/AAAA/PTR when the live sync missed one — e.g. bulk imports or a previously failed push.",
     keywords: [
@@ -196,6 +287,7 @@ const SECTIONS: SectionDef[] = [
   {
     id: "dns-pull-from-server",
     title: "Zone ↔ Server Reconciliation",
+    group: "DNS",
     description:
       "Catches drift between SpatiumDDI's DNS DB and the authoritative server's wire (Windows DNS today). AXFR imports out-of-band edits; any DB-only records get pushed back via RFC 2136. Additive only — never deletes.",
     keywords: [
@@ -214,9 +306,12 @@ const SECTIONS: SectionDef[] = [
       "auto",
     ],
   },
+
+  // ── DHCP ─────────────────────────────────────────────────────────────
   {
     id: "dhcp",
     title: "DHCP Defaults",
+    group: "DHCP",
     description:
       "Default DNS servers, domain, NTP, and lease time pre-filled when creating a new scope.",
     keywords: ["dns", "domain", "search", "ntp", "lease", "option 42", "scope"],
@@ -224,6 +319,7 @@ const SECTIONS: SectionDef[] = [
   {
     id: "dhcp-lease-sync",
     title: "DHCP Lease Sync",
+    group: "DHCP",
     description:
       "Poll agentless DHCP servers (Windows DHCP today) for active leases and mirror them into DHCP + IPAM. Additive only; expiry is handled by the existing lease cleanup sweep.",
     keywords: [
@@ -237,36 +333,6 @@ const SECTIONS: SectionDef[] = [
       "additive",
       "auto",
     ],
-  },
-  {
-    id: "ip-allocation",
-    title: "IP Allocation",
-    description: "How the next IP is chosen during auto-allocation.",
-    keywords: ["sequential", "random", "next ip", "strategy"],
-  },
-  {
-    id: "session",
-    title: "Session & Security",
-    description: "Login session lifetime and idle behavior.",
-    keywords: ["timeout", "logout", "expiry", "auth"],
-  },
-  {
-    id: "subnet-tree",
-    title: "Subnet Tree UI",
-    description: "Tree view defaults in the IPAM browser.",
-    keywords: ["expand", "collapse", "depth", "tree"],
-  },
-  {
-    id: "updates",
-    title: "Updates",
-    description: "Release-check behavior.",
-    keywords: ["github", "release", "version", "check"],
-  },
-  {
-    id: "utilization",
-    title: "Utilization Thresholds",
-    description: "Warning and critical percentages for utilization indicators.",
-    keywords: ["warn", "critical", "threshold", "color"],
   },
 ];
 
@@ -407,18 +473,47 @@ export function SettingsPage() {
               No sections match.
             </p>
           )}
-          {filteredSections.map((s) => (
-            <button
-              key={s.id}
-              onClick={() => setActiveId(s.id)}
-              className={cn(
-                "block w-full rounded-md px-3 py-1.5 text-left text-sm hover:bg-accent",
-                activeId === s.id && "bg-accent font-medium",
-              )}
-            >
-              {s.title}
-            </button>
-          ))}
+          {/* When filtering we drop the group headers so results read as a
+              single flat list; otherwise render grouped with separators. */}
+          {q
+            ? filteredSections.map((s) => (
+                <button
+                  key={s.id}
+                  onClick={() => setActiveId(s.id)}
+                  className={cn(
+                    "block w-full rounded-md px-3 py-1.5 text-left text-sm hover:bg-accent",
+                    activeId === s.id && "bg-accent font-medium",
+                  )}
+                >
+                  {s.title}
+                </button>
+              ))
+            : GROUP_ORDER.map((group, idx) => {
+                const entries = SECTIONS.filter((s) => s.group === group);
+                if (entries.length === 0) return null;
+                return (
+                  <div
+                    key={group}
+                    className={cn(idx > 0 && "mt-3 border-t pt-3")}
+                  >
+                    <p className="mb-1 px-3 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground/70">
+                      {group}
+                    </p>
+                    {entries.map((s) => (
+                      <button
+                        key={s.id}
+                        onClick={() => setActiveId(s.id)}
+                        className={cn(
+                          "block w-full rounded-md px-3 py-1.5 text-left text-sm hover:bg-accent",
+                          activeId === s.id && "bg-accent font-medium",
+                        )}
+                      >
+                        {s.title}
+                      </button>
+                    ))}
+                  </div>
+                );
+              })}
         </nav>
       </aside>
 
@@ -731,16 +826,16 @@ export function SettingsPage() {
                 </Field>
                 <Field
                   label="Poll Interval"
-                  description="How often the sync job polls each agentless server. WinRM round-trips are cheap; 5 minutes is a reasonable default. Lower it if your lease TTLs are short and you want fresher IPAM mirroring."
+                  description="How often the sync job polls each agentless server, in seconds. Beat ticks every 10 s (the floor); 15 s is the default — near-real-time IPAM population without hammering the Windows DC. Raise it (e.g. 60 / 300) if WinRM latency matters more than freshness."
                 >
                   <div className="flex items-center gap-2">
                     <input
                       type="number"
-                      min={1}
-                      value={values.dhcp_pull_leases_interval_minutes ?? 5}
+                      min={10}
+                      value={values.dhcp_pull_leases_interval_seconds ?? 15}
                       onChange={(e) =>
                         set(
-                          "dhcp_pull_leases_interval_minutes",
+                          "dhcp_pull_leases_interval_seconds",
                           Number(e.target.value),
                         )
                       }
@@ -749,7 +844,7 @@ export function SettingsPage() {
                       }
                       className={cn(inputCls, "w-24")}
                     />
-                    <span className="text-xs text-muted-foreground">min</span>
+                    <span className="text-xs text-muted-foreground">sec</span>
                   </div>
                 </Field>
                 <Field
@@ -764,6 +859,185 @@ export function SettingsPage() {
                       : "never"}
                   </span>
                 </Field>
+              </>
+            )}
+
+            {activeId === "audit-forward" && (
+              <>
+                <div className="rounded-md border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+                  Delivery is fire-and-forget. Syslog over UDP silently drops on
+                  network error; TCP / webhook errors are logged via structlog
+                  and surface in the Logs view. Audit writes never block on
+                  forwarding.
+                </div>
+
+                {/* ── Syslog ── */}
+                <div className="pt-1">
+                  <h4 className="mb-2 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                    Syslog (RFC 5424)
+                  </h4>
+                  <div className="space-y-3">
+                    <Field
+                      label="Enable Syslog Forwarding"
+                      description="Ship each AuditLog row as one RFC 5424 line. MSG body is compact JSON — SIEMs like Splunk / Elastic / Graylog parse it automatically."
+                    >
+                      <Toggle
+                        checked={!!values.audit_forward_syslog_enabled}
+                        onChange={(v) => set("audit_forward_syslog_enabled", v)}
+                        disabled={!isSuperadmin}
+                      />
+                    </Field>
+                    <div className="grid grid-cols-2 gap-3">
+                      <Field label="Host">
+                        <input
+                          type="text"
+                          value={values.audit_forward_syslog_host ?? ""}
+                          onChange={(e) =>
+                            set("audit_forward_syslog_host", e.target.value)
+                          }
+                          disabled={
+                            !isSuperadmin ||
+                            !values.audit_forward_syslog_enabled
+                          }
+                          placeholder="syslog.example.com"
+                          className={inputCls}
+                        />
+                      </Field>
+                      <Field label="Port">
+                        <input
+                          type="number"
+                          min={1}
+                          max={65535}
+                          value={values.audit_forward_syslog_port ?? 514}
+                          onChange={(e) =>
+                            set(
+                              "audit_forward_syslog_port",
+                              Number(e.target.value),
+                            )
+                          }
+                          disabled={
+                            !isSuperadmin ||
+                            !values.audit_forward_syslog_enabled
+                          }
+                          className={inputCls}
+                        />
+                      </Field>
+                    </div>
+                    <div className="grid grid-cols-2 gap-3">
+                      <Field
+                        label="Protocol"
+                        description="UDP is fire-and-forget (may drop); TCP blocks briefly on connect but is reliable."
+                      >
+                        <select
+                          value={values.audit_forward_syslog_protocol ?? "udp"}
+                          onChange={(e) =>
+                            set("audit_forward_syslog_protocol", e.target.value)
+                          }
+                          disabled={
+                            !isSuperadmin ||
+                            !values.audit_forward_syslog_enabled
+                          }
+                          className={inputCls}
+                        >
+                          <option value="udp">UDP</option>
+                          <option value="tcp">TCP</option>
+                        </select>
+                      </Field>
+                      <Field
+                        label="Facility"
+                        description="RFC 5424 §6.2.1. local0 (16) is typical for app audit."
+                      >
+                        <select
+                          value={values.audit_forward_syslog_facility ?? 16}
+                          onChange={(e) =>
+                            set(
+                              "audit_forward_syslog_facility",
+                              Number(e.target.value),
+                            )
+                          }
+                          disabled={
+                            !isSuperadmin ||
+                            !values.audit_forward_syslog_enabled
+                          }
+                          className={inputCls}
+                        >
+                          <option value={1}>user (1)</option>
+                          <option value={4}>auth (4)</option>
+                          <option value={10}>authpriv (10)</option>
+                          <option value={13}>log_audit (13)</option>
+                          <option value={16}>local0 (16)</option>
+                          <option value={17}>local1 (17)</option>
+                          <option value={18}>local2 (18)</option>
+                          <option value={19}>local3 (19)</option>
+                          <option value={20}>local4 (20)</option>
+                          <option value={21}>local5 (21)</option>
+                          <option value={22}>local6 (22)</option>
+                          <option value={23}>local7 (23)</option>
+                        </select>
+                      </Field>
+                    </div>
+                  </div>
+                </div>
+
+                {/* ── Webhook ── */}
+                <div className="pt-2">
+                  <h4 className="mb-2 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+                    HTTP Webhook
+                  </h4>
+                  <div className="space-y-3">
+                    <Field
+                      label="Enable Webhook Forwarding"
+                      description="POST each AuditLog row as JSON to the configured URL."
+                    >
+                      <Toggle
+                        checked={!!values.audit_forward_webhook_enabled}
+                        onChange={(v) =>
+                          set("audit_forward_webhook_enabled", v)
+                        }
+                        disabled={!isSuperadmin}
+                      />
+                    </Field>
+                    <Field
+                      label="URL"
+                      description="Full HTTPS endpoint. Non-2xx responses are logged but don't retry — use a reverse proxy for replay guarantees if you need them."
+                    >
+                      <input
+                        type="text"
+                        value={values.audit_forward_webhook_url ?? ""}
+                        onChange={(e) =>
+                          set("audit_forward_webhook_url", e.target.value)
+                        }
+                        disabled={
+                          !isSuperadmin || !values.audit_forward_webhook_enabled
+                        }
+                        placeholder="https://collector.example.com/ingest"
+                        className={inputCls}
+                      />
+                    </Field>
+                    <Field
+                      label="Authorization Header (optional)"
+                      description={
+                        'Sent verbatim as the "Authorization" header. Include the scheme, e.g. "Bearer …" or "Basic …".'
+                      }
+                    >
+                      <input
+                        type="text"
+                        value={values.audit_forward_webhook_auth_header ?? ""}
+                        onChange={(e) =>
+                          set(
+                            "audit_forward_webhook_auth_header",
+                            e.target.value,
+                          )
+                        }
+                        disabled={
+                          !isSuperadmin || !values.audit_forward_webhook_enabled
+                        }
+                        placeholder="Bearer …"
+                        className={inputCls}
+                      />
+                    </Field>
+                  </div>
+                </div>
               </>
             )}
 

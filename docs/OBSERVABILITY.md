@@ -242,6 +242,64 @@ Available at `/admin/audit`:
 - Diff view for updates: shows old vs. new value side-by-side
 - Non-deletable — no delete button, enforced at DB level (trigger prevents DELETE)
 
+### 5.1 External forwarding
+
+Every committed `AuditLog` row can be forwarded to external systems in
+near-real-time. Two independent channels — configure either, both, or
+neither under **Settings → Audit Event Forwarding**.
+
+**Delivery guarantee.** Best-effort. A dedicated `asyncio` task runs
+outside the commit path, so the audit write always succeeds before
+forwarding is even attempted. A failing collector never rolls back
+a DDI mutation. Operators who need at-least-once replay should point
+the webhook at a queue (NATS / Kafka / Redis) and let that be the
+durable layer.
+
+**Implementation.** SQLAlchemy `after_commit` listener in
+`app/services/audit_forward.py`. Registered once at import time via
+`app/main.py`. Snapshots new `AuditLog` rows inside `after_flush`
+(while they still carry committed values), then in `after_commit`
+schedules an `asyncio.create_task` per row so slow collectors don't
+serialize the queue.
+
+**Channel 1: Syslog (RFC 5424).**
+- Transport: UDP or TCP. TLS deferred (cert management complexity).
+- Format: `<PRI>1 <ISO-TIME> <HOST> spatiumddi - AUDIT - <JSON-MSG>`.
+  MSG body is compact JSON; Splunk / Elastic / Graylog auto-detect
+  and parse it.
+- Severity mapping: `result="success"` → 6 (info),
+  `result="denied"` → 4 (warn), `result="failed"` → 3 (err).
+- Facility configurable 0–23; default 16 (local0).
+- UDP path uses `socket.sendto` (one syscall, no backpressure). TCP
+  path uses `asyncio.open_connection` with a 5 s timeout so a
+  tarpitted collector can't stall the event loop.
+
+**Channel 2: HTTP webhook.**
+- POST with `Content-Type: application/json`; 5 s timeout.
+- Optional `Authorization` header — sent verbatim (include the
+  scheme: `Bearer …` / `Basic …`).
+- Non-2xx responses are logged via structlog at warning but not
+  retried. Use a reverse-proxy / queueing layer for replay.
+- Payload shape matches the syslog JSON MSG body:
+  ```json
+  {
+    "id": "…", "timestamp": "2026-04-21T10:00:00+00:00",
+    "action": "create", "resource_type": "dns_zone",
+    "resource_id": "…", "resource_display": "example.com.",
+    "result": "success", "user_id": "…",
+    "user_display_name": "admin", "auth_source": "local",
+    "changed_fields": [], "old_value": null, "new_value": {…}
+  }
+  ```
+
+**Known gap.** Celery-scheduled audits (e.g. the lease-pull
+housekeeping row) may not forward — Celery wraps the task body in
+`asyncio.run`, which closes its loop before the scheduled dispatch
+task runs. Operator-triggered audit events (the 99% case) forward
+reliably from the API worker's long-running loop. If scheduled-task
+forwarding turns out to matter, the fix is an awaitable drain in
+each task wrapper.
+
 ---
 
 ## 6. Prometheus Metrics

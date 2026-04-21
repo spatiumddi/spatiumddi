@@ -451,13 +451,15 @@ See [WINDOWS.md](../deployment/WINDOWS.md) for the WinRM + account setup.
 
 ### 15.3 Scheduled lease pull
 
-Scheduled Celery beat task: [`app.tasks.dhcp_pull_leases.auto_pull_dhcp_leases`](../../backend/app/tasks/dhcp_pull_leases.py). Beat fires every 60s; the task gates on platform settings so the UI can change cadence without restarting beat.
+Scheduled Celery beat task: [`app.tasks.dhcp_pull_leases.auto_pull_dhcp_leases`](../../backend/app/tasks/dhcp_pull_leases.py). Beat fires every **10 seconds**; the task gates on platform settings so the UI can change cadence without restarting beat. A 10-second beat tick means operators can configure near-real-time IPAM population from Windows DHCP — the interval is the only knob that limits poll frequency now.
 
 | Setting | Default | Description |
 |---|---|---|
 | `dhcp_pull_leases_enabled` | off | Master toggle. |
-| `dhcp_pull_leases_interval_minutes` | 5 | How often to poll each agentless server. |
+| `dhcp_pull_leases_interval_seconds` | 15 | How often to poll each agentless server, in seconds. Floor is 10 (matching the beat tick). Operators who don't need sub-minute freshness can raise it to 60 / 300 / etc to reduce WinRM load. |
 | `dhcp_pull_leases_last_run_at` | — | Populated after each pass; visible in Settings. |
+
+> **Windows DHCP has no streaming primitive.** The lease audit log (`DhcpSrvLog-<Day>.log`) and `Get-DhcpServerv4Lease` are the only real windows into the running service, and both are pull-based. WinRM itself is request/response — `Get-Content -Wait` does exist in PowerShell but it holds the HTTPS connection open indefinitely and can't flush partial output back through `pywinrm.run_ps`, so true push-style streaming would require an agent process on the DC that POSTs events back to SpatiumDDI. Short-interval polling is the practical upper bound without adding that complexity.
 
 Per poll:
 

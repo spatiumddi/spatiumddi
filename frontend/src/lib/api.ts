@@ -1143,8 +1143,16 @@ export interface PlatformSettings {
   dns_pull_from_server_interval_minutes: number;
   dns_pull_from_server_last_run_at: string | null;
   dhcp_pull_leases_enabled: boolean;
-  dhcp_pull_leases_interval_minutes: number;
+  dhcp_pull_leases_interval_seconds: number;
   dhcp_pull_leases_last_run_at: string | null;
+  audit_forward_syslog_enabled: boolean;
+  audit_forward_syslog_host: string;
+  audit_forward_syslog_port: number;
+  audit_forward_syslog_protocol: string;
+  audit_forward_syslog_facility: number;
+  audit_forward_webhook_enabled: boolean;
+  audit_forward_webhook_url: string;
+  audit_forward_webhook_auth_header: string;
   ip_allocation_strategy: string;
   session_timeout_minutes: number;
   auto_logout_minutes: number;
@@ -2518,4 +2526,45 @@ export const logsApi = {
     api.post<LogQueryResponse>("/logs/query", body).then((r) => r.data),
   dhcpAudit: (body: DhcpAuditRequest) =>
     api.post<DhcpAuditResponse>("/logs/dhcp-audit", body).then((r) => r.data),
+};
+
+// ── API Tokens ────────────────────────────────────────────────────────────────
+
+export interface ApiToken {
+  id: string;
+  name: string;
+  description: string;
+  prefix: string;
+  scope: string;
+  user_id: string | null;
+  expires_at: string | null;
+  last_used_at: string | null;
+  is_active: boolean;
+  created_at: string;
+}
+
+export interface ApiTokenCreate {
+  name: string;
+  description?: string;
+  expires_in_days?: number | null;
+}
+
+/** Response from POST — contains the raw token ONCE. */
+export interface ApiTokenCreated extends ApiToken {
+  token: string;
+}
+
+export interface ApiTokenUpdate {
+  name?: string;
+  description?: string;
+  is_active?: boolean;
+}
+
+export const apiTokensApi = {
+  list: () => api.get<ApiToken[]>("/api-tokens").then((r) => r.data),
+  create: (body: ApiTokenCreate) =>
+    api.post<ApiTokenCreated>("/api-tokens", body).then((r) => r.data),
+  update: (id: string, body: ApiTokenUpdate) =>
+    api.patch<ApiToken>(`/api-tokens/${id}`, body).then((r) => r.data),
+  delete: (id: string) => api.delete(`/api-tokens/${id}`),
 };

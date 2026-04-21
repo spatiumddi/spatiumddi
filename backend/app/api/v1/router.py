@@ -1,5 +1,6 @@
 from fastapi import APIRouter
 
+from app.api.v1.api_tokens.router import router as api_tokens_router
 from app.api.v1.audit.router import router as audit_router
 from app.api.v1.auth.router import router as auth_router
 from app.api.v1.auth_providers.router import router as auth_providers_router
@@ -23,6 +24,7 @@ api_v1_router.include_router(auth_router, prefix="/auth", tags=["auth"])
 api_v1_router.include_router(
     auth_providers_router, prefix="/auth-providers", tags=["auth-providers"]
 )
+api_v1_router.include_router(api_tokens_router, prefix="/api-tokens", tags=["api-tokens"])
 api_v1_router.include_router(ipam_router, prefix="/ipam", tags=["ipam"])
 api_v1_router.include_router(dns_router, prefix="/dns", tags=["dns"])
 api_v1_router.include_router(dns_blocklist_router, prefix="/dns", tags=["dns-blocklists"])

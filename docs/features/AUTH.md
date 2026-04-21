@@ -289,15 +289,62 @@ logins for unknown usernames still get a row (`user_id=NULL`,
 `user_display_name=<attempted name>`) so brute-force attempts are visible
 in the audit viewer.
 
+## API tokens
+
+Long-lived bearer credentials for scripts, CI pipelines, and
+automation. A token is equivalent to its owning user for permission
+purposes — no separate RBAC surface yet. Tokens are indistinguishable
+from JWTs on the wire (both use `Authorization: Bearer …`); the auth
+middleware peeks at the prefix to pick the validation path.
+
+**Wire format.** Raw tokens start with `sddi_` followed by 40
+url-safe base64 characters. Operators typically see only the first
+10 characters (`sddi_AbCdE`) in the UI as an identifier — this is
+the `APIToken.prefix` column, sufficient to pick a token out of a
+list without leaking entropy to an observer.
+
+**At rest.** Only the SHA-256 hash is stored (`APIToken.token_hash`).
+The raw value is returned exactly once from `POST /api/v1/api-tokens`
+and never again — losing it means creating a new token.
+
+**Validation path.** `app/api/deps.py:get_current_user` checks for the
+`sddi_` prefix first; if present it hashes the bearer, looks the row
+up by hash, enforces `is_active` and `expires_at`, then loads the
+owning user and bumps `last_used_at`. JWTs take the original path. A
+missing / wrong / revoked token returns the same generic 401 as an
+invalid JWT to avoid confirming token existence to an attacker.
+
+**Lifecycle.**
+- Create via the Admin → API Tokens UI or `POST /api/v1/api-tokens`
+  (JSON: `{name, description?, expires_in_days?}`). The create
+  response contains the raw `token` field **once** — the UI forces a
+  "copy now" dialog before it disappears.
+- List via `GET /api/v1/api-tokens` (your tokens only; superadmins
+  see everyone's).
+- Revoke softly via `PATCH /api/v1/api-tokens/{id}` with
+  `{is_active: false}` — the row stays so `last_used_at` is still
+  visible for incident forensics.
+- Delete hard via `DELETE /api/v1/api-tokens/{id}` — same outward
+  behaviour (401 on next use), audit row written on both paths.
+
+**TTL.** The UI defaults to 90 days and flags "Never" in amber so
+operators have to opt into long-lived bearers. The backend accepts
+both `expires_in_days` (UX-friendly) and `expires_at` (ISO timestamp,
+for automation). Expired tokens 401 with a distinct detail message
+so clients can detect "refresh me" vs "reconfigure me".
+
 ## Open items
 
-- **API tokens** — a `user_api_token` model exists but the issuance /
-  revocation UI is not yet wired up. Planned for Phase 1 finish.
 - **Forced-password policy** — `force_password_change=True` is honoured
   on first login; a broader policy (age, rotation, history) is Phase 4.
 - **SCIM provisioning** — not planned for Phase 1.
 - **Per-provider signing key rotation** — manual today; automate in a
   later wave.
+- **Global-scope / service-account tokens** — the `APIToken.scope`
+  column supports `global`, but validation rejects them today pending
+  a proper service-account user model. Token-only `allowed_paths` and
+  per-token permission overrides exist on the model but aren't
+  exposed on create yet.
 
 ## Rules & constraints
 

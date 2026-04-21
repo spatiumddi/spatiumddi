@@ -1,8 +1,11 @@
 """Periodic "DHCP lease pull" task.
 
-Fired every 60 seconds by Celery Beat. Gates on
+Fired every 10 seconds by Celery Beat. Gates on
 ``PlatformSettings.dhcp_pull_leases_enabled`` + its interval, so the
-beat schedule stays static while the UI can change cadence live.
+beat schedule stays static while the UI can change cadence live. The
+interval is stored in *seconds* (minimum 10) so operators can tune
+near-real-time IPAM population from Windows DHCP without restarting
+beat.
 
 Each run iterates every ``DHCPServer`` whose driver is registered as
 agentless (today: ``windows_dhcp``) and calls
@@ -66,7 +69,9 @@ async def _run_pull() -> dict[str, Any]:
                 return {"status": "disabled"}
 
             now = datetime.now(UTC)
-            interval = timedelta(minutes=max(1, ps.dhcp_pull_leases_interval_minutes))
+            # Minimum 10 s — beat only ticks that often, and we don't want to
+            # hammer the WinRM endpoint harder than that by accident.
+            interval = timedelta(seconds=max(10, ps.dhcp_pull_leases_interval_seconds))
             if ps.dhcp_pull_leases_last_run_at is not None:
                 elapsed = now - ps.dhcp_pull_leases_last_run_at
                 if elapsed < interval:
@@ -208,8 +213,8 @@ async def _run_pull() -> dict[str, Any]:
 
 @celery_app.task(name="app.tasks.dhcp_pull_leases.auto_pull_dhcp_leases", bind=True)
 def auto_pull_dhcp_leases(self: object) -> dict[str, Any]:  # type: ignore[type-arg]
-    """Celery beat entrypoint — fires every 60s; the task itself checks the
-    platform-settings gate and the per-run interval."""
+    """Celery beat entrypoint — fires every 10s; the task itself checks the
+    platform-settings gate and the per-run interval (in seconds)."""
     try:
         return asyncio.run(_run_pull())
     except Exception as exc:  # noqa: BLE001

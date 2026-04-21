@@ -77,15 +77,18 @@ celery_app.conf.update(
             "task": "app.tasks.dns_pull.auto_pull_dns_from_servers",
             "schedule": schedule(run_every=60.0),
         },
-        # Every 60 s, tick the DHCP lease-pull task. The task itself checks
+        # Every 10 s, tick the DHCP lease-pull task. The task itself checks
         # ``PlatformSettings.dhcp_pull_leases_enabled`` and the per-run
-        # interval, so cadence changes in the UI take effect without
-        # restarting celery-beat. Only applies to agentless drivers
-        # (windows_dhcp). Additive-only — the existing lease-cleanup sweep
-        # handles stale expiry.
+        # interval (in seconds, min 10), so cadence changes in the UI take
+        # effect without restarting celery-beat. The 10-second tick caps the
+        # fastest achievable cadence — enough for near-real-time IPAM
+        # population from Windows DHCP while leaving the WinRM endpoint
+        # breathing room. Only applies to agentless drivers (windows_dhcp).
+        # Additive-only — the existing lease-cleanup sweep handles stale
+        # expiry.
         "dhcp-pull-leases": {
             "task": "app.tasks.dhcp_pull_leases.auto_pull_dhcp_leases",
-            "schedule": schedule(run_every=60.0),
+            "schedule": schedule(run_every=10.0),
         },
     },
 )

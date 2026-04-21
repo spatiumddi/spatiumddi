@@ -10,6 +10,7 @@ import {
   Users,
   UsersRound,
   KeyRound,
+  KeySquare,
   ClipboardList,
   ChevronsLeft,
   ChevronsRight,
@@ -32,6 +33,7 @@ const mainNav = [
 ];
 
 const adminNav = [
+  { label: "API Tokens", icon: KeySquare, to: "/admin/api-tokens" },
   { label: "Audit Log", icon: ClipboardList, to: "/admin/audit" },
   { label: "Auth Providers", icon: ShieldCheck, to: "/admin/auth-providers" },
   { label: "Custom Fields", icon: Tags, to: "/admin/custom-fields" },

@@ -46,8 +46,16 @@ class SettingsResponse(BaseModel):
     dns_pull_from_server_interval_minutes: int
     dns_pull_from_server_last_run_at: datetime | None
     dhcp_pull_leases_enabled: bool
-    dhcp_pull_leases_interval_minutes: int
+    dhcp_pull_leases_interval_seconds: int
     dhcp_pull_leases_last_run_at: datetime | None
+    audit_forward_syslog_enabled: bool
+    audit_forward_syslog_host: str
+    audit_forward_syslog_port: int
+    audit_forward_syslog_protocol: str
+    audit_forward_syslog_facility: int
+    audit_forward_webhook_enabled: bool
+    audit_forward_webhook_url: str
+    audit_forward_webhook_auth_header: str
     dhcp_default_dns_servers: list[str]
     dhcp_default_domain_name: str
     dhcp_default_domain_search: list[str]
@@ -79,7 +87,15 @@ class SettingsUpdate(BaseModel):
     dns_pull_from_server_enabled: bool | None = None
     dns_pull_from_server_interval_minutes: int | None = None
     dhcp_pull_leases_enabled: bool | None = None
-    dhcp_pull_leases_interval_minutes: int | None = None
+    dhcp_pull_leases_interval_seconds: int | None = None
+    audit_forward_syslog_enabled: bool | None = None
+    audit_forward_syslog_host: str | None = None
+    audit_forward_syslog_port: int | None = None
+    audit_forward_syslog_protocol: str | None = None
+    audit_forward_syslog_facility: int | None = None
+    audit_forward_webhook_enabled: bool | None = None
+    audit_forward_webhook_url: str | None = None
+    audit_forward_webhook_auth_header: str | None = None
     dhcp_default_dns_servers: list[str] | None = None
     dhcp_default_domain_name: str | None = None
     dhcp_default_domain_search: list[str] | None = None
@@ -104,7 +120,6 @@ class SettingsUpdate(BaseModel):
         "discovery_scan_interval_minutes",
         "dns_auto_sync_interval_minutes",
         "dns_pull_from_server_interval_minutes",
-        "dhcp_pull_leases_interval_minutes",
     )
     @classmethod
     def validate_positive(cls, v: int | None) -> int | None:
@@ -112,11 +127,41 @@ class SettingsUpdate(BaseModel):
             raise ValueError("Must be >= 1")
         return v
 
+    @field_validator("dhcp_pull_leases_interval_seconds")
+    @classmethod
+    def validate_dhcp_pull_seconds(cls, v: int | None) -> int | None:
+        # Beat ticks every 10 s — anything below that can't be honoured.
+        if v is not None and v < 10:
+            raise ValueError("Must be >= 10 (Celery beat ticks every 10 seconds)")
+        return v
+
     @field_validator("utilization_warn_threshold", "utilization_critical_threshold")
     @classmethod
     def validate_threshold(cls, v: int | None) -> int | None:
         if v is not None and not (0 <= v <= 100):
             raise ValueError("Threshold must be between 0 and 100")
+        return v
+
+    @field_validator("audit_forward_syslog_protocol")
+    @classmethod
+    def validate_syslog_protocol(cls, v: str | None) -> str | None:
+        if v is not None and v not in ("udp", "tcp"):
+            raise ValueError("syslog_protocol must be 'udp' or 'tcp'")
+        return v
+
+    @field_validator("audit_forward_syslog_port")
+    @classmethod
+    def validate_syslog_port(cls, v: int | None) -> int | None:
+        if v is not None and not (1 <= v <= 65535):
+            raise ValueError("Port must be 1–65535")
+        return v
+
+    @field_validator("audit_forward_syslog_facility")
+    @classmethod
+    def validate_syslog_facility(cls, v: int | None) -> int | None:
+        # RFC 5424 §6.2.1 — facility is 0–23.
+        if v is not None and not (0 <= v <= 23):
+            raise ValueError("Syslog facility must be 0–23 (RFC 5424)")
         return v
 
 

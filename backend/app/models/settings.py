@@ -93,8 +93,13 @@ class PlatformSettings(Base):
     # rows are upserted by (server_id, ip_address); mirrored IPAM rows are
     # removed by the existing lease-cleanup sweep when expires_at passes.
     dhcp_pull_leases_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    dhcp_pull_leases_interval_minutes: Mapped[int] = mapped_column(
-        Integer, nullable=False, default=5
+    # Interval in *seconds* (was minutes pre-b2f7e91d3c48). Beat ticks every
+    # 10 s now, so values down to ~10 s take effect as configured; anything
+    # smaller is floored. Operators who want true sub-minute cadence should
+    # be mindful of the load it puts on the Windows DC — a 15 s poll is one
+    # WinRM round trip every 15 s per server.
+    dhcp_pull_leases_interval_seconds: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=15
     )
     dhcp_pull_leases_last_run_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
@@ -108,3 +113,34 @@ class PlatformSettings(Base):
     )
     dhcp_default_ntp_servers: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
     dhcp_default_lease_time: Mapped[int] = mapped_column(Integer, nullable=False, default=86400)
+
+    # Audit event forwarding — ship each committed AuditLog row out to an
+    # external syslog collector and/or a generic HTTP webhook. Both targets
+    # are independent: enable either, both, or neither. Failure to deliver
+    # never blocks the audit commit; errors are logged via structlog and
+    # eventually surface in the scheduled-task / system logs view.
+    audit_forward_syslog_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+    audit_forward_syslog_host: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    audit_forward_syslog_port: Mapped[int] = mapped_column(Integer, nullable=False, default=514)
+    # protocol: udp | tcp (TLS deferred — needs cert management)
+    audit_forward_syslog_protocol: Mapped[str] = mapped_column(
+        String(10), nullable=False, default="udp"
+    )
+    # facility: 0–23, mapped to LOG_* per RFC 5424 §6.2.1. Default is
+    # "local0" (16) since audit events are clearly app-level, not kernel
+    # or auth-daemon scope.
+    audit_forward_syslog_facility: Mapped[int] = mapped_column(Integer, nullable=False, default=16)
+
+    audit_forward_webhook_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+    audit_forward_webhook_url: Mapped[str] = mapped_column(String(1024), nullable=False, default="")
+    # Optional Authorization header (e.g. "Bearer …" or "Basic …"); stored
+    # in plaintext today because the rest of this row is plaintext too —
+    # move to Fernet alongside the provider creds when we tighten secrets
+    # at rest across the board.
+    audit_forward_webhook_auth_header: Mapped[str] = mapped_column(
+        String(1024), nullable=False, default=""
+    )

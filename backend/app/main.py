@@ -14,6 +14,12 @@ from app.config import settings
 from app.log import configure_logging
 from app.metrics import PrometheusMiddleware, metrics_endpoint
 
+# Import for side-effect: registers the SQLAlchemy after_commit listener
+# that forwards audit events to syslog + webhook targets. Must run at app
+# startup so the listener is attached before any request handler writes
+# an AuditLog row.
+from app.services import audit_forward  # noqa: F401
+
 logger = structlog.get_logger(__name__)
 
 

@@ -239,7 +239,12 @@ SpatiumDDI cut its alpha release `2026.04.16-1` on 2026-04-16 with IPAM, DNS (BI
   and mirrored into IPAM as `status="dhcp"` + `auto_from_lease=True` rows
   when the lease IP falls inside a known subnet; the existing lease-
   cleanup sweep handles expiry uniformly. Manual "Sync Leases" button
-  on the server detail header for agentless drivers.
+  on the server detail header for agentless drivers. Beat ticks every
+  10 s and the per-run interval is stored in seconds
+  (`PlatformSettings.dhcp_pull_leases_interval_seconds`, default 15 s)
+  so operators can tune near-real-time IPAM population — Windows
+  DHCP has no streaming primitive, so short-interval polling is the
+  practical upper bound without putting an agent on the DC.
 - ⬜ **Windows DHCP — Path B (WinRM + PowerShell, full CRUD)** — scope
   / reservation / client-class / option CRUD via `Add-DhcpServerv4Scope`,
   `Add-DhcpServerv4Reservation`, etc. Layered on top of Path A in the
@@ -250,6 +255,57 @@ SpatiumDDI cut its alpha release `2026.04.16-1` on 2026-04-16 with IPAM, DNS (BI
 - ⬜ IP discovery — ping sweep + ARP scan Celery task; flags `discovered` status; reconciliation report (see `docs/features/IPAM.md §8`)
 - ⬜ OUI/vendor lookup — IEEE OUI database loaded into `oui_vendor` table; shown next to MAC addresses (see `docs/features/IPAM.md §12`)
 - ⬜ SNMP polling / network device management — ARP table polling for IP discovery (see `docs/features/IPAM.md §13`)
+- ✅ **API tokens with auto-expiry** (Phase 1 close-out) — `APIToken`
+  model already existed; this session wires the create/list/revoke
+  router, extends `get_current_user` to accept `spddi_*` bearer
+  tokens alongside JWTs, tracks `last_used_at`, and adds an admin UI
+  at `/admin/api-tokens`. Tokens are hashed at rest (SHA-256) and
+  shown in plaintext once at creation.
+- ✅ **Syslog + event forwarding** — every successful `AuditLog`
+  commit is optionally forwarded to an external syslog target
+  (RFC 5424 over UDP / TCP) and/or a generic HTTP webhook. Hook is
+  a SQLAlchemy `after_commit` session listener in
+  `services/audit_forward.py`; delivery is fire-and-forget on a
+  dedicated asyncio task so audit writes never block on network I/O.
+  Configured in Settings; targets live on `PlatformSettings`
+  (single syslog + single webhook for now — multi-target moves to a
+  dedicated table when a second customer asks).
+- ⬜ **DNS Views — end-to-end split-horizon wiring** — `DNSView`
+  model + CRUD ship today, but the BIND9 driver doesn't wrap zones
+  in `view { match-clients …; zone { … }; }` blocks and record
+  CRUD has no `view_id` assignment UI. The storage side is ready;
+  what's missing is driver rendering + record-level view selection
+  + UI binding on the record form. Phase 3.
+- ⬜ **DHCP state failover (Kea HA)** — peer-level failover
+  configuration rendered into Kea's `high-availability` hook,
+  heartbeat channel, lease-replication state machine (Normal /
+  Communications-Interrupted / Partner-Down / Recover /
+  Load-Balancing / Hot-Standby). Requires agent support on both
+  peers, a new `DHCPFailoverChannel` model, and UI for peer
+  configuration + state-transition actions. Phase 3–4.
+- ⬜ **Alerts framework** — rule-based alerts on metrics we already
+  collect (subnet utilisation, DHCP lease exhaustion, server
+  unreachable, query rate spikes). Models: `AlertRule`,
+  `AlertHistory`. Celery-beat evaluation loop against the metrics
+  table. Delivery channels: email (SMTP), SNMP trap, syslog (reuse
+  the Phase-7-completed forwarder), webhook. UI for rule CRUD +
+  history viewer. Phase 4 — fits alongside the existing
+  "notifications" bucket.
+- ⬜ **IPAM template classes** — reusable stamp templates that
+  carry default tags, custom-field values, DNS / DHCP group
+  assignments, and optional sub-subnet layouts. Applied to a block
+  or subnet on create; existing instances can re-apply to pick up
+  template drift. Phase 5 — belongs alongside advanced reporting /
+  multi-tenancy, once the base inheritance story is fully bedded
+  down.
+- ⬜ **Cloud DNS driver family — Route 53 / Azure DNS / Cisco DNA**
+  — each is its own driver module implementing the DNS driver ABC.
+  Route 53 via `boto3` is the simplest entry point (stable REST
+  API, well-documented record-type mapping). Azure DNS via
+  `azure-mgmt-dns`. Cisco DNA is its own adventure — it's an
+  enterprise controller, not a DNS service, and its "DNS" touches
+  SD-Access rather than the public resolver tree. Phase 4 — pairs
+  with the Terraform / Ansible providers already on the roadmap.
 
 ---
 
