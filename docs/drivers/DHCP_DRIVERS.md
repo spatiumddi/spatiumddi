@@ -110,11 +110,13 @@ The IPv6 path renders a `Dhcp6` tree in parallel to `Dhcp4`. Dhcp6 option-name t
 
 ### HA coordination
 
-Kea's built-in `HA hook library` handles pool coordination between paired servers. SpatiumDDI's driver:
+Kea's built-in `libdhcp_ha.so` hook handles pool coordination between paired servers. SpatiumDDI pairs two Kea servers in a **`DHCPFailoverChannel`** row — see `backend/app/models/dhcp.py` for the model, [`docs/features/DHCP.md` §14](../features/DHCP.md) for the feature-level spec.
 
-- Pushes matching `hooks-libraries` config to both peers in a `DHCPServerGroup`.
-- Configures `load-balancing` or `hot-standby` mode based on `DHCPServerGroup.mode`.
-- Does **not** coordinate leases itself — Kea peers talk directly to each other.
+- `_resolve_failover` in `backend/app/services/dhcp/config_bundle.py` emits a `FailoverConfig` on the `ConfigBundle` when the server belongs to a channel.
+- The agent's `render_kea.py:_ha_hook()` injects `libdhcp_ha.so` alongside the always-loaded `libdhcp_lease_cmds.so` (the HA hook depends on it).
+- Each peer's `this-server-name` is derived from its `DHCPServer.name`; the `peers` array carries both entries with roles `primary` + (`standby` in hot-standby / `secondary` in load-balancing) and the shared heartbeat / max-response / max-ack / max-unacked tuning from the channel.
+- Agent-side `HAStatusPoller` (`agent/dhcp/spatium_dhcp_agent/ha_status.py`) calls `ha-status-get` every ~15 s and POSTs the state to the control plane — drives the live HA pill in the UI.
+- The driver does **not** replicate leases itself — Kea's hook talks directly to the peer's `kea-ctrl-agent`. SpatiumDDI just renders the config.
 
 ### Agent bootstrap
 

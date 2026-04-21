@@ -396,7 +396,35 @@ Pre-built dashboards shipped with the project (in `deploy/grafana/dashboards/`):
 
 ---
 
-## 9. Alerting Rules
+## 9. Alerting
+
+SpatiumDDI exposes two parallel paths for alerts. Both can run at
+once — they serve different audiences.
+
+### 9.1 In-app alerts framework (native)
+
+Operator-authored rules stored in the `alert_rule` table. The
+evaluator (`backend/app/services/alerts.py:evaluate_all`) runs on a
+60 s Celery beat tick; `POST /api/v1/alerts/evaluate` forces an
+immediate pass. Each match opens an `alert_event` row (partial
+index on `(rule_id, subject_type, subject_id) WHERE resolved_at IS
+NULL` keeps dedup O(1)); events resolve automatically when the
+subject clears. Delivery reuses the **Audit Event Forwarding**
+syslog + webhook targets — one SIEM destination for both audit and
+alerts.
+
+Rule types shipped today:
+
+| Type | Fires when |
+|---|---|
+| `subnet_utilization` | `Subnet.utilization_percent ≥ threshold`; honours `PlatformSettings.utilization_max_prefix_{ipv4,ipv6}` so PTP / loopback subnets can't trip the alarm. |
+| `server_unreachable` | Any DNS / DHCP server whose status is `unreachable` or `error`. `server_type` filters the family. |
+
+Admin UI lives at `/admin/alerts` — rules CRUD + live events viewer
+(15 s refetch) + per-event `Resolve` to manually silence a known-
+noisy event.
+
+### 9.2 Prometheus alerting rules (external)
 
 Pre-built Prometheus alerting rules (in `deploy/prometheus/alerts/`):
 

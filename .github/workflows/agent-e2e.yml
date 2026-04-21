@@ -29,6 +29,13 @@ on:
         required: false
         default: "latest"
 
+# Least-privilege default — this workflow only needs to read the repo
+# to pull the chart + manifests. No contents/packages/issues/PR
+# writes. Keeps CodeQL's actions/missing-workflow-permissions rule
+# happy and survives a repo default that's stricter than read-all.
+permissions:
+  contents: read
+
 jobs:
   e2e:
     runs-on: ubuntu-latest

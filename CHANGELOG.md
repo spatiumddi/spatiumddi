@@ -11,6 +11,239 @@ _No unreleased changes yet._
 
 ---
 
+## 2026.04.21-1 — 2026-04-21
+
+Big feature push — Kea HA failover, OUI vendor lookup, IPv6
+auto-allocation, a first-cut alerts framework, the umbrella Helm
+chart with OCI publishing, agent-side Kea DDNS + block/space
+inheritance, per-server DNS zone serial reporting, API tokens,
+audit-event forwarding, near-real-time Windows DHCP lease polling,
+plus a healthy batch of infrastructure hardening (dev-stack
+healthchecks, Trivy gate, kind-based e2e workflow).
+
+### Added
+
+**DHCP**
+
+- **Kea HA failover channels** — new `DHCPFailoverChannel` model
+  pairs two Kea DHCP servers in an HA relationship. Mode
+  (`hot-standby` / `load-balancing`), per-peer `kea-ctrl-agent` URL,
+  heartbeat / max-response / max-ack / max-unacked tuning, and
+  auto-failover toggle live on the channel; each server may belong
+  to at most one channel (unique FK constraints). The agent's
+  `render_kea.py` injects `libdhcp_ha.so` + `high-availability`
+  alongside the existing `libdhcp_lease_cmds.so` hook. Fourth agent
+  thread (`HAStatusPoller`) polls `ha-status-get` every ~15 s and
+  POSTs state to `/api/v1/dhcp/agents/ha-status` — control plane
+  stores it on `DHCPServer.ha_state` + `ha_last_heartbeat_at`.
+  Admin UI at **`/admin/failover-channels`** does CRUD; DHCP server
+  detail header shows a live colored HA pill. Deferred: state-
+  transition actions (`ha-maintenance-start` / `ha-continue` /
+  force-sync), peer compatibility validation, per-pool HA scope
+  tuning. See [`docs/features/DHCP.md` §14](docs/features/DHCP.md).
+- **Near-real-time Windows DHCP lease polling** — beat ticks every
+  10 s; interval now stored in seconds (default 15) via
+  `PlatformSettings.dhcp_pull_leases_interval_seconds`, so
+  operators can tune live cadence in the UI without restarting
+  celery-beat. Closes the last agentless-DHCP visibility gap.
+- **Agent-side Kea DDNS** — `/api/v1/dhcp/agents/lease-events` now
+  calls `apply_ddns_for_lease` after mirroring a lease into IPAM
+  and `revoke_ddns_for_lease` before deleting the mirror on
+  expire / release. Errors are logged but never block lease
+  ingestion.
+
+**DNS**
+
+- **Per-server zone serial reporting** — new `DNSServerZoneState`
+  table (unique on `(server_id, zone_id)`); agents POST
+  `{zones: [{zone_name, serial}, ...]}` to
+  `/api/v1/dns/agents/zone-state` after each successful structural
+  apply. Read endpoint
+  `GET /dns/groups/{gid}/zones/{zid}/server-state` joins the
+  servers for a group with their latest report. Frontend: new
+  `ZoneSyncPill` on the zone detail header with 30 s refetch —
+  emerald "N/N synced · serial X", amber "1/N drift · target X"
+  with per-server tooltip, muted "not reported" for fresh agents.
+
+**IPAM**
+
+- **Full IPv6 `/next-address`** — three strategies at the API
+  boundary (`sequential` / `random` / `eui64`) + a subnet-level
+  default via the new `Subnet.ipv6_allocation_policy` column. EUI-64
+  derives per RFC 4291 §2.5.1 (u/l bit flip + FF:FE insert); random
+  uses CSPRNG with collision retry and skips the all-zero suffix
+  (RFC 4291 §2.6.1 subnet-router anycast); sequential is a first-
+  free linear scan capped at 65k hosts. Pydantic + UI exposed;
+  `/next-ip-preview` accepts `?mac_address=` so the UI can show the
+  EUI-64 candidate pre-commit. Unit coverage in
+  `tests/test_ipv6_allocation.py` pins the RFC 4291 Appendix A
+  example.
+- **OUI vendor lookup** — opt-in IEEE OUI database fetched by the
+  new `app.tasks.oui_update` Celery task on an hourly beat tick;
+  task self-gates on `PlatformSettings.oui_lookup_enabled` +
+  `oui_update_interval_hours` (default 24 h). Incremental diff-
+  based upsert keeps each prefix's `updated_at` meaningful. New
+  **Settings → IPAM → OUI Vendor Lookup** section shows source
+  URL, toggle, interval, last-updated timestamp, vendor count, and
+  a "Refresh Now" modal that polls task state via
+  `/settings/oui/refresh/{task_id}` and renders added / updated /
+  removed / unchanged counters on completion. IPAM address table +
+  DHCP leases show `aa:bb:cc:dd:ee:ff (Vendor)` when enabled; the
+  IPAM MAC column filter also matches vendor names so `apple` /
+  `cisco` work without knowing the prefix. See
+  [`docs/features/IPAM.md` §12](docs/features/IPAM.md).
+
+**Alerts**
+
+- **Rule-based alerts framework (v1)** — new `alert_rule` +
+  `alert_event` tables. Two rule types at launch: `subnet_
+  utilization` (honours `PlatformSettings.utilization_max_prefix_*`
+  so PTP / loopback subnets can't trip the alarm) and
+  `server_unreachable` (DNS / DHCP / any). Evaluator opens events
+  for fresh matches and resolves on clear; partial index on
+  `(rule_id, subject_type, subject_id) WHERE resolved_at IS NULL`
+  keeps dedup O(1). Delivery reuses the audit-forward syslog +
+  webhook targets. Celery beat fires every 60 s; a
+  `POST /alerts/evaluate` endpoint lets the UI force a run.
+  Admin page at `/admin/alerts` — rules CRUD + live events viewer
+  (15 s refetch) + per-event "Resolve".
+
+**DDNS inheritance**
+
+- **Block + space DDNS inheritance** — `IPSpace` / `IPBlock` now
+  carry `ddns_enabled` / `ddns_hostname_policy` /
+  `ddns_domain_override` / `ddns_ttl`. `Subnet` / `IPBlock` carry
+  `ddns_inherit_settings`. `services/dns/ddns.resolve_effective_
+  ddns` walks `subnet → block chain → space` and returns an
+  `EffectiveDDNS` with a `source` field for UI / debug. Both the
+  hostname resolver and the apply path now consult the effective
+  config instead of reading subnet fields directly — fixes the
+  "space-level DDNS toggle doesn't cascade" behaviour.
+
+**Auth / API**
+
+- **API tokens with auto-expiry** — CRUD at `/api/v1/api-tokens`;
+  `sddi_` prefix branch in `get_current_user`; tokens hashed at
+  rest (sha256), shown plaintext exactly once on creation. Admin
+  page at `/admin/api-tokens`.
+- **Audit-event forwarding** — RFC 5424 syslog (UDP / TCP) and / or
+  HTTP webhook. SQLAlchemy `after_commit` listener in
+  `services/audit_forward.py`; delivery is fire-and-forget on a
+  dedicated asyncio task so audit writes never block on network
+  I/O. Configured under **Settings → Audit Event Forwarding** on
+  platform-level `PlatformSettings` columns.
+
+**Deployment**
+
+- **Umbrella Helm chart (`charts/spatiumddi/`)** — replaces the
+  narrow `charts/spatium-dns/` with a full application chart
+  covering API, frontend, Celery worker, Celery beat, the migrate
+  Job, Postgres + Redis via Bitnami subcharts, and optional DNS +
+  DHCP agent StatefulSets (one per values entry). Chart-owned
+  secret preserves `SECRET_KEY` across upgrades via `lookup`.
+  Migrate Job runs as a pre-install + pre-upgrade Helm hook.
+  Release workflow publishes to
+  `oci://ghcr.io/<owner>/charts/spatiumddi` on every CalVer tag
+  (CalVer → SemVer normalised: `2026.04.21-1` → `2026.4.21-1`).
+  Chart README + NOTES.txt cover install, upgrade, external DB /
+  Redis, and agent enablement.
+
+**Infrastructure / CI**
+
+- **Kind-based agent e2e workflow** — new `.github/workflows/
+  agent-e2e.yml` spins up a kind cluster, installs the umbrella
+  chart with one ns1 DNS agent, port-forwards the API for
+  `/health/live`, execs `dig +short version.bind CH TXT` in the
+  DNS agent pod, and checks restart count. Fires on
+  `agent/**` / `charts/spatiumddi/**` / `backend/**` / `frontend/**`
+  PRs + `workflow_dispatch`.
+- **Trivy gate enforced** — `exit-code: "0"` → `"1"` with
+  `ignore-unfixed: true` on both `build-dns-images.yml` and
+  `build-dhcp-images.yml`, so HIGH/CRITICAL CVEs with an available
+  fix block image builds. Un-fixed CVEs don't block the pipeline.
+
+**UI polish**
+
+- **IP Space tree interleaves blocks + subnets by network** —
+  previously the tree rendered all child blocks first and all
+  subnets second, so a block like `10.255.0.0/24` would bubble
+  above sibling `/24` subnets regardless of address. Now
+  `buildBlockTree()` merges children and sorts by network per
+  level. New `lib/cidr.ts:compareNetwork()` + `addressToBigInt()`
+  helpers work for both IPv4 and IPv6 at any prefix length.
+- **Small-subnet suppression** —
+  `PlatformSettings.utilization_max_prefix_ipv4` (default 29) and
+  `_ipv6` (default 126). Subnets whose prefix exceeds the max are
+  excluded from dashboard utilization counts, the heatmap, Top
+  Subnets list, and the `subnet_utilization` alert rule — so
+  `/30` / `/31` / `/32` (PTP, loopback) and `/127` / `/128` (RFC
+  6164 PTP) no longer skew reporting. Shared
+  `lib/utilization.ts:includeInUtilization` predicate.
+
+### Changed
+
+- **ISC DHCP support is now explicitly not supported.** Upstream
+  entered maintenance-only mode in 2022 and the ISC team
+  recommends Kea as the successor. Removed from the roadmap and
+  every doc section, replaced with an explicit "not supported"
+  note where the question would otherwise come up
+  (`docs/features/DHCP.md`, `docs/drivers/DHCP_DRIVERS.md`). The
+  `VALID_DRIVERS` check in the CRUD router rejects `driver:
+  "isc_dhcp"` with a clean `422`.
+- **Agent sync loop now unwraps the long-poll envelope.** The
+  DHCP agent's `_apply_bundle` was passing the full envelope
+  (`{server_id, etag, bundle, pending_ops}`) to `render_kea`,
+  which expects the inner bundle dict. The agent would render a
+  Kea config with no subnets or client classes. Fix: unwrap once
+  in `_apply_bundle`, which also makes the new `failover` block
+  actually reach the Kea renderer.
+
+### Fixed
+
+- **Frontend nginx cached the api upstream IP.** Recreating the
+  `api` container changed its Docker-assigned IP; nginx held the
+  stale one from config-load time and every `/api/v1/*` call
+  started returning 502. `frontend/nginx.conf` now declares
+  `resolver 127.0.0.11 valid=10s ipv6=off` + uses variable-based
+  `proxy_pass` so each request re-resolves via Docker's embedded
+  DNS. Adds a new `location = /nginx-health` that answers `200 ok`
+  directly — no more upstream hop in the healthcheck.
+- **Worker + beat healthchecks were wrong.** Both inherited the
+  api's `http://localhost:8000/health/live` probe from
+  `backend/Dockerfile` but neither process listens on HTTP; both
+  kept flipping to `unhealthy`. Overrode in `docker-compose.yml`:
+  worker uses `celery -A app.celery_app inspect ping -d celery@
+  $HOSTNAME` (broker round-trip); beat uses
+  `grep -q 'celery' /proc/1/cmdline`.
+- **Frontend healthcheck resolved to IPv6.** Busybox wget prefers
+  `::1` for `localhost`; nginx binds `0.0.0.0:80`, so the probe
+  returned "Connection refused". Switched to
+  `http://127.0.0.1/nginx-health`.
+- **CodeQL `actions/missing-workflow-permissions` on agent-e2e**
+  — new workflow missed its top-level `permissions:` block.
+  Added `contents: read` (least-privilege).
+
+### Docs
+
+- `docs/features/DHCP.md` — §14 rewritten as a real "Kea HA
+  failover channels" spec (data model, modes, agent-side rendered
+  hook payload, state-reporting cadence, managing channels), and
+  Rules & constraints gets a new "Failover channels" subsection.
+  §15 "Parent / child setting inheritance" explicitly calls out
+  the DDNS inheritance chain.
+- `docs/features/IPAM.md` §12 — OUI section rewritten to match
+  the shipped behaviour (source URL, gating fields, diff-based
+  atomic replace, manual refresh endpoint, inline display).
+- `CLAUDE.md` — multiple roadmap status updates: Phase 1 IPv6,
+  DDNS agent path, DDNS block/space inheritance, per-server zone
+  serial, Trivy-clean + kind e2e, alerts framework (v1), and
+  Kea HA (core) flipped to ✅. ACME DNS-01 provider + embedded
+  client entries added to Future Phases with full shape.
+- `README.md` + `CLAUDE.md` + `docs/drivers/DHCP_DRIVERS.md` +
+  `docs/PERMISSIONS.md` — ISC DHCP scrubbed.
+
+---
+
 ## 2026.04.20-2 — 2026-04-20
 
 Follow-on polish release. Dark sidebar so the nav is distinct from
