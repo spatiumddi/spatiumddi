@@ -431,15 +431,22 @@ The `libdhcp_lease_cmds.so` hook is a hard prerequisite for HA and is loaded unc
 
 ### Live state reporting
 
-A fourth thread in the agent (`HAStatusPoller`, `agent/dhcp/spatium_dhcp_agent/ha_status.py`) calls `ha-status-get` against the local Kea control socket every ~15 s with small jitter and POSTs the result to `POST /api/v1/dhcp/agents/ha-status`. The control plane stores the state on `DHCPServer.ha_state` + `ha_last_heartbeat_at`. The poller self-disables when the most recent bundle carried no `failover` block, so standalone servers don't spam Kea with commands that return an error.
+A fourth thread in the agent (`HAStatusPoller`, `agent/dhcp/spatium_dhcp_agent/ha_status.py`) calls `status-get` against the local Kea control socket every ~15 s with small jitter and POSTs the result to `POST /api/v1/dhcp/agents/ha-status`. Kea 2.6 folded HA state into the generic `status-get` response under `arguments.high-availability[0].ha-servers.local.state`; the extractor also accepts pre-2.6 `ha-status-get` shapes for forward-compat. The control plane stores the state on `DHCPServer.ha_state` + `ha_last_heartbeat_at`. The poller self-disables when the most recent bundle carried no `failover` block, so standalone servers don't spam Kea with commands that return an error.
 
-Kea state names pass through verbatim (`normal` / `hot-standby` / `load-balancing` / `ready` / `waiting` / `syncing` / `communications-interrupted` / `partner-down` / `backup` / `passive-backup` / `terminated`). The DHCP server detail header renders a colored `HA: <state>` pill. The dashboard's DHCP column lists one row per HA-paired group with a state dot per peer.
+Kea state names pass through verbatim (`normal` / `hot-standby` / `load-balancing` / `ready` / `waiting` / `syncing` / `communications-interrupted` / `partner-down` / `backup` / `passive-backup` / `terminated`). The DHCP server detail header renders a colored `HA: <state>` pill. The dashboard's DHCP column lists one row per HA-paired group with a state dot per peer. The group detail view shows the same pill inline per-server so you can see HA state without drilling into each server page; use the Refresh button there after changing HA mode to repaint without waiting for the 30 s React Query poll.
+
+### Peer IP drift self-healing
+
+Kea's HA hook parses peer URLs with Boost asio, which only accepts IP literals — hostnames aren't looked up by Kea itself. The agent resolves hostnames at render time via `_resolve_peer_url`, but the IP can change afterwards (compose `--force-recreate`, k8s pod restart, bridge-IP reshuffle), leaving Kea pointing at a stale peer. A fifth thread (`PeerResolveWatcher`, `agent/dhcp/spatium_dhcp_agent/peer_resolve.py`) re-resolves peer hostnames every 30 s and, if any have drifted, triggers a render + config-reload with the fresh URL. Resolution failures are treated as transient (keep the cached IP, try again next tick), so a brief DNS outage doesn't thrash reloads.
 
 ### Not yet shipped (follow-up)
 
 - **State-transition actions** — `ha-maintenance-start`, `ha-continue`, force-sync. The state machine is observable today but operators can't drive it from the UI; `kubectl exec` + manual `kea-shell` is the workaround.
 - **Peer compatibility validation** — the control plane doesn't yet refuse groups with ≥ 3 Kea members (Kea HA only supports pairs).
 - **Per-pool HA scope tuning** — the Kea HA hook supports per-subnet scope overrides; we render the relationship globally only.
+- **Kea version skew guard** — `status-get` HA shape shifted between Kea 2.4 and 2.6. The extractor handles both, but the control plane still accepts pairing peers on mismatched Kea versions.
+- **DDNS double-write under HA** — agent-side `apply_ddns_for_lease` doesn't gate on HA state. If the standby ever serves a lease (pre-sync window, partner-down), both peers could try to write the same RR.
+- **HA DHCP e2e test** — the kind-based workflow stands up a single DNS agent; an HA DHCP variant would have caught all the bootstrap / port-split / `status-get` / wire-shape regressions shaken out in 2026.04.21-2.
 
 ### Managing HA
 

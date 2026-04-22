@@ -100,7 +100,7 @@ Located at [`app/drivers/dhcp/kea.py`](../../backend/app/drivers/dhcp/kea.py). A
 | Read leases | Kea `lease_cmds` hook → HTTP POST to Kea Control Agent `/` with `command: lease4-get-all` | Real-time; falls back to polling if CA is unreachable. |
 | Read scopes | Kea Control Agent `config-get` | Used by the /scopes read endpoints. |
 
-Kea runs an HTTP Control Agent on `localhost:8000` (inside the agent pod/container). The agent drives Kea by:
+Kea runs an HTTP Control Agent on `localhost:8544` (inside the agent pod/container — `:8000` is reserved for the HA hook's peer-to-peer listener). The agent drives Kea by:
 
 1. Rendering the config bundle into Kea JSON (`Dhcp4` for IPv4, `Dhcp6` for IPv6 — address-family split on `DHCPScope.address_family`).
 2. POSTing to `config-test` before `config-set` to catch validation errors early.
@@ -108,19 +108,52 @@ Kea runs an HTTP Control Agent on `localhost:8000` (inside the agent pod/contain
 
 The IPv6 path renders a `Dhcp6` tree in parallel to `Dhcp4`. Dhcp6 option-name translation is marked TODO in the driver — today it passes option codes through unchanged.
 
+### Wire shape from control plane → renderer
+
+The HTTP envelope returned by `GET /api/v1/dhcp/agents/config` is:
+
+```json
+{
+  "server_id": "<uuid>",
+  "etag": "sha256:…",
+  "bundle": {
+    "server_name": "…",
+    "driver": "kea",
+    "roles": [...],
+    "scopes": [
+      {
+        "subnet_cidr": "10.0.0.0/24",
+        "lease_time": 3600,
+        "options": {…},
+        "pools": [{"start_ip": "...", "end_ip": "...", "pool_type": "dynamic"}, …],
+        "statics": [{"ip_address": "...", "mac_address": "...", "hostname": "..."}, …],
+        "ddns_enabled": false
+      }, …
+    ],
+    "client_classes": [{"name": "...", "match_expression": "...", "options": {…}}, …],
+    "failover": { ... } | null
+  },
+  "pending_ops": [...]
+}
+```
+
+Shipped 2026.04.21-2: `render_kea.py:_scope_to_subnet` maps each wire scope to a Kea `subnet4` entry — `subnet_cidr` → `subnet`, `pools[start_ip,end_ip,pool_type]` → `{"pool": "start - end"}` (only `dynamic` pools are emitted; `excluded` / `reserved` are IPAM bookkeeping and must **not** become Kea lease pools), `statics[ip_address,mac_address,hostname]` → `reservations[ip-address,hw-address,hostname]`. Client-class `match_expression` → Kea `test`. Subnet `id` is derived deterministically from the CIDR via truncated SHA-256, so a config reload never orphans active leases by renumbering subnets.
+
 ### HA coordination
 
-Kea's built-in `libdhcp_ha.so` hook handles pool coordination between paired servers. Under the group-centric data model (shipped 2026.04.22-1), SpatiumDDI treats a `DHCPServerGroup` with exactly two Kea members as an implicit HA pair — HA tuning lives on the group, per-peer URLs live on each `DHCPServer.ha_peer_url`. There is no separate "failover channel" object any more.
+Kea's built-in `libdhcp_ha.so` hook handles pool coordination between paired servers. Under the group-centric data model (shipped 2026.04.21-2), SpatiumDDI treats a `DHCPServerGroup` with exactly two Kea members as an implicit HA pair — HA tuning lives on the group, per-peer URLs live on each `DHCPServer.ha_peer_url`. There is no separate "failover channel" object any more.
 
 - `_resolve_failover` in `backend/app/services/dhcp/config_bundle.py` walks the server's group. If the group has ≥ 2 Kea members and each has a non-empty `ha_peer_url`, it emits a `FailoverConfig` carrying the group's mode / heartbeat / max-response / max-ack / max-unacked tuning and both peers' URLs. Members are sorted by `id` so both peers render an identical `peers` array.
 - The agent's `render_kea.py:_ha_hook()` injects `libdhcp_ha.so` alongside the always-loaded `libdhcp_lease_cmds.so` (the HA hook depends on it).
 - **Peer URL hostname resolution** — Kea's HA hook parses peer URLs with Boost asio directly and only accepts IP literals. Hostnames like `http://dhcp-kea-2:8000/` fail with `bad url ...: Failed to convert string to address`. `render_kea._resolve_peer_url` resolves the hostname agent-side (via the container's resolver — Docker DNS on compose, k8s DNS on Kubernetes) before emitting the URL into Kea config. IPv4/v6 literals pass through unchanged.
+- **Peer IP drift self-healing** — `PeerResolveWatcher` (`agent/dhcp/spatium_dhcp_agent/peer_resolve.py`) runs as a 30 s background thread, re-resolves every peer hostname from the last-applied bundle's failover block, and if any resolution has changed, triggers the renderer + reload via the agent's existing apply pipeline. Resolution failures are treated as transient (cached IP kept, retried next tick) so a brief DNS outage doesn't thrash reloads. Matters most on k8s where pod IPs churn; on compose bridges IPs are mostly stable across `restart`, but `docker compose --force-recreate` WILL reshuffle bridge allocations.
 - **Port topology** — Kea 2.6's HA hook spins up its own `CmdHttpListener` bound to the `this-server` peer URL to receive peer-to-peer traffic. That **must not** collide with `kea-ctrl-agent`. SpatiumDDI's Kea image dedicates:
   - `:8000` — HA hook peer-to-peer HTTP (the URL advertised to the partner).
   - `:8544` — `kea-ctrl-agent` operator-facing REST (deliberately off 8000).
 - Each peer's `this-server-name` is derived from its `DHCPServer.name`; the `peers` array carries both entries with roles `primary` + (`standby` in hot-standby / `secondary` in load-balancing).
 - Agent-side `HAStatusPoller` (`agent/dhcp/spatium_dhcp_agent/ha_status.py`) calls `status-get` on the Kea unix socket every ~15 s and POSTs the state to the control plane — drives the live HA pill in the UI. Kea 2.6 moved HA state into the generic `status-get` response under `arguments.high-availability[]`; the poller also accepts pre-2.6 `ha-status-get` shapes for forward-compat.
 - **Bootstrap reload** — on agent startup the entrypoint launches `kea-dhcp4` in the background with the Dockerfile-baked config, then the agent re-renders the cached bundle and issues `config-reload` with up to 15 s of retry so Kea picks up HA even on cold starts where the control socket isn't live yet.
+- **Daemon supervision** — both `kea-dhcp4` and `kea-ctrl-agent` run under per-daemon supervise loops in the container entrypoint. Each loop scrubs stale `/run/kea/*.pid` files before every launch (Kea only removes its own PID on GRACEFUL shutdown, so SIGKILL / hard crash / mid-init SIGTERM leaves the file behind and `createPIDFile` refuses to start with `DHCP4_ALREADY_RUNNING`), restarts the daemon on transient crashes (e.g. the Docker bridge-attach race that intermittently fails HA-hook bind with "Address not available" right after a container restart), and trips a 5-in-30s crash-loop guard so a truly broken config surfaces instead of looping forever. SIGTERM handlers inside each loop forward to the live daemon AND flip a stopping flag so we don't restart during container shutdown.
 - The driver does **not** replicate leases itself — Kea's hook talks directly to the peer's HA listener. SpatiumDDI just renders the config.
 - **Scope mirroring** is automatic under the group-centric model: scopes / pools / statics / client classes live on the group, and every member of the group renders the same Kea config. Operators configure scopes once, both peers serve them.
 

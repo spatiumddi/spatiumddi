@@ -146,7 +146,7 @@ Three patterns recur across the DNS and DHCP subsystems. Know these before addin
 
 ### Current state
 
-SpatiumDDI cut its alpha release `2026.04.16-1` on 2026-04-16 with IPAM, DNS (BIND9), and DHCP (Kea) all shipping. Subsequent releases landed Windows Server integration (`2026.04.18-1`, 2026-04-18) and the **performance + polish + visibility** release (`2026.04.19-1`, 2026-04-19) — batched WinRM dispatch, DDNS pipeline, the Logs surface (Windows Event Log + DHCP audit), subnet/block resize, subnet-scoped IP import, DHCP pool awareness + dynamic-pool gates, collision warnings, sync modals, dashboard heatmap, draggable modals, standardised header buttons. For the full list of what has landed see `CHANGELOG.md`. The forward-looking work is below.
+SpatiumDDI cut its alpha release `2026.04.16-1` on 2026-04-16 with IPAM, DNS (BIND9), and DHCP (Kea) all shipping. Subsequent releases landed Windows Server integration (`2026.04.18-1`, 2026-04-18), the **performance + polish + visibility** release (`2026.04.19-1`, 2026-04-19) — batched WinRM dispatch, DDNS pipeline, the Logs surface, subnet/block resize, subnet-scoped IP import, DHCP pool awareness, collision warnings, sync modals, dashboard heatmap, draggable modals, standardised header buttons — the 2026.04.20 IPv6 + DDNS closure work, and the **Kea HA + group-centric DHCP** release (`2026.04.21-2`, 2026-04-21) which shipped the full three-wave Kea HA story: end-to-end HA shake-out (peer URL resolution, port split, `status-get`, bootstrap reload), group-centric DHCP data model (scopes / pools / statics / classes live on `DHCPServerGroup`; HA is implicit with ≥ 2 Kea members), agent rendering fix (every prior Kea install was silently rendering `subnet4: []` due to a wire-shape bug), `PeerResolveWatcher` self-healing for peer IP drift, supervised Kea daemons, and standalone agent-only compose files for distributed deployments. For the full list see `CHANGELOG.md`. The forward-looking work is below.
 
 ### Auth waves A–D (landed after `2026.04.16-2`)
 
@@ -287,44 +287,35 @@ Phase 1 IPv6 closure + the Phase 2/3 DDNS / zone-state / CI-hardening items all 
   what's missing is driver rendering + record-level view selection
   + UI binding on the record form. Phase 3.
 - ✅ **DHCP state failover (Kea HA)** — under the group-centric data
-  model (2026.04.22-1), a `DHCPServerGroup` with two Kea members is
-  implicitly an HA pair. HA tuning (mode, heartbeat / max-response /
-  max-ack / max-unacked, auto-failover) lives on the group; per-peer
-  URL lives on each `DHCPServer.ha_peer_url`. `DHCPFailoverChannel`
-  is gone — merged into the group. `ConfigBundle` carries a
-  `FailoverConfig` when the server's group is an HA pair; the agent's
-  `render_kea.py` injects `libdhcp_ha.so` + `high-availability`
-  alongside the always-loaded `libdhcp_lease_cmds.so` hook. Peer URLs
-  are resolved agent-side (`_resolve_peer_url`) before render because
-  Kea's Boost asio parser only accepts IP literals — hostnames like
-  `http://dhcp-kea-2:8000/` would otherwise fail with `bad url`.
-  Kea image splits ports: `:8000` is owned by the HA hook's
-  `CmdHttpListener` (peer-to-peer HTTP), `:8544` by the operator-
-  facing `kea-ctrl-agent`; collocating them on the same port races
-  `Address in use` on the second reload. Agent supervises an
-  `HAStatusPoller` thread that calls `status-get` (Kea 2.6 folded HA
-  state into the generic status command; pre-2.6 `ha-status-get`
-  shapes still accepted) on the local control socket every ~15s
-  when HA is active and POSTs state to
-  `/api/v1/dhcp/agents/ha-status`; the control plane stores it on
-  `DHCPServer.ha_state` + `ha_last_heartbeat_at`. Bootstrap-from-
-  cache now issues `config-reload` with retry so Kea picks up HA on
-  agent restart even when the ETag is unchanged. HA config lives in
-  the main DHCP tab's server-group edit modal; the separate
-  `/admin/failover-channels` page is gone (legacy URL redirects to
-  `/dhcp`). Dashboard shows one row per HA pair with a live state
-  dot per peer. Scope mirroring happens automatically — all servers
-  in a group render the same scopes, pools, statics, and client
-  classes. **Deferred follow-ups:**
-  - **Peer IP re-resolve loop.** Hostname → IP resolution happens
-    once at render time. If a peer container/pod gets a new IP
-    (compose `--force-recreate`, any k8s restart), the other peer's
-    Kea config has a stale IP and the hook drifts to
-    `communications-interrupted` / `partner-down`. Fix: background
-    loop in the agent that re-resolves peer hostnames every ~30s
-    and forces a render + reload if any IP changed. Matters most
-    on k8s where pod IPs churn; on compose bridges IPs are stable
-    across `restart`.
+  model (shipped 2026.04.21-2), a `DHCPServerGroup` with two Kea
+  members is implicitly an HA pair. HA tuning (mode, heartbeat /
+  max-response / max-ack / max-unacked, auto-failover) lives on the
+  group; per-peer URL lives on each `DHCPServer.ha_peer_url`.
+  `DHCPFailoverChannel` is gone — merged into the group.
+  `ConfigBundle` carries a `FailoverConfig` when the server's group
+  is an HA pair; the agent's `render_kea.py` injects `libdhcp_ha.so`
+  + `high-availability` alongside the always-loaded
+  `libdhcp_lease_cmds.so` hook. Peer URLs are resolved agent-side
+  (`_resolve_peer_url`) before render because Kea's Boost asio
+  parser only accepts IP literals. Kea image splits ports: `:8000`
+  is owned by the HA hook's `CmdHttpListener`, `:8544` by the
+  operator-facing `kea-ctrl-agent`. Agent supervises an
+  `HAStatusPoller` thread that calls `status-get` (Kea 2.6 folded
+  HA state into the generic status command; pre-2.6 `ha-status-get`
+  shapes still accepted) and POSTs state to
+  `/api/v1/dhcp/agents/ha-status`. Bootstrap-from-cache issues
+  `config-reload` with retry so Kea picks up HA on agent restart.
+  HA config lives in the main DHCP tab's server-group edit modal;
+  dashboard shows one row per HA pair with a live state dot per
+  peer. Scope mirroring is automatic — all servers in a group
+  render the same scopes, pools, statics, and client classes.
+  **`PeerResolveWatcher`** re-resolves peer hostnames every 30s
+  and triggers render + reload on IP drift, so compose
+  `--force-recreate` / k8s pod restarts heal without operator
+  action. Kea daemons (`kea-dhcp4` + `kea-ctrl-agent`) run under
+  per-daemon supervise loops with stale-PID-file scrubbing, 5-in-
+  30s crash-loop guards, and SIGTERM forwarding. **Deferred
+  follow-ups:**
   - **Kea version skew guard.** The `status-get` HA shape shifted
     between Kea 2.4 and 2.6. Pairing peers on mismatched Kea
     versions is accepted today. Cheap fix: ship Kea version in the
@@ -342,8 +333,8 @@ Phase 1 IPv6 closure + the Phase 2/3 DDNS / zone-state / CI-hardening items all 
     HA scope tuning for load-balancing.
   - **HA e2e test.** `.github/workflows/agent-e2e.yml` stands up
     a single-agent DNS pair today; an HA DHCP variant would have
-    caught all the bootstrap / port-split / `status-get` regressions
-    we hit in 2026.04.21-2.
+    caught the bootstrap / port-split / `status-get` / wire-shape
+    regressions we hit in 2026.04.21-2.
 - ✅ **Alerts framework (v1)** — `AlertRule` + `AlertEvent` tables;
   evaluator at `services/alerts.py:evaluate_all()` runs from
   `app.tasks.alerts.evaluate_alerts` on a 60 s beat tick. Two rule

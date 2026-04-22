@@ -40,7 +40,7 @@
 
 - 🗂 **Hierarchical IP management** — spaces, blocks, subnets, addresses in a visual tree; IPv4 + full IPv6 auto-allocation (EUI-64 + random /128 + sequential)
 - 🌐 **Built-in DNS server** — BIND9 container that auto-registers, syncs via RFC 2136, and reports per-server zone serial drift
-- 🔄 **DHCP server management** — Kea container + agent with lease tracking; Kea HA failover channels (hot-standby + load-balancing) with live state reporting
+- 🔄 **DHCP server management** — Kea container + agent with lease tracking; group-centric HA (hot-standby + load-balancing) with live state reporting, self-healing peer-IP drift, and supervised daemons for crash-loop-safe restarts
 - 🪟 **Windows Server DNS + DHCP** — agentless management of existing Windows DCs (RFC 2136 + WinRM for DNS; near-real-time WinRM lease-mirroring for DHCP). No software installed on the Windows side.
 - 🔒 **Group-based RBAC + external identity** — LDAP, OIDC, SAML, RADIUS, TACACS+ with backup-server failover; delegate IP ranges and zones by role; API tokens with auto-expiry
 - 🔔 **Alerts + audit forwarding** — rule-based alerts framework (subnet utilization, server unreachable) + fire-and-forget RFC 5424 syslog + HTTP webhook forwarding for every mutation
@@ -211,7 +211,7 @@ Full docs at **[spatiumddi.github.io](https://spatiumddi.github.io)** (coming so
 |---|---|---|
 | Phase 1 | Core IPAM, auth, user management, audit log, Docker Compose | ✅ Done — LDAP/OIDC/SAML + RADIUS/TACACS+, group-based RBAC, bulk-edit, inheritance, mobile-responsive UI, and full IPv6 `/next-address` (EUI-64 + random /128 + sequential) all shipped |
 | Phase 2 | DHCP (Kea), DNS (BIND9), DDNS, zone/subnet tree UI | ✅ Done — DNS, Kea DHCPv4, subnet-level DDNS, agent-side Kea DDNS, block/space DDNS inheritance, per-server zone serial reporting all shipped |
-| Phase 3 | DNS views, server groups, blocking lists, VLAN/VXLAN, system admin, Kea HA | 🔄 DNS features + health dashboard + alerts framework + Kea HA failover channels landed; DNS Views end-to-end + HA state-transition actions still pending |
+| Phase 3 | DNS views, server groups, blocking lists, VLAN/VXLAN, system admin, Kea HA | 🔄 DNS features + health dashboard + alerts framework + group-centric Kea HA (self-healing peer-IP drift + supervised daemons) landed; DNS Views end-to-end + HA state-transition actions still pending |
 | Phase 4 | OS appliance, Terraform provider, SAML, backup/restore, ACME | 🔄 SAML landed; appliance + providers + backup + ACME (DNS-01 provider + embedded client) pending |
 | Phase 5 | Multi-tenancy, IP request workflows, advanced reporting | 📋 Planned |
 
