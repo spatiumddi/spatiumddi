@@ -19,6 +19,7 @@ from app.api.v1.roles.router import router as roles_router
 from app.api.v1.search.router import router as search_router
 from app.api.v1.settings.router import router as settings_router
 from app.api.v1.users.router import router as users_router
+from app.api.v1.version import router as version_router
 from app.api.v1.vlans.router import router as vlans_router
 
 api_v1_router = APIRouter()
@@ -45,3 +46,4 @@ api_v1_router.include_router(logs_router, prefix="/logs", tags=["logs"])
 api_v1_router.include_router(alerts_router, prefix="/alerts", tags=["alerts"])
 api_v1_router.include_router(acme_router, prefix="/acme", tags=["acme"])
 api_v1_router.include_router(metrics_router, prefix="/metrics", tags=["metrics"])
+api_v1_router.include_router(version_router, prefix="/version", tags=["version"])

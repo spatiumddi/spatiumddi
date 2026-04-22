@@ -19,6 +19,7 @@ celery_app = Celery(
         "app.tasks.alerts",
         "app.tasks.oui_update",
         "app.tasks.prune_metrics",
+        "app.tasks.update_check",
     ],
 )
 
@@ -50,6 +51,7 @@ celery_app.conf.update(
         "app.tasks.alerts.*": {"queue": "default"},
         "app.tasks.oui_update.*": {"queue": "default"},
         "app.tasks.prune_metrics.*": {"queue": "default"},
+        "app.tasks.update_check.*": {"queue": "default"},
     },
     beat_schedule={
         # Every 60s, fan-out health checks to every registered DNS server.
@@ -132,6 +134,15 @@ celery_app.conf.update(
         # pruning more often just burns cycles.
         "metric-samples-prune": {
             "task": "app.tasks.prune_metrics.prune_metric_samples",
+            "schedule": schedule(run_every=24 * 3600.0),
+        },
+        # Once a day, check GitHub for the latest release tag. Gated
+        # on ``PlatformSettings.github_release_check_enabled`` — so
+        # operators can turn this off in air-gapped deployments
+        # without restarting beat. Unauthenticated call; the 60/hour
+        # rate limit is plenty for a daily tick.
+        "update-check": {
+            "task": "app.tasks.update_check.check_github_release",
             "schedule": schedule(run_every=24 * 3600.0),
         },
     },

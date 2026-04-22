@@ -54,6 +54,16 @@ class Settings(BaseSettings):
     # App
     app_title: str = "SpatiumDDI"
     debug: bool = False
+    # Running version. Populated from the ``VERSION`` env var, which the
+    # compose file threads in from ``SPATIUMDDI_VERSION`` (same value the
+    # operator sets to pick which image tag to run). Falls back to ``dev``
+    # so unversioned local builds are obvious in the sidebar and don't
+    # misreport themselves as a release.
+    version: str = "dev"
+
+    # GitHub repo coordinates used by the release-check task. Overridable
+    # so forks can point their update check at their own repo.
+    github_repo: str = "spatiumddi/spatiumddi"
 
 
 settings = Settings()

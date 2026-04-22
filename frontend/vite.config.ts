@@ -7,10 +7,15 @@ const pkg = JSON.parse(readFileSync(new URL("./package.json", import.meta.url), 
   version: string;
 };
 
+// Prefer the release-workflow stamp (VITE_APP_VERSION build arg) over
+// the value baked into package.json — package.json is a convenience
+// default for local `npm run dev`, not the release source of truth.
+const appVersion = process.env.VITE_APP_VERSION || pkg.version;
+
 export default defineConfig({
   plugins: [react()],
   define: {
-    __APP_VERSION__: JSON.stringify(pkg.version),
+    __APP_VERSION__: JSON.stringify(appVersion),
   },
   resolve: {
     alias: {

@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Integer, String
+from sqlalchemy import Boolean, DateTime, Integer, String, Text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -53,10 +53,26 @@ class PlatformSettings(Base):
         Integer, nullable=False, default=60
     )
 
-    # Release checking
+    # Release checking. When enabled, a daily Celery beat task queries
+    # ``api.github.com/repos/{github_repo}/releases/latest`` and stores
+    # the result on the columns below. Operators can turn this off in
+    # air-gapped deployments or for forks that don't want the check.
     github_release_check_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True
     )
+    # Result columns written by the task. Null until the first successful
+    # check; retained through disabled periods so the UI can still show
+    # "last seen X" when the toggle is off.
+    latest_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    update_available: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    latest_release_url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    latest_checked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # Populated when the most recent check hit an error (rate limit, DNS,
+    # parse issue). Cleared on a successful check. Surfaced in the admin
+    # release-check panel so operators don't chase a stale banner.
+    latest_check_error: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # DNS defaults
     dns_default_ttl: Mapped[int] = mapped_column(Integer, nullable=False, default=3600)

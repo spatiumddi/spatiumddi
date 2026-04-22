@@ -2977,3 +2977,17 @@ export const metricsApi = {
       .get<DHCPMetricsSeries>("/metrics/dhcp/timeseries", { params })
       .then((r) => r.data),
 };
+
+export interface VersionInfo {
+  version: string;
+  latest_version: string | null;
+  update_available: boolean;
+  latest_release_url: string | null;
+  latest_checked_at: string | null;
+  release_check_enabled: boolean;
+  latest_check_error: string | null;
+}
+
+export const versionApi = {
+  get: () => api.get<VersionInfo>("/version").then((r) => r.data),
+};

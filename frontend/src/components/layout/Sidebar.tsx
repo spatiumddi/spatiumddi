@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { NavLink, useLocation } from "react-router-dom";
+import { useQuery } from "@tanstack/react-query";
 import {
   Network,
   Globe,
@@ -19,9 +20,11 @@ import {
   ShieldCheck,
   ScrollText,
   BellRing,
+  Sparkles,
   X,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { versionApi } from "@/lib/api";
 import logoIcon from "@/assets/logo-icon.svg";
 
 const mainNav = [
@@ -112,6 +115,23 @@ export function Sidebar({
 
   // In the mobile drawer, ignore the "collapsed" state — always show labels.
   const effectiveCollapsed = mobileOpen ? false : collapsed;
+
+  // Pull the running version from the backend so the sidebar always
+  // reflects the deployed image, not the value baked in at build time.
+  // Falls back to ``__APP_VERSION__`` (the build-time stamp) if the
+  // API is unreachable — the login screen still renders a version
+  // that way. Refresh hourly; release checks are daily so there's
+  // nothing to gain from polling faster.
+  const { data: versionInfo } = useQuery({
+    queryKey: ["version"],
+    queryFn: versionApi.get,
+    staleTime: 60 * 60 * 1000,
+    refetchInterval: 60 * 60 * 1000,
+  });
+  const displayVersion = versionInfo?.version ?? __APP_VERSION__;
+  const updateAvailable = versionInfo?.update_available ?? false;
+  const latestVersion = versionInfo?.latest_version ?? null;
+  const latestReleaseUrl = versionInfo?.latest_release_url ?? null;
 
   return (
     <>
@@ -205,11 +225,34 @@ export function Sidebar({
           )}
         >
           {!effectiveCollapsed && (
-            <div className="px-3 py-1">
+            <div className="flex items-center gap-2 px-3 py-1">
               <span className="text-xs font-mono text-sidebar-muted-foreground/80">
-                v{__APP_VERSION__}
+                v{displayVersion}
               </span>
+              {updateAvailable && latestReleaseUrl && (
+                <a
+                  href={latestReleaseUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  title={`Update available: ${latestVersion ?? "newer release"}`}
+                  className="inline-flex items-center gap-1 rounded bg-emerald-500/15 px-1.5 py-0.5 text-[10px] font-medium text-emerald-700 hover:bg-emerald-500/25 dark:text-emerald-400"
+                >
+                  <Sparkles className="h-3 w-3" />
+                  update
+                </a>
+              )}
             </div>
+          )}
+          {effectiveCollapsed && updateAvailable && latestReleaseUrl && (
+            <a
+              href={latestReleaseUrl}
+              target="_blank"
+              rel="noopener noreferrer"
+              title={`Update available: ${latestVersion ?? "newer release"}`}
+              className="flex items-center justify-center rounded-md p-2 text-emerald-600 hover:bg-sidebar-accent dark:text-emerald-400"
+            >
+              <Sparkles className="h-4 w-4" />
+            </a>
           )}
 
           <a

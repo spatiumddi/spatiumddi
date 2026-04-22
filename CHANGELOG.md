@@ -9,6 +9,31 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versioning uses 
 
 ### Added
 
+- **Runtime version reporting + GitHub release check.** The sidebar
+  footer now shows the actual running version instead of the
+  hardcoded `0.1.0` that came from `package.json`. Mechanism: the
+  release workflow tags Docker images with the git tag, and
+  operators pick a tag via `SPATIUMDDI_VERSION` in their `.env`.
+  That value flows through `docker-compose.yml` to a `VERSION` env
+  var on the api/worker/beat containers, and through a
+  `VITE_APP_VERSION` build arg on the frontend Dockerfile (now
+  honored) as a build-time fallback. New public endpoint `GET
+  /api/v1/version` returns `{version, latest_version,
+  update_available, latest_release_url, latest_checked_at,
+  release_check_enabled, latest_check_error}`. A daily Celery beat
+  task `app.tasks.update_check.check_github_release` queries
+  `api.github.com/repos/{github_repo}/releases/latest`
+  unauthenticated (60/hour rate limit is plenty for a daily tick),
+  compares the tag against the running version (CalVer
+  lexicographic compare; `dev` is treated as outdated vs any real
+  tag), and stores `latest_version`, `update_available`,
+  `latest_release_url`, `latest_checked_at`, and `latest_check_error`
+  on `PlatformSettings`. Gated by the existing
+  `github_release_check_enabled` flag — air-gapped deployments
+  flip it off and the task no-ops. When an update is available,
+  the sidebar shows a small "update" pill linking directly to the
+  release notes page. Migration `e5b21a8f0d94`.
+
 - **DHCP MAC blocklist at the server-group level.** Block a MAC
   address from getting a lease anywhere in the group. Covers both
   Kea (rendered into Kea's reserved `DROP` client class via the

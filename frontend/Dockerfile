@@ -1,6 +1,12 @@
 # ── Stage 1: build ────────────────────────────────────────────────────────────
 FROM node:20-alpine AS builder
 
+# Release-pipeline version stamp. The release workflow passes the git
+# tag (e.g. ``2026.04.22-1``); local builds default to ``dev`` so
+# unversioned images are obvious in the sidebar.
+ARG VITE_APP_VERSION=dev
+ENV VITE_APP_VERSION=${VITE_APP_VERSION}
+
 WORKDIR /app
 
 COPY package.json package-lock.json* ./
