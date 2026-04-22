@@ -533,6 +533,91 @@ Phase 1 IPv6 closure + the Phase 2/3 DDNS / zone-state / CI-hardening items all 
   SD-Access rather than the public resolver tree. Phase 4 — pairs
   with the Terraform / Ansible providers already on the roadmap.
 
+- ⬜ **Kubernetes integration (read-only cluster mirror).** Poll one
+  or more Kubernetes clusters with a read-only service-account
+  token and mirror the stable bits of cluster state into SpatiumDDI.
+  **Deliberately not mirroring pod IPs** — they churn too fast to
+  be useful in IPAM. The value is reserving cluster CIDRs in IPAM
+  (so operators can't accidentally overlap), surfacing LoadBalancer
+  VIPs with their owning `namespace/service`, and auto-generating
+  DNS records for Ingress hostnames. Pure pull, SpatiumDDI never
+  writes to the cluster.
+
+  **UX shape (agreed):**
+  - **Settings → Integrations** is a new top-level settings section
+    that hosts one card per integration type. Each card carries its
+    own independent enable toggle on `PlatformSettings` (no single
+    master `integrations_enabled` flag — granular by design so
+    enabling Kubernetes doesn't also enable a future Terraform
+    Cloud integration). When an integration's toggle is on, its
+    corresponding top-level sidebar nav item appears (flat, not
+    nested under an "Integrations" meta-item — matches how DHCP /
+    DNS already surface).
+  - **`KubernetesCluster` rows** are the per-cluster config, not
+    PlatformSettings. Each cluster binds to exactly one
+    `IPAMSpace` (required — discovered IPs / blocks land there)
+    and optionally one `DNSServerGroup` (for ingress → DNS sync).
+    Many clusters supported, same or different space/group per
+    cluster.
+  - **Credentials**: API server URL + CA bundle PEM + bearer token,
+    with the token Fernet-encrypted at rest alongside the other
+    driver creds (`DHCPServer.credentials_encrypted`,
+    `DNSServer.credentials_encrypted`).
+  - **Modal** shows an embedded setup guide with the exact
+    ServiceAccount / ClusterRole / ClusterRoleBinding YAML plus
+    `kubectl` commands to extract the token + CA bundle. Cluster
+    version + node count round-trip via a **Test Connection**
+    button before save.
+  - **Operator also enters pod CIDR + service CIDR** in the form —
+    service CIDR is not reliably extractable from the API; pod CIDR
+    could be derived from Node objects but asking is simpler and
+    matches how the DHCP / DNS server forms work.
+
+  **Phased scope:**
+
+  - ⬜ **Phase 1a — Scaffolding (this session).** Settings →
+    Integrations UX + per-integration toggle on PlatformSettings +
+    sidebar gating. `KubernetesCluster` model + migration + CRUD
+    API + admin UI page + setup-guide modal + Test Connection
+    button that calls `/version` on the cluster's API server.
+    **No sync logic yet** — listing shows clusters with "never
+    synced" status.
+
+  - ⬜ **Phase 1b — Read-only reconciliation.** Celery beat task
+    that polls every enabled cluster every 60 s and writes:
+    - Pod CIDR + Service CIDR → one `IPBlock` each under the bound
+      space, `source="kubernetes"`, non-editable.
+    - Node objects → `IPAddress` rows with `status="kubernetes-node"`,
+      `description` carrying the node name.
+    - `Service` objects with `spec.type=LoadBalancer` + a non-empty
+      `status.loadBalancer.ingress[].ip` → `IPAddress` with
+      `status="kubernetes-lb"`, `hostname` set to
+      `<service>.<namespace>`, link-out in the UI.
+    - `Ingress` objects (and optionally `Service` objects with the
+      `external-dns.alpha.kubernetes.io/hostname` annotation) →
+      DNS records in the bound group: A / CNAME depending on
+      whether the target resolves to an IP (LB VIP) or a hostname.
+    - Reconcile is idempotent; deletes mirror rows when the k8s
+      object is gone. All rows carry `source="kubernetes"` so ops
+      can filter them in the IPAM tree.
+
+  - ⬜ **Phase 2 — external-dns webhook provider (separate
+    feature).** Implement the external-dns webhook provider HTTP
+    protocol so teams already running external-dns can just point
+    it at SpatiumDDI as a DNS backend. Different protocol, different
+    testing story — deliberately not bundled with the pull-based
+    integration above.
+
+  **Explicit non-goals:**
+  - Mirroring pod IPs (too dynamic, too noisy — the CIDR block is
+    what matters).
+  - Writing to the cluster (no CRD create, no annotation updates).
+    If we want write-back, Phase 2's external-dns webhook is the
+    right pattern — it's what ops teams already expect.
+  - Managing the kubeconfig / kubectl flow — operator brings their
+    own cluster-admin credentials to create the ServiceAccount; we
+    only ever see the resulting read-only token.
+
 ---
 
 ## Version Scheme
