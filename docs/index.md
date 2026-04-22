@@ -27,6 +27,7 @@ Open-source DDI platform — unified DNS, DHCP, and IP Address Management.
 - [DNS](features/DNS.md) — zones, records, views, server groups, blocking lists, Windows DNS (Path A + B)
 - [DHCP](features/DHCP.md) — servers, scopes, pools, static assignments, leases, Windows DHCP (Path A)
 - [Auth & Permissions](features/AUTH.md) — LDAP, OIDC, SAML, RADIUS, TACACS+, roles, API tokens
+- [ACME DNS-01 Provider](features/ACME.md) — acme-dns-compatible surface for LE / public-CA cert issuance against SpatiumDDI-managed zones
 - [System Admin](features/SYSTEM_ADMIN.md) — config, health dashboard, backup/restore
 
 ## Deployment

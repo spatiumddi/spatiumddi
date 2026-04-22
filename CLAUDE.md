@@ -40,6 +40,7 @@ Always read the relevant spec doc(s) before writing code for a feature area.
 | `docs/features/DHCP.md` | DHCP servers, scopes, pools, static assignments, DDNS, caching, Windows DHCP (Path A) |
 | `docs/features/DNS.md` | DNS servers, zones, records, views, server groups, blocking lists, DDNS, zone tree, Windows DNS (Path A + B), sync-with-servers reconciliation |
 | `docs/features/AUTH.md` | Authentication, LDAP/OIDC/SAML, roles, group-scoped permissions, API tokens |
+| `docs/features/ACME.md` | ACME DNS-01 provider — acme-dns-compatible HTTP surface for LE / public-CA cert issuance |
 | `docs/PERMISSIONS.md` | RBAC permission grammar (`{action, resource_type, resource_id?}`), builtin roles, wildcards |
 | `docs/features/SYSTEM_ADMIN.md` | System config, health dashboard, notifications, backup/restore, service control |
 | `docs/deployment/APPLIANCE.md` | OS appliance build, base OS selection, licensing |
@@ -354,78 +355,62 @@ Phase 1 IPv6 closure + the Phase 2/3 DDNS / zone-state / CI-hardening items all 
   template drift. Phase 5 — belongs alongside advanced reporting /
   multi-tenancy, once the base inheritance story is fully bedded
   down.
-- ⬜ **ACME / Let's Encrypt — DNS-01 provider for external clients**
-  — lets someone running certbot / lego / acme.sh on their own box
-  prove control of a FQDN hosted in a SpatiumDDI-managed zone, so
-  they can issue public certs (wildcards included) against a DNS
-  that SpatiumDDI owns. **Routes writes through our REST API, not
-  RFC 2136 to BIND9 directly** — otherwise records land outside the
-  control-plane model and get overwritten by the next ConfigBundle
-  push.
+- ✅ **ACME / Let's Encrypt — DNS-01 provider for external clients**
+  — landed in the 2026.04.22-1 wave. Lets certbot / lego / acme.sh
+  on a client box prove control of a FQDN hosted in (or delegated
+  to) a SpatiumDDI-managed zone and issue public certs (wildcards
+  included). Implementation shipped as an `acme-dns`-compatible HTTP
+  surface under `/api/v1/acme/` with the following pieces:
+  - **Data model** — `ACMEAccount` (`app/models/acme.py`,
+    migration `ac3e1f0d8b42`): `username` + `password_hash`
+    (bcrypt), UUID `subdomain`, FK `zone_id`, optional
+    `allowed_source_cidrs`, `last_used_at`. Credentials shown once
+    at registration; only the hash persists.
+  - **Endpoints** — `POST /register` (JWT auth, gated by
+    `manage_acme` / `write:acme_account`), `POST /update` +
+    `DELETE /update` (acme-dns `X-Api-User` / `X-Api-Key` auth,
+    subdomain must match authenticated account), `GET /accounts`
+    / `DELETE /accounts/{id}` admin ops.
+  - **Record write** — routes through the normal
+    `enqueue_record_op` pipeline so TXT records land in the UI +
+    audit log + DDNS pipeline uniformly. `subnet_id`-equivalent
+    routing here is the zone's primary server.
+  - **Propagation wait** — `/update` blocks up to 30 s polling
+    `DNSRecordOp.state` until `applied`, so the CA's subsequent
+    DNS-01 poll finds the record live. Returns 504 on timeout,
+    502 on primary driver error.
+  - **Wildcard support** — keeps the 2 most-recent TXT values per
+    subdomain so wildcard + base cert issuance (which presents two
+    different validation tokens at the same record name) works.
+  - **Protocol choice** — `acme-dns` compat means certbot
+    (`dns-acmedns` plugin), lego, acme.sh all work out of the box
+    with no custom plugin. Delegation pattern documented in
+    `docs/features/ACME.md` — operator CNAMEs
+    `_acme-challenge.<their-fqdn>` to
+    `<account.subdomain>.<our-acme-zone>` and delegates the small
+    subzone via NS records, so a leaked credential can't rewrite
+    anything outside that label.
+  - **Audit** — every register / update / delete / revoke lands in
+    `audit_log`. TXT values logged as a 12-char prefix only, never
+    in full. Credentials never logged, hashed or otherwise.
+  - **Tests** — `backend/tests/test_acme.py`, 24 tests covering
+    crypto roundtrip, source-CIDR allowlist edge cases, HTTP auth
+    paths, wildcard rolling window, revocation, cleanup.
 
-  Recommended shape: implement an [acme-dns](https://github.com/joohoi/acme-dns)-compatible
-  HTTP surface (minimal, widely supported). certbot (`--dns-acme-dns`),
-  lego (`ACMEDNSProvider`), and acme.sh all speak the protocol out of
-  the box, so no custom plugin to maintain.
-
-  **Data model.** New `ACMEAccount` table: `id`, `subdomain` (a
-  UUID that the client CNAMEs `_acme-challenge.<fqdn>` to —
-  standard acme-dns delegation pattern; compromised creds can only
-  write that one subdomain), `username` + `password_hash` (scrypt),
-  `allowed_source_cidrs` (optional IP allowlist), `zone_id` FK to
-  `DNSZone`, `last_used_at`, `created_at`. Issued once on
-  registration, shown plaintext exactly once (reuse the API-token
-  reveal pattern). No "scope" field on `APIToken` — ACME creds are
-  a separate auth path with its own protocol, keeping the
-  permission surface tidy.
-
-  **Endpoints** (under `/api/v1/acme/`, rate-limited separately):
-  - `POST /register` → 201 with `{username, password, fulldomain,
-    subdomain, allowlist}`. Superadmin or user with the
-    `manage_acme` permission. Creates the `ACMEAccount` row and
-    returns the creds.
-  - `POST /update` with `X-Api-User` + `X-Api-Key` headers and
-    `{subdomain, txt}` body → writes the TXT at
-    `<subdomain>.acme.<our-apex>` with a short TTL (60 s). Record
-    goes through the normal `_sync_dns_record` path so it's
-    visible in IPAM / UI and cleaned up uniformly. **Response
-    blocks until the record is confirmed live on the primary**
-    (agent ack with new ETag) — otherwise LE polls before the
-    record propagates and the challenge fails.
-  - `DELETE /update` (or `POST` with empty `txt`) — idempotent
-    cleanup; clients call this post-validation. Stale TXT records
-    left >24 h get swept by a new janitor Celery task.
-  - `GET /accounts` / `DELETE /accounts/{id}` — admin list +
-    revocation.
-
-  **Delegation pattern, documented:** users add a `CNAME
-  _acme-challenge.foo.example.com → <subdomain>.acme.their-apex.com`
-  in their upstream zone, then delegate `acme.their-apex.com` to
-  the SpatiumDDI DNS servers. The ACME account can only write under
-  that tiny subdomain — a leaked credential can't rewrite the whole
-  zone. Walk through this in `docs/features/ACME.md` with a worked
-  example.
-
-  **Wildcards.** DNS-01 is the ONLY path LE offers for
-  `*.example.com`; most operators asking for ACME want this. Make
-  sure docs call out that the TXT on `_acme-challenge.example.com`
-  (via the CNAME delegation) also covers wildcard issuance.
-
-  **Audit + rate limit.** Every register / update / delete lands in
-  `audit_log` with the account display. Separate rate-limit bucket
-  from the main API (a broken cron on a client shouldn't DoS the
-  auth-token endpoints). Fail2Ban-style temp-ban on repeated auth
-  failures against `/update`.
-
-  **Propagation gotcha.** Our agent long-polls the ConfigBundle +
-  ETag — typical tick is sub-second, but `/update` must still block
-  until the agent acks the new bundle, otherwise LE polls stale.
-  Reuse the existing per-op ack channel (`apply_record_changes`
-  already returns async; surface the wait).
-
-  Phase 4 — pairs with the OS appliance / HA deployment story, since
-  production SpatiumDDI behind a public apex is the main "I need
-  public certs" customer.
+  **Deferred follow-ups:**
+  - **Dedicated rate-limit bucket** for `/api/v1/acme/*` + Fail2Ban-
+    style temp-ban on repeated `/update` auth failures. Today the
+    endpoint rides the general API rate limit (none in v1; add
+    slowapi or similar when it lands).
+  - **Per-op `asyncio.Event` ack channel** to replace the DB-polling
+    `wait_for_op_applied` loop. ~250 ms latency savings on the
+    typical path; the polling approach is simple and correct but
+    opens/closes a DB session every 500 ms.
+  - **Celery janitor task** for the 24 h stale TXT sweep — service-
+    level function `acme.sweep_stale_txt_records` is written and
+    unit-testable; wiring it into the beat schedule is pending.
+  - **Metric exposure** for ACME activity (registrations,
+    /update rate, sweep counts) on the admin dashboard.
 
 - ⬜ **ACME embedded client — certs for SpatiumDDI's own services**
   — *separate from the DNS-01 provider above.* SpatiumDDI runs an

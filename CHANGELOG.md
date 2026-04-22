@@ -7,7 +7,27 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versioning uses 
 
 ## Unreleased
 
-_No unreleased changes yet._
+### Added
+
+- **ACME DNS-01 provider — external-client flow.** New
+  `/api/v1/acme/` surface implementing the
+  [acme-dns](https://github.com/joohoi/acme-dns) protocol so
+  certbot / lego / acme.sh can prove control of a FQDN hosted in
+  (or CNAME-delegated to) a SpatiumDDI-managed zone and issue
+  public certs (wildcards included). Five endpoints: `POST
+  /register` (admin, returns plaintext creds once), `POST /update`
+  (acme-dns auth via `X-Api-User` / `X-Api-Key`, writes TXT with
+  60 s TTL and blocks up to 30 s until the primary DNS server
+  acks), `DELETE /update` (idempotent cleanup), `GET /accounts` +
+  `DELETE /accounts/{id}` (admin list / revoke). Keeps the two
+  most-recent TXT values per subdomain so wildcard + base cert
+  issuance works. bcrypt-hashed passwords at rest; optional
+  `allowed_source_cidrs` per-account allowlist. Delegation pattern
+  documented in [`docs/features/ACME.md`](docs/features/ACME.md)
+  with worked certbot / lego / acme.sh examples. New permission
+  resource type `acme_account`. Migration
+  `ac3e1f0d8b42_acme_account`. Covered by 24 new tests in
+  `backend/tests/test_acme.py`.
 
 ---
 

@@ -59,6 +59,7 @@ Each entry in `Role.permissions` (JSONB) is an object with this shape:
 | `custom_field`    | Custom field definitions                              |
 | `settings`        | Platform settings                                     |
 | `api_token`       | API tokens                                            |
+| `acme_account`    | ACME DNS-01 provider credentials (`/api/v1/acme/`)    |
 | `*`               | Wildcard — match any resource type                    |
 
 ## Evaluation rules
