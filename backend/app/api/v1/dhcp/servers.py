@@ -3,21 +3,23 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, field_validator
-from sqlalchemy import select
+from sqlalchemy import or_, select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.api.v1.dhcp._audit import write_audit
 from app.core.crypto import encrypt_dict
 from app.core.permissions import require_resource_permission
 from app.drivers.dhcp import is_agentless, is_read_only
+from app.drivers.dhcp.base import MACBlockDef
 from app.drivers.dhcp.registry import _DRIVERS as _DHCP_DRIVERS
+from app.drivers.dhcp.registry import get_driver
 from app.drivers.dhcp.windows import test_winrm_credentials
-from app.models.dhcp import DHCPConfigOp, DHCPLease, DHCPServer
+from app.models.dhcp import DHCPConfigOp, DHCPLease, DHCPMACBlock, DHCPServer
 from app.services.dhcp.config_bundle import build_config_bundle
 from app.services.dhcp.pull_leases import pull_leases_from_server
 from app.services.oui import bulk_lookup_vendors, normalize_mac_key
@@ -229,6 +231,10 @@ class SyncLeasesResponse(BaseModel):
     scopes_skipped_no_subnet: int = 0
     pools_synced: int = 0
     statics_synced: int = 0
+    # MAC deny-filter reconciliation against the group's active blocks.
+    # Zero when the server isn't in a group or has no blocks configured.
+    mac_blocks_added: int = 0
+    mac_blocks_removed: int = 0
     errors: list[str]
 
 
@@ -505,6 +511,46 @@ async def sync_leases_now(server_id: uuid.UUID, db: DB, user: SuperAdmin) -> Syn
             detail=f"driver {s.driver!r} is agent-based; leases arrive via the agent",
         )
     result = await pull_leases_from_server(db, s, apply=True)
+
+    # Reconcile the server's MAC deny-filter list against the group's
+    # active blocks while we're already holding the WinRM session up.
+    # Any driver error here is reported as an extra entry in `errors`
+    # rather than failing the whole sync — lease pull is the primary
+    # job; mac-block reconciliation is a best-effort piggy-back.
+    mac_added = 0
+    mac_removed = 0
+    if s.server_group_id is not None:
+        now = datetime.now(UTC)
+        mb_rows = list(
+            (
+                await db.execute(
+                    select(DHCPMACBlock).where(
+                        DHCPMACBlock.group_id == s.server_group_id,
+                        DHCPMACBlock.enabled.is_(True),
+                        or_(
+                            DHCPMACBlock.expires_at.is_(None),
+                            DHCPMACBlock.expires_at > now,
+                        ),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        desired = [
+            MACBlockDef(
+                mac_address=str(r.mac_address).lower(),
+                reason=r.reason or "other",
+                description=r.description or "",
+            )
+            for r in mb_rows
+        ]
+        try:
+            driver = get_driver(s.driver)
+            mac_added, mac_removed = await driver.sync_mac_blocks(s, desired=desired)
+        except Exception as exc:  # noqa: BLE001 — don't fail the lease sync
+            result.errors.append(f"sync_mac_blocks failed: {exc}")
+
     write_audit(
         db,
         user=user,
@@ -526,6 +572,8 @@ async def sync_leases_now(server_id: uuid.UUID, db: DB, user: SuperAdmin) -> Syn
             "scopes_skipped_no_subnet": result.scopes_skipped_no_subnet,
             "pools_synced": result.pools_synced,
             "statics_synced": result.statics_synced,
+            "mac_blocks_added": mac_added,
+            "mac_blocks_removed": mac_removed,
             "errors": result.errors[:20],
         },
     )
@@ -544,6 +592,8 @@ async def sync_leases_now(server_id: uuid.UUID, db: DB, user: SuperAdmin) -> Syn
         scopes_skipped_no_subnet=result.scopes_skipped_no_subnet,
         pools_synced=result.pools_synced,
         statics_synced=result.statics_synced,
+        mac_blocks_added=mac_added,
+        mac_blocks_removed=mac_removed,
         errors=result.errors,
     )
 

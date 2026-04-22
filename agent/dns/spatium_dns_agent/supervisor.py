@@ -18,6 +18,7 @@ from .config import AgentConfig
 from .drivers.base import DriverBase
 from .drivers.bind9 import Bind9Driver
 from .heartbeat import HeartbeatClient
+from .metrics import MetricsPoller
 from .sync import SyncLoop
 
 log = structlog.get_logger(__name__)
@@ -37,6 +38,7 @@ def run(cfg: AgentConfig) -> int:
     driver = _select_driver(cfg)
     heartbeat = HeartbeatClient(cfg, token_ref)
     syncer = SyncLoop(cfg, token_ref, driver, heartbeat)
+    metrics = MetricsPoller(cfg, token_ref)
 
     # Spawn daemon before threads so the first poll can reload it if needed
     driver.start_daemon()
@@ -44,6 +46,7 @@ def run(cfg: AgentConfig) -> int:
     threads = [
         threading.Thread(target=syncer.run, name="sync", daemon=True),
         threading.Thread(target=heartbeat.run, name="heartbeat", daemon=True),
+        threading.Thread(target=metrics.run, name="metrics", daemon=True),
     ]
     for t in threads:
         t.start()
@@ -55,6 +58,7 @@ def run(cfg: AgentConfig) -> int:
         stopping.set()
         heartbeat.stop()
         syncer.stop()
+        metrics.stop()
 
     signal.signal(signal.SIGTERM, _sig)
     signal.signal(signal.SIGINT, _sig)

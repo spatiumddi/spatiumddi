@@ -244,43 +244,61 @@ Available at `/admin/audit`:
 
 ### 5.1 External forwarding
 
-Every committed `AuditLog` row can be forwarded to external systems in
-near-real-time. Two independent channels — configure either, both, or
-neither under **Settings → Audit Event Forwarding**.
+Every committed `AuditLog` row fans out to every enabled
+`AuditForwardTarget`. Each target picks its own transport, wire
+format, and optional severity / resource-type filter, so a single
+SpatiumDDI instance can feed (for example) a Splunk HTTP collector,
+a QRadar LEEF syslog relay, and a compliance-only JSON-lines sink at
+the same time. Configure under **Settings → Audit Event Forwarding**.
 
-**Delivery guarantee.** Best-effort. A dedicated `asyncio` task runs
-outside the commit path, so the audit write always succeeds before
-forwarding is even attempted. A failing collector never rolls back
-a DDI mutation. Operators who need at-least-once replay should point
-the webhook at a queue (NATS / Kafka / Redis) and let that be the
-durable layer.
+**Delivery guarantee.** Best-effort. A dedicated `asyncio` task
+runs outside the commit path, so the audit write always succeeds
+before forwarding is attempted. A failing collector never rolls back
+a DDI mutation. Each target's failure is isolated — one dead SIEM
+doesn't affect the others. Operators who need at-least-once replay
+should point a webhook at a queue (NATS / Kafka / Redis) and let
+that be the durable layer.
 
 **Implementation.** SQLAlchemy `after_commit` listener in
-`app/services/audit_forward.py`. Registered once at import time via
-`app/main.py`. Snapshots new `AuditLog` rows inside `after_flush`
-(while they still carry committed values), then in `after_commit`
-schedules an `asyncio.create_task` per row so slow collectors don't
-serialize the queue.
+`app/services/audit_forward.py`. Snapshots new `AuditLog` rows
+inside `after_flush`, then in `after_commit` schedules one
+`asyncio.create_task` per (row, target) pair so slow collectors
+don't serialize the queue.
 
-**Channel 1: Syslog (RFC 5424).**
-- Transport: UDP or TCP. TLS deferred (cert management complexity).
-- Format: `<PRI>1 <ISO-TIME> <HOST> spatiumddi - AUDIT - <JSON-MSG>`.
-  MSG body is compact JSON; Splunk / Elastic / Graylog auto-detect
-  and parse it.
-- Severity mapping: `result="success"` → 6 (info),
-  `result="denied"` → 4 (warn), `result="failed"` → 3 (err).
-- Facility configurable 0–23; default 16 (local0).
-- UDP path uses `socket.sendto` (one syscall, no backpressure). TCP
-  path uses `asyncio.open_connection` with a 5 s timeout so a
-  tarpitted collector can't stall the event loop.
+**Transports.**
+- **Syslog UDP** — `socket.sendto`, fire-and-forget, one syscall.
+- **Syslog TCP** — `asyncio.open_connection`, 5 s connect timeout.
+- **Syslog TLS** — same as TCP plus `ssl.create_default_context()`;
+  an optional PEM-encoded CA bundle per target lets operators pin
+  a private CA without touching the system store.
+- **HTTP webhook** — `httpx.AsyncClient`, 5 s timeout,
+  `Content-Type: application/json`, optional `Authorization`
+  header sent verbatim.
 
-**Channel 2: HTTP webhook.**
-- POST with `Content-Type: application/json`; 5 s timeout.
-- Optional `Authorization` header — sent verbatim (include the
-  scheme: `Bearer …` / `Basic …`).
-- Non-2xx responses are logged via structlog at warning but not
-  retried. Use a reverse-proxy / queueing layer for replay.
-- Payload shape matches the syslog JSON MSG body:
+**Syslog output formats** (per-target). Webhook targets always
+deliver JSON and ignore this setting.
+
+| Format | Use case |
+|---|---|
+| `rfc5424_json` | Default. Modern SIEMs (Splunk, Elastic, Graylog) auto-parse the JSON body after the RFC 5424 header. |
+| `rfc5424_cef` | ArcSight + many commercial SIEMs. `CEF:0\|SpatiumDDI\|SpatiumDDI\|1.0\|<rtype:action>\|<display>\|<sev>` header + `act=`/`suser=`/`cs1=…` extensions. CEF severity mapped as info=3, error=6, denied=9. |
+| `rfc5424_leef` | IBM QRadar native format. LEEF 2.0 with `^` field delimiter (safer over UDP than the default tab). |
+| `rfc3164` | Legacy BSD syslog: `<PRI>Mmm dd HH:MM:SS host tag: <JSON>`. For collectors that don't speak RFC 5424. |
+| `json_lines` | Bare JSON per line — no syslog framing. For raw Logstash / Fluentd / Vector inputs. |
+
+**Severity mapping** (RFC 5424): `result="success"` → 6 info,
+`result="denied"` → 4 warn, `result="failed"` / `"error"` → 3 err.
+Facility is per-target and configurable 0–23 (default 16 = local0).
+
+**Per-target filters.**
+- `min_severity` — drop events below this bucket (info / warn /
+  error / denied). Null = forward everything.
+- `resource_types` — optional allowlist of `AuditLog.resource_type`.
+  Null / empty = forward everything. Useful for compliance-scoped
+  targets that should only see, say, auth + IPAM events.
+
+**JSON payload shape** (the body used by `rfc5424_json`, `json_lines`,
+and the webhook):
   ```json
   {
     "id": "…", "timestamp": "2026-04-21T10:00:00+00:00",
@@ -291,6 +309,13 @@ serialize the queue.
     "changed_fields": [], "old_value": null, "new_value": {…}
   }
   ```
+
+**Backward compatibility.** The pre-multi-target flat columns on
+`platform_settings` (`audit_forward_syslog_*`, `audit_forward_webhook_*`)
+are preserved and migrated into one `audit_forward_target` row apiece
+on upgrade. When the targets table is empty the service falls back to
+those flat columns so existing installs keep forwarding without
+operator intervention. They are slated for removal in a future release.
 
 **Known gap.** Celery-scheduled audits (e.g. the lease-pull
 housekeeping row) may not forward — Celery wraps the task body in
@@ -343,6 +368,41 @@ spatiumddi_dns_zones_total{server_id, view_id}
 spatiumddi_dns_blocklist_entries_total{list_id}
 spatiumddi_dns_server_status{server_id}
 ```
+
+### Built-in Dashboard Time-Series (agent-driven)
+
+For operators who don't run Prometheus, SpatiumDDI ships a minimal
+self-contained time-series path used by the built-in dashboard
+charts. Agents poll their local daemons every 60 s and POST
+per-bucket counter *deltas* to the control plane:
+
+| Surface | Source | Endpoint |
+|---|---|---|
+| **BIND9** | `statistics-channels` XMLv3 (`/xml/v3/server`, bound to `127.0.0.1:8053`, injected at render time) | `POST /api/v1/dns/agents/metrics` |
+| **Kea** | `statistic-get-all` over the existing control socket | `POST /api/v1/dhcp/agents/metrics` |
+
+The control plane stores deltas in two small tables —
+`dns_metric_sample(server_id, bucket_at, queries_total, noerror,
+nxdomain, servfail, recursion)` and `dhcp_metric_sample(server_id,
+bucket_at, discover, offer, request, ack, nak, decline, release,
+inform)`. Retention is enforced by the `prune_metric_samples`
+Celery task (daily, default 7 days).
+
+The dashboard queries two read endpoints:
+
+```
+GET /api/v1/metrics/dns/timeseries?window={1h|6h|24h|7d}&server_id={uuid?}
+GET /api/v1/metrics/dhcp/timeseries?window={1h|6h|24h|7d}&server_id={uuid?}
+```
+
+Server-side `date_bin` downsamples transparently — 60 s buckets for
+windows ≤ 24 h, 5 min buckets for 7 d. That keeps the response under
+~2 k points regardless of retention.
+
+Windows DNS / DHCP drivers don't report through this path yet (they'd
+need `Get-DnsServerStatistics` / `Get-DhcpServerv4Statistics` calls
+over WinRM). The dashboard card shows "no data yet" rather than an
+error in that case.
 
 ### Celery / Worker Metrics
 

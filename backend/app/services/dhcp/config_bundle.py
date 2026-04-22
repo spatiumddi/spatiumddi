@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -22,6 +22,7 @@ from app.drivers.dhcp.base import (
     ClientClassDef,
     ConfigBundle,
     FailoverConfig,
+    MACBlockDef,
     PoolDef,
     ScopeDef,
     ServerOptionsDef,
@@ -29,6 +30,7 @@ from app.drivers.dhcp.base import (
 )
 from app.models.dhcp import (
     DHCPClientClass,
+    DHCPMACBlock,
     DHCPScope,
     DHCPServer,
     DHCPServerGroup,
@@ -111,6 +113,7 @@ async def build_config_bundle(db: AsyncSession, server: DHCPServer) -> ConfigBun
 
     scope_rows: list[DHCPScope] = []
     cc_rows: list[DHCPClientClass] = []
+    mb_rows: list[DHCPMACBlock] = []
     if group is not None:
         scope_rows = list(
             (
@@ -131,6 +134,29 @@ async def build_config_bundle(db: AsyncSession, server: DHCPServer) -> ConfigBun
         )
         cc_rows = list(
             (await db.execute(select(DHCPClientClass).where(DHCPClientClass.group_id == group.id)))
+            .scalars()
+            .all()
+        )
+        # MAC blocks: group-global, enabled + not expired only. Expired
+        # rows stay in the DB for history but are stripped from the
+        # bundle so a re-render naturally drops them from the live
+        # config — the expiry beat task just forces the re-push.
+        now = datetime.now(UTC)
+        mb_rows = list(
+            (
+                await db.execute(
+                    select(DHCPMACBlock)
+                    .where(
+                        DHCPMACBlock.group_id == group.id,
+                        DHCPMACBlock.enabled.is_(True),
+                        or_(
+                            DHCPMACBlock.expires_at.is_(None),
+                            DHCPMACBlock.expires_at > now,
+                        ),
+                    )
+                    .order_by(DHCPMACBlock.mac_address)
+                )
+            )
             .scalars()
             .all()
         )
@@ -197,6 +223,15 @@ async def build_config_bundle(db: AsyncSession, server: DHCPServer) -> ConfigBun
         for c in cc_rows
     )
 
+    mac_blocks = tuple(
+        MACBlockDef(
+            mac_address=str(m.mac_address).lower(),
+            reason=m.reason or "other",
+            description=m.description or "",
+        )
+        for m in mb_rows
+    )
+
     failover = await _resolve_failover(db, server, group)
     bundle = ConfigBundle(
         server_id=str(server.id),
@@ -206,6 +241,7 @@ async def build_config_bundle(db: AsyncSession, server: DHCPServer) -> ConfigBun
         options=ServerOptionsDef(options={}, lease_time=86400),
         scopes=tuple(scopes),
         client_classes=client_classes,
+        mac_blocks=mac_blocks,
         generated_at=datetime.now(UTC),
         failover=failover,
     )

@@ -89,13 +89,14 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
         ],
     ),
     "DHCP Editor": (
-        "Full CRUD on DHCP servers, scopes, pools, statics and client classes.",
+        "Full CRUD on DHCP servers, scopes, pools, statics, client classes, and MAC blocks.",
         [
             {"action": "admin", "resource_type": "dhcp_server"},
             {"action": "admin", "resource_type": "dhcp_scope"},
             {"action": "admin", "resource_type": "dhcp_pool"},
             {"action": "admin", "resource_type": "dhcp_static"},
             {"action": "admin", "resource_type": "dhcp_client_class"},
+            {"action": "admin", "resource_type": "dhcp_mac_block"},
         ],
     ),
 }

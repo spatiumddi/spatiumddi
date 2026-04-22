@@ -1,6 +1,7 @@
 from app.models.acme import ACMEAccount
 from app.models.alerts import AlertEvent, AlertRule
 from app.models.audit import AuditLog
+from app.models.audit_forward import AuditForwardTarget
 from app.models.auth import APIToken, Group, Role, User, UserSession, user_group
 from app.models.auth_provider import AuthGroupMapping, AuthProvider
 from app.models.base import Base
@@ -8,6 +9,7 @@ from app.models.dhcp import (
     DHCPClientClass,
     DHCPConfigOp,
     DHCPLease,
+    DHCPMACBlock,
     DHCPPool,
     DHCPRecordOp,
     DHCPScope,
@@ -40,6 +42,7 @@ from app.models.ipam import (
     SubnetDomain,
     VLANMapping,
 )
+from app.models.metrics import DHCPMetricSample, DNSMetricSample
 from app.models.oui import OUIVendor
 from app.models.settings import PlatformSettings
 from app.models.vlans import VLAN, Router
@@ -48,6 +51,7 @@ __all__ = [
     "ACMEAccount",
     "Base",
     "AuditLog",
+    "AuditForwardTarget",
     "AlertRule",
     "AlertEvent",
     "User",
@@ -89,7 +93,10 @@ __all__ = [
     "DHCPPool",
     "DHCPStaticAssignment",
     "DHCPClientClass",
+    "DHCPMACBlock",
     "DHCPLease",
     "DHCPConfigOp",
     "DHCPRecordOp",
+    "DNSMetricSample",
+    "DHCPMetricSample",
 ]

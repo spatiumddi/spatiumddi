@@ -12,8 +12,10 @@ from sqlalchemy import func, select
 
 from app.api.deps import DB, CurrentUser
 from app.core.permissions import user_has_permission
+from app.models.audit_forward import AuditForwardTarget
 from app.models.oui import OUIVendor
 from app.models.settings import PlatformSettings
+from app.services import audit_forward as audit_forward_svc
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()
@@ -371,3 +373,237 @@ async def get_oui_refresh_status(task_id: str, current_user: CurrentUser) -> OUI
     elif state == "FAILURE":
         payload.error = repr(async_result.result) if async_result.result else "task failed"
     return payload
+
+
+# ── Audit forward targets (multi-target + multi-format) ───────────────────
+
+_VALID_KINDS = {"syslog", "webhook"}
+_VALID_FORMATS = {
+    "rfc5424_json",
+    "rfc5424_cef",
+    "rfc5424_leef",
+    "rfc3164",
+    "json_lines",
+}
+_VALID_PROTOCOLS = {"udp", "tcp", "tls"}
+_VALID_SEVERITIES = {"info", "warn", "error", "denied"}
+
+
+class AuditTargetBody(BaseModel):
+    """Create / update body. Webhook-only or syslog-only fields are
+    ignored for the other kind, so a single shape fits both."""
+
+    name: str
+    enabled: bool = True
+    kind: str
+    format: str = "rfc5424_json"
+    # syslog
+    host: str = ""
+    port: int = 514
+    protocol: str = "udp"
+    facility: int = 16
+    ca_cert_pem: str | None = None
+    # webhook
+    url: str = ""
+    auth_header: str = ""
+    # filter
+    min_severity: str | None = None
+    resource_types: list[str] | None = None
+
+    @field_validator("kind")
+    @classmethod
+    def _valid_kind(cls, v: str) -> str:
+        if v not in _VALID_KINDS:
+            raise ValueError(f"kind must be one of {sorted(_VALID_KINDS)}")
+        return v
+
+    @field_validator("format")
+    @classmethod
+    def _valid_format(cls, v: str) -> str:
+        if v not in _VALID_FORMATS:
+            raise ValueError(f"format must be one of {sorted(_VALID_FORMATS)}")
+        return v
+
+    @field_validator("protocol")
+    @classmethod
+    def _valid_protocol(cls, v: str) -> str:
+        if v not in _VALID_PROTOCOLS:
+            raise ValueError(f"protocol must be one of {sorted(_VALID_PROTOCOLS)}")
+        return v
+
+    @field_validator("min_severity")
+    @classmethod
+    def _valid_severity(cls, v: str | None) -> str | None:
+        if v is None or v == "":
+            return None
+        if v not in _VALID_SEVERITIES:
+            raise ValueError(f"min_severity must be one of {sorted(_VALID_SEVERITIES)}")
+        return v
+
+
+class AuditTargetResponse(BaseModel):
+    id: str
+    name: str
+    enabled: bool
+    kind: str
+    format: str
+    host: str
+    port: int
+    protocol: str
+    facility: int
+    ca_cert_pem: str | None
+    url: str
+    # Redact auth_header — we return whether it's set, never the value.
+    auth_header_set: bool
+    min_severity: str | None
+    resource_types: list[str] | None
+    created_at: datetime
+    modified_at: datetime
+
+
+def _target_to_response(t: AuditForwardTarget) -> AuditTargetResponse:
+    return AuditTargetResponse(
+        id=str(t.id),
+        name=t.name,
+        enabled=t.enabled,
+        kind=t.kind,
+        format=t.format,
+        host=t.host,
+        port=t.port,
+        protocol=t.protocol,
+        facility=t.facility,
+        ca_cert_pem=t.ca_cert_pem,
+        url=t.url,
+        auth_header_set=bool(t.auth_header),
+        min_severity=t.min_severity,
+        resource_types=t.resource_types,
+        created_at=t.created_at,
+        modified_at=t.modified_at,
+    )
+
+
+def _apply_body(t: AuditForwardTarget, body: AuditTargetBody) -> None:
+    t.name = body.name
+    t.enabled = body.enabled
+    t.kind = body.kind
+    t.format = body.format
+    t.host = body.host
+    t.port = body.port
+    t.protocol = body.protocol
+    t.facility = body.facility
+    t.ca_cert_pem = body.ca_cert_pem
+    t.url = body.url
+    t.auth_header = body.auth_header
+    t.min_severity = body.min_severity
+    t.resource_types = body.resource_types
+
+
+@router.get("/audit-forward-targets", response_model=list[AuditTargetResponse])
+async def list_audit_targets(current_user: CurrentUser, db: DB) -> list[AuditTargetResponse]:
+    if not current_user.is_superadmin:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+    res = await db.execute(select(AuditForwardTarget).order_by(AuditForwardTarget.name))
+    return [_target_to_response(t) for t in res.scalars().all()]
+
+
+@router.post(
+    "/audit-forward-targets",
+    response_model=AuditTargetResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_audit_target(
+    body: AuditTargetBody, current_user: CurrentUser, db: DB
+) -> AuditTargetResponse:
+    if not current_user.is_superadmin:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+    row = AuditForwardTarget()
+    _apply_body(row, body)
+    db.add(row)
+    try:
+        await db.commit()
+    except Exception as exc:  # noqa: BLE001 — name collisions land here
+        await db.rollback()
+        raise HTTPException(status_code=400, detail=f"create failed: {exc}") from exc
+    await db.refresh(row)
+    return _target_to_response(row)
+
+
+@router.put("/audit-forward-targets/{target_id}", response_model=AuditTargetResponse)
+async def update_audit_target(
+    target_id: str, body: AuditTargetBody, current_user: CurrentUser, db: DB
+) -> AuditTargetResponse:
+    if not current_user.is_superadmin:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+    row = await db.get(AuditForwardTarget, target_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Target not found")
+    _apply_body(row, body)
+    try:
+        await db.commit()
+    except Exception as exc:  # noqa: BLE001
+        await db.rollback()
+        raise HTTPException(status_code=400, detail=f"update failed: {exc}") from exc
+    await db.refresh(row)
+    return _target_to_response(row)
+
+
+@router.delete("/audit-forward-targets/{target_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_audit_target(target_id: str, current_user: CurrentUser, db: DB) -> None:
+    if not current_user.is_superadmin:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+    row = await db.get(AuditForwardTarget, target_id)
+    if row is None:
+        return
+    await db.delete(row)
+    await db.commit()
+
+
+@router.post("/audit-forward-targets/{target_id}/test")
+async def test_audit_target(target_id: str, current_user: CurrentUser, db: DB) -> dict[str, Any]:
+    """Send a synthetic event to one target and report success / error.
+
+    The event is flagged ``action="test_forward"`` so the operator can
+    filter it out in the collector if they want. Doesn't land in
+    ``audit_log`` — this is explicit probe traffic, not an audit.
+    """
+    if not current_user.is_superadmin:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
+    row = await db.get(AuditForwardTarget, target_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Target not found")
+
+    now = datetime.utcnow()
+    payload: dict[str, Any] = {
+        "id": "test-" + str(row.id),
+        "timestamp": now.isoformat() + "Z",
+        "action": "test_forward",
+        "resource_type": "audit_forward_target",
+        "resource_id": str(row.id),
+        "resource_display": row.name,
+        "result": "success",
+        "user_id": str(current_user.id),
+        "user_display_name": current_user.display_name,
+        "auth_source": "local",
+        "changed_fields": [],
+        "old_value": None,
+        "new_value": None,
+    }
+    target_dict = {
+        "name": row.name,
+        "kind": row.kind,
+        "format": row.format,
+        "host": row.host,
+        "port": row.port,
+        "protocol": row.protocol,
+        "facility": row.facility,
+        "ca_cert_pem": row.ca_cert_pem,
+        "url": row.url,
+        "auth_header": row.auth_header or "",
+        "min_severity": None,  # ignore filter on a probe
+        "resource_types": None,
+    }
+    try:
+        await audit_forward_svc._deliver_to_target(target_dict, payload)  # noqa: SLF001
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=f"delivery failed: {exc}") from exc
+    return {"status": "ok", "target": row.name}

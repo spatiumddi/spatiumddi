@@ -74,6 +74,21 @@ class ClientClassDef:
 
 
 @dataclass(frozen=True)
+class MACBlockDef:
+    """A blocked MAC address — group-global deny entry.
+
+    Rendered into Kea's reserved ``DROP`` client class and into the
+    Windows DHCP server-level deny-filter list. ``mac_address`` is
+    normalized to colon-separated lowercase (``aa:bb:cc:dd:ee:ff``)
+    before it reaches the agent.
+    """
+
+    mac_address: str
+    reason: str = "other"
+    description: str = ""
+
+
+@dataclass(frozen=True)
 class ScopeDef:
     """A DHCP scope — one subnet configuration."""
 
@@ -143,6 +158,7 @@ class ConfigBundle:
     scopes: tuple[ScopeDef, ...]
     client_classes: tuple[ClientClassDef, ...]
     generated_at: datetime
+    mac_blocks: tuple[MACBlockDef, ...] = ()
     etag: str = ""
     # Populated when the server's group has ≥ 2 Kea members. The
     # agent's Kea renderer injects ``libdhcp_ha.so`` + the ``high-
@@ -159,6 +175,7 @@ class ConfigBundle:
             "options": asdict(self.options),
             "scopes": [asdict(s) for s in self.scopes],
             "client_classes": [asdict(c) for c in self.client_classes],
+            "mac_blocks": [asdict(m) for m in self.mac_blocks],
             "failover": asdict(self.failover) if self.failover else None,
         }
         blob = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
@@ -344,6 +361,22 @@ class DHCPDriver(ABC):
                 results.append(ExclusionResult(ok=False, item=item, error=str(exc)))
         return results
 
+    async def sync_mac_blocks(
+        self, server: Any, *, desired: Sequence[MACBlockDef]
+    ) -> tuple[int, int]:
+        """Reconcile the server's MAC deny-list against ``desired``.
+
+        Windows DHCP has a server-level deny filter list that we keep in
+        sync with the SpatiumDDI group's ``DHCPMACBlock`` rows. Kea-based
+        drivers do NOT implement this: their blocklist ships via the
+        ConfigBundle + rendered DROP class, not as a per-object write.
+
+        Returns ``(added, removed)``. Drivers that don't need to push
+        per-object MAC filters (everything except Windows) inherit this
+        default no-op — the bundle path covers them.
+        """
+        return (0, 0)
+
 
 __all__ = [
     "STANDARD_OPTION_NAMES",
@@ -352,6 +385,7 @@ __all__ = [
     "DHCPDriver",
     "ExclusionItem",
     "ExclusionResult",
+    "MACBlockDef",
     "PoolDef",
     "RemoveReservationItem",
     "ReservationItem",

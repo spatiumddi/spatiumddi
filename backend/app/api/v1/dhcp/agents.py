@@ -27,6 +27,7 @@ from app.models.dhcp import (
     DHCPServer,
     DHCPServerGroup,
 )
+from app.models.metrics import DHCPMetricSample
 from app.services.dhcp.agent_token import (
     hash_token,
     mint_agent_token,
@@ -342,6 +343,14 @@ async def agent_config_longpoll(
                         }
                         for c in bundle.client_classes
                     ],
+                    "mac_blocks": [
+                        {
+                            "mac_address": m.mac_address,
+                            "reason": m.reason,
+                            "description": m.description,
+                        }
+                        for m in bundle.mac_blocks
+                    ],
                     # Kea HA hook configuration — absent when the
                     # server isn't part of a failover channel. The
                     # agent's render_kea.py keys off the presence of
@@ -576,6 +585,55 @@ async def agent_ha_status(
     server, _ = auth
     server.ha_state = body.state
     server.ha_last_heartbeat_at = datetime.now(UTC)
+    await db.commit()
+    return {"status": "ok"}
+
+
+class DHCPMetricReport(BaseModel):
+    """One time-bucketed sample of Kea packet counters.
+
+    Shape mirrors ``DNSMetricReport`` — the agent emits deltas
+    computed from two consecutive ``statistic-get-all`` snapshots so
+    a Kea restart (counters reset to zero) only drops one bucket on
+    the floor instead of creating a spurious spike when the next
+    poll's counters come in lower than the previous ones.
+    """
+
+    bucket_at: datetime
+    discover: int = 0
+    offer: int = 0
+    request: int = 0
+    ack: int = 0
+    nak: int = 0
+    decline: int = 0
+    release: int = 0
+    inform: int = 0
+
+
+@router.post("/metrics")
+async def agent_metrics(
+    body: DHCPMetricReport,
+    db: DB,
+    auth: tuple[DHCPServer, dict[str, Any]] = Depends(_auth_agent),
+) -> dict[str, str]:
+    """Ingest one sample row. Idempotent on ``(server_id, bucket_at)``."""
+    server, _ = auth
+    values = {
+        "discover": max(0, body.discover),
+        "offer": max(0, body.offer),
+        "request": max(0, body.request),
+        "ack": max(0, body.ack),
+        "nak": max(0, body.nak),
+        "decline": max(0, body.decline),
+        "release": max(0, body.release),
+        "inform": max(0, body.inform),
+    }
+    existing = await db.get(DHCPMetricSample, (server.id, body.bucket_at))
+    if existing is None:
+        db.add(DHCPMetricSample(server_id=server.id, bucket_at=body.bucket_at, **values))
+    else:
+        for k, v in values.items():
+            setattr(existing, k, v)
     await db.commit()
     return {"status": "ok"}
 

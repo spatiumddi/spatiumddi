@@ -80,6 +80,9 @@ class DHCPServerGroup(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     client_classes: Mapped[list[DHCPClientClass]] = relationship(
         "DHCPClientClass", back_populates="group", cascade="all, delete-orphan"
     )
+    mac_blocks: Mapped[list[DHCPMACBlock]] = relationship(
+        "DHCPMACBlock", back_populates="group", cascade="all, delete-orphan"
+    )
 
 
 class DHCPServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -313,6 +316,59 @@ class DHCPClientClass(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
 
 
+# ── MAC blocklist ───────────────────────────────────────────────────────────
+
+
+class DHCPMACBlock(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """A blocked MAC address — group-global, applies to every scope.
+
+    Under Kea this becomes part of the reserved ``DROP`` client class's
+    ``test`` expression, rendered by the agent. Under Windows DHCP the
+    agentless driver pushes an ``Add-DhcpServerv4Filter -List Deny`` row
+    on every member server via WinRM. Expired rows are filtered out of
+    the rendered config on every ``ConfigBundle`` build; a beat tick
+    notices the state transition and forces a re-push so the operator
+    doesn't have to.
+    """
+
+    __tablename__ = "dhcp_mac_block"
+    __table_args__ = (
+        UniqueConstraint("group_id", "mac_address", name="uq_dhcp_mac_block_group_mac"),
+        Index("ix_dhcp_mac_block_group", "group_id"),
+        Index("ix_dhcp_mac_block_mac", "mac_address"),
+        Index("ix_dhcp_mac_block_expires_at", "expires_at"),
+    )
+
+    group_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dhcp_server_group.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    mac_address: Mapped[str] = mapped_column(MACADDR, nullable=False)
+    # reason: rogue | lost_stolen | quarantine | policy | other
+    reason: Mapped[str] = mapped_column(String(20), nullable=False, default="other")
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("user.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    updated_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("user.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
+    # Populated by agents reporting a drop — optional telemetry.
+    last_match_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    match_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    group: Mapped[DHCPServerGroup] = relationship("DHCPServerGroup", back_populates="mac_blocks")
+
+
 # ── Leases ──────────────────────────────────────────────────────────────────
 
 
@@ -396,6 +452,7 @@ __all__ = [
     "DHCPPool",
     "DHCPStaticAssignment",
     "DHCPClientClass",
+    "DHCPMACBlock",
     "DHCPLease",
     "DHCPConfigOp",
     "DHCPRecordOp",

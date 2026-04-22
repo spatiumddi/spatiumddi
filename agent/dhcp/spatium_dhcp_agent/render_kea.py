@@ -115,6 +115,45 @@ def _options_from_mapping(options: dict[str, Any] | None) -> list[dict[str, Any]
     return out
 
 
+def _normalize_mac_for_kea(raw: str) -> str | None:
+    """Return a normalized colon-separated lowercase MAC, or None if invalid.
+
+    Kea's ``hexstring(pkt4.mac, ':')`` yields a lowercase colon-separated
+    form — we must match that exactly. We accept operator input in the
+    common variants (``AA-BB-CC-DD-EE-FF``, ``aabbccddeeff``, etc.) and
+    coerce to the canonical shape. Anything that doesn't yield exactly
+    12 hex chars is dropped with a warning rather than emitted malformed
+    — a single bad row shouldn't take the whole Kea config down.
+    """
+    cleaned = "".join(ch for ch in raw.lower() if ch in "0123456789abcdef")
+    if len(cleaned) != 12:
+        _log.warning("drop_mac_invalid", raw=raw)
+        return None
+    return ":".join(cleaned[i : i + 2] for i in range(0, 12, 2))
+
+
+def _build_drop_expression(mac_blocks: list[dict[str, Any]]) -> str:
+    """Build a Kea client-class ``test`` expression for the DROP list.
+
+    Returns ``""`` when the list is empty — caller skips DROP rendering
+    entirely in that case. We use ``hexstring(pkt4.mac, ':') == '...'``
+    per MAC and OR them together. Kea has no upper limit on expression
+    length in practice; at ~70 chars per clause a 10k-entry blocklist
+    is ~700KB which Kea handles (validated against 2.6).
+    """
+    norms: list[str] = []
+    for entry in mac_blocks:
+        mac = entry.get("mac_address") if isinstance(entry, dict) else None
+        if not mac:
+            continue
+        n = _normalize_mac_for_kea(str(mac))
+        if n is not None:
+            norms.append(n)
+    if not norms:
+        return ""
+    return " or ".join(f"hexstring(pkt4.mac, ':') == '{m}'" for m in norms)
+
+
 def _reservation(res: dict[str, Any]) -> dict[str, Any]:
     out: dict[str, Any] = {}
     if "hw_address" in res or "mac" in res:
@@ -366,23 +405,35 @@ def render(
     # Client classes: wire carries ``match_expression``, legacy/hand-
     # crafted fixtures carry ``test``. Accept either.
     classes = bundle.get("client_classes") or []
-    if classes:
-        dhcp4["client-classes"] = [
-            {
-                "name": c["name"],
-                **(
-                    {"test": c.get("test") or c.get("match_expression")}
-                    if (c.get("test") or c.get("match_expression"))
-                    else {}
-                ),
-                **(
-                    {"option-data": _options_from_mapping(c.get("options"))}
-                    if c.get("options")
-                    else {}
-                ),
-            }
-            for c in classes
-        ]
+    rendered_classes: list[dict[str, Any]] = [
+        {
+            "name": c["name"],
+            **(
+                {"test": c.get("test") or c.get("match_expression")}
+                if (c.get("test") or c.get("match_expression"))
+                else {}
+            ),
+            **(
+                {"option-data": _options_from_mapping(c.get("options"))}
+                if c.get("options")
+                else {}
+            ),
+        }
+        for c in classes
+    ]
+
+    # MAC blocklist — render as Kea's reserved ``DROP`` class. Any packet
+    # whose hardware address matches the OR-ed expression is silently
+    # dropped before allocation. ``DROP`` is a Kea built-in name, not
+    # something the operator can reuse — so if a user-defined class is
+    # already named ``DROP`` we skip blocklist rendering to avoid
+    # clobbering it (defensive; the API already reserves the name).
+    drop_expr = _build_drop_expression(bundle.get("mac_blocks") or [])
+    if drop_expr and not any(c.get("name") == "DROP" for c in rendered_classes):
+        rendered_classes.append({"name": "DROP", "test": drop_expr})
+
+    if rendered_classes:
+        dhcp4["client-classes"] = rendered_classes
 
     if bundle.get("reservation_mode"):
         dhcp4["reservation-mode"] = bundle["reservation_mode"]

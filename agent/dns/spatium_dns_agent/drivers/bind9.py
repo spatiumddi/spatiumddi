@@ -39,6 +39,9 @@ options {{
     check-integrity no;
 {forwarders}{response_policy}
 }};
+statistics-channels {{
+    inet 127.0.0.1 port 8053 allow {{ 127.0.0.1; }};
+}};
 {tsig_include}"""
 
 
@@ -173,9 +176,24 @@ class Bind9Driver(DriverBase):
         for rec in zone.get("records", []) or []:
             rec_ttl = rec.get("ttl") or ttl
             name_field = rec.get("name") or "@"
-            lines.append(
-                f"{name_field} {rec_ttl} IN {rec['type']} {rec['value']}"
-            )
+            rtype = rec["type"].upper()
+            value = rec["value"]
+            # MX / SRV zone-file format requires inline priority (and
+            # weight+port for SRV) before the target. The control plane
+            # stores those in separate columns; compose the wire shape
+            # here so ``named-checkzone`` parses the zone cleanly.
+            if rtype == "MX" and rec.get("priority") is not None:
+                if not value.lstrip().split(" ", 1)[0].isdigit():
+                    value = f"{rec['priority']} {value}"
+            elif (
+                rtype == "SRV"
+                and rec.get("priority") is not None
+                and rec.get("weight") is not None
+                and rec.get("port") is not None
+                and len(value.split()) < 4
+            ):
+                value = f"{rec['priority']} {rec['weight']} {rec['port']} {value}"
+            lines.append(f"{name_field} {rec_ttl} IN {rtype} {value}")
         path.write_text("\n".join(lines) + "\n")
 
     def _write_rpz_zone_file(self, path: Path, bl: dict[str, Any]) -> None:
@@ -283,9 +301,32 @@ class Bind9Driver(DriverBase):
             if m:
                 keyring = dns.tsigkeyring.from_text({m.group(1): m.group(2)})
 
+        # MX / SRV wire-format requires the priority (and weight+port) to
+        # appear inline before the target. The control plane stores those
+        # as separate columns and, historically, only forwarded `value`.
+        # Prefer explicit fields; fall back to the raw value if an already-
+        # composed wire string came through (legacy path + future-proofing).
+        wire_value = value
+        rtype_u = rtype.upper()
+        if rtype_u == "MX":
+            pri = rec.get("priority")
+            if pri is not None and not value.lstrip().split(" ", 1)[0].isdigit():
+                wire_value = f"{pri} {value}"
+        elif rtype_u == "SRV":
+            pri = rec.get("priority")
+            wt = rec.get("weight")
+            prt = rec.get("port")
+            if (
+                pri is not None
+                and wt is not None
+                and prt is not None
+                and len(value.split()) < 4
+            ):
+                wire_value = f"{pri} {wt} {prt} {value}"
+
         upd = dns.update.Update(zone, keyring=keyring)
         if op["op"] in ("create", "update"):
-            upd.replace(name, ttl, rtype, value)
+            upd.replace(name, ttl, rtype, wire_value)
         elif op["op"] == "delete":
             # Some BIND configurations reject the RR-specific delete form
             # (value must exactly match a live RR) when the running daemon

@@ -193,7 +193,7 @@ SpatiumDDI cut its alpha release `2026.04.16-1` on 2026-04-16 with IPAM, DNS (BI
 - **DHCP stale-lease absence-delete.** `pull_leases` now finds every active `DHCPLease` for this server whose IP wasn't in the wire response and deletes both the lease row and its `auto_from_lease=True` IPAM mirror. `PullLeasesResult` / `SyncLeasesResponse` / scheduled-task audit rows gain `removed` + `ipam_revoked` counters. The time-based `dhcp_lease_cleanup` sweep still handles between-poll expiry.
 - **Sync menu + DHCP sync modals.** Replaces the standalone "Sync DNS" button on the subnet detail with a `[Sync ▾]` dropdown (DNS / DHCP / All). `DhcpSyncModal` fans out `POST /dhcp/servers/{id}/sync-leases` across every unique server backing a scope in the subnet, shows per-server counters. `SyncAllModal` combines DHCP results + DNS drift summary in one modal with a "Review DNS changes…" button that chains into the existing `DnsSyncModal`.
 - **Refresh buttons** on DNS zone records, IPAM subnet detail, and the VLANs sidebar — each invalidates every relevant React Query key.
-- **Dashboard rewrite.** Six KPI cards + **Subnet Utilization Heatmap** (every managed subnet = one grid cell coloured by utilization, click-through to IPAM) + Top Subnets + Live Activity feed (15 s auto-refresh, action-family colour coding) + DNS/DHCP service panel. No historical time-series panels yet — left a clean hook for when snapshot infra lands.
+- **Dashboard rewrite.** Six KPI cards + **Subnet Utilization Heatmap** (every managed subnet = one grid cell coloured by utilization, click-through to IPAM) + Top Subnets + Live Activity feed (15 s auto-refresh, action-family colour coding) + DNS/DHCP service panel. **Time-series panels landed post-release** (2026-04-22 metrics MVP) — two Recharts cards under the activity row render DNS query rate + DHCP traffic from agent-driven `metric_sample` tables.
 - **Draggable modals.** Seven per-page `function Modal({...})` copies collapsed into a single `<Modal>` at `frontend/src/components/ui/modal.tsx` + `use-draggable-modal.ts` (utility split out so Vite fast-refresh doesn't warn on mixed exports). Title bar is a drag handle; backdrop is `bg-black/20` so the page behind stays readable; Esc closes. Custom modal shapes (header with border-b + footer slot) use `useDraggableModal(onClose)` + `MODAL_BACKDROP_CLS` directly. Migrated across admin, DNS, DHCP, VLANs, IPAM + `ResizeModals` + `ImportExportModals` + inline `DnsSyncModal`.
 - **Standardised header buttons.** `<HeaderButton>` primitive with three variants (`secondary` / `primary` / `destructive`) on a shared `inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-sm` base. Logical left→right ordering applied everywhere: `[Refresh] [Sync …] [Import] [Export] [misc reads] [Edit] [Resize] [Delete] [+ Primary]`. DNS / DHCP / VLANs were smaller (`text-xs`); all bumped to match IPAM's dominant size.
 
@@ -336,6 +336,53 @@ Phase 1 IPv6 closure + the Phase 2/3 DDNS / zone-state / CI-hardening items all 
     a single-agent DNS pair today; an HA DHCP variant would have
     caught the bootstrap / port-split / `status-get` / wire-shape
     regressions we hit in 2026.04.21-2.
+- ✅ **DHCP MAC blocklist (group-global)** — `DHCPMACBlock` table
+  hung off `DHCPServerGroup`, unique on `(group_id, mac_address)`,
+  indexed on `expires_at`. Per-row fields: `mac_address` (MACADDR),
+  `reason` (`rogue` / `lost_stolen` / `quarantine` / `policy` /
+  `other`), `description`, `enabled`, `expires_at`, `created_at` +
+  `created_by_user_id`, `updated_by_user_id`, `last_match_at`,
+  `match_count`. `MACBlockDef` added to `ConfigBundle`; the control
+  plane strips `enabled=False` + expired rows pre-render so the
+  ETag naturally shifts on expiry transitions and agents long-poll
+  pick it up. **Kea path**: agent's `render_kea.py` wraps the active
+  MAC list in Kea's reserved `DROP` client class via an OR-ed
+  `hexstring(pkt4.mac, ':') == '...'` expression — packets are
+  silently dropped before allocation; if the operator hand-defined
+  a `DROP` class the renderer steps aside rather than clobber it.
+  **Windows DHCP path**: `WindowsDHCPReadOnlyDriver.sync_mac_blocks`
+  diffs desired-set against `Get-DhcpServerv4Filter -List Deny` and
+  ships one batched PS script per WinRM round trip. Beat tick every
+  60 s (`app.tasks.dhcp_mac_blocks.sync_dhcp_mac_blocks`) reconciles
+  Windows servers — Kea doesn't need the task since blocklist
+  changes flow through the bundle. CRUD at `/api/v1/dhcp/server-
+  groups/{gid}/mac-blocks` (list + create) + `/api/v1/dhcp/mac-
+  blocks/{id}` (update + delete). List endpoint joins OUI vendor
+  lookup and an `IPAddress.mac_address` cross-reference so the UI
+  surfaces vendor + any IPAM rows tied to the blocked MAC.
+  Frontend `MacBlocksTab` on the DHCP server detail view (mirrors
+  where `ClientClassesTab` lives): filterable table, reason pills,
+  status pill (active / disabled / expired), IPAM link-outs, add /
+  edit modal accepting any common MAC format. Permission gate
+  `dhcp_mac_block`; built-in "DHCP Editor" role gets it. Migration
+  `d4a18b20e3c7_dhcp_mac_blocks`. **Deferred follow-ups:**
+  - **Bulk import / paste** from CSV — the current UI is one-at-a-
+    time; large blocklists need a paste-a-list path.
+  - **Per-scope restriction.** Kea's class/pool pinning supports
+    "block this MAC only on subnet X" — would mean dropping the
+    `DROP` shortcut in favour of per-pool `client-class` + a
+    per-subnet class. Windows can't do per-scope deny at all
+    (deny-list is server-global). Group-global is the right
+    default; per-scope is a Phase 5 precision tool.
+  - **`last_match_at` + `match_count` wiring.** The columns exist
+    but nothing writes to them yet. Kea has a lease-event hook and
+    Windows has a `FilterNotifications` event channel we already
+    surface in Logs — either can drive the counter.
+  - **HA pair compatibility**: the beat task iterates every
+    agentless server regardless of group HA state. Should still be
+    idempotent but worth a targeted test when HA + Windows DHCP
+    land together.
+
 - ✅ **Alerts framework (v1)** — `AlertRule` + `AlertEvent` tables;
   evaluator at `services/alerts.py:evaluate_all()` runs from
   `app.tasks.alerts.evaluate_alerts` on a 60 s beat tick. Two rule
@@ -348,6 +395,39 @@ Phase 1 IPv6 closure + the Phase 2/3 DDNS / zone-state / CI-hardening items all 
   live events viewer + "Evaluate now". Email (SMTP) and SNMP trap
   channels are the remaining v2 work — needs SMTP config infra that
   doesn't exist yet, and SNMP is its own dependency footprint.
+- ✅ **Dashboard time-series (MVP)** — agent-driven DNS query rate +
+  DHCP traffic charts, self-contained (no Prometheus / InfluxDB
+  required). BIND9 agents poll `statistics-channels` XMLv3 on
+  `127.0.0.1:8053` (injected into rendered `named.conf`); Kea
+  agents poll `statistic-get-all` over the existing control socket.
+  Both report per-60s-bucket deltas to `POST
+  /api/v1/{dns,dhcp}/agents/metrics`. Counter resets on daemon
+  restart are detected agent-side (`delta < 0`) and drop the
+  bucket rather than emitting a phantom spike. Storage in two
+  narrow tables `dns_metric_sample` + `dhcp_metric_sample` keyed
+  on `(server_id, bucket_at)`. Dashboard reads `GET
+  /api/v1/metrics/{dns,dhcp}/timeseries?window={1h|6h|24h|7d}`
+  with server-side `date_bin` downsampling (60 s for ≤24 h,
+  5 min for 7 d). Retention by nightly `prune_metric_samples`
+  Celery task (default 7 d). Migration
+  `bd4f2a91c7e3_metric_samples`. **Deferred follow-ups:**
+  - **Windows DNS / DHCP stats** — needs `Get-DnsServerStatistics`
+    + `Get-DhcpServerv4Statistics` driver methods over WinRM.
+    Chart currently shows "no data yet" for Windows-only
+    deployments.
+  - **Prometheus export** of the same samples — one Gauge per
+    column with `server_id` label would make the existing
+    `/metrics` endpoint a full-featured scrape target for
+    operators who prefer Grafana.
+  - **InfluxDB push export** (`InfluxDBTarget` spec in
+    `docs/features/SYSTEM_ADMIN.md §8.2`) — shape exists, writer
+    still pending.
+  - **Per-qtype** (BIND) / **per-subnet** (Kea) breakdowns —
+    `statistic-get-all` already carries per-subnet counters; the
+    agent strips them for MVP. Adding them is column-only, no
+    protocol change.
+  - **Alert rule types `dns_query_rate` / `dhcp_lease_rate`** —
+    threshold-based alerts keyed off the timeseries data.
 - ⬜ **IPAM template classes** — reusable stamp templates that
   carry default tags, custom-field values, DNS / DHCP group
   assignments, and optional sub-subnet layouts. Applied to a block

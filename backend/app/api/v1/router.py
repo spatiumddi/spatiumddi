@@ -14,6 +14,7 @@ from app.api.v1.dns.router import router as dns_router
 from app.api.v1.groups.router import router as groups_router
 from app.api.v1.ipam.router import router as ipam_router
 from app.api.v1.logs import logs_router
+from app.api.v1.metrics import router as metrics_router
 from app.api.v1.roles.router import router as roles_router
 from app.api.v1.search.router import router as search_router
 from app.api.v1.settings.router import router as settings_router
@@ -43,3 +44,4 @@ api_v1_router.include_router(vlans_router, prefix="/vlans", tags=["vlans"])
 api_v1_router.include_router(logs_router, prefix="/logs", tags=["logs"])
 api_v1_router.include_router(alerts_router, prefix="/alerts", tags=["alerts"])
 api_v1_router.include_router(acme_router, prefix="/acme", tags=["acme"])
+api_v1_router.include_router(metrics_router, prefix="/metrics", tags=["metrics"])

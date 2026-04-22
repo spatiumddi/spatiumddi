@@ -2300,7 +2300,15 @@ async def create_record(
         db,
         zone,
         "create",
-        {"name": record.name, "type": record.record_type, "value": record.value, "ttl": record.ttl},
+        {
+            "name": record.name,
+            "type": record.record_type,
+            "value": record.value,
+            "ttl": record.ttl,
+            "priority": record.priority,
+            "weight": record.weight,
+            "port": record.port,
+        },
         target_serial=target_serial,
     )
     db.add(
@@ -2347,6 +2355,9 @@ async def update_record(
                 "type": record.record_type,
                 "value": record.value,
                 "ttl": record.ttl,
+                "priority": record.priority,
+                "weight": record.weight,
+                "port": record.port,
             },
             target_serial=target_serial,
         )
@@ -2392,6 +2403,9 @@ async def delete_record(
         "type": record.record_type,
         "value": record.value,
         "ttl": record.ttl,
+        "priority": record.priority,
+        "weight": record.weight,
+        "port": record.port,
     }
     await db.delete(record)
     if zone is not None:
@@ -2473,6 +2487,9 @@ async def bulk_delete_records(
                 "type": r.record_type,
                 "value": r.value,
                 "ttl": r.ttl,
+                "priority": r.priority,
+                "weight": r.weight,
+                "port": r.port,
             },
             "target_serial": target_serial,
         }

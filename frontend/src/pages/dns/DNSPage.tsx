@@ -5008,6 +5008,26 @@ function GroupDetailView({
           </div>
           <div className="flex items-center gap-2 flex-shrink-0">
             <button
+              className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent"
+              onClick={() => {
+                qc.invalidateQueries({ queryKey: ["dns-zones", group.id] });
+                qc.invalidateQueries({
+                  queryKey: ["dns-group-records", group.id],
+                });
+                qc.invalidateQueries({
+                  queryKey: ["dns-servers", group.id],
+                });
+                qc.invalidateQueries({ queryKey: ["dns-views", group.id] });
+                qc.invalidateQueries({ queryKey: ["dns-acls", group.id] });
+                qc.invalidateQueries({ queryKey: ["dns-blocklists"] });
+                qc.invalidateQueries({ queryKey: ["dns-options", group.id] });
+              }}
+              title="Reload all data for this group (zones, records, servers, views, ACLs, blocklists, options) from the control plane."
+            >
+              <RefreshCw className="h-3 w-3" />
+              Refresh
+            </button>
+            <button
               className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent disabled:opacity-50"
               onClick={runGroupSync}
               disabled={syncing}

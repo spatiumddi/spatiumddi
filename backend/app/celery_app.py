@@ -14,9 +14,11 @@ celery_app = Celery(
         "app.tasks.dns_pull",
         "app.tasks.dhcp_health",
         "app.tasks.dhcp_lease_cleanup",
+        "app.tasks.dhcp_mac_blocks",
         "app.tasks.dhcp_pull_leases",
         "app.tasks.alerts",
         "app.tasks.oui_update",
+        "app.tasks.prune_metrics",
     ],
 )
 
@@ -43,9 +45,11 @@ celery_app.conf.update(
         "app.tasks.dns_pull.*": {"queue": "dns"},
         "app.tasks.dhcp_health.*": {"queue": "dhcp"},
         "app.tasks.dhcp_lease_cleanup.*": {"queue": "dhcp"},
+        "app.tasks.dhcp_mac_blocks.*": {"queue": "dhcp"},
         "app.tasks.dhcp_pull_leases.*": {"queue": "dhcp"},
         "app.tasks.alerts.*": {"queue": "default"},
         "app.tasks.oui_update.*": {"queue": "default"},
+        "app.tasks.prune_metrics.*": {"queue": "default"},
     },
     beat_schedule={
         # Every 60s, fan-out health checks to every registered DNS server.
@@ -94,6 +98,15 @@ celery_app.conf.update(
             "task": "app.tasks.dhcp_pull_leases.auto_pull_dhcp_leases",
             "schedule": schedule(run_every=10.0),
         },
+        # Every 60 s, reconcile the Windows DHCP server-level deny
+        # filter list against each group's active MAC blocks. Kea is
+        # driven by the ConfigBundle DROP class render and needs no
+        # periodic push. Windows has no built-in expiry so this tick
+        # handles the ``expires_at`` transitions uniformly.
+        "dhcp-mac-blocks-sync": {
+            "task": "app.tasks.dhcp_mac_blocks.sync_dhcp_mac_blocks",
+            "schedule": schedule(run_every=60.0),
+        },
         # Every 60 s, evaluate every enabled AlertRule. Idempotent —
         # opens events for fresh matches, resolves events whose
         # subject no longer matches. Delivery reuses the
@@ -111,6 +124,15 @@ celery_app.conf.update(
         "oui-refresh": {
             "task": "app.tasks.oui_update.auto_update_oui_database",
             "schedule": schedule(run_every=3600.0),
+        },
+        # Nightly prune of dns/dhcp metric_sample rows older than the
+        # configured retention window (default 7 d). Keeps the two
+        # tables a bounded size without coarsening resolution. Cadence
+        # is deliberately slow — the tables are already small and
+        # pruning more often just burns cycles.
+        "metric-samples-prune": {
+            "task": "app.tasks.prune_metrics.prune_metric_samples",
+            "schedule": schedule(run_every=24 * 3600.0),
         },
     },
 )

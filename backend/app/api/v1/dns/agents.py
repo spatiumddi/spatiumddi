@@ -21,6 +21,7 @@ from sqlalchemy import select
 from app.api.deps import DB
 from app.models.audit import AuditLog
 from app.models.dns import DNSRecordOp, DNSServer, DNSServerGroup, DNSServerZoneState, DNSZone
+from app.models.metrics import DNSMetricSample
 from app.services.dns.agent_config import build_config_bundle
 from app.services.dns.agent_token import (
     hash_token,
@@ -453,3 +454,53 @@ async def agent_zone_state(
 
     await db.commit()
     return {"updated": updated}
+
+
+class DNSMetricReport(BaseModel):
+    """One time-bucketed sample of BIND9 query counters.
+
+    Agents report *deltas* (the difference between two consecutive
+    polls of the statistics-channels endpoint), already bucketed to
+    whatever cadence the agent runs at (default 60 s). That keeps
+    counter resets on daemon restart from back-propagating into the
+    stored time series — the agent absorbs them.
+    """
+
+    bucket_at: datetime
+    queries_total: int = 0
+    noerror: int = 0
+    nxdomain: int = 0
+    servfail: int = 0
+    recursion: int = 0
+
+
+@router.post("/metrics")
+async def agent_metrics(
+    body: DNSMetricReport,
+    db: DB,
+    auth: tuple[DNSServer, dict[str, Any]] = Depends(_auth_agent),
+) -> dict[str, str]:
+    """Ingest one sample row from the agent's MetricsPoller thread.
+
+    Idempotent on ``(server_id, bucket_at)`` — if the agent retries a
+    POST after a transient failure it overwrites the prior row
+    rather than duplicating. Counters that arrive negative (e.g. a
+    buggy agent) are clamped to zero so the dashboard can't render
+    impossible dips.
+    """
+    server, _ = auth
+    values = {
+        "queries_total": max(0, body.queries_total),
+        "noerror": max(0, body.noerror),
+        "nxdomain": max(0, body.nxdomain),
+        "servfail": max(0, body.servfail),
+        "recursion": max(0, body.recursion),
+    }
+    existing = await db.get(DNSMetricSample, (server.id, body.bucket_at))
+    if existing is None:
+        db.add(DNSMetricSample(server_id=server.id, bucket_at=body.bucket_at, **values))
+    else:
+        for k, v in values.items():
+            setattr(existing, k, v)
+    await db.commit()
+    return {"status": "ok"}

@@ -9,6 +9,86 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versioning uses 
 
 ### Added
 
+- **DHCP MAC blocklist at the server-group level.** Block a MAC
+  address from getting a lease anywhere in the group. Covers both
+  Kea (rendered into Kea's reserved `DROP` client class via the
+  ConfigBundle → agent path, packets are silently dropped before
+  allocation) and Windows DHCP (`Add-DhcpServerv4Filter -List Deny`
+  pushed over WinRM by a 60 s Celery beat task that diffs desired
+  against the server's current deny-list). Group-global: one entry
+  blocks the MAC on every scope served by every member of the
+  group — no per-subnet pinning. Per-entry fields: `mac_address`,
+  `reason` (`rogue` / `lost_stolen` / `quarantine` / `policy` /
+  `other`), `description`, `enabled` (soft-disable without losing
+  history), `expires_at` (nullable; expired rows stay in the DB
+  but are stripped from the rendered config), `created_at` /
+  `created_by_user_id` / `updated_by_user_id` / `last_match_at` /
+  `match_count`. List reads enrich each row with the OUI vendor
+  name (via the existing `oui_vendor` table) and an IPAM cross-
+  reference (any `IPAddress` rows currently tied to the blocked
+  MAC, with IP + subnet + hostname). Admin UI under the DHCP server
+  → "MAC Blocks" tab with filter-as-you-type over MAC / vendor /
+  IP / hostname, reason pills, status pill, IPAM links, expiry
+  formatting, and a modal for add / edit. MACs accept the common
+  operator formats (colon, dash, dotted, bare hex) and canonicalize
+  to colon-lowercase server-side. CRUD endpoints: `GET/POST
+  /api/v1/dhcp/server-groups/{gid}/mac-blocks`, `PUT/DELETE
+  /api/v1/dhcp/mac-blocks/{id}`. Permission gate on
+  `dhcp_mac_block` (builtin "DHCP Editor" role gets it
+  automatically). Migration `d4a18b20e3c7_dhcp_mac_blocks`.
+  Covered by `backend/tests/test_dhcp_mac_blocks.py` (model,
+  bundle-filter on enabled + expiry, API round-trip, validation
+  rejections) and four new Kea-renderer cases in
+  `agent/dhcp/tests/test_render_kea.py` (DROP emission, empty
+  list skip, invalid-entry resilience, user-defined `DROP` not
+  clobbered). **Deferred follow-ups:** bulk import from CSV,
+  per-scope restriction (Kea supports class/pool pinning; Windows
+  doesn't), `last_match_at` wiring from Kea lease-event hooks +
+  Windows DHCP FilterNotifications event log.
+
+- **Multi-target audit forwarding + pluggable wire formats.** The
+  single-syslog + single-webhook slot on `PlatformSettings` is
+  replaced by a dedicated `audit_forward_target` table: one row per
+  destination with independent transport, format, and filter. Five
+  syslog output formats — `rfc5424_json` (current default),
+  `rfc5424_cef` (ArcSight), `rfc5424_leef` (QRadar), `rfc3164`
+  (legacy BSD), and `json_lines` (bare NDJSON for Logstash / Vector).
+  Three transports — UDP, TCP, **new TLS** (with optional per-target
+  PEM CA bundle). Per-target filters `min_severity` and
+  `resource_types` cut noisy events before they leave the box.
+  Admin UI under Settings → Audit Event Forwarding gains an
+  add / edit / delete table plus a **Test** button that sends a
+  synthetic event to the target so operators get instant feedback on
+  a new collector. Migration seeds one row per previously configured
+  flat target so existing deployments keep forwarding through the
+  upgrade; the flat columns remain as a fallback for one release.
+  Admin-only endpoints: `GET /POST /PUT /DELETE
+  /api/v1/settings/audit-forward-targets{/id}` and `POST
+  /api/v1/settings/audit-forward-targets/{id}/test`. Migration
+  `c7e2f5a91d48_audit_forward_targets`. Covered by 17 new tests in
+  `backend/tests/test_audit_forward.py`.
+
+- **Built-in DNS query rate + DHCP traffic charts on the dashboard.**
+  Two new time-series cards under the activity row. BIND9 agents
+  emit per-60s-bucket deltas of `QUERY` / `QryAuthAns` /
+  `QryNoauthAns` / `QryNXDOMAIN` / `QrySERVFAIL` / `QryRecursion`
+  pulled from `statistics-channels` XMLv3 on `127.0.0.1:8053`
+  (injected into the rendered `named.conf`). Kea agents emit
+  deltas of `pkt4-{discover,offer,request,ack,nak,decline,release,
+  inform}-{received,sent}` pulled from `statistic-get-all` over
+  the existing control socket. Counter resets from a daemon
+  restart are detected agent-side and drop one bucket rather than
+  emitting a spurious spike. Control plane stores samples in two
+  small tables — `dns_metric_sample` + `dhcp_metric_sample` —
+  keyed on `(server_id, bucket_at)`. Dashboard reads via
+  `GET /api/v1/metrics/{dns,dhcp}/timeseries?window={1h|6h|24h|7d}`
+  with server-side `date_bin` downsampling (60 s buckets for ≤24 h,
+  5 min for 7 d). Nightly `prune_metric_samples` Celery task
+  enforces retention (default 7 days). New `recharts` dep on the
+  frontend. Windows DNS/DHCP drivers don't report yet — the card
+  shows an empty state explaining where data comes from.
+  Migration `bd4f2a91c7e3_metric_samples`.
+
 - **ACME DNS-01 provider — external-client flow.** New
   `/api/v1/acme/` surface implementing the
   [acme-dns](https://github.com/joohoi/acme-dns) protocol so

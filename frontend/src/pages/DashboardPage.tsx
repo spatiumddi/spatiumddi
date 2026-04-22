@@ -1,4 +1,4 @@
-import { useQuery, useQueries } from "@tanstack/react-query";
+import { useQuery, useQueries, useQueryClient } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
 import {
   Activity,
@@ -10,6 +10,7 @@ import {
   Globe2,
   Layers,
   Network,
+  RefreshCw,
   Server,
   Shield,
 } from "lucide-react";
@@ -26,6 +27,7 @@ import {
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { includeInUtilization } from "@/lib/utilization";
+import { DHCPTrafficCard, DNSQueryRateCard } from "@/components/MetricsCharts";
 
 /**
  * Dashboard — the home page.
@@ -42,10 +44,10 @@ import { includeInUtilization } from "@/lib/utilization";
  *      Activity feed (right, audit-log-driven, auto-refreshing).
  *   5. Services panel — all DNS + DHCP servers with status dots.
  *
- * Deliberately *not* included: time-series sparklines / trends / lease
- * rate / DNS query rate. Those require historical snapshots which we
- * don't collect yet. When they land, the six KPI cards gain a chart
- * strip at the bottom without needing layout changes.
+ * Two time-series cards under the activity row render DNS query rate
+ * (BIND9 statistics-channels) and DHCP traffic (Kea statistic-get-all)
+ * from the per-server `metric_sample` tables — empty when no agent
+ * has reported yet.
  */
 
 // ── Small building blocks ───────────────────────────────────────────────────
@@ -304,6 +306,7 @@ function humanTime(ts: string): string {
 // ── Page ────────────────────────────────────────────────────────────────────
 
 export function DashboardPage() {
+  const qc = useQueryClient();
   // IPAM
   const { data: spaces } = useQuery({
     queryKey: ["spaces"],
@@ -461,6 +464,30 @@ export function DashboardPage() {
                 {alertCount} alert{alertCount === 1 ? "" : "s"} open
               </Link>
             )}
+            <button
+              type="button"
+              onClick={() => {
+                for (const key of [
+                  ["spaces"],
+                  ["subnets"],
+                  ["settings"],
+                  ["dns-groups"],
+                  ["dns-zones"],
+                  ["dns-servers"],
+                  ["dhcp-servers"],
+                  ["dhcp-groups"],
+                  ["audit", "recent"],
+                  ["metrics"],
+                ]) {
+                  qc.invalidateQueries({ queryKey: key });
+                }
+              }}
+              title="Reload every panel on the dashboard — IPAM, DNS, DHCP, activity feed, metrics charts."
+              className="inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs font-medium hover:bg-accent"
+            >
+              <RefreshCw className="h-3.5 w-3.5" />
+              Refresh
+            </button>
           </div>
         </div>
 
@@ -542,7 +569,13 @@ export function DashboardPage() {
           />
         </div>
 
-        {/* ── Heatmap (hero) ─────────────────────────────────────────── */}
+        {/* ── DNS query rate + DHCP traffic (hoisted: signal-dense, operator-favorite) ─ */}
+        <div className="grid gap-5 lg:grid-cols-2">
+          <DNSQueryRateCard dnsServers={allDnsServers} />
+          <DHCPTrafficCard dhcpServers={dhcpServers} />
+        </div>
+
+        {/* ── Heatmap ────────────────────────────────────────────────── */}
         <SubnetHeatmap subnets={reporting} />
 
         {/* ── Top subnets + Live activity ────────────────────────────── */}

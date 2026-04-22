@@ -202,3 +202,78 @@ def test_render_wire_shape_subnet_id_is_stable() -> None:
     out1 = render(bundle)
     out2 = render(bundle)
     assert out1["Dhcp4"]["subnet4"][0]["id"] == out2["Dhcp4"]["subnet4"][0]["id"]
+
+
+# ── MAC blocklist → Kea DROP class ─────────────────────────────────
+
+
+def test_mac_blocks_render_as_drop_class() -> None:
+    """The wire carries ``mac_blocks``; the renderer must fold them into
+    the reserved ``DROP`` client class as an OR-ed ``hexstring(pkt4.mac,
+    ':')`` expression. That's the Kea-recommended way to drop a packet
+    pre-allocation."""
+    bundle = {
+        "server": {"name": "t", "interfaces": ["eth0"]},
+        "subnets": [{"id": 1, "subnet": "192.0.2.0/24", "pools": []}],
+        "mac_blocks": [
+            {"mac_address": "aa:bb:cc:dd:ee:ff", "reason": "rogue", "description": ""},
+            {"mac_address": "11:22:33:44:55:66", "reason": "policy", "description": ""},
+        ],
+    }
+    out = render(bundle)
+    classes = out["Dhcp4"]["client-classes"]
+    drop = [c for c in classes if c["name"] == "DROP"]
+    assert len(drop) == 1, f"expected one DROP class, got {classes}"
+    test_expr = drop[0]["test"]
+    assert "aa:bb:cc:dd:ee:ff" in test_expr
+    assert "11:22:33:44:55:66" in test_expr
+    assert " or " in test_expr
+    assert "hexstring(pkt4.mac, ':')" in test_expr
+
+
+def test_no_drop_class_when_blocklist_empty() -> None:
+    """An empty blocklist must not leak an empty DROP expression into
+    Kea — that'd parse as "always false" but noise the config."""
+    bundle = {
+        "server": {"name": "t", "interfaces": ["eth0"]},
+        "subnets": [{"id": 1, "subnet": "192.0.2.0/24", "pools": []}],
+        "mac_blocks": [],
+    }
+    out = render(bundle)
+    classes = out["Dhcp4"].get("client-classes", [])
+    assert not any(c["name"] == "DROP" for c in classes)
+
+
+def test_mac_blocklist_skips_invalid_entries() -> None:
+    """A single malformed MAC shouldn't break rendering for the rest."""
+    bundle = {
+        "server": {"name": "t", "interfaces": ["eth0"]},
+        "subnets": [{"id": 1, "subnet": "192.0.2.0/24", "pools": []}],
+        "mac_blocks": [
+            {"mac_address": "totally not a mac", "reason": "other", "description": ""},
+            {"mac_address": "aa:bb:cc:dd:ee:ff", "reason": "rogue", "description": ""},
+        ],
+    }
+    out = render(bundle)
+    drop = next(c for c in out["Dhcp4"]["client-classes"] if c["name"] == "DROP")
+    assert "aa:bb:cc:dd:ee:ff" in drop["test"]
+    assert "totally" not in drop["test"]
+
+
+def test_user_drop_class_not_clobbered() -> None:
+    """If an operator manually defined a ``DROP`` client class, the
+    renderer must not overwrite it with the blocklist-generated one."""
+    bundle = {
+        "server": {"name": "t", "interfaces": ["eth0"]},
+        "subnets": [{"id": 1, "subnet": "192.0.2.0/24", "pools": []}],
+        "client_classes": [{"name": "DROP", "match_expression": "option[60].hex == 'bad'"}],
+        "mac_blocks": [
+            {"mac_address": "aa:bb:cc:dd:ee:ff", "reason": "rogue", "description": ""}
+        ],
+    }
+    out = render(bundle)
+    drops = [c for c in out["Dhcp4"]["client-classes"] if c["name"] == "DROP"]
+    assert len(drops) == 1
+    # The user's test expression wins; the blocklist is silently skipped.
+    assert "option[60]" in drops[0]["test"]
+    assert "aa:bb:cc:dd:ee:ff" not in drops[0]["test"]

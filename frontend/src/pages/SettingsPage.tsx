@@ -19,6 +19,7 @@ import {
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
+import { AuditForwardTargets } from "@/components/AuditForwardTargets";
 
 const OUI_SOURCE_URL = "https://standards-oui.ieee.org/oui/oui.csv";
 
@@ -143,16 +144,12 @@ const SECTION_FIELDS: Record<SectionId, (keyof PlatformSettings)[]> = {
     "dhcp_pull_leases_enabled",
     "dhcp_pull_leases_interval_seconds",
   ],
-  "audit-forward": [
-    "audit_forward_syslog_enabled",
-    "audit_forward_syslog_host",
-    "audit_forward_syslog_port",
-    "audit_forward_syslog_protocol",
-    "audit_forward_syslog_facility",
-    "audit_forward_webhook_enabled",
-    "audit_forward_webhook_url",
-    "audit_forward_webhook_auth_header",
-  ],
+  // Managed through the dedicated AuditForwardTargets component, not
+  // the flat settings form. Legacy flat columns stay on
+  // PlatformSettings for one release as a fallback (see audit_forward
+  // service); they're intentionally not listed here so the singleton
+  // Save button doesn't hit them.
+  "audit-forward": [],
   "ip-allocation": ["ip_allocation_strategy"],
   "oui-lookup": ["oui_lookup_enabled", "oui_update_interval_hours"],
   session: ["session_timeout_minutes", "auto_logout_minutes"],
@@ -501,7 +498,7 @@ const SECTIONS: SectionDef[] = [
     title: "Audit Event Forwarding",
     group: "Security",
     description:
-      "Ship every AuditLog commit to external systems — RFC 5424 syslog and/or a generic HTTP webhook. Both are independent and fire-and-forget: delivery failures never block the audit write.",
+      "Multi-target forwarding for AuditLog events. Add syslog (UDP/TCP/TLS with RFC 5424 JSON, CEF, LEEF, RFC 3164, or raw JSON-lines) or HTTP webhook targets; each filters independently and a dead collector never blocks the audit write.",
     keywords: [
       "syslog",
       "siem",
@@ -511,6 +508,11 @@ const SECTIONS: SectionDef[] = [
       "splunk",
       "elastic",
       "graylog",
+      "arcsight",
+      "qradar",
+      "cef",
+      "leef",
+      "tls",
       "log",
       "export",
     ],
@@ -1173,182 +1175,7 @@ export function SettingsPage() {
             )}
 
             {activeId === "audit-forward" && (
-              <>
-                <div className="rounded-md border bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
-                  Delivery is fire-and-forget. Syslog over UDP silently drops on
-                  network error; TCP / webhook errors are logged via structlog
-                  and surface in the Logs view. Audit writes never block on
-                  forwarding.
-                </div>
-
-                {/* ── Syslog ── */}
-                <div className="pt-1">
-                  <h4 className="mb-2 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-                    Syslog (RFC 5424)
-                  </h4>
-                  <div className="space-y-3">
-                    <Field
-                      label="Enable Syslog Forwarding"
-                      description="Ship each AuditLog row as one RFC 5424 line. MSG body is compact JSON — SIEMs like Splunk / Elastic / Graylog parse it automatically."
-                    >
-                      <Toggle
-                        checked={!!values.audit_forward_syslog_enabled}
-                        onChange={(v) => set("audit_forward_syslog_enabled", v)}
-                        disabled={!isSuperadmin}
-                      />
-                    </Field>
-                    <div className="grid grid-cols-2 gap-3">
-                      <Field label="Host">
-                        <input
-                          type="text"
-                          value={values.audit_forward_syslog_host ?? ""}
-                          onChange={(e) =>
-                            set("audit_forward_syslog_host", e.target.value)
-                          }
-                          disabled={
-                            !isSuperadmin ||
-                            !values.audit_forward_syslog_enabled
-                          }
-                          placeholder="syslog.example.com"
-                          className={inputCls}
-                        />
-                      </Field>
-                      <Field label="Port">
-                        <input
-                          type="number"
-                          min={1}
-                          max={65535}
-                          value={values.audit_forward_syslog_port ?? 514}
-                          onChange={(e) =>
-                            set(
-                              "audit_forward_syslog_port",
-                              Number(e.target.value),
-                            )
-                          }
-                          disabled={
-                            !isSuperadmin ||
-                            !values.audit_forward_syslog_enabled
-                          }
-                          className={inputCls}
-                        />
-                      </Field>
-                    </div>
-                    <div className="grid grid-cols-2 gap-3">
-                      <Field
-                        label="Protocol"
-                        description="UDP is fire-and-forget (may drop); TCP blocks briefly on connect but is reliable."
-                      >
-                        <select
-                          value={values.audit_forward_syslog_protocol ?? "udp"}
-                          onChange={(e) =>
-                            set("audit_forward_syslog_protocol", e.target.value)
-                          }
-                          disabled={
-                            !isSuperadmin ||
-                            !values.audit_forward_syslog_enabled
-                          }
-                          className={inputCls}
-                        >
-                          <option value="udp">UDP</option>
-                          <option value="tcp">TCP</option>
-                        </select>
-                      </Field>
-                      <Field
-                        label="Facility"
-                        description="RFC 5424 §6.2.1. local0 (16) is typical for app audit."
-                      >
-                        <select
-                          value={values.audit_forward_syslog_facility ?? 16}
-                          onChange={(e) =>
-                            set(
-                              "audit_forward_syslog_facility",
-                              Number(e.target.value),
-                            )
-                          }
-                          disabled={
-                            !isSuperadmin ||
-                            !values.audit_forward_syslog_enabled
-                          }
-                          className={inputCls}
-                        >
-                          <option value={1}>user (1)</option>
-                          <option value={4}>auth (4)</option>
-                          <option value={10}>authpriv (10)</option>
-                          <option value={13}>log_audit (13)</option>
-                          <option value={16}>local0 (16)</option>
-                          <option value={17}>local1 (17)</option>
-                          <option value={18}>local2 (18)</option>
-                          <option value={19}>local3 (19)</option>
-                          <option value={20}>local4 (20)</option>
-                          <option value={21}>local5 (21)</option>
-                          <option value={22}>local6 (22)</option>
-                          <option value={23}>local7 (23)</option>
-                        </select>
-                      </Field>
-                    </div>
-                  </div>
-                </div>
-
-                {/* ── Webhook ── */}
-                <div className="pt-2">
-                  <h4 className="mb-2 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-                    HTTP Webhook
-                  </h4>
-                  <div className="space-y-3">
-                    <Field
-                      label="Enable Webhook Forwarding"
-                      description="POST each AuditLog row as JSON to the configured URL."
-                    >
-                      <Toggle
-                        checked={!!values.audit_forward_webhook_enabled}
-                        onChange={(v) =>
-                          set("audit_forward_webhook_enabled", v)
-                        }
-                        disabled={!isSuperadmin}
-                      />
-                    </Field>
-                    <Field
-                      label="URL"
-                      description="Full HTTPS endpoint. Non-2xx responses are logged but don't retry — use a reverse proxy for replay guarantees if you need them."
-                    >
-                      <input
-                        type="text"
-                        value={values.audit_forward_webhook_url ?? ""}
-                        onChange={(e) =>
-                          set("audit_forward_webhook_url", e.target.value)
-                        }
-                        disabled={
-                          !isSuperadmin || !values.audit_forward_webhook_enabled
-                        }
-                        placeholder="https://collector.example.com/ingest"
-                        className={inputCls}
-                      />
-                    </Field>
-                    <Field
-                      label="Authorization Header (optional)"
-                      description={
-                        'Sent verbatim as the "Authorization" header. Include the scheme, e.g. "Bearer …" or "Basic …".'
-                      }
-                    >
-                      <input
-                        type="text"
-                        value={values.audit_forward_webhook_auth_header ?? ""}
-                        onChange={(e) =>
-                          set(
-                            "audit_forward_webhook_auth_header",
-                            e.target.value,
-                          )
-                        }
-                        disabled={
-                          !isSuperadmin || !values.audit_forward_webhook_enabled
-                        }
-                        placeholder="Bearer …"
-                        className={inputCls}
-                      />
-                    </Field>
-                  </div>
-                </div>
-              </>
+              <AuditForwardTargets isSuperadmin={!!isSuperadmin} />
             )}
 
             {activeId === "dhcp" && (

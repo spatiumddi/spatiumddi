@@ -59,6 +59,7 @@ from app.drivers.dhcp.base import (
     DHCPDriver,
     ExclusionItem,
     ExclusionResult,
+    MACBlockDef,
     RemoveReservationItem,
     ReservationItem,
     ReservationResult,
@@ -488,6 +489,88 @@ Remove-DhcpServerv4ExclusionRange -ScopeId {_ps_literal(scope_id)} `
             result_ctor=lambda ok, item, error: ExclusionResult(ok=ok, item=item, error=error),
             chunk_log="dhcp_apply_exclusions_batch",
         )
+
+    # ── MAC blocklist (deny filter) ───────────────────────────────────
+
+    async def sync_mac_blocks(
+        self, server: Any, *, desired: Sequence[MACBlockDef]
+    ) -> tuple[int, int]:
+        """Reconcile this server's Windows DHCP deny filter list.
+
+        Pulls the current deny-list via ``Get-DhcpServerv4Filter -List
+        Deny``, diffs against ``desired``, and issues one batched PS
+        script that adds missing entries and removes extras. Filters are
+        server-global on Windows — this one PS script covers every scope.
+
+        Returns ``(added, removed)``. Whole-batch errors raise so the
+        caller can surface the failure in audit + health rather than
+        silently drift.
+        """
+        creds = _load_credentials(server)
+
+        # Windows wants dash-separated MACs (``AA-BB-CC-DD-EE-FF``) on
+        # both write and read. We canonicalize inputs to that form and
+        # keep a mapping back to the original (colon-separated) so the
+        # audit log references the shape operators typed.
+        dash_by_colon: dict[str, str] = {}
+        desired_set: set[str] = set()
+        desc_by_dash: dict[str, str] = {}
+        for mb in desired:
+            colon = mb.mac_address.lower()
+            dash = colon.replace(":", "-").upper()
+            desired_set.add(dash)
+            dash_by_colon[colon] = dash
+            desc_by_dash[dash] = mb.description or mb.reason or ""
+
+        existing_raw = await asyncio.to_thread(
+            _run_ps,
+            server,
+            creds,
+            "Get-DhcpServerv4Filter -List Deny | "
+            "Select-Object @{N='mac';E={$_.MacAddress}}, Description | "
+            "ConvertTo-Json -Compress",
+        )
+        existing_set: set[str] = set()
+        text = (existing_raw or "").strip()
+        if text:
+            parsed = json.loads(text)
+            rows = parsed if isinstance(parsed, list) else [parsed]
+            for row in rows:
+                mac = str(row.get("mac", "")).upper()
+                if mac:
+                    existing_set.add(mac)
+
+        to_add = sorted(desired_set - existing_set)
+        to_remove = sorted(existing_set - desired_set)
+        if not to_add and not to_remove:
+            return (0, 0)
+
+        # One round trip for both adds and removes. ``-ErrorAction
+        # SilentlyContinue`` on each swallows the "already exists" /
+        # "not found" races that naturally occur when multiple agents
+        # converge on the same state.
+        lines: list[str] = ["$ErrorActionPreference = 'Continue'"]
+        for mac in to_add:
+            desc = desc_by_dash.get(mac, "")
+            lines.append(
+                f"Add-DhcpServerv4Filter -List Deny -MacAddress {_ps_literal(mac)} "
+                f"-Description {_ps_literal(desc)} -ErrorAction SilentlyContinue"
+            )
+        for mac in to_remove:
+            lines.append(
+                f"Remove-DhcpServerv4Filter -List Deny -MacAddress {_ps_literal(mac)} "
+                "-ErrorAction SilentlyContinue"
+            )
+        lines.append('"OK"')
+        await asyncio.to_thread(_run_ps, server, creds, "\n".join(lines))
+
+        logger.info(
+            "dhcp_mac_blocks_sync",
+            server=str(getattr(server, "id", "")),
+            added=len(to_add),
+            removed=len(to_remove),
+        )
+        return (len(to_add), len(to_remove))
 
     # ── reads ──────────────────────────────────────────────────────────
     # (health_check continues below.)

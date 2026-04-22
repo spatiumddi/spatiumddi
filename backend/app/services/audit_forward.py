@@ -1,26 +1,36 @@
 """External forwarding for audit-log events.
 
 Subscribes to the SQLAlchemy ``after_commit`` lifecycle on every async
-session and, for each successfully committed ``AuditLog`` row, fires
-the configured delivery channels (RFC 5424 syslog and / or HTTP
-webhook) as a background ``asyncio`` task.
+session and, for each successfully committed ``AuditLog`` row, fans
+the event out to every enabled ``AuditForwardTarget`` using that
+target's configured output format and transport.
+
+Supported output formats (syslog kind):
+
+* ``rfc5424_json``  RFC 5424 envelope, JSON body. Default — most
+  modern SIEMs (Splunk, Elastic, Graylog) auto-parse embedded JSON.
+* ``rfc5424_cef``   RFC 5424 envelope, CEF 0 body. ArcSight + many
+  commercial SIEMs.
+* ``rfc5424_leef``  RFC 5424 envelope, LEEF 2.0 body. IBM QRadar.
+* ``rfc3164``       Legacy BSD syslog — short PRI + timestamp + host
+  + tag. For collectors that don't speak 5424.
+* ``json_lines``    No syslog wrapper, just one JSON object per line.
+  For raw TCP/UDP inputs on Logstash / Fluentd / Vector.
+
+Webhook targets always deliver compact JSON (the HTTP body); the
+``format`` column is ignored for ``kind="webhook"``.
 
 Design notes:
 
 * **Never blocks the commit.** The hook collects audit rows inside
   ``after_flush`` while they still have IDs, then schedules delivery
-  in ``after_commit`` via ``asyncio.create_task`` — audit writes are
-  the control-plane hot path and must stay fast even when the
-  collector is unreachable.
-* **Settings snapshot.** Each delivery pass reads ``PlatformSettings``
-  row 1 through a short-lived session so cadence / target changes
-  from the UI take effect immediately without a worker restart.
-* **Single instance per process.** The listener is registered exactly
-  once at import time. Multiple uvicorn workers each install their
-  own copy — that's fine because each writes from its own sessions.
-* **Delivery is best-effort.** Syslog over UDP can drop without
-  notice, which is the RFC contract; TCP errors + webhook non-2xx
-  are logged via structlog and otherwise swallowed.
+  in ``after_commit`` via ``asyncio.create_task``.
+* **One task per target per row.** A dead collector isolates to its
+  own target; others still see the event.
+* **Legacy flat-config fallback.** When no ``AuditForwardTarget``
+  rows exist (fresh install + operator hasn't migrated), we still
+  read the flat ``audit_forward_*`` columns on ``PlatformSettings``
+  so existing deployments keep working through the upgrade.
 
 See ``docs/OBSERVABILITY.md`` for the operator-facing view.
 """
@@ -30,16 +40,18 @@ from __future__ import annotations
 import asyncio
 import json
 import socket
+import ssl
 from datetime import UTC, datetime
-from typing import Any, cast
+from typing import Any
 
 import httpx
 import structlog
-from sqlalchemy import event
+from sqlalchemy import event, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import AsyncSessionLocal
 from app.models.audit import AuditLog
+from app.models.audit_forward import AuditForwardTarget
 from app.models.settings import PlatformSettings
 
 logger = structlog.get_logger(__name__)
@@ -56,27 +68,23 @@ _MSG_ID = "AUDIT"
 
 _SINGLETON_ID = 1
 
-# The session attribute we stash pending audit rows on between
-# ``after_flush`` and ``after_commit``. Using a dunder-prefixed name so
-# it's clearly ours and won't collide with application code.
 _PENDING_ATTR = "__spatium_audit_forward_pending__"
+
+# min_severity filter — higher rank means more severe. Keeps the
+# filter logic a single numeric compare.
+_SEVERITY_RANK = {
+    "info": 0,
+    "warn": 1,
+    "error": 2,
+    "denied": 3,
+}
 
 
 # ── Event payload ──────────────────────────────────────────────────────────
 
 
 def _serialize(row: AuditLog) -> dict[str, Any]:
-    """Neutral JSON shape sent to both syslog and webhook.
-
-    Kept deliberately small — collectors typically parse this into
-    structured fields for search / alerting. Fields that may be very
-    large (``old_value`` / ``new_value``) are passed through but we
-    trust operators to configure log rotation on the collector side.
-    """
-    # AuditLog uses ``timestamp`` (server-side default NOW()) rather than
-    # ``created_at`` — unlike most other models in the schema. Fall back to
-    # wall-clock ``now`` if the DB hasn't populated it yet (e.g. during
-    # tests that don't flush before emitting).
+    """Neutral JSON shape — consumed by every formatter + the webhook."""
     ts = getattr(row, "timestamp", None) or datetime.now(UTC)
     return {
         "id": str(row.id),
@@ -95,8 +103,8 @@ def _serialize(row: AuditLog) -> dict[str, Any]:
     }
 
 
-def _severity_for(row: AuditLog) -> int:
-    r = (row.result or "").lower()
+def _severity_for_result(result: str | None) -> int:
+    r = (result or "").lower()
     if r == "denied":
         return _SEVERITY_DENIED
     if r in ("failed", "error"):
@@ -104,50 +112,221 @@ def _severity_for(row: AuditLog) -> int:
     return _SEVERITY_SUCCESS
 
 
+def _severity_bucket(result: str | None) -> str:
+    r = (result or "").lower()
+    if r == "denied":
+        return "denied"
+    if r in ("failed", "error"):
+        return "error"
+    return "info"
+
+
 def _hostname() -> str:
-    # Kept fresh on every call — containers often rotate hostnames on
-    # restart, and the cost is negligible.
     return socket.gethostname() or "spatiumddi"
 
 
-def _render_rfc5424(facility: int, row: AuditLog, payload: dict[str, Any]) -> str:
-    """Format one audit row as a single RFC 5424 syslog line.
+# ── Formatters ─────────────────────────────────────────────────────────────
 
-    Payload goes into the MSG body as compact JSON — most SIEMs
-    (Splunk, Elastic, Graylog) detect JSON in MSG automatically and
-    parse it out. STRUCTURED-DATA is set to ``-`` because we don't
-    have a registered PEN; operators who want structured sdata can
-    switch to the webhook.
-    """
-    severity = _severity_for(row)
+
+def _render_rfc5424_prefix(facility: int, severity: int, ts: str) -> str:
     pri = (facility << 3) | severity
-    ts_src = getattr(row, "timestamp", None) or datetime.now(UTC)
-    ts = ts_src.isoformat()
-    procid = "-"
-    return f"<{pri}>1 {ts} {_hostname()} {_APP_NAME} {procid} {_MSG_ID} - " + json.dumps(
-        payload, separators=(",", ":"), default=str
+    return f"<{pri}>1 {ts} {_hostname()} {_APP_NAME} - {_MSG_ID} -"
+
+
+def _render_rfc5424_json(facility: int, payload: dict[str, Any]) -> str:
+    severity = _severity_for_result(payload.get("result"))
+    prefix = _render_rfc5424_prefix(facility, severity, payload["timestamp"])
+    return prefix + " " + json.dumps(payload, separators=(",", ":"), default=str)
+
+
+def _cef_escape(s: Any) -> str:
+    """Escape a CEF extension value.
+
+    CEF reserves ``\\`` and ``=`` in extension values and ``|`` in the
+    header pipe-separated fields. Per the spec any value containing
+    those characters must be backslash-escaped.
+    """
+    v = "" if s is None else str(s)
+    return v.replace("\\", "\\\\").replace("=", "\\=").replace("\n", " ").replace("\r", " ")
+
+
+def _cef_header_escape(s: Any) -> str:
+    v = "" if s is None else str(s)
+    return v.replace("\\", "\\\\").replace("|", "\\|").replace("\n", " ")
+
+
+def _render_cef(payload: dict[str, Any]) -> str:
+    """ArcSight CEF 0 body.
+
+    Fixed header: ``CEF:0|Vendor|Product|Version|SignatureID|Name|Severity``
+    then key=value extension pairs. CEF severity is 0-10; we map our
+    three buckets to 3/6/9 for info/error/denied.
+    """
+    sev_map = {"info": 3, "error": 6, "denied": 9}
+    sev = sev_map[_severity_bucket(payload.get("result"))]
+    action = payload.get("action") or "audit"
+    resource_type = payload.get("resource_type") or ""
+    signature = f"{resource_type}:{action}" if resource_type else action
+    name = payload.get("resource_display") or signature
+
+    header = "|".join(
+        _cef_header_escape(x)
+        for x in [
+            "CEF:0",
+            "SpatiumDDI",
+            "SpatiumDDI",
+            "1.0",
+            signature,
+            name,
+            str(sev),
+        ]
     )
 
+    ext_fields: list[tuple[str, Any]] = [
+        ("act", payload.get("action")),
+        ("outcome", payload.get("result")),
+        ("suser", payload.get("user_display_name")),
+        ("duser", payload.get("resource_display")),
+        ("cs1Label", "resource_type"),
+        ("cs1", payload.get("resource_type")),
+        ("cs2Label", "resource_id"),
+        ("cs2", payload.get("resource_id")),
+        ("cs3Label", "auth_source"),
+        ("cs3", payload.get("auth_source")),
+        ("cs4Label", "changed_fields"),
+        ("cs4", ",".join(payload.get("changed_fields") or [])),
+        ("externalId", payload.get("id")),
+        ("rt", payload.get("timestamp")),
+    ]
+    ext = " ".join(f"{k}={_cef_escape(v)}" for k, v in ext_fields if v not in (None, ""))
+    return f"{header}|{ext}"
 
-# ── Delivery ───────────────────────────────────────────────────────────────
+
+def _render_rfc5424_cef(facility: int, payload: dict[str, Any]) -> str:
+    severity = _severity_for_result(payload.get("result"))
+    prefix = _render_rfc5424_prefix(facility, severity, payload["timestamp"])
+    return prefix + " " + _render_cef(payload)
 
 
-async def _send_syslog(host: str, port: int, protocol: str, message: str) -> None:
-    # We open a fresh connection per-event. A long-lived TCP connection
-    # would be more efficient but sharing state across asyncio tasks in
-    # the listener context is complicated and rarely worth it —
-    # collectors handle reconnect cheaply.
+def _leef_escape(s: Any) -> str:
+    v = "" if s is None else str(s)
+    # LEEF uses tab as the default delimiter between key=value pairs, so
+    # strip tabs from values. Backslash + = escape like CEF.
+    return v.replace("\\", "\\\\").replace("=", "\\=").replace("\t", " ").replace("\n", " ")
+
+
+def _render_leef(payload: dict[str, Any]) -> str:
+    """IBM QRadar LEEF 2.0 body.
+
+    ``LEEF:2.0|Vendor|Product|Version|EventID|DelimiterChar|key=val<delim>…``
+    We use ``^`` as the delimiter (DelimiterChar hex ``5e``) because tab
+    gets mangled over UDP on some relays.
+    """
+    action = payload.get("action") or "audit"
+    resource_type = payload.get("resource_type") or ""
+    event_id = f"{resource_type}:{action}" if resource_type else action
+
+    header = "|".join(
+        _leef_escape(x) for x in ["LEEF:2.0", "SpatiumDDI", "SpatiumDDI", "1.0", event_id, "^"]
+    )
+
+    fields: list[tuple[str, Any]] = [
+        ("devTime", payload.get("timestamp")),
+        ("devTimeFormat", "yyyy-MM-dd'T'HH:mm:ss.SSSXXX"),
+        ("act", payload.get("action")),
+        ("outcome", payload.get("result")),
+        ("usrName", payload.get("user_display_name")),
+        ("userId", payload.get("user_id")),
+        ("resourceType", payload.get("resource_type")),
+        ("resourceId", payload.get("resource_id")),
+        ("resource", payload.get("resource_display")),
+        ("authSource", payload.get("auth_source")),
+        ("changedFields", ",".join(payload.get("changed_fields") or [])),
+        ("externalId", payload.get("id")),
+    ]
+    body = "^".join(f"{k}={_leef_escape(v)}" for k, v in fields if v not in (None, ""))
+    return f"{header}|{body}"
+
+
+def _render_rfc5424_leef(facility: int, payload: dict[str, Any]) -> str:
+    severity = _severity_for_result(payload.get("result"))
+    prefix = _render_rfc5424_prefix(facility, severity, payload["timestamp"])
+    return prefix + " " + _render_leef(payload)
+
+
+def _render_rfc3164(facility: int, payload: dict[str, Any]) -> str:
+    """Legacy BSD syslog per RFC 3164.
+
+    ``<PRI>Mmm dd HH:MM:SS host tag: msg``. Month/day/time are in the
+    local system's convention — no year, no timezone. Body is compact
+    JSON (keeps parsing simple for legacy collectors that index via
+    regex).
+    """
+    severity = _severity_for_result(payload.get("result"))
+    pri = (facility << 3) | severity
+    try:
+        ts = datetime.fromisoformat(payload["timestamp"])
+    except (KeyError, ValueError, TypeError):
+        ts = datetime.now(UTC)
+    # RFC 3164: single-digit days get a leading space, not zero.
+    day = f"{ts.day:>2}"
+    stamp = ts.strftime(f"%b {day} %H:%M:%S")
+    body = json.dumps(payload, separators=(",", ":"), default=str)
+    return f"<{pri}>{stamp} {_hostname()} {_APP_NAME}: {body}"
+
+
+def _render_json_lines(payload: dict[str, Any]) -> str:
+    """Bare JSON — no syslog framing. For raw TCP/UDP Logstash / Vector."""
+    return json.dumps(payload, separators=(",", ":"), default=str)
+
+
+_FORMATTERS = {
+    "rfc5424_json": _render_rfc5424_json,
+    "rfc5424_cef": _render_rfc5424_cef,
+    "rfc5424_leef": _render_rfc5424_leef,
+    "rfc3164": _render_rfc3164,
+    # json_lines takes no facility — adapter below.
+}
+
+
+def render_for_target(fmt: str, facility: int, payload: dict[str, Any]) -> str:
+    if fmt == "json_lines":
+        return _render_json_lines(payload)
+    formatter = _FORMATTERS.get(fmt)
+    if formatter is None:
+        formatter = _FORMATTERS["rfc5424_json"]
+    return formatter(facility, payload)
+
+
+# Legacy single-format helper — kept so alerts.py doesn't break mid-refactor.
+def _render_rfc5424(facility: int, row: Any, payload: dict[str, Any]) -> str:
+    return _render_rfc5424_json(facility, payload)
+
+
+# ── Transport ──────────────────────────────────────────────────────────────
+
+
+async def _send_syslog(
+    host: str,
+    port: int,
+    protocol: str,
+    message: str,
+    ca_cert_pem: str | None = None,
+) -> None:
     if protocol == "udp":
-        # ``socket.sendto`` is synchronous but fire-and-forget against
-        # a local / LAN collector — no kernel backpressure to speak of.
-        # Wrapping in ``to_thread`` is overkill here; one syscall.
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
             sock.sendto((message + "\n").encode("utf-8"), (host, port))
         return
-    # TCP path — uses asyncio streams to avoid blocking the event loop
-    # if the collector is slow / tarpitted.
+
+    ssl_ctx: ssl.SSLContext | None = None
+    if protocol == "tls":
+        if ca_cert_pem:
+            ssl_ctx = ssl.create_default_context(cadata=ca_cert_pem)
+        else:
+            ssl_ctx = ssl.create_default_context()
+
     reader, writer = await asyncio.wait_for(
-        asyncio.open_connection(host, port),
+        asyncio.open_connection(host, port, ssl=ssl_ctx),
         timeout=5.0,
     )
     try:
@@ -159,7 +338,6 @@ async def _send_syslog(host: str, port: int, protocol: str, message: str) -> Non
             await writer.wait_closed()
         except Exception:  # noqa: BLE001
             pass
-        # ``reader`` is closed via ``writer`` — explicit drain above.
         del reader
 
 
@@ -169,10 +347,6 @@ async def _send_webhook(url: str, auth_header: str, payload: dict[str, Any]) -> 
         headers["Authorization"] = auth_header
     async with httpx.AsyncClient(timeout=5.0) as client:
         resp = await client.post(url, json=payload, headers=headers)
-        # Non-2xx is logged but never raised — the audit commit is
-        # already done; retrying here would only add complexity. A
-        # future "dead letter" table could capture these if it becomes
-        # a real operational need.
         if resp.status_code >= 300:
             logger.warning(
                 "audit_forward_webhook_non2xx",
@@ -181,80 +355,133 @@ async def _send_webhook(url: str, auth_header: str, payload: dict[str, Any]) -> 
             )
 
 
+# ── Per-target delivery ────────────────────────────────────────────────────
+
+
+def _target_accepts(target: dict[str, Any], payload: dict[str, Any]) -> bool:
+    """Filter gate: honour min_severity + resource_types on the target."""
+    ms = target.get("min_severity")
+    if ms:
+        needed = _SEVERITY_RANK.get(ms.lower())
+        got = _SEVERITY_RANK.get(_severity_bucket(payload.get("result")))
+        if needed is not None and got is not None and got < needed:
+            return False
+    rtypes = target.get("resource_types") or []
+    if rtypes and payload.get("resource_type") not in rtypes:
+        return False
+    return True
+
+
+async def _deliver_to_target(target: dict[str, Any], payload: dict[str, Any]) -> None:
+    if not _target_accepts(target, payload):
+        return
+    kind = target.get("kind")
+    try:
+        if kind == "syslog":
+            message = render_for_target(
+                target.get("format", "rfc5424_json"),
+                int(target.get("facility", 16)),
+                payload,
+            )
+            await _send_syslog(
+                target["host"],
+                int(target["port"]),
+                target.get("protocol", "udp"),
+                message,
+                ca_cert_pem=target.get("ca_cert_pem"),
+            )
+        elif kind == "webhook":
+            await _send_webhook(
+                target["url"],
+                target.get("auth_header") or "",
+                payload,
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "audit_forward_target_failed",
+            target=target.get("name"),
+            kind=kind,
+            error=str(exc),
+        )
+
+
+# ── Legacy deliver helper (alerts.py still calls _deliver_one indirectly) ──
+
+
 async def _deliver_one(
     payload: dict[str, Any],
-    row_summary: dict[str, Any],
+    row_summary: dict[str, Any],  # noqa: ARG001 — retained for call compat
     syslog_cfg: dict[str, Any] | None,
     webhook_cfg: dict[str, Any] | None,
 ) -> None:
-    """Deliver one audit row to all configured channels.
-
-    Runs inside ``asyncio.create_task`` so exceptions don't propagate
-    back into the caller's commit path. Each channel's failure is
-    isolated — a dead syslog target shouldn't stop the webhook.
-    """
+    """Legacy path — shape-compatible with pre-multi-target callers."""
     if syslog_cfg is not None:
-        message = _render_rfc5424(
-            syslog_cfg["facility"],
-            cast(AuditLog, _StubRow(**row_summary)),
+        await _deliver_to_target(
+            {
+                "kind": "syslog",
+                "format": "rfc5424_json",
+                "host": syslog_cfg["host"],
+                "port": syslog_cfg["port"],
+                "protocol": syslog_cfg["protocol"],
+                "facility": syslog_cfg["facility"],
+            },
             payload,
         )
-        try:
-            await _send_syslog(
-                syslog_cfg["host"],
-                syslog_cfg["port"],
-                syslog_cfg["protocol"],
-                message,
-            )
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "audit_forward_syslog_failed",
-                host=syslog_cfg["host"],
-                port=syslog_cfg["port"],
-                protocol=syslog_cfg["protocol"],
-                error=str(exc),
-            )
-
     if webhook_cfg is not None:
-        try:
-            await _send_webhook(webhook_cfg["url"], webhook_cfg["auth_header"], payload)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "audit_forward_webhook_failed",
-                url=webhook_cfg["url"],
-                error=str(exc),
-            )
+        await _deliver_to_target(
+            {
+                "kind": "webhook",
+                "url": webhook_cfg["url"],
+                "auth_header": webhook_cfg.get("auth_header", ""),
+            },
+            payload,
+        )
 
 
-class _StubRow:
-    """Minimal duck-type of ``AuditLog`` for ``_render_rfc5424`` severity +
-    timestamp resolution after the ORM session is gone.
-
-    We can't re-use the detached ORM instance across the task boundary
-    (SQLAlchemy gets cranky about expired attributes on a closed
-    session), so we snapshot the fields we need into a plain object.
-    """
-
-    def __init__(self, result: str | None = None, timestamp: datetime | None = None) -> None:
-        self.result = result
-        self.timestamp = timestamp
-
-
-# ── Listener wiring ────────────────────────────────────────────────────────
+# ── Config loading ─────────────────────────────────────────────────────────
 
 
 async def _load_forward_config() -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-    """Read the current platform settings for forwarding.
+    """Back-compat shim: return *one* syslog + *one* webhook config dict.
 
-    Returns (syslog_cfg, webhook_cfg) — either can be ``None`` when
-    disabled or incompletely configured.
+    Used by alerts.py. Prefers the first enabled row of each kind from
+    ``audit_forward_target``; falls back to the flat settings columns
+    when the table is empty.
     """
+    async with AsyncSessionLocal() as session:
+        res = await session.execute(
+            select(AuditForwardTarget).where(AuditForwardTarget.enabled.is_(True))
+        )
+        rows = list(res.scalars().all())
+
+    syslog_cfg: dict[str, Any] | None = None
+    webhook_cfg: dict[str, Any] | None = None
+    for t in rows:
+        if syslog_cfg is None and t.kind == "syslog" and t.host:
+            syslog_cfg = {
+                "host": t.host,
+                "port": int(t.port or 514),
+                "protocol": t.protocol or "udp",
+                "facility": int(t.facility or 16),
+            }
+        elif webhook_cfg is None and t.kind == "webhook" and t.url:
+            webhook_cfg = {
+                "url": t.url,
+                "auth_header": t.auth_header or "",
+            }
+        if syslog_cfg is not None and webhook_cfg is not None:
+            break
+
+    if syslog_cfg is not None or webhook_cfg is not None:
+        return syslog_cfg, webhook_cfg
+
+    # No targets configured — fall back to legacy flat columns so a
+    # pre-multi-target deployment keeps forwarding after upgrade without
+    # the operator having to re-create the row.
     async with AsyncSessionLocal() as session:
         ps = await session.get(PlatformSettings, _SINGLETON_ID)
     if ps is None:
         return None, None
-
-    syslog_cfg: dict[str, Any] | None = None
     if (
         ps.audit_forward_syslog_enabled
         and ps.audit_forward_syslog_host
@@ -266,36 +493,100 @@ async def _load_forward_config() -> tuple[dict[str, Any] | None, dict[str, Any] 
             "protocol": ps.audit_forward_syslog_protocol or "udp",
             "facility": int(ps.audit_forward_syslog_facility),
         }
-
-    webhook_cfg: dict[str, Any] | None = None
     if ps.audit_forward_webhook_enabled and ps.audit_forward_webhook_url:
         webhook_cfg = {
             "url": ps.audit_forward_webhook_url,
             "auth_header": ps.audit_forward_webhook_auth_header or "",
         }
-
     return syslog_cfg, webhook_cfg
 
 
-async def _dispatch(rows: list[dict[str, Any]]) -> None:
-    syslog_cfg, webhook_cfg = await _load_forward_config()
-    if syslog_cfg is None and webhook_cfg is None:
-        return
-    # One task per row so slow collectors don't serialize the queue.
-    # Small batches typical — admin-triggered mutations are the usual
-    # source.
-    await asyncio.gather(
-        *[
-            _deliver_one(
-                r["payload"],
-                {"result": r["result"], "timestamp": r["timestamp"]},
-                syslog_cfg,
-                webhook_cfg,
+async def _load_targets() -> list[dict[str, Any]]:
+    """Return every enabled target as a dict. Includes a fallback from
+    the legacy flat settings when the targets table is empty, so existing
+    deployments keep forwarding across the upgrade boundary."""
+    async with AsyncSessionLocal() as session:
+        res = await session.execute(
+            select(AuditForwardTarget).where(AuditForwardTarget.enabled.is_(True))
+        )
+        rows = list(res.scalars().all())
+
+    out: list[dict[str, Any]] = []
+    for t in rows:
+        if t.kind == "syslog" and t.host:
+            out.append(
+                {
+                    "name": t.name,
+                    "kind": "syslog",
+                    "format": t.format,
+                    "host": t.host,
+                    "port": int(t.port),
+                    "protocol": t.protocol,
+                    "facility": int(t.facility),
+                    "ca_cert_pem": t.ca_cert_pem,
+                    "min_severity": t.min_severity,
+                    "resource_types": t.resource_types,
+                }
             )
-            for r in rows
-        ],
-        return_exceptions=True,
-    )
+        elif t.kind == "webhook" and t.url:
+            out.append(
+                {
+                    "name": t.name,
+                    "kind": "webhook",
+                    "url": t.url,
+                    "auth_header": t.auth_header or "",
+                    "min_severity": t.min_severity,
+                    "resource_types": t.resource_types,
+                }
+            )
+    if out:
+        return out
+
+    # Legacy flat-config fallback.
+    syslog_cfg, webhook_cfg = await _load_forward_config()
+    if syslog_cfg is not None:
+        out.append(
+            {
+                "name": "Legacy Syslog",
+                "kind": "syslog",
+                "format": "rfc5424_json",
+                **syslog_cfg,
+                "ca_cert_pem": None,
+                "min_severity": None,
+                "resource_types": None,
+            }
+        )
+    if webhook_cfg is not None:
+        out.append(
+            {
+                "name": "Legacy Webhook",
+                "kind": "webhook",
+                **webhook_cfg,
+                "min_severity": None,
+                "resource_types": None,
+            }
+        )
+    return out
+
+
+# ── Dispatch ───────────────────────────────────────────────────────────────
+
+
+async def _dispatch(rows: list[dict[str, Any]]) -> None:
+    targets = await _load_targets()
+    if not targets:
+        return
+
+    tasks: list[Any] = []
+    for r in rows:
+        payload = r["payload"]
+        for t in targets:
+            tasks.append(_deliver_to_target(t, payload))
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+# ── Listener wiring ────────────────────────────────────────────────────────
 
 
 def _register_session_listener() -> None:
@@ -307,8 +598,6 @@ def _register_session_listener() -> None:
 
     @event.listens_for(AsyncSession.sync_session_class, "after_flush")
     def _after_flush(session: Any, flush_context: Any) -> None:  # noqa: ARG001
-        # Collect new AuditLog rows *now* so we still have the committed
-        # values; walking session.new is only safe inside flush.
         new_audits = [obj for obj in session.new if isinstance(obj, AuditLog)]
         if not new_audits:
             return
@@ -328,25 +617,16 @@ def _register_session_listener() -> None:
         snapshots = getattr(session, _PENDING_ATTR, None)
         if not snapshots:
             return
-        # Clear before scheduling so an explicit re-flush in a unit-
-        # of-work pattern doesn't double-fire.
         setattr(session, _PENDING_ATTR, [])
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
-            # Rare path — a sync commit (e.g. during tests / migrations)
-            # runs outside an event loop. We drop the forward rather
-            # than try to bootstrap a loop mid-commit; the audit row
-            # still lands in the DB, which is what matters.
             logger.debug("audit_forward_no_loop_dropped", count=len(snapshots))
             return
-        # Fire-and-forget — never await; never block the commit.
         loop.create_task(_dispatch(snapshots))
 
     @event.listens_for(AsyncSession.sync_session_class, "after_rollback")
     def _after_rollback(session: Any) -> None:
-        # If the commit failed, drop the pending snapshots so a later
-        # successful commit on the same session doesn't replay them.
         if getattr(session, _PENDING_ATTR, None):
             setattr(session, _PENDING_ATTR, [])
 
@@ -354,4 +634,10 @@ def _register_session_listener() -> None:
 _register_session_listener()
 
 
-__all__: list[str] = []
+__all__: list[str] = [
+    "render_for_target",
+    "_send_syslog",
+    "_send_webhook",
+    "_deliver_to_target",
+    "_load_targets",
+]

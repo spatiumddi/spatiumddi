@@ -165,6 +165,42 @@ Classes are referenced by pool `class_restriction` field. The DHCP driver transl
 
 ---
 
+## 4a. DHCP MAC Blocklist
+
+A group-level deny list. Any MAC address listed here is dropped on every scope served by every member of the group — no leases, no response packets at all.
+
+```
+DHCPMACBlock
+  id, group_id             -- every member blocks every listed MAC
+  mac_address: MACADDR     -- unique per (group_id, mac_address)
+  reason: str              -- rogue | lost_stolen | quarantine | policy | other
+  description: str
+  enabled: bool            -- soft-disable toggle
+  expires_at: timestamptz  -- nullable; expired rows stay in DB, stripped from rendered config
+  created_at, created_by_user_id
+  updated_at, updated_by_user_id
+  last_match_at, match_count  -- telemetry (wiring deferred)
+```
+
+**How each driver enforces the block**
+
+| Driver | Enforcement | Update mechanism |
+|---|---|---|
+| Kea | Packets matching the reserved `DROP` client class are silently dropped before allocation. The agent renders active blocks as `hexstring(pkt4.mac, ':') == '…'` OR-clauses inside `DROP.test`. | ConfigBundle — blocklist changes shift the bundle ETag; agent long-poll picks them up and re-renders. |
+| Windows DHCP | Server-level deny filter list (`Add-DhcpServerv4Filter -List Deny`). Deny filter is server-global — every scope on the server enforces it. | 60 s Celery beat task diffs desired-set against `Get-DhcpServerv4Filter -List Deny` and ships one batched PS script per WinRM round trip. |
+
+Group-global is deliberate. Kea supports per-subnet via class/pool pinning; Windows doesn't support per-scope deny at all. A single "this device is bad, nowhere gets to serve it" rule is the usage pattern — per-scope precision is deferred until a concrete need surfaces.
+
+**MAC input shapes** — the API accepts the common operator formats (`aa:bb:cc:dd:ee:ff`, `aa-bb-cc-dd-ee-ff`, `aabb.ccdd.eeff`, or bare `aabbccddeeff`, any case) and canonicalizes to colon-separated lowercase server-side. Agents see canonical form only.
+
+**Expiry** — null = permanent; setting `expires_at` in the past is idempotent with `enabled=False` (both filter the row out of the rendered config). The beat task scanning for Windows DHCP means expiry transitions propagate within 60 s even without a config push.
+
+**UI** — DHCP server → "MAC Blocks" tab. Filter-as-you-type over MAC / vendor / IP / hostname; vendor column sourced from `oui_vendor` (opt-in feature, null when OUI lookup is disabled); IPAM cross-ref shows any `IPAddress` rows currently tied to the blocked MAC, with IP + subnet + hostname. Per-row edit toggles `enabled`, `expires_at`, `reason`, and `description` — the MAC itself is immutable so the audit trail for each MAC stays linear (rename = delete + re-add).
+
+**Permission** — `dhcp_mac_block`. The built-in "DHCP Editor" role gets it automatically.
+
+---
+
 ## 5. DHCP Lease Tracking
 
 Leases are **read-only** in SpatiumDDI — they are pulled from the DHCP server, not managed directly.

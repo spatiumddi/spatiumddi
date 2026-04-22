@@ -1230,6 +1230,51 @@ export interface OUITaskStatus {
   error: string | null;
 }
 
+export type AuditForwardKind = "syslog" | "webhook";
+export type AuditForwardFormat =
+  | "rfc5424_json"
+  | "rfc5424_cef"
+  | "rfc5424_leef"
+  | "rfc3164"
+  | "json_lines";
+export type AuditForwardProtocol = "udp" | "tcp" | "tls";
+export type AuditForwardSeverity = "info" | "warn" | "error" | "denied";
+
+export interface AuditForwardTarget {
+  id: string;
+  name: string;
+  enabled: boolean;
+  kind: AuditForwardKind;
+  format: AuditForwardFormat;
+  host: string;
+  port: number;
+  protocol: AuditForwardProtocol;
+  facility: number;
+  ca_cert_pem: string | null;
+  url: string;
+  auth_header_set: boolean;
+  min_severity: AuditForwardSeverity | null;
+  resource_types: string[] | null;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface AuditForwardTargetWrite {
+  name: string;
+  enabled: boolean;
+  kind: AuditForwardKind;
+  format: AuditForwardFormat;
+  host?: string;
+  port?: number;
+  protocol?: AuditForwardProtocol;
+  facility?: number;
+  ca_cert_pem?: string | null;
+  url?: string;
+  auth_header?: string;
+  min_severity?: AuditForwardSeverity | null;
+  resource_types?: string[] | null;
+}
+
 export const settingsApi = {
   get: () => api.get<PlatformSettings>("/settings").then((r) => r.data),
   update: (data: Partial<PlatformSettings>) =>
@@ -1247,6 +1292,27 @@ export const settingsApi = {
   getOUIRefreshStatus: (taskId: string) =>
     api
       .get<OUITaskStatus>(`/settings/oui/refresh/${taskId}`)
+      .then((r) => r.data),
+  listAuditTargets: () =>
+    api
+      .get<AuditForwardTarget[]>("/settings/audit-forward-targets")
+      .then((r) => r.data),
+  createAuditTarget: (body: AuditForwardTargetWrite) =>
+    api
+      .post<AuditForwardTarget>("/settings/audit-forward-targets", body)
+      .then((r) => r.data),
+  updateAuditTarget: (id: string, body: AuditForwardTargetWrite) =>
+    api
+      .put<AuditForwardTarget>(`/settings/audit-forward-targets/${id}`, body)
+      .then((r) => r.data),
+  deleteAuditTarget: (id: string) =>
+    api.delete(`/settings/audit-forward-targets/${id}`),
+  testAuditTarget: (id: string) =>
+    api
+      .post<{
+        status: string;
+        target: string;
+      }>(`/settings/audit-forward-targets/${id}/test`)
       .then((r) => r.data),
 };
 
@@ -2332,6 +2398,8 @@ export interface DHCPLeaseSyncResult {
   scopes_skipped_no_subnet: number;
   pools_synced: number;
   statics_synced: number;
+  mac_blocks_added?: number;
+  mac_blocks_removed?: number;
   errors: string[];
 }
 
@@ -2489,6 +2557,25 @@ export const dhcpApi = {
       .then((r) => r.data),
   deleteClientClass: (_groupId: string, classId: string) =>
     api.delete(`/dhcp/client-classes/${classId}`),
+
+  listMacBlocks: (groupId: string) =>
+    api
+      .get<DHCPMACBlock[]>(`/dhcp/server-groups/${groupId}/mac-blocks`)
+      .then((r) => r.data),
+  createMacBlock: (groupId: string, data: DHCPMACBlockWrite) =>
+    api
+      .post<DHCPMACBlock>(`/dhcp/server-groups/${groupId}/mac-blocks`, data)
+      .then((r) => r.data),
+  updateMacBlock: (
+    _groupId: string,
+    blockId: string,
+    data: Partial<DHCPMACBlockWrite>,
+  ) =>
+    api
+      .put<DHCPMACBlock>(`/dhcp/mac-blocks/${blockId}`, data)
+      .then((r) => r.data),
+  deleteMacBlock: (_groupId: string, blockId: string) =>
+    api.delete(`/dhcp/mac-blocks/${blockId}`),
 };
 
 export interface DHCPPool {
@@ -2539,6 +2626,46 @@ export interface DHCPClientClass {
   options: Record<string, unknown>;
   created_at: string;
   modified_at: string;
+}
+
+export type DHCPMACBlockReason =
+  | "rogue"
+  | "lost_stolen"
+  | "quarantine"
+  | "policy"
+  | "other";
+
+export interface DHCPMACBlockIPAMMatch {
+  ip_address: string;
+  subnet_cidr: string;
+  hostname: string;
+  description: string;
+}
+
+export interface DHCPMACBlock {
+  id: string;
+  group_id: string;
+  mac_address: string;
+  reason: DHCPMACBlockReason;
+  description: string;
+  enabled: boolean;
+  expires_at: string | null;
+  created_at: string;
+  modified_at: string;
+  created_by_user_id: string | null;
+  updated_by_user_id: string | null;
+  last_match_at: string | null;
+  match_count: number;
+  vendor: string | null;
+  ipam_matches: DHCPMACBlockIPAMMatch[];
+}
+
+export interface DHCPMACBlockWrite {
+  mac_address?: string;
+  reason?: DHCPMACBlockReason;
+  description?: string;
+  enabled?: boolean;
+  expires_at?: string | null;
 }
 
 export interface DHCPLease {
@@ -2799,4 +2926,54 @@ export const alertsApi = {
     api.post<AlertEvent>(`/alerts/events/${id}/resolve`).then((r) => r.data),
   evaluateNow: () =>
     api.post<AlertEvaluateResult>("/alerts/evaluate").then((r) => r.data),
+};
+
+export type MetricsWindow = "1h" | "6h" | "24h" | "7d";
+
+export interface DNSMetricsPoint {
+  t: string;
+  queries_total: number;
+  noerror: number;
+  nxdomain: number;
+  servfail: number;
+  recursion: number;
+}
+
+export interface DNSMetricsSeries {
+  window: MetricsWindow;
+  bucket_seconds: number;
+  points: DNSMetricsPoint[];
+}
+
+export interface DHCPMetricsPoint {
+  t: string;
+  discover: number;
+  offer: number;
+  request: number;
+  ack: number;
+  nak: number;
+  decline: number;
+  release: number;
+  inform: number;
+}
+
+export interface DHCPMetricsSeries {
+  window: MetricsWindow;
+  bucket_seconds: number;
+  points: DHCPMetricsPoint[];
+}
+
+export const metricsApi = {
+  dnsTimeseries: (
+    params: { window?: MetricsWindow; server_id?: string } = {},
+  ) =>
+    api
+      .get<DNSMetricsSeries>("/metrics/dns/timeseries", { params })
+      .then((r) => r.data),
+  dhcpTimeseries: (
+    params: { window?: MetricsWindow; server_id?: string } = {},
+  ) =>
+    api
+      .get<DHCPMetricsSeries>("/metrics/dhcp/timeseries", { params })
+      .then((r) => r.data),
 };

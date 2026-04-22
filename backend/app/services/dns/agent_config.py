@@ -110,6 +110,9 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
                 "type": r.record_type,
                 "ttl": r.ttl,
                 "value": r.value,
+                "priority": r.priority,
+                "weight": r.weight,
+                "port": r.port,
             }
             for r in rec_res.scalars().all()
         ]

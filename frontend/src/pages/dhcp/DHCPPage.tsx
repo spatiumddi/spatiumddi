@@ -36,6 +36,7 @@ import { CreateServerGroupModal } from "./CreateServerGroupModal";
 import { CreateServerModal } from "./CreateServerModal";
 import { CreateScopeModal } from "./CreateScopeModal";
 import { CreateClientClassModal } from "./CreateClientClassModal";
+import { MacBlocksTab } from "./MacBlocksTab";
 import { DeleteConfirmModal, StatusDot } from "./_shared";
 
 type Selection =
@@ -43,7 +44,14 @@ type Selection =
   | { type: "server"; group: DHCPServerGroup | null; server: DHCPServer }
   | null;
 
-type Tab = "scopes" | "pools" | "statics" | "classes" | "leases" | "options";
+type Tab =
+  | "scopes"
+  | "pools"
+  | "statics"
+  | "classes"
+  | "mac-blocks"
+  | "leases"
+  | "options";
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Sidebar
@@ -1224,6 +1232,10 @@ function ServerDetailView({
         parts.push(`IPAM ${result.ipam_created}+ / ${result.ipam_refreshed}~`);
       if (result.out_of_scope)
         parts.push(`${result.out_of_scope} out-of-scope`);
+      if (result.mac_blocks_added || result.mac_blocks_removed)
+        parts.push(
+          `MAC blocks +${result.mac_blocks_added ?? 0}/-${result.mac_blocks_removed ?? 0}`,
+        );
       if (result.errors.length)
         parts.push(`${result.errors.length} error(s): ${result.errors[0]}`);
       setSyncBanner(parts.join(" · "));
@@ -1379,6 +1391,12 @@ function ServerDetailView({
           >
             Client Classes
           </TabButton>
+          <TabButton
+            active={tab === "mac-blocks"}
+            onClick={() => setTab("mac-blocks")}
+          >
+            MAC Blocks
+          </TabButton>
           <TabButton active={tab === "leases"} onClick={() => setTab("leases")}>
             Leases
           </TabButton>
@@ -1400,6 +1418,7 @@ function ServerDetailView({
           <ServerPoolsOrStaticsTab server={server} kind="statics" />
         )}
         {tab === "classes" && <ClientClassesTab server={server} />}
+        {tab === "mac-blocks" && <MacBlocksTab server={server} />}
         {tab === "leases" && <LeasesTab server={server} />}
         {tab === "options" && (
           <div className="rounded-lg border p-6 text-sm text-muted-foreground">

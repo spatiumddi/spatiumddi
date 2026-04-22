@@ -20,6 +20,7 @@ from .config import AgentConfig
 from .ha_status import HAStatusPoller
 from .heartbeat import HeartbeatClient
 from .leases import LeaseWatcher
+from .metrics import MetricsPoller
 from .peer_resolve import PeerResolveWatcher
 from .sync import SyncLoop
 
@@ -45,6 +46,7 @@ def run(cfg: AgentConfig) -> int:
     )
     syncer_holder.append(syncer)
     leases = LeaseWatcher(cfg, token_ref, heartbeat)
+    metrics = MetricsPoller(cfg, token_ref)
 
     threads = [
         threading.Thread(target=syncer.run, name="sync", daemon=True),
@@ -52,6 +54,7 @@ def run(cfg: AgentConfig) -> int:
         threading.Thread(target=leases.run, name="leases", daemon=True),
         threading.Thread(target=ha_poller.run, name="ha-status", daemon=True),
         threading.Thread(target=peer_watcher.run, name="peer-resolve", daemon=True),
+        threading.Thread(target=metrics.run, name="metrics", daemon=True),
     ]
     for t in threads:
         t.start()
@@ -66,6 +69,7 @@ def run(cfg: AgentConfig) -> int:
         leases.stop()
         ha_poller.stop()
         peer_watcher.stop()
+        metrics.stop()
 
     signal.signal(signal.SIGTERM, _sig)
     signal.signal(signal.SIGINT, _sig)
