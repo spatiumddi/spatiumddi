@@ -17,6 +17,7 @@ import {
   type VLAN,
   type Subnet,
 } from "@/lib/api";
+import { copyToClipboard } from "@/lib/clipboard";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { useTableSort, SortableTh } from "@/lib/useTableSort";
 import {
@@ -537,14 +538,10 @@ function VLANRow({ vlan, onClick }: { vlan: VLAN; onClick: () => void }) {
         </ContextMenuLabel>
         <ContextMenuSeparator />
         <ContextMenuItem onSelect={onClick}>Open…</ContextMenuItem>
-        <ContextMenuItem
-          onSelect={() => navigator.clipboard.writeText(String(vlan.vlan_id))}
-        >
+        <ContextMenuItem onSelect={() => copyToClipboard(String(vlan.vlan_id))}>
           Copy VLAN ID
         </ContextMenuItem>
-        <ContextMenuItem
-          onSelect={() => navigator.clipboard.writeText(vlan.name)}
-        >
+        <ContextMenuItem onSelect={() => copyToClipboard(vlan.name)}>
           Copy Name
         </ContextMenuItem>
       </ContextMenuContent>

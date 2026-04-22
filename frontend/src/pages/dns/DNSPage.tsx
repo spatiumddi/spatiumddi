@@ -49,6 +49,7 @@ import {
   type WindowsDNSCredentials,
   type DNSGroupSyncResult,
 } from "@/lib/api";
+import { copyToClipboard } from "@/lib/clipboard";
 import { useTableSort, SortableTh } from "@/lib/useTableSort";
 import { cn, swatchCls, zebraBodyCls } from "@/lib/utils";
 import { SwatchPicker } from "@/components/ui/swatch-picker";
@@ -1939,13 +1940,11 @@ function ZoneDetailView({
                         {r.name} {r.record_type}
                       </ContextMenuLabel>
                       <ContextMenuSeparator />
-                      <ContextMenuItem
-                        onSelect={() => navigator.clipboard.writeText(r.name)}
-                      >
+                      <ContextMenuItem onSelect={() => copyToClipboard(r.name)}>
                         Copy Name
                       </ContextMenuItem>
                       <ContextMenuItem
-                        onSelect={() => navigator.clipboard.writeText(r.value)}
+                        onSelect={() => copyToClipboard(r.value)}
                       >
                         Copy Value
                       </ContextMenuItem>
@@ -3802,9 +3801,7 @@ function ZonesTab({
               Open Zone
             </ContextMenuItem>
             <ContextMenuItem
-              onSelect={() =>
-                navigator.clipboard.writeText(z.name.replace(/\.$/, ""))
-              }
+              onSelect={() => copyToClipboard(z.name.replace(/\.$/, ""))}
             >
               Copy Name
             </ContextMenuItem>

@@ -52,6 +52,7 @@ import {
   type VLAN,
   type DHCPLeaseSyncResult,
 } from "@/lib/api";
+import { copyToClipboard } from "@/lib/clipboard";
 import { cn, swatchTintCls, zebraBodyCls } from "@/lib/utils";
 import { SwatchPicker } from "@/components/ui/swatch-picker";
 import { useStickyLocation } from "@/lib/stickyLocation";
@@ -156,9 +157,11 @@ function CopyButton({ text }: { text: string }) {
   const [copied, setCopied] = useState(false);
   function handleCopy(e: React.MouseEvent) {
     e.stopPropagation();
-    navigator.clipboard.writeText(text).then(() => {
-      setCopied(true);
-      setTimeout(() => setCopied(false), 1500);
+    copyToClipboard(text).then((ok) => {
+      if (ok) {
+        setCopied(true);
+        setTimeout(() => setCopied(false), 1500);
+      }
     });
   }
   return (
@@ -3675,17 +3678,13 @@ function SubnetDetail({
                             <ContextMenuLabel>{addr.address}</ContextMenuLabel>
                             <ContextMenuSeparator />
                             <ContextMenuItem
-                              onSelect={() =>
-                                navigator.clipboard.writeText(addr.address)
-                              }
+                              onSelect={() => copyToClipboard(addr.address)}
                             >
                               Copy IP
                             </ContextMenuItem>
                             {addr.fqdn && (
                               <ContextMenuItem
-                                onSelect={() =>
-                                  navigator.clipboard.writeText(addr.fqdn!)
-                                }
+                                onSelect={() => copyToClipboard(addr.fqdn!)}
                               >
                                 Copy FQDN
                               </ContextMenuItem>
@@ -3693,9 +3692,7 @@ function SubnetDetail({
                             {addr.mac_address && (
                               <ContextMenuItem
                                 onSelect={() =>
-                                  navigator.clipboard.writeText(
-                                    addr.mac_address!,
-                                  )
+                                  copyToClipboard(addr.mac_address!)
                                 }
                               >
                                 Copy MAC

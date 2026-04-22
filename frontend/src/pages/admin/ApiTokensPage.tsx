@@ -2,6 +2,7 @@ import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Copy, Eye, EyeOff, Plus, Power, PowerOff, Trash2 } from "lucide-react";
 import { apiTokensApi, type ApiToken, type ApiTokenCreated } from "@/lib/api";
+import { copyToClipboard } from "@/lib/clipboard";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
 
@@ -174,16 +175,20 @@ function RevealTokenModal({
   onClose: () => void;
 }) {
   const [copied, setCopied] = useState(false);
+  const [copyFailed, setCopyFailed] = useState(false);
   const [visible, setVisible] = useState(false);
 
   async function copy() {
-    try {
-      await navigator.clipboard.writeText(token.token);
+    const ok = await copyToClipboard(token.token);
+    if (ok) {
       setCopied(true);
+      setCopyFailed(false);
       setTimeout(() => setCopied(false), 2000);
-    } catch {
-      // Clipboard blocked (insecure origin / browser permission) —
-      // the user can still eyeball the value and copy manually.
+    } else {
+      // Both paths failed — reveal the value and prompt the user to
+      // copy it manually. Don't silently swallow.
+      setVisible(true);
+      setCopyFailed(true);
     }
   }
 
@@ -195,6 +200,14 @@ function RevealTokenModal({
           SpatiumDDI stores only a hash — if you lose this value, delete the
           token and create a new one.
         </div>
+        {copyFailed && (
+          <div className="rounded-md border border-rose-500/40 bg-rose-500/5 px-3 py-2 text-xs text-rose-700 dark:text-rose-300">
+            Automatic copy failed (browser blocked the clipboard API — usually
+            because the page is served over plain HTTP on a non-localhost host).
+            The token is now visible below — select it manually and copy with{" "}
+            <kbd>Ctrl</kbd>/<kbd>⌘</kbd>+<kbd>C</kbd>.
+          </div>
+        )}
         <div className="flex items-center gap-2 rounded-md border bg-muted/30 px-3 py-2 font-mono text-sm">
           <code className="flex-1 truncate" title={token.token}>
             {visible ? token.token : "•".repeat(40)}

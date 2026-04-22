@@ -20,6 +20,7 @@ import {
   type DHCPLease,
 } from "@/lib/api";
 import { useSessionState } from "@/lib/useSessionState";
+import { copyToClipboard } from "@/lib/clipboard";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { useTableSort, SortableTh } from "@/lib/useTableSort";
 import {
@@ -599,15 +600,13 @@ function ServerScopesTab({ server }: { server: DHCPServer }) {
                       </ContextMenuItem>
                       <ContextMenuSeparator />
                       <ContextMenuItem
-                        onSelect={() => navigator.clipboard.writeText(sc.name)}
+                        onSelect={() => copyToClipboard(sc.name)}
                       >
                         Copy Scope Name
                       </ContextMenuItem>
                       {sc.subnet_network && (
                         <ContextMenuItem
-                          onSelect={() =>
-                            navigator.clipboard.writeText(sc.subnet_network!)
-                          }
+                          onSelect={() => copyToClipboard(sc.subnet_network!)}
                         >
                           Copy Subnet CIDR
                         </ContextMenuItem>
@@ -868,24 +867,18 @@ function ServerPoolsOrStaticsTab({
                       <ContextMenuLabel>{s.ip_address}</ContextMenuLabel>
                       <ContextMenuSeparator />
                       <ContextMenuItem
-                        onSelect={() =>
-                          navigator.clipboard.writeText(s.ip_address)
-                        }
+                        onSelect={() => copyToClipboard(s.ip_address)}
                       >
                         Copy IP
                       </ContextMenuItem>
                       <ContextMenuItem
-                        onSelect={() =>
-                          navigator.clipboard.writeText(s.mac_address)
-                        }
+                        onSelect={() => copyToClipboard(s.mac_address)}
                       >
                         Copy MAC
                       </ContextMenuItem>
                       {s.hostname && (
                         <ContextMenuItem
-                          onSelect={() =>
-                            navigator.clipboard.writeText(s.hostname!)
-                          }
+                          onSelect={() => copyToClipboard(s.hostname!)}
                         >
                           Copy Hostname
                         </ContextMenuItem>
@@ -1143,22 +1136,18 @@ function LeasesTab({ server }: { server: DHCPServer }) {
                   <ContextMenuLabel>{l.ip_address}</ContextMenuLabel>
                   <ContextMenuSeparator />
                   <ContextMenuItem
-                    onSelect={() => navigator.clipboard.writeText(l.ip_address)}
+                    onSelect={() => copyToClipboard(l.ip_address)}
                   >
                     Copy IP
                   </ContextMenuItem>
                   <ContextMenuItem
-                    onSelect={() =>
-                      navigator.clipboard.writeText(l.mac_address)
-                    }
+                    onSelect={() => copyToClipboard(l.mac_address)}
                   >
                     Copy MAC
                   </ContextMenuItem>
                   {l.hostname && (
                     <ContextMenuItem
-                      onSelect={() =>
-                        navigator.clipboard.writeText(l.hostname!)
-                      }
+                      onSelect={() => copyToClipboard(l.hostname!)}
                     >
                       Copy Hostname
                     </ContextMenuItem>
