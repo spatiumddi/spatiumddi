@@ -464,6 +464,15 @@ class DNSRecord(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("user.id", ondelete="SET NULL"), nullable=True
     )
+    # Set by the Kubernetes reconciler when this record mirrors an
+    # Ingress (or annotated Service) hostname from a cluster. FK
+    # cascades on cluster delete.
+    kubernetes_cluster_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("kubernetes_cluster.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
 
     zone: Mapped["DNSZone"] = relationship("DNSZone", back_populates="records")
 

@@ -9,6 +9,53 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versioning uses 
 
 ### Added
 
+- **Kubernetes integration — Phase 1a scaffolding + 1b read-only
+  reconciler.** Settings → Integrations is a new settings section;
+  per-integration toggle `integration_kubernetes_enabled` drives
+  whether the Kubernetes nav item appears in the sidebar. Per-
+  cluster config lives on `KubernetesCluster` rows bound to exactly
+  one IPAM Space (required) + optionally one DNS server group.
+  Bearer token Fernet-encrypted at rest; CA bundle optional
+  (system CA store used when empty, for cloud-managed clusters).
+  Admin page at `/kubernetes` with setup guide (YAML +
+  ServiceAccount / ClusterRole / ClusterRoleBinding / Secret +
+  `kubectl` extract commands) shown in the Add modal, Test
+  Connection probe that calls `/version` + `/api/v1/nodes` on the
+  apiserver and distinguishes 401 / 403 / TLS / network errors
+  with human-readable messages. Migrations `f8c3d104e27a`
+  (`kubernetes_cluster` table + toggle) and `a917b4c9e251`
+  (`kubernetes_cluster_id` FK on `ip_address`, `ip_block`,
+  `dns_record` with `ON DELETE CASCADE`). Every 30 s Celery beat
+  tick sweeps every enabled cluster whose
+  `sync_interval_seconds` (min 30) has elapsed and runs the
+  reconciler: pod CIDR + service CIDR become `IPBlock`s under the
+  bound space; node `InternalIP`s become `IPAddress` rows with
+  `status="kubernetes-node"`; `Service`s of type `LoadBalancer`
+  with a populated VIP become `IPAddress` with
+  `status="kubernetes-lb"` and hostname `<svc>.<ns>`; `Ingress`
+  hostnames become A records (or CNAME if the LB surfaces a
+  hostname rather than an IP) in the longest-suffix-matching zone
+  in the bound DNS group. Create / update / **delete** semantics
+  — removed cluster objects immediately drop their mirror rows
+  (not orphaned). Deleting the cluster itself cascades every
+  mirror via the FK. "Sync Now" button per cluster fires the same
+  reconciler on demand, bypassing the interval. Covered end-to-end
+  by `backend/tests/test_kubernetes_reconcile.py` with the k8s
+  client stubbed — 9 tests across block diff, node mapping, LB
+  VIP mapping, Ingress → A, Ingress → CNAME, zone-miss skipping,
+  subnet-miss skipping, and cascade delete.
+  **Deferred follow-ups**:
+  - Pod IP mirroring (deliberately out of scope — pods churn;
+    CIDR-as-IPBlock is the value).
+  - external-dns webhook provider protocol (Phase 2 — separate
+    feature).
+  - Service annotation-driven DNS (`external-dns.alpha.kubernetes.io/hostname`
+    on non-Ingress Services) — trivially additive on top of the
+    existing Ingress path once a user asks for it.
+  - ClusterRoleBinding check in Test Connection (detects the common
+    "applied the SA but forgot the binding" case by probing
+    `/apis/networking.k8s.io/v1/ingresses` explicitly).
+
 - **Runtime version reporting + GitHub release check.** The sidebar
   footer now shows the actual running version instead of the
   hardcoded `0.1.0` that came from `package.json`. Mechanism: the

@@ -2570,8 +2570,11 @@ async def update_subnet(
         setattr(subnet, field, val)
         changes_for_audit[field] = str(val) if isinstance(val, uuid.UUID) else val
 
-    # Handle add/remove of auto-created network/broadcast/gateway records
-    if body.manage_auto_addresses is not None:
+    # Handle add/remove of auto-created network/broadcast/gateway records.
+    # Kubernetes-semantics subnets (pod / service CIDRs) are routed
+    # overlays without LAN broadcasts — skip the add path so the
+    # operator can't accidentally stamp placeholder rows on them.
+    if body.manage_auto_addresses is not None and not subnet.kubernetes_semantics:
         net = _parse_network(str(subnet.network))
         if net.prefixlen < 31:
             is_v6 = isinstance(net, ipaddress.IPv6Network)

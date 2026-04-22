@@ -143,12 +143,17 @@ export function Sidebar({
     staleTime: 5 * 60 * 1000,
   });
 
-  const mainNav = [
-    ...baseMainNav,
+  // Integrations live in their own sidebar section, rendered between
+  // the main nav and the admin nav, but only when at least one
+  // integration is enabled. Each integration contributes one entry
+  // — kept declarative so adding a future integration is a one-line
+  // extension here and a toggle on PlatformSettings.
+  const integrationsNav = [
     ...(platformSettings?.integration_kubernetes_enabled
       ? [{ label: "Kubernetes", icon: Boxes, to: "/kubernetes" }]
       : []),
   ];
+  const mainNav = baseMainNav;
 
   return (
     <>
@@ -211,6 +216,29 @@ export function Sidebar({
               />
             ))}
           </div>
+
+          {integrationsNav.length > 0 && (
+            <div className="mt-4">
+              {!effectiveCollapsed && (
+                <p className="mb-1 px-3 text-xs font-semibold uppercase tracking-wider text-sidebar-muted-foreground/70">
+                  Integrations
+                </p>
+              )}
+              {effectiveCollapsed && (
+                <div className="my-2 border-t border-sidebar-border" />
+              )}
+              <div className="space-y-1">
+                {integrationsNav.map((item) => (
+                  <NavItem
+                    key={item.to}
+                    {...item}
+                    collapsed={effectiveCollapsed}
+                    onNavigate={mobileOpen ? onMobileClose : undefined}
+                  />
+                ))}
+              </div>
+            </div>
+          )}
 
           <div className="mt-4">
             {!effectiveCollapsed && (

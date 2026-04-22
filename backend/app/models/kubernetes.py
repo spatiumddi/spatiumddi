@@ -26,6 +26,9 @@ from sqlalchemy import (
     String,
     Text,
 )
+from sqlalchemy import (
+    text as sa_text,
+)
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -80,6 +83,15 @@ class KubernetesCluster(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # Floored at 30 s; anything higher puts real load on the apiserver
     # for multi-cluster deployments.
     sync_interval_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=60)
+
+    # Opt-in pod IP mirroring. Pods churn — a busy cluster can generate
+    # thousands of create/delete events per day, which would noisy-up
+    # audit log and bloat ``ip_address``. Off by default; operators who
+    # want pod-level visibility can flip it on per cluster. Service
+    # ClusterIPs are always mirrored — they're stable and one per Service.
+    mirror_pods: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
 
     # Sync state (populated in Phase 1b).
     last_synced_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

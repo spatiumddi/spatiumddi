@@ -2,11 +2,15 @@ import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Boxes,
+  Check,
+  Clipboard,
   Pencil,
   Plus,
   RefreshCw,
   Trash2,
   TestTube2,
+  RotateCw,
+  Wand2,
 } from "lucide-react";
 
 import {
@@ -18,8 +22,10 @@ import {
   type KubernetesCluster,
   type KubernetesClusterCreate,
   type KubernetesClusterUpdate,
+  type KubernetesDetectCIDRsResult,
   type KubernetesTestResult,
 } from "@/lib/api";
+import { copyToClipboard } from "@/lib/clipboard";
 import { HeaderButton } from "@/components/ui/header-button";
 import { Modal } from "@/components/ui/modal";
 
@@ -43,10 +49,10 @@ kind: ClusterRole
 metadata: { name: spatiumddi-reader }
 rules:
   - apiGroups: [""]
-    resources: ["nodes", "services", "namespaces"]
+    resources: ["nodes", "services", "namespaces", "pods"]
     verbs: ["get", "list", "watch"]
   - apiGroups: ["networking.k8s.io"]
-    resources: ["ingresses"]
+    resources: ["ingresses", "servicecidrs"]
     verbs: ["get", "list", "watch"]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -118,6 +124,24 @@ export function KubernetesPage() {
     },
   });
 
+  // "Sync Now" — queues the reconciler for this cluster. Fire-and-
+  // forget; the list endpoint will pick up updated last_synced_at on
+  // the next poll (we refetch a few seconds later to catch the
+  // completed state).
+  const syncMut = useMutation({
+    mutationFn: (id: string) => kubernetesApi.syncNow(id),
+    onSuccess: () => {
+      // Immediate invalidate so the row shows "syncing…", then a
+      // delayed refetch so the new last_synced_at / error show up
+      // after the worker finishes.
+      qc.invalidateQueries({ queryKey: ["kubernetes-clusters"] });
+      setTimeout(
+        () => qc.invalidateQueries({ queryKey: ["kubernetes-clusters"] }),
+        5000,
+      );
+    },
+  });
+
   return (
     <div className="flex flex-col h-full overflow-hidden">
       <div className="border-b px-6 py-4 bg-card">
@@ -174,7 +198,7 @@ export function KubernetesPage() {
             </div>
           ) : (
             <div className="overflow-x-auto">
-              <table className="w-full min-w-[960px] text-xs">
+              <table className="w-full min-w-[1120px] text-xs">
                 <thead>
                   <tr className="border-b bg-muted/30">
                     <th className="whitespace-nowrap px-3 py-2 text-left font-medium">
@@ -191,6 +215,12 @@ export function KubernetesPage() {
                     </th>
                     <th className="whitespace-nowrap px-3 py-2 text-left font-medium">
                       Nodes
+                    </th>
+                    <th className="whitespace-nowrap px-3 py-2 text-left font-medium">
+                      Pod CIDR
+                    </th>
+                    <th className="whitespace-nowrap px-3 py-2 text-left font-medium">
+                      Service CIDR
                     </th>
                     <th className="whitespace-nowrap px-3 py-2 text-left font-medium">
                       Last sync
@@ -240,6 +270,16 @@ export function KubernetesPage() {
                         <td className="whitespace-nowrap px-3 py-2 text-muted-foreground">
                           {c.node_count ?? "—"}
                         </td>
+                        <td className="whitespace-nowrap px-3 py-2 font-mono text-[11px]">
+                          {c.pod_cidr || (
+                            <span className="text-muted-foreground">—</span>
+                          )}
+                        </td>
+                        <td className="whitespace-nowrap px-3 py-2 font-mono text-[11px]">
+                          {c.service_cidr || (
+                            <span className="text-muted-foreground">—</span>
+                          )}
+                        </td>
                         <td className="whitespace-nowrap px-3 py-2 text-muted-foreground">
                           {c.last_synced_at
                             ? new Date(c.last_synced_at).toLocaleString()
@@ -276,6 +316,22 @@ export function KubernetesPage() {
                           )}
                         </td>
                         <td className="whitespace-nowrap px-3 py-2 text-right">
+                          <button
+                            onClick={() => syncMut.mutate(c.id)}
+                            disabled={
+                              syncMut.isPending && syncMut.variables === c.id
+                            }
+                            className="rounded p-1 text-muted-foreground hover:text-foreground disabled:opacity-50"
+                            title="Sync Now"
+                          >
+                            <RotateCw
+                              className={`h-3.5 w-3.5 ${
+                                syncMut.isPending && syncMut.variables === c.id
+                                  ? "animate-spin"
+                                  : ""
+                              }`}
+                            />
+                          </button>
                           <button
                             onClick={() => setEdit(c)}
                             className="rounded p-1 text-muted-foreground hover:text-foreground"
@@ -351,12 +407,15 @@ function ClusterModal({
   const [syncInterval, setSyncInterval] = useState(
     cluster?.sync_interval_seconds ?? 60,
   );
+  const [mirrorPods, setMirrorPods] = useState(cluster?.mirror_pods ?? false);
   const [showGuide, setShowGuide] = useState(!editing);
   const [error, setError] = useState("");
 
   const [testResult, setTestResult] = useState<KubernetesTestResult | null>(
     null,
   );
+  const [detectResult, setDetectResult] =
+    useState<KubernetesDetectCIDRsResult | null>(null);
 
   const testMut = useMutation({
     mutationFn: () =>
@@ -376,6 +435,30 @@ function ClusterModal({
       }),
   });
 
+  const detectMut = useMutation({
+    mutationFn: () =>
+      kubernetesApi.detectCidrs({
+        cluster_id: cluster?.id,
+        api_server_url: apiServerUrl || undefined,
+        ca_bundle_pem: caBundlePem || undefined,
+        token: token || undefined,
+      }),
+    onSuccess: (result) => {
+      setDetectResult(result);
+      // Only overwrite empty fields so the operator's typed value
+      // wins if they've already entered one.
+      if (result.pod_cidr && !podCidr) setPodCidr(result.pod_cidr);
+      if (result.service_cidr && !serviceCidr)
+        setServiceCidr(result.service_cidr);
+    },
+    onError: (e) =>
+      setDetectResult({
+        pod_cidr: null,
+        service_cidr: null,
+        messages: [errMsg(e, "Detection failed")],
+      }),
+  });
+
   const saveMut = useMutation({
     mutationFn: () => {
       if (editing) {
@@ -389,6 +472,7 @@ function ClusterModal({
           pod_cidr: podCidr,
           service_cidr: serviceCidr,
           sync_interval_seconds: syncInterval,
+          mirror_pods: mirrorPods,
         };
         if (caBundlePem) update.ca_bundle_pem = caBundlePem;
         if (token) update.token = token;
@@ -409,6 +493,7 @@ function ClusterModal({
         pod_cidr: podCidr,
         service_cidr: serviceCidr,
         sync_interval_seconds: syncInterval,
+        mirror_pods: mirrorPods,
       };
       return kubernetesApi.createCluster(create);
     },
@@ -432,38 +517,32 @@ function ClusterModal({
         }}
         className="space-y-3"
       >
-        {!editing && (
-          <div className="rounded-md border bg-muted/30 p-3">
-            <div className="flex items-center justify-between">
-              <h3 className="text-sm font-semibold">Setup guide</h3>
-              <button
-                type="button"
-                onClick={() => setShowGuide((v) => !v)}
-                className="text-xs text-muted-foreground hover:text-foreground"
-              >
-                {showGuide ? "Hide" : "Show"}
-              </button>
-            </div>
-            {showGuide && (
-              <div className="mt-2 space-y-2 text-xs">
-                <p className="text-muted-foreground">
-                  SpatiumDDI connects to Kubernetes with a read-only
-                  ServiceAccount. Apply this YAML on your cluster (requires
-                  cluster-admin):
-                </p>
-                <pre className="overflow-auto rounded bg-background p-2 font-mono text-[11px] leading-tight">
-                  {SETUP_YAML}
-                </pre>
-                <p className="text-muted-foreground">
-                  Then extract the values to paste below:
-                </p>
-                <pre className="overflow-auto rounded bg-background p-2 font-mono text-[11px] leading-tight">
-                  {EXTRACT_COMMANDS}
-                </pre>
-              </div>
-            )}
+        <div className="rounded-md border bg-muted/30 p-3">
+          <div className="flex items-center justify-between">
+            <h3 className="text-sm font-semibold">Setup guide</h3>
+            <button
+              type="button"
+              onClick={() => setShowGuide((v) => !v)}
+              className="text-xs text-muted-foreground hover:text-foreground"
+            >
+              {showGuide ? "Hide" : "Show"}
+            </button>
           </div>
-        )}
+          {showGuide && (
+            <div className="mt-2 space-y-2 text-xs">
+              <p className="text-muted-foreground">
+                SpatiumDDI connects to Kubernetes with a read-only
+                ServiceAccount. Apply this YAML on your cluster (requires
+                cluster-admin):
+              </p>
+              <CopyablePre text={SETUP_YAML} label="YAML" />
+              <p className="text-muted-foreground">
+                Then extract the values to paste below:
+              </p>
+              <CopyablePre text={EXTRACT_COMMANDS} label="commands" />
+            </div>
+          )}
+        </div>
 
         <div className="grid grid-cols-2 gap-3">
           <Field label="Name">
@@ -596,23 +675,50 @@ function ClusterModal({
           </Field>
         </div>
 
-        <div className="grid grid-cols-2 gap-3">
-          <Field label="Pod CIDR" hint="e.g. 10.244.0.0/16">
-            <input
-              className={`${inputCls} font-mono`}
-              value={podCidr}
-              onChange={(e) => setPodCidr(e.target.value)}
-              placeholder="10.244.0.0/16"
-            />
-          </Field>
-          <Field label="Service CIDR" hint="e.g. 10.96.0.0/12">
-            <input
-              className={`${inputCls} font-mono`}
-              value={serviceCidr}
-              onChange={(e) => setServiceCidr(e.target.value)}
-              placeholder="10.96.0.0/12"
-            />
-          </Field>
+        <div className="space-y-2">
+          <div className="flex items-center justify-between">
+            <span className="text-xs font-medium text-muted-foreground">
+              Pod / Service CIDRs
+            </span>
+            <button
+              type="button"
+              onClick={() => detectMut.mutate()}
+              disabled={detectMut.isPending || (!apiServerUrl && !cluster?.id)}
+              className="inline-flex items-center gap-1 rounded-md border px-2 py-1 text-[11px] hover:bg-accent disabled:opacity-50"
+              title="Probe the cluster for pod and service CIDRs"
+            >
+              <Wand2 className="h-3 w-3" />
+              {detectMut.isPending ? "Detecting…" : "Auto-detect"}
+            </button>
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <Field label="Pod CIDR" hint="e.g. 10.244.0.0/16">
+              <input
+                className={`${inputCls} font-mono`}
+                value={podCidr}
+                onChange={(e) => setPodCidr(e.target.value)}
+                placeholder="10.244.0.0/16"
+              />
+            </Field>
+            <Field label="Service CIDR" hint="e.g. 10.96.0.0/12">
+              <input
+                className={`${inputCls} font-mono`}
+                value={serviceCidr}
+                onChange={(e) => setServiceCidr(e.target.value)}
+                placeholder="10.96.0.0/12"
+              />
+            </Field>
+          </div>
+          {detectResult && detectResult.messages.length > 0 && (
+            <ul className="space-y-0.5 text-[11px] text-muted-foreground">
+              {detectResult.messages.map((m, i) => (
+                <li key={i} className="flex gap-1">
+                  <span className="text-muted-foreground/50">•</span>
+                  <span>{m}</span>
+                </li>
+              ))}
+            </ul>
+          )}
         </div>
 
         <Field label="Sync interval (seconds)" hint="Minimum 30 s.">
@@ -624,6 +730,24 @@ function ClusterModal({
             onChange={(e) => setSyncInterval(parseInt(e.target.value) || 60)}
           />
         </Field>
+
+        <label className="flex cursor-pointer items-start gap-2 text-sm">
+          <input
+            type="checkbox"
+            checked={mirrorPods}
+            onChange={(e) => setMirrorPods(e.target.checked)}
+            className="mt-0.5"
+          />
+          <div>
+            <span>Mirror pod IPs into IPAM</span>
+            <p className="text-[11px] text-muted-foreground/70">
+              Off by default. Pods churn — every restart or rolling deploy is a
+              create/delete event. Turn on if you want per-pod visibility; node
+              IPs, LoadBalancer VIPs and Service ClusterIPs are always mirrored
+              regardless.
+            </p>
+          </div>
+        </label>
 
         {error && <p className="text-xs text-destructive">{error}</p>}
 
@@ -700,6 +824,43 @@ function DeleteClusterModal({
 }
 
 // ── Helpers (local to this page) ────────────────────────────────────
+
+function CopyablePre({ text, label }: { text: string; label: string }) {
+  const [copied, setCopied] = useState(false);
+  async function handle() {
+    const ok = await copyToClipboard(text);
+    if (ok) {
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1500);
+    }
+  }
+  return (
+    <div className="relative">
+      <pre className="overflow-auto rounded bg-background p-2 pr-20 font-mono text-[11px] leading-tight">
+        {text}
+      </pre>
+      <button
+        type="button"
+        onClick={handle}
+        className="absolute right-1.5 top-1.5 inline-flex items-center gap-1 rounded border bg-background px-2 py-0.5 text-[11px] text-muted-foreground hover:bg-accent hover:text-foreground"
+        aria-label={`Copy ${label}`}
+        title={`Copy ${label}`}
+      >
+        {copied ? (
+          <>
+            <Check className="h-3 w-3 text-emerald-600 dark:text-emerald-400" />
+            Copied
+          </>
+        ) : (
+          <>
+            <Clipboard className="h-3 w-3" />
+            Copy
+          </>
+        )}
+      </button>
+    </div>
+  );
+}
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";

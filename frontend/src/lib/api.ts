@@ -3008,6 +3008,7 @@ export interface KubernetesCluster {
   pod_cidr: string;
   service_cidr: string;
   sync_interval_seconds: number;
+  mirror_pods: boolean;
   last_synced_at: string | null;
   last_sync_error: string | null;
   cluster_version: string | null;
@@ -3028,6 +3029,7 @@ export interface KubernetesClusterCreate {
   pod_cidr?: string;
   service_cidr?: string;
   sync_interval_seconds?: number;
+  mirror_pods?: boolean;
 }
 
 export interface KubernetesClusterUpdate {
@@ -3042,6 +3044,7 @@ export interface KubernetesClusterUpdate {
   pod_cidr?: string;
   service_cidr?: string;
   sync_interval_seconds?: number;
+  mirror_pods?: boolean;
 }
 
 export interface KubernetesTestResult {
@@ -3049,6 +3052,12 @@ export interface KubernetesTestResult {
   message: string;
   version: string | null;
   node_count: number | null;
+}
+
+export interface KubernetesDetectCIDRsResult {
+  pod_cidr: string | null;
+  service_cidr: string | null;
+  messages: string[];
 }
 
 export const kubernetesApi = {
@@ -3071,5 +3080,24 @@ export const kubernetesApi = {
   }) =>
     api
       .post<KubernetesTestResult>("/kubernetes/clusters/test", body)
+      .then((r) => r.data),
+  syncNow: (id: string) =>
+    api
+      .post<{
+        status: string;
+        task_id: string;
+      }>(`/kubernetes/clusters/${id}/sync`)
+      .then((r) => r.data),
+  detectCidrs: (body: {
+    cluster_id?: string;
+    api_server_url?: string;
+    ca_bundle_pem?: string;
+    token?: string;
+  }) =>
+    api
+      .post<KubernetesDetectCIDRsResult>(
+        "/kubernetes/clusters/detect-cidrs",
+        body,
+      )
       .then((r) => r.data),
 };

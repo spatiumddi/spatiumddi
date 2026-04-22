@@ -20,6 +20,7 @@ celery_app = Celery(
         "app.tasks.oui_update",
         "app.tasks.prune_metrics",
         "app.tasks.update_check",
+        "app.tasks.kubernetes_sync",
     ],
 )
 
@@ -52,6 +53,7 @@ celery_app.conf.update(
         "app.tasks.oui_update.*": {"queue": "default"},
         "app.tasks.prune_metrics.*": {"queue": "default"},
         "app.tasks.update_check.*": {"queue": "default"},
+        "app.tasks.kubernetes_sync.*": {"queue": "default"},
     },
     beat_schedule={
         # Every 60s, fan-out health checks to every registered DNS server.
@@ -144,6 +146,16 @@ celery_app.conf.update(
         "update-check": {
             "task": "app.tasks.update_check.check_github_release",
             "schedule": schedule(run_every=24 * 3600.0),
+        },
+        # Every 30 s, sweep every enabled KubernetesCluster. The per-
+        # cluster ``sync_interval_seconds`` (min 30) gates the actual
+        # reconciler pass, so a cluster configured with a 5-minute
+        # interval sees 10 beat ticks between passes. Gated overall by
+        # ``PlatformSettings.integration_kubernetes_enabled`` — turn
+        # the master toggle off and no cluster is polled.
+        "kubernetes-sync-sweep": {
+            "task": "app.tasks.kubernetes_sync.sweep_kubernetes_clusters",
+            "schedule": schedule(run_every=30.0),
         },
     },
 )

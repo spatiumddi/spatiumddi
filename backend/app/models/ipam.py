@@ -119,6 +119,15 @@ class IPBlock(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     tags: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     custom_fields: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
 
+    # Set by the Kubernetes reconciler for pod CIDR / service CIDR
+    # blocks mirrored from a cluster. FK cascades on cluster delete.
+    kubernetes_cluster_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("kubernetes_cluster.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+
     # DNS assignment (propagates to child blocks and subnets unless overridden)
     dns_group_ids: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
     dns_zone_id: Mapped[str | None] = mapped_column(Text, nullable=True)
@@ -280,6 +289,25 @@ class Subnet(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # Status: active | deprecated | reserved | quarantine
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="active", index=True)
 
+    # Kubernetes integration provenance. When set, the subnet was auto-
+    # created by the Kubernetes reconciler for this cluster; the FK
+    # cascade-deletes mirrored subnets when the cluster row is dropped.
+    kubernetes_cluster_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("kubernetes_cluster.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    # Pod / Service CIDR subnets are routed overlays without LAN
+    # semantics — no broadcast, no gateway, the full range is usable
+    # pod / service IP space. Suppresses the network / broadcast /
+    # gateway placeholder rows that ``POST /ipam/subnets`` normally
+    # inserts, and tells the UI not to offer edit controls for those
+    # LAN-specific fields.
+    kubernetes_semantics: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
+
     # Computed / cached. ``total_ips`` is BigInteger because IPv6 subnets can
     # be as large as 2^64 addresses (a /64 — the standard LAN size) which
     # overflows INT4. We still clamp at the BIGINT max (2^63 − 1) to keep
@@ -370,6 +398,15 @@ class IPAddress(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # with the same IP wouldn't be.
     auto_from_lease: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
+    # Set by the Kubernetes reconciler when this row mirrors a k8s
+    # Node or LoadBalancer Service VIP. Null on all non-k8s rows. FK
+    # cascades on cluster delete so we never leak orphans.
+    kubernetes_cluster_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("kubernetes_cluster.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
     )
 
     subnet: Mapped[Subnet] = relationship("Subnet", back_populates="addresses")

@@ -575,31 +575,42 @@ Phase 1 IPv6 closure + the Phase 2/3 DDNS / zone-state / CI-hardening items all 
 
   **Phased scope:**
 
-  - ⬜ **Phase 1a — Scaffolding (this session).** Settings →
-    Integrations UX + per-integration toggle on PlatformSettings +
-    sidebar gating. `KubernetesCluster` model + migration + CRUD
-    API + admin UI page + setup-guide modal + Test Connection
-    button that calls `/version` on the cluster's API server.
-    **No sync logic yet** — listing shows clusters with "never
-    synced" status.
+  - ✅ **Phase 1a — Scaffolding.** Settings → Integrations UX +
+    per-integration toggle on PlatformSettings + sidebar gating.
+    `KubernetesCluster` model + migration `f8c3d104e27a` + CRUD API
+    + admin UI page + setup-guide modal (embedded YAML + kubectl
+    extract commands) + Test Connection button that probes
+    `/version` + `/api/v1/nodes` with structured error
+    reporting (401/403/TLS/network distinguished).
 
-  - ⬜ **Phase 1b — Read-only reconciliation.** Celery beat task
-    that polls every enabled cluster every 60 s and writes:
+  - ✅ **Phase 1b — Read-only reconciliation.** Every 30 s beat
+    tick; per-cluster `sync_interval_seconds` (min 30 s) gates the
+    actual reconcile. Gated overall by
+    `PlatformSettings.integration_kubernetes_enabled`. Provenance
+    via dedicated `kubernetes_cluster_id` FK on `ip_address`,
+    `ip_block`, `dns_record` (migration `a917b4c9e251`); FK is
+    `ON DELETE CASCADE` so removing a cluster sweeps every mirror
+    row atomically. What gets mirrored:
     - Pod CIDR + Service CIDR → one `IPBlock` each under the bound
-      space, `source="kubernetes"`, non-editable.
-    - Node objects → `IPAddress` rows with `status="kubernetes-node"`,
-      `description` carrying the node name.
-    - `Service` objects with `spec.type=LoadBalancer` + a non-empty
-      `status.loadBalancer.ingress[].ip` → `IPAddress` with
-      `status="kubernetes-lb"`, `hostname` set to
-      `<service>.<namespace>`, link-out in the UI.
-    - `Ingress` objects (and optionally `Service` objects with the
-      `external-dns.alpha.kubernetes.io/hostname` annotation) →
-      DNS records in the bound group: A / CNAME depending on
-      whether the target resolves to an IP (LB VIP) or a hostname.
-    - Reconcile is idempotent; deletes mirror rows when the k8s
-      object is gone. All rows carry `source="kubernetes"` so ops
-      can filter them in the IPAM tree.
+      space.
+    - Node objects → `IPAddress` with `status="kubernetes-node"`,
+      hostname = node name.
+    - `Service` objects with `spec.type=LoadBalancer` + populated
+      `status.loadBalancer.ingress[0].ip` → `IPAddress` with
+      `status="kubernetes-lb"`, hostname = `<service>.<namespace>`.
+    - `Ingress` objects with `status.loadBalancer.ingress[0].ip`
+      → DNS **A** record per `rules[].host` in the longest-suffix-
+      matching zone from the bound DNS group; `ingress[0].hostname`
+      (cloud LBs) → **CNAME**. `auto_generated=True` + fixed 300 s
+      TTL. Rows missing a matching subnet / zone increment
+      `skipped_no_subnet` / `skipped_no_zone` on the reconcile
+      summary — non-fatal, surfaced in logs + audit. Diff is
+      create / update / delete (option 2a: delete, not orphan).
+    **Admin UI**: "Sync Now" button per cluster (fires
+    `sync_cluster_now` Celery task, bypasses interval gating) plus
+    per-row `last_synced_at` / `last_sync_error` display. K8s
+    client is a thin `httpx`-based REST wrapper — no
+    `kubernetes-asyncio` dep.
 
   - ⬜ **Phase 2 — external-dns webhook provider (separate
     feature).** Implement the external-dns webhook provider HTTP
