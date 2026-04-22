@@ -181,3 +181,11 @@ class PlatformSettings(Base):
     oui_last_updated_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+
+    # Integrations — one toggle per integration type. Granular by design:
+    # enabling Kubernetes should not implicitly enable a future Terraform
+    # Cloud / ServiceNow integration. When a toggle is on, the
+    # corresponding top-level sidebar nav item appears.
+    integration_kubernetes_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )

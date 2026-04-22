@@ -9,6 +9,7 @@ import { IPAMPage } from "@/pages/ipam/IPAMPage";
 import { DNSPage } from "@/pages/dns/DNSPage";
 import { VLANsPage } from "@/pages/vlans/VLANsPage";
 import { DHCPPage } from "@/pages/dhcp/DHCPPage";
+import { KubernetesPage } from "@/pages/kubernetes/KubernetesPage";
 import { LogsPage } from "@/pages/LogsPage";
 import { UsersPage } from "@/pages/admin/UsersPage";
 import { AuditPage } from "@/pages/admin/AuditPage";
@@ -47,6 +48,7 @@ export default function App() {
         <Route path="vlans" element={<VLANsPage />} />
         <Route path="dhcp" element={<DHCPPage />} />
         <Route path="logs" element={<LogsPage />} />
+        <Route path="kubernetes" element={<KubernetesPage />} />
         <Route path="admin/users" element={<UsersPage />} />
         <Route path="admin/groups" element={<GroupsPage />} />
         <Route path="admin/roles" element={<RolesPage />} />

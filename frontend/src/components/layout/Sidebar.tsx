@@ -21,13 +21,14 @@ import {
   ScrollText,
   BellRing,
   Sparkles,
+  Boxes,
   X,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { versionApi } from "@/lib/api";
+import { settingsApi, versionApi } from "@/lib/api";
 import logoIcon from "@/assets/logo-icon.svg";
 
-const mainNav = [
+const baseMainNav = [
   { label: "Dashboard", icon: LayoutDashboard, to: "/dashboard" },
   { label: "IPAM", icon: Network, to: "/ipam" },
   { label: "DHCP", icon: Server, to: "/dhcp" },
@@ -132,6 +133,22 @@ export function Sidebar({
   const updateAvailable = versionInfo?.update_available ?? false;
   const latestVersion = versionInfo?.latest_version ?? null;
   const latestReleaseUrl = versionInfo?.latest_release_url ?? null;
+
+  // Platform settings drive which integration nav items are visible.
+  // The settings endpoint is post-login only, so no need to guard —
+  // the sidebar itself doesn't render on the login page.
+  const { data: platformSettings } = useQuery({
+    queryKey: ["settings"],
+    queryFn: settingsApi.get,
+    staleTime: 5 * 60 * 1000,
+  });
+
+  const mainNav = [
+    ...baseMainNav,
+    ...(platformSettings?.integration_kubernetes_enabled
+      ? [{ label: "Kubernetes", icon: Boxes, to: "/kubernetes" }]
+      : []),
+  ];
 
   return (
     <>

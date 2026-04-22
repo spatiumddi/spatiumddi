@@ -84,6 +84,7 @@ type SectionId =
   | "dhcp"
   | "dhcp-lease-sync"
   | "audit-forward"
+  | "integrations-kubernetes"
   | "ip-allocation"
   | "oui-lookup"
   | "session"
@@ -91,7 +92,13 @@ type SectionId =
   | "updates"
   | "utilization";
 
-type SectionGroup = "Application" | "Security" | "IPAM" | "DNS" | "DHCP";
+type SectionGroup =
+  | "Application"
+  | "Security"
+  | "IPAM"
+  | "DNS"
+  | "DHCP"
+  | "Integrations";
 
 interface SectionDef {
   id: SectionId;
@@ -111,6 +118,7 @@ const GROUP_ORDER: SectionGroup[] = [
   "IPAM",
   "DNS",
   "DHCP",
+  "Integrations",
 ];
 
 // Which PlatformSettings keys each section owns — drives the per-section
@@ -150,6 +158,7 @@ const SECTION_FIELDS: Record<SectionId, (keyof PlatformSettings)[]> = {
   // service); they're intentionally not listed here so the singleton
   // Save button doesn't hit them.
   "audit-forward": [],
+  "integrations-kubernetes": ["integration_kubernetes_enabled"],
   "ip-allocation": ["ip_allocation_strategy"],
   "oui-lookup": ["oui_lookup_enabled", "oui_update_interval_hours"],
   session: ["session_timeout_minutes", "auto_logout_minutes"],
@@ -644,6 +653,26 @@ const SECTIONS: SectionDef[] = [
       "mirror",
       "additive",
       "auto",
+    ],
+  },
+
+  // ── Integrations ─────────────────────────────────────────────────────
+  {
+    id: "integrations-kubernetes",
+    title: "Kubernetes",
+    group: "Integrations",
+    description:
+      "Connect one or more Kubernetes clusters. When enabled, SpatiumDDI adds a Kubernetes menu item to the sidebar where you manage per-cluster connection configs. Read-only — SpatiumDDI polls the cluster's API server with a service-account token and mirrors LoadBalancer VIPs, Node IPs, cluster CIDRs, and Ingress hostnames into the bound IPAM space + DNS group. Never writes to the cluster.",
+    keywords: [
+      "kubernetes",
+      "k8s",
+      "cluster",
+      "integration",
+      "ingress",
+      "loadbalancer",
+      "ipam",
+      "dns",
+      "service account",
     ],
   },
 ];
@@ -1381,6 +1410,34 @@ export function SettingsPage() {
                   disabled={!isSuperadmin}
                 />
               </Field>
+            )}
+
+            {activeId === "integrations-kubernetes" && (
+              <>
+                <Field
+                  label="Enable Kubernetes integration"
+                  description="Adds a Kubernetes menu item to the sidebar. Per-cluster connection configs are managed there."
+                >
+                  <Toggle
+                    checked={!!values.integration_kubernetes_enabled}
+                    onChange={(v) => set("integration_kubernetes_enabled", v)}
+                    disabled={!isSuperadmin}
+                  />
+                </Field>
+                {values.integration_kubernetes_enabled && (
+                  <Field
+                    label="Clusters"
+                    description="Manage connected clusters."
+                  >
+                    <a
+                      href="/kubernetes"
+                      className="inline-flex items-center gap-1 rounded-md border px-3 py-1.5 text-xs hover:bg-accent"
+                    >
+                      Open Kubernetes page →
+                    </a>
+                  </Field>
+                )}
+              </>
             )}
 
             {activeId === "utilization" && (

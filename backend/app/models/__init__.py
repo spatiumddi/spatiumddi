@@ -42,6 +42,7 @@ from app.models.ipam import (
     SubnetDomain,
     VLANMapping,
 )
+from app.models.kubernetes import KubernetesCluster
 from app.models.metrics import DHCPMetricSample, DNSMetricSample
 from app.models.oui import OUIVendor
 from app.models.settings import PlatformSettings
@@ -99,4 +100,5 @@ __all__ = [
     "DHCPRecordOp",
     "DNSMetricSample",
     "DHCPMetricSample",
+    "KubernetesCluster",
 ]

@@ -70,6 +70,7 @@ class SettingsResponse(BaseModel):
     oui_lookup_enabled: bool
     oui_update_interval_hours: int
     oui_last_updated_at: datetime | None
+    integration_kubernetes_enabled: bool
 
     model_config = {"from_attributes": True}
 
@@ -114,6 +115,7 @@ class SettingsUpdate(BaseModel):
     dhcp_default_lease_time: int | None = None
     oui_lookup_enabled: bool | None = None
     oui_update_interval_hours: int | None = None
+    integration_kubernetes_enabled: bool | None = None
 
     @field_validator("ip_allocation_strategy")
     @classmethod

@@ -1201,6 +1201,7 @@ export interface PlatformSettings {
   oui_lookup_enabled: boolean;
   oui_update_interval_hours: number;
   oui_last_updated_at: string | null;
+  integration_kubernetes_enabled: boolean;
 }
 
 export interface OUIStatus {
@@ -2990,4 +2991,85 @@ export interface VersionInfo {
 
 export const versionApi = {
   get: () => api.get<VersionInfo>("/version").then((r) => r.data),
+};
+
+// ── Kubernetes integration ─────────────────────────────────────────
+
+export interface KubernetesCluster {
+  id: string;
+  name: string;
+  description: string;
+  enabled: boolean;
+  api_server_url: string;
+  ca_bundle_present: boolean;
+  token_present: boolean;
+  ipam_space_id: string;
+  dns_group_id: string | null;
+  pod_cidr: string;
+  service_cidr: string;
+  sync_interval_seconds: number;
+  last_synced_at: string | null;
+  last_sync_error: string | null;
+  cluster_version: string | null;
+  node_count: number | null;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface KubernetesClusterCreate {
+  name: string;
+  description?: string;
+  enabled?: boolean;
+  api_server_url: string;
+  ca_bundle_pem?: string;
+  token: string;
+  ipam_space_id: string;
+  dns_group_id?: string | null;
+  pod_cidr?: string;
+  service_cidr?: string;
+  sync_interval_seconds?: number;
+}
+
+export interface KubernetesClusterUpdate {
+  name?: string;
+  description?: string;
+  enabled?: boolean;
+  api_server_url?: string;
+  ca_bundle_pem?: string;
+  token?: string;
+  ipam_space_id?: string;
+  dns_group_id?: string | null;
+  pod_cidr?: string;
+  service_cidr?: string;
+  sync_interval_seconds?: number;
+}
+
+export interface KubernetesTestResult {
+  ok: boolean;
+  message: string;
+  version: string | null;
+  node_count: number | null;
+}
+
+export const kubernetesApi = {
+  listClusters: () =>
+    api.get<KubernetesCluster[]>("/kubernetes/clusters").then((r) => r.data),
+  createCluster: (data: KubernetesClusterCreate) =>
+    api
+      .post<KubernetesCluster>("/kubernetes/clusters", data)
+      .then((r) => r.data),
+  updateCluster: (id: string, data: KubernetesClusterUpdate) =>
+    api
+      .put<KubernetesCluster>(`/kubernetes/clusters/${id}`, data)
+      .then((r) => r.data),
+  deleteCluster: (id: string) => api.delete(`/kubernetes/clusters/${id}`),
+  testConnection: (body: {
+    cluster_id?: string;
+    api_server_url?: string;
+    ca_bundle_pem?: string;
+    token?: string;
+  }) =>
+    api
+      .post<KubernetesTestResult>("/kubernetes/clusters/test", body)
+      .then((r) => r.data),
 };
