@@ -289,6 +289,21 @@ and runtime-version + GitHub-release-check wiring.
 
 ### Fixed
 
+- **Frontend Docker image fails to build for `linux/arm64`.** The
+  frontend Dockerfile's builder stage ran emulated under QEMU for
+  each `--platform` target, which on `linux/arm64-musl` triggered
+  the npm optional-dependency bug
+  ([npm/cli#4828](https://github.com/npm/cli/issues/4828)): the
+  committed `package-lock.json` only resolves concrete `node_modules/`
+  entries for `@rollup/rollup-linux-x64-{gnu,musl}`, so `npm install`
+  on emulated arm64 couldn't find `@rollup/rollup-linux-arm64-musl`
+  and rollup bailed with "Cannot find module". Fixed by pinning the
+  builder stage to `--platform=$BUILDPLATFORM` (usually amd64) — the
+  output `dist/` is static JS/CSS/HTML and platform-independent, so
+  the nginx final stage still ships both amd64 and arm64. Surfaced
+  during the initial `2026.04.22-1` release build; caught + fixed
+  before tag retargeted.
+
 - **Copy-to-clipboard fails on insecure origins (HTTP LAN deploys).**
   `navigator.clipboard.writeText` is only exposed on secure contexts
   (HTTPS or `localhost`), so the API-token reveal modal's Copy

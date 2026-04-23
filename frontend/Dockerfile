@@ -1,5 +1,14 @@
 # ── Stage 1: build ────────────────────────────────────────────────────────────
-FROM node:20-alpine AS builder
+# ``--platform=$BUILDPLATFORM`` forces the build stage to run natively on
+# the host architecture (typically amd64) instead of emulated under QEMU
+# for each ``--platform`` target. The output is a ``dist/`` tree of
+# static JS / CSS / HTML — platform-independent — which the final nginx
+# stage then wraps for both amd64 and arm64. Prevents the npm bug
+# (https://github.com/npm/cli/issues/4828) where a lockfile generated
+# on one platform lacks the ``@rollup/rollup-linux-arm64-musl`` optional
+# dep needed when ``npm install`` runs on emulated arm64-musl — which
+# was the failure mode on the 2026.04.22-1 release build.
+FROM --platform=$BUILDPLATFORM node:20-alpine AS builder
 
 # Release-pipeline version stamp. The release workflow passes the git
 # tag (e.g. ``2026.04.22-1``); local builds default to ``dev`` so
