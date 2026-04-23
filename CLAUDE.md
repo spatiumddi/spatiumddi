@@ -701,6 +701,141 @@ Phase 1 IPv6 closure + the Phase 2/3 DDNS / zone-state / CI-hardening items all 
   Scoped as a separate feature because it's a full management UI,
   not IPAM, and needs a websocket pipeline we don't have today.
 
+### Additional integration candidates (not started)
+
+Same read-only-pull reconciler shape as Kubernetes/Docker — each
+one gets a `*Target` row type, Settings → Integrations toggle,
+sidebar entry, and 30 s beat sweep with per-target interval
+gating. Ranked by homelab/SMB test accessibility + IPAM value so
+operators can exercise them in their own lab without standing up
+cloud accounts.
+
+- ⬜ **Proxmox VE** *(tier 1 — highest homelab leverage).* Each
+  `ProxmoxNode` polls `/api2/json/nodes/{n}/{qemu,lxc,network}`
+  with an API token (UI-generated, ACL-restricted). Mirror:
+  - Bridges + VLAN interfaces → Subnets (when they carry a CIDR).
+  - VM + LXC NICs → IPAddress rows with `status="proxmox-vm"` /
+    `"proxmox-lxc"`, hostname = VM name, MAC from config.
+  - Runtime IP comes from the QEMU guest-agent (`agent=1`) or
+    LXC's `/interfaces` endpoint when the instance is running;
+    falls back to config-time static IP, else null.
+  Token scope is explicit per-user in PVE, so read-only is easy
+  to produce. Cluster-aware — one row can represent the whole
+  cluster (query any node's API, it speaks for the cluster).
+  Natural parent block candidate: the node's bridge CIDR, or
+  auto-create RFC1918 supernet via the same helper Docker uses.
+
+- ⬜ **UniFi Network Application** *(tier 1 — biggest LAN
+  inventory win).* Per-controller row, API-key auth on modern
+  UniFi OS (Site Manager API), cookie+CSRF fallback on older
+  controllers. Multi-site aware. Mirror:
+  - Networks / VLANs → Subnets (respect `subnet` + `vlan`
+    fields; VLANs land as `VLAN` rows too, re-using the existing
+    VLAN table).
+  - Active clients → IPAddress rows with MAC + hostname + OUI
+    vendor + fixed_ip flag, refreshed every 30 s.
+  - DHCP fixed IPs (reservations) → IPAddress rows with
+    `status="reserved"` so the UI shows them as static.
+  The highest-value integration for home/SMB operators — plug a
+  new device into the network, it shows up in IPAM with correct
+  VLAN + vendor + hostname with zero operator effort. Design
+  wrinkle: UniFi's two API shapes (legacy controller vs. new
+  Site Manager) need two transport implementations; shared
+  reconciler on top. Per-site or per-network opt-in gates the
+  client-mirror so a noisy guest SSID doesn't fire-hose IPAM.
+
+- ⬜ **Tailscale** *(tier 1 — tiny surface, direct SpatiumDDI
+  relevance).* Per-`TailscaleTenant` row, PAT token, hits
+  `GET /api/v2/tailnet/{tn}/devices` every 30 s. Mirror every
+  tailnet device as an IPAddress in a dedicated Tailscale IP
+  space pre-carved out of `100.64.0.0/10`:
+  - Hostname = tailnet FQDN (`hostname.tailnet.ts.net`).
+  - `status="tailscale-node"`, MAC null (no L2 on the overlay).
+  - Custom fields: OS, client version, tags, authorized flag,
+    expires_at, user.
+  - Optional DNS sync: create AAAA + A records for the tailnet
+    FQDN in a chosen zone so SpatiumDDI-managed BIND9 can resolve
+    tailnet names for non-Tailscale consumers.
+  Smallest-surface integration on this list — probably a day of
+  work end-to-end. Directly relevant because the user's own
+  working environment runs on Tailscale (`*.rooster-trout.ts.net`
+  hostnames).
+
+- ⬜ **OPNsense** *(tier 1 — firewall-of-choice for labs).*
+  Per-`OPNsenseRouter` row, API key + secret auth over HTTPS.
+  REST endpoints: `/api/dhcpv4/leases/searchLease`,
+  `/api/dhcpv4/settings/getReservation`,
+  `/api/diagnostics/interface/getInterfaceConfig`,
+  `/api/interfaces/vlan_settings/get`. Mirror LAN / VLAN /
+  OPT* interfaces → Subnets, DHCP leases → IPAddress
+  (`status="dhcp"`, same shape as Kea mirror), static mappings →
+  `status="reserved"`. ARP table endpoint as a secondary
+  population source for devices with static-IP-outside-DHCP.
+
+- ⬜ **pfSense** *(tier 1 — paired with OPNsense).* Same scope
+  as OPNsense but through either the FauxAPI package or the
+  pfsense-api REST add-on. Auth shape differs (FauxAPI key-based,
+  HMAC-signed request body; pfsense-api JWT or API-key header).
+  Shared reconciler with OPNsense once both drivers are done —
+  the data model's the same (interfaces + DHCP + ARP).
+
+- ⬜ **MikroTik RouterOS 7** *(tier 2).* Native REST API on v7,
+  or the legacy API/API2 on v6. Per-`MikrotikRouter` row.
+  Mirror: interface addresses (`/ip/address`) → Subnets, DHCP
+  leases (`/ip/dhcp-server/lease`) → IPAddress, ARP table
+  (`/ip/arp`) as a fallback population source. Narrower
+  audience than OPNsense/pfSense but very common in some lab
+  + WISP shops.
+
+- ⬜ **Incus / LXD** *(tier 2 — Docker-adjacent).* Same shape as
+  the Docker integration — `/1.0/networks` + `/1.0/instances`
+  over HTTPS with client cert auth. Different runtime, same
+  reconciler architecture. Likely share ≥ 80 % of the code with
+  `services/docker/reconcile.py` via a common base — refactor
+  when the second container-runtime integration lands, not
+  before.
+
+- ⬜ **HashiCorp Nomad** *(tier 2 — Kubernetes alt).* Read-only
+  ACL token, `GET /v1/allocations?status=running`. Mirror
+  running allocations with a resolved IP → IPAddress with
+  `status="nomad-alloc"`, hostname = `<job>.<group>.<task>`,
+  plus the Nomad network CIDR as a Subnet. Smaller install base
+  than K8s but architecturally close — Docker/K8s reconciler
+  pattern slots right in.
+
+- ⬜ **NetBox read-only import (one-shot)** *(tier 2 — migration
+  tool, not continuous sync).* Pull existing IPAM state out of
+  a NetBox install so the operator can evaluate SpatiumDDI
+  without re-entering their inventory. Not an ongoing
+  reconciler — a UI-driven import at `Admin → Import →
+  NetBox` that reads prefixes + IP addresses + VLANs +
+  tenants (mapped to IP spaces) and stamps them into IPAM
+  with `custom_fields.imported_from="netbox"`. Differs from
+  every other entry here — it's migration tooling, not
+  integration.
+
+- ⬜ **Cloud VPC family (AWS / Azure / GCP / Hetzner / DO /
+  Linode / Vultr)** *(tier 3 — lab-inaccessible, but roadmap
+  coherent).* Same shape: per-account/subscription row with
+  access-key + region scope, mirror VPCs/VNets → IP spaces,
+  subnets → Subnets, EC2/VM instances → IPAddress rows. Cloud
+  DNS driver family already on the roadmap above is the
+  write-side counterpart. Gating for later — no lab relevance
+  for the Proxmox/UniFi/Tailscale/OPNsense operator base we're
+  aiming at first.
+
+**Explicit non-goals for the integrations shelf:**
+
+- **VMware vCenter / ESXi.** Bigger enterprise audience, but
+  vCenter's SOAP-heavy + licensed API makes it a significantly
+  bigger dev effort than the tier 1 candidates. Revisit only if
+  a deployment specifically needs it.
+- **SNMP device polling** as an integration. Already tracked as
+  its own line item above (IPAM ARP discovery); belongs with
+  ping-sweep / ARP-scan, not the read-only integration shelf.
+- **WireGuard raw config.** No API — config files only. Belongs
+  in a manual-import flow if at all.
+
 ---
 
 ## Version Scheme
