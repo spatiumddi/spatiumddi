@@ -5,9 +5,57 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versioning uses 
 
 ---
 
-## Unreleased
+## 2026.04.23-1 — 2026-04-23
+
+Integrations-heavy release. The headline work is **Docker** and
+**Kubernetes** read-only mirror integrations that pull host/cluster
+network state into IPAM automatically, plus three dashboard additions
+(platform-health card, integrations panel, collapsible sidebar) that
+make the control plane easier to eyeball at a glance. Also bundles
+the multi-target audit-forwarding rewrite, the ACME DNS-01 provider
+for external certbot / lego / acme.sh clients, the DHCP MAC
+blocklist, self-contained DNS+DHCP traffic charts on the dashboard,
+and runtime-version + GitHub-release-check wiring.
 
 ### Added
+
+- **Dashboard: Platform Health card.** Five-up grid showing the live
+  status of every control-plane component SpatiumDDI ships — API,
+  PostgreSQL, Redis, Celery workers, Celery beat. Per-component dot
+  (green / amber / red) + one-line detail ("SELECT 1 in 1 ms",
+  "1 alive", "last tick 5s ago"). Worker list surfaces on hover.
+  Backed by a new `/health/platform` endpoint that probes each
+  piece — worker liveness via `celery_app.control.inspect().ping()`
+  in a threadpool with a 3 s outer timeout (so a dead broker can't
+  hang the call), beat liveness via a new
+  `app.tasks.heartbeat.beat_tick` task that writes
+  `spatium:beat:heartbeat` to Redis every 30 s with a 5-minute TTL
+  and folds the key's age into ok (≤90 s) / warn (>90 s) / error
+  (missing). Endpoint always returns 200 with per-component status
+  so partial failures surface without the UI losing the whole card.
+  Runtime-agnostic — same output on Docker Compose, Kubernetes, or
+  bare metal.
+
+- **Dashboard: Integrations panel.** Appears when Kubernetes or
+  Docker integrations are enabled. Two columns (one per enabled
+  integration type) with one row per registered cluster / host:
+  status dot that folds `last_sync_error` + staleness into a single
+  green (synced recently) / amber (stalled > 3× interval) / red
+  (sync error) / gray (disabled or never synced) signal, name,
+  endpoint, node / container count, humanized last-synced age.
+  Section header click-throughs to `/kubernetes` / `/docker` full
+  pages. Panel auto-hides when both integration toggles are off —
+  default deployments stay clean.
+
+- **Sidebar: collapsible sections + Core header.** All three
+  sections now carry an uppercase chevron-header — **Core** (was
+  unlabeled), **Integrations**, **Admin** — and each toggles
+  open/closed independently. Per-section expanded state persists to
+  `sessionStorage` via the existing `useSessionState` helper so it
+  survives in-session navigation but not tab close. Collapsed-
+  sidebar mode still uses separator lines (no labels to hide at
+  that width). Groundwork for adding more sections without the
+  sidebar becoming a wall of links.
 
 - **Docker integration (read-only host mirror).** Settings →
   Integrations → Docker toggle (`integration_docker_enabled`)
@@ -240,6 +288,25 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versioning uses 
   `backend/tests/test_ipam_block_overlap.py`.
 
 ### Fixed
+
+- **Copy-to-clipboard fails on insecure origins (HTTP LAN deploys).**
+  `navigator.clipboard.writeText` is only exposed on secure contexts
+  (HTTPS or `localhost`), so the API-token reveal modal's Copy
+  button silently no-op'd on plain-HTTP LAN deployments served by
+  IP / mDNS / Tailscale hostnames. Shared helper now falls back to
+  a detached `<textarea>` + `document.execCommand("copy")` when the
+  clipboard API is unavailable, so Copy works in every deployment
+  topology. Tests cover both the secure-context happy path and the
+  fallback path.
+
+- **CodeQL alert #15 (`py/incomplete-url-substring-sanitization`).**
+  The ACME account-registration test asserted
+  `body["fulldomain"].endswith("acme.example.com")`, which
+  CodeQL's URL-host rule flags as an unsafe substring check even
+  in test code. Reworked to an exact-match comparison against
+  `f"{subdomain}.acme.example.com"` — silences the static analyzer
+  and tightens the test (now fails on any unexpected affix between
+  the subdomain and zone name, not just on a wrong zone).
 
 - **`audit_forward` crash in Celery workers.** The `after_commit`
   listener fired `loop.create_task(_dispatch(...))` which called

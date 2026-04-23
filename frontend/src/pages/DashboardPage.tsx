@@ -1002,17 +1002,12 @@ function prettyComponentName(name: string): string {
 }
 
 function PlatformHealthCard({ health }: { health: PlatformHealthResponse }) {
-  const headlineTone =
-    health.status === "ok"
-      ? "bg-emerald-500"
-      : "bg-red-500";
+  const headlineTone = health.status === "ok" ? "bg-emerald-500" : "bg-red-500";
   return (
     <div className="rounded-lg border bg-card">
       <div className="flex items-center justify-between border-b px-4 py-2.5">
         <div className="flex items-center gap-2">
-          <span
-            className={cn("h-1.5 w-1.5 rounded-full", headlineTone)}
-          />
+          <span className={cn("h-1.5 w-1.5 rounded-full", headlineTone)} />
           <h3 className="text-xs font-semibold uppercase tracking-wider">
             Platform Health
           </h3>
@@ -1128,9 +1123,7 @@ function IntegrationsPanel({
                     to={`/kubernetes`}
                     name={c.name}
                     subtitle={c.api_server_url}
-                    meta={
-                      c.node_count != null ? `${c.node_count} nodes` : "—"
-                    }
+                    meta={c.node_count != null ? `${c.node_count} nodes` : "—"}
                     lastSyncedAt={c.last_synced_at}
                     lastSyncError={c.last_sync_error}
                     intervalSeconds={c.sync_interval_seconds}
@@ -1217,7 +1210,10 @@ function IntegrationRow({
       <span className="w-28 truncate font-semibold" title={name}>
         {name}
       </span>
-      <span className="w-48 truncate font-mono text-muted-foreground" title={subtitle}>
+      <span
+        className="w-48 truncate font-mono text-muted-foreground"
+        title={subtitle}
+      >
         {subtitle}
       </span>
       <span className="w-28 truncate text-muted-foreground" title={meta}>

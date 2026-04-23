@@ -41,13 +41,13 @@ import asyncio
 import json
 import socket
 import ssl
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from typing import Any
 
 import httpx
 import structlog
-from contextlib import asynccontextmanager
-from collections.abc import AsyncIterator
 from sqlalchemy import event, select
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.pool import NullPool

@@ -42,8 +42,11 @@
 - 🌐 **Built-in DNS server** — BIND9 container that auto-registers, syncs via RFC 2136, and reports per-server zone serial drift
 - 🔄 **DHCP server management** — Kea container + agent with lease tracking; group-centric HA (hot-standby + load-balancing) with live state reporting, self-healing peer-IP drift, and supervised daemons for crash-loop-safe restarts
 - 🪟 **Windows Server DNS + DHCP** — agentless management of existing Windows DCs (RFC 2136 + WinRM for DNS; near-real-time WinRM lease-mirroring for DHCP). No software installed on the Windows side.
+- 🧩 **Read-only integrations** — auto-mirror **Kubernetes** clusters (CIDRs, nodes, LoadBalancer VIPs, Ingress → DNS) and **Docker** hosts (networks, optional container IPs) into IPAM with one-click setup guides. Settings toggle gates each; per-target sync interval + on-demand Sync Now. Supernet auto-creation for RFC 1918 / CGNAT ranges keeps the tree tidy.
+- 🎨 **Dashboard-at-a-glance** — platform health card (API / Postgres / Redis / workers / beat), live DNS query rate + DHCP traffic charts (BIND9 statistics-channels + Kea `statistic-get-all`, self-contained — no Prometheus needed), subnet utilization heatmap, and live activity feed
 - 🔒 **Group-based RBAC + external identity** — LDAP, OIDC, SAML, RADIUS, TACACS+ with backup-server failover; delegate IP ranges and zones by role; API tokens with auto-expiry
-- 🔔 **Alerts + audit forwarding** — rule-based alerts framework (subnet utilization, server unreachable) + fire-and-forget RFC 5424 syslog + HTTP webhook forwarding for every mutation
+- 🔔 **Alerts + audit forwarding** — rule-based alerts framework (subnet utilization, server unreachable) + multi-target syslog (UDP / TCP / TLS) + HTTP webhook forwarding with pluggable wire formats (RFC 5424 JSON / CEF / LEEF / RFC 3164 / JSON lines) and per-target filters
+- 🔐 **ACME DNS-01 provider** — `acme-dns`-compatible HTTP surface so certbot / lego / acme.sh can issue public certs (wildcards included) for names delegated to a SpatiumDDI-managed zone
 - 🏷 **IEEE OUI vendor lookup** — opt-in display of MAC vendor names in IP tables and DHCP leases, with filter-by-vendor support
 - 📋 **Full audit trail** — every mutation logged, append-only, viewable in the UI with per-column filters
 - 🚀 **Flexible deployment** — Docker Compose, Kubernetes (Helm umbrella chart + OCI publishing), bare metal, or OS appliance

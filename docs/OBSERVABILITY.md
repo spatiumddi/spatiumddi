@@ -439,6 +439,32 @@ All services expose:
 **`GET /health/startup`** — Startup probe (for Kubernetes slow-start containers)
 - Same as readiness but used only during initial startup
 
+**`GET /health/platform`** — Per-component rollup for the dashboard
+- Unlike `/health/ready` (which returns a single binary verdict for
+  orchestrator probes), this endpoint enumerates each control-plane
+  piece so the UI can show a per-component status dot.
+- Response: `200 {"status": "ok"|"degraded", "components": [...]}`.
+  Individual component failures **never** make the endpoint itself
+  fail — the caller always gets a 200 with the rollup so a single
+  flaky component doesn't blank the dashboard card.
+- Components checked:
+  - `api` — always `ok` when the endpoint responds
+  - `postgres` — `SELECT 1` with round-trip latency in the detail
+  - `redis` — `PING` with round-trip latency
+  - `celery-workers` — `celery_app.control.inspect(timeout=2).ping()`
+    run in a threadpool with a 3 s overall timeout (so a dead broker
+    can't hang the endpoint). Detail carries the worker count; full
+    list surfaces on UI hover.
+  - `celery-beat` — reads the `spatium:beat:heartbeat` key from
+    Redis (written by `app.tasks.heartbeat.beat_tick` every 30 s with
+    a 5-min TTL). Age folded into `ok` (≤ 90 s), `warn` (> 90 s — two
+    beat intervals missed), or `error` (missing — beat stopped or
+    down > 5 min).
+- Consumed by the Dashboard → Platform Health card. Authenticated
+  dashboard users only — the endpoint itself is unauthenticated for
+  parity with the other `/health/*` probes, and exposes nothing a
+  normal monitoring probe doesn't already see.
+
 ---
 
 ## 8. Bundled Grafana Dashboards
