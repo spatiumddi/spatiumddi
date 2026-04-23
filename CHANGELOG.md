@@ -5,7 +5,7 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versioning uses 
 
 ---
 
-## 2026.04.23-1 — 2026-04-23
+## 2026.04.22-1 — 2026-04-22
 
 Integrations-heavy release. The headline work is **Docker** and
 **Kubernetes** read-only mirror integrations that pull host/cluster
