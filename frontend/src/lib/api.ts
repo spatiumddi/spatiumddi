@@ -3170,6 +3170,31 @@ export interface DockerTestResult {
   container_count: number | null;
 }
 
+// ── Platform health ─────────────────────────────────────────────────
+
+export type PlatformHealthStatus = "ok" | "warn" | "error";
+
+export interface PlatformHealthComponent {
+  name: string;
+  status: PlatformHealthStatus;
+  detail: string;
+  workers?: string[];
+  last_tick?: string;
+}
+
+export interface PlatformHealthResponse {
+  status: "ok" | "degraded";
+  components: PlatformHealthComponent[];
+}
+
+export const platformHealthApi = {
+  get: () =>
+    // Endpoint lives at root (outside /api/v1) so strip the prefix.
+    api
+      .get<PlatformHealthResponse>("/health/platform", { baseURL: "/" })
+      .then((r) => r.data),
+};
+
 export const dockerApi = {
   listHosts: () => api.get<DockerHost[]>("/docker/hosts").then((r) => r.data),
   createHost: (data: DockerHostCreate) =>

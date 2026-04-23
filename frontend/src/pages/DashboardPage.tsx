@@ -4,12 +4,15 @@ import {
   Activity,
   AlertTriangle,
   Ban,
+  Boxes,
   Check,
+  Container as ContainerIcon,
   Cpu,
   FileText,
   Globe2,
   Layers,
   Network,
+  Plug,
   RefreshCw,
   Server,
   Shield,
@@ -20,10 +23,17 @@ import {
   dhcpApi,
   auditApi,
   settingsApi,
+  kubernetesApi,
+  dockerApi,
+  platformHealthApi,
   type Subnet,
   type DNSServer,
   type DHCPServer,
   type DHCPServerGroup,
+  type KubernetesCluster,
+  type DockerHost,
+  type PlatformHealthResponse,
+  type PlatformHealthStatus,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { includeInUtilization } from "@/lib/utilization";
@@ -378,6 +388,33 @@ export function DashboardPage() {
     refetchInterval: 15_000,
   });
 
+  // Integrations — only fetched when the corresponding toggle is on,
+  // so default deployments don't pay for the queries.
+  const kubernetesEnabled = settings?.integration_kubernetes_enabled ?? false;
+  const dockerEnabled = settings?.integration_docker_enabled ?? false;
+  const { data: k8sClusters = [] } = useQuery<KubernetesCluster[]>({
+    queryKey: ["kubernetes-clusters"],
+    queryFn: kubernetesApi.listClusters,
+    enabled: kubernetesEnabled,
+    refetchInterval: 30_000,
+  });
+  const { data: dockerHosts = [] } = useQuery<DockerHost[]>({
+    queryKey: ["docker-hosts"],
+    queryFn: dockerApi.listHosts,
+    enabled: dockerEnabled,
+    refetchInterval: 30_000,
+  });
+
+  // Platform health — covers api / postgres / redis / celery workers /
+  // celery beat. Unlike DNS/DHCP server health (which is user-managed),
+  // these are the pieces *we* ship, so surfacing their liveness makes
+  // the dashboard a one-stop check for "is the control plane healthy".
+  const { data: platformHealth } = useQuery<PlatformHealthResponse>({
+    queryKey: ["platform-health"],
+    queryFn: platformHealthApi.get,
+    refetchInterval: 30_000,
+  });
+
   // Derived stats — every utilization-driven counter reads from
   // `reportSubnets` so small PTP / loopback subnets don't skew the
   // dashboard. `subnets` (the unfiltered list) is still used for
@@ -680,6 +717,9 @@ export function DashboardPage() {
           </div>
         </div>
 
+        {/* ── Platform health (control-plane components) ─────────────── */}
+        {platformHealth && <PlatformHealthCard health={platformHealth} />}
+
         {/* ── Services panel ─────────────────────────────────────────── */}
         {allServers.length > 0 && (
           <div className="rounded-lg border bg-card">
@@ -775,6 +815,16 @@ export function DashboardPage() {
               </div>
             </div>
           </div>
+        )}
+
+        {/* ── Integrations panel ─────────────────────────────────────── */}
+        {(kubernetesEnabled || dockerEnabled) && (
+          <IntegrationsPanel
+            kubernetesEnabled={kubernetesEnabled}
+            dockerEnabled={dockerEnabled}
+            clusters={k8sClusters}
+            hosts={dockerHosts}
+          />
         )}
 
         {/* ── Empty state ────────────────────────────────────────────── */}
@@ -922,6 +972,263 @@ function FailoverRow({ group }: { group: DHCPServerGroup }) {
             </span>
           </span>
         ))}
+      </span>
+    </Link>
+  );
+}
+
+// ── Platform health card ────────────────────────────────────────────────
+// One row per control-plane component (api / postgres / redis / celery
+// workers / celery beat). Each comes back from /health/platform with a
+// green/amber/red status — we render them as a compact inline strip so
+// the whole card fits in roughly the height of a single KPI row.
+function platformStatusDotCls(status: PlatformHealthStatus): string {
+  return status === "ok"
+    ? "bg-emerald-500"
+    : status === "warn"
+      ? "bg-amber-500"
+      : "bg-red-500";
+}
+
+function prettyComponentName(name: string): string {
+  const map: Record<string, string> = {
+    api: "API",
+    postgres: "PostgreSQL",
+    redis: "Redis",
+    "celery-workers": "Workers",
+    "celery-beat": "Beat",
+  };
+  return map[name] ?? name;
+}
+
+function PlatformHealthCard({ health }: { health: PlatformHealthResponse }) {
+  const headlineTone =
+    health.status === "ok"
+      ? "bg-emerald-500"
+      : "bg-red-500";
+  return (
+    <div className="rounded-lg border bg-card">
+      <div className="flex items-center justify-between border-b px-4 py-2.5">
+        <div className="flex items-center gap-2">
+          <span
+            className={cn("h-1.5 w-1.5 rounded-full", headlineTone)}
+          />
+          <h3 className="text-xs font-semibold uppercase tracking-wider">
+            Platform Health
+          </h3>
+          <span className="text-[11px] text-muted-foreground">
+            {health.status === "ok" ? "all good" : "degraded"}
+          </span>
+        </div>
+      </div>
+      <div className="divide-y sm:grid sm:grid-cols-2 sm:divide-y-0 sm:divide-x lg:grid-cols-5">
+        {health.components.map((c) => (
+          <div
+            key={c.name}
+            className="flex min-w-0 items-center gap-2 px-4 py-2.5"
+            title={
+              c.workers && c.workers.length > 0
+                ? `${c.detail}\n${c.workers.join("\n")}`
+                : c.detail
+            }
+          >
+            <span
+              className={cn(
+                "h-1.5 w-1.5 flex-shrink-0 rounded-full",
+                platformStatusDotCls(c.status),
+              )}
+            />
+            <div className="min-w-0 flex-1">
+              <div className="truncate text-xs font-medium">
+                {prettyComponentName(c.name)}
+              </div>
+              <div className="truncate text-[10px] text-muted-foreground">
+                {c.detail}
+              </div>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// ── Integrations panel ─────────────────────────────────────────────────────
+// One section per enabled integration — each row shows name, endpoint
+// hint, sync age, mirrored counts, and a status dot that folds
+// last_sync_error + staleness into a single green/amber/red signal.
+function integrationDotCls(
+  lastSyncedAt: string | null,
+  lastSyncError: string | null,
+  intervalSeconds: number,
+): string {
+  if (lastSyncError) return "bg-red-500";
+  if (!lastSyncedAt) return "bg-muted-foreground/40";
+  const age = (Date.now() - new Date(lastSyncedAt).getTime()) / 1000;
+  // Amber when the last sync is older than ~3 intervals — implies the
+  // reconcile beat sweep is stalled or the target is unreachable.
+  return age > intervalSeconds * 3 ? "bg-amber-500" : "bg-emerald-500";
+}
+
+function IntegrationsPanel({
+  kubernetesEnabled,
+  dockerEnabled,
+  clusters,
+  hosts,
+}: {
+  kubernetesEnabled: boolean;
+  dockerEnabled: boolean;
+  clusters: KubernetesCluster[];
+  hosts: DockerHost[];
+}) {
+  const hasK8s = kubernetesEnabled;
+  const hasDocker = dockerEnabled;
+  const cols = [hasK8s, hasDocker].filter(Boolean).length;
+  return (
+    <div className="rounded-lg border bg-card">
+      <div className="flex items-center justify-between border-b px-4 py-2.5">
+        <div className="flex items-center gap-2">
+          <Plug className="h-3.5 w-3.5 text-muted-foreground" />
+          <h3 className="text-xs font-semibold uppercase tracking-wider">
+            Integrations
+          </h3>
+          <span className="text-[11px] text-muted-foreground">
+            {clusters.length + hosts.length} target
+            {clusters.length + hosts.length === 1 ? "" : "s"}
+          </span>
+        </div>
+      </div>
+      <div
+        className={cn(
+          "grid divide-y",
+          cols === 2 && "md:grid-cols-2 md:divide-x md:divide-y-0",
+        )}
+      >
+        {hasK8s && (
+          <div className="min-w-0">
+            <Link
+              to="/kubernetes"
+              className="flex items-center gap-1.5 bg-muted/30 px-4 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground hover:bg-muted/50"
+            >
+              <Boxes className="h-3 w-3" />
+              Kubernetes ({clusters.length})
+              <span className="ml-auto text-[10px] text-muted-foreground/70">
+                view all →
+              </span>
+            </Link>
+            {clusters.length === 0 ? (
+              <p className="px-4 py-3 text-[11px] italic text-muted-foreground">
+                No clusters registered.
+              </p>
+            ) : (
+              <div className="divide-y">
+                {clusters.map((c) => (
+                  <IntegrationRow
+                    key={c.id}
+                    to={`/kubernetes`}
+                    name={c.name}
+                    subtitle={c.api_server_url}
+                    meta={
+                      c.node_count != null ? `${c.node_count} nodes` : "—"
+                    }
+                    lastSyncedAt={c.last_synced_at}
+                    lastSyncError={c.last_sync_error}
+                    intervalSeconds={c.sync_interval_seconds}
+                    enabled={c.enabled}
+                  />
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+        {hasDocker && (
+          <div className="min-w-0">
+            <Link
+              to="/docker"
+              className="flex items-center gap-1.5 bg-muted/30 px-4 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground hover:bg-muted/50"
+            >
+              <ContainerIcon className="h-3 w-3" />
+              Docker ({hosts.length})
+              <span className="ml-auto text-[10px] text-muted-foreground/70">
+                view all →
+              </span>
+            </Link>
+            {hosts.length === 0 ? (
+              <p className="px-4 py-3 text-[11px] italic text-muted-foreground">
+                No hosts registered.
+              </p>
+            ) : (
+              <div className="divide-y">
+                {hosts.map((h) => (
+                  <IntegrationRow
+                    key={h.id}
+                    to={`/docker`}
+                    name={h.name}
+                    subtitle={h.endpoint}
+                    meta={
+                      h.container_count != null
+                        ? `${h.container_count} containers`
+                        : "—"
+                    }
+                    lastSyncedAt={h.last_synced_at}
+                    lastSyncError={h.last_sync_error}
+                    intervalSeconds={h.sync_interval_seconds}
+                    enabled={h.enabled}
+                  />
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function IntegrationRow({
+  to,
+  name,
+  subtitle,
+  meta,
+  lastSyncedAt,
+  lastSyncError,
+  intervalSeconds,
+  enabled,
+}: {
+  to: string;
+  name: string;
+  subtitle: string;
+  meta: string;
+  lastSyncedAt: string | null;
+  lastSyncError: string | null;
+  intervalSeconds: number;
+  enabled: boolean;
+}) {
+  const dotCls = !enabled
+    ? "bg-muted-foreground/40"
+    : integrationDotCls(lastSyncedAt, lastSyncError, intervalSeconds);
+  return (
+    <Link
+      to={to}
+      className="flex items-center gap-3 px-4 py-2 text-[11px] hover:bg-muted/30"
+      title={lastSyncError ?? undefined}
+    >
+      <span className={cn("h-1.5 w-1.5 flex-shrink-0 rounded-full", dotCls)} />
+      <span className="w-28 truncate font-semibold" title={name}>
+        {name}
+      </span>
+      <span className="w-48 truncate font-mono text-muted-foreground" title={subtitle}>
+        {subtitle}
+      </span>
+      <span className="w-28 truncate text-muted-foreground" title={meta}>
+        {meta}
+      </span>
+      <span className="ml-auto w-20 flex-shrink-0 text-right text-muted-foreground">
+        {!enabled
+          ? "disabled"
+          : lastSyncedAt
+            ? humanTime(lastSyncedAt)
+            : "never"}
       </span>
     </Link>
   );

@@ -237,8 +237,12 @@ async def test_register_success_returns_once(client: AsyncClient, db_session: As
     assert body["username"]
     assert body["password"]
     assert body["subdomain"]
-    assert body["fulldomain"].startswith(body["subdomain"] + ".")
-    assert body["fulldomain"].endswith("acme.example.com")
+    # Exact-match assertion (not `endswith`) so the test fails on any
+    # unexpected affix. Also silences CodeQL's
+    # ``py/incomplete-url-substring-sanitization`` rule, which treats
+    # ``endswith("domain")`` as a potentially unsafe host check even in
+    # test code.
+    assert body["fulldomain"] == f"{body['subdomain']}.acme.example.com"
     assert body["allowfrom"] == ["10.0.0.0/8"]
     # Plaintext password verifies against stored hash
     row = (

@@ -17,6 +17,7 @@ celery_app = Celery(
         "app.tasks.dhcp_mac_blocks",
         "app.tasks.dhcp_pull_leases",
         "app.tasks.alerts",
+        "app.tasks.heartbeat",
         "app.tasks.oui_update",
         "app.tasks.prune_metrics",
         "app.tasks.update_check",
@@ -51,6 +52,7 @@ celery_app.conf.update(
         "app.tasks.dhcp_mac_blocks.*": {"queue": "dhcp"},
         "app.tasks.dhcp_pull_leases.*": {"queue": "dhcp"},
         "app.tasks.alerts.*": {"queue": "default"},
+        "app.tasks.heartbeat.*": {"queue": "default"},
         "app.tasks.oui_update.*": {"queue": "default"},
         "app.tasks.prune_metrics.*": {"queue": "default"},
         "app.tasks.update_check.*": {"queue": "default"},
@@ -164,6 +166,14 @@ celery_app.conf.update(
         # ``PlatformSettings.integration_docker_enabled``.
         "docker-sync-sweep": {
             "task": "app.tasks.docker_sync.sweep_docker_hosts",
+            "schedule": schedule(run_every=30.0),
+        },
+        # Beat self-heartbeat — writes a redis key every 30 s with a
+        # 5-min TTL so the platform-health endpoint can tell a stalled
+        # beat from a healthy one. Celery has no built-in beat-liveness
+        # primitive, so a trivial heartbeat task is the cheapest signal.
+        "platform-beat-heartbeat": {
+            "task": "app.tasks.heartbeat.beat_tick",
             "schedule": schedule(run_every=30.0),
         },
     },

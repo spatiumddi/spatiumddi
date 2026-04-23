@@ -15,6 +15,8 @@ import {
   ClipboardList,
   ChevronsLeft,
   ChevronsRight,
+  ChevronDown,
+  ChevronRight,
   Settings,
   Tags,
   ShieldCheck,
@@ -27,6 +29,7 @@ import {
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { settingsApi, versionApi } from "@/lib/api";
+import { useSessionState } from "@/lib/useSessionState";
 import logoIcon from "@/assets/logo-icon.svg";
 
 const baseMainNav = [
@@ -49,6 +52,50 @@ const adminNav = [
   { label: "Settings", icon: Settings, to: "/settings" },
   { label: "Users", icon: Users, to: "/admin/users" },
 ];
+
+function NavSection({
+  label,
+  storageKey,
+  collapsed,
+  children,
+  showDivider = false,
+}: {
+  label: string;
+  storageKey: string;
+  collapsed: boolean;
+  children: React.ReactNode;
+  showDivider?: boolean;
+}) {
+  const [open, setOpen] = useSessionState<boolean>(storageKey, true);
+
+  if (collapsed) {
+    return (
+      <>
+        {showDivider && <div className="my-2 border-t border-sidebar-border" />}
+        <div className="space-y-1">{children}</div>
+      </>
+    );
+  }
+
+  return (
+    <div>
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        className="group flex w-full items-center gap-1 px-2 py-1 text-xs font-semibold uppercase tracking-wider text-sidebar-muted-foreground/70 hover:text-sidebar-foreground"
+        aria-expanded={open}
+      >
+        {open ? (
+          <ChevronDown className="h-3 w-3 flex-shrink-0" />
+        ) : (
+          <ChevronRight className="h-3 w-3 flex-shrink-0" />
+        )}
+        <span>{label}</span>
+      </button>
+      {open && <div className="space-y-1">{children}</div>}
+    </div>
+  );
+}
 
 function NavItem({
   label,
@@ -212,8 +259,12 @@ export function Sidebar({
         </div>
 
         {/* Nav */}
-        <nav className="flex-1 overflow-y-auto p-2">
-          <div className="space-y-1">
+        <nav className="flex-1 overflow-y-auto p-2 space-y-4">
+          <NavSection
+            label="Core"
+            storageKey="sidebar-section-core-open"
+            collapsed={effectiveCollapsed}
+          >
             {mainNav.map((item) => (
               <NavItem
                 key={item.to}
@@ -222,42 +273,16 @@ export function Sidebar({
                 onNavigate={mobileOpen ? onMobileClose : undefined}
               />
             ))}
-          </div>
+          </NavSection>
 
           {integrationsNav.length > 0 && (
-            <div className="mt-4">
-              {!effectiveCollapsed && (
-                <p className="mb-1 px-3 text-xs font-semibold uppercase tracking-wider text-sidebar-muted-foreground/70">
-                  Integrations
-                </p>
-              )}
-              {effectiveCollapsed && (
-                <div className="my-2 border-t border-sidebar-border" />
-              )}
-              <div className="space-y-1">
-                {integrationsNav.map((item) => (
-                  <NavItem
-                    key={item.to}
-                    {...item}
-                    collapsed={effectiveCollapsed}
-                    onNavigate={mobileOpen ? onMobileClose : undefined}
-                  />
-                ))}
-              </div>
-            </div>
-          )}
-
-          <div className="mt-4">
-            {!effectiveCollapsed && (
-              <p className="mb-1 px-3 text-xs font-semibold uppercase tracking-wider text-sidebar-muted-foreground/70">
-                Admin
-              </p>
-            )}
-            {effectiveCollapsed && (
-              <div className="my-2 border-t border-sidebar-border" />
-            )}
-            <div className="space-y-1">
-              {adminNav.map((item) => (
+            <NavSection
+              label="Integrations"
+              storageKey="sidebar-section-integrations-open"
+              collapsed={effectiveCollapsed}
+              showDivider
+            >
+              {integrationsNav.map((item) => (
                 <NavItem
                   key={item.to}
                   {...item}
@@ -265,8 +290,24 @@ export function Sidebar({
                   onNavigate={mobileOpen ? onMobileClose : undefined}
                 />
               ))}
-            </div>
-          </div>
+            </NavSection>
+          )}
+
+          <NavSection
+            label="Admin"
+            storageKey="sidebar-section-admin-open"
+            collapsed={effectiveCollapsed}
+            showDivider
+          >
+            {adminNav.map((item) => (
+              <NavItem
+                key={item.to}
+                {...item}
+                collapsed={effectiveCollapsed}
+                onNavigate={mobileOpen ? onMobileClose : undefined}
+              />
+            ))}
+          </NavSection>
         </nav>
 
         {/* Footer */}
