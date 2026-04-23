@@ -1202,6 +1202,7 @@ export interface PlatformSettings {
   oui_update_interval_hours: number;
   oui_last_updated_at: string | null;
   integration_kubernetes_enabled: boolean;
+  integration_docker_enabled: boolean;
 }
 
 export interface OUIStatus {
@@ -3099,5 +3100,94 @@ export const kubernetesApi = {
         "/kubernetes/clusters/detect-cidrs",
         body,
       )
+      .then((r) => r.data),
+};
+
+// ── Docker integration ──────────────────────────────────────────────
+
+export interface DockerHost {
+  id: string;
+  name: string;
+  description: string;
+  enabled: boolean;
+  connection_type: "unix" | "tcp";
+  endpoint: string;
+  ca_bundle_present: boolean;
+  client_cert_present: boolean;
+  client_key_present: boolean;
+  ipam_space_id: string;
+  dns_group_id: string | null;
+  mirror_containers: boolean;
+  include_default_networks: boolean;
+  include_stopped_containers: boolean;
+  sync_interval_seconds: number;
+  last_synced_at: string | null;
+  last_sync_error: string | null;
+  engine_version: string | null;
+  container_count: number | null;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface DockerHostCreate {
+  name: string;
+  description?: string;
+  enabled?: boolean;
+  connection_type: "unix" | "tcp";
+  endpoint: string;
+  ca_bundle_pem?: string;
+  client_cert_pem?: string;
+  client_key_pem?: string;
+  ipam_space_id: string;
+  dns_group_id?: string | null;
+  mirror_containers?: boolean;
+  include_default_networks?: boolean;
+  include_stopped_containers?: boolean;
+  sync_interval_seconds?: number;
+}
+
+export interface DockerHostUpdate {
+  name?: string;
+  description?: string;
+  enabled?: boolean;
+  connection_type?: "unix" | "tcp";
+  endpoint?: string;
+  ca_bundle_pem?: string;
+  client_cert_pem?: string;
+  client_key_pem?: string;
+  ipam_space_id?: string;
+  dns_group_id?: string | null;
+  mirror_containers?: boolean;
+  include_default_networks?: boolean;
+  include_stopped_containers?: boolean;
+  sync_interval_seconds?: number;
+}
+
+export interface DockerTestResult {
+  ok: boolean;
+  message: string;
+  engine_version: string | null;
+  container_count: number | null;
+}
+
+export const dockerApi = {
+  listHosts: () => api.get<DockerHost[]>("/docker/hosts").then((r) => r.data),
+  createHost: (data: DockerHostCreate) =>
+    api.post<DockerHost>("/docker/hosts", data).then((r) => r.data),
+  updateHost: (id: string, data: DockerHostUpdate) =>
+    api.put<DockerHost>(`/docker/hosts/${id}`, data).then((r) => r.data),
+  deleteHost: (id: string) => api.delete(`/docker/hosts/${id}`),
+  testConnection: (body: {
+    host_id?: string;
+    connection_type?: "unix" | "tcp";
+    endpoint?: string;
+    ca_bundle_pem?: string;
+    client_cert_pem?: string;
+    client_key_pem?: string;
+  }) =>
+    api.post<DockerTestResult>("/docker/hosts/test", body).then((r) => r.data),
+  syncNow: (id: string) =>
+    api
+      .post<{ status: string; task_id: string }>(`/docker/hosts/${id}/sync`)
       .then((r) => r.data),
 };

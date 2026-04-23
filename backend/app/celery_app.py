@@ -21,6 +21,7 @@ celery_app = Celery(
         "app.tasks.prune_metrics",
         "app.tasks.update_check",
         "app.tasks.kubernetes_sync",
+        "app.tasks.docker_sync",
     ],
 )
 
@@ -54,6 +55,7 @@ celery_app.conf.update(
         "app.tasks.prune_metrics.*": {"queue": "default"},
         "app.tasks.update_check.*": {"queue": "default"},
         "app.tasks.kubernetes_sync.*": {"queue": "default"},
+        "app.tasks.docker_sync.*": {"queue": "default"},
     },
     beat_schedule={
         # Every 60s, fan-out health checks to every registered DNS server.
@@ -155,6 +157,13 @@ celery_app.conf.update(
         # the master toggle off and no cluster is polled.
         "kubernetes-sync-sweep": {
             "task": "app.tasks.kubernetes_sync.sweep_kubernetes_clusters",
+            "schedule": schedule(run_every=30.0),
+        },
+        # Same pattern for Docker — 30 s beat, per-host interval gates
+        # the actual reconcile pass. Gated overall by
+        # ``PlatformSettings.integration_docker_enabled``.
+        "docker-sync-sweep": {
+            "task": "app.tasks.docker_sync.sweep_docker_hosts",
             "schedule": schedule(run_every=30.0),
         },
     },

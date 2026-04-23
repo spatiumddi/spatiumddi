@@ -64,6 +64,21 @@ logger = structlog.get_logger(__name__)
 # BIGINT clamp for IPv6 ``/64`` or wider — ``Subnet.total_ips`` is BigInteger.
 _BIGINT_MAX = 2**63 - 1
 
+# Private-address supernets we auto-create as top-level IPBlocks
+# when a cluster's pod / service CIDR falls inside one but no
+# enclosing block exists yet. Keeps the IPAM tree tidy: a
+# 10.42.0.0/16 pod CIDR lands under 10.0.0.0/8 instead of creating
+# its own top-level wrapper. Unowned (no FK) so they persist across
+# cluster removal and can be shared with Docker + manual allocations.
+# Covers RFC 1918 + RFC 6598 CGNAT (100.64/10) — the latter shows
+# up in some k3s and Tailscale-adjacent clusters.
+_PRIVATE_SUPERNETS = [
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("100.64.0.0/10"),
+]
+
 
 def _k8s_total_ips(net: ipaddress.IPv4Network | ipaddress.IPv6Network) -> int:
     """Full address count for a Kubernetes pod / service CIDR.
@@ -173,6 +188,20 @@ class ReconcileSummary:
 
 
 # ── Helpers ───────────────────────────────────────────────────────────
+
+
+def _private_supernet_of(cidr: str) -> str | None:
+    """Return the private-address supernet that strictly contains
+    ``cidr`` as a string, or ``None``. Only IPv4 ranges — IPv6 ULA
+    detection (fc00::/7) is a future extension.
+    """
+    net = _parse_net(cidr)
+    if net is None or not isinstance(net, ipaddress.IPv4Network):
+        return None
+    for parent in _PRIVATE_SUPERNETS:
+        if net.subnet_of(parent) and net.prefixlen > parent.prefixlen:  # type: ignore[arg-type]
+            return str(parent)
+    return None
 
 
 def _parse_net(value: str) -> ipaddress.IPv4Network | ipaddress.IPv6Network | None:
@@ -404,6 +433,27 @@ async def _apply_blocks_and_subnets(
     cluster_owned_wrappers = {
         str(b.network): b for b in blocks if b.kubernetes_cluster_id == cluster.id
     }
+
+    # Ensure a private-address supernet exists for every desired CIDR
+    # that falls in a private range (RFC 1918 or RFC 6598 CGNAT).
+    # Auto-created unowned so the block survives cluster removal and
+    # can be shared with other integrations or manual allocations.
+    existing_networks = {str(b.network): b for b in blocks}
+    for d in desired_subnets:
+        supernet = _private_supernet_of(d.network)
+        if supernet is None or supernet in existing_networks:
+            continue
+        parent = IPBlock(
+            space_id=cluster.ipam_space_id,
+            network=supernet,
+            name=f"Private {supernet}",
+            description=f"Auto-created as the private-address parent for {d.network}",
+        )
+        db.add(parent)
+        await db.flush()
+        blocks.append(parent)
+        existing_networks[supernet] = parent
+        summary.blocks_created += 1
 
     # Current cluster-owned subnets.
     res = await db.execute(select(Subnet).where(Subnet.kubernetes_cluster_id == cluster.id))

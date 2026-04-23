@@ -32,6 +32,7 @@ from app.models.dns import (
     DNSView,
     DNSZone,
 )
+from app.models.docker import DockerHost
 from app.models.ipam import (
     CustomFieldDefinition,
     IPAddress,
@@ -100,5 +101,6 @@ __all__ = [
     "DHCPRecordOp",
     "DNSMetricSample",
     "DHCPMetricSample",
+    "DockerHost",
     "KubernetesCluster",
 ]

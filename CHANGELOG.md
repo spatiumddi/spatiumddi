@@ -9,6 +9,36 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versioning uses 
 
 ### Added
 
+- **Docker integration (read-only host mirror).** Settings →
+  Integrations → Docker toggle (`integration_docker_enabled`)
+  lights up a Docker nav item in the sidebar. `DockerHost` rows
+  bind per-host to one IPAM space + optional DNS group; bearer-
+  equivalent secret is the Fernet-encrypted TLS client key. Two
+  transports: **Unix socket** (requires mounting
+  `/var/run/docker.sock` into the api + worker containers) and
+  **TCP+TLS** (CA bundle + client cert + client key). Same
+  reconciler pattern as Kubernetes Phase 1b: 30 s beat sweep,
+  per-host `sync_interval_seconds` gating, on-demand
+  `sync_host_now` for the UI's Sync Now button, FK cascade on
+  host delete. Mirrors **every Docker network** into IPAM
+  (smart parent-block detection when an enclosing operator block
+  exists), with network gateway stamped as a `reserved` IP row so
+  the subnet looks like a normal LAN. `bridge` / `host` / `none`
+  / `docker_gwbridge` / `ingress` skipped by default; Swarm
+  overlay networks always skipped. **Container mirroring is
+  opt-in** per host (`mirror_containers`, default off) — matches
+  the `mirror_pods` shape on the k8s side. When on, each
+  container's IP lands as `status="docker-container"` with
+  hostname = either `<compose_project>.<compose_service>` (via
+  the `com.docker.compose.*` labels) or the container name.
+  Stopped containers skipped unless
+  `include_stopped_containers=true`. Minimal `httpx`-based
+  client (no `docker` SDK dep). Migration `c9e2b0d3a5f7`.
+  Frontend admin page at `/docker` with setup guide (copy-paste
+  TCP+TLS `daemon.json` or unix-socket compose mount snippet),
+  Test Connection probe, and Sync Now button. SSH transport
+  (`ssh://user@host`) deferred.
+
 - **Kubernetes integration — Phase 1a scaffolding + 1b read-only
   reconciler.** Settings → Integrations is a new settings section;
   per-integration toggle `integration_kubernetes_enabled` drives
@@ -180,6 +210,54 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versioning uses 
   resource type `acme_account`. Migration
   `ac3e1f0d8b42_acme_account`. Covered by 24 new tests in
   `backend/tests/test_acme.py`.
+
+- **RFC 1918 + CGNAT supernet auto-creation on integration
+  reconcile.** When the Kubernetes or Docker reconciler detects
+  that a mirrored network is contained in `10.0.0.0/8`,
+  `172.16.0.0/12`, `192.168.0.0/16`, or `100.64.0.0/10`, and no
+  enclosing parent block exists in the target IPAM space, the
+  reconciler now auto-creates the canonical private supernet as
+  an unowned top-level block (`Private 10.0.0.0/8`, etc). The
+  mirrored subnet then nests under it via the existing smart
+  parent-block detection. Unowned = integration-FK null, so the
+  supernet survives removal of the integration that caused it
+  and can be shared across Docker + Kubernetes + hand-made
+  allocations. Applies to IPv4 only; matches `ipaddress.IPv4Network.subnet_of`
+  semantics.
+
+- **Block creation accepts strict supernets of existing siblings
+  and auto-reparents.** `_assert_no_block_overlap` previously
+  rejected any new top-level block that enclosed a sibling with
+  409. The rule now admits one specific exception: if the new
+  block is a strict supernet of one or more siblings (e.g.
+  operator creates `172.16.0.0/12` when `172.20.0.0/16` and
+  `172.21.0.0/16` already exist at top level), the new block is
+  inserted and the existing siblings are reparented under it in
+  the same transaction. Duplicates (same CIDR), strict subsets
+  (new block contained in a sibling), and partial overlaps are
+  still rejected. Matching behaviour lives in `create_block` +
+  `update_block` (the reparent path). 4 new tests in
+  `backend/tests/test_ipam_block_overlap.py`.
+
+### Fixed
+
+- **`audit_forward` crash in Celery workers.** The `after_commit`
+  listener fired `loop.create_task(_dispatch(...))` which called
+  `_load_targets()` / `_load_forward_config()` against the global
+  `AsyncSessionLocal` from `app.db`. Celery wraps each async task
+  in its own `asyncio.run()` loop, so the global engine's pool
+  held asyncpg connections bound to a previous, now-defunct
+  loop — reusing one raised `asyncpg.exceptions.InterfaceError:
+  cannot perform operation: another operation is in progress`.
+  Fixed by routing those two loaders through a new
+  `_ephemeral_session()` helper that creates a short-lived engine
+  with `NullPool` (no loop-bound pool state to leak), yields a
+  session, and disposes on exit. Surfaced as a loud stack trace
+  every time the Docker or Kubernetes reconciler wrote an audit
+  row — now silent. (Separate issue not addressed here: forwards
+  fired from Celery-committed audit rows may still be cancelled
+  mid-HTTP when `asyncio.run` closes the loop; crash-free, but
+  delivery is best-effort from reconcile-task context.)
 
 ---
 

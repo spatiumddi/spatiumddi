@@ -85,6 +85,7 @@ type SectionId =
   | "dhcp-lease-sync"
   | "audit-forward"
   | "integrations-kubernetes"
+  | "integrations-docker"
   | "ip-allocation"
   | "oui-lookup"
   | "session"
@@ -159,6 +160,7 @@ const SECTION_FIELDS: Record<SectionId, (keyof PlatformSettings)[]> = {
   // Save button doesn't hit them.
   "audit-forward": [],
   "integrations-kubernetes": ["integration_kubernetes_enabled"],
+  "integrations-docker": ["integration_docker_enabled"],
   "ip-allocation": ["ip_allocation_strategy"],
   "oui-lookup": ["oui_lookup_enabled", "oui_update_interval_hours"],
   session: ["session_timeout_minutes", "auto_logout_minutes"],
@@ -673,6 +675,25 @@ const SECTIONS: SectionDef[] = [
       "ipam",
       "dns",
       "service account",
+    ],
+  },
+  {
+    id: "integrations-docker",
+    title: "Docker",
+    group: "Integrations",
+    description:
+      "Connect one or more Docker hosts over Unix socket or TCP+TLS. When enabled, SpatiumDDI adds a Docker menu item to the sidebar where you manage per-host connection configs. Read-only — SpatiumDDI polls each daemon and mirrors Docker networks into the bound IPAM space as subnets, with container IPs as opt-in. Never writes to the daemon.",
+    keywords: [
+      "docker",
+      "container",
+      "compose",
+      "swarm",
+      "integration",
+      "bridge",
+      "network",
+      "ipam",
+      "socket",
+      "tls",
     ],
   },
 ];
@@ -1434,6 +1455,31 @@ export function SettingsPage() {
                       className="inline-flex items-center gap-1 rounded-md border px-3 py-1.5 text-xs hover:bg-accent"
                     >
                       Open Kubernetes page →
+                    </a>
+                  </Field>
+                )}
+              </>
+            )}
+
+            {activeId === "integrations-docker" && (
+              <>
+                <Field
+                  label="Enable Docker integration"
+                  description="Adds a Docker menu item to the sidebar. Per-host connection configs are managed there."
+                >
+                  <Toggle
+                    checked={!!values.integration_docker_enabled}
+                    onChange={(v) => set("integration_docker_enabled", v)}
+                    disabled={!isSuperadmin}
+                  />
+                </Field>
+                {values.integration_docker_enabled && (
+                  <Field label="Hosts" description="Manage connected hosts.">
+                    <a
+                      href="/docker"
+                      className="inline-flex items-center gap-1 rounded-md border px-3 py-1.5 text-xs hover:bg-accent"
+                    >
+                      Open Docker page →
                     </a>
                   </Field>
                 )}

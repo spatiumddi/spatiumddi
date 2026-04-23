@@ -141,11 +141,10 @@ def _patch_client(fake: _FakeClient):
 
 
 @pytest.mark.asyncio
-async def test_cidrs_with_no_parent_create_wrapper_block_and_subnet(
-    db_session: AsyncSession,
-) -> None:
-    """No enclosing block exists → reconciler creates a wrapper IPBlock
-    and a Subnet at the CIDR, both tagged with ``kubernetes_cluster_id``.
+async def test_rfc1918_supernet_auto_created(db_session: AsyncSession) -> None:
+    """No enclosing block exists → reconciler creates a private-
+    address parent (10.0.0.0/8) and nests both the pod and service
+    CIDR subnets directly under it. No cluster-owned wrappers.
     """
     space = await _make_space(db_session)
     cluster = await _make_cluster(
@@ -157,21 +156,26 @@ async def test_cidrs_with_no_parent_create_wrapper_block_and_subnet(
         summary = await reconcile_cluster(db_session, cluster)
 
     assert summary.ok, summary.error
-    assert summary.blocks_created == 2
+    # One supernet /8 created; no cluster-owned wrappers at /16.
+    assert summary.blocks_created == 1
     assert summary.subnets_created == 2
+
+    res = await db_session.execute(
+        select(IPBlock).where(IPBlock.space_id == space.id, IPBlock.network == "10.0.0.0/8")
+    )
+    parent = res.scalar_one()
+    # Supernet is unowned so it survives cluster removal.
+    assert parent.kubernetes_cluster_id is None
 
     res = await db_session.execute(
         select(IPBlock).where(IPBlock.kubernetes_cluster_id == cluster.id)
     )
-    assert sorted(str(b.network) for b in res.scalars().all()) == [
-        "10.244.0.0/16",
-        "10.96.0.0/12",
-    ]
+    assert list(res.scalars().all()) == []
+
     res = await db_session.execute(select(Subnet).where(Subnet.kubernetes_cluster_id == cluster.id))
     subnets = list(res.scalars().all())
     assert sorted(str(s.network) for s in subnets) == ["10.244.0.0/16", "10.96.0.0/12"]
-    # Every auto-created subnet carries the k8s-semantics flag so the
-    # IPAM create path skips network/broadcast/gateway placeholders.
+    assert all(s.block_id == parent.id for s in subnets)
     assert all(s.kubernetes_semantics for s in subnets)
 
 
@@ -219,52 +223,23 @@ async def test_cidr_removed_deletes_subnet_and_wrapper(
     with _patch_client(_FakeClient()):
         await reconcile_cluster(db_session, cluster)
 
-    # Operator drops the service_cidr on the cluster config.
+    # Operator drops the service_cidr on the cluster config. Only the
+    # service CIDR subnet disappears; the 10.0.0.0/8 supernet stays
+    # (unowned, still backing the pod CIDR).
     cluster.service_cidr = ""
     await db_session.commit()
     with _patch_client(_FakeClient()):
         summary = await reconcile_cluster(db_session, cluster)
     assert summary.subnets_deleted == 1
-    assert summary.blocks_deleted == 1
-
-    res = await db_session.execute(
-        select(IPBlock).where(IPBlock.kubernetes_cluster_id == cluster.id)
-    )
-    assert [str(b.network) for b in res.scalars().all()] == ["10.244.0.0/16"]
-
-
-@pytest.mark.asyncio
-async def test_parent_block_added_later_reparents_subnet(
-    db_session: AsyncSession,
-) -> None:
-    """Pass 1: no enclosing block → wrapper created. Pass 2: operator
-    adds an enclosing 10.0.0.0/8 block → wrapper gets deleted and the
-    subnet is reparented under the operator block.
-    """
-    space = await _make_space(db_session)
-    cluster = await _make_cluster(db_session, space, pod_cidr="10.244.0.0/16", service_cidr="")
-    await db_session.commit()
-
-    with _patch_client(_FakeClient()):
-        await reconcile_cluster(db_session, cluster)
-    # Sanity: one wrapper, one subnet.
-    res = await db_session.execute(
-        select(IPBlock).where(IPBlock.kubernetes_cluster_id == cluster.id)
-    )
-    assert len(list(res.scalars().all())) == 1
-
-    # Operator adds a wider block.
-    parent = await _make_block(db_session, space, "10.0.0.0/8")
-    await db_session.commit()
-
-    with _patch_client(_FakeClient()):
-        summary = await reconcile_cluster(db_session, cluster)
-    assert summary.blocks_deleted == 1  # our wrapper is gone
-    assert summary.subnets_updated >= 1  # reparented
+    assert summary.blocks_deleted == 0
 
     res = await db_session.execute(select(Subnet).where(Subnet.kubernetes_cluster_id == cluster.id))
-    sub = res.scalar_one()
-    assert sub.block_id == parent.id
+    assert [str(s.network) for s in res.scalars().all()] == ["10.244.0.0/16"]
+    # Supernet still exists and is unowned.
+    res = await db_session.execute(
+        select(IPBlock).where(IPBlock.space_id == space.id, IPBlock.network == "10.0.0.0/8")
+    )
+    assert res.scalar_one().kubernetes_cluster_id is None
 
 
 # ── Node address reconciliation ─────────────────────────────────────
@@ -607,14 +582,25 @@ async def test_cluster_delete_cascades_rows(db_session: AsyncSession) -> None:
     ):
         await reconcile_cluster(db_session, cluster)
 
-    # Sanity: wrapper blocks + subnets + address + record all exist.
-    for model, expected in ((IPBlock, 2), (Subnet, 2), (DNSRecord, 1)):
+    # Sanity: two cluster-owned subnets + one record mirrored. The
+    # 10.0.0.0/8 private-address parent is unowned (no FK), so it
+    # isn't counted on the cluster-owned side.
+    for model, expected in ((Subnet, 2), (DNSRecord, 1)):
         res = await db_session.execute(
             select(model).where(model.kubernetes_cluster_id == cluster.id)
         )
         assert len(list(res.scalars().all())) == expected, model.__name__
 
+    # Confirm the supernet is present but unowned — it should not
+    # cascade when we delete the cluster.
+    res = await db_session.execute(
+        select(IPBlock).where(IPBlock.space_id == space.id, IPBlock.network == "10.0.0.0/8")
+    )
+    supernet = res.scalar_one()
+    assert supernet.kubernetes_cluster_id is None
+
     cluster_id = cluster.id
+    supernet_id = supernet.id
     await db_session.delete(cluster)
     await db_session.commit()
 
@@ -623,3 +609,7 @@ async def test_cluster_delete_cascades_rows(db_session: AsyncSession) -> None:
             select(model).where(model.kubernetes_cluster_id == cluster_id)
         )
         assert list(res.scalars().all()) == [], f"{model.__name__} orphaned"
+
+    # Supernet should still be here — it's unowned, not linked to the
+    # cluster via FK, so cluster delete leaves it intact.
+    assert await db_session.get(IPBlock, supernet_id) is not None

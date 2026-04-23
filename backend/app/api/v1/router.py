@@ -11,6 +11,7 @@ from app.api.v1.dhcp import router as dhcp_router
 from app.api.v1.dns.agents import router as dns_agents_router
 from app.api.v1.dns.blocklist_router import router as dns_blocklist_router
 from app.api.v1.dns.router import router as dns_router
+from app.api.v1.docker import router as docker_router
 from app.api.v1.groups.router import router as groups_router
 from app.api.v1.ipam.router import router as ipam_router
 from app.api.v1.kubernetes import router as kubernetes_router
@@ -49,3 +50,4 @@ api_v1_router.include_router(acme_router, prefix="/acme", tags=["acme"])
 api_v1_router.include_router(metrics_router, prefix="/metrics", tags=["metrics"])
 api_v1_router.include_router(version_router, prefix="/version", tags=["version"])
 api_v1_router.include_router(kubernetes_router, prefix="/kubernetes", tags=["kubernetes"])
+api_v1_router.include_router(docker_router, prefix="/docker", tags=["docker"])

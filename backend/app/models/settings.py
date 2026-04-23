@@ -189,3 +189,4 @@ class PlatformSettings(Base):
     integration_kubernetes_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False
     )
+    integration_docker_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)

@@ -46,10 +46,13 @@ from typing import Any
 
 import httpx
 import structlog
+from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator
 from sqlalchemy import event, select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.pool import NullPool
 
-from app.db import AsyncSessionLocal
+from app.config import settings as _app_settings
 from app.models.audit import AuditLog
 from app.models.audit_forward import AuditForwardTarget
 from app.models.settings import PlatformSettings
@@ -441,6 +444,26 @@ async def _deliver_one(
 # ── Config loading ─────────────────────────────────────────────────────────
 
 
+@asynccontextmanager
+async def _ephemeral_session() -> AsyncIterator[AsyncSession]:
+    """Short-lived engine + session for audit-forward config reads.
+
+    Why: the ``after_commit`` listener runs on whatever event loop
+    committed the parent session. In FastAPI that's the long-lived
+    request loop; in Celery workers each task spins its own loop via
+    ``asyncio.run``. Using the global engine from ``app.db`` would
+    reuse asyncpg connections created on a prior loop and race them
+    ("another operation is in progress"). An ephemeral engine with
+    ``NullPool`` has no loop-bound pool state to leak.
+    """
+    engine = create_async_engine(_app_settings.database_url, poolclass=NullPool)
+    try:
+        async with AsyncSession(engine, expire_on_commit=False) as session:
+            yield session
+    finally:
+        await engine.dispose()
+
+
 async def _load_forward_config() -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     """Back-compat shim: return *one* syslog + *one* webhook config dict.
 
@@ -448,7 +471,7 @@ async def _load_forward_config() -> tuple[dict[str, Any] | None, dict[str, Any] 
     ``audit_forward_target``; falls back to the flat settings columns
     when the table is empty.
     """
-    async with AsyncSessionLocal() as session:
+    async with _ephemeral_session() as session:
         res = await session.execute(
             select(AuditForwardTarget).where(AuditForwardTarget.enabled.is_(True))
         )
@@ -478,7 +501,7 @@ async def _load_forward_config() -> tuple[dict[str, Any] | None, dict[str, Any] 
     # No targets configured — fall back to legacy flat columns so a
     # pre-multi-target deployment keeps forwarding after upgrade without
     # the operator having to re-create the row.
-    async with AsyncSessionLocal() as session:
+    async with _ephemeral_session() as session:
         ps = await session.get(PlatformSettings, _SINGLETON_ID)
     if ps is None:
         return None, None
@@ -505,7 +528,7 @@ async def _load_targets() -> list[dict[str, Any]]:
     """Return every enabled target as a dict. Includes a fallback from
     the legacy flat settings when the targets table is empty, so existing
     deployments keep forwarding across the upgrade boundary."""
-    async with AsyncSessionLocal() as session:
+    async with _ephemeral_session() as session:
         res = await session.execute(
             select(AuditForwardTarget).where(AuditForwardTarget.enabled.is_(True))
         )

@@ -435,6 +435,35 @@ Phase 1 IPv6 closure + the Phase 2/3 DDNS / zone-state / CI-hardening items all 
   template drift. Phase 5 — belongs alongside advanced reporting /
   multi-tenancy, once the base inheritance story is fully bedded
   down.
+- ⬜ **Move IP block / space across IP spaces** — operator-driven
+  relocation of a block (and everything under it: child blocks,
+  subnets, addresses) into a different `IPSpace`. Preview + commit
+  endpoints under `/api/v1/ipam/blocks/{id}/move/{preview,commit}`
+  mirroring the existing resize UX. **Decision points still open**
+  — confirm before building:
+  1. **Scope**: block-move only (recursive through descendants),
+     not space-merge. Moving a whole space means just moving its
+     top-level blocks one-by-one — same code path.
+  2. **Integration-owned rows**: refuse when any descendant has
+     `kubernetes_cluster_id` / `docker_host_id` / future-integration
+     FKs set — the reconciler would immediately re-create the rows
+     in the original space, so moving them is a no-op that
+     desynchronises provenance. Preview flags these; commit 409s.
+  3. **Atomicity**: single transaction with `SELECT … FOR UPDATE`
+     on the block subtree; overlap re-check against the target
+     space's existing blocks before the writes land.
+  4. **Target parent**: optional — if the operator picks a parent
+     block in the target space, validate the moved block is a
+     strict subset of it. If omitted, moved block lands at top
+     level of the target space and the standard overlap-reparent
+     logic applies (can pull existing top-level siblings under it
+     if it's a supernet, by the same rule `create_block` uses).
+  5. **UI**: `MoveBlockModal` on the block detail header; typed
+     CIDR confirmation like resize; preview returns counts
+     (blocks, subnets, addresses, integration-owned blockers).
+  Phase 5-ish — no urgent driver for it, but it's the natural
+  cleanup tool once operators start reorganising spaces after
+  integrations have seeded them.
 - ✅ **ACME / Let's Encrypt — DNS-01 provider for external clients**
   — landed in the 2026.04.22-1 wave. Lets certbot / lego / acme.sh
   on a client box prove control of a FQDN hosted in (or delegated
@@ -628,6 +657,49 @@ Phase 1 IPv6 closure + the Phase 2/3 DDNS / zone-state / CI-hardening items all 
   - Managing the kubeconfig / kubectl flow — operator brings their
     own cluster-admin credentials to create the ServiceAccount; we
     only ever see the resulting read-only token.
+
+- ✅ **Docker integration (read-only host mirror).** Poll one or
+  more Docker daemons with a read-only connection and mirror the
+  networks + (opt-in) containers into IPAM. Same UX shape as the
+  Kubernetes integration above — `DockerHost` rows bound per-host
+  to one `IPAMSpace` + optional `DNSServerGroup`, Settings →
+  Integrations → Docker toggle, sidebar item gated on the toggle,
+  Fernet-encrypted TLS client key, per-row Test Connection + Sync
+  Now buttons, Setup guide with copy-paste TCP+TLS daemon config
+  or Unix socket mount instructions.
+
+  **Transport:** `unix` socket or `tcp` with optional mTLS. SSH
+  (`docker -H ssh://`) is deferred — needs paramiko +
+  `docker system dial-stdio` stream shuffling. No Docker Python
+  SDK dep; we hit three Engine API endpoints (`/networks`,
+  `/containers/json`, `/info`) over `httpx`.
+
+  **What's mirrored:**
+  - Every non-skipped Docker network → IPAM subnet under an
+    enclosing operator block when one exists, else a cluster-
+    owned wrapper block at the CIDR. Default `bridge` / `host` /
+    `none` / `docker_gwbridge` / `ingress` are skipped unless
+    `include_default_networks=true`. Swarm overlay networks
+    always skipped (cluster-wide — would duplicate across nodes).
+  - Network gateway → one `reserved`-status `IPAddress` per
+    subnet (mirrors the LAN placeholder that `/ipam/subnets`
+    creates for operator-made subnets).
+  - Containers (opt-in via `host.mirror_containers`) → one
+    `IPAddress` per (container × connected network) with
+    `status="docker-container"` and hostname = either
+    `<compose_project>.<compose_service>` when Docker Compose
+    labels are present, else the container name. Stopped
+    containers skipped unless `include_stopped_containers=true`.
+
+  **Phase-3 placeholder (deferred).** Rich per-host management
+  surface like mzac/uhld's Docker plugin: container actions
+  (start/stop/restart), log streaming, shell exec (pty over
+  websocket), image management, compose project up/down,
+  volume browser, live events feed. Queries the stored
+  connection live — no schema migration needed. Same treatment
+  for Kubernetes (pod logs, shell exec, YAML apply, scaling).
+  Scoped as a separate feature because it's a full management UI,
+  not IPAM, and needs a websocket pipeline we don't have today.
 
 ---
 

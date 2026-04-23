@@ -22,6 +22,7 @@ import {
   BellRing,
   Sparkles,
   Boxes,
+  Container as ContainerIcon,
   X,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -148,11 +149,17 @@ export function Sidebar({
   // integration is enabled. Each integration contributes one entry
   // — kept declarative so adding a future integration is a one-line
   // extension here and a toggle on PlatformSettings.
+  // Sorted alphabetically by label so the order is stable regardless
+  // of the order we added integrations here — adding a new one later
+  // shouldn't re-shuffle the sidebar for operators already using it.
   const integrationsNav = [
     ...(platformSettings?.integration_kubernetes_enabled
       ? [{ label: "Kubernetes", icon: Boxes, to: "/kubernetes" }]
       : []),
-  ];
+    ...(platformSettings?.integration_docker_enabled
+      ? [{ label: "Docker", icon: ContainerIcon, to: "/docker" }]
+      : []),
+  ].sort((a, b) => a.label.localeCompare(b.label));
   const mainNav = baseMainNav;
 
   return (

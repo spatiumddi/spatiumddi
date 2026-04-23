@@ -50,6 +50,22 @@ services:
       CELERY_BROKER_URL: redis://redis:6379/1
       CELERY_RESULT_BACKEND: redis://redis:6379/2
       VERSION: ${SPATIUMDDI_VERSION:-dev}
+    # Docker integration — uncomment both entries below to poll the
+    # host's Docker daemon over its local Unix socket. Required when
+    # adding a Docker host with connection_type=unix. Read-only
+    # mount; SpatiumDDI only reads. Unnecessary for TCP+TLS remote
+    # daemons.
+    #
+    # ``DOCKER_GID`` must match the gid of ``/var/run/docker.sock``
+    # on the host — find it with:
+    #   stat -c '%g' /var/run/docker.sock
+    # then set ``DOCKER_GID=<that number>`` in your .env. Common
+    # values: 999 (Debian/Ubuntu), 998 or 989 (RHEL/Fedora), varies.
+    # Without this the api user (uid 1000) gets EACCES on the socket.
+    # volumes:
+    #   - /var/run/docker.sock:/var/run/docker.sock:ro
+    # group_add:
+    #   - "${DOCKER_GID:-999}"
     depends_on:
       postgres:
         condition: service_healthy
@@ -76,6 +92,14 @@ services:
       CELERY_BROKER_URL: redis://redis:6379/1
       CELERY_RESULT_BACKEND: redis://redis:6379/2
       VERSION: ${SPATIUMDDI_VERSION:-dev}
+    # Docker integration — the worker runs the reconcile tasks, so it
+    # also needs the host socket when polling a local daemon.
+    # Uncomment alongside the matching entries on the api service
+    # above — same ``DOCKER_GID`` comment applies.
+    # volumes:
+    #   - /var/run/docker.sock:/var/run/docker.sock:ro
+    # group_add:
+    #   - "${DOCKER_GID:-999}"
     depends_on:
       postgres:
         condition: service_healthy

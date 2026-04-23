@@ -112,19 +112,23 @@ async def _assert_no_block_overlap(
     network: str,
     parent_block_id: uuid.UUID | None,
     exclude_id: uuid.UUID | None = None,
-) -> None:
-    """Raise 409 if the proposed block overlaps (or exactly duplicates) any
-    existing sibling block — i.e. another block in the same space at the
-    same level of the tree (top-level, or sharing ``parent_block_id``).
+) -> list[uuid.UUID]:
+    """Validate the new/updated block against its siblings.
 
-    Parent/child relationships across levels are intentionally allowed: a
-    child explicitly declaring its parent is expected to be contained within
-    that parent. The sibling-only check catches the common mistake of
-    duplicating a block at the same level without triggering false positives
-    for a legitimate reparent / nesting.
+    Siblings at the same level (top-level, or sharing
+    ``parent_block_id``) cannot overlap — with one deliberate
+    exception: when the new block is a **strict supernet** of an
+    existing sibling, the sibling is returned in a "reparent
+    candidates" list and the caller reparents it under the new block
+    after insertion. This lets operators organise a flat top-level
+    of `/16`s under a new `/12` without tripping the overlap check.
+
+    Raises 409 on: exact duplicate, strict subset of a sibling
+    (operator should set ``parent_block_id`` to that sibling
+    instead), or any partial overlap.
     """
     q = (
-        "SELECT network FROM ip_block "
+        "SELECT id, network FROM ip_block "
         "WHERE space_id = CAST(:space_id AS uuid) "
         "AND network && CAST(:network AS cidr)"
     )
@@ -137,12 +141,39 @@ async def _assert_no_block_overlap(
     if exclude_id:
         q += " AND id != CAST(:exclude_id AS uuid)"
         params["exclude_id"] = str(exclude_id)
-    row = (await db.execute(text(q), params)).fetchone()
-    if row:
+    rows = (await db.execute(text(q), params)).fetchall()
+    if not rows:
+        return []
+
+    new_net = ipaddress.ip_network(network, strict=False)
+    reparent: list[uuid.UUID] = []
+    for row in rows:
+        sibling_id = row[0]
+        sibling_net = ipaddress.ip_network(str(row[1]), strict=False)
+        if sibling_net == new_net:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Block {network} already exists at this level",
+            )
+        if sibling_net.subnet_of(new_net):  # type: ignore[arg-type]
+            # New block is a strict supernet of this sibling. Reparent.
+            reparent.append(sibling_id)
+            continue
+        if new_net.subnet_of(sibling_net):  # type: ignore[arg-type]
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"Block {network} is contained in existing block "
+                    f"{sibling_net}; set parent_block_id to that block "
+                    "instead of placing it at the same level."
+                ),
+            )
+        # Neither contains the other → true partial overlap.
         raise HTTPException(
             status_code=status.HTTP_409_CONFLICT,
-            detail=f"Block {network} overlaps with existing block {row[0]}",
+            detail=f"Block {network} overlaps with existing block {sibling_net}",
         )
+    return reparent
 
 
 async def _update_utilization(db: AsyncSession, subnet_id: uuid.UUID) -> None:
@@ -1842,13 +1873,25 @@ async def create_block(body: IPBlockCreate, current_user: CurrentUser, db: DB) -
                 detail=f"{body.network} is not contained within parent block {parent.network}",
             )
 
-    # Reject duplicates / overlaps at the same tree level.
+    # Reject duplicates / overlaps at the same tree level. Any
+    # existing sibling that's a strict subset of the new block is
+    # returned for reparenting — treat the new block as their parent
+    # instead of rejecting the create.
     canonical = str(_parse_network(body.network))
-    await _assert_no_block_overlap(db, body.space_id, canonical, body.parent_block_id)
+    reparent_ids = await _assert_no_block_overlap(
+        db, body.space_id, canonical, body.parent_block_id
+    )
 
     block = IPBlock(**body.model_dump())
     db.add(block)
     await db.flush()
+    reparented: list[str] = []
+    for sid in reparent_ids:
+        existing = await db.get(IPBlock, sid)
+        if existing is None:
+            continue  # raced / deleted — skip
+        existing.parent_block_id = block.id
+        reparented.append(str(existing.network))
     db.add(
         _audit(
             current_user,
@@ -1856,12 +1899,23 @@ async def create_block(body: IPBlockCreate, current_user: CurrentUser, db: DB) -
             "ip_block",
             str(block.id),
             f"{body.network} ({body.name})",
-            new_value=body.model_dump(mode="json"),
+            new_value={
+                **body.model_dump(mode="json"),
+                # Surface any reparented children in the audit payload
+                # so operators can see what moved when they check the
+                # log later.
+                "reparented_children": reparented if reparented else None,
+            },
         )
     )
     await db.commit()
     await db.refresh(block)
-    logger.info("ip_block_created", block_id=str(block.id), network=block.network)
+    logger.info(
+        "ip_block_created",
+        block_id=str(block.id),
+        network=block.network,
+        reparented_children=reparented or None,
+    )
     return block
 
 

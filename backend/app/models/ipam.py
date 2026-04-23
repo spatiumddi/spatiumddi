@@ -127,6 +127,15 @@ class IPBlock(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         nullable=True,
         index=True,
     )
+    # Set by the Docker reconciler for wrapper blocks it creates
+    # when no operator block encloses a Docker network CIDR.
+    # Cascades on host delete.
+    docker_host_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("docker_host.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
 
     # DNS assignment (propagates to child blocks and subnets unless overridden)
     dns_group_ids: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
@@ -307,6 +316,17 @@ class Subnet(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     kubernetes_semantics: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=sa_text("false")
     )
+    # Docker integration provenance. Same cascade semantics as the
+    # Kubernetes FK above. Docker bridge networks DO carry LAN
+    # semantics (gateway + broadcast), so there's no docker_semantics
+    # flag — the reconciler creates these subnets with normal LAN
+    # placeholder rows.
+    docker_host_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("docker_host.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
 
     # Computed / cached. ``total_ips`` is BigInteger because IPv6 subnets can
     # be as large as 2^64 addresses (a /64 — the standard LAN size) which
@@ -405,6 +425,14 @@ class IPAddress(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     kubernetes_cluster_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("kubernetes_cluster.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    # Same pattern for the Docker reconciler — set on containers
+    # that are mirrored in, null otherwise.
+    docker_host_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("docker_host.id", ondelete="CASCADE"),
         nullable=True,
         index=True,
     )
