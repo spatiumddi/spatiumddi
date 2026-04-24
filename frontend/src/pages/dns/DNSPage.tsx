@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from "react";
 import { useLocation, useSearchParams } from "react-router-dom";
 import { useStickyLocation } from "@/lib/stickyLocation";
 import { useSessionState } from "@/lib/useSessionState";
+import { useRowHighlight } from "@/lib/useRowHighlight";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   Globe,
@@ -1490,6 +1491,15 @@ function ZoneDetailView({
   const [showImport, setShowImport] = useState(false);
   const [showRecFilters, setShowRecFilters] = useState(false);
   const [recFilter, setRecFilter] = useState({ name: "", type: "", value: "" });
+  // Search-landing highlight — same pattern as IPAM page. Pulled from
+  // location.state once; hook handles scroll + auto-clear.
+  const location = useLocation();
+  const [highlightRecordId] = useState<string | null>(
+    (location.state as { highlightRecord?: string } | null)?.highlightRecord ??
+      null,
+  );
+  const { register: registerHighlightRow, isActive: isHighlightedRow } =
+    useRowHighlight(highlightRecordId);
 
   const handleExport = async () => {
     const { data, filename } = await dnsApi.exportZone(group.id, zone.id);
@@ -1851,7 +1861,13 @@ function ZoneDetailView({
                 {filtered.map((r) => (
                   <ContextMenu key={r.id}>
                     <ContextMenuTrigger asChild>
-                      <tr className="border-b last:border-0 hover:bg-muted/40 group">
+                      <tr
+                        ref={registerHighlightRow(r.id)}
+                        className={cn(
+                          "border-b last:border-0 hover:bg-muted/40 group",
+                          isHighlightedRow(r.id) && "spatium-row-highlight",
+                        )}
+                      >
                         <td className="w-8 py-1.5 pl-3">
                           {!r.auto_generated && (
                             <input

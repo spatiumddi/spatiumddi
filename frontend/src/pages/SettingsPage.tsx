@@ -851,7 +851,18 @@ export function SettingsPage() {
                 </button>
               ))
             : GROUP_ORDER.map((group, idx) => {
-                const entries = SECTIONS.filter((s) => s.group === group);
+                // Integrations: always alphabetical by title so the
+                // order is stable regardless of the source-order that
+                // new integration entries are appended in. Other
+                // groups keep their declared order (the grouping is
+                // intentional — e.g. IPAM Import/Export reads
+                // naturally grouped, not alphabetized).
+                const entries =
+                  group === "Integrations"
+                    ? SECTIONS.filter((s) => s.group === group)
+                        .slice()
+                        .sort((a, b) => a.title.localeCompare(b.title))
+                    : SECTIONS.filter((s) => s.group === group);
                 if (entries.length === 0) return null;
                 return (
                   <div

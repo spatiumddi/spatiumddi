@@ -57,6 +57,7 @@ import { cn, swatchTintCls, zebraBodyCls } from "@/lib/utils";
 import { SwatchPicker } from "@/components/ui/swatch-picker";
 import { useStickyLocation } from "@/lib/stickyLocation";
 import { useSessionState } from "@/lib/useSessionState";
+import { useRowHighlight } from "@/lib/useRowHighlight";
 import { Modal } from "@/components/ui/modal";
 import {
   MODAL_BACKDROP_CLS,
@@ -2506,6 +2507,15 @@ function SubnetDetail({
   const [showDhcpSync, setShowDhcpSync] = useState(false);
   const [showSyncAll, setShowSyncAll] = useState(false);
   const [showOrphans, setShowOrphans] = useState(false);
+  // Search-landing highlight — flash the matching IP row briefly when
+  // GlobalSearch redirects here with a ``highlightAddress`` in state.
+  const subnetLocation = useLocation();
+  const [highlightAddressId] = useState<string | null>(
+    (subnetLocation.state as { highlightAddress?: string } | null)
+      ?.highlightAddress ?? null,
+  );
+  const { register: registerHighlightRow, isActive: isHighlightedRow } =
+    useRowHighlight(highlightAddressId);
 
   // Lightweight drift count for the banner — cheap enough to refetch on
   // every subnet detail load. Invalidated when the user applies a sync,
@@ -3441,6 +3451,7 @@ function SubnetDetail({
                         <ContextMenu key={addr.id}>
                           <ContextMenuTrigger asChild>
                             <tr
+                              ref={registerHighlightRow(addr.id)}
                               className={cn(
                                 "group/addr border-b last:border-0 hover:bg-muted/20",
                                 (addr.status === "network" ||
@@ -3448,6 +3459,8 @@ function SubnetDetail({
                                   "opacity-50",
                                 addr.status === "orphan" && "opacity-40",
                                 rowSelected && "bg-primary/5",
+                                isHighlightedRow(addr.id) &&
+                                  "spatium-row-highlight",
                               )}
                             >
                               <td className="w-8 px-2 py-2">

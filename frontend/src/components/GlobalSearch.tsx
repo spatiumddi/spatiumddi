@@ -236,6 +236,7 @@ export function GlobalSearch() {
           state: {
             selectGroup: result.dns_group_id,
             selectZone: result.dns_zone_id,
+            highlightRecord: result.id,
           },
         });
       }
