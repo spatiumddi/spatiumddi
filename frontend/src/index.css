@@ -85,22 +85,23 @@
 
 /* ── Search-result landing highlight ────────────────────────────────────
  * Used by the IPAM + DNS pages when a Global Search result navigates
- * to a specific IP address / DNS record. The destination row gets a
- * brief amber flash so the operator can tell WHICH row in the table
- * matched their search — otherwise a subnet with 50 rows is a wall of
- * identical cells after a redirect.
+ * to a specific IP address / DNS record. The destination row fades in
+ * amber and stays amber so the operator can tell WHICH row in the
+ * table matched their search — otherwise a subnet with 50 rows is a
+ * wall of identical cells after a redirect. The tint is cleared when
+ * the operator clicks away / navigates away (the active-id state in
+ * ``useRowHighlight`` is scoped to the current SubnetDetail instance).
  */
-@keyframes spatium-highlight-pulse {
-  0%,
-  15% {
-    background-color: rgb(251 191 36 / 0.35); /* amber-400 @ 35% */
-    box-shadow: inset 3px 0 0 0 rgb(245 158 11);
-  }
-  100% {
+@keyframes spatium-highlight-fade-in {
+  0% {
     background-color: transparent;
     box-shadow: inset 3px 0 0 0 transparent;
   }
+  100% {
+    background-color: rgb(251 191 36 / 0.35); /* amber-400 @ 35% */
+    box-shadow: inset 3px 0 0 0 rgb(245 158 11);
+  }
 }
 .spatium-row-highlight {
-  animation: spatium-highlight-pulse 2.5s ease-out forwards;
+  animation: spatium-highlight-fade-in 400ms ease-out forwards;
 }

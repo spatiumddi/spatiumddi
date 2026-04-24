@@ -9,6 +9,11 @@ import { useLocation, useNavigate } from "react-router-dom";
  *
  * - Only restores when the current URL has no search params, so deep-links
  *   (e.g. `/ipam?subnet=abc` from global search) always win.
+ * - Also skips restoration when the current navigation carried router
+ *   state — otherwise GlobalSearch's ``navigate("/ipam", { state })``
+ *   would be silently clobbered by ``navigate(saved, { replace: true })``
+ *   below (the replace drops ``location.state``), wiping the
+ *   ``highlightAddress`` before ``SubnetDetail`` ever reads it.
  * - Uses `sessionStorage` so reloading restores but closing the tab clears.
  * - Only writes when search params are non-empty; bare visits don't overwrite
  *   a meaningful saved location.
@@ -20,6 +25,7 @@ export function useStickyLocation(key: string): void {
   // Restore saved URL on first mount if current is bare.
   useEffect(() => {
     if (location.search !== "") return;
+    if (location.state != null) return;
     const saved = sessionStorage.getItem(key);
     if (saved && saved.startsWith(location.pathname + "?")) {
       navigate(saved, { replace: true });

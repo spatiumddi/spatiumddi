@@ -1,56 +1,49 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 /**
  * Brief landing-flash for search navigation.
  *
  * Usage:
- *   const { ref, isActive, register } = useRowHighlight(highlightId);
- *   ...
+ *   const { register, isActive } = useRowHighlight(highlightId);
  *   <tr ref={register(addr.id)} className={cn(..., isActive(addr.id) && "spatium-row-highlight")}>
  *
- * - ``register(id)`` returns a ref callback; attach it to every row so the
- *   hook can locate the matching one after mount.
- * - ``isActive(id)`` returns true when the row should carry the flash class.
- * - The hook scrolls the matched row into view once, then clears after
- *   3s so a re-render doesn't re-trigger the animation.
+ * The matching row auto-scrolls into view as soon as it mounts, even
+ * if that mount happens well after navigation (common case: the table
+ * is populated by a pending query). The CSS keyframe
+ * ``.spatium-row-highlight`` uses ``animation-fill-mode: forwards`` so
+ * it plays once and fades to the baseline — we don't need to actively
+ * clear the active-id state.
  */
 export function useRowHighlight(targetId: string | null | undefined) {
   const [activeId, setActiveId] = useState<string | null>(targetId ?? null);
-  const refs = useRef<Map<string, HTMLElement>>(new Map());
+  // Track which ids we've already scrolled into view so a re-render
+  // doesn't re-scroll (jarring on every state change).
+  const scrolledRef = useRef<Set<string>>(new Set());
 
-  // When the caller's target changes (e.g. new search result), re-arm.
+  // Sync to the caller's target whenever it changes — including to
+  // ``null``, so the parent can clear the highlight by setting the
+  // prop back to null / undefined.
   useEffect(() => {
-    if (targetId) setActiveId(targetId);
+    const next = targetId ?? null;
+    setActiveId(next);
+    if (next) scrolledRef.current.delete(next);
   }, [targetId]);
 
-  // Scroll + auto-clear once a matching ref shows up.
-  useEffect(() => {
-    if (!activeId) return;
-    // Defer one tick so the ref registration runs after the parent's
-    // render commits.
-    const raf = requestAnimationFrame(() => {
-      const el = refs.current.get(activeId);
-      if (el) {
+  const register = useCallback(
+    (id: string) => (el: HTMLElement | null) => {
+      if (!el) return;
+      if (id !== activeId) return;
+      if (scrolledRef.current.has(id)) return;
+      scrolledRef.current.add(id);
+      // Defer one frame so the row has painted before we scroll.
+      requestAnimationFrame(() => {
         el.scrollIntoView({ behavior: "smooth", block: "center" });
-      }
-    });
-    const timeout = setTimeout(() => setActiveId(null), 3000);
-    return () => {
-      cancelAnimationFrame(raf);
-      clearTimeout(timeout);
-    };
-  }, [activeId]);
+      });
+    },
+    [activeId],
+  );
 
-  function register(id: string) {
-    return (el: HTMLElement | null) => {
-      if (el) refs.current.set(id, el);
-      else refs.current.delete(id);
-    };
-  }
-
-  function isActive(id: string) {
-    return activeId === id;
-  }
+  const isActive = useCallback((id: string) => id === activeId, [activeId]);
 
   return { register, isActive };
 }

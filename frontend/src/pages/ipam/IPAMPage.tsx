@@ -2485,6 +2485,7 @@ function SubnetDetail({
   spaceName,
   block,
   blockAncestors,
+  highlightAddressId,
   onSelectSpace,
   onSelectBlock,
   onSubnetEdited,
@@ -2494,6 +2495,7 @@ function SubnetDetail({
   spaceName?: string;
   block?: IPBlock;
   blockAncestors?: IPBlock[];
+  highlightAddressId?: string | null;
   onSelectSpace?: () => void;
   onSelectBlock?: (b: IPBlock) => void;
   onSubnetEdited: (updated: Subnet) => void;
@@ -2507,15 +2509,13 @@ function SubnetDetail({
   const [showDhcpSync, setShowDhcpSync] = useState(false);
   const [showSyncAll, setShowSyncAll] = useState(false);
   const [showOrphans, setShowOrphans] = useState(false);
-  // Search-landing highlight — flash the matching IP row briefly when
-  // GlobalSearch redirects here with a ``highlightAddress`` in state.
-  const subnetLocation = useLocation();
-  const [highlightAddressId] = useState<string | null>(
-    (subnetLocation.state as { highlightAddress?: string } | null)
-      ?.highlightAddress ?? null,
-  );
+  // Search-landing highlight — ``highlightAddressId`` is passed down
+  // by IPAMPage, which captured it from ``location.state`` before
+  // calling ``selectSubnet`` (selectSubnet triggers
+  // ``setSearchParams(..., { replace: true })`` which silently drops
+  // ``location.state``, so we can't lazy-read it here).
   const { register: registerHighlightRow, isActive: isHighlightedRow } =
-    useRowHighlight(highlightAddressId);
+    useRowHighlight(highlightAddressId ?? null);
 
   // Lightweight drift count for the banner — cheap enough to refetch on
   // every subnet detail load. Invalidated when the user applies a sync,
@@ -9694,6 +9694,19 @@ export function IPAMPage() {
   const [searchParams, setSearchParams] = useSearchParams();
   const deepLinkHandled = useRef(false);
   const urlRestored = useRef(false);
+  // Captured from ``location.state`` on the first deep-link read and
+  // passed down to ``SubnetDetail``. Can't be read lazily by
+  // ``SubnetDetail`` itself because ``selectSubnet`` calls
+  // ``setSearchParams(..., { replace: true })`` which drops
+  // ``location.state`` before ``SubnetDetail`` ever mounts.
+  const [pendingHighlightAddress, setPendingHighlightAddress] = useState<
+    string | null
+  >(null);
+  // Subnet id the deep-link targeted — used below to clear the
+  // highlight as soon as the operator navigates to a different subnet,
+  // so coming back to the original subnet doesn't re-flash the row
+  // (one-shot semantics).
+  const highlightTargetSubnetRef = useRef<string | null>(null);
 
   const { data: spaces, isLoading } = useQuery({
     queryKey: ["spaces"],
@@ -9739,12 +9752,30 @@ export function IPAMPage() {
     } else if (state.selectSubnet && allSubnets) {
       const sn = allSubnets.find((s) => s.id === state.selectSubnet);
       if (sn) {
+        // Capture the highlight BEFORE selectSubnet fires — the setter
+        // replaces the history entry via setSearchParams and drops
+        // ``location.state``, so SubnetDetail can't read it later.
+        if (state.highlightAddress) {
+          setPendingHighlightAddress(state.highlightAddress);
+          highlightTargetSubnetRef.current = sn.id;
+        }
         selectSubnet(sn);
         deepLinkHandled.current = true;
         urlRestored.current = true;
       }
     }
   }, [location.state, spaces, allBlocks, allSubnets]);
+
+  // One-shot semantics: as soon as the operator navigates to a subnet
+  // other than the deep-link target (or to a block / space), clear the
+  // pending highlight. Re-visiting the original subnet later should
+  // not re-flash the row.
+  useEffect(() => {
+    if (!pendingHighlightAddress) return;
+    if (selectedSubnet?.id !== highlightTargetSubnetRef.current) {
+      setPendingHighlightAddress(null);
+    }
+  }, [selectedSubnet, pendingHighlightAddress]);
 
   // URL-state restore: reopen last-visited space/block/subnet on back-navigation
   // Depends on searchParams so that when `useStickyLocation` navigates from
@@ -9919,6 +9950,7 @@ export function IPAMPage() {
             }
             block={selectedSubnetBlock}
             blockAncestors={selectedSubnetBlockAncestors}
+            highlightAddressId={pendingHighlightAddress}
             onSelectSpace={() => {
               const sp = spaces?.find(
                 (s: IPSpace) => s.id === selectedSubnet.space_id,

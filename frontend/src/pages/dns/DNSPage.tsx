@@ -1477,10 +1477,12 @@ function ZoneSyncPill({ state }: { state: ZoneServerState }) {
 function ZoneDetailView({
   group,
   zone,
+  highlightRecordId,
   onDeleted,
 }: {
   group: DNSServerGroup;
   zone: DNSZone;
+  highlightRecordId?: string | null;
   onDeleted: () => void;
 }) {
   const qc = useQueryClient();
@@ -1491,15 +1493,12 @@ function ZoneDetailView({
   const [showImport, setShowImport] = useState(false);
   const [showRecFilters, setShowRecFilters] = useState(false);
   const [recFilter, setRecFilter] = useState({ name: "", type: "", value: "" });
-  // Search-landing highlight — same pattern as IPAM page. Pulled from
-  // location.state once; hook handles scroll + auto-clear.
-  const location = useLocation();
-  const [highlightRecordId] = useState<string | null>(
-    (location.state as { highlightRecord?: string } | null)?.highlightRecord ??
-      null,
-  );
+  // Search-landing highlight — ``highlightRecordId`` is passed down
+  // by DNSPage, which captured it from ``location.state`` before
+  // ``setSelection`` fired its ``setSearchParams(..., { replace: true })``
+  // that drops state.
   const { register: registerHighlightRow, isActive: isHighlightedRow } =
-    useRowHighlight(highlightRecordId);
+    useRowHighlight(highlightRecordId ?? null);
 
   const handleExport = async () => {
     const { data, filename } = await dnsApi.exportZone(group.id, zone.id);
@@ -5550,6 +5549,16 @@ export function DNSPage() {
     new Set(),
   );
   const urlRestored = useRef(false);
+  // Captured from ``location.state.highlightRecord`` before
+  // ``setSelection`` fires its ``setSearchParams(..., { replace: true })``
+  // — that replace drops ``location.state`` so we can't lazy-read it
+  // inside ``ZoneDetailView``.
+  const [pendingHighlightRecord, setPendingHighlightRecord] = useState<
+    string | null
+  >(null);
+  // Zone the deep-link targeted — used below to clear the highlight as
+  // soon as the operator switches to a different zone (one-shot).
+  const highlightTargetZoneRef = useRef<string | null>(null);
 
   // Update selection state + URL search params together. Preserves `tab`
   // when staying within the same group; clears it when switching groups.
@@ -5583,11 +5592,12 @@ export function DNSPage() {
     queryFn: () => dnsApi.listGroups(),
   });
 
-  // Deep-link from global search: navigate("/dns", { state: { selectGroup, selectZone } })
+  // Deep-link from global search: navigate("/dns", { state: { selectGroup, selectZone, highlightRecord? } })
   useEffect(() => {
     const state = location.state as {
       selectGroup?: string;
       selectZone?: string;
+      highlightRecord?: string;
     } | null;
     if (!state?.selectGroup || groups.length === 0) return;
     const group = groups.find(
@@ -5595,6 +5605,13 @@ export function DNSPage() {
     );
     if (!group) return;
     setExpandedGroups((prev) => new Set([...prev, group.id]));
+    // Capture the highlight BEFORE setSelection fires — the setter
+    // calls setSearchParams(..., { replace: true }) which drops
+    // location.state, so ZoneDetailView can't read it later.
+    if (state.highlightRecord && state.selectZone) {
+      setPendingHighlightRecord(state.highlightRecord);
+      highlightTargetZoneRef.current = state.selectZone;
+    }
     if (state.selectZone) {
       // Zone selection: load zones for the group, then select
       dnsApi.listZones(group.id).then((zones: DNSZone[]) => {
@@ -5609,6 +5626,16 @@ export function DNSPage() {
     window.history.replaceState({}, "");
     urlRestored.current = true;
   }, [location.state, groups]);
+
+  // One-shot: clear the pending record highlight as soon as the
+  // operator switches to a different zone (or back to group view).
+  useEffect(() => {
+    if (!pendingHighlightRecord) return;
+    const currentZoneId = selection?.type === "zone" ? selection.zone.id : null;
+    if (currentZoneId !== highlightTargetZoneRef.current) {
+      setPendingHighlightRecord(null);
+    }
+  }, [selection, pendingHighlightRecord]);
 
   // URL-state restore: reopen last-visited group/zone on back-navigation.
   // Depends on searchParams so that when `useStickyLocation` navigates from
@@ -5822,6 +5849,7 @@ export function DNSPage() {
           <ZoneDetailView
             group={selection.group}
             zone={selection.zone}
+            highlightRecordId={pendingHighlightRecord}
             onDeleted={() =>
               setSelection({ type: "group", group: selection.group })
             }
