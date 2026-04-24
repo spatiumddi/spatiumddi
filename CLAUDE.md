@@ -711,20 +711,41 @@ gating. Ranked by homelab/SMB test accessibility + IPAM value so
 operators can exercise them in their own lab without standing up
 cloud accounts.
 
-- ⬜ **Proxmox VE** *(tier 1 — highest homelab leverage).* Each
-  `ProxmoxNode` polls `/api2/json/nodes/{n}/{qemu,lxc,network}`
-  with an API token (UI-generated, ACL-restricted). Mirror:
-  - Bridges + VLAN interfaces → Subnets (when they carry a CIDR).
-  - VM + LXC NICs → IPAddress rows with `status="proxmox-vm"` /
-    `"proxmox-lxc"`, hostname = VM name, MAC from config.
-  - Runtime IP comes from the QEMU guest-agent (`agent=1`) or
-    LXC's `/interfaces` endpoint when the instance is running;
-    falls back to config-time static IP, else null.
-  Token scope is explicit per-user in PVE, so read-only is easy
-  to produce. Cluster-aware — one row can represent the whole
-  cluster (query any node's API, it speaks for the cluster).
-  Natural parent block candidate: the node's bridge CIDR, or
-  auto-create RFC1918 supernet via the same helper Docker uses.
+- ✅ **Proxmox VE** — `ProxmoxNode` model + REST client
+  + reconciler landed. Auth is API-token (`user@realm!tokenid`
+  + UUID), token secret Fernet-encrypted at rest. One row
+  covers a standalone host OR a whole cluster (PVE API is
+  homogeneous across cluster members; `/cluster/status` surfaces
+  cluster name + node count). Mirror scope:
+  - Bridges + VLAN interfaces with a CIDR → Subnet (under
+    enclosing operator block when present, else auto-created
+    RFC 1918 / CGNAT supernet via the shared helper). Bridges
+    without a CIDR skipped.
+  - VM + LXC NICs → IPAddress with `status="proxmox-vm"` /
+    `"proxmox-lxc"`, MAC from config. Runtime IP from QEMU
+    guest-agent (when `agent=1` + agent running) or LXC
+    `/interfaces`; falls back to `ipconfigN` static IP (VMs)
+    or inline `ip=` (LXC); NIC silently skipped when nothing
+    resolves. Link-local + loopback addresses filtered out.
+  - Bridge gateway IP → `reserved` placeholder row per subnet.
+  `mirror_vms` + `mirror_lxc` default **true** (PVE guests are
+  long-lived, unlike Docker CI containers). Covered by 27
+  tests: `test_proxmox_client.py` (NIC + ipconfig string
+  parsing) + `test_proxmox_reconcile.py` (pipeline end-to-end
+  with stubbed client). Migration `d1a8f3c704e9`.
+  **Deferred follow-ups:**
+  - **Phase 2 per-cluster management surface** — VM / LXC
+    start/stop/shutdown, console access, live migrate,
+    snapshot, backup browser. Mirrors the Kubernetes /
+    Docker Phase-3 pattern; needs websocket pipeline we
+    don't have today.
+  - **Pool / resource-tag awareness.** PVE has a "pool" object
+    for grouping resources and an arbitrary tag system; neither
+    surfaces in IPAM today. Low-effort to add as custom-field
+    passthrough once an operator asks.
+  - **Cluster-quorum alerting.** `/cluster/status` carries a
+    `quorate` bool — wire that into the alerts framework so an
+    HA cluster losing quorum pages operators.
 
 - ⬜ **UniFi Network Application** *(tier 1 — biggest LAN
   inventory win).* Per-controller row, API-key auth on modern

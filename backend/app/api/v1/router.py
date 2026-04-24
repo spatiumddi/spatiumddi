@@ -17,6 +17,7 @@ from app.api.v1.ipam.router import router as ipam_router
 from app.api.v1.kubernetes import router as kubernetes_router
 from app.api.v1.logs import logs_router
 from app.api.v1.metrics import router as metrics_router
+from app.api.v1.proxmox import router as proxmox_router
 from app.api.v1.roles.router import router as roles_router
 from app.api.v1.search.router import router as search_router
 from app.api.v1.settings.router import router as settings_router
@@ -51,3 +52,4 @@ api_v1_router.include_router(metrics_router, prefix="/metrics", tags=["metrics"]
 api_v1_router.include_router(version_router, prefix="/version", tags=["version"])
 api_v1_router.include_router(kubernetes_router, prefix="/kubernetes", tags=["kubernetes"])
 api_v1_router.include_router(docker_router, prefix="/docker", tags=["docker"])
+api_v1_router.include_router(proxmox_router, prefix="/proxmox", tags=["proxmox"])

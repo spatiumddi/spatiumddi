@@ -14,11 +14,9 @@ import {
 } from "lucide-react";
 
 import {
-  ipamApi,
   dnsApi,
   kubernetesApi,
   type DNSServerGroup,
-  type IPSpace,
   type KubernetesCluster,
   type KubernetesClusterCreate,
   type KubernetesClusterUpdate,
@@ -28,6 +26,7 @@ import {
 import { copyToClipboard } from "@/lib/clipboard";
 import { HeaderButton } from "@/components/ui/header-button";
 import { Modal } from "@/components/ui/modal";
+import { IPSpacePicker } from "@/components/ipam/space-picker";
 
 // ── Setup guide ─────────────────────────────────────────────────────
 // Shown in the create modal so operators know what to run on their
@@ -383,10 +382,6 @@ function ClusterModal({
   const qc = useQueryClient();
   const editing = !!cluster;
 
-  const { data: spaces = [] } = useQuery<IPSpace[]>({
-    queryKey: ["spaces"],
-    queryFn: () => ipamApi.listSpaces(),
-  });
   const { data: dnsGroups = [] } = useQuery<DNSServerGroup[]>({
     queryKey: ["dns-groups"],
     queryFn: () => dnsApi.listGroups(),
@@ -645,19 +640,7 @@ function ClusterModal({
 
         <div className="grid grid-cols-2 gap-3 border-t pt-3">
           <Field label="IPAM space">
-            <select
-              className={inputCls}
-              value={spaceId}
-              onChange={(e) => setSpaceId(e.target.value)}
-              required
-            >
-              <option value="">— select —</option>
-              {spaces.map((s) => (
-                <option key={s.id} value={s.id}>
-                  {s.name}
-                </option>
-              ))}
-            </select>
+            <IPSpacePicker value={spaceId} onChange={setSpaceId} required />
           </Field>
           <Field label="DNS server group (optional)">
             <select

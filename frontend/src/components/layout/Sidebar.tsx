@@ -25,6 +25,7 @@ import {
   Sparkles,
   Boxes,
   Container as ContainerIcon,
+  HardDrive,
   X,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -205,6 +206,9 @@ export function Sidebar({
       : []),
     ...(platformSettings?.integration_docker_enabled
       ? [{ label: "Docker", icon: ContainerIcon, to: "/docker" }]
+      : []),
+    ...(platformSettings?.integration_proxmox_enabled
+      ? [{ label: "Proxmox", icon: HardDrive, to: "/proxmox" }]
       : []),
   ].sort((a, b) => a.label.localeCompare(b.label));
   const mainNav = baseMainNav;

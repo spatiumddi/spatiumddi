@@ -136,6 +136,14 @@ class IPBlock(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         nullable=True,
         index=True,
     )
+    # Set by the Proxmox reconciler for blocks it creates from bridge
+    # CIDRs. Cascades on endpoint delete.
+    proxmox_node_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("proxmox_node.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
 
     # DNS assignment (propagates to child blocks and subnets unless overridden)
     dns_group_ids: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
@@ -327,6 +335,15 @@ class Subnet(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         nullable=True,
         index=True,
     )
+    # Proxmox integration provenance. Bridges + VLAN interfaces on a
+    # PVE node carry a real LAN CIDR (gateway + broadcast) so normal
+    # placeholder rows apply, same as Docker.
+    proxmox_node_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("proxmox_node.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
 
     # Computed / cached. ``total_ips`` is BigInteger because IPv6 subnets can
     # be as large as 2^64 addresses (a /64 — the standard LAN size) which
@@ -433,6 +450,14 @@ class IPAddress(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     docker_host_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("docker_host.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    # Proxmox provenance — set on rows mirrored from a PVE VM or LXC.
+    # Cascades on endpoint delete.
+    proxmox_node_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("proxmox_node.id", ondelete="CASCADE"),
         nullable=True,
         index=True,
     )

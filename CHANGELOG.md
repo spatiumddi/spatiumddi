@@ -5,6 +5,85 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versioning uses 
 
 ---
 
+## Unreleased
+
+### Added
+
+- **Proxmox VE integration (read-only endpoint mirror).** Settings →
+  Integrations → Proxmox toggle (`integration_proxmox_enabled`)
+  lights up a Proxmox nav item in the sidebar. `ProxmoxNode` rows
+  bind per-endpoint to one IPAM space + optional DNS group; a single
+  row represents a standalone host *or* a whole cluster — the PVE
+  REST API is homogeneous across cluster members, so one endpoint
+  surfaces the full cluster state via `/cluster/status` and
+  `/nodes`. Auth is API-token only (no password, no cookie+CSRF):
+  operators issue a read-only token with `PVEAuditor`, paste the
+  `user@realm!tokenid` + UUID secret into the admin page's setup
+  guide, and hit Test Connection. Same 30 s beat sweep + per-node
+  `sync_interval_seconds` gating + on-demand Sync Now as Kubernetes
+  / Docker, plus FK cascade on endpoint delete. Mirrors:
+  - **SDN VNets** (`/cluster/sdn/vnets` + per-vnet `/subnets`) →
+    `Subnet` named `vnet:<vnet>`, with the declared gateway. This
+    is the authoritative source when the operator runs PVE SDN:
+    the backing bridge often doesn't carry a host IP (split-
+    responsibility setup where a router upstream owns L3), so the
+    bridge pass alone would miss every overlay VLAN. SDN wins over
+    a bridge advertising the same CIDR because the VNet label
+    carries the operator's intent. PVE without SDN installed
+    returns 404 on the endpoint — the reconciler treats that as
+    "no SDN configured" and moves on.
+  - **VNet subnet inference** (opt-in via the endpoint's new
+    `infer_vnet_subnets` toggle, default off) — when a VNet exists
+    in `/cluster/sdn/vnets` but has no declared subnets, the
+    reconciler derives a CIDR from the guests attached to that
+    VNet. Priority order: exact `static_cidr` from a VM's
+    `ipconfigN` (gateway from the accompanying `gw=`) or an LXC's
+    inline `ip=`/`gw=`; falling back to a /24 guess around
+    guest-agent runtime IPs. The /24 fallback is speculative and
+    logs a warning with a `pvesh create` hint; operators running
+    /23 or /25 should declare SDN subnets properly instead. Solves
+    the common "PVE is L2 passthrough, gateway lives on an
+    upstream router" layout where operators have 14 VNets but
+    zero declared subnets and have to chase each CIDR by hand
+    today. Migration `e5a72f14c890`.
+  - **Bridges + VLAN interfaces with a CIDR** → `Subnet` (nested
+    under enclosing operator blocks when present, otherwise under
+    an auto-created RFC 1918 / CGNAT supernet). Bridges without a
+    CIDR are skipped — they're the common L2-span case and would
+    pollute IPAM with empty subnets.
+  - **VM NICs** → `IPAddress` with `status="proxmox-vm"`, hostname
+    = VM name, MAC from `netN` config. Runtime IP comes from the
+    QEMU guest-agent (`/nodes/{n}/qemu/{vmid}/agent/network-get-interfaces`)
+    when the agent is enabled + running; falls back to the
+    `ipconfigN` static IP; otherwise the NIC contributes no row.
+    Link-local and loopback IPs are stripped from the agent
+    response so `fe80::…` / `127.0.0.1` don't land in IPAM.
+  - **LXC NICs** → `IPAddress` with `status="proxmox-lxc"`,
+    hostname = container hostname (or name fallback), MAC from
+    config. Runtime IP comes from `/nodes/{n}/lxc/{vmid}/interfaces`
+    when the container is running; falls back to the inline
+    `ip=` value on the netN config.
+  - **Bridge gateway IPs** → `reserved`-status `IPAddress` per
+    subnet, matching the LAN placeholder shape used by
+    operator-created subnets.
+  - **Mirror toggles default ON** (`mirror_vms` + `mirror_lxc`) —
+    unlike Docker containers (CI-ephemeral, noisy), PVE guests are
+    typically long-lived operator inventory, so the integration is
+    useful without flipping anything extra after setup.
+  Minimal `httpx`-based client (no `proxmoxer` / `pveapi-py` dep).
+  Admin page at `/proxmox` with a copy-paste `pveum` token-setup
+  guide, Test Connection probe that distinguishes 401 / 403 / TLS
+  / connect errors with human-readable messages, and Sync Now
+  button per endpoint. Dashboard Integrations panel grows a
+  Proxmox column when the toggle is on, with the same
+  green/amber/red staleness dot + click-through to the admin page.
+  Migration `d1a8f3c704e9`. 27 new tests in
+  `backend/tests/test_proxmox_reconcile.py` +
+  `backend/tests/test_proxmox_client.py` (reconcile pipeline +
+  NIC/ipconfig string parsing).
+
+---
+
 ## 2026.04.22-1 — 2026-04-22
 
 Integrations-heavy release. The headline work is **Docker** and

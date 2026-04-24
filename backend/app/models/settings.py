@@ -190,3 +190,6 @@ class PlatformSettings(Base):
         Boolean, nullable=False, default=False
     )
     integration_docker_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    integration_proxmox_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )

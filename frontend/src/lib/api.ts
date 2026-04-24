@@ -17,9 +17,38 @@ function createClient(): AxiosInstance {
     return config;
   });
 
-  // On 401, attempt token refresh once then redirect to login
+  // On 401, attempt token refresh once then redirect to login.
+  //
+  // Two deadlock traps to avoid:
+  //
+  //   1. The ``/auth/refresh`` call itself goes through this same
+  //      interceptor. A 401 from refresh must NOT be treated as
+  //      "try to refresh again" — otherwise it queues on itself and
+  //      the outer ``await`` never resolves, the ``catch`` block
+  //      never runs, and the user is never redirected.
+  //
+  //   2. If refresh fails, we must reject every queued request too
+  //      — not just the current one. Otherwise any concurrent
+  //      requests that were already queued hang forever.
   let isRefreshing = false;
-  let refreshQueue: Array<(token: string) => void> = [];
+  let refreshQueue: Array<{
+    resolve: (token: string) => void;
+    reject: (err: unknown) => void;
+  }> = [];
+
+  function isRefreshCall(url: string | undefined): boolean {
+    return !!url && url.replace(/^[^/]*\/\//, "").includes("/auth/refresh");
+  }
+
+  function forceLogin(): void {
+    localStorage.removeItem("access_token");
+    localStorage.removeItem("refresh_token");
+    // Skip redirect if we're already on /login so the user doesn't
+    // see a white flash when an expired session fires first.
+    if (!window.location.pathname.startsWith("/login")) {
+      window.location.href = "/login";
+    }
+  }
 
   client.interceptors.response.use(
     (res) => res,
@@ -27,20 +56,30 @@ function createClient(): AxiosInstance {
       const originalRequest = err.config as typeof err.config & {
         _retry?: boolean;
       };
+
+      // 401 on the refresh call itself = the refresh token is dead.
+      // Surface the original error so the caller's ``catch`` branch
+      // runs its cleanup + redirect. Don't try to refresh the refresh.
+      if (err.response?.status === 401 && isRefreshCall(originalRequest?.url)) {
+        return Promise.reject(err);
+      }
+
       if (err.response?.status === 401 && !originalRequest?._retry) {
         const refreshToken = localStorage.getItem("refresh_token");
         if (!refreshToken) {
-          localStorage.removeItem("access_token");
-          window.location.href = "/login";
+          forceLogin();
           return Promise.reject(err);
         }
 
         if (isRefreshing) {
-          return new Promise((resolve) => {
-            refreshQueue.push((token: string) => {
-              if (originalRequest?.headers)
-                originalRequest.headers.Authorization = `Bearer ${token}`;
-              resolve(client(originalRequest!));
+          return new Promise((resolve, reject) => {
+            refreshQueue.push({
+              resolve: (token: string) => {
+                if (originalRequest?.headers)
+                  originalRequest.headers.Authorization = `Bearer ${token}`;
+                resolve(client(originalRequest!));
+              },
+              reject,
             });
           });
         }
@@ -54,15 +93,17 @@ function createClient(): AxiosInstance {
           const { access_token, refresh_token: newRefresh } = res.data;
           localStorage.setItem("access_token", access_token);
           localStorage.setItem("refresh_token", newRefresh);
-          refreshQueue.forEach((cb) => cb(access_token));
+          refreshQueue.forEach(({ resolve }) => resolve(access_token));
           refreshQueue = [];
           if (originalRequest?.headers)
             originalRequest.headers.Authorization = `Bearer ${access_token}`;
           return client(originalRequest!);
-        } catch {
-          localStorage.removeItem("access_token");
-          localStorage.removeItem("refresh_token");
-          window.location.href = "/login";
+        } catch (refreshErr) {
+          // Refresh failed — reject every queued request so their
+          // awaits resolve, then clear storage + redirect.
+          refreshQueue.forEach(({ reject }) => reject(refreshErr));
+          refreshQueue = [];
+          forceLogin();
           return Promise.reject(err);
         } finally {
           isRefreshing = false;
@@ -1203,6 +1244,7 @@ export interface PlatformSettings {
   oui_last_updated_at: string | null;
   integration_kubernetes_enabled: boolean;
   integration_docker_enabled: boolean;
+  integration_proxmox_enabled: boolean;
 }
 
 export interface OUIStatus {
@@ -3214,5 +3256,156 @@ export const dockerApi = {
   syncNow: (id: string) =>
     api
       .post<{ status: string; task_id: string }>(`/docker/hosts/${id}/sync`)
+      .then((r) => r.data),
+};
+
+// ── Proxmox VE integration ─────────────────────────────────────────
+
+export interface ProxmoxDiscoveryGuest {
+  kind: "qemu" | "lxc";
+  vmid: number;
+  name: string;
+  node: string;
+  status: string;
+  nic_count: number;
+  bridges: string[];
+  ips_mirrored: number;
+  ips_from_agent: number;
+  ips_from_static: number;
+  // "reporting" = agent on + returned IPs; "not_responding" = agent on
+  // but no response; "off" = agent flag 0; "n/a" = LXC (no agent concept).
+  agent_state: "reporting" | "not_responding" | "off" | "n/a";
+  // Single top-level reason code for filtering in the UI. ``null`` ==
+  // "everything's fine, guest is mirroring IPs into IPAM".
+  issue:
+    | null
+    | "agent_not_responding"
+    | "agent_off"
+    | "no_ip"
+    | "no_nic"
+    | "static_only";
+  // Operator-facing hint for fixing the issue. ``null`` when there's
+  // nothing to fix.
+  hint: string | null;
+}
+
+export interface ProxmoxDiscoverySummary {
+  vm_total: number;
+  vm_agent_reporting: number;
+  vm_agent_not_responding: number;
+  vm_agent_off: number;
+  vm_no_nic: number;
+  lxc_total: number;
+  lxc_reporting: number;
+  lxc_no_ip: number;
+  sdn_vnets_total: number;
+  sdn_vnets_with_subnet: number;
+  sdn_vnets_unresolved: number;
+  addresses_skipped_no_subnet: number;
+  desired_subnets: number;
+}
+
+export interface ProxmoxDiscovery {
+  summary: ProxmoxDiscoverySummary;
+  guests: ProxmoxDiscoveryGuest[];
+  generated_at: string;
+}
+
+export interface ProxmoxNode {
+  id: string;
+  name: string;
+  description: string;
+  enabled: boolean;
+  host: string;
+  port: number;
+  verify_tls: boolean;
+  ca_bundle_present: boolean;
+  token_id: string;
+  token_secret_present: boolean;
+  ipam_space_id: string;
+  dns_group_id: string | null;
+  mirror_vms: boolean;
+  mirror_lxc: boolean;
+  include_stopped: boolean;
+  infer_vnet_subnets: boolean;
+  sync_interval_seconds: number;
+  last_synced_at: string | null;
+  last_sync_error: string | null;
+  pve_version: string | null;
+  cluster_name: string | null;
+  node_count: number | null;
+  last_discovery: ProxmoxDiscovery | null;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface ProxmoxNodeCreate {
+  name: string;
+  description?: string;
+  enabled?: boolean;
+  host: string;
+  port?: number;
+  verify_tls?: boolean;
+  ca_bundle_pem?: string;
+  token_id: string;
+  token_secret: string;
+  ipam_space_id: string;
+  dns_group_id?: string | null;
+  mirror_vms?: boolean;
+  mirror_lxc?: boolean;
+  include_stopped?: boolean;
+  infer_vnet_subnets?: boolean;
+  sync_interval_seconds?: number;
+}
+
+export interface ProxmoxNodeUpdate {
+  name?: string;
+  description?: string;
+  enabled?: boolean;
+  host?: string;
+  port?: number;
+  verify_tls?: boolean;
+  ca_bundle_pem?: string;
+  token_id?: string;
+  token_secret?: string;
+  ipam_space_id?: string;
+  dns_group_id?: string | null;
+  mirror_vms?: boolean;
+  mirror_lxc?: boolean;
+  include_stopped?: boolean;
+  infer_vnet_subnets?: boolean;
+  sync_interval_seconds?: number;
+}
+
+export interface ProxmoxTestResult {
+  ok: boolean;
+  message: string;
+  pve_version: string | null;
+  cluster_name: string | null;
+  node_count: number | null;
+}
+
+export const proxmoxApi = {
+  listNodes: () => api.get<ProxmoxNode[]>("/proxmox/nodes").then((r) => r.data),
+  createNode: (data: ProxmoxNodeCreate) =>
+    api.post<ProxmoxNode>("/proxmox/nodes", data).then((r) => r.data),
+  updateNode: (id: string, data: ProxmoxNodeUpdate) =>
+    api.put<ProxmoxNode>(`/proxmox/nodes/${id}`, data).then((r) => r.data),
+  deleteNode: (id: string) => api.delete(`/proxmox/nodes/${id}`),
+  testConnection: (body: {
+    node_id?: string;
+    host?: string;
+    port?: number;
+    verify_tls?: boolean;
+    ca_bundle_pem?: string;
+    token_id?: string;
+    token_secret?: string;
+  }) =>
+    api
+      .post<ProxmoxTestResult>("/proxmox/nodes/test", body)
+      .then((r) => r.data),
+  syncNow: (id: string) =>
+    api
+      .post<{ status: string; task_id: string }>(`/proxmox/nodes/${id}/sync`)
       .then((r) => r.data),
 };

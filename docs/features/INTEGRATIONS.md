@@ -102,11 +102,57 @@ When using `connection_type=unix`, the api + worker containers need read access 
 
 ---
 
+## Proxmox VE
+
+**Phase status**: 1a + 1b shipped. Phase 2 (per-VM management actions — start / stop / console / snapshot / migrate) deferred.
+
+Per-endpoint config (`ProxmoxNode` rows):
+
+| Field | Notes |
+|---|---|
+| `host` | Hostname or IP of **any** node in the cluster. PVE's REST API is homogeneous across members, so a single row covers a cluster. |
+| `port` | Default `8006`. |
+| `verify_tls` | Default `true`. Disable for self-signed labs, or paste the PVE CA bundle in the field below. |
+| `ca_bundle_pem` | Optional. Trusted in addition to the system store when `verify_tls=true`. |
+| `token_id` | Format `user@realm!tokenid` (e.g. `spatiumddi@pve!spatiumddi`). |
+| `token_secret` | UUID printed by `pveum user token add`. Fernet-encrypted at rest. |
+| `ipam_space_id` | Required. |
+| `dns_group_id` | Optional. |
+| `mirror_vms` | Default `true`. Turn off to mirror bridges only. |
+| `mirror_lxc` | Default `true`. |
+| `include_stopped` | Default `false`. |
+| `infer_vnet_subnets` | Default `false`. When on, infer SDN VNet CIDRs from guest NICs for VNets that have no declared subnet — exact from `static_cidr`, speculative /24 from runtime IPs. |
+
+### Mirror semantics
+
+- **SDN VNets** (`/cluster/sdn/vnets/{vnet}/subnets`) → `Subnet` named `vnet:<vnet>`, gateway from the VNet subnet declaration. Operator-declared intent, authoritative over bridges that happen to carry the same CIDR. PVE without SDN installed returns 404 — the reconciler treats that as "no SDN" and keeps going; no error on the endpoint row.
+- **VNet subnet inference** (opt-in via `infer_vnet_subnets`) — for VNets that exist but have no declared subnet, derive the CIDR from guests attached to the VNet. Priority: (1) exact `static_cidr` from `ipconfigN` / LXC `ip=`, gateway from `gw=`; (2) /24 guess around guest-agent runtime IPs, no gateway. The /24 path is speculative and logs a `proxmox_vnet_cidr_guessed` warning — declare subnets properly with `pvesh create /cluster/sdn/vnets/<vnet>/subnets --subnet <cidr> --gateway <ip> --type subnet` to replace guesses with exact values.
+- **Bridges + VLAN interfaces with a CIDR** → `Subnet` under the enclosing operator block (or the auto-created RFC 1918 / CGNAT supernet). Bridges without a CIDR (common L2-only VM bridges, *and* every VLAN the PVE host doesn't terminate) are skipped to avoid empty-subnet noise — use SDN for those, or add the subnet in IPAM manually.
+- **Bridge gateway IP** → one `reserved` `IPAddress` per subnet.
+- **VM NICs** → `IPAddress` with `status="proxmox-vm"`, MAC from `netN` config. Runtime IP from the QEMU guest-agent (`/nodes/{n}/qemu/{vmid}/agent/network-get-interfaces`) when the agent is enabled + running; falls back to `ipconfigN`; NIC dropped when nothing resolves. Link-local + loopback filtered.
+- **LXC NICs** → `IPAddress` with `status="proxmox-lxc"`, hostname = container hostname, MAC from `netN`. Runtime IP from `/nodes/{n}/lxc/{vmid}/interfaces`; falls back to the inline `ip=` on `netN`.
+
+### Setup — minimum-privilege token
+
+The admin page ships a copy-paste guide. TL;DR on any PVE node:
+
+```sh
+pveum useradd spatiumddi@pve --comment "SpatiumDDI read-only"
+pveum aclmod / -user spatiumddi@pve -role PVEAuditor
+pveum user token add spatiumddi@pve spatiumddi --privsep=0
+```
+
+The last command prints the `full-tokenid` (`spatiumddi@pve!spatiumddi`) + `value` (UUID). Paste those into the admin form's **Token ID** and **Token Secret** fields; hit **Test Connection** to verify.
+
+`PVEAuditor` grants read-only ACLs across datacentre + SDN resources — enough for the endpoints this integration calls (`/version`, `/cluster/status`, `/cluster/sdn/vnets*`, `/nodes/*/{qemu,lxc,network}`) plus the per-guest agent / interfaces calls.
+
+---
+
 ## Dashboard surface
 
-When **either** integration toggle is on, the dashboard renders an **Integrations panel** below the service health strip with:
+When **any** integration toggle is on, the dashboard renders an **Integrations panel** below the service health strip with:
 
-- One column per enabled integration (Kubernetes / Docker), header linking to the full admin page.
+- One column per enabled integration (Kubernetes / Docker / Proxmox), header linking to the full admin page.
 - Per-row: status dot (green = synced recently, amber = stalled > 3× sync interval, red = `last_sync_error`, gray = disabled or never synced), name, endpoint, node / container count, humanized last-synced age.
 - `last_sync_error` is exposed as the row tooltip so operators can triage without leaving the dashboard.
 
@@ -114,7 +160,7 @@ When **either** integration toggle is on, the dashboard renders an **Integration
 
 ## Roadmap — additional integrations
 
-Tier 1 candidates tracked in [CLAUDE.md §Future Phases § Additional integration candidates](../../CLAUDE.md): **Proxmox VE**, **UniFi Network Application**, **Tailscale**, **OPNsense**, **pfSense**. All four target the same homelab / SMB audience and fit the Kubernetes/Docker reconciler shape. See CLAUDE.md for per-integration scope notes.
+Tier 1 remaining (tracked in [CLAUDE.md §Future Phases § Additional integration candidates](../../CLAUDE.md)): **UniFi Network Application**, **Tailscale**, **OPNsense**, **pfSense**. All target the same homelab / SMB audience and fit the Kubernetes/Docker/Proxmox reconciler shape. See CLAUDE.md for per-integration scope notes.
 
 Tier 2 (narrower): MikroTik RouterOS 7, Incus / LXD, HashiCorp Nomad, NetBox one-shot import.
 

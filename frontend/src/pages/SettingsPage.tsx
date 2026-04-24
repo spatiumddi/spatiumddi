@@ -86,6 +86,7 @@ type SectionId =
   | "audit-forward"
   | "integrations-kubernetes"
   | "integrations-docker"
+  | "integrations-proxmox"
   | "ip-allocation"
   | "oui-lookup"
   | "session"
@@ -161,6 +162,7 @@ const SECTION_FIELDS: Record<SectionId, (keyof PlatformSettings)[]> = {
   "audit-forward": [],
   "integrations-kubernetes": ["integration_kubernetes_enabled"],
   "integrations-docker": ["integration_docker_enabled"],
+  "integrations-proxmox": ["integration_proxmox_enabled"],
   "ip-allocation": ["ip_allocation_strategy"],
   "oui-lookup": ["oui_lookup_enabled", "oui_update_interval_hours"],
   session: ["session_timeout_minutes", "auto_logout_minutes"],
@@ -694,6 +696,28 @@ const SECTIONS: SectionDef[] = [
       "ipam",
       "socket",
       "tls",
+    ],
+  },
+  {
+    id: "integrations-proxmox",
+    title: "Proxmox",
+    group: "Integrations",
+    description:
+      "Connect one or more Proxmox VE endpoints via the REST API with an API token. A single endpoint can represent a whole cluster (the PVE API is homogeneous across members). Read-only — SpatiumDDI mirrors bridges + VLAN interfaces as subnets, and VMs + LXC containers as IP rows. Runtime IPs come from the QEMU guest-agent (VMs) or the LXC /interfaces endpoint. Never writes to PVE.",
+    keywords: [
+      "proxmox",
+      "pve",
+      "qemu",
+      "lxc",
+      "hypervisor",
+      "vm",
+      "container",
+      "bridge",
+      "cluster",
+      "integration",
+      "ipam",
+      "dns",
+      "token",
     ],
   },
 ];
@@ -1491,6 +1515,34 @@ export function SettingsPage() {
                       className="inline-flex items-center gap-1 rounded-md border px-3 py-1.5 text-xs hover:bg-accent"
                     >
                       Open Docker page →
+                    </a>
+                  </Field>
+                )}
+              </>
+            )}
+
+            {activeId === "integrations-proxmox" && (
+              <>
+                <Field
+                  label="Enable Proxmox integration"
+                  description="Adds a Proxmox menu item to the sidebar. Per-endpoint connection configs are managed there."
+                >
+                  <Toggle
+                    checked={!!values.integration_proxmox_enabled}
+                    onChange={(v) => set("integration_proxmox_enabled", v)}
+                    disabled={!isSuperadmin}
+                  />
+                </Field>
+                {values.integration_proxmox_enabled && (
+                  <Field
+                    label="Endpoints"
+                    description="Manage connected Proxmox VE endpoints."
+                  >
+                    <a
+                      href="/proxmox"
+                      className="inline-flex items-center gap-1 rounded-md border px-3 py-1.5 text-xs hover:bg-accent"
+                    >
+                      Open Proxmox page →
                     </a>
                   </Field>
                 )}

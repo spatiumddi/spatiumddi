@@ -10,6 +10,7 @@ import {
   Cpu,
   FileText,
   Globe2,
+  HardDrive,
   Layers,
   Network,
   Plug,
@@ -25,6 +26,7 @@ import {
   settingsApi,
   kubernetesApi,
   dockerApi,
+  proxmoxApi,
   platformHealthApi,
   type Subnet,
   type DNSServer,
@@ -32,6 +34,7 @@ import {
   type DHCPServerGroup,
   type KubernetesCluster,
   type DockerHost,
+  type ProxmoxNode,
   type PlatformHealthResponse,
   type PlatformHealthStatus,
 } from "@/lib/api";
@@ -392,6 +395,7 @@ export function DashboardPage() {
   // so default deployments don't pay for the queries.
   const kubernetesEnabled = settings?.integration_kubernetes_enabled ?? false;
   const dockerEnabled = settings?.integration_docker_enabled ?? false;
+  const proxmoxEnabled = settings?.integration_proxmox_enabled ?? false;
   const { data: k8sClusters = [] } = useQuery<KubernetesCluster[]>({
     queryKey: ["kubernetes-clusters"],
     queryFn: kubernetesApi.listClusters,
@@ -402,6 +406,12 @@ export function DashboardPage() {
     queryKey: ["docker-hosts"],
     queryFn: dockerApi.listHosts,
     enabled: dockerEnabled,
+    refetchInterval: 30_000,
+  });
+  const { data: proxmoxNodes = [] } = useQuery<ProxmoxNode[]>({
+    queryKey: ["proxmox-nodes"],
+    queryFn: proxmoxApi.listNodes,
+    enabled: proxmoxEnabled,
     refetchInterval: 30_000,
   });
 
@@ -818,12 +828,14 @@ export function DashboardPage() {
         )}
 
         {/* ── Integrations panel ─────────────────────────────────────── */}
-        {(kubernetesEnabled || dockerEnabled) && (
+        {(kubernetesEnabled || dockerEnabled || proxmoxEnabled) && (
           <IntegrationsPanel
             kubernetesEnabled={kubernetesEnabled}
             dockerEnabled={dockerEnabled}
+            proxmoxEnabled={proxmoxEnabled}
             clusters={k8sClusters}
             hosts={dockerHosts}
+            proxmoxNodes={proxmoxNodes}
           />
         )}
 
@@ -1068,17 +1080,23 @@ function integrationDotCls(
 function IntegrationsPanel({
   kubernetesEnabled,
   dockerEnabled,
+  proxmoxEnabled,
   clusters,
   hosts,
+  proxmoxNodes,
 }: {
   kubernetesEnabled: boolean;
   dockerEnabled: boolean;
+  proxmoxEnabled: boolean;
   clusters: KubernetesCluster[];
   hosts: DockerHost[];
+  proxmoxNodes: ProxmoxNode[];
 }) {
   const hasK8s = kubernetesEnabled;
   const hasDocker = dockerEnabled;
-  const cols = [hasK8s, hasDocker].filter(Boolean).length;
+  const hasProxmox = proxmoxEnabled;
+  const cols = [hasK8s, hasDocker, hasProxmox].filter(Boolean).length;
+  const totalTargets = clusters.length + hosts.length + proxmoxNodes.length;
   return (
     <div className="rounded-lg border bg-card">
       <div className="flex items-center justify-between border-b px-4 py-2.5">
@@ -1088,8 +1106,8 @@ function IntegrationsPanel({
             Integrations
           </h3>
           <span className="text-[11px] text-muted-foreground">
-            {clusters.length + hosts.length} target
-            {clusters.length + hosts.length === 1 ? "" : "s"}
+            {totalTargets} target
+            {totalTargets === 1 ? "" : "s"}
           </span>
         </div>
       </div>
@@ -1097,6 +1115,7 @@ function IntegrationsPanel({
         className={cn(
           "grid divide-y",
           cols === 2 && "md:grid-cols-2 md:divide-x md:divide-y-0",
+          cols === 3 && "md:grid-cols-3 md:divide-x md:divide-y-0",
         )}
       >
         {hasK8s && (
@@ -1167,6 +1186,47 @@ function IntegrationsPanel({
                     lastSyncError={h.last_sync_error}
                     intervalSeconds={h.sync_interval_seconds}
                     enabled={h.enabled}
+                  />
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+        {hasProxmox && (
+          <div className="min-w-0">
+            <Link
+              to="/proxmox"
+              className="flex items-center gap-1.5 bg-muted/30 px-4 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground hover:bg-muted/50"
+            >
+              <HardDrive className="h-3 w-3" />
+              Proxmox ({proxmoxNodes.length})
+              <span className="ml-auto text-[10px] text-muted-foreground/70">
+                view all →
+              </span>
+            </Link>
+            {proxmoxNodes.length === 0 ? (
+              <p className="px-4 py-3 text-[11px] italic text-muted-foreground">
+                No endpoints registered.
+              </p>
+            ) : (
+              <div className="divide-y">
+                {proxmoxNodes.map((p) => (
+                  <IntegrationRow
+                    key={p.id}
+                    to={`/proxmox`}
+                    name={p.name}
+                    subtitle={`${p.host}:${p.port}`}
+                    meta={
+                      p.cluster_name
+                        ? `${p.cluster_name} (${p.node_count ?? "?"})`
+                        : p.node_count != null
+                          ? `${p.node_count} node${p.node_count === 1 ? "" : "s"}`
+                          : "—"
+                    }
+                    lastSyncedAt={p.last_synced_at}
+                    lastSyncError={p.last_sync_error}
+                    intervalSeconds={p.sync_interval_seconds}
+                    enabled={p.enabled}
                   />
                 ))}
               </div>
