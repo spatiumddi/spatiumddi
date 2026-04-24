@@ -5,7 +5,16 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versioning uses 
 
 ---
 
-## Unreleased
+## 2026.04.24-1 — 2026-04-24
+
+Proxmox VE integration release. The headline work is a read-only
+PVE endpoint mirror with first-class SDN + VNet-inference support,
+plus a per-guest discovery modal so "why isn't this VM showing up
+in IPAM?" is a two-click answer instead of a log-trawl. Also bundles
+four UX polish fixes (real source IP behind the reverse proxy,
+alphabetised Integrations nav, wider Custom Fields page, search-row
+amber highlight) and a shared IP-space quick-create component so a
+fresh install doesn't dead-end on the integration modals.
 
 ### Added
 
@@ -77,10 +86,87 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versioning uses 
   button per endpoint. Dashboard Integrations panel grows a
   Proxmox column when the toggle is on, with the same
   green/amber/red staleness dot + click-through to the admin page.
-  Migration `d1a8f3c704e9`. 27 new tests in
-  `backend/tests/test_proxmox_reconcile.py` +
-  `backend/tests/test_proxmox_client.py` (reconcile pipeline +
-  NIC/ipconfig string parsing).
+  Migration `d1a8f3c704e9`. 38 tests covering parse helpers, SDN
+  subnet pipeline, VNet inference (both static-CIDR + runtime-IP
+  paths), discovery payload shape, and cascade delete.
+
+- **Proxmox discovery modal** — the reconciler now persists a
+  `last_discovery` JSONB snapshot on every successful sync
+  containing (a) category counters (VM agent reporting / not
+  responding / off, LXC reporting / no IP, SDN VNets resolved /
+  unresolved, addresses skipped because no subnet encloses them)
+  and (b) a per-guest list with a single top-level `issue` code
+  + operator-facing `hint`. New magnifier button on each endpoint
+  row opens a "Discovery — {endpoint}" modal: counter pills along
+  the top, filter bar (`Issues (N)` / `All (N)` / per-issue tabs),
+  search box, and a filterable table with agent-state pills +
+  IPs-mirrored split (`N from agent / M from static`) + inline
+  hints like "install qemu-guest-agent inside the VM:
+  `apt install qemu-guest-agent && systemctl enable --now
+  qemu-guest-agent`". Default filter is `Issues` so operators land
+  directly on what needs attention. Migration `e7b3f29a1d6c`.
+
+- **Shared `IPSpacePicker` component with inline quick-create.**
+  Proxmox / Docker / Kubernetes endpoint modals all require an IPAM
+  space; operators on a fresh install had to cancel out of the
+  endpoint form, create a space on the IPAM page, and come back.
+  The picker wraps the select with a `+ New` button that opens a
+  minimal quick-create modal (name + description + colour only —
+  DNS/DHCP defaults still live on the full IPAM page). On success
+  the new space auto-selects in the outer form. Lives at
+  `frontend/src/components/ipam/space-picker.tsx`; wired into all
+  three integration pages.
+
+### Fixed
+
+- **Source IP in audit log behind the reverse proxy.** The backend
+  already captured `request.client.host` into `AuditLog.source_ip`
+  and the audit UI already surfaces the field, but every deployment
+  behind the frontend nginx container was logging the nginx IP
+  instead of the real user IP. Uvicorn now runs with
+  `--proxy-headers --forwarded-allow-ips=*` in `backend/Dockerfile`
+  so the ASGI scope's client host is populated from the
+  `X-Forwarded-For` header that nginx already sends. Wildcard is
+  safe — only nginx can reach the api container on the compose /
+  k8s network.
+
+- **Settings → Integrations: stable alphabetical order.** Within
+  the Integrations sidebar group, entries now sort by title so
+  Docker appears before Kubernetes regardless of source-file
+  order. Other groups (IPAM, DNS, DHCP) keep their declared
+  ordering — alphabetisation is intentionally scoped to the
+  integrations cluster where "which comes first" isn't meaningful.
+
+- **Custom Fields settings page width.** The CF page was capped at
+  the same `max-w` as the narrow single-column settings panes,
+  which truncated the rightmost columns on the CF table. Bumped to
+  the wide-table cap used by the roles + audit pages.
+
+- **Search-result row highlight actually fires + stays amber +
+  one-shot.** The amber highlight on subnet-detail navigation from
+  global search had three bugs stacked on top of each other:
+  `useStickyLocation` was calling `navigate(…, {replace: true})`
+  which dropped `location.state`; `selectSubnet` was then calling
+  `setSearchParams(…, {replace: true})` on the detail view which
+  dropped what remained; and the CSS animation used
+  `animation-fill-mode: none` so the amber faded back out instead
+  of staying visible. All three patched — the highlight now fires
+  the first time only, paints the row amber for ~2 s with a hold
+  until the user clicks elsewhere, and clears when navigating
+  between subnets.
+
+- **Proxmox settings toggle actually persists.** The settings
+  router's Pydantic response + update schemas were missing
+  `integration_proxmox_enabled`, so toggling it on in the UI
+  silently round-tripped to `false` on save. Added to both schemas
+  — the Kubernetes and Docker toggles were already correct.
+
+### Changed
+
+- **Proxmox, Kubernetes, Docker endpoint modals now embed the new
+  IPSpacePicker**, replacing the plain `<select>` that previously
+  listed only existing spaces. Operators can create a new IPAM
+  space without leaving the endpoint form.
 
 ---
 

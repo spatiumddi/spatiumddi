@@ -28,7 +28,7 @@ Open-source DDI platform — unified DNS, DHCP, and IP Address Management.
 - [DHCP](features/DHCP.md) — servers, scopes, pools, static assignments, leases, Windows DHCP (Path A)
 - [Auth & Permissions](features/AUTH.md) — LDAP, OIDC, SAML, RADIUS, TACACS+, roles, API tokens
 - [ACME DNS-01 Provider](features/ACME.md) — acme-dns-compatible surface for LE / public-CA cert issuance against SpatiumDDI-managed zones
-- [Integrations](features/INTEGRATIONS.md) — read-only Kubernetes + Docker mirrors into IPAM; per-integration setup, mirror semantics, dashboard surface, roadmap
+- [Integrations](features/INTEGRATIONS.md) — read-only Kubernetes + Docker + Proxmox VE mirrors into IPAM; per-integration setup, mirror semantics, dashboard surface, roadmap
 - [System Admin](features/SYSTEM_ADMIN.md) — config, health dashboard, backup/restore
 
 ## Deployment

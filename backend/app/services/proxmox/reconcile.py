@@ -44,9 +44,9 @@ from app.models.proxmox import ProxmoxNode
 from app.services.proxmox.client import (
     ProxmoxClient,
     ProxmoxClientError,
+    _normalise_mac,
     _ProxmoxSDNSubnet,
     _ProxmoxSDNVnet,
-    _normalise_mac,
 )
 
 logger = structlog.get_logger(__name__)
@@ -733,9 +733,7 @@ def _build_discovery_payload(
 
         for nic in g.nics:
             mac_key = nic.mac.lower() if nic.mac else None
-            runtime = (
-                g.runtime_ips_by_mac.get(_normalise_mac(nic.mac)) if nic.mac else None
-            ) or []
+            runtime = (g.runtime_ips_by_mac.get(_normalise_mac(nic.mac)) if nic.mac else None) or []
             for ip in runtime:
                 if (mac_key, ip) in desired_set:
                     ips_mirrored += 1

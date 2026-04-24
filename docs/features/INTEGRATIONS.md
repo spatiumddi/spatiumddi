@@ -146,6 +146,17 @@ The last command prints the `full-tokenid` (`spatiumddi@pve!spatiumddi`) + `valu
 
 `PVEAuditor` grants read-only ACLs across datacentre + SDN resources — enough for the endpoints this integration calls (`/version`, `/cluster/status`, `/cluster/sdn/vnets*`, `/nodes/*/{qemu,lxc,network}`) plus the per-guest agent / interfaces calls.
 
+### Discovery modal
+
+The reconciler writes a `last_discovery` JSONB snapshot on every successful sync containing category counters and a per-guest diagnostic list. The admin page exposes a magnifier-icon button on each endpoint row that opens the **Discovery** modal:
+
+- **Counter pills** at the top: VM totals vs. agent reporting / not responding / off, LXC reporting / no IP, SDN VNets resolved vs. unresolved, subnets mirrored, addresses skipped because no subnet encloses the IP.
+- **Filter tabs** — `Issues (N)` (default), `All (N)`, and one tab per issue code (`Agent not responding`, `Agent off`, `No IP`, `No NIC`, `Static only`).
+- **Search box** — name / vmid / node / bridge substring match.
+- **Per-row table** with agent-state pills, mirrored IP count split (`Na/Ms` = `N` from agent, `M` from static), and an inline operator-facing **hint** like "install qemu-guest-agent inside the VM: `apt install qemu-guest-agent && systemctl enable --now qemu-guest-agent`" or "Enable the QEMU agent on this VM in Options → QEMU Guest Agent".
+
+The button is disabled until the endpoint has been synced at least once (nothing to show). Snapshot freshness matches `last_synced_at`; click **Sync Now** on the row to refresh.
+
 ---
 
 ## Dashboard surface
