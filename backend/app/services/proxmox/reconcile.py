@@ -128,9 +128,12 @@ def _cidr_of_interface(iface_cidr: str) -> str | None:
         return None
 
 
-def _gateway_of_interface(iface_cidr: str) -> str | None:
-    """The PVE bridge IP IS the gateway from the guest's perspective.
-    Returns ``None`` when parsing fails.
+def _ip_of_interface(iface_cidr: str) -> str | None:
+    """Pull the host-side IP from an iface CIDR (``10.0.0.94/24`` →
+    ``10.0.0.94``). Returns ``None`` on parse failure. This is the
+    PVE host's own IP on the bridge — emphatically *not* the gateway
+    of the underlying network in plain-bridge deployments where
+    upstream routing happens on a separate device.
     """
     try:
         return str(ipaddress.ip_interface(iface_cidr).ip)
@@ -334,22 +337,32 @@ def _compute_desired(
     # happens to carry an IP on the same CIDR as an SDN subnet we
     # already emitted, the SDN row wins (it has the human-meaningful
     # vnet label and is the operator's declared intent).
+    #
+    # Note: we deliberately do NOT set ``gateway`` from a bridge IP.
+    # In a plain-bridge deployment the host's bridge IP is just the
+    # PVE node's own LAN address, not the network gateway — that
+    # lives upstream on a router/firewall. SDN simple zones are the
+    # only case where PVE itself routes for a subnet, and those land
+    # via ``sdn_subnets`` above with their declared gateway.
+    bridge_host_ips: list[tuple[str, str, str]] = []  # (cidr, ip, label)
     for n in networks:
         if not n.cidr or not n.active:
             continue
         cidr = _cidr_of_interface(n.cidr)
         if cidr is None:
             continue
+        host_ip = _ip_of_interface(n.cidr)
+        if host_ip is not None:
+            bridge_host_ips.append((cidr, host_ip, f"{n.node}/{n.iface}"))
         if cidr in seen_networks:
             continue
         seen_networks.add(cidr)
-        gateway = _gateway_of_interface(n.cidr)
         subnets.append(
             _DesiredSubnet(
                 network=cidr,
                 name=f"{node.name}/{n.iface}",
                 description=f"Proxmox {n.iface_type} {n.iface} on {n.node}",
-                gateway=gateway,
+                gateway=None,
             )
         )
 
@@ -421,9 +434,8 @@ def _compute_desired(
                     )
                 )
 
-    # Gateway placeholder rows — PVE bridges that carry a CIDR are
-    # routing interfaces for their guests, so the bridge IP lands as
-    # a reserved gateway row.
+    # SDN gateway placeholder rows — when an SDN subnet declares a
+    # real gateway (PVE owns L3 for the VNet), reserve the gateway IP.
     for d in subnets:
         if d.gateway:
             addresses.append(
@@ -434,6 +446,27 @@ def _compute_desired(
                     description=f"Gateway for {d.name}",
                 )
             )
+
+    # PVE host placeholder rows — every node's own bridge IP on a
+    # mirrored CIDR lands as a ``reserved`` row so the host shows up
+    # in IPAM under its own identity (e.g. ``pve1`` at ``192.168.0.94``)
+    # rather than masquerading as a gateway. Each PVE node in the
+    # cluster contributes its own row on the same subnet.
+    seen_host_ips: set[tuple[str, str]] = set()
+    for cidr, host_ip, label in bridge_host_ips:
+        key = (cidr, host_ip)
+        if key in seen_host_ips:
+            continue
+        seen_host_ips.add(key)
+        node_name = label.split("/", 1)[0] if "/" in label else label
+        addresses.append(
+            _DesiredAddress(
+                address=host_ip,
+                status="reserved",
+                hostname=node_name,
+                description=f"PVE host {label}",
+            )
+        )
 
     return subnets, addresses
 
@@ -533,7 +566,13 @@ async def _apply_blocks_and_subnets(
             if existing.description != d.description:
                 existing.description = d.description
                 changed = True
-            if existing.gateway != d.gateway:
+            # Only set gateway when the integration knows one (SDN
+            # subnet declared it). Bridges carry no gateway info, so
+            # ``d.gateway`` is None for those — in that case, leave
+            # whatever's already there alone. Operators who manually
+            # set the correct upstream gateway on a Proxmox-mirrored
+            # subnet shouldn't see it cleared on every sync.
+            if d.gateway and existing.gateway != d.gateway:
                 existing.gateway = d.gateway
                 changed = True
             if existing.total_ips != expected_total:
@@ -570,9 +609,6 @@ async def _apply_addresses(
     )
     subnets = list(subnet_rows)
 
-    res = await db.execute(select(IPAddress).where(IPAddress.proxmox_node_id == node.id))
-    current = {str(a.address): a for a in res.scalars().all()}
-
     # Dedupe by address — a guest with multiple IPs on the same NIC
     # will show up once per IP, but two NICs bridged to the same VLAN
     # with overlapping addresses is a misconfiguration we shouldn't
@@ -583,13 +619,60 @@ async def _apply_addresses(
             continue
         desired_map[d.address] = d
 
+    # Phase 1 — claim any pre-existing operator-owned rows at the
+    # desired (subnet, address) tuples. "Operator-owned" means
+    # ``proxmox_node_id IS NULL``: an IP the user created before
+    # enabling the Proxmox integration, or a row from a different
+    # integration. We adopt the row by stamping ``proxmox_node_id``
+    # AND ``user_modified_at = now()``, which locks the operator's
+    # hostname / description / status / mac from being clobbered on
+    # subsequent reconciles. We never claim rows owned by another
+    # Proxmox endpoint or by Kubernetes / Docker — those are skipped
+    # with a counter bump so the operator can see the conflict.
+    desired_addrs = list(desired_map.keys())
+    if desired_addrs:
+        existing = (
+            (await db.execute(select(IPAddress).where(IPAddress.address.in_(desired_addrs))))
+            .scalars()
+            .all()
+        )
+        for row in existing:
+            if row.proxmox_node_id == node.id:
+                continue  # already ours
+            if row.proxmox_node_id is not None:
+                # Owned by a different Proxmox endpoint — skip.
+                summary.warnings.append(
+                    f"address {row.address} owned by another Proxmox endpoint; not claiming"
+                )
+                continue
+            if row.kubernetes_cluster_id is not None or row.docker_host_id is not None:
+                summary.warnings.append(
+                    f"address {row.address} owned by another integration; not claiming"
+                )
+                continue
+            row.proxmox_node_id = node.id
+            if row.user_modified_at is None:
+                row.user_modified_at = datetime.now(UTC)
+        await db.flush()
+
+    res = await db.execute(select(IPAddress).where(IPAddress.proxmox_node_id == node.id))
+    current = {str(a.address): a for a in res.scalars().all()}
+
     dirty_subnets: set[Any] = {s.id for s in subnets if s.proxmox_node_id == node.id}
 
     for addr, row in current.items():
         if addr not in desired_map:
             dirty_subnets.add(row.subnet_id)
-            await db.delete(row)
-            summary.addresses_deleted += 1
+            if row.user_modified_at is not None:
+                # Operator has invested edits in this row; preserve it.
+                # Releasing the FK lets the operator see a clean
+                # "manually managed" row instead of having their data
+                # silently deleted when a VM goes away.
+                row.proxmox_node_id = None
+                summary.addresses_updated += 1
+            else:
+                await db.delete(row)
+                summary.addresses_deleted += 1
 
     for addr, d in desired_map.items():
         subnet = _find_subnet_for_ip(subnets, d.address)
@@ -599,22 +682,28 @@ async def _apply_addresses(
         if addr in current:
             row = current[addr]
             changed = False
+            # subnet_id is factual (where the address lives); always
+            # update regardless of the user-modified lock.
             if row.subnet_id != subnet.id:
                 dirty_subnets.add(row.subnet_id)
                 row.subnet_id = subnet.id
                 changed = True
-            if row.status != d.status:
-                row.status = d.status
-                changed = True
-            if (row.hostname or "") != d.hostname:
-                row.hostname = d.hostname
-                changed = True
-            if (row.description or "") != d.description:
-                row.description = d.description
-                changed = True
-            if d.mac and (row.mac_address or "") != d.mac.lower():
-                row.mac_address = d.mac.lower()
-                changed = True
+            # Soft fields are skipped when the operator has touched
+            # the row. Comparison short-circuits update when values
+            # already match.
+            if row.user_modified_at is None:
+                if row.status != d.status:
+                    row.status = d.status
+                    changed = True
+                if (row.hostname or "") != d.hostname:
+                    row.hostname = d.hostname
+                    changed = True
+                if (row.description or "") != d.description:
+                    row.description = d.description
+                    changed = True
+                if d.mac and (row.mac_address or "") != d.mac.lower():
+                    row.mac_address = d.mac.lower()
+                    changed = True
             if changed:
                 dirty_subnets.add(subnet.id)
                 summary.addresses_updated += 1

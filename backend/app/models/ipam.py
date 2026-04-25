@@ -20,6 +20,37 @@ from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.models.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
 
+# Valid IPAddress.status values. Operator-settable values cover the
+# manual lifecycle (free → allocated → reserved → deprecated, plus the
+# static_dhcp tag for DHCP reservations). Integration-owned values are
+# stamped by reconcilers (Proxmox / Docker / Kubernetes / DHCP lease
+# pull). The combined set is what API validators accept on update;
+# operators can keep an integration status as-is on a row, or override
+# with any operator-settable value (which stamps user_modified_at on
+# the row and locks it from future reconciler overwrites).
+IP_STATUSES_OPERATOR_SETTABLE: frozenset[str] = frozenset(
+    {
+        "available",
+        "allocated",
+        "reserved",
+        "static_dhcp",
+        "deprecated",
+        "orphan",
+    }
+)
+IP_STATUSES_INTEGRATION_OWNED: frozenset[str] = frozenset(
+    {
+        "dhcp",
+        "docker-container",
+        "kubernetes-node",
+        "kubernetes-lb",
+        "kubernetes-service",
+        "proxmox-vm",
+        "proxmox-lxc",
+    }
+)
+IP_STATUSES: frozenset[str] = IP_STATUSES_OPERATOR_SETTABLE | IP_STATUSES_INTEGRATION_OWNED
+
 
 class IPSpace(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     """VRF / isolated routing domain. IPs in different spaces may overlap."""
@@ -460,6 +491,22 @@ class IPAddress(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         ForeignKey("proxmox_node.id", ondelete="CASCADE"),
         nullable=True,
         index=True,
+    )
+
+    # Stamped by the API write path when an operator edits the row's
+    # soft fields (hostname / description / status / mac_address).
+    # While non-null, integration reconcilers (Proxmox / Docker /
+    # Kubernetes) treat those soft fields as locked and skip overwrites
+    # — so a VM rename in PVE doesn't blow away an operator-chosen IPAM
+    # name, and a row that pre-existed before the integration was
+    # enabled keeps its operator-chosen values when the reconciler
+    # claims it. ``subnet_id`` is always updated regardless of the lock
+    # — that's a factual binding between address and subnet, not an
+    # operator preference. Cleared by the reconciler when the row is
+    # un-claimed (integration-owned but no longer in the upstream
+    # snapshot, with the operator's edits preserved).
+    user_modified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )
 
     subnet: Mapped[Subnet] = relationship("Subnet", back_populates="addresses")

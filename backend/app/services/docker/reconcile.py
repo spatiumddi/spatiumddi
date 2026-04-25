@@ -419,22 +419,58 @@ async def _apply_addresses(
     )
     subnets = list(subnet_rows)
 
-    res = await db.execute(select(IPAddress).where(IPAddress.docker_host_id == host.id))
-    current = {str(a.address): a for a in res.scalars().all()}
-
     desired_map: dict[str, _DesiredAddress] = {}
     for d in desired:
         if d.address in desired_map:
             continue
         desired_map[d.address] = d
 
+    # Phase 1 — claim pre-existing operator-owned rows at the desired
+    # addresses. See the matching block in services/proxmox/reconcile.py
+    # for the full rationale. Operator rows (no integration FK) are
+    # adopted with ``user_modified_at`` stamped so their values stay
+    # locked; rows owned by another integration are skipped + warned.
+    desired_addrs = list(desired_map.keys())
+    if desired_addrs:
+        existing = (
+            (await db.execute(select(IPAddress).where(IPAddress.address.in_(desired_addrs))))
+            .scalars()
+            .all()
+        )
+        for row in existing:
+            if row.docker_host_id == host.id:
+                continue
+            if row.docker_host_id is not None:
+                summary.warnings.append(
+                    f"address {row.address} owned by another Docker host; not claiming"
+                )
+                continue
+            if row.kubernetes_cluster_id is not None or row.proxmox_node_id is not None:
+                summary.warnings.append(
+                    f"address {row.address} owned by another integration; not claiming"
+                )
+                continue
+            row.docker_host_id = host.id
+            if row.user_modified_at is None:
+                row.user_modified_at = datetime.now(UTC)
+        await db.flush()
+
+    res = await db.execute(select(IPAddress).where(IPAddress.docker_host_id == host.id))
+    current = {str(a.address): a for a in res.scalars().all()}
+
     dirty_subnets: set[Any] = {s.id for s in subnets if s.docker_host_id == host.id}
 
     for addr, row in current.items():
         if addr not in desired_map:
             dirty_subnets.add(row.subnet_id)
-            await db.delete(row)
-            summary.addresses_deleted += 1
+            if row.user_modified_at is not None:
+                # Preserve operator-edited rows when the upstream
+                # disappears — release the FK rather than delete.
+                row.docker_host_id = None
+                summary.addresses_updated += 1
+            else:
+                await db.delete(row)
+                summary.addresses_deleted += 1
 
     for addr, d in desired_map.items():
         subnet = _find_subnet_for_ip(subnets, d.address)
@@ -448,15 +484,16 @@ async def _apply_addresses(
                 dirty_subnets.add(row.subnet_id)
                 row.subnet_id = subnet.id
                 changed = True
-            if row.status != d.status:
-                row.status = d.status
-                changed = True
-            if (row.hostname or "") != d.hostname:
-                row.hostname = d.hostname
-                changed = True
-            if (row.description or "") != d.description:
-                row.description = d.description
-                changed = True
+            if row.user_modified_at is None:
+                if row.status != d.status:
+                    row.status = d.status
+                    changed = True
+                if (row.hostname or "") != d.hostname:
+                    row.hostname = d.hostname
+                    changed = True
+                if (row.description or "") != d.description:
+                    row.description = d.description
+                    changed = True
             if changed:
                 dirty_subnets.add(subnet.id)
                 summary.addresses_updated += 1

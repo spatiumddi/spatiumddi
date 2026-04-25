@@ -147,9 +147,14 @@ def _patch_client(fake: _FakeClient):
 
 
 @pytest.mark.asyncio
-async def test_bridge_with_cidr_creates_subnet_and_gateway(
+async def test_bridge_with_cidr_creates_subnet_and_host_placeholder(
     db_session: AsyncSession,
 ) -> None:
+    """Plain Linux bridge: subnet is created with NO gateway (the
+    bridge IP is the host's own LAN address, not the network gateway
+    — which lives upstream on a router). The bridge IP lands as a
+    ``reserved`` row labelled with the PVE node name, not a phantom
+    "gateway" entry."""
     space = await _make_space(db_session)
     node = await _make_node(db_session, space)
     await db_session.commit()
@@ -161,7 +166,7 @@ async def test_bridge_with_cidr_creates_subnet_and_gateway(
                     node="pve01",
                     iface="vmbr0",
                     iface_type="bridge",
-                    cidr="10.0.0.1/24",
+                    cidr="10.0.0.94/24",
                     active=True,
                 )
             ]
@@ -177,18 +182,59 @@ async def test_bridge_with_cidr_creates_subnet_and_gateway(
         await db_session.execute(select(Subnet).where(Subnet.proxmox_node_id == node.id))
     ).scalar_one()
     assert str(sub.network) == "10.0.0.0/24"
-    assert str(sub.gateway) == "10.0.0.1"
+    assert sub.gateway is None  # bridges don't imply a gateway
     assert sub.kubernetes_semantics is False
 
-    # Gateway row — reserved status.
-    gw = (
+    # Host placeholder — the PVE node's own bridge IP, marked reserved
+    # with the PVE node name as hostname.
+    host = (
         await db_session.execute(
             select(IPAddress).where(
                 IPAddress.proxmox_node_id == node.id, IPAddress.status == "reserved"
             )
         )
     ).scalar_one()
-    assert str(gw.address) == "10.0.0.1"
+    assert str(host.address) == "10.0.0.94"
+    assert host.hostname == "pve01"
+
+
+@pytest.mark.asyncio
+async def test_bridge_does_not_clobber_operator_gateway(
+    db_session: AsyncSession,
+) -> None:
+    """If the operator manually sets the correct upstream gateway on
+    a Proxmox-mirrored subnet, subsequent reconciles must NOT clear
+    it back to None just because the bridge doesn't declare one."""
+    space = await _make_space(db_session)
+    node = await _make_node(db_session, space)
+    await db_session.commit()
+
+    network = [
+        _ProxmoxNetworkIface(
+            node="pve01",
+            iface="vmbr0",
+            iface_type="bridge",
+            cidr="10.0.0.94/24",
+            active=True,
+        )
+    ]
+    # First sync: subnet created with gateway=None.
+    with _patch_client(_FakeClient(networks={"pve01": network})):
+        await reconcile_node(db_session, node)
+    sub = (
+        await db_session.execute(select(Subnet).where(Subnet.proxmox_node_id == node.id))
+    ).scalar_one()
+    assert sub.gateway is None
+
+    # Operator sets the real upstream gateway in IPAM.
+    sub.gateway = "10.0.0.1"
+    await db_session.commit()
+
+    # Second sync — no SDN data, just bridges. Operator's gateway must persist.
+    with _patch_client(_FakeClient(networks={"pve01": network})):
+        await reconcile_node(db_session, node)
+    await db_session.refresh(sub)
+    assert str(sub.gateway) == "10.0.0.1"
 
 
 @pytest.mark.asyncio
@@ -937,3 +983,276 @@ async def test_infer_vnet_skipped_when_declared_subnet_exists(
     )
     assert len(rows) == 1
     assert str(rows[0].network) == "10.10.10.0/24"  # declared, not /25
+
+
+# ── User-edit lock + claim-on-existing ────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_pre_existing_operator_row_is_claimed_with_lock(
+    db_session: AsyncSession,
+) -> None:
+    """The user's specific scenario: operator created an IPAM row
+    manually (e.g. ``db-prod`` at 10.0.0.50), THEN added Proxmox.
+    PVE has a VM at the same IP. First reconcile must adopt the row
+    (set proxmox_node_id) but preserve the operator's hostname /
+    description."""
+    space = await _make_space(db_session)
+    node = await _make_node(db_session, space)
+    await db_session.commit()
+
+    # Pre-create the IPAM tree the operator would have built.
+    block = IPBlock(space_id=space.id, network="10.0.0.0/24", name="lan")
+    db_session.add(block)
+    await db_session.flush()
+    sub = Subnet(
+        space_id=space.id,
+        block_id=block.id,
+        network="10.0.0.0/24",
+        name="lan",
+        total_ips=254,
+    )
+    db_session.add(sub)
+    await db_session.flush()
+    operator_row = IPAddress(
+        subnet_id=sub.id,
+        address="10.0.0.50",
+        status="allocated",
+        hostname="db-prod",
+        description="Production database — DO NOT TOUCH",
+    )
+    db_session.add(operator_row)
+    await db_session.commit()
+
+    # Now Proxmox reports the same IP under VM 100 named "vm-100".
+    vm = _ProxmoxGuest(
+        node="pve01",
+        vmid=100,
+        name="vm-100",
+        kind="qemu",
+        status="running",
+        agent_enabled=True,
+        nics=[
+            _ProxmoxNicDef(
+                slot="net0",
+                mac="BC:24:11:E8:4A:3F",
+                bridge="vmbr0",
+                vlan_tag=None,
+                static_cidr=None,
+            )
+        ],
+        runtime_ips_by_mac={"bc:24:11:e8:4a:3f": ["10.0.0.50"]},
+    )
+    fake = _FakeClient(
+        networks={
+            "pve01": [
+                _ProxmoxNetworkIface(
+                    node="pve01",
+                    iface="vmbr0",
+                    iface_type="bridge",
+                    cidr="10.0.0.1/24",
+                    active=True,
+                )
+            ]
+        },
+        qemu={"pve01": [vm]},
+    )
+    with _patch_client(fake):
+        summary = await reconcile_node(db_session, node)
+    assert summary.ok, summary.error
+
+    await db_session.refresh(operator_row)
+    # Row was claimed by Proxmox …
+    assert operator_row.proxmox_node_id == node.id
+    # … but the operator's values were preserved.
+    assert operator_row.hostname == "db-prod"
+    assert operator_row.description == "Production database — DO NOT TOUCH"
+    assert operator_row.status == "allocated"
+    # And user_modified_at is now stamped, locking future reconciles.
+    assert operator_row.user_modified_at is not None
+
+
+@pytest.mark.asyncio
+async def test_user_edit_blocks_reconciler_overwrite(
+    db_session: AsyncSession,
+) -> None:
+    """Operator renames a Proxmox-mirrored row from ``vm-100`` to
+    ``db-prod`` (stamping user_modified_at via the API path), then
+    the reconciler runs again. The rename must stick."""
+    space = await _make_space(db_session)
+    node = await _make_node(db_session, space)
+    await db_session.commit()
+
+    vm = _ProxmoxGuest(
+        node="pve01",
+        vmid=100,
+        name="vm-100",
+        kind="qemu",
+        status="running",
+        agent_enabled=True,
+        nics=[
+            _ProxmoxNicDef(
+                slot="net0",
+                mac="BC:24:11:E8:4A:3F",
+                bridge="vmbr0",
+                vlan_tag=None,
+                static_cidr=None,
+            )
+        ],
+        runtime_ips_by_mac={"bc:24:11:e8:4a:3f": ["10.0.0.50"]},
+    )
+    network = [
+        _ProxmoxNetworkIface(
+            node="pve01",
+            iface="vmbr0",
+            iface_type="bridge",
+            cidr="10.0.0.1/24",
+            active=True,
+        )
+    ]
+    # First sync — creates the row with PVE's name.
+    with _patch_client(_FakeClient(networks={"pve01": network}, qemu={"pve01": [vm]})):
+        await reconcile_node(db_session, node)
+    row = (
+        await db_session.execute(
+            select(IPAddress).where(
+                IPAddress.proxmox_node_id == node.id, IPAddress.status == "proxmox-vm"
+            )
+        )
+    ).scalar_one()
+    assert row.hostname == "vm-100"
+
+    # Operator renames the row (simulating the API write path).
+    from datetime import UTC as _UTC
+    from datetime import datetime as _dt
+
+    row.hostname = "db-prod"
+    row.description = "Production DB — keep hands off"
+    row.user_modified_at = _dt.now(_UTC)
+    await db_session.commit()
+
+    # Second sync — PVE still says "vm-100" but operator's edits hold.
+    with _patch_client(_FakeClient(networks={"pve01": network}, qemu={"pve01": [vm]})):
+        await reconcile_node(db_session, node)
+    await db_session.refresh(row)
+    assert row.hostname == "db-prod"
+    assert row.description == "Production DB — keep hands off"
+
+
+@pytest.mark.asyncio
+async def test_locked_row_keeps_when_vm_disappears(
+    db_session: AsyncSession,
+) -> None:
+    """If the operator has invested edits in a Proxmox-mirrored row
+    and the underlying VM is later deleted from PVE, the row must
+    NOT be deleted — the FK is released so it becomes a plain
+    operator-managed row."""
+    space = await _make_space(db_session)
+    node = await _make_node(db_session, space)
+    await db_session.commit()
+
+    network = [
+        _ProxmoxNetworkIface(
+            node="pve01",
+            iface="vmbr0",
+            iface_type="bridge",
+            cidr="10.0.0.1/24",
+            active=True,
+        )
+    ]
+    vm = _ProxmoxGuest(
+        node="pve01",
+        vmid=100,
+        name="vm-100",
+        kind="qemu",
+        status="running",
+        agent_enabled=True,
+        nics=[
+            _ProxmoxNicDef(
+                slot="net0",
+                mac="BC:24:11:E8:4A:3F",
+                bridge="vmbr0",
+                vlan_tag=None,
+                static_cidr=None,
+            )
+        ],
+        runtime_ips_by_mac={"bc:24:11:e8:4a:3f": ["10.0.0.50"]},
+    )
+    with _patch_client(_FakeClient(networks={"pve01": network}, qemu={"pve01": [vm]})):
+        await reconcile_node(db_session, node)
+    row = (
+        await db_session.execute(
+            select(IPAddress).where(
+                IPAddress.proxmox_node_id == node.id, IPAddress.status == "proxmox-vm"
+            )
+        )
+    ).scalar_one()
+
+    # Operator edits the row.
+    from datetime import UTC as _UTC
+    from datetime import datetime as _dt
+
+    row.hostname = "important-host"
+    row.user_modified_at = _dt.now(_UTC)
+    row_id = row.id
+    await db_session.commit()
+
+    # VM disappears from PVE.
+    with _patch_client(_FakeClient(networks={"pve01": network}, qemu={"pve01": []})):
+        await reconcile_node(db_session, node)
+
+    survivor = await db_session.get(IPAddress, row_id)
+    assert survivor is not None  # not deleted
+    assert survivor.proxmox_node_id is None  # un-claimed
+    assert survivor.hostname == "important-host"  # operator value preserved
+
+
+@pytest.mark.asyncio
+async def test_unlocked_row_deletes_when_vm_disappears(
+    db_session: AsyncSession,
+) -> None:
+    """Sanity check the inverse — if the row has no operator edits,
+    deleting the VM in PVE deletes the IPAM row as before."""
+    space = await _make_space(db_session)
+    node = await _make_node(db_session, space)
+    await db_session.commit()
+
+    network = [
+        _ProxmoxNetworkIface(
+            node="pve01",
+            iface="vmbr0",
+            iface_type="bridge",
+            cidr="10.0.0.1/24",
+            active=True,
+        )
+    ]
+    vm = _ProxmoxGuest(
+        node="pve01",
+        vmid=100,
+        name="vm-100",
+        kind="qemu",
+        status="running",
+        agent_enabled=True,
+        nics=[
+            _ProxmoxNicDef(
+                slot="net0",
+                mac="BC:24:11:E8:4A:3F",
+                bridge="vmbr0",
+                vlan_tag=None,
+                static_cidr=None,
+            )
+        ],
+        runtime_ips_by_mac={"bc:24:11:e8:4a:3f": ["10.0.0.50"]},
+    )
+    with _patch_client(_FakeClient(networks={"pve01": network}, qemu={"pve01": [vm]})):
+        await reconcile_node(db_session, node)
+
+    with _patch_client(_FakeClient(networks={"pve01": network}, qemu={"pve01": []})):
+        await reconcile_node(db_session, node)
+
+    rows = (
+        (await db_session.execute(select(IPAddress).where(IPAddress.status == "proxmox-vm")))
+        .scalars()
+        .all()
+    )
+    assert list(rows) == []

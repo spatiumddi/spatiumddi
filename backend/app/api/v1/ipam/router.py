@@ -3,7 +3,7 @@
 import ipaddress
 import re
 import uuid
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 import structlog
@@ -20,7 +20,15 @@ from app.drivers.dhcp import is_agentless
 from app.models.audit import AuditLog
 from app.models.dhcp import DHCPConfigOp, DHCPPool, DHCPScope, DHCPServer, DHCPStaticAssignment
 from app.models.dns import DNSRecord, DNSZone
-from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet, SubnetDomain
+from app.models.ipam import (
+    IP_STATUSES,
+    IP_STATUSES_OPERATOR_SETTABLE,
+    IPAddress,
+    IPBlock,
+    IPSpace,
+    Subnet,
+    SubnetDomain,
+)
 from app.models.vlans import VLAN
 from app.services.dhcp.config_bundle import build_config_bundle
 from app.services.dhcp.windows_writethrough import (
@@ -1559,7 +1567,13 @@ class IPAddressCreate(BaseModel):
     @field_validator("status")
     @classmethod
     def validate_status(cls, v: str) -> str:
-        allowed = {"allocated", "reserved", "dhcp", "static_dhcp", "deprecated"}
+        # Manual creation: only operator-settable statuses + ``dhcp``
+        # for the static-reservation conversion path. Integration
+        # statuses (proxmox-vm, kubernetes-node, …) are reserved for
+        # the reconcilers — operators picking them on a brand-new
+        # row would create a phantom "owned by no integration"
+        # record.
+        allowed = IP_STATUSES_OPERATOR_SETTABLE | {"dhcp"}
         if v not in allowed:
             raise ValueError(
                 f"status must be one of: {', '.join(sorted(allowed))}. "
@@ -1585,9 +1599,15 @@ class IPAddressUpdate(BaseModel):
     def validate_status(cls, v: str | None) -> str | None:
         if v is None:
             return v
-        allowed = {"available", "allocated", "reserved", "static_dhcp", "deprecated"}
-        if v not in allowed:
-            raise ValueError(f"status must be one of: {', '.join(sorted(allowed))}")
+        # Update path accepts the full status set so an operator can
+        # edit an integration-mirrored row (e.g. change the hostname
+        # on a proxmox-vm row) without having to first move it off
+        # the integration's status. Switching *to* an operator status
+        # on an integration-owned row is allowed too — that, plus the
+        # ``user_modified_at`` stamp the handler writes, is how
+        # operators "claim" a row away from the reconciler.
+        if v not in IP_STATUSES:
+            raise ValueError(f"status must be one of: {', '.join(sorted(IP_STATUSES))}")
         return v
 
 
@@ -1664,7 +1684,10 @@ class NextIPRequest(BaseModel):
     @field_validator("status")
     @classmethod
     def validate_status(cls, v: str) -> str:
-        allowed = {"allocated", "reserved", "dhcp", "static_dhcp"}
+        # next-IP allocation: same shape as manual create — operator
+        # statuses + dhcp. No integration statuses; those rows come
+        # from reconcilers, not the next-IP picker.
+        allowed = IP_STATUSES_OPERATOR_SETTABLE | {"dhcp"}
         if v not in allowed:
             raise ValueError(f"status must be one of: {', '.join(sorted(allowed))}")
         return v
@@ -3924,8 +3947,21 @@ async def update_address(
     changes_for_audit = body.model_dump(
         mode="json", exclude_none=True, exclude={"dns_zone_id", "force"}
     )
+    # Track whether any integration-relevant soft field is genuinely
+    # changing — used to decide if we stamp ``user_modified_at`` so
+    # the reconcilers know to skip overwrites of those fields.
+    soft_fields = {"hostname", "description", "status", "mac_address"}
+    soft_field_actually_changed = False
     for field, value in changes.items():
+        if field in soft_fields and getattr(ip, field) != value:
+            soft_field_actually_changed = True
         setattr(ip, field, value)
+    if soft_field_actually_changed:
+        # Stamp on every operator edit, not just integration-owned
+        # rows — cheap, and makes operator-set values sticky if the
+        # row gets adopted by a future integration (e.g. operator
+        # creates "db-prod" manually, then enables Proxmox later).
+        ip.user_modified_at = datetime.now(UTC)
 
     # Sync DNS:
     # - hostname or dns_zone_id changed → update
