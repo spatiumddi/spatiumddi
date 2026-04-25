@@ -73,6 +73,7 @@ class SettingsResponse(BaseModel):
     integration_kubernetes_enabled: bool
     integration_docker_enabled: bool
     integration_proxmox_enabled: bool
+    integration_tailscale_enabled: bool
 
     model_config = {"from_attributes": True}
 
@@ -120,6 +121,7 @@ class SettingsUpdate(BaseModel):
     integration_kubernetes_enabled: bool | None = None
     integration_docker_enabled: bool | None = None
     integration_proxmox_enabled: bool | None = None
+    integration_tailscale_enabled: bool | None = None
 
     @field_validator("ip_allocation_strategy")
     @classmethod

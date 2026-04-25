@@ -630,7 +630,14 @@ export const ipamApi = {
     id: string,
     data: Partial<Subnet> & { manage_auto_addresses?: boolean },
   ) => api.put<Subnet>(`/ipam/subnets/${id}`, data).then((r) => r.data),
-  deleteSubnet: (id: string) => api.delete(`/ipam/subnets/${id}`),
+  // ``force`` cascades the delete: the backend refuses by default if
+  // the subnet still has user-owned IP rows or attached DHCP scopes.
+  // The UI's two confirmation modals already make the cascade
+  // explicit ("…and all IP address records will be permanently
+  // deleted") so they pass force=true; the bare-id callable shape is
+  // kept for any future "soft" call site.
+  deleteSubnet: (id: string, force: boolean = false) =>
+    api.delete(`/ipam/subnets/${id}${force ? "?force=true" : ""}`),
 
   // Resize (grow-only) — preview is a pure read; commit takes a pg
   // advisory lock and returns 423 Locked if another resize is in flight
@@ -1245,6 +1252,7 @@ export interface PlatformSettings {
   integration_kubernetes_enabled: boolean;
   integration_docker_enabled: boolean;
   integration_proxmox_enabled: boolean;
+  integration_tailscale_enabled: boolean;
 }
 
 export interface OUIStatus {
@@ -3407,5 +3415,90 @@ export const proxmoxApi = {
   syncNow: (id: string) =>
     api
       .post<{ status: string; task_id: string }>(`/proxmox/nodes/${id}/sync`)
+      .then((r) => r.data),
+};
+
+// ── Tailscale integration ──────────────────────────────────────────
+
+export interface TailscaleTenant {
+  id: string;
+  name: string;
+  description: string;
+  enabled: boolean;
+  tailnet: string;
+  api_key_present: boolean;
+  ipam_space_id: string;
+  dns_group_id: string | null;
+  cgnat_cidr: string;
+  ipv6_cidr: string;
+  skip_expired: boolean;
+  sync_interval_seconds: number;
+  last_synced_at: string | null;
+  last_sync_error: string | null;
+  tailnet_domain: string | null;
+  device_count: number | null;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface TailscaleTenantCreate {
+  name: string;
+  description?: string;
+  enabled?: boolean;
+  tailnet?: string;
+  api_key: string;
+  ipam_space_id: string;
+  dns_group_id?: string | null;
+  cgnat_cidr?: string;
+  ipv6_cidr?: string;
+  skip_expired?: boolean;
+  sync_interval_seconds?: number;
+}
+
+export interface TailscaleTenantUpdate {
+  name?: string;
+  description?: string;
+  enabled?: boolean;
+  tailnet?: string;
+  api_key?: string;
+  ipam_space_id?: string;
+  dns_group_id?: string | null;
+  cgnat_cidr?: string;
+  ipv6_cidr?: string;
+  skip_expired?: boolean;
+  sync_interval_seconds?: number;
+}
+
+export interface TailscaleTestResult {
+  ok: boolean;
+  message: string;
+  tailnet_domain: string | null;
+  device_count: number | null;
+}
+
+export const tailscaleApi = {
+  listTenants: () =>
+    api.get<TailscaleTenant[]>("/tailscale/tenants").then((r) => r.data),
+  createTenant: (data: TailscaleTenantCreate) =>
+    api.post<TailscaleTenant>("/tailscale/tenants", data).then((r) => r.data),
+  updateTenant: (id: string, data: TailscaleTenantUpdate) =>
+    api
+      .put<TailscaleTenant>(`/tailscale/tenants/${id}`, data)
+      .then((r) => r.data),
+  deleteTenant: (id: string) => api.delete(`/tailscale/tenants/${id}`),
+  testConnection: (body: {
+    tenant_id?: string;
+    tailnet?: string;
+    api_key?: string;
+  }) =>
+    api
+      .post<TailscaleTestResult>("/tailscale/tenants/test", body)
+      .then((r) => r.data),
+  syncNow: (id: string) =>
+    api
+      .post<{
+        status: string;
+        task_id: string;
+      }>(`/tailscale/tenants/${id}/sync`)
       .then((r) => r.data),
 };

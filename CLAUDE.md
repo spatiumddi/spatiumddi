@@ -794,22 +794,63 @@ cloud accounts.
   reconciler on top. Per-site or per-network opt-in gates the
   client-mirror so a noisy guest SSID doesn't fire-hose IPAM.
 
-- ⬜ **Tailscale** *(tier 1 — tiny surface, direct SpatiumDDI
-  relevance).* Per-`TailscaleTenant` row, PAT token, hits
-  `GET /api/v2/tailnet/{tn}/devices` every 30 s. Mirror every
-  tailnet device as an IPAddress in a dedicated Tailscale IP
-  space pre-carved out of `100.64.0.0/10`:
-  - Hostname = tailnet FQDN (`hostname.tailnet.ts.net`).
-  - `status="tailscale-node"`, MAC null (no L2 on the overlay).
-  - Custom fields: OS, client version, tags, authorized flag,
-    expires_at, user.
-  - Optional DNS sync: create AAAA + A records for the tailnet
-    FQDN in a chosen zone so SpatiumDDI-managed BIND9 can resolve
-    tailnet names for non-Tailscale consumers.
-  Smallest-surface integration on this list — probably a day of
-  work end-to-end. Directly relevant because the user's own
-  working environment runs on Tailscale (`*.rooster-trout.ts.net`
-  hostnames).
+- ✅ **Tailscale — Phase 1: device mirror.** Per-`TailscaleTenant`
+  row, PAT token + tailnet name (default `-`), Fernet-encrypted
+  at rest. 60 s default sync interval (Tailscale rate-limits
+  `/api/v2` at 100 req/min, so 30 s floor is the same as the
+  other integrations). The reconciler hits
+  `GET /api/v2/tailnet/{tn}/devices?fields=all` and mirrors each
+  device's `addresses[]` (both IPv4 in `100.64.0.0/10` and IPv6
+  ULA in `fd7a:115c:a1e0::/48`) as IPAddress rows under the
+  bound IPAM space. The CGNAT + IPv6-ULA blocks are
+  auto-created on first sync — operator can override the CGNAT
+  CIDR per tenant for non-default tailnets. Per-row shape:
+  - `status="tailscale-node"`, hostname = device FQDN
+    (`<host>.<tailnet>.ts.net`), MAC null (no L2 on the overlay).
+  - `description` = `<os> <clientVersion> — <user>`.
+  - `custom_fields` = `{os, client_version, user, tags,
+    authorized, last_seen, expires, key_expiry_disabled,
+    update_available, advertised_routes, enabled_routes,
+    node_id}`.
+  - Tailnet domain is auto-derived from the first device's FQDN
+    (no separate config field; mirrors the uhld pattern).
+  Read-only-ish: integration-owned status + the
+  `user_modified_at` lock keep operator edits sticky across
+  reconciles (same pattern as Proxmox / Docker / Kubernetes).
+  Provenance via `tailscale_tenant_id` FK on
+  `ip_address`/`ip_block`/`subnet` with `ON DELETE CASCADE`.
+  Subnet-router routes (`enabledRoutes`) are stored in
+  custom_fields today; promoting them to first-class IPBlock
+  rows is a follow-up. Test Connection probe + Sync Now button
+  in the admin page mirror the other integrations.
+
+- ⬜ **Tailscale — Phase 2: synthetic tailnet DNS surface.**
+  Register `<tailnet>.ts.net` as a read-only DNS source backed
+  by the same `/devices` poll Phase 1 already runs. Two
+  implementation options under evaluation:
+  1. Add a `TailscaleDNSReadOnlyDriver` to
+     `app/drivers/dns/`, register it in `READ_ONLY_DRIVERS`
+     alongside `WindowsDHCPReadOnlyDriver`. Driver synthesises
+     A + AAAA records from each device's `addresses[]` and
+     `name`. Every CRUD method raises
+     `NotImplementedError` — same shape as Path A Windows
+     DHCP. Tailscale shows up as a "DNS Server" in the
+     existing `/dns` admin page.
+  2. Light-weight: add a per-tenant toggle on
+     `TailscaleTenant.create_synthetic_zone` that, when on,
+     materialises a synthetic `DNSZone` (read-only flag) plus
+     auto-generated `DNSRecord` rows on every reconcile.
+     Records carry `auto_generated=True` + provenance FK so
+     operators can see them in the standard zone view.
+     Doesn't need a new driver; reuses the existing record
+     surface but makes the rows uneditable.
+  Optional follow-up to either: render a BIND9 forwarder zone
+  for `<tailnet>.ts.net` → `100.100.100.100` so non-Tailscale
+  LAN clients can resolve tailnet names through SpatiumDDI's
+  managed BIND9. (`100.100.100.100` is the MagicDNS resolver;
+  it's local-only and can't be queried externally, so the
+  records have to be synthesised — there's no AXFR path.)
+  Phase 2 is a follow-up to Phase 1, not a blocker.
 
 - ⬜ **OPNsense** *(tier 1 — firewall-of-choice for labs).*
   Per-`OPNsenseRouter` row, API key + secret auth over HTTPS.

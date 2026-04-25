@@ -21,6 +21,7 @@ from app.api.v1.proxmox import router as proxmox_router
 from app.api.v1.roles.router import router as roles_router
 from app.api.v1.search.router import router as search_router
 from app.api.v1.settings.router import router as settings_router
+from app.api.v1.tailscale import router as tailscale_router
 from app.api.v1.users.router import router as users_router
 from app.api.v1.version import router as version_router
 from app.api.v1.vlans.router import router as vlans_router
@@ -53,3 +54,4 @@ api_v1_router.include_router(version_router, prefix="/version", tags=["version"]
 api_v1_router.include_router(kubernetes_router, prefix="/kubernetes", tags=["kubernetes"])
 api_v1_router.include_router(docker_router, prefix="/docker", tags=["docker"])
 api_v1_router.include_router(proxmox_router, prefix="/proxmox", tags=["proxmox"])
+api_v1_router.include_router(tailscale_router, prefix="/tailscale", tags=["tailscale"])

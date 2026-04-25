@@ -159,11 +159,65 @@ The button is disabled until the endpoint has been synced at least once (nothing
 
 ---
 
+## Tailscale
+
+**Phase status**: 1 shipped (read-only device mirror). Phase 2 (synthetic `<tailnet>.ts.net` DNS surface backed by the same poll, optionally rendering a BIND9 forwarder zone for `100.100.100.100`) is on the roadmap.
+
+Per-tenant config (`TailscaleTenant` rows):
+
+| Field | Notes |
+|---|---|
+| `tailnet` | Tailnet slug from <https://login.tailscale.com/admin/settings/general>, or `-` for the API key's default tailnet (works for solo accounts and any PAT issued without an explicit tailnet override). |
+| `api_key` | Personal-access token (`tskey-api-…`). Generate at <https://login.tailscale.com/admin/settings/keys>. Fernet-encrypted at rest; tokens carry the issuing user's permissions but SpatiumDDI only ever reads. |
+| `ipam_space_id` | Required. The CGNAT IPv4 + IPv6 ULA blocks land here. |
+| `dns_group_id` | Optional. Held for Phase 2 — unused today. |
+| `cgnat_cidr` | Default `100.64.0.0/10` (Tailscale's standard CGNAT slice). Override only if your tailnet was provisioned with a custom slice. |
+| `ipv6_cidr` | Default `fd7a:115c:a1e0::/48` (Tailscale's standard ULA prefix). |
+| `skip_expired` | Default `true`. Skip devices whose Tailscale node-key has expired. The `0001-01-01T00:00:00Z` "never expires" sentinel is correctly treated as not-expired. |
+| `sync_interval_seconds` | Default `60`. Floor `30`. Tailscale's documented rate limit is 100 req/min — 60 s default leaves plenty of headroom. |
+
+### Mirror semantics
+
+- **CGNAT IPv4 block + IPv6 ULA block** are auto-created under the bound space on first sync (one tenant-owned `IPBlock` each), with a single `Subnet` per block covering the whole slice. The tailnet is a flat overlay — no subdivision.
+- **Devices** (`GET /api/v2/tailnet/{tn}/devices?fields=all`) → one `IPAddress` per `(device, address)` tuple under the matching subnet, with:
+  - `status="tailscale-node"`, `hostname` = device FQDN (`<host>.<tailnet>.ts.net`).
+  - `description` = `<os> <client_version> — <user>`.
+  - `custom_fields` carry: `tailscale_id`, `tailscale_node_id`, `os`, `client_version`, `user`, `tags`, `authorized`, `last_seen`, `expires`, `key_expiry_disabled`, `update_available`, `advertised_routes`, `enabled_routes`. Empty / falsy fields are dropped to keep the JSON column compact.
+- **MAC** is always null — Tailscale is an L3 overlay, no L2 addresses.
+- **Tailnet domain** (`tailnet_domain` on the row) is auto-derived from the first device FQDN — no separate config field.
+
+### Lock semantics
+
+Same shape as Proxmox / Docker / Kubernetes:
+
+- **Claim-on-existing**: pre-existing operator rows in the CGNAT block at desired Tailscale addresses get adopted (FK stamped) with `user_modified_at` set, locking the operator's hostname / description / status / mac from reconciler overwrites.
+- **Skip-on-locked**: rows the operator has edited (`user_modified_at IS NOT NULL`) preserve their soft fields on every subsequent reconcile. The reconciler still updates `subnet_id` and the `custom_fields` JSON (since tailnet metadata like `last_seen` is most useful when fresh).
+- **Un-claim-on-disappear**: locked rows whose upstream device is gone keep the operator's edits — the FK is released so the row appears as "manually managed", rather than being silently deleted.
+- **Cross-integration safety**: rows already owned by Proxmox / Docker / Kubernetes are skipped with a warning rather than claimed.
+
+### Setup
+
+The admin page ships a copy-paste guide:
+
+1. Open <https://login.tailscale.com/admin/settings/keys>, click **Generate API key…**.
+2. Pick an expiry window (90 days minimum). Tailscale doesn't support non-expiring API keys.
+3. Copy the printed value (`tskey-api-…`).
+4. Open <https://login.tailscale.com/admin/settings/general> for the **Organization** slug — paste it into **Tailnet**, or leave the default `-` for solo / single-tailnet accounts.
+5. Hit **Test Connection** to verify before save.
+
+### What's not done in Phase 1
+
+- **Synthetic DNS zone for `<tailnet>.ts.net`** — Phase 2. The device list is the zone; rendering it as a read-only DNS surface (so SpatiumDDI's BIND9 can forward in-tailnet hostnames for non-Tailscale clients) is the natural next step.
+- **Subnet-router routes (`enabled_routes`) as first-class IPBlock rows** — currently surface only in `custom_fields`. Promoting them is straightforward but waits for an operator request.
+- **Per-device management surface** (rename / expire / authorize / delete via the admin API write side) — outside scope of the read-only mirror; Phase 3 territory if it ever lands.
+
+---
+
 ## Dashboard surface
 
 When **any** integration toggle is on, the dashboard renders an **Integrations panel** below the service health strip with:
 
-- One column per enabled integration (Kubernetes / Docker / Proxmox), header linking to the full admin page.
+- One column per enabled integration (Kubernetes / Docker / Proxmox / Tailscale), header linking to the full admin page.
 - Per-row: status dot (green = synced recently, amber = stalled > 3× sync interval, red = `last_sync_error`, gray = disabled or never synced), name, endpoint, node / container count, humanized last-synced age.
 - `last_sync_error` is exposed as the row tooltip so operators can triage without leaving the dashboard.
 
@@ -171,7 +225,7 @@ When **any** integration toggle is on, the dashboard renders an **Integrations p
 
 ## Roadmap — additional integrations
 
-Tier 1 remaining (tracked in [CLAUDE.md §Future Phases § Additional integration candidates](../../CLAUDE.md)): **UniFi Network Application**, **Tailscale**, **OPNsense**, **pfSense**. All target the same homelab / SMB audience and fit the Kubernetes/Docker/Proxmox reconciler shape. See CLAUDE.md for per-integration scope notes.
+Tier 1 remaining (tracked in [CLAUDE.md §Future Phases § Additional integration candidates](../../CLAUDE.md)): **UniFi Network Application**, **OPNsense**, **pfSense**. All target the same homelab / SMB audience and fit the Kubernetes/Docker/Proxmox/Tailscale reconciler shape. See CLAUDE.md for per-integration scope notes.
 
 Tier 2 (narrower): MikroTik RouterOS 7, Incus / LXD, HashiCorp Nomad, NetBox one-shot import.
 

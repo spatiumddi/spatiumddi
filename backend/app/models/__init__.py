@@ -48,6 +48,7 @@ from app.models.metrics import DHCPMetricSample, DNSMetricSample
 from app.models.oui import OUIVendor
 from app.models.proxmox import ProxmoxNode
 from app.models.settings import PlatformSettings
+from app.models.tailscale import TailscaleTenant
 from app.models.vlans import VLAN, Router
 
 __all__ = [
@@ -105,4 +106,5 @@ __all__ = [
     "DockerHost",
     "KubernetesCluster",
     "ProxmoxNode",
+    "TailscaleTenant",
 ]

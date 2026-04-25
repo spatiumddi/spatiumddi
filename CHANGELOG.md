@@ -5,6 +5,79 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versioning uses 
 
 ---
 
+## Unreleased
+
+### Added
+
+- **Tailscale integration (read-only tenant mirror) — Phase 1.**
+  Settings → Integrations → Tailscale toggle
+  (`integration_tailscale_enabled`) lights up a Tailscale nav item
+  in the sidebar. `TailscaleTenant` rows bind per-tenant to one
+  IPAM space + optional DNS server group, with a Fernet-encrypted
+  PAT (`tskey-api-…`) and the tailnet slug (or `-` for the API
+  key's default tailnet). Same 30 s beat sweep + per-tenant
+  `sync_interval_seconds` gating (60 s default, 30 s floor) + Sync
+  Now button as Proxmox / Docker / Kubernetes; FK cascade on
+  tenant delete. The reconciler hits `GET
+  /api/v2/tailnet/{tn}/devices?fields=all` and:
+  - Auto-creates the CGNAT IPv4 block (`100.64.0.0/10` by default,
+    operator can override per tenant for non-default slices) and
+    the IPv6 ULA block (`fd7a:115c:a1e0::/48`) under the bound
+    space on first sync, plus one subnet per block. Idempotent —
+    subsequent reconciles don't duplicate.
+  - Mirrors every device's `addresses[]` (both IPv4 + IPv6) as
+    `IPAddress` rows with `status="tailscale-node"`, hostname =
+    device FQDN (`<host>.<tailnet>.ts.net`), description carrying
+    OS + client version + user, and `custom_fields` for tags,
+    authorized flag, last seen, expires, advertised + enabled
+    routes, key-expiry-disabled, update-available, plus the stable
+    Tailscale device + node IDs.
+  - Skips devices whose Tailscale node-key has expired by default
+    (`skip_expired=True`); devices with `keyExpiryDisabled=true`
+    (long-lived servers / appliances where the operator has turned
+    expiry off) are kept regardless of what the `expires`
+    timestamp says, since Tailscale leaves a frozen / ignored
+    value on the field. Tailscale's `0001-01-01T00:00:00Z`
+    sentinel for "never expires" is correctly interpreted as
+    not-expired.
+  - Auto-derives the tailnet domain (e.g. `rooster-trout.ts.net`)
+    from the first device FQDN — no separate config field.
+  - Claim-on-existing + `user_modified_at` lock semantics match
+    the Proxmox path: pre-existing operator rows in the CGNAT
+    block get adopted (FK stamped) with the lock set, so operator
+    edits to hostname / description / status / mac survive every
+    subsequent reconcile. Custom fields stay reconciler-owned
+    because the tailnet metadata (last_seen, version, route list)
+    is most useful when fresh.
+  - Un-claim-on-disappear preserves operator-edited rows when the
+    upstream device goes away — releases the FK rather than
+    deleting the row, mirroring Proxmox/Docker/K8s behaviour.
+  - Setup guide in the admin page walks the operator through PAT
+    generation in the Tailscale admin console and explains the
+    `-` shorthand for default tailnet. Test Connection probe hits
+    `/devices?fields=default` for a cheap reachability + auth
+    check before save.
+  - Migration `c4e1a87b3920_tailscale_integration` adds the
+    `tailscale_tenant` table + `tailscale_tenant_id` provenance
+    FK on `ip_address` / `ip_block` / `subnet` (CASCADE on tenant
+    delete) + `integration_tailscale_enabled` on
+    `platform_settings`.
+  - 14 unit tests covering tailnet-domain derivation edge cases
+    plus the full reconciler diff: block/subnet idempotency,
+    multi-address mirroring, expired-device skip + the
+    `0001-01-01` sentinel guard, claim-on-existing with the
+    `user_modified_at` lock, and the lock-vs-unlock branches in
+    the un-claim-on-disappear path.
+
+### Notes
+
+- Tailscale Phase 2 (synthetic `<tailnet>.ts.net` DNS surface
+  backed by the same device poll, optionally rendering a BIND9
+  forwarder zone for `100.100.100.100`) is on the roadmap — see
+  `CLAUDE.md` "Future Phases".
+
+---
+
 ## 2026.04.24-1 — 2026-04-24
 
 Proxmox VE integration release. The headline work is a read-only

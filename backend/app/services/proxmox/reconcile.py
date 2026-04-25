@@ -479,6 +479,7 @@ async def _apply_blocks_and_subnets(
     node: ProxmoxNode,
     desired_subnets: list[_DesiredSubnet],
     summary: ReconcileSummary,
+    sdn_vnets: list[_ProxmoxSDNVnet] | None = None,
 ) -> None:
     block_rows = (
         (await db.execute(select(IPBlock).where(IPBlock.space_id == node.ipam_space_id)))
@@ -511,10 +512,29 @@ async def _apply_blocks_and_subnets(
     desired_map = {d.network: d for d in desired_subnets}
     used_wrapper_cidrs: set[str] = set()
 
+    # VNets that still exist on the cluster, by name. Used by the
+    # delete loop below to keep ``vnet:<name>`` subnets stable across
+    # reconciles where we couldn't re-infer the CIDR (e.g. all guests
+    # on the VNet went offline, agent stopped responding, no
+    # ``static_cidr`` on any NIC for this pass). We only delete an
+    # inferred subnet when the underlying VNet has actually been
+    # removed from PVE — that's the operator-meaningful event.
+    extant_vnet_names = {v.vnet for v in (sdn_vnets or [])}
+
     for net_str, row in current_subnets.items():
-        if net_str not in desired_map:
-            await db.delete(row)
-            summary.subnets_deleted += 1
+        if net_str in desired_map:
+            continue
+        # Stickiness: if this subnet was named after a VNet and that
+        # VNet still exists, keep it. Operators only see deletions
+        # when PVE has genuinely removed the upstream object.
+        name = row.name or ""
+        if name.startswith("vnet:"):
+            vnet_name = name[len("vnet:") :]
+            if vnet_name in extant_vnet_names:
+                used_wrapper_cidrs.add(net_str)
+                continue
+        await db.delete(row)
+        summary.subnets_deleted += 1
 
     for net_str, d in desired_map.items():
         parent_block = _find_enclosing_operator_block(blocks, d.network, node.id)
@@ -1030,7 +1050,7 @@ async def reconcile_node(db: AsyncSession, node: ProxmoxNode) -> ReconcileSummar
         node, all_networks, all_guests, sdn_subnets, sdn_vnets
     )
 
-    await _apply_blocks_and_subnets(db, node, desired_subnets, summary)
+    await _apply_blocks_and_subnets(db, node, desired_subnets, summary, sdn_vnets)
     await _apply_addresses(db, node, desired_addresses, summary)
 
     node.last_synced_at = datetime.now(UTC)

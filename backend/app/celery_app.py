@@ -24,6 +24,7 @@ celery_app = Celery(
         "app.tasks.kubernetes_sync",
         "app.tasks.docker_sync",
         "app.tasks.proxmox_sync",
+        "app.tasks.tailscale_sync",
     ],
 )
 
@@ -60,6 +61,7 @@ celery_app.conf.update(
         "app.tasks.kubernetes_sync.*": {"queue": "default"},
         "app.tasks.docker_sync.*": {"queue": "default"},
         "app.tasks.proxmox_sync.*": {"queue": "default"},
+        "app.tasks.tailscale_sync.*": {"queue": "default"},
     },
     beat_schedule={
         # Every 60s, fan-out health checks to every registered DNS server.
@@ -174,6 +176,12 @@ celery_app.conf.update(
         # Gated overall by ``PlatformSettings.integration_proxmox_enabled``.
         "proxmox-sync-sweep": {
             "task": "app.tasks.proxmox_sync.sweep_proxmox_nodes",
+            "schedule": schedule(run_every=30.0),
+        },
+        # Tailscale — same 30 s beat, per-tenant interval gate.
+        # Gated overall by ``PlatformSettings.integration_tailscale_enabled``.
+        "tailscale-sync-sweep": {
+            "task": "app.tasks.tailscale_sync.sweep_tailscale_tenants",
             "schedule": schedule(run_every=30.0),
         },
         # Beat self-heartbeat — writes a redis key every 30 s with a

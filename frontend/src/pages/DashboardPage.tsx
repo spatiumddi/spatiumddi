@@ -17,6 +17,7 @@ import {
   RefreshCw,
   Server,
   Shield,
+  Waypoints,
 } from "lucide-react";
 import {
   ipamApi,
@@ -27,6 +28,7 @@ import {
   kubernetesApi,
   dockerApi,
   proxmoxApi,
+  tailscaleApi,
   platformHealthApi,
   type Subnet,
   type DNSServer,
@@ -35,6 +37,7 @@ import {
   type KubernetesCluster,
   type DockerHost,
   type ProxmoxNode,
+  type TailscaleTenant,
   type PlatformHealthResponse,
   type PlatformHealthStatus,
 } from "@/lib/api";
@@ -396,6 +399,7 @@ export function DashboardPage() {
   const kubernetesEnabled = settings?.integration_kubernetes_enabled ?? false;
   const dockerEnabled = settings?.integration_docker_enabled ?? false;
   const proxmoxEnabled = settings?.integration_proxmox_enabled ?? false;
+  const tailscaleEnabled = settings?.integration_tailscale_enabled ?? false;
   const { data: k8sClusters = [] } = useQuery<KubernetesCluster[]>({
     queryKey: ["kubernetes-clusters"],
     queryFn: kubernetesApi.listClusters,
@@ -408,6 +412,12 @@ export function DashboardPage() {
     enabled: dockerEnabled,
     refetchInterval: 30_000,
   });
+  const { data: tailscaleTenants = [] } = useQuery<TailscaleTenant[]>({
+    queryKey: ["tailscale-tenants"],
+    queryFn: tailscaleApi.listTenants,
+    enabled: tailscaleEnabled,
+  });
+
   const { data: proxmoxNodes = [] } = useQuery<ProxmoxNode[]>({
     queryKey: ["proxmox-nodes"],
     queryFn: proxmoxApi.listNodes,
@@ -828,14 +838,19 @@ export function DashboardPage() {
         )}
 
         {/* ── Integrations panel ─────────────────────────────────────── */}
-        {(kubernetesEnabled || dockerEnabled || proxmoxEnabled) && (
+        {(kubernetesEnabled ||
+          dockerEnabled ||
+          proxmoxEnabled ||
+          tailscaleEnabled) && (
           <IntegrationsPanel
             kubernetesEnabled={kubernetesEnabled}
             dockerEnabled={dockerEnabled}
             proxmoxEnabled={proxmoxEnabled}
+            tailscaleEnabled={tailscaleEnabled}
             clusters={k8sClusters}
             hosts={dockerHosts}
             proxmoxNodes={proxmoxNodes}
+            tailscaleTenants={tailscaleTenants}
           />
         )}
 
@@ -1081,22 +1096,33 @@ function IntegrationsPanel({
   kubernetesEnabled,
   dockerEnabled,
   proxmoxEnabled,
+  tailscaleEnabled,
   clusters,
   hosts,
   proxmoxNodes,
+  tailscaleTenants,
 }: {
   kubernetesEnabled: boolean;
   dockerEnabled: boolean;
   proxmoxEnabled: boolean;
+  tailscaleEnabled: boolean;
   clusters: KubernetesCluster[];
   hosts: DockerHost[];
   proxmoxNodes: ProxmoxNode[];
+  tailscaleTenants: TailscaleTenant[];
 }) {
   const hasK8s = kubernetesEnabled;
   const hasDocker = dockerEnabled;
   const hasProxmox = proxmoxEnabled;
-  const cols = [hasK8s, hasDocker, hasProxmox].filter(Boolean).length;
-  const totalTargets = clusters.length + hosts.length + proxmoxNodes.length;
+  const hasTailscale = tailscaleEnabled;
+  const cols = [hasK8s, hasDocker, hasProxmox, hasTailscale].filter(
+    Boolean,
+  ).length;
+  const totalTargets =
+    clusters.length +
+    hosts.length +
+    proxmoxNodes.length +
+    tailscaleTenants.length;
   return (
     <div className="rounded-lg border bg-card">
       <div className="flex items-center justify-between border-b px-4 py-2.5">
@@ -1116,6 +1142,7 @@ function IntegrationsPanel({
           "grid divide-y",
           cols === 2 && "md:grid-cols-2 md:divide-x md:divide-y-0",
           cols === 3 && "md:grid-cols-3 md:divide-x md:divide-y-0",
+          cols === 4 && "md:grid-cols-4 md:divide-x md:divide-y-0",
         )}
       >
         {hasK8s && (
@@ -1227,6 +1254,45 @@ function IntegrationsPanel({
                     lastSyncError={p.last_sync_error}
                     intervalSeconds={p.sync_interval_seconds}
                     enabled={p.enabled}
+                  />
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+        {hasTailscale && (
+          <div className="min-w-0">
+            <Link
+              to="/tailscale"
+              className="flex items-center gap-1.5 bg-muted/30 px-4 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground hover:bg-muted/50"
+            >
+              <Waypoints className="h-3 w-3" />
+              Tailscale ({tailscaleTenants.length})
+              <span className="ml-auto text-[10px] text-muted-foreground/70">
+                view all →
+              </span>
+            </Link>
+            {tailscaleTenants.length === 0 ? (
+              <p className="px-4 py-3 text-[11px] italic text-muted-foreground">
+                No tenants registered.
+              </p>
+            ) : (
+              <div className="divide-y">
+                {tailscaleTenants.map((t) => (
+                  <IntegrationRow
+                    key={t.id}
+                    to={`/tailscale`}
+                    name={t.name}
+                    subtitle={t.tailnet_domain ?? `tailnet ${t.tailnet}`}
+                    meta={
+                      t.device_count != null
+                        ? `${t.device_count} device${t.device_count === 1 ? "" : "s"}`
+                        : "—"
+                    }
+                    lastSyncedAt={t.last_synced_at}
+                    lastSyncError={t.last_sync_error}
+                    intervalSeconds={t.sync_interval_seconds}
+                    enabled={t.enabled}
                   />
                 ))}
               </div>

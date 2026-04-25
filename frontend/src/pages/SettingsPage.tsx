@@ -87,6 +87,7 @@ type SectionId =
   | "integrations-kubernetes"
   | "integrations-docker"
   | "integrations-proxmox"
+  | "integrations-tailscale"
   | "ip-allocation"
   | "oui-lookup"
   | "session"
@@ -163,6 +164,7 @@ const SECTION_FIELDS: Record<SectionId, (keyof PlatformSettings)[]> = {
   "integrations-kubernetes": ["integration_kubernetes_enabled"],
   "integrations-docker": ["integration_docker_enabled"],
   "integrations-proxmox": ["integration_proxmox_enabled"],
+  "integrations-tailscale": ["integration_tailscale_enabled"],
   "ip-allocation": ["ip_allocation_strategy"],
   "oui-lookup": ["oui_lookup_enabled", "oui_update_interval_hours"],
   session: ["session_timeout_minutes", "auto_logout_minutes"],
@@ -717,6 +719,26 @@ const SECTIONS: SectionDef[] = [
       "integration",
       "ipam",
       "dns",
+      "token",
+    ],
+  },
+  {
+    id: "integrations-tailscale",
+    title: "Tailscale",
+    group: "Integrations",
+    description:
+      "Connect one or more Tailscale tenants (tailnets) via the Tailscale REST API with a personal-access token. Read-only — SpatiumDDI auto-creates the CGNAT 100.64.0.0/10 IPv4 block + the IPv6 ULA block under the bound IPAM space and mirrors every tailnet device's addresses as IP rows with OS / version / user / tags / routes in custom fields. Never writes to Tailscale.",
+    keywords: [
+      "tailscale",
+      "tailnet",
+      "wireguard",
+      "vpn",
+      "mesh",
+      "magicdns",
+      "cgnat",
+      "integration",
+      "ipam",
+      "pat",
       "token",
     ],
   },
@@ -1543,6 +1565,34 @@ export function SettingsPage() {
                       className="inline-flex items-center gap-1 rounded-md border px-3 py-1.5 text-xs hover:bg-accent"
                     >
                       Open Proxmox page →
+                    </a>
+                  </Field>
+                )}
+              </>
+            )}
+
+            {activeId === "integrations-tailscale" && (
+              <>
+                <Field
+                  label="Enable Tailscale integration"
+                  description="Adds a Tailscale menu item to the sidebar. Per-tenant connection configs are managed there."
+                >
+                  <Toggle
+                    checked={!!values.integration_tailscale_enabled}
+                    onChange={(v) => set("integration_tailscale_enabled", v)}
+                    disabled={!isSuperadmin}
+                  />
+                </Field>
+                {values.integration_tailscale_enabled && (
+                  <Field
+                    label="Tenants"
+                    description="Manage connected Tailscale tenants (tailnets)."
+                  >
+                    <a
+                      href="/tailscale"
+                      className="inline-flex items-center gap-1 rounded-md border px-3 py-1.5 text-xs hover:bg-accent"
+                    >
+                      Open Tailscale page →
                     </a>
                   </Field>
                 )}

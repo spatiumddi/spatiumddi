@@ -26,6 +26,7 @@ import {
   Boxes,
   Container as ContainerIcon,
   HardDrive,
+  Waypoints,
   X,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -209,6 +210,9 @@ export function Sidebar({
       : []),
     ...(platformSettings?.integration_proxmox_enabled
       ? [{ label: "Proxmox", icon: HardDrive, to: "/proxmox" }]
+      : []),
+    ...(platformSettings?.integration_tailscale_enabled
+      ? [{ label: "Tailscale", icon: Waypoints, to: "/tailscale" }]
       : []),
   ].sort((a, b) => a.label.localeCompare(b.label));
   const mainNav = baseMainNav;

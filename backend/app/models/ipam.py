@@ -47,6 +47,7 @@ IP_STATUSES_INTEGRATION_OWNED: frozenset[str] = frozenset(
         "kubernetes-service",
         "proxmox-vm",
         "proxmox-lxc",
+        "tailscale-node",
     }
 )
 IP_STATUSES: frozenset[str] = IP_STATUSES_OPERATOR_SETTABLE | IP_STATUSES_INTEGRATION_OWNED
@@ -172,6 +173,15 @@ class IPBlock(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     proxmox_node_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("proxmox_node.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    # Set by the Tailscale reconciler for the auto-created CGNAT +
+    # IPv6 ULA blocks under the bound space. Cascades on tenant
+    # delete.
+    tailscale_tenant_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("tailscale_tenant.id", ondelete="CASCADE"),
         nullable=True,
         index=True,
     )
@@ -375,6 +385,19 @@ class Subnet(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         nullable=True,
         index=True,
     )
+    # Tailscale integration provenance. Subnets created by the
+    # Tailscale reconciler under the auto-created CGNAT + IPv6 ULA
+    # blocks. Tailnet IPs are routed overlays without LAN semantics
+    # (no broadcast, no gateway), so the reconciler sets this with
+    # ``kubernetes_semantics=True`` analogue logic — but we don't
+    # need a separate flag because we don't allocate sub-subnets in
+    # the CGNAT block; every device IP lives in one big subnet.
+    tailscale_tenant_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("tailscale_tenant.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
 
     # Computed / cached. ``total_ips`` is BigInteger because IPv6 subnets can
     # be as large as 2^64 addresses (a /64 — the standard LAN size) which
@@ -489,6 +512,14 @@ class IPAddress(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     proxmox_node_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("proxmox_node.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    # Tailscale provenance — set on rows mirrored from a tailnet
+    # device. Cascades on tenant delete.
+    tailscale_tenant_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("tailscale_tenant.id", ondelete="CASCADE"),
         nullable=True,
         index=True,
     )

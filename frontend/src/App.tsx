@@ -12,6 +12,7 @@ import { DHCPPage } from "@/pages/dhcp/DHCPPage";
 import { KubernetesPage } from "@/pages/kubernetes/KubernetesPage";
 import { DockerPage } from "@/pages/docker/DockerPage";
 import { ProxmoxPage } from "@/pages/proxmox/ProxmoxPage";
+import { TailscalePage } from "@/pages/tailscale/TailscalePage";
 import { LogsPage } from "@/pages/LogsPage";
 import { UsersPage } from "@/pages/admin/UsersPage";
 import { AuditPage } from "@/pages/admin/AuditPage";
@@ -53,6 +54,7 @@ export default function App() {
         <Route path="kubernetes" element={<KubernetesPage />} />
         <Route path="docker" element={<DockerPage />} />
         <Route path="proxmox" element={<ProxmoxPage />} />
+        <Route path="tailscale" element={<TailscalePage />} />
         <Route path="admin/users" element={<UsersPage />} />
         <Route path="admin/groups" element={<GroupsPage />} />
         <Route path="admin/roles" element={<RolesPage />} />

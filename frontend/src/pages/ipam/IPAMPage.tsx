@@ -4695,7 +4695,10 @@ function EditSubnetModal({
 
   const [deleteError, setDeleteError] = useState<string | null>(null);
   const deleteMutation = useMutation({
-    mutationFn: () => ipamApi.deleteSubnet(subnet.id),
+    // EditSubnetModal's two-step delete already requires the
+    // operator to tick "…and all its contents will be permanently
+    // deleted" — cascade is the right semantics. force=true.
+    mutationFn: () => ipamApi.deleteSubnet(subnet.id, true),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["subnets", subnet.space_id] });
       qc.invalidateQueries({ queryKey: ["blocks", subnet.space_id] });
@@ -7683,7 +7686,10 @@ function BlockDetailView({
     mutationFn: async () => {
       const ids = Array.from(selectedSubnets);
       const results = await Promise.allSettled(
-        ids.map((id) => ipamApi.deleteSubnet(id)),
+        // Cascade — the confirmation modal already says "…and all
+        // IP address records within them will be permanently
+        // deleted". force=true matches that intent.
+        ids.map((id) => ipamApi.deleteSubnet(id, true)),
       );
       const failures: { id: string; message: string }[] = [];
       ids.forEach((id, i) => {
@@ -8503,7 +8509,10 @@ function SpaceTableView({
           blockIds.push(key.slice("block:".length));
       }
       const subnetResults = await Promise.allSettled(
-        subnetIds.map((id) => ipamApi.deleteSubnet(id)),
+        // The bulk-delete confirmation modal already made the
+        // cascade explicit; pass force=true so we cascade through
+        // any non-empty subnets the operator has acknowledged.
+        subnetIds.map((id) => ipamApi.deleteSubnet(id, true)),
       );
       const blockResults = await Promise.allSettled(
         blockIds.map((id) => ipamApi.deleteBlock(id)),
@@ -9340,7 +9349,10 @@ function SpaceSection({
     null,
   );
   const deleteSubnet = useMutation({
-    mutationFn: (id: string) => ipamApi.deleteSubnet(id),
+    // The single-subnet ConfirmDestroyModal already requires the
+    // operator to tick "…and all its contents will be permanently
+    // deleted" before this fires, so cascade is the right semantics.
+    mutationFn: (id: string) => ipamApi.deleteSubnet(id, true),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["subnets", space.id] });
       setSubnetToDelete(null);
