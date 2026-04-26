@@ -2850,12 +2850,90 @@ export interface DhcpAuditResponse {
   truncated: boolean;
 }
 
+// ── Agent-shipped logs (BIND9 + Kea) ─────────────────────────────
+
+export interface AgentLogSource {
+  server_id: string;
+  server_name: string;
+  server_kind: "dns" | "dhcp";
+  driver: string;
+  host: string;
+}
+
+export interface DNSQueryLogRow {
+  id: number;
+  ts: string;
+  client_ip: string | null;
+  client_port: number | null;
+  qname: string | null;
+  qclass: string | null;
+  qtype: string | null;
+  flags: string | null;
+  view: string | null;
+  raw: string;
+}
+
+export interface DNSQueryLogRequest {
+  server_id: string;
+  since?: string | null;
+  until?: string | null;
+  q?: string | null;
+  qtype?: string | null;
+  client_ip?: string | null;
+  max_events?: number;
+}
+
+export interface DNSQueryLogResponse {
+  server_id: string;
+  events: DNSQueryLogRow[];
+  truncated: boolean;
+}
+
+export interface DHCPActivityLogRow {
+  id: number;
+  ts: string;
+  severity: string | null;
+  code: string | null;
+  mac_address: string | null;
+  ip_address: string | null;
+  transaction_id: string | null;
+  raw: string;
+}
+
+export interface DHCPActivityLogRequest {
+  server_id: string;
+  since?: string | null;
+  until?: string | null;
+  q?: string | null;
+  severity?: string | null;
+  code?: string | null;
+  mac_address?: string | null;
+  ip_address?: string | null;
+  max_events?: number;
+}
+
+export interface DHCPActivityLogResponse {
+  server_id: string;
+  events: DHCPActivityLogRow[];
+  truncated: boolean;
+}
+
 export const logsApi = {
   listSources: () => api.get<LogSource[]>("/logs/sources").then((r) => r.data),
+  listAgentSources: () =>
+    api.get<AgentLogSource[]>("/logs/agent-sources").then((r) => r.data),
   query: (body: LogQueryRequest) =>
     api.post<LogQueryResponse>("/logs/query", body).then((r) => r.data),
   dhcpAudit: (body: DhcpAuditRequest) =>
     api.post<DhcpAuditResponse>("/logs/dhcp-audit", body).then((r) => r.data),
+  dnsQueries: (body: DNSQueryLogRequest) =>
+    api
+      .post<DNSQueryLogResponse>("/logs/dns-queries", body)
+      .then((r) => r.data),
+  dhcpActivity: (body: DHCPActivityLogRequest) =>
+    api
+      .post<DHCPActivityLogResponse>("/logs/dhcp-activity", body)
+      .then((r) => r.data),
 };
 
 // ── API Tokens ────────────────────────────────────────────────────────────────

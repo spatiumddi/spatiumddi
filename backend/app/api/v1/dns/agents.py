@@ -21,6 +21,7 @@ from sqlalchemy import select
 from app.api.deps import DB
 from app.models.audit import AuditLog
 from app.models.dns import DNSRecordOp, DNSServer, DNSServerGroup, DNSServerZoneState, DNSZone
+from app.models.logs import DNSQueryLogEntry
 from app.models.metrics import DNSMetricSample
 from app.services.dns.agent_config import build_config_bundle
 from app.services.dns.agent_token import (
@@ -504,3 +505,63 @@ async def agent_metrics(
             setattr(existing, k, v)
     await db.commit()
     return {"status": "ok"}
+
+
+# ── Query log ingestion ──────────────────────────────────────────────
+
+
+class QueryLogBatch(BaseModel):
+    """Batch of raw BIND9 query log lines pushed by the agent.
+
+    The agent tails the configured query log file (default
+    ``/var/log/named/queries.log``), collects up to ~200 lines or 5 s
+    worth of activity, and POSTs them here. The control plane parses
+    each line into structured fields and inserts. Idempotency is not
+    enforced — duplicates are rare (they'd require the agent to
+    retry a partially-applied batch) and harmless (rows have a
+    monotonic ``id`` PK; nothing depends on uniqueness).
+    """
+
+    lines: list[str]
+
+
+@router.post("/query-log-entries")
+async def agent_query_log_entries(
+    body: QueryLogBatch,
+    db: DB,
+    auth: tuple[DNSServer, dict[str, Any]] = Depends(_auth_agent),
+) -> dict[str, Any]:
+    """Ingest a batch of BIND9 query log lines from the agent.
+
+    Capped at 1000 lines per request to keep individual transactions
+    bounded. Anything beyond is dropped with a count returned so the
+    agent can log + alert.
+    """
+    from app.services.logs.bind9_parser import parse_query_line  # noqa: PLC0415
+
+    server, _ = auth
+    capped = body.lines[:1000]
+    dropped = max(0, len(body.lines) - len(capped))
+    now = datetime.now(UTC)
+    inserted = 0
+    for raw in capped:
+        parsed = parse_query_line(raw, fallback_ts=now)
+        if parsed is None:
+            continue
+        db.add(
+            DNSQueryLogEntry(
+                server_id=server.id,
+                ts=parsed.ts,
+                client_ip=parsed.client_ip,
+                client_port=parsed.client_port,
+                qname=parsed.qname,
+                qclass=parsed.qclass,
+                qtype=parsed.qtype,
+                flags=parsed.flags,
+                view=parsed.view,
+                raw=parsed.raw,
+            )
+        )
+        inserted += 1
+    await db.commit()
+    return {"status": "ok", "inserted": inserted, "dropped": dropped}

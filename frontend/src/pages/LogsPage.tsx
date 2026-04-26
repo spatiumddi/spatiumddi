@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
+  Activity,
   AlertTriangle,
   Ban,
   Calendar,
@@ -11,12 +12,16 @@ import {
   RefreshCw,
   Search,
   ScrollText,
+  Server,
   XCircle,
 } from "lucide-react";
 import {
   logsApi,
+  type AgentLogSource,
   type DhcpAuditDay,
   type DhcpAuditRow,
+  type DHCPActivityLogRow,
+  type DNSQueryLogRow,
   type LogEventRow,
   type LogSource,
 } from "@/lib/api";
@@ -42,12 +47,15 @@ import { cn } from "@/lib/utils";
  * Infinity so tab-switching doesn't re-hit the DC.
  */
 
-type Tab = "events" | "audit";
+type Tab = "events" | "audit" | "dns-queries" | "dhcp-activity";
 
 export function LogsPage() {
   const [tab, setTab] = useState<Tab>("events");
 
-  // Discovery — who can we pull logs from? Shared across tabs.
+  // Two source lists: Windows servers (Event Log + DHCP Audit) and
+  // agent-driven servers (DNS Queries + DHCP Activity). They're
+  // populated by separate endpoints because the underlying
+  // transports are different (WinRM pull vs. agent push).
   const {
     data: sources,
     isLoading: sourcesLoading,
@@ -58,21 +66,49 @@ export function LogsPage() {
     staleTime: 60_000,
   });
 
-  // Filter by tab — audit tab is DHCP-only.
+  const {
+    data: agentSources,
+    isLoading: agentSourcesLoading,
+    refetch: refetchAgentSources,
+  } = useQuery({
+    queryKey: ["logs-agent-sources"],
+    queryFn: logsApi.listAgentSources,
+    staleTime: 60_000,
+  });
+
+  // Filter by tab — audit tab is DHCP-only. The agent tabs filter
+  // their own list on `server_kind` directly.
   const tabSources = useMemo(() => {
     if (!sources) return [];
     if (tab === "audit") return sources.filter((s) => s.server_kind === "dhcp");
     return sources;
   }, [sources, tab]);
 
-  if (sourcesLoading) {
+  const dnsAgentSources = useMemo(
+    () => (agentSources ?? []).filter((s) => s.server_kind === "dns"),
+    [agentSources],
+  );
+  const dhcpAgentSources = useMemo(
+    () => (agentSources ?? []).filter((s) => s.server_kind === "dhcp"),
+    [agentSources],
+  );
+
+  if (sourcesLoading || agentSourcesLoading) {
     return (
       <div className="p-6 text-sm text-muted-foreground">Loading sources…</div>
     );
   }
 
-  if (!sources || sources.length === 0) {
+  const hasWindows = !!sources && sources.length > 0;
+  const hasAgents = !!agentSources && agentSources.length > 0;
+
+  if (!hasWindows && !hasAgents) {
     return <EmptyLogsState />;
+  }
+
+  function refreshAll() {
+    refetchSources();
+    refetchAgentSources();
   }
 
   return (
@@ -86,12 +122,11 @@ export function LogsPage() {
               Logs
             </h1>
             <p className="mt-1 text-xs text-muted-foreground">
-              Read-only. Windows DNS / DHCP today; agent + control-plane logs
-              coming.
+              Read-only. Windows DNS/DHCP via WinRM, BIND9/Kea via agent push.
             </p>
           </div>
           <button
-            onClick={() => refetchSources()}
+            onClick={refreshAll}
             title="Refresh source list"
             className="flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs font-medium hover:bg-accent"
           >
@@ -99,30 +134,51 @@ export function LogsPage() {
             Sources
           </button>
         </div>
-        <div className="mt-3 flex gap-1 border-b -mb-4">
+        <div className="mt-3 flex flex-wrap gap-1 border-b -mb-4">
           <TabButton
             active={tab === "events"}
             onClick={() => setTab("events")}
             icon={ScrollText}
             label="Event Log"
-            hint="Service events (scope load, zone transfer, auth)"
+            hint="Windows DNS/DHCP service events (scope load, zone transfer, auth)"
+            count={hasWindows ? sources?.length : undefined}
           />
           <TabButton
             active={tab === "audit"}
             onClick={() => setTab("audit")}
             icon={FileClock}
             label="DHCP Audit"
-            hint="Per-lease events (grants, renewals, releases)"
+            hint="Windows DHCP per-lease events (grants, renewals, releases)"
             count={
-              sources.filter((s) => s.server_kind === "dhcp").length ||
+              sources?.filter((s) => s.server_kind === "dhcp").length ||
               undefined
             }
+          />
+          <TabButton
+            active={tab === "dns-queries"}
+            onClick={() => setTab("dns-queries")}
+            icon={Search}
+            label="DNS Queries"
+            hint="BIND9 query log (client → name → qtype). Requires query_log_enabled on the server."
+            count={dnsAgentSources.length || undefined}
+          />
+          <TabButton
+            active={tab === "dhcp-activity"}
+            onClick={() => setTab("dhcp-activity")}
+            icon={Activity}
+            label="DHCP Activity"
+            hint="Kea DHCPv4 activity (DISCOVER / OFFER / REQUEST / ACK, lease alloc, declines)"
+            count={dhcpAgentSources.length || undefined}
           />
         </div>
       </div>
 
       {tab === "events" && <EventLogTab sources={tabSources} />}
       {tab === "audit" && <DhcpAuditTab sources={tabSources} />}
+      {tab === "dns-queries" && <DNSQueriesTab sources={dnsAgentSources} />}
+      {tab === "dhcp-activity" && (
+        <DHCPActivityTab sources={dhcpAgentSources} />
+      )}
     </div>
   );
 }
@@ -884,4 +940,474 @@ function formatTime(iso: string): string {
   } catch {
     return iso;
   }
+}
+
+// ── Agent server picker ───────────────────────────────────────────
+
+function AgentServerPicker({
+  sources,
+  value,
+  onChange,
+}: {
+  sources: AgentLogSource[];
+  value: string | null;
+  onChange: (v: string) => void;
+}) {
+  return (
+    <label className="flex items-center gap-1.5 text-xs">
+      <span className="inline-flex items-center gap-1 text-muted-foreground">
+        <Server className="h-3 w-3" />
+        Server
+      </span>
+      <select
+        value={value ?? ""}
+        onChange={(e) => onChange(e.target.value)}
+        className="rounded-md border bg-background px-2 py-1 text-sm"
+      >
+        {sources.map((s) => (
+          <option key={s.server_id} value={s.server_id}>
+            {s.server_name} ({s.host})
+          </option>
+        ))}
+      </select>
+    </label>
+  );
+}
+
+function EmptyAgentTab({
+  kind,
+  drivers,
+}: {
+  kind: "DNS" | "DHCP";
+  drivers: string;
+}) {
+  return (
+    <div className="m-6 rounded-lg border border-dashed p-8 text-center">
+      <p className="text-sm font-medium">
+        No {kind} servers using a SpatiumDDI agent.
+      </p>
+      <p className="mt-2 text-xs text-muted-foreground">
+        Register a {kind} server with driver <code>{drivers}</code> and the
+        agent will start shipping log lines once activity flows through it.
+      </p>
+    </div>
+  );
+}
+
+// ── DNS Queries tab (BIND9 query log) ────────────────────────────
+
+function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
+  const [serverId, setServerId] = useState<string | null>(
+    sources[0]?.server_id ?? null,
+  );
+  const [maxEvents, setMaxEvents] = useState(200);
+  const [since, setSince] = useState<string>("");
+  const [q, setQ] = useState("");
+  const [qtype, setQtype] = useState<string>("");
+  const [clientIp, setClientIp] = useState<string>("");
+
+  useEffect(() => {
+    if (sources.length === 0) {
+      setServerId(null);
+      return;
+    }
+    if (!serverId || !sources.some((s) => s.server_id === serverId)) {
+      setServerId(sources[0].server_id);
+    }
+  }, [sources, serverId]);
+
+  const sinceIso = since ? new Date(since).toISOString() : null;
+  const enabled = !!serverId;
+
+  const dnsQueriesQuery = useQuery({
+    queryKey: [
+      "logs-dns-queries",
+      serverId,
+      maxEvents,
+      sinceIso,
+      q,
+      qtype,
+      clientIp,
+    ],
+    queryFn: () =>
+      logsApi.dnsQueries({
+        server_id: serverId!,
+        max_events: maxEvents,
+        since: sinceIso,
+        q: q.trim() || null,
+        qtype: qtype.trim() || null,
+        client_ip: clientIp.trim() || null,
+      }),
+    enabled,
+    staleTime: 5_000,
+    gcTime: 60_000,
+    retry: false,
+  });
+
+  const events = dnsQueriesQuery.data?.events ?? [];
+  const selected = useMemo(
+    () => sources.find((s) => s.server_id === serverId),
+    [serverId, sources],
+  );
+
+  if (sources.length === 0) {
+    return <EmptyAgentTab kind="DNS" drivers="bind9" />;
+  }
+
+  return (
+    <>
+      {/* Filter bar */}
+      <div className="flex flex-wrap items-center gap-3 border-b bg-muted/20 px-6 py-3">
+        <AgentServerPicker
+          sources={sources}
+          value={serverId}
+          onChange={setServerId}
+        />
+        <label className="flex items-center gap-1.5 text-xs">
+          <span className="text-muted-foreground">QType</span>
+          <input
+            value={qtype}
+            onChange={(e) => setQtype(e.target.value.toUpperCase())}
+            placeholder="A / AAAA / MX…"
+            className="w-24 rounded-md border bg-background px-2 py-1 text-sm"
+          />
+        </label>
+        <label className="flex items-center gap-1.5 text-xs">
+          <span className="text-muted-foreground">Client IP</span>
+          <input
+            value={clientIp}
+            onChange={(e) => setClientIp(e.target.value)}
+            placeholder="192.0.2.5"
+            className="w-32 rounded-md border bg-background px-2 py-1 text-sm font-mono text-[11px]"
+          />
+        </label>
+        <label className="flex items-center gap-1.5 text-xs">
+          <span className="inline-flex items-center gap-1 text-muted-foreground">
+            <Calendar className="h-3 w-3" />
+            Since
+          </span>
+          <input
+            type="datetime-local"
+            value={since}
+            onChange={(e) => setSince(e.target.value)}
+            className="rounded-md border bg-background px-2 py-1 text-sm"
+          />
+          {since && (
+            <button
+              type="button"
+              onClick={() => setSince("")}
+              title="Clear"
+              className="rounded p-0.5 text-muted-foreground hover:text-foreground"
+            >
+              <XCircle className="h-3.5 w-3.5" />
+            </button>
+          )}
+        </label>
+        <MaxEventsPicker value={maxEvents} onChange={setMaxEvents} />
+        <FilterSearch value={q} onChange={setQ} />
+        <div className="ml-auto">
+          <RefreshButton query={dnsQueriesQuery} enabled={enabled} />
+        </div>
+      </div>
+
+      {dnsQueriesQuery.isError && <QueryErrorBanner query={dnsQueriesQuery} />}
+      {dnsQueriesQuery.isFetching && events.length === 0 && (
+        <QueryingIndicator host={selected?.host} />
+      )}
+      {!dnsQueriesQuery.isError &&
+        !dnsQueriesQuery.isFetching &&
+        events.length === 0 && <EmptyResults hasSince={!!sinceIso} />}
+
+      {events.length > 0 && (
+        <div className="flex-1 overflow-auto">
+          <div className="grid grid-cols-[160px_140px_60px_70px_120px_80px_1fr] gap-x-3 border-b bg-muted/30 px-6 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+            <span>Time</span>
+            <span>Client</span>
+            <span>QType</span>
+            <span>QClass</span>
+            <span>QName</span>
+            <span>Flags</span>
+            <span>Raw</span>
+          </div>
+          <div className="divide-y text-xs">
+            {events.map((row) => (
+              <DNSQueryRow key={row.id} row={row} />
+            ))}
+          </div>
+          {dnsQueriesQuery.data?.truncated && (
+            <div className="px-6 py-2 text-[11px] text-amber-600">
+              Showing newest {events.length} — older entries exist; raise Max or
+              narrow the time window.
+            </div>
+          )}
+        </div>
+      )}
+    </>
+  );
+}
+
+function DNSQueryRow({ row }: { row: DNSQueryLogRow }) {
+  return (
+    <div className="grid grid-cols-[160px_140px_60px_70px_120px_80px_1fr] items-baseline gap-x-3 px-6 py-1 hover:bg-muted/40">
+      <span
+        className="font-mono tabular-nums text-muted-foreground"
+        title={row.ts}
+      >
+        {formatTime(row.ts)}
+      </span>
+      <span
+        className="truncate font-mono text-[11px]"
+        title={
+          row.client_ip
+            ? `${row.client_ip}${row.client_port ? `#${row.client_port}` : ""}`
+            : ""
+        }
+      >
+        {row.client_ip ?? <span className="text-muted-foreground/40">—</span>}
+      </span>
+      <span className="font-mono">
+        {row.qtype ?? <span className="text-muted-foreground/40">—</span>}
+      </span>
+      <span className="font-mono text-muted-foreground">
+        {row.qclass ?? <span className="text-muted-foreground/40">—</span>}
+      </span>
+      <span className="truncate" title={row.qname ?? ""}>
+        {row.qname ?? <span className="text-muted-foreground/40">—</span>}
+      </span>
+      <span className="font-mono text-muted-foreground">
+        {row.flags ?? <span className="text-muted-foreground/40">—</span>}
+      </span>
+      <span
+        className="truncate font-mono text-[10px] text-muted-foreground/70"
+        title={row.raw}
+      >
+        {row.raw}
+      </span>
+    </div>
+  );
+}
+
+// ── DHCP Activity tab (Kea log) ───────────────────────────────────
+
+function DHCPActivityTab({ sources }: { sources: AgentLogSource[] }) {
+  const [serverId, setServerId] = useState<string | null>(
+    sources[0]?.server_id ?? null,
+  );
+  const [maxEvents, setMaxEvents] = useState(200);
+  const [since, setSince] = useState<string>("");
+  const [q, setQ] = useState("");
+  const [severity, setSeverity] = useState<string>("");
+  const [code, setCode] = useState<string>("");
+  const [mac, setMac] = useState<string>("");
+  const [ip, setIp] = useState<string>("");
+
+  useEffect(() => {
+    if (sources.length === 0) {
+      setServerId(null);
+      return;
+    }
+    if (!serverId || !sources.some((s) => s.server_id === serverId)) {
+      setServerId(sources[0].server_id);
+    }
+  }, [sources, serverId]);
+
+  const sinceIso = since ? new Date(since).toISOString() : null;
+  const enabled = !!serverId;
+
+  const activityQuery = useQuery({
+    queryKey: [
+      "logs-dhcp-activity",
+      serverId,
+      maxEvents,
+      sinceIso,
+      q,
+      severity,
+      code,
+      mac,
+      ip,
+    ],
+    queryFn: () =>
+      logsApi.dhcpActivity({
+        server_id: serverId!,
+        max_events: maxEvents,
+        since: sinceIso,
+        q: q.trim() || null,
+        severity: severity.trim() || null,
+        code: code.trim() || null,
+        mac_address: mac.trim() || null,
+        ip_address: ip.trim() || null,
+      }),
+    enabled,
+    staleTime: 5_000,
+    gcTime: 60_000,
+    retry: false,
+  });
+
+  const events = activityQuery.data?.events ?? [];
+  const selected = useMemo(
+    () => sources.find((s) => s.server_id === serverId),
+    [serverId, sources],
+  );
+
+  if (sources.length === 0) {
+    return <EmptyAgentTab kind="DHCP" drivers="kea" />;
+  }
+
+  return (
+    <>
+      <div className="flex flex-wrap items-center gap-3 border-b bg-muted/20 px-6 py-3">
+        <AgentServerPicker
+          sources={sources}
+          value={serverId}
+          onChange={setServerId}
+        />
+        <label className="flex items-center gap-1.5 text-xs">
+          <span className="text-muted-foreground">Severity</span>
+          <select
+            value={severity}
+            onChange={(e) => setSeverity(e.target.value)}
+            className="rounded-md border bg-background px-2 py-1 text-sm"
+          >
+            <option value="">All</option>
+            <option value="DEBUG">Debug</option>
+            <option value="INFO">Info</option>
+            <option value="WARN">Warn</option>
+            <option value="ERROR">Error</option>
+            <option value="FATAL">Fatal</option>
+          </select>
+        </label>
+        <label className="flex items-center gap-1.5 text-xs">
+          <span className="text-muted-foreground">Code</span>
+          <input
+            value={code}
+            onChange={(e) => setCode(e.target.value.toUpperCase())}
+            placeholder="DHCP4_LEASE_ALLOC"
+            className="w-44 rounded-md border bg-background px-2 py-1 font-mono text-[11px]"
+          />
+        </label>
+        <label className="flex items-center gap-1.5 text-xs">
+          <span className="text-muted-foreground">MAC</span>
+          <input
+            value={mac}
+            onChange={(e) => setMac(e.target.value.toLowerCase())}
+            placeholder="aa:bb:cc:dd:ee:ff"
+            className="w-40 rounded-md border bg-background px-2 py-1 font-mono text-[11px]"
+          />
+        </label>
+        <label className="flex items-center gap-1.5 text-xs">
+          <span className="text-muted-foreground">IP</span>
+          <input
+            value={ip}
+            onChange={(e) => setIp(e.target.value)}
+            placeholder="192.0.2.10"
+            className="w-32 rounded-md border bg-background px-2 py-1 font-mono text-[11px]"
+          />
+        </label>
+        <label className="flex items-center gap-1.5 text-xs">
+          <span className="inline-flex items-center gap-1 text-muted-foreground">
+            <Calendar className="h-3 w-3" />
+            Since
+          </span>
+          <input
+            type="datetime-local"
+            value={since}
+            onChange={(e) => setSince(e.target.value)}
+            className="rounded-md border bg-background px-2 py-1 text-sm"
+          />
+          {since && (
+            <button
+              type="button"
+              onClick={() => setSince("")}
+              title="Clear"
+              className="rounded p-0.5 text-muted-foreground hover:text-foreground"
+            >
+              <XCircle className="h-3.5 w-3.5" />
+            </button>
+          )}
+        </label>
+        <MaxEventsPicker value={maxEvents} onChange={setMaxEvents} />
+        <FilterSearch value={q} onChange={setQ} />
+        <div className="ml-auto">
+          <RefreshButton query={activityQuery} enabled={enabled} />
+        </div>
+      </div>
+
+      {activityQuery.isError && <QueryErrorBanner query={activityQuery} />}
+      {activityQuery.isFetching && events.length === 0 && (
+        <QueryingIndicator host={selected?.host} />
+      )}
+      {!activityQuery.isError &&
+        !activityQuery.isFetching &&
+        events.length === 0 && <EmptyResults hasSince={!!sinceIso} />}
+
+      {events.length > 0 && (
+        <div className="flex-1 overflow-auto">
+          <div className="grid grid-cols-[160px_70px_180px_140px_120px_1fr] gap-x-3 border-b bg-muted/30 px-6 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+            <span>Time</span>
+            <span>Severity</span>
+            <span>Code</span>
+            <span>MAC</span>
+            <span>IP</span>
+            <span>Raw</span>
+          </div>
+          <div className="divide-y text-xs">
+            {events.map((row) => (
+              <DHCPActivityRow key={row.id} row={row} />
+            ))}
+          </div>
+          {activityQuery.data?.truncated && (
+            <div className="px-6 py-2 text-[11px] text-amber-600">
+              Showing newest {events.length} — older entries exist; raise Max or
+              narrow the time window.
+            </div>
+          )}
+        </div>
+      )}
+    </>
+  );
+}
+
+function DHCPActivityRow({ row }: { row: DHCPActivityLogRow }) {
+  const sevCls =
+    row.severity === "ERROR" || row.severity === "FATAL"
+      ? "text-destructive"
+      : row.severity === "WARN"
+        ? "text-amber-600 dark:text-amber-400"
+        : row.severity === "DEBUG"
+          ? "text-muted-foreground/60"
+          : "text-foreground";
+  return (
+    <div className="grid grid-cols-[160px_70px_180px_140px_120px_1fr] items-baseline gap-x-3 px-6 py-1 hover:bg-muted/40">
+      <span
+        className="font-mono tabular-nums text-muted-foreground"
+        title={row.ts}
+      >
+        {formatTime(row.ts)}
+      </span>
+      <span className={cn("font-mono text-[11px]", sevCls)}>
+        {row.severity ?? <span className="text-muted-foreground/40">—</span>}
+      </span>
+      <span className="truncate font-mono text-[11px]" title={row.code ?? ""}>
+        {row.code ?? <span className="text-muted-foreground/40">—</span>}
+      </span>
+      <span
+        className="truncate font-mono text-muted-foreground"
+        title={row.mac_address ?? ""}
+      >
+        {row.mac_address ?? <span className="text-muted-foreground/40">—</span>}
+      </span>
+      <span
+        className="truncate font-mono text-muted-foreground"
+        title={row.ip_address ?? ""}
+      >
+        {row.ip_address ?? <span className="text-muted-foreground/40">—</span>}
+      </span>
+      <span
+        className="truncate font-mono text-[10px] text-muted-foreground/70"
+        title={row.raw}
+      >
+        {row.raw}
+      </span>
+    </div>
+  );
 }

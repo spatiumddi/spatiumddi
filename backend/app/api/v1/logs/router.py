@@ -28,6 +28,7 @@ from typing import Any, Literal
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
+from sqlalchemy import select
 
 from app.api.deps import DB
 from app.core.permissions import require_permission
@@ -37,6 +38,14 @@ from app.drivers.dns import AGENTLESS_DRIVERS as DNS_AGENTLESS
 from app.drivers.dns import get_driver as get_dns_driver
 from app.models.dhcp import DHCPServer
 from app.models.dns import DNSServer
+from app.models.logs import DHCPLogEntry, DNSQueryLogEntry
+
+# Drivers backed by an in-container agent (BIND9, Kea). Distinct from
+# ``AGENTLESS_DRIVERS`` (Windows over WinRM) because the log-pull
+# transport is different — agent-driven sources push log lines to the
+# control plane on a tail thread, agentless drivers pull on demand.
+DNS_AGENT_DRIVERS: frozenset[str] = frozenset({"bind9"})
+DHCP_AGENT_DRIVERS: frozenset[str] = frozenset({"kea"})
 
 logger = structlog.get_logger(__name__)
 
@@ -381,6 +390,247 @@ async def query_dhcp_audit(body: DhcpAuditRequest, db: DB) -> DhcpAuditResponse:
     return DhcpAuditResponse(
         server_id=body.server_id,
         day=resolved_day,
+        events=events,
+        truncated=len(events) >= body.max_events,
+    )
+
+
+# ── Agent-shipped query / activity logs (BIND9 + Kea) ────────────────
+
+
+class AgentLogSource(BaseModel):
+    """One server that ships logs via its in-container agent.
+
+    Different shape from ``LogSource`` — there's no log-name picker
+    (each agent ships one stream), and we don't pre-fetch driver
+    capability lists since the parser is universal.
+    """
+
+    server_id: uuid.UUID
+    server_name: str
+    server_kind: Literal["dns", "dhcp"]
+    driver: str
+    host: str
+
+
+@router.get("/agent-sources", response_model=list[AgentLogSource])
+async def list_agent_sources(db: DB) -> list[AgentLogSource]:
+    """List every DNS / DHCP server backed by an agent driver.
+
+    Drives the server-picker on the "DNS Queries" / "DHCP Activity"
+    tabs. Servers whose agent has never reported in still appear —
+    the tab UI reports "no entries yet" rather than hiding them, so
+    operators can tell the difference between "I haven't enabled
+    query logging yet" and "the server doesn't exist".
+    """
+    out: list[AgentLogSource] = []
+
+    dns_rows = (
+        (await db.execute(select(DNSServer).where(DNSServer.driver.in_(DNS_AGENT_DRIVERS))))
+        .scalars()
+        .all()
+    )
+    for s in dns_rows:
+        out.append(
+            AgentLogSource(
+                server_id=s.id,
+                server_name=s.name,
+                server_kind="dns",
+                driver=s.driver,
+                host=s.host,
+            )
+        )
+
+    dhcp_rows = (
+        (await db.execute(select(DHCPServer).where(DHCPServer.driver.in_(DHCP_AGENT_DRIVERS))))
+        .scalars()
+        .all()
+    )
+    for s in dhcp_rows:
+        out.append(
+            AgentLogSource(
+                server_id=s.id,
+                server_name=s.name,
+                server_kind="dhcp",
+                driver=s.driver,
+                host=s.host,
+            )
+        )
+
+    out.sort(key=lambda s: (s.server_kind, s.server_name.lower()))
+    return out
+
+
+class DNSQueryLogRow(BaseModel):
+    id: int
+    ts: datetime
+    client_ip: str | None
+    client_port: int | None
+    qname: str | None
+    qclass: str | None
+    qtype: str | None
+    flags: str | None
+    view: str | None
+    raw: str
+
+
+class DNSQueryLogRequest(BaseModel):
+    server_id: uuid.UUID
+    since: datetime | None = None
+    until: datetime | None = None
+    q: str | None = None
+    qtype: str | None = None
+    client_ip: str | None = None
+    max_events: int = Field(default=200, ge=1, le=1000)
+
+
+class DNSQueryLogResponse(BaseModel):
+    server_id: uuid.UUID
+    events: list[DNSQueryLogRow]
+    truncated: bool
+
+
+@router.post("/dns-queries", response_model=DNSQueryLogResponse)
+async def query_dns_queries(body: DNSQueryLogRequest, db: DB) -> DNSQueryLogResponse:
+    """Read parsed BIND9 query log entries for a server.
+
+    All filters are server-side so the firehose stays manageable —
+    the typical caller asks for the most recent 200 entries with an
+    optional substring on ``qname`` (e.g. operator typed "github.com"
+    to debug a resolution problem). Newest first.
+    """
+    server = await db.get(DNSServer, body.server_id)
+    if server is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="DNS server not found")
+    if server.driver not in DNS_AGENT_DRIVERS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Driver {server.driver!r} doesn't ship query logs from an "
+                f"agent. Use /logs/query for Windows DNS event log."
+            ),
+        )
+
+    stmt = select(DNSQueryLogEntry).where(DNSQueryLogEntry.server_id == server.id)
+    if body.since is not None:
+        stmt = stmt.where(DNSQueryLogEntry.ts >= body.since)
+    if body.until is not None:
+        stmt = stmt.where(DNSQueryLogEntry.ts <= body.until)
+    if body.qtype:
+        stmt = stmt.where(DNSQueryLogEntry.qtype == body.qtype.upper())
+    if body.client_ip:
+        stmt = stmt.where(DNSQueryLogEntry.client_ip == body.client_ip)
+    if body.q:
+        like = f"%{body.q.lower()}%"
+        # ILIKE on qname (most common search) and a fallback on raw —
+        # operators sometimes paste a fragment they remember from the
+        # daemon stdout that didn't survive parsing.
+        stmt = stmt.where((DNSQueryLogEntry.qname.ilike(like)) | (DNSQueryLogEntry.raw.ilike(like)))
+    stmt = stmt.order_by(DNSQueryLogEntry.ts.desc(), DNSQueryLogEntry.id.desc()).limit(
+        body.max_events
+    )
+
+    rows = (await db.execute(stmt)).scalars().all()
+    events = [
+        DNSQueryLogRow(
+            id=r.id,
+            ts=r.ts,
+            client_ip=str(r.client_ip) if r.client_ip is not None else None,
+            client_port=r.client_port,
+            qname=r.qname,
+            qclass=r.qclass,
+            qtype=r.qtype,
+            flags=r.flags,
+            view=r.view,
+            raw=r.raw,
+        )
+        for r in rows
+    ]
+    return DNSQueryLogResponse(
+        server_id=server.id,
+        events=events,
+        truncated=len(events) >= body.max_events,
+    )
+
+
+class DHCPActivityLogRow(BaseModel):
+    id: int
+    ts: datetime
+    severity: str | None
+    code: str | None
+    mac_address: str | None
+    ip_address: str | None
+    transaction_id: str | None
+    raw: str
+
+
+class DHCPActivityLogRequest(BaseModel):
+    server_id: uuid.UUID
+    since: datetime | None = None
+    until: datetime | None = None
+    q: str | None = None
+    severity: str | None = None
+    code: str | None = None
+    mac_address: str | None = None
+    ip_address: str | None = None
+    max_events: int = Field(default=200, ge=1, le=1000)
+
+
+class DHCPActivityLogResponse(BaseModel):
+    server_id: uuid.UUID
+    events: list[DHCPActivityLogRow]
+    truncated: bool
+
+
+@router.post("/dhcp-activity", response_model=DHCPActivityLogResponse)
+async def query_dhcp_activity(body: DHCPActivityLogRequest, db: DB) -> DHCPActivityLogResponse:
+    """Read parsed Kea DHCPv4 log entries for a server. Newest first."""
+    server = await db.get(DHCPServer, body.server_id)
+    if server is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="DHCP server not found")
+    if server.driver not in DHCP_AGENT_DRIVERS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Driver {server.driver!r} doesn't ship activity logs from an "
+                f"agent. Use /logs/dhcp-audit for Windows DHCP audit log."
+            ),
+        )
+
+    stmt = select(DHCPLogEntry).where(DHCPLogEntry.server_id == server.id)
+    if body.since is not None:
+        stmt = stmt.where(DHCPLogEntry.ts >= body.since)
+    if body.until is not None:
+        stmt = stmt.where(DHCPLogEntry.ts <= body.until)
+    if body.severity:
+        stmt = stmt.where(DHCPLogEntry.severity == body.severity.upper())
+    if body.code:
+        stmt = stmt.where(DHCPLogEntry.code == body.code.upper())
+    if body.mac_address:
+        stmt = stmt.where(DHCPLogEntry.mac_address == body.mac_address.lower())
+    if body.ip_address:
+        stmt = stmt.where(DHCPLogEntry.ip_address == body.ip_address)
+    if body.q:
+        like = f"%{body.q.lower()}%"
+        stmt = stmt.where(DHCPLogEntry.raw.ilike(like))
+    stmt = stmt.order_by(DHCPLogEntry.ts.desc(), DHCPLogEntry.id.desc()).limit(body.max_events)
+
+    rows = (await db.execute(stmt)).scalars().all()
+    events = [
+        DHCPActivityLogRow(
+            id=r.id,
+            ts=r.ts,
+            severity=r.severity,
+            code=r.code,
+            mac_address=r.mac_address,
+            ip_address=str(r.ip_address) if r.ip_address is not None else None,
+            transaction_id=r.transaction_id,
+            raw=r.raw,
+        )
+        for r in rows
+    ]
+    return DHCPActivityLogResponse(
+        server_id=server.id,
         events=events,
         truncated=len(events) >= body.max_events,
     )

@@ -27,6 +27,7 @@ from app.models.dhcp import (
     DHCPServer,
     DHCPServerGroup,
 )
+from app.models.logs import DHCPLogEntry
 from app.models.metrics import DHCPMetricSample
 from app.services.dhcp.agent_token import (
     hash_token,
@@ -655,3 +656,58 @@ async def agent_ops_ack(
     op.acked_at = datetime.now(UTC)
     await db.commit()
     return {"status": "ok"}
+
+
+# ── Activity log ingestion ───────────────────────────────────────────
+
+
+class DHCPLogBatch(BaseModel):
+    """Batch of raw ``kea-dhcp4`` log lines pushed by the agent.
+
+    Same shape as the DNS query log batch. The agent tails Kea's
+    file output (we configure a file ``output_options`` in the
+    rendered ``kea-dhcp4.conf`` so the lines are tail-able), batches
+    them, and POSTs every few seconds.
+    """
+
+    lines: list[str]
+
+
+@router.post("/log-entries")
+async def agent_log_entries(
+    body: DHCPLogBatch,
+    db: DB,
+    auth: tuple[DHCPServer, dict[str, Any]] = Depends(_auth_agent),
+) -> dict[str, Any]:
+    """Ingest a batch of Kea log lines from the agent.
+
+    Capped at 1000 lines per request. The parser tolerates lines it
+    can't fully match — they still get inserted with the raw text
+    preserved so the UI shows everything Kea emitted.
+    """
+    from app.services.logs.kea_parser import parse_kea_line  # noqa: PLC0415
+
+    server, _ = auth
+    capped = body.lines[:1000]
+    dropped = max(0, len(body.lines) - len(capped))
+    now = datetime.now(UTC)
+    inserted = 0
+    for raw in capped:
+        parsed = parse_kea_line(raw, fallback_ts=now)
+        if parsed is None:
+            continue
+        db.add(
+            DHCPLogEntry(
+                server_id=server.id,
+                ts=parsed.ts,
+                severity=parsed.severity,
+                code=parsed.code,
+                mac_address=parsed.mac_address,
+                ip_address=parsed.ip_address,
+                transaction_id=parsed.transaction_id,
+                raw=parsed.raw,
+            )
+        )
+        inserted += 1
+    await db.commit()
+    return {"status": "ok", "inserted": inserted, "dropped": dropped}

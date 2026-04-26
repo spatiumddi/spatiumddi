@@ -209,6 +209,45 @@ Shared helpers (`ServerPicker` / `MaxEventsPicker` / `FilterSearch` / `RefreshBu
 
 ---
 
+## 4½. SpatiumDDI Agent Log Viewer (BIND9 + Kea)
+
+Two additional tabs on the same Logs page, sourced from in-container agents instead of WinRM.
+
+### 4½.1 DNS Queries tab
+
+**Source.** BIND9's `query-log` channel. The control-plane template (`backend/app/drivers/dns/templates/bind9/named.conf.j2`) renders a `logging { channel queries_channel { file "/var/log/named/queries.log" versions 5 size 50m; ... }; category queries { queries_channel; }; };` block when `DNSServerOptions.query_log_enabled` is on.
+
+**Pipeline.**
+
+1. BIND9 writes lines to `/var/log/named/queries.log` (path is templated; agents respect `DNS_QUERY_LOG_PATH` env override).
+2. The DNS agent's `QueryLogShipper` thread (`agent/dns/spatium_dns_agent/query_log_shipper.py`) tails the file like `tail -F`, batches up to 200 lines or 5 s of activity (whichever first), and POSTs to `POST /api/v1/dns/agents/query-log-entries`.
+3. The control plane parses each line into `DNSQueryLogEntry` rows (`backend/app/services/logs/bind9_parser.py`) — timestamp, client IP+port, qname, qclass, qtype, flags, view. The original raw line is preserved alongside.
+4. UI calls `POST /logs/dns-queries` with filters (`q` substring, `qtype`, `client_ip`, `since`, `max_events`); newest first.
+
+**Filters.** Server picker, qtype (A / AAAA / MX / …), client IP, datetime-`since`, max events, raw-substring search.
+
+**Resilience.** File-not-yet-present (operator hasn't enabled `query_log_enabled`) is silent — the shipper sleeps + re-checks. Inode-change rotation is detected and the file re-opened. Control-plane errors drop the batch (logs are triage data, not durable). Buffer is capped at 5000 lines; older half is trimmed if the control plane stays unreachable.
+
+### 4½.2 DHCP Activity tab
+
+**Source.** Kea's `kea-dhcp4` logger. The agent's `render_kea` adds two `output_options` to the rendered config — `stdout` (existing `docker logs` workflow stays intact) **and** `/var/log/kea/kea-dhcp4.log` with in-process rotation (`maxsize: 50_000_000`, `maxver: 5`, `flush: true`).
+
+**Pipeline.** Same shape as the DNS path — `LogShipper` thread (`agent/dhcp/spatium_dhcp_agent/log_shipper.py`) → `POST /api/v1/dhcp/agents/log-entries` → `kea_parser.py` → `DHCPLogEntry` rows.
+
+**Parser fields.** Severity (`DEBUG` / `INFO` / `WARN` / `ERROR` / `FATAL`), Kea log code (`DHCP4_LEASE_ALLOC`, `DHCP4_LEASE_DECLINE`, `DHCP4_PACKET_PROCESS_STARTED`, etc), MAC address (after `hwtype=N`), lease IP, transaction id. Lines that don't match the regex still get stored with the raw text — Kea has hundreds of log codes and we only structure-parse the most common shape.
+
+**Filters.** Server picker, severity, log code (free-form text — operators paste e.g. `DHCP4_LEASE_ALLOC`), MAC, IP, datetime-since, max events, raw substring.
+
+### 4½.3 Storage + retention
+
+Two narrow tables (`dns_query_log_entry`, `dhcp_log_entry`) with composite indexes on `(server_id, ts)`. Migration `d8c5f12a47b9_query_log_entries`. FK cascade drops a server's rows when the server is removed.
+
+Retention is a nightly Celery task (`app.tasks.prune_logs.prune_log_entries`) that deletes rows older than 24 h. This is *operator triage*, not analytics — for longer history, ship to Loki / a SIEM.
+
+**Why so short?** Query logs are a firehose. A busy resolver doing 100 qps writes 8.6M rows per day; even 24 h of that is significant. Anyone needing days of history should run Loki alongside and the agent push can coexist with stdout shipping.
+
+---
+
 ## 5. Audit Log
 
 The audit log is a separate, append-only, structured log of all **data mutations** in SpatiumDDI. It is stored in the **PostgreSQL database** (not the log store) for queryability, immutability guarantees, and compliance.

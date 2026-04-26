@@ -19,6 +19,7 @@ celery_app = Celery(
         "app.tasks.alerts",
         "app.tasks.heartbeat",
         "app.tasks.oui_update",
+        "app.tasks.prune_logs",
         "app.tasks.prune_metrics",
         "app.tasks.update_check",
         "app.tasks.kubernetes_sync",
@@ -56,6 +57,7 @@ celery_app.conf.update(
         "app.tasks.alerts.*": {"queue": "default"},
         "app.tasks.heartbeat.*": {"queue": "default"},
         "app.tasks.oui_update.*": {"queue": "default"},
+        "app.tasks.prune_logs.*": {"queue": "default"},
         "app.tasks.prune_metrics.*": {"queue": "default"},
         "app.tasks.update_check.*": {"queue": "default"},
         "app.tasks.kubernetes_sync.*": {"queue": "default"},
@@ -144,6 +146,14 @@ celery_app.conf.update(
         # pruning more often just burns cycles.
         "metric-samples-prune": {
             "task": "app.tasks.prune_metrics.prune_metric_samples",
+            "schedule": schedule(run_every=24 * 3600.0),
+        },
+        # Nightly prune of agent-shipped query / activity log entries
+        # older than the retention window (default 24 h). Query logs
+        # are a firehose; the short window keeps the tables manageable
+        # without operator tuning.
+        "log-entries-prune": {
+            "task": "app.tasks.prune_logs.prune_log_entries",
             "schedule": schedule(run_every=24 * 3600.0),
         },
         # Once a day, check GitHub for the latest release tag. Gated

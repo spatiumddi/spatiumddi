@@ -9,6 +9,49 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versioning uses 
 
 ### Added
 
+- **Query / activity log surface for BIND9 + Kea agents.** Two new
+  tabs on the Logs page (`/logs`):
+  - **DNS Queries** — BIND9 `query-log` channel content, parsed into
+    timestamp / client IP+port / qname / qclass / qtype / flags /
+    view columns with the original raw line preserved. Filters: `q`
+    (substring match on qname or raw), `qtype`, `client_ip`, time
+    `since`, max events. Requires `query_log_enabled` on the
+    `DNSServerOptions` row (already a UI toggle); the BIND9 template
+    has rendered the channel since the `f8a3c1e7d925` migration —
+    this wave just plugs in the read side.
+  - **DHCP Activity** — Kea `kea-dhcp4` log content, parsed into
+    timestamp / severity / log code / MAC / IP / transaction id
+    columns. Filters: severity, log code (`DHCP4_LEASE_ALLOC` etc),
+    MAC, IP, time `since`, raw substring search.
+  Each tab has its own server picker drawing from the new
+  `GET /logs/agent-sources` endpoint (lists `bind9` DNS + `kea`
+  DHCP servers).
+- **Agent push pipeline.** The DNS agent gains a `QueryLogShipper`
+  thread that tails `/var/log/named/queries.log` (override via
+  `DNS_QUERY_LOG_PATH`), batches up to 200 lines or 5 s of activity
+  (whichever first), and POSTs to `POST /api/v1/dns/agents/query-
+  log-entries`. The DHCP agent gains a `LogShipper` thread doing the
+  same against `/var/log/kea/kea-dhcp4.log` (override via
+  `DHCP_LOG_PATH`) → `POST /api/v1/dhcp/agents/log-entries`. Kea's
+  rendered config now writes to *both* stdout (existing
+  `docker logs` workflow) and the new file with in-process rotation
+  (`maxsize=50MB`, `maxver=5`). Both shippers handle file-not-yet-
+  present (sleep + retry), inode-change rotation (re-open), and
+  transient control-plane errors (drop the batch, never block the
+  daemon). Memory cap at 5000 buffered lines per shipper trims the
+  oldest half if the control plane is unreachable.
+- **Storage + retention.** Two narrow tables `dns_query_log_entry`
+  and `dhcp_log_entry` hold the parsed lines (composite indexes on
+  `(server_id, ts)`); FK cascade drops a server's entries when the
+  server row is removed. Nightly `prune_log_entries` Celery task
+  drops rows older than 24 h — query logs are *operator triage*, not
+  analytics; longer retention belongs in Loki / a SIEM. Migration
+  `d8c5f12a47b9_query_log_entries`. Parser unit tests in
+  `tests/test_log_parsers.py` cover IPv4 / IPv6 / view-tagged BIND9
+  lines plus stock Kea lease-alloc / decline / packet-trace shapes,
+  including the "unparseable line still preserves raw text" path.
+  Retention task tests in `tests/test_prune_logs.py`.
+
 - **Tailscale integration (read-only tenant mirror) — Phase 1.**
   Settings → Integrations → Tailscale toggle
   (`integration_tailscale_enabled`) lights up a Tailscale nav item

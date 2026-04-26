@@ -375,7 +375,23 @@ def render(
         "loggers": [
             {
                 "name": "kea-dhcp4",
-                "output_options": [{"output": "stdout"}],
+                # Two outputs by design:
+                #   * stdout — picked up by `docker logs` for the
+                #     existing operator workflow.
+                #   * file — tailed by ``LogShipper`` and shipped to
+                #     the control plane for the Logs UI's "DHCP
+                #     Activity" tab. Kea rotates the file in-process
+                #     via ``maxsize`` / ``maxver`` so we don't need
+                #     external logrotate.
+                "output_options": [
+                    {"output": "stdout"},
+                    {
+                        "output": "/var/log/kea/kea-dhcp4.log",
+                        "maxsize": 50_000_000,
+                        "maxver": 5,
+                        "flush": True,
+                    },
+                ],
                 "severity": "INFO",
             }
         ],

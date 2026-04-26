@@ -44,6 +44,7 @@ from app.models.ipam import (
     VLANMapping,
 )
 from app.models.kubernetes import KubernetesCluster
+from app.models.logs import DHCPLogEntry, DNSQueryLogEntry
 from app.models.metrics import DHCPMetricSample, DNSMetricSample
 from app.models.oui import OUIVendor
 from app.models.proxmox import ProxmoxNode
@@ -103,6 +104,8 @@ __all__ = [
     "DHCPRecordOp",
     "DNSMetricSample",
     "DHCPMetricSample",
+    "DNSQueryLogEntry",
+    "DHCPLogEntry",
     "DockerHost",
     "KubernetesCluster",
     "ProxmoxNode",
