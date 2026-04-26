@@ -1,5 +1,5 @@
 from celery import Celery
-from celery.schedules import schedule
+from celery.schedules import crontab, schedule
 
 from app.config import settings
 
@@ -21,6 +21,9 @@ celery_app = Celery(
         "app.tasks.oui_update",
         "app.tasks.prune_logs",
         "app.tasks.prune_metrics",
+        "app.tasks.trash_purge",
+        "app.tasks.ipam_reservation_sweep",
+        "app.tasks.dhcp_lease_history_prune",
         "app.tasks.update_check",
         "app.tasks.kubernetes_sync",
         "app.tasks.docker_sync",
@@ -59,6 +62,9 @@ celery_app.conf.update(
         "app.tasks.oui_update.*": {"queue": "default"},
         "app.tasks.prune_logs.*": {"queue": "default"},
         "app.tasks.prune_metrics.*": {"queue": "default"},
+        "app.tasks.trash_purge.*": {"queue": "default"},
+        "app.tasks.ipam_reservation_sweep.*": {"queue": "ipam"},
+        "app.tasks.dhcp_lease_history_prune.*": {"queue": "dhcp"},
         "app.tasks.update_check.*": {"queue": "default"},
         "app.tasks.kubernetes_sync.*": {"queue": "default"},
         "app.tasks.docker_sync.*": {"queue": "default"},
@@ -155,6 +161,28 @@ celery_app.conf.update(
         "log-entries-prune": {
             "task": "app.tasks.prune_logs.prune_log_entries",
             "schedule": schedule(run_every=24 * 3600.0),
+        },
+        # Daily at 03:00 UTC, hard-delete soft-deleted rows older than the
+        # configured retention window (default 30 d). Gated on
+        # ``PlatformSettings.soft_delete_purge_days`` — set to 0 to
+        # disable purge entirely.
+        "trash-purge": {
+            "task": "app.tasks.trash_purge.purge_expired_soft_deletes",
+            "schedule": crontab(hour=3, minute=0),
+        },
+        # Every 5 min, release IPAM reservations whose reserved_until has
+        # passed. Gated on ``PlatformSettings.reservation_sweep_enabled`` —
+        # turn off to keep all reservations indefinitely.
+        "reservation-sweep": {
+            "task": "app.tasks.ipam_reservation_sweep.sweep_expired_reservations",
+            "schedule": schedule(run_every=300.0),
+        },
+        # Daily at 03:15 UTC, prune DHCPLeaseHistory rows older than the
+        # configured retention window (default 90 d). Offset from trash-purge
+        # to avoid simultaneous heavy writes.
+        "dhcp-lease-history-prune": {
+            "task": "app.tasks.dhcp_lease_history_prune.prune_lease_history",
+            "schedule": crontab(hour=3, minute=15),
         },
         # Once a day, check GitHub for the latest release tag. Gated
         # on ``PlatformSettings.github_release_check_enabled`` — so

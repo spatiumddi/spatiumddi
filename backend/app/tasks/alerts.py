@@ -14,7 +14,7 @@ import asyncio
 import structlog
 
 from app.celery_app import celery_app
-from app.db import AsyncSessionLocal
+from app.db import task_session
 from app.services import alerts as alert_service
 
 logger = structlog.get_logger(__name__)
@@ -26,7 +26,7 @@ def evaluate_alerts() -> dict[str, int]:
 
 
 async def _run() -> dict[str, int]:
-    async with AsyncSessionLocal() as session:
+    async with task_session() as session:
         try:
             result = await alert_service.evaluate_all(session)
             if result["opened"] or result["resolved"]:

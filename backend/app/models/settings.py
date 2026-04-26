@@ -1,6 +1,7 @@
 from datetime import datetime
 
 from sqlalchemy import Boolean, DateTime, Integer, String, Text
+from sqlalchemy import text as sa_text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -195,4 +196,22 @@ class PlatformSettings(Base):
     )
     integration_tailscale_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False
+    )
+
+    # Trash retention — high-blast-radius IPAM/DNS/DHCP rows are soft-
+    # deleted (``deleted_at`` set) and the nightly purge sweep hard-
+    # deletes anything older than this many days. Set to 0 to disable
+    # purge entirely (rows accumulate forever; manual permanent-delete
+    # is still available). Default 30 d matches the user-facing spec.
+    soft_delete_purge_days: Mapped[int] = mapped_column(Integer, nullable=False, default=30)
+
+    # Gate for the reservation expiry sweep task. When False, manually-
+    # reserved IPs with a reserved_until timestamp are never auto-released.
+    reservation_sweep_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=sa_text("true")
+    )
+
+    # How many days to retain DHCPLeaseHistory rows. Set to 0 to keep forever.
+    dhcp_lease_history_retention_days: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=90, server_default=sa_text("90")
     )

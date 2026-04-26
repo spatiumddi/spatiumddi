@@ -10,6 +10,7 @@ import {
 import { Pencil, Plus, RefreshCw, Server, Trash2, Wifi } from "lucide-react";
 import {
   dhcpApi,
+  dhcpLeaseHistoryApi,
   ipamApi,
   type DHCPPool,
   type DHCPScope,
@@ -51,6 +52,7 @@ type Tab =
   | "classes"
   | "mac-blocks"
   | "leases"
+  | "history"
   | "options";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1175,6 +1177,202 @@ function LeasesTab({ server }: { server: DHCPServer }) {
   );
 }
 
+// Default to "last 7 days" for the History tab — operators usually
+// want recent context, not the whole 90-day window. Returns an ISO
+// timestamp suitable for the ``since`` query param.
+function defaultHistorySince(): string {
+  const d = new Date();
+  d.setDate(d.getDate() - 7);
+  return d.toISOString();
+}
+
+function LeaseHistoryTab({ server }: { server: DHCPServer }) {
+  const [state, setState] = useState<string>("");
+  const [mac, setMac] = useState<string>("");
+  const [ip, setIp] = useState<string>("");
+  const [hostname, setHostname] = useState<string>("");
+  const [since, setSince] = useState<string>(defaultHistorySince());
+  const [page, setPage] = useState<number>(1);
+  const perPage = 50;
+
+  const params = useMemo(
+    () => ({
+      lease_state: state || undefined,
+      mac: mac || undefined,
+      ip: ip || undefined,
+      hostname: hostname || undefined,
+      since: since || undefined,
+      page,
+      per_page: perPage,
+    }),
+    [state, mac, ip, hostname, since, page],
+  );
+
+  const { data, isFetching, refetch } = useQuery({
+    queryKey: ["dhcp-lease-history", server.id, params],
+    queryFn: () => dhcpLeaseHistoryApi.list(server.id, params),
+    placeholderData: (prev) => prev,
+  });
+
+  const items = data?.items ?? [];
+  const total = data?.total ?? 0;
+  const totalPages = Math.max(1, Math.ceil(total / perPage));
+
+  return (
+    <div className="space-y-3">
+      <div className="flex flex-wrap items-center gap-2">
+        <select
+          className="rounded-md border bg-background px-2 py-1 text-xs"
+          value={state}
+          onChange={(e) => {
+            setState(e.target.value);
+            setPage(1);
+          }}
+        >
+          <option value="">All states</option>
+          <option value="expired">Expired</option>
+          <option value="released">Released</option>
+          <option value="removed">Removed</option>
+          <option value="superseded">Superseded</option>
+        </select>
+        <input
+          className="rounded-md border bg-background px-2 py-1 text-xs"
+          placeholder="MAC contains…"
+          value={mac}
+          onChange={(e) => {
+            setMac(e.target.value);
+            setPage(1);
+          }}
+        />
+        <input
+          className="rounded-md border bg-background px-2 py-1 text-xs"
+          placeholder="IP / CIDR"
+          value={ip}
+          onChange={(e) => {
+            setIp(e.target.value);
+            setPage(1);
+          }}
+        />
+        <input
+          className="rounded-md border bg-background px-2 py-1 text-xs"
+          placeholder="Hostname contains…"
+          value={hostname}
+          onChange={(e) => {
+            setHostname(e.target.value);
+            setPage(1);
+          }}
+        />
+        <input
+          type="datetime-local"
+          className="rounded-md border bg-background px-2 py-1 text-xs"
+          // Slice off seconds + Z to satisfy the input control's local
+          // datetime format. Round-trip back to ISO Z on change.
+          value={since ? since.slice(0, 16) : ""}
+          onChange={(e) => {
+            setSince(
+              e.target.value ? new Date(e.target.value).toISOString() : "",
+            );
+            setPage(1);
+          }}
+          title="Show entries with expired_at on or after this time"
+        />
+        <button
+          onClick={() => refetch()}
+          className="ml-auto flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent"
+          disabled={isFetching}
+        >
+          <RefreshCw className={cn("h-3 w-3", isFetching && "animate-spin")} />
+          Refresh
+        </button>
+      </div>
+      <div className="rounded-lg border overflow-auto">
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="border-b bg-muted/30 text-xs">
+              <th className="px-3 py-2 text-left font-medium">IP</th>
+              <th className="px-3 py-2 text-left font-medium">MAC</th>
+              <th className="px-3 py-2 text-left font-medium">Hostname</th>
+              <th className="px-3 py-2 text-left font-medium">State</th>
+              <th className="px-3 py-2 text-left font-medium">Started</th>
+              <th className="px-3 py-2 text-left font-medium">Ended at</th>
+            </tr>
+          </thead>
+          <tbody className={zebraBodyCls}>
+            {items.length === 0 && (
+              <tr>
+                <td
+                  colSpan={6}
+                  className="p-6 text-center text-sm text-muted-foreground"
+                >
+                  {isFetching ? "Loading…" : "No history entries match."}
+                </td>
+              </tr>
+            )}
+            {items.map((row) => (
+              <tr key={row.id} className="border-b last:border-0">
+                <td className="px-3 py-1.5 font-mono text-xs">
+                  {row.ip_address}
+                </td>
+                <td className="px-3 py-1.5 font-mono text-xs">
+                  {row.mac_address}
+                </td>
+                <td className="px-3 py-1.5">{row.hostname || "—"}</td>
+                <td className="px-3 py-1.5">
+                  <span
+                    className={cn(
+                      "rounded-full px-2 py-0.5 text-xs",
+                      row.lease_state === "expired"
+                        ? "bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-400"
+                        : row.lease_state === "removed"
+                          ? "bg-rose-100 text-rose-800 dark:bg-rose-900/30 dark:text-rose-400"
+                          : row.lease_state === "superseded"
+                            ? "bg-indigo-100 text-indigo-800 dark:bg-indigo-900/30 dark:text-indigo-400"
+                            : "bg-muted text-muted-foreground",
+                    )}
+                  >
+                    {row.lease_state}
+                  </span>
+                </td>
+                <td className="px-3 py-1.5 text-xs text-muted-foreground">
+                  {row.started_at
+                    ? new Date(row.started_at).toLocaleString()
+                    : "—"}
+                </td>
+                <td className="px-3 py-1.5 text-xs text-muted-foreground">
+                  {new Date(row.expired_at).toLocaleString()}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      {total > 0 && (
+        <div className="flex items-center justify-between text-xs text-muted-foreground">
+          <span>
+            {total} entr{total === 1 ? "y" : "ies"} • page {page} / {totalPages}
+          </span>
+          <div className="flex gap-2">
+            <button
+              className="rounded-md border px-2 py-1 hover:bg-accent disabled:opacity-50"
+              onClick={() => setPage((p) => Math.max(1, p - 1))}
+              disabled={page <= 1}
+            >
+              Prev
+            </button>
+            <button
+              className="rounded-md border px-2 py-1 hover:bg-accent disabled:opacity-50"
+              onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
+              disabled={page >= totalPages}
+            >
+              Next
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function ServerDetailView({
   server,
   group,
@@ -1401,6 +1599,12 @@ function ServerDetailView({
             Leases
           </TabButton>
           <TabButton
+            active={tab === "history"}
+            onClick={() => setTab("history")}
+          >
+            History
+          </TabButton>
+          <TabButton
             active={tab === "options"}
             onClick={() => setTab("options")}
           >
@@ -1420,6 +1624,7 @@ function ServerDetailView({
         {tab === "classes" && <ClientClassesTab server={server} />}
         {tab === "mac-blocks" && <MacBlocksTab server={server} />}
         {tab === "leases" && <LeasesTab server={server} />}
+        {tab === "history" && <LeaseHistoryTab server={server} />}
         {tab === "options" && (
           <div className="rounded-lg border p-6 text-sm text-muted-foreground">
             Server-level default options (global pool, renew times, reservation

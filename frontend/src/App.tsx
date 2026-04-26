@@ -6,6 +6,7 @@ import { LoginCallbackPage } from "@/pages/LoginCallbackPage";
 import { ChangePasswordPage } from "@/pages/ChangePasswordPage";
 import { DashboardPage } from "@/pages/DashboardPage";
 import { IPAMPage } from "@/pages/ipam/IPAMPage";
+import { NATPage } from "@/pages/ipam/NATPage";
 import { DNSPage } from "@/pages/dns/DNSPage";
 import { VLANsPage } from "@/pages/vlans/VLANsPage";
 import { DHCPPage } from "@/pages/dhcp/DHCPPage";
@@ -22,6 +23,7 @@ import { AlertsPage } from "@/pages/admin/AlertsPage";
 import { AuthProvidersPage } from "@/pages/admin/AuthProvidersPage";
 import { GroupsPage } from "@/pages/admin/GroupsPage";
 import { RolesPage } from "@/pages/admin/RolesPage";
+import { TrashPage } from "@/pages/admin/TrashPage";
 import { SettingsPage } from "@/pages/SettingsPage";
 import { useAuth } from "@/hooks/useAuth";
 
@@ -47,6 +49,7 @@ export default function App() {
         <Route index element={<Navigate to="/dashboard" replace />} />
         <Route path="dashboard" element={<DashboardPage />} />
         <Route path="ipam" element={<IPAMPage />} />
+        <Route path="ipam/nat" element={<NATPage />} />
         <Route path="dns" element={<DNSPage />} />
         <Route path="vlans" element={<VLANsPage />} />
         <Route path="dhcp" element={<DHCPPage />} />
@@ -63,6 +66,7 @@ export default function App() {
         <Route path="admin/auth-providers" element={<AuthProvidersPage />} />
         <Route path="admin/api-tokens" element={<ApiTokensPage />} />
         <Route path="admin/alerts" element={<AlertsPage />} />
+        <Route path="admin/trash" element={<TrashPage />} />
         <Route
           path="admin/failover-channels"
           element={<Navigate to="/dhcp" replace />}

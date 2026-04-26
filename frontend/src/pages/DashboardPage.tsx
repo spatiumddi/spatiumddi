@@ -440,8 +440,14 @@ export function DashboardPage() {
   // dashboard. `subnets` (the unfiltered list) is still used for
   // inventory counts like "N subnets".
   const reporting = reportSubnets ?? [];
-  const totalIPs = reporting.reduce((s, n) => s + n.total_ips, 0);
-  const allocatedIPs = reporting.reduce((s, n) => s + n.allocated_ips, 0);
+  // IPv6 subnets (typically /64) carry 2^64 hosts each — counting them in
+  // "free addresses" or overall utilization makes the headline numbers
+  // meaningless (a single /64 swamps every IPv4 subnet combined). Restrict
+  // the top-line counters to IPv4. The heatmap + per-subnet stats keep
+  // IPv6 since per-subnet utilization_percent is still meaningful.
+  const reportingV4 = reporting.filter((s) => !s.network.includes(":"));
+  const totalIPs = reportingV4.reduce((s, n) => s + n.total_ips, 0);
+  const allocatedIPs = reportingV4.reduce((s, n) => s + n.allocated_ips, 0);
   const freeIPs = totalIPs - allocatedIPs;
   const overallUtil = totalIPs > 0 ? (allocatedIPs / totalIPs) * 100 : 0;
   const topSubnets = [...reporting]
@@ -581,14 +587,14 @@ export function DashboardPage() {
             to="/ipam"
           />
           <KpiCard
-            label="Allocated IPs"
+            label="Allocated IPs (IPv4)"
             value={allocatedIPs.toLocaleString()}
             sub={`${freeIPs.toLocaleString()} free`}
             icon={Activity}
             to="/ipam"
           />
           <KpiCard
-            label="Utilization"
+            label="Utilization (IPv4)"
             value={`${overallUtil.toFixed(1)}%`}
             sub={`${allocatedIPs.toLocaleString()} / ${totalIPs.toLocaleString()}`}
             icon={Server}

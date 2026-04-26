@@ -21,10 +21,13 @@ from app.models.audit import AuditLog
 from app.models.dhcp import DHCPConfigOp, DHCPPool, DHCPScope, DHCPServer, DHCPStaticAssignment
 from app.models.dns import DNSRecord, DNSZone
 from app.models.ipam import (
+    IP_ROLES,
+    IP_ROLES_SHARED,
     IP_STATUSES,
     IP_STATUSES_OPERATOR_SETTABLE,
     IPAddress,
     IPBlock,
+    IpMacHistory,
     IPSpace,
     Subnet,
     SubnetDomain,
@@ -36,6 +39,10 @@ from app.services.dhcp.windows_writethrough import (
     push_statics_bulk_delete,
 )
 from app.services.oui import bulk_lookup_vendors, normalize_mac_key
+from app.services.soft_delete import (
+    apply_soft_delete,
+    collect_soft_delete_batch,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -49,12 +56,25 @@ router = APIRouter(
     dependencies=[
         Depends(
             require_any_resource_permission(
-                "ip_space", "ip_block", "subnet", "ip_address", "custom_field"
+                "ip_space",
+                "ip_block",
+                "subnet",
+                "ip_address",
+                "custom_field",
+                "nat_mapping",
             )
         )
     ]
 )
 router.include_router(io_router)
+
+# NAT mappings — operator-curated metadata cross-referenced from IPAM
+# rows. Lives under /api/v1/ipam/nat-mappings. Imported here to avoid
+# touching the top-level api/v1/router.py — natural home is alongside
+# the other IPAM tools.
+from app.api.v1.ipam.nat import router as nat_router  # noqa: E402
+
+router.include_router(nat_router)
 
 # ── Internal helpers ───────────────────────────────────────────────────────────
 
@@ -338,6 +358,7 @@ async def _check_ip_collisions(
     forward_zone_id: uuid.UUID | None,
     mac_address: str | None,
     exclude_ip_id: uuid.UUID | None = None,
+    role: str | None = None,
 ) -> list[dict[str, Any]]:
     """Return FQDN + MAC collision warnings for a pending IP assignment.
 
@@ -348,6 +369,13 @@ async def _check_ip_collisions(
       still prefilter malformed input so the query doesn't error out.
     - ``exclude_ip_id`` is set on update so the IP doesn't collide with
       its own current state.
+    - ``role`` carries the pending row's role. When the role is in
+      ``IP_ROLES_SHARED`` (``anycast`` / ``vip`` / ``vrrp``) the IP is
+      intentionally shared across multiple devices — same MAC on two
+      rows is the *correct* configuration for an HA pair using a
+      common virtual MAC, so the MAC-collision warning is suppressed.
+      The FQDN check still runs (a duplicate hostname on a VIP isn't a
+      shared-by-design pattern, just an operator typo).
     """
     warnings: list[dict[str, Any]] = []
 
@@ -374,7 +402,8 @@ async def _check_ip_collisions(
             )
 
     mac_norm = _normalize_mac(mac_address)
-    if mac_norm and mac_address is not None:
+    skip_mac_check = role in IP_ROLES_SHARED
+    if mac_norm and mac_address is not None and not skip_mac_check:
         q = (
             select(IPAddress, Subnet.network)
             .join(Subnet, Subnet.id == IPAddress.subnet_id)
@@ -401,6 +430,39 @@ def _collision_http_exc(warnings: list[dict[str, Any]]) -> HTTPException:
     return HTTPException(
         status_code=status.HTTP_409_CONFLICT,
         detail={"warnings": warnings, "requires_confirmation": True},
+    )
+
+
+async def _record_mac_history(db: AsyncSession, ip_id: uuid.UUID, mac_address: str | None) -> None:
+    """Upsert ``(ip_id, mac)`` in ``ip_mac_history``, bumping ``last_seen``.
+
+    Called from create + update paths whenever the row carries a MAC.
+    The rule is "this IP currently has MAC X" → upsert with
+    ``last_seen = now()``. A MAC change leaves the prior row alone
+    with its earlier ``last_seen``, so the implicit history is the
+    set of distinct rows for the IP. Postgres's MACADDR type
+    normalises common formats so equality compares cleanly.
+
+    No-op when the MAC is missing or doesn't normalise — the IPAM
+    layer already validates MACs on the way in, so a malformed value
+    here would be defensive and we'd rather not poison the history
+    table with garbage.
+    """
+    if not mac_address:
+        return
+    if _normalize_mac(mac_address) is None:
+        return
+    # ``ON CONFLICT`` here is the cleanest path — Postgres-only, but
+    # the rest of the schema is too. Bump last_seen on conflict;
+    # first_seen sticks at its insert-time default.
+    await db.execute(
+        text("""
+            INSERT INTO ip_mac_history (id, ip_address_id, mac_address, first_seen, last_seen)
+            VALUES (gen_random_uuid(), :ip_id, CAST(:mac AS macaddr), now(), now())
+            ON CONFLICT (ip_address_id, mac_address)
+            DO UPDATE SET last_seen = now()
+            """),
+        {"ip_id": str(ip_id), "mac": mac_address},
     )
 
 
@@ -1106,6 +1168,13 @@ class IPSpaceCreate(BaseModel):
     ddns_hostname_policy: str = "client_or_generated"
     ddns_domain_override: str | None = None
     ddns_ttl: int | None = None
+    # VRF / routing annotation. Pure metadata; address allocation
+    # ignores these. ``route_targets`` is a list of strings rather
+    # than a structured object so the inline ``import:A:B; export:C:D``
+    # convention some operators use stays expressible.
+    vrf_name: str | None = None
+    route_distinguisher: str | None = None
+    route_targets: list[str] | None = None
 
     @field_validator("color")
     @classmethod
@@ -1140,6 +1209,9 @@ class IPSpaceUpdate(BaseModel):
     ddns_hostname_policy: str | None = None
     ddns_domain_override: str | None = None
     ddns_ttl: int | None = None
+    vrf_name: str | None = None
+    route_distinguisher: str | None = None
+    route_targets: list[str] | None = None
 
     @field_validator("color")
     @classmethod
@@ -1171,6 +1243,9 @@ class IPSpaceResponse(BaseModel):
     ddns_hostname_policy: str = "client_or_generated"
     ddns_domain_override: str | None = None
     ddns_ttl: int | None = None
+    vrf_name: str | None = None
+    route_distinguisher: str | None = None
+    route_targets: list[str] | None = None
     created_at: datetime
     modified_at: datetime
 
@@ -1540,6 +1615,20 @@ class AliasInput(BaseModel):
         return v
 
 
+def _validate_role(v: str | None) -> str | None:
+    """Reject role values outside the curated ``IP_ROLES`` set.
+
+    Empty string is normalised to None so the modal can submit a
+    blank picker value (= "no specific role") without the operator
+    having to send ``null`` explicitly.
+    """
+    if v is None or v == "":
+        return None
+    if v not in IP_ROLES:
+        raise ValueError(f"role must be one of: {', '.join(sorted(IP_ROLES))}")
+    return v
+
+
 class IPAddressCreate(BaseModel):
     address: str
     status: str = "allocated"
@@ -1551,6 +1640,15 @@ class IPAddressCreate(BaseModel):
     tags: dict[str, Any] = {}
     dns_zone_id: str | None = None  # explicit zone override; falls back to subnet's effective DNS
     aliases: list[AliasInput] = []
+    # Optional role tag. See ``IP_ROLES`` for the set; null means
+    # "ordinary host" and skips the badge in the UI. Roles in
+    # ``IP_ROLES_SHARED`` (anycast / vip / vrrp) bypass the
+    # MAC-collision warning.
+    role: str | None = None
+    # Reservation TTL — only honoured when ``status='reserved'``.
+    # When set, the ``sweep_expired_reservations`` Celery beat task
+    # flips the row back to ``available`` after the timestamp passes.
+    reserved_until: datetime | None = None
     # When False (default), the server returns 409 if the pending assignment
     # collides with another IP's FQDN or MAC. Clients re-submit with True
     # after the user confirms the warning.
@@ -1581,6 +1679,11 @@ class IPAddressCreate(BaseModel):
             )
         return v
 
+    @field_validator("role", mode="before")
+    @classmethod
+    def validate_role(cls, v: str | None) -> str | None:
+        return _validate_role(v)
+
 
 class IPAddressUpdate(BaseModel):
     status: str | None = None
@@ -1591,6 +1694,8 @@ class IPAddressUpdate(BaseModel):
     custom_fields: dict[str, Any] | None = None
     tags: dict[str, Any] | None = None
     dns_zone_id: str | None = None  # explicit zone override for DNS record
+    role: str | None = None
+    reserved_until: datetime | None = None
     # See IPAddressCreate.force.
     force: bool = False
 
@@ -1610,12 +1715,19 @@ class IPAddressUpdate(BaseModel):
             raise ValueError(f"status must be one of: {', '.join(sorted(IP_STATUSES))}")
         return v
 
+    @field_validator("role", mode="before")
+    @classmethod
+    def validate_role(cls, v: str | None) -> str | None:
+        return _validate_role(v)
+
 
 class IPAddressResponse(BaseModel):
     id: uuid.UUID
     subnet_id: uuid.UUID
     address: str
     status: str
+    role: str | None = None
+    reserved_until: datetime | None = None
     hostname: str | None
     fqdn: str | None
     mac_address: str | None
@@ -1639,6 +1751,11 @@ class IPAddressResponse(BaseModel):
     # Number of user-added CNAME/A alias records on this IP (excludes the primary A).
     # Populated in list/get endpoints via a bulk lookup; defaults to 0 on other paths.
     alias_count: int = 0
+    # Count of NAT mappings referencing this IP as either ``internal_ip``
+    # or ``external_ip``. Populated by the address list endpoint via a
+    # cheap LEFT-JOIN-like grouped lookup. Defaults to 0 on writes /
+    # singular GET.
+    nat_mapping_count: int = 0
     # IEEE OUI vendor for this MAC, when the feature is enabled and we have
     # the prefix in our local DB. None on writes / unknown MACs / OUI off.
     vendor: str | None = None
@@ -1663,6 +1780,8 @@ class NextIPRequest(BaseModel):
     tags: dict[str, Any] = {}
     dns_zone_id: str | None = None  # explicit zone override; falls back to subnet's effective DNS
     aliases: list[AliasInput] = []
+    role: str | None = None
+    reserved_until: datetime | None = None
     # See IPAddressCreate.force.
     force: bool = False
 
@@ -1691,6 +1810,11 @@ class NextIPRequest(BaseModel):
         if v not in allowed:
             raise ValueError(f"status must be one of: {', '.join(sorted(allowed))}")
         return v
+
+    @field_validator("role", mode="before")
+    @classmethod
+    def validate_role(cls, v: str | None) -> str | None:
+        return _validate_role(v)
 
 
 # ── IP Spaces ──────────────────────────────────────────────────────────────────
@@ -1761,6 +1885,14 @@ async def update_space(
         changes["dhcp_server_group_id"] = (
             str(body.dhcp_server_group_id) if body.dhcp_server_group_id else None
         )
+    # VRF / routing annotations are nullable and explicit null is a
+    # meaningful intent ("clear this field"). model_dump(exclude_none)
+    # would have dropped them; re-apply explicitly.
+    for vrf_field in ("vrf_name", "route_distinguisher", "route_targets"):
+        if vrf_field in body.model_fields_set:
+            value = getattr(body, vrf_field)
+            setattr(space, vrf_field, value)
+            changes[vrf_field] = value
 
     db.add(
         _audit(
@@ -1812,49 +1944,86 @@ async def get_effective_space_dhcp(
 
 
 @router.delete("/spaces/{space_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_space(space_id: uuid.UUID, current_user: CurrentUser, db: DB) -> None:
+async def delete_space(
+    space_id: uuid.UUID,
+    current_user: CurrentUser,
+    db: DB,
+    permanent: bool = False,
+) -> None:
+    """Delete an IP space.
+
+    Default behavior is soft-delete: the space, every block under it, every
+    subnet under those blocks, and the DHCP scopes anchored to those subnets
+    all get stamped with the same ``deletion_batch_id`` so a single restore
+    brings the whole subtree back. The rows still exist in the DB but are
+    hidden from every default SELECT by the global query filter.
+
+    ``?permanent=true`` runs the legacy hard-delete path (super-admin only).
+    """
     space = await db.get(IPSpace, space_id)
     if space is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP space not found")
 
-    # Subnet.space_id is ondelete=RESTRICT so a naive delete bubbles as 500
-    # when anything is still anchored here. Pre-check blocks and subnets so
-    # the UI gets a clear 409 with a count instead of an opaque server error.
-    subnet_count = (
-        await db.execute(
-            select(func.count()).select_from(Subnet).where(Subnet.space_id == space_id)
-        )
-    ).scalar_one()
-    block_count = (
-        await db.execute(
-            select(func.count()).select_from(IPBlock).where(IPBlock.space_id == space_id)
-        )
-    ).scalar_one()
-    if subnet_count or block_count:
-        parts = []
-        if block_count:
-            parts.append(f"{block_count} block(s)")
-        if subnet_count:
-            parts.append(f"{subnet_count} subnet(s)")
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=(
-                f"IP space {space.name!r} still contains {' and '.join(parts)}. "
-                "Delete or move them before deleting the space."
-            ),
-        )
+    if permanent:
+        # Permanent deletion is destructive — gate on superadmin.
+        from app.api.deps import require_superadmin  # local import for circularity safety
 
-    db.add(
-        _audit(
-            current_user,
-            "delete",
-            "ip_space",
-            str(space.id),
-            space.name,
-            old_value={"name": space.name},
+        require_superadmin(current_user)
+        # Subnet.space_id is ondelete=RESTRICT so a naive delete bubbles as 500
+        # when anything is still anchored here. Pre-check blocks and subnets so
+        # the UI gets a clear 409 with a count instead of an opaque server error.
+        subnet_count = (
+            await db.execute(
+                select(func.count()).select_from(Subnet).where(Subnet.space_id == space_id)
+            )
+        ).scalar_one()
+        block_count = (
+            await db.execute(
+                select(func.count()).select_from(IPBlock).where(IPBlock.space_id == space_id)
+            )
+        ).scalar_one()
+        if subnet_count or block_count:
+            parts = []
+            if block_count:
+                parts.append(f"{block_count} block(s)")
+            if subnet_count:
+                parts.append(f"{subnet_count} subnet(s)")
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"IP space {space.name!r} still contains {' and '.join(parts)}. "
+                    "Delete or move them before deleting the space."
+                ),
+            )
+
+        db.add(
+            _audit(
+                current_user,
+                "delete",
+                "ip_space",
+                str(space.id),
+                space.name,
+                old_value={"name": space.name},
+            )
         )
-    )
-    await db.delete(space)
+        await db.delete(space)
+        await db.commit()
+        return
+
+    # Soft-delete: cascade-stamp the whole subtree under one batch UUID.
+    batch = await collect_soft_delete_batch(db, space)
+    apply_soft_delete(batch, current_user.id)
+    for row in batch.rows:
+        db.add(
+            _audit(
+                current_user,
+                "soft_delete",
+                row.resource_type,
+                str(row.obj.id),
+                row.display,
+                old_value={"deletion_batch_id": str(batch.batch_id)},
+            )
+        )
     await db.commit()
 
 
@@ -2064,52 +2233,83 @@ async def update_block(
 
 
 @router.delete("/blocks/{block_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_block(block_id: uuid.UUID, current_user: CurrentUser, db: DB) -> None:
+async def delete_block(
+    block_id: uuid.UUID,
+    current_user: CurrentUser,
+    db: DB,
+    permanent: bool = False,
+) -> None:
+    """Delete an IP block.
+
+    Default soft-delete cascades to child blocks + every subnet (and their
+    DHCP scopes) anchored under this block. ``?permanent=true`` is the
+    legacy hard-delete path (superadmin only).
+    """
     block = await db.get(IPBlock, block_id)
     if block is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP block not found")
 
-    # Refuse if anything is anchored below this block. Child blocks cascade,
-    # which would silently nuke a chunk of the tree. Subnet.block_id is
-    # RESTRICT at the DB level so a subnet-having block would bubble a 500
-    # anyway — but the DB column is also historically nullable (schema
-    # drift), so a naive delete can end up orphaning subnets with
-    # ``block_id=NULL``. Check explicitly and return a useful 409.
-    subnet_count = (
-        await db.execute(
-            select(func.count()).select_from(Subnet).where(Subnet.block_id == block_id)
-        )
-    ).scalar_one()
-    child_block_count = (
-        await db.execute(
-            select(func.count()).select_from(IPBlock).where(IPBlock.parent_block_id == block_id)
-        )
-    ).scalar_one()
-    if subnet_count or child_block_count:
-        parts = []
-        if child_block_count:
-            parts.append(f"{child_block_count} child block(s)")
-        if subnet_count:
-            parts.append(f"{subnet_count} subnet(s)")
-        raise HTTPException(
-            status_code=status.HTTP_409_CONFLICT,
-            detail=(
-                f"Block {block.network} still contains {' and '.join(parts)}. "
-                "Delete or move them before deleting the block."
-            ),
-        )
+    if permanent:
+        from app.api.deps import require_superadmin  # local import for circularity safety
 
-    db.add(
-        _audit(
-            current_user,
-            "delete",
-            "ip_block",
-            str(block.id),
-            f"{block.network} ({block.name})",
-            old_value={"network": str(block.network)},
+        require_superadmin(current_user)
+        # Refuse if anything is anchored below this block. Child blocks cascade,
+        # which would silently nuke a chunk of the tree. Subnet.block_id is
+        # RESTRICT at the DB level so a subnet-having block would bubble a 500
+        # anyway — but the DB column is also historically nullable (schema
+        # drift), so a naive delete can end up orphaning subnets with
+        # ``block_id=NULL``. Check explicitly and return a useful 409.
+        subnet_count = (
+            await db.execute(
+                select(func.count()).select_from(Subnet).where(Subnet.block_id == block_id)
+            )
+        ).scalar_one()
+        child_block_count = (
+            await db.execute(
+                select(func.count()).select_from(IPBlock).where(IPBlock.parent_block_id == block_id)
+            )
+        ).scalar_one()
+        if subnet_count or child_block_count:
+            parts = []
+            if child_block_count:
+                parts.append(f"{child_block_count} child block(s)")
+            if subnet_count:
+                parts.append(f"{subnet_count} subnet(s)")
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    f"Block {block.network} still contains {' and '.join(parts)}. "
+                    "Delete or move them before deleting the block."
+                ),
+            )
+
+        db.add(
+            _audit(
+                current_user,
+                "delete",
+                "ip_block",
+                str(block.id),
+                f"{block.network} ({block.name})",
+                old_value={"network": str(block.network)},
+            )
         )
-    )
-    await db.delete(block)
+        await db.delete(block)
+        await db.commit()
+        return
+
+    batch = await collect_soft_delete_batch(db, block)
+    apply_soft_delete(batch, current_user.id)
+    for row in batch.rows:
+        db.add(
+            _audit(
+                current_user,
+                "soft_delete",
+                row.resource_type,
+                str(row.obj.id),
+                row.display,
+                old_value={"deletion_batch_id": str(batch.batch_id)},
+            )
+        )
     await db.commit()
 
 
@@ -2726,12 +2926,45 @@ async def delete_subnet(
     current_user: CurrentUser,
     db: DB,
     force: bool = False,
+    permanent: bool = False,
 ) -> None:
+    """Delete a subnet.
+
+    Default soft-delete stamps the subnet (and its DHCP scopes) under one
+    batch UUID. The ``force`` query param keeps the legacy
+    "skip the non-empty check" semantic for the hard-delete path.
+    ``permanent=true`` runs the legacy hard-delete path; soft-delete is
+    additive — non-emptiness doesn't block it because the operator can
+    always restore on second thought.
+    """
     from app.models.dns import DNSRecord, DNSZone
 
     subnet = await db.get(Subnet, subnet_id)
     if subnet is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
+
+    if not permanent:
+        # Soft-delete: cascade-stamp the subnet + its scopes. Non-emptiness
+        # is allowed since the operator can restore via /admin/trash.
+        batch = await collect_soft_delete_batch(db, subnet)
+        apply_soft_delete(batch, current_user.id)
+        for row in batch.rows:
+            db.add(
+                _audit(
+                    current_user,
+                    "soft_delete",
+                    row.resource_type,
+                    str(row.obj.id),
+                    row.display,
+                    old_value={"deletion_batch_id": str(batch.batch_id)},
+                )
+            )
+        await db.commit()
+        return
+
+    from app.api.deps import require_superadmin  # noqa: PLC0415
+
+    require_superadmin(current_user)
 
     # Refuse to delete a non-empty subnet unless the caller explicitly opts in
     # via ?force=true. A subnet is considered "non-empty" if it has any user-
@@ -3162,6 +3395,371 @@ async def resize_block_commit(
         block=IPBlockResponse.model_validate(block),
         old_cidr=result.old_cidr,
         new_cidr=result.new_cidr,
+        summary=result.summary,
+    )
+
+
+# ── Free-space finder (Item 1) ────────────────────────────────────────────────
+#
+# POST /api/v1/ipam/spaces/{space_id}/find-free walks the space (or one
+# block subtree) for unused CIDRs of the requested prefix length.
+# Service layer in ``app.services.ipam.free_space``; router stays thin.
+
+
+class FindFreeRequest(BaseModel):
+    prefix_length: int
+    address_family: int = 4
+    count: int = 5
+    min_free_addresses: int | None = None
+    parent_block_id: uuid.UUID | None = None
+
+    @field_validator("address_family")
+    @classmethod
+    def _af(cls, v: int) -> int:
+        if v not in (4, 6):
+            raise ValueError("address_family must be 4 or 6")
+        return v
+
+    @field_validator("count")
+    @classmethod
+    def _count(cls, v: int) -> int:
+        if v < 1:
+            raise ValueError("count must be >= 1")
+        # Cap silently rather than raising — the service caps at 100 too;
+        # we mirror it here so the schema documents the upper bound.
+        return min(v, 100)
+
+    @model_validator(mode="after")
+    def _bounds(self) -> "FindFreeRequest":
+        if self.address_family == 4 and not (8 <= self.prefix_length <= 30):
+            raise ValueError(
+                f"prefix_length must be between 8 and 30 for IPv4 (got {self.prefix_length})"
+            )
+        if self.address_family == 6 and not (8 <= self.prefix_length <= 126):
+            raise ValueError(
+                f"prefix_length must be between 8 and 126 for IPv6 (got {self.prefix_length})"
+            )
+        return self
+
+
+class FindFreeCandidate(BaseModel):
+    cidr: str
+    parent_block_id: uuid.UUID
+    parent_block_cidr: str
+    free_addresses: int | None = None
+
+
+class FindFreeResponse(BaseModel):
+    candidates: list[FindFreeCandidate]
+    summary: dict[str, Any] = {}
+
+
+@router.post(
+    "/spaces/{space_id}/find-free",
+    response_model=FindFreeResponse,
+)
+async def find_free_space_in_space(
+    space_id: uuid.UUID,
+    body: FindFreeRequest,
+    current_user: CurrentUser,
+    db: DB,
+) -> FindFreeResponse:
+    """Search an IPSpace for unused CIDRs of the requested prefix length.
+
+    Returns up to ``count`` candidates (capped at 100). Empty space
+    yields HTTP 200 with ``summary.warning="space has no blocks"``;
+    the UI uses this for the "create a block first" nudge.
+    """
+    from app.services.ipam.free_space import find_free_space
+
+    space = await db.get(IPSpace, space_id)
+    if space is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP space not found")
+
+    # If the caller scoped to a specific block, validate it lives in
+    # this space — otherwise an operator could leak space membership
+    # across spaces by passing an arbitrary block UUID.
+    if body.parent_block_id is not None:
+        parent = await db.get(IPBlock, body.parent_block_id)
+        if parent is None or parent.space_id != space_id:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="parent_block_id not found in this space",
+            )
+
+    result = await find_free_space(
+        db,
+        space_id=space_id,
+        prefix_length=body.prefix_length,
+        address_family=body.address_family,
+        count=body.count,
+        min_free_addresses=body.min_free_addresses,
+        parent_block_id=body.parent_block_id,
+    )
+    return FindFreeResponse(
+        candidates=[
+            FindFreeCandidate(
+                cidr=c.cidr,
+                parent_block_id=c.parent_block_id,
+                parent_block_cidr=c.parent_block_cidr,
+                free_addresses=c.free_addresses,
+            )
+            for c in result.candidates
+        ],
+        summary=result.summary,
+    )
+
+
+# ── Subnet split (Item 2) ─────────────────────────────────────────────────────
+#
+# POST /subnets/{id}/split/preview — pure read; per-child counters +
+# structured conflicts.
+# POST /subnets/{id}/split/commit — atomic mutation under advisory lock.
+
+
+class _SplitChildResp(BaseModel):
+    cidr: str
+    allocations_count: int
+    placeholders_default_named: int
+    placeholders_renamed: int
+    dhcp_scope_id: uuid.UUID | None
+    dhcp_pool_count: int
+    dhcp_static_count: int
+    dns_record_count: int
+
+
+class SplitSubnetPreviewRequest(BaseModel):
+    new_prefix_length: int
+
+
+class SplitSubnetPreviewResponse(BaseModel):
+    parent_cidr: str
+    new_prefix_length: int
+    children: list[_SplitChildResp]
+    conflicts: list[dict[str, str]]
+    warnings: list[str]
+
+
+class SplitSubnetCommitRequest(BaseModel):
+    new_prefix_length: int
+    confirm_cidr: str
+
+
+class SplitSubnetCommitResponse(BaseModel):
+    parent_cidr: str
+    children: list[SubnetResponse]
+    summary: list[str]
+
+
+@router.post(
+    "/subnets/{subnet_id}/split/preview",
+    response_model=SplitSubnetPreviewResponse,
+)
+async def split_subnet_preview(
+    subnet_id: uuid.UUID,
+    body: SplitSubnetPreviewRequest,
+    current_user: CurrentUser,
+    db: DB,
+) -> SplitSubnetPreviewResponse:
+    from app.services.ipam.subnet_split import preview_subnet_split
+
+    subnet = await db.get(Subnet, subnet_id)
+    if subnet is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
+
+    preview = await preview_subnet_split(db, subnet, body.new_prefix_length)
+    return SplitSubnetPreviewResponse(
+        parent_cidr=preview.parent_cidr,
+        new_prefix_length=preview.new_prefix_length,
+        children=[
+            _SplitChildResp(
+                cidr=c.cidr,
+                allocations_count=c.allocations_count,
+                placeholders_default_named=c.placeholders_default_named,
+                placeholders_renamed=c.placeholders_renamed,
+                dhcp_scope_id=c.dhcp_scope_id,
+                dhcp_pool_count=c.dhcp_pool_count,
+                dhcp_static_count=c.dhcp_static_count,
+                dns_record_count=c.dns_record_count,
+            )
+            for c in preview.children
+        ],
+        conflicts=[{"type": c.type, "detail": c.detail} for c in preview.conflicts],
+        warnings=preview.warnings,
+    )
+
+
+@router.post(
+    "/subnets/{subnet_id}/split/commit",
+    response_model=SplitSubnetCommitResponse,
+)
+async def split_subnet_commit(
+    subnet_id: uuid.UUID,
+    body: SplitSubnetCommitRequest,
+    current_user: CurrentUser,
+    db: DB,
+) -> SplitSubnetCommitResponse:
+    from app.services.ipam.subnet_split import SplitError, commit_subnet_split
+
+    subnet = await db.get(Subnet, subnet_id)
+    if subnet is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
+
+    parent_snapshot = {
+        "id": str(subnet.id),
+        "network": str(subnet.network),
+    }
+
+    try:
+        result = await commit_subnet_split(
+            db,
+            subnet,
+            body.new_prefix_length,
+            confirm_cidr=body.confirm_cidr,
+            current_user=current_user,
+        )
+    except SplitError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+    db.add(
+        _audit(
+            current_user,
+            "split",
+            "subnet",
+            str(subnet_id),
+            f"{result.parent_cidr} → {len(result.children)} child(ren)",
+            old_value=parent_snapshot,
+            new_value={
+                "new_prefix_length": body.new_prefix_length,
+                "children": [str(c.id) for c in result.children],
+                "summary": result.summary,
+            },
+        )
+    )
+    await db.commit()
+    for child in result.children:
+        await db.refresh(child)
+    return SplitSubnetCommitResponse(
+        parent_cidr=result.parent_cidr,
+        children=[SubnetResponse.model_validate(c) for c in result.children],
+        summary=result.summary,
+    )
+
+
+# ── Subnet merge (Item 3) ─────────────────────────────────────────────────────
+
+
+class _MergeSourceResp(BaseModel):
+    id: uuid.UUID
+    cidr: str
+
+
+class MergeSubnetPreviewRequest(BaseModel):
+    sibling_subnet_ids: list[uuid.UUID]
+
+
+class MergeSubnetPreviewResponse(BaseModel):
+    merged_cidr: str | None
+    source_subnets: list[_MergeSourceResp]
+    surviving_dhcp_scope_id: uuid.UUID | None
+    conflicts: list[dict[str, str]]
+    warnings: list[str]
+
+
+class MergeSubnetCommitRequest(BaseModel):
+    sibling_subnet_ids: list[uuid.UUID]
+    confirm_cidr: str
+
+
+class MergeSubnetCommitResponse(BaseModel):
+    merged_subnet: SubnetResponse
+    deleted_subnet_ids: list[uuid.UUID]
+    summary: list[str]
+
+
+@router.post(
+    "/subnets/{subnet_id}/merge/preview",
+    response_model=MergeSubnetPreviewResponse,
+)
+async def merge_subnet_preview(
+    subnet_id: uuid.UUID,
+    body: MergeSubnetPreviewRequest,
+    current_user: CurrentUser,
+    db: DB,
+) -> MergeSubnetPreviewResponse:
+    from app.services.ipam.subnet_merge import preview_subnet_merge
+
+    subnet = await db.get(Subnet, subnet_id)
+    if subnet is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
+
+    preview = await preview_subnet_merge(db, subnet, body.sibling_subnet_ids)
+    return MergeSubnetPreviewResponse(
+        merged_cidr=preview.merged_cidr,
+        source_subnets=[_MergeSourceResp(id=s.id, cidr=s.cidr) for s in preview.source_subnets],
+        surviving_dhcp_scope_id=preview.surviving_dhcp_scope_id,
+        conflicts=[{"type": c.type, "detail": c.detail} for c in preview.conflicts],
+        warnings=preview.warnings,
+    )
+
+
+@router.post(
+    "/subnets/{subnet_id}/merge/commit",
+    response_model=MergeSubnetCommitResponse,
+)
+async def merge_subnet_commit(
+    subnet_id: uuid.UUID,
+    body: MergeSubnetCommitRequest,
+    current_user: CurrentUser,
+    db: DB,
+) -> MergeSubnetCommitResponse:
+    from app.services.ipam.subnet_merge import MergeError, commit_subnet_merge
+
+    subnet = await db.get(Subnet, subnet_id)
+    if subnet is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
+
+    target_snapshot = {
+        "id": str(subnet.id),
+        "network": str(subnet.network),
+    }
+    sources_snapshot = [str(subnet.id)] + [str(sid) for sid in body.sibling_subnet_ids]
+
+    try:
+        result = await commit_subnet_merge(
+            db,
+            subnet,
+            body.sibling_subnet_ids,
+            confirm_cidr=body.confirm_cidr,
+            current_user=current_user,
+        )
+    except MergeError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+    db.add(
+        _audit(
+            current_user,
+            "merge",
+            "subnet",
+            str(result.merged_subnet.id),
+            f"{len(sources_snapshot)} subnets → {body.confirm_cidr}",
+            old_value={
+                "target": target_snapshot,
+                "source_ids": sources_snapshot,
+            },
+            new_value={
+                "merged_cidr": body.confirm_cidr,
+                "merged_subnet_id": str(result.merged_subnet.id),
+                "deleted_subnet_ids": [str(i) for i in result.deleted_subnet_ids],
+                "summary": result.summary,
+            },
+        )
+    )
+    await db.commit()
+    await db.refresh(result.merged_subnet)
+    return MergeSubnetCommitResponse(
+        merged_subnet=SubnetResponse.model_validate(result.merged_subnet),
+        deleted_subnet_ids=result.deleted_subnet_ids,
         summary=result.summary,
     )
 
@@ -3734,6 +4332,45 @@ async def _alias_counts_for(db: AsyncSession, ips: list[IPAddress]) -> dict[uuid
     return {row[0]: row[1] for row in (await db.execute(q)).all()}
 
 
+async def _nat_mapping_counts_for(db: AsyncSession, ips: list[IPAddress]) -> dict[str, int]:
+    """Return {address_str: count} for NAT mappings referencing each IP.
+
+    Mappings are matched as either ``internal_ip`` or ``external_ip``.
+    Keying by the stringified address (rather than ``ip.id``) means a
+    single SQL query covers all IPs without join through ``ip_address``
+    — NATMapping.internal_ip is a free-standing INET, not an FK to the
+    IPAM row, because operators may record mappings before the IP lands
+    in IPAM.
+    """
+    from app.models.ipam import NATMapping  # noqa: PLC0415 — keep import local
+
+    if not ips:
+        return {}
+    addrs = list({str(ip.address) for ip in ips if ip.address is not None})
+    if not addrs:
+        return {}
+
+    # Two grouped counts (one per side) merged in Python — simpler than
+    # an OR-with-CASE that would still need post-processing for the
+    # "same IP on both sides of a mapping" edge case.
+    counts: dict[str, int] = {}
+    int_q = (
+        select(NATMapping.internal_ip, func.count(NATMapping.id))
+        .where(NATMapping.internal_ip.in_(addrs))
+        .group_by(NATMapping.internal_ip)
+    )
+    ext_q = (
+        select(NATMapping.external_ip, func.count(NATMapping.id))
+        .where(NATMapping.external_ip.in_(addrs))
+        .group_by(NATMapping.external_ip)
+    )
+    for ip_addr, n in (await db.execute(int_q)).all():
+        counts[str(ip_addr)] = counts.get(str(ip_addr), 0) + int(n)
+    for ip_addr, n in (await db.execute(ext_q)).all():
+        counts[str(ip_addr)] = counts.get(str(ip_addr), 0) + int(n)
+    return counts
+
+
 @router.get("/subnets/{subnet_id}/addresses", response_model=list[IPAddressResponse])
 async def list_addresses(
     subnet_id: uuid.UUID,
@@ -3753,11 +4390,13 @@ async def list_addresses(
         query = query.where(IPAddress.status == status_filter)
     rows = list((await db.execute(query)).scalars().all())
     counts = await _alias_counts_for(db, rows)
+    nat_counts = await _nat_mapping_counts_for(db, rows)
     vendors = await bulk_lookup_vendors(
         db, [str(ip.mac_address) if ip.mac_address else None for ip in rows]
     )
     for ip in rows:
         ip.alias_count = counts.get(ip.id, 0)  # type: ignore[attr-defined]
+        ip.nat_mapping_count = nat_counts.get(str(ip.address), 0)  # type: ignore[attr-defined]
         key = normalize_mac_key(str(ip.mac_address)) if ip.mac_address else None
         ip.vendor = vendors.get(key) if key else None  # type: ignore[attr-defined]
     return rows
@@ -3832,6 +4471,7 @@ async def create_address(
             hostname=body.hostname,
             forward_zone_id=effective_zone,
             mac_address=body.mac_address,
+            role=body.role,
         )
         if warnings:
             raise _collision_http_exc(warnings)
@@ -3839,10 +4479,15 @@ async def create_address(
     ip = IPAddress(
         subnet_id=subnet_id,
         created_by_user_id=current_user.id,
-        **body.model_dump(exclude={"dns_zone_id", "force"}),
+        **body.model_dump(exclude={"dns_zone_id", "force", "aliases"}),
     )
     db.add(ip)
     await db.flush()
+
+    # Stamp a MAC observation row. Idempotent on the (ip_id, mac)
+    # uniqueness — a future PUT bumps last_seen instead of inserting.
+    if body.mac_address:
+        await _record_mac_history(db, ip.id, body.mac_address)
 
     # Sync DNS A record
     await _sync_dns_record(db, ip, subnet, zone_id=explicit_zone, action="create")
@@ -3877,6 +4522,73 @@ async def get_address(address_id: uuid.UUID, current_user: CurrentUser, db: DB) 
     if ip is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP address not found")
     return ip
+
+
+class MacHistoryEntry(BaseModel):
+    """Per-row entry in an IP's MAC observation history.
+
+    ``vendor`` is best-effort — populated when the OUI lookup
+    feature is enabled and the prefix is in our local DB. Null
+    when OUI is off or the prefix is unknown.
+    """
+
+    id: uuid.UUID
+    mac_address: str
+    first_seen: datetime
+    last_seen: datetime
+    vendor: str | None = None
+
+    model_config = {"from_attributes": True}
+
+    @field_validator("mac_address", mode="before")
+    @classmethod
+    def coerce_mac(cls, v: Any) -> Any:
+        return str(v) if v is not None else v
+
+
+@router.get("/addresses/{address_id}/mac-history", response_model=list[MacHistoryEntry])
+async def list_mac_history(
+    address_id: uuid.UUID, current_user: CurrentUser, db: DB
+) -> list[MacHistoryEntry]:
+    """List every distinct MAC ever observed on this IP, newest first.
+
+    The history is appended on every IP create/update where a MAC is
+    present — see ``_record_mac_history``. Each entry carries the
+    ``first_seen`` (initial insert) and ``last_seen`` (most recent
+    bump) timestamps; the spread tells operators how long the MAC
+    has been associated with the IP. Permission gate is the same
+    ``read:ip_address`` the parent endpoint uses (router-level).
+    """
+    ip = await db.get(IPAddress, address_id)
+    if ip is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP address not found")
+
+    rows = list(
+        (
+            await db.execute(
+                select(IpMacHistory)
+                .where(IpMacHistory.ip_address_id == address_id)
+                .order_by(IpMacHistory.last_seen.desc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    macs: list[str | None] = [str(r.mac_address) for r in rows]
+    vendors = await bulk_lookup_vendors(db, macs)
+    out: list[MacHistoryEntry] = []
+    for r in rows:
+        key = normalize_mac_key(str(r.mac_address))
+        out.append(
+            MacHistoryEntry(
+                id=r.id,
+                mac_address=str(r.mac_address),
+                first_seen=r.first_seen,
+                last_seen=r.last_seen,
+                vendor=vendors.get(key) if key else None,
+            )
+        )
+    return out
 
 
 @router.put("/addresses/{address_id}", response_model=IPAddressResponse)
@@ -3924,6 +4636,11 @@ async def update_address(
     touched = body.model_dump(exclude_unset=True)
     hostname_or_zone_touched = "hostname" in touched or "dns_zone_id" in touched
     mac_touched = "mac_address" in touched
+    # Effective role for the collision check — pending value if the
+    # client touched it, otherwise the existing row's role. The role
+    # exemption only matters when MAC was touched (otherwise no MAC
+    # collision check runs anyway).
+    effective_role = body.role if "role" in touched else ip.role
     if not body.force and (hostname_or_zone_touched or mac_touched):
         subnet_for_check = await db.get(Subnet, ip.subnet_id)
         new_hostname = body.hostname if body.hostname is not None else ip.hostname
@@ -3939,13 +4656,17 @@ async def update_address(
             forward_zone_id=new_zone_id if hostname_or_zone_touched else None,
             mac_address=body.mac_address if mac_touched else None,
             exclude_ip_id=ip.id,
+            role=effective_role,
         )
         if warnings:
             raise _collision_http_exc(warnings)
 
-    changes = body.model_dump(exclude_none=True, exclude={"dns_zone_id", "force"})
+    # ``exclude_unset`` lets the client legitimately clear ``role`` /
+    # ``reserved_until`` by sending an explicit null. ``dns_zone_id`` /
+    # ``force`` are routing fields, not row attrs.
+    changes = body.model_dump(exclude_unset=True, exclude={"dns_zone_id", "force"})
     changes_for_audit = body.model_dump(
-        mode="json", exclude_none=True, exclude={"dns_zone_id", "force"}
+        mode="json", exclude_unset=True, exclude={"dns_zone_id", "force"}
     )
     # Track whether any integration-relevant soft field is genuinely
     # changing — used to decide if we stamp ``user_modified_at`` so
@@ -3956,6 +4677,16 @@ async def update_address(
         if field in soft_fields and getattr(ip, field) != value:
             soft_field_actually_changed = True
         setattr(ip, field, value)
+    # If status moved off "reserved", clear the TTL so a stale
+    # ``reserved_until`` can't accidentally trip the sweeper later.
+    if "status" in changes and ip.status != "reserved":
+        ip.reserved_until = None
+    # On every successful update, if the row carries a MAC, bump
+    # the history. Touching the MAC triggers a new (or refreshed)
+    # row; leaving it alone refreshes ``last_seen`` for the
+    # existing observation.
+    if ip.mac_address:
+        await _record_mac_history(db, ip.id, str(ip.mac_address))
     if soft_field_actually_changed:
         # Stamp on every operator edit, not just integration-owned
         # rows — cheap, and makes operator-set values sticky if the
@@ -4365,6 +5096,7 @@ async def allocate_next_ip(
             hostname=body.hostname,
             forward_zone_id=effective_zone,
             mac_address=body.mac_address,
+            role=body.role,
         )
         if warnings:
             raise _collision_http_exc(warnings)
@@ -4393,10 +5125,15 @@ async def allocate_next_ip(
         description=body.description,
         custom_fields=body.custom_fields,
         tags=body.tags,
+        role=body.role,
+        reserved_until=body.reserved_until,
         created_by_user_id=current_user.id,
     )
     db.add(ip)
     await db.flush()
+
+    if body.mac_address:
+        await _record_mac_history(db, ip.id, body.mac_address)
 
     # Sync DNS A record
     await _sync_dns_record(db, ip, subnet, zone_id=explicit_zone, action="create")
@@ -5028,6 +5765,13 @@ class IPAddressBulkChanges(BaseModel):
     # record reconciliation (create / move / delete) via _sync_dns_record.
     # Use the empty string ``""`` to clear a zone assignment.
     dns_zone_id: str | None = None
+    # Role + reservation TTL — both opt-in like the other bulk fields.
+    # Empty string on ``role`` clears (= "no specific role" for the
+    # selected IPs); explicit ``null`` on ``reserved_until`` clears.
+    # Field presence (model_dump exclude_none) is the opt-in signal,
+    # so the client should omit fields it doesn't intend to change.
+    role: str | None = None
+    reserved_until: datetime | None = None
 
     @field_validator("status")
     @classmethod
@@ -5037,6 +5781,11 @@ class IPAddressBulkChanges(BaseModel):
                 f"status must be one of: {', '.join(sorted(_IP_BULK_ALLOWED_STATUSES))}"
             )
         return v
+
+    @field_validator("role", mode="before")
+    @classmethod
+    def _validate_role(cls, v: str | None) -> str | None:
+        return _validate_role(v)
 
 
 class IPAddressBulkEditRequest(BaseModel):
@@ -5059,13 +5808,16 @@ async def bulk_edit_addresses(
 ) -> IPAddressBulkEditResponse:
     """Apply the same change set to multiple IPs.
 
-    * ``status`` and ``description`` replace the existing value.
+    * ``status``, ``description``, ``role`` and ``reserved_until``
+      replace the existing value (per-field opt-in: omit the field
+      from the payload to leave it untouched). For ``role``, an
+      empty string clears it (= no specific role).
     * ``tags`` and ``custom_fields`` are **merged** into the existing dicts —
       set a key to ``null`` to remove it. This matches UX expectations when
       bulk-tagging a set of IPs.
     * System rows (``network``/``broadcast``/``orphan``) are skipped.
     """
-    changes = body.changes.model_dump(exclude_none=True)
+    changes = body.changes.model_dump(exclude_unset=True)
     if not changes:
         raise HTTPException(
             status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
@@ -5088,7 +5840,18 @@ async def bulk_edit_addresses(
 
     tags_patch = body.changes.tags
     cf_patch = body.changes.custom_fields
-    scalar_changes = {k: v for k, v in changes.items() if k in ("status", "description")}
+    # Per-field opt-in: the change set carries ONLY the fields the
+    # client explicitly set. ``role`` and ``reserved_until`` flow
+    # through as scalars; an empty string on ``role`` clears.
+    scalar_field_names = ("status", "description", "role", "reserved_until")
+    scalar_changes: dict[str, Any] = {}
+    for k in scalar_field_names:
+        if k not in changes:
+            continue
+        v = changes[k]
+        if k == "role" and v == "":
+            v = None
+        scalar_changes[k] = v
     apply_zone = body.changes.dns_zone_id is not None
     new_zone_id: uuid.UUID | None = None
     if apply_zone and body.changes.dns_zone_id:

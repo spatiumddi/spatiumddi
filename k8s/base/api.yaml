@@ -58,6 +58,8 @@ spec:
                 configMapKeyRef:
                   name: spatiumddi-config
                   key: CELERY_RESULT_BACKEND
+          # Liveness — "process responds to HTTP". Deliberately shallow:
+          # a transient Postgres blip should not trigger a pod restart.
           livenessProbe:
             httpGet:
               path: /health/live
@@ -65,12 +67,17 @@ spec:
             initialDelaySeconds: 10
             periodSeconds: 15
             failureThreshold: 3
+          # Readiness — "can actually serve traffic". /health/ready
+          # checks DB + Redis connectivity, so an api pod that can't
+          # reach its dependencies is taken out of the LB rotation
+          # instead of returning 5xx to clients.
           readinessProbe:
             httpGet:
-              path: /health/live
+              path: /health/ready
               port: 8000
             initialDelaySeconds: 5
             periodSeconds: 10
+            failureThreshold: 3
           resources:
             requests:
               cpu: 100m

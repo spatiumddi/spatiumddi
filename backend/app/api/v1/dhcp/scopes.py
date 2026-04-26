@@ -23,6 +23,10 @@ from app.services.dhcp.windows_writethrough import (
     push_scope_delete,
     push_scope_upsert,
 )
+from app.services.soft_delete import (
+    apply_soft_delete,
+    collect_soft_delete_batch,
+)
 
 router = APIRouter(tags=["dhcp"], dependencies=[Depends(require_resource_permission("dhcp_scope"))])
 
@@ -311,10 +315,40 @@ async def update_scope(
 
 
 @router.delete("/scopes/{scope_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_scope(scope_id: uuid.UUID, db: DB, user: SuperAdmin) -> None:
+async def delete_scope(
+    scope_id: uuid.UUID,
+    db: DB,
+    user: SuperAdmin,
+    permanent: bool = False,
+) -> None:
+    """Delete a DHCP scope.
+
+    Default soft-delete stamps the scope with a fresh batch UUID so it
+    can be restored from /admin/trash. The Windows write-through is only
+    fired on the permanent path; soft-delete leaves the scope in the
+    rendered config until restoration deadline expires (the purge sweep
+    triggers the actual config refresh by hard-deleting then).
+    """
     scope = await db.get(DHCPScope, scope_id)
     if scope is None:
         raise HTTPException(status_code=404, detail="Scope not found")
+
+    if not permanent:
+        batch = await collect_soft_delete_batch(db, scope)
+        apply_soft_delete(batch, user.id)
+        for row in batch.rows:
+            write_audit(
+                db,
+                user=user,
+                action="soft_delete",
+                resource_type=row.resource_type,
+                resource_id=str(row.obj.id),
+                resource_display=row.display,
+                old_value={"deletion_batch_id": str(batch.batch_id)},
+            )
+        await db.commit()
+        return
+
     await push_scope_delete(db, scope)
     write_audit(
         db,

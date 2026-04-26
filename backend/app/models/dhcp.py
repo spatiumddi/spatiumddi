@@ -33,7 +33,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import INET, JSONB, MACADDR, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from app.models.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
+from app.models.base import Base, SoftDeleteMixin, TimestampMixin, UUIDPrimaryKeyMixin
 
 # ── Server Group / Server ────────────────────────────────────────────────────
 
@@ -162,7 +162,7 @@ class DHCPServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 # ── Scope / Pool / Static / Client Class ─────────────────────────────────────
 
 
-class DHCPScope(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+class DHCPScope(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     """A DHCP scope — one subnet served by one group.
 
     Under the group-centric model, a scope belongs to a DHCPServerGroup,
@@ -445,6 +445,47 @@ class DHCPConfigOp(UUIDPrimaryKeyMixin, Base):
 DHCPRecordOp = DHCPConfigOp
 
 
+class DHCPLeaseHistory(UUIDPrimaryKeyMixin, Base):
+    """Historical record of a DHCP lease that left the active set.
+
+    Written on absence-delete (pull_leases), time-based expiry sweep
+    (dhcp_lease_cleanup), and MAC-reassignment within pull_leases.
+    Retained for PlatformSettings.dhcp_lease_history_retention_days days
+    (default 90).
+    """
+
+    __tablename__ = "dhcp_lease_history"
+    __table_args__ = (
+        Index("ix_dhcp_lease_history_server_id", "server_id"),
+        Index("ix_dhcp_lease_history_ip_address", "ip_address"),
+        Index("ix_dhcp_lease_history_mac_address", "mac_address"),
+        Index("ix_dhcp_lease_history_server_expired", "server_id", "expired_at"),
+    )
+
+    server_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dhcp_server.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    scope_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dhcp_scope.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    ip_address: Mapped[str] = mapped_column(INET, nullable=False)
+    mac_address: Mapped[str] = mapped_column(MACADDR, nullable=False)
+    hostname: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    client_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    expired_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    lease_state: Mapped[str] = mapped_column(String(20), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
 __all__ = [
     "DHCPServerGroup",
     "DHCPServer",
@@ -456,4 +497,5 @@ __all__ = [
     "DHCPLease",
     "DHCPConfigOp",
     "DHCPRecordOp",
+    "DHCPLeaseHistory",
 ]

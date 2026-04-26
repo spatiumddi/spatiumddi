@@ -66,6 +66,21 @@ spec:
             limits:
               cpu: 2000m
               memory: 1Gi
+          # No HTTP listener — use a Celery-native ping over the broker
+          # to confirm this specific worker is alive. ``$HOSTNAME`` lands
+          # the unique pod name into ``celery@<hostname>`` so the probe
+          # only succeeds for *this* pod, not any random worker on the
+          # broker.
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - celery -A app.celery_app inspect ping -d "celery@${HOSTNAME}" --timeout 5 >/dev/null 2>&1
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
 ---
 # Beat runs as a singleton — only 1 replica allowed
 apiVersion: apps/v1
@@ -135,3 +150,16 @@ spec:
             limits:
               cpu: 200m
               memory: 256Mi
+          # Beat has no broker-reachable identity (it only enqueues, it
+          # doesn't accept ``inspect ping``). Cheapest accurate signal:
+          # check the celery process is still pid 1 of the container.
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - grep -q celery /proc/1/cmdline
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3

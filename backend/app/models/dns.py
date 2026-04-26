@@ -20,7 +20,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from app.models.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
+from app.models.base import Base, SoftDeleteMixin, TimestampMixin, UUIDPrimaryKeyMixin
 
 
 class DNSServerZoneState(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -364,7 +364,7 @@ class DNSView(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
 
 
-class DNSZone(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+class DNSZone(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     """DNS zone — authoritative, secondary, stub, or forward."""
 
     __tablename__ = "dns_zone"
@@ -439,7 +439,7 @@ class DNSZone(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
 
 
-class DNSRecord(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+class DNSRecord(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     """Individual DNS resource record within a zone."""
 
     __tablename__ = "dns_record"

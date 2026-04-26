@@ -192,6 +192,13 @@ export interface IPSpace {
   ddns_hostname_policy?: DdnsHostnamePolicy;
   ddns_domain_override?: string | null;
   ddns_ttl?: number | null;
+  // VRF / routing annotation — pure metadata; address allocation
+  // ignores these. ``route_targets`` is an array of strings so the
+  // operator can encode the inline import:A:B; export:C:D convention
+  // until first-class import / export columns land.
+  vrf_name?: string | null;
+  route_distinguisher?: string | null;
+  route_targets?: string[] | null;
   created_at?: string;
   modified_at?: string;
 }
@@ -359,11 +366,45 @@ export interface Subnet {
   modified_at?: string;
 }
 
+/** Optional role tag, orthogonal to ``status``. Roles in
+ *  ``IP_ROLES_SHARED`` (anycast / vip / vrrp) are intentionally
+ *  shared across multiple devices — the API skips MAC-collision
+ *  warnings for them. */
+export type IPRole =
+  | "host"
+  | "loopback"
+  | "anycast"
+  | "vip"
+  | "vrrp"
+  | "secondary"
+  | "gateway";
+
+export const IP_ROLE_OPTIONS: IPRole[] = [
+  "host",
+  "loopback",
+  "anycast",
+  "vip",
+  "vrrp",
+  "secondary",
+  "gateway",
+];
+
+export const IP_ROLES_SHARED: ReadonlySet<IPRole> = new Set([
+  "anycast",
+  "vip",
+  "vrrp",
+]);
+
 export interface IPAddress {
   id: string;
   subnet_id: string;
   address: string;
   status: string;
+  /** Curated role tag — null = no specific role. See ``IP_ROLE_OPTIONS``. */
+  role?: IPRole | null;
+  /** TTL on a ``status='reserved'`` row. The Celery sweep task flips
+   *  the row back to ``available`` after this passes. */
+  reserved_until?: string | null;
   hostname: string | null;
   fqdn: string | null;
   description: string;
@@ -385,10 +426,26 @@ export interface IPAddress {
   auto_from_lease?: boolean;
   // User-added CNAME/A aliases on this IP (excludes the primary A).
   alias_count?: number;
+  // Count of NAT mappings referencing this IP (as either internal or
+  // external endpoint). Populated by /ipam/subnets/{id}/addresses;
+  // defaults to 0 elsewhere. Surfaced as a small "NAT" badge in the
+  // IP-row of IPAMPage with a tooltip listing the matching mapping
+  // names.
+  nat_mapping_count?: number;
   // IEEE OUI vendor for this MAC (populated when OUI lookup is enabled).
   vendor?: string | null;
   created_at?: string;
   modified_at?: string;
+}
+
+/** One observation in an IP's MAC history. ``vendor`` is best-effort
+ *  via the OUI lookup feature. */
+export interface MacHistoryEntry {
+  id: string;
+  mac_address: string;
+  first_seen: string;
+  last_seen: string;
+  vendor?: string | null;
 }
 
 export interface SubnetAlias {
@@ -544,6 +601,99 @@ export interface BlockResizeCommitResponse {
   summary: string[];
 }
 
+// ── Free-space finder ──────────────────────────────────────────────────────
+//
+// Sweep an IPSpace (or one block subtree) for unused CIDRs of the
+// requested prefix length. Empty space yields HTTP 200 with
+// `summary.warning="space has no blocks"` so the UI can render a
+// "create a block first" nudge instead of an error.
+
+export interface FindFreeRequest {
+  prefix_length: number;
+  address_family?: 4 | 6;
+  count?: number;
+  min_free_addresses?: number | null;
+  parent_block_id?: string | null;
+}
+
+export interface FindFreeCandidate {
+  cidr: string;
+  parent_block_id: string;
+  parent_block_cidr: string;
+  free_addresses?: number | null;
+}
+
+export interface FindFreeResponse {
+  candidates: FindFreeCandidate[];
+  summary: Record<string, string | number>;
+}
+
+// ── Subnet split ───────────────────────────────────────────────────────────
+
+export interface SplitChildPreview {
+  cidr: string;
+  allocations_count: number;
+  placeholders_default_named: number;
+  placeholders_renamed: number;
+  dhcp_scope_id: string | null;
+  dhcp_pool_count: number;
+  dhcp_static_count: number;
+  dns_record_count: number;
+}
+
+export interface SplitSubnetPreviewRequest {
+  new_prefix_length: number;
+}
+
+export interface SplitSubnetPreviewResponse {
+  parent_cidr: string;
+  new_prefix_length: number;
+  children: SplitChildPreview[];
+  conflicts: ResizeConflict[];
+  warnings: string[];
+}
+
+export interface SplitSubnetCommitRequest {
+  new_prefix_length: number;
+  confirm_cidr: string;
+}
+
+export interface SplitSubnetCommitResponse {
+  parent_cidr: string;
+  children: Subnet[];
+  summary: string[];
+}
+
+// ── Subnet merge ───────────────────────────────────────────────────────────
+
+export interface MergeSourceRow {
+  id: string;
+  cidr: string;
+}
+
+export interface MergeSubnetPreviewRequest {
+  sibling_subnet_ids: string[];
+}
+
+export interface MergeSubnetPreviewResponse {
+  merged_cidr: string | null;
+  source_subnets: MergeSourceRow[];
+  surviving_dhcp_scope_id: string | null;
+  conflicts: ResizeConflict[];
+  warnings: string[];
+}
+
+export interface MergeSubnetCommitRequest {
+  sibling_subnet_ids: string[];
+  confirm_cidr: string;
+}
+
+export interface MergeSubnetCommitResponse {
+  merged_subnet: Subnet;
+  deleted_subnet_ids: string[];
+  summary: string[];
+}
+
 export const ipamApi = {
   listSpaces: () => api.get<IPSpace[]>("/ipam/spaces").then((r) => r.data),
   getSpace: (id: string) =>
@@ -668,6 +818,42 @@ export const ipamApi = {
       .post<BlockResizeCommitResponse>(`/ipam/blocks/${blockId}/resize`, body)
       .then((r) => r.data),
 
+  // ── Free-space finder ───────────────────────────────────────────────
+  findFreeSpace: (spaceId: string, body: FindFreeRequest) =>
+    api
+      .post<FindFreeResponse>(`/ipam/spaces/${spaceId}/find-free`, body)
+      .then((r) => r.data),
+
+  // ── Subnet split / merge ────────────────────────────────────────────
+  splitSubnetPreview: (subnetId: string, body: SplitSubnetPreviewRequest) =>
+    api
+      .post<SplitSubnetPreviewResponse>(
+        `/ipam/subnets/${subnetId}/split/preview`,
+        body,
+      )
+      .then((r) => r.data),
+  splitSubnetCommit: (subnetId: string, body: SplitSubnetCommitRequest) =>
+    api
+      .post<SplitSubnetCommitResponse>(
+        `/ipam/subnets/${subnetId}/split/commit`,
+        body,
+      )
+      .then((r) => r.data),
+  mergeSubnetPreview: (subnetId: string, body: MergeSubnetPreviewRequest) =>
+    api
+      .post<MergeSubnetPreviewResponse>(
+        `/ipam/subnets/${subnetId}/merge/preview`,
+        body,
+      )
+      .then((r) => r.data),
+  mergeSubnetCommit: (subnetId: string, body: MergeSubnetCommitRequest) =>
+    api
+      .post<MergeSubnetCommitResponse>(
+        `/ipam/subnets/${subnetId}/merge/commit`,
+        body,
+      )
+      .then((r) => r.data),
+
   dnsSyncPreview: (subnetId: string) =>
     api
       .get<DnsSyncPreview>(`/ipam/subnets/${subnetId}/dns-sync/preview`)
@@ -770,6 +956,11 @@ export const ipamApi = {
         }[]
       >(`/ipam/addresses/${addressId}/aliases`)
       .then((r) => r.data),
+  /** Pull every distinct MAC ever observed on this IP, newest-first. */
+  listMacHistory: (addressId: string) =>
+    api
+      .get<MacHistoryEntry[]>(`/ipam/addresses/${addressId}/mac-history`)
+      .then((r) => r.data),
   addAlias: (
     addressId: string,
     data: { name: string; record_type: "CNAME" | "A" },
@@ -807,6 +998,10 @@ export const ipamApi = {
       custom_fields?: Record<string, unknown>;
       /** New forward-zone for every selected IP. Empty string clears. */
       dns_zone_id?: string;
+      /** Curated role tag. Empty string clears (= no specific role). */
+      role?: IPRole | "" | null;
+      /** TTL on reservations. ``null`` clears, ISO 8601 string sets. */
+      reserved_until?: string | null;
     };
   }) =>
     api
@@ -854,6 +1049,8 @@ export const ipamApi = {
       custom_fields?: Record<string, unknown>;
       dns_zone_id?: string | null;
       aliases?: { name: string; record_type: "CNAME" | "A" }[];
+      role?: IPRole;
+      reserved_until?: string;
       /** Re-submit flag after the user confirms a 409 collision warning. */
       force?: boolean;
     },
@@ -3587,4 +3784,173 @@ export const tailscaleApi = {
         task_id: string;
       }>(`/tailscale/tenants/${id}/sync`)
       .then((r) => r.data),
+};
+
+// ── Trash (soft-delete recovery) ────────────────────────────────────────────
+
+export type TrashEntryType =
+  | "ip_space"
+  | "ip_block"
+  | "subnet"
+  | "dns_zone"
+  | "dns_record"
+  | "dhcp_scope";
+
+export interface TrashEntry {
+  id: string;
+  type: TrashEntryType;
+  name_or_cidr: string;
+  deleted_at: string;
+  deleted_by_user_id: string | null;
+  deleted_by_username: string | null;
+  deletion_batch_id: string | null;
+  batch_size: number;
+}
+
+export interface TrashListResponse {
+  items: TrashEntry[];
+  total: number;
+}
+
+export interface TrashRestoreResponse {
+  batch_id: string;
+  restored: number;
+}
+
+export const trashApi = {
+  list: (
+    params: {
+      type?: TrashEntryType;
+      since?: string;
+      until?: string;
+      q?: string;
+      limit?: number;
+      offset?: number;
+    } = {},
+  ) =>
+    api
+      .get<TrashListResponse>("/admin/trash", { params })
+      .then((r) => r.data),
+  restore: (type: TrashEntryType, id: string) =>
+    api
+      .post<TrashRestoreResponse>(`/admin/trash/${type}/${id}/restore`)
+      .then((r) => r.data),
+  permanentDelete: (type: TrashEntryType, id: string) =>
+    api.delete(`/admin/trash/${type}/${id}`),
+};
+
+// ── DHCP lease history ─────────────────────────────────────────────────────────
+
+export interface DHCPLeaseHistoryRow {
+  id: string;
+  server_id: string;
+  scope_id: string | null;
+  ip_address: string;
+  mac_address: string;
+  hostname: string | null;
+  client_id: string | null;
+  started_at: string | null;
+  expired_at: string;
+  // "expired" | "released" | "removed" | "superseded"
+  lease_state: string;
+  created_at: string;
+}
+
+export interface DHCPLeaseHistoryPage {
+  total: number;
+  page: number;
+  per_page: number;
+  items: DHCPLeaseHistoryRow[];
+}
+
+export interface DHCPLeaseHistoryQuery {
+  since?: string;
+  until?: string;
+  mac?: string;
+  ip?: string;
+  hostname?: string;
+  lease_state?: string;
+  page?: number;
+  per_page?: number;
+}
+
+export const dhcpLeaseHistoryApi = {
+  list: (serverId: string, params?: DHCPLeaseHistoryQuery) =>
+    api
+      .get<DHCPLeaseHistoryPage>(`/dhcp/servers/${serverId}/lease-history`, {
+        params,
+      })
+      .then((r) => r.data),
+};
+
+// ── NAT mappings ───────────────────────────────────────────────────────────────
+
+export type NATKind = "1to1" | "pat" | "hide";
+export type NATProtocol = "tcp" | "udp" | "any";
+
+export interface NATMapping {
+  id: string;
+  name: string;
+  kind: NATKind;
+  internal_ip: string | null;
+  internal_subnet_id: string | null;
+  internal_port_start: number | null;
+  internal_port_end: number | null;
+  external_ip: string | null;
+  external_port_start: number | null;
+  external_port_end: number | null;
+  protocol: NATProtocol;
+  device_label: string | null;
+  description: string | null;
+  tags: unknown[];
+  custom_fields: Record<string, unknown>;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface NATMappingPage {
+  total: number;
+  page: number;
+  per_page: number;
+  items: NATMapping[];
+}
+
+export interface NATMappingWrite {
+  name?: string;
+  kind?: NATKind;
+  internal_ip?: string | null;
+  internal_subnet_id?: string | null;
+  internal_port_start?: number | null;
+  internal_port_end?: number | null;
+  external_ip?: string | null;
+  external_port_start?: number | null;
+  external_port_end?: number | null;
+  protocol?: NATProtocol;
+  device_label?: string | null;
+  description?: string | null;
+  tags?: unknown[];
+  custom_fields?: Record<string, unknown>;
+}
+
+export interface NATMappingQuery {
+  kind?: NATKind;
+  internal_ip?: string;
+  external_ip?: string;
+  q?: string;
+  page?: number;
+  per_page?: number;
+}
+
+export const natApi = {
+  list: (params?: NATMappingQuery) =>
+    api
+      .get<NATMappingPage>("/ipam/nat-mappings", { params })
+      .then((r) => r.data),
+  get: (id: string) =>
+    api.get<NATMapping>(`/ipam/nat-mappings/${id}`).then((r) => r.data),
+  create: (data: NATMappingWrite) =>
+    api.post<NATMapping>("/ipam/nat-mappings", data).then((r) => r.data),
+  update: (id: string, data: NATMappingWrite) =>
+    api.patch<NATMapping>(`/ipam/nat-mappings/${id}`, data).then((r) => r.data),
+  delete: (id: string) => api.delete(`/ipam/nat-mappings/${id}`),
 };

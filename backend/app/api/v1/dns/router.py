@@ -42,6 +42,10 @@ from app.services.dns_io import (
     parse_zone_file,
     write_zone_file,
 )
+from app.services.soft_delete import (
+    apply_soft_delete,
+    collect_soft_delete_batch,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -2111,10 +2115,48 @@ async def update_zone(
 
 @router.delete("/groups/{group_id}/zones/{zone_id}", status_code=204)
 async def delete_zone(
-    group_id: uuid.UUID, zone_id: uuid.UUID, db: DB, current_user: SuperAdmin
+    group_id: uuid.UUID,
+    zone_id: uuid.UUID,
+    db: DB,
+    current_user: SuperAdmin,
+    permanent: bool = False,
 ) -> None:
+    """Delete a DNS zone.
+
+    Default behavior is soft-delete: the zone + every record in it gets
+    stamped with the same ``deletion_batch_id``. Records cascade alongside
+    the zone, so a single restore brings them all back atomically. The
+    Windows write-through (``apply_zone_change(..., "delete")``) is
+    deliberately skipped on the soft-delete path — the zone hasn't actually
+    been removed from BIND9 / the agent's bundle yet, so we don't yank the
+    serving zone out from under live clients. Permanent delete still pushes
+    the write-through first.
+
+    ``?permanent=true`` runs the legacy hard-delete path (super-admin only).
+    """
     zone = await _require_zone(group_id, zone_id, db)
     _reject_if_synthesised_zone(zone, "delete")
+
+    if not permanent:
+        batch = await collect_soft_delete_batch(db, zone)
+        apply_soft_delete(batch, current_user.id)
+        for row in batch.rows:
+            db.add(
+                AuditLog(
+                    user_id=current_user.id,
+                    user_display_name=current_user.display_name,
+                    auth_source=current_user.auth_source,
+                    action="soft_delete",
+                    resource_type=row.resource_type,
+                    resource_id=str(row.obj.id),
+                    resource_display=row.display,
+                    old_value={"deletion_batch_id": str(batch.batch_id)},
+                    result="success",
+                )
+            )
+        await db.commit()
+        return
+
     # Same write-through contract as create: push the delete first, only
     # drop the DB row if the Windows side agreed.
     await _push_zone_to_agentless_servers(db, zone, "delete")
@@ -2395,10 +2437,49 @@ async def update_record(
 
 @router.delete("/groups/{group_id}/zones/{zone_id}/records/{record_id}", status_code=204)
 async def delete_record(
-    group_id: uuid.UUID, zone_id: uuid.UUID, record_id: uuid.UUID, db: DB, current_user: CurrentUser
+    group_id: uuid.UUID,
+    zone_id: uuid.UUID,
+    record_id: uuid.UUID,
+    db: DB,
+    current_user: CurrentUser,
+    permanent: bool = False,
 ) -> None:
+    """Delete a DNS record.
+
+    Default soft-delete stamps the record with a fresh ``deletion_batch_id``
+    so it can be individually restored from /admin/trash. The DDNS / agent
+    record-op is enqueued only on the permanent path; on soft-delete the
+    record is hidden from queries but still in the served bundle until the
+    next render — operators who want to re-instate it within the trash
+    window won't see a serial bump round trip first.
+    """
     record = await _require_record(group_id, zone_id, record_id, db)
     _reject_if_synthesised_record(record, "delete")
+
+    if not permanent:
+        batch = await collect_soft_delete_batch(db, record)
+        apply_soft_delete(batch, current_user.id)
+        for row in batch.rows:
+            db.add(
+                AuditLog(
+                    user_id=current_user.id,
+                    user_display_name=current_user.display_name,
+                    auth_source=current_user.auth_source,
+                    action="soft_delete",
+                    resource_type=row.resource_type,
+                    resource_id=str(row.obj.id),
+                    resource_display=row.display,
+                    old_value={"deletion_batch_id": str(batch.batch_id)},
+                    result="success",
+                )
+            )
+        await db.commit()
+        return
+
+    from app.api.deps import require_superadmin  # noqa: PLC0415
+
+    require_superadmin(current_user)
+
     zone = await db.get(DNSZone, record.zone_id)
     db.add(
         AuditLog(

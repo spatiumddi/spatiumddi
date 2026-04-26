@@ -40,6 +40,20 @@ spec:
             - {{ .Values.worker.queues | quote }}
           env:
             {{- include "spatiumddi.commonEnv" . | nindent 12 }}
+          # Worker has no HTTP listener — Celery-native ping over the
+          # broker confirms this specific worker is alive. Using
+          # ``$HOSTNAME`` scopes the ping to this pod, not any random
+          # worker on the broker.
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - celery -A app.celery_app inspect ping -d "celery@${HOSTNAME}" --timeout 5 >/dev/null 2>&1
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 10
+            failureThreshold: 3
           resources:
             {{- toYaml .Values.worker.resources | nindent 12 }}
       {{- with .Values.worker.nodeSelector }}

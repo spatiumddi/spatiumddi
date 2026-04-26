@@ -18,7 +18,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import CIDR, INET, JSONB, MACADDR, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from app.models.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
+from app.models.base import Base, SoftDeleteMixin, TimestampMixin, UUIDPrimaryKeyMixin
 
 # Valid IPAddress.status values. Operator-settable values cover the
 # manual lifecycle (free → allocated → reserved → deprecated, plus the
@@ -52,8 +52,18 @@ IP_STATUSES_INTEGRATION_OWNED: frozenset[str] = frozenset(
 )
 IP_STATUSES: frozenset[str] = IP_STATUSES_OPERATOR_SETTABLE | IP_STATUSES_INTEGRATION_OWNED
 
+# Valid IPAddress.role values. Orthogonal to ``status`` — the role
+# describes what the IP *is* (a host vs. a VRRP virtual address),
+# while the status describes its lifecycle (allocated vs. reserved).
+# Roles in ``IP_ROLES_SHARED`` (anycast / vip / vrrp) are intentionally
+# shared across multiple devices and bypass the MAC-collision warning.
+IP_ROLES: frozenset[str] = frozenset(
+    {"host", "loopback", "anycast", "vip", "vrrp", "secondary", "gateway"}
+)
+IP_ROLES_SHARED: frozenset[str] = frozenset({"anycast", "vip", "vrrp"})
 
-class IPSpace(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+
+class IPSpace(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     """VRF / isolated routing domain. IPs in different spaces may overlap."""
 
     __tablename__ = "ip_space"
@@ -96,6 +106,26 @@ class IPSpace(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     ddns_domain_override: Mapped[str | None] = mapped_column(String(255), nullable=True)
     ddns_ttl: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
+    # ── VRF / routing annotation ─────────────────────────────────────────
+    # Pure metadata. Address-overlap semantics for VRFs are already
+    # handled by having one IPSpace per VRF (overlapping IPs live in
+    # separate IPSpace rows). These columns let the operator record the
+    # canonical VRF name + RD + RT(s) for documentation / change
+    # management; address allocation does not consult them.
+    #
+    # ``route_distinguisher`` is conventionally the ASN:idx
+    # (``65000:100``) or IPv4:idx (``192.0.2.1:1``) form; stored as
+    # plain text since vendor opinions on the canonical form differ
+    # and validation churn buys nothing here.
+    #
+    # ``route_targets`` is a JSONB array of strings to keep room for
+    # the inline "import:A:B; export:C:D" convention; first-class
+    # import / export columns can be split out later without breaking
+    # the data shape.
+    vrf_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    route_distinguisher: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    route_targets: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
+
     blocks: Mapped[list["IPBlock"]] = relationship(
         "IPBlock", back_populates="space", cascade="all, delete-orphan"
     )
@@ -121,7 +151,7 @@ class RouterZone(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     subnets: Mapped[list["Subnet"]] = relationship("Subnet", back_populates="router_zone")
 
 
-class IPBlock(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+class IPBlock(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     """
     Aggregate/supernet range for organizational grouping.
     IPs are not directly assigned to blocks — only to subnets.
@@ -229,7 +259,7 @@ class IPBlock(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     subnets: Mapped[list["Subnet"]] = relationship("Subnet", back_populates="block")
 
 
-class Subnet(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+class Subnet(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     """Primary managed unit. Routable network; IPs are allocated here."""
 
     __tablename__ = "subnet"
@@ -441,6 +471,16 @@ class IPAddress(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     #          discovered | orphan | deprecated
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="available", index=True)
 
+    # Role describes what the IP *is*, orthogonal to status. Allowed values
+    # live in ``IP_ROLES``; null means uncategorised. Roles in
+    # ``IP_ROLES_SHARED`` bypass MAC-collision warnings (intentional sharing).
+    role: Mapped[str | None] = mapped_column(String(20), nullable=True)
+
+    # Reservation TTL — only meaningful when status='reserved'.
+    # The sweep_expired_reservations beat task flips expired rows to
+    # 'available' and clears this column.  Null = indefinite reservation.
+    reserved_until: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
     hostname: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
     fqdn: Mapped[str | None] = mapped_column(String(512), nullable=True)
     mac_address: Mapped[str | None] = mapped_column(MACADDR, nullable=True)
@@ -586,6 +626,70 @@ class CustomFieldDefinition(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     default_value: Mapped[str | None] = mapped_column(String(500), nullable=True)
     display_order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+
+
+class IpMacHistory(UUIDPrimaryKeyMixin, Base):
+    """Per-IP MAC observation log (upsert on every create/update with a MAC).
+
+    Keyed on (ip_address_id, mac_address); last_seen bumped each touch.
+    Cascades on IP delete.
+    """
+
+    __tablename__ = "ip_mac_history"
+    __table_args__ = (
+        UniqueConstraint("ip_address_id", "mac_address", name="uq_ip_mac_history_ip_mac"),
+        Index("ix_ip_mac_history_ip_address_id", "ip_address_id"),
+        Index("ix_ip_mac_history_last_seen", "last_seen"),
+    )
+
+    ip_address_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("ip_address.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    mac_address: Mapped[str] = mapped_column(MACADDR, nullable=False)
+    first_seen: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=sa_text("now()")
+    )
+    last_seen: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=sa_text("now()")
+    )
+
+
+class NATMapping(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """Operator-curated NAT/PAT mapping for IPAM cross-reference.
+
+    Three kinds: ``1to1`` (static NAT), ``pat`` (port translation),
+    ``hide`` (many-to-one masquerade). SpatiumDDI records but does not
+    push these rules; they surface as a nat_mapping_count badge on IP rows.
+    """
+
+    __tablename__ = "nat_mapping"
+    __table_args__ = (
+        Index("ix_nat_mapping_internal_ip", "internal_ip"),
+        Index("ix_nat_mapping_external_ip", "external_ip"),
+        Index("ix_nat_mapping_internal_subnet_id", "internal_subnet_id"),
+    )
+
+    name: Mapped[str] = mapped_column(String(128), nullable=False)
+    kind: Mapped[str] = mapped_column(String(20), nullable=False)  # 1to1 | pat | hide
+
+    internal_ip: Mapped[str | None] = mapped_column(INET, nullable=True)
+    internal_subnet_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("subnet.id", ondelete="SET NULL"), nullable=True
+    )
+    internal_port_start: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    internal_port_end: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    external_ip: Mapped[str | None] = mapped_column(INET, nullable=True)
+    external_port_start: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    external_port_end: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    protocol: Mapped[str] = mapped_column(String(10), nullable=False, default="any")
+    device_label: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    description: Mapped[str | None] = mapped_column(Text, nullable=True)
+    tags: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
+    custom_fields: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
 
 
 class VLANMapping(UUIDPrimaryKeyMixin, Base):

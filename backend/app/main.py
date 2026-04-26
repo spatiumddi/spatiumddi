@@ -69,13 +69,15 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
         [{"action": "read", "resource_type": "*"}],
     ),
     "IPAM Editor": (
-        "Full CRUD on IPAM objects (spaces, blocks, subnets, addresses, VLANs, custom fields).",
+        "Full CRUD on IPAM objects (spaces, blocks, subnets, addresses, VLANs, "
+        "NAT mappings, custom fields).",
         [
             {"action": "admin", "resource_type": "ip_space"},
             {"action": "admin", "resource_type": "ip_block"},
             {"action": "admin", "resource_type": "subnet"},
             {"action": "admin", "resource_type": "ip_address"},
             {"action": "admin", "resource_type": "vlan"},
+            {"action": "admin", "resource_type": "nat_mapping"},
             {"action": "admin", "resource_type": "custom_field"},
         ],
     ),

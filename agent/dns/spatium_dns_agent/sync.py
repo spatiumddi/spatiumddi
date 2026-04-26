@@ -73,9 +73,16 @@ class SyncLoop:
 
         if resp.status_code == 304:
             return
-        if resp.status_code == 401:
-            log.warning("sync_token_expired_will_rebootstrap")
-            # Drop cached token; next bootstrap round gets a new one
+        if resp.status_code in (401, 404):
+            # 401 = token expired/invalid. 404 = the server row was deleted
+            # on the control plane (e.g. operator wiped it, or a fresh
+            # control-plane install with cached creds). Both recover by
+            # the same path: drop cached token and re-bootstrap from PSK.
+            log.warning(
+                "sync_will_rebootstrap",
+                status=resp.status_code,
+                reason="token_invalid" if resp.status_code == 401 else "server_missing",
+            )
             from .cache import save_token
             save_token(self.cfg.state_dir, "")
             self._stop.set()

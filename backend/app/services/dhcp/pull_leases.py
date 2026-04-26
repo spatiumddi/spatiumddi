@@ -52,6 +52,7 @@ from app.models.dhcp import (
     DHCPStaticAssignment,
 )
 from app.models.ipam import IPAddress, Subnet
+from app.services.dhcp.lease_history import record_lease_history
 
 logger = structlog.get_logger(__name__)
 
@@ -182,6 +183,20 @@ async def pull_leases_from_server(
             result.imported += 1
         else:
             if apply:
+                # Detect MAC supersede — same IP, new MAC. Stamp a history
+                # row recording the OLD MAC's tenancy on this IP before
+                # we overwrite it. Comparison is case-insensitive
+                # because postgres MACADDR canonicalises to lower-case
+                # but the wire format from the driver may not.
+                old_mac = str(existing.mac_address) if existing.mac_address else None
+                if old_mac and mac and old_mac.lower() != str(mac).lower():
+                    record_lease_history(
+                        db,
+                        existing,
+                        lease_state="superseded",
+                        expired_at=now,
+                        mac_override=old_mac,
+                    )
                 existing.mac_address = mac
                 existing.hostname = lease.get("hostname") or existing.hostname
                 existing.client_id = lease.get("client_id") or existing.client_id
@@ -285,6 +300,10 @@ async def pull_leases_from_server(
                 await db.delete(mirror)
             result.ipam_revoked += 1
         if apply:
+            # Stamp history before the lease row goes away. ``removed``
+            # signals "operator/server purged the lease before we polled"
+            # vs ``expired`` which is the time-based sweep state.
+            record_lease_history(db, stale, lease_state="removed", expired_at=now)
             await db.delete(stale)
         result.removed += 1
 

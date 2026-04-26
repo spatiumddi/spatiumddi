@@ -25,6 +25,7 @@ import {
   AlertTriangle,
   Filter,
   Lock,
+  Search,
 } from "lucide-react";
 import {
   DndContext,
@@ -41,16 +42,19 @@ import {
   dhcpApi,
   customFieldsApi,
   vlansApi,
+  IP_ROLE_OPTIONS,
   type IPSpace,
   type IPBlock,
   type Subnet,
   type IPAddress,
+  type IPRole,
   type CustomField,
   type DNSZone,
   type FreeCidrRange,
   type Router as NetworkRouter,
   type VLAN,
   type DHCPLeaseSyncResult,
+  type MacHistoryEntry,
 } from "@/lib/api";
 import { copyToClipboard } from "@/lib/clipboard";
 import { cn, swatchTintCls, zebraBodyCls } from "@/lib/utils";
@@ -70,6 +74,11 @@ import {
   SubnetImportExportButton,
 } from "./ImportExportModals";
 import { ResizeBlockModal, ResizeSubnetModal } from "./ResizeModals";
+import {
+  FindFreeModal,
+  MergeSubnetSiblingPicker,
+  SplitSubnetModal,
+} from "./SubnetOpsModals";
 import { cidrContains, compareNetwork } from "@/lib/cidr";
 import { FreeSpaceBand } from "@/components/ipam/FreeSpaceBand";
 import {
@@ -113,6 +122,31 @@ function StatusBadge({ status }: { status: string }) {
       )}
     >
       {status}
+    </span>
+  );
+}
+
+// Compact role badge — paired with StatusBadge in the IP table.
+// ``anycast`` / ``vip`` / ``vrrp`` are intentionally shared roles
+// (the API skips MAC-collision warnings for them) so they get a
+// hint colour the operator can spot at a glance.
+function RoleBadge({ role }: { role: string }) {
+  const SHARED = new Set(["anycast", "vip", "vrrp"]);
+  const cls = SHARED.has(role)
+    ? "bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-300 border border-amber-200/60 dark:border-amber-900/60"
+    : "bg-slate-100 text-slate-700 dark:bg-slate-800/40 dark:text-slate-300 border border-slate-200/60 dark:border-slate-800/60";
+  const tip = SHARED.has(role)
+    ? `${role} — shared-by-design (MAC collisions suppressed)`
+    : role;
+  return (
+    <span
+      title={tip}
+      className={cn(
+        "ml-1 inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium",
+        cls,
+      )}
+    >
+      {role}
     </span>
   );
 }
@@ -1817,6 +1851,8 @@ function AddAddressModal({
   const [mac, setMac] = useState("");
   const [description, setDescription] = useState("");
   const [ipStatus, setIpStatus] = useState("allocated");
+  const [role, setRole] = useState<string>("");
+  const [reservedUntil, setReservedUntil] = useState<string>("");
   const [customFields, setCustomFields] = useState<Record<string, unknown>>({});
   const [dnsZoneId, setDnsZoneId] = useState<string>("");
   const [dhcpScopeId, setDhcpScopeId] = useState<string>("");
@@ -1940,6 +1976,14 @@ function AddAddressModal({
       const cleanedAliases = aliases
         .map((a) => ({ ...a, name: a.name.trim() }))
         .filter((a) => a.name.length > 0);
+      // Local datetime input is naive (browser TZ); convert to ISO
+      // before sending so the API stores an absolute instant. Empty
+      // string means "no TTL" — don't send the field at all.
+      const reservedIso =
+        ipStatus === "reserved" && reservedUntil
+          ? new Date(reservedUntil).toISOString()
+          : undefined;
+      const roleParam = role || undefined;
       const created =
         mode === "next"
           ? await ipamApi.nextAddress(subnetId, {
@@ -1950,6 +1994,8 @@ function AddAddressModal({
               custom_fields: customFields,
               dns_zone_id: zoneParam,
               aliases: cleanedAliases.length ? cleanedAliases : undefined,
+              role: roleParam as IPRole | undefined,
+              reserved_until: reservedIso,
               force,
             })
           : await ipamApi.createAddress({
@@ -1962,6 +2008,8 @@ function AddAddressModal({
               custom_fields: customFields,
               dns_zone_id: zoneParam,
               aliases: cleanedAliases.length ? cleanedAliases : undefined,
+              role: roleParam as IPRole | undefined,
+              reserved_until: reservedIso,
               force,
             });
       // If the user picked a static_dhcp status and a scope, mirror the row
@@ -2150,6 +2198,44 @@ function AddAddressModal({
               ))}
             </select>
           </Field>
+        </div>
+        <div className="grid grid-cols-2 gap-2">
+          <Field label="Role">
+            <select
+              className={inputCls}
+              value={role}
+              onChange={(e) => setRole(e.target.value)}
+            >
+              <option value="">— None —</option>
+              {IP_ROLE_OPTIONS.map((r) => (
+                <option key={r} value={r}>
+                  {r}
+                </option>
+              ))}
+            </select>
+            {role === "vrrp" || role === "vip" || role === "anycast" ? (
+              <p className="mt-1 text-[11px] text-amber-700 dark:text-amber-400">
+                Shared-by-design role — MAC collision warnings are suppressed
+                for this IP.
+              </p>
+            ) : null}
+          </Field>
+          {ipStatus === "reserved" ? (
+            <Field label="Reserved until">
+              <input
+                type="datetime-local"
+                className={inputCls}
+                value={reservedUntil}
+                onChange={(e) => setReservedUntil(e.target.value)}
+              />
+              <p className="mt-1 text-[11px] text-muted-foreground">
+                Optional TTL. The reservation sweep returns this IP to{" "}
+                <em>available</em> after this time.
+              </p>
+            </Field>
+          ) : (
+            <div />
+          )}
         </div>
         {needsDhcpScope && (
           <Field label="DHCP Scope">
@@ -2505,6 +2591,8 @@ function SubnetDetail({
   const [showAddModal, setShowAddModal] = useState(false);
   const [showEditSubnet, setShowEditSubnet] = useState(false);
   const [showResizeSubnet, setShowResizeSubnet] = useState(false);
+  const [showSplitSubnet, setShowSplitSubnet] = useState(false);
+  const [showMergeSubnet, setShowMergeSubnet] = useState(false);
   const [showDnsSync, setShowDnsSync] = useState(false);
   const [showDhcpSync, setShowDhcpSync] = useState(false);
   const [showSyncAll, setShowSyncAll] = useState(false);
@@ -2917,6 +3005,18 @@ function SubnetDetail({
               title="Grow this subnet to a larger CIDR (e.g. /24 → /23). Shrinking is not supported."
             >
               Resize…
+            </HeaderButton>
+            <HeaderButton
+              onClick={() => setShowSplitSubnet(true)}
+              title="Split this subnet into 2^k aligned children at a longer prefix"
+            >
+              Split…
+            </HeaderButton>
+            <HeaderButton
+              onClick={() => setShowMergeSubnet(true)}
+              title="Merge this subnet with one or more contiguous siblings"
+            >
+              Merge…
             </HeaderButton>
             <HeaderButton
               variant="primary"
@@ -3512,6 +3612,14 @@ function SubnetDetail({
                                         : "aliases"}
                                     </span>
                                   )}
+                                  {(addr.nat_mapping_count ?? 0) > 0 && (
+                                    <span
+                                      className="inline-flex items-center rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 dark:bg-amber-900/30 dark:text-amber-400"
+                                      title={`Referenced in ${addr.nat_mapping_count} NAT mapping${(addr.nat_mapping_count ?? 0) === 1 ? "" : "s"} — see /ipam/nat`}
+                                    >
+                                      NAT
+                                    </span>
+                                  )}
                                 </span>
                               </td>
                               <td className="px-4 py-2 font-mono text-xs">
@@ -3579,7 +3687,12 @@ function SubnetDetail({
                                 })()}
                               </td>
                               <td className="px-4 py-2">
-                                <StatusBadge status={addr.status} />
+                                <span className="inline-flex items-center">
+                                  <StatusBadge status={addr.status} />
+                                  {addr.role ? (
+                                    <RoleBadge role={addr.role} />
+                                  ) : null}
+                                </span>
                               </td>
                               <td className="px-4 py-2">
                                 {(() => {
@@ -3790,6 +3903,29 @@ function SubnetDetail({
             // Refresh the subnet in-place so the header reflects the new
             // CIDR without remounting the whole view.
             onSubnetEdited(result.subnet);
+          }}
+        />
+      )}
+      {showSplitSubnet && (
+        <SplitSubnetModal
+          subnet={subnet}
+          onClose={() => setShowSplitSubnet(false)}
+          onCommitted={() => {
+            qc.invalidateQueries({ queryKey: ["subnets"] });
+            qc.invalidateQueries({ queryKey: ["blocks"] });
+            // Parent subnet was deleted; bounce back to the space.
+            onSubnetDeleted?.();
+          }}
+        />
+      )}
+      {showMergeSubnet && (
+        <MergeSubnetSiblingPicker
+          subnet={subnet}
+          onClose={() => setShowMergeSubnet(false)}
+          onCommitted={() => {
+            qc.invalidateQueries({ queryKey: ["subnets"] });
+            qc.invalidateQueries({ queryKey: ["blocks"] });
+            onSubnetDeleted?.();
           }}
         />
       )}
@@ -5313,11 +5449,20 @@ function EditAddressModal({
   const [description, setDescription] = useState(address.description ?? "");
   const [macAddress, setMacAddress] = useState(address.mac_address ?? "");
   const [status, setStatus] = useState(address.status);
+  const [role, setRole] = useState<string>(address.role ?? "");
+  // datetime-local needs ``YYYY-MM-DDTHH:MM`` (no seconds, no TZ).
+  // Trim trailing seconds + drop the trailing ``Z`` if present.
+  const [reservedUntil, setReservedUntil] = useState<string>(
+    address.reserved_until
+      ? new Date(address.reserved_until).toISOString().slice(0, 16)
+      : "",
+  );
   const [customFields, setCustomFields] = useState<Record<string, unknown>>(
     (address.custom_fields as Record<string, unknown>) ?? {},
   );
   const [dnsZoneId, setDnsZoneId] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
+  const [showMacHistory, setShowMacHistory] = useState(false);
   const [pendingWarnings, setPendingWarnings] = useState<
     CollisionWarning[] | null
   >(null);
@@ -5416,16 +5561,27 @@ function EditAddressModal({
       : null;
 
   const mutation = useMutation({
-    mutationFn: (force: boolean) =>
-      ipamApi.updateAddress(address.id, {
+    mutationFn: (force: boolean) => {
+      // Empty string on role → null (clears the field).
+      // Empty string on reservedUntil → null when status=reserved
+      // (= no TTL); when status moved off reserved we still send
+      // null so the backend's safety guard can clear it explicitly.
+      const reservedIso =
+        status === "reserved" && reservedUntil
+          ? new Date(reservedUntil).toISOString()
+          : null;
+      return ipamApi.updateAddress(address.id, {
         hostname: hostname || undefined,
         description: description || undefined,
         mac_address: macAddress || undefined,
         status,
         custom_fields: customFields,
         dns_zone_id: dnsZoneId || undefined,
+        role: (role || null) as IPRole | null,
+        reserved_until: reservedIso,
         force,
-      }),
+      });
+    },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["addresses", address.subnet_id] });
       qc.invalidateQueries({ queryKey: ["dns-records"] });
@@ -5529,6 +5685,53 @@ function EditAddressModal({
             ))}
           </select>
         </Field>
+        <div className="grid grid-cols-2 gap-2">
+          <Field label="Role">
+            <select
+              className={inputCls}
+              value={role}
+              onChange={(e) => setRole(e.target.value)}
+            >
+              <option value="">— None —</option>
+              {IP_ROLE_OPTIONS.map((r) => (
+                <option key={r} value={r}>
+                  {r}
+                </option>
+              ))}
+            </select>
+            {role === "vrrp" || role === "vip" || role === "anycast" ? (
+              <p className="mt-1 text-[11px] text-amber-700 dark:text-amber-400">
+                Shared-by-design role — MAC collision warnings are suppressed.
+              </p>
+            ) : null}
+          </Field>
+          {status === "reserved" ? (
+            <Field label="Reserved until">
+              <input
+                type="datetime-local"
+                className={inputCls}
+                value={reservedUntil}
+                onChange={(e) => setReservedUntil(e.target.value)}
+              />
+              <p className="mt-1 text-[11px] text-muted-foreground">
+                Optional TTL — auto-released after this time.
+              </p>
+            </Field>
+          ) : (
+            <div />
+          )}
+        </div>
+        {address.mac_address ? (
+          <div className="-mt-1 mb-1">
+            <button
+              type="button"
+              onClick={() => setShowMacHistory(true)}
+              className="rounded-md border px-2 py-1 text-xs text-muted-foreground hover:bg-muted"
+            >
+              MAC history…
+            </button>
+          </div>
+        ) : null}
 
         <Field label="DNS Aliases">
           <div className="space-y-1.5">
@@ -5638,6 +5841,80 @@ function EditAddressModal({
                 : "Save"}
           </button>
         </div>
+      </div>
+      {showMacHistory && (
+        <MacHistoryModal
+          address={address}
+          onClose={() => setShowMacHistory(false)}
+        />
+      )}
+    </Modal>
+  );
+}
+
+function MacHistoryModal({
+  address,
+  onClose,
+}: {
+  address: IPAddress;
+  onClose: () => void;
+}) {
+  const { data: history = [], isLoading } = useQuery<MacHistoryEntry[]>({
+    queryKey: ["mac-history", address.id],
+    queryFn: () => ipamApi.listMacHistory(address.id),
+  });
+  return (
+    <Modal title={`MAC history — ${address.address}`} onClose={onClose} wide>
+      <div className="space-y-3">
+        <p className="text-xs text-muted-foreground">
+          Every distinct MAC ever assigned to this IP, newest activity first.
+          ``last_seen`` bumps on every IP write that carries the same MAC; a MAC
+          change appends a new row instead of overwriting the previous one.
+        </p>
+        {isLoading ? (
+          <p className="text-sm text-muted-foreground">Loading…</p>
+        ) : history.length === 0 ? (
+          <p className="text-sm text-muted-foreground">
+            No MAC observations recorded for this IP yet.
+          </p>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full min-w-[480px] text-sm">
+              <thead>
+                <tr className="border-b bg-muted/40 text-xs">
+                  <th className="px-3 py-1.5 text-left font-medium">MAC</th>
+                  <th className="px-3 py-1.5 text-left font-medium">Vendor</th>
+                  <th className="px-3 py-1.5 text-left font-medium">
+                    First seen
+                  </th>
+                  <th className="px-3 py-1.5 text-left font-medium">
+                    Last seen
+                  </th>
+                </tr>
+              </thead>
+              <tbody className={zebraBodyCls}>
+                {history.map((row) => (
+                  <tr key={row.id} className="border-b last:border-0">
+                    <td className="px-3 py-1.5 font-mono text-xs">
+                      {row.mac_address}
+                    </td>
+                    <td className="px-3 py-1.5 text-xs text-muted-foreground">
+                      {row.vendor ?? (
+                        <span className="text-muted-foreground/40">—</span>
+                      )}
+                    </td>
+                    <td className="px-3 py-1.5 text-xs text-muted-foreground">
+                      {new Date(row.first_seen).toLocaleString()}
+                    </td>
+                    <td className="px-3 py-1.5 text-xs text-muted-foreground">
+                      {new Date(row.last_seen).toLocaleString()}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
       </div>
     </Modal>
   );
@@ -5787,6 +6064,10 @@ function BulkEditAddressesModal({
   const [editCustomFields, setEditCustomFields] = useState(false);
   const [editDnsZone, setEditDnsZone] = useState(false);
   const [dnsZoneId, setDnsZoneId] = useState<string>("");
+  const [editRole, setEditRole] = useState(false);
+  const [role, setRole] = useState<string>("");
+  const [editReservedUntil, setEditReservedUntil] = useState(false);
+  const [reservedUntil, setReservedUntil] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
 
   const { data: cfDefs = [] } = useQuery({
@@ -5855,9 +6136,20 @@ function BulkEditAddressesModal({
         tags?: Record<string, unknown>;
         custom_fields?: Record<string, unknown>;
         dns_zone_id?: string;
+        role?: IPRole | "" | null;
+        reserved_until?: string | null;
       } = {};
       if (editStatus) changes.status = status;
       if (editDescription) changes.description = description;
+      if (editRole) {
+        // Empty string clears the role on every selected IP.
+        changes.role = (role || "") as IPRole | "";
+      }
+      if (editReservedUntil) {
+        changes.reserved_until = reservedUntil
+          ? new Date(reservedUntil).toISOString()
+          : null;
+      }
 
       if (editTags) {
         const tagsObj: Record<string, unknown> = {};
@@ -5930,7 +6222,9 @@ function BulkEditAddressesModal({
     editDescription ||
     hasTagChanges ||
     hasCfChanges ||
-    editDnsZone;
+    editDnsZone ||
+    editRole ||
+    editReservedUntil;
 
   return (
     <Modal title={`Bulk edit ${ipIds.length} IP addresses`} onClose={onClose}>
@@ -5988,6 +6282,58 @@ function BulkEditAddressesModal({
               onChange={(e) => setDescription(e.target.value)}
               placeholder="Replace description with…"
             />
+          )}
+        </div>
+
+        <div className="rounded-md border p-3 space-y-2">
+          <label className="flex items-center gap-2 text-sm font-medium">
+            <input
+              type="checkbox"
+              checked={editRole}
+              onChange={(e) => setEditRole(e.target.checked)}
+            />
+            Role
+          </label>
+          {editRole && (
+            <select
+              className={inputCls}
+              value={role}
+              onChange={(e) => setRole(e.target.value)}
+            >
+              <option value="">— None (clear) —</option>
+              {IP_ROLE_OPTIONS.map((r) => (
+                <option key={r} value={r}>
+                  {r}
+                </option>
+              ))}
+            </select>
+          )}
+        </div>
+
+        <div className="rounded-md border p-3 space-y-2">
+          <label className="flex items-center gap-2 text-sm font-medium">
+            <input
+              type="checkbox"
+              checked={editReservedUntil}
+              onChange={(e) => setEditReservedUntil(e.target.checked)}
+            />
+            Reserved until
+          </label>
+          {editReservedUntil && (
+            <>
+              <input
+                type="datetime-local"
+                className={inputCls}
+                value={reservedUntil}
+                onChange={(e) => setReservedUntil(e.target.value)}
+              />
+              <p className="text-[11px] text-muted-foreground">
+                Sets the TTL on every selected IP. Leave blank to clear the TTL
+                (= indefinite reservation). The reservation sweep flips expired
+                rows back to
+                <em> available</em>.
+              </p>
+            </>
           )}
         </div>
 
@@ -6683,10 +7029,27 @@ function EditSpaceModal({
   const [dhcpServerGroupId, setDhcpServerGroupId] = useState<string | null>(
     space.dhcp_server_group_id ?? null,
   );
+  // VRF / routing annotation — pure metadata, no semantic effect on
+  // address allocation. The collapsible section keeps the modal tidy
+  // for operators who don't run multiple VRFs.
+  const [showVrf, setShowVrf] = useState<boolean>(true);
+  const [vrfName, setVrfName] = useState<string>(space.vrf_name ?? "");
+  const [routeDistinguisher, setRouteDistinguisher] = useState<string>(
+    space.route_distinguisher ?? "",
+  );
+  // Stored as a single comma- / newline-separated string in the form
+  // for ergonomics — split into a list on save.
+  const [routeTargetsText, setRouteTargetsText] = useState<string>(
+    (space.route_targets ?? []).join("\n"),
+  );
 
   const saveMutation = useMutation({
-    mutationFn: () =>
-      ipamApi.updateSpace(space.id, {
+    mutationFn: () => {
+      const trimmedRTs = routeTargetsText
+        .split(/[,\n]+/g)
+        .map((s) => s.trim())
+        .filter((s) => s.length > 0);
+      return ipamApi.updateSpace(space.id, {
         name,
         description,
         color,
@@ -6694,7 +7057,11 @@ function EditSpaceModal({
         dns_zone_id: dnsZoneId,
         dns_additional_zone_ids: dnsAdditionalZoneIds,
         dhcp_server_group_id: dhcpServerGroupId,
-      }),
+        vrf_name: vrfName.trim() || null,
+        route_distinguisher: routeDistinguisher.trim() || null,
+        route_targets: showVrf ? trimmedRTs : null,
+      });
+    },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["spaces"] });
       onClose();
@@ -6857,6 +7224,57 @@ function EditSpaceModal({
             onInheritChange={() => {}}
             onServerGroupIdChange={setDhcpServerGroupId}
           />
+        </div>
+
+        {/* VRF / routing annotation — collapsible because most homelab
+            and small deployments don't run a multi-VRF fabric. */}
+        <div className="border-t pt-3">
+          <button
+            type="button"
+            onClick={() => setShowVrf((s) => !s)}
+            className="flex items-center gap-1 text-xs font-semibold text-muted-foreground uppercase tracking-wide hover:text-foreground"
+          >
+            {showVrf ? (
+              <ChevronDown className="h-3 w-3" />
+            ) : (
+              <ChevronRight className="h-3 w-3" />
+            )}
+            VRF / Routing (optional)
+          </button>
+          {showVrf && (
+            <div className="mt-2 space-y-2">
+              <Field label="VRF name">
+                <input
+                  className={inputCls}
+                  value={vrfName}
+                  onChange={(e) => setVrfName(e.target.value)}
+                  placeholder="e.g. CORP-RED"
+                />
+              </Field>
+              <Field label="Route distinguisher">
+                <input
+                  className={inputCls}
+                  value={routeDistinguisher}
+                  onChange={(e) => setRouteDistinguisher(e.target.value)}
+                  placeholder="e.g. 65000:100"
+                />
+              </Field>
+              <Field label="Route targets (comma- or newline-separated)">
+                <textarea
+                  className={inputCls}
+                  rows={3}
+                  value={routeTargetsText}
+                  onChange={(e) => setRouteTargetsText(e.target.value)}
+                  placeholder={"import:65000:100\nexport:65000:200"}
+                />
+              </Field>
+              <p className="text-xs text-muted-foreground">
+                Pure annotation — address allocation does not consult these
+                fields. Different VRFs with overlapping IPs already work via
+                separate IPSpace rows.
+              </p>
+            </div>
+          )}
         </div>
 
         <div className="flex justify-end gap-2 pt-2">
@@ -7642,6 +8060,7 @@ function BlockDetailView({
   ancestors,
   allBlocks,
   allSubnets,
+  space,
   onSelectSpace,
   onSelectBlock,
   onSelectSubnet,
@@ -7651,6 +8070,7 @@ function BlockDetailView({
   ancestors: IPBlock[];
   allBlocks: IPBlock[];
   allSubnets: Subnet[];
+  space?: IPSpace;
   onSelectSpace: () => void;
   onSelectBlock: (b: IPBlock) => void;
   onSelectSubnet: (s: Subnet) => void;
@@ -7674,6 +8094,9 @@ function BlockDetailView({
   const [showBulkEdit, setShowBulkEdit] = useState(false);
   const [showBulkDelete, setShowBulkDelete] = useState(false);
   const [showDnsSync, setShowDnsSync] = useState(false);
+  const [showFindFree, setShowFindFree] = useState(false);
+  const [showSplitSubnet, setShowSplitSubnet] = useState(false);
+  const [showMergeSubnet, setShowMergeSubnet] = useState(false);
 
   const qc = useQueryClient();
 
@@ -7781,6 +8204,16 @@ function BlockDetailView({
                 >
                   Bulk Edit ({selectedSubnets.size})
                 </HeaderButton>
+                {selectedSubnets.size === 1 && (
+                  <HeaderButton onClick={() => setShowSplitSubnet(true)}>
+                    Split…
+                  </HeaderButton>
+                )}
+                {selectedSubnets.size >= 2 && (
+                  <HeaderButton onClick={() => setShowMergeSubnet(true)}>
+                    Merge…
+                  </HeaderButton>
+                )}
                 <HeaderButton
                   variant="destructive"
                   icon={Trash2}
@@ -7802,6 +8235,15 @@ function BlockDetailView({
                   Sync DNS
                 </HeaderButton>
                 <ExportButton scope={{ block_id: block.id }} label="Export" />
+                {space && (
+                  <HeaderButton
+                    icon={Search}
+                    onClick={() => setShowFindFree(true)}
+                    title="Find unused CIDRs in this block"
+                  >
+                    Find Free…
+                  </HeaderButton>
+                )}
                 <HeaderButton icon={Pencil} onClick={() => setShowEdit(true)}>
                   Edit
                 </HeaderButton>
@@ -7928,8 +8370,8 @@ function BlockDetailView({
       {showBulkDelete && (
         <ConfirmDestroyModal
           title={`Delete ${selectedSubnets.size} Subnet${selectedSubnets.size === 1 ? "" : "s"}`}
-          description={`This will permanently delete ${selectedSubnets.size} subnet${selectedSubnets.size === 1 ? "" : "s"} and all IP address records within them.`}
-          checkLabel="I understand all IP addresses in these subnets will be permanently deleted."
+          description={`This will move ${selectedSubnets.size} subnet${selectedSubnets.size === 1 ? "" : "s"} to Trash. You can restore from Admin → Trash within 30 days.`}
+          checkLabel={`I understand ${selectedSubnets.size} subnet${selectedSubnets.size === 1 ? "" : "s"} will be moved to Trash.`}
           isPending={blockBulkDeleteMut.isPending}
           error={blockBulkDeleteError}
           onClose={() => {
@@ -7942,6 +8384,48 @@ function BlockDetailView({
           }}
         />
       )}
+      {showFindFree && space && (
+        <FindFreeModal
+          space={space}
+          defaultBlockId={block.id}
+          onClose={() => setShowFindFree(false)}
+          onPickCidr={(cidr) => {
+            setFreeRangePreset({ network: cidr, first: "", last: "", size: 0, prefix_len: 0 });
+            setShowFindFree(false);
+            setShowCreateSubnet(true);
+          }}
+        />
+      )}
+      {showSplitSubnet && (() => {
+        const subnetId = Array.from(selectedSubnets)[0];
+        const sn = allSubnets.find((s) => s.id === subnetId);
+        return sn ? (
+          <SplitSubnetModal
+            subnet={sn}
+            onClose={() => setShowSplitSubnet(false)}
+            onCommitted={() => {
+              setShowSplitSubnet(false);
+              setSelectedSubnets(new Set());
+              qc.invalidateQueries({ queryKey: ["subnets"] });
+            }}
+          />
+        ) : null;
+      })()}
+      {showMergeSubnet && (() => {
+        const subnetId = Array.from(selectedSubnets)[0];
+        const sn = allSubnets.find((s) => s.id === subnetId);
+        return sn ? (
+          <MergeSubnetSiblingPicker
+            subnet={sn}
+            onClose={() => setShowMergeSubnet(false)}
+            onCommitted={() => {
+              setShowMergeSubnet(false);
+              setSelectedSubnets(new Set());
+              qc.invalidateQueries({ queryKey: ["subnets"] });
+            }}
+          />
+        ) : null;
+      })()}
       <div className="flex-1 overflow-auto">
         {(() => {
           // Build a synthetic BlockNode for the current block so flattenToTableRows
@@ -8482,6 +8966,13 @@ function SpaceTableView({
   const [showEditSpace, setShowEditSpace] = useState(false);
   const [showCreateBlock, setShowCreateBlock] = useState(false);
   const [showCreateSubnet, setShowCreateSubnet] = useState(false);
+  const [showFindFree, setShowFindFree] = useState(false);
+  const [findFreePrefill, setFindFreePrefill] = useState<{
+    network: string;
+    blockId: string;
+  } | null>(null);
+  const [showSplitSubnet, setShowSplitSubnet] = useState(false);
+  const [showMergeSubnet, setShowMergeSubnet] = useState(false);
   const [showSpaceFilters, setShowSpaceFilters] = useState(false);
   const [spaceFilter, setSpaceFilter] = useState({
     network: "",
@@ -8600,6 +9091,9 @@ function SpaceTableView({
   }
   const selectedCount = selected.size;
   const hasBlocksSelected = [...selected].some((k) => k.startsWith("block:"));
+  const selectedSubnetIds = [...selected]
+    .filter((k) => k.startsWith("subnet:"))
+    .map((k) => k.slice("subnet:".length));
 
   const hasSpaceFilter = Object.values(spaceFilter).some(Boolean);
   const filteredSpaceRows = hasSpaceFilter
@@ -8686,6 +9180,22 @@ function SpaceTableView({
                     Bulk Edit ({selectedCount})
                   </HeaderButton>
                 )}
+                {!hasBlocksSelected && selectedSubnetIds.length === 1 && (
+                  <HeaderButton
+                    onClick={() => setShowSplitSubnet(true)}
+                    title="Split this subnet into 2^k aligned children"
+                  >
+                    Split…
+                  </HeaderButton>
+                )}
+                {!hasBlocksSelected && selectedSubnetIds.length >= 2 && (
+                  <HeaderButton
+                    onClick={() => setShowMergeSubnet(true)}
+                    title="Merge contiguous sibling subnets"
+                  >
+                    Merge…
+                  </HeaderButton>
+                )}
                 <HeaderButton
                   variant="destructive"
                   icon={Trash2}
@@ -8703,6 +9213,13 @@ function SpaceTableView({
               Sync DNS
             </HeaderButton>
             <ExportButton scope={{ space_id: space.id }} label="Export" />
+            <HeaderButton
+              icon={Search}
+              onClick={() => setShowFindFree(true)}
+              title="Find unused CIDRs in this space"
+            >
+              Find Free…
+            </HeaderButton>
             <HeaderButton icon={Pencil} onClick={() => setShowEditSpace(true)}>
               Edit Space
             </HeaderButton>
@@ -8725,6 +9242,38 @@ function SpaceTableView({
           <h2 className="text-base font-semibold">{space.name}</h2>
           {space.description && (
             <p className="text-xs text-muted-foreground">{space.description}</p>
+          )}
+          {(space.vrf_name ||
+            space.route_distinguisher ||
+            (space.route_targets && space.route_targets.length > 0)) ? (
+            <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+              {space.vrf_name && (
+                <span className="rounded border px-1.5 py-0.5 font-mono">
+                  VRF: {space.vrf_name}
+                </span>
+              )}
+              {space.route_distinguisher && (
+                <span className="rounded border px-1.5 py-0.5 font-mono">
+                  RD: {space.route_distinguisher}
+                </span>
+              )}
+              {space.route_targets && space.route_targets.length > 0 && (
+                <span className="rounded border px-1.5 py-0.5 font-mono">
+                  RT: {space.route_targets.join(", ")}
+                </span>
+              )}
+            </div>
+          ) : (
+            <p className="mt-1 text-xs text-muted-foreground/50">
+              VRF / Routing — not configured{" "}
+              <button
+                type="button"
+                onClick={() => setShowEditSpace(true)}
+                className="underline hover:text-muted-foreground"
+              >
+                (Edit Space to add)
+              </button>
+            </p>
           )}
         </div>
       </div>
@@ -9121,9 +9670,53 @@ function SpaceTableView({
       {showCreateSubnet && (
         <CreateSubnetModal
           spaceId={space.id}
-          onClose={() => setShowCreateSubnet(false)}
+          defaultBlockId={findFreePrefill?.blockId}
+          defaultNetwork={findFreePrefill?.network}
+          onClose={() => {
+            setShowCreateSubnet(false);
+            setFindFreePrefill(null);
+          }}
         />
       )}
+      {showFindFree && (
+        <FindFreeModal
+          space={space}
+          onClose={() => setShowFindFree(false)}
+          onPickCidr={(cidr, blockId) => {
+            setFindFreePrefill({ network: cidr, blockId });
+            setShowFindFree(false);
+            setShowCreateSubnet(true);
+          }}
+        />
+      )}
+      {showSplitSubnet && (() => {
+        const sn = subnets?.find((s) => s.id === selectedSubnetIds[0]);
+        return sn ? (
+          <SplitSubnetModal
+            subnet={sn}
+            onClose={() => setShowSplitSubnet(false)}
+            onCommitted={() => {
+              setShowSplitSubnet(false);
+              setSelected(new Set());
+              qc.invalidateQueries({ queryKey: ["subnets", space.id] });
+            }}
+          />
+        ) : null;
+      })()}
+      {showMergeSubnet && (() => {
+        const sn = subnets?.find((s) => s.id === selectedSubnetIds[0]);
+        return sn ? (
+          <MergeSubnetSiblingPicker
+            subnet={sn}
+            onClose={() => setShowMergeSubnet(false)}
+            onCommitted={() => {
+              setShowMergeSubnet(false);
+              setSelected(new Set());
+              qc.invalidateQueries({ queryKey: ["subnets", space.id] });
+            }}
+          />
+        ) : null;
+      })()}
       {showBulkDelete &&
         (() => {
           const subnetCount = [...selected].filter((k) =>
@@ -9141,12 +9734,8 @@ function SpaceTableView({
           return (
             <ConfirmDestroyModal
               title={`Delete ${summary}`}
-              description={`This will permanently delete ${summary}${
-                subnetCount
-                  ? " and all IP address records within the selected subnets"
-                  : ""
-              }. Only leaf blocks (no child blocks or subnets) are selectable.`}
-              checkLabel={`I understand this is permanent.`}
+              description={`This will move ${summary} to Trash. You can restore from Admin → Trash within 30 days. Only leaf blocks (no child blocks or subnets) are selectable.`}
+              checkLabel={`I understand ${summary} will be moved to Trash.`}
               isPending={bulkDeleteMut.isPending}
               error={spaceBulkDeleteError}
               onClose={() => {
@@ -9980,6 +10569,9 @@ export function IPAMPage() {
               spaces?.find((s: IPSpace) => s.id === selectedBlock.space_id)
                 ?.name ?? ""
             }
+            space={spaces?.find(
+              (s: IPSpace) => s.id === selectedBlock.space_id,
+            )}
             ancestors={selectedBlockAncestors}
             allBlocks={detailBlocks ?? []}
             allSubnets={detailSubnets ?? []}

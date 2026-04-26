@@ -72,6 +72,14 @@ def run(cfg: AgentConfig) -> int:
         if not driver.daemon_running() and cfg.driver == "bind9":
             log.error("dns_daemon_exited", driver=cfg.driver)
             return 2
+        # If any critical thread died (e.g. the sync loop dropped its
+        # token after a 401/404 and self-stopped), exit so the container
+        # orchestrator restarts us — bootstrap then re-registers from
+        # PSK with a fresh empty token cache.
+        dead = [t.name for t in threads if not t.is_alive()]
+        if dead:
+            log.error("dns_agent_thread_died", threads=dead)
+            return 2
 
     log.info("dns_agent_exiting")
     return 0

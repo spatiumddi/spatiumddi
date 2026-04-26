@@ -41,6 +41,19 @@ spec:
             - --loglevel=info
           env:
             {{- include "spatiumddi.commonEnv" . | nindent 12 }}
+          # Beat has no broker-reachable identity (it only enqueues, it
+          # doesn't accept ``inspect ping``). Cheapest accurate signal:
+          # check the celery process is still pid 1 of the container.
+          livenessProbe:
+            exec:
+              command:
+                - sh
+                - -c
+                - grep -q celery /proc/1/cmdline
+            initialDelaySeconds: 15
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
           resources:
             {{- toYaml .Values.beat.resources | nindent 12 }}
       {{- with .Values.beat.nodeSelector }}

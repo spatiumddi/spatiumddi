@@ -17,9 +17,10 @@ from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
 from app.celery_app import celery_app
-from app.db import AsyncSessionLocal
+from app.db import task_session
 from app.models.dhcp import DHCPLease
 from app.models.ipam import IPAddress
+from app.services.dhcp.lease_history import record_lease_history
 
 logger = structlog.get_logger(__name__)
 
@@ -30,7 +31,7 @@ EXPIRY_GRACE = timedelta(minutes=5)
 
 async def _sweep() -> int:
     cutoff = datetime.now(UTC) - EXPIRY_GRACE
-    async with AsyncSessionLocal() as db:
+    async with task_session() as db:
         # Find any active-marked lease whose actual expiry passed the grace.
         res = await db.execute(
             select(DHCPLease).where(
@@ -45,7 +46,13 @@ async def _sweep() -> int:
         # ddns_enabled, so calling it unconditionally is cheap.
         from app.services.dns.ddns import revoke_ddns_for_lease  # noqa: PLC0415
 
+        now_ts = datetime.now(UTC)
         for lease in res.scalars().all():
+            # Stamp lease history before flipping state. ``expired`` is
+            # the time-based sweep label (vs ``removed`` from the
+            # pull-leases absence-delete branch) so consumers can tell
+            # the two apart.
+            record_lease_history(db, lease, lease_state="expired", expired_at=now_ts)
             lease.state = "expired"
             # Remove mirrored IPAM row if auto_from_lease.
             ipam_res = await db.execute(

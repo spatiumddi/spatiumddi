@@ -27,6 +27,8 @@ import {
   Container as ContainerIcon,
   HardDrive,
   Waypoints,
+  Shuffle,
+  Trash2,
   X,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -36,7 +38,8 @@ import logoIcon from "@/assets/logo-icon.svg";
 
 const baseMainNav = [
   { label: "Dashboard", icon: LayoutDashboard, to: "/dashboard" },
-  { label: "IPAM", icon: Network, to: "/ipam" },
+  { label: "IPAM", icon: Network, to: "/ipam", end: true },
+  { label: "NAT mappings", icon: Shuffle, to: "/ipam/nat" },
   { label: "DHCP", icon: Server, to: "/dhcp" },
   { label: "DNS", icon: Globe, to: "/dns" },
   { label: "VLANs", icon: RouterIcon, to: "/vlans" },
@@ -52,6 +55,7 @@ const adminNav = [
   { label: "Groups", icon: UsersRound, to: "/admin/groups" },
   { label: "Roles", icon: KeyRound, to: "/admin/roles" },
   { label: "Settings", icon: Settings, to: "/settings" },
+  { label: "Trash", icon: Trash2, to: "/admin/trash" },
   { label: "Users", icon: Users, to: "/admin/users" },
 ];
 
@@ -106,6 +110,7 @@ function NavItem({
   disabled,
   collapsed,
   onNavigate,
+  end,
 }: {
   label: string;
   icon: React.ElementType;
@@ -113,10 +118,12 @@ function NavItem({
   disabled?: boolean;
   collapsed: boolean;
   onNavigate?: () => void;
+  end?: boolean;
 }) {
   return (
     <NavLink
       to={to}
+      end={end}
       aria-disabled={disabled}
       tabIndex={disabled ? -1 : undefined}
       title={collapsed ? label : undefined}

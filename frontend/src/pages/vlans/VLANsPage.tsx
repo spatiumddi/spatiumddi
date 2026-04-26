@@ -335,6 +335,13 @@ function RouterDetail({
           >
             Delete
           </HeaderButton>
+          <HeaderButton
+            variant="primary"
+            icon={Plus}
+            onClick={() => setShowCreateVlan(true)}
+          >
+            New VLAN
+          </HeaderButton>
         </div>
       </div>
 
@@ -353,12 +360,6 @@ function RouterDetail({
             VLANs{" "}
             <span className="text-muted-foreground">({vlans.length})</span>
           </h3>
-          <button
-            onClick={() => setShowCreateVlan(true)}
-            className="rounded-md border px-2 py-1 text-xs hover:bg-muted"
-          >
-            <Plus className="h-3 w-3 inline mr-1" /> New VLAN
-          </button>
         </div>
         <div className="overflow-x-auto">
           <table className="w-full min-w-[560px] text-xs">

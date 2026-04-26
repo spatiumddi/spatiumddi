@@ -42,6 +42,8 @@ spec:
             {{- with .Values.api.env }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
+          # Liveness — "process responds to HTTP". Deliberately shallow:
+          # a transient Postgres blip should not trigger a pod restart.
           livenessProbe:
             httpGet:
               path: /health/live
@@ -49,12 +51,17 @@ spec:
             initialDelaySeconds: 10
             periodSeconds: 15
             failureThreshold: 3
+          # Readiness — "can actually serve traffic". /health/ready
+          # checks DB + Redis connectivity, so an api pod that can't
+          # reach its dependencies is taken out of the LB rotation
+          # instead of returning 5xx to clients.
           readinessProbe:
             httpGet:
-              path: /health/live
+              path: /health/ready
               port: http
             initialDelaySeconds: 5
             periodSeconds: 10
+            failureThreshold: 3
           resources:
             {{- toYaml .Values.api.resources | nindent 12 }}
       {{- with .Values.api.nodeSelector }}

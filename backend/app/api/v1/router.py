@@ -1,6 +1,7 @@
 from fastapi import APIRouter
 
 from app.api.v1.acme import router as acme_router
+from app.api.v1.admin.trash import router as trash_router
 from app.api.v1.alerts.router import router as alerts_router
 from app.api.v1.api_tokens.router import router as api_tokens_router
 from app.api.v1.audit.router import router as audit_router
@@ -55,3 +56,4 @@ api_v1_router.include_router(kubernetes_router, prefix="/kubernetes", tags=["kub
 api_v1_router.include_router(docker_router, prefix="/docker", tags=["docker"])
 api_v1_router.include_router(proxmox_router, prefix="/proxmox", tags=["proxmox"])
 api_v1_router.include_router(tailscale_router, prefix="/tailscale", tags=["tailscale"])
+api_v1_router.include_router(trash_router, prefix="/admin", tags=["admin-trash"])
