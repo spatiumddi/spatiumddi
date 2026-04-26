@@ -16,6 +16,7 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.dns import DNSRecord, DNSServerGroup, DNSZone
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
 from app.models.tailscale import TailscaleTenant
 from app.services.tailscale.client import _TailscaleDevice
@@ -500,3 +501,273 @@ async def test_reconcile_deletes_unlocked_row_when_device_disappears(
         .all()
     )
     assert rows == []
+
+
+# ── Phase 2: synthetic DNS zone + records ─────────────────────────────
+
+
+async def _make_dns_group(db: AsyncSession) -> DNSServerGroup:
+    grp = DNSServerGroup(name=f"ts-grp-{uuid.uuid4().hex[:6]}")
+    db.add(grp)
+    await db.flush()
+    return grp
+
+
+@pytest.mark.asyncio
+async def test_phase2_synthesises_zone_and_records(
+    db_session: AsyncSession,
+) -> None:
+    """Tenant with a bound dns_group_id materialises ``<tailnet>.ts.net``
+    + one A/AAAA record per device address. Idempotent — second pass
+    creates nothing new and deletes nothing."""
+    space = await _make_space(db_session)
+    grp = await _make_dns_group(db_session)
+    tenant = await _make_tenant(db_session, space)
+    tenant.api_key_encrypted = b"x"
+    tenant.dns_group_id = grp.id
+    await db_session.commit()
+
+    devices = [
+        _device(
+            id_="laptop",
+            name="laptop.example.ts.net",
+            hostname="laptop",
+            addresses=["100.64.1.5", "fd7a:115c:a1e0::5"],
+        ),
+        _device(
+            id_="server",
+            name="server.example.ts.net",
+            hostname="server",
+            addresses=["100.64.1.6"],
+        ),
+    ]
+    with _patch_client(_FakeClient(devices)), _patch_decrypt():
+        summary = await reconcile_tenant(db_session, tenant)
+
+    assert summary.ok, summary.error
+    assert summary.dns_zones_created == 1
+    assert summary.dns_records_created == 3  # laptop A + AAAA, server A
+    assert summary.dns_skipped is False
+
+    # Zone exists with the FK + auto-generated flag set.
+    zone = (
+        await db_session.execute(select(DNSZone).where(DNSZone.tailscale_tenant_id == tenant.id))
+    ).scalar_one()
+    assert zone.name == "example.ts.net."
+    assert zone.is_auto_generated is True
+    assert zone.group_id == grp.id
+
+    # Records mirror the desired set.
+    recs = (
+        (
+            await db_session.execute(
+                select(DNSRecord)
+                .where(DNSRecord.tailscale_tenant_id == tenant.id)
+                .order_by(DNSRecord.fqdn, DNSRecord.record_type)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    keys = {(r.name, r.record_type, r.value) for r in recs}
+    assert keys == {
+        ("laptop", "A", "100.64.1.5"),
+        ("laptop", "AAAA", "fd7a:115c:a1e0::5"),
+        ("server", "A", "100.64.1.6"),
+    }
+    for r in recs:
+        assert r.auto_generated is True
+        assert r.zone_id == zone.id
+
+    # Idempotent.
+    with _patch_client(_FakeClient(devices)), _patch_decrypt():
+        summary2 = await reconcile_tenant(db_session, tenant)
+    assert summary2.ok
+    assert summary2.dns_zones_created == 0
+    assert summary2.dns_records_created == 0
+    assert summary2.dns_records_deleted == 0
+
+
+@pytest.mark.asyncio
+async def test_phase2_diff_device_disappears_drops_records(
+    db_session: AsyncSession,
+) -> None:
+    """When a device leaves the tailnet, its records vanish on the
+    next sync."""
+    space = await _make_space(db_session)
+    grp = await _make_dns_group(db_session)
+    tenant = await _make_tenant(db_session, space)
+    tenant.api_key_encrypted = b"x"
+    tenant.dns_group_id = grp.id
+    await db_session.commit()
+
+    devices_before = [
+        _device(
+            id_="alive",
+            name="alive.example.ts.net",
+            hostname="alive",
+            addresses=["100.64.2.5"],
+        ),
+        _device(
+            id_="leaving",
+            name="leaving.example.ts.net",
+            hostname="leaving",
+            addresses=["100.64.2.6"],
+        ),
+    ]
+    with _patch_client(_FakeClient(devices_before)), _patch_decrypt():
+        await reconcile_tenant(db_session, tenant)
+
+    devices_after = [devices_before[0]]
+    with _patch_client(_FakeClient(devices_after)), _patch_decrypt():
+        summary = await reconcile_tenant(db_session, tenant)
+    assert summary.ok
+    assert summary.dns_records_deleted == 1
+    assert summary.dns_records_created == 0
+
+    fqdns = {
+        r.fqdn
+        for r in (
+            await db_session.execute(
+                select(DNSRecord).where(DNSRecord.tailscale_tenant_id == tenant.id)
+            )
+        )
+        .scalars()
+        .all()
+    }
+    assert "alive.example.ts.net" in fqdns
+    assert "leaving.example.ts.net" not in fqdns
+
+
+@pytest.mark.asyncio
+async def test_phase2_skipped_when_no_dns_group_bound(
+    db_session: AsyncSession,
+) -> None:
+    """Tenant without a dns_group_id binding is opted out of Phase 2;
+    the IP mirror still runs but no zone is synthesised."""
+    space = await _make_space(db_session)
+    tenant = await _make_tenant(db_session, space)
+    tenant.api_key_encrypted = b"x"
+    # dns_group_id intentionally left None.
+    await db_session.commit()
+
+    devices = [
+        _device(
+            id_="d",
+            name="d.example.ts.net",
+            hostname="d",
+            addresses=["100.64.4.2"],
+        ),
+    ]
+    with _patch_client(_FakeClient(devices)), _patch_decrypt():
+        summary = await reconcile_tenant(db_session, tenant)
+
+    assert summary.ok
+    assert summary.dns_skipped is True
+    assert summary.dns_zones_created == 0
+
+    rows = (
+        (await db_session.execute(select(DNSZone).where(DNSZone.tailscale_tenant_id == tenant.id)))
+        .scalars()
+        .all()
+    )
+    assert rows == []
+
+
+@pytest.mark.asyncio
+async def test_phase2_refuses_pre_existing_operator_zone(
+    db_session: AsyncSession,
+) -> None:
+    """If the operator already has a manually-managed zone with the
+    same name in the bound group, the reconciler refuses to claim it
+    (which would silently overwrite operator records every sync).
+    The collision lands as a summary warning."""
+    space = await _make_space(db_session)
+    grp = await _make_dns_group(db_session)
+    tenant = await _make_tenant(db_session, space)
+    tenant.api_key_encrypted = b"x"
+    tenant.dns_group_id = grp.id
+
+    # Operator already has the zone.
+    op_zone = DNSZone(
+        group_id=grp.id,
+        name="example.ts.net.",
+        zone_type="primary",
+        kind="forward",
+    )
+    db_session.add(op_zone)
+    await db_session.commit()
+
+    devices = [
+        _device(
+            id_="d",
+            name="d.example.ts.net",
+            hostname="d",
+            addresses=["100.64.4.2"],
+        ),
+    ]
+    with _patch_client(_FakeClient(devices)), _patch_decrypt():
+        summary = await reconcile_tenant(db_session, tenant)
+
+    assert summary.ok
+    assert summary.dns_skipped is True
+    assert summary.dns_zones_created == 0
+    assert any("operator-managed" in w for w in summary.warnings)
+
+    # Operator's zone is untouched (no FK stamp, no synthesised
+    # records added under it).
+    await db_session.refresh(op_zone)
+    assert op_zone.tailscale_tenant_id is None
+    recs = (
+        (await db_session.execute(select(DNSRecord).where(DNSRecord.zone_id == op_zone.id)))
+        .scalars()
+        .all()
+    )
+    assert recs == []
+
+
+@pytest.mark.asyncio
+async def test_phase2_skips_devices_with_foreign_fqdn(
+    db_session: AsyncSession,
+) -> None:
+    """Tailscale occasionally returns devices with FQDNs from a
+    different tailnet (or truncated names while they're being
+    onboarded). Those should not pollute the synthesised zone."""
+    space = await _make_space(db_session)
+    grp = await _make_dns_group(db_session)
+    tenant = await _make_tenant(db_session, space)
+    tenant.api_key_encrypted = b"x"
+    tenant.dns_group_id = grp.id
+    await db_session.commit()
+
+    devices = [
+        _device(
+            id_="ours",
+            name="ours.example.ts.net",
+            hostname="ours",
+            addresses=["100.64.5.1"],
+        ),
+        _device(
+            id_="other",
+            name="other.different-tailnet.ts.net",
+            hostname="other",
+            addresses=["100.64.5.2"],
+        ),
+        _device(
+            id_="bare",
+            name="just-a-host",  # no FQDN at all
+            hostname="just-a-host",
+            addresses=["100.64.5.3"],
+        ),
+    ]
+    with _patch_client(_FakeClient(devices)), _patch_decrypt():
+        summary = await reconcile_tenant(db_session, tenant)
+    assert summary.ok
+    # Only the device whose FQDN ends with our derived domain lands.
+    assert summary.dns_records_created == 1
+    rec = (
+        await db_session.execute(
+            select(DNSRecord).where(DNSRecord.tailscale_tenant_id == tenant.id)
+        )
+    ).scalar_one()
+    assert rec.fqdn == "ours.example.ts.net"

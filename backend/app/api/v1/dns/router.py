@@ -587,6 +587,11 @@ class ZoneResponse(BaseModel):
     allow_transfer: list[str] | None
     also_notify: list[str] | None
     notify_enabled: str | None
+    # Non-null when the zone was synthesised by the Tailscale Phase 2
+    # reconciler. The UI uses this to render a read-only badge and
+    # disable edit/delete controls; the API enforces it on the
+    # write paths regardless of UI state.
+    tailscale_tenant_id: uuid.UUID | None = None
     created_at: datetime
     modified_at: datetime
 
@@ -638,6 +643,8 @@ class RecordResponse(BaseModel):
     weight: int | None
     port: int | None
     auto_generated: bool
+    # Non-null when the record was synthesised by Tailscale Phase 2.
+    tailscale_tenant_id: uuid.UUID | None = None
     created_at: datetime
     modified_at: datetime
 
@@ -2017,7 +2024,7 @@ async def get_zone_server_state(
     Servers with no state row yet report ``current_serial=None`` — the
     agent hasn't applied a bundle containing this zone yet. ``in_sync``
     is True when every server that's reported matches the zone's
-    target serial (``DNSZone.serial``).
+    target serial (``DNSZone.last_serial``).
     """
     from app.models.dns import DNSServer, DNSServerZoneState  # noqa: PLC0415
 
@@ -2039,7 +2046,7 @@ async def get_zone_server_state(
 
     entries: list[ServerZoneStateEntry] = []
     all_in_sync = True
-    target = int(zone.serial or 0)
+    target = int(zone.last_serial or 0)
     any_reported = False
     for srv in servers:
         st = state_by_server.get(srv.id)
@@ -2075,6 +2082,7 @@ async def update_zone(
     group_id: uuid.UUID, zone_id: uuid.UUID, body: ZoneUpdate, db: DB, current_user: SuperAdmin
 ) -> DNSZone:
     zone = await _require_zone(group_id, zone_id, db)
+    _reject_if_synthesised_zone(zone, "edit")
     changes = body.model_dump(exclude_none=True)
     # ``color`` is the one field on this schema where NULL is a meaningful
     # user intent ("clear the color"). Re-inject it when explicitly set to
@@ -2106,6 +2114,7 @@ async def delete_zone(
     group_id: uuid.UUID, zone_id: uuid.UUID, db: DB, current_user: SuperAdmin
 ) -> None:
     zone = await _require_zone(group_id, zone_id, db)
+    _reject_if_synthesised_zone(zone, "delete")
     # Same write-through contract as create: push the delete first, only
     # drop the DB row if the Windows side agreed.
     await _push_zone_to_agentless_servers(db, zone, "delete")
@@ -2200,6 +2209,7 @@ class GroupRecordResponse(BaseModel):
     weight: int | None
     port: int | None
     auto_generated: bool
+    tailscale_tenant_id: uuid.UUID | None = None
     created_at: datetime
     modified_at: datetime
 
@@ -2258,6 +2268,7 @@ async def list_group_records(
                 weight=rec.weight,
                 port=rec.port,
                 auto_generated=rec.auto_generated,
+                tailscale_tenant_id=rec.tailscale_tenant_id,
                 created_at=rec.created_at,
                 modified_at=rec.modified_at,
             )
@@ -2285,6 +2296,7 @@ async def create_record(
     group_id: uuid.UUID, zone_id: uuid.UUID, body: RecordCreate, db: DB, current_user: CurrentUser
 ) -> DNSRecord:
     zone = await _require_zone(group_id, zone_id, db)
+    _reject_if_synthesised_zone(zone, "add records to")
     fqdn = f"{body.name}.{zone.name}" if body.name != "@" else zone.name
 
     record = DNSRecord(
@@ -2338,6 +2350,7 @@ async def update_record(
     current_user: CurrentUser,
 ) -> DNSRecord:
     record = await _require_record(group_id, zone_id, record_id, db)
+    _reject_if_synthesised_record(record, "edit")
     zone = await db.get(DNSZone, record.zone_id)
     changes = body.model_dump(exclude_none=True)
     for k, v in changes.items():
@@ -2385,6 +2398,7 @@ async def delete_record(
     group_id: uuid.UUID, zone_id: uuid.UUID, record_id: uuid.UUID, db: DB, current_user: CurrentUser
 ) -> None:
     record = await _require_record(group_id, zone_id, record_id, db)
+    _reject_if_synthesised_record(record, "delete")
     zone = await db.get(DNSZone, record.zone_id)
     db.add(
         AuditLog(
@@ -3013,3 +3027,39 @@ async def _require_record(
     if not record:
         raise HTTPException(status_code=404, detail="Record not found")
     return record
+
+
+def _reject_if_synthesised_zone(zone: DNSZone, op: str) -> None:
+    """Refuse writes against a Tailscale-synthesised zone.
+
+    Phase 2 materialises ``<tailnet>.ts.net`` from the device list
+    and the reconciler is the only authorised writer — operator
+    edits would be silently overwritten on the next sync, so we
+    block them at the API instead. To make changes, delete the
+    Tailscale tenant (or rebind it to a different DNS group), then
+    the operator can manage the zone manually.
+    """
+    if zone.tailscale_tenant_id is not None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"Zone {zone.name!r} is synthesised by the Tailscale "
+                f"integration and cannot be {op}ed manually. The reconciler "
+                f"will overwrite any changes on the next sync. Unbind the "
+                f"DNS group on the Tailscale tenant or delete the tenant "
+                f"to release the zone."
+            ),
+        )
+
+
+def _reject_if_synthesised_record(record: DNSRecord, op: str) -> None:
+    """Same gate, applied to records belonging to a synthesised zone."""
+    if record.tailscale_tenant_id is not None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"Record {record.fqdn!r} is synthesised by the Tailscale "
+                f"integration and cannot be {op}ed manually. Edits would be "
+                f"overwritten on the next sync."
+            ),
+        )

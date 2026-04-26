@@ -9,6 +9,54 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versioning uses 
 
 ### Added
 
+- **Tailscale integration — Phase 2: synthetic tailnet DNS surface.**
+  When a `TailscaleTenant` has `dns_group_id` bound, the reconciler
+  now also materialises a `<tailnet>.ts.net` `DNSZone` in that
+  group and one A / AAAA record per device address. Tailnet domain
+  is auto-derived from the first device FQDN (same as Phase 1's
+  `tailnet_domain`). Records carry `auto_generated=True` plus a
+  new `tailscale_tenant_id` FK on both `dns_zone` and `dns_record`
+  (CASCADE on tenant delete) — so deleting the tenant sweeps the
+  whole synthetic zone in one shot.
+  - **Read-only enforcement.** API blocks `PUT /zones/{id}`,
+    `DELETE /zones/{id}`, record CRUD on synthesised zones with a
+    422 + explanatory message ("delete the Tailscale tenant or
+    unbind its DNS group to release the zone"). UI shows a cyan
+    "Tailscale (read-only)" badge near the zone title and disables
+    the Edit / Delete / Add Record header buttons. The per-record
+    lock badge in the records table now branches on
+    `tailscale_tenant_id` to read "Tailscale" instead of "IPAM"
+    when the record was synthesised by Tailscale (rather than
+    DDNS / IPAM auto-sync).
+  - **Diff semantics.** Reconciler compares desired vs. current
+    on every pass keyed by `(name, record_type, value)`: new
+    records are inserted, removed devices have their records
+    deleted. Idempotent — a second sync with the same device list
+    creates / deletes nothing.
+  - **Conflict safety.** If an operator-managed zone with the
+    same name already exists in the bound DNS group, the
+    reconciler refuses to claim it (would silently overwrite
+    operator records every sync); the collision lands as a summary
+    warning, the operator-managed zone is left untouched, and the
+    sync still succeeds for the IPAM mirror.
+  - **Filtering.** Devices with expired keys (and
+    `keyExpiryDisabled=false`) are skipped, matching Phase 1's
+    IPAM mirror semantics. Devices with no FQDN, or whose FQDN
+    doesn't end in the derived tailnet domain (different tailnet,
+    truncated name during onboarding), are skipped without error.
+  - **Bonus.** Because we land actual `DNSRecord` rows, the
+    existing BIND9 render path picks them up automatically — non-
+    Tailscale LAN clients can resolve `<host>.<tailnet>.ts.net`
+    through SpatiumDDI's BIND9 with no extra forwarder plumbing.
+  - **TTL.** Synthesised records are stamped at 300 s — short
+    enough that a stale entry (device reauthed with a different
+    IP) falls out of resolver caches within five minutes of the
+    next sync.
+  - Migration `e6f12b9a3c84_tailscale_phase2_dns`. 5 new reconciler
+    tests cover the synthesis happy path + idempotency, diff on
+    device disappearance, no-DNS-group skip, operator-zone
+    collision refusal, and foreign-FQDN filtering.
+
 - **Query / activity log surface for BIND9 + Kea agents.** Two new
   tabs on the Logs page (`/logs`):
   - **DNS Queries** — BIND9 `query-log` channel content, parsed into

@@ -1802,6 +1802,10 @@ export interface DNSZone {
   allow_transfer: string[] | null;
   also_notify: string[] | null;
   notify_enabled: string | null;
+  // Non-null when the zone was synthesised by the Tailscale Phase 2
+  // reconciler. The UI shows a read-only badge and disables edit /
+  // delete controls on the zone + its records.
+  tailscale_tenant_id: string | null;
   created_at: string;
   modified_at: string;
 }
@@ -1840,6 +1844,8 @@ export interface DNSRecord {
   weight: number | null;
   port: number | null;
   auto_generated: boolean;
+  // Non-null when the record was synthesised by Tailscale Phase 2.
+  tailscale_tenant_id: string | null;
   created_at: string;
   modified_at: string;
 }
@@ -1852,6 +1858,8 @@ export interface DNSGroupRecord {
   view_name: string | null;
   name: string;
   fqdn: string;
+  // Synthesised by Tailscale Phase 2 → write paths blocked.
+  tailscale_tenant_id?: string | null;
   record_type: string;
   value: string;
   ttl: number | null;

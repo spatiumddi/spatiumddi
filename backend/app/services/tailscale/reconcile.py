@@ -31,6 +31,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.crypto import decrypt_str
 from app.models.audit import AuditLog
+from app.models.dns import DNSRecord, DNSZone
 from app.models.ipam import IPAddress, IPBlock, Subnet
 from app.models.tailscale import TailscaleTenant
 from app.services.tailscale.client import (
@@ -69,6 +70,12 @@ class ReconcileSummary:
     addresses_deleted: int = 0
     skipped_expired: int = 0
     skipped_no_subnet: int = 0
+    # Phase 2: synthetic DNS zone + records.
+    dns_zones_created: int = 0
+    dns_records_created: int = 0
+    dns_records_updated: int = 0
+    dns_records_deleted: int = 0
+    dns_skipped: bool = False
     warnings: list[str] = field(default_factory=list)
 
 
@@ -405,6 +412,175 @@ async def _apply_addresses(
             await _recompute_subnet_utilization(db, subnet_id)
 
 
+# ── Phase 2: synthetic DNS zone + records ────────────────────────────
+
+
+# TTL on synthesised records. Short by design — devices come and go,
+# IP assignments shift after re-auth, etc. 300 s lets a stale record
+# fall out of resolver caches within five minutes of the next sync.
+_SYNTHESISED_RECORD_TTL = 300
+
+
+def _device_records_for_tenant(
+    devices: list[_TailscaleDevice],
+    zone_name: str,
+    tenant: TailscaleTenant,
+) -> list[tuple[str, str, str]]:
+    """Compute the desired (label, record_type, value) tuples.
+
+    One A record per IPv4 address, one AAAA record per IPv6 address.
+    The label is the device's short hostname (the leading part of
+    its FQDN before the tailnet zone). Devices with no FQDN, or
+    whose FQDN doesn't end in our zone, are skipped — Tailscale
+    sometimes returns devices with truncated names while they're
+    being onboarded.
+
+    Devices with expired keys (and ``skip_expired=True``) are
+    filtered out the same way the IPAM mirror handles them, so the
+    DNS surface and the IPAM surface stay consistent.
+    """
+    suffix = "." + zone_name
+    out: list[tuple[str, str, str]] = []
+    for d in devices:
+        if tenant.skip_expired and not d.key_expiry_disabled and _expires_in_past(d.expires):
+            continue
+        name = (d.name or "").strip().rstrip(".")
+        if not name:
+            continue
+        if not name.endswith(suffix):
+            # Belongs to a different tailnet (or the FQDN hasn't
+            # converged yet) — skip rather than crash.
+            continue
+        label = name[: -len(suffix)] or "@"
+        for ip in d.addresses:
+            try:
+                addr = ipaddress.ip_address(ip)
+            except ValueError:
+                continue
+            if isinstance(addr, ipaddress.IPv4Address):
+                out.append((label, "A", str(addr)))
+            else:
+                out.append((label, "AAAA", str(addr)))
+    return out
+
+
+async def _apply_synthetic_dns(
+    db: AsyncSession,
+    tenant: TailscaleTenant,
+    devices: list[_TailscaleDevice],
+    summary: ReconcileSummary,
+) -> None:
+    """Materialise ``<tailnet>.ts.net`` zone + per-device records.
+
+    Skips silently when:
+
+    * the tenant has no ``dns_group_id`` bound (operator opt-in;
+      Phase 2 is on the form but not required);
+    * we can't derive the tailnet domain from the device list (no
+      device has a usable FQDN — empty tailnet, agent first-boot, etc).
+
+    Refuses to claim a pre-existing operator-managed zone with the
+    same name in the bound group: that would silently overwrite
+    operator records every reconcile pass. The collision lands as a
+    summary warning so the UI / audit log surface it.
+    """
+    if tenant.dns_group_id is None:
+        summary.dns_skipped = True
+        return
+    if not summary.tailnet_domain:
+        summary.dns_skipped = True
+        return
+
+    # BIND9 zone names canonically end with a trailing dot. Other
+    # subsystems in this repo round-trip both shapes; we follow the
+    # template's convention so the zone renders cleanly in
+    # ``named.conf``.
+    zone_name = summary.tailnet_domain.rstrip(".") + "."
+
+    # Look for an existing zone in this tenant's bound group.
+    res = await db.execute(
+        select(DNSZone).where(
+            DNSZone.group_id == tenant.dns_group_id,
+            DNSZone.name == zone_name,
+        )
+    )
+    zone = res.scalar_one_or_none()
+    if zone is not None and zone.tailscale_tenant_id is None:
+        summary.warnings.append(
+            f"DNS zone {zone_name!r} already exists in the bound group and is "
+            f"operator-managed; not synthesising. Delete it or rename to "
+            f"unblock the Tailscale Phase 2 surface."
+        )
+        summary.dns_skipped = True
+        return
+    if zone is not None and zone.tailscale_tenant_id != tenant.id:
+        summary.warnings.append(
+            f"DNS zone {zone_name!r} owned by another Tailscale tenant; " f"not synthesising."
+        )
+        summary.dns_skipped = True
+        return
+
+    if zone is None:
+        zone = DNSZone(
+            group_id=tenant.dns_group_id,
+            name=zone_name,
+            zone_type="primary",
+            kind="forward",
+            ttl=_SYNTHESISED_RECORD_TTL,
+            primary_ns=zone_name,
+            admin_email=f"hostmaster.{zone_name}",
+            is_auto_generated=True,
+            tailscale_tenant_id=tenant.id,
+        )
+        db.add(zone)
+        await db.flush()
+        summary.dns_zones_created += 1
+
+    # Compute desired records.
+    desired = _device_records_for_tenant(devices, summary.tailnet_domain, tenant)
+    desired_keys: set[tuple[str, str, str]] = set(desired)
+
+    rec_res = await db.execute(
+        select(DNSRecord).where(
+            DNSRecord.zone_id == zone.id,
+            DNSRecord.tailscale_tenant_id == tenant.id,
+        )
+    )
+    current: list[DNSRecord] = list(rec_res.scalars().all())
+    current_by_key: dict[tuple[str, str, str], DNSRecord] = {}
+    for r in current:
+        key = (r.name, r.record_type, r.value)
+        # Multiple devices could in theory clash on (label, type, value)
+        # — a duplicate IP claim across hosts. Keep the first; the
+        # second won't show up in `desired_keys` and will be deleted.
+        current_by_key.setdefault(key, r)
+
+    # Delete records no longer in the desired set.
+    for key, row in current_by_key.items():
+        if key in desired_keys:
+            continue
+        await db.delete(row)
+        summary.dns_records_deleted += 1
+
+    # Insert records that are new.
+    for key in desired_keys - current_by_key.keys():
+        label, rtype, value = key
+        fqdn = zone_name.rstrip(".") if label == "@" else f"{label}.{zone_name.rstrip('.')}"
+        db.add(
+            DNSRecord(
+                zone_id=zone.id,
+                name=label,
+                fqdn=fqdn,
+                record_type=rtype,
+                value=value,
+                ttl=_SYNTHESISED_RECORD_TTL,
+                auto_generated=True,
+                tailscale_tenant_id=tenant.id,
+            )
+        )
+        summary.dns_records_created += 1
+
+
 # ── Entry point ───────────────────────────────────────────────────────
 
 
@@ -453,6 +629,12 @@ async def reconcile_tenant(db: AsyncSession, tenant: TailscaleTenant) -> Reconci
     desired = _compute_desired(tenant, devices, summary)
     await _apply_addresses(db, tenant, desired, summary)
 
+    # Phase 2 — synthesise the tailnet's DNS surface in the bound
+    # DNS group. Skipped silently when the operator hasn't bound a
+    # group; an existing operator-managed zone with the same name
+    # is left alone (warning surfaced via summary.warnings).
+    await _apply_synthetic_dns(db, tenant, devices, summary)
+
     tenant.last_synced_at = datetime.now(UTC)
     tenant.last_sync_error = None
     tenant.tailnet_domain = summary.tailnet_domain
@@ -476,6 +658,13 @@ async def reconcile_tenant(db: AsyncSession, tenant: TailscaleTenant) -> Reconci
                     "skipped_expired": summary.skipped_expired,
                     "skipped_no_subnet": summary.skipped_no_subnet,
                 },
+                "dns": {
+                    "zones_created": summary.dns_zones_created,
+                    "records_created": summary.dns_records_created,
+                    "records_updated": summary.dns_records_updated,
+                    "records_deleted": summary.dns_records_deleted,
+                    "skipped": summary.dns_skipped,
+                },
             },
         )
     )
@@ -491,6 +680,9 @@ async def reconcile_tenant(db: AsyncSession, tenant: TailscaleTenant) -> Reconci
         addresses_created=summary.addresses_created,
         addresses_updated=summary.addresses_updated,
         addresses_deleted=summary.addresses_deleted,
+        dns_zones_created=summary.dns_zones_created,
+        dns_records_created=summary.dns_records_created,
+        dns_records_deleted=summary.dns_records_deleted,
     )
     return summary
 

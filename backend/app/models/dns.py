@@ -28,7 +28,7 @@ class DNSServerZoneState(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     Each agent posts back the serial it *actually rendered* after a
     successful config apply — the "ground truth" of what's live on
-    that particular server, as distinct from ``DNSZone.serial`` which
+    that particular server, as distinct from ``DNSZone.last_serial`` which
     is the value the control plane most-recently pushed.
 
     Unique on ``(server_id, zone_id)`` so the evaluator can drive a
@@ -405,6 +405,18 @@ class DNSZone(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     linked_subnet_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("subnet.id", ondelete="SET NULL"), nullable=True
     )
+    # Set by the Tailscale reconciler when this zone synthesises
+    # ``<tailnet>.ts.net`` from the device list (Phase 2). The FK
+    # cascades on tenant delete so the synthetic zone + its records
+    # disappear cleanly when the tenant row is removed. While
+    # non-null the API blocks edits / deletes — the reconciler is
+    # the only writer.
+    tailscale_tenant_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("tailscale_tenant.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
     # Optional per-zone color key (from a curated swatch set) shown as a
     # dot/stripe in zone lists + tree nodes. Free-form hex is not accepted
     # so both light and dark themes remain legible. See API validator for
@@ -470,6 +482,15 @@ class DNSRecord(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     kubernetes_cluster_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("kubernetes_cluster.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    # Set by the Tailscale reconciler when the row mirrors a
+    # tailnet device (Phase 2). The FK cascades on tenant delete.
+    # API blocks edits / deletes while non-null.
+    tailscale_tenant_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("tailscale_tenant.id", ondelete="CASCADE"),
         nullable=True,
         index=True,
     )

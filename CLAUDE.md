@@ -826,33 +826,56 @@ cloud accounts.
   rows is a follow-up. Test Connection probe + Sync Now button
   in the admin page mirror the other integrations.
 
-- ⬜ **Tailscale — Phase 2: synthetic tailnet DNS surface.**
-  Register `<tailnet>.ts.net` as a read-only DNS source backed
-  by the same `/devices` poll Phase 1 already runs. Two
-  implementation options under evaluation:
-  1. Add a `TailscaleDNSReadOnlyDriver` to
-     `app/drivers/dns/`, register it in `READ_ONLY_DRIVERS`
-     alongside `WindowsDHCPReadOnlyDriver`. Driver synthesises
-     A + AAAA records from each device's `addresses[]` and
-     `name`. Every CRUD method raises
-     `NotImplementedError` — same shape as Path A Windows
-     DHCP. Tailscale shows up as a "DNS Server" in the
-     existing `/dns` admin page.
-  2. Light-weight: add a per-tenant toggle on
-     `TailscaleTenant.create_synthetic_zone` that, when on,
-     materialises a synthetic `DNSZone` (read-only flag) plus
-     auto-generated `DNSRecord` rows on every reconcile.
-     Records carry `auto_generated=True` + provenance FK so
-     operators can see them in the standard zone view.
-     Doesn't need a new driver; reuses the existing record
-     surface but makes the rows uneditable.
-  Optional follow-up to either: render a BIND9 forwarder zone
-  for `<tailnet>.ts.net` → `100.100.100.100` so non-Tailscale
-  LAN clients can resolve tailnet names through SpatiumDDI's
-  managed BIND9. (`100.100.100.100` is the MagicDNS resolver;
-  it's local-only and can't be queried externally, so the
-  records have to be synthesised — there's no AXFR path.)
-  Phase 2 is a follow-up to Phase 1, not a blocker.
+- ✅ **Tailscale — Phase 2: synthetic tailnet DNS surface.**
+  Implemented as Option 2 from the original plan (synthetic
+  `DNSZone` materialised by the reconciler). When a
+  `TailscaleTenant` has `dns_group_id` bound, every reconcile
+  pass derives `<tailnet>.ts.net` from the first device FQDN,
+  upserts a `DNSZone` with `is_auto_generated=True` and
+  `tailscale_tenant_id=<tenant>`, and materialises one A / AAAA
+  `DNSRecord` per device address. Records also carry
+  `auto_generated=True` + the tenant FK. **Read-only enforcement**:
+  `update_zone` / `delete_zone` / record CRUD reject writes
+  with 422 when `tailscale_tenant_id IS NOT NULL`; UI renders a
+  "Tailscale (read-only)" badge near the zone title and disables
+  the Edit / Delete / Add Record buttons; the per-record lock
+  badge in the records table branches on `tailscale_tenant_id`
+  to read "Tailscale" instead of "IPAM" for synthesised rows.
+  **Diff semantics**: keyed on `(name, record_type, value)` —
+  removed devices have their records deleted on the next sync;
+  idempotent on stable input. **Conflict safety**: a pre-
+  existing operator-managed zone with the same name is left
+  untouched, with a `summary.warnings` entry that surfaces in
+  the audit log. **Filtering**: expired-key devices skipped per
+  Phase 1's `skip_expired` toggle; devices with no FQDN or
+  foreign tailnet suffix are skipped without error. **Bonus**:
+  because we land actual `DNSRecord` rows, the existing BIND9
+  render path picks them up automatically — non-Tailscale LAN
+  clients can resolve `<host>.<tailnet>.ts.net` through
+  SpatiumDDI's managed BIND9 with no forwarder plumbing. TTL
+  is 300 s (short by design — IP assignments shift after re-auth).
+  Migration `e6f12b9a3c84_tailscale_phase2_dns`.
+
+  **Deferred follow-ups:**
+  - **Per-tenant zone-name override.** Today we use the auto-
+    derived `<tailnet>.ts.net`. Some operators run Tailscale
+    with a custom split-DNS arrangement and want the synthetic
+    zone published under a different name (e.g.
+    `tailnet.internal`). Adding a `synthetic_zone_name` column
+    on `TailscaleTenant` (defaulting to null = derive) would
+    cover that without much code.
+  - **Subnet-router routes (`enabled_routes`) → first-class
+    `IPBlock` rows.** Phase 1 stores them in `custom_fields`;
+    promoting them to real IPBlocks (one per route, FK to
+    tenant) would let the IPAM tree show "this CIDR is reachable
+    via tailnet device X." Worthwhile if operators start
+    advertising LAN subnets through Tailscale.
+  - **BIND9 forwarder zone for `100.100.100.100`.** Optional
+    alternative for operators who don't want SpatiumDDI's BIND9
+    serving the records itself but DO want to forward `*.ts.net`
+    queries through MagicDNS (which only listens on the local
+    Tailscale daemon — works only if the BIND9 host is itself
+    on Tailscale).
 
 - ⬜ **OPNsense** *(tier 1 — firewall-of-choice for labs).*
   Per-`OPNsenseRouter` row, API key + secret auth over HTTPS.

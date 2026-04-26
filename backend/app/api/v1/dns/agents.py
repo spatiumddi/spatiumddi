@@ -403,7 +403,7 @@ async def agent_zone_state(
 
     Called after a successful ``apply_config`` pass — the serial
     reported here is the "ground truth" of what this particular
-    server is serving, as distinct from ``DNSZone.serial`` which is
+    server is serving, as distinct from ``DNSZone.last_serial`` which is
     the latest value the control plane *pushed*. Used for per-server
     drift detection on the zone detail page + (future) a
     ``zone_serial_drift`` alert-rule type.

@@ -205,9 +205,28 @@ The admin page ships a copy-paste guide:
 4. Open <https://login.tailscale.com/admin/settings/general> for the **Organization** slug — paste it into **Tailnet**, or leave the default `-` for solo / single-tailnet accounts.
 5. Hit **Test Connection** to verify before save.
 
-### What's not done in Phase 1
+### Phase 2 — synthetic tailnet DNS surface
 
-- **Synthetic DNS zone for `<tailnet>.ts.net`** — Phase 2. The device list is the zone; rendering it as a read-only DNS surface (so SpatiumDDI's BIND9 can forward in-tailnet hostnames for non-Tailscale clients) is the natural next step.
+Shipped as Option 2 from the original plan (synthetic `DNSZone` materialised by the reconciler, not a `TailscaleDNSReadOnlyDriver`). Activates automatically when the tenant has `dns_group_id` bound; skipped silently otherwise.
+
+**What it does.** Every reconcile pass:
+
+1. Derives the tailnet domain from the first device FQDN (already cached on `TailscaleTenant.tailnet_domain`).
+2. Upserts a `DNSZone` named `<tailnet>.ts.net.` in the bound DNS group, FK-stamped with `tailscale_tenant_id` + `is_auto_generated=True`.
+3. Diffs the desired record set (one A or AAAA per device address) against the existing synthesised records — keyed on `(label, record_type, value)`. Adds new, deletes orphaned. No-ops when the device list is unchanged.
+4. Stamps each record with `auto_generated=True` + `tailscale_tenant_id`. TTL = 300 s.
+
+**Read-only enforcement.** API write paths (`PUT /zones/{id}`, `DELETE /zones/{id}`, record CRUD) return **422** with an explanatory message when `tailscale_tenant_id IS NOT NULL` on the target row. UI shows a cyan **Tailscale (read-only)** badge near the zone title and disables the Edit / Delete / Add Record buttons. The per-record lock badge differentiates `Tailscale` vs `IPAM` based on which integration owns the row.
+
+**Conflict with operator zones.** If an operator has manually created `<tailnet>.ts.net` in the same group, the reconciler refuses to claim it (which would silently overwrite operator records every sync). The conflict is recorded as a `summary.warnings` entry visible in the audit log; the operator-managed zone is left untouched, and the IPAM mirror still runs to completion. To unblock Phase 2, the operator deletes their manual zone (or rebinds the tenant to a different DNS group).
+
+**Filtering.** Devices skipped by the IPAM mirror (expired keys, no FQDN, foreign-tailnet FQDN) are also skipped here, so the DNS view stays consistent with the IPAM view.
+
+**Bonus.** Records land in real `DNSRecord` rows — the existing BIND9 render path picks them up automatically. Non-Tailscale LAN clients can resolve `<host>.<tailnet>.ts.net` through SpatiumDDI's BIND9 with no forwarder plumbing.
+
+### What's not done
+
+- **Per-tenant zone-name override.** Auto-derived from the device FQDN today. Adding a `synthetic_zone_name` column would cover operators with custom split-DNS arrangements (e.g. publishing under `tailnet.internal`).
 - **Subnet-router routes (`enabled_routes`) as first-class IPBlock rows** — currently surface only in `custom_fields`. Promoting them is straightforward but waits for an operator request.
 - **Per-device management surface** (rename / expire / authorize / delete via the admin API write side) — outside scope of the read-only mirror; Phase 3 territory if it ever lands.
 

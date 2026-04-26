@@ -1633,6 +1633,14 @@ function ZoneDetailView({
                 DNSSEC
               </span>
             )}
+            {zone.tailscale_tenant_id && (
+              <span
+                className="inline-flex items-center rounded px-1.5 py-0.5 text-xs bg-cyan-500/15 text-cyan-700 dark:text-cyan-300"
+                title="Synthesised by the Tailscale integration. Records are derived from the device list on every sync; manual edits are blocked."
+              >
+                Tailscale (read-only)
+              </span>
+            )}
           </div>
           <p className="text-xs text-muted-foreground mt-0.5">
             TTL {zone.ttl}s · serial {zone.last_serial || "—"}
@@ -1667,13 +1675,28 @@ function ZoneDetailView({
           <HeaderButton icon={Download} onClick={handleExport}>
             Export
           </HeaderButton>
-          <HeaderButton icon={Pencil} onClick={() => setShowEditZone(true)}>
+          <HeaderButton
+            icon={Pencil}
+            onClick={() => setShowEditZone(true)}
+            disabled={!!zone.tailscale_tenant_id}
+            title={
+              zone.tailscale_tenant_id
+                ? "This zone is synthesised by the Tailscale integration; edits would be overwritten on the next sync."
+                : undefined
+            }
+          >
             Edit Zone
           </HeaderButton>
           <HeaderButton
             variant="destructive"
             icon={Trash2}
             onClick={() => setConfirmDelete(true)}
+            disabled={!!zone.tailscale_tenant_id}
+            title={
+              zone.tailscale_tenant_id
+                ? "Delete the Tailscale tenant or unbind its DNS group to release this zone."
+                : undefined
+            }
           >
             Delete Zone
           </HeaderButton>
@@ -1681,6 +1704,12 @@ function ZoneDetailView({
             variant="primary"
             icon={Plus}
             onClick={() => setShowAddRecord(true)}
+            disabled={!!zone.tailscale_tenant_id}
+            title={
+              zone.tailscale_tenant_id
+                ? "Records are managed by the Tailscale reconciler."
+                : undefined
+            }
           >
             Add Record
           </HeaderButton>
@@ -1915,15 +1944,25 @@ function ZoneDetailView({
                         <td className="py-1.5 pr-3">
                           {r.auto_generated ? (
                             <div className="flex items-center justify-end gap-1">
+                              {r.tailscale_tenant_id ? (
+                                <span
+                                  title="Synthesised by the Tailscale integration. Records are derived from the device list on every sync; manual edits are blocked."
+                                  className="flex items-center gap-1 rounded border border-cyan-300/60 bg-cyan-50 px-1.5 py-0.5 text-xs text-cyan-700 dark:border-cyan-700/40 dark:bg-cyan-900/20 dark:text-cyan-300"
+                                >
+                                  <Lock className="h-2.5 w-2.5" />
+                                  Tailscale
+                                </span>
+                              ) : (
+                                <span
+                                  title="This record was created automatically by IPAM. Edit the IP address in IPAM to change it."
+                                  className="flex items-center gap-1 rounded border border-amber-300/60 bg-amber-50 px-1.5 py-0.5 text-xs text-amber-700 dark:border-amber-700/40 dark:bg-amber-900/20 dark:text-amber-400"
+                                >
+                                  <Lock className="h-2.5 w-2.5" />
+                                  IPAM
+                                </span>
+                              )}
                               <span
-                                title="This record was created automatically by IPAM. Edit the IP address in IPAM to change it."
-                                className="flex items-center gap-1 rounded border border-amber-300/60 bg-amber-50 px-1.5 py-0.5 text-xs text-amber-700 dark:border-amber-700/40 dark:bg-amber-900/20 dark:text-amber-400"
-                              >
-                                <Lock className="h-2.5 w-2.5" />
-                                IPAM
-                              </span>
-                              <span
-                                title="Managed by IPAM — changes made here will be overwritten. To edit, update the IP address record in IPAM."
+                                title="Managed externally — changes made here will be overwritten on the next sync."
                                 className="flex h-5 w-5 cursor-help items-center justify-center rounded text-muted-foreground/60 hover:text-muted-foreground"
                               >
                                 <Info className="h-3 w-3" />
@@ -3587,6 +3626,7 @@ function RecordsTab({
             weight: editing.weight,
             port: editing.port,
             auto_generated: editing.auto_generated,
+            tailscale_tenant_id: editing.tailscale_tenant_id ?? null,
             created_at: editing.created_at,
             modified_at: editing.modified_at,
           }}
