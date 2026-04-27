@@ -1,0 +1,13 @@
+{
+  "name": "spatiumddi-screenshots",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Headless screenshot capture for the SpatiumDDI README",
+  "type": "module",
+  "scripts": {
+    "capture": "node capture.mjs"
+  },
+  "devDependencies": {
+    "playwright": "^1.59.0"
+  }
+}

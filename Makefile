@@ -1,5 +1,5 @@
 .PHONY: help up down dev build migrate lint test lint-backend lint-frontend test-backend \
-        ci ci-backend-lint ci-frontend-lint ci-frontend-build
+        ci ci-backend-lint ci-frontend-lint ci-frontend-build screenshots
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 COMPOSE        = docker compose
@@ -19,6 +19,7 @@ help:
 	@echo "  make lint        Lint backend (ruff+mypy) and frontend (eslint+prettier)"
 	@echo "  make test        Run backend tests against a live DB"
 	@echo "  make ci          Run the exact same lint + typecheck + build jobs CI runs"
+	@echo "  make screenshots Re-capture docs/assets/screenshots/ via headless chromium"
 	@echo ""
 
 # ── Stack ──────────────────────────────────────────────────────────────────────
@@ -94,3 +95,18 @@ ci-frontend-lint:
 ci-frontend-build:
 	@echo "→ Frontend — Build"
 	cd $(FRONTEND_DIR) && npm run build
+
+# ── Screenshots ────────────────────────────────────────────────────────────────
+# Re-captures the README screenshots via headless chromium. The dev stack must
+# be running and reachable at the configured URL (default http://localhost:8077).
+# See scripts/screenshots/README.md for options + troubleshooting.
+#
+# Pass extra flags via SCREENSHOT_ARGS, e.g.:
+#   make screenshots SCREENSHOT_ARGS="--only dashboard,ipam"
+#   make screenshots SCREENSHOT_ARGS="--base-url http://localhost:8077 --width 1920"
+screenshots:
+	@command -v node >/dev/null || (echo "node not installed — apt-get install -y nodejs"; exit 1)
+	@test -x /usr/bin/chromium || (echo "chromium missing — apt-get install -y chromium"; exit 1)
+	@test -d scripts/screenshots/node_modules || \
+	  (cd scripts/screenshots && npm install --no-audit --no-fund)
+	node scripts/screenshots/capture.mjs $(SCREENSHOT_ARGS)
