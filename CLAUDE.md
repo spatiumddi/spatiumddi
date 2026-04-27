@@ -211,7 +211,15 @@ Phase 1 IPv6 closure + the Phase 2/3 DDNS / zone-state / CI-hardening items all 
 - **Per-server zone serial reporting** — `DNSServerZoneState` table + `POST /dns/agents/zone-state` for agents (agent reports after each successful apply in `agent/dns/spatium_dns_agent/sync.py`) + `GET /dns/groups/{gid}/zones/{zid}/server-state` for the UI + `ZoneSyncPill` on the zone detail header showing per-server convergence against the current SOA serial.
 - **Trivy-clean + kind-AXFR acceptance tests for the agent images** — Trivy now enforces HIGH/CRITICAL (with `ignore-unfixed: true`) on both `build-dns-images.yml` and `build-dhcp-images.yml`; kind-based installation + `dig version.bind CH TXT` smoke test runs on PR via the new `.github/workflows/agent-e2e.yml` — spins up a kind cluster via `helm/kind-action@v1`, installs the umbrella chart with `dnsAgents.enabled=true`, port-forwards the API for `/health/live`, and checks the DNS agent pod isn't crash-looping.
 
-### Future Phases — Tracked Items
+### Major roadmap items (✅ shipped + ⬜ tracked)
+
+This is a single chronological list of major roadmap items. Each entry
+is marked ✅ when shipped or ⬜ when still pending. A shipped (✅) item
+may still carry a "Deferred follow-ups" block — those are pending
+sub-items that fit naturally with the parent narrative and live there
+rather than moving to a separate "tracked" section. Pure-greenfield
+ideas added in the 2026.04.26 brainstorm pass live in their own
+categorised section further down.
 
 - ✅ **Windows DNS — Path A (RFC 2136, agentless)** — `WindowsDNSDriver`
   in `backend/app/drivers/dns/windows.py`. Record CRUD only (A / AAAA /
@@ -565,7 +573,7 @@ Phase 1 IPv6 closure + the Phase 2/3 DDNS / zone-state / CI-hardening items all 
   SD-Access rather than the public resolver tree. Phase 4 — pairs
   with the Terraform / Ansible providers already on the roadmap.
 
-- ⬜ **Kubernetes integration (read-only cluster mirror).** Poll one
+- ✅ **Kubernetes integration (read-only cluster mirror).** Poll one
   or more Kubernetes clusters with a read-only service-account
   token and mirror the stable bits of cluster state into SpatiumDDI.
   **Deliberately not mirroring pod IPs** — they churn too fast to
@@ -704,14 +712,18 @@ Phase 1 IPv6 closure + the Phase 2/3 DDNS / zone-state / CI-hardening items all 
   Scoped as a separate feature because it's a full management UI,
   not IPAM, and needs a websocket pipeline we don't have today.
 
-### Additional integration candidates (not started)
+### Integration roadmap (✅ shipped + ⬜ tracked)
 
 Same read-only-pull reconciler shape as Kubernetes/Docker — each
 one gets a `*Target` row type, Settings → Integrations toggle,
 sidebar entry, and 30 s beat sweep with per-target interval
 gating. Ranked by homelab/SMB test accessibility + IPAM value so
 operators can exercise them in their own lab without standing up
-cloud accounts.
+cloud accounts. Items below are listed in roughly the order they
+were originally prioritised; ✅ entries have shipped, ⬜ entries
+are still pending (the ServiceNow CMDB integration in the
+brainstorm section follows a different shape — bidirectional
+write surface, not a read-only pull mirror).
 
 - ✅ **Proxmox VE** — `ProxmoxNode` model + REST client
   + reconciler landed. Auth is API-token (`user@realm!tokenid`
@@ -951,6 +963,423 @@ cloud accounts.
   ping-sweep / ARP-scan, not the read-only integration shelf.
 - **WireGuard raw config.** No API — config files only. Belongs
   in a manual-import flow if at all.
+
+### Future ideas — categorised (added 2026.04.26)
+
+Brainstorm pass that catalogues standard IPAM / DDI features
+operators of comparable tools (Infoblox, EfficientIP, NetBox,
+phpIPAM, SolarWinds IPAM) expect but SpatiumDDI doesn't yet
+ship. Sketched at enough depth to start work without
+re-deriving the design — pick by impact, not by section order.
+None of these have started; everything below is ⬜.
+
+#### Discovery & network awareness
+
+- ⬜ **LLDP / CDP neighbour collection** — once SNMP polling
+  lands (already tracked above), walk `lldpRemTable` (LLDP-MIB)
+  and `cdpCacheTable` (CISCO-CDP-MIB) per device to record
+  adjacencies. New `network_neighbour` table (`local_device_id`,
+  `local_port`, `remote_chassis_id`, `remote_system_name`,
+  `remote_port_id`, `last_seen_at`). Powers a topology graph on
+  the dashboard and "where is this MAC plugged in?" drilldown
+  when paired with FDB data.
+- ⬜ **NetFlow / sFlow ingestion** — bind a UDP listener
+  (sflowtool / goflow2 sidecar, or pure-Python decoder) and
+  aggregate to per-IP byte / packet / flow counters in 5-minute
+  buckets. Writes to a `traffic_sample` table parallel to
+  `metric_sample`. Surfaces "active vs allocated" pivot — IPs
+  in IPAM that haven't seen a flow in N days are surfacing
+  candidates for stale-IP cleanup.
+- ⬜ **mDNS / Bonjour / WSD passive discovery** — agent-style
+  listener that joins the multicast group on each managed
+  subnet and records hostnames + service-types announced
+  (`_workstation._tcp`, `_printer._tcp`, etc). Best run inside
+  a DHCP agent pod since the agent already has L2 reach. Cheap
+  incremental population.
+- ⬜ **Switch-port mapping in the IP table** — depends on SNMP
+  polling. Adds Switch / Port columns to the IP table from
+  `dot1dTpFdbTable` (Q-BRIDGE-MIB) + `ifTable` lookups.
+  "Click MAC → all IPs on this port" cross-reference. Standard
+  IPAM display once the FDB is being polled.
+- ⬜ **Reverse-DNS auto-population** — Celery beat sweeps IP rows
+  where `hostname IS NULL` and issues a PTR lookup against the
+  configured resolvers. Hostname is filled with the trailing
+  single-label only (the FQDN goes in `description`). Skipped
+  for integration-owned rows whose hostname is authoritative
+  from upstream.
+
+#### Reporting & analytics
+
+- ⬜ **Capacity forecasting** — linear-regression projection of
+  subnet utilization based on the existing time-series data.
+  "This /24 trends to 100% on YYYY-MM-DD at current rate."
+  Surfaces as a "Days to full" column on subnet tables + an
+  alert rule type `subnet_capacity_forecast` keyed on
+  `< N days`. Math is trivial; the win is operator-actionable.
+- ⬜ **Per-subnet utilization history** — small chart on subnet
+  detail showing % used over the last 30 / 90 days. Storage
+  piggy-backs on the subnet `allocated_ips` column with a daily
+  snapshot (`subnet_utilization_history(subnet_id, sampled_at,
+  allocated_ips, total_ips)`); 90-day retention cap.
+- ⬜ **Stale-IP report** — admin page listing IP rows with
+  `status = allocated` and `last_seen_at` older than N days
+  (operator-tunable, default 90). One-click bulk-deprecate.
+  Feed for "address space hygiene" alerts.
+- ⬜ **Decom-date awareness** — first-class `decom_date` column
+  on subnet + ip_address (currently only suggested as a custom
+  field). Beat task generates a "subnets decom in next 30 days"
+  summary that feeds the alerts framework + an admin dashboard
+  widget.
+- ⬜ **Top-N reports** — fixed dashboard widgets: top 10 subnets
+  by utilization, top 10 owners by IP count, top 10
+  most-modified resources in the last 7 days, top 10 noisiest
+  DNS clients. All derivable from existing tables; just needs
+  a reports router + page.
+- ⬜ **Compliance / change report PDF** — scheduled or on-demand
+  PDF rollup of every audit_log mutation in a date range,
+  grouped by user / resource type / action. Generated
+  server-side via `weasyprint` or `reportlab`.
+  Auditor-friendly; pairs with the audit-log immutability work
+  below.
+
+#### Subnet planning & calculation tools
+
+- ⬜ **Built-in CIDR calculator** — utility page at `/tools/cidr`
+  that takes a CIDR and renders network / broadcast / netmask /
+  wildcard / usable / binary / decimal / hex breakdowns. Pure
+  client-side computation, no API needed. Standard IPAM utility
+  — saves operators context-switching to `subnet-calculator.com`.
+- ⬜ **Subnet planner / "what-if" workspace** — drag-and-drop
+  sketchpad for designing a hierarchy (parent + nested children
+  + sizes) before committing. Saved as a `SubnetPlan` row (JSON
+  tree); "Apply" runs the same overlap / fit validators as the
+  live tree and creates the rows in one transaction. Useful for
+  new-site provisioning.
+- ⬜ **Address planner** — given a parent block and a sized
+  request (`4×/24, 2×/26, 1×/22`), allocate sibling subnets with
+  optimal packing (largest-first heuristic). Returns an apply
+  preview that feeds the planner above.
+- ⬜ **Aggregation suggestion** — beat task scans for contiguous
+  sibling subnets and surfaces "you have 10.0.0.0/24 +
+  10.0.1.0/24, want me to merge into /23?" suggestions on the
+  block detail. Operator one-clicks into the existing merge flow.
+- ⬜ **Free-space treemap** — visual proportional rendering of a
+  supernet showing allocated vs free chunks by area. Complements
+  the existing per-subnet utilization heatmap (cell-per-subnet);
+  the treemap is cell-per-CIDR-slice and surfaces fragmentation.
+  React lib (`d3-hierarchy`) does the math.
+
+#### DNS-specific
+
+- ⬜ **DNSSEC** — sign zones, manage KSK / ZSK rollover, NSEC3
+  parameters, DS-record export to upstream. BIND9 supports
+  inline signing (`dnssec-policy` configs in 9.16+). Storage:
+  `DNSSECPolicy` + `DNSKey` tables tracking key material
+  (Fernet-encrypted) and rollover state. Massive compliance ask
+  in regulated verticals; table-stakes for any "enterprise DDI"
+  comparison.
+- ⬜ **TSIG key management UI** — list / rotate / revoke TSIG
+  keys used for RFC 2136 dynamic updates and AXFR auth. Today
+  they're agent-side files only; no central inventory or
+  rotation flow.
+- ⬜ **Conditional forwarders** — per-zone "forward queries for
+  `corp.local` to 10.0.0.5" config. Common in mixed-AD
+  environments where SpatiumDDI's BIND9 needs to defer to the
+  AD-integrated DNS for specific zones. Renders to BIND9
+  `forward only;` zone blocks.
+- ⬜ **BIND9 catalog zones (RFC 9432)** — distribute zone
+  definitions across multiple BIND9 servers in a group via a
+  single catalog zone rather than per-server config push.
+  BIND 9.18+ supports this natively. Cuts the agent's per-server
+  zone-add / zone-delete bookkeeping; massive operational win
+  for >2 BIND server groups.
+- ⬜ **Response Policy Zones (RPZ)** — DNS-level malware /
+  phishing / ad blocking via BIND9 `response-policy { zone
+  "rpz.example"; };`. Operators upload a blocklist (hostnames,
+  CIDRs, regex) and the driver renders + signs the RPZ zone.
+  Pairs nicely with the existing blocklists infrastructure.
+- ⬜ **DoT / DoH listener** — BIND 9.18+ supports DNS-over-TLS
+  (`tls`) and DNS-over-HTTPS (`https`) natively. Driver renders
+  the listener config; cert lifecycle ties into the ACME
+  embedded-client item already on the roadmap.
+- ⬜ **DNS query analytics aggregation** — today the BIND9 query
+  log surfaces individual lines via the Logs page. Missing:
+  aggregation (top qnames, top clients, qtype distribution,
+  NXDOMAIN ratio) rolled into the dashboard. Storage:
+  per-bucket counters on a `dns_query_aggregate` table fed by
+  the same agent ship pipeline.
+- ⬜ **Zone delegation wizard** — when creating a sub-zone of an
+  existing zone, auto-create the parent's NS records + glue and
+  propagate. Today operators have to remember to do this
+  manually and zones often end up un-delegated.
+- ⬜ **DNS template wizards** — pre-canned zone templates:
+  "AD-integrated forward zone with all required SRV records";
+  "email zone with MX + SPF + DKIM + DMARC starter records";
+  "kubernetes external-dns target zone". One-click materialise
+  → operator edits / removes records as needed.
+- ⬜ **Multi-resolver propagation check** — utility tool that
+  queries a record from N external resolvers (1.1.1.1, 8.8.8.8,
+  9.9.9.9, 208.67.222.222) and shows per-resolver result with
+  timing. Surfaces as a "Check Propagation" button on the
+  record detail.
+
+#### DHCP-specific
+
+- ⬜ **DHCP option library / templates** — named profiles ("VoIP
+  devices", "PXE boot", "VPN pool") that bundle option-code →
+  value sets and can be applied to scopes in one click. Today
+  every scope's options are set individually. Templates are a
+  `DHCPOptionTemplate` row + many-to-many to scopes.
+- ⬜ **Option-code library lookup** — searchable list of
+  well-known DHCP option codes (RFC 2132 + IANA registry) with
+  descriptions. Helps operators dig up the meaning of "option
+  121" without context-switching to the RFC. Static JSON
+  shipped with the app.
+- ⬜ **DHCP fingerprinting** — identify device type from
+  option-55 parameter request list + vendor-class (option 60) +
+  class-id. Fingerprint database from the `fingerbank` project
+  (CC-BY-SA). Surfaces as a `device_type` column on leases
+  ("HP iLO", "Aruba AP", "Cisco IP Phone 8841", "iOS device").
+  Big differentiator vs. vanilla DHCP servers.
+- ⬜ **PXE / iPXE provisioning** — first-class fields for
+  `next-server`, `boot-filename`, with per-arch matching (BIOS
+  vs UEFI vs ARM). Today it's manual option-stuffing. Renders
+  to Kea client classes + scope-level overrides; surfaces in
+  the scope edit modal as a "PXE / iPXE" tab.
+- ⬜ **DHCPv6 stateful + SLAAC config UI** — Kea Dhcp6 backend
+  exists; the missing piece is operator-friendly UI for
+  choosing between stateless / stateful / SLAAC + RA mode.
+  Today the address-family toggle exists but the v6-specific
+  modes don't.
+- ⬜ **Lease histogram by hour** — per-scope chart showing lease
+  grants by hour-of-day over the last 7 / 30 days. Pinpoints
+  office-arrival surges + capacity planning. Storage: bucketed
+  counters on `dhcp_lease_hourly` written by the existing lease
+  ingestion path.
+- ⬜ **Option 82 (relay agent info) class matching** — Kea
+  client classes that match on `relay-agent-info` sub-options
+  (circuit-id, remote-id). Lets carriers / large-enterprise
+  drive scope selection off switch port info inserted by the
+  relay. UI: per-class predicate builder.
+- ⬜ **DHCP test client** — synthetic DISCOVER → OFFER →
+  REQUEST → ACK from inside SpatiumDDI to validate a scope is
+  operational. Implemented as a Celery task using `scapy` or
+  pure-socket DHCP. Useful for change-window verification +
+  post-deploy smoke tests.
+
+#### Operational tooling
+
+- ⬜ **Time-travel queries** — "what did this subnet look like a
+  month ago?" UI that replays the audit_log forward from a
+  snapshot to a target timestamp. Read-only — no rollback.
+  Powered entirely by the existing audit data; just needs a
+  replay engine + UI.
+- ⬜ **Maintenance mode** — global toggle that puts the entire
+  system in read-only state during change windows. UI shows a
+  top banner; every write endpoint returns 503 with
+  `Retry-After`. Bypass for superadmins so they can still make
+  the changes themselves.
+- ⬜ **Built-in network tools page** — `/tools` with widgets for
+  ping, traceroute, dig, whois, port-test, MTR,
+  DNS-propagation-check, TLS cert checker, MAC vendor lookup.
+  Each runs from the SpatiumDDI server perspective (or a chosen
+  DHCP / DNS agent's perspective). Saves operators bouncing to
+  a jump-box. Bound by the existing permission gates;
+  rate-limited to avoid abuse.
+- ⬜ **PCAP capture trigger** — start a tcpdump on a chosen
+  agent pod / host with a BPF filter, return a downloadable
+  pcap when done. Niche but loved; uses the agent's existing
+  JWT for auth.
+- ⬜ **ACL / prefix-list generator** — given a subnet or list of
+  subnets, render Cisco IOS / Juniper JUNOS / Arista EOS /
+  Linux iptables / nftables ACL syntax. Pairs with router-zone
+  metadata for "all subnets in zone X as a Cisco prefix-list"
+  exports.
+- ⬜ **Config-drift report (full record diff)** — extends the
+  existing zone-serial drift surface with a full record-level
+  diff: AXFR the zone from each member, diff against the
+  SpatiumDDI source of truth, surface adds / changes / deletes
+  per server. Lets operators spot manual changes made directly
+  on a BIND9 host.
+
+#### Workflow & RBAC
+
+- ⬜ **Approval workflows for risky ops** — two-person rule on
+  subnet / zone / scope delete + bulk operations above a
+  threshold. Request lands as a `PendingChange` row; second
+  eligible approver clicks Approve → the change executes under
+  their identity. Audit log carries both user IDs.
+- ⬜ **Resource locking** — operator can lock a resource (subnet,
+  zone, scope) for the duration of a change window. While
+  locked, even superadmins get a confirmation prompt. Lock has
+  TTL + owner; "force-unlock" requires a permission gate.
+- ⬜ **Per-resource ACLs** — augment the role-based system with
+  resource-scoped grants ("group X can allocate IPs in subnet
+  Y but not delete"). Uses the existing `{action,
+  resource_type, resource_id?}` permission grammar; just needs
+  a per-resource grant editor in the UI.
+- ⬜ **Time-bound permissions** — grant group X access to subnet
+  Y until a specific timestamp. Beat task revokes expired
+  grants automatically. Useful for vendor / contractor access
+  windows.
+- ⬜ **Comments / activity feed per resource** — Slack-style
+  discussion thread on subnets / IPs / zones / scopes.
+  Markdown-rendered comments + system-generated activity
+  entries (deletes, edits, status changes). Powerful "who
+  broke this" forensics aid; pairs with @-mention notifications.
+
+#### Notifications & external integrations
+
+- ⬜ **Email (SMTP) notifications** — first-class delivery
+  channel for the alerts framework. `SMTPTarget` config row
+  (host, port, TLS, auth, from-address). Templates for each
+  alert rule type rendered from Jinja2. Today operators only
+  get syslog / webhook. Already noted as v2 work in the alerts
+  framework entry above; calling out separately so it doesn't
+  stay buried.
+- ⬜ **Slack / Teams / Discord webhooks** — chat-channel delivery
+  for alerts + audit forward. One-click setup using the
+  standard incoming-webhook URL for each platform. Templates
+  render platform-specific blocks (Slack mrkdwn / Teams
+  adaptive cards / Discord embeds).
+- ⬜ **Generic outbound webhooks on resource changes** —
+  operators subscribe to typed events (`subnet.created`,
+  `ip.allocated`, `zone.modified`, etc.) at `/api/v1/webhooks`
+  with a target URL + HMAC secret. Delivery worker replays
+  from an outbox table with retry + DLQ. Distinct from
+  audit-forward webhooks (which fire on every audit row);
+  these are typed events for downstream automation.
+- ⬜ **Ansible dynamic-inventory endpoint** —
+  `/api/v1/ansible/inventory` returns Ansible-formatted JSON:
+  groups by IP space / block / subnet / tag / custom field.
+  Drop-in replacement for static inventory files. Token-auth
+  scoped to read-only.
+- ⬜ **ServiceNow CMDB integration** — bidirectional sync with a
+  ServiceNow instance. Per-`ServiceNowInstance` row: instance
+  URL + auth (basic / OAuth client-credentials / API key,
+  Fernet-encrypted at rest). Phase 4 — pairs naturally with the
+  alerts framework SMTP / webhook work above. **Mirror scope:**
+  - **Push** IPAM subnets + IP rows to CMDB as
+    `cmdb_ci_ip_network` + `cmdb_ci_ip_address` records via the
+    Table API. Optional `cmdb_ci_network_adapter` for rows with
+    a MAC. Provenance via `service_now_sys_id` column on each
+    mirrored row so updates are PATCH not POST. Beat-driven
+    reconciliation, same shape as the K8s / Docker mirrors but
+    write-direction.
+  - **Pull** asset ownership from CMDB → populate IPAM
+    `owner_user_id` / `owner_group_id` / `managed_by` from the
+    matching CI's `assigned_to` / `support_group` / `owned_by`
+    fields. Operator-edits stay sticky via `user_modified_at`
+    lock (same pattern as Proxmox / Tailscale rows).
+  - **Ticket linkage** — operator pastes an INC / CHG / REQ
+    number on an IP / subnet, SpatiumDDI resolves it to
+    `sys_id` + `short_description` + `state` via the Table API
+    and renders a clickable badge with deep-link back into
+    ServiceNow. New `service_now_ticket_link(resource_type,
+    resource_id, table, sys_id, number, short_description,
+    state, link_url, created_at)` table.
+  - **Auto-create CHG on risky ops** — subnet delete / resize /
+    bulk-edit modals get an opt-in "Open ServiceNow change?"
+    checkbox. SpatiumDDI POSTs a CHG with templated short
+    description / planned start / category, captures the
+    resulting number, and stamps it on the audit_log row.
+  - **Self-service catalog item** — published catalog form
+    "Request IP allocation" calls the SpatiumDDI API on
+    fulfilment via a SNOW Flow. Decoupled — SNOW just hits our
+    REST surface like any other client.
+  - **Phasing.** Phase 1 = ticket-linkage badges + read-only
+    pull (lowest risk, biggest immediate UX win). Phase 2 =
+    CMDB push. Phase 3 = auto-CHG + catalog item. Each phase
+    is separately enable-able from Settings → Integrations
+    once it lands.
+  - **Permission gate** `manage_servicenow` (admin-only). No
+    new roles created — fits inside the existing RBAC grammar.
+  - **Why this matters:** in enterprises that run SNOW as the
+    asset source of truth, an IPAM tool that doesn't sync with
+    CMDB ends up with stale owner / contact data within a
+    quarter. The ticket-linkage piece alone closes the
+    "where's the change request for this subnet?" forensics
+    gap that operators currently solve by greping email.
+
+#### Security & compliance
+
+- ⬜ **2FA / MFA for local users** — TOTP enrolment via `pyotp`
+  with recovery codes. `User.totp_secret` (Fernet-encrypted) +
+  `User.mfa_enabled`. Login flow: password → TOTP prompt →
+  JWT. Optional WebAuthn / FIDO2 in a follow-up.
+- ⬜ **Password policy enforcement** — configurable
+  `PlatformSettings.password_*`: min length, character classes,
+  history (last N hashes), max age (force change after N days),
+  lockout threshold. Today auth is bcrypt + force-change flag
+  only.
+- ⬜ **Account lockout after N failed logins** — windowed
+  counter on `User.failed_login_count` +
+  `failed_login_locked_until`. Resets on successful login.
+  Operator-tunable threshold; superadmin bypass via "force
+  unlock" admin action.
+- ⬜ **Active session viewer + force-logout** — admin UI listing
+  every live JWT (by `jti` cached in Redis), with last-IP /
+  user-agent / login-method / age. "Revoke" adds the JTI to a
+  revocation set checked at every auth-decode.
+- ⬜ **Audit-log tamper detection** — chain hash on each
+  audit_log row: `row_hash = sha256(prev_row_hash ||
+  canonical_json(row))`. Stored in a new column; nightly
+  verifier flags any chain break. Big tick for SOC2 / HIPAA
+  audits; near-zero runtime cost on writes.
+- ⬜ **API-token scopes** — per-token grants (read-only /
+  IPAM-only / DNS-only / DHCP-only / agent-only). Today tokens
+  are full-access JWT-equivalents. Storage: `APIToken.scopes`
+  JSONB list checked at the auth layer alongside the existing
+  permission gates.
+- ⬜ **Subnet classification tags** — first-class `pci_scope` /
+  `hipaa_scope` / `internet_facing` boolean flags on subnet
+  (versus free-form custom fields) + a Compliance dashboard
+  filtered by them. Common ask in regulated verticals —
+  auditors love being able to ask "show me every PCI subnet,
+  who owns it, when was it last changed."
+- ⬜ **Internal cert + secret expiry monitoring** — alert rule
+  type `secret_expiring` keyed off internal TLS certs
+  (control-plane, agent comms), TSIG keys, API tokens, ACME
+  accounts, and any Fernet-encrypted credential with an
+  `expires_at`. Catches the "we forgot to rotate" failure mode
+  before it pages someone at 3am.
+
+#### UX polish
+
+- ⬜ **Saved searches / saved views** — store filter + column +
+  sort state per user as a named `SavedView(user_id, page,
+  name, payload)`. Pinned to the page header dropdown.
+  "All subnets in DC1 over 80% utilization, sorted by name"
+  becomes a one-click view. Massive QoL.
+- ⬜ **Personal pinned dashboard** — pin specific subnets /
+  zones / scopes / IPs to a per-user home page. Stored as
+  `UserPin(user_id, resource_type, resource_id, pinned_at)`.
+  Operators get their habitual workspace as the default
+  landing.
+- ⬜ **Field-level history** — click any field on a resource
+  detail page, see every past value with who / when. Powered
+  by the existing audit_log + a JSON-diff renderer.
+- ⬜ **Recent items / favourites sidebar** — last-N visited
+  resources per user (browser-local) + an explicit star button
+  for sticky favourites (server-side `UserFavourite`).
+- ⬜ **Keyboard shortcut help overlay** — `?` opens a modal
+  listing every binding (Cmd+K is great; growing the surface).
+  One source of truth in `frontend/src/lib/shortcuts.ts`.
+- ⬜ **Print / PDF export for IPAM tree + subnet detail** —
+  server-rendered PDF (weasyprint) with stable page breaks +
+  headers. Auditors and ops handovers love static deliverables;
+  pairs with the compliance report PDF item above.
+
+#### CLI tool
+
+- ⬜ **`spddi` CLI** — stand-alone Python CLI published to PyPI
+  as `spatiumddi-cli`. Auth via `~/.config/spddi/config`
+  (token + URL). Commands mirror the REST surface:
+  `spddi ip alloc`, `spddi subnet ls / show / split / merge`,
+  `spddi zone export / import`, `spddi dhcp scope ls`, etc.
+  Output supports `--format table|json|yaml`. Useful in scripts
+  + ops handover when the UI is inconvenient. Built on `httpx`
+  + `typer` (fast iteration).
 
 ---
 

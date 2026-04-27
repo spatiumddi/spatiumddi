@@ -10,12 +10,32 @@
 </p>
 
 <p align="center">
+  <a href="https://github.com/spatiumddi/spatiumddi/actions/workflows/ci.yml"><img src="https://img.shields.io/github/actions/workflow/status/spatiumddi/spatiumddi/ci.yml?branch=main&label=CI" alt="CI"/></a>
+  <a href="https://github.com/spatiumddi/spatiumddi/security/code-scanning"><img src="https://img.shields.io/badge/security-CodeQL-1f6feb" alt="CodeQL"/></a>
   <a href="https://github.com/spatiumddi/spatiumddi/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-blue.svg" alt="License"/></a>
-  <a href="https://github.com/spatiumddi/spatiumddi/issues"><img src="https://img.shields.io/github/issues/spatiumddi/spatiumddi" alt="Issues"/></a>
   <a href="https://spatiumddi.github.io"><img src="https://img.shields.io/badge/docs-github.io-informational" alt="Docs"/></a>
   <img src="https://img.shields.io/badge/status-alpha-orange" alt="Status"/>
+</p>
+
+<p align="center">
+  <a href="https://github.com/spatiumddi/spatiumddi/releases/latest"><img src="https://img.shields.io/github/v/release/spatiumddi/spatiumddi?label=release" alt="Latest release"/></a>
+  <a href="https://github.com/spatiumddi/spatiumddi/commits/main"><img src="https://img.shields.io/github/last-commit/spatiumddi/spatiumddi" alt="Last commit"/></a>
+  <img src="https://img.shields.io/maintenance/yes/2026" alt="Maintained"/>
+</p>
+
+<p align="center">
   <img src="https://img.shields.io/badge/python-3.12+-green" alt="Python"/>
   <img src="https://img.shields.io/badge/react-18+-61DAFB" alt="React"/>
+  <a href="https://github.com/psf/black"><img src="https://img.shields.io/badge/code%20style-black-000000" alt="Code style: black"/></a>
+  <a href="https://github.com/astral-sh/ruff"><img src="https://img.shields.io/badge/lint-ruff-FCC21B" alt="Lint: ruff"/></a>
+  <a href="https://mypy-lang.org/"><img src="https://img.shields.io/badge/type%20checked-mypy-blue" alt="Type checked: mypy"/></a>
+</p>
+
+<p align="center">
+  <a href="https://github.com/spatiumddi/spatiumddi/stargazers"><img src="https://img.shields.io/github/stars/spatiumddi/spatiumddi?style=social" alt="Stars"/></a>
+  <a href="https://github.com/spatiumddi/spatiumddi/discussions"><img src="https://img.shields.io/github/discussions/spatiumddi/spatiumddi" alt="Discussions"/></a>
+  <a href="https://github.com/spatiumddi/spatiumddi/graphs/contributors"><img src="https://img.shields.io/github/contributors/spatiumddi/spatiumddi" alt="Contributors"/></a>
+  <a href="https://github.com/spatiumddi/spatiumddi/issues"><img src="https://img.shields.io/github/issues/spatiumddi/spatiumddi" alt="Issues"/></a>
 </p>
 
 ---
