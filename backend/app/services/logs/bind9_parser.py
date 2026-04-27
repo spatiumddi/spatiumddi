@@ -128,6 +128,9 @@ def _parse_iso_ts(value: str) -> datetime | None:
         return None
 
 
+_MAX_LINE_LEN: Final = 4096
+
+
 def parse_query_line(line: str, *, fallback_ts: datetime | None = None) -> ParsedQueryLine | None:
     """Parse one BIND9 query log line.
 
@@ -139,10 +142,20 @@ def parse_query_line(line: str, *, fallback_ts: datetime | None = None) -> Parse
     ``fallback_ts`` is used when the line has no leading timestamp
     (e.g. ``print-time no`` in named.conf). The shipper passes the
     receive-time so we don't drop the line.
+
+    Lines are truncated to ``_MAX_LINE_LEN`` before regex matching to
+    bound the cost of the polynomial-backtracking patterns
+    (``\\s+`` repetitions + optional view groups). A real BIND9
+    query line is bounded by the qname (≤ 255 chars per RFC 1035)
+    plus the timestamp / client / view metadata, so 4 KiB is well
+    above any legitimate line. Truncation preserves the raw text
+    on the resulting ParsedQueryLine for forensic inspection.
     """
     line = line.rstrip("\r\n")
     if not line.strip():
         return None
+    if len(line) > _MAX_LINE_LEN:
+        line = line[:_MAX_LINE_LEN]
 
     ts: datetime | None = None
     rest = line

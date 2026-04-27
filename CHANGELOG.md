@@ -7,6 +7,28 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versioning uses 
 
 ## Unreleased
 
+_(no entries yet — next release will add changes that land after `2026.04.26-1`)_
+
+---
+
+## 2026.04.26-1 — 2026-04-26
+
+IPAM operations + observability release. The headline work is the
+soft-delete + Trash recovery surface for accidental deletions, three
+preview-then-commit subnet operations (find-free / split / merge),
+NAT mapping cross-reference into IPAM, the new
+`/admin/platform-insights` page surfacing Postgres + container stats
+without a Prometheus pipeline, and dashboard sub-tabs that split
+the home page into Overview / IPAM / DNS / DHCP. Also bundles per-IP
+role + reservation TTL + MAC observation history, DHCP lease history
+forensics, IPSpace VRF metadata, VXLAN UI surface, the `task_session`
+helper that fixes a long-standing Celery loop-leak across seven
+tasks, the DNS-agent 404 → re-bootstrap recovery path, k8s + Helm
+worker / beat liveness probes, ReDoS hardening on the BIND9 + Kea
+log-line parsers, and the f963137 fix (status-validator +
+`user_modified_at` lock + Proxmox bridge gateway) that was pushed
+in the previous cycle but never made the changelog.
+
 ### Added
 
 - **Dashboard sub-tabs.** Home page now sits under four tabs:
@@ -412,6 +434,22 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versioning uses 
   prod `docker-compose.yml` had — without them, both services
   inherited the Dockerfile's `/health/live` HTTP probe and
   reported `unhealthy` because they don't run an HTTP listener.
+
+### Security
+
+- **ReDoS hardening on agent log parsers.** CodeQL flagged the
+  BIND9 query-line regex (`_QUERY_RE` in
+  `app/services/logs/bind9_parser.py`) as polynomial — the
+  whitespace + optional view-group repetitions could be coerced
+  into quadratic-time matching by a malicious agent shipping a
+  crafted line through `POST /api/v1/dns/agents/query-log-entries`.
+  Added a 4 KiB length cap (`_MAX_LINE_LEN`) at the top of
+  `parse_query_line` before any regex execution; same cap added
+  to `parse_kea_line` for parity. A real BIND9 query line is
+  bounded by qname (≤ 255 chars per RFC 1035) plus timestamp /
+  client / view metadata, so 4 KiB is well above any legitimate
+  line. Verified — a 10 KiB pathological input now caps at 4 KiB
+  and parses in under 50 ms instead of degrading.
 
 ### Fixed
 

@@ -930,6 +930,146 @@ counts of created / updated / skipped / failed.
 dropdown on the subnet header (`SubnetImportExportButton`) replacing
 the older single-purpose export button.
 
+### ✅ 15.14 Per-IP role + reservation TTL + MAC observation history
+
+Three IP enrichment columns landed in `2026.04.26-1` via migration
+`f1c9a4d2b8e6_ip_role_reserved_mac_history`:
+
+- **`ip_address.role`** (string, nullable) — `host` / `loopback` /
+  `anycast` / `vip` / `vrrp` / `secondary` / `gateway`. Orthogonal
+  to `status` — a row can be both `allocated` and a `vip`.
+  `IP_ROLES_SHARED` (`anycast`, `vip`, `vrrp`) bypass MAC-collision
+  warnings, since the same MAC legitimately appears on multiple IPs
+  in load-balancer or HSRP/VRRP topologies. Surfaced in the IP
+  table as a chip and in the create/edit modal as a picker.
+
+- **`ip_address.reserved_until`** (timestamp, nullable) — soft TTL
+  on `status="reserved"` rows. The new beat task
+  `app.tasks.ipam_reservation_sweep.sweep_expired_reservations`
+  runs every 5 min, finds rows whose TTL has passed, and flips them
+  back to `available`. UI shows a relative-time chip ("expires in
+  2 days") on the row + a datetime picker in the edit modal.
+
+- **`ip_mac_history`** table — append-only record of every distinct
+  MAC ever observed against an IP, keyed
+  `(ip_address_id, mac_address)` with `first_seen` + `last_seen`
+  timestamps. Written on every IP create/update where a MAC is
+  present; surfaced via `GET /ipam/addresses/{id}/mac-history`
+  (newest-first, OUI vendor lookup attached). The IP detail toolbar
+  gains a "MAC History" button that opens a modal listing the
+  rows.
+
+### ✅ 15.15 Subnet operations — find-free / split / merge
+
+Three preview-then-commit endpoints, all with typed-CIDR
+confirmation gates and pg advisory locks held through commit:
+
+- `POST /ipam/spaces/{id}/find-free` — walks the IPBlock tree for
+  unallocated CIDRs of the requested prefix length. Optional
+  `parent_block_id` scope (Find Free… on the block detail
+  pre-restricts to that block) and a `min_free_addresses` filter.
+  Service layer in `app.services.ipam.free_space`.
+
+- `POST /ipam/subnets/{id}/split/preview` + `/commit` — break a
+  subnet into 2^k aligned children at a longer prefix. Preview
+  reports the prospective children + any IP-address conflicts
+  (rows that wouldn't fit cleanly into one child or the other);
+  commit refuses if the typed CIDR doesn't match. Service in
+  `app.services.ipam.subnet_split`.
+
+- `POST /ipam/subnets/{id}/merge/preview` + `/commit` — collapse
+  contiguous siblings back into one supernet via
+  `ipaddress.collapse_addresses`. Preview reports the prospective
+  merged CIDR + any conflicts. Single-source gateways are
+  preserved; differing source gateways are nulled (operator must
+  re-set). Service in `app.services.ipam.subnet_merge`.
+
+UI surfaces all three on the subnet-detail header, *and* via the
+bulk-action toolbar on the block- and space-level subnet tables:
+select 1 subnet to enable Split, select 2+ to enable Merge.
+Free-space finder on the block detail header pre-scopes to the
+block.
+
+### ✅ 15.16 Soft-delete + Trash recovery
+
+IPSpace, IPBlock, Subnet, DNSZone, DNSRecord, and DHCPScope
+inherit `SoftDeleteMixin` (`deleted_at`, `deleted_by_user_id`,
+`deletion_batch_id`). A global `do_orm_execute` listener injects
+`deleted_at IS NULL` into every SELECT — opt out via
+`execution_options(include_deleted=True)`. Cascade-stamping under
+one `deletion_batch_id` lets a single Restore click bring back
+every dependent row atomically (subnet → its DHCP scopes; zone →
+its records).
+
+- Subnet / block / space delete is soft by default — UI confirms
+  "move to Trash. You can restore from Admin → Trash within 30
+  days." Hard-delete is reachable via the Permanent button on the
+  Trash row.
+- IP addresses are deliberately NOT soft-deletable — they
+  cascade-delete with their parent subnet, and the parent subnet
+  is the recoverable unit.
+- Nightly `app.tasks.trash_purge.purge_expired_soft_deletes`
+  hard-deletes rows past `PlatformSettings.soft_delete_purge_days`
+  (default 30; set to 0 to keep forever).
+- Admin UI at `/admin/trash` lists deleted rows newest-first,
+  per-type filter + since-date filter + free-text search.
+  Restore button opens a confirmation modal that surfaces conflict
+  details when a live row would clash on the same uniqueness key.
+
+Migration `c1f4a8b27d09_soft_delete`.
+
+### ✅ 15.17 IPSpace VRF / route-domain annotation
+
+Three new optional columns on `ip_space` (migration
+`f1c8b2a945d3_subnet_ops_ipspace_vrf`):
+
+- `vrf_name` — VARCHAR(64), nullable.
+- `route_distinguisher` — VARCHAR(32), nullable. ASN:idx or
+  IPv4:idx form; no validation since vendors disagree.
+- `route_targets` — JSONB list of RT strings (`[]` is a legal
+  value distinct from NULL).
+
+Pure metadata — address allocation already supports overlapping
+ranges via separate IPSpace rows; these columns give operators
+somewhere to put the routing identity for reporting / export /
+future BGP-EVPN integration. Surfaced as badges on the IPSpace
+detail header when set, plus a "VRF / Routing" section in the
+Edit Space modal (open by default since operators kept missing
+it under a collapsed toggle).
+
+### ✅ 15.18 NAT mapping cross-reference into IPAM
+
+`nat_mapping` carries operator-curated 1:1 NAT, PAT, and hide-NAT
+records. SpatiumDDI doesn't render or push these rules — purely
+IPAM cross-reference. Migration `f5b9c1e8d472_nat_ip_fks` adds
+optional FK columns `internal_ip_address_id` +
+`external_ip_address_id` (`ON DELETE SET NULL`) auto-resolved on
+create / update by looking up the typed string in `ip_address`.
+Strings stay authoritative for addresses outside IPAM (a public
+WAN IP, a peer's NAT endpoint).
+
+- **Conflict detection** — create / update rejects 409 when an
+  external IP+ports is already claimed by another `1to1` / `pat`
+  rule on the same protocol (port-overlap aware, protocol-aware).
+- **Per-IP listing** — `GET /ipam/nat-mappings/by-ip/{id}` returns
+  every mapping touching an IPAM row (FK match + INET-string match
+  on either side).
+- **Per-subnet listing** — `GET /ipam/nat-mappings/by-subnet/{id}`
+  uses Postgres `inet <<= cidr` containment to find every mapping
+  whose internal IP falls inside a subnet's CIDR.
+
+UI: clicking the NAT badge on an IP row opens a modal listing
+every mapping for that IP; new "NAT" tab on the subnet detail
+shows every mapping touching the subnet's CIDR.
+
+### ✅ 15.19 VXLAN ID surface in the UI
+
+`subnet.vxlan_id` (Integer, range 1–16 777 214, nullable) existed
+in the schema and the frontend type but no UI ever read or wrote
+it. Numeric input added to Create + Edit subnet modals next to the
+VLAN picker; chip on the subnet detail header next to the existing
+VLAN chip when set.
+
 ## 16. Rules & constraints
 
 Server-side validations that reject requests with a human-readable

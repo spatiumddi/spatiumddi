@@ -6,6 +6,50 @@ SpatiumDDI includes a comprehensive **System Administration** panel accessible t
 
 ---
 
+## 0. Operator surfaces shipped after `2026.04.16-1`
+
+This document was originally written as a forward-looking spec.
+Several admin surfaces have since landed; the rest of this file
+remains the design reference for what hasn't shipped yet.
+
+### Trash (`/admin/trash`) — landed in `2026.04.26-1`
+
+Soft-delete + 30-day recovery for IP spaces, blocks, subnets,
+DNS zones / records, and DHCP scopes. See
+[IPAM § 15.16](IPAM.md#-1516-soft-delete--trash-recovery) for
+the full data model + cascade-batch semantics. The admin page
+lists deleted rows newest-first with type / since / `q` filters,
+per-row Restore (with conflict-detail rendering when a live row
+would clash) and Delete-permanently buttons. Nightly purge sweep
+is operator-configurable via
+`PlatformSettings.soft_delete_purge_days`.
+
+### Platform Insights (`/admin/platform-insights`) — landed in `2026.04.26-1`
+
+Read-only diagnostic surface so operators can see what their
+control plane is doing without standing up a separate Prometheus
+/ pgwatch / Grafana pipeline. Two tabs:
+
+- **Postgres** — version + DB size, cache hit ratio, current WAL
+  position, active vs max connections, longest-running
+  transaction (PID / age / state / query / app / client),
+  per-table size with autovacuum lag, connections grouped by
+  state with idle-in-transaction tinted amber, slow queries from
+  `pg_stat_statements` if the extension is installed.
+- **Containers** — per-container CPU% (computed the same way
+  `docker stats` does), memory used / limit / %, network rx /
+  tx, block-IO read / write. Default-filtered to the
+  `spatiumddi-*` prefix; set the filter to empty to see every
+  container on the host. Reports `available=false` with a
+  one-line setup hint when `/var/run/docker.sock` isn't mounted
+  into the api container.
+
+Backend at `app/api/v1/admin/postgres.py` (4 endpoints) +
+`app/api/v1/admin/containers.py` (1 endpoint). Both
+superadmin-gated.
+
+---
+
 ## 1. System Health Dashboard
 
 The main **Health Overview** page gives a single-pane-of-glass view of the entire platform.

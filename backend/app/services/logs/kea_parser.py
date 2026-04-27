@@ -72,15 +72,26 @@ def _parse_kea_ts(value: str) -> datetime | None:
         return None
 
 
+_MAX_LINE_LEN: Final = 4096
+
+
 def parse_kea_line(line: str, *, fallback_ts: datetime | None = None) -> ParsedDHCPLine | None:
     """Parse one Kea DHCPv4 log line.
 
     Returns ``None`` for empty lines. Lines the regex doesn't match
     still produce a ``ParsedDHCPLine`` with the raw text preserved.
+
+    Lines are truncated to ``_MAX_LINE_LEN`` before matching to bound
+    the cost of regex execution against agent-supplied input. The
+    Kea regex is anchored + bounded so it doesn't have an obvious
+    polynomial path, but the cap is cheap defence-in-depth and
+    matches the bind9_parser pattern.
     """
     line = line.rstrip("\r\n")
     if not line.strip():
         return None
+    if len(line) > _MAX_LINE_LEN:
+        line = line[:_MAX_LINE_LEN]
 
     m = _KEA_LINE_RE.match(line)
     if not m:

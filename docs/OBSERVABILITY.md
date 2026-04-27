@@ -4,6 +4,27 @@
 
 SpatiumDDI provides a fully integrated observability stack: structured logging shipped to a centralized store, a **built-in log viewer in the admin UI**, Prometheus metrics, health endpoints, and a Grafana dashboard bundle. No external observability tooling is required for basic operations, but all outputs are compatible with standard enterprise stacks (ELK, Loki, Datadog, Splunk).
 
+### Native admin surfaces (since `2026.04.26-1`)
+
+Two admin surfaces give operators platform visibility without
+standing up Prometheus / Grafana:
+
+- **Dashboard sub-tabs** (`/dashboard`) — Overview / IPAM / DNS /
+  DHCP. The DNS and DHCP tabs show full-width Recharts
+  time-series of query rate (BIND9 statistics-channels) and
+  traffic (Kea `statistic-get-all`), driven by the per-server
+  `dns_metric_sample` / `dhcp_metric_sample` tables.
+- **Platform Insights** (`/admin/platform-insights`) — Postgres
+  diagnostics (DB size, cache hit, WAL position, slow queries,
+  table sizes, connection state, longest-running transaction)
+  and per-container CPU / memory / network / IO from the local
+  Docker socket. See
+  [SYSTEM_ADMIN § 0](features/SYSTEM_ADMIN.md#0-operator-surfaces-shipped-after-20260416-1).
+
+The native surfaces are intentionally tactical — for long-term
+metrics retention and cross-instance dashboards, fall back to
+Prometheus scraping `/metrics` (see § 6).
+
 ---
 
 ## 1. Structured Logging

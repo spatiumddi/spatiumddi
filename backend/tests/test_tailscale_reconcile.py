@@ -635,8 +635,10 @@ async def test_phase2_diff_device_disappears_drops_records(
         .scalars()
         .all()
     }
-    assert "alive.example.ts.net" in fqdns
-    assert "leaving.example.ts.net" not in fqdns
+    # Set-equality assertion (rather than two ``in`` / ``not in`` checks)
+    # so static analysis can see this is set-membership against IPAM rows,
+    # not URL-substring sanitisation against an untrusted target.
+    assert fqdns == {"alive.example.ts.net"}
 
 
 @pytest.mark.asyncio

@@ -221,6 +221,24 @@ DHCPLease (not persisted long-term — cached in Redis, written to DB for histor
 - **Polling fallback**: Celery task pulls lease dump every N minutes via DHCP driver API
 - Leases are used to update `IPAddress.status`, `IPAddress.last_seen`, and trigger DDNS
 
+### Lease History (forensic trail)
+
+Landed in `2026.04.26-1` via migration
+`f4e1d2a09b75_lease_history_and_nat`. The `dhcp_lease_history`
+table records every lease that ever expired, was reassigned to a
+different MAC, or got swept on absence-delete — gives operators a
+"who had this IP last week" audit trail when the live
+`dhcp_lease` row is gone.
+
+- Written from three sites: the `dhcp_lease_cleanup` expiry sweep,
+  the agent lease-event ingest path on MAC change, and
+  `pull_leases` on absence-delete.
+- Surfaced on the DHCP server detail as a new **Lease History**
+  tab with filtering by MAC / IP / time window.
+- Daily prune task (`app.tasks.dhcp_lease_history_prune`) honours
+  `PlatformSettings.dhcp_lease_history_retention_days` (default
+  90; set to 0 to keep forever).
+
 ---
 
 ## 6. Local Config Caching on DHCP Agents
