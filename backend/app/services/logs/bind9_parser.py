@@ -60,10 +60,17 @@ _QUERY_RE: Final = re.compile(
     r"(?:@\S+\s+)?"
     r"(?P<client_ip>\S+?)"
     r"#(?P<client_port>\d+)"
-    r"(?:\s+\((?P<echo>[^)]*)\))?"
-    # View name appears as ``view <name>`` (no parens) or
-    # ``(view <name>)`` depending on BIND build / config. Tolerate both.
-    r"(?:\s*\(view\s+(?P<view_paren>[^)]+)\))?"
+    # Single optional parenthesised block — either ``(view <name>)``
+    # or generic ``(echo)``. Internal alternation (view-first, echo
+    # second) keeps the two possibilities mutually exclusive at the
+    # engine level so we don't have two independently-optional groups
+    # competing for the same ``\s+(`` prefix. Both branches share the
+    # outer ``\s+\( … \)`` so the engine commits up-front and never
+    # backtracks across the boundary — fixes the py/polynomial-redos
+    # CodeQL alert that the old three-optional-groups shape tripped.
+    r"(?:\s+\((?:view\s+(?P<view_paren>[^)]+)|(?P<echo>[^)]*))\))?"
+    # Optional bare ``view <name>`` form (no parens) — appears in
+    # BIND9 builds that print the view name after the echo block.
     r"(?:\s+view\s+(?P<view_bare>\S+))?"
     r":\s+query:\s+"
     r"(?P<qname>\S+)\s+(?P<qclass>\S+)\s+(?P<qtype>\S+)"
