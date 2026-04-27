@@ -3828,9 +3828,7 @@ export const trashApi = {
       offset?: number;
     } = {},
   ) =>
-    api
-      .get<TrashListResponse>("/admin/trash", { params })
-      .then((r) => r.data),
+    api.get<TrashListResponse>("/admin/trash", { params }).then((r) => r.data),
   restore: (type: TrashEntryType, id: string) =>
     api
       .post<TrashRestoreResponse>(`/admin/trash/${type}/${id}/restore`)
@@ -3893,10 +3891,12 @@ export interface NATMapping {
   name: string;
   kind: NATKind;
   internal_ip: string | null;
+  internal_ip_address_id: string | null;
   internal_subnet_id: string | null;
   internal_port_start: number | null;
   internal_port_end: number | null;
   external_ip: string | null;
+  external_ip_address_id: string | null;
   external_port_start: number | null;
   external_port_end: number | null;
   protocol: NATProtocol;
@@ -3941,6 +3941,107 @@ export interface NATMappingQuery {
   per_page?: number;
 }
 
+// ── Postgres insights + container stats ──────────────────────────────────────
+
+export interface PostgresOverview {
+  version: string;
+  db_size_bytes: number;
+  cache_hit_ratio: number | null;
+  wal_bytes: number | null;
+  active_connections: number;
+  max_connections: number;
+  longest_transaction: {
+    pid: number;
+    state: string | null;
+    age_seconds: number;
+    query: string | null;
+    application_name: string | null;
+    client_addr: string | null;
+  } | null;
+}
+
+export interface PostgresTableSize {
+  schema_name: string;
+  table_name: string;
+  total_bytes: number;
+  table_bytes: number;
+  index_bytes: number;
+  toast_bytes: number;
+  live_rows: number;
+  dead_rows: number;
+  last_autovacuum: string | null;
+  last_autoanalyze: string | null;
+}
+
+export interface PostgresConnection {
+  state: string;
+  count: number;
+}
+
+export interface PostgresSlowQuery {
+  query: string;
+  calls: number;
+  total_time_ms: number;
+  mean_time_ms: number;
+  rows: number;
+}
+
+export interface PostgresSlowQueriesResponse {
+  available: boolean;
+  hint: string | null;
+  rows: PostgresSlowQuery[];
+}
+
+export const postgresApi = {
+  overview: () =>
+    api.get<PostgresOverview>("/admin/postgres/overview").then((r) => r.data),
+  tables: (limit = 50) =>
+    api
+      .get<{ rows: PostgresTableSize[] }>("/admin/postgres/tables", {
+        params: { limit },
+      })
+      .then((r) => r.data.rows),
+  connections: () =>
+    api
+      .get<{ rows: PostgresConnection[] }>("/admin/postgres/connections")
+      .then((r) => r.data.rows),
+  slowQueries: (limit = 20) =>
+    api
+      .get<PostgresSlowQueriesResponse>("/admin/postgres/slow-queries", {
+        params: { limit },
+      })
+      .then((r) => r.data),
+};
+
+export interface ContainerStat {
+  id: string;
+  name: string;
+  image: string;
+  state: string;
+  started_at: string | null;
+  cpu_percent: number | null;
+  memory_bytes: number | null;
+  memory_limit_bytes: number | null;
+  memory_percent: number | null;
+  network_rx_bytes: number | null;
+  network_tx_bytes: number | null;
+  block_read_bytes: number | null;
+  block_write_bytes: number | null;
+}
+
+export interface ContainerStatsResponse {
+  available: boolean;
+  hint: string | null;
+  rows: ContainerStat[];
+}
+
+export const containersApi = {
+  stats: (params: { prefix?: string; include_stopped?: boolean } = {}) =>
+    api
+      .get<ContainerStatsResponse>("/admin/containers/stats", { params })
+      .then((r) => r.data),
+};
+
 export const natApi = {
   list: (params?: NATMappingQuery) =>
     api
@@ -3953,4 +4054,12 @@ export const natApi = {
   update: (id: string, data: NATMappingWrite) =>
     api.patch<NATMapping>(`/ipam/nat-mappings/${id}`, data).then((r) => r.data),
   delete: (id: string) => api.delete(`/ipam/nat-mappings/${id}`),
+  byIp: (ipId: string) =>
+    api
+      .get<NATMapping[]>(`/ipam/nat-mappings/by-ip/${ipId}`)
+      .then((r) => r.data),
+  bySubnet: (subnetId: string) =>
+    api
+      .get<NATMapping[]>(`/ipam/nat-mappings/by-subnet/${subnetId}`)
+      .then((r) => r.data),
 };

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 import structlog
 from sqlalchemy import delete, select
@@ -44,7 +45,7 @@ _PURGE_MODELS_LEAF_FIRST: tuple[type, ...] = (
 )
 
 
-async def _sweep() -> dict[str, int]:
+async def _sweep() -> dict[str, Any]:
     async with task_session() as db:
         ps_res = await db.execute(select(PlatformSettings).limit(1))
         ps = ps_res.scalar_one_or_none()
@@ -99,7 +100,7 @@ async def _sweep() -> dict[str, int]:
 
 
 @celery_app.task(name="app.tasks.trash_purge.purge_expired_soft_deletes")
-def purge_expired_soft_deletes() -> dict[str, int]:
+def purge_expired_soft_deletes() -> dict[str, Any]:
     result = asyncio.run(_sweep())
     logger.info("trash_purge.completed", **result)
     return result

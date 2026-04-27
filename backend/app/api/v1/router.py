@@ -1,6 +1,8 @@
 from fastapi import APIRouter
 
 from app.api.v1.acme import router as acme_router
+from app.api.v1.admin.containers import router as containers_router
+from app.api.v1.admin.postgres import router as postgres_router
 from app.api.v1.admin.trash import router as trash_router
 from app.api.v1.alerts.router import router as alerts_router
 from app.api.v1.api_tokens.router import router as api_tokens_router
@@ -57,3 +59,5 @@ api_v1_router.include_router(docker_router, prefix="/docker", tags=["docker"])
 api_v1_router.include_router(proxmox_router, prefix="/proxmox", tags=["proxmox"])
 api_v1_router.include_router(tailscale_router, prefix="/tailscale", tags=["tailscale"])
 api_v1_router.include_router(trash_router, prefix="/admin", tags=["admin-trash"])
+api_v1_router.include_router(postgres_router, prefix="/admin", tags=["admin-postgres"])
+api_v1_router.include_router(containers_router, prefix="/admin", tags=["admin-containers"])

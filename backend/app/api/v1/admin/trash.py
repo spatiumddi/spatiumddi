@@ -87,9 +87,7 @@ def _row_label(obj: Any) -> str:
     return str(getattr(obj, "id", obj))
 
 
-async def _resolve_usernames(
-    db: Any, user_ids: set[uuid.UUID]
-) -> dict[uuid.UUID, str]:
+async def _resolve_usernames(db: Any, user_ids: set[uuid.UUID]) -> dict[uuid.UUID, str]:
     if not user_ids:
         return {}
     res = await db.execute(select(User.id, User.username).where(User.id.in_(user_ids)))
@@ -128,7 +126,7 @@ async def list_trash(
     # global filter hides them.
     for resource_type in types_to_query:
         model = TYPE_TO_MODEL[resource_type]
-        stmt = (
+        stmt: Any = (
             select(model)
             .where(model.deleted_at.is_not(None))
             .execution_options(include_deleted=True)
@@ -206,7 +204,7 @@ async def restore_row(
         )
 
     model = TYPE_TO_MODEL[type]
-    stmt = (
+    stmt: Any = (
         select(model)
         .where(model.id == row_id, model.deleted_at.is_not(None))
         .execution_options(include_deleted=True)
@@ -282,7 +280,7 @@ async def permanent_delete_from_trash(
         )
 
     model = TYPE_TO_MODEL[type]
-    stmt = (
+    stmt: Any = (
         select(model)
         .where(model.id == row_id, model.deleted_at.is_not(None))
         .execution_options(include_deleted=True)

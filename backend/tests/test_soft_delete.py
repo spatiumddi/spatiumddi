@@ -45,9 +45,7 @@ async def _make_admin(db: AsyncSession) -> tuple[User, str]:
 
 
 @pytest.mark.asyncio
-async def test_soft_delete_ip_space_cascades(
-    client: AsyncClient, db_session: AsyncSession
-) -> None:
+async def test_soft_delete_ip_space_cascades(client: AsyncClient, db_session: AsyncSession) -> None:
     """Deleting an IPSpace soft-deletes every block + subnet under it
     with the same deletion_batch_id."""
     _, token = await _make_admin(db_session)
@@ -83,9 +81,7 @@ async def test_soft_delete_ip_space_cascades(
     # the same batch UUID.
     space_row = (
         await db_session.execute(
-            select(IPSpace)
-            .where(IPSpace.id == space.id)
-            .execution_options(include_deleted=True)
+            select(IPSpace).where(IPSpace.id == space.id).execution_options(include_deleted=True)
         )
     ).scalar_one()
     assert space_row.deleted_at is not None
@@ -93,9 +89,7 @@ async def test_soft_delete_ip_space_cascades(
 
     block_row = (
         await db_session.execute(
-            select(IPBlock)
-            .where(IPBlock.id == block.id)
-            .execution_options(include_deleted=True)
+            select(IPBlock).where(IPBlock.id == block.id).execution_options(include_deleted=True)
         )
     ).scalar_one()
     assert block_row.deleted_at is not None
@@ -103,9 +97,7 @@ async def test_soft_delete_ip_space_cascades(
 
     subnet_row = (
         await db_session.execute(
-            select(Subnet)
-            .where(Subnet.id == subnet.id)
-            .execution_options(include_deleted=True)
+            select(Subnet).where(Subnet.id == subnet.id).execution_options(include_deleted=True)
         )
     ).scalar_one()
     assert subnet_row.deleted_at is not None
@@ -136,9 +128,7 @@ async def test_global_query_filter_hides_soft_deleted(
 
 
 @pytest.mark.asyncio
-async def test_restore_batch_atomic(
-    client: AsyncClient, db_session: AsyncSession
-) -> None:
+async def test_restore_batch_atomic(client: AsyncClient, db_session: AsyncSession) -> None:
     """Restore brings every batch sibling back in one transaction."""
     _, token = await _make_admin(db_session)
     headers = {"Authorization": f"Bearer {token}"}
@@ -149,9 +139,7 @@ async def test_restore_batch_atomic(
     block = IPBlock(space_id=space.id, network="172.16.0.0/12", name="root")
     db_session.add(block)
     await db_session.flush()
-    subnet = Subnet(
-        space_id=space.id, block_id=block.id, network="172.16.1.0/24", name="lan"
-    )
+    subnet = Subnet(space_id=space.id, block_id=block.id, network="172.16.1.0/24", name="lan")
     db_session.add(subnet)
     await db_session.flush()
     await db_session.commit()
@@ -175,9 +163,7 @@ async def test_restore_batch_atomic(
 
 
 @pytest.mark.asyncio
-async def test_restore_conflict_409(
-    client: AsyncClient, db_session: AsyncSession
-) -> None:
+async def test_restore_conflict_409(client: AsyncClient, db_session: AsyncSession) -> None:
     """Restoring a batch whose head row would clash returns 409.
 
     Tested via DNSZone — the live ``uq_dns_zone_group_view_name``
@@ -208,9 +194,7 @@ async def test_restore_conflict_409(
     await db_session.commit()
 
     # Soft-delete via API.
-    resp = await client.delete(
-        f"/api/v1/dns/groups/{group1.id}/zones/{zone.id}", headers=headers
-    )
+    resp = await client.delete(f"/api/v1/dns/groups/{group1.id}/zones/{zone.id}", headers=headers)
     assert resp.status_code == 204
 
     # Create an active zone with the same name in the SAME group — the
@@ -237,9 +221,7 @@ async def test_restore_conflict_409(
     # Manually rewrite the soft-deleted row to clash with `live`.
     sd_row = (
         await db_session.execute(
-            select(DNSZone)
-            .where(DNSZone.id == zone.id)
-            .execution_options(include_deleted=True)
+            select(DNSZone).where(DNSZone.id == zone.id).execution_options(include_deleted=True)
         )
     ).scalar_one()
     sd_row.name = "other.test."
@@ -272,9 +254,7 @@ async def test_permanent_delete_hard_removes_row(
     await db_session.flush()
     await db_session.commit()
 
-    resp = await client.delete(
-        f"/api/v1/ipam/spaces/{space.id}?permanent=true", headers=headers
-    )
+    resp = await client.delete(f"/api/v1/ipam/spaces/{space.id}?permanent=true", headers=headers)
     assert resp.status_code == 204, resp.text
 
     # Even include_deleted shouldn't find the row.
@@ -288,9 +268,7 @@ async def test_permanent_delete_hard_removes_row(
 
 
 @pytest.mark.asyncio
-async def test_trash_list_surface(
-    client: AsyncClient, db_session: AsyncSession
-) -> None:
+async def test_trash_list_surface(client: AsyncClient, db_session: AsyncSession) -> None:
     _, token = await _make_admin(db_session)
     headers = {"Authorization": f"Bearer {token}"}
 
@@ -314,9 +292,7 @@ async def test_trash_list_surface(
 
 
 @pytest.mark.asyncio
-async def test_trash_list_filter_by_type(
-    client: AsyncClient, db_session: AsyncSession
-) -> None:
+async def test_trash_list_filter_by_type(client: AsyncClient, db_session: AsyncSession) -> None:
     _, token = await _make_admin(db_session)
     headers = {"Authorization": f"Bearer {token}"}
 
@@ -369,24 +345,18 @@ async def test_dns_zone_soft_delete_cascades_records(
     await db_session.flush()
     await db_session.commit()
 
-    resp = await client.delete(
-        f"/api/v1/dns/groups/{group.id}/zones/{zone.id}", headers=headers
-    )
+    resp = await client.delete(f"/api/v1/dns/groups/{group.id}/zones/{zone.id}", headers=headers)
     assert resp.status_code == 204, resp.text
 
     # Default SELECT hides them.
-    list_res = await client.get(
-        f"/api/v1/dns/groups/{group.id}/zones", headers=headers
-    )
+    list_res = await client.get(f"/api/v1/dns/groups/{group.id}/zones", headers=headers)
     assert list_res.status_code == 200
     assert all(z["id"] != str(zone.id) for z in list_res.json())
 
     # Both rows share the same deletion_batch_id.
     zone_row = (
         await db_session.execute(
-            select(DNSZone)
-            .where(DNSZone.id == zone.id)
-            .execution_options(include_deleted=True)
+            select(DNSZone).where(DNSZone.id == zone.id).execution_options(include_deleted=True)
         )
     ).scalar_one()
     rec_row = (
@@ -473,9 +443,7 @@ async def test_purge_sweep_disabled_when_zero(db_session: AsyncSession) -> None:
 
 
 @pytest.mark.asyncio
-async def test_dhcp_scope_soft_delete(
-    client: AsyncClient, db_session: AsyncSession
-) -> None:
+async def test_dhcp_scope_soft_delete(client: AsyncClient, db_session: AsyncSession) -> None:
     _, token = await _make_admin(db_session)
     headers = {"Authorization": f"Bearer {token}"}
 
@@ -485,9 +453,7 @@ async def test_dhcp_scope_soft_delete(
     block = IPBlock(space_id=space.id, network="10.0.0.0/8", name="root")
     db_session.add(block)
     await db_session.flush()
-    subnet = Subnet(
-        space_id=space.id, block_id=block.id, network="10.0.5.0/24", name="lan"
-    )
+    subnet = Subnet(space_id=space.id, block_id=block.id, network="10.0.5.0/24", name="lan")
     db_session.add(subnet)
     await db_session.flush()
 
@@ -520,9 +486,7 @@ async def test_dhcp_scope_soft_delete(
     # ``DHCPScope`` has joined-eager-load relationships (pools / statics) so
     # the result needs ``.unique()`` before scalar_one().
     result = await db_session.execute(
-        select(DHCPScope)
-        .where(DHCPScope.id == scope.id)
-        .execution_options(include_deleted=True)
+        select(DHCPScope).where(DHCPScope.id == scope.id).execution_options(include_deleted=True)
     )
     scope_row = result.unique().scalar_one()
     assert scope_row.deleted_at is not None

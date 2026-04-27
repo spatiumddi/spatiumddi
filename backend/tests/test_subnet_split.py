@@ -124,9 +124,7 @@ async def test_commit_migrates_addresses(db_session: AsyncSession) -> None:
     )
     await db_session.flush()
 
-    result = await commit_subnet_split(
-        db_session, subnet, 25, confirm_cidr="10.0.0.0/24"
-    )
+    result = await commit_subnet_split(db_session, subnet, 25, confirm_cidr="10.0.0.0/24")
     assert result.parent_cidr == "10.0.0.0/24"
     assert len(result.children) == 2
 
@@ -140,20 +138,12 @@ async def test_commit_migrates_addresses(db_session: AsyncSession) -> None:
     right = by_cidr["10.0.0.128/25"]
 
     left_rows = (
-        (
-            await db_session.execute(
-                select(IPAddress).where(IPAddress.subnet_id == left.id)
-            )
-        )
+        (await db_session.execute(select(IPAddress).where(IPAddress.subnet_id == left.id)))
         .scalars()
         .all()
     )
     right_rows = (
-        (
-            await db_session.execute(
-                select(IPAddress).where(IPAddress.subnet_id == right.id)
-            )
-        )
+        (await db_session.execute(select(IPAddress).where(IPAddress.subnet_id == right.id)))
         .scalars()
         .all()
     )
@@ -188,17 +178,11 @@ async def test_commit_renamed_placeholder_survives(
     )
     await db_session.flush()
 
-    result = await commit_subnet_split(
-        db_session, subnet, 25, confirm_cidr="10.0.0.0/24"
-    )
+    result = await commit_subnet_split(db_session, subnet, 25, confirm_cidr="10.0.0.0/24")
     by_cidr = {str(c.network): c for c in result.children}
     right = by_cidr["10.0.0.128/25"]
     rows = (
-        (
-            await db_session.execute(
-                select(IPAddress).where(IPAddress.subnet_id == right.id)
-            )
-        )
+        (await db_session.execute(select(IPAddress).where(IPAddress.subnet_id == right.id)))
         .scalars()
         .all()
     )
@@ -214,9 +198,7 @@ async def test_commit_rejects_wrong_confirm_cidr(
 ) -> None:
     subnet = await _make_subnet(db_session, "10.0.0.0/24")
     with pytest.raises(SplitError) as exc:
-        await commit_subnet_split(
-            db_session, subnet, 25, confirm_cidr="10.0.0.0/25"
-        )
+        await commit_subnet_split(db_session, subnet, 25, confirm_cidr="10.0.0.0/25")
     assert exc.value.status_code == 422
 
 
@@ -255,9 +237,7 @@ async def test_commit_rejects_dhcp_scope_straddling_boundary(
     ), preview.conflicts
 
     with pytest.raises(SplitError) as exc:
-        await commit_subnet_split(
-            db_session, subnet, 25, confirm_cidr="10.0.0.0/24"
-        )
+        await commit_subnet_split(db_session, subnet, 25, confirm_cidr="10.0.0.0/24")
     assert exc.value.status_code == 409
 
 
@@ -290,9 +270,7 @@ async def test_commit_rebinds_dhcp_scope_to_one_child(
     )
     await db_session.flush()
 
-    result = await commit_subnet_split(
-        db_session, subnet, 25, confirm_cidr="10.0.0.0/24"
-    )
+    result = await commit_subnet_split(db_session, subnet, 25, confirm_cidr="10.0.0.0/24")
     by_cidr = {str(c.network): c for c in result.children}
     left = by_cidr["10.0.0.0/25"]
 
@@ -329,9 +307,7 @@ async def test_endpoint_smoke(client: AsyncClient, db_session: AsyncSession) -> 
 
 
 @pytest.mark.asyncio
-async def test_endpoint_rejects_bad_confirm(
-    client: AsyncClient, db_session: AsyncSession
-) -> None:
+async def test_endpoint_rejects_bad_confirm(client: AsyncClient, db_session: AsyncSession) -> None:
     _, token = await _make_admin(db_session)
     subnet = await _make_subnet(db_session, "10.0.0.0/24")
 

@@ -166,9 +166,7 @@ async def test_prefix_too_wide_yields_empty(db_session: AsyncSession) -> None:
 async def test_address_family_filters(db_session: AsyncSession) -> None:
     """An IPv6 block in the space is invisible to a v4 sweep."""
     space = await _make_space(db_session)
-    db_session.add(
-        IPBlock(space_id=space.id, network="2001:db8::/32", name="v6")
-    )
+    db_session.add(IPBlock(space_id=space.id, network="2001:db8::/32", name="v6"))
     db_session.add(IPBlock(space_id=space.id, network="10.0.0.0/16", name="v4"))
     await db_session.flush()
 
@@ -192,9 +190,7 @@ async def test_count_capped_at_100(db_session: AsyncSession) -> None:
     db_session.add(IPBlock(space_id=space.id, network="10.0.0.0/8", name="huge"))
     await db_session.flush()
 
-    result = await find_free_space(
-        db_session, space_id=space.id, prefix_length=24, count=9999
-    )
+    result = await find_free_space(db_session, space_id=space.id, prefix_length=24, count=9999)
     assert len(result.candidates) == 100
 
 
@@ -241,9 +237,7 @@ async def test_endpoint_smoke(client: AsyncClient, db_session: AsyncSession) -> 
 
 
 @pytest.mark.asyncio
-async def test_endpoint_validates_prefix(
-    client: AsyncClient, db_session: AsyncSession
-) -> None:
+async def test_endpoint_validates_prefix(client: AsyncClient, db_session: AsyncSession) -> None:
     """Out-of-range prefix is a 422 (pydantic validation)."""
     _, token = await _make_admin(db_session)
     space = await _make_space(db_session)

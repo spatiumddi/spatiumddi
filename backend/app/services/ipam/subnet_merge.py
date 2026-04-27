@@ -237,7 +237,7 @@ def _summarise_or_none(nets: list[IPNetwork]) -> IPNetwork | None:
     try:
         # ``collapse_addresses`` requires same family — caller has
         # already filtered.
-        collapsed = list(ipaddress.collapse_addresses(nets))  # type: ignore[arg-type]
+        collapsed = list(ipaddress.collapse_addresses(nets))  # type: ignore[arg-type,type-var]
     except (TypeError, ValueError):
         return None
     if len(collapsed) != 1:
@@ -327,9 +327,7 @@ async def preview_subnet_merge(
         parsed.append(net)
 
     merged: IPNetwork | None = None
-    if family_v4 is not None and parsed and not any(
-        c.type == "family_mismatch" for c in conflicts
-    ):
+    if family_v4 is not None and parsed and not any(c.type == "family_mismatch" for c in conflicts):
         merged = _summarise_or_none(parsed)
         if merged is None:
             conflicts.append(
@@ -348,7 +346,11 @@ async def preview_subnet_merge(
 
     # DHCP scope handling — at most one survivor.
     scopes = (
-        (await db.execute(select(DHCPScope).where(DHCPScope.subnet_id.in_([s.id for s in sources]))))
+        (
+            await db.execute(
+                select(DHCPScope).where(DHCPScope.subnet_id.in_([s.id for s in sources]))
+            )
+        )
         .unique()
         .scalars()
         .all()
@@ -425,8 +427,7 @@ async def commit_subnet_merge(
     """
     if not await _try_advisory_lock(db, target.id):
         raise MergeError(
-            "Another operation is already in progress for this subnet. "
-            "Retry once it completes.",
+            "Another operation is already in progress for this subnet. " "Retry once it completes.",
             status_code=423,
         )
 
@@ -524,9 +525,7 @@ async def commit_subnet_merge(
     deleted_default = 0
     for s in sources:
         rows = (
-            (await db.execute(select(IPAddress).where(IPAddress.subnet_id == s.id)))
-            .scalars()
-            .all()
+            (await db.execute(select(IPAddress).where(IPAddress.subnet_id == s.id))).scalars().all()
         )
         for row in rows:
             if str(row.address) in source_boundary_ips and _is_default_placeholder(row):
@@ -597,9 +596,7 @@ async def commit_subnet_merge(
                     address=net_addr,
                     status="network",
                     description="Network address",
-                    created_by_user_id=(
-                        current_user.id if current_user is not None else None
-                    ),
+                    created_by_user_id=(current_user.id if current_user is not None else None),
                 )
             )
             placeholders_created += 1
@@ -612,9 +609,7 @@ async def commit_subnet_merge(
                         address=bcast,
                         status="broadcast",
                         description="Broadcast address",
-                        created_by_user_id=(
-                            current_user.id if current_user is not None else None
-                        ),
+                        created_by_user_id=(current_user.id if current_user is not None else None),
                     )
                 )
                 placeholders_created += 1

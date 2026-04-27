@@ -282,9 +282,7 @@ async def preview_subnet_split(
         static_rows = (
             (
                 await db.execute(
-                    select(DHCPStaticAssignment).where(
-                        DHCPStaticAssignment.scope_id.in_(scope_ids)
-                    )
+                    select(DHCPStaticAssignment).where(DHCPStaticAssignment.scope_id.in_(scope_ids))
                 )
             )
             .scalars()
@@ -386,9 +384,7 @@ async def preview_subnet_split(
         for child, prev in zip(children_nets, children_preview, strict=True):
             if prev.dhcp_scope_id == scope.id:
                 matching.append(prev.cidr)
-        if len(matching) == 0 and (
-            pools_by_scope.get(scope.id) or statics_by_scope.get(scope.id)
-        ):
+        if len(matching) == 0 and (pools_by_scope.get(scope.id) or statics_by_scope.get(scope.id)):
             conflicts.append(
                 SplitConflict(
                     type="dhcp_scope_straddles_boundary",
@@ -484,8 +480,7 @@ async def commit_subnet_split(
     """
     if not await _try_advisory_lock(db, subnet.id):
         raise SplitError(
-            "Another operation is already in progress for this subnet. "
-            "Retry once it completes.",
+            "Another operation is already in progress for this subnet. " "Retry once it completes.",
             status_code=423,
         )
 
@@ -495,8 +490,7 @@ async def commit_subnet_split(
 
     if confirm_cidr != canonical_parent:
         raise SplitError(
-            f"confirm_cidr {confirm_cidr!r} does not match parent CIDR "
-            f"{canonical_parent!r}.",
+            f"confirm_cidr {confirm_cidr!r} does not match parent CIDR " f"{canonical_parent!r}.",
             status_code=422,
         )
 
@@ -504,8 +498,7 @@ async def commit_subnet_split(
     preview = await preview_subnet_split(db, subnet, new_prefix_length)
     if preview.conflicts:
         raise SplitError(
-            "Split blocked by conflicts: "
-            + "; ".join(c.detail for c in preview.conflicts),
+            "Split blocked by conflicts: " + "; ".join(c.detail for c in preview.conflicts),
             status_code=409,
         )
 
@@ -635,9 +628,7 @@ async def commit_subnet_split(
                     address=net_addr,
                     status="network",
                     description="Network address",
-                    created_by_user_id=(
-                        current_user.id if current_user is not None else None
-                    ),
+                    created_by_user_id=(current_user.id if current_user is not None else None),
                 )
             )
             placeholders_created += 1
@@ -650,9 +641,7 @@ async def commit_subnet_split(
                         address=bcast,
                         status="broadcast",
                         description="Broadcast address",
-                        created_by_user_id=(
-                            current_user.id if current_user is not None else None
-                        ),
+                        created_by_user_id=(current_user.id if current_user is not None else None),
                     )
                 )
                 placeholders_created += 1
@@ -803,9 +792,7 @@ async def commit_subnet_split(
             "row(s) (recreated on children)"
         )
     if dhcp_servers_notified:
-        summary.append(
-            f"Notified {dhcp_servers_notified} DHCP server(s) to re-render config"
-        )
+        summary.append(f"Notified {dhcp_servers_notified} DHCP server(s) to re-render config")
 
     logger.info(
         "subnet_split",

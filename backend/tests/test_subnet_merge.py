@@ -111,12 +111,8 @@ async def test_preview_block_mismatch(db_session: AsyncSession) -> None:
     block_b = IPBlock(space_id=space.id, network="172.16.0.0/16", name="bb")
     db_session.add_all([block_a, block_b])
     await db_session.flush()
-    a = Subnet(
-        space_id=space.id, block_id=block_a.id, network="10.0.0.0/25", name="a"
-    )
-    b = Subnet(
-        space_id=space.id, block_id=block_b.id, network="172.16.0.0/25", name="b"
-    )
+    a = Subnet(space_id=space.id, block_id=block_a.id, network="10.0.0.0/25", name="a")
+    b = Subnet(space_id=space.id, block_id=block_b.id, network="172.16.0.0/25", name="b")
     db_session.add_all([a, b])
     await db_session.flush()
 
@@ -154,15 +150,19 @@ async def test_commit_merges_addresses(db_session: AsyncSession) -> None:
                 IPAddress(
                     subnet_id=s.id,
                     address=addr,
-                    status="network" if addr.endswith(".0") or addr == "10.0.0.128" else "broadcast",
-                    description="Network address" if addr.endswith(".0") or addr == "10.0.0.128" else "Broadcast address",
+                    status=(
+                        "network" if addr.endswith(".0") or addr == "10.0.0.128" else "broadcast"
+                    ),
+                    description=(
+                        "Network address"
+                        if addr.endswith(".0") or addr == "10.0.0.128"
+                        else "Broadcast address"
+                    ),
                 )
             )
     await db_session.flush()
 
-    result = await commit_subnet_merge(
-        db_session, a, [b.id], confirm_cidr="10.0.0.0/24"
-    )
+    result = await commit_subnet_merge(db_session, a, [b.id], confirm_cidr="10.0.0.0/24")
     assert str(result.merged_subnet.network) == "10.0.0.0/24"
     assert sorted(result.deleted_subnet_ids) == sorted([a.id, b.id])
 
@@ -207,22 +207,14 @@ async def test_commit_rejects_multiple_dhcp_scopes(
     group = DHCPServerGroup(name=f"g-{uuid.uuid4().hex[:6]}", description="")
     db_session.add(group)
     await db_session.flush()
-    db_session.add(
-        DHCPScope(
-            group_id=group.id, subnet_id=a.id, name="a", address_family="ipv4"
-        )
-    )
+    db_session.add(DHCPScope(group_id=group.id, subnet_id=a.id, name="a", address_family="ipv4"))
     # Distinct group to avoid the unique-(group, subnet) constraint
     # collision; in practice you can't have two scopes-on-same-group-on-
     # same-subnet anyway.
     group2 = DHCPServerGroup(name=f"g-{uuid.uuid4().hex[:6]}", description="")
     db_session.add(group2)
     await db_session.flush()
-    db_session.add(
-        DHCPScope(
-            group_id=group2.id, subnet_id=b.id, name="b", address_family="ipv4"
-        )
-    )
+    db_session.add(DHCPScope(group_id=group2.id, subnet_id=b.id, name="b", address_family="ipv4"))
     await db_session.flush()
 
     preview = await preview_subnet_merge(db_session, a, [b.id])
@@ -239,15 +231,11 @@ async def test_commit_rebinds_single_dhcp_scope(db_session: AsyncSession) -> Non
     group = DHCPServerGroup(name=f"g-{uuid.uuid4().hex[:6]}", description="")
     db_session.add(group)
     await db_session.flush()
-    scope = DHCPScope(
-        group_id=group.id, subnet_id=a.id, name="a", address_family="ipv4"
-    )
+    scope = DHCPScope(group_id=group.id, subnet_id=a.id, name="a", address_family="ipv4")
     db_session.add(scope)
     await db_session.flush()
 
-    result = await commit_subnet_merge(
-        db_session, a, [b.id], confirm_cidr="10.0.0.0/24"
-    )
+    result = await commit_subnet_merge(db_session, a, [b.id], confirm_cidr="10.0.0.0/24")
     refreshed = await db_session.get(DHCPScope, scope.id)
     assert refreshed is not None
     assert refreshed.subnet_id == result.merged_subnet.id

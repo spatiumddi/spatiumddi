@@ -29,12 +29,13 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field, field_validator, model_validator
-from sqlalchemy import String, cast, func, select
+from sqlalchemy import String, and_, cast, func, or_, select
+from sqlalchemy.dialects.postgresql import INET
 
 from app.api.deps import DB, CurrentUser
 from app.api.v1.dhcp._audit import write_audit
 from app.core.permissions import require_resource_permission
-from app.models.ipam import NATMapping
+from app.models.ipam import IPAddress, NATMapping, Subnet
 
 router = APIRouter(
     prefix="/nat-mappings",
@@ -178,10 +179,12 @@ class NATMappingResponse(BaseModel):
     name: str
     kind: str
     internal_ip: str | None
+    internal_ip_address_id: uuid.UUID | None
     internal_subnet_id: uuid.UUID | None
     internal_port_start: int | None
     internal_port_end: int | None
     external_ip: str | None
+    external_ip_address_id: uuid.UUID | None
     external_port_start: int | None
     external_port_end: int | None
     protocol: str
@@ -198,6 +201,80 @@ class NATMappingResponse(BaseModel):
     @classmethod
     def _coerce_inet(cls, v: Any) -> Any:
         return str(v) if v is not None else v
+
+
+# ── Helpers ────────────────────────────────────────────────────────────────
+
+
+async def _resolve_ip_to_address_id(db: Any, ip_str: str | None) -> uuid.UUID | None:
+    """Look up an IPAddress row whose ``address`` matches the literal IP.
+
+    Returns the UUID if found, ``None`` if the IP isn't tracked in IPAM.
+    The INET ``host()`` cast on both sides handles netmask-suffixed
+    forms (``10.0.0.5/32``) so an exact-match lookup works regardless
+    of how the operator typed it.
+    """
+
+    if not ip_str:
+        return None
+    try:
+        res = await db.execute(
+            select(IPAddress.id).where(
+                func.host(IPAddress.address) == func.host(cast(ip_str, INET))
+            )
+        )
+        row = res.first()
+        return row[0] if row else None
+    except Exception:
+        # Bad IP literal — let pydantic validation surface it elsewhere.
+        return None
+
+
+async def _check_external_conflict(
+    db: Any,
+    *,
+    kind: str,
+    external_ip: str | None,
+    external_port_start: int | None,
+    external_port_end: int | None,
+    protocol: str,
+    exclude_id: uuid.UUID | None = None,
+) -> NATMapping | None:
+    """Detect an existing 1to1/pat mapping claiming the same external slot.
+
+    Two ``1to1`` mappings on the same external IP collide. A ``pat``
+    overlapping a ``1to1`` on the same external IP also collides — the
+    1to1 owns every port. Two ``pat`` mappings collide only when their
+    external port ranges overlap on the same protocol. Returns the
+    conflicting row if any, else None.
+    """
+
+    if not external_ip or kind not in ("1to1", "pat"):
+        return None
+
+    base = select(NATMapping).where(
+        NATMapping.external_ip == cast(external_ip, INET),
+        NATMapping.kind.in_(("1to1", "pat")),
+    )
+    if exclude_id is not None:
+        base = base.where(NATMapping.id != exclude_id)
+
+    rows = (await db.execute(base)).scalars().all()
+    for other in rows:
+        # 1to1 on either side claims all ports.
+        if kind == "1to1" or other.kind == "1to1":
+            return other
+        # Both pat — protocol must match (or one side is "any") and
+        # port ranges must overlap.
+        if other.protocol != "any" and protocol != "any" and other.protocol != protocol:
+            continue
+        a_lo = external_port_start or 0
+        a_hi = external_port_end or external_port_start or 65535
+        b_lo = other.external_port_start or 0
+        b_hi = other.external_port_end or other.external_port_start or 65535
+        if a_lo <= b_hi and b_lo <= a_hi:
+            return other
+    return None
 
 
 class NATMappingPage(BaseModel):
@@ -258,7 +335,28 @@ async def list_nat_mappings(
 async def create_nat_mapping(
     body: NATMappingCreate, db: DB, user: CurrentUser
 ) -> NATMappingResponse:
+    conflict = await _check_external_conflict(
+        db,
+        kind=body.kind,
+        external_ip=body.external_ip,
+        external_port_start=body.external_port_start,
+        external_port_end=body.external_port_end,
+        protocol=body.protocol,
+    )
+    if conflict is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"External IP {body.external_ip} already claimed by "
+                f"NAT mapping {conflict.name!r} ({conflict.kind})"
+            ),
+        )
+
     row = NATMapping(**body.model_dump())
+    # Auto-resolve string IPs to IPAM rows when known. Strings stay
+    # authoritative; the FK is just for fast joins + cascade-on-delete.
+    row.internal_ip_address_id = await _resolve_ip_to_address_id(db, body.internal_ip)
+    row.external_ip_address_id = await _resolve_ip_to_address_id(db, body.external_ip)
     db.add(row)
     await db.flush()
     write_audit(
@@ -322,8 +420,32 @@ async def update_nat_mapping(
     except Exception as exc:
         raise HTTPException(status_code=422, detail=str(exc))
 
+    conflict = await _check_external_conflict(
+        db,
+        kind=merged["kind"],
+        external_ip=merged["external_ip"],
+        external_port_start=merged["external_port_start"],
+        external_port_end=merged["external_port_end"],
+        protocol=merged["protocol"],
+        exclude_id=row.id,
+    )
+    if conflict is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"External IP {merged['external_ip']} already claimed by "
+                f"NAT mapping {conflict.name!r} ({conflict.kind})"
+            ),
+        )
+
     for key, value in patch.items():
         setattr(row, key, value)
+
+    # Re-resolve FK if either IP changed (or was cleared).
+    if "internal_ip" in patch:
+        row.internal_ip_address_id = await _resolve_ip_to_address_id(db, patch["internal_ip"])
+    if "external_ip" in patch:
+        row.external_ip_address_id = await _resolve_ip_to_address_id(db, patch["external_ip"])
 
     write_audit(
         db,
@@ -338,6 +460,83 @@ async def update_nat_mapping(
     await db.commit()
     await db.refresh(row)
     return NATMappingResponse.model_validate(row)
+
+
+@router.get("/by-ip/{ip_address_id}", response_model=list[NATMappingResponse])
+async def list_nat_mappings_for_ip(
+    ip_address_id: uuid.UUID, db: DB, _: CurrentUser
+) -> list[NATMappingResponse]:
+    """Every NAT mapping that touches a given IPAM address.
+
+    Matches on the FK first (cheap join) and falls back to the INET
+    string for legacy rows that pre-date the FK or were created with
+    an external_ip outside IPAM. Both internal and external sides
+    counted; the IP can play either role in a NAT pair.
+    """
+
+    ip = await db.get(IPAddress, ip_address_id)
+    if ip is None:
+        raise HTTPException(status_code=404, detail="IP address not found")
+
+    addr_str = str(ip.address)
+    inet_lit = cast(addr_str, INET)
+    rows = (
+        (
+            await db.execute(
+                select(NATMapping)
+                .where(
+                    or_(
+                        NATMapping.internal_ip_address_id == ip_address_id,
+                        NATMapping.external_ip_address_id == ip_address_id,
+                        NATMapping.internal_ip == inet_lit,
+                        NATMapping.external_ip == inet_lit,
+                    )
+                )
+                .order_by(NATMapping.name)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return [NATMappingResponse.model_validate(r) for r in rows]
+
+
+@router.get("/by-subnet/{subnet_id}", response_model=list[NATMappingResponse])
+async def list_nat_mappings_for_subnet(
+    subnet_id: uuid.UUID, db: DB, _: CurrentUser
+) -> list[NATMappingResponse]:
+    """Every NAT mapping whose internal IP falls inside this subnet's CIDR.
+
+    Combines:
+      * mappings with ``internal_subnet_id == subnet_id`` (hide-NAT pinned to subnet)
+      * mappings whose ``internal_ip`` is contained by the subnet's network
+    """
+
+    subnet = await db.get(Subnet, subnet_id)
+    if subnet is None:
+        raise HTTPException(status_code=404, detail="Subnet not found")
+
+    cidr_lit = cast(str(subnet.network), INET)
+    rows = (
+        (
+            await db.execute(
+                select(NATMapping)
+                .where(
+                    or_(
+                        NATMapping.internal_subnet_id == subnet_id,
+                        and_(
+                            NATMapping.internal_ip.is_not(None),
+                            NATMapping.internal_ip.op("<<=")(cidr_lit),
+                        ),
+                    )
+                )
+                .order_by(NATMapping.name)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return [NATMappingResponse.model_validate(r) for r in rows]
 
 
 @router.delete("/{mapping_id}", status_code=status.HTTP_204_NO_CONTENT)

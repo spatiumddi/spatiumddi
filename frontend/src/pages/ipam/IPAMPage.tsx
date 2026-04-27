@@ -42,6 +42,7 @@ import {
   dhcpApi,
   customFieldsApi,
   vlansApi,
+  natApi,
   IP_ROLE_OPTIONS,
   type IPSpace,
   type IPBlock,
@@ -55,6 +56,7 @@ import {
   type VLAN,
   type DHCPLeaseSyncResult,
   type MacHistoryEntry,
+  type NATMapping,
 } from "@/lib/api";
 import { copyToClipboard } from "@/lib/clipboard";
 import { cn, swatchTintCls, zebraBodyCls } from "@/lib/utils";
@@ -1400,6 +1402,7 @@ function CreateSubnetModal({
   const [blockId, setBlockId] = useState(defaultBlockId ?? "");
   const [gateway, setGateway] = useState("");
   const [vlanRefId, setVlanRefId] = useState<string | null>(null);
+  const [vxlanId, setVxlanId] = useState<string>("");
   const [skipAuto, setSkipAuto] = useState(false);
   const [customFields, setCustomFields] = useState<Record<string, unknown>>({});
   const [error, setError] = useState<string | null>(null);
@@ -1497,6 +1500,7 @@ function CreateSubnetModal({
         name: name || undefined,
         gateway: gateway || undefined,
         vlan_ref_id: vlanRefId ?? undefined,
+        vxlan_id: vxlanId.trim() ? Number(vxlanId.trim()) : null,
         status: "active",
         skip_auto_addresses: skipAuto,
         custom_fields: customFields,
@@ -1669,6 +1673,17 @@ function CreateSubnetModal({
           />
         </Field>
         <VlanPicker vlanRefId={vlanRefId} onChange={setVlanRefId} />
+        <Field label="VXLAN ID (optional)">
+          <input
+            type="number"
+            min={1}
+            max={16777214}
+            placeholder="1 – 16777214"
+            value={vxlanId}
+            onChange={(e) => setVxlanId(e.target.value)}
+            className={inputCls}
+          />
+        </Field>
         <label className="flex items-center gap-2 text-xs text-muted-foreground cursor-pointer">
           <input
             type="checkbox"
@@ -2616,8 +2631,9 @@ function SubnetDetail({
   const [editingAddress, setEditingAddress] = useState<IPAddress | null>(null);
   const [showFilters, setShowFilters] = useState(false);
   const [activeSubnetTab, setActiveSubnetTab] = useState<
-    "addresses" | "dhcp" | "aliases"
+    "addresses" | "dhcp" | "aliases" | "nat"
   >("addresses");
+  const [natModalIp, setNatModalIp] = useState<IPAddress | null>(null);
   const [selectedIpIds, setSelectedIpIds] = useState<Set<string>>(new Set());
   const [showBulkEdit, setShowBulkEdit] = useState(false);
   const [showBulkDelete, setShowBulkDelete] = useState(false);
@@ -3080,6 +3096,14 @@ function SubnetDetail({
               </span>
             </div>
           ) : null}
+          {subnet.vxlan_id != null && (
+            <div className="flex items-center gap-1.5">
+              <span className="text-xs text-muted-foreground">VXLAN</span>
+              <span className="text-xs font-medium font-mono">
+                {subnet.vxlan_id}
+              </span>
+            </div>
+          )}
           <div className="flex items-center gap-1.5">
             <span className="text-xs text-muted-foreground">Total IPs</span>
             <span className="text-xs font-medium">{subnet.total_ips}</span>
@@ -3169,6 +3193,18 @@ function SubnetDetail({
           >
             Aliases
           </button>
+          <button
+            onClick={() => setActiveSubnetTab("nat")}
+            className={cn(
+              "px-3 py-2 text-xs font-medium border-b-2 -mb-px transition-colors",
+              activeSubnetTab === "nat"
+                ? "border-primary text-foreground"
+                : "border-transparent text-muted-foreground hover:text-foreground",
+            )}
+            title="NAT mappings whose internal IP falls inside this subnet"
+          >
+            NAT
+          </button>
           {activeSubnetTab === "addresses" && selectedIpIds.size > 0 && (
             <div className="ml-auto flex items-center gap-2 py-1">
               <span className="text-xs font-medium text-muted-foreground">
@@ -3210,6 +3246,12 @@ function SubnetDetail({
       {activeSubnetTab === "aliases" && (
         <div className="flex-1 overflow-auto">
           <AliasesSubnetPanel subnetId={subnet.id} />
+        </div>
+      )}
+
+      {activeSubnetTab === "nat" && (
+        <div className="flex-1 overflow-auto">
+          <NatSubnetPanel subnetId={subnet.id} />
         </div>
       )}
 
@@ -3613,12 +3655,17 @@ function SubnetDetail({
                                     </span>
                                   )}
                                   {(addr.nat_mapping_count ?? 0) > 0 && (
-                                    <span
-                                      className="inline-flex items-center rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 dark:bg-amber-900/30 dark:text-amber-400"
-                                      title={`Referenced in ${addr.nat_mapping_count} NAT mapping${(addr.nat_mapping_count ?? 0) === 1 ? "" : "s"} — see /ipam/nat`}
+                                    <button
+                                      type="button"
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        setNatModalIp(addr);
+                                      }}
+                                      className="inline-flex items-center rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 hover:bg-amber-200 dark:bg-amber-900/30 dark:text-amber-400 dark:hover:bg-amber-900/50"
+                                      title={`Click to view ${addr.nat_mapping_count} NAT mapping${(addr.nat_mapping_count ?? 0) === 1 ? "" : "s"}`}
                                     >
-                                      NAT
-                                    </span>
+                                      NAT {addr.nat_mapping_count}
+                                    </button>
                                   )}
                                 </span>
                               </td>
@@ -3962,6 +4009,12 @@ function SubnetDetail({
         <EditAddressModal
           address={editingAddress}
           onClose={() => setEditingAddress(null)}
+        />
+      )}
+      {natModalIp && (
+        <NatMappingsForIpModal
+          ip={natModalIp}
+          onClose={() => setNatModalIp(null)}
         />
       )}
       {confirmDeleteAddr && (
@@ -4676,6 +4729,9 @@ function EditSubnetModal({
   const [vlanRefId, setVlanRefId] = useState<string | null>(
     subnet.vlan_ref_id ?? null,
   );
+  const [vxlanId, setVxlanId] = useState<string>(
+    subnet.vxlan_id != null ? String(subnet.vxlan_id) : "",
+  );
   const [status, setStatus] = useState(subnet.status);
   const [customFields, setCustomFields] = useState<Record<string, unknown>>(
     (subnet.custom_fields as Record<string, unknown>) ?? {},
@@ -4793,6 +4849,7 @@ function EditSubnetModal({
         description,
         gateway: gateway || undefined,
         vlan_ref_id: vlanRefId,
+        vxlan_id: vxlanId.trim() ? Number(vxlanId.trim()) : null,
         status,
         custom_fields: customFields,
         dns_inherit_settings: dnsInherit,
@@ -4982,6 +5039,17 @@ function EditSubnetModal({
             VLAN to manage).
           </p>
         )}
+        <Field label="VXLAN ID (optional)">
+          <input
+            type="number"
+            min={1}
+            max={16777214}
+            placeholder="1 – 16777214"
+            value={vxlanId}
+            onChange={(e) => setVxlanId(e.target.value)}
+            className={inputCls}
+          />
+        </Field>
         <Field label="Status">
           <select
             className={inputCls}
@@ -5921,6 +5989,145 @@ function MacHistoryModal({
 }
 
 // ─── Aliases Subnet Panel ────────────────────────────────────────────────────
+
+function _formatNatPorts(start: number | null, end: number | null): string {
+  if (start == null && end == null) return "";
+  if (end == null || end === start) return `:${start}`;
+  return `:${start}–${end}`;
+}
+
+function _formatNatLine(m: NATMapping): {
+  from: string;
+  to: string;
+  proto: string;
+} {
+  const internal =
+    (m.internal_ip ??
+      (m.internal_subnet_id
+        ? `subnet:${m.internal_subnet_id.slice(0, 8)}`
+        : "—")) + _formatNatPorts(m.internal_port_start, m.internal_port_end);
+  const external =
+    (m.external_ip ?? "—") +
+    _formatNatPorts(m.external_port_start, m.external_port_end);
+  return { from: internal, to: external, proto: m.protocol };
+}
+
+function NatRowsTable({
+  rows,
+  emptyText,
+}: {
+  rows: NATMapping[];
+  emptyText: string;
+}) {
+  if (rows.length === 0) {
+    return (
+      <p className="px-6 py-4 text-sm text-muted-foreground">{emptyText}</p>
+    );
+  }
+  return (
+    <table className="w-full text-sm">
+      <thead className="bg-muted/40 text-xs">
+        <tr>
+          <th className="px-3 py-2 text-left font-medium">Name</th>
+          <th className="px-3 py-2 text-left font-medium">Kind</th>
+          <th className="px-3 py-2 text-left font-medium">
+            Internal → External
+          </th>
+          <th className="px-3 py-2 text-left font-medium">Proto</th>
+          <th className="px-3 py-2 text-left font-medium">Device</th>
+          <th className="px-3 py-2 text-left font-medium">Description</th>
+        </tr>
+      </thead>
+      <tbody className={zebraBodyCls}>
+        {rows.map((m) => {
+          const f = _formatNatLine(m);
+          return (
+            <tr key={m.id}>
+              <td className="px-3 py-1.5 font-medium">{m.name}</td>
+              <td className="px-3 py-1.5">
+                <span className="inline-flex rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium uppercase">
+                  {m.kind}
+                </span>
+              </td>
+              <td className="px-3 py-1.5 font-mono text-xs">
+                {f.from}
+                <span className="mx-1 text-muted-foreground">→</span>
+                {f.to}
+              </td>
+              <td className="px-3 py-1.5 text-xs uppercase text-muted-foreground">
+                {f.proto}
+              </td>
+              <td className="px-3 py-1.5 text-xs text-muted-foreground">
+                {m.device_label ?? "—"}
+              </td>
+              <td className="px-3 py-1.5 text-xs text-muted-foreground">
+                {m.description ?? "—"}
+              </td>
+            </tr>
+          );
+        })}
+      </tbody>
+    </table>
+  );
+}
+
+function NatSubnetPanel({ subnetId }: { subnetId: string }) {
+  const { data = [], isLoading } = useQuery({
+    queryKey: ["subnet-nat-mappings", subnetId],
+    queryFn: () => natApi.bySubnet(subnetId),
+  });
+  if (isLoading) {
+    return <p className="px-6 py-4 text-sm text-muted-foreground">Loading…</p>;
+  }
+  return (
+    <div className="space-y-2 p-2">
+      <p className="px-3 pt-1 text-xs text-muted-foreground">
+        Every NAT mapping whose internal IP falls inside this subnet's CIDR, or
+        that's pinned to it as a hide-NAT source.
+      </p>
+      <NatRowsTable
+        rows={data}
+        emptyText="No NAT mappings reference any IP in this subnet."
+      />
+    </div>
+  );
+}
+
+function NatMappingsForIpModal({
+  ip,
+  onClose,
+}: {
+  ip: IPAddress;
+  onClose: () => void;
+}) {
+  const { data = [], isLoading } = useQuery({
+    queryKey: ["nat-by-ip", ip.id],
+    queryFn: () => natApi.byIp(ip.id),
+  });
+  return (
+    <Modal title={`NAT mappings for ${ip.address}`} onClose={onClose}>
+      <div className="space-y-3">
+        {isLoading ? (
+          <p className="text-sm text-muted-foreground">Loading…</p>
+        ) : (
+          <NatRowsTable
+            rows={data}
+            emptyText="No NAT mappings reference this IP."
+          />
+        )}
+        <div className="flex justify-end">
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded-md border px-3 py-1.5 text-sm hover:bg-accent"
+          >
+            Close
+          </button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
 
 function AliasesSubnetPanel({ subnetId }: { subnetId: string }) {
   const qc = useQueryClient();
@@ -8390,42 +8597,50 @@ function BlockDetailView({
           defaultBlockId={block.id}
           onClose={() => setShowFindFree(false)}
           onPickCidr={(cidr) => {
-            setFreeRangePreset({ network: cidr, first: "", last: "", size: 0, prefix_len: 0 });
+            setFreeRangePreset({
+              network: cidr,
+              first: "",
+              last: "",
+              size: 0,
+              prefix_len: 0,
+            });
             setShowFindFree(false);
             setShowCreateSubnet(true);
           }}
         />
       )}
-      {showSplitSubnet && (() => {
-        const subnetId = Array.from(selectedSubnets)[0];
-        const sn = allSubnets.find((s) => s.id === subnetId);
-        return sn ? (
-          <SplitSubnetModal
-            subnet={sn}
-            onClose={() => setShowSplitSubnet(false)}
-            onCommitted={() => {
-              setShowSplitSubnet(false);
-              setSelectedSubnets(new Set());
-              qc.invalidateQueries({ queryKey: ["subnets"] });
-            }}
-          />
-        ) : null;
-      })()}
-      {showMergeSubnet && (() => {
-        const subnetId = Array.from(selectedSubnets)[0];
-        const sn = allSubnets.find((s) => s.id === subnetId);
-        return sn ? (
-          <MergeSubnetSiblingPicker
-            subnet={sn}
-            onClose={() => setShowMergeSubnet(false)}
-            onCommitted={() => {
-              setShowMergeSubnet(false);
-              setSelectedSubnets(new Set());
-              qc.invalidateQueries({ queryKey: ["subnets"] });
-            }}
-          />
-        ) : null;
-      })()}
+      {showSplitSubnet &&
+        (() => {
+          const subnetId = Array.from(selectedSubnets)[0];
+          const sn = allSubnets.find((s) => s.id === subnetId);
+          return sn ? (
+            <SplitSubnetModal
+              subnet={sn}
+              onClose={() => setShowSplitSubnet(false)}
+              onCommitted={() => {
+                setShowSplitSubnet(false);
+                setSelectedSubnets(new Set());
+                qc.invalidateQueries({ queryKey: ["subnets"] });
+              }}
+            />
+          ) : null;
+        })()}
+      {showMergeSubnet &&
+        (() => {
+          const subnetId = Array.from(selectedSubnets)[0];
+          const sn = allSubnets.find((s) => s.id === subnetId);
+          return sn ? (
+            <MergeSubnetSiblingPicker
+              subnet={sn}
+              onClose={() => setShowMergeSubnet(false)}
+              onCommitted={() => {
+                setShowMergeSubnet(false);
+                setSelectedSubnets(new Set());
+                qc.invalidateQueries({ queryKey: ["subnets"] });
+              }}
+            />
+          ) : null;
+        })()}
       <div className="flex-1 overflow-auto">
         {(() => {
           // Build a synthetic BlockNode for the current block so flattenToTableRows
@@ -9243,9 +9458,9 @@ function SpaceTableView({
           {space.description && (
             <p className="text-xs text-muted-foreground">{space.description}</p>
           )}
-          {(space.vrf_name ||
-            space.route_distinguisher ||
-            (space.route_targets && space.route_targets.length > 0)) ? (
+          {space.vrf_name ||
+          space.route_distinguisher ||
+          (space.route_targets && space.route_targets.length > 0) ? (
             <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
               {space.vrf_name && (
                 <span className="rounded border px-1.5 py-0.5 font-mono">
@@ -9689,34 +9904,36 @@ function SpaceTableView({
           }}
         />
       )}
-      {showSplitSubnet && (() => {
-        const sn = subnets?.find((s) => s.id === selectedSubnetIds[0]);
-        return sn ? (
-          <SplitSubnetModal
-            subnet={sn}
-            onClose={() => setShowSplitSubnet(false)}
-            onCommitted={() => {
-              setShowSplitSubnet(false);
-              setSelected(new Set());
-              qc.invalidateQueries({ queryKey: ["subnets", space.id] });
-            }}
-          />
-        ) : null;
-      })()}
-      {showMergeSubnet && (() => {
-        const sn = subnets?.find((s) => s.id === selectedSubnetIds[0]);
-        return sn ? (
-          <MergeSubnetSiblingPicker
-            subnet={sn}
-            onClose={() => setShowMergeSubnet(false)}
-            onCommitted={() => {
-              setShowMergeSubnet(false);
-              setSelected(new Set());
-              qc.invalidateQueries({ queryKey: ["subnets", space.id] });
-            }}
-          />
-        ) : null;
-      })()}
+      {showSplitSubnet &&
+        (() => {
+          const sn = subnets?.find((s) => s.id === selectedSubnetIds[0]);
+          return sn ? (
+            <SplitSubnetModal
+              subnet={sn}
+              onClose={() => setShowSplitSubnet(false)}
+              onCommitted={() => {
+                setShowSplitSubnet(false);
+                setSelected(new Set());
+                qc.invalidateQueries({ queryKey: ["subnets", space.id] });
+              }}
+            />
+          ) : null;
+        })()}
+      {showMergeSubnet &&
+        (() => {
+          const sn = subnets?.find((s) => s.id === selectedSubnetIds[0]);
+          return sn ? (
+            <MergeSubnetSiblingPicker
+              subnet={sn}
+              onClose={() => setShowMergeSubnet(false)}
+              onCommitted={() => {
+                setShowMergeSubnet(false);
+                setSelected(new Set());
+                qc.invalidateQueries({ queryKey: ["subnets", space.id] });
+              }}
+            />
+          ) : null;
+        })()}
       {showBulkDelete &&
         (() => {
           const subnetCount = [...selected].filter((k) =>

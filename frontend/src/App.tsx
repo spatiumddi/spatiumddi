@@ -24,6 +24,7 @@ import { AuthProvidersPage } from "@/pages/admin/AuthProvidersPage";
 import { GroupsPage } from "@/pages/admin/GroupsPage";
 import { RolesPage } from "@/pages/admin/RolesPage";
 import { TrashPage } from "@/pages/admin/TrashPage";
+import { PlatformInsightsPage } from "@/pages/admin/PlatformInsightsPage";
 import { SettingsPage } from "@/pages/SettingsPage";
 import { useAuth } from "@/hooks/useAuth";
 
@@ -67,6 +68,10 @@ export default function App() {
         <Route path="admin/api-tokens" element={<ApiTokensPage />} />
         <Route path="admin/alerts" element={<AlertsPage />} />
         <Route path="admin/trash" element={<TrashPage />} />
+        <Route
+          path="admin/platform-insights"
+          element={<PlatformInsightsPage />}
+        />
         <Route
           path="admin/failover-channels"
           element={<Navigate to="/dhcp" replace />}

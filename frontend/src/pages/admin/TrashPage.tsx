@@ -1,11 +1,7 @@
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { RotateCcw, Search, Trash2 } from "lucide-react";
-import {
-  trashApi,
-  type TrashEntry,
-  type TrashEntryType,
-} from "@/lib/api";
+import { trashApi, type TrashEntry, type TrashEntryType } from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
 
@@ -78,8 +74,8 @@ function ConfirmRestoreModal({
       <div className="space-y-4">
         <p className="text-sm">
           Restore{" "}
-          <span className="font-mono font-medium">{entry.name_or_cidr}</span>{" "}
-          ({TYPE_LABELS[entry.type]})
+          <span className="font-mono font-medium">{entry.name_or_cidr}</span> (
+          {TYPE_LABELS[entry.type]})
           {entry.batch_size > 1
             ? ` and ${entry.batch_size - 1} cascaded child row${entry.batch_size - 1 === 1 ? "" : "s"}`
             : ""}
@@ -140,8 +136,8 @@ function ConfirmPermanentDeleteModal({
       <div className="space-y-4">
         <p className="text-sm">
           This permanently removes{" "}
-          <span className="font-mono font-medium">{entry.name_or_cidr}</span>{" "}
-          ({TYPE_LABELS[entry.type]}). It cannot be restored.
+          <span className="font-mono font-medium">{entry.name_or_cidr}</span> (
+          {TYPE_LABELS[entry.type]}). It cannot be restored.
         </p>
         {error && (
           <p className="rounded bg-red-500/15 p-2 text-xs text-red-700 dark:text-red-300">
@@ -199,143 +195,143 @@ export function TrashPage() {
 
   return (
     <div className="h-full overflow-auto p-6">
-    <div className="mx-auto max-w-5xl space-y-4">
-      <div>
-        <h1 className="flex items-center gap-2 text-xl font-semibold">
-          <Trash2 className="h-5 w-5" />
-          Trash
-        </h1>
-        <p className="text-sm text-muted-foreground">
-          Soft-deleted IPAM / DNS / DHCP rows. Restore by row to bring back
-          every cascaded child in the same batch. The nightly purge sweep
-          permanently removes anything older than the platform retention
-          window (default 30 days).
-        </p>
-      </div>
-
-      <div className="flex flex-wrap items-center gap-3">
-        <div className="flex items-center gap-2">
-          <label className="text-xs text-muted-foreground">Type</label>
-          <select
-            className="rounded-md border bg-background px-2 py-1 text-sm"
-            value={filterType}
-            onChange={(e) =>
-              setFilterType(e.target.value as TrashEntryType | "all")
-            }
-          >
-            <option value="all">All</option>
-            {(Object.keys(TYPE_LABELS) as TrashEntryType[]).map((t) => (
-              <option key={t} value={t}>
-                {TYPE_LABELS[t]}
-              </option>
-            ))}
-          </select>
+      <div className="mx-auto max-w-5xl space-y-4">
+        <div>
+          <h1 className="flex items-center gap-2 text-xl font-semibold">
+            <Trash2 className="h-5 w-5" />
+            Trash
+          </h1>
+          <p className="text-sm text-muted-foreground">
+            Soft-deleted IPAM / DNS / DHCP rows. Restore by row to bring back
+            every cascaded child in the same batch. The nightly purge sweep
+            permanently removes anything older than the platform retention
+            window (default 30 days).
+          </p>
         </div>
-        <div className="flex items-center gap-2">
-          <label className="text-xs text-muted-foreground">Since</label>
-          <input
-            type="datetime-local"
-            value={filterSince}
-            onChange={(e) => setFilterSince(e.target.value)}
-            className="rounded-md border bg-background px-2 py-1 text-sm"
+
+        <div className="flex flex-wrap items-center gap-3">
+          <div className="flex items-center gap-2">
+            <label className="text-xs text-muted-foreground">Type</label>
+            <select
+              className="rounded-md border bg-background px-2 py-1 text-sm"
+              value={filterType}
+              onChange={(e) =>
+                setFilterType(e.target.value as TrashEntryType | "all")
+              }
+            >
+              <option value="all">All</option>
+              {(Object.keys(TYPE_LABELS) as TrashEntryType[]).map((t) => (
+                <option key={t} value={t}>
+                  {TYPE_LABELS[t]}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="flex items-center gap-2">
+            <label className="text-xs text-muted-foreground">Since</label>
+            <input
+              type="datetime-local"
+              value={filterSince}
+              onChange={(e) => setFilterSince(e.target.value)}
+              className="rounded-md border bg-background px-2 py-1 text-sm"
+            />
+          </div>
+          <div className="flex items-center gap-2">
+            <Search className="h-4 w-4 text-muted-foreground" />
+            <input
+              type="text"
+              placeholder="Search name / CIDR…"
+              value={filterQ}
+              onChange={(e) => setFilterQ(e.target.value)}
+              className="rounded-md border bg-background px-2 py-1 text-sm"
+            />
+          </div>
+        </div>
+
+        <div className="overflow-x-auto rounded border">
+          <table className="min-w-[800px] w-full text-sm">
+            <thead>
+              <tr className="bg-muted/40 text-left">
+                <th className="px-2 py-1 font-medium">Type</th>
+                <th className="px-2 py-1 font-medium">Name / CIDR</th>
+                <th className="px-2 py-1 font-medium">Deleted at</th>
+                <th className="px-2 py-1 font-medium">Deleted by</th>
+                <th className="px-2 py-1 font-medium">Batch size</th>
+                <th className="px-2 py-1 font-medium text-right">Actions</th>
+              </tr>
+            </thead>
+            <tbody className={zebraBodyCls}>
+              {isLoading && (
+                <tr>
+                  <td colSpan={6} className="px-2 py-4 text-muted-foreground">
+                    Loading…
+                  </td>
+                </tr>
+              )}
+              {!isLoading && items.length === 0 && (
+                <tr>
+                  <td colSpan={6} className="px-2 py-4 text-muted-foreground">
+                    Trash is empty.
+                  </td>
+                </tr>
+              )}
+              {items.map((item) => (
+                <tr key={`${item.type}:${item.id}`}>
+                  <td className="px-2 py-1">
+                    <span
+                      className={cn(
+                        "inline-flex rounded px-1.5 py-0.5 text-xs font-medium",
+                        TYPE_BADGE[item.type],
+                      )}
+                    >
+                      {TYPE_LABELS[item.type]}
+                    </span>
+                  </td>
+                  <td className="px-2 py-1 font-mono">{item.name_or_cidr}</td>
+                  <td className="px-2 py-1 text-muted-foreground">
+                    {formatTs(item.deleted_at)}
+                  </td>
+                  <td className="px-2 py-1 text-muted-foreground">
+                    {item.deleted_by_username ?? "—"}
+                  </td>
+                  <td className="px-2 py-1 text-center">{item.batch_size}</td>
+                  <td className="px-2 py-1 text-right space-x-2">
+                    <button
+                      onClick={() => setPendingRestore(item)}
+                      title="Restore this row + its batch siblings"
+                      className="inline-flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-muted"
+                    >
+                      <RotateCcw className="h-3 w-3" />
+                      Restore
+                    </button>
+                    <button
+                      onClick={() => setPendingPermanent(item)}
+                      title="Permanently delete (cannot be undone)"
+                      className="inline-flex items-center gap-1 rounded-md border border-red-500/40 px-2 py-1 text-xs text-red-700 hover:bg-red-500/10 dark:text-red-300"
+                    >
+                      <Trash2 className="h-3 w-3" />
+                      Delete
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+
+        {pendingRestore && (
+          <ConfirmRestoreModal
+            entry={pendingRestore}
+            onClose={() => setPendingRestore(null)}
           />
-        </div>
-        <div className="flex items-center gap-2">
-          <Search className="h-4 w-4 text-muted-foreground" />
-          <input
-            type="text"
-            placeholder="Search name / CIDR…"
-            value={filterQ}
-            onChange={(e) => setFilterQ(e.target.value)}
-            className="rounded-md border bg-background px-2 py-1 text-sm"
+        )}
+        {pendingPermanent && (
+          <ConfirmPermanentDeleteModal
+            entry={pendingPermanent}
+            onClose={() => setPendingPermanent(null)}
           />
-        </div>
+        )}
       </div>
-
-      <div className="overflow-x-auto rounded border">
-        <table className="min-w-[800px] w-full text-sm">
-          <thead>
-            <tr className="bg-muted/40 text-left">
-              <th className="px-2 py-1 font-medium">Type</th>
-              <th className="px-2 py-1 font-medium">Name / CIDR</th>
-              <th className="px-2 py-1 font-medium">Deleted at</th>
-              <th className="px-2 py-1 font-medium">Deleted by</th>
-              <th className="px-2 py-1 font-medium">Batch size</th>
-              <th className="px-2 py-1 font-medium text-right">Actions</th>
-            </tr>
-          </thead>
-          <tbody className={zebraBodyCls}>
-            {isLoading && (
-              <tr>
-                <td colSpan={6} className="px-2 py-4 text-muted-foreground">
-                  Loading…
-                </td>
-              </tr>
-            )}
-            {!isLoading && items.length === 0 && (
-              <tr>
-                <td colSpan={6} className="px-2 py-4 text-muted-foreground">
-                  Trash is empty.
-                </td>
-              </tr>
-            )}
-            {items.map((item) => (
-              <tr key={`${item.type}:${item.id}`}>
-                <td className="px-2 py-1">
-                  <span
-                    className={cn(
-                      "inline-flex rounded px-1.5 py-0.5 text-xs font-medium",
-                      TYPE_BADGE[item.type],
-                    )}
-                  >
-                    {TYPE_LABELS[item.type]}
-                  </span>
-                </td>
-                <td className="px-2 py-1 font-mono">{item.name_or_cidr}</td>
-                <td className="px-2 py-1 text-muted-foreground">
-                  {formatTs(item.deleted_at)}
-                </td>
-                <td className="px-2 py-1 text-muted-foreground">
-                  {item.deleted_by_username ?? "—"}
-                </td>
-                <td className="px-2 py-1 text-center">{item.batch_size}</td>
-                <td className="px-2 py-1 text-right space-x-2">
-                  <button
-                    onClick={() => setPendingRestore(item)}
-                    title="Restore this row + its batch siblings"
-                    className="inline-flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-muted"
-                  >
-                    <RotateCcw className="h-3 w-3" />
-                    Restore
-                  </button>
-                  <button
-                    onClick={() => setPendingPermanent(item)}
-                    title="Permanently delete (cannot be undone)"
-                    className="inline-flex items-center gap-1 rounded-md border border-red-500/40 px-2 py-1 text-xs text-red-700 hover:bg-red-500/10 dark:text-red-300"
-                  >
-                    <Trash2 className="h-3 w-3" />
-                    Delete
-                  </button>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-
-      {pendingRestore && (
-        <ConfirmRestoreModal
-          entry={pendingRestore}
-          onClose={() => setPendingRestore(null)}
-        />
-      )}
-      {pendingPermanent && (
-        <ConfirmPermanentDeleteModal
-          entry={pendingPermanent}
-          onClose={() => setPendingPermanent(null)}
-        />
-      )}
-    </div>
     </div>
   );
 }

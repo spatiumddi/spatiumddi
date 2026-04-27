@@ -127,9 +127,7 @@ async def _load_blocks(
     seen[root.id] = root
     frontier: list[uuid.UUID] = [root.id]
     while frontier:
-        next_rows = await db.execute(
-            select(IPBlock).where(IPBlock.parent_block_id.in_(frontier))
-        )
+        next_rows = await db.execute(select(IPBlock).where(IPBlock.parent_block_id.in_(frontier)))
         next_ids: list[uuid.UUID] = []
         for blk in next_rows.scalars().all():
             if blk.id in seen:
@@ -212,10 +210,7 @@ def _candidates_for_block(
     # smaller than the parent — already guarded above.
     for candidate in block_net.subnets(new_prefix=prefix_length):
         # Skip candidates that overlap any occupant.
-        if any(
-            candidate.overlaps(occ)  # type: ignore[arg-type]
-            for occ in occupants
-        ):
+        if any(candidate.overlaps(occ) for occ in occupants):  # type: ignore[arg-type]
             continue
         out.append(candidate)
         if len(out) >= remaining:

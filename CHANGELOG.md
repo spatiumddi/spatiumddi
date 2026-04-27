@@ -9,6 +9,200 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versioning uses 
 
 ### Added
 
+- **Dashboard sub-tabs.** Home page now sits under four tabs:
+  Overview / IPAM / DNS / DHCP. Selection persists to
+  ``localStorage`` so reload lands on the last-viewed tab; the KPI
+  strip stays visible across all tabs (subnet count + utilisation +
+  zones + servers as the always-present inventory). Per tab:
+  - **Overview** — heatmap, Top Subnets (compact, top 6), Live
+    Activity feed, Platform Health card, empty-state for fresh
+    installs. The "everything-at-a-glance" page.
+  - **IPAM** — heatmap (also shown), three new summary cards (IPv4
+    vs IPv6 subnet-count split, total NAT mappings, IPv4 capacity
+    headroom), Top Subnets extended list (top 20), and the
+    Integrations panel (Kubernetes / Docker / Proxmox / Tailscale)
+    moved here since they all populate IPAM rows.
+  - **DNS** — DNS query rate chart full-width (previously cramped
+    into a half-width slot on the home page) + DNS server list
+    with status / driver / group / last-seen columns. Empty-state
+    explains how to register a server.
+  - **DHCP** — DHCP traffic chart full-width + DHCP server list
+    + HA Pairs section listing groups with ≥ 2 Kea members.
+    Same empty-state pattern.
+  Refresh button now also invalidates the new
+  ``["nat-mappings", "count"]`` and ``["platform-health"]`` keys
+  alongside the existing dashboard query keys.
+
+- **Platform Insights admin page.** New `/admin/platform-insights`
+  surface with two tabs covering the bits operators usually need a
+  separate Prometheus / pgwatch / Grafana pipeline for:
+  - **Postgres** — version + DB size, cache hit ratio, current WAL
+    position, active vs max connections, longest-running
+    transaction (PID / age / state / query / app / client). Tables
+    by total size (heap + indexes + TOAST, live + dead rows, last
+    autovacuum) for catching unbounded growth in audit / metrics
+    / log tables. Connections grouped by state with "idle in
+    transaction" tinted amber — the canonical signal for a stuck
+    pool. Slow queries from `pg_stat_statements` if the extension
+    is enabled, with a friendly hint when it isn't (we don't
+    install it ourselves; needs `shared_preload_libraries` +
+    restart).
+  - **Containers** — per-container CPU% (computed the same way
+    `docker stats` does), memory used / limit / %, network rx /
+    tx, block-IO read / write. Default-filtered to the
+    `spatiumddi-*` prefix; pass empty `prefix=` to see every
+    container on the host. Tone-coded (red >80% CPU, amber >50%;
+    red >90% memory, amber >75%) and auto-refreshes every 5 s.
+    Endpoint reports `available=false` with a one-line hint when
+    `/var/run/docker.sock` isn't mounted into the api container —
+    operator opt-in via the same compose toggle the Docker
+    integration uses. K8s side covered the same way via a
+    hostPath mount.
+  Backend at `app/api/v1/admin/postgres.py` (4 endpoints) +
+  `app/api/v1/admin/containers.py` (1 endpoint). Sidebar entry
+  under Admin → Platform Insights with a Cpu icon.
+
+- **NAT mapping ↔ IPAM tighter integration.** NAT records used
+  to be loose strings; an `IPAddress` row showed only a count
+  badge with no way to drill in. Now:
+  - **FK columns on `nat_mapping`** — `internal_ip_address_id`
+    and `external_ip_address_id` (nullable, ``ON DELETE SET
+    NULL``) auto-resolved on create / update by looking up the
+    typed string in `ip_address`. Strings stay authoritative for
+    addresses outside IPAM (a public WAN IP, a peer's NAT
+    endpoint), so existing operator workflows keep working.
+    Migration `f5b9c1e8d472` adds + backfills the columns.
+  - **Conflict detection** — create / update reject 409 when the
+    requested external IP+ports is already claimed by another
+    `1to1` / `pat` rule on the same protocol. Port-overlap
+    aware; protocol-aware (an `any`-protocol pat collides with
+    everything on its IP).
+  - **Per-IP and per-subnet listing endpoints** —
+    `GET /ipam/nat-mappings/by-ip/{id}` returns every mapping
+    touching an IPAM row (FK match + INET-string match on either
+    side); `GET /ipam/nat-mappings/by-subnet/{id}` uses Postgres
+    `inet <<= cidr` containment to find every mapping whose
+    internal IP falls inside a subnet's CIDR.
+  - **UI** — clicking the NAT badge on an IP row opens a modal
+    listing every mapping for that IP (formatted as
+    `internal:port → external:port` with kind / protocol /
+    device pills). A new "NAT" tab on the subnet detail page
+    shows every mapping touching that subnet.
+
+- **VXLAN ID surface in the IPAM UI.** `subnet.vxlan_id` already
+  existed in the schema (Integer, nullable, range 1–16 777 214)
+  and the frontend type, but no UI ever read or wrote it.
+  Numeric input added to Create + Edit subnet modals next to the
+  VLAN picker; chip on the subnet detail header next to the
+  existing VLAN chip when set.
+
+- **Per-IP role + reservation TTL + MAC observation history.**
+  `IPAddress` gains `role` (host / loopback / anycast / vip /
+  vrrp / secondary / gateway — orthogonal to status) and
+  `reserved_until` (datetime, nullable). New beat task
+  `app.tasks.ipam_reservation_sweep.sweep_expired_reservations`
+  flips reserved rows past their TTL back to `available`, on a
+  5-minute cadence. Roles in `IP_ROLES_SHARED` (anycast / vip /
+  vrrp) bypass MAC-collision warnings — the same MAC legitimately
+  appears on multiple IPs in a load-balancer or HSRP/VRRP pair.
+  New `ip_mac_history` table tracks every distinct MAC ever
+  observed against an IP, keyed `(ip_address_id, mac_address)`
+  with `first_seen` + `last_seen` timestamps; written on every IP
+  create / update where a MAC is present, surfaced via
+  `GET /ipam/addresses/{id}/mac-history` (newest-first, OUI
+  vendor lookup attached). Migration
+  `f1c9a4d2b8e6_ip_role_reserved_mac_history`. Test coverage in
+  `tests/test_ip_role.py`, `tests/test_mac_history.py`,
+  `tests/test_reservation_sweep.py`.
+
+- **IPAM subnet operations — find-free + split + merge.** Three
+  preview-then-commit endpoints under `/ipam/spaces/{id}/find-
+  free`, `/ipam/subnets/{id}/split/preview` + `/commit`,
+  `/ipam/subnets/{id}/merge/preview` + `/commit`. Find-free
+  walks the IPBlock tree for unallocated CIDRs of a requested
+  prefix length (with optional `parent_block_id` scope and a
+  minimum-free-addresses filter). Split breaks a subnet into
+  2^k aligned children at a longer prefix; merge collapses
+  contiguous siblings back into one supernet via
+  `ipaddress.collapse_addresses`. Both gate non-trivial
+  operations on a typed-CIDR confirmation, hold a pg advisory
+  lock through commit, and re-validate every constraint pre-
+  mutation. Surfaced in the UI via three header buttons on
+  the subnet detail (Find Free… / Split… / Merge…) **and** via
+  the bulk-action toolbar on the block- and space-level subnet
+  tables: select 1 subnet to split, select 2+ to merge.
+  Free-space finder also lives on the block detail header
+  pre-scoped to that block.
+
+- **`IPSpace` VRF / route-domain annotation.** Three new
+  optional columns on `ip_space`: `vrf_name` (≤ 64 chars),
+  `route_distinguisher` (ASN:idx or IPv4:idx, no validation —
+  vendors disagree), `route_targets` (JSONB list of RT strings).
+  Pure metadata — address allocation already supports
+  overlapping ranges via separate IPSpace rows; these columns
+  give operators somewhere to put the routing identity for
+  reporting / export / future BGP-EVPN integration. Migration
+  `f1c8b2a945d3_subnet_ops_ipspace_vrf`. Surfaced as badges on
+  the IPSpace detail header when set, plus a "VRF / Routing"
+  section in the Edit Space modal (open by default since
+  operators kept missing it under a collapsed toggle).
+
+- **Soft-delete + 30-day recovery + Trash admin page.**
+  `IPSpace`, `IPBlock`, `Subnet`, `DNSZone`, `DNSRecord`, and
+  `DHCPScope` rows now inherit a `SoftDeleteMixin` (`deleted_at`,
+  `deleted_by_user_id`, `deletion_batch_id`). A global
+  `do_orm_execute` event listener injects
+  `Model.deleted_at IS NULL` into every SELECT touching one of
+  these models — callers that need to see soft-deleted rows opt
+  in via `execution_options(include_deleted=True)`. Cascade-
+  stamping under one `deletion_batch_id` means restoring a
+  subnet brings its DHCP scopes back atomically; restoring a
+  zone brings its records back. New endpoints under `/admin/`:
+  - `GET /admin/trash` — paginated list across every in-scope
+    model, with type / since / `q` substring filters and
+    deleted-by user resolution.
+  - `POST /admin/trash/{type}/{id}/restore` — atomic batch
+    restore with `default_conflict_check` (rejects 409 when a
+    live row would clash on the same uniqueness key).
+  - `DELETE /admin/trash/{type}/{id}` — hard-delete a row
+    that's already soft-deleted.
+
+  Frontend page at `/admin/trash` lists soft-deleted rows
+  newest-first, per-row Restore (with confirmation modal +
+  conflict-detail rendering) and Delete-permanently buttons.
+  Sidebar entry under Admin. Nightly `trash_purge` Celery beat
+  task (`app.tasks.trash_purge.purge_expired_soft_deletes`)
+  hard-deletes rows past `PlatformSettings.soft_delete_purge_days`
+  (default 30; set to 0 to disable purging). Subnet / block /
+  space delete confirmation text updated from "permanently
+  delete" → "move to Trash. You can restore from Admin → Trash
+  within 30 days." since the actual behaviour is soft-delete,
+  not hard-delete. IP addresses are intentionally NOT
+  soft-deletable — they cascade-delete with their parent
+  subnet, and the parent subnet is the recoverable unit.
+  Migration `c1f4a8b27d09_soft_delete`.
+
+- **DHCP lease history + NAT mapping table.** New
+  `dhcp_lease_history` table records every lease that ever
+  expired, was reassigned to a different MAC, or disappeared
+  from an absence-delete sweep — gives operators a forensic
+  trail when "who had this IP last week" comes up. Written from
+  three sites: the `dhcp_lease_cleanup` expiry sweep, the agent
+  lease-event ingest path on MAC change, and `pull_leases` on
+  absence-delete. Surfaced on the DHCP server detail as a new
+  "Lease History" tab with filtering by MAC / IP / time window.
+  Daily prune task (`app.tasks.dhcp_lease_history_prune`)
+  honours `PlatformSettings.dhcp_lease_history_retention_days`
+  (default 90; set to 0 to keep forever).
+
+  New `nat_mapping` table is operator-curated metadata
+  describing 1:1 NAT, PAT, or hide-NAT bindings between
+  internal and external IPs. SpatiumDDI doesn't render or push
+  these rules anywhere — purely IPAM cross-reference: an IP row
+  gets a `nat_mapping_count` badge and the dedicated
+  `/ipam/nat` page lists / creates / edits / deletes mappings.
+  Migration `f4e1d2a09b75_lease_history_and_nat`.
+
 - **Tailscale integration — Phase 2: synthetic tailnet DNS surface.**
   When a `TailscaleTenant` has `dns_group_id` bound, the reconciler
   now also materialises a `<tailnet>.ts.net` `DNSZone` in that
@@ -160,12 +354,164 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versioning uses 
     `user_modified_at` lock, and the lock-vs-unlock branches in
     the un-claim-on-disappear path.
 
+### Changed
+
+- **Dashboard headline KPIs restricted to IPv4.** "Allocated IPs"
+  and "Utilization %" now compute over IPv4 subnets only. A single
+  IPv6 /64 carries 2^64 hosts and was swamping the totals across
+  every IPv4 subnet combined, making the headline numbers
+  meaningless. Per-subnet utilisation, the heatmap, and the IPv6
+  subnet count remain — IPv6 stays first-class everywhere it's
+  meaningful, just not in capacity-planning rollups. KPI labels
+  updated to "Allocated IPs (IPv4)" / "Utilization (IPv4)" so the
+  scope is explicit.
+
+- **VRF / Routing section open by default in Edit Space modal.**
+  Previously collapsed under a toggle that operators kept missing;
+  now expanded by default so the fields are visible the first time
+  you open the modal. Operators who don't run multiple VRFs can
+  collapse it with the toggle.
+
+- **VLAN page "New VLAN" button promoted to page header.**
+  Previously a small inline button above the VLANs sub-table that
+  was easy to miss; now lives in the router page header alongside
+  Edit / Delete as a `HeaderButton variant="primary" icon={Plus}`,
+  consistent with the create-button placement on every other page.
+
+- **Trash page wrapped in standard admin container** (`h-full
+  overflow-auto p-6` + `mx-auto max-w-5xl`) so the table no longer
+  spans the entire viewport and truncates the rightmost columns
+  on widescreen layouts. Restore now opens a confirmation modal
+  with conflict-detail rendering instead of firing the mutation
+  directly from the table row.
+
+- **Soft-delete confirmation copy** — every "Delete" dialog whose
+  underlying API path soft-deletes (Subnet bulk, Block, Space,
+  Subnet single) now reads "move to Trash. You can restore from
+  Admin → Trash within 30 days" instead of the misleading
+  "permanently delete" wording carried over from the pre-trash
+  era. Hard-delete (operator picks Permanent in the Trash modal)
+  still says "cannot be restored".
+
+- **K8s + Helm worker / beat liveness probes.** Both manifests
+  shipped with no probes for the Celery worker + beat
+  Deployments — k8s couldn't detect a hung worker. Worker now
+  runs `celery -A app.celery_app inspect ping -d
+  celery@${HOSTNAME}` (scoped by hostname so the probe matches
+  this specific pod, not any random worker on the broker); beat
+  runs `grep -q celery /proc/1/cmdline` (matches the
+  docker-compose pattern). API readinessProbe in both k8s/base
+  and the Helm chart switched from `/health/live` to
+  `/health/ready` (which actually checks DB + Redis
+  connectivity) — a pod that can't reach its dependencies is now
+  removed from LB rotation instead of returning 5xx. Liveness
+  stays on `/health/live` so a transient Postgres blip doesn't
+  trigger a pod restart.
+
+- **Dev compose worker / beat healthchecks.** Same overrides the
+  prod `docker-compose.yml` had — without them, both services
+  inherited the Dockerfile's `/health/live` HTTP probe and
+  reported `unhealthy` because they don't run an HTTP listener.
+
+### Fixed
+
+- **Multiple Celery tasks broke under "Future attached to a
+  different loop".** `asyncio.run(...)` creates a fresh event
+  loop per task invocation; the shared `engine` /
+  `AsyncSessionLocal` from `app/db.py` were binding asyncpg
+  connections to whichever loop first checked them out, so a
+  later task using a pooled connection would crash with a stale
+  loop reference. Manifested most visibly in the alerts
+  evaluator (fires every 60 s) but lurked across
+  `dhcp_lease_cleanup`, `dhcp_lease_history_prune`,
+  `ipam_reservation_sweep`, `trash_purge`, `prune_metrics`, and
+  `prune_logs` — every newer task that imported
+  `AsyncSessionLocal` directly. Added a `task_session()`
+  context-manager helper in `app/db.py` that builds a throwaway
+  `create_async_engine` + `async_sessionmaker` per call and
+  disposes the engine on exit (connection lifecycle now matches
+  loop lifecycle). Migrated all seven affected tasks. Existing
+  `dhcp_health` and `dhcp_pull_leases` already followed this
+  pattern with their own per-task engine; we now have one
+  canonical helper.
+
+- **DNS agent stuck in 404 loop after stale server row.** Sync
+  loop handled 401 by dropping cached token + signalling stop,
+  but treated 404 ("server row deleted on the control plane")
+  as a generic "unexpected status" and just logged + retried
+  forever. CLAUDE.md non-negotiable was clear that both 401 and
+  404 should re-bootstrap from PSK; the DHCP agent already had
+  it right. Mirrored the DHCP pattern. Even after sync stopped
+  itself, the DNS supervisor only watched `daemon_running()` and
+  signal events — heartbeat / metrics / query-log threads kept
+  hammering the API with the stale token. Supervisor now adds
+  the DHCP-agent-style "die if any thread dies" check; container
+  exits with code 2, orchestrator restarts, `ensure_token` sees
+  the empty cache, and the agent re-bootstraps from PSK.
+
+- **NAT mappings sidebar nav also lit up the IPAM nav item.**
+  React Router's `NavLink` does prefix matching by default;
+  `/ipam/nat` matched both the `/ipam` IPAM entry and the
+  `/ipam/nat` NAT Mappings entry. Added an `end` prop to
+  `NavItem` and set `end: true` on the IPAM nav config so it
+  only matches `/ipam` exactly.
+
+- **Free space finder now scoped per block.** `FindFreeModal`
+  takes an optional `defaultBlockId` prop that flows into the
+  request body's `parent_block_id`; the block-detail toolbar
+  passes the current block so search results are pre-restricted
+  to candidates inside it. Without this, opening Find Free from
+  inside a block searched the whole space and surfaced
+  candidates the operator probably didn't want.
+
+- **Integration mirror reconcilers preserve operator edits +
+  accept integration-owned statuses on update + don't fake
+  bridge gateways.** Three closely-related fixes around the
+  Proxmox / Kubernetes / Docker reconcilers, all hitting the
+  same scenario (operator has IPAM rows, enables an integration,
+  syncs run, things either error or get clobbered):
+  - **Status validator now accepts integration values on
+    update.** `IPAddressUpdate` hardcoded
+    `{available, allocated, reserved, static_dhcp,
+    deprecated}` and 422'd anything else, making every
+    Proxmox-mirrored row (`status="proxmox-vm"`) un-editable
+    from the API/UI. Lifted the sets to module-level constants
+    in `app.models.ipam` (`IP_STATUSES_OPERATOR_SETTABLE`,
+    `IP_STATUSES_INTEGRATION_OWNED`, `IP_STATUSES`); update
+    path now accepts ALL statuses, create + next-IP paths are
+    unchanged in spirit (operators shouldn't be hand-creating
+    `proxmox-vm` rows).
+  - **Operator edits sticky across reconciles.** Added
+    `ip_address.user_modified_at` (timestamp, nullable) —
+    stamped by the API write path when an operator changes
+    hostname / description / status / mac_address. All three
+    integration reconcilers consult the column: claim-on-
+    existing adopts an operator-owned row at a desired
+    (subnet, address) tuple by stamping the FK + `user_modified
+    _at = now()`; subsequent edit-skip protects the operator's
+    fields; preserve-on-disappear releases the FK rather than
+    deleting the row when a guest goes away. Migration
+    `f8d4e29b1c75`.
+  - **Proxmox bridge stops faking a gateway.** The reconciler
+    was treating the PVE host's bridge IP (e.g. `192.168.0.94`
+    on `vmbr0.20`) as the network gateway — wrong: in plain-
+    bridge deployments PVE is a peer on the LAN, not the
+    router. Bridge subnets now land with `gateway=None`; the
+    bridge IP becomes a per-PVE-host placeholder row labelled
+    with the node name. SDN subnets keep their declared
+    gateway (PVE owns L3 there, so the value is real). Subnet
+    gateway updates are now no-clobber: integrations only set
+    the field when they know a real value, so an operator who
+    fixes the upstream gateway on a Proxmox-mirrored subnet
+    doesn't see it cleared on every sync.
+
 ### Notes
 
-- Tailscale Phase 2 (synthetic `<tailnet>.ts.net` DNS surface
-  backed by the same device poll, optionally rendering a BIND9
-  forwarder zone for `100.100.100.100`) is on the roadmap — see
-  `CLAUDE.md` "Future Phases".
+- Phase 2 of the Tailscale integration (synthetic
+  `<tailnet>.ts.net` DNS surface) shipped in this cycle (entry
+  above). The optional BIND9 forwarder zone for
+  `100.100.100.100` remains a roadmap item — see `CLAUDE.md`
+  "Future Phases" for the deferred follow-ups.
 
 ---
 

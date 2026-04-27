@@ -662,6 +662,13 @@ class NATMapping(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     Three kinds: ``1to1`` (static NAT), ``pat`` (port translation),
     ``hide`` (many-to-one masquerade). SpatiumDDI records but does not
     push these rules; they surface as a nat_mapping_count badge on IP rows.
+
+    Both internal and external IPs carry an optional FK to ``ip_address``
+    in addition to the raw INET string. The FK is auto-resolved on
+    write when the typed string matches an existing IPAM row; the
+    string stays authoritative so external IPs not tracked in IPAM
+    (e.g. a public WAN address) still work. ``ON DELETE SET NULL``
+    so deleting an IPAM row leaves the NAT history intact.
     """
 
     __tablename__ = "nat_mapping"
@@ -669,12 +676,17 @@ class NATMapping(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         Index("ix_nat_mapping_internal_ip", "internal_ip"),
         Index("ix_nat_mapping_external_ip", "external_ip"),
         Index("ix_nat_mapping_internal_subnet_id", "internal_subnet_id"),
+        Index("ix_nat_mapping_internal_ip_address_id", "internal_ip_address_id"),
+        Index("ix_nat_mapping_external_ip_address_id", "external_ip_address_id"),
     )
 
     name: Mapped[str] = mapped_column(String(128), nullable=False)
     kind: Mapped[str] = mapped_column(String(20), nullable=False)  # 1to1 | pat | hide
 
     internal_ip: Mapped[str | None] = mapped_column(INET, nullable=True)
+    internal_ip_address_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("ip_address.id", ondelete="SET NULL"), nullable=True
+    )
     internal_subnet_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("subnet.id", ondelete="SET NULL"), nullable=True
     )
@@ -682,6 +694,9 @@ class NATMapping(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     internal_port_end: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     external_ip: Mapped[str | None] = mapped_column(INET, nullable=True)
+    external_ip_address_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("ip_address.id", ondelete="SET NULL"), nullable=True
+    )
     external_port_start: Mapped[int | None] = mapped_column(Integer, nullable=True)
     external_port_end: Mapped[int | None] = mapped_column(Integer, nullable=True)
 

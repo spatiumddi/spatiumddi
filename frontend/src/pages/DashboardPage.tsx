@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { useQuery, useQueries, useQueryClient } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
 import {
@@ -23,6 +24,7 @@ import {
   ipamApi,
   dnsApi,
   dhcpApi,
+  natApi,
   auditApi,
   settingsApi,
   kubernetesApi,
@@ -321,8 +323,20 @@ function humanTime(ts: string): string {
 
 // ── Page ────────────────────────────────────────────────────────────────────
 
+type DashboardTab = "overview" | "ipam" | "dns" | "dhcp";
+
 export function DashboardPage() {
   const qc = useQueryClient();
+  const [tab, setTab] = useState<DashboardTab>(() => {
+    const saved = localStorage.getItem("dashboard-tab");
+    if (saved === "ipam" || saved === "dns" || saved === "dhcp") return saved;
+    return "overview";
+  });
+  function selectTab(next: DashboardTab) {
+    setTab(next);
+    localStorage.setItem("dashboard-tab", next);
+  }
+
   // IPAM
   const { data: spaces } = useQuery({
     queryKey: ["spaces"],
@@ -331,6 +345,13 @@ export function DashboardPage() {
   const { data: subnets } = useQuery({
     queryKey: ["subnets"],
     queryFn: () => ipamApi.listSubnets(),
+  });
+
+  // NAT mapping count — cheap (single page=1, per_page=1 just for total).
+  const { data: natTotal } = useQuery({
+    queryKey: ["nat-mappings", "count"],
+    queryFn: () => natApi.list({ page: 1, per_page: 1 }).then((r) => r.total),
+    staleTime: 60_000,
   });
 
   // Platform settings drive the utilization filter (excludes /30, /31,
@@ -446,14 +467,22 @@ export function DashboardPage() {
   // the top-line counters to IPv4. The heatmap + per-subnet stats keep
   // IPv6 since per-subnet utilization_percent is still meaningful.
   const reportingV4 = reporting.filter((s) => !s.network.includes(":"));
+  const reportingV6 = reporting.filter((s) => s.network.includes(":"));
   const totalIPs = reportingV4.reduce((s, n) => s + n.total_ips, 0);
   const allocatedIPs = reportingV4.reduce((s, n) => s + n.allocated_ips, 0);
   const freeIPs = totalIPs - allocatedIPs;
   const overallUtil = totalIPs > 0 ? (allocatedIPs / totalIPs) * 100 : 0;
-  const topSubnets = [...reporting]
+  // IPv6 allocation count is meaningful per-subnet but the totals don't
+  // make sense (a /64 has 2^64 hosts); track subnet count + alloc count
+  // separately so the IPv4 vs IPv6 split panel can show both dimensions.
+  const v6SubnetCount = reportingV6.length;
+  const v6AllocCount = reportingV6.reduce((s, n) => s + n.allocated_ips, 0);
+  const v4SubnetCount = reportingV4.length;
+  const sortedSubnets = [...reporting]
     .filter((s) => s.total_ips > 0)
-    .sort((a, b) => b.utilization_percent - a.utilization_percent)
-    .slice(0, 6);
+    .sort((a, b) => b.utilization_percent - a.utilization_percent);
+  const topSubnets = sortedSubnets.slice(0, 6);
+  const ipamTopSubnets = sortedSubnets.slice(0, 20);
   const critical = reporting.filter((s) => s.utilization_percent >= 95).length;
   const warning = reporting.filter(
     (s) => s.utilization_percent >= 80 && s.utilization_percent < 95,
@@ -541,6 +570,8 @@ export function DashboardPage() {
                   ["dhcp-groups"],
                   ["audit", "recent"],
                   ["metrics"],
+                  ["nat-mappings", "count"],
+                  ["platform-health"],
                 ]) {
                   qc.invalidateQueries({ queryKey: key });
                 }
@@ -554,7 +585,41 @@ export function DashboardPage() {
           </div>
         </div>
 
-        {/* ── KPI grid ───────────────────────────────────────────────── */}
+        {/* ── Tab bar ─────────────────────────────────────────────────
+            Sub-tabs scope the dashboard to one subsystem at a time.
+            Overview keeps the headline KPI grid + heatmap + activity
+            feed + platform health; the per-subsystem tabs surface the
+            subsystem-scoped panels (charts, server lists, integration
+            status) without overcrowding the home view. */}
+        <div className="border-b">
+          <div className="flex gap-1">
+            {(
+              [
+                { key: "overview", label: "Overview", Icon: Activity },
+                { key: "ipam", label: "IPAM", Icon: Network },
+                { key: "dns", label: "DNS", Icon: Globe2 },
+                { key: "dhcp", label: "DHCP", Icon: Server },
+              ] as const
+            ).map(({ key, label, Icon }) => (
+              <button
+                key={key}
+                type="button"
+                onClick={() => selectTab(key)}
+                className={cn(
+                  "inline-flex items-center gap-1.5 border-b-2 px-3 py-2 text-sm font-medium -mb-px transition-colors",
+                  tab === key
+                    ? "border-primary text-foreground"
+                    : "border-transparent text-muted-foreground hover:text-foreground",
+                )}
+              >
+                <Icon className="h-3.5 w-3.5" />
+                {label}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* ── KPI grid (always visible — same data, different lens) ─── */}
         <div className="grid gap-3 grid-cols-2 md:grid-cols-3 lg:grid-cols-6">
           <KpiCard
             label="IP Spaces"
@@ -632,18 +697,207 @@ export function DashboardPage() {
           />
         </div>
 
-        {/* ── DNS query rate + DHCP traffic (hoisted: signal-dense, operator-favorite) ─ */}
-        <div className="grid gap-5 lg:grid-cols-2">
-          <DNSQueryRateCard dnsServers={allDnsServers} />
-          <DHCPTrafficCard dhcpServers={dhcpServers} />
-        </div>
+        {/* ── DNS query rate (DNS tab only) ──────────────────────────── */}
+        {tab === "dns" && <DNSQueryRateCard dnsServers={allDnsServers} />}
 
-        {/* ── Heatmap ────────────────────────────────────────────────── */}
-        <SubnetHeatmap subnets={reporting} />
+        {/* ── DHCP traffic (DHCP tab only) ───────────────────────────── */}
+        {tab === "dhcp" && <DHCPTrafficCard dhcpServers={dhcpServers} />}
 
-        {/* ── Top subnets + Live activity ────────────────────────────── */}
-        <div className="grid gap-5 lg:grid-cols-2">
-          {/* Top Subnets */}
+        {/* ── Heatmap (Overview + IPAM) ──────────────────────────────── */}
+        {(tab === "overview" || tab === "ipam") && (
+          <SubnetHeatmap subnets={reporting} />
+        )}
+
+        {/* ── IPAM-specific summary cards ───────────────────────────── */}
+        {tab === "ipam" && (
+          <div className="grid gap-3 grid-cols-2 md:grid-cols-3">
+            {/* IPv4 vs IPv6 split — counts only; v6 host counts are
+                meaningless. */}
+            <div className="rounded-lg border bg-card p-4">
+              <div className="flex items-center justify-between">
+                <span className="text-xs uppercase tracking-wide text-muted-foreground">
+                  IPv4 / IPv6 split
+                </span>
+                <Layers className="h-4 w-4 text-muted-foreground" />
+              </div>
+              <div className="mt-3 space-y-2">
+                <div>
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="font-mono">IPv4</span>
+                    <span className="text-muted-foreground">
+                      {v4SubnetCount} subnet
+                      {v4SubnetCount === 1 ? "" : "s"} ·{" "}
+                      {allocatedIPs.toLocaleString()} alloc
+                    </span>
+                  </div>
+                  <div className="mt-1 h-2 overflow-hidden rounded-full bg-muted">
+                    <div
+                      className="h-full bg-blue-500"
+                      style={{
+                        width: `${
+                          v4SubnetCount + v6SubnetCount === 0
+                            ? 0
+                            : (v4SubnetCount /
+                                (v4SubnetCount + v6SubnetCount)) *
+                              100
+                        }%`,
+                      }}
+                    />
+                  </div>
+                </div>
+                <div>
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="font-mono">IPv6</span>
+                    <span className="text-muted-foreground">
+                      {v6SubnetCount} subnet
+                      {v6SubnetCount === 1 ? "" : "s"} ·{" "}
+                      {v6AllocCount.toLocaleString()} alloc
+                    </span>
+                  </div>
+                  <div className="mt-1 h-2 overflow-hidden rounded-full bg-muted">
+                    <div
+                      className="h-full bg-purple-500"
+                      style={{
+                        width: `${
+                          v4SubnetCount + v6SubnetCount === 0
+                            ? 0
+                            : (v6SubnetCount /
+                                (v4SubnetCount + v6SubnetCount)) *
+                              100
+                        }%`,
+                      }}
+                    />
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <KpiCard
+              label="NAT mappings"
+              value={natTotal ?? "—"}
+              sub={natTotal === 0 ? "none configured" : "operator-curated"}
+              icon={Plug}
+              to="/ipam/nat"
+            />
+
+            <KpiCard
+              label="Capacity headroom"
+              value={`${(100 - overallUtil).toFixed(1)}%`}
+              sub={`${freeIPs.toLocaleString()} IPv4 free`}
+              icon={HardDrive}
+              tone={
+                overallUtil >= 95 ? "bad" : overallUtil >= 80 ? "warn" : "good"
+              }
+            />
+          </div>
+        )}
+
+        {/* ── Overview: Top subnets (compact) + Live activity ─────────── */}
+        {tab === "overview" && (
+          <div className="grid gap-5 lg:grid-cols-2">
+            {/* Top Subnets */}
+            <div className="rounded-lg border bg-card">
+              <div className="flex items-center justify-between border-b px-4 py-2.5">
+                <div className="flex items-center gap-2">
+                  <span className="inline-block h-1.5 w-1.5 rounded-full bg-emerald-500" />
+                  <h3 className="text-xs font-semibold uppercase tracking-wider">
+                    Top Subnets by Utilization
+                  </h3>
+                </div>
+                <span className="text-[11px] text-muted-foreground">
+                  Showing {topSubnets.length} of {subnets?.length ?? 0}
+                </span>
+              </div>
+              <div className="divide-y">
+                {topSubnets.length === 0 ? (
+                  <div className="px-4 py-8 text-center text-xs text-muted-foreground">
+                    No subnets have allocated IPs yet.
+                  </div>
+                ) : (
+                  topSubnets.map((subnet) => (
+                    <Link
+                      key={subnet.id}
+                      to={`/ipam?subnet=${subnet.id}`}
+                      className="flex items-center gap-4 px-4 py-2.5 transition-colors hover:bg-accent/40"
+                    >
+                      <span className="w-32 flex-shrink-0 font-mono text-xs">
+                        {subnet.network}
+                      </span>
+                      <span className="w-32 truncate text-xs text-muted-foreground">
+                        {subnet.name || (
+                          <span className="text-muted-foreground/40">—</span>
+                        )}
+                      </span>
+                      <div className="flex-1">
+                        <UtilizationBar percent={subnet.utilization_percent} />
+                      </div>
+                      <span className="w-20 text-right text-[11px] tabular-nums text-muted-foreground">
+                        {subnet.allocated_ips} / {subnet.total_ips}
+                      </span>
+                    </Link>
+                  ))
+                )}
+              </div>
+            </div>
+
+            {/* Live activity */}
+            <div className="rounded-lg border bg-card">
+              <div className="flex items-center justify-between border-b px-4 py-2.5">
+                <div className="flex items-center gap-2">
+                  <span className="relative inline-flex h-1.5 w-1.5">
+                    <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-75" />
+                    <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-emerald-500" />
+                  </span>
+                  <h3 className="text-xs font-semibold uppercase tracking-wider">
+                    Live Activity
+                  </h3>
+                </div>
+                <Link
+                  to="/admin/audit"
+                  className="text-[11px] text-muted-foreground hover:text-foreground"
+                >
+                  view all →
+                </Link>
+              </div>
+              <div className="divide-y">
+                {!recent || recent.items.length === 0 ? (
+                  <div className="px-4 py-8 text-center text-xs text-muted-foreground">
+                    No recent activity. Try creating a subnet or a DNS record.
+                  </div>
+                ) : (
+                  recent.items.slice(0, 12).map((entry) => (
+                    <div
+                      key={entry.id}
+                      className="flex items-center gap-3 px-4 py-2 text-[11px]"
+                    >
+                      <span className="w-14 flex-shrink-0 tabular-nums text-muted-foreground">
+                        {humanTime(entry.timestamp)}
+                      </span>
+                      <span className="w-36 flex-shrink-0 min-w-0">
+                        <ActionBadge
+                          action={entry.action}
+                          result={entry.result}
+                        />
+                      </span>
+                      <span className="w-20 flex-shrink-0 truncate text-muted-foreground">
+                        {entry.resource_type.replace(/_/g, " ")}
+                      </span>
+                      <span className="flex-1 truncate font-mono">
+                        {entry.resource_display}
+                      </span>
+                      <span className="w-20 flex-shrink-0 truncate text-right text-muted-foreground">
+                        {entry.user_display_name}
+                      </span>
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+          </div>
+        )}
+
+        {/* ── IPAM tab: Top Subnets (extended list) ──────────────────── */}
+        {tab === "ipam" && (
           <div className="rounded-lg border bg-card">
             <div className="flex items-center justify-between border-b px-4 py-2.5">
               <div className="flex items-center gap-2">
@@ -653,16 +907,16 @@ export function DashboardPage() {
                 </h3>
               </div>
               <span className="text-[11px] text-muted-foreground">
-                Showing {topSubnets.length} of {subnets?.length ?? 0}
+                Showing {ipamTopSubnets.length} of {subnets?.length ?? 0}
               </span>
             </div>
             <div className="divide-y">
-              {topSubnets.length === 0 ? (
+              {ipamTopSubnets.length === 0 ? (
                 <div className="px-4 py-8 text-center text-xs text-muted-foreground">
                   No subnets have allocated IPs yet.
                 </div>
               ) : (
-                topSubnets.map((subnet) => (
+                ipamTopSubnets.map((subnet) => (
                   <Link
                     key={subnet.id}
                     to={`/ipam?subnet=${subnet.id}`}
@@ -671,7 +925,7 @@ export function DashboardPage() {
                     <span className="w-32 flex-shrink-0 font-mono text-xs">
                       {subnet.network}
                     </span>
-                    <span className="w-32 truncate text-xs text-muted-foreground">
+                    <span className="w-40 truncate text-xs text-muted-foreground">
                       {subnet.name || (
                         <span className="text-muted-foreground/40">—</span>
                       )}
@@ -679,7 +933,7 @@ export function DashboardPage() {
                     <div className="flex-1">
                       <UtilizationBar percent={subnet.utilization_percent} />
                     </div>
-                    <span className="w-20 text-right text-[11px] tabular-nums text-muted-foreground">
+                    <span className="w-24 text-right text-[11px] tabular-nums text-muted-foreground">
                       {subnet.allocated_ips} / {subnet.total_ips}
                     </span>
                   </Link>
@@ -687,196 +941,157 @@ export function DashboardPage() {
               )}
             </div>
           </div>
+        )}
 
-          {/* Live activity */}
+        {/* ── Platform health (Overview only) ────────────────────────── */}
+        {tab === "overview" && platformHealth && (
+          <PlatformHealthCard health={platformHealth} />
+        )}
+
+        {/* ── DNS tab: Server list ──────────────────────────────────── */}
+        {tab === "dns" && allDnsServers.length > 0 && (
           <div className="rounded-lg border bg-card">
             <div className="flex items-center justify-between border-b px-4 py-2.5">
               <div className="flex items-center gap-2">
-                <span className="relative inline-flex h-1.5 w-1.5">
-                  <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-75" />
-                  <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-emerald-500" />
-                </span>
+                <Globe2 className="h-3.5 w-3.5 text-muted-foreground" />
                 <h3 className="text-xs font-semibold uppercase tracking-wider">
-                  Live Activity
-                </h3>
-              </div>
-              <Link
-                to="/admin/audit"
-                className="text-[11px] text-muted-foreground hover:text-foreground"
-              >
-                view all →
-              </Link>
-            </div>
-            <div className="divide-y">
-              {!recent || recent.items.length === 0 ? (
-                <div className="px-4 py-8 text-center text-xs text-muted-foreground">
-                  No recent activity. Try creating a subnet or a DNS record.
-                </div>
-              ) : (
-                recent.items.slice(0, 12).map((entry) => (
-                  <div
-                    key={entry.id}
-                    className="flex items-center gap-3 px-4 py-2 text-[11px]"
-                  >
-                    <span className="w-14 flex-shrink-0 tabular-nums text-muted-foreground">
-                      {humanTime(entry.timestamp)}
-                    </span>
-                    <span className="w-36 flex-shrink-0 min-w-0">
-                      <ActionBadge
-                        action={entry.action}
-                        result={entry.result}
-                      />
-                    </span>
-                    <span className="w-20 flex-shrink-0 truncate text-muted-foreground">
-                      {entry.resource_type.replace(/_/g, " ")}
-                    </span>
-                    <span className="flex-1 truncate font-mono">
-                      {entry.resource_display}
-                    </span>
-                    <span className="w-20 flex-shrink-0 truncate text-right text-muted-foreground">
-                      {entry.user_display_name}
-                    </span>
-                  </div>
-                ))
-              )}
-            </div>
-          </div>
-        </div>
-
-        {/* ── Platform health (control-plane components) ─────────────── */}
-        {platformHealth && <PlatformHealthCard health={platformHealth} />}
-
-        {/* ── Services panel ─────────────────────────────────────────── */}
-        {allServers.length > 0 && (
-          <div className="rounded-lg border bg-card">
-            <div className="flex items-center justify-between border-b px-4 py-2.5">
-              <div className="flex items-center gap-2">
-                <Shield className="h-3.5 w-3.5 text-muted-foreground" />
-                <h3 className="text-xs font-semibold uppercase tracking-wider">
-                  Services
+                  DNS Servers ({allDnsServers.length})
                 </h3>
                 <span className="text-[11px] text-muted-foreground">
-                  {allServers.length} total · {activeServers} active
+                  {totalZones} zone{totalZones === 1 ? "" : "s"} ·{" "}
+                  {dnsGroups.length} group{dnsGroups.length === 1 ? "" : "s"}
                 </span>
               </div>
             </div>
-            <div className="grid divide-y md:grid-cols-2 md:divide-x md:divide-y-0">
-              {/* DNS column */}
-              <div className="min-w-0">
-                <div className="flex items-center gap-1.5 bg-muted/30 px-4 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
-                  <Globe2 className="h-3 w-3" />
-                  DNS ({allDnsServers.length})
-                </div>
-                {allDnsServers.length === 0 ? (
-                  <p className="px-4 py-3 text-[11px] italic text-muted-foreground">
-                    No DNS servers registered.
-                  </p>
-                ) : (
-                  <div className="divide-y">
-                    {allDnsServers.map((s) => {
-                      const group = dnsGroups.find((g) => g.id === s.group_id);
-                      return (
-                        <ServerRow
-                          key={s.id}
-                          name={s.name}
-                          host={`${s.host}:${s.port}`}
-                          driver={s.driver}
-                          status={s.status}
-                          groupName={group?.name ?? "—"}
-                          lastSeen={s.last_health_check_at}
-                          isEnabled={s.is_enabled !== false}
-                        />
-                      );
-                    })}
-                  </div>
-                )}
-              </div>
-              {/* DHCP column */}
-              <div className="min-w-0">
-                <div className="flex items-center gap-1.5 bg-muted/30 px-4 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
-                  <Server className="h-3 w-3" />
-                  DHCP ({dhcpServers.length})
-                </div>
-                {dhcpServers.length === 0 ? (
-                  <p className="px-4 py-3 text-[11px] italic text-muted-foreground">
-                    No DHCP servers registered.
-                  </p>
-                ) : (
-                  <div className="divide-y">
-                    {dhcpServers.map((s) => {
-                      const group = dhcpGroups.find(
-                        (g) => g.id === s.server_group_id,
-                      );
-                      return (
-                        <ServerRow
-                          key={s.id}
-                          name={s.name}
-                          host={`${s.host}:${s.port}`}
-                          driver={s.driver}
-                          status={
-                            !s.agent_approved
-                              ? "pending"
-                              : (s.status ?? "unknown")
-                          }
-                          groupName={group?.name ?? "ungrouped"}
-                          lastSeen={s.last_health_check_at}
-                        />
-                      );
-                    })}
-                  </div>
-                )}
-                {haGroups.length > 0 && (
-                  <>
-                    <div className="flex items-center gap-1.5 bg-muted/30 px-4 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
-                      <Shield className="h-3 w-3" />
-                      HA Pairs ({haGroups.length})
-                    </div>
-                    <div className="divide-y">
-                      {haGroups.map((g) => (
-                        <FailoverRow key={g.id} group={g} />
-                      ))}
-                    </div>
-                  </>
-                )}
-              </div>
+            <div className="divide-y">
+              {allDnsServers.map((s) => {
+                const group = dnsGroups.find((g) => g.id === s.group_id);
+                return (
+                  <ServerRow
+                    key={s.id}
+                    name={s.name}
+                    host={`${s.host}:${s.port}`}
+                    driver={s.driver}
+                    status={s.status}
+                    groupName={group?.name ?? "—"}
+                    lastSeen={s.last_health_check_at}
+                    isEnabled={s.is_enabled !== false}
+                  />
+                );
+              })}
             </div>
           </div>
         )}
-
-        {/* ── Integrations panel ─────────────────────────────────────── */}
-        {(kubernetesEnabled ||
-          dockerEnabled ||
-          proxmoxEnabled ||
-          tailscaleEnabled) && (
-          <IntegrationsPanel
-            kubernetesEnabled={kubernetesEnabled}
-            dockerEnabled={dockerEnabled}
-            proxmoxEnabled={proxmoxEnabled}
-            tailscaleEnabled={tailscaleEnabled}
-            clusters={k8sClusters}
-            hosts={dockerHosts}
-            proxmoxNodes={proxmoxNodes}
-            tailscaleTenants={tailscaleTenants}
-          />
-        )}
-
-        {/* ── Empty state ────────────────────────────────────────────── */}
-        {subnets?.length === 0 && spaces?.length === 0 && (
+        {tab === "dns" && allDnsServers.length === 0 && (
           <div className="rounded-lg border border-dashed p-10 text-center">
-            <FileText className="mx-auto mb-3 h-10 w-10 text-muted-foreground/30" />
-            <p className="text-sm font-medium">Welcome to SpatiumDDI</p>
+            <Globe2 className="mx-auto mb-3 h-10 w-10 text-muted-foreground/30" />
+            <p className="text-sm font-medium">No DNS servers registered</p>
             <p className="mt-1 text-xs text-muted-foreground">
-              Head to{" "}
-              <Link
-                to="/ipam"
-                className="text-primary underline underline-offset-2"
-              >
-                IPAM
-              </Link>{" "}
-              to create your first IP space + subnet.
+              Register a DNS server to see query rates, zones, and health here.
             </p>
           </div>
         )}
+
+        {/* ── DHCP tab: Server list + HA pairs ──────────────────────── */}
+        {tab === "dhcp" && dhcpServers.length > 0 && (
+          <div className="rounded-lg border bg-card">
+            <div className="flex items-center justify-between border-b px-4 py-2.5">
+              <div className="flex items-center gap-2">
+                <Server className="h-3.5 w-3.5 text-muted-foreground" />
+                <h3 className="text-xs font-semibold uppercase tracking-wider">
+                  DHCP Servers ({dhcpServers.length})
+                </h3>
+                <span className="text-[11px] text-muted-foreground">
+                  {dhcpGroups.length} group
+                  {dhcpGroups.length === 1 ? "" : "s"}
+                  {haGroups.length > 0 &&
+                    ` · ${haGroups.length} HA pair${haGroups.length === 1 ? "" : "s"}`}
+                </span>
+              </div>
+            </div>
+            <div className="divide-y">
+              {dhcpServers.map((s) => {
+                const group = dhcpGroups.find(
+                  (g) => g.id === s.server_group_id,
+                );
+                return (
+                  <ServerRow
+                    key={s.id}
+                    name={s.name}
+                    host={`${s.host}:${s.port}`}
+                    driver={s.driver}
+                    status={
+                      !s.agent_approved ? "pending" : (s.status ?? "unknown")
+                    }
+                    groupName={group?.name ?? "ungrouped"}
+                    lastSeen={s.last_health_check_at}
+                  />
+                );
+              })}
+            </div>
+            {haGroups.length > 0 && (
+              <>
+                <div className="flex items-center gap-1.5 border-t bg-muted/30 px-4 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+                  <Shield className="h-3 w-3" />
+                  HA Pairs ({haGroups.length})
+                </div>
+                <div className="divide-y">
+                  {haGroups.map((g) => (
+                    <FailoverRow key={g.id} group={g} />
+                  ))}
+                </div>
+              </>
+            )}
+          </div>
+        )}
+        {tab === "dhcp" && dhcpServers.length === 0 && (
+          <div className="rounded-lg border border-dashed p-10 text-center">
+            <Server className="mx-auto mb-3 h-10 w-10 text-muted-foreground/30" />
+            <p className="text-sm font-medium">No DHCP servers registered</p>
+            <p className="mt-1 text-xs text-muted-foreground">
+              Register a DHCP server to see lease activity, scopes, and HA state
+              here.
+            </p>
+          </div>
+        )}
+
+        {/* ── Integrations panel (IPAM tab — they populate IPAM) ────── */}
+        {tab === "ipam" &&
+          (kubernetesEnabled ||
+            dockerEnabled ||
+            proxmoxEnabled ||
+            tailscaleEnabled) && (
+            <IntegrationsPanel
+              kubernetesEnabled={kubernetesEnabled}
+              dockerEnabled={dockerEnabled}
+              proxmoxEnabled={proxmoxEnabled}
+              tailscaleEnabled={tailscaleEnabled}
+              clusters={k8sClusters}
+              hosts={dockerHosts}
+              proxmoxNodes={proxmoxNodes}
+              tailscaleTenants={tailscaleTenants}
+            />
+          )}
+
+        {/* ── Empty state (Overview only) ───────────────────────────── */}
+        {tab === "overview" &&
+          subnets?.length === 0 &&
+          spaces?.length === 0 && (
+            <div className="rounded-lg border border-dashed p-10 text-center">
+              <FileText className="mx-auto mb-3 h-10 w-10 text-muted-foreground/30" />
+              <p className="text-sm font-medium">Welcome to SpatiumDDI</p>
+              <p className="mt-1 text-xs text-muted-foreground">
+                Head to{" "}
+                <Link
+                  to="/ipam"
+                  className="text-primary underline underline-offset-2"
+                >
+                  IPAM
+                </Link>{" "}
+                to create your first IP space + subnet.
+              </p>
+            </div>
+          )}
       </div>
     </div>
   );

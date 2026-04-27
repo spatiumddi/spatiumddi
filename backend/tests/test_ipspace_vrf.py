@@ -31,9 +31,7 @@ async def _make_admin(db: AsyncSession) -> tuple[User, str]:
 
 
 @pytest.mark.asyncio
-async def test_create_with_vrf_fields(
-    client: AsyncClient, db_session: AsyncSession
-) -> None:
+async def test_create_with_vrf_fields(client: AsyncClient, db_session: AsyncSession) -> None:
     _, token = await _make_admin(db_session)
     resp = await client.post(
         "/api/v1/ipam/spaces",
@@ -73,9 +71,7 @@ async def test_create_without_vrf_fields_defaults_null(
 
 
 @pytest.mark.asyncio
-async def test_update_persists_explicit_null(
-    client: AsyncClient, db_session: AsyncSession
-) -> None:
+async def test_update_persists_explicit_null(client: AsyncClient, db_session: AsyncSession) -> None:
     """Sending an explicit null clears a previously-set field."""
     _, token = await _make_admin(db_session)
     headers = {"Authorization": f"Bearer {token}"}

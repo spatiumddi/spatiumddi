@@ -12,11 +12,7 @@
  */
 
 import { useMemo, useState } from "react";
-import {
-  useMutation,
-  useQuery,
-  useQueryClient,
-} from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertCircle,
   AlertTriangle,
@@ -518,7 +514,8 @@ export function MergeSubnetModal({
   const [error, setError] = useState<string | null>(null);
 
   const sortedSiblings = useMemo(
-    () => [...candidateSiblings].sort((a, b) => a.network.localeCompare(b.network)),
+    () =>
+      [...candidateSiblings].sort((a, b) => a.network.localeCompare(b.network)),
     [candidateSiblings],
   );
 

@@ -197,7 +197,7 @@ async def restore_batch(
     # include_deleted so it can see soft-deleted rows; without that the
     # global filter hides them.
     for resource_type, model in TYPE_TO_MODEL.items():
-        stmt = (
+        stmt: Any = (
             select(model)
             .where(model.deletion_batch_id == batch_id)
             .execution_options(include_deleted=True)
@@ -240,9 +240,7 @@ async def default_conflict_check(db: AsyncSession, obj: Any) -> str | None:
 
     if isinstance(obj, IPSpace):
         existing = (
-            await db.execute(
-                select(IPSpace).where(IPSpace.name == obj.name, IPSpace.id != obj.id)
-            )
+            await db.execute(select(IPSpace).where(IPSpace.name == obj.name, IPSpace.id != obj.id))
         ).scalar_one_or_none()
         if existing is not None:
             return f"An active IP space named {obj.name!r} already exists"
