@@ -43,6 +43,7 @@ import {
   customFieldsApi,
   vlansApi,
   natApi,
+  networkApi,
   IP_ROLE_OPTIONS,
   type IPSpace,
   type IPBlock,
@@ -57,6 +58,7 @@ import {
   type DHCPLeaseSyncResult,
   type MacHistoryEntry,
   type NATMapping,
+  type NetworkContextEntry,
 } from "@/lib/api";
 import { copyToClipboard } from "@/lib/clipboard";
 import { cn, swatchTintCls, zebraBodyCls } from "@/lib/utils";
@@ -76,6 +78,11 @@ import {
   SubnetImportExportButton,
 } from "./ImportExportModals";
 import { ResizeBlockModal, ResizeSubnetModal } from "./ResizeModals";
+import {
+  IPNetworkTab,
+  NetworkTabBadge,
+  useNetworkContext,
+} from "./IPNetworkTab";
 import {
   FindFreeModal,
   MergeSubnetSiblingPicker,
@@ -213,6 +220,52 @@ function CopyButton({ text }: { text: string }) {
         <Copy className="h-3 w-3" />
       )}
     </button>
+  );
+}
+
+// ─── Network discovery cell ───────────────────────────────────────────────
+//
+// Renders the SNMP-discovered switch/port/VLAN context for an IP. Inputs
+// come from the batched ``/ipam/subnets/{id}/network-context`` join — see
+// the ``subnetNetworkContext`` query in ``SubnetView``.
+//
+// Cardinality matters: a single MAC can legitimately appear on multiple
+// (device, port, VLAN) tuples — the canonical case is a hypervisor host
+// and its VMs all egressing through one trunk port, learned per-VLAN. We
+// surface the most-recent entry by default and expose the rest via a
+// ``+N more`` badge with a hover tooltip listing all of them.
+
+function NetworkContextCell({ entries }: { entries: NetworkContextEntry[] }) {
+  if (!entries.length)
+    return <span className="text-muted-foreground/40">—</span>;
+  const primary = entries[0];
+  const more = entries.length - 1;
+  const tooltipLines = entries
+    .map(
+      (e) =>
+        `${e.device_name} : ${e.interface_name}` +
+        (e.vlan_id != null ? ` (VLAN ${e.vlan_id})` : ""),
+    )
+    .join("\n");
+  return (
+    <span
+      className="inline-flex items-center gap-1.5 text-xs"
+      title={tooltipLines}
+    >
+      <span className="font-medium">{primary.device_name}</span>
+      <span className="text-muted-foreground">·</span>
+      <span className="font-mono text-[11px]">{primary.interface_name}</span>
+      {primary.vlan_id != null && (
+        <span className="rounded bg-amber-500/15 px-1 py-0.5 font-mono text-[10px] font-semibold text-amber-700 dark:text-amber-300">
+          VLAN {primary.vlan_id}
+        </span>
+      )}
+      {more > 0 && (
+        <span className="rounded bg-muted px-1 py-0.5 text-[10px] text-muted-foreground">
+          +{more} more
+        </span>
+      )}
+    </span>
   );
 }
 
@@ -2679,6 +2732,18 @@ function SubnetDetail({
   // Per-IP DNS sync state derived from the same drift report the sync modal
   // uses. Refreshed alongside addresses; stale-while-revalidate is fine since
   // the column is informational.
+
+  // Network discovery cross-reference — one batched call per subnet
+  // returns ``{ip_id: NetworkContextEntry[]}``. Drives the "Network"
+  // column; absent IPs render an em-dash. Slightly long stale time
+  // because FDB tables only refresh on a 5-min poll cadence anyway,
+  // so per-keystroke refetching adds zero value.
+  const { data: subnetNetworkContext } = useQuery({
+    queryKey: ["subnet-network-context", subnet.id],
+    queryFn: () => networkApi.getSubnetNetworkContext(subnet.id),
+    staleTime: 30_000,
+  });
+
   // DHCP pool membership — derive which pool (if any) each IP falls within.
   const { data: dhcpScopes = [] } = useQuery({
     queryKey: ["dhcp-scopes-subnet", subnet.id],
@@ -3360,6 +3425,9 @@ function SubnetDetail({
                           </th>
                         );
                       })}
+                      <th className="px-4 py-2 text-left font-medium">
+                        Network
+                      </th>
                       <th className="px-4 py-2 text-right">
                         {hasActiveFilter && (
                           <button
@@ -3518,6 +3586,9 @@ function SubnetDetail({
                             )}
                           </td>
                         ))}
+                        {/* Network column has no filter input yet — operators
+                            can still filter via the per-device pages. */}
+                        <td />
                         <td />
                       </tr>
                     )}
@@ -3526,7 +3597,7 @@ function SubnetDetail({
                     {filteredAddresses?.length === 0 && (
                       <tr>
                         <td
-                          colSpan={10}
+                          colSpan={11}
                           className="px-4 py-6 text-center text-sm text-muted-foreground"
                         >
                           No addresses match the active filters.
@@ -3554,7 +3625,7 @@ function SubnetDetail({
                         return (
                           <tr key={`pool-${pool.id}-${row.boundary}-${rowIdx}`}>
                             <td
-                              colSpan={10}
+                              colSpan={11}
                               className={cn("px-4 py-1.5", tint)}
                             >
                               <span className="mr-2 font-mono text-xs">
@@ -3787,6 +3858,17 @@ function SubnetDetail({
                                     —
                                   </span>
                                 )}
+                              </td>
+                              {/* Network discovery — switch / port / VLAN
+                                  from the SNMP-discovered FDB. May render
+                                  multiple lines for trunk ports / hypervisor
+                                  hosts where one MAC is learned across VLANs. */}
+                              <td className="px-4 py-2">
+                                <NetworkContextCell
+                                  entries={
+                                    subnetNetworkContext?.[addr.id] ?? []
+                                  }
+                                />
                               </td>
                               <td className="px-4 py-2 text-right">
                                 <div className="flex items-center justify-end gap-1">
@@ -5676,9 +5758,53 @@ function EditAddressModal({
     setPendingWarnings(null);
   }, [hostname, macAddress, dnsZoneId]);
 
+  // ── Tabs ────────────────────────────────────────────────────────────
+  // EditAddressModal is also the "IP detail panel" surface — the
+  // network-discovery feature mounts a second tab here that surfaces
+  // switch-port info from the FDB join. Keeping the form on the
+  // "Details" tab means the modal is unchanged for users who never
+  // open Network.
+  const [activeIpTab, setActiveIpTab] = useState<"details" | "network">(
+    "details",
+  );
+  const { data: networkRows } = useNetworkContext(address.id);
+  const networkCount = networkRows?.length ?? 0;
+
   return (
     <Modal title={`Edit ${address.address}`} onClose={onClose}>
-      <div className="space-y-3">
+      <div className="-mt-1 mb-3 flex gap-1 border-b">
+        <button
+          type="button"
+          onClick={() => setActiveIpTab("details")}
+          className={cn(
+            "-mb-px border-b-2 px-3 py-1.5 text-sm",
+            activeIpTab === "details"
+              ? "border-primary text-foreground"
+              : "border-transparent text-muted-foreground hover:text-foreground",
+          )}
+        >
+          Details
+        </button>
+        <button
+          type="button"
+          onClick={() => setActiveIpTab("network")}
+          className={cn(
+            "-mb-px border-b-2 px-3 py-1.5 text-sm",
+            activeIpTab === "network"
+              ? "border-primary text-foreground"
+              : "border-transparent text-muted-foreground hover:text-foreground",
+          )}
+        >
+          Network
+          <NetworkTabBadge count={networkCount} />
+        </button>
+      </div>
+      {activeIpTab === "network" && (
+        <div className="pb-2">
+          <IPNetworkTab addressId={address.id} />
+        </div>
+      )}
+      <div className={cn("space-y-3", activeIpTab !== "details" && "hidden")}>
         <Field label="Hostname">
           <input
             className={inputCls}

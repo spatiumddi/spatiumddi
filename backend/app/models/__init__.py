@@ -48,6 +48,12 @@ from app.models.ipam import (
 from app.models.kubernetes import KubernetesCluster
 from app.models.logs import DHCPLogEntry, DNSQueryLogEntry
 from app.models.metrics import DHCPMetricSample, DNSMetricSample
+from app.models.network import (
+    NetworkArpEntry,
+    NetworkDevice,
+    NetworkFdbEntry,
+    NetworkInterface,
+)
 from app.models.oui import OUIVendor
 from app.models.proxmox import ProxmoxNode
 from app.models.settings import PlatformSettings
@@ -114,4 +120,8 @@ __all__ = [
     "KubernetesCluster",
     "ProxmoxNode",
     "TailscaleTenant",
+    "NetworkDevice",
+    "NetworkInterface",
+    "NetworkArpEntry",
+    "NetworkFdbEntry",
 ]

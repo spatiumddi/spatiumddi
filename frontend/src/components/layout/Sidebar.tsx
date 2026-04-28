@@ -7,6 +7,7 @@ import {
   LayoutDashboard,
   Server,
   Router as RouterIcon,
+  Cable,
   Github,
   Users,
   UsersRound,
@@ -44,6 +45,7 @@ const baseMainNav = [
   { label: "DHCP", icon: Server, to: "/dhcp" },
   { label: "DNS", icon: Globe, to: "/dns" },
   { label: "VLANs", icon: RouterIcon, to: "/vlans" },
+  { label: "Network", icon: Cable, to: "/network" },
   { label: "Logs", icon: ScrollText, to: "/logs" },
 ];
 

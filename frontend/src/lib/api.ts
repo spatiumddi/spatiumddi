@@ -4063,3 +4063,313 @@ export const natApi = {
       .get<NATMapping[]>(`/ipam/nat-mappings/by-subnet/${subnetId}`)
       .then((r) => r.data),
 };
+
+// ── Network discovery (SNMP-based router/switch/AP polling) ────────────
+
+export type NetworkDeviceType =
+  | "router"
+  | "switch"
+  | "ap"
+  | "firewall"
+  | "l3_switch"
+  | "other";
+
+export type NetworkSnmpVersion = "v1" | "v2c" | "v3";
+
+export type NetworkV3SecurityLevel = "noAuthNoPriv" | "authNoPriv" | "authPriv";
+
+export type NetworkV3AuthProtocol =
+  | "MD5"
+  | "SHA"
+  | "SHA224"
+  | "SHA256"
+  | "SHA384"
+  | "SHA512";
+
+export type NetworkV3PrivProtocol =
+  | "DES"
+  | "3DES"
+  | "AES128"
+  | "AES192"
+  | "AES256";
+
+export type NetworkPollStatus =
+  | "pending"
+  | "success"
+  | "partial"
+  | "failed"
+  | "timeout";
+
+export interface NetworkDeviceRead {
+  id: string;
+  name: string;
+  hostname: string;
+  ip_address: string;
+  device_type: NetworkDeviceType;
+  description: string | null;
+  vendor: string | null;
+  sys_descr: string | null;
+  sys_object_id: string | null;
+  sys_name: string | null;
+  sys_uptime_seconds: number | null;
+  snmp_version: NetworkSnmpVersion;
+  snmp_port: number;
+  snmp_timeout_seconds: number;
+  snmp_retries: number;
+  has_community: boolean;
+  v3_security_name: string | null;
+  v3_security_level: NetworkV3SecurityLevel | null;
+  v3_auth_protocol: NetworkV3AuthProtocol | null;
+  has_auth_key: boolean;
+  v3_priv_protocol: NetworkV3PrivProtocol | null;
+  has_priv_key: boolean;
+  v3_context_name: string | null;
+  poll_interval_seconds: number;
+  poll_arp: boolean;
+  poll_fdb: boolean;
+  poll_interfaces: boolean;
+  auto_create_discovered: boolean;
+  last_poll_at: string | null;
+  next_poll_at: string | null;
+  last_poll_status: NetworkPollStatus;
+  last_poll_error: string | null;
+  last_poll_arp_count: number | null;
+  last_poll_fdb_count: number | null;
+  last_poll_interface_count: number | null;
+  ip_space_id: string;
+  ip_space_name: string;
+  is_active: boolean;
+  tags: Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface NetworkDeviceListResponse {
+  items: NetworkDeviceRead[];
+  total: number;
+  page: number;
+  page_size: number;
+}
+
+export interface NetworkDeviceListQuery {
+  active?: boolean;
+  device_type?: NetworkDeviceType;
+  last_poll_status?: NetworkPollStatus;
+  page?: number;
+  page_size?: number;
+}
+
+export interface NetworkDeviceCreate {
+  name: string;
+  hostname: string;
+  ip_address: string;
+  device_type?: NetworkDeviceType;
+  description?: string | null;
+  snmp_version?: NetworkSnmpVersion;
+  snmp_port?: number;
+  snmp_timeout_seconds?: number;
+  snmp_retries?: number;
+  community?: string;
+  v3_security_name?: string;
+  v3_security_level?: NetworkV3SecurityLevel;
+  v3_auth_protocol?: NetworkV3AuthProtocol;
+  v3_auth_key?: string;
+  v3_priv_protocol?: NetworkV3PrivProtocol;
+  v3_priv_key?: string;
+  v3_context_name?: string;
+  poll_interval_seconds?: number;
+  poll_arp?: boolean;
+  poll_fdb?: boolean;
+  poll_interfaces?: boolean;
+  auto_create_discovered?: boolean;
+  ip_space_id: string;
+  is_active?: boolean;
+  tags?: Record<string, unknown>;
+}
+
+export type NetworkDeviceUpdate = Partial<NetworkDeviceCreate>;
+
+export interface NetworkTestConnectionResult {
+  success: boolean;
+  sys_descr: string | null;
+  sys_object_id: string | null;
+  sys_name: string | null;
+  vendor: string | null;
+  error_kind:
+    | "timeout"
+    | "auth_failure"
+    | "no_response"
+    | "transport_error"
+    | "internal"
+    | null;
+  error_message: string | null;
+  elapsed_ms: number;
+}
+
+export interface NetworkPollNowResponse {
+  task_id: string;
+  queued_at: string;
+}
+
+export interface NetworkInterfaceRead {
+  id: string;
+  device_id: string;
+  if_index: number;
+  name: string;
+  alias: string | null;
+  description: string | null;
+  speed_bps: number | null;
+  mac_address: string | null;
+  admin_status: "up" | "down" | "testing" | null;
+  oper_status:
+    | "up"
+    | "down"
+    | "testing"
+    | "unknown"
+    | "dormant"
+    | "notPresent"
+    | "lowerLayerDown"
+    | null;
+  last_change_seconds: number | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface NetworkInterfaceListResponse {
+  items: NetworkInterfaceRead[];
+  total: number;
+  page: number;
+  page_size: number;
+}
+
+export interface NetworkArpEntryRead {
+  id: string;
+  device_id: string;
+  interface_id: string | null;
+  interface_name: string | null;
+  ip_address: string;
+  mac_address: string;
+  vrf_name: string | null;
+  address_type: "ipv4" | "ipv6";
+  state: "reachable" | "stale" | "delay" | "probe" | "invalid" | "unknown";
+  first_seen: string;
+  last_seen: string;
+}
+
+export interface NetworkArpListResponse {
+  items: NetworkArpEntryRead[];
+  total: number;
+  page: number;
+  page_size: number;
+}
+
+export interface NetworkArpQuery {
+  ip?: string;
+  mac?: string;
+  vrf?: string;
+  state?: NetworkArpEntryRead["state"];
+  page?: number;
+  page_size?: number;
+}
+
+export interface NetworkFdbEntryRead {
+  id: string;
+  device_id: string;
+  interface_id: string;
+  interface_name: string;
+  mac_address: string;
+  vlan_id: number | null;
+  fdb_type: "learned" | "static" | "mgmt" | "other";
+  first_seen: string;
+  last_seen: string;
+}
+
+export interface NetworkFdbListResponse {
+  items: NetworkFdbEntryRead[];
+  total: number;
+  page: number;
+  page_size: number;
+}
+
+export interface NetworkFdbQuery {
+  mac?: string;
+  vlan_id?: number;
+  interface_id?: string;
+  page?: number;
+  page_size?: number;
+}
+
+export interface NetworkContextEntry {
+  device_id: string;
+  device_name: string;
+  interface_id: string;
+  interface_name: string;
+  interface_alias: string | null;
+  vlan_id: number | null;
+  mac_address: string;
+  fdb_type: string;
+  last_seen: string;
+}
+
+export const networkApi = {
+  listDevices: (params?: NetworkDeviceListQuery) =>
+    api
+      .get<NetworkDeviceListResponse>("/network-devices", { params })
+      .then((r) => r.data),
+  getDevice: (id: string) =>
+    api.get<NetworkDeviceRead>(`/network-devices/${id}`).then((r) => r.data),
+  createDevice: (data: NetworkDeviceCreate) =>
+    api.post<NetworkDeviceRead>("/network-devices", data).then((r) => r.data),
+  updateDevice: (id: string, data: NetworkDeviceUpdate) =>
+    api
+      .patch<NetworkDeviceRead>(`/network-devices/${id}`, data)
+      .then((r) => r.data),
+  deleteDevice: (id: string) => api.delete(`/network-devices/${id}`),
+  testConnection: (id: string) =>
+    api
+      .post<NetworkTestConnectionResult>(`/network-devices/${id}/test`)
+      .then((r) => r.data),
+  pollNow: (id: string) =>
+    api
+      .post<NetworkPollNowResponse>(`/network-devices/${id}/poll-now`)
+      .then((r) => r.data),
+  listInterfaces: (
+    deviceId: string,
+    params?: { page?: number; page_size?: number },
+  ) =>
+    api
+      .get<NetworkInterfaceListResponse>(
+        `/network-devices/${deviceId}/interfaces`,
+        { params },
+      )
+      .then((r) => r.data),
+  listArp: (deviceId: string, params?: NetworkArpQuery) =>
+    api
+      .get<NetworkArpListResponse>(`/network-devices/${deviceId}/arp`, {
+        params,
+      })
+      .then((r) => r.data),
+  listFdb: (deviceId: string, params?: NetworkFdbQuery) =>
+    api
+      .get<NetworkFdbListResponse>(`/network-devices/${deviceId}/fdb`, {
+        params,
+      })
+      .then((r) => r.data),
+  // Mounted under /ipam/addresses/{address_id}/network-context but exposed
+  // here so all network-discovery client wrappers live in one place.
+  getAddressNetworkContext: (addressId: string) =>
+    api
+      .get<
+        NetworkContextEntry[]
+      >(`/ipam/addresses/${addressId}/network-context`)
+      .then((r) => r.data),
+  // Batched: one round-trip per subnet, returns {ip_id: [entries...]}.
+  // Drives the "Network" column on the IPAM IP listing without an
+  // N+1 fan-out of per-IP requests.
+  getSubnetNetworkContext: (subnetId: string) =>
+    api
+      .get<
+        Record<string, NetworkContextEntry[]>
+      >(`/ipam/subnets/${subnetId}/network-context`)
+      .then((r) => r.data),
+};

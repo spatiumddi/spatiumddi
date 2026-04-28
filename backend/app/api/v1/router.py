@@ -20,6 +20,7 @@ from app.api.v1.ipam.router import router as ipam_router
 from app.api.v1.kubernetes import router as kubernetes_router
 from app.api.v1.logs import logs_router
 from app.api.v1.metrics import router as metrics_router
+from app.api.v1.network import router as network_router
 from app.api.v1.proxmox import router as proxmox_router
 from app.api.v1.roles.router import router as roles_router
 from app.api.v1.search.router import router as search_router
@@ -58,6 +59,7 @@ api_v1_router.include_router(kubernetes_router, prefix="/kubernetes", tags=["kub
 api_v1_router.include_router(docker_router, prefix="/docker", tags=["docker"])
 api_v1_router.include_router(proxmox_router, prefix="/proxmox", tags=["proxmox"])
 api_v1_router.include_router(tailscale_router, prefix="/tailscale", tags=["tailscale"])
+api_v1_router.include_router(network_router, tags=["network"])
 api_v1_router.include_router(trash_router, prefix="/admin", tags=["admin-trash"])
 api_v1_router.include_router(postgres_router, prefix="/admin", tags=["admin-postgres"])
 api_v1_router.include_router(containers_router, prefix="/admin", tags=["admin-containers"])

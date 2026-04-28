@@ -29,6 +29,7 @@ celery_app = Celery(
         "app.tasks.docker_sync",
         "app.tasks.proxmox_sync",
         "app.tasks.tailscale_sync",
+        "app.tasks.snmp_poll",
     ],
 )
 
@@ -70,6 +71,7 @@ celery_app.conf.update(
         "app.tasks.docker_sync.*": {"queue": "default"},
         "app.tasks.proxmox_sync.*": {"queue": "default"},
         "app.tasks.tailscale_sync.*": {"queue": "default"},
+        "app.tasks.snmp_poll.*": {"queue": "default"},
     },
     beat_schedule={
         # Every 60s, fan-out health checks to every registered DNS server.
@@ -221,6 +223,23 @@ celery_app.conf.update(
         "tailscale-sync-sweep": {
             "task": "app.tasks.tailscale_sync.sweep_tailscale_tenants",
             "schedule": schedule(run_every=30.0),
+        },
+        # Every 60 s, fan-out SNMP polls to network devices whose
+        # ``next_poll_at`` has elapsed. The dispatcher itself respects
+        # each device's ``poll_interval_seconds`` so a 5-minute poller
+        # only fires every 5 ticks. Per-device tasks acquire SELECT
+        # FOR UPDATE SKIP LOCKED so a manual "Poll Now" running in
+        # parallel won't double-poll.
+        "snmp-poll-dispatch": {
+            "task": "app.tasks.snmp_poll.dispatch_due_devices",
+            "schedule": schedule(run_every=60.0),
+        },
+        # Daily, purge ARP entries that have been stale for > 30 days.
+        # FDB rows are absence-deleted on every poll so they don't
+        # need a janitor.
+        "snmp-arp-purge": {
+            "task": "app.tasks.snmp_poll.purge_stale_arp_entries",
+            "schedule": crontab(hour=3, minute=30),
         },
         # Beat self-heartbeat — writes a redis key every 30 s with a
         # 5-min TTL so the platform-health endpoint can tell a stalled

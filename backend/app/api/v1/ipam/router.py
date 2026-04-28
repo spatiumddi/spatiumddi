@@ -4591,6 +4591,12 @@ async def list_mac_history(
     return out
 
 
+# Network-context endpoint is registered after this module finishes
+# loading — the schema lives in app.api.v1.network.schemas which
+# imports from this module's siblings, so a top-level import here
+# would be circular. See ``_register_network_context_endpoint`` below.
+
+
 @router.put("/addresses/{address_id}", response_model=IPAddressResponse)
 async def update_address(
     address_id: uuid.UUID, body: IPAddressUpdate, current_user: CurrentUser, db: DB
@@ -5939,3 +5945,126 @@ async def bulk_edit_addresses(
         not_found=not_found,
         skipped=skipped,
     )
+
+
+# ── Network discovery cross-reference ──────────────────────────────────────
+# Registered at module bottom so ``app.api.v1.network.schemas`` (which
+# may import sibling modules) can finish loading first. The handler
+# joins each IP's MAC into the SNMP-discovered FDB so operators can
+# answer "where on the network is this IP plugged in?" without leaving
+# the IPAM page.
+
+from app.api.v1.network.schemas import NetworkContextEntry  # noqa: E402
+from app.models.network import (  # noqa: E402
+    NetworkDevice as _NetworkDevice,
+)
+from app.models.network import (  # noqa: E402
+    NetworkFdbEntry as _NetworkFdbEntry,
+)
+from app.models.network import (  # noqa: E402
+    NetworkInterface as _NetworkInterface,
+)
+
+
+@router.get(
+    "/addresses/{address_id}/network-context",
+    response_model=list[NetworkContextEntry],
+)
+async def list_network_context(
+    address_id: uuid.UUID, current_user: CurrentUser, db: DB
+) -> list[NetworkContextEntry]:
+    """Cross-reference an IP's MAC against SNMP-discovered FDB entries.
+
+    Joins ``IPAddress.mac_address`` → ``NetworkFdbEntry`` →
+    ``NetworkInterface`` → ``NetworkDevice``. Returns one entry per
+    matching FDB row — multiple results are normal when the same MAC
+    is learned across VLANs / trunked interfaces. Empty list when the
+    IP has no MAC or the MAC isn't in any device's FDB.
+    """
+    ip = await db.get(IPAddress, address_id)
+    if ip is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP address not found")
+    if ip.mac_address is None:
+        return []
+
+    rows = (
+        await db.execute(
+            select(_NetworkFdbEntry, _NetworkInterface, _NetworkDevice)
+            .join(
+                _NetworkInterface,
+                _NetworkInterface.id == _NetworkFdbEntry.interface_id,
+            )
+            .join(_NetworkDevice, _NetworkDevice.id == _NetworkFdbEntry.device_id)
+            .where(_NetworkFdbEntry.mac_address == str(ip.mac_address))
+            .order_by(_NetworkFdbEntry.last_seen.desc())
+        )
+    ).all()
+
+    out: list[NetworkContextEntry] = []
+    for fdb, iface, device in rows:
+        out.append(
+            NetworkContextEntry(
+                device_id=device.id,
+                device_name=device.name,
+                interface_id=iface.id,
+                interface_name=iface.name,
+                interface_alias=iface.alias,
+                vlan_id=fdb.vlan_id,
+                mac_address=str(fdb.mac_address),
+                fdb_type=fdb.fdb_type,
+                last_seen=fdb.last_seen,
+            )
+        )
+    return out
+
+
+@router.get(
+    "/subnets/{subnet_id}/network-context",
+    response_model=dict[str, list[NetworkContextEntry]],
+)
+async def list_subnet_network_context(
+    subnet_id: uuid.UUID, current_user: CurrentUser, db: DB
+) -> dict[str, list[NetworkContextEntry]]:
+    """Batched network-context lookup for every IP in a subnet.
+
+    Returns ``{<ip_address_id>: [NetworkContextEntry, ...]}``. IPs
+    with no MAC or no FDB hit are absent from the response (the
+    frontend treats them as empty). One DB round-trip per subnet
+    instead of N per page-of-IPs — drives the "Network" column on
+    the IPAM IP listing.
+    """
+    subnet = await db.get(Subnet, subnet_id)
+    if subnet is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
+
+    rows = (
+        await db.execute(
+            select(IPAddress.id, _NetworkFdbEntry, _NetworkInterface, _NetworkDevice)
+            .join(_NetworkFdbEntry, _NetworkFdbEntry.mac_address == IPAddress.mac_address)
+            .join(
+                _NetworkInterface,
+                _NetworkInterface.id == _NetworkFdbEntry.interface_id,
+            )
+            .join(_NetworkDevice, _NetworkDevice.id == _NetworkFdbEntry.device_id)
+            .where(IPAddress.subnet_id == subnet_id)
+            .where(IPAddress.mac_address.is_not(None))
+            .order_by(_NetworkFdbEntry.last_seen.desc())
+        )
+    ).all()
+
+    out: dict[str, list[NetworkContextEntry]] = {}
+    for ip_id, fdb, iface, device in rows:
+        out.setdefault(str(ip_id), []).append(
+            NetworkContextEntry(
+                device_id=device.id,
+                device_name=device.name,
+                interface_id=iface.id,
+                interface_name=iface.name,
+                interface_alias=iface.alias,
+                vlan_id=fdb.vlan_id,
+                mac_address=str(fdb.mac_address),
+                fdb_type=fdb.fdb_type,
+                last_seen=fdb.last_seen,
+            )
+        )
+    return out

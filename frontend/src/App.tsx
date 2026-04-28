@@ -14,6 +14,8 @@ import { KubernetesPage } from "@/pages/kubernetes/KubernetesPage";
 import { DockerPage } from "@/pages/docker/DockerPage";
 import { ProxmoxPage } from "@/pages/proxmox/ProxmoxPage";
 import { TailscalePage } from "@/pages/tailscale/TailscalePage";
+import { NetworkPage } from "@/pages/network/NetworkPage";
+import { DeviceDetailView } from "@/pages/network/DeviceDetailView";
 import { LogsPage } from "@/pages/LogsPage";
 import { UsersPage } from "@/pages/admin/UsersPage";
 import { AuditPage } from "@/pages/admin/AuditPage";
@@ -53,6 +55,8 @@ export default function App() {
         <Route path="ipam/nat" element={<NATPage />} />
         <Route path="dns" element={<DNSPage />} />
         <Route path="vlans" element={<VLANsPage />} />
+        <Route path="network" element={<NetworkPage />} />
+        <Route path="network/:id" element={<DeviceDetailView />} />
         <Route path="dhcp" element={<DHCPPage />} />
         <Route path="logs" element={<LogsPage />} />
         <Route path="kubernetes" element={<KubernetesPage />} />

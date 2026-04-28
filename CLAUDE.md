@@ -276,7 +276,140 @@ categorised section further down.
   `update_oui_database_now`). MACs render as `aa:bb:cc:dd:ee:ff
   (Cisco Systems)` in the IP table + DHCP leases; feature off =
   vendor null + UI falls back to bare MAC.
-- ⬜ SNMP polling / network device management — ARP table polling for IP discovery (see `docs/features/IPAM.md §13`)
+- ✅ **SNMP polling / network device management** — vendor-neutral
+  read-only polling of routers/switches via standard MIBs, with
+  every result cross-referenced into IPAM. Lands the "every
+  managed IP gets a heartbeat + switch-port automatically" payoff
+  this whole roadmap pivots on. **Mirror scope:**
+  - **Data model** (migration
+    `c4e7a2f813b9_network_devices`): `network_device` (SNMP
+    credentials Fernet-encrypted at rest; v1 / v2c / v3 USM all
+    supported with auth + priv protocol enums), `network_interface`,
+    `network_arp_entry` keyed `(device, ip, vrf)`, and
+    `network_fdb_entry` keyed `(device, mac, vlan)` with the
+    Postgres 15+ `NULLS NOT DISTINCT` unique index — so a single
+    port can carry the same MAC across multiple VLANs (hypervisor
+    with VMs in different access VLANs, IP phone with PC
+    passthrough on voice + data VLANs).
+  - **MIBs walked** — SNMPv2-MIB system group (sysDescr /
+    sysObjectID / sysName / sysUpTime), IF-MIB `ifTable` +
+    `ifXTable`, IP-MIB `ipNetToPhysicalTable` with legacy
+    RFC1213 `ipNetToMediaTable` fallback, Q-BRIDGE-MIB
+    `dot1qTpFdbTable` with BRIDGE-MIB `dot1dTpFdbTable` fallback.
+    All standard, no vendor-specific MIBs — works on Cisco /
+    Juniper / Arista / Aruba / MikroTik / OPNsense / pfSense /
+    FortiNet / Cumulus / SONiC / FS.com / Ubiquiti out of the
+    box.
+  - **Polling pipeline** — `pysnmp` 6.x async (`bulkWalk` for
+    table OIDs, ~10–50× faster than `getNext`).
+    `app.tasks.snmp_poll.poll_device` runs sysinfo → interfaces
+    → ARP → FDB sequentially under a per-device
+    `SELECT FOR UPDATE SKIP LOCKED` so concurrent dispatches
+    can't double-poll the same row. `dispatch_due_devices`
+    beat-fires every 60 s and queues every active device whose
+    `next_poll_at <= now`. Per-device interval default 300 s,
+    minimum 60 s. Status: `success | partial | failed |
+    timeout`, with `last_poll_error` populated for ops triage.
+    Stale ARP entries are kept with `state='stale'` (no
+    delete); `purge_stale_arp_entries` daily beat task removes
+    rows older than 30 days.
+  - **IPAM cross-reference** — after every successful ARP poll,
+    `cross_reference_arp` finds matching `IPAddress` rows in
+    the device's bound `IPSpace` and updates `last_seen_at`
+    (max-merge), `last_seen_method='snmp'`, and fills
+    `mac_address` only when currently NULL — operator-set MACs
+    are never overwritten. When the per-device
+    `auto_create_discovered=True` toggle is on (off by default;
+    operator stays in control), inserts new
+    `status='discovered'` rows for ARP IPs that fall inside a
+    known `Subnet`. Returns counts (`updated`, `created`,
+    `skipped_no_subnet`).
+  - **API** — full CRUD at `/api/v1/network-devices` plus
+    `POST /test` (synchronous SNMP probe, ≤10 s, returns
+    `TestConnectionResult` with sysDescr + classified
+    `error_kind`: `timeout | auth_failure | no_response |
+    transport_error | internal`), `POST /poll-now` (queues
+    immediate Celery task, returns 202 + task_id), and
+    per-device list endpoints `/interfaces`, `/arp` (filter by
+    ip/mac/vrf/state), `/fdb` (filter by mac/vlan/interface_id).
+    The IP-detail surface gains
+    `GET /api/v1/ipam/addresses/{id}/network-context` — joins
+    `IPAddress.mac_address → NetworkFdbEntry → NetworkInterface
+    → NetworkDevice` and returns one row per (device, port,
+    VLAN, MAC) tuple so a hypervisor / IP phone surfaces every
+    leg.
+  - **Frontend** — top-level `/network` page in the core sidebar
+    (always visible between VLANs and Logs — this is core IPAM
+    functionality, not gated on a Settings → Integrations
+    toggle). Per-device detail at `/network/:id` with Overview /
+    Interfaces / ARP / FDB tabs, each filterable + paginated.
+    Add/edit modal with SNMP-version-conditional credential
+    fields (community for v1/v2c; security_name + level + auth
+    + priv for v3) plus inline Test Connection (saves first on
+    create, then probes against the saved row). New "Network"
+    tab on the IP detail modal showing per-IP switch/port table
+    sorted by `last_seen DESC`.
+  - **Permissions** — single `manage_network_devices` permission
+    gates all endpoints (read + write); new "Network Editor"
+    builtin role gets it. Superadmin always bypasses.
+  - **Tests** — 35 backend tests covering pysnmp wrapper paths
+    (mocked: v1 / v2c / v3 auth construction, OID resolution,
+    `ipNetToPhysical → ipNetToMedia` fallback,
+    `Q-BRIDGE → BRIDGE` fallback, error classification),
+    API CRUD + `/test` + `/poll-now` + the four list endpoints
+    + `/network-context`, and three cross-reference paths
+    (existing IP gets last_seen + MAC fill; operator-set MAC
+    never overwritten; auto-create on/off; no-matching-subnet
+    skip).
+
+  **Deferred follow-ups:**
+  - **LLDP / CDP neighbour collection** + topology graph — its
+    own ⬜ item under the categorised brainstorm below.
+  - **VRF-aware ARP polling.** `network_device.v3_context_name`
+    column exists for SNMPv3 context-name targeting, but the
+    poller doesn't iterate per-VRF in v1. Per-VRF SNMPv2c
+    community-string indexing
+    (`<community>@<vrf-name>` Cisco convention) and SNMPv3
+    context-name iteration are both pending.
+  - **Standalone `snmp-poller` container** (per
+    `docs/features/IPAM.md §13`). Today the polling lives in
+    the existing Celery worker pool, which is fine to ~100
+    devices on a 5-min interval. Splitting becomes interesting
+    once SNMP traffic competes with the worker's other tasks
+    or when the operator wants different network reachability
+    for the poller (different VLAN, jumphost, etc).
+  - **Beat-tick fan-out cap.** `dispatch_due_devices` queues
+    every due device in one tick; at >1k devices this is a
+    queue spike. Chunking + per-tick rate-limit is the cheap
+    follow-up.
+  - **Permission granularity** — read vs write split. Today
+    `manage_network_devices` covers both; ops teams that want
+    network-engineer read access without write privs need a
+    `view_network_devices` companion permission.
+  - **Stateless probe endpoint** — today `/test` requires the
+    device row to exist; the create-then-test flow on the UI
+    saves first then probes. A
+    `POST /network-devices/probe` that accepts inline creds
+    would let operators verify before committing the row.
+  - **Frontend permission gating** — sidebar nav entry shows
+    for every authenticated user (backend 403s unauthorised
+    callers). A `useCurrentUser` hook + `hasPermission` check
+    on the sidebar item is the polish step; depends on
+    introducing those hooks (they don't exist anywhere in the
+    frontend today).
+  - **Vendor-specific MIBs** — CISCO-VRF-MIB for VRF
+    auto-discovery, ENTITY-MIB for chassis info, vendor PoE
+    MIBs. The vendor-neutral path covers the IPAM payoff;
+    extensions are operator-pull additions.
+  - **`/network-context` reverse-lookup pages.** "Show me every
+    IP currently learned on switch X port 24" needs an
+    interface-detail page or a query mode on the FDB tab.
+    Today operators can filter the FDB tab by interface_id —
+    the dedicated UI is a polish iteration.
+
+  Original spec lives at `docs/features/IPAM.md §13` (the
+  pre-build placeholder). The shipped behaviour matches that
+  spec for the standard-MIB scope.
 - ✅ **API tokens with auto-expiry** (Phase 1 close-out) — `APIToken`
   model already existed; this session wires the create/list/revoke
   router, extends `get_current_user` to accept `spddi_*` bearer
@@ -996,11 +1129,27 @@ None of these have started; everything below is ⬜.
   (`_workstation._tcp`, `_printer._tcp`, etc). Best run inside
   a DHCP agent pod since the agent already has L2 reach. Cheap
   incremental population.
-- ⬜ **Switch-port mapping in the IP table** — depends on SNMP
-  polling. Adds Switch / Port columns to the IP table from
-  `dot1dTpFdbTable` (Q-BRIDGE-MIB) + `ifTable` lookups.
-  "Click MAC → all IPs on this port" cross-reference. Standard
-  IPAM display once the FDB is being polled.
+- ✅ **Switch-port mapping in the IP table (column-level).** The
+  IPAM IP table now carries a "Network" column showing
+  `<device> · <port> [VLAN N]` for the most-recent FDB hit on
+  each IP's MAC, with a `+N more` badge + hover tooltip listing
+  every (device, port, VLAN) tuple when the MAC is learned in
+  multiple places (hypervisor host + VMs across access VLANs,
+  trunk ports). Backed by a batched
+  `GET /api/v1/ipam/subnets/{id}/network-context` endpoint that
+  returns `{ip_address_id: NetworkContextEntry[]}` in one round
+  trip — no N+1 fan-out per page-of-IPs. The per-IP detail
+  modal's "Network" tab still works as the deep-dive surface.
+  **Deferred follow-ups:**
+  - Reverse "click MAC → all IPs on this port" drilldown
+    starting from an interface row in the network detail page.
+    Useful when an operator's looking at a switch port and
+    wants to see "what's plugged in here?".
+  - Per-user column show/hide (lives under the broader Saved
+    Views work in UX polish below).
+  - Filter input on the Network column (the column header has
+    no filter today; operators can still filter via the device
+    detail page's ARP/FDB tabs).
 - ⬜ **Reverse-DNS auto-population** — Celery beat sweeps IP rows
   where `hostname IS NULL` and issues a PTR lookup against the
   configured resolvers. Hostname is filled with the trailing

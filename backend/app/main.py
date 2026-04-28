@@ -101,6 +101,12 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
             {"action": "admin", "resource_type": "dhcp_mac_block"},
         ],
     ),
+    "Network Editor": (
+        "Full CRUD on SNMP-polled network devices (routers, switches, APs).",
+        [
+            {"action": "admin", "resource_type": "manage_network_devices"},
+        ],
+    ),
 }
 
 
