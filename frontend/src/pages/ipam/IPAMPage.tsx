@@ -8492,9 +8492,10 @@ function BlockDetailView({
     status: "",
   });
   const [showBlockFilters, setShowBlockFilters] = useState(false);
-  const [selectedSubnets, setSelectedSubnets] = useState<Set<string>>(
-    new Set(),
-  );
+  // Unified selection set with ``subnet:<id>`` / ``block:<id>`` keys —
+  // mirrors the space-level view so a single bulk action can delete a
+  // mixed set of subnets + empty leaf blocks.
+  const [selected, setSelected] = useState<Set<string>>(new Set());
   const [showBulkEdit, setShowBulkEdit] = useState(false);
   const [showBulkDelete, setShowBulkDelete] = useState(false);
   const [showDnsSync, setShowDnsSync] = useState(false);
@@ -8508,54 +8509,72 @@ function BlockDetailView({
     string | null
   >(null);
   const blockBulkDeleteMut = useMutation({
-    // allSettled so one 409 doesn't hide the rest. We report per-subnet
-    // failures up as a single multi-line error; successes still commit.
+    // allSettled on both phases so a single 409 (non-empty subnet/block)
+    // doesn't hide the rest. Subnets first — a subnet hanging off a leaf
+    // block would otherwise trip the block's RESTRICT FK on cascade.
     mutationFn: async () => {
-      const ids = Array.from(selectedSubnets);
-      const results = await Promise.allSettled(
-        // Cascade — the confirmation modal already says "…and all
-        // IP address records within them will be permanently
-        // deleted". force=true matches that intent.
-        ids.map((id) => ipamApi.deleteSubnet(id, true)),
+      const subnetIds: string[] = [];
+      const blockIds: string[] = [];
+      for (const key of selected) {
+        if (key.startsWith("subnet:")) subnetIds.push(key.slice("subnet:".length));
+        else if (key.startsWith("block:")) blockIds.push(key.slice("block:".length));
+      }
+      const subnetResults = await Promise.allSettled(
+        subnetIds.map((id) => ipamApi.deleteSubnet(id, true)),
       );
-      const failures: { id: string; message: string }[] = [];
-      ids.forEach((id, i) => {
-        const r = results[i];
-        if (r.status === "rejected") {
-          const reason = r.reason as
-            | { response?: { data?: { detail?: unknown } } }
-            | undefined;
-          const detail = reason?.response?.data?.detail;
-          failures.push({
-            id,
-            message:
-              typeof detail === "string"
-                ? detail
-                : detail
-                  ? JSON.stringify(detail)
-                  : "Unknown error",
-          });
-        }
-      });
-      return { failures, total: ids.length };
+      const blockResults = await Promise.allSettled(
+        blockIds.map((id) => ipamApi.deleteBlock(id)),
+      );
+      type Fail = { id: string; kind: "subnet" | "block"; message: string };
+      const failures: Fail[] = [];
+      const collect = (
+        ids: string[],
+        results: PromiseSettledResult<unknown>[],
+        kind: "subnet" | "block",
+      ) => {
+        ids.forEach((id, i) => {
+          const r = results[i];
+          if (r.status === "rejected") {
+            const reason = r.reason as
+              | { response?: { data?: { detail?: unknown } } }
+              | undefined;
+            const detail = reason?.response?.data?.detail;
+            failures.push({
+              id,
+              kind,
+              message:
+                typeof detail === "string"
+                  ? detail
+                  : detail
+                    ? JSON.stringify(detail)
+                    : "Unknown error",
+            });
+          }
+        });
+      };
+      collect(subnetIds, subnetResults, "subnet");
+      collect(blockIds, blockResults, "block");
+      return { failures, total: subnetIds.length + blockIds.length };
     },
     onSuccess: ({ failures, total }) => {
       qc.invalidateQueries({ queryKey: ["subnets", block.space_id] });
       qc.invalidateQueries({ queryKey: ["blocks", block.space_id] });
       if (failures.length === 0) {
-        setSelectedSubnets(new Set());
+        setSelected(new Set());
         setShowBulkDelete(false);
         setBlockBulkDeleteError(null);
         return;
       }
-      // Surface per-subnet messages; the modal stays open so the operator
-      // can read them and either cancel or clear the blockers and retry.
-      const lookup = new Map(allSubnets.map((s) => [s.id, s.network]));
+      const subnetLookup = new Map(allSubnets.map((s) => [s.id, s.network]));
+      const blockLookup = new Map(allBlocks.map((b) => [b.id, b.network]));
       const detail = failures
-        .map((f) => `• ${lookup.get(f.id) ?? f.id}: ${f.message}`)
+        .map((f) => {
+          const lookup = f.kind === "subnet" ? subnetLookup : blockLookup;
+          return `• ${f.kind} ${lookup.get(f.id) ?? f.id}: ${f.message}`;
+        })
         .join("\n");
       setBlockBulkDeleteError(
-        `${failures.length} of ${total} subnets could not be deleted:\n${detail}`,
+        `${failures.length} of ${total} items could not be deleted:\n${detail}`,
       );
     },
   });
@@ -8574,6 +8593,37 @@ function BlockDetailView({
   const directChildBlocks = allBlocks.filter(
     (b) => b.parent_block_id === block.id,
   );
+
+  // Leaf-empty blocks (no child blocks AND no child subnets) get a checkbox.
+  // Anything else is hidden behind a placeholder cell — deleting a non-leaf
+  // would either cascade unpredictably or hit the FK RESTRICT.
+  const leafBlockIds = new Set<string>();
+  {
+    const subnetBlockParents = new Set(allSubnets.map((s) => s.block_id));
+    const blockParents = new Set(
+      allBlocks.map((b) => b.parent_block_id).filter((p): p is string => !!p),
+    );
+    for (const b of allBlocks) {
+      if (!subnetBlockParents.has(b.id) && !blockParents.has(b.id)) {
+        leafBlockIds.add(b.id);
+      }
+    }
+  }
+
+  const selectedSubnetIds = [...selected]
+    .filter((k) => k.startsWith("subnet:"))
+    .map((k) => k.slice("subnet:".length));
+  const selectedBlockKeys = [...selected].filter((k) => k.startsWith("block:"));
+  const hasBlocksSelected = selectedBlockKeys.length > 0;
+  const selectedCount = selected.size;
+  const toggleOne = (key: string) =>
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+
   const [freeRangePreset, setFreeRangePreset] = useState<FreeCidrRange | null>(
     null,
   );
@@ -8600,20 +8650,22 @@ function BlockDetailView({
         <div className="flex items-center justify-between gap-4 px-6 pt-3 pb-2">
           <BreadcrumbPills items={crumbs} />
           <div className="flex flex-shrink-0 items-center gap-2">
-            {selectedSubnets.size > 0 ? (
+            {selectedCount > 0 ? (
               <>
-                <HeaderButton
-                  icon={Pencil}
-                  onClick={() => setShowBulkEdit(true)}
-                >
-                  Bulk Edit ({selectedSubnets.size})
-                </HeaderButton>
-                {selectedSubnets.size === 1 && (
+                {!hasBlocksSelected && (
+                  <HeaderButton
+                    icon={Pencil}
+                    onClick={() => setShowBulkEdit(true)}
+                  >
+                    Bulk Edit ({selectedSubnetIds.length})
+                  </HeaderButton>
+                )}
+                {!hasBlocksSelected && selectedSubnetIds.length === 1 && (
                   <HeaderButton onClick={() => setShowSplitSubnet(true)}>
                     Split…
                   </HeaderButton>
                 )}
-                {selectedSubnets.size >= 2 && (
+                {!hasBlocksSelected && selectedSubnetIds.length >= 2 && (
                   <HeaderButton onClick={() => setShowMergeSubnet(true)}>
                     Merge…
                   </HeaderButton>
@@ -8623,9 +8675,9 @@ function BlockDetailView({
                   icon={Trash2}
                   onClick={() => setShowBulkDelete(true)}
                 >
-                  Delete ({selectedSubnets.size})
+                  Delete ({selectedCount})
                 </HeaderButton>
-                <HeaderButton onClick={() => setSelectedSubnets(new Set())}>
+                <HeaderButton onClick={() => setSelected(new Set())}>
                   Clear
                 </HeaderButton>
               </>
@@ -8803,11 +8855,11 @@ function BlockDetailView({
       )}
       {showBulkEdit && (
         <BulkEditSubnetsModal
-          subnetIds={Array.from(selectedSubnets)}
+          subnetIds={selectedSubnetIds}
           onClose={() => setShowBulkEdit(false)}
           onDone={() => {
             setShowBulkEdit(false);
-            setSelectedSubnets(new Set());
+            setSelected(new Set());
           }}
         />
       )}
@@ -8821,11 +8873,27 @@ function BlockDetailView({
           onClose={() => setShowDnsSync(false)}
         />
       )}
-      {showBulkDelete && (
+      {showBulkDelete && (() => {
+        const sCount = selectedSubnetIds.length;
+        const bCount = selectedBlockKeys.length;
+        const noun =
+          sCount && bCount
+            ? `${sCount} subnet${sCount === 1 ? "" : "s"} + ${bCount} block${bCount === 1 ? "" : "s"}`
+            : sCount
+              ? `${sCount} Subnet${sCount === 1 ? "" : "s"}`
+              : `${bCount} empty Block${bCount === 1 ? "" : "s"}`;
+        return (
         <ConfirmDestroyModal
-          title={`Delete ${selectedSubnets.size} Subnet${selectedSubnets.size === 1 ? "" : "s"}`}
-          description={`This will move ${selectedSubnets.size} subnet${selectedSubnets.size === 1 ? "" : "s"} to Trash. You can restore from Admin → Trash within 30 days.`}
-          checkLabel={`I understand ${selectedSubnets.size} subnet${selectedSubnets.size === 1 ? "" : "s"} will be moved to Trash.`}
+          title={`Delete ${noun}`}
+          description={
+            sCount > 0
+              ? `This will move ${sCount} subnet${sCount === 1 ? "" : "s"} to Trash` +
+                (bCount > 0
+                  ? ` and permanently delete ${bCount} empty block${bCount === 1 ? "" : "s"}.`
+                  : ". You can restore from Admin → Trash within 30 days.")
+              : `This will permanently delete ${bCount} empty block${bCount === 1 ? "" : "s"}. Blocks are not restorable from Trash.`
+          }
+          checkLabel={`I understand ${noun} will be deleted.`}
           isPending={blockBulkDeleteMut.isPending}
           error={blockBulkDeleteError}
           onClose={() => {
@@ -8837,7 +8905,8 @@ function BlockDetailView({
             blockBulkDeleteMut.mutate();
           }}
         />
-      )}
+        );
+      })()}
       {showFindFree && space && (
         <FindFreeModal
           space={space}
@@ -8858,7 +8927,7 @@ function BlockDetailView({
       )}
       {showSplitSubnet &&
         (() => {
-          const subnetId = Array.from(selectedSubnets)[0];
+          const subnetId = selectedSubnetIds[0];
           const sn = allSubnets.find((s) => s.id === subnetId);
           return sn ? (
             <SplitSubnetModal
@@ -8866,7 +8935,7 @@ function BlockDetailView({
               onClose={() => setShowSplitSubnet(false)}
               onCommitted={() => {
                 setShowSplitSubnet(false);
-                setSelectedSubnets(new Set());
+                setSelected(new Set());
                 qc.invalidateQueries({ queryKey: ["subnets"] });
               }}
             />
@@ -8874,7 +8943,7 @@ function BlockDetailView({
         })()}
       {showMergeSubnet &&
         (() => {
-          const subnetId = Array.from(selectedSubnets)[0];
+          const subnetId = selectedSubnetIds[0];
           const sn = allSubnets.find((s) => s.id === subnetId);
           return sn ? (
             <MergeSubnetSiblingPicker
@@ -8882,7 +8951,7 @@ function BlockDetailView({
               onClose={() => setShowMergeSubnet(false)}
               onCommitted={() => {
                 setShowMergeSubnet(false);
-                setSelectedSubnets(new Set());
+                setSelected(new Set());
                 qc.invalidateQueries({ queryKey: ["subnets"] });
               }}
             />
@@ -8983,20 +9052,31 @@ function BlockDetailView({
                   <tr className="border-b bg-muted/40 text-xs">
                     <th className="w-8 px-2 py-2 text-left">
                       {(() => {
-                        const subnetIds = allRows
-                          .filter((r) => r.type === "subnet" && r.subnet)
-                          .map((r) => r.subnet!.id);
+                        const selectableKeys = [
+                          ...allRows
+                            .filter((r) => r.type === "subnet" && r.subnet)
+                            .map((r) => `subnet:${r.subnet!.id}`),
+                          ...allRows
+                            .filter(
+                              (r) =>
+                                r.type === "block" &&
+                                r.block &&
+                                leafBlockIds.has(r.block.id),
+                            )
+                            .map((r) => `block:${r.block!.id}`),
+                        ];
                         const allSelected =
-                          subnetIds.length > 0 &&
-                          subnetIds.every((id) => selectedSubnets.has(id));
+                          selectableKeys.length > 0 &&
+                          selectableKeys.every((k) => selected.has(k));
                         return (
                           <input
                             type="checkbox"
-                            aria-label="Select all subnets"
+                            aria-label="Select all selectable rows"
                             checked={allSelected}
+                            disabled={selectableKeys.length === 0}
                             onChange={() =>
-                              setSelectedSubnets(
-                                allSelected ? new Set() : new Set(subnetIds),
+                              setSelected(
+                                allSelected ? new Set() : new Set(selectableKeys),
                               )
                             }
                           />
@@ -9179,13 +9259,32 @@ function BlockDetailView({
                     const indent = item.depth * 20;
                     if (item.type === "block" && item.block) {
                       const b = item.block;
+                      const isLeaf = leafBlockIds.has(b.id);
+                      const blockKey = `block:${b.id}`;
                       return (
                         <tr
                           key={item.key}
                           onClick={() => onSelectBlock(b)}
                           className="border-b last:border-0 cursor-pointer hover:bg-muted/30 bg-muted/10"
                         >
-                          <td className="w-8 px-2 py-2" />
+                          <td
+                            className="w-8 px-2 py-2"
+                            onClick={(e) => e.stopPropagation()}
+                          >
+                            {isLeaf ? (
+                              <input
+                                type="checkbox"
+                                aria-label={`Select block ${b.network}`}
+                                checked={selected.has(blockKey)}
+                                onChange={() => toggleOne(blockKey)}
+                              />
+                            ) : (
+                              <span
+                                className="inline-block h-3.5 w-3.5"
+                                title="Block has child blocks or subnets — delete those first"
+                              />
+                            )}
+                          </td>
                           <td
                             className="py-2 pr-4"
                             style={{ paddingLeft: `${indent + 16}px` }}
@@ -9246,7 +9345,7 @@ function BlockDetailView({
                           onClick={() => onSelectSubnet(s)}
                           className={cn(
                             "border-b last:border-0 cursor-pointer hover:bg-muted/30",
-                            selectedSubnets.has(s.id) && "bg-primary/5",
+                            selected.has(`subnet:${s.id}`) && "bg-primary/5",
                           )}
                         >
                           <td
@@ -9256,15 +9355,8 @@ function BlockDetailView({
                             <input
                               type="checkbox"
                               aria-label={`Select ${s.network}`}
-                              checked={selectedSubnets.has(s.id)}
-                              onChange={() =>
-                                setSelectedSubnets((prev) => {
-                                  const next = new Set(prev);
-                                  if (next.has(s.id)) next.delete(s.id);
-                                  else next.add(s.id);
-                                  return next;
-                                })
-                              }
+                              checked={selected.has(`subnet:${s.id}`)}
+                              onChange={() => toggleOne(`subnet:${s.id}`)}
                             />
                           </td>
                           <td
