@@ -274,6 +274,74 @@ export interface PlanAllocationResponse {
   remaining_free: FreeCidrRange[];
 }
 
+// ── Subnet plans (multi-level CIDR designs) ─────────────────────────────
+
+export interface PlanNode {
+  id: string;
+  network: string;
+  name: string;
+  description: string;
+  existing_block_id?: string | null;
+  kind: "block" | "subnet";
+  // Optional resource bindings — null/undefined = inherit from parent.
+  dns_group_id?: string | null;
+  dns_zone_id?: string | null;
+  dhcp_server_group_id?: string | null;
+  vlan_ref_id?: string | null;
+  gateway?: string | null;
+  children: PlanNode[];
+}
+
+export interface SubnetPlanRead {
+  id: string;
+  name: string;
+  description: string;
+  space_id: string;
+  tree: PlanNode | null;
+  applied_at: string | null;
+  applied_resource_ids: { block_ids: string[]; subnet_ids: string[] } | null;
+  created_by_user_id: string | null;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface SubnetPlanCreate {
+  name: string;
+  description?: string;
+  space_id: string;
+  tree: PlanNode;
+}
+
+export interface SubnetPlanUpdate {
+  name?: string;
+  description?: string;
+  tree?: PlanNode;
+}
+
+export interface PlanValidationConflict {
+  node_id: string;
+  network: string;
+  kind:
+    | "overlap_existing"
+    | "out_of_parent"
+    | "sibling_overlap"
+    | "duplicate_id"
+    | "missing_block";
+  message: string;
+}
+
+export interface PlanValidationResult {
+  ok: boolean;
+  conflicts: PlanValidationConflict[];
+  summary: { block_count: number; subnet_count: number };
+}
+
+export interface PlanApplyResult {
+  block_ids: string[];
+  subnet_ids: string[];
+  applied_at: string;
+}
+
 export interface EffectiveDns {
   dns_group_ids: string[];
   dns_zone_id: string | null;
@@ -789,6 +857,34 @@ export const ipamApi = {
         items,
       })
       .then((r) => r.data),
+
+  // Subnet plans
+  listSubnetPlans: (spaceId?: string) =>
+    api
+      .get<SubnetPlanRead[]>(`/ipam/plans`, {
+        params: spaceId ? { space_id: spaceId } : undefined,
+      })
+      .then((r) => r.data),
+  getSubnetPlan: (id: string) =>
+    api.get<SubnetPlanRead>(`/ipam/plans/${id}`).then((r) => r.data),
+  createSubnetPlan: (body: SubnetPlanCreate) =>
+    api.post<SubnetPlanRead>(`/ipam/plans`, body).then((r) => r.data),
+  updateSubnetPlan: (id: string, body: SubnetPlanUpdate) =>
+    api.patch<SubnetPlanRead>(`/ipam/plans/${id}`, body).then((r) => r.data),
+  deleteSubnetPlan: (id: string) =>
+    api.delete<void>(`/ipam/plans/${id}`).then((r) => r.data),
+  validateSubnetPlan: (id: string) =>
+    api
+      .post<PlanValidationResult>(`/ipam/plans/${id}/validate`)
+      .then((r) => r.data),
+  validateSubnetPlanTree: (body: SubnetPlanCreate) =>
+    api
+      .post<PlanValidationResult>(`/ipam/plans/validate-tree`, body)
+      .then((r) => r.data),
+  applySubnetPlan: (id: string) =>
+    api.post<PlanApplyResult>(`/ipam/plans/${id}/apply`).then((r) => r.data),
+  reopenSubnetPlan: (id: string) =>
+    api.post<SubnetPlanRead>(`/ipam/plans/${id}/reopen`).then((r) => r.data),
   getEffectiveBlockDns: (blockId: string) =>
     api
       .get<EffectiveDns>(`/ipam/blocks/${blockId}/effective-dns`)

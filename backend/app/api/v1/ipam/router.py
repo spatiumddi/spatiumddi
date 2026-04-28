@@ -76,6 +76,12 @@ from app.api.v1.ipam.nat import router as nat_router  # noqa: E402
 
 router.include_router(nat_router)
 
+# Subnet plans — multi-level CIDR designs applied transactionally.
+# Lives under /api/v1/ipam/plans, parallel to /nat-mappings.
+from app.api.v1.ipam.plans import router as plans_router  # noqa: E402
+
+router.include_router(plans_router)
+
 # ── Internal helpers ───────────────────────────────────────────────────────────
 
 

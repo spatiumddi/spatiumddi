@@ -33,6 +33,7 @@ import {
   Trash2,
   Search,
   Calculator,
+  Workflow,
   X,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -45,6 +46,7 @@ const baseMainNav = [
   { label: "IPAM", icon: Network, to: "/ipam", end: true },
   { label: "VLANs", icon: RouterIcon, to: "/vlans" },
   { label: "NAT Mappings", icon: Shuffle, to: "/ipam/nat" },
+  { label: "Subnet Planner", icon: Workflow, to: "/ipam/plans" },
   { label: "DNS", icon: Globe, to: "/dns" },
   { label: "DHCP", icon: Server, to: "/dhcp" },
   { label: "Network", icon: Cable, to: "/network" },

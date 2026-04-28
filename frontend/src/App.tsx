@@ -18,6 +18,8 @@ import { NetworkPage } from "@/pages/network/NetworkPage";
 import { DeviceDetailView } from "@/pages/network/DeviceDetailView";
 import { NmapToolsPage } from "@/pages/nmap/NmapToolsPage";
 import { CidrCalculatorPage } from "@/pages/tools/CidrCalculatorPage";
+import { SubnetPlannerListPage } from "@/pages/ipam/SubnetPlannerListPage";
+import { SubnetPlannerEditorPage } from "@/pages/ipam/SubnetPlannerEditorPage";
 import { LogsPage } from "@/pages/LogsPage";
 import { UsersPage } from "@/pages/admin/UsersPage";
 import { AuditPage } from "@/pages/admin/AuditPage";
@@ -55,6 +57,8 @@ export default function App() {
         <Route path="dashboard" element={<DashboardPage />} />
         <Route path="ipam" element={<IPAMPage />} />
         <Route path="ipam/nat" element={<NATPage />} />
+        <Route path="ipam/plans" element={<SubnetPlannerListPage />} />
+        <Route path="ipam/plans/:id" element={<SubnetPlannerEditorPage />} />
         <Route path="dns" element={<DNSPage />} />
         <Route path="vlans" element={<VLANsPage />} />
         <Route path="network" element={<NetworkPage />} />

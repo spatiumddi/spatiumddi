@@ -1255,14 +1255,60 @@ None of these have started; everything below is ⬜.
   expanded forms (v6). Quick-paste preset buttons for the common
   RFC 1918 / CGNAT / ULA blocks. BigInt math throughout so v6
   prefixes work cleanly.
-- ⬜ **Subnet planner / "what-if" workspace** — drag-and-drop
-  sketchpad for designing a hierarchy (parent + nested children
-  + sizes) before committing. Saved as a `SubnetPlan` row (JSON
-  tree); "Apply" runs the same overlap / fit validators as the
-  live tree and creates the rows in one transaction. Useful for
-  new-site provisioning. Distinct from the per-block address
-  planner that shipped — this one persists multi-level designs
-  and applies them transactionally.
+- ✅ **Subnet planner / "what-if" workspace** — `/ipam/plans`.
+  Operator designs a multi-level CIDR hierarchy as a draggable
+  tree (one root + nested children, arbitrary depth), saves it
+  as a `SubnetPlan` row, validates against current state, then
+  one-click applies — every block + subnet created in a single
+  transaction. **Data model:** `subnet_plan(id, name,
+  description, space_id, tree JSONB, applied_at,
+  applied_resource_ids JSONB, created_by_user_id)`. Tree node
+  shape: `{id, network, name, description, kind, existing_block_id?,
+  dns_group_id?, dns_zone_id?, dhcp_server_group_id?,
+  vlan_ref_id?, gateway?, children[]}`. **`kind` is explicit**
+  per node (`block` or `subnet`) — root must be a block
+  (subnets need a block parent), and a subnet may not have
+  children (validation enforces both). **Resource bindings**
+  (DNS group, DHCP group, gateway) are optional per-node;
+  `null` = inherit, explicit value sets the field on the
+  materialised row and flips the corresponding
+  `*_inherit_settings=False`. UI exposes DNS group + DHCP
+  group dropdowns + gateway field on subnets; VLAN + DNS-zone
+  fields exist in the model but UI binding is deferred (VLAN
+  is router-scoped — needs a flat list endpoint first). **Root
+  modes:** new top-level CIDR (creates a fresh block at the
+  space root) OR anchor to an existing `IPBlock` (descendants
+  land as children of the existing block, root not re-created).
+  **Validation** (`/plans/{id}/validate` + `/plans/validate-tree`
+  for in-flight trees) checks duplicate node ids, kind rules,
+  parent-containment of every child, sibling-overlap, and
+  overlap against current IPAM state in the bound space.
+  Auto-fires every 300 ms as the operator edits — conflicts
+  surface inline as red ring on offending nodes + a banner
+  above the tree. **Apply** opens a confirmation modal with
+  block + subnet counts ("this will create N blocks + M
+  subnets"), then re-validates inside the txn; any conflict
+  → 409 with the full conflict list and nothing is written.
+  Once applied, the plan flips read-only and
+  `applied_resource_ids` records every created block + subnet
+  for audit. **Reopen** (`/plans/{id}/reopen`) flips an
+  applied plan back to draft state, but only if every
+  materialised resource has been deleted from IPAM —
+  otherwise 409 with the survivor list. Lets operators
+  iterate on the same plan after a teardown rather than start
+  fresh. **Frontend:** `@dnd-kit/core` (already a dep) for
+  drag-to-reparent; drops onto descendants OR onto subnet
+  targets are refused. Properties panel on the right edits
+  CIDR / name / kind / DNS / DHCP / gateway for the selected
+  node. Sidebar entry "Subnet Planner" alongside NAT
+  Mappings. Migration `c8e1f04a932d_subnet_plan`.
+  **Deferred:** sibling reordering via `@dnd-kit/sortable`
+  (today reparenting only appends as last child); split-into-N
+  action on a node; VLAN dropdown in the planner UI (model
+  field exists; needs a flat VLAN list endpoint first); DNS
+  zone selector that's gated on the chosen DNS group; per-node
+  custom-fields / tags / status (those are per-IP and edited
+  through normal IPAM use after apply).
 - ✅ **Address planner** — `POST /api/v1/ipam/blocks/{id}/plan-
   allocation` accepts a list of `{count, prefix_len}` requests
   (e.g. `4 × /24, 2 × /26, 1 × /22`) and packs them into the

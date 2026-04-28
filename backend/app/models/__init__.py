@@ -43,6 +43,7 @@ from app.models.ipam import (
     RouterZone,
     Subnet,
     SubnetDomain,
+    SubnetPlan,
     VLANMapping,
 )
 from app.models.kubernetes import KubernetesCluster
@@ -82,6 +83,7 @@ __all__ = [
     "RouterZone",
     "Subnet",
     "SubnetDomain",
+    "SubnetPlan",
     "IPAddress",
     "CustomFieldDefinition",
     "VLANMapping",

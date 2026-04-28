@@ -723,3 +723,56 @@ class VLANMapping(UUIDPrimaryKeyMixin, Base):
     vxlan_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+
+
+class SubnetPlan(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """Operator-designed multi-level CIDR plan, applied transactionally.
+
+    The ``tree`` JSONB carries the planned hierarchy. Each node has the
+    shape::
+
+        {
+            "id":          "node-uuid",          // client-stable id (DnD)
+            "network":     "10.0.0.0/16",        // CIDR
+            "name":        "Datacenter East",    // operator-friendly label
+            "description": "...",
+            "children":    [ ... ],              // nested nodes
+        }
+
+    The root node may carry ``"existing_block_id": "<uuid>"`` to anchor the
+    plan inside an already-existing IPBlock. When set, apply does not
+    re-create the root — only the descendants are materialised, with the
+    existing block as their parent. When null, the root itself becomes a
+    new top-level block in the bound IPSpace on apply.
+
+    A node with children = an IPBlock; a leaf = a Subnet. The kind is
+    inferred from tree shape so the operator doesn't have to toggle a
+    per-node flag.
+
+    ``applied_at`` is set the first time the plan is applied; once
+    applied, the plan is immutable (the materialised IPAM rows are the
+    source of truth). ``applied_resource_ids`` records what was
+    created so operators can audit "this plan produced these blocks +
+    subnets".
+    """
+
+    __tablename__ = "subnet_plan"
+
+    name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    space_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("ip_space.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    tree: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+
+    applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    applied_resource_ids: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("user.id", ondelete="SET NULL"), nullable=True
+    )
+
+    space: Mapped["IPSpace"] = relationship("IPSpace")
