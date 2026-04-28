@@ -46,35 +46,49 @@ _ISO_TS_RE: Final = re.compile(
 # ``print-severity`` / ``print-category`` are on. We tolerate both.
 _CAT_SEV_RE: Final = re.compile(r"^(?:queries:\s+)?(?:info:\s+)?")
 
-# The interesting body. ``client`` form (most common) or ``view ...:
-# query:`` form (BIND with views).
+# BIND9 query lines are split on the hard ``: query: `` separator
+# rather than matched by one big regex. The combined pattern (client
+# + optional view block + optional bare view + qname/qclass/qtype +
+# optional flags) had three independent ``\s+``-anchored optional
+# groups that gave the regex engine room to try multiple alignments
+# of whitespace runs on adversarial input — see CodeQL
+# py/polynomial-redos alert #16. Splitting on ``: query: `` first
+# disambiguates the structure: nothing on either side can contain
+# the literal ``: query: ``, and each side gets a small, linear
+# regex.
 #
 # Examples:
 #   client @0x7f8b1c001234 192.0.2.5#54321 (example.com): query: example.com IN A +E(0)K (10.0.0.1)
 #   client @0x... 2001:db8::1#34567 (foo.bar): query: foo.bar IN AAAA + (2001:db8::dead)
-_QUERY_RE: Final = re.compile(
-    r"client\s+"
-    # Opaque pointer like ``@0x7f8b1c001234``. We accept any
-    # non-whitespace run so logs from builds emitting different
-    # pointer formats (or test fixtures using `@0x...`) still parse.
+_QUERY_SEP_RE: Final = re.compile(r":\s+query:\s+", re.IGNORECASE)
+
+# Head: everything between ``client`` and the ``: query: `` separator.
+# Captures client IP + port up front; the parenthesised echo / view
+# block and the bare ``view <name>`` form are extracted with a
+# follow-up regex against the *remainder* — no two ``\s+``-anchored
+# optionals competing for the same whitespace run.
+_HEAD_RE: Final = re.compile(
+    r"^client\s+"
     r"(?:@\S+\s+)?"
     r"(?P<client_ip>\S+?)"
     r"#(?P<client_port>\d+)"
-    # Single optional parenthesised block — either ``(view <name>)``
-    # or generic ``(echo)``. Internal alternation (view-first, echo
-    # second) keeps the two possibilities mutually exclusive at the
-    # engine level so we don't have two independently-optional groups
-    # competing for the same ``\s+(`` prefix. Both branches share the
-    # outer ``\s+\( … \)`` so the engine commits up-front and never
-    # backtracks across the boundary — fixes the py/polynomial-redos
-    # CodeQL alert that the old three-optional-groups shape tripped.
-    r"(?:\s+\((?:view\s+(?P<view_paren>[^)]+)|(?P<echo>[^)]*))\))?"
-    # Optional bare ``view <name>`` form (no parens) — appears in
-    # BIND9 builds that print the view name after the echo block.
-    r"(?:\s+view\s+(?P<view_bare>\S+))?"
-    r":\s+query:\s+"
-    r"(?P<qname>\S+)\s+(?P<qclass>\S+)\s+(?P<qtype>\S+)"
-    r"(?:\s+(?P<flags>\S+))?"
+    r"(?P<rest>.*)$",
+    re.DOTALL,
+)
+
+# Pulls a view name out of the head's remainder. Either
+# ``(view <name>)`` or bare ``view <name>``. Run with ``search`` so
+# leading whitespace / parenthesised echo blocks are skipped over.
+_VIEW_RE: Final = re.compile(
+    r"\(\s*view\s+(?P<view_paren>[^)]+?)\s*\)" r"|" r"\bview\s+(?P<view_bare>\S+)",
+)
+
+# Body: ``<qname> <qclass> <qtype> [<flags>]`` — what follows
+# ``: query: ``. Anchored at the start so we don't search; bounded
+# by ``\S+`` runs separated by single ``\s+`` matches that can't
+# overlap thanks to the anchor.
+_BODY_RE: Final = re.compile(
+    r"^(?P<qname>\S+)\s+(?P<qclass>\S+)\s+(?P<qtype>\S+)" r"(?:\s+(?P<flags>\S+))?",
 )
 
 _MONTH_MAP: Final[dict[str, int]] = {
@@ -182,8 +196,27 @@ def parse_query_line(line: str, *, fallback_ts: datetime | None = None) -> Parse
 
     rest = _CAT_SEV_RE.sub("", rest, count=1)
 
-    qm = _QUERY_RE.search(rest)
-    if not qm:
+    # Split on the hard ``: query: `` separator so each side gets a
+    # small, linear regex. The split itself is bounded — at most one
+    # cut, and ``: query: `` can't appear inside a qname or view name.
+    parts = _QUERY_SEP_RE.split(rest, maxsplit=1)
+    if len(parts) != 2:
+        return ParsedQueryLine(
+            ts=ts,
+            client_ip=None,
+            client_port=None,
+            qname=None,
+            qclass=None,
+            qtype=None,
+            flags=None,
+            view=None,
+            raw=line,
+        )
+    head, body = parts
+
+    head_m = _HEAD_RE.search(head)
+    body_m = _BODY_RE.match(body)
+    if head_m is None or body_m is None:
         return ParsedQueryLine(
             ts=ts,
             client_ip=None,
@@ -196,20 +229,28 @@ def parse_query_line(line: str, *, fallback_ts: datetime | None = None) -> Parse
             raw=line,
         )
 
+    # Strip the trailing ``)`` parenthesised echo (e.g. ``(example.com)``)
+    # before scanning for a view marker so the search bound is short.
+    remainder = head_m.group("rest") or ""
+    view: str | None = None
+    vm = _VIEW_RE.search(remainder)
+    if vm:
+        view = (vm.group("view_paren") or vm.group("view_bare") or "").strip() or None
+
     try:
-        client_port = int(qm.group("client_port"))
+        client_port = int(head_m.group("client_port"))
     except (TypeError, ValueError):
         client_port = None
 
     return ParsedQueryLine(
         ts=ts,
-        client_ip=qm.group("client_ip") or None,
+        client_ip=head_m.group("client_ip") or None,
         client_port=client_port,
-        qname=qm.group("qname") or None,
-        qclass=qm.group("qclass") or None,
-        qtype=qm.group("qtype") or None,
-        flags=qm.group("flags") or None,
-        view=qm.group("view_paren") or qm.group("view_bare") or None,
+        qname=body_m.group("qname") or None,
+        qclass=body_m.group("qclass") or None,
+        qtype=body_m.group("qtype") or None,
+        flags=body_m.group("flags") or None,
+        view=view,
         raw=line,
     )
 
