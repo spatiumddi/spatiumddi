@@ -75,8 +75,22 @@ _HEAD_RE: Final = re.compile(
 # Pulls a view name out of the head's remainder. Either
 # ``(view <name>)`` or bare ``view <name>``. Run with ``search`` so
 # leading whitespace / parenthesised echo blocks are skipped over.
+#
+# CodeQL alert #18 (polynomial ReDoS): the previous shape was
+# ``\(\s*view\s+(?P<view_paren>[^)]+?)\s*\)`` — and even the
+# intermediate ``\(view\s+(?P<view_paren>[^)]*)\)`` is quadratic
+# because ``\s+`` and ``[^)]*`` both consume whitespace and the
+# engine enumerates every split between them when the trailing
+# ``\)`` fails to match. Real BIND9 view names are single tokens
+# (DNS-name-like — no embedded whitespace), so the safe shape is
+# to constrain the inner capture to non-whitespace-non-paren
+# (``[^)\s]+``). ``\s+`` matches whitespace exclusively, the
+# capture matches non-whitespace exclusively, and the optional
+# trailing ``\s*`` before ``\)`` doesn't overlap with the capture
+# either — every segment has a disjoint character class, so the
+# total time is linear in the input length.
 _VIEW_RE: Final = re.compile(
-    r"\(\s*view\s+(?P<view_paren>[^)]+?)\s*\)" r"|" r"\bview\s+(?P<view_bare>\S+)",
+    r"\(view\s+(?P<view_paren>[^)\s]+)\s*\)" r"|" r"\bview\s+(?P<view_bare>\S+)",
 )
 
 # Body: ``<qname> <qclass> <qtype> [<flags>]`` — what follows
