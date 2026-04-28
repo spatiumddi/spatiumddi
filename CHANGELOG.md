@@ -7,7 +7,312 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versioning uses 
 
 ## Unreleased
 
-_(no entries yet — next release will add changes that land after `2026.04.26-1`)_
+_(no entries yet — next release will add changes that land after `2026.04.28-1`)_
+
+---
+
+## 2026.04.28-1 — 2026-04-28
+
+Network discovery + nmap release. The headline work is the SNMP
+polling surface that walks standard MIBs (IF-MIB, IP-MIB,
+Q-BRIDGE-MIB, RFC1213/BRIDGE-MIB fallbacks) on routers + switches
+to populate ARP / FDB / interface tables and cross-references the
+results back into IPAM (last-seen timestamps, optional auto-create
+of discovered IPs, switch-port + VLAN visibility on every IP that's
+been observed). Bundled with an on-demand nmap scanner — preset
+or custom scans launched from a per-IP "Scan with Nmap" button or
+the standalone `/tools/nmap` page, with live SSE output streaming
+to the browser and structured XML parsed into a results panel. The
+IPAM IP table now opens a read-only detail modal on row click
+(replacing the previous edit-form-on-click behaviour); the sidebar
+is regrouped (core flattened, Tools section added, Administration
+items separated by dividers); the Settings → Discovery section that
+toggled a never-implemented stub task is removed; and the BIND9
+query log parser is reworked to be linear-time (CodeQL alert #16
+closed).
+
+### Added
+
+- **SNMP-based network discovery.** New `/network` top-level page
+  for managing routers + switches with read-only SNMP polling.
+  Vendor-neutral — works on Cisco / Juniper / Arista / Aruba /
+  MikroTik / OPNsense / pfSense / FortiNet / Cumulus / SONiC /
+  FS.com / Ubiquiti out of the box because everything walks
+  standard MIBs.
+  - **Data model** (migration `c4e7a2f813b9_network_devices`):
+    `network_device` row carries SNMP credentials Fernet-encrypted
+    at rest (v1 / v2c community OR v3 USM with auth + priv
+    protocol enums + context name); `network_interface`,
+    `network_arp_entry` keyed `(device, ip, vrf)`, and
+    `network_fdb_entry` keyed `(device, mac, vlan)` with the
+    Postgres 15+ `NULLS NOT DISTINCT` unique index — so a single
+    port can carry the same MAC across multiple VLANs (hypervisor
+    with VMs in different access VLANs, IP phone with PC
+    passthrough on voice + data VLANs).
+  - **MIBs walked** — SNMPv2-MIB system group (sysDescr /
+    sysObjectID / sysName / sysUpTime), IF-MIB `ifTable` +
+    `ifXTable`, IP-MIB `ipNetToPhysicalTable` with legacy
+    RFC1213 `ipNetToMediaTable` fallback, Q-BRIDGE-MIB
+    `dot1qTpFdbTable` with BRIDGE-MIB `dot1dTpFdbTable` fallback.
+  - **Polling pipeline.** `pysnmp` 6.x async with `bulkWalkCmd`
+    (one OID column per walk to avoid GETBULK PDU bloat that
+    timed out on UniFi switches). `app.tasks.snmp_poll.poll_device`
+    runs sysinfo → interfaces → ARP → FDB sequentially under a
+    per-device `SELECT FOR UPDATE SKIP LOCKED` so concurrent
+    dispatches can't double-poll the same row.
+    `dispatch_due_devices` beat-fires every 60 s and queues every
+    active device whose `next_poll_at <= now`. Per-device interval
+    default 300 s, minimum 60 s. Status: `success | partial |
+    failed | timeout`, with `last_poll_error` populated for ops
+    triage. Stale ARP entries are kept with `state='stale'` (no
+    delete); `purge_stale_arp_entries` daily beat task removes
+    rows older than 30 days.
+  - **IPAM cross-reference.** After every successful ARP poll,
+    `cross_reference_arp` finds matching `IPAddress` rows in the
+    device's bound `IPSpace` and updates `last_seen_at` (max-merge),
+    `last_seen_method='snmp'`, and fills `mac_address` only when
+    currently NULL — operator-set MACs are never overwritten. When
+    the per-device `auto_create_discovered=True` toggle is on
+    (off by default), inserts new `status='discovered'` rows for
+    ARP IPs that fall inside a known `Subnet`. Returns counts
+    (`updated`, `created`, `skipped_no_subnet`).
+  - **Switch-port column in IPAM.** The IPAM IP table carries a
+    "Network" column showing `<device> · <port> [VLAN N]` for the
+    most-recent FDB hit on each IP's MAC, with a `+N more` badge
+    + hover tooltip listing every (device, port, VLAN) tuple when
+    the MAC is learned in multiple places. Backed by a batched
+    `GET /api/v1/ipam/subnets/{id}/network-context` endpoint that
+    returns `{ip_address_id: NetworkContextEntry[]}` in one round
+    trip — no N+1 fan-out per page-of-IPs. Per-IP detail modal
+    keeps the deeper "Network" tab for the full per-MAC drilldown.
+  - **API.** Full CRUD at `/api/v1/network-devices` plus
+    `POST /test` (synchronous SNMP probe, ≤10 s, returns
+    `TestConnectionResult` with sysDescr + classified
+    `error_kind`: `timeout | auth_failure | no_response |
+    transport_error | internal`), `POST /poll-now` (queues
+    immediate Celery task, returns 202 + task_id), and per-device
+    list endpoints `/interfaces`, `/arp` (filter by ip / mac /
+    vrf / state), `/fdb` (filter by mac / vlan / interface_id).
+    All paginated `{items, total, page, page_size}`.
+  - **Frontend.** Top-level `/network` page in the core sidebar.
+    Per-device detail at `/network/:id` with Overview / Interfaces
+    / ARP / FDB tabs, each filterable + paginated. Add/edit modal
+    with SNMP-version-conditional credential fields plus inline
+    Test Connection (saves first on create, then probes against
+    the saved row). New "Network" tab on the IP detail modal
+    showing per-IP switch/port table sorted by `last_seen DESC`.
+  - **Bulk operations + import/export.** Network page supports
+    multi-select with bulk Test / Poll Now / Activate / Deactivate
+    / Delete actions, plus per-row Edit pencil. CSV export
+    (deliberately no credentials) and CSV import with default-
+    community fallback for v1/v2c rows missing the column. Live
+    preview validates each row (resolves `ip_space_name` → id,
+    checks enums + port range), shows ready/error per row, then
+    commits via `Promise.allSettled` of per-row creates with
+    per-row outcome reporting.
+  - **Permissions.** Single `manage_network_devices` permission
+    gates all endpoints (read + write); new "Network Editor"
+    builtin role gets it. Superadmin always bypasses.
+  - **Tests.** 35 backend tests covering pysnmp wrapper paths
+    (mocked: v1 / v2c / v3 auth construction, OID resolution,
+    `ipNetToPhysical → ipNetToMedia` fallback,
+    `Q-BRIDGE → BRIDGE` fallback, error classification), API CRUD
+    + `/test` + `/poll-now` + the four list endpoints +
+    `/network-context`, and three cross-reference paths.
+
+- **Nmap scan integration.** On-demand nmap scans against any
+  IPv4/IPv6 host from the SpatiumDDI host perspective. Two entry
+  points: a per-IP "Scan with Nmap" button on the IPAM detail
+  modal, and a standalone `/tools/nmap` page for ad-hoc targets
+  (including IPs that aren't in IPAM yet).
+  - **Data model** (migration `d2f7a91e4c8b_nmap_scans`):
+    `nmap_scan` table carries the target IP + optional FK to the
+    matching `IPAddress` row, the operator's preset choice, the
+    sanitised port-spec + extra-args, full status / exit-code /
+    duration metadata, and the parsed summary JSON. The actual
+    XML artefact lands in `raw_xml`; the line-buffered human
+    output lands in `raw_stdout` (so the SSE stream has something
+    to replay if an operator opens a viewer mid-scan).
+  - **Presets.** `quick` (`-T4 -F`), `service_version` (`-T4 -sV
+    --version-light`), `os_fingerprint` (`-T4 -O`),
+    `default_scripts` (`-T4 -sC`), `udp_top100` (`-T4 -sU
+    --top-ports 100`), `aggressive` (`-T4 -A`), and `custom`
+    (everything from `extra_args`).
+  - **Argv hardening.** `build_argv` validates target IPs via
+    `ipaddress.ip_address`, port-specs against `^[0-9,\-,UTSI:]+$`,
+    and shlex-tokenises operator-supplied extra args, rejecting
+    any token containing shell metacharacters
+    (`;|&$\`<>()`) or path traversal in `--script` values. The
+    subprocess is spawned via `create_subprocess_exec` — never a
+    shell. nmap runs as the API container's non-root user, so
+    privileged scan modes (raw SYN, OS detection without
+    privilege) silently degrade to TCP-connect.
+  - **Dual output for live UX.** `nmap -oN -` streams human-
+    readable output to stdout (what the operator sees scrolling
+    in the live viewer); `-oX <tmpfile>` writes structured XML
+    to a per-scan tempfile in parallel. After process exit, the
+    runner reads the XML, parses it into `summary_json`, and
+    unlinks the file. No XML wall-of-text in the live view.
+  - **API.** `POST /api/v1/nmap/scans` (queues a celery task,
+    returns 202 + the row), `GET /scans` (paginated list, filter
+    by ip_address_id / target_ip / status), `GET /scans/{id}`
+    (full record), `GET /scans/{id}/stream` (SSE — emits one
+    `data:` frame per nmap stdout line, then a final `event:done`
+    on terminal status), and `DELETE /scans/{id}` (cancels
+    queued/running scans, hard-deletes terminal ones — both
+    paths share the trash button in the UI).
+  - **SSE auth.** `EventSource` can't set Authorization headers,
+    so the stream endpoint accepts `?token=<jwt-or-api-token>`.
+    A dedicated `_resolve_user_from_query_token` helper validates
+    the token against the same JWT / API-token paths that the
+    Bearer dep uses; the router has no global
+    `Depends(get_current_user)` because that would 401 the SSE
+    request before the query-token resolver could run (each
+    non-SSE endpoint declares its own permission dep instead).
+  - **Frontend.** `NmapScanModal` flips between the form view and
+    the live output viewer (Cmd+K-style). `NmapScanForm` carries
+    the preset radio group + port-spec + extra-args + lockable
+    target. `NmapScanLiveViewer` opens an `EventSource`,
+    appends each line to a `<pre>` with auto-scroll, and renders
+    the parsed summary panel (open ports table + OS guess) on
+    `done`. `NmapToolsPage` reuses the same form + viewer
+    components, plus a Recent Scans table with row-click to
+    open and per-row delete (both with a custom
+    `ConfirmDeleteScanModal` instead of `window.confirm`).
+  - **Permissions.** Single `manage_nmap_scans` permission gates
+    all endpoints, seeded into the existing "Network Editor"
+    builtin role.
+  - **Image.** `nmap` added to the api Dockerfile's apt-get
+    install list.
+
+- **IP detail modal.** Clicking an IP row in the IPAM table now
+  opens a read-only detail surface (`IPDetailModal`) with status /
+  role / DHCP-mirror badges, hostname + FQDN + MAC + OUI vendor,
+  forward / reverse DNS zone references, DNS / DHCP linkage
+  flags, tags, custom-fields table, and the per-IP SNMP network-
+  context inline. Action buttons in the modal header: **Scan with
+  Nmap**, **Edit** (hops into the existing form), **Delete**
+  (routes through the existing orphan-vs-purge confirm).
+  Read-only rows (network / broadcast / DHCP-mirror / orphan /
+  read-only statuses) stay inspectable but hide the Edit /
+  Delete actions. The pencil + trash icons in the row's right-
+  edge cell still behave as before — the detail modal is purely
+  additive.
+
+- **Network device CSV import / export.** Import accepts CSV via
+  file picker or paste, validates each row pre-commit (resolves
+  `ip_space_name` → id, checks enums + port range), and shows
+  per-row status. Export downloads
+  `network-devices-<utc>.csv` with name / hostname / ip_address /
+  device_type / description / vendor / snmp_version / snmp_port /
+  ip_space_name / is_active / last_poll_status — deliberately no
+  community / v3 keys since exports must not leak credentials.
+  An import-time "default community" field fills v1/v2c rows
+  missing the column so round-trip exports + edits + re-imports
+  work without re-typing communities per device.
+
+### Changed
+
+- **Sidebar regroup.** Core nav reordered for data-flow logic
+  (Dashboard → IPAM → VLANs → NAT → DNS → DHCP → Network →
+  Logs). New **Tools** section between core and Integrations
+  (always visible, default-open) holds the Nmap entry. The
+  Administration section's 11 items are now grouped into
+  Identity & Access (Users, Groups, Roles, Auth Providers, API
+  Tokens) → Platform (Settings, Custom Fields, Alerts, Platform
+  Insights, Trash) → Audit (Audit Log), separated by horizontal
+  dividers within the same collapsible parent — no nested
+  collapsibles. Collapsed-rail mode flattens cleanly.
+
+- **README "What's in the box".** The 17 dense paragraph-bullets
+  are replaced with five category-grouped tables (Core DDI /
+  Discovery & visibility / Integrations / Identity & ops /
+  Deployment) plus a one-line tagline above. Each row carries
+  an emoji + bold feature name + 6-10 word detail — eyes scan
+  in seconds. The original long-form prose is preserved verbatim
+  under a `<details>` disclosure for evaluators who want the
+  full spec.
+
+- **BIND9 query log parser.** Reworked to drop the polynomial-
+  ReDoS regex shape that CodeQL alert #16 flagged. The previous
+  iteration's three independent `\s+`-anchored optional groups
+  (parenthesised view, bare view, qname/qclass/qtype/flags
+  chain) gave the engine room to try multiple alignments of
+  whitespace runs on adversarial input. Replaced with a hard
+  split on the unambiguous `: query: ` literal: a tiny linear
+  `_HEAD_RE` matches client + port and emits the remainder,
+  `_VIEW_RE` extracts an optional view name from that remainder,
+  and `_BODY_RE` matches qname/qclass/qtype/flags anchored at
+  the start of the post-separator slice. Each regex is now
+  clearly linear; the existing 13 parser tests pass unchanged.
+
+- **CI workflow on docs-only pushes.** `ci.yml` now uses
+  `paths-ignore` to skip the lint / typecheck / test pipeline
+  when a push only touches `**/*.md`, `docs/**`, `LICENSE`,
+  `NOTICE`, `.gitignore`, or issue/PR templates.
+
+### Removed
+
+- **Settings → Discovery section.** The two toggles
+  (`discovery_scan_enabled`, `discovery_scan_interval_minutes`)
+  shipped in 2026.04.16-1 with a Celery task stub that never
+  did anything — no beat schedule, no production code reading
+  the flags. Real discovery is the SNMP polling surface above
+  (with its own per-device `auto_create_discovered` toggle).
+  Migration `a4d92f61c08b_drop_discovery_scan_settings` drops
+  both columns; the Settings page section is gone; the stub
+  Celery task is deleted. Destructive but safe — the columns
+  held no operational data.
+
+### Fixed
+
+- **Nmap task dispatch.** `app.tasks.nmap.*` had no entry in
+  `task_routes` so dispatched scans landed in celery's default
+  `celery` queue, which the worker doesn't subscribe to (worker
+  consumes only `ipam` / `dns` / `dhcp` / `default`). Added
+  the route. Without this, scan rows stayed `queued` forever
+  and the SSE stream just polled an empty `raw_stdout`.
+
+- **Nmap SSE 401.** The router-level `Depends(get_current_user)`
+  fired the Bearer extractor before the per-endpoint query-token
+  resolver could run, so EventSource (which can't set Authorization
+  headers) always 401'd on `/scans/{id}/stream`. Removed the
+  router-level dep; every other endpoint already enforces auth
+  via its own permission dep.
+
+- **Confirm-delete dialogs in nmap.** The first cut used the
+  browser's `window.confirm()` which doesn't match the rest of
+  the app's modal patterns. Replaced with a shared
+  `ConfirmDeleteScanModal` showing the target IP, preset, and
+  status; verb flips between "Cancel" (running) and "Delete"
+  (terminal).
+
+### Notes
+
+- The SSE stream is implemented as a 500 ms-poll over the DB-
+  persisted `raw_stdout` column (one `db.get(NmapScan, …)` +
+  `expire_all()` per tick per active stream). For nmap that's
+  fine — the tool emits lines at human cadence — but it's a hot
+  loop per concurrent viewer. If many operators end up watching
+  live scans simultaneously (more than ~20-30) it'll show up as
+  measurable Postgres load; the natural follow-up is a Redis
+  pub/sub fanout or `LISTEN/NOTIFY` behind the same HTTP shape.
+  Tracked under deferred follow-ups in `CLAUDE.md`.
+
+- SNMP polling lives in the existing Celery worker pool. That's
+  fine to ~100 devices on a 5-min interval. Splitting into a
+  dedicated `snmp-poller` container becomes interesting once
+  SNMP traffic competes with the worker's other tasks or when
+  the operator wants different network reachability for the
+  poller (different VLAN, jumphost, etc) — also tracked as a
+  deferred follow-up.
+
+- Nmap runs as a non-root user inside the api container. That's
+  the right default for a containerised service, but it means
+  raw SYN scans (`-sS`) and unprivileged OS detection silently
+  fall back to TCP-connect. Operators running on bare metal can
+  give the API process `CAP_NET_RAW` to unlock those modes;
+  containerised deployments can't and shouldn't.
 
 ---
 

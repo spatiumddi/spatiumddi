@@ -148,7 +148,7 @@ Three patterns recur across the DNS and DHCP subsystems. Know these before addin
 
 ### Current state
 
-SpatiumDDI cut its alpha release `2026.04.16-1` on 2026-04-16 with IPAM, DNS (BIND9), and DHCP (Kea) all shipping. Subsequent releases landed Windows Server integration (`2026.04.18-1`, 2026-04-18), the **performance + polish + visibility** release (`2026.04.19-1`, 2026-04-19) — batched WinRM dispatch, DDNS pipeline, the Logs surface, subnet/block resize, subnet-scoped IP import, DHCP pool awareness, collision warnings, sync modals, dashboard heatmap, draggable modals, standardised header buttons — the 2026.04.20 IPv6 + DDNS closure work, the **Kea HA + group-centric DHCP** release (`2026.04.21-2`, 2026-04-21) which shipped the full three-wave Kea HA story: end-to-end HA shake-out (peer URL resolution, port split, `status-get`, bootstrap reload), group-centric DHCP data model (scopes / pools / statics / classes live on `DHCPServerGroup`; HA is implicit with ≥ 2 Kea members), agent rendering fix (every prior Kea install was silently rendering `subnet4: []` due to a wire-shape bug), `PeerResolveWatcher` self-healing for peer IP drift, supervised Kea daemons, and standalone agent-only compose files for distributed deployments, the **integrations + observability** release (`2026.04.22-1`, 2026-04-22) that shipped Kubernetes + Docker read-only mirrors, the ACME DNS-01 provider, DHCP MAC blocklist, dashboard timeseries charts + platform-health card + collapsible sidebar, and the **Proxmox VE + polish** release (`2026.04.24-1`, 2026-04-24) which shipped the Proxmox endpoint mirror (bridges + SDN VNets + opt-in VNet-CIDR inference + per-guest Discovery modal), the shared `IPSpacePicker` quick-create component across all three integration modals, plus four UX polish fixes (real source IP behind nginx, alphabetised Integrations nav, wider Custom Fields page, search-row amber highlight). For the full list see `CHANGELOG.md`. The forward-looking work is below.
+SpatiumDDI cut its alpha release `2026.04.16-1` on 2026-04-16 with IPAM, DNS (BIND9), and DHCP (Kea) all shipping. Subsequent releases landed Windows Server integration (`2026.04.18-1`, 2026-04-18), the **performance + polish + visibility** release (`2026.04.19-1`, 2026-04-19) — batched WinRM dispatch, DDNS pipeline, the Logs surface, subnet/block resize, subnet-scoped IP import, DHCP pool awareness, collision warnings, sync modals, dashboard heatmap, draggable modals, standardised header buttons — the 2026.04.20 IPv6 + DDNS closure work, the **Kea HA + group-centric DHCP** release (`2026.04.21-2`, 2026-04-21) which shipped the full three-wave Kea HA story: end-to-end HA shake-out (peer URL resolution, port split, `status-get`, bootstrap reload), group-centric DHCP data model (scopes / pools / statics / classes live on `DHCPServerGroup`; HA is implicit with ≥ 2 Kea members), agent rendering fix (every prior Kea install was silently rendering `subnet4: []` due to a wire-shape bug), `PeerResolveWatcher` self-healing for peer IP drift, supervised Kea daemons, and standalone agent-only compose files for distributed deployments, the **integrations + observability** release (`2026.04.22-1`, 2026-04-22) that shipped Kubernetes + Docker read-only mirrors, the ACME DNS-01 provider, DHCP MAC blocklist, dashboard timeseries charts + platform-health card + collapsible sidebar, and the **Proxmox VE + polish** release (`2026.04.24-1`, 2026-04-24) which shipped the Proxmox endpoint mirror (bridges + SDN VNets + opt-in VNet-CIDR inference + per-guest Discovery modal), the shared `IPSpacePicker` quick-create component across all three integration modals, plus four UX polish fixes (real source IP behind nginx, alphabetised Integrations nav, wider Custom Fields page, search-row amber highlight), and the **network discovery + nmap** release (`2026.04.28-1`, 2026-04-28) which shipped SNMP polling of routers + switches with ARP/FDB cross-reference into IPAM (per-IP switch-port + VLAN visibility), the on-demand nmap scanner with live SSE output streaming (per-IP + `/tools/nmap` standalone page), the read-only `IPDetailModal` opened on row-click in IPAM with action buttons for Scan/Edit/Delete, sidebar regroup (core flattened, new Tools section, Administration items separated by dividers), removal of the dead Settings → Discovery section, and a linear-time rework of the BIND9 query log parser (CodeQL alert #16 closed). For the full list see `CHANGELOG.md`. The forward-looking work is below.
 
 ### Auth waves A–D (landed after `2026.04.16-2`)
 
@@ -410,6 +410,39 @@ categorised section further down.
   Original spec lives at `docs/features/IPAM.md §13` (the
   pre-build placeholder). The shipped behaviour matches that
   spec for the standard-MIB scope.
+- ✅ **Nmap scanner** — on-demand nmap scans against any IPv4 /
+  IPv6 host from the SpatiumDDI host perspective. Two entry
+  points: a per-IP "Scan with Nmap" button on the IPAM IP detail
+  modal, and a standalone `/tools/nmap` page for ad-hoc targets
+  (including IPs that aren't in IPAM yet). Backend: `NmapScan`
+  model + migration `d2f7a91e4c8b`, sanitised argv builder with
+  preset table (quick / service+version / OS fingerprint /
+  default-scripts / UDP top-100 / aggressive / custom), async
+  subprocess runner using `-oN -` on stdout for the live SSE
+  viewer + `-oX <tmpfile>` in parallel for structured XML
+  parsing, Celery task on the `default` queue, and the SSE
+  endpoint at `GET /api/v1/nmap/scans/{id}/stream`. SSE auth
+  uses `?token=<...>` because EventSource can't set Authorization
+  headers; the router has no global `Depends(get_current_user)`
+  because that would 401 before the query-token resolver runs
+  (each non-SSE endpoint declares its own permission dep). New
+  `manage_nmap_scans` permission seeded into the existing
+  Network Editor builtin role. nmap installed in the api image.
+  **Deferred follow-ups:**
+  - **Trigger pipeline** — auto-scan on ARP/SNMP discovery (the
+    `auto_create_discovered=True` path) and alert-rule-driven
+    re-scans. Phase 2.
+  - **Realtime fanout** — the SSE stream polls the DB-persisted
+    `raw_stdout` column every 500 ms per active viewer. Fine
+    at human cadence and a handful of operators; if many
+    operators end up watching live scans simultaneously
+    (>~20-30) it'll show up as Postgres load. Swap to Redis
+    pub/sub or `LISTEN/NOTIFY` behind the same HTTP shape.
+  - **Privileged scans** — nmap runs as the api container's
+    non-root user; raw-SYN (`-sS`) and unprivileged OS-detect
+    silently fall back to TCP-connect. Bare-metal deployments
+    can give the API process `CAP_NET_RAW` to unlock those
+    modes; containerised deployments can't and shouldn't.
 - ✅ **API tokens with auto-expiry** (Phase 1 close-out) — `APIToken`
   model already existed; this session wires the create/list/revoke
   router, extends `get_current_user` to accept `spddi_*` bearer
