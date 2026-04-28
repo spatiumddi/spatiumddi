@@ -30,6 +30,7 @@ celery_app = Celery(
         "app.tasks.proxmox_sync",
         "app.tasks.tailscale_sync",
         "app.tasks.snmp_poll",
+        "app.tasks.nmap",
     ],
 )
 
@@ -72,6 +73,7 @@ celery_app.conf.update(
         "app.tasks.proxmox_sync.*": {"queue": "default"},
         "app.tasks.tailscale_sync.*": {"queue": "default"},
         "app.tasks.snmp_poll.*": {"queue": "default"},
+        "app.tasks.nmap.*": {"queue": "default"},
     },
     beat_schedule={
         # Every 60s, fan-out health checks to every registered DNS server.

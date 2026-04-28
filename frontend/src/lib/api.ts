@@ -1431,8 +1431,6 @@ export interface PlatformSettings {
   utilization_max_prefix_ipv4: number;
   utilization_max_prefix_ipv6: number;
   subnet_tree_default_expanded_depth: number;
-  discovery_scan_enabled: boolean;
-  discovery_scan_interval_minutes: number;
   github_release_check_enabled: boolean;
   dns_default_ttl: number;
   dns_default_zone_type: string;
@@ -4372,4 +4370,109 @@ export const networkApi = {
         Record<string, NetworkContextEntry[]>
       >(`/ipam/subnets/${subnetId}/network-context`)
       .then((r) => r.data),
+};
+
+// ── Nmap on-demand scans ──────────────────────────────────────────────
+
+export type NmapPreset =
+  | "quick"
+  | "service_version"
+  | "os_fingerprint"
+  | "default_scripts"
+  | "udp_top100"
+  | "aggressive"
+  | "custom";
+
+export type NmapScanStatus =
+  | "queued"
+  | "running"
+  | "completed"
+  | "failed"
+  | "cancelled";
+
+export interface NmapPortResult {
+  port: number;
+  proto: string;
+  state: string;
+  reason: string | null;
+  service: string | null;
+  product: string | null;
+  version: string | null;
+  extrainfo: string | null;
+}
+
+export interface NmapOsResult {
+  name: string | null;
+  accuracy: number | null;
+}
+
+export interface NmapSummary {
+  host_state: string;
+  ports: NmapPortResult[];
+  os: NmapOsResult | null;
+}
+
+export interface NmapScanRead {
+  id: string;
+  target_ip: string;
+  ip_address_id: string | null;
+  preset: NmapPreset;
+  port_spec: string | null;
+  extra_args: string | null;
+  status: NmapScanStatus;
+  started_at: string | null;
+  finished_at: string | null;
+  duration_seconds: number | null;
+  exit_code: number | null;
+  command_line: string | null;
+  error_message: string | null;
+  summary: NmapSummary | null;
+  raw_xml: string | null;
+  raw_stdout: string | null;
+  created_by_user_id: string | null;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface NmapScanCreate {
+  target_ip: string;
+  preset: NmapPreset;
+  port_spec?: string | null;
+  extra_args?: string | null;
+  ip_address_id?: string | null;
+}
+
+export interface NmapScanListResponse {
+  items: NmapScanRead[];
+  total: number;
+  page: number;
+  page_size: number;
+}
+
+export interface NmapScanListQuery {
+  ip_address_id?: string;
+  target_ip?: string;
+  status?: NmapScanStatus;
+  page?: number;
+  page_size?: number;
+}
+
+export const nmapApi = {
+  listScans: (params?: NmapScanListQuery) =>
+    api
+      .get<NmapScanListResponse>("/nmap/scans", { params })
+      .then((r) => r.data),
+  getScan: (id: string) =>
+    api.get<NmapScanRead>(`/nmap/scans/${id}`).then((r) => r.data),
+  createScan: (body: NmapScanCreate) =>
+    api.post<NmapScanRead>("/nmap/scans", body).then((r) => r.data),
+  cancelScan: (id: string) => api.delete(`/nmap/scans/${id}`),
+  // The SSE stream isn't fetched via axios — callers use `EventSource`
+  // pointed at the URL returned here. Auth piggybacks on a query
+  // token because EventSource can't set Authorization headers.
+  streamUrl: (id: string) => {
+    const token = localStorage.getItem("access_token") ?? "";
+    const base = API_BASE.replace(/\/$/, "");
+    return `${base}/nmap/scans/${id}/stream?token=${encodeURIComponent(token)}`;
+  },
 };

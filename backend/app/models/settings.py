@@ -48,12 +48,6 @@ class PlatformSettings(Base):
         Integer, nullable=False, default=2
     )
 
-    # Discovery
-    discovery_scan_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    discovery_scan_interval_minutes: Mapped[int] = mapped_column(
-        Integer, nullable=False, default=60
-    )
-
     # Release checking. When enabled, a daily Celery beat task queries
     # ``api.github.com/repos/{github_repo}/releases/latest`` and stores
     # the result on the columns below. Operators can turn this off in

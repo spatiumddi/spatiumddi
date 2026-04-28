@@ -26,6 +26,7 @@ import {
   Filter,
   Lock,
   Search,
+  Radar,
 } from "lucide-react";
 import {
   DndContext,
@@ -83,6 +84,8 @@ import {
   NetworkTabBadge,
   useNetworkContext,
 } from "./IPNetworkTab";
+import { NmapScanModal } from "@/pages/nmap/NmapScanModal";
+import { IPDetailModal } from "./IPDetailModal";
 import {
   FindFreeModal,
   MergeSubnetSiblingPicker,
@@ -2682,6 +2685,8 @@ function SubnetDetail({
     refetchOnMount: "always",
   });
   const [editingAddress, setEditingAddress] = useState<IPAddress | null>(null);
+  const [viewingAddress, setViewingAddress] = useState<IPAddress | null>(null);
+  const [scanFromDetail, setScanFromDetail] = useState<IPAddress | null>(null);
   const [showFilters, setShowFilters] = useState(false);
   const [activeSubnetTab, setActiveSubnetTab] = useState<
     "addresses" | "dhcp" | "aliases" | "nat"
@@ -3665,8 +3670,9 @@ function SubnetDetail({
                           <ContextMenuTrigger asChild>
                             <tr
                               ref={registerHighlightRow(addr.id)}
+                              onClick={() => setViewingAddress(addr)}
                               className={cn(
-                                "group/addr border-b last:border-0 hover:bg-muted/20",
+                                "group/addr border-b last:border-0 hover:bg-muted/20 cursor-pointer",
                                 (addr.status === "network" ||
                                   addr.status === "broadcast") &&
                                   "opacity-50",
@@ -3676,7 +3682,10 @@ function SubnetDetail({
                                   "spatium-row-highlight",
                               )}
                             >
-                              <td className="w-8 px-2 py-2">
+                              <td
+                                className="w-8 px-2 py-2"
+                                onClick={(e) => e.stopPropagation()}
+                              >
                                 {!systemRow && (
                                   <input
                                     type="checkbox"
@@ -3870,7 +3879,10 @@ function SubnetDetail({
                                   }
                                 />
                               </td>
-                              <td className="px-4 py-2 text-right">
+                              <td
+                                className="px-4 py-2 text-right"
+                                onClick={(e) => e.stopPropagation()}
+                              >
                                 <div className="flex items-center justify-end gap-1">
                                   {addr.status === "orphan" ? (
                                     <>
@@ -4091,6 +4103,40 @@ function SubnetDetail({
         <EditAddressModal
           address={editingAddress}
           onClose={() => setEditingAddress(null)}
+        />
+      )}
+      {viewingAddress && (
+        <IPDetailModal
+          address={viewingAddress}
+          subnet={subnet}
+          canEdit={
+            !(
+              viewingAddress.status === "network" ||
+              viewingAddress.status === "broadcast" ||
+              !!viewingAddress.auto_from_lease ||
+              viewingAddress.status === "orphan" ||
+              isReadOnly(viewingAddress.status)
+            )
+          }
+          onClose={() => setViewingAddress(null)}
+          onEdit={() => {
+            const a = viewingAddress;
+            setViewingAddress(null);
+            setEditingAddress(a);
+          }}
+          onScan={() => setScanFromDetail(viewingAddress)}
+          onDelete={() => {
+            const a = viewingAddress;
+            setViewingAddress(null);
+            setConfirmDeleteAddr(a);
+          }}
+        />
+      )}
+      {scanFromDetail && (
+        <NmapScanModal
+          ip={scanFromDetail.address}
+          ipAddressId={scanFromDetail.id}
+          onClose={() => setScanFromDetail(null)}
         />
       )}
       {natModalIp && (
@@ -5769,6 +5815,7 @@ function EditAddressModal({
   );
   const { data: networkRows } = useNetworkContext(address.id);
   const networkCount = networkRows?.length ?? 0;
+  const [nmapOpen, setNmapOpen] = useState(false);
 
   return (
     <Modal title={`Edit ${address.address}`} onClose={onClose}>
@@ -5798,7 +5845,23 @@ function EditAddressModal({
           Network
           <NetworkTabBadge count={networkCount} />
         </button>
+        <button
+          type="button"
+          onClick={() => setNmapOpen(true)}
+          className="ml-auto -mb-px inline-flex items-center gap-1 border-b-2 border-transparent px-3 py-1.5 text-sm text-muted-foreground hover:text-foreground"
+          title="Run an nmap scan against this IP"
+        >
+          <Radar className="h-3.5 w-3.5" />
+          Scan with Nmap
+        </button>
       </div>
+      {nmapOpen && (
+        <NmapScanModal
+          ip={address.address}
+          ipAddressId={address.id}
+          onClose={() => setNmapOpen(false)}
+        />
+      )}
       {activeIpTab === "network" && (
         <div className="pb-2">
           <IPNetworkTab addressId={address.id} />

@@ -54,6 +54,7 @@ from app.models.network import (
     NetworkFdbEntry,
     NetworkInterface,
 )
+from app.models.nmap import NmapScan
 from app.models.oui import OUIVendor
 from app.models.proxmox import ProxmoxNode
 from app.models.settings import PlatformSettings
@@ -124,4 +125,5 @@ __all__ = [
     "NetworkInterface",
     "NetworkArpEntry",
     "NetworkFdbEntry",
+    "NmapScan",
 ]

@@ -37,8 +37,6 @@ class SettingsResponse(BaseModel):
     utilization_max_prefix_ipv4: int
     utilization_max_prefix_ipv6: int
     subnet_tree_default_expanded_depth: int
-    discovery_scan_enabled: bool
-    discovery_scan_interval_minutes: int
     github_release_check_enabled: bool
     dns_default_ttl: int
     dns_default_zone_type: str
@@ -89,8 +87,6 @@ class SettingsUpdate(BaseModel):
     utilization_max_prefix_ipv4: int | None = None
     utilization_max_prefix_ipv6: int | None = None
     subnet_tree_default_expanded_depth: int | None = None
-    discovery_scan_enabled: bool | None = None
-    discovery_scan_interval_minutes: int | None = None
     github_release_check_enabled: bool | None = None
     dns_default_ttl: int | None = None
     dns_default_zone_type: str | None = None
@@ -138,7 +134,6 @@ class SettingsUpdate(BaseModel):
         return v
 
     @field_validator(
-        "discovery_scan_interval_minutes",
         "dns_auto_sync_interval_minutes",
         "dns_pull_from_server_interval_minutes",
         "oui_update_interval_hours",

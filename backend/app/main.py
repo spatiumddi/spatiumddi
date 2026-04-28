@@ -102,9 +102,11 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
         ],
     ),
     "Network Editor": (
-        "Full CRUD on SNMP-polled network devices (routers, switches, APs).",
+        "Full CRUD on SNMP-polled network devices (routers, switches, APs) "
+        "and on-demand nmap scans.",
         [
             {"action": "admin", "resource_type": "manage_network_devices"},
+            {"action": "admin", "resource_type": "manage_nmap_scans"},
         ],
     ),
 }

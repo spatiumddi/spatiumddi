@@ -77,7 +77,6 @@ function Toggle({
 
 type SectionId =
   | "branding"
-  | "discovery"
   | "dns"
   | "dns-auto-sync"
   | "dns-pull-from-server"
@@ -128,7 +127,6 @@ const GROUP_ORDER: SectionGroup[] = [
 // "Reset to defaults" button so it only overwrites that section's fields.
 const SECTION_FIELDS: Record<SectionId, (keyof PlatformSettings)[]> = {
   branding: ["app_title", "app_base_url"],
-  discovery: ["discovery_scan_enabled", "discovery_scan_interval_minutes"],
   dns: [
     "dns_default_ttl",
     "dns_default_zone_type",
@@ -541,13 +539,6 @@ const SECTIONS: SectionDef[] = [
   },
 
   // ── IPAM ─────────────────────────────────────────────────────────────
-  {
-    id: "discovery",
-    title: "Discovery",
-    group: "IPAM",
-    description: "Periodic ping/scan jobs to detect active hosts.",
-    keywords: ["scan", "ping", "interval", "discover"],
-  },
   {
     id: "ip-allocation",
     title: "IP Allocation",
@@ -1007,42 +998,6 @@ export function SettingsPage() {
                     disabled={!isSuperadmin}
                     className={cn(inputCls, "w-72")}
                   />
-                </Field>
-              </>
-            )}
-
-            {activeId === "discovery" && (
-              <>
-                <Field
-                  label="Enable Discovery Scans"
-                  description="Periodically ping subnets to detect active hosts."
-                >
-                  <Toggle
-                    checked={!!values.discovery_scan_enabled}
-                    onChange={(v) => set("discovery_scan_enabled", v)}
-                    disabled={!isSuperadmin}
-                  />
-                </Field>
-                <Field
-                  label="Scan Interval"
-                  description="How often to run discovery scans."
-                >
-                  <div className="flex items-center gap-2">
-                    <input
-                      type="number"
-                      min={1}
-                      value={values.discovery_scan_interval_minutes ?? 60}
-                      onChange={(e) =>
-                        set(
-                          "discovery_scan_interval_minutes",
-                          Number(e.target.value),
-                        )
-                      }
-                      disabled={!isSuperadmin || !values.discovery_scan_enabled}
-                      className={cn(inputCls, "w-24")}
-                    />
-                    <span className="text-xs text-muted-foreground">min</span>
-                  </div>
                 </Field>
               </>
             )}

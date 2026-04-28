@@ -31,6 +31,7 @@ import {
   Waypoints,
   Shuffle,
   Trash2,
+  Search,
   X,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -41,26 +42,34 @@ import logoIcon from "@/assets/logo-icon.svg";
 const baseMainNav = [
   { label: "Dashboard", icon: LayoutDashboard, to: "/dashboard" },
   { label: "IPAM", icon: Network, to: "/ipam", end: true },
-  { label: "NAT mappings", icon: Shuffle, to: "/ipam/nat" },
-  { label: "DHCP", icon: Server, to: "/dhcp" },
-  { label: "DNS", icon: Globe, to: "/dns" },
   { label: "VLANs", icon: RouterIcon, to: "/vlans" },
+  { label: "NAT mappings", icon: Shuffle, to: "/ipam/nat" },
+  { label: "DNS", icon: Globe, to: "/dns" },
+  { label: "DHCP", icon: Server, to: "/dhcp" },
   { label: "Network", icon: Cable, to: "/network" },
   { label: "Logs", icon: ScrollText, to: "/logs" },
 ];
 
-const adminNav = [
-  { label: "Alerts", icon: BellRing, to: "/admin/alerts" },
-  { label: "API Tokens", icon: KeySquare, to: "/admin/api-tokens" },
-  { label: "Audit Log", icon: ClipboardList, to: "/admin/audit" },
-  { label: "Auth Providers", icon: ShieldCheck, to: "/admin/auth-providers" },
-  { label: "Custom Fields", icon: Tags, to: "/admin/custom-fields" },
-  { label: "Groups", icon: UsersRound, to: "/admin/groups" },
-  { label: "Platform Insights", icon: Cpu, to: "/admin/platform-insights" },
-  { label: "Roles", icon: KeyRound, to: "/admin/roles" },
-  { label: "Settings", icon: Settings, to: "/settings" },
-  { label: "Trash", icon: Trash2, to: "/admin/trash" },
+const toolsNav = [{ label: "Nmap", icon: Search, to: "/tools/nmap" }];
+
+const adminIdentityNav = [
   { label: "Users", icon: Users, to: "/admin/users" },
+  { label: "Groups", icon: UsersRound, to: "/admin/groups" },
+  { label: "Roles", icon: KeyRound, to: "/admin/roles" },
+  { label: "Auth Providers", icon: ShieldCheck, to: "/admin/auth-providers" },
+  { label: "API Tokens", icon: KeySquare, to: "/admin/api-tokens" },
+];
+
+const adminPlatformNav = [
+  { label: "Settings", icon: Settings, to: "/settings" },
+  { label: "Custom Fields", icon: Tags, to: "/admin/custom-fields" },
+  { label: "Alerts", icon: BellRing, to: "/admin/alerts" },
+  { label: "Platform Insights", icon: Cpu, to: "/admin/platform-insights" },
+  { label: "Trash", icon: Trash2, to: "/admin/trash" },
+];
+
+const adminAuditNav = [
+  { label: "Audit Log", icon: ClipboardList, to: "/admin/audit" },
 ];
 
 function NavSection({
@@ -294,6 +303,22 @@ export function Sidebar({
             ))}
           </NavSection>
 
+          <NavSection
+            label="Tools"
+            storageKey="sidebar-section-tools-open"
+            collapsed={effectiveCollapsed}
+            showDivider
+          >
+            {toolsNav.map((item) => (
+              <NavItem
+                key={item.to}
+                {...item}
+                collapsed={effectiveCollapsed}
+                onNavigate={mobileOpen ? onMobileClose : undefined}
+              />
+            ))}
+          </NavSection>
+
           {integrationsNav.length > 0 && (
             <NavSection
               label="Integrations"
@@ -313,12 +338,30 @@ export function Sidebar({
           )}
 
           <NavSection
-            label="Admin"
+            label="Administration"
             storageKey="sidebar-section-admin-open"
             collapsed={effectiveCollapsed}
             showDivider
           >
-            {adminNav.map((item) => (
+            {adminIdentityNav.map((item) => (
+              <NavItem
+                key={item.to}
+                {...item}
+                collapsed={effectiveCollapsed}
+                onNavigate={mobileOpen ? onMobileClose : undefined}
+              />
+            ))}
+            <div className="my-1 border-t border-sidebar-border/60" />
+            {adminPlatformNav.map((item) => (
+              <NavItem
+                key={item.to}
+                {...item}
+                collapsed={effectiveCollapsed}
+                onNavigate={mobileOpen ? onMobileClose : undefined}
+              />
+            ))}
+            <div className="my-1 border-t border-sidebar-border/60" />
+            {adminAuditNav.map((item) => (
               <NavItem
                 key={item.to}
                 {...item}
