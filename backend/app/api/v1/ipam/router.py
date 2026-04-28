@@ -8,7 +8,7 @@ from typing import Any
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from sqlalchemy import delete, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -2439,6 +2439,233 @@ async def get_block_free_space(
     occupied = [str(n) for (n,) in child_blocks.all()] + [str(n) for (n,) in child_subnets.all()]
     ranges = _compute_free_cidrs(str(block.network), occupied)
     return [FreeCidrRange(**r) for r in ranges]
+
+
+class PlanRequestItem(BaseModel):
+    """One sized request: e.g. {count: 4, prefix_len: 24} = four /24s."""
+
+    count: int = Field(ge=1, le=1024)
+    prefix_len: int = Field(ge=0, le=128)
+
+
+class PlanAllocationRequest(BaseModel):
+    items: list[PlanRequestItem] = Field(min_length=1, max_length=64)
+
+
+class PlannedSubnet(BaseModel):
+    prefix_len: int
+    network: str
+    first: str
+    last: str
+    size: int
+
+
+class UnfulfilledItem(BaseModel):
+    prefix_len: int
+    requested: int
+    allocated: int
+
+
+class PlanAllocationResponse(BaseModel):
+    block_network: str
+    block_prefix_len: int
+    allocations: list[PlannedSubnet]
+    unfulfilled: list[UnfulfilledItem]
+    remaining_free: list[FreeCidrRange]
+
+
+@router.post("/blocks/{block_id}/plan-allocation", response_model=PlanAllocationResponse)
+async def plan_block_allocation(
+    block_id: uuid.UUID,
+    body: PlanAllocationRequest,
+    current_user: CurrentUser,
+    db: DB,
+) -> PlanAllocationResponse:
+    """Pack requested subnet sizes into the block's free space.
+
+    Largest-first heuristic — sorts requests by ascending prefix_len (= largest
+    network first) and best-fits each into the smallest free range that can hold
+    it. Returns the planned allocations plus anything that couldn't fit. This is
+    a preview only; nothing is written.
+    """
+    block = await db.get(IPBlock, block_id)
+    if block is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Block not found")
+
+    block_net = ipaddress.ip_network(str(block.network), strict=False)
+    family_max = 32 if block_net.version == 4 else 128
+
+    for item in body.items:
+        if item.prefix_len > family_max:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"prefix_len {item.prefix_len} exceeds max {family_max} for IPv{block_net.version}",
+            )
+        if item.prefix_len <= block_net.prefixlen:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=(
+                    f"prefix_len {item.prefix_len} must be greater than "
+                    f"block prefix length {block_net.prefixlen}"
+                ),
+            )
+
+    child_blocks = await db.execute(
+        select(IPBlock.network).where(IPBlock.parent_block_id == block.id)
+    )
+    child_subnets = await db.execute(select(Subnet.network).where(Subnet.block_id == block.id))
+    occupied_strs = [str(n) for (n,) in child_blocks.all()] + [
+        str(n) for (n,) in child_subnets.all()
+    ]
+
+    # Working free list as live ipaddress networks.
+    working: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = [block_net]
+    for raw in occupied_strs:
+        child = ipaddress.ip_network(raw, strict=False)
+        next_working: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+        for net in working:
+            if child == net:
+                continue
+            if child.subnet_of(net):  # type: ignore[arg-type]
+                next_working.extend(net.address_exclude(child))  # type: ignore[arg-type]
+            elif net.subnet_of(child):  # type: ignore[arg-type]
+                continue
+            else:
+                next_working.append(net)
+        working = next_working
+
+    # Flatten request into a list of prefix_lens with stable submission order, then
+    # sort by prefix_len ascending (largest network first).
+    flat: list[tuple[int, int]] = []  # (submission_index, prefix_len)
+    for idx, item in enumerate(body.items):
+        for _ in range(item.count):
+            flat.append((idx, item.prefix_len))
+    flat.sort(key=lambda t: (t[1], t[0]))
+
+    allocated: list[tuple[int, ipaddress.IPv4Network | ipaddress.IPv6Network]] = []
+    fulfilled_counts: dict[int, int] = {}
+
+    for submission_idx, prefix_len in flat:
+        # First-fit by address order: pick the lowest-address free range that's
+        # big enough, carve from its low end. This packs sequential same-size
+        # requests contiguously inside one big free chunk rather than scattering
+        # them across small islands (which best-fit would do).
+        candidates = [n for n in working if n.prefixlen <= prefix_len]
+        if not candidates:
+            continue
+        candidates.sort(key=lambda n: int(n.network_address))
+        chosen = candidates[0]
+        carved = next(chosen.subnets(new_prefix=prefix_len))
+        allocated.append((submission_idx, carved))
+        working.remove(chosen)
+        if chosen != carved:
+            working.extend(chosen.address_exclude(carved))  # type: ignore[arg-type]
+        fulfilled_counts[submission_idx] = fulfilled_counts.get(submission_idx, 0) + 1
+
+    # Re-order allocations by submission index then prefix_len for stable output.
+    allocated.sort(key=lambda t: (t[0], t[1].prefixlen))
+    planned = [
+        PlannedSubnet(
+            prefix_len=net.prefixlen,
+            network=str(net),
+            first=str(net.network_address),
+            last=str(net.broadcast_address),
+            size=net.num_addresses,
+        )
+        for _, net in allocated
+    ]
+
+    unfulfilled = [
+        UnfulfilledItem(
+            prefix_len=item.prefix_len,
+            requested=item.count,
+            allocated=fulfilled_counts.get(idx, 0),
+        )
+        for idx, item in enumerate(body.items)
+        if fulfilled_counts.get(idx, 0) < item.count
+    ]
+
+    working.sort(key=lambda n: int(n.network_address))
+    remaining_free = [
+        FreeCidrRange(
+            network=str(n),
+            first=str(n.network_address),
+            last=str(n.broadcast_address),
+            size=n.num_addresses,
+            prefix_len=n.prefixlen,
+        )
+        for n in working
+    ]
+
+    return PlanAllocationResponse(
+        block_network=str(block.network),
+        block_prefix_len=block_net.prefixlen,
+        allocations=planned,
+        unfulfilled=unfulfilled,
+        remaining_free=remaining_free,
+    )
+
+
+class AggregationSuggestion(BaseModel):
+    supernet: str
+    prefix_len: int
+    total_size: int
+    subnet_ids: list[str]
+    subnet_networks: list[str]
+
+
+@router.get(
+    "/blocks/{block_id}/aggregation-suggestions",
+    response_model=list[AggregationSuggestion],
+)
+async def get_aggregation_suggestions(
+    block_id: uuid.UUID, current_user: CurrentUser, db: DB
+) -> list[AggregationSuggestion]:
+    """Surface contiguous sibling subnets that could be merged into a supernet.
+
+    Uses ``ipaddress.collapse_addresses`` to produce the minimal cover of the
+    block's direct-child subnets — any output that subsumes more than one input
+    is a clean merge opportunity (the inputs pack perfectly into the supernet
+    with no gaps). Returns an empty list when nothing is aggregable.
+    """
+    block = await db.get(IPBlock, block_id)
+    if block is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Block not found")
+
+    rows = (
+        await db.execute(select(Subnet.id, Subnet.network).where(Subnet.block_id == block.id))
+    ).all()
+    if len(rows) < 2:
+        return []
+
+    parsed = [(rid, ipaddress.ip_network(str(net), strict=False)) for rid, net in rows]
+    networks = [n for _, n in parsed]
+
+    try:
+        collapsed = list(ipaddress.collapse_addresses(networks))  # type: ignore[arg-type]
+    except TypeError:
+        # Mixed v4/v6 inside one block — collapse_addresses refuses; nothing
+        # meaningful to suggest in that case.
+        return []
+
+    out: list[AggregationSuggestion] = []
+    for super_net in collapsed:
+        members = [(rid, n) for rid, n in parsed if n.subnet_of(super_net)]  # type: ignore[arg-type]
+        if len(members) < 2:
+            continue
+        if super_net.prefixlen >= max(n.prefixlen for _, n in members):
+            continue
+        out.append(
+            AggregationSuggestion(
+                supernet=str(super_net),
+                prefix_len=super_net.prefixlen,
+                total_size=super_net.num_addresses,
+                subnet_ids=[str(rid) for rid, _ in members],
+                subnet_networks=[str(n) for _, n in members],
+            )
+        )
+    out.sort(key=lambda s: (-s.total_size, s.supernet))
+    return out
 
 
 @router.get("/blocks/{block_id}/effective-dns", response_model=EffectiveDnsResponse)

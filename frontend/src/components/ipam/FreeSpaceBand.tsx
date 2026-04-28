@@ -16,6 +16,7 @@ interface Segment {
   label: string;
   size: number;
   network?: string;
+  utilization?: number; // 0..100 — only set for blocks/subnets
 }
 
 /**
@@ -58,6 +59,7 @@ export function FreeSpaceBand({
       net: string,
       kind: Segment["kind"],
       label: string,
+      utilization?: number,
     ): Segment | null => {
       const p = parseCidr(net);
       if (!p) return null;
@@ -70,6 +72,7 @@ export function FreeSpaceBand({
         label,
         size,
         network: net,
+        utilization,
       };
     };
 
@@ -78,7 +81,8 @@ export function FreeSpaceBand({
       const s = mapRange(
         b.network,
         "block",
-        `${b.network}${b.name ? ` (${b.name})` : ""}`,
+        `${b.network}${b.name ? ` (${b.name})` : ""} — ${Math.round(b.utilization_percent)}% used`,
+        b.utilization_percent,
       );
       if (s) out.push(s);
     }
@@ -86,7 +90,8 @@ export function FreeSpaceBand({
       const s = mapRange(
         sn.network,
         "subnet",
-        `${sn.network}${sn.name ? ` (${sn.name})` : ""}`,
+        `${sn.network}${sn.name ? ` (${sn.name})` : ""} — ${Math.round(sn.utilization_percent)}% used`,
+        sn.utilization_percent,
       );
       if (s) out.push(s);
     }
@@ -137,24 +142,41 @@ export function FreeSpaceBand({
               width: `${Math.max(seg.width * 100, 0.25)}%`,
             }}
             className={cn(
-              "absolute top-0 h-full border-r border-background/60 last:border-r-0",
-              seg.kind === "block" && "bg-violet-500/70 hover:bg-violet-500",
-              seg.kind === "subnet" && "bg-blue-500/70 hover:bg-blue-500",
+              "absolute top-0 h-full overflow-hidden border-r border-background/60 last:border-r-0",
+              // Mid-saturation background = the slice exists; the inner fill
+              // (below) shows how much of it is allocated.
+              seg.kind === "block" && "bg-violet-600/40 hover:bg-violet-600/55",
+              seg.kind === "subnet" && "bg-blue-600/40 hover:bg-blue-600/55",
               seg.kind === "free" &&
                 "cursor-pointer bg-[repeating-linear-gradient(45deg,theme(colors.zinc.400/.5)_0_4px,transparent_4px_8px)] dark:bg-[repeating-linear-gradient(45deg,theme(colors.zinc.500/.6)_0_4px,transparent_4px_8px)] hover:bg-[repeating-linear-gradient(45deg,theme(colors.emerald.500/.6)_0_4px,transparent_4px_8px)] dark:hover:bg-[repeating-linear-gradient(45deg,theme(colors.emerald.400/.5)_0_4px,transparent_4px_8px)]",
             )}
             aria-label={seg.label}
             disabled={seg.kind !== "free"}
-          />
+          >
+            {(seg.kind === "block" || seg.kind === "subnet") && (
+              <span
+                className={cn(
+                  "absolute left-0 top-0 h-full",
+                  seg.kind === "block" ? "bg-violet-700" : "bg-blue-700",
+                )}
+                style={{
+                  width: `${Math.min(100, Math.max(0, seg.utilization ?? 0))}%`,
+                }}
+              />
+            )}
+          </button>
         ))}
       </div>
       <div className="flex items-center gap-3 text-[10px] text-muted-foreground">
-        <Legend color="bg-violet-500/70" label="Child blocks" />
-        <Legend color="bg-blue-500/70" label="Subnets" />
+        <Legend color="bg-violet-700" label="Child blocks" />
+        <Legend color="bg-blue-700" label="Subnets" />
         <Legend
           color="bg-[repeating-linear-gradient(45deg,theme(colors.zinc.400/.6)_0_4px,transparent_4px_8px)] dark:bg-[repeating-linear-gradient(45deg,theme(colors.zinc.500/.7)_0_4px,transparent_4px_8px)]"
           label="Free"
         />
+        <span className="text-muted-foreground/70">
+          (saturated portion = % allocated)
+        </span>
         {hovered && (
           <span className="ml-auto font-mono text-foreground">
             {hovered.label}

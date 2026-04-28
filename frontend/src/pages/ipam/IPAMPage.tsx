@@ -93,6 +93,9 @@ import {
 } from "./SubnetOpsModals";
 import { cidrContains, compareNetwork } from "@/lib/cidr";
 import { FreeSpaceBand } from "@/components/ipam/FreeSpaceBand";
+import { PlanAllocationModal } from "@/components/ipam/PlanAllocationModal";
+import { AggregationSuggestions } from "@/components/ipam/AggregationSuggestions";
+import { FreeSpaceTreemap } from "@/components/ipam/FreeSpaceTreemap";
 import {
   ContextMenu,
   ContextMenuContent,
@@ -8476,6 +8479,11 @@ function BlockDetailView({
   const [showResizeBlock, setShowResizeBlock] = useState(false);
   const [showCreateSubnet, setShowCreateSubnet] = useState(false);
   const [showCreateChildBlock, setShowCreateChildBlock] = useState(false);
+  const [showPlanAllocation, setShowPlanAllocation] = useState(false);
+  const [allocationView, setAllocationView] = useSessionState<"band" | "treemap">(
+    `block-${initialBlock.id}-alloc-view`,
+    "band",
+  );
   const [blockFilter, setBlockFilter] = useState({
     network: "",
     name: "",
@@ -8694,20 +8702,70 @@ function BlockDetailView({
         )}
         {/* Allocation map */}
         <div className="border-t px-6 py-2">
-          <p className="mb-1 text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
-            Allocation map
-          </p>
-          <FreeSpaceBand
-            block={block}
-            directSubnets={directSubnets}
-            childBlocks={directChildBlocks}
-            onSelectFree={(range) => {
-              setFreeRangePreset(range);
-              setShowCreateSubnet(true);
-            }}
-          />
+          <div className="mb-1 flex items-center justify-between">
+            <p className="text-[10px] font-semibold uppercase tracking-wide text-muted-foreground">
+              Allocation map
+            </p>
+            <div className="flex items-center gap-3">
+              <div className="inline-flex overflow-hidden rounded border text-[10px]">
+                <button
+                  type="button"
+                  onClick={() => setAllocationView("band")}
+                  className={
+                    allocationView === "band"
+                      ? "bg-primary px-2 py-0.5 text-primary-foreground"
+                      : "px-2 py-0.5 text-muted-foreground hover:bg-muted/50"
+                  }
+                >
+                  Band
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setAllocationView("treemap")}
+                  className={
+                    allocationView === "treemap"
+                      ? "bg-primary px-2 py-0.5 text-primary-foreground"
+                      : "px-2 py-0.5 text-muted-foreground hover:bg-muted/50"
+                  }
+                >
+                  Treemap
+                </button>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowPlanAllocation(true)}
+                className="text-[10px] font-medium text-primary hover:underline"
+              >
+                Plan allocation…
+              </button>
+            </div>
+          </div>
+          {allocationView === "band" ? (
+            <FreeSpaceBand
+              block={block}
+              directSubnets={directSubnets}
+              childBlocks={directChildBlocks}
+              onSelectFree={(range) => {
+                setFreeRangePreset(range);
+                setShowCreateSubnet(true);
+              }}
+            />
+          ) : (
+            <FreeSpaceTreemap
+              block={block}
+              directSubnets={directSubnets}
+              childBlocks={directChildBlocks}
+            />
+          )}
         </div>
+        <AggregationSuggestions blockId={block.id} />
       </div>
+      {showPlanAllocation && (
+        <PlanAllocationModal
+          block={block}
+          onClose={() => setShowPlanAllocation(false)}
+        />
+      )}
       {showEdit && (
         <EditBlockModal
           block={block}

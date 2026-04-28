@@ -17,6 +17,7 @@ import { TailscalePage } from "@/pages/tailscale/TailscalePage";
 import { NetworkPage } from "@/pages/network/NetworkPage";
 import { DeviceDetailView } from "@/pages/network/DeviceDetailView";
 import { NmapToolsPage } from "@/pages/nmap/NmapToolsPage";
+import { CidrCalculatorPage } from "@/pages/tools/CidrCalculatorPage";
 import { LogsPage } from "@/pages/LogsPage";
 import { UsersPage } from "@/pages/admin/UsersPage";
 import { AuditPage } from "@/pages/admin/AuditPage";
@@ -59,6 +60,7 @@ export default function App() {
         <Route path="network" element={<NetworkPage />} />
         <Route path="network/:id" element={<DeviceDetailView />} />
         <Route path="tools/nmap" element={<NmapToolsPage />} />
+        <Route path="tools/cidr" element={<CidrCalculatorPage />} />
         <Route path="dhcp" element={<DHCPPage />} />
         <Route path="logs" element={<LogsPage />} />
         <Route path="kubernetes" element={<KubernetesPage />} />

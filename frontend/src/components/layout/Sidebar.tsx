@@ -32,6 +32,7 @@ import {
   Shuffle,
   Trash2,
   Search,
+  Calculator,
   X,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -43,14 +44,17 @@ const baseMainNav = [
   { label: "Dashboard", icon: LayoutDashboard, to: "/dashboard" },
   { label: "IPAM", icon: Network, to: "/ipam", end: true },
   { label: "VLANs", icon: RouterIcon, to: "/vlans" },
-  { label: "NAT mappings", icon: Shuffle, to: "/ipam/nat" },
+  { label: "NAT Mappings", icon: Shuffle, to: "/ipam/nat" },
   { label: "DNS", icon: Globe, to: "/dns" },
   { label: "DHCP", icon: Server, to: "/dhcp" },
   { label: "Network", icon: Cable, to: "/network" },
   { label: "Logs", icon: ScrollText, to: "/logs" },
 ];
 
-const toolsNav = [{ label: "Nmap", icon: Search, to: "/tools/nmap" }];
+const toolsNav = [
+  { label: "CIDR Calculator", icon: Calculator, to: "/tools/cidr" },
+  { label: "Nmap", icon: Search, to: "/tools/nmap" },
+];
 
 const adminIdentityNav = [
   { label: "Users", icon: Users, to: "/admin/users" },

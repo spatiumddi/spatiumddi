@@ -239,6 +239,41 @@ export interface FreeCidrRange {
   prefix_len: number;
 }
 
+export interface PlanRequestItem {
+  count: number;
+  prefix_len: number;
+}
+
+export interface PlannedSubnet {
+  prefix_len: number;
+  network: string;
+  first: string;
+  last: string;
+  size: number;
+}
+
+export interface UnfulfilledItem {
+  prefix_len: number;
+  requested: number;
+  allocated: number;
+}
+
+export interface AggregationSuggestion {
+  supernet: string;
+  prefix_len: number;
+  total_size: number;
+  subnet_ids: string[];
+  subnet_networks: string[];
+}
+
+export interface PlanAllocationResponse {
+  block_network: string;
+  block_prefix_len: number;
+  allocations: PlannedSubnet[];
+  unfulfilled: UnfulfilledItem[];
+  remaining_free: FreeCidrRange[];
+}
+
 export interface EffectiveDns {
   dns_group_ids: string[];
   dns_zone_id: string | null;
@@ -741,6 +776,18 @@ export const ipamApi = {
   blockFreeSpace: (blockId: string) =>
     api
       .get<FreeCidrRange[]>(`/ipam/blocks/${blockId}/free-space`)
+      .then((r) => r.data),
+  blockAggregationSuggestions: (blockId: string) =>
+    api
+      .get<AggregationSuggestion[]>(
+        `/ipam/blocks/${blockId}/aggregation-suggestions`,
+      )
+      .then((r) => r.data),
+  planBlockAllocation: (blockId: string, items: PlanRequestItem[]) =>
+    api
+      .post<PlanAllocationResponse>(`/ipam/blocks/${blockId}/plan-allocation`, {
+        items,
+      })
       .then((r) => r.data),
   getEffectiveBlockDns: (blockId: string) =>
     api

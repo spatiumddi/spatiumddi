@@ -1247,30 +1247,56 @@ None of these have started; everything below is ⬜.
 
 #### Subnet planning & calculation tools
 
-- ⬜ **Built-in CIDR calculator** — utility page at `/tools/cidr`
-  that takes a CIDR and renders network / broadcast / netmask /
-  wildcard / usable / binary / decimal / hex breakdowns. Pure
-  client-side computation, no API needed. Standard IPAM utility
-  — saves operators context-switching to `subnet-calculator.com`.
+- ✅ **Built-in CIDR calculator** — utility page at `/tools/cidr`
+  with sidebar nav under Tools. Pure client-side, no API. Accepts
+  IPv4 or IPv6 (CIDR or bare address), renders network / netmask /
+  wildcard / broadcast / first-last usable / total addresses /
+  decimal + hex / binary breakdown (v4) and compressed +
+  expanded forms (v6). Quick-paste preset buttons for the common
+  RFC 1918 / CGNAT / ULA blocks. BigInt math throughout so v6
+  prefixes work cleanly.
 - ⬜ **Subnet planner / "what-if" workspace** — drag-and-drop
   sketchpad for designing a hierarchy (parent + nested children
   + sizes) before committing. Saved as a `SubnetPlan` row (JSON
   tree); "Apply" runs the same overlap / fit validators as the
   live tree and creates the rows in one transaction. Useful for
-  new-site provisioning.
-- ⬜ **Address planner** — given a parent block and a sized
-  request (`4×/24, 2×/26, 1×/22`), allocate sibling subnets with
-  optimal packing (largest-first heuristic). Returns an apply
-  preview that feeds the planner above.
-- ⬜ **Aggregation suggestion** — beat task scans for contiguous
-  sibling subnets and surfaces "you have 10.0.0.0/24 +
-  10.0.1.0/24, want me to merge into /23?" suggestions on the
-  block detail. Operator one-clicks into the existing merge flow.
-- ⬜ **Free-space treemap** — visual proportional rendering of a
-  supernet showing allocated vs free chunks by area. Complements
-  the existing per-subnet utilization heatmap (cell-per-subnet);
-  the treemap is cell-per-CIDR-slice and surfaces fragmentation.
-  React lib (`d3-hierarchy`) does the math.
+  new-site provisioning. Distinct from the per-block address
+  planner that shipped — this one persists multi-level designs
+  and applies them transactionally.
+- ✅ **Address planner** — `POST /api/v1/ipam/blocks/{id}/plan-
+  allocation` accepts a list of `{count, prefix_len}` requests
+  (e.g. `4 × /24, 2 × /26, 1 × /22`) and packs them into the
+  block's free space using largest-prefix-first ordering with
+  first-fit-by-address placement (so sequential same-size
+  requests pack contiguously from low addresses rather than
+  chasing small isolated free islands).
+  Returns the planned allocations + any unfulfilled rows + the
+  remaining free space after the plan. Reuses the same
+  `address_exclude` walk that powers `/free-space`. UI: "Plan
+  allocation…" button next to the Allocation map on the block
+  detail; modal lets the operator add/remove rows and shows the
+  packed result. Preview only — no writes — so the operator can
+  iterate freely. **Deferred:** one-click apply that chains the
+  preview into N `POST /subnets` calls inside a transaction.
+- ✅ **Aggregation suggestion** — `GET /api/v1/ipam/blocks/{id}/
+  aggregation-suggestions` runs `ipaddress.collapse_addresses` on
+  the block's direct-child subnets; any output that subsumes more
+  than one input is a clean merge opportunity (the inputs pack
+  perfectly into a supernet with no gaps). Read-only banner on the
+  block detail surfaces them when present (e.g. `10.0.0.0/24 +
+  10.0.1.0/24 → /23`). **Deferred:** one-click merge flow — needs
+  to handle the cascade across IP rows + DNS records owned by the
+  deleted siblings, plus operator confirmation. Today operators
+  see the suggestion and act manually (delete + recreate).
+- ✅ **Free-space treemap** — Recharts squarified Treemap on the
+  block detail, toggled via a Band / Treemap selector next to
+  the Allocation map header (selection persisted in
+  sessionStorage per block). Cells are coloured by kind (violet
+  child blocks, blue subnets, hashed-zinc free) and sized by
+  raw address count. Pixel-thin slices on the 1-D band become
+  visible squares here, surfacing fragmentation that's easy to
+  miss otherwise. Uses the existing `recharts` dep — no new
+  packages added.
 
 #### DNS-specific
 
