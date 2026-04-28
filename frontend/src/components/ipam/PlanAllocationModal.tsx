@@ -121,9 +121,7 @@ export function PlanAllocationModal({
                       min={1}
                       max={1024}
                       value={r.count}
-                      onChange={(e) =>
-                        updateRow(i, { count: e.target.value })
-                      }
+                      onChange={(e) => updateRow(i, { count: e.target.value })}
                       className="w-20 rounded border bg-background px-2 py-1 text-xs"
                     />
                   </td>
@@ -202,8 +200,7 @@ export function PlanAllocationModal({
               </h3>
               {result.allocations.length === 0 ? (
                 <p className="text-xs text-muted-foreground">
-                  No subnets could be packed — block has no matching free
-                  space.
+                  No subnets could be packed — block has no matching free space.
                 </p>
               ) : (
                 <div className="overflow-x-auto rounded border">

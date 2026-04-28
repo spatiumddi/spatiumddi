@@ -30,9 +30,14 @@ import {
   ListTree,
   Radar,
   Sparkles,
+  Workflow,
+  KeyRound,
+  Copy,
 } from "lucide-react";
 import { PropagationCheckModal } from "./PropagationCheckModal";
 import { BlocklistCatalogModal } from "./BlocklistCatalogModal";
+import { DelegationModal } from "./DelegationModal";
+import { ZoneTemplateModal } from "./ZoneTemplateModal";
 import { Modal } from "@/components/ui/modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import {
@@ -51,6 +56,7 @@ import {
   type DNSBlockList,
   type DNSBlockListEntry,
   type DNSBlockListException,
+  type DNSTSIGKey,
   type WindowsDNSCredentials,
   type DNSGroupSyncResult,
 } from "@/lib/api";
@@ -546,6 +552,14 @@ function GroupModal({
   const [description, setDescription] = useState(group?.description ?? "");
   const [groupType, setGroupType] = useState(group?.group_type ?? "internal");
   const [isRecursive, setIsRecursive] = useState(group?.is_recursive ?? true);
+  // BIND9 catalog zones (RFC 9432). Off by default — only meaningful in
+  // ≥2-server BIND9 groups, and BIND 9.18+ is required.
+  const [catalogZonesEnabled, setCatalogZonesEnabled] = useState(
+    group?.catalog_zones_enabled ?? false,
+  );
+  const [catalogZoneName, setCatalogZoneName] = useState(
+    group?.catalog_zone_name ?? "catalog.spatium.invalid.",
+  );
   const [error, setError] = useState("");
 
   const mut = useMutation({
@@ -572,6 +586,8 @@ function GroupModal({
             description,
             group_type: groupType,
             is_recursive: isRecursive,
+            catalog_zones_enabled: catalogZonesEnabled,
+            catalog_zone_name: catalogZoneName.trim(),
           });
         }}
         className="space-y-3"
@@ -619,6 +635,46 @@ function GroupModal({
             </label>
           </Field>
         </div>
+
+        {/* BIND9 catalog zones (RFC 9432). The producer is the group's
+            is_primary=True bind9 server; every other bind9 member joins
+            as a consumer and pulls members from the catalog instead of
+            getting per-zone config push. Pointless on a single-server
+            group; the toggle is kept available so adding a second server
+            later just works. */}
+        <div className="rounded border bg-muted/20 p-3">
+          <label className="flex items-center gap-2 cursor-pointer">
+            <input
+              type="checkbox"
+              checked={catalogZonesEnabled}
+              onChange={(e) => setCatalogZonesEnabled(e.target.checked)}
+              className="h-4 w-4"
+            />
+            <span className="text-sm font-medium">Use BIND9 catalog zones</span>
+          </label>
+          <p className="mt-1 text-[11px] text-muted-foreground">
+            Distribute zones via one catalog instead of per-server config push.
+            Requires BIND 9.18+. Skip on single-server groups.
+          </p>
+          {catalogZonesEnabled && (
+            <div className="mt-2">
+              <label className="mb-0.5 block text-xs font-medium">
+                Catalog zone name
+              </label>
+              <input
+                className={inputCls}
+                value={catalogZoneName}
+                onChange={(e) => setCatalogZoneName(e.target.value)}
+                placeholder="catalog.spatium.invalid."
+              />
+              <p className="mt-0.5 text-[11px] text-muted-foreground">
+                Synthetic FQDN — pick something inside an unroutable label (e.g.{" "}
+                <code>.invalid.</code>) so it doesn't collide with a real zone.
+              </p>
+            </div>
+          )}
+        </div>
+
         {error && <p className="text-sm text-destructive">{error}</p>}
         <Btns
           onClose={onClose}
@@ -1213,10 +1269,9 @@ function ZoneModal({
             <p className="text-[11px] text-muted-foreground">
               <strong>Conditional forwarder.</strong> Queries for{" "}
               <span className="font-mono">{name || "this zone"}</span> are
-              relayed to the upstream resolvers below — typical use is
-              "forward <code>corp.local</code> to the AD DNS at
-              10.0.0.5". Records on the zone are ignored when the type is
-              forward.
+              relayed to the upstream resolvers below — typical use is "forward{" "}
+              <code>corp.local</code> to the AD DNS at 10.0.0.5". Records on the
+              zone are ignored when the type is forward.
             </p>
             <Field label="Forwarder IPs (comma- or space-separated)">
               <input
@@ -1548,6 +1603,7 @@ function ZoneDetailView({
     null,
   );
   const [showEditZone, setShowEditZone] = useState(false);
+  const [showDelegate, setShowDelegate] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [showImport, setShowImport] = useState(false);
   const [showRecFilters, setShowRecFilters] = useState(false);
@@ -1575,6 +1631,20 @@ function ZoneDetailView({
     queryFn: () => dnsApi.getZoneServerState(group.id, zone.id),
     refetchInterval: 30_000,
   });
+
+  // Delegation wizard surface only appears when this zone has an eligible
+  // parent zone in the same group — preview the parent up front so the
+  // header button can hide cleanly otherwise.
+  const { data: delegationPreview } = useQuery({
+    queryKey: ["dns-delegation-preview", group.id, zone.id],
+    queryFn: () => dnsApi.getDelegationPreview(group.id, zone.id),
+    // Forward zones don't host records, so no delegation work to do.
+    enabled: zone.zone_type !== "forward" && !zone.tailscale_tenant_id,
+  });
+  const showDelegateButton =
+    delegationPreview?.has_parent === true &&
+    (delegationPreview.ns_records_to_create.length > 0 ||
+      delegationPreview.glue_records_to_create.length > 0);
 
   // "Sync with server" — bi-directional additive sync against the zone's
   // primary authoritative server (today: Windows DNS). AXFR imports missing
@@ -1745,6 +1815,15 @@ function ZoneDetailView({
               </HeaderButton>
             </>
           )}
+          {showDelegateButton && (
+            <HeaderButton
+              icon={Workflow}
+              onClick={() => setShowDelegate(true)}
+              title="The parent zone is missing NS / glue records for this zone. Click to review and create them."
+            >
+              Delegate
+            </HeaderButton>
+          )}
           <HeaderButton
             icon={Pencil}
             onClick={() => setShowEditZone(true)}
@@ -1794,7 +1873,9 @@ function ZoneDetailView({
           <div className="max-w-2xl space-y-4">
             <div className="rounded border bg-card p-4 text-sm">
               <p className="text-xs text-muted-foreground">
-                <strong className="text-foreground">Conditional forwarder.</strong>{" "}
+                <strong className="text-foreground">
+                  Conditional forwarder.
+                </strong>{" "}
                 Queries for{" "}
                 <code className="rounded bg-muted px-1 py-0.5 font-mono text-xs">
                   {zone.name.replace(/\.$/, "")}
@@ -1874,303 +1955,314 @@ function ZoneDetailView({
 
       {/* Records table */}
       {!isForward && (
-      <div className="flex-1 overflow-auto">
-        {isFetching && records.length === 0 && (
-          <p className="px-5 py-4 text-sm text-muted-foreground">Loading…</p>
-        )}
-        {filtered.length === 0 && !isFetching && (
-          <div className="flex flex-col items-center justify-center h-40">
-            <p className="text-sm text-muted-foreground italic">
-              {hasRecFilter
-                ? "No records match the current filter."
-                : 'No records yet. Click "Add Record" to create one.'}
-            </p>
-          </div>
-        )}
-        {(filtered.length > 0 || showRecFilters) && (
-          <div className="overflow-x-auto">
-            <table className="w-full min-w-[720px] text-sm">
-              <thead className="sticky top-0 bg-card">
-                <tr className="border-b text-xs text-muted-foreground">
-                  <th className="w-8 py-2 pl-3">
-                    {(() => {
-                      const manualIds = filtered
-                        .filter((r) => !r.auto_generated)
-                        .map((r) => r.id);
-                      const allSel =
-                        manualIds.length > 0 &&
-                        manualIds.every((id) => selectedRecords.has(id));
-                      return (
-                        <input
-                          type="checkbox"
-                          disabled={manualIds.length === 0}
-                          checked={allSel}
-                          onChange={() => {
-                            setSelectedRecords((prev) => {
-                              const next = new Set(prev);
-                              if (allSel)
-                                manualIds.forEach((id) => next.delete(id));
-                              else manualIds.forEach((id) => next.add(id));
-                              return next;
-                            });
-                          }}
-                          title="Select all manual records (IPAM-managed records are skipped)"
-                        />
-                      );
-                    })()}
-                  </th>
-                  {(["Name", "Type", "Value", "TTL", "Pri"] as const).map(
-                    (col) => {
-                      const filterKey =
-                        col === "Name"
-                          ? "name"
-                          : col === "Type"
-                            ? "type"
-                            : col === "Value"
-                              ? "value"
-                              : null;
-                      const hasFilter = filterKey
-                        ? !!recFilter[filterKey as keyof typeof recFilter]
-                        : false;
-                      return (
-                        <th
-                          key={col}
-                          className={
-                            col === "Name"
-                              ? "py-2 pl-5 text-left font-medium"
-                              : "py-2 text-left font-medium"
-                          }
-                        >
-                          <span className="inline-flex items-center gap-1">
-                            {col}
-                            {filterKey && (
-                              <button
-                                onClick={() => setShowRecFilters((v) => !v)}
-                                title={`Filter by ${col}`}
-                                className={`rounded p-0.5 hover:bg-accent ${hasFilter ? "text-primary" : showRecFilters || hasRecFilter ? "text-primary/50" : "text-muted-foreground/40 hover:text-muted-foreground"}`}
-                              >
-                                <Filter className="h-2.5 w-2.5" />
-                              </button>
-                            )}
-                          </span>
-                        </th>
-                      );
-                    },
-                  )}
-                  <th className="py-2 pr-3 text-right">
-                    {hasRecFilter && (
-                      <button
-                        onClick={() =>
-                          setRecFilter({ name: "", type: "", value: "" })
-                        }
-                        title="Clear filters"
-                        className="rounded p-0.5 text-primary hover:text-destructive"
-                      >
-                        <X className="h-3 w-3" />
-                      </button>
-                    )}
-                  </th>
-                </tr>
-                {showRecFilters && (
-                  <tr className="border-b bg-muted/10 text-xs">
-                    <td />
-                    <td className="px-2 py-1 pl-5">
-                      <input
-                        type="text"
-                        value={recFilter.name}
-                        onChange={(e) =>
-                          setRecFilter((f) => ({ ...f, name: e.target.value }))
-                        }
-                        placeholder="Filter…"
-                        className="w-full rounded border border-border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
-                      />
-                    </td>
-                    <td className="px-2 py-1">
-                      <select
-                        value={recFilter.type}
-                        onChange={(e) =>
-                          setRecFilter((f) => ({ ...f, type: e.target.value }))
-                        }
-                        className="w-full rounded border border-border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
-                      >
-                        <option value="">All</option>
-                        {recordTypes.map((t) => (
-                          <option key={t} value={t}>
-                            {t}
-                          </option>
-                        ))}
-                      </select>
-                    </td>
-                    <td className="px-2 py-1">
-                      <input
-                        type="text"
-                        value={recFilter.value}
-                        onChange={(e) =>
-                          setRecFilter((f) => ({ ...f, value: e.target.value }))
-                        }
-                        placeholder="Filter…"
-                        className="w-full rounded border border-border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
-                      />
-                    </td>
-                    <td />
-                    <td />
-                    <td />
-                  </tr>
-                )}
-              </thead>
-              <tbody className={zebraBodyCls}>
-                {filtered.map((r) => (
-                  <ContextMenu key={r.id}>
-                    <ContextMenuTrigger asChild>
-                      <tr
-                        ref={registerHighlightRow(r.id)}
-                        className={cn(
-                          "border-b last:border-0 hover:bg-muted/40 group",
-                          isHighlightedRow(r.id) && "spatium-row-highlight",
-                        )}
-                      >
-                        <td className="w-8 py-1.5 pl-3">
-                          {!r.auto_generated && (
-                            <input
-                              type="checkbox"
-                              checked={selectedRecords.has(r.id)}
-                              onChange={() =>
-                                setSelectedRecords((prev) => {
-                                  const next = new Set(prev);
-                                  if (next.has(r.id)) next.delete(r.id);
-                                  else next.add(r.id);
-                                  return next;
-                                })
-                              }
-                            />
-                          )}
-                        </td>
-                        <td className="py-1.5 pl-5 font-mono text-xs font-medium">
-                          {r.auto_generated ? (
-                            r.name
-                          ) : (
-                            <button
-                              onClick={() => setEditRecord(r)}
-                              className="hover:text-primary hover:underline"
-                              title="Edit record"
-                            >
-                              {r.name}
-                            </button>
-                          )}
-                        </td>
-                        <td className="py-1.5">
-                          <span
-                            className={`inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium ${typeBadge[r.record_type] ?? "bg-muted text-muted-foreground"}`}
+        <div className="flex-1 overflow-auto">
+          {isFetching && records.length === 0 && (
+            <p className="px-5 py-4 text-sm text-muted-foreground">Loading…</p>
+          )}
+          {filtered.length === 0 && !isFetching && (
+            <div className="flex flex-col items-center justify-center h-40">
+              <p className="text-sm text-muted-foreground italic">
+                {hasRecFilter
+                  ? "No records match the current filter."
+                  : 'No records yet. Click "Add Record" to create one.'}
+              </p>
+            </div>
+          )}
+          {(filtered.length > 0 || showRecFilters) && (
+            <div className="overflow-x-auto">
+              <table className="w-full min-w-[720px] text-sm">
+                <thead className="sticky top-0 bg-card">
+                  <tr className="border-b text-xs text-muted-foreground">
+                    <th className="w-8 py-2 pl-3">
+                      {(() => {
+                        const manualIds = filtered
+                          .filter((r) => !r.auto_generated)
+                          .map((r) => r.id);
+                        const allSel =
+                          manualIds.length > 0 &&
+                          manualIds.every((id) => selectedRecords.has(id));
+                        return (
+                          <input
+                            type="checkbox"
+                            disabled={manualIds.length === 0}
+                            checked={allSel}
+                            onChange={() => {
+                              setSelectedRecords((prev) => {
+                                const next = new Set(prev);
+                                if (allSel)
+                                  manualIds.forEach((id) => next.delete(id));
+                                else manualIds.forEach((id) => next.add(id));
+                                return next;
+                              });
+                            }}
+                            title="Select all manual records (IPAM-managed records are skipped)"
+                          />
+                        );
+                      })()}
+                    </th>
+                    {(["Name", "Type", "Value", "TTL", "Pri"] as const).map(
+                      (col) => {
+                        const filterKey =
+                          col === "Name"
+                            ? "name"
+                            : col === "Type"
+                              ? "type"
+                              : col === "Value"
+                                ? "value"
+                                : null;
+                        const hasFilter = filterKey
+                          ? !!recFilter[filterKey as keyof typeof recFilter]
+                          : false;
+                        return (
+                          <th
+                            key={col}
+                            className={
+                              col === "Name"
+                                ? "py-2 pl-5 text-left font-medium"
+                                : "py-2 text-left font-medium"
+                            }
                           >
-                            {r.record_type}
-                          </span>
-                        </td>
-                        <td className="py-1.5 font-mono text-xs text-muted-foreground max-w-xs truncate">
-                          {r.value}
-                        </td>
-                        <td className="py-1.5 text-xs text-muted-foreground">
-                          {r.ttl ?? "—"}
-                        </td>
-                        <td className="py-1.5 text-xs text-muted-foreground">
-                          {r.priority ?? "—"}
-                        </td>
-                        <td className="py-1.5 pr-3">
-                          {r.auto_generated ? (
-                            <div className="flex items-center justify-end gap-1">
-                              {r.tailscale_tenant_id ? (
-                                <span
-                                  title="Synthesised by the Tailscale integration. Records are derived from the device list on every sync; manual edits are blocked."
-                                  className="flex items-center gap-1 rounded border border-cyan-300/60 bg-cyan-50 px-1.5 py-0.5 text-xs text-cyan-700 dark:border-cyan-700/40 dark:bg-cyan-900/20 dark:text-cyan-300"
+                            <span className="inline-flex items-center gap-1">
+                              {col}
+                              {filterKey && (
+                                <button
+                                  onClick={() => setShowRecFilters((v) => !v)}
+                                  title={`Filter by ${col}`}
+                                  className={`rounded p-0.5 hover:bg-accent ${hasFilter ? "text-primary" : showRecFilters || hasRecFilter ? "text-primary/50" : "text-muted-foreground/40 hover:text-muted-foreground"}`}
                                 >
-                                  <Lock className="h-2.5 w-2.5" />
-                                  Tailscale
-                                </span>
-                              ) : (
-                                <span
-                                  title="This record was created automatically by IPAM. Edit the IP address in IPAM to change it."
-                                  className="flex items-center gap-1 rounded border border-amber-300/60 bg-amber-50 px-1.5 py-0.5 text-xs text-amber-700 dark:border-amber-700/40 dark:bg-amber-900/20 dark:text-amber-400"
-                                >
-                                  <Lock className="h-2.5 w-2.5" />
-                                  IPAM
-                                </span>
+                                  <Filter className="h-2.5 w-2.5" />
+                                </button>
                               )}
-                              <span
-                                title="Managed externally — changes made here will be overwritten on the next sync."
-                                className="flex h-5 w-5 cursor-help items-center justify-center rounded text-muted-foreground/60 hover:text-muted-foreground"
-                              >
-                                <Info className="h-3 w-3" />
-                              </span>
-                            </div>
-                          ) : (
-                            <div className="flex items-center justify-end gap-1">
+                            </span>
+                          </th>
+                        );
+                      },
+                    )}
+                    <th className="py-2 pr-3 text-right">
+                      {hasRecFilter && (
+                        <button
+                          onClick={() =>
+                            setRecFilter({ name: "", type: "", value: "" })
+                          }
+                          title="Clear filters"
+                          className="rounded p-0.5 text-primary hover:text-destructive"
+                        >
+                          <X className="h-3 w-3" />
+                        </button>
+                      )}
+                    </th>
+                  </tr>
+                  {showRecFilters && (
+                    <tr className="border-b bg-muted/10 text-xs">
+                      <td />
+                      <td className="px-2 py-1 pl-5">
+                        <input
+                          type="text"
+                          value={recFilter.name}
+                          onChange={(e) =>
+                            setRecFilter((f) => ({
+                              ...f,
+                              name: e.target.value,
+                            }))
+                          }
+                          placeholder="Filter…"
+                          className="w-full rounded border border-border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
+                        />
+                      </td>
+                      <td className="px-2 py-1">
+                        <select
+                          value={recFilter.type}
+                          onChange={(e) =>
+                            setRecFilter((f) => ({
+                              ...f,
+                              type: e.target.value,
+                            }))
+                          }
+                          className="w-full rounded border border-border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
+                        >
+                          <option value="">All</option>
+                          {recordTypes.map((t) => (
+                            <option key={t} value={t}>
+                              {t}
+                            </option>
+                          ))}
+                        </select>
+                      </td>
+                      <td className="px-2 py-1">
+                        <input
+                          type="text"
+                          value={recFilter.value}
+                          onChange={(e) =>
+                            setRecFilter((f) => ({
+                              ...f,
+                              value: e.target.value,
+                            }))
+                          }
+                          placeholder="Filter…"
+                          className="w-full rounded border border-border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
+                        />
+                      </td>
+                      <td />
+                      <td />
+                      <td />
+                    </tr>
+                  )}
+                </thead>
+                <tbody className={zebraBodyCls}>
+                  {filtered.map((r) => (
+                    <ContextMenu key={r.id}>
+                      <ContextMenuTrigger asChild>
+                        <tr
+                          ref={registerHighlightRow(r.id)}
+                          className={cn(
+                            "border-b last:border-0 hover:bg-muted/40 group",
+                            isHighlightedRow(r.id) && "spatium-row-highlight",
+                          )}
+                        >
+                          <td className="w-8 py-1.5 pl-3">
+                            {!r.auto_generated && (
+                              <input
+                                type="checkbox"
+                                checked={selectedRecords.has(r.id)}
+                                onChange={() =>
+                                  setSelectedRecords((prev) => {
+                                    const next = new Set(prev);
+                                    if (next.has(r.id)) next.delete(r.id);
+                                    else next.add(r.id);
+                                    return next;
+                                  })
+                                }
+                              />
+                            )}
+                          </td>
+                          <td className="py-1.5 pl-5 font-mono text-xs font-medium">
+                            {r.auto_generated ? (
+                              r.name
+                            ) : (
                               <button
-                                className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-foreground"
-                                onClick={() => setPropagationRecord(r)}
-                                title="Check propagation across public resolvers"
-                              >
-                                <Radar className="h-3 w-3" />
-                              </button>
-                              <button
-                                className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-foreground"
                                 onClick={() => setEditRecord(r)}
+                                className="hover:text-primary hover:underline"
                                 title="Edit record"
                               >
-                                <Pencil className="h-3 w-3" />
+                                {r.name}
                               </button>
-                              <button
-                                className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-destructive"
-                                onClick={() => setConfirmDeleteRecord(r)}
-                                title="Delete record"
-                              >
-                                <Trash2 className="h-3 w-3" />
-                              </button>
-                            </div>
-                          )}
-                        </td>
-                      </tr>
-                    </ContextMenuTrigger>
-                    <ContextMenuContent>
-                      <ContextMenuLabel>
-                        {r.name} {r.record_type}
-                      </ContextMenuLabel>
-                      <ContextMenuSeparator />
-                      <ContextMenuItem onSelect={() => copyToClipboard(r.name)}>
-                        Copy Name
-                      </ContextMenuItem>
-                      <ContextMenuItem
-                        onSelect={() => copyToClipboard(r.value)}
-                      >
-                        Copy Value
-                      </ContextMenuItem>
-                      {r.auto_generated ? (
-                        <>
-                          <ContextMenuSeparator />
-                          <ContextMenuItem disabled>
-                            Managed by IPAM — read-only
-                          </ContextMenuItem>
-                        </>
-                      ) : (
-                        <>
-                          <ContextMenuSeparator />
-                          <ContextMenuItem onSelect={() => setEditRecord(r)}>
-                            Edit…
-                          </ContextMenuItem>
-                          <ContextMenuItem
-                            destructive
-                            onSelect={() => setConfirmDeleteRecord(r)}
-                          >
-                            Delete…
-                          </ContextMenuItem>
-                        </>
-                      )}
-                    </ContextMenuContent>
-                  </ContextMenu>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
-      </div>
+                            )}
+                          </td>
+                          <td className="py-1.5">
+                            <span
+                              className={`inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium ${typeBadge[r.record_type] ?? "bg-muted text-muted-foreground"}`}
+                            >
+                              {r.record_type}
+                            </span>
+                          </td>
+                          <td className="py-1.5 font-mono text-xs text-muted-foreground max-w-xs truncate">
+                            {r.value}
+                          </td>
+                          <td className="py-1.5 text-xs text-muted-foreground">
+                            {r.ttl ?? "—"}
+                          </td>
+                          <td className="py-1.5 text-xs text-muted-foreground">
+                            {r.priority ?? "—"}
+                          </td>
+                          <td className="py-1.5 pr-3">
+                            {r.auto_generated ? (
+                              <div className="flex items-center justify-end gap-1">
+                                {r.tailscale_tenant_id ? (
+                                  <span
+                                    title="Synthesised by the Tailscale integration. Records are derived from the device list on every sync; manual edits are blocked."
+                                    className="flex items-center gap-1 rounded border border-cyan-300/60 bg-cyan-50 px-1.5 py-0.5 text-xs text-cyan-700 dark:border-cyan-700/40 dark:bg-cyan-900/20 dark:text-cyan-300"
+                                  >
+                                    <Lock className="h-2.5 w-2.5" />
+                                    Tailscale
+                                  </span>
+                                ) : (
+                                  <span
+                                    title="This record was created automatically by IPAM. Edit the IP address in IPAM to change it."
+                                    className="flex items-center gap-1 rounded border border-amber-300/60 bg-amber-50 px-1.5 py-0.5 text-xs text-amber-700 dark:border-amber-700/40 dark:bg-amber-900/20 dark:text-amber-400"
+                                  >
+                                    <Lock className="h-2.5 w-2.5" />
+                                    IPAM
+                                  </span>
+                                )}
+                                <span
+                                  title="Managed externally — changes made here will be overwritten on the next sync."
+                                  className="flex h-5 w-5 cursor-help items-center justify-center rounded text-muted-foreground/60 hover:text-muted-foreground"
+                                >
+                                  <Info className="h-3 w-3" />
+                                </span>
+                              </div>
+                            ) : (
+                              <div className="flex items-center justify-end gap-1">
+                                <button
+                                  className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-foreground"
+                                  onClick={() => setPropagationRecord(r)}
+                                  title="Check propagation across public resolvers"
+                                >
+                                  <Radar className="h-3 w-3" />
+                                </button>
+                                <button
+                                  className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-foreground"
+                                  onClick={() => setEditRecord(r)}
+                                  title="Edit record"
+                                >
+                                  <Pencil className="h-3 w-3" />
+                                </button>
+                                <button
+                                  className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-destructive"
+                                  onClick={() => setConfirmDeleteRecord(r)}
+                                  title="Delete record"
+                                >
+                                  <Trash2 className="h-3 w-3" />
+                                </button>
+                              </div>
+                            )}
+                          </td>
+                        </tr>
+                      </ContextMenuTrigger>
+                      <ContextMenuContent>
+                        <ContextMenuLabel>
+                          {r.name} {r.record_type}
+                        </ContextMenuLabel>
+                        <ContextMenuSeparator />
+                        <ContextMenuItem
+                          onSelect={() => copyToClipboard(r.name)}
+                        >
+                          Copy Name
+                        </ContextMenuItem>
+                        <ContextMenuItem
+                          onSelect={() => copyToClipboard(r.value)}
+                        >
+                          Copy Value
+                        </ContextMenuItem>
+                        {r.auto_generated ? (
+                          <>
+                            <ContextMenuSeparator />
+                            <ContextMenuItem disabled>
+                              Managed by IPAM — read-only
+                            </ContextMenuItem>
+                          </>
+                        ) : (
+                          <>
+                            <ContextMenuSeparator />
+                            <ContextMenuItem onSelect={() => setEditRecord(r)}>
+                              Edit…
+                            </ContextMenuItem>
+                            <ContextMenuItem
+                              destructive
+                              onSelect={() => setConfirmDeleteRecord(r)}
+                            >
+                              Delete…
+                            </ContextMenuItem>
+                          </>
+                        )}
+                      </ContextMenuContent>
+                    </ContextMenu>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
       )}
 
       {showAddRecord && (
@@ -2242,6 +2334,14 @@ function ZoneDetailView({
           views={views}
           zone={zone}
           onClose={() => setShowEditZone(false)}
+        />
+      )}
+      {showDelegate && (
+        <DelegationModal
+          groupId={group.id}
+          zoneId={zone.id}
+          zoneName={zone.name}
+          onClose={() => setShowDelegate(false)}
         />
       )}
       {showImport && (
@@ -2937,6 +3037,436 @@ function AclsTab({ groupId }: { groupId: string }) {
         ))}
       </div>
     </div>
+  );
+}
+
+// ── TSIG Keys Tab ─────────────────────────────────────────────────────────────
+
+function TSIGKeysTab({ group }: { group: DNSServerGroup }) {
+  const qc = useQueryClient();
+  const { data: keys = [], isFetching } = useQuery({
+    queryKey: ["dns-tsig-keys", group.id],
+    queryFn: () => dnsApi.listTSIGKeys(group.id),
+  });
+  const [showAdd, setShowAdd] = useState(false);
+  const [editKey, setEditKey] = useState<DNSTSIGKey | null>(null);
+  const [confirmDelete, setConfirmDelete] = useState<DNSTSIGKey | null>(null);
+  const [confirmRotate, setConfirmRotate] = useState<DNSTSIGKey | null>(null);
+  // Lives across modals — surfaces the freshly-issued plaintext secret one
+  // last time after create / rotate so the operator can copy it.
+  const [revealedSecret, setRevealedSecret] = useState<{
+    name: string;
+    algorithm: string;
+    secret: string;
+    action: "created" | "rotated";
+  } | null>(null);
+
+  const deleteMut = useMutation({
+    mutationFn: (id: string) => dnsApi.deleteTSIGKey(group.id, id),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["dns-tsig-keys", group.id] });
+      setConfirmDelete(null);
+    },
+  });
+  const rotateMut = useMutation({
+    mutationFn: (id: string) => dnsApi.rotateTSIGKey(group.id, id),
+    onSuccess: (key) => {
+      qc.invalidateQueries({ queryKey: ["dns-tsig-keys", group.id] });
+      setConfirmRotate(null);
+      if (key.secret) {
+        setRevealedSecret({
+          name: key.name,
+          algorithm: key.algorithm,
+          secret: key.secret,
+          action: "rotated",
+        });
+      }
+    },
+  });
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center justify-between">
+        <span className="text-xs font-medium text-muted-foreground uppercase tracking-wider">
+          {keys.length} TSIG key{keys.length !== 1 ? "s" : ""}
+        </span>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={() =>
+              qc.invalidateQueries({ queryKey: ["dns-tsig-keys", group.id] })
+            }
+            className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-muted/50"
+            disabled={isFetching}
+          >
+            <RefreshCw
+              className={cn("h-3 w-3", isFetching && "animate-spin")}
+            />
+            Refresh
+          </button>
+          <button
+            onClick={() => setShowAdd(true)}
+            className="flex items-center gap-1 rounded-md bg-primary px-2 py-1 text-xs text-primary-foreground hover:bg-primary/90"
+          >
+            <Plus className="h-3 w-3" /> New TSIG Key
+          </button>
+        </div>
+      </div>
+
+      <p className="rounded border bg-muted/20 px-3 py-2 text-xs text-muted-foreground">
+        Named TSIG keys distributed to every BIND9 agent in this group. Use them
+        to authenticate external <code>nsupdate</code> clients (allow-update) or
+        downstream secondaries pulling AXFR (allow-transfer). Reference a key
+        from a zone's allow-update / allow-transfer field as{" "}
+        <code>key {"<name>;"}</code>.
+      </p>
+
+      {keys.length === 0 && (
+        <p className="text-xs italic text-muted-foreground">
+          No TSIG keys yet. Click <em>New TSIG Key</em> to add one.
+        </p>
+      )}
+
+      <div className="overflow-x-auto rounded border">
+        <table className="w-full min-w-[640px] text-sm">
+          <thead className="bg-muted/30 text-xs text-muted-foreground">
+            <tr className="border-b">
+              <th className="px-3 py-1.5 text-left font-medium">Name</th>
+              <th className="px-2 py-1.5 text-left font-medium">Algorithm</th>
+              <th className="px-2 py-1.5 text-left font-medium">Purpose</th>
+              <th className="px-2 py-1.5 text-left font-medium">
+                Last rotated
+              </th>
+              <th className="px-3 py-1.5 text-right font-medium">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            {keys.map((k) => (
+              <tr
+                key={k.id}
+                className="border-b last:border-0 hover:bg-muted/20"
+              >
+                <td className="px-3 py-1.5 font-mono text-xs">{k.name}</td>
+                <td className="px-2 py-1.5 font-mono text-xs">{k.algorithm}</td>
+                <td className="px-2 py-1.5 text-xs text-muted-foreground">
+                  {k.purpose ?? "—"}
+                </td>
+                <td className="px-2 py-1.5 text-xs text-muted-foreground">
+                  {k.last_rotated_at
+                    ? new Date(k.last_rotated_at).toLocaleString()
+                    : "never"}
+                </td>
+                <td className="px-3 py-1.5 text-right">
+                  <div className="inline-flex items-center gap-1">
+                    <button
+                      onClick={() => setConfirmRotate(k)}
+                      className="rounded border px-2 py-0.5 text-xs hover:bg-muted/50"
+                      title="Generate a fresh secret of the same algorithm and replace the stored one"
+                    >
+                      Rotate
+                    </button>
+                    <button
+                      onClick={() => setEditKey(k)}
+                      className="h-6 w-6 inline-flex items-center justify-center rounded hover:bg-muted/50"
+                      title="Edit metadata"
+                    >
+                      <Pencil className="h-3 w-3" />
+                    </button>
+                    <button
+                      onClick={() => setConfirmDelete(k)}
+                      className="h-6 w-6 inline-flex items-center justify-center rounded text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+                      title="Delete key"
+                    >
+                      <Trash2 className="h-3 w-3" />
+                    </button>
+                  </div>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      {showAdd && (
+        <TSIGKeyModal
+          groupId={group.id}
+          onClose={() => setShowAdd(false)}
+          onCreated={(secret) => {
+            setShowAdd(false);
+            setRevealedSecret({ ...secret, action: "created" });
+          }}
+        />
+      )}
+      {editKey && (
+        <TSIGKeyModal
+          groupId={group.id}
+          existing={editKey}
+          onClose={() => setEditKey(null)}
+        />
+      )}
+      {confirmDelete && (
+        <ConfirmDestroyModal
+          title="Delete TSIG Key"
+          description={`Permanently delete "${confirmDelete.name}"? Any zones referencing this key in their allow-update / allow-transfer fields will start failing auth on the next BIND reload.`}
+          checkLabel={`I understand "${confirmDelete.name}" will be deleted from every BIND9 server in this group on the next config push.`}
+          onConfirm={() => deleteMut.mutate(confirmDelete.id)}
+          onClose={() => setConfirmDelete(null)}
+          isPending={deleteMut.isPending}
+        />
+      )}
+      {confirmRotate && (
+        <ConfirmDestroyModal
+          title="Rotate TSIG Key"
+          description={`Generate a new secret for "${confirmRotate.name}"? The old secret stops working immediately on the next BIND9 push — every consuming client must be updated with the new value.`}
+          checkLabel={`I understand consumers of "${confirmRotate.name}" will break until reconfigured.`}
+          onConfirm={() => rotateMut.mutate(confirmRotate.id)}
+          onClose={() => setConfirmRotate(null)}
+          isPending={rotateMut.isPending}
+        />
+      )}
+      {revealedSecret && (
+        <RevealedSecretModal
+          name={revealedSecret.name}
+          algorithm={revealedSecret.algorithm}
+          secret={revealedSecret.secret}
+          action={revealedSecret.action}
+          onClose={() => setRevealedSecret(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+function TSIGKeyModal({
+  groupId,
+  existing,
+  onClose,
+  onCreated,
+}: {
+  groupId: string;
+  existing?: DNSTSIGKey;
+  onClose: () => void;
+  onCreated?: (s: { name: string; algorithm: string; secret: string }) => void;
+}) {
+  const qc = useQueryClient();
+  const isEdit = !!existing;
+  const [name, setName] = useState(existing?.name ?? "");
+  const [algorithm, setAlgorithm] = useState(
+    existing?.algorithm ?? "hmac-sha256",
+  );
+  const [purpose, setPurpose] = useState<string>(existing?.purpose ?? "");
+  const [notes, setNotes] = useState<string>(existing?.notes ?? "");
+  // Optional operator-supplied secret — empty string means "let the server
+  // generate one." Only used on the create path.
+  const [secret, setSecret] = useState<string>("");
+
+  const generateMut = useMutation({
+    mutationFn: () => dnsApi.generateTSIGSecret(groupId, algorithm),
+    onSuccess: (r) => setSecret(r.secret),
+  });
+
+  const saveMut = useMutation({
+    mutationFn: () => {
+      if (isEdit && existing) {
+        return dnsApi.updateTSIGKey(groupId, existing.id, {
+          name,
+          algorithm,
+          purpose: purpose || null,
+          notes,
+        });
+      }
+      return dnsApi.createTSIGKey(groupId, {
+        name,
+        algorithm,
+        secret: secret.trim() || null,
+        purpose: purpose || null,
+        notes,
+      });
+    },
+    onSuccess: (key) => {
+      qc.invalidateQueries({ queryKey: ["dns-tsig-keys", groupId] });
+      if (!isEdit && key.secret && onCreated) {
+        onCreated({
+          name: key.name,
+          algorithm: key.algorithm,
+          secret: key.secret,
+        });
+      } else {
+        onClose();
+      }
+    },
+  });
+
+  return (
+    <Modal
+      title={isEdit ? `Edit ${existing!.name}` : "New TSIG Key"}
+      onClose={onClose}
+    >
+      <div className="space-y-3 text-sm">
+        <div>
+          <label className="mb-0.5 block text-xs font-medium">Name</label>
+          <input
+            type="text"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            placeholder="e.g. tsig-update.spatium.local."
+            className="w-full rounded border bg-background px-2 py-1 text-xs font-mono"
+          />
+          <p className="mt-0.5 text-[11px] text-muted-foreground">
+            RFC 1035 dotted ASCII label. Lower-case letters, digits, dots,
+            dashes. The convention is to end with a trailing dot (FQDN).
+          </p>
+        </div>
+        <div>
+          <label className="mb-0.5 block text-xs font-medium">Algorithm</label>
+          <select
+            value={algorithm}
+            onChange={(e) => setAlgorithm(e.target.value)}
+            className="w-full rounded border bg-background px-2 py-1 text-xs"
+          >
+            {[
+              "hmac-sha1",
+              "hmac-sha224",
+              "hmac-sha256",
+              "hmac-sha384",
+              "hmac-sha512",
+            ].map((a) => (
+              <option key={a} value={a}>
+                {a}
+              </option>
+            ))}
+          </select>
+          <p className="mt-0.5 text-[11px] text-muted-foreground">
+            BIND9 + dnspython both default to <code>hmac-sha256</code>. Older
+            clients may still need <code>hmac-sha1</code>.
+          </p>
+        </div>
+        {!isEdit && (
+          <div>
+            <label className="mb-0.5 block text-xs font-medium">
+              Secret (optional)
+            </label>
+            <div className="flex items-center gap-2">
+              <input
+                type="text"
+                value={secret}
+                onChange={(e) => setSecret(e.target.value)}
+                placeholder="Leave blank to generate"
+                className="flex-1 rounded border bg-background px-2 py-1 text-xs font-mono"
+              />
+              <button
+                type="button"
+                onClick={() => generateMut.mutate()}
+                disabled={generateMut.isPending}
+                className="rounded border px-2 py-1 text-xs hover:bg-muted/50 disabled:opacity-50"
+              >
+                Generate
+              </button>
+            </div>
+            <p className="mt-0.5 text-[11px] text-muted-foreground">
+              Base64-encoded random bytes. Leave blank to have the server
+              generate one of the right size for the chosen algorithm.
+            </p>
+          </div>
+        )}
+        <div>
+          <label className="mb-0.5 block text-xs font-medium">
+            Purpose (optional)
+          </label>
+          <input
+            type="text"
+            value={purpose}
+            onChange={(e) => setPurpose(e.target.value)}
+            placeholder="e.g. nsupdate, axfr-pull"
+            className="w-full rounded border bg-background px-2 py-1 text-xs"
+          />
+        </div>
+        <div>
+          <label className="mb-0.5 block text-xs font-medium">Notes</label>
+          <textarea
+            value={notes}
+            onChange={(e) => setNotes(e.target.value)}
+            rows={2}
+            className="w-full rounded border bg-background px-2 py-1 text-xs"
+            placeholder="What is this key for?"
+          />
+        </div>
+        {saveMut.isError && (
+          <p className="text-xs text-destructive">
+            {formatApiError(saveMut.error, "Save failed")}
+          </p>
+        )}
+        <div className="flex justify-end gap-2 pt-1">
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded border px-3 py-1.5 text-xs hover:bg-muted/50"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            onClick={() => saveMut.mutate()}
+            disabled={saveMut.isPending || !name.trim()}
+            className="rounded bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+          >
+            {saveMut.isPending ? "Saving…" : isEdit ? "Save" : "Create"}
+          </button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+function RevealedSecretModal({
+  name,
+  algorithm,
+  secret,
+  action,
+  onClose,
+}: {
+  name: string;
+  algorithm: string;
+  secret: string;
+  action: "created" | "rotated";
+  onClose: () => void;
+}) {
+  return (
+    <Modal title="Copy this secret now" onClose={onClose}>
+      <div className="space-y-3 text-sm">
+        <p className="text-xs text-muted-foreground">
+          This is the only time the plaintext secret for{" "}
+          <code className="font-mono">{name}</code> will be shown. Copy it into
+          your <code>nsupdate</code> client / secondary-server config before
+          closing — it is hashed at rest and can't be recovered.
+        </p>
+        <div className="rounded border bg-muted/30 p-3 font-mono text-xs">
+          <div className="mb-1 text-muted-foreground">{algorithm}</div>
+          <div className="break-all">{secret}</div>
+        </div>
+        <button
+          type="button"
+          onClick={() => {
+            void navigator.clipboard.writeText(secret);
+          }}
+          className="inline-flex items-center gap-1.5 rounded border px-2 py-1 text-xs hover:bg-muted/50"
+        >
+          <Copy className="h-3 w-3" /> Copy secret
+        </button>
+        <p className="text-[11px] text-muted-foreground">
+          Key {action} • The new value will reach BIND9 servers on the next
+          ConfigBundle long-poll (typically within seconds).
+        </p>
+        <div className="flex justify-end pt-1">
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground hover:bg-primary/90"
+          >
+            I have copied it
+          </button>
+        </div>
+      </div>
+    </Modal>
   );
 }
 
@@ -3833,6 +4363,7 @@ function ZonesTab({
 }) {
   const qc = useQueryClient();
   const [showAdd, setShowAdd] = useState(false);
+  const [showFromTemplate, setShowFromTemplate] = useState(false);
   const [showZoneFilters, setShowZoneFilters] = useState(false);
   const [zoneNameFilter, setZoneNameFilter] = useState("");
   const [zoneTypeFilter, setZoneTypeFilter] = useState("");
@@ -4105,6 +4636,13 @@ function ZonesTab({
             <Download className="h-3.5 w-3.5" /> Export All
           </button>
           <button
+            className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-muted/50"
+            onClick={() => setShowFromTemplate(true)}
+            title="Stamp a starter zone from a curated template (mail, AD, web, k8s)"
+          >
+            <Sparkles className="h-3 w-3" /> From Template
+          </button>
+          <button
             className="flex items-center gap-1 rounded-md bg-primary px-2 py-1 text-xs text-primary-foreground hover:bg-primary/90"
             onClick={() => setShowAdd(true)}
           >
@@ -4201,6 +4739,17 @@ function ZonesTab({
           onClose={() => setShowAdd(false)}
         />
       )}
+      {showFromTemplate && (
+        <ZoneTemplateModal
+          groupId={group.id}
+          onClose={() => setShowFromTemplate(false)}
+          onCreated={(zone) => {
+            setShowFromTemplate(false);
+            // Navigate the operator straight into the freshly-created zone.
+            onSelectZone(zone);
+          }}
+        />
+      )}
 
       {confirmBulkDelete && (
         <ConfirmDestroyModal
@@ -4232,6 +4781,10 @@ function BlocklistsTab({ group }: { group: DNSServerGroup }) {
   const [showCatalog, setShowCatalog] = useState(false);
   const [editList, setEditList] = useState<DNSBlockList | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<DNSBlockList | null>(null);
+  // Bulk-select state. Keyed by blocklist id; spans both sections so the
+  // operator can apply / detach / refresh / delete a mixed selection.
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [confirmBulkDelete, setConfirmBulkDelete] = useState(false);
 
   // Track baselines so we can detect when an in-flight refresh has actually
   // finished writing rows. Stamping `last_synced_at` is the proxy.
@@ -4272,6 +4825,35 @@ function BlocklistsTab({ group }: { group: DNSServerGroup }) {
   // Filter by lists applied to this group (or not yet applied anywhere)
   const applied = lists.filter((l) => l.applied_group_ids.includes(group.id));
   const other = lists.filter((l) => !l.applied_group_ids.includes(group.id));
+
+  // Selection helpers — both per-row and per-section.
+  function toggleOne(id: string) {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+  function toggleSection(rows: DNSBlockList[]) {
+    const ids = rows.map((r) => r.id);
+    const allSel = ids.length > 0 && ids.every((id) => selectedIds.has(id));
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (allSel) ids.forEach((id) => next.delete(id));
+      else ids.forEach((id) => next.add(id));
+      return next;
+    });
+  }
+  const selectedRows = lists.filter((l) => selectedIds.has(l.id));
+  const selCount = selectedRows.length;
+  const selAppliedCount = selectedRows.filter((l) =>
+    l.applied_group_ids.includes(group.id),
+  ).length;
+  const selDetachedCount = selCount - selAppliedCount;
+  const selRefreshableCount = selectedRows.filter(
+    (l) => l.source_type === "url" && l.feed_url,
+  ).length;
 
   const deleteMut = useMutation({
     mutationFn: (id: string) => dnsBlocklistApi.delete(id),
@@ -4319,6 +4901,93 @@ function BlocklistsTab({ group }: { group: DNSServerGroup }) {
     },
   });
 
+  // Bulk mutations — fan out via Promise.allSettled. Per-list scale is
+  // small (a few dozen at most), so client-side fan-out beats adding a
+  // bulk endpoint for now.
+  const bulkApply = useMutation({
+    mutationFn: async (ids: string[]) => {
+      const targets = lists.filter(
+        (l) => ids.includes(l.id) && !l.applied_group_ids.includes(group.id),
+      );
+      await Promise.allSettled(
+        targets.map((l) =>
+          dnsBlocklistApi.updateAssignments(l.id, {
+            server_group_ids: [...l.applied_group_ids, group.id],
+          }),
+        ),
+      );
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["dns-blocklists"] });
+      setSelectedIds(new Set());
+    },
+  });
+  const bulkDetach = useMutation({
+    mutationFn: async (ids: string[]) => {
+      const targets = lists.filter(
+        (l) => ids.includes(l.id) && l.applied_group_ids.includes(group.id),
+      );
+      await Promise.allSettled(
+        targets.map((l) =>
+          dnsBlocklistApi.updateAssignments(l.id, {
+            server_group_ids: l.applied_group_ids.filter((g) => g !== group.id),
+          }),
+        ),
+      );
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["dns-blocklists"] });
+      setSelectedIds(new Set());
+    },
+  });
+  const bulkRefresh = useMutation({
+    mutationFn: async (ids: string[]) => {
+      const targets = lists.filter(
+        (l) => ids.includes(l.id) && l.source_type === "url" && l.feed_url,
+      );
+      // Stamp baselines + flip per-row spinners up-front so the existing
+      // single-row polling logic clears them once last_synced_at advances.
+      for (const l of targets) {
+        refreshBaselineRef.current.set(l.id, l.last_synced_at ?? null);
+      }
+      setRefreshing((prev) => {
+        const next = new Set(prev);
+        for (const l of targets) next.add(l.id);
+        return next;
+      });
+      const results = await Promise.allSettled(
+        targets.map((l) => dnsBlocklistApi.refresh(l.id)),
+      );
+      // Roll back spinners for any failed enqueue. Successes stay spinning
+      // until last_synced_at moves.
+      const failedIds = targets
+        .filter((_, i) => results[i].status === "rejected")
+        .map((l) => l.id);
+      if (failedIds.length > 0) {
+        setRefreshing((prev) => {
+          const next = new Set(prev);
+          for (const id of failedIds) next.delete(id);
+          return next;
+        });
+        for (const id of failedIds) refreshBaselineRef.current.delete(id);
+      }
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["dns-blocklists"] });
+      setSelectedIds(new Set());
+    },
+  });
+  const bulkDelete = useMutation({
+    mutationFn: async (ids: string[]) => {
+      await Promise.allSettled(ids.map((id) => dnsBlocklistApi.delete(id)));
+    },
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["dns-blocklists"] });
+      setSelectedIds(new Set());
+      setConfirmBulkDelete(false);
+    },
+  });
+
   if (selected) {
     return (
       <BlocklistDetail
@@ -4357,6 +5026,69 @@ function BlocklistsTab({ group }: { group: DNSServerGroup }) {
         <BlocklistCatalogModal onClose={() => setShowCatalog(false)} />
       )}
 
+      {/* Bulk-action toolbar — only visible when at least one row is
+          selected. Each button operates on the subset of selected rows
+          where it's meaningful (Apply skips already-applied; Detach
+          skips not-applied; Refresh skips manual / file_upload lists). */}
+      {selCount > 0 && (
+        <div className="flex items-center justify-between rounded-md border border-amber-300 bg-amber-50 px-3 py-1.5 text-xs dark:border-amber-900 dark:bg-amber-900/20">
+          <span>
+            {selCount} list{selCount !== 1 ? "s" : ""} selected
+          </span>
+          <div className="flex items-center gap-2">
+            <button
+              onClick={() => setSelectedIds(new Set())}
+              className="rounded border px-2 py-1 hover:bg-muted/30"
+            >
+              Clear
+            </button>
+            <button
+              onClick={() => bulkApply.mutate(Array.from(selectedIds))}
+              disabled={bulkApply.isPending || selDetachedCount === 0}
+              className="inline-flex items-center gap-1 rounded border border-emerald-400 px-2 py-1 text-emerald-600 hover:bg-emerald-500/10 disabled:opacity-40"
+              title={
+                selDetachedCount === 0
+                  ? "Every selected list is already applied to this group"
+                  : `Apply ${selDetachedCount} list${selDetachedCount !== 1 ? "s" : ""} to ${group.name}`
+              }
+            >
+              Apply ({selDetachedCount})
+            </button>
+            <button
+              onClick={() => bulkDetach.mutate(Array.from(selectedIds))}
+              disabled={bulkDetach.isPending || selAppliedCount === 0}
+              className="inline-flex items-center gap-1 rounded border border-amber-400 px-2 py-1 text-amber-600 hover:bg-amber-500/10 disabled:opacity-40"
+              title={
+                selAppliedCount === 0
+                  ? "None of the selected lists are applied to this group"
+                  : `Detach ${selAppliedCount} list${selAppliedCount !== 1 ? "s" : ""} from ${group.name}`
+              }
+            >
+              Detach ({selAppliedCount})
+            </button>
+            <button
+              onClick={() => bulkRefresh.mutate(Array.from(selectedIds))}
+              disabled={bulkRefresh.isPending || selRefreshableCount === 0}
+              className="inline-flex items-center gap-1 rounded border px-2 py-1 hover:bg-muted/30 disabled:opacity-40"
+              title={
+                selRefreshableCount === 0
+                  ? "Only URL-sourced lists can be refreshed"
+                  : `Refresh ${selRefreshableCount} URL-sourced list${selRefreshableCount !== 1 ? "s" : ""}`
+              }
+            >
+              <RefreshCw className="h-3 w-3" /> Refresh ({selRefreshableCount})
+            </button>
+            <button
+              onClick={() => setConfirmBulkDelete(true)}
+              disabled={bulkDelete.isPending}
+              className="inline-flex items-center gap-1 rounded border border-destructive/40 px-2 py-1 text-destructive hover:bg-destructive/10 disabled:opacity-40"
+            >
+              <Trash2 className="h-3 w-3" /> Delete ({selCount})
+            </button>
+          </div>
+        </div>
+      )}
+
       {isFetching && lists.length === 0 && (
         <p className="text-sm text-muted-foreground">Loading…</p>
       )}
@@ -4364,99 +5096,133 @@ function BlocklistsTab({ group }: { group: DNSServerGroup }) {
       {[
         { label: "Applied to this group", rows: applied, assigned: true },
         { label: "Available (not applied)", rows: other, assigned: false },
-      ].map((section) => (
-        <div key={section.label}>
-          <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider mb-2">
-            {section.label}
-          </h4>
-          {section.rows.length === 0 && (
-            <p className="text-xs text-muted-foreground italic">None.</p>
-          )}
-          <div className="space-y-1">
-            {section.rows.map((l) => (
-              <div
-                key={l.id}
-                className="flex items-center gap-2 rounded-md border bg-card px-3 py-2 group hover:bg-accent/30 cursor-pointer"
-                onClick={() => setSelected(l)}
-              >
-                <Ban className="h-3.5 w-3.5 text-muted-foreground flex-shrink-0" />
-                <span className="font-mono text-sm truncate">{l.name}</span>
-                <span className="inline-flex items-center rounded px-1.5 py-0.5 text-xs bg-muted text-muted-foreground">
-                  {l.category}
-                </span>
-                <span className="inline-flex items-center rounded px-1.5 py-0.5 text-xs bg-muted text-muted-foreground">
-                  {l.block_mode}
-                </span>
-                {l.source_type === "url" && l.feed_url && (
-                  <span className="inline-flex items-center rounded px-1.5 py-0.5 text-xs bg-blue-500/15 text-blue-600">
-                    feed
-                  </span>
-                )}
-                {!l.enabled && (
-                  <span className="inline-flex items-center rounded px-1.5 py-0.5 text-xs bg-amber-500/15 text-amber-600">
-                    disabled
-                  </span>
-                )}
-                <span className="ml-auto text-xs text-muted-foreground">
-                  {l.entry_count} entries
-                </span>
-                <div
-                  className="flex items-center gap-1"
-                  onClick={(e) => e.stopPropagation()}
-                >
-                  <button
-                    title={
-                      section.assigned
-                        ? "Detach from this group"
-                        : "Apply to this group"
-                    }
-                    className={`rounded border px-2 py-0.5 text-xs ${section.assigned ? "text-amber-600 border-amber-400" : "text-emerald-600 border-emerald-400"}`}
-                    onClick={() =>
-                      toggleAssignment.mutate({
-                        list: l,
-                        assign: !section.assigned,
-                      })
-                    }
+      ].map((section) => {
+        const sectionIds = section.rows.map((r) => r.id);
+        const sectionAllSel =
+          sectionIds.length > 0 &&
+          sectionIds.every((id) => selectedIds.has(id));
+        const sectionSomeSel =
+          !sectionAllSel && sectionIds.some((id) => selectedIds.has(id));
+        return (
+          <div key={section.label}>
+            <div className="mb-2 flex items-center gap-2">
+              {section.rows.length > 0 && (
+                <input
+                  type="checkbox"
+                  checked={sectionAllSel}
+                  ref={(el) => {
+                    if (el) el.indeterminate = sectionSomeSel;
+                  }}
+                  onChange={() => toggleSection(section.rows)}
+                  title={`Select all in "${section.label}"`}
+                />
+              )}
+              <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">
+                {section.label}
+              </h4>
+            </div>
+            {section.rows.length === 0 && (
+              <p className="text-xs text-muted-foreground italic">None.</p>
+            )}
+            <div className="space-y-1">
+              {section.rows.map((l) => {
+                const isSel = selectedIds.has(l.id);
+                return (
+                  <div
+                    key={l.id}
+                    className={cn(
+                      "flex items-center gap-2 rounded-md border bg-card px-3 py-2 group hover:bg-accent/30 cursor-pointer",
+                      isSel && "ring-1 ring-primary/40 bg-primary/5",
+                    )}
+                    onClick={() => setSelected(l)}
                   >
-                    {section.assigned ? "Detach" : "Apply"}
-                  </button>
-                  {l.source_type === "url" && l.feed_url && (
-                    <button
-                      title={
-                        refreshing.has(l.id)
-                          ? "Refresh in progress…"
-                          : "Refresh from feed"
-                      }
-                      disabled={refreshing.has(l.id)}
-                      className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-foreground disabled:opacity-50"
-                      onClick={() => refreshMut.mutate(l.id)}
+                    <input
+                      type="checkbox"
+                      checked={isSel}
+                      onChange={() => toggleOne(l.id)}
+                      onClick={(e) => e.stopPropagation()}
+                      className="flex-shrink-0"
+                    />
+                    <Ban className="h-3.5 w-3.5 text-muted-foreground flex-shrink-0" />
+                    <span className="font-mono text-sm truncate">{l.name}</span>
+                    <span className="inline-flex items-center rounded px-1.5 py-0.5 text-xs bg-muted text-muted-foreground">
+                      {l.category}
+                    </span>
+                    <span className="inline-flex items-center rounded px-1.5 py-0.5 text-xs bg-muted text-muted-foreground">
+                      {l.block_mode}
+                    </span>
+                    {l.source_type === "url" && l.feed_url && (
+                      <span className="inline-flex items-center rounded px-1.5 py-0.5 text-xs bg-blue-500/15 text-blue-600">
+                        feed
+                      </span>
+                    )}
+                    {!l.enabled && (
+                      <span className="inline-flex items-center rounded px-1.5 py-0.5 text-xs bg-amber-500/15 text-amber-600">
+                        disabled
+                      </span>
+                    )}
+                    <span className="ml-auto text-xs text-muted-foreground">
+                      {l.entry_count} entries
+                    </span>
+                    <div
+                      className="flex items-center gap-1"
+                      onClick={(e) => e.stopPropagation()}
                     >
-                      <RefreshCw
-                        className={cn(
-                          "h-3 w-3",
-                          refreshing.has(l.id) && "animate-spin",
-                        )}
-                      />
-                    </button>
-                  )}
-                  <button
-                    className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-foreground"
-                    onClick={() => setEditList(l)}
-                  >
-                    <Pencil className="h-3 w-3" />
-                  </button>
-                  <button
-                    className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-destructive"
-                    onClick={() => setConfirmDelete(l)}
-                  >
-                    <Trash2 className="h-3 w-3" />
-                  </button>
-                </div>
-              </div>
-            ))}
+                      <button
+                        title={
+                          section.assigned
+                            ? "Detach from this group"
+                            : "Apply to this group"
+                        }
+                        className={`rounded border px-2 py-0.5 text-xs ${section.assigned ? "text-amber-600 border-amber-400" : "text-emerald-600 border-emerald-400"}`}
+                        onClick={() =>
+                          toggleAssignment.mutate({
+                            list: l,
+                            assign: !section.assigned,
+                          })
+                        }
+                      >
+                        {section.assigned ? "Detach" : "Apply"}
+                      </button>
+                      {l.source_type === "url" && l.feed_url && (
+                        <button
+                          title={
+                            refreshing.has(l.id)
+                              ? "Refresh in progress…"
+                              : "Refresh from feed"
+                          }
+                          disabled={refreshing.has(l.id)}
+                          className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-foreground disabled:opacity-50"
+                          onClick={() => refreshMut.mutate(l.id)}
+                        >
+                          <RefreshCw
+                            className={cn(
+                              "h-3 w-3",
+                              refreshing.has(l.id) && "animate-spin",
+                            )}
+                          />
+                        </button>
+                      )}
+                      <button
+                        className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-foreground"
+                        onClick={() => setEditList(l)}
+                      >
+                        <Pencil className="h-3 w-3" />
+                      </button>
+                      <button
+                        className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-destructive"
+                        onClick={() => setConfirmDelete(l)}
+                      >
+                        <Trash2 className="h-3 w-3" />
+                      </button>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
           </div>
-        </div>
-      ))}
+        );
+      })}
 
       {showCreate && <BlocklistModal onClose={() => setShowCreate(false)} />}
       {editList && (
@@ -4470,6 +5236,16 @@ function BlocklistsTab({ group }: { group: DNSServerGroup }) {
           onConfirm={() => deleteMut.mutate(confirmDelete.id)}
           onClose={() => setConfirmDelete(null)}
           isPending={deleteMut.isPending}
+        />
+      )}
+      {confirmBulkDelete && (
+        <ConfirmDestroyModal
+          title={`Delete ${selCount} blocklist${selCount === 1 ? "" : "s"}`}
+          description={`Permanently delete the ${selCount} selected blocking list${selCount === 1 ? "" : "s"} and all their entries / exceptions? This cannot be undone.`}
+          checkLabel={`I understand the ${selCount} selected blocking list${selCount === 1 ? " will be" : "s will be"} permanently deleted.`}
+          onConfirm={() => bulkDelete.mutate(Array.from(selectedIds))}
+          onClose={() => setConfirmBulkDelete(false)}
+          isPending={bulkDelete.isPending}
         />
       )}
     </div>
@@ -5190,6 +5966,7 @@ type GroupTab =
   | "views"
   | "acls"
   | "blocklists"
+  | "tsig"
   | "options";
 
 function GroupDetailView({
@@ -5248,6 +6025,7 @@ function GroupDetailView({
     { id: "views", label: "Views", icon: Eye },
     { id: "acls", label: "ACLs", icon: Shield },
     { id: "blocklists", label: "Blocking Lists", icon: Ban },
+    { id: "tsig", label: "TSIG Keys", icon: KeyRound },
     { id: "options", label: "Options", icon: Settings2 },
   ];
 
@@ -5351,6 +6129,7 @@ function GroupDetailView({
         {tab === "views" && <ViewsTab group={group} />}
         {tab === "acls" && <AclsTab groupId={group.id} />}
         {tab === "blocklists" && <BlocklistsTab group={group} />}
+        {tab === "tsig" && <TSIGKeysTab group={group} />}
         {tab === "options" && <OptionsTab groupId={group.id} />}
       </div>
 

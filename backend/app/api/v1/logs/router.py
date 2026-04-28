@@ -28,7 +28,7 @@ from typing import Any, Literal
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from app.api.deps import DB
 from app.core.permissions import require_permission
@@ -550,6 +550,94 @@ async def query_dns_queries(body: DNSQueryLogRequest, db: DB) -> DNSQueryLogResp
         server_id=server.id,
         events=events,
         truncated=len(events) >= body.max_events,
+    )
+
+
+# ── DNS query analytics ─────────────────────────────────────────────────────
+
+
+class DNSQueryAnalyticsRow(BaseModel):
+    key: str
+    count: int
+
+
+class DNSQueryAnalyticsRequest(BaseModel):
+    server_id: uuid.UUID
+    # Defaults to "last hour" — the query log table is pruned at 24h, so
+    # asking past that returns nothing useful anyway.
+    since: datetime | None = None
+    until: datetime | None = None
+    limit: int = Field(default=10, ge=1, le=100)
+
+
+class DNSQueryAnalyticsResponse(BaseModel):
+    server_id: uuid.UUID
+    since: datetime | None
+    until: datetime | None
+    total_queries: int
+    top_qnames: list[DNSQueryAnalyticsRow]
+    top_clients: list[DNSQueryAnalyticsRow]
+    qtype_distribution: list[DNSQueryAnalyticsRow]
+
+
+@router.post("/dns-queries/analytics", response_model=DNSQueryAnalyticsResponse)
+async def query_dns_analytics(body: DNSQueryAnalyticsRequest, db: DB) -> DNSQueryAnalyticsResponse:
+    """Top-N rollups over the parsed BIND9 query log.
+
+    Computed on-demand against ``dns_query_log_entry`` (24 h retention).
+    Three dimensions in one round trip — operators land on the analytics
+    panel and see all of them at once. Longer history belongs in Loki;
+    this endpoint deliberately mirrors the query log's retention window.
+    """
+    server = await db.get(DNSServer, body.server_id)
+    if server is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="DNS server not found")
+    if server.driver not in DNS_AGENT_DRIVERS:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Driver {server.driver!r} doesn't ship query logs — "
+                f"analytics only works for agent-based BIND9 servers."
+            ),
+        )
+
+    base_filter = [DNSQueryLogEntry.server_id == server.id]
+    if body.since is not None:
+        base_filter.append(DNSQueryLogEntry.ts >= body.since)
+    if body.until is not None:
+        base_filter.append(DNSQueryLogEntry.ts <= body.until)
+
+    total_q = select(func.count()).select_from(DNSQueryLogEntry).where(*base_filter)
+    total_queries = (await db.execute(total_q)).scalar_one() or 0
+
+    async def _topn(column: Any, limit: int) -> list[DNSQueryAnalyticsRow]:
+        # Aliased to ``n`` (not ``count``) because ``Row.count`` is a method
+        # on SQLAlchemy's Row API — naming the column ``count`` would shadow
+        # it on attribute access and mypy flags the resulting confusion.
+        stmt = (
+            select(column.label("key"), func.count().label("n"))
+            .where(*base_filter, column.is_not(None))
+            .group_by(column)
+            .order_by(func.count().desc())
+            .limit(limit)
+        )
+        rows = (await db.execute(stmt)).all()
+        return [DNSQueryAnalyticsRow(key=str(r.key), count=int(r.n)) for r in rows]
+
+    top_qnames = await _topn(DNSQueryLogEntry.qname, body.limit)
+    top_clients = await _topn(DNSQueryLogEntry.client_ip, body.limit)
+    # Distribution returns *every* qtype seen, not just top-N — operators
+    # want a complete pie of A vs AAAA vs CNAME etc.
+    qtype_distribution = await _topn(DNSQueryLogEntry.qtype, 25)
+
+    return DNSQueryAnalyticsResponse(
+        server_id=server.id,
+        since=body.since,
+        until=body.until,
+        total_queries=int(total_queries),
+        top_qnames=top_qnames,
+        top_clients=top_clients,
+        qtype_distribution=qtype_distribution,
     )
 
 

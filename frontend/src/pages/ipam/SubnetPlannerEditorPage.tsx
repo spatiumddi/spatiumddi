@@ -118,7 +118,9 @@ export function SubnetPlannerEditorPage() {
     },
   });
 
-  const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 4 } }));
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 4 } }),
+  );
 
   function handleDragEnd(e: DragEndEvent) {
     if (!tree) return;
@@ -187,7 +189,8 @@ export function SubnetPlannerEditorPage() {
               {applied && (
                 <span className="inline-flex items-center gap-1 rounded bg-emerald-500/15 px-1.5 py-0.5 text-xs text-emerald-700 dark:text-emerald-400">
                   <CheckCircle2 className="h-3 w-3" />
-                  Applied {new Date(plan.applied_at!).toLocaleString()} (read-only)
+                  Applied {new Date(plan.applied_at!).toLocaleString()}{" "}
+                  (read-only)
                 </span>
               )}
             </div>
@@ -225,10 +228,7 @@ export function SubnetPlannerEditorPage() {
             <button
               type="button"
               disabled={
-                applied ||
-                conflicts.length > 0 ||
-                applyMut.isPending ||
-                dirty
+                applied || conflicts.length > 0 || applyMut.isPending || dirty
               }
               onClick={() => setShowApplyConfirm(true)}
               className="inline-flex items-center gap-1 rounded bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
@@ -240,7 +240,9 @@ export function SubnetPlannerEditorPage() {
                     : ""
               }
             >
-              {applyMut.isPending && <Loader2 className="h-3 w-3 animate-spin" />}
+              {applyMut.isPending && (
+                <Loader2 className="h-3 w-3 animate-spin" />
+              )}
               Apply
             </button>
           </div>
@@ -280,13 +282,15 @@ export function SubnetPlannerEditorPage() {
           <div className="flex-1 overflow-auto border-r p-4">
             {!applied && (
               <div className="mb-3 rounded border border-dashed bg-muted/20 px-3 py-2 text-[11px] text-muted-foreground">
-                <strong className="font-medium text-foreground">How to use:</strong>{" "}
-                On any block row, click <em>+ Subnet</em> or <em>+ Block</em>{" "}
-                to nest a child of that kind. Click a node to edit it on the
-                right (CIDR, name, kind, optional DNS / DHCP / gateway).
-                Drag the grip handle to reparent (drops onto subnets are
-                refused — subnets can't have children). Save, then Apply to
-                materialise everything in IPAM in one transaction.
+                <strong className="font-medium text-foreground">
+                  How to use:
+                </strong>{" "}
+                On any block row, click <em>+ Subnet</em> or <em>+ Block</em> to
+                nest a child of that kind. Click a node to edit it on the right
+                (CIDR, name, kind, optional DNS / DHCP / gateway). Drag the grip
+                handle to reparent (drops onto subnets are refused — subnets
+                can't have children). Save, then Apply to materialise everything
+                in IPAM in one transaction.
               </div>
             )}
             <TreeNodeRow
@@ -306,8 +310,8 @@ export function SubnetPlannerEditorPage() {
             {!applied && tree.children.length === 0 && (
               <p className="mt-3 pl-8 text-[11px] text-muted-foreground">
                 Tip: pick the kind explicitly per node — blocks can hold more
-                blocks or subnets, subnets are leaves. The root must be a
-                block (subnets need a block parent).
+                blocks or subnets, subnets are leaves. The root must be a block
+                (subnets need a block parent).
               </p>
             )}
           </div>
@@ -390,8 +394,8 @@ function ApplyConfirmModal({
           </div>
         </div>
         <p className="text-xs text-muted-foreground">
-          If anything fails (overlap, missing parent, drifted state) the
-          whole transaction rolls back and you'll see the conflicts here.
+          If anything fails (overlap, missing parent, drifted state) the whole
+          transaction rolls back and you'll see the conflicts here.
         </p>
         <div className="flex justify-end gap-2 pt-2">
           <button
@@ -657,13 +661,11 @@ function PropertiesPanel({
             Root must be a block — subnets need a block parent.
           </p>
         )}
-        {!isRoot &&
-          node.kind === "block" &&
-          node.children.length > 0 && (
-            <p className="mt-1 text-[11px] text-muted-foreground">
-              Has children — delete or move them before converting to subnet.
-            </p>
-          )}
+        {!isRoot && node.kind === "block" && node.children.length > 0 && (
+          <p className="mt-1 text-[11px] text-muted-foreground">
+            Has children — delete or move them before converting to subnet.
+          </p>
+        )}
       </Field>
 
       <Field label="CIDR">
@@ -706,9 +708,7 @@ function PropertiesPanel({
         <Field label="DNS server group">
           <select
             value={node.dns_group_id ?? ""}
-            onChange={(e) =>
-              onChange({ dns_group_id: e.target.value || null })
-            }
+            onChange={(e) => onChange({ dns_group_id: e.target.value || null })}
             disabled={readOnly}
             className="w-full rounded border bg-background px-2 py-1 text-sm disabled:opacity-50"
           >
@@ -834,15 +834,26 @@ function findNode(root: PlanNode, id: string): PlanNode | null {
   return null;
 }
 
-function isDescendant(root: PlanNode, ancestorId: string, candidateId: string): boolean {
+function isDescendant(
+  root: PlanNode,
+  ancestorId: string,
+  candidateId: string,
+): boolean {
   const ancestor = findNode(root, ancestorId);
   if (!ancestor) return false;
   return findNode(ancestor, candidateId) !== null;
 }
 
-function mutateNode(root: PlanNode, id: string, patch: Partial<PlanNode>): PlanNode {
+function mutateNode(
+  root: PlanNode,
+  id: string,
+  patch: Partial<PlanNode>,
+): PlanNode {
   if (root.id === id) return { ...root, ...patch };
-  return { ...root, children: root.children.map((c) => mutateNode(c, id, patch)) };
+  return {
+    ...root,
+    children: root.children.map((c) => mutateNode(c, id, patch)),
+  };
 }
 
 function deleteNode(root: PlanNode, id: string): PlanNode | null {
@@ -855,7 +866,11 @@ function deleteNode(root: PlanNode, id: string): PlanNode | null {
   };
 }
 
-function reparentNode(root: PlanNode, dragId: string, dropId: string): PlanNode | null {
+function reparentNode(
+  root: PlanNode,
+  dragId: string,
+  dropId: string,
+): PlanNode | null {
   const dragged = findNode(root, dragId);
   if (!dragged) return null;
   // Detach

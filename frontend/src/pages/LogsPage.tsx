@@ -1044,6 +1044,22 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
     retry: false,
   });
 
+  // Analytics rollups — keyed off (server_id, since) only so per-keystroke
+  // filter changes (qtype / client_ip / q) don't refetch the entire summary.
+  const analyticsQuery = useQuery({
+    queryKey: ["logs-dns-queries-analytics", serverId, sinceIso],
+    queryFn: () =>
+      logsApi.dnsQueryAnalytics({
+        server_id: serverId!,
+        since: sinceIso,
+        limit: 10,
+      }),
+    enabled,
+    staleTime: 30_000,
+    gcTime: 60_000,
+    retry: false,
+  });
+
   const events = dnsQueriesQuery.data?.events ?? [];
   const selected = useMemo(
     () => sources.find((s) => s.server_id === serverId),
@@ -1110,6 +1126,17 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
         </div>
       </div>
 
+      {/* On-demand analytics rollups over the same time window — top
+          qnames / clients + qtype distribution. Click a row to seed the
+          filter bar above and narrow the events grid. */}
+      <DNSQueryAnalyticsStrip
+        analytics={analyticsQuery.data ?? null}
+        loading={analyticsQuery.isFetching}
+        onPickQname={(name) => setQ(name)}
+        onPickClient={(ip) => setClientIp(ip)}
+        onPickQtype={(t) => setQtype(t)}
+      />
+
       {dnsQueriesQuery.isError && <QueryErrorBanner query={dnsQueriesQuery} />}
       {dnsQueriesQuery.isFetching && events.length === 0 && (
         <QueryingIndicator host={selected?.host} />
@@ -1143,6 +1170,110 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
         </div>
       )}
     </>
+  );
+}
+
+function DNSQueryAnalyticsStrip({
+  analytics,
+  loading,
+  onPickQname,
+  onPickClient,
+  onPickQtype,
+}: {
+  analytics: import("@/lib/api").DNSQueryAnalyticsResponse | null;
+  loading: boolean;
+  onPickQname: (name: string) => void;
+  onPickClient: (ip: string) => void;
+  onPickQtype: (t: string) => void;
+}) {
+  if (!analytics && !loading) return null;
+  const total = analytics?.total_queries ?? 0;
+
+  return (
+    <div className="border-b bg-muted/10 px-6 py-2">
+      <div className="mb-1 flex items-center gap-2 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+        <span>Analytics</span>
+        <span className="text-muted-foreground/70">
+          {loading
+            ? "computing…"
+            : `${total.toLocaleString()} queries in window`}
+        </span>
+      </div>
+      <div className="grid grid-cols-1 gap-3 md:grid-cols-3">
+        <AnalyticsCard
+          title="Top names"
+          rows={analytics?.top_qnames ?? []}
+          total={total}
+          onPick={onPickQname}
+          emptyHint="No queries in window."
+        />
+        <AnalyticsCard
+          title="Top clients"
+          rows={analytics?.top_clients ?? []}
+          total={total}
+          onPick={onPickClient}
+          emptyHint="No clients in window."
+        />
+        <AnalyticsCard
+          title="QType breakdown"
+          rows={analytics?.qtype_distribution ?? []}
+          total={total}
+          onPick={onPickQtype}
+          emptyHint="No qtype data."
+        />
+      </div>
+    </div>
+  );
+}
+
+function AnalyticsCard({
+  title,
+  rows,
+  total,
+  onPick,
+  emptyHint,
+}: {
+  title: string;
+  rows: import("@/lib/api").DNSQueryAnalyticsRow[];
+  total: number;
+  onPick: (key: string) => void;
+  emptyHint: string;
+}) {
+  return (
+    <div className="rounded border bg-card p-2">
+      <div className="mb-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+        {title}
+      </div>
+      {rows.length === 0 ? (
+        <p className="px-1 py-1 text-[11px] italic text-muted-foreground">
+          {emptyHint}
+        </p>
+      ) : (
+        <ul className="space-y-0.5 text-[11px]">
+          {rows.map((r) => {
+            const pct = total > 0 ? (100 * r.count) / total : 0;
+            return (
+              <li key={r.key}>
+                <button
+                  type="button"
+                  onClick={() => onPick(r.key)}
+                  className="group flex w-full items-center gap-2 rounded px-1 py-0.5 text-left hover:bg-muted/40"
+                  title={`Filter the events grid below by "${r.key}"`}
+                >
+                  <span className="flex-1 truncate font-mono">{r.key}</span>
+                  <span className="tabular-nums text-muted-foreground">
+                    {r.count}
+                  </span>
+                  <span className="w-12 text-right tabular-nums text-muted-foreground/70">
+                    {pct.toFixed(1)}%
+                  </span>
+                </button>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </div>
   );
 }
 

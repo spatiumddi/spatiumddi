@@ -77,8 +77,8 @@ export function BlocklistCatalogModal({ onClose }: { onClose: () => void }) {
           Public DNS blocklist sources curated from AdGuard's HostlistsRegistry,
           Pi-hole defaults, and Hagezi / OISD. Subscribing creates a
           ``url``-sourced blocklist with the entry's URL prefilled — the
-          existing refresh pipeline parses + ingests entries on the
-          configured cadence.
+          existing refresh pipeline parses + ingests entries on the configured
+          cadence.
         </p>
 
         <div className="flex flex-wrap items-center gap-2">
@@ -123,7 +123,9 @@ export function BlocklistCatalogModal({ onClose }: { onClose: () => void }) {
             />
           ))}
           {filtered.length === 0 && (
-            <p className="text-xs text-muted-foreground">No matching sources.</p>
+            <p className="text-xs text-muted-foreground">
+              No matching sources.
+            </p>
           )}
         </div>
 

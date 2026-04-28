@@ -9,7 +9,12 @@ type ParsedCidr = {
 };
 
 type CalcResult =
-  | { ok: true; family: 4 | 6; rows: { label: string; value: string; mono?: boolean }[]; binary?: string[] }
+  | {
+      ok: true;
+      family: 4 | 6;
+      rows: { label: string; value: string; mono?: boolean }[];
+      binary?: string[];
+    }
   | { ok: false; error: string };
 
 const V4_BITS = 32;
@@ -154,7 +159,8 @@ function compute(input: string): CalcResult {
   const bits = family === 4 ? V4_BITS : V6_BITS;
   const hostBits = bits - prefix;
   const fullMask = (1n << BigInt(bits)) - 1n;
-  const networkMask = hostBits === bits ? 0n : (fullMask >> BigInt(hostBits)) << BigInt(hostBits);
+  const networkMask =
+    hostBits === bits ? 0n : (fullMask >> BigInt(hostBits)) << BigInt(hostBits);
   const wildcard = fullMask ^ networkMask;
   const network = address & networkMask;
   const broadcast = network | wildcard;
@@ -166,13 +172,15 @@ function compute(input: string): CalcResult {
   if (family === 4) {
     const usable =
       hostBits >= 2 ? totalAddresses - 2n : hostBits === 1 ? 2n : 1n;
-    const firstUsable =
-      hostBits >= 2 ? network + 1n : network;
-    const lastUsable =
-      hostBits >= 2 ? broadcast - 1n : broadcast;
+    const firstUsable = hostBits >= 2 ? network + 1n : network;
+    const lastUsable = hostBits >= 2 ? broadcast - 1n : broadcast;
 
     rows.push(
-      { label: "Network", value: `${formatIPv4(network)}/${prefix}`, mono: true },
+      {
+        label: "Network",
+        value: `${formatIPv4(network)}/${prefix}`,
+        mono: true,
+      },
       { label: "Netmask", value: formatIPv4(networkMask), mono: true },
       { label: "Wildcard", value: formatIPv4(wildcard), mono: true },
       { label: "Broadcast", value: formatIPv4(broadcast), mono: true },
@@ -181,7 +189,11 @@ function compute(input: string): CalcResult {
       { label: "Total addresses", value: totalAddresses.toLocaleString() },
       { label: "Usable hosts", value: usable.toLocaleString() },
       { label: "Decimal", value: network.toString(), mono: true },
-      { label: "Hex", value: `0x${network.toString(16).toUpperCase()}`, mono: true },
+      {
+        label: "Hex",
+        value: `0x${network.toString(16).toUpperCase()}`,
+        mono: true,
+      },
     );
     binary = [
       `Address  : ${ipv4ToBinary(address)}`,
@@ -193,14 +205,30 @@ function compute(input: string): CalcResult {
     const firstUsable = network;
     const lastUsable = broadcast;
     rows.push(
-      { label: "Network", value: `${compressIPv6(network)}/${prefix}`, mono: true },
-      { label: "Network (expanded)", value: formatIPv6Full(network), mono: true },
+      {
+        label: "Network",
+        value: `${compressIPv6(network)}/${prefix}`,
+        mono: true,
+      },
+      {
+        label: "Network (expanded)",
+        value: formatIPv6Full(network),
+        mono: true,
+      },
       { label: "Last address", value: compressIPv6(broadcast), mono: true },
-      { label: "Last (expanded)", value: formatIPv6Full(broadcast), mono: true },
+      {
+        label: "Last (expanded)",
+        value: formatIPv6Full(broadcast),
+        mono: true,
+      },
       { label: "First usable", value: compressIPv6(firstUsable), mono: true },
       { label: "Last usable", value: compressIPv6(lastUsable), mono: true },
       { label: "Total addresses", value: totalAddresses.toString() },
-      { label: "Hex", value: `0x${network.toString(16).toUpperCase()}`, mono: true },
+      {
+        label: "Hex",
+        value: `0x${network.toString(16).toUpperCase()}`,
+        mono: true,
+      },
     );
   }
 

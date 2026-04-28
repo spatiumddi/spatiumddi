@@ -36,6 +36,9 @@ export function newNodeId(): string {
   }
   // Last-resort fallback. Not cryptographically random but fine as a tree key.
   return (
-    "n-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 10)
+    "n-" +
+    Date.now().toString(36) +
+    "-" +
+    Math.random().toString(36).slice(2, 10)
   );
 }

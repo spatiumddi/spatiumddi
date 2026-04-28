@@ -235,8 +235,7 @@ async def _validate_tree(
                     network=n.network,
                     kind="invalid_kind",
                     message=(
-                        f"Subnet {n.network} cannot have children — "
-                        "convert it to a block first"
+                        f"Subnet {n.network} cannot have children — " "convert it to a block first"
                     ),
                 )
             )

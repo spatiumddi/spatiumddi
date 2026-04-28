@@ -1,0 +1,225 @@
+{
+  "version": "1",
+  "templates": [
+    {
+      "id": "mail-basic",
+      "name": "Email zone",
+      "category": "Mail",
+      "description": "Apex MX + SPF + DMARC stub. Optional DKIM selector record. Designed as a starter for a single-mailserver setup; tune values after creation.",
+      "parameters": [
+        {
+          "key": "mx_host",
+          "label": "Mail server hostname",
+          "type": "string",
+          "required": true,
+          "placeholder": "mail.example.com.",
+          "hint": "FQDN of the MX target. Trailing dot recommended; otherwise it's relative to this zone."
+        },
+        {
+          "key": "spf_includes",
+          "label": "SPF additional includes",
+          "type": "string",
+          "required": false,
+          "placeholder": "include:_spf.google.com",
+          "hint": "Space-separated SPF mechanisms appended after `mx`. Leave blank for `v=spf1 mx -all`."
+        },
+        {
+          "key": "dmarc_email",
+          "label": "DMARC reporting email",
+          "type": "string",
+          "required": false,
+          "placeholder": "postmaster@example.com",
+          "hint": "Mailbox that receives aggregate DMARC reports (rua=)."
+        },
+        {
+          "key": "dkim_selector",
+          "label": "DKIM selector (optional)",
+          "type": "string",
+          "required": false,
+          "placeholder": "default",
+          "hint": "Leave blank to skip the DKIM record. The value is a placeholder — paste the real key after your mail server generates it."
+        }
+      ],
+      "records": [
+        {
+          "name": "@",
+          "record_type": "MX",
+          "value": "{{mx_host}}",
+          "priority": 10,
+          "ttl": 3600
+        },
+        {
+          "name": "@",
+          "record_type": "TXT",
+          "value": "v=spf1 mx {{spf_includes}} -all",
+          "ttl": 3600
+        },
+        {
+          "name": "_dmarc",
+          "record_type": "TXT",
+          "value": "v=DMARC1; p=quarantine; rua=mailto:{{dmarc_email}}",
+          "ttl": 3600,
+          "skip_if_empty": ["dmarc_email"]
+        },
+        {
+          "name": "{{dkim_selector}}._domainkey",
+          "record_type": "TXT",
+          "value": "v=DKIM1; k=rsa; p=REPLACE_WITH_PUBLIC_KEY",
+          "ttl": 3600,
+          "skip_if_empty": ["dkim_selector"]
+        }
+      ]
+    },
+    {
+      "id": "active-directory",
+      "name": "Active Directory zone",
+      "category": "Directory",
+      "description": "SRV records expected by domain-joined clients: LDAP, Kerberos, Global Catalog, GC-SRV. Targets the DC hostname you pass in.",
+      "parameters": [
+        {
+          "key": "dc_hostname",
+          "label": "Domain controller hostname",
+          "type": "string",
+          "required": true,
+          "placeholder": "dc01.corp.example.com.",
+          "hint": "FQDN of the DC. Add additional DCs as extra SRV records after creation."
+        },
+        {
+          "key": "site_name",
+          "label": "AD site name (optional)",
+          "type": "string",
+          "required": false,
+          "default": "Default-First-Site-Name",
+          "hint": "Adds site-aware SRV records under `_sites.<name>`. Leave blank to skip."
+        }
+      ],
+      "records": [
+        {
+          "name": "_ldap._tcp",
+          "record_type": "SRV",
+          "value": "{{dc_hostname}}",
+          "priority": 0,
+          "weight": 100,
+          "port": 389,
+          "ttl": 600
+        },
+        {
+          "name": "_kerberos._tcp",
+          "record_type": "SRV",
+          "value": "{{dc_hostname}}",
+          "priority": 0,
+          "weight": 100,
+          "port": 88,
+          "ttl": 600
+        },
+        {
+          "name": "_kpasswd._tcp",
+          "record_type": "SRV",
+          "value": "{{dc_hostname}}",
+          "priority": 0,
+          "weight": 100,
+          "port": 464,
+          "ttl": 600
+        },
+        {
+          "name": "_gc._tcp",
+          "record_type": "SRV",
+          "value": "{{dc_hostname}}",
+          "priority": 0,
+          "weight": 100,
+          "port": 3268,
+          "ttl": 600
+        },
+        {
+          "name": "_ldap._tcp.dc._msdcs",
+          "record_type": "SRV",
+          "value": "{{dc_hostname}}",
+          "priority": 0,
+          "weight": 100,
+          "port": 389,
+          "ttl": 600
+        },
+        {
+          "name": "_kerberos._tcp.dc._msdcs",
+          "record_type": "SRV",
+          "value": "{{dc_hostname}}",
+          "priority": 0,
+          "weight": 100,
+          "port": 88,
+          "ttl": 600
+        },
+        {
+          "name": "_ldap._tcp.{{site_name}}._sites",
+          "record_type": "SRV",
+          "value": "{{dc_hostname}}",
+          "priority": 0,
+          "weight": 100,
+          "port": 389,
+          "ttl": 600,
+          "skip_if_empty": ["site_name"]
+        },
+        {
+          "name": "_kerberos._tcp.{{site_name}}._sites",
+          "record_type": "SRV",
+          "value": "{{dc_hostname}}",
+          "priority": 0,
+          "weight": 100,
+          "port": 88,
+          "ttl": 600,
+          "skip_if_empty": ["site_name"]
+        }
+      ]
+    },
+    {
+      "id": "web-basic",
+      "name": "Web zone (apex + www)",
+      "category": "Web",
+      "description": "Apex A record pointing at your origin host plus a `www` CNAME aliasing it. Use this for a single-host website starter.",
+      "parameters": [
+        {
+          "key": "origin_ip",
+          "label": "Origin IPv4 address",
+          "type": "string",
+          "required": true,
+          "placeholder": "203.0.113.10"
+        },
+        {
+          "key": "origin_ipv6",
+          "label": "Origin IPv6 address (optional)",
+          "type": "string",
+          "required": false,
+          "placeholder": "2001:db8::10"
+        }
+      ],
+      "records": [
+        {
+          "name": "@",
+          "record_type": "A",
+          "value": "{{origin_ip}}",
+          "ttl": 300
+        },
+        {
+          "name": "@",
+          "record_type": "AAAA",
+          "value": "{{origin_ipv6}}",
+          "ttl": 300,
+          "skip_if_empty": ["origin_ipv6"]
+        },
+        {
+          "name": "www",
+          "record_type": "CNAME",
+          "value": "{{__zone__}}",
+          "ttl": 300
+        }
+      ]
+    },
+    {
+      "id": "k8s-external-dns",
+      "name": "Kubernetes external-dns target",
+      "category": "Kubernetes",
+      "description": "Empty zone with no preset records. Pair with external-dns running in your cluster; it will create A / CNAME / TXT records here as Ingress and LoadBalancer services come and go.",
+      "parameters": [],
+      "records": []
+    }
+  ]
+}

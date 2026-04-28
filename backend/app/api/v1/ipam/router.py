@@ -4,7 +4,7 @@ import ipaddress
 import re
 import uuid
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, cast
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, status
@@ -2561,7 +2561,14 @@ async def plan_block_allocation(
             continue
         candidates.sort(key=lambda n: int(n.network_address))
         chosen = candidates[0]
-        carved = next(chosen.subnets(new_prefix=prefix_len))
+        # `subnets()` on the IPv4Network|IPv6Network union widens to ``object``
+        # under mypy because the generator's element type can't be narrowed
+        # without a runtime check; the carved network is always the same
+        # family as ``chosen``, so a cast is safe.
+        carved = cast(
+            ipaddress.IPv4Network | ipaddress.IPv6Network,
+            next(chosen.subnets(new_prefix=prefix_len)),
+        )
         allocated.append((submission_idx, carved))
         working.remove(chosen)
         if chosen != carved:
@@ -2648,7 +2655,7 @@ async def get_aggregation_suggestions(
     networks = [n for _, n in parsed]
 
     try:
-        collapsed = list(ipaddress.collapse_addresses(networks))  # type: ignore[arg-type]
+        collapsed = list(ipaddress.collapse_addresses(networks))  # type: ignore[type-var]
     except TypeError:
         # Mixed v4/v6 inside one block — collapse_addresses refuses; nothing
         # meaningful to suggest in that case.

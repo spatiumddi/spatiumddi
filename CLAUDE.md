@@ -1366,10 +1366,29 @@ None of these have started; everything below is ⬜.
   (Fernet-encrypted) and rollover state. Massive compliance ask
   in regulated verticals; table-stakes for any "enterprise DDI"
   comparison.
-- ⬜ **TSIG key management UI** — list / rotate / revoke TSIG
-  keys used for RFC 2136 dynamic updates and AXFR auth. Today
-  they're agent-side files only; no central inventory or
-  rotation flow.
+- ✅ **TSIG key management UI** — `DNSTSIGKey` model with
+  Fernet-encrypted `secret_encrypted`, `algorithm` enum
+  (hmac-sha1/224/256/384/512), `name`, `purpose`, `notes`, and
+  `last_rotated_at`. CRUD lives at
+  `/api/v1/dns/groups/{gid}/tsig-keys` with a side `/generate-secret`
+  helper that returns a fresh random base64 secret of the right
+  size for the chosen algorithm, and a `/{kid}/rotate` endpoint
+  that re-randomises the secret. Plaintext is returned **once** on
+  the create / rotate response — list / get never expose it.
+  Operator-managed rows distribute to every BIND9 agent in the
+  group via the existing `tsig_keys` block in the ConfigBundle
+  (alongside the legacy auto-generated agent loopback key);
+  named.conf renders one `key { algorithm …; secret …; };`
+  stanza per row. UI: new "TSIG Keys" tab on the DNS server
+  group view, with create / edit / rotate / delete plus a
+  one-shot "Copy this secret now" modal after each
+  create / rotate. Operators reference keys from a zone's
+  allow-update / allow-transfer fields as `key keyname.;`.
+  Migration `7c299e8a5490_dns_tsig_keys`.
+  **Deferred:** zone-level dropdown picker that suggests
+  available keys (today operators paste the key reference into
+  the existing free-text allow-update / allow-transfer fields);
+  per-key audit-log of which zones reference it.
 - ✅ **Conditional forwarders** — per-zone forwarding for mixed-AD
   environments. `DNSZone` carries `forwarders` (JSONB list of IPs)
   + `forward_only` (true → `forward only;`, false → `forward
@@ -1382,12 +1401,30 @@ None of these have started; everything below is ⬜.
   `a07f6c12e5d3_dns_zone_forwarders`. **Deferred:** Windows DNS
   via `Add-DnsServerConditionalForwarderZone` (the field
   shape is identical; just needs the WinRM dispatch).
-- ⬜ **BIND9 catalog zones (RFC 9432)** — distribute zone
-  definitions across multiple BIND9 servers in a group via a
-  single catalog zone rather than per-server config push.
-  BIND 9.18+ supports this natively. Cuts the agent's per-server
-  zone-add / zone-delete bookkeeping; massive operational win
-  for >2 BIND server groups.
+- ✅ **BIND9 catalog zones (RFC 9432)** — opt-in per group via
+  `DNSServerGroup.catalog_zones_enabled` + `catalog_zone_name`
+  (defaults to `catalog.spatium.invalid.`). The producer is the
+  group's `is_primary=True` bind9 server; every other bind9
+  member joins as a consumer. Bundle assembly emits a `catalog`
+  block per server: `mode=producer` ships the member zone list,
+  `mode=consumer` ships the producer's IP. The agent renders
+  the catalog zone file per RFC 9432 §4.1 — SOA + NS at apex,
+  `version IN TXT "2"`, and one `<sha1-of-wire-name>.zones IN
+  PTR <member>` per primary zone — and on consumers injects a
+  single `catalog-zones { zone "<catalog>." default-masters {
+  <producer-ip>; } in-memory yes; };` directive into the
+  options block. The catalog block is part of the structural
+  ETag so membership changes trigger a daemon reload, and SHA-1
+  hashing uses the proper wire format (length-prefixed labels +
+  null terminator) so consumer BINDs find the same labels.
+  Frontend toggle lives in the server-group create / edit
+  modal alongside the recursion checkbox. Migration
+  `d8e4a73f12c5_dns_catalog_zones`. **Deferred:** version-skew
+  guard (refuse the toggle on groups with a server <9.18);
+  visualising consumer pull state (today operators rely on
+  the existing per-server zone-serial drift pill);
+  per-member properties (epoch, change-of-ownership) — most
+  homelab / SMB groups won't need them.
 - ✅ **Response Policy Zones (RPZ)** — DNS-level malware / phishing
   / ad blocking via BIND9 `response-policy { zone … };`. Full
   `DNSBlockList` + `DNSBlockListEntry` + `DNSBlockListException`
@@ -1428,21 +1465,61 @@ None of these have started; everything below is ⬜.
   (`tls`) and DNS-over-HTTPS (`https`) natively. Driver renders
   the listener config; cert lifecycle ties into the ACME
   embedded-client item already on the roadmap.
-- ⬜ **DNS query analytics aggregation** — today the BIND9 query
-  log surfaces individual lines via the Logs page. Missing:
-  aggregation (top qnames, top clients, qtype distribution,
-  NXDOMAIN ratio) rolled into the dashboard. Storage:
-  per-bucket counters on a `dns_query_aggregate` table fed by
-  the same agent ship pipeline.
-- ⬜ **Zone delegation wizard** — when creating a sub-zone of an
-  existing zone, auto-create the parent's NS records + glue and
-  propagate. Today operators have to remember to do this
-  manually and zones often end up un-delegated.
-- ⬜ **DNS template wizards** — pre-canned zone templates:
-  "AD-integrated forward zone with all required SRV records";
-  "email zone with MX + SPF + DKIM + DMARC starter records";
-  "kubernetes external-dns target zone". One-click materialise
-  → operator edits / removes records as needed.
+- ✅ **DNS query analytics aggregation** — `POST
+  /api/v1/logs/dns-queries/analytics` returns top-10 qnames +
+  top-10 clients + complete qtype distribution in a single
+  round trip. Computed on-demand via `GROUP BY` against the
+  existing `dns_query_log_entry` rows (24 h retention) — no
+  new schema, no new beat task. The Logs → DNS Queries tab
+  renders an Analytics strip above the raw event grid: three
+  cards each showing key + count + percentage of total, with
+  every row clickable to seed the corresponding filter
+  (qname / client_ip / qtype). The strip refetches only when
+  `(server_id, since)` changes, so per-keystroke filter edits
+  on the events grid don't pay for a re-aggregation.
+  Deliberately mirrors the query log's retention window —
+  longer history belongs in Loki, not Postgres. **Deferred:**
+  rcode breakdown (BIND9's `query` log channel doesn't emit
+  rcode; would need a parallel `client error` channel + parser);
+  pre-aggregated `dns_query_aggregate` table with longer
+  retention (only worth it if the on-demand `GROUP BY` becomes
+  slow, which it won't for typical 24h windows).
+- ✅ **Zone delegation wizard** — `services/dns/delegation.py` finds
+  the longest-suffix-matching parent zone in the same group
+  (forward zones excluded), reads the child's apex NS records,
+  and computes the NS records the parent needs to delegate the
+  child plus glue (A / AAAA) for any in-bailiwick NS hostnames.
+  Diffs against existing parent records so a second run is a
+  no-op, surfaces warnings ("ns1 is in-bailiwick but has no
+  A/AAAA in child"), and applies through the normal
+  `enqueue_record_op` pipeline so the parent zone's serial bumps
+  once and the agent / Windows-driver push fires uniformly.
+  Endpoints: `GET /dns/groups/{gid}/zones/{zid}/delegation-preview`
+  + `POST /dns/groups/{gid}/zones/{zid}/delegate-from-parent`.
+  Frontend: a contextual "Delegate" button appears in the zone
+  header only when an eligible parent has missing records;
+  `DelegationModal` shows the exact records that would land in
+  the parent before commit, with skipped/already-present rows
+  in a separate section.
+- ✅ **DNS template wizards** — static catalog at
+  `backend/app/data/dns_zone_templates.json` with four starter
+  shapes (Email zone with MX + SPF + DMARC + optional DKIM
+  selector, Active Directory zone with the standard LDAP /
+  Kerberos / GC SRV records + optional `_sites` entries, Web
+  zone with apex A + optional AAAA + `www CNAME`, Kubernetes
+  external-dns target — empty zone). `services/dns/zone_templates.py`
+  loads the catalog once per process, validates required
+  parameters, and substitutes `{{key}}` placeholders (plus a
+  built-in `{{__zone__}}`) at materialise time; records can
+  declare `skip_if_empty: ["param"]` so optional fields drop
+  out cleanly. Endpoints: `GET /dns/zone-templates` +
+  `POST /dns/groups/{gid}/zones/from-template`. Frontend
+  `ZoneTemplateModal` with a left-column category-grouped
+  template list and a right-column parameter form; submitting
+  creates the zone + every materialised record in one
+  transaction and navigates straight into the zone detail.
+  Mounted as a "From Template" button on the ZonesTab header,
+  alongside "Add Zone".
 - ✅ **Multi-resolver propagation check** — `POST
   /dns/tools/propagation-check` fires the same query against
   Cloudflare / Google / Quad9 / OpenDNS in parallel using

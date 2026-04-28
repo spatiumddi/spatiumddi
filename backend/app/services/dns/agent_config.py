@@ -19,6 +19,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from app.core.crypto import decrypt_str
 from app.models.dns import (
     DNSAcl,
     DNSRecord,
@@ -26,6 +27,7 @@ from app.models.dns import (
     DNSServer,
     DNSServerGroup,
     DNSServerOptions,
+    DNSTSIGKey,
     DNSView,
     DNSZone,
 )
@@ -162,6 +164,25 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
             }
         )
 
+    # Operator-managed named TSIG keys (DNSTSIGKey rows). These are for
+    # external nsupdate clients / AXFR auth — distinct from the legacy
+    # auto-generated single key on DNSServerGroup. Both kinds end up in
+    # the same `key { … };` block via the named.conf template.
+    op_keys = (
+        (await db.execute(select(DNSTSIGKey).where(DNSTSIGKey.group_id == server.group_id)))
+        .scalars()
+        .all()
+    )
+    for k in op_keys:
+        try:
+            secret = decrypt_str(k.secret_encrypted)
+        except ValueError:
+            # Decryption failure (e.g. key rotated since this row was written).
+            # Skip rather than write a broken key block — agent reload would
+            # otherwise fail. Operator visibility is via the audit log.
+            continue
+        tsig_keys.append({"name": k.name, "secret": secret, "algorithm": k.algorithm})
+
     options_block = {
         "forwarders": getattr(opts, "forwarders", []) if opts else [],
         "forward_policy": getattr(opts, "forward_policy", "first") if opts else "first",
@@ -190,6 +211,40 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
             }
             for e in eff_entries
         ]
+
+    # ── BIND9 catalog zones (RFC 9432) ──
+    # When the group has the feature toggled on, build a producer or
+    # consumer block depending on whether this server is the primary
+    # (is_primary=True). Non-bind9 servers always get None.
+    catalog_block: dict[str, Any] | None = None
+    if grp and grp.catalog_zones_enabled and server.driver == "bind9":
+        producer = (
+            await db.execute(
+                select(DNSServer).where(
+                    DNSServer.group_id == server.group_id,
+                    DNSServer.driver == "bind9",
+                    DNSServer.is_primary.is_(True),
+                )
+            )
+        ).scalar_one_or_none()
+
+        if producer is not None:
+            # Members are every primary zone in the group. Forward / stub
+            # zones don't belong in a catalog (they're lookups, not
+            # served data); secondaries are the consumer's responsibility.
+            member_names = sorted(z.name for z in zones if z.zone_type in ("primary", "master"))
+            if server.id == producer.id:
+                catalog_block = {
+                    "mode": "producer",
+                    "zone_name": grp.catalog_zone_name,
+                    "members": [{"zone_name": n} for n in member_names],
+                }
+            else:
+                catalog_block = {
+                    "mode": "consumer",
+                    "zone_name": grp.catalog_zone_name,
+                    "producer_addr": producer.host,
+                }
 
     blocklists_payload: list[dict[str, Any]] = []
     if views:
@@ -224,6 +279,7 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
         "forwarders": options_block["forwarders"],
         "blocklists": blocklists_payload,
         "pending_record_ops": pending_ops,
+        "catalog": catalog_block,
     }
 
     # Structural fingerprint excludes records and pending ops so record-only
@@ -239,6 +295,9 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
         # Blocklists affect named.conf (response-policy block) + RPZ zone
         # files, so a change MUST trigger a daemon reload.
         "blocklists": blocklists_payload,
+        # Catalog membership / mode changes also rewrite named.conf and
+        # the catalog zone file, so they belong in the structural set.
+        "catalog": catalog_block,
     }
     structural_etag = _compute_etag(structural)
     bundle_body["structural_etag"] = structural_etag

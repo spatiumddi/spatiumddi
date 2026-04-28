@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import re
 import uuid
 import zipfile
 from datetime import UTC, datetime
@@ -16,7 +17,7 @@ from sqlalchemy import func, select
 from sqlalchemy.orm import selectinload
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
-from app.core.crypto import decrypt_dict, encrypt_dict
+from app.core.crypto import decrypt_dict, encrypt_dict, encrypt_str
 from app.core.permissions import require_any_resource_permission
 from app.drivers.dns import _DRIVERS as _DNS_DRIVERS
 from app.drivers.dns import is_agentless
@@ -30,11 +31,23 @@ from app.models.dns import (
     DNSServerGroup,
     DNSServerOptions,
     DNSTrustAnchor,
+    DNSTSIGKey,
     DNSView,
     DNSZone,
 )
+from app.services.dns.delegation import (
+    compute_delegation,
+    find_parent_zone,
+    preview_to_dict,
+)
 from app.services.dns.record_ops import enqueue_record_op, enqueue_record_ops_batch
 from app.services.dns.serial import bump_zone_serial
+from app.services.dns.zone_templates import (
+    get_template,
+    list_templates,
+    materialize,
+    validate_params,
+)
 from app.services.dns_io import (
     RecordChange,
     ZoneParseError,
@@ -93,6 +106,10 @@ class ServerGroupCreate(BaseModel):
     group_type: str = "internal"
     default_view: str | None = None
     is_recursive: bool = True
+    # BIND9 catalog zones (RFC 9432). Off by default — only meaningful in
+    # ≥2-server BIND9 groups.
+    catalog_zones_enabled: bool = False
+    catalog_zone_name: str = "catalog.spatium.invalid."
 
     @field_validator("group_type")
     @classmethod
@@ -108,6 +125,8 @@ class ServerGroupUpdate(BaseModel):
     group_type: str | None = None
     default_view: str | None = None
     is_recursive: bool | None = None
+    catalog_zones_enabled: bool | None = None
+    catalog_zone_name: str | None = None
 
     @field_validator("group_type")
     @classmethod
@@ -124,6 +143,8 @@ class ServerGroupResponse(BaseModel):
     group_type: str
     default_view: str | None
     is_recursive: bool
+    catalog_zones_enabled: bool
+    catalog_zone_name: str
     created_at: datetime
     modified_at: datetime
 
@@ -1814,6 +1835,297 @@ async def delete_acl(
     await db.commit()
 
 
+# ── TSIG key endpoints ──────────────────────────────────────────────────────
+
+
+_TSIG_ALGO_LENGTHS = {
+    "hmac-sha1": 20,
+    "hmac-sha224": 28,
+    "hmac-sha256": 32,
+    "hmac-sha384": 48,
+    "hmac-sha512": 64,
+}
+_TSIG_NAME_RE = re.compile(r"^[a-z0-9]([a-z0-9.\-]*[a-z0-9])?\.?$")
+
+
+def _generate_tsig_secret(algorithm: str) -> str:
+    import base64
+    import secrets
+
+    nbytes = _TSIG_ALGO_LENGTHS.get(algorithm.lower(), 32)
+    return base64.b64encode(secrets.token_bytes(nbytes)).decode("ascii")
+
+
+class TSIGKeyCreate(BaseModel):
+    name: str
+    algorithm: str = "hmac-sha256"
+    # Empty/missing secret → generate one server-side. Operator-supplied
+    # secrets must already be base64.
+    secret: str | None = None
+    purpose: str | None = None
+    notes: str = ""
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, v: str) -> str:
+        v = v.strip().lower()
+        if not _TSIG_NAME_RE.match(v):
+            raise ValueError(
+                "name must be a dotted-ASCII label (a-z, 0-9, '.', '-'); e.g. tsig-update.spatium.local."
+            )
+        return v
+
+    @field_validator("algorithm")
+    @classmethod
+    def validate_algo(cls, v: str) -> str:
+        v = v.strip().lower()
+        if v not in _TSIG_ALGO_LENGTHS:
+            raise ValueError(f"algorithm must be one of {sorted(_TSIG_ALGO_LENGTHS)}")
+        return v
+
+
+class TSIGKeyUpdate(BaseModel):
+    name: str | None = None
+    algorithm: str | None = None
+    purpose: str | None = None
+    notes: str | None = None
+
+    @field_validator("name")
+    @classmethod
+    def validate_name(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        v = v.strip().lower()
+        if not _TSIG_NAME_RE.match(v):
+            raise ValueError("name must be a dotted-ASCII label")
+        return v
+
+    @field_validator("algorithm")
+    @classmethod
+    def validate_algo(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        v = v.strip().lower()
+        if v not in _TSIG_ALGO_LENGTHS:
+            raise ValueError(f"algorithm must be one of {sorted(_TSIG_ALGO_LENGTHS)}")
+        return v
+
+
+class TSIGKeyResponse(BaseModel):
+    id: uuid.UUID
+    group_id: uuid.UUID
+    name: str
+    algorithm: str
+    purpose: str | None
+    notes: str
+    last_rotated_at: datetime | None
+    created_at: datetime
+    modified_at: datetime
+    # Plaintext secret. Populated *only* on the create / rotate responses.
+    # List + get endpoints return null so secrets never persist outside
+    # postgres in plaintext.
+    secret: str | None = None
+
+    model_config = {"from_attributes": True}
+
+
+class TSIGGenerateSecretResponse(BaseModel):
+    algorithm: str
+    secret: str
+
+
+@router.get(
+    "/groups/{group_id}/tsig-keys/generate-secret",
+    response_model=TSIGGenerateSecretResponse,
+)
+async def generate_tsig_secret(
+    group_id: uuid.UUID,
+    db: DB,
+    _: CurrentUser,
+    algorithm: str = "hmac-sha256",
+) -> TSIGGenerateSecretResponse:
+    """Return a freshly-generated random base64 secret of the right size.
+
+    Helper for the create-form pre-fill. No DB write — the operator can
+    discard or regenerate before submitting.
+    """
+    await _require_group(group_id, db)
+    algo = algorithm.strip().lower()
+    if algo not in _TSIG_ALGO_LENGTHS:
+        raise HTTPException(status_code=422, detail=f"unsupported algorithm: {algorithm}")
+    return TSIGGenerateSecretResponse(algorithm=algo, secret=_generate_tsig_secret(algo))
+
+
+@router.get("/groups/{group_id}/tsig-keys", response_model=list[TSIGKeyResponse])
+async def list_tsig_keys(group_id: uuid.UUID, db: DB, _: CurrentUser) -> list[TSIGKeyResponse]:
+    await _require_group(group_id, db)
+    res = await db.execute(
+        select(DNSTSIGKey).where(DNSTSIGKey.group_id == group_id).order_by(DNSTSIGKey.name)
+    )
+    keys = list(res.scalars().all())
+    return [TSIGKeyResponse.model_validate(k) for k in keys]
+
+
+@router.post(
+    "/groups/{group_id}/tsig-keys",
+    response_model=TSIGKeyResponse,
+    status_code=201,
+)
+async def create_tsig_key(
+    group_id: uuid.UUID,
+    body: TSIGKeyCreate,
+    db: DB,
+    current_user: SuperAdmin,
+) -> TSIGKeyResponse:
+    """Create a TSIG key. Secret is returned in the response *exactly once*."""
+    await _require_group(group_id, db)
+    existing = await db.execute(
+        select(DNSTSIGKey).where(DNSTSIGKey.group_id == group_id, DNSTSIGKey.name == body.name)
+    )
+    if existing.scalar_one_or_none():
+        raise HTTPException(
+            status_code=409, detail="A TSIG key with that name already exists in this group"
+        )
+
+    plaintext = body.secret.strip() if body.secret else _generate_tsig_secret(body.algorithm)
+    key = DNSTSIGKey(
+        group_id=group_id,
+        name=body.name,
+        algorithm=body.algorithm,
+        secret_encrypted=encrypt_str(plaintext),
+        purpose=body.purpose,
+        notes=body.notes,
+    )
+    db.add(key)
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="create",
+            resource_type="dns_tsig_key",
+            resource_id=str(key.id),
+            resource_display=f"{key.name} ({key.algorithm})",
+            result="success",
+        )
+    )
+    await db.commit()
+    await db.refresh(key)
+    out = TSIGKeyResponse.model_validate(key)
+    out.secret = plaintext
+    return out
+
+
+@router.get("/groups/{group_id}/tsig-keys/{key_id}", response_model=TSIGKeyResponse)
+async def get_tsig_key(
+    group_id: uuid.UUID, key_id: uuid.UUID, db: DB, _: CurrentUser
+) -> TSIGKeyResponse:
+    key = await db.get(DNSTSIGKey, key_id)
+    if key is None or key.group_id != group_id:
+        raise HTTPException(status_code=404, detail="TSIG key not found")
+    return TSIGKeyResponse.model_validate(key)
+
+
+@router.put("/groups/{group_id}/tsig-keys/{key_id}", response_model=TSIGKeyResponse)
+async def update_tsig_key(
+    group_id: uuid.UUID,
+    key_id: uuid.UUID,
+    body: TSIGKeyUpdate,
+    db: DB,
+    current_user: SuperAdmin,
+) -> TSIGKeyResponse:
+    """Update metadata (name / algorithm / purpose / notes). Does not rotate the
+    secret — use /rotate for that, since rotating returns the new secret in
+    the response body."""
+    key = await db.get(DNSTSIGKey, key_id)
+    if key is None or key.group_id != group_id:
+        raise HTTPException(status_code=404, detail="TSIG key not found")
+    changes = body.model_dump(exclude_unset=True)
+    if changes.get("name") and changes["name"] != key.name:
+        clash = await db.execute(
+            select(DNSTSIGKey).where(
+                DNSTSIGKey.group_id == group_id,
+                DNSTSIGKey.name == changes["name"],
+                DNSTSIGKey.id != key_id,
+            )
+        )
+        if clash.scalar_one_or_none():
+            raise HTTPException(status_code=409, detail="Name already in use")
+    for k, v in changes.items():
+        setattr(key, k, v)
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="update",
+            resource_type="dns_tsig_key",
+            resource_id=str(key.id),
+            resource_display=key.name,
+            changed_fields=list(changes.keys()),
+            result="success",
+        )
+    )
+    await db.commit()
+    await db.refresh(key)
+    return TSIGKeyResponse.model_validate(key)
+
+
+@router.post("/groups/{group_id}/tsig-keys/{key_id}/rotate", response_model=TSIGKeyResponse)
+async def rotate_tsig_key(
+    group_id: uuid.UUID, key_id: uuid.UUID, db: DB, current_user: SuperAdmin
+) -> TSIGKeyResponse:
+    """Generate a fresh secret of the same algorithm and replace the stored
+    one. Returns the new secret in the response body — show it to the
+    operator once and let them copy it into consuming clients."""
+    key = await db.get(DNSTSIGKey, key_id)
+    if key is None or key.group_id != group_id:
+        raise HTTPException(status_code=404, detail="TSIG key not found")
+    plaintext = _generate_tsig_secret(key.algorithm)
+    key.secret_encrypted = encrypt_str(plaintext)
+    key.last_rotated_at = datetime.now(UTC)
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="rotate",
+            resource_type="dns_tsig_key",
+            resource_id=str(key.id),
+            resource_display=key.name,
+            result="success",
+        )
+    )
+    await db.commit()
+    await db.refresh(key)
+    out = TSIGKeyResponse.model_validate(key)
+    out.secret = plaintext
+    return out
+
+
+@router.delete("/groups/{group_id}/tsig-keys/{key_id}", status_code=204)
+async def delete_tsig_key(
+    group_id: uuid.UUID, key_id: uuid.UUID, db: DB, current_user: SuperAdmin
+) -> None:
+    key = await db.get(DNSTSIGKey, key_id)
+    if key is None or key.group_id != group_id:
+        raise HTTPException(status_code=404, detail="TSIG key not found")
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="delete",
+            resource_type="dns_tsig_key",
+            resource_id=str(key.id),
+            resource_display=key.name,
+            result="success",
+        )
+    )
+    await db.delete(key)
+    await db.commit()
+
+
 # ── View endpoints ──────────────────────────────────────────────────────────
 
 
@@ -2182,6 +2494,272 @@ async def delete_zone(
     )
     await db.delete(zone)
     await db.commit()
+
+
+# ── Zone template wizard ────────────────────────────────────────────────────
+
+
+class FromTemplateRequest(BaseModel):
+    template_id: str
+    zone_name: str
+    params: dict[str, str] = {}
+    view_id: uuid.UUID | None = None
+    zone_type: str = "primary"
+    kind: str = "forward"
+
+    @field_validator("zone_name")
+    @classmethod
+    def ensure_trailing_dot(cls, v: str) -> str:
+        return v if v.endswith(".") else v + "."
+
+
+@router.get("/zone-templates")
+async def list_zone_templates(_: CurrentUser) -> dict[str, Any]:
+    """Return the static catalog of zone templates."""
+    templates = list_templates()
+    return {
+        "templates": [
+            {
+                "id": t.id,
+                "name": t.name,
+                "category": t.category,
+                "description": t.description,
+                "parameters": [
+                    {
+                        "key": p.key,
+                        "label": p.label,
+                        "type": p.type,
+                        "required": p.required,
+                        "default": p.default,
+                        "placeholder": p.placeholder,
+                        "hint": p.hint,
+                    }
+                    for p in t.parameters
+                ],
+                "record_count": len(t.records),
+            }
+            for t in templates
+        ]
+    }
+
+
+@router.post(
+    "/groups/{group_id}/zones/from-template",
+    response_model=ZoneResponse,
+    status_code=201,
+)
+async def create_zone_from_template(
+    group_id: uuid.UUID, body: FromTemplateRequest, db: DB, current_user: SuperAdmin
+) -> DNSZone:
+    """Create a zone + materialise the template's records in one transaction."""
+    await _require_group(group_id, db)
+    template = get_template(body.template_id)
+    if template is None:
+        raise HTTPException(status_code=404, detail=f"Unknown template: {body.template_id}")
+
+    errors = validate_params(template, body.params)
+    if errors:
+        raise HTTPException(status_code=422, detail="; ".join(errors))
+
+    existing = await db.execute(
+        select(DNSZone).where(
+            DNSZone.group_id == group_id,
+            DNSZone.view_id == body.view_id,
+            DNSZone.name == body.zone_name,
+        )
+    )
+    if existing.scalar_one_or_none():
+        raise HTTPException(
+            status_code=409, detail="A zone with that name already exists in this group/view"
+        )
+
+    zone = DNSZone(
+        group_id=group_id,
+        view_id=body.view_id,
+        name=body.zone_name,
+        zone_type=body.zone_type,
+        kind=body.kind,
+    )
+    db.add(zone)
+    await _push_zone_to_agentless_servers(db, zone, "create")
+    await db.flush()
+
+    record_payloads = materialize(template, body.zone_name, body.params)
+    created_records: list[DNSRecord] = []
+    for r in record_payloads:
+        if r["record_type"] not in VALID_RECORD_TYPES:
+            # Catalog-author bug — refuse rather than write garbage records.
+            raise HTTPException(
+                status_code=500,
+                detail=f"Template {body.template_id} produced invalid record type {r['record_type']}",
+            )
+        fqdn = (f"{r['name']}.{zone.name}" if r["name"] != "@" else zone.name).rstrip(".") + "."
+        rec = DNSRecord(
+            zone_id=zone.id,
+            fqdn=fqdn,
+            name=r["name"],
+            record_type=r["record_type"],
+            value=r["value"],
+            ttl=r["ttl"],
+            priority=r["priority"],
+            weight=r["weight"],
+            port=r["port"],
+            created_by_user_id=current_user.id,
+        )
+        db.add(rec)
+        created_records.append(rec)
+
+    target_serial = bump_zone_serial(zone) if record_payloads else None
+    await db.flush()
+    for rec in created_records:
+        await enqueue_record_op(
+            db,
+            zone,
+            "create",
+            {
+                "name": rec.name,
+                "type": rec.record_type,
+                "value": rec.value,
+                "ttl": rec.ttl,
+                "priority": rec.priority,
+                "weight": rec.weight,
+                "port": rec.port,
+            },
+            target_serial=target_serial,
+        )
+
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="create",
+            resource_type="dns_zone",
+            resource_id=str(zone.id),
+            resource_display=zone.name,
+            new_value={
+                "from_template": template.id,
+                "records_created": len(created_records),
+            },
+            result="success",
+        )
+    )
+    await db.commit()
+    await db.refresh(zone)
+    return zone
+
+
+# ── Zone delegation wizard ──────────────────────────────────────────────────
+
+
+@router.get("/groups/{group_id}/zones/{zone_id}/delegation-preview")
+async def get_delegation_preview(
+    group_id: uuid.UUID, zone_id: uuid.UUID, db: DB, _: CurrentUser
+) -> dict[str, Any]:
+    """Compute the NS + glue records needed to delegate this zone from its parent.
+
+    Returns ``{has_parent: false}`` when no eligible parent zone exists in
+    the same group; otherwise the dict is the full preview shape from
+    ``preview_to_dict`` plus ``has_parent: true``.
+    """
+    child = await _require_zone(group_id, zone_id, db)
+    parent = await find_parent_zone(db, group_id, child.name)
+    if parent is None:
+        return {"has_parent": False}
+    preview = await compute_delegation(db, parent, child)
+    return {"has_parent": True, **preview_to_dict(preview)}
+
+
+@router.post(
+    "/groups/{group_id}/zones/{zone_id}/delegate-from-parent",
+    response_model=list[RecordResponse],
+    status_code=201,
+)
+async def apply_delegation(
+    group_id: uuid.UUID, zone_id: uuid.UUID, db: DB, current_user: CurrentUser
+) -> list[DNSRecord]:
+    """Materialise the delegation records into the parent zone.
+
+    Idempotent — records that already exist in the parent are skipped, so a
+    second call after the first succeeds is a no-op. Each created record
+    flows through ``enqueue_record_op`` so the parent zone's serial bumps
+    once and the agent / Windows-driver push happens uniformly.
+    """
+    child = await _require_zone(group_id, zone_id, db)
+    parent = await find_parent_zone(db, group_id, child.name)
+    if parent is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No parent zone found in this group for {child.name.rstrip('.')}",
+        )
+    preview = await compute_delegation(db, parent, child)
+    pending = preview.ns_records_to_create + preview.glue_records_to_create
+    if not pending:
+        return []
+    if preview.child_apex_ns_count == 0:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Cannot delegate {child.name.rstrip('.')} — it has no NS records at "
+                "the apex. Add at least one NS record before delegating."
+            ),
+        )
+
+    created: list[DNSRecord] = []
+    for r in pending:
+        fqdn = (f"{r.name}.{parent.name}" if r.name != "@" else parent.name).rstrip(".") + "."
+        record = DNSRecord(
+            zone_id=parent.id,
+            fqdn=fqdn,
+            name=r.name,
+            record_type=r.record_type,
+            value=r.value,
+            ttl=r.ttl,
+            created_by_user_id=current_user.id,
+        )
+        db.add(record)
+        created.append(record)
+
+    target_serial = bump_zone_serial(parent)
+    await db.flush()
+    for record in created:
+        await enqueue_record_op(
+            db,
+            parent,
+            "create",
+            {
+                "name": record.name,
+                "type": record.record_type,
+                "value": record.value,
+                "ttl": record.ttl,
+                "priority": record.priority,
+                "weight": record.weight,
+                "port": record.port,
+            },
+            target_serial=target_serial,
+        )
+
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="delegate",
+            resource_type="dns_zone",
+            resource_id=str(parent.id),
+            resource_display=parent.name,
+            new_value={
+                "child_zone": child.name,
+                "ns_created": len(preview.ns_records_to_create),
+                "glue_created": len(preview.glue_records_to_create),
+            },
+            result="success",
+        )
+    )
+    await db.commit()
+    for record in created:
+        await db.refresh(record)
+    return created
 
 
 async def _push_zone_to_agentless_servers(db: DB, zone: DNSZone, op: str) -> None:

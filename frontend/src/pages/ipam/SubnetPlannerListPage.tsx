@@ -1,13 +1,7 @@
 import { useState } from "react";
 import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import {
-  CheckCircle2,
-  Loader2,
-  Plus,
-  Trash2,
-  Workflow,
-} from "lucide-react";
+import { CheckCircle2, Loader2, Plus, Trash2, Workflow } from "lucide-react";
 import {
   ipamApi,
   type IPBlock,
@@ -59,8 +53,8 @@ export function SubnetPlannerListPage() {
             <p className="mt-1 max-w-3xl text-xs text-muted-foreground">
               Design multi-level CIDR hierarchies before committing them. Each
               plan captures a tree of nested blocks + subnets; "Apply"
-              transactionally creates everything in IPAM. Plans persist
-              after apply as an audit trail.
+              transactionally creates everything in IPAM. Plans persist after
+              apply as an audit trail.
             </p>
           </div>
           <button
@@ -354,7 +348,9 @@ function NewPlanModal({ onClose }: { onClose: () => void }) {
             onClick={() => createMut.mutate()}
             className="inline-flex items-center gap-1 rounded bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground disabled:opacity-50"
           >
-            {createMut.isPending && <Loader2 className="h-3 w-3 animate-spin" />}
+            {createMut.isPending && (
+              <Loader2 className="h-3 w-3 animate-spin" />
+            )}
             Create
           </button>
         </div>

@@ -87,6 +87,22 @@ class DNSServerGroup(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         String(50), nullable=False, default="hmac-sha256"
     )
 
+    # ── BIND9 catalog zones (RFC 9432) — distribute zones across the
+    # group via one catalog instead of per-server config push. BIND 9.18+
+    # only. The producer is the group's `is_primary=True` server; every
+    # other bind9 member joins as a consumer. ``catalog_zone_serial`` is
+    # bumped by the bundle builder whenever the membership list changes,
+    # so a NOTIFY fires automatically on add/remove.
+    catalog_zones_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    catalog_zone_name: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+        default="catalog.spatium.invalid.",
+        server_default="catalog.spatium.invalid.",
+    )
+
     servers: Mapped[list["DNSServer"]] = relationship(
         "DNSServer", back_populates="group", cascade="all, delete-orphan"
     )
@@ -329,6 +345,45 @@ class DNSAclEntry(UUIDPrimaryKeyMixin, Base):
     order: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
     acl: Mapped["DNSAcl"] = relationship("DNSAcl", back_populates="entries")
+
+
+class DNSTSIGKey(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """Named TSIG key for RFC 2136 dynamic updates / AXFR auth.
+
+    The legacy single key on ``DNSServerGroup.tsig_key_*`` is auto-generated
+    on first server registration and used by the agent itself for loopback
+    updates. These rows are operator-managed keys for things like granting
+    an external nsupdate client write access to a zone, or authenticating
+    a remote AXFR pull from a downstream secondary. Both kinds end up in
+    the same ``key { … };`` block in named.conf — the agent doesn't care
+    where they came from.
+    """
+
+    __tablename__ = "dns_tsig_key"
+    __table_args__ = (UniqueConstraint("group_id", "name", name="uq_dns_tsig_key_group_name"),)
+
+    group_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dns_server_group.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    # RFC 1035 dotted name; convention is to end with a dot. The agent
+    # quotes whatever string we give it, so trailing-dot is ignored at
+    # the wire layer but kept here for operator readability.
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    algorithm: Mapped[str] = mapped_column(String(50), nullable=False, default="hmac-sha256")
+    # Base64-encoded raw key bytes, Fernet-encrypted at rest. Never logged
+    # or returned in plaintext via the read endpoints — only the create
+    # response surfaces the secret one time so the operator can copy it
+    # into the consuming client's nsupdate / AXFR config.
+    secret_encrypted: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    # Operator hint about intended use. Free-form; not enforced.
+    purpose: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    notes: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    last_rotated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    group: Mapped["DNSServerGroup"] = relationship("DNSServerGroup")
 
 
 class DNSView(UUIDPrimaryKeyMixin, TimestampMixin, Base):

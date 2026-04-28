@@ -847,9 +847,9 @@ export const ipamApi = {
       .then((r) => r.data),
   blockAggregationSuggestions: (blockId: string) =>
     api
-      .get<AggregationSuggestion[]>(
-        `/ipam/blocks/${blockId}/aggregation-suggestions`,
-      )
+      .get<
+        AggregationSuggestion[]
+      >(`/ipam/blocks/${blockId}/aggregation-suggestions`)
       .then((r) => r.data),
   planBlockAllocation: (blockId: string, items: PlanRequestItem[]) =>
     api
@@ -1949,6 +1949,11 @@ export interface DNSServerGroup {
   group_type: string;
   default_view: string | null;
   is_recursive: boolean;
+  // RFC 9432 BIND9 catalog zones — distribute zones via one catalog
+  // instead of per-server config push. Producer is the group's primary
+  // bind9 server; consumers auto-pull members.
+  catalog_zones_enabled: boolean;
+  catalog_zone_name: string;
   created_at: string;
   modified_at: string;
 }
@@ -2172,6 +2177,101 @@ export interface ZoneServerState {
   in_sync: boolean;
 }
 
+// Pending records the delegation wizard would land in the parent zone.
+// `existing_*` lists are already-present rows the wizard would skip on apply.
+export interface DelegationRecord {
+  name: string;
+  record_type: string;
+  value: string;
+  ttl: number | null;
+}
+
+export interface DelegationPreview {
+  has_parent: true;
+  parent_zone_id: string;
+  parent_zone_name: string;
+  child_zone_id: string;
+  child_zone_name: string;
+  child_label: string;
+  ns_records_to_create: DelegationRecord[];
+  glue_records_to_create: DelegationRecord[];
+  existing_ns_records: DelegationRecord[];
+  existing_glue_records: DelegationRecord[];
+  warnings: string[];
+  child_apex_ns_count: number;
+}
+
+export type DelegationPreviewResponse =
+  | { has_parent: false }
+  | DelegationPreview;
+
+// Zone-template wizard catalog. Templates carry a parameter manifest
+// the UI renders into a form; submission returns a fully-built zone.
+export interface ZoneTemplateParameter {
+  key: string;
+  label: string;
+  type: string;
+  required: boolean;
+  default: string | null;
+  placeholder: string | null;
+  hint: string | null;
+}
+
+export interface ZoneTemplate {
+  id: string;
+  name: string;
+  category: string;
+  description: string;
+  parameters: ZoneTemplateParameter[];
+  record_count: number;
+}
+
+export interface ZoneTemplateCatalog {
+  templates: ZoneTemplate[];
+}
+
+export interface FromTemplateRequest {
+  template_id: string;
+  zone_name: string;
+  params: Record<string, string>;
+  view_id?: string | null;
+  zone_type?: string;
+  kind?: string;
+}
+
+// Operator-managed named TSIG keys for RFC 2136 / AXFR auth. Distinct
+// from the legacy single key auto-generated on DNSServerGroup which is
+// reserved for the agent's own loopback updates.
+export interface DNSTSIGKey {
+  id: string;
+  group_id: string;
+  name: string;
+  algorithm: string;
+  purpose: string | null;
+  notes: string;
+  last_rotated_at: string | null;
+  created_at: string;
+  modified_at: string;
+  // Plaintext secret. Populated on the create / rotate responses *only*.
+  // Read endpoints (list / get) leave this null.
+  secret: string | null;
+}
+
+export interface TSIGKeyCreate {
+  name: string;
+  algorithm?: string;
+  secret?: string | null;
+  purpose?: string | null;
+  notes?: string;
+}
+
+export interface TSIGKeyUpdate {
+  name?: string;
+  algorithm?: string;
+  purpose?: string | null;
+  notes?: string;
+}
+
 export interface DNSRecord {
   id: string;
   zone_id: string;
@@ -2377,6 +2477,57 @@ export const dnsApi = {
       .get<ZoneServerState>(
         `/dns/groups/${groupId}/zones/${zoneId}/server-state`,
       )
+      .then((r) => r.data),
+
+  // Delegation wizard
+  getDelegationPreview: (groupId: string, zoneId: string) =>
+    api
+      .get<DelegationPreviewResponse>(
+        `/dns/groups/${groupId}/zones/${zoneId}/delegation-preview`,
+      )
+      .then((r) => r.data),
+  applyDelegation: (groupId: string, zoneId: string) =>
+    api
+      .post<
+        DNSRecord[]
+      >(`/dns/groups/${groupId}/zones/${zoneId}/delegate-from-parent`)
+      .then((r) => r.data),
+
+  // Zone templates (starter zones with parameterised records)
+  listZoneTemplates: () =>
+    api.get<ZoneTemplateCatalog>(`/dns/zone-templates`).then((r) => r.data),
+  createZoneFromTemplate: (groupId: string, body: FromTemplateRequest) =>
+    api
+      .post<DNSZone>(`/dns/groups/${groupId}/zones/from-template`, body)
+      .then((r) => r.data),
+
+  // TSIG keys (operator-managed named keys for RFC 2136 / AXFR auth)
+  listTSIGKeys: (groupId: string) =>
+    api
+      .get<DNSTSIGKey[]>(`/dns/groups/${groupId}/tsig-keys`)
+      .then((r) => r.data),
+  createTSIGKey: (groupId: string, body: TSIGKeyCreate) =>
+    api
+      .post<DNSTSIGKey>(`/dns/groups/${groupId}/tsig-keys`, body)
+      .then((r) => r.data),
+  updateTSIGKey: (groupId: string, keyId: string, body: TSIGKeyUpdate) =>
+    api
+      .put<DNSTSIGKey>(`/dns/groups/${groupId}/tsig-keys/${keyId}`, body)
+      .then((r) => r.data),
+  rotateTSIGKey: (groupId: string, keyId: string) =>
+    api
+      .post<DNSTSIGKey>(`/dns/groups/${groupId}/tsig-keys/${keyId}/rotate`)
+      .then((r) => r.data),
+  deleteTSIGKey: (groupId: string, keyId: string) =>
+    api.delete(`/dns/groups/${groupId}/tsig-keys/${keyId}`),
+  generateTSIGSecret: (groupId: string, algorithm: string) =>
+    api
+      .get<{
+        algorithm: string;
+        secret: string;
+      }>(`/dns/groups/${groupId}/tsig-keys/generate-secret`, {
+        params: { algorithm },
+      })
       .then((r) => r.data),
 
   // Records
@@ -3332,6 +3483,30 @@ export interface DHCPActivityLogResponse {
   truncated: boolean;
 }
 
+// On-demand top-N rollups computed against `dns_query_log_entry`
+// (24 h retention). One round trip returns three dimensions.
+export interface DNSQueryAnalyticsRow {
+  key: string;
+  count: number;
+}
+
+export interface DNSQueryAnalyticsRequest {
+  server_id: string;
+  since?: string | null;
+  until?: string | null;
+  limit?: number;
+}
+
+export interface DNSQueryAnalyticsResponse {
+  server_id: string;
+  since: string | null;
+  until: string | null;
+  total_queries: number;
+  top_qnames: DNSQueryAnalyticsRow[];
+  top_clients: DNSQueryAnalyticsRow[];
+  qtype_distribution: DNSQueryAnalyticsRow[];
+}
+
 export const logsApi = {
   listSources: () => api.get<LogSource[]>("/logs/sources").then((r) => r.data),
   listAgentSources: () =>
@@ -3343,6 +3518,10 @@ export const logsApi = {
   dnsQueries: (body: DNSQueryLogRequest) =>
     api
       .post<DNSQueryLogResponse>("/logs/dns-queries", body)
+      .then((r) => r.data),
+  dnsQueryAnalytics: (body: DNSQueryAnalyticsRequest) =>
+    api
+      .post<DNSQueryAnalyticsResponse>("/logs/dns-queries/analytics", body)
       .then((r) => r.data),
   dhcpActivity: (body: DHCPActivityLogRequest) =>
     api

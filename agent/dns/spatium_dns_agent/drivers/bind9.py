@@ -144,6 +144,40 @@ class Bind9Driver(DriverBase):
             if zone_type in {"primary", "master"}:
                 self._write_zone_file(new_dir / rel_zfile, zone)
 
+        # BIND9 catalog zone (RFC 9432). When the group has catalog zones
+        # enabled, the producer (is_primary=True) renders a master catalog
+        # zone whose contents describe every primary zone in the group.
+        # Consumers get a single `catalog-zones` directive in options{};
+        # BIND9 auto-pulls the catalog and creates each member zone as a
+        # secondary served from the producer.
+        catalog = bundle.get("catalog") or None
+        if catalog and catalog.get("mode") == "producer":
+            cname = catalog["zone_name"]
+            rel = f"zones/{cname.rstrip('.')}.db"
+            abs_zfile = self.state_dir / self.rendered_dir_name / rel
+            conf += (
+                f'zone "{cname}" {{ type master; file "{abs_zfile}"; '
+                f"allow-transfer {{ any; }}; notify yes; }};\n"
+            )
+            self._write_catalog_zone_file(new_dir / rel, catalog)
+        elif catalog and catalog.get("mode") == "consumer":
+            cname = catalog["zone_name"]
+            producer_addr = (catalog.get("producer_addr") or "").strip()
+            if producer_addr:
+                # `catalog-zones` lives inside options{}; inject just before
+                # the closing brace of the options block we already rendered
+                # via NAMED_CONF_SKELETON. ``in-memory yes`` keeps the
+                # member zones cached in RAM so we don't litter the
+                # rendered tree with per-member files.
+                injection = (
+                    f"    catalog-zones {{ "
+                    f'zone "{cname}" default-masters {{ {producer_addr}; }} '
+                    f"in-memory yes; }};"
+                )
+                target = "    check-integrity no;"
+                if target in conf and injection not in conf:
+                    conf = conf.replace(target, target + "\n" + injection, 1)
+
         # RPZ zones for blocklists. Each blocklist becomes a master zone named
         # after its rpz_zone_name. Entries are rendered as CNAME records:
         # - nxdomain     → CNAME .                  (synthesize NXDOMAIN)
@@ -173,6 +207,54 @@ class Bind9Driver(DriverBase):
                 f'secret "{k["secret"]}"; }};\n'
             )
             os.chmod(tsig_file, 0o600)
+
+    def _write_catalog_zone_file(self, path: Path, catalog: dict[str, Any]) -> None:
+        """Render a BIND9 catalog zone file per RFC 9432.
+
+        Each member zone shows up as a synthetic label
+        ``<sha1-of-wire-name>.zones.<catalog>``. The PTR record at that
+        label points back to the member zone name. The mandatory
+        ``version`` TXT at the apex pins the schema to "2" (the only
+        version BIND9 accepts).
+
+        SOA serial uses ``int(time.time())`` because the long-poll only
+        delivers a fresh bundle when membership actually changes (the
+        catalog block is in the structural ETag); the agent only re-
+        renders on bundle change, so each render really is a different
+        membership state and consumers will always pull.
+        """
+        import hashlib
+        import time
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        cname = (catalog.get("zone_name") or "").strip()
+        if not cname:
+            return
+        members = catalog.get("members") or []
+        serial = int(time.time())
+        lines = [
+            "$TTL 86400",
+            f"@ IN SOA invalid. invalid. ( {serial} 86400 3600 86400 86400 )",
+            "@ IN NS invalid.",
+            'version IN TXT "2"',
+        ]
+        for m in members:
+            zname = (m.get("zone_name") or "").strip()
+            if not zname:
+                continue
+            text = zname.lower().rstrip(".")
+            # RFC 9432 §4.1: hash is SHA-1 of the *wire-format* zone
+            # name (each label prefixed with its length byte, root null
+            # byte at the end).
+            wire = b"".join(
+                bytes([len(label)]) + label.encode("ascii")
+                for label in text.split(".")
+                if label
+            ) + b"\x00"
+            digest = hashlib.sha1(wire).hexdigest()
+            text_with_dot = text + "." if text else "."
+            lines.append(f"{digest}.zones IN PTR {text_with_dot}")
+        path.write_text("\n".join(lines) + "\n")
 
     def _write_zone_file(self, path: Path, zone: dict[str, Any]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)

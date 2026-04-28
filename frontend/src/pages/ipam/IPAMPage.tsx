@@ -510,10 +510,22 @@ function CreateSpaceModal({ onClose }: { onClose: () => void }) {
   const [dhcpServerGroupId, setDhcpServerGroupId] = useState<string | null>(
     null,
   );
+  // VRF / routing annotation — pure metadata, parity with EditSpaceModal so
+  // operators don't have to round-trip through Edit just to set their VRF
+  // name on a freshly-created space. Collapsed by default since most
+  // homelab / SMB deployments don't run a multi-VRF fabric.
+  const [showVrf, setShowVrf] = useState<boolean>(false);
+  const [vrfName, setVrfName] = useState<string>("");
+  const [routeDistinguisher, setRouteDistinguisher] = useState<string>("");
+  const [routeTargetsText, setRouteTargetsText] = useState<string>("");
 
   const mutation = useMutation({
-    mutationFn: () =>
-      ipamApi.createSpace({
+    mutationFn: () => {
+      const trimmedRTs = routeTargetsText
+        .split(/[,\n]+/g)
+        .map((s) => s.trim())
+        .filter((s) => s.length > 0);
+      return ipamApi.createSpace({
         name,
         description,
         is_default: false,
@@ -522,7 +534,11 @@ function CreateSpaceModal({ onClose }: { onClose: () => void }) {
         dns_zone_id: dnsZoneId,
         dns_additional_zone_ids: dnsAdditionalZoneIds,
         dhcp_server_group_id: dhcpServerGroupId,
-      }),
+        vrf_name: vrfName.trim() || null,
+        route_distinguisher: routeDistinguisher.trim() || null,
+        route_targets: trimmedRTs.length > 0 ? trimmedRTs : null,
+      });
+    },
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["spaces"] });
       onClose();
@@ -579,6 +595,60 @@ function CreateSpaceModal({ onClose }: { onClose: () => void }) {
             onServerGroupIdChange={setDhcpServerGroupId}
           />
         </div>
+
+        {/* VRF / routing annotation — collapsible to keep the create form
+            tidy for operators who don't run multiple VRFs. Mirrors the
+            same section in EditSpaceModal so operators see VRF / RD / RT
+            on first creation without round-tripping through Edit. */}
+        <div className="border-t pt-3">
+          <button
+            type="button"
+            onClick={() => setShowVrf((s) => !s)}
+            className="flex items-center gap-1 text-xs font-semibold text-muted-foreground uppercase tracking-wide hover:text-foreground"
+          >
+            {showVrf ? (
+              <ChevronDown className="h-3 w-3" />
+            ) : (
+              <ChevronRight className="h-3 w-3" />
+            )}
+            VRF / Routing (optional)
+          </button>
+          {showVrf && (
+            <div className="mt-2 space-y-2">
+              <Field label="VRF name">
+                <input
+                  className={inputCls}
+                  value={vrfName}
+                  onChange={(e) => setVrfName(e.target.value)}
+                  placeholder="e.g. CORP-RED"
+                />
+              </Field>
+              <Field label="Route distinguisher">
+                <input
+                  className={inputCls}
+                  value={routeDistinguisher}
+                  onChange={(e) => setRouteDistinguisher(e.target.value)}
+                  placeholder="e.g. 65000:100"
+                />
+              </Field>
+              <Field label="Route targets (comma- or newline-separated)">
+                <textarea
+                  className={inputCls}
+                  rows={3}
+                  value={routeTargetsText}
+                  onChange={(e) => setRouteTargetsText(e.target.value)}
+                  placeholder={"import:65000:100\nexport:65000:200"}
+                />
+              </Field>
+              <p className="text-xs text-muted-foreground">
+                Pure annotation — address allocation does not consult these
+                fields. Different VRFs with overlapping IPs already work via
+                separate IPSpace rows.
+              </p>
+            </div>
+          )}
+        </div>
+
         <div className="flex justify-end gap-2 pt-2">
           <button
             onClick={onClose}
@@ -8480,10 +8550,9 @@ function BlockDetailView({
   const [showCreateSubnet, setShowCreateSubnet] = useState(false);
   const [showCreateChildBlock, setShowCreateChildBlock] = useState(false);
   const [showPlanAllocation, setShowPlanAllocation] = useState(false);
-  const [allocationView, setAllocationView] = useSessionState<"band" | "treemap">(
-    `block-${initialBlock.id}-alloc-view`,
-    "band",
-  );
+  const [allocationView, setAllocationView] = useSessionState<
+    "band" | "treemap"
+  >(`block-${initialBlock.id}-alloc-view`, "band");
   const [blockFilter, setBlockFilter] = useState({
     network: "",
     name: "",
@@ -8516,8 +8585,10 @@ function BlockDetailView({
       const subnetIds: string[] = [];
       const blockIds: string[] = [];
       for (const key of selected) {
-        if (key.startsWith("subnet:")) subnetIds.push(key.slice("subnet:".length));
-        else if (key.startsWith("block:")) blockIds.push(key.slice("block:".length));
+        if (key.startsWith("subnet:"))
+          subnetIds.push(key.slice("subnet:".length));
+        else if (key.startsWith("block:"))
+          blockIds.push(key.slice("block:".length));
       }
       const subnetResults = await Promise.allSettled(
         subnetIds.map((id) => ipamApi.deleteSubnet(id, true)),
@@ -8873,40 +8944,41 @@ function BlockDetailView({
           onClose={() => setShowDnsSync(false)}
         />
       )}
-      {showBulkDelete && (() => {
-        const sCount = selectedSubnetIds.length;
-        const bCount = selectedBlockKeys.length;
-        const noun =
-          sCount && bCount
-            ? `${sCount} subnet${sCount === 1 ? "" : "s"} + ${bCount} block${bCount === 1 ? "" : "s"}`
-            : sCount
-              ? `${sCount} Subnet${sCount === 1 ? "" : "s"}`
-              : `${bCount} empty Block${bCount === 1 ? "" : "s"}`;
-        return (
-        <ConfirmDestroyModal
-          title={`Delete ${noun}`}
-          description={
-            sCount > 0
-              ? `This will move ${sCount} subnet${sCount === 1 ? "" : "s"} to Trash` +
-                (bCount > 0
-                  ? ` and permanently delete ${bCount} empty block${bCount === 1 ? "" : "s"}.`
-                  : ". You can restore from Admin → Trash within 30 days.")
-              : `This will permanently delete ${bCount} empty block${bCount === 1 ? "" : "s"}. Blocks are not restorable from Trash.`
-          }
-          checkLabel={`I understand ${noun} will be deleted.`}
-          isPending={blockBulkDeleteMut.isPending}
-          error={blockBulkDeleteError}
-          onClose={() => {
-            setShowBulkDelete(false);
-            setBlockBulkDeleteError(null);
-          }}
-          onConfirm={() => {
-            setBlockBulkDeleteError(null);
-            blockBulkDeleteMut.mutate();
-          }}
-        />
-        );
-      })()}
+      {showBulkDelete &&
+        (() => {
+          const sCount = selectedSubnetIds.length;
+          const bCount = selectedBlockKeys.length;
+          const noun =
+            sCount && bCount
+              ? `${sCount} subnet${sCount === 1 ? "" : "s"} + ${bCount} block${bCount === 1 ? "" : "s"}`
+              : sCount
+                ? `${sCount} Subnet${sCount === 1 ? "" : "s"}`
+                : `${bCount} empty Block${bCount === 1 ? "" : "s"}`;
+          return (
+            <ConfirmDestroyModal
+              title={`Delete ${noun}`}
+              description={
+                sCount > 0
+                  ? `This will move ${sCount} subnet${sCount === 1 ? "" : "s"} to Trash` +
+                    (bCount > 0
+                      ? ` and permanently delete ${bCount} empty block${bCount === 1 ? "" : "s"}.`
+                      : ". You can restore from Admin → Trash within 30 days.")
+                  : `This will permanently delete ${bCount} empty block${bCount === 1 ? "" : "s"}. Blocks are not restorable from Trash.`
+              }
+              checkLabel={`I understand ${noun} will be deleted.`}
+              isPending={blockBulkDeleteMut.isPending}
+              error={blockBulkDeleteError}
+              onClose={() => {
+                setShowBulkDelete(false);
+                setBlockBulkDeleteError(null);
+              }}
+              onConfirm={() => {
+                setBlockBulkDeleteError(null);
+                blockBulkDeleteMut.mutate();
+              }}
+            />
+          );
+        })()}
       {showFindFree && space && (
         <FindFreeModal
           space={space}
@@ -9076,7 +9148,9 @@ function BlockDetailView({
                             disabled={selectableKeys.length === 0}
                             onChange={() =>
                               setSelected(
-                                allSelected ? new Set() : new Set(selectableKeys),
+                                allSelected
+                                  ? new Set()
+                                  : new Set(selectableKeys),
                               )
                             }
                           />
