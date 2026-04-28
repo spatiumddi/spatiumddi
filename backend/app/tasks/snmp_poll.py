@@ -34,6 +34,7 @@ from app.models.network import (
     NetworkDevice,
     NetworkFdbEntry,
     NetworkInterface,
+    NetworkNeighbour,
 )
 from app.services.snmp import (
     cross_reference_arp,
@@ -48,7 +49,13 @@ from app.services.snmp.errors import (
     SNMPTimeoutError,
     SNMPTransportError,
 )
-from app.services.snmp.poller import ArpData, FdbData, InterfaceData
+from app.services.snmp.poller import (
+    ArpData,
+    FdbData,
+    InterfaceData,
+    NeighbourData,
+    walk_lldp_neighbours,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -221,6 +228,47 @@ async def _upsert_fdb(
     return len(rows_list)
 
 
+async def _upsert_neighbours(
+    db: AsyncSession,
+    device: NetworkDevice,
+    rows: Iterable[NeighbourData],
+    if_index_to_id: dict[int, uuid.UUID],
+) -> int:
+    """Replace LLDP neighbours for the device — absence-delete on poll.
+
+    Like FDB, neighbours that disappear from the wire's lldpRemTable
+    should disappear from the DB. The wire is the source of truth;
+    operators looking for forensic "what used to be plugged here"
+    history should use the audit log + cycled poll snapshots.
+    """
+    rows_list = list(rows)
+
+    await db.execute(delete(NetworkNeighbour).where(NetworkNeighbour.device_id == device.id))
+
+    for r in rows_list:
+        # interface_id is nullable — when the local-port-num doesn't
+        # map to a known ifIndex (rare; usually a poll race where LLDP
+        # was walked before ifTable) we keep the row with the FK
+        # null, so the neighbour still surfaces in the UI.
+        iface_id = if_index_to_id.get(r.if_index)
+        db.add(
+            NetworkNeighbour(
+                device_id=device.id,
+                interface_id=iface_id,
+                local_port_num=r.if_index,
+                remote_chassis_id_subtype=r.chassis_id_subtype,
+                remote_chassis_id=r.chassis_id,
+                remote_port_id_subtype=r.port_id_subtype,
+                remote_port_id=r.port_id,
+                remote_port_desc=r.port_desc,
+                remote_sys_name=r.sys_name,
+                remote_sys_desc=r.sys_desc,
+                remote_sys_cap_enabled=r.sys_cap_enabled,
+            )
+        )
+    return len(rows_list)
+
+
 # ── Single-device poll ──────────────────────────────────────────────
 
 
@@ -251,6 +299,7 @@ async def _poll_device_async(device_id: str) -> dict[str, Any]:
             arp_count = 0
             fdb_count = 0
             interface_count = 0
+            neighbour_count = 0
             errors: list[str] = []
 
             # ── 1. sys-group probe (always run) ───────────────────────
@@ -317,8 +366,18 @@ async def _poll_device_async(device_id: str) -> dict[str, Any]:
                 except Exception as exc:  # noqa: BLE001
                     errors.append(f"fdb: {exc}")
 
-            # ── 5. Status roll-up ────────────────────────────────────
-            requested = sum(int(x) for x in (row.poll_arp, row.poll_fdb, row.poll_interfaces))
+            # ── 5. LLDP neighbours ───────────────────────────────────
+            if row.poll_lldp:
+                try:
+                    nbr_rows = await walk_lldp_neighbours(row)
+                    neighbour_count = await _upsert_neighbours(db, row, nbr_rows, if_index_to_id)
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(f"lldp: {exc}")
+
+            # ── 6. Status roll-up ────────────────────────────────────
+            requested = sum(
+                int(x) for x in (row.poll_arp, row.poll_fdb, row.poll_interfaces, row.poll_lldp)
+            )
             failed = len(errors)
             if failed == 0:
                 row.last_poll_status = "success"
@@ -334,6 +393,7 @@ async def _poll_device_async(device_id: str) -> dict[str, Any]:
             row.last_poll_arp_count = arp_count
             row.last_poll_fdb_count = fdb_count
             row.last_poll_interface_count = interface_count
+            row.last_poll_neighbour_count = neighbour_count
             row.next_poll_at = now + timedelta(seconds=row.poll_interval_seconds)
 
             await db.commit()
@@ -343,6 +403,7 @@ async def _poll_device_async(device_id: str) -> dict[str, Any]:
                     "arp_count": arp_count,
                     "fdb_count": fdb_count,
                     "interface_count": interface_count,
+                    "neighbour_count": neighbour_count,
                     "errors": errors,
                 }
             )

@@ -68,6 +68,36 @@ OID_DOT1D_TP_FDB_STATUS: Final[str] = "1.3.6.1.2.1.17.4.3.1.3"
 # port to the underlying ifIndex so we can join FDB → ifTable.
 OID_DOT1D_BASE_PORT_IF_INDEX: Final[str] = "1.3.6.1.2.1.17.1.4.1.2"
 
+# ── LLDP-MIB lldpRemTable (IEEE 802.1AB §11.5.2) ───────────────────────
+# Vendor-neutral neighbour discovery — one row per (local-port,
+# neighbour) tuple advertised on a wire. Walked once per poll to
+# build ``network_neighbour`` rows.
+#
+# Index format is ``timeMark.localPortNum.remoteIndex`` — we only
+# need ``localPortNum`` and ``remoteIndex`` for de-dupe, so the
+# table-walk handler splits by '.' and keeps the last two integers.
+#
+# ``localPortNum`` from LLDP is a separate enumeration from ifIndex;
+# on most modern switches the two coincide, but on Juniper / Aruba
+# the local-port-num is a per-LLDP-agent counter. We map back to
+# ifIndex via lldpLocPortIfIndex when present (currently we just
+# trust localPortNum == ifIndex — fine for the tier-1 vendors and
+# easy to enrich later via ENTITY-MIB / lldpLocPortDesc).
+OID_LLDP_REM_CHASSIS_ID_SUBTYPE: Final[str] = "1.0.8802.1.1.2.1.4.1.1.4"
+OID_LLDP_REM_CHASSIS_ID: Final[str] = "1.0.8802.1.1.2.1.4.1.1.5"
+OID_LLDP_REM_PORT_ID_SUBTYPE: Final[str] = "1.0.8802.1.1.2.1.4.1.1.6"
+OID_LLDP_REM_PORT_ID: Final[str] = "1.0.8802.1.1.2.1.4.1.1.7"
+OID_LLDP_REM_PORT_DESC: Final[str] = "1.0.8802.1.1.2.1.4.1.1.8"
+OID_LLDP_REM_SYS_NAME: Final[str] = "1.0.8802.1.1.2.1.4.1.1.9"
+OID_LLDP_REM_SYS_DESC: Final[str] = "1.0.8802.1.1.2.1.4.1.1.10"
+OID_LLDP_REM_SYS_CAP_ENABLED: Final[str] = "1.0.8802.1.1.2.1.4.1.1.12"
+
+# ── LLDP-MIB lldpRemManAddrTable (§11.5.4) ─────────────────────────────
+# Optional management addresses the neighbour advertises. Lets us
+# cross-reference into IPAM. Most switches advertise their primary
+# management IP here; some advertise IPv6 too.
+OID_LLDP_REM_MAN_ADDR_IF_SUBTYPE: Final[str] = "1.0.8802.1.1.2.1.4.2.1.3"
+
 __all__ = [
     "OID_SYS_DESCR",
     "OID_SYS_OBJECT_ID",
@@ -94,4 +124,13 @@ __all__ = [
     "OID_DOT1D_TP_FDB_PORT",
     "OID_DOT1D_TP_FDB_STATUS",
     "OID_DOT1D_BASE_PORT_IF_INDEX",
+    "OID_LLDP_REM_CHASSIS_ID_SUBTYPE",
+    "OID_LLDP_REM_CHASSIS_ID",
+    "OID_LLDP_REM_PORT_ID_SUBTYPE",
+    "OID_LLDP_REM_PORT_ID",
+    "OID_LLDP_REM_PORT_DESC",
+    "OID_LLDP_REM_SYS_NAME",
+    "OID_LLDP_REM_SYS_DESC",
+    "OID_LLDP_REM_SYS_CAP_ENABLED",
+    "OID_LLDP_REM_MAN_ADDR_IF_SUBTYPE",
 ]

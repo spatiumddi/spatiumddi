@@ -15,9 +15,12 @@ import {
 } from "lucide-react";
 
 import {
+  LLDP_CHASSIS_ID_SUBTYPES,
+  LLDP_PORT_ID_SUBTYPES,
   networkApi,
   type NetworkArpQuery,
   type NetworkFdbQuery,
+  type NetworkNeighbourQuery,
   type NetworkTestConnectionResult,
 } from "@/lib/api";
 import { HeaderButton } from "@/components/ui/header-button";
@@ -38,7 +41,7 @@ import {
 } from "./_shared";
 import { DeviceFormModal } from "./DeviceFormModal";
 
-type Tab = "overview" | "interfaces" | "arp" | "fdb";
+type Tab = "overview" | "interfaces" | "arp" | "fdb" | "neighbours";
 
 // ── Detail page ──────────────────────────────────────────────────────
 
@@ -179,6 +182,7 @@ export function DeviceDetailView() {
                 });
                 qc.invalidateQueries({ queryKey: ["network-arp", id] });
                 qc.invalidateQueries({ queryKey: ["network-fdb", id] });
+                qc.invalidateQueries({ queryKey: ["network-neighbours", id] });
               }}
             >
               Refresh
@@ -231,6 +235,7 @@ export function DeviceDetailView() {
               ["interfaces", "Interfaces"],
               ["arp", "ARP"],
               ["fdb", "FDB"],
+              ["neighbours", "Neighbours"],
             ] as Array<[Tab, string]>
           ).map(([key, label]) => (
             <button
@@ -257,6 +262,9 @@ export function DeviceDetailView() {
         {tab === "interfaces" && <InterfacesTab deviceId={device.id} />}
         {tab === "arp" && <ArpTab deviceId={device.id} />}
         {tab === "fdb" && <FdbTab deviceId={device.id} />}
+        {tab === "neighbours" && (
+          <NeighboursTab deviceId={device.id} vendor={device.vendor} />
+        )}
       </div>
 
       {/* Modals */}
@@ -780,6 +788,230 @@ function FdbTab({ deviceId }: { deviceId: string }) {
                     title={f.last_seen}
                   >
                     {humanTime(f.last_seen)}
+                  </td>
+                </tr>
+              ))
+            )}
+          </tbody>
+        </table>
+      </div>
+      <Pager
+        page={page}
+        total={data?.total ?? 0}
+        pageSize={pageSize}
+        onChange={setPage}
+      />
+    </div>
+  );
+}
+
+// ── Neighbours tab (LLDP) ────────────────────────────────────────────
+
+// Vendor-specific commands shown in the empty-state banner so an
+// operator who sees zero neighbours can flip LLDP on without leaving
+// the page. Best-effort by sysDescr substring; falls through to the
+// generic hint when nothing matches.
+const _LLDP_ENABLE_HINTS: { match: string; cmd: string }[] = [
+  { match: "Cisco IOS", cmd: "(config)# lldp run" },
+  { match: "NX-OS", cmd: "(config)# feature lldp" },
+  { match: "Junos", cmd: "set protocols lldp interface all" },
+  { match: "Arista", cmd: "(config)# lldp run" },
+  { match: "ProCurve", cmd: "(config)# lldp run" },
+  { match: "Aruba", cmd: "(config)# lldp run" },
+  {
+    match: "MikroTik",
+    cmd: "/ip neighbor discovery-settings set discover-interface-list=all protocol=lldp",
+  },
+  {
+    match: "RouterOS",
+    cmd: "/ip neighbor discovery-settings set discover-interface-list=all protocol=lldp",
+  },
+  {
+    match: "OPNsense",
+    cmd: "Install os-lldpd, then enable in System → Settings → LLDP",
+  },
+  {
+    match: "pfSense",
+    cmd: "Install pfSense-pkg-LLDP, then enable in Services → LLDP",
+  },
+];
+
+function _enableHint(vendorOrDescr: string | null | undefined): string | null {
+  if (!vendorOrDescr) return null;
+  for (const { match, cmd } of _LLDP_ENABLE_HINTS) {
+    if (vendorOrDescr.toLowerCase().includes(match.toLowerCase())) return cmd;
+  }
+  return null;
+}
+
+// Decode LldpSystemCapabilitiesMap bitmask into compact labels.
+const _CAP_LABELS: { bit: number; label: string }[] = [
+  { bit: 1, label: "other" },
+  { bit: 2, label: "repeater" },
+  { bit: 4, label: "bridge" },
+  { bit: 8, label: "wlanAP" },
+  { bit: 16, label: "router" },
+  { bit: 32, label: "phone" },
+  { bit: 64, label: "docsis" },
+  { bit: 128, label: "stationOnly" },
+  { bit: 256, label: "cVLAN" },
+  { bit: 512, label: "sVLAN" },
+  { bit: 1024, label: "twoPortMACRelay" },
+];
+
+function _decodeCaps(mask: number | null | undefined): string {
+  if (mask == null) return "";
+  return _CAP_LABELS
+    .filter((c) => (mask & c.bit) !== 0)
+    .map((c) => c.label)
+    .join(", ");
+}
+
+function NeighboursTab({
+  deviceId,
+  vendor,
+}: {
+  deviceId: string;
+  vendor: string | null;
+}) {
+  const [page, setPage] = useState(1);
+  const [sysNameFilter, setSysNameFilter] = useState("");
+  const [chassisFilter, setChassisFilter] = useState("");
+  const pageSize = 50;
+
+  const params = useMemo<NetworkNeighbourQuery>(() => {
+    const p: NetworkNeighbourQuery = { page, page_size: pageSize };
+    if (sysNameFilter.trim()) p.sys_name = sysNameFilter.trim();
+    if (chassisFilter.trim()) p.chassis_id = chassisFilter.trim();
+    return p;
+  }, [page, sysNameFilter, chassisFilter]);
+
+  const { data, isFetching } = useQuery({
+    queryKey: ["network-neighbours", deviceId, params],
+    queryFn: () => networkApi.listNeighbours(deviceId, params),
+  });
+  const items = data?.items ?? [];
+  const enableCmd = _enableHint(vendor);
+
+  return (
+    <div className="space-y-3">
+      <p className="text-xs text-muted-foreground">
+        From LLDP-MIB <span className="font-mono">lldpRemTable</span>{" "}
+        (IEEE&nbsp;802.1AB). {data?.total ?? 0} neighbour
+        {(data?.total ?? 0) === 1 ? "" : "s"}.
+        {isFetching && <Loader2 className="ml-1 inline h-3 w-3 animate-spin" />}
+      </p>
+      {items.length === 0 && !isFetching && (
+        <div className="rounded-md border border-amber-500/30 bg-amber-500/5 p-3 text-xs text-amber-800 dark:text-amber-300">
+          <strong>No neighbours seen.</strong> LLDP is often disabled by default
+          or only on uplink ports. Check that LLDP is enabled on the device and
+          that the polling user can read the LLDP-MIB.
+          {enableCmd && (
+            <>
+              {" "}
+              For this vendor:{" "}
+              <code className="rounded bg-amber-500/10 px-1 py-0.5 font-mono">
+                {enableCmd}
+              </code>
+              .
+            </>
+          )}
+        </div>
+      )}
+      <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+        <input
+          className={inputCls}
+          placeholder="Filter by remote sys name"
+          value={sysNameFilter}
+          onChange={(e) => {
+            setSysNameFilter(e.target.value);
+            setPage(1);
+          }}
+        />
+        <input
+          className={inputCls}
+          placeholder="Filter by remote chassis id"
+          value={chassisFilter}
+          onChange={(e) => {
+            setChassisFilter(e.target.value);
+            setPage(1);
+          }}
+        />
+      </div>
+      <div className="overflow-x-auto rounded-lg border">
+        <table className="w-full min-w-[1100px] text-xs">
+          <thead>
+            <tr className="border-b bg-muted/30">
+              <th className="px-3 py-2 text-left font-medium">Local port</th>
+              <th className="px-3 py-2 text-left font-medium">Remote system</th>
+              <th className="px-3 py-2 text-left font-medium">Chassis ID</th>
+              <th className="px-3 py-2 text-left font-medium">Port ID</th>
+              <th className="px-3 py-2 text-left font-medium">Capabilities</th>
+              <th className="px-3 py-2 text-left font-medium">Last seen</th>
+            </tr>
+          </thead>
+          <tbody>
+            {items.length === 0 ? (
+              <tr>
+                <td
+                  colSpan={6}
+                  className="px-3 py-6 text-center text-muted-foreground"
+                >
+                  {isFetching ? "Loading…" : "No neighbours."}
+                </td>
+              </tr>
+            ) : (
+              items.map((n) => (
+                <tr key={n.id} className="border-b last:border-0">
+                  <td className="whitespace-nowrap px-3 py-1.5">
+                    {n.interface_name ?? (
+                      <span className="font-mono text-muted-foreground">
+                        port#{n.local_port_num}
+                      </span>
+                    )}
+                  </td>
+                  <td className="px-3 py-1.5">
+                    <div className="font-medium">
+                      {n.remote_sys_name ?? (
+                        <span className="text-muted-foreground">—</span>
+                      )}
+                    </div>
+                    {n.remote_sys_desc && (
+                      <div
+                        className="text-[10px] text-muted-foreground line-clamp-2"
+                        title={n.remote_sys_desc}
+                      >
+                        {n.remote_sys_desc}
+                      </div>
+                    )}
+                  </td>
+                  <td className="px-3 py-1.5 font-mono text-[11px]">
+                    <div>{n.remote_chassis_id}</div>
+                    <div className="text-[10px] text-muted-foreground">
+                      {LLDP_CHASSIS_ID_SUBTYPES[n.remote_chassis_id_subtype] ??
+                        `subtype ${n.remote_chassis_id_subtype}`}
+                    </div>
+                  </td>
+                  <td className="px-3 py-1.5 font-mono text-[11px]">
+                    <div>{n.remote_port_id}</div>
+                    {n.remote_port_desc && (
+                      <div className="text-[10px] text-muted-foreground">
+                        {n.remote_port_desc}
+                      </div>
+                    )}
+                    <div className="text-[10px] text-muted-foreground">
+                      {LLDP_PORT_ID_SUBTYPES[n.remote_port_id_subtype] ??
+                        `subtype ${n.remote_port_id_subtype}`}
+                    </div>
+                  </td>
+                  <td className="px-3 py-1.5 text-[11px] text-muted-foreground">
+                    {_decodeCaps(n.remote_sys_cap_enabled) || "—"}
+                  </td>
+                  <td
+                    className="whitespace-nowrap px-3 py-1.5 text-muted-foreground"
+                    title={n.last_seen}
+                  >
+                    {humanTime(n.last_seen)}
                   </td>
                 </tr>
               ))

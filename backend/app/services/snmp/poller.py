@@ -39,7 +39,7 @@ from .errors import (
     SNMPTimeoutError,
     SNMPTransportError,
 )
-from .oids import (
+from .oids import (  # noqa: F401  (some imports are surface API)
     OID_DOT1D_BASE_PORT_IF_INDEX,
     OID_DOT1D_TP_FDB_PORT,
     OID_DOT1D_TP_FDB_STATUS,
@@ -59,6 +59,14 @@ from .oids import (
     OID_IP_NTP_PHYS_ADDRESS,
     OID_IP_NTP_STATE,
     OID_IP_NTP_TYPE,
+    OID_LLDP_REM_CHASSIS_ID,
+    OID_LLDP_REM_CHASSIS_ID_SUBTYPE,
+    OID_LLDP_REM_PORT_DESC,
+    OID_LLDP_REM_PORT_ID,
+    OID_LLDP_REM_PORT_ID_SUBTYPE,
+    OID_LLDP_REM_SYS_CAP_ENABLED,
+    OID_LLDP_REM_SYS_DESC,
+    OID_LLDP_REM_SYS_NAME,
     OID_SYS_DESCR,
     OID_SYS_NAME,
     OID_SYS_OBJECT_ID,
@@ -113,6 +121,27 @@ class FdbData:
     fdb_type: str  # learned | static | mgmt | other
 
 
+@dataclass(frozen=True)
+class NeighbourData:
+    """One LLDP neighbour seen on a local interface.
+
+    Both ``chassis_id`` and ``port_id`` carry the same opaque-binary
+    semantics as the wire — formatting depends on the corresponding
+    subtype enum (``chassis_id_subtype`` / ``port_id_subtype``) which
+    is preserved for the persistence layer + UI to render correctly.
+    """
+
+    if_index: int  # local-port-num from the lldpRem index, treated as ifIndex
+    chassis_id_subtype: int  # 1..7 per LLDP-MIB LldpChassisIdSubtype
+    chassis_id: str  # decoded for the common subtypes (4=mac, 7=local), hex otherwise
+    port_id_subtype: int  # 1..7 per LLDP-MIB LldpPortIdSubtype
+    port_id: str
+    port_desc: str | None
+    sys_name: str | None
+    sys_desc: str | None
+    sys_cap_enabled: int | None  # bitmask per LLDP-MIB LldpSystemCapabilitiesMap
+
+
 # ── IF-MIB enum mapping ─────────────────────────────────────────────
 
 _IF_STATUS_MAP: dict[int, str] = {
@@ -145,6 +174,29 @@ _FDB_STATUS_MAP: dict[int, str] = {
     3: "learned",
     4: "self",
     5: "mgmt",
+}
+
+# LLDP-MIB LldpChassisIdSubtype + LldpPortIdSubtype enums. We don't
+# translate to strings inside the poller — the persistence layer
+# stores the raw int so the formatter has full fidelity. The
+# constant lives here for readability of the format helpers below.
+LLDP_CHASSIS_ID_SUBTYPES: dict[int, str] = {
+    1: "chassisComponent",
+    2: "interfaceAlias",
+    3: "portComponent",
+    4: "macAddress",
+    5: "networkAddress",
+    6: "interfaceName",
+    7: "local",
+}
+LLDP_PORT_ID_SUBTYPES: dict[int, str] = {
+    1: "interfaceAlias",
+    2: "portComponent",
+    3: "macAddress",
+    4: "networkAddress",
+    5: "interfaceName",
+    6: "agentCircuitId",
+    7: "local",
 }
 
 # Vendor heuristics from sysDescr substrings. Order matters — first
@@ -893,13 +945,164 @@ async def walk_fdb(device: NetworkDevice) -> list[FdbData]:
     return rows
 
 
+# ── LLDP-MIB lldpRemTable ────────────────────────────────────────────
+
+
+def _format_lldp_id(value: Any, subtype: int) -> str:
+    """Decode an LLDP chassis-id / port-id according to its subtype.
+
+    LLDP IDs are opaque binary on the wire; the subtype enum tells us
+    how to render. We fall back to a hex string for subtypes whose
+    contents are vendor-defined or carry binary chassisComponent
+    identifiers — surfacing raw hex is honest, and the operator can
+    cross-reference against vendor docs if needed.
+    """
+    if value is None:
+        return ""
+    # MAC address (subtype 4 for chassis, 3 for port) — most common.
+    if subtype in (3, 4):
+        try:
+            raw = bytes(value) if hasattr(value, "__iter__") else None
+            if raw is None and isinstance(value, str | bytes):
+                raw = value.encode("latin-1") if isinstance(value, str) else value
+            if raw is not None and len(raw) == 6:
+                return ":".join(f"{b:02x}" for b in raw)
+        except (TypeError, ValueError):
+            pass
+    # Interface name (chassis subtype 6, port subtype 5),
+    # interfaceAlias (chassis 2, port 1), local (chassis/port 7) —
+    # these are operator-readable text.
+    if subtype in (1, 2, 5, 6, 7):
+        try:
+            if isinstance(value, bytes):
+                return value.decode("utf-8", errors="replace").strip()
+            return str(value).strip()
+        except Exception:  # noqa: BLE001 — defensive
+            pass
+    # Fall back to hex.
+    try:
+        raw = bytes(value) if hasattr(value, "__iter__") else value.encode("latin-1")  # type: ignore[union-attr]
+        return raw.hex()
+    except (TypeError, ValueError, AttributeError):
+        return str(value)
+
+
+async def walk_lldp_neighbours(device: NetworkDevice) -> list[NeighbourData]:
+    """Walk LLDP-MIB lldpRemTable and return one row per neighbour.
+
+    Returns an empty list if the device doesn't speak LLDP-MIB
+    (``noSuchObject`` / ``endOfMibView``). That's a real outcome on
+    consumer firmware (UDM-SE / older RouterOS) and on switches
+    where LLDP is admin-disabled — the caller surfaces the empty
+    result as informational, not an error.
+
+    The lldpRemEntry index is ``timeMark.localPortNum.lldpRemIndex``;
+    we keep ``localPortNum`` as the local interface's ifIndex (the
+    default mapping on every tier-1 vendor we target). When that
+    assumption fails on a specific deployment we can enrich via
+    ``lldpLocPortIfIndex`` later without changing the schema.
+    """
+    hlapi = _import_hlapi()
+
+    rows: dict[tuple[int, int, int], dict[str, Any]] = {}
+    oids = [
+        OID_LLDP_REM_CHASSIS_ID_SUBTYPE,
+        OID_LLDP_REM_CHASSIS_ID,
+        OID_LLDP_REM_PORT_ID_SUBTYPE,
+        OID_LLDP_REM_PORT_ID,
+        OID_LLDP_REM_PORT_DESC,
+        OID_LLDP_REM_SYS_NAME,
+        OID_LLDP_REM_SYS_DESC,
+        OID_LLDP_REM_SYS_CAP_ENABLED,
+    ]
+    try:
+        async for oid_str, value in _walk_oids(device, oids, hlapi=hlapi):
+            for base, key in [
+                (OID_LLDP_REM_CHASSIS_ID_SUBTYPE, "chassis_subtype"),
+                (OID_LLDP_REM_CHASSIS_ID, "chassis_id"),
+                (OID_LLDP_REM_PORT_ID_SUBTYPE, "port_subtype"),
+                (OID_LLDP_REM_PORT_ID, "port_id"),
+                (OID_LLDP_REM_PORT_DESC, "port_desc"),
+                (OID_LLDP_REM_SYS_NAME, "sys_name"),
+                (OID_LLDP_REM_SYS_DESC, "sys_desc"),
+                (OID_LLDP_REM_SYS_CAP_ENABLED, "sys_cap_enabled"),
+            ]:
+                suffix = _suffix_after(oid_str, base)
+                if suffix is None:
+                    continue
+                parts = suffix.split(".")
+                if len(parts) < 3:
+                    break
+                try:
+                    time_mark = int(parts[0])
+                    local_port = int(parts[1])
+                    remote_index = int(parts[2])
+                except ValueError:
+                    break
+                rows.setdefault(
+                    (time_mark, local_port, remote_index),
+                    {"local_port": local_port},
+                )[key] = value
+                break
+    except SNMPProtocolError:
+        # Device doesn't expose LLDP-MIB. Empty result, not an error.
+        return []
+
+    out: list[NeighbourData] = []
+    for fields in rows.values():
+        chassis_subtype = _try_int(fields.get("chassis_subtype")) or 0
+        port_subtype = _try_int(fields.get("port_subtype")) or 0
+        chassis_id = _format_lldp_id(fields.get("chassis_id"), chassis_subtype)
+        port_id = _format_lldp_id(fields.get("port_id"), port_subtype)
+        # Drop rows whose mandatory IDs decoded to empty strings —
+        # those are usually mid-update wire reads we caught at the
+        # wrong tick.
+        if not chassis_id or not port_id:
+            continue
+        sys_name = fields.get("sys_name")
+        sys_desc = fields.get("sys_desc")
+        port_desc = fields.get("port_desc")
+
+        def _to_str(v: Any) -> str | None:
+            if v is None:
+                return None
+            try:
+                if isinstance(v, bytes):
+                    s = v.decode("utf-8", errors="replace")
+                else:
+                    s = str(v)
+                s = s.strip()
+                return s or None
+            except Exception:  # noqa: BLE001
+                return None
+
+        out.append(
+            NeighbourData(
+                if_index=fields["local_port"],
+                chassis_id_subtype=chassis_subtype,
+                chassis_id=chassis_id,
+                port_id_subtype=port_subtype,
+                port_id=port_id,
+                port_desc=_to_str(port_desc),
+                sys_name=_to_str(sys_name),
+                sys_desc=_to_str(sys_desc),
+                sys_cap_enabled=_try_int(fields.get("sys_cap_enabled")),
+            )
+        )
+    return out
+
+
 __all__ = [
     "SysInfo",
     "InterfaceData",
     "ArpData",
     "FdbData",
+    "NeighbourData",
+    "LLDP_CHASSIS_ID_SUBTYPES",
+    "LLDP_PORT_ID_SUBTYPES",
     "test_connection",
     "walk_interfaces",
     "walk_arp",
     "walk_fdb",
+    "walk_lldp_neighbours",
 ]

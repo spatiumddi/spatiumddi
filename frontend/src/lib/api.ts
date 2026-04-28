@@ -4126,6 +4126,7 @@ export interface NetworkDeviceRead {
   poll_arp: boolean;
   poll_fdb: boolean;
   poll_interfaces: boolean;
+  poll_lldp: boolean;
   auto_create_discovered: boolean;
   last_poll_at: string | null;
   next_poll_at: string | null;
@@ -4134,6 +4135,7 @@ export interface NetworkDeviceRead {
   last_poll_arp_count: number | null;
   last_poll_fdb_count: number | null;
   last_poll_interface_count: number | null;
+  last_poll_neighbour_count: number | null;
   ip_space_id: string;
   ip_space_name: string;
   is_active: boolean;
@@ -4179,6 +4181,7 @@ export interface NetworkDeviceCreate {
   poll_arp?: boolean;
   poll_fdb?: boolean;
   poll_interfaces?: boolean;
+  poll_lldp?: boolean;
   auto_create_discovered?: boolean;
   ip_space_id: string;
   is_active?: boolean;
@@ -4309,6 +4312,61 @@ export interface NetworkContextEntry {
   last_seen: string;
 }
 
+// LLDP-MIB chassis-id / port-id subtype enums kept in sync with the
+// backend poller. Used by the Neighbours tab to render the right
+// label next to opaque IDs (e.g. "MAC" vs "interfaceName").
+export const LLDP_CHASSIS_ID_SUBTYPES: Record<number, string> = {
+  1: "chassisComponent",
+  2: "interfaceAlias",
+  3: "portComponent",
+  4: "macAddress",
+  5: "networkAddress",
+  6: "interfaceName",
+  7: "local",
+};
+export const LLDP_PORT_ID_SUBTYPES: Record<number, string> = {
+  1: "interfaceAlias",
+  2: "portComponent",
+  3: "macAddress",
+  4: "networkAddress",
+  5: "interfaceName",
+  6: "agentCircuitId",
+  7: "local",
+};
+
+export interface NetworkNeighbourRead {
+  id: string;
+  device_id: string;
+  interface_id: string | null;
+  interface_name: string | null;
+  local_port_num: number;
+  remote_chassis_id_subtype: number;
+  remote_chassis_id: string;
+  remote_port_id_subtype: number;
+  remote_port_id: string;
+  remote_port_desc: string | null;
+  remote_sys_name: string | null;
+  remote_sys_desc: string | null;
+  remote_sys_cap_enabled: number | null;
+  first_seen: string;
+  last_seen: string;
+}
+
+export interface NetworkNeighbourListResponse {
+  items: NetworkNeighbourRead[];
+  total: number;
+  page: number;
+  page_size: number;
+}
+
+export interface NetworkNeighbourQuery {
+  sys_name?: string;
+  chassis_id?: string;
+  interface_id?: string;
+  page?: number;
+  page_size?: number;
+}
+
 export const networkApi = {
   listDevices: (params?: NetworkDeviceListQuery) =>
     api
@@ -4352,6 +4410,13 @@ export const networkApi = {
       .get<NetworkFdbListResponse>(`/network-devices/${deviceId}/fdb`, {
         params,
       })
+      .then((r) => r.data),
+  listNeighbours: (deviceId: string, params?: NetworkNeighbourQuery) =>
+    api
+      .get<NetworkNeighbourListResponse>(
+        `/network-devices/${deviceId}/neighbours`,
+        { params },
+      )
       .then((r) => r.data),
   // Mounted under /ipam/addresses/{address_id}/network-context but exposed
   // here so all network-discovery client wrappers live in one place.

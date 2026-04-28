@@ -167,6 +167,16 @@ class NetworkDevice(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         back_populates="device",
         cascade="all, delete-orphan",
     )
+    neighbours: Mapped[list[NetworkNeighbour]] = relationship(
+        "NetworkNeighbour",
+        back_populates="device",
+        cascade="all, delete-orphan",
+    )
+
+    last_poll_neighbour_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    poll_lldp: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default="true"
+    )
 
 
 class NetworkInterface(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -302,9 +312,83 @@ class NetworkFdbEntry(UUIDPrimaryKeyMixin, Base):
     device: Mapped[NetworkDevice] = relationship("NetworkDevice", back_populates="fdb_entries")
 
 
+class NetworkNeighbour(UUIDPrimaryKeyMixin, Base):
+    """An LLDP neighbour discovered on a local interface.
+
+    One row per ``(device, local_interface, remote_chassis_id,
+    remote_port_id)`` tuple — that's the same compound key LLDP
+    itself uses to dedupe neighbours over time. ``chassis_id`` and
+    ``port_id`` are stored verbatim as decoded by the poller (MAC
+    string for the common subtypes, hex for vendor-defined ones);
+    the matching ``*_subtype`` columns let the UI render correctly.
+
+    FDB rows are absence-deleted on every poll; we mirror that here
+    — neighbours that aged out of the wire's lldpRemTable disappear
+    from the DB on the next poll. Operators looking for historical
+    "what used to be plugged here" should use the audit log.
+    """
+
+    __tablename__ = "network_neighbour"
+    __table_args__ = (
+        UniqueConstraint(
+            "device_id",
+            "interface_id",
+            "remote_chassis_id",
+            "remote_port_id",
+            name="uq_network_neighbour_device_iface_remote",
+        ),
+        Index("ix_network_neighbour_device", "device_id"),
+        Index("ix_network_neighbour_remote_sys_name", "remote_sys_name"),
+        Index("ix_network_neighbour_remote_chassis_id", "remote_chassis_id"),
+    )
+
+    device_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("network_device.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    interface_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("network_interface.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    # Raw local-port-num from the LLDP index. We persist it
+    # alongside ``interface_id`` because devices that haven't been
+    # polled for ifTable yet still need a stable identifier here.
+    local_port_num: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    # 1=chassisComponent, 2=interfaceAlias, 3=portComponent,
+    # 4=macAddress, 5=networkAddress, 6=interfaceName, 7=local —
+    # see LLDP-MIB LldpChassisIdSubtype.
+    remote_chassis_id_subtype: Mapped[int] = mapped_column(Integer, nullable=False)
+    remote_chassis_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    # 1=interfaceAlias, 2=portComponent, 3=macAddress, 4=networkAddress,
+    # 5=interfaceName, 6=agentCircuitId, 7=local — LldpPortIdSubtype.
+    remote_port_id_subtype: Mapped[int] = mapped_column(Integer, nullable=False)
+    remote_port_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    remote_port_desc: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    remote_sys_name: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    remote_sys_desc: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Bitmask per LldpSystemCapabilitiesMap (1=other, 2=repeater,
+    # 4=bridge, 8=wlanAccessPoint, 16=router, 32=telephone,
+    # 64=docsisCableDevice, 128=stationOnly, 256=cVLANComponent,
+    # 512=sVLANComponent, 1024=twoPortMACRelay).
+    remote_sys_cap_enabled: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    first_seen: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    last_seen: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    device: Mapped[NetworkDevice] = relationship("NetworkDevice", back_populates="neighbours")
+
+
 __all__ = [
     "NetworkDevice",
     "NetworkInterface",
     "NetworkArpEntry",
     "NetworkFdbEntry",
+    "NetworkNeighbour",
 ]

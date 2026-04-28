@@ -118,6 +118,7 @@ export function DeviceFormModal({
   const [pollInterfaces, setPollInterfaces] = useState(
     device?.poll_interfaces ?? true,
   );
+  const [pollLldp, setPollLldp] = useState(device?.poll_lldp ?? true);
   const [autoCreate, setAutoCreate] = useState(
     device?.auto_create_discovered ?? false,
   );
@@ -182,6 +183,7 @@ export function DeviceFormModal({
       poll_arp: pollArp,
       poll_fdb: pollFdb,
       poll_interfaces: pollInterfaces,
+      poll_lldp: pollLldp,
       auto_create_discovered: autoCreate,
       ip_space_id: ipSpaceId,
       is_active: isActive,
@@ -222,6 +224,7 @@ export function DeviceFormModal({
       poll_arp: pollArp,
       poll_fdb: pollFdb,
       poll_interfaces: pollInterfaces,
+      poll_lldp: pollLldp,
       auto_create_discovered: autoCreate,
       ip_space_id: ipSpaceId,
       is_active: isActive,
@@ -626,6 +629,14 @@ export function DeviceFormModal({
                 onChange={(e) => setPollFdb(e.target.checked)}
               />
               Poll FDB
+            </label>
+            <label className="flex items-center gap-2 text-sm">
+              <input
+                type="checkbox"
+                checked={pollLldp}
+                onChange={(e) => setPollLldp(e.target.checked)}
+              />
+              Poll LLDP
             </label>
           </div>
           <label className="flex items-start gap-2 text-sm">

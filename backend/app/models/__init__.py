@@ -53,6 +53,7 @@ from app.models.network import (
     NetworkDevice,
     NetworkFdbEntry,
     NetworkInterface,
+    NetworkNeighbour,
 )
 from app.models.nmap import NmapScan
 from app.models.oui import OUIVendor
@@ -125,5 +126,6 @@ __all__ = [
     "NetworkInterface",
     "NetworkArpEntry",
     "NetworkFdbEntry",
+    "NetworkNeighbour",
     "NmapScan",
 ]

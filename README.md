@@ -77,7 +77,7 @@
 
 | | Feature | Highlights |
 |---|---|---|
-| 📡 | **SNMP discovery** | v1 / v2c / v3 polling of routers + switches → ARP / FDB / interfaces feed back into IPAM |
+| 📡 | **SNMP discovery** | v1 / v2c / v3 polling of routers + switches → ARP / FDB / interfaces / LLDP neighbours feed back into IPAM |
 | 🎯 | **Nmap scanner** | per-IP "Scan with Nmap" + `/tools/nmap` + live SSE output streaming |
 | 🏷 | **OUI vendor lookup** | MAC → vendor names in IP tables, DHCP leases, search filters |
 | 🎨 | **Dashboards** | utilization heatmap · DNS query rate · DHCP traffic · platform health card |
@@ -128,7 +128,7 @@ The tables above are the elevator pitch. The bullets here are the same surface w
 
 ### Discovery & visibility
 
-- 📡 **SNMP discovery** — v1 / v2c / v3 polling of routers + switches via standard MIBs (IF-MIB, IP-MIB, Q-BRIDGE-MIB) — interfaces, ARP, and FDB feed back into IPAM with per-IP switch-port + VLAN visibility
+- 📡 **SNMP discovery** — v1 / v2c / v3 polling of routers + switches via standard MIBs (IF-MIB, IP-MIB, Q-BRIDGE-MIB, LLDP-MIB) — interfaces, ARP, FDB, and LLDP neighbours feed back into IPAM with per-IP switch-port + VLAN visibility and a Neighbours tab on each device
 - 🎯 **Nmap scanner** — per-IP "Scan with Nmap" launches preset or custom scans (quick / service-version / OS / default-scripts / UDP top-100 / aggressive); live SSE output streams to the browser; structured XML parsed into a results panel; standalone `/tools/nmap` page for ad-hoc targets
 - 🎨 **Dashboard-at-a-glance** — sub-tabs for Overview / IPAM / DNS / DHCP, platform health card (API / Postgres / Redis / workers / beat), live DNS query rate + DHCP traffic charts (BIND9 statistics-channels + Kea `statistic-get-all`, self-contained — no Prometheus needed), subnet utilization heatmap, and live activity feed
 - 📊 **Platform Insights admin page** — read-only Postgres diagnostics (DB size, cache hit ratio, WAL position, slow queries via `pg_stat_statements`, table sizes, idle-in-transaction watch) + per-container CPU / memory / network / IO from the local Docker socket. Native, no extra agents

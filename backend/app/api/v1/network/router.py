@@ -34,6 +34,7 @@ from app.models.network import (
     NetworkDevice,
     NetworkFdbEntry,
     NetworkInterface,
+    NetworkNeighbour,
 )
 from app.services.snmp.errors import (
     SNMPAuthError,
@@ -53,6 +54,8 @@ from .schemas import (
     NetworkFdbRead,
     NetworkInterfaceListResponse,
     NetworkInterfaceRead,
+    NetworkNeighbourListResponse,
+    NetworkNeighbourRead,
     PollNowResult,
     TestConnectionResult,
 )
@@ -99,6 +102,7 @@ def _to_read(device: NetworkDevice, ip_space_name: str | None) -> NetworkDeviceR
         poll_arp=device.poll_arp,
         poll_fdb=device.poll_fdb,
         poll_interfaces=device.poll_interfaces,
+        poll_lldp=device.poll_lldp,
         auto_create_discovered=device.auto_create_discovered,
         last_poll_at=device.last_poll_at,
         next_poll_at=device.next_poll_at,
@@ -107,6 +111,7 @@ def _to_read(device: NetworkDevice, ip_space_name: str | None) -> NetworkDeviceR
         last_poll_arp_count=device.last_poll_arp_count,
         last_poll_fdb_count=device.last_poll_fdb_count,
         last_poll_interface_count=device.last_poll_interface_count,
+        last_poll_neighbour_count=device.last_poll_neighbour_count,
         ip_space_id=device.ip_space_id,
         ip_space_name=ip_space_name,
         is_active=device.is_active,
@@ -241,6 +246,7 @@ async def create_device(
         poll_arp=body.poll_arp,
         poll_fdb=body.poll_fdb,
         poll_interfaces=body.poll_interfaces,
+        poll_lldp=body.poll_lldp,
         auto_create_discovered=body.auto_create_discovered,
         ip_space_id=body.ip_space_id,
         is_active=body.is_active,
@@ -570,6 +576,65 @@ async def list_fdb(
         for r in rows
     ]
     return NetworkFdbListResponse(items=items, total=total, page=page, page_size=page_size)
+
+
+@router.get(
+    "/network-devices/{device_id}/neighbours",
+    response_model=NetworkNeighbourListResponse,
+)
+async def list_neighbours(
+    device_id: uuid.UUID,
+    db: DB,
+    current_user: CurrentUser,
+    sys_name: str | None = Query(None),
+    chassis_id: str | None = Query(None),
+    interface_id: uuid.UUID | None = Query(None),
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=2000),
+) -> NetworkNeighbourListResponse:
+    """List LLDP neighbours discovered on this device.
+
+    Mirrors the FDB / ARP listing shape — paginated envelope, filter
+    knobs for the columns most operators search by, interface-name
+    join hydrated server-side so the frontend doesn't have to
+    fan-out per row.
+    """
+    if not user_has_permission(current_user, "read", PERMISSION):
+        raise HTTPException(status_code=403, detail="Permission denied")
+    await _ensure_device(db, device_id)
+    base = select(NetworkNeighbour).where(NetworkNeighbour.device_id == device_id)
+    if sys_name:
+        base = base.where(NetworkNeighbour.remote_sys_name.ilike(f"%{sys_name}%"))
+    if chassis_id:
+        base = base.where(NetworkNeighbour.remote_chassis_id == chassis_id.lower())
+    if interface_id is not None:
+        base = base.where(NetworkNeighbour.interface_id == interface_id)
+    total = int((await db.execute(select(func.count()).select_from(base.subquery()))).scalar_one())
+    stmt = (
+        base.order_by(NetworkNeighbour.last_seen.desc())
+        .limit(page_size)
+        .offset((page - 1) * page_size)
+    )
+    rows = list((await db.execute(stmt)).scalars().all())
+    if_ids = {r.interface_id for r in rows if r.interface_id is not None}
+    name_by_if: dict[uuid.UUID, str] = {}
+    if if_ids:
+        for ifrow in (
+            (await db.execute(select(NetworkInterface).where(NetworkInterface.id.in_(if_ids))))
+            .scalars()
+            .all()
+        ):
+            name_by_if[ifrow.id] = ifrow.name
+    items = [
+        NetworkNeighbourRead.model_validate(
+            {
+                **{c.name: getattr(r, c.name) for c in r.__table__.columns},
+                "interface_name": (name_by_if.get(r.interface_id) if r.interface_id else None),
+            }
+        )
+        for r in rows
+    ]
+    return NetworkNeighbourListResponse(items=items, total=total, page=page, page_size=page_size)
 
 
 __all__ = ["router"]

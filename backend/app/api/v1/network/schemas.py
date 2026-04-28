@@ -46,6 +46,7 @@ class NetworkDeviceCreate(BaseModel):
     poll_arp: bool = True
     poll_fdb: bool = True
     poll_interfaces: bool = True
+    poll_lldp: bool = True
     auto_create_discovered: bool = False
 
     # Binding
@@ -115,6 +116,7 @@ class NetworkDeviceUpdate(BaseModel):
     poll_arp: bool | None = None
     poll_fdb: bool | None = None
     poll_interfaces: bool | None = None
+    poll_lldp: bool | None = None
     auto_create_discovered: bool | None = None
 
     ip_space_id: uuid.UUID | None = None
@@ -154,6 +156,7 @@ class NetworkDeviceRead(BaseModel):
     poll_arp: bool
     poll_fdb: bool
     poll_interfaces: bool
+    poll_lldp: bool
     auto_create_discovered: bool
 
     last_poll_at: datetime | None
@@ -163,6 +166,7 @@ class NetworkDeviceRead(BaseModel):
     last_poll_arp_count: int | None
     last_poll_fdb_count: int | None
     last_poll_interface_count: int | None
+    last_poll_neighbour_count: int | None
 
     ip_space_id: uuid.UUID
     ip_space_name: str | None
@@ -302,6 +306,40 @@ class NetworkArpListResponse(BaseModel):
 
 class NetworkFdbListResponse(BaseModel):
     items: list[NetworkFdbRead]
+    total: int
+    page: int
+    page_size: int
+
+
+class NetworkNeighbourRead(BaseModel):
+    """One LLDP neighbour seen on a local interface.
+
+    The ``*_subtype`` integers come straight from the wire so the
+    frontend can render the matching label (mac vs interfaceName vs
+    local etc). The frontend's ``LLDP_CHASSIS_ID_SUBTYPES`` /
+    ``LLDP_PORT_ID_SUBTYPES`` maps are kept in sync with the backend
+    poller's enums.
+    """
+
+    id: uuid.UUID
+    device_id: uuid.UUID
+    interface_id: uuid.UUID | None
+    interface_name: str | None = None  # joined for UI convenience
+    local_port_num: int
+    remote_chassis_id_subtype: int
+    remote_chassis_id: str
+    remote_port_id_subtype: int
+    remote_port_id: str
+    remote_port_desc: str | None
+    remote_sys_name: str | None
+    remote_sys_desc: str | None
+    remote_sys_cap_enabled: int | None
+    first_seen: datetime
+    last_seen: datetime
+
+
+class NetworkNeighbourListResponse(BaseModel):
+    items: list[NetworkNeighbourRead]
     total: int
     page: int
     page_size: int

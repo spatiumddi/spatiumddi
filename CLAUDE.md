@@ -363,8 +363,10 @@ categorised section further down.
     skip).
 
   **Deferred follow-ups:**
-  - **LLDP / CDP neighbour collection** + topology graph — its
-    own ⬜ item under the categorised brainstorm below.
+  - **CDP neighbour collection** + topology graph. LLDP shipped
+    in the categorised brainstorm section below; CDP (Cisco-only)
+    deferred — modern Cisco gear runs LLDP alongside CDP, so the
+    standard-MIB path covers the typical case.
   - **VRF-aware ARP polling.** `network_device.v3_context_name`
     column exists for SNMPv3 context-name targeting, but the
     poller doesn't iterate per-VRF in v1. Per-VRF SNMPv2c
@@ -1141,14 +1143,33 @@ None of these have started; everything below is ⬜.
 
 #### Discovery & network awareness
 
-- ⬜ **LLDP / CDP neighbour collection** — once SNMP polling
-  lands (already tracked above), walk `lldpRemTable` (LLDP-MIB)
-  and `cdpCacheTable` (CISCO-CDP-MIB) per device to record
-  adjacencies. New `network_neighbour` table (`local_device_id`,
-  `local_port`, `remote_chassis_id`, `remote_system_name`,
-  `remote_port_id`, `last_seen_at`). Powers a topology graph on
-  the dashboard and "where is this MAC plugged in?" drilldown
-  when paired with FDB data.
+- ✅ **LLDP neighbour collection** — vendor-neutral via
+  LLDP-MIB (IEEE 802.1AB) `lldpRemTable`. Per-device opt-in
+  `poll_lldp` toggle (default on); polled as a 5th step after
+  ARP / FDB in `app.tasks.snmp_poll.poll_device`.
+  `network_neighbour` table keyed
+  `(device_id, interface_id, remote_chassis_id, remote_port_id)`
+  with absence-delete every poll so stale neighbours fall off
+  cleanly. Captures remote chassis ID + port ID (with subtype
+  decoding — MAC addresses formatted, interface names left
+  raw), system name + description, port description, and a
+  decoded capabilities bitmask (Bridge / Router / WLAN AP /
+  Phone / Repeater / Other / Station / DocsisCableDevice).
+  API: `GET /api/v1/network-devices/{id}/neighbours` with
+  `sys_name` (ilike) / `chassis_id` / `interface_id` filters.
+  Frontend: new "Neighbours" tab on the network device detail
+  view, with vendor-aware enable hints (Cisco IOS / NX-OS,
+  Junos, Arista EOS, ProCurve / Aruba, MikroTik RouterOS,
+  OPNsense / pfSense) when no rows are present. Migration
+  `b9e4d2a17c83_network_neighbour`. **Deferred:** CDP polling
+  (Cisco-only — LLDP usually runs alongside on modern gear);
+  topology graph rendering (the data is captured, the graph UI
+  isn't built yet); IP cross-reference via
+  `lldpRemManAddrTable`; per-port enrichment via
+  `lldpLocPortIfIndex` to resolve LLDP's own port numbering to
+  ifIndex (today the local port is recorded by SNMP-side
+  ifIndex via the FDB / interface walk, not LLDP's local
+  port-num index).
 - ⬜ **NetFlow / sFlow ingestion** — bind a UDP listener
   (sflowtool / goflow2 sidecar, or pure-Python decoder) and
   aggregate to per-IP byte / packet / flow counters in 5-minute
