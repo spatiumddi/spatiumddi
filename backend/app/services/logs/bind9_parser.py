@@ -68,11 +68,7 @@ _QUERY_SEP_RE: Final = re.compile(r":\s+query:\s+", re.IGNORECASE)
 # follow-up regex against the *remainder* — no two ``\s+``-anchored
 # optionals competing for the same whitespace run.
 _HEAD_RE: Final = re.compile(
-    r"^client\s+"
-    r"(?:@\S+\s+)?"
-    r"(?P<client_ip>\S+?)"
-    r"#(?P<client_port>\d+)"
-    r"(?P<rest>.*)$",
+    r"^client\s+" r"(?:@\S+\s+)?" r"(?P<client_ip>\S+?)" r"#(?P<client_port>\d+)" r"(?P<rest>.*)$",
     re.DOTALL,
 )
 
