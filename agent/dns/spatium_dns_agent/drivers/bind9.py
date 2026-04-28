@@ -110,13 +110,29 @@ class Bind9Driver(DriverBase):
             zname = zone.get("name") or ""
             if not zname:
                 continue
+            zone_type = zone.get("type", "primary")
+            # Forward zones: BIND9 doesn't expect a file or allow-update — just
+            # a forwarders block. Skip the per-zone file write entirely.
+            if zone_type == "forward":
+                fwds = [str(f) for f in (zone.get("forwarders") or []) if f]
+                if not fwds:
+                    # Forward zone with no upstreams is invalid — skip rather
+                    # than emit a malformed stanza.
+                    continue
+                forward_only = bool(zone.get("forward_only", True))
+                policy = "only" if forward_only else "first"
+                conf += (
+                    f'zone "{zname}" {{ type forward; '
+                    f"forward {policy}; "
+                    f'forwarders {{ {"; ".join(fwds)}; }}; }};\n'
+                )
+                continue
             # Relative path used inside the rendered tree; absolute path
             # written into named.conf so BIND9 doesn't resolve against its
             # `directory` (which is /var/cache/bind, not our rendered tree).
             rel_zfile = f"zones/{zname.rstrip('.')}.db"
             current_dir = self.state_dir / self.rendered_dir_name
             abs_zfile = current_dir / rel_zfile
-            zone_type = zone.get("type", "primary")
             bind_type = "master" if zone_type in {"primary", "master"} else "slave"
             allow_update = (
                 f'allow-update {{ key "{tsig_key_name}"; }}; ' if tsig_key_name else ""

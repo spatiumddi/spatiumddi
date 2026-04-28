@@ -17,6 +17,7 @@ from sqlalchemy import (
     UniqueConstraint,
     func,
 )
+from sqlalchemy import text as sa_text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -431,6 +432,17 @@ class DNSZone(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     allow_transfer: Mapped[list | None] = mapped_column(JSONB, nullable=True)
     also_notify: Mapped[list | None] = mapped_column(JSONB, nullable=True)
     notify_enabled: Mapped[str | None] = mapped_column(String(20), nullable=True)
+
+    # Conditional-forwarder config. Only meaningful when ``zone_type == "forward"``.
+    # ``forwarders`` is the upstream resolver list (IP or IP@port strings).
+    # ``forward_only`` true → ``forward only;`` (don't fall through to recursion);
+    # false → ``forward first;`` (fall through if all forwarders fail).
+    forwarders: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=sa_text("'[]'::jsonb")
+    )
+    forward_only: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=sa_text("true")
+    )
 
     group: Mapped["DNSServerGroup"] = relationship("DNSServerGroup", back_populates="zones")
     view: Mapped["DNSView | None"] = relationship("DNSView", back_populates="zones")

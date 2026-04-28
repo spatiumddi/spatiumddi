@@ -55,6 +55,12 @@ class ZoneData:
     also_notify: tuple[str, ...] | None = None
     notify_enabled: str | None = None
     view_name: str | None = None
+    # Forward-zone fields. Only meaningful when ``zone_type == "forward"``;
+    # ignored otherwise. ``forwarders`` is the upstream resolver list and
+    # ``forward_only`` toggles "forward only;" (true) vs "forward first;"
+    # (false — the resolver may fall back to recursion if all forwarders fail).
+    forwarders: tuple[str, ...] = ()
+    forward_only: bool = True
 
 
 @dataclass(frozen=True)

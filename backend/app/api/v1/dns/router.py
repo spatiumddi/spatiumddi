@@ -499,6 +499,10 @@ class ZoneCreate(BaseModel):
     allow_transfer: list[str] | None = None
     also_notify: list[str] | None = None
     notify_enabled: str | None = None
+    # Forward-zone fields. Required when ``zone_type == "forward"``;
+    # ignored otherwise.
+    forwarders: list[str] = []
+    forward_only: bool = True
 
     @field_validator("zone_type")
     @classmethod
@@ -541,6 +545,8 @@ class ZoneUpdate(BaseModel):
     allow_transfer: list[str] | None = None
     also_notify: list[str] | None = None
     notify_enabled: str | None = None
+    forwarders: list[str] | None = None
+    forward_only: bool | None = None
 
     @field_validator("zone_type")
     @classmethod
@@ -591,6 +597,8 @@ class ZoneResponse(BaseModel):
     allow_transfer: list[str] | None
     also_notify: list[str] | None
     notify_enabled: str | None
+    forwarders: list[str]
+    forward_only: bool
     # Non-null when the zone was synthesised by the Tailscale Phase 2
     # reconciler. The UI uses this to render a read-only badge and
     # disable edit/delete controls; the API enforces it on the

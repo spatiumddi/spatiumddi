@@ -200,6 +200,8 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
                 also_notify=_tuple_or_none(z.also_notify),
                 notify_enabled=z.notify_enabled,
                 view_name=view_name,
+                forwarders=tuple(z.forwarders or ()),
+                forward_only=bool(z.forward_only),
             )
         )
 

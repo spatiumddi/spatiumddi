@@ -28,7 +28,11 @@ import {
   Filter,
   Search,
   ListTree,
+  Radar,
+  Sparkles,
 } from "lucide-react";
+import { PropagationCheckModal } from "./PropagationCheckModal";
+import { BlocklistCatalogModal } from "./BlocklistCatalogModal";
 import { Modal } from "@/components/ui/modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import {
@@ -1113,6 +1117,11 @@ function ZoneModal({
   const [ttl, setTtl] = useState(String(zone?.ttl ?? 3600));
   const [dnssec, setDnssec] = useState(zone?.dnssec_enabled ?? false);
   const [color, setColor] = useState<string | null>(zone?.color ?? null);
+  // Forward-zone config — only shown / submitted when zoneType === "forward".
+  const [forwardersText, setForwardersText] = useState(
+    (zone?.forwarders ?? []).join(", "),
+  );
+  const [forwardOnly, setForwardOnly] = useState(zone?.forward_only ?? true);
   const [error, setError] = useState("");
 
   const mut = useMutation({
@@ -1130,7 +1139,7 @@ function ZoneModal({
   function submit(e: React.FormEvent) {
     e.preventDefault();
     setError("");
-    mut.mutate({
+    const payload: Record<string, unknown> = {
       name,
       zone_type: zoneType,
       kind,
@@ -1140,7 +1149,20 @@ function ZoneModal({
       ttl: parseInt(ttl, 10),
       dnssec_enabled: dnssec,
       color,
-    });
+    };
+    if (zoneType === "forward") {
+      const fwds = forwardersText
+        .split(/[,\s]+/)
+        .map((s) => s.trim())
+        .filter(Boolean);
+      if (fwds.length === 0) {
+        setError("Forward zones need at least one forwarder IP");
+        return;
+      }
+      payload.forwarders = fwds;
+      payload.forward_only = forwardOnly;
+    }
+    mut.mutate(payload);
   }
 
   return (
@@ -1186,6 +1208,40 @@ function ZoneModal({
             </select>
           </Field>
         </div>
+        {zoneType === "forward" && (
+          <div className="space-y-3 rounded border border-dashed bg-muted/20 p-3">
+            <p className="text-[11px] text-muted-foreground">
+              <strong>Conditional forwarder.</strong> Queries for{" "}
+              <span className="font-mono">{name || "this zone"}</span> are
+              relayed to the upstream resolvers below — typical use is
+              "forward <code>corp.local</code> to the AD DNS at
+              10.0.0.5". Records on the zone are ignored when the type is
+              forward.
+            </p>
+            <Field label="Forwarder IPs (comma- or space-separated)">
+              <input
+                className={inputCls}
+                value={forwardersText}
+                onChange={(e) => setForwardersText(e.target.value)}
+                placeholder="10.0.0.5, 10.0.0.6"
+              />
+            </Field>
+            <Field label="Fallback policy">
+              <select
+                className={inputCls}
+                value={forwardOnly ? "only" : "first"}
+                onChange={(e) => setForwardOnly(e.target.value === "only")}
+              >
+                <option value="only">
+                  forward only — never fall back to recursion
+                </option>
+                <option value="first">
+                  forward first — fall back if all forwarders fail
+                </option>
+              </select>
+            </Field>
+          </div>
+        )}
         {views.length > 0 && (
           <Field label="View (optional)">
             <select
@@ -1488,6 +1544,9 @@ function ZoneDetailView({
   const qc = useQueryClient();
   const [showAddRecord, setShowAddRecord] = useState(false);
   const [editRecord, setEditRecord] = useState<DNSRecord | null>(null);
+  const [propagationRecord, setPropagationRecord] = useState<DNSRecord | null>(
+    null,
+  );
   const [showEditZone, setShowEditZone] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [showImport, setShowImport] = useState(false);
@@ -1577,6 +1636,11 @@ function ZoneDetailView({
     },
   });
 
+  // Forward zones have no records — they just hand queries off to the
+  // listed forwarders. The detail surface below swaps the records table
+  // for a forwarders/policy panel and hides the record-management buttons.
+  const isForward = zone.zone_type === "forward";
+
   const recordTypes = [...new Set(records.map((r) => r.record_type))].sort();
   const hasRecFilter = Object.values(recFilter).some(Boolean);
   const filtered = records.filter((r) => {
@@ -1649,32 +1713,38 @@ function ZoneDetailView({
           </p>
         </div>
         <div className="flex items-center gap-2">
-          <HeaderButton
-            icon={RefreshCw}
-            iconClassName={isFetching ? "animate-spin" : ""}
-            onClick={() =>
-              qc.invalidateQueries({ queryKey: ["dns-records", zone.id] })
-            }
-            disabled={isFetching}
-            title="Reload the record list from SpatiumDDI (does not re-query the DNS server)"
-          >
-            Refresh
-          </HeaderButton>
-          <HeaderButton
-            icon={RefreshCw}
-            iconClassName={syncMut.isPending ? "animate-spin" : ""}
-            onClick={() => syncMut.mutate()}
-            disabled={syncMut.isPending}
-            title="Two-way additive sync with the zone's authoritative server: AXFR missing records into SpatiumDDI, then push anything in our DB that isn't on the wire. Never deletes."
-          >
-            {syncMut.isPending ? "Syncing…" : "Sync with server"}
-          </HeaderButton>
-          <HeaderButton icon={Upload} onClick={() => setShowImport(true)}>
-            Import
-          </HeaderButton>
-          <HeaderButton icon={Download} onClick={handleExport}>
-            Export
-          </HeaderButton>
+          {!isForward && (
+            <HeaderButton
+              icon={RefreshCw}
+              iconClassName={isFetching ? "animate-spin" : ""}
+              onClick={() =>
+                qc.invalidateQueries({ queryKey: ["dns-records", zone.id] })
+              }
+              disabled={isFetching}
+              title="Reload the record list from SpatiumDDI (does not re-query the DNS server)"
+            >
+              Refresh
+            </HeaderButton>
+          )}
+          {!isForward && (
+            <>
+              <HeaderButton
+                icon={RefreshCw}
+                iconClassName={syncMut.isPending ? "animate-spin" : ""}
+                onClick={() => syncMut.mutate()}
+                disabled={syncMut.isPending}
+                title="Two-way additive sync with the zone's authoritative server: AXFR missing records into SpatiumDDI, then push anything in our DB that isn't on the wire. Never deletes."
+              >
+                {syncMut.isPending ? "Syncing…" : "Sync with server"}
+              </HeaderButton>
+              <HeaderButton icon={Upload} onClick={() => setShowImport(true)}>
+                Import
+              </HeaderButton>
+              <HeaderButton icon={Download} onClick={handleExport}>
+                Export
+              </HeaderButton>
+            </>
+          )}
           <HeaderButton
             icon={Pencil}
             onClick={() => setShowEditZone(true)}
@@ -1700,24 +1770,86 @@ function ZoneDetailView({
           >
             Delete Zone
           </HeaderButton>
-          <HeaderButton
-            variant="primary"
-            icon={Plus}
-            onClick={() => setShowAddRecord(true)}
-            disabled={!!zone.tailscale_tenant_id}
-            title={
-              zone.tailscale_tenant_id
-                ? "Records are managed by the Tailscale reconciler."
-                : undefined
-            }
-          >
-            Add Record
-          </HeaderButton>
+          {!isForward && (
+            <HeaderButton
+              variant="primary"
+              icon={Plus}
+              onClick={() => setShowAddRecord(true)}
+              disabled={!!zone.tailscale_tenant_id}
+              title={
+                zone.tailscale_tenant_id
+                  ? "Records are managed by the Tailscale reconciler."
+                  : undefined
+              }
+            >
+              Add Record
+            </HeaderButton>
+          )}
         </div>
       </div>
 
+      {/* Forward-zone detail — no records, just forwarders + policy. */}
+      {isForward && (
+        <div className="flex-1 overflow-auto px-5 py-4">
+          <div className="max-w-2xl space-y-4">
+            <div className="rounded border bg-card p-4 text-sm">
+              <p className="text-xs text-muted-foreground">
+                <strong className="text-foreground">Conditional forwarder.</strong>{" "}
+                Queries for{" "}
+                <code className="rounded bg-muted px-1 py-0.5 font-mono text-xs">
+                  {zone.name.replace(/\.$/, "")}
+                </code>{" "}
+                are sent to the upstream resolvers below — no records are stored
+                in SpatiumDDI for this zone.
+              </p>
+            </div>
+
+            <div className="rounded border bg-card">
+              <div className="border-b px-4 py-2 text-xs font-medium text-muted-foreground">
+                Forwarders
+              </div>
+              <div className="divide-y">
+                {zone.forwarders.length === 0 ? (
+                  <p className="px-4 py-3 text-sm italic text-muted-foreground">
+                    No forwarders configured. Click <em>Edit Zone</em> to add
+                    upstream resolvers.
+                  </p>
+                ) : (
+                  zone.forwarders.map((ip, i) => (
+                    <div
+                      key={`${ip}-${i}`}
+                      className="px-4 py-2 font-mono text-sm"
+                    >
+                      {ip}
+                    </div>
+                  ))
+                )}
+              </div>
+            </div>
+
+            <div className="rounded border bg-card px-4 py-3 text-sm">
+              <div className="text-xs font-medium text-muted-foreground">
+                Policy
+              </div>
+              <div className="mt-1">
+                {zone.forward_only ? (
+                  <span className="font-mono">forward only</span>
+                ) : (
+                  <span className="font-mono">forward first</span>
+                )}
+                <p className="mt-1 text-xs text-muted-foreground">
+                  {zone.forward_only
+                    ? "Queries are sent only to the forwarders. If they all fail, BIND returns SERVFAIL — it never falls back to recursion."
+                    : "Queries are sent to the forwarders first. If they all fail, BIND falls back to normal recursion via the root servers."}
+                </p>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Bulk actions — shown when any manual records are selected. */}
-      {selectedRecords.size > 0 && (
+      {!isForward && selectedRecords.size > 0 && (
         <div className="flex items-center justify-between border-b bg-amber-50 px-5 py-1.5 text-xs dark:bg-amber-900/10">
           <span>
             {selectedRecords.size} record
@@ -1741,6 +1873,7 @@ function ZoneDetailView({
       )}
 
       {/* Records table */}
+      {!isForward && (
       <div className="flex-1 overflow-auto">
         {isFetching && records.length === 0 && (
           <p className="px-5 py-4 text-sm text-muted-foreground">Loading…</p>
@@ -1972,6 +2105,13 @@ function ZoneDetailView({
                             <div className="flex items-center justify-end gap-1">
                               <button
                                 className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-foreground"
+                                onClick={() => setPropagationRecord(r)}
+                                title="Check propagation across public resolvers"
+                              >
+                                <Radar className="h-3 w-3" />
+                              </button>
+                              <button
+                                className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-foreground"
                                 onClick={() => setEditRecord(r)}
                                 title="Edit record"
                               >
@@ -2031,6 +2171,7 @@ function ZoneDetailView({
           </div>
         )}
       </div>
+      )}
 
       {showAddRecord && (
         <RecordModal
@@ -2047,6 +2188,13 @@ function ZoneDetailView({
           zoneName={zone.name}
           record={editRecord}
           onClose={() => setEditRecord(null)}
+        />
+      )}
+      {propagationRecord && (
+        <PropagationCheckModal
+          fqdn={propagationRecord.fqdn}
+          recordType={propagationRecord.record_type}
+          onClose={() => setPropagationRecord(null)}
         />
       )}
       {confirmDeleteRecord && (
@@ -4081,13 +4229,45 @@ function BlocklistsTab({ group }: { group: DNSServerGroup }) {
   const qc = useQueryClient();
   const [selected, setSelected] = useState<DNSBlockList | null>(null);
   const [showCreate, setShowCreate] = useState(false);
+  const [showCatalog, setShowCatalog] = useState(false);
   const [editList, setEditList] = useState<DNSBlockList | null>(null);
   const [confirmDelete, setConfirmDelete] = useState<DNSBlockList | null>(null);
+
+  // Track baselines so we can detect when an in-flight refresh has actually
+  // finished writing rows. Stamping `last_synced_at` is the proxy.
+  const refreshBaselineRef = useRef<Map<string, string | null>>(new Map());
+  // Per-row in-flight set; the refresh task takes 10–60s, far longer than
+  // the API call to enqueue it. Driven by onMutate / onError plus an
+  // effect that clears entries once the row's last_synced_at advances.
+  const [refreshing, setRefreshing] = useState<Set<string>>(new Set());
 
   const { data: lists = [], isFetching } = useQuery({
     queryKey: ["dns-blocklists"],
     queryFn: () => dnsBlocklistApi.list(),
+    // While any row is mid-refresh, poll every 3s so the entry_count
+    // updates without the operator having to refresh the page. The
+    // task itself takes 10–60s; the refetch interval clears once
+    // every pending row's last_synced_at has advanced past its baseline.
+    refetchInterval: refreshing.size > 0 ? 3000 : false,
   });
+
+  // Clear the per-row pending flag as soon as the row's last_synced_at
+  // advances past the value it had when the refresh was kicked off.
+  useEffect(() => {
+    if (refreshing.size === 0) return;
+    setRefreshing((prev) => {
+      const next = new Set(prev);
+      for (const id of prev) {
+        const baseline = refreshBaselineRef.current.get(id) ?? null;
+        const row = lists.find((l) => l.id === id);
+        if (row && row.last_synced_at && row.last_synced_at !== baseline) {
+          next.delete(id);
+          refreshBaselineRef.current.delete(id);
+        }
+      }
+      return next.size === prev.size ? prev : next;
+    });
+  }, [lists, refreshing]);
 
   // Filter by lists applied to this group (or not yet applied anywhere)
   const applied = lists.filter((l) => l.applied_group_ids.includes(group.id));
@@ -4123,7 +4303,20 @@ function BlocklistsTab({ group }: { group: DNSServerGroup }) {
 
   const refreshMut = useMutation({
     mutationFn: (id: string) => dnsBlocklistApi.refresh(id),
+    onMutate: (id) => {
+      const row = lists.find((l) => l.id === id);
+      refreshBaselineRef.current.set(id, row?.last_synced_at ?? null);
+      setRefreshing((prev) => new Set(prev).add(id));
+    },
     onSuccess: () => qc.invalidateQueries({ queryKey: ["dns-blocklists"] }),
+    onError: (_e, id) => {
+      setRefreshing((prev) => {
+        const next = new Set(prev);
+        next.delete(id);
+        return next;
+      });
+      refreshBaselineRef.current.delete(id);
+    },
   });
 
   if (selected) {
@@ -4144,13 +4337,25 @@ function BlocklistsTab({ group }: { group: DNSServerGroup }) {
         <span className="text-xs font-medium text-muted-foreground uppercase tracking-wider">
           {lists.length} blocking list{lists.length !== 1 ? "s" : ""}
         </span>
-        <button
-          className="flex items-center gap-1 rounded-md bg-primary px-2 py-1 text-xs text-primary-foreground hover:bg-primary/90"
-          onClick={() => setShowCreate(true)}
-        >
-          <Plus className="h-3 w-3" /> New Blocking List
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            className="flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-muted/50"
+            onClick={() => setShowCatalog(true)}
+            title="Subscribe to a curated public blocklist (StevenBlack / Hagezi / OISD / AdGuard / …)"
+          >
+            <Sparkles className="h-3 w-3" /> Browse Catalog
+          </button>
+          <button
+            className="flex items-center gap-1 rounded-md bg-primary px-2 py-1 text-xs text-primary-foreground hover:bg-primary/90"
+            onClick={() => setShowCreate(true)}
+          >
+            <Plus className="h-3 w-3" /> New Blocking List
+          </button>
+        </div>
       </div>
+      {showCatalog && (
+        <BlocklistCatalogModal onClose={() => setShowCatalog(false)} />
+      )}
 
       {isFetching && lists.length === 0 && (
         <p className="text-sm text-muted-foreground">Loading…</p>
@@ -4196,7 +4401,7 @@ function BlocklistsTab({ group }: { group: DNSServerGroup }) {
                   {l.entry_count} entries
                 </span>
                 <div
-                  className="flex items-center gap-1 opacity-0 group-hover:opacity-100"
+                  className="flex items-center gap-1"
                   onClick={(e) => e.stopPropagation()}
                 >
                   <button
@@ -4217,11 +4422,21 @@ function BlocklistsTab({ group }: { group: DNSServerGroup }) {
                   </button>
                   {l.source_type === "url" && l.feed_url && (
                     <button
-                      title="Refresh from feed"
-                      className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-foreground"
+                      title={
+                        refreshing.has(l.id)
+                          ? "Refresh in progress…"
+                          : "Refresh from feed"
+                      }
+                      disabled={refreshing.has(l.id)}
+                      className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-foreground disabled:opacity-50"
                       onClick={() => refreshMut.mutate(l.id)}
                     >
-                      <RefreshCw className="h-3 w-3" />
+                      <RefreshCw
+                        className={cn(
+                          "h-3 w-3",
+                          refreshing.has(l.id) && "animate-spin",
+                        )}
+                      />
                     </button>
                   )}
                   <button

@@ -16,8 +16,11 @@ produced by `app.services.dns_blocklist`.
 
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import datetime
+from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
 import structlog
@@ -330,6 +333,141 @@ def _audit(
         changed_fields=changed_fields,
         result="success",
     )
+
+
+# ── Curated catalog ─────────────────────────────────────────────────────────
+
+
+_CATALOG_PATH = Path(__file__).resolve().parents[3] / "data" / "dns_blocklist_catalog.json"
+
+
+@lru_cache(maxsize=1)
+def _load_catalog() -> dict[str, Any]:
+    """Load the static blocklist catalog JSON shipped with the app.
+
+    Memoised — the file is read once per process. Operators who want a
+    fresh snapshot from upstream get it via the next release.
+    """
+    with open(_CATALOG_PATH, encoding="utf-8") as f:
+        return json.load(f)
+
+
+class CatalogSource(BaseModel):
+    id: str
+    name: str
+    description: str
+    category: str
+    feed_url: str
+    feed_format: str
+    license: str
+    homepage: str | None = None
+    recommended: bool = False
+
+
+class CatalogResponse(BaseModel):
+    version: str
+    comment: str
+    sources: list[CatalogSource]
+
+
+class SubscribeFromCatalogRequest(BaseModel):
+    source_id: str
+    # Operator can override the default name (handy if they're subscribing to
+    # the same source twice with different scopes).
+    name: str | None = None
+    update_interval_hours: int = 24
+    block_mode: str = "nxdomain"
+    enabled: bool = True
+
+
+@router.get("/blocklists/catalog", response_model=CatalogResponse)
+async def get_blocklist_catalog(_: CurrentUser) -> CatalogResponse:
+    """Return the curated catalog of public DNS blocklist sources.
+
+    Snapshot of well-known feeds (StevenBlack, Hagezi, OISD, AdGuard,
+    Phishing Army, URLhaus, etc.) that ships with the app and updates
+    in lockstep with releases. Operators subscribe to a catalog entry
+    via ``POST /blocklists/from-catalog`` — that creates a normal
+    ``DNSBlockList`` row with ``source_type="url"`` prefilled from
+    the catalog entry.
+    """
+    return CatalogResponse(**_load_catalog())
+
+
+@router.post(
+    "/blocklists/from-catalog",
+    response_model=BlockListResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def subscribe_from_catalog(
+    body: SubscribeFromCatalogRequest, db: DB, current_user: SuperAdmin
+) -> BlockListResponse:
+    """Create a ``DNSBlockList`` subscribed to a catalog entry.
+
+    Equivalent to ``POST /blocklists`` with the catalog entry's URL,
+    format, name, and category prefilled. The operator can override
+    the name (so they can subscribe to the same upstream twice with
+    different scopes); everything else comes from the catalog.
+    """
+    catalog = _load_catalog()
+    src = next((s for s in catalog["sources"] if s["id"] == body.source_id), None)
+    if src is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Catalog entry '{body.source_id}' not found",
+        )
+    name = body.name or src["name"]
+    existing = await db.execute(select(DNSBlockList).where(DNSBlockList.name == name))
+    if existing.scalar_one_or_none():
+        raise HTTPException(
+            status_code=409,
+            detail=f"A blocklist named '{name}' already exists",
+        )
+    bl = DNSBlockList(
+        name=name,
+        description=src["description"],
+        category=src["category"],
+        source_type="url",
+        feed_url=src["feed_url"],
+        feed_format=src["feed_format"],
+        update_interval_hours=body.update_interval_hours,
+        block_mode=body.block_mode,
+        enabled=body.enabled,
+    )
+    db.add(bl)
+    await db.flush()
+    db.add(
+        _audit(
+            current_user,
+            "create",
+            "dns_blocklist",
+            str(bl.id),
+            bl.name,
+        )
+    )
+    await db.commit()
+    reloaded = await _require_list(bl.id, db)
+
+    # Kick off the initial fetch immediately — operators expect a freshly-
+    # subscribed list to populate without a manual Refresh click. Same as
+    # the explicit /refresh endpoint, but enqueued automatically on subscribe.
+    if bl.enabled:
+        from app.tasks.dns import refresh_blocklist_feed
+
+        try:
+            refresh_blocklist_feed.delay(str(bl.id))
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "blocklist_initial_refresh_enqueue_failed",
+                list_id=str(bl.id),
+                error=str(e),
+            )
+    logger.info(
+        "dns_blocklist_subscribed_from_catalog",
+        list_id=str(bl.id),
+        source_id=body.source_id,
+    )
+    return _to_response(reloaded)
 
 
 # ── Blocklist CRUD ──────────────────────────────────────────────────────────

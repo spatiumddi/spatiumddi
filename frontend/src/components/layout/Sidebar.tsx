@@ -44,13 +44,13 @@ import logoIcon from "@/assets/logo-icon.svg";
 const baseMainNav = [
   { label: "Dashboard", icon: LayoutDashboard, to: "/dashboard" },
   { label: "IPAM", icon: Network, to: "/ipam", end: true },
-  { label: "VLANs", icon: RouterIcon, to: "/vlans" },
-  { label: "NAT Mappings", icon: Shuffle, to: "/ipam/nat" },
-  { label: "Subnet Planner", icon: Workflow, to: "/ipam/plans" },
-  { label: "DNS", icon: Globe, to: "/dns" },
   { label: "DHCP", icon: Server, to: "/dhcp" },
-  { label: "Network", icon: Cable, to: "/network" },
+  { label: "DNS", icon: Globe, to: "/dns" },
   { label: "Logs", icon: ScrollText, to: "/logs" },
+  { label: "NAT Mappings", icon: Shuffle, to: "/ipam/nat" },
+  { label: "Network", icon: Cable, to: "/network" },
+  { label: "Subnet Planner", icon: Workflow, to: "/ipam/plans" },
+  { label: "VLANs", icon: RouterIcon, to: "/vlans" },
 ];
 
 const toolsNav = [
@@ -59,23 +59,20 @@ const toolsNav = [
 ];
 
 const adminIdentityNav = [
-  { label: "Users", icon: Users, to: "/admin/users" },
+  { label: "API Tokens", icon: KeySquare, to: "/admin/api-tokens" },
+  { label: "Auth Providers", icon: ShieldCheck, to: "/admin/auth-providers" },
   { label: "Groups", icon: UsersRound, to: "/admin/groups" },
   { label: "Roles", icon: KeyRound, to: "/admin/roles" },
-  { label: "Auth Providers", icon: ShieldCheck, to: "/admin/auth-providers" },
-  { label: "API Tokens", icon: KeySquare, to: "/admin/api-tokens" },
+  { label: "Users", icon: Users, to: "/admin/users" },
 ];
 
 const adminPlatformNav = [
-  { label: "Settings", icon: Settings, to: "/settings" },
-  { label: "Custom Fields", icon: Tags, to: "/admin/custom-fields" },
   { label: "Alerts", icon: BellRing, to: "/admin/alerts" },
-  { label: "Platform Insights", icon: Cpu, to: "/admin/platform-insights" },
-  { label: "Trash", icon: Trash2, to: "/admin/trash" },
-];
-
-const adminAuditNav = [
   { label: "Audit Log", icon: ClipboardList, to: "/admin/audit" },
+  { label: "Custom Fields", icon: Tags, to: "/admin/custom-fields" },
+  { label: "Platform Insights", icon: Cpu, to: "/admin/platform-insights" },
+  { label: "Settings", icon: Settings, to: "/settings" },
+  { label: "Trash", icon: Trash2, to: "/admin/trash" },
 ];
 
 function NavSection({
@@ -367,14 +364,6 @@ export function Sidebar({
               />
             ))}
             <div className="my-1 border-t border-sidebar-border/60" />
-            {adminAuditNav.map((item) => (
-              <NavItem
-                key={item.to}
-                {...item}
-                collapsed={effectiveCollapsed}
-                onNavigate={mobileOpen ? onMobileClose : undefined}
-              />
-            ))}
           </NavSection>
         </nav>
 

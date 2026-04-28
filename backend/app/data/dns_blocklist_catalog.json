@@ -1,0 +1,160 @@
+{
+  "version": "2026.04.29",
+  "comment": "Curated catalog of public DNS blocklist sources. Snapshot derived from AdGuard's HostlistsRegistry (https://github.com/AdguardTeam/HostlistsRegistry, MIT) plus the most-cited Pi-hole defaults and Hagezi / OISD entries. Each source's own license is recorded per entry. Move in lockstep with releases — operators can also subscribe to ad-hoc URLs alongside catalog entries.",
+  "sources": [
+    {
+      "id": "adguard-dns-filter",
+      "name": "AdGuard DNS Filter",
+      "description": "AdGuard's own filter list, balanced for general ad/tracker blocking with low breakage.",
+      "category": "ads",
+      "feed_url": "https://adguardteam.github.io/AdGuardSDNSFilter/Filters/filter.txt",
+      "feed_format": "adblock",
+      "license": "GPL-3.0",
+      "homepage": "https://github.com/AdguardTeam/AdGuardSDNSFilter",
+      "recommended": true
+    },
+    {
+      "id": "stevenblack-unified",
+      "name": "StevenBlack Unified Hosts",
+      "description": "Consolidated hosts file aggregating ad / malware / fakenews sources. The default Pi-hole adlist.",
+      "category": "ads",
+      "feed_url": "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts",
+      "feed_format": "hosts",
+      "license": "MIT",
+      "homepage": "https://github.com/StevenBlack/hosts",
+      "recommended": true
+    },
+    {
+      "id": "oisd-small",
+      "name": "OISD Small",
+      "description": "OISD basic — a curated low-breakage block list focused on ads and trackers.",
+      "category": "ads",
+      "feed_url": "https://small.oisd.nl/domainswild",
+      "feed_format": "domains",
+      "license": "free-for-personal-use",
+      "homepage": "https://oisd.nl/",
+      "recommended": true
+    },
+    {
+      "id": "oisd-big",
+      "name": "OISD Big",
+      "description": "OISD extended — broader ad / tracker / malware coverage. Higher breakage risk than OISD Small.",
+      "category": "ads",
+      "feed_url": "https://big.oisd.nl/domainswild",
+      "feed_format": "domains",
+      "license": "free-for-personal-use",
+      "homepage": "https://oisd.nl/",
+      "recommended": false
+    },
+    {
+      "id": "hagezi-multi-pro",
+      "name": "Hagezi Pro",
+      "description": "Hagezi's flagship Pro list — well-maintained, broadly compatible, focused on ads / tracking / privacy.",
+      "category": "ads",
+      "feed_url": "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/hosts/pro.txt",
+      "feed_format": "hosts",
+      "license": "GPL-3.0",
+      "homepage": "https://github.com/hagezi/dns-blocklists",
+      "recommended": true
+    },
+    {
+      "id": "hagezi-multi-pro-plus",
+      "name": "Hagezi Pro Plus",
+      "description": "Hagezi Pro+ — Pro list plus tightened tracking / telemetry. Higher breakage than Pro.",
+      "category": "tracking",
+      "feed_url": "https://raw.githubusercontent.com/hagezi/dns-blocklists/main/hosts/pro.plus.txt",
+      "feed_format": "hosts",
+      "license": "GPL-3.0",
+      "homepage": "https://github.com/hagezi/dns-blocklists",
+      "recommended": false
+    },
+    {
+      "id": "1hosts-lite",
+      "name": "1Hosts (Lite)",
+      "description": "Minimalist ad / tracker list. Lower breakage than 1Hosts Pro.",
+      "category": "ads",
+      "feed_url": "https://o0.pages.dev/Lite/hosts.txt",
+      "feed_format": "hosts",
+      "license": "MIT",
+      "homepage": "https://github.com/badmojr/1Hosts",
+      "recommended": false
+    },
+    {
+      "id": "phishing-army-extended",
+      "name": "Phishing Army (Extended)",
+      "description": "Daily-updated phishing-domain blocklist. Pairs well with a general ad list.",
+      "category": "phishing",
+      "feed_url": "https://phishing.army/download/phishing_army_blocklist_extended.txt",
+      "feed_format": "domains",
+      "license": "MIT",
+      "homepage": "https://phishing.army/",
+      "recommended": true
+    },
+    {
+      "id": "urlhaus",
+      "name": "URLhaus (abuse.ch)",
+      "description": "Abuse.ch URLhaus malware-distribution domain blocklist.",
+      "category": "malware",
+      "feed_url": "https://urlhaus.abuse.ch/downloads/hostfile/",
+      "feed_format": "hosts",
+      "license": "CC0-1.0",
+      "homepage": "https://urlhaus.abuse.ch/",
+      "recommended": true
+    },
+    {
+      "id": "digitalside-threat-intel",
+      "name": "DigitalSide Threat-Intel",
+      "description": "OSINT-curated malware / threat-intel domain feed maintained by DigitalSide.",
+      "category": "malware",
+      "feed_url": "https://osint.digitalside.it/Threat-Intel/lists/latestdomains.txt",
+      "feed_format": "domains",
+      "license": "MIT",
+      "homepage": "https://osint.digitalside.it/",
+      "recommended": false
+    },
+    {
+      "id": "easyprivacy",
+      "name": "EasyPrivacy",
+      "description": "Tracking and analytics domains — widely used by browser ad-blockers.",
+      "category": "tracking",
+      "feed_url": "https://easylist.to/easylist/easyprivacy.txt",
+      "feed_format": "adblock",
+      "license": "GPL-3.0",
+      "homepage": "https://easylist.to/",
+      "recommended": false
+    },
+    {
+      "id": "stevenblack-fakenews",
+      "name": "StevenBlack Fakenews Add-on",
+      "description": "Fake-news / clickbait / disinformation domain extension to StevenBlack hosts.",
+      "category": "misc",
+      "feed_url": "https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/fakenews/hosts",
+      "feed_format": "hosts",
+      "license": "MIT",
+      "homepage": "https://github.com/StevenBlack/hosts",
+      "recommended": false
+    },
+    {
+      "id": "stevenblack-gambling",
+      "name": "StevenBlack Gambling Add-on",
+      "description": "Gambling-domain extension to StevenBlack hosts.",
+      "category": "gambling",
+      "feed_url": "https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/gambling/hosts",
+      "feed_format": "hosts",
+      "license": "MIT",
+      "homepage": "https://github.com/StevenBlack/hosts",
+      "recommended": false
+    },
+    {
+      "id": "stevenblack-adult",
+      "name": "StevenBlack Adult Add-on",
+      "description": "Adult-content domain extension to StevenBlack hosts.",
+      "category": "adult",
+      "feed_url": "https://raw.githubusercontent.com/StevenBlack/hosts/master/alternates/porn/hosts",
+      "feed_format": "hosts",
+      "license": "MIT",
+      "homepage": "https://github.com/StevenBlack/hosts",
+      "recommended": false
+    }
+  ]
+}

@@ -2140,6 +2140,9 @@ export interface DNSZone {
   allow_transfer: string[] | null;
   also_notify: string[] | null;
   notify_enabled: string | null;
+  // Conditional-forwarder config. Meaningful only when zone_type==="forward".
+  forwarders: string[];
+  forward_only: boolean;
   // Non-null when the zone was synthesised by the Tailscale Phase 2
   // reconciler. The UI shows a read-only badge and disables edit /
   // delete controls on the zone + its records.
@@ -2209,10 +2212,43 @@ export interface DNSGroupRecord {
   modified_at: string;
 }
 
+export interface ResolverInfo {
+  name: string;
+  address: string;
+}
+
+export interface PropagationResolverResult {
+  resolver: string;
+  name: string | null;
+  status: "ok" | "nxdomain" | "timeout" | "error";
+  rtt_ms: number | null;
+  answers: string[];
+  error: string | null;
+}
+
+export interface PropagationCheckResult {
+  name: string;
+  record_type: string;
+  queried_at_ms: number;
+  results: PropagationResolverResult[];
+}
+
 export const dnsApi = {
   // Server groups
   listGroups: () =>
     api.get<DNSServerGroup[]>("/dns/groups").then((r) => r.data),
+  // Multi-resolver propagation check
+  checkPropagation: (body: {
+    name: string;
+    record_type?: string;
+    resolvers?: string[];
+    timeout_seconds?: number;
+  }) =>
+    api
+      .post<PropagationCheckResult>(`/dns/tools/propagation-check`, body)
+      .then((r) => r.data),
+  defaultResolvers: () =>
+    api.get<ResolverInfo[]>(`/dns/tools/default-resolvers`).then((r) => r.data),
   createGroup: (data: Partial<DNSServerGroup>) =>
     api.post<DNSServerGroup>("/dns/groups", data).then((r) => r.data),
   updateGroup: (id: string, data: Partial<DNSServerGroup>) =>
@@ -2553,8 +2589,40 @@ export interface DNSBlockListException {
   created_at: string;
 }
 
+export interface BlocklistCatalogSource {
+  id: string;
+  name: string;
+  description: string;
+  category: string;
+  feed_url: string;
+  feed_format: string;
+  license: string;
+  homepage: string | null;
+  recommended: boolean;
+}
+
+export interface BlocklistCatalogResponse {
+  version: string;
+  comment: string;
+  sources: BlocklistCatalogSource[];
+}
+
 export const dnsBlocklistApi = {
   list: () => api.get<DNSBlockList[]>("/dns/blocklists").then((r) => r.data),
+  catalog: () =>
+    api
+      .get<BlocklistCatalogResponse>("/dns/blocklists/catalog")
+      .then((r) => r.data),
+  subscribeFromCatalog: (body: {
+    source_id: string;
+    name?: string;
+    update_interval_hours?: number;
+    block_mode?: string;
+    enabled?: boolean;
+  }) =>
+    api
+      .post<DNSBlockList>("/dns/blocklists/from-catalog", body)
+      .then((r) => r.data),
   get: (id: string) =>
     api.get<DNSBlockList>(`/dns/blocklists/${id}`).then((r) => r.data),
   create: (data: Partial<DNSBlockList>) =>

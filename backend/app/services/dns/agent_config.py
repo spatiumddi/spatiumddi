@@ -98,6 +98,9 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
             "name": getattr(z, "name", None) or getattr(z, "fqdn", None),
             "type": getattr(z, "zone_type", "primary"),
             "ttl": getattr(z, "default_ttl", 3600),
+            # Forward-zone-only fields (ignored by the agent for other types).
+            "forwarders": list(getattr(z, "forwarders", []) or []),
+            "forward_only": bool(getattr(z, "forward_only", True)),
         }
         # Ship records to every server in the group. The is_primary flag
         # historically gated this, but agents need records to render zone

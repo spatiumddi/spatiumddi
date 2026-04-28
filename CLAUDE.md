@@ -1210,6 +1210,19 @@ None of these have started; everything below is ⬜.
   single-label only (the FQDN goes in `description`). Skipped
   for integration-owned rows whose hostname is authoritative
   from upstream.
+- ⬜ **CGNAT (RFC 6598) awareness** — first-class recognition of
+  `100.64.0.0/10` as carrier-grade NAT space, distinct from
+  RFC 1918 / public space. Quick-paste preset already exists
+  in the CIDR calculator; the rest is operator-facing
+  semantics: a "CGNAT" badge on subnets that fall in the
+  block, exclusion from public-space reporting, and a hint
+  in the New Subnet modal when an operator picks a CGNAT
+  CIDR for a normal LAN ("this is RFC 6598 carrier-grade NAT
+  space — Tailscale uses it; double-check before using for
+  on-prem"). Pairs with the existing Tailscale tenant
+  CGNAT-block auto-create — that already lands `100.64.0.0/10`
+  as the default CGNAT root for the tenant. Operator-facing
+  framing only; no allocation behaviour changes.
 
 #### Reporting & analytics
 
@@ -1357,22 +1370,60 @@ None of these have started; everything below is ⬜.
   keys used for RFC 2136 dynamic updates and AXFR auth. Today
   they're agent-side files only; no central inventory or
   rotation flow.
-- ⬜ **Conditional forwarders** — per-zone "forward queries for
-  `corp.local` to 10.0.0.5" config. Common in mixed-AD
-  environments where SpatiumDDI's BIND9 needs to defer to the
-  AD-integrated DNS for specific zones. Renders to BIND9
-  `forward only;` zone blocks.
+- ✅ **Conditional forwarders** — per-zone forwarding for mixed-AD
+  environments. `DNSZone` carries `forwarders` (JSONB list of IPs)
+  + `forward_only` (true → `forward only;`, false → `forward
+  first;`). When `zone_type = "forward"` the BIND9 driver renders
+  `zone "X" { type forward; forward only; forwarders { ... }; }`
+  in `zone.stanza.j2` and the agent's wire-format renderer
+  (no zone file written, no allow-update); the form gates the
+  forwarders/policy fields on `zone_type === "forward"` and
+  refuses submit when no upstreams are listed. Migration
+  `a07f6c12e5d3_dns_zone_forwarders`. **Deferred:** Windows DNS
+  via `Add-DnsServerConditionalForwarderZone` (the field
+  shape is identical; just needs the WinRM dispatch).
 - ⬜ **BIND9 catalog zones (RFC 9432)** — distribute zone
   definitions across multiple BIND9 servers in a group via a
   single catalog zone rather than per-server config push.
   BIND 9.18+ supports this natively. Cuts the agent's per-server
   zone-add / zone-delete bookkeeping; massive operational win
   for >2 BIND server groups.
-- ⬜ **Response Policy Zones (RPZ)** — DNS-level malware /
-  phishing / ad blocking via BIND9 `response-policy { zone
-  "rpz.example"; };`. Operators upload a blocklist (hostnames,
-  CIDRs, regex) and the driver renders + signs the RPZ zone.
-  Pairs nicely with the existing blocklists infrastructure.
+- ✅ **Response Policy Zones (RPZ)** — DNS-level malware / phishing
+  / ad blocking via BIND9 `response-policy { zone … };`. Full
+  `DNSBlockList` + `DNSBlockListEntry` + `DNSBlockListException`
+  model with categories / source types (manual / url /
+  file_upload) / block modes (nxdomain / sinkhole / refused) /
+  per-list scheduled refresh. Service-side aggregation produces
+  effective entries per server-group or view; agent renders one
+  RPZ master zone per blocklist with CNAME-based actions
+  (`. = NXDOMAIN`, `rpz-drop. = sinkhole`, target = redirect,
+  `rpz-passthru. = exception). CRUD lives at
+  `app/api/v1/dns/blocklist_router.py`. BIND9-only — Windows
+  DNS has no RPZ equivalent (closest is Query Resolution
+  Policies which lack the wire format).
+- ✅ **Curated RPZ blocklist source catalog** — ships a static
+  JSON catalog at `backend/app/data/dns_blocklist_catalog.json`
+  with 14 well-known public blocklists drawn from AdGuard's
+  HostlistsRegistry + Pi-hole defaults + Hagezi / OISD: AdGuard
+  DNS Filter, StevenBlack Unified, OISD Small/Big, Hagezi Pro
+  / Pro+, 1Hosts Lite, Phishing Army Extended, URLhaus,
+  DigitalSide Threat-Intel, EasyPrivacy, plus StevenBlack
+  fakenews / gambling / adult add-ons. Each entry carries
+  `{id, name, description, category, feed_url, feed_format,
+  license, homepage, recommended}`. `GET /dns/blocklists/catalog`
+  returns the snapshot (cached in-process). `POST
+  /dns/blocklists/from-catalog` creates a normal `DNSBlockList`
+  row with `source_type="url"` prefilled — leverages the
+  existing `parse_feed` + `_refresh_blocklist_feed_async` task
+  for fetch / parse / ingest with no new beat task. Frontend
+  has a "Browse Catalog" button on the Blocklists tab opening a
+  filterable picker (category + free-text), with already-
+  subscribed entries flagged. Catalog snapshot moves in
+  lockstep with releases; operators can still add custom
+  sources via the existing "New Blocking List" flow.
+  **Deferred:** "Refresh catalog from upstream" button that
+  re-fetches `filters.json` from HostlistsRegistry between
+  releases.
 - ⬜ **DoT / DoH listener** — BIND 9.18+ supports DNS-over-TLS
   (`tls`) and DNS-over-HTTPS (`https`) natively. Driver renders
   the listener config; cert lifecycle ties into the ACME
@@ -1392,11 +1443,19 @@ None of these have started; everything below is ⬜.
   "email zone with MX + SPF + DKIM + DMARC starter records";
   "kubernetes external-dns target zone". One-click materialise
   → operator edits / removes records as needed.
-- ⬜ **Multi-resolver propagation check** — utility tool that
-  queries a record from N external resolvers (1.1.1.1, 8.8.8.8,
-  9.9.9.9, 208.67.222.222) and shows per-resolver result with
-  timing. Surfaces as a "Check Propagation" button on the
-  record detail.
+- ✅ **Multi-resolver propagation check** — `POST
+  /dns/tools/propagation-check` fires the same query against
+  Cloudflare / Google / Quad9 / OpenDNS in parallel using
+  `dnspython`'s `AsyncResolver` (each query carries its own
+  timeout so a slow resolver can't poison the others) and
+  returns per-resolver `{resolver, status, rtt_ms, answers,
+  error}`. UI surfaces as a Radar button on each record row in
+  the records table; modal lets the operator switch record
+  type and re-check. Driver-agnostic — queries are made from
+  the API process, doesn't touch the BIND9 / Windows drivers.
+  **Deferred:** operator-customisable resolver list (today the
+  curated set is hard-coded server-side; the API accepts an
+  override but the UI doesn't yet expose it).
 
 #### DHCP-specific
 

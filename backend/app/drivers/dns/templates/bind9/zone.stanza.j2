@@ -1,3 +1,10 @@
+{%- if zone.zone_type == "forward" %}
+zone "{{ zone.name }}" {
+    type forward;
+    forward {{ "only" if zone.forward_only else "first" }};
+    forwarders { {% for f in zone.forwarders %}{{ f }}; {% endfor %}};
+};
+{%- else %}
 zone "{{ zone.name }}" {
     type {{ "master" if zone.zone_type == "primary" else zone.zone_type }};
     file "/var/cache/bind/zones/{{ zone.name }}db";
@@ -14,3 +21,4 @@ zone "{{ zone.name }}" {
     notify {{ zone.notify_enabled }};
     {%- endif %}
 };
+{%- endif %}
