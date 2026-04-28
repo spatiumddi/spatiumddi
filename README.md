@@ -109,8 +109,13 @@
 | ☸️ | **Kubernetes** | Helm umbrella chart, OCI-published |
 | 🖥 | **Bare metal / OS appliance** | bare metal today · self-contained appliance image (roadmap) |
 
-<details>
-<summary>Full feature detail — click to expand</summary>
+---
+
+## Full feature detail
+
+The tables above are the elevator pitch. The bullets here are the same surface with the operational detail — what's stored, how it behaves, where the seams are.
+
+### Core DDI
 
 - 🗂 **Hierarchical IP management** — spaces, blocks, subnets, addresses in a visual tree; IPv4 + full IPv6 auto-allocation (EUI-64 + random /128 + sequential); per-IP role (host / loopback / anycast / vip / vrrp / secondary / gateway), reservation TTL with auto-expiry, and per-IP MAC observation history
 - ✂️ **Subnet operations** — preview-then-commit Split, Merge, and Find-Free workflows with a typed-CIDR confirmation gate; surfaced on the subnet detail header *and* via bulk-action toolbars on the block + space tables (select 1 to split, 2+ to merge)
@@ -120,19 +125,29 @@
 - 🌐 **Built-in DNS server** — BIND9 container that auto-registers, syncs via RFC 2136, and reports per-server zone serial drift
 - 🔄 **DHCP server management** — Kea container + agent with lease tracking; group-centric HA (hot-standby + load-balancing) with live state reporting, self-healing peer-IP drift, and supervised daemons for crash-loop-safe restarts
 - 🪟 **Windows Server DNS + DHCP** — agentless management of existing Windows DCs (RFC 2136 + WinRM for DNS; near-real-time WinRM lease-mirroring for DHCP). No software installed on the Windows side.
+
+### Discovery & visibility
+
 - 📡 **SNMP discovery** — v1 / v2c / v3 polling of routers + switches via standard MIBs (IF-MIB, IP-MIB, Q-BRIDGE-MIB) — interfaces, ARP, and FDB feed back into IPAM with per-IP switch-port + VLAN visibility
 - 🎯 **Nmap scanner** — per-IP "Scan with Nmap" launches preset or custom scans (quick / service-version / OS / default-scripts / UDP top-100 / aggressive); live SSE output streams to the browser; structured XML parsed into a results panel; standalone `/tools/nmap` page for ad-hoc targets
-- 🧩 **Read-only integrations** — auto-mirror **Kubernetes** clusters (CIDRs, nodes, LoadBalancer VIPs, Ingress → DNS), **Docker** hosts (networks, optional container IPs), **Proxmox VE** endpoints (bridges, SDN VNets + subnets, VMs, LXC guests — runtime IPs via QEMU guest-agent, one row per cluster), and **Tailscale** tailnets (device mirror + synthetic `*.ts.net` DNS zone) into IPAM with one-click setup guides. Opt-in VNet-CIDR inference from guest NICs for SDN deployments where PVE is L2-only. Per-endpoint "Discovery" modal shows which VMs aren't reporting IPs + why, with copy-ready fix hints. Settings toggle gates each; per-target sync interval + on-demand Sync Now. Supernet auto-creation for RFC 1918 / CGNAT ranges keeps the tree tidy.
 - 🎨 **Dashboard-at-a-glance** — sub-tabs for Overview / IPAM / DNS / DHCP, platform health card (API / Postgres / Redis / workers / beat), live DNS query rate + DHCP traffic charts (BIND9 statistics-channels + Kea `statistic-get-all`, self-contained — no Prometheus needed), subnet utilization heatmap, and live activity feed
 - 📊 **Platform Insights admin page** — read-only Postgres diagnostics (DB size, cache hit ratio, WAL position, slow queries via `pg_stat_statements`, table sizes, idle-in-transaction watch) + per-container CPU / memory / network / IO from the local Docker socket. Native, no extra agents
+- 🏷 **IEEE OUI vendor lookup** — opt-in display of MAC vendor names in IP tables and DHCP leases, with filter-by-vendor support
+
+### Integrations
+
+- 🧩 **Read-only integrations** — auto-mirror **Kubernetes** clusters (CIDRs, nodes, LoadBalancer VIPs, Ingress → DNS), **Docker** hosts (networks, optional container IPs), **Proxmox VE** endpoints (bridges, SDN VNets + subnets, VMs, LXC guests — runtime IPs via QEMU guest-agent, one row per cluster), and **Tailscale** tailnets (device mirror + synthetic `*.ts.net` DNS zone) into IPAM with one-click setup guides. Opt-in VNet-CIDR inference from guest NICs for SDN deployments where PVE is L2-only. Per-endpoint "Discovery" modal shows which VMs aren't reporting IPs + why, with copy-ready fix hints. Settings toggle gates each; per-target sync interval + on-demand Sync Now. Supernet auto-creation for RFC 1918 / CGNAT ranges keeps the tree tidy.
+
+### Identity & ops
+
 - 🔒 **Group-based RBAC + external identity** — LDAP, OIDC, SAML, RADIUS, TACACS+ with backup-server failover; delegate IP ranges and zones by role; API tokens with auto-expiry
 - 🔔 **Alerts + audit forwarding** — rule-based alerts framework (subnet utilization, server unreachable) + multi-target syslog (UDP / TCP / TLS) + HTTP webhook forwarding with pluggable wire formats (RFC 5424 JSON / CEF / LEEF / RFC 3164 / JSON lines) and per-target filters
 - 🔐 **ACME DNS-01 provider** — `acme-dns`-compatible HTTP surface so certbot / lego / acme.sh can issue public certs (wildcards included) for names delegated to a SpatiumDDI-managed zone
-- 🏷 **IEEE OUI vendor lookup** — opt-in display of MAC vendor names in IP tables and DHCP leases, with filter-by-vendor support
 - 📋 **Full audit trail** — every mutation logged, append-only, viewable in the UI with per-column filters
-- 🚀 **Flexible deployment** — Docker Compose, Kubernetes (Helm umbrella chart + OCI publishing), bare metal, or OS appliance
 
-</details>
+### Deployment
+
+- 🚀 **Flexible deployment** — Docker Compose, Kubernetes (Helm umbrella chart + OCI publishing), bare metal, or OS appliance
 
 ---
 
