@@ -83,6 +83,9 @@ class DHCPServerGroup(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     mac_blocks: Mapped[list[DHCPMACBlock]] = relationship(
         "DHCPMACBlock", back_populates="group", cascade="all, delete-orphan"
     )
+    option_templates: Mapped[list[DHCPOptionTemplate]] = relationship(
+        "DHCPOptionTemplate", back_populates="group", cascade="all, delete-orphan"
+    )
 
 
 class DHCPServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
@@ -316,6 +319,49 @@ class DHCPClientClass(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
 
 
+class DHCPOptionTemplate(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """A named bundle of DHCP option-code → value pairs — group-scoped.
+
+    Operators apply a template to a scope (or pool/static in a future
+    iteration) to stamp multiple options at once instead of editing them
+    individually. The ``options`` JSONB shape mirrors ``DHCPScope.options``
+    (``{name: value}``) so apply == merge-by-key.
+
+    Templates are advisory bundles only — they do not flow into the
+    ConfigBundle directly. Applying a template copies its options into
+    the target scope's options dict at the moment of apply; subsequent
+    template edits do NOT propagate back to scopes that already used it.
+    """
+
+    __tablename__ = "dhcp_option_template"
+    __table_args__ = (
+        UniqueConstraint("group_id", "name", name="uq_dhcp_option_template_group_name"),
+        Index("ix_dhcp_option_template_group", "group_id"),
+    )
+
+    group_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dhcp_server_group.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    address_family: Mapped[str] = mapped_column(
+        String(4), nullable=False, default="ipv4", server_default="ipv4"
+    )
+    options: Mapped[dict] = mapped_column(JSONB, nullable=False, default=lambda: {})
+
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("user.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
+    group: Mapped[DHCPServerGroup] = relationship(
+        "DHCPServerGroup", back_populates="option_templates"
+    )
+
+
 # ── MAC blocklist ───────────────────────────────────────────────────────────
 
 
@@ -493,6 +539,7 @@ __all__ = [
     "DHCPPool",
     "DHCPStaticAssignment",
     "DHCPClientClass",
+    "DHCPOptionTemplate",
     "DHCPMACBlock",
     "DHCPLease",
     "DHCPConfigOp",

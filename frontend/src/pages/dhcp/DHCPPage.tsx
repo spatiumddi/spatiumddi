@@ -18,6 +18,7 @@ import {
   type DHCPServerGroup,
   type DHCPStaticAssignment,
   type DHCPClientClass,
+  type DHCPOptionTemplate,
   type DHCPLease,
 } from "@/lib/api";
 import { useSessionState } from "@/lib/useSessionState";
@@ -37,6 +38,7 @@ import { CreateServerGroupModal } from "./CreateServerGroupModal";
 import { CreateServerModal } from "./CreateServerModal";
 import { CreateScopeModal } from "./CreateScopeModal";
 import { CreateClientClassModal } from "./CreateClientClassModal";
+import { CreateOptionTemplateModal } from "./CreateOptionTemplateModal";
 import { MacBlocksTab } from "./MacBlocksTab";
 import { DeleteConfirmModal, StatusDot } from "./_shared";
 
@@ -50,6 +52,7 @@ type Tab =
   | "pools"
   | "statics"
   | "classes"
+  | "option-templates"
   | "mac-blocks"
   | "leases"
   | "history"
@@ -1022,6 +1025,136 @@ function ClientClassesTab({ server }: { server: DHCPServer }) {
   );
 }
 
+function OptionTemplatesTab({ server }: { server: DHCPServer }) {
+  const qc = useQueryClient();
+  const groupId = server.server_group_id ?? "";
+  const { data: templates = [] } = useQuery({
+    queryKey: ["dhcp-option-templates", groupId],
+    queryFn: () =>
+      groupId ? dhcpApi.listOptionTemplates(groupId) : Promise.resolve([]),
+    enabled: !!groupId,
+  });
+  const [showCreate, setShowCreate] = useState(false);
+  const [edit, setEdit] = useState<DHCPOptionTemplate | null>(null);
+  const [del, setDel] = useState<DHCPOptionTemplate | null>(null);
+  const delMut = useMutation({
+    mutationFn: (id: string) => dhcpApi.deleteOptionTemplate(groupId, id),
+    onSuccess: () => {
+      qc.invalidateQueries({
+        queryKey: ["dhcp-option-templates", groupId],
+      });
+      setDel(null);
+    },
+  });
+
+  if (!groupId) {
+    return (
+      <p className="p-6 text-center text-sm text-muted-foreground">
+        This server is not attached to a group yet. Option templates are
+        configured on the server group — assign the server to a group first.
+      </p>
+    );
+  }
+
+  return (
+    <div className="space-y-3">
+      <div className="flex items-center justify-between">
+        <p className="text-xs text-muted-foreground">
+          Named bundles of DHCP options that can be applied to a scope in one
+          click. Apply is a stamp — later edits to a template do not propagate
+          back to scopes that already used it.
+        </p>
+        <button
+          onClick={() => setShowCreate(true)}
+          className="flex items-center gap-1 rounded-md bg-primary px-3 py-1.5 text-xs text-primary-foreground hover:bg-primary/90"
+        >
+          <Plus className="h-3 w-3" /> New Template
+        </button>
+      </div>
+      <div className="rounded-lg border">
+        {templates.length === 0 ? (
+          <p className="p-6 text-center text-sm text-muted-foreground">
+            No option templates defined.
+          </p>
+        ) : (
+          <div className="overflow-x-auto">
+            <table className="w-full min-w-[640px] text-sm">
+              <thead>
+                <tr className="border-b bg-muted/30 text-xs">
+                  <th className="px-3 py-2 text-left font-medium">Name</th>
+                  <th className="px-3 py-2 text-left font-medium">
+                    Description
+                  </th>
+                  <th className="px-3 py-2 text-left font-medium">Family</th>
+                  <th className="px-3 py-2 text-left font-medium">Options</th>
+                  <th className="px-3 py-2"></th>
+                </tr>
+              </thead>
+              <tbody className={zebraBodyCls}>
+                {templates.map((t) => (
+                  <tr key={t.id} className="border-b last:border-0">
+                    <td className="px-3 py-2 font-medium">{t.name}</td>
+                    <td className="px-3 py-2 text-muted-foreground">
+                      {t.description}
+                    </td>
+                    <td className="px-3 py-2 font-mono text-xs">
+                      {t.address_family}
+                    </td>
+                    <td className="px-3 py-2 font-mono text-xs text-muted-foreground">
+                      {Object.keys(t.options ?? {})
+                        .sort()
+                        .slice(0, 5)
+                        .join(", ")}
+                      {Object.keys(t.options ?? {}).length > 5 && " …"}
+                    </td>
+                    <td className="px-3 py-2 text-right">
+                      <button
+                        onClick={() => setEdit(t)}
+                        className="rounded p-1 text-muted-foreground hover:text-foreground"
+                      >
+                        <Pencil className="h-3.5 w-3.5" />
+                      </button>
+                      <button
+                        onClick={() => setDel(t)}
+                        className="rounded p-1 text-muted-foreground hover:text-destructive"
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+
+      {showCreate && (
+        <CreateOptionTemplateModal
+          groupId={groupId}
+          onClose={() => setShowCreate(false)}
+        />
+      )}
+      {edit && (
+        <CreateOptionTemplateModal
+          template={edit}
+          groupId={groupId}
+          onClose={() => setEdit(null)}
+        />
+      )}
+      {del && (
+        <DeleteConfirmModal
+          title="Delete Option Template"
+          description={`Delete template "${del.name}"? Scopes that already had it applied keep their options.`}
+          onConfirm={() => delMut.mutate(del.id)}
+          onClose={() => setDel(null)}
+          isPending={delMut.isPending}
+        />
+      )}
+    </div>
+  );
+}
+
 function LeasesTab({ server }: { server: DHCPServer }) {
   const [state, setState] = useState<string>("");
   const [subnetId, setSubnetId] = useState<string>("");
@@ -1590,6 +1723,12 @@ function ServerDetailView({
             Client Classes
           </TabButton>
           <TabButton
+            active={tab === "option-templates"}
+            onClick={() => setTab("option-templates")}
+          >
+            Option Templates
+          </TabButton>
+          <TabButton
             active={tab === "mac-blocks"}
             onClick={() => setTab("mac-blocks")}
           >
@@ -1622,6 +1761,7 @@ function ServerDetailView({
           <ServerPoolsOrStaticsTab server={server} kind="statics" />
         )}
         {tab === "classes" && <ClientClassesTab server={server} />}
+        {tab === "option-templates" && <OptionTemplatesTab server={server} />}
         {tab === "mac-blocks" && <MacBlocksTab server={server} />}
         {tab === "leases" && <LeasesTab server={server} />}
         {tab === "history" && <LeaseHistoryTab server={server} />}

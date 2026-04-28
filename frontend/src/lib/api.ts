@@ -3175,6 +3175,47 @@ export const dhcpApi = {
   deleteClientClass: (_groupId: string, classId: string) =>
     api.delete(`/dhcp/client-classes/${classId}`),
 
+  listOptionCodes: (q?: string) =>
+    api
+      .get<DHCPOptionCodeDef[]>("/dhcp/option-codes", {
+        params: q ? { q } : undefined,
+      })
+      .then((r) => r.data),
+
+  listOptionTemplates: (groupId: string) =>
+    api
+      .get<
+        DHCPOptionTemplate[]
+      >(`/dhcp/server-groups/${groupId}/option-templates`)
+      .then((r) => r.data),
+  createOptionTemplate: (groupId: string, data: DHCPOptionTemplateWrite) =>
+    api
+      .post<DHCPOptionTemplate>(
+        `/dhcp/server-groups/${groupId}/option-templates`,
+        data,
+      )
+      .then((r) => r.data),
+  updateOptionTemplate: (
+    _groupId: string,
+    templateId: string,
+    data: Partial<DHCPOptionTemplateWrite>,
+  ) =>
+    api
+      .put<DHCPOptionTemplate>(`/dhcp/option-templates/${templateId}`, data)
+      .then((r) => r.data),
+  deleteOptionTemplate: (_groupId: string, templateId: string) =>
+    api.delete(`/dhcp/option-templates/${templateId}`),
+  applyOptionTemplate: (
+    scopeId: string,
+    data: { template_id: string; mode?: "merge" | "replace" },
+  ) =>
+    api
+      .post<DHCPApplyTemplateResponse>(
+        `/dhcp/scopes/${scopeId}/apply-option-template`,
+        data,
+      )
+      .then((r) => r.data),
+
   listMacBlocks: (groupId: string) =>
     api
       .get<DHCPMACBlock[]>(`/dhcp/server-groups/${groupId}/mac-blocks`)
@@ -3243,6 +3284,38 @@ export interface DHCPClientClass {
   options: Record<string, unknown>;
   created_at: string;
   modified_at: string;
+}
+
+export interface DHCPOptionCodeDef {
+  code: number;
+  name: string;
+  kind: string;
+  description: string;
+  rfc?: string | null;
+}
+
+export interface DHCPOptionTemplate {
+  id: string;
+  group_id: string;
+  name: string;
+  description: string;
+  address_family: "ipv4" | "ipv6";
+  options: Record<string, string | string[]>;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface DHCPOptionTemplateWrite {
+  name: string;
+  description?: string;
+  address_family?: "ipv4" | "ipv6";
+  options?: Record<string, string | string[]>;
+}
+
+export interface DHCPApplyTemplateResponse {
+  scope_id: string;
+  options: Record<string, string | string[]>;
+  overwritten_keys: string[];
 }
 
 export type DHCPMACBlockReason =

@@ -6,6 +6,8 @@ from app.api.v1.dhcp.agents import router as agents_router
 from app.api.v1.dhcp.client_classes import router as client_classes_router
 from app.api.v1.dhcp.lease_history import router as lease_history_router
 from app.api.v1.dhcp.mac_blocks import router as mac_blocks_router
+from app.api.v1.dhcp.option_codes import router as option_codes_router
+from app.api.v1.dhcp.option_templates import router as option_templates_router
 from app.api.v1.dhcp.pools import router as pools_router
 from app.api.v1.dhcp.scopes import router as scopes_router
 from app.api.v1.dhcp.server_groups import router as server_groups_router
@@ -21,6 +23,8 @@ router.include_router(pools_router)
 router.include_router(statics_router)
 router.include_router(client_classes_router)
 router.include_router(mac_blocks_router)
+router.include_router(option_codes_router)
+router.include_router(option_templates_router)
 router.include_router(agents_router)
 
 __all__ = ["router"]

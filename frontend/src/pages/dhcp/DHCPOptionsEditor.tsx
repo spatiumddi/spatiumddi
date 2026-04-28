@@ -1,6 +1,7 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { useQuery } from "@tanstack/react-query";
 import { ChevronDown, ChevronRight, Plus, X } from "lucide-react";
-import type { DHCPOption } from "@/lib/api";
+import { dhcpApi, type DHCPOption, type DHCPOptionCodeDef } from "@/lib/api";
 import { Field, inputCls } from "./_shared";
 
 /**
@@ -95,6 +96,139 @@ function joinList(xs: string[] | string | undefined): string {
   return xs;
 }
 
+function CustomOptionRow({
+  opt,
+  catalog,
+  onChange,
+  onRemove,
+}: {
+  opt: DHCPOption;
+  catalog: DHCPOptionCodeDef[];
+  onChange: (next: DHCPOption) => void;
+  onRemove: () => void;
+}) {
+  const [query, setQuery] = useState<string>(
+    opt.code ? `${opt.code} — ${opt.name ?? ""}`.trim() : "",
+  );
+  const [open, setOpen] = useState(false);
+  const wrapperRef = useRef<HTMLDivElement>(null);
+
+  // Reflect external changes to opt.code (e.g. template apply).
+  useEffect(() => {
+    setQuery(opt.code ? `${opt.code} — ${opt.name ?? ""}`.trim() : "");
+  }, [opt.code, opt.name]);
+
+  useEffect(() => {
+    function onDoc(e: MouseEvent) {
+      if (
+        wrapperRef.current &&
+        !wrapperRef.current.contains(e.target as Node)
+      ) {
+        setOpen(false);
+      }
+    }
+    document.addEventListener("mousedown", onDoc);
+    return () => document.removeEventListener("mousedown", onDoc);
+  }, []);
+
+  const matches = useMemo(() => {
+    const needle = query.trim().toLowerCase();
+    if (!needle) return catalog.slice(0, 25);
+    const isNum = /^\d+$/.test(needle);
+    return catalog
+      .filter((d) => {
+        if (isNum) return String(d.code).startsWith(needle);
+        return (
+          d.name.toLowerCase().includes(needle) ||
+          d.description.toLowerCase().includes(needle)
+        );
+      })
+      .slice(0, 25);
+  }, [catalog, query]);
+
+  const knownDef = useMemo(
+    () => catalog.find((d) => d.code === opt.code),
+    [catalog, opt.code],
+  );
+
+  function pick(def: DHCPOptionCodeDef) {
+    onChange({ ...opt, code: def.code, name: def.name });
+    setQuery(`${def.code} — ${def.name}`);
+    setOpen(false);
+  }
+
+  return (
+    <div className="space-y-1">
+      <div className="flex items-start gap-2">
+        <div ref={wrapperRef} className="relative w-72 shrink-0">
+          <input
+            className={inputCls}
+            placeholder="Search code or name…"
+            value={query}
+            onChange={(e) => {
+              const v = e.target.value;
+              setQuery(v);
+              setOpen(true);
+              // Live numeric typing — reflect into the row immediately so
+              // the operator can still type "42" + tab and have a custom
+              // unknown code stick. Name resolution happens on pick.
+              const numMatch = /^(\d+)/.exec(v.trim());
+              if (numMatch) {
+                const n = parseInt(numMatch[1], 10);
+                if (!Number.isNaN(n) && n !== opt.code) {
+                  onChange({ ...opt, code: n });
+                }
+              }
+            }}
+            onFocus={() => setOpen(true)}
+          />
+          {open && matches.length > 0 && (
+            <div className="absolute left-0 right-0 top-full z-20 mt-1 max-h-72 overflow-y-auto rounded-md border bg-popover shadow-md">
+              {matches.map((def) => (
+                <button
+                  key={def.code}
+                  type="button"
+                  onClick={() => pick(def)}
+                  className="block w-full px-3 py-1.5 text-left text-xs hover:bg-accent"
+                >
+                  <div className="font-mono">
+                    {def.code} — <span className="font-sans">{def.name}</span>
+                  </div>
+                  {def.description && (
+                    <div className="truncate text-[11px] text-muted-foreground">
+                      {def.description}
+                    </div>
+                  )}
+                </button>
+              ))}
+            </div>
+          )}
+        </div>
+        <input
+          className="min-w-0 flex-1 rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+          placeholder="value"
+          value={
+            typeof opt.value === "string" ? opt.value : opt.value.join(", ")
+          }
+          onChange={(e) => onChange({ ...opt, value: e.target.value })}
+        />
+        <button
+          type="button"
+          onClick={onRemove}
+          className="rounded p-1 text-muted-foreground hover:text-destructive"
+        >
+          <X className="h-4 w-4" />
+        </button>
+      </div>
+      {knownDef?.description && (
+        <div className="ml-1 text-[11px] text-muted-foreground">
+          {knownDef.description}
+        </div>
+      )}
+    </div>
+  );
+}
+
 export function DHCPOptionsEditor({
   value,
   onChange,
@@ -109,6 +243,13 @@ export function DHCPOptionsEditor({
   }, [value]);
 
   const [showCustom, setShowCustom] = useState(false);
+
+  const { data: catalog = [] } = useQuery({
+    queryKey: ["dhcp-option-codes"],
+    queryFn: () => dhcpApi.listOptionCodes(),
+    staleTime: Infinity,
+    gcTime: Infinity,
+  });
 
   function setStandard(def: StandardDef, rawInput: string) {
     const clean = rawInput.trim();
@@ -130,6 +271,23 @@ export function DHCPOptionsEditor({
   const customOptions = value.filter(
     (o) => !STANDARD_OPTIONS.some((s) => s.code === o.code),
   );
+
+  function updateCustomAt(idx: number, next: DHCPOption) {
+    const fullIdx = value.findIndex(
+      (o) =>
+        o === customOptions[idx] ||
+        (o.code === customOptions[idx].code &&
+          o.value === customOptions[idx].value),
+    );
+    if (fullIdx < 0) return;
+    const out = [...value];
+    out[fullIdx] = next;
+    onChange(out);
+  }
+
+  function removeCustomAt(idx: number) {
+    onChange(value.filter((o) => o !== customOptions[idx]));
+  }
 
   return (
     <div className="space-y-3">
@@ -172,54 +330,15 @@ export function DHCPOptionsEditor({
         </button>
 
         {showCustom && (
-          <div className="mt-2 space-y-2">
+          <div className="mt-2 space-y-3">
             {customOptions.map((opt, idx) => (
-              <div key={idx} className="flex items-center gap-2">
-                <input
-                  type="number"
-                  className="w-20 shrink-0 rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
-                  placeholder="code"
-                  value={opt.code}
-                  onChange={(e) => {
-                    const code = parseInt(e.target.value, 10) || 0;
-                    const next = [...value];
-                    const fullIdx = next.findIndex(
-                      (o) =>
-                        o === opt ||
-                        (o.code === opt.code && o.value === opt.value),
-                    );
-                    if (fullIdx >= 0) next[fullIdx] = { ...opt, code };
-                    onChange(next);
-                  }}
-                />
-                <input
-                  className="min-w-0 flex-1 rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
-                  placeholder="value"
-                  value={
-                    typeof opt.value === "string"
-                      ? opt.value
-                      : opt.value.join(", ")
-                  }
-                  onChange={(e) => {
-                    const next = [...value];
-                    const fullIdx = next.findIndex(
-                      (o) =>
-                        o === opt ||
-                        (o.code === opt.code && o.value === opt.value),
-                    );
-                    if (fullIdx >= 0)
-                      next[fullIdx] = { ...opt, value: e.target.value };
-                    onChange(next);
-                  }}
-                />
-                <button
-                  type="button"
-                  onClick={() => onChange(value.filter((o) => o !== opt))}
-                  className="rounded p-1 text-muted-foreground hover:text-destructive"
-                >
-                  <X className="h-4 w-4" />
-                </button>
-              </div>
+              <CustomOptionRow
+                key={idx}
+                opt={opt}
+                catalog={catalog}
+                onChange={(next) => updateCustomAt(idx, next)}
+                onRemove={() => removeCustomAt(idx)}
+              />
             ))}
             <button
               type="button"

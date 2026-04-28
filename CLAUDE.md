@@ -1536,16 +1536,45 @@ None of these have started; everything below is ⬜.
 
 #### DHCP-specific
 
-- ⬜ **DHCP option library / templates** — named profiles ("VoIP
-  devices", "PXE boot", "VPN pool") that bundle option-code →
-  value sets and can be applied to scopes in one click. Today
-  every scope's options are set individually. Templates are a
-  `DHCPOptionTemplate` row + many-to-many to scopes.
-- ⬜ **Option-code library lookup** — searchable list of
-  well-known DHCP option codes (RFC 2132 + IANA registry) with
-  descriptions. Helps operators dig up the meaning of "option
-  121" without context-switching to the RFC. Static JSON
-  shipped with the app.
+- ✅ **DHCP option library / templates** — `DHCPOptionTemplate`
+  row, group-scoped, holds a named bundle of option-code → value
+  pairs (e.g. "VoIP phones", "PXE BIOS clients"). CRUD at
+  `/api/v1/dhcp/server-groups/{gid}/option-templates` +
+  `/api/v1/dhcp/option-templates/{id}` plus a server-side
+  `POST /scopes/{id}/apply-option-template` for programmatic
+  apply (mode=`merge` template-wins, mode=`replace` drop-existing).
+  UI: new "Option Templates" tab on the DHCP server-group view
+  (mirrors the Client Classes / MAC Blocks tabs) with the
+  shared `DHCPOptionsEditor` for authoring, plus an
+  "Apply template…" picker above the options editor on the
+  scope create / edit modal that does a client-side merge into
+  the editor's local state (operator still hits Save to
+  persist; conflict-key list surfaces inline). Apply is a
+  stamp, not a binding — later template edits do not
+  propagate back to scopes that already used it. Permission
+  gate `dhcp_option_template`, seeded into the existing "DHCP
+  Editor" role. Migration `e7f218ac4d9b_dhcp_option_templates`.
+  **Deferred:** pool / static template-apply (scope only first),
+  auto-apply default template on scope create, drift report
+  showing which scopes diverged from a template after apply.
+- ✅ **Option-code library lookup** — static catalog at
+  `backend/app/data/dhcp_option_codes.json` covering 95 RFC
+  2132 + IANA `bootp-dhcp-parameters` v4 entries operators
+  actually configure (each entry: `code`, `name`, `kind`,
+  `description`, `rfc`). Loaded once per process via
+  `services/dhcp/option_codes.py` (lru_cache); `search()`
+  helper does case-insensitive name/description matching with
+  numeric-prefix code lookup. `GET /api/v1/dhcp/option-codes`
+  returns the catalog (with optional `q=` substring filter
+  + `limit`). Frontend wires it into `DHCPOptionsEditor`'s
+  custom-options row: the bare numeric code input becomes a
+  combobox that searches by code or name, surfaces the
+  description as a hint under the row, and auto-fills `name`
+  on pick. Catalog is fetched once per session
+  (`staleTime: Infinity`) and filtered client-side, so
+  per-keystroke search has no server round-trip.
+  **Deferred:** v6 option-code catalog (separate namespace —
+  ships once v6 UI lands).
 - ⬜ **DHCP fingerprinting** — identify device type from
   option-55 parameter request list + vendor-class (option 60) +
   class-id. Fingerprint database from the `fingerbank` project

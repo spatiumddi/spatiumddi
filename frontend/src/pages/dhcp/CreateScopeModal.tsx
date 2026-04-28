@@ -491,7 +491,14 @@ export function CreateScopeModal({
         </Field>
 
         <div className="border-t pt-3">
-          <h3 className="text-sm font-semibold mb-2">Options</h3>
+          <div className="mb-2 flex items-center justify-between gap-3">
+            <h3 className="text-sm font-semibold">Options</h3>
+            <ApplyTemplateControl
+              groupId={groupId}
+              currentOptions={options}
+              onApply={setOptions}
+            />
+          </div>
           <DHCPOptionsEditor value={options} onChange={setOptions} />
         </div>
 
@@ -503,3 +510,85 @@ export function CreateScopeModal({
 }
 
 export const EditScopeModal = CreateScopeModal;
+
+/**
+ * "Apply template…" dropdown above the options editor. Client-side merge
+ * into the local options state — operator still has to hit Save to persist.
+ * On conflict, template wins (most natural — operator just picked it). The
+ * conflict-key list is shown in a small caption so the operator knows what
+ * was overwritten.
+ */
+function ApplyTemplateControl({
+  groupId,
+  currentOptions,
+  onApply,
+}: {
+  groupId: string;
+  currentOptions: DHCPOption[];
+  onApply: (next: DHCPOption[]) => void;
+}) {
+  const { data: templates = [] } = useQuery({
+    queryKey: ["dhcp-option-templates", groupId],
+    queryFn: () =>
+      groupId ? dhcpApi.listOptionTemplates(groupId) : Promise.resolve([]),
+    enabled: !!groupId,
+  });
+  const [overwritten, setOverwritten] = useState<string[]>([]);
+  const [pickerKey, setPickerKey] = useState(0);
+
+  if (!groupId || templates.length === 0) return null;
+
+  function handleSelect(templateId: string) {
+    if (!templateId) return;
+    const tpl = templates.find((t) => t.id === templateId);
+    if (!tpl) return;
+    const tplOptions = tpl.options ?? {};
+    // Build a name->existing-DHCPOption map for the current value so we can
+    // diff and report which keys we're about to clobber.
+    const byName = new Map<string, DHCPOption>();
+    for (const o of currentOptions) {
+      const n = o.name || `option-${o.code}`;
+      byName.set(n, o);
+    }
+    const conflicts: string[] = [];
+    for (const [n, v] of Object.entries(tplOptions)) {
+      const existing = byName.get(n);
+      if (existing) {
+        const a = JSON.stringify(existing.value);
+        const b = JSON.stringify(v);
+        if (a !== b) conflicts.push(n);
+        byName.set(n, { ...existing, name: n, value: v });
+      } else {
+        byName.set(n, { code: 0, name: n, value: v });
+      }
+    }
+    onApply(Array.from(byName.values()));
+    setOverwritten(conflicts);
+    // Reset the select so picking the same template again still fires.
+    setPickerKey((k) => k + 1);
+  }
+
+  return (
+    <div className="flex items-center gap-2">
+      {overwritten.length > 0 && (
+        <span className="text-[11px] text-amber-600 dark:text-amber-400">
+          Overwrote: {overwritten.join(", ")}
+        </span>
+      )}
+      <select
+        key={pickerKey}
+        defaultValue=""
+        onChange={(e) => handleSelect(e.target.value)}
+        className="rounded-md border bg-background px-2 py-1 text-xs hover:bg-accent"
+      >
+        <option value="">Apply template…</option>
+        {templates.map((t) => (
+          <option key={t.id} value={t.id}>
+            {t.name}
+            {t.address_family === "ipv6" ? " (v6)" : ""}
+          </option>
+        ))}
+      </select>
+    </div>
+  );
+}
