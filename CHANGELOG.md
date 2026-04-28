@@ -7,7 +7,365 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versioning uses 
 
 ## Unreleased
 
-_(no entries yet — next release will add changes that land after `2026.04.28-1`)_
+_(no entries yet — next release will add changes that land after `2026.04.28-2`)_
+
+---
+
+## 2026.04.28-2 — 2026-04-28
+
+DNS finish-line + IPAM subnet planning + DHCP option authoring
+release. The headline work closes most of the remaining
+DNS-specific roadmap items in CLAUDE.md: a multi-resolver
+propagation check that fans out to Cloudflare / Google / Quad9 /
+OpenDNS in parallel, conditional forwarders as a first-class
+zone type, a curated catalog of 14 well-known public RPZ
+blocklist sources, a zone-delegation wizard that finds the
+parent zone in the same group and auto-stamps the NS + glue
+records, four starter zone-template wizards (Email with
+MX/SPF/DMARC, Active Directory with the standard SRV records,
+Web with apex A + www CNAME, k8s external-dns target), full
+TSIG key management with Fernet-encrypted secrets and a
+"copy this secret now" reveal modal, a clickable DNS query
+analytics strip on the Logs page (top qnames + top clients +
+qtype distribution), and BIND9 catalog zones (RFC 9432) with
+producer / consumer roles auto-derived from the group's
+primary. On the IPAM side the subnet planner lands as a
+draggable multi-level CIDR design surface with transactional
+apply, the block detail tooling gains a CIDR calculator,
+address planner, aggregation suggestion, and free-space
+treemap, and bulk-select on block detail reaches parity with
+the space view. Plus DHCP scope authoring gets an option-code
+library lookup (95-entry RFC 2132 + IANA catalog with
+autocomplete on the custom-options row) and named option
+templates that can be applied to a scope in one click.
+Also: vendor-neutral LLDP neighbour collection on network
+devices, hostname targets for the nmap scanner, and a
+follow-up linear-time fix for CodeQL alert #18 in the BIND9
+query log parser (same shape as the #16 fix that landed in
+2026.04.28-1).
+
+### Added
+
+- **DNS multi-resolver propagation check.** New `/dns/tools/
+  propagation-check` POST endpoint fires the same query against
+  Cloudflare / Google / Quad9 / OpenDNS in parallel via
+  `dnspython`'s `AsyncResolver` and returns per-resolver
+  `{resolver, status, rtt_ms, answers, error}`. Each query
+  carries its own timeout so a slow resolver can't poison the
+  others. UI surfaces as a Radar button on every record row in
+  the records table; modal lets the operator switch record
+  type and re-check. Driver-agnostic — queries are made from
+  the API process, doesn't touch the BIND9 / Windows drivers.
+- **Conditional forwarders.** `DNSZone` carries `forwarders`
+  (JSONB list of IPs) + `forward_only` (true → `forward only;`,
+  false → `forward first;`). When `zone_type = "forward"` the
+  BIND9 driver renders `zone "X" { type forward; forward only;
+  forwarders { ... }; }` in `zone.stanza.j2` and the agent's
+  wire-format renderer (no zone file written, no allow-update);
+  the form gates the forwarders/policy fields on the type
+  selector and refuses submit when no upstreams are listed.
+  `ZoneDetailView` swaps the records table for a forwarders +
+  policy panel for forward zones — record management never
+  applied there. Migration `a07f6c12e5d3_dns_zone_forwarders`.
+- **Curated RPZ blocklist source catalog.** Static JSON shipped
+  at `backend/app/data/dns_blocklist_catalog.json` with 14
+  well-known public blocklists drawn from AdGuard's
+  HostlistsRegistry + Pi-hole defaults + Hagezi / OISD
+  (AdGuard DNS Filter, StevenBlack Unified, OISD Small/Big,
+  Hagezi Pro / Pro+, 1Hosts Lite, Phishing Army Extended,
+  URLhaus, DigitalSide Threat-Intel, EasyPrivacy, plus
+  StevenBlack fakenews / gambling / adult). New
+  `GET /dns/blocklists/catalog` returns the snapshot
+  (in-process cached); `POST /dns/blocklists/from-catalog`
+  creates a normal `DNSBlockList` row with `source_type="url"`
+  prefilled and immediately enqueues `refresh_blocklist_feed`
+  so the list populates without a manual click. Frontend
+  "Browse Catalog" button on the Blocklists tab opens a
+  filterable picker (category + free-text), with already-
+  subscribed entries flagged.
+- **Zone delegation wizard.** `services/dns/delegation.py`
+  finds the longest-suffix-matching parent zone in the same
+  group (forward zones excluded), reads the child's apex NS
+  records, and computes the NS records the parent needs to
+  delegate the child plus glue (A / AAAA) for any
+  in-bailiwick NS hostnames. Diffs against existing parent
+  records so a second run is a no-op, surfaces warnings
+  ("ns1 is in-bailiwick but has no A/AAAA in child"), and
+  applies through the normal `enqueue_record_op` pipeline so
+  the parent zone's serial bumps once. Endpoints
+  `GET /dns/groups/{gid}/zones/{zid}/delegation-preview` +
+  `POST /dns/groups/{gid}/zones/{zid}/delegate-from-parent`.
+  Frontend: contextual "Delegate" button appears in the zone
+  header only when an eligible parent has missing records;
+  `DelegationModal` shows the exact records that would land
+  in the parent before commit.
+- **DNS template wizards.** Static catalog at
+  `backend/app/data/dns_zone_templates.json` with four starter
+  shapes (Email zone with MX + SPF + DMARC + optional DKIM
+  selector, Active Directory zone with the standard LDAP /
+  Kerberos / GC SRV records + optional `_sites` entries, Web
+  zone with apex A + optional AAAA + `www CNAME`, Kubernetes
+  external-dns target — empty zone). `services/dns/
+  zone_templates.py` validates required parameters and
+  substitutes `{{key}}` placeholders (plus a built-in
+  `{{__zone__}}`) at materialise time; records can declare
+  `skip_if_empty: ["param"]` so optional fields drop out
+  cleanly. Endpoints `GET /dns/zone-templates` +
+  `POST /dns/groups/{gid}/zones/from-template`. Frontend
+  `ZoneTemplateModal` mounted as a "From Template" button on
+  the ZonesTab header alongside "Add Zone".
+- **TSIG key management UI.** New `DNSTSIGKey` model with
+  Fernet-encrypted `secret_encrypted`, `algorithm` enum
+  (hmac-sha1 / 224 / 256 / 384 / 512), `name`, `purpose`,
+  `notes`, `last_rotated_at`. CRUD at `/api/v1/dns/groups/
+  {gid}/tsig-keys` with a side `/generate-secret` helper that
+  returns a fresh random base64 secret of the right size for
+  the chosen algorithm, and a `/{kid}/rotate` endpoint that
+  re-randomises the secret. Plaintext is returned **once** on
+  the create / rotate response — list / get never expose it.
+  Operator-managed rows distribute to every BIND9 agent in
+  the group via the existing `tsig_keys` block in the
+  `ConfigBundle` (alongside the legacy auto-generated agent
+  loopback key); named.conf renders one
+  `key { algorithm …; secret …; };` stanza per row. UI: new
+  "TSIG Keys" tab on the DNS server group view, with create /
+  edit / rotate / delete plus a one-shot "Copy this secret
+  now" modal after each create / rotate. Migration
+  `7c299e8a5490_dns_tsig_keys`.
+- **DNS query analytics.** `POST /api/v1/logs/dns-queries/
+  analytics` returns top-10 qnames + top-10 clients + complete
+  qtype distribution in a single round trip. Computed
+  on-demand via `GROUP BY` against the existing
+  `dns_query_log_entry` rows (24 h retention) — no new schema,
+  no new beat task. The Logs → DNS Queries tab renders an
+  Analytics strip above the raw event grid: three cards each
+  showing key + count + percentage of total, with every row
+  clickable to seed the corresponding filter (qname /
+  client_ip / qtype). The strip refetches only when
+  `(server_id, since)` changes, so per-keystroke filter edits
+  on the events grid don't pay for a re-aggregation.
+- **BIND9 catalog zones (RFC 9432).** Opt-in per group via
+  `DNSServerGroup.catalog_zones_enabled` +
+  `catalog_zone_name` (defaults to `catalog.spatium.invalid.`).
+  The producer is the group's `is_primary=True` bind9 server;
+  every other bind9 member joins as a consumer. Bundle
+  assembly emits a `catalog` block per server: `mode=producer`
+  ships the member zone list, `mode=consumer` ships the
+  producer's IP. The agent renders the catalog zone file per
+  RFC 9432 §4.1 — SOA + NS at apex,
+  `version IN TXT "2"`, and one `<sha1-of-wire-name>.zones IN
+  PTR <member>` per primary zone — and on consumers injects a
+  single `catalog-zones { zone "<catalog>." default-masters {
+  <producer-ip>; } in-memory yes; };` directive into the
+  options block. The catalog block is part of the structural
+  ETag so membership changes trigger a daemon reload, and
+  SHA-1 hashing uses the proper wire format (length-prefixed
+  labels + null terminator). Frontend toggle lives in the
+  server-group create / edit modal alongside the recursion
+  checkbox. Migration `d8e4a73f12c5_dns_catalog_zones`.
+- **IPAM subnet planner.** New `/ipam/plans` page where the
+  operator designs a multi-level CIDR hierarchy as a
+  draggable tree (one root + nested children, arbitrary
+  depth), saves it as a `SubnetPlan` row, validates against
+  current state, then one-click applies — every block +
+  subnet created in a single transaction. `kind` is
+  explicit per node (`block` or `subnet`); root must be a
+  block (subnets need a block parent), and a subnet may not
+  have children. Resource bindings (DNS group, DHCP group,
+  gateway) are optional per-node — `null` = inherit, explicit
+  value sets the field on the materialised row and flips the
+  corresponding `*_inherit_settings=False`. Two root modes:
+  new top-level CIDR (creates a fresh block at the space
+  root) OR anchor to an existing `IPBlock` (descendants land
+  as children of the existing block). Validation
+  (`/plans/{id}/validate` + `/plans/validate-tree` for
+  in-flight trees) checks duplicate node ids, kind rules,
+  parent-containment, sibling-overlap, and overlap against
+  current IPAM state. Live validation runs every 300 ms; the
+  apply confirmation modal surfaces block + subnet counts;
+  any conflict mid-apply → 409 with the full conflict list
+  and nothing is written. `/plans/{id}/reopen` flips an
+  applied plan back to draft state when the materialised
+  resources have all been deleted, so operators can iterate
+  without starting fresh. Frontend uses `@dnd-kit/core` for
+  drag-to-reparent; drops onto descendants OR onto subnet
+  targets are refused. Sidebar entry "Subnet Planner"
+  alongside NAT Mappings. Migration
+  `c8e1f04a932d_subnet_plan`.
+- **IPAM subnet planning + calculation tools.** Four
+  related additions on the block detail surface:
+  - **CIDR calculator** at `/tools/cidr` — pure client-side
+    breakdown of any IPv4 or IPv6 prefix
+    (network / netmask / wildcard / broadcast / range / total
+    addresses / decimal + hex / binary breakdown for v4 and
+    compressed + expanded forms for v6). Quick-paste preset
+    buttons for the common RFC 1918 / CGNAT / ULA blocks.
+    BigInt math throughout so v6 prefixes work cleanly.
+    Sidebar entry under Tools.
+  - **Address planner** —
+    `POST /api/v1/ipam/blocks/{id}/plan-allocation` accepts
+    a list of `{count, prefix_len}` requests (e.g. `4 × /24,
+    2 × /26, 1 × /22`) and packs them into the block's free
+    space using largest-prefix-first ordering with first-
+    fit-by-address placement (so sequential same-size
+    requests pack contiguously from low addresses). Returns
+    the planned allocations + any unfulfilled rows + the
+    remaining free space after the plan. Reuses the same
+    `address_exclude` walk that powers `/free-space`. UI:
+    "Plan allocation…" button next to the Allocation map.
+  - **Aggregation suggestion** —
+    `GET /api/v1/ipam/blocks/{id}/aggregation-suggestions`
+    runs `ipaddress.collapse_addresses` on the block's
+    direct-child subnets; any output that subsumes more than
+    one input is a clean merge opportunity. Read-only banner
+    on the block detail surfaces them when present
+    (e.g. `10.0.0.0/24 + 10.0.1.0/24 → /23`).
+  - **Free-space treemap** — Recharts squarified Treemap on
+    the block detail, toggled via a Band / Treemap selector
+    next to the Allocation map header (selection persisted
+    in sessionStorage per block). Cells coloured by kind
+    (violet child blocks, blue subnets, hashed-zinc free)
+    and sized by raw address count. Pixel-thin slices on the
+    1-D band become visible squares here.
+- **Block-detail bulk-select parity with space view.** The
+  block-detail table can now select child blocks (not just
+  subnets), so the bulk-action toolbar that's been there at
+  the top level is accessible inside any block. Selection
+  state moved to the same `subnet:<id>` / `block:<id>` keyed
+  Set the space view uses; a single bulk delete cascades a
+  mixed set (subnets first, then leaf blocks, allSettled on
+  both phases). Subnet-only actions (Bulk Edit, Split, Merge)
+  gate on the absence of selected blocks.
+- **Vendor-neutral LLDP neighbour collection.** Adds an
+  LLDP-MIB (IEEE 802.1AB) walk as a 5th poll step on every
+  network device, gated by per-device `poll_lldp` toggle
+  (default on). Captures remote chassis ID + port ID
+  (subtype-aware decoding — MAC addresses formatted, interface
+  names left raw), system name + description, port
+  description, and decoded capabilities bitmask (Bridge /
+  Router / WLAN AP / Phone / Repeater / Other / Station /
+  DocsisCableDevice). Stored in
+  `network_neighbour(device_id, interface_id,
+  remote_chassis_id, remote_port_id)` with absence-delete
+  every poll so stale neighbours fall off cleanly. New API
+  `GET /network-devices/{id}/neighbours` with `sys_name` /
+  `chassis_id` / `interface_id` filters; new "Neighbours" tab
+  on the network device detail page with vendor-aware enable
+  hints (Cisco IOS / NX-OS, Junos, Arista EOS, ProCurve /
+  Aruba, MikroTik RouterOS, OPNsense / pfSense) when no rows
+  are present. Migration `b9e4d2a17c83_network_neighbour`.
+- **Nmap accepts hostname targets.** Operators routinely
+  scan `router1.lan` without first looking up its IP, and
+  nmap does its own DNS resolution at scan time. New
+  `_HOSTNAME_RE` validates RFC 1123 labels (rejecting shell
+  metachars, spaces, slashes, anything that isn't a valid
+  DNS character). The `target_ip` column is widened from
+  `INET` to `VARCHAR(255)` (DNS hard upper bound) via
+  migration `f4a83cb15920_nmap_target_text`; the column name
+  stays for audit / API continuity. Form input relabelled
+  "Target" with hostname examples + helper text.
+- **DHCP option-code library lookup.** Static catalog of 95
+  RFC 2132 + IANA `bootp-dhcp-parameters` v4 entries shipped
+  at `backend/app/data/dhcp_option_codes.json` (each entry:
+  `code`, `name`, `kind`, `description`, `rfc`). Loaded once
+  per process via `services/dhcp/option_codes.py`
+  (lru_cache); `search()` helper does case-insensitive
+  name/description matching with numeric-prefix code lookup.
+  `GET /api/v1/dhcp/option-codes` returns the catalog (with
+  optional `q=` substring filter + `limit`). Frontend wires
+  it into `DHCPOptionsEditor`'s custom-options row — the
+  bare numeric code input is now a combobox that searches by
+  code or name, surfaces the description as a hint under the
+  row, and auto-fills `name` on pick. Catalog is fetched once
+  per session (`staleTime: Infinity`) and filtered
+  client-side, so per-keystroke search has no server round-
+  trip. v6 catalog deferred until v6-specific UI lands.
+- **DHCP option templates.** New `DHCPOptionTemplate` model,
+  group-scoped, holds named bundles of option-code → value
+  pairs (e.g. "VoIP phones", "PXE BIOS clients"). CRUD at
+  `/api/v1/dhcp/server-groups/{gid}/option-templates` +
+  `/api/v1/dhcp/option-templates/{id}` plus a server-side
+  `POST /scopes/{id}/apply-option-template` for programmatic
+  apply (mode `merge` = template wins, mode `replace` = drop
+  existing). UI ships a new "Option Templates" tab on the
+  DHCP server-group view (mirrors Client Classes / MAC
+  Blocks) with the shared `DHCPOptionsEditor` for authoring,
+  plus an "Apply template…" picker above the options editor
+  on the scope create / edit modal that does a client-side
+  merge into the editor's local state — operator still hits
+  Save to persist; conflict-key list surfaces inline so the
+  operator knows what was overwritten. Apply is a stamp,
+  not a binding — later template edits do not propagate back
+  to scopes that already used it. Permission gate
+  `dhcp_option_template`, seeded into the existing
+  "DHCP Editor" role. Migration
+  `e7f218ac4d9b_dhcp_option_templates`.
+- **DNS Blocklists multi-select.** Conditional bulk-action
+  toolbar (Apply / Detach / Refresh / Delete) on the
+  Blocklists tab — each button counts only the rows where
+  the action makes sense (Refresh skips manual lists,
+  Detach skips not-applied, etc.).
+- **IP space VRF / RD / RT fields on Create.** The IPAM
+  Create IP Space modal gains the same VRF /
+  Route-distinguisher / Route-targets fields the Edit modal
+  already had — the backend schema accepted them; only the
+  create form was the gap. Collapsed by default since most
+  homelab deployments don't run multi-VRF.
+
+### Changed
+
+- **Subnet / block utilization is now visible in the
+  Allocation map.** Each subnet/block cell carries a
+  mid-saturation tint (the slice exists) plus a saturated
+  fill sized by `utilization_percent`, so you can see at a
+  glance which subnets are nearly full vs nearly empty
+  without scrolling to read the table below. Applies to
+  both the Band view and the new Treemap view.
+- **Per-row Refresh button on the Blocklists tab now shows
+  a spinner + auto-polls** until `last_synced_at` advances
+  (was silently no-op-feeling).
+- **Blocklist per-row action buttons no longer hide on
+  hover** — operator complaint after the bulk-actions push
+  obscured the per-row affordances.
+- **Sidebar nav alphabetised within each section** and the
+  audit-log group merged into platform admin (one less
+  divider to scan past).
+- **Adding a new IPAM block now reparents existing subnets
+  too**, not just sibling blocks. Operator intent on adding
+  e.g. a /16 inside a /12 that already holds /24 subnets is
+  for the /24s to land under the new /16 — matching the
+  existing block-reparenting story we already had on
+  `create_block`. Audit row carries `reparented_subnets`
+  listing what moved.
+- **DNS group selection / expand-collapse UX** — clicking
+  the name of an already-expanded group no longer collapses
+  it (operator complaint after returning from a zone
+  drilldown caused unwanted collapse). Click is now
+  expand-only; explicit chevron click still toggles.
+
+### Fixed
+
+- **CodeQL alert #18 — polynomial-redos in BIND9 query log
+  view-name regex.** The previous shape was
+  `\(\s*view\s+(?P<view_paren>[^)]+?)\s*\)` — both `\s+` and
+  the lazy `[^)]+?` could match whitespace, so on
+  operator-supplied inputs like `(view ` followed by many
+  spaces with no closing paren the engine enumerated every
+  split between the two and backtracked quadratically
+  (~3.4 s on 50k chars in the lab). Same shape as alert #16
+  that landed at the start of release 2026.04.28-1. Fix is
+  to give every segment a disjoint character class:
+  `\(view\s+(?P<view_paren>[^)\s]+)\s*\)`. Adversarial
+  200k-char input now parses in ~4 ms; existing parser tests
+  still pass. Taint source is the agent-posted query log
+  `raw` field, so this is a real DoS surface.
+- **Live nmap SSE viewer now clears the output buffer when
+  the scan ID changes.** The parent reuses the same
+  component instance across scans (just swaps the prop), so
+  React's `useState` initial value never reset and old
+  lines lingered until the first new `data:` frame painted
+  over them. Reset moved into the `useEffect` that opens the
+  EventSource so it fires on every scan switch.
 
 ---
 
