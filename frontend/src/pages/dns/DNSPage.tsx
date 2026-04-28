@@ -6809,15 +6809,16 @@ export function DNSPage() {
                   >
                     {expanded ? "−" : "+"}
                   </button>
-                  {/* Group name — click to select AND toggle expand/collapse.
-                      The chevron button still works on its own; having the
-                      row click also toggle removes the footgun where the
-                      only way to collapse is via a 24px-wide chevron. */}
+                  {/* Group name — click to select. Auto-expand on first
+                      click but NEVER auto-collapse: clicking the name to
+                      navigate back to the group view from a child zone
+                      shouldn't lose the tree context. The chevron is the
+                      dedicated way to collapse. */}
                   <button
                     className="flex flex-1 items-center gap-2 py-1.5 pl-2 pr-1 min-w-0"
                     onClick={() => {
                       setSelection({ type: "group", group: g });
-                      toggleGroup(g.id);
+                      if (!expanded) toggleGroup(g.id);
                     }}
                   >
                     <span
