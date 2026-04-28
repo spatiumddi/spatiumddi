@@ -66,6 +66,13 @@ export function NmapScanLiveViewer({
   });
 
   useEffect(() => {
+    // Starting a fresh scan reuses this component (parent just swaps
+    // the ``scanId`` prop). Clear the buffer + reconnect state so we
+    // don't see stale lines from the previous scan flicker through
+    // before the first new ``data:`` frame arrives.
+    setLines([]);
+    setStreamStatus("connecting");
+
     const url = nmapApi.streamUrl(scanId);
     const es = new EventSource(url);
 

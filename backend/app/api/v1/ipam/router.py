@@ -2084,6 +2084,41 @@ async def create_block(body: IPBlockCreate, current_user: CurrentUser, db: DB) -
             continue  # raced / deleted — skip
         existing.parent_block_id = block.id
         reparented.append(str(existing.network))
+
+    # Subnet reparenting: any subnet currently sitting directly
+    # under the new block's parent (i.e. the new block's would-be
+    # sibling) whose CIDR falls inside the new block's range gets
+    # pulled under the new block. Matches operator intent — adding
+    # a /13 inside a /12 that already holds /16 subnets should
+    # adopt the /16s without a manual move per subnet. Top-level
+    # blocks (parent_block_id IS NULL) have no subnet siblings
+    # because every Subnet.block_id is non-nullable, so this is a
+    # no-op in that case.
+    reparented_subnets: list[str] = []
+    if body.parent_block_id is not None:
+        sibling_subnets = (
+            await db.execute(
+                text(
+                    "SELECT id, network FROM subnet "
+                    "WHERE space_id = CAST(:space_id AS uuid) "
+                    "AND block_id = CAST(:parent_id AS uuid) "
+                    "AND deleted_at IS NULL"
+                ),
+                {
+                    "space_id": str(body.space_id),
+                    "parent_id": str(body.parent_block_id),
+                },
+            )
+        ).fetchall()
+        new_block_net = _parse_network(canonical)
+        for srow in sibling_subnets:
+            sub_net = ipaddress.ip_network(str(srow[1]), strict=False)
+            if sub_net.subnet_of(new_block_net):  # type: ignore[arg-type]
+                sub = await db.get(Subnet, srow[0])
+                if sub is None:
+                    continue
+                sub.block_id = block.id
+                reparented_subnets.append(str(sub.network))
     db.add(
         _audit(
             current_user,
@@ -2097,6 +2132,7 @@ async def create_block(body: IPBlockCreate, current_user: CurrentUser, db: DB) -
                 # so operators can see what moved when they check the
                 # log later.
                 "reparented_children": reparented if reparented else None,
+                "reparented_subnets": reparented_subnets if reparented_subnets else None,
             },
         )
     )
@@ -2107,6 +2143,7 @@ async def create_block(body: IPBlockCreate, current_user: CurrentUser, db: DB) -
         block_id=str(block.id),
         network=block.network,
         reparented_children=reparented or None,
+        reparented_subnets=reparented_subnets or None,
     )
     return block
 

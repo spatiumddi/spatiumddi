@@ -34,7 +34,7 @@ import uuid
 import xml.etree.ElementTree as ET
 from collections.abc import AsyncIterator
 from datetime import UTC, datetime
-from typing import Any
+from typing import Any, Final
 
 import structlog
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -81,12 +81,44 @@ class NmapArgError(ValueError):
     """Raised when operator-supplied arguments fail validation."""
 
 
-def _validate_target_ip(target: str) -> str:
+_HOSTNAME_RE: Final = re.compile(
+    # RFC 1123 / 952 hostname: labels of [A-Za-z0-9-] up to 63 chars,
+    # joined by dots, no leading/trailing hyphen per label, total
+    # length <= 253. We deliberately allow a trailing dot (FQDN form)
+    # which nmap accepts. Operator can target a bare host
+    # (``router1``) or an FQDN (``router1.lan``).
+    r"^(?=.{1,253}\.?$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*"
+    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.?$"
+)
+
+
+def _validate_target(target: str) -> str:
+    """Accept either a literal IPv4/IPv6 address or a hostname / FQDN.
+
+    Hostname mode is a deliberate extension over the original IP-only
+    contract — operators routinely want to scan ``router1.lan``
+    without first looking up its IP. nmap performs DNS resolution
+    itself, so we just need to validate the syntax tightly enough
+    that the argv builder can pass the value through to nmap without
+    risk of injection. The hostname regex rejects shell metachars,
+    spaces, slashes, and anything else that isn't a valid DNS label
+    character.
+    """
+    target = target.strip()
+    if not target:
+        raise NmapArgError("target is required")
     try:
         addr = ipaddress.ip_address(target)
-    except ValueError as exc:
-        raise NmapArgError(f"target_ip is not a valid IPv4/IPv6 address: {target}") from exc
-    return str(addr)
+        return str(addr)
+    except ValueError:
+        pass
+    if _HOSTNAME_RE.match(target):
+        return target
+    raise NmapArgError(f"target must be a valid IPv4/IPv6 address or hostname (got {target!r})")
+
+
+# Keep the old name as an alias for callers that import it directly.
+_validate_target_ip = _validate_target
 
 
 def _validate_port_spec(spec: str | None) -> str | None:

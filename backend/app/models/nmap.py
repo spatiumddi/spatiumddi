@@ -27,7 +27,7 @@ from sqlalchemy import (
     String,
     Text,
 )
-from sqlalchemy.dialects.postgresql import INET, JSONB, UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
@@ -43,7 +43,11 @@ class NmapScan(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         Index("ix_nmap_scan_ip_address", "ip_address_id"),
     )
 
-    target_ip: Mapped[str] = mapped_column(INET, nullable=False)
+    # Operator-supplied scan target. Despite the column name (kept for
+    # audit / API continuity) this can be either an IP literal or a
+    # hostname / FQDN — nmap resolves the latter at scan time. Stored
+    # as VARCHAR(255) (DNS hard upper bound).
+    target_ip: Mapped[str] = mapped_column(String(255), nullable=False)
     ip_address_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("ip_address.id", ondelete="SET NULL"),

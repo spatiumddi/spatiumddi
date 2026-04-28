@@ -102,16 +102,19 @@ export function NmapScanForm({
     <div className="space-y-3">
       <div>
         <label className="mb-1 block text-xs font-medium text-muted-foreground">
-          Target IP
+          Target
         </label>
         <input
           className={cn(inputCls, "font-mono")}
           value={targetIp}
           onChange={(e) => setTargetIp(e.target.value)}
           disabled={!!lockTarget}
-          placeholder="e.g. 192.0.2.10 or 2001:db8::1"
+          placeholder="IP or hostname — e.g. 192.0.2.10, 2001:db8::1, router1.lan"
           autoFocus={!lockTarget}
         />
+        <p className="mt-1 text-[11px] text-muted-foreground/70">
+          Hostnames are resolved by nmap at scan time.
+        </p>
       </div>
 
       <div>
