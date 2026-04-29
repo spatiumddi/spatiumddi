@@ -1110,15 +1110,165 @@ write surface, not a read-only pull mirror).
   every other entry here — it's migration tooling, not
   integration.
 
-- ⬜ **Cloud VPC family (AWS / Azure / GCP / Hetzner / DO /
-  Linode / Vultr)** *(tier 3 — lab-inaccessible, but roadmap
-  coherent).* Same shape: per-account/subscription row with
-  access-key + region scope, mirror VPCs/VNets → IP spaces,
-  subnets → Subnets, EC2/VM instances → IPAddress rows. Cloud
-  DNS driver family already on the roadmap above is the
-  write-side counterpart. Gating for later — no lab relevance
-  for the Proxmox/UniFi/Tailscale/OPNsense operator base we're
-  aiming at first.
+- ⬜ **Cloud connectors — unified "Cloud" integration with
+  per-provider picker (Azure / AWS / GCP)** *(tier 3 —
+  lab-inaccessible, enterprise-driven).* One Settings →
+  Integrations card labelled **Cloud**; the create modal asks
+  for provider first, then renders the provider-specific
+  credential form with an embedded setup guide (CLI commands
+  + console click-through). Every materialised row provenances
+  via `cloud_endpoint_id` FK with `ON DELETE CASCADE` so
+  removing the endpoint sweeps mirror rows atomically.
+
+  **Data model.** Single `cloud_endpoint` row with
+  `provider` enum (`aws | azure | gcp | hetzner | digitalocean
+  | linode | vultr` — only the first three actually
+  implemented at first) plus a JSONB
+  `credentials_encrypted` blob (Fernet-encrypted, schema
+  varies per provider). Standard fields:
+  `name`, `description`, `space_id` (required — discovered
+  IPs / blocks land there), `dns_group_id` (optional, mirrors
+  the K8s shape), `sync_interval_seconds` (default 300, min
+  60), `regions` (string list — empty = all), `last_synced_at`,
+  `last_sync_error`, `mirror_load_balancers` (default true),
+  `mirror_stopped_instances` (default false).
+
+  **Per-provider credential schema:**
+  - **Azure**: `tenant_id`, `client_id`, `client_secret`,
+    `subscription_ids[]`. Setup: `az ad sp create-for-rbac
+    --name spatiumddi --role Reader --scopes /subscriptions/
+    <sub-id>` outputs all four fields. Reader is the
+    least-privileged role with read access to the four
+    resource types we mirror (VNets, subnets, NICs, LBs).
+  - **AWS**: `access_key_id`, `secret_access_key`. Setup:
+    create IAM user with `AmazonVPCReadOnlyAccess` +
+    `AmazonEC2ReadOnlyAccess` +
+    `ElasticLoadBalancingReadOnly`; attach those three
+    managed policies, generate access key, paste into the
+    form.
+  - **GCP**: `service_account_json` (entire JSON key file
+    as a single string, Fernet-encrypted), `project_ids[]`.
+    Setup: `gcloud iam service-accounts create spatiumddi
+    --display-name "SpatiumDDI"` + `gcloud projects
+    add-iam-policy-binding <proj> --member
+    serviceAccount:... --role roles/compute.viewer` +
+    `gcloud iam service-accounts keys create key.json
+    --iam-account ...`.
+
+  **Mirror scope (structurally identical across providers):**
+  - VNet (Az) / VPC (AWS) / VPC Network (GCP) → `IPSpace`
+    (auto-create with vendor-prefixed name); the address
+    space CIDR(s) → `IPBlock` rows under it.
+  - subnet (Az) / subnet (AWS) / subnetwork (GCP) →
+    `Subnet` (gateway derived from per-vendor convention —
+    Az x.x.x.1, AWS x.x.x.1, GCP x.x.x.1).
+  - VM NIC private IP (Az) / EC2 ENI (AWS) / GCE NIC (GCP)
+    → `IPAddress` with `status="cloud-vm"`, hostname =
+    `<resource>.<resource_group>` (Az) / `<instance>.<region>`
+    (AWS) / `<instance>.<zone>` (GCP).
+  - Public IPs / EIPs / external addresses → `IPAddress`
+    with `status="cloud-public"` in a separate per-endpoint
+    "public" IPSpace (or operator-chosen).
+  - LB frontend IP (Az LB / AWS ELB|ALB|NLB / GCP forwarding
+    rule) → `IPAddress` with `status="cloud-lb"`. Once
+    `LBMapping` lands these flow into it with full backend
+    pool membership.
+
+  **Connectors:** Azure via `azure-mgmt-network` +
+  `azure-mgmt-compute` + `azure-identity` (ClientSecret
+  credential), AWS via `boto3` (per-region client fan-out),
+  GCP via `google-cloud-compute` + `google-cloud-network`
+  + `google-auth`. Each connector is a thin reconciler under
+  `services/cloud/<provider>.py` that returns a normalised
+  `CloudInventory` dataclass; the shared
+  `services/cloud/reconcile.py` does the IPAM upsert. Same
+  `user_modified_at` lock pattern as Proxmox / Docker / K8s
+  rows so operator edits stay sticky.
+
+  **Phasing (recommended).** Phase 1 = Azure (simplest auth
+  flow, user-familiar). Phase 2 = AWS. Phase 3 = GCP. Each
+  phase is independently shippable since the data model is
+  the same; `provider` enum gates the connector dispatch.
+
+  **Permission gate** `manage_cloud_endpoints` (admin-only).
+  Optional new "Cloud Operator" builtin role — usually fits
+  inside Superadmin in practice.
+
+  **Explicit non-goals.** Writing back to the cloud (no
+  resource creation, no NSG / Security Group edits, no
+  instance start/stop). Cloud DNS (Route 53 / Azure DNS /
+  Cloud DNS) is a **separate write-side driver family**
+  already on the roadmap — it does NOT live in the cloud
+  endpoint row. Tags / NSGs / route tables surface as
+  `custom_fields` passthrough at most; Phase 4+ if operators
+  ask. Per-provider quirks (Azure availability sets, AWS
+  placement groups, GCP shared VPC) deferred — start with
+  the four resource types above.
+
+- ⬜ **Load balancer family (F5 BIG-IP, HAProxy, nginx,
+  KEMP, A10, Citrix ADC)** *(tier 2 — F5 first, others
+  follow).* Read-only mirror of VIPs + pools + members from
+  external load balancers into a new first-class
+  `LBMapping` table that parallels the existing
+  `NATMapping` shape (operator-curated 1:1 / PAT / hide-NAT
+  rules surface in the per-IP modal + per-subnet "NAT"
+  tab; load-balancer mappings would surface the same way
+  with "VIP" / "backend" role badges). The data-model
+  payoff: per-IP modal answers "is this a VIP? what
+  backends serve it?" / "is this a pool member behind
+  what VIP?", per-subnet view shows every VIP in range,
+  and operators can finally tell load-balancer IPs apart
+  from regular host IPs in the IP table.
+
+  **Decision points still open** — confirm before building:
+  1. **Manual-only first, or integration-driven only?**
+     NAT mappings work as manual-entry today and we
+     accept the staleness; LB mappings change much more
+     often (pool membership shifts on every deploy /
+     auto-scale event). Recommendation: gate on the
+     integration, no manual-entry shipping. The data is
+     only useful when fresh.
+  2. **`LBMapping` shape**: `vip_ip` (FK to `IPAddress`,
+     nullable), `vip_port`, `protocol` (tcp/udp/icmp),
+     `pool_name`, `description`, `lb_endpoint_id` FK to
+     the integration row that materialised it (nullable
+     for any future manual-entry path), `members` JSONB
+     `[{ip, port, weight, state}]` with optional FKs to
+     live `IPAddress` rows on each member.
+     Provenance via `lb_endpoint_id` with
+     `ON DELETE CASCADE` so removing the integration
+     sweeps mirror rows atomically (mirrors how
+     `kubernetes_cluster_id` / `proxmox_node_id` work).
+  3. **Phasing.** Phase 1 = `LBMapping` table +
+     `F5Endpoint` row + reconciler over iControl REST
+     (token auth, Fernet-encrypted at rest, partition-
+     aware). Phase 2 = HAProxy stats socket / Runtime
+     API + nginx Plus API readers. Phase 3 = KEMP / A10
+     / Citrix ADC. Cloud LBs (AWS ELB / Azure LB / GCP
+     LB) ride along with the Cloud VPC integration
+     family above and write into the same `LBMapping`
+     table — the schema is shared; the connector is
+     vendor-specific.
+  4. **F5 specifics**: per-`F5Endpoint` row covers a
+     single BIG-IP (or cluster — iControl normalises
+     standalone vs HA pairs). Mirror VIPs from
+     `/mgmt/tm/ltm/virtual` and pools from
+     `/mgmt/tm/ltm/pool`. Member health is in
+     `/mgmt/tm/ltm/pool/~<partition>~<pool>/members`.
+     iRule / iApp / partition surface deferred — start
+     with the basic VIP + pool + members triple.
+  5. **Permission gate** `manage_load_balancers`
+     (admin-only). New "Load Balancer Editor" builtin
+     role for ops teams that need write access to the
+     manual-entry path (if it ever lands) without full
+     superadmin.
+
+  **Explicit non-goals**: writing config back to the
+  load balancer (no `iControl REST PUT`, no HAProxy
+  reload), managing certificates on F5 (separate
+  surface; pairs with the embedded ACME client item
+  on the roadmap), iRule / iApp authoring. The mirror
+  is for IPAM context, not LB administration.
 
 **Explicit non-goals for the integrations shelf:**
 
@@ -1533,6 +1683,118 @@ None of these have started; everything below is ⬜.
   **Deferred:** operator-customisable resolver list (today the
   curated set is hard-coded server-side; the API accepts an
   override but the UI doesn't yet expose it).
+- ⬜ **DNS pool with health monitoring (GSLB-lite)** — named
+  pool of A / AAAA targets where one DNS name (e.g.
+  `www.example.com`) returns one record per healthy + enabled
+  member. Health checks (`tcp | http | https | icmp`) run on
+  a per-pool interval, members flip in/out of the rendered
+  record set as state changes; operator can also manually
+  enable/disable members like a load-balancer pool. Driver-
+  agnostic: pool members render as **regular A/AAAA records**
+  in the bound zone (one per healthy member), so BIND9 and
+  Windows DNS render unchanged.
+
+  **Data model:**
+  - `dns_pool(id, group_id, zone_id, name, record_name, record_type,
+    ttl, hc_type, hc_target_port, hc_path, hc_method,
+    hc_expected_status_codes, hc_interval_seconds,
+    hc_timeout_seconds, hc_unhealthy_threshold,
+    hc_healthy_threshold, enabled, created_at, modified_at)`.
+  - `dns_pool_member(id, pool_id, address, weight, enabled,
+    last_check_at, last_check_state, last_check_error,
+    consecutive_failures, consecutive_successes)`. Operator-
+    set `enabled=False` keeps the member out of the rendered
+    set regardless of health.
+  - `dns_record` gains a nullable `pool_member_id` FK. When
+    set, the records-tab UI renders a "managed by pool — do
+    not edit" badge and disables the row's edit/delete
+    buttons; record CRUD endpoints reject writes with 422.
+
+  **Pipeline:**
+  - `app.tasks.dns_pool_healthcheck.run_pool_check(pool_id)`
+    fires per-pool on the configured interval (Celery beat
+    dispatcher fans out due pools every 30s, same shape as
+    the SNMP poll dispatcher).
+  - Each member's check runs concurrently inside the task
+    (asyncio gather with per-check timeout); state updates
+    after `consecutive_failures >= unhealthy_threshold` (or
+    successes for recovery) so a single flapping check
+    doesn't churn DNS records.
+  - On state change, `enqueue_record_op` add/remove for the
+    affected member's record. Other members unaffected.
+
+  **Operator UX:**
+  - Per-zone "Pools" tab (mirrors the Records tab shape).
+  - Pool create / edit modal: pick zone + record name +
+    record type + TTL + check config; member sub-table for
+    add/edit/remove with manual enable toggle and live
+    status dot.
+  - Per-member status: `healthy` (green), `unhealthy` (red),
+    `unknown` (gray, pre-first-check), `disabled` (zinc,
+    operator-toggled).
+
+  **Tradeoff (operator-facing warning in the UI):** TTL
+  races. DNS is cached client-side; a member dropping out
+  doesn't take effect until TTL expires, so this is **not**
+  the same as a real L4/L7 load balancer — clients can
+  still hit a dead box for up to `ttl` seconds. UI defaults
+  TTL to 30s with an inline note pointing operators at the
+  LB-mapping roadmap item for real load balancing.
+
+  **Where the checks run.** Phase 1: from the API process
+  (single-region, simplest). Phase 2: delegate to a chosen
+  DNS agent so the check originates from the same network
+  vantage as the DNS server (matters for split-horizon
+  setups + when targets are on a private network the API
+  can't reach). Permission gate `manage_dns_pools` seeded
+  into the existing "DNS Editor" role.
+
+- ⬜ **DNS server detail page** — per-server `/dns/servers/{id}`
+  view (not a modal — too much to fit) with tabbed UI.
+  Mirrors the existing per-DHCP-server detail shape. Tabs:
+  - **Overview** — name, IP, role, driver, agent version,
+    last heartbeat, JWT expiry, pending-ops queue depth,
+    structural ETag (current vs. last-acked = drift
+    indicator), health status dot, recent state-transition
+    history.
+  - **Config** — terminal-style monospace block showing the
+    rendered `named.conf` (and zone files via a sub-picker
+    for BIND9). Backed by a new agent endpoint
+    `GET /api/v1/dns/agents/admin/rendered-config` that
+    returns the file content from the agent's local
+    materialised config dir. Read-only; copy-to-clipboard
+    button.
+  - **Zones** — table of zones served by this server with
+    per-zone serial + drift state from `DNSServerZoneState`.
+    Click-through to zone detail.
+  - **Stats** — BIND9 `statistics-channels` XML (already
+    polled for the dashboard MVP). Per-qtype query rate, top
+    qnames, response codes (NOERROR / NXDOMAIN / SERVFAIL),
+    cache hit ratio. Windows DNS: `Get-DnsServerStatistics`
+    via WinRM. New agent endpoint
+    `GET /api/v1/dns/agents/admin/stats`.
+  - **Logs** — last N lines from the BIND9 query log /
+    error log, with per-line filtering. Reuses the same
+    `dns_query_log_entry` rows the Logs page already has,
+    filtered to this server.
+  - **Events** — last N audit-log rows where `resource_id`
+    matches this server.
+
+  **Agent admin endpoints.** New surface
+  `/api/v1/dns/agents/admin/*` with three GETs initially:
+  `/rendered-config?file=<named.conf|zones/<zone>>`,
+  `/stats`, `/rndc-status` (BIND9 `rndc status` shell-out).
+  Each carries the same JWT auth as existing agent
+  endpoints; operator-side requests proxy through the API
+  using the agent's bound credentials. Windows servers
+  bypass — they hit the WinRM driver directly for
+  rendered-config (effectively "show this is what we'd
+  send" — no live config-on-disk concept) and stats.
+
+  **Tradeoff.** Adds agent surface area + auth proxying.
+  Worth it because it answers the operator's #1 first-
+  diagnosis question ("is this server actually running the
+  config we sent?") without SSHing into the container.
 
 #### DHCP-specific
 

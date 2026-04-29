@@ -247,6 +247,14 @@ class ServerResponse(BaseModel):
     # names client-side.
     has_credentials: bool
     is_agentless: bool
+    # Agent-state fields used by the Server Detail modal — surfacing
+    # these lets operators answer "what's this server doing right now"
+    # without crawling the database.
+    agent_id: uuid.UUID | None
+    last_seen_at: datetime | None
+    last_config_etag: str | None
+    pending_approval: bool
+    is_primary: bool
     created_at: datetime
     modified_at: datetime
 
@@ -270,6 +278,11 @@ class ServerResponse(BaseModel):
             notes=s.notes,
             has_credentials=bool(s.credentials_encrypted),
             is_agentless=is_agentless(s.driver),
+            agent_id=s.agent_id,
+            last_seen_at=s.last_seen_at,
+            last_config_etag=s.last_config_etag,
+            pending_approval=s.pending_approval,
+            is_primary=s.is_primary,
             created_at=s.created_at,
             modified_at=s.modified_at,
         )
@@ -2399,6 +2412,236 @@ async def get_zone_server_state(
         servers=entries,
         in_sync=all_in_sync and any_reported,
     )
+
+
+# ── Per-server detail endpoints (powering the Server Detail modal) ──
+
+
+class PerServerZoneStateEntry(BaseModel):
+    zone_id: uuid.UUID
+    zone_name: str
+    zone_type: str
+    target_serial: int
+    current_serial: int | None
+    reported_at: datetime | None
+    in_sync: bool
+
+
+class PerServerZoneStateResponse(BaseModel):
+    server_id: uuid.UUID
+    server_name: str
+    zones: list[PerServerZoneStateEntry]
+    summary: dict[str, int]
+
+
+@router.get(
+    "/servers/{server_id}/zone-state",
+    response_model=PerServerZoneStateResponse,
+)
+async def get_server_zone_state(
+    server_id: uuid.UUID, db: DB, _: CurrentUser
+) -> PerServerZoneStateResponse:
+    """Per-zone state from this server's perspective.
+
+    For every zone in the server's group, joins the zone's
+    ``last_serial`` (target) with this server's
+    ``DNSServerZoneState.current_serial`` (what the agent reported).
+    Drives the "Zones" tab on the Server Detail modal.
+    """
+    from app.models.dns import DNSServerZoneState  # noqa: PLC0415
+
+    server = await db.get(DNSServer, server_id)
+    if server is None:
+        raise HTTPException(status_code=404, detail="Server not found")
+
+    zones_res = await db.execute(
+        select(DNSZone).where(DNSZone.group_id == server.group_id).order_by(DNSZone.name)
+    )
+    zones = list(zones_res.scalars().all())
+
+    state_res = await db.execute(
+        select(DNSServerZoneState).where(DNSServerZoneState.server_id == server_id)
+    )
+    state_by_zone: dict[uuid.UUID, DNSServerZoneState] = {
+        s.zone_id: s for s in state_res.scalars().all()
+    }
+
+    entries: list[PerServerZoneStateEntry] = []
+    in_sync_count = 0
+    drift_count = 0
+    not_reported_count = 0
+    for z in zones:
+        st = state_by_zone.get(z.id)
+        target = int(z.last_serial or 0)
+        current = int(st.current_serial) if st else None
+        in_sync = current is not None and current == target
+        if current is None:
+            not_reported_count += 1
+        elif in_sync:
+            in_sync_count += 1
+        else:
+            drift_count += 1
+        entries.append(
+            PerServerZoneStateEntry(
+                zone_id=z.id,
+                zone_name=z.name,
+                zone_type=z.zone_type or "primary",
+                target_serial=target,
+                current_serial=current,
+                reported_at=st.reported_at if st else None,
+                in_sync=in_sync,
+            )
+        )
+
+    return PerServerZoneStateResponse(
+        server_id=server.id,
+        server_name=server.name,
+        zones=entries,
+        summary={
+            "total": len(entries),
+            "in_sync": in_sync_count,
+            "drift": drift_count,
+            "not_reported": not_reported_count,
+        },
+    )
+
+
+class PendingOpEntry(BaseModel):
+    op_id: uuid.UUID
+    zone_name: str
+    op: str
+    state: str
+    record: dict[str, Any]
+    target_serial: int | None
+    attempts: int
+    last_error: str | None
+    created_at: datetime
+    applied_at: datetime | None
+
+
+class PendingOpsResponse(BaseModel):
+    server_id: uuid.UUID
+    counts: dict[str, int]
+    items: list[PendingOpEntry]
+
+
+@router.get(
+    "/servers/{server_id}/pending-ops",
+    response_model=PendingOpsResponse,
+)
+async def get_server_pending_ops(
+    server_id: uuid.UUID, db: DB, _: CurrentUser, limit: int = 50
+) -> PendingOpsResponse:
+    """Pending / in-flight / recently-applied / failed record ops.
+
+    Drives the Server Detail modal's "Sync" tab. The counts dict has
+    one key per state value (``pending``, ``in_flight``, ``applied``,
+    ``failed``). Items are ordered by ``created_at DESC`` and capped
+    at ``limit``.
+    """
+    from app.models.dns import DNSRecordOp  # noqa: PLC0415
+
+    server = await db.get(DNSServer, server_id)
+    if server is None:
+        raise HTTPException(status_code=404, detail="Server not found")
+
+    counts_res = await db.execute(
+        select(DNSRecordOp.state, func.count())
+        .where(DNSRecordOp.server_id == server_id)
+        .group_by(DNSRecordOp.state)
+    )
+    counts: dict[str, int] = {row[0]: int(row[1]) for row in counts_res.all()}
+
+    ops_res = await db.execute(
+        select(DNSRecordOp)
+        .where(DNSRecordOp.server_id == server_id)
+        .order_by(DNSRecordOp.created_at.desc())
+        .limit(limit)
+    )
+    items = [
+        PendingOpEntry(
+            op_id=op.id,
+            zone_name=op.zone_name,
+            op=op.op,
+            state=op.state,
+            record=dict(op.record or {}),
+            target_serial=op.target_serial,
+            attempts=op.attempts,
+            last_error=op.last_error,
+            created_at=op.created_at,
+            applied_at=op.applied_at,
+        )
+        for op in ops_res.scalars().all()
+    ]
+    return PendingOpsResponse(
+        server_id=server.id,
+        counts=counts,
+        items=items,
+    )
+
+
+class ServerEventEntry(BaseModel):
+    id: str
+    timestamp: datetime
+    user_display_name: str
+    action: str
+    resource_type: str
+    resource_display: str
+    result: str
+
+    @field_validator("id", mode="before")
+    @classmethod
+    def coerce_id(cls, v: object) -> str:
+        return str(v)
+
+
+class ServerEventsResponse(BaseModel):
+    server_id: uuid.UUID
+    items: list[ServerEventEntry]
+
+
+@router.get(
+    "/servers/{server_id}/recent-events",
+    response_model=ServerEventsResponse,
+)
+async def get_server_recent_events(
+    server_id: uuid.UUID, db: DB, _: CurrentUser, limit: int = 50
+) -> ServerEventsResponse:
+    """Audit-log rows where ``resource_id`` matches this server.
+
+    The audit log keys ``resource_id`` as text, so we filter on the
+    string form of the UUID. Drives the "Events" tab on the Server
+    Detail modal.
+    """
+    server = await db.get(DNSServer, server_id)
+    if server is None:
+        raise HTTPException(status_code=404, detail="Server not found")
+
+    rows = (
+        (
+            await db.execute(
+                select(AuditLog)
+                .where(AuditLog.resource_id == str(server_id))
+                .order_by(AuditLog.timestamp.desc())
+                .limit(limit)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    items = [
+        ServerEventEntry(
+            id=str(r.id),
+            timestamp=r.timestamp,
+            user_display_name=r.user_display_name,
+            action=r.action,
+            resource_type=r.resource_type,
+            resource_display=r.resource_display,
+            result=r.result,
+        )
+        for r in rows
+    ]
+    return ServerEventsResponse(server_id=server.id, items=items)
 
 
 @router.put("/groups/{group_id}/zones/{zone_id}", response_model=ZoneResponse)

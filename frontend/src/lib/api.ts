@@ -2021,6 +2021,62 @@ export interface DNSGroupSyncResult {
   items: DNSPerServerSyncItem[];
 }
 
+export interface DNSPerServerZoneStateEntry {
+  zone_id: string;
+  zone_name: string;
+  zone_type: string;
+  target_serial: number;
+  current_serial: number | null;
+  reported_at: string | null;
+  in_sync: boolean;
+}
+
+export interface DNSPerServerZoneStateResponse {
+  server_id: string;
+  server_name: string;
+  zones: DNSPerServerZoneStateEntry[];
+  summary: {
+    total: number;
+    in_sync: number;
+    drift: number;
+    not_reported: number;
+  };
+}
+
+export interface DNSPendingOpEntry {
+  op_id: string;
+  zone_name: string;
+  op: string;
+  state: string;
+  record: Record<string, unknown>;
+  target_serial: number | null;
+  attempts: number;
+  last_error: string | null;
+  created_at: string;
+  applied_at: string | null;
+}
+
+export interface DNSPendingOpsResponse {
+  server_id: string;
+  counts: Record<string, number>;
+  items: DNSPendingOpEntry[];
+}
+
+export interface DNSServerEventEntry {
+  id: string;
+  timestamp: string;
+  user_display_name: string;
+  action: string;
+  resource_type: string;
+  resource_display: string;
+  result: string;
+}
+
+export interface DNSServerEventsResponse {
+  server_id: string;
+  items: DNSServerEventEntry[];
+}
+
 export interface DNSServer {
   id: string;
   group_id: string;
@@ -2045,6 +2101,12 @@ export interface DNSServer {
   /** True when the driver runs from the control plane (no agent). Used
    * by the UI to hide approval / agent-registration affordances. */
   is_agentless: boolean;
+  /** Agent-state fields surfaced for the Server Detail modal. */
+  agent_id: string | null;
+  last_seen_at: string | null;
+  last_config_etag: string | null;
+  pending_approval: boolean;
+  is_primary: boolean;
   created_at: string;
   modified_at: string;
 }
@@ -2407,6 +2469,24 @@ export const dnsApi = {
     api
       .post<DNSServerSyncResult>(
         `/dns/groups/${groupId}/servers/${serverId}/sync-from-server`,
+      )
+      .then((r) => r.data),
+
+  // Per-server detail (powers the Server Detail modal)
+  getServerZoneState: (serverId: string) =>
+    api
+      .get<DNSPerServerZoneStateResponse>(`/dns/servers/${serverId}/zone-state`)
+      .then((r) => r.data),
+  getServerPendingOps: (serverId: string, limit = 50) =>
+    api
+      .get<DNSPendingOpsResponse>(
+        `/dns/servers/${serverId}/pending-ops?limit=${limit}`,
+      )
+      .then((r) => r.data),
+  getServerRecentEvents: (serverId: string, limit = 50) =>
+    api
+      .get<DNSServerEventsResponse>(
+        `/dns/servers/${serverId}/recent-events?limit=${limit}`,
       )
       .then((r) => r.data),
 

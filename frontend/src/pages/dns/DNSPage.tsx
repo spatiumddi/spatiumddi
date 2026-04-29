@@ -38,6 +38,7 @@ import { PropagationCheckModal } from "./PropagationCheckModal";
 import { BlocklistCatalogModal } from "./BlocklistCatalogModal";
 import { DelegationModal } from "./DelegationModal";
 import { ZoneTemplateModal } from "./ZoneTemplateModal";
+import { ServerDetailModal } from "./ServerDetailModal";
 import { Modal } from "@/components/ui/modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import {
@@ -2630,6 +2631,7 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
   const qc = useQueryClient();
   const [showAdd, setShowAdd] = useState(false);
   const [editServer, setEditServer] = useState<DNSServer | null>(null);
+  const [detailServer, setDetailServer] = useState<DNSServer | null>(null);
   const [confirmDeleteServer, setConfirmDeleteServer] =
     useState<DNSServer | null>(null);
 
@@ -2733,7 +2735,9 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
         {servers.map((s) => (
           <div
             key={s.id}
-            className="flex items-center justify-between rounded-md border bg-card px-3 py-2.5 group"
+            className="flex items-center justify-between rounded-md border bg-card px-3 py-2.5 group cursor-pointer hover:bg-accent/40"
+            onClick={() => setDetailServer(s)}
+            title="Click to view details"
           >
             <div className="flex items-center gap-3">
               <Cpu className="h-4 w-4 text-muted-foreground flex-shrink-0" />
@@ -2766,13 +2770,19 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
             <div className="flex items-center gap-1">
               <button
                 className="h-7 w-7 flex items-center justify-center rounded text-muted-foreground hover:text-foreground"
-                onClick={() => setEditServer(s)}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setEditServer(s);
+                }}
               >
                 <Pencil className="h-3.5 w-3.5" />
               </button>
               <button
                 className="h-7 w-7 flex items-center justify-center rounded text-muted-foreground hover:text-destructive"
-                onClick={() => setConfirmDeleteServer(s)}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  setConfirmDeleteServer(s);
+                }}
               >
                 <Trash2 className="h-3.5 w-3.5" />
               </button>
@@ -2788,6 +2798,12 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
           groupId={group.id}
           server={editServer}
           onClose={() => setEditServer(null)}
+        />
+      )}
+      {detailServer && (
+        <ServerDetailModal
+          server={detailServer}
+          onClose={() => setDetailServer(null)}
         />
       )}
       {confirmDeleteServer && (
