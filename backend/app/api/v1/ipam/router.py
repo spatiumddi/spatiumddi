@@ -2,6 +2,7 @@
 
 import ipaddress
 import re
+import string
 import uuid
 from datetime import UTC, datetime
 from typing import Any, cast
@@ -5540,13 +5541,30 @@ async def purge_orphans(
 #   {oct1}    → first octet of the IP (IPv4 only)
 #   {oct2-4}  → other octets
 #
-# Anything outside those tokens is literal. The same regex is mirrored
-# client-side for live preview as the operator types — keep them in sync.
+# Anything outside those tokens is literal. The same token grammar is
+# mirrored client-side for live preview as the operator types — keep them
+# in sync.
 
-_BULK_TEMPLATE_RE = re.compile(r"\{(n|oct[1-4])(?::([^}]+))?\}")
 _BULK_MAX_IPS = 1024
 _BULK_ALLOC_ALLOWED_STATUSES = frozenset({"allocated", "reserved", "deprecated"})
 _HOSTNAME_LABEL_RE = re.compile(r"^[a-zA-Z0-9]([a-zA-Z0-9-]{0,62})$")
+_BULK_TEMPLATE_FIELDS: frozenset[str] = frozenset({"n", "oct1", "oct2", "oct3", "oct4"})
+
+
+def _bulk_template_has_token(template: str) -> bool:
+    """Linear-time check — does the template carry a real interpolation
+    token? Uses the same ``string.Formatter`` parser as the renderer so
+    escaped braces (``{{n}}``) are correctly treated as literal.
+    Warns the operator when N>1 IPs would all collapse to the same
+    hostname."""
+    try:
+        parsed = string.Formatter().parse(template)
+    except ValueError:
+        return False
+    for _literal, field_name, _spec, _conv in parsed:
+        if field_name in _BULK_TEMPLATE_FIELDS:
+            return True
+    return False
 
 
 def _expand_bulk_template(
@@ -5554,25 +5572,59 @@ def _expand_bulk_template(
     ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address,
     n: int,
 ) -> str:
-    """Substitute ``{n}`` / ``{oct1-4}`` tokens. Bad format specs degrade
-    to plain ``str(n)`` rather than raising — preview should still render
-    something so the operator can correct the template visually."""
+    """Substitute ``{n}`` / ``{oct1-4}`` tokens.
+
+    Implementation note — we used to drive this with a hand-rolled
+    regex (``\\{(n|oct[1-4])(?::([^}]+))?\\}``) but CodeQL flagged the
+    inner ``[^}]+`` as polynomial-redos under
+    ``re.sub`` (alerts #19 + #20): for inputs starting with ``{{n:``
+    and many repetitions thereof, every starting ``{`` triggers an
+    O(n) backtrack scan, taking the whole substitution to O(n²).
+    Pydantic caps ``hostname_template`` at 128 chars so the practical
+    surface is small, but the warning shouldn't be ignored.
+
+    Replaced by Python's stdlib ``string.Formatter`` parser, which is
+    a C-implemented linear-time tokenizer — exactly the grammar we
+    want anyway (``{n}`` / ``{n:03d}`` / ``{oct1}``) without the
+    custom regex. Bad format specs degrade to ``str(n)`` rather than
+    raising so preview still renders something the operator can
+    correct."""
     octets = str(ip_obj).split(".") if isinstance(ip_obj, ipaddress.IPv4Address) else []
 
-    def _repl(m: "re.Match[str]") -> str:
-        token = m.group(1)
-        fmt = m.group(2)
-        if token == "n":
-            try:
-                return f"{n:{fmt}}" if fmt else str(n)
-            except (ValueError, KeyError):
-                return str(n)
-        idx = int(token[3]) - 1
-        if 0 <= idx < len(octets):
-            return octets[idx]
-        return ""
+    def _value_for(field_name: str) -> str | int | None:
+        if field_name == "n":
+            return n
+        if len(field_name) == 4 and field_name.startswith("oct") and field_name[3] in "1234":
+            idx = int(field_name[3]) - 1
+            return octets[idx] if 0 <= idx < len(octets) else ""
+        return None  # unknown token — leave literal
 
-    return _BULK_TEMPLATE_RE.sub(_repl, template)
+    formatter = string.Formatter()
+    out_parts: list[str] = []
+    try:
+        parsed = list(formatter.parse(template))
+    except ValueError:
+        # Malformed template (unbalanced braces, etc) — return literal so
+        # the operator can see + correct the bad input.
+        return template
+
+    for literal_text, field_name, format_spec, conversion in parsed:
+        out_parts.append(literal_text)
+        if field_name is None:
+            continue
+        value = _value_for(field_name)
+        if value is None:
+            # Unknown token — re-emit literally so {server}-style typos
+            # surface in the preview without raising.
+            spec_part = f":{format_spec}" if format_spec else ""
+            conv_part = f"!{conversion}" if conversion else ""
+            out_parts.append(f"{{{field_name}{conv_part}{spec_part}}}")
+            continue
+        try:
+            out_parts.append(format(value, format_spec or ""))
+        except (ValueError, TypeError):
+            out_parts.append(str(value))
+    return "".join(out_parts)
 
 
 class BulkAllocateItem(BaseModel):
@@ -5679,7 +5731,7 @@ async def _build_bulk_allocate_candidates(
         )
 
     warnings: list[str] = []
-    if total > 1 and not _BULK_TEMPLATE_RE.search(body.hostname_template):
+    if total > 1 and not _bulk_template_has_token(body.hostname_template):
         warnings.append("Template has no {n}/{oct1-4} token — every IP gets the same hostname.")
 
     dynamic_ranges = await _load_dynamic_pool_ranges(db, subnet.id)
