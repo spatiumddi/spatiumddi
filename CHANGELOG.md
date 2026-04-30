@@ -7,7 +7,236 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versioning uses 
 
 ## Unreleased
 
-_(no entries yet — next release will add changes that land after `2026.04.28-2`)_
+_(no entries yet — next release will add changes that land after `2026.04.30-1`)_
+
+---
+
+## 2026.04.30-1 — 2026-04-30
+
+Notifications-and-automation release. The headline work closes
+out the Notifications & external integrations bucket on the
+roadmap: SMTP email delivery for the alerts framework + audit
+forward, Slack / Teams / Discord chat-channel webhook flavors
+that render mrkdwn / MessageCard / embed bodies natively, and a
+new typed-event webhook surface — 96 curated events
+(`subnet.created`, `dns.zone.updated`, `ip.allocated`, …)
+delivered with HMAC-SHA256 signatures via an outbox-backed retry
+queue (exponential backoff 2 / 4 / 8 … 600 s, dead-letter on
+permanent failure, manual retry from the UI). Bundled with two
+DNS deliverables (GSLB pools — priority + weight + health-checked
+A/AAAA record sets that auto-render rendered-record sets the
+BIND9 driver applies, and a server-detail modal with
+logs / stats / config tabs) plus three IPAM deliverables (device
+profiling — passive DHCP fingerprinting + active auto-nmap on
+fresh leases, IPAM bulk allocate — contiguous IP range stamping
+with name templates, and the post-bulk-allocate IPAM table polish
+wave: sticky thead, shift-click range select, dashed gap-marker
+rows for missing IPs between contiguous allocations, plus a
+revamped subnet Tools dropdown). Plus a DNS pool reconciliation
+fix (member IP edits + removed-member cleanup + zone-detail
+refresh).
+
+### Added
+
+- **Typed-event webhooks** (Phase 2 of notifications-and-
+  external-integrations). New `/admin/webhooks` admin surface
+  + `POST/GET/PUT/DELETE /api/v1/webhooks` CRUD. 96 typed event
+  types derived from a `resource_namespace × verb` cross-product
+  (e.g. `space.created`, `subnet.bulk_allocate`,
+  `dns.zone.updated`, `dhcp.scope.deleted`, `auth.user.created`,
+  `integration.kubernetes.created`); subscribers with empty
+  `event_types` match everything. SQLAlchemy
+  `after_flush` + `after_commit` listeners snapshot committed
+  `AuditLog` rows and write one `EventOutbox` row per matching
+  `EventSubscription`. Celery beat (`event-outbox-drain`, 10 s)
+  drains the outbox via `SELECT … FOR UPDATE SKIP LOCKED`, signs
+  each POST with `hmac(secret, ts + "." + body, sha256)`, and
+  retries with exponential backoff (2 / 4 / 8 … 600 s capped) up
+  to `max_attempts` (default 8 ≈ 8.5 min cumulative). Permanent
+  failures flip to `state="dead"` for operator review. Reserved
+  `X-SpatiumDDI-*` headers (Event / Delivery / Timestamp /
+  Signature) protected from operator override. Migration
+  `0f83a227b16d_event_subscription_outbox_tables`.
+- **Webhook admin UI.** Subscriptions page with one-time secret
+  reveal modal on create (auto-generated 32-byte hex unless an
+  operator supplies their own), event-type multi-select with
+  filter box, custom-headers editor, timeout + max-attempts
+  inputs. Per-row test button synthesizes a `test.ping` event
+  through the live pipeline with an inline success / failure
+  flash. Per-row expandable deliveries panel auto-refreshes
+  every 8 s and shows state / attempts / last-status / next-
+  retry; **Retry now** on failed/dead rows resets attempts and
+  re-queues. Edit form supports secret rotation toggle.
+- **SMTP delivery for alerts + audit forward** (Phase 1 of
+  notifications-and-external-integrations). New SMTP target
+  type with host / port / username / encrypted password / TLS
+  mode (`starttls` / `ssl` / `none`) / from-address / to-list
+  fields. stdlib `smtplib` driven through `asyncio.to_thread`
+  (no extra dep). Subject + body rendered from the audit row
+  (or the alert event for the alerts framework). Audit-forward
+  targets gain `kind="smtp"`; alert rules gain a `notify_smtp`
+  toggle alongside the existing syslog + webhook channels.
+  Migration `30cda233dce9_add_smtp_chat_flavor_to_audit_forward`.
+- **Chat-flavored webhooks** — Slack / Teams / Discord. New
+  `webhook_flavor` column on `audit_forward_target` selects
+  between generic JSON (default), Slack `mrkdwn` block, Teams
+  `MessageCard`, and Discord `embed`. Single payload renderer
+  per flavor; no extra dep. Configured by pasting the
+  platform's incoming-webhook URL into a webhook target.
+- **DNS GSLB pools.** New `DNSPool` model — priority + weight +
+  health-checked record sets that render to a rotating set of
+  A / AAAA records. The pool has members (each with an
+  address, weight, health-check policy) and an enabled/disabled
+  flag; on each beat tick (`dns_pool_healthcheck.dispatch_due_pools`
+  → per-pool `run_pool_check`) the worker runs every member's
+  TCP / HTTP(S) / ICMP probe with configurable
+  unhealthy / healthy thresholds, transitions states based on
+  consecutive successes / failures, and `apply_pool_state`
+  reconciles the rendered records — DELETE the rows for
+  members that are now unhealthy or removed; CREATE / UPDATE
+  for members whose IP changed or who newly went healthy. All
+  changes flow through the existing `enqueue_record_op`
+  pipeline so the zone serial bumps once per reconciliation
+  pass and the agent applies in driver-native order. UI: new
+  Pools tab on the zone detail with members CRUD, weight + IP
+  edit, and per-member last-check state badge.
+- **DNS server detail modal.** Click a server row in the
+  group's Servers tab to open a draggable detail modal with
+  three tabs — **Logs** (filtered live tail of the agent's
+  query log + structured filters: substring / qtype / client
+  IP / since), **Stats** (push-driven 5 m / 15 m / 1 h
+  rolling agent metrics: queries-per-second, NXDOMAIN rate,
+  cache hit ratio when reported), and **Config** (read-only
+  rendered server-options snapshot from the latest applied
+  ConfigBundle).
+- **IPAM device profiling.** Two new sub-systems converging on
+  a unified "Device profile" panel inside the read-only IP
+  detail modal.
+  - **Active auto-nmap on fresh DHCP leases** (Phase 1).
+    Subnet-level opt-in (`Subnet.auto_profile_on_lease: bool`,
+    default false). On a fresh lease event the agent posts to
+    `/api/v1/dhcp/agents/lease-events`; the API enqueues a
+    `service_and_os` nmap run against the new IP, capped at 4
+    in-flight scans per subnet with a refresh-window dedupe so
+    a flapping lease can't fire-hose the scanner. Per-IP
+    re-profile-now button (`POST /ipam/addresses/{id}/profile`)
+    on the IP detail modal lets operators kick a fresh scan
+    on demand.
+  - **Passive DHCP fingerprinting** (Phase 2, default off,
+    needs `cap_add: NET_RAW`). DHCP agent gains a scapy
+    `AsyncSniffer` thread that captures DHCP DISCOVER /
+    REQUEST option lists and posts them to a fingerbank lookup
+    task. Results land in the IP row's profile panel as
+    Type / Class / Manufacturer (e.g.
+    `Phone / VoIP / Polycom`).
+  - Same-day follow-ups: `setcap cap_net_raw+eip` on
+    `/usr/bin/nmap` plus `NMAP_PRIVILEGED=1` so non-root
+    operator OS scans actually work (Debian's nmap does an
+    early `getuid()==0` check that ignores file caps),
+    `securityContext.capabilities.add: [NET_RAW]` on the K8s
+    worker + `worker.netRawCapability` Helm gate for
+    restricted PSA / OpenShift-SCC / GKE Autopilot, and a
+    Settings → IPAM → Device Profiling form for the
+    fingerbank API key (Fernet-encrypted at rest; response
+    only exposes a boolean `fingerbank_api_key_set`).
+- **IPAM bulk allocate.** New `POST /ipam/subnets/{id}/bulk-
+  allocate/{preview,commit}` stamps a contiguous IP range plus
+  a name template (`{n}` / `{n:03d}` / `{n:x}` /
+  `{oct1}`–`{oct4}` octet fragments) in one shot. Per-row
+  conflict detection (already-allocated, dynamic-pool overlap,
+  FQDN collision) with `on_collision: skip|abort` policy,
+  capped at 1024 IPs per call. New `BulkAllocateModal` lives
+  under the subnet Tools menu with a three-phase form →
+  preview → committed flow and live client-side template
+  rendering as the operator types.
+- **Nmap subnet sweep + bulk operations.** Two new presets —
+  `subnet_sweep` (`-sn` ping-sweep, capped at /16 worth of
+  hosts) and `service_and_os` (`-sV -O --version-light`, the
+  device-profiling default). CIDR-aware target validation +
+  multi-host XML parsing — the runner walks every `<host>`
+  element and emits a `hosts[]` summary when more than one
+  responds. New `POST /nmap/scans/bulk-delete` (cap 500,
+  mixes cancel + delete based on per-row state) and
+  `POST /nmap/scans/{id}/stamp-discovered` (claim alive hosts
+  as `discovered` IPAM rows + stamp `last_seen_at`;
+  integration-owned rows just bump the timestamp). The
+  `NmapToolsPage` is rewritten as a 3-tab right panel
+  (Live / History / Last result) with a checkbox column +
+  bulk-delete toolbar on history.
+- **Seen recency column on IPAM IP table.** New "Seen" column
+  backed by a 4-state `SeenDot` (alive < 24 h green / stale
+  24 h–7 d amber / cold > 7 d red / never grey, source method
+  in the tooltip — orthogonal to lifecycle status).
+- **Tools dropdown on subnet header.** IPAM subnet header
+  collapsed from 9 buttons to 6 via a Tools dropdown
+  (alphabetised: Bulk allocate…, Clean Orphans, Merge…,
+  Resize…, Scan with nmap, Split…). New `discovered` status
+  added to `IP_STATUSES_INTEGRATION_OWNED` so nmap-stamped
+  rows show up correctly across the integration colour-coding.
+
+### Changed
+
+- **IPAM table polish — sticky `<thead>` finally holds in
+  Chrome.** The inner `<div className="overflow-x-auto">`
+  wrapper was establishing a Y-scroll context per CSS spec —
+  `overflow-x: auto` with `overflow-y: visible` computes to
+  `overflow-y: auto` automatically, defeating sticky
+  positioning by anchoring the head to a non-scrolling
+  intermediate parent. Removed the wrapper so sticky resolves
+  to the outer `flex-1 overflow-auto`.
+- **Shift-click range select on IPAM IP checkboxes.** Capture
+  `e.shiftKey` in `onClick` (which fires before `onChange`),
+  walk the IP-only `tableRows` order between the previous
+  click and the new one, and toggle every selectable row to
+  the new state.
+- **Subtle dashed-emerald gap-marker rows in the IP table.**
+  Between non-adjacent IPAM entries (e.g. `.11 · 1 free` or
+  `.11 – .13 · 3 free`) a heads-up row makes deleted /
+  missing IPs visible — humans tend to miss single-row gaps
+  scrolling a long table. Suppressed inside dynamic DHCP
+  pools where slots are owned by the DHCP server.
+
+### Fixed
+
+- **DNS pool member IP edits silently dropped.** The
+  `PoolMemberUpdate` Pydantic schema only declared `weight` +
+  `enabled`, so a frontend PUT carrying a new `address` was
+  filtered out before the handler saw it; the diff loop in
+  `PoolsView` was also only checking `enabled` / `weight`.
+  Added `address` to both the schema (with an IP validator +
+  uniqueness guard returning 409 on collision) and the
+  frontend diff. Address change resets the member's health
+  stats (`last_check_state="unknown"`, counters → 0) so the
+  new IP re-proves health.
+- **DNS pool member removal didn't clean up rendered records.**
+  `apply_pool_state` only iterated `pool.members` (the in-
+  memory list), so records whose member had just been deleted
+  were missed before the FK CASCADE stripped the row at SQL
+  commit. Added an orphan sweep using a JOIN through
+  `DNSPoolMember.pool_id` that catches records whose member
+  is no longer attached to the pool, deleting them as part of
+  the same reconciliation pass.
+- **Pools tab Refresh button on zone detail.** The header
+  Refresh on the zone view only invalidated `["dns-records"]`,
+  so the Pools tab + per-zone server-state pill stayed
+  stale. Now invalidates `["dns-records"]`, `["dns-pools"]`,
+  and `["dns-zone-server-state"]`.
+- **Reconciliation gate widened on pool member edit.** Was
+  `enabled_changed` only — now `member_changed` covers any of
+  address / enabled / weight, so a pure address change
+  triggers reconciliation (was previously a no-op).
+- **`event_outbox` Celery task corrupted asyncpg in prefork
+  workers.** First implementation imported `AsyncSessionLocal`
+  from `app.db`, which binds asyncpg connections to the loop
+  that first checked them out. Celery's prefork pool reuses
+  processes across tasks, so the second `asyncio.run`
+  re-entered with a different loop and surfaced as `Future
+  attached to a different loop` followed by cascading
+  `cannot perform operation: another operation is in
+  progress` errors. Replaced with a per-tick `NullPool`
+  ephemeral engine — same pattern `audit_forward.
+  _ephemeral_session` and `event_publisher._ephemeral_session`
+  use.
 
 ---
 

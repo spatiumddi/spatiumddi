@@ -370,9 +370,65 @@ Mirrors CLAUDE.md's three mixed sections:
   DHCP / any). Delivery reuses the audit-forward syslog + webhook
   send helpers against the platform-level targets; per-rule
   override of targets deferred. Admin UI at `/admin/alerts` with
-  live events viewer + "Evaluate now". Email (SMTP) and SNMP trap
-  channels are the remaining v2 work — needs SMTP config infra that
-  doesn't exist yet, and SNMP is its own dependency footprint.
+  live events viewer + "Evaluate now". SNMP trap delivery is the
+  remaining v2 work (SMTP + chat-flavored webhooks landed in
+  2026.04.30-1).
+
+- ✅ **SMTP delivery for alerts + audit forward** — landed in
+  2026.04.30-1. New SMTP target type with host / port / username /
+  Fernet-encrypted password / TLS mode (`starttls` / `ssl` /
+  `none`) / from-address / to-list fields. Wired through stdlib
+  `smtplib` driven via `asyncio.to_thread` so we don't take a
+  dependency on `aiosmtplib`. Audit-forward targets gain
+  `kind="smtp"`; alert rules gain a `notify_smtp` toggle alongside
+  the existing syslog + webhook channels. Migration
+  `30cda233dce9_add_smtp_chat_flavor_to_audit_forward`.
+
+- ✅ **Chat-flavored webhooks (Slack / Teams / Discord)** — landed
+  in 2026.04.30-1. New `webhook_flavor` column on
+  `audit_forward_target` selects between generic JSON (default),
+  Slack `mrkdwn` block, Teams `MessageCard`, and Discord `embed`
+  body renderers. Single payload renderer per flavor, no extra
+  dependency. Operator pastes the platform's incoming-webhook URL
+  into a webhook target and picks the matching flavor.
+
+- ✅ **Typed-event webhooks (generic outbound on resource
+  changes)** — landed in 2026.04.30-1. Curated automation surface
+  separate from audit-forward. `EventSubscription` + `EventOutbox`
+  tables (migration
+  `0f83a227b16d_event_subscription_outbox_tables`). 96 typed
+  events derived from a `resource_namespace × verb` cross-product
+  (`space.created`, `subnet.bulk_allocate`, `dns.zone.updated`,
+  `dhcp.scope.deleted`, `auth.user.created`,
+  `integration.kubernetes.created`, …). SQLAlchemy
+  `after_flush` + `after_commit` listeners snapshot committed
+  `AuditLog` rows and write one outbox row per matching
+  subscription. Celery beat (`event-outbox-drain`, every 10 s)
+  drains via `SELECT … FOR UPDATE SKIP LOCKED`, signs each POST
+  with `hmac(secret, ts + "." + body, sha256)`, and retries with
+  exponential backoff (2 / 4 / 8 … 600 s capped) up to
+  `max_attempts` (default 8 ≈ 8.5 min cumulative). Permanent
+  failures flip to `state="dead"` for operator review. Reserved
+  `X-SpatiumDDI-*` headers (Event / Delivery / Timestamp /
+  Signature) are protected from operator override; custom headers
+  are applied last so platform-owned headers can't be silently
+  overridden. Admin UI at `/admin/webhooks` with one-time secret
+  reveal on create (auto-generated 32-byte hex unless an operator
+  supplies their own), event-type multi-select with filter,
+  custom-headers editor, per-row test button (synthesizes a
+  `test.ping` through the live pipeline), expandable deliveries
+  panel with auto-refresh + manual **Retry now** on failed/dead
+  rows, and a secret rotation toggle on edit. **Worker engine
+  fix bundled** — first cut of `event_outbox` imported
+  `AsyncSessionLocal` from `app.db`, which binds asyncpg
+  connections to the loop that first checked them out. Celery's
+  prefork pool reuses processes across tasks so the second
+  `asyncio.run` re-entered with a different loop and surfaced as
+  `Future attached to a different loop` followed by cascading
+  `cannot perform operation: another operation is in progress`
+  errors. Replaced with a per-tick `NullPool` ephemeral engine —
+  same pattern `audit_forward._ephemeral_session` and
+  `event_publisher._ephemeral_session` use.
 
 - ✅ **Dashboard time-series (MVP)** — agent-driven DNS query rate +
   DHCP traffic charts, self-contained (no Prometheus / InfluxDB

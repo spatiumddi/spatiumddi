@@ -100,7 +100,8 @@
 | | Feature | Highlights |
 |---|---|---|
 | 🔒 | **RBAC + external auth** | LDAP · OIDC · SAML · RADIUS · TACACS+ with backup-server failover · API tokens with auto-expiry |
-| 🔔 | **Alerts + forwarding** | rule-based alerts · multi-target syslog (RFC 5424 / CEF / LEEF / RFC 3164) + HTTP webhooks |
+| 🔔 | **Alerts + forwarding** | rule-based alerts · multi-target syslog (RFC 5424 / CEF / LEEF / RFC 3164) · HTTP webhooks · SMTP email · Slack / Teams / Discord chat |
+| 🪝 | **Typed-event webhooks** | 96 typed events (resource × verb) · HMAC-SHA256 signed · outbox-backed retry with backoff + dead-letter |
 | 🔐 | **ACME DNS-01** | `acme-dns`-compatible — certbot / lego / acme.sh issue public certs (wildcards included) |
 | 📋 | **Audit log** | every mutation logged, append-only, filterable in the UI |
 
@@ -289,9 +290,15 @@ The tables above are the elevator pitch. The bullets here are the same surface w
 
 - 🔔 **Alerts + audit forwarding** — multi-target delivery with pluggable wire formats.
   - Rule-based alerts framework (subnet utilization, server unreachable)
-  - Multi-target syslog (UDP / TCP / TLS) + HTTP webhook
+  - Multi-target syslog (UDP / TCP / TLS), HTTP webhook, SMTP email, Slack / Teams / Discord chat
   - Wire formats: RFC 5424 JSON, CEF, LEEF, RFC 3164, JSON lines
   - Per-target filters
+
+- 🪝 **Typed-event webhooks** — curated automation surface for downstream consumers.
+  - 96 typed events covering every resource × verb (e.g. `subnet.created`, `dns.zone.updated`, `ip.allocated`)
+  - HMAC-SHA256 signed POSTs with reserved `X-SpatiumDDI-*` headers
+  - Outbox-backed at-least-once delivery with exponential backoff + dead-letter
+  - Per-subscription manual retry, custom headers, and one-time secret reveal
 
 - 🔐 **ACME DNS-01 provider** — `acme-dns`-compatible HTTP surface.
   - certbot / lego / acme.sh issue public certs (wildcards included)

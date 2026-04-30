@@ -333,7 +333,14 @@ don't serialize the queue.
   a private CA without touching the system store.
 - **HTTP webhook** — `httpx.AsyncClient`, 5 s timeout,
   `Content-Type: application/json`, optional `Authorization`
-  header sent verbatim.
+  header sent verbatim. The `webhook_flavor` column picks between
+  generic JSON, **Slack** (`mrkdwn` block), **Teams**
+  (`MessageCard`), and **Discord** (`embed`) so chat-channel
+  delivery doesn't need a separate adapter.
+- **SMTP email** — stdlib `smtplib` driven through
+  `asyncio.to_thread` (no extra dep). Supports `starttls` / `ssl` /
+  plaintext, optional auth (Fernet-encrypted password at rest).
+  Subject + body rendered from the audit row.
 
 **Syslog output formats** (per-target). Webhook targets always
 deliver JSON and ignore this setting.
@@ -384,6 +391,57 @@ task runs. Operator-triggered audit events (the 99% case) forward
 reliably from the API worker's long-running loop. If scheduled-task
 forwarding turns out to matter, the fix is an awaitable drain in
 each task wrapper.
+
+---
+
+## 5b. Typed-event webhooks
+
+Distinct from audit-forward: this is a curated **typed-event
+surface** for downstream automation, not raw audit rows. Operators
+configure subscriptions at `Admin → Webhooks` (`/admin/webhooks`).
+
+**Vocabulary.** 96 typed events generated from a resource × verb
+cross-product — e.g. `space.created`, `subnet.bulk_allocate`,
+`dns.zone.updated`, `dhcp.scope.deleted`, `auth.user.created`,
+`integration.kubernetes.created`. Subscriptions with no event-type
+filter match everything.
+
+**Pipeline.** Audit-row commit triggers an `EventOutbox` write per
+matching `EventSubscription`. Celery beat (`event-outbox-drain`,
+every 10 s) claims rows with `SELECT … FOR UPDATE SKIP LOCKED`,
+signs each POST with `hmac(secret, ts + "." + body, sha256)`, and
+delivers. Failures retry with exponential backoff
+(2 / 4 / 8 … 600 s capped) up to `max_attempts` (default 8 ≈
+8.5 min cumulative). Permanent failures flip to `state="dead"` for
+operator review.
+
+**Wire format.**
+- Body: full audit-row JSON snapshot.
+- Headers: `Content-Type: application/json`,
+  `User-Agent: SpatiumDDI/<ver>`,
+  `X-SpatiumDDI-Event: <event_type>`,
+  `X-SpatiumDDI-Delivery: <outbox_id>`,
+  `X-SpatiumDDI-Timestamp: <unix-seconds>`,
+  `X-SpatiumDDI-Signature: sha256=<hex>`.
+- Receivers verify by recomputing the HMAC over `<ts>.<body>` and
+  rejecting requests whose timestamp is outside their tolerance
+  window (default 5 minutes is sensible).
+- Operator-supplied custom headers are applied last, but the
+  `X-SpatiumDDI-*` namespace is reserved and can't be overridden.
+
+**Delivery semantics.** At-least-once modulo the audit-row commit
+window. The outbox write happens after the audit row commits, so a
+process crash between the two drops the event. Receivers should
+de-duplicate on `event_id` (= `AuditLog.id`).
+
+**Operator controls.**
+- One-time secret reveal on subscription create (also rotatable on
+  edit). Stored Fernet-encrypted; the response only reveals
+  `secret_set: bool` afterwards.
+- Test button synthesizes a `test.ping` through the same pipeline
+  with an inline pass/fail flash.
+- Per-subscription deliveries panel with live state + manual
+  **Retry now** on failed/dead rows.
 
 ---
 
