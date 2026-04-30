@@ -225,6 +225,22 @@ refresh).
   `enabled_changed` only — now `member_changed` covers any of
   address / enabled / weight, so a pure address change
   triggers reconciliation (was previously a no-op).
+- **CodeQL alerts #19 + #20 — polynomial-redos in the bulk-
+  allocate hostname-template parser.** The hand-rolled regex
+  driving the `{n}` / `{oct1-4}` substitution
+  (`\{(n|oct[1-4])(?::([^}]+))?\}`) was flagged as polynomial
+  under `re.sub`: for adversarial inputs starting with `{{n:`
+  and many repetitions, every `{` starting position triggered
+  an O(n) backtrack scan of the inner `[^}]+`, taking the
+  whole substitution to O(n²). Same shape as the BIND9 query
+  log parser fixes #16 / #18. Replaced with the stdlib
+  `string.Formatter` parser — a C-implemented linear-time
+  tokenizer that already understands the exact grammar we
+  want and handles escaped `{{` / `}}` correctly. 250 kB
+  adversarial input (`{{n:|` × 50000) now renders in ~5 ms.
+  Companion `_bulk_template_has_token` warning detector
+  uses the same parser, so escaped tokens like `a{{n}}b` no
+  longer trip a false-positive warning.
 - **`event_outbox` Celery task corrupted asyncpg in prefork
   workers.** First implementation imported `AsyncSessionLocal`
   from `app.db`, which binds asyncpg connections to the loop
