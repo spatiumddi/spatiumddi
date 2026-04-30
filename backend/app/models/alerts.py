@@ -78,12 +78,19 @@ class AlertRule(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
 
     # Delivery channel toggles. Platform-level audit-forward targets are
-    # reused for the actual connection.
+    # reused for the actual connection — every target whose ``kind``
+    # matches an enabled toggle here receives the firing event (filtered
+    # by the target's own ``min_severity`` / ``resource_types`` rules).
     notify_syslog: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True, server_default=sa_text("true")
     )
     notify_webhook: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True, server_default=sa_text("true")
+    )
+    # Email channel — defaults to OFF so existing rules don't suddenly
+    # spam every SMTP target the operator configures.
+    notify_smtp: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
     )
 
     __table_args__ = (Index("ix_alert_rule_rule_type_enabled", "rule_type", "enabled"),)
@@ -129,6 +136,9 @@ class AlertEvent(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         Boolean, nullable=False, default=False, server_default=sa_text("false")
     )
     delivered_webhook: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
+    delivered_smtp: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=sa_text("false")
     )
 

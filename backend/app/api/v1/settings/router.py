@@ -423,7 +423,9 @@ async def get_oui_refresh_status(task_id: str, current_user: CurrentUser) -> OUI
 
 # ── Audit forward targets (multi-target + multi-format) ───────────────────
 
-_VALID_KINDS = {"syslog", "webhook"}
+_VALID_KINDS = {"syslog", "webhook", "smtp"}
+_VALID_WEBHOOK_FLAVORS = {"generic", "slack", "teams", "discord"}
+_VALID_SMTP_SECURITY = {"none", "starttls", "ssl"}
 _VALID_FORMATS = {
     "rfc5424_json",
     "rfc5424_cef",
@@ -436,8 +438,8 @@ _VALID_SEVERITIES = {"info", "warn", "error", "denied"}
 
 
 class AuditTargetBody(BaseModel):
-    """Create / update body. Webhook-only or syslog-only fields are
-    ignored for the other kind, so a single shape fits both."""
+    """Create / update body. kind-specific fields are ignored for
+    other kinds, so a single shape fits all three (syslog/webhook/smtp)."""
 
     name: str
     enabled: bool = True
@@ -452,6 +454,20 @@ class AuditTargetBody(BaseModel):
     # webhook
     url: str = ""
     auth_header: str = ""
+    webhook_flavor: str = "generic"
+    # smtp
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_security: str = "starttls"
+    smtp_username: str = ""
+    # When ``None``, leave the existing encrypted password alone (so
+    # the operator can edit the From-address without retyping the
+    # password). Empty string ``""`` clears it. Anything else is
+    # encrypted at rest.
+    smtp_password: str | None = None
+    smtp_from_address: str = ""
+    smtp_to_addresses: list[str] | None = None
+    smtp_reply_to: str = ""
     # filter
     min_severity: str | None = None
     resource_types: list[str] | None = None
@@ -475,6 +491,24 @@ class AuditTargetBody(BaseModel):
     def _valid_protocol(cls, v: str) -> str:
         if v not in _VALID_PROTOCOLS:
             raise ValueError(f"protocol must be one of {sorted(_VALID_PROTOCOLS)}")
+        return v
+
+    @field_validator("webhook_flavor")
+    @classmethod
+    def _valid_flavor(cls, v: str) -> str:
+        if v not in _VALID_WEBHOOK_FLAVORS:
+            raise ValueError(
+                f"webhook_flavor must be one of {sorted(_VALID_WEBHOOK_FLAVORS)}"
+            )
+        return v
+
+    @field_validator("smtp_security")
+    @classmethod
+    def _valid_smtp_security(cls, v: str) -> str:
+        if v not in _VALID_SMTP_SECURITY:
+            raise ValueError(
+                f"smtp_security must be one of {sorted(_VALID_SMTP_SECURITY)}"
+            )
         return v
 
     @field_validator("min_severity")
@@ -501,6 +535,16 @@ class AuditTargetResponse(BaseModel):
     url: str
     # Redact auth_header — we return whether it's set, never the value.
     auth_header_set: bool
+    webhook_flavor: str
+    smtp_host: str
+    smtp_port: int
+    smtp_security: str
+    smtp_username: str
+    # Redact the SMTP password the same way Fingerbank does — bool only.
+    smtp_password_set: bool
+    smtp_from_address: str
+    smtp_to_addresses: list[str] | None
+    smtp_reply_to: str
     min_severity: str | None
     resource_types: list[str] | None
     created_at: datetime
@@ -521,6 +565,15 @@ def _target_to_response(t: AuditForwardTarget) -> AuditTargetResponse:
         ca_cert_pem=t.ca_cert_pem,
         url=t.url,
         auth_header_set=bool(t.auth_header),
+        webhook_flavor=t.webhook_flavor or "generic",
+        smtp_host=t.smtp_host or "",
+        smtp_port=int(t.smtp_port or 587),
+        smtp_security=t.smtp_security or "starttls",
+        smtp_username=t.smtp_username or "",
+        smtp_password_set=bool(t.smtp_password_encrypted),
+        smtp_from_address=t.smtp_from_address or "",
+        smtp_to_addresses=list(t.smtp_to_addresses) if t.smtp_to_addresses else None,
+        smtp_reply_to=t.smtp_reply_to or "",
         min_severity=t.min_severity,
         resource_types=t.resource_types,
         created_at=t.created_at,
@@ -529,6 +582,8 @@ def _target_to_response(t: AuditForwardTarget) -> AuditTargetResponse:
 
 
 def _apply_body(t: AuditForwardTarget, body: AuditTargetBody) -> None:
+    from app.core.crypto import encrypt_str
+
     t.name = body.name
     t.enabled = body.enabled
     t.kind = body.kind
@@ -540,6 +595,21 @@ def _apply_body(t: AuditForwardTarget, body: AuditTargetBody) -> None:
     t.ca_cert_pem = body.ca_cert_pem
     t.url = body.url
     t.auth_header = body.auth_header
+    t.webhook_flavor = body.webhook_flavor
+    t.smtp_host = body.smtp_host
+    t.smtp_port = body.smtp_port
+    t.smtp_security = body.smtp_security
+    t.smtp_username = body.smtp_username
+    t.smtp_from_address = body.smtp_from_address
+    t.smtp_to_addresses = body.smtp_to_addresses
+    t.smtp_reply_to = body.smtp_reply_to
+    # ``smtp_password`` semantics: ``None`` = leave existing encrypted
+    # value alone (operator editing other fields), ``""`` = clear,
+    # anything else = encrypt + replace.
+    if body.smtp_password is not None:
+        t.smtp_password_encrypted = (
+            encrypt_str(body.smtp_password) if body.smtp_password else None
+        )
     t.min_severity = body.min_severity
     t.resource_types = body.resource_types
 
@@ -634,6 +704,19 @@ async def test_audit_target(target_id: str, current_user: CurrentUser, db: DB) -
         "old_value": None,
         "new_value": None,
     }
+    # Decrypt the SMTP password lazily — only the test path needs the
+    # cleartext, and only inside this request scope.
+    smtp_password = ""
+    if row.kind == "smtp" and row.smtp_password_encrypted:
+        try:
+            from app.core.crypto import decrypt_str
+
+            smtp_password = decrypt_str(row.smtp_password_encrypted)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(
+                status_code=500,
+                detail=f"failed to decrypt SMTP password: {exc}",
+            ) from exc
     target_dict = {
         "name": row.name,
         "kind": row.kind,
@@ -645,6 +728,15 @@ async def test_audit_target(target_id: str, current_user: CurrentUser, db: DB) -
         "ca_cert_pem": row.ca_cert_pem,
         "url": row.url,
         "auth_header": row.auth_header or "",
+        "webhook_flavor": row.webhook_flavor or "generic",
+        "smtp_host": row.smtp_host or "",
+        "smtp_port": int(row.smtp_port or 587),
+        "smtp_security": row.smtp_security or "starttls",
+        "smtp_username": row.smtp_username or "",
+        "smtp_password": smtp_password,
+        "smtp_from_address": row.smtp_from_address or "",
+        "smtp_to_addresses": list(row.smtp_to_addresses or []),
+        "smtp_reply_to": row.smtp_reply_to or "",
         "min_severity": None,  # ignore filter on a probe
         "resource_types": None,
     }

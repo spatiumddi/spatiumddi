@@ -75,6 +75,15 @@ const EMPTY: AuditForwardTargetWrite = {
   ca_cert_pem: null,
   url: "",
   auth_header: "",
+  webhook_flavor: "generic",
+  smtp_host: "",
+  smtp_port: 587,
+  smtp_security: "starttls",
+  smtp_username: "",
+  smtp_password: null,
+  smtp_from_address: "",
+  smtp_to_addresses: null,
+  smtp_reply_to: "",
   min_severity: null,
   resource_types: null,
 };
@@ -91,10 +100,21 @@ function targetToBody(t: AuditForwardTarget): AuditForwardTargetWrite {
     facility: t.facility,
     ca_cert_pem: t.ca_cert_pem ?? null,
     url: t.url,
-    // auth_header is write-only — server never returns the plaintext.
-    // Leaving blank on edit means "don't change". The modal makes this
-    // explicit with a placeholder hint when auth_header_set is true.
+    // auth_header + smtp_password are write-only — server returns
+    // booleans only. Leaving them blank on edit means "don't change";
+    // ``null`` on smtp_password mirrors that intent (the form sends
+    // null when not retyped, an explicit empty string only when the
+    // operator hits "clear stored password").
     auth_header: "",
+    webhook_flavor: t.webhook_flavor,
+    smtp_host: t.smtp_host,
+    smtp_port: t.smtp_port,
+    smtp_security: t.smtp_security,
+    smtp_username: t.smtp_username,
+    smtp_password: null,
+    smtp_from_address: t.smtp_from_address,
+    smtp_to_addresses: t.smtp_to_addresses,
+    smtp_reply_to: t.smtp_reply_to,
     min_severity: t.min_severity,
     resource_types: t.resource_types,
   };
@@ -336,6 +356,9 @@ export function AuditForwardTargets({
           authHeaderSet={
             editing.mode === "edit" ? editing.row.auth_header_set : false
           }
+          smtpPasswordSet={
+            editing.mode === "edit" ? editing.row.smtp_password_set : false
+          }
           onClose={() => setEditing(null)}
         />
       )}
@@ -373,11 +396,13 @@ function TargetModal({
   initial,
   existingId,
   authHeaderSet,
+  smtpPasswordSet,
   onClose,
 }: {
   initial: AuditForwardTargetWrite;
   existingId?: string;
   authHeaderSet: boolean;
+  smtpPasswordSet: boolean;
   onClose: () => void;
 }) {
   const qc = useQueryClient();
@@ -391,6 +416,12 @@ function TargetModal({
       // left the field blank — that means "keep what's on file".
       if (existingId && authHeaderSet && !body.auth_header) {
         delete body.auth_header;
+      }
+      // Same dance for SMTP password — ``null`` (default on edit) means
+      // "keep". Empty string keeps as is; the operator opens a separate
+      // dialog to clear if they ever need to.
+      if (existingId && smtpPasswordSet && body.smtp_password === null) {
+        delete body.smtp_password;
       }
       if (body.resource_types && body.resource_types.length === 0) {
         body.resource_types = null;
@@ -416,6 +447,7 @@ function TargetModal({
   });
 
   const isSyslog = form.kind === "syslog";
+  const isWebhook = form.kind === "webhook";
 
   return (
     <Modal
@@ -472,6 +504,7 @@ function TargetModal({
           >
             <option value="syslog">Syslog</option>
             <option value="webhook">HTTP Webhook</option>
+            <option value="smtp">Email (SMTP)</option>
           </select>
         </label>
 
@@ -600,8 +633,37 @@ function TargetModal({
               </label>
             )}
           </>
-        ) : (
+        ) : isWebhook ? (
           <>
+            <label className="block">
+              <div className="mb-1 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+                Flavor
+              </div>
+              <select
+                className={inputCls}
+                value={form.webhook_flavor ?? "generic"}
+                onChange={(e) =>
+                  setForm({
+                    ...form,
+                    webhook_flavor: e.target.value as
+                      | "generic"
+                      | "slack"
+                      | "teams"
+                      | "discord",
+                  })
+                }
+              >
+                <option value="generic">Generic JSON</option>
+                <option value="slack">Slack (mrkdwn blocks)</option>
+                <option value="teams">Microsoft Teams (MessageCard)</option>
+                <option value="discord">Discord (embed)</option>
+              </select>
+              <div className="mt-1 text-[11px] text-muted-foreground">
+                {form.webhook_flavor === "generic"
+                  ? "Posts the raw audit/alert JSON. For collectors that parse it themselves."
+                  : "Wraps the payload in the platform's incoming-webhook block format. Paste the URL the platform issued."}
+              </div>
+            </label>
             <label className="block">
               <div className="mb-1 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
                 URL
@@ -610,24 +672,170 @@ function TargetModal({
                 className={inputCls}
                 value={form.url ?? ""}
                 onChange={(e) => setForm({ ...form, url: e.target.value })}
-                placeholder="https://collector.example.com/ingest"
+                placeholder={
+                  form.webhook_flavor === "slack"
+                    ? "https://hooks.slack.com/services/T…/B…/…"
+                    : form.webhook_flavor === "teams"
+                      ? "https://…webhook.office.com/webhookb2/…"
+                      : form.webhook_flavor === "discord"
+                        ? "https://discord.com/api/webhooks/…/…"
+                        : "https://collector.example.com/ingest"
+                }
+              />
+            </label>
+            {form.webhook_flavor === "generic" && (
+              <label className="block">
+                <div className="mb-1 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+                  Authorization Header (optional)
+                </div>
+                <input
+                  className={inputCls}
+                  value={form.auth_header ?? ""}
+                  onChange={(e) =>
+                    setForm({ ...form, auth_header: e.target.value })
+                  }
+                  placeholder={
+                    authHeaderSet
+                      ? "(stored — leave blank to keep unchanged)"
+                      : "Bearer …"
+                  }
+                />
+              </label>
+            )}
+          </>
+        ) : (
+          // SMTP
+          <>
+            <div className="grid grid-cols-2 gap-3">
+              <label className="block">
+                <div className="mb-1 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+                  SMTP Host
+                </div>
+                <input
+                  className={inputCls}
+                  value={form.smtp_host ?? ""}
+                  onChange={(e) =>
+                    setForm({ ...form, smtp_host: e.target.value })
+                  }
+                  placeholder="smtp.example.com"
+                />
+              </label>
+              <label className="block">
+                <div className="mb-1 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+                  Port
+                </div>
+                <input
+                  type="number"
+                  min={1}
+                  max={65535}
+                  className={inputCls}
+                  value={form.smtp_port ?? 587}
+                  onChange={(e) =>
+                    setForm({ ...form, smtp_port: Number(e.target.value) })
+                  }
+                />
+              </label>
+            </div>
+            <label className="block">
+              <div className="mb-1 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+                Security
+              </div>
+              <select
+                className={inputCls}
+                value={form.smtp_security ?? "starttls"}
+                onChange={(e) =>
+                  setForm({
+                    ...form,
+                    smtp_security: e.target.value as
+                      | "none"
+                      | "starttls"
+                      | "ssl",
+                  })
+                }
+              >
+                <option value="starttls">STARTTLS (587)</option>
+                <option value="ssl">SSL/TLS (465)</option>
+                <option value="none">None (plain)</option>
+              </select>
+            </label>
+            <div className="grid grid-cols-2 gap-3">
+              <label className="block">
+                <div className="mb-1 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+                  Username
+                </div>
+                <input
+                  className={inputCls}
+                  value={form.smtp_username ?? ""}
+                  onChange={(e) =>
+                    setForm({ ...form, smtp_username: e.target.value })
+                  }
+                  placeholder="(blank = no auth)"
+                />
+              </label>
+              <label className="block">
+                <div className="mb-1 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+                  Password
+                </div>
+                <input
+                  type="password"
+                  autoComplete="new-password"
+                  className={inputCls}
+                  value={form.smtp_password ?? ""}
+                  onChange={(e) =>
+                    setForm({ ...form, smtp_password: e.target.value })
+                  }
+                  placeholder={
+                    smtpPasswordSet
+                      ? "(stored — leave blank to keep unchanged)"
+                      : ""
+                  }
+                />
+              </label>
+            </div>
+            <label className="block">
+              <div className="mb-1 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+                From Address
+              </div>
+              <input
+                className={inputCls}
+                value={form.smtp_from_address ?? ""}
+                onChange={(e) =>
+                  setForm({ ...form, smtp_from_address: e.target.value })
+                }
+                placeholder="alerts@example.com"
               />
             </label>
             <label className="block">
               <div className="mb-1 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
-                Authorization Header (optional)
+                Recipients (comma-separated)
               </div>
               <input
                 className={inputCls}
-                value={form.auth_header ?? ""}
+                value={(form.smtp_to_addresses ?? []).join(", ")}
+                onChange={(e) => {
+                  const list = e.target.value
+                    .split(",")
+                    .map((s) => s.trim())
+                    .filter(Boolean);
+                  setForm({
+                    ...form,
+                    smtp_to_addresses: list.length > 0 ? list : null,
+                  });
+                }}
+                placeholder="oncall@example.com, soc@example.com"
+              />
+            </label>
+            <label className="block">
+              <div className="mb-1 text-[11px] font-medium uppercase tracking-wider text-muted-foreground">
+                Reply-To (optional)
+              </div>
+              <input
+                className={inputCls}
+                value={form.smtp_reply_to ?? ""}
                 onChange={(e) =>
-                  setForm({ ...form, auth_header: e.target.value })
+                  setForm({ ...form, smtp_reply_to: e.target.value })
                 }
-                placeholder={
-                  authHeaderSet
-                    ? "(stored — leave blank to keep unchanged)"
-                    : "Bearer …"
-                }
+                placeholder="(leave blank to use From address)"
               />
             </label>
           </>

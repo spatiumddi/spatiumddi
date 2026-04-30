@@ -358,6 +358,225 @@ async def _send_webhook(url: str, auth_header: str, payload: dict[str, Any]) -> 
             )
 
 
+# ── Chat-flavor webhook formatters (Slack / Teams / Discord) ───────────────
+#
+# Each platform's incoming-webhook URL accepts JSON in a slightly
+# different shape. Operators paste the same incoming-webhook URL the
+# platform issued them; we shape the body at send time based on the
+# target's ``webhook_flavor``. ``generic`` keeps the original raw
+# payload for downstream automation that doesn't speak chat-card JSON.
+
+_SEVERITY_COLOURS = {
+    # Generic decimal RGB colours used by Discord embeds.
+    "info": 0x4FACFE,  # cyan-blue
+    "warn": 0xF59E0B,  # amber
+    "error": 0xEF4444,  # red
+    "denied": 0xEF4444,
+    # Alert framework severities (shared with email subject prefix).
+    "warning": 0xF59E0B,
+    "critical": 0xDC2626,  # darker red
+}
+
+_TEAMS_COLOURS = {
+    "info": "4FACFE",
+    "warn": "F59E0B",
+    "error": "EF4444",
+    "denied": "EF4444",
+    "warning": "F59E0B",
+    "critical": "DC2626",
+}
+
+
+def _payload_severity(payload: dict[str, Any]) -> str:
+    """Best-effort severity bucket. Audit rows expose ``result`` (which
+    we map via ``_severity_bucket``); alert payloads carry ``severity``
+    directly (``info`` / ``warning`` / ``critical``)."""
+    sev = payload.get("severity")
+    if isinstance(sev, str) and sev:
+        return sev
+    return _severity_bucket(payload.get("result"))
+
+
+def _payload_summary_lines(payload: dict[str, Any]) -> tuple[str, str]:
+    """Return ``(short_title, longer_body)`` for chat-card rendering.
+
+    Audit rows carry ``action`` + ``resource_type`` + ``resource_display``;
+    alert events carry ``rule_name`` + ``subject_display`` + ``message``.
+    Both shapes are common enough to handle inline rather than needing
+    separate formatters per source.
+    """
+    if payload.get("kind") == "alert":
+        rule_name = payload.get("rule_name") or "alert"
+        subject = payload.get("subject_display") or payload.get("subject_id", "")
+        msg = payload.get("message") or ""
+        title = f"[{payload.get('severity', 'warning').upper()}] {rule_name}"
+        body = subject if not msg else f"{subject}\n{msg}" if subject else msg
+        return title, body
+    action = payload.get("action") or "audit"
+    rtype = payload.get("resource_type") or ""
+    rid = payload.get("resource_display") or payload.get("resource_id", "")
+    user = payload.get("user_display_name") or "system"
+    result = payload.get("result") or "success"
+    title = f"{action} · {rtype}".strip(" ·")
+    body = f"{rid} ({result}) by {user}".strip()
+    return title, body
+
+
+def _slack_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    title, body = _payload_summary_lines(payload)
+    sev = _payload_severity(payload)
+    icon = {
+        "info": ":information_source:",
+        "warn": ":warning:",
+        "warning": ":warning:",
+        "error": ":rotating_light:",
+        "denied": ":no_entry:",
+        "critical": ":rotating_light:",
+    }.get(sev, ":information_source:")
+    return {
+        "text": f"{icon} *{title}*\n{body}",
+        "blocks": [
+            {
+                "type": "section",
+                "text": {"type": "mrkdwn", "text": f"{icon} *{title}*"},
+            },
+            {"type": "section", "text": {"type": "mrkdwn", "text": body or "—"}},
+        ],
+    }
+
+
+def _teams_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    title, body = _payload_summary_lines(payload)
+    sev = _payload_severity(payload)
+    colour = _TEAMS_COLOURS.get(sev, "4FACFE")
+    return {
+        "@type": "MessageCard",
+        "@context": "https://schema.org/extensions",
+        "summary": title,
+        "themeColor": colour,
+        "title": title,
+        "text": body or "—",
+    }
+
+
+def _discord_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    title, body = _payload_summary_lines(payload)
+    sev = _payload_severity(payload)
+    colour = _SEVERITY_COLOURS.get(sev, _SEVERITY_COLOURS["info"])
+    return {
+        "username": "SpatiumDDI",
+        "embeds": [
+            {
+                "title": title[:256],
+                "description": (body or "—")[:4096],
+                "color": colour,
+            }
+        ],
+    }
+
+
+def _shape_webhook_body(flavor: str, payload: dict[str, Any]) -> dict[str, Any]:
+    if flavor == "slack":
+        return _slack_payload(payload)
+    if flavor == "teams":
+        return _teams_payload(payload)
+    if flavor == "discord":
+        return _discord_payload(payload)
+    return payload
+
+
+# ── SMTP transport ─────────────────────────────────────────────────────────
+
+
+async def _send_smtp(
+    host: str,
+    port: int,
+    security: str,
+    username: str,
+    password: str,
+    from_address: str,
+    to_addresses: list[str],
+    subject: str,
+    body: str,
+    reply_to: str | None = None,
+) -> None:
+    """Send a single text email via stdlib ``smtplib`` in a thread.
+
+    Async-friendly via ``asyncio.to_thread`` — alert volumes are low
+    enough that a dedicated async SMTP client (``aiosmtplib``) doesn't
+    earn its dep weight. ``security`` picks the connect mode:
+    ``ssl`` = implicit TLS on connect (port 465 typical),
+    ``starttls`` = upgrade plain socket to TLS after EHLO (port 587),
+    ``none`` = no encryption (trusted-network relays only).
+    """
+    if not to_addresses:
+        return
+
+    import smtplib
+    from email.message import EmailMessage
+
+    def _sync_send() -> None:
+        msg = EmailMessage()
+        msg["From"] = from_address
+        msg["To"] = ", ".join(to_addresses)
+        msg["Subject"] = subject
+        if reply_to:
+            msg["Reply-To"] = reply_to
+        msg.set_content(body)
+
+        if security == "ssl":
+            with smtplib.SMTP_SSL(host, port, timeout=10) as smtp:
+                if username and password:
+                    smtp.login(username, password)
+                smtp.send_message(msg)
+            return
+
+        with smtplib.SMTP(host, port, timeout=10) as smtp:
+            smtp.ehlo()
+            if security == "starttls":
+                smtp.starttls()
+                smtp.ehlo()
+            if username and password:
+                smtp.login(username, password)
+            smtp.send_message(msg)
+
+    await asyncio.to_thread(_sync_send)
+
+
+def _smtp_subject_body(payload: dict[str, Any]) -> tuple[str, str]:
+    """Render a plain-text subject + body for an audit or alert payload.
+
+    Default templates are deliberately simple — Jinja overrides are a
+    follow-up if operators ask for per-rule customisation. Subject is
+    prefixed with the severity for inbox-side filtering / colouring.
+    """
+    title, summary = _payload_summary_lines(payload)
+    sev = _payload_severity(payload)
+    subject = f"[SpatiumDDI {sev.upper()}] {title}"
+
+    if payload.get("kind") == "alert":
+        body_lines = [
+            f"Rule: {payload.get('rule_name', '?')} ({payload.get('rule_type', '?')})",
+            f"Severity: {sev}",
+            f"Subject: {payload.get('subject_display') or payload.get('subject_id', '')}",
+            f"Fired at: {payload.get('fired_at', '')}",
+            "",
+            payload.get("message") or "(no message)",
+        ]
+    else:
+        body_lines = [
+            f"Action: {payload.get('action', '?')}",
+            f"Resource: {payload.get('resource_type', '?')} — "
+            f"{payload.get('resource_display') or payload.get('resource_id', '')}",
+            f"User: {payload.get('user_display_name') or 'system'}",
+            f"Result: {payload.get('result', 'success')}",
+            f"Timestamp: {payload.get('timestamp', '')}",
+        ]
+        if summary:
+            body_lines.extend(["", summary])
+    return subject, "\n".join(body_lines)
+
+
 # ── Per-target delivery ────────────────────────────────────────────────────
 
 
@@ -394,10 +613,35 @@ async def _deliver_to_target(target: dict[str, Any], payload: dict[str, Any]) ->
                 ca_cert_pem=target.get("ca_cert_pem"),
             )
         elif kind == "webhook":
-            await _send_webhook(
-                target["url"],
-                target.get("auth_header") or "",
-                payload,
+            flavor = (target.get("webhook_flavor") or "generic").lower()
+            body = _shape_webhook_body(flavor, payload)
+            # Slack / Teams / Discord incoming-webhook URLs accept
+            # unauthenticated POSTs by design; forwarding the
+            # ``Authorization`` header would just confuse them. Keep
+            # auth_header for ``generic`` only.
+            auth = target.get("auth_header") or "" if flavor == "generic" else ""
+            await _send_webhook(target["url"], auth, body)
+        elif kind == "smtp":
+            password = target.get("smtp_password") or ""
+            to_addrs = target.get("smtp_to_addresses") or []
+            if not target.get("smtp_host") or not target.get("smtp_from_address") or not to_addrs:
+                logger.warning(
+                    "audit_forward_smtp_missing_config",
+                    target=target.get("name"),
+                )
+                return
+            subject, body = _smtp_subject_body(payload)
+            await _send_smtp(
+                target["smtp_host"],
+                int(target.get("smtp_port", 587)),
+                target.get("smtp_security", "starttls"),
+                target.get("smtp_username", ""),
+                password,
+                target["smtp_from_address"],
+                list(to_addrs),
+                subject,
+                body,
+                reply_to=target.get("smtp_reply_to") or None,
             )
     except Exception as exc:  # noqa: BLE001
         logger.warning(
@@ -556,8 +800,42 @@ async def _load_targets() -> list[dict[str, Any]]:
                 {
                     "name": t.name,
                     "kind": "webhook",
+                    "webhook_flavor": t.webhook_flavor or "generic",
                     "url": t.url,
                     "auth_header": t.auth_header or "",
+                    "min_severity": t.min_severity,
+                    "resource_types": t.resource_types,
+                }
+            )
+        elif t.kind == "smtp" and t.smtp_host and t.smtp_from_address:
+            # Decrypt the password lazily here so the cleartext stays
+            # off the in-memory target dict any longer than necessary —
+            # ``_send_smtp`` is the only consumer.
+            password = ""
+            if t.smtp_password_encrypted:
+                try:
+                    from app.core.crypto import decrypt_str
+
+                    password = decrypt_str(t.smtp_password_encrypted)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "audit_forward_smtp_decrypt_failed",
+                        target=t.name,
+                        error=str(exc),
+                    )
+                    continue
+            out.append(
+                {
+                    "name": t.name,
+                    "kind": "smtp",
+                    "smtp_host": t.smtp_host,
+                    "smtp_port": int(t.smtp_port),
+                    "smtp_security": t.smtp_security,
+                    "smtp_username": t.smtp_username,
+                    "smtp_password": password,
+                    "smtp_from_address": t.smtp_from_address,
+                    "smtp_to_addresses": list(t.smtp_to_addresses or []),
+                    "smtp_reply_to": t.smtp_reply_to or None,
                     "min_severity": t.min_severity,
                     "resource_types": t.resource_types,
                 }

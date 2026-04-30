@@ -47,6 +47,7 @@ class AlertRuleCreate(BaseModel):
     severity: str = "warning"
     notify_syslog: bool = True
     notify_webhook: bool = True
+    notify_smtp: bool = False
 
     @field_validator("rule_type")
     @classmethod
@@ -92,6 +93,7 @@ class AlertRuleUpdate(BaseModel):
     severity: str | None = None
     notify_syslog: bool | None = None
     notify_webhook: bool | None = None
+    notify_smtp: bool | None = None
 
     @field_validator("severity")
     @classmethod
@@ -132,6 +134,7 @@ class AlertRuleResponse(BaseModel):
     severity: str
     notify_syslog: bool
     notify_webhook: bool
+    notify_smtp: bool
     created_at: datetime
     modified_at: datetime
 
@@ -150,6 +153,7 @@ class AlertEventResponse(BaseModel):
     resolved_at: datetime | None
     delivered_syslog: bool
     delivered_webhook: bool
+    delivered_smtp: bool
 
     model_config = {"from_attributes": True}
 
@@ -159,6 +163,7 @@ class EvaluateResponse(BaseModel):
     resolved: int
     delivered_syslog: int
     delivered_webhook: int
+    delivered_smtp: int
 
 
 # ── Rules ──────────────────────────────────────────────────────────────────

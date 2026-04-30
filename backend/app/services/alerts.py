@@ -139,17 +139,20 @@ def _severity_to_syslog(severity: str) -> int:
 async def _deliver(
     rule: AlertRule,
     event: AlertEvent,
-    syslog_cfg: dict[str, Any] | None,
-    webhook_cfg: dict[str, Any] | None,
-) -> tuple[bool, bool]:
-    """Push one newly-opened event out to the configured channels.
+    targets: list[dict[str, Any]],
+) -> tuple[bool, bool, bool]:
+    """Fan an event out to every audit-forward target whose ``kind``
+    matches an enabled rule channel. Returns
+    ``(delivered_syslog, delivered_webhook, delivered_smtp)`` as
+    booleans suitable for stamping onto the event row.
 
-    Returns (delivered_syslog, delivered_webhook) as booleans suitable
-    for stamping onto the event row. Failures are logged via structlog
-    and not raised — a dead collector never blocks alert creation.
+    Per-target ``min_severity`` / ``resource_types`` filters still
+    apply via ``_deliver_to_target``. A dead target isolates to its
+    own row; the others still see the event.
     """
     delivered_syslog = False
     delivered_webhook = False
+    delivered_smtp = False
 
     payload: dict[str, Any] = {
         "kind": "alert",
@@ -164,52 +167,33 @@ async def _deliver(
         "message": event.message,
     }
 
-    if rule.notify_syslog and syslog_cfg is not None:
-        facility = int(syslog_cfg["facility"])
-        severity = _severity_to_syslog(event.severity)
-        pri = (facility << 3) | severity
-        hostname = audit_forward._hostname()  # noqa: SLF001
-        ts = event.fired_at.isoformat()
-        # Matches the RFC 5424 shape audit_forward renders — JSON body
-        # after the header.
-        import json  # noqa: PLC0415
-
-        msg = f"<{pri}>1 {ts} {hostname} spatiumddi - ALERT - " + json.dumps(
-            payload, separators=(",", ":"), default=str
-        )
+    for target in targets:
+        kind = target.get("kind")
+        if kind == "syslog" and not rule.notify_syslog:
+            continue
+        if kind == "webhook" and not rule.notify_webhook:
+            continue
+        if kind == "smtp" and not rule.notify_smtp:
+            continue
         try:
-            await audit_forward._send_syslog(  # noqa: SLF001
-                syslog_cfg["host"],
-                int(syslog_cfg["port"]),
-                syslog_cfg["protocol"],
-                msg,
-            )
-            delivered_syslog = True
+            await audit_forward._deliver_to_target(target, payload)  # noqa: SLF001
+            if kind == "syslog":
+                delivered_syslog = True
+            elif kind == "webhook":
+                delivered_webhook = True
+            elif kind == "smtp":
+                delivered_smtp = True
         except Exception as exc:  # noqa: BLE001
             logger.warning(
-                "alert_deliver_syslog_failed",
+                "alert_deliver_failed",
                 rule=str(rule.id),
                 event=str(event.id),
+                target=target.get("name"),
+                kind=kind,
                 error=str(exc),
             )
 
-    if rule.notify_webhook and webhook_cfg is not None:
-        try:
-            await audit_forward._send_webhook(  # noqa: SLF001
-                webhook_cfg["url"],
-                webhook_cfg["auth_header"],
-                payload,
-            )
-            delivered_webhook = True
-        except Exception as exc:  # noqa: BLE001
-            logger.warning(
-                "alert_deliver_webhook_failed",
-                rule=str(rule.id),
-                event=str(event.id),
-                error=str(exc),
-            )
-
-    return delivered_syslog, delivered_webhook
+    return delivered_syslog, delivered_webhook, delivered_smtp
 
 
 # ── Main entry point ───────────────────────────────────────────────────────
@@ -224,18 +208,19 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
     the rest.
     """
     settings = await db.get(PlatformSettings, 1)
-    syslog_cfg, webhook_cfg = await audit_forward._load_forward_config()  # noqa: SLF001
+    targets = await audit_forward._load_targets()  # noqa: SLF001
 
     # Alerts have their own enabled toggle per rule; we still rely on
-    # audit-forward's target config for actual delivery. If the user
-    # hasn't configured either target the event is recorded but goes
-    # nowhere — still visible in the /alerts UI.
+    # audit-forward's target table for actual delivery. With no targets
+    # configured the event is recorded but goes nowhere — still visible
+    # in the /alerts UI.
     now = datetime.now(UTC)
 
     opened = 0
     resolved = 0
     delivered_syslog = 0
     delivered_webhook = 0
+    delivered_smtp = 0
 
     res = await db.execute(select(AlertRule).where(AlertRule.enabled.is_(True)))
     rules = list(res.scalars().all())
@@ -278,14 +263,17 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 )
                 db.add(event)
                 await db.flush()  # populate event.id for delivery payload
-                ds, dw = await _deliver(rule, event, syslog_cfg, webhook_cfg)
+                ds, dw, dm = await _deliver(rule, event, targets)
                 event.delivered_syslog = ds
                 event.delivered_webhook = dw
+                event.delivered_smtp = dm
                 opened += 1
                 if ds:
                     delivered_syslog += 1
                 if dw:
                     delivered_webhook += 1
+                if dm:
+                    delivered_smtp += 1
 
             # Resolve open events whose subject no longer matches.
             for subject_id, event in open_by_subject.items():
@@ -307,4 +295,5 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
         "resolved": resolved,
         "delivered_syslog": delivered_syslog,
         "delivered_webhook": delivered_webhook,
+        "delivered_smtp": delivered_smtp,
     }

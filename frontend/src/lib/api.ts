@@ -1757,7 +1757,13 @@ export interface OUITaskStatus {
   error: string | null;
 }
 
-export type AuditForwardKind = "syslog" | "webhook";
+export type AuditForwardKind = "syslog" | "webhook" | "smtp";
+export type AuditForwardWebhookFlavor =
+  | "generic"
+  | "slack"
+  | "teams"
+  | "discord";
+export type AuditForwardSmtpSecurity = "none" | "starttls" | "ssl";
 export type AuditForwardFormat =
   | "rfc5424_json"
   | "rfc5424_cef"
@@ -1780,6 +1786,16 @@ export interface AuditForwardTarget {
   ca_cert_pem: string | null;
   url: string;
   auth_header_set: boolean;
+  webhook_flavor: AuditForwardWebhookFlavor;
+  smtp_host: string;
+  smtp_port: number;
+  smtp_security: AuditForwardSmtpSecurity;
+  smtp_username: string;
+  // Server returns only a boolean (the password is Fernet-encrypted at rest).
+  smtp_password_set: boolean;
+  smtp_from_address: string;
+  smtp_to_addresses: string[] | null;
+  smtp_reply_to: string;
   min_severity: AuditForwardSeverity | null;
   resource_types: string[] | null;
   created_at: string;
@@ -1798,6 +1814,17 @@ export interface AuditForwardTargetWrite {
   ca_cert_pem?: string | null;
   url?: string;
   auth_header?: string;
+  webhook_flavor?: AuditForwardWebhookFlavor;
+  smtp_host?: string;
+  smtp_port?: number;
+  smtp_security?: AuditForwardSmtpSecurity;
+  smtp_username?: string;
+  // ``null`` keeps the existing encrypted password, ``""`` clears it,
+  // any other string is sent in plaintext and encrypted server-side.
+  smtp_password?: string | null;
+  smtp_from_address?: string;
+  smtp_to_addresses?: string[] | null;
+  smtp_reply_to?: string;
   min_severity?: AuditForwardSeverity | null;
   resource_types?: string[] | null;
 }
@@ -4043,6 +4070,7 @@ export interface AlertRule {
   severity: AlertSeverity;
   notify_syslog: boolean;
   notify_webhook: boolean;
+  notify_smtp: boolean;
   created_at: string;
   modified_at: string;
 }
@@ -4057,6 +4085,7 @@ export interface AlertRuleCreate {
   severity?: AlertSeverity;
   notify_syslog?: boolean;
   notify_webhook?: boolean;
+  notify_smtp?: boolean;
 }
 
 export interface AlertRuleUpdate {
@@ -4068,6 +4097,7 @@ export interface AlertRuleUpdate {
   severity?: AlertSeverity;
   notify_syslog?: boolean;
   notify_webhook?: boolean;
+  notify_smtp?: boolean;
 }
 
 export interface AlertEvent {
@@ -4082,6 +4112,7 @@ export interface AlertEvent {
   resolved_at: string | null;
   delivered_syslog: boolean;
   delivered_webhook: boolean;
+  delivered_smtp: boolean;
 }
 
 export interface AlertEvaluateResult {
@@ -4089,6 +4120,7 @@ export interface AlertEvaluateResult {
   resolved: number;
   delivered_syslog: number;
   delivered_webhook: number;
+  delivered_smtp: number;
 }
 
 export const alertsApi = {

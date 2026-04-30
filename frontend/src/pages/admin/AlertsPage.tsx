@@ -74,6 +74,7 @@ function RuleEditorModal({
   const [notifyWebhook, setNotifyWebhook] = useState(
     existing?.notify_webhook ?? true,
   );
+  const [notifySmtp, setNotifySmtp] = useState(existing?.notify_smtp ?? false);
   const [error, setError] = useState<string | null>(null);
 
   const mut = useMutation({
@@ -85,6 +86,7 @@ function RuleEditorModal({
         severity,
         notify_syslog: notifySyslog,
         notify_webhook: notifyWebhook,
+        notify_smtp: notifySmtp,
         threshold_percent: ruleType === "subnet_utilization" ? threshold : null,
         server_type: ruleType === "server_unreachable" ? serverType : null,
       };
@@ -183,8 +185,9 @@ function RuleEditorModal({
             Delivery channels
           </p>
           <p className="text-[11px] text-muted-foreground/80">
-            Uses the syslog / webhook targets configured under Settings → Audit
-            Event Forwarding.
+            Fans out to every enabled target of the matching kind in Settings →
+            Audit Event Forwarding (webhook covers Slack / Teams / Discord chat
+            flavors automatically).
           </p>
           <label className="flex items-center gap-2 text-sm">
             <input
@@ -200,7 +203,15 @@ function RuleEditorModal({
               checked={notifyWebhook}
               onChange={(e) => setNotifyWebhook(e.target.checked)}
             />
-            Webhook
+            Webhook (incl. Slack / Teams / Discord)
+          </label>
+          <label className="flex items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              checked={notifySmtp}
+              onChange={(e) => setNotifySmtp(e.target.checked)}
+            />
+            Email (SMTP)
           </label>
         </div>
         <label className="flex items-center gap-2 text-sm">
@@ -372,6 +383,7 @@ export function AlertsPage() {
                       {[
                         r.notify_syslog && "syslog",
                         r.notify_webhook && "webhook",
+                        r.notify_smtp && "smtp",
                       ]
                         .filter(Boolean)
                         .join(" · ") || "(none)"}
