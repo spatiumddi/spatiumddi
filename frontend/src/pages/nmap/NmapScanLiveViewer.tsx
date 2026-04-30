@@ -4,6 +4,7 @@ import { Loader2, StopCircle } from "lucide-react";
 import { type NmapScanRead, type NmapScanStatus, nmapApi } from "@/lib/api";
 import { HeaderButton } from "@/components/ui/header-button";
 import { cn } from "@/lib/utils";
+import { NmapResultPanel } from "./NmapResultPanel";
 
 const TERMINAL: NmapScanStatus[] = ["completed", "failed", "cancelled"];
 
@@ -30,6 +31,12 @@ function StatusPill({ status }: { status: NmapScanStatus }) {
 export interface NmapScanLiveViewerProps {
   scanId: string;
   onClose?: () => void;
+  /** Fires once when the scan reaches a terminal state. The parent
+   *  uses this to switch tabs and stash the finished scan as the
+   *  "Last result" view. Receives the most recent ``NmapScanRead``
+   *  available; if a refetch is in flight, the parent can still call
+   *  the API again later if needed. */
+  onComplete?: (scan: NmapScanRead) => void;
 }
 
 /**
@@ -45,6 +52,7 @@ export interface NmapScanLiveViewerProps {
 export function NmapScanLiveViewer({
   scanId,
   onClose,
+  onComplete,
 }: NmapScanLiveViewerProps) {
   const qc = useQueryClient();
   const [lines, setLines] = useState<string[]>([]);
@@ -52,6 +60,9 @@ export function NmapScanLiveViewer({
     "connecting" | "open" | "done" | "error"
   >("connecting");
   const preRef = useRef<HTMLPreElement | null>(null);
+  // Guard against firing onComplete twice — the SSE done event AND
+  // the polling refetch can both observe the terminal status.
+  const completedFiredRef = useRef<string | null>(null);
 
   // The server side persists everything we need, so once the stream
   // ends we just refetch the record to render the final summary.
@@ -107,6 +118,19 @@ export function NmapScanLiveViewer({
 
   const status = scan?.status ?? "queued";
   const isTerminal = TERMINAL.includes(status);
+
+  useEffect(() => {
+    if (
+      isTerminal &&
+      scan &&
+      onComplete &&
+      completedFiredRef.current !== scanId
+    ) {
+      completedFiredRef.current = scanId;
+      onComplete(scan);
+    }
+  }, [isTerminal, scan, onComplete, scanId]);
+
   const cancel = async () => {
     try {
       await nmapApi.cancelScan(scanId);
@@ -160,75 +184,7 @@ export function NmapScanLiveViewer({
         </p>
       )}
 
-      {isTerminal && scan?.summary && <SummaryPanel scan={scan} />}
-    </div>
-  );
-}
-
-function SummaryPanel({ scan }: { scan: NmapScanRead }) {
-  const summary = scan.summary;
-  if (!summary) return null;
-  const openPorts = summary.ports.filter((p) => p.state === "open");
-  return (
-    <div className="space-y-2 rounded-md border bg-muted/20 p-3">
-      <div className="flex flex-wrap gap-3 text-xs">
-        <span>
-          Host state: <strong>{summary.host_state}</strong>
-        </span>
-        {scan.exit_code !== null && (
-          <span>
-            Exit: <strong>{scan.exit_code}</strong>
-          </span>
-        )}
-        {scan.duration_seconds !== null && (
-          <span>Duration: {scan.duration_seconds.toFixed(1)}s</span>
-        )}
-        {summary.os?.name && (
-          <span>
-            OS guess: <strong>{summary.os.name}</strong>
-            {summary.os.accuracy ? ` (${summary.os.accuracy}%)` : ""}
-          </span>
-        )}
-      </div>
-      {openPorts.length > 0 ? (
-        <div className="overflow-x-auto rounded-md border bg-background">
-          <table className="w-full min-w-[480px] text-xs">
-            <thead>
-              <tr className="border-b bg-muted/30">
-                <th className="px-2 py-1.5 text-left">Port</th>
-                <th className="px-2 py-1.5 text-left">Proto</th>
-                <th className="px-2 py-1.5 text-left">State</th>
-                <th className="px-2 py-1.5 text-left">Service</th>
-                <th className="px-2 py-1.5 text-left">Version</th>
-              </tr>
-            </thead>
-            <tbody>
-              {openPorts.map((p) => (
-                <tr
-                  key={`${p.proto}-${p.port}`}
-                  className="border-b last:border-0"
-                >
-                  <td className="px-2 py-1 font-mono">{p.port}</td>
-                  <td className="px-2 py-1">{p.proto}</td>
-                  <td className="px-2 py-1">{p.state}</td>
-                  <td className="px-2 py-1">
-                    {p.service ?? (
-                      <span className="text-muted-foreground">—</span>
-                    )}
-                  </td>
-                  <td className="px-2 py-1 text-muted-foreground">
-                    {[p.product, p.version, p.extrainfo]
-                      .filter(Boolean)
-                      .join(" ") || "—"}
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      ) : (
-        <p className="text-xs text-muted-foreground">No open ports detected.</p>
-      )}
+      {isTerminal && scan?.summary && <NmapResultPanel scan={scan} />}
     </div>
   );
 }

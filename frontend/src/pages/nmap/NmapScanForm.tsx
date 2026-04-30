@@ -23,7 +23,17 @@ const PRESETS: { id: NmapPreset; label: string; hint: string }[] = [
   {
     id: "os_fingerprint",
     label: "OS Fingerprint",
-    hint: "TCP/IP stack fingerprinting (-O). Privileged scans need root; falls back to TCP-connect inside the container.",
+    hint: "TCP/IP stack fingerprinting (-O). Needs CAP_NET_RAW (granted by default in our images).",
+  },
+  {
+    id: "service_and_os",
+    label: "Services + OS",
+    hint: "Service detection + OS fingerprint in one pass (-sV -O --version-light). The right default for device profiling.",
+  },
+  {
+    id: "subnet_sweep",
+    label: "Subnet Sweep",
+    hint: "Ping-scan a CIDR (-sn). Returns alive hosts only — no port scan. Cap is /16 worth of hosts.",
   },
   {
     id: "default_scripts",
@@ -52,6 +62,11 @@ const inputCls =
 
 export interface NmapScanFormProps {
   defaultTargetIp?: string;
+  /** Pre-selects a specific preset radio. Used when callers want to
+   *  push the operator toward the right default — e.g. the subnet
+   *  Tools menu opens the modal with ``subnet_sweep`` because the
+   *  target is a CIDR. */
+  defaultPreset?: NmapPreset;
   ipAddressId?: string;
   /** Disables the target_ip input — used when launching from the IPAM
    *  detail modal where the IP is fixed. */
@@ -61,12 +76,13 @@ export interface NmapScanFormProps {
 
 export function NmapScanForm({
   defaultTargetIp = "",
+  defaultPreset = "quick",
   ipAddressId,
   lockTarget,
   onScanStarted,
 }: NmapScanFormProps) {
   const [targetIp, setTargetIp] = useState(defaultTargetIp);
-  const [preset, setPreset] = useState<NmapPreset>("quick");
+  const [preset, setPreset] = useState<NmapPreset>(defaultPreset);
   const [portSpec, setPortSpec] = useState("");
   const [extraArgs, setExtraArgs] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -109,11 +125,12 @@ export function NmapScanForm({
           value={targetIp}
           onChange={(e) => setTargetIp(e.target.value)}
           disabled={!!lockTarget}
-          placeholder="IP or hostname — e.g. 192.0.2.10, 2001:db8::1, router1.lan"
+          placeholder="IP, CIDR, or hostname — e.g. 192.0.2.10, 192.0.2.0/24, 2001:db8::1, router1.lan"
           autoFocus={!lockTarget}
         />
         <p className="mt-1 text-[11px] text-muted-foreground/70">
-          Hostnames are resolved by nmap at scan time.
+          Hostnames are resolved by nmap at scan time. CIDRs expand to a list of
+          alive hosts with the chosen preset (capped at /16 worth of addresses).
         </p>
       </div>
 

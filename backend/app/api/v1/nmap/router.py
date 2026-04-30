@@ -41,7 +41,12 @@ from app.core.security import decode_access_token
 from app.db import get_db
 from app.models.audit import AuditLog
 from app.models.auth import User
-from app.models.ipam import IPAddress
+from app.models.ipam import (
+    IP_STATUSES_INTEGRATION_OWNED,
+    IP_STATUSES_OPERATOR_SETTABLE,
+    IPAddress,
+    Subnet,
+)
 from app.models.nmap import NmapScan
 from app.services.nmap import NmapArgError, build_argv
 
@@ -277,6 +282,205 @@ async def cancel_scan(scan_id: uuid.UUID, db: DB, current_user: CurrentUser) -> 
     )
     await db.delete(row)
     await db.commit()
+
+
+@router.post(
+    "/scans/bulk-delete",
+    status_code=status.HTTP_200_OK,
+    dependencies=[Depends(require_permission("delete", PERMISSION))],
+)
+async def bulk_delete_scans(
+    body: dict[str, list[uuid.UUID]],
+    db: DB,
+    current_user: CurrentUser,
+) -> dict[str, int]:
+    """Bulk-cancel + delete N scans in a single transaction.
+
+    Same per-row policy as the single ``DELETE`` endpoint:
+    queued/running scans get marked ``cancelled`` (the runner self-
+    terminates on its next DB read); terminal scans are removed.
+    Returns a counter so the UI can render "deleted X / cancelled Y".
+    Missing ids are silently skipped — the operator may have just
+    deleted them in another tab.
+    """
+    scan_ids = body.get("scan_ids") or []
+    if not scan_ids:
+        raise HTTPException(status_code=422, detail="scan_ids must be a non-empty list")
+    if len(scan_ids) > 500:
+        raise HTTPException(status_code=422, detail="bulk-delete is capped at 500 scans per call")
+
+    cancelled = 0
+    deleted = 0
+    now = datetime.now(UTC)
+    for sid in scan_ids:
+        row = await db.get(NmapScan, sid)
+        if row is None:
+            continue
+        target = str(row.target_ip)
+        if row.status in ("queued", "running"):
+            row.status = "cancelled"
+            if row.finished_at is None:
+                row.finished_at = now
+            await _audit(db, user=current_user, action="cancel", scan_id=row.id, target=target)
+            cancelled += 1
+        else:
+            await _audit(db, user=current_user, action="delete", scan_id=row.id, target=target)
+            await db.delete(row)
+            deleted += 1
+    await db.commit()
+    return {"deleted": deleted, "cancelled": cancelled}
+
+
+# ── Stamp alive hosts → IPAM ────────────────────────────────────────
+
+
+@router.post(
+    "/scans/{scan_id}/stamp-discovered",
+    status_code=status.HTTP_200_OK,
+)
+async def stamp_discovered(
+    scan_id: uuid.UUID,
+    db: DB,
+    current_user: CurrentUser,
+) -> dict[str, Any]:
+    """Stamp every alive host from a multi-host scan into IPAM.
+
+    Mirrors the DHCP-lease IPAM mirror policy: an existing row in
+    ``available`` or ``discovered`` status gets bumped to
+    ``discovered`` with ``last_seen_at`` + ``last_seen_method='nmap'``;
+    rows owned by an integration or carrying an operator-set status
+    only get the ``last_seen`` stamp (status is left alone). New rows
+    land as ``discovered``. IPs that don't fall inside any known
+    subnet are skipped — there's no obvious place to put them.
+
+    Permission gate: the user must be able to write IPAM
+    (``ip_address`` write). This is intentionally a different gate
+    from ``manage_nmap_scans`` because the action mutates IPAM, not
+    nmap state.
+    """
+    from sqlalchemy import func as sa_func
+
+    # The action mutates IPAM rows, so gate on ip_address write
+    # rather than the manage_nmap_scans permission. Operators with
+    # only nmap-read shouldn't be able to seed IPAM by side-effect.
+    if not user_has_permission(current_user, "write", "ip_address"):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Permission denied: need 'write' on 'ip_address'",
+        )
+
+    scan = await db.get(NmapScan, scan_id)
+    if scan is None:
+        raise HTTPException(status_code=404, detail="Scan not found")
+    summary = scan.summary_json or {}
+    hosts: list[dict[str, Any]] = summary.get("hosts") or []
+    if not hosts:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Scan has no multi-host result to stamp — "
+                "this action only applies to CIDR / subnet sweeps."
+            ),
+        )
+
+    now = datetime.now(UTC)
+    created = 0
+    bumped = 0  # status flipped to discovered
+    refreshed = 0  # last_seen stamped, status preserved
+    skipped_no_subnet = 0
+    skipped_address: list[str] = []
+
+    for host in hosts:
+        if host.get("host_state") != "up":
+            continue
+        addr = host.get("address")
+        if not addr:
+            continue
+        try:
+            # Validate the address parses as IP — nmap can in theory
+            # emit hostnames here for resolved targets, which the INET
+            # cast would reject. Skip with a record so the UI can show.
+            import ipaddress
+
+            ipaddress.ip_address(addr)
+        except (ValueError, TypeError):
+            skipped_address.append(str(addr))
+            continue
+
+        subnet_res = await db.execute(
+            select(Subnet).where(Subnet.network.op(">>=")(sa_func.inet(addr)))
+        )
+        subnet = subnet_res.scalars().first()
+        if subnet is None:
+            skipped_no_subnet += 1
+            continue
+
+        ipam_res = await db.execute(
+            select(IPAddress).where(
+                IPAddress.subnet_id == subnet.id,
+                IPAddress.address == addr,
+            )
+        )
+        row = ipam_res.scalar_one_or_none()
+        if row is None:
+            db.add(
+                IPAddress(
+                    subnet_id=subnet.id,
+                    address=addr,
+                    status="discovered",
+                    last_seen_at=now,
+                    last_seen_method="nmap",
+                    created_by_user_id=current_user.id,
+                )
+            )
+            created += 1
+            continue
+
+        # Existing row policy:
+        #   - available / discovered → bump to discovered + stamp
+        #   - integration-owned (dhcp / k8s / proxmox / …) → stamp only
+        #   - operator-set (allocated / reserved / …) → stamp only
+        #   - placeholder rows (network / broadcast) → skip entirely
+        if row.status in ("network", "broadcast"):
+            continue
+        row.last_seen_at = now
+        row.last_seen_method = "nmap"
+        if row.status in ("available", "discovered"):
+            if row.status != "discovered":
+                row.status = "discovered"
+                bumped += 1
+            else:
+                refreshed += 1
+        elif (
+            row.status in IP_STATUSES_INTEGRATION_OWNED
+            or row.status in IP_STATUSES_OPERATOR_SETTABLE
+        ):
+            refreshed += 1
+        else:
+            refreshed += 1
+
+    await _audit(
+        db,
+        user=current_user,
+        action="stamp_discovered",
+        scan_id=scan.id,
+        target=str(scan.target_ip),
+        new_value={
+            "created": created,
+            "bumped": bumped,
+            "refreshed": refreshed,
+            "skipped_no_subnet": skipped_no_subnet,
+            "skipped_addresses": skipped_address[:50],
+        },
+    )
+    await db.commit()
+    return {
+        "created": created,
+        "bumped": bumped,
+        "refreshed": refreshed,
+        "skipped_no_subnet": skipped_no_subnet,
+        "skipped_addresses": skipped_address,
+    }
 
 
 # ── SSE stream ──────────────────────────────────────────────────────

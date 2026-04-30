@@ -5231,6 +5231,7 @@ export type NmapPreset =
   | "service_version"
   | "os_fingerprint"
   | "service_and_os"
+  | "subnet_sweep"
   | "default_scripts"
   | "udp_top100"
   | "aggressive"
@@ -5259,10 +5260,22 @@ export interface NmapOsResult {
   accuracy: number | null;
 }
 
+export interface NmapHostResult {
+  address: string | null;
+  hostname: string | null;
+  host_state: string;
+  ports: NmapPortResult[];
+  os: NmapOsResult | null;
+}
+
 export interface NmapSummary {
   host_state: string;
   ports: NmapPortResult[];
   os: NmapOsResult | null;
+  /** Populated when the scan target was a CIDR (or any target nmap
+   *  expanded to multiple hosts). The single-host fields above mirror
+   *  the first entry. */
+  hosts: NmapHostResult[] | null;
 }
 
 export interface NmapScanRead {
@@ -5320,6 +5333,30 @@ export const nmapApi = {
   createScan: (body: NmapScanCreate) =>
     api.post<NmapScanRead>("/nmap/scans", body).then((r) => r.data),
   cancelScan: (id: string) => api.delete(`/nmap/scans/${id}`),
+  /** Bulk-delete scans. Server returns ``{deleted, cancelled}`` —
+   *  queued/running scans get cancelled, terminal scans are removed.
+   *  Capped at 500 scan ids per call. */
+  bulkDeleteScans: (scanIds: string[]) =>
+    api
+      .post<{ deleted: number; cancelled: number }>("/nmap/scans/bulk-delete", {
+        scan_ids: scanIds,
+      })
+      .then((r) => r.data),
+  /** Stamp every alive host from a multi-host (CIDR) scan into IPAM.
+   *  Existing rows in ``available`` / ``discovered`` get bumped to
+   *  ``discovered``; integration / operator-owned rows get a
+   *  ``last_seen`` stamp only. New rows land as ``discovered``.
+   *  Returns counters for the UI to render. */
+  stampDiscovered: (scanId: string) =>
+    api
+      .post<{
+        created: number;
+        bumped: number;
+        refreshed: number;
+        skipped_no_subnet: number;
+        skipped_addresses: string[];
+      }>(`/nmap/scans/${scanId}/stamp-discovered`)
+      .then((r) => r.data),
   // The SSE stream isn't fetched via axios — callers use `EventSource`
   // pointed at the URL returned here. Auth piggybacks on a query
   // token because EventSource can't set Authorization headers.

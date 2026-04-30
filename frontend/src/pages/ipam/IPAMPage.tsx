@@ -27,6 +27,10 @@ import {
   Lock,
   Search,
   Radar,
+  Wrench,
+  Scissors,
+  GitMerge,
+  Maximize2,
 } from "lucide-react";
 import {
   DndContext,
@@ -86,6 +90,7 @@ import {
 } from "./IPNetworkTab";
 import { NmapScanModal } from "@/pages/nmap/NmapScanModal";
 import { IPDetailModal } from "./IPDetailModal";
+import { SeenDot } from "./SeenDot";
 import {
   FindFreeModal,
   MergeSubnetSiblingPicker,
@@ -128,6 +133,10 @@ function StatusBadge({ status }: { status: string }) {
       "bg-zinc-100 text-zinc-500 dark:bg-zinc-800/50 dark:text-zinc-400",
     orphan:
       "bg-orange-100 text-orange-600 dark:bg-orange-900/30 dark:text-orange-400",
+    // ``discovered`` — passive observation only, no operator intent.
+    // The Seen column's recency dot tells the operator whether the
+    // row is currently up; the badge here just labels the source.
+    discovered: "bg-sky-100 text-sky-800 dark:bg-sky-900/30 dark:text-sky-400",
   };
   return (
     <span
@@ -2824,6 +2833,113 @@ function SyncMenu({
   );
 }
 
+// ─── Tools dropdown — alphabetical bundle of low-frequency subnet ops ───────
+//
+// Collapses Clean Orphans / Merge / Resize / Scan with nmap / Split into a
+// single dropdown so the subnet header doesn't accumulate a row of 9+ buttons
+// as we add features. Items are alphabetical to make discovery predictable —
+// operators don't have to scan a custom ordering. Closes on outside click via
+// a mousedown listener (same pattern as SyncMenu above).
+function ToolsMenu({
+  onCleanOrphans,
+  onMerge,
+  onResize,
+  onScan,
+  onSplit,
+}: {
+  onCleanOrphans: () => void;
+  onMerge: () => void;
+  onResize: () => void;
+  onScan: () => void;
+  onSplit: () => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onDocMouseDown = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) {
+        setOpen(false);
+      }
+    };
+    document.addEventListener("mousedown", onDocMouseDown);
+    return () => document.removeEventListener("mousedown", onDocMouseDown);
+  }, [open]);
+
+  const itemCls =
+    "flex w-full items-center gap-2 px-3 py-2 text-left text-sm hover:bg-muted disabled:opacity-50";
+
+  return (
+    <div ref={ref} className="relative">
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        title="Subnet tools — scan, clean, reshape"
+        className="flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
+      >
+        <Wrench className="h-3.5 w-3.5" />
+        Tools
+        <ChevronDown className="h-3.5 w-3.5" />
+      </button>
+      {open && (
+        <div className="absolute right-0 z-20 mt-1 w-52 overflow-hidden rounded-md border bg-popover shadow-md">
+          <button
+            type="button"
+            onClick={() => {
+              setOpen(false);
+              onCleanOrphans();
+            }}
+            className={itemCls}
+          >
+            <Trash2 className="h-3.5 w-3.5" /> Clean Orphans
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setOpen(false);
+              onMerge();
+            }}
+            className={itemCls}
+          >
+            <GitMerge className="h-3.5 w-3.5" /> Merge…
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setOpen(false);
+              onResize();
+            }}
+            className={itemCls}
+          >
+            <Maximize2 className="h-3.5 w-3.5" /> Resize…
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setOpen(false);
+              onScan();
+            }}
+            className={itemCls}
+          >
+            <Radar className="h-3.5 w-3.5" /> Scan with nmap
+          </button>
+          <button
+            type="button"
+            onClick={() => {
+              setOpen(false);
+              onSplit();
+            }}
+            className={itemCls}
+          >
+            <Scissors className="h-3.5 w-3.5" /> Split…
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ─── IP <-> int helpers + pool-boundary row type ────────────────────────────
 //
 // IPv4-only utilities for interleaving pool markers with IP rows in the
@@ -2884,6 +3000,10 @@ function SubnetDetail({
   const [showResizeSubnet, setShowResizeSubnet] = useState(false);
   const [showSplitSubnet, setShowSplitSubnet] = useState(false);
   const [showMergeSubnet, setShowMergeSubnet] = useState(false);
+  // Scan-the-whole-subnet trigger from the Tools menu. Re-uses the
+  // existing NmapScanModal with the subnet CIDR + subnet_sweep preset
+  // pre-filled so the operator just hits "Start scan".
+  const [showSubnetScan, setShowSubnetScan] = useState(false);
   const [showDnsSync, setShowDnsSync] = useState(false);
   const [showDhcpSync, setShowDhcpSync] = useState(false);
   const [showSyncAll, setShowSyncAll] = useState(false);
@@ -3296,33 +3416,15 @@ function SubnetDetail({
                 qc.invalidateQueries({ queryKey: ["subnets"] });
               }}
             />
-            <HeaderButton
-              icon={Trash2}
-              onClick={() => setShowOrphans(true)}
-              title="List orphaned IPs in this subnet and permanently delete selected rows"
-            >
-              Clean Orphans
-            </HeaderButton>
+            <ToolsMenu
+              onCleanOrphans={() => setShowOrphans(true)}
+              onMerge={() => setShowMergeSubnet(true)}
+              onResize={() => setShowResizeSubnet(true)}
+              onScan={() => setShowSubnetScan(true)}
+              onSplit={() => setShowSplitSubnet(true)}
+            />
             <HeaderButton icon={Pencil} onClick={() => setShowEditSubnet(true)}>
               Edit
-            </HeaderButton>
-            <HeaderButton
-              onClick={() => setShowResizeSubnet(true)}
-              title="Grow this subnet to a larger CIDR (e.g. /24 → /23). Shrinking is not supported."
-            >
-              Resize…
-            </HeaderButton>
-            <HeaderButton
-              onClick={() => setShowSplitSubnet(true)}
-              title="Split this subnet into 2^k aligned children at a longer prefix"
-            >
-              Split…
-            </HeaderButton>
-            <HeaderButton
-              onClick={() => setShowMergeSubnet(true)}
-              title="Merge this subnet with one or more contiguous siblings"
-            >
-              Merge…
             </HeaderButton>
             <HeaderButton
               variant="primary"
@@ -3570,7 +3672,13 @@ function SubnetDetail({
             <>
               <div className="overflow-x-auto">
                 <table className="w-full min-w-[640px] text-sm">
-                  <thead>
+                  {/* Sticky header — pinned to the parent
+                      ``flex-1 overflow-auto`` scroll container so the
+                      column headers stay visible while scrolling a
+                      long IP list. ``bg-card`` is an opaque base so
+                      the muted overlay on the <tr> doesn't let body
+                      rows bleed through as the user scrolls. */}
+                  <thead className="sticky top-0 z-10 bg-card">
                     <tr className="border-b bg-muted/40 text-xs">
                       <th className="w-8 px-2 py-2">
                         {(() => {
@@ -3650,6 +3758,12 @@ function SubnetDetail({
                           </th>
                         );
                       })}
+                      <th
+                        className="px-4 py-2 text-center font-medium"
+                        title="Alive: green = seen <24h, amber = 24h–7d, red = >7d, grey = never"
+                      >
+                        Seen
+                      </th>
                       <th className="px-4 py-2 text-left font-medium">
                         Network
                       </th>
@@ -3822,7 +3936,7 @@ function SubnetDetail({
                     {filteredAddresses?.length === 0 && (
                       <tr>
                         <td
-                          colSpan={11}
+                          colSpan={12}
                           className="px-4 py-6 text-center text-sm text-muted-foreground"
                         >
                           No addresses match the active filters.
@@ -3850,7 +3964,7 @@ function SubnetDetail({
                         return (
                           <tr key={`pool-${pool.id}-${row.boundary}-${rowIdx}`}>
                             <td
-                              colSpan={11}
+                              colSpan={12}
                               className={cn("px-4 py-1.5", tint)}
                             >
                               <span className="mr-2 font-mono text-xs">
@@ -4088,6 +4202,17 @@ function SubnetDetail({
                                   </span>
                                 )}
                               </td>
+                              {/* Seen — recency dot derived from
+                                  ``last_seen_at``. Orthogonal to status:
+                                  an ``allocated`` row can still be cold,
+                                  a ``discovered`` row can be alive right
+                                  now. Tooltip carries exact age + method. */}
+                              <td className="px-4 py-2 text-center">
+                                <SeenDot
+                                  lastSeenAt={addr.last_seen_at}
+                                  lastSeenMethod={addr.last_seen_method}
+                                />
+                              </td>
                               {/* Network discovery — switch / port / VLAN
                                   from the SNMP-discovered FDB. May render
                                   multiple lines for trunk ports / hypervisor
@@ -4288,6 +4413,14 @@ function SubnetDetail({
             qc.invalidateQueries({ queryKey: ["blocks"] });
             onSubnetDeleted?.();
           }}
+        />
+      )}
+      {showSubnetScan && (
+        <NmapScanModal
+          ip={subnet.network}
+          defaultPreset="subnet_sweep"
+          title={`Scan subnet — ${subnet.network}${subnet.name ? ` (${subnet.name})` : ""}`}
+          onClose={() => setShowSubnetScan(false)}
         />
       )}
       {showDnsSync && (

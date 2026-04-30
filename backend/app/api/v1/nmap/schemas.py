@@ -13,6 +13,7 @@ NmapPreset = Literal[
     "service_version",
     "os_fingerprint",
     "service_and_os",
+    "subnet_sweep",
     "default_scripts",
     "udp_top100",
     "aggressive",
@@ -38,10 +39,24 @@ class NmapOsResult(BaseModel):
     accuracy: int | None = None
 
 
+class NmapHostResult(BaseModel):
+    """One alive/down host from a multi-target (CIDR) scan."""
+
+    address: str | None = None
+    hostname: str | None = None
+    host_state: str = "unknown"
+    ports: list[NmapPortResult] = Field(default_factory=list)
+    os: NmapOsResult | None = None
+
+
 class NmapSummary(BaseModel):
     host_state: str = "unknown"
     ports: list[NmapPortResult] = Field(default_factory=list)
     os: NmapOsResult | None = None
+    # Populated when the scan target was a CIDR (or any target nmap
+    # expanded to multiple hosts). The single-host fields above mirror
+    # the first entry so existing single-host callers keep working.
+    hosts: list[NmapHostResult] | None = None
 
 
 class NmapScanCreate(BaseModel):
@@ -107,6 +122,7 @@ __all__ = [
     "NmapScanStatus",
     "NmapPortResult",
     "NmapOsResult",
+    "NmapHostResult",
     "NmapSummary",
     "NmapScanCreate",
     "NmapScanRead",

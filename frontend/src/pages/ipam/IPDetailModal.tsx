@@ -25,6 +25,7 @@ import {
   useDraggableModal,
 } from "@/components/ui/use-draggable-modal";
 import { IPNetworkTab } from "./IPNetworkTab";
+import { SeenDot } from "./SeenDot";
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -46,6 +47,11 @@ const STATUS_COLORS: Record<string, string> = {
   broadcast: "bg-zinc-100 text-zinc-500 dark:bg-zinc-800/50 dark:text-zinc-400",
   orphan:
     "bg-orange-100 text-orange-600 dark:bg-orange-900/30 dark:text-orange-400",
+  // ``discovered`` — passive observation only, no operator intent yet.
+  // Sky tone keeps it visually distinct from ``available`` (green) and
+  // ``allocated`` (purple); the orthogonal alive dot in the IPAM table
+  // tells the operator whether the discovered row is currently up.
+  discovered: "bg-sky-100 text-sky-800 dark:bg-sky-900/30 dark:text-sky-400",
 };
 
 function copy(text: string) {
@@ -163,6 +169,11 @@ export function IPDetailModal({
               >
                 {addr.status}
               </span>
+              <SeenDot
+                lastSeenAt={addr.last_seen_at}
+                lastSeenMethod={addr.last_seen_method}
+                size="md"
+              />
               {addr.role && (
                 <span className="inline-flex items-center rounded bg-indigo-100 px-1.5 py-0.5 text-[11px] font-medium text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-400">
                   {addr.role}

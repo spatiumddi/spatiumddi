@@ -48,6 +48,13 @@ IP_STATUSES_INTEGRATION_OWNED: frozenset[str] = frozenset(
         "proxmox-vm",
         "proxmox-lxc",
         "tailscale-node",
+        # Stamped by the nmap "Stamp alive hosts → IPAM" action on a
+        # multi-host (CIDR) scan result. Marks an IP as "we saw a host
+        # on the wire here" without claiming it's allocated. Operators
+        # can transition discovered rows to allocated / reserved
+        # through the normal edit path; that stamps user_modified_at
+        # and locks the row from further auto-discovery overwrites.
+        "discovered",
     }
 )
 IP_STATUSES: frozenset[str] = IP_STATUSES_OPERATOR_SETTABLE | IP_STATUSES_INTEGRATION_OWNED

@@ -56,6 +56,11 @@ PRESETS: dict[str, list[str]] = {
     # comparable to ``service_version`` in runtime, just with ``-O`` on
     # top to fill the OS guess panel.
     "service_and_os": ["-T4", "-sV", "-O", "--version-light"],
+    # Subnet sweep — accepts CIDR targets and reports alive hosts only
+    # (no port scan). ``-sn`` is nmap's "ping scan" mode: ICMP echo +
+    # TCP SYN to 80/443 + ARP for local subnets. Output is a list of
+    # alive IPs the operator can use for discovery + IPAM seeding.
+    "subnet_sweep": ["-sn", "-T4"],
     "default_scripts": ["-T4", "-sC"],
     "udp_top100": ["-T4", "-sU", "--top-ports", "100"],
     "aggressive": ["-T4", "-A"],
@@ -72,6 +77,14 @@ _BASE_ARGS = ["nmap", "-oN", "-", "--stats-every", "2s"]
 
 _PORT_SPEC_RE = re.compile(r"^[0-9,\-UTSI:]+$")
 _SHELL_METACHARS = set(";|&$`<>()")
+
+# CIDR-target safety limits. /16 IPv4 is 65k hosts which is at the
+# upper end of "I know what I'm doing" — anything larger than this
+# almost always means the operator typo'd a prefix. The
+# ``MAX_CIDR_HOST_BITS`` value is just a derived display string used
+# in the error message so operators know the equivalent prefix.
+MAX_CIDR_HOST_BITS = 16
+MAX_CIDR_HOST_COUNT = 1 << MAX_CIDR_HOST_BITS
 
 # Maximum time we'll allow a single scan to run, mostly so a forgotten
 # ``aggressive`` against a /16 doesn't pin a worker indefinitely. Eight
@@ -100,7 +113,7 @@ _HOSTNAME_RE: Final = re.compile(
 
 
 def _validate_target(target: str) -> str:
-    """Accept either a literal IPv4/IPv6 address or a hostname / FQDN.
+    """Accept a literal IPv4/IPv6 address, a CIDR range, or a hostname / FQDN.
 
     Hostname mode is a deliberate extension over the original IP-only
     contract — operators routinely want to scan ``router1.lan``
@@ -110,6 +123,12 @@ def _validate_target(target: str) -> str:
     risk of injection. The hostname regex rejects shell metachars,
     spaces, slashes, and anything else that isn't a valid DNS label
     character.
+
+    CIDR mode powers the ``subnet_sweep`` preset (and operator-driven
+    multi-host scans of any preset). The CIDR is canonicalised through
+    ``ipaddress.ip_network(strict=False)`` and the number of host bits
+    is capped at ``MAX_CIDR_HOST_COUNT`` so a stray ``-sn 10.0.0.0/8``
+    can't pin a worker for hours.
     """
     target = target.strip()
     if not target:
@@ -119,9 +138,22 @@ def _validate_target(target: str) -> str:
         return str(addr)
     except ValueError:
         pass
+    if "/" in target:
+        try:
+            net = ipaddress.ip_network(target, strict=False)
+        except ValueError as exc:
+            raise NmapArgError(f"target is not a valid CIDR: {target!r} ({exc})") from exc
+        if net.num_addresses > MAX_CIDR_HOST_COUNT:
+            raise NmapArgError(
+                f"CIDR is too large ({net.num_addresses} hosts) — limit is "
+                f"{MAX_CIDR_HOST_COUNT} (≤ /{net.max_prefixlen - MAX_CIDR_HOST_BITS} for IPv4)"
+            )
+        return str(net)
     if _HOSTNAME_RE.match(target):
         return target
-    raise NmapArgError(f"target must be a valid IPv4/IPv6 address or hostname (got {target!r})")
+    raise NmapArgError(
+        f"target must be a valid IPv4/IPv6 address, CIDR, or hostname (got {target!r})"
+    )
 
 
 # Keep the old name as an alias for callers that import it directly.
@@ -215,32 +247,20 @@ def _safe_text(elem: ET.Element | None, attr: str) -> str | None:
     return val if val else None
 
 
-def parse_nmap_xml(xml_str: str) -> dict:
-    """Parse the XML emitted by ``nmap -oX -`` into a compact summary.
+def _parse_host(host: ET.Element) -> dict[str, Any]:
+    """Extract a single ``<host>`` element into a summary dict.
 
-    Returns a dict with keys ``host_state``, ``ports`` (list of
-    ``{port, proto, state, service, version, product}``), and ``os``
-    (``{name, accuracy}`` or ``None``). Best-effort: returns sensible
-    defaults if the XML is truncated (which happens when nmap is
-    killed mid-run).
+    Returns the same ``{address, host_state, ports, os}`` shape used in
+    the multi-host ``hosts`` list. The single-host fields on the
+    top-level summary are populated from the first parsed host.
     """
-    out: dict[str, Any] = {"host_state": "unknown", "ports": [], "os": None}
-    if not xml_str:
-        return out
-    try:
-        root = ET.fromstring(xml_str)
-    except ET.ParseError as exc:
-        logger.debug("nmap_xml_parse_failed", error=str(exc))
-        return out
-
-    host = root.find("host")
-    if host is None:
-        return out
+    addr_elem = host.find("address")
+    address = addr_elem.get("addr") if addr_elem is not None else None
 
     status = host.find("status")
     state = _safe_text(status, "state") or "unknown"
-    out["host_state"] = state
 
+    ports: list[dict[str, Any]] = []
     ports_root = host.find("ports")
     if ports_root is not None:
         for p in ports_root.findall("port"):
@@ -250,7 +270,7 @@ def parse_nmap_xml(xml_str: str) -> dict:
                 port_num = int(p.get("portid", "0"))
             except ValueError:
                 continue
-            out["ports"].append(
+            ports.append(
                 {
                     "port": port_num,
                     "proto": p.get("protocol") or "tcp",
@@ -263,6 +283,7 @@ def parse_nmap_xml(xml_str: str) -> dict:
                 }
             )
 
+    os_data: dict[str, Any] | None = None
     os_elem = host.find("os")
     if os_elem is not None:
         match = os_elem.find("osmatch")
@@ -271,11 +292,54 @@ def parse_nmap_xml(xml_str: str) -> dict:
                 accuracy = int(match.get("accuracy", "0"))
             except ValueError:
                 accuracy = 0
-            out["os"] = {
-                "name": match.get("name") or None,
-                "accuracy": accuracy,
-            }
+            os_data = {"name": match.get("name") or None, "accuracy": accuracy}
 
+    hostname_elem = host.find("hostnames/hostname")
+    hostname = hostname_elem.get("name") if hostname_elem is not None else None
+
+    return {
+        "address": address,
+        "hostname": hostname,
+        "host_state": state,
+        "ports": ports,
+        "os": os_data,
+    }
+
+
+def parse_nmap_xml(xml_str: str) -> dict:
+    """Parse the XML emitted by ``nmap -oX -`` into a compact summary.
+
+    Single-host scans return ``{host_state, ports, os, hosts: None}``.
+    CIDR / multi-target scans additionally populate ``hosts`` with one
+    entry per ``<host>`` in the XML — the single-host fields then
+    reflect the first parsed host so existing callers (auto-profile
+    stamper, IP detail panel) keep working without a shape check.
+    """
+    out: dict[str, Any] = {
+        "host_state": "unknown",
+        "ports": [],
+        "os": None,
+        "hosts": None,
+    }
+    if not xml_str:
+        return out
+    try:
+        root = ET.fromstring(xml_str)
+    except ET.ParseError as exc:
+        logger.debug("nmap_xml_parse_failed", error=str(exc))
+        return out
+
+    host_elems = root.findall("host")
+    if not host_elems:
+        return out
+
+    parsed = [_parse_host(h) for h in host_elems]
+    first = parsed[0]
+    out["host_state"] = first["host_state"]
+    out["ports"] = first["ports"]
+    out["os"] = first["os"]
+    if len(parsed) > 1:
+        out["hosts"] = parsed
     return out
 
 

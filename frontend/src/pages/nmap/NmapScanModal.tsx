@@ -1,7 +1,7 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Modal } from "@/components/ui/modal";
-import { type NmapScanRead, nmapApi } from "@/lib/api";
+import { type NmapPreset, type NmapScanRead, nmapApi } from "@/lib/api";
 import { NmapScanForm } from "./NmapScanForm";
 import { NmapScanLiveViewer } from "./NmapScanLiveViewer";
 import { ConfirmDeleteScanModal } from "./ConfirmDeleteScanModal";
@@ -11,6 +11,14 @@ import { History, Trash2 } from "lucide-react";
 export interface NmapScanModalProps {
   ip: string;
   ipAddressId?: string;
+  /** Pre-selects a preset radio in the form — caller can push the
+   *  operator toward the right default (e.g. ``subnet_sweep`` when
+   *  the modal opens from a subnet header). */
+  defaultPreset?: NmapPreset;
+  /** Override the modal title (default: ``Nmap scan — {ip}``). The
+   *  subnet header path uses this to read ``Nmap scan — 10.0.0.0/24``
+   *  instead of repeating the noun. */
+  title?: string;
   onClose: () => void;
 }
 
@@ -25,13 +33,15 @@ export interface NmapScanModalProps {
 export function NmapScanModal({
   ip,
   ipAddressId,
+  defaultPreset,
+  title,
   onClose,
 }: NmapScanModalProps) {
   const [activeScan, setActiveScan] = useState<NmapScanRead | null>(null);
   const [showHistory, setShowHistory] = useState(false);
 
   return (
-    <Modal title={`Nmap scan — ${ip}`} onClose={onClose} wide>
+    <Modal title={title ?? `Nmap scan — ${ip}`} onClose={onClose} wide>
       {activeScan ? (
         <NmapScanLiveViewer
           scanId={activeScan.id}
@@ -41,6 +51,7 @@ export function NmapScanModal({
         <div className="space-y-3">
           <NmapScanForm
             defaultTargetIp={ip}
+            defaultPreset={defaultPreset}
             ipAddressId={ipAddressId}
             lockTarget
             onScanStarted={setActiveScan}
