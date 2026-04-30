@@ -64,8 +64,8 @@
 
 | | Feature | Highlights |
 |---|---|---|
-| 🗂 | **Hierarchical IPAM** | spaces · blocks · subnets · IPv4 + full IPv6 (EUI-64 / random / sequential) · per-IP roles · MAC history · reservation TTL |
-| ✂️ | **Subnet operations** | Split · Merge · Find-free · subnet planner (multi-level CIDR design + transactional apply) — preview-then-commit with typed-CIDR confirm |
+| 🗂 | **Hierarchical IPAM** | spaces · blocks · subnets · IPv4 + full IPv6 (EUI-64 / random / sequential) · per-IP roles · MAC history · reservation TTL · bulk allocate with name templates |
+| ✂️ | **Subnet operations** | Split · Merge · Find-free · subnet planner (multi-level CIDR design + transactional apply) — preview-then-commit with typed-CIDR confirm · single Tools dropdown on subnet headers |
 | 🧮 | **Planning tools** | CIDR calculator · address planner (pack /N requests into free space) · aggregation suggestion · free-space treemap |
 | 🌐 | **DNS** | BIND9 container, auto-registering · RFC 2136 dynamic updates · per-server zone-serial drift · TSIG keys · zone delegation wizard · zone templates · RPZ blocklists with curated catalog · BIND9 catalog zones (RFC 9432) |
 | ⚖️ | **GSLB-lite** | health-checked DNS pools — tcp / http / https / icmp / none probes flip A/AAAA records in/out of the rendered rrset; manual enable per member |
@@ -80,7 +80,7 @@
 | | Feature | Highlights |
 |---|---|---|
 | 📡 | **SNMP discovery** | v1 / v2c / v3 polling of routers + switches → ARP / FDB / interfaces / LLDP neighbours feed back into IPAM |
-| 🎯 | **Nmap scanner** | per-IP "Scan with Nmap" + `/tools/nmap` + live SSE output streaming |
+| 🎯 | **Nmap scanner** | per-IP / per-subnet (CIDR sweep) / `/tools/nmap` · live SSE streaming · stamp alive hosts → IPAM |
 | 🛰 | **Device profiling** | passive DHCP fingerprinting (scapy + fingerbank) **and** opt-in auto-nmap on new DHCP lease — what kind of device is on every IP |
 | 🏷 | **OUI vendor lookup** | MAC → vendor names in IP tables, DHCP leases, search filters |
 | 🎨 | **Dashboards** | utilization heatmap · DNS query rate · DHCP traffic · platform health card |
@@ -125,6 +125,14 @@ The tables above are the elevator pitch. The bullets here are the same surface w
   - Per-IP role: host / loopback / anycast / vip / vrrp / secondary / gateway
   - Reservation TTL with auto-expiry
   - Per-IP MAC observation history
+  - **Bulk allocate** a contiguous range with a name template
+    (`dhcp-{n}` / `host-{oct3}-{oct4}` / `web-{n:03d}`) — preview
+    → commit, capped at 1024 IPs, skips dynamic DHCP pools, detects
+    FQDN collisions, optionally creates A + PTR records
+  - **IP table polish** — sticky column headers, shift-click range
+    select, "Seen" recency dot per row (alive / stale / cold /
+    never), subtle gap markers between non-contiguous IPs so a
+    deleted hole doesn't go unnoticed
 
 - ✂️ **Subnet operations** — preview-then-commit with typed-CIDR confirm.
   - Split, Merge, Find-Free workflows
@@ -211,11 +219,21 @@ The tables above are the elevator pitch. The bullets here are the same surface w
   - Neighbours tab on each device
 
 - 🎯 **Nmap scanner** — on-demand scans from the browser.
-  - Per-IP "Scan with Nmap" launcher
-  - Presets: quick, service-version, OS, default-scripts, UDP top-100, aggressive
-  - Live SSE output streams while the scan runs
-  - Structured XML parsed into a results panel
-  - Standalone `/tools/nmap` page for ad-hoc targets
+  - Per-IP "Scan with Nmap" launcher · per-subnet "Scan with nmap"
+    in the IPAM Tools dropdown (pre-fills CIDR target +
+    `subnet_sweep` preset) · standalone `/tools/nmap` page for
+    ad-hoc targets
+  - Presets: quick, service+version, **service+OS**, OS,
+    default-scripts, **subnet_sweep** (-sn ping sweep capped at
+    /16 worth of hosts), UDP top-100, aggressive, custom
+  - Live SSE output streams while the scan runs; results render
+    single-host or multi-host (CIDR) summaries
+  - **Stamp alive hosts → IPAM** action on a CIDR scan claims
+    responding IPs as `discovered` rows with `last_seen_at` set;
+    `Copy alive IPs` for clipboard handoff
+  - History page with bulk-delete (cancels in-flight scans + drops
+    terminal ones) and a 3-tab right panel (Live / History / Last
+    result) that auto-switches as a scan completes
 
 - 🛰 **Device profiling** — answer "what kind of device is on every IP" without
   asking. Two layers feeding one consolidated panel in the IP detail modal.

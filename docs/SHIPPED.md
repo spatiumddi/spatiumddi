@@ -191,23 +191,45 @@ Mirrors CLAUDE.md's three mixed sections:
   spec for the standard-MIB scope.
 
 - ✅ **Nmap scanner** — on-demand nmap scans against any IPv4 /
-  IPv6 host from the SpatiumDDI host perspective. Two entry
-  points: a per-IP "Scan with Nmap" button on the IPAM IP detail
-  modal, and a standalone `/tools/nmap` page for ad-hoc targets
-  (including IPs that aren't in IPAM yet). Backend: `NmapScan`
-  model + migration `d2f7a91e4c8b`, sanitised argv builder with
-  preset table (quick / service+version / OS fingerprint /
-  default-scripts / UDP top-100 / aggressive / custom), async
-  subprocess runner using `-oN -` on stdout for the live SSE
-  viewer + `-oX <tmpfile>` in parallel for structured XML
-  parsing, Celery task on the `default` queue, and the SSE
-  endpoint at `GET /api/v1/nmap/scans/{id}/stream`. SSE auth
-  uses `?token=<...>` because EventSource can't set Authorization
+  IPv6 host or **CIDR** from the SpatiumDDI host perspective.
+  Three entry points: a per-IP "Scan with Nmap" button on the
+  IPAM IP detail modal, a per-subnet "Scan with nmap" entry in
+  the IPAM Tools dropdown (pre-fills target = subnet CIDR +
+  preset = `subnet_sweep`), and a standalone `/tools/nmap` page
+  for ad-hoc targets (including IPs that aren't in IPAM yet).
+  Backend: `NmapScan` model + migration `d2f7a91e4c8b`,
+  sanitised argv builder with preset table (quick /
+  service+version / **service_and_os** / OS fingerprint /
+  **subnet_sweep** / default-scripts / UDP top-100 / aggressive
+  / custom), CIDR-aware target validation
+  (`ipaddress.ip_network(strict=False)`, capped at /16 worth of
+  hosts), async subprocess runner using `-oN -` on stdout for
+  the live SSE viewer + `-oX <tmpfile>` in parallel for
+  structured XML parsing. The XML parser walks every `<host>`
+  element and emits a `hosts[]` list when more than one
+  responded — single-host fields stay populated for backward
+  compat. Celery task on the `default` queue, SSE endpoint at
+  `GET /api/v1/nmap/scans/{id}/stream`. SSE auth uses
+  `?token=<...>` because EventSource can't set Authorization
   headers; the router has no global `Depends(get_current_user)`
   because that would 401 before the query-token resolver runs
-  (each non-SSE endpoint declares its own permission dep). New
-  `manage_nmap_scans` permission seeded into the existing
-  Network Editor builtin role. nmap installed in the api image.
+  (each non-SSE endpoint declares its own permission dep).
+  Bulk operations on the history surface:
+  `POST /nmap/scans/bulk-delete` (cap 500; per-row policy
+  cancels queued/running scans + deletes terminal ones in one
+  transaction) and
+  `POST /nmap/scans/{id}/stamp-discovered` (claims alive hosts
+  from a CIDR scan as `discovered` IPAM rows + stamps
+  `last_seen_at` via nmap; integration-owned rows just bump the
+  timestamp without changing status). `NmapToolsPage` rewritten
+  as a 3-tab right panel (Live / History / Last result) that
+  auto-switches Live → Last result on completion; History tab
+  has a checkbox column + amber bulk-delete toolbar.
+  `NmapResultPanel` renders both single-host and multi-host
+  (CIDR) scans with "Copy alive IPs" + "Stamp alive hosts →
+  IPAM" actions. New `manage_nmap_scans` permission seeded
+  into the existing Network Editor builtin role. nmap installed
+  in the api image.
   **Deferred follow-ups:**
   - **Trigger pipeline** — auto-scan on ARP/SNMP discovery (the
     `auto_create_discovered=True` path) and alert-rule-driven
@@ -1437,4 +1459,93 @@ Mirrors CLAUDE.md's three mixed sections:
   randomised MACs each look like a fresh device — by design
   in Phase 2; revisit when MAC-hashing-aware grouping is
   scoped).
+
+- ✅ **IPAM bulk allocate + table polish** (2026-04-30, post
+  device profiling). Five-item polish wave on the IPAM IP table
+  surface that landed alongside the device-profiling work.
+  - **Bulk allocate.** New
+    `POST /ipam/subnets/{id}/bulk-allocate/{preview,commit}`
+    pair stamps a contiguous IP range plus a name template in
+    one transaction. Template language: `{n}` iterator,
+    `{n:03d}` zero-pad, `{n:x}` / `{n:X}` hex, `{oct1}`–
+    `{oct4}` IPv4 octets — anything else literal. Capped at
+    1024 IPs per call; preview returns counts plus a
+    first-5/last-2 sample of rendered hostnames; commit runs
+    under a `FOR UPDATE` subnet lock and applies per-row
+    conflict detection (already-allocated, dynamic-DHCP-pool
+    membership, hostname+zone collisions including
+    within-batch duplicates). `on_collision: skip | abort`
+    chooses whether conflicts skip or refuse the whole batch.
+    Per-row audit + one summary `bulk_allocate` audit at the
+    subnet level. `BulkAllocateModal` lives first in the IPAM
+    Tools dropdown (alphabetical) with a three-phase form →
+    preview → committed flow and a live client-side template
+    preview that mirrors the backend `_BULK_TEMPLATE_RE` regex
+    so the operator sees rendered hostnames as they type.
+  - **IPAM Tools dropdown.** Subnet header collapsed from 9
+    buttons to 6 by folding Resize / Split / Merge / Clean
+    Orphans + the new "Scan with nmap" + "Bulk allocate…" into
+    one `[Tools ▾]` menu (alphabetised). Standard IPAM-style
+    outside-click handler; mirrors the existing `[Sync ▾]` and
+    `[Import / Export ▾]` patterns.
+  - **"Seen" recency column.** New `SeenDot` component renders
+    a 4-state coloured dot derived from
+    `IPAddress.last_seen_at`: alive (<24h) green, stale
+    (24h–7d) amber, cold (>7d) red, never grey. Source method
+    (`via dhcp` / `via nmap` / `via snmp` / `via arp` / etc.)
+    sits in the tooltip. Orthogonal to lifecycle status — an
+    `allocated` IP can be down, a `discovered` IP can be live.
+    Same dot also sits next to the status pill in
+    `IPDetailModal`. Companion: `discovered` added to
+    `IP_STATUSES_INTEGRATION_OWNED` so `Stamp alive hosts →
+    IPAM` writes integration-owned rows the operator can
+    transition by editing.
+  - **Sticky thead, finally.** The IP table's `<thead>` is
+    `sticky top-0 bg-card` so column headers stay visible
+    while scrolling long IP lists. The earlier landing
+    silently failed in Chrome because an inner
+    `<div className="overflow-x-auto">` wrapper around the
+    `<table>` was establishing a Y-scroll context per CSS
+    spec (`overflow-x: auto` with `overflow-y: visible`
+    computes to `overflow-y: auto` automatically), which
+    anchored the head's sticky context to a non-scrolling
+    intermediate parent. Removed the wrapper so sticky
+    resolves to the outer `flex-1 overflow-auto` scroll
+    container; horizontal overflow now happens at that level
+    too (the table's `min-w-[640px]` still triggers x-scroll
+    on narrow viewports).
+  - **Shift-click range select on IP checkboxes.** `onChange`
+    doesn't carry `shiftKey` so we stash the modifier state in
+    `onClick` (which fires first) plus the previously-clicked
+    id, then the change handler walks the IP-only ordered list
+    from `tableRows` (display order — survives sort changes)
+    between the two endpoints and toggles every selectable row
+    to the new state. Standard Gmail-style multi-select.
+  - **Free-IP gap markers.** New `kind: "gap"` row variant
+    rendered as a slim half-height row with a dashed emerald
+    border (`192.168.0.11 · 1 free` for single-IP gaps,
+    `.11 – .13 · 3 free` for ranges). Inserted between
+    non-adjacent IP rows during the same build loop that
+    interleaves DHCP pool boundary markers. Suppressed when a
+    pool boundary just got emitted (the boundary already shows
+    the discontinuity) and when the gap falls fully inside a
+    dynamic DHCP pool (those slots are owned by the DHCP
+    server, not operator-allocatable). Heads-up for "you
+    deleted something and might have missed the hole" — easy
+    to miss otherwise.
+
+  **Two debug fixes caught during testing:** (1) The
+  module-level `_BULK_ALLOWED_STATUSES` constant collided with
+  the existing subnet-bulk-edit name; Python's silent rebind
+  meant the IPAddress-status validator was reading the subnet
+  status set (`active / deprecated / quarantine / reserved`)
+  at request time. Renamed the new one to
+  `_BULK_ALLOC_ALLOWED_STATUSES`. (2) `BulkAllocateRequest.tags`
+  was originally typed `list[str]` but `IPAddress.tags` is a
+  JSONB **dict** (matching the rest of IPAM); 11 bulk-allocated
+  rows landed with `tags=[]` and broke `GET /addresses`
+  response validation for the whole subnet. Schema corrected to
+  `dict[str, Any]` (frontend type `Record<string, unknown>`),
+  broken rows repaired with
+  `UPDATE ip_address SET tags = '{}'::jsonb WHERE jsonb_typeof(tags) = 'array'`.
 
