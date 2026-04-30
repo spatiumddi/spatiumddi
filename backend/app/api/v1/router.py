@@ -32,6 +32,7 @@ from app.api.v1.tailscale import router as tailscale_router
 from app.api.v1.users.router import router as users_router
 from app.api.v1.version import router as version_router
 from app.api.v1.vlans.router import router as vlans_router
+from app.api.v1.webhooks import router as webhooks_router
 
 api_v1_router = APIRouter()
 
@@ -69,3 +70,4 @@ api_v1_router.include_router(nmap_router, prefix="/nmap", tags=["nmap"])
 api_v1_router.include_router(trash_router, prefix="/admin", tags=["admin-trash"])
 api_v1_router.include_router(postgres_router, prefix="/admin", tags=["admin-postgres"])
 api_v1_router.include_router(containers_router, prefix="/admin", tags=["admin-containers"])
+api_v1_router.include_router(webhooks_router, prefix="/webhooks", tags=["webhooks"])

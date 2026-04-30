@@ -33,6 +33,7 @@ import {
   Trash2,
   Search,
   Calculator,
+  Webhook,
   Workflow,
   X,
 } from "lucide-react";
@@ -74,6 +75,7 @@ const adminPlatformNav = [
   { label: "Platform Insights", icon: Cpu, to: "/admin/platform-insights" },
   { label: "Settings", icon: Settings, to: "/settings" },
   { label: "Trash", icon: Trash2, to: "/admin/trash" },
+  { label: "Webhooks", icon: Webhook, to: "/admin/webhooks" },
 ];
 
 function NavSection({

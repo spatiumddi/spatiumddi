@@ -18,7 +18,10 @@ from app.metrics import PrometheusMiddleware, metrics_endpoint
 # that forwards audit events to syslog + webhook targets. Must run at app
 # startup so the listener is attached before any request handler writes
 # an AuditLog row.
-from app.services import audit_forward  # noqa: F401
+from app.services import (
+    audit_forward,  # noqa: F401
+    event_publisher,  # noqa: F401
+)
 
 logger = structlog.get_logger(__name__)
 

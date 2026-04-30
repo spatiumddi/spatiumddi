@@ -4139,6 +4139,90 @@ export const alertsApi = {
     api.post<AlertEvaluateResult>("/alerts/evaluate").then((r) => r.data),
 };
 
+// ── Webhooks (typed-event subscriptions) ────────────────────────────────────
+
+export interface WebhookSubscription {
+  id: string;
+  name: string;
+  description: string;
+  enabled: boolean;
+  url: string;
+  // Server-side bool — the secret itself is Fernet-encrypted at rest
+  // and only ever returned in plaintext from the create / update
+  // response when one was newly assigned (``secret_plaintext``).
+  secret_set: boolean;
+  event_types: string[] | null;
+  headers: Record<string, string> | null;
+  timeout_seconds: number;
+  max_attempts: number;
+  created_at: string;
+  modified_at: string;
+  // Populated only on the create response (and on update when the
+  // operator supplied a new value). Surface to the operator once,
+  // then drop.
+  secret_plaintext?: string | null;
+}
+
+export interface WebhookSubscriptionWrite {
+  name: string;
+  description?: string;
+  enabled: boolean;
+  url: string;
+  // ``null`` on edit = keep existing, ``""`` = clear, anything else =
+  // sent in plaintext + encrypted server-side.
+  secret?: string | null;
+  event_types?: string[] | null;
+  headers?: Record<string, string> | null;
+  timeout_seconds?: number;
+  max_attempts?: number;
+}
+
+export interface WebhookDelivery {
+  id: string;
+  subscription_id: string;
+  event_type: string;
+  state: "pending" | "in_flight" | "delivered" | "failed" | "dead";
+  attempts: number;
+  next_attempt_at: string;
+  last_error: string | null;
+  last_status_code: number | null;
+  delivered_at: string | null;
+  created_at: string;
+}
+
+export interface WebhookTestResult {
+  status: "ok" | "error";
+  status_code: number | null;
+  error: string | null;
+}
+
+export const webhooksApi = {
+  listEventTypes: () =>
+    api
+      .get<{ event_types: string[] }>("/webhooks/event-types")
+      .then((r) => r.data.event_types),
+  list: () => api.get<WebhookSubscription[]>("/webhooks").then((r) => r.data),
+  get: (id: string) =>
+    api.get<WebhookSubscription>(`/webhooks/${id}`).then((r) => r.data),
+  create: (body: WebhookSubscriptionWrite) =>
+    api.post<WebhookSubscription>("/webhooks", body).then((r) => r.data),
+  update: (id: string, body: WebhookSubscriptionWrite) =>
+    api.put<WebhookSubscription>(`/webhooks/${id}`, body).then((r) => r.data),
+  delete: (id: string) => api.delete(`/webhooks/${id}`),
+  test: (id: string) =>
+    api.post<WebhookTestResult>(`/webhooks/${id}/test`).then((r) => r.data),
+  listDeliveries: (id: string, limit = 100) =>
+    api
+      .get<WebhookDelivery[]>(`/webhooks/${id}/deliveries`, {
+        params: { limit },
+      })
+      .then((r) => r.data),
+  retryDelivery: (deliveryId: string) =>
+    api
+      .post<WebhookDelivery>(`/webhooks/deliveries/${deliveryId}/retry`)
+      .then((r) => r.data),
+};
+
 export type MetricsWindow = "1h" | "6h" | "24h" | "7d";
 
 export interface DNSMetricsPoint {

@@ -31,6 +31,7 @@ import { AuthProvidersPage } from "@/pages/admin/AuthProvidersPage";
 import { GroupsPage } from "@/pages/admin/GroupsPage";
 import { RolesPage } from "@/pages/admin/RolesPage";
 import { TrashPage } from "@/pages/admin/TrashPage";
+import { WebhooksPage } from "@/pages/admin/WebhooksPage";
 import { PlatformInsightsPage } from "@/pages/admin/PlatformInsightsPage";
 import { SettingsPage } from "@/pages/SettingsPage";
 import { useAuth } from "@/hooks/useAuth";
@@ -81,6 +82,7 @@ export default function App() {
         <Route path="admin/auth-providers" element={<AuthProvidersPage />} />
         <Route path="admin/api-tokens" element={<ApiTokensPage />} />
         <Route path="admin/alerts" element={<AlertsPage />} />
+        <Route path="admin/webhooks" element={<WebhooksPage />} />
         <Route path="admin/trash" element={<TrashPage />} />
         <Route
           path="admin/platform-insights"

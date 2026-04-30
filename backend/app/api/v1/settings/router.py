@@ -497,18 +497,14 @@ class AuditTargetBody(BaseModel):
     @classmethod
     def _valid_flavor(cls, v: str) -> str:
         if v not in _VALID_WEBHOOK_FLAVORS:
-            raise ValueError(
-                f"webhook_flavor must be one of {sorted(_VALID_WEBHOOK_FLAVORS)}"
-            )
+            raise ValueError(f"webhook_flavor must be one of {sorted(_VALID_WEBHOOK_FLAVORS)}")
         return v
 
     @field_validator("smtp_security")
     @classmethod
     def _valid_smtp_security(cls, v: str) -> str:
         if v not in _VALID_SMTP_SECURITY:
-            raise ValueError(
-                f"smtp_security must be one of {sorted(_VALID_SMTP_SECURITY)}"
-            )
+            raise ValueError(f"smtp_security must be one of {sorted(_VALID_SMTP_SECURITY)}")
         return v
 
     @field_validator("min_severity")
@@ -607,9 +603,7 @@ def _apply_body(t: AuditForwardTarget, body: AuditTargetBody) -> None:
     # value alone (operator editing other fields), ``""`` = clear,
     # anything else = encrypt + replace.
     if body.smtp_password is not None:
-        t.smtp_password_encrypted = (
-            encrypt_str(body.smtp_password) if body.smtp_password else None
-        )
+        t.smtp_password_encrypted = encrypt_str(body.smtp_password) if body.smtp_password else None
     t.min_severity = body.min_severity
     t.resource_types = body.resource_types
 

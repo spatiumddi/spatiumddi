@@ -630,7 +630,7 @@ async def _deliver_to_target(target: dict[str, Any], payload: dict[str, Any]) ->
                     target=target.get("name"),
                 )
                 return
-            subject, body = _smtp_subject_body(payload)
+            subject, email_body = _smtp_subject_body(payload)
             await _send_smtp(
                 target["smtp_host"],
                 int(target.get("smtp_port", 587)),
@@ -640,7 +640,7 @@ async def _deliver_to_target(target: dict[str, Any], payload: dict[str, Any]) ->
                 target["smtp_from_address"],
                 list(to_addrs),
                 subject,
-                body,
+                email_body,
                 reply_to=target.get("smtp_reply_to") or None,
             )
     except Exception as exc:  # noqa: BLE001

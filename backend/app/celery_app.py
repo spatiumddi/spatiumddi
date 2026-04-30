@@ -33,6 +33,7 @@ celery_app = Celery(
         "app.tasks.nmap",
         "app.tasks.dns_pool_healthcheck",
         "app.tasks.dhcp_fingerprint",
+        "app.tasks.event_outbox",
     ],
 )
 
@@ -78,6 +79,7 @@ celery_app.conf.update(
         "app.tasks.nmap.*": {"queue": "default"},
         "app.tasks.dns_pool_healthcheck.*": {"queue": "dns"},
         "app.tasks.dhcp_fingerprint.*": {"queue": "dhcp"},
+        "app.tasks.event_outbox.*": {"queue": "default"},
     },
     beat_schedule={
         # Every 60s, fan-out health checks to every registered DNS server.
@@ -142,6 +144,16 @@ celery_app.conf.update(
         "alerts-evaluate": {
             "task": "app.tasks.alerts.evaluate_alerts",
             "schedule": schedule(run_every=60.0),
+        },
+        # Every 10 s, drain the typed-event outbox (webhooks). Uses
+        # ``SELECT … FOR UPDATE SKIP LOCKED`` so multiple workers can
+        # cooperate without double-delivery; idempotent on its own.
+        # Cadence is hardcoded — no operator knob — because the
+        # outbox is per-event so a slow tick just defers individual
+        # deliveries, it doesn't batch up the world.
+        "event-outbox-drain": {
+            "task": "app.tasks.event_outbox.process_event_outbox",
+            "schedule": schedule(run_every=10.0),
         },
         # Every hour, tick the IEEE OUI refresh. Opt-in feature — the
         # task itself checks ``PlatformSettings.oui_lookup_enabled`` and

@@ -35,6 +35,7 @@ from app.models.dns import (
     DNSZone,
 )
 from app.models.docker import DockerHost
+from app.models.event_subscription import EventOutbox, EventSubscription
 from app.models.ipam import (
     CustomFieldDefinition,
     IPAddress,
@@ -132,4 +133,6 @@ __all__ = [
     "NetworkFdbEntry",
     "NetworkNeighbour",
     "NmapScan",
+    "EventSubscription",
+    "EventOutbox",
 ]
