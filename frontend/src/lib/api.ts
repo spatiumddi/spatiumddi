@@ -845,6 +845,54 @@ export interface MergeSubnetCommitResponse {
   summary: string[];
 }
 
+// ── Bulk allocate (subnet-level) ──────────────────────────────────────────
+//
+// Stamp a contiguous IP range with name templating in one shot. Token
+// language is mirrored client-side in BulkAllocateModal for live preview;
+// keep the regex in sync with the backend `_BULK_TEMPLATE_RE`.
+
+export interface BulkAllocateItem {
+  address: string;
+  hostname: string;
+  fqdn: string | null;
+  in_use: boolean;
+  in_dynamic_pool: boolean;
+  fqdn_collision: boolean;
+}
+
+export interface BulkAllocateRequest {
+  range_start: string;
+  range_end: string;
+  hostname_template: string;
+  template_start?: number;
+  status?: string;
+  description?: string | null;
+  dns_zone_id?: string | null;
+  create_dns_records?: boolean;
+  on_collision?: "skip" | "abort";
+  tags?: Record<string, unknown>;
+  custom_fields?: Record<string, unknown>;
+}
+
+export interface BulkAllocatePreviewResponse {
+  total: number;
+  will_create: number;
+  conflicts_in_use: number;
+  conflicts_in_pool: number;
+  conflicts_fqdn: number;
+  sample: BulkAllocateItem[];
+  warnings: string[];
+}
+
+export interface BulkAllocateCommitResponse {
+  created: number;
+  skipped_in_use: number;
+  skipped_in_pool: number;
+  skipped_fqdn_collision: number;
+  sample_created: string[];
+  summary: string[];
+}
+
 export const ipamApi = {
   listSpaces: () => api.get<IPSpace[]>("/ipam/spaces").then((r) => r.data),
   getSpace: (id: string) =>
@@ -1041,6 +1089,21 @@ export const ipamApi = {
     api
       .post<MergeSubnetCommitResponse>(
         `/ipam/subnets/${subnetId}/merge/commit`,
+        body,
+      )
+      .then((r) => r.data),
+
+  bulkAllocatePreview: (subnetId: string, body: BulkAllocateRequest) =>
+    api
+      .post<BulkAllocatePreviewResponse>(
+        `/ipam/subnets/${subnetId}/bulk-allocate/preview`,
+        body,
+      )
+      .then((r) => r.data),
+  bulkAllocateCommit: (subnetId: string, body: BulkAllocateRequest) =>
+    api
+      .post<BulkAllocateCommitResponse>(
+        `/ipam/subnets/${subnetId}/bulk-allocate`,
         body,
       )
       .then((r) => r.data),

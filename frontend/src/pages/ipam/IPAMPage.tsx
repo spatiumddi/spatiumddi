@@ -89,6 +89,7 @@ import {
   useNetworkContext,
 } from "./IPNetworkTab";
 import { NmapScanModal } from "@/pages/nmap/NmapScanModal";
+import { BulkAllocateModal } from "./BulkAllocateModal";
 import { IPDetailModal } from "./IPDetailModal";
 import { SeenDot } from "./SeenDot";
 import {
@@ -2841,12 +2842,14 @@ function SyncMenu({
 // operators don't have to scan a custom ordering. Closes on outside click via
 // a mousedown listener (same pattern as SyncMenu above).
 function ToolsMenu({
+  onBulkAllocate,
   onCleanOrphans,
   onMerge,
   onResize,
   onScan,
   onSplit,
 }: {
+  onBulkAllocate: () => void;
   onCleanOrphans: () => void;
   onMerge: () => void;
   onResize: () => void;
@@ -2884,6 +2887,16 @@ function ToolsMenu({
       </button>
       {open && (
         <div className="absolute right-0 z-20 mt-1 w-52 overflow-hidden rounded-md border bg-popover shadow-md">
+          <button
+            type="button"
+            onClick={() => {
+              setOpen(false);
+              onBulkAllocate();
+            }}
+            className={itemCls}
+          >
+            <Layers className="h-3.5 w-3.5" /> Bulk allocate…
+          </button>
           <button
             type="button"
             onClick={() => {
@@ -2953,6 +2966,15 @@ function ipStringToInt(ip: string): number {
   return ((p[0] << 24) | (p[1] << 16) | (p[2] << 8) | p[3]) >>> 0;
 }
 
+function intToIpv4(n: number): string {
+  return [
+    (n >>> 24) & 0xff,
+    (n >>> 16) & 0xff,
+    (n >>> 8) & 0xff,
+    n & 0xff,
+  ].join(".");
+}
+
 type PoolMeta = {
   id: string;
   name: string;
@@ -2969,6 +2991,16 @@ type AddressOrPoolRow =
       kind: "pool-boundary";
       pool: PoolMeta;
       boundary: "start" | "end";
+    }
+  // Visual marker between two non-adjacent IPAM rows (eg .10 and .12,
+  // showing .11 is unallocated). Subtle by design — it's a heads-up
+  // for "you deleted something and might have missed the hole", not
+  // a primary navigation aid. Skipped inside dynamic DHCP pools where
+  // gaps are owned by the DHCP server and aren't operator-allocatable.
+  | {
+      kind: "gap";
+      startIpInt: number;
+      endIpInt: number;
     };
 
 // ─── Subnet Detail Panel (right pane) ────────────────────────────────────────
@@ -3004,6 +3036,8 @@ function SubnetDetail({
   // existing NmapScanModal with the subnet CIDR + subnet_sweep preset
   // pre-filled so the operator just hits "Start scan".
   const [showSubnetScan, setShowSubnetScan] = useState(false);
+  // Bulk-allocate (range + name template) from the Tools menu.
+  const [showBulkAllocate, setShowBulkAllocate] = useState(false);
   const [showDnsSync, setShowDnsSync] = useState(false);
   const [showDhcpSync, setShowDhcpSync] = useState(false);
   const [showSyncAll, setShowSyncAll] = useState(false);
@@ -3033,6 +3067,12 @@ function SubnetDetail({
   >("addresses");
   const [natModalIp, setNatModalIp] = useState<IPAddress | null>(null);
   const [selectedIpIds, setSelectedIpIds] = useState<Set<string>>(new Set());
+  // Shift-click range select. ``onChange`` doesn't carry shiftKey, so we
+  // stash both the modifier state (set in ``onClick`` which fires first)
+  // and the previously-clicked id, then read both from ``onChange`` to
+  // do range vs. single toggle. Cleared after each toggle.
+  const lastClickedIpIdRef = useRef<string | null>(null);
+  const shiftDownAtClickRef = useRef(false);
   const [showBulkEdit, setShowBulkEdit] = useState(false);
   const [showBulkDelete, setShowBulkDelete] = useState(false);
 
@@ -3268,15 +3308,41 @@ function SubnetDetail({
       }
     };
 
+    // Helper for the gap detector: a gap fully inside a dynamic pool
+    // is suppressed because those slots belong to the DHCP server, not
+    // to IPAM allocation. Reserved/excluded pools still surface gaps
+    // since the operator can manually allocate inside them.
+    const gapInsideDynamicPool = (s: number, e: number) =>
+      sortedPools.some(
+        (p) => p.pool_type === "dynamic" && p._start <= s && e <= p._end,
+      );
+
+    let prevIpInt: number | null = null;
     for (const addr of filteredAddresses) {
       const ipInt = ipStringToInt(String(addr.address));
       if (!Number.isFinite(ipInt)) {
         rows.push({ kind: "ip", addr });
+        prevIpInt = null;
         continue;
       }
       emitStarts(ipInt);
       emitEnds(ipInt);
+
+      // Gap detection between the previous IP and this one. Skipped
+      // when a pool boundary just got emitted (the boundary already
+      // signals the discontinuity) or when the gap falls inside a
+      // dynamic pool (DHCP-owned, not operator-allocatable).
+      if (prevIpInt !== null && ipInt - prevIpInt > 1) {
+        const lastWasPool = rows[rows.length - 1]?.kind === "pool-boundary";
+        const gapStart = prevIpInt + 1;
+        const gapEnd = ipInt - 1;
+        if (!lastWasPool && !gapInsideDynamicPool(gapStart, gapEnd)) {
+          rows.push({ kind: "gap", startIpInt: gapStart, endIpInt: gapEnd });
+        }
+      }
+
       rows.push({ kind: "ip", addr });
+      prevIpInt = ipInt;
     }
     // Close out any pools still open, then emit markers for pools that
     // sit entirely past the last assigned IP so the range is still
@@ -3417,6 +3483,7 @@ function SubnetDetail({
               }}
             />
             <ToolsMenu
+              onBulkAllocate={() => setShowBulkAllocate(true)}
               onCleanOrphans={() => setShowOrphans(true)}
               onMerge={() => setShowMergeSubnet(true)}
               onResize={() => setShowResizeSubnet(true)}
@@ -3670,49 +3737,134 @@ function SubnetDetail({
             </div>
           ) : (
             <>
-              <div className="overflow-x-auto">
-                <table className="w-full min-w-[640px] text-sm">
-                  {/* Sticky header — pinned to the parent
+              {/* No nested overflow wrapper — Chrome/WebKit treat
+                  ``overflow-x: auto`` as establishing a Y-scroll
+                  context too (CSS spec: paired axis can't be
+                  ``visible`` when the other isn't), which would
+                  defeat the sticky thead by anchoring it to a
+                  non-scrolling intermediate parent. The outer
+                  ``flex-1 overflow-auto`` handles both axes. */}
+              <table className="w-full min-w-[640px] text-sm">
+                {/* Sticky header — pinned to the parent
                       ``flex-1 overflow-auto`` scroll container so the
                       column headers stay visible while scrolling a
                       long IP list. ``bg-card`` is an opaque base so
                       the muted overlay on the <tr> doesn't let body
                       rows bleed through as the user scrolls. */}
-                  <thead className="sticky top-0 z-10 bg-card">
-                    <tr className="border-b bg-muted/40 text-xs">
-                      <th className="w-8 px-2 py-2">
-                        {(() => {
-                          const selectable = (filteredAddresses ?? []).filter(
-                            (a: IPAddress) =>
-                              a.status !== "network" &&
-                              a.status !== "broadcast" &&
-                              !a.auto_from_lease,
+                <thead className="sticky top-0 z-10 bg-card">
+                  <tr className="border-b bg-muted/40 text-xs">
+                    <th className="w-8 px-2 py-2">
+                      {(() => {
+                        const selectable = (filteredAddresses ?? []).filter(
+                          (a: IPAddress) =>
+                            a.status !== "network" &&
+                            a.status !== "broadcast" &&
+                            !a.auto_from_lease,
+                        );
+                        const allSelected =
+                          selectable.length > 0 &&
+                          selectable.every((a: IPAddress) =>
+                            selectedIpIds.has(a.id),
                           );
-                          const allSelected =
-                            selectable.length > 0 &&
-                            selectable.every((a: IPAddress) =>
-                              selectedIpIds.has(a.id),
-                            );
-                          return (
-                            <input
-                              type="checkbox"
-                              checked={allSelected}
-                              aria-label="Select all"
-                              onChange={(e) => {
-                                if (e.target.checked) {
-                                  setSelectedIpIds(
-                                    new Set(
-                                      selectable.map((a: IPAddress) => a.id),
-                                    ),
-                                  );
-                                } else {
-                                  setSelectedIpIds(new Set());
-                                }
-                              }}
-                            />
-                          );
-                        })()}
-                      </th>
+                        return (
+                          <input
+                            type="checkbox"
+                            checked={allSelected}
+                            aria-label="Select all"
+                            onChange={(e) => {
+                              if (e.target.checked) {
+                                setSelectedIpIds(
+                                  new Set(
+                                    selectable.map((a: IPAddress) => a.id),
+                                  ),
+                                );
+                              } else {
+                                setSelectedIpIds(new Set());
+                              }
+                            }}
+                          />
+                        );
+                      })()}
+                    </th>
+                    {(
+                      [
+                        "address",
+                        "hostname",
+                        "mac",
+                        "description",
+                        "tags",
+                        "status",
+                        "pool",
+                        "dns",
+                      ] as const
+                    ).map((col) => {
+                      const label =
+                        col === "mac"
+                          ? "MAC"
+                          : col === "dns"
+                            ? "DNS"
+                            : col === "pool"
+                              ? "DHCP Pool"
+                              : col;
+                      return (
+                        <th
+                          key={col}
+                          className="px-4 py-2 text-left font-medium"
+                        >
+                          <span className="inline-flex items-center gap-1">
+                            <span className="capitalize">{label}</span>
+                            <button
+                              onClick={() => setShowFilters((v) => !v)}
+                              title={`Filter by ${label}`}
+                              className={cn(
+                                "rounded p-0.5 hover:bg-accent",
+                                colFilters[col]
+                                  ? "text-primary"
+                                  : showFilters
+                                    ? "text-primary/40"
+                                    : "text-muted-foreground/30 hover:text-muted-foreground",
+                              )}
+                            >
+                              <Filter className="h-2.5 w-2.5" />
+                            </button>
+                          </span>
+                        </th>
+                      );
+                    })}
+                    <th
+                      className="px-4 py-2 text-center font-medium"
+                      title="Alive: green = seen <24h, amber = 24h–7d, red = >7d, grey = never"
+                    >
+                      Seen
+                    </th>
+                    <th className="px-4 py-2 text-left font-medium">Network</th>
+                    <th className="px-4 py-2 text-right">
+                      {hasActiveFilter && (
+                        <button
+                          onClick={() => {
+                            setColFilters({
+                              address: "",
+                              hostname: "",
+                              mac: "",
+                              description: "",
+                              tags: "",
+                              status: "",
+                              dns: "",
+                              pool: "",
+                            });
+                            setFilterModes({});
+                          }}
+                          title="Clear all filters"
+                          className="rounded p-0.5 text-primary hover:text-destructive"
+                        >
+                          <X className="h-3 w-3" />
+                        </button>
+                      )}
+                    </th>
+                  </tr>
+                  {showFilters && (
+                    <tr className="border-b bg-muted/10 text-xs">
+                      <td />
                       {(
                         [
                           "address",
@@ -3724,639 +3876,615 @@ function SubnetDetail({
                           "pool",
                           "dns",
                         ] as const
-                      ).map((col) => {
-                        const label =
-                          col === "mac"
-                            ? "MAC"
-                            : col === "dns"
-                              ? "DNS"
-                              : col === "pool"
-                                ? "DHCP Pool"
-                                : col;
-                        return (
-                          <th
-                            key={col}
-                            className="px-4 py-2 text-left font-medium"
-                          >
-                            <span className="inline-flex items-center gap-1">
-                              <span className="capitalize">{label}</span>
-                              <button
-                                onClick={() => setShowFilters((v) => !v)}
-                                title={`Filter by ${label}`}
-                                className={cn(
-                                  "rounded p-0.5 hover:bg-accent",
-                                  colFilters[col]
-                                    ? "text-primary"
-                                    : showFilters
-                                      ? "text-primary/40"
-                                      : "text-muted-foreground/30 hover:text-muted-foreground",
-                                )}
-                              >
-                                <Filter className="h-2.5 w-2.5" />
-                              </button>
-                            </span>
-                          </th>
-                        );
-                      })}
-                      <th
-                        className="px-4 py-2 text-center font-medium"
-                        title="Alive: green = seen <24h, amber = 24h–7d, red = >7d, grey = never"
-                      >
-                        Seen
-                      </th>
-                      <th className="px-4 py-2 text-left font-medium">
-                        Network
-                      </th>
-                      <th className="px-4 py-2 text-right">
-                        {hasActiveFilter && (
-                          <button
-                            onClick={() => {
-                              setColFilters({
-                                address: "",
-                                hostname: "",
-                                mac: "",
-                                description: "",
-                                tags: "",
-                                status: "",
-                                dns: "",
-                                pool: "",
-                              });
-                              setFilterModes({});
-                            }}
-                            title="Clear all filters"
-                            className="rounded p-0.5 text-primary hover:text-destructive"
-                          >
-                            <X className="h-3 w-3" />
-                          </button>
-                        )}
-                      </th>
-                    </tr>
-                    {showFilters && (
-                      <tr className="border-b bg-muted/10 text-xs">
-                        <td />
-                        {(
-                          [
-                            "address",
-                            "hostname",
-                            "mac",
-                            "description",
-                            "tags",
-                            "status",
-                            "pool",
-                            "dns",
-                          ] as const
-                        ).map((col) => (
-                          <td key={col} className="px-2 py-1">
-                            {col === "status" ? (
-                              <select
-                                value={colFilters.status}
-                                onChange={(e) =>
-                                  setColFilters((p) => ({
-                                    ...p,
-                                    status: e.target.value,
-                                  }))
-                                }
-                                className="w-full rounded border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
-                              >
-                                <option value="">All</option>
-                                {[
-                                  "allocated",
-                                  "available",
-                                  "reserved",
-                                  "dhcp",
-                                  "static_dhcp",
-                                  "network",
-                                  "broadcast",
-                                  "orphan",
-                                ].map((s) => (
-                                  <option key={s} value={s}>
-                                    {s}
-                                  </option>
-                                ))}
-                              </select>
-                            ) : col === "dns" ? (
-                              <select
-                                value={colFilters.dns}
-                                onChange={(e) =>
-                                  setColFilters((p) => ({
-                                    ...p,
-                                    dns: e.target.value,
-                                  }))
-                                }
-                                className="w-full rounded border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
-                              >
-                                <option value="">All</option>
-                                <option value="in-sync">In sync</option>
-                                <option value="out-of-sync">Out of sync</option>
-                                <option value="n/a">N/A</option>
-                              </select>
-                            ) : (
-                              <div className="flex items-center">
-                                <input
-                                  type="text"
-                                  value={colFilters[col]}
-                                  onChange={(e) =>
-                                    setColFilters((p) => ({
-                                      ...p,
-                                      [col]: e.target.value,
-                                    }))
-                                  }
-                                  placeholder="Filter…"
-                                  className="w-full min-w-0 rounded-l border border-r-0 bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
-                                />
-                                <div className="relative">
-                                  <button
-                                    type="button"
-                                    onClick={() =>
-                                      setOpenFilterMenu(
-                                        openFilterMenu === col ? null : col,
-                                      )
-                                    }
-                                    className="rounded-r border bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground hover:bg-accent"
-                                    title="Filter mode"
-                                  >
-                                    {filterModes[col] === "begins"
-                                      ? "^"
-                                      : filterModes[col] === "ends"
-                                        ? "$"
-                                        : filterModes[col] === "regex"
-                                          ? ".*"
-                                          : "⊂"}
-                                  </button>
-                                  {openFilterMenu === col && (
-                                    <div className="absolute left-0 top-full z-30 mt-0.5 w-32 rounded-md border bg-popover shadow-md">
-                                      {(
-                                        [
-                                          "contains",
-                                          "begins",
-                                          "ends",
-                                          "regex",
-                                        ] as const
-                                      ).map((m) => (
-                                        <button
-                                          key={m}
-                                          type="button"
-                                          onClick={() => {
-                                            setFilterModes((p) => ({
-                                              ...p,
-                                              [col]: m,
-                                            }));
-                                            setOpenFilterMenu(null);
-                                          }}
-                                          className={cn(
-                                            "w-full px-3 py-1.5 text-left text-xs hover:bg-accent",
-                                            filterModes[col] === m &&
-                                              "font-semibold text-primary",
-                                          )}
-                                        >
-                                          {m === "contains"
-                                            ? "⊂ Contains"
-                                            : m === "begins"
-                                              ? "^ Begins"
-                                              : m === "ends"
-                                                ? "$ Ends"
-                                                : ".* Regex"}
-                                        </button>
-                                      ))}
-                                    </div>
-                                  )}
-                                </div>
-                              </div>
-                            )}
-                          </td>
-                        ))}
-                        {/* Network column has no filter input yet — operators
-                            can still filter via the per-device pages. */}
-                        <td />
-                        <td />
-                      </tr>
-                    )}
-                  </thead>
-                  <tbody className={zebraBodyCls}>
-                    {filteredAddresses?.length === 0 && (
-                      <tr>
-                        <td
-                          colSpan={12}
-                          className="px-4 py-6 text-center text-sm text-muted-foreground"
-                        >
-                          No addresses match the active filters.
-                        </td>
-                      </tr>
-                    )}
-                    {tableRows.map((row, rowIdx) => {
-                      if (row.kind === "pool-boundary") {
-                        const pool = row.pool;
-                        const isDynamic = pool.pool_type === "dynamic";
-                        const tint = isDynamic
-                          ? "bg-cyan-500/10 text-cyan-700 dark:text-cyan-300 border-y border-cyan-500/30"
-                          : pool.pool_type === "reserved"
-                            ? "bg-violet-500/10 text-violet-700 dark:text-violet-300 border-y border-violet-500/30"
-                            : "bg-zinc-500/10 text-zinc-700 dark:text-zinc-300 border-y border-zinc-500/30";
-                        const arrow = row.boundary === "start" ? "▼" : "▲";
-                        const label =
-                          row.boundary === "start"
-                            ? `Start of ${pool.pool_type} pool`
-                            : `End of ${pool.pool_type} pool`;
-                        const anchorIp =
-                          row.boundary === "start"
-                            ? pool.start_ip
-                            : pool.end_ip;
-                        return (
-                          <tr key={`pool-${pool.id}-${row.boundary}-${rowIdx}`}>
-                            <td
-                              colSpan={12}
-                              className={cn("px-4 py-1.5", tint)}
+                      ).map((col) => (
+                        <td key={col} className="px-2 py-1">
+                          {col === "status" ? (
+                            <select
+                              value={colFilters.status}
+                              onChange={(e) =>
+                                setColFilters((p) => ({
+                                  ...p,
+                                  status: e.target.value,
+                                }))
+                              }
+                              className="w-full rounded border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
                             >
-                              <span className="mr-2 font-mono text-xs">
-                                {arrow}
+                              <option value="">All</option>
+                              {[
+                                "allocated",
+                                "available",
+                                "reserved",
+                                "dhcp",
+                                "static_dhcp",
+                                "network",
+                                "broadcast",
+                                "orphan",
+                              ].map((s) => (
+                                <option key={s} value={s}>
+                                  {s}
+                                </option>
+                              ))}
+                            </select>
+                          ) : col === "dns" ? (
+                            <select
+                              value={colFilters.dns}
+                              onChange={(e) =>
+                                setColFilters((p) => ({
+                                  ...p,
+                                  dns: e.target.value,
+                                }))
+                              }
+                              className="w-full rounded border bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
+                            >
+                              <option value="">All</option>
+                              <option value="in-sync">In sync</option>
+                              <option value="out-of-sync">Out of sync</option>
+                              <option value="n/a">N/A</option>
+                            </select>
+                          ) : (
+                            <div className="flex items-center">
+                              <input
+                                type="text"
+                                value={colFilters[col]}
+                                onChange={(e) =>
+                                  setColFilters((p) => ({
+                                    ...p,
+                                    [col]: e.target.value,
+                                  }))
+                                }
+                                placeholder="Filter…"
+                                className="w-full min-w-0 rounded-l border border-r-0 bg-background px-1.5 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
+                              />
+                              <div className="relative">
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    setOpenFilterMenu(
+                                      openFilterMenu === col ? null : col,
+                                    )
+                                  }
+                                  className="rounded-r border bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground hover:bg-accent"
+                                  title="Filter mode"
+                                >
+                                  {filterModes[col] === "begins"
+                                    ? "^"
+                                    : filterModes[col] === "ends"
+                                      ? "$"
+                                      : filterModes[col] === "regex"
+                                        ? ".*"
+                                        : "⊂"}
+                                </button>
+                                {openFilterMenu === col && (
+                                  <div className="absolute left-0 top-full z-30 mt-0.5 w-32 rounded-md border bg-popover shadow-md">
+                                    {(
+                                      [
+                                        "contains",
+                                        "begins",
+                                        "ends",
+                                        "regex",
+                                      ] as const
+                                    ).map((m) => (
+                                      <button
+                                        key={m}
+                                        type="button"
+                                        onClick={() => {
+                                          setFilterModes((p) => ({
+                                            ...p,
+                                            [col]: m,
+                                          }));
+                                          setOpenFilterMenu(null);
+                                        }}
+                                        className={cn(
+                                          "w-full px-3 py-1.5 text-left text-xs hover:bg-accent",
+                                          filterModes[col] === m &&
+                                            "font-semibold text-primary",
+                                        )}
+                                      >
+                                        {m === "contains"
+                                          ? "⊂ Contains"
+                                          : m === "begins"
+                                            ? "^ Begins"
+                                            : m === "ends"
+                                              ? "$ Ends"
+                                              : ".* Regex"}
+                                      </button>
+                                    ))}
+                                  </div>
+                                )}
+                              </div>
+                            </div>
+                          )}
+                        </td>
+                      ))}
+                      {/* Network column has no filter input yet — operators
+                            can still filter via the per-device pages. */}
+                      <td />
+                      <td />
+                    </tr>
+                  )}
+                </thead>
+                <tbody className={zebraBodyCls}>
+                  {filteredAddresses?.length === 0 && (
+                    <tr>
+                      <td
+                        colSpan={12}
+                        className="px-4 py-6 text-center text-sm text-muted-foreground"
+                      >
+                        No addresses match the active filters.
+                      </td>
+                    </tr>
+                  )}
+                  {tableRows.map((row, rowIdx) => {
+                    if (row.kind === "pool-boundary") {
+                      const pool = row.pool;
+                      const isDynamic = pool.pool_type === "dynamic";
+                      const tint = isDynamic
+                        ? "bg-cyan-500/10 text-cyan-700 dark:text-cyan-300 border-y border-cyan-500/30"
+                        : pool.pool_type === "reserved"
+                          ? "bg-violet-500/10 text-violet-700 dark:text-violet-300 border-y border-violet-500/30"
+                          : "bg-zinc-500/10 text-zinc-700 dark:text-zinc-300 border-y border-zinc-500/30";
+                      const arrow = row.boundary === "start" ? "▼" : "▲";
+                      const label =
+                        row.boundary === "start"
+                          ? `Start of ${pool.pool_type} pool`
+                          : `End of ${pool.pool_type} pool`;
+                      const anchorIp =
+                        row.boundary === "start" ? pool.start_ip : pool.end_ip;
+                      return (
+                        <tr key={`pool-${pool.id}-${row.boundary}-${rowIdx}`}>
+                          <td colSpan={12} className={cn("px-4 py-1.5", tint)}>
+                            <span className="mr-2 font-mono text-xs">
+                              {arrow}
+                            </span>
+                            <span className="text-xs font-semibold uppercase tracking-wide">
+                              {label}
+                            </span>
+                            {pool.name && (
+                              <span className="ml-2 text-xs">
+                                — {pool.name}
                               </span>
-                              <span className="text-xs font-semibold uppercase tracking-wide">
-                                {label}
-                              </span>
-                              {pool.name && (
-                                <span className="ml-2 text-xs">
-                                  — {pool.name}
-                                </span>
+                            )}
+                            <span className="ml-2 font-mono text-xs opacity-80">
+                              {anchorIp}
+                            </span>
+                            <span className="ml-3 text-[11px] opacity-70">
+                              range {pool.start_ip} – {pool.end_ip}
+                            </span>
+                          </td>
+                        </tr>
+                      );
+                    }
+                    if (row.kind === "gap") {
+                      const count = row.endIpInt - row.startIpInt + 1;
+                      const startIp = intToIpv4(row.startIpInt);
+                      const endIp = intToIpv4(row.endIpInt);
+                      const label =
+                        count === 1 ? startIp : `${startIp} – ${endIp}`;
+                      return (
+                        <tr
+                          key={`gap-${row.startIpInt}-${row.endIpInt}`}
+                          aria-label={`${count} unallocated IP${count === 1 ? "" : "s"} between rows`}
+                        >
+                          <td
+                            colSpan={12}
+                            className="border-y border-dashed border-emerald-400/30 bg-emerald-500/[0.04] px-4 py-0.5 text-[11px] text-emerald-700/80 dark:border-emerald-500/30 dark:text-emerald-300/70"
+                          >
+                            <span className="font-mono">{label}</span>
+                            <span className="ml-2 opacity-70">
+                              · {count} free
+                            </span>
+                          </td>
+                        </tr>
+                      );
+                    }
+                    const addr = row.addr;
+                    const dnsState = ipDnsState(addr);
+                    const systemRow =
+                      addr.status === "network" ||
+                      addr.status === "broadcast" ||
+                      !!addr.auto_from_lease;
+                    const rowSelected = selectedIpIds.has(addr.id);
+                    const canEdit =
+                      !systemRow &&
+                      addr.status !== "orphan" &&
+                      !isReadOnly(addr.status);
+                    return (
+                      <ContextMenu key={addr.id}>
+                        <ContextMenuTrigger asChild>
+                          <tr
+                            ref={registerHighlightRow(addr.id)}
+                            onClick={() => setViewingAddress(addr)}
+                            className={cn(
+                              "group/addr border-b last:border-0 hover:bg-muted/20 cursor-pointer",
+                              (addr.status === "network" ||
+                                addr.status === "broadcast") &&
+                                "opacity-50",
+                              addr.status === "orphan" && "opacity-40",
+                              rowSelected && "bg-primary/5",
+                              isHighlightedRow(addr.id) &&
+                                "spatium-row-highlight",
+                            )}
+                          >
+                            <td
+                              className="w-8 px-2 py-2"
+                              onClick={(e) => e.stopPropagation()}
+                            >
+                              {!systemRow && (
+                                <input
+                                  type="checkbox"
+                                  checked={rowSelected}
+                                  aria-label={`Select ${addr.address}`}
+                                  onClick={(e) => {
+                                    // ``onClick`` fires before ``onChange``
+                                    // and exposes shiftKey; stash it so
+                                    // the change handler can decide
+                                    // single vs. range toggle.
+                                    shiftDownAtClickRef.current = e.shiftKey;
+                                  }}
+                                  onChange={(e) => {
+                                    const newChecked = e.target.checked;
+                                    const lastId = lastClickedIpIdRef.current;
+                                    const useRange =
+                                      shiftDownAtClickRef.current &&
+                                      lastId !== null &&
+                                      lastId !== addr.id;
+                                    shiftDownAtClickRef.current = false;
+                                    lastClickedIpIdRef.current = addr.id;
+
+                                    setSelectedIpIds((prev) => {
+                                      const next = new Set(prev);
+                                      if (useRange) {
+                                        // Build the IP-only selectable
+                                        // order from the same tableRows
+                                        // that drives rendering, so the
+                                        // range matches what the user
+                                        // sees on screen.
+                                        const ids: string[] = [];
+                                        for (const r of tableRows) {
+                                          if (r.kind !== "ip") continue;
+                                          const a = r.addr;
+                                          if (
+                                            a.status === "network" ||
+                                            a.status === "broadcast" ||
+                                            a.auto_from_lease
+                                          )
+                                            continue;
+                                          ids.push(a.id);
+                                        }
+                                        const lo = ids.indexOf(lastId!);
+                                        const hi = ids.indexOf(addr.id);
+                                        if (lo !== -1 && hi !== -1) {
+                                          const [s, e2] =
+                                            lo < hi ? [lo, hi] : [hi, lo];
+                                          for (let i = s; i <= e2; i++) {
+                                            if (newChecked) next.add(ids[i]);
+                                            else next.delete(ids[i]);
+                                          }
+                                          return next;
+                                        }
+                                      }
+                                      if (newChecked) next.add(addr.id);
+                                      else next.delete(addr.id);
+                                      return next;
+                                    });
+                                  }}
+                                />
                               )}
-                              <span className="ml-2 font-mono text-xs opacity-80">
-                                {anchorIp}
-                              </span>
-                              <span className="ml-3 text-[11px] opacity-70">
-                                range {pool.start_ip} – {pool.end_ip}
+                            </td>
+                            <td className="px-4 py-2 font-mono font-medium">
+                              <span className="inline-flex items-center gap-0.5">
+                                {addr.address}
+                                <CopyButton text={addr.address} />
                               </span>
                             </td>
-                          </tr>
-                        );
-                      }
-                      const addr = row.addr;
-                      const dnsState = ipDnsState(addr);
-                      const systemRow =
-                        addr.status === "network" ||
-                        addr.status === "broadcast" ||
-                        !!addr.auto_from_lease;
-                      const rowSelected = selectedIpIds.has(addr.id);
-                      const canEdit =
-                        !systemRow &&
-                        addr.status !== "orphan" &&
-                        !isReadOnly(addr.status);
-                      return (
-                        <ContextMenu key={addr.id}>
-                          <ContextMenuTrigger asChild>
-                            <tr
-                              ref={registerHighlightRow(addr.id)}
-                              onClick={() => setViewingAddress(addr)}
-                              className={cn(
-                                "group/addr border-b last:border-0 hover:bg-muted/20 cursor-pointer",
-                                (addr.status === "network" ||
-                                  addr.status === "broadcast") &&
-                                  "opacity-50",
-                                addr.status === "orphan" && "opacity-40",
-                                rowSelected && "bg-primary/5",
-                                isHighlightedRow(addr.id) &&
-                                  "spatium-row-highlight",
-                              )}
-                            >
-                              <td
-                                className="w-8 px-2 py-2"
-                                onClick={(e) => e.stopPropagation()}
-                              >
-                                {!systemRow && (
-                                  <input
-                                    type="checkbox"
-                                    checked={rowSelected}
-                                    aria-label={`Select ${addr.address}`}
-                                    onChange={(e) => {
-                                      setSelectedIpIds((prev) => {
-                                        const next = new Set(prev);
-                                        if (e.target.checked) next.add(addr.id);
-                                        else next.delete(addr.id);
-                                        return next;
-                                      });
-                                    }}
-                                  />
+                            <td className="px-4 py-2">
+                              <span className="inline-flex items-center gap-1.5">
+                                {addr.fqdn ? (
+                                  <span className="font-mono text-xs">
+                                    {addr.fqdn}
+                                  </span>
+                                ) : addr.hostname ? (
+                                  <span className="text-muted-foreground">
+                                    {addr.hostname}
+                                  </span>
+                                ) : (
+                                  <span className="text-muted-foreground/40">
+                                    —
+                                  </span>
                                 )}
-                              </td>
-                              <td className="px-4 py-2 font-mono font-medium">
-                                <span className="inline-flex items-center gap-0.5">
-                                  {addr.address}
-                                  <CopyButton text={addr.address} />
+                                {(addr.alias_count ?? 0) > 0 && (
+                                  <span
+                                    className="inline-flex items-center rounded bg-indigo-100 px-1.5 py-0.5 text-[10px] font-medium text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-400"
+                                    title={`${addr.alias_count} alias${(addr.alias_count ?? 0) === 1 ? "" : "es"} — edit IP to view`}
+                                  >
+                                    +{addr.alias_count}{" "}
+                                    {addr.alias_count === 1
+                                      ? "alias"
+                                      : "aliases"}
+                                  </span>
+                                )}
+                                {(addr.nat_mapping_count ?? 0) > 0 && (
+                                  <button
+                                    type="button"
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      setNatModalIp(addr);
+                                    }}
+                                    className="inline-flex items-center rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 hover:bg-amber-200 dark:bg-amber-900/30 dark:text-amber-400 dark:hover:bg-amber-900/50"
+                                    title={`Click to view ${addr.nat_mapping_count} NAT mapping${(addr.nat_mapping_count ?? 0) === 1 ? "" : "s"}`}
+                                  >
+                                    NAT {addr.nat_mapping_count}
+                                  </button>
+                                )}
+                              </span>
+                            </td>
+                            <td className="px-4 py-2 font-mono text-xs">
+                              {addr.mac_address ? (
+                                <>
+                                  {addr.mac_address}
+                                  {addr.vendor && (
+                                    <span className="ml-1 font-sans text-[11px] text-muted-foreground">
+                                      ({addr.vendor})
+                                    </span>
+                                  )}
+                                </>
+                              ) : (
+                                <span className="text-muted-foreground/40">
+                                  —
                                 </span>
-                              </td>
-                              <td className="px-4 py-2">
-                                <span className="inline-flex items-center gap-1.5">
-                                  {addr.fqdn ? (
-                                    <span className="font-mono text-xs">
-                                      {addr.fqdn}
-                                    </span>
-                                  ) : addr.hostname ? (
-                                    <span className="text-muted-foreground">
-                                      {addr.hostname}
-                                    </span>
-                                  ) : (
+                              )}
+                            </td>
+                            <td className="px-4 py-2 text-muted-foreground">
+                              {addr.description ?? (
+                                <span className="text-muted-foreground/40">
+                                  —
+                                </span>
+                              )}
+                            </td>
+                            <td className="px-4 py-2">
+                              {(() => {
+                                const t =
+                                  (addr.tags as Record<
+                                    string,
+                                    unknown
+                                  > | null) ?? {};
+                                const entries = Object.entries(t);
+                                if (entries.length === 0)
+                                  return (
                                     <span className="text-muted-foreground/40">
                                       —
                                     </span>
-                                  )}
-                                  {(addr.alias_count ?? 0) > 0 && (
-                                    <span
-                                      className="inline-flex items-center rounded bg-indigo-100 px-1.5 py-0.5 text-[10px] font-medium text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-400"
-                                      title={`${addr.alias_count} alias${(addr.alias_count ?? 0) === 1 ? "" : "es"} — edit IP to view`}
-                                    >
-                                      +{addr.alias_count}{" "}
-                                      {addr.alias_count === 1
-                                        ? "alias"
-                                        : "aliases"}
-                                    </span>
-                                  )}
-                                  {(addr.nat_mapping_count ?? 0) > 0 && (
-                                    <button
-                                      type="button"
-                                      onClick={(e) => {
-                                        e.stopPropagation();
-                                        setNatModalIp(addr);
-                                      }}
-                                      className="inline-flex items-center rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 hover:bg-amber-200 dark:bg-amber-900/30 dark:text-amber-400 dark:hover:bg-amber-900/50"
-                                      title={`Click to view ${addr.nat_mapping_count} NAT mapping${(addr.nat_mapping_count ?? 0) === 1 ? "" : "s"}`}
-                                    >
-                                      NAT {addr.nat_mapping_count}
-                                    </button>
-                                  )}
-                                </span>
-                              </td>
-                              <td className="px-4 py-2 font-mono text-xs">
-                                {addr.mac_address ? (
-                                  <>
-                                    {addr.mac_address}
-                                    {addr.vendor && (
-                                      <span className="ml-1 font-sans text-[11px] text-muted-foreground">
-                                        ({addr.vendor})
-                                      </span>
-                                    )}
-                                  </>
-                                ) : (
-                                  <span className="text-muted-foreground/40">
-                                    —
-                                  </span>
-                                )}
-                              </td>
-                              <td className="px-4 py-2 text-muted-foreground">
-                                {addr.description ?? (
-                                  <span className="text-muted-foreground/40">
-                                    —
-                                  </span>
-                                )}
-                              </td>
-                              <td className="px-4 py-2">
-                                {(() => {
-                                  const t =
-                                    (addr.tags as Record<
-                                      string,
-                                      unknown
-                                    > | null) ?? {};
-                                  const entries = Object.entries(t);
-                                  if (entries.length === 0)
-                                    return (
-                                      <span className="text-muted-foreground/40">
-                                        —
-                                      </span>
-                                    );
-                                  return (
-                                    <div className="flex flex-wrap gap-1">
-                                      {entries.map(([k, v]) => {
-                                        const vStr = v == null ? "" : String(v);
-                                        const label = vStr ? `${k}=${vStr}` : k;
-                                        return (
-                                          <button
-                                            key={k}
-                                            type="button"
-                                            onClick={() => {
-                                              setColFilters((p) => ({
-                                                ...p,
-                                                tags: label,
-                                              }));
-                                              setShowFilters(true);
-                                            }}
-                                            title={`Filter by ${label}`}
-                                            className="inline-flex max-w-[14rem] items-center truncate rounded border border-sky-200 bg-sky-50 px-1.5 py-0.5 text-[10px] font-medium text-sky-700 hover:border-sky-300 hover:bg-sky-100 dark:border-sky-900/60 dark:bg-sky-900/30 dark:text-sky-300 dark:hover:bg-sky-900/50"
-                                          >
-                                            {label}
-                                          </button>
-                                        );
-                                      })}
-                                    </div>
                                   );
-                                })()}
-                              </td>
-                              <td className="px-4 py-2">
-                                <span className="inline-flex items-center">
-                                  <StatusBadge status={addr.status} />
-                                  {addr.role ? (
-                                    <RoleBadge role={addr.role} />
-                                  ) : null}
-                                </span>
-                              </td>
-                              <td className="px-4 py-2">
-                                {(() => {
-                                  const pi = ipPoolInfo(addr);
-                                  if (!pi)
-                                    return (
-                                      <span className="text-muted-foreground/40">
-                                        —
-                                      </span>
-                                    );
-                                  const cls =
-                                    pi.type === "dynamic"
-                                      ? "bg-cyan-100 text-cyan-800 dark:bg-cyan-900/30 dark:text-cyan-400"
-                                      : pi.type === "reserved"
-                                        ? "bg-violet-100 text-violet-800 dark:bg-violet-900/30 dark:text-violet-400"
-                                        : "bg-zinc-100 text-zinc-600 dark:bg-zinc-800/30 dark:text-zinc-400";
+                                return (
+                                  <div className="flex flex-wrap gap-1">
+                                    {entries.map(([k, v]) => {
+                                      const vStr = v == null ? "" : String(v);
+                                      const label = vStr ? `${k}=${vStr}` : k;
+                                      return (
+                                        <button
+                                          key={k}
+                                          type="button"
+                                          onClick={() => {
+                                            setColFilters((p) => ({
+                                              ...p,
+                                              tags: label,
+                                            }));
+                                            setShowFilters(true);
+                                          }}
+                                          title={`Filter by ${label}`}
+                                          className="inline-flex max-w-[14rem] items-center truncate rounded border border-sky-200 bg-sky-50 px-1.5 py-0.5 text-[10px] font-medium text-sky-700 hover:border-sky-300 hover:bg-sky-100 dark:border-sky-900/60 dark:bg-sky-900/30 dark:text-sky-300 dark:hover:bg-sky-900/50"
+                                        >
+                                          {label}
+                                        </button>
+                                      );
+                                    })}
+                                  </div>
+                                );
+                              })()}
+                            </td>
+                            <td className="px-4 py-2">
+                              <span className="inline-flex items-center">
+                                <StatusBadge status={addr.status} />
+                                {addr.role ? (
+                                  <RoleBadge role={addr.role} />
+                                ) : null}
+                              </span>
+                            </td>
+                            <td className="px-4 py-2">
+                              {(() => {
+                                const pi = ipPoolInfo(addr);
+                                if (!pi)
                                   return (
-                                    <span
-                                      className={`inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium ${cls}`}
-                                    >
-                                      {pi.name}
+                                    <span className="text-muted-foreground/40">
+                                      —
                                     </span>
                                   );
-                                })()}
-                              </td>
-                              <td className="px-4 py-2">
-                                {dnsState === "in-sync" ? (
+                                const cls =
+                                  pi.type === "dynamic"
+                                    ? "bg-cyan-100 text-cyan-800 dark:bg-cyan-900/30 dark:text-cyan-400"
+                                    : pi.type === "reserved"
+                                      ? "bg-violet-100 text-violet-800 dark:bg-violet-900/30 dark:text-violet-400"
+                                      : "bg-zinc-100 text-zinc-600 dark:bg-zinc-800/30 dark:text-zinc-400";
+                                return (
                                   <span
-                                    className="inline-flex items-center gap-1 text-xs text-emerald-600"
-                                    title="DNS records match IPAM"
+                                    className={`inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium ${cls}`}
                                   >
-                                    <span className="inline-block h-1.5 w-1.5 rounded-full bg-emerald-500" />
-                                    in sync
+                                    {pi.name}
                                   </span>
-                                ) : dnsState === "out-of-sync" ? (
-                                  <span
-                                    className="inline-flex items-center gap-1 text-xs text-amber-600"
-                                    title="DNS records are missing or differ — open Sync DNS to reconcile"
-                                  >
-                                    <span className="inline-block h-1.5 w-1.5 rounded-full bg-amber-500" />
-                                    out of sync
-                                  </span>
-                                ) : (
-                                  <span className="text-muted-foreground/40">
-                                    —
-                                  </span>
-                                )}
-                              </td>
-                              {/* Seen — recency dot derived from
+                                );
+                              })()}
+                            </td>
+                            <td className="px-4 py-2">
+                              {dnsState === "in-sync" ? (
+                                <span
+                                  className="inline-flex items-center gap-1 text-xs text-emerald-600"
+                                  title="DNS records match IPAM"
+                                >
+                                  <span className="inline-block h-1.5 w-1.5 rounded-full bg-emerald-500" />
+                                  in sync
+                                </span>
+                              ) : dnsState === "out-of-sync" ? (
+                                <span
+                                  className="inline-flex items-center gap-1 text-xs text-amber-600"
+                                  title="DNS records are missing or differ — open Sync DNS to reconcile"
+                                >
+                                  <span className="inline-block h-1.5 w-1.5 rounded-full bg-amber-500" />
+                                  out of sync
+                                </span>
+                              ) : (
+                                <span className="text-muted-foreground/40">
+                                  —
+                                </span>
+                              )}
+                            </td>
+                            {/* Seen — recency dot derived from
                                   ``last_seen_at``. Orthogonal to status:
                                   an ``allocated`` row can still be cold,
                                   a ``discovered`` row can be alive right
                                   now. Tooltip carries exact age + method. */}
-                              <td className="px-4 py-2 text-center">
-                                <SeenDot
-                                  lastSeenAt={addr.last_seen_at}
-                                  lastSeenMethod={addr.last_seen_method}
-                                />
-                              </td>
-                              {/* Network discovery — switch / port / VLAN
+                            <td className="px-4 py-2 text-center">
+                              <SeenDot
+                                lastSeenAt={addr.last_seen_at}
+                                lastSeenMethod={addr.last_seen_method}
+                              />
+                            </td>
+                            {/* Network discovery — switch / port / VLAN
                                   from the SNMP-discovered FDB. May render
                                   multiple lines for trunk ports / hypervisor
                                   hosts where one MAC is learned across VLANs. */}
-                              <td className="px-4 py-2">
-                                <NetworkContextCell
-                                  entries={
-                                    subnetNetworkContext?.[addr.id] ?? []
-                                  }
-                                />
-                              </td>
-                              <td
-                                className="px-4 py-2 text-right"
-                                onClick={(e) => e.stopPropagation()}
-                              >
-                                <div className="flex items-center justify-end gap-1">
-                                  {addr.status === "orphan" ? (
-                                    <>
-                                      <button
-                                        onClick={() =>
-                                          restoreAddr.mutate(addr.id)
-                                        }
-                                        disabled={restoreAddr.isPending}
-                                        className="rounded p-1 text-xs text-muted-foreground hover:text-green-600"
-                                        title="Restore (mark as allocated)"
-                                      >
-                                        <RefreshCw className="h-3.5 w-3.5" />
-                                      </button>
-                                      <button
-                                        onClick={() =>
-                                          setConfirmPurgeAddr(addr)
-                                        }
-                                        className="rounded p-1 text-muted-foreground hover:text-destructive"
-                                        title="Permanently delete"
-                                      >
-                                        <Trash2 className="h-3.5 w-3.5" />
-                                      </button>
-                                    </>
-                                  ) : addr.auto_from_lease ? (
-                                    // Mirror of a dynamic DHCP lease — the DHCP
-                                    // server owns the state; editing or deleting
-                                    // from IPAM would just get overwritten on
-                                    // the next pull. Show a lock hint instead.
-                                    <span
-                                      className="inline-flex items-center rounded p-1 text-muted-foreground/60"
-                                      title="Managed by DHCP server — edit the lease or reservation at the source. This row is refreshed by the lease-pull task."
-                                    >
-                                      <Lock className="h-3.5 w-3.5" />
-                                    </span>
-                                  ) : !isReadOnly(addr.status) ? (
-                                    <>
-                                      <button
-                                        onClick={() => setEditingAddress(addr)}
-                                        className="rounded p-1 text-muted-foreground hover:text-foreground"
-                                        title="Edit"
-                                      >
-                                        <Pencil className="h-3.5 w-3.5" />
-                                      </button>
-                                      <button
-                                        onClick={() =>
-                                          setConfirmDeleteAddr(addr)
-                                        }
-                                        className="rounded p-1 text-muted-foreground hover:text-destructive"
-                                        title="Delete"
-                                      >
-                                        <Trash2 className="h-3.5 w-3.5" />
-                                      </button>
-                                    </>
-                                  ) : null}
-                                </div>
-                              </td>
-                            </tr>
-                          </ContextMenuTrigger>
-                          <ContextMenuContent>
-                            <ContextMenuLabel>{addr.address}</ContextMenuLabel>
-                            <ContextMenuSeparator />
-                            <ContextMenuItem
-                              onSelect={() => copyToClipboard(addr.address)}
+                            <td className="px-4 py-2">
+                              <NetworkContextCell
+                                entries={subnetNetworkContext?.[addr.id] ?? []}
+                              />
+                            </td>
+                            <td
+                              className="px-4 py-2 text-right"
+                              onClick={(e) => e.stopPropagation()}
                             >
-                              Copy IP
+                              <div className="flex items-center justify-end gap-1">
+                                {addr.status === "orphan" ? (
+                                  <>
+                                    <button
+                                      onClick={() =>
+                                        restoreAddr.mutate(addr.id)
+                                      }
+                                      disabled={restoreAddr.isPending}
+                                      className="rounded p-1 text-xs text-muted-foreground hover:text-green-600"
+                                      title="Restore (mark as allocated)"
+                                    >
+                                      <RefreshCw className="h-3.5 w-3.5" />
+                                    </button>
+                                    <button
+                                      onClick={() => setConfirmPurgeAddr(addr)}
+                                      className="rounded p-1 text-muted-foreground hover:text-destructive"
+                                      title="Permanently delete"
+                                    >
+                                      <Trash2 className="h-3.5 w-3.5" />
+                                    </button>
+                                  </>
+                                ) : addr.auto_from_lease ? (
+                                  // Mirror of a dynamic DHCP lease — the DHCP
+                                  // server owns the state; editing or deleting
+                                  // from IPAM would just get overwritten on
+                                  // the next pull. Show a lock hint instead.
+                                  <span
+                                    className="inline-flex items-center rounded p-1 text-muted-foreground/60"
+                                    title="Managed by DHCP server — edit the lease or reservation at the source. This row is refreshed by the lease-pull task."
+                                  >
+                                    <Lock className="h-3.5 w-3.5" />
+                                  </span>
+                                ) : !isReadOnly(addr.status) ? (
+                                  <>
+                                    <button
+                                      onClick={() => setEditingAddress(addr)}
+                                      className="rounded p-1 text-muted-foreground hover:text-foreground"
+                                      title="Edit"
+                                    >
+                                      <Pencil className="h-3.5 w-3.5" />
+                                    </button>
+                                    <button
+                                      onClick={() => setConfirmDeleteAddr(addr)}
+                                      className="rounded p-1 text-muted-foreground hover:text-destructive"
+                                      title="Delete"
+                                    >
+                                      <Trash2 className="h-3.5 w-3.5" />
+                                    </button>
+                                  </>
+                                ) : null}
+                              </div>
+                            </td>
+                          </tr>
+                        </ContextMenuTrigger>
+                        <ContextMenuContent>
+                          <ContextMenuLabel>{addr.address}</ContextMenuLabel>
+                          <ContextMenuSeparator />
+                          <ContextMenuItem
+                            onSelect={() => copyToClipboard(addr.address)}
+                          >
+                            Copy IP
+                          </ContextMenuItem>
+                          {addr.fqdn && (
+                            <ContextMenuItem
+                              onSelect={() => copyToClipboard(addr.fqdn!)}
+                            >
+                              Copy FQDN
                             </ContextMenuItem>
-                            {addr.fqdn && (
+                          )}
+                          {addr.mac_address && (
+                            <ContextMenuItem
+                              onSelect={() =>
+                                copyToClipboard(addr.mac_address!)
+                              }
+                            >
+                              Copy MAC
+                            </ContextMenuItem>
+                          )}
+                          {canEdit && (
+                            <>
+                              <ContextMenuSeparator />
                               <ContextMenuItem
-                                onSelect={() => copyToClipboard(addr.fqdn!)}
+                                onSelect={() => setEditingAddress(addr)}
                               >
-                                Copy FQDN
+                                Edit…
                               </ContextMenuItem>
-                            )}
-                            {addr.mac_address && (
                               <ContextMenuItem
-                                onSelect={() =>
-                                  copyToClipboard(addr.mac_address!)
-                                }
+                                destructive
+                                onSelect={() => setConfirmDeleteAddr(addr)}
                               >
-                                Copy MAC
+                                Delete…
                               </ContextMenuItem>
-                            )}
-                            {canEdit && (
-                              <>
-                                <ContextMenuSeparator />
-                                <ContextMenuItem
-                                  onSelect={() => setEditingAddress(addr)}
-                                >
-                                  Edit…
-                                </ContextMenuItem>
-                                <ContextMenuItem
-                                  destructive
-                                  onSelect={() => setConfirmDeleteAddr(addr)}
-                                >
-                                  Delete…
-                                </ContextMenuItem>
-                              </>
-                            )}
-                            {addr.status === "orphan" && (
-                              <>
-                                <ContextMenuSeparator />
-                                <ContextMenuItem
-                                  onSelect={() => restoreAddr.mutate(addr.id)}
-                                >
-                                  Restore
-                                </ContextMenuItem>
-                                <ContextMenuItem
-                                  destructive
-                                  onSelect={() => setConfirmPurgeAddr(addr)}
-                                >
-                                  Delete Forever…
-                                </ContextMenuItem>
-                              </>
-                            )}
-                            {addr.auto_from_lease && (
-                              <>
-                                <ContextMenuSeparator />
-                                <ContextMenuItem disabled>
-                                  Managed by DHCP — read-only
-                                </ContextMenuItem>
-                              </>
-                            )}
-                          </ContextMenuContent>
-                        </ContextMenu>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </div>
+                            </>
+                          )}
+                          {addr.status === "orphan" && (
+                            <>
+                              <ContextMenuSeparator />
+                              <ContextMenuItem
+                                onSelect={() => restoreAddr.mutate(addr.id)}
+                              >
+                                Restore
+                              </ContextMenuItem>
+                              <ContextMenuItem
+                                destructive
+                                onSelect={() => setConfirmPurgeAddr(addr)}
+                              >
+                                Delete Forever…
+                              </ContextMenuItem>
+                            </>
+                          )}
+                          {addr.auto_from_lease && (
+                            <>
+                              <ContextMenuSeparator />
+                              <ContextMenuItem disabled>
+                                Managed by DHCP — read-only
+                              </ContextMenuItem>
+                            </>
+                          )}
+                        </ContextMenuContent>
+                      </ContextMenu>
+                    );
+                  })}
+                </tbody>
+              </table>
             </>
           )}
         </div>
@@ -4421,6 +4549,16 @@ function SubnetDetail({
           defaultPreset="subnet_sweep"
           title={`Scan subnet — ${subnet.network}${subnet.name ? ` (${subnet.name})` : ""}`}
           onClose={() => setShowSubnetScan(false)}
+        />
+      )}
+      {showBulkAllocate && (
+        <BulkAllocateModal
+          subnet={subnet}
+          onClose={() => setShowBulkAllocate(false)}
+          onCommitted={() => {
+            qc.invalidateQueries({ queryKey: ["addresses", subnet.id] });
+            qc.invalidateQueries({ queryKey: ["subnets"] });
+          }}
         />
       )}
       {showDnsSync && (

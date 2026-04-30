@@ -5524,6 +5524,395 @@ async def purge_orphans(
     return {"purged": len(rows)}
 
 
+# ── Bulk allocate (subnet-level) ─────────────────────────────────────────────
+#
+# Stamp a contiguous IP range with name templating in one shot — the
+# operator types ``192.168.0.100`` → ``192.168.0.200`` plus a hostname
+# template like ``dhcp-{n}`` and the endpoint creates IPAM rows + DNS
+# records in a single transaction. Two endpoints: ``/preview`` (read-only
+# blast radius) and the bare commit (advisory-locks the subnet).
+#
+# Template language is a small subset of Python's ``{name[:fmt]}``:
+#
+#   {n}       → iterator value (starts at ``template_start``, default 1)
+#   {n:03d}   → zero-padded decimal
+#   {n:x}     → hex (and any other ``str.format`` int-format)
+#   {oct1}    → first octet of the IP (IPv4 only)
+#   {oct2-4}  → other octets
+#
+# Anything outside those tokens is literal. The same regex is mirrored
+# client-side for live preview as the operator types — keep them in sync.
+
+_BULK_TEMPLATE_RE = re.compile(r"\{(n|oct[1-4])(?::([^}]+))?\}")
+_BULK_MAX_IPS = 1024
+_BULK_ALLOC_ALLOWED_STATUSES = frozenset({"allocated", "reserved", "deprecated"})
+_HOSTNAME_LABEL_RE = re.compile(r"^[a-zA-Z0-9]([a-zA-Z0-9-]{0,62})$")
+
+
+def _expand_bulk_template(
+    template: str,
+    ip_obj: ipaddress.IPv4Address | ipaddress.IPv6Address,
+    n: int,
+) -> str:
+    """Substitute ``{n}`` / ``{oct1-4}`` tokens. Bad format specs degrade
+    to plain ``str(n)`` rather than raising — preview should still render
+    something so the operator can correct the template visually."""
+    octets = str(ip_obj).split(".") if isinstance(ip_obj, ipaddress.IPv4Address) else []
+
+    def _repl(m: "re.Match[str]") -> str:
+        token = m.group(1)
+        fmt = m.group(2)
+        if token == "n":
+            try:
+                return f"{n:{fmt}}" if fmt else str(n)
+            except (ValueError, KeyError):
+                return str(n)
+        idx = int(token[3]) - 1
+        if 0 <= idx < len(octets):
+            return octets[idx]
+        return ""
+
+    return _BULK_TEMPLATE_RE.sub(_repl, template)
+
+
+class BulkAllocateItem(BaseModel):
+    address: str
+    hostname: str
+    fqdn: str | None
+    in_use: bool
+    in_dynamic_pool: bool
+    fqdn_collision: bool
+
+
+class BulkAllocateRequest(BaseModel):
+    range_start: str
+    range_end: str
+    hostname_template: str = Field(min_length=1, max_length=128)
+    template_start: int = 1
+    status: str = "allocated"
+    description: str | None = None
+    dns_zone_id: str | None = None
+    create_dns_records: bool = True
+    on_collision: str = "skip"  # "skip" | "abort"
+    # ``IPAddress.tags`` is JSONB dict (not a list) — matches the rest of
+    # IPAM. Empty dict means "no tags".
+    tags: dict[str, Any] = Field(default_factory=dict)
+    custom_fields: dict[str, Any] = Field(default_factory=dict)
+
+
+class BulkAllocatePreviewResponse(BaseModel):
+    total: int
+    will_create: int
+    conflicts_in_use: int
+    conflicts_in_pool: int
+    conflicts_fqdn: int
+    sample: list[BulkAllocateItem]
+    warnings: list[str]
+
+
+class BulkAllocateCommitResponse(BaseModel):
+    created: int
+    skipped_in_use: int
+    skipped_in_pool: int
+    skipped_fqdn_collision: int
+    sample_created: list[str]
+    summary: list[str]
+
+
+async def _build_bulk_allocate_candidates(
+    db: AsyncSession,
+    subnet: Subnet,
+    body: BulkAllocateRequest,
+) -> tuple[list[BulkAllocateItem], list[str], uuid.UUID | None]:
+    """Validate + render the per-IP candidate list for preview and commit.
+
+    Shared by both endpoints so they always agree on what the conflict
+    flags mean. Raises ``HTTPException`` for hard validation errors
+    (range outside subnet, range too large, malformed template); soft
+    issues end up in the returned ``warnings`` list.
+    """
+    if body.status not in _BULK_ALLOC_ALLOWED_STATUSES:
+        raise HTTPException(
+            status_code=422,
+            detail=f"status must be one of {sorted(_BULK_ALLOC_ALLOWED_STATUSES)}",
+        )
+    if body.on_collision not in {"skip", "abort"}:
+        raise HTTPException(status_code=422, detail="on_collision must be 'skip' or 'abort'")
+
+    try:
+        start = ipaddress.ip_address(body.range_start)
+        end = ipaddress.ip_address(body.range_end)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=f"Invalid IP in range: {exc}") from exc
+    if type(start) is not type(end):
+        raise HTTPException(
+            status_code=422,
+            detail="range_start and range_end must be the same address family",
+        )
+    if int(start) > int(end):
+        raise HTTPException(status_code=422, detail="range_start must be ≤ range_end")
+
+    net = _parse_network(str(subnet.network))
+    if start not in net or end not in net:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Range must be inside subnet {subnet.network}",
+        )
+
+    total = int(end) - int(start) + 1
+    if total > _BULK_MAX_IPS:
+        raise HTTPException(
+            status_code=422,
+            detail=f"Range too large ({total} IPs); max {_BULK_MAX_IPS} per call",
+        )
+
+    # Validate the template against the first candidate. RFC 1035 label
+    # rules: ≤ 63 chars, alphanumeric + hyphen, no leading hyphen.
+    probe = _expand_bulk_template(body.hostname_template, start, body.template_start)
+    if not probe or not _HOSTNAME_LABEL_RE.match(probe):
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Template produces invalid hostname for range_start: '{probe}'. "
+                "Hostnames must match ^[a-zA-Z0-9][a-zA-Z0-9-]{0,62}$."
+            ),
+        )
+
+    warnings: list[str] = []
+    if total > 1 and not _BULK_TEMPLATE_RE.search(body.hostname_template):
+        warnings.append("Template has no {n}/{oct1-4} token — every IP gets the same hostname.")
+
+    dynamic_ranges = await _load_dynamic_pool_ranges(db, subnet.id)
+
+    existing_rows = await db.execute(
+        select(IPAddress.address).where(IPAddress.subnet_id == subnet.id)
+    )
+    existing_ips = {str(addr) for (addr,) in existing_rows.all()}
+
+    explicit_zone = uuid.UUID(body.dns_zone_id) if body.dns_zone_id else None
+    effective_zone = explicit_zone or await _resolve_effective_zone(db, subnet)
+
+    items: list[BulkAllocateItem] = []
+    name_pairs: list[tuple[str, int]] = []  # (lower hostname, idx)
+    for idx in range(total):
+        ip_int = int(start) + idx
+        ip_obj = ipaddress.ip_address(ip_int)
+        ip_str = str(ip_obj)
+        hostname = _expand_bulk_template(body.hostname_template, ip_obj, body.template_start + idx)
+        items.append(
+            BulkAllocateItem(
+                address=ip_str,
+                hostname=hostname,
+                fqdn=None,
+                in_use=ip_str in existing_ips,
+                in_dynamic_pool=_ip_int_in_dynamic_pool(ip_int, dynamic_ranges),
+                fqdn_collision=False,
+            )
+        )
+        name_pairs.append((hostname.lower(), idx))
+
+    # FQDN collision: existing rows in the same zone, plus any duplicate
+    # within this batch (operator template that maps multiple IPs to the
+    # same hostname). One bulk SELECT keeps it cheap on a 1000-IP range.
+    if body.create_dns_records and effective_zone is not None and name_pairs:
+        zone = await db.get(DNSZone, effective_zone)
+        zone_domain = zone.name.rstrip(".") if zone is not None else None
+        host_set = {h for (h, _) in name_pairs}
+        rows = await db.execute(
+            select(IPAddress.hostname).where(
+                func.lower(IPAddress.hostname).in_(host_set),
+                IPAddress.forward_zone_id == effective_zone,
+            )
+        )
+        taken_hosts = {h.lower() for (h,) in rows.all() if h}
+        for h_lower, idx in name_pairs:
+            if zone_domain:
+                items[idx].fqdn = f"{items[idx].hostname}.{zone_domain}"
+            if h_lower in taken_hosts:
+                items[idx].fqdn_collision = True
+        seen_in_batch: set[str] = set()
+        for h_lower, idx in name_pairs:
+            if items[idx].in_use or items[idx].in_dynamic_pool:
+                continue
+            if h_lower in seen_in_batch:
+                items[idx].fqdn_collision = True
+            else:
+                seen_in_batch.add(h_lower)
+
+    return items, warnings, effective_zone
+
+
+@router.post(
+    "/subnets/{subnet_id}/bulk-allocate/preview",
+    response_model=BulkAllocatePreviewResponse,
+)
+async def bulk_allocate_preview(
+    subnet_id: uuid.UUID,
+    body: BulkAllocateRequest,
+    current_user: CurrentUser,
+    db: DB,
+) -> BulkAllocatePreviewResponse:
+    """Read-only blast radius for a bulk-allocate."""
+    subnet = await db.get(Subnet, subnet_id)
+    if subnet is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
+
+    items, warnings, _ = await _build_bulk_allocate_candidates(db, subnet, body)
+    in_use = sum(1 for i in items if i.in_use)
+    in_pool = sum(1 for i in items if not i.in_use and i.in_dynamic_pool)
+    fqdn_coll = sum(1 for i in items if not i.in_use and not i.in_dynamic_pool and i.fqdn_collision)
+    will_create = len(items) - in_use - in_pool - fqdn_coll
+
+    sample = items if len(items) <= 7 else items[:5] + items[-2:]
+
+    return BulkAllocatePreviewResponse(
+        total=len(items),
+        will_create=will_create,
+        conflicts_in_use=in_use,
+        conflicts_in_pool=in_pool,
+        conflicts_fqdn=fqdn_coll,
+        sample=sample,
+        warnings=warnings,
+    )
+
+
+@router.post(
+    "/subnets/{subnet_id}/bulk-allocate",
+    response_model=BulkAllocateCommitResponse,
+)
+async def bulk_allocate_commit(
+    subnet_id: uuid.UUID,
+    body: BulkAllocateRequest,
+    current_user: CurrentUser,
+    db: DB,
+) -> BulkAllocateCommitResponse:
+    """Atomically allocate every non-conflicting IP in the range.
+
+    ``on_collision='abort'`` refuses the whole batch on any conflict
+    so the operator gets a clean retry path. ``on_collision='skip'``
+    quietly drops conflicts and creates the rest. Locks the subnet
+    row for the duration so concurrent allocations can't race.
+    """
+    result = await db.execute(
+        select(Subnet).where(Subnet.id == subnet_id).with_for_update(of=Subnet)
+    )
+    subnet = result.unique().scalar_one_or_none()
+    if subnet is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
+
+    items, _warnings, _ = await _build_bulk_allocate_candidates(db, subnet, body)
+
+    skipped_in_use = sum(1 for i in items if i.in_use)
+    skipped_in_pool = sum(1 for i in items if not i.in_use and i.in_dynamic_pool)
+    skipped_fqdn = sum(
+        1 for i in items if not i.in_use and not i.in_dynamic_pool and i.fqdn_collision
+    )
+    total_conflicts = skipped_in_use + skipped_in_pool + skipped_fqdn
+
+    if body.on_collision == "abort" and total_conflicts > 0:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={
+                "message": (
+                    f"{total_conflicts} of {len(items)} IPs conflict — "
+                    "aborting (on_collision=abort)"
+                ),
+                "conflicts_in_use": skipped_in_use,
+                "conflicts_in_pool": skipped_in_pool,
+                "conflicts_fqdn": skipped_fqdn,
+            },
+        )
+
+    explicit_zone = uuid.UUID(body.dns_zone_id) if body.dns_zone_id else None
+    created_addrs: list[str] = []
+    for item in items:
+        if item.in_use or item.in_dynamic_pool or item.fqdn_collision:
+            continue
+        ip = IPAddress(
+            subnet_id=subnet_id,
+            address=item.address,
+            status=body.status,
+            hostname=item.hostname,
+            description=body.description,
+            tags=dict(body.tags),
+            custom_fields=dict(body.custom_fields),
+            created_by_user_id=current_user.id,
+        )
+        db.add(ip)
+        await db.flush()
+
+        if body.create_dns_records:
+            await _sync_dns_record(db, ip, subnet, zone_id=explicit_zone, action="create")
+
+        db.add(
+            _audit(
+                current_user,
+                "create",
+                "ip_address",
+                str(ip.id),
+                item.address,
+                new_value={
+                    "address": item.address,
+                    "hostname": item.hostname,
+                    "status": body.status,
+                    "reason": "bulk_allocate",
+                },
+            )
+        )
+        created_addrs.append(item.address)
+
+    await db.flush()
+    db.add(
+        _audit(
+            current_user,
+            "bulk_allocate",
+            "subnet",
+            str(subnet.id),
+            str(subnet.network),
+            new_value={
+                "range": f"{body.range_start} → {body.range_end}",
+                "template": body.hostname_template,
+                "status": body.status,
+                "created": len(created_addrs),
+                "skipped_in_use": skipped_in_use,
+                "skipped_in_pool": skipped_in_pool,
+                "skipped_fqdn": skipped_fqdn,
+            },
+        )
+    )
+    await _update_utilization(db, subnet_id)
+    await _update_block_utilization(db, subnet.block_id)
+    await db.commit()
+    logger.info(
+        "ipam_bulk_allocate",
+        subnet_id=str(subnet_id),
+        created=len(created_addrs),
+        skipped_in_use=skipped_in_use,
+        skipped_in_pool=skipped_in_pool,
+        skipped_fqdn=skipped_fqdn,
+    )
+
+    sample_created = (
+        created_addrs[:10] + created_addrs[-2:] if len(created_addrs) > 12 else created_addrs
+    )
+    summary: list[str] = [f"Created {len(created_addrs)} IPs in {subnet.network}."]
+    if skipped_in_use:
+        summary.append(f"Skipped {skipped_in_use} already-allocated IP(s).")
+    if skipped_in_pool:
+        summary.append(f"Skipped {skipped_in_pool} IP(s) inside dynamic DHCP pools.")
+    if skipped_fqdn:
+        summary.append(f"Skipped {skipped_fqdn} IP(s) due to FQDN collisions.")
+
+    return BulkAllocateCommitResponse(
+        created=len(created_addrs),
+        skipped_in_use=skipped_in_use,
+        skipped_in_pool=skipped_in_pool,
+        skipped_fqdn_collision=skipped_fqdn,
+        sample_created=sample_created,
+        summary=summary,
+    )
+
+
 # ── Next available IP ──────────────────────────────────────────────────────────
 
 
