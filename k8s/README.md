@@ -103,6 +103,10 @@ For Redis HA in Docker Compose, use the Redis Sentinel pattern (see `k8s/ha/redi
 
 Celery workers are stateless and support any replica count. In K8s, the `worker` Deployment runs 2+ replicas by default. The Beat scheduler runs as a `Recreate` Deployment (replicas: 1) to prevent double-scheduling.
 
+### Worker capability — `NET_RAW`
+
+The worker pod ships with `securityContext.capabilities.add: ["NET_RAW"]` so `nmap` can run SYN scans + `-O` OS detection from the device-profiling auto-nmap path. The image already grants the cap to the `nmap` binary via `setcap` — this line keeps it in the pod's bounding set so restricted Pod Security Admission (`restricted` profile), OpenShift SCC, and GKE Autopilot don't drop it. The cap is in containerd's default cap set on permissive clusters, so it's a no-op there. If you've turned device profiling off cluster-wide and want a tighter security posture, drop the `securityContext` block from `k8s/base/worker.yaml` (or set `worker.netRawCapability: false` in the Helm chart).
+
 ## TLS / Ingress
 
 The Ingress in `k8s/base/frontend.yaml` uses `ingressClassName: nginx`. For TLS:

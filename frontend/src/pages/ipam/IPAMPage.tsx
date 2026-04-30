@@ -1022,6 +1022,135 @@ type DdnsPolicy =
   | "always_generate"
   | "disabled";
 
+/**
+ * Device profiling — auto-nmap on new DHCP leases. Subnet-only setting
+ * (Phase 1: no inheritance). Three knobs:
+ *
+ *   ``enabled``       — master toggle. Default off because nmap is loud:
+ *                       corporate IDS will flag the SpatiumDDI host as a
+ *                       port-scanner once enabled.
+ *   ``preset``        — nmap preset key. ``service_and_os`` is the
+ *                       default: services + OS fingerprint in one pass
+ *                       (``-T4 -sV -O --version-light``), without the
+ *                       heavyweight ``-A`` aggressive scripts.
+ *   ``refreshDays``   — dedupe window. The same IP won't re-scan within
+ *                       this many days of its last successful profile.
+ *                       Wi-Fi clients churning leases on roam events
+ *                       won't fire-hose nmap.
+ */
+type AutoProfilePreset =
+  | "quick"
+  | "service_version"
+  | "os_fingerprint"
+  | "service_and_os"
+  | "default_scripts"
+  | "udp_top100"
+  | "aggressive";
+
+function ProfilingSettingsSection({
+  enabled,
+  preset,
+  refreshDays,
+  onEnabledChange,
+  onPresetChange,
+  onRefreshDaysChange,
+}: {
+  enabled: boolean;
+  preset: AutoProfilePreset;
+  refreshDays: number;
+  onEnabledChange: (v: boolean) => void;
+  onPresetChange: (v: AutoProfilePreset) => void;
+  onRefreshDaysChange: (v: number) => void;
+}) {
+  const disabled = !enabled;
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center justify-between">
+        <div className="flex items-center gap-1.5">
+          <Network className="h-3.5 w-3.5 text-muted-foreground" />
+          <span className="text-xs font-medium">
+            Device profiling (auto-nmap on new DHCP lease)
+          </span>
+        </div>
+        <label className="flex items-center gap-1.5 text-xs cursor-pointer select-none">
+          <input
+            type="checkbox"
+            checked={enabled}
+            onChange={(e) => onEnabledChange(e.target.checked)}
+            className="h-3.5 w-3.5"
+          />
+          Enabled
+        </label>
+      </div>
+      {!enabled && (
+        <p className="text-xs text-muted-foreground italic">
+          When enabled, a fresh DHCP lease in this subnet kicks off an nmap scan
+          to fingerprint the device. Loud — corporate IDS will see the
+          SpatiumDDI host as a port-scanner. Authorise the source first.
+        </p>
+      )}
+      {enabled && (
+        <div className="space-y-2 pl-5 border-l-2 border-muted">
+          <label className="block text-xs">
+            <span className="block text-muted-foreground mb-0.5">
+              Scan preset
+            </span>
+            <select
+              value={preset}
+              onChange={(e) =>
+                onPresetChange(e.target.value as AutoProfilePreset)
+              }
+              disabled={disabled}
+              className="w-full rounded-md border bg-background px-2 py-1 text-sm disabled:opacity-60"
+            >
+              <option value="service_and_os">
+                service_and_os — services + OS guess (default)
+              </option>
+              <option value="quick">quick — top 100 ports, no banner</option>
+              <option value="service_version">
+                service_version — top 1000 ports + service banners
+              </option>
+              <option value="os_fingerprint">
+                os_fingerprint — TCP stack OS guess only
+              </option>
+              <option value="default_scripts">
+                default_scripts — NSE -sC checks
+              </option>
+              <option value="udp_top100">udp_top100 — UDP top 100 ports</option>
+              <option value="aggressive">
+                aggressive — -A (loud, slow, full)
+              </option>
+            </select>
+          </label>
+          <label className="block text-xs">
+            <span className="block text-muted-foreground mb-0.5">
+              Refresh window (days)
+            </span>
+            <input
+              type="number"
+              min={1}
+              max={365}
+              value={refreshDays}
+              onChange={(e) => {
+                const v = e.target.value.trim();
+                if (!v) return;
+                const n = parseInt(v, 10);
+                if (!isNaN(n)) onRefreshDaysChange(n);
+              }}
+              disabled={disabled}
+              className="w-full rounded-md border bg-background px-2 py-1 text-sm disabled:opacity-60"
+            />
+            <span className="mt-0.5 block text-[11px] text-muted-foreground">
+              Same (IP, MAC) pair won't re-scan within this many days. 30 is a
+              sane default — Wi-Fi roam churn won't re-trigger.
+            </span>
+          </label>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function DdnsSettingsSection({
   enabled,
   policy,
@@ -1561,6 +1690,11 @@ function CreateSubnetModal({
     null,
   );
   const [ddnsTtl, setDdnsTtl] = useState<number | null>(null);
+  // Device profiling state — Phase 1 active layer.
+  const [autoProfileEnabled, setAutoProfileEnabled] = useState(false);
+  const [autoProfilePreset, setAutoProfilePreset] =
+    useState<AutoProfilePreset>("service_and_os");
+  const [autoProfileRefreshDays, setAutoProfileRefreshDays] = useState(30);
 
   const { data: blocks } = useQuery({
     queryKey: ["blocks", spaceId],
@@ -1647,6 +1781,9 @@ function CreateSubnetModal({
         ddns_hostname_policy: ddnsPolicy,
         ddns_domain_override: ddnsDomainOverride,
         ddns_ttl: ddnsTtl,
+        auto_profile_on_dhcp_lease: autoProfileEnabled,
+        auto_profile_preset: autoProfilePreset,
+        auto_profile_refresh_days: autoProfileRefreshDays,
       }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["subnets", spaceId] });
@@ -1861,6 +1998,16 @@ function CreateSubnetModal({
             onPolicyChange={setDdnsPolicy}
             onDomainOverrideChange={setDdnsDomainOverride}
             onTtlChange={setDdnsTtl}
+          />
+        </div>
+        <div className="border-t pt-3">
+          <ProfilingSettingsSection
+            enabled={autoProfileEnabled}
+            preset={autoProfilePreset}
+            refreshDays={autoProfileRefreshDays}
+            onEnabledChange={setAutoProfileEnabled}
+            onPresetChange={setAutoProfilePreset}
+            onRefreshDaysChange={setAutoProfileRefreshDays}
           />
         </div>
         {error && <p className="text-xs text-destructive">{error}</p>}
@@ -4972,6 +5119,16 @@ function EditSubnetModal({
   const [ddnsTtl, setDdnsTtl] = useState<number | null>(
     subnet.ddns_ttl ?? null,
   );
+  // Device profiling state — initialised from subnet (Phase 1).
+  const [autoProfileEnabled, setAutoProfileEnabled] = useState(
+    subnet.auto_profile_on_dhcp_lease ?? false,
+  );
+  const [autoProfilePreset, setAutoProfilePreset] = useState<AutoProfilePreset>(
+    subnet.auto_profile_preset ?? "service_and_os",
+  );
+  const [autoProfileRefreshDays, setAutoProfileRefreshDays] = useState(
+    subnet.auto_profile_refresh_days ?? 30,
+  );
 
   // Detect whether network/broadcast records currently exist
   const { data: addresses } = useQuery({
@@ -5063,6 +5220,9 @@ function EditSubnetModal({
         ddns_hostname_policy: ddnsPolicy,
         ddns_domain_override: ddnsDomainOverride,
         ddns_ttl: ddnsTtl,
+        auto_profile_on_dhcp_lease: autoProfileEnabled,
+        auto_profile_preset: autoProfilePreset,
+        auto_profile_refresh_days: autoProfileRefreshDays,
         ...(manageAuto !== undefined
           ? { manage_auto_addresses: manageAuto }
           : {}),
@@ -5325,6 +5485,16 @@ function EditSubnetModal({
             onPolicyChange={setDdnsPolicy}
             onDomainOverrideChange={setDdnsDomainOverride}
             onTtlChange={setDdnsTtl}
+          />
+        </div>
+        <div className="border-t pt-3">
+          <ProfilingSettingsSection
+            enabled={autoProfileEnabled}
+            preset={autoProfilePreset}
+            refreshDays={autoProfileRefreshDays}
+            onEnabledChange={setAutoProfileEnabled}
+            onPresetChange={setAutoProfilePreset}
+            onRefreshDaysChange={setAutoProfileRefreshDays}
           />
         </div>
         {error && <p className="text-xs text-destructive">{error}</p>}

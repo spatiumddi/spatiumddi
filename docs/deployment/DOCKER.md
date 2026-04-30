@@ -262,6 +262,33 @@ docker compose -f docker-compose.agent-dhcp.yml --profile dhcp-ha up -d
 
 For a **true HA pair across two VMs**, run the same compose file on each VM with a different `DHCP_HOSTNAME` (say `dhcp-kea-east` and `dhcp-kea-west`) and the same `AGENT_GROUP`. On the control plane, edit the DHCP Server Group's HA mode (hot-standby or load-balancing) and set each server's `ha_peer_url` to the other peer's reachable URL. The agent resolves peer hostnames at render time and the `PeerResolveWatcher` thread keeps them fresh if IPs change.
 
+#### Optional: passive DHCP fingerprinting
+
+To enable Phase 2 device profiling (DHCP fingerprint capture +
+fingerbank lookup), add the `NET_RAW` capability to the
+`dhcp-kea` service in your override file and flip the env toggle:
+
+```yaml
+services:
+  dhcp-kea:
+    cap_add:
+      - NET_RAW
+    environment:
+      DHCP_FINGERPRINT_ENABLED: "1"
+      # Optional — interface name for the sniffer. Default "any"
+      # works for host-networked containers; bridge-networked
+      # containers should set this explicitly.
+      DHCP_FINGERPRINT_IFACE: "any"
+```
+
+The capability is **not** added to the shipped `docker-compose.yml`
+because the feature is default-off and we don't want to grant
+sniffing privileges on installs that aren't using it. Set the
+fingerbank API key in **Settings → IPAM → Device Profiling** on the
+control plane to enable enrichment; without a key the agent still
+ships raw signatures, fingerbank lookups just don't run. See
+`docs/features/DHCP.md §15` for the full design and privacy notes.
+
 ### DNS-only VM
 
 ```bash

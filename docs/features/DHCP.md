@@ -673,3 +673,95 @@ rule here has been surfaced to an operator, not just silently logged.
 - **Duplicate client-class name per group.** Class names are scoped
   to the server group — every member renders the same classes. `409` at
   `backend/app/api/v1/dhcp/client_classes.py`.
+
+## 15. Passive DHCP Fingerprinting (Phase 2 device profiling)
+
+Auto-populate "what is this thing?" for every DHCP-leasing client by
+sniffing each DISCOVER / REQUEST and looking the resulting
+option-55 / option-60 signature up against fingerbank's device
+taxonomy. Pairs with the active layer (auto-nmap on lease) — both
+write into the same `IPAddress.device_type` / `device_class` /
+`device_manufacturer` columns, so the IP detail modal shows one
+consolidated answer regardless of which layer enriched the row.
+
+### How it flows
+
+1. The DHCP agent's `DhcpFingerprintShipper` thread runs scapy's
+   `AsyncSniffer` against the BPF filter `udp and (port 67 or port 68)`
+   and extracts option-55 (parameter request list), option-60
+   (vendor class), option-77 (user class) and option-61 (client id)
+   from each DISCOVER / REQUEST.
+2. Observations are buffered + deduped at the agent layer (one
+   batch per MAC per minute) and POSTed to
+   `/api/v1/dhcp/agents/dhcp-fingerprints` every 10 s in batches of
+   up to 50.
+3. The control plane upserts the fingerprint into the
+   `dhcp_fingerprint` table (keyed by MAC) and enqueues a Celery
+   task per fresh / changed signature.
+4. The task hits fingerbank's `/api/v2/combinations/interrogate`
+   endpoint, caches the result on the row for 7 days, and stamps
+   matching `IPAddress` rows (joined on MAC) with the resolved
+   `device_type` / `device_class` / `device_manufacturer`. Rows
+   with `user_modified_at` set are left alone — the operator's
+   edits win.
+
+### Enabling it
+
+The feature is **default off** for two reasons: it requires
+`CAP_NET_RAW` to bind a BPF socket, and sniffing every DHCP
+transaction is privacy-sensitive on guest / BYOD subnets.
+
+**On the agent** — add the env var **and** the Linux capability to
+your compose override:
+
+```yaml
+services:
+  dhcp-kea:
+    cap_add:
+      - NET_RAW
+    environment:
+      DHCP_FINGERPRINT_ENABLED: "1"
+      # Optional — defaults to "any" which works for host-networked
+      # containers. Bridge-networked containers should pick a real
+      # interface name (eth0, etc).
+      DHCP_FINGERPRINT_IFACE: "any"
+```
+
+The shipped `docker-compose.yml` does **not** add `NET_RAW`
+unconditionally — operators who don't need fingerprinting shouldn't
+have to grant the capability. Same reasoning for not enabling it via
+default env.
+
+**On the control plane** — set the fingerbank API key in
+**Settings → IPAM → Device Profiling**. The form is a password-style
+input with a "Configured ✓ Replace… Clear" view once a key is on file
+(the encrypted value is never echoed back). Without a key, the agent
+still ships raw signatures (visible as the option-55 / option-60
+strings under the "Raw signature" disclosure on the IP detail
+modal), but no enrichment runs. Get a key at https://fingerbank.org
+(free tier: 30 lookups / hour / account is plenty for small-to-medium
+fleets).
+
+### Privacy + data shape
+
+The fingerprint table is **MAC-keyed, not lease-keyed**. We don't
+record per-transaction history; one row per device, refreshed
+in-place on every observation. That means:
+
+- A device that comes and goes still produces a single row with
+  `last_seen_at` bumped on every observation.
+- The raw option-55 / option-60 strings persist in the DB for
+  operator triage. There's no separate retention sweep — the table
+  is bounded by the number of unique MACs the agent has ever seen,
+  which scales with the size of your physical fleet.
+- We don't capture client IPs in fingerprints — the linkage to a
+  specific IP comes from `IPAddress.mac_address` and is updated on
+  every lease event (the existing path).
+
+### Operator-facing UI
+
+The IP detail modal surfaces both the enriched device line and (in
+a "Raw signature" disclosure) the option-55 / option-60 strings.
+The same surface lets operators force a re-lookup if they think the
+fingerbank result is wrong (the dispatched task ignores the cache
+window for that one MAC).

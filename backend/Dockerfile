@@ -28,19 +28,35 @@ FROM python:3.12-slim AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PYTHONPATH=/app
+    PYTHONPATH=/app \
+    NMAP_PRIVILEGED=1
+    # NMAP_PRIVILEGED=1 — Debian's nmap does an early getuid()==0 check
+    # for SYN scans + ``-O`` OS detection and bails before consulting the
+    # process's actual capabilities. This env var (or ``--privileged``)
+    # tells nmap to trust that it has the necessary raw-socket privilege
+    # via Linux capabilities (granted by the setcap-on-nmap line below).
+    # Without it operators get "TCP/IP fingerprinting requires root
+    # privileges" even though CAP_NET_RAW is in the process's effective
+    # set. The cap itself is still required — env var alone doesn't help.
 
 WORKDIR /app
 
 # Runtime system deps: libpq5 for asyncpg, libxmlsec1 for python3-saml,
 # iputils-ping for the DNS pool ICMP health-check (the binary ships
 # with cap_net_raw+ep on Debian, so it works as the non-root app user).
+# libcap2-bin gives us setcap so we can grant nmap CAP_NET_RAW —
+# without it ``nmap -O`` (and any SYN scan) bails with
+# "TCP/IP fingerprinting requires root privileges" when invoked by
+# the non-root app user. The cap is in Docker's default bounding set
+# so this works without needing cap_add at the compose / k8s layer.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq5 \
     libxml2 \
     libxmlsec1-openssl \
     nmap \
     iputils-ping \
+    libcap2-bin \
+    && setcap cap_net_raw,cap_net_bind_service+eip /usr/bin/nmap \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /install /usr/local

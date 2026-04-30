@@ -49,6 +49,13 @@ PRESETS: dict[str, list[str]] = {
     "quick": ["-T4", "-F"],
     "service_version": ["-T4", "-sV", "--version-light"],
     "os_fingerprint": ["-T4", "-O"],
+    # service_and_os combines service detection + OS fingerprinting in
+    # one pass — the right default for device profiling, since the IP
+    # detail modal renders both. ``-A`` would also do this but adds NSE
+    # scripts + traceroute which are heavyweight; this preset stays
+    # comparable to ``service_version`` in runtime, just with ``-O`` on
+    # top to fill the OS guess panel.
+    "service_and_os": ["-T4", "-sV", "-O", "--version-light"],
     "default_scripts": ["-T4", "-sC"],
     "udp_top100": ["-T4", "-sU", "--top-ports", "100"],
     "aggressive": ["-T4", "-A"],
@@ -492,6 +499,34 @@ async def run_scan(scan_id: uuid.UUID) -> None:
                 scan_row.error_message = (
                     scan_row.error_message or f"nmap exited with code {proc.returncode}"
                 )
+
+            # Stamp the IPAddress when a scan that targeted a known
+            # IPAM row finishes successfully. Powers the device-profile
+            # surface in the IP detail modal (last scan, last summary)
+            # and the dedupe window in services.profiling.auto_profile.
+            # We do this here — not in the auto_profile service —
+            # because operator-driven "Scan with nmap" runs deserve
+            # the same treatment, and the runner is the only place
+            # that knows when a scan is actually done.
+            if scan_row.status == "completed" and scan_row.ip_address_id is not None:
+                from app.models.ipam import IPAddress as _IPAddress
+
+                ip_row = await db.get(_IPAddress, scan_row.ip_address_id)
+                if ip_row is not None:
+                    ip_row.last_profiled_at = scan_row.finished_at
+                    ip_row.last_profile_scan_id = scan_row.id
+                    # Mirror nmap's OS guess onto the row's ``device_type``
+                    # so the IP table + detail modal can render the OS
+                    # without re-fetching the scan row. Defers to the
+                    # passive (fingerbank) layer when that's already
+                    # populated something — those values are usually
+                    # more specific ("HP iLO" vs nmap's "Linux 3.X").
+                    summary = scan_row.summary_json or {}
+                    os_info = summary.get("os") if isinstance(summary, dict) else None
+                    os_name = (os_info or {}).get("name") if isinstance(os_info, dict) else None
+                    if os_name and not ip_row.device_type:
+                        ip_row.device_type = str(os_name)[:100]
+
             await db.commit()
             logger.info(
                 "nmap_scan_finished",

@@ -1334,3 +1334,107 @@ Mirrors CLAUDE.md's three mixed sections:
   **Deferred:** v6 option-code catalog (separate namespace —
   ships once v6 UI lands).
 
+- ✅ **Device profiling — Phase 1: active layer (auto-nmap on
+  DHCP lease).** Subnet-level opt-in
+  (`auto_profile_on_dhcp_lease` + `auto_profile_preset` +
+  `auto_profile_refresh_days` on `Subnet`). When a fresh DHCP
+  lease lands the lease-event handler calls
+  `services/profiling/auto_profile.maybe_enqueue_for_lease`,
+  which gates on three guards before dispatch: (1) the
+  subnet's master toggle, (2) a per-(IP, MAC) refresh window
+  read from `IPAddress.last_profiled_at` so churning Wi-Fi
+  clients don't fan out, (3) a per-subnet concurrency cap of
+  4 in-flight scans counted across the existing `NmapScan`
+  queue (operator-driven scans count too — better to defer
+  the next auto-profile than queue ahead of a human). Pass
+  through the existing `app.tasks.nmap.run_scan_task` Celery
+  pipeline; the runner finaliser at
+  `services/nmap/runner.py` stamps `last_profiled_at` +
+  `last_profile_scan_id` on completion and mirrors
+  `summary_json["os"]["name"]` into `IPAddress.device_type`
+  when the passive layer hasn't already set a more specific
+  value.
+
+  Operator endpoint `POST /api/v1/ipam/addresses/{id}/profile`
+  exposes "Re-profile now" — bypasses the refresh-window
+  dedupe, returns 429 when the per-subnet cap is hit. UI:
+  `ProfilingSettingsSection` reused in the create + edit
+  Subnet modals; the IP detail modal grew a "Device profile"
+  section that surfaces the most recent scan's OS guess +
+  top 8 open services with a deep-link to the full nmap row.
+  Migration `d4f2a86c5b91_device_profiling_phase1`.
+
+  **Image / cluster-side fix-ups (landed alongside Phase 1).**
+  Operator-driven OS detection (`nmap -O`) and SYN scans need
+  raw-socket privilege, which the non-root `app` user in the api
+  + worker images doesn't have by default. We grant
+  `cap_net_raw,cap_net_bind_service+eip` to `/usr/bin/nmap` via
+  `setcap` in the runtime layer of `backend/Dockerfile`, then
+  set `NMAP_PRIVILEGED=1` as a baked-in env var so Debian's nmap
+  doesn't bail on its early `getuid()==0` check (which ignores
+  file caps). The K8s side adds
+  `securityContext.capabilities.add: ["NET_RAW"]` to the worker
+  pod in `k8s/base/worker.yaml`; the Helm chart gates the same
+  on `worker.netRawCapability` (default true). On permissive
+  clusters this is a no-op (NET_RAW is in containerd's default
+  cap set); on restricted PSA / OpenShift-SCC / GKE Autopilot
+  it's required for the cap to actually reach the process.
+
+  **Deferred:** block / space inheritance for `auto_profile_*`
+  fields (Phase 1 is subnet-only — added once operators ask for
+  cascade), per-subnet `auto_profile_on_snmp_discovery` toggle
+  (depends on the still-pending SNMP discovery task), IPAM list
+  column for `device_type` (operator show/hide).
+
+- ✅ **Device profiling — Phase 2: passive DHCP fingerprinting
+  + fingerbank.** The companion to Phase 1's active-layer
+  auto-nmap. The DHCP agent's
+  `DhcpFingerprintShipper` thread runs `scapy.AsyncSniffer` with
+  the BPF filter `udp and (port 67 or port 68)`, extracts
+  option-55 / option-60 / option-77 / option-61 from each
+  DISCOVER + REQUEST, dedupes per-MAC at 1/min, and POSTs
+  batches of up to 50 to `POST /api/v1/dhcp/agents/dhcp-fingerprints`
+  every 10 s. Default off — operators flip
+  `DHCP_FINGERPRINT_ENABLED=1` and add `cap_add: [NET_RAW]` in
+  their compose override (the shipped `docker-compose.yml`
+  doesn't grant the cap unconditionally because most installs
+  don't need it).
+
+  Control-plane side: new `dhcp_fingerprint` table
+  (MAC-keyed, one row per device) with the raw signature plus
+  cached fingerbank result. New
+  `services/profiling/fingerbank.py` (async httpx client against
+  `https://api.fingerbank.org/api/v2/combinations/interrogate`,
+  7-day cache window, swallows 404 / 429 / 5xx / network errors
+  to avoid breaking ingestion). New
+  `app.tasks.dhcp_fingerprint.lookup_fingerprint_task` Celery
+  task (idempotent + retry-3) does the slow lookup off the
+  ingestion request path and stamps `IPAddress.device_type` /
+  `device_class` / `device_manufacturer` on every matching
+  IPAM row sharing the MAC — respecting the `user_modified_at`
+  lock the integration reconcilers already use.
+  Operators set the fingerbank API key in **Settings → IPAM
+  → Device Profiling** (Fernet-encrypted at rest, password-
+  style input with a "Configured ✓ Replace… Clear" view once
+  set; the encrypted bytes never round-trip through the API
+  response — `SettingsResponse` exposes only a boolean
+  `fingerbank_api_key_set`). No key = passive collection
+  still happens, enrichment doesn't.
+
+  IPAM `IPAddressResponse` extended with the three device_*
+  columns + a new `GET /api/v1/ipam/addresses/{id}/dhcp-fingerprint`
+  endpoint returning the joined `dhcp_fingerprint` row by
+  MAC. Migration `e5a3f17b2d8c_device_profiling_phase2`. New
+  agent dep on scapy (>=2.5) + Alpine `libpcap` package; both
+  are pure-python at install time, no compilation, multi-arch
+  clean. Tests at `backend/tests/profiling/` +
+  `agent/dhcp/tests/test_dhcp_fingerprint.py` (parser-only,
+  scapy.importorskip so the suite still passes without the
+  optional dep).
+  **Deferred:** v6 DHCPv6 fingerprint capture (DHCPv6 has its
+  own option-numbering namespace), Wi-Fi-roaming-aware MAC
+  privacy randomisation handling (the per-MAC dedupe means
+  randomised MACs each look like a fresh device — by design
+  in Phase 2; revisit when MAC-hashing-aware grouping is
+  scoped).
+

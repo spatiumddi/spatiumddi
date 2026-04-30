@@ -29,6 +29,16 @@ spec:
         - name: worker
           image: {{ include "spatiumddi.image" (merge (dict "imageName" "spatiumddi-api") .) }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          {{- if .Values.worker.netRawCapability }}
+          # NET_RAW unlocks nmap raw-socket scans (SYN, ``-O`` OS
+          # detection) for the device-profiling auto-nmap path. The
+          # image already grants the cap to the nmap binary via setcap;
+          # this line keeps it in the pod bounding set so restricted
+          # PSA / OpenShift-SCC clusters don't drop it.
+          securityContext:
+            capabilities:
+              add: ["NET_RAW"]
+          {{- end }}
           command:
             - celery
             - -A

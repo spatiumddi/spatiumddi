@@ -116,6 +116,25 @@ class LeaseEventBatch(BaseModel):
     leases: list[LeaseEvent]
 
 
+class DHCPFingerprintEntry(BaseModel):
+    """One DHCP fingerprint observation pushed by the agent's scapy sniffer.
+
+    All fields except ``mac_address`` are nullable — devices with
+    minimal DHCP option chatter still produce a useful row even if
+    fingerbank can't enrich them.
+    """
+
+    mac_address: str
+    option_55: str | None = None
+    option_60: str | None = None
+    option_77: str | None = None
+    client_id: str | None = None
+
+
+class DHCPFingerprintBatch(BaseModel):
+    fingerprints: list[DHCPFingerprintEntry]
+
+
 # ── Auth ────────────────────────────────────────────────────────────────────
 
 
@@ -547,6 +566,26 @@ async def agent_lease_events(
                         ip=ev.ip_address,
                         error=str(exc),
                     )
+
+            # Auto-profile (Phase 1: active layer). Subnet-level opt-in;
+            # the service applies the refresh-window dedupe + per-subnet
+            # concurrency cap. Like the DDNS branch above, errors are
+            # logged but never break the lease pass — profiling is
+            # opportunistic.
+            if ipam_row is not None and ipam_row.auto_from_lease:
+                try:
+                    from app.services.profiling.auto_profile import (
+                        maybe_enqueue_for_lease,
+                    )
+
+                    await maybe_enqueue_for_lease(db, subnet=subnet, ipam_row=ipam_row)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "dhcp_agent_lease_auto_profile_failed",
+                        server=str(server.id),
+                        ip=ev.ip_address,
+                        error=str(exc),
+                    )
         else:  # expired / released / declined
             if ipam_row is not None and ipam_row.auto_from_lease:
                 # Revoke DDNS BEFORE deleting the row — revoke reads
@@ -711,3 +750,84 @@ async def agent_log_entries(
         inserted += 1
     await db.commit()
     return {"status": "ok", "inserted": inserted, "dropped": dropped}
+
+
+# ── DHCP fingerprint ingestion (Phase 2 device profiling) ─────────────
+
+
+@router.post("/dhcp-fingerprints")
+async def agent_dhcp_fingerprints(
+    body: DHCPFingerprintBatch,
+    db: DB,
+    auth: tuple[DHCPServer, dict[str, Any]] = Depends(_auth_agent),
+) -> dict[str, int]:
+    """Bulk fingerprint upsert from the agent's scapy sniffer.
+
+    Capped at 500 entries per request so a misbehaving agent can't
+    OOM us. For each fingerprint we either create a new
+    ``dhcp_fingerprint`` row or refresh ``last_seen_at`` on the
+    existing one. Fresh / signature-changed rows enqueue a Celery
+    task that does the slow part (fingerbank lookup +
+    ``IPAddress.device_*`` stamping) so the agent's POST returns
+    fast.
+
+    No audit row written — fingerprint observations are too
+    high-volume to land in the audit log; the agent generates one
+    per DISCOVER/REQUEST per device. Operator-triggered actions
+    against this surface DO write audit (see the IPAM router's
+    fingerprint endpoints).
+    """
+    from app.services.profiling.passive import upsert_fingerprint
+
+    server, _ = auth
+    capped = body.fingerprints[:500]
+    dropped = max(0, len(body.fingerprints) - len(capped))
+    upserted = 0
+    enqueue_macs: list[str] = []
+    for fp in capped:
+        try:
+            _, signature_changed = await upsert_fingerprint(
+                db,
+                mac_address=fp.mac_address,
+                option_55=fp.option_55,
+                option_60=fp.option_60,
+                option_77=fp.option_77,
+                client_id=fp.client_id,
+            )
+        except Exception as exc:  # noqa: BLE001
+            # One bad row shouldn't kill the batch — log + skip.
+            logger.warning(
+                "dhcp_fingerprint_upsert_failed",
+                server=str(server.id),
+                mac=fp.mac_address,
+                error=str(exc),
+            )
+            continue
+        upserted += 1
+        if signature_changed:
+            enqueue_macs.append(fp.mac_address)
+
+    await db.commit()
+
+    # Dispatch Celery tasks for fresh / changed fingerprints. Lazy
+    # import to avoid pulling Celery into the request import graph
+    # for every other endpoint in this module.
+    if enqueue_macs:
+        try:
+            from app.tasks.dhcp_fingerprint import lookup_fingerprint_task
+
+            for mac in enqueue_macs:
+                lookup_fingerprint_task.delay(mac)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "dhcp_fingerprint_dispatch_failed",
+                server=str(server.id),
+                count=len(enqueue_macs),
+                error=str(exc),
+            )
+
+    return {
+        "upserted": upserted,
+        "dropped": dropped,
+        "enqueued": len(enqueue_macs),
+    }

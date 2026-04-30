@@ -77,6 +77,13 @@ worker:
   resources:
     requests: { cpu: 200m, memory: 256Mi }
     limits:   { cpu: 2000m, memory: 1Gi }
+  # Add CAP_NET_RAW to the worker pod so nmap can do SYN scans + ``-O``
+  # OS detection from the device-profiling auto-nmap path. NET_RAW is
+  # in containerd's default cap set so this is a no-op on permissive
+  # clusters; on restricted PSA / OpenShift-SCC it's required.
+  # Set to false if you've turned off device profiling cluster-wide
+  # and want a tighter security posture.
+  netRawCapability: true
   nodeSelector: {}
   tolerations: []
   affinity: {}

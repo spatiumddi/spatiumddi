@@ -18,6 +18,7 @@ from app.models.dhcp import (
     DHCPServerGroup,
     DHCPStaticAssignment,
 )
+from app.models.dhcp_fingerprint import DHCPFingerprint
 from app.models.dns import (
     DNSAcl,
     DNSAclEntry,
@@ -111,6 +112,7 @@ __all__ = [
     "DHCPStaticAssignment",
     "DHCPClientClass",
     "DHCPMACBlock",
+    "DHCPFingerprint",
     "DHCPLease",
     "DHCPLeaseHistory",
     "DHCPConfigOp",

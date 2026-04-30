@@ -7,7 +7,7 @@ from typing import Any
 
 import structlog
 from fastapi import APIRouter, HTTPException, status
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, model_validator
 from sqlalchemy import func, select
 
 from app.api.deps import DB, CurrentUser
@@ -72,8 +72,25 @@ class SettingsResponse(BaseModel):
     integration_docker_enabled: bool
     integration_proxmox_enabled: bool
     integration_tailscale_enabled: bool
+    # Device profiling — fingerbank API key. Boolean reflects whether
+    # an encrypted key is stored; the plaintext is never returned.
+    fingerbank_api_key_set: bool = False
 
     model_config = {"from_attributes": True}
+
+    @model_validator(mode="before")
+    @classmethod
+    def _attach_fb_set(cls, data: Any) -> Any:
+        # When serializing a PlatformSettings ORM instance, fold the
+        # ciphertext-bearing ``fingerbank_api_key_encrypted`` column
+        # into a boolean ``fingerbank_api_key_set`` so the payload
+        # never leaks the encrypted bytes — the UI only needs to know
+        # whether a key is configured.
+        if isinstance(data, PlatformSettings):
+            cols = {c.name: getattr(data, c.name) for c in data.__table__.columns}
+            cols["fingerbank_api_key_set"] = bool(cols.pop("fingerbank_api_key_encrypted", None))
+            return cols
+        return data
 
 
 class SettingsUpdate(BaseModel):
@@ -118,6 +135,11 @@ class SettingsUpdate(BaseModel):
     integration_docker_enabled: bool | None = None
     integration_proxmox_enabled: bool | None = None
     integration_tailscale_enabled: bool | None = None
+    # Device profiling — fingerbank API key. Plaintext on the wire
+    # (TLS-protected); empty string clears the stored value. Omit the
+    # field entirely to leave the existing value alone (pydantic
+    # ``model_dump(exclude_none=True)`` semantics in the write path).
+    fingerbank_api_key: str | None = None
 
     @field_validator("ip_allocation_strategy")
     @classmethod
@@ -263,7 +285,28 @@ async def update_settings(
 
     settings = await _get_or_create(db)
     changes = body.model_dump(exclude_none=True)
+
+    # fingerbank_api_key needs Fernet encryption + maps to a different
+    # column name. Empty string = clear; non-empty = encrypt + store.
+    # Pop it out of ``changes`` so the audit log doesn't capture the
+    # plaintext, then set the encrypted column directly.
+    if "fingerbank_api_key" in changes:
+        from app.core.crypto import encrypt_str
+
+        raw = changes.pop("fingerbank_api_key")
+        if raw == "":
+            settings.fingerbank_api_key_encrypted = None
+            changes["fingerbank_api_key_cleared"] = True
+        else:
+            settings.fingerbank_api_key_encrypted = encrypt_str(raw)
+            # Don't echo the plaintext in the audit log — record only
+            # that a value was set.
+            changes["fingerbank_api_key_set"] = True
+
     for field, value in changes.items():
+        # Skip the synthetic audit-only flags we just inserted.
+        if field in ("fingerbank_api_key_cleared", "fingerbank_api_key_set"):
+            continue
         setattr(settings, field, value)
 
     await db.commit()

@@ -12,11 +12,16 @@ COPY agent/dhcp/README.md /src/README.md
 RUN python3 -m pip install --prefix=/install --no-cache-dir --break-system-packages .
 
 FROM alpine:3.22 AS runtime
+# libpcap is pulled in for scapy's BPF socket support, used by the
+# optional Phase 2 device-fingerprinting sniffer (DHCP_FINGERPRINT_ENABLED=1).
+# scapy itself is pure-python so the install works on amd64 + arm64
+# without compilation. The container also needs CAP_NET_RAW at run-time
+# for the sniffer to bind the socket — see docs/deployment/DOCKER.md.
 RUN apk add --no-cache \
       kea kea-dhcp4 kea-ctrl-agent kea-admin \
       kea-hook-lease-cmds kea-hook-ha \
       tini su-exec \
-      python3 py3-pip \
+      python3 py3-pip libpcap \
       ca-certificates tzdata \
  && addgroup -S spatium \
  && adduser -S -G spatium spatium \

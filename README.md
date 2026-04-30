@@ -81,6 +81,7 @@
 |---|---|---|
 | 📡 | **SNMP discovery** | v1 / v2c / v3 polling of routers + switches → ARP / FDB / interfaces / LLDP neighbours feed back into IPAM |
 | 🎯 | **Nmap scanner** | per-IP "Scan with Nmap" + `/tools/nmap` + live SSE output streaming |
+| 🛰 | **Device profiling** | passive DHCP fingerprinting (scapy + fingerbank) **and** opt-in auto-nmap on new DHCP lease — what kind of device is on every IP |
 | 🏷 | **OUI vendor lookup** | MAC → vendor names in IP tables, DHCP leases, search filters |
 | 🎨 | **Dashboards** | utilization heatmap · DNS query rate · DHCP traffic · platform health card |
 | 📊 | **Platform Insights** | native Postgres diagnostics + per-container CPU / mem / IO. No extra agents |
@@ -215,6 +216,22 @@ The tables above are the elevator pitch. The bullets here are the same surface w
   - Live SSE output streams while the scan runs
   - Structured XML parsed into a results panel
   - Standalone `/tools/nmap` page for ad-hoc targets
+
+- 🛰 **Device profiling** — answer "what kind of device is on every IP" without
+  asking. Two layers feeding one consolidated panel in the IP detail modal.
+  - **Passive — DHCP fingerprinting.** scapy `AsyncSniffer` thread on the DHCP
+    agent reads option-55 / option-60 / option-77 / client-id from every
+    DISCOVER + REQUEST, batches per-MAC, ships to the control plane
+  - **Enrichment — fingerbank.** Optional API key in Settings → IPAM →
+    Device Profiling turns raw signatures into Type / Class / Manufacturer
+    (`HP iLO`, `Aruba AP`, `Cisco IP Phone 8841`, `iOS device`, …); 7-day
+    cache; works offline-degraded
+  - **Active — auto-nmap on new DHCP lease.** Per-subnet opt-in toggle picks a
+    preset; refresh-window dedupe (default 30 days) means churning Wi-Fi
+    leases don't fan out; per-subnet 4-scan concurrency cap
+  - **"Re-profile now"** button on the IP detail modal for ad-hoc rescan
+  - Default-off everywhere — IDS-aware (nmap is loud; passive collection
+    needs `cap_add: NET_RAW`)
 
 - 🎨 **Dashboard-at-a-glance** — sub-tabs for Overview / IPAM / DNS / DHCP.
   - Platform health card (API / Postgres / Redis / workers / beat)

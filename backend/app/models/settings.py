@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, Integer, LargeBinary, String, Text
 from sqlalchemy import text as sa_text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
@@ -209,3 +209,12 @@ class PlatformSettings(Base):
     dhcp_lease_history_retention_days: Mapped[int] = mapped_column(
         Integer, nullable=False, default=90, server_default=sa_text("90")
     )
+
+    # Fingerbank API key for passive DHCP device fingerprinting (Phase 2 of
+    # the device profiling feature). Fernet-encrypted at rest; null when the
+    # operator hasn't configured a key. When unset, the agent still ships
+    # raw option-55 / option-60 fingerprints into ``dhcp_fingerprint`` —
+    # operators just don't get the enriched device-type / class /
+    # manufacturer triple. Read via ``services.profiling.fingerbank``
+    # which decrypts on demand.
+    fingerbank_api_key_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)

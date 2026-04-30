@@ -32,6 +32,7 @@ celery_app = Celery(
         "app.tasks.snmp_poll",
         "app.tasks.nmap",
         "app.tasks.dns_pool_healthcheck",
+        "app.tasks.dhcp_fingerprint",
     ],
 )
 
@@ -76,6 +77,7 @@ celery_app.conf.update(
         "app.tasks.snmp_poll.*": {"queue": "default"},
         "app.tasks.nmap.*": {"queue": "default"},
         "app.tasks.dns_pool_healthcheck.*": {"queue": "dns"},
+        "app.tasks.dhcp_fingerprint.*": {"queue": "dhcp"},
     },
     beat_schedule={
         # Every 60s, fan-out health checks to every registered DNS server.

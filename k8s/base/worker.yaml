@@ -22,6 +22,17 @@ spec:
         - name: worker
           image: ghcr.io/spatiumddi/spatiumddi-api:latest
           imagePullPolicy: Always
+          # NET_RAW lets the worker run nmap with raw sockets — required
+          # for SYN scans + ``-O`` OS detection in the device-profiling
+          # auto-nmap path. The image grants the cap to the nmap binary
+          # via setcap; this line keeps it in the pod's bounding set
+          # so restricted PSA / OpenShift-SCC clusters don't drop it.
+          # No effect on permissive clusters (NET_RAW is in the default
+          # set there). Drop NET_RAW with a values-level toggle if you
+          # disable device profiling cluster-wide.
+          securityContext:
+            capabilities:
+              add: ["NET_RAW"]
           command:
             - celery
             - -A

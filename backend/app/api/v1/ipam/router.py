@@ -1399,6 +1399,10 @@ class SubnetCreate(BaseModel):
     ddns_domain_override: str | None = None
     ddns_ttl: int | None = None
     ddns_inherit_settings: bool = True
+    # Device profiling — see Subnet model. Default off because nmap is loud.
+    auto_profile_on_dhcp_lease: bool = False
+    auto_profile_preset: str = "service_and_os"
+    auto_profile_refresh_days: int = 30
     ipv6_allocation_policy: str = "random"
 
     @field_validator("ipv6_allocation_policy")
@@ -1415,6 +1419,31 @@ class SubnetCreate(BaseModel):
         allowed = {"client_provided", "client_or_generated", "always_generate", "disabled"}
         if v not in allowed:
             raise ValueError(f"ddns_hostname_policy must be one of: {', '.join(sorted(allowed))}")
+        return v
+
+    @field_validator("auto_profile_preset")
+    @classmethod
+    def validate_auto_profile_preset_create(cls, v: str) -> str:
+        # ``custom`` is intentionally excluded — auto-profile dispatches
+        # have no operator-supplied argv to attach a custom flag list to.
+        allowed = {
+            "quick",
+            "service_version",
+            "os_fingerprint",
+            "service_and_os",
+            "default_scripts",
+            "udp_top100",
+            "aggressive",
+        }
+        if v not in allowed:
+            raise ValueError(f"auto_profile_preset must be one of: {', '.join(sorted(allowed))}")
+        return v
+
+    @field_validator("auto_profile_refresh_days")
+    @classmethod
+    def validate_auto_profile_refresh_create(cls, v: int) -> int:
+        if v < 1 or v > 365:
+            raise ValueError("auto_profile_refresh_days must be between 1 and 365")
         return v
 
     @field_validator("network")
@@ -1470,6 +1499,9 @@ class SubnetUpdate(BaseModel):
     ddns_domain_override: str | None = None
     ddns_ttl: int | None = None
     ddns_inherit_settings: bool | None = None
+    auto_profile_on_dhcp_lease: bool | None = None
+    auto_profile_preset: str | None = None
+    auto_profile_refresh_days: int | None = None
     ipv6_allocation_policy: str | None = None
 
     @field_validator("ipv6_allocation_policy")
@@ -1500,6 +1532,33 @@ class SubnetUpdate(BaseModel):
         allowed = {"client_provided", "client_or_generated", "always_generate", "disabled"}
         if v not in allowed:
             raise ValueError(f"ddns_hostname_policy must be one of: {', '.join(sorted(allowed))}")
+        return v
+
+    @field_validator("auto_profile_preset")
+    @classmethod
+    def validate_auto_profile_preset_update(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        allowed = {
+            "quick",
+            "service_version",
+            "os_fingerprint",
+            "service_and_os",
+            "default_scripts",
+            "udp_top100",
+            "aggressive",
+        }
+        if v not in allowed:
+            raise ValueError(f"auto_profile_preset must be one of: {', '.join(sorted(allowed))}")
+        return v
+
+    @field_validator("auto_profile_refresh_days")
+    @classmethod
+    def validate_auto_profile_refresh_update(cls, v: int | None) -> int | None:
+        if v is None:
+            return v
+        if v < 1 or v > 365:
+            raise ValueError("auto_profile_refresh_days must be between 1 and 365")
         return v
 
 
@@ -1548,6 +1607,9 @@ class SubnetResponse(BaseModel):
     ddns_domain_override: str | None = None
     ddns_ttl: int | None = None
     ddns_inherit_settings: bool = True
+    auto_profile_on_dhcp_lease: bool = False
+    auto_profile_preset: str = "service_and_os"
+    auto_profile_refresh_days: int = 30
     ipv6_allocation_policy: str = "random"
     created_at: datetime
     modified_at: datetime
@@ -1765,6 +1827,19 @@ class IPAddressResponse(BaseModel):
     # IEEE OUI vendor for this MAC, when the feature is enabled and we have
     # the prefix in our local DB. None on writes / unknown MACs / OUI off.
     vendor: str | None = None
+    # Device profile (Phase 1 — active layer). ``last_profiled_at`` is
+    # the finished_at timestamp of the most recent successful nmap
+    # profile scan; ``last_profile_scan_id`` deep-links to that scan
+    # row for the IP detail modal's "Device profile" section.
+    last_profiled_at: datetime | None = None
+    last_profile_scan_id: uuid.UUID | None = None
+    # Device profile (Phase 2 — passive layer). Denormalised from the
+    # ``dhcp_fingerprint`` row matching this IP's MAC; populated by
+    # the fingerbank lookup task. Null when no fingerprint exists yet
+    # or the operator's ``user_modified_at`` lock is set.
+    device_type: str | None = None
+    device_class: str | None = None
+    device_manufacturer: str | None = None
     created_at: datetime
     modified_at: datetime
 
@@ -5142,6 +5217,151 @@ async def delete_alias(
     )
     await db.delete(rec)
     await db.commit()
+
+
+class ProfileScanRequest(BaseModel):
+    """Optional override of the subnet's configured auto-profile preset.
+
+    When ``preset`` is omitted, ``services.profiling.auto_profile.enqueue_now``
+    falls back to ``Subnet.auto_profile_preset``.
+    """
+
+    preset: str | None = None
+
+    @field_validator("preset")
+    @classmethod
+    def _v(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        allowed = {
+            "quick",
+            "service_version",
+            "os_fingerprint",
+            "service_and_os",
+            "default_scripts",
+            "udp_top100",
+            "aggressive",
+        }
+        if v not in allowed:
+            raise ValueError(f"preset must be one of: {', '.join(sorted(allowed))}")
+        return v
+
+
+class ProfileScanResponse(BaseModel):
+    scan_id: uuid.UUID
+    preset: str
+    status: str
+
+
+@router.post(
+    "/addresses/{address_id}/profile",
+    response_model=ProfileScanResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+)
+async def profile_address(
+    address_id: uuid.UUID,
+    body: ProfileScanRequest,
+    current_user: CurrentUser,
+    db: DB,
+) -> ProfileScanResponse:
+    """Operator-triggered "Re-profile now" for an IP.
+
+    Bypasses the subnet-level dedupe window — the operator just told us
+    to scan again — but still respects the per-subnet concurrency cap
+    (returns 429 when exceeded). The dispatched scan flows through the
+    same NmapScan pipeline as auto-profiles and operator-initiated
+    scans; on success the runner stamps ``last_profiled_at`` +
+    ``last_profile_scan_id`` back on the IP.
+    """
+    ip = await db.get(IPAddress, address_id)
+    if ip is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP address not found")
+
+    from app.services.profiling.auto_profile import enqueue_now
+
+    try:
+        scan = await enqueue_now(db, ipam_row=ip, preset=body.preset)
+    except ValueError as exc:
+        # Concurrency cap reached — surfaced as 429 so the UI can show
+        # a "try again in a moment" message rather than treating this
+        # as a permanent failure.
+        raise HTTPException(status_code=status.HTTP_429_TOO_MANY_REQUESTS, detail=str(exc)) from exc
+
+    db.add(
+        _audit(
+            current_user,
+            "create",
+            "ip_address",
+            str(ip.id),
+            f"profile_scan {ip.address}",
+            new_value={"scan_id": str(scan.id), "preset": scan.preset},
+        )
+    )
+    await db.commit()
+    await db.refresh(scan)
+    return ProfileScanResponse(scan_id=scan.id, preset=scan.preset, status=scan.status)
+
+
+class DHCPFingerprintResponse(BaseModel):
+    """Passive DHCP fingerprint surface for the IP detail modal.
+
+    Mirrors ``DHCPFingerprint`` columns one-for-one. Fingerbank
+    fields are nullable when no API key is configured or the lookup
+    hasn't run yet — the UI shows the raw signature in either case.
+    """
+
+    mac_address: str
+    option_55: str | None
+    option_60: str | None
+    option_77: str | None
+    client_id: str | None
+    fingerbank_device_id: int | None
+    fingerbank_device_name: str | None
+    fingerbank_device_class: str | None
+    fingerbank_manufacturer: str | None
+    fingerbank_score: int | None
+    fingerbank_last_lookup_at: datetime | None
+    fingerbank_last_error: str | None
+    first_seen_at: datetime
+    last_seen_at: datetime
+
+    model_config = {"from_attributes": True}
+
+    @field_validator("mac_address", mode="before")
+    @classmethod
+    def coerce_mac(cls, v: Any) -> Any:
+        return str(v) if v is not None else v
+
+
+@router.get(
+    "/addresses/{address_id}/dhcp-fingerprint",
+    response_model=DHCPFingerprintResponse,
+)
+async def get_address_dhcp_fingerprint(
+    address_id: uuid.UUID,
+    current_user: CurrentUser,
+    db: DB,
+) -> DHCPFingerprintResponse:
+    """Fetch the DHCP fingerprint row keyed by this IP's MAC.
+
+    404s when the IP has no MAC, or when no fingerprint has been
+    captured yet for that MAC. The agent's scapy sniffer must be
+    enabled (``DHCP_FINGERPRINT_ENABLED=1``) for these rows to
+    populate.
+    """
+    ip = await db.get(IPAddress, address_id)
+    if ip is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP address not found")
+
+    from app.services.profiling.passive import get_fingerprint_for_ip
+
+    fingerprint = await get_fingerprint_for_ip(db, ip=ip)
+    if fingerprint is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No DHCP fingerprint recorded for this IP's MAC",
+        )
+    return DHCPFingerprintResponse.model_validate(fingerprint)
 
 
 @router.delete("/addresses/{address_id}", status_code=status.HTTP_204_NO_CONTENT)

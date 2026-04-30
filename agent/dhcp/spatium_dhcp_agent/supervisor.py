@@ -8,6 +8,7 @@ container orchestrator restarts us.
 
 from __future__ import annotations
 
+import os
 import signal
 import sys
 import threading
@@ -17,6 +18,7 @@ import structlog
 
 from .bootstrap import ensure_token
 from .config import AgentConfig
+from .dhcp_fingerprint import DhcpFingerprintShipper
 from .ha_status import HAStatusPoller
 from .heartbeat import HeartbeatClient
 from .leases import LeaseWatcher
@@ -50,6 +52,21 @@ def run(cfg: AgentConfig) -> int:
     metrics = MetricsPoller(cfg, token_ref)
     log_shipper = LogShipper(cfg, token_ref)
 
+    # Passive DHCP fingerprinting is opt-in (Phase 2 device profiling).
+    # Default off because:
+    #   1. The container needs CAP_NET_RAW to bind the BPF socket, and
+    #      we don't want to silently fail when the cap isn't granted.
+    #   2. scapy is a heavyweight import — we don't want the cost on
+    #      deployments that aren't using fingerprinting.
+    # Operators flip DHCP_FINGERPRINT_ENABLED=1 in their compose env
+    # to turn it on; the cap_add must be set in the compose override
+    # too (see docs/deployment/DOCKER.md).
+    fingerprint_enabled = os.environ.get("DHCP_FINGERPRINT_ENABLED", "0") == "1"
+    fingerprint_shipper: DhcpFingerprintShipper | None = None
+    if fingerprint_enabled:
+        fingerprint_shipper = DhcpFingerprintShipper(cfg, token_ref)
+        log.info("dhcp_fingerprint_enabled")
+
     threads = [
         threading.Thread(target=syncer.run, name="sync", daemon=True),
         threading.Thread(target=heartbeat.run, name="heartbeat", daemon=True),
@@ -59,6 +76,14 @@ def run(cfg: AgentConfig) -> int:
         threading.Thread(target=metrics.run, name="metrics", daemon=True),
         threading.Thread(target=log_shipper.run, name="log-shipper", daemon=True),
     ]
+    if fingerprint_shipper is not None:
+        threads.append(
+            threading.Thread(
+                target=fingerprint_shipper.run,
+                name="dhcp-fingerprint",
+                daemon=True,
+            )
+        )
     for t in threads:
         t.start()
 
@@ -74,6 +99,8 @@ def run(cfg: AgentConfig) -> int:
         peer_watcher.stop()
         metrics.stop()
         log_shipper.stop()
+        if fingerprint_shipper is not None:
+            fingerprint_shipper.stop()
 
     signal.signal(signal.SIGTERM, _sig)
     signal.signal(signal.SIGINT, _sig)

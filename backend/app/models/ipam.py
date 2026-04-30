@@ -354,6 +354,36 @@ class Subnet(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
         Boolean, nullable=False, default=True, server_default=sa_text("true")
     )
 
+    # ── Device profiling — auto-nmap on new DHCP leases ──────────────
+    # When enabled, a fresh DHCP lease landing in this subnet enqueues
+    # an active nmap scan against the leased IP via the existing
+    # NmapScan pipeline. ``auto_profile_preset`` picks one of the
+    # PRESETS keys in services/nmap/runner.py (default
+    # ``service_version`` — gives OS hints + open services without the
+    # heavyweight ``aggressive`` flag). ``auto_profile_refresh_days``
+    # is the dedupe window: the same (mac, ip) pair won't re-scan
+    # within this many days of its last profile, so churning Wi-Fi
+    # leases don't spawn back-to-back scans.
+    #
+    # Tradeoffs intentionally exposed in the UI: nmap from the
+    # SpatiumDDI host shows up as a port-scan to corporate IDS, so
+    # the toggle is default-off and operators have to opt in per
+    # subnet. See CLAUDE.md "Device profiling" entry for the full
+    # design. (Block/space inheritance intentionally omitted in Phase 1 —
+    # added once operators ask for cascade.)
+    auto_profile_on_dhcp_lease: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
+    auto_profile_preset: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="service_and_os",
+        server_default=sa_text("'service_and_os'"),
+    )
+    auto_profile_refresh_days: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=30, server_default=sa_text("30")
+    )
+
     # IPv6 auto-allocation policy (ignored for IPv4 subnets — those use
     # PlatformSettings.ip_allocation_strategy which is sequential /
     # random only). Values:
@@ -563,6 +593,37 @@ class IPAddress(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         nullable=True,
         index=True,
     )
+
+    # ── Device profiling — populated by the auto-profile pipeline ────
+    # ``last_profiled_at`` is the timestamp of the last *successful*
+    # profile scan; the dedupe gate in services/profiling/auto_profile.py
+    # uses it together with the subnet's ``auto_profile_refresh_days``
+    # to decide whether a fresh lease should re-trigger a scan.
+    # ``last_profile_scan_id`` deep-links to the NmapScan row that
+    # produced the most recent result, so the IP detail modal can
+    # render the full scan output without denormalising it here.
+    last_profiled_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_profile_scan_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("nmap_scan.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
+    # ── Device profile — passive layer (Phase 2) ─────────────────────
+    # Denormalised fingerbank lookup result for fast list rendering.
+    # Source of truth is ``dhcp_fingerprint`` keyed by MAC; the
+    # fingerprint task stamps these three columns whenever a fresh
+    # lookup lands. Operators with edits on the row (``user_modified_at``
+    # not null) keep their values — the stamper respects the same
+    # lock the integration reconcilers use. nmap OS-detection
+    # populates the same surface (``os.name`` → ``device_type``) so
+    # the IP detail modal can render one consistent "device" line
+    # whether enrichment came from passive DHCP or active nmap.
+    device_type: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    device_class: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    device_manufacturer: Mapped[str | None] = mapped_column(String(100), nullable=True)
 
     # Stamped by the API write path when an operator edits the row's
     # soft fields (hostname / description / status / mac_address).

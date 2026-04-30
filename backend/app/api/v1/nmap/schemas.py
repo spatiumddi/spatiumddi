@@ -12,6 +12,7 @@ NmapPreset = Literal[
     "quick",
     "service_version",
     "os_fingerprint",
+    "service_and_os",
     "default_scripts",
     "udp_top100",
     "aggressive",

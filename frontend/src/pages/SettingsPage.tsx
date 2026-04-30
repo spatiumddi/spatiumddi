@@ -89,6 +89,7 @@ type SectionId =
   | "integrations-tailscale"
   | "ip-allocation"
   | "oui-lookup"
+  | "device-profiling"
   | "session"
   | "subnet-tree"
   | "updates"
@@ -165,6 +166,7 @@ const SECTION_FIELDS: Record<SectionId, (keyof PlatformSettings)[]> = {
   "integrations-tailscale": ["integration_tailscale_enabled"],
   "ip-allocation": ["ip_allocation_strategy"],
   "oui-lookup": ["oui_lookup_enabled", "oui_update_interval_hours"],
+  "device-profiling": ["fingerbank_api_key"],
   session: ["session_timeout_minutes", "auto_logout_minutes"],
   "subnet-tree": ["subnet_tree_default_expanded_depth"],
   updates: ["github_release_check_enabled"],
@@ -477,6 +479,125 @@ function OUILookupSection({
   );
 }
 
+// ── Device Profiling ───────────────────────────────────────────────────
+//
+// Backend stores ``fingerbank_api_key_encrypted`` (Fernet at rest) and
+// surfaces a read-only ``fingerbank_api_key_set`` boolean on the
+// settings response. To set or clear the key, the operator submits a
+// plaintext value on the update payload — empty string clears, a
+// non-empty value encrypts + replaces. We mirror that in this UI: a
+// toggle between "Configured ✓ Replace…" and a password-style input,
+// and a separate "Clear" button when one is on file.
+function DeviceProfilingSection({
+  values,
+  set,
+  isSuperadmin,
+  inputCls,
+}: {
+  values: PlatformSettings;
+  set: <K extends keyof PlatformSettings>(
+    key: K,
+    value: PlatformSettings[K],
+  ) => void;
+  isSuperadmin: boolean;
+  inputCls: string;
+}) {
+  const isSet = !!values.fingerbank_api_key_set;
+  const draft = values.fingerbank_api_key;
+  // Tri-state UI: configured + idle, or replacing/setting (input
+  // visible), or clear-pending (draft === "").
+  // When the operator clicks Replace… we set draft to "" — that
+  // *would* clear the key on save. To keep the "replacing" intent
+  // distinct from "clear", we rely on the empty-string draft being
+  // typed-over before save. If they save with the input still empty,
+  // that's a clear, which matches what the Clear button does anyway.
+  const [replacing, setReplacing] = useState(false);
+  const clearPending = isSet && draft === "";
+  const showInput =
+    !isSet || replacing || (draft !== undefined && draft !== "");
+  return (
+    <>
+      <Field
+        label="fingerbank API key"
+        description="Sign up at fingerbank.org for a free key. Stored Fernet-encrypted server-side; the plaintext is never returned. Without a key, raw DHCP signatures still surface in the IP detail modal but no enrichment runs."
+      >
+        {clearPending ? (
+          <div className="flex items-center gap-2">
+            <span className="rounded bg-amber-500/10 px-2 py-1 text-xs font-medium text-amber-700 dark:text-amber-400">
+              Pending clear — save to apply
+            </span>
+            <button
+              type="button"
+              onClick={() => set("fingerbank_api_key", undefined)}
+              disabled={!isSuperadmin}
+              className="rounded-md border px-2 py-1 text-xs hover:bg-accent disabled:opacity-40"
+            >
+              Undo
+            </button>
+          </div>
+        ) : showInput ? (
+          <div className="flex items-center gap-2">
+            <input
+              type="password"
+              autoComplete="off"
+              spellCheck={false}
+              value={draft ?? ""}
+              onChange={(e) => set("fingerbank_api_key", e.target.value)}
+              placeholder={isSet ? "(replace existing key)" : "Paste API key"}
+              disabled={!isSuperadmin}
+              className={cn(inputCls, "w-96 max-w-full font-mono")}
+            />
+            {isSet && (
+              <button
+                type="button"
+                onClick={() => {
+                  set("fingerbank_api_key", undefined);
+                  setReplacing(false);
+                }}
+                disabled={!isSuperadmin}
+                className="rounded-md border px-2 py-1 text-xs hover:bg-accent disabled:opacity-40"
+                title="Cancel — keep the existing key"
+              >
+                Cancel
+              </button>
+            )}
+          </div>
+        ) : (
+          <div className="flex items-center gap-2">
+            <span className="rounded bg-emerald-500/10 px-2 py-1 text-xs font-medium text-emerald-700 dark:text-emerald-400">
+              Configured ✓
+            </span>
+            <button
+              type="button"
+              onClick={() => setReplacing(true)}
+              disabled={!isSuperadmin}
+              className="rounded-md border px-2 py-1 text-xs hover:bg-accent disabled:opacity-40"
+            >
+              Replace…
+            </button>
+            <button
+              type="button"
+              onClick={() => set("fingerbank_api_key", "")}
+              disabled={!isSuperadmin}
+              className="rounded-md border border-destructive/40 px-2 py-1 text-xs text-destructive hover:bg-destructive/10 disabled:opacity-40"
+            >
+              Clear
+            </button>
+          </div>
+        )}
+      </Field>
+      <Field
+        label="How it gets used"
+        description="The DHCP agent's scapy sniffer (when enabled with DHCP_FINGERPRINT_ENABLED=1) ships option-55 / option-60 / option-77 / client-id captures to the control plane. A Celery task looks up each fingerprint via the fingerbank API and stamps Type / Class / Manufacturer onto every IPAM row sharing the MAC. 7-day cache; failures are swallowed so collection never breaks."
+      >
+        <span className="text-xs text-muted-foreground">
+          See the IP detail modal's "Device profile" section for live results.
+        </span>
+      </Field>
+    </>
+  );
+}
+
 // Grouped, then alphabetical by title within each group. The sidebar
 // renders a section header + divider at every group boundary.
 const SECTIONS: SectionDef[] = [
@@ -560,6 +681,25 @@ const SECTIONS: SectionDef[] = [
       "manufacturer",
       "lookup",
       "prefix",
+    ],
+  },
+  {
+    id: "device-profiling",
+    title: "Device Profiling",
+    group: "IPAM",
+    description:
+      "Optional fingerbank API key — turns the DHCP fingerprints captured by the agent's scapy sniffer into Type / Class / Manufacturer on every IP. Without a key, raw signatures still surface in the IP detail modal but no enrichment runs. Free tier exists at fingerbank.org.",
+    keywords: [
+      "fingerbank",
+      "fingerprint",
+      "device",
+      "profile",
+      "profiling",
+      "dhcp",
+      "passive",
+      "nmap",
+      "manufacturer",
+      "class",
     ],
   },
   {
@@ -1362,6 +1502,15 @@ export function SettingsPage() {
 
             {activeId === "oui-lookup" && (
               <OUILookupSection
+                values={values}
+                set={set}
+                isSuperadmin={isSuperadmin}
+                inputCls={inputCls}
+              />
+            )}
+
+            {activeId === "device-profiling" && (
+              <DeviceProfilingSection
                 values={values}
                 set={set}
                 isSuperadmin={isSuperadmin}

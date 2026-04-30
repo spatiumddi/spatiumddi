@@ -463,6 +463,21 @@ export interface Subnet {
   // When True, the four fields above are ignored and the effective DDNS
   // config is resolved from the containing block / space.
   ddns_inherit_settings?: boolean;
+  // Device profiling — opt-in auto-nmap on new DHCP leases. See
+  // CLAUDE.md "Device profiling" entry. Default off because nmap is
+  // loud (corporate IDS will flag the source IP); operators must
+  // authorise + enable per subnet. ``auto_profile_refresh_days`` is
+  // the dedupe window so churning Wi-Fi clients don't re-trigger.
+  auto_profile_on_dhcp_lease?: boolean;
+  auto_profile_preset?:
+    | "quick"
+    | "service_version"
+    | "os_fingerprint"
+    | "service_and_os"
+    | "default_scripts"
+    | "udp_top100"
+    | "aggressive";
+  auto_profile_refresh_days?: number;
   dns_servers?: string[] | null;
   domain_name?: string | null;
   created_at?: string;
@@ -537,8 +552,41 @@ export interface IPAddress {
   nat_mapping_count?: number;
   // IEEE OUI vendor for this MAC (populated when OUI lookup is enabled).
   vendor?: string | null;
+  // Device profile (active-layer Phase 1). ``last_profiled_at`` is the
+  // finished_at of the most recent successful nmap profile scan;
+  // ``last_profile_scan_id`` deep-links to the NmapScan row. Surfaced
+  // in the IP detail modal's "Device profile" section.
+  last_profiled_at?: string | null;
+  last_profile_scan_id?: string | null;
+  // Device profile (passive-layer Phase 2). Populated by the
+  // fingerbank lookup task off DHCP option-55/option-60 captures
+  // pushed by the agent's scapy sniffer. Null while the sniffer is
+  // disabled or no fingerprint has been observed for the row's MAC.
+  device_type?: string | null;
+  device_class?: string | null;
+  device_manufacturer?: string | null;
   created_at?: string;
   modified_at?: string;
+}
+
+/** Joined view of the ``dhcp_fingerprint`` row (passive-layer Phase 2)
+ *  that matches an IP's MAC. Surfaced in the IP detail modal's "Device
+ *  profile" section under a "Raw signature" disclosure. */
+export interface DHCPFingerprintResponse {
+  mac_address: string;
+  option_55: string | null;
+  option_60: string | null;
+  option_77: string | null;
+  client_id: string | null;
+  fingerbank_device_id: number | null;
+  fingerbank_device_name: string | null;
+  fingerbank_device_class: string | null;
+  fingerbank_manufacturer: string | null;
+  fingerbank_score: number | null;
+  fingerbank_last_lookup_at: string | null;
+  fingerbank_last_error: string | null;
+  first_seen_at: string;
+  last_seen_at: string;
 }
 
 /** One observation in an IP's MAC history. ``vendor`` is best-effort
@@ -1086,6 +1134,24 @@ export const ipamApi = {
     api.delete(`/ipam/addresses/${id}`, {
       params: permanent ? { permanent: true } : undefined,
     }),
+  /** Operator-triggered "Re-profile now" — bypasses the subnet's
+   *  refresh-window dedupe but still respects the per-subnet
+   *  concurrency cap (returns 429 when full). */
+  profileAddress: (id: string, preset?: string) =>
+    api
+      .post<{
+        scan_id: string;
+        preset: string;
+        status: string;
+      }>(`/ipam/addresses/${id}/profile`, { preset: preset ?? null })
+      .then((r) => r.data),
+  /** Fetch the passive DHCP fingerprint joined to this IP's MAC.
+   *  404 when the IP has no MAC or no fingerprint has been captured
+   *  yet — callers should swallow that and treat it as "no data". */
+  getDhcpFingerprint: (id: string) =>
+    api
+      .get<DHCPFingerprintResponse>(`/ipam/addresses/${id}/dhcp-fingerprint`)
+      .then((r) => r.data),
   listAliases: (addressId: string) =>
     api
       .get<
@@ -1591,6 +1657,14 @@ export interface PlatformSettings {
   integration_docker_enabled: boolean;
   integration_proxmox_enabled: boolean;
   integration_tailscale_enabled: boolean;
+  /** Read-only — true when an encrypted fingerbank API key is on file.
+   *  The plaintext is never returned. Submit a value via
+   *  ``fingerbank_api_key`` on the update payload to set or clear it
+   *  (empty string clears). */
+  fingerbank_api_key_set: boolean;
+  /** Write-only — Fernet-encrypted server-side. Set to a non-empty
+   *  string to store; set to "" to clear; omit to leave unchanged. */
+  fingerbank_api_key?: string;
 }
 
 export interface OUIStatus {
@@ -5156,6 +5230,7 @@ export type NmapPreset =
   | "quick"
   | "service_version"
   | "os_fingerprint"
+  | "service_and_os"
   | "default_scripts"
   | "udp_top100"
   | "aggressive"
