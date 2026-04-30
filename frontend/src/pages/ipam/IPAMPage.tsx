@@ -6263,11 +6263,18 @@ function _formatNatLine(m: NATMapping): {
   to: string;
   proto: string;
 } {
+  // hide-NAT mappings have a subnet on the internal side (no single IP);
+  // render the subnet's CIDR, falling back to its name, then to a UUID
+  // prefix only as a last-resort label.
+  const subnetLabel =
+    m.internal_subnet_cidr ??
+    m.internal_subnet_name ??
+    (m.internal_subnet_id
+      ? `subnet ${m.internal_subnet_id.slice(0, 8)}…`
+      : "—");
   const internal =
-    (m.internal_ip ??
-      (m.internal_subnet_id
-        ? `subnet:${m.internal_subnet_id.slice(0, 8)}`
-        : "—")) + _formatNatPorts(m.internal_port_start, m.internal_port_end);
+    (m.internal_ip ?? (m.internal_subnet_id ? subnetLabel : "—")) +
+    _formatNatPorts(m.internal_port_start, m.internal_port_end);
   const external =
     (m.external_ip ?? "—") +
     _formatNatPorts(m.external_port_start, m.external_port_end);

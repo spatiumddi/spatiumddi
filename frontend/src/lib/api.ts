@@ -2077,6 +2077,121 @@ export interface DNSServerEventsResponse {
   items: DNSServerEventEntry[];
 }
 
+// Latest agent-pushed snapshot of the on-disk rendered config tree.
+// One entry per text file under the agent's rendered/ directory:
+// "named.conf" + every "zones/<name>.db". `rendered_at` is null when
+// the agent hasn't pushed yet (fresh server, never reloaded).
+export interface DNSRenderedConfigFile {
+  path: string;
+  content: string;
+}
+export interface DNSRenderedConfigResponse {
+  server_id: string;
+  rendered_at: string | null;
+  files: DNSRenderedConfigFile[];
+}
+
+// Latest agent-pushed `rndc status` output. Confirms the daemon is
+// running + which zones are loaded without needing SSH access.
+export interface DNSRndcStatusResponse {
+  server_id: string;
+  observed_at: string | null;
+  text: string | null;
+}
+
+export interface DNSPoolMember {
+  id: string;
+  pool_id: string;
+  address: string;
+  weight: number;
+  enabled: boolean;
+  last_check_state: "unknown" | "healthy" | "unhealthy";
+  last_check_at: string | null;
+  last_check_error: string | null;
+  consecutive_failures: number;
+  consecutive_successes: number;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface DNSPoolMemberWrite {
+  address: string;
+  weight?: number;
+  enabled?: boolean;
+}
+
+export interface DNSPool {
+  id: string;
+  group_id: string;
+  zone_id: string;
+  name: string;
+  description: string;
+  record_name: string;
+  record_type: "A" | "AAAA";
+  ttl: number;
+  enabled: boolean;
+  hc_type: "none" | "tcp" | "http" | "https" | "icmp";
+  hc_target_port: number | null;
+  hc_path: string;
+  hc_method: string;
+  hc_verify_tls: boolean;
+  hc_expected_status_codes: number[];
+  hc_interval_seconds: number;
+  hc_timeout_seconds: number;
+  hc_unhealthy_threshold: number;
+  hc_healthy_threshold: number;
+  next_check_at: string | null;
+  last_checked_at: string | null;
+  members: DNSPoolMember[];
+  created_at: string;
+  modified_at: string;
+}
+
+export interface DNSPoolListEntry {
+  id: string;
+  group_id: string;
+  group_name: string;
+  zone_id: string;
+  zone_name: string;
+  name: string;
+  description: string;
+  record_name: string;
+  record_type: "A" | "AAAA";
+  ttl: number;
+  enabled: boolean;
+  hc_type: "none" | "tcp" | "http" | "https" | "icmp";
+  hc_target_port: number | null;
+  hc_interval_seconds: number;
+  next_check_at: string | null;
+  last_checked_at: string | null;
+  member_count: number;
+  healthy_count: number;
+  enabled_count: number;
+  live_count: number;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface DNSPoolWrite {
+  name: string;
+  description?: string;
+  record_name: string;
+  record_type?: "A" | "AAAA";
+  ttl?: number;
+  enabled?: boolean;
+  hc_type?: "none" | "tcp" | "http" | "https" | "icmp";
+  hc_target_port?: number | null;
+  hc_path?: string;
+  hc_method?: string;
+  hc_verify_tls?: boolean;
+  hc_expected_status_codes?: number[];
+  hc_interval_seconds?: number;
+  hc_timeout_seconds?: number;
+  hc_unhealthy_threshold?: number;
+  hc_healthy_threshold?: number;
+  members?: DNSPoolMemberWrite[];
+}
+
 export interface DNSServer {
   id: string;
   group_id: string;
@@ -2349,6 +2464,9 @@ export interface DNSRecord {
   auto_generated: boolean;
   // Non-null when the record was synthesised by Tailscale Phase 2.
   tailscale_tenant_id: string | null;
+  // Non-null when the record is rendered by the DNS pool health-check
+  // pipeline. Operator edits / deletes are blocked while non-null.
+  pool_member_id: string | null;
   created_at: string;
   modified_at: string;
 }
@@ -2363,6 +2481,8 @@ export interface DNSGroupRecord {
   fqdn: string;
   // Synthesised by Tailscale Phase 2 → write paths blocked.
   tailscale_tenant_id?: string | null;
+  // Managed by a DNS pool → write paths blocked.
+  pool_member_id?: string | null;
   record_type: string;
   value: string;
   ttl: number | null;
@@ -2489,6 +2609,52 @@ export const dnsApi = {
         `/dns/servers/${serverId}/recent-events?limit=${limit}`,
       )
       .then((r) => r.data),
+  getServerRenderedConfig: (serverId: string) =>
+    api
+      .get<DNSRenderedConfigResponse>(
+        `/dns/servers/${serverId}/rendered-config`,
+      )
+      .then((r) => r.data),
+  getServerRndcStatus: (serverId: string) =>
+    api
+      .get<DNSRndcStatusResponse>(`/dns/servers/${serverId}/rndc-status`)
+      .then((r) => r.data),
+
+  // DNS pools (GSLB-lite)
+  listAllPools: (groupId?: string) =>
+    api
+      .get<DNSPoolListEntry[]>(`/dns/pools`, {
+        params: groupId ? { group_id: groupId } : undefined,
+      })
+      .then((r) => r.data),
+  listPools: (groupId: string, zoneId: string) =>
+    api
+      .get<DNSPool[]>(`/dns/groups/${groupId}/zones/${zoneId}/pools`)
+      .then((r) => r.data),
+  createPool: (groupId: string, zoneId: string, data: DNSPoolWrite) =>
+    api
+      .post<DNSPool>(`/dns/groups/${groupId}/zones/${zoneId}/pools`, data)
+      .then((r) => r.data),
+  getPool: (poolId: string) =>
+    api.get<DNSPool>(`/dns/pools/${poolId}`).then((r) => r.data),
+  updatePool: (poolId: string, data: Partial<DNSPoolWrite>) =>
+    api.put<DNSPool>(`/dns/pools/${poolId}`, data).then((r) => r.data),
+  deletePool: (poolId: string) => api.delete(`/dns/pools/${poolId}`),
+  checkPoolNow: (poolId: string) =>
+    api.post<DNSPool>(`/dns/pools/${poolId}/check-now`).then((r) => r.data),
+  addPoolMember: (poolId: string, data: DNSPoolMemberWrite) =>
+    api
+      .post<DNSPoolMember>(`/dns/pools/${poolId}/members`, data)
+      .then((r) => r.data),
+  updatePoolMember: (
+    memberId: string,
+    data: { weight?: number; enabled?: boolean },
+  ) =>
+    api
+      .put<DNSPoolMember>(`/dns/pool-members/${memberId}`, data)
+      .then((r) => r.data),
+  deletePoolMember: (memberId: string) =>
+    api.delete(`/dns/pool-members/${memberId}`),
 
   syncGroupWithServers: (groupId: string) =>
     api
@@ -4434,6 +4600,10 @@ export interface NATMapping {
   internal_ip: string | null;
   internal_ip_address_id: string | null;
   internal_subnet_id: string | null;
+  // Display labels for the internal subnet (populated server-side on the
+  // hide-NAT path); without these the UI can only show the bare UUID.
+  internal_subnet_cidr: string | null;
+  internal_subnet_name: string | null;
   internal_port_start: number | null;
   internal_port_end: number | null;
   external_ip: string | null;

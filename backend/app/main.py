@@ -82,12 +82,13 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
         ],
     ),
     "DNS Editor": (
-        "Full CRUD on DNS zones, records, server groups and blocklists.",
+        "Full CRUD on DNS zones, records, server groups, blocklists, and pools.",
         [
             {"action": "admin", "resource_type": "dns_group"},
             {"action": "admin", "resource_type": "dns_zone"},
             {"action": "admin", "resource_type": "dns_record"},
             {"action": "admin", "resource_type": "dns_blocklist"},
+            {"action": "admin", "resource_type": "manage_dns_pools"},
         ],
     ),
     "DHCP Editor": (

@@ -13,6 +13,7 @@ from app.api.v1.custom_fields.router import router as custom_fields_router
 from app.api.v1.dhcp import router as dhcp_router
 from app.api.v1.dns.agents import router as dns_agents_router
 from app.api.v1.dns.blocklist_router import router as dns_blocklist_router
+from app.api.v1.dns.pool_router import router as dns_pool_router
 from app.api.v1.dns.router import router as dns_router
 from app.api.v1.dns_tools import router as dns_tools_router
 from app.api.v1.docker import router as docker_router
@@ -43,6 +44,7 @@ api_v1_router.include_router(ipam_router, prefix="/ipam", tags=["ipam"])
 api_v1_router.include_router(dns_router, prefix="/dns", tags=["dns"])
 api_v1_router.include_router(dns_tools_router, prefix="/dns", tags=["dns-tools"])
 api_v1_router.include_router(dns_blocklist_router, prefix="/dns", tags=["dns-blocklists"])
+api_v1_router.include_router(dns_pool_router, prefix="/dns", tags=["dns-pools"])
 api_v1_router.include_router(dns_agents_router, prefix="/dns", tags=["dns-agents"])
 api_v1_router.include_router(dhcp_router, prefix="/dhcp", tags=["dhcp"])
 api_v1_router.include_router(users_router, prefix="/users", tags=["users"])

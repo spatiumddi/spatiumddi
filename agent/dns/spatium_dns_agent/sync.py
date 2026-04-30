@@ -14,6 +14,7 @@ from typing import Any
 import httpx
 import structlog
 
+from .admin_pusher import push_rendered_config
 from .cache import load_config, save_config
 from .config import AgentConfig
 from .drivers.base import DriverBase
@@ -44,6 +45,15 @@ class SyncLoop:
                 self.driver.apply_config(bundle)
                 self._current_structural_etag = bundle.get("structural_etag")
                 log.info("dns_agent_bootstrap_from_cache", etag=etag)
+                # Push the rendered tree once at bootstrap so operators
+                # get a Config-tab snapshot the moment the agent comes
+                # up — without this, the snapshot only lands on the
+                # next structural reload (could be hours away on a
+                # quiet group).
+                try:
+                    push_rendered_config(self.cfg, self.token_ref[0])
+                except Exception:
+                    log.exception("rendered_config_bootstrap_push_failed")
             except Exception:
                 log.exception("bootstrap_cache_apply_failed")
 
@@ -128,6 +138,14 @@ class SyncLoop:
             # show per-server drift. Best-effort — a failed POST doesn't
             # roll back the apply (we already serve the new config).
             self._report_zone_state(bundle)
+
+            # Push the on-disk rendered config snapshot so the Server
+            # Detail modal's Config tab can show "what's actually live
+            # right now" — operators no longer need to SSH in to verify.
+            try:
+                push_rendered_config(self.cfg, self.token_ref[0])
+            except Exception:
+                log.exception("rendered_config_push_failed")
 
         self._current_etag = etag
 

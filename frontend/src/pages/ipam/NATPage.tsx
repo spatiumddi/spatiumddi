@@ -461,7 +461,11 @@ export function NATPage() {
                     <td className="px-3 py-2 font-mono text-xs">
                       {m.kind === "hide" ? (
                         <span className="text-muted-foreground">
-                          subnet {m.internal_subnet_id?.slice(0, 8) ?? "—"}…
+                          {m.internal_subnet_cidr ??
+                            m.internal_subnet_name ??
+                            (m.internal_subnet_id
+                              ? `subnet ${m.internal_subnet_id.slice(0, 8)}…`
+                              : "—")}
                         </span>
                       ) : (
                         (m.internal_ip ?? "—")

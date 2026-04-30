@@ -8,6 +8,7 @@ import { DashboardPage } from "@/pages/DashboardPage";
 import { IPAMPage } from "@/pages/ipam/IPAMPage";
 import { NATPage } from "@/pages/ipam/NATPage";
 import { DNSPage } from "@/pages/dns/DNSPage";
+import { DNSPoolsPage } from "@/pages/dns/DNSPoolsPage";
 import { VLANsPage } from "@/pages/vlans/VLANsPage";
 import { DHCPPage } from "@/pages/dhcp/DHCPPage";
 import { KubernetesPage } from "@/pages/kubernetes/KubernetesPage";
@@ -60,6 +61,7 @@ export default function App() {
         <Route path="ipam/plans" element={<SubnetPlannerListPage />} />
         <Route path="ipam/plans/:id" element={<SubnetPlannerEditorPage />} />
         <Route path="dns" element={<DNSPage />} />
+        <Route path="dns/pools" element={<DNSPoolsPage />} />
         <Route path="vlans" element={<VLANsPage />} />
         <Route path="network" element={<NetworkPage />} />
         <Route path="network/:id" element={<DeviceDetailView />} />

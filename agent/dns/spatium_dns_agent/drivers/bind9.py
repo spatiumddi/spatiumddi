@@ -106,6 +106,23 @@ class Bind9Driver(DriverBase):
             tsig_include=tsig_include,
         )
 
+        # Explicit controls block keyed off the agent-generated rndc.key
+        # (written by the entrypoint at first boot). Without this, BIND9
+        # auto-generates an in-memory rndc key that doesn't match the
+        # on-disk file, so `rndc reconfig` + the rndc-status pusher both
+        # fail with "bad auth". The same key lives on disk under
+        # state_dir/rndc.key with an `rndc.conf` wrapper the agent uses
+        # for every CLI invocation.
+        rndc_key_path = self.state_dir / "rndc.key"
+        if rndc_key_path.exists():
+            conf += (
+                f'include "{rndc_key_path}";\n'
+                'controls {\n'
+                '    inet 127.0.0.1 port 953 allow { 127.0.0.1; } '
+                'keys { "spatium-rndc"; };\n'
+                '};\n'
+            )
+
         for zone in bundle.get("zones", []):
             zname = zone.get("name") or ""
             if not zname:
@@ -361,9 +378,12 @@ class Bind9Driver(DriverBase):
         # fall back to SIGHUP which named handles as a config + zone reload.
         rndc_ok = False
         if shutil.which("rndc"):
-            res = subprocess.run(
-                ["rndc", "reconfig"], capture_output=True, text=True, check=False
-            )
+            cmd = ["rndc"]
+            agent_conf = self.state_dir / "rndc.conf"
+            if agent_conf.exists():
+                cmd += ["-c", str(agent_conf)]
+            cmd.append("reconfig")
+            res = subprocess.run(cmd, capture_output=True, text=True, check=False)
             rndc_ok = res.returncode == 0
             if not rndc_ok:
                 log.warning("rndc_failed_falling_back_to_sighup", stderr=res.stderr.strip())
@@ -422,15 +442,34 @@ class Bind9Driver(DriverBase):
             ):
                 wire_value = f"{pri} {wt} {prt} {value}"
 
+        # ``rrset_action`` is set by callers that need precise multi-RR
+        # semantics (most notably DNS pools, where N A records share a
+        # single name and ``replace`` would clobber siblings every time
+        # a member is added). When unset (the legacy default) the
+        # existing replace/wildcard-delete behaviour applies, matching
+        # the single-RR-per-name case the operator-facing record CRUD
+        # path was originally written for.
+        rrset_action = (rec.get("rrset_action") or "").lower()
+
         upd = dns.update.Update(zone, keyring=keyring)
         if op["op"] in ("create", "update"):
-            upd.replace(name, ttl, rtype, wire_value)
+            if rrset_action == "add":
+                upd.add(name, ttl, rtype, wire_value)
+            else:
+                upd.replace(name, ttl, rtype, wire_value)
         elif op["op"] == "delete":
-            # Some BIND configurations reject the RR-specific delete form
-            # (value must exactly match a live RR) when the running daemon
-            # has drifted from the zone file. Delete by (name, rtype) so any
-            # matching RR gets cleared. Idempotent.
-            upd.delete(name, rtype)
+            if rrset_action == "delete_value":
+                # Remove the specific RR only; sibling RRs at the same
+                # (name, rtype) survive. Used by pool member removal so
+                # taking one member out doesn't drop the rest.
+                upd.delete(name, rtype, wire_value)
+            else:
+                # Some BIND configurations reject the RR-specific delete
+                # form (value must exactly match a live RR) when the
+                # running daemon has drifted from the zone file. Delete
+                # by (name, rtype) so any matching RR gets cleared.
+                # Idempotent.
+                upd.delete(name, rtype)
         else:
             raise ValueError(f"unknown op: {op['op']}")
         resp = dns.query.tcp(upd, "127.0.0.1", timeout=10)

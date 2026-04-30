@@ -20,7 +20,14 @@ from sqlalchemy import select
 
 from app.api.deps import DB
 from app.models.audit import AuditLog
-from app.models.dns import DNSRecordOp, DNSServer, DNSServerGroup, DNSServerZoneState, DNSZone
+from app.models.dns import (
+    DNSRecordOp,
+    DNSServer,
+    DNSServerGroup,
+    DNSServerRuntimeState,
+    DNSServerZoneState,
+    DNSZone,
+)
 from app.models.logs import DNSQueryLogEntry
 from app.models.metrics import DNSMetricSample
 from app.services.dns.agent_config import build_config_bundle
@@ -565,3 +572,110 @@ async def agent_query_log_entries(
         inserted += 1
     await db.commit()
     return {"status": "ok", "inserted": inserted, "dropped": dropped}
+
+
+# ── Admin runtime-state push (rendered config + rndc status) ─────────
+
+
+class RenderedConfigFile(BaseModel):
+    """One materialised file from the agent's rendered config tree."""
+
+    path: str  # relative path inside the rendered/ dir, e.g. "named.conf" or "zones/example.com.db"
+    content: str
+
+
+class RenderedConfigReport(BaseModel):
+    """Snapshot the agent ships after a successful structural apply.
+
+    The agent walks ``state_dir/rendered/`` and ships every file it
+    finds. Total payload is bounded by the size of the operator's
+    config — typically <100 KB even for groups with hundreds of zones.
+    """
+
+    files: list[RenderedConfigFile]
+
+
+# Hard cap on what the control plane will accept. Defends against an
+# agent shipping an unbounded zone tree without the operator noticing.
+_RENDERED_FILES_MAX = 5_000
+_RENDERED_FILE_SIZE_MAX = 256 * 1024  # 256 KB per file
+_RENDERED_TOTAL_SIZE_MAX = 8 * 1024 * 1024  # 8 MB total
+
+
+@router.post("/admin/rendered-config")
+async def agent_rendered_config(
+    body: RenderedConfigReport,
+    db: DB,
+    auth: tuple[DNSServer, dict[str, Any]] = Depends(_auth_agent),
+) -> dict[str, Any]:
+    """Ingest the agent's most-recent rendered config snapshot.
+
+    Idempotent: writes (or upserts) the single ``DNSServerRuntimeState``
+    row keyed on server_id. The previous snapshot is replaced wholesale
+    — there is no history kept beyond "current".
+    """
+    server, _ = auth
+    files = body.files[:_RENDERED_FILES_MAX]
+    total = 0
+    sanitised: list[dict[str, str]] = []
+    for f in files:
+        if len(f.content) > _RENDERED_FILE_SIZE_MAX:
+            # Truncate rather than reject — operator wants to *see*
+            # something even if a single file blew the cap.
+            content = f.content[:_RENDERED_FILE_SIZE_MAX] + "\n... [truncated by control plane]\n"
+        else:
+            content = f.content
+        total += len(content)
+        if total > _RENDERED_TOTAL_SIZE_MAX:
+            break
+        sanitised.append({"path": f.path, "content": content})
+
+    now = datetime.now(UTC)
+    state = await db.get(DNSServerRuntimeState, server.id)
+    if state is None:
+        state = DNSServerRuntimeState(
+            server_id=server.id,
+            rendered_files=sanitised,
+            rendered_at=now,
+        )
+        db.add(state)
+    else:
+        state.rendered_files = sanitised
+        state.rendered_at = now
+    await db.commit()
+    return {"status": "ok", "files": len(sanitised)}
+
+
+class RndcStatusReport(BaseModel):
+    text: str
+
+
+@router.post("/admin/rndc-status")
+async def agent_rndc_status(
+    body: RndcStatusReport,
+    db: DB,
+    auth: tuple[DNSServer, dict[str, Any]] = Depends(_auth_agent),
+) -> dict[str, str]:
+    """Ingest the agent's most-recent ``rndc status`` output.
+
+    The agent shells out to ``rndc status`` once a minute. We keep the
+    raw text plus a timestamp; the UI shows it on the Overview tab so
+    operators can confirm ``named`` is up + which zones are loaded
+    without SSHing into the host.
+    """
+    server, _ = auth
+    text = body.text[:_RENDERED_FILE_SIZE_MAX]  # rndc status is normally a few KB
+    now = datetime.now(UTC)
+    state = await db.get(DNSServerRuntimeState, server.id)
+    if state is None:
+        state = DNSServerRuntimeState(
+            server_id=server.id,
+            rndc_status_text=text,
+            rndc_observed_at=now,
+        )
+        db.add(state)
+    else:
+        state.rndc_status_text = text
+        state.rndc_observed_at = now
+    await db.commit()
+    return {"status": "ok"}

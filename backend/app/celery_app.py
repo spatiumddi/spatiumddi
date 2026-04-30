@@ -31,6 +31,7 @@ celery_app = Celery(
         "app.tasks.tailscale_sync",
         "app.tasks.snmp_poll",
         "app.tasks.nmap",
+        "app.tasks.dns_pool_healthcheck",
     ],
 )
 
@@ -74,6 +75,7 @@ celery_app.conf.update(
         "app.tasks.tailscale_sync.*": {"queue": "default"},
         "app.tasks.snmp_poll.*": {"queue": "default"},
         "app.tasks.nmap.*": {"queue": "default"},
+        "app.tasks.dns_pool_healthcheck.*": {"queue": "dns"},
     },
     beat_schedule={
         # Every 60s, fan-out health checks to every registered DNS server.
@@ -249,6 +251,15 @@ celery_app.conf.update(
         # primitive, so a trivial heartbeat task is the cheapest signal.
         "platform-beat-heartbeat": {
             "task": "app.tasks.heartbeat.beat_tick",
+            "schedule": schedule(run_every=30.0),
+        },
+        # Every 30 s, fan-out health-check tasks to enabled DNS pools
+        # whose ``next_check_at`` has elapsed. The dispatcher itself
+        # respects each pool's ``hc_interval_seconds`` by setting
+        # ``next_check_at`` after each check, so a pool configured with
+        # a 5-minute interval only fires every 10 ticks.
+        "dns-pool-healthcheck-dispatch": {
+            "task": "app.tasks.dns_pool_healthcheck.dispatch_due_pools",
             "schedule": schedule(run_every=30.0),
         },
     },

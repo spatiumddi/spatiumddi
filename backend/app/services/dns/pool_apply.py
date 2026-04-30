@@ -1,0 +1,199 @@
+"""DNS pool apply-state service.
+
+Bridges ``DNSPoolMember`` state to actual ``DNSRecord`` rows. For every
+healthy + enabled member there should be exactly one ``DNSRecord``
+(name = pool.record_name, type = pool.record_type, value =
+member.address, pool_member_id = member.id). For every unhealthy or
+disabled member, that record should not exist.
+
+This service is called from the pool health-check task after each
+member-state evaluation; it diffs current records against what
+``apply_pool_state`` says should exist and emits create/delete ops.
+
+Driver-agnostic: emits regular ``enqueue_record_op`` calls so BIND9 +
+Windows DNS render unchanged. The records themselves carry
+``pool_member_id`` so the records UI can flag them as pool-managed and
+record CRUD endpoints reject operator edits.
+"""
+
+from __future__ import annotations
+
+import structlog
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.models.dns import DNSPool, DNSPoolMember, DNSRecord, DNSZone
+from app.services.dns.record_ops import enqueue_record_op
+from app.services.dns.serial import bump_zone_serial
+
+logger = structlog.get_logger(__name__)
+
+
+async def apply_pool_state(
+    db: AsyncSession,
+    pool: DNSPool,
+) -> dict[str, int]:
+    """Reconcile rendered records with the current member state.
+
+    For each member: if healthy + enabled, ensure a record exists; if
+    unhealthy or disabled, ensure none exists. Returns a summary dict
+    with ``created`` / ``deleted`` counts.
+
+    The pool's TTL is honoured on every emitted record so changes to
+    ``pool.ttl`` flow through on the next reconcile pass.
+    """
+    zone = await db.get(DNSZone, pool.zone_id)
+    if zone is None:
+        return {"created": 0, "deleted": 0, "skipped": 0}
+
+    # Existing records for this pool — keyed by member id so we can
+    # diff against desired state below.
+    existing_res = await db.execute(
+        select(DNSRecord).where(
+            DNSRecord.zone_id == pool.zone_id,
+            DNSRecord.pool_member_id.in_(_member_ids(pool)),
+        )
+    )
+    existing_by_member: dict[str, DNSRecord] = {
+        str(r.pool_member_id): r for r in existing_res.scalars().all()
+    }
+
+    created = 0
+    deleted = 0
+    skipped = 0
+
+    for member in pool.members:
+        should_render = bool(member.enabled) and (
+            (member.last_check_state or "unknown") == "healthy"
+        )
+        rec = existing_by_member.get(str(member.id))
+
+        if should_render and rec is None:
+            await _create_pool_record(db, zone, pool, member)
+            created += 1
+        elif not should_render and rec is not None:
+            await _delete_pool_record(db, zone, rec)
+            deleted += 1
+        elif should_render and rec is not None and rec.ttl != pool.ttl:
+            # Pool TTL changed — push an update (rare, but harmless).
+            rec.ttl = pool.ttl
+            target_serial = bump_zone_serial(zone)
+            await enqueue_record_op(
+                db,
+                zone,
+                "update",
+                _record_payload(pool, member, rec.ttl),
+                target_serial=target_serial,
+            )
+        elif (
+            should_render
+            and rec is not None
+            and (rec.name != pool.record_name or rec.record_type != pool.record_type)
+        ):
+            # Pool rename / type-change — the existing record carries
+            # the old (name, type) and BIND9 is still serving it under
+            # those labels. Delete-then-recreate so the live daemon
+            # actually moves to the new identity. Done as two ops on
+            # the same serial so the replay is atomic from the
+            # operator's perspective.
+            old_snapshot = {
+                "name": rec.name,
+                "type": rec.record_type,
+                "value": rec.value,
+                "ttl": rec.ttl,
+                "rrset_action": "delete_value",
+            }
+            target_serial = bump_zone_serial(zone)
+            await enqueue_record_op(db, zone, "delete", old_snapshot, target_serial=target_serial)
+            fqdn = zone.name if pool.record_name == "@" else f"{pool.record_name}.{zone.name}"
+            rec.name = pool.record_name
+            rec.record_type = pool.record_type
+            rec.fqdn = fqdn
+            rec.ttl = pool.ttl
+            await enqueue_record_op(
+                db,
+                zone,
+                "create",
+                _record_payload(pool, member, pool.ttl),
+                target_serial=target_serial,
+            )
+            created += 1  # counts as a re-creation under the new name
+        else:
+            skipped += 1
+
+    if created or deleted:
+        logger.info(
+            "dns_pool_apply",
+            pool=pool.name,
+            zone=zone.name,
+            created=created,
+            deleted=deleted,
+        )
+
+    return {"created": created, "deleted": deleted, "skipped": skipped}
+
+
+def _member_ids(pool: DNSPool) -> list[str]:
+    if not pool.members:
+        return ["00000000-0000-0000-0000-000000000000"]  # safe non-match
+    return [str(m.id) for m in pool.members]
+
+
+async def _create_pool_record(
+    db: AsyncSession,
+    zone: DNSZone,
+    pool: DNSPool,
+    member: DNSPoolMember,
+) -> None:
+    fqdn = zone.name if pool.record_name == "@" else f"{pool.record_name}.{zone.name}"
+    rec = DNSRecord(
+        zone_id=zone.id,
+        name=pool.record_name,
+        fqdn=fqdn,
+        record_type=pool.record_type,
+        value=member.address,
+        ttl=pool.ttl,
+        pool_member_id=member.id,
+    )
+    db.add(rec)
+    target_serial = bump_zone_serial(zone)
+    await db.flush()
+    await enqueue_record_op(
+        db,
+        zone,
+        "create",
+        _record_payload(pool, member, rec.ttl),
+        target_serial=target_serial,
+    )
+
+
+async def _delete_pool_record(db: AsyncSession, zone: DNSZone, rec: DNSRecord) -> None:
+    # ``delete_value`` removes only this specific RR — sibling pool
+    # members at the same (name, rtype) survive. Without this, removing
+    # one unhealthy member would wipe every healthy member's record too.
+    snapshot = {
+        "name": rec.name,
+        "type": rec.record_type,
+        "value": rec.value,
+        "ttl": rec.ttl,
+        "rrset_action": "delete_value",
+    }
+    target_serial = bump_zone_serial(zone)
+    await db.delete(rec)
+    await db.flush()
+    await enqueue_record_op(db, zone, "delete", snapshot, target_serial=target_serial)
+
+
+def _record_payload(pool: DNSPool, member: DNSPoolMember, ttl: int | None) -> dict[str, object]:
+    # ``add`` semantics — pool members are explicitly multi-RR (every
+    # healthy member contributes its own A record at the same name).
+    # The default RFC 2136 ``replace`` would clobber siblings on every
+    # create, so the BIND9 driver only ever has one record live at the
+    # pool's name regardless of how many members exist.
+    return {
+        "name": pool.record_name,
+        "type": pool.record_type,
+        "value": member.address,
+        "ttl": ttl,
+        "rrset_action": "add",
+    }

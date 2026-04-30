@@ -30,6 +30,7 @@ from app.models.dns import (
     DNSServer,
     DNSServerGroup,
     DNSServerOptions,
+    DNSServerRuntimeState,
     DNSTrustAnchor,
     DNSTSIGKey,
     DNSView,
@@ -691,6 +692,9 @@ class RecordResponse(BaseModel):
     auto_generated: bool
     # Non-null when the record was synthesised by Tailscale Phase 2.
     tailscale_tenant_id: uuid.UUID | None = None
+    # Non-null when the record is rendered by the DNS pool health-check
+    # pipeline. Operator edits / deletes are blocked while non-null.
+    pool_member_id: uuid.UUID | None = None
     created_at: datetime
     modified_at: datetime
 
@@ -2644,6 +2648,78 @@ async def get_server_recent_events(
     return ServerEventsResponse(server_id=server.id, items=items)
 
 
+# ── Server runtime-state read endpoints (rendered config + rndc) ─────
+
+
+class RenderedConfigFileEntry(BaseModel):
+    path: str
+    content: str
+
+
+class RenderedConfigResponse(BaseModel):
+    server_id: uuid.UUID
+    rendered_at: datetime | None
+    files: list[RenderedConfigFileEntry]
+
+
+@router.get(
+    "/servers/{server_id}/rendered-config",
+    response_model=RenderedConfigResponse,
+)
+async def get_server_rendered_config(
+    server_id: uuid.UUID, db: DB, _: CurrentUser
+) -> RenderedConfigResponse:
+    """Latest agent-pushed snapshot of the on-disk rendered config.
+
+    BIND9 only — Windows DNS has no equivalent on-disk config. Returns
+    an empty file list with ``rendered_at=None`` when the agent hasn't
+    pushed yet (fresh server, never reloaded). The UI shows a "no
+    snapshot yet" placeholder in that case.
+    """
+    server = await db.get(DNSServer, server_id)
+    if server is None:
+        raise HTTPException(status_code=404, detail="Server not found")
+
+    state = await db.get(DNSServerRuntimeState, server_id)
+    files: list[RenderedConfigFileEntry] = []
+    rendered_at: datetime | None = None
+    if state is not None and state.rendered_files:
+        files = [
+            RenderedConfigFileEntry(path=f["path"], content=f["content"])
+            for f in state.rendered_files
+            if isinstance(f, dict) and "path" in f and "content" in f
+        ]
+        rendered_at = state.rendered_at
+    return RenderedConfigResponse(server_id=server.id, rendered_at=rendered_at, files=files)
+
+
+class RndcStatusResponse(BaseModel):
+    server_id: uuid.UUID
+    observed_at: datetime | None
+    text: str | None
+
+
+@router.get(
+    "/servers/{server_id}/rndc-status",
+    response_model=RndcStatusResponse,
+)
+async def get_server_rndc_status(
+    server_id: uuid.UUID, db: DB, _: CurrentUser
+) -> RndcStatusResponse:
+    """Latest agent-pushed ``rndc status`` output for this server."""
+    server = await db.get(DNSServer, server_id)
+    if server is None:
+        raise HTTPException(status_code=404, detail="Server not found")
+    state = await db.get(DNSServerRuntimeState, server_id)
+    if state is None:
+        return RndcStatusResponse(server_id=server.id, observed_at=None, text=None)
+    return RndcStatusResponse(
+        server_id=server.id,
+        observed_at=state.rndc_observed_at,
+        text=state.rndc_status_text,
+    )
+
+
 @router.put("/groups/{group_id}/zones/{zone_id}", response_model=ZoneResponse)
 async def update_zone(
     group_id: uuid.UUID, zone_id: uuid.UUID, body: ZoneUpdate, db: DB, current_user: SuperAdmin
@@ -3081,6 +3157,7 @@ class GroupRecordResponse(BaseModel):
     port: int | None
     auto_generated: bool
     tailscale_tenant_id: uuid.UUID | None = None
+    pool_member_id: uuid.UUID | None = None
     created_at: datetime
     modified_at: datetime
 
@@ -3140,6 +3217,7 @@ async def list_group_records(
                 port=rec.port,
                 auto_generated=rec.auto_generated,
                 tailscale_tenant_id=rec.tailscale_tenant_id,
+                pool_member_id=rec.pool_member_id,
                 created_at=rec.created_at,
                 modified_at=rec.modified_at,
             )
@@ -3971,5 +4049,14 @@ def _reject_if_synthesised_record(record: DNSRecord, op: str) -> None:
                 f"Record {record.fqdn!r} is synthesised by the Tailscale "
                 f"integration and cannot be {op}ed manually. Edits would be "
                 f"overwritten on the next sync."
+            ),
+        )
+    if record.pool_member_id is not None:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                f"Record {record.fqdn!r} is managed by a DNS pool and cannot "
+                f"be {op}ed manually. Edits would be overwritten on the next "
+                f"health-check pass — manage the pool / member instead."
             ),
         )

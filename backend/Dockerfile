@@ -32,12 +32,15 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 WORKDIR /app
 
-# Runtime system deps: libpq5 for asyncpg, libxmlsec1 for python3-saml.
+# Runtime system deps: libpq5 for asyncpg, libxmlsec1 for python3-saml,
+# iputils-ping for the DNS pool ICMP health-check (the binary ships
+# with cap_net_raw+ep on Debian, so it works as the non-root app user).
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libpq5 \
     libxml2 \
     libxmlsec1-openssl \
     nmap \
+    iputils-ping \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /install /usr/local

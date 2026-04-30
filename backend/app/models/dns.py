@@ -66,6 +66,39 @@ class DNSServerZoneState(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
 
 
+class DNSServerRuntimeState(Base):
+    """Latest agent-pushed runtime snapshot for a single DNS server.
+
+    Two pieces of operator-facing diagnostics live here, both pushed
+    from the BIND9 agent:
+
+    - ``rendered_files``: the actual ``named.conf`` + zone files the
+      agent wrote to disk during its most recent successful structural
+      apply, so operators can answer "is the server actually running
+      the config we sent?" without SSHing in.
+    - ``rndc_status_text``: stdout of ``rndc status`` from a periodic
+      poll. Confirms the daemon is up + which zones are loaded.
+
+    One row per server; the agent overwrites both fields independently
+    on its own cadence. Windows DNS servers never write here — they
+    have no on-disk rendered config to surface and no rndc.
+    """
+
+    __tablename__ = "dns_server_runtime_state"
+
+    server_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dns_server.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    rendered_files: Mapped[list[dict] | None] = mapped_column(JSONB, nullable=True)
+    rendered_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    rndc_status_text: Mapped[str | None] = mapped_column(Text, nullable=True)
+    rndc_observed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
 class DNSServerGroup(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     """Logical cluster of DNS servers sharing configuration (e.g. internal-resolvers, external-auth)."""
 
@@ -561,8 +594,136 @@ class DNSRecord(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
         nullable=True,
         index=True,
     )
+    # Set by the DNS pool health-check pipeline when the row was
+    # auto-created for a healthy + enabled pool member. Cascades on
+    # member delete so a removed member cleans up its rendered record.
+    # API blocks operator edits / deletes while non-null — the row is
+    # owned by the pool and only flips through the pool service.
+    pool_member_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dns_pool_member.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
 
     zone: Mapped["DNSZone"] = relationship("DNSZone", back_populates="records")
+
+
+# ── DNS Pools (GSLB-lite) ───────────────────────────────────────────────────
+
+
+class DNSPool(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """A health-checked pool of A / AAAA targets sharing one DNS name.
+
+    The pool name maps to a record in the bound zone (e.g. ``www`` →
+    ``www.example.com``). Members render as **regular A / AAAA
+    ``DNSRecord`` rows** with ``pool_member_id`` set, one per healthy +
+    enabled member, so BIND9 / Windows DNS render unchanged.
+
+    The health-check task fires on the per-pool ``hc_interval_seconds``
+    cadence; member states flip in / out of the rendered record set via
+    the pool apply-state service.
+
+    **TTL caveat (operator-facing):** DNS is cached client-side. A
+    member dropping out doesn't take effect until ``ttl`` expires, so
+    this is **not** the same as a real L4/L7 load balancer — clients
+    may still hit a dead box for up to ``ttl`` seconds. Default TTL is
+    deliberately short (30 s).
+    """
+
+    __tablename__ = "dns_pool"
+    __table_args__ = (
+        UniqueConstraint("zone_id", "record_name", name="uq_dns_pool_zone_record"),
+        Index("ix_dns_pool_zone", "zone_id"),
+        Index("ix_dns_pool_next_check_at", "next_check_at"),
+    )
+
+    group_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dns_server_group.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    zone_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dns_zone.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    # Relative label (``"www"``, ``"@"``) — same convention as DNSRecord.name
+    record_name: Mapped[str] = mapped_column(String(255), nullable=False)
+    # A | AAAA — the only types that make sense for a pool of host targets
+    record_type: Mapped[str] = mapped_column(String(10), nullable=False, default="A")
+    ttl: Mapped[int] = mapped_column(Integer, nullable=False, default=30)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+    # Health-check config — apply uniformly to every member.
+    # hc_type: none | tcp | http | https
+    # (icmp deferred — needs CAP_NET_RAW on the api container)
+    hc_type: Mapped[str] = mapped_column(String(10), nullable=False, default="tcp")
+    hc_target_port: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    hc_path: Mapped[str] = mapped_column(String(255), nullable=False, default="/")
+    hc_method: Mapped[str] = mapped_column(String(10), nullable=False, default="GET")
+    # HTTPS-only — when True the check fails fast on bad / self-signed
+    # certs. Default False because internal pool members are commonly
+    # self-signed; operators flip it on for public targets where a
+    # bad cert is itself a signal worth alerting on.
+    hc_verify_tls: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    # Stored as a JSON array of int status codes; default = [200..399].
+    hc_expected_status_codes: Mapped[list] = mapped_column(
+        JSONB, nullable=False, default=lambda: [200, 201, 202, 204, 301, 302, 304]
+    )
+    hc_interval_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=30)
+    hc_timeout_seconds: Mapped[int] = mapped_column(Integer, nullable=False, default=5)
+    hc_unhealthy_threshold: Mapped[int] = mapped_column(Integer, nullable=False, default=2)
+    hc_healthy_threshold: Mapped[int] = mapped_column(Integer, nullable=False, default=2)
+
+    # Beat dispatcher reads ``next_check_at`` to decide which pools to fire.
+    next_check_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    members: Mapped[list["DNSPoolMember"]] = relationship(
+        "DNSPoolMember",
+        back_populates="pool",
+        cascade="all, delete-orphan",
+        lazy="selectin",
+    )
+
+
+class DNSPoolMember(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """One target IP within a ``DNSPool``."""
+
+    __tablename__ = "dns_pool_member"
+    __table_args__ = (
+        UniqueConstraint("pool_id", "address", name="uq_dns_pool_member_addr"),
+        Index("ix_dns_pool_member_pool", "pool_id"),
+    )
+
+    pool_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dns_pool.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    address: Mapped[str] = mapped_column(String(45), nullable=False)
+    # Per-member optional weight (advisory — not used by basic A/AAAA
+    # rendering, but reserved for a future weighted-record-set follow-up).
+    weight: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    # Operator-controlled "pause" — keeps the member out of the rendered
+    # set regardless of health. Distinct from ``last_check_state``.
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+    # Health-check state — populated by the pool health-check task.
+    # last_check_state: unknown | healthy | unhealthy
+    last_check_state: Mapped[str] = mapped_column(String(20), nullable=False, default="unknown")
+    last_check_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_check_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    consecutive_failures: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    consecutive_successes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    pool: Mapped[DNSPool] = relationship("DNSPool", back_populates="members")
 
 
 # ── Blocking Lists / RPZ ────────────────────────────────────────────────────

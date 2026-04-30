@@ -1,41 +1,70 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import {
   Activity,
   AlertCircle,
+  BarChart3,
   CheckCircle2,
   Clock,
+  Copy,
   Cpu,
+  FileText,
   History,
   Loader2,
   RefreshCw,
+  ScrollText,
   Server,
   Workflow,
 } from "lucide-react";
+import {
+  CartesianGrid,
+  Legend,
+  Line,
+  LineChart,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from "recharts";
 import { Modal } from "@/components/ui/modal";
 import {
   dnsApi,
-  type DNSServer,
+  logsApi,
+  metricsApi,
   type DNSPendingOpEntry,
   type DNSPerServerZoneStateEntry,
+  type DNSQueryLogRow,
+  type DNSRenderedConfigFile,
+  type DNSServer,
   type DNSServerEventEntry,
+  type MetricsWindow,
 } from "@/lib/api";
 
 /**
  * Tabbed read-only inspector for a single DNS server. Mounted from
  * the ServersTab when an operator clicks a server row. Surfaces
- * everything we know without needing the operator to SSH in:
+ * everything we know about the server without operators needing to
+ * SSH in:
  *
- * - **Overview** — agent status, last heartbeat, ETag drift, JWT, version
+ * - **Overview** — agent status, last heartbeat, ETag drift, plus the
+ *   latest `rndc status` snapshot the agent pushed
  * - **Zones** — per-zone serial drift (target vs. what this server reports)
  * - **Sync** — pending / in-flight / failed `DNSRecordOp` rows
  * - **Events** — recent audit-log rows scoped to this server
- *
- * Live BIND9 statistics-channels output + rendered named.conf are tracked
- * in the roadmap as a follow-up — they need new agent admin endpoints
- * (`/api/v1/dns/agents/admin/*`).
+ * - **Logs** — last N parsed BIND9 query log lines (24 h retention)
+ * - **Stats** — query rate timeseries + top qnames + qtype distribution
+ * - **Config** — the rendered `named.conf` + zone files actually on disk
  */
-type Tab = "overview" | "zones" | "sync" | "events";
+type Tab =
+  | "overview"
+  | "zones"
+  | "sync"
+  | "events"
+  | "logs"
+  | "stats"
+  | "config";
+
+const BIND9_DRIVER = "bind9";
 
 export function ServerDetailModal({
   server,
@@ -45,6 +74,7 @@ export function ServerDetailModal({
   onClose: () => void;
 }) {
   const [tab, setTab] = useState<Tab>("overview");
+  const isBind9 = server.driver === BIND9_DRIVER;
 
   return (
     <Modal title={server.name} onClose={onClose} wide>
@@ -63,7 +93,7 @@ export function ServerDetailModal({
             </span>
           )}
         </div>
-        <div className="flex gap-1 border-b">
+        <div className="flex flex-wrap gap-1 border-b">
           <TabButton
             active={tab === "overview"}
             onClick={() => setTab("overview")}
@@ -88,13 +118,40 @@ export function ServerDetailModal({
             icon={<History className="h-3.5 w-3.5" />}
             label="Events"
           />
+          {isBind9 && (
+            <>
+              <TabButton
+                active={tab === "logs"}
+                onClick={() => setTab("logs")}
+                icon={<ScrollText className="h-3.5 w-3.5" />}
+                label="Logs"
+              />
+              <TabButton
+                active={tab === "stats"}
+                onClick={() => setTab("stats")}
+                icon={<BarChart3 className="h-3.5 w-3.5" />}
+                label="Stats"
+              />
+              <TabButton
+                active={tab === "config"}
+                onClick={() => setTab("config")}
+                icon={<FileText className="h-3.5 w-3.5" />}
+                label="Config"
+              />
+            </>
+          )}
         </div>
 
         <div className="min-h-[24rem]">
-          {tab === "overview" && <OverviewTab server={server} />}
+          {tab === "overview" && (
+            <OverviewTab server={server} isBind9={isBind9} />
+          )}
           {tab === "zones" && <ZonesTab serverId={server.id} />}
           {tab === "sync" && <SyncTab serverId={server.id} />}
           {tab === "events" && <EventsTab serverId={server.id} />}
+          {tab === "logs" && isBind9 && <LogsTab serverId={server.id} />}
+          {tab === "stats" && isBind9 && <StatsTab serverId={server.id} />}
+          {tab === "config" && isBind9 && <ConfigTab serverId={server.id} />}
         </div>
       </div>
     </Modal>
@@ -131,9 +188,26 @@ function TabButton({
 
 // ── Overview tab ──────────────────────────────────────────────────────────
 
-function OverviewTab({ server }: { server: DNSServer }) {
+function OverviewTab({
+  server,
+  isBind9,
+}: {
+  server: DNSServer;
+  isBind9: boolean;
+}) {
   return (
-    <div className="grid grid-cols-2 gap-3">
+    <div className="space-y-4">
+      <div className="grid grid-cols-2 gap-3">
+        <OverviewInfo server={server} />
+      </div>
+      {isBind9 && <RndcStatusPanel serverId={server.id} />}
+    </div>
+  );
+}
+
+function OverviewInfo({ server }: { server: DNSServer }) {
+  return (
+    <>
       <InfoCard label="Status" value={server.status}>
         <StatusDot status={server.status} />
         <span className="ml-2 text-sm font-medium capitalize">
@@ -178,6 +252,47 @@ function OverviewTab({ server }: { server: DNSServer }) {
           <div className="whitespace-pre-wrap">{server.notes}</div>
         </div>
       )}
+    </>
+  );
+}
+
+function RndcStatusPanel({ serverId }: { serverId: string }) {
+  const { data, isLoading } = useQuery({
+    queryKey: ["dns-server-rndc-status", serverId],
+    queryFn: () => dnsApi.getServerRndcStatus(serverId),
+    refetchInterval: 60_000,
+  });
+
+  return (
+    <div className="rounded-md border bg-card">
+      <div className="flex items-center justify-between border-b px-3 py-2">
+        <div className="flex items-center gap-2">
+          <Activity className="h-3.5 w-3.5 text-emerald-500" />
+          <h4 className="text-xs font-semibold uppercase tracking-wider">
+            rndc status
+          </h4>
+        </div>
+        <span className="text-[10px] text-muted-foreground">
+          {data?.observed_at
+            ? `pushed ${fmtRelative(data.observed_at)}`
+            : "no snapshot yet"}
+        </span>
+      </div>
+      <div className="p-3">
+        {isLoading ? (
+          <LoadingBlock />
+        ) : !data?.text ? (
+          <p className="rounded-md bg-muted/30 p-3 text-center text-xs text-muted-foreground">
+            The agent pushes <code className="font-mono">rndc status</code>{" "}
+            every 60&nbsp;s. Once it lands you'll see the daemon uptime, zone
+            count, and recursion stats here.
+          </p>
+        ) : (
+          <pre className="max-h-72 overflow-auto whitespace-pre-wrap rounded-md bg-muted/30 p-3 font-mono text-[11px] leading-snug">
+            {data.text}
+          </pre>
+        )}
+      </div>
     </div>
   );
 }
@@ -495,6 +610,453 @@ function EventRow({ event }: { event: DNSServerEventEntry }) {
       </td>
     </tr>
   );
+}
+
+// ── Logs tab ──────────────────────────────────────────────────────────────
+
+function LogsTab({ serverId }: { serverId: string }) {
+  const [q, setQ] = useState("");
+  const [qtype, setQtype] = useState("");
+  const [clientIp, setClientIp] = useState("");
+  const filterKey = `${q}|${qtype}|${clientIp}`;
+
+  // Drop empty fields rather than sending "" — the backend ILIKEs the
+  // empty string against every row, which is technically correct but
+  // wastes a query.
+  const { data, isLoading, isError, refetch, isFetching } = useQuery({
+    queryKey: ["dns-server-query-log", serverId, filterKey],
+    queryFn: () =>
+      logsApi.dnsQueries({
+        server_id: serverId,
+        q: q || null,
+        qtype: qtype || null,
+        client_ip: clientIp || null,
+        max_events: 200,
+      }),
+    refetchInterval: 30_000,
+  });
+
+  return (
+    <div className="space-y-3">
+      <div className="flex flex-wrap items-center gap-2 rounded-md border bg-card px-3 py-2">
+        <input
+          type="text"
+          value={q}
+          onChange={(e) => setQ(e.target.value)}
+          placeholder="Filter qname / raw…"
+          className="flex-1 min-w-[10rem] rounded border bg-background px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
+        />
+        <input
+          type="text"
+          value={qtype}
+          onChange={(e) => setQtype(e.target.value.toUpperCase())}
+          placeholder="qtype"
+          className="w-20 rounded border bg-background px-2 py-1 text-xs uppercase focus:outline-none focus:ring-1 focus:ring-ring"
+        />
+        <input
+          type="text"
+          value={clientIp}
+          onChange={(e) => setClientIp(e.target.value)}
+          placeholder="client IP"
+          className="w-32 rounded border bg-background px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-ring"
+        />
+        <button
+          type="button"
+          onClick={() => refetch()}
+          className="inline-flex items-center gap-1 rounded border px-2 py-1 text-xs hover:bg-accent"
+          disabled={isFetching}
+        >
+          <RefreshCw
+            className={`h-3 w-3 ${isFetching ? "animate-spin" : ""}`}
+          />
+          Refresh
+        </button>
+      </div>
+
+      {isLoading ? (
+        <LoadingBlock />
+      ) : isError ? (
+        <ErrorBlock />
+      ) : !data || data.events.length === 0 ? (
+        <p className="rounded-md border bg-card p-4 text-center text-sm text-muted-foreground">
+          No query log entries match — agents tail{" "}
+          <code className="font-mono">/var/log/named/queries.log</code> and ship
+          parsed lines on a 24&nbsp;h retention window.
+        </p>
+      ) : (
+        <div className="overflow-hidden rounded-md border">
+          <table className="w-full text-sm">
+            <thead className="border-b bg-muted/30 text-xs">
+              <tr>
+                <th className="px-3 py-2 text-left font-medium">When</th>
+                <th className="px-3 py-2 text-left font-medium">Client</th>
+                <th className="px-3 py-2 text-left font-medium">Qname</th>
+                <th className="px-3 py-2 text-left font-medium">Type</th>
+                <th className="px-3 py-2 text-left font-medium">Flags</th>
+              </tr>
+            </thead>
+            <tbody>
+              {data.events.map((e) => (
+                <QueryLogRow key={e.id} entry={e} />
+              ))}
+            </tbody>
+          </table>
+          {data.truncated && (
+            <div className="border-t bg-muted/30 px-3 py-1.5 text-[11px] text-muted-foreground">
+              Truncated — showing the most recent 200 entries.
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+function QueryLogRow({ entry }: { entry: DNSQueryLogRow }) {
+  return (
+    <tr className="border-b last:border-0" title={entry.raw}>
+      <td
+        className="px-3 py-1 text-xs text-muted-foreground"
+        title={new Date(entry.ts).toLocaleString()}
+      >
+        {fmtRelative(entry.ts)}
+      </td>
+      <td className="px-3 py-1 font-mono text-xs">
+        {entry.client_ip ?? "—"}
+        {entry.client_port ? `:${entry.client_port}` : ""}
+      </td>
+      <td className="px-3 py-1 truncate font-mono text-xs">
+        {entry.qname ?? "—"}
+      </td>
+      <td className="px-3 py-1 text-xs uppercase">{entry.qtype ?? "—"}</td>
+      <td className="px-3 py-1 font-mono text-[11px] text-muted-foreground">
+        {entry.flags ?? ""}
+      </td>
+    </tr>
+  );
+}
+
+// ── Stats tab ─────────────────────────────────────────────────────────────
+
+function StatsTab({ serverId }: { serverId: string }) {
+  const [win, setWin] = useState<MetricsWindow>("24h");
+
+  const ts = useQuery({
+    queryKey: ["dns-server-metrics-ts", serverId, win],
+    queryFn: () =>
+      metricsApi.dnsTimeseries({ server_id: serverId, window: win }),
+    refetchInterval: 60_000,
+  });
+
+  const analytics = useQuery({
+    queryKey: ["dns-server-query-analytics", serverId],
+    queryFn: () =>
+      logsApi.dnsQueryAnalytics({ server_id: serverId, limit: 10 }),
+    refetchInterval: 60_000,
+  });
+
+  // Convert per-bucket counters to per-second rates so the chart axis
+  // is stable across windows (60 s buckets at 1h/6h, 300 s at 7d).
+  const points = useMemo(() => {
+    if (!ts.data) return [];
+    const bs = ts.data.bucket_seconds || 60;
+    return ts.data.points.map((p) => ({
+      t: formatBucket(p.t, bs),
+      qps: round2(p.queries_total / bs),
+      noerror: round2(p.noerror / bs),
+      nxdomain: round2(p.nxdomain / bs),
+      servfail: round2(p.servfail / bs),
+    }));
+  }, [ts.data]);
+
+  return (
+    <div className="space-y-3">
+      <div className="rounded-md border bg-card">
+        <div className="flex items-center justify-between border-b px-3 py-2">
+          <div className="flex items-center gap-2">
+            <Activity className="h-3.5 w-3.5 text-blue-500" />
+            <h4 className="text-xs font-semibold uppercase tracking-wider">
+              Query rate
+            </h4>
+          </div>
+          <select
+            value={win}
+            onChange={(e) => setWin(e.target.value as MetricsWindow)}
+            className="rounded border bg-background px-2 py-0.5 text-[11px] focus:outline-none focus:ring-1 focus:ring-ring"
+          >
+            <option value="1h">1h</option>
+            <option value="6h">6h</option>
+            <option value="24h">24h</option>
+            <option value="7d">7d</option>
+          </select>
+        </div>
+        <div className="h-56 p-3">
+          {ts.isLoading ? (
+            <LoadingBlock />
+          ) : points.length === 0 ? (
+            <p className="flex h-full flex-col items-center justify-center gap-1 text-center text-xs text-muted-foreground">
+              <span>No query data yet.</span>
+              <span className="text-[11px]">
+                BIND9 agents poll statistics-channels every 60&nbsp;s.
+              </span>
+            </p>
+          ) : (
+            <ResponsiveContainer width="100%" height="100%">
+              <LineChart
+                data={points}
+                margin={{ top: 5, right: 12, left: 0, bottom: 0 }}
+              >
+                <CartesianGrid strokeDasharray="3 3" opacity={0.3} />
+                <XAxis dataKey="t" tick={{ fontSize: 10 }} minTickGap={32} />
+                <YAxis tick={{ fontSize: 10 }} width={42} />
+                <Tooltip
+                  contentStyle={{ fontSize: 11, borderRadius: 6 }}
+                  labelStyle={{ fontWeight: 600 }}
+                />
+                <Legend wrapperStyle={{ fontSize: 11 }} />
+                <Line
+                  type="monotone"
+                  dataKey="qps"
+                  stroke="#3b82f6"
+                  strokeWidth={2}
+                  dot={false}
+                  name="Total qps"
+                />
+                <Line
+                  type="monotone"
+                  dataKey="noerror"
+                  stroke="#10b981"
+                  strokeWidth={1.5}
+                  dot={false}
+                  name="NOERROR"
+                />
+                <Line
+                  type="monotone"
+                  dataKey="nxdomain"
+                  stroke="#f59e0b"
+                  strokeWidth={1.5}
+                  dot={false}
+                  name="NXDOMAIN"
+                />
+                <Line
+                  type="monotone"
+                  dataKey="servfail"
+                  stroke="#ef4444"
+                  strokeWidth={1.5}
+                  dot={false}
+                  name="SERVFAIL"
+                />
+              </LineChart>
+            </ResponsiveContainer>
+          )}
+        </div>
+      </div>
+
+      <div className="grid grid-cols-1 gap-3 md:grid-cols-2">
+        <AnalyticsCard
+          title="Top qnames"
+          rows={analytics.data?.top_qnames ?? []}
+          isLoading={analytics.isLoading}
+        />
+        <AnalyticsCard
+          title="Top clients"
+          rows={analytics.data?.top_clients ?? []}
+          isLoading={analytics.isLoading}
+        />
+        <AnalyticsCard
+          title="qtype distribution"
+          rows={analytics.data?.qtype_distribution ?? []}
+          isLoading={analytics.isLoading}
+          spanFull
+        />
+      </div>
+      {analytics.data && (
+        <p className="text-[11px] text-muted-foreground">
+          Top-N rollups computed against the parsed BIND9 query log (24&nbsp;h
+          retention) — {analytics.data.total_queries.toLocaleString()} queries
+          in window.
+        </p>
+      )}
+    </div>
+  );
+}
+
+function AnalyticsCard({
+  title,
+  rows,
+  isLoading,
+  spanFull,
+}: {
+  title: string;
+  rows: { key: string; count: number }[];
+  isLoading: boolean;
+  spanFull?: boolean;
+}) {
+  const max = rows[0]?.count ?? 0;
+  return (
+    <div
+      className={`rounded-md border bg-card ${spanFull ? "md:col-span-2" : ""}`}
+    >
+      <div className="border-b px-3 py-2">
+        <h4 className="text-xs font-semibold uppercase tracking-wider">
+          {title}
+        </h4>
+      </div>
+      <div className="p-2">
+        {isLoading ? (
+          <LoadingBlock />
+        ) : rows.length === 0 ? (
+          <p className="px-2 py-3 text-center text-xs text-muted-foreground">
+            No data in window.
+          </p>
+        ) : (
+          <ul className="space-y-1">
+            {rows.map((r) => {
+              const pct = max > 0 ? (r.count / max) * 100 : 0;
+              return (
+                <li key={r.key} className="flex items-center gap-2 px-1">
+                  <span
+                    className="flex-1 truncate font-mono text-xs"
+                    title={r.key}
+                  >
+                    {r.key}
+                  </span>
+                  <div className="relative h-3 w-32 overflow-hidden rounded bg-muted/40">
+                    <div
+                      className="absolute inset-y-0 left-0 bg-blue-500/40"
+                      style={{ width: `${pct}%` }}
+                    />
+                  </div>
+                  <span className="w-16 text-right text-xs tabular-nums text-muted-foreground">
+                    {r.count.toLocaleString()}
+                  </span>
+                </li>
+              );
+            })}
+          </ul>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ── Config tab ────────────────────────────────────────────────────────────
+
+function ConfigTab({ serverId }: { serverId: string }) {
+  const { data, isLoading, isError } = useQuery({
+    queryKey: ["dns-server-rendered-config", serverId],
+    queryFn: () => dnsApi.getServerRenderedConfig(serverId),
+    refetchInterval: 60_000,
+  });
+  const [selected, setSelected] = useState<string | null>(null);
+
+  if (isLoading) return <LoadingBlock />;
+  if (isError || !data) return <ErrorBlock />;
+
+  if (data.files.length === 0) {
+    return (
+      <p className="rounded-md border bg-card p-4 text-center text-sm text-muted-foreground">
+        No rendered-config snapshot yet. The agent ships its{" "}
+        <code className="font-mono">named.conf</code> + zone files after every
+        successful structural reload — trigger one (record edit, zone create,
+        etc.) or wait for the next bundle to land.
+      </p>
+    );
+  }
+
+  // Default to named.conf when the operator first opens the tab —
+  // it's what they're most likely after.
+  const activePath =
+    selected ??
+    data.files.find((f) => f.path === "named.conf")?.path ??
+    data.files[0].path;
+  const active = data.files.find((f) => f.path === activePath) ?? data.files[0];
+
+  return (
+    <div className="grid grid-cols-1 gap-3 md:grid-cols-[14rem_1fr]">
+      <div className="rounded-md border bg-card">
+        <div className="border-b px-3 py-2 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+          Files
+        </div>
+        <ul className="max-h-[28rem] overflow-y-auto p-1 text-xs">
+          {data.files.map((f) => (
+            <li key={f.path}>
+              <button
+                type="button"
+                onClick={() => setSelected(f.path)}
+                className={`flex w-full items-center justify-between gap-2 truncate rounded px-2 py-1.5 text-left font-mono text-[11px] transition-colors ${
+                  f.path === active.path
+                    ? "bg-accent/60 font-semibold"
+                    : "hover:bg-accent/30"
+                }`}
+                title={f.path}
+              >
+                <span className="truncate">{f.path}</span>
+                <span className="flex-shrink-0 text-[10px] text-muted-foreground">
+                  {fmtBytes(f.content.length)}
+                </span>
+              </button>
+            </li>
+          ))}
+        </ul>
+        {data.rendered_at && (
+          <div className="border-t px-3 py-1.5 text-[10px] text-muted-foreground">
+            Pushed {fmtRelative(data.rendered_at)}
+          </div>
+        )}
+      </div>
+      <FileViewer file={active} />
+    </div>
+  );
+}
+
+function FileViewer({ file }: { file: DNSRenderedConfigFile }) {
+  const [copied, setCopied] = useState(false);
+  return (
+    <div className="rounded-md border bg-card">
+      <div className="flex items-center justify-between border-b px-3 py-2">
+        <span className="font-mono text-xs">{file.path}</span>
+        <button
+          type="button"
+          onClick={() => {
+            navigator.clipboard.writeText(file.content).then(() => {
+              setCopied(true);
+              setTimeout(() => setCopied(false), 1500);
+            });
+          }}
+          className="inline-flex items-center gap-1 rounded border px-2 py-0.5 text-[11px] hover:bg-accent"
+        >
+          <Copy className="h-3 w-3" />
+          {copied ? "Copied" : "Copy"}
+        </button>
+      </div>
+      <pre className="max-h-[28rem] overflow-auto whitespace-pre-wrap break-words p-3 font-mono text-[11px] leading-snug">
+        {file.content}
+      </pre>
+    </div>
+  );
+}
+
+function fmtBytes(n: number): string {
+  if (n < 1024) return `${n}B`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)}KB`;
+  return `${(n / 1024 / 1024).toFixed(1)}MB`;
+}
+
+function formatBucket(iso: string, bucketSeconds: number): string {
+  const d = new Date(iso);
+  if (bucketSeconds >= 3600) {
+    return `${d.getMonth() + 1}/${d.getDate()} ${pad(d.getHours())}:00`;
+  }
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function pad(n: number): string {
+  return n.toString().padStart(2, "0");
+}
+
+function round2(x: number): number {
+  return Math.round(x * 100) / 100;
 }
 
 // ── Shared bits ───────────────────────────────────────────────────────────

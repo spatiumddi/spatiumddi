@@ -181,6 +181,11 @@ class NATMappingResponse(BaseModel):
     internal_ip: str | None
     internal_ip_address_id: uuid.UUID | None
     internal_subnet_id: uuid.UUID | None
+    # Display labels for the internal subnet on hide-NAT mappings — without
+    # them the UI can only show the bare UUID, which is useless for operators.
+    # Populated by ``_serialize_nat_*`` helpers; never read from a column.
+    internal_subnet_cidr: str | None = None
+    internal_subnet_name: str | None = None
     internal_port_start: int | None
     internal_port_end: int | None
     external_ip: str | None
@@ -201,6 +206,36 @@ class NATMappingResponse(BaseModel):
     @classmethod
     def _coerce_inet(cls, v: Any) -> Any:
         return str(v) if v is not None else v
+
+
+async def _serialize_one(db: Any, row: NATMapping) -> NATMappingResponse:
+    """Serialize one mapping with the internal subnet display fields filled."""
+    resp = NATMappingResponse.model_validate(row)
+    if row.internal_subnet_id is not None:
+        sn = await db.get(Subnet, row.internal_subnet_id)
+        if sn is not None:
+            resp.internal_subnet_cidr = str(sn.network)
+            resp.internal_subnet_name = sn.name or None
+    return resp
+
+
+async def _serialize_many(db: Any, rows: list[NATMapping]) -> list[NATMappingResponse]:
+    """Batch-load subnets so listing N mappings is one extra SELECT, not N."""
+    sn_ids = {r.internal_subnet_id for r in rows if r.internal_subnet_id is not None}
+    subnets: dict[uuid.UUID, Subnet] = {}
+    if sn_ids:
+        sn_rows = (await db.execute(select(Subnet).where(Subnet.id.in_(sn_ids)))).scalars().all()
+        subnets = {sn.id: sn for sn in sn_rows}
+    out: list[NATMappingResponse] = []
+    for row in rows:
+        resp = NATMappingResponse.model_validate(row)
+        if row.internal_subnet_id is not None:
+            sn = subnets.get(row.internal_subnet_id)
+            if sn is not None:
+                resp.internal_subnet_cidr = str(sn.network)
+                resp.internal_subnet_name = sn.name or None
+        out.append(resp)
+    return out
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -327,7 +362,7 @@ async def list_nat_mappings(
         total=int(total or 0),
         page=page,
         per_page=per_page,
-        items=[NATMappingResponse.model_validate(r) for r in rows],
+        items=await _serialize_many(db, list(rows)),
     )
 
 
@@ -370,7 +405,7 @@ async def create_nat_mapping(
     )
     await db.commit()
     await db.refresh(row)
-    return NATMappingResponse.model_validate(row)
+    return await _serialize_one(db, row)
 
 
 @router.get("/{mapping_id}", response_model=NATMappingResponse)
@@ -378,7 +413,7 @@ async def get_nat_mapping(mapping_id: uuid.UUID, db: DB, _: CurrentUser) -> NATM
     row = await db.get(NATMapping, mapping_id)
     if row is None:
         raise HTTPException(status_code=404, detail="NAT mapping not found")
-    return NATMappingResponse.model_validate(row)
+    return await _serialize_one(db, row)
 
 
 @router.patch("/{mapping_id}", response_model=NATMappingResponse)
@@ -391,7 +426,7 @@ async def update_nat_mapping(
 
     patch = body.model_dump(exclude_unset=True)
     if not patch:
-        return NATMappingResponse.model_validate(row)
+        return await _serialize_one(db, row)
 
     # Build the merged-state shape and re-run kind-aware validation so a
     # partial update that toggles ``kind`` still gets the full check.
@@ -459,7 +494,7 @@ async def update_nat_mapping(
     )
     await db.commit()
     await db.refresh(row)
-    return NATMappingResponse.model_validate(row)
+    return await _serialize_one(db, row)
 
 
 @router.get("/by-ip/{ip_address_id}", response_model=list[NATMappingResponse])
@@ -498,7 +533,7 @@ async def list_nat_mappings_for_ip(
         .scalars()
         .all()
     )
-    return [NATMappingResponse.model_validate(r) for r in rows]
+    return await _serialize_many(db, list(rows))
 
 
 @router.get("/by-subnet/{subnet_id}", response_model=list[NATMappingResponse])
@@ -536,7 +571,7 @@ async def list_nat_mappings_for_subnet(
         .scalars()
         .all()
     )
-    return [NATMappingResponse.model_validate(r) for r in rows]
+    return await _serialize_many(db, list(rows))
 
 
 @router.delete("/{mapping_id}", status_code=status.HTTP_204_NO_CONTENT)

@@ -212,6 +212,42 @@ docker compose up -d
 
 Open `http://localhost:8077` and log in with `admin` / `admin` (you're forced to change the password on first login).
 
+### Upgrading
+
+SpatiumDDI uses CalVer (`YYYY.MM.DD-N`) and ships every component
+(api, worker, beat, frontend, dns-bind9, dhcp-kea) at the same tag.
+The image tag is controlled by `SPATIUMDDI_VERSION` in your `.env`.
+
+**Track latest** (default — your `.env` ships with `SPATIUMDDI_VERSION=latest`):
+
+```bash
+cd spatiumddi
+git pull                              # refresh docker-compose.yml + .env.example for any new fields
+docker compose pull                   # fetch the newest images
+docker compose run --rm migrate       # apply any new alembic migrations (idempotent — no-op if up to date)
+docker compose up -d                  # recreate api/worker/beat/frontend on the new images
+```
+
+**Pin to a specific release** (recommended for production — reproducible, no surprise upgrades):
+
+```bash
+# In your .env:
+SPATIUMDDI_VERSION=2026.04.30-1
+
+# Then:
+docker compose pull
+docker compose run --rm migrate
+docker compose up -d
+```
+
+Bump the pinned version when you're ready to upgrade and re-run the same three commands.
+
+**Notes:**
+- `docker compose run --rm migrate` runs alembic against your current schema — safe to run every upgrade. It exits as a no-op if there are no new migrations.
+- Downgrades are **not** supported. Database migrations are forward-only; if a release introduces a schema change you can't roll back to a tag that predates it without restoring a database backup. Always snapshot Postgres before a major-version upgrade you're not sure about.
+- Watch the **CHANGELOG.md** entry for your target version for any release-specific upgrade notes (e.g. "operators on Kea HA must read this before upgrading").
+- The sidebar shows the running version in the bottom-left corner and surfaces an `update available` badge when a newer GitHub release exists — the version probe runs hourly.
+
 ### Running the built-in BIND9 / Kea containers
 
 The managed-service containers ship under Compose profiles — opt in when you want them:

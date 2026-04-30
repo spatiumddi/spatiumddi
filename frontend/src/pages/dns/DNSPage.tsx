@@ -39,6 +39,7 @@ import { BlocklistCatalogModal } from "./BlocklistCatalogModal";
 import { DelegationModal } from "./DelegationModal";
 import { ZoneTemplateModal } from "./ZoneTemplateModal";
 import { ServerDetailModal } from "./ServerDetailModal";
+import { PoolsView } from "./PoolsView";
 import { Modal } from "@/components/ui/modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import {
@@ -1712,6 +1713,17 @@ function ZoneDetailView({
   // for a forwarders/policy panel and hides the record-management buttons.
   const isForward = zone.zone_type === "forward";
 
+  // Records / Pools sub-tab toggle. Pools live under the same zone but
+  // need their own management surface — health-check config, member
+  // states, manual enable toggles. Forward zones don't host records,
+  // so the tab strip is hidden there.
+  const [zoneView, setZoneView] = useState<"records" | "pools">("records");
+  const { data: poolsForCount = [] } = useQuery({
+    queryKey: ["dns-pools", group.id, zone.id],
+    queryFn: () => dnsApi.listPools(group.id, zone.id),
+    enabled: !isForward && !zone.tailscale_tenant_id,
+  });
+
   const recordTypes = [...new Set(records.map((r) => r.record_type))].sort();
   const hasRecFilter = Object.values(recFilter).some(Boolean);
   const filtered = records.filter((r) => {
@@ -1930,8 +1942,43 @@ function ZoneDetailView({
         </div>
       )}
 
+      {/* Records / Pools tab strip — primary zones only. */}
+      {!isForward && !zone.tailscale_tenant_id && (
+        <div className="flex gap-1 border-b px-5">
+          <button
+            type="button"
+            onClick={() => setZoneView("records")}
+            className={
+              "border-b-2 px-3 py-2 text-xs font-medium transition-colors " +
+              (zoneView === "records"
+                ? "border-primary text-foreground"
+                : "border-transparent text-muted-foreground hover:text-foreground")
+            }
+          >
+            Records ({records.length})
+          </button>
+          <button
+            type="button"
+            onClick={() => setZoneView("pools")}
+            className={
+              "border-b-2 px-3 py-2 text-xs font-medium transition-colors " +
+              (zoneView === "pools"
+                ? "border-primary text-foreground"
+                : "border-transparent text-muted-foreground hover:text-foreground")
+            }
+          >
+            Pools ({poolsForCount.length})
+          </button>
+        </div>
+      )}
+
+      {/* Pools sub-view */}
+      {!isForward && !zone.tailscale_tenant_id && zoneView === "pools" && (
+        <PoolsView group={group} zone={zone} />
+      )}
+
       {/* Bulk actions — shown when any manual records are selected. */}
-      {!isForward && selectedRecords.size > 0 && (
+      {!isForward && zoneView === "records" && selectedRecords.size > 0 && (
         <div className="flex items-center justify-between border-b bg-amber-50 px-5 py-1.5 text-xs dark:bg-amber-900/10">
           <span>
             {selectedRecords.size} record
@@ -1955,7 +2002,7 @@ function ZoneDetailView({
       )}
 
       {/* Records table */}
-      {!isForward && (
+      {!isForward && zoneView === "records" && (
         <div className="flex-1 overflow-auto">
           {isFetching && records.length === 0 && (
             <p className="px-5 py-4 text-sm text-muted-foreground">Loading…</p>
@@ -1977,7 +2024,7 @@ function ZoneDetailView({
                     <th className="w-8 py-2 pl-3">
                       {(() => {
                         const manualIds = filtered
-                          .filter((r) => !r.auto_generated)
+                          .filter((r) => !r.auto_generated && !r.pool_member_id)
                           .map((r) => r.id);
                         const allSel =
                           manualIds.length > 0 &&
@@ -2121,7 +2168,7 @@ function ZoneDetailView({
                           )}
                         >
                           <td className="w-8 py-1.5 pl-3">
-                            {!r.auto_generated && (
+                            {!r.auto_generated && !r.pool_member_id && (
                               <input
                                 type="checkbox"
                                 checked={selectedRecords.has(r.id)}
@@ -2137,7 +2184,7 @@ function ZoneDetailView({
                             )}
                           </td>
                           <td className="py-1.5 pl-5 font-mono text-xs font-medium">
-                            {r.auto_generated ? (
+                            {r.auto_generated || r.pool_member_id ? (
                               r.name
                             ) : (
                               <button
@@ -2166,7 +2213,24 @@ function ZoneDetailView({
                             {r.priority ?? "—"}
                           </td>
                           <td className="py-1.5 pr-3">
-                            {r.auto_generated ? (
+                            {r.pool_member_id ? (
+                              <div className="flex items-center justify-end gap-1">
+                                <span
+                                  title="This record is rendered by a DNS pool's health-check pipeline. Manage it from the Pools tab — direct edits are blocked."
+                                  className="flex items-center gap-1 rounded border border-violet-300/60 bg-violet-50 px-1.5 py-0.5 text-xs text-violet-700 dark:border-violet-700/40 dark:bg-violet-900/20 dark:text-violet-300"
+                                >
+                                  <Lock className="h-2.5 w-2.5" />
+                                  Pool
+                                </span>
+                                <button
+                                  className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-foreground"
+                                  onClick={() => setZoneView("pools")}
+                                  title="Manage in Pools tab"
+                                >
+                                  <Info className="h-3 w-3" />
+                                </button>
+                              </div>
+                            ) : r.auto_generated ? (
                               <div className="flex items-center justify-end gap-1">
                                 {r.tailscale_tenant_id ? (
                                   <span
@@ -4321,6 +4385,7 @@ function RecordsTab({
             port: editing.port,
             auto_generated: editing.auto_generated,
             tailscale_tenant_id: editing.tailscale_tenant_id ?? null,
+            pool_member_id: editing.pool_member_id ?? null,
             created_at: editing.created_at,
             modified_at: editing.modified_at,
           }}

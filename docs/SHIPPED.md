@@ -1,0 +1,1336 @@
+# SpatiumDDI — Shipped roadmap items
+
+Companion to `CLAUDE.md`. The roadmap sections in CLAUDE.md track only items that haven't shipped yet — each ✅ entry below is the full body of an item that landed, kept here so future sessions can recover the design context (migration id, file paths, deferred follow-ups, why-it-was-built) without crowding the working list.
+
+Mirrors CLAUDE.md's three mixed sections:
+- [Major roadmap items](#major-roadmap-items) — feature-level tracker for the IPAM / DNS / DHCP core.
+- [Integration roadmap](#integration-roadmap) — read-only pull mirrors (Kubernetes, Docker, Proxmox, Tailscale, …).
+- [Future ideas — categorised](#future-ideas--categorised) — the 2026.04.26 brainstorm pass, organised by topic.
+
+## Major roadmap items
+
+- ✅ **Windows DNS — Path A (RFC 2136, agentless)** — `WindowsDNSDriver`
+  in `backend/app/drivers/dns/windows.py`. Record CRUD only (A / AAAA /
+  CNAME / MX / TXT / PTR / SRV / NS / TLSA) via dnspython over RFC 2136;
+  zones are managed externally in Windows DNS Manager. Optional TSIG
+  signing; GSS-TSIG and SIG(0) are Path B. Control plane sends updates
+  directly; `record_ops.enqueue_record_op` short-circuits the agent queue
+  for servers whose driver is in `AGENTLESS_DRIVERS`.
+
+- ✅ **Windows DHCP — Path A (WinRM, read-only lease monitoring)** —
+  `WindowsDHCPReadOnlyDriver` in `backend/app/drivers/dhcp/windows.py`.
+  Implements `get_leases` via `Get-DhcpServerv4Scope` /
+  `Get-DhcpServerv4Lease` over WinRM (`pywinrm`). All write methods
+  (`apply_config`, `reload`, `restart`, `validate_config`) raise
+  `NotImplementedError` — Path A is strictly read-only. Credentials are
+  stored Fernet-encrypted on `DHCPServer.credentials_encrypted`. Driver
+  registry gains `AGENTLESS_DRIVERS` + `READ_ONLY_DRIVERS` sets mirroring
+  the DNS side. Scheduled Celery beat task
+  `app.tasks.dhcp_pull_leases.auto_pull_dhcp_leases` fires every 60 s;
+  task gates on `PlatformSettings.dhcp_pull_leases_enabled` /
+  `_interval_minutes`. Leases are upserted by `(server_id, ip_address)`
+  and mirrored into IPAM as `status="dhcp"` + `auto_from_lease=True` rows
+  when the lease IP falls inside a known subnet; the existing lease-
+  cleanup sweep handles expiry uniformly. Manual "Sync Leases" button
+  on the server detail header for agentless drivers. Beat ticks every
+  10 s and the per-run interval is stored in seconds
+  (`PlatformSettings.dhcp_pull_leases_interval_seconds`, default 15 s)
+  so operators can tune near-real-time IPAM population — Windows
+  DHCP has no streaming primitive, so short-interval polling is the
+  practical upper bound without putting an agent on the DC.
+
+- ✅ **OUI/vendor lookup** — opt-in IEEE OUI database fetched by
+  `app.tasks.oui_update.auto_update_oui_database` (hourly beat, task
+  honours `PlatformSettings.oui_lookup_enabled` +
+  `oui_update_interval_hours`, default 24 h). `oui_vendor(prefix
+  CHAR(6) PK, vendor_name, updated_at)` replaced atomically each run
+  so lookups always see a consistent snapshot. `services/oui.py`
+  exposes `bulk_lookup_vendors` + `normalize_mac_key`; IPAM's
+  `list_addresses` and DHCP's `list_leases` use them to attach a
+  `vendor` field. Settings → IPAM → OUI Vendor Lookup carries the
+  toggle + interval + "Refresh Now" (queues
+  `update_oui_database_now`). MACs render as `aa:bb:cc:dd:ee:ff
+  (Cisco Systems)` in the IP table + DHCP leases; feature off =
+  vendor null + UI falls back to bare MAC.
+
+- ✅ **SNMP polling / network device management** — vendor-neutral
+  read-only polling of routers/switches via standard MIBs, with
+  every result cross-referenced into IPAM. Lands the "every
+  managed IP gets a heartbeat + switch-port automatically" payoff
+  this whole roadmap pivots on. **Mirror scope:**
+  - **Data model** (migration
+    `c4e7a2f813b9_network_devices`): `network_device` (SNMP
+    credentials Fernet-encrypted at rest; v1 / v2c / v3 USM all
+    supported with auth + priv protocol enums), `network_interface`,
+    `network_arp_entry` keyed `(device, ip, vrf)`, and
+    `network_fdb_entry` keyed `(device, mac, vlan)` with the
+    Postgres 15+ `NULLS NOT DISTINCT` unique index — so a single
+    port can carry the same MAC across multiple VLANs (hypervisor
+    with VMs in different access VLANs, IP phone with PC
+    passthrough on voice + data VLANs).
+  - **MIBs walked** — SNMPv2-MIB system group (sysDescr /
+    sysObjectID / sysName / sysUpTime), IF-MIB `ifTable` +
+    `ifXTable`, IP-MIB `ipNetToPhysicalTable` with legacy
+    RFC1213 `ipNetToMediaTable` fallback, Q-BRIDGE-MIB
+    `dot1qTpFdbTable` with BRIDGE-MIB `dot1dTpFdbTable` fallback.
+    All standard, no vendor-specific MIBs — works on Cisco /
+    Juniper / Arista / Aruba / MikroTik / OPNsense / pfSense /
+    FortiNet / Cumulus / SONiC / FS.com / Ubiquiti out of the
+    box.
+  - **Polling pipeline** — `pysnmp` 6.x async (`bulkWalk` for
+    table OIDs, ~10–50× faster than `getNext`).
+    `app.tasks.snmp_poll.poll_device` runs sysinfo → interfaces
+    → ARP → FDB sequentially under a per-device
+    `SELECT FOR UPDATE SKIP LOCKED` so concurrent dispatches
+    can't double-poll the same row. `dispatch_due_devices`
+    beat-fires every 60 s and queues every active device whose
+    `next_poll_at <= now`. Per-device interval default 300 s,
+    minimum 60 s. Status: `success | partial | failed |
+    timeout`, with `last_poll_error` populated for ops triage.
+    Stale ARP entries are kept with `state='stale'` (no
+    delete); `purge_stale_arp_entries` daily beat task removes
+    rows older than 30 days.
+  - **IPAM cross-reference** — after every successful ARP poll,
+    `cross_reference_arp` finds matching `IPAddress` rows in
+    the device's bound `IPSpace` and updates `last_seen_at`
+    (max-merge), `last_seen_method='snmp'`, and fills
+    `mac_address` only when currently NULL — operator-set MACs
+    are never overwritten. When the per-device
+    `auto_create_discovered=True` toggle is on (off by default;
+    operator stays in control), inserts new
+    `status='discovered'` rows for ARP IPs that fall inside a
+    known `Subnet`. Returns counts (`updated`, `created`,
+    `skipped_no_subnet`).
+  - **API** — full CRUD at `/api/v1/network-devices` plus
+    `POST /test` (synchronous SNMP probe, ≤10 s, returns
+    `TestConnectionResult` with sysDescr + classified
+    `error_kind`: `timeout | auth_failure | no_response |
+    transport_error | internal`), `POST /poll-now` (queues
+    immediate Celery task, returns 202 + task_id), and
+    per-device list endpoints `/interfaces`, `/arp` (filter by
+    ip/mac/vrf/state), `/fdb` (filter by mac/vlan/interface_id).
+    The IP-detail surface gains
+    `GET /api/v1/ipam/addresses/{id}/network-context` — joins
+    `IPAddress.mac_address → NetworkFdbEntry → NetworkInterface
+    → NetworkDevice` and returns one row per (device, port,
+    VLAN, MAC) tuple so a hypervisor / IP phone surfaces every
+    leg.
+  - **Frontend** — top-level `/network` page in the core sidebar
+    (always visible between VLANs and Logs — this is core IPAM
+    functionality, not gated on a Settings → Integrations
+    toggle). Per-device detail at `/network/:id` with Overview /
+    Interfaces / ARP / FDB tabs, each filterable + paginated.
+    Add/edit modal with SNMP-version-conditional credential
+    fields (community for v1/v2c; security_name + level + auth
+    + priv for v3) plus inline Test Connection (saves first on
+    create, then probes against the saved row). New "Network"
+    tab on the IP detail modal showing per-IP switch/port table
+    sorted by `last_seen DESC`.
+  - **Permissions** — single `manage_network_devices` permission
+    gates all endpoints (read + write); new "Network Editor"
+    builtin role gets it. Superadmin always bypasses.
+  - **Tests** — 35 backend tests covering pysnmp wrapper paths
+    (mocked: v1 / v2c / v3 auth construction, OID resolution,
+    `ipNetToPhysical → ipNetToMedia` fallback,
+    `Q-BRIDGE → BRIDGE` fallback, error classification),
+    API CRUD + `/test` + `/poll-now` + the four list endpoints
+    + `/network-context`, and three cross-reference paths
+    (existing IP gets last_seen + MAC fill; operator-set MAC
+    never overwritten; auto-create on/off; no-matching-subnet
+    skip).
+
+  **Deferred follow-ups:**
+  - **CDP neighbour collection** + topology graph. LLDP shipped
+    in the categorised brainstorm section below; CDP (Cisco-only)
+    deferred — modern Cisco gear runs LLDP alongside CDP, so the
+    standard-MIB path covers the typical case.
+  - **VRF-aware ARP polling.** `network_device.v3_context_name`
+    column exists for SNMPv3 context-name targeting, but the
+    poller doesn't iterate per-VRF in v1. Per-VRF SNMPv2c
+    community-string indexing
+    (`<community>@<vrf-name>` Cisco convention) and SNMPv3
+    context-name iteration are both pending.
+  - **Standalone `snmp-poller` container** (per
+    `docs/features/IPAM.md §13`). Today the polling lives in
+    the existing Celery worker pool, which is fine to ~100
+    devices on a 5-min interval. Splitting becomes interesting
+    once SNMP traffic competes with the worker's other tasks
+    or when the operator wants different network reachability
+    for the poller (different VLAN, jumphost, etc).
+  - **Beat-tick fan-out cap.** `dispatch_due_devices` queues
+    every due device in one tick; at >1k devices this is a
+    queue spike. Chunking + per-tick rate-limit is the cheap
+    follow-up.
+  - **Permission granularity** — read vs write split. Today
+    `manage_network_devices` covers both; ops teams that want
+    network-engineer read access without write privs need a
+    `view_network_devices` companion permission.
+  - **Stateless probe endpoint** — today `/test` requires the
+    device row to exist; the create-then-test flow on the UI
+    saves first then probes. A
+    `POST /network-devices/probe` that accepts inline creds
+    would let operators verify before committing the row.
+  - **Frontend permission gating** — sidebar nav entry shows
+    for every authenticated user (backend 403s unauthorised
+    callers). A `useCurrentUser` hook + `hasPermission` check
+    on the sidebar item is the polish step; depends on
+    introducing those hooks (they don't exist anywhere in the
+    frontend today).
+  - **Vendor-specific MIBs** — CISCO-VRF-MIB for VRF
+    auto-discovery, ENTITY-MIB for chassis info, vendor PoE
+    MIBs. The vendor-neutral path covers the IPAM payoff;
+    extensions are operator-pull additions.
+  - **`/network-context` reverse-lookup pages.** "Show me every
+    IP currently learned on switch X port 24" needs an
+    interface-detail page or a query mode on the FDB tab.
+    Today operators can filter the FDB tab by interface_id —
+    the dedicated UI is a polish iteration.
+
+  Original spec lives at `docs/features/IPAM.md §13` (the
+  pre-build placeholder). The shipped behaviour matches that
+  spec for the standard-MIB scope.
+
+- ✅ **Nmap scanner** — on-demand nmap scans against any IPv4 /
+  IPv6 host from the SpatiumDDI host perspective. Two entry
+  points: a per-IP "Scan with Nmap" button on the IPAM IP detail
+  modal, and a standalone `/tools/nmap` page for ad-hoc targets
+  (including IPs that aren't in IPAM yet). Backend: `NmapScan`
+  model + migration `d2f7a91e4c8b`, sanitised argv builder with
+  preset table (quick / service+version / OS fingerprint /
+  default-scripts / UDP top-100 / aggressive / custom), async
+  subprocess runner using `-oN -` on stdout for the live SSE
+  viewer + `-oX <tmpfile>` in parallel for structured XML
+  parsing, Celery task on the `default` queue, and the SSE
+  endpoint at `GET /api/v1/nmap/scans/{id}/stream`. SSE auth
+  uses `?token=<...>` because EventSource can't set Authorization
+  headers; the router has no global `Depends(get_current_user)`
+  because that would 401 before the query-token resolver runs
+  (each non-SSE endpoint declares its own permission dep). New
+  `manage_nmap_scans` permission seeded into the existing
+  Network Editor builtin role. nmap installed in the api image.
+  **Deferred follow-ups:**
+  - **Trigger pipeline** — auto-scan on ARP/SNMP discovery (the
+    `auto_create_discovered=True` path) and alert-rule-driven
+    re-scans. Phase 2.
+  - **Realtime fanout** — the SSE stream polls the DB-persisted
+    `raw_stdout` column every 500 ms per active viewer. Fine
+    at human cadence and a handful of operators; if many
+    operators end up watching live scans simultaneously
+    (>~20-30) it'll show up as Postgres load. Swap to Redis
+    pub/sub or `LISTEN/NOTIFY` behind the same HTTP shape.
+  - **Privileged scans** — nmap runs as the api container's
+    non-root user; raw-SYN (`-sS`) and unprivileged OS-detect
+    silently fall back to TCP-connect. Bare-metal deployments
+    can give the API process `CAP_NET_RAW` to unlock those
+    modes; containerised deployments can't and shouldn't.
+
+- ✅ **API tokens with auto-expiry** (Phase 1 close-out) — `APIToken`
+  model already existed; this session wires the create/list/revoke
+  router, extends `get_current_user` to accept `spddi_*` bearer
+  tokens alongside JWTs, tracks `last_used_at`, and adds an admin UI
+  at `/admin/api-tokens`. Tokens are hashed at rest (SHA-256) and
+  shown in plaintext once at creation.
+
+- ✅ **Syslog + event forwarding** — every successful `AuditLog`
+  commit is optionally forwarded to an external syslog target
+  (RFC 5424 over UDP / TCP) and/or a generic HTTP webhook. Hook is
+  a SQLAlchemy `after_commit` session listener in
+  `services/audit_forward.py`; delivery is fire-and-forget on a
+  dedicated asyncio task so audit writes never block on network I/O.
+  Configured in Settings; targets live on `PlatformSettings`
+  (single syslog + single webhook for now — multi-target moves to a
+  dedicated table when a second customer asks).
+
+- ✅ **DHCP state failover (Kea HA)** — under the group-centric data
+  model (shipped 2026.04.21-2), a `DHCPServerGroup` with two Kea
+  members is implicitly an HA pair. HA tuning (mode, heartbeat /
+  max-response / max-ack / max-unacked, auto-failover) lives on the
+  group; per-peer URL lives on each `DHCPServer.ha_peer_url`.
+  `DHCPFailoverChannel` is gone — merged into the group.
+  `ConfigBundle` carries a `FailoverConfig` when the server's group
+  is an HA pair; the agent's `render_kea.py` injects `libdhcp_ha.so`
+  + `high-availability` alongside the always-loaded
+  `libdhcp_lease_cmds.so` hook. Peer URLs are resolved agent-side
+  (`_resolve_peer_url`) before render because Kea's Boost asio
+  parser only accepts IP literals. Kea image splits ports: `:8000`
+  is owned by the HA hook's `CmdHttpListener`, `:8544` by the
+  operator-facing `kea-ctrl-agent`. Agent supervises an
+  `HAStatusPoller` thread that calls `status-get` (Kea 2.6 folded
+  HA state into the generic status command; pre-2.6 `ha-status-get`
+  shapes still accepted) and POSTs state to
+  `/api/v1/dhcp/agents/ha-status`. Bootstrap-from-cache issues
+  `config-reload` with retry so Kea picks up HA on agent restart.
+  HA config lives in the main DHCP tab's server-group edit modal;
+  dashboard shows one row per HA pair with a live state dot per
+  peer. Scope mirroring is automatic — all servers in a group
+  render the same scopes, pools, statics, and client classes.
+  **`PeerResolveWatcher`** re-resolves peer hostnames every 30s
+  and triggers render + reload on IP drift, so compose
+  `--force-recreate` / k8s pod restarts heal without operator
+  action. Kea daemons (`kea-dhcp4` + `kea-ctrl-agent`) run under
+  per-daemon supervise loops with stale-PID-file scrubbing, 5-in-
+  30s crash-loop guards, and SIGTERM forwarding. **Deferred
+  follow-ups:**
+  - **Kea version skew guard.** The `status-get` HA shape shifted
+    between Kea 2.4 and 2.6. Pairing peers on mismatched Kea
+    versions is accepted today. Cheap fix: ship Kea version in the
+    heartbeat, reject group membership changes if peers differ.
+  - **DDNS double-write under HA.** Agent-side DDNS
+    (`apply_ddns_for_lease`) doesn't gate on HA state — if the
+    standby ever serves a lease (pre-sync window, partner-down),
+    both peers could try to write the same RR. Kea's hook
+    coordinates DHCP serving but not our DDNS pipeline.
+  - **State-transition actions** (`ha-maintenance-start`,
+    `ha-continue`, force-sync) — observable today but operators
+    can't drive the HA state machine from the UI.
+  - **Peer compatibility validation** (refuse groups with ≥ 3 Kea
+    members because `libdhcp_ha.so` only supports pairs), per-pool
+    HA scope tuning for load-balancing.
+  - **HA e2e test.** `.github/workflows/agent-e2e.yml` stands up
+    a single-agent DNS pair today; an HA DHCP variant would have
+    caught the bootstrap / port-split / `status-get` / wire-shape
+    regressions we hit in 2026.04.21-2.
+
+- ✅ **DHCP MAC blocklist (group-global)** — `DHCPMACBlock` table
+  hung off `DHCPServerGroup`, unique on `(group_id, mac_address)`,
+  indexed on `expires_at`. Per-row fields: `mac_address` (MACADDR),
+  `reason` (`rogue` / `lost_stolen` / `quarantine` / `policy` /
+  `other`), `description`, `enabled`, `expires_at`, `created_at` +
+  `created_by_user_id`, `updated_by_user_id`, `last_match_at`,
+  `match_count`. `MACBlockDef` added to `ConfigBundle`; the control
+  plane strips `enabled=False` + expired rows pre-render so the
+  ETag naturally shifts on expiry transitions and agents long-poll
+  pick it up. **Kea path**: agent's `render_kea.py` wraps the active
+  MAC list in Kea's reserved `DROP` client class via an OR-ed
+  `hexstring(pkt4.mac, ':') == '...'` expression — packets are
+  silently dropped before allocation; if the operator hand-defined
+  a `DROP` class the renderer steps aside rather than clobber it.
+  **Windows DHCP path**: `WindowsDHCPReadOnlyDriver.sync_mac_blocks`
+  diffs desired-set against `Get-DhcpServerv4Filter -List Deny` and
+  ships one batched PS script per WinRM round trip. Beat tick every
+  60 s (`app.tasks.dhcp_mac_blocks.sync_dhcp_mac_blocks`) reconciles
+  Windows servers — Kea doesn't need the task since blocklist
+  changes flow through the bundle. CRUD at `/api/v1/dhcp/server-
+  groups/{gid}/mac-blocks` (list + create) + `/api/v1/dhcp/mac-
+  blocks/{id}` (update + delete). List endpoint joins OUI vendor
+  lookup and an `IPAddress.mac_address` cross-reference so the UI
+  surfaces vendor + any IPAM rows tied to the blocked MAC.
+  Frontend `MacBlocksTab` on the DHCP server detail view (mirrors
+  where `ClientClassesTab` lives): filterable table, reason pills,
+  status pill (active / disabled / expired), IPAM link-outs, add /
+  edit modal accepting any common MAC format. Permission gate
+  `dhcp_mac_block`; built-in "DHCP Editor" role gets it. Migration
+  `d4a18b20e3c7_dhcp_mac_blocks`. **Deferred follow-ups:**
+  - **Bulk import / paste** from CSV — the current UI is one-at-a-
+    time; large blocklists need a paste-a-list path.
+  - **Per-scope restriction.** Kea's class/pool pinning supports
+    "block this MAC only on subnet X" — would mean dropping the
+    `DROP` shortcut in favour of per-pool `client-class` + a
+    per-subnet class. Windows can't do per-scope deny at all
+    (deny-list is server-global). Group-global is the right
+    default; per-scope is a Phase 5 precision tool.
+  - **`last_match_at` + `match_count` wiring.** The columns exist
+    but nothing writes to them yet. Kea has a lease-event hook and
+    Windows has a `FilterNotifications` event channel we already
+    surface in Logs — either can drive the counter.
+  - **HA pair compatibility**: the beat task iterates every
+    agentless server regardless of group HA state. Should still be
+    idempotent but worth a targeted test when HA + Windows DHCP
+    land together.
+
+
+- ✅ **Alerts framework (v1)** — `AlertRule` + `AlertEvent` tables;
+  evaluator at `services/alerts.py:evaluate_all()` runs from
+  `app.tasks.alerts.evaluate_alerts` on a 60 s beat tick. Two rule
+  types on launch: `subnet_utilization` (honours
+  `PlatformSettings.utilization_max_prefix_*` so PTP / loopback
+  subnets can't trip the alarm) and `server_unreachable` (DNS /
+  DHCP / any). Delivery reuses the audit-forward syslog + webhook
+  send helpers against the platform-level targets; per-rule
+  override of targets deferred. Admin UI at `/admin/alerts` with
+  live events viewer + "Evaluate now". Email (SMTP) and SNMP trap
+  channels are the remaining v2 work — needs SMTP config infra that
+  doesn't exist yet, and SNMP is its own dependency footprint.
+
+- ✅ **Dashboard time-series (MVP)** — agent-driven DNS query rate +
+  DHCP traffic charts, self-contained (no Prometheus / InfluxDB
+  required). BIND9 agents poll `statistics-channels` XMLv3 on
+  `127.0.0.1:8053` (injected into rendered `named.conf`); Kea
+  agents poll `statistic-get-all` over the existing control socket.
+  Both report per-60s-bucket deltas to `POST
+  /api/v1/{dns,dhcp}/agents/metrics`. Counter resets on daemon
+  restart are detected agent-side (`delta < 0`) and drop the
+  bucket rather than emitting a phantom spike. Storage in two
+  narrow tables `dns_metric_sample` + `dhcp_metric_sample` keyed
+  on `(server_id, bucket_at)`. Dashboard reads `GET
+  /api/v1/metrics/{dns,dhcp}/timeseries?window={1h|6h|24h|7d}`
+  with server-side `date_bin` downsampling (60 s for ≤24 h,
+  5 min for 7 d). Retention by nightly `prune_metric_samples`
+  Celery task (default 7 d). Migration
+  `bd4f2a91c7e3_metric_samples`. **Deferred follow-ups:**
+  - **Windows DNS / DHCP stats** — needs `Get-DnsServerStatistics`
+    + `Get-DhcpServerv4Statistics` driver methods over WinRM.
+    Chart currently shows "no data yet" for Windows-only
+    deployments.
+  - **Prometheus export** of the same samples — one Gauge per
+    column with `server_id` label would make the existing
+    `/metrics` endpoint a full-featured scrape target for
+    operators who prefer Grafana.
+  - **InfluxDB push export** (`InfluxDBTarget` spec in
+    `docs/features/SYSTEM_ADMIN.md §8.2`) — shape exists, writer
+    still pending.
+  - **Per-qtype** (BIND) / **per-subnet** (Kea) breakdowns —
+    `statistic-get-all` already carries per-subnet counters; the
+    agent strips them for MVP. Adding them is column-only, no
+    protocol change.
+  - **Alert rule types `dns_query_rate` / `dhcp_lease_rate`** —
+    threshold-based alerts keyed off the timeseries data.
+
+- ✅ **ACME / Let's Encrypt — DNS-01 provider for external clients**
+  — landed in the 2026.04.22-1 wave. Lets certbot / lego / acme.sh
+  on a client box prove control of a FQDN hosted in (or delegated
+  to) a SpatiumDDI-managed zone and issue public certs (wildcards
+  included). Implementation shipped as an `acme-dns`-compatible HTTP
+  surface under `/api/v1/acme/` with the following pieces:
+  - **Data model** — `ACMEAccount` (`app/models/acme.py`,
+    migration `ac3e1f0d8b42`): `username` + `password_hash`
+    (bcrypt), UUID `subdomain`, FK `zone_id`, optional
+    `allowed_source_cidrs`, `last_used_at`. Credentials shown once
+    at registration; only the hash persists.
+  - **Endpoints** — `POST /register` (JWT auth, gated by
+    `manage_acme` / `write:acme_account`), `POST /update` +
+    `DELETE /update` (acme-dns `X-Api-User` / `X-Api-Key` auth,
+    subdomain must match authenticated account), `GET /accounts`
+    / `DELETE /accounts/{id}` admin ops.
+  - **Record write** — routes through the normal
+    `enqueue_record_op` pipeline so TXT records land in the UI +
+    audit log + DDNS pipeline uniformly. `subnet_id`-equivalent
+    routing here is the zone's primary server.
+  - **Propagation wait** — `/update` blocks up to 30 s polling
+    `DNSRecordOp.state` until `applied`, so the CA's subsequent
+    DNS-01 poll finds the record live. Returns 504 on timeout,
+    502 on primary driver error.
+  - **Wildcard support** — keeps the 2 most-recent TXT values per
+    subdomain so wildcard + base cert issuance (which presents two
+    different validation tokens at the same record name) works.
+  - **Protocol choice** — `acme-dns` compat means certbot
+    (`dns-acmedns` plugin), lego, acme.sh all work out of the box
+    with no custom plugin. Delegation pattern documented in
+    `docs/features/ACME.md` — operator CNAMEs
+    `_acme-challenge.<their-fqdn>` to
+    `<account.subdomain>.<our-acme-zone>` and delegates the small
+    subzone via NS records, so a leaked credential can't rewrite
+    anything outside that label.
+  - **Audit** — every register / update / delete / revoke lands in
+    `audit_log`. TXT values logged as a 12-char prefix only, never
+    in full. Credentials never logged, hashed or otherwise.
+  - **Tests** — `backend/tests/test_acme.py`, 24 tests covering
+    crypto roundtrip, source-CIDR allowlist edge cases, HTTP auth
+    paths, wildcard rolling window, revocation, cleanup.
+
+  **Deferred follow-ups:**
+  - **Dedicated rate-limit bucket** for `/api/v1/acme/*` + Fail2Ban-
+    style temp-ban on repeated `/update` auth failures. Today the
+    endpoint rides the general API rate limit (none in v1; add
+    slowapi or similar when it lands).
+  - **Per-op `asyncio.Event` ack channel** to replace the DB-polling
+    `wait_for_op_applied` loop. ~250 ms latency savings on the
+    typical path; the polling approach is simple and correct but
+    opens/closes a DB session every 500 ms.
+  - **Celery janitor task** for the 24 h stale TXT sweep — service-
+    level function `acme.sweep_stale_txt_records` is written and
+    unit-testable; wiring it into the beat schedule is pending.
+  - **Metric exposure** for ACME activity (registrations,
+    /update rate, sweep counts) on the admin dashboard.
+
+
+- ✅ **Kubernetes integration (read-only cluster mirror).** Poll one
+  or more Kubernetes clusters with a read-only service-account
+  token and mirror the stable bits of cluster state into SpatiumDDI.
+  **Deliberately not mirroring pod IPs** — they churn too fast to
+  be useful in IPAM. The value is reserving cluster CIDRs in IPAM
+  (so operators can't accidentally overlap), surfacing LoadBalancer
+  VIPs with their owning `namespace/service`, and auto-generating
+  DNS records for Ingress hostnames. Pure pull, SpatiumDDI never
+  writes to the cluster.
+
+  **UX shape (agreed):**
+  - **Settings → Integrations** is a new top-level settings section
+    that hosts one card per integration type. Each card carries its
+    own independent enable toggle on `PlatformSettings` (no single
+    master `integrations_enabled` flag — granular by design so
+    enabling Kubernetes doesn't also enable a future Terraform
+    Cloud integration). When an integration's toggle is on, its
+    corresponding top-level sidebar nav item appears (flat, not
+    nested under an "Integrations" meta-item — matches how DHCP /
+    DNS already surface).
+  - **`KubernetesCluster` rows** are the per-cluster config, not
+    PlatformSettings. Each cluster binds to exactly one
+    `IPAMSpace` (required — discovered IPs / blocks land there)
+    and optionally one `DNSServerGroup` (for ingress → DNS sync).
+    Many clusters supported, same or different space/group per
+    cluster.
+  - **Credentials**: API server URL + CA bundle PEM + bearer token,
+    with the token Fernet-encrypted at rest alongside the other
+    driver creds (`DHCPServer.credentials_encrypted`,
+    `DNSServer.credentials_encrypted`).
+  - **Modal** shows an embedded setup guide with the exact
+    ServiceAccount / ClusterRole / ClusterRoleBinding YAML plus
+    `kubectl` commands to extract the token + CA bundle. Cluster
+    version + node count round-trip via a **Test Connection**
+    button before save.
+  - **Operator also enters pod CIDR + service CIDR** in the form —
+    service CIDR is not reliably extractable from the API; pod CIDR
+    could be derived from Node objects but asking is simpler and
+    matches how the DHCP / DNS server forms work.
+
+  **Phased scope:**
+
+  - ✅ **Phase 1a — Scaffolding.** Settings → Integrations UX +
+    per-integration toggle on PlatformSettings + sidebar gating.
+    `KubernetesCluster` model + migration `f8c3d104e27a` + CRUD API
+    + admin UI page + setup-guide modal (embedded YAML + kubectl
+    extract commands) + Test Connection button that probes
+    `/version` + `/api/v1/nodes` with structured error
+    reporting (401/403/TLS/network distinguished).
+
+  - ✅ **Phase 1b — Read-only reconciliation.** Every 30 s beat
+    tick; per-cluster `sync_interval_seconds` (min 30 s) gates the
+    actual reconcile. Gated overall by
+    `PlatformSettings.integration_kubernetes_enabled`. Provenance
+    via dedicated `kubernetes_cluster_id` FK on `ip_address`,
+    `ip_block`, `dns_record` (migration `a917b4c9e251`); FK is
+    `ON DELETE CASCADE` so removing a cluster sweeps every mirror
+    row atomically. What gets mirrored:
+    - Pod CIDR + Service CIDR → one `IPBlock` each under the bound
+      space.
+    - Node objects → `IPAddress` with `status="kubernetes-node"`,
+      hostname = node name.
+    - `Service` objects with `spec.type=LoadBalancer` + populated
+      `status.loadBalancer.ingress[0].ip` → `IPAddress` with
+      `status="kubernetes-lb"`, hostname = `<service>.<namespace>`.
+    - `Ingress` objects with `status.loadBalancer.ingress[0].ip`
+      → DNS **A** record per `rules[].host` in the longest-suffix-
+      matching zone from the bound DNS group; `ingress[0].hostname`
+      (cloud LBs) → **CNAME**. `auto_generated=True` + fixed 300 s
+      TTL. Rows missing a matching subnet / zone increment
+      `skipped_no_subnet` / `skipped_no_zone` on the reconcile
+      summary — non-fatal, surfaced in logs + audit. Diff is
+      create / update / delete (option 2a: delete, not orphan).
+    **Admin UI**: "Sync Now" button per cluster (fires
+    `sync_cluster_now` Celery task, bypasses interval gating) plus
+    per-row `last_synced_at` / `last_sync_error` display. K8s
+    client is a thin `httpx`-based REST wrapper — no
+    `kubernetes-asyncio` dep.
+
+  - ⬜ **Phase 2 — external-dns webhook provider (separate
+    feature).** Implement the external-dns webhook provider HTTP
+    protocol so teams already running external-dns can just point
+    it at SpatiumDDI as a DNS backend. Different protocol, different
+    testing story — deliberately not bundled with the pull-based
+    integration above.
+
+  **Explicit non-goals:**
+  - Mirroring pod IPs (too dynamic, too noisy — the CIDR block is
+    what matters).
+  - Writing to the cluster (no CRD create, no annotation updates).
+    If we want write-back, Phase 2's external-dns webhook is the
+    right pattern — it's what ops teams already expect.
+  - Managing the kubeconfig / kubectl flow — operator brings their
+    own cluster-admin credentials to create the ServiceAccount; we
+    only ever see the resulting read-only token.
+
+
+- ✅ **Docker integration (read-only host mirror).** Poll one or
+  more Docker daemons with a read-only connection and mirror the
+  networks + (opt-in) containers into IPAM. Same UX shape as the
+  Kubernetes integration above — `DockerHost` rows bound per-host
+  to one `IPAMSpace` + optional `DNSServerGroup`, Settings →
+  Integrations → Docker toggle, sidebar item gated on the toggle,
+  Fernet-encrypted TLS client key, per-row Test Connection + Sync
+  Now buttons, Setup guide with copy-paste TCP+TLS daemon config
+  or Unix socket mount instructions.
+
+  **Transport:** `unix` socket or `tcp` with optional mTLS. SSH
+  (`docker -H ssh://`) is deferred — needs paramiko +
+  `docker system dial-stdio` stream shuffling. No Docker Python
+  SDK dep; we hit three Engine API endpoints (`/networks`,
+  `/containers/json`, `/info`) over `httpx`.
+
+  **What's mirrored:**
+  - Every non-skipped Docker network → IPAM subnet under an
+    enclosing operator block when one exists, else a cluster-
+    owned wrapper block at the CIDR. Default `bridge` / `host` /
+    `none` / `docker_gwbridge` / `ingress` are skipped unless
+    `include_default_networks=true`. Swarm overlay networks
+    always skipped (cluster-wide — would duplicate across nodes).
+  - Network gateway → one `reserved`-status `IPAddress` per
+    subnet (mirrors the LAN placeholder that `/ipam/subnets`
+    creates for operator-made subnets).
+  - Containers (opt-in via `host.mirror_containers`) → one
+    `IPAddress` per (container × connected network) with
+    `status="docker-container"` and hostname = either
+    `<compose_project>.<compose_service>` when Docker Compose
+    labels are present, else the container name. Stopped
+    containers skipped unless `include_stopped_containers=true`.
+
+  **Phase-3 placeholder (deferred).** Rich per-host management
+  surface like mzac/uhld's Docker plugin: container actions
+  (start/stop/restart), log streaming, shell exec (pty over
+  websocket), image management, compose project up/down,
+  volume browser, live events feed. Queries the stored
+  connection live — no schema migration needed. Same treatment
+  for Kubernetes (pod logs, shell exec, YAML apply, scaling).
+  Scoped as a separate feature because it's a full management UI,
+  not IPAM, and needs a websocket pipeline we don't have today.
+
+
+## Integration roadmap
+
+- ✅ **Proxmox VE** — `ProxmoxNode` model + REST client
+  + reconciler landed. Auth is API-token (`user@realm!tokenid`
+  + UUID), token secret Fernet-encrypted at rest. One row
+  covers a standalone host OR a whole cluster (PVE API is
+  homogeneous across cluster members; `/cluster/status` surfaces
+  cluster name + node count). Mirror scope:
+  - **SDN VNets** (`/cluster/sdn/vnets/{vnet}/subnets`) →
+    `Subnet` named `vnet:<vnet>` with the declared gateway.
+    Authoritative over bridge-derived rows for the same CIDR —
+    operator intent from PVE SDN wins. Returns 404 when SDN
+    isn't installed; reconciler treats that as "no SDN" and
+    keeps going.
+  - **SDN VNet subnet inference** (opt-in via
+    `infer_vnet_subnets` toggle, default off) — for VNets that
+    exist but have no declared subnets, derive the CIDR from
+    guests. Priority: (1) exact `static_cidr` from a VM's
+    `ipconfigN gw=` or LXC's inline `ip=`/`gw=`; (2) /24 guess
+    around guest-agent runtime IPs with a `proxmox_vnet_cidr_guessed`
+    warning hinting at the `pvesh create` replacement. Solves
+    the "PVE is L2 passthrough, gateway lives on upstream
+    router" case where operators have many VNets with zero
+    declared subnets. Migration `e5a72f14c890`.
+  - Bridges + VLAN interfaces with a CIDR → Subnet (under
+    enclosing operator block when present, else auto-created
+    RFC 1918 / CGNAT supernet via the shared helper). Bridges
+    without a CIDR skipped.
+  - VM + LXC NICs → IPAddress with `status="proxmox-vm"` /
+    `"proxmox-lxc"`, MAC from config. Runtime IP from QEMU
+    guest-agent (when `agent=1` + agent running) or LXC
+    `/interfaces`; falls back to `ipconfigN` static IP (VMs)
+    or inline `ip=` (LXC); NIC silently skipped when nothing
+    resolves. Link-local + loopback addresses filtered out.
+  - Bridge gateway IP → `reserved` placeholder row per subnet.
+  `mirror_vms` + `mirror_lxc` default **true** (PVE guests are
+  long-lived, unlike Docker CI containers). **Discovery
+  modal** — the reconciler writes a `last_discovery` JSONB
+  snapshot on every successful sync (category counters + a
+  per-guest list with single top-level `issue` code + operator-
+  facing `hint`); admin page gets a magnifier-icon button per
+  endpoint that opens a filterable Discovery modal showing
+  agent-state pills + IPs-mirrored split + copy-ready fix
+  hints like "install qemu-guest-agent inside the VM". Default
+  filter is `Issues` so operators land on what needs attention.
+  Migration `e7b3f29a1d6c`. Covered by 38 tests:
+  `test_proxmox_client.py` (NIC + ipconfig + SDN-id parsing) +
+  `test_proxmox_reconcile.py` (pipeline end-to-end, SDN
+  subnet merge, VNet inference with both static-CIDR and
+  runtime-IP paths, cascade delete). Migration
+  `d1a8f3c704e9` (base) + `e5a72f14c890` (infer toggle) +
+  `e7b3f29a1d6c` (discovery payload).
+  **Deferred follow-ups:**
+  - **Phase 2 per-cluster management surface** — VM / LXC
+    start/stop/shutdown, console access, live migrate,
+    snapshot, backup browser. Mirrors the Kubernetes /
+    Docker Phase-3 pattern; needs websocket pipeline we
+    don't have today.
+  - **Pool / resource-tag awareness.** PVE has a "pool" object
+    for grouping resources and an arbitrary tag system; neither
+    surfaces in IPAM today. Low-effort to add as custom-field
+    passthrough once an operator asks.
+  - **Cluster-quorum alerting.** `/cluster/status` carries a
+    `quorate` bool — wire that into the alerts framework so an
+    HA cluster losing quorum pages operators.
+
+
+- ✅ **Tailscale — Phase 1: device mirror.** Per-`TailscaleTenant`
+  row, PAT token + tailnet name (default `-`), Fernet-encrypted
+  at rest. 60 s default sync interval (Tailscale rate-limits
+  `/api/v2` at 100 req/min, so 30 s floor is the same as the
+  other integrations). The reconciler hits
+  `GET /api/v2/tailnet/{tn}/devices?fields=all` and mirrors each
+  device's `addresses[]` (both IPv4 in `100.64.0.0/10` and IPv6
+  ULA in `fd7a:115c:a1e0::/48`) as IPAddress rows under the
+  bound IPAM space. The CGNAT + IPv6-ULA blocks are
+  auto-created on first sync — operator can override the CGNAT
+  CIDR per tenant for non-default tailnets. Per-row shape:
+  - `status="tailscale-node"`, hostname = device FQDN
+    (`<host>.<tailnet>.ts.net`), MAC null (no L2 on the overlay).
+  - `description` = `<os> <clientVersion> — <user>`.
+  - `custom_fields` = `{os, client_version, user, tags,
+    authorized, last_seen, expires, key_expiry_disabled,
+    update_available, advertised_routes, enabled_routes,
+    node_id}`.
+  - Tailnet domain is auto-derived from the first device's FQDN
+    (no separate config field; mirrors the uhld pattern).
+  Read-only-ish: integration-owned status + the
+  `user_modified_at` lock keep operator edits sticky across
+  reconciles (same pattern as Proxmox / Docker / Kubernetes).
+  Provenance via `tailscale_tenant_id` FK on
+  `ip_address`/`ip_block`/`subnet` with `ON DELETE CASCADE`.
+  Subnet-router routes (`enabledRoutes`) are stored in
+  custom_fields today; promoting them to first-class IPBlock
+  rows is a follow-up. Test Connection probe + Sync Now button
+  in the admin page mirror the other integrations.
+
+
+- ✅ **Tailscale — Phase 2: synthetic tailnet DNS surface.**
+  Implemented as Option 2 from the original plan (synthetic
+  `DNSZone` materialised by the reconciler). When a
+  `TailscaleTenant` has `dns_group_id` bound, every reconcile
+  pass derives `<tailnet>.ts.net` from the first device FQDN,
+  upserts a `DNSZone` with `is_auto_generated=True` and
+  `tailscale_tenant_id=<tenant>`, and materialises one A / AAAA
+  `DNSRecord` per device address. Records also carry
+  `auto_generated=True` + the tenant FK. **Read-only enforcement**:
+  `update_zone` / `delete_zone` / record CRUD reject writes
+  with 422 when `tailscale_tenant_id IS NOT NULL`; UI renders a
+  "Tailscale (read-only)" badge near the zone title and disables
+  the Edit / Delete / Add Record buttons; the per-record lock
+  badge in the records table branches on `tailscale_tenant_id`
+  to read "Tailscale" instead of "IPAM" for synthesised rows.
+  **Diff semantics**: keyed on `(name, record_type, value)` —
+  removed devices have their records deleted on the next sync;
+  idempotent on stable input. **Conflict safety**: a pre-
+  existing operator-managed zone with the same name is left
+  untouched, with a `summary.warnings` entry that surfaces in
+  the audit log. **Filtering**: expired-key devices skipped per
+  Phase 1's `skip_expired` toggle; devices with no FQDN or
+  foreign tailnet suffix are skipped without error. **Bonus**:
+  because we land actual `DNSRecord` rows, the existing BIND9
+  render path picks them up automatically — non-Tailscale LAN
+  clients can resolve `<host>.<tailnet>.ts.net` through
+  SpatiumDDI's managed BIND9 with no forwarder plumbing. TTL
+  is 300 s (short by design — IP assignments shift after re-auth).
+  Migration `e6f12b9a3c84_tailscale_phase2_dns`.
+
+  **Deferred follow-ups:**
+  - **Per-tenant zone-name override.** Today we use the auto-
+    derived `<tailnet>.ts.net`. Some operators run Tailscale
+    with a custom split-DNS arrangement and want the synthetic
+    zone published under a different name (e.g.
+    `tailnet.internal`). Adding a `synthetic_zone_name` column
+    on `TailscaleTenant` (defaulting to null = derive) would
+    cover that without much code.
+  - **Subnet-router routes (`enabled_routes`) → first-class
+    `IPBlock` rows.** Phase 1 stores them in `custom_fields`;
+    promoting them to real IPBlocks (one per route, FK to
+    tenant) would let the IPAM tree show "this CIDR is reachable
+    via tailnet device X." Worthwhile if operators start
+    advertising LAN subnets through Tailscale.
+  - **BIND9 forwarder zone for `100.100.100.100`.** Optional
+    alternative for operators who don't want SpatiumDDI's BIND9
+    serving the records itself but DO want to forward `*.ts.net`
+    queries through MagicDNS (which only listens on the local
+    Tailscale daemon — works only if the BIND9 host is itself
+    on Tailscale).
+
+
+## Future ideas — categorised
+
+### Discovery & network awareness
+
+- ✅ **LLDP neighbour collection** — vendor-neutral via
+  LLDP-MIB (IEEE 802.1AB) `lldpRemTable`. Per-device opt-in
+  `poll_lldp` toggle (default on); polled as a 5th step after
+  ARP / FDB in `app.tasks.snmp_poll.poll_device`.
+  `network_neighbour` table keyed
+  `(device_id, interface_id, remote_chassis_id, remote_port_id)`
+  with absence-delete every poll so stale neighbours fall off
+  cleanly. Captures remote chassis ID + port ID (with subtype
+  decoding — MAC addresses formatted, interface names left
+  raw), system name + description, port description, and a
+  decoded capabilities bitmask (Bridge / Router / WLAN AP /
+  Phone / Repeater / Other / Station / DocsisCableDevice).
+  API: `GET /api/v1/network-devices/{id}/neighbours` with
+  `sys_name` (ilike) / `chassis_id` / `interface_id` filters.
+  Frontend: new "Neighbours" tab on the network device detail
+  view, with vendor-aware enable hints (Cisco IOS / NX-OS,
+  Junos, Arista EOS, ProCurve / Aruba, MikroTik RouterOS,
+  OPNsense / pfSense) when no rows are present. Migration
+  `b9e4d2a17c83_network_neighbour`. **Deferred:** CDP polling
+  (Cisco-only — LLDP usually runs alongside on modern gear);
+  topology graph rendering (the data is captured, the graph UI
+  isn't built yet); IP cross-reference via
+  `lldpRemManAddrTable`; per-port enrichment via
+  `lldpLocPortIfIndex` to resolve LLDP's own port numbering to
+  ifIndex (today the local port is recorded by SNMP-side
+  ifIndex via the FDB / interface walk, not LLDP's local
+  port-num index).
+
+- ✅ **Switch-port mapping in the IP table (column-level).** The
+  IPAM IP table now carries a "Network" column showing
+  `<device> · <port> [VLAN N]` for the most-recent FDB hit on
+  each IP's MAC, with a `+N more` badge + hover tooltip listing
+  every (device, port, VLAN) tuple when the MAC is learned in
+  multiple places (hypervisor host + VMs across access VLANs,
+  trunk ports). Backed by a batched
+  `GET /api/v1/ipam/subnets/{id}/network-context` endpoint that
+  returns `{ip_address_id: NetworkContextEntry[]}` in one round
+  trip — no N+1 fan-out per page-of-IPs. The per-IP detail
+  modal's "Network" tab still works as the deep-dive surface.
+  **Deferred follow-ups:**
+  - Reverse "click MAC → all IPs on this port" drilldown
+    starting from an interface row in the network detail page.
+    Useful when an operator's looking at a switch port and
+    wants to see "what's plugged in here?".
+  - Per-user column show/hide (lives under the broader Saved
+    Views work in UX polish below).
+  - Filter input on the Network column (the column header has
+    no filter today; operators can still filter via the device
+    detail page's ARP/FDB tabs).
+
+### Subnet planning & calculation tools
+
+- ✅ **Built-in CIDR calculator** — utility page at `/tools/cidr`
+  with sidebar nav under Tools. Pure client-side, no API. Accepts
+  IPv4 or IPv6 (CIDR or bare address), renders network / netmask /
+  wildcard / broadcast / first-last usable / total addresses /
+  decimal + hex / binary breakdown (v4) and compressed +
+  expanded forms (v6). Quick-paste preset buttons for the common
+  RFC 1918 / CGNAT / ULA blocks. BigInt math throughout so v6
+  prefixes work cleanly.
+
+- ✅ **Subnet planner / "what-if" workspace** — `/ipam/plans`.
+  Operator designs a multi-level CIDR hierarchy as a draggable
+  tree (one root + nested children, arbitrary depth), saves it
+  as a `SubnetPlan` row, validates against current state, then
+  one-click applies — every block + subnet created in a single
+  transaction. **Data model:** `subnet_plan(id, name,
+  description, space_id, tree JSONB, applied_at,
+  applied_resource_ids JSONB, created_by_user_id)`. Tree node
+  shape: `{id, network, name, description, kind, existing_block_id?,
+  dns_group_id?, dns_zone_id?, dhcp_server_group_id?,
+  vlan_ref_id?, gateway?, children[]}`. **`kind` is explicit**
+  per node (`block` or `subnet`) — root must be a block
+  (subnets need a block parent), and a subnet may not have
+  children (validation enforces both). **Resource bindings**
+  (DNS group, DHCP group, gateway) are optional per-node;
+  `null` = inherit, explicit value sets the field on the
+  materialised row and flips the corresponding
+  `*_inherit_settings=False`. UI exposes DNS group + DHCP
+  group dropdowns + gateway field on subnets; VLAN + DNS-zone
+  fields exist in the model but UI binding is deferred (VLAN
+  is router-scoped — needs a flat list endpoint first). **Root
+  modes:** new top-level CIDR (creates a fresh block at the
+  space root) OR anchor to an existing `IPBlock` (descendants
+  land as children of the existing block, root not re-created).
+  **Validation** (`/plans/{id}/validate` + `/plans/validate-tree`
+  for in-flight trees) checks duplicate node ids, kind rules,
+  parent-containment of every child, sibling-overlap, and
+  overlap against current IPAM state in the bound space.
+  Auto-fires every 300 ms as the operator edits — conflicts
+  surface inline as red ring on offending nodes + a banner
+  above the tree. **Apply** opens a confirmation modal with
+  block + subnet counts ("this will create N blocks + M
+  subnets"), then re-validates inside the txn; any conflict
+  → 409 with the full conflict list and nothing is written.
+  Once applied, the plan flips read-only and
+  `applied_resource_ids` records every created block + subnet
+  for audit. **Reopen** (`/plans/{id}/reopen`) flips an
+  applied plan back to draft state, but only if every
+  materialised resource has been deleted from IPAM —
+  otherwise 409 with the survivor list. Lets operators
+  iterate on the same plan after a teardown rather than start
+  fresh. **Frontend:** `@dnd-kit/core` (already a dep) for
+  drag-to-reparent; drops onto descendants OR onto subnet
+  targets are refused. Properties panel on the right edits
+  CIDR / name / kind / DNS / DHCP / gateway for the selected
+  node. Sidebar entry "Subnet Planner" alongside NAT
+  Mappings. Migration `c8e1f04a932d_subnet_plan`.
+  **Deferred:** sibling reordering via `@dnd-kit/sortable`
+  (today reparenting only appends as last child); split-into-N
+  action on a node; VLAN dropdown in the planner UI (model
+  field exists; needs a flat VLAN list endpoint first); DNS
+  zone selector that's gated on the chosen DNS group; per-node
+  custom-fields / tags / status (those are per-IP and edited
+  through normal IPAM use after apply).
+
+- ✅ **Address planner** — `POST /api/v1/ipam/blocks/{id}/plan-
+  allocation` accepts a list of `{count, prefix_len}` requests
+  (e.g. `4 × /24, 2 × /26, 1 × /22`) and packs them into the
+  block's free space using largest-prefix-first ordering with
+  first-fit-by-address placement (so sequential same-size
+  requests pack contiguously from low addresses rather than
+  chasing small isolated free islands).
+  Returns the planned allocations + any unfulfilled rows + the
+  remaining free space after the plan. Reuses the same
+  `address_exclude` walk that powers `/free-space`. UI: "Plan
+  allocation…" button next to the Allocation map on the block
+  detail; modal lets the operator add/remove rows and shows the
+  packed result. Preview only — no writes — so the operator can
+  iterate freely. **Deferred:** one-click apply that chains the
+  preview into N `POST /subnets` calls inside a transaction.
+
+- ✅ **Aggregation suggestion** — `GET /api/v1/ipam/blocks/{id}/
+  aggregation-suggestions` runs `ipaddress.collapse_addresses` on
+  the block's direct-child subnets; any output that subsumes more
+  than one input is a clean merge opportunity (the inputs pack
+  perfectly into a supernet with no gaps). Read-only banner on the
+  block detail surfaces them when present (e.g. `10.0.0.0/24 +
+  10.0.1.0/24 → /23`). **Deferred:** one-click merge flow — needs
+  to handle the cascade across IP rows + DNS records owned by the
+  deleted siblings, plus operator confirmation. Today operators
+  see the suggestion and act manually (delete + recreate).
+
+- ✅ **Free-space treemap** — Recharts squarified Treemap on the
+  block detail, toggled via a Band / Treemap selector next to
+  the Allocation map header (selection persisted in
+  sessionStorage per block). Cells are coloured by kind (violet
+  child blocks, blue subnets, hashed-zinc free) and sized by
+  raw address count. Pixel-thin slices on the 1-D band become
+  visible squares here, surfacing fragmentation that's easy to
+  miss otherwise. Uses the existing `recharts` dep — no new
+  packages added.
+
+
+### DNS-specific
+
+- ✅ **TSIG key management UI** — `DNSTSIGKey` model with
+  Fernet-encrypted `secret_encrypted`, `algorithm` enum
+  (hmac-sha1/224/256/384/512), `name`, `purpose`, `notes`, and
+  `last_rotated_at`. CRUD lives at
+  `/api/v1/dns/groups/{gid}/tsig-keys` with a side `/generate-secret`
+  helper that returns a fresh random base64 secret of the right
+  size for the chosen algorithm, and a `/{kid}/rotate` endpoint
+  that re-randomises the secret. Plaintext is returned **once** on
+  the create / rotate response — list / get never expose it.
+  Operator-managed rows distribute to every BIND9 agent in the
+  group via the existing `tsig_keys` block in the ConfigBundle
+  (alongside the legacy auto-generated agent loopback key);
+  named.conf renders one `key { algorithm …; secret …; };`
+  stanza per row. UI: new "TSIG Keys" tab on the DNS server
+  group view, with create / edit / rotate / delete plus a
+  one-shot "Copy this secret now" modal after each
+  create / rotate. Operators reference keys from a zone's
+  allow-update / allow-transfer fields as `key keyname.;`.
+  Migration `7c299e8a5490_dns_tsig_keys`.
+  **Deferred:** zone-level dropdown picker that suggests
+  available keys (today operators paste the key reference into
+  the existing free-text allow-update / allow-transfer fields);
+  per-key audit-log of which zones reference it.
+
+- ✅ **Conditional forwarders** — per-zone forwarding for mixed-AD
+  environments. `DNSZone` carries `forwarders` (JSONB list of IPs)
+  + `forward_only` (true → `forward only;`, false → `forward
+  first;`). When `zone_type = "forward"` the BIND9 driver renders
+  `zone "X" { type forward; forward only; forwarders { ... }; }`
+  in `zone.stanza.j2` and the agent's wire-format renderer
+  (no zone file written, no allow-update); the form gates the
+  forwarders/policy fields on `zone_type === "forward"` and
+  refuses submit when no upstreams are listed. Migration
+  `a07f6c12e5d3_dns_zone_forwarders`. **Deferred:** Windows DNS
+  via `Add-DnsServerConditionalForwarderZone` (the field
+  shape is identical; just needs the WinRM dispatch).
+
+- ✅ **BIND9 catalog zones (RFC 9432)** — opt-in per group via
+  `DNSServerGroup.catalog_zones_enabled` + `catalog_zone_name`
+  (defaults to `catalog.spatium.invalid.`). The producer is the
+  group's `is_primary=True` bind9 server; every other bind9
+  member joins as a consumer. Bundle assembly emits a `catalog`
+  block per server: `mode=producer` ships the member zone list,
+  `mode=consumer` ships the producer's IP. The agent renders
+  the catalog zone file per RFC 9432 §4.1 — SOA + NS at apex,
+  `version IN TXT "2"`, and one `<sha1-of-wire-name>.zones IN
+  PTR <member>` per primary zone — and on consumers injects a
+  single `catalog-zones { zone "<catalog>." default-masters {
+  <producer-ip>; } in-memory yes; };` directive into the
+  options block. The catalog block is part of the structural
+  ETag so membership changes trigger a daemon reload, and SHA-1
+  hashing uses the proper wire format (length-prefixed labels +
+  null terminator) so consumer BINDs find the same labels.
+  Frontend toggle lives in the server-group create / edit
+  modal alongside the recursion checkbox. Migration
+  `d8e4a73f12c5_dns_catalog_zones`. **Deferred:** version-skew
+  guard (refuse the toggle on groups with a server <9.18);
+  visualising consumer pull state (today operators rely on
+  the existing per-server zone-serial drift pill);
+  per-member properties (epoch, change-of-ownership) — most
+  homelab / SMB groups won't need them.
+
+- ✅ **Response Policy Zones (RPZ)** — DNS-level malware / phishing
+  / ad blocking via BIND9 `response-policy { zone … };`. Full
+  `DNSBlockList` + `DNSBlockListEntry` + `DNSBlockListException`
+  model with categories / source types (manual / url /
+  file_upload) / block modes (nxdomain / sinkhole / refused) /
+  per-list scheduled refresh. Service-side aggregation produces
+  effective entries per server-group or view; agent renders one
+  RPZ master zone per blocklist with CNAME-based actions
+  (`. = NXDOMAIN`, `rpz-drop. = sinkhole`, target = redirect,
+  `rpz-passthru. = exception). CRUD lives at
+  `app/api/v1/dns/blocklist_router.py`. BIND9-only — Windows
+  DNS has no RPZ equivalent (closest is Query Resolution
+  Policies which lack the wire format).
+
+- ✅ **Curated RPZ blocklist source catalog** — ships a static
+  JSON catalog at `backend/app/data/dns_blocklist_catalog.json`
+  with 14 well-known public blocklists drawn from AdGuard's
+  HostlistsRegistry + Pi-hole defaults + Hagezi / OISD: AdGuard
+  DNS Filter, StevenBlack Unified, OISD Small/Big, Hagezi Pro
+  / Pro+, 1Hosts Lite, Phishing Army Extended, URLhaus,
+  DigitalSide Threat-Intel, EasyPrivacy, plus StevenBlack
+  fakenews / gambling / adult add-ons. Each entry carries
+  `{id, name, description, category, feed_url, feed_format,
+  license, homepage, recommended}`. `GET /dns/blocklists/catalog`
+  returns the snapshot (cached in-process). `POST
+  /dns/blocklists/from-catalog` creates a normal `DNSBlockList`
+  row with `source_type="url"` prefilled — leverages the
+  existing `parse_feed` + `_refresh_blocklist_feed_async` task
+  for fetch / parse / ingest with no new beat task. Frontend
+  has a "Browse Catalog" button on the Blocklists tab opening a
+  filterable picker (category + free-text), with already-
+  subscribed entries flagged. Catalog snapshot moves in
+  lockstep with releases; operators can still add custom
+  sources via the existing "New Blocking List" flow.
+  **Deferred:** "Refresh catalog from upstream" button that
+  re-fetches `filters.json` from HostlistsRegistry between
+  releases.
+
+- ✅ **DNS query analytics aggregation** — `POST
+  /api/v1/logs/dns-queries/analytics` returns top-10 qnames +
+  top-10 clients + complete qtype distribution in a single
+  round trip. Computed on-demand via `GROUP BY` against the
+  existing `dns_query_log_entry` rows (24 h retention) — no
+  new schema, no new beat task. The Logs → DNS Queries tab
+  renders an Analytics strip above the raw event grid: three
+  cards each showing key + count + percentage of total, with
+  every row clickable to seed the corresponding filter
+  (qname / client_ip / qtype). The strip refetches only when
+  `(server_id, since)` changes, so per-keystroke filter edits
+  on the events grid don't pay for a re-aggregation.
+  Deliberately mirrors the query log's retention window —
+  longer history belongs in Loki, not Postgres. **Deferred:**
+  rcode breakdown (BIND9's `query` log channel doesn't emit
+  rcode; would need a parallel `client error` channel + parser);
+  pre-aggregated `dns_query_aggregate` table with longer
+  retention (only worth it if the on-demand `GROUP BY` becomes
+  slow, which it won't for typical 24h windows).
+
+- ✅ **Zone delegation wizard** — `services/dns/delegation.py` finds
+  the longest-suffix-matching parent zone in the same group
+  (forward zones excluded), reads the child's apex NS records,
+  and computes the NS records the parent needs to delegate the
+  child plus glue (A / AAAA) for any in-bailiwick NS hostnames.
+  Diffs against existing parent records so a second run is a
+  no-op, surfaces warnings ("ns1 is in-bailiwick but has no
+  A/AAAA in child"), and applies through the normal
+  `enqueue_record_op` pipeline so the parent zone's serial bumps
+  once and the agent / Windows-driver push fires uniformly.
+  Endpoints: `GET /dns/groups/{gid}/zones/{zid}/delegation-preview`
+  + `POST /dns/groups/{gid}/zones/{zid}/delegate-from-parent`.
+  Frontend: a contextual "Delegate" button appears in the zone
+  header only when an eligible parent has missing records;
+  `DelegationModal` shows the exact records that would land in
+  the parent before commit, with skipped/already-present rows
+  in a separate section.
+
+- ✅ **DNS template wizards** — static catalog at
+  `backend/app/data/dns_zone_templates.json` with four starter
+  shapes (Email zone with MX + SPF + DMARC + optional DKIM
+  selector, Active Directory zone with the standard LDAP /
+  Kerberos / GC SRV records + optional `_sites` entries, Web
+  zone with apex A + optional AAAA + `www CNAME`, Kubernetes
+  external-dns target — empty zone). `services/dns/zone_templates.py`
+  loads the catalog once per process, validates required
+  parameters, and substitutes `{{key}}` placeholders (plus a
+  built-in `{{__zone__}}`) at materialise time; records can
+  declare `skip_if_empty: ["param"]` so optional fields drop
+  out cleanly. Endpoints: `GET /dns/zone-templates` +
+  `POST /dns/groups/{gid}/zones/from-template`. Frontend
+  `ZoneTemplateModal` with a left-column category-grouped
+  template list and a right-column parameter form; submitting
+  creates the zone + every materialised record in one
+  transaction and navigates straight into the zone detail.
+  Mounted as a "From Template" button on the ZonesTab header,
+  alongside "Add Zone".
+
+- ✅ **Multi-resolver propagation check** — `POST
+  /dns/tools/propagation-check` fires the same query against
+  Cloudflare / Google / Quad9 / OpenDNS in parallel using
+  `dnspython`'s `AsyncResolver` (each query carries its own
+  timeout so a slow resolver can't poison the others) and
+  returns per-resolver `{resolver, status, rtt_ms, answers,
+  error}`. UI surfaces as a Radar button on each record row in
+  the records table; modal lets the operator switch record
+  type and re-check. Driver-agnostic — queries are made from
+  the API process, doesn't touch the BIND9 / Windows drivers.
+  **Deferred:** operator-customisable resolver list (today the
+  curated set is hard-coded server-side; the API accepts an
+  override but the UI doesn't yet expose it).
+
+- ✅ **DNS pool with health monitoring (GSLB-lite)** — named
+  pool of A / AAAA targets where one DNS name (e.g.
+  `www.example.com`) returns one record per healthy + enabled
+  member. Health checks (`tcp | http | https | icmp | none`)
+  run on a per-pool interval, members flip in/out of the
+  rendered record set as state changes; operator can also
+  manually enable/disable members like a load-balancer pool.
+  Driver-agnostic: pool members render as **regular A/AAAA
+  records** in the bound zone (one per healthy + enabled
+  member) via the normal `enqueue_record_op` pipeline, so
+  BIND9 and Windows DNS render unchanged.
+
+  **Data model** (migration `f5b1a8c3d927_dns_pool_healthcheck`):
+  - `dns_pool(id, group_id, zone_id, name, description,
+    record_name, record_type, ttl, enabled, hc_type,
+    hc_target_port, hc_path, hc_method, hc_verify_tls,
+    hc_expected_status_codes JSONB, hc_interval_seconds,
+    hc_timeout_seconds, hc_unhealthy_threshold,
+    hc_healthy_threshold, next_check_at, last_checked_at,
+    created_at, modified_at)`. Unique on
+    `(zone_id, record_name)`.
+  - `dns_pool_member(id, pool_id, address, weight, enabled,
+    last_check_state, last_check_at, last_check_error,
+    consecutive_failures, consecutive_successes,
+    created_at, modified_at)`. Operator-set `enabled=False`
+    keeps the member out of the rendered set regardless of
+    health.
+  - `dns_record` gains a nullable `pool_member_id` FK with
+    `ON DELETE CASCADE`. When set, the records-tab UI
+    renders a violet "Pool" lock badge with a click-through
+    to the Pools tab and disables the row's edit/delete
+    buttons; record CRUD endpoints reject writes with 422.
+
+  **Pipeline:**
+  - `app.tasks.dns_pool_healthcheck.dispatch_due_pools` is
+    a Celery beat tick (30 s) that queues
+    `run_pool_check(pool_id)` for every pool whose
+    `next_check_at <= now`. Per-pool task uses
+    `SELECT FOR UPDATE SKIP LOCKED` so concurrent
+    dispatches can't double-poll. Mirrors the
+    `app.tasks.snmp_poll` shape.
+  - `services/dns/pool_healthcheck.run_check` fires per
+    member with the chosen check type. TCP =
+    `asyncio.open_connection`, HTTP/HTTPS = `httpx`,
+    ICMP = `asyncio.create_subprocess_exec` calling
+    `/bin/ping` (Debian's `iputils-ping` ships
+    `cap_net_raw+ep` so the non-root app user can fire ICMP
+    without `CAP_NET_RAW` on the container — the API
+    Dockerfile installs the package explicitly).
+    `hc_type=none` always reports healthy (operator opted
+    out of health checks but still wants the record-set
+    semantics).
+  - State transitions only after
+    `consecutive_failures >= unhealthy_threshold` (or
+    successes for recovery), so a single flapping check
+    doesn't churn DNS records.
+  - On state change, `services/dns/pool_apply.apply_pool_state`
+    diffs current pool DNSRecords against desired (healthy
+    + enabled members) and emits create / delete via
+    `enqueue_record_op` — pool records ride the normal
+    record pipeline (audit log, ETag bump, agent push).
+  - Pool ops carry `rrset_action` on the record payload
+    (`"add"` for create, `"delete_value"` for delete). The
+    bind9 driver branches on this so multiple members share
+    a single (name, rtype) RRset cleanly. Without it, the
+    driver's default `dns.update.replace()` semantics would
+    delete every existing RR at the name+type before adding
+    the new one, silently clobbering siblings — for an N-
+    member pool, only the most-recently-applied member
+    would survive in BIND9's running zone.
+  - Rename / type-change branch in `apply_pool_state`:
+    when `record_name` or `record_type` shifts on an
+    existing pool, emit a `delete_value` op for the old
+    (name, type, value) and an `add` op for the new one
+    on the same target_serial. Operator-edit of those
+    fields actually moves the live records instead of
+    leaving stale entries under the old labels.
+
+  **HTTPS TLS validation toggle** — `hc_verify_tls` controls
+  whether httpx verifies the server cert. Default off because
+  internal pool members commonly ship self-signed certs; on
+  for public-facing targets where a bad cert should itself be
+  a signal (self-signed / expired / hostname mismatch all
+  fail the check fast).
+
+  **Operator UX:**
+  - **Top-level "DNS Pools" sidebar item** under DNS — lands
+    on `/dns/pools` showing every pool across every zone with
+    pool name (clickable to navigate to its zone), FQDN,
+    group, type, check config, health summary, TTL, last
+    check. Create flow asks for group → zone first
+    (`PickGroupZoneModal`) before launching the pool form.
+  - **Per-zone "Pools" tab** on the zone detail page mirrors
+    the Records tab — same `PoolModal` reused for create /
+    edit. Pool members render with status dot (`healthy`
+    green, `unhealthy` red, `unknown` gray pre-first-check,
+    `disabled` zinc when operator-toggled), manual enable
+    toggle, and live last-check error.
+  - Records tab on the zone detail surfaces pool-managed
+    rows with a violet "Pool" lock badge and an Info button
+    that switches to the Pools tab.
+
+  **Tradeoff (operator-facing warning in the UI):** TTL
+  races. DNS is cached client-side; a member dropping out
+  doesn't take effect until TTL expires, so this is **not**
+  the same as a real L4/L7 load balancer — clients can
+  still hit a dead box for up to `ttl` seconds. UI defaults
+  TTL to 30 s with an inline note pointing operators at the
+  LB-mapping roadmap item for real load balancing.
+
+  **Permission gate** `manage_dns_pools` seeded into the
+  existing "DNS Editor" role.
+
+  **Deferred follow-ups:**
+  - **Phase 2: delegate checks to a chosen DNS agent** so
+    the probe originates from the same network vantage as
+    the DNS server. Matters for split-horizon setups + when
+    targets are on a private network the API process can't
+    reach. Today checks fire from the API/worker container.
+  - **Weighted record sets.** `dns_pool_member.weight` exists
+    but isn't honoured on render — every healthy member gets
+    one record. BIND9 supports per-record weight via the
+    `dnsrps` plugin and Route 53 has weighted routing
+    natively; would need driver-specific render paths.
+  - **Geo / latency routing** — picking which subset of
+    healthy members to return based on client IP or RTT.
+    Real GSLB territory; would need view-aware record
+    rendering plus a geo-IP database. Phase 5+.
+  - **Per-pool / per-member metrics in dashboard** — the
+    health-check engine has all the data; pairs with the
+    existing dashboard timeseries work.
+  - **Pre-aggregated health-event log** — today operator
+    triage of "why did this member flap?" goes through the
+    normal audit log entries from `enqueue_record_op`. A
+    dedicated `dns_pool_event` table would let the UI render
+    a per-member uptime timeline.
+
+
+- ✅ **DNS server detail modal** — clickable server rows in
+  the DNS group's Servers tab open a tabbed read-only
+  inspector (`frontend/src/pages/dns/ServerDetailModal.tsx`).
+  Surfaces everything we know about a server without
+  requiring the operator to SSH in. Tabs (last three are
+  bind9-only):
+  - **Overview** — name, host:port, driver, role
+    (primary / secondary), agent version, last heartbeat,
+    JWT expiry, structural ETag (current vs. last-acked =
+    drift indicator), health status dot. Includes a live
+    `rndc status` panel showing daemon uptime + zone count
+    + the same fields operators normally `ssh + rndc` for.
+  - **Zones** — table of zones served by this server with
+    per-zone serial + drift state pulled from
+    `DNSServerZoneState`. Click-through to zone detail.
+  - **Sync** — pending / in-flight / failed `DNSRecordOp`
+    rows for this server. Lets operators triage stuck
+    record pushes without trawling the audit log.
+  - **Events** — last N audit-log rows scoped to this
+    server (`resource_id` match).
+  - **Logs** — filterable parsed BIND9 query log
+    (`dns_query_log_entry`, 24 h retention) scoped to this
+    server. qname / qtype / client IP filters + auto-refresh
+    every 30 s. Reuses the existing `/logs/dns-queries`
+    endpoint with `server_id` filter — no new schema.
+  - **Stats** — query-rate Recharts time-series
+    (queries_total / NOERROR / NXDOMAIN / SERVFAIL, per-
+    second rate) over selectable 1h / 6h / 24h / 7d windows
+    plus three rollup cards: top qnames, top clients, qtype
+    distribution. Sources: `metricsApi.dnsTimeseries` (the
+    same `dns_metric_sample` table the dashboard MVP uses)
+    + `/logs/dns-queries/analytics`.
+  - **Config** — file picker (named.conf + every rendered
+    zone file) with monospace viewer + copy-to-clipboard.
+    Driven by a new agent push pipeline (see below).
+
+  **Backing endpoints**: `GET /api/v1/dns/servers/{sid}/{zone-state,pending-ops,recent-events,rendered-config,rndc-status}`.
+  The first three are thin server-scoped projections of
+  existing data; the last two read the new
+  `dns_server_runtime_state` table populated by agent
+  pushes (one row per server, idempotent overwrite).
+
+  **Agent push pipeline** for Config + rndc:
+  - `POST /api/v1/dns/agents/admin/rendered-config`: agent
+    walks `state_dir/rendered/`, ships every text file's
+    relative path + content (size-capped at 5k files,
+    256 KB/file, 8 MB total). Fires after every successful
+    structural reload + once on bootstrap-from-cache so the
+    snapshot lands the moment the agent comes up.
+  - `POST /api/v1/dns/agents/admin/rndc-status`: a new
+    `RndcStatusPoller` thread shells out to
+    `rndc -c <state_dir>/rndc.conf status` every 60 s ±3 s
+    jitter and POSTs the stdout. Migration
+    `c3e9a2b71f48_dns_server_runtime_state`.
+
+  **Agent rndc credentials** are agent-owned (not the
+  alpine package's `/etc/bind/rndc.key`, which lives in a
+  dir `spatium` can't traverse). The container entrypoint
+  generates a fresh keypair via `rndc-confgen` at
+  `/var/lib/spatium-dns-agent/rndc.{key,conf}` on first
+  boot, and the bind9 driver renders an explicit
+  `controls { … keys { "spatium-rndc"; }; };` block in
+  named.conf referencing the same key — both ends agree by
+  construction, so `rndc reconfig` + the rndc-status push
+  authenticate cleanly. Without this, BIND9's auto-
+  generated controls channel uses an in-memory key that
+  doesn't match the on-disk file (causing "bad auth"
+  failures even when the file contents are byte-identical).
+
+  Implementation deliberately landed as a modal (not a
+  per-server page) because the seven tabs all fit
+  comfortably and operators stay in the group context for
+  comparing sibling servers side-by-side.
+
+  **Deferred follow-ups:**
+  - **Windows DNS Stats** — `Get-DnsServerStatistics` via
+    WinRM driver method. Today the Stats tab is bind9-only;
+    Windows servers don't get a Stats button.
+  - **`/api/v1/dns/agents/admin/stats` push from BIND9
+    statistics-channels** — could surface richer per-zone
+    or per-qtype counters than the dashboard MVP carries,
+    but the existing `dns_query_log_entry` analytics path
+    already covers operator triage so this is a future-
+    polish item, not a blocker.
+
+
+### DHCP-specific
+
+- ✅ **DHCP option library / templates** — `DHCPOptionTemplate`
+  row, group-scoped, holds a named bundle of option-code → value
+  pairs (e.g. "VoIP phones", "PXE BIOS clients"). CRUD at
+  `/api/v1/dhcp/server-groups/{gid}/option-templates` +
+  `/api/v1/dhcp/option-templates/{id}` plus a server-side
+  `POST /scopes/{id}/apply-option-template` for programmatic
+  apply (mode=`merge` template-wins, mode=`replace` drop-existing).
+  UI: new "Option Templates" tab on the DHCP server-group view
+  (mirrors the Client Classes / MAC Blocks tabs) with the
+  shared `DHCPOptionsEditor` for authoring, plus an
+  "Apply template…" picker above the options editor on the
+  scope create / edit modal that does a client-side merge into
+  the editor's local state (operator still hits Save to
+  persist; conflict-key list surfaces inline). Apply is a
+  stamp, not a binding — later template edits do not
+  propagate back to scopes that already used it. Permission
+  gate `dhcp_option_template`, seeded into the existing "DHCP
+  Editor" role. Migration `e7f218ac4d9b_dhcp_option_templates`.
+  **Deferred:** pool / static template-apply (scope only first),
+  auto-apply default template on scope create, drift report
+  showing which scopes diverged from a template after apply.
+
+- ✅ **Option-code library lookup** — static catalog at
+  `backend/app/data/dhcp_option_codes.json` covering 95 RFC
+  2132 + IANA `bootp-dhcp-parameters` v4 entries operators
+  actually configure (each entry: `code`, `name`, `kind`,
+  `description`, `rfc`). Loaded once per process via
+  `services/dhcp/option_codes.py` (lru_cache); `search()`
+  helper does case-insensitive name/description matching with
+  numeric-prefix code lookup. `GET /api/v1/dhcp/option-codes`
+  returns the catalog (with optional `q=` substring filter
+  + `limit`). Frontend wires it into `DHCPOptionsEditor`'s
+  custom-options row: the bare numeric code input becomes a
+  combobox that searches by code or name, surfaces the
+  description as a hint under the row, and auto-fills `name`
+  on pick. Catalog is fetched once per session
+  (`staleTime: Infinity`) and filtered client-side, so
+  per-keystroke search has no server round-trip.
+  **Deferred:** v6 option-code catalog (separate namespace —
+  ships once v6 UI lands).
+

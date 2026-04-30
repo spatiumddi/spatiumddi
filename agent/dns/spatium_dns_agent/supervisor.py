@@ -13,6 +13,7 @@ import time
 
 import structlog
 
+from .admin_pusher import RndcStatusPoller
 from .bootstrap import ensure_token
 from .config import AgentConfig
 from .drivers.base import DriverBase
@@ -41,6 +42,7 @@ def run(cfg: AgentConfig) -> int:
     syncer = SyncLoop(cfg, token_ref, driver, heartbeat)
     metrics = MetricsPoller(cfg, token_ref)
     query_log = QueryLogShipper(cfg, token_ref)
+    rndc_status = RndcStatusPoller(cfg, token_ref)
 
     # Spawn daemon before threads so the first poll can reload it if needed
     driver.start_daemon()
@@ -50,6 +52,7 @@ def run(cfg: AgentConfig) -> int:
         threading.Thread(target=heartbeat.run, name="heartbeat", daemon=True),
         threading.Thread(target=metrics.run, name="metrics", daemon=True),
         threading.Thread(target=query_log.run, name="query-log", daemon=True),
+        threading.Thread(target=rndc_status.run, name="rndc-status", daemon=True),
     ]
     for t in threads:
         t.start()
@@ -63,6 +66,7 @@ def run(cfg: AgentConfig) -> int:
         syncer.stop()
         metrics.stop()
         query_log.stop()
+        rndc_status.stop()
 
     signal.signal(signal.SIGTERM, _sig)
     signal.signal(signal.SIGINT, _sig)
