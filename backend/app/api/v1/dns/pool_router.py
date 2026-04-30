@@ -508,8 +508,21 @@ async def add_member(
 
 
 class PoolMemberUpdate(BaseModel):
+    address: str | None = None
     weight: int | None = None
     enabled: bool | None = None
+
+    @field_validator("address")
+    @classmethod
+    def _addr(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        v = v.strip()
+        try:
+            ipaddress.ip_address(v)
+        except ValueError as exc:
+            raise ValueError(f"invalid IP address: {v}") from exc
+        return v
 
 
 @router.put("/pool-members/{member_id}", response_model=PoolMemberResponse)
@@ -520,10 +533,48 @@ async def update_member(
     if member is None:
         raise HTTPException(status_code=404, detail="Pool member not found")
 
-    enabled_changed = body.enabled is not None and body.enabled != member.enabled
     payload: dict[str, Any] = body.model_dump(exclude_none=True)
+    # Snapshot the fields the reconciler diffs on so we can decide
+    # below whether to re-render the rrset. Address edits in particular
+    # used to fall through silently — the DB row updated but BIND9 kept
+    # serving the old IP because nothing pushed a DDNS update.
+    member_changed = any(
+        k in payload and getattr(member, k) != payload[k] for k in ("address", "enabled", "weight")
+    )
+
+    # Uniqueness guard on address change. The DB has
+    # ``UniqueConstraint("pool_id", "address")``, so without this we'd
+    # blow up with an IntegrityError on commit; nicer to surface 409.
+    new_address = payload.get("address")
+    address_changed = new_address is not None and new_address != member.address
+    if address_changed:
+        clash = await db.execute(
+            select(DNSPoolMember).where(
+                DNSPoolMember.pool_id == member.pool_id,
+                DNSPoolMember.address == new_address,
+                DNSPoolMember.id != member.id,
+            )
+        )
+        if clash.scalar_one_or_none():
+            raise HTTPException(
+                status_code=409,
+                detail=f"Member with address {new_address!r} already exists in this pool",
+            )
+
     for k, v in payload.items():
         setattr(member, k, v)
+
+    # Reset health stats when the IP itself changed — the new endpoint
+    # has to earn its way back into the rrset rather than inheriting
+    # the old IP's "healthy" state. ``unknown`` is the default starting
+    # point already used by ``add_member``; the next health-check tick
+    # will update it.
+    if address_changed:
+        member.last_check_state = "unknown"
+        member.last_check_at = None
+        member.last_check_error = None
+        member.consecutive_successes = 0
+        member.consecutive_failures = 0
     db.add(
         AuditLog(
             user_id=user.id,
@@ -537,9 +588,11 @@ async def update_member(
         )
     )
 
-    # Toggling enabled flips the rendered record-set immediately —
-    # don't make the operator wait for the next health-check tick.
-    if enabled_changed:
+    # Reconcile on any rrset-affecting change (address or enabled);
+    # weight is advisory today but cheap to include if/when weighted
+    # rendering lands. Don't make the operator wait for the next
+    # health-check tick.
+    if member_changed:
         pool = await db.get(DNSPool, member.pool_id)
         if pool is not None:
             await apply_pool_state(db, pool)

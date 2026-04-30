@@ -403,8 +403,13 @@ export function PoolModal({
             await dnsApi.deletePoolMember(id);
           } else {
             const d = desired.get(id)!;
-            if (d.enabled !== m.enabled || d.weight !== m.weight) {
+            if (
+              d.address !== m.address ||
+              d.enabled !== m.enabled ||
+              d.weight !== m.weight
+            ) {
               await dnsApi.updatePoolMember(id, {
+                address: d.address,
                 enabled: d.enabled,
                 weight: d.weight,
               });
@@ -701,19 +706,13 @@ export function PoolModal({
                     recordType === "AAAA" ? "2001:db8::1" : "10.0.0.10"
                   }
                 />
-                <input
-                  type="number"
-                  min={1}
-                  max={1000}
-                  value={m.weight}
-                  onChange={(e) =>
-                    updateMember(idx, {
-                      weight: parseInt(e.target.value, 10) || 1,
-                    })
-                  }
-                  className={inputCls + " w-20"}
-                  title="Weight (advisory)"
-                />
+                {/* Weight is advisory today — the basic A/AAAA
+                    rrset rendering doesn't honour it. Hidden from
+                    the form until weighted-record-set support
+                    actually lands; the value is still shipped at
+                    its default ``1`` so the field is round-trip
+                    safe and re-surfacing the input later doesn't
+                    break existing rows. */}
                 <label className="flex items-center gap-1 text-xs">
                   <input
                     type="checkbox"

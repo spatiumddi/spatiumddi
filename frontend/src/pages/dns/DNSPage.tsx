@@ -1800,11 +1800,23 @@ function ZoneDetailView({
             <HeaderButton
               icon={RefreshCw}
               iconClassName={isFetching ? "animate-spin" : ""}
-              onClick={() =>
-                qc.invalidateQueries({ queryKey: ["dns-records", zone.id] })
-              }
+              onClick={() => {
+                // Refresh everything the zone view can show — records,
+                // pools, and per-server convergence — so the button
+                // works on whichever tab the operator is on. Each
+                // invalidation only re-fetches if the corresponding
+                // query is currently mounted, so this stays cheap.
+                qc.invalidateQueries({ queryKey: ["dns-records", zone.id] });
+                qc.invalidateQueries({
+                  queryKey: ["dns-pools", group.id, zone.id],
+                });
+                qc.invalidateQueries({ queryKey: ["dns-pools"] });
+                qc.invalidateQueries({
+                  queryKey: ["dns-zone-server-state", zone.id],
+                });
+              }}
               disabled={isFetching}
-              title="Reload the record list from SpatiumDDI (does not re-query the DNS server)"
+              title="Reload the data shown in this view (records, pools, sync state) from SpatiumDDI — does not re-query the DNS server"
             >
               Refresh
             </HeaderButton>

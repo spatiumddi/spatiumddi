@@ -2785,7 +2785,7 @@ export const dnsApi = {
       .then((r) => r.data),
   updatePoolMember: (
     memberId: string,
-    data: { weight?: number; enabled?: boolean },
+    data: { address?: string; weight?: number; enabled?: boolean },
   ) =>
     api
       .put<DNSPoolMember>(`/dns/pool-members/${memberId}`, data)

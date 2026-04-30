@@ -47,7 +47,9 @@ async def apply_pool_state(
         return {"created": 0, "deleted": 0, "skipped": 0}
 
     # Existing records for this pool — keyed by member id so we can
-    # diff against desired state below.
+    # diff against desired state below. No name/type filter on this
+    # query because the rename branch downstream needs to find the
+    # record under its OLD name to delete-then-recreate it.
     existing_res = await db.execute(
         select(DNSRecord).where(
             DNSRecord.zone_id == pool.zone_id,
@@ -58,9 +60,31 @@ async def apply_pool_state(
         str(r.pool_member_id): r for r in existing_res.scalars().all()
     }
 
+    # Orphan sweep — records whose ``pool_member_id`` belongs to a
+    # member of THIS pool that's no longer in ``pool.members`` (eg.
+    # the caller is ``delete_member`` which mutated the in-memory
+    # list before calling here). Without this, the FK
+    # ``ondelete=CASCADE`` on ``DNSRecord.pool_member_id`` strips the
+    # record row at SQL commit but no ``enqueue_record_op('delete')``
+    # ever fires, leaving BIND9 serving the stale answer until the
+    # zone re-renders for some other reason.
+    current_member_ids = {str(m.id) for m in pool.members}
+    orphan_res = await db.execute(
+        select(DNSRecord)
+        .join(DNSPoolMember, DNSRecord.pool_member_id == DNSPoolMember.id)
+        .where(DNSPoolMember.pool_id == pool.id)
+    )
+    orphan_records = [
+        r for r in orphan_res.scalars().all() if str(r.pool_member_id) not in current_member_ids
+    ]
+
     created = 0
     deleted = 0
     skipped = 0
+
+    for orphan in orphan_records:
+        await _delete_pool_record(db, zone, orphan)
+        deleted += 1
 
     for member in pool.members:
         should_render = bool(member.enabled) and (
@@ -74,6 +98,30 @@ async def apply_pool_state(
         elif not should_render and rec is not None:
             await _delete_pool_record(db, zone, rec)
             deleted += 1
+        elif should_render and rec is not None and rec.value != member.address:
+            # Member address edited — the rendered record still
+            # carries the old IP. Delete-then-recreate on the same
+            # serial so the live daemon moves to the new value
+            # atomically (same shape as the rename branch below).
+            old_snapshot = {
+                "name": rec.name,
+                "type": rec.record_type,
+                "value": rec.value,
+                "ttl": rec.ttl,
+                "rrset_action": "delete_value",
+            }
+            target_serial = bump_zone_serial(zone)
+            await enqueue_record_op(db, zone, "delete", old_snapshot, target_serial=target_serial)
+            rec.value = member.address
+            rec.ttl = pool.ttl
+            await enqueue_record_op(
+                db,
+                zone,
+                "create",
+                _record_payload(pool, member, pool.ttl),
+                target_serial=target_serial,
+            )
+            created += 1
         elif should_render and rec is not None and rec.ttl != pool.ttl:
             # Pool TTL changed — push an update (rare, but harmless).
             rec.ttl = pool.ttl

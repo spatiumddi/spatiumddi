@@ -243,6 +243,64 @@ further down.
   CRUD has no `view_id` assignment UI. The storage side is ready;
   what's missing is driver rendering + record-level view selection
   + UI binding on the record form. Phase 3.
+- ⬜ **Multi-group DNS publishing (split-horizon at the IPAM
+  layer)** — distinct from DNS Views above. Scenario: operator
+  has one public-IP subnet hosting an internet-facing service +
+  two DNS server groups (one internal, one external) and wants
+  the same A record published into a zone in EACH group so
+  internal resolvers and external resolvers both answer for that
+  hostname. Today the IPAM → DNS pipeline is 1:1 — `IPAddress`
+  carries a single `forward_zone_id`, `_resolve_effective_zone`
+  walks subnet → block → space and returns one zone, and
+  `_sync_dns_record` publishes one A/AAAA. Need 1:N: one IPAM
+  row publishes N records, one per `(group, zone)` pin.
+
+  **Smallest correct shape** (additive, two-day landing): keep
+  `forward_zone_id` as the singular primary for backward compat,
+  add `IPAddress.extra_zone_ids: list[uuid]` for the multi-zone
+  case. Each zone naturally belongs to exactly one group, so
+  multi-group fanout is implicit — no `dns_zone_ids_by_group`
+  map needed. `_sync_dns_record` enumerates both fields and
+  emits one A/AAAA per zone; the agent push pipeline already
+  routes by zone-owning-group, so agent code is untouched.
+  Same shape applies at Subnet / Block / Space inheritance —
+  the existing `dns_additional_zone_ids` columns already store
+  group-agnostic zone lists; the constraint is in the picker UI.
+  **Cleaner long-term shape**: many-to-many join table
+  `ip_address_zone_publish(ip_id, zone_id)` retiring
+  `forward_zone_id`; bigger migration, touches every record
+  publish path. Start additive for v1 — promote to the join
+  table only if dual-storage gets in the way.
+
+  **Safety gates** (the part the operator actually asked
+  about):
+  1. **Per-subnet opt-in** `Subnet.dns_split_horizon: bool`
+     (default false), inheritable from Block. When off, the
+     zone picker stays single-group like today — current
+     behaviour, no surprise. When on, picker becomes a
+     multi-select grouped by DNS group. Don't auto-enable for
+     public CIDRs; `ipaddress.is_private` is fragile (doesn't
+     cleanly cover ULA / CGNAT) and operators legitimately
+     run split-horizon on RFC 1918 too (e.g. two internal
+     views).
+  2. **`DNSServerGroup.is_public_facing: bool`** + a server-
+     side guard. When an operator pins a private subnet's IP
+     into a public-facing group, return 422 with
+     `requires_confirmation` (mirrors the existing
+     `_check_ip_collisions` shape) so the modal can render
+     "This is RFC 1918 — publishing to `{group}` exposes
+     internal IPs to a publicly-facing resolver. Type the
+     CIDR to confirm." This is the actual safety net —
+     catches the misconfiguration whether or not split-
+     horizon is on.
+
+  Pairs naturally with DNS Views (entry above) — Views are
+  per-zone match-clients filtering (same SOA, different
+  answers per source); this entry is per-IP fanout across
+  zones in different groups (different SOAs, two
+  authoritative resolvers each serving the right one). Real
+  operators want both. Phase 3 — fits the same wave as the
+  DNS Views finish-line.
 - ⬜ **IPAM template classes** — reusable stamp templates that
   carry default tags, custom-field values, DNS / DHCP group
   assignments, and optional sub-subnet layouts. Applied to a block
