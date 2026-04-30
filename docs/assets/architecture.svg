@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="820" viewBox="0 0 1200 820"
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="1100" viewBox="0 0 1200 1100"
      preserveAspectRatio="xMidYMid meet"
      font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
   <defs>
@@ -27,6 +27,14 @@
     <linearGradient id="g-agentless" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0%" stop-color="#22d3ee"/>
       <stop offset="100%" stop-color="#0891b2"/>
+    </linearGradient>
+    <linearGradient id="g-integrations" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#14b8a6"/>
+      <stop offset="100%" stop-color="#0f766e"/>
+    </linearGradient>
+    <linearGradient id="g-discovery" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#f472b6"/>
+      <stop offset="100%" stop-color="#be185d"/>
     </linearGradient>
 
     <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5"
@@ -266,6 +274,56 @@
   <!-- Beat → agentless (scheduled sync jobs) -->
   <path d="M 416 380 L 416 420 Q 416 432 428 432 L 1020 432 Q 1030 432 1030 444 L 1030 492" class="edge-dashed" marker-end="url(#arrow-dashed)"/>
   <text x="720" y="427" class="edge-label">scheduled: lease pull · zone sync · IPAM→DNS reconcile</text>
+
+  <!-- ─────────────────── Read-only sources band ─────────────────── -->
+  <text x="40" y="824" class="layer-label">Read-only sources — pulled into IPAM (scheduled by Worker)</text>
+  <rect x="36" y="836" width="1128" height="240" rx="12" ry="12" class="band"/>
+
+  <!-- Lane: Integrations -->
+  <g>
+    <rect x="56" y="856" width="540" height="200" rx="10" ry="10" class="card" fill="url(#g-integrations)"/>
+    <text x="326" y="884" text-anchor="middle" class="card-title">Integrations (read-only mirrors)</text>
+    <text x="326" y="902" text-anchor="middle" class="card-sub-dim">Settings → Integrations · per-target Sync Now</text>
+
+    <line x1="76" y1="918" x2="576" y2="918" stroke="rgba(255,255,255,0.35)" stroke-width="1"/>
+
+    <text x="76" y="942" class="card-sub" font-weight="600">Kubernetes</text>
+    <text x="76" y="958" class="card-sub-dim">CIDRs · nodes · LB VIPs · Ingress → DNS</text>
+
+    <text x="76" y="982" class="card-sub" font-weight="600">Docker</text>
+    <text x="76" y="998" class="card-sub-dim">networks · optional container IPs</text>
+
+    <text x="316" y="942" class="card-sub" font-weight="600">Proxmox VE</text>
+    <text x="316" y="958" class="card-sub-dim">bridges · SDN VNets · VM/LXC NICs</text>
+
+    <text x="316" y="982" class="card-sub" font-weight="600">Tailscale</text>
+    <text x="316" y="998" class="card-sub-dim">devices + synthetic *.ts.net zone</text>
+
+    <line x1="76" y1="1014" x2="576" y2="1014" stroke="rgba(255,255,255,0.35)" stroke-width="1"/>
+    <text x="326" y="1034" text-anchor="middle" class="card-sub-dim">credentials Fernet-encrypted · 30 s default sync</text>
+  </g>
+
+  <!-- Lane: Network discovery (SNMP) -->
+  <g>
+    <rect x="616" y="856" width="540" height="200" rx="10" ry="10" class="card" fill="url(#g-discovery)"/>
+    <text x="886" y="884" text-anchor="middle" class="card-title">Network discovery (SNMP)</text>
+    <text x="886" y="902" text-anchor="middle" class="card-sub-dim">routers + switches · standard MIBs</text>
+
+    <line x1="636" y1="918" x2="1136" y2="918" stroke="rgba(255,255,255,0.35)" stroke-width="1"/>
+
+    <text x="886" y="942" text-anchor="middle" class="card-sub">v1 · v2c · v3 (USM auth + priv)</text>
+    <text x="886" y="960" text-anchor="middle" class="card-sub-dim">IF-MIB · IP-MIB · Q-BRIDGE-MIB · LLDP-MIB</text>
+
+    <text x="886" y="984" text-anchor="middle" class="card-sub">interfaces · ARP · FDB · LLDP neighbours</text>
+    <text x="886" y="1002" text-anchor="middle" class="card-sub-dim">cross-referenced into IP rows</text>
+
+    <line x1="636" y1="1014" x2="1136" y2="1014" stroke="rgba(255,255,255,0.35)" stroke-width="1"/>
+    <text x="886" y="1034" text-anchor="middle" class="card-sub-dim">per-IP switch-port + VLAN visibility in IPAM</text>
+  </g>
+
+  <!-- Worker → Read-only sources band (scheduled pulls) -->
+  <path d="M 416 380 L 416 412 Q 416 422 426 422 L 580 422 Q 596 422 596 836" class="edge-dashed" marker-end="url(#arrow-dashed)"/>
+  <text x="486" y="416" class="edge-label">scheduled: integration sync · SNMP poll · GSLB health</text>
 
   <!-- ─────────────────── Notes / legend ─────────────────── -->
   <rect x="880" y="96" width="280" height="120" rx="8" ry="8" class="note-box"/>

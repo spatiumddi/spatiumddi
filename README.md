@@ -68,6 +68,7 @@
 | ✂️ | **Subnet operations** | Split · Merge · Find-free · subnet planner (multi-level CIDR design + transactional apply) — preview-then-commit with typed-CIDR confirm |
 | 🧮 | **Planning tools** | CIDR calculator · address planner (pack /N requests into free space) · aggregation suggestion · free-space treemap |
 | 🌐 | **DNS** | BIND9 container, auto-registering · RFC 2136 dynamic updates · per-server zone-serial drift · TSIG keys · zone delegation wizard · zone templates · RPZ blocklists with curated catalog · BIND9 catalog zones (RFC 9432) |
+| ⚖️ | **GSLB-lite** | health-checked DNS pools — tcp / http / https / icmp / none probes flip A/AAAA records in/out of the rendered rrset; manual enable per member |
 | 🔄 | **DHCP** | Kea container · group-centric Kea HA (load-balanced or hot-standby) with self-healing peer drift · option templates · 95-entry option-code library |
 | 🪟 | **Windows DNS + DHCP** | agentless — RFC 2136 + WinRM, no software on the DC |
 | 🔁 | **NAT cross-reference** | 1:1 / PAT / hide-NAT tracked in IPAM with FK links to live IP rows |
@@ -118,38 +119,159 @@ The tables above are the elevator pitch. The bullets here are the same surface w
 
 ### Core DDI
 
-- 🗂 **Hierarchical IP management** — spaces, blocks, subnets, addresses in a visual tree; IPv4 + full IPv6 auto-allocation (EUI-64 + random /128 + sequential); per-IP role (host / loopback / anycast / vip / vrrp / secondary / gateway), reservation TTL with auto-expiry, and per-IP MAC observation history
-- ✂️ **Subnet operations** — preview-then-commit Split, Merge, and Find-Free workflows with a typed-CIDR confirmation gate; surfaced on the subnet detail header *and* via bulk-action toolbars on the block + space tables (select 1 to split, 2+ to merge). Block-detail tables reach parity with the space view — child blocks are bulk-selectable too, so leaf-empty blocks cascade-delete alongside subnets in one shot
-- 🧮 **Subnet planner + planning tools** — `/ipam/plans` is a draggable multi-level CIDR design surface (root + nested children, arbitrary depth) saved as `SubnetPlan` rows, validated live as the operator edits, then one-click applied — every block + subnet created in a single transaction. Each node carries optional DNS-group / DHCP-group / gateway bindings (null = inherit, explicit = set + flip inherit off). On the block-detail surface there's also a CIDR calculator (`/tools/cidr`, pure client-side IPv4 + IPv6 breakdown), an address planner that packs `{count, prefix_len}` requests into free space using largest-prefix-first ordering, an aggregation suggestion banner that surfaces clean-merge opportunities (10.0.0.0/24 + 10.0.1.0/24 → /23), and a free-space treemap toggleable from the Allocation map header that surfaces fragmentation that's hidden in the 1-D band
-- 🗑 **Soft-delete + Trash recovery** — IP spaces, blocks, subnets, DNS zones / records, and DHCP scopes go to a 30-day Trash on delete; cascade-stamped batch IDs let one Restore click bring back every dependent row atomically. Conflict-detection on restore guards against clashing with live rows. Nightly purge sweep is operator-configurable (`soft_delete_purge_days`, default 30, set to 0 to keep forever)
-- 🔁 **NAT mapping cross-reference** — operator-curated 1:1 / PAT / hide-NAT rules tracked in IPAM with optional FK links to the live `IPAddress` rows. Per-IP modal lists every mapping that touches an address; per-subnet "NAT" tab uses Postgres CIDR containment to find every mapping crossing into the subnet's range
-- 📜 **DHCP lease history** — forensic trail of every lease that expired, was reassigned to a different MAC, or got swept on absence-delete. Operator retention window (default 90 days) honoured by a daily prune task
-- 🌐 **Built-in DNS server** — BIND9 container that auto-registers, syncs via RFC 2136, and reports per-server zone serial drift. **Zone authoring helpers**: delegation wizard (auto-stamps NS + glue in the parent zone), four starter zone templates (Email with MX/SPF/DMARC, Active Directory with LDAP/Kerberos/GC SRV, Web with apex + www, k8s external-dns target), conditional forwarders as a first-class zone type. **TSIG keys**: full CRUD with Fernet-encrypted secrets and a one-shot "copy this secret now" reveal modal; rows distribute through the existing `tsig_keys` ConfigBundle block. **RPZ blocklists**: 14-source curated catalog (AdGuard, StevenBlack, OISD, Hagezi, 1Hosts, Phishing Army, URLhaus, EasyPrivacy, …) with one-click subscribe + immediate refresh. **Catalog zones (RFC 9432)**: producer / consumer roles auto-derived from the group's primary, RFC-compliant SHA-1 hashing of zone names. **Operator tools**: multi-resolver propagation check (Cloudflare / Google / Quad9 / OpenDNS in parallel) on every record row; clickable analytics strip on the Logs page (top qnames + top clients + qtype distribution)
-- 🔄 **DHCP server management** — Kea container + agent with lease tracking; group-centric HA (hot-standby + load-balancing) with live state reporting, self-healing peer-IP drift, and supervised daemons for crash-loop-safe restarts. **Scope authoring helpers**: 95-entry RFC 2132 + IANA option-code library with autocomplete on the custom-options row (search by code or name, surfaces description as inline hint); named option templates (group-scoped, e.g. "VoIP phones", "PXE BIOS clients") that can be applied to a scope in one click — apply is a stamp not a binding, so later template edits don't propagate
-- 🪟 **Windows Server DNS + DHCP** — agentless management of existing Windows DCs (RFC 2136 + WinRM for DNS; near-real-time WinRM lease-mirroring for DHCP). No software installed on the Windows side.
+- 🗂 **Hierarchical IP management** — spaces, blocks, subnets, addresses in a visual tree.
+  - IPv4 + full IPv6 auto-allocation (EUI-64 / random /128 / sequential)
+  - Per-IP role: host / loopback / anycast / vip / vrrp / secondary / gateway
+  - Reservation TTL with auto-expiry
+  - Per-IP MAC observation history
+
+- ✂️ **Subnet operations** — preview-then-commit with typed-CIDR confirm.
+  - Split, Merge, Find-Free workflows
+  - Surfaced on the subnet detail header *and* via bulk-action toolbars on the block + space tables
+  - Bulk-select 1 row to split, 2+ to merge
+  - Block-detail tables reach parity with the space view — child blocks are bulk-selectable too, so leaf-empty blocks cascade-delete alongside subnets in one shot
+
+- 🧮 **Subnet planner + planning tools** — design CIDR hierarchies before applying them.
+  - `/ipam/plans` — draggable multi-level CIDR design surface (root + nested children, arbitrary depth)
+  - Saved as `SubnetPlan` rows, validated live as the operator edits, applied in a single transaction
+  - Per-node DNS-group / DHCP-group / gateway bindings (null = inherit, explicit = set + flip inherit off)
+  - CIDR calculator at `/tools/cidr` — pure client-side IPv4 + IPv6 breakdown
+  - Address planner — packs `{count, prefix_len}` requests into free space using largest-prefix-first ordering
+  - Aggregation suggestion banner — surfaces clean-merge opportunities (10.0.0.0/24 + 10.0.1.0/24 → /23)
+  - Free-space treemap toggleable from the Allocation map header — surfaces fragmentation hidden in the 1-D band
+
+- 🗑 **Soft-delete + Trash recovery** — 30-day Trash with cascade restore.
+  - Covers IP spaces, blocks, subnets, DNS zones / records, DHCP scopes
+  - Cascade-stamped batch IDs — one Restore click brings back every dependent row atomically
+  - Conflict detection on restore guards against clashing with live rows
+  - Operator-configurable purge sweep (`soft_delete_purge_days`, default 30; `0` = keep forever)
+
+- 🔁 **NAT mapping cross-reference** — operator-curated rules with FK links to IPAM.
+  - 1:1 / PAT / hide-NAT supported
+  - Per-IP modal lists every mapping that touches the address
+  - Per-subnet "NAT" tab uses Postgres CIDR containment to find every mapping crossing into the subnet's range
+
+- 📜 **DHCP lease history** — forensic trail of every lease lifecycle event.
+  - Captures expiry, MAC reassignment, absence-delete
+  - Operator retention window (default 90 days), daily prune task
+
+- 🌐 **Built-in DNS server** — BIND9 container, auto-registers, syncs via RFC 2136.
+  - Per-server zone-serial drift reporting
+  - **Zone authoring**:
+    - Delegation wizard — auto-stamps NS + glue in the parent zone
+    - Four starter templates: Email (MX / SPF / DMARC), Active Directory (LDAP / Kerberos / GC SRV), Web (apex + www), k8s external-dns target
+    - Conditional forwarders as a first-class zone type
+  - **TSIG keys** — full CRUD with Fernet-encrypted secrets
+    - One-shot "copy this secret now" reveal modal
+    - Rows distribute through the existing `tsig_keys` ConfigBundle block
+  - **RPZ blocklists** — 14-source curated catalog with one-click subscribe + immediate refresh
+    - Sources: AdGuard, StevenBlack, OISD, Hagezi, 1Hosts, Phishing Army, URLhaus, EasyPrivacy, …
+  - **Catalog zones (RFC 9432)** — producer / consumer roles auto-derived from the group's primary
+    - RFC-compliant SHA-1 hashing of zone names
+  - **Operator tools**:
+    - Multi-resolver propagation check (Cloudflare / Google / Quad9 / OpenDNS in parallel) on every record row
+    - Clickable analytics strip on the Logs page (top qnames + top clients + qtype distribution)
+    - Per-server detail modal — Overview / Zones / Sync / Events / Logs / Stats / Config tabs + a live `rndc status` panel — answers "is this server actually running the config we sent?" without SSHing in
+
+- ⚖️ **DNS pools (GSLB-lite)** — health-checked DNS round-robin.
+  - One DNS name returns one record per healthy + enabled member; members flip in / out of the rrset as state changes
+  - **Health checks**:
+    - `tcp` — open-connection probe
+    - `http` / `https` — status-code match with optional TLS verification
+    - `icmp` — echo-request via `iputils-ping`
+    - `none` — always healthy (for pools that just want manual-enable + multi-RR semantics)
+  - Per-pool interval (default 30 s), timeout, and consecutive-failure / consecutive-success thresholds so single flapping checks don't churn records
+  - **Operator UX**:
+    - Top-level `/dns/pools` page — every pool across every zone with live health summary
+    - Per-zone Pools tab on the zone detail page
+    - Manual enable / disable per member, like a load-balancer pool
+  - **Driver-agnostic** — members render as regular A/AAAA records via the normal record pipeline, so BIND9 + Windows DNS serve them unchanged
+  - **Tradeoff (UI-warned)** — TTL races. DNS is cached client-side; a member dropping out doesn't take effect until TTL expires. This is not a real L4/L7 load balancer. Default TTL is 30 s with an inline pointer to the LB-mapping roadmap item.
+
+- 🔄 **DHCP server management** — Kea container + agent with lease tracking.
+  - Group-centric HA (hot-standby + load-balancing) with live state reporting
+  - Self-healing peer-IP drift
+  - Supervised daemons for crash-loop-safe restarts
+  - **Scope authoring**:
+    - 95-entry RFC 2132 + IANA option-code library with autocomplete on the custom-options row (search by code or name, description shown inline)
+    - Named option templates (group-scoped, e.g. "VoIP phones", "PXE BIOS clients") — apply to a scope in one click; apply is a stamp not a binding, so later template edits don't propagate
+
+- 🪟 **Windows Server DNS + DHCP** — agentless management of existing Windows DCs.
+  - RFC 2136 + WinRM for DNS
+  - Near-real-time WinRM lease-mirroring for DHCP
+  - No software installed on the Windows side
 
 ### Discovery & visibility
 
-- 📡 **SNMP discovery** — v1 / v2c / v3 polling of routers + switches via standard MIBs (IF-MIB, IP-MIB, Q-BRIDGE-MIB, LLDP-MIB) — interfaces, ARP, FDB, and LLDP neighbours feed back into IPAM with per-IP switch-port + VLAN visibility and a Neighbours tab on each device
-- 🎯 **Nmap scanner** — per-IP "Scan with Nmap" launches preset or custom scans (quick / service-version / OS / default-scripts / UDP top-100 / aggressive); live SSE output streams to the browser; structured XML parsed into a results panel; standalone `/tools/nmap` page for ad-hoc targets
-- 🎨 **Dashboard-at-a-glance** — sub-tabs for Overview / IPAM / DNS / DHCP, platform health card (API / Postgres / Redis / workers / beat), live DNS query rate + DHCP traffic charts (BIND9 statistics-channels + Kea `statistic-get-all`, self-contained — no Prometheus needed), subnet utilization heatmap, and live activity feed
-- 📊 **Platform Insights admin page** — read-only Postgres diagnostics (DB size, cache hit ratio, WAL position, slow queries via `pg_stat_statements`, table sizes, idle-in-transaction watch) + per-container CPU / memory / network / IO from the local Docker socket. Native, no extra agents
-- 🏷 **IEEE OUI vendor lookup** — opt-in display of MAC vendor names in IP tables and DHCP leases, with filter-by-vendor support
+- 📡 **SNMP discovery** — v1 / v2c / v3 polling via standard MIBs.
+  - MIBs walked: IF-MIB, IP-MIB, Q-BRIDGE-MIB, LLDP-MIB
+  - Surfaces interfaces, ARP, FDB, LLDP neighbours
+  - Per-IP switch-port + VLAN visibility in IPAM
+  - Neighbours tab on each device
+
+- 🎯 **Nmap scanner** — on-demand scans from the browser.
+  - Per-IP "Scan with Nmap" launcher
+  - Presets: quick, service-version, OS, default-scripts, UDP top-100, aggressive
+  - Live SSE output streams while the scan runs
+  - Structured XML parsed into a results panel
+  - Standalone `/tools/nmap` page for ad-hoc targets
+
+- 🎨 **Dashboard-at-a-glance** — sub-tabs for Overview / IPAM / DNS / DHCP.
+  - Platform health card (API / Postgres / Redis / workers / beat)
+  - Live DNS query rate + DHCP traffic charts — self-contained, no Prometheus needed
+    - Sources: BIND9 statistics-channels + Kea `statistic-get-all`
+  - Subnet utilization heatmap
+  - Live activity feed
+
+- 📊 **Platform Insights admin page** — native diagnostics, no extra agents.
+  - Postgres: DB size, cache hit ratio, WAL position, slow queries via `pg_stat_statements`, table sizes, idle-in-transaction watch
+  - Containers: per-container CPU / memory / network / IO from the local Docker socket
+
+- 🏷 **IEEE OUI vendor lookup** — opt-in MAC vendor display.
+  - Surfaces in IP tables and DHCP leases
+  - Filter-by-vendor support
 
 ### Integrations
 
-- 🧩 **Read-only integrations** — auto-mirror **Kubernetes** clusters (CIDRs, nodes, LoadBalancer VIPs, Ingress → DNS), **Docker** hosts (networks, optional container IPs), **Proxmox VE** endpoints (bridges, SDN VNets + subnets, VMs, LXC guests — runtime IPs via QEMU guest-agent, one row per cluster), and **Tailscale** tailnets (device mirror + synthetic `*.ts.net` DNS zone) into IPAM with one-click setup guides. Opt-in VNet-CIDR inference from guest NICs for SDN deployments where PVE is L2-only. Per-endpoint "Discovery" modal shows which VMs aren't reporting IPs + why, with copy-ready fix hints. Settings toggle gates each; per-target sync interval + on-demand Sync Now. Supernet auto-creation for RFC 1918 / CGNAT ranges keeps the tree tidy.
+- 🧩 **Read-only integrations** — auto-mirror cluster / hypervisor / overlay state into IPAM.
+  - **Kubernetes** — CIDRs, nodes, LoadBalancer VIPs, Ingress → DNS
+  - **Docker** — networks, optional container IPs
+  - **Proxmox VE** — bridges, SDN VNets + subnets, VMs, LXC guests (runtime IPs via QEMU guest-agent); one row per cluster
+  - **Tailscale** — device mirror + synthetic `*.ts.net` DNS zone
+  - One-click setup guides per integration
+  - Opt-in VNet-CIDR inference from guest NICs (for SDN deployments where PVE is L2-only)
+  - Per-endpoint "Discovery" modal — which VMs aren't reporting IPs + copy-ready fix hints
+  - Settings toggle gates each; per-target sync interval + on-demand Sync Now
+  - Supernet auto-creation for RFC 1918 / CGNAT ranges keeps the tree tidy
 
 ### Identity & ops
 
-- 🔒 **Group-based RBAC + external identity** — LDAP, OIDC, SAML, RADIUS, TACACS+ with backup-server failover; delegate IP ranges and zones by role; API tokens with auto-expiry
-- 🔔 **Alerts + audit forwarding** — rule-based alerts framework (subnet utilization, server unreachable) + multi-target syslog (UDP / TCP / TLS) + HTTP webhook forwarding with pluggable wire formats (RFC 5424 JSON / CEF / LEEF / RFC 3164 / JSON lines) and per-target filters
-- 🔐 **ACME DNS-01 provider** — `acme-dns`-compatible HTTP surface so certbot / lego / acme.sh can issue public certs (wildcards included) for names delegated to a SpatiumDDI-managed zone
-- 📋 **Full audit trail** — every mutation logged, append-only, viewable in the UI with per-column filters
+- 🔒 **Group-based RBAC + external identity** — multi-protocol auth.
+  - LDAP, OIDC, SAML, RADIUS, TACACS+
+  - Backup-server failover for every protocol
+  - Delegate IP ranges and zones by role
+  - API tokens with auto-expiry
+
+- 🔔 **Alerts + audit forwarding** — multi-target delivery with pluggable wire formats.
+  - Rule-based alerts framework (subnet utilization, server unreachable)
+  - Multi-target syslog (UDP / TCP / TLS) + HTTP webhook
+  - Wire formats: RFC 5424 JSON, CEF, LEEF, RFC 3164, JSON lines
+  - Per-target filters
+
+- 🔐 **ACME DNS-01 provider** — `acme-dns`-compatible HTTP surface.
+  - certbot / lego / acme.sh issue public certs (wildcards included)
+  - For any FQDN delegated to a SpatiumDDI-managed zone
+
+- 📋 **Full audit trail** — every mutation logged, append-only.
+  - Viewable in the UI with per-column filters
 
 ### Deployment
 
-- 🚀 **Flexible deployment** — Docker Compose, Kubernetes (Helm umbrella chart + OCI publishing), bare metal, or OS appliance
+- 🚀 **Flexible deployment** — same control plane, multiple paths.
+  - Docker Compose
+  - Kubernetes — Helm umbrella chart, OCI-published
+  - Bare metal
+  - OS appliance (roadmap)
 
 ---
 
