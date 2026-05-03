@@ -1383,8 +1383,8 @@ function ZoneModal({
           </select>
           <p className="mt-1 text-[11px] text-muted-foreground">
             Pin to a tracked domain registration so the Domain detail page
-            surfaces it under "Linked DNS Zones". Auto-matches by name when
-            left blank.
+            surfaces it under "Linked DNS Zones". Auto-matches by name when left
+            blank.
           </p>
         </Field>
         {error && <p className="text-sm text-destructive">{error}</p>}

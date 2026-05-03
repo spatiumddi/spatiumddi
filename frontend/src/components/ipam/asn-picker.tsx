@@ -10,7 +10,12 @@ interface AsnPickerProps {
 }
 
 /** Single-select dropdown bound to the ASN list. NULL = "no AS recorded". */
-export function AsnPicker({ value, onChange, className, disabled }: AsnPickerProps) {
+export function AsnPicker({
+  value,
+  onChange,
+  className,
+  disabled,
+}: AsnPickerProps) {
   const { data } = useQuery({
     queryKey: ["asns-picker"],
     queryFn: () => asnsApi.list({ limit: 500 }),

@@ -5840,8 +5840,7 @@ export const asnsApi = {
   listPeerings: (params?: {
     asn_id?: string;
     relationship_type?: BGPRelationshipType;
-  }) =>
-    api.get<BGPPeering[]>("/asns/peerings", { params }).then((r) => r.data),
+  }) => api.get<BGPPeering[]>("/asns/peerings", { params }).then((r) => r.data),
   createPeering: (data: BGPPeeringCreate) =>
     api.post<BGPPeering>("/asns/peerings", data).then((r) => r.data),
   updatePeering: (id: string, data: BGPPeeringUpdate) =>

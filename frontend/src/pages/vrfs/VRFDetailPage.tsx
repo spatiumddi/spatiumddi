@@ -200,9 +200,7 @@ export function VRFDetailPage() {
                     {asn.name ? ` — ${asn.name}` : ""}
                   </Link>
                 ) : vrf.asn_id ? (
-                  <span className="font-mono text-[11px]">
-                    {vrf.asn_id}
-                  </span>
+                  <span className="font-mono text-[11px]">{vrf.asn_id}</span>
                 ) : (
                   <span className="text-muted-foreground">— none —</span>
                 )}

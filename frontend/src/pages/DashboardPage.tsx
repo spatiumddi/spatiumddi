@@ -412,7 +412,8 @@ function AsnSummaryCard() {
 
     // RPKI ROAs — the field is optional (may not exist in all deployments)
     const allRoas: { state: string }[] = asns.flatMap(
-      (a) => ((a as ASNRead & { rpki_roas?: { state: string }[] }).rpki_roas ?? []),
+      (a) =>
+        (a as ASNRead & { rpki_roas?: { state: string }[] }).rpki_roas ?? [],
     );
     const roasExpiring = allRoas.filter((r) => r.state === "expiring").length;
     const roasExpired = allRoas.filter((r) => r.state === "expired").length;
@@ -492,7 +493,11 @@ function AsnSummaryCard() {
 // ── VRF Summary card ─────────────────────────────────────────────────────────
 
 function VrfSummaryCard() {
-  const { data: vrfs = [], isLoading, isError } = useQuery<VRF[]>({
+  const {
+    data: vrfs = [],
+    isLoading,
+    isError,
+  } = useQuery<VRF[]>({
     queryKey: ["vrfs-summary"],
     queryFn: () => vrfsApi.list(),
     staleTime: 30_000,
@@ -541,16 +546,10 @@ function VrfSummaryCard() {
       <div className="mt-3 flex-1 flex flex-col justify-between gap-2">
         <div className="flex flex-wrap gap-1">
           {missingRd > 0 && (
-            <StatusChip
-              tone="amber"
-              label={`${missingRd} missing RD`}
-            />
+            <StatusChip tone="amber" label={`${missingRd} missing RD`} />
           )}
           {unlinked > 0 && (
-            <StatusChip
-              tone="gray"
-              label={`${unlinked} unlinked (no ASN)`}
-            />
+            <StatusChip tone="gray" label={`${unlinked} unlinked (no ASN)`} />
           )}
           {missingRd === 0 && unlinked === 0 && (
             <StatusChip tone="green" label="all linked" />
@@ -616,7 +615,9 @@ function DomainsSummaryCard() {
     if (domains.length === 0) {
       return (
         <div className="mt-3 flex-1 flex flex-col justify-between">
-          <p className="text-xs text-muted-foreground">No domains configured.</p>
+          <p className="text-xs text-muted-foreground">
+            No domains configured.
+          </p>
           <Link
             to="/admin/domains"
             className="mt-2 text-[11px] text-primary hover:underline"
@@ -645,10 +646,7 @@ function DomainsSummaryCard() {
         <div className="space-y-1.5">
           <div className="flex flex-wrap gap-1">
             {expired > 0 && (
-              <StatusChip
-                tone="red"
-                label={`${expired} expired`}
-              />
+              <StatusChip tone="red" label={`${expired} expired`} />
             )}
             {expiringSoon > 0 && (
               <StatusChip

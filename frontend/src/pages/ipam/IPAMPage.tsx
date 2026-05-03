@@ -649,8 +649,8 @@ function CreateSpaceModal({ onClose }: { onClose: () => void }) {
               </Field>
               <p className="text-xs text-muted-foreground">
                 Pure annotation — address allocation does not consult these
-                fields. Different VRFs with overlapping IPs already work
-                via separate IPSpace rows.
+                fields. Different VRFs with overlapping IPs already work via
+                separate IPSpace rows.
               </p>
             </div>
           )}
@@ -7935,7 +7935,8 @@ function SpaceVrfBadges({
     : null;
 
   const vrfName = linkedVrf?.name ?? space.vrf_name ?? null;
-  const rd = linkedVrf?.route_distinguisher ?? space.route_distinguisher ?? null;
+  const rd =
+    linkedVrf?.route_distinguisher ?? space.route_distinguisher ?? null;
   const importTargets = linkedVrf?.import_targets ?? null;
   const exportTargets = linkedVrf?.export_targets ?? null;
   const legacyTargets = !linkedVrf ? (space.route_targets ?? null) : null;
@@ -7972,9 +7973,7 @@ function SpaceVrfBadges({
         </span>
       )}
       {rd && (
-        <span className="rounded border px-1.5 py-0.5 font-mono">
-          RD: {rd}
-        </span>
+        <span className="rounded border px-1.5 py-0.5 font-mono">RD: {rd}</span>
       )}
       {importTargets && importTargets.length > 0 && (
         <span className="rounded border px-1.5 py-0.5 font-mono">
@@ -8282,8 +8281,8 @@ function EditSpaceModal({
               </Field>
               <p className="text-xs text-muted-foreground">
                 Pure annotation — address allocation does not consult these
-                fields. Different VRFs with overlapping IPs already work
-                via separate IPSpace rows.
+                fields. Different VRFs with overlapping IPs already work via
+                separate IPSpace rows.
               </p>
             </div>
           )}
@@ -8556,23 +8555,15 @@ function CreateBlockModal({
         </div>
         <div className="border-t pt-3 space-y-3">
           <Field label="VRF (optional)">
-            <VrfPicker
-              className={inputCls}
-              value={vrfId}
-              onChange={setVrfId}
-            />
+            <VrfPicker className={inputCls} value={vrfId} onChange={setVrfId} />
             <p className="mt-1 text-[11px] text-muted-foreground">
-              Pin a different VRF than the parent space when this block lives
-              in a separate routing context (e.g. hub-and-spoke fabrics).
-              Leave blank to inherit from the space.
+              Pin a different VRF than the parent space when this block lives in
+              a separate routing context (e.g. hub-and-spoke fabrics). Leave
+              blank to inherit from the space.
             </p>
           </Field>
           <Field label="Origin ASN (BGP, optional)">
-            <AsnPicker
-              className={inputCls}
-              value={asnId}
-              onChange={setAsnId}
-            />
+            <AsnPicker className={inputCls} value={asnId} onChange={setAsnId} />
           </Field>
         </div>
         {error && <p className="text-xs text-destructive">{error}</p>}
@@ -8883,22 +8874,14 @@ function EditBlockModal({
         </div>
         <div className="border-t pt-3 space-y-3">
           <Field label="VRF (optional)">
-            <VrfPicker
-              className={inputCls}
-              value={vrfId}
-              onChange={setVrfId}
-            />
+            <VrfPicker className={inputCls} value={vrfId} onChange={setVrfId} />
             <p className="mt-1 text-[11px] text-muted-foreground">
               Override the parent space's VRF when this block lives in a
               different routing context. Leave blank to inherit.
             </p>
           </Field>
           <Field label="Origin ASN (BGP, optional)">
-            <AsnPicker
-              className={inputCls}
-              value={asnId}
-              onChange={setAsnId}
-            />
+            <AsnPicker className={inputCls} value={asnId} onChange={setAsnId} />
           </Field>
         </div>
         {error && <p className="text-xs text-destructive">{error}</p>}
@@ -10463,10 +10446,7 @@ function SpaceTableView({
           {space.description && (
             <p className="text-xs text-muted-foreground">{space.description}</p>
           )}
-          <SpaceVrfBadges
-            space={space}
-            onEdit={() => setShowEditSpace(true)}
-          />
+          <SpaceVrfBadges space={space} onEdit={() => setShowEditSpace(true)} />
         </div>
       </div>
       <div className="flex-1 overflow-auto">

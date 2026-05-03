@@ -1,7 +1,14 @@
 import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Building2, Loader2, Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
+import {
+  Building2,
+  Loader2,
+  Pencil,
+  Plus,
+  RefreshCw,
+  Trash2,
+} from "lucide-react";
 
 import {
   asnsApi,

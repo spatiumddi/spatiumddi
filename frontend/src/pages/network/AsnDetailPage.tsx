@@ -98,9 +98,7 @@ const SEVERITY_COLOR: Record<AlertSeverity, string> = {
 
 function SeverityBadge({ severity }: { severity: AlertSeverity }) {
   return (
-    <span
-      className={cn(PILL_BASE, SEVERITY_COLOR[severity], "capitalize")}
-    >
+    <span className={cn(PILL_BASE, SEVERITY_COLOR[severity], "capitalize")}>
       {severity}
     </span>
   );
@@ -703,13 +701,7 @@ export function AsnDetailPage() {
   );
 }
 
-function InfoRow({
-  label,
-  value,
-}: {
-  label: string;
-  value: React.ReactNode;
-}) {
+function InfoRow({ label, value }: { label: string; value: React.ReactNode }) {
   return (
     <div>
       <dt className="text-[11px] font-medium uppercase tracking-wide text-muted-foreground">

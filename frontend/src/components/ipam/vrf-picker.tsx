@@ -10,7 +10,12 @@ interface VrfPickerProps {
 }
 
 /** Single-select dropdown bound to the VRF list. NULL = "no VRF". */
-export function VrfPicker({ value, onChange, className, disabled }: VrfPickerProps) {
+export function VrfPicker({
+  value,
+  onChange,
+  className,
+  disabled,
+}: VrfPickerProps) {
   const { data } = useQuery({
     queryKey: ["vrfs-picker"],
     queryFn: () => vrfsApi.list(),

@@ -384,7 +384,10 @@ function AlertHistoryTab({ domainId }: { domainId: string }) {
           )}
           {events.map((e) => (
             <tr key={e.id} className="border-b">
-              <td className="px-4 py-2.5 text-xs max-w-xs truncate" title={e.message}>
+              <td
+                className="px-4 py-2.5 text-xs max-w-xs truncate"
+                title={e.message}
+              >
                 {e.message}
               </td>
               <td className="px-4 py-2.5">
@@ -392,7 +395,9 @@ function AlertHistoryTab({ domainId }: { domainId: string }) {
               </td>
               <td className="px-4 py-2.5">
                 {e.resolved_at ? (
-                  <span className="text-xs text-muted-foreground">resolved</span>
+                  <span className="text-xs text-muted-foreground">
+                    resolved
+                  </span>
                 ) : (
                   <span className="inline-flex items-center rounded bg-amber-100 px-2 py-0.5 text-[11px] font-medium text-amber-700 dark:bg-amber-950/30 dark:text-amber-400">
                     open
@@ -451,7 +456,10 @@ export function DomainDetailPage() {
       <div className="flex h-full flex-col items-center justify-center gap-3 text-muted-foreground">
         <AlertTriangle className="h-8 w-8" />
         <p className="text-sm">Domain not found.</p>
-        <Link to="/admin/domains" className="text-sm text-primary hover:underline">
+        <Link
+          to="/admin/domains"
+          className="text-sm text-primary hover:underline"
+        >
           Back to Domains
         </Link>
       </div>
@@ -489,7 +497,10 @@ export function DomainDetailPage() {
             className="inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm hover:bg-accent disabled:opacity-50"
           >
             <RefreshCw
-              className={cn("h-3.5 w-3.5", refreshMut.isPending && "animate-spin")}
+              className={cn(
+                "h-3.5 w-3.5",
+                refreshMut.isPending && "animate-spin",
+              )}
             />
             {refreshMut.isPending ? "Refreshing…" : "Refresh WHOIS"}
           </button>
@@ -506,11 +517,19 @@ export function DomainDetailPage() {
             />
             <InfoRow
               label="Registered"
-              value={domain.registered_at ? new Date(domain.registered_at).toLocaleString() : "—"}
+              value={
+                domain.registered_at
+                  ? new Date(domain.registered_at).toLocaleString()
+                  : "—"
+              }
             />
             <InfoRow
               label="Expires"
-              value={domain.expires_at ? new Date(domain.expires_at).toLocaleString() : "—"}
+              value={
+                domain.expires_at
+                  ? new Date(domain.expires_at).toLocaleString()
+                  : "—"
+              }
             />
             <InfoRow
               label="DNSSEC"
@@ -583,13 +602,7 @@ export function DomainDetailPage() {
 
 // ── InfoRow helper ───────────────────────────────────────────────────────────
 
-function InfoRow({
-  label,
-  value,
-}: {
-  label: string;
-  value: React.ReactNode;
-}) {
+function InfoRow({ label, value }: { label: string; value: React.ReactNode }) {
   return (
     <div className="flex flex-col gap-0.5">
       <dt className="text-xs font-medium text-muted-foreground">{label}</dt>

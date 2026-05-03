@@ -1588,10 +1588,7 @@ export function SettingsPage() {
                       max={168}
                       value={values.asn_whois_interval_hours ?? 24}
                       onChange={(e) =>
-                        set(
-                          "asn_whois_interval_hours",
-                          Number(e.target.value),
-                        )
+                        set("asn_whois_interval_hours", Number(e.target.value))
                       }
                       disabled={!isSuperadmin}
                       className={cn(inputCls, "w-24")}
@@ -1650,10 +1647,7 @@ export function SettingsPage() {
                     max={168}
                     value={values.domain_whois_interval_hours ?? 24}
                     onChange={(e) =>
-                      set(
-                        "domain_whois_interval_hours",
-                        Number(e.target.value),
-                      )
+                      set("domain_whois_interval_hours", Number(e.target.value))
                     }
                     disabled={!isSuperadmin}
                     className={cn(inputCls, "w-24")}
