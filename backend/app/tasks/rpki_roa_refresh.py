@@ -263,9 +263,15 @@ async def _run_refresh() -> dict[str, Any]:
         )
 
         # Also include any public ASN that has NO ROAs yet — first-time
-        # reconcile. ``ASN.next_check_at`` is a parent-table gate that
-        # the WHOIS task also touches; reading it lets us pace fresh
-        # rows without a separate column. NULL = pull on first tick.
+        # reconcile. ``ASN.next_check_at`` is owned by the WHOIS refresh
+        # task (it gets bumped ~24h forward on every successful WHOIS
+        # pull), so it would permanently lock out fresh ASNs from their
+        # first ROA pull if we gated on it. We don't gate first-time
+        # rows at all — the source-side service caches the global ROA
+        # dump for 5 min so back-to-back refreshes don't fan out to N
+        # network calls. Per-row pacing kicks in once a ROA exists via
+        # the ``ASNRpkiRoa.next_check_at`` floor in the existing-ROA
+        # branch above.
         first_time = (
             (
                 await db.execute(
@@ -274,7 +280,6 @@ async def _run_refresh() -> dict[str, Any]:
                     .where(
                         ASN.kind == "public",
                         ASNRpkiRoa.id.is_(None),
-                        or_(ASN.next_check_at.is_(None), ASN.next_check_at <= now),
                     )
                 )
             )
