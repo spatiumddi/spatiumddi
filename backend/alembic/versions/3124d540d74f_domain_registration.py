@@ -1,7 +1,7 @@
 """domain registration tracking — RDAP/WHOIS, NS drift, expiry
 
 Revision ID: 3124d540d74f
-Revises: 0f83a227b16d
+Revises: 2c4e9d1a7f63
 Create Date: 2026-05-02 00:00:00.000000
 
 Phase 1 of issue #87 — distinct from ``dns_zone``. Tracks the
@@ -18,7 +18,7 @@ from alembic import op
 from sqlalchemy.dialects import postgresql
 
 revision: str = "3124d540d74f"
-down_revision: Union[str, None] = "0f83a227b16d"
+down_revision: Union[str, None] = "2c4e9d1a7f63"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

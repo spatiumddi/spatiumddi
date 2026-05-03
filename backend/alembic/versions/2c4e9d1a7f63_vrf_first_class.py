@@ -1,7 +1,7 @@
 """VRF as a first-class entity (issue #86, phase 1).
 
 Revision ID: 2c4e9d1a7f63
-Revises: 0f83a227b16d
+Revises: f59a5371bdfb
 
 Create Date: 2026-05-02 00:00:00
 
@@ -37,7 +37,7 @@ from alembic import op
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 
 revision: str = "2c4e9d1a7f63"
-down_revision: Union[str, None] = "0f83a227b16d"
+down_revision: Union[str, None] = "f59a5371bdfb"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
