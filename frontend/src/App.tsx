@@ -17,6 +17,8 @@ import { ProxmoxPage } from "@/pages/proxmox/ProxmoxPage";
 import { TailscalePage } from "@/pages/tailscale/TailscalePage";
 import { NetworkPage } from "@/pages/network/NetworkPage";
 import { DeviceDetailView } from "@/pages/network/DeviceDetailView";
+import { VRFsStubPage } from "@/pages/network/VRFsStubPage";
+import { ASNsStubPage } from "@/pages/network/ASNsStubPage";
 import { NmapToolsPage } from "@/pages/nmap/NmapToolsPage";
 import { CidrCalculatorPage } from "@/pages/tools/CidrCalculatorPage";
 import { SubnetPlannerListPage } from "@/pages/ipam/SubnetPlannerListPage";
@@ -63,8 +65,24 @@ export default function App() {
         <Route path="ipam/plans/:id" element={<SubnetPlannerEditorPage />} />
         <Route path="dns" element={<DNSPage />} />
         <Route path="dns/pools" element={<DNSPoolsPage />} />
-        <Route path="vlans" element={<VLANsPage />} />
-        <Route path="network" element={<NetworkPage />} />
+        {/* Network section — Devices / VLANs / VRFs / ASNs. The old top-
+            level /network and /vlans paths redirect here so existing
+            bookmarks keep working. See issue #84. */}
+        <Route
+          path="network"
+          element={<Navigate to="/network/devices" replace />}
+        />
+        <Route path="network/devices" element={<NetworkPage />} />
+        <Route path="network/devices/:id" element={<DeviceDetailView />} />
+        <Route path="network/vlans" element={<VLANsPage />} />
+        <Route path="network/vrfs" element={<VRFsStubPage />} />
+        <Route path="network/asns" element={<ASNsStubPage />} />
+        <Route
+          path="vlans"
+          element={<Navigate to="/network/vlans" replace />}
+        />
+        {/* Legacy device-detail bookmark (/network/:id) — preserve by
+            redirecting to /network/devices/:id. */}
         <Route path="network/:id" element={<DeviceDetailView />} />
         <Route path="tools/nmap" element={<NmapToolsPage />} />
         <Route path="tools/cidr" element={<CidrCalculatorPage />} />

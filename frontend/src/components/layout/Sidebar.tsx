@@ -9,6 +9,7 @@ import {
   Router as RouterIcon,
   Cable,
   Github,
+  Hash,
   Users,
   UsersRound,
   KeyRound,
@@ -50,9 +51,18 @@ const baseMainNav = [
   { label: "DNS Pools", icon: Workflow, to: "/dns/pools" },
   { label: "Logs", icon: ScrollText, to: "/logs" },
   { label: "NAT Mappings", icon: Shuffle, to: "/ipam/nat" },
-  { label: "Network", icon: Cable, to: "/network" },
   { label: "Subnet Planner", icon: Workflow, to: "/ipam/plans" },
-  { label: "VLANs", icon: RouterIcon, to: "/vlans" },
+];
+
+// Network section — grouped under a non-clickable section header
+// (mirrors Administration). Devices replaces the old top-level
+// "Network" entry; VLANs lifts up from its own top-level slot;
+// VRFs / ASNs are stubs gated on issues #86 / #85.
+const networkNav = [
+  { label: "Devices", icon: Cable, to: "/network/devices" },
+  { label: "VLANs", icon: RouterIcon, to: "/network/vlans" },
+  { label: "VRFs", icon: Workflow, to: "/network/vrfs" },
+  { label: "ASNs", icon: Hash, to: "/network/asns" },
 ];
 
 const toolsNav = [
@@ -300,6 +310,22 @@ export function Sidebar({
             collapsed={effectiveCollapsed}
           >
             {mainNav.map((item) => (
+              <NavItem
+                key={item.to}
+                {...item}
+                collapsed={effectiveCollapsed}
+                onNavigate={mobileOpen ? onMobileClose : undefined}
+              />
+            ))}
+          </NavSection>
+
+          <NavSection
+            label="Network"
+            storageKey="sidebar-section-network-open"
+            collapsed={effectiveCollapsed}
+            showDivider
+          >
+            {networkNav.map((item) => (
               <NavItem
                 key={item.to}
                 {...item}

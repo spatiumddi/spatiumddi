@@ -94,7 +94,7 @@ export function IPNetworkTab({ addressId }: { addressId: string }) {
               >
                 <td className="whitespace-nowrap px-3 py-1.5">
                   <Link
-                    to={`/network/${r.device_id}`}
+                    to={`/network/devices/${r.device_id}`}
                     className="inline-flex items-center gap-1 text-primary hover:underline"
                   >
                     {r.device_name}

@@ -503,7 +503,7 @@ export function NetworkPage() {
                     return (
                       <tr
                         key={d.id}
-                        onClick={() => navigate(`/network/${d.id}`)}
+                        onClick={() => navigate(`/network/devices/${d.id}`)}
                         className={`cursor-pointer border-b last:border-0 hover:bg-muted/20 ${
                           sel ? "bg-primary/5" : ""
                         }`}
