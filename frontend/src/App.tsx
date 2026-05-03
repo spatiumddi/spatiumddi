@@ -11,6 +11,7 @@ import { DNSPage } from "@/pages/dns/DNSPage";
 import { DNSPoolsPage } from "@/pages/dns/DNSPoolsPage";
 import { VLANsPage } from "@/pages/vlans/VLANsPage";
 import { VRFsPage } from "@/pages/vrfs/VRFsPage";
+import { VRFDetailPage } from "@/pages/vrfs/VRFDetailPage";
 import { DHCPPage } from "@/pages/dhcp/DHCPPage";
 import { KubernetesPage } from "@/pages/kubernetes/KubernetesPage";
 import { DockerPage } from "@/pages/docker/DockerPage";
@@ -19,6 +20,7 @@ import { TailscalePage } from "@/pages/tailscale/TailscalePage";
 import { NetworkPage } from "@/pages/network/NetworkPage";
 import { DeviceDetailView } from "@/pages/network/DeviceDetailView";
 import { AsnsPage } from "@/pages/network/AsnsPage";
+import { AsnDetailPage } from "@/pages/network/AsnDetailPage";
 import { NmapToolsPage } from "@/pages/nmap/NmapToolsPage";
 import { CidrCalculatorPage } from "@/pages/tools/CidrCalculatorPage";
 import { SubnetPlannerListPage } from "@/pages/ipam/SubnetPlannerListPage";
@@ -31,6 +33,7 @@ import { ApiTokensPage } from "@/pages/admin/ApiTokensPage";
 import { AlertsPage } from "@/pages/admin/AlertsPage";
 import { AuthProvidersPage } from "@/pages/admin/AuthProvidersPage";
 import { DomainsPage } from "@/pages/admin/DomainsPage";
+import { DomainDetailPage } from "@/pages/admin/DomainDetailPage";
 import { GroupsPage } from "@/pages/admin/GroupsPage";
 import { RolesPage } from "@/pages/admin/RolesPage";
 import { TrashPage } from "@/pages/admin/TrashPage";
@@ -77,7 +80,9 @@ export default function App() {
         <Route path="network/devices/:id" element={<DeviceDetailView />} />
         <Route path="network/vlans" element={<VLANsPage />} />
         <Route path="network/vrfs" element={<VRFsPage />} />
+        <Route path="network/vrfs/:id" element={<VRFDetailPage />} />
         <Route path="network/asns" element={<AsnsPage />} />
+        <Route path="network/asns/:id" element={<AsnDetailPage />} />
         <Route
           path="vlans"
           element={<Navigate to="/network/vlans" replace />}
@@ -102,6 +107,7 @@ export default function App() {
         <Route path="admin/api-tokens" element={<ApiTokensPage />} />
         <Route path="admin/alerts" element={<AlertsPage />} />
         <Route path="admin/domains" element={<DomainsPage />} />
+        <Route path="admin/domains/:id" element={<DomainDetailPage />} />
         <Route path="admin/webhooks" element={<WebhooksPage />} />
         <Route path="admin/trash" element={<TrashPage />} />
         <Route

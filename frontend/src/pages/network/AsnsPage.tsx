@@ -1,6 +1,7 @@
 import { useMemo, useState } from "react";
+import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Building2, Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
+import { Building2, Loader2, Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
 
 import {
   asnsApi,
@@ -182,6 +183,110 @@ function ConfirmBulkDeleteModal({
         </div>
       </div>
     </Modal>
+  );
+}
+
+// ── Per-row component (owns the per-row refreshWhois mutation) ───────
+
+function AsnRow({
+  asn: a,
+  selected: sel,
+  onToggle,
+  onEdit,
+}: {
+  asn: ASNRead;
+  selected: boolean;
+  onToggle: () => void;
+  onEdit: () => void;
+}) {
+  const qc = useQueryClient();
+  const refreshMut = useMutation({
+    mutationFn: () => asnsApi.refreshWhois(a.id),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["asns"] });
+    },
+  });
+
+  return (
+    <tr
+      className={`border-b last:border-0 hover:bg-muted/20 ${
+        sel ? "bg-primary/5" : ""
+      }`}
+    >
+      <td className="w-8 px-2 py-2">
+        <input
+          type="checkbox"
+          checked={sel}
+          onChange={onToggle}
+          aria-label={`Select AS${a.number}`}
+        />
+      </td>
+      <td className="whitespace-nowrap px-3 py-2 font-mono">
+        <Link
+          to={`/network/asns/${a.id}`}
+          className="hover:text-primary hover:underline"
+        >
+          AS{a.number}
+        </Link>
+      </td>
+      <td className="whitespace-nowrap px-3 py-2">
+        <Link to={`/network/asns/${a.id}`} className="hover:text-primary">
+          <div className="font-medium">
+            {a.name || <span className="text-muted-foreground">—</span>}
+          </div>
+          {a.description && (
+            <div className="text-[11px] text-muted-foreground">
+              {a.description}
+            </div>
+          )}
+        </Link>
+      </td>
+      <td className="px-3 py-2">
+        <KindBadge kind={a.kind} />
+      </td>
+      <td className="whitespace-nowrap px-3 py-2">
+        {a.holder_org ?? <span className="text-muted-foreground">—</span>}
+      </td>
+      <td className="px-3 py-2">
+        <RegistryBadge registry={a.registry} />
+      </td>
+      <td className="px-3 py-2">
+        <WhoisBadge state={a.whois_state} />
+      </td>
+      <td
+        className="whitespace-nowrap px-3 py-2 text-muted-foreground"
+        title={a.whois_last_checked_at ?? ""}
+      >
+        {humanTime(a.whois_last_checked_at)}
+      </td>
+      <td className="w-16 px-2 py-2 text-right">
+        <div className="inline-flex items-center gap-0.5">
+          <button
+            onClick={() => refreshMut.mutate()}
+            disabled={refreshMut.isPending || a.kind === "private"}
+            title={
+              a.kind === "private"
+                ? "Private ASN — no public WHOIS"
+                : "Refresh WHOIS"
+            }
+            className="inline-flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground disabled:pointer-events-none disabled:opacity-40"
+          >
+            {refreshMut.isPending ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <RefreshCw className="h-[14px] w-[14px]" />
+            )}
+          </button>
+          <button
+            onClick={onEdit}
+            title="Edit ASN"
+            className="inline-flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground"
+          >
+            <Pencil className="h-3 w-3" />
+          </button>
+        </div>
+      </td>
+    </tr>
   );
 }
 
@@ -402,74 +507,19 @@ export function AsnsPage() {
                   <th className="whitespace-nowrap px-3 py-2 text-left font-medium">
                     Last Checked
                   </th>
-                  <th className="w-10 px-2 py-2" />
+                  <th className="w-16 px-2 py-2" />
                 </tr>
               </thead>
               <tbody>
-                {asns.map((a) => {
-                  const sel = selected.has(a.id);
-                  return (
-                    <tr
-                      key={a.id}
-                      className={`border-b last:border-0 hover:bg-muted/20 ${
-                        sel ? "bg-primary/5" : ""
-                      }`}
-                    >
-                      <td className="w-8 px-2 py-2">
-                        <input
-                          type="checkbox"
-                          checked={sel}
-                          onChange={() => toggleOne(a.id)}
-                          aria-label={`Select AS${a.number}`}
-                        />
-                      </td>
-                      <td className="whitespace-nowrap px-3 py-2 font-mono">
-                        AS{a.number}
-                      </td>
-                      <td className="whitespace-nowrap px-3 py-2">
-                        <div className="font-medium">
-                          {a.name || (
-                            <span className="text-muted-foreground">—</span>
-                          )}
-                        </div>
-                        {a.description && (
-                          <div className="text-[11px] text-muted-foreground">
-                            {a.description}
-                          </div>
-                        )}
-                      </td>
-                      <td className="px-3 py-2">
-                        <KindBadge kind={a.kind} />
-                      </td>
-                      <td className="whitespace-nowrap px-3 py-2">
-                        {a.holder_org ?? (
-                          <span className="text-muted-foreground">—</span>
-                        )}
-                      </td>
-                      <td className="px-3 py-2">
-                        <RegistryBadge registry={a.registry} />
-                      </td>
-                      <td className="px-3 py-2">
-                        <WhoisBadge state={a.whois_state} />
-                      </td>
-                      <td
-                        className="whitespace-nowrap px-3 py-2 text-muted-foreground"
-                        title={a.whois_last_checked_at ?? ""}
-                      >
-                        {humanTime(a.whois_last_checked_at)}
-                      </td>
-                      <td className="w-10 px-2 py-2 text-right">
-                        <button
-                          onClick={() => setEditing(a)}
-                          title="Edit ASN"
-                          className="inline-flex h-6 w-6 items-center justify-center rounded text-muted-foreground hover:bg-muted hover:text-foreground"
-                        >
-                          <Pencil className="h-3 w-3" />
-                        </button>
-                      </td>
-                    </tr>
-                  );
-                })}
+                {asns.map((a) => (
+                  <AsnRow
+                    key={a.id}
+                    asn={a}
+                    selected={selected.has(a.id)}
+                    onToggle={() => toggleOne(a.id)}
+                    onEdit={() => setEditing(a)}
+                  />
+                ))}
               </tbody>
             </table>
           )}

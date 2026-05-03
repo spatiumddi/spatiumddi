@@ -10,12 +10,15 @@ import {
   Container as ContainerIcon,
   Cpu,
   FileText,
+  Globe,
   Globe2,
   HardDrive,
+  Hash,
   Layers,
   Network,
   Plug,
   RefreshCw,
+  Route,
   Server,
   Shield,
   Waypoints,
@@ -32,6 +35,9 @@ import {
   proxmoxApi,
   tailscaleApi,
   platformHealthApi,
+  asnsApi,
+  vrfsApi,
+  domainsApi,
   type Subnet,
   type DNSServer,
   type DHCPServer,
@@ -42,6 +48,9 @@ import {
   type TailscaleTenant,
   type PlatformHealthResponse,
   type PlatformHealthStatus,
+  type ASNRead,
+  type VRF,
+  type Domain,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { includeInUtilization } from "@/lib/utilization";
@@ -319,6 +328,373 @@ function humanTime(ts: string): string {
   if (diff < 3600) return `${Math.floor(diff / 60)}m ago`;
   if (diff < 86400) return `${Math.floor(diff / 3600)}h ago`;
   return d.toLocaleDateString();
+}
+
+// ── Status chip ─────────────────────────────────────────────────────────────
+
+function StatusChip({
+  tone,
+  label,
+}: {
+  tone: "green" | "amber" | "red" | "gray";
+  label: string;
+}) {
+  const cls =
+    tone === "green"
+      ? "bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-400"
+      : tone === "amber"
+        ? "bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-400"
+        : tone === "red"
+          ? "bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-400"
+          : "bg-muted text-muted-foreground";
+  return (
+    <span
+      className={cn(
+        "inline-flex items-center rounded-full px-2 py-0.5 text-[10px] font-semibold",
+        cls,
+      )}
+    >
+      {label}
+    </span>
+  );
+}
+
+// ── ASN Summary card ─────────────────────────────────────────────────────────
+
+function AsnSummaryCard() {
+  const { data, isLoading, isError } = useQuery({
+    queryKey: ["asns-summary"],
+    queryFn: () => asnsApi.list({ limit: 200 }),
+    staleTime: 30_000,
+  });
+
+  const inner = (() => {
+    if (isLoading) {
+      return (
+        <div className="mt-3 space-y-2">
+          {[1, 2, 3].map((i) => (
+            <div
+              key={i}
+              className="h-4 animate-pulse rounded bg-muted"
+              style={{ width: `${60 + i * 10}%` }}
+            />
+          ))}
+        </div>
+      );
+    }
+    if (isError) {
+      return (
+        <p className="mt-3 text-xs text-red-600 dark:text-red-400">
+          Failed to load ASN data.
+        </p>
+      );
+    }
+    const asns: ASNRead[] = data?.items ?? [];
+    if (asns.length === 0) {
+      return (
+        <div className="mt-3 flex-1 flex flex-col justify-between">
+          <p className="text-xs text-muted-foreground">No ASNs configured.</p>
+          <Link
+            to="/network/asns"
+            className="mt-2 text-[11px] text-primary hover:underline"
+          >
+            Add one →
+          </Link>
+        </div>
+      );
+    }
+    const publicCount = asns.filter((a) => a.kind === "public").length;
+    const privateCount = asns.filter((a) => a.kind === "private").length;
+    const whoisOk = asns.filter((a) => a.whois_state === "ok").length;
+    const whoisUnreachable = asns.filter(
+      (a) => a.whois_state === "unreachable",
+    ).length;
+
+    // RPKI ROAs — the field is optional (may not exist in all deployments)
+    const allRoas: { state: string }[] = asns.flatMap(
+      (a) => ((a as ASNRead & { rpki_roas?: { state: string }[] }).rpki_roas ?? []),
+    );
+    const roasExpiring = allRoas.filter((r) => r.state === "expiring").length;
+    const roasExpired = allRoas.filter((r) => r.state === "expired").length;
+
+    return (
+      <div className="mt-3 flex-1 flex flex-col justify-between gap-2">
+        <div className="space-y-1.5">
+          <p className="text-xs text-muted-foreground">
+            <span className="font-medium text-foreground">{publicCount}</span>{" "}
+            public,{" "}
+            <span className="font-medium text-foreground">{privateCount}</span>{" "}
+            private
+          </p>
+          <div className="flex flex-wrap items-center gap-1.5">
+            {whoisOk > 0 && (
+              <span className="flex items-center gap-1 text-[11px]">
+                <span className="inline-block h-1.5 w-1.5 rounded-full bg-emerald-500" />
+                <span className="text-emerald-700 dark:text-emerald-400">
+                  {whoisOk} ok
+                </span>
+              </span>
+            )}
+            {whoisUnreachable > 0 && (
+              <span className="flex items-center gap-1 text-[11px]">
+                <span className="inline-block h-1.5 w-1.5 rounded-full bg-red-500" />
+                <span className="text-red-600 dark:text-red-400">
+                  {whoisUnreachable} unreachable
+                </span>
+              </span>
+            )}
+          </div>
+          {(roasExpiring > 0 || roasExpired > 0) && (
+            <div className="flex flex-wrap gap-1">
+              {roasExpiring > 0 && (
+                <StatusChip
+                  tone="amber"
+                  label={`${roasExpiring} ROA${roasExpiring === 1 ? "" : "s"} expiring`}
+                />
+              )}
+              {roasExpired > 0 && (
+                <StatusChip
+                  tone="red"
+                  label={`${roasExpired} ROA${roasExpired === 1 ? "" : "s"} expired`}
+                />
+              )}
+            </div>
+          )}
+        </div>
+        <Link
+          to="/network/asns"
+          className="text-[11px] text-muted-foreground hover:text-foreground"
+        >
+          View all →
+        </Link>
+      </div>
+    );
+  })();
+
+  return (
+    <div className="rounded-lg border bg-card p-4 flex flex-col">
+      <div className="flex items-center justify-between">
+        <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+          ASNs
+        </p>
+        <Hash className="h-3.5 w-3.5 text-muted-foreground" />
+      </div>
+      {!isLoading && !isError && (data?.items?.length ?? 0) > 0 && (
+        <p className="mt-1.5 text-2xl font-bold tabular-nums">
+          {data?.total ?? data?.items?.length ?? 0}
+        </p>
+      )}
+      {inner}
+    </div>
+  );
+}
+
+// ── VRF Summary card ─────────────────────────────────────────────────────────
+
+function VrfSummaryCard() {
+  const { data: vrfs = [], isLoading, isError } = useQuery<VRF[]>({
+    queryKey: ["vrfs-summary"],
+    queryFn: () => vrfsApi.list(),
+    staleTime: 30_000,
+  });
+
+  const inner = (() => {
+    if (isLoading) {
+      return (
+        <div className="mt-3 space-y-2">
+          {[1, 2].map((i) => (
+            <div
+              key={i}
+              className="h-4 animate-pulse rounded bg-muted"
+              style={{ width: `${55 + i * 15}%` }}
+            />
+          ))}
+        </div>
+      );
+    }
+    if (isError) {
+      return (
+        <p className="mt-3 text-xs text-red-600 dark:text-red-400">
+          Failed to load VRF data.
+        </p>
+      );
+    }
+    if (vrfs.length === 0) {
+      return (
+        <div className="mt-3 flex-1 flex flex-col justify-between">
+          <p className="text-xs text-muted-foreground">No VRFs configured.</p>
+          <Link
+            to="/network/vrfs"
+            className="mt-2 text-[11px] text-primary hover:underline"
+          >
+            Add one →
+          </Link>
+        </div>
+      );
+    }
+    const missingRd = vrfs.filter(
+      (v) => !v.route_distinguisher || v.route_distinguisher.trim() === "",
+    ).length;
+    const unlinked = vrfs.filter((v) => v.asn_id === null).length;
+
+    return (
+      <div className="mt-3 flex-1 flex flex-col justify-between gap-2">
+        <div className="flex flex-wrap gap-1">
+          {missingRd > 0 && (
+            <StatusChip
+              tone="amber"
+              label={`${missingRd} missing RD`}
+            />
+          )}
+          {unlinked > 0 && (
+            <StatusChip
+              tone="gray"
+              label={`${unlinked} unlinked (no ASN)`}
+            />
+          )}
+          {missingRd === 0 && unlinked === 0 && (
+            <StatusChip tone="green" label="all linked" />
+          )}
+        </div>
+        <Link
+          to="/network/vrfs"
+          className="text-[11px] text-muted-foreground hover:text-foreground"
+        >
+          View all →
+        </Link>
+      </div>
+    );
+  })();
+
+  return (
+    <div className="rounded-lg border bg-card p-4 flex flex-col">
+      <div className="flex items-center justify-between">
+        <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+          VRFs
+        </p>
+        <Route className="h-3.5 w-3.5 text-muted-foreground" />
+      </div>
+      {!isLoading && !isError && vrfs.length > 0 && (
+        <p className="mt-1.5 text-2xl font-bold tabular-nums">{vrfs.length}</p>
+      )}
+      {inner}
+    </div>
+  );
+}
+
+// ── Domains Summary card ──────────────────────────────────────────────────────
+
+function DomainsSummaryCard() {
+  const { data, isLoading, isError } = useQuery({
+    queryKey: ["domains-summary"],
+    queryFn: () => domainsApi.list({ page_size: 200 }),
+    staleTime: 30_000,
+  });
+
+  const inner = (() => {
+    if (isLoading) {
+      return (
+        <div className="mt-3 space-y-2">
+          {[1, 2, 3].map((i) => (
+            <div
+              key={i}
+              className="h-4 animate-pulse rounded bg-muted"
+              style={{ width: `${50 + i * 12}%` }}
+            />
+          ))}
+        </div>
+      );
+    }
+    if (isError) {
+      return (
+        <p className="mt-3 text-xs text-red-600 dark:text-red-400">
+          Failed to load domain data.
+        </p>
+      );
+    }
+    const domains: Domain[] = data?.items ?? [];
+    if (domains.length === 0) {
+      return (
+        <div className="mt-3 flex-1 flex flex-col justify-between">
+          <p className="text-xs text-muted-foreground">No domains configured.</p>
+          <Link
+            to="/admin/domains"
+            className="mt-2 text-[11px] text-primary hover:underline"
+          >
+            Add one →
+          </Link>
+        </div>
+      );
+    }
+
+    const now = Date.now();
+    const thirtyDaysMs = 30 * 24 * 60 * 60 * 1000;
+    const expired = domains.filter(
+      (d) => d.expires_at && new Date(d.expires_at).getTime() < now,
+    ).length;
+    const expiringSoon = domains.filter((d) => {
+      if (!d.expires_at) return false;
+      const exp = new Date(d.expires_at).getTime();
+      return exp >= now && exp - now < thirtyDaysMs;
+    }).length;
+    const healthy = domains.length - expired - expiringSoon;
+    const driftCount = domains.filter((d) => d.nameserver_drift).length;
+
+    return (
+      <div className="mt-3 flex-1 flex flex-col justify-between gap-2">
+        <div className="space-y-1.5">
+          <div className="flex flex-wrap gap-1">
+            {expired > 0 && (
+              <StatusChip
+                tone="red"
+                label={`${expired} expired`}
+              />
+            )}
+            {expiringSoon > 0 && (
+              <StatusChip
+                tone="amber"
+                label={`${expiringSoon} expiring soon`}
+              />
+            )}
+            {healthy > 0 && (
+              <StatusChip tone="green" label={`${healthy} healthy`} />
+            )}
+          </div>
+          {driftCount > 0 && (
+            <div>
+              <StatusChip
+                tone="amber"
+                label={`${driftCount} NS drift detected`}
+              />
+            </div>
+          )}
+        </div>
+        <Link
+          to="/admin/domains"
+          className="text-[11px] text-muted-foreground hover:text-foreground"
+        >
+          View all →
+        </Link>
+      </div>
+    );
+  })();
+
+  return (
+    <div className="rounded-lg border bg-card p-4 flex flex-col">
+      <div className="flex items-center justify-between">
+        <p className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+          Domains
+        </p>
+        <Globe className="h-3.5 w-3.5 text-muted-foreground" />
+      </div>
+      {!isLoading && !isError && (data?.items?.length ?? 0) > 0 && (
+        <p className="mt-1.5 text-2xl font-bold tabular-nums">
+          {data?.total ?? data?.items?.length ?? 0}
+        </p>
+      )}
+      {inner}
+    </div>
+  );
 }
 
 // ── Page ────────────────────────────────────────────────────────────────────
@@ -696,6 +1072,15 @@ export function DashboardPage() {
             tone={unhealthyServers > 0 ? "bad" : "default"}
           />
         </div>
+
+        {/* ── Network overview cards (Overview tab) ─────────────────── */}
+        {tab === "overview" && (
+          <div className="grid gap-3 grid-cols-1 sm:grid-cols-3">
+            <AsnSummaryCard />
+            <VrfSummaryCard />
+            <DomainsSummaryCard />
+          </div>
+        )}
 
         {/* ── DNS query rate (DNS tab only) ──────────────────────────── */}
         {tab === "dns" && <DNSQueryRateCard dnsServers={allDnsServers} />}

@@ -196,9 +196,11 @@ export interface IPSpace {
   // ignores these. ``route_targets`` is an array of strings so the
   // operator can encode the inline import:A:B; export:C:D convention
   // until first-class import / export columns land.
+  vrf_id?: string | null;
   vrf_name?: string | null;
   route_distinguisher?: string | null;
   route_targets?: string[] | null;
+  asn_id?: string | null;
   created_at?: string;
   modified_at?: string;
 }
@@ -227,6 +229,8 @@ export interface IPBlock {
   ddns_domain_override?: string | null;
   ddns_ttl?: number | null;
   ddns_inherit_settings?: boolean;
+  vrf_id?: string | null;
+  asn_id?: string | null;
   created_at?: string;
   modified_at?: string;
 }
@@ -1725,6 +1729,10 @@ export interface PlatformSettings {
    *  effect on the next tick without restarting beat. 1–168 h range
    *  enforced server-side. */
   domain_whois_interval_hours: number;
+  asn_whois_interval_hours: number;
+  rpki_roa_source: string;
+  rpki_roa_refresh_interval_hours: number;
+  vrf_strict_rd_validation: boolean;
   /** Read-only — true when an encrypted fingerbank API key is on file.
    *  The plaintext is never returned. Submit a value via
    *  ``fingerbank_api_key`` on the update payload to set or clear it
@@ -5731,6 +5739,20 @@ export interface ASNRead {
   modified_at: string;
 }
 
+export type ASNRpkiRoaState = "valid" | "expiring" | "expired" | "invalid";
+
+export interface ASNRpkiRoa {
+  id: string;
+  asn_id: string;
+  prefix: string;
+  max_length: number;
+  valid_from: string | null;
+  valid_to: string | null;
+  trust_anchor: string;
+  state: ASNRpkiRoaState;
+  last_checked_at: string | null;
+}
+
 export interface ASNListResponse {
   items: ASNRead[];
   total: number;
@@ -5773,6 +5795,10 @@ export const asnsApi = {
   update: (id: string, data: ASNUpdate) =>
     api.put<ASNRead>(`/asns/${id}`, data).then((r) => r.data),
   remove: (id: string) => api.delete(`/asns/${id}`),
+  refreshWhois: (id: string) =>
+    api.post<ASNRead>(`/asns/${id}/refresh-whois`).then((r) => r.data),
+  getRpkiRoas: (id: string) =>
+    api.get<ASNRpkiRoa[]>(`/asns/${id}/rpki-roas`).then((r) => r.data),
   bulkDelete: (ids: string[]) =>
     api
       .post<{ deleted: number; not_found: string[] }>("/asns/bulk-delete", {

@@ -1182,6 +1182,7 @@ class IPSpaceCreate(BaseModel):
     vrf_name: str | None = None
     route_distinguisher: str | None = None
     route_targets: list[str] | None = None
+    asn_id: uuid.UUID | None = None
 
     @field_validator("color")
     @classmethod
@@ -1219,6 +1220,7 @@ class IPSpaceUpdate(BaseModel):
     vrf_name: str | None = None
     route_distinguisher: str | None = None
     route_targets: list[str] | None = None
+    asn_id: uuid.UUID | None = None
 
     @field_validator("color")
     @classmethod
@@ -1250,9 +1252,11 @@ class IPSpaceResponse(BaseModel):
     ddns_hostname_policy: str = "client_or_generated"
     ddns_domain_override: str | None = None
     ddns_ttl: int | None = None
+    vrf_id: uuid.UUID | None = None
     vrf_name: str | None = None
     route_distinguisher: str | None = None
     route_targets: list[str] | None = None
+    asn_id: uuid.UUID | None = None
     created_at: datetime
     modified_at: datetime
 
@@ -1283,6 +1287,7 @@ class IPBlockCreate(BaseModel):
     ddns_domain_override: str | None = None
     ddns_ttl: int | None = None
     ddns_inherit_settings: bool = True
+    asn_id: uuid.UUID | None = None
 
     @field_validator("network")
     @classmethod
@@ -1320,6 +1325,7 @@ class IPBlockUpdate(BaseModel):
     ddns_domain_override: str | None = None
     ddns_ttl: int | None = None
     ddns_inherit_settings: bool | None = None
+    asn_id: uuid.UUID | None = None
 
     @field_validator("ddns_hostname_policy")
     @classmethod
@@ -1355,6 +1361,7 @@ class IPBlockResponse(BaseModel):
     # 2 cross-cutting validation). ``None`` when both VRFs match or
     # at least one is unset.
     vrf_warning: str | None = None
+    asn_id: uuid.UUID | None = None
     created_at: datetime
     modified_at: datetime
 

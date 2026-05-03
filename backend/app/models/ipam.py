@@ -134,6 +134,14 @@ class IPSpace(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     # DEPRECATED — drop after one release cycle, see issue #86.
     route_targets: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
 
+    # Optional BGP origin (issue #85). NULL = "no AS recorded".
+    asn_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("asn.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
     blocks: Mapped[list["IPBlock"]] = relationship(
         "IPBlock", back_populates="space", cascade="all, delete-orphan"
     )
@@ -270,6 +278,15 @@ class IPBlock(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     vrf_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("vrf.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    # Optional BGP origin (issue #85). NULL = "inherit from the
+    # parent block (recurse) or ultimately from the IPSpace".
+    asn_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("asn.id", ondelete="SET NULL"),
         nullable=True,
         index=True,
     )

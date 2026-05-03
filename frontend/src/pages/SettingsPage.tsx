@@ -90,6 +90,9 @@ type SectionId =
   | "ip-allocation"
   | "oui-lookup"
   | "device-profiling"
+  | "network-asn"
+  | "network-domains"
+  | "network-vrf"
   | "session"
   | "subnet-tree"
   | "updates"
@@ -101,6 +104,7 @@ type SectionGroup =
   | "IPAM"
   | "DNS"
   | "DHCP"
+  | "Network"
   | "Integrations";
 
 interface SectionDef {
@@ -121,6 +125,7 @@ const GROUP_ORDER: SectionGroup[] = [
   "IPAM",
   "DNS",
   "DHCP",
+  "Network",
   "Integrations",
 ];
 
@@ -167,6 +172,13 @@ const SECTION_FIELDS: Record<SectionId, (keyof PlatformSettings)[]> = {
   "ip-allocation": ["ip_allocation_strategy"],
   "oui-lookup": ["oui_lookup_enabled", "oui_update_interval_hours"],
   "device-profiling": ["fingerbank_api_key"],
+  "network-asn": [
+    "asn_whois_interval_hours",
+    "rpki_roa_source",
+    "rpki_roa_refresh_interval_hours",
+  ],
+  "network-domains": ["domain_whois_interval_hours"],
+  "network-vrf": ["vrf_strict_rd_validation"],
   session: ["session_timeout_minutes", "auto_logout_minutes"],
   "subnet-tree": ["subnet_tree_default_expanded_depth"],
   updates: ["github_release_check_enabled"],
@@ -790,6 +802,51 @@ const SECTIONS: SectionDef[] = [
       "mirror",
       "additive",
       "auto",
+    ],
+  },
+
+  // ── Network ──────────────────────────────────────────────────────────
+  {
+    id: "network-asn",
+    title: "ASN Refresh",
+    group: "Network",
+    description:
+      "Cadence for the RDAP / WHOIS refresh of tracked ASNs and the RPKI ROA pull. Beat ticks hourly; the tasks gate on per-row next_check_at + the platform-level interval below, so cadence changes take effect on the next tick without restarting beat.",
+    keywords: [
+      "asn",
+      "autonomous system",
+      "rdap",
+      "whois",
+      "rpki",
+      "roa",
+      "cloudflare",
+      "ripe",
+      "bgp",
+      "interval",
+    ],
+  },
+  {
+    id: "network-domains",
+    title: "Domain Refresh",
+    group: "Network",
+    description:
+      "Cadence for the RDAP / WHOIS refresh of tracked domain registrations. Per-row next_check_at gates against this knob.",
+    keywords: ["domain", "rdap", "whois", "registrar", "refresh", "expiry"],
+  },
+  {
+    id: "network-vrf",
+    title: "VRF Validation",
+    group: "Network",
+    description:
+      "Strict mode for VRF route distinguisher / route target validation. When off, ASN-portion mismatches between an RD/RT and the VRF's linked ASN produce a non-blocking warning. When on, the same mismatch is a 422 hard-fail on create / update.",
+    keywords: [
+      "vrf",
+      "route distinguisher",
+      "route target",
+      "rd",
+      "rt",
+      "validation",
+      "strict",
     ],
   },
 
@@ -1516,6 +1573,112 @@ export function SettingsPage() {
                 isSuperadmin={isSuperadmin}
                 inputCls={inputCls}
               />
+            )}
+
+            {activeId === "network-asn" && (
+              <>
+                <Field
+                  label="ASN WHOIS / RDAP refresh interval"
+                  description="How often each tracked ASN re-queries RDAP for registration data. Per-ASN gating on next_check_at — bumping this knob is the dial for the global cadence; one-off refresh is available from the per-row button on the ASNs page. 1–168 h range."
+                >
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="number"
+                      min={1}
+                      max={168}
+                      value={values.asn_whois_interval_hours ?? 24}
+                      onChange={(e) =>
+                        set(
+                          "asn_whois_interval_hours",
+                          Number(e.target.value),
+                        )
+                      }
+                      disabled={!isSuperadmin}
+                      className={cn(inputCls, "w-24")}
+                    />
+                    <span className="text-xs text-muted-foreground">hours</span>
+                  </div>
+                </Field>
+                <Field
+                  label="RPKI ROA source"
+                  description="Source for the global RPKI ROA dump that feeds per-ASN ROA tracking. Cloudflare's mirror is the default — it caches well, refreshes every ~20 min, and ships JSON. RIPE NCC is the authoritative source if you'd rather skip the Cloudflare hop."
+                >
+                  <select
+                    value={values.rpki_roa_source ?? "cloudflare"}
+                    onChange={(e) => set("rpki_roa_source", e.target.value)}
+                    disabled={!isSuperadmin}
+                    className={inputCls}
+                  >
+                    <option value="cloudflare">Cloudflare (default)</option>
+                    <option value="ripe">RIPE NCC</option>
+                  </select>
+                </Field>
+                <Field
+                  label="RPKI ROA refresh interval"
+                  description="How often the global ROA dump is re-pulled and per-ASN rows are reconciled (INSERT / UPDATE / DELETE + state transitions). The source service caches the dump in-memory for 5 min, so values below 1 h still hit cache where possible. 1–24 h range."
+                >
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="number"
+                      min={1}
+                      max={24}
+                      value={values.rpki_roa_refresh_interval_hours ?? 4}
+                      onChange={(e) =>
+                        set(
+                          "rpki_roa_refresh_interval_hours",
+                          Number(e.target.value),
+                        )
+                      }
+                      disabled={!isSuperadmin}
+                      className={cn(inputCls, "w-24")}
+                    />
+                    <span className="text-xs text-muted-foreground">hours</span>
+                  </div>
+                </Field>
+              </>
+            )}
+
+            {activeId === "network-domains" && (
+              <Field
+                label="Domain WHOIS / RDAP refresh interval"
+                description="How often each tracked domain re-queries RDAP for registrar / expiry / nameserver data. Per-domain gating on next_check_at; one-off refresh is on the per-row button. 1–168 h range."
+              >
+                <div className="flex items-center gap-2">
+                  <input
+                    type="number"
+                    min={1}
+                    max={168}
+                    value={values.domain_whois_interval_hours ?? 24}
+                    onChange={(e) =>
+                      set(
+                        "domain_whois_interval_hours",
+                        Number(e.target.value),
+                      )
+                    }
+                    disabled={!isSuperadmin}
+                    className={cn(inputCls, "w-24")}
+                  />
+                  <span className="text-xs text-muted-foreground">hours</span>
+                </div>
+              </Field>
+            )}
+
+            {activeId === "network-vrf" && (
+              <Field
+                label="Strict RD / RT validation"
+                description="When ON, an ASN:N route distinguisher (or any ASN:N entry in import / export route-target lists) whose ASN portion does not match the VRF's linked ASN row returns 422 — the create / update is rejected outright. When OFF (default), the same mismatch is a non-blocking warning on the response and the row still saves. Flip ON for shops that want strict cross-cutting validation; leave OFF if you regularly carry partner / customer RDs that intentionally don't match your local AS."
+              >
+                <div className="flex items-center gap-3">
+                  <Toggle
+                    checked={!!values.vrf_strict_rd_validation}
+                    onChange={(v) => set("vrf_strict_rd_validation", v)}
+                    disabled={!isSuperadmin}
+                  />
+                  <span className="text-sm text-muted-foreground">
+                    {values.vrf_strict_rd_validation ? "Strict" : "Warn only"}
+                  </span>
+                </div>
+              </Field>
             )}
 
             {activeId === "session" && (

@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   CheckCircle2,
@@ -596,7 +597,14 @@ function DomainRow({
             )}
           </button>
         </td>
-        <td className="px-3 py-2 font-medium">{domain.name}</td>
+        <td className="px-3 py-2 font-medium">
+          <Link
+            to={`/admin/domains/${domain.id}`}
+            className="hover:text-primary hover:underline"
+          >
+            {domain.name}
+          </Link>
+        </td>
         <td className="px-3 py-2 text-muted-foreground">
           {domain.registrar ?? "—"}
         </td>
