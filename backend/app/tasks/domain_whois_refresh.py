@@ -70,9 +70,7 @@ async def _refresh_due_async() -> dict[str, Any]:
     """
     async with task_session() as db:
         ps = await db.get(PlatformSettings, _SINGLETON_ID)
-        interval_hours = _clamp_interval(
-            ps.domain_whois_interval_hours if ps is not None else None
-        )
+        interval_hours = _clamp_interval(ps.domain_whois_interval_hours if ps is not None else None)
 
         now = datetime.now(UTC)
 
@@ -83,9 +81,7 @@ async def _refresh_due_async() -> dict[str, Any]:
             (
                 await db.execute(
                     select(Domain)
-                    .where(
-                        or_(Domain.next_check_at.is_(None), Domain.next_check_at <= now)
-                    )
+                    .where(or_(Domain.next_check_at.is_(None), Domain.next_check_at <= now))
                     .order_by(Domain.next_check_at.asc().nulls_first())
                 )
             )

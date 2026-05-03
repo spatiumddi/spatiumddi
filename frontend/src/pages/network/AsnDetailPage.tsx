@@ -15,13 +15,14 @@ import {
   ipamApi,
   type ASNRpkiRoaState,
   type AlertSeverity,
+  type BGPRelationshipType,
 } from "@/lib/api";
 import { HeaderButton } from "@/components/ui/header-button";
 import { cn } from "@/lib/utils";
 
 import { errMsg, humanTime } from "./_shared";
 
-type Tab = "whois" | "rpki" | "ipam" | "alerts";
+type Tab = "whois" | "rpki" | "bgp" | "ipam" | "alerts";
 
 // ── Badges ───────────────────────────────────────────────────────────
 
@@ -105,6 +106,37 @@ function SeverityBadge({ severity }: { severity: AlertSeverity }) {
   );
 }
 
+// ── BGP relationship helpers ──────────────────────────────────────────
+
+const RELATIONSHIP_COLOR: Record<BGPRelationshipType, string> = {
+  peer: "bg-sky-500/15 text-sky-700 dark:text-sky-400",
+  customer: "bg-emerald-500/15 text-emerald-700 dark:text-emerald-400",
+  provider: "bg-violet-500/15 text-violet-700 dark:text-violet-400",
+  sibling: "bg-amber-500/15 text-amber-700 dark:text-amber-400",
+};
+
+function RelationshipBadge({
+  relationship,
+}: {
+  relationship: BGPRelationshipType;
+}) {
+  return (
+    <span
+      className={cn(PILL_BASE, RELATIONSHIP_COLOR[relationship], "capitalize")}
+    >
+      {relationship}
+    </span>
+  );
+}
+
+// From the *peer's* point of view, customer ↔ provider invert; peer
+// and sibling are symmetric.
+function invertRelationship(r: BGPRelationshipType): BGPRelationshipType {
+  if (r === "customer") return "provider";
+  if (r === "provider") return "customer";
+  return r;
+}
+
 // ── Page ─────────────────────────────────────────────────────────────
 
 export function AsnDetailPage() {
@@ -134,6 +166,12 @@ export function AsnDetailPage() {
     queryKey: ["asn-rpki-roas", id],
     queryFn: () => asnsApi.getRpkiRoas(id),
     enabled: !!id && tab === "rpki",
+  });
+
+  const { data: peerings = [] } = useQuery({
+    queryKey: ["asn-peerings", id],
+    queryFn: () => asnsApi.listPeerings({ asn_id: id }),
+    enabled: !!id && tab === "bgp",
   });
 
   const { data: spaces } = useQuery({
@@ -178,6 +216,15 @@ export function AsnDetailPage() {
 
   const whoisRaw =
     typeof asn.whois_data?.raw === "string" ? asn.whois_data.raw : null;
+  const previousHolder =
+    typeof asn.whois_data?.previous_holder === "string"
+      ? (asn.whois_data.previous_holder as string)
+      : null;
+  const showHolderDriftDiff =
+    asn.whois_state === "drift" &&
+    !!previousHolder &&
+    !!asn.holder_org &&
+    previousHolder !== asn.holder_org;
 
   const sortedRoas = roas
     ? [...roas].sort((a, b) => {
@@ -210,6 +257,7 @@ export function AsnDetailPage() {
   const TABS: Array<[Tab, string]> = [
     ["whois", "WHOIS"],
     ["rpki", "RPKI ROAs"],
+    ["bgp", "BGP Peering"],
     ["ipam", "IP Spaces / Blocks"],
     ["alerts", "Alert History"],
   ];
@@ -298,6 +346,39 @@ export function AsnDetailPage() {
               <div className="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-sm text-amber-700 dark:text-amber-300">
                 <AlertTriangle className="mt-0.5 h-4 w-4 flex-shrink-0" />
                 RDAP lookup failed — check connectivity
+              </div>
+            )}
+
+            {showHolderDriftDiff && (
+              <div className="rounded-md border border-rose-500/40 bg-rose-500/5 p-4">
+                <div className="mb-3 flex items-center gap-2 text-sm font-medium text-rose-700 dark:text-rose-300">
+                  <AlertTriangle className="h-4 w-4 flex-shrink-0" />
+                  Holder drift detected
+                </div>
+                <div className="grid gap-3 sm:grid-cols-2">
+                  <div>
+                    <p className="mb-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+                      Previous holder
+                    </p>
+                    <p className="rounded border bg-muted/30 px-3 py-2 text-sm font-mono">
+                      {previousHolder}
+                    </p>
+                  </div>
+                  <div>
+                    <p className="mb-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+                      Current holder
+                    </p>
+                    <p className="rounded border border-rose-300 bg-rose-50/50 px-3 py-2 text-sm font-mono dark:border-rose-800 dark:bg-rose-950/20">
+                      {asn.holder_org}
+                    </p>
+                  </div>
+                </div>
+                {asn.whois_last_checked_at && (
+                  <p className="mt-3 text-[11px] text-muted-foreground">
+                    Detected at{" "}
+                    {new Date(asn.whois_last_checked_at).toLocaleString()}
+                  </p>
+                )}
               </div>
             )}
 
@@ -395,6 +476,73 @@ export function AsnDetailPage() {
                   ))}
                 </tbody>
               </table>
+            )}
+          </div>
+        )}
+
+        {tab === "bgp" && (
+          <div className="space-y-3">
+            {peerings.length === 0 ? (
+              <p className="text-xs text-muted-foreground">
+                No BGP peerings recorded for this ASN. Add them via{" "}
+                <code className="rounded bg-muted px-1 py-0.5">
+                  POST /api/v1/asns/peerings
+                </code>{" "}
+                — UI editor to follow.
+              </p>
+            ) : (
+              <div className="rounded-lg border">
+                <table className="w-full text-xs">
+                  <thead className="bg-muted/30">
+                    <tr className="border-b">
+                      <th className="px-3 py-2 text-left font-medium">
+                        Direction
+                      </th>
+                      <th className="px-3 py-2 text-left font-medium">
+                        Counterparty
+                      </th>
+                      <th className="px-3 py-2 text-left font-medium">
+                        Relationship
+                      </th>
+                      <th className="px-3 py-2 text-left font-medium">
+                        Description
+                      </th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {peerings.map((p) => {
+                      const isLocal = p.local_asn_id === id;
+                      const counterAs = isLocal
+                        ? `AS${p.peer_asn_number}${p.peer_asn_name ? " — " + p.peer_asn_name : ""}`
+                        : `AS${p.local_asn_number}${p.local_asn_name ? " — " + p.local_asn_name : ""}`;
+                      const rel = isLocal
+                        ? p.relationship_type
+                        : invertRelationship(p.relationship_type);
+                      return (
+                        <tr key={p.id} className="border-b last:border-b-0">
+                          <td className="px-3 py-2 text-muted-foreground">
+                            {isLocal ? "→ outbound" : "← inbound"}
+                          </td>
+                          <td className="px-3 py-2 font-mono">
+                            <Link
+                              to={`/network/asns/${isLocal ? p.peer_asn_id : p.local_asn_id}`}
+                              className="hover:text-primary hover:underline"
+                            >
+                              {counterAs}
+                            </Link>
+                          </td>
+                          <td className="px-3 py-2">
+                            <RelationshipBadge relationship={rel} />
+                          </td>
+                          <td className="px-3 py-2 text-muted-foreground">
+                            {p.description || "—"}
+                          </td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+              </div>
             )}
           </div>
         )}

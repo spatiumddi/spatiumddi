@@ -22,6 +22,16 @@ class Router(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     model: Mapped[str | None] = mapped_column(String(100), nullable=True)
     notes: Mapped[str] = mapped_column(Text, nullable=False, default="")
 
+    # Optional BGP origin (issue #85). Stamps which AS this router
+    # originates routes from. Pairs with the ``bgp_peering`` graph
+    # so a router's neighbours can be derived from its ``local_asn``.
+    local_asn_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("asn.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
     vlans: Mapped[list["VLAN"]] = relationship(
         "VLAN", back_populates="router", cascade="all, delete-orphan"
     )

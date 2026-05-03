@@ -45,6 +45,7 @@ import { HeaderButton } from "@/components/ui/header-button";
 import {
   dnsApi,
   dnsBlocklistApi,
+  domainsApi,
   formatApiError,
   type DNSServerGroup,
   type DNSServer,
@@ -1180,6 +1181,14 @@ function ZoneModal({
     (zone?.forwarders ?? []).join(", "),
   );
   const [forwardOnly, setForwardOnly] = useState(zone?.forward_only ?? true);
+  const [domainId, setDomainId] = useState<string | null>(
+    zone?.domain_id ?? null,
+  );
+  const { data: domainList } = useQuery({
+    queryKey: ["domains-picker"],
+    queryFn: () => domainsApi.list({ page_size: 500 }),
+    staleTime: 60_000,
+  });
   const [error, setError] = useState("");
 
   const mut = useMutation({
@@ -1207,6 +1216,7 @@ function ZoneModal({
       ttl: parseInt(ttl, 10),
       dnssec_enabled: dnssec,
       color,
+      domain_id: domainId,
     };
     if (zoneType === "forward") {
       const fwds = forwardersText
@@ -1356,6 +1366,26 @@ function ZoneModal({
         </div>
         <Field label="Color">
           <SwatchPicker value={color} onChange={setColor} />
+        </Field>
+        <Field label="Linked Domain (optional)">
+          <select
+            className={inputCls}
+            value={domainId ?? ""}
+            onChange={(e) => setDomainId(e.target.value || null)}
+          >
+            <option value="">— Auto-match by zone name —</option>
+            {(domainList?.items ?? []).map((d) => (
+              <option key={d.id} value={d.id}>
+                {d.name}
+                {d.registrar ? ` — ${d.registrar}` : ""}
+              </option>
+            ))}
+          </select>
+          <p className="mt-1 text-[11px] text-muted-foreground">
+            Pin to a tracked domain registration so the Domain detail page
+            surfaces it under "Linked DNS Zones". Auto-matches by name when
+            left blank.
+          </p>
         </Field>
         {error && <p className="text-sm text-destructive">{error}</p>}
         <Btns

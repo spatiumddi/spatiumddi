@@ -72,6 +72,7 @@ import { useStickyLocation } from "@/lib/stickyLocation";
 import { useSessionState } from "@/lib/useSessionState";
 import { useRowHighlight } from "@/lib/useRowHighlight";
 import { Modal } from "@/components/ui/modal";
+import { AsnPicker } from "@/components/ipam/asn-picker";
 import {
   MODAL_BACKDROP_CLS,
   useDraggableModal,
@@ -528,6 +529,7 @@ function CreateSpaceModal({ onClose }: { onClose: () => void }) {
   const [vrfName, setVrfName] = useState<string>("");
   const [routeDistinguisher, setRouteDistinguisher] = useState<string>("");
   const [routeTargetsText, setRouteTargetsText] = useState<string>("");
+  const [asnId, setAsnId] = useState<string | null>(null);
 
   const mutation = useMutation({
     mutationFn: () => {
@@ -547,6 +549,7 @@ function CreateSpaceModal({ onClose }: { onClose: () => void }) {
         vrf_name: vrfName.trim() || null,
         route_distinguisher: routeDistinguisher.trim() || null,
         route_targets: trimmedRTs.length > 0 ? trimmedRTs : null,
+        asn_id: asnId,
       });
     },
     onSuccess: () => {
@@ -648,6 +651,13 @@ function CreateSpaceModal({ onClose }: { onClose: () => void }) {
                   value={routeTargetsText}
                   onChange={(e) => setRouteTargetsText(e.target.value)}
                   placeholder={"import:65000:100\nexport:65000:200"}
+                />
+              </Field>
+              <Field label="Origin ASN (BGP)">
+                <AsnPicker
+                  className={inputCls}
+                  value={asnId}
+                  onChange={setAsnId}
                 />
               </Field>
               <p className="text-xs text-muted-foreground">
@@ -7959,6 +7969,7 @@ function EditSpaceModal({
   const [routeTargetsText, setRouteTargetsText] = useState<string>(
     (space.route_targets ?? []).join("\n"),
   );
+  const [asnId, setAsnId] = useState<string | null>(space.asn_id ?? null);
 
   const saveMutation = useMutation({
     mutationFn: () => {
@@ -7977,6 +7988,7 @@ function EditSpaceModal({
         vrf_name: vrfName.trim() || null,
         route_distinguisher: routeDistinguisher.trim() || null,
         route_targets: showVrf ? trimmedRTs : null,
+        asn_id: asnId,
       });
     },
     onSuccess: () => {
@@ -8185,6 +8197,13 @@ function EditSpaceModal({
                   placeholder={"import:65000:100\nexport:65000:200"}
                 />
               </Field>
+              <Field label="Origin ASN (BGP)">
+                <AsnPicker
+                  className={inputCls}
+                  value={asnId}
+                  onChange={setAsnId}
+                />
+              </Field>
               <p className="text-xs text-muted-foreground">
                 Pure annotation — address allocation does not consult these
                 fields. Different VRFs with overlapping IPs already work via
@@ -8331,6 +8350,7 @@ function CreateBlockModal({
   const [dhcpServerGroupId, setDhcpServerGroupId] = useState<string | null>(
     null,
   );
+  const [asnId, setAsnId] = useState<string | null>(null);
 
   const { data: existingBlocks } = useQuery({
     queryKey: ["blocks", spaceId],
@@ -8365,6 +8385,7 @@ function CreateBlockModal({
             }),
         dhcp_inherit_settings: dhcpInherit,
         ...(dhcpInherit ? {} : { dhcp_server_group_id: dhcpServerGroupId }),
+        asn_id: asnId,
       }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["blocks", spaceId] });
@@ -8455,6 +8476,15 @@ function CreateBlockModal({
             fallbackSpaceId={!parentBlockId ? spaceId : null}
           />
         </div>
+        <div className="border-t pt-3">
+          <Field label="Origin ASN (BGP, optional)">
+            <AsnPicker
+              className={inputCls}
+              value={asnId}
+              onChange={setAsnId}
+            />
+          </Field>
+        </div>
         {error && <p className="text-xs text-destructive">{error}</p>}
         <div className="flex justify-end gap-2 pt-2">
           <button
@@ -8520,6 +8550,7 @@ function EditBlockModal({
   const [dhcpServerGroupId, setDhcpServerGroupId] = useState<string | null>(
     block.dhcp_server_group_id ?? null,
   );
+  const [asnId, setAsnId] = useState<string | null>(block.asn_id ?? null);
 
   const { data: cfDefs = [] } = useQuery({
     queryKey: ["custom-fields", "ip_block"],
@@ -8582,6 +8613,7 @@ function EditBlockModal({
         dns_additional_zone_ids: dnsInherit ? null : dnsAdditionalZoneIds,
         dhcp_inherit_settings: dhcpInherit,
         dhcp_server_group_id: dhcpInherit ? null : dhcpServerGroupId,
+        asn_id: asnId,
       }),
     onSuccess: (updated) => {
       qc.invalidateQueries({ queryKey: ["blocks", block.space_id] });
@@ -8756,6 +8788,15 @@ function EditBlockModal({
               !block.parent_block_id ? block.space_id : undefined
             }
           />
+        </div>
+        <div className="border-t pt-3">
+          <Field label="Origin ASN (BGP, optional)">
+            <AsnPicker
+              className={inputCls}
+              value={asnId}
+              onChange={setAsnId}
+            />
+          </Field>
         </div>
         {error && <p className="text-xs text-destructive">{error}</p>}
         <div className="flex justify-end gap-2 pt-2">

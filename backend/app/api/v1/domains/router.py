@@ -352,9 +352,7 @@ async def update_domain(
     # list-page badge reflects the operator's edit immediately —
     # without forcing a full RDAP round trip.
     if "expected_nameservers" in changes and d.actual_nameservers is not None:
-        d.nameserver_drift = compute_nameserver_drift(
-            d.expected_nameservers, d.actual_nameservers
-        )
+        d.nameserver_drift = compute_nameserver_drift(d.expected_nameservers, d.actual_nameservers)
         # And refresh the derived state label (preserving expiry
         # buckets if applicable).
         d.whois_state = derive_whois_state(
@@ -425,9 +423,7 @@ async def refresh_whois(
     # back-to-back.
     ps = await db.get(PlatformSettings, 1)
     interval_hours = (
-        ps.domain_whois_interval_hours
-        if ps is not None and ps.domain_whois_interval_hours
-        else 24
+        ps.domain_whois_interval_hours if ps is not None and ps.domain_whois_interval_hours else 24
     )
 
     result = await refresh_one_domain(d, interval_hours=interval_hours)

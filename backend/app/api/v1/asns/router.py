@@ -26,7 +26,7 @@ from sqlalchemy import String, func, or_, select
 from app.api.deps import DB, CurrentUser
 from app.api.v1.asns._audit import write_audit
 from app.core.permissions import require_resource_permission
-from app.models.asn import ASN
+from app.models.asn import ASN, BGPPeering
 from app.services.asns.classifier import REGISTRIES, classify_asn
 
 # Router-level permission gate — covers GET (read), POST/PUT (write),
@@ -390,6 +390,183 @@ async def bulk_delete_asns(body: ASNBulkDelete, db: DB, user: CurrentUser) -> di
 
     await db.commit()
     return {"deleted": len(rows), "not_found": not_found}
+
+
+# ── BGP peering ─────────────────────────────────────────────────────
+
+_BGP_RELATIONSHIPS = frozenset({"peer", "customer", "provider", "sibling"})
+
+
+class BGPPeeringRead(BaseModel):
+    id: uuid.UUID
+    local_asn_id: uuid.UUID
+    peer_asn_id: uuid.UUID
+    relationship_type: Literal["peer", "customer", "provider", "sibling"]
+    description: str
+    local_asn_number: int
+    local_asn_name: str
+    peer_asn_number: int
+    peer_asn_name: str
+    created_at: datetime
+    modified_at: datetime
+
+
+class BGPPeeringCreate(BaseModel):
+    local_asn_id: uuid.UUID
+    peer_asn_id: uuid.UUID
+    relationship_type: Literal["peer", "customer", "provider", "sibling"]
+    description: str = ""
+
+    @field_validator("peer_asn_id")
+    @classmethod
+    def _no_self_peering(cls, v: uuid.UUID, info: Any) -> uuid.UUID:  # type: ignore[override]
+        local = info.data.get("local_asn_id")
+        if local is not None and v == local:
+            raise ValueError("local_asn_id and peer_asn_id must differ")
+        return v
+
+
+class BGPPeeringUpdate(BaseModel):
+    relationship_type: Literal["peer", "customer", "provider", "sibling"] | None = None
+    description: str | None = None
+
+
+def _serialize_peering(p: BGPPeering) -> BGPPeeringRead:
+    return BGPPeeringRead(
+        id=p.id,
+        local_asn_id=p.local_asn_id,
+        peer_asn_id=p.peer_asn_id,
+        relationship_type=p.relationship_type,  # type: ignore[arg-type]
+        description=p.description,
+        local_asn_number=p.local_asn.number,
+        local_asn_name=p.local_asn.name,
+        peer_asn_number=p.peer_asn.number,
+        peer_asn_name=p.peer_asn.name,
+        created_at=p.created_at,
+        modified_at=p.modified_at,
+    )
+
+
+@router.get("/peerings", response_model=list[BGPPeeringRead])
+async def list_peerings(
+    db: DB,
+    asn_id: uuid.UUID | None = Query(
+        None,
+        description="Filter to peerings where this ASN is local OR peer.",
+    ),
+    relationship_type: str | None = Query(None),
+) -> list[BGPPeeringRead]:
+    stmt = select(BGPPeering)
+    if asn_id is not None:
+        stmt = stmt.where(
+            or_(
+                BGPPeering.local_asn_id == asn_id,
+                BGPPeering.peer_asn_id == asn_id,
+            )
+        )
+    if relationship_type is not None:
+        if relationship_type not in _BGP_RELATIONSHIPS:
+            raise HTTPException(
+                status_code=422, detail=f"unknown relationship_type: {relationship_type}"
+            )
+        stmt = stmt.where(BGPPeering.relationship_type == relationship_type)
+    rows = (await db.execute(stmt)).scalars().all()
+    return [_serialize_peering(r) for r in rows]
+
+
+def _peering_display(p: BGPPeering) -> str:
+    return f"AS{p.local_asn.number} → AS{p.peer_asn.number} ({p.relationship_type})"
+
+
+@router.post("/peerings", response_model=BGPPeeringRead, status_code=status.HTTP_201_CREATED)
+async def create_peering(body: BGPPeeringCreate, db: DB, user: CurrentUser) -> BGPPeeringRead:
+    asn_ids = {body.local_asn_id, body.peer_asn_id}
+    found = (await db.execute(select(ASN.id).where(ASN.id.in_(asn_ids)))).scalars().all()
+    missing = asn_ids - set(found)
+    if missing:
+        raise HTTPException(
+            status_code=404,
+            detail=f"ASN(s) not found: {sorted(str(m) for m in missing)}",
+        )
+
+    peering = BGPPeering(
+        local_asn_id=body.local_asn_id,
+        peer_asn_id=body.peer_asn_id,
+        relationship_type=body.relationship_type,
+        description=body.description,
+    )
+    db.add(peering)
+    try:
+        await db.flush()
+    except Exception as exc:  # IntegrityError on uq_bgp_peering
+        await db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="A peering with this (local, peer, relationship_type) already exists.",
+        ) from exc
+
+    await db.refresh(peering)
+    write_audit(
+        db,
+        user=user,
+        action="create",
+        resource_type="bgp_peering",
+        resource_id=str(peering.id),
+        resource_display=_peering_display(peering),
+        new_value=body.model_dump(mode="json"),
+    )
+    await db.commit()
+    await db.refresh(peering)
+    return _serialize_peering(peering)
+
+
+@router.patch("/peerings/{peering_id}", response_model=BGPPeeringRead)
+async def update_peering(
+    peering_id: uuid.UUID,
+    body: BGPPeeringUpdate,
+    db: DB,
+    user: CurrentUser,
+) -> BGPPeeringRead:
+    peering = await db.get(BGPPeering, peering_id)
+    if peering is None:
+        raise HTTPException(status_code=404, detail="Peering not found")
+
+    changes = body.model_dump(exclude_none=True)
+    for k, v in changes.items():
+        setattr(peering, k, v)
+
+    if changes:
+        write_audit(
+            db,
+            user=user,
+            action="update",
+            resource_type="bgp_peering",
+            resource_id=str(peering_id),
+            resource_display=_peering_display(peering),
+            changed_fields=list(changes.keys()),
+            new_value=changes,
+        )
+    await db.commit()
+    await db.refresh(peering)
+    return _serialize_peering(peering)
+
+
+@router.delete("/peerings/{peering_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_peering(peering_id: uuid.UUID, db: DB, user: CurrentUser) -> None:
+    peering = await db.get(BGPPeering, peering_id)
+    if peering is None:
+        raise HTTPException(status_code=404, detail="Peering not found")
+    display = _peering_display(peering)
+    await db.delete(peering)
+    write_audit(
+        db,
+        user=user,
+        action="delete",
+        resource_type="bgp_peering",
+        resource_id=str(peering_id),
+        resource_display=display,
+    )
+    await db.commit()
 
 
 __all__ = ["router"]

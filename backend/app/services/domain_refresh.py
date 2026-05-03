@@ -155,9 +155,7 @@ async def refresh_one_domain(
     )
 
 
-def build_refresh_audit_payload(
-    domain: Domain, result: DomainRefreshResult
-) -> dict[str, Any]:
+def build_refresh_audit_payload(domain: Domain, result: DomainRefreshResult) -> dict[str, Any]:
     """Compact dict suitable for the ``new_value`` of an audit row.
 
     Shared so endpoint + task audit rows have the same shape — makes

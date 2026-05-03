@@ -931,6 +931,7 @@ export const ipamApi = {
         | "dns_inherit_settings"
         | "dhcp_server_group_id"
         | "dhcp_inherit_settings"
+        | "asn_id"
       >
     >,
   ) => api.put<IPBlock>(`/ipam/blocks/${id}`, data).then((r) => r.data),
@@ -2491,6 +2492,7 @@ export interface DNSZone {
   admin_email: string;
   is_auto_generated: boolean;
   linked_subnet_id: string | null;
+  domain_id?: string | null;
   dnssec_enabled: boolean;
   color: string | null;
   last_serial: number;
@@ -5786,6 +5788,34 @@ export interface ASNUpdate {
   custom_fields?: Record<string, unknown>;
 }
 
+export type BGPRelationshipType = "peer" | "customer" | "provider" | "sibling";
+
+export interface BGPPeering {
+  id: string;
+  local_asn_id: string;
+  peer_asn_id: string;
+  relationship_type: BGPRelationshipType;
+  description: string;
+  local_asn_number: number;
+  local_asn_name: string;
+  peer_asn_number: number;
+  peer_asn_name: string;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface BGPPeeringCreate {
+  local_asn_id: string;
+  peer_asn_id: string;
+  relationship_type: BGPRelationshipType;
+  description?: string;
+}
+
+export interface BGPPeeringUpdate {
+  relationship_type?: BGPRelationshipType;
+  description?: string;
+}
+
 export const asnsApi = {
   list: (params?: ASNListQuery) =>
     api.get<ASNListResponse>("/asns", { params }).then((r) => r.data),
@@ -5805,4 +5835,15 @@ export const asnsApi = {
         ids,
       })
       .then((r) => r.data),
+  // BGP peering — operator-curated graph of peering relationships.
+  listPeerings: (params?: {
+    asn_id?: string;
+    relationship_type?: BGPRelationshipType;
+  }) =>
+    api.get<BGPPeering[]>("/asns/peerings", { params }).then((r) => r.data),
+  createPeering: (data: BGPPeeringCreate) =>
+    api.post<BGPPeering>("/asns/peerings", data).then((r) => r.data),
+  updatePeering: (id: string, data: BGPPeeringUpdate) =>
+    api.patch<BGPPeering>(`/asns/peerings/${id}`, data).then((r) => r.data),
+  deletePeering: (id: string) => api.delete(`/asns/peerings/${id}`),
 };

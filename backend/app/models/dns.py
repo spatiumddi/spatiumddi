@@ -494,6 +494,18 @@ class DNSZone(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     linked_subnet_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("subnet.id", ondelete="SET NULL"), nullable=True
     )
+    # Optional explicit link to the registered domain (issue #87). NULL
+    # means "no domain pinned" — the Domain detail page falls back to a
+    # name-match heuristic for backward-compat. Setting this lets
+    # operators link "example.com." (zone) to a Domain row even when
+    # the names don't match exactly (e.g. ``foo.example.com.`` zone
+    # under ``example.com`` registration).
+    domain_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("domain.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     # Set by the Tailscale reconciler when this zone synthesises
     # ``<tailnet>.ts.net`` from the device list (Phase 2). The FK
     # cascades on tenant delete so the synthetic zone + its records

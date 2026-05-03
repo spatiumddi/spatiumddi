@@ -13,10 +13,7 @@ import {
   alertsApi,
   dnsApi,
   domainsApi,
-  type AlertEvent,
   type AlertSeverity,
-  type DNSZone,
-  type DNSServerGroup,
   type Domain,
   type DomainWhoisState,
 } from "@/lib/api";
@@ -229,9 +226,9 @@ function NameserverDiffPanel({ domain }: { domain: Domain }) {
 function WhoisTab({ domain }: { domain: Domain }) {
   return (
     <div className="rounded-lg border bg-card p-4">
-      {domain.whois_raw ? (
+      {domain.whois_data ? (
         <pre className="overflow-auto text-xs font-mono max-h-96 bg-muted p-3 rounded">
-          {domain.whois_raw}
+          {JSON.stringify(domain.whois_data, null, 2)}
         </pre>
       ) : (
         <p className="text-sm text-muted-foreground py-6 text-center">
@@ -251,13 +248,8 @@ function LinkedZonesTab({ domain }: { domain: Domain }) {
     queryFn: () => dnsApi.listGroups(),
   });
 
-  // Fetch zones for all groups in parallel via multiple queries.
-  const zoneQueries = groups.map((g) => ({
-    queryKey: ["dns-zones", g.id],
-    queryFn: () => dnsApi.listZones(g.id),
-  }));
-
-  // Use a single derived query that depends on groups being loaded.
+  // Fan out one query per group; combined into a single derived
+  // query that depends on groups being loaded.
   const { data: allZonesWithGroup = [], isLoading: loadingZones } = useQuery({
     queryKey: ["domain-linked-zones", domain.id, groups.map((g) => g.id)],
     enabled: groups.length > 0,
@@ -274,8 +266,12 @@ function LinkedZonesTab({ domain }: { domain: Domain }) {
 
   const isLoading = loadingGroups || loadingZones;
 
-  // Filter zones whose name matches the domain name (strip trailing dot, case-insensitive).
+  // Prefer the explicit ``domain_id`` FK; fall back to a case-insensitive
+  // name-match for zones that haven't been pinned yet (backward-compat).
   const linkedZones = allZonesWithGroup.filter(({ zone }) => {
+    if (zone.domain_id) {
+      return zone.domain_id === domain.id;
+    }
     const zoneName = zone.name.replace(/\.$/, "").toLowerCase();
     const domainName = domain.name.replace(/\.$/, "").toLowerCase();
     return zoneName === domainName;

@@ -530,6 +530,7 @@ class ZoneCreate(BaseModel):
     dnssec_enabled: bool = False
     color: str | None = None
     linked_subnet_id: uuid.UUID | None = None
+    domain_id: uuid.UUID | None = None
     allow_query: list[str] | None = None
     allow_transfer: list[str] | None = None
     also_notify: list[str] | None = None
@@ -576,6 +577,7 @@ class ZoneUpdate(BaseModel):
     dnssec_enabled: bool | None = None
     color: str | None = None
     linked_subnet_id: uuid.UUID | None = None
+    domain_id: uuid.UUID | None = None
     allow_query: list[str] | None = None
     allow_transfer: list[str] | None = None
     also_notify: list[str] | None = None
@@ -624,6 +626,7 @@ class ZoneResponse(BaseModel):
     admin_email: str
     is_auto_generated: bool
     linked_subnet_id: uuid.UUID | None
+    domain_id: uuid.UUID | None = None
     dnssec_enabled: bool
     color: str | None
     last_serial: int

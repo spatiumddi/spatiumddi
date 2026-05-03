@@ -130,8 +130,13 @@ async def _refresh_one_asn(
     # Persist a serialisable version of the RDAP response — the raw
     # ``last_modified_at`` field is a ``datetime`` which the JSON
     # serializer in ``app.db`` already coerces via ``default=str``.
+    # Persist ``previous_holder`` so the detail-page drift viewer can
+    # show the before/after side-by-side without consulting the audit
+    # log. Always recorded — even on a non-drift refresh — so the UI
+    # can render "no change since last check" when previous == current.
     snapshot = {
         "holder_org": new_holder,
+        "previous_holder": previous_holder or None,
         "registry": payload.get("registry"),
         "name": payload.get("name"),
         "last_modified_at": _datetime_to_iso(payload.get("last_modified_at")),

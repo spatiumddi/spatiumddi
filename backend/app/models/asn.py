@@ -201,4 +201,52 @@ class ASNRpkiRoa(UUIDPrimaryKeyMixin, Base):
     asn: Mapped[ASN] = relationship("ASN", back_populates="rpki_roas")
 
 
-__all__ = ["ASN", "ASNRpkiRoa"]
+class BGPPeering(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """Operator-curated BGP peering relationship between two tracked ASNs.
+
+    Direction matters: ``relationship`` describes what the *peer* is
+    relative to the *local* AS. ``customer`` means ``peer_asn_id`` is a
+    downstream customer of ``local_asn_id``; ``provider`` is the
+    inverse; ``peer`` is settlement-free (private peering / IXP);
+    ``sibling`` is two ASes under common ownership.
+
+    Pairs are unique per ``(local, peer, relationship)`` so two ASNs
+    can hold multiple peering rows iff the relationship type differs
+    (rare in practice — flagged-and-changed not deleted-and-readded).
+    """
+
+    __tablename__ = "bgp_peering"
+    __table_args__ = (
+        UniqueConstraint("local_asn_id", "peer_asn_id", "relationship_type", name="uq_bgp_peering"),
+        Index("ix_bgp_peering_local", "local_asn_id"),
+        Index("ix_bgp_peering_peer", "peer_asn_id"),
+        Index("ix_bgp_peering_relationship", "relationship_type"),
+    )
+
+    # SQLAlchemy ``relationship()`` declarations come *before* the
+    # column named ``relationship_type`` would otherwise be tempting
+    # to spell ``relationship`` — that would shadow the imported
+    # function and break the line below.
+    local_asn: Mapped[ASN] = relationship(
+        "ASN", foreign_keys="BGPPeering.local_asn_id", lazy="joined"
+    )
+    peer_asn: Mapped[ASN] = relationship(
+        "ASN", foreign_keys="BGPPeering.peer_asn_id", lazy="joined"
+    )
+
+    local_asn_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("asn.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    peer_asn_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("asn.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    # ``peer`` | ``customer`` | ``provider`` | ``sibling``
+    relationship_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+
+
+__all__ = ["ASN", "ASNRpkiRoa", "BGPPeering"]

@@ -369,22 +369,13 @@ async def _matching_domain_drift_subjects(
     operator-set ``expected_nameservers`` doesn't match the
     last-observed ``actual_nameservers``."""
     rows = (
-        (
-            await db.execute(
-                select(Domain).where(Domain.nameserver_drift.is_(True))
-            )
-        )
-        .scalars()
-        .all()
+        (await db.execute(select(Domain).where(Domain.nameserver_drift.is_(True)))).scalars().all()
     )
     matches: list[tuple[str, str, str]] = []
     for d in rows:
         expected = sorted(d.expected_nameservers or [])
         actual = sorted(d.actual_nameservers or [])
-        message = (
-            f"Domain {d.name} NS drift — "
-            f"expected={expected!r}, actual={actual!r}"
-        )
+        message = f"Domain {d.name} NS drift — " f"expected={expected!r}, actual={actual!r}"
         matches.append((str(d.id), d.name, message))
     return matches
 
@@ -450,9 +441,7 @@ async def _evaluate_domain_transition_rule(
     # rule-create has no "from" to record. Look up the most recent
     # event row per subject — open or resolved.
     last_event_res = await db.execute(
-        select(AlertEvent)
-        .where(AlertEvent.rule_id == rule.id)
-        .order_by(AlertEvent.fired_at.desc())
+        select(AlertEvent).where(AlertEvent.rule_id == rule.id).order_by(AlertEvent.fired_at.desc())
     )
     last_event_by_subject: dict[str, AlertEvent] = {}
     for ev in last_event_res.scalars().all():
@@ -501,10 +490,7 @@ async def _evaluate_domain_transition_rule(
             continue
 
         # Real transition. Open a fresh event + deliver.
-        message = (
-            f"Domain {d.name} {rule_label} changed: "
-            f"{prior_value!r} → {current_value!r}"
-        )
+        message = f"Domain {d.name} {rule_label} changed: " f"{prior_value!r} → {current_value!r}"
         event = AlertEvent(
             rule_id=rule.id,
             subject_type="domain",
