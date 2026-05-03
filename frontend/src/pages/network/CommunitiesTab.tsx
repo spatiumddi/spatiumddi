@@ -346,7 +346,7 @@ export function CommunitiesTab({ asnId }: { asnId: string }) {
         </button>
         {showStandard && (
           <table className="w-full text-xs">
-            <thead className="bg-muted/30">
+            <thead className="sticky top-0 z-10 bg-card shadow-[inset_0_-1px_0] shadow-border">
               <tr className="border-y">
                 <th className="px-3 py-1.5 text-left font-medium">Value</th>
                 <th className="px-3 py-1.5 text-left font-medium">Name</th>
@@ -394,7 +394,7 @@ export function CommunitiesTab({ asnId }: { asnId: string }) {
       ) : (
         <div className="rounded-lg border">
           <table className="w-full text-xs">
-            <thead className="bg-muted/30">
+            <thead className="sticky top-0 z-10 bg-card shadow-[inset_0_-1px_0] shadow-border">
               <tr className="border-b">
                 <th className="px-3 py-2 text-left font-medium">Kind</th>
                 <th className="px-3 py-2 text-left font-medium">Value</th>

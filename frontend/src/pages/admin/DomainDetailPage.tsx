@@ -269,9 +269,14 @@ function LinkedZonesTab({ domain }: { domain: Domain }) {
     if (zone.domain_id) {
       return zone.domain_id === domain.id;
     }
+    // Suffix match — ``test.example.com`` belongs to the ``example.com``
+    // domain unless an explicit ``domain_id`` overrides it. We accept
+    // either the exact match or a left-side label tree (``.<domain>``)
+    // to avoid false positives like ``example.com.au`` matching
+    // ``example.com``.
     const zoneName = zone.name.replace(/\.$/, "").toLowerCase();
     const domainName = domain.name.replace(/\.$/, "").toLowerCase();
-    return zoneName === domainName;
+    return zoneName === domainName || zoneName.endsWith("." + domainName);
   });
 
   return (
@@ -306,27 +311,40 @@ function LinkedZonesTab({ domain }: { domain: Domain }) {
               </td>
             </tr>
           )}
-          {linkedZones.map(({ zone, group }) => (
-            <tr key={zone.id} className="border-b">
-              <td className="px-4 py-2.5 font-medium font-mono text-xs">
-                <Link
-                  to={`/dns`}
-                  className="hover:underline hover:text-primary"
-                >
-                  {zone.name}
-                </Link>
-              </td>
-              <td className="px-4 py-2.5 text-muted-foreground capitalize">
-                {zone.zone_type}
-              </td>
-              <td className="px-4 py-2.5 text-muted-foreground capitalize">
-                {zone.kind}
-              </td>
-              <td className="px-4 py-2.5 text-muted-foreground">
-                {group.name}
-              </td>
-            </tr>
-          ))}
+          {linkedZones.map(({ zone, group }) => {
+            const zoneClean = zone.name.replace(/\.$/, "").toLowerCase();
+            const domainClean = domain.name.replace(/\.$/, "").toLowerCase();
+            const isSubzone = zoneClean !== domainClean;
+            return (
+              <tr key={zone.id} className="border-b">
+                <td className="px-4 py-2.5 font-medium font-mono text-xs">
+                  <Link
+                    to={`/dns`}
+                    className="hover:underline hover:text-primary"
+                  >
+                    {zone.name}
+                  </Link>
+                  {isSubzone && (
+                    <span
+                      className="ml-2 rounded bg-muted px-1.5 py-0.5 font-sans text-[10px] uppercase tracking-wider text-muted-foreground"
+                      title={`Sub-zone of ${domainClean}`}
+                    >
+                      sub-zone
+                    </span>
+                  )}
+                </td>
+                <td className="px-4 py-2.5 text-muted-foreground capitalize">
+                  {zone.zone_type}
+                </td>
+                <td className="px-4 py-2.5 text-muted-foreground capitalize">
+                  {zone.kind}
+                </td>
+                <td className="px-4 py-2.5 text-muted-foreground">
+                  {group.name}
+                </td>
+              </tr>
+            );
+          })}
         </tbody>
       </table>
     </div>

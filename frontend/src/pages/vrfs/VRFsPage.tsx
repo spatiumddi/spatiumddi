@@ -137,7 +137,7 @@ function listToCsv(xs: string[]): string {
 
 // ── Editor modal ──────────────────────────────────────────────────────────────
 
-function VRFEditorModal({
+export function VRFEditorModal({
   existing,
   onClose,
 }: {

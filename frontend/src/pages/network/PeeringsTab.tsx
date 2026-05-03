@@ -329,7 +329,7 @@ export function PeeringsTab({ asnId }: { asnId: string }) {
       ) : (
         <div className="rounded-lg border">
           <table className="w-full text-xs">
-            <thead className="bg-muted/30">
+            <thead className="sticky top-0 z-10 bg-card shadow-[inset_0_-1px_0] shadow-border">
               <tr className="border-b">
                 <th className="px-3 py-2 text-left font-medium">Direction</th>
                 <th className="px-3 py-2 text-left font-medium">

@@ -1,8 +1,10 @@
 import { useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
-import { ArrowLeft, Loader2, Route as RouteIcon } from "lucide-react";
+import { ArrowLeft, Loader2, Pencil, Route as RouteIcon } from "lucide-react";
 import { asnsApi, ipamApi, vrfsApi } from "@/lib/api";
+import { HeaderButton } from "@/components/ui/header-button";
+import { VRFEditorModal } from "./VRFsPage";
 
 type Tab = "spaces" | "blocks";
 
@@ -76,6 +78,7 @@ function InfoRow({
 export function VRFDetailPage() {
   const { id = "" } = useParams<{ id: string }>();
   const [tab, setTab] = useState<Tab>("spaces");
+  const [showEdit, setShowEdit] = useState(false);
 
   const {
     data: vrf,
@@ -155,6 +158,11 @@ export function VRFDetailPage() {
                 {vrf.description}
               </p>
             )}
+          </div>
+          <div className="flex flex-shrink-0 items-center gap-2">
+            <HeaderButton icon={Pencil} onClick={() => setShowEdit(true)}>
+              Edit
+            </HeaderButton>
           </div>
         </div>
 
@@ -334,6 +342,10 @@ export function VRFDetailPage() {
           </div>
         )}
       </div>
+
+      {showEdit && (
+        <VRFEditorModal existing={vrf} onClose={() => setShowEdit(false)} />
+      )}
     </div>
   );
 }

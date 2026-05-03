@@ -434,8 +434,8 @@ export function AsnDetailPage() {
               </div>
             ) : (
               <table className="w-full text-xs">
-                <thead className="sticky top-0 z-10 bg-muted/30">
-                  <tr className="border-b">
+                <thead className="sticky top-0 z-10 bg-card shadow-[inset_0_-1px_0] shadow-border">
+                  <tr>
                     <th className="whitespace-nowrap px-3 py-2 text-left font-medium">
                       Prefix
                     </th>

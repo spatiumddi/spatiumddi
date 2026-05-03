@@ -4,24 +4,20 @@ filter it down to the ROAs an AS is authorised to originate.
 Two source backends today:
 
 * **Cloudflare** — ``https://rpki.cloudflare.com/rpki.json``. Compact
-  JSON shape: ``{"roas": [{"asn": "AS13335", "prefix": "1.1.1.0/24",
-  "maxLength": 24, "ta": "apnic"}, ...]}``. No per-ROA validity
-  windows; the dump itself is refreshed roughly every 20 minutes.
+  JSON shape: ``{"roas": [{"asn": 13335, "prefix": "1.1.1.0/24",
+  "maxLength": 24, "ta": "apnic", "expires": 1778336254}, ...]}``.
+  ``expires`` is a Unix epoch (seconds) — that's the ``valid_to`` we
+  surface. Cloudflare doesn't ship ``valid_from``; we leave it NULL.
+  The dump itself is refreshed roughly every 20 minutes.
 * **RIPE NCC RPKI Validator 3** —
   ``https://rpki-validator.ripe.net/api/objects/validated.json``.
   Same triple shape (``asn`` / ``prefix`` / ``maxLength`` / ``ta``)
-  under a different envelope. RIPE's validator publishes the full
-  validated set (not just RIPE-issued) so the data is comparable.
-
-Neither mirror exposes ``valid_from`` / ``valid_to`` on individual
-ROAs in a stable shape — both project the underlying RPKI artifacts'
-notBefore/notAfter from the X.509 layer, but the public JSON drops
-them. We accept that and return ``None`` for both fields; the caller
-treats unknown windows as ``state="valid"`` (no expiry pressure)
-rather than firing spurious alerts.
+  under a different envelope. ``notBefore`` / ``notAfter`` are
+  surfaced as ISO 8601 strings on the underlying validated objects;
+  we map them to ``valid_from`` / ``valid_to``.
 
 The full ROA dump is multi-MB (Cloudflare's 2026-vintage payload is
-~120k entries, ~6 MB JSON). We cache it in-memory for 5 minutes via
+~80 MB JSON, ~850k entries). We cache it in-memory for 5 minutes via
 :func:`_get_cached_roas` so a beat sweep that needs to refresh ROAs
 for 50 ASNs makes a single HTTP call instead of 50.
 """
@@ -29,6 +25,7 @@ for 50 ASNs makes a single HTTP call instead of 50.
 from __future__ import annotations
 
 import time
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -87,6 +84,41 @@ def _normalise_trust_anchor(value: Any) -> str | None:
         return None
     code = value.strip().lower()
     return code if code in _VALID_TRUST_ANCHORS else None
+
+
+def _parse_validity(value: Any) -> datetime | None:
+    """Coerce a ROA-validity field to ``datetime``.
+
+    Cloudflare ships ``expires`` as a Unix epoch (seconds). RIPE's
+    validator ships ``notBefore`` / ``notAfter`` as ISO 8601 strings.
+    Accept both shapes and silently return ``None`` for anything we
+    can't parse — a stray malformed row shouldn't poison the load.
+    """
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(int(value), tz=UTC)
+        except (OverflowError, OSError, ValueError):
+            return None
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        # Numeric string → epoch.
+        if s.isdigit():
+            try:
+                return datetime.fromtimestamp(int(s), tz=UTC)
+            except (OverflowError, OSError, ValueError):
+                return None
+        # ISO 8601 — handle both ``...Z`` and ``...+00:00`` shapes.
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        try:
+            return datetime.fromisoformat(s)
+        except ValueError:
+            return None
+    return None
 
 
 def _normalise_max_length(value: Any) -> int | None:
@@ -183,14 +215,10 @@ async def fetch_roas_for_asn(asn_number: int, source: str) -> list[dict[str, Any
         {
             "prefix": "1.1.1.0/24",
             "max_length": 24,
-            "valid_from": None,         # public mirrors don't expose these
-            "valid_to": None,           # — caller falls back to state="valid"
-            "trust_anchor": "apnic",    # may be None on malformed rows
+            "valid_from": datetime | None,  # ``notBefore`` (RIPE only)
+            "valid_to": datetime | None,    # ``expires`` (CF) or ``notAfter`` (RIPE)
+            "trust_anchor": "apnic",        # may be None on malformed rows
         }
-
-    # TODO: pull validity windows from a Routinator instance when one
-    # is configured — Routinator's API exposes per-VRP notBefore/notAfter.
-    # The two public mirrors used here don't surface them.
 
     Returns an empty list on fetch failure so the caller's reconcile
     pass treats the AS as "no ROAs this tick" rather than wiping the
@@ -223,12 +251,18 @@ async def fetch_roas_for_asn(asn_number: int, source: str) -> list[dict[str, Any
         ta_raw = raw.get("ta") or raw.get("trustAnchor") or raw.get("ta_name")
         ta = _normalise_trust_anchor(ta_raw)
 
+        # Validity windows. Cloudflare ships ``expires`` (epoch);
+        # RIPE ships ``notBefore`` / ``notAfter`` (ISO 8601). Accept
+        # whichever the source provides; either may be absent.
+        valid_from = _parse_validity(raw.get("notBefore"))
+        valid_to = _parse_validity(raw.get("expires") or raw.get("notAfter"))
+
         out.append(
             {
                 "prefix": prefix.strip(),
                 "max_length": int(max_length),
-                "valid_from": None,
-                "valid_to": None,
+                "valid_from": valid_from,
+                "valid_to": valid_to,
                 "trust_anchor": ta,
             }
         )
