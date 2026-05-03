@@ -217,7 +217,7 @@ async def create_asn(body: ASNCreate, db: DB, user: CurrentUser) -> ASNRead:
     return ASNRead.model_validate(row)
 
 
-@router.get("/{asn_id}", response_model=ASNRead)
+@router.get("/{asn_id:uuid}", response_model=ASNRead)
 async def get_asn(asn_id: uuid.UUID, db: DB, _: CurrentUser) -> ASNRead:
     row = await db.get(ASN, asn_id)
     if row is None:
@@ -225,7 +225,7 @@ async def get_asn(asn_id: uuid.UUID, db: DB, _: CurrentUser) -> ASNRead:
     return ASNRead.model_validate(row)
 
 
-@router.put("/{asn_id}", response_model=ASNRead)
+@router.put("/{asn_id:uuid}", response_model=ASNRead)
 async def update_asn(asn_id: uuid.UUID, body: ASNUpdate, db: DB, user: CurrentUser) -> ASNRead:
     row = await db.get(ASN, asn_id)
     if row is None:
@@ -250,7 +250,7 @@ async def update_asn(asn_id: uuid.UUID, body: ASNUpdate, db: DB, user: CurrentUs
     return ASNRead.model_validate(row)
 
 
-@router.delete("/{asn_id}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete("/{asn_id:uuid}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_asn(asn_id: uuid.UUID, db: DB, user: CurrentUser) -> None:
     row = await db.get(ASN, asn_id)
     if row is None:
@@ -270,7 +270,7 @@ async def delete_asn(asn_id: uuid.UUID, db: DB, user: CurrentUser) -> None:
     await db.commit()
 
 
-@router.post("/{asn_id}/refresh-whois", response_model=ASNRead)
+@router.post("/{asn_id:uuid}/refresh-whois", response_model=ASNRead)
 async def refresh_asn_whois(asn_id: uuid.UUID, db: DB, user: CurrentUser) -> ASNRead:
     """Synchronous "Refresh now" — fetch RDAP for this AS and stamp the
     result back to the row. Same per-row state machine as the scheduled
@@ -373,8 +373,16 @@ class ASNRpkiRoaRead(BaseModel):
 
     model_config = {"from_attributes": True}
 
+    @field_validator("prefix", mode="before")
+    @classmethod
+    def _coerce_prefix(cls, v: Any) -> Any:
+        # asyncpg returns CIDR columns as ``IPv4Network`` /
+        # ``IPv6Network`` instances. Coerce to ``str`` so JSON
+        # serialisation has something to work with.
+        return str(v) if v is not None else v
 
-@router.get("/{asn_id}/rpki-roas", response_model=list[ASNRpkiRoaRead])
+
+@router.get("/{asn_id:uuid}/rpki-roas", response_model=list[ASNRpkiRoaRead])
 async def list_asn_rpki_roas(asn_id: uuid.UUID, db: DB, _: CurrentUser) -> list[ASNRpkiRoaRead]:
     """List ROAs the AS is authorised to originate.
 
@@ -410,7 +418,7 @@ class RefreshRpkiResult(BaseModel):
     transitions: int
 
 
-@router.post("/{asn_id}/refresh-rpki", response_model=RefreshRpkiResult)
+@router.post("/{asn_id:uuid}/refresh-rpki", response_model=RefreshRpkiResult)
 async def refresh_asn_rpki(asn_id: uuid.UUID, db: DB, user: CurrentUser) -> RefreshRpkiResult:
     """Synchronous "Refresh RPKI now" — pulls the global ROA dump and
     reconciles ROAs for this AS only. Same per-row state machine as the
