@@ -161,7 +161,11 @@ def upgrade() -> None:
             FROM ip_space
             WHERE vrf_name IS NOT NULL
                OR route_distinguisher IS NOT NULL
-               OR (route_targets IS NOT NULL AND jsonb_array_length(route_targets) > 0)
+               OR (
+                   route_targets IS NOT NULL
+                   AND jsonb_typeof(route_targets) = 'array'
+                   AND jsonb_array_length(route_targets) > 0
+               )
             """
         )
     ).fetchall()

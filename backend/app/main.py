@@ -109,19 +109,12 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
     ),
     "Network Editor": (
         "Full CRUD on SNMP-polled network devices (routers, switches, APs), "
-<<<<<<< HEAD
-        "on-demand nmap scans, and the ASN registry.",
+        "on-demand nmap scans, the ASN registry, and VRFs.",
         [
             {"action": "admin", "resource_type": "manage_network_devices"},
             {"action": "admin", "resource_type": "manage_nmap_scans"},
             {"action": "admin", "resource_type": "manage_asns"},
-=======
-        "on-demand nmap scans, and VRFs.",
-        [
-            {"action": "admin", "resource_type": "manage_network_devices"},
-            {"action": "admin", "resource_type": "manage_nmap_scans"},
             {"action": "admin", "resource_type": "vrf"},
->>>>>>> fa04a06 (feat(network): VRFs as first-class entities — model, migration, CRUD UI)
         ],
     ),
 }

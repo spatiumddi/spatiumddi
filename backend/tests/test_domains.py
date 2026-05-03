@@ -20,7 +20,6 @@ from app.services.rdap import (
     _parse_rdap_datetime,
 )
 
-
 # ── derive_whois_state ─────────────────────────────────────────────────
 
 
