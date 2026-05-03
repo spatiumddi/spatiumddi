@@ -232,6 +232,10 @@ further down.
 - ⬜ [**Move IP block / space across IP spaces**](https://github.com/spatiumddi/spatiumddi/issues/27)
 - ⬜ [**ACME embedded client — certs for SpatiumDDI's own services**](https://github.com/spatiumddi/spatiumddi/issues/28)
 - ⬜ [**Cloud DNS driver family — Route 53 / Azure DNS / Cisco DNA**](https://github.com/spatiumddi/spatiumddi/issues/29)
+- ⬜ [**Network sidebar section — group VLANs / VRFs / ASNs / Devices**](https://github.com/spatiumddi/spatiumddi/issues/84)
+- ⬜ [**ASN management (RDAP refresh · drift detection · RPKI ROA expiry · BGP relationships)**](https://github.com/spatiumddi/spatiumddi/issues/85)
+- ⬜ [**VRFs as first-class entities (model · migration of freeform fields · ASN linkage)**](https://github.com/spatiumddi/spatiumddi/issues/86)
+- ⬜ [**Domain registration tracking (RDAP/WHOIS · NS drift · expiry alerts)**](https://github.com/spatiumddi/spatiumddi/issues/87)
 
 ### Integration roadmap (⬜ pending)
 
