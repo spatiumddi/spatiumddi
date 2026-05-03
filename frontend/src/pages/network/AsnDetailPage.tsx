@@ -15,15 +15,16 @@ import {
   ipamApi,
   type ASNRpkiRoaState,
   type AlertSeverity,
-  type BGPRelationshipType,
 } from "@/lib/api";
 import { HeaderButton } from "@/components/ui/header-button";
 import { RdapPanel } from "@/components/network/rdap-panel";
 import { cn } from "@/lib/utils";
+import { CommunitiesTab } from "./CommunitiesTab";
+import { PeeringsTab } from "./PeeringsTab";
 
 import { errMsg, humanTime } from "./_shared";
 
-type Tab = "whois" | "rpki" | "bgp" | "ipam" | "alerts";
+type Tab = "whois" | "rpki" | "bgp" | "communities" | "ipam" | "alerts";
 
 // ── Badges ───────────────────────────────────────────────────────────
 
@@ -112,37 +113,6 @@ function SeverityBadge({ severity }: { severity: AlertSeverity }) {
   );
 }
 
-// ── BGP relationship helpers ──────────────────────────────────────────
-
-const RELATIONSHIP_COLOR: Record<BGPRelationshipType, string> = {
-  peer: "bg-sky-500/15 text-sky-700 dark:text-sky-400",
-  customer: "bg-emerald-500/15 text-emerald-700 dark:text-emerald-400",
-  provider: "bg-violet-500/15 text-violet-700 dark:text-violet-400",
-  sibling: "bg-amber-500/15 text-amber-700 dark:text-amber-400",
-};
-
-function RelationshipBadge({
-  relationship,
-}: {
-  relationship: BGPRelationshipType;
-}) {
-  return (
-    <span
-      className={cn(PILL_BASE, RELATIONSHIP_COLOR[relationship], "capitalize")}
-    >
-      {relationship}
-    </span>
-  );
-}
-
-// From the *peer's* point of view, customer ↔ provider invert; peer
-// and sibling are symmetric.
-function invertRelationship(r: BGPRelationshipType): BGPRelationshipType {
-  if (r === "customer") return "provider";
-  if (r === "provider") return "customer";
-  return r;
-}
-
 // ── Page ─────────────────────────────────────────────────────────────
 
 export function AsnDetailPage() {
@@ -179,12 +149,6 @@ export function AsnDetailPage() {
     queryKey: ["asn-rpki-roas", id],
     queryFn: () => asnsApi.getRpkiRoas(id),
     enabled: !!id && tab === "rpki",
-  });
-
-  const { data: peerings = [] } = useQuery({
-    queryKey: ["asn-peerings", id],
-    queryFn: () => asnsApi.listPeerings({ asn_id: id }),
-    enabled: !!id && tab === "bgp",
   });
 
   const { data: spaces } = useQuery({
@@ -281,6 +245,7 @@ export function AsnDetailPage() {
     ["whois", "WHOIS"],
     ["rpki", "RPKI ROAs"],
     ["bgp", "BGP Peering"],
+    ["communities", "Communities"],
     ["ipam", "IP Spaces / Blocks"],
     ["alerts", "Alert History"],
   ];
@@ -525,72 +490,9 @@ export function AsnDetailPage() {
           </div>
         )}
 
-        {tab === "bgp" && (
-          <div className="space-y-3">
-            {peerings.length === 0 ? (
-              <p className="text-xs text-muted-foreground">
-                No BGP peerings recorded for this ASN. Add them via{" "}
-                <code className="rounded bg-muted px-1 py-0.5">
-                  POST /api/v1/asns/peerings
-                </code>{" "}
-                — UI editor to follow.
-              </p>
-            ) : (
-              <div className="rounded-lg border">
-                <table className="w-full text-xs">
-                  <thead className="bg-muted/30">
-                    <tr className="border-b">
-                      <th className="px-3 py-2 text-left font-medium">
-                        Direction
-                      </th>
-                      <th className="px-3 py-2 text-left font-medium">
-                        Counterparty
-                      </th>
-                      <th className="px-3 py-2 text-left font-medium">
-                        Relationship
-                      </th>
-                      <th className="px-3 py-2 text-left font-medium">
-                        Description
-                      </th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {peerings.map((p) => {
-                      const isLocal = p.local_asn_id === id;
-                      const counterAs = isLocal
-                        ? `AS${p.peer_asn_number}${p.peer_asn_name ? " — " + p.peer_asn_name : ""}`
-                        : `AS${p.local_asn_number}${p.local_asn_name ? " — " + p.local_asn_name : ""}`;
-                      const rel = isLocal
-                        ? p.relationship_type
-                        : invertRelationship(p.relationship_type);
-                      return (
-                        <tr key={p.id} className="border-b last:border-b-0">
-                          <td className="px-3 py-2 text-muted-foreground">
-                            {isLocal ? "→ outbound" : "← inbound"}
-                          </td>
-                          <td className="px-3 py-2 font-mono">
-                            <Link
-                              to={`/network/asns/${isLocal ? p.peer_asn_id : p.local_asn_id}`}
-                              className="hover:text-primary hover:underline"
-                            >
-                              {counterAs}
-                            </Link>
-                          </td>
-                          <td className="px-3 py-2">
-                            <RelationshipBadge relationship={rel} />
-                          </td>
-                          <td className="px-3 py-2 text-muted-foreground">
-                            {p.description || "—"}
-                          </td>
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </div>
-            )}
-          </div>
-        )}
+        {tab === "bgp" && <PeeringsTab asnId={id} />}
+
+        {tab === "communities" && <CommunitiesTab asnId={id} />}
 
         {tab === "ipam" && (
           <div className="space-y-6">

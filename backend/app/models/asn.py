@@ -249,4 +249,55 @@ class BGPPeering(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     description: Mapped[str] = mapped_column(Text, nullable=False, default="")
 
 
-__all__ = ["ASN", "ASNRpkiRoa", "BGPPeering"]
+class BGPCommunity(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """Operator-curated BGP community value with policy semantics.
+
+    ``asn_id`` is nullable because the standard / well-known catalog
+    (RFC 1997 ``no-export`` etc.) lives at the platform level rather
+    than per-AS — each well-known community is one shared row that
+    every AS can reference.
+
+    ``kind`` denormalises which on-the-wire shape ``value`` carries:
+
+    * ``standard`` — RFC 1997 well-knowns (``no-export``,
+      ``no-advertise``, ``no-export-subconfed``, ``local-as``) and
+      RFC 7611 ``graceful-shutdown``. ``value`` carries the shortcut
+      name; the renderer expands to the wire encoding (``65535:0``
+      for graceful-shutdown, etc.).
+    * ``regular`` — RFC 1997 ``ASN:N`` (32-bit). ``value`` is the
+      printable ``65000:100`` form.
+    * ``large`` — RFC 8092 ``ASN:N:M`` (64-bit). ``value`` is
+      ``65000:100:200``.
+
+    Unique on ``(asn_id, value)`` so the same wire value can't be
+    entered twice within an AS (across ASes is fine — different
+    networks legitimately reuse the same number).
+    """
+
+    __tablename__ = "bgp_community"
+    __table_args__ = (
+        UniqueConstraint("asn_id", "value", name="uq_bgp_community_value"),
+        Index("ix_bgp_community_asn", "asn_id"),
+        Index("ix_bgp_community_kind", "kind"),
+    )
+
+    asn_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("asn.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    value: Mapped[str] = mapped_column(String(64), nullable=False)
+    # ``standard`` | ``regular`` | ``large``
+    kind: Mapped[str] = mapped_column(String(16), nullable=False, default="regular")
+    name: Mapped[str] = mapped_column(String(128), nullable=False, default="")
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    # Free-form policy hints — most operator config lives in router
+    # vendor syntax that we don't try to model. ``accept`` / ``reject``
+    # / ``localpref+`` etc. as a free-text label is enough for the
+    # cross-reference today.
+    inbound_action: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    outbound_action: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    tags: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict, server_default="{}")
+
+
+__all__ = ["ASN", "ASNRpkiRoa", "BGPPeering", "BGPCommunity"]

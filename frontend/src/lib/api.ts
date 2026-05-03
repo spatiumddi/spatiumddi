@@ -5865,4 +5865,55 @@ export const asnsApi = {
   updatePeering: (id: string, data: BGPPeeringUpdate) =>
     api.patch<BGPPeering>(`/asns/peerings/${id}`, data).then((r) => r.data),
   deletePeering: (id: string) => api.delete(`/asns/peerings/${id}`),
+
+  // BGP communities catalog (issue #88).
+  listStandardCommunities: () =>
+    api.get<BGPCommunity[]>("/asns/communities/standard").then((r) => r.data),
+  listCommunities: (asnId: string) =>
+    api.get<BGPCommunity[]>(`/asns/${asnId}/communities`).then((r) => r.data),
+  createCommunity: (asnId: string, data: BGPCommunityCreate) =>
+    api
+      .post<BGPCommunity>(`/asns/${asnId}/communities`, data)
+      .then((r) => r.data),
+  updateCommunity: (id: string, data: BGPCommunityUpdate) =>
+    api
+      .patch<BGPCommunity>(`/asns/communities/${id}`, data)
+      .then((r) => r.data),
+  deleteCommunity: (id: string) => api.delete(`/asns/communities/${id}`),
 };
+
+// ── BGP communities ────────────────────────────────────────────────
+
+export type BGPCommunityKind = "standard" | "regular" | "large";
+
+export interface BGPCommunity {
+  id: string;
+  asn_id: string | null;
+  value: string;
+  kind: BGPCommunityKind;
+  name: string;
+  description: string;
+  inbound_action: string;
+  outbound_action: string;
+  tags: Record<string, unknown>;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface BGPCommunityCreate {
+  value: string;
+  kind: BGPCommunityKind;
+  name?: string;
+  description?: string;
+  inbound_action?: string;
+  outbound_action?: string;
+  tags?: Record<string, unknown>;
+}
+
+export interface BGPCommunityUpdate {
+  name?: string;
+  description?: string;
+  inbound_action?: string;
+  outbound_action?: string;
+  tags?: Record<string, unknown>;
+}

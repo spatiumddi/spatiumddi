@@ -162,6 +162,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     logger.info("startup", service="api", version="0.1.0", debug=settings.debug)
     await _seed_default_admin()
     await _seed_builtin_roles()
+    # Standard / well-known BGP communities (RFC 1997 / 7611 / 7999).
+    # Idempotent; failure-tolerant.
+    try:
+        from app.services.bgp_communities import (  # noqa: PLC0415
+            seed_standard_communities,
+        )
+
+        await seed_standard_communities()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("bgp_communities_seed_skipped", reason=str(exc))
     yield
     logger.info("shutdown", service="api")
 

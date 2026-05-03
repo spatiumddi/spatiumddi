@@ -15,6 +15,7 @@ builtin role; superadmins always pass). Each mutation writes an
 
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import datetime
 from typing import Any, Literal
@@ -26,7 +27,7 @@ from sqlalchemy import String, func, or_, select
 from app.api.deps import DB, CurrentUser
 from app.api.v1.asns._audit import write_audit
 from app.core.permissions import require_resource_permission
-from app.models.asn import ASN, ASNRpkiRoa, BGPPeering
+from app.models.asn import ASN, ASNRpkiRoa, BGPCommunity, BGPPeering
 from app.services.asns.classifier import REGISTRIES, classify_asn
 
 # Router-level permission gate — covers GET (read), POST/PUT (write),
@@ -682,6 +683,228 @@ async def delete_peering(peering_id: uuid.UUID, db: DB, user: CurrentUser) -> No
         action="delete",
         resource_type="bgp_peering",
         resource_id=str(peering_id),
+        resource_display=display,
+    )
+    await db.commit()
+
+
+# ── BGP communities ─────────────────────────────────────────────────
+
+_REGULAR_COMMUNITY_RE = re.compile(r"^\d+:\d+$")
+_LARGE_COMMUNITY_RE = re.compile(r"^\d+:\d+:\d+$")
+_STANDARD_NAMES = frozenset(
+    {
+        "no-export",
+        "no-advertise",
+        "no-export-subconfed",
+        "local-as",
+        "graceful-shutdown",
+        "blackhole",
+        "accept-own",
+    }
+)
+
+
+class BGPCommunityRead(BaseModel):
+    id: uuid.UUID
+    asn_id: uuid.UUID | None
+    value: str
+    kind: Literal["standard", "regular", "large"]
+    name: str
+    description: str
+    inbound_action: str
+    outbound_action: str
+    tags: dict[str, Any]
+    created_at: datetime
+    modified_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class BGPCommunityCreate(BaseModel):
+    value: str
+    kind: Literal["standard", "regular", "large"] = "regular"
+    name: str = ""
+    description: str = ""
+    inbound_action: str = ""
+    outbound_action: str = ""
+    tags: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("value")
+    @classmethod
+    def _v_value(cls, v: str, info: Any) -> str:  # type: ignore[override]
+        v = v.strip()
+        if not v:
+            raise ValueError("value is required")
+        kind = info.data.get("kind", "regular")
+        if kind == "standard":
+            if v not in _STANDARD_NAMES:
+                raise ValueError(f"standard community must be one of: {sorted(_STANDARD_NAMES)}")
+        elif kind == "regular":
+            if not _REGULAR_COMMUNITY_RE.match(v):
+                raise ValueError("regular community must be ASN:N (e.g. 65000:100)")
+        elif kind == "large":
+            if not _LARGE_COMMUNITY_RE.match(v):
+                raise ValueError("large community must be ASN:N:M (e.g. 65000:100:200)")
+        return v
+
+
+class BGPCommunityUpdate(BaseModel):
+    name: str | None = None
+    description: str | None = None
+    inbound_action: str | None = None
+    outbound_action: str | None = None
+    tags: dict[str, Any] | None = None
+
+
+def _community_display(c: BGPCommunity, asn: ASN | None) -> str:
+    prefix = f"AS{asn.number} " if asn is not None else "[platform] "
+    return f"{prefix}{c.value}" + (f" ({c.name})" if c.name else "")
+
+
+@router.get("/communities/standard", response_model=list[BGPCommunityRead])
+async def list_standard_communities(db: DB, _: CurrentUser) -> list[BGPCommunityRead]:
+    """Read-only well-known catalog (RFC 1997 / 7611 / 7999). Seeded
+    on first boot from ``app.services.bgp_communities.STANDARD_COMMUNITIES``."""
+    rows = (
+        (
+            await db.execute(
+                select(BGPCommunity)
+                .where(BGPCommunity.asn_id.is_(None))
+                .order_by(BGPCommunity.value)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return [BGPCommunityRead.model_validate(r) for r in rows]
+
+
+@router.get("/{asn_id:uuid}/communities", response_model=list[BGPCommunityRead])
+async def list_asn_communities(asn_id: uuid.UUID, db: DB, _: CurrentUser) -> list[BGPCommunityRead]:
+    """List operator-defined communities for the given AS."""
+    asn = await db.get(ASN, asn_id)
+    if asn is None:
+        raise HTTPException(status_code=404, detail="ASN not found")
+    rows = (
+        (
+            await db.execute(
+                select(BGPCommunity)
+                .where(BGPCommunity.asn_id == asn_id)
+                .order_by(BGPCommunity.kind, BGPCommunity.value)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return [BGPCommunityRead.model_validate(r) for r in rows]
+
+
+@router.post(
+    "/{asn_id:uuid}/communities",
+    response_model=BGPCommunityRead,
+    status_code=status.HTTP_201_CREATED,
+)
+async def create_asn_community(
+    asn_id: uuid.UUID,
+    body: BGPCommunityCreate,
+    db: DB,
+    user: CurrentUser,
+) -> BGPCommunityRead:
+    asn = await db.get(ASN, asn_id)
+    if asn is None:
+        raise HTTPException(status_code=404, detail="ASN not found")
+
+    row = BGPCommunity(
+        asn_id=asn_id,
+        value=body.value,
+        kind=body.kind,
+        name=body.name,
+        description=body.description,
+        inbound_action=body.inbound_action,
+        outbound_action=body.outbound_action,
+        tags=body.tags or {},
+    )
+    db.add(row)
+    try:
+        await db.flush()
+    except Exception as exc:  # IntegrityError on uq_bgp_community_value
+        await db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail=f"Community {body.value} already defined for this ASN",
+        ) from exc
+
+    write_audit(
+        db,
+        user=user,
+        action="create",
+        resource_type="bgp_community",
+        resource_id=str(row.id),
+        resource_display=_community_display(row, asn),
+        new_value=body.model_dump(mode="json"),
+    )
+    await db.commit()
+    await db.refresh(row)
+    return BGPCommunityRead.model_validate(row)
+
+
+@router.patch("/communities/{community_id:uuid}", response_model=BGPCommunityRead)
+async def update_asn_community(
+    community_id: uuid.UUID,
+    body: BGPCommunityUpdate,
+    db: DB,
+    user: CurrentUser,
+) -> BGPCommunityRead:
+    row = await db.get(BGPCommunity, community_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Community not found")
+    if row.asn_id is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Standard / well-known communities are read-only.",
+        )
+
+    changes = body.model_dump(exclude_none=True)
+    for k, v in changes.items():
+        setattr(row, k, v)
+
+    if changes:
+        asn = await db.get(ASN, row.asn_id) if row.asn_id else None
+        write_audit(
+            db,
+            user=user,
+            action="update",
+            resource_type="bgp_community",
+            resource_id=str(row.id),
+            resource_display=_community_display(row, asn),
+            changed_fields=list(changes.keys()),
+            new_value=changes,
+        )
+    await db.commit()
+    await db.refresh(row)
+    return BGPCommunityRead.model_validate(row)
+
+
+@router.delete("/communities/{community_id:uuid}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_asn_community(community_id: uuid.UUID, db: DB, user: CurrentUser) -> None:
+    row = await db.get(BGPCommunity, community_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Community not found")
+    if row.asn_id is None:
+        raise HTTPException(
+            status_code=400,
+            detail="Standard / well-known communities cannot be deleted.",
+        )
+    asn = await db.get(ASN, row.asn_id) if row.asn_id else None
+    display = _community_display(row, asn)
+    await db.delete(row)
+    write_audit(
+        db,
+        user=user,
+        action="delete",
+        resource_type="bgp_community",
+        resource_id=str(community_id),
         resource_display=display,
     )
     await db.commit()

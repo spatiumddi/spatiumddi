@@ -1,6 +1,6 @@
 from app.models.acme import ACMEAccount
 from app.models.alerts import AlertEvent, AlertRule
-from app.models.asn import ASN, ASNRpkiRoa, BGPPeering
+from app.models.asn import ASN, ASNRpkiRoa, BGPCommunity, BGPPeering
 from app.models.audit import AuditLog
 from app.models.audit_forward import AuditForwardTarget
 from app.models.auth import APIToken, Group, Role, User, UserSession, user_group
@@ -77,6 +77,7 @@ __all__ = [
     "AlertEvent",
     "ASN",
     "ASNRpkiRoa",
+    "BGPCommunity",
     "BGPPeering",
     "User",
     "Group",
