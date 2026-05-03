@@ -1,7 +1,7 @@
 """domain phase 2 — scheduled refresh + alert rule columns
 
 Revision ID: 4a9e7c2d18b3
-Revises: 3124d540d74f
+Revises: 4a7c8e3d51b9
 Create Date: 2026-05-02 00:01:00.000000
 
 Phase 2 of issue #87. Adds:
@@ -30,7 +30,7 @@ from alembic import op
 from sqlalchemy.dialects import postgresql
 
 revision: str = "4a9e7c2d18b3"
-down_revision: Union[str, None] = "3124d540d74f"
+down_revision: Union[str, None] = "4a7c8e3d51b9"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

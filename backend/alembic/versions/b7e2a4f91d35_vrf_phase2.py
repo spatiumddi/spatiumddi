@@ -1,7 +1,7 @@
 """VRF phase 2 — asn_id FK + strict-RD-validation toggle.
 
 Revision ID: b7e2a4f91d35
-Revises: 3124d540d74f
+Revises: 4a9e7c2d18b3
 Create Date: 2026-05-02 00:00:00.000000
 
 Phase 2 of issue #86:
@@ -28,7 +28,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision: str = "b7e2a4f91d35"
-down_revision: Union[str, None] = "3124d540d74f"
+down_revision: Union[str, None] = "4a9e7c2d18b3"
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
