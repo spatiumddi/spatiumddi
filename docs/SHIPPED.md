@@ -662,6 +662,195 @@ Mirrors CLAUDE.md's three mixed sections:
   Scoped as a separate feature because it's a full management UI,
   not IPAM, and needs a websocket pipeline we don't have today.
 
+- ✅ **Network sidebar section — group VLANs / VRFs / ASNs /
+  Devices** (issue #84). Pure sidebar nav reorg replacing the
+  standalone "Network" (SNMP routers/switches) and "VLANs"
+  top-level entries with a non-clickable "Network" parent
+  mirroring the Administration shape. Devices replaces the old
+  top-level Network entry; VLANs lifts up from its own slot.
+  Routes moved to `/network/devices`, `/network/vlans`,
+  `/network/vrfs`, `/network/asns`; old `/network` and `/vlans`
+  paths redirect so existing bookmarks keep working, and the
+  legacy `/network/:id` device-detail URL is preserved alongside
+  the canonical `/network/devices/:id` form.
+
+- ✅ **ASN management** (issue #85). First-class entity for the
+  autonomous systems carrying our IP space, with RDAP holder
+  refresh, RPKI ROA tracking, holder-drift detection, four
+  ASN/RPKI alert rule types, BGP peering relationships, and the
+  BGP communities catalog (issues #88 + #89 ride along).
+  - **Data model.** `asn` table — BigInteger `number` to fit the
+    full 32-bit AS range; `kind` (public / private) auto-derived
+    from RFC 6996 + RFC 7300; `registry` (RIR) auto-derived from
+    a hand-curated IANA ASN delegation snapshot at
+    `app/data/asn_registry_delegations.json`; WHOIS columns
+    populated by the refresh task. `asn_rpki_roa` sibling table —
+    prefix CIDR + max_length + validity window + trust_anchor +
+    state, ON DELETE CASCADE from `asn`. Migrations
+    `f59a5371bdfb_asn_management` + `4a7c8e3d51b9_asn_phase2`.
+  - **RDAP holder refresh.** `app/services/rdap_asn.py` derives
+    the RIR via `derive_registry()` and queries the RIR's RDAP
+    base directly (`rdap.arin.net`, `rdap.db.ripe.net`,
+    `rdap.apnic.net`, `rdap.lacnic.net`, `rdap.afrinic.net`) —
+    `rdap.iana.org/autnum/<n>` is a bootstrap *registry* not a
+    query proxy and returns HTTP 501 for every real query, so
+    routing-by-RIR is mandatory. `app/tasks/asn_whois_refresh.
+    refresh_due_asns` ticks hourly; per-row Refresh button drives
+    the same code path synchronously (`POST /api/v1/asns/{id}/
+    refresh-whois`). `next_check_at` cadence tunable via
+    `PlatformSettings.asn_whois_interval_hours` (default 24, range
+    1..168).
+  - **RPKI ROA pull.** `app/services/rpki_roa.py` fetches the
+    global ROA dump from Cloudflare (`rpki.cloudflare.com/rpki.
+    json`, ~80 MB JSON, ~850k entries) or RIPE NCC's validator
+    JSON, filters by AS number, and caches the multi-MB payload
+    in-memory for 5 min via `_get_cached_roas` so a beat sweep
+    refreshing 50 ASNs makes a single HTTP call instead of 50.
+    `app/tasks/rpki_roa_refresh.refresh_due_roas` ticks hourly,
+    derives state (`valid` / `expiring_soon` / `expired` /
+    `not_found`) off `valid_to`, audit-logs adds / removes / state
+    transitions. `_parse_validity` accepts Cloudflare's `expires`
+    (Unix epoch) + RIPE's `notBefore` / `notAfter` (ISO 8601) on
+    the same row. Per-row Refresh RPKI button (`POST
+    /api/v1/asns/{id}/refresh-rpki`) reuses `_refresh_one_asn`
+    for the synchronous path. Two new `PlatformSettings` knobs:
+    `rpki_roa_source` (cloudflare | ripe) and
+    `rpki_roa_refresh_interval_hours` (default 4, range 1..168).
+  - **Holder-drift diff viewer.** `asn_whois_refresh` persists
+    `previous_holder` into `whois_data` on every successful RDAP
+    refresh — drift or not — so the WHOIS tab can render the
+    side-by-side without consulting the audit log.
+  - **Alert rules.** Four new types: `asn_holder_drift` (latched
+    via `alert_event.last_observed_value` JSONB so a single flip
+    fires exactly one event auto-resolved after 7 d),
+    `asn_whois_unreachable`, `rpki_roa_expiring` (severity
+    escalation at threshold/4 + threshold/12 around
+    `threshold_days`, default 30 d), `rpki_roa_expired`.
+  - **BGP peering relationships (issue #89).** `bgp_peering`
+    table — `peer | customer | provider | sibling`. Both
+    endpoints FK ON DELETE CASCADE; unique on `(local, peer,
+    relationship_type)`. Column named `relationship_type` so it
+    doesn't shadow the imported `sqlalchemy.relationship`
+    function. `router.local_asn_id` FK ON DELETE SET NULL stamps
+    which AS a router originates routes from. `PeeringsTab` on
+    ASN detail with directional listing (`→ outbound` / `←
+    inbound` from this AS's POV) and clickable counter-AS;
+    `PeeringFormModal` lets the operator pick either side as
+    "local" + normalises to canonical shape on submit. Migration
+    `d3f2a51c8e76_bgp_peering`.
+  - **BGP communities catalog (issue #88).** `bgp_community`
+    table; `asn_id` nullable so platform-level rows (RFC 1997 /
+    7611 / 7999 well-knowns: no-export, no-advertise,
+    no-export-subconfed, local-as, graceful-shutdown, blackhole,
+    accept-own) are shared across all ASes. `kind` denormalises
+    on-the-wire shape: `standard` / `regular` (`ASN:N` per RFC
+    1997) / `large` (`ASN:N:M` per RFC 8092).
+    `app.services.bgp_communities` owns the well-known catalog +
+    seeds it on first boot via a hook in `main.py`'s lifespan
+    (subsequent boots refresh the description text so upgrades
+    that reword a row land without an admin edit). CRUD: `GET
+    /asns/communities/standard`, `GET|POST /asns/{asn_id:uuid}/
+    communities`, `PATCH|DELETE /asns/communities/{community_id:
+    uuid}`. Standard catalog rows refuse PATCH / DELETE with a
+    400. `CommunitiesTab` with collapsible standard catalog +
+    "Use on this AS" buttons + per-AS list grouped by kind.
+    Migration `f4a6c8b2e571_bgp_communities`.
+  - **BGP FK on IPSpace / IPBlock.** `asn_id` UUID column on
+    both, FK to `asn.id` ON DELETE SET NULL, indexed. Shared
+    `AsnPicker` at `components/ipam/asn-picker.tsx` wired into
+    the four IPSpace / IPBlock modals as an optional "Origin ASN
+    (BGP)" field. Migration `c9f1e47d2a83_bgp_asn_fk`.
+  - **Detail page tabs.** WHOIS · RPKI ROAs · Linked IPAM ·
+    BGP Peering · Communities · Alerts.
+
+- ✅ **VRFs as first-class entities** (issue #86). Replaces the
+  freeform `vrf_name` / `route_distinguisher` / `route_targets`
+  text fields on IPSpace with a relational `vrf` table.
+  - **Data model.** `vrf` table carries name, description,
+    optional `asn_id` FK, RD with format validation, split
+    import / export RT lists, tags, custom_fields. `ip_space.
+    vrf_id` + `ip_block.vrf_id` FKs ON DELETE SET NULL. Migration
+    backfills new VRF rows from every distinct (vrf_name, rd,
+    rt-list) triple on existing IPSpace rows and stamps each
+    space's `vrf_id` at the matching new row; freeform columns
+    stay in place for one release cycle so operators can verify
+    the mapping landed before they get dropped.
+  - **Cross-cutting RD / RT validation.** Each `ASN:N` entry
+    whose ASN portion does not match `vrf.asn.number` produces a
+    non-blocking warning on the response. `PlatformSettings.
+    vrf_strict_rd_validation` flips to escalate the same
+    mismatch to 422. Second warning fires when `vrf.asn_id` is
+    null but the RD is in `ASN:N` form. `IPBlock` responses also
+    carry `vrf_warning` flagging when a block's pinned VRF
+    differs from its parent space's VRF (intentional in
+    hub-and-spoke designs but worth a heads-up).
+  - **VRF picker** at `components/ipam/vrf-picker.tsx` wired into
+    the New / Edit IPSpace + Create / Edit IPBlock modals,
+    replacing the freeform text inputs. Space-detail header
+    surfaces the linked VRF's name + RD + RTs read-only via the
+    cached VRF list.
+  - **Permission + UI.** `manage_vrfs` permission seeded into
+    the Network Editor builtin role. List page at `/network/
+    vrfs` with bulk-select + draggable create/edit modal. Detail
+    page at `/network/vrfs/:id` with linked IP spaces / blocks
+    tabs and a Pencil HeaderButton wired to the shared
+    `VRFEditorModal`. Migrations `2c4e9d1a7f63_vrf_first_class`
+    + `b7e2a4f91d35_vrf_phase2`.
+
+- ✅ **Domain registration tracking** (issue #87). Distinct from
+  DNSZone — tracks the registry side of a name (registrar /
+  registrant / expiry / nameservers / DNSSEC) versus the records
+  SpatiumDDI serves.
+  - **Data model.** `domain` table with the registry-side fields,
+    expected-vs-actual nameservers, `whois_state` (ok / drift /
+    expiring / expired / unreachable), `consecutive_failures`
+    counter. Migrations `3124d540d74f_domain_registration` +
+    `4a9e7c2d18b3_domain_phase2`.
+  - **RDAP refresh.** `app.services.rdap` httpx client (10 s
+    per-call / 15 s total budget). TLD → RDAP-base lookup driven
+    by the IANA bootstrap registry at `data.iana.org/rdap/dns.
+    json`, cached in-process for 6 h with an asyncio lock against
+    thundering-herd refetch + a stale-cache fallback if the
+    bootstrap fetch fails — `rdap.iana.org/domain/<n>` returns
+    404 for any non-test domain so per-TLD routing is mandatory.
+    Routes `.com` → `rdap.verisign.com/com/v1/`, `.net` →
+    `rdap.verisign.com/net/v1/`, etc. Beat-fired `app/tasks/
+    domain_whois_refresh.refresh_due_domains` ticks hourly,
+    self-paces via `PlatformSettings.domain_whois_interval_hours`
+    (default 24 h, 1–168 h range). `derive_whois_state` decision
+    tree (unreachable → expired → expiring < 30 d → drift → ok)
+    + `compute_nameserver_drift` shared between sync `POST
+    /domains/{id}/refresh-whois` endpoint and the task.
+  - **Alert rules.** `domain_expiring` (severity escalation at
+    threshold/4 + threshold/12 around the operator-set
+    `threshold_days`, default 30 d), `domain_nameserver_drift`,
+    `domain_registrar_changed`, `domain_dnssec_status_changed`.
+    The two transition-once rules latch the observed value into
+    a new `alert_event.last_observed_value` JSONB column so a
+    single flip fires exactly one event, auto-resolved after
+    7 d. `alert_rule.threshold_days` is the new params column
+    (mirrors the existing `threshold_percent` shape).
+  - **DNSZone linkage.** `dns_zone.domain_id` nullable FK ON
+    DELETE SET NULL. Picker on the DNS zone create / edit modal —
+    "Auto-match by zone name" remains the default for backward-
+    compat. Domain detail's "Linked DNS Zones" tab prefers the
+    explicit FK and falls back to a left-anchored suffix match
+    (`zone === domain || zone.endsWith("." + domain)`) when
+    `domain_id` is unset, so child zones inherit (`test.example.
+    com` shows up under `example.com`) but `example.com.au`
+    correctly does NOT match `example.com`. Sub-zones get a
+    "sub-zone" badge. Migration `e7b8c4f96a12_dns_zone_domain_fk`.
+  - **List + detail UI.** Domains nav lives in the core sidebar
+    (between DNS Pools and Logs) — registration tracking is core
+    operational data, not platform admin. List page at `/admin/
+    domains` with sticky table, expiry countdown badges (green >
+    90 d / amber 30–90 d / red < 30 d / dark-red expired),
+    per-row Refresh + Edit + Delete, multi-select bulk refresh /
+    bulk delete, expandable row with raw RDAP payload. Detail
+    page at `/admin/domains/:id` with registration card,
+    expected-vs-actual NS diff panel, raw WHOIS / Linked DNS
+    Zones / Alert History tabs.
+
 
 ## Integration roadmap
 

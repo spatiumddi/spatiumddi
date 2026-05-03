@@ -75,6 +75,15 @@
 | 📜 | **DHCP lease history** | forensic trail of every expiry, MAC reassignment, absence-delete |
 | 🗑 | **Soft-delete trash** | 30-day Trash with cascade restore for spaces, blocks, subnets, zones, scopes |
 
+### 🌐 Network entities
+
+| | Feature | Highlights |
+|---|---|---|
+| 🌐 | **ASN management** | first-class ASN entity · RDAP holder refresh (per-RIR routing via IANA bootstrap) · RPKI ROA pull (Cloudflare or RIPE) with expiry tracking · holder-drift detection with side-by-side diff · alert rules for drift / unreachable / ROA expiry |
+| 🤝 | **BGP peering + communities** | peer / customer / provider / sibling graph between tracked ASNs · BGP communities catalog (RFC 1997 / 7611 / 7999 well-knowns + per-AS extensions, large communities per RFC 8092) |
+| 🛣 | **VRFs as first-class** | name / RD / import + export RTs / optional ASN linkage · cross-cutting RD/RT validator (warns or 422s on ASN-portion mismatch) · VRF picker on IPSpace + IPBlock modals · auto-backfill from existing freeform fields |
+| 📛 | **Domain registration tracking** | distinct from DNSZone — registrar / registrant / expiry / nameservers / DNSSEC · RDAP refresh (TLD → RDAP-base via IANA bootstrap) · NS-drift, registrar-changed, DNSSEC-status-changed alerts · explicit `dns_zone.domain_id` linkage with sub-zone tree fallback |
+
 ### 🔍 Discovery & visibility
 
 | | Feature | Highlights |
@@ -210,6 +219,38 @@ The tables above are the elevator pitch. The bullets here are the same surface w
   - RFC 2136 + WinRM for DNS
   - Near-real-time WinRM lease-mirroring for DHCP
   - No software installed on the Windows side
+
+### Network entities
+
+- 🌐 **ASN management** — first-class autonomous-system entity.
+  - Data model: `asn` table with BigInteger `number` (full 32-bit range), auto-derived `kind` (public / private per RFC 6996 + RFC 7300), auto-derived `registry` (RIR — arin / ripe / apnic / lacnic / afrinic) from a hand-curated IANA delegation snapshot
+  - **RDAP holder refresh** — per-RIR routing via IANA bootstrap; per-row Refresh button + scheduled hourly task (`asn_whois_interval_hours`, default 24 h)
+  - **RPKI ROA pull** — Cloudflare or RIPE NCC source (operator-tunable via `rpki_roa_source`); cached for 5 min in-memory so a sweep of 50 ASNs makes one HTTP call; per-row Refresh RPKI button
+  - **Holder-drift diff viewer** — `previous_holder` persisted on every refresh so the WHOIS tab can render a side-by-side without consulting the audit log
+  - **Alert rules** — `asn_holder_drift`, `asn_whois_unreachable`, `rpki_roa_expiring`, `rpki_roa_expired`
+  - Detail page tabs: WHOIS · RPKI ROAs · Linked IPAM · BGP Peering · Communities · Alerts
+
+- 🤝 **BGP peering + communities** — operator-curated relationship graph + community catalog.
+  - **Peerings** — `bgp_peering` table with `peer | customer | provider | sibling`; both endpoints FK ON DELETE CASCADE; unique on `(local, peer, relationship_type)`. Form lets the operator pick either side as "local"; modal normalises to canonical shape on submit
+  - **`Router.local_asn_id` FK** — stamps which AS a router originates routes from
+  - **Communities catalog** — 7 RFC 1997 / 7611 / 7999 well-knowns seeded as platform rows (no-export, no-advertise, no-export-subconfed, local-as, graceful-shutdown, blackhole, accept-own); per-AS catalog with `kind` validation (`standard` / `regular` `ASN:N` / `large` `ASN:N:M`)
+  - "Use on this AS" button per standard row pre-fills the form with the well-known value
+
+- 🛣 **VRFs as first-class entities** — replaces the freeform `vrf_name` / `route_distinguisher` / `route_targets` text fields on IPSpace.
+  - Data model: `vrf` table with name, description, optional `asn_id` FK, RD (with format validation), split import / export RT lists, tags, custom_fields
+  - `ip_space.vrf_id` + `ip_block.vrf_id` FKs ON DELETE SET NULL
+  - **Cross-cutting RD / RT validator** — each `ASN:N` entry whose ASN portion does not match `vrf.asn.number` produces a non-blocking warning; `vrf_strict_rd_validation` toggle escalates to 422
+  - `IPBlock.vrf_warning` flags when a block's pinned VRF differs from its parent space's VRF (intentional in hub-and-spoke designs but worth a heads-up)
+  - **VRF picker** on the New / Edit IPSpace and Create / Edit IPBlock modals (replaces the freeform text inputs)
+  - Migration backfills existing freeform values into VRF rows so nothing is lost
+
+- 📛 **Domain registration tracking** — distinct from DNSZone (records SpatiumDDI serves vs. registry-side metadata).
+  - Data model: `domain` table tracking registrar / registrant / expiry / DNSSEC status / nameservers
+  - **RDAP refresh** — TLD → RDAP-base lookup driven by the IANA bootstrap registry (`data.iana.org/rdap/dns.json`), cached 6 h; routes `.com` → `rdap.verisign.com/com/v1/`, etc.
+  - **Nameserver drift** — operator-pinned expected list vs. registry-advertised list, with a side-by-side diff panel
+  - **Alert rules** — `domain_expiring` (severity escalation around `threshold_days`), `domain_nameserver_drift`, `domain_registrar_changed`, `domain_dnssec_status_changed`
+  - Per-row expiry countdown badges (green > 90 d / amber 30–90 d / red < 30 d / dark-red expired)
+  - **Explicit `dns_zone.domain_id` linkage** with sub-zone suffix-match fallback — `test.example.com` shows up under `example.com`'s linked-zones tab; `example.com.au` correctly does NOT
 
 ### Discovery & visibility
 
@@ -396,7 +437,7 @@ docker compose up -d                  # recreate api/worker/beat/frontend on the
 
 ```bash
 # In your .env:
-SPATIUMDDI_VERSION=2026.04.30-1
+SPATIUMDDI_VERSION=2026.05.03-1
 
 # Then:
 docker compose pull

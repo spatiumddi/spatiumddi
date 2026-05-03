@@ -43,6 +43,8 @@ Each entry in `Role.permissions` (JSONB) is an object with this shape:
 | `ip_address`      | Individual IPs, aliases, bulk address ops             |
 | `vlan`            | VLANs and routers                                     |
 | `vrf`             | VRFs (Virtual Routing and Forwarding) — `manage_vrfs` |
+| `asn`             | Autonomous Systems + RPKI ROAs + BGP peering / communities — `manage_asns` |
+| `domain`          | Domain registration tracking (registrar / expiry / NS drift) — `manage_domains` |
 | `dns_zone`        | DNS zones (forward and reverse)                       |
 | `dns_record`      | DNS records within a zone                             |
 | `dns_group`       | DNS server groups, servers, views, ACLs, trust anchors |
@@ -89,7 +91,8 @@ Each entry in `Role.permissions` (JSONB) is an object with this shape:
 | `Viewer`       | `[{"action": "read", "resource_type": "*"}]`                 |
 | `IPAM Editor`  | `admin` on `ip_space`, `ip_block`, `subnet`, `ip_address`, `vlan`, `custom_field` |
 | `DNS Editor`   | `admin` on `dns_zone`, `dns_record`, `dns_group`, `dns_blocklist` |
-| `DHCP Editor`  | `admin` on `dhcp_server`, `dhcp_scope`, `dhcp_pool`, `dhcp_static`, `dhcp_client_class` |
+| `DHCP Editor`  | `admin` on `dhcp_server`, `dhcp_scope`, `dhcp_pool`, `dhcp_static`, `dhcp_client_class`, `dhcp_option_template`, `dhcp_mac_block` |
+| `Network Editor` | `admin` on `manage_network_devices`, `manage_nmap_scans`, `manage_asns`, `vrf` (full CRUD on SNMP-polled devices, nmap scans, ASN registry, and VRFs) |
 
 Built-in roles (`is_builtin=True`) can be cloned but not deleted.
 
