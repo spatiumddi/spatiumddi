@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Check,
@@ -11,7 +12,14 @@ import {
 } from "lucide-react";
 import { Modal } from "@/components/ui/modal";
 import { HeaderButton } from "@/components/ui/header-button";
-import { vrfsApi, type VRF, type VRFCreate, type VRFUpdate } from "@/lib/api";
+import { AsnPicker } from "@/components/ipam/asn-picker";
+import {
+  asnsApi,
+  vrfsApi,
+  type VRF,
+  type VRFCreate,
+  type VRFUpdate,
+} from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
 
 const inputCls =
@@ -84,6 +92,38 @@ function CountBadge({
 // Comma-separated string ↔ trimmed string[]. Preserves user-typed
 // whitespace until submit so "65000:100, 65000:200" doesn't keep
 // stripping mid-edit.
+/** Resolves ``asn_id`` against the cached ASN list and renders
+ * ``AS{number}`` instead of a UUID slice. Falls back to "—" when
+ * the ASN list hasn't loaded yet or the row is missing. */
+function AsnNumberCell({ asnId }: { asnId: string | null | undefined }) {
+  const { data } = useQuery({
+    queryKey: ["asns-picker"],
+    queryFn: () => asnsApi.list({ limit: 500 }),
+    staleTime: 60_000,
+    enabled: !!asnId,
+  });
+  if (!asnId) {
+    return <span className="text-muted-foreground/50">—</span>;
+  }
+  const asn = (data?.items ?? []).find((a) => a.id === asnId);
+  if (!asn) {
+    return (
+      <span className="text-muted-foreground/50" title={asnId}>
+        …
+      </span>
+    );
+  }
+  return (
+    <Link
+      to={`/network/asns/${asn.id}`}
+      className="rounded bg-muted px-1.5 py-0.5 hover:bg-accent"
+    >
+      AS{asn.number}
+      {asn.name ? ` — ${asn.name}` : ""}
+    </Link>
+  );
+}
+
 function csvToList(s: string): string[] {
   return s
     .split(",")
@@ -114,6 +154,7 @@ function VRFEditorModal({
   const [exportTargets, setExportTargets] = useState(
     listToCsv(existing?.export_targets ?? []),
   );
+  const [asnId, setAsnId] = useState<string | null>(existing?.asn_id ?? null);
   const [error, setError] = useState<string | null>(null);
 
   const rdValid = rd.trim() === "" || isValidRdRt(rd);
@@ -133,6 +174,7 @@ function VRFEditorModal({
         route_distinguisher: rd.trim() === "" ? null : rd.trim(),
         import_targets: importItems,
         export_targets: exportItems,
+        asn_id: asnId,
       };
       if (existing) {
         return vrfsApi.update(existing.id, body);
@@ -201,6 +243,17 @@ function VRFEditorModal({
             value={description}
             onChange={(e) => setDescription(e.target.value)}
           />
+        </Field>
+        <Field
+          label="Origin ASN"
+          hint={
+            <span>
+              Optional. Cross-cutting validators check that any{" "}
+              <code>ASN:N</code> RD / RT below uses this ASN's number.
+            </span>
+          }
+        >
+          <AsnPicker className={inputCls} value={asnId} onChange={setAsnId} />
         </Field>
         <Field label="Route distinguisher (RD)" hint={rdHint}>
           <input
@@ -532,18 +585,16 @@ export function VRFsPage() {
                       onChange={() => toggleOne(v.id)}
                     />
                   </td>
-                  <td className="px-2 py-1.5 font-mono text-xs">{v.name}</td>
+                  <td className="px-2 py-1.5 font-mono text-xs">
+                    <Link
+                      to={`/network/vrfs/${v.id}`}
+                      className="hover:text-primary hover:underline"
+                    >
+                      {v.name}
+                    </Link>
+                  </td>
                   <td className="px-2 py-1.5 font-mono text-[11px]">
-                    {v.asn_id ? (
-                      <span
-                        className="rounded bg-muted px-1.5 py-0.5"
-                        title={v.asn_id}
-                      >
-                        {v.asn_id.slice(0, 8)}
-                      </span>
-                    ) : (
-                      <span className="text-muted-foreground/50">—</span>
-                    )}
+                    <AsnNumberCell asnId={v.asn_id} />
                   </td>
                   <td className="px-2 py-1.5 font-mono text-[11px]">
                     {v.route_distinguisher ?? (

@@ -18,6 +18,7 @@ import {
   type BGPRelationshipType,
 } from "@/lib/api";
 import { HeaderButton } from "@/components/ui/header-button";
+import { RdapPanel } from "@/components/network/rdap-panel";
 import { cn } from "@/lib/utils";
 
 import { errMsg, humanTime } from "./_shared";
@@ -227,19 +228,17 @@ export function AsnDetailPage() {
   }
 
   // ``whois_data.raw`` is the full RDAP response payload. The RIRs
-  // serve JSON, so this is normally a nested object — pretty-print it
-  // for the operator. Older snapshots may have stored a plain string,
-  // so keep that path working too.
-  const whoisRawDisplay = (() => {
-    const raw = asn.whois_data?.raw;
-    if (raw == null) return null;
-    if (typeof raw === "string") return raw;
-    try {
-      return JSON.stringify(raw, null, 2);
-    } catch {
-      return null;
-    }
-  })();
+  // serve JSON, so this is normally a nested object that the
+  // ``RdapPanel`` component below pulls into structured UI. Older
+  // snapshots may have stored a plain string — render those as a
+  // pre-formatted block.
+  const rawValue = asn.whois_data?.raw;
+  const rawString =
+    typeof rawValue === "string" && rawValue.length > 0 ? rawValue : null;
+  const rawObject =
+    rawValue && typeof rawValue === "object" && !Array.isArray(rawValue)
+      ? (rawValue as Record<string, unknown>)
+      : null;
   const previousHolder =
     typeof asn.whois_data?.previous_holder === "string"
       ? (asn.whois_data.previous_holder as string)
@@ -448,15 +447,12 @@ export function AsnDetailPage() {
               />
             </div>
 
-            {whoisRawDisplay ? (
-              <div>
-                <p className="mb-1 text-xs font-medium text-muted-foreground">
-                  Raw RDAP response
-                </p>
-                <pre className="rounded-md border bg-muted/30 p-3 text-xs font-mono overflow-auto max-h-96 whitespace-pre-wrap">
-                  {whoisRawDisplay}
-                </pre>
-              </div>
+            {rawObject ? (
+              <RdapPanel payload={rawObject} kind="asn" />
+            ) : rawString ? (
+              <pre className="rounded-md border bg-muted/30 p-3 text-xs font-mono overflow-auto max-h-96 whitespace-pre-wrap">
+                {rawString}
+              </pre>
             ) : (
               <p className="text-xs text-muted-foreground">
                 No raw WHOIS data — run Refresh WHOIS to populate.

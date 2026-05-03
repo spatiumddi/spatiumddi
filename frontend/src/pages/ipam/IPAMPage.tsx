@@ -2137,14 +2137,24 @@ function CollisionWarningBanner({
 
 function AddAddressModal({
   subnetId,
+  presetRange,
   onClose,
 }: {
   subnetId: string;
+  /** When set (e.g. operator clicked a "free range" gap row), the
+   * modal opens locked to manual mode with the address pre-filled to
+   * the start of the range and a row of quick-pick buttons for first
+   * / next / last / random within the range. */
+  presetRange?: { startIpInt: number; endIpInt: number } | null;
   onClose: () => void;
 }) {
   const qc = useQueryClient();
-  const [mode, setMode] = useState<"manual" | "next">("next");
-  const [address, setAddress] = useState("");
+  const [mode, setMode] = useState<"manual" | "next">(
+    presetRange ? "manual" : "next",
+  );
+  const [address, setAddress] = useState(
+    presetRange ? intToIpv4(presetRange.startIpInt) : "",
+  );
   const [hostname, setHostname] = useState("");
   const [mac, setMac] = useState("");
   const [description, setDescription] = useState("");
@@ -2410,6 +2420,50 @@ function AddAddressModal({
         )}
         {mode === "manual" && (
           <Field label="IP Address">
+            {presetRange && (
+              <div className="mb-2 rounded-md border border-emerald-400/40 bg-emerald-500/[0.06] px-3 py-2 text-xs">
+                <div className="mb-1 text-emerald-700 dark:text-emerald-400">
+                  Allocating from free range{" "}
+                  <span className="font-mono">
+                    {intToIpv4(presetRange.startIpInt)} –{" "}
+                    {intToIpv4(presetRange.endIpInt)}
+                  </span>{" "}
+                  ({presetRange.endIpInt - presetRange.startIpInt + 1} free)
+                </div>
+                <div className="flex flex-wrap gap-1">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setAddress(intToIpv4(presetRange.startIpInt))
+                    }
+                    className="rounded border px-2 py-0.5 text-[11px] hover:bg-accent"
+                  >
+                    First
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setAddress(intToIpv4(presetRange.endIpInt))}
+                    className="rounded border px-2 py-0.5 text-[11px] hover:bg-accent"
+                  >
+                    Last
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const span =
+                        presetRange.endIpInt - presetRange.startIpInt + 1;
+                      const pick =
+                        presetRange.startIpInt +
+                        Math.floor(Math.random() * span);
+                      setAddress(intToIpv4(pick));
+                    }}
+                    className="rounded border px-2 py-0.5 text-[11px] hover:bg-accent"
+                  >
+                    Random
+                  </button>
+                </div>
+              </div>
+            )}
             <input
               className={inputCls}
               value={address}
@@ -3025,6 +3079,13 @@ function SubnetDetail({
 }) {
   const qc = useQueryClient();
   const [showAddModal, setShowAddModal] = useState(false);
+  // Optional seed for ``AddAddressModal`` — set when the operator clicks
+  // a gap-marker row so the modal opens in manual mode constrained to
+  // that contiguous free range.
+  const [addModalRange, setAddModalRange] = useState<{
+    startIpInt: number;
+    endIpInt: number;
+  } | null>(null);
   const [showEditSubnet, setShowEditSubnet] = useState(false);
   const [showResizeSubnet, setShowResizeSubnet] = useState(false);
   const [showSplitSubnet, setShowSplitSubnet] = useState(false);
@@ -4061,6 +4122,15 @@ function SubnetDetail({
                         <tr
                           key={`gap-${row.startIpInt}-${row.endIpInt}`}
                           aria-label={`${count} unallocated IP${count === 1 ? "" : "s"} between rows`}
+                          className="cursor-pointer hover:bg-emerald-500/[0.10]"
+                          onClick={() => {
+                            setAddModalRange({
+                              startIpInt: row.startIpInt,
+                              endIpInt: row.endIpInt,
+                            });
+                            setShowAddModal(true);
+                          }}
+                          title={`Allocate an IP from this free range (${count} available)`}
                         >
                           <td
                             colSpan={12}
@@ -4069,6 +4139,9 @@ function SubnetDetail({
                             <span className="font-mono">{label}</span>
                             <span className="ml-2 opacity-70">
                               · {count} free
+                            </span>
+                            <span className="ml-2 opacity-60">
+                              · click to allocate
                             </span>
                           </td>
                         </tr>
@@ -4490,7 +4563,11 @@ function SubnetDetail({
       {showAddModal && (
         <AddAddressModal
           subnetId={subnet.id}
-          onClose={() => setShowAddModal(false)}
+          presetRange={addModalRange}
+          onClose={() => {
+            setShowAddModal(false);
+            setAddModalRange(null);
+          }}
         />
       )}
       {showEditSubnet && (

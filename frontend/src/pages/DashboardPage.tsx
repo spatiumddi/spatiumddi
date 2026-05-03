@@ -1071,6 +1071,13 @@ export function DashboardPage() {
           />
         </div>
 
+        {/* ── Platform health (Overview only — sits directly below the
+              KPI row so the colour-coded health ribbon is the next
+              thing the eye lands on after the headline counters). ──── */}
+        {tab === "overview" && platformHealth && (
+          <PlatformHealthCard health={platformHealth} />
+        )}
+
         {/* ── Network overview cards (Overview tab) ─────────────────── */}
         {tab === "overview" && (
           <div className="grid gap-3 grid-cols-1 sm:grid-cols-3">
@@ -1324,11 +1331,6 @@ export function DashboardPage() {
               )}
             </div>
           </div>
-        )}
-
-        {/* ── Platform health (Overview only) ────────────────────────── */}
-        {tab === "overview" && platformHealth && (
-          <PlatformHealthCard health={platformHealth} />
         )}
 
         {/* ── DNS tab: Server list ──────────────────────────────────── */}

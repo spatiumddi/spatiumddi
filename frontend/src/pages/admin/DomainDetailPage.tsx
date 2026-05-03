@@ -17,6 +17,7 @@ import {
   type Domain,
   type DomainWhoisState,
 } from "@/lib/api";
+import { RdapPanel } from "@/components/network/rdap-panel";
 import { cn, zebraBodyCls } from "@/lib/utils";
 
 // ── helpers ─────────────────────────────────────────────────────────────────
@@ -226,15 +227,11 @@ function NameserverDiffPanel({ domain }: { domain: Domain }) {
 function WhoisTab({ domain }: { domain: Domain }) {
   return (
     <div className="rounded-lg border bg-card p-4">
-      {domain.whois_data ? (
-        <pre className="overflow-auto text-xs font-mono max-h-96 bg-muted p-3 rounded">
-          {JSON.stringify(domain.whois_data, null, 2)}
-        </pre>
-      ) : (
-        <p className="text-sm text-muted-foreground py-6 text-center">
-          No WHOIS data available — try Refresh WHOIS
-        </p>
-      )}
+      <RdapPanel
+        payload={domain.whois_data as Record<string, unknown> | null}
+        kind="domain"
+        emptyMessage="No WHOIS data available — try Refresh WHOIS"
+      />
     </div>
   );
 }

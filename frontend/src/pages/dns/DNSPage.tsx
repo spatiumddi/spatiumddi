@@ -1635,6 +1635,7 @@ function ZoneDetailView({
     null,
   );
   const [showEditZone, setShowEditZone] = useState(false);
+  const [showAddSubzone, setShowAddSubzone] = useState(false);
   const [showDelegate, setShowDelegate] = useState(false);
   const [confirmDelete, setConfirmDelete] = useState(false);
   const [showImport, setShowImport] = useState(false);
@@ -1904,6 +1905,15 @@ function ZoneDetailView({
           >
             Delete Zone
           </HeaderButton>
+          {!isForward && (
+            <HeaderButton
+              icon={Plus}
+              onClick={() => setShowAddSubzone(true)}
+              title={`Create a sub-zone under ${zone.name.replace(/\.$/, "")}`}
+            >
+              Sub-zone
+            </HeaderButton>
+          )}
           {!isForward && (
             <HeaderButton
               variant="primary"
@@ -2441,6 +2451,16 @@ function ZoneDetailView({
           views={views}
           zone={zone}
           onClose={() => setShowEditZone(false)}
+        />
+      )}
+      {showAddSubzone && (
+        <ZoneModal
+          groupId={group.id}
+          views={views}
+          // Pre-fill with the parent suffix so the operator just types
+          // the leading label at the cursor: "sub" + ".example.com".
+          initialName={"." + zone.name.replace(/\.$/, "")}
+          onClose={() => setShowAddSubzone(false)}
         />
       )}
       {showDelegate && (
