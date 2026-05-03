@@ -1,10 +1,14 @@
 """RDAP (Registration Data Access Protocol) client for domain lookups.
 
-RDAP is the JSON-returning successor to WHOIS. ``rdap.iana.org`` runs
-the bootstrap service: hitting it for any domain returns either the
-TLD's RDAP server URL (via HTTP redirect) or the data directly.
-``httpx``'s default redirect-following turns this into a single call
-from our perspective.
+RDAP is the JSON-returning successor to WHOIS. The IANA bootstrap
+registry at ``data.iana.org/rdap/dns.json`` maps each TLD to its
+authoritative RDAP server URL — we fetch + cache that JSON and use
+it to route per-domain queries to the right server.
+
+(``rdap.iana.org/domain/<n>`` itself returns 404 for any real-world
+domain — it's a *registry*, not a query proxy. An earlier shape that
+relied on it failed silently for everything but a couple of well-known
+test domains.)
 
 Coverage of the major TLDs (com / net / org / io / dev / app / co.uk
 etc) is good enough that we ship RDAP-only in v1. A legacy WHOIS
@@ -19,6 +23,7 @@ for writing the result back to the DB and recomputing derived fields
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -34,9 +39,94 @@ logger = structlog.get_logger(__name__)
 _PER_REQUEST_TIMEOUT = httpx.Timeout(10.0, connect=5.0, read=10.0)
 _TOTAL_TIMEOUT_SECONDS = 15.0
 
-# IANA RDAP bootstrap entry point. ``follow_redirects=True`` resolves
-# the redirect to the TLD-specific RDAP server transparently.
-_RDAP_BASE = "https://rdap.iana.org/domain"
+# IANA RDAP bootstrap registry — JSON map of TLD → RDAP base URL.
+# Refreshed once per ``_BOOTSTRAP_TTL_SECONDS``; on fetch failure we
+# fall back to the previous in-memory copy to keep refreshes working
+# during a transient IANA outage.
+_BOOTSTRAP_URL = "https://data.iana.org/rdap/dns.json"
+_BOOTSTRAP_TTL_SECONDS = 6 * 3600
+
+_bootstrap_lock = asyncio.Lock()
+_bootstrap_cache: dict[str, str] | None = None
+_bootstrap_fetched_at: datetime | None = None
+
+
+async def _get_bootstrap() -> dict[str, str]:
+    """Return a TLD → RDAP-base map. Fetches IANA's bootstrap registry
+    on first call and re-fetches once per :data:`_BOOTSTRAP_TTL_SECONDS`.
+    """
+    global _bootstrap_cache, _bootstrap_fetched_at  # noqa: PLW0603
+
+    now = datetime.now(UTC)
+    cache = _bootstrap_cache
+    fetched = _bootstrap_fetched_at
+    if (
+        cache is not None
+        and fetched is not None
+        and (now - fetched).total_seconds() < _BOOTSTRAP_TTL_SECONDS
+    ):
+        return cache
+
+    async with _bootstrap_lock:
+        # Re-check inside the lock to avoid a thundering-herd refetch.
+        if (
+            _bootstrap_cache is not None
+            and _bootstrap_fetched_at is not None
+            and (now - _bootstrap_fetched_at).total_seconds() < _BOOTSTRAP_TTL_SECONDS
+        ):
+            return _bootstrap_cache
+
+        try:
+            async with httpx.AsyncClient(timeout=_PER_REQUEST_TIMEOUT) as client:
+                resp = await client.get(_BOOTSTRAP_URL)
+            if resp.status_code != 200:
+                raise RuntimeError(f"bootstrap http {resp.status_code}")
+            payload = resp.json()
+        except Exception as exc:  # noqa: BLE001 — fall back to stale cache
+            logger.info(
+                "rdap_bootstrap_fetch_failed",
+                error=str(exc),
+                stale_cache=_bootstrap_cache is not None,
+            )
+            if _bootstrap_cache is not None:
+                return _bootstrap_cache
+            return {}
+
+        # ``services`` is a list of [tlds, urls] pairs. Flatten to
+        # tld → first-https-url (preferred) | first-url so a single
+        # lookup is a dict access.
+        new_map: dict[str, str] = {}
+        for entry in payload.get("services", []):
+            if not (
+                isinstance(entry, list)
+                and len(entry) == 2
+                and isinstance(entry[0], list)
+                and isinstance(entry[1], list)
+            ):
+                continue
+            tlds, urls = entry
+            url_list = [u for u in urls if isinstance(u, str) and u.strip()]
+            if not url_list:
+                continue
+            chosen = next((u for u in url_list if u.startswith("https://")), url_list[0])
+            chosen = chosen.rstrip("/") + "/"
+            for tld in tlds:
+                if isinstance(tld, str) and tld.strip():
+                    new_map[tld.strip().lower()] = chosen
+
+        _bootstrap_cache = new_map
+        _bootstrap_fetched_at = now
+        return new_map
+
+
+def _domain_to_tld(name: str) -> str | None:
+    """Extract the public-facing TLD label from a domain. ``foo.bar.com``
+    → ``com``. Multi-label TLDs like ``co.uk`` aren't matched directly —
+    the bootstrap key is always the rightmost label since IANA delegates
+    per-TLD; ``co.uk`` itself is served by the ``uk`` RDAP base.
+    """
+    parts = [p for p in name.strip().rstrip(".").lower().split(".") if p]
+    return parts[-1] if parts else None
 
 
 def _parse_rdap_datetime(value: Any) -> datetime | None:
@@ -223,7 +313,22 @@ async def lookup_domain(name: str) -> dict[str, Any] | None:
     if not name or not name.strip():
         return None
     target = name.strip().rstrip(".").lower()
-    url = f"{_RDAP_BASE}/{target}"
+
+    tld = _domain_to_tld(target)
+    if tld is None:
+        return None
+
+    bootstrap = await _get_bootstrap()
+    base = bootstrap.get(tld)
+    if base is None:
+        logger.info(
+            "domain_rdap_unreachable",
+            domain=target,
+            error=f"no RDAP base for tld={tld}",
+        )
+        return None
+
+    url = f"{base}domain/{target}"
 
     try:
         async with httpx.AsyncClient(

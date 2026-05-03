@@ -49,6 +49,8 @@ import {
   vlansApi,
   natApi,
   networkApi,
+  asnsApi,
+  vrfsApi,
   IP_ROLE_OPTIONS,
   type IPSpace,
   type IPBlock,
@@ -73,6 +75,7 @@ import { useSessionState } from "@/lib/useSessionState";
 import { useRowHighlight } from "@/lib/useRowHighlight";
 import { Modal } from "@/components/ui/modal";
 import { AsnPicker } from "@/components/ipam/asn-picker";
+import { VrfPicker } from "@/components/ipam/vrf-picker";
 import {
   MODAL_BACKDROP_CLS,
   useDraggableModal,
@@ -521,22 +524,16 @@ function CreateSpaceModal({ onClose }: { onClose: () => void }) {
   const [dhcpServerGroupId, setDhcpServerGroupId] = useState<string | null>(
     null,
   );
-  // VRF / routing annotation — pure metadata, parity with EditSpaceModal so
-  // operators don't have to round-trip through Edit just to set their VRF
-  // name on a freshly-created space. Collapsed by default since most
-  // homelab / SMB deployments don't run a multi-VRF fabric.
+  // VRF / BGP annotation — pure metadata, parity with EditSpaceModal so
+  // operators don't have to round-trip through Edit just to set their
+  // routing context on a freshly-created space. Collapsed by default
+  // since most homelab / SMB deployments don't run a multi-VRF fabric.
   const [showVrf, setShowVrf] = useState<boolean>(false);
-  const [vrfName, setVrfName] = useState<string>("");
-  const [routeDistinguisher, setRouteDistinguisher] = useState<string>("");
-  const [routeTargetsText, setRouteTargetsText] = useState<string>("");
+  const [vrfId, setVrfId] = useState<string | null>(null);
   const [asnId, setAsnId] = useState<string | null>(null);
 
   const mutation = useMutation({
     mutationFn: () => {
-      const trimmedRTs = routeTargetsText
-        .split(/[,\n]+/g)
-        .map((s) => s.trim())
-        .filter((s) => s.length > 0);
       return ipamApi.createSpace({
         name,
         description,
@@ -546,9 +543,7 @@ function CreateSpaceModal({ onClose }: { onClose: () => void }) {
         dns_zone_id: dnsZoneId,
         dns_additional_zone_ids: dnsAdditionalZoneIds,
         dhcp_server_group_id: dhcpServerGroupId,
-        vrf_name: vrfName.trim() || null,
-        route_distinguisher: routeDistinguisher.trim() || null,
-        route_targets: trimmedRTs.length > 0 ? trimmedRTs : null,
+        vrf_id: vrfId,
         asn_id: asnId,
       });
     },
@@ -609,10 +604,10 @@ function CreateSpaceModal({ onClose }: { onClose: () => void }) {
           />
         </div>
 
-        {/* VRF / routing annotation — collapsible to keep the create form
-            tidy for operators who don't run multiple VRFs. Mirrors the
-            same section in EditSpaceModal so operators see VRF / RD / RT
-            on first creation without round-tripping through Edit. */}
+        {/* VRF / BGP annotation — collapsible to keep the form tidy
+            for operators who don't run multiple VRFs. Both fields are
+            FK pickers backed by first-class entities; RD / RT are
+            stored on the VRF row and surfaced read-only when picked. */}
         <div className="border-t pt-3">
           <button
             type="button"
@@ -624,34 +619,26 @@ function CreateSpaceModal({ onClose }: { onClose: () => void }) {
             ) : (
               <ChevronRight className="h-3 w-3" />
             )}
-            VRF / Routing (optional)
+            VRF / BGP (optional)
           </button>
           {showVrf && (
             <div className="mt-2 space-y-2">
-              <Field label="VRF name">
-                <input
+              <Field label="VRF">
+                <VrfPicker
                   className={inputCls}
-                  value={vrfName}
-                  onChange={(e) => setVrfName(e.target.value)}
-                  placeholder="e.g. CORP-RED"
+                  value={vrfId}
+                  onChange={setVrfId}
                 />
-              </Field>
-              <Field label="Route distinguisher">
-                <input
-                  className={inputCls}
-                  value={routeDistinguisher}
-                  onChange={(e) => setRouteDistinguisher(e.target.value)}
-                  placeholder="e.g. 65000:100"
-                />
-              </Field>
-              <Field label="Route targets (comma- or newline-separated)">
-                <textarea
-                  className={inputCls}
-                  rows={3}
-                  value={routeTargetsText}
-                  onChange={(e) => setRouteTargetsText(e.target.value)}
-                  placeholder={"import:65000:100\nexport:65000:200"}
-                />
+                <p className="mt-1 text-[11px] text-muted-foreground">
+                  Manage VRFs (RD + import / export RTs) under{" "}
+                  <a
+                    href="/network/vrfs"
+                    className="underline hover:text-foreground"
+                  >
+                    Network → VRFs
+                  </a>
+                  .
+                </p>
               </Field>
               <Field label="Origin ASN (BGP)">
                 <AsnPicker
@@ -662,8 +649,8 @@ function CreateSpaceModal({ onClose }: { onClose: () => void }) {
               </Field>
               <p className="text-xs text-muted-foreground">
                 Pure annotation — address allocation does not consult these
-                fields. Different VRFs with overlapping IPs already work via
-                separate IPSpace rows.
+                fields. Different VRFs with overlapping IPs already work
+                via separate IPSpace rows.
               </p>
             </div>
           )}
@@ -7925,6 +7912,106 @@ function ConfirmDestroyModal({
   );
 }
 
+// ─── VRF / BGP badges in the space detail header ────────────────────────────
+
+/** Resolves ``space.vrf_id`` against the VRF list (cached) and renders the
+ * linked VRF's name + RD + RTs as badges. Falls back to the legacy freeform
+ * ``vrf_name`` / ``route_distinguisher`` / ``route_targets`` columns for
+ * backward-compat with rows created before issue #86 phase 1. */
+function SpaceVrfBadges({
+  space,
+  onEdit,
+}: {
+  space: IPSpace;
+  onEdit: () => void;
+}) {
+  const { data: vrfs } = useQuery({
+    queryKey: ["vrfs-picker"],
+    queryFn: () => vrfsApi.list(),
+    staleTime: 60_000,
+  });
+  const linkedVrf = space.vrf_id
+    ? (vrfs ?? []).find((v) => v.id === space.vrf_id)
+    : null;
+
+  const vrfName = linkedVrf?.name ?? space.vrf_name ?? null;
+  const rd = linkedVrf?.route_distinguisher ?? space.route_distinguisher ?? null;
+  const importTargets = linkedVrf?.import_targets ?? null;
+  const exportTargets = linkedVrf?.export_targets ?? null;
+  const legacyTargets = !linkedVrf ? (space.route_targets ?? null) : null;
+
+  const hasAny =
+    vrfName ||
+    rd ||
+    space.asn_id ||
+    (importTargets && importTargets.length > 0) ||
+    (exportTargets && exportTargets.length > 0) ||
+    (legacyTargets && legacyTargets.length > 0);
+
+  if (!hasAny) {
+    return (
+      <p className="mt-1 text-xs text-muted-foreground/50">
+        VRF / BGP — not configured{" "}
+        <button
+          type="button"
+          onClick={onEdit}
+          className="underline hover:text-muted-foreground"
+        >
+          (Edit Space to add)
+        </button>
+      </p>
+    );
+  }
+
+  return (
+    <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+      {vrfName && (
+        <span className="rounded border px-1.5 py-0.5 font-mono">
+          VRF: {vrfName}
+          {!linkedVrf && space.vrf_name ? " (legacy)" : ""}
+        </span>
+      )}
+      {rd && (
+        <span className="rounded border px-1.5 py-0.5 font-mono">
+          RD: {rd}
+        </span>
+      )}
+      {importTargets && importTargets.length > 0 && (
+        <span className="rounded border px-1.5 py-0.5 font-mono">
+          import: {importTargets.join(", ")}
+        </span>
+      )}
+      {exportTargets && exportTargets.length > 0 && (
+        <span className="rounded border px-1.5 py-0.5 font-mono">
+          export: {exportTargets.join(", ")}
+        </span>
+      )}
+      {legacyTargets && legacyTargets.length > 0 && (
+        <span className="rounded border border-amber-500/40 bg-amber-500/5 px-1.5 py-0.5 font-mono text-amber-700 dark:text-amber-400">
+          RT (legacy): {legacyTargets.join(", ")}
+        </span>
+      )}
+      {space.asn_id && <SpaceAsnBadge asnId={space.asn_id} />}
+    </div>
+  );
+}
+
+function SpaceAsnBadge({ asnId }: { asnId: string }) {
+  const { data } = useQuery({
+    queryKey: ["asns-picker"],
+    queryFn: () => asnsApi.list({ limit: 500 }),
+    staleTime: 60_000,
+  });
+  const asn = (data?.items ?? []).find((a) => a.id === asnId);
+  if (!asn) return null;
+  return (
+    <span className="rounded border px-1.5 py-0.5 font-mono">
+      AS{asn.number}
+      {asn.name ? ` — ${asn.name}` : ""}
+    </span>
+  );
+}
+
 // ─── Edit IP Space Modal (name/description + delete trigger) ─────────────────
 
 function EditSpaceModal({
@@ -7956,27 +8043,17 @@ function EditSpaceModal({
   const [dhcpServerGroupId, setDhcpServerGroupId] = useState<string | null>(
     space.dhcp_server_group_id ?? null,
   );
-  // VRF / routing annotation — pure metadata, no semantic effect on
+  // VRF / BGP annotation — pure metadata, no semantic effect on
   // address allocation. The collapsible section keeps the modal tidy
-  // for operators who don't run multiple VRFs.
+  // for operators who don't run multiple VRFs. Legacy freeform values
+  // (vrf_name / RD / RTs) are migrated forward to first-class VRF
+  // entities — see issue #86 phase 1; the picker below points at one.
   const [showVrf, setShowVrf] = useState<boolean>(true);
-  const [vrfName, setVrfName] = useState<string>(space.vrf_name ?? "");
-  const [routeDistinguisher, setRouteDistinguisher] = useState<string>(
-    space.route_distinguisher ?? "",
-  );
-  // Stored as a single comma- / newline-separated string in the form
-  // for ergonomics — split into a list on save.
-  const [routeTargetsText, setRouteTargetsText] = useState<string>(
-    (space.route_targets ?? []).join("\n"),
-  );
+  const [vrfId, setVrfId] = useState<string | null>(space.vrf_id ?? null);
   const [asnId, setAsnId] = useState<string | null>(space.asn_id ?? null);
 
   const saveMutation = useMutation({
     mutationFn: () => {
-      const trimmedRTs = routeTargetsText
-        .split(/[,\n]+/g)
-        .map((s) => s.trim())
-        .filter((s) => s.length > 0);
       return ipamApi.updateSpace(space.id, {
         name,
         description,
@@ -7985,9 +8062,7 @@ function EditSpaceModal({
         dns_zone_id: dnsZoneId,
         dns_additional_zone_ids: dnsAdditionalZoneIds,
         dhcp_server_group_id: dhcpServerGroupId,
-        vrf_name: vrfName.trim() || null,
-        route_distinguisher: routeDistinguisher.trim() || null,
-        route_targets: showVrf ? trimmedRTs : null,
+        vrf_id: vrfId,
         asn_id: asnId,
       });
     },
@@ -8155,8 +8230,8 @@ function EditSpaceModal({
           />
         </div>
 
-        {/* VRF / routing annotation — collapsible because most homelab
-            and small deployments don't run a multi-VRF fabric. */}
+        {/* VRF / BGP annotation — collapsible because most homelab and
+            small deployments don't run a multi-VRF fabric. */}
         <div className="border-t pt-3">
           <button
             type="button"
@@ -8168,34 +8243,35 @@ function EditSpaceModal({
             ) : (
               <ChevronRight className="h-3 w-3" />
             )}
-            VRF / Routing (optional)
+            VRF / BGP (optional)
           </button>
           {showVrf && (
             <div className="mt-2 space-y-2">
-              <Field label="VRF name">
-                <input
+              <Field label="VRF">
+                <VrfPicker
                   className={inputCls}
-                  value={vrfName}
-                  onChange={(e) => setVrfName(e.target.value)}
-                  placeholder="e.g. CORP-RED"
+                  value={vrfId}
+                  onChange={setVrfId}
                 />
-              </Field>
-              <Field label="Route distinguisher">
-                <input
-                  className={inputCls}
-                  value={routeDistinguisher}
-                  onChange={(e) => setRouteDistinguisher(e.target.value)}
-                  placeholder="e.g. 65000:100"
-                />
-              </Field>
-              <Field label="Route targets (comma- or newline-separated)">
-                <textarea
-                  className={inputCls}
-                  rows={3}
-                  value={routeTargetsText}
-                  onChange={(e) => setRouteTargetsText(e.target.value)}
-                  placeholder={"import:65000:100\nexport:65000:200"}
-                />
+                <p className="mt-1 text-[11px] text-muted-foreground">
+                  Manage VRFs (RD + import / export RTs) under{" "}
+                  <a
+                    href="/network/vrfs"
+                    className="underline hover:text-foreground"
+                  >
+                    Network → VRFs
+                  </a>
+                  .
+                </p>
+                {space.vrf_name && !vrfId && (
+                  <p className="mt-1 text-[11px] text-amber-600 dark:text-amber-400">
+                    Legacy freeform VRF: <code>{space.vrf_name}</code>
+                    {space.route_distinguisher
+                      ? ` (RD ${space.route_distinguisher})`
+                      : ""}{" "}
+                    — pick a first-class VRF above to migrate.
+                  </p>
+                )}
               </Field>
               <Field label="Origin ASN (BGP)">
                 <AsnPicker
@@ -8206,8 +8282,8 @@ function EditSpaceModal({
               </Field>
               <p className="text-xs text-muted-foreground">
                 Pure annotation — address allocation does not consult these
-                fields. Different VRFs with overlapping IPs already work via
-                separate IPSpace rows.
+                fields. Different VRFs with overlapping IPs already work
+                via separate IPSpace rows.
               </p>
             </div>
           )}
@@ -8351,6 +8427,7 @@ function CreateBlockModal({
     null,
   );
   const [asnId, setAsnId] = useState<string | null>(null);
+  const [vrfId, setVrfId] = useState<string | null>(null);
 
   const { data: existingBlocks } = useQuery({
     queryKey: ["blocks", spaceId],
@@ -8386,6 +8463,7 @@ function CreateBlockModal({
         dhcp_inherit_settings: dhcpInherit,
         ...(dhcpInherit ? {} : { dhcp_server_group_id: dhcpServerGroupId }),
         asn_id: asnId,
+        vrf_id: vrfId,
       }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["blocks", spaceId] });
@@ -8476,7 +8554,19 @@ function CreateBlockModal({
             fallbackSpaceId={!parentBlockId ? spaceId : null}
           />
         </div>
-        <div className="border-t pt-3">
+        <div className="border-t pt-3 space-y-3">
+          <Field label="VRF (optional)">
+            <VrfPicker
+              className={inputCls}
+              value={vrfId}
+              onChange={setVrfId}
+            />
+            <p className="mt-1 text-[11px] text-muted-foreground">
+              Pin a different VRF than the parent space when this block lives
+              in a separate routing context (e.g. hub-and-spoke fabrics).
+              Leave blank to inherit from the space.
+            </p>
+          </Field>
           <Field label="Origin ASN (BGP, optional)">
             <AsnPicker
               className={inputCls}
@@ -8551,6 +8641,7 @@ function EditBlockModal({
     block.dhcp_server_group_id ?? null,
   );
   const [asnId, setAsnId] = useState<string | null>(block.asn_id ?? null);
+  const [vrfId, setVrfId] = useState<string | null>(block.vrf_id ?? null);
 
   const { data: cfDefs = [] } = useQuery({
     queryKey: ["custom-fields", "ip_block"],
@@ -8614,6 +8705,7 @@ function EditBlockModal({
         dhcp_inherit_settings: dhcpInherit,
         dhcp_server_group_id: dhcpInherit ? null : dhcpServerGroupId,
         asn_id: asnId,
+        vrf_id: vrfId,
       }),
     onSuccess: (updated) => {
       qc.invalidateQueries({ queryKey: ["blocks", block.space_id] });
@@ -8789,7 +8881,18 @@ function EditBlockModal({
             }
           />
         </div>
-        <div className="border-t pt-3">
+        <div className="border-t pt-3 space-y-3">
+          <Field label="VRF (optional)">
+            <VrfPicker
+              className={inputCls}
+              value={vrfId}
+              onChange={setVrfId}
+            />
+            <p className="mt-1 text-[11px] text-muted-foreground">
+              Override the parent space's VRF when this block lives in a
+              different routing context. Leave blank to inherit.
+            </p>
+          </Field>
           <Field label="Origin ASN (BGP, optional)">
             <AsnPicker
               className={inputCls}
@@ -10360,38 +10463,10 @@ function SpaceTableView({
           {space.description && (
             <p className="text-xs text-muted-foreground">{space.description}</p>
           )}
-          {space.vrf_name ||
-          space.route_distinguisher ||
-          (space.route_targets && space.route_targets.length > 0) ? (
-            <div className="mt-1 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
-              {space.vrf_name && (
-                <span className="rounded border px-1.5 py-0.5 font-mono">
-                  VRF: {space.vrf_name}
-                </span>
-              )}
-              {space.route_distinguisher && (
-                <span className="rounded border px-1.5 py-0.5 font-mono">
-                  RD: {space.route_distinguisher}
-                </span>
-              )}
-              {space.route_targets && space.route_targets.length > 0 && (
-                <span className="rounded border px-1.5 py-0.5 font-mono">
-                  RT: {space.route_targets.join(", ")}
-                </span>
-              )}
-            </div>
-          ) : (
-            <p className="mt-1 text-xs text-muted-foreground/50">
-              VRF / Routing — not configured{" "}
-              <button
-                type="button"
-                onClick={() => setShowEditSpace(true)}
-                className="underline hover:text-muted-foreground"
-              >
-                (Edit Space to add)
-              </button>
-            </p>
-          )}
+          <SpaceVrfBadges
+            space={space}
+            onEdit={() => setShowEditSpace(true)}
+          />
         </div>
       </div>
       <div className="flex-1 overflow-auto">

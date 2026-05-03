@@ -1,10 +1,12 @@
 """RDAP (Registration Data Access Protocol) client for autnum lookups.
 
 ASN-side counterpart to :mod:`app.services.rdap` (which handles domain
-RDAP). The IANA bootstrap server at ``rdap.iana.org/autnum/<n>`` serves
-the right RIR's RDAP server via HTTP redirect, so a single
-``follow_redirects=True`` GET is enough to pull holder + last-modified
-info from any of ARIN / RIPE / APNIC / LACNIC / AFRINIC.
+RDAP). IANA's ``rdap.iana.org/autnum/<n>`` is documented as a
+redirect-bootstrap but in practice returns ``501 Not Implemented`` for
+direct queries — it's only a bootstrap *registry*, not a query
+service. We instead derive the RIR from the bundled IANA delegation
+snapshot (see :mod:`app.services.asns.classifier`) and query that
+RIR's RDAP base directly.
 
 Phase 2 of issue #85 ships RDAP-only — legacy ``whois.<rir>.net`` text
 parsing is a follow-up if real-world coverage gaps surface. Today's
@@ -24,6 +26,8 @@ from typing import Any
 import httpx
 import structlog
 
+from app.services.asns.classifier import derive_registry
+
 logger = structlog.get_logger(__name__)
 
 # Match domain RDAP timing budget so the manual "Refresh now" click
@@ -31,11 +35,18 @@ logger = structlog.get_logger(__name__)
 _PER_REQUEST_TIMEOUT = httpx.Timeout(10.0, connect=5.0, read=10.0)
 _TOTAL_TIMEOUT_SECONDS = 15.0
 
-# IANA RDAP bootstrap entry point for autnum queries. Returns a 30x
-# redirect to the right RIR's RDAP server when the AS number falls
-# inside a delegated block — ``follow_redirects=True`` resolves it
-# transparently.
-_RDAP_BASE = "https://rdap.iana.org/autnum"
+# Per-RIR RDAP base. Lifted from the IANA RDAP bootstrap registry
+# (https://data.iana.org/rdap/asn.json). Hardcoded so the refresh task
+# doesn't take a network dependency on the bootstrap fetch — the RIR
+# RDAP endpoints rarely move and a bad URL here just falls back to
+# ``unreachable`` like any other RDAP failure.
+_RIR_RDAP_BASE: dict[str, str] = {
+    "arin": "https://rdap.arin.net/registry/autnum",
+    "ripe": "https://rdap.db.ripe.net/autnum",
+    "apnic": "https://rdap.apnic.net/autnum",
+    "lacnic": "https://rdap.lacnic.net/rdap/autnum",
+    "afrinic": "https://rdap.afrinic.net/rdap/autnum",
+}
 
 # RDAP ``port43`` field hints at the underlying registry; we map the
 # common values to our internal RIR codes for the ``registry`` field
@@ -184,7 +195,20 @@ async def lookup_asn(number: int) -> dict[str, Any] | None:
     if number <= 0:
         return None
 
-    url = f"{_RDAP_BASE}/{number}"
+    rir = derive_registry(number)
+    base = _RIR_RDAP_BASE.get(rir)
+    if base is None:
+        # ``derive_registry`` returns ``unknown`` for private ranges + for
+        # public numbers the IANA snapshot doesn't cover. Either way we
+        # have no idea where to query, so log + bail.
+        logger.info(
+            "asn_rdap_unreachable",
+            asn=number,
+            error=f"no RDAP base for registry={rir}",
+        )
+        return None
+
+    url = f"{base}/{number}"
 
     try:
         async with httpx.AsyncClient(

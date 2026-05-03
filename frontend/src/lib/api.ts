@@ -932,6 +932,7 @@ export const ipamApi = {
         | "dhcp_server_group_id"
         | "dhcp_inherit_settings"
         | "asn_id"
+        | "vrf_id"
       >
     >,
   ) => api.put<IPBlock>(`/ipam/blocks/${id}`, data).then((r) => r.data),

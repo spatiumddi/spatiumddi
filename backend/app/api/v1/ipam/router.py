@@ -1179,6 +1179,7 @@ class IPSpaceCreate(BaseModel):
     # ignores these. ``route_targets`` is a list of strings rather
     # than a structured object so the inline ``import:A:B; export:C:D``
     # convention some operators use stays expressible.
+    vrf_id: uuid.UUID | None = None
     vrf_name: str | None = None
     route_distinguisher: str | None = None
     route_targets: list[str] | None = None
@@ -1217,6 +1218,7 @@ class IPSpaceUpdate(BaseModel):
     ddns_hostname_policy: str | None = None
     ddns_domain_override: str | None = None
     ddns_ttl: int | None = None
+    vrf_id: uuid.UUID | None = None
     vrf_name: str | None = None
     route_distinguisher: str | None = None
     route_targets: list[str] | None = None
@@ -1288,6 +1290,7 @@ class IPBlockCreate(BaseModel):
     ddns_ttl: int | None = None
     ddns_inherit_settings: bool = True
     asn_id: uuid.UUID | None = None
+    vrf_id: uuid.UUID | None = None
 
     @field_validator("network")
     @classmethod
@@ -1326,6 +1329,7 @@ class IPBlockUpdate(BaseModel):
     ddns_ttl: int | None = None
     ddns_inherit_settings: bool | None = None
     asn_id: uuid.UUID | None = None
+    vrf_id: uuid.UUID | None = None
 
     @field_validator("ddns_hostname_policy")
     @classmethod
