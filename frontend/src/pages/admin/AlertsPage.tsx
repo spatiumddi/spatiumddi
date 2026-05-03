@@ -62,6 +62,9 @@ function RuleEditorModal({
   const [threshold, setThreshold] = useState<number>(
     existing?.threshold_percent ?? 90,
   );
+  const [thresholdDays, setThresholdDays] = useState<number>(
+    existing?.threshold_days ?? 30,
+  );
   const [serverType, setServerType] = useState<AlertServerType>(
     (existing?.server_type as AlertServerType | null) ?? "any",
   );
@@ -88,6 +91,7 @@ function RuleEditorModal({
         notify_webhook: notifyWebhook,
         notify_smtp: notifySmtp,
         threshold_percent: ruleType === "subnet_utilization" ? threshold : null,
+        threshold_days: ruleType === "domain_expiring" ? thresholdDays : null,
         server_type: ruleType === "server_unreachable" ? serverType : null,
       };
       if (existing) {
@@ -136,14 +140,30 @@ function RuleEditorModal({
               value={ruleType}
               onChange={(e) => setRuleType(e.target.value as AlertRuleType)}
             >
-              <option value="subnet_utilization">Subnet utilization</option>
-              <option value="server_unreachable">Server unreachable</option>
-              <option value="asn_holder_drift">ASN holder drift</option>
-              <option value="asn_whois_unreachable">
-                ASN WHOIS unreachable
-              </option>
-              <option value="rpki_roa_expiring">RPKI ROA expiring</option>
-              <option value="rpki_roa_expired">RPKI ROA expired</option>
+              <optgroup label="Infrastructure">
+                <option value="subnet_utilization">Subnet utilization</option>
+                <option value="server_unreachable">Server unreachable</option>
+              </optgroup>
+              <optgroup label="Network (ASN / RPKI)">
+                <option value="asn_holder_drift">ASN holder drift</option>
+                <option value="asn_whois_unreachable">
+                  ASN WHOIS unreachable
+                </option>
+                <option value="rpki_roa_expiring">RPKI ROA expiring</option>
+                <option value="rpki_roa_expired">RPKI ROA expired</option>
+              </optgroup>
+              <optgroup label="Domains (registry)">
+                <option value="domain_expiring">Domain expiring</option>
+                <option value="domain_nameserver_drift">
+                  Domain nameserver drift
+                </option>
+                <option value="domain_registrar_changed">
+                  Domain registrar changed (transfer)
+                </option>
+                <option value="domain_dnssec_status_changed">
+                  Domain DNSSEC status changed
+                </option>
+              </optgroup>
             </select>
           </Field>
         )}
@@ -174,6 +194,43 @@ function RuleEditorModal({
               <option value="dhcp">DHCP only</option>
             </select>
           </Field>
+        )}
+        {ruleType === "domain_expiring" && (
+          <Field
+            label="Threshold (days)"
+            hint="Soft fire at threshold; severity escalates to warning at threshold/4 and critical at threshold/12 (e.g. 30 → 7.5 → 2.5 d)."
+          >
+            <input
+              type="number"
+              min={1}
+              max={3650}
+              className={inputCls}
+              value={thresholdDays}
+              onChange={(e) => setThresholdDays(Number(e.target.value))}
+            />
+          </Field>
+        )}
+        {ruleType === "domain_nameserver_drift" && (
+          <p className="rounded-md border bg-muted/20 p-3 text-[11px] text-muted-foreground">
+            Fires for any domain whose operator-pinned{" "}
+            <code>expected_nameservers</code> list differs from the
+            registrar-reported <code>actual_nameservers</code>. Resolves when
+            drift clears.
+          </p>
+        )}
+        {ruleType === "domain_registrar_changed" && (
+          <p className="rounded-md border bg-muted/20 p-3 text-[11px] text-muted-foreground">
+            Fires once per registrar transition (e.g. a transfer). Auto-resolves
+            after 7 days; can be marked resolved manually before then. The first
+            observation per domain is recorded as a baseline without paging.
+          </p>
+        )}
+        {ruleType === "domain_dnssec_status_changed" && (
+          <p className="rounded-md border bg-muted/20 p-3 text-[11px] text-muted-foreground">
+            Fires once when a domain's <code>dnssec_signed</code> flag flips at
+            the parent zone (DS records appearing or disappearing).
+            Auto-resolves after 7 days; can be marked resolved manually.
+          </p>
         )}
         <Field label="Severity">
           <select
@@ -382,7 +439,9 @@ export function AlertsPage() {
                         ? `≥ ${r.threshold_percent}%`
                         : r.rule_type === "server_unreachable"
                           ? `type=${r.server_type ?? "any"}`
-                          : "—"}
+                          : r.rule_type === "domain_expiring"
+                            ? `≤ ${r.threshold_days ?? 30} d`
+                            : "—"}
                     </td>
                     <td className="px-4 py-2">
                       <SeverityBadge severity={r.severity} />

@@ -1720,6 +1720,11 @@ export interface PlatformSettings {
   integration_docker_enabled: boolean;
   integration_proxmox_enabled: boolean;
   integration_tailscale_enabled: boolean;
+  /** Domain WHOIS refresh cadence (hours). Beat ticks hourly; the
+   *  task itself reads this on every fire so cadence changes take
+   *  effect on the next tick without restarting beat. 1–168 h range
+   *  enforced server-side. */
+  domain_whois_interval_hours: number;
   /** Read-only — true when an encrypted fingerbank API key is on file.
    *  The plaintext is never returned. Submit a value via
    *  ``fingerbank_api_key`` on the update payload to set or clear it
@@ -4120,7 +4125,11 @@ export type AlertRuleType =
   | "asn_holder_drift"
   | "asn_whois_unreachable"
   | "rpki_roa_expiring"
-  | "rpki_roa_expired";
+  | "rpki_roa_expired"
+  | "domain_expiring"
+  | "domain_nameserver_drift"
+  | "domain_registrar_changed"
+  | "domain_dnssec_status_changed";
 export type AlertSeverity = "info" | "warning" | "critical";
 export type AlertServerType = "dns" | "dhcp" | "any";
 
@@ -4131,6 +4140,7 @@ export interface AlertRule {
   enabled: boolean;
   rule_type: AlertRuleType;
   threshold_percent: number | null;
+  threshold_days: number | null;
   server_type: AlertServerType | null;
   severity: AlertSeverity;
   notify_syslog: boolean;
@@ -4146,6 +4156,7 @@ export interface AlertRuleCreate {
   enabled?: boolean;
   rule_type: AlertRuleType;
   threshold_percent?: number | null;
+  threshold_days?: number | null;
   server_type?: AlertServerType | null;
   severity?: AlertSeverity;
   notify_syslog?: boolean;
@@ -4158,6 +4169,7 @@ export interface AlertRuleUpdate {
   description?: string;
   enabled?: boolean;
   threshold_percent?: number | null;
+  threshold_days?: number | null;
   server_type?: AlertServerType | null;
   severity?: AlertSeverity;
   notify_syslog?: boolean;
@@ -4178,6 +4190,7 @@ export interface AlertEvent {
   delivered_syslog: boolean;
   delivered_webhook: boolean;
   delivered_smtp: boolean;
+  last_observed_value: Record<string, unknown> | null;
 }
 
 export interface AlertEvaluateResult {

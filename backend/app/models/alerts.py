@@ -39,7 +39,7 @@ from sqlalchemy import (
     Text,
 )
 from sqlalchemy import text as sa_text
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
@@ -57,12 +57,21 @@ class AlertRule(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
 
     # Rule type discriminator. Valid values today:
-    #   "subnet_utilization"   — threshold_percent vs Subnet.utilization_percent.
-    #                            Honours PlatformSettings.utilization_max_prefix_*
-    #                            so /30, /127 etc. can't trip the alarm.
-    #   "server_unreachable"   — server_type in {"dns","dhcp","any"}; fires on
-    #                            any server row whose `status` is "unreachable"
-    #                            or "error" at eval time.
+    #   "subnet_utilization"          — threshold_percent vs Subnet.utilization_percent.
+    #                                    Honours PlatformSettings.utilization_max_prefix_*
+    #                                    so /30, /127 etc. can't trip the alarm.
+    #   "server_unreachable"          — server_type in {"dns","dhcp","any"}; fires on
+    #                                    any server row whose `status` is "unreachable"
+    #                                    or "error" at eval time.
+    #   "domain_expiring"             — threshold_days against Domain.expires_at.
+    #                                    Severity escalates: soft at threshold, warning
+    #                                    at threshold/4, critical at threshold/12.
+    #                                    Resolves on renewal or row delete.
+    #   "domain_nameserver_drift"     — fires when Domain.nameserver_drift = true.
+    #   "domain_registrar_changed"    — fires once per registrar transition.
+    #                                    Auto-resolves after 7 days.
+    #   "domain_dnssec_status_changed"— fires once per dnssec_signed flip.
+    #                                    Auto-resolves after 7 days.
     rule_type: Mapped[str] = mapped_column(String(40), nullable=False)
 
     # Subnet utilization params.
@@ -70,6 +79,14 @@ class AlertRule(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     # Server-unreachable params.
     server_type: Mapped[str | None] = mapped_column(String(10), nullable=True)
+
+    # Domain-expiring params. Number of days before ``expires_at`` at
+    # which the rule first fires. The rule's ``severity`` column drives
+    # the *base* severity; the evaluator escalates based on how close
+    # ``expires_at`` actually is — threshold/4 widens to "warning",
+    # threshold/12 widens to "critical". Default 30 d (matches the
+    # ``whois_state="expiring"`` bucket).
+    threshold_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     # Severity (info | warning | critical). Maps to a syslog severity on
     # delivery and drives UI colour.
@@ -141,6 +158,17 @@ class AlertEvent(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     delivered_smtp: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=sa_text("false")
     )
+
+    # Snapshot of the value at the time of firing. Used by transition-
+    # once rules (``domain_registrar_changed``, ``domain_dnssec_status_changed``)
+    # to dedupe — the evaluator only opens a new event when the
+    # observed value has actually moved off the snapshot stored in the
+    # most recent open event for the same subject. Shape is rule-type
+    # specific:
+    #   domain_registrar_changed     → {"from": "<old>", "to": "<new>"}
+    #   domain_dnssec_status_changed → {"from": <bool>, "to": <bool>}
+    # Other rule types may write None.
+    last_observed_value: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
 
     __table_args__ = (
         Index(

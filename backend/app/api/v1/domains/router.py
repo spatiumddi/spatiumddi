@@ -30,7 +30,9 @@ from app.core.permissions import require_permission, user_has_permission
 from app.models.audit import AuditLog
 from app.models.auth import User
 from app.models.domain import Domain
-from app.services.rdap import lookup_domain
+from app.models.settings import PlatformSettings
+from app.services.domain_refresh import build_refresh_audit_payload, refresh_one_domain
+from app.services.rdap import compute_nameserver_drift, derive_whois_state
 
 logger = structlog.get_logger(__name__)
 
@@ -42,13 +44,6 @@ router = APIRouter(
 )
 
 # ── Constants ───────────────────────────────────────────────────────
-
-# Soft / warn thresholds for ``derive_whois_state``. Mirrors the
-# ``domain_expiring`` alert rule shape from issue #87 (soft <90d /
-# warn <30d / critical <7d). For ``whois_state`` we collapse all of
-# those into the single ``expiring`` bucket and let the alert
-# evaluator (deferred) carry the day-window granularity.
-_EXPIRING_DAYS = 30
 
 # Hard cap on the bulk-delete payload to keep the endpoint from
 # becoming a denial-of-service vector. Mirrors the cap used elsewhere
@@ -174,47 +169,6 @@ class BulkDeleteResponse(BaseModel):
 
 
 # ── Pure helpers ────────────────────────────────────────────────────
-
-
-def derive_whois_state(
-    *,
-    rdap_returned_data: bool,
-    expires_at: datetime | None,
-    expected_nameservers: list[str],
-    actual_nameservers: list[str],
-    now: datetime | None = None,
-) -> str:
-    """Compute the bucket label that drives the list-page badge + the
-    (deferred) alert rules.
-
-    Decision order matches the issue spec:
-
-    1. RDAP unreachable (None response) → ``unreachable``.
-    2. Past expiry → ``expired``.
-    3. Within 30 days of expiry → ``expiring``.
-    4. Operator pinned ``expected_nameservers`` and the actual NS
-       list (lowercase + sorted) doesn't match → ``drift``.
-    5. Otherwise → ``ok``.
-    """
-    if not rdap_returned_data:
-        return "unreachable"
-    when = now or datetime.now(UTC)
-    if expires_at is not None:
-        # Postgres returns timezone-aware datetimes; defensive coerce
-        # in case a caller passes a naive one.
-        exp = expires_at if expires_at.tzinfo else expires_at.replace(tzinfo=UTC)
-        if exp <= when:
-            return "expired"
-        if exp - when <= timedelta(days=_EXPIRING_DAYS):
-            return "expiring"
-    if expected_nameservers:
-        # Already normalised on save — but defensive lowercase + sort
-        # in case a row predates normalisation.
-        exp_set = sorted({s.strip().rstrip(".").lower() for s in expected_nameservers if s})
-        act_set = sorted({s.strip().rstrip(".").lower() for s in actual_nameservers if s})
-        if exp_set and exp_set != act_set:
-            return "drift"
-    return "ok"
 
 
 def _audit(
@@ -398,9 +352,9 @@ async def update_domain(
     # list-page badge reflects the operator's edit immediately —
     # without forcing a full RDAP round trip.
     if "expected_nameservers" in changes and d.actual_nameservers is not None:
-        d.nameserver_drift = bool(d.expected_nameservers) and sorted(
-            {s.lower() for s in d.expected_nameservers}
-        ) != sorted({s.lower() for s in (d.actual_nameservers or [])})
+        d.nameserver_drift = compute_nameserver_drift(
+            d.expected_nameservers, d.actual_nameservers
+        )
         # And refresh the derived state label (preserving expiry
         # buckets if applicable).
         d.whois_state = derive_whois_state(
@@ -466,31 +420,17 @@ async def refresh_whois(
     if d is None:
         raise HTTPException(status_code=404, detail="Domain not found")
 
-    parsed = await lookup_domain(d.name)
-    now = datetime.now(UTC)
-    d.whois_last_checked_at = now
+    # Push the next scheduled poll out by the configured cadence so a
+    # manual refresh + the beat tick don't double-poll the registry
+    # back-to-back.
+    ps = await db.get(PlatformSettings, 1)
+    interval_hours = (
+        ps.domain_whois_interval_hours
+        if ps is not None and ps.domain_whois_interval_hours
+        else 24
+    )
 
-    if parsed is None:
-        d.whois_state = "unreachable"
-    else:
-        d.registrar = parsed.get("registrar")
-        d.registrant_org = parsed.get("registrant_org")
-        d.registered_at = parsed.get("registered_at")
-        d.expires_at = parsed.get("expires_at")
-        d.last_renewed_at = parsed.get("last_renewed_at")
-        d.actual_nameservers = list(parsed.get("nameservers") or [])
-        d.dnssec_signed = bool(parsed.get("dnssec_signed"))
-        d.whois_data = parsed.get("raw")
-        d.nameserver_drift = bool(d.expected_nameservers) and sorted(
-            {s.lower() for s in (d.expected_nameservers or [])}
-        ) != sorted({s.lower() for s in (d.actual_nameservers or [])})
-        d.whois_state = derive_whois_state(
-            rdap_returned_data=True,
-            expires_at=d.expires_at,
-            expected_nameservers=d.expected_nameservers or [],
-            actual_nameservers=d.actual_nameservers or [],
-            now=now,
-        )
+    result = await refresh_one_domain(d, interval_hours=interval_hours)
 
     _audit(
         db,
@@ -498,14 +438,7 @@ async def refresh_whois(
         action="refresh_whois",
         domain_id=d.id,
         domain_name=d.name,
-        new_value={
-            "whois_state": d.whois_state,
-            "registrar": d.registrar,
-            "expires_at": d.expires_at.isoformat() if d.expires_at else None,
-            "nameserver_drift": d.nameserver_drift,
-            "dnssec_signed": d.dnssec_signed,
-            "rdap_reachable": parsed is not None,
-        },
+        new_value=build_refresh_audit_payload(d, result),
     )
     await db.commit()
     await db.refresh(d)

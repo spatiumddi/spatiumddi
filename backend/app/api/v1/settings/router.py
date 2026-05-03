@@ -72,6 +72,7 @@ class SettingsResponse(BaseModel):
     integration_docker_enabled: bool
     integration_proxmox_enabled: bool
     integration_tailscale_enabled: bool
+    domain_whois_interval_hours: int
     # Device profiling — fingerbank API key. Boolean reflects whether
     # an encrypted key is stored; the plaintext is never returned.
     fingerbank_api_key_set: bool = False
@@ -139,6 +140,7 @@ class SettingsUpdate(BaseModel):
     integration_docker_enabled: bool | None = None
     integration_proxmox_enabled: bool | None = None
     integration_tailscale_enabled: bool | None = None
+    domain_whois_interval_hours: int | None = None
     # Device profiling — fingerbank API key. Plaintext on the wire
     # (TLS-protected); empty string clears the stored value. Omit the
     # field entirely to leave the existing value alone (pydantic
@@ -198,6 +200,17 @@ class SettingsUpdate(BaseModel):
         # Beat ticks every 10 s — anything below that can't be honoured.
         if v is not None and v < 10:
             raise ValueError("Must be >= 10 (Celery beat ticks every 10 seconds)")
+        return v
+
+    @field_validator("domain_whois_interval_hours")
+    @classmethod
+    def validate_domain_whois_interval(cls, v: int | None) -> int | None:
+        # Beat ticks every hour for the domain refresh; floor at 1 h
+        # (any faster than that just self-skips). Cap at 168 h (one
+        # week) — slower than that and operators may as well not have
+        # the feature on.
+        if v is not None and not (1 <= v <= 168):
+            raise ValueError("Must be between 1 and 168 hours")
         return v
 
     @field_validator("utilization_warn_threshold", "utilization_critical_threshold")

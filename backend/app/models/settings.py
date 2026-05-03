@@ -220,24 +220,24 @@ class PlatformSettings(Base):
     fingerbank_api_key_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
 
     # ASN RDAP refresh cadence (Phase 2 of issue #85). Beat ticks
-    # hourly; the per-row ``asn.next_check_at`` gate is what actually
-    # paces refreshes against this. Min 1h to avoid hammering RIR RDAP
-    # endpoints; max 168h (one week) so a misconfigured row eventually
-    # gets re-checked.
+    # hourly; per-row ``asn.next_check_at`` gates against this knob.
     asn_whois_interval_hours: Mapped[int] = mapped_column(
         Integer, nullable=False, default=24, server_default=sa_text("24")
     )
 
     # RPKI ROA pull source — ``cloudflare`` (default) or ``ripe``.
-    # Both expose roughly the same JSON shape; Cloudflare is faster +
-    # more lenient on rate limits, RIPE is the canonical mirror.
     rpki_roa_source: Mapped[str] = mapped_column(
         String(16), nullable=False, default="cloudflare", server_default=sa_text("'cloudflare'")
     )
 
-    # Cadence for the RPKI ROA refresh task. The full ROA dump is
-    # cached in-memory for 5 minutes inside the source service so a
-    # 4 h refresh doesn't refetch a multi-MB JSON per ASN.
+    # Cadence for the RPKI ROA refresh task; ROA dump cached in-memory
+    # for 5 min inside the source service.
     rpki_roa_refresh_interval_hours: Mapped[int] = mapped_column(
         Integer, nullable=False, default=4, server_default=sa_text("4")
+    )
+
+    # Domain WHOIS refresh cadence (Phase 2 of issue #87). Same per-row
+    # gating shape as the ASN cadence above.
+    domain_whois_interval_hours: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=24, server_default=sa_text("24")
     )

@@ -61,10 +61,10 @@ const baseMainNav = [
 // "Network" entry; VLANs lifts up from its own top-level slot;
 // VRFs / ASNs are real first-class pages from issues #85 / #86.
 const networkNav = [
+  { label: "ASNs", icon: Hash, to: "/network/asns" },
   { label: "Devices", icon: Cable, to: "/network/devices" },
   { label: "VLANs", icon: RouterIcon, to: "/network/vlans" },
   { label: "VRFs", icon: RouteIcon, to: "/network/vrfs" },
-  { label: "ASNs", icon: Hash, to: "/network/asns" },
 ];
 
 const toolsNav = [

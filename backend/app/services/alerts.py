@@ -14,6 +14,16 @@ For each enabled ``AlertRule`` we:
 The filter from ``PlatformSettings.utilization_max_prefix_*`` applies
 to ``subnet_utilization`` rules so small PTP / loopback subnets can't
 trip the alarm — same predicate the dashboard honours.
+
+Domain rule types use a slightly different shape: the four match
+families come from ``Domain`` row state (expiry date, drift flag,
+registrar transition, dnssec transition). Two of them are
+"transition-once" rules (``domain_registrar_changed`` /
+``domain_dnssec_status_changed``) — the evaluator latches the
+observed value into ``AlertEvent.last_observed_value`` so a single
+flip fires exactly one event, and that event auto-resolves after
+``_TRANSITION_AUTO_RESOLVE_DAYS`` (7 d) or when an operator marks
+it resolved.
 """
 
 from __future__ import annotations
@@ -30,6 +40,7 @@ from app.models.alerts import AlertEvent, AlertRule
 from app.models.asn import ASN, ASNRpkiRoa
 from app.models.dhcp import DHCPServer
 from app.models.dns import DNSServer
+from app.models.domain import Domain
 from app.models.ipam import Subnet
 from app.models.settings import PlatformSettings
 from app.services import audit_forward
@@ -39,16 +50,17 @@ logger = structlog.get_logger(__name__)
 
 RULE_TYPE_SUBNET_UTILIZATION = "subnet_utilization"
 RULE_TYPE_SERVER_UNREACHABLE = "server_unreachable"
-# ASN / RPKI rule types — Phase 2 of issue #85. ``asn_holder_drift``
-# fires when a row flips to ``whois_state="drift"``;
-# ``asn_whois_unreachable`` fires once
-# ``whois_data.consecutive_failures`` reaches 3;
-# ``rpki_roa_expiring`` / ``rpki_roa_expired`` key off the per-ROA
-# state column the refresh task maintains.
+# ASN / RPKI rule types — Phase 2 of issue #85.
 RULE_TYPE_ASN_HOLDER_DRIFT = "asn_holder_drift"
 RULE_TYPE_ASN_WHOIS_UNREACHABLE = "asn_whois_unreachable"
 RULE_TYPE_RPKI_ROA_EXPIRING = "rpki_roa_expiring"
 RULE_TYPE_RPKI_ROA_EXPIRED = "rpki_roa_expired"
+# Domain rule types — Phase 2 of issue #87.
+RULE_TYPE_DOMAIN_EXPIRING = "domain_expiring"
+RULE_TYPE_DOMAIN_NS_DRIFT = "domain_nameserver_drift"
+RULE_TYPE_DOMAIN_REGISTRAR_CHANGED = "domain_registrar_changed"
+RULE_TYPE_DOMAIN_DNSSEC_CHANGED = "domain_dnssec_status_changed"
+
 RULE_TYPES = frozenset(
     {
         RULE_TYPE_SUBNET_UTILIZATION,
@@ -57,15 +69,24 @@ RULE_TYPES = frozenset(
         RULE_TYPE_ASN_WHOIS_UNREACHABLE,
         RULE_TYPE_RPKI_ROA_EXPIRING,
         RULE_TYPE_RPKI_ROA_EXPIRED,
+        RULE_TYPE_DOMAIN_EXPIRING,
+        RULE_TYPE_DOMAIN_NS_DRIFT,
+        RULE_TYPE_DOMAIN_REGISTRAR_CHANGED,
+        RULE_TYPE_DOMAIN_DNSSEC_CHANGED,
     }
 )
 
 # Default consecutive-failure threshold for ``asn_whois_unreachable``.
-# Hardcoded today; could become a per-rule field if operator demand
-# surfaces. Three failures at 24 h cadence = ~3 days of drift before
-# the alert fires, which matches the spec's "operator-configurable,
-# default 3" intent.
 _ASN_WHOIS_UNREACHABLE_THRESHOLD = 3
+
+# Default expiring threshold when ``domain_expiring`` doesn't pin one.
+_DEFAULT_EXPIRING_THRESHOLD_DAYS = 30
+
+# Auto-resolve window for the two "fires once on transition" domain
+# rule types (registrar / DNSSEC change). Transitions don't resolve
+# themselves the way threshold-bound conditions do, so we time-box
+# the open event. Operators can also manually resolve at any point.
+_TRANSITION_AUTO_RESOLVE_DAYS = 7
 
 
 def _prefix_len(network: str) -> tuple[int, int] | None:
@@ -247,6 +268,270 @@ async def _matching_server_subjects(
     return matches
 
 
+# ── Domain rule evaluators ──────────────────────────────────────────
+
+
+def _escalate_severity_for_expiring(
+    base_severity: str,
+    *,
+    threshold_days: int,
+    days_to_expiry: float,
+) -> str:
+    """For ``domain_expiring`` we widen the rule's base severity based
+    on how close the actual expiry is — the issue spec calls for soft
+    at threshold / warning at threshold/4 / critical at threshold/12.
+
+    The base severity acts as a *floor*: a rule authored with
+    ``severity="critical"`` always fires critical; a rule authored
+    with ``severity="info"`` upgrades to warning / critical as the
+    expiry window narrows. This way operators get one rule per
+    domain (or zero — defaults to warning at threshold/4), not three.
+    """
+
+    def _rank(s: str) -> int:
+        return {"info": 0, "warning": 1, "critical": 2}.get(s, 1)
+
+    base_rank = _rank(base_severity)
+    actual_rank = 0  # info at the soft threshold
+
+    # Avoid division blowups for absurdly small thresholds. Floor of 1.
+    safe = max(1, threshold_days)
+    if days_to_expiry <= safe / 12:
+        actual_rank = 2  # critical
+    elif days_to_expiry <= safe / 4:
+        actual_rank = 1  # warning
+
+    final = max(base_rank, actual_rank)
+    return ("info", "warning", "critical")[final]
+
+
+async def _matching_domain_expiring_subjects(
+    db: AsyncSession,
+    rule: AlertRule,
+    now: datetime,
+) -> list[tuple[str, str, str, str]]:
+    """Return ``[(subject_id, display, message, severity)]`` for the
+    ``domain_expiring`` rule type. Severity escalates per the
+    threshold/4 / threshold/12 boundaries.
+    """
+    threshold_days = rule.threshold_days or _DEFAULT_EXPIRING_THRESHOLD_DAYS
+    cutoff = now + timedelta(days=threshold_days)
+
+    rows = (
+        (
+            await db.execute(
+                select(Domain)
+                .where(Domain.expires_at.is_not(None))
+                .where(Domain.expires_at <= cutoff)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    matches: list[tuple[str, str, str, str]] = []
+    for d in rows:
+        # Defensive coerce — Postgres returns timezone-aware, but
+        # tests may construct naive datetimes.
+        exp = d.expires_at
+        if exp is None:
+            continue
+        if exp.tzinfo is None:
+            exp = exp.replace(tzinfo=UTC)
+        delta = exp - now
+        days_to_expiry = delta.total_seconds() / 86400.0
+
+        sev = _escalate_severity_for_expiring(
+            rule.severity,
+            threshold_days=threshold_days,
+            days_to_expiry=days_to_expiry,
+        )
+
+        if days_to_expiry <= 0:
+            descriptor = "expired"
+        elif days_to_expiry < 1:
+            descriptor = "expires within 24 h"
+        else:
+            descriptor = f"expires in {int(days_to_expiry)} day(s)"
+
+        message = (
+            f"Domain {d.name} {descriptor} (expires_at "
+            f"{exp.isoformat()}, threshold {threshold_days} d)"
+        )
+        matches.append((str(d.id), d.name, message, sev))
+    return matches
+
+
+async def _matching_domain_drift_subjects(
+    db: AsyncSession, rule: AlertRule
+) -> list[tuple[str, str, str]]:
+    """``domain_nameserver_drift`` — fires for every domain whose
+    operator-set ``expected_nameservers`` doesn't match the
+    last-observed ``actual_nameservers``."""
+    rows = (
+        (
+            await db.execute(
+                select(Domain).where(Domain.nameserver_drift.is_(True))
+            )
+        )
+        .scalars()
+        .all()
+    )
+    matches: list[tuple[str, str, str]] = []
+    for d in rows:
+        expected = sorted(d.expected_nameservers or [])
+        actual = sorted(d.actual_nameservers or [])
+        message = (
+            f"Domain {d.name} NS drift — "
+            f"expected={expected!r}, actual={actual!r}"
+        )
+        matches.append((str(d.id), d.name, message))
+    return matches
+
+
+async def _evaluate_domain_transition_rule(
+    db: AsyncSession,
+    rule: AlertRule,
+    *,
+    field_name: str,
+    rule_label: str,
+    now: datetime,
+) -> tuple[int, int, int, int, int]:
+    """Shared body for the two "fires once on transition" domain rules.
+
+    Walks every Domain row, looks up the most recent open event for
+    ``(rule, subject_id)``. When the current value of ``field_name``
+    differs from the snapshot stored in that event's
+    ``last_observed_value.to``, opens a new event with the snapshot
+    ``{"from": <previous>, "to": <current>}``. Auto-resolves any open
+    event older than ``_TRANSITION_AUTO_RESOLVE_DAYS`` days.
+
+    Returns ``(opened, resolved, delivered_syslog, delivered_webhook,
+    delivered_smtp)`` aligned with the main evaluator's accumulators.
+
+    Note: this approach relies on each new transition's "from" being
+    the previous "to", so re-firing on the same value-pair is
+    suppressed by the existing-open-event check. A registrar that
+    flips A→B→A within the auto-resolve window opens two events (the
+    A→B transition, then B→A); that's the intended behaviour.
+    """
+    targets = await audit_forward._load_targets()  # noqa: SLF001
+
+    opened = 0
+    resolved = 0
+    delivered_syslog = 0
+    delivered_webhook = 0
+    delivered_smtp = 0
+
+    # Index existing OPEN events by subject_id so we can compare the
+    # snapshot the last firing latched against the row's current value.
+    open_res = await db.execute(
+        select(AlertEvent).where(
+            AlertEvent.rule_id == rule.id,
+            AlertEvent.resolved_at.is_(None),
+        )
+    )
+    open_events = list(open_res.scalars().all())
+    open_by_subject: dict[str, AlertEvent] = {ev.subject_id: ev for ev in open_events}
+
+    # Auto-resolve any open transition event whose age exceeds the
+    # window. Time-bounding these is important — the alternative is a
+    # UI cluttered with months-old "registrar changed" rows.
+    cutoff = now - timedelta(days=_TRANSITION_AUTO_RESOLVE_DAYS)
+    for ev in list(open_events):
+        if ev.fired_at < cutoff:
+            ev.resolved_at = now
+            resolved += 1
+            del open_by_subject[ev.subject_id]
+
+    # We also need each domain's *previous* observed value (i.e. the
+    # last "to" we latched into an event, regardless of whether that
+    # event is still open). Without it the first transition after
+    # rule-create has no "from" to record. Look up the most recent
+    # event row per subject — open or resolved.
+    last_event_res = await db.execute(
+        select(AlertEvent)
+        .where(AlertEvent.rule_id == rule.id)
+        .order_by(AlertEvent.fired_at.desc())
+    )
+    last_event_by_subject: dict[str, AlertEvent] = {}
+    for ev in last_event_res.scalars().all():
+        if ev.subject_id not in last_event_by_subject:
+            last_event_by_subject[ev.subject_id] = ev
+
+    rows = (await db.execute(select(Domain))).scalars().all()
+    for d in rows:
+        subject_id = str(d.id)
+        current_value = getattr(d, field_name)
+        # Bool / nullable string both serialise into JSON cleanly.
+        if open_by_subject.get(subject_id) is not None:
+            # Already an open transition for this domain — wait it
+            # out (will auto-resolve at the cutoff above).
+            continue
+
+        prior_event = last_event_by_subject.get(subject_id)
+        if prior_event is not None and isinstance(prior_event.last_observed_value, dict):
+            prior_value = prior_event.last_observed_value.get("to")
+        else:
+            prior_value = None
+
+        # First-ever sighting (no prior event): record the "first
+        # observation" silently — open + immediately resolve so we
+        # have a baseline without paging the operator. Unset values
+        # (registrar=NULL on a row that's never been refreshed) get
+        # treated as "no observation yet" and skipped.
+        if prior_event is None:
+            if current_value is None:
+                continue
+            baseline = AlertEvent(
+                rule_id=rule.id,
+                subject_type="domain",
+                subject_id=subject_id,
+                subject_display=d.name,
+                severity="info",
+                message=f"Initial {rule_label} baseline for {d.name}: {current_value!r}",
+                fired_at=now,
+                resolved_at=now,
+                last_observed_value={"from": None, "to": current_value},
+            )
+            db.add(baseline)
+            continue
+
+        if current_value == prior_value:
+            continue
+
+        # Real transition. Open a fresh event + deliver.
+        message = (
+            f"Domain {d.name} {rule_label} changed: "
+            f"{prior_value!r} → {current_value!r}"
+        )
+        event = AlertEvent(
+            rule_id=rule.id,
+            subject_type="domain",
+            subject_id=subject_id,
+            subject_display=d.name,
+            severity=rule.severity,
+            message=message,
+            fired_at=now,
+            last_observed_value={"from": prior_value, "to": current_value},
+        )
+        db.add(event)
+        await db.flush()  # populate event.id for delivery payload
+        ds, dw, dm = await _deliver(rule, event, targets)
+        event.delivered_syslog = ds
+        event.delivered_webhook = dw
+        event.delivered_smtp = dm
+        opened += 1
+        if ds:
+            delivered_syslog += 1
+        if dw:
+            delivered_webhook += 1
+        if dm:
+            delivered_smtp += 1
+
+    return opened, resolved, delivered_syslog, delivered_webhook, delivered_smtp
+
+
 # ── Delivery ───────────────────────────────────────────────────────────────
 
 
@@ -349,11 +634,20 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
     rules = list(res.scalars().all())
     for rule in rules:
         try:
+            # Each match tuple is (subject_id, display, message,
+            # severity_override). Threshold-style rules pass
+            # severity_override=None so the rule's own severity
+            # applies; ``domain_expiring`` overrides per-row based on
+            # how close the actual expiry is.
+            matches: list[tuple[str, str, str, str | None]] = []
+
             if rule.rule_type == RULE_TYPE_SUBNET_UTILIZATION:
-                matches = await _matching_subnet_subjects(db, rule, settings)
+                base = await _matching_subnet_subjects(db, rule, settings)
+                matches = [(sid, disp, msg, None) for sid, disp, msg in base]
                 subject_type = "subnet"
             elif rule.rule_type == RULE_TYPE_SERVER_UNREACHABLE:
-                matches = await _matching_server_subjects(db, rule)
+                base = await _matching_server_subjects(db, rule)
+                matches = [(sid, disp, msg, None) for sid, disp, msg in base]
                 subject_type = "server"
             elif rule.rule_type == RULE_TYPE_ASN_HOLDER_DRIFT:
                 matches = await _matching_asn_drift_subjects(db, rule)
@@ -367,6 +661,40 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
             elif rule.rule_type == RULE_TYPE_RPKI_ROA_EXPIRED:
                 matches = await _matching_rpki_roa_expired_subjects(db, rule)
                 subject_type = "rpki_roa"
+            elif rule.rule_type == RULE_TYPE_DOMAIN_EXPIRING:
+                expiring = await _matching_domain_expiring_subjects(db, rule, now)
+                matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in expiring]
+                subject_type = "domain"
+            elif rule.rule_type == RULE_TYPE_DOMAIN_NS_DRIFT:
+                drift = await _matching_domain_drift_subjects(db, rule)
+                matches = [(sid, disp, msg, None) for sid, disp, msg in drift]
+                subject_type = "domain"
+            elif rule.rule_type in (
+                RULE_TYPE_DOMAIN_REGISTRAR_CHANGED,
+                RULE_TYPE_DOMAIN_DNSSEC_CHANGED,
+            ):
+                # Transition-once rules don't fit the open/resolve
+                # symmetry — they have their own evaluator that
+                # latches snapshots into AlertEvent.last_observed_value
+                # and auto-resolves after _TRANSITION_AUTO_RESOLVE_DAYS.
+                field_name, label = (
+                    ("registrar", "registrar")
+                    if rule.rule_type == RULE_TYPE_DOMAIN_REGISTRAR_CHANGED
+                    else ("dnssec_signed", "DNSSEC status")
+                )
+                op_, res_, dsy, dwh, dsm = await _evaluate_domain_transition_rule(
+                    db,
+                    rule,
+                    field_name=field_name,
+                    rule_label=label,
+                    now=now,
+                )
+                opened += op_
+                resolved += res_
+                delivered_syslog += dsy
+                delivered_webhook += dwh
+                delivered_smtp += dsm
+                continue
             else:
                 logger.warning("alert_unknown_rule_type", rule=str(rule.id), type=rule.rule_type)
                 continue
@@ -381,10 +709,10 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
             open_events = list(open_res.scalars().all())
             open_by_subject = {ev.subject_id: ev for ev in open_events}
 
-            match_ids = {sid for sid, _, _ in matches}
+            match_ids = {sid for sid, _, _, _ in matches}
 
             # Open new events for unseen matches.
-            for subject_id, display, message in matches:
+            for subject_id, display, message, severity_override in matches:
                 if subject_id in open_by_subject:
                     continue
                 event = AlertEvent(
@@ -392,7 +720,7 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                     subject_type=subject_type,
                     subject_id=subject_id,
                     subject_display=display,
-                    severity=rule.severity,
+                    severity=severity_override or rule.severity,
                     message=message,
                     fired_at=now,
                 )

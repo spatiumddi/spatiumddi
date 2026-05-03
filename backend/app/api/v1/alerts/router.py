@@ -43,6 +43,7 @@ class AlertRuleCreate(BaseModel):
     enabled: bool = True
     rule_type: str
     threshold_percent: int | None = None
+    threshold_days: int | None = None
     server_type: str | None = None
     severity: str = "warning"
     notify_syslog: bool = True
@@ -83,12 +84,26 @@ class AlertRuleCreate(BaseModel):
             raise ValueError("threshold_percent must be 0..100")
         return v
 
+    @field_validator("threshold_days")
+    @classmethod
+    def _v_thr_days(cls, v: int | None) -> int | None:
+        if v is None:
+            return None
+        # Floor at 1 — anything ≤0 turns the rule into a trivial
+        # "fires forever" predicate. Ceiling at 3650 (10 y) is just
+        # a sanity bound; long-lived domains rarely care about
+        # multi-year alerts.
+        if not (1 <= v <= 3650):
+            raise ValueError("threshold_days must be 1..3650")
+        return v
+
 
 class AlertRuleUpdate(BaseModel):
     name: str | None = None
     description: str | None = None
     enabled: bool | None = None
     threshold_percent: int | None = None
+    threshold_days: int | None = None
     server_type: str | None = None
     severity: str | None = None
     notify_syslog: bool | None = None
@@ -122,6 +137,15 @@ class AlertRuleUpdate(BaseModel):
             raise ValueError("threshold_percent must be 0..100")
         return v
 
+    @field_validator("threshold_days")
+    @classmethod
+    def _v_thr_days(cls, v: int | None) -> int | None:
+        if v is None:
+            return None
+        if not (1 <= v <= 3650):
+            raise ValueError("threshold_days must be 1..3650")
+        return v
+
 
 class AlertRuleResponse(BaseModel):
     id: uuid.UUID
@@ -130,6 +154,7 @@ class AlertRuleResponse(BaseModel):
     enabled: bool
     rule_type: str
     threshold_percent: int | None
+    threshold_days: int | None
     server_type: str | None
     severity: str
     notify_syslog: bool
@@ -154,6 +179,7 @@ class AlertEventResponse(BaseModel):
     delivered_syslog: bool
     delivered_webhook: bool
     delivered_smtp: bool
+    last_observed_value: dict[str, Any] | None
 
     model_config = {"from_attributes": True}
 

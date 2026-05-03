@@ -19,7 +19,7 @@ for writing the result back to the DB and recomputing derived fields
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import httpx
@@ -301,7 +301,100 @@ async def lookup_domain(name: str) -> dict[str, Any] | None:
     }
 
 
-# Total-timeout constant exported for the (deferred) scheduled-task
-# implementation — it should bound a per-row refresh end-to-end so a
-# slow registry can't stall the whole sweep.
-__all__ = ["lookup_domain", "_TOTAL_TIMEOUT_SECONDS"]
+# ── Derived-field helper ────────────────────────────────────────────
+#
+# ``derive_whois_state`` is the single source of truth for the
+# ``Domain.whois_state`` bucket label. It's pure / side-effect-free
+# and used by both the synchronous ``POST /domains/{id}/refresh-whois``
+# endpoint and the scheduled refresh task in
+# ``app.tasks.domain_whois_refresh``. Decision rules mirror issue #87:
+#
+#   1. RDAP returned no data → ``unreachable``.
+#   2. ``expires_at`` in the past → ``expired``.
+#   3. ``expires_at`` within ``_EXPIRING_DAYS`` (30) → ``expiring``.
+#   4. Operator pinned ``expected_nameservers`` and the actual list
+#      (lowercase + sorted) doesn't match → ``drift``.
+#   5. Otherwise → ``ok``.
+
+_EXPIRING_DAYS = 30
+
+
+def derive_whois_state(
+    *,
+    rdap_returned_data: bool,
+    expires_at: datetime | None,
+    expected_nameservers: list[str],
+    actual_nameservers: list[str],
+    now: datetime | None = None,
+) -> str:
+    """Compute the ``Domain.whois_state`` bucket label.
+
+    Pure helper. The order of checks matters — expiry beats drift so
+    a domain that's both about to expire AND has NS drift surfaces the
+    more urgent label. The day-window granularity for alert severity
+    (soft/warning/critical) lives in the alert evaluator; this function
+    only collapses to the four-bucket UI state.
+    """
+    if not rdap_returned_data:
+        return "unreachable"
+    when = now or datetime.now(UTC)
+    if expires_at is not None:
+        # Postgres returns timezone-aware datetimes; defensive coerce
+        # in case a caller passes a naive one.
+        exp = expires_at if expires_at.tzinfo else expires_at.replace(tzinfo=UTC)
+        if exp <= when:
+            return "expired"
+        if exp - when <= timedelta(days=_EXPIRING_DAYS):
+            return "expiring"
+    if expected_nameservers:
+        # Defensive lowercase + sort in case a row predates normalisation.
+        exp_set = sorted({s.strip().rstrip(".").lower() for s in expected_nameservers if s})
+        act_set = sorted({s.strip().rstrip(".").lower() for s in actual_nameservers if s})
+        if exp_set and exp_set != act_set:
+            return "drift"
+    return "ok"
+
+
+def normalise_nameservers(values: list[str] | None) -> list[str]:
+    """Lowercase + trailing-dot strip + de-dupe + sort.
+
+    Pure helper used by the drift comparator on both the endpoint and
+    the task path. Stable sort makes equality checks against
+    ``expected_nameservers`` deterministic.
+    """
+    if not values:
+        return []
+    out: set[str] = set()
+    for v in values:
+        if not isinstance(v, str):
+            continue
+        s = v.strip().rstrip(".").lower()
+        if s:
+            out.add(s)
+    return sorted(out)
+
+
+def compute_nameserver_drift(
+    expected: list[str] | None,
+    actual: list[str] | None,
+) -> bool:
+    """True iff the operator pinned at least one expected NS AND the
+    actual list (post-normalisation) differs from it. Returns False
+    when ``expected`` is empty — drift is opt-in, the operator has to
+    pin an expectation before drift can fire."""
+    exp = normalise_nameservers(expected)
+    act = normalise_nameservers(actual)
+    return bool(exp) and exp != act
+
+
+# Total-timeout constant exported for the scheduled-task implementation
+# — it should bound a per-row refresh end-to-end so a slow registry
+# can't stall the whole sweep.
+__all__ = [
+    "lookup_domain",
+    "derive_whois_state",
+    "normalise_nameservers",
+    "compute_nameserver_drift",
+    "_TOTAL_TIMEOUT_SECONDS",
+    "_EXPIRING_DAYS",
+]
