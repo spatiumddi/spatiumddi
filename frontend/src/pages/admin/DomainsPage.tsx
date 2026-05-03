@@ -1,15 +1,7 @@
 import { useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import {
-  CheckCircle2,
-  ChevronDown,
-  ChevronRight,
-  Pencil,
-  Plus,
-  RefreshCw,
-  Trash2,
-} from "lucide-react";
+import { CheckCircle2, Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
 import {
   domainsApi,
   type Domain,
@@ -276,7 +268,6 @@ export function DomainsPage() {
   const [stateFilter, setStateFilter] = useState<DomainWhoisState | "">("");
   const [search, setSearch] = useState("");
   const [selected, setSelected] = useState<Set<string>>(new Set());
-  const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const [refreshingId, setRefreshingId] = useState<string | null>(null);
 
   const listParams = {
@@ -350,15 +341,6 @@ export function DomainsPage() {
     } else {
       setSelected(new Set(items.map((d) => d.id)));
     }
-  }
-
-  function toggleExpanded(id: string) {
-    setExpanded((prev) => {
-      const next = new Set(prev);
-      if (next.has(id)) next.delete(id);
-      else next.add(id);
-      return next;
-    });
   }
 
   return (
@@ -477,7 +459,6 @@ export function DomainsPage() {
                     onChange={toggleSelectAll}
                   />
                 </th>
-                <th className="w-6 px-2 py-2" />
                 <th className="px-3 py-2 text-left">Name</th>
                 <th className="px-3 py-2 text-left">Registrar</th>
                 <th className="px-3 py-2 text-left">Expires</th>
@@ -492,7 +473,7 @@ export function DomainsPage() {
               {isLoading && (
                 <tr>
                   <td
-                    colSpan={10}
+                    colSpan={9}
                     className="px-4 py-8 text-center text-xs text-muted-foreground"
                   >
                     Loading…
@@ -502,7 +483,7 @@ export function DomainsPage() {
               {!isLoading && items.length === 0 && (
                 <tr>
                   <td
-                    colSpan={10}
+                    colSpan={9}
                     className="px-4 py-8 text-center text-xs text-muted-foreground"
                   >
                     No domains yet — click "New domain" to add the first one.
@@ -514,9 +495,7 @@ export function DomainsPage() {
                   key={d.id}
                   domain={d}
                   selected={selected.has(d.id)}
-                  expanded={expanded.has(d.id)}
                   onToggleSelect={() => toggleSelect(d.id)}
-                  onToggleExpanded={() => toggleExpanded(d.id)}
                   onEdit={() => setEditing(d)}
                   onDelete={() => {
                     if (
@@ -555,9 +534,7 @@ export function DomainsPage() {
 function DomainRow({
   domain,
   selected,
-  expanded,
   onToggleSelect,
-  onToggleExpanded,
   onEdit,
   onDelete,
   onRefresh,
@@ -565,157 +542,86 @@ function DomainRow({
 }: {
   domain: Domain;
   selected: boolean;
-  expanded: boolean;
   onToggleSelect: () => void;
-  onToggleExpanded: () => void;
   onEdit: () => void;
   onDelete: () => void;
   onRefresh: () => void;
   refreshing: boolean;
 }) {
   return (
-    <>
-      <tr className={cn("border-b", selected && "bg-primary/5")}>
-        <td className="px-3 py-2">
-          <input
-            type="checkbox"
-            checked={selected}
-            onChange={onToggleSelect}
-            aria-label={`Select ${domain.name}`}
-          />
-        </td>
-        <td className="px-2 py-2">
+    <tr className={cn("border-b", selected && "bg-primary/5")}>
+      <td className="px-3 py-2">
+        <input
+          type="checkbox"
+          checked={selected}
+          onChange={onToggleSelect}
+          aria-label={`Select ${domain.name}`}
+        />
+      </td>
+      <td className="px-3 py-2 font-medium">
+        <Link
+          to={`/admin/domains/${domain.id}`}
+          className="hover:text-primary hover:underline"
+        >
+          {domain.name}
+        </Link>
+      </td>
+      <td className="px-3 py-2 text-muted-foreground">
+        {domain.registrar ?? "—"}
+      </td>
+      <td className="px-3 py-2">
+        <ExpiryBadge expiresAt={domain.expires_at} />
+      </td>
+      <td className="px-3 py-2">
+        <StateBadge state={domain.whois_state} />
+      </td>
+      <td className="px-3 py-2">
+        {domain.nameserver_drift ? (
+          <span className="inline-flex items-center rounded bg-amber-100 px-2 py-0.5 text-[11px] font-medium text-amber-700 dark:bg-amber-950/30 dark:text-amber-400">
+            drift
+          </span>
+        ) : (
+          <span className="text-xs text-muted-foreground">—</span>
+        )}
+      </td>
+      <td className="px-3 py-2">
+        {domain.dnssec_signed ? (
+          <CheckCircle2 className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
+        ) : (
+          <span className="text-xs text-muted-foreground">—</span>
+        )}
+      </td>
+      <td className="px-3 py-2 text-xs text-muted-foreground tabular-nums whitespace-nowrap">
+        {relativeFromNow(domain.whois_last_checked_at)}
+      </td>
+      <td className="px-3 py-2">
+        <div className="flex justify-end gap-1">
           <button
-            onClick={onToggleExpanded}
-            className="rounded p-1 text-muted-foreground hover:bg-accent"
-            title={expanded ? "Hide WHOIS data" : "Show WHOIS data"}
+            onClick={onRefresh}
+            disabled={refreshing}
+            title="Refresh WHOIS"
+            className="rounded p-1.5 hover:bg-accent disabled:opacity-50"
           >
-            {expanded ? (
-              <ChevronDown className="h-3.5 w-3.5" />
-            ) : (
-              <ChevronRight className="h-3.5 w-3.5" />
-            )}
+            <RefreshCw
+              className={cn("h-3.5 w-3.5", refreshing && "animate-spin")}
+            />
           </button>
-        </td>
-        <td className="px-3 py-2 font-medium">
-          <Link
-            to={`/admin/domains/${domain.id}`}
-            className="hover:text-primary hover:underline"
+          <button
+            onClick={onEdit}
+            title="Edit"
+            className="rounded p-1.5 hover:bg-accent"
           >
-            {domain.name}
-          </Link>
-        </td>
-        <td className="px-3 py-2 text-muted-foreground">
-          {domain.registrar ?? "—"}
-        </td>
-        <td className="px-3 py-2">
-          <ExpiryBadge expiresAt={domain.expires_at} />
-        </td>
-        <td className="px-3 py-2">
-          <StateBadge state={domain.whois_state} />
-        </td>
-        <td className="px-3 py-2">
-          {domain.nameserver_drift ? (
-            <span className="inline-flex items-center rounded bg-amber-100 px-2 py-0.5 text-[11px] font-medium text-amber-700 dark:bg-amber-950/30 dark:text-amber-400">
-              drift
-            </span>
-          ) : (
-            <span className="text-xs text-muted-foreground">—</span>
-          )}
-        </td>
-        <td className="px-3 py-2">
-          {domain.dnssec_signed ? (
-            <CheckCircle2 className="h-4 w-4 text-emerald-600 dark:text-emerald-400" />
-          ) : (
-            <span className="text-xs text-muted-foreground">—</span>
-          )}
-        </td>
-        <td className="px-3 py-2 text-xs text-muted-foreground tabular-nums whitespace-nowrap">
-          {relativeFromNow(domain.whois_last_checked_at)}
-        </td>
-        <td className="px-3 py-2">
-          <div className="flex justify-end gap-1">
-            <button
-              onClick={onRefresh}
-              disabled={refreshing}
-              title="Refresh WHOIS"
-              className="rounded p-1.5 hover:bg-accent disabled:opacity-50"
-            >
-              <RefreshCw
-                className={cn("h-3.5 w-3.5", refreshing && "animate-spin")}
-              />
-            </button>
-            <button
-              onClick={onEdit}
-              title="Edit"
-              className="rounded p-1.5 hover:bg-accent"
-            >
-              <Pencil className="h-3.5 w-3.5" />
-            </button>
-            <button
-              onClick={onDelete}
-              title="Delete"
-              className="rounded p-1.5 text-red-600 hover:bg-red-50 dark:hover:bg-red-950/30"
-            >
-              <Trash2 className="h-3.5 w-3.5" />
-            </button>
-          </div>
-        </td>
-      </tr>
-      {expanded && (
-        <tr className="border-b bg-muted/20">
-          <td colSpan={10} className="px-6 py-4">
-            <div className="grid gap-4 md:grid-cols-2">
-              <div className="space-y-1">
-                <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-                  Expected nameservers
-                </p>
-                {(domain.expected_nameservers ?? []).length === 0 ? (
-                  <p className="text-xs text-muted-foreground/80">
-                    Not pinned — drift detection disabled until set.
-                  </p>
-                ) : (
-                  <ul className="font-mono text-xs">
-                    {domain.expected_nameservers.map((ns) => (
-                      <li key={ns}>{ns}</li>
-                    ))}
-                  </ul>
-                )}
-              </div>
-              <div className="space-y-1">
-                <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-                  Actual nameservers (from RDAP)
-                </p>
-                {(domain.actual_nameservers ?? []).length === 0 ? (
-                  <p className="text-xs text-muted-foreground/80">
-                    Not yet observed — refresh WHOIS to populate.
-                  </p>
-                ) : (
-                  <ul className="font-mono text-xs">
-                    {domain.actual_nameservers.map((ns) => (
-                      <li key={ns}>{ns}</li>
-                    ))}
-                  </ul>
-                )}
-              </div>
-            </div>
-            <div className="mt-4 space-y-1">
-              <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-                Raw RDAP response
-              </p>
-              {domain.whois_data ? (
-                <pre className="max-h-[400px] overflow-auto rounded border bg-background p-3 text-[11px] font-mono">
-                  {JSON.stringify(domain.whois_data, null, 2)}
-                </pre>
-              ) : (
-                <p className="text-xs text-muted-foreground/80">
-                  No RDAP response cached yet.
-                </p>
-              )}
-            </div>
-          </td>
-        </tr>
-      )}
-    </>
+            <Pencil className="h-3.5 w-3.5" />
+          </button>
+          <button
+            onClick={onDelete}
+            title="Delete"
+            className="rounded p-1.5 text-red-600 hover:bg-red-50 dark:hover:bg-red-950/30"
+          >
+            <Trash2 className="h-3.5 w-3.5" />
+          </button>
+        </div>
+      </td>
+    </tr>
   );
 }
