@@ -20,7 +20,7 @@ follow-up migration; until then both surfaces co-exist and the
 
 from __future__ import annotations
 
-from sqlalchemy import String, Text
+from sqlalchemy import ForeignKey, String, Text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -38,10 +38,12 @@ class VRF(UUIDPrimaryKeyMixin, TimestampMixin, Base):
       (``IPBlock.vrf_id``) — typically inherits the VRF of the
       parent space, but a block may pin its own (e.g. hub-and-spoke
       where one space hosts blocks belonging to multiple VRFs).
-    * an optional :class:`app.models.asn.ASN` once issue #85 lands
-      (``vrf.asn_id`` is added in this migration without an FK
-      constraint; the constraint is added in a follow-up after the
-      ASN model lands).
+    * an optional :class:`app.models.asn.ASN`
+      (``vrf.asn_id``). The FK constraint is added in the VRF
+      Phase 2 migration once issue #85's ``asn`` table is in
+      place. ``ON DELETE SET NULL`` — deleting an ASN nulls the
+      VRF's ``asn_id`` rather than cascading the delete, since
+      operators typically want to re-link to a replacement AS.
     """
 
     __tablename__ = "vrf"
@@ -49,11 +51,16 @@ class VRF(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     name: Mapped[str] = mapped_column(String(255), unique=True, nullable=False, index=True)
     description: Mapped[str] = mapped_column(Text, nullable=False, default="")
 
-    # ASN binding. Added in this migration WITHOUT a FK constraint —
-    # the ``asn`` table is delivered by issue #85 and may not exist
-    # in this worktree yet. A follow-up migration will add the
-    # constraint once #85 has merged.
-    asn_id: Mapped[str | None] = mapped_column(UUID(as_uuid=True), nullable=True, index=True)
+    # ASN binding — FK constraint added in the VRF Phase 2 migration
+    # (see ``alembic/versions/<rev>_vrf_phase2.py``). ``ON DELETE
+    # SET NULL`` — deleting an ASN nulls this column rather than
+    # cascade-deleting the VRF.
+    asn_id: Mapped[str | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("asn.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
 
     # Route distinguisher. Validated at the API layer against the
     # regex ``^(\\d+|(\\d+\\.){3}\\d+):\\d+$``. Stored as text since

@@ -34,8 +34,10 @@ from sqlalchemy import func, or_, select
 
 from app.api.deps import DB, CurrentUser
 from app.core.permissions import require_resource_permission
+from app.models.asn import ASN
 from app.models.audit import AuditLog
 from app.models.ipam import IPBlock, IPSpace
+from app.models.settings import PlatformSettings
 from app.models.vrf import VRF
 
 logger = structlog.get_logger(__name__)
@@ -78,6 +80,115 @@ def _validate_rt_list(values: list[str] | None) -> list[str]:
             )
         out.append(v)
     return out
+
+
+def _parse_asn_portion(rd_or_rt: str) -> int | None:
+    """Return the ASN-portion of an ``ASN:N``-flavoured RD/RT string.
+
+    Returns ``None`` for ``IP:N`` flavour (dotted-quad on the left), or
+    when the string is malformed (caller has already enforced the
+    regex by this point, so the second case is defensive only).
+    """
+    if not rd_or_rt:
+        return None
+    left, _, _ = rd_or_rt.partition(":")
+    if not left or "." in left:
+        # IP:N — not an ASN-flavour.
+        return None
+    try:
+        return int(left)
+    except ValueError:
+        return None
+
+
+async def _resolve_asn_number(db, asn_id: uuid.UUID | str | None) -> int | None:
+    """Look up the AS-number for the row currently FKed by ``asn_id``.
+
+    Returns ``None`` when ``asn_id`` is null or the row no longer
+    exists (the FK is ``ON DELETE SET NULL`` so a stale id should
+    only happen mid-transaction). Caller treats either case as
+    "no comparison possible".
+    """
+    if asn_id is None:
+        return None
+    asn = await db.get(ASN, asn_id)
+    return asn.number if asn is not None else None
+
+
+async def _vrf_rd_rt_warnings(
+    db,
+    asn_id: uuid.UUID | str | None,
+    rd: str | None,
+    import_targets: list[str],
+    export_targets: list[str],
+) -> list[str]:
+    """Compute non-blocking RD/RT vs ASN warnings for a VRF.
+
+    * Every ``ASN:N`` entry in ``rd`` / ``import_targets`` /
+      ``export_targets`` whose ASN portion does not match the linked
+      ``asn.number`` produces a warning.
+    * When ``asn_id`` is null but ``rd`` is in ``ASN:N`` format, emit
+      the "VRF has no ASN linked but RD references ASN N" warning so
+      the operator knows to either link an ASN row or move to
+      ``IP:N`` flavour.
+
+    Empty list when nothing is amiss. Caller decides whether to
+    return them as response warnings or escalate to 422 based on
+    ``PlatformSettings.vrf_strict_rd_validation``.
+    """
+    warnings: list[str] = []
+    rd_asn = _parse_asn_portion(rd) if rd else None
+    asn_number = await _resolve_asn_number(db, asn_id)
+
+    if asn_id is None and rd_asn is not None:
+        warnings.append(
+            f"VRF has no ASN linked but RD references ASN {rd_asn} — "
+            "link an ASN row or update the RD"
+        )
+
+    if asn_number is not None and rd_asn is not None and rd_asn != asn_number:
+        warnings.append(
+            f"RD '{rd}' ASN portion ({rd_asn}) does not match linked ASN ({asn_number})"
+        )
+
+    for label, items in (("import_targets", import_targets), ("export_targets", export_targets)):
+        for item in items or []:
+            rt_asn = _parse_asn_portion(item)
+            if asn_number is not None and rt_asn is not None and rt_asn != asn_number:
+                warnings.append(
+                    f"{label} entry '{item}' ASN portion ({rt_asn}) "
+                    f"does not match linked ASN ({asn_number})"
+                )
+
+    return warnings
+
+
+async def _strict_rd_validation_enabled(db) -> bool:
+    """Read ``PlatformSettings.vrf_strict_rd_validation``.
+
+    Defaults to ``False`` if the singleton row hasn't been seeded yet
+    (matches the column default). The settings table is touched on
+    every UI/config-API call, so this is effectively a cache-warm
+    read in production paths.
+    """
+    settings = await db.get(PlatformSettings, 1)
+    if settings is None:
+        return False
+    return bool(getattr(settings, "vrf_strict_rd_validation", False))
+
+
+def _enforce_or_collect_warnings(warnings: list[str], strict: bool) -> list[str]:
+    """When strict mode is on, raise 422 with the warnings; else
+    return them so the caller can attach them to the response."""
+    if strict and warnings:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail={
+                "message": "VRF RD/RT cross-validation failed",
+                "warnings": warnings,
+            },
+        )
+    return warnings
 
 
 def _audit(
@@ -204,6 +315,11 @@ class VRFResponse(BaseModel):
     modified_at: datetime
     space_count: int = 0
     block_count: int = 0
+    # Non-blocking cross-cutting validation messages — RD/RT ASN
+    # portion vs linked ASN mismatch, missing-ASN-with-RD-set, etc.
+    # Empty list when everything checks out. The list endpoint also
+    # populates this so the UI can badge VRFs that need attention.
+    warnings: list[str] = []
 
     model_config = {"from_attributes": True}
 
@@ -263,7 +379,12 @@ async def _fetch_counts(db, vrf_ids: list[uuid.UUID]) -> dict[uuid.UUID, tuple[i
     return out
 
 
-def _to_response(v: VRF, space_count: int = 0, block_count: int = 0) -> dict[str, Any]:
+def _to_response(
+    v: VRF,
+    space_count: int = 0,
+    block_count: int = 0,
+    warnings: list[str] | None = None,
+) -> dict[str, Any]:
     return {
         "id": v.id,
         "name": v.name,
@@ -278,6 +399,7 @@ def _to_response(v: VRF, space_count: int = 0, block_count: int = 0) -> dict[str
         "modified_at": v.modified_at,
         "space_count": space_count,
         "block_count": block_count,
+        "warnings": list(warnings or []),
     }
 
 
@@ -314,7 +436,19 @@ async def list_vrfs(
     q = q.limit(limit).offset(offset)
     rows = list((await db.execute(q)).scalars().all())
     counts = await _fetch_counts(db, [r.id for r in rows])
-    return [_to_response(r, *counts.get(r.id, (0, 0))) for r in rows]
+    out: list[dict[str, Any]] = []
+    for r in rows:
+        # Read-side warnings: never escalate to 422 on list/get
+        # responses (the operator hasn't asked us to write anything).
+        warns = await _vrf_rd_rt_warnings(
+            db,
+            r.asn_id,
+            r.route_distinguisher,
+            list(r.import_targets or []),
+            list(r.export_targets or []),
+        )
+        out.append(_to_response(r, *counts.get(r.id, (0, 0)), warnings=warns))
+    return out
 
 
 @router.post("", response_model=VRFResponse, status_code=status.HTTP_201_CREATED)
@@ -324,6 +458,20 @@ async def create_vrf(body: VRFCreate, current_user: CurrentUser, db: DB) -> dict
             status_code=status.HTTP_409_CONFLICT,
             detail=f"VRF with name '{body.name}' already exists",
         )
+
+    # Cross-cutting RD/RT vs ASN validation. With strict mode on
+    # (``PlatformSettings.vrf_strict_rd_validation``), any mismatch
+    # is a 422; otherwise the warnings ride along on the response.
+    warnings = await _vrf_rd_rt_warnings(
+        db,
+        body.asn_id,
+        body.route_distinguisher,
+        list(body.import_targets or []),
+        list(body.export_targets or []),
+    )
+    strict = await _strict_rd_validation_enabled(db)
+    warnings = _enforce_or_collect_warnings(warnings, strict)
+
     v = VRF(
         name=body.name,
         description=body.description,
@@ -347,7 +495,7 @@ async def create_vrf(body: VRFCreate, current_user: CurrentUser, db: DB) -> dict
     )
     await db.commit()
     await db.refresh(v)
-    return _to_response(v)
+    return _to_response(v, warnings=warnings)
 
 
 @router.get("/{vrf_id}", response_model=VRFResponse)
@@ -356,7 +504,14 @@ async def get_vrf(vrf_id: uuid.UUID, current_user: CurrentUser, db: DB) -> dict[
     if v is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="VRF not found")
     counts = await _fetch_counts(db, [v.id])
-    return _to_response(v, *counts.get(v.id, (0, 0)))
+    warns = await _vrf_rd_rt_warnings(
+        db,
+        v.asn_id,
+        v.route_distinguisher,
+        list(v.import_targets or []),
+        list(v.export_targets or []),
+    )
+    return _to_response(v, *counts.get(v.id, (0, 0)), warnings=warns)
 
 
 @router.put("/{vrf_id}", response_model=VRFResponse)
@@ -385,6 +540,21 @@ async def update_vrf(
     }
     for field, value in changes.items():
         setattr(v, field, value)
+
+    # Cross-cutting RD/RT vs ASN validation runs against the
+    # post-update view of the row (any of asn_id / RD / RTs may have
+    # changed in this PUT). Strict mode → 422 with the warnings;
+    # else they ride along on the response.
+    warnings = await _vrf_rd_rt_warnings(
+        db,
+        v.asn_id,
+        v.route_distinguisher,
+        list(v.import_targets or []),
+        list(v.export_targets or []),
+    )
+    strict = await _strict_rd_validation_enabled(db)
+    warnings = _enforce_or_collect_warnings(warnings, strict)
+
     db.add(
         _audit(
             current_user,
@@ -398,7 +568,7 @@ async def update_vrf(
     await db.commit()
     await db.refresh(v)
     counts = await _fetch_counts(db, [v.id])
-    return _to_response(v, *counts.get(v.id, (0, 0)))
+    return _to_response(v, *counts.get(v.id, (0, 0)), warnings=warnings)
 
 
 @router.delete("/{vrf_id}", status_code=status.HTTP_204_NO_CONTENT)

@@ -80,6 +80,10 @@ class SettingsResponse(BaseModel):
     asn_whois_interval_hours: int = 24
     rpki_roa_source: str = "cloudflare"
     rpki_roa_refresh_interval_hours: int = 4
+    # VRF strict-RD validation toggle (issue #86 phase 2). When False
+    # (default), ASN-portion mismatches between the VRF's RD/RT and
+    # its linked ASN row produce warnings; when True they are 422.
+    vrf_strict_rd_validation: bool = False
 
     model_config = {"from_attributes": True}
 
@@ -146,10 +150,12 @@ class SettingsUpdate(BaseModel):
     # field entirely to leave the existing value alone (pydantic
     # ``model_dump(exclude_none=True)`` semantics in the write path).
     fingerbank_api_key: str | None = None
-    # ASN / RPKI Phase 2 settings.
+    # ASN / RPKI Phase 2 settings (issue #85).
     asn_whois_interval_hours: int | None = None
     rpki_roa_source: str | None = None
     rpki_roa_refresh_interval_hours: int | None = None
+    # VRF strict-RD validation toggle (issue #86 phase 2).
+    vrf_strict_rd_validation: bool | None = None
 
     @field_validator("ip_allocation_strategy")
     @classmethod

@@ -1348,6 +1348,13 @@ class IPBlockResponse(BaseModel):
     ddns_domain_override: str | None = None
     ddns_ttl: int | None = None
     ddns_inherit_settings: bool = True
+    vrf_id: uuid.UUID | None = None
+    # Non-blocking warning when the block's VRF differs from its
+    # parent space's VRF — intentional in some hub-and-spoke designs
+    # but worth flagging so it doesn't go unnoticed (issue #86 phase
+    # 2 cross-cutting validation). ``None`` when both VRFs match or
+    # at least one is unset.
+    vrf_warning: str | None = None
     created_at: datetime
     modified_at: datetime
 
@@ -2112,21 +2119,98 @@ async def delete_space(
 # ── IP Blocks ──────────────────────────────────────────────────────────────────
 
 
+_BLOCK_VRF_DIVERGENCE_MSG = (
+    "Block VRF differs from parent space VRF — intentional in "
+    "hub-and-spoke designs but worth verifying"
+)
+
+
+async def _block_vrf_warning(
+    db: AsyncSession,
+    block: IPBlock,
+    _space_vrf_cache: dict[uuid.UUID, uuid.UUID | None] | None = None,
+) -> str | None:
+    """Compute the per-block VRF mismatch warning (issue #86 phase 2).
+
+    Returns the warning string when both ``block.vrf_id`` and the
+    parent space's ``vrf_id`` are set and they disagree; otherwise
+    ``None``. Caller can pass ``_space_vrf_cache`` (a dict of
+    ``space_id → vrf_id``) so list endpoints don't re-issue the
+    same SELECT for every block under the same space.
+    """
+    if block.vrf_id is None:
+        return None
+    space_vrf: uuid.UUID | None
+    if _space_vrf_cache is not None and block.space_id in _space_vrf_cache:
+        space_vrf = _space_vrf_cache[block.space_id]
+    else:
+        space = await db.get(IPSpace, block.space_id)
+        space_vrf = space.vrf_id if space is not None else None
+        if _space_vrf_cache is not None:
+            _space_vrf_cache[block.space_id] = space_vrf
+    if space_vrf is None:
+        return None
+    if block.vrf_id != space_vrf:
+        return _BLOCK_VRF_DIVERGENCE_MSG
+    return None
+
+
+def _block_to_response(block: IPBlock, vrf_warning: str | None) -> dict[str, Any]:
+    """Serialise an IPBlock + computed vrf_warning into the response shape.
+
+    We hand-roll the dict instead of letting pydantic ``from_attributes``
+    walk the ORM row so we can splice ``vrf_warning`` (which has no
+    ORM-side counterpart) into the same payload.
+    """
+    return {
+        "id": block.id,
+        "space_id": block.space_id,
+        "parent_block_id": block.parent_block_id,
+        "network": str(block.network),
+        "name": block.name,
+        "description": block.description,
+        "utilization_percent": block.utilization_percent,
+        "tags": dict(block.tags or {}),
+        "custom_fields": dict(block.custom_fields or {}),
+        "dns_group_ids": block.dns_group_ids,
+        "dns_zone_id": block.dns_zone_id,
+        "dns_additional_zone_ids": block.dns_additional_zone_ids,
+        "dns_inherit_settings": block.dns_inherit_settings,
+        "dhcp_server_group_id": block.dhcp_server_group_id,
+        "dhcp_inherit_settings": block.dhcp_inherit_settings,
+        "ddns_enabled": block.ddns_enabled,
+        "ddns_hostname_policy": block.ddns_hostname_policy,
+        "ddns_domain_override": block.ddns_domain_override,
+        "ddns_ttl": block.ddns_ttl,
+        "ddns_inherit_settings": block.ddns_inherit_settings,
+        "vrf_id": block.vrf_id,
+        "vrf_warning": vrf_warning,
+        "created_at": block.created_at,
+        "modified_at": block.modified_at,
+    }
+
+
 @router.get("/blocks", response_model=list[IPBlockResponse])
 async def list_blocks(
     current_user: CurrentUser,
     db: DB,
     space_id: uuid.UUID | None = None,
-) -> list[IPBlock]:
+) -> list[dict[str, Any]]:
     query = select(IPBlock).order_by(IPBlock.network)
     if space_id:
         query = query.where(IPBlock.space_id == space_id)
     result = await db.execute(query)
-    return list(result.scalars().all())
+    blocks = list(result.scalars().all())
+    space_vrf_cache: dict[uuid.UUID, uuid.UUID | None] = {}
+    out: list[dict[str, Any]] = []
+    for block in blocks:
+        warn = await _block_vrf_warning(db, block, space_vrf_cache)
+        out.append(_block_to_response(block, warn))
+    return out
 
 
 @router.post("/blocks", response_model=IPBlockResponse, status_code=status.HTTP_201_CREATED)
-async def create_block(body: IPBlockCreate, current_user: CurrentUser, db: DB) -> IPBlock:
+async def create_block(body: IPBlockCreate, current_user: CurrentUser, db: DB) -> dict[str, Any]:
     # Verify space exists
     if await db.get(IPSpace, body.space_id) is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP space not found")
@@ -2227,21 +2311,23 @@ async def create_block(body: IPBlockCreate, current_user: CurrentUser, db: DB) -
         reparented_children=reparented or None,
         reparented_subnets=reparented_subnets or None,
     )
-    return block
+    warn = await _block_vrf_warning(db, block)
+    return _block_to_response(block, warn)
 
 
 @router.get("/blocks/{block_id}", response_model=IPBlockResponse)
-async def get_block(block_id: uuid.UUID, current_user: CurrentUser, db: DB) -> IPBlock:
+async def get_block(block_id: uuid.UUID, current_user: CurrentUser, db: DB) -> dict[str, Any]:
     block = await db.get(IPBlock, block_id)
     if block is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP block not found")
-    return block
+    warn = await _block_vrf_warning(db, block)
+    return _block_to_response(block, warn)
 
 
 @router.put("/blocks/{block_id}", response_model=IPBlockResponse)
 async def update_block(
     block_id: uuid.UUID, body: IPBlockUpdate, current_user: CurrentUser, db: DB
-) -> IPBlock:
+) -> dict[str, Any]:
     block = await db.get(IPBlock, block_id)
     if block is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP block not found")
@@ -2348,7 +2434,8 @@ async def update_block(
 
     await db.commit()
     await db.refresh(block)
-    return block
+    warn = await _block_vrf_warning(db, block)
+    return _block_to_response(block, warn)
 
 
 @router.delete("/blocks/{block_id}", status_code=status.HTTP_204_NO_CONTENT)

@@ -241,3 +241,13 @@ class PlatformSettings(Base):
     domain_whois_interval_hours: Mapped[int] = mapped_column(
         Integer, nullable=False, default=24, server_default=sa_text("24")
     )
+
+    # VRF cross-cutting validation gate (Phase 2 of issue #86). When
+    # False (default), an ``ASN:N`` route-distinguisher whose ASN
+    # portion does not match the VRF's linked ``asn.number`` produces
+    # a non-blocking warning in the create / update response. When
+    # True, the same mismatch is a 422. Same logic applies to each
+    # ``ASN:N`` entry in the VRF's import / export route-target lists.
+    vrf_strict_rd_validation: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
