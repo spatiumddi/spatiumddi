@@ -18,6 +18,7 @@ from app.api.v1.dns.pool_router import router as dns_pool_router
 from app.api.v1.dns.router import router as dns_router
 from app.api.v1.dns_tools import router as dns_tools_router
 from app.api.v1.docker import router as docker_router
+from app.api.v1.domains import router as domains_router
 from app.api.v1.groups.router import router as groups_router
 from app.api.v1.ipam.router import router as ipam_router
 from app.api.v1.kubernetes import router as kubernetes_router
@@ -67,6 +68,7 @@ api_v1_router.include_router(metrics_router, prefix="/metrics", tags=["metrics"]
 api_v1_router.include_router(version_router, prefix="/version", tags=["version"])
 api_v1_router.include_router(kubernetes_router, prefix="/kubernetes", tags=["kubernetes"])
 api_v1_router.include_router(docker_router, prefix="/docker", tags=["docker"])
+api_v1_router.include_router(domains_router, tags=["domains"])
 api_v1_router.include_router(proxmox_router, prefix="/proxmox", tags=["proxmox"])
 api_v1_router.include_router(tailscale_router, prefix="/tailscale", tags=["tailscale"])
 api_v1_router.include_router(network_router, tags=["network"])

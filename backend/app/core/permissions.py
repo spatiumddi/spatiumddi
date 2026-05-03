@@ -272,7 +272,25 @@ def require_any_resource_permission(
     return _dep
 
 
+# ── Known synthetic permission resource_types ─────────────────────────────────
+#
+# Most resource_types map 1:1 to a real DB row (``ip_space``, ``dns_zone`` …),
+# but a handful of admin-only surfaces use synthetic ``manage_*`` scopes that
+# guard a feature rather than a row. Centralising the list here keeps the
+# `_BUILTIN_ROLES` seed in `app.main` and the documentation in
+# `docs/PERMISSIONS.md` honest as new ones land.
+KNOWN_MANAGE_PERMISSIONS: frozenset[str] = frozenset(
+    {
+        "manage_dns_pools",
+        "manage_domains",
+        "manage_network_devices",
+        "manage_nmap_scans",
+    }
+)
+
+
 __all__ = [
+    "KNOWN_MANAGE_PERMISSIONS",
     "require_any_permission",
     "require_any_resource_permission",
     "require_permission",

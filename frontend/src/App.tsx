@@ -30,6 +30,7 @@ import { CustomFieldsPage } from "@/pages/admin/CustomFieldsPage";
 import { ApiTokensPage } from "@/pages/admin/ApiTokensPage";
 import { AlertsPage } from "@/pages/admin/AlertsPage";
 import { AuthProvidersPage } from "@/pages/admin/AuthProvidersPage";
+import { DomainsPage } from "@/pages/admin/DomainsPage";
 import { GroupsPage } from "@/pages/admin/GroupsPage";
 import { RolesPage } from "@/pages/admin/RolesPage";
 import { TrashPage } from "@/pages/admin/TrashPage";
@@ -100,6 +101,7 @@ export default function App() {
         <Route path="admin/auth-providers" element={<AuthProvidersPage />} />
         <Route path="admin/api-tokens" element={<ApiTokensPage />} />
         <Route path="admin/alerts" element={<AlertsPage />} />
+        <Route path="admin/domains" element={<DomainsPage />} />
         <Route path="admin/webhooks" element={<WebhooksPage />} />
         <Route path="admin/trash" element={<TrashPage />} />
         <Route

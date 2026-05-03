@@ -4198,6 +4198,84 @@ export const alertsApi = {
     api.post<AlertEvaluateResult>("/alerts/evaluate").then((r) => r.data),
 };
 
+// ── Domain registration (RDAP / WHOIS tracking) ─────────────────────────────
+
+export type DomainWhoisState =
+  | "ok"
+  | "drift"
+  | "expiring"
+  | "expired"
+  | "unreachable"
+  | "unknown";
+
+export interface Domain {
+  id: string;
+  name: string;
+  registrar: string | null;
+  registrant_org: string | null;
+  registered_at: string | null;
+  expires_at: string | null;
+  last_renewed_at: string | null;
+  expected_nameservers: string[];
+  actual_nameservers: string[];
+  nameserver_drift: boolean;
+  dnssec_signed: boolean;
+  whois_last_checked_at: string | null;
+  whois_state: DomainWhoisState;
+  whois_data: Record<string, unknown> | null;
+  next_check_at: string | null;
+  tags: Record<string, unknown>;
+  custom_fields: Record<string, unknown>;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface DomainCreate {
+  name: string;
+  expected_nameservers?: string[];
+  tags?: Record<string, unknown>;
+  custom_fields?: Record<string, unknown>;
+}
+
+export interface DomainUpdate {
+  name?: string;
+  expected_nameservers?: string[];
+  tags?: Record<string, unknown>;
+  custom_fields?: Record<string, unknown>;
+}
+
+export interface DomainListResponse {
+  items: Domain[];
+  total: number;
+  page: number;
+  page_size: number;
+}
+
+export interface DomainListParams {
+  whois_state?: DomainWhoisState;
+  expiring_within_days?: number;
+  search?: string;
+  page?: number;
+  page_size?: number;
+}
+
+export const domainsApi = {
+  list: (params: DomainListParams = {}) =>
+    api.get<DomainListResponse>("/domains", { params }).then((r) => r.data),
+  get: (id: string) => api.get<Domain>(`/domains/${id}`).then((r) => r.data),
+  create: (body: DomainCreate) =>
+    api.post<Domain>("/domains", body).then((r) => r.data),
+  update: (id: string, body: DomainUpdate) =>
+    api.put<Domain>(`/domains/${id}`, body).then((r) => r.data),
+  delete: (id: string) => api.delete(`/domains/${id}`),
+  refreshWhois: (id: string) =>
+    api.post<Domain>(`/domains/${id}/refresh-whois`).then((r) => r.data),
+  bulkDelete: (ids: string[]) =>
+    api
+      .post<{ deleted: number }>("/domains/bulk-delete", { ids })
+      .then((r) => r.data),
+};
+
 // ── Webhooks (typed-event subscriptions) ────────────────────────────────────
 
 export interface WebhookSubscription {

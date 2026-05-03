@@ -36,6 +36,7 @@ from app.models.dns import (
     DNSZone,
 )
 from app.models.docker import DockerHost
+from app.models.domain import Domain
 from app.models.event_subscription import EventOutbox, EventSubscription
 from app.models.ipam import (
     CustomFieldDefinition,
@@ -129,6 +130,7 @@ __all__ = [
     "DNSQueryLogEntry",
     "DHCPLogEntry",
     "DockerHost",
+    "Domain",
     "KubernetesCluster",
     "ProxmoxNode",
     "TailscaleTenant",
