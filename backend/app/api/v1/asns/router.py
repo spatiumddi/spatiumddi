@@ -26,7 +26,7 @@ from sqlalchemy import String, func, or_, select
 from app.api.deps import DB, CurrentUser
 from app.api.v1.asns._audit import write_audit
 from app.core.permissions import require_resource_permission
-from app.models.asn import ASN, BGPPeering
+from app.models.asn import ASN, ASNRpkiRoa, BGPPeering
 from app.services.asns.classifier import REGISTRIES, classify_asn
 
 # Router-level permission gate — covers GET (read), POST/PUT (write),
@@ -360,6 +360,47 @@ async def refresh_asn_whois(asn_id: uuid.UUID, db: DB, user: CurrentUser) -> ASN
     return ASNRead.model_validate(row)
 
 
+class ASNRpkiRoaRead(BaseModel):
+    id: uuid.UUID
+    asn_id: uuid.UUID
+    prefix: str
+    max_length: int
+    valid_from: datetime | None
+    valid_to: datetime | None
+    trust_anchor: str
+    state: str
+    last_checked_at: datetime | None
+
+    model_config = {"from_attributes": True}
+
+
+@router.get("/{asn_id}/rpki-roas", response_model=list[ASNRpkiRoaRead])
+async def list_asn_rpki_roas(asn_id: uuid.UUID, db: DB, _: CurrentUser) -> list[ASNRpkiRoaRead]:
+    """List ROAs the AS is authorised to originate.
+
+    Sorted by state (expired first, then expiring, then valid) and
+    by ``valid_to`` ascending so the most-urgent rows surface at the
+    top. Empty list when the parent AS has no ROAs yet — the
+    detail-page UI renders an empty-state in that case.
+    """
+    asn = await db.get(ASN, asn_id)
+    if asn is None:
+        raise HTTPException(status_code=404, detail="ASN not found")
+
+    rows = (
+        (
+            await db.execute(
+                select(ASNRpkiRoa)
+                .where(ASNRpkiRoa.asn_id == asn_id)
+                .order_by(ASNRpkiRoa.prefix, ASNRpkiRoa.max_length)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    return [ASNRpkiRoaRead.model_validate(r) for r in rows]
+
+
 class RefreshRpkiResult(BaseModel):
     asn_id: uuid.UUID
     asn_number: int
@@ -370,9 +411,7 @@ class RefreshRpkiResult(BaseModel):
 
 
 @router.post("/{asn_id}/refresh-rpki", response_model=RefreshRpkiResult)
-async def refresh_asn_rpki(
-    asn_id: uuid.UUID, db: DB, user: CurrentUser
-) -> RefreshRpkiResult:
+async def refresh_asn_rpki(asn_id: uuid.UUID, db: DB, user: CurrentUser) -> RefreshRpkiResult:
     """Synchronous "Refresh RPKI now" — pulls the global ROA dump and
     reconciles ROAs for this AS only. Same per-row state machine as the
     scheduled task; just driven by an operator click.
@@ -385,9 +424,7 @@ async def refresh_asn_rpki(
     if row is None:
         raise HTTPException(status_code=404, detail="ASN not found")
     if row.kind == "private":
-        raise HTTPException(
-            status_code=400, detail="private ASN — no RPKI ROAs issued"
-        )
+        raise HTTPException(status_code=400, detail="private ASN — no RPKI ROAs issued")
 
     from datetime import UTC  # noqa: PLC0415
     from datetime import datetime as _dt  # noqa: PLC0415
@@ -399,9 +436,7 @@ async def refresh_asn_rpki(
     interval_hours = 4
     source = "cloudflare"
     if ps is not None:
-        interval_hours = max(
-            1, min(168, int(ps.rpki_roa_refresh_interval_hours or 4))
-        )
+        interval_hours = max(1, min(168, int(ps.rpki_roa_refresh_interval_hours or 4)))
         candidate = (ps.rpki_roa_source or "cloudflare").lower()
         if candidate in {"cloudflare", "ripe"}:
             source = candidate

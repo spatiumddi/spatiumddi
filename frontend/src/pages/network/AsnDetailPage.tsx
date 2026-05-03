@@ -75,16 +75,23 @@ function WhoisBadge({ state }: { state: string }) {
 const ROA_STATE_COLOR: Record<ASNRpkiRoaState, string> = {
   valid:
     "bg-emerald-50 text-emerald-700 dark:bg-emerald-500/10 dark:text-emerald-300",
-  expiring:
+  expiring_soon:
     "bg-amber-50 text-amber-700 dark:bg-amber-500/10 dark:text-amber-300",
   expired: "bg-red-50 text-red-700 dark:bg-red-500/10 dark:text-red-300",
-  invalid: "bg-zinc-100 text-zinc-700 dark:bg-zinc-500/15 dark:text-zinc-300",
+  not_found: "bg-zinc-100 text-zinc-700 dark:bg-zinc-500/15 dark:text-zinc-300",
+};
+
+const ROA_STATE_LABEL: Record<ASNRpkiRoaState, string> = {
+  valid: "Valid",
+  expiring_soon: "Expiring",
+  expired: "Expired",
+  not_found: "Not found",
 };
 
 function RoaStateBadge({ state }: { state: ASNRpkiRoaState }) {
   return (
-    <span className={cn(PILL_BASE, ROA_STATE_COLOR[state], "capitalize")}>
-      {state}
+    <span className={cn(PILL_BASE, ROA_STATE_COLOR[state])}>
+      {ROA_STATE_LABEL[state] ?? state}
     </span>
   );
 }
@@ -247,8 +254,8 @@ export function AsnDetailPage() {
     ? [...roas].sort((a, b) => {
         const stateOrder: Record<ASNRpkiRoaState, number> = {
           expired: 0,
-          expiring: 1,
-          invalid: 2,
+          expiring_soon: 1,
+          not_found: 2,
           valid: 3,
         };
         const so = (stateOrder[a.state] ?? 4) - (stateOrder[b.state] ?? 4);

@@ -5742,7 +5742,15 @@ export interface ASNRead {
   modified_at: string;
 }
 
-export type ASNRpkiRoaState = "valid" | "expiring" | "expired" | "invalid";
+// Mirrors the canonical set written by ``app.tasks.rpki_roa_refresh``:
+// ``valid`` (under 30 days from expiry — also the default when
+// validity is unknown), ``expiring_soon`` (<30 days), ``expired``,
+// ``not_found`` (the trust anchor stopped emitting the ROA).
+export type ASNRpkiRoaState =
+  | "valid"
+  | "expiring_soon"
+  | "expired"
+  | "not_found";
 
 export interface ASNRpkiRoa {
   id: string;
