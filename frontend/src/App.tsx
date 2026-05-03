@@ -18,7 +18,7 @@ import { TailscalePage } from "@/pages/tailscale/TailscalePage";
 import { NetworkPage } from "@/pages/network/NetworkPage";
 import { DeviceDetailView } from "@/pages/network/DeviceDetailView";
 import { VRFsStubPage } from "@/pages/network/VRFsStubPage";
-import { ASNsStubPage } from "@/pages/network/ASNsStubPage";
+import { AsnsPage } from "@/pages/network/AsnsPage";
 import { NmapToolsPage } from "@/pages/nmap/NmapToolsPage";
 import { CidrCalculatorPage } from "@/pages/tools/CidrCalculatorPage";
 import { SubnetPlannerListPage } from "@/pages/ipam/SubnetPlannerListPage";
@@ -76,7 +76,7 @@ export default function App() {
         <Route path="network/devices/:id" element={<DeviceDetailView />} />
         <Route path="network/vlans" element={<VLANsPage />} />
         <Route path="network/vrfs" element={<VRFsStubPage />} />
-        <Route path="network/asns" element={<ASNsStubPage />} />
+        <Route path="network/asns" element={<AsnsPage />} />
         <Route
           path="vlans"
           element={<Navigate to="/network/vlans" replace />}

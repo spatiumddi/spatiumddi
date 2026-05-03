@@ -6,6 +6,7 @@ from app.api.v1.admin.postgres import router as postgres_router
 from app.api.v1.admin.trash import router as trash_router
 from app.api.v1.alerts.router import router as alerts_router
 from app.api.v1.api_tokens.router import router as api_tokens_router
+from app.api.v1.asns import router as asns_router
 from app.api.v1.audit.router import router as audit_router
 from app.api.v1.auth.router import router as auth_router
 from app.api.v1.auth_providers.router import router as auth_providers_router
@@ -58,6 +59,7 @@ api_v1_router.include_router(custom_fields_router, prefix="/custom-fields", tags
 api_v1_router.include_router(vlans_router, prefix="/vlans", tags=["vlans"])
 api_v1_router.include_router(logs_router, prefix="/logs", tags=["logs"])
 api_v1_router.include_router(alerts_router, prefix="/alerts", tags=["alerts"])
+api_v1_router.include_router(asns_router, prefix="/asns", tags=["asns"])
 api_v1_router.include_router(acme_router, prefix="/acme", tags=["acme"])
 api_v1_router.include_router(metrics_router, prefix="/metrics", tags=["metrics"])
 api_v1_router.include_router(version_router, prefix="/version", tags=["version"])

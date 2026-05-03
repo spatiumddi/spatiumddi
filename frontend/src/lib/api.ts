@@ -5545,3 +5545,82 @@ export const nmapApi = {
     return `${base}/nmap/scans/${id}/stream?token=${encodeURIComponent(token)}`;
   },
 };
+
+// ── ASN management ──────────────────────────────────────────────────
+
+export type ASNKind = "public" | "private";
+export type ASNRegistry =
+  | "arin"
+  | "ripe"
+  | "apnic"
+  | "lacnic"
+  | "afrinic"
+  | "unknown";
+export type ASNWhoisState = "ok" | "drift" | "unreachable" | "n/a";
+
+export interface ASNRead {
+  id: string;
+  number: number;
+  name: string;
+  description: string;
+  kind: ASNKind;
+  holder_org: string | null;
+  registry: ASNRegistry;
+  whois_last_checked_at: string | null;
+  whois_data: Record<string, unknown> | null;
+  whois_state: ASNWhoisState;
+  tags: Record<string, unknown>;
+  custom_fields: Record<string, unknown>;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface ASNListResponse {
+  items: ASNRead[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface ASNListQuery {
+  limit?: number;
+  offset?: number;
+  kind?: ASNKind;
+  registry?: ASNRegistry;
+  whois_state?: ASNWhoisState;
+  search?: string;
+}
+
+export interface ASNCreate {
+  number: number;
+  name?: string;
+  description?: string;
+  holder_org?: string | null;
+  tags?: Record<string, unknown>;
+  custom_fields?: Record<string, unknown>;
+}
+
+export interface ASNUpdate {
+  name?: string;
+  description?: string;
+  holder_org?: string | null;
+  tags?: Record<string, unknown>;
+  custom_fields?: Record<string, unknown>;
+}
+
+export const asnsApi = {
+  list: (params?: ASNListQuery) =>
+    api.get<ASNListResponse>("/asns", { params }).then((r) => r.data),
+  get: (id: string) => api.get<ASNRead>(`/asns/${id}`).then((r) => r.data),
+  create: (data: ASNCreate) =>
+    api.post<ASNRead>("/asns", data).then((r) => r.data),
+  update: (id: string, data: ASNUpdate) =>
+    api.put<ASNRead>(`/asns/${id}`, data).then((r) => r.data),
+  remove: (id: string) => api.delete(`/asns/${id}`),
+  bulkDelete: (ids: string[]) =>
+    api
+      .post<{ deleted: number; not_found: string[] }>("/asns/bulk-delete", {
+        ids,
+      })
+      .then((r) => r.data),
+};
