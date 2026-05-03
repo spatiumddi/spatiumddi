@@ -223,160 +223,15 @@ than getting hoisted here. Pure-greenfield ideas from the
 2026.04.26 brainstorm pass live in their own categorised section
 further down.
 
-- ⬜ **Windows DNS — Path B (WinRM + PowerShell, full CRUD)** — zone
-  creation / edit / delete, view config, server-level options. Uses
-  `pypsrp`/`pywinrm` to invoke the `DnsServer` PowerShell module on the
-  DC. Requires WinRM-over-HTTPS, a service account in `DnsAdmins`, and a
-  credential-handling UI in the server form. Secure-only DDNS zones
-  become manageable via GSS-TSIG once Kerberos ticket acquisition lands.
-- ⬜ **Windows DHCP — Path B (WinRM + PowerShell, full CRUD)** — scope
-  / reservation / client-class / option CRUD via `Add-DhcpServerv4Scope`,
-  `Add-DhcpServerv4Reservation`, etc. Layered on top of Path A in the
-  same driver class. Service account must be in `DHCP Administrators`
-  rather than `DHCP Users`. Much bigger scope than DNS Path B since
-  there's no wire-level admin protocol; every scope field becomes a
-  cmdlet call.
-- ⬜ IP discovery — ping sweep + ARP scan Celery task; flags `discovered` status; reconciliation report (see `docs/features/IPAM.md §8`)
-- ⬜ **DNS Views — end-to-end split-horizon wiring** — `DNSView`
-  model + CRUD ship today, but the BIND9 driver doesn't wrap zones
-  in `view { match-clients …; zone { … }; }` blocks and record
-  CRUD has no `view_id` assignment UI. The storage side is ready;
-  what's missing is driver rendering + record-level view selection
-  + UI binding on the record form. Phase 3.
-- ⬜ **Multi-group DNS publishing (split-horizon at the IPAM
-  layer)** — distinct from DNS Views above. Scenario: operator
-  has one public-IP subnet hosting an internet-facing service +
-  two DNS server groups (one internal, one external) and wants
-  the same A record published into a zone in EACH group so
-  internal resolvers and external resolvers both answer for that
-  hostname. Today the IPAM → DNS pipeline is 1:1 — `IPAddress`
-  carries a single `forward_zone_id`, `_resolve_effective_zone`
-  walks subnet → block → space and returns one zone, and
-  `_sync_dns_record` publishes one A/AAAA. Need 1:N: one IPAM
-  row publishes N records, one per `(group, zone)` pin.
-
-  **Smallest correct shape** (additive, two-day landing): keep
-  `forward_zone_id` as the singular primary for backward compat,
-  add `IPAddress.extra_zone_ids: list[uuid]` for the multi-zone
-  case. Each zone naturally belongs to exactly one group, so
-  multi-group fanout is implicit — no `dns_zone_ids_by_group`
-  map needed. `_sync_dns_record` enumerates both fields and
-  emits one A/AAAA per zone; the agent push pipeline already
-  routes by zone-owning-group, so agent code is untouched.
-  Same shape applies at Subnet / Block / Space inheritance —
-  the existing `dns_additional_zone_ids` columns already store
-  group-agnostic zone lists; the constraint is in the picker UI.
-  **Cleaner long-term shape**: many-to-many join table
-  `ip_address_zone_publish(ip_id, zone_id)` retiring
-  `forward_zone_id`; bigger migration, touches every record
-  publish path. Start additive for v1 — promote to the join
-  table only if dual-storage gets in the way.
-
-  **Safety gates** (the part the operator actually asked
-  about):
-  1. **Per-subnet opt-in** `Subnet.dns_split_horizon: bool`
-     (default false), inheritable from Block. When off, the
-     zone picker stays single-group like today — current
-     behaviour, no surprise. When on, picker becomes a
-     multi-select grouped by DNS group. Don't auto-enable for
-     public CIDRs; `ipaddress.is_private` is fragile (doesn't
-     cleanly cover ULA / CGNAT) and operators legitimately
-     run split-horizon on RFC 1918 too (e.g. two internal
-     views).
-  2. **`DNSServerGroup.is_public_facing: bool`** + a server-
-     side guard. When an operator pins a private subnet's IP
-     into a public-facing group, return 422 with
-     `requires_confirmation` (mirrors the existing
-     `_check_ip_collisions` shape) so the modal can render
-     "This is RFC 1918 — publishing to `{group}` exposes
-     internal IPs to a publicly-facing resolver. Type the
-     CIDR to confirm." This is the actual safety net —
-     catches the misconfiguration whether or not split-
-     horizon is on.
-
-  Pairs naturally with DNS Views (entry above) — Views are
-  per-zone match-clients filtering (same SOA, different
-  answers per source); this entry is per-IP fanout across
-  zones in different groups (different SOAs, two
-  authoritative resolvers each serving the right one). Real
-  operators want both. Phase 3 — fits the same wave as the
-  DNS Views finish-line.
-- ⬜ **IPAM template classes** — reusable stamp templates that
-  carry default tags, custom-field values, DNS / DHCP group
-  assignments, and optional sub-subnet layouts. Applied to a block
-  or subnet on create; existing instances can re-apply to pick up
-  template drift. Phase 5 — belongs alongside advanced reporting /
-  multi-tenancy, once the base inheritance story is fully bedded
-  down.
-- ⬜ **Move IP block / space across IP spaces** — operator-driven
-  relocation of a block (and everything under it: child blocks,
-  subnets, addresses) into a different `IPSpace`. Preview + commit
-  endpoints under `/api/v1/ipam/blocks/{id}/move/{preview,commit}`
-  mirroring the existing resize UX. **Decision points still open**
-  — confirm before building:
-  1. **Scope**: block-move only (recursive through descendants),
-     not space-merge. Moving a whole space means just moving its
-     top-level blocks one-by-one — same code path.
-  2. **Integration-owned rows**: refuse when any descendant has
-     `kubernetes_cluster_id` / `docker_host_id` / future-integration
-     FKs set — the reconciler would immediately re-create the rows
-     in the original space, so moving them is a no-op that
-     desynchronises provenance. Preview flags these; commit 409s.
-  3. **Atomicity**: single transaction with `SELECT … FOR UPDATE`
-     on the block subtree; overlap re-check against the target
-     space's existing blocks before the writes land.
-  4. **Target parent**: optional — if the operator picks a parent
-     block in the target space, validate the moved block is a
-     strict subset of it. If omitted, moved block lands at top
-     level of the target space and the standard overlap-reparent
-     logic applies (can pull existing top-level siblings under it
-     if it's a supernet, by the same rule `create_block` uses).
-  5. **UI**: `MoveBlockModal` on the block detail header; typed
-     CIDR confirmation like resize; preview returns counts
-     (blocks, subnets, addresses, integration-owned blockers).
-  Phase 5-ish — no urgent driver for it, but it's the natural
-  cleanup tool once operators start reorganising spaces after
-  integrations have seeded them.
-- ⬜ **ACME embedded client — certs for SpatiumDDI's own services**
-  — *separate from the DNS-01 provider above.* SpatiumDDI runs an
-  embedded ACME client (candidate libs: `acme` / `certbot-core`
-  from the certbot project, or Go's `acme/autocert` if we ever port
-  chunks; Python-native is the fit today) that issues and auto-
-  renews certs for:
-  - the frontend HTTPS listener (today configured by hand in the
-    reverse-proxy layer — appliance deployments need this turn-key);
-  - BIND9 DoT / DoH listeners on the DNS agent (when those ship);
-  - the Kea control agent TLS (if operators expose it externally);
-  - optionally, the API's own TLS when running without an upstream
-    proxy (small deployments).
-
-  Uses our **own DNS-01 provider** (the entry above) for the
-  challenge — SpatiumDDI becomes its own ACME solver, which is a
-  nice dogfooding story. Or HTTP-01 for the frontend HTTPS listener
-  if port 80 is reachable. Certs land in a new `Certificate` table
-  (`fqdn`, `san_list`, `issued_at`, `expires_at`, `pem`,
-  `chain_pem`, `private_key_pem` Fernet-encrypted) and get pushed
-  to consuming agents via the same ConfigBundle mechanism the rest
-  of the config flows through — so a DoT listener on BIND9 picks up
-  a renewed cert without a manual deploy.
-
-  Renewal task: Celery beat every 24 h, renews anything <30 days
-  from expiry. Alert rule `certificate_expiring` fires through the
-  alerts framework at <14 days (soft) and <3 days (critical) if
-  renewal has failed — reuses the framework we just shipped.
-
-  Phase 4 — natural bundle with the OS appliance item (`docs/
-  deployment/APPLIANCE.md`) since shipping a self-configuring
-  appliance means owning the cert story end-to-end.
-
-- ⬜ **Cloud DNS driver family — Route 53 / Azure DNS / Cisco DNA**
-  — each is its own driver module implementing the DNS driver ABC.
-  Route 53 via `boto3` is the simplest entry point (stable REST
-  API, well-documented record-type mapping). Azure DNS via
-  `azure-mgmt-dns`. Cisco DNA is its own adventure — it's an
-  enterprise controller, not a DNS service, and its "DNS" touches
-  SD-Access rather than the public resolver tree. Phase 4 — pairs
-  with the Terraform / Ansible providers already on the roadmap.
+- ⬜ [**Windows DNS — Path B (WinRM + PowerShell, full CRUD)**](https://github.com/spatiumddi/spatiumddi/issues/21)
+- ⬜ [**Windows DHCP — Path B (WinRM + PowerShell, full CRUD)**](https://github.com/spatiumddi/spatiumddi/issues/22)
+- ⬜ [**IP discovery**](https://github.com/spatiumddi/spatiumddi/issues/23)
+- ⬜ [**DNS Views — end-to-end split-horizon wiring**](https://github.com/spatiumddi/spatiumddi/issues/24)
+- ⬜ [**Multi-group DNS publishing (split-horizon at the IPAM layer)**](https://github.com/spatiumddi/spatiumddi/issues/25)
+- ⬜ [**IPAM template classes**](https://github.com/spatiumddi/spatiumddi/issues/26)
+- ⬜ [**Move IP block / space across IP spaces**](https://github.com/spatiumddi/spatiumddi/issues/27)
+- ⬜ [**ACME embedded client — certs for SpatiumDDI's own services**](https://github.com/spatiumddi/spatiumddi/issues/28)
+- ⬜ [**Cloud DNS driver family — Route 53 / Azure DNS / Cisco DNA**](https://github.com/spatiumddi/spatiumddi/issues/29)
 
 ### Integration roadmap (⬜ pending)
 
@@ -391,240 +246,15 @@ Proxmox, Tailscale Phase 1+2) live in
 the brainstorm section follows a different shape — bidirectional
 write surface, not a read-only pull mirror.
 
-- ⬜ **UniFi Network Application** *(tier 1 — biggest LAN
-  inventory win).* Per-controller row, API-key auth on modern
-  UniFi OS (Site Manager API), cookie+CSRF fallback on older
-  controllers. Multi-site aware. Mirror:
-  - Networks / VLANs → Subnets (respect `subnet` + `vlan`
-    fields; VLANs land as `VLAN` rows too, re-using the existing
-    VLAN table).
-  - Active clients → IPAddress rows with MAC + hostname + OUI
-    vendor + fixed_ip flag, refreshed every 30 s.
-  - DHCP fixed IPs (reservations) → IPAddress rows with
-    `status="reserved"` so the UI shows them as static.
-  The highest-value integration for home/SMB operators — plug a
-  new device into the network, it shows up in IPAM with correct
-  VLAN + vendor + hostname with zero operator effort. Design
-  wrinkle: UniFi's two API shapes (legacy controller vs. new
-  Site Manager) need two transport implementations; shared
-  reconciler on top. Per-site or per-network opt-in gates the
-  client-mirror so a noisy guest SSID doesn't fire-hose IPAM.
-
-- ⬜ **OPNsense** *(tier 1 — firewall-of-choice for labs).*
-  Per-`OPNsenseRouter` row, API key + secret auth over HTTPS.
-  REST endpoints: `/api/dhcpv4/leases/searchLease`,
-  `/api/dhcpv4/settings/getReservation`,
-  `/api/diagnostics/interface/getInterfaceConfig`,
-  `/api/interfaces/vlan_settings/get`. Mirror LAN / VLAN /
-  OPT* interfaces → Subnets, DHCP leases → IPAddress
-  (`status="dhcp"`, same shape as Kea mirror), static mappings →
-  `status="reserved"`. ARP table endpoint as a secondary
-  population source for devices with static-IP-outside-DHCP.
-
-- ⬜ **pfSense** *(tier 1 — paired with OPNsense).* Same scope
-  as OPNsense but through either the FauxAPI package or the
-  pfsense-api REST add-on. Auth shape differs (FauxAPI key-based,
-  HMAC-signed request body; pfsense-api JWT or API-key header).
-  Shared reconciler with OPNsense once both drivers are done —
-  the data model's the same (interfaces + DHCP + ARP).
-
-- ⬜ **MikroTik RouterOS 7** *(tier 2).* Native REST API on v7,
-  or the legacy API/API2 on v6. Per-`MikrotikRouter` row.
-  Mirror: interface addresses (`/ip/address`) → Subnets, DHCP
-  leases (`/ip/dhcp-server/lease`) → IPAddress, ARP table
-  (`/ip/arp`) as a fallback population source. Narrower
-  audience than OPNsense/pfSense but very common in some lab
-  + WISP shops.
-
-- ⬜ **Incus / LXD** *(tier 2 — Docker-adjacent).* Same shape as
-  the Docker integration — `/1.0/networks` + `/1.0/instances`
-  over HTTPS with client cert auth. Different runtime, same
-  reconciler architecture. Likely share ≥ 80 % of the code with
-  `services/docker/reconcile.py` via a common base — refactor
-  when the second container-runtime integration lands, not
-  before.
-
-- ⬜ **HashiCorp Nomad** *(tier 2 — Kubernetes alt).* Read-only
-  ACL token, `GET /v1/allocations?status=running`. Mirror
-  running allocations with a resolved IP → IPAddress with
-  `status="nomad-alloc"`, hostname = `<job>.<group>.<task>`,
-  plus the Nomad network CIDR as a Subnet. Smaller install base
-  than K8s but architecturally close — Docker/K8s reconciler
-  pattern slots right in.
-
-- ⬜ **NetBox read-only import (one-shot)** *(tier 2 — migration
-  tool, not continuous sync).* Pull existing IPAM state out of
-  a NetBox install so the operator can evaluate SpatiumDDI
-  without re-entering their inventory. Not an ongoing
-  reconciler — a UI-driven import at `Admin → Import →
-  NetBox` that reads prefixes + IP addresses + VLANs +
-  tenants (mapped to IP spaces) and stamps them into IPAM
-  with `custom_fields.imported_from="netbox"`. Differs from
-  every other entry here — it's migration tooling, not
-  integration.
-
-- ⬜ **Cloud connectors — unified "Cloud" integration with
-  per-provider picker (Azure / AWS / GCP)** *(tier 3 —
-  lab-inaccessible, enterprise-driven).* One Settings →
-  Integrations card labelled **Cloud**; the create modal asks
-  for provider first, then renders the provider-specific
-  credential form with an embedded setup guide (CLI commands
-  + console click-through). Every materialised row provenances
-  via `cloud_endpoint_id` FK with `ON DELETE CASCADE` so
-  removing the endpoint sweeps mirror rows atomically.
-
-  **Data model.** Single `cloud_endpoint` row with
-  `provider` enum (`aws | azure | gcp | hetzner | digitalocean
-  | linode | vultr` — only the first three actually
-  implemented at first) plus a JSONB
-  `credentials_encrypted` blob (Fernet-encrypted, schema
-  varies per provider). Standard fields:
-  `name`, `description`, `space_id` (required — discovered
-  IPs / blocks land there), `dns_group_id` (optional, mirrors
-  the K8s shape), `sync_interval_seconds` (default 300, min
-  60), `regions` (string list — empty = all), `last_synced_at`,
-  `last_sync_error`, `mirror_load_balancers` (default true),
-  `mirror_stopped_instances` (default false).
-
-  **Per-provider credential schema:**
-  - **Azure**: `tenant_id`, `client_id`, `client_secret`,
-    `subscription_ids[]`. Setup: `az ad sp create-for-rbac
-    --name spatiumddi --role Reader --scopes /subscriptions/
-    <sub-id>` outputs all four fields. Reader is the
-    least-privileged role with read access to the four
-    resource types we mirror (VNets, subnets, NICs, LBs).
-  - **AWS**: `access_key_id`, `secret_access_key`. Setup:
-    create IAM user with `AmazonVPCReadOnlyAccess` +
-    `AmazonEC2ReadOnlyAccess` +
-    `ElasticLoadBalancingReadOnly`; attach those three
-    managed policies, generate access key, paste into the
-    form.
-  - **GCP**: `service_account_json` (entire JSON key file
-    as a single string, Fernet-encrypted), `project_ids[]`.
-    Setup: `gcloud iam service-accounts create spatiumddi
-    --display-name "SpatiumDDI"` + `gcloud projects
-    add-iam-policy-binding <proj> --member
-    serviceAccount:... --role roles/compute.viewer` +
-    `gcloud iam service-accounts keys create key.json
-    --iam-account ...`.
-
-  **Mirror scope (structurally identical across providers):**
-  - VNet (Az) / VPC (AWS) / VPC Network (GCP) → `IPSpace`
-    (auto-create with vendor-prefixed name); the address
-    space CIDR(s) → `IPBlock` rows under it.
-  - subnet (Az) / subnet (AWS) / subnetwork (GCP) →
-    `Subnet` (gateway derived from per-vendor convention —
-    Az x.x.x.1, AWS x.x.x.1, GCP x.x.x.1).
-  - VM NIC private IP (Az) / EC2 ENI (AWS) / GCE NIC (GCP)
-    → `IPAddress` with `status="cloud-vm"`, hostname =
-    `<resource>.<resource_group>` (Az) / `<instance>.<region>`
-    (AWS) / `<instance>.<zone>` (GCP).
-  - Public IPs / EIPs / external addresses → `IPAddress`
-    with `status="cloud-public"` in a separate per-endpoint
-    "public" IPSpace (or operator-chosen).
-  - LB frontend IP (Az LB / AWS ELB|ALB|NLB / GCP forwarding
-    rule) → `IPAddress` with `status="cloud-lb"`. Once
-    `LBMapping` lands these flow into it with full backend
-    pool membership.
-
-  **Connectors:** Azure via `azure-mgmt-network` +
-  `azure-mgmt-compute` + `azure-identity` (ClientSecret
-  credential), AWS via `boto3` (per-region client fan-out),
-  GCP via `google-cloud-compute` + `google-cloud-network`
-  + `google-auth`. Each connector is a thin reconciler under
-  `services/cloud/<provider>.py` that returns a normalised
-  `CloudInventory` dataclass; the shared
-  `services/cloud/reconcile.py` does the IPAM upsert. Same
-  `user_modified_at` lock pattern as Proxmox / Docker / K8s
-  rows so operator edits stay sticky.
-
-  **Phasing (recommended).** Phase 1 = Azure (simplest auth
-  flow, user-familiar). Phase 2 = AWS. Phase 3 = GCP. Each
-  phase is independently shippable since the data model is
-  the same; `provider` enum gates the connector dispatch.
-
-  **Permission gate** `manage_cloud_endpoints` (admin-only).
-  Optional new "Cloud Operator" builtin role — usually fits
-  inside Superadmin in practice.
-
-  **Explicit non-goals.** Writing back to the cloud (no
-  resource creation, no NSG / Security Group edits, no
-  instance start/stop). Cloud DNS (Route 53 / Azure DNS /
-  Cloud DNS) is a **separate write-side driver family**
-  already on the roadmap — it does NOT live in the cloud
-  endpoint row. Tags / NSGs / route tables surface as
-  `custom_fields` passthrough at most; Phase 4+ if operators
-  ask. Per-provider quirks (Azure availability sets, AWS
-  placement groups, GCP shared VPC) deferred — start with
-  the four resource types above.
-
-- ⬜ **Load balancer family (F5 BIG-IP, HAProxy, nginx,
-  KEMP, A10, Citrix ADC)** *(tier 2 — F5 first, others
-  follow).* Read-only mirror of VIPs + pools + members from
-  external load balancers into a new first-class
-  `LBMapping` table that parallels the existing
-  `NATMapping` shape (operator-curated 1:1 / PAT / hide-NAT
-  rules surface in the per-IP modal + per-subnet "NAT"
-  tab; load-balancer mappings would surface the same way
-  with "VIP" / "backend" role badges). The data-model
-  payoff: per-IP modal answers "is this a VIP? what
-  backends serve it?" / "is this a pool member behind
-  what VIP?", per-subnet view shows every VIP in range,
-  and operators can finally tell load-balancer IPs apart
-  from regular host IPs in the IP table.
-
-  **Decision points still open** — confirm before building:
-  1. **Manual-only first, or integration-driven only?**
-     NAT mappings work as manual-entry today and we
-     accept the staleness; LB mappings change much more
-     often (pool membership shifts on every deploy /
-     auto-scale event). Recommendation: gate on the
-     integration, no manual-entry shipping. The data is
-     only useful when fresh.
-  2. **`LBMapping` shape**: `vip_ip` (FK to `IPAddress`,
-     nullable), `vip_port`, `protocol` (tcp/udp/icmp),
-     `pool_name`, `description`, `lb_endpoint_id` FK to
-     the integration row that materialised it (nullable
-     for any future manual-entry path), `members` JSONB
-     `[{ip, port, weight, state}]` with optional FKs to
-     live `IPAddress` rows on each member.
-     Provenance via `lb_endpoint_id` with
-     `ON DELETE CASCADE` so removing the integration
-     sweeps mirror rows atomically (mirrors how
-     `kubernetes_cluster_id` / `proxmox_node_id` work).
-  3. **Phasing.** Phase 1 = `LBMapping` table +
-     `F5Endpoint` row + reconciler over iControl REST
-     (token auth, Fernet-encrypted at rest, partition-
-     aware). Phase 2 = HAProxy stats socket / Runtime
-     API + nginx Plus API readers. Phase 3 = KEMP / A10
-     / Citrix ADC. Cloud LBs (AWS ELB / Azure LB / GCP
-     LB) ride along with the Cloud VPC integration
-     family above and write into the same `LBMapping`
-     table — the schema is shared; the connector is
-     vendor-specific.
-  4. **F5 specifics**: per-`F5Endpoint` row covers a
-     single BIG-IP (or cluster — iControl normalises
-     standalone vs HA pairs). Mirror VIPs from
-     `/mgmt/tm/ltm/virtual` and pools from
-     `/mgmt/tm/ltm/pool`. Member health is in
-     `/mgmt/tm/ltm/pool/~<partition>~<pool>/members`.
-     iRule / iApp / partition surface deferred — start
-     with the basic VIP + pool + members triple.
-  5. **Permission gate** `manage_load_balancers`
-     (admin-only). New "Load Balancer Editor" builtin
-     role for ops teams that need write access to the
-     manual-entry path (if it ever lands) without full
-     superadmin.
-
-  **Explicit non-goals**: writing config back to the
-  load balancer (no `iControl REST PUT`, no HAProxy
-  reload), managing certificates on F5 (separate
-  surface; pairs with the embedded ACME client item
-  on the roadmap), iRule / iApp authoring. The mirror
-  is for IPAM context, not LB administration.
-
-**Explicit non-goals for the integrations shelf:**
-
+- ⬜ [**UniFi Network Application**](https://github.com/spatiumddi/spatiumddi/issues/30)
+- ⬜ [**OPNsense (tier 1 — firewall-of-choice for labs)**](https://github.com/spatiumddi/spatiumddi/issues/31)
+- ⬜ [**pfSense (tier 1 — paired with OPNsense)**](https://github.com/spatiumddi/spatiumddi/issues/32)
+- ⬜ [**MikroTik RouterOS 7 (tier 2)**](https://github.com/spatiumddi/spatiumddi/issues/33)
+- ⬜ [**Incus / LXD (tier 2 — Docker-adjacent)**](https://github.com/spatiumddi/spatiumddi/issues/34)
+- ⬜ [**HashiCorp Nomad (tier 2 — Kubernetes alt)**](https://github.com/spatiumddi/spatiumddi/issues/35)
+- ⬜ [**NetBox read-only import (one-shot)**](https://github.com/spatiumddi/spatiumddi/issues/36)
+- ⬜ [**Cloud connectors — unified "Cloud" integration with per-provider picker (Azure / AWS / GCP)**](https://github.com/spatiumddi/spatiumddi/issues/37)
+- ⬜ [**Load balancer family (F5 BIG-IP, HAProxy, nginx, KEMP, A10, Citrix ADC)**](https://github.com/spatiumddi/spatiumddi/issues/38)
 - **VMware vCenter / ESXi.** Bigger enterprise audience, but
   vCenter's SOAP-heavy + licensed API makes it a significantly
   bigger dev effort than the tier 1 candidates. Revisit only if
@@ -653,72 +283,19 @@ sub-headings.
 
 #### Discovery & network awareness
 
-- ⬜ **NetFlow / sFlow ingestion** — bind a UDP listener
-  (sflowtool / goflow2 sidecar, or pure-Python decoder) and
-  aggregate to per-IP byte / packet / flow counters in 5-minute
-  buckets. Writes to a `traffic_sample` table parallel to
-  `metric_sample`. Surfaces "active vs allocated" pivot — IPs
-  in IPAM that haven't seen a flow in N days are surfacing
-  candidates for stale-IP cleanup.
-- ⬜ **mDNS / Bonjour / WSD passive discovery** — agent-style
-  listener that joins the multicast group on each managed
-  subnet and records hostnames + service-types announced
-  (`_workstation._tcp`, `_printer._tcp`, etc). Best run inside
-  a DHCP agent pod since the agent already has L2 reach. Cheap
-  incremental population.
-- ⬜ **Reverse-DNS auto-population** — Celery beat sweeps IP rows
-  where `hostname IS NULL` and issues a PTR lookup against the
-  configured resolvers. Hostname is filled with the trailing
-  single-label only (the FQDN goes in `description`). Skipped
-  for integration-owned rows whose hostname is authoritative
-  from upstream.
-- ⬜ **CGNAT (RFC 6598) awareness** — first-class recognition of
-  `100.64.0.0/10` as carrier-grade NAT space, distinct from
-  RFC 1918 / public space. Quick-paste preset already exists
-  in the CIDR calculator; the rest is operator-facing
-  semantics: a "CGNAT" badge on subnets that fall in the
-  block, exclusion from public-space reporting, and a hint
-  in the New Subnet modal when an operator picks a CGNAT
-  CIDR for a normal LAN ("this is RFC 6598 carrier-grade NAT
-  space — Tailscale uses it; double-check before using for
-  on-prem"). Pairs with the existing Tailscale tenant
-  CGNAT-block auto-create — that already lands `100.64.0.0/10`
-  as the default CGNAT root for the tenant. Operator-facing
-  framing only; no allocation behaviour changes.
+- ⬜ [**NetFlow / sFlow ingestion**](https://github.com/spatiumddi/spatiumddi/issues/39)
+- ⬜ [**mDNS / Bonjour / WSD passive discovery**](https://github.com/spatiumddi/spatiumddi/issues/40)
+- ⬜ [**Reverse-DNS auto-population**](https://github.com/spatiumddi/spatiumddi/issues/41)
+- ⬜ [**CGNAT (RFC 6598) awareness**](https://github.com/spatiumddi/spatiumddi/issues/42)
 
 #### Reporting & analytics
 
-- ⬜ **Capacity forecasting** — linear-regression projection of
-  subnet utilization based on the existing time-series data.
-  "This /24 trends to 100% on YYYY-MM-DD at current rate."
-  Surfaces as a "Days to full" column on subnet tables + an
-  alert rule type `subnet_capacity_forecast` keyed on
-  `< N days`. Math is trivial; the win is operator-actionable.
-- ⬜ **Per-subnet utilization history** — small chart on subnet
-  detail showing % used over the last 30 / 90 days. Storage
-  piggy-backs on the subnet `allocated_ips` column with a daily
-  snapshot (`subnet_utilization_history(subnet_id, sampled_at,
-  allocated_ips, total_ips)`); 90-day retention cap.
-- ⬜ **Stale-IP report** — admin page listing IP rows with
-  `status = allocated` and `last_seen_at` older than N days
-  (operator-tunable, default 90). One-click bulk-deprecate.
-  Feed for "address space hygiene" alerts.
-- ⬜ **Decom-date awareness** — first-class `decom_date` column
-  on subnet + ip_address (currently only suggested as a custom
-  field). Beat task generates a "subnets decom in next 30 days"
-  summary that feeds the alerts framework + an admin dashboard
-  widget.
-- ⬜ **Top-N reports** — fixed dashboard widgets: top 10 subnets
-  by utilization, top 10 owners by IP count, top 10
-  most-modified resources in the last 7 days, top 10 noisiest
-  DNS clients. All derivable from existing tables; just needs
-  a reports router + page.
-- ⬜ **Compliance / change report PDF** — scheduled or on-demand
-  PDF rollup of every audit_log mutation in a date range,
-  grouped by user / resource type / action. Generated
-  server-side via `weasyprint` or `reportlab`.
-  Auditor-friendly; pairs with the audit-log immutability work
-  below.
+- ⬜ [**Capacity forecasting**](https://github.com/spatiumddi/spatiumddi/issues/43)
+- ⬜ [**Per-subnet utilization history**](https://github.com/spatiumddi/spatiumddi/issues/44)
+- ⬜ [**Stale-IP report**](https://github.com/spatiumddi/spatiumddi/issues/45)
+- ⬜ [**Decom-date awareness**](https://github.com/spatiumddi/spatiumddi/issues/46)
+- ⬜ [**Top-N reports**](https://github.com/spatiumddi/spatiumddi/issues/47)
+- ⬜ [**Compliance / change report PDF**](https://github.com/spatiumddi/spatiumddi/issues/48)
 
 #### Subnet planning & calculation tools
 
@@ -729,241 +306,62 @@ suggestion, free-space treemap.
 
 #### DNS-specific
 
-- ⬜ **DNSSEC** — sign zones, manage KSK / ZSK rollover, NSEC3
-  parameters, DS-record export to upstream. BIND9 supports
-  inline signing (`dnssec-policy` configs in 9.16+). Storage:
-  `DNSSECPolicy` + `DNSKey` tables tracking key material
-  (Fernet-encrypted) and rollover state. Massive compliance ask
-  in regulated verticals; table-stakes for any "enterprise DDI"
-  comparison.
-- ⬜ **DoT / DoH listener** — BIND 9.18+ supports DNS-over-TLS
-  (`tls`) and DNS-over-HTTPS (`https`) natively. Driver renders
-  the listener config; cert lifecycle ties into the ACME
-  embedded-client item already on the roadmap.
+- ⬜ [**DNSSEC**](https://github.com/spatiumddi/spatiumddi/issues/49)
+- ⬜ [**DoT / DoH listener**](https://github.com/spatiumddi/spatiumddi/issues/50)
+
 #### DHCP-specific
 
-- ⬜ **PXE / iPXE provisioning** — first-class fields for
-  `next-server`, `boot-filename`, with per-arch matching (BIOS
-  vs UEFI vs ARM). Today it's manual option-stuffing. Renders
-  to Kea client classes + scope-level overrides; surfaces in
-  the scope edit modal as a "PXE / iPXE" tab.
-- ⬜ **DHCPv6 stateful + SLAAC config UI** — Kea Dhcp6 backend
-  exists; the missing piece is operator-friendly UI for
-  choosing between stateless / stateful / SLAAC + RA mode.
-  Today the address-family toggle exists but the v6-specific
-  modes don't.
-- ⬜ **Lease histogram by hour** — per-scope chart showing lease
-  grants by hour-of-day over the last 7 / 30 days. Pinpoints
-  office-arrival surges + capacity planning. Storage: bucketed
-  counters on `dhcp_lease_hourly` written by the existing lease
-  ingestion path.
-- ⬜ **Option 82 (relay agent info) class matching** — Kea
-  client classes that match on `relay-agent-info` sub-options
-  (circuit-id, remote-id). Lets carriers / large-enterprise
-  drive scope selection off switch port info inserted by the
-  relay. UI: per-class predicate builder.
-- ⬜ **DHCP test client** — synthetic DISCOVER → OFFER →
-  REQUEST → ACK from inside SpatiumDDI to validate a scope is
-  operational. Implemented as a Celery task using `scapy` or
-  pure-socket DHCP. Useful for change-window verification +
-  post-deploy smoke tests.
+- ⬜ [**PXE / iPXE provisioning**](https://github.com/spatiumddi/spatiumddi/issues/51)
+- ⬜ [**DHCPv6 stateful + SLAAC config UI**](https://github.com/spatiumddi/spatiumddi/issues/52)
+- ⬜ [**Lease histogram by hour**](https://github.com/spatiumddi/spatiumddi/issues/53)
+- ⬜ [**Option 82 (relay agent info) class matching**](https://github.com/spatiumddi/spatiumddi/issues/54)
+- ⬜ [**DHCP test client**](https://github.com/spatiumddi/spatiumddi/issues/55)
 
 #### Operational tooling
 
-- ⬜ **Time-travel queries** — "what did this subnet look like a
-  month ago?" UI that replays the audit_log forward from a
-  snapshot to a target timestamp. Read-only — no rollback.
-  Powered entirely by the existing audit data; just needs a
-  replay engine + UI.
-- ⬜ **Maintenance mode** — global toggle that puts the entire
-  system in read-only state during change windows. UI shows a
-  top banner; every write endpoint returns 503 with
-  `Retry-After`. Bypass for superadmins so they can still make
-  the changes themselves.
-- ⬜ **Built-in network tools page** — `/tools` with widgets for
-  ping, traceroute, dig, whois, port-test, MTR,
-  DNS-propagation-check, TLS cert checker, MAC vendor lookup.
-  Each runs from the SpatiumDDI server perspective (or a chosen
-  DHCP / DNS agent's perspective). Saves operators bouncing to
-  a jump-box. Bound by the existing permission gates;
-  rate-limited to avoid abuse.
-- ⬜ **PCAP capture trigger** — start a tcpdump on a chosen
-  agent pod / host with a BPF filter, return a downloadable
-  pcap when done. Niche but loved; uses the agent's existing
-  JWT for auth.
-- ⬜ **ACL / prefix-list generator** — given a subnet or list of
-  subnets, render Cisco IOS / Juniper JUNOS / Arista EOS /
-  Linux iptables / nftables ACL syntax. Pairs with router-zone
-  metadata for "all subnets in zone X as a Cisco prefix-list"
-  exports.
-- ⬜ **Config-drift report (full record diff)** — extends the
-  existing zone-serial drift surface with a full record-level
-  diff: AXFR the zone from each member, diff against the
-  SpatiumDDI source of truth, surface adds / changes / deletes
-  per server. Lets operators spot manual changes made directly
-  on a BIND9 host.
+- ⬜ [**Time-travel queries**](https://github.com/spatiumddi/spatiumddi/issues/56)
+- ⬜ [**Maintenance mode**](https://github.com/spatiumddi/spatiumddi/issues/57)
+- ⬜ [**Built-in network tools page**](https://github.com/spatiumddi/spatiumddi/issues/58)
+- ⬜ [**PCAP capture trigger**](https://github.com/spatiumddi/spatiumddi/issues/59)
+- ⬜ [**ACL / prefix-list generator**](https://github.com/spatiumddi/spatiumddi/issues/60)
+- ⬜ [**Config-drift report (full record diff)**](https://github.com/spatiumddi/spatiumddi/issues/61)
 
 #### Workflow & RBAC
 
-- ⬜ **Approval workflows for risky ops** — two-person rule on
-  subnet / zone / scope delete + bulk operations above a
-  threshold. Request lands as a `PendingChange` row; second
-  eligible approver clicks Approve → the change executes under
-  their identity. Audit log carries both user IDs.
-- ⬜ **Resource locking** — operator can lock a resource (subnet,
-  zone, scope) for the duration of a change window. While
-  locked, even superadmins get a confirmation prompt. Lock has
-  TTL + owner; "force-unlock" requires a permission gate.
-- ⬜ **Per-resource ACLs** — augment the role-based system with
-  resource-scoped grants ("group X can allocate IPs in subnet
-  Y but not delete"). Uses the existing `{action,
-  resource_type, resource_id?}` permission grammar; just needs
-  a per-resource grant editor in the UI.
-- ⬜ **Time-bound permissions** — grant group X access to subnet
-  Y until a specific timestamp. Beat task revokes expired
-  grants automatically. Useful for vendor / contractor access
-  windows.
-- ⬜ **Comments / activity feed per resource** — Slack-style
-  discussion thread on subnets / IPs / zones / scopes.
-  Markdown-rendered comments + system-generated activity
-  entries (deletes, edits, status changes). Powerful "who
-  broke this" forensics aid; pairs with @-mention notifications.
+- ⬜ [**Approval workflows for risky ops**](https://github.com/spatiumddi/spatiumddi/issues/62)
+- ⬜ [**Resource locking**](https://github.com/spatiumddi/spatiumddi/issues/63)
+- ⬜ [**Per-resource ACLs**](https://github.com/spatiumddi/spatiumddi/issues/64)
+- ⬜ [**Time-bound permissions**](https://github.com/spatiumddi/spatiumddi/issues/65)
+- ⬜ [**Comments / activity feed per resource**](https://github.com/spatiumddi/spatiumddi/issues/66)
 
 #### Notifications & external integrations
 
-- ⬜ **Ansible dynamic-inventory endpoint** —
-  `/api/v1/ansible/inventory` returns Ansible-formatted JSON:
-  groups by IP space / block / subnet / tag / custom field.
-  Drop-in replacement for static inventory files. Token-auth
-  scoped to read-only.
-- ⬜ **ServiceNow CMDB integration** — bidirectional sync with a
-  ServiceNow instance. Per-`ServiceNowInstance` row: instance
-  URL + auth (basic / OAuth client-credentials / API key,
-  Fernet-encrypted at rest). Phase 4 — pairs naturally with the
-  alerts framework SMTP / webhook work above. **Mirror scope:**
-  - **Push** IPAM subnets + IP rows to CMDB as
-    `cmdb_ci_ip_network` + `cmdb_ci_ip_address` records via the
-    Table API. Optional `cmdb_ci_network_adapter` for rows with
-    a MAC. Provenance via `service_now_sys_id` column on each
-    mirrored row so updates are PATCH not POST. Beat-driven
-    reconciliation, same shape as the K8s / Docker mirrors but
-    write-direction.
-  - **Pull** asset ownership from CMDB → populate IPAM
-    `owner_user_id` / `owner_group_id` / `managed_by` from the
-    matching CI's `assigned_to` / `support_group` / `owned_by`
-    fields. Operator-edits stay sticky via `user_modified_at`
-    lock (same pattern as Proxmox / Tailscale rows).
-  - **Ticket linkage** — operator pastes an INC / CHG / REQ
-    number on an IP / subnet, SpatiumDDI resolves it to
-    `sys_id` + `short_description` + `state` via the Table API
-    and renders a clickable badge with deep-link back into
-    ServiceNow. New `service_now_ticket_link(resource_type,
-    resource_id, table, sys_id, number, short_description,
-    state, link_url, created_at)` table.
-  - **Auto-create CHG on risky ops** — subnet delete / resize /
-    bulk-edit modals get an opt-in "Open ServiceNow change?"
-    checkbox. SpatiumDDI POSTs a CHG with templated short
-    description / planned start / category, captures the
-    resulting number, and stamps it on the audit_log row.
-  - **Self-service catalog item** — published catalog form
-    "Request IP allocation" calls the SpatiumDDI API on
-    fulfilment via a SNOW Flow. Decoupled — SNOW just hits our
-    REST surface like any other client.
-  - **Phasing.** Phase 1 = ticket-linkage badges + read-only
-    pull (lowest risk, biggest immediate UX win). Phase 2 =
-    CMDB push. Phase 3 = auto-CHG + catalog item. Each phase
-    is separately enable-able from Settings → Integrations
-    once it lands.
-  - **Permission gate** `manage_servicenow` (admin-only). No
-    new roles created — fits inside the existing RBAC grammar.
-  - **Why this matters:** in enterprises that run SNOW as the
-    asset source of truth, an IPAM tool that doesn't sync with
-    CMDB ends up with stale owner / contact data within a
-    quarter. The ticket-linkage piece alone closes the
-    "where's the change request for this subnet?" forensics
-    gap that operators currently solve by greping email.
+- ⬜ [**Ansible dynamic-inventory endpoint**](https://github.com/spatiumddi/spatiumddi/issues/67)
+- ⬜ [**ServiceNow CMDB integration**](https://github.com/spatiumddi/spatiumddi/issues/68)
 
 #### Security & compliance
 
-- ⬜ **2FA / MFA for local users** — TOTP enrolment via `pyotp`
-  with recovery codes. `User.totp_secret` (Fernet-encrypted) +
-  `User.mfa_enabled`. Login flow: password → TOTP prompt →
-  JWT. Optional WebAuthn / FIDO2 in a follow-up.
-- ⬜ **Password policy enforcement** — configurable
-  `PlatformSettings.password_*`: min length, character classes,
-  history (last N hashes), max age (force change after N days),
-  lockout threshold. Today auth is bcrypt + force-change flag
-  only.
-- ⬜ **Account lockout after N failed logins** — windowed
-  counter on `User.failed_login_count` +
-  `failed_login_locked_until`. Resets on successful login.
-  Operator-tunable threshold; superadmin bypass via "force
-  unlock" admin action.
-- ⬜ **Active session viewer + force-logout** — admin UI listing
-  every live JWT (by `jti` cached in Redis), with last-IP /
-  user-agent / login-method / age. "Revoke" adds the JTI to a
-  revocation set checked at every auth-decode.
-- ⬜ **Audit-log tamper detection** — chain hash on each
-  audit_log row: `row_hash = sha256(prev_row_hash ||
-  canonical_json(row))`. Stored in a new column; nightly
-  verifier flags any chain break. Big tick for SOC2 / HIPAA
-  audits; near-zero runtime cost on writes.
-- ⬜ **API-token scopes** — per-token grants (read-only /
-  IPAM-only / DNS-only / DHCP-only / agent-only). Today tokens
-  are full-access JWT-equivalents. Storage: `APIToken.scopes`
-  JSONB list checked at the auth layer alongside the existing
-  permission gates.
-- ⬜ **Subnet classification tags** — first-class `pci_scope` /
-  `hipaa_scope` / `internet_facing` boolean flags on subnet
-  (versus free-form custom fields) + a Compliance dashboard
-  filtered by them. Common ask in regulated verticals —
-  auditors love being able to ask "show me every PCI subnet,
-  who owns it, when was it last changed."
-- ⬜ **Internal cert + secret expiry monitoring** — alert rule
-  type `secret_expiring` keyed off internal TLS certs
-  (control-plane, agent comms), TSIG keys, API tokens, ACME
-  accounts, and any Fernet-encrypted credential with an
-  `expires_at`. Catches the "we forgot to rotate" failure mode
-  before it pages someone at 3am.
+- ⬜ [**2FA / MFA for local users**](https://github.com/spatiumddi/spatiumddi/issues/69)
+- ⬜ [**Password policy enforcement**](https://github.com/spatiumddi/spatiumddi/issues/70)
+- ⬜ [**Account lockout after N failed logins**](https://github.com/spatiumddi/spatiumddi/issues/71)
+- ⬜ [**Active session viewer + force-logout**](https://github.com/spatiumddi/spatiumddi/issues/72)
+- ⬜ [**Audit-log tamper detection**](https://github.com/spatiumddi/spatiumddi/issues/73)
+- ⬜ [**API-token scopes**](https://github.com/spatiumddi/spatiumddi/issues/74)
+- ⬜ [**Subnet classification tags**](https://github.com/spatiumddi/spatiumddi/issues/75)
+- ⬜ [**Internal cert + secret expiry monitoring**](https://github.com/spatiumddi/spatiumddi/issues/76)
 
 #### UX polish
 
-- ⬜ **Saved searches / saved views** — store filter + column +
-  sort state per user as a named `SavedView(user_id, page,
-  name, payload)`. Pinned to the page header dropdown.
-  "All subnets in DC1 over 80% utilization, sorted by name"
-  becomes a one-click view. Massive QoL.
-- ⬜ **Personal pinned dashboard** — pin specific subnets /
-  zones / scopes / IPs to a per-user home page. Stored as
-  `UserPin(user_id, resource_type, resource_id, pinned_at)`.
-  Operators get their habitual workspace as the default
-  landing.
-- ⬜ **Field-level history** — click any field on a resource
-  detail page, see every past value with who / when. Powered
-  by the existing audit_log + a JSON-diff renderer.
-- ⬜ **Recent items / favourites sidebar** — last-N visited
-  resources per user (browser-local) + an explicit star button
-  for sticky favourites (server-side `UserFavourite`).
-- ⬜ **Keyboard shortcut help overlay** — `?` opens a modal
-  listing every binding (Cmd+K is great; growing the surface).
-  One source of truth in `frontend/src/lib/shortcuts.ts`.
-- ⬜ **Print / PDF export for IPAM tree + subnet detail** —
-  server-rendered PDF (weasyprint) with stable page breaks +
-  headers. Auditors and ops handovers love static deliverables;
-  pairs with the compliance report PDF item above.
+- ⬜ [**Saved searches / saved views**](https://github.com/spatiumddi/spatiumddi/issues/77)
+- ⬜ [**Personal pinned dashboard**](https://github.com/spatiumddi/spatiumddi/issues/78)
+- ⬜ [**Field-level history**](https://github.com/spatiumddi/spatiumddi/issues/79)
+- ⬜ [**Recent items / favourites sidebar**](https://github.com/spatiumddi/spatiumddi/issues/80)
+- ⬜ [**Keyboard shortcut help overlay**](https://github.com/spatiumddi/spatiumddi/issues/81)
+- ⬜ [**Print / PDF export for IPAM tree + subnet detail**](https://github.com/spatiumddi/spatiumddi/issues/82)
 
 #### CLI tool
 
-- ⬜ **`spddi` CLI** — stand-alone Python CLI published to PyPI
-  as `spatiumddi-cli`. Auth via `~/.config/spddi/config`
-  (token + URL). Commands mirror the REST surface:
-  `spddi ip alloc`, `spddi subnet ls / show / split / merge`,
-  `spddi zone export / import`, `spddi dhcp scope ls`, etc.
-  Output supports `--format table|json|yaml`. Useful in scripts
-  + ops handover when the UI is inconvenient. Built on `httpx`
-  + `typer` (fast iteration).
-
----
+- ⬜ [**`spddi` CLI**](https://github.com/spatiumddi/spatiumddi/issues/83)
 
 ## Version Scheme
 
