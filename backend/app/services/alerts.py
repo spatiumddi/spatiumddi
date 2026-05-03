@@ -19,7 +19,7 @@ trip the alarm — same predicate the dashboard honours.
 from __future__ import annotations
 
 import ipaddress
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
@@ -27,6 +27,7 @@ from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.alerts import AlertEvent, AlertRule
+from app.models.asn import ASN, ASNRpkiRoa
 from app.models.dhcp import DHCPServer
 from app.models.dns import DNSServer
 from app.models.ipam import Subnet
@@ -38,7 +39,33 @@ logger = structlog.get_logger(__name__)
 
 RULE_TYPE_SUBNET_UTILIZATION = "subnet_utilization"
 RULE_TYPE_SERVER_UNREACHABLE = "server_unreachable"
-RULE_TYPES = frozenset({RULE_TYPE_SUBNET_UTILIZATION, RULE_TYPE_SERVER_UNREACHABLE})
+# ASN / RPKI rule types — Phase 2 of issue #85. ``asn_holder_drift``
+# fires when a row flips to ``whois_state="drift"``;
+# ``asn_whois_unreachable`` fires once
+# ``whois_data.consecutive_failures`` reaches 3;
+# ``rpki_roa_expiring`` / ``rpki_roa_expired`` key off the per-ROA
+# state column the refresh task maintains.
+RULE_TYPE_ASN_HOLDER_DRIFT = "asn_holder_drift"
+RULE_TYPE_ASN_WHOIS_UNREACHABLE = "asn_whois_unreachable"
+RULE_TYPE_RPKI_ROA_EXPIRING = "rpki_roa_expiring"
+RULE_TYPE_RPKI_ROA_EXPIRED = "rpki_roa_expired"
+RULE_TYPES = frozenset(
+    {
+        RULE_TYPE_SUBNET_UTILIZATION,
+        RULE_TYPE_SERVER_UNREACHABLE,
+        RULE_TYPE_ASN_HOLDER_DRIFT,
+        RULE_TYPE_ASN_WHOIS_UNREACHABLE,
+        RULE_TYPE_RPKI_ROA_EXPIRING,
+        RULE_TYPE_RPKI_ROA_EXPIRED,
+    }
+)
+
+# Default consecutive-failure threshold for ``asn_whois_unreachable``.
+# Hardcoded today; could become a per-rule field if operator demand
+# surfaces. Three failures at 24 h cadence = ~3 days of drift before
+# the alert fires, which matches the spec's "operator-configurable,
+# default 3" intent.
+_ASN_WHOIS_UNREACHABLE_THRESHOLD = 3
 
 
 def _prefix_len(network: str) -> tuple[int, int] | None:
@@ -90,6 +117,102 @@ async def _matching_subnet_subjects(
         )
         matches.append((str(s.id), display, message))
     return matches
+
+
+async def _matching_asn_drift_subjects(
+    db: AsyncSession, rule: AlertRule  # noqa: ARG001 — symmetry with sibling evaluators
+) -> list[tuple[str, str, str]]:
+    """Every ``asn`` row currently in ``whois_state="drift"``."""
+    res = await db.execute(select(ASN).where(ASN.whois_state == "drift"))
+    matches: list[tuple[str, str, str]] = []
+    for row in res.scalars().all():
+        display = f"AS{row.number}" + (f" ({row.name})" if row.name else "")
+        new_holder = row.holder_org or "<unknown>"
+        message = f"AS{row.number} WHOIS holder changed — current holder: {new_holder}"
+        matches.append((str(row.id), display, message))
+    return matches
+
+
+async def _matching_asn_unreachable_subjects(
+    db: AsyncSession, rule: AlertRule  # noqa: ARG001
+) -> list[tuple[str, str, str]]:
+    """Every ``asn`` row whose ``whois_data.consecutive_failures`` has
+    crossed the threshold and is currently in ``whois_state="unreachable"``.
+
+    ``consecutive_failures`` lives inside the JSONB ``whois_data`` blob
+    (the refresh task increments it on every failed RDAP fetch and
+    resets it on success). Reading it via ORM gives us the live value
+    without a JSONB query expression.
+    """
+    res = await db.execute(select(ASN).where(ASN.whois_state == "unreachable"))
+    matches: list[tuple[str, str, str]] = []
+    for row in res.scalars().all():
+        data = row.whois_data if isinstance(row.whois_data, dict) else {}
+        try:
+            failures = int(data.get("consecutive_failures") or 0)
+        except (TypeError, ValueError):
+            failures = 0
+        if failures < _ASN_WHOIS_UNREACHABLE_THRESHOLD:
+            continue
+        display = f"AS{row.number}" + (f" ({row.name})" if row.name else "")
+        message = f"AS{row.number} WHOIS unreachable — {failures} consecutive RDAP fetch failures"
+        matches.append((str(row.id), display, message))
+    return matches
+
+
+async def _matching_rpki_roa_expiring_subjects(
+    db: AsyncSession, rule: AlertRule  # noqa: ARG001
+) -> list[tuple[str, str, str]]:
+    """Every ROA in ``state="expiring_soon"``.
+
+    The refresh task derives the state ladder; the alert evaluator
+    just reads it. Severity is operator-chosen on the rule itself —
+    soft / warning / critical for <30d / <7d / <24h respectively;
+    operators create N rules with different severities + filters
+    when they want graduated alerting.
+    """
+    res = await db.execute(select(ASNRpkiRoa).where(ASNRpkiRoa.state == "expiring_soon"))
+    matches: list[tuple[str, str, str]] = []
+    now = datetime.now(UTC)
+    for roa in res.scalars().all():
+        # Resolve the parent AS for a human-friendly display string.
+        parent = await db.get(ASN, roa.asn_id)
+        parent_label = f"AS{parent.number}" if parent is not None else "AS?"
+        display = f"{parent_label} {roa.prefix}-{roa.max_length}"
+        when = ""
+        if roa.valid_to is not None:
+            delta = roa.valid_to - now
+            days = max(0, delta.days)
+            when = f" — expires in {days}d"
+        message = (
+            f"RPKI ROA {parent_label} {roa.prefix} maxLen {roa.max_length} "
+            f"({roa.trust_anchor}) is expiring soon{when}"
+        )
+        matches.append((str(roa.id), display, message))
+    return matches
+
+
+async def _matching_rpki_roa_expired_subjects(
+    db: AsyncSession, rule: AlertRule  # noqa: ARG001
+) -> list[tuple[str, str, str]]:
+    """Every ROA in ``state="expired"``."""
+    res = await db.execute(select(ASNRpkiRoa).where(ASNRpkiRoa.state == "expired"))
+    matches: list[tuple[str, str, str]] = []
+    for roa in res.scalars().all():
+        parent = await db.get(ASN, roa.asn_id)
+        parent_label = f"AS{parent.number}" if parent is not None else "AS?"
+        display = f"{parent_label} {roa.prefix}-{roa.max_length}"
+        message = (
+            f"RPKI ROA {parent_label} {roa.prefix} maxLen {roa.max_length} "
+            f"({roa.trust_anchor}) has expired"
+        )
+        matches.append((str(roa.id), display, message))
+    return matches
+
+
+# Suppress the unused-import warning for ``timedelta`` when this module
+# is read in isolation — used in expiring-soon message rendering.
+_ = timedelta
 
 
 async def _matching_server_subjects(
@@ -232,6 +355,18 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
             elif rule.rule_type == RULE_TYPE_SERVER_UNREACHABLE:
                 matches = await _matching_server_subjects(db, rule)
                 subject_type = "server"
+            elif rule.rule_type == RULE_TYPE_ASN_HOLDER_DRIFT:
+                matches = await _matching_asn_drift_subjects(db, rule)
+                subject_type = "asn"
+            elif rule.rule_type == RULE_TYPE_ASN_WHOIS_UNREACHABLE:
+                matches = await _matching_asn_unreachable_subjects(db, rule)
+                subject_type = "asn"
+            elif rule.rule_type == RULE_TYPE_RPKI_ROA_EXPIRING:
+                matches = await _matching_rpki_roa_expiring_subjects(db, rule)
+                subject_type = "rpki_roa"
+            elif rule.rule_type == RULE_TYPE_RPKI_ROA_EXPIRED:
+                matches = await _matching_rpki_roa_expired_subjects(db, rule)
+                subject_type = "rpki_roa"
             else:
                 logger.warning("alert_unknown_rule_type", rule=str(rule.id), type=rule.rule_type)
                 continue

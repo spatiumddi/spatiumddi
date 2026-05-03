@@ -34,6 +34,8 @@ celery_app = Celery(
         "app.tasks.dns_pool_healthcheck",
         "app.tasks.dhcp_fingerprint",
         "app.tasks.event_outbox",
+        "app.tasks.asn_whois_refresh",
+        "app.tasks.rpki_roa_refresh",
     ],
 )
 
@@ -80,6 +82,8 @@ celery_app.conf.update(
         "app.tasks.dns_pool_healthcheck.*": {"queue": "dns"},
         "app.tasks.dhcp_fingerprint.*": {"queue": "dhcp"},
         "app.tasks.event_outbox.*": {"queue": "default"},
+        "app.tasks.asn_whois_refresh.*": {"queue": "default"},
+        "app.tasks.rpki_roa_refresh.*": {"queue": "default"},
     },
     beat_schedule={
         # Every 60s, fan-out health checks to every registered DNS server.
@@ -275,6 +279,26 @@ celery_app.conf.update(
         "dns-pool-healthcheck-dispatch": {
             "task": "app.tasks.dns_pool_healthcheck.dispatch_due_pools",
             "schedule": schedule(run_every=30.0),
+        },
+        # Every 1 h, tick the ASN RDAP refresh task. The task itself
+        # walks every ``asn`` row whose ``next_check_at`` has elapsed
+        # (or is NULL) and bumps it forward by
+        # ``PlatformSettings.asn_whois_interval_hours`` (default 24h,
+        # min 1h). The hourly beat tick is just a cadence ceiling;
+        # per-row gating is what actually paces refreshes.
+        "asn-whois-refresh-tick": {
+            "task": "app.tasks.asn_whois_refresh.refresh_due_asns",
+            "schedule": schedule(run_every=3600.0),
+        },
+        # Every 1 h, tick the RPKI ROA refresh task. The task itself
+        # walks every public ASN with at least one ROA row OR whose
+        # parent gate is due, fetches the configured source's global
+        # ROA dump (in-memory cached for 5 min so a fan-out doesn't
+        # refetch the multi-MB JSON per ASN), and reconciles
+        # ``asn_rpki_roa`` rows additively + with deletes.
+        "rpki-roa-refresh-tick": {
+            "task": "app.tasks.rpki_roa_refresh.refresh_due_roas",
+            "schedule": schedule(run_every=3600.0),
         },
     },
 )

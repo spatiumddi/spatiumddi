@@ -110,6 +110,13 @@ class ASN(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     whois_data: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
     whois_state: Mapped[str] = mapped_column(String(16), nullable=False, default="n/a")
 
+    # Per-row gate for the RDAP refresh task (``app.tasks.asn_whois_refresh``).
+    # Beat ticks hourly; the task only refreshes rows whose ``next_check_at``
+    # is NULL or has elapsed, then bumps it forward by
+    # ``PlatformSettings.asn_whois_interval_hours``. Lets operators tune
+    # cadence in the UI without restarting beat.
+    next_check_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
     # Operator-driven metadata; same shape as everywhere else in IPAM
     # / DHCP / DNS so cross-resource bulk-edits and CSV exports compose.
     tags: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict, server_default="{}")
@@ -169,8 +176,14 @@ class ASNRpkiRoa(UUIDPrimaryKeyMixin, Base):
     )
     prefix: Mapped[str] = mapped_column(CIDR, nullable=False)
     max_length: Mapped[int] = mapped_column(Integer, nullable=False)
-    valid_from: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    valid_to: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    # Some public ROA mirrors (Cloudflare's ``rpki.json`` in particular)
+    # don't surface per-ROA validity windows — the JSON only has
+    # ``(asn, prefix, maxLength, ta)`` quads. We relax these to nullable
+    # in Phase 2 so the pull job can land what it has; ``state`` falls
+    # back to ``valid`` when the window is unknown so the alert
+    # evaluator doesn't fire spurious "expired" events.
+    valid_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    valid_to: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     # ``arin`` | ``ripe`` | ``apnic`` | ``lacnic`` | ``afrinic``
     trust_anchor: Mapped[str] = mapped_column(String(16), nullable=False)
@@ -179,6 +192,11 @@ class ASNRpkiRoa(UUIDPrimaryKeyMixin, Base):
     state: Mapped[str] = mapped_column(String(16), nullable=False, default="valid")
 
     last_checked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # Per-row gate for the RPKI ROA refresh task. Same shape as the
+    # parent ``asn.next_check_at`` — bumped forward by the configured
+    # interval each time the ROA pull job touches the row.
+    next_check_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     asn: Mapped[ASN] = relationship("ASN", back_populates="rpki_roas")
 

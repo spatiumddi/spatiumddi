@@ -75,6 +75,10 @@ class SettingsResponse(BaseModel):
     # Device profiling — fingerbank API key. Boolean reflects whether
     # an encrypted key is stored; the plaintext is never returned.
     fingerbank_api_key_set: bool = False
+    # ASN RDAP refresh + RPKI ROA pull (Phase 2 of issue #85).
+    asn_whois_interval_hours: int = 24
+    rpki_roa_source: str = "cloudflare"
+    rpki_roa_refresh_interval_hours: int = 4
 
     model_config = {"from_attributes": True}
 
@@ -140,6 +144,10 @@ class SettingsUpdate(BaseModel):
     # field entirely to leave the existing value alone (pydantic
     # ``model_dump(exclude_none=True)`` semantics in the write path).
     fingerbank_api_key: str | None = None
+    # ASN / RPKI Phase 2 settings.
+    asn_whois_interval_hours: int | None = None
+    rpki_roa_source: str | None = None
+    rpki_roa_refresh_interval_hours: int | None = None
 
     @field_validator("ip_allocation_strategy")
     @classmethod
@@ -164,6 +172,24 @@ class SettingsUpdate(BaseModel):
     def validate_positive(cls, v: int | None) -> int | None:
         if v is not None and v < 1:
             raise ValueError("Must be >= 1")
+        return v
+
+    @field_validator("asn_whois_interval_hours", "rpki_roa_refresh_interval_hours")
+    @classmethod
+    def validate_asn_rpki_interval(cls, v: int | None) -> int | None:
+        if v is None:
+            return None
+        if not (1 <= v <= 168):
+            raise ValueError("Must be between 1 and 168 hours")
+        return v
+
+    @field_validator("rpki_roa_source")
+    @classmethod
+    def validate_rpki_source(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        if v not in ("cloudflare", "ripe"):
+            raise ValueError("rpki_roa_source must be 'cloudflare' or 'ripe'")
         return v
 
     @field_validator("dhcp_pull_leases_interval_seconds")

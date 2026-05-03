@@ -270,6 +270,96 @@ async def delete_asn(asn_id: uuid.UUID, db: DB, user: CurrentUser) -> None:
     await db.commit()
 
 
+@router.post("/{asn_id}/refresh-whois", response_model=ASNRead)
+async def refresh_asn_whois(asn_id: uuid.UUID, db: DB, user: CurrentUser) -> ASNRead:
+    """Synchronous "Refresh now" — fetch RDAP for this AS and stamp the
+    result back to the row. Same per-row state machine as the scheduled
+    task, just driven by an operator click instead of the beat tick.
+
+    Returns 400 for ``kind="private"`` since RIRs don't delegate
+    private numbers and there's nothing to refresh.
+
+    Permission gate is the router-level ``manage_asns`` already; no
+    extra check needed here.
+    """
+    row = await db.get(ASN, asn_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="ASN not found")
+    if row.kind == "private":
+        raise HTTPException(status_code=400, detail="private ASN — no public WHOIS")
+
+    # Deferred imports — keep the router-import path light.
+    from datetime import UTC, timedelta  # noqa: PLC0415
+    from datetime import datetime as _dt  # noqa: PLC0415
+
+    from app.models.settings import PlatformSettings  # noqa: PLC0415
+    from app.services.rdap_asn import lookup_asn  # noqa: PLC0415
+
+    ps = await db.get(PlatformSettings, 1)
+    interval_hours = 24
+    if ps is not None:
+        interval_hours = max(1, min(168, int(ps.asn_whois_interval_hours or 24)))
+
+    now = _dt.now(UTC)
+    previous_state = row.whois_state
+    previous_holder = (row.holder_org or "").strip()
+
+    payload = await lookup_asn(int(row.number))
+    existing_data = row.whois_data if isinstance(row.whois_data, dict) else {}
+    consecutive_failures = int(existing_data.get("consecutive_failures") or 0)
+
+    if payload is None:
+        consecutive_failures += 1
+        row.whois_state = "unreachable"
+        row.whois_last_checked_at = now
+        row.next_check_at = now + timedelta(hours=interval_hours)
+        merged = dict(existing_data)
+        merged["consecutive_failures"] = consecutive_failures
+        merged["last_error_at"] = now.isoformat()
+        row.whois_data = merged
+    else:
+        new_holder = (payload.get("holder_org") or "").strip() or None
+        if new_holder is not None and previous_holder and previous_holder != new_holder:
+            new_state = "drift"
+        else:
+            new_state = "ok"
+        row.holder_org = new_holder
+        row.whois_state = new_state
+        row.whois_last_checked_at = now
+        row.next_check_at = now + timedelta(hours=interval_hours)
+        last_modified = payload.get("last_modified_at")
+        row.whois_data = {
+            "holder_org": new_holder,
+            "registry": payload.get("registry"),
+            "name": payload.get("name"),
+            "last_modified_at": last_modified.isoformat() if last_modified else None,
+            "raw": payload.get("raw"),
+            "consecutive_failures": 0,
+        }
+
+    new_value: dict[str, Any] = {
+        "whois_state": row.whois_state,
+        "old_state": previous_state,
+    }
+    if row.whois_state == "unreachable":
+        new_value["consecutive_failures"] = consecutive_failures
+
+    write_audit(
+        db,
+        user=user,
+        action="refresh_whois",
+        resource_type="asn",
+        resource_id=str(row.id),
+        resource_display=f"AS{row.number}",
+        changed_fields=["whois_state", "whois_data"],
+        new_value=new_value,
+    )
+
+    await db.commit()
+    await db.refresh(row)
+    return ASNRead.model_validate(row)
+
+
 @router.post("/bulk-delete")
 async def bulk_delete_asns(body: ASNBulkDelete, db: DB, user: CurrentUser) -> dict[str, Any]:
     """Delete up to 500 ASNs in a single round-trip.

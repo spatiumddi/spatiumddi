@@ -218,3 +218,26 @@ class PlatformSettings(Base):
     # manufacturer triple. Read via ``services.profiling.fingerbank``
     # which decrypts on demand.
     fingerbank_api_key_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+
+    # ASN RDAP refresh cadence (Phase 2 of issue #85). Beat ticks
+    # hourly; the per-row ``asn.next_check_at`` gate is what actually
+    # paces refreshes against this. Min 1h to avoid hammering RIR RDAP
+    # endpoints; max 168h (one week) so a misconfigured row eventually
+    # gets re-checked.
+    asn_whois_interval_hours: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=24, server_default=sa_text("24")
+    )
+
+    # RPKI ROA pull source — ``cloudflare`` (default) or ``ripe``.
+    # Both expose roughly the same JSON shape; Cloudflare is faster +
+    # more lenient on rate limits, RIPE is the canonical mirror.
+    rpki_roa_source: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="cloudflare", server_default=sa_text("'cloudflare'")
+    )
+
+    # Cadence for the RPKI ROA refresh task. The full ROA dump is
+    # cached in-memory for 5 minutes inside the source service so a
+    # 4 h refresh doesn't refetch a multi-MB JSON per ASN.
+    rpki_roa_refresh_interval_hours: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=4, server_default=sa_text("4")
+    )

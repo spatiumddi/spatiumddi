@@ -138,6 +138,12 @@ function RuleEditorModal({
             >
               <option value="subnet_utilization">Subnet utilization</option>
               <option value="server_unreachable">Server unreachable</option>
+              <option value="asn_holder_drift">ASN holder drift</option>
+              <option value="asn_whois_unreachable">
+                ASN WHOIS unreachable
+              </option>
+              <option value="rpki_roa_expiring">RPKI ROA expiring</option>
+              <option value="rpki_roa_expired">RPKI ROA expired</option>
             </select>
           </Field>
         )}
@@ -374,7 +380,9 @@ export function AlertsPage() {
                     <td className="px-4 py-2 text-muted-foreground tabular-nums">
                       {r.rule_type === "subnet_utilization"
                         ? `≥ ${r.threshold_percent}%`
-                        : `type=${r.server_type ?? "any"}`}
+                        : r.rule_type === "server_unreachable"
+                          ? `type=${r.server_type ?? "any"}`
+                          : "—"}
                     </td>
                     <td className="px-4 py-2">
                       <SeverityBadge severity={r.severity} />

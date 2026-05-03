@@ -4114,7 +4114,13 @@ export const apiTokensApi = {
 
 // ── Alerts ─────────────────────────────────────────────────────────────────────
 
-export type AlertRuleType = "subnet_utilization" | "server_unreachable";
+export type AlertRuleType =
+  | "subnet_utilization"
+  | "server_unreachable"
+  | "asn_holder_drift"
+  | "asn_whois_unreachable"
+  | "rpki_roa_expiring"
+  | "rpki_roa_expired";
 export type AlertSeverity = "info" | "warning" | "critical";
 export type AlertServerType = "dns" | "dhcp" | "any";
 
