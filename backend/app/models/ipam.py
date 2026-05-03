@@ -114,23 +114,24 @@ class IPSpace(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     ddns_ttl: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     # ── VRF / routing annotation ─────────────────────────────────────────
-    # Pure metadata. Address-overlap semantics for VRFs are already
-    # handled by having one IPSpace per VRF (overlapping IPs live in
-    # separate IPSpace rows). These columns let the operator record the
-    # canonical VRF name + RD + RT(s) for documentation / change
-    # management; address allocation does not consult them.
-    #
-    # ``route_distinguisher`` is conventionally the ASN:idx
-    # (``65000:100``) or IPv4:idx (``192.0.2.1:1``) form; stored as
-    # plain text since vendor opinions on the canonical form differ
-    # and validation churn buys nothing here.
-    #
-    # ``route_targets`` is a JSONB array of strings to keep room for
-    # the inline "import:A:B; export:C:D" convention; first-class
-    # import / export columns can be split out later without breaking
-    # the data shape.
+    # First-class VRF binding (added by issue #86). The freeform
+    # ``vrf_name`` / ``route_distinguisher`` / ``route_targets``
+    # columns immediately below are DEPRECATED — drop after one
+    # release cycle, see issue #86. They are kept through this
+    # release so operators can verify the freeform→``vrf_id``
+    # mapping landed by the ``vrf_first_class`` migration; new
+    # writes should set ``vrf_id`` instead.
+    vrf_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("vrf.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    # DEPRECATED — drop after one release cycle, see issue #86.
     vrf_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # DEPRECATED — drop after one release cycle, see issue #86.
     route_distinguisher: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # DEPRECATED — drop after one release cycle, see issue #86.
     route_targets: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
 
     blocks: Mapped[list["IPBlock"]] = relationship(
@@ -258,6 +259,19 @@ class IPBlock(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     ddns_ttl: Mapped[int | None] = mapped_column(Integer, nullable=True)
     ddns_inherit_settings: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True, server_default=sa_text("true")
+    )
+
+    # ── VRF binding (issue #86) ───────────────────────────────────────────
+    # Optional. NULL means "inherit from the parent block (recurse) or
+    # ultimately from the IPSpace". Pinning a non-NULL value lets a
+    # block live in a different VRF than its enclosing space — common
+    # in hub-and-spoke designs where one space hosts blocks belonging
+    # to multiple tenant VRFs.
+    vrf_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("vrf.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
     )
 
     space: Mapped[IPSpace] = relationship("IPSpace", back_populates="blocks")

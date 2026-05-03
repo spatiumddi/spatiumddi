@@ -41,6 +41,13 @@ logger = structlog.get_logger(__name__)
 # Actions that are implied by the "admin" action.
 _ADMIN_IMPLIES = frozenset({"read", "write", "delete", "admin"})
 
+# Resource type gate for VRF CRUD (issue #86). The "manage_vrfs"
+# label in design docs corresponds to ``admin`` on this resource_type
+# in the underlying RBAC grammar — the API uses
+# ``require_resource_permission("vrf")``. The Network Editor builtin
+# role grants ``admin`` on this type; superadmin always bypasses.
+RESOURCE_TYPE_VRF = "vrf"
+
 
 def _action_matches(granted: str, requested: str) -> bool:
     """Return True if a granted `action` string covers the requested action."""

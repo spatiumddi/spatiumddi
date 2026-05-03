@@ -3287,6 +3287,65 @@ export interface VLAN {
   modified_at: string;
 }
 
+// ── VRFs ─────────────────────────────────────────────────────────────────────
+
+export interface VRF {
+  id: string;
+  name: string;
+  description: string;
+  asn_id: string | null;
+  route_distinguisher: string | null;
+  import_targets: string[];
+  export_targets: string[];
+  tags: Record<string, unknown>;
+  custom_fields: Record<string, unknown>;
+  created_at: string;
+  modified_at: string;
+  space_count: number;
+  block_count: number;
+}
+
+export interface VRFCreate {
+  name: string;
+  description?: string;
+  asn_id?: string | null;
+  route_distinguisher?: string | null;
+  import_targets?: string[];
+  export_targets?: string[];
+  tags?: Record<string, unknown>;
+  custom_fields?: Record<string, unknown>;
+}
+
+export type VRFUpdate = Partial<VRFCreate>;
+
+export interface VRFBulkDeleteResponse {
+  deleted: number;
+  detached_spaces: number;
+  detached_blocks: number;
+  not_found: string[];
+  refused: {
+    id: string;
+    name: string;
+    linked_spaces: number;
+    linked_blocks: number;
+  }[];
+}
+
+export const vrfsApi = {
+  list: (params?: { search?: string; asn_id?: string }) =>
+    api.get<VRF[]>("/vrfs", { params }).then((r) => r.data),
+  get: (id: string) => api.get<VRF>(`/vrfs/${id}`).then((r) => r.data),
+  create: (body: VRFCreate) => api.post<VRF>("/vrfs", body).then((r) => r.data),
+  update: (id: string, body: VRFUpdate) =>
+    api.put<VRF>(`/vrfs/${id}`, body).then((r) => r.data),
+  delete: (id: string, force = false) =>
+    api.delete(`/vrfs/${id}`, { params: { force } }),
+  bulkDelete: (ids: string[], force = false) =>
+    api
+      .post<VRFBulkDeleteResponse>("/vrfs/bulk-delete", { ids, force })
+      .then((r) => r.data),
+};
+
 export const vlansApi = {
   listRouters: () => api.get<Router[]>("/vlans/routers").then((r) => r.data),
   getRouter: (id: string) =>

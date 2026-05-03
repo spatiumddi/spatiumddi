@@ -33,6 +33,7 @@ from app.api.v1.tailscale import router as tailscale_router
 from app.api.v1.users.router import router as users_router
 from app.api.v1.version import router as version_router
 from app.api.v1.vlans.router import router as vlans_router
+from app.api.v1.vrfs import router as vrfs_router
 from app.api.v1.webhooks import router as webhooks_router
 
 api_v1_router = APIRouter()
@@ -57,6 +58,7 @@ api_v1_router.include_router(search_router, prefix="/search", tags=["search"])
 api_v1_router.include_router(settings_router, prefix="/settings", tags=["settings"])
 api_v1_router.include_router(custom_fields_router, prefix="/custom-fields", tags=["custom-fields"])
 api_v1_router.include_router(vlans_router, prefix="/vlans", tags=["vlans"])
+api_v1_router.include_router(vrfs_router, prefix="/vrfs", tags=["vrfs"])
 api_v1_router.include_router(logs_router, prefix="/logs", tags=["logs"])
 api_v1_router.include_router(alerts_router, prefix="/alerts", tags=["alerts"])
 api_v1_router.include_router(asns_router, prefix="/asns", tags=["asns"])

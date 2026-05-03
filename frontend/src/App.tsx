@@ -10,6 +10,7 @@ import { NATPage } from "@/pages/ipam/NATPage";
 import { DNSPage } from "@/pages/dns/DNSPage";
 import { DNSPoolsPage } from "@/pages/dns/DNSPoolsPage";
 import { VLANsPage } from "@/pages/vlans/VLANsPage";
+import { VRFsPage } from "@/pages/vrfs/VRFsPage";
 import { DHCPPage } from "@/pages/dhcp/DHCPPage";
 import { KubernetesPage } from "@/pages/kubernetes/KubernetesPage";
 import { DockerPage } from "@/pages/docker/DockerPage";
@@ -17,7 +18,6 @@ import { ProxmoxPage } from "@/pages/proxmox/ProxmoxPage";
 import { TailscalePage } from "@/pages/tailscale/TailscalePage";
 import { NetworkPage } from "@/pages/network/NetworkPage";
 import { DeviceDetailView } from "@/pages/network/DeviceDetailView";
-import { VRFsStubPage } from "@/pages/network/VRFsStubPage";
 import { AsnsPage } from "@/pages/network/AsnsPage";
 import { NmapToolsPage } from "@/pages/nmap/NmapToolsPage";
 import { CidrCalculatorPage } from "@/pages/tools/CidrCalculatorPage";
@@ -75,7 +75,7 @@ export default function App() {
         <Route path="network/devices" element={<NetworkPage />} />
         <Route path="network/devices/:id" element={<DeviceDetailView />} />
         <Route path="network/vlans" element={<VLANsPage />} />
-        <Route path="network/vrfs" element={<VRFsStubPage />} />
+        <Route path="network/vrfs" element={<VRFsPage />} />
         <Route path="network/asns" element={<AsnsPage />} />
         <Route
           path="vlans"

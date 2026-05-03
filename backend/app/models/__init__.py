@@ -65,6 +65,7 @@ from app.models.proxmox import ProxmoxNode
 from app.models.settings import PlatformSettings
 from app.models.tailscale import TailscaleTenant
 from app.models.vlans import VLAN, Router
+from app.models.vrf import VRF
 
 __all__ = [
     "ACMEAccount",
@@ -109,6 +110,7 @@ __all__ = [
     "DNSBlockListException",
     "Router",
     "VLAN",
+    "VRF",
     "DHCPServerGroup",
     "DHCPServer",
     "DHCPScope",

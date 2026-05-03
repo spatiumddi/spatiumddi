@@ -7,6 +7,7 @@ import {
   LayoutDashboard,
   Server,
   Router as RouterIcon,
+  Route as RouteIcon,
   Cable,
   Github,
   Hash,
@@ -57,11 +58,11 @@ const baseMainNav = [
 // Network section — grouped under a non-clickable section header
 // (mirrors Administration). Devices replaces the old top-level
 // "Network" entry; VLANs lifts up from its own top-level slot;
-// VRFs / ASNs are stubs gated on issues #86 / #85.
+// VRFs / ASNs are real first-class pages from issues #85 / #86.
 const networkNav = [
   { label: "Devices", icon: Cable, to: "/network/devices" },
   { label: "VLANs", icon: RouterIcon, to: "/network/vlans" },
-  { label: "VRFs", icon: Workflow, to: "/network/vrfs" },
+  { label: "VRFs", icon: RouteIcon, to: "/network/vrfs" },
   { label: "ASNs", icon: Hash, to: "/network/asns" },
 ];
 

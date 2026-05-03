@@ -42,6 +42,7 @@ Each entry in `Role.permissions` (JSONB) is an object with this shape:
 | `subnet`          | Subnets under a block                                 |
 | `ip_address`      | Individual IPs, aliases, bulk address ops             |
 | `vlan`            | VLANs and routers                                     |
+| `vrf`             | VRFs (Virtual Routing and Forwarding) — `manage_vrfs` |
 | `dns_zone`        | DNS zones (forward and reverse)                       |
 | `dns_record`      | DNS records within a zone                             |
 | `dns_group`       | DNS server groups, servers, views, ACLs, trust anchors |
