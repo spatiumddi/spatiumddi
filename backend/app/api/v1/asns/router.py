@@ -360,6 +360,81 @@ async def refresh_asn_whois(asn_id: uuid.UUID, db: DB, user: CurrentUser) -> ASN
     return ASNRead.model_validate(row)
 
 
+class RefreshRpkiResult(BaseModel):
+    asn_id: uuid.UUID
+    asn_number: int
+    added: int
+    updated: int
+    removed: int
+    transitions: int
+
+
+@router.post("/{asn_id}/refresh-rpki", response_model=RefreshRpkiResult)
+async def refresh_asn_rpki(
+    asn_id: uuid.UUID, db: DB, user: CurrentUser
+) -> RefreshRpkiResult:
+    """Synchronous "Refresh RPKI now" — pulls the global ROA dump and
+    reconciles ROAs for this AS only. Same per-row state machine as the
+    scheduled task; just driven by an operator click.
+
+    Returns 400 for ``kind="private"`` since RIRs don't issue ROAs for
+    private AS numbers and there's nothing to fetch. Permission gate
+    is the router-level ``manage_asns`` already.
+    """
+    row = await db.get(ASN, asn_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="ASN not found")
+    if row.kind == "private":
+        raise HTTPException(
+            status_code=400, detail="private ASN — no RPKI ROAs issued"
+        )
+
+    from datetime import UTC  # noqa: PLC0415
+    from datetime import datetime as _dt  # noqa: PLC0415
+
+    from app.models.settings import PlatformSettings  # noqa: PLC0415
+    from app.tasks.rpki_roa_refresh import _refresh_one_asn  # noqa: PLC0415
+
+    ps = await db.get(PlatformSettings, 1)
+    interval_hours = 4
+    source = "cloudflare"
+    if ps is not None:
+        interval_hours = max(
+            1, min(168, int(ps.rpki_roa_refresh_interval_hours or 4))
+        )
+        candidate = (ps.rpki_roa_source or "cloudflare").lower()
+        if candidate in {"cloudflare", "ripe"}:
+            source = candidate
+
+    now = _dt.now(UTC)
+    summary = await _refresh_one_asn(db, row, source, interval_hours, now)
+
+    write_audit(
+        db,
+        user=user,
+        action="refresh_rpki",
+        resource_type="asn",
+        resource_id=str(row.id),
+        resource_display=f"AS{row.number}",
+        new_value={
+            "added": summary["added"],
+            "updated": summary["updated"],
+            "removed": summary["removed"],
+            "transitions": summary["transitions"],
+            "source": source,
+        },
+    )
+    await db.commit()
+    return RefreshRpkiResult(
+        asn_id=row.id,
+        asn_number=row.number,
+        added=summary["added"],
+        updated=summary["updated"],
+        removed=summary["removed"],
+        transitions=summary["transitions"],
+    )
+
+
 @router.post("/bulk-delete")
 async def bulk_delete_asns(body: ASNBulkDelete, db: DB, user: CurrentUser) -> dict[str, Any]:
     """Delete up to 500 ASNs in a single round-trip.

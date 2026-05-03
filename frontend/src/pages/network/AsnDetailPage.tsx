@@ -160,6 +160,13 @@ export function AsnDetailPage() {
     },
   });
 
+  const refreshRpkiMut = useMutation({
+    mutationFn: () => asnsApi.refreshRpki(id),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["asn-rpki-roas", id] });
+    },
+  });
+
   const { data: roas } = useQuery({
     queryKey: ["asn-rpki-roas", id],
     queryFn: () => asnsApi.getRpkiRoas(id),
@@ -212,8 +219,20 @@ export function AsnDetailPage() {
     );
   }
 
-  const whoisRaw =
-    typeof asn.whois_data?.raw === "string" ? asn.whois_data.raw : null;
+  // ``whois_data.raw`` is the full RDAP response payload. The RIRs
+  // serve JSON, so this is normally a nested object — pretty-print it
+  // for the operator. Older snapshots may have stored a plain string,
+  // so keep that path working too.
+  const whoisRawDisplay = (() => {
+    const raw = asn.whois_data?.raw;
+    if (raw == null) return null;
+    if (typeof raw === "string") return raw;
+    try {
+      return JSON.stringify(raw, null, 2);
+    } catch {
+      return null;
+    }
+  })();
   const previousHolder =
     typeof asn.whois_data?.previous_holder === "string"
       ? (asn.whois_data.previous_holder as string)
@@ -310,12 +329,37 @@ export function AsnDetailPage() {
             >
               Refresh WHOIS
             </HeaderButton>
+            <HeaderButton
+              icon={refreshRpkiMut.isPending ? Loader2 : RefreshCw}
+              iconClassName={refreshRpkiMut.isPending ? "animate-spin" : ""}
+              disabled={refreshRpkiMut.isPending || asn.kind === "private"}
+              onClick={() => refreshRpkiMut.mutate()}
+              title={
+                asn.kind === "private"
+                  ? "Private ASN — no RPKI ROAs issued"
+                  : "Pull the global ROA dump and reconcile this ASN's ROAs"
+              }
+            >
+              Refresh RPKI
+            </HeaderButton>
           </div>
         </div>
 
         {refreshMut.isError && (
           <div className="mt-2 text-xs text-destructive">
-            {errMsg(refreshMut.error, "Refresh failed")}
+            {errMsg(refreshMut.error, "WHOIS refresh failed")}
+          </div>
+        )}
+        {refreshRpkiMut.isError && (
+          <div className="mt-2 text-xs text-destructive">
+            {errMsg(refreshRpkiMut.error, "RPKI refresh failed")}
+          </div>
+        )}
+        {refreshRpkiMut.isSuccess && refreshRpkiMut.data && (
+          <div className="mt-2 text-xs text-muted-foreground">
+            RPKI sync: +{refreshRpkiMut.data.added} added,{" "}
+            {refreshRpkiMut.data.updated} updated, {refreshRpkiMut.data.removed}{" "}
+            removed
           </div>
         )}
 
@@ -397,13 +441,13 @@ export function AsnDetailPage() {
               />
             </div>
 
-            {whoisRaw ? (
+            {whoisRawDisplay ? (
               <div>
                 <p className="mb-1 text-xs font-medium text-muted-foreground">
-                  Raw WHOIS
+                  Raw RDAP response
                 </p>
                 <pre className="rounded-md border bg-muted/30 p-3 text-xs font-mono overflow-auto max-h-96 whitespace-pre-wrap">
-                  {whoisRaw}
+                  {whoisRawDisplay}
                 </pre>
               </div>
             ) : (

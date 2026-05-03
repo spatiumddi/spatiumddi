@@ -5828,6 +5828,17 @@ export const asnsApi = {
   remove: (id: string) => api.delete(`/asns/${id}`),
   refreshWhois: (id: string) =>
     api.post<ASNRead>(`/asns/${id}/refresh-whois`).then((r) => r.data),
+  refreshRpki: (id: string) =>
+    api
+      .post<{
+        asn_id: string;
+        asn_number: number;
+        added: number;
+        updated: number;
+        removed: number;
+        transitions: number;
+      }>(`/asns/${id}/refresh-rpki`)
+      .then((r) => r.data),
   getRpkiRoas: (id: string) =>
     api.get<ASNRpkiRoa[]>(`/asns/${id}/rpki-roas`).then((r) => r.data),
   bulkDelete: (ids: string[]) =>
