@@ -121,6 +121,15 @@ class ScopeUpdate(BaseModel):
     ddns_hostname_policy: str | None = None
     hostname_to_ipam_sync: str | None = None
     hostname_sync_mode: str | None = None
+    # PXE / iPXE profile binding (issue #51). Pass the UUID of a
+    # ``DHCPPXEProfile`` in this scope's group to enable PXE; pass
+    # null to detach. The bound profile's matches render as Kea
+    # client-classes on the next bundle push.
+    pxe_profile_id: uuid.UUID | None = None
+    # Distinguish "set to null" from "field not present" — Pydantic
+    # treats null + missing identically by default. We need this to
+    # support detaching a previously-bound profile.
+    clear_pxe_profile: bool | None = None
 
 
 _NAME_TO_CODE = {v: k for k, v in _CODE_TO_NAME.items()}
@@ -295,6 +304,13 @@ async def update_scope(
         changes["hostname_to_ipam_sync"] = _normalize_sync_mode(changes["hostname_to_ipam_sync"])
     if "options" in changes:
         changes["options"] = _normalize_options(changes["options"])
+    # ``clear_pxe_profile=True`` is the explicit detach signal — Pydantic
+    # collapses missing + null on ``pxe_profile_id`` so we need a
+    # second boolean field to disambiguate. Apply detach first; a
+    # later ``pxe_profile_id`` set in the same call (operator
+    # detaches one profile and binds another) still wins.
+    if changes.pop("clear_pxe_profile", False):
+        scope.pxe_profile_id = None
     for k, v in changes.items():
         setattr(scope, k, v)
     await db.flush()
