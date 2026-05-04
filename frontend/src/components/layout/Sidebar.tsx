@@ -82,20 +82,29 @@ const adminIdentityNav = [
   { label: "Users", icon: Users, to: "/admin/users" },
 ];
 
-const adminPlatformNav = [
-  { label: "Alerts", icon: BellRing, to: "/admin/alerts" },
-  { label: "Audit Log", icon: ClipboardList, to: "/admin/audit" },
-  { label: "Compliance", icon: ShieldCheck, to: "/admin/compliance" },
+// Administration → Platform was getting unwieldy at 9-10 items; split it
+// into three sub-groups rendered with small non-collapsible labels.
+const adminConfigurationNav = [
+  { label: "AI Providers", icon: Sparkles, to: "/admin/ai/providers" },
   { label: "Custom Fields", icon: Tags, to: "/admin/custom-fields" },
   {
     label: "IPAM Templates",
     icon: LayoutTemplate,
     to: "/admin/ipam/templates",
   },
-  { label: "Platform Insights", icon: Cpu, to: "/admin/platform-insights" },
   { label: "Settings", icon: Settings, to: "/settings" },
-  { label: "Trash", icon: Trash2, to: "/admin/trash" },
+];
+
+const adminNotificationsNav = [
+  { label: "Alerts", icon: BellRing, to: "/admin/alerts" },
   { label: "Webhooks", icon: Webhook, to: "/admin/webhooks" },
+];
+
+const adminInsightsNav = [
+  { label: "Audit Log", icon: ClipboardList, to: "/admin/audit" },
+  { label: "Compliance", icon: ShieldCheck, to: "/admin/compliance" },
+  { label: "Platform Insights", icon: Cpu, to: "/admin/platform-insights" },
+  { label: "Trash", icon: Trash2, to: "/admin/trash" },
 ];
 
 function NavSection({
@@ -138,6 +147,26 @@ function NavSection({
         <span>{label}</span>
       </button>
       {open && <div className="space-y-1">{children}</div>}
+    </div>
+  );
+}
+
+// Small non-collapsible label that breaks a long NavSection (like
+// Administration → Platform) into themed sub-groups. Lighter weight
+// than NavSection — no chevron, no collapse, no own storageKey.
+function SubNavLabel({
+  label,
+  collapsed,
+}: {
+  label: string;
+  collapsed: boolean;
+}) {
+  if (collapsed) {
+    return <div className="my-1 border-t border-sidebar-border/60" />;
+  }
+  return (
+    <div className="px-3 pb-1 pt-2 text-[10px] font-semibold uppercase tracking-wider text-sidebar-muted-foreground/50">
+      {label}
     </div>
   );
 }
@@ -385,6 +414,7 @@ export function Sidebar({
             collapsed={effectiveCollapsed}
             showDivider
           >
+            <SubNavLabel label="Identity" collapsed={effectiveCollapsed} />
             {adminIdentityNav.map((item) => (
               <NavItem
                 key={item.to}
@@ -393,8 +423,29 @@ export function Sidebar({
                 onNavigate={mobileOpen ? onMobileClose : undefined}
               />
             ))}
-            <div className="my-1 border-t border-sidebar-border/60" />
-            {adminPlatformNav.map((item) => (
+            <SubNavLabel label="Configuration" collapsed={effectiveCollapsed} />
+            {adminConfigurationNav.map((item) => (
+              <NavItem
+                key={item.to}
+                {...item}
+                collapsed={effectiveCollapsed}
+                onNavigate={mobileOpen ? onMobileClose : undefined}
+              />
+            ))}
+            <SubNavLabel label="Notifications" collapsed={effectiveCollapsed} />
+            {adminNotificationsNav.map((item) => (
+              <NavItem
+                key={item.to}
+                {...item}
+                collapsed={effectiveCollapsed}
+                onNavigate={mobileOpen ? onMobileClose : undefined}
+              />
+            ))}
+            <SubNavLabel
+              label="Insights & Audit"
+              collapsed={effectiveCollapsed}
+            />
+            {adminInsightsNav.map((item) => (
               <NavItem
                 key={item.to}
                 {...item}

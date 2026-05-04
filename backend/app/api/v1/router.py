@@ -4,6 +4,7 @@ from app.api.v1.acme import router as acme_router
 from app.api.v1.admin.containers import router as containers_router
 from app.api.v1.admin.postgres import router as postgres_router
 from app.api.v1.admin.trash import router as trash_router
+from app.api.v1.ai import router as ai_router
 from app.api.v1.alerts.router import router as alerts_router
 from app.api.v1.api_tokens.router import router as api_tokens_router
 from app.api.v1.asns import router as asns_router
@@ -42,6 +43,7 @@ api_v1_router = APIRouter()
 # Tags are alphabetised so the ReDoc / Swagger surface lists sections
 # A → Z. New entries should be inserted in sort order.
 api_v1_router.include_router(acme_router, prefix="/acme", tags=["acme"])
+api_v1_router.include_router(ai_router, prefix="/ai", tags=["ai"])
 api_v1_router.include_router(containers_router, prefix="/admin", tags=["admin-containers"])
 api_v1_router.include_router(postgres_router, prefix="/admin", tags=["admin-postgres"])
 api_v1_router.include_router(trash_router, prefix="/admin", tags=["admin-trash"])

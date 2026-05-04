@@ -379,11 +379,13 @@ export function UsersPage() {
   return (
     <div className="h-full overflow-auto p-6">
       <div className="space-y-4">
-        <div className="flex items-center justify-between">
-          <h1 className="text-2xl font-bold tracking-tight">Users</h1>
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <h1 className="min-w-0 flex-1 text-2xl font-bold tracking-tight">
+            Users
+          </h1>
           <button
             onClick={() => setShowCreate(true)}
-            className="flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90"
+            className="flex shrink-0 items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90"
           >
             <Plus className="h-3.5 w-3.5" />
             New User

@@ -562,7 +562,7 @@ export function WebhooksPage() {
     <div className="h-full overflow-auto p-6">
       <div className="mx-auto max-w-6xl space-y-4">
         <div className="flex flex-wrap items-start justify-between gap-3">
-          <div>
+          <div className="min-w-0 flex-1">
             <h1 className="text-xl font-semibold">Webhooks</h1>
             <p className="max-w-2xl text-xs text-muted-foreground">
               Typed-event subscriptions for downstream automation. Every enabled
@@ -576,7 +576,7 @@ export function WebhooksPage() {
           <button
             type="button"
             onClick={() => setShowCreate(true)}
-            className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:opacity-90"
+            className="inline-flex shrink-0 items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:opacity-90"
           >
             <Plus className="h-4 w-4" />
             New subscription

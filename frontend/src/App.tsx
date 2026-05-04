@@ -30,6 +30,7 @@ import { SubnetPlannerEditorPage } from "@/pages/ipam/SubnetPlannerEditorPage";
 import { LogsPage } from "@/pages/LogsPage";
 import { UsersPage } from "@/pages/admin/UsersPage";
 import { AuditPage } from "@/pages/admin/AuditPage";
+import { AIProvidersPage } from "@/pages/admin/AIProvidersPage";
 import { CustomFieldsPage } from "@/pages/admin/CustomFieldsPage";
 import { IPAMTemplatesPage } from "@/pages/admin/IPAMTemplatesPage";
 import { ApiTokensPage } from "@/pages/admin/ApiTokensPage";
@@ -108,6 +109,7 @@ export default function App() {
         <Route path="admin/groups" element={<GroupsPage />} />
         <Route path="admin/roles" element={<RolesPage />} />
         <Route path="admin/audit" element={<AuditPage />} />
+        <Route path="admin/ai/providers" element={<AIProvidersPage />} />
         <Route path="admin/custom-fields" element={<CustomFieldsPage />} />
         <Route path="admin/ipam/templates" element={<IPAMTemplatesPage />} />
         <Route path="admin/auth-providers" element={<AuthProvidersPage />} />

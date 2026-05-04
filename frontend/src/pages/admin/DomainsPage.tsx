@@ -346,8 +346,8 @@ export function DomainsPage() {
   return (
     <div className="h-full overflow-auto p-6">
       <div className="mx-auto max-w-[1400px] space-y-4">
-        <div className="flex flex-wrap items-center justify-between gap-3">
-          <div>
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div className="min-w-0 flex-1">
             <h1 className="text-2xl font-bold tracking-tight">Domains</h1>
             <p className="mt-1 text-xs text-muted-foreground">
               Track registered domains via RDAP — registrar, expiry, nameserver
@@ -355,7 +355,7 @@ export function DomainsPage() {
               authoritatively).
             </p>
           </div>
-          <div className="flex gap-2">
+          <div className="flex shrink-0 gap-2">
             <button
               onClick={() => refetch()}
               className="inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm hover:bg-accent"

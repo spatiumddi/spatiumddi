@@ -318,8 +318,8 @@ export function ApiTokensPage() {
   return (
     <div className="h-full overflow-auto p-6">
       <div className="space-y-4">
-        <div className="flex items-start justify-between gap-4">
-          <div className="min-w-0">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div className="min-w-0 flex-1">
             <h1 className="text-2xl font-bold tracking-tight">API Tokens</h1>
             <p className="mt-1 text-xs text-muted-foreground">
               Long-lived bearer credentials for scripts and automation. Each
@@ -328,7 +328,7 @@ export function ApiTokensPage() {
           </div>
           <button
             onClick={() => setShowCreate(true)}
-            className="flex flex-shrink-0 items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90"
+            className="flex shrink-0 items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90"
           >
             <Plus className="h-3.5 w-3.5" />
             New Token

@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Outlet } from "react-router-dom";
 import { Sidebar } from "./Sidebar";
 import { Header } from "./Header";
+import { CopilotButton } from "@/components/copilot/CopilotButton";
 
 export function AppLayout() {
   // Mobile drawer state. On desktop (md+) the sidebar is always visible and
@@ -20,6 +21,9 @@ export function AppLayout() {
           <Outlet />
         </main>
       </div>
+      {/* Issue #90 — Operator Copilot floating button. Hidden when no
+          AI provider is enabled, opens the chat drawer otherwise. */}
+      <CopilotButton />
     </div>
   );
 }
