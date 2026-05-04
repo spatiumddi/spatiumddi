@@ -24,6 +24,7 @@ from app.drivers.dhcp.base import (
     FailoverConfig,
     MACBlockDef,
     PoolDef,
+    PXEClassDef,
     ScopeDef,
     ServerOptionsDef,
     StaticAssignmentDef,
@@ -31,6 +32,7 @@ from app.drivers.dhcp.base import (
 from app.models.dhcp import (
     DHCPClientClass,
     DHCPMACBlock,
+    DHCPPXEArchMatch,
     DHCPScope,
     DHCPServer,
     DHCPServerGroup,
@@ -232,6 +234,8 @@ async def build_config_bundle(db: AsyncSession, server: DHCPServer) -> ConfigBun
         for m in mb_rows
     )
 
+    pxe_classes = await _assemble_pxe_classes(db, scope_rows)
+
     failover = await _resolve_failover(db, server, group)
     bundle = ConfigBundle(
         server_id=str(server.id),
@@ -242,11 +246,99 @@ async def build_config_bundle(db: AsyncSession, server: DHCPServer) -> ConfigBun
         scopes=tuple(scopes),
         client_classes=client_classes,
         mac_blocks=mac_blocks,
+        pxe_classes=pxe_classes,
         generated_at=datetime.now(UTC),
         failover=failover,
     )
     bundle.etag = bundle.compute_etag()
     return bundle
+
+
+def _build_pxe_match_expression(
+    vendor_class_match: str | None, arch_codes: list[int] | None
+) -> str:
+    """Compose the Kea ``test`` expression for a PXE arch-match row.
+
+    Rules:
+      * vendor-class: ``substring(option[60].hex,0,N)=='<lit>'`` —
+        Kea's ``hex`` repr is the raw bytes; option 60 carries
+        ``PXEClient`` / ``iPXE`` / ``HTTPClient`` as plain ASCII so
+        a substring compare is the right shape.
+      * arch-code: ``option[93].hex == '0007'`` — option 93 is a
+        2-byte big-endian unsigned int. We zero-pad to 4 hex chars.
+        A list of arch codes joins with ``or``.
+      * Both null = empty string (always-match — pair with low
+        priority for a fallthrough).
+      * Both set = ``(vendor_test) and (arch_test)``.
+    """
+    parts: list[str] = []
+    if vendor_class_match:
+        n = len(vendor_class_match)
+        # Kea's `hex` for option 60 is the literal byte string.
+        parts.append(f"substring(option[60].hex,0,{n})=='{vendor_class_match}'")
+    if arch_codes:
+        arch_or = " or ".join(f"option[93].hex == 0x{code:04X}" for code in arch_codes)
+        if len(arch_codes) > 1:
+            arch_or = f"({arch_or})"
+        parts.append(arch_or)
+    return " and ".join(parts)
+
+
+async def _assemble_pxe_classes(
+    db: AsyncSession, scope_rows: list[DHCPScope]
+) -> tuple[PXEClassDef, ...]:
+    """Walk every scope with a bound PXE profile and emit one class
+    per arch-match. Disabled profiles render no classes.
+
+    Class names are deterministic: ``pxe-{profile_id8}-{match_id8}``
+    where the suffixes are the first 8 hex chars of each UUID. Stable
+    across runs, unique across profiles.
+
+    Sorted by (priority ASC, profile_id ASC, match_id ASC) so Kea's
+    declared-order evaluation puts most-specific matches first when
+    the operator orders priorities right.
+    """
+    profile_ids = {sc.pxe_profile_id for sc in scope_rows if sc.pxe_profile_id is not None}
+    if not profile_ids:
+        return ()
+
+    matches = (
+        (
+            await db.execute(
+                select(DHCPPXEArchMatch)
+                .where(DHCPPXEArchMatch.profile_id.in_(profile_ids))
+                .options(selectinload(DHCPPXEArchMatch.profile))
+                .order_by(
+                    DHCPPXEArchMatch.priority,
+                    DHCPPXEArchMatch.profile_id,
+                    DHCPPXEArchMatch.id,
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    out: list[PXEClassDef] = []
+    seen_names: set[str] = set()
+    for m in matches:
+        prof = m.profile
+        if prof is None or not prof.enabled:
+            continue
+        name = f"pxe-{str(prof.id)[:8]}-{str(m.id)[:8]}"
+        if name in seen_names:
+            continue
+        seen_names.add(name)
+        out.append(
+            PXEClassDef(
+                name=name,
+                match_expression=_build_pxe_match_expression(m.vendor_class_match, m.arch_codes),
+                next_server=str(prof.next_server),
+                boot_file_name=m.boot_filename,
+                is_ipxe_chain=(m.match_kind == "ipxe_chain"),
+            )
+        )
+    return tuple(out)
 
 
 __all__ = ["ConfigBundle", "build_config_bundle"]

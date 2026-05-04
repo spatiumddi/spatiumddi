@@ -78,6 +78,9 @@ export function CreateScopeModal({
   const [ddnsDomain, setDdnsDomain] = useState(
     scope?.ddns_domain_override ?? "",
   );
+  const [pxeProfileId, setPxeProfileId] = useState<string>(
+    scope?.pxe_profile_id ?? "",
+  );
   const [hostnameSync, setHostnameSync] = useState(
     scope?.hostname_sync_mode ?? "ipam",
   );
@@ -199,7 +202,10 @@ export function CreateScopeModal({
         );
       }
 
-      const data: Partial<DHCPScope> & { group_id?: string } = {
+      const data: Partial<DHCPScope> & {
+        group_id?: string;
+        clear_pxe_profile?: boolean;
+      } = {
         group_id: groupId || undefined,
         name,
         description,
@@ -213,6 +219,15 @@ export function CreateScopeModal({
         hostname_sync_mode: hostnameSync,
         options,
       };
+      // PXE binding (issue #51). The backend distinguishes "no
+      // change" from "explicit detach" via ``clear_pxe_profile``;
+      // pass it true when the operator picked "(none)" on an
+      // existing scope that previously had a profile bound.
+      if (pxeProfileId) {
+        data.pxe_profile_id = pxeProfileId;
+      } else if (editing && scope?.pxe_profile_id) {
+        data.clear_pxe_profile = true;
+      }
       if (editing) return dhcpApi.updateScope(scope!.id, data);
       return dhcpApi.createScope(subnetId, data).then(async (created) => {
         if (poolStart && poolEnd) {
@@ -502,6 +517,12 @@ export function CreateScopeModal({
           <DHCPOptionsEditor value={options} onChange={setOptions} />
         </div>
 
+        <PXEProfileSection
+          groupId={groupId}
+          value={pxeProfileId}
+          onChange={setPxeProfileId}
+        />
+
         {error && <p className="text-xs text-destructive">{error}</p>}
         <Btns onClose={onClose} pending={mut.isPending} />
       </form>
@@ -510,6 +531,103 @@ export function CreateScopeModal({
 }
 
 export const EditScopeModal = CreateScopeModal;
+
+/**
+ * PXE / iPXE profile picker on the scope edit modal (issue #51).
+ *
+ * Renders a single dropdown of profiles in the scope's group plus a
+ * read-only summary of the selected profile's next-server + first
+ * few arch-matches. Profile CRUD lives at ``/dhcp/groups/:gid/pxe`` —
+ * the picker doesn't open a nested editor (keeps this modal focused
+ * on the scope).
+ */
+function PXEProfileSection({
+  groupId,
+  value,
+  onChange,
+}: {
+  groupId: string;
+  value: string;
+  onChange: (v: string) => void;
+}) {
+  const { data: profiles = [] } = useQuery({
+    queryKey: ["dhcp-pxe-profiles", groupId],
+    queryFn: () =>
+      groupId ? dhcpApi.listPxeProfiles(groupId) : Promise.resolve([]),
+    enabled: !!groupId,
+  });
+  const selected = profiles.find((p) => p.id === value);
+
+  if (!groupId) return null;
+
+  return (
+    <div className="space-y-2 border-t pt-3">
+      <div className="flex items-center justify-between">
+        <h3 className="text-sm font-semibold">PXE / iPXE provisioning</h3>
+        {profiles.length > 0 && (
+          <span className="text-[11px] text-muted-foreground">
+            {profiles.length} profile{profiles.length === 1 ? "" : "s"} in group
+          </span>
+        )}
+      </div>
+      <p className="text-[11px] text-muted-foreground">
+        Bind a PXE profile to render Kea client-classes for BIOS / UEFI / iPXE
+        boot. Manage profiles at{" "}
+        <a
+          href={`/dhcp/groups/${groupId}/pxe`}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="text-primary hover:underline"
+        >
+          DHCP → PXE Profiles
+        </a>
+        .
+      </p>
+      <select
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className={inputCls}
+      >
+        <option value="">— none (no PXE) —</option>
+        {profiles.map((p) => (
+          <option key={p.id} value={p.id}>
+            {p.name}
+            {!p.enabled ? " (disabled)" : ""} — {p.matches.length} arch
+            {p.matches.length === 1 ? "" : "es"}
+          </option>
+        ))}
+      </select>
+      {selected && (
+        <div className="rounded border bg-muted/20 p-2 text-[11px]">
+          <p>
+            <strong>next-server:</strong>{" "}
+            <code className="font-mono">{selected.next_server}</code>
+          </p>
+          <p className="mt-0.5">
+            <strong>matches</strong> (priority order):
+          </p>
+          <ul className="ml-3 mt-0.5 space-y-0.5 font-mono text-[11px]">
+            {selected.matches.slice(0, 6).map((m) => (
+              <li key={m.id}>
+                #{m.priority}{" "}
+                {m.vendor_class_match ? `[${m.vendor_class_match}]` : "[any]"}
+                {m.arch_codes && m.arch_codes.length > 0
+                  ? ` arch=${m.arch_codes.join(",")}`
+                  : ""}{" "}
+                → {m.boot_filename}
+              </li>
+            ))}
+            {selected.matches.length > 6 && (
+              <li className="text-muted-foreground">
+                … and {selected.matches.length - 6} more
+              </li>
+            )}
+          </ul>
+        </div>
+      )}
+    </div>
+  );
+}
 
 /**
  * "Apply template…" dropdown above the options editor. Client-side merge

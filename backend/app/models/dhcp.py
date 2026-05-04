@@ -219,6 +219,20 @@ class DHCPScope(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
 
     last_pushed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
+    # ── PXE / iPXE provisioning (issue #51) ─────────────────────────
+    # Operator picks one PXEProfile per scope. The profile carries
+    # the next-server + N arch-matches; the Kea driver renders one
+    # client-class per (profile × arch-match) pair when this is set.
+    # Null = no PXE on this scope (default — most scopes don't run
+    # PXE; a single scope that does avoids polluting every scope's
+    # config). FK is SET NULL so deleting a profile doesn't cascade-
+    # trash the scope; the scope just stops emitting PXE classes.
+    pxe_profile_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dhcp_pxe_profile.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
     group: Mapped[DHCPServerGroup] = relationship("DHCPServerGroup", back_populates="scopes")
     pools: Mapped[list[DHCPPool]] = relationship(
         "DHCPPool",
@@ -231,6 +245,18 @@ class DHCPScope(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
         back_populates="scope",
         cascade="all, delete-orphan",
         lazy="joined",
+    )
+    # ``selectin`` rather than ``joined`` because the profile's
+    # ``matches`` collection is itself joined-loaded — pulling profile
+    # via JOIN on scope queries pulls a JOIN-against-collection that
+    # SQLAlchemy refuses without ``.unique()``. Selectin issues one
+    # extra small query keyed by ``pxe_profile_id`` and side-steps
+    # the collection-joined-load constraint. Bundle assembly does its
+    # own targeted query in ``_assemble_pxe_classes`` anyway.
+    pxe_profile: Mapped[DHCPPXEProfile | None] = relationship(
+        "DHCPPXEProfile",
+        foreign_keys=[pxe_profile_id],
+        lazy="selectin",
     )
 
 
@@ -532,6 +558,91 @@ class DHCPLeaseHistory(UUIDPrimaryKeyMixin, Base):
     )
 
 
+class DHCPPXEProfile(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """A reusable PXE / iPXE provisioning profile (issue #51).
+
+    Group-scoped (mirrors how scopes / pools / statics live on
+    ``DHCPServerGroup``). One profile carries N arch-matches; an
+    operator picks one profile per scope via
+    ``DHCPScope.pxe_profile_id``. Disabled profiles render no
+    classes, letting an operator A/B-test boot files without
+    deleting the configuration.
+
+    ``next_server`` is the IPv4 of the TFTP / HTTP boot server. The
+    matches each carry a vendor_class + arch-code filter and the
+    boot file the matched client should download (ipxe.efi /
+    undionly.kpxe / a chained iPXE config URL / etc).
+    """
+
+    __tablename__ = "dhcp_pxe_profile"
+    __table_args__ = (UniqueConstraint("group_id", "name", name="uq_dhcp_pxe_profile_group_name"),)
+
+    group_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dhcp_server_group.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    next_server: Mapped[str] = mapped_column(String(45), nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    tags: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+
+    matches: Mapped[list[DHCPPXEArchMatch]] = relationship(
+        "DHCPPXEArchMatch",
+        back_populates="profile",
+        cascade="all, delete-orphan",
+        lazy="joined",
+        order_by="DHCPPXEArchMatch.priority",
+    )
+
+
+class DHCPPXEArchMatch(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """One arch-match row within a PXE profile.
+
+    Each match describes a (vendor_class_substring, arch_code_set)
+    filter and the boot filename (TFTP) or URL (HTTP / iPXE chain)
+    the matched client should download.
+
+    ``priority`` is the deterministic tie-breaker — Kea evaluates
+    client-classes in declared order, so the renderer emits matches
+    in (priority ASC, id ASC) so config diffs stay stable across
+    runs and most-specific matches fire first when the operator
+    orders them right.
+
+    ``match_kind`` is informational + drives the UI's preset boot-
+    filename hints; the renderer treats both kinds the same. Kea
+    sees a class either way.
+    """
+
+    __tablename__ = "dhcp_pxe_arch_match"
+    __table_args__ = (Index("ix_dhcp_pxe_arch_match_profile_priority", "profile_id", "priority"),)
+
+    profile_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dhcp_pxe_profile.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    priority: Mapped[int] = mapped_column(Integer, nullable=False, default=100)
+    # match_kind: first_stage | ipxe_chain
+    match_kind: Mapped[str] = mapped_column(String(20), nullable=False, default="first_stage")
+    # Substring match on DHCP option 60 (vendor class identifier).
+    # ``PXEClient`` for first-stage TFTP boot, ``iPXE`` for the
+    # chained iPXE GET, ``HTTPClient`` for UEFI HTTP boot. Null =
+    # match anything (paired with arch_codes to filter).
+    vendor_class_match: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # List of DHCP option 93 (Client Architecture Type) values to
+    # match — see issue #51 for the canonical lookup table. Null =
+    # match any arch (paired with vendor_class_match to filter).
+    arch_codes: Mapped[list[int] | None] = mapped_column(JSONB, nullable=True)
+    boot_filename: Mapped[str] = mapped_column(String(512), nullable=False)
+    boot_file_url_v6: Mapped[str | None] = mapped_column(String(512), nullable=True)
+
+    profile: Mapped[DHCPPXEProfile] = relationship("DHCPPXEProfile", back_populates="matches")
+
+
 __all__ = [
     "DHCPServerGroup",
     "DHCPServer",
@@ -541,6 +652,8 @@ __all__ = [
     "DHCPClientClass",
     "DHCPOptionTemplate",
     "DHCPMACBlock",
+    "DHCPPXEProfile",
+    "DHCPPXEArchMatch",
     "DHCPLease",
     "DHCPConfigOp",
     "DHCPRecordOp",

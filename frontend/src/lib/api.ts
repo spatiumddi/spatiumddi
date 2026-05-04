@@ -3530,8 +3530,87 @@ export interface DHCPScope {
   // "ipv4" → Kea Dhcp4; "ipv6" → Kea Dhcp6. Inferred from subnet CIDR.
   address_family?: "ipv4" | "ipv6";
   options: DHCPOption[];
+  // PXE / iPXE profile binding (issue #51). Null = no PXE on this
+  // scope. Bound profile renders one Kea client-class per arch-match
+  // on the next ConfigBundle push.
+  pxe_profile_id?: string | null;
   created_at: string;
   modified_at: string;
+}
+
+// ── PXE / iPXE profiles (issue #51) ─────────────────────────────
+//
+// Group-scoped reusable provisioning profiles. Each profile carries
+// ``next_server`` + N arch-matches. Operators bind a profile to a
+// scope via ``DHCPScope.pxe_profile_id``; the Kea driver renders one
+// client-class per arch-match.
+
+/** DHCP option-93 (Client Architecture Type) lookup. Surfaced in
+ * the UI's arch-codes multi-select. */
+export const DHCP_PXE_ARCH_LABELS: Record<number, string> = {
+  0: "BIOS / Legacy x86",
+  6: "UEFI x86 (32-bit)",
+  7: "UEFI x86-64",
+  9: "UEFI x86-64 (alt)",
+  10: "ARM 32-bit UEFI",
+  11: "ARM 64-bit UEFI",
+  15: "HTTP boot UEFI",
+  16: "HTTP boot UEFI x86-64",
+};
+
+export type PXEMatchKind = "first_stage" | "ipxe_chain";
+
+export interface PXEArchMatch {
+  id: string;
+  profile_id: string;
+  priority: number;
+  match_kind: PXEMatchKind;
+  vendor_class_match: string | null;
+  arch_codes: number[] | null;
+  boot_filename: string;
+  boot_file_url_v6: string | null;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface PXEArchMatchInput {
+  priority?: number;
+  match_kind?: PXEMatchKind;
+  vendor_class_match?: string | null;
+  arch_codes?: number[] | null;
+  boot_filename: string;
+  boot_file_url_v6?: string | null;
+}
+
+export interface PXEProfile {
+  id: string;
+  group_id: string;
+  name: string;
+  description: string;
+  next_server: string;
+  enabled: boolean;
+  tags: Record<string, unknown>;
+  matches: PXEArchMatch[];
+  created_at: string;
+  modified_at: string;
+}
+
+export interface PXEProfileCreate {
+  name: string;
+  description?: string;
+  next_server: string;
+  enabled?: boolean;
+  tags?: Record<string, unknown>;
+  matches?: PXEArchMatchInput[];
+}
+
+export interface PXEProfileUpdate {
+  name?: string;
+  description?: string;
+  next_server?: string;
+  enabled?: boolean;
+  tags?: Record<string, unknown>;
+  matches?: PXEArchMatchInput[];
 }
 
 export const dhcpApi = {
@@ -3700,6 +3779,24 @@ export const dhcpApi = {
         data,
       )
       .then((r) => r.data),
+
+  // ── PXE / iPXE profiles (issue #51) ──────────────────────────────
+  listPxeProfiles: (groupId: string) =>
+    api
+      .get<PXEProfile[]>(`/dhcp/server-groups/${groupId}/pxe-profiles`)
+      .then((r) => r.data),
+  getPxeProfile: (profileId: string) =>
+    api.get<PXEProfile>(`/dhcp/pxe-profiles/${profileId}`).then((r) => r.data),
+  createPxeProfile: (groupId: string, body: PXEProfileCreate) =>
+    api
+      .post<PXEProfile>(`/dhcp/server-groups/${groupId}/pxe-profiles`, body)
+      .then((r) => r.data),
+  updatePxeProfile: (profileId: string, body: PXEProfileUpdate) =>
+    api
+      .put<PXEProfile>(`/dhcp/pxe-profiles/${profileId}`, body)
+      .then((r) => r.data),
+  deletePxeProfile: (profileId: string) =>
+    api.delete(`/dhcp/pxe-profiles/${profileId}`),
 
   listMacBlocks: (groupId: string) =>
     api

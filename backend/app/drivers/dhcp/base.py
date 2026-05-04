@@ -74,6 +74,32 @@ class ClientClassDef:
 
 
 @dataclass(frozen=True)
+class PXEClassDef:
+    """A rendered PXE / iPXE client class (issue #51).
+
+    Distinct shape from :class:`ClientClassDef` because PXE classes
+    carry per-class ``next_server`` + ``boot_file_name`` rather than
+    relying on Kea's global option-data — the boot file the client
+    pulls is what differentiates BIOS / UEFI / HTTP-boot
+    architectures, so each match must override these fields. Kea
+    evaluates classes in declared order; we render in (priority ASC,
+    profile_id ASC, match_id ASC) so config diffs stay stable.
+
+    ``match_expression`` is the Kea ``test`` expression composed
+    from the operator's ``vendor_class_match`` (option 60 substring)
+    and ``arch_codes`` (option 93 enumeration) on
+    ``DHCPPXEArchMatch``. Empty match = always match (paired with a
+    low priority so it acts as a fallthrough).
+    """
+
+    name: str
+    match_expression: str
+    next_server: str
+    boot_file_name: str
+    is_ipxe_chain: bool = False
+
+
+@dataclass(frozen=True)
 class MACBlockDef:
     """A blocked MAC address — group-global deny entry.
 
@@ -159,6 +185,7 @@ class ConfigBundle:
     client_classes: tuple[ClientClassDef, ...]
     generated_at: datetime
     mac_blocks: tuple[MACBlockDef, ...] = ()
+    pxe_classes: tuple[PXEClassDef, ...] = ()
     etag: str = ""
     # Populated when the server's group has ≥ 2 Kea members. The
     # agent's Kea renderer injects ``libdhcp_ha.so`` + the ``high-
@@ -176,6 +203,7 @@ class ConfigBundle:
             "scopes": [asdict(s) for s in self.scopes],
             "client_classes": [asdict(c) for c in self.client_classes],
             "mac_blocks": [asdict(m) for m in self.mac_blocks],
+            "pxe_classes": [asdict(p) for p in self.pxe_classes],
             "failover": asdict(self.failover) if self.failover else None,
         }
         blob = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
@@ -386,6 +414,7 @@ __all__ = [
     "ExclusionItem",
     "ExclusionResult",
     "MACBlockDef",
+    "PXEClassDef",
     "PoolDef",
     "RemoveReservationItem",
     "ReservationItem",

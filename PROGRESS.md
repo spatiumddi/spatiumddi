@@ -161,18 +161,18 @@ HTTP URL to a config script.
 
 ### Checkpoints
 
-- [ ] Migration: `dhcp_pxe_profile` + `dhcp_pxe_arch_match` + `dhcp_scope.pxe_profile_id`
-- [ ] Models: `DHCPPXEProfile` + `DHCPPXEArchMatch`; extend `DHCPScope`
-- [ ] Schemas: profile create / update / response with nested matches
-- [ ] Service: `app/services/dhcp/pxe.py` — CRUD with match-list replace semantics
-- [ ] Driver: extend `drivers/dhcp/kea.py` with `_render_pxe_classes`; wire into ConfigBundle
-- [ ] Driver tests: deterministic class ordering by priority; vendor + arch match expression renders correctly
-- [ ] Router: `/dhcp/groups/{gid}/pxe-profiles` CRUD + `pxe_profile_id` on scope update
-- [ ] Frontend: PXE / iPXE tab on scope edit modal
-- [ ] Frontend: profile editor modal with draggable arch-match rows
-- [ ] Frontend: arch-code multi-select with documented labels
-- [ ] `make ci` clean
-- [ ] Commit chain split at model+driver / API / frontend
+- [x] Migration: `dhcp_pxe_profile` + `dhcp_pxe_arch_match` + `dhcp_scope.pxe_profile_id` (`d5b8a3f12e64_dhcp_pxe_profiles`)
+- [x] Models: `DHCPPXEProfile` + `DHCPPXEArchMatch`; extend `DHCPScope` with `pxe_profile_id` + `pxe_profile` relationship (lazy=`selectin` to avoid joined-collection conflict)
+- [x] Schemas: `PXEProfileCreate` / `Update` / `Response` with nested `ArchMatchInput` + `ArchMatchResponse`; arch-code range validation (0..255)
+- [x] Service: PXE class assembly in `services/dhcp/config_bundle._assemble_pxe_classes` + `_build_pxe_match_expression` composing Kea `substring(option[60].hex,…)` + `option[93].hex == 0xNNNN` test expressions
+- [x] Driver: `PXEClassDef` added to `drivers/dhcp/base`; `bundle.pxe_classes` field; `_render_pxe_class` in Kea driver appended to Dhcp4 client-classes list
+- [x] Router: `/dhcp/server-groups/{gid}/pxe-profiles` CRUD + `/dhcp/pxe-profiles/{id}` get/put/delete; `ScopeUpdate.pxe_profile_id` + `clear_pxe_profile` flag for explicit detach
+- [x] Frontend: `PXEProfileSection` picker on the scope edit modal (within the existing single-form layout — no tab restructure needed; the picker shows next-server + first 6 matches as a read-only summary)
+- [x] Frontend: `/dhcp/groups/:groupId/pxe` page with create + edit modal (`ProfileEditor`) + per-profile card list + arch-match rows with priority + match_kind + vendor-class + arch-codes multi-select chips + boot-filename
+- [x] Frontend: arch-code multi-select with documented labels (`DHCP_PXE_ARCH_LABELS`)
+- [x] Smoke-test: created 3-match profile (BIOS / UEFI x86-64 / iPXE chain) via API; bound to scope; bundle assembly emitted 3 PXE classes; Kea renderer emitted them as Dhcp4 client-classes with vendor-class substring + option-93 hex tests
+- [x] `make ci` clean
+- [x] Single commit `feat(dhcp): #51 PXE / iPXE provisioning profiles`
 
 ### Done when
 

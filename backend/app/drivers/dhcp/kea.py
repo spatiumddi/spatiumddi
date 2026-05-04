@@ -22,6 +22,7 @@ from app.drivers.dhcp.base import (
     ConfigBundle,
     DHCPDriver,
     PoolDef,
+    PXEClassDef,
     ScopeDef,
     StaticAssignmentDef,
 )
@@ -170,6 +171,30 @@ def _render_client_class(c: ClientClassDef, *, address_family: str = "ipv4") -> 
     return d
 
 
+def _render_pxe_class(p: PXEClassDef) -> dict[str, Any]:
+    """Render a PXE / iPXE class for Dhcp4 ``client-classes`` (issue #51).
+
+    PXE classes are Dhcp4-only — the v6 PXE story uses option 59
+    (Bootfile-URL) which is a different flow and is deferred. The
+    ``next-server`` + ``boot-file-name`` fields on the class win
+    over scope-level defaults when Kea matches the packet, so each
+    arch / vendor combo can serve a different boot binary.
+
+    The ``test`` expression is whatever the bundle assembler
+    composed from the operator's ``vendor_class_match`` substring +
+    ``arch_codes`` enumeration. An empty test means "always match"
+    — typically a low-priority fallthrough.
+    """
+    d: dict[str, Any] = {
+        "name": p.name,
+        "next-server": p.next_server,
+        "boot-file-name": p.boot_file_name,
+    }
+    if p.match_expression:
+        d["test"] = p.match_expression
+    return d
+
+
 class KeaDriver(DHCPDriver):
     """Kea DHCPv4 driver — emits a ``Dhcp4`` JSON config structure."""
 
@@ -196,7 +221,8 @@ class KeaDriver(DHCPDriver):
                 "subnet4": [_render_scope(s) for s in v4_scopes],
                 "client-classes": [
                     _render_client_class(c, address_family="ipv4") for c in bundle.client_classes
-                ],
+                ]
+                + [_render_pxe_class(p) for p in bundle.pxe_classes],
                 "option-data": _render_option_data(bundle.options.options, address_family="ipv4"),
             }
         if v6_scopes:

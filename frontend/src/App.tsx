@@ -13,6 +13,7 @@ import { VLANsPage } from "@/pages/vlans/VLANsPage";
 import { VRFsPage } from "@/pages/vrfs/VRFsPage";
 import { VRFDetailPage } from "@/pages/vrfs/VRFDetailPage";
 import { DHCPPage } from "@/pages/dhcp/DHCPPage";
+import { PXEProfilesPage } from "@/pages/dhcp/PXEProfilesPage";
 import { KubernetesPage } from "@/pages/kubernetes/KubernetesPage";
 import { DockerPage } from "@/pages/docker/DockerPage";
 import { ProxmoxPage } from "@/pages/proxmox/ProxmoxPage";
@@ -93,6 +94,7 @@ export default function App() {
         <Route path="tools/nmap" element={<NmapToolsPage />} />
         <Route path="tools/cidr" element={<CidrCalculatorPage />} />
         <Route path="dhcp" element={<DHCPPage />} />
+        <Route path="dhcp/groups/:groupId/pxe" element={<PXEProfilesPage />} />
         <Route path="logs" element={<LogsPage />} />
         <Route path="kubernetes" element={<KubernetesPage />} />
         <Route path="docker" element={<DockerPage />} />
