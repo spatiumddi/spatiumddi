@@ -171,3 +171,49 @@ class AIPrompt(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         ForeignKey("user.id", ondelete="SET NULL"),
         nullable=True,
     )
+
+
+class AIOperationProposal(UUIDPrimaryKeyMixin, Base):
+    """Pending Copilot write operation awaiting operator confirmation.
+
+    When the LLM fires a write tool, the orchestrator calls the
+    operation's :func:`preview` instead of its :func:`apply`. The
+    preview produces a human-readable description (no side effects),
+    and a row of this type is persisted with the args. The chat
+    surface renders the proposal as an Apply / Discard card; the
+    actual mutation only runs after an explicit POST to
+    ``/api/v1/ai/proposals/{id}/apply``.
+
+    A row reaches one of three terminal states:
+
+    * ``applied_at`` set    — operator confirmed; ``result`` carries
+      the dispatch outcome.
+    * ``discarded_at`` set  — operator rejected; ``error`` may carry
+      a discard reason.
+    * Neither, ``expires_at`` in the past — the cleanup task drops it
+      on the next sweep.
+    """
+
+    __tablename__ = "ai_operation_proposal"
+
+    session_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("ai_chat_session.id", ondelete="CASCADE"),
+        nullable=True,
+    )
+    user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("user.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    operation: Mapped[str] = mapped_column(String(64), nullable=False)
+    args: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    preview_text: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    applied_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    discarded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    result: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=datetime.utcnow
+    )

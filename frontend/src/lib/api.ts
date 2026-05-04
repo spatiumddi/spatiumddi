@@ -2474,6 +2474,22 @@ export const aiApi = {
     api.put<AIPrompt>(`/ai/prompts/${id}`, body).then((r) => r.data),
   deletePrompt: (id: string) =>
     api.delete<void>(`/ai/prompts/${id}`).then((r) => r.data),
+
+  // ── Operation proposals (Phase 2 — write-tool preview/apply) ──
+  listProposals: (pendingOnly = true) =>
+    api
+      .get<AIProposal[]>("/ai/proposals", {
+        params: { pending_only: pendingOnly },
+      })
+      .then((r) => r.data),
+  getProposal: (id: string) =>
+    api.get<AIProposal>(`/ai/proposals/${id}`).then((r) => r.data),
+  applyProposal: (id: string) =>
+    api
+      .post<AIProposalApplyResponse>(`/ai/proposals/${id}/apply`, {})
+      .then((r) => r.data),
+  discardProposal: (id: string) =>
+    api.post<AIProposal>(`/ai/proposals/${id}/discard`, {}).then((r) => r.data),
 };
 
 // ── AI usage observability types ─────────────────────────────────────
@@ -2530,6 +2546,28 @@ export interface AIPromptUpdate {
   description?: string;
   prompt_text?: string;
   is_shared?: boolean;
+}
+
+// ── AI write-operation proposal types (Phase 2) ──────────────────────
+
+export interface AIProposal {
+  id: string;
+  operation: string;
+  args: Record<string, unknown>;
+  preview_text: string;
+  expires_at: string;
+  applied_at: string | null;
+  discarded_at: string | null;
+  result: Record<string, unknown> | null;
+  error: string | null;
+  created_at: string;
+}
+
+export interface AIProposalApplyResponse {
+  ok: boolean;
+  detail: string;
+  result: Record<string, unknown> | null;
+  proposal: AIProposal;
 }
 
 // ── AI chat types ────────────────────────────────────────────────────

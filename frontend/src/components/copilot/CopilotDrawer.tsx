@@ -472,6 +472,29 @@ function EmptyState({ onPick }: { onPick: (text: string) => void }) {
 
 function MessageBubble({ message }: { message: AIChatMessage }) {
   if (message.role === "tool") {
+    // Detect proposal-shape tool results — render the Apply / Discard
+    // card instead of the raw JSON tool envelope. Pattern matches the
+    // contract from ``app/services/ai/tools/proposals.py``.
+    let parsed: unknown = null;
+    try {
+      parsed = JSON.parse(message.content);
+    } catch {
+      // Not JSON — fall through to plain ToolCard.
+    }
+    if (
+      parsed != null &&
+      typeof parsed === "object" &&
+      (parsed as { kind?: string }).kind === "proposal" &&
+      typeof (parsed as { proposal_id?: string }).proposal_id === "string"
+    ) {
+      return (
+        <ProposalCard
+          proposalId={(parsed as { proposal_id: string }).proposal_id}
+          operation={(parsed as { operation?: string }).operation ?? ""}
+          previewText={(parsed as { preview?: string }).preview ?? ""}
+        />
+      );
+    }
     return <ToolCard message={message} />;
   }
   const isUser = message.role === "user";
@@ -503,6 +526,134 @@ function MessageBubble({ message }: { message: AIChatMessage }) {
                 </span>
               </div>
             ))}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/** Apply / Discard card rendered in place of a raw tool result for
+ *  proposal-shape payloads. Lazy-fetches the canonical proposal row
+ *  on mount so it can show the latest terminal state when the chat
+ *  history is replayed (e.g. the operator already applied or
+ *  discarded earlier).
+ */
+function ProposalCard({
+  proposalId,
+  operation,
+  previewText,
+}: {
+  proposalId: string;
+  operation: string;
+  previewText: string;
+}) {
+  const qc = useQueryClient();
+  const proposalQ = useQuery({
+    queryKey: ["ai-proposal", proposalId],
+    queryFn: () => aiApi.getProposal(proposalId),
+    // Refresh on every mount so a session replay shows the right
+    // applied / discarded / expired state.
+    staleTime: 0,
+  });
+
+  const applyMut = useMutation({
+    mutationFn: () => aiApi.applyProposal(proposalId),
+    onSettled: () => {
+      qc.invalidateQueries({ queryKey: ["ai-proposal", proposalId] });
+    },
+  });
+  const discardMut = useMutation({
+    mutationFn: () => aiApi.discardProposal(proposalId),
+    onSettled: () => {
+      qc.invalidateQueries({ queryKey: ["ai-proposal", proposalId] });
+    },
+  });
+
+  const proposal = proposalQ.data;
+  const applied = !!proposal?.applied_at;
+  const discarded = !!proposal?.discarded_at;
+  const expired =
+    !!proposal?.expires_at &&
+    !applied &&
+    !discarded &&
+    new Date(proposal.expires_at).getTime() < Date.now();
+  const pending = !applied && !discarded && !expired;
+
+  let badge: { text: string; cls: string };
+  if (applied) {
+    badge = {
+      text: "applied",
+      cls: "bg-emerald-500/10 text-emerald-600 border-emerald-500/30",
+    };
+  } else if (discarded) {
+    badge = {
+      text: "discarded",
+      cls: "bg-zinc-500/10 text-zinc-600 border-zinc-500/30",
+    };
+  } else if (expired) {
+    badge = {
+      text: "expired",
+      cls: "bg-amber-500/10 text-amber-600 border-amber-500/30",
+    };
+  } else {
+    badge = {
+      text: "pending",
+      cls: "bg-primary/10 text-primary border-primary/30",
+    };
+  }
+
+  return (
+    <div className="mb-3 flex justify-start">
+      <div className="max-w-[85%] rounded-lg border border-primary/30 bg-primary/5 p-3 text-sm">
+        <div className="flex items-center gap-2">
+          <Sparkles className="h-3.5 w-3.5 text-primary" />
+          <span className="font-medium">Proposed: {operation}</span>
+          <span className={`ml-auto rounded border px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wider ${badge.cls}`}>
+            {badge.text}
+          </span>
+        </div>
+        <div className="mt-2 whitespace-pre-wrap break-words font-sans text-xs text-foreground/90">
+          {proposal?.preview_text || previewText || "(no preview)"}
+        </div>
+        {applied && proposal?.result && (
+          <details className="mt-2 text-xs">
+            <summary className="cursor-pointer text-muted-foreground">
+              Result
+            </summary>
+            <pre className="mt-1 max-h-48 overflow-auto whitespace-pre-wrap break-all font-mono text-[10px]">
+              {JSON.stringify(proposal.result, null, 2)}
+            </pre>
+          </details>
+        )}
+        {proposal?.error && (
+          <div className="mt-2 rounded border border-destructive/30 bg-destructive/5 p-2 text-xs text-destructive">
+            {proposal.error}
+          </div>
+        )}
+        {pending && (
+          <div className="mt-3 flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => applyMut.mutate()}
+              disabled={applyMut.isPending || discardMut.isPending}
+              className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1 text-xs font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+            >
+              {applyMut.isPending ? "Applying…" : "Apply"}
+            </button>
+            <button
+              type="button"
+              onClick={() => discardMut.mutate()}
+              disabled={applyMut.isPending || discardMut.isPending}
+              className="inline-flex items-center gap-1.5 rounded-md border px-3 py-1 text-xs hover:bg-accent disabled:opacity-50"
+            >
+              {discardMut.isPending ? "Discarding…" : "Discard"}
+            </button>
+            {proposal?.expires_at && (
+              <span className="ml-auto text-[10px] text-muted-foreground">
+                expires {new Date(proposal.expires_at).toLocaleTimeString()}
+              </span>
+            )}
           </div>
         )}
       </div>
