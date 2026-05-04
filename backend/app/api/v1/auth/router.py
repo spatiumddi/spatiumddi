@@ -42,7 +42,9 @@ from app.core.auth.user_sync import (
 )
 from app.core.security import (
     create_access_token,
+    create_mfa_challenge_token,
     create_refresh_token,
+    decode_mfa_challenge_token,
     hash_password,
     hash_refresh_token,
     verify_password,
@@ -51,6 +53,17 @@ from app.models.audit import AuditLog
 from app.models.auth import User, UserSession
 from app.models.auth_provider import PASSWORD_PROVIDER_TYPES, AuthProvider
 from app.models.settings import PlatformSettings
+from app.services.mfa import (
+    consume_recovery_code,
+    decrypt_secret,
+    encrypt_recovery_codes,
+    encrypt_secret,
+    generate_recovery_codes,
+    generate_secret,
+    otpauth_uri,
+    remaining_recovery_codes,
+    verify_totp,
+)
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()
@@ -66,6 +79,34 @@ class TokenResponse(BaseModel):
     refresh_token: str
     token_type: str = "bearer"
     force_password_change: bool = False
+
+
+class LoginResponse(BaseModel):
+    """Login response. Two shapes the caller has to handle:
+
+    1. **MFA not required.** ``access_token`` + ``refresh_token`` are
+       set; ``mfa_required`` is False; the caller stashes the tokens
+       and proceeds. Identical to ``TokenResponse``.
+    2. **MFA required.** Tokens are NOT set; ``mfa_required`` is
+       True; ``mfa_token`` carries a 5-minute JWT (claim
+       ``type=mfa``) that the caller must POST to
+       ``/auth/login/mfa`` along with a TOTP code or a recovery
+       code. The challenge token is useless for any other endpoint.
+    """
+
+    access_token: str | None = None
+    refresh_token: str | None = None
+    token_type: str = "bearer"
+    force_password_change: bool = False
+    mfa_required: bool = False
+    mfa_token: str | None = None
+
+
+class MfaLoginRequest(BaseModel):
+    mfa_token: str
+    # Operator submits exactly one of these. Both empty = 422.
+    code: str | None = None
+    recovery_code: str | None = None
 
 
 class UserResponse(BaseModel):
@@ -293,8 +334,8 @@ async def _try_external_password_login(
     return None
 
 
-@router.post("/login", response_model=TokenResponse)
-async def login(body: LoginRequest, request: Request, db: DB) -> TokenResponse:
+@router.post("/login", response_model=LoginResponse)
+async def login(body: LoginRequest, request: Request, db: DB) -> LoginResponse:
     result = await db.execute(select(User).where(User.username == body.username))
     user = result.scalar_one_or_none()
 
@@ -311,14 +352,31 @@ async def login(body: LoginRequest, request: Request, db: DB) -> TokenResponse:
                 db, request, body.username, reason="account_disabled", user=user
             )
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account disabled")
-        return await _issue_tokens(db, request, user, auth_source="local")
+        # MFA gate (issue #69). Local users only — external providers
+        # rely on their own IdP for MFA and don't run TOTP here. We don't
+        # write an audit row for the password-success-but-MFA-pending case
+        # because a successful login is what crosses the audit boundary;
+        # ``/login/mfa`` is what fires the ``login`` action.
+        if user.totp_enabled and user.totp_secret_encrypted is not None:
+            challenge = create_mfa_challenge_token(str(user.id))
+            return LoginResponse(mfa_required=True, mfa_token=challenge)
+        tokens = await _issue_tokens(db, request, user, auth_source="local")
+        return LoginResponse(
+            access_token=tokens.access_token,
+            refresh_token=tokens.refresh_token,
+            force_password_change=tokens.force_password_change,
+        )
 
     # ── External provider fallthrough (LDAP / RADIUS / TACACS+) ─────────────
     external_response = await _try_external_password_login(
         db, request, body.username, body.password
     )
     if external_response is not None:
-        return external_response
+        return LoginResponse(
+            access_token=external_response.access_token,
+            refresh_token=external_response.refresh_token,
+            force_password_change=external_response.force_password_change,
+        )
 
     # Existing-but-external user with no matching provider → fall through to
     # the generic 401 so we don't leak account-existence information.
@@ -331,6 +389,104 @@ async def login(body: LoginRequest, request: Request, db: DB) -> TokenResponse:
         auth_source=user.auth_source if user else "local",
     )
     raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+
+
+@router.post("/login/mfa", response_model=LoginResponse)
+async def login_mfa(body: MfaLoginRequest, request: Request, db: DB) -> LoginResponse:
+    """Complete a TOTP-gated login. Body carries the challenge token
+    minted by ``/login`` plus a 6-digit TOTP code or a one-time recovery
+    code. Either is accepted; both = 422.
+
+    The challenge token is single-use in spirit but stateless — once
+    spent it can technically be replayed within the 5 min TTL, but
+    only against a successful TOTP/recovery code, so an attacker who
+    captures the challenge token still needs the second factor.
+    """
+    if (body.code and body.recovery_code) or (not body.code and not body.recovery_code):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Provide exactly one of: code, recovery_code",
+        )
+
+    try:
+        payload = decode_mfa_challenge_token(body.mfa_token)
+        user_id: str = payload["sub"]
+    except (JWTError, KeyError) as exc:
+        await _audit_login_failure(db, request, "<mfa>", reason="mfa_challenge_invalid")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired MFA challenge",
+        ) from exc
+
+    user = await db.get(User, user_id)
+    if user is None or not user.is_active:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired MFA challenge",
+        )
+    if not user.totp_enabled or user.totp_secret_encrypted is None:
+        # Defence in depth — the challenge token says this user has MFA,
+        # but the column does not. Could only happen if MFA was disabled
+        # between mint + redeem. Fail closed.
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="MFA not enabled for this user",
+        )
+
+    # ── Validate the second factor ─────────────────────────────────────────
+    matched = False
+    used_recovery = False
+    if body.code is not None:
+        try:
+            secret = decrypt_secret(user.totp_secret_encrypted)
+        except ValueError:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="MFA secret could not be decrypted — admin must reset",
+            )
+        matched = verify_totp(secret, body.code)
+    elif body.recovery_code is not None:
+        if user.recovery_codes_encrypted is None:
+            matched = False
+        else:
+            ok, new_blob = consume_recovery_code(user.recovery_codes_encrypted, body.recovery_code)
+            if ok:
+                matched = True
+                used_recovery = True
+                user.recovery_codes_encrypted = new_blob
+                db.add(
+                    AuditLog(
+                        user_id=user.id,
+                        user_display_name=user.display_name,
+                        auth_source="local",
+                        source_ip=_client_ip(request),
+                        user_agent=request.headers.get("user-agent"),
+                        action="mfa.recovery_used",
+                        resource_type="user",
+                        resource_id=str(user.id),
+                        resource_display=user.username,
+                        result="success",
+                        new_value={
+                            "remaining": remaining_recovery_codes(user.recovery_codes_encrypted),
+                        },
+                    )
+                )
+
+    if not matched:
+        await _audit_login_failure(db, request, user.username, reason="mfa_code_invalid", user=user)
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid MFA code")
+
+    # ── Success — issue real tokens ────────────────────────────────────────
+    tokens = await _issue_tokens(db, request, user, auth_source="local")
+    if used_recovery:
+        # The audit row was written before _issue_tokens committed; the
+        # _issue_tokens commit covers it. No extra commit needed.
+        logger.info("mfa_recovery_used", user_id=str(user.id))
+    return LoginResponse(
+        access_token=tokens.access_token,
+        refresh_token=tokens.refresh_token,
+        force_password_change=tokens.force_password_change,
+    )
 
 
 class RefreshRequest(BaseModel):
@@ -443,6 +599,236 @@ async def logout(current_user: CurrentUser, db: DB) -> None:
 @router.get("/me", response_model=UserResponse)
 async def get_me(current_user: CurrentUser) -> User:
     return current_user
+
+
+# ── MFA — TOTP enrolment + management (issue #69) ───────────────────────────
+#
+# Local users only. The flow:
+#
+#   POST /auth/mfa/enroll/begin   → server generates a candidate secret +
+#                                    recovery codes; persists the *secret*
+#                                    encrypted on the user row but does NOT
+#                                    flip ``totp_enabled``. Returns the
+#                                    raw secret + otpauth URI + the 10
+#                                    recovery codes.
+#   POST /auth/mfa/enroll/verify  → operator submits the first 6-digit code
+#                                    from their authenticator. On success
+#                                    we persist the encrypted recovery
+#                                    codes + flip ``totp_enabled = true``.
+#                                    Audit-logged as ``mfa.enabled``.
+#   POST /auth/mfa/disable        → password + current code required. Clears
+#                                    all three columns. Audit-logged.
+#   POST /auth/mfa/recovery-codes/regenerate → password + current code.
+#                                    Returns a fresh set + replaces stored
+#                                    hashes. Audit-logged.
+#
+# Recovery-code consumption is folded into ``/auth/login/mfa`` above; the
+# endpoint accepts either ``code`` or ``recovery_code``.
+
+
+class MfaEnrolBeginResponse(BaseModel):
+    secret: str
+    otpauth_uri: str
+    recovery_codes: list[str]
+
+
+class MfaEnrolVerifyRequest(BaseModel):
+    code: str
+
+
+class MfaPasswordCodeRequest(BaseModel):
+    """Body shape for disable + recovery-code regen — both gated on the
+    same two-factor reauth (current password + current TOTP code)."""
+
+    password: str
+    code: str
+
+
+class MfaStatusResponse(BaseModel):
+    enabled: bool
+    enrolment_pending: bool
+    recovery_codes_remaining: int
+
+
+@router.get("/mfa/status", response_model=MfaStatusResponse)
+async def mfa_status(current_user: CurrentUser) -> MfaStatusResponse:
+    """Surface current MFA state for the Settings panel. ``enrolment_pending``
+    is True when the operator has called ``begin`` but not ``verify`` —
+    handy for the UI to render a "Resume enrolment" affordance."""
+    return MfaStatusResponse(
+        enabled=current_user.totp_enabled,
+        enrolment_pending=(
+            not current_user.totp_enabled and current_user.totp_secret_encrypted is not None
+        ),
+        recovery_codes_remaining=remaining_recovery_codes(current_user.recovery_codes_encrypted),
+    )
+
+
+@router.post("/mfa/enroll/begin", response_model=MfaEnrolBeginResponse)
+async def mfa_enroll_begin(current_user: CurrentUser, db: DB) -> MfaEnrolBeginResponse:
+    """Mint a candidate TOTP secret + recovery codes. Persists the secret
+    on the user row encrypted (so /verify can compare without taking it
+    over the wire twice) but leaves ``totp_enabled`` false.
+
+    Calling begin a second time before verify replaces the candidate —
+    operator scanned a half-broken QR code, fine, just start over."""
+    if current_user.auth_source != "local":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="MFA enrolment is for local users only",
+        )
+    if current_user.totp_enabled:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="MFA is already enabled — disable it first to re-enrol",
+        )
+    secret = generate_secret()
+    codes = generate_recovery_codes()
+    current_user.totp_secret_encrypted = encrypt_secret(secret)
+    # Stash the recovery codes on the row right now so the operator can
+    # resume verify without losing them. They're only "active" once
+    # ``totp_enabled`` flips below.
+    current_user.recovery_codes_encrypted = encrypt_recovery_codes(codes)
+    await db.commit()
+    return MfaEnrolBeginResponse(
+        secret=secret,
+        otpauth_uri=otpauth_uri(secret, current_user.username),
+        recovery_codes=codes,
+    )
+
+
+@router.post("/mfa/enroll/verify", status_code=status.HTTP_204_NO_CONTENT)
+async def mfa_enroll_verify(
+    body: MfaEnrolVerifyRequest, current_user: CurrentUser, request: Request, db: DB
+) -> None:
+    """Confirm enrolment by submitting the first 6-digit TOTP code. Until
+    this succeeds ``totp_enabled`` stays false and login skips the MFA
+    gate. On success we audit-log and the next ``/login`` will MFA-gate."""
+    if current_user.auth_source != "local":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="MFA enrolment is for local users only",
+        )
+    if current_user.totp_enabled:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="MFA already enabled")
+    if current_user.totp_secret_encrypted is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="No enrolment in progress — call /mfa/enroll/begin first",
+        )
+    secret = decrypt_secret(current_user.totp_secret_encrypted)
+    if not verify_totp(secret, body.code):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid TOTP code")
+    current_user.totp_enabled = True
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source="local",
+            source_ip=_client_ip(request),
+            user_agent=request.headers.get("user-agent"),
+            action="mfa.enabled",
+            resource_type="user",
+            resource_id=str(current_user.id),
+            resource_display=current_user.username,
+            result="success",
+        )
+    )
+    await db.commit()
+
+
+@router.post("/mfa/disable", status_code=status.HTTP_204_NO_CONTENT)
+async def mfa_disable(
+    body: MfaPasswordCodeRequest, current_user: CurrentUser, request: Request, db: DB
+) -> None:
+    """Disable MFA. Requires both the current password AND a current TOTP
+    code — neither alone is sufficient. Clears the secret and recovery
+    codes."""
+    if current_user.auth_source != "local":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="MFA management is for local users only",
+        )
+    if not current_user.totp_enabled or current_user.totp_secret_encrypted is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="MFA is not currently enabled"
+        )
+    if not current_user.hashed_password or not verify_password(
+        body.password, current_user.hashed_password
+    ):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+    secret = decrypt_secret(current_user.totp_secret_encrypted)
+    if not verify_totp(secret, body.code):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid TOTP code")
+    current_user.totp_enabled = False
+    current_user.totp_secret_encrypted = None
+    current_user.recovery_codes_encrypted = None
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source="local",
+            source_ip=_client_ip(request),
+            user_agent=request.headers.get("user-agent"),
+            action="mfa.disabled",
+            resource_type="user",
+            resource_id=str(current_user.id),
+            resource_display=current_user.username,
+            result="success",
+        )
+    )
+    await db.commit()
+
+
+@router.post(
+    "/mfa/recovery-codes/regenerate",
+    response_model=MfaEnrolBeginResponse,
+)
+async def mfa_regenerate_recovery_codes(
+    body: MfaPasswordCodeRequest, current_user: CurrentUser, request: Request, db: DB
+) -> MfaEnrolBeginResponse:
+    """Replace the recovery-code list. Same two-factor reauth as
+    ``/disable``. Returns the new codes ONCE — operator must record them.
+    The existing ``secret`` is kept so the authenticator app entry stays
+    valid; only the recovery-code list rotates."""
+    if current_user.auth_source != "local":
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="MFA management is for local users only",
+        )
+    if not current_user.totp_enabled or current_user.totp_secret_encrypted is None:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST, detail="MFA is not currently enabled"
+        )
+    if not current_user.hashed_password or not verify_password(
+        body.password, current_user.hashed_password
+    ):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials")
+    secret = decrypt_secret(current_user.totp_secret_encrypted)
+    if not verify_totp(secret, body.code):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid TOTP code")
+    codes = generate_recovery_codes()
+    current_user.recovery_codes_encrypted = encrypt_recovery_codes(codes)
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source="local",
+            source_ip=_client_ip(request),
+            user_agent=request.headers.get("user-agent"),
+            action="mfa.recovery_regenerated",
+            resource_type="user",
+            resource_id=str(current_user.id),
+            resource_display=current_user.username,
+            result="success",
+        )
+    )
+    await db.commit()
+    return MfaEnrolBeginResponse(
+        secret=secret,
+        otpauth_uri=otpauth_uri(secret, current_user.username),
+        recovery_codes=codes,
+    )
 
 
 # ── OIDC / SAML redirect flow ────────────────────────────────────────────────

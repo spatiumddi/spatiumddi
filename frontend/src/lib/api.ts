@@ -1564,10 +1564,28 @@ export const ipamIoApi = {
 };
 
 export interface LoginResponse {
-  access_token: string;
-  refresh_token: string;
+  // Set when MFA is NOT required — normal token issuance.
+  access_token: string | null;
+  refresh_token: string | null;
   token_type: string;
   force_password_change: boolean;
+  // Set when the user has TOTP enabled (issue #69). The frontend
+  // routes the operator into a TOTP prompt + posts to /auth/login/mfa
+  // with this challenge token + the second factor.
+  mfa_required?: boolean;
+  mfa_token?: string | null;
+}
+
+export interface MfaStatusResponse {
+  enabled: boolean;
+  enrolment_pending: boolean;
+  recovery_codes_remaining: number;
+}
+
+export interface MfaEnrolBeginResponse {
+  secret: string;
+  otpauth_uri: string;
+  recovery_codes: string[];
 }
 
 export interface AppUser {
@@ -3880,6 +3898,15 @@ export const authApi = {
     api
       .post<LoginResponse>("/auth/login", { username, password })
       .then((r) => r.data),
+  /** Complete a TOTP-gated login. Submit either ``code`` (6-digit
+   * authenticator) or ``recovery_code``; submitting both 422s. */
+  loginMfa: (
+    mfa_token: string,
+    body: { code?: string; recovery_code?: string },
+  ) =>
+    api
+      .post<LoginResponse>("/auth/login/mfa", { mfa_token, ...body })
+      .then((r) => r.data),
   publicProviders: () =>
     api.get<PublicAuthProvider[]>("/auth/providers").then((r) => r.data),
   logout: () => api.post("/auth/logout"),
@@ -3903,6 +3930,25 @@ export const authApi = {
         force_password_change: boolean;
         auth_source: string;
       }>("/auth/me")
+      .then((r) => r.data),
+
+  // ── MFA (issue #69) ─────────────────────────────────────────────────
+  mfaStatus: () =>
+    api.get<MfaStatusResponse>("/auth/mfa/status").then((r) => r.data),
+  mfaEnrollBegin: () =>
+    api
+      .post<MfaEnrolBeginResponse>("/auth/mfa/enroll/begin")
+      .then((r) => r.data),
+  mfaEnrollVerify: (code: string) =>
+    api.post("/auth/mfa/enroll/verify", { code }),
+  mfaDisable: (password: string, code: string) =>
+    api.post("/auth/mfa/disable", { password, code }),
+  mfaRegenerateRecoveryCodes: (password: string, code: string) =>
+    api
+      .post<MfaEnrolBeginResponse>("/auth/mfa/recovery-codes/regenerate", {
+        password,
+        code,
+      })
       .then((r) => r.data),
 };
 

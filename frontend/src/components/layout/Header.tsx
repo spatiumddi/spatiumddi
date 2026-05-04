@@ -1,7 +1,7 @@
 import { useAuth } from "@/hooks/useAuth";
 import { useTheme } from "@/hooks/useTheme";
-import { useNavigate } from "react-router-dom";
-import { LogOut, Menu, Moon, Sun } from "lucide-react";
+import { Link, useNavigate } from "react-router-dom";
+import { LogOut, Menu, Moon, Sun, UserCircle2 } from "lucide-react";
 import { GlobalSearch } from "@/components/GlobalSearch";
 
 export function Header({ onMobileMenu }: { onMobileMenu?: () => void }) {
@@ -28,6 +28,13 @@ export function Header({ onMobileMenu }: { onMobileMenu?: () => void }) {
       <div className="flex-1" />
       <GlobalSearch />
       <div className="flex items-center gap-1">
+        <Link
+          to="/account"
+          title="Account — password & two-factor"
+          className="rounded-md p-2 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+        >
+          <UserCircle2 className="h-4 w-4" />
+        </Link>
         <button
           onClick={toggleTheme}
           title={

@@ -222,17 +222,19 @@ All checkpoints checked + commit landed.
 
 ### Checkpoints
 
-- [ ] Add `pyotp` dependency
-- [ ] Migration: add `totp_secret_encrypted` / `mfa_enabled` / `recovery_codes_encrypted` to `user`
-- [ ] Model: extend `User` with the three columns
-- [ ] Service: `app/services/mfa.py` — generate secret, generate codes, hash codes, verify TOTP, consume recovery code
-- [ ] Router: `app/api/v1/auth/mfa.py` — enrol begin / verify / disable / regenerate
-- [ ] Auth: split login into password-step + mfa-step; mint short-lived `purpose: mfa` token
-- [ ] Frontend: Settings → Account MFA panel
-- [ ] Frontend: login page handles `mfa_required` redirect to TOTP input
-- [ ] Tests: enrol → verify → login flow; recovery-code consume; disable
-- [ ] `make ci` clean
-- [ ] Commit chain: `feat(security): #69 MFA — model + service`, `feat(security): #69 MFA — login flow`, `feat(security): #69 MFA — frontend`
+- [x] Add `pyotp` dependency
+- [x] Migration: drop unused `user.totp_secret` (String) + add `totp_secret_encrypted` / `recovery_codes_encrypted` (LargeBinary) — `c8a3f1e94d27_user_mfa`
+- [x] Model: extend `User` with the two new bytea columns; keep existing `totp_enabled`
+- [x] Service: `app/services/mfa.py` — generate secret, generate codes (10× ABCD-EF12), hash codes (sha256), verify TOTP (±1 step), consume recovery code, encrypt/decrypt secret
+- [x] Security: `create_mfa_challenge_token` / `decode_mfa_challenge_token` (5-minute JWT with `type=mfa`)
+- [x] Router: enrol/begin, enrol/verify, disable, recovery-codes/regenerate, status — all on `/api/v1/auth/mfa/*` behind the existing CurrentUser dep
+- [x] Auth: `/auth/login` returns `LoginResponse` shape; gates on `totp_enabled` and returns `mfa_required: true` + challenge token; `/auth/login/mfa` validates + issues real tokens; recovery codes consumed via the same endpoint
+- [x] Frontend: `/account` page with PasswordPanel + MfaPanel; QR code via `api.qrserver.com` + manual-secret fallback; recovery-code reveal panel with copy + acknowledgement gate; disable + regenerate flows behind password+TOTP reauth
+- [x] Frontend: `LoginPage` two-step state machine (password → MFA); supports both authenticator code and recovery code with toggle; expired-challenge auto-bounces back to password step
+- [x] Header: account icon links to `/account`
+- [x] Smoke test (script): enrol begin → verify → MFA-gated login → bad code 401 → good code 200 → recovery code 200 → status decrement → disable → plain login passes
+- [x] `make ci` clean
+- [x] Single commit `feat(security): #69 TOTP MFA for local users`
 
 ### Done when
 
