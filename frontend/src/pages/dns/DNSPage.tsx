@@ -1865,7 +1865,7 @@ function ZoneDetailView({
             ]
               .filter(Boolean)
               .join(", ")}
-            label="Ask AI about this zone"
+            tooltip="Ask AI about this zone"
           />
           {!isForward && (
             <HeaderButton

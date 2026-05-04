@@ -3753,7 +3753,7 @@ function SubnetDetail({
               ]
                 .filter(Boolean)
                 .join(", ")}
-              label="Ask AI about this subnet"
+              tooltip="Ask AI about this subnet"
             />
             <HeaderButton icon={Pencil} onClick={() => setShowEditSubnet(true)}>
               Edit

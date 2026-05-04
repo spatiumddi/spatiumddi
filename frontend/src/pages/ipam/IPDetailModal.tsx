@@ -218,7 +218,7 @@ export function IPDetailModal({
               ]
                 .filter(Boolean)
                 .join(", ")}
-              label="Ask AI about this IP"
+              tooltip="Ask AI about this IP"
             />
             <button
               type="button"
