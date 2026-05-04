@@ -125,16 +125,16 @@ All checkpoints checked + commit landed.
 
 ### Checkpoints
 
-- [ ] Migration: add `scopes` JSONB column to `api_token`
-- [ ] Model: add `scopes: list[str]` to `APIToken`
-- [ ] Service: define `TOKEN_SCOPE_VOCABULARY` + `scope_matches_request`
-- [ ] Auth: add `_check_token_scope` to the token-auth path
-- [ ] Schemas: `scopes` on Create / Response
-- [ ] Router: `POST /admin/api-tokens` accepts + persists scopes
-- [ ] Frontend: scope multi-select in create modal + chip column in list
-- [ ] Tests: scope-mismatch returns 401; empty-scopes falls through
-- [ ] `make ci` clean
-- [ ] Single commit `feat(security): #74 API-token scopes`
+- [x] Migration: add `scopes` JSONB column to `api_token` (`b6f1d4a82c97_api_token_scopes`)
+- [x] Model: add `scopes: list[str]` to `APIToken`
+- [x] Service: define `TOKEN_SCOPE_VOCABULARY` + `scope_matches_request` + `validate_scopes`
+- [x] Auth: scope enforcement in `_resolve_api_token` BEFORE RBAC (request-aware via `Request` dep)
+- [x] Schemas: `scopes` on Create / Update / Response with validator
+- [x] Router: `POST/PATCH /api-tokens` accepts + persists scopes; audit-log payload includes scopes
+- [x] Frontend: shared `API_TOKEN_SCOPES` vocabulary + scope multi-select in create modal + ScopeChips column in list
+- [x] Smoke-test: scope-mismatch returns 401 ("Token scope insufficient"); empty-scopes falls through to RBAC
+- [x] `make ci` clean
+- [x] Single commit `feat(security): #74 API-token scopes`
 
 ### Done when
 

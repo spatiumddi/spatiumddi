@@ -4100,12 +4100,58 @@ export const logsApi = {
 
 // ── API Tokens ────────────────────────────────────────────────────────────────
 
+/** Coarse-grained scope vocabulary — see issue #74 +
+ * `app/services/api_token_scopes.py`. Empty list = no scope
+ * restriction (token still inherits the owner's RBAC). Non-empty
+ * = enforced at the auth layer BEFORE RBAC. Multiple scopes
+ * union; ``read`` covers safe-method requests across the surface.
+ */
+export type ApiTokenScope =
+  | "read"
+  | "ipam:write"
+  | "dns:write"
+  | "dhcp:write"
+  | "agent";
+
+export const API_TOKEN_SCOPES: {
+  value: ApiTokenScope;
+  label: string;
+  hint: string;
+}[] = [
+  {
+    value: "read",
+    label: "Read-only",
+    hint: "GET / HEAD / OPTIONS only — no mutations anywhere.",
+  },
+  {
+    value: "ipam:write",
+    label: "IPAM write",
+    hint: "Mutate /ipam/*, /vlans*, /vrfs*, /network-devices*.",
+  },
+  {
+    value: "dns:write",
+    label: "DNS write",
+    hint: "Mutate /dns/* + /dns-pools*. Excludes the agent surface.",
+  },
+  {
+    value: "dhcp:write",
+    label: "DHCP write",
+    hint: "Mutate /dhcp/*. Excludes the agent surface.",
+  },
+  {
+    value: "agent",
+    label: "Agent",
+    hint: "Bootstrap + push for /dns/agents/* and /dhcp/agents/*.",
+  },
+];
+
 export interface ApiToken {
   id: string;
   name: string;
   description: string;
   prefix: string;
   scope: string;
+  scopes: ApiTokenScope[];
   user_id: string | null;
   expires_at: string | null;
   last_used_at: string | null;
@@ -4117,6 +4163,7 @@ export interface ApiTokenCreate {
   name: string;
   description?: string;
   expires_in_days?: number | null;
+  scopes?: ApiTokenScope[];
 }
 
 /** Response from POST — contains the raw token ONCE. */
@@ -4128,6 +4175,7 @@ export interface ApiTokenUpdate {
   name?: string;
   description?: string;
   is_active?: boolean;
+  scopes?: ApiTokenScope[];
 }
 
 export const apiTokensApi = {

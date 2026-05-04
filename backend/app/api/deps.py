@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from typing import Annotated
 
 import structlog
-from fastapi import Depends, HTTPException, Security, status
+from fastapi import Depends, HTTPException, Request, Security, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from jose import JWTError
 from sqlalchemy import select
@@ -13,6 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.security import decode_access_token, hash_api_token
 from app.db import get_db
 from app.models.auth import APIToken, User
+from app.services.api_token_scopes import scope_matches_request
 
 logger = structlog.get_logger(__name__)
 
@@ -24,7 +25,7 @@ _bearer = HTTPBearer(auto_error=False)
 _API_TOKEN_PREFIX = "sddi_"
 
 
-async def _resolve_api_token(db: AsyncSession, raw: str) -> User:
+async def _resolve_api_token(db: AsyncSession, raw: str, request: Request) -> User:
     """Validate an ``sddi_*`` bearer and return the owning user.
 
     Raises the same 401/403 pattern as JWT auth so callers can't
@@ -32,6 +33,11 @@ async def _resolve_api_token(db: AsyncSession, raw: str) -> User:
     Successful lookups also bump ``last_used_at`` so operators have a
     single column they can glance at to see which tokens are live
     vs. dead.
+
+    The ``request`` arg lets us enforce ``token.scopes`` BEFORE the
+    RBAC check downstream — see ``app.services.api_token_scopes``. A
+    "read-only" token can never reach a write handler, even if the
+    owner's RBAC would allow it.
     """
     token_hash = hash_api_token(raw)
     token = (
@@ -47,6 +53,15 @@ async def _resolve_api_token(db: AsyncSession, raw: str) -> User:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="API token has expired",
+        )
+    # Coarse-grained scope gate. Empty list = no restriction; the
+    # vocabulary check happens at create time so we can trust the
+    # stored values here.
+    scopes = list(token.scopes or [])
+    if scopes and not scope_matches_request(scopes, request.method, request.url.path):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Token scope insufficient for this request",
         )
     if token.user_id is None:
         # Scope "global" isn't wired through permissions yet — reject
@@ -71,6 +86,7 @@ async def _resolve_api_token(db: AsyncSession, raw: str) -> User:
 
 
 async def get_current_user(
+    request: Request,
     db: Annotated[AsyncSession, Depends(get_db)],
     credentials: Annotated[HTTPAuthorizationCredentials | None, Security(_bearer)],
 ) -> User:
@@ -91,7 +107,7 @@ async def get_current_user(
     # never try to JWT-decode one (which would just 401 on signature
     # mismatch anyway, but this is cleaner error messaging).
     if raw.startswith(_API_TOKEN_PREFIX):
-        return await _resolve_api_token(db, raw)
+        return await _resolve_api_token(db, raw, request)
 
     try:
         payload = decode_access_token(raw)

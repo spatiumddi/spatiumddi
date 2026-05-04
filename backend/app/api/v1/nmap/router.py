@@ -486,20 +486,22 @@ async def stamp_discovered(
 # ── SSE stream ──────────────────────────────────────────────────────
 
 
-async def _resolve_user_from_query_token(db: AsyncSession, token: str) -> User:
+async def _resolve_user_from_query_token(db: AsyncSession, token: str, request: Request) -> User:
     """Validate a JWT or API token passed as a query parameter.
 
     EventSource can't set ``Authorization`` headers, so the SSE
     endpoint accepts ``?token=<...>``. We re-implement the relevant
     branches of :func:`app.api.deps.get_current_user` here rather
     than reach into Security() — that dep is wired to the Bearer
-    extractor which won't see a query arg.
+    extractor which won't see a query arg. ``request`` is forwarded
+    into ``_resolve_api_token`` so the scope guard (issue #74) can
+    inspect the SSE endpoint's path before allowing the connection.
     """
     if token.startswith("sddi_"):
         # API tokens — re-use the deps helper.
         from app.api.deps import _resolve_api_token  # noqa: PLC0415
 
-        return await _resolve_api_token(db, token)
+        return await _resolve_api_token(db, token, request)
 
     try:
         payload = decode_access_token(token)
@@ -518,7 +520,7 @@ async def _resolve_user_from_query_token(db: AsyncSession, token: str) -> User:
 @router.get("/scans/{scan_id}/stream")
 async def stream_scan(
     scan_id: uuid.UUID,
-    request: Request,  # noqa: ARG001 — required so FastAPI doesn't auto-resolve as body
+    request: Request,
     token: Annotated[str, Query(...)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> StreamingResponse:
@@ -529,7 +531,7 @@ async def stream_scan(
     nmap stdout. On terminal status we emit one final
     ``event: done`` frame and close.
     """
-    user = await _resolve_user_from_query_token(db, token)
+    user = await _resolve_user_from_query_token(db, token, request)
     if not user_has_permission(user, "read", PERMISSION):
         raise HTTPException(status_code=403, detail="Permission denied")
 

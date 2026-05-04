@@ -1,7 +1,13 @@
 import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Copy, Eye, EyeOff, Plus, Power, PowerOff, Trash2 } from "lucide-react";
-import { apiTokensApi, type ApiToken, type ApiTokenCreated } from "@/lib/api";
+import {
+  apiTokensApi,
+  API_TOKEN_SCOPES,
+  type ApiToken,
+  type ApiTokenCreated,
+  type ApiTokenScope,
+} from "@/lib/api";
 import { copyToClipboard } from "@/lib/clipboard";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
@@ -46,6 +52,7 @@ function CreateTokenModal({
   // slightly annoying on purpose.
   const [expiryMode, setExpiryMode] = useState<"days" | "never">("days");
   const [days, setDays] = useState<number>(90);
+  const [scopes, setScopes] = useState<ApiTokenScope[]>([]);
   const [error, setError] = useState<string | null>(null);
 
   const mut = useMutation({
@@ -54,6 +61,7 @@ function CreateTokenModal({
         name,
         description,
         expires_in_days: expiryMode === "never" ? null : days,
+        scopes,
       }),
     onSuccess: (token) => {
       qc.invalidateQueries({ queryKey: ["api-tokens"] });
@@ -134,6 +142,36 @@ function CreateTokenModal({
               />
               Never
             </label>
+          </div>
+        </Field>
+        <Field
+          label="Scopes (optional)"
+          hint="Leave empty to inherit the owner's full RBAC. Pick one or more to restrict — multiple scopes union (any match passes)."
+        >
+          <div className="space-y-1.5">
+            {API_TOKEN_SCOPES.map((s) => (
+              <label
+                key={s.value}
+                className="flex items-start gap-2 text-xs cursor-pointer select-none"
+              >
+                <input
+                  type="checkbox"
+                  className="mt-0.5 h-3.5 w-3.5"
+                  checked={scopes.includes(s.value)}
+                  onChange={(e) => {
+                    setScopes((prev) =>
+                      e.target.checked
+                        ? [...prev, s.value]
+                        : prev.filter((x) => x !== s.value),
+                    );
+                  }}
+                />
+                <span>
+                  <span className="font-medium">{s.label}</span>
+                  <span className="text-muted-foreground"> — {s.hint}</span>
+                </span>
+              </label>
+            ))}
           </div>
         </Field>
         {error && (
@@ -311,6 +349,7 @@ export function ApiTokensPage() {
                 <tr>
                   <th className="px-3 py-2">Name</th>
                   <th className="px-3 py-2">Prefix</th>
+                  <th className="px-3 py-2">Scopes</th>
                   <th className="px-3 py-2">Expires</th>
                   <th className="px-3 py-2">Last Used</th>
                   <th className="px-3 py-2">Status</th>
@@ -332,6 +371,9 @@ export function ApiTokensPage() {
                       )}
                     </td>
                     <td className="px-3 py-2 font-mono text-xs">{t.prefix}…</td>
+                    <td className="px-3 py-2">
+                      <ScopeChips scopes={t.scopes} />
+                    </td>
                     <td className="px-3 py-2 text-xs">
                       {t.expires_at ? (
                         <ExpiryCell iso={t.expires_at} />
@@ -434,6 +476,38 @@ export function ApiTokensPage() {
           </Modal>
         )}
       </div>
+    </div>
+  );
+}
+
+function ScopeChips({ scopes }: { scopes: ApiTokenScope[] | undefined }) {
+  // Empty list = no restriction; render an explicit "full access"
+  // hint rather than blank so operators can tell the difference
+  // between "scopes weren't loaded" and "no scope restriction".
+  if (!scopes || scopes.length === 0) {
+    return (
+      <span
+        className="inline-flex items-center rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground"
+        title="No scope restriction — token inherits the owner's full RBAC."
+      >
+        full
+      </span>
+    );
+  }
+  return (
+    <div className="flex flex-wrap gap-1">
+      {scopes.map((s) => {
+        const meta = API_TOKEN_SCOPES.find((m) => m.value === s);
+        return (
+          <span
+            key={s}
+            className="inline-flex items-center rounded bg-primary/10 px-1.5 py-0.5 font-mono text-[10px] text-primary"
+            title={meta?.hint ?? s}
+          >
+            {s}
+          </span>
+        );
+      })}
     </div>
   );
 }
