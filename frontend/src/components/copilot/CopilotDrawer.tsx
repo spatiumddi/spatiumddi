@@ -286,7 +286,9 @@ export function CopilotDrawer({ onClose }: { onClose: () => void }) {
 
         {/* Message stream */}
         <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 py-4">
-          {!activeSessionId && !sendMut.isPending && <EmptyState />}
+          {!activeSessionId && !sendMut.isPending && (
+            <EmptyState onPick={(q) => sendMut.mutate(q)} />
+          )}
           {messages.map((m) => (
             <MessageBubble key={m.id} message={m} />
           ))}
@@ -327,7 +329,7 @@ export function CopilotDrawer({ onClose }: { onClose: () => void }) {
   );
 }
 
-function EmptyState() {
+function EmptyState({ onPick }: { onPick: (text: string) => void }) {
   const examples = [
     "How many subnets do I have?",
     "Find the IP 192.168.0.1",
@@ -343,15 +345,18 @@ function EmptyState() {
       </p>
       <p className="mt-1 text-xs text-muted-foreground">
         Read-only for now — questions about IPAM, DNS, DHCP, alerts, audit logs.
+        Click an example to try it, or type your own.
       </p>
       <div className="mt-4 space-y-1.5">
         {examples.map((q) => (
-          <div
+          <button
             key={q}
-            className="rounded-md border bg-muted/30 px-3 py-1.5 text-left text-xs text-muted-foreground"
+            type="button"
+            onClick={() => onPick(q)}
+            className="block w-full rounded-md border bg-muted/30 px-3 py-1.5 text-left text-xs text-muted-foreground transition-colors hover:border-primary/40 hover:bg-primary/5 hover:text-foreground"
           >
             {q}
-          </div>
+          </button>
         ))}
       </div>
     </div>
