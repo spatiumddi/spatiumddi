@@ -35,6 +35,7 @@ const RESOURCE_TYPES = [
   "role",
   "auth_provider",
   "custom_field",
+  "manage_ipam_templates",
   "settings",
   "api_token",
 ] as const;

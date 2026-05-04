@@ -298,6 +298,16 @@ class IPBlock(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
         index=True,
     )
 
+    # Back-reference to the IPAMTemplate (issue #26) that stamped this
+    # block, if any. Lets a "reapply to all instances" sweep find every
+    # block touched by a given template. SET NULL on template delete —
+    # we don't want a template removal to take blocks with it.
+    applied_template_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("ipam_template.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
     space: Mapped[IPSpace] = relationship("IPSpace", back_populates="blocks")
     parent: Mapped["IPBlock | None"] = relationship("IPBlock", remote_side="IPBlock.id")
     children: Mapped[list["IPBlock"]] = relationship("IPBlock", back_populates="parent")
@@ -543,6 +553,14 @@ class Subnet(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
 
     custom_fields: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     tags: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+
+    # Back-reference to the IPAMTemplate (issue #26) that stamped this
+    # subnet, if any. SET NULL on template delete.
+    applied_template_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("ipam_template.id", ondelete="SET NULL"),
+        nullable=True,
+    )
 
     space: Mapped[IPSpace] = relationship("IPSpace", back_populates="subnets")
     block: Mapped[IPBlock | None] = relationship("IPBlock", back_populates="subnets")
@@ -921,3 +939,74 @@ class SubnetPlan(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     )
 
     space: Mapped["IPSpace"] = relationship("IPSpace")
+
+
+class IPAMTemplate(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """Reusable stamp template for IPBlocks or Subnets (issue #26).
+
+    Carries default tags, custom-field values, DNS / DHCP group
+    assignments, and DDNS settings. ``applies_to`` locks each row to
+    one carrier ('block' or 'subnet') — same template can't stamp
+    both because the apply-time semantics (child_layout, DDNS
+    inheritance gate, etc.) diverge.
+
+    Templates STAMP at apply time. Inheritance LOOKS UP at read
+    time. Re-apply is the operator-driven way to refresh stamp
+    values after a template edit.
+    """
+
+    __tablename__ = "ipam_template"
+    __table_args__ = (UniqueConstraint("name", name="uq_ipam_template_name"),)
+
+    name: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    # 'block' | 'subnet' — enforced by CHECK constraint at the DB
+    # layer + Pydantic at the API layer.
+    applies_to: Mapped[str] = mapped_column(String(16), nullable=False, index=True)
+
+    tags: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    custom_fields: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+
+    dns_group_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dns_server_group.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    # Stored as text since the rest of the IPAM tree treats DNS zone
+    # IDs as opaque strings — see ``Subnet.dns_zone_id``.
+    dns_zone_id: Mapped[str | None] = mapped_column(Text, nullable=True)
+    dns_additional_zone_ids: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
+
+    dhcp_group_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dhcp_server_group.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
+    # DDNS settings stamped onto the carrier on apply. Note we
+    # deliberately do NOT mirror ``ddns_inherit_settings`` — a
+    # template's whole point is to lock in a config, not to inherit
+    # upstream. Apply always sets ``ddns_inherit_settings=False`` on
+    # the target when any of these four fields are non-null.
+    ddns_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
+    ddns_hostname_policy: Mapped[str] = mapped_column(
+        String(30),
+        nullable=False,
+        default="client_or_generated",
+        server_default=sa_text("'client_or_generated'"),
+    )
+    ddns_domain_override: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    ddns_ttl: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    # Optional sub-subnet layout. Only valid when applies_to='block'.
+    # Schema:
+    #   {"children": [
+    #       {"prefix": int, "name_template": str,
+    #        "description"?: str, "tags"?: dict, "custom_fields"?: dict}
+    #   ]}
+    # Children are carved with the standard split logic on apply;
+    # name_template supports the same {n} / {oct1}–{oct4} tokens as
+    # bulk-allocate.
+    child_layout: Mapped[dict | None] = mapped_column(JSONB, nullable=True)

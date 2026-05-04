@@ -234,6 +234,7 @@ export interface IPBlock {
   ddns_inherit_settings?: boolean;
   vrf_id?: string | null;
   asn_id?: string | null;
+  applied_template_id?: string | null;
   created_at?: string;
   modified_at?: string;
 }
@@ -499,6 +500,7 @@ export interface Subnet {
   internet_facing?: boolean;
   dns_servers?: string[] | null;
   domain_name?: string | null;
+  applied_template_id?: string | null;
   created_at?: string;
   modified_at?: string;
 }
@@ -969,6 +971,107 @@ export interface BulkAllocateCommitResponse {
   summary: string[];
 }
 
+// ── IPAM Templates (issue #26) ────────────────────────────────────────
+
+export type IPAMTemplateAppliesTo = "block" | "subnet";
+
+export interface IPAMTemplateChildLayoutEntry {
+  prefix: number;
+  name_template: string;
+  description?: string;
+  tags?: Record<string, unknown>;
+  custom_fields?: Record<string, unknown>;
+}
+
+export interface IPAMTemplateChildLayout {
+  children: IPAMTemplateChildLayoutEntry[];
+}
+
+export interface IPAMTemplate {
+  id: string;
+  name: string;
+  description: string;
+  applies_to: IPAMTemplateAppliesTo;
+  tags: Record<string, unknown>;
+  custom_fields: Record<string, unknown>;
+  dns_group_id: string | null;
+  dns_zone_id: string | null;
+  dns_additional_zone_ids: string[] | null;
+  dhcp_group_id: string | null;
+  ddns_enabled: boolean;
+  ddns_hostname_policy: DdnsHostnamePolicy;
+  ddns_domain_override: string | null;
+  ddns_ttl: number | null;
+  child_layout: IPAMTemplateChildLayout | null;
+  applied_count: number;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface IPAMTemplateCreate {
+  name: string;
+  description?: string;
+  applies_to: IPAMTemplateAppliesTo;
+  tags?: Record<string, unknown>;
+  custom_fields?: Record<string, unknown>;
+  dns_group_id?: string | null;
+  dns_zone_id?: string | null;
+  dns_additional_zone_ids?: string[];
+  dhcp_group_id?: string | null;
+  ddns_enabled?: boolean;
+  ddns_hostname_policy?: DdnsHostnamePolicy;
+  ddns_domain_override?: string | null;
+  ddns_ttl?: number | null;
+  child_layout?: IPAMTemplateChildLayout | null;
+}
+
+export interface IPAMTemplateUpdate {
+  name?: string;
+  description?: string;
+  tags?: Record<string, unknown>;
+  custom_fields?: Record<string, unknown>;
+  dns_group_id?: string | null;
+  dns_zone_id?: string | null;
+  dns_additional_zone_ids?: string[] | null;
+  dhcp_group_id?: string | null;
+  ddns_enabled?: boolean;
+  ddns_hostname_policy?: DdnsHostnamePolicy;
+  ddns_domain_override?: string | null;
+  ddns_ttl?: number | null;
+  child_layout?: IPAMTemplateChildLayout | null;
+  clear_dns_group_id?: boolean;
+  clear_dhcp_group_id?: boolean;
+  clear_dns_zone_id?: boolean;
+  clear_dns_additional_zone_ids?: boolean;
+  clear_child_layout?: boolean;
+  clear_ddns_domain_override?: boolean;
+  clear_ddns_ttl?: boolean;
+}
+
+export interface TemplateApplyRequest {
+  block_id?: string;
+  subnet_id?: string;
+  force?: boolean;
+  carve_children?: boolean;
+}
+
+export interface TemplateApplyResponse {
+  template_id: string;
+  target_kind: "block" | "subnet";
+  target_id: string;
+  fields_written: string[];
+  children_carved: { cidr: string; name: string; skipped: boolean }[];
+}
+
+export interface TemplateReapplyAllResponse {
+  template_id: string;
+  target_kind: "block" | "subnet";
+  instances_total: number;
+  instances_processed: number;
+  instances_skipped: number;
+  cap_reached: boolean;
+}
+
 export const ipamApi = {
   listSpaces: () => api.get<IPSpace[]>("/ipam/spaces").then((r) => r.data),
   getSpace: (id: string) =>
@@ -985,7 +1088,7 @@ export const ipamApi = {
         IPBlock[]
       >("/ipam/blocks", { params: spaceId ? { space_id: spaceId } : undefined })
       .then((r) => r.data),
-  createBlock: (data: Partial<IPBlock>) =>
+  createBlock: (data: Partial<IPBlock> & { template_id?: string | null }) =>
     api.post<IPBlock>("/ipam/blocks", data).then((r) => r.data),
   updateBlock: (
     id: string,
@@ -1094,7 +1197,7 @@ export const ipamApi = {
   }) => api.get<Subnet[]>("/ipam/subnets", { params }).then((r) => r.data),
   getSubnet: (id: string) =>
     api.get<Subnet>(`/ipam/subnets/${id}`).then((r) => r.data),
-  createSubnet: (data: Partial<Subnet>) =>
+  createSubnet: (data: Partial<Subnet> & { template_id?: string | null }) =>
     api.post<Subnet>("/ipam/subnets", data).then((r) => r.data),
   updateSubnet: (
     id: string,
@@ -1472,6 +1575,29 @@ export const ipamApi = {
         subnet_ids,
         changes,
       })
+      .then((r) => r.data),
+
+  // ── IPAM templates (issue #26) ────────────────────────────────────
+  listTemplates: (params?: {
+    applies_to?: IPAMTemplateAppliesTo;
+    search?: string;
+  }) =>
+    api.get<IPAMTemplate[]>("/ipam/templates", { params }).then((r) => r.data),
+  getTemplate: (id: string) =>
+    api.get<IPAMTemplate>(`/ipam/templates/${id}`).then((r) => r.data),
+  createTemplate: (body: IPAMTemplateCreate) =>
+    api.post<IPAMTemplate>("/ipam/templates", body).then((r) => r.data),
+  updateTemplate: (id: string, body: IPAMTemplateUpdate) =>
+    api.put<IPAMTemplate>(`/ipam/templates/${id}`, body).then((r) => r.data),
+  deleteTemplate: (id: string) =>
+    api.delete<void>(`/ipam/templates/${id}`).then((r) => r.data),
+  applyTemplate: (id: string, body: TemplateApplyRequest) =>
+    api
+      .post<TemplateApplyResponse>(`/ipam/templates/${id}/apply`, body)
+      .then((r) => r.data),
+  reapplyAllTemplate: (id: string) =>
+    api
+      .post<TemplateReapplyAllResponse>(`/ipam/templates/${id}/reapply-all`, {})
       .then((r) => r.data),
 };
 
