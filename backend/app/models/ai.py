@@ -10,8 +10,20 @@ live under ``app/drivers/llm/`` and are looked up via the registry
 
 from __future__ import annotations
 
-from sqlalchemy import Boolean, Integer, LargeBinary, String, UniqueConstraint
-from sqlalchemy.dialects.postgresql import JSONB
+import uuid
+from datetime import datetime
+
+from sqlalchemy import (
+    Boolean,
+    DateTime,
+    ForeignKey,
+    Integer,
+    LargeBinary,
+    String,
+    Text,
+    UniqueConstraint,
+)
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
@@ -61,3 +73,66 @@ class AIProvider(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # streaming-options overrides, etc. Drivers consume what they
     # recognize and ignore the rest.
     options: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+
+
+CHAT_ROLES: tuple[str, ...] = ("system", "user", "assistant", "tool")
+
+
+class AIChatSession(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """One Operator Copilot conversation. Messages live on
+    :class:`AIChatMessage` linked by ``session_id``.
+
+    Provider + model + system prompt are *snapshotted* on the session
+    so a later edit of the global config doesn't retroactively change
+    how this conversation was answered.
+    """
+
+    __tablename__ = "ai_chat_session"
+
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("user.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    name: Mapped[str] = mapped_column(String(255), nullable=False, default="Untitled")
+    provider_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("ai_provider.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    model: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    system_prompt: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    archived_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class AIChatMessage(UUIDPrimaryKeyMixin, Base):
+    """One message in an :class:`AIChatSession`. Append-only — operators
+    edit by starting a new session, not by mutating history.
+
+    ``role`` mirrors the OpenAI chat schema. ``tool_calls`` is set on
+    assistant messages that requested tool execution; the response
+    arrives as one or more ``role=tool`` messages whose
+    ``tool_call_id`` matches.
+    """
+
+    __tablename__ = "ai_chat_message"
+
+    session_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("ai_chat_session.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    role: Mapped[str] = mapped_column(String(20), nullable=False)
+    content: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    # Shape: [{"id": str, "name": str, "arguments": str-as-json}, ...]
+    tool_calls: Mapped[list[dict] | None] = mapped_column(JSONB, nullable=True)
+    tool_call_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    name: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    # Per-message observability — populated when this message comes from
+    # the LLM. Wave 4 fills these in via the rate sheet.
+    tokens_in: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    tokens_out: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=datetime.utcnow
+    )
