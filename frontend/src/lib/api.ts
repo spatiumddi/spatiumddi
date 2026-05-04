@@ -2427,7 +2427,138 @@ export const aiApi = {
     api
       .get<{ models: AIModelInfo[] }>(`/ai/providers/${id}/models`)
       .then((r) => r.data.models),
+
+  // ── Chat sessions (Wave 3) ───────────────────────────────────────
+  listSessions: (includeArchived = false) =>
+    api
+      .get<AIChatSessionSummary[]>("/ai/sessions", {
+        params: { include_archived: includeArchived },
+      })
+      .then((r) => r.data),
+  getSession: (id: string) =>
+    api.get<AIChatSessionDetail>(`/ai/sessions/${id}`).then((r) => r.data),
+  updateSession: (id: string, body: { name?: string; archived?: boolean }) =>
+    api
+      .put<AIChatSessionSummary>(`/ai/sessions/${id}`, body)
+      .then((r) => r.data),
+  deleteSession: (id: string) =>
+    api.delete<void>(`/ai/sessions/${id}`).then((r) => r.data),
+  // Catalog of registered tools (admin-only). Wave 3 surface uses this
+  // for the "what can the copilot do?" panel inside the chat drawer.
+  listTools: () =>
+    api
+      .get<{ tools: AIToolEntry[]; total: number }>("/ai/tools")
+      .then((r) => r.data),
 };
+
+// ── AI chat types ────────────────────────────────────────────────────
+
+export type AIChatRole = "system" | "user" | "assistant" | "tool";
+
+export interface AIChatToolCall {
+  id: string;
+  name: string;
+  arguments: string;
+}
+
+export interface AIChatMessage {
+  id: string;
+  role: AIChatRole;
+  content: string;
+  tool_calls: AIChatToolCall[] | null;
+  tool_call_id: string | null;
+  name: string | null;
+  tokens_in: number | null;
+  tokens_out: number | null;
+  latency_ms: number | null;
+  created_at: string;
+}
+
+export interface AIChatSessionSummary {
+  id: string;
+  name: string;
+  provider_id: string | null;
+  model: string;
+  archived_at: string | null;
+  created_at: string;
+  modified_at: string;
+  message_count: number;
+}
+
+export interface AIChatSessionDetail extends AIChatSessionSummary {
+  system_prompt: string;
+  messages: AIChatMessage[];
+}
+
+export interface AIToolEntry {
+  name: string;
+  description: string;
+  category: string;
+  writes: boolean;
+  parameters_schema: Record<string, unknown>;
+}
+
+/**
+ * Stream a chat turn. Uses ``fetch`` rather than ``EventSource`` because
+ * EventSource doesn't support custom headers (Authorization). Yields one
+ * parsed SSE event at a time. Cancel via the ``AbortSignal``.
+ */
+export async function* streamChatTurn(
+  body: {
+    message: string;
+    session_id?: string;
+    provider_id?: string;
+    model?: string;
+  },
+  signal?: AbortSignal,
+): AsyncIterable<{ event: string; data: Record<string, unknown> }> {
+  const token = localStorage.getItem("access_token");
+  const res = await fetch("/api/v1/ai/chat", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      Accept: "text/event-stream",
+    },
+    body: JSON.stringify(body),
+    signal,
+  });
+  if (!res.ok || !res.body) {
+    let detail = "";
+    try {
+      detail = (await res.json())?.detail ?? "";
+    } catch {
+      detail = await res.text();
+    }
+    throw new Error(`chat request failed (${res.status}): ${detail}`);
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    // SSE frames are separated by blank lines.
+    const frames = buffer.split("\n\n");
+    buffer = frames.pop() ?? "";
+    for (const frame of frames) {
+      if (!frame.trim()) continue;
+      let event = "message";
+      let data = "";
+      for (const line of frame.split("\n")) {
+        if (line.startsWith("event: ")) event = line.slice(7).trim();
+        else if (line.startsWith("data: ")) data += line.slice(6);
+      }
+      if (!data) continue;
+      try {
+        yield { event, data: JSON.parse(data) };
+      } catch {
+        // Skip malformed frames silently — keep the stream alive.
+      }
+    }
+  }
+}
 
 // ── Custom Fields ──────────────────────────────────────────────────────────────
 
