@@ -86,6 +86,7 @@ const adminIdentityNav = [
 // into three sub-groups rendered with small non-collapsible labels.
 const adminConfigurationNav = [
   { label: "AI Providers", icon: Sparkles, to: "/admin/ai/providers" },
+  { label: "AI Prompts", icon: Sparkles, to: "/admin/ai/prompts" },
   { label: "Custom Fields", icon: Tags, to: "/admin/custom-fields" },
   {
     label: "IPAM Templates",

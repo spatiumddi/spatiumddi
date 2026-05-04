@@ -2458,6 +2458,17 @@ export const aiApi = {
   // ── Usage observability (Wave 4) ────────────────────────────────
   myUsage: () => api.get<AIUsageSnapshot>("/ai/usage/me").then((r) => r.data),
   adminUsage: () => api.get<AIAdminUsage>("/ai/usage").then((r) => r.data),
+
+  // ── Prompt library (Phase 2) ────────────────────────────────────
+  listPrompts: () => api.get<AIPrompt[]>("/ai/prompts").then((r) => r.data),
+  getPrompt: (id: string) =>
+    api.get<AIPrompt>(`/ai/prompts/${id}`).then((r) => r.data),
+  createPrompt: (body: AIPromptCreate) =>
+    api.post<AIPrompt>("/ai/prompts", body).then((r) => r.data),
+  updatePrompt: (id: string, body: AIPromptUpdate) =>
+    api.put<AIPrompt>(`/ai/prompts/${id}`, body).then((r) => r.data),
+  deletePrompt: (id: string) =>
+    api.delete<void>(`/ai/prompts/${id}`).then((r) => r.data),
 };
 
 // ── AI usage observability types ─────────────────────────────────────
@@ -2486,6 +2497,34 @@ export interface AIAdminUsage {
   last_7d: AIUsageSnapshot;
   last_30d: AIUsageSnapshot;
   top_users_today: AIAdminUsageTopUser[];
+}
+
+// ── AI prompts library types (Phase 2) ───────────────────────────────
+
+export interface AIPrompt {
+  id: string;
+  name: string;
+  description: string;
+  prompt_text: string;
+  is_shared: boolean;
+  created_by_user_id: string | null;
+  created_at: string;
+  modified_at: string;
+  is_owner: boolean;
+}
+
+export interface AIPromptCreate {
+  name: string;
+  description?: string;
+  prompt_text: string;
+  is_shared?: boolean;
+}
+
+export interface AIPromptUpdate {
+  name?: string;
+  description?: string;
+  prompt_text?: string;
+  is_shared?: boolean;
 }
 
 // ── AI chat types ────────────────────────────────────────────────────

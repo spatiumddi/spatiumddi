@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Archive,
+  BookOpen,
   Loader2,
   MessageSquarePlus,
   Pencil,
@@ -16,6 +17,7 @@ import {
   streamChatTurn,
   type AIChatMessage,
   type AIChatSessionSummary,
+  type AIPrompt,
 } from "@/lib/api";
 
 /**
@@ -686,7 +688,18 @@ function ChatComposer({
   isStreaming: boolean;
 }) {
   const [text, setText] = useState("");
+  const [showPrompts, setShowPrompts] = useState(false);
   const taRef = useRef<HTMLTextAreaElement | null>(null);
+
+  // Pull the prompt library lazily — only fires when the operator
+  // clicks the "Prompts ▾" button to open the picker.
+  const promptsQ = useQuery({
+    queryKey: ["ai-prompts"],
+    queryFn: aiApi.listPrompts,
+    enabled: showPrompts,
+    staleTime: 60_000,
+  });
+
   function submit() {
     const trimmed = text.trim();
     if (!trimmed || disabled) return;
@@ -694,46 +707,183 @@ function ChatComposer({
     setText("");
     taRef.current?.focus();
   }
+
+  function loadPrompt(p: AIPrompt) {
+    setText(p.prompt_text);
+    setShowPrompts(false);
+    // Defer focus until after the popover unmounts so React's
+    // synchronous reconciliation doesn't steal it back.
+    setTimeout(() => taRef.current?.focus(), 0);
+  }
+
   return (
     <form
-      className="flex gap-2 border-t p-3"
+      className="relative flex flex-col gap-1.5 border-t p-3"
       onSubmit={(e) => {
         e.preventDefault();
         submit();
       }}
     >
-      <textarea
-        ref={taRef}
-        value={text}
-        onChange={(e) => setText(e.target.value)}
-        onKeyDown={(e) => {
-          if (e.key === "Enter" && !e.shiftKey) {
-            e.preventDefault();
-            submit();
-          }
-        }}
-        rows={2}
-        placeholder="Ask about IPAM / DNS / DHCP / alerts / audit log…"
-        className="flex-1 resize-none rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
-      />
-      {isStreaming ? (
+      <div className="flex gap-2">
+        <textarea
+          ref={taRef}
+          value={text}
+          onChange={(e) => setText(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && !e.shiftKey) {
+              e.preventDefault();
+              submit();
+            }
+          }}
+          rows={2}
+          placeholder="Ask about IPAM / DNS / DHCP / alerts / audit log…"
+          className="flex-1 resize-none rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+        />
+        {isStreaming ? (
+          <button
+            type="button"
+            onClick={onCancel}
+            className="self-end rounded-md border px-3 py-1.5 text-sm text-muted-foreground hover:bg-accent"
+          >
+            Stop
+          </button>
+        ) : (
+          <button
+            type="submit"
+            disabled={!text.trim() || disabled}
+            className="self-end rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+          >
+            <Send className="h-3.5 w-3.5" />
+          </button>
+        )}
+      </div>
+      <div className="flex items-center justify-between">
         <button
           type="button"
-          onClick={onCancel}
-          className="self-end rounded-md border px-3 py-1.5 text-sm text-muted-foreground hover:bg-accent"
+          onClick={() => setShowPrompts((v) => !v)}
+          className="inline-flex items-center gap-1 rounded-md border px-2 py-0.5 text-xs text-muted-foreground hover:bg-accent"
+          title="Load a saved prompt"
         >
-          Stop
+          <BookOpen className="h-3 w-3" />
+          Prompts ▾
         </button>
-      ) : (
-        <button
-          type="submit"
-          disabled={!text.trim() || disabled}
-          className="self-end rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
-        >
-          <Send className="h-3.5 w-3.5" />
-        </button>
+        <span className="text-[11px] text-muted-foreground/60">
+          Enter to send · Shift+Enter for newline
+        </span>
+      </div>
+      {showPrompts && (
+        <PromptsPopover
+          prompts={promptsQ.data ?? []}
+          isLoading={promptsQ.isLoading}
+          onClose={() => setShowPrompts(false)}
+          onPick={loadPrompt}
+        />
       )}
     </form>
+  );
+}
+
+/** Inline popover anchored above the prompts button. Closes on click
+ *  outside or Escape. Two sections — shared prompts (curated) and the
+ *  user's own private prompts.
+ */
+function PromptsPopover({
+  prompts,
+  isLoading,
+  onClose,
+  onPick,
+}: {
+  prompts: AIPrompt[];
+  isLoading: boolean;
+  onClose: () => void;
+  onPick: (p: AIPrompt) => void;
+}) {
+  const ref = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    function onDocClick(e: MouseEvent) {
+      if (ref.current && !ref.current.contains(e.target as Node)) {
+        onClose();
+      }
+    }
+    function onEsc(e: KeyboardEvent) {
+      if (e.key === "Escape") onClose();
+    }
+    document.addEventListener("mousedown", onDocClick);
+    document.addEventListener("keydown", onEsc);
+    return () => {
+      document.removeEventListener("mousedown", onDocClick);
+      document.removeEventListener("keydown", onEsc);
+    };
+  }, [onClose]);
+
+  const shared = prompts.filter((p) => p.is_shared);
+  const mine = prompts.filter((p) => !p.is_shared);
+
+  return (
+    <div
+      ref={ref}
+      className="absolute bottom-[calc(100%-0.25rem)] left-3 z-50 max-h-72 w-80 overflow-auto rounded-md border bg-popover p-1 shadow-lg"
+    >
+      {isLoading ? (
+        <div className="px-3 py-4 text-center text-xs text-muted-foreground">
+          Loading…
+        </div>
+      ) : prompts.length === 0 ? (
+        <div className="px-3 py-4 text-center text-xs text-muted-foreground">
+          No saved prompts. Curate them at{" "}
+          <a className="underline" href="/admin/ai/prompts">
+            Admin → AI Prompts
+          </a>
+          .
+        </div>
+      ) : (
+        <>
+          {shared.length > 0 && (
+            <div>
+              <div className="px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+                Shared
+              </div>
+              {shared.map((p) => (
+                <PromptRow key={p.id} prompt={p} onPick={onPick} />
+              ))}
+            </div>
+          )}
+          {mine.length > 0 && (
+            <div>
+              <div className="px-2 py-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
+                Your prompts
+              </div>
+              {mine.map((p) => (
+                <PromptRow key={p.id} prompt={p} onPick={onPick} />
+              ))}
+            </div>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+function PromptRow({
+  prompt,
+  onPick,
+}: {
+  prompt: AIPrompt;
+  onPick: (p: AIPrompt) => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={() => onPick(prompt)}
+      className="block w-full rounded px-2 py-1.5 text-left text-xs hover:bg-accent"
+    >
+      <div className="font-medium">{prompt.name}</div>
+      {prompt.description && (
+        <div className="mt-0.5 text-[11px] text-muted-foreground line-clamp-2">
+          {prompt.description}
+        </div>
+      )}
+    </button>
   );
 }
 

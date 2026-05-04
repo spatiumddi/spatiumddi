@@ -141,3 +141,33 @@ class AIChatMessage(UUIDPrimaryKeyMixin, Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=datetime.utcnow
     )
+
+
+class AIPrompt(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """A reusable prompt the operator can load into the chat drawer.
+
+    Two visibility modes (selected via ``is_shared``):
+
+    * **Shared** — visible to every user with chat access. Curated by
+      superadmins so triage runbooks ("audit trail review",
+      "identify orphan IPs in /24") are one click away for everyone.
+      Names must be globally unique across shared rows.
+    * **Private** — visible only to ``created_by_user_id``. Lets a
+      power user keep half-finished or personal prompts without
+      polluting the shared list. Names must be unique per-user.
+
+    Both modes live in the same row type to keep the picker query
+    simple — one ``WHERE is_shared OR created_by = me`` predicate.
+    """
+
+    __tablename__ = "ai_prompt"
+
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    prompt_text: Mapped[str] = mapped_column(Text, nullable=False)
+    is_shared: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("user.id", ondelete="SET NULL"),
+        nullable=True,
+    )
