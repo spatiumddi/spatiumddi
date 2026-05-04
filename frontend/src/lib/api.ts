@@ -2346,9 +2346,13 @@ export const AI_PROVIDER_KIND_SHORT: Record<AIProviderKind, string> = {
   azure_openai: "Azure OpenAI",
 };
 
-// Wave 1 ships only openai_compat. Other kinds appear in the dropdown
-// but the backend rejects them until the matching driver lands.
-export const AI_PROVIDER_KIND_AVAILABLE: AIProviderKind[] = ["openai_compat"];
+// Drivers currently shipping. Anthropic landed in Phase 2; google /
+// azure_openai still pending — they're in the kind enum on the
+// backend but the registry rejects them until the driver registers.
+export const AI_PROVIDER_KIND_AVAILABLE: AIProviderKind[] = [
+  "openai_compat",
+  "anthropic",
+];
 
 export interface AIProvider {
   id: string;

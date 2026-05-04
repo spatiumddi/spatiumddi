@@ -4,21 +4,24 @@ Per CLAUDE.md non-negotiable #10, the chat orchestrator obtains a
 driver via :func:`get_driver` and speaks only to the abstract
 interface. Mirrors ``app.drivers.dhcp.registry``.
 
-Wave 1 ships the ``openai_compat`` driver (covers OpenAI, Ollama,
-OpenWebUI, vLLM, LM Studio, llama.cpp server, LocalAI, Together,
-Groq, Fireworks). ``anthropic`` / ``google`` / ``azure_openai``
-drivers register themselves here in Phase 2.
+Phase 1 shipped ``openai_compat`` (covers OpenAI, Ollama, OpenWebUI,
+vLLM, LM Studio, llama.cpp server, LocalAI, Together, Groq,
+Fireworks). Phase 2 adds ``anthropic`` (Claude). ``google`` and
+``azure_openai`` drivers will register themselves here in
+follow-up commits.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
+from app.drivers.llm.anthropic import AnthropicDriver
 from app.drivers.llm.base import LLMDriver
 from app.drivers.llm.openai_compat import OpenAICompatDriver
 
 _DRIVERS: dict[str, type[LLMDriver]] = {
     OpenAICompatDriver.kind: OpenAICompatDriver,
+    AnthropicDriver.kind: AnthropicDriver,
 }
 
 
