@@ -3850,6 +3850,168 @@ async def resize_block_commit(
     )
 
 
+# ── Block move (issue #27) ────────────────────────────────────────────────────
+#
+# Operator-driven relocation of an IPBlock + everything under it
+# (descendant blocks, subnets, addresses) into a different IPSpace.
+# Two endpoints mirroring the resize shape:
+#   POST /blocks/{id}/move/preview  — pure read, returns a MovePlan
+#   POST /blocks/{id}/move/commit   — typed-CIDR-confirmed rewrite
+#
+# Service layer in ``app.services.ipam.block_move`` does the heavy
+# lifting (descendant walk, integration-owner detection, target-side
+# overlap re-check, advisory lock); the handlers parse / call /
+# audit / commit.
+
+
+class _MoveIntegrationBlocker(BaseModel):
+    kind: str
+    resource_id: str
+    network: str
+    integration: str
+
+
+class BlockMovePreviewRequest(BaseModel):
+    target_space_id: uuid.UUID
+    target_parent_id: uuid.UUID | None = None
+
+
+class BlockMovePreviewResponse(BaseModel):
+    block_id: str
+    block_network: str
+    source_space_id: str
+    target_space_id: str
+    target_parent_id: str | None
+    descendant_blocks_count: int
+    descendant_subnets_count: int
+    descendant_ip_addresses_total: int
+    reparent_chain_block_ids: list[str]
+    integration_blockers: list[_MoveIntegrationBlocker]
+    warnings: list[str]
+
+
+class BlockMoveCommitRequest(BaseModel):
+    target_space_id: uuid.UUID
+    target_parent_id: uuid.UUID | None = None
+    confirmation_cidr: str
+
+
+class BlockMoveCommitResponse(BaseModel):
+    block: IPBlockResponse
+    source_space_id: str
+    target_space_id: str
+    target_parent_id: str | None
+    blocks_moved: int
+    subnets_moved: int
+    addresses_in_moved_subtree: int
+    reparented_block_ids: list[str]
+
+
+@router.post(
+    "/blocks/{block_id}/move/preview",
+    response_model=BlockMovePreviewResponse,
+)
+async def move_block_preview(
+    block_id: uuid.UUID,
+    body: BlockMovePreviewRequest,
+    current_user: CurrentUser,
+    db: DB,
+) -> BlockMovePreviewResponse:
+    from app.services.ipam.block_move import BlockMoveError, preview_move
+
+    block = await db.get(IPBlock, block_id)
+    if block is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP block not found")
+    try:
+        plan = await preview_move(db, block, body.target_space_id, body.target_parent_id)
+    except BlockMoveError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+    return BlockMovePreviewResponse(
+        block_id=plan.block_id,
+        block_network=plan.block_network,
+        source_space_id=plan.source_space_id,
+        target_space_id=plan.target_space_id,
+        target_parent_id=plan.target_parent_id,
+        descendant_blocks_count=len(plan.descendant_block_ids),
+        descendant_subnets_count=len(plan.descendant_subnet_ids),
+        descendant_ip_addresses_total=plan.descendant_ip_count,
+        reparent_chain_block_ids=plan.reparent_chain_block_ids,
+        integration_blockers=[
+            _MoveIntegrationBlocker(
+                kind=b.kind,
+                resource_id=b.resource_id,
+                network=b.network,
+                integration=b.integration,
+            )
+            for b in plan.integration_blockers
+        ],
+        warnings=plan.warnings,
+    )
+
+
+@router.post("/blocks/{block_id}/move/commit", response_model=BlockMoveCommitResponse)
+async def move_block_commit(
+    block_id: uuid.UUID,
+    body: BlockMoveCommitRequest,
+    current_user: CurrentUser,
+    db: DB,
+) -> BlockMoveCommitResponse:
+    from app.services.ipam.block_move import BlockMoveError, commit_move
+
+    block = await db.get(IPBlock, block_id)
+    if block is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP block not found")
+
+    old_space_id = str(block.space_id)
+    old_parent_id = str(block.parent_block_id) if block.parent_block_id else None
+
+    try:
+        result = await commit_move(
+            db,
+            block,
+            body.target_space_id,
+            body.target_parent_id,
+            body.confirmation_cidr,
+        )
+    except BlockMoveError as exc:
+        raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
+    db.add(
+        _audit(
+            current_user,
+            "move",
+            "ip_block",
+            str(block.id),
+            f"{block.network} → space {result.target_space_id}",
+            old_value={
+                "space_id": old_space_id,
+                "parent_block_id": old_parent_id,
+            },
+            new_value={
+                "space_id": result.target_space_id,
+                "parent_block_id": result.target_parent_id,
+                "blocks_moved": result.blocks_moved,
+                "subnets_moved": result.subnets_moved,
+                "addresses_in_moved_subtree": result.addresses_in_moved_subtree,
+                "reparented_block_ids": result.reparented_block_ids,
+            },
+        )
+    )
+
+    await db.commit()
+    await db.refresh(block)
+    return BlockMoveCommitResponse(
+        block=IPBlockResponse.model_validate(block),
+        source_space_id=result.source_space_id,
+        target_space_id=result.target_space_id,
+        target_parent_id=result.target_parent_id,
+        blocks_moved=result.blocks_moved,
+        subnets_moved=result.subnets_moved,
+        addresses_in_moved_subtree=result.addresses_in_moved_subtree,
+        reparented_block_ids=result.reparented_block_ids,
+    )
+
+
 # ── Free-space finder (Item 1) ────────────────────────────────────────────────
 #
 # POST /api/v1/ipam/spaces/{space_id}/find-free walks the space (or one

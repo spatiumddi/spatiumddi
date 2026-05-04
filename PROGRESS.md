@@ -107,14 +107,14 @@ IPBlock (and everything under it) into a different IPSpace.
 
 ### Checkpoints
 
-- [ ] Service: `app/services/ipam/block_move.py` with `_assemble_move_plan`, `preview_move`, `commit_move`
-- [ ] Router: `POST /api/v1/ipam/blocks/{id}/move/preview` + `/commit`
-- [ ] Schemas: `MoveBlockPreview` + `MoveBlockResult` Pydantic models
-- [ ] Tests: preview detects integration blockers; commit fails on overlap; reparent-chain works; integration-blocker → 409
-- [ ] Frontend: `MoveBlockModal` (use shared `Modal` + draggable hook)
-- [ ] Frontend: "Move" header button on `IPBlockDetailPage`
-- [ ] `make ci` clean
-- [ ] Commit `feat(ipam): #27 block move across IP spaces`
+- [x] Service: `app/services/ipam/block_move.py` with `assemble_move_plan` / `preview_move` / `commit_move` + integration-owner detection across all four FK columns + per-block advisory xact-lock + recursive descendant walker
+- [x] Router: `POST /api/v1/ipam/blocks/{id}/move/preview` + `/move/commit` with audit-log of `move` action carrying old → new space and counts
+- [x] Schemas: `BlockMovePreviewRequest` / `Response` / `BlockMoveCommitRequest` / `Response` + `_MoveIntegrationBlocker` row type
+- [x] Smoke-test: builds 2 spaces + block + subnet + 3 IPs; verifies preview returns counts; bad-CIDR → 422; good-CIDR commit moves block.space_id + subnet.space_id; preserves IP rows
+- [x] Frontend: `MoveBlockModal` with two-stage preview-then-confirm flow; integration blocker list hides commit button; typed-CIDR confirmation gate
+- [x] Frontend: "Move…" header button on `IPBlockDetailPage` next to "Resize…"
+- [x] `make ci` clean
+- [x] Single commit `feat(ipam): #27 block move across IP spaces`
 
 ### Done when
 

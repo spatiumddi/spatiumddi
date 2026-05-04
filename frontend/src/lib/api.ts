@@ -756,6 +756,57 @@ export interface BlockResizeCommitResponse {
   summary: string[];
 }
 
+// ── Block move (issue #27) ───────────────────────────────────────────────
+//
+// Operator-driven relocation of an IPBlock + everything under it
+// (descendant blocks, subnets, addresses) into a different IPSpace.
+// Preview is a pure read of the blast radius; commit takes a per-block
+// advisory lock and refuses if any descendant is owned by an integration
+// reconciler (kubernetes / docker / proxmox / tailscale FK set).
+
+export interface BlockMovePreviewRequest {
+  target_space_id: string;
+  target_parent_id?: string | null;
+}
+
+export interface BlockMoveIntegrationBlocker {
+  kind: "block" | "subnet" | "ip_address";
+  resource_id: string;
+  network: string;
+  integration: "kubernetes" | "docker" | "proxmox" | "tailscale";
+}
+
+export interface BlockMovePreviewResponse {
+  block_id: string;
+  block_network: string;
+  source_space_id: string;
+  target_space_id: string;
+  target_parent_id: string | null;
+  descendant_blocks_count: number;
+  descendant_subnets_count: number;
+  descendant_ip_addresses_total: number;
+  reparent_chain_block_ids: string[];
+  integration_blockers: BlockMoveIntegrationBlocker[];
+  warnings: string[];
+}
+
+export interface BlockMoveCommitRequest {
+  target_space_id: string;
+  target_parent_id?: string | null;
+  confirmation_cidr: string;
+}
+
+export interface BlockMoveCommitResponse {
+  block: IPBlock;
+  source_space_id: string;
+  target_space_id: string;
+  target_parent_id: string | null;
+  blocks_moved: number;
+  subnets_moved: number;
+  addresses_in_moved_subtree: number;
+  reparented_block_ids: string[];
+}
+
 // ── Free-space finder ──────────────────────────────────────────────────────
 //
 // Sweep an IPSpace (or one block subtree) for unused CIDRs of the
@@ -1061,6 +1112,22 @@ export const ipamApi = {
   resizeBlockCommit: (blockId: string, body: BlockResizeCommitRequest) =>
     api
       .post<BlockResizeCommitResponse>(`/ipam/blocks/${blockId}/resize`, body)
+      .then((r) => r.data),
+
+  // ── Block move (issue #27) ───────────────────────────────────────────
+  moveBlockPreview: (blockId: string, body: BlockMovePreviewRequest) =>
+    api
+      .post<BlockMovePreviewResponse>(
+        `/ipam/blocks/${blockId}/move/preview`,
+        body,
+      )
+      .then((r) => r.data),
+  moveBlockCommit: (blockId: string, body: BlockMoveCommitRequest) =>
+    api
+      .post<BlockMoveCommitResponse>(
+        `/ipam/blocks/${blockId}/move/commit`,
+        body,
+      )
       .then((r) => r.data),
 
   // ── Free-space finder ───────────────────────────────────────────────

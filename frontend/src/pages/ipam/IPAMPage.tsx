@@ -87,6 +87,7 @@ import {
   SubnetImportExportButton,
 } from "./ImportExportModals";
 import { ResizeBlockModal, ResizeSubnetModal } from "./ResizeModals";
+import { MoveBlockModal } from "./MoveBlockModal";
 import {
   IPNetworkTab,
   NetworkTabBadge,
@@ -9199,6 +9200,7 @@ function BlockDetailView({
   const [block, setBlock] = useState(initialBlock);
   const [showEdit, setShowEdit] = useState(false);
   const [showResizeBlock, setShowResizeBlock] = useState(false);
+  const [showMoveBlock, setShowMoveBlock] = useState(false);
   const [showCreateSubnet, setShowCreateSubnet] = useState(false);
   const [showCreateChildBlock, setShowCreateChildBlock] = useState(false);
   const [showPlanAllocation, setShowPlanAllocation] = useState(false);
@@ -9433,6 +9435,12 @@ function BlockDetailView({
                   Resize…
                 </HeaderButton>
                 <HeaderButton
+                  onClick={() => setShowMoveBlock(true)}
+                  title="Move this block (and everything under it) to a different IP space."
+                >
+                  Move…
+                </HeaderButton>
+                <HeaderButton
                   icon={Layers}
                   onClick={() => setShowCreateChildBlock(true)}
                 >
@@ -9556,6 +9564,16 @@ function BlockDetailView({
           block={block}
           onClose={() => setShowResizeBlock(false)}
           onCommitted={(result) => setBlock(result.block)}
+        />
+      )}
+      {showMoveBlock && (
+        <MoveBlockModal
+          block={block}
+          onClose={() => setShowMoveBlock(false)}
+          onCommitted={(result) => {
+            setBlock(result.block);
+            setShowMoveBlock(false);
+          }}
         />
       )}
       {showCreateSubnet && (
