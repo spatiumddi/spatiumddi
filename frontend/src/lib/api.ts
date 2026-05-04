@@ -2346,12 +2346,13 @@ export const AI_PROVIDER_KIND_SHORT: Record<AIProviderKind, string> = {
   azure_openai: "Azure OpenAI",
 };
 
-// Drivers currently shipping. Anthropic landed in Phase 2; google /
-// azure_openai still pending — they're in the kind enum on the
-// backend but the registry rejects them until the driver registers.
+// Drivers currently shipping. All four kinds are registered after the
+// Phase 2 Azure + Gemini bundle landed.
 export const AI_PROVIDER_KIND_AVAILABLE: AIProviderKind[] = [
   "openai_compat",
   "anthropic",
+  "azure_openai",
+  "google",
 ];
 
 export interface AIProvider {

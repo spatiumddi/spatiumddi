@@ -6,9 +6,9 @@ interface. Mirrors ``app.drivers.dhcp.registry``.
 
 Phase 1 shipped ``openai_compat`` (covers OpenAI, Ollama, OpenWebUI,
 vLLM, LM Studio, llama.cpp server, LocalAI, Together, Groq,
-Fireworks). Phase 2 adds ``anthropic`` (Claude). ``google`` and
-``azure_openai`` drivers will register themselves here in
-follow-up commits.
+Fireworks). Phase 2 adds ``anthropic`` (Claude), ``azure_openai``
+(deployment-scoped Azure resources), and ``google`` (Google Gemini
+via the AI-Studio OpenAI-compat endpoint).
 """
 
 from __future__ import annotations
@@ -16,12 +16,16 @@ from __future__ import annotations
 from typing import Any
 
 from app.drivers.llm.anthropic import AnthropicDriver
+from app.drivers.llm.azure_openai import AzureOpenAIDriver
 from app.drivers.llm.base import LLMDriver
+from app.drivers.llm.google_gemini import GoogleGeminiDriver
 from app.drivers.llm.openai_compat import OpenAICompatDriver
 
 _DRIVERS: dict[str, type[LLMDriver]] = {
     OpenAICompatDriver.kind: OpenAICompatDriver,
     AnthropicDriver.kind: AnthropicDriver,
+    AzureOpenAIDriver.kind: AzureOpenAIDriver,
+    GoogleGeminiDriver.kind: GoogleGeminiDriver,
 }
 
 

@@ -55,7 +55,18 @@ _RATES: dict[str, ModelRate] = {
     # Google
     "gemini-1.5-pro": ModelRate(Decimal("1.25"), Decimal("5.00")),
     "gemini-1.5-flash": ModelRate(Decimal("0.075"), Decimal("0.30")),
+    "gemini-1.5-flash-8b": ModelRate(Decimal("0.0375"), Decimal("0.15")),
     "gemini-2.0-flash": ModelRate(Decimal("0.10"), Decimal("0.40")),
+    "gemini-2.0-flash-lite": ModelRate(Decimal("0.075"), Decimal("0.30")),
+    "gemini-2.5-pro": ModelRate(Decimal("1.25"), Decimal("10.00")),
+    "gemini-2.5-flash": ModelRate(Decimal("0.30"), Decimal("2.50")),
+    # Azure OpenAI — Azure publishes the same per-token rates as
+    # OpenAI's direct API for the equivalent model family. Deployments
+    # are operator-named (e.g. ``my-prod-gpt4o``) so longest-prefix
+    # matching against the family alone won't help; operators should
+    # pin overrides via ``ai_pricing_overrides`` keyed on the
+    # deployment name. The entries below are a courtesy fallback for
+    # operators who name deployments after the base model.
     # Together / Groq / Fireworks — representative averages; operator
     # should override for accuracy.
     "llama-3.1-70b": ModelRate(Decimal("0.88"), Decimal("0.88")),
