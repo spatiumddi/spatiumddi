@@ -84,6 +84,11 @@ class SettingsResponse(BaseModel):
     # (default), ASN-portion mismatches between the VRF's RD/RT and
     # its linked ASN row produce warnings; when True they are 422.
     vrf_strict_rd_validation: bool = False
+    # Operator Copilot daily digest (issue #90 Phase 2). When True,
+    # a Celery cron at 08:00 UTC rolls up the prior 24 h, sends to
+    # the highest-priority enabled AIProvider for an executive
+    # summary, and pushes through audit-forward targets.
+    ai_daily_digest_enabled: bool = False
 
     model_config = {"from_attributes": True}
 
@@ -156,6 +161,8 @@ class SettingsUpdate(BaseModel):
     rpki_roa_refresh_interval_hours: int | None = None
     # VRF strict-RD validation toggle (issue #86 phase 2).
     vrf_strict_rd_validation: bool | None = None
+    # Operator Copilot daily digest (issue #90 Phase 2).
+    ai_daily_digest_enabled: bool | None = None
 
     @field_validator("ip_allocation_strategy")
     @classmethod

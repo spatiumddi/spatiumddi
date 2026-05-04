@@ -1980,6 +1980,11 @@ export interface PlatformSettings {
   /** Write-only — Fernet-encrypted server-side. Set to a non-empty
    *  string to store; set to "" to clear; omit to leave unchanged. */
   fingerbank_api_key?: string;
+  /** Operator Copilot daily digest (issue #90 Phase 2). When true,
+   *  a Celery cron at 08:00 UTC rolls up the prior 24 h, sends to
+   *  the highest-priority enabled AI provider for an executive
+   *  summary, and dispatches via the audit-forward targets. */
+  ai_daily_digest_enabled: boolean;
 }
 
 export interface OUIStatus {

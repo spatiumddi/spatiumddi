@@ -401,9 +401,10 @@ def _payload_summary_lines(payload: dict[str, Any]) -> tuple[str, str]:
     """Return ``(short_title, longer_body)`` for chat-card rendering.
 
     Audit rows carry ``action`` + ``resource_type`` + ``resource_display``;
-    alert events carry ``rule_name`` + ``subject_display`` + ``message``.
-    Both shapes are common enough to handle inline rather than needing
-    separate formatters per source.
+    alert events carry ``rule_name`` + ``subject_display`` + ``message``;
+    digests (issue #90 Phase 2) carry ``title`` + ``summary``. Each
+    flavor lands in the same chat / SMTP renderers so a single target
+    can receive all three.
     """
     if payload.get("kind") == "alert":
         rule_name = payload.get("rule_name") or "alert"
@@ -411,6 +412,10 @@ def _payload_summary_lines(payload: dict[str, Any]) -> tuple[str, str]:
         msg = payload.get("message") or ""
         title = f"[{payload.get('severity', 'warning').upper()}] {rule_name}"
         body = subject if not msg else f"{subject}\n{msg}" if subject else msg
+        return title, body
+    if payload.get("kind") == "digest":
+        title = payload.get("title") or "Operator Daily Digest"
+        body = payload.get("summary") or payload.get("message") or "(no summary)"
         return title, body
     action = payload.get("action") or "audit"
     rtype = payload.get("resource_type") or ""
@@ -562,6 +567,13 @@ def _smtp_subject_body(payload: dict[str, Any]) -> tuple[str, str]:
             f"Fired at: {payload.get('fired_at', '')}",
             "",
             payload.get("message") or "(no message)",
+        ]
+    elif payload.get("kind") == "digest":
+        body_lines = [
+            f"Window: {payload.get('rollup', {}).get('window_start_utc', '?')}"
+            f" → {payload.get('rollup', {}).get('window_end_utc', '?')} (UTC)",
+            "",
+            payload.get("summary") or payload.get("message") or "(no summary)",
         ]
     else:
         body_lines = [

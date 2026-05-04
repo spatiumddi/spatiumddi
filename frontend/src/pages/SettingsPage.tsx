@@ -93,6 +93,7 @@ type SectionId =
   | "network-asn"
   | "network-domains"
   | "network-vrf"
+  | "ai-digest"
   | "session"
   | "subnet-tree"
   | "updates"
@@ -105,7 +106,8 @@ type SectionGroup =
   | "DNS"
   | "DHCP"
   | "Network"
-  | "Integrations";
+  | "Integrations"
+  | "AI";
 
 interface SectionDef {
   id: SectionId;
@@ -179,6 +181,7 @@ const SECTION_FIELDS: Record<SectionId, (keyof PlatformSettings)[]> = {
   ],
   "network-domains": ["domain_whois_interval_hours"],
   "network-vrf": ["vrf_strict_rd_validation"],
+  "ai-digest": ["ai_daily_digest_enabled"],
   session: ["session_timeout_minutes", "auto_logout_minutes"],
   "subnet-tree": ["subnet_tree_default_expanded_depth"],
   updates: ["github_release_check_enabled"],
@@ -847,6 +850,25 @@ const SECTIONS: SectionDef[] = [
       "rt",
       "validation",
       "strict",
+    ],
+  },
+
+  // ── AI ────────────────────────────────────────────────────────────────
+  {
+    id: "ai-digest",
+    title: "Operator Daily Digest",
+    group: "AI",
+    description:
+      "Once-per-day rollup of audit events, alert activity, and DHCP lease churn — summarised by the highest-priority enabled AI provider and pushed through the existing audit-forward targets (Slack / Teams / Discord / SMTP). Default off; flip on once you have at least one target wired in Audit-forward and at least one AI provider enabled.",
+    keywords: [
+      "ai",
+      "copilot",
+      "digest",
+      "summary",
+      "daily",
+      "rollup",
+      "report",
+      "executive",
     ],
   },
 
@@ -1670,6 +1692,24 @@ export function SettingsPage() {
                   />
                   <span className="text-sm text-muted-foreground">
                     {values.vrf_strict_rd_validation ? "Strict" : "Warn only"}
+                  </span>
+                </div>
+              </Field>
+            )}
+
+            {activeId === "ai-digest" && (
+              <Field
+                label="Daily Operator Digest"
+                description="Fires daily at 08:00 UTC. Picks the highest-priority enabled AI provider, summarises the last 24 h of activity, and dispatches the result through every audit-forward target as a `kind=digest` payload (filter on `resource_types: ['ai.digest']` on a target to route digests separately from alerts). Default OFF — turn ON once you have an AI provider and at least one audit-forward target wired up."
+              >
+                <div className="flex items-center gap-3">
+                  <Toggle
+                    checked={!!values.ai_daily_digest_enabled}
+                    onChange={(v) => set("ai_daily_digest_enabled", v)}
+                    disabled={!isSuperadmin}
+                  />
+                  <span className="text-sm text-muted-foreground">
+                    {values.ai_daily_digest_enabled ? "Enabled" : "Disabled"}
                   </span>
                 </div>
               </Field>

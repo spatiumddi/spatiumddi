@@ -86,6 +86,7 @@ celery_app.conf.update(
         "app.tasks.asn_whois_refresh.*": {"queue": "default"},
         "app.tasks.rpki_roa_refresh.*": {"queue": "default"},
         "app.tasks.domain_whois_refresh.*": {"queue": "default"},
+        "app.tasks.ai_digest.*": {"queue": "default"},
     },
     beat_schedule={
         # Every 60s, fan-out health checks to every registered DNS server.
@@ -302,6 +303,16 @@ celery_app.conf.update(
         "domain-whois-refresh-tick": {
             "task": "app.tasks.domain_whois_refresh.refresh_due_domains",
             "schedule": schedule(run_every=3600.0),
+        },
+        # Daily at 08:00 UTC, fire the Operator Copilot digest. The
+        # task itself gates on ``PlatformSettings.ai_daily_digest_enabled``
+        # so the cron is harmless on installs that haven't opted in.
+        # 08:00 UTC = 03:00 EST / 04:00 EDT — lands in the inbox before
+        # the start of the US business day; operators in other time
+        # zones can adjust by editing this entry directly.
+        "ai-daily-digest": {
+            "task": "app.tasks.ai_digest.send_daily_digest",
+            "schedule": crontab(hour=8, minute=0),
         },
     },
 )

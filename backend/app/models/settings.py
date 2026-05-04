@@ -281,3 +281,15 @@ class PlatformSettings(Base):
     ai_pricing_overrides: Mapped[dict] = mapped_column(
         JSONB, nullable=False, default=dict, server_default=sa_text("'{}'::jsonb")
     )
+
+    # ── Daily digest (issue #90 Phase 2) ────────────────────────────
+    # When True, a Celery beat job once per day rolls up the previous
+    # 24 h of audit / alert / lease activity, sends it to the highest-
+    # priority enabled AIProvider for an executive summary, and pushes
+    # the result through the existing audit-forward targets (filter on
+    # ``resource_types: ["ai.digest"]`` to route it separately from
+    # alerts). Default off — operators turn it on once they've put an
+    # SMTP / webhook target in place.
+    ai_daily_digest_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
