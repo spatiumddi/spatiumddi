@@ -196,6 +196,7 @@ function TemplateEditor({
     <Modal
       title={mode === "create" ? "New IPAM Template" : `Edit — ${initial.name}`}
       onClose={onClose}
+      wide
     >
       <div className="space-y-4">
         {error && (
@@ -204,11 +205,11 @@ function TemplateEditor({
           </div>
         )}
 
-        <div className="flex gap-1 border-b">
+        <div className="flex flex-wrap gap-1 border-b">
           {(
             [
               ["general", "General"],
-              ["stamp", "Tags + CFs + DNS/DHCP"],
+              ["stamp", "Stamp values"],
               ["ddns", "DDNS"],
               ["children", "Child layout"],
             ] as [TabKey, string][]
@@ -670,8 +671,8 @@ export function IPAMTemplatesPage() {
 
   return (
     <div className="space-y-4">
-      <div className="flex items-center justify-between">
-        <div>
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="min-w-0 flex-1">
           <h1 className="flex items-center gap-2 text-xl font-semibold">
             <LayoutTemplate className="h-5 w-5" /> IPAM Templates
           </h1>
@@ -686,7 +687,7 @@ export function IPAMTemplatesPage() {
             setEditorErr("");
             setEditor({ mode: "create", initial: { ...EMPTY } });
           }}
-          className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90"
+          className="inline-flex shrink-0 items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90"
         >
           <Plus className="h-4 w-4" /> New template
         </button>
@@ -748,10 +749,10 @@ export function IPAMTemplatesPage() {
             )}
             {visible.map((t) => (
               <tr key={t.id} className="border-b last:border-b-0">
-                <td className="px-3 py-2">
-                  <div className="font-medium">{t.name}</div>
+                <td className="px-3 py-2 align-top">
+                  <div className="font-medium break-words">{t.name}</div>
                   {t.description && (
-                    <div className="text-xs text-muted-foreground">
+                    <div className="text-xs text-muted-foreground break-words">
                       {t.description}
                     </div>
                   )}
