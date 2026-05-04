@@ -65,6 +65,15 @@ export function CopilotDrawer({
     }[]
   >([]);
   const [streamingError, setStreamingError] = useState<string | null>(null);
+  // Failover notices emitted by the backend orchestrator when the
+  // primary provider failed transiently and the request was retried
+  // on a fallback. ``null`` when no failover happened on this turn.
+  const [streamingFailover, setStreamingFailover] = useState<{
+    from_provider: string;
+    to_provider: string;
+    to_model: string;
+    reason: string;
+  } | null>(null);
   // Echo of the just-sent user message — kept in component state until
   // the backend stream ends and detailQ refetches the persisted version.
   // Without this, second-and-later turns appear to "swallow" the user
@@ -145,6 +154,7 @@ export function CopilotDrawer({
       setStreamingContent("");
       setStreamingTools([]);
       setStreamingError(null);
+      setStreamingFailover(null);
       setPendingUserMessage(message);
       let resolvedSessionId = activeSessionId;
       // ``initial_context`` only matters on a *new* session — the
@@ -193,6 +203,17 @@ export function CopilotDrawer({
                   : t,
               ),
             );
+          } else if (ev.event === "info") {
+            // Phase 2 failover notice — primary provider failed
+            // transiently and the orchestrator retried on a fallback.
+            if (ev.data.kind === "failover") {
+              setStreamingFailover({
+                from_provider: ev.data.from_provider as string,
+                to_provider: ev.data.to_provider as string,
+                to_model: ev.data.to_model as string,
+                reason: ev.data.reason as string,
+              });
+            }
           } else if (ev.event === "error") {
             setStreamingError(ev.data.message as string);
           }
@@ -385,6 +406,7 @@ export function CopilotDrawer({
               content={streamingContent}
               tools={streamingTools}
               error={streamingError}
+              failover={streamingFailover}
             />
           )}
         </div>
@@ -514,6 +536,7 @@ function StreamingBubble({
   content,
   tools,
   error,
+  failover,
 }: {
   content: string;
   tools: {
@@ -524,10 +547,27 @@ function StreamingBubble({
     is_error?: boolean;
   }[];
   error: string | null;
+  failover: {
+    from_provider: string;
+    to_provider: string;
+    to_model: string;
+    reason: string;
+  } | null;
 }) {
   return (
     <div className="mb-3 flex justify-start">
       <div className="max-w-[85%] space-y-2">
+        {failover && (
+          <div className="rounded-lg border border-amber-500/30 bg-amber-500/5 px-3 py-1.5 text-xs text-amber-700 dark:text-amber-300">
+            <span className="font-medium">Failed over</span>{" "}
+            <span className="opacity-80">
+              from <code className="font-mono">{failover.from_provider}</code>{" "}
+              to <code className="font-mono">{failover.to_provider}</code> ·
+              model <code className="font-mono">{failover.to_model}</code> ·
+              reason <code className="font-mono">{failover.reason}</code>
+            </span>
+          </div>
+        )}
         {tools.map((t) => (
           <div
             key={t.id}
