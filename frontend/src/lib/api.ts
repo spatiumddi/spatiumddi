@@ -482,6 +482,14 @@ export interface Subnet {
     | "udp_top100"
     | "aggressive";
   auto_profile_refresh_days?: number;
+  // Compliance / classification flags. First-class booleans (rather
+  // than freeform tags) so auditor queries — "show me every PCI
+  // subnet" — are clean indexed predicates. Default false on every
+  // subnet; flip via the Edit modal. Surfaces on the Compliance
+  // dashboard at /admin/compliance.
+  pci_scope?: boolean;
+  hipaa_scope?: boolean;
+  internet_facing?: boolean;
   dns_servers?: string[] | null;
   domain_name?: string | null;
   created_at?: string;
@@ -1016,6 +1024,9 @@ export const ipamApi = {
     space_id?: string;
     block_id?: string;
     vlan_ref_id?: string;
+    pci_scope?: boolean;
+    hipaa_scope?: boolean;
+    internet_facing?: boolean;
   }) => api.get<Subnet[]>("/ipam/subnets", { params }).then((r) => r.data),
   getSubnet: (id: string) =>
     api.get<Subnet>(`/ipam/subnets/${id}`).then((r) => r.data),

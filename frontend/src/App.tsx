@@ -36,6 +36,7 @@ import { DomainsPage } from "@/pages/admin/DomainsPage";
 import { DomainDetailPage } from "@/pages/admin/DomainDetailPage";
 import { GroupsPage } from "@/pages/admin/GroupsPage";
 import { RolesPage } from "@/pages/admin/RolesPage";
+import { CompliancePage } from "@/pages/admin/CompliancePage";
 import { TrashPage } from "@/pages/admin/TrashPage";
 import { WebhooksPage } from "@/pages/admin/WebhooksPage";
 import { PlatformInsightsPage } from "@/pages/admin/PlatformInsightsPage";
@@ -109,6 +110,7 @@ export default function App() {
         <Route path="admin/domains" element={<DomainsPage />} />
         <Route path="admin/domains/:id" element={<DomainDetailPage />} />
         <Route path="admin/webhooks" element={<WebhooksPage />} />
+        <Route path="admin/compliance" element={<CompliancePage />} />
         <Route path="admin/trash" element={<TrashPage />} />
         <Route
           path="admin/platform-insights"

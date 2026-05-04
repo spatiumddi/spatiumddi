@@ -31,6 +31,7 @@ import {
   Scissors,
   GitMerge,
   Maximize2,
+  ShieldCheck,
 } from "lucide-react";
 import {
   DndContext,
@@ -1158,6 +1159,88 @@ function ProfilingSettingsSection({
   );
 }
 
+/**
+ * Compliance classification — first-class boolean flags on the
+ * subnet for PCI / HIPAA / internet-facing scope. Used by the
+ * Compliance dashboard at /admin/compliance to answer auditor
+ * queries ("show me every PCI subnet") with indexed predicates
+ * rather than freeform-tag scans. Subnet-level only, no
+ * inheritance — a parent block being PCI-scope doesn't
+ * automatically tag its children. Operators tag deliberately.
+ */
+function ClassificationSection({
+  pciScope,
+  hipaaScope,
+  internetFacing,
+  onPciChange,
+  onHipaaChange,
+  onInternetFacingChange,
+}: {
+  pciScope: boolean;
+  hipaaScope: boolean;
+  internetFacing: boolean;
+  onPciChange: (v: boolean) => void;
+  onHipaaChange: (v: boolean) => void;
+  onInternetFacingChange: (v: boolean) => void;
+}) {
+  return (
+    <div className="space-y-2">
+      <div className="flex items-center gap-1.5">
+        <ShieldCheck className="h-3.5 w-3.5 text-muted-foreground" />
+        <span className="text-xs font-medium">Compliance classification</span>
+      </div>
+      <p className="text-[11px] text-muted-foreground">
+        First-class scope flags surfaced on the Compliance dashboard. Indexed
+        for auditor queries.
+      </p>
+      <div className="space-y-1.5 pl-5 border-l-2 border-muted">
+        <label className="flex items-center gap-2 text-xs cursor-pointer select-none">
+          <input
+            type="checkbox"
+            checked={pciScope}
+            onChange={(e) => onPciChange(e.target.checked)}
+            className="h-3.5 w-3.5"
+          />
+          <span>
+            <span className="font-medium">PCI scope</span>
+            <span className="text-muted-foreground">
+              {" "}
+              — handles cardholder data
+            </span>
+          </span>
+        </label>
+        <label className="flex items-center gap-2 text-xs cursor-pointer select-none">
+          <input
+            type="checkbox"
+            checked={hipaaScope}
+            onChange={(e) => onHipaaChange(e.target.checked)}
+            className="h-3.5 w-3.5"
+          />
+          <span>
+            <span className="font-medium">HIPAA scope</span>
+            <span className="text-muted-foreground"> — handles ePHI</span>
+          </span>
+        </label>
+        <label className="flex items-center gap-2 text-xs cursor-pointer select-none">
+          <input
+            type="checkbox"
+            checked={internetFacing}
+            onChange={(e) => onInternetFacingChange(e.target.checked)}
+            className="h-3.5 w-3.5"
+          />
+          <span>
+            <span className="font-medium">Internet-facing</span>
+            <span className="text-muted-foreground">
+              {" "}
+              — directly reachable from the public internet
+            </span>
+          </span>
+        </label>
+      </div>
+    </div>
+  );
+}
+
 function DdnsSettingsSection({
   enabled,
   policy,
@@ -1702,6 +1785,10 @@ function CreateSubnetModal({
   const [autoProfilePreset, setAutoProfilePreset] =
     useState<AutoProfilePreset>("service_and_os");
   const [autoProfileRefreshDays, setAutoProfileRefreshDays] = useState(30);
+  // Compliance / classification flags (issue #75).
+  const [pciScope, setPciScope] = useState(false);
+  const [hipaaScope, setHipaaScope] = useState(false);
+  const [internetFacing, setInternetFacing] = useState(false);
 
   const { data: blocks } = useQuery({
     queryKey: ["blocks", spaceId],
@@ -1791,6 +1878,9 @@ function CreateSubnetModal({
         auto_profile_on_dhcp_lease: autoProfileEnabled,
         auto_profile_preset: autoProfilePreset,
         auto_profile_refresh_days: autoProfileRefreshDays,
+        pci_scope: pciScope,
+        hipaa_scope: hipaaScope,
+        internet_facing: internetFacing,
       }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["subnets", spaceId] });
@@ -2015,6 +2105,16 @@ function CreateSubnetModal({
             onEnabledChange={setAutoProfileEnabled}
             onPresetChange={setAutoProfilePreset}
             onRefreshDaysChange={setAutoProfileRefreshDays}
+          />
+        </div>
+        <div className="border-t pt-3">
+          <ClassificationSection
+            pciScope={pciScope}
+            hipaaScope={hipaaScope}
+            internetFacing={internetFacing}
+            onPciChange={setPciScope}
+            onHipaaChange={setHipaaScope}
+            onInternetFacingChange={setInternetFacing}
           />
         </div>
         {error && <p className="text-xs text-destructive">{error}</p>}
@@ -5474,6 +5574,14 @@ function EditSubnetModal({
   const [autoProfileRefreshDays, setAutoProfileRefreshDays] = useState(
     subnet.auto_profile_refresh_days ?? 30,
   );
+  // Compliance / classification flags (issue #75). First-class
+  // booleans rather than freeform tags so the Compliance dashboard
+  // queries hit indexed predicates.
+  const [pciScope, setPciScope] = useState(subnet.pci_scope ?? false);
+  const [hipaaScope, setHipaaScope] = useState(subnet.hipaa_scope ?? false);
+  const [internetFacing, setInternetFacing] = useState(
+    subnet.internet_facing ?? false,
+  );
 
   // Detect whether network/broadcast records currently exist
   const { data: addresses } = useQuery({
@@ -5568,6 +5676,9 @@ function EditSubnetModal({
         auto_profile_on_dhcp_lease: autoProfileEnabled,
         auto_profile_preset: autoProfilePreset,
         auto_profile_refresh_days: autoProfileRefreshDays,
+        pci_scope: pciScope,
+        hipaa_scope: hipaaScope,
+        internet_facing: internetFacing,
         ...(manageAuto !== undefined
           ? { manage_auto_addresses: manageAuto }
           : {}),
@@ -5840,6 +5951,16 @@ function EditSubnetModal({
             onEnabledChange={setAutoProfileEnabled}
             onPresetChange={setAutoProfilePreset}
             onRefreshDaysChange={setAutoProfileRefreshDays}
+          />
+        </div>
+        <div className="border-t pt-3">
+          <ClassificationSection
+            pciScope={pciScope}
+            hipaaScope={hipaaScope}
+            internetFacing={internetFacing}
+            onPciChange={setPciScope}
+            onHipaaChange={setHipaaScope}
+            onInternetFacingChange={setInternetFacing}
           />
         </div>
         {error && <p className="text-xs text-destructive">{error}</p>}

@@ -69,15 +69,15 @@ smallest-first so each can land standalone if context runs out.
 
 ### Checkpoints
 
-- [ ] Migration: add `pci_scope` / `hipaa_scope` / `internet_facing` to `subnet`
-- [ ] Model: add the three columns to `app/models/ipam.py::Subnet`
-- [ ] Schemas: add to `SubnetCreate` / `SubnetUpdate` / `SubnetResponse`
-- [ ] Router: extend `GET /api/v1/ipam/subnets` filters
-- [ ] Frontend: add the three checkboxes to Edit Subnet modal
-- [ ] Frontend: add `/admin/compliance` page with three filtered tables
-- [ ] Sidebar: add "Compliance" entry under Administration (or top-level Tools)
-- [ ] `make ci` clean
-- [ ] Single commit `feat(security): #75 subnet classification tags`
+- [x] Migration: add `pci_scope` / `hipaa_scope` / `internet_facing` to `subnet` (`a3c8e5d61b94_subnet_classification_tags`)
+- [x] Model: add the three columns to `app/models/ipam.py::Subnet`
+- [x] Schemas: add to `SubnetCreate` / `SubnetUpdate` / `SubnetResponse`
+- [x] Router: extend `GET /api/v1/ipam/subnets` filters
+- [x] Frontend: add the three checkboxes to Add + Edit Subnet modals (shared `ClassificationSection`)
+- [x] Frontend: add `/admin/compliance` page with three filtered tables
+- [x] Sidebar: add "Compliance" entry under Administration
+- [x] `make ci` clean
+- [x] Single commit `feat(security): #75 subnet classification tags`
 
 ### Done when
 
