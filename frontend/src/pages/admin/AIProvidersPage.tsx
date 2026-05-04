@@ -15,6 +15,7 @@ import {
   aiApi,
   AI_PROVIDER_KIND_AVAILABLE,
   AI_PROVIDER_KIND_LABELS,
+  AI_PROVIDER_KIND_SHORT,
   type AIProvider,
   type AIProviderCreate,
   type AIProviderKind,
@@ -238,6 +239,26 @@ function ProviderEditor({
               placeholder="e.g. llama3.1:8b or gpt-4o-mini"
               className={`${inputCls} font-mono text-xs`}
             />
+            {testResult?.ok && testResult.sample_models.length > 0 && (
+              <div className="mt-1.5 flex flex-wrap gap-1">
+                <span className="text-xs text-muted-foreground">Detected:</span>
+                {testResult.sample_models.map((m) => (
+                  <button
+                    key={m}
+                    type="button"
+                    onClick={() => set("default_model", m)}
+                    className={`rounded border px-1.5 py-0.5 font-mono text-[10px] transition-colors ${
+                      form.default_model === m
+                        ? "border-primary bg-primary/10 text-foreground"
+                        : "text-muted-foreground hover:border-foreground/30 hover:text-foreground"
+                    }`}
+                    title={`Use ${m}`}
+                  >
+                    {m}
+                  </button>
+                ))}
+              </div>
+            )}
           </div>
           <div>
             <label className="mb-1 block text-xs font-medium text-muted-foreground">
@@ -300,7 +321,7 @@ function ProviderEditor({
               )}
             </div>
             {testResult.sample_models.length > 0 && (
-              <div className="mt-2 text-xs">
+              <div className="mt-2 text-xs break-all">
                 Sample models:{" "}
                 <span className="font-mono">
                   {testResult.sample_models.join(", ")}
@@ -624,16 +645,19 @@ export function AIProvidersPage() {
                     </div>
                   )}
                 </td>
-                <td className="px-3 py-2 text-xs">
-                  {AI_PROVIDER_KIND_LABELS[p.kind] ?? p.kind}
+                <td
+                  className="px-3 py-2 align-top text-xs"
+                  title={AI_PROVIDER_KIND_LABELS[p.kind] ?? p.kind}
+                >
+                  {AI_PROVIDER_KIND_SHORT[p.kind] ?? p.kind}
                 </td>
-                <td className="px-3 py-2 font-mono text-xs break-words">
+                <td className="px-3 py-2 align-top font-mono text-xs break-all">
                   {p.base_url || "—"}
                 </td>
-                <td className="px-3 py-2 font-mono text-xs">
+                <td className="px-3 py-2 align-top font-mono text-xs break-all">
                   {p.default_model || "—"}
                 </td>
-                <td className="px-3 py-2 text-xs">
+                <td className="px-3 py-2 align-top text-xs">
                   {p.is_enabled ? (
                     <span className="rounded bg-emerald-500/15 px-2 py-0.5 text-emerald-700 dark:text-emerald-400">
                       enabled
@@ -644,7 +668,7 @@ export function AIProvidersPage() {
                     </span>
                   )}
                 </td>
-                <td className="px-3 py-2 text-xs">{p.priority}</td>
+                <td className="px-3 py-2 align-top text-xs">{p.priority}</td>
                 <td className="px-3 py-2 text-right">
                   <button
                     onClick={() => testRowMut.mutate(p.id)}
@@ -723,7 +747,7 @@ export function AIProvidersPage() {
             </button>
           </div>
           {testResult.sample_models.length > 0 && (
-            <div className="mt-1 text-xs">
+            <div className="mt-1 text-xs break-all">
               Sample models:{" "}
               <span className="font-mono">
                 {testResult.sample_models.join(", ")}

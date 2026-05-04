@@ -42,7 +42,7 @@ class ChatMessage:
     name: str | None = None
     tool_call_id: str | None = None
     # Present on assistant messages that requested tool execution.
-    tool_calls: tuple["ToolCall", ...] = field(default_factory=tuple)
+    tool_calls: tuple[ToolCall, ...] = field(default_factory=tuple)
 
 
 @dataclass(frozen=True)

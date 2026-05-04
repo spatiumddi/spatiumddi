@@ -2337,6 +2337,15 @@ export const AI_PROVIDER_KIND_LABELS: Record<AIProviderKind, string> = {
   azure_openai: "Azure OpenAI",
 };
 
+// Short labels for table cells (the verbose ``AI_PROVIDER_KIND_LABELS``
+// fits in a form picker but pushes the table too wide on narrow viewports).
+export const AI_PROVIDER_KIND_SHORT: Record<AIProviderKind, string> = {
+  openai_compat: "OpenAI-compat",
+  anthropic: "Claude",
+  google: "Gemini",
+  azure_openai: "Azure OpenAI",
+};
+
 // Wave 1 ships only openai_compat. Other kinds appear in the dropdown
 // but the backend rejects them until the matching driver lands.
 export const AI_PROVIDER_KIND_AVAILABLE: AIProviderKind[] = ["openai_compat"];
