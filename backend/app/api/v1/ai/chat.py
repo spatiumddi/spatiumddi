@@ -52,6 +52,14 @@ class ChatTurnRequest(BaseModel):
     # session is locked in.
     provider_id: uuid.UUID | None = None
     model: str | None = None
+    # Operator-supplied context that pre-seeds the system prompt for
+    # *new* sessions. Used by the "Ask AI about this" affordances —
+    # right-click a subnet / IP / DNS record and the frontend bundles
+    # a human-readable summary here so the model knows what the
+    # operator is looking at without them having to restate it. Length-
+    # capped to avoid ballooning the system prompt; ignored on existing
+    # sessions (the snapshot already includes any prior context).
+    initial_context: str | None = Field(default=None, max_length=4000)
 
 
 class SessionSummary(BaseModel):
@@ -320,6 +328,7 @@ async def chat(body: ChatTurnRequest, current_user: CurrentUser, db: DB) -> Stre
         session_id=str(body.session_id) if body.session_id else None,
         provider=provider,
         model=model,
+        initial_context=body.initial_context,
     )
 
     async def _stream():

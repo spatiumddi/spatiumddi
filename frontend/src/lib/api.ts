@@ -2541,6 +2541,7 @@ export async function* streamChatTurn(
     session_id?: string;
     provider_id?: string;
     model?: string;
+    initial_context?: string;
   },
   signal?: AbortSignal,
 ): AsyncIterable<{ event: string; data: Record<string, unknown> }> {

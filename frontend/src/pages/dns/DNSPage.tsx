@@ -42,6 +42,7 @@ import { ServerDetailModal } from "./ServerDetailModal";
 import { PoolsView } from "./PoolsView";
 import { Modal } from "@/components/ui/modal";
 import { HeaderButton } from "@/components/ui/header-button";
+import { AskAIButton } from "@/components/copilot/AskAIButton";
 import {
   dnsApi,
   dnsBlocklistApi,
@@ -1851,6 +1852,21 @@ function ZoneDetailView({
           </p>
         </div>
         <div className="flex items-center gap-2">
+          <AskAIButton
+            context={[
+              `DNS zone ${zone.name}`,
+              `type: ${zone.zone_type}`,
+              `kind: ${zone.kind}`,
+              group?.name ? `server group: ${group.name}` : null,
+              `TTL: ${zone.ttl}`,
+              zone.last_serial ? `last serial: ${zone.last_serial}` : null,
+              zone.primary_ns ? `primary NS: ${zone.primary_ns}` : null,
+              `zone_id: ${zone.id}`,
+            ]
+              .filter(Boolean)
+              .join(", ")}
+            label="Ask AI about this zone"
+          />
           {!isForward && (
             <HeaderButton
               icon={RefreshCw}

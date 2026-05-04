@@ -82,6 +82,7 @@ import {
   useDraggableModal,
 } from "@/components/ui/use-draggable-modal";
 import { HeaderButton } from "@/components/ui/header-button";
+import { AskAIButton } from "@/components/copilot/AskAIButton";
 import {
   ImportModal,
   ExportButton,
@@ -3734,6 +3735,25 @@ function SubnetDetail({
               onResize={() => setShowResizeSubnet(true)}
               onScan={() => setShowSubnetScan(true)}
               onSplit={() => setShowSplitSubnet(true)}
+            />
+            <AskAIButton
+              context={[
+                `Subnet ${subnet.network}`,
+                subnet.name ? `name: ${subnet.name}` : null,
+                subnet.description
+                  ? `description: ${subnet.description}`
+                  : null,
+                spaceName ? `space: ${spaceName}` : null,
+                block ? `block: ${block.network}` : null,
+                subnet.vlan_id != null ? `VLAN: ${subnet.vlan_id}` : null,
+                subnet.gateway ? `gateway: ${subnet.gateway}` : null,
+                `utilization: ${(subnet.utilization_percent ?? 0).toFixed(1)}%`,
+                `${subnet.allocated_ips ?? 0} of ${subnet.total_ips ?? 0} IPs allocated`,
+                `subnet_id: ${subnet.id}`,
+              ]
+                .filter(Boolean)
+                .join(", ")}
+              label="Ask AI about this subnet"
             />
             <HeaderButton icon={Pencil} onClick={() => setShowEditSubnet(true)}>
               Edit

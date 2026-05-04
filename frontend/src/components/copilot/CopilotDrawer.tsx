@@ -35,7 +35,21 @@ import {
  *   │ [textarea]                  [send]  │
  *   └─────────────────────────────────────┘
  */
-export function CopilotDrawer({ onClose }: { onClose: () => void }) {
+export function CopilotDrawer({
+  onClose,
+  pendingContext,
+  onContextConsumed,
+}: {
+  onClose: () => void;
+  /** Set when the drawer was opened via ``askAI({ context })``. Forwarded
+   *  to the chat endpoint as ``initial_context`` on the first new-session
+   *  turn so it pre-seeds the system prompt. */
+  pendingContext?: string | null;
+  /** Called by the drawer once ``pendingContext`` has been consumed
+   *  (i.e. the first chat turn fired with it included), so the parent
+   *  can clear its state and avoid re-injecting on subsequent opens. */
+  onContextConsumed?: () => void;
+}) {
   const qc = useQueryClient();
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
   // Local in-flight stream — mirror of what's also being persisted on
@@ -86,6 +100,20 @@ export function CopilotDrawer({ onClose }: { onClose: () => void }) {
     enabled: activeSessionId !== null,
   });
 
+  // ``pendingContext`` arrives when the drawer was opened via
+  // ``askAI({ context })`` (right-click "Ask AI about this"). Whenever
+  // a context is present, force a fresh session — the operator's
+  // intent is "ask the model about this resource I'm looking at",
+  // not "tack this onto whatever conversation I had open." Without
+  // this reset the context would be silently dropped on existing
+  // sessions because the system prompt is snapshotted at session
+  // create.
+  useEffect(() => {
+    if (pendingContext) {
+      setActiveSessionId(null);
+    }
+  }, [pendingContext]);
+
   // Esc closes the drawer.
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
@@ -119,11 +147,20 @@ export function CopilotDrawer({ onClose }: { onClose: () => void }) {
       setStreamingError(null);
       setPendingUserMessage(message);
       let resolvedSessionId = activeSessionId;
+      // ``initial_context`` only matters on a *new* session — the
+      // backend ignores it once a session has its system prompt
+      // snapshotted. Notify the parent the moment we send it so it
+      // doesn't reinject on a follow-up "Ask AI" without resetting.
+      const includeContext =
+        activeSessionId === null && Boolean(pendingContext);
       try {
         for await (const ev of streamChatTurn(
           {
             message,
             session_id: activeSessionId ?? undefined,
+            initial_context: includeContext
+              ? (pendingContext ?? undefined)
+              : undefined,
           },
           ctrl.signal,
         )) {
@@ -162,6 +199,12 @@ export function CopilotDrawer({ onClose }: { onClose: () => void }) {
         }
       } finally {
         abortRef.current = null;
+        if (includeContext) {
+          // Tell the parent we consumed the initial context — it will
+          // clear its ``pendingContext`` state so subsequent opens
+          // (without an ``askAI`` event) don't re-inject anything.
+          onContextConsumed?.();
+        }
       }
       return resolvedSessionId;
     },

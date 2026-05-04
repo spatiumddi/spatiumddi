@@ -24,6 +24,7 @@ import {
   MODAL_BACKDROP_CLS,
   useDraggableModal,
 } from "@/components/ui/use-draggable-modal";
+import { AskAIButton } from "@/components/copilot/AskAIButton";
 import { IPNetworkTab } from "./IPNetworkTab";
 import { SeenDot } from "./SeenDot";
 
@@ -199,6 +200,26 @@ export function IPDetailModal({
             className="flex flex-shrink-0 items-center gap-2"
             onClick={(e) => e.stopPropagation()}
           >
+            <AskAIButton
+              context={[
+                `IP address ${addr.address}`,
+                addr.hostname ? `hostname: ${addr.hostname}` : null,
+                addr.fqdn ? `FQDN: ${addr.fqdn}` : null,
+                addr.mac_address ? `MAC: ${addr.mac_address}` : null,
+                `status: ${addr.status}`,
+                addr.role ? `role: ${addr.role}` : null,
+                addr.description ? `description: ${addr.description}` : null,
+                addr.last_seen_at
+                  ? `last seen: ${addr.last_seen_at}` +
+                    (addr.last_seen_method ? ` (${addr.last_seen_method})` : "")
+                  : null,
+                `subnet_id: ${addr.subnet_id}`,
+                `ip_address_id: ${addr.id}`,
+              ]
+                .filter(Boolean)
+                .join(", ")}
+              label="Ask AI about this IP"
+            />
             <button
               type="button"
               onClick={onScan}

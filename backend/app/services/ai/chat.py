@@ -134,6 +134,7 @@ class ChatOrchestrator:
         session_id: str | None,
         provider: AIProvider,
         model: str,
+        initial_context: str | None = None,
     ) -> AIChatSession:
         if session_id:
             row = await self.db.get(AIChatSession, session_id)
@@ -141,12 +142,26 @@ class ChatOrchestrator:
                 raise PermissionError("session not found or not yours")
             return row
         tools = REGISTRY.read_only()
+        system_prompt = build_system_prompt(self.user, tools)
+        # "Ask AI about this" — operator clicked a context affordance
+        # in the IPAM / DNS / DHCP UI; the frontend supplied a
+        # human-readable summary of what they were looking at. Append
+        # it to the system prompt so the model can answer questions
+        # without the operator having to restate the context. Wrapping
+        # in delimiters helps the model treat it as factual reference.
+        if initial_context:
+            system_prompt += (
+                "\n\n---\nThe operator started this chat from a specific "
+                "resource. Use this as background; their question may or "
+                "may not be about it.\n"
+                f"{initial_context.strip()}\n---"
+            )
         session = AIChatSession(
             user_id=self.user.id,
             name="Untitled",
             provider_id=provider.id,
             model=model,
-            system_prompt=build_system_prompt(self.user, tools),
+            system_prompt=system_prompt,
         )
         self.db.add(session)
         await self.db.flush()
