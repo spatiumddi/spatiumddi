@@ -34,6 +34,7 @@ import {
   ContextMenuTrigger,
 } from "@/components/ui/context-menu";
 import { HeaderButton } from "@/components/ui/header-button";
+import { AskAIButton } from "@/components/copilot/AskAIButton";
 import { CreateServerGroupModal } from "./CreateServerGroupModal";
 import { CreateServerModal } from "./CreateServerModal";
 import { CreateScopeModal } from "./CreateScopeModal";
@@ -322,6 +323,18 @@ function GroupDetailView({
             )}
           </div>
           <div className="flex items-center gap-2">
+            <AskAIButton
+              context={[
+                `DHCP server group ${group.name}`,
+                `mode: ${group.mode}`,
+                `${servers.length} server${servers.length !== 1 ? "s" : ""}`,
+                group.description ? `description: ${group.description}` : null,
+                `group_id: ${group.id}`,
+              ]
+                .filter(Boolean)
+                .join(", ")}
+              tooltip="Ask AI about this DHCP group"
+            />
             <HeaderButton
               icon={RefreshCw}
               iconClassName={isFetching ? "animate-spin" : ""}
@@ -584,18 +597,36 @@ function ServerScopesTab({ server }: { server: DHCPServer }) {
                           {sc.ddns_enabled ? "on" : "off"}
                         </td>
                         <td className="px-3 py-2 text-right">
-                          <button
-                            onClick={() => setEditScope(sc)}
-                            className="rounded p-1 text-muted-foreground hover:text-foreground"
-                          >
-                            <Pencil className="h-3.5 w-3.5" />
-                          </button>
-                          <button
-                            onClick={() => setDelScope(sc)}
-                            className="rounded p-1 text-muted-foreground hover:text-destructive"
-                          >
-                            <Trash2 className="h-3.5 w-3.5" />
-                          </button>
+                          <div className="inline-flex items-center justify-end gap-1">
+                            <AskAIButton
+                              context={[
+                                `DHCP scope ${sc.name}`,
+                                sc.subnet_network ? `subnet: ${sc.subnet_network}` : null,
+                                `enabled: ${sc.enabled ? "yes" : "no"}`,
+                                `lease time: ${sc.lease_time}s`,
+                                `DDNS: ${sc.ddns_enabled ? "on" : "off"}`,
+                                `scope_id: ${sc.id}`,
+                                sc.subnet_id ? `subnet_id: ${sc.subnet_id}` : null,
+                              ]
+                                .filter(Boolean)
+                                .join(", ")}
+                              tooltip="Ask AI about this scope"
+                              iconOnly
+                              className="px-1.5 py-1"
+                            />
+                            <button
+                              onClick={() => setEditScope(sc)}
+                              className="rounded p-1 text-muted-foreground hover:text-foreground"
+                            >
+                              <Pencil className="h-3.5 w-3.5" />
+                            </button>
+                            <button
+                              onClick={() => setDelScope(sc)}
+                              className="rounded p-1 text-muted-foreground hover:text-destructive"
+                            >
+                              <Trash2 className="h-3.5 w-3.5" />
+                            </button>
+                          </div>
                         </td>
                       </tr>
                     </ContextMenuTrigger>

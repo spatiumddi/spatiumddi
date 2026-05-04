@@ -2350,6 +2350,20 @@ function ZoneDetailView({
                               </div>
                             ) : (
                               <div className="flex items-center justify-end gap-1">
+                                <AskAIButton
+                                  context={[
+                                    `DNS record ${r.name} ${r.record_type} ${r.value}`,
+                                    r.ttl != null ? `TTL: ${r.ttl}` : null,
+                                    r.priority != null ? `priority: ${r.priority}` : null,
+                                    `zone: ${zone.name}`,
+                                    `record_id: ${r.id}`,
+                                  ]
+                                    .filter(Boolean)
+                                    .join(", ")}
+                                  tooltip="Ask AI about this record"
+                                  iconOnly
+                                  className="h-6 px-1 py-0"
+                                />
                                 <button
                                   className="h-6 w-6 flex items-center justify-center rounded text-muted-foreground hover:text-foreground"
                                   onClick={() => setPropagationRecord(r)}

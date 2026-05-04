@@ -19,6 +19,7 @@ import {
 } from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
+import { AskAIButton } from "@/components/copilot/AskAIButton";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -468,6 +469,27 @@ export function AlertsPage() {
                     </td>
                     <td className="px-4 py-2">
                       <div className="flex justify-end gap-1">
+                        <AskAIButton
+                          context={[
+                            `Alert rule ${r.name}`,
+                            `type: ${r.rule_type}`,
+                            `severity: ${r.severity}`,
+                            r.threshold_percent != null
+                              ? `threshold: ${r.threshold_percent}%`
+                              : null,
+                            r.threshold_days != null
+                              ? `threshold: ${r.threshold_days} days`
+                              : null,
+                            r.server_type ? `server type: ${r.server_type}` : null,
+                            r.enabled ? "enabled" : "disabled",
+                            `rule_id: ${r.id}`,
+                          ]
+                            .filter(Boolean)
+                            .join(", ")}
+                          tooltip="Ask AI about this rule"
+                          iconOnly
+                          className="px-1.5 py-1"
+                        />
                         <button
                           onClick={() => toggle.mutate(r)}
                           title={r.enabled ? "Disable" : "Enable"}
@@ -575,14 +597,31 @@ export function AlertsPage() {
                       )}
                     </td>
                     <td className="px-4 py-2">
-                      {!ev.resolved_at && (
-                        <button
-                          onClick={() => resolve.mutate(ev.id)}
-                          className="rounded border px-2 py-0.5 text-[11px] hover:bg-accent"
-                        >
-                          Resolve
-                        </button>
-                      )}
+                      <div className="flex items-center justify-end gap-1">
+                        <AskAIButton
+                          context={[
+                            `Alert event on ${ev.subject_type} ${ev.subject_display}`,
+                            `severity: ${ev.severity}`,
+                            `message: ${ev.message}`,
+                            `fired_at: ${ev.fired_at}`,
+                            ev.resolved_at
+                              ? `resolved_at: ${ev.resolved_at}`
+                              : "state: open",
+                            `event_id: ${ev.id}`,
+                          ].join(", ")}
+                          tooltip="Ask AI about this alert"
+                          iconOnly
+                          className="px-1.5 py-1"
+                        />
+                        {!ev.resolved_at && (
+                          <button
+                            onClick={() => resolve.mutate(ev.id)}
+                            className="rounded border px-2 py-0.5 text-[11px] hover:bg-accent"
+                          >
+                            Resolve
+                          </button>
+                        )}
+                      </div>
                     </td>
                   </tr>
                 ))}

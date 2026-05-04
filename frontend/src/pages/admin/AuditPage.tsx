@@ -3,6 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { ClipboardList, ChevronLeft, ChevronRight, X } from "lucide-react";
 import { auditApi, type AuditLogEntry } from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
+import { AskAIButton } from "@/components/copilot/AskAIButton";
 
 const PAGE_SIZE = 50;
 
@@ -332,11 +333,30 @@ export function AuditPage() {
                     <td className="px-3 py-2 whitespace-nowrap">
                       <ResultBadge result={entry.result} />
                     </td>
-                    <td
-                      className="px-3 py-2 font-mono text-xs text-muted-foreground whitespace-nowrap"
-                      colSpan={2}
-                    >
+                    <td className="px-3 py-2 font-mono text-xs text-muted-foreground whitespace-nowrap">
                       {entry.source_ip ?? "—"}
+                    </td>
+                    <td className="px-2 py-2 text-right">
+                      <AskAIButton
+                        context={[
+                          `Audit event: ${entry.action} on ${entry.resource_type}`,
+                          `summary: ${entry.resource_display}`,
+                          `result: ${entry.result}`,
+                          `user: ${entry.user_display_name}${
+                            entry.auth_source !== "local"
+                              ? ` (${entry.auth_source})`
+                              : ""
+                          }`,
+                          entry.source_ip ? `source_ip: ${entry.source_ip}` : null,
+                          `timestamp: ${entry.timestamp}`,
+                          `audit_id: ${entry.id}`,
+                        ]
+                          .filter(Boolean)
+                          .join(", ")}
+                        tooltip="Ask AI about this event"
+                        iconOnly
+                        className="px-1.5 py-1"
+                      />
                     </td>
                   </tr>
                 ))

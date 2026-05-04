@@ -25,6 +25,7 @@ import {
 } from "@/lib/api";
 import { HeaderButton } from "@/components/ui/header-button";
 import { Modal } from "@/components/ui/modal";
+import { AskAIButton } from "@/components/copilot/AskAIButton";
 
 import {
   ArpStatePill,
@@ -172,6 +173,24 @@ export function DeviceDetailView() {
             </div>
           </div>
           <div className="flex flex-shrink-0 items-center gap-2">
+            <AskAIButton
+              context={[
+                `Network device ${device.name}`,
+                `type: ${device.device_type}`,
+                `hostname: ${device.hostname}`,
+                `IP: ${device.ip_address}`,
+                device.vendor ? `vendor: ${device.vendor}` : null,
+                device.sys_name ? `sys_name: ${device.sys_name}` : null,
+                `SNMP: ${device.snmp_version}`,
+                `last poll status: ${device.last_poll_status ?? "unknown"}`,
+                device.last_poll_at ? `last poll at: ${device.last_poll_at}` : null,
+                device.is_active ? "active" : "inactive",
+                `device_id: ${device.id}`,
+              ]
+                .filter(Boolean)
+                .join(", ")}
+              tooltip="Ask AI about this device"
+            />
             <HeaderButton
               icon={RefreshCw}
               iconClassName={isFetching ? "animate-spin" : ""}
