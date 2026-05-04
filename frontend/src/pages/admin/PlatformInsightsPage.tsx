@@ -9,8 +9,10 @@ import {
   HardDrive,
   Network,
   RefreshCw,
+  Sparkles,
 } from "lucide-react";
 import {
+  aiApi,
   postgresApi,
   containersApi,
   type PostgresOverview,
@@ -567,6 +569,107 @@ export function PlatformInsightsPage() {
 
         {tab === "postgres" && <PostgresPanel />}
         {tab === "containers" && <ContainersPanel />}
+
+        <AIUsagePanel />
+      </div>
+    </div>
+  );
+}
+
+function AIUsagePanel() {
+  const usageQ = useQuery({
+    queryKey: ["ai-usage-admin"],
+    queryFn: aiApi.adminUsage,
+    staleTime: 60 * 1000,
+    refetchOnWindowFocus: false,
+    retry: false,
+  });
+
+  if (usageQ.isLoading) {
+    return null;
+  }
+  if (usageQ.error || !usageQ.data) {
+    // Endpoint is SuperAdmin-only — non-superadmins get a 403 here
+    // and we just hide the card. Network errors bail the same way.
+    return null;
+  }
+  const { today, last_7d, last_30d, top_users_today } = usageQ.data;
+
+  return (
+    <section>
+      <div className="mb-2 flex items-center gap-2">
+        <Sparkles className="h-4 w-4" />
+        <h2 className="text-base font-semibold">Operator Copilot usage</h2>
+      </div>
+      <div className="rounded-lg border bg-card p-4">
+        <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+          <UsageWindowCard label="Today" snapshot={today} />
+          <UsageWindowCard label="Last 7 days" snapshot={last_7d} />
+          <UsageWindowCard label="Last 30 days" snapshot={last_30d} />
+        </div>
+        {top_users_today.length > 0 && (
+          <div className="mt-5">
+            <div className="mb-2 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+              Top users today
+            </div>
+            <div className="overflow-x-auto rounded-md border">
+              <table className="w-full text-sm">
+                <thead className="border-b bg-muted/30 text-left text-xs uppercase text-muted-foreground">
+                  <tr>
+                    <th className="px-3 py-1.5">User</th>
+                    <th className="px-3 py-1.5 text-right">Messages</th>
+                    <th className="px-3 py-1.5 text-right">Tokens</th>
+                    <th className="px-3 py-1.5 text-right">Cost</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {top_users_today.map((u) => (
+                    <tr key={u.user_id} className="border-b last:border-b-0">
+                      <td className="px-3 py-1.5 font-medium">{u.username}</td>
+                      <td className="px-3 py-1.5 text-right">{u.messages}</td>
+                      <td className="px-3 py-1.5 text-right text-muted-foreground">
+                        {(u.tokens_in + u.tokens_out).toLocaleString()}
+                      </td>
+                      <td className="px-3 py-1.5 text-right font-mono text-xs">
+                        ${parseFloat(u.cost_usd).toFixed(4)}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+      </div>
+    </section>
+  );
+}
+
+function UsageWindowCard({
+  label,
+  snapshot,
+}: {
+  label: string;
+  snapshot: import("@/lib/api").AIUsageSnapshot;
+}) {
+  const tokens = snapshot.tokens_in + snapshot.tokens_out;
+  const cost = parseFloat(snapshot.cost_usd);
+  return (
+    <div className="rounded-md border bg-muted/20 p-3">
+      <div className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+        {label}
+      </div>
+      <div className="mt-2 flex flex-wrap items-baseline gap-x-3 gap-y-1">
+        <span className="text-2xl font-semibold">{snapshot.messages}</span>
+        <span className="text-xs text-muted-foreground">
+          message{snapshot.messages === 1 ? "" : "s"}
+        </span>
+      </div>
+      <div className="mt-1 grid grid-cols-2 gap-x-4 gap-y-0.5 text-xs text-muted-foreground">
+        <span>Tokens</span>
+        <span className="text-right font-mono">{tokens.toLocaleString()}</span>
+        <span>Cost</span>
+        <span className="text-right font-mono">${cost.toFixed(4)}</span>
       </div>
     </div>
   );

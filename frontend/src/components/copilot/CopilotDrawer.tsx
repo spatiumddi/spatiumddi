@@ -68,6 +68,15 @@ export function CopilotDrawer({ onClose }: { onClose: () => void }) {
     staleTime: 30 * 1000,
   });
 
+  // Wave 4 — operator's own today-so-far totals + caps. Refetches
+  // after every chat turn so the drawer's progress bar stays current.
+  const usageQ = useQuery({
+    queryKey: ["ai-usage-me"],
+    queryFn: aiApi.myUsage,
+    staleTime: 10 * 1000,
+    refetchOnWindowFocus: false,
+  });
+
   const detailQ = useQuery({
     queryKey: ["ai-session", activeSessionId],
     queryFn: () =>
@@ -163,6 +172,9 @@ export function CopilotDrawer({ onClose }: { onClose: () => void }) {
       if (sid) {
         qc.invalidateQueries({ queryKey: ["ai-session", sid] });
       }
+      // Refresh the usage panel — message count + cost will have
+      // ticked up after the persisted assistant message.
+      qc.invalidateQueries({ queryKey: ["ai-usage-me"] });
       setStreamingContent("");
       setStreamingTools([]);
       setPendingUserMessage(null);
@@ -200,6 +212,22 @@ export function CopilotDrawer({ onClose }: { onClose: () => void }) {
     return detailQ.data.messages.filter((m) => m.role !== "system");
   }, [detailQ.data]);
 
+  // The most recent user message in the persisted history. Used to
+  // suppress the optimistic ``pendingUserMessage`` bubble once the
+  // canonical version has shown up — without this, the first turn
+  // of a new session double-renders the user message: once from
+  // ``pendingUserMessage`` (still set until onSettled), once from
+  // detailQ (refetched the moment ``session_id`` arrives mid-stream).
+  const lastUserMessageContent = useMemo<string | null>(() => {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role === "user") return messages[i].content;
+    }
+    return null;
+  }, [messages]);
+  const showPendingUserMessage =
+    pendingUserMessage !== null &&
+    pendingUserMessage !== lastUserMessageContent;
+
   const sessionLabel = useMemo(() => {
     if (!detailQ.data) return null;
     return `${detailQ.data.model}${detailQ.data.provider_id ? "" : " (provider missing)"}`;
@@ -226,6 +254,7 @@ export function CopilotDrawer({ onClose }: { onClose: () => void }) {
                 {sessionLabel}
               </div>
             )}
+            {usageQ.data && <UsageChip usage={usageQ.data} />}
           </div>
           <div className="flex shrink-0 items-center gap-1">
             <button
@@ -298,7 +327,7 @@ export function CopilotDrawer({ onClose }: { onClose: () => void }) {
               stream closes — without this, second-and-later turns
               appear to swallow the user's message during the LLM's
               think time. */}
-          {pendingUserMessage && (
+          {showPendingUserMessage && (
             <div className="mb-3 flex justify-end">
               <div className="max-w-[85%] rounded-lg bg-primary px-3 py-2 text-sm text-primary-foreground">
                 <pre className="whitespace-pre-wrap break-words font-sans">
@@ -622,5 +651,82 @@ function ChatComposer({
         </button>
       )}
     </form>
+  );
+}
+
+/**
+ * Today-so-far usage indicator (Wave 4). Shows three chips when caps
+ * are configured: messages today, tokens today, cost today. When a
+ * cap is set, the relevant chip becomes a progress bar that fills as
+ * the operator approaches the cap; over-cap chips render in
+ * destructive tint.
+ */
+function UsageChip({ usage }: { usage: import("@/lib/api").AIUsageSnapshot }) {
+  const tokens = usage.tokens_in + usage.tokens_out;
+  const costNum = parseFloat(usage.cost_usd);
+  const capCostNum = usage.cap_cost_usd ? parseFloat(usage.cap_cost_usd) : null;
+
+  // Token cap progress
+  const tokenPct =
+    usage.cap_token != null && usage.cap_token > 0
+      ? Math.min(100, (tokens / usage.cap_token) * 100)
+      : null;
+  // Cost cap progress
+  const costPct =
+    capCostNum != null && capCostNum > 0
+      ? Math.min(100, (costNum / capCostNum) * 100)
+      : null;
+
+  return (
+    <div className="mt-1.5 flex flex-wrap items-center gap-1.5 text-[10px] text-muted-foreground">
+      <span>
+        {usage.messages} msg
+        {usage.messages === 1 ? "" : "s"} today
+      </span>
+      <span aria-hidden>·</span>
+      {tokenPct !== null ? (
+        <ProgressChip
+          label={`${tokens.toLocaleString()} / ${usage.cap_token!.toLocaleString()} tokens`}
+          pct={tokenPct}
+        />
+      ) : (
+        <span>{tokens.toLocaleString()} tokens</span>
+      )}
+      {(costNum > 0 || capCostNum != null) && (
+        <>
+          <span aria-hidden>·</span>
+          {costPct !== null ? (
+            <ProgressChip
+              label={`$${costNum.toFixed(2)} / $${capCostNum!.toFixed(2)}`}
+              pct={costPct}
+            />
+          ) : (
+            <span>${costNum.toFixed(2)}</span>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+function ProgressChip({ label, pct }: { label: string; pct: number }) {
+  const over = pct >= 100;
+  return (
+    <span
+      className={`relative inline-flex items-center overflow-hidden rounded border px-1.5 py-0.5 ${
+        over
+          ? "border-destructive/40 bg-destructive/5 text-destructive"
+          : "border-foreground/15"
+      }`}
+    >
+      <span
+        aria-hidden
+        className={`absolute inset-y-0 left-0 ${
+          over ? "bg-destructive/20" : "bg-primary/15"
+        }`}
+        style={{ width: `${pct}%` }}
+      />
+      <span className="relative">{label}</span>
+    </span>
   );
 }

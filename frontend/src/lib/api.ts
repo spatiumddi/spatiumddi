@@ -2449,7 +2449,39 @@ export const aiApi = {
     api
       .get<{ tools: AIToolEntry[]; total: number }>("/ai/tools")
       .then((r) => r.data),
+
+  // ── Usage observability (Wave 4) ────────────────────────────────
+  myUsage: () => api.get<AIUsageSnapshot>("/ai/usage/me").then((r) => r.data),
+  adminUsage: () => api.get<AIAdminUsage>("/ai/usage").then((r) => r.data),
 };
+
+// ── AI usage observability types ─────────────────────────────────────
+
+export interface AIUsageSnapshot {
+  messages: number;
+  tokens_in: number;
+  tokens_out: number;
+  // Returned as a string to preserve Decimal precision.
+  cost_usd: string;
+  cap_token: number | null;
+  cap_cost_usd: string | null;
+}
+
+export interface AIAdminUsageTopUser {
+  user_id: string;
+  username: string;
+  messages: number;
+  tokens_in: number;
+  tokens_out: number;
+  cost_usd: string;
+}
+
+export interface AIAdminUsage {
+  today: AIUsageSnapshot;
+  last_7d: AIUsageSnapshot;
+  last_30d: AIUsageSnapshot;
+  top_users_today: AIAdminUsageTopUser[];
+}
 
 // ── AI chat types ────────────────────────────────────────────────────
 
