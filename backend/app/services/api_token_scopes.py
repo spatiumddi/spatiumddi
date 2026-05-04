@@ -63,6 +63,11 @@ _AGENT_PREFIXES: tuple[str, ...] = (
     "/api/v1/dns/agents",
     "/api/v1/dhcp/agents",
 )
+# Operator Copilot — MCP endpoint accepts POST under JSON-RPC, so it
+# doesn't fit the generic GET = read mapping. Tokens with ``read`` scope
+# may POST here because every Wave 2 tool is read-only. Phase 3 adds an
+# ``mcp:write`` scope to gate write-tool calls.
+_MCP_PREFIXES: tuple[str, ...] = ("/api/v1/ai/mcp",)
 
 
 def _path_under(path: str, prefixes: tuple[str, ...]) -> bool:
@@ -81,6 +86,10 @@ def scope_matches_request(scopes: list[str], method: str, path: str) -> bool:
     is_safe = method in _SAFE_METHODS
     for scope in scopes:
         if scope == "read" and is_safe:
+            return True
+        # MCP tools are read-only in Wave 2 — any safe method or a
+        # JSON-RPC POST to ``/api/v1/ai/mcp`` is fine under ``read``.
+        if scope == "read" and _path_under(path, _MCP_PREFIXES):
             return True
         if scope == "ipam:write" and _path_under(path, _IPAM_PREFIXES):
             return True
