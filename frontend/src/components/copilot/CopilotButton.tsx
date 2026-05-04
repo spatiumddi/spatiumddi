@@ -15,7 +15,9 @@ import { onAskAIRequested } from "./askAI";
  *
  * Three ways to open the drawer:
  *   - Click the floating button.
- *   - Cmd-K / Ctrl-K (modern command-palette muscle memory).
+ *   - Cmd-K → "Ask AI: <query>" entry at the bottom of the global
+ *     search palette (the palette owns Cmd-K end-to-end so there's
+ *     no shortcut conflict).
  *   - ``askAI({ context })`` from anywhere — the "Ask AI about this"
  *     affordances on subnet / IP / DNS rows fire this event.
  *
@@ -27,6 +29,7 @@ import { onAskAIRequested } from "./askAI";
 export function CopilotButton() {
   const [open, setOpen] = useState(false);
   const [pendingContext, setPendingContext] = useState<string | null>(null);
+  const [pendingPrompt, setPendingPrompt] = useState<string | null>(null);
 
   // Tiny query to gate visibility — fetches the provider list once
   // every 5 minutes and renders the button only if ≥ 1 enabled.
@@ -40,25 +43,18 @@ export function CopilotButton() {
     retry: false,
   });
 
-  // Cmd-K / Ctrl-K opens the drawer.
-  useEffect(() => {
-    function onKey(e: KeyboardEvent) {
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
-        e.preventDefault();
-        setOpen((prev) => !prev);
-      }
-    }
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, []);
-
-  // ``askAI({ context })`` from any "Ask AI about this" affordance
-  // bubbles up here as a window event. Open the drawer + remember the
-  // context so the drawer can seed the next new-session's prompt.
+  // ``askAI({ context, prompt })`` from any "Ask AI about this"
+  // affordance — or the Cmd-K palette's "Ask AI: <query>" entry —
+  // bubbles up here as a window event. Open the drawer + remember
+  // the context (seeds system prompt) and / or the prompt (pre-fills
+  // the textarea) so the drawer can hand them off to its children.
   useEffect(() => {
     return onAskAIRequested((detail) => {
       if (detail.context) {
         setPendingContext(detail.context);
+      }
+      if (detail.prompt) {
+        setPendingPrompt(detail.prompt);
       }
       setOpen(true);
     });
@@ -74,7 +70,7 @@ export function CopilotButton() {
       <button
         type="button"
         onClick={() => setOpen(true)}
-        title="Operator Copilot — Cmd/Ctrl+K"
+        title="Operator Copilot"
         className="fixed bottom-4 right-4 z-40 inline-flex items-center gap-1.5 rounded-full bg-primary px-4 py-2 text-sm font-medium text-primary-foreground shadow-lg transition-transform hover:scale-105 hover:bg-primary/90"
       >
         <Sparkles className="h-4 w-4" />
@@ -85,9 +81,12 @@ export function CopilotButton() {
           onClose={() => {
             setOpen(false);
             setPendingContext(null);
+            setPendingPrompt(null);
           }}
           pendingContext={pendingContext}
           onContextConsumed={() => setPendingContext(null)}
+          pendingPrompt={pendingPrompt}
+          onPromptConsumed={() => setPendingPrompt(null)}
         />
       )}
     </>

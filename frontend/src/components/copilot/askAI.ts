@@ -20,6 +20,11 @@ export interface AskAIDetail {
   /** Human-readable context block injected into the new session's
    *  system prompt. Keep concise — caps at 4000 chars on the backend. */
   context?: string;
+  /** Prefill text for the chat composer textarea. Used by the
+   *  Cmd-K "Ask AI: <query>" entry — the operator's typed query
+   *  becomes the next message but they can still edit before
+   *  sending. Cleared once the drawer reads it. */
+  prompt?: string;
 }
 
 export function askAI(detail: AskAIDetail = {}): void {

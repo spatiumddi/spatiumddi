@@ -41,6 +41,8 @@ export function CopilotDrawer({
   onClose,
   pendingContext,
   onContextConsumed,
+  pendingPrompt,
+  onPromptConsumed,
 }: {
   onClose: () => void;
   /** Set when the drawer was opened via ``askAI({ context })``. Forwarded
@@ -51,6 +53,13 @@ export function CopilotDrawer({
    *  (i.e. the first chat turn fired with it included), so the parent
    *  can clear its state and avoid re-injecting on subsequent opens. */
   onContextConsumed?: () => void;
+  /** Set when the drawer was opened via ``askAI({ prompt })``
+   *  (typically from the Cmd-K palette). Pre-fills the chat composer
+   *  textarea so the operator can review or edit before sending. */
+  pendingPrompt?: string | null;
+  /** Called once ``pendingPrompt`` has been written into the composer
+   *  state, so the parent doesn't keep re-injecting it on re-renders. */
+  onPromptConsumed?: () => void;
 }) {
   const qc = useQueryClient();
   const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
@@ -419,6 +428,8 @@ export function CopilotDrawer({
           onSend={(text) => sendMut.mutate(text)}
           onCancel={() => abortRef.current?.abort()}
           isStreaming={sendMut.isPending}
+          pendingPrompt={pendingPrompt ?? null}
+          onPromptConsumed={onPromptConsumed}
         />
       </div>
     </div>
@@ -681,11 +692,15 @@ function ChatComposer({
   onSend,
   onCancel,
   isStreaming,
+  pendingPrompt,
+  onPromptConsumed,
 }: {
   disabled: boolean;
   onSend: (text: string) => void;
   onCancel: () => void;
   isStreaming: boolean;
+  pendingPrompt?: string | null;
+  onPromptConsumed?: () => void;
 }) {
   const [text, setText] = useState("");
   const [showPrompts, setShowPrompts] = useState(false);
@@ -699,6 +714,17 @@ function ChatComposer({
     enabled: showPrompts,
     staleTime: 60_000,
   });
+
+  // Drain ``pendingPrompt`` into the textarea once. Notify the parent
+  // via ``onPromptConsumed`` so it clears its state and we don't
+  // overwrite operator edits on the next re-render.
+  useEffect(() => {
+    if (pendingPrompt) {
+      setText(pendingPrompt);
+      onPromptConsumed?.();
+      setTimeout(() => taRef.current?.focus(), 0);
+    }
+  }, [pendingPrompt, onPromptConsumed]);
 
   function submit() {
     const trimmed = text.trim();

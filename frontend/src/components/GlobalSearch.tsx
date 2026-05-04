@@ -6,6 +6,7 @@ import {
   Layers,
   Globe,
   MapPin,
+  Sparkles,
   X,
   Server,
   FileText,
@@ -13,6 +14,7 @@ import {
 import { useQuery } from "@tanstack/react-query";
 import { searchApi, type SearchResult } from "@/lib/api";
 import { cn } from "@/lib/utils";
+import { askAI } from "@/components/copilot/askAI";
 
 function useDebounce<T>(value: T, delay: number): T {
   const [debounced, setDebounced] = useState(value);
@@ -244,15 +246,33 @@ export function GlobalSearch() {
     [navigate],
   );
 
+  // The "Ask AI" row sits at index ``results.length`` after every
+  // structured search hit. Showing it whenever the operator has typed
+  // something gives them a deterministic escape hatch — even if the
+  // search service didn't match anything, they can hit ↓-Enter to
+  // hand the query straight to the Copilot.
+  const askAIVisible = debouncedQuery.length > 0;
+  const askAIIdx = results.length;
+  const totalRows = results.length + (askAIVisible ? 1 : 0);
+
+  const handleAskAI = useCallback(() => {
+    setOpen(false);
+    askAI({ prompt: query.trim() });
+  }, [query]);
+
   function handleKeyDown(e: React.KeyboardEvent) {
     if (e.key === "ArrowDown") {
       e.preventDefault();
-      setActiveIdx((i) => Math.min(i + 1, results.length - 1));
+      setActiveIdx((i) => Math.min(i + 1, totalRows - 1));
     } else if (e.key === "ArrowUp") {
       e.preventDefault();
       setActiveIdx((i) => Math.max(i - 1, 0));
-    } else if (e.key === "Enter" && results[activeIdx]) {
-      handleSelect(results[activeIdx]);
+    } else if (e.key === "Enter") {
+      if (askAIVisible && activeIdx === askAIIdx) {
+        handleAskAI();
+      } else if (results[activeIdx]) {
+        handleSelect(results[activeIdx]);
+      }
     } else if (e.key === "Escape") {
       setOpen(false);
     }
@@ -342,6 +362,29 @@ export function GlobalSearch() {
                   onSelect={handleSelect}
                 />
               ))}
+              {askAIVisible && (
+                <button
+                  type="button"
+                  onClick={handleAskAI}
+                  className={cn(
+                    "flex w-full items-center gap-3 border-t px-4 py-2.5 text-left text-sm transition-colors",
+                    activeIdx === askAIIdx
+                      ? "bg-primary/5"
+                      : "hover:bg-accent/50",
+                  )}
+                >
+                  <Sparkles className="h-4 w-4 flex-shrink-0 text-primary" />
+                  <div className="min-w-0 flex-1">
+                    <div className="truncate">
+                      Ask AI:{" "}
+                      <span className="font-medium">"{debouncedQuery}"</span>
+                    </div>
+                    <div className="text-[11px] text-muted-foreground">
+                      Open Copilot with this query pre-filled
+                    </div>
+                  </div>
+                </button>
+              )}
             </div>
 
             {results.length > 0 && (
