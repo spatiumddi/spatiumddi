@@ -36,6 +36,7 @@ dependencies = [
     "pywinrm>=0.4.3",
     "pysnmp~=6.2",
     "pyotp>=2.9.0",
+    "openai>=1.40.0",
 ]
 
 [project.optional-dependencies]

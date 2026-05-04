@@ -83,6 +83,7 @@ const adminIdentityNav = [
 ];
 
 const adminPlatformNav = [
+  { label: "AI Providers", icon: Sparkles, to: "/admin/ai/providers" },
   { label: "Alerts", icon: BellRing, to: "/admin/alerts" },
   { label: "Audit Log", icon: ClipboardList, to: "/admin/audit" },
   { label: "Compliance", icon: ShieldCheck, to: "/admin/compliance" },

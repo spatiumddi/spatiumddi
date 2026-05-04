@@ -2322,6 +2322,104 @@ export const authProvidersApi = {
     api.delete(`/auth-providers/${id}/mappings/${mappingId}`),
 };
 
+// ── AI Providers (issue #90 — Operator Copilot) ────────────────────────────────
+
+export type AIProviderKind =
+  | "openai_compat"
+  | "anthropic"
+  | "google"
+  | "azure_openai";
+
+export const AI_PROVIDER_KIND_LABELS: Record<AIProviderKind, string> = {
+  openai_compat: "OpenAI-compatible (OpenAI / Ollama / vLLM / OpenWebUI / …)",
+  anthropic: "Anthropic Claude",
+  google: "Google Gemini",
+  azure_openai: "Azure OpenAI",
+};
+
+// Wave 1 ships only openai_compat. Other kinds appear in the dropdown
+// but the backend rejects them until the matching driver lands.
+export const AI_PROVIDER_KIND_AVAILABLE: AIProviderKind[] = ["openai_compat"];
+
+export interface AIProvider {
+  id: string;
+  name: string;
+  kind: AIProviderKind;
+  base_url: string;
+  has_api_key: boolean;
+  default_model: string;
+  is_enabled: boolean;
+  priority: number;
+  options: Record<string, unknown>;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface AIProviderCreate {
+  name: string;
+  kind: AIProviderKind;
+  base_url?: string;
+  api_key?: string | null;
+  default_model?: string;
+  is_enabled?: boolean;
+  priority?: number;
+  options?: Record<string, unknown>;
+}
+
+export interface AIProviderUpdate {
+  name?: string;
+  base_url?: string;
+  api_key?: string | null;
+  default_model?: string;
+  is_enabled?: boolean;
+  priority?: number;
+  options?: Record<string, unknown>;
+}
+
+export interface AITestConnectionResult {
+  ok: boolean;
+  detail: string;
+  latency_ms: number | null;
+  sample_models: string[];
+}
+
+export interface AIModelInfo {
+  id: string;
+  owned_by: string;
+  context_window: number | null;
+}
+
+export const aiApi = {
+  listProviders: () =>
+    api.get<AIProvider[]>("/ai/providers").then((r) => r.data),
+  getProvider: (id: string) =>
+    api.get<AIProvider>(`/ai/providers/${id}`).then((r) => r.data),
+  createProvider: (body: AIProviderCreate) =>
+    api.post<AIProvider>("/ai/providers", body).then((r) => r.data),
+  updateProvider: (id: string, body: AIProviderUpdate) =>
+    api.put<AIProvider>(`/ai/providers/${id}`, body).then((r) => r.data),
+  deleteProvider: (id: string) =>
+    api.delete<void>(`/ai/providers/${id}`).then((r) => r.data),
+  testProvider: (id: string) =>
+    api
+      .post<AITestConnectionResult>(`/ai/providers/${id}/test`, {})
+      .then((r) => r.data),
+  testUnsaved: (body: {
+    kind: AIProviderKind;
+    base_url?: string;
+    api_key?: string | null;
+    default_model?: string;
+    options?: Record<string, unknown>;
+  }) =>
+    api
+      .post<AITestConnectionResult>("/ai/providers/test", body)
+      .then((r) => r.data),
+  listModels: (id: string) =>
+    api
+      .get<{ models: AIModelInfo[] }>(`/ai/providers/${id}/models`)
+      .then((r) => r.data.models),
+};
+
 // ── Custom Fields ──────────────────────────────────────────────────────────────
 
 export interface CustomField {

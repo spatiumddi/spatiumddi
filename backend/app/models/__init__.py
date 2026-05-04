@@ -1,4 +1,5 @@
 from app.models.acme import ACMEAccount
+from app.models.ai import AIProvider
 from app.models.alerts import AlertEvent, AlertRule
 from app.models.asn import ASN, ASNRpkiRoa, BGPCommunity, BGPPeering
 from app.models.audit import AuditLog
@@ -70,6 +71,7 @@ from app.models.vrf import VRF
 
 __all__ = [
     "ACMEAccount",
+    "AIProvider",
     "Base",
     "AuditLog",
     "AuditForwardTarget",
