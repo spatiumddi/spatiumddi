@@ -445,6 +445,25 @@ class Subnet(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     # Status: active | deprecated | reserved | quarantine
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="active", index=True)
 
+    # ── Compliance / classification flags ────────────────────────────
+    # First-class booleans rather than freeform tags so auditor queries
+    # ("show me every PCI subnet, owner, last changed") are clean
+    # indexed predicates. Subnet-level only (not block / space) — the
+    # ask is precise scope tagging, not inheritance. Each column is
+    # individually indexed (partial index, ``WHERE col = true``) so
+    # the Compliance dashboard's three filtered lists each hit an
+    # index without competing with a single composite key. See
+    # ``/admin/compliance``.
+    pci_scope: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
+    hipaa_scope: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
+    internet_facing: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
+
     # Kubernetes integration provenance. When set, the subnet was auto-
     # created by the Kubernetes reconciler for this cluster; the FK
     # cascade-deletes mirrored subnets when the cluster row is dropped.

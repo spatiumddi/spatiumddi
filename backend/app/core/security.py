@@ -50,6 +50,33 @@ def decode_access_token(token: str) -> dict[str, Any]:
     return payload
 
 
+# ── MFA challenge tokens (issue #69) ──────────────────────────────────────────
+#
+# Short-lived JWT minted by ``/auth/login`` when a user has TOTP enabled. Only
+# valid as the ``mfa_token`` in ``/auth/login/mfa``. Carries ``type="mfa"`` so
+# it can never be mistaken for an access token by the auth deps. 5 min TTL
+# is enough for the user to fish their phone out and type the code without
+# leaving a window large enough to phish-replay.
+
+_MFA_TOKEN_TTL_MINUTES = 5
+
+
+def create_mfa_challenge_token(user_id: str) -> str:
+    expire = datetime.now(UTC) + timedelta(minutes=_MFA_TOKEN_TTL_MINUTES)
+    payload: dict[str, Any] = {"sub": user_id, "exp": expire, "type": "mfa"}
+    return jwt.encode(payload, settings.secret_key, algorithm=ALGORITHM)
+
+
+def decode_mfa_challenge_token(token: str) -> dict[str, Any]:
+    """Decode a challenge token. Raises JWTError on bad signature, expired,
+    or wrong type — same error class the access path uses so the login router
+    can collapse the failure modes."""
+    payload = jwt.decode(token, settings.secret_key, algorithms=[ALGORITHM])
+    if payload.get("type") != "mfa":
+        raise JWTError("Not an MFA challenge token")
+    return payload
+
+
 # ── API Tokens ─────────────────────────────────────────────────────────────────
 
 

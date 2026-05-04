@@ -84,6 +84,7 @@ const adminIdentityNav = [
 const adminPlatformNav = [
   { label: "Alerts", icon: BellRing, to: "/admin/alerts" },
   { label: "Audit Log", icon: ClipboardList, to: "/admin/audit" },
+  { label: "Compliance", icon: ShieldCheck, to: "/admin/compliance" },
   { label: "Custom Fields", icon: Tags, to: "/admin/custom-fields" },
   { label: "Platform Insights", icon: Cpu, to: "/admin/platform-insights" },
   { label: "Settings", icon: Settings, to: "/settings" },

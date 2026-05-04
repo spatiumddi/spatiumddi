@@ -482,6 +482,14 @@ export interface Subnet {
     | "udp_top100"
     | "aggressive";
   auto_profile_refresh_days?: number;
+  // Compliance / classification flags. First-class booleans (rather
+  // than freeform tags) so auditor queries — "show me every PCI
+  // subnet" — are clean indexed predicates. Default false on every
+  // subnet; flip via the Edit modal. Surfaces on the Compliance
+  // dashboard at /admin/compliance.
+  pci_scope?: boolean;
+  hipaa_scope?: boolean;
+  internet_facing?: boolean;
   dns_servers?: string[] | null;
   domain_name?: string | null;
   created_at?: string;
@@ -1016,6 +1024,9 @@ export const ipamApi = {
     space_id?: string;
     block_id?: string;
     vlan_ref_id?: string;
+    pci_scope?: boolean;
+    hipaa_scope?: boolean;
+    internet_facing?: boolean;
   }) => api.get<Subnet[]>("/ipam/subnets", { params }).then((r) => r.data),
   getSubnet: (id: string) =>
     api.get<Subnet>(`/ipam/subnets/${id}`).then((r) => r.data),
@@ -1553,10 +1564,28 @@ export const ipamIoApi = {
 };
 
 export interface LoginResponse {
-  access_token: string;
-  refresh_token: string;
+  // Set when MFA is NOT required — normal token issuance.
+  access_token: string | null;
+  refresh_token: string | null;
   token_type: string;
   force_password_change: boolean;
+  // Set when the user has TOTP enabled (issue #69). The frontend
+  // routes the operator into a TOTP prompt + posts to /auth/login/mfa
+  // with this challenge token + the second factor.
+  mfa_required?: boolean;
+  mfa_token?: string | null;
+}
+
+export interface MfaStatusResponse {
+  enabled: boolean;
+  enrolment_pending: boolean;
+  recovery_codes_remaining: number;
+}
+
+export interface MfaEnrolBeginResponse {
+  secret: string;
+  otpauth_uri: string;
+  recovery_codes: string[];
 }
 
 export interface AppUser {
@@ -3869,6 +3898,15 @@ export const authApi = {
     api
       .post<LoginResponse>("/auth/login", { username, password })
       .then((r) => r.data),
+  /** Complete a TOTP-gated login. Submit either ``code`` (6-digit
+   * authenticator) or ``recovery_code``; submitting both 422s. */
+  loginMfa: (
+    mfa_token: string,
+    body: { code?: string; recovery_code?: string },
+  ) =>
+    api
+      .post<LoginResponse>("/auth/login/mfa", { mfa_token, ...body })
+      .then((r) => r.data),
   publicProviders: () =>
     api.get<PublicAuthProvider[]>("/auth/providers").then((r) => r.data),
   logout: () => api.post("/auth/logout"),
@@ -3892,6 +3930,25 @@ export const authApi = {
         force_password_change: boolean;
         auth_source: string;
       }>("/auth/me")
+      .then((r) => r.data),
+
+  // ── MFA (issue #69) ─────────────────────────────────────────────────
+  mfaStatus: () =>
+    api.get<MfaStatusResponse>("/auth/mfa/status").then((r) => r.data),
+  mfaEnrollBegin: () =>
+    api
+      .post<MfaEnrolBeginResponse>("/auth/mfa/enroll/begin")
+      .then((r) => r.data),
+  mfaEnrollVerify: (code: string) =>
+    api.post("/auth/mfa/enroll/verify", { code }),
+  mfaDisable: (password: string, code: string) =>
+    api.post("/auth/mfa/disable", { password, code }),
+  mfaRegenerateRecoveryCodes: (password: string, code: string) =>
+    api
+      .post<MfaEnrolBeginResponse>("/auth/mfa/recovery-codes/regenerate", {
+        password,
+        code,
+      })
       .then((r) => r.data),
 };
 
@@ -4089,12 +4146,58 @@ export const logsApi = {
 
 // ── API Tokens ────────────────────────────────────────────────────────────────
 
+/** Coarse-grained scope vocabulary — see issue #74 +
+ * `app/services/api_token_scopes.py`. Empty list = no scope
+ * restriction (token still inherits the owner's RBAC). Non-empty
+ * = enforced at the auth layer BEFORE RBAC. Multiple scopes
+ * union; ``read`` covers safe-method requests across the surface.
+ */
+export type ApiTokenScope =
+  | "read"
+  | "ipam:write"
+  | "dns:write"
+  | "dhcp:write"
+  | "agent";
+
+export const API_TOKEN_SCOPES: {
+  value: ApiTokenScope;
+  label: string;
+  hint: string;
+}[] = [
+  {
+    value: "read",
+    label: "Read-only",
+    hint: "GET / HEAD / OPTIONS only — no mutations anywhere.",
+  },
+  {
+    value: "ipam:write",
+    label: "IPAM write",
+    hint: "Mutate /ipam/*, /vlans*, /vrfs*, /network-devices*.",
+  },
+  {
+    value: "dns:write",
+    label: "DNS write",
+    hint: "Mutate /dns/* + /dns-pools*. Excludes the agent surface.",
+  },
+  {
+    value: "dhcp:write",
+    label: "DHCP write",
+    hint: "Mutate /dhcp/*. Excludes the agent surface.",
+  },
+  {
+    value: "agent",
+    label: "Agent",
+    hint: "Bootstrap + push for /dns/agents/* and /dhcp/agents/*.",
+  },
+];
+
 export interface ApiToken {
   id: string;
   name: string;
   description: string;
   prefix: string;
   scope: string;
+  scopes: ApiTokenScope[];
   user_id: string | null;
   expires_at: string | null;
   last_used_at: string | null;
@@ -4106,6 +4209,7 @@ export interface ApiTokenCreate {
   name: string;
   description?: string;
   expires_in_days?: number | null;
+  scopes?: ApiTokenScope[];
 }
 
 /** Response from POST — contains the raw token ONCE. */
@@ -4117,6 +4221,7 @@ export interface ApiTokenUpdate {
   name?: string;
   description?: string;
   is_active?: boolean;
+  scopes?: ApiTokenScope[];
 }
 
 export const apiTokensApi = {

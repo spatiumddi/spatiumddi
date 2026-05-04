@@ -35,6 +35,7 @@ from app.api.deps import DB, CurrentUser
 from app.core.security import generate_api_token
 from app.models.audit import AuditLog
 from app.models.auth import APIToken
+from app.services.api_token_scopes import validate_scopes
 
 router = APIRouter()
 
@@ -51,6 +52,9 @@ class ApiTokenCreate(BaseModel):
     # allowed because some use cases genuinely need it).
     expires_at: datetime | None = None
     expires_in_days: int | None = Field(None, ge=1, le=3650)
+    # Coarse-grained scope vocabulary — see issue #74 +
+    # ``app.services.api_token_scopes``. Empty = no restriction.
+    scopes: list[str] = Field(default_factory=list)
 
     @field_validator("expires_in_days")
     @classmethod
@@ -59,6 +63,11 @@ class ApiTokenCreate(BaseModel):
         # fields. If both expires_at and expires_in_days are set we
         # prefer expires_at (more precise) and drop the days field.
         return v
+
+    @field_validator("scopes")
+    @classmethod
+    def _validate_scopes(cls, v: list[str]) -> list[str]:
+        return validate_scopes(v)
 
 
 class ApiTokenResponse(BaseModel):
@@ -69,6 +78,7 @@ class ApiTokenResponse(BaseModel):
     description: str
     prefix: str
     scope: str
+    scopes: list[str] = Field(default_factory=list)
     user_id: uuid.UUID | None
     expires_at: datetime | None
     last_used_at: datetime | None
@@ -94,6 +104,17 @@ class ApiTokenUpdate(BaseModel):
     name: str | None = Field(None, min_length=1, max_length=255)
     description: str | None = Field(None, max_length=1000)
     is_active: bool | None = None
+    # Operators can rotate the scope list on an existing token —
+    # tighten ("oops, this token shouldn't be writing DNS") without
+    # rotating the secret. Empty list explicitly clears restriction.
+    scopes: list[str] | None = None
+
+    @field_validator("scopes")
+    @classmethod
+    def _validate_scopes(cls, v: list[str] | None) -> list[str] | None:
+        if v is None:
+            return v
+        return validate_scopes(v)
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
@@ -142,6 +163,7 @@ async def create_token(
         token_hash=token_hash,
         prefix=display_prefix,
         scope="user",
+        scopes=body.scopes,
         user_id=current_user.id,
         created_by_user_id=current_user.id,
         expires_at=expires_at,
@@ -162,6 +184,7 @@ async def create_token(
                 "name": body.name,
                 "prefix": display_prefix,
                 "expires_at": expires_at.isoformat() if expires_at else None,
+                "scopes": body.scopes,
             },
         )
     )
@@ -173,6 +196,7 @@ async def create_token(
         "description": token.description,
         "prefix": token.prefix,
         "scope": token.scope,
+        "scopes": token.scopes,
         "user_id": token.user_id,
         "expires_at": token.expires_at,
         "last_used_at": token.last_used_at,

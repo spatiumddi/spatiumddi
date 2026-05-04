@@ -6,6 +6,7 @@ from sqlalchemy import (
     Column,
     DateTime,
     ForeignKey,
+    LargeBinary,
     String,
     Table,
 )
@@ -57,8 +58,16 @@ class User(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     is_superadmin: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     force_password_change: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
-    # MFA
-    totp_secret: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # MFA — TOTP via pyotp + recovery codes (issue #69). The secret
+    # is stored Fernet-encrypted; recovery codes are stored as a
+    # Fernet-encrypted JSON list of sha256 hashes (raw codes are
+    # only visible to the operator at enrolment, never recoverable
+    # from the DB). ``totp_enabled`` flips true only after the
+    # operator submits a valid first code via the verify step —
+    # before that the secret on disk is a candidate, not active,
+    # so a half-finished enrolment doesn't lock anyone out.
+    totp_secret_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    recovery_codes_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
     totp_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
@@ -165,6 +174,19 @@ class APIToken(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # Optional restriction: list of allowed API path prefixes
     allowed_paths: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
     permissions: Mapped[dict | None] = mapped_column(JSONB, nullable=True)
+
+    # Coarse-grained scope vocabulary — see issue #74 +
+    # ``app.services.api_token_scopes``. Empty list = no scope
+    # restriction (token still inherits the owner's RBAC). Non-empty
+    # = enforced at the auth layer BEFORE RBAC, so a "read-only"
+    # token can never hit a write handler even if its owner's RBAC
+    # would otherwise allow it. Closed vocabulary checked at create
+    # time; storing free-form strings would let an operator scope a
+    # token to a non-existent surface and silently lock themselves
+    # out.
+    scopes: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default="[]"
+    )
 
     expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

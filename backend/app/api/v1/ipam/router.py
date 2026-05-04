@@ -1423,6 +1423,10 @@ class SubnetCreate(BaseModel):
     auto_profile_preset: str = "service_and_os"
     auto_profile_refresh_days: int = 30
     ipv6_allocation_policy: str = "random"
+    # Compliance / classification flags — see Subnet model.
+    pci_scope: bool = False
+    hipaa_scope: bool = False
+    internet_facing: bool = False
 
     @field_validator("ipv6_allocation_policy")
     @classmethod
@@ -1522,6 +1526,9 @@ class SubnetUpdate(BaseModel):
     auto_profile_preset: str | None = None
     auto_profile_refresh_days: int | None = None
     ipv6_allocation_policy: str | None = None
+    pci_scope: bool | None = None
+    hipaa_scope: bool | None = None
+    internet_facing: bool | None = None
 
     @field_validator("ipv6_allocation_policy")
     @classmethod
@@ -1630,6 +1637,9 @@ class SubnetResponse(BaseModel):
     auto_profile_preset: str = "service_and_os"
     auto_profile_refresh_days: int = 30
     ipv6_allocation_policy: str = "random"
+    pci_scope: bool = False
+    hipaa_scope: bool = False
+    internet_facing: bool = False
     created_at: datetime
     modified_at: datetime
 
@@ -2939,6 +2949,9 @@ async def list_subnets(
     space_id: uuid.UUID | None = None,
     block_id: uuid.UUID | None = None,
     vlan_ref_id: uuid.UUID | None = None,
+    pci_scope: bool | None = None,
+    hipaa_scope: bool | None = None,
+    internet_facing: bool | None = None,
 ) -> list[Subnet]:
     query = select(Subnet).order_by(Subnet.network)
     if space_id:
@@ -2947,6 +2960,12 @@ async def list_subnets(
         query = query.where(Subnet.block_id == block_id)
     if vlan_ref_id:
         query = query.where(Subnet.vlan_ref_id == vlan_ref_id)
+    if pci_scope is not None:
+        query = query.where(Subnet.pci_scope == pci_scope)
+    if hipaa_scope is not None:
+        query = query.where(Subnet.hipaa_scope == hipaa_scope)
+    if internet_facing is not None:
+        query = query.where(Subnet.internet_facing == internet_facing)
     result = await db.execute(query)
     return list(result.scalars().all())
 

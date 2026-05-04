@@ -38,17 +38,32 @@ function humanizeError(code: string | null): string {
   return "Login failed.";
 }
 
+/** Two-step state machine — start on the password form, switch to the
+ * TOTP form when /auth/login returns ``mfa_required=true`` with a
+ * challenge token. The challenge is short-lived (5 min) so we don't
+ * persist it; if the operator backgrounds the tab too long they
+ * re-enter their password. */
+type Step =
+  | { kind: "password" }
+  | { kind: "mfa"; challengeToken: string; forcePasswordChange: boolean };
+
 export function LoginPage() {
-  const { login } = useAuth();
+  const { login, completeMfa } = useAuth();
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const initialError = humanizeError(searchParams.get("error"));
 
+  const [step, setStep] = useState<Step>({ kind: "password" });
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [error, setError] = useState(initialError);
   const [loading, setLoading] = useState(false);
   const [providers, setProviders] = useState<PublicAuthProvider[]>([]);
+
+  // MFA prompt state.
+  const [mfaMode, setMfaMode] = useState<"code" | "recovery">("code");
+  const [mfaCode, setMfaCode] = useState("");
+  const [recoveryCode, setRecoveryCode] = useState("");
 
   useEffect(() => {
     authApi
@@ -57,13 +72,30 @@ export function LoginPage() {
       .catch(() => setProviders([]));
   }, []);
 
-  async function handleSubmit(e: FormEvent) {
+  function dismissErrorBanner() {
+    setError("");
+    if (searchParams.get("error")) {
+      searchParams.delete("error");
+      setSearchParams(searchParams, { replace: true });
+    }
+  }
+
+  async function handlePasswordSubmit(e: FormEvent) {
     e.preventDefault();
     setError("");
     setLoading(true);
     try {
-      const tokens = await login(username, password);
-      if (tokens.force_password_change) {
+      const resp = await login(username, password);
+      if (resp.mfa_required && resp.mfa_token) {
+        setStep({
+          kind: "mfa",
+          challengeToken: resp.mfa_token,
+          forcePasswordChange: resp.force_password_change,
+        });
+        setMfaCode("");
+        setRecoveryCode("");
+        setMfaMode("code");
+      } else if (resp.force_password_change) {
         navigate("/change-password");
       } else {
         navigate("/dashboard");
@@ -75,11 +107,39 @@ export function LoginPage() {
     }
   }
 
-  function dismissErrorBanner() {
+  async function handleMfaSubmit(e: FormEvent) {
+    e.preventDefault();
+    if (step.kind !== "mfa") return;
     setError("");
-    if (searchParams.get("error")) {
-      searchParams.delete("error");
-      setSearchParams(searchParams, { replace: true });
+    setLoading(true);
+    try {
+      const body =
+        mfaMode === "code"
+          ? { code: mfaCode.trim() }
+          : { recovery_code: recoveryCode.trim() };
+      const resp = await completeMfa(step.challengeToken, body);
+      if (resp.force_password_change || step.forcePasswordChange) {
+        navigate("/change-password");
+      } else {
+        navigate("/dashboard");
+      }
+    } catch (err: unknown) {
+      // Common cases: bad code, expired challenge. Either way: nudge
+      // the operator back to the password step rather than letting
+      // them guess endlessly.
+      const detail = (err as { response?: { data?: { detail?: string } } })
+        ?.response?.data?.detail;
+      const expired =
+        typeof detail === "string" &&
+        /expired|invalid mfa challenge/i.test(detail);
+      if (expired) {
+        setError("MFA challenge expired — please sign in again.");
+        setStep({ kind: "password" });
+      } else {
+        setError(typeof detail === "string" ? detail : "Invalid MFA code.");
+      }
+    } finally {
+      setLoading(false);
     }
   }
 
@@ -89,7 +149,9 @@ export function LoginPage() {
         <div className="space-y-1 text-center">
           <h1 className="text-2xl font-bold tracking-tight">SpatiumDDI</h1>
           <p className="text-sm text-muted-foreground">
-            Sign in to your account
+            {step.kind === "mfa"
+              ? "Two-factor verification"
+              : "Sign in to your account"}
           </p>
         </div>
 
@@ -106,45 +168,134 @@ export function LoginPage() {
           </div>
         )}
 
-        <form onSubmit={handleSubmit} className="space-y-4">
-          <div className="space-y-2">
-            <label htmlFor="username" className="text-sm font-medium">
-              Username
-            </label>
-            <input
-              id="username"
-              type="text"
-              autoComplete="username"
-              required
-              value={username}
-              onChange={(e) => setUsername(e.target.value)}
-              className="w-full rounded-md border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
-            />
-          </div>
-          <div className="space-y-2">
-            <label htmlFor="password" className="text-sm font-medium">
-              Password
-            </label>
-            <input
-              id="password"
-              type="password"
-              autoComplete="current-password"
-              required
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              className="w-full rounded-md border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
-            />
-          </div>
-          <button
-            type="submit"
-            disabled={loading}
-            className="w-full rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
-          >
-            {loading ? "Signing in…" : "Sign in"}
-          </button>
-        </form>
+        {step.kind === "password" ? (
+          <form onSubmit={handlePasswordSubmit} className="space-y-4">
+            <div className="space-y-2">
+              <label htmlFor="username" className="text-sm font-medium">
+                Username
+              </label>
+              <input
+                id="username"
+                type="text"
+                autoComplete="username"
+                required
+                value={username}
+                onChange={(e) => setUsername(e.target.value)}
+                className="w-full rounded-md border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+              />
+            </div>
+            <div className="space-y-2">
+              <label htmlFor="password" className="text-sm font-medium">
+                Password
+              </label>
+              <input
+                id="password"
+                type="password"
+                autoComplete="current-password"
+                required
+                value={password}
+                onChange={(e) => setPassword(e.target.value)}
+                className="w-full rounded-md border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+              />
+            </div>
+            <button
+              type="submit"
+              disabled={loading}
+              className="w-full rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+            >
+              {loading ? "Signing in…" : "Sign in"}
+            </button>
+          </form>
+        ) : (
+          <form onSubmit={handleMfaSubmit} className="space-y-4">
+            <p className="text-xs text-muted-foreground">
+              {mfaMode === "code"
+                ? "Enter the 6-digit code from your authenticator app."
+                : "Enter one of your recovery codes (e.g. ABCD-EF12). Each code works once."}
+            </p>
+            {mfaMode === "code" ? (
+              <div className="space-y-2">
+                <label htmlFor="mfa-code" className="text-sm font-medium">
+                  Authenticator code
+                </label>
+                <input
+                  id="mfa-code"
+                  type="text"
+                  inputMode="numeric"
+                  pattern="[0-9]*"
+                  autoComplete="one-time-code"
+                  required
+                  autoFocus
+                  value={mfaCode}
+                  onChange={(e) =>
+                    setMfaCode(e.target.value.replace(/\D/g, "").slice(0, 6))
+                  }
+                  className="w-full rounded-md border bg-background px-3 py-2 text-center font-mono text-lg tracking-[0.3em] focus:outline-none focus:ring-2 focus:ring-ring"
+                  placeholder="000000"
+                  maxLength={6}
+                />
+              </div>
+            ) : (
+              <div className="space-y-2">
+                <label htmlFor="recovery-code" className="text-sm font-medium">
+                  Recovery code
+                </label>
+                <input
+                  id="recovery-code"
+                  type="text"
+                  autoComplete="off"
+                  required
+                  autoFocus
+                  value={recoveryCode}
+                  onChange={(e) =>
+                    setRecoveryCode(e.target.value.toUpperCase())
+                  }
+                  className="w-full rounded-md border bg-background px-3 py-2 text-center font-mono text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+                  placeholder="ABCD-EF12"
+                />
+              </div>
+            )}
+            <button
+              type="submit"
+              disabled={
+                loading ||
+                (mfaMode === "code"
+                  ? mfaCode.length !== 6
+                  : recoveryCode.trim().length === 0)
+              }
+              className="w-full rounded-md bg-primary px-4 py-2 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+            >
+              {loading ? "Verifying…" : "Verify"}
+            </button>
+            <div className="flex items-center justify-between text-xs">
+              <button
+                type="button"
+                onClick={() => {
+                  setMfaMode((m) => (m === "code" ? "recovery" : "code"));
+                  setError("");
+                }}
+                className="text-muted-foreground hover:text-foreground hover:underline"
+              >
+                {mfaMode === "code"
+                  ? "Use a recovery code instead"
+                  : "Use my authenticator code"}
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setStep({ kind: "password" });
+                  setError("");
+                  setPassword("");
+                }}
+                className="text-muted-foreground hover:text-foreground hover:underline"
+              >
+                Sign out
+              </button>
+            </div>
+          </form>
+        )}
 
-        {providers.length > 0 && (
+        {step.kind === "password" && providers.length > 0 && (
           <>
             <div className="relative">
               <div className="absolute inset-0 flex items-center">

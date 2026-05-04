@@ -4,6 +4,7 @@ import { AppLayout } from "@/components/layout/AppLayout";
 import { LoginPage } from "@/pages/LoginPage";
 import { LoginCallbackPage } from "@/pages/LoginCallbackPage";
 import { ChangePasswordPage } from "@/pages/ChangePasswordPage";
+import { AccountPage } from "@/pages/AccountPage";
 import { DashboardPage } from "@/pages/DashboardPage";
 import { IPAMPage } from "@/pages/ipam/IPAMPage";
 import { NATPage } from "@/pages/ipam/NATPage";
@@ -36,6 +37,7 @@ import { DomainsPage } from "@/pages/admin/DomainsPage";
 import { DomainDetailPage } from "@/pages/admin/DomainDetailPage";
 import { GroupsPage } from "@/pages/admin/GroupsPage";
 import { RolesPage } from "@/pages/admin/RolesPage";
+import { CompliancePage } from "@/pages/admin/CompliancePage";
 import { TrashPage } from "@/pages/admin/TrashPage";
 import { WebhooksPage } from "@/pages/admin/WebhooksPage";
 import { PlatformInsightsPage } from "@/pages/admin/PlatformInsightsPage";
@@ -62,6 +64,7 @@ export default function App() {
         }
       >
         <Route index element={<Navigate to="/dashboard" replace />} />
+        <Route path="account" element={<AccountPage />} />
         <Route path="dashboard" element={<DashboardPage />} />
         <Route path="ipam" element={<IPAMPage />} />
         <Route path="ipam/nat" element={<NATPage />} />
@@ -109,6 +112,7 @@ export default function App() {
         <Route path="admin/domains" element={<DomainsPage />} />
         <Route path="admin/domains/:id" element={<DomainDetailPage />} />
         <Route path="admin/webhooks" element={<WebhooksPage />} />
+        <Route path="admin/compliance" element={<CompliancePage />} />
         <Route path="admin/trash" element={<TrashPage />} />
         <Route
           path="admin/platform-insights"
