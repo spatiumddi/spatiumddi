@@ -575,219 +575,222 @@ export function AIProvidersPage() {
   }
 
   return (
-    <div className="space-y-4">
-      <div className="flex flex-wrap items-start justify-between gap-3">
-        <div className="min-w-0 flex-1">
-          <h1 className="flex items-center gap-2 text-xl font-semibold">
-            <Sparkles className="h-5 w-5" /> AI Providers
-          </h1>
-          <p className="text-sm text-muted-foreground">
-            Configure LLM providers for the Operator Copilot. Wave 1 ships the
-            OpenAI-compatible driver — works with OpenAI, Ollama, OpenWebUI,
-            vLLM, LM Studio, and most local model servers. Anthropic / Gemini /
-            Azure drivers ship in Phase 2.
-          </p>
-        </div>
-        <button
-          onClick={() => {
-            setEditorErr("");
-            setTestResult(null);
-            setEditor({ mode: "create", initial: { ...EMPTY } });
-          }}
-          className="inline-flex shrink-0 items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90"
-        >
-          <Plus className="h-4 w-4" /> New provider
-        </button>
-      </div>
-
-      <div className="overflow-x-auto rounded-lg border">
-        <table className="w-full text-sm">
-          <thead className="border-b bg-muted/30 text-left text-xs uppercase text-muted-foreground">
-            <tr>
-              <th className="px-3 py-2">Name</th>
-              <th className="px-3 py-2">Kind</th>
-              <th className="px-3 py-2">Base URL</th>
-              <th className="px-3 py-2">Default model</th>
-              <th className="px-3 py-2">Enabled</th>
-              <th className="px-3 py-2">Priority</th>
-              <th className="px-3 py-2 text-right">Actions</th>
-            </tr>
-          </thead>
-          <tbody>
-            {providersQ.isLoading && (
-              <tr>
-                <td
-                  colSpan={7}
-                  className="px-3 py-8 text-center text-muted-foreground"
-                >
-                  Loading…
-                </td>
-              </tr>
-            )}
-            {!providersQ.isLoading && (providersQ.data ?? []).length === 0 && (
-              <tr>
-                <td
-                  colSpan={7}
-                  className="px-3 py-8 text-center text-muted-foreground"
-                >
-                  No providers configured. Click <strong>New provider</strong>{" "}
-                  to add one.
-                </td>
-              </tr>
-            )}
-            {(providersQ.data ?? []).map((p) => (
-              <tr key={p.id} className="border-b last:border-b-0">
-                <td className="px-3 py-2 align-top">
-                  <div className="font-medium break-words">{p.name}</div>
-                  {p.has_api_key && (
-                    <div className="text-xs text-muted-foreground">
-                      🔒 key stored
-                    </div>
-                  )}
-                </td>
-                <td
-                  className="px-3 py-2 align-top text-xs"
-                  title={AI_PROVIDER_KIND_LABELS[p.kind] ?? p.kind}
-                >
-                  {AI_PROVIDER_KIND_SHORT[p.kind] ?? p.kind}
-                </td>
-                <td className="px-3 py-2 align-top font-mono text-xs break-all">
-                  {p.base_url || "—"}
-                </td>
-                <td className="px-3 py-2 align-top font-mono text-xs break-all">
-                  {p.default_model || "—"}
-                </td>
-                <td className="px-3 py-2 align-top text-xs">
-                  {p.is_enabled ? (
-                    <span className="rounded bg-emerald-500/15 px-2 py-0.5 text-emerald-700 dark:text-emerald-400">
-                      enabled
-                    </span>
-                  ) : (
-                    <span className="rounded bg-muted px-2 py-0.5 text-muted-foreground">
-                      disabled
-                    </span>
-                  )}
-                </td>
-                <td className="px-3 py-2 align-top text-xs">{p.priority}</td>
-                <td className="px-3 py-2 text-right">
-                  <button
-                    onClick={() => testRowMut.mutate(p.id)}
-                    disabled={rowTestId === p.id}
-                    className="mr-1 inline-flex items-center gap-1 rounded-md border px-2 py-1 text-xs text-muted-foreground hover:bg-accent disabled:opacity-50"
-                    title="Test connection"
-                  >
-                    {rowTestId === p.id ? (
-                      <Loader2 className="h-3 w-3 animate-spin" />
-                    ) : (
-                      <PlugZap className="h-3 w-3" />
-                    )}
-                  </button>
-                  <button
-                    onClick={() => setModelPickerFor(p)}
-                    className="mr-1 inline-flex items-center gap-1 rounded-md border px-2 py-1 text-xs text-muted-foreground hover:bg-accent"
-                    title="List models"
-                  >
-                    <RefreshCw className="h-3 w-3" />
-                  </button>
-                  <button
-                    onClick={() => {
-                      setEditorErr("");
-                      setTestResult(null);
-                      setEditor({
-                        mode: "edit",
-                        provider: p,
-                        initial: formFromProvider(p),
-                      });
-                    }}
-                    className="mr-1 rounded-md border px-2 py-1 text-xs text-muted-foreground hover:bg-accent"
-                  >
-                    <Pencil className="h-3 w-3" />
-                  </button>
-                  <button
-                    onClick={() => {
-                      if (confirm(`Delete provider "${p.name}"?`))
-                        deleteMut.mutate(p.id);
-                    }}
-                    className="rounded-md border px-2 py-1 text-xs text-muted-foreground hover:bg-accent hover:text-destructive"
-                  >
-                    <Trash2 className="h-3 w-3" />
-                  </button>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
-
-      {testResult && !editor && (
-        <div
-          className={`rounded-md border px-3 py-2 text-sm ${
-            testResult.ok
-              ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
-              : "border-destructive/30 bg-destructive/10 text-destructive"
-          }`}
-        >
-          <div className="flex items-center gap-2">
-            {testResult.ok ? (
-              <CheckCircle2 className="h-4 w-4" />
-            ) : (
-              <XCircle className="h-4 w-4" />
-            )}
-            <span className="font-medium">{testResult.detail}</span>
-            {testResult.latency_ms !== null && (
-              <span className="text-xs opacity-70">
-                · {testResult.latency_ms} ms
-              </span>
-            )}
-            <button
-              onClick={() => setTestResult(null)}
-              className="ml-auto text-xs opacity-70 hover:opacity-100"
-            >
-              dismiss
-            </button>
+    <div className="h-full overflow-auto p-6">
+      <div className="space-y-4">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div className="min-w-0 flex-1">
+            <h1 className="flex items-center gap-2 text-xl font-semibold">
+              <Sparkles className="h-5 w-5" /> AI Providers
+            </h1>
+            <p className="text-sm text-muted-foreground">
+              Configure LLM providers for the Operator Copilot. Wave 1 ships the
+              OpenAI-compatible driver — works with OpenAI, Ollama, OpenWebUI,
+              vLLM, LM Studio, and most local model servers. Anthropic / Gemini
+              / Azure drivers ship in Phase 2.
+            </p>
           </div>
-          {testResult.sample_models.length > 0 && (
-            <div className="mt-1 text-xs break-all">
-              Sample models:{" "}
-              <span className="font-mono">
-                {testResult.sample_models.join(", ")}
-              </span>
-            </div>
-          )}
+          <button
+            onClick={() => {
+              setEditorErr("");
+              setTestResult(null);
+              setEditor({ mode: "create", initial: { ...EMPTY } });
+            }}
+            className="inline-flex shrink-0 items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90"
+          >
+            <Plus className="h-4 w-4" /> New provider
+          </button>
         </div>
-      )}
 
-      {editor && (
-        <ProviderEditor
-          mode={editor.mode}
-          initial={editor.initial}
-          error={editorErr}
-          saving={createMut.isPending || updateMut.isPending}
-          onClose={() => {
-            setEditor(null);
-            setEditorErr("");
-            setTestResult(null);
-          }}
-          onSave={handleSave}
-          testResult={testResult}
-          testing={testEditorMut.isPending}
-          onTest={handleTest}
-        />
-      )}
+        <div className="overflow-x-auto rounded-lg border">
+          <table className="w-full text-sm">
+            <thead className="border-b bg-muted/30 text-left text-xs uppercase text-muted-foreground">
+              <tr>
+                <th className="px-3 py-2">Name</th>
+                <th className="px-3 py-2">Kind</th>
+                <th className="px-3 py-2">Base URL</th>
+                <th className="px-3 py-2">Default model</th>
+                <th className="px-3 py-2">Enabled</th>
+                <th className="px-3 py-2">Priority</th>
+                <th className="px-3 py-2 text-right">Actions</th>
+              </tr>
+            </thead>
+            <tbody>
+              {providersQ.isLoading && (
+                <tr>
+                  <td
+                    colSpan={7}
+                    className="px-3 py-8 text-center text-muted-foreground"
+                  >
+                    Loading…
+                  </td>
+                </tr>
+              )}
+              {!providersQ.isLoading &&
+                (providersQ.data ?? []).length === 0 && (
+                  <tr>
+                    <td
+                      colSpan={7}
+                      className="px-3 py-8 text-center text-muted-foreground"
+                    >
+                      No providers configured. Click{" "}
+                      <strong>New provider</strong> to add one.
+                    </td>
+                  </tr>
+                )}
+              {(providersQ.data ?? []).map((p) => (
+                <tr key={p.id} className="border-b last:border-b-0">
+                  <td className="px-3 py-2 align-top">
+                    <div className="font-medium break-words">{p.name}</div>
+                    {p.has_api_key && (
+                      <div className="text-xs text-muted-foreground">
+                        🔒 key stored
+                      </div>
+                    )}
+                  </td>
+                  <td
+                    className="px-3 py-2 align-top text-xs"
+                    title={AI_PROVIDER_KIND_LABELS[p.kind] ?? p.kind}
+                  >
+                    {AI_PROVIDER_KIND_SHORT[p.kind] ?? p.kind}
+                  </td>
+                  <td className="px-3 py-2 align-top font-mono text-xs break-all">
+                    {p.base_url || "—"}
+                  </td>
+                  <td className="px-3 py-2 align-top font-mono text-xs break-all">
+                    {p.default_model || "—"}
+                  </td>
+                  <td className="px-3 py-2 align-top text-xs">
+                    {p.is_enabled ? (
+                      <span className="rounded bg-emerald-500/15 px-2 py-0.5 text-emerald-700 dark:text-emerald-400">
+                        enabled
+                      </span>
+                    ) : (
+                      <span className="rounded bg-muted px-2 py-0.5 text-muted-foreground">
+                        disabled
+                      </span>
+                    )}
+                  </td>
+                  <td className="px-3 py-2 align-top text-xs">{p.priority}</td>
+                  <td className="px-3 py-2 text-right">
+                    <button
+                      onClick={() => testRowMut.mutate(p.id)}
+                      disabled={rowTestId === p.id}
+                      className="mr-1 inline-flex items-center gap-1 rounded-md border px-2 py-1 text-xs text-muted-foreground hover:bg-accent disabled:opacity-50"
+                      title="Test connection"
+                    >
+                      {rowTestId === p.id ? (
+                        <Loader2 className="h-3 w-3 animate-spin" />
+                      ) : (
+                        <PlugZap className="h-3 w-3" />
+                      )}
+                    </button>
+                    <button
+                      onClick={() => setModelPickerFor(p)}
+                      className="mr-1 inline-flex items-center gap-1 rounded-md border px-2 py-1 text-xs text-muted-foreground hover:bg-accent"
+                      title="List models"
+                    >
+                      <RefreshCw className="h-3 w-3" />
+                    </button>
+                    <button
+                      onClick={() => {
+                        setEditorErr("");
+                        setTestResult(null);
+                        setEditor({
+                          mode: "edit",
+                          provider: p,
+                          initial: formFromProvider(p),
+                        });
+                      }}
+                      className="mr-1 rounded-md border px-2 py-1 text-xs text-muted-foreground hover:bg-accent"
+                    >
+                      <Pencil className="h-3 w-3" />
+                    </button>
+                    <button
+                      onClick={() => {
+                        if (confirm(`Delete provider "${p.name}"?`))
+                          deleteMut.mutate(p.id);
+                      }}
+                      className="rounded-md border px-2 py-1 text-xs text-muted-foreground hover:bg-accent hover:text-destructive"
+                    >
+                      <Trash2 className="h-3 w-3" />
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
 
-      {modelPickerFor && (
-        <ModelPickerModal
-          provider={modelPickerFor}
-          onClose={() => setModelPickerFor(null)}
-          onPick={(model) => {
-            updateMut.mutate({
-              id: modelPickerFor.id,
-              body: { default_model: model },
-            });
-            setModelPickerFor(null);
-          }}
-        />
-      )}
+        {testResult && !editor && (
+          <div
+            className={`rounded-md border px-3 py-2 text-sm ${
+              testResult.ok
+                ? "border-emerald-500/30 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
+                : "border-destructive/30 bg-destructive/10 text-destructive"
+            }`}
+          >
+            <div className="flex items-center gap-2">
+              {testResult.ok ? (
+                <CheckCircle2 className="h-4 w-4" />
+              ) : (
+                <XCircle className="h-4 w-4" />
+              )}
+              <span className="font-medium">{testResult.detail}</span>
+              {testResult.latency_ms !== null && (
+                <span className="text-xs opacity-70">
+                  · {testResult.latency_ms} ms
+                </span>
+              )}
+              <button
+                onClick={() => setTestResult(null)}
+                className="ml-auto text-xs opacity-70 hover:opacity-100"
+              >
+                dismiss
+              </button>
+            </div>
+            {testResult.sample_models.length > 0 && (
+              <div className="mt-1 text-xs break-all">
+                Sample models:{" "}
+                <span className="font-mono">
+                  {testResult.sample_models.join(", ")}
+                </span>
+              </div>
+            )}
+          </div>
+        )}
+
+        {editor && (
+          <ProviderEditor
+            mode={editor.mode}
+            initial={editor.initial}
+            error={editorErr}
+            saving={createMut.isPending || updateMut.isPending}
+            onClose={() => {
+              setEditor(null);
+              setEditorErr("");
+              setTestResult(null);
+            }}
+            onSave={handleSave}
+            testResult={testResult}
+            testing={testEditorMut.isPending}
+            onTest={handleTest}
+          />
+        )}
+
+        {modelPickerFor && (
+          <ModelPickerModal
+            provider={modelPickerFor}
+            onClose={() => setModelPickerFor(null)}
+            onPick={(model) => {
+              updateMut.mutate({
+                id: modelPickerFor.id,
+                body: { default_model: model },
+              });
+              setModelPickerFor(null);
+            }}
+          />
+        )}
+      </div>
     </div>
   );
 }

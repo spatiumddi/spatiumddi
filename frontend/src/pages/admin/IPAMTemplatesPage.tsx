@@ -670,170 +670,172 @@ export function IPAMTemplatesPage() {
   }
 
   return (
-    <div className="space-y-4">
-      <div className="flex flex-wrap items-start justify-between gap-3">
-        <div className="min-w-0 flex-1">
-          <h1 className="flex items-center gap-2 text-xl font-semibold">
-            <LayoutTemplate className="h-5 w-5" /> IPAM Templates
-          </h1>
-          <p className="text-sm text-muted-foreground">
-            Reusable stamp templates that pre-fill block / subnet defaults on
-            create and let you reapply across instances when the template
-            changes.
-          </p>
+    <div className="h-full overflow-auto p-6">
+      <div className="space-y-4">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div className="min-w-0 flex-1">
+            <h1 className="flex items-center gap-2 text-xl font-semibold">
+              <LayoutTemplate className="h-5 w-5" /> IPAM Templates
+            </h1>
+            <p className="text-sm text-muted-foreground">
+              Reusable stamp templates that pre-fill block / subnet defaults on
+              create and let you reapply across instances when the template
+              changes.
+            </p>
+          </div>
+          <button
+            onClick={() => {
+              setEditorErr("");
+              setEditor({ mode: "create", initial: { ...EMPTY } });
+            }}
+            className="inline-flex shrink-0 items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90"
+          >
+            <Plus className="h-4 w-4" /> New template
+          </button>
         </div>
-        <button
-          onClick={() => {
-            setEditorErr("");
-            setEditor({ mode: "create", initial: { ...EMPTY } });
-          }}
-          className="inline-flex shrink-0 items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90"
-        >
-          <Plus className="h-4 w-4" /> New template
-        </button>
-      </div>
 
-      <div className="flex flex-wrap items-center gap-2">
-        <select
-          value={filterApplies}
-          onChange={(e) =>
-            setFilterApplies(e.target.value as "" | IPAMTemplateAppliesTo)
-          }
-          className={`${inputCls} max-w-[12rem]`}
-        >
-          <option value="">All carriers</option>
-          <option value="block">{APPLIES_TO_LABEL.block}</option>
-          <option value="subnet">{APPLIES_TO_LABEL.subnet}</option>
-        </select>
-        <input
-          value={search}
-          onChange={(e) => setSearch(e.target.value)}
-          placeholder="Filter by name / description…"
-          className={`${inputCls} max-w-md`}
-        />
-      </div>
+        <div className="flex flex-wrap items-center gap-2">
+          <select
+            value={filterApplies}
+            onChange={(e) =>
+              setFilterApplies(e.target.value as "" | IPAMTemplateAppliesTo)
+            }
+            className={`${inputCls} max-w-[12rem]`}
+          >
+            <option value="">All carriers</option>
+            <option value="block">{APPLIES_TO_LABEL.block}</option>
+            <option value="subnet">{APPLIES_TO_LABEL.subnet}</option>
+          </select>
+          <input
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+            placeholder="Filter by name / description…"
+            className={`${inputCls} max-w-md`}
+          />
+        </div>
 
-      <div className="overflow-x-auto rounded-lg border">
-        <table className="w-full text-sm">
-          <thead className="border-b bg-muted/30 text-left text-xs uppercase text-muted-foreground">
-            <tr>
-              <th className="px-3 py-2">Name</th>
-              <th className="px-3 py-2">Applies to</th>
-              <th className="px-3 py-2">DNS group</th>
-              <th className="px-3 py-2">DHCP group</th>
-              <th className="px-3 py-2">Children</th>
-              <th className="px-3 py-2">Applied</th>
-              <th className="px-3 py-2 text-right">Actions</th>
-            </tr>
-          </thead>
-          <tbody>
-            {tplsQ.isLoading && (
+        <div className="overflow-x-auto rounded-lg border">
+          <table className="w-full text-sm">
+            <thead className="border-b bg-muted/30 text-left text-xs uppercase text-muted-foreground">
               <tr>
-                <td
-                  colSpan={7}
-                  className="px-3 py-8 text-center text-muted-foreground"
-                >
-                  Loading…
-                </td>
+                <th className="px-3 py-2">Name</th>
+                <th className="px-3 py-2">Applies to</th>
+                <th className="px-3 py-2">DNS group</th>
+                <th className="px-3 py-2">DHCP group</th>
+                <th className="px-3 py-2">Children</th>
+                <th className="px-3 py-2">Applied</th>
+                <th className="px-3 py-2 text-right">Actions</th>
               </tr>
-            )}
-            {!tplsQ.isLoading && visible.length === 0 && (
-              <tr>
-                <td
-                  colSpan={7}
-                  className="px-3 py-8 text-center text-muted-foreground"
-                >
-                  No templates yet.
-                </td>
-              </tr>
-            )}
-            {visible.map((t) => (
-              <tr key={t.id} className="border-b last:border-b-0">
-                <td className="px-3 py-2 align-top">
-                  <div className="font-medium break-words">{t.name}</div>
-                  {t.description && (
-                    <div className="text-xs text-muted-foreground break-words">
-                      {t.description}
-                    </div>
-                  )}
-                </td>
-                <td className="px-3 py-2 text-xs">
-                  {APPLIES_TO_LABEL[t.applies_to]}
-                </td>
-                <td className="px-3 py-2 text-xs font-mono">
-                  {t.dns_group_id ? t.dns_group_id.slice(0, 8) : "—"}
-                </td>
-                <td className="px-3 py-2 text-xs font-mono">
-                  {t.dhcp_group_id ? t.dhcp_group_id.slice(0, 8) : "—"}
-                </td>
-                <td className="px-3 py-2 text-xs">
-                  {t.child_layout?.children?.length ?? 0}
-                </td>
-                <td className="px-3 py-2 text-xs">{t.applied_count}</td>
-                <td className="px-3 py-2 text-right">
-                  <button
-                    onClick={() => setReapplyTarget(t)}
-                    disabled={t.applied_count === 0}
-                    className="mr-1 inline-flex items-center gap-1 rounded-md border px-2 py-1 text-xs text-muted-foreground hover:bg-accent disabled:opacity-40"
-                    title="Reapply across all instances"
+            </thead>
+            <tbody>
+              {tplsQ.isLoading && (
+                <tr>
+                  <td
+                    colSpan={7}
+                    className="px-3 py-8 text-center text-muted-foreground"
                   >
-                    <RefreshCw className="h-3 w-3" />
-                  </button>
-                  <button
-                    onClick={() => {
-                      setEditorErr("");
-                      setEditor({
-                        mode: "edit",
-                        tpl: t,
-                        initial: formFromTemplate(t),
-                      });
-                    }}
-                    className="mr-1 rounded-md border px-2 py-1 text-xs text-muted-foreground hover:bg-accent"
+                    Loading…
+                  </td>
+                </tr>
+              )}
+              {!tplsQ.isLoading && visible.length === 0 && (
+                <tr>
+                  <td
+                    colSpan={7}
+                    className="px-3 py-8 text-center text-muted-foreground"
                   >
-                    <Pencil className="h-3 w-3" />
-                  </button>
-                  <button
-                    onClick={() => {
-                      if (
-                        confirm(
-                          `Delete template "${t.name}"? Applied instances are not removed; their applied_template_id is cleared.`,
+                    No templates yet.
+                  </td>
+                </tr>
+              )}
+              {visible.map((t) => (
+                <tr key={t.id} className="border-b last:border-b-0">
+                  <td className="px-3 py-2 align-top">
+                    <div className="font-medium break-words">{t.name}</div>
+                    {t.description && (
+                      <div className="text-xs text-muted-foreground break-words">
+                        {t.description}
+                      </div>
+                    )}
+                  </td>
+                  <td className="px-3 py-2 text-xs">
+                    {APPLIES_TO_LABEL[t.applies_to]}
+                  </td>
+                  <td className="px-3 py-2 text-xs font-mono">
+                    {t.dns_group_id ? t.dns_group_id.slice(0, 8) : "—"}
+                  </td>
+                  <td className="px-3 py-2 text-xs font-mono">
+                    {t.dhcp_group_id ? t.dhcp_group_id.slice(0, 8) : "—"}
+                  </td>
+                  <td className="px-3 py-2 text-xs">
+                    {t.child_layout?.children?.length ?? 0}
+                  </td>
+                  <td className="px-3 py-2 text-xs">{t.applied_count}</td>
+                  <td className="px-3 py-2 text-right">
+                    <button
+                      onClick={() => setReapplyTarget(t)}
+                      disabled={t.applied_count === 0}
+                      className="mr-1 inline-flex items-center gap-1 rounded-md border px-2 py-1 text-xs text-muted-foreground hover:bg-accent disabled:opacity-40"
+                      title="Reapply across all instances"
+                    >
+                      <RefreshCw className="h-3 w-3" />
+                    </button>
+                    <button
+                      onClick={() => {
+                        setEditorErr("");
+                        setEditor({
+                          mode: "edit",
+                          tpl: t,
+                          initial: formFromTemplate(t),
+                        });
+                      }}
+                      className="mr-1 rounded-md border px-2 py-1 text-xs text-muted-foreground hover:bg-accent"
+                    >
+                      <Pencil className="h-3 w-3" />
+                    </button>
+                    <button
+                      onClick={() => {
+                        if (
+                          confirm(
+                            `Delete template "${t.name}"? Applied instances are not removed; their applied_template_id is cleared.`,
+                          )
                         )
-                      )
-                        deleteMut.mutate(t.id);
-                    }}
-                    className="rounded-md border px-2 py-1 text-xs text-muted-foreground hover:text-destructive hover:bg-accent"
-                  >
-                    <Trash2 className="h-3 w-3" />
-                  </button>
-                </td>
-              </tr>
-            ))}
-          </tbody>
-        </table>
+                          deleteMut.mutate(t.id);
+                      }}
+                      className="rounded-md border px-2 py-1 text-xs text-muted-foreground hover:text-destructive hover:bg-accent"
+                    >
+                      <Trash2 className="h-3 w-3" />
+                    </button>
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+
+        {editor && (
+          <TemplateEditor
+            mode={editor.mode}
+            initial={editor.initial}
+            error={editorErr}
+            saving={createMut.isPending || updateMut.isPending}
+            onClose={() => {
+              setEditor(null);
+              setEditorErr("");
+            }}
+            onSave={handleSave}
+          />
+        )}
+
+        {reapplyTarget && (
+          <ReapplyConfirmModal
+            template={reapplyTarget}
+            onClose={() => setReapplyTarget(null)}
+            onConfirm={() => reapplyMut.mutate(reapplyTarget.id)}
+            busy={reapplyMut.isPending}
+          />
+        )}
       </div>
-
-      {editor && (
-        <TemplateEditor
-          mode={editor.mode}
-          initial={editor.initial}
-          error={editorErr}
-          saving={createMut.isPending || updateMut.isPending}
-          onClose={() => {
-            setEditor(null);
-            setEditorErr("");
-          }}
-          onSave={handleSave}
-        />
-      )}
-
-      {reapplyTarget && (
-        <ReapplyConfirmModal
-          template={reapplyTarget}
-          onClose={() => setReapplyTarget(null)}
-          onConfirm={() => reapplyMut.mutate(reapplyTarget.id)}
-          busy={reapplyMut.isPending}
-        />
-      )}
     </div>
   );
 }
