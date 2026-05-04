@@ -63,6 +63,7 @@ router = APIRouter(
                 "ip_address",
                 "custom_field",
                 "nat_mapping",
+                "manage_ipam_templates",
             )
         )
     ]
@@ -76,6 +77,14 @@ router.include_router(io_router)
 from app.api.v1.ipam.nat import router as nat_router  # noqa: E402
 
 router.include_router(nat_router)
+
+# IPAM templates (issue #26) — reusable stamp templates that pre-fill
+# tags / CFs / DNS / DHCP / DDNS settings on block or subnet create.
+# Lives under /api/v1/ipam/templates with its own ``manage_ipam_templates``
+# permission gate.
+from app.api.v1.ipam.templates_router import router as templates_router  # noqa: E402
+
+router.include_router(templates_router)
 
 # Subnet plans — multi-level CIDR designs applied transactionally.
 # Lives under /api/v1/ipam/plans, parallel to /nat-mappings.
@@ -1291,6 +1300,11 @@ class IPBlockCreate(BaseModel):
     ddns_inherit_settings: bool = True
     asn_id: uuid.UUID | None = None
     vrf_id: uuid.UUID | None = None
+    # Optional IPAM template (issue #26). When set, the matching
+    # template's defaults pre-fill any operator-supplied fields that
+    # are still empty before the row commits. Operator overrides
+    # always win.
+    template_id: uuid.UUID | None = None
 
     @field_validator("network")
     @classmethod
@@ -1366,6 +1380,7 @@ class IPBlockResponse(BaseModel):
     # at least one is unset.
     vrf_warning: str | None = None
     asn_id: uuid.UUID | None = None
+    applied_template_id: uuid.UUID | None = None
     created_at: datetime
     modified_at: datetime
 
@@ -1423,6 +1438,9 @@ class SubnetCreate(BaseModel):
     auto_profile_preset: str = "service_and_os"
     auto_profile_refresh_days: int = 30
     ipv6_allocation_policy: str = "random"
+    # Optional IPAM template (issue #26). Same pre-fill semantics as
+    # IPBlockCreate.template_id — operator-supplied fields win.
+    template_id: uuid.UUID | None = None
 
     @field_validator("ipv6_allocation_policy")
     @classmethod
@@ -1630,6 +1648,7 @@ class SubnetResponse(BaseModel):
     auto_profile_preset: str = "service_and_os"
     auto_profile_refresh_days: int = 30
     ipv6_allocation_policy: str = "random"
+    applied_template_id: uuid.UUID | None = None
     created_at: datetime
     modified_at: datetime
 
@@ -2226,6 +2245,25 @@ async def create_block(body: IPBlockCreate, current_user: CurrentUser, db: DB) -
     if await db.get(IPSpace, body.space_id) is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="IP space not found")
 
+    # IPAM template pre-fill (issue #26). Mutates ``body`` in place
+    # before any other validation runs, so the rest of this handler
+    # treats the merged values as if the operator had typed them.
+    template_id = body.template_id
+    if template_id is not None:
+        from app.models.ipam import IPAMTemplate as _Tmpl  # noqa: PLC0415
+        from app.services.ipam.templates import (  # noqa: PLC0415
+            TemplateError,
+            apply_template_on_create_block,
+        )
+
+        template = await db.get(_Tmpl, template_id)
+        if template is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Template not found")
+        try:
+            apply_template_on_create_block(template, body)
+        except TemplateError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
     # Verify parent block exists and belongs to the same space
     if body.parent_block_id:
         parent = await db.get(IPBlock, body.parent_block_id)
@@ -2251,9 +2289,33 @@ async def create_block(body: IPBlockCreate, current_user: CurrentUser, db: DB) -
         db, body.space_id, canonical, body.parent_block_id
     )
 
-    block = IPBlock(**body.model_dump())
+    block_payload = body.model_dump()
+    block_payload.pop("template_id", None)
+    block = IPBlock(**block_payload)
+    if template_id is not None:
+        block.applied_template_id = template_id
     db.add(block)
     await db.flush()
+
+    # If the template carries a child_layout, carve sub-subnets into
+    # the new block. Idempotent — sub-subnets already at a target
+    # CIDR are skipped (none should exist on a fresh create).
+    carved_children: list[dict[str, Any]] = []
+    if template_id is not None:
+        from app.services.ipam.templates import (  # noqa: PLC0415
+            TemplateError as _TmplErr,
+        )
+        from app.services.ipam.templates import carve_children as _carve  # noqa: PLC0415
+
+        if template is not None and template.child_layout is not None:
+            try:
+                carved = await _carve(db, template, block)
+                carved_children = [
+                    {"cidr": r.cidr, "name": r.name, "skipped": r.skipped} for r in carved
+                ]
+            except _TmplErr as exc:
+                raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
     reparented: list[str] = []
     for sid in reparent_ids:
         existing = await db.get(IPBlock, sid)
@@ -2310,6 +2372,7 @@ async def create_block(body: IPBlockCreate, current_user: CurrentUser, db: DB) -
                 # log later.
                 "reparented_children": reparented if reparented else None,
                 "reparented_subnets": reparented_subnets if reparented_subnets else None,
+                "carved_children": carved_children if carved_children else None,
             },
         )
     )
@@ -2962,6 +3025,25 @@ async def create_subnet(body: SubnetCreate, current_user: CurrentUser, db: DB) -
             status_code=status.HTTP_404_NOT_FOUND, detail="Block not found in this space"
         )
 
+    # IPAM template pre-fill (issue #26). Mutates ``body`` in place
+    # so the rest of this handler treats the merged values as if the
+    # operator had typed them. Operator overrides win.
+    template_id = body.template_id
+    if template_id is not None:
+        from app.models.ipam import IPAMTemplate as _Tmpl  # noqa: PLC0415
+        from app.services.ipam.templates import (  # noqa: PLC0415
+            TemplateError,
+            apply_template_on_create_subnet,
+        )
+
+        template = await db.get(_Tmpl, template_id)
+        if template is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Template not found")
+        try:
+            apply_template_on_create_subnet(template, body)
+        except TemplateError as exc:
+            raise HTTPException(status_code=exc.status_code, detail=str(exc)) from exc
+
     net = _parse_network(body.network)
     canonical = str(net)  # normalise e.g. "10.0.0.1/24" → "10.0.0.0/24"
 
@@ -3007,6 +3089,7 @@ async def create_subnet(body: SubnetCreate, current_user: CurrentUser, db: DB) -
                     "skip_reverse_zone",
                     "dns_group_id",
                     "dns_zone_id",
+                    "template_id",
                 }
             ),
             "network": canonical,
@@ -3015,6 +3098,8 @@ async def create_subnet(body: SubnetCreate, current_user: CurrentUser, db: DB) -
         utilization_percent=0.0,
         allocated_ips=0,
     )
+    if template_id is not None:
+        subnet.applied_template_id = template_id
     db.add(subnet)
     await db.flush()
 

@@ -29,6 +29,7 @@ import { LogsPage } from "@/pages/LogsPage";
 import { UsersPage } from "@/pages/admin/UsersPage";
 import { AuditPage } from "@/pages/admin/AuditPage";
 import { CustomFieldsPage } from "@/pages/admin/CustomFieldsPage";
+import { IPAMTemplatesPage } from "@/pages/admin/IPAMTemplatesPage";
 import { ApiTokensPage } from "@/pages/admin/ApiTokensPage";
 import { AlertsPage } from "@/pages/admin/AlertsPage";
 import { AuthProvidersPage } from "@/pages/admin/AuthProvidersPage";
@@ -103,6 +104,7 @@ export default function App() {
         <Route path="admin/roles" element={<RolesPage />} />
         <Route path="admin/audit" element={<AuditPage />} />
         <Route path="admin/custom-fields" element={<CustomFieldsPage />} />
+        <Route path="admin/ipam/templates" element={<IPAMTemplatesPage />} />
         <Route path="admin/auth-providers" element={<AuthProvidersPage />} />
         <Route path="admin/api-tokens" element={<ApiTokensPage />} />
         <Route path="admin/alerts" element={<AlertsPage />} />

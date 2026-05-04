@@ -111,18 +111,18 @@ group assignments, and optional sub-subnet layouts on create).
 
 ### Checkpoints
 
-- [ ] Migration: `ipam_template` table + `applied_template_id` FKs on `ip_block` / `subnet`
-- [ ] Models: `IPAMTemplate` + `applied_template_id` columns
-- [ ] Schemas: `IPAMTemplateCreate` / `Update` / `Response` + `template_id` on Create
-- [ ] Service: `app/services/ipam/templates.py` (apply / reapply / pre-fill helpers)
-- [ ] Router: `/api/v1/ipam/templates` CRUD + `/apply` + `/reapply-all`
-- [ ] Hook into `create_block` / `create_subnet` for `template_id` pre-fill
-- [ ] Permission: seed `manage_ipam_templates` into `IPAM Editor`
-- [ ] Frontend: `/admin/ipam/templates` list + editor modal
-- [ ] Frontend: optional template combo on `AddBlockModal` / `AddSubnetModal`
-- [ ] Tests: apply with force=true overwrites; force=false fills only nulls; child layout carves correctly
-- [ ] `make ci` clean
-- [ ] Commits split: `feat(ipam): #26 templates — model + service`, `feat(ipam): #26 templates — API + create-flow integration`, `feat(ipam): #26 templates — frontend`
+- [x] Migration: `ipam_template` table + `applied_template_id` FKs on `ip_block` / `subnet` (`f9c1a7e25b83_ipam_template_classes`)
+- [x] Models: `IPAMTemplate` + `applied_template_id` columns
+- [x] Schemas: `IPAMTemplateCreate` / `Update` / `Response` + `template_id` on Create
+- [x] Service: `app/services/ipam/templates.py` (apply / reapply / pre-fill helpers, `_prefill` uses Pydantic `model_fields_set` so booleans like `ddns_enabled=False` aren't mistaken for "operator-provided")
+- [x] Router: `/api/v1/ipam/templates` CRUD + `/apply` + `/reapply-all` (cap 200/call)
+- [x] Hook into `create_block` / `create_subnet` for `template_id` pre-fill + child_layout carve on block create
+- [x] Permission: seed `manage_ipam_templates` into `IPAM Editor` (and into RolesPage resource-type list so admins can grant it standalone)
+- [x] Frontend: `/admin/ipam/templates` list + editor modal (4 tabs: General, Stamp values, DDNS, Child layout)
+- [x] Frontend: optional template combo on `CreateBlockModal` / `CreateSubnetModal` — only renders when ≥1 matching template exists
+- [x] Smoke-test (live): 11 assertions — child_layout 422 on subnet template, apply-with-carve, idempotent re-apply, wrong-target 422, create-with-template-id pre-fill, force=true overwrites, reapply-all all pass
+- [x] `make ci` clean
+- [x] Single commit `feat(ipam): #26 IPAM template classes — reusable stamp templates with sub-subnet child layouts`
 
 ### Done when
 

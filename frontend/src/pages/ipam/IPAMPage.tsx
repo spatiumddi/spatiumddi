@@ -1702,10 +1702,16 @@ function CreateSubnetModal({
   const [autoProfilePreset, setAutoProfilePreset] =
     useState<AutoProfilePreset>("service_and_os");
   const [autoProfileRefreshDays, setAutoProfileRefreshDays] = useState(30);
+  // Optional template pre-fill (issue #26).
+  const [templateId, setTemplateId] = useState<string>("");
 
   const { data: blocks } = useQuery({
     queryKey: ["blocks", spaceId],
     queryFn: () => ipamApi.listBlocks(spaceId),
+  });
+  const { data: subnetTemplates } = useQuery({
+    queryKey: ["ipam-templates", "subnet"],
+    queryFn: () => ipamApi.listTemplates({ applies_to: "subnet" }),
   });
 
   // Narrow the prefix picker to values valid for the selected block's family
@@ -1791,6 +1797,7 @@ function CreateSubnetModal({
         auto_profile_on_dhcp_lease: autoProfileEnabled,
         auto_profile_preset: autoProfilePreset,
         auto_profile_refresh_days: autoProfileRefreshDays,
+        ...(templateId ? { template_id: templateId } : {}),
       }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["subnets", spaceId] });
@@ -1828,6 +1835,29 @@ function CreateSubnetModal({
             </button>
           ))}
         </div>
+
+        {(subnetTemplates ?? []).length > 0 && (
+          <Field label="Apply template (optional)">
+            <select
+              className={inputCls}
+              value={templateId}
+              onChange={(e) => setTemplateId(e.target.value)}
+            >
+              <option value="">— none —</option>
+              {(subnetTemplates ?? []).map((t) => (
+                <option key={t.id} value={t.id}>
+                  {t.name}
+                  {t.description ? ` — ${t.description}` : ""}
+                </option>
+              ))}
+            </select>
+            {templateId && (
+              <p className="mt-1 text-xs text-muted-foreground">
+                Operator-supplied fields below override the template's defaults.
+              </p>
+            )}
+          </Field>
+        )}
 
         <Field label="Block *">
           <select
@@ -8504,6 +8534,8 @@ function CreateBlockModal({
   );
   const [asnId, setAsnId] = useState<string | null>(null);
   const [vrfId, setVrfId] = useState<string | null>(null);
+  // Optional template pre-fill (issue #26).
+  const [templateId, setTemplateId] = useState<string>("");
 
   const { data: existingBlocks } = useQuery({
     queryKey: ["blocks", spaceId],
@@ -8513,6 +8545,11 @@ function CreateBlockModal({
   const { data: cfDefs = [] } = useQuery({
     queryKey: ["custom-fields", "ip_block"],
     queryFn: () => customFieldsApi.list("ip_block"),
+  });
+
+  const { data: blockTemplates } = useQuery({
+    queryKey: ["ipam-templates", "block"],
+    queryFn: () => ipamApi.listTemplates({ applies_to: "block" }),
   });
 
   const flatBlocks = existingBlocks
@@ -8540,6 +8577,7 @@ function CreateBlockModal({
         ...(dhcpInherit ? {} : { dhcp_server_group_id: dhcpServerGroupId }),
         asn_id: asnId,
         vrf_id: vrfId,
+        ...(templateId ? { template_id: templateId } : {}),
       }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["blocks", spaceId] });
@@ -8557,6 +8595,29 @@ function CreateBlockModal({
   return (
     <Modal title="New IP Block" onClose={onClose}>
       <div className="space-y-3">
+        {(blockTemplates ?? []).length > 0 && (
+          <Field label="Apply template (optional)">
+            <select
+              className={inputCls}
+              value={templateId}
+              onChange={(e) => setTemplateId(e.target.value)}
+            >
+              <option value="">— none —</option>
+              {(blockTemplates ?? []).map((t) => (
+                <option key={t.id} value={t.id}>
+                  {t.name}
+                  {t.description ? ` — ${t.description}` : ""}
+                </option>
+              ))}
+            </select>
+            {templateId && (
+              <p className="mt-1 text-xs text-muted-foreground">
+                Operator-supplied fields below override the template's defaults.
+                Children defined in the template are carved automatically.
+              </p>
+            )}
+          </Field>
+        )}
         <Field label="Network (CIDR)">
           <input
             className={inputCls}
