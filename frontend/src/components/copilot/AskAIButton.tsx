@@ -32,6 +32,11 @@ export function AskAIButton({
   className?: string;
 }) {
   const sizing = size === "xs" ? "h-3 w-3" : "h-3.5 w-3.5";
+  // Mirrors ``HeaderButton`` secondary variant exactly so the button
+  // sits at the same visual weight as Edit / Refresh / etc. in a
+  // header bar — anything more muted reads as a tertiary utility
+  // and operators miss it. Primary tint kicks in on hover to signal
+  // "this opens the AI surface".
   return (
     <button
       type="button"
@@ -40,9 +45,9 @@ export function AskAIButton({
         askAI({ context });
       }}
       title={tooltip}
-      className={`inline-flex items-center gap-1.5 rounded-md border px-2.5 py-1.5 text-xs text-muted-foreground transition-colors hover:border-primary/40 hover:bg-primary/5 hover:text-primary ${className}`}
+      className={`inline-flex items-center gap-1.5 whitespace-nowrap rounded-md border px-3 py-1.5 text-sm transition-colors hover:border-primary/40 hover:bg-primary/5 hover:text-primary ${className}`}
     >
-      <Sparkles className={sizing} />
+      <Sparkles className={`${sizing} text-primary`} />
       {!iconOnly && <span>Ask AI</span>}
     </button>
   );
