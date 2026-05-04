@@ -51,6 +51,14 @@ export function CopilotDrawer({ onClose }: { onClose: () => void }) {
     }[]
   >([]);
   const [streamingError, setStreamingError] = useState<string | null>(null);
+  // Echo of the just-sent user message — kept in component state until
+  // the backend stream ends and detailQ refetches the persisted version.
+  // Without this, second-and-later turns appear to "swallow" the user
+  // message: the textbox clears but nothing renders until the LLM
+  // finishes responding (which may be 5–30 s on a slow local model).
+  const [pendingUserMessage, setPendingUserMessage] = useState<string | null>(
+    null,
+  );
   const [showHistory, setShowHistory] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
 
@@ -85,7 +93,13 @@ export function CopilotDrawer({ onClose }: { onClose: () => void }) {
       top: scrollRef.current.scrollHeight,
       behavior: "smooth",
     });
-  }, [detailQ.data, streamingContent, streamingTools.length, streamingError]);
+  }, [
+    detailQ.data,
+    streamingContent,
+    streamingTools.length,
+    streamingError,
+    pendingUserMessage,
+  ]);
 
   const sendMut = useMutation({
     mutationFn: async (message: string) => {
@@ -94,6 +108,7 @@ export function CopilotDrawer({ onClose }: { onClose: () => void }) {
       setStreamingContent("");
       setStreamingTools([]);
       setStreamingError(null);
+      setPendingUserMessage(message);
       let resolvedSessionId = activeSessionId;
       try {
         for await (const ev of streamChatTurn(
@@ -150,6 +165,7 @@ export function CopilotDrawer({ onClose }: { onClose: () => void }) {
       }
       setStreamingContent("");
       setStreamingTools([]);
+      setPendingUserMessage(null);
     },
   });
 
@@ -274,6 +290,21 @@ export function CopilotDrawer({ onClose }: { onClose: () => void }) {
           {messages.map((m) => (
             <MessageBubble key={m.id} message={m} />
           ))}
+          {/* Optimistic echo of the just-sent user message. Stays
+              visible from the moment the operator hits Send until
+              detailQ refetches with the persisted version after the
+              stream closes — without this, second-and-later turns
+              appear to swallow the user's message during the LLM's
+              think time. */}
+          {pendingUserMessage && (
+            <div className="mb-3 flex justify-end">
+              <div className="max-w-[85%] rounded-lg bg-primary px-3 py-2 text-sm text-primary-foreground">
+                <pre className="whitespace-pre-wrap break-words font-sans">
+                  {pendingUserMessage}
+                </pre>
+              </div>
+            </div>
+          )}
           {/* In-flight streaming */}
           {sendMut.isPending && (
             <StreamingBubble
