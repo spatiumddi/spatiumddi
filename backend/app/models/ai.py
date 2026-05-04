@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import uuid
 from datetime import datetime
+from decimal import Decimal
 
 from sqlalchemy import (
     Boolean,
@@ -19,6 +20,7 @@ from sqlalchemy import (
     ForeignKey,
     Integer,
     LargeBinary,
+    Numeric,
     String,
     Text,
     UniqueConstraint,
@@ -129,10 +131,13 @@ class AIChatMessage(UUIDPrimaryKeyMixin, Base):
     tool_call_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     name: Mapped[str | None] = mapped_column(String(128), nullable=True)
     # Per-message observability — populated when this message comes from
-    # the LLM. Wave 4 fills these in via the rate sheet.
+    # the LLM. ``cost_usd`` is computed at write time via the rate sheet
+    # in ``app.services.ai.pricing``; None when the model is unknown to
+    # the rate sheet (local Ollama, custom-hosted, etc.).
     tokens_in: Mapped[int | None] = mapped_column(Integer, nullable=True)
     tokens_out: Mapped[int | None] = mapped_column(Integer, nullable=True)
     latency_ms: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    cost_usd: Mapped[Decimal | None] = mapped_column(Numeric(12, 6), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=datetime.utcnow
     )

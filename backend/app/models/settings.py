@@ -1,6 +1,16 @@
 from datetime import datetime
+from decimal import Decimal
 
-from sqlalchemy import Boolean, DateTime, Integer, LargeBinary, String, Text
+from sqlalchemy import (
+    BigInteger,
+    Boolean,
+    DateTime,
+    Integer,
+    LargeBinary,
+    Numeric,
+    String,
+    Text,
+)
 from sqlalchemy import text as sa_text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
@@ -250,4 +260,24 @@ class PlatformSettings(Base):
     # ``ASN:N`` entry in the VRF's import / export route-target lists.
     vrf_strict_rd_validation: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
+
+    # ── Operator Copilot caps + pricing (issue #90 Wave 4) ────────────
+    # Per-user daily cap on token consumption against the chat
+    # endpoint. None = unlimited. Default unlimited because most
+    # operators self-host with local LLMs where this is moot; cloud-
+    # API-using deployments will set it.
+    ai_per_user_daily_token_cap: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    # Per-user daily cost cap in USD. None = unlimited. Same default
+    # rationale as the token cap.
+    ai_per_user_daily_cost_cap_usd: Mapped[Decimal | None] = mapped_column(
+        Numeric(10, 4), nullable=True
+    )
+    # Operator-supplied per-model rate overrides. Shape:
+    #   {"<model_id>": {"input": <usd_per_million>, "output": <...>}}
+    # The pricing service consults this *first* — operators can pin
+    # rates for their custom-hosted or non-canonical model names that
+    # the in-code rate sheet wouldn't recognise (e.g. "qwen3:8b" → $0).
+    ai_pricing_overrides: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=sa_text("'{}'::jsonb")
     )

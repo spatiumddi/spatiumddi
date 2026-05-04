@@ -31,6 +31,7 @@ from app.models.ai import (
     AIProvider,
 )
 from app.services.ai.chat import ChatOrchestrator
+from app.services.ai.usage import UsageCapExceeded, check_user_caps
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()
@@ -301,6 +302,18 @@ async def chat(body: ChatTurnRequest, current_user: CurrentUser, db: DB) -> Stre
                 detail="session's provider is disabled — start a new chat",
             )
         model = existing.model
+
+    # Cap enforcement (Wave 4). Cheap aggregate query against today's
+    # ai_chat_message rows for this user. No-op when neither cap is
+    # configured in PlatformSettings.
+    try:
+        await check_user_caps(db, current_user)
+    except UsageCapExceeded as exc:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=str(exc),
+            headers={"Retry-After": str(exc.retry_after_seconds)},
+        ) from exc
 
     orchestrator = ChatOrchestrator(db, current_user)
     session_row = await orchestrator.get_or_create_session(

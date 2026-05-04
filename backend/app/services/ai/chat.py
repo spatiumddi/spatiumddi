@@ -47,6 +47,8 @@ from app.drivers.llm.base import (
 )
 from app.models.ai import AIChatMessage, AIChatSession, AIProvider
 from app.models.auth import User
+from app.models.settings import PlatformSettings
+from app.services.ai.pricing import compute_cost
 from app.services.ai.tools import REGISTRY, ToolArgumentError, ToolNotFound
 
 logger = structlog.get_logger(__name__)
@@ -293,6 +295,12 @@ class ChatOrchestrator:
 
             elapsed_ms = int((time.monotonic() - started) * 1000)
 
+            # Compute cost via the rate sheet (Wave 4). None when the
+            # model isn't recognised — local LLMs / custom hosts.
+            settings = await self.db.scalar(select(PlatformSettings))
+            overrides = (settings.ai_pricing_overrides if settings else None) or None
+            cost_usd = compute_cost(session.model, prompt_tokens, completion_tokens, overrides)
+
             # Persist whatever the assistant produced this round.
             assistant_msg = AIChatMessage(
                 session_id=session.id,
@@ -313,6 +321,7 @@ class ChatOrchestrator:
                 tokens_in=prompt_tokens,
                 tokens_out=completion_tokens,
                 latency_ms=elapsed_ms,
+                cost_usd=cost_usd,
             )
             self.db.add(assistant_msg)
             await self.db.commit()
