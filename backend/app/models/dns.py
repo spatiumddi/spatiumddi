@@ -136,6 +136,15 @@ class DNSServerGroup(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         server_default="catalog.spatium.invalid.",
     )
 
+    # Split-horizon safety flag (issue #25). When True, publishing a
+    # private-IP record into a zone in this group requires typed-CIDR
+    # confirmation — the safety net catches an operator accidentally
+    # exposing internal IPs through a publicly-facing resolver. Off by
+    # default; existing groups stay unaffected.
+    is_public_facing: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+
     servers: Mapped[list["DNSServer"]] = relationship(
         "DNSServer", back_populates="group", cascade="all, delete-orphan"
     )

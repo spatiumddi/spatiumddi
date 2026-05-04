@@ -2163,6 +2163,10 @@ function AddAddressModal({
   const [reservedUntil, setReservedUntil] = useState<string>("");
   const [customFields, setCustomFields] = useState<Record<string, unknown>>({});
   const [dnsZoneId, setDnsZoneId] = useState<string>("");
+  // Issue #25 — split-horizon publishing. Extra zone UUIDs to
+  // publish beyond the singular primary. Only surfaced when the
+  // subnet has ``dns_split_horizon`` on (effective).
+  const [extraZoneIds, setExtraZoneIds] = useState<string[]>([]);
   const [dhcpScopeId, setDhcpScopeId] = useState<string>("");
   const [aliases, setAliases] = useState<
     { name: string; record_type: "CNAME" | "A" }[]
@@ -2239,6 +2243,14 @@ function AddAddressModal({
     queryFn: () => ipamApi.getEffectiveSubnetDns(subnetId),
     staleTime: 30_000,
   });
+  // Issue #25 — split-horizon mode flips the modal into multi-zone
+  // picker rendering. Read straight off the subnet row.
+  const { data: subnetDetailForSplit } = useQuery({
+    queryKey: ["subnet", subnetId],
+    queryFn: () => ipamApi.getSubnet(subnetId),
+    staleTime: 30_000,
+  });
+  const splitHorizon = subnetDetailForSplit?.dns_split_horizon ?? false;
 
   // Load zones from all effective group IDs
   const zoneGroupIds: string[] = effectiveDns?.dns_group_ids ?? [];
@@ -2301,6 +2313,7 @@ function AddAddressModal({
               description: description || undefined,
               custom_fields: customFields,
               dns_zone_id: zoneParam,
+              extra_zone_ids: extraZoneIds.length ? extraZoneIds : undefined,
               aliases: cleanedAliases.length ? cleanedAliases : undefined,
               role: roleParam as IPRole | undefined,
               reserved_until: reservedIso,
@@ -2315,6 +2328,7 @@ function AddAddressModal({
               status: ipStatus,
               custom_fields: customFields,
               dns_zone_id: zoneParam,
+              extra_zone_ids: extraZoneIds.length ? extraZoneIds : undefined,
               aliases: cleanedAliases.length ? cleanedAliases : undefined,
               role: roleParam as IPRole | undefined,
               reserved_until: reservedIso,
@@ -2526,6 +2540,48 @@ function AddAddressModal({
                 )}
               </div>
             )}
+          </Field>
+        )}
+        {/* Issue #25 — extra-zone picker for split-horizon publishing.
+            Only surfaced when the subnet opted in + at least 2 zones are
+            available (otherwise there's nothing to fan out to). */}
+        {splitHorizon && availableZones.length > 1 && (
+          <Field label="Also publish in (extra zones)">
+            <div className="space-y-1 rounded border bg-muted/20 p-2">
+              {availableZones
+                .filter((z) => z.id !== dnsZoneId)
+                .map((z) => {
+                  const checked = extraZoneIds.includes(z.id);
+                  return (
+                    <label
+                      key={z.id}
+                      className="flex items-center gap-2 text-xs cursor-pointer"
+                    >
+                      <input
+                        type="checkbox"
+                        className="h-3.5 w-3.5"
+                        checked={checked}
+                        onChange={(e) => {
+                          setExtraZoneIds((prev) =>
+                            e.target.checked
+                              ? [...prev, z.id]
+                              : prev.filter((id) => id !== z.id),
+                          );
+                        }}
+                      />
+                      <Globe2 className="h-3 w-3 text-muted-foreground" />
+                      <span className="font-mono">
+                        {z.name.replace(/\.$/, "")}
+                      </span>
+                    </label>
+                  );
+                })}
+              <p className="pt-1 text-[11px] text-muted-foreground">
+                Each checked zone publishes its own A/AAAA record. Useful for
+                split-horizon deployments where the same hostname must resolve
+                through both internal and external resolvers.
+              </p>
+            </div>
           </Field>
         )}
         <div className="grid grid-cols-2 gap-2">
@@ -5446,6 +5502,10 @@ function EditSubnetModal({
   const [dnsAdditionalZoneIds, setDnsAdditionalZoneIds] = useState<string[]>(
     subnet.dns_additional_zone_ids ?? [],
   );
+  // Issue #25 — split-horizon publishing toggle.
+  const [dnsSplitHorizon, setDnsSplitHorizon] = useState(
+    subnet.dns_split_horizon ?? false,
+  );
   // DHCP state — initialized from subnet
   const [dhcpInherit, setDhcpInherit] = useState(
     subnet.dhcp_inherit_settings ?? true,
@@ -5559,6 +5619,7 @@ function EditSubnetModal({
         dns_group_ids: dnsInherit ? null : dnsGroupIds,
         dns_zone_id: dnsInherit ? null : dnsZoneId,
         dns_additional_zone_ids: dnsInherit ? null : dnsAdditionalZoneIds,
+        dns_split_horizon: dnsSplitHorizon,
         dhcp_inherit_settings: dhcpInherit,
         dhcp_server_group_id: dhcpInherit ? null : dhcpServerGroupId,
         ddns_enabled: ddnsEnabled,
@@ -5818,6 +5879,24 @@ function EditSubnetModal({
             parentBlockId={subnet.block_id}
             fallbackSpaceId={subnet.space_id}
           />
+        </div>
+        <div className="border-t pt-3">
+          <label className="flex items-start gap-2 text-xs cursor-pointer select-none">
+            <input
+              type="checkbox"
+              className="mt-0.5 h-3.5 w-3.5"
+              checked={dnsSplitHorizon}
+              onChange={(e) => setDnsSplitHorizon(e.target.checked)}
+            />
+            <span>
+              <span className="font-medium">DNS split-horizon publishing</span>
+              <span className="ml-1 text-muted-foreground">
+                — when on, the IP create / edit modal lets operators publish the
+                same name into additional zones (typically an internal +
+                external pair).
+              </span>
+            </span>
+          </label>
         </div>
         <div className="border-t pt-3">
           <DdnsSettingsSection

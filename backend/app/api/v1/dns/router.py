@@ -111,6 +111,11 @@ class ServerGroupCreate(BaseModel):
     # ≥2-server BIND9 groups.
     catalog_zones_enabled: bool = False
     catalog_zone_name: str = "catalog.spatium.invalid."
+    # Issue #25 — flag this group as exposed to the public internet.
+    # The IPAM safety guard returns ``requires_confirmation`` when an
+    # operator pins a private IP into a zone in this group, forcing a
+    # typed-CIDR confirm. Off by default — existing groups unaffected.
+    is_public_facing: bool = False
 
     @field_validator("group_type")
     @classmethod
@@ -128,6 +133,7 @@ class ServerGroupUpdate(BaseModel):
     is_recursive: bool | None = None
     catalog_zones_enabled: bool | None = None
     catalog_zone_name: str | None = None
+    is_public_facing: bool | None = None
 
     @field_validator("group_type")
     @classmethod
@@ -146,6 +152,7 @@ class ServerGroupResponse(BaseModel):
     is_recursive: bool
     catalog_zones_enabled: bool
     catalog_zone_name: str
+    is_public_facing: bool = False
     created_at: datetime
     modified_at: datetime
 

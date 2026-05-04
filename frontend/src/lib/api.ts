@@ -219,6 +219,9 @@ export interface IPBlock {
   dns_zone_id: string | null;
   dns_additional_zone_ids: string[] | null;
   dns_inherit_settings: boolean;
+  // Issue #25 — block-level split-horizon flag, inheritable to
+  // descendant subnets via the existing dns_inherit_settings walk.
+  dns_split_horizon?: boolean;
   dhcp_server_group_id?: string | null;
   dhcp_inherit_settings?: boolean;
   // DDNS inheritance. When `ddns_inherit_settings` is True, the four
@@ -451,6 +454,10 @@ export interface Subnet {
   dns_zone_id: string | null;
   dns_additional_zone_ids: string[] | null;
   dns_inherit_settings: boolean;
+  // Issue #25 — when true the IP picker becomes a multi-select
+  // grouped by DNS server group; ``IPAddress.extra_zone_ids``
+  // carries the extras. Off = single-zone publishing (current).
+  dns_split_horizon?: boolean;
   dhcp_server_group_id?: string | null;
   dhcp_inherit_settings?: boolean;
   // DDNS — dynamic DNS reconciliation from DHCP leases. Subnet-level
@@ -538,6 +545,12 @@ export interface IPAddress {
   custom_fields: Record<string, unknown>;
   // Linkage (§3) — populated by Wave 3 DDNS/DHCP integration.
   forward_zone_id?: string | null;
+  // Issue #25 — additional zones to publish A/AAAA records into
+  // beyond the singular primary. Each entry is a zone UUID. Empty
+  // list = current behaviour (one record). Operator-edited via the
+  // multi-zone picker on the IP create / edit modal when the
+  // subnet's ``dns_split_horizon`` is on.
+  extra_zone_ids?: string[];
   reverse_zone_id?: string | null;
   dns_record_id?: string | null;
   dhcp_lease_id?: string | null;
@@ -1326,6 +1339,8 @@ export const ipamApi = {
       description?: string;
       custom_fields?: Record<string, unknown>;
       dns_zone_id?: string | null;
+      /** Issue #25 — additional zones to publish A/AAAA records into. */
+      extra_zone_ids?: string[];
       aliases?: { name: string; record_type: "CNAME" | "A" }[];
       role?: IPRole;
       reserved_until?: string;
@@ -2133,6 +2148,11 @@ export interface DNSServerGroup {
   // bind9 server; consumers auto-pull members.
   catalog_zones_enabled: boolean;
   catalog_zone_name: string;
+  // Issue #25 — flag this group as exposed to the public internet.
+  // The IPAM safety guard returns ``requires_confirmation`` when an
+  // operator binds a private IP into a zone in this group, forcing a
+  // typed-CIDR confirm.
+  is_public_facing?: boolean;
   created_at: string;
   modified_at: string;
 }

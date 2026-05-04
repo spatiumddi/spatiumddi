@@ -563,6 +563,12 @@ function GroupModal({
   const [catalogZoneName, setCatalogZoneName] = useState(
     group?.catalog_zone_name ?? "catalog.spatium.invalid.",
   );
+  // Issue #25 — flag this group as exposed to the public internet.
+  // The IPAM safety guard returns ``requires_confirmation`` when an
+  // operator binds a private IP into a zone in this group.
+  const [isPublicFacing, setIsPublicFacing] = useState(
+    group?.is_public_facing ?? false,
+  );
   const [error, setError] = useState("");
 
   const mut = useMutation({
@@ -591,6 +597,7 @@ function GroupModal({
             is_recursive: isRecursive,
             catalog_zones_enabled: catalogZonesEnabled,
             catalog_zone_name: catalogZoneName.trim(),
+            is_public_facing: isPublicFacing,
           });
         }}
         className="space-y-3"
@@ -638,6 +645,23 @@ function GroupModal({
             </label>
           </Field>
         </div>
+
+        <label className="flex items-start gap-2 text-xs cursor-pointer select-none rounded border bg-amber-500/5 px-3 py-2">
+          <input
+            type="checkbox"
+            className="mt-0.5 h-4 w-4"
+            checked={isPublicFacing}
+            onChange={(e) => setIsPublicFacing(e.target.checked)}
+          />
+          <span>
+            <span className="font-medium">Public-facing</span>
+            <span className="ml-1 text-muted-foreground">
+              — flag this group as exposed to the public internet. Publishing a
+              private IP (RFC 1918 / CGNAT / ULA) into a zone in this group will
+              require typed-CIDR confirmation on the IPAM side.
+            </span>
+          </span>
+        </label>
 
         {/* BIND9 catalog zones (RFC 9432). The producer is the group's
             is_primary=True bind9 server; every other bind9 member joins

@@ -237,6 +237,13 @@ class IPBlock(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     dns_zone_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     dns_additional_zone_ids: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
     dns_inherit_settings: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    # Block-level split-horizon (issue #25). Inheritable to descendant
+    # subnets via the existing ``dns_inherit_settings`` walk. False by
+    # default — operators opt in per-block (or per-subnet) so existing
+    # IPAM trees keep their single-zone publishing semantics.
+    dns_split_horizon: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
 
     # DHCP assignment — same inherit-from-parent semantics as DNS. When
     # ``dhcp_inherit_settings`` is True we walk up the block chain (and
@@ -342,6 +349,15 @@ class Subnet(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     dns_zone_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     dns_additional_zone_ids: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
     dns_inherit_settings: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    # Per-subnet opt-in for split-horizon multi-zone publishing
+    # (issue #25). When False the IP picker stays single-group like
+    # today. When True the picker becomes a multi-select grouped by
+    # DNS server group; ``IPAddress.extra_zone_ids`` carries the
+    # extra picks. Inheritable from the parent block via the
+    # existing ``dns_inherit_settings`` walk.
+    dns_split_horizon: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
 
     # DHCP assignment — same inherit-from-parent semantics as DNS.
     dhcp_server_group_id: Mapped[uuid.UUID | None] = mapped_column(
@@ -579,6 +595,17 @@ class IPAddress(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # Forward zone hosting the A/AAAA record for this IP's FQDN.
     forward_zone_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("dns_zone.id", ondelete="SET NULL"), nullable=True
+    )
+    # Additional zones to publish into beyond the singular
+    # ``forward_zone_id`` — issue #25 split-horizon. Each entry is a
+    # zone UUID; the IPAM → DNS sync emits one A/AAAA record per
+    # distinct (forward_zone + each entry). Ordering preserved on
+    # round-trip. Default empty list = current behaviour (one
+    # record). Each zone implicitly carries its DNS server group
+    # via the existing ``DNSZone.group_id`` FK so multi-group fanout
+    # is implicit.
+    extra_zone_ids: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=sa_text("'[]'::jsonb")
     )
     # Reverse zone hosting the PTR record for this IP.
     reverse_zone_id: Mapped[uuid.UUID | None] = mapped_column(

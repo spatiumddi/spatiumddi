@@ -20,7 +20,7 @@ from app.core.permissions import require_any_resource_permission
 from app.drivers.dhcp import is_agentless
 from app.models.audit import AuditLog
 from app.models.dhcp import DHCPConfigOp, DHCPPool, DHCPScope, DHCPServer, DHCPStaticAssignment
-from app.models.dns import DNSRecord, DNSZone
+from app.models.dns import DNSRecord, DNSServerGroup, DNSZone
 from app.models.ipam import (
     IP_ROLES,
     IP_ROLES_SHARED,
@@ -440,6 +440,67 @@ def _collision_http_exc(warnings: list[dict[str, Any]]) -> HTTPException:
     )
 
 
+async def _check_public_facing_warnings(
+    db: AsyncSession,
+    *,
+    address: str,
+    forward_zone_id: uuid.UUID | None,
+    extra_zone_ids: list[str] | None,
+) -> list[dict[str, Any]]:
+    """Issue #25 safety guard. Return warnings when a private IP is
+    being published into a zone whose group is flagged
+    ``is_public_facing=True``. Public IPs and non-public-facing
+    groups produce no warning.
+
+    The warnings flow through the same ``_collision_http_exc`` shape
+    as MAC / FQDN collisions so the frontend's existing
+    ``requires_confirmation`` path lights up automatically — operator
+    types the CIDR to confirm and re-submits with ``force=True``.
+    """
+    from app.services.ipam.classify import is_private_ip
+
+    if not is_private_ip(address):
+        return []
+    zone_ids: list[uuid.UUID] = []
+    if forward_zone_id is not None:
+        zone_ids.append(forward_zone_id)
+    for raw in extra_zone_ids or []:
+        try:
+            zone_ids.append(uuid.UUID(str(raw)))
+        except (ValueError, TypeError):
+            continue
+    if not zone_ids:
+        return []
+
+    rows = (
+        await db.execute(
+            select(DNSZone.id, DNSZone.name, DNSServerGroup.id, DNSServerGroup.name)
+            .join(DNSServerGroup, DNSServerGroup.id == DNSZone.group_id)
+            .where(DNSZone.id.in_(zone_ids))
+            .where(DNSServerGroup.is_public_facing.is_(True))
+        )
+    ).all()
+
+    warnings: list[dict[str, Any]] = []
+    for _, zone_name, _, group_name in rows:
+        warnings.append(
+            {
+                "type": "public_facing_private_ip",
+                "field": "extra_zone_ids",
+                "message": (
+                    f"{address} is a private (RFC 1918 / CGNAT / ULA / "
+                    f"link-local) address; publishing it into zone "
+                    f"'{zone_name}' in group '{group_name}' (marked "
+                    f"public-facing) would expose internal IPs through a "
+                    f"publicly reachable resolver."
+                ),
+                "zone": zone_name,
+                "group": group_name,
+            }
+        )
+    return warnings
+
+
 async def _record_mac_history(db: AsyncSession, ip_id: uuid.UUID, mac_address: str | None) -> None:
     """Upsert ``(ip_id, mac)`` in ``ip_mac_history``, bumping ``last_seen``.
 
@@ -846,12 +907,25 @@ async def _sync_dns_record(
         return
 
     effective_zone_id = zone_id or await _resolve_effective_zone(db, subnet)
-    if not effective_zone_id or not ip.hostname:
+    # Fallback: when the subnet hierarchy resolves to no zone (operator
+    # detached the dns_zone configuration), prefer the IP's existing
+    # ``forward_zone_id`` so previously-published records can still be
+    # tracked through update / cleanup. Without this, an update that
+    # only changes ``extra_zone_ids`` would early-return and leak the
+    # old records (issue #25).
+    if effective_zone_id is None:
+        effective_zone_id = ip.forward_zone_id
+    if not ip.hostname:
+        return
+    if effective_zone_id is None and not ip.extra_zone_ids:
+        # Nothing to publish to — no primary zone, no extras.
         return
 
-    zone = await db.get(DNSZone, effective_zone_id)
-    if not zone:
-        return
+    zone = await db.get(DNSZone, effective_zone_id) if effective_zone_id else None
+    if effective_zone_id and not zone:
+        # Stale FK — primary zone deleted out from under us. Treat as
+        # no-primary so the cleanup path still runs against extras.
+        effective_zone_id = None
 
     # Backfill the reverse zone if missing. Subnets created before DNS was
     # assigned won't have had `ensure_reverse_zone_for_subnet` run at create
@@ -863,9 +937,10 @@ async def _sync_dns_record(
     except Exception:  # noqa: BLE001 — best-effort, don't block IP allocation
         pass
 
-    zone_domain = zone.name.rstrip(".")
-    fqdn = f"{ip.hostname}.{zone_domain}"
-    ip.fqdn = fqdn
+    zone_domain = zone.name.rstrip(".") if zone else ""
+    fqdn = f"{ip.hostname}.{zone_domain}" if zone_domain else None
+    if fqdn:
+        ip.fqdn = fqdn
 
     # Forward record type depends on the address family: AAAA for IPv6, A for IPv4.
     try:
@@ -874,7 +949,7 @@ async def _sync_dns_record(
         addr_obj = None
     forward_rtype = "AAAA" if isinstance(addr_obj, ipaddress.IPv6Address) else "A"
 
-    # ── Forward A/AAAA ──────────────────────────────────────────────────────
+    # ── Forward A/AAAA — fanout across primary + extra zones (issue #25) ──
     # Skip forward DNS for the default gateway placeholder hostname.
     # Every subnet has one, so syncing them all would create N copies of
     # `gateway.example.com` that resolve to different IPs — useless and noisy.
@@ -883,8 +958,27 @@ async def _sync_dns_record(
     # created below since reverse lookups for the gateway IP are useful.
     is_default_gateway_name = ip.hostname == "gateway"
 
-    # Fetch any pre-existing auto-generated A **or** AAAA for this IP — if the
-    # address family changed we want to catch the stale record.
+    # Desired set of forward zones: primary + extras, deduped, with
+    # the primary always first. ``extra_zone_ids`` is JSONB list[str];
+    # each entry is a UUID stored as string.
+    desired_zone_ids: list[uuid.UUID] = []
+    seen_extras: set[uuid.UUID] = set()
+    if effective_zone_id is not None:
+        desired_zone_ids.append(effective_zone_id)
+        seen_extras.add(effective_zone_id)
+    for raw in ip.extra_zone_ids or []:
+        try:
+            extra_uuid = uuid.UUID(str(raw))
+        except (ValueError, TypeError):
+            continue
+        if extra_uuid in seen_extras:
+            continue
+        seen_extras.add(extra_uuid)
+        desired_zone_ids.append(extra_uuid)
+
+    # Fetch any pre-existing auto-generated A/AAAA for this IP across
+    # ALL zones — fanout cleanup needs the full picture. The address
+    # family swap (v4↔v6) is handled by the rewrite branch below.
     result = await db.execute(
         select(DNSRecord).where(
             DNSRecord.ip_address_id == ip.id,
@@ -892,12 +986,12 @@ async def _sync_dns_record(
             DNSRecord.record_type.in_(["A", "AAAA"]),
         )
     )
-    existing_a = result.scalars().all()
+    existing_records = list(result.scalars().all())
 
     if is_default_gateway_name:
         # Tear down any A/AAAA record that may have been published before the
         # user renamed the IP back to the default. PTR continues below.
-        for record in existing_a:
+        for record in existing_records:
             old_zone = await db.get(DNSZone, record.zone_id)
             if old_zone is not None:
                 await _enqueue_dns_op(
@@ -911,73 +1005,125 @@ async def _sync_dns_record(
                 )
             await db.delete(record)
         ip.dns_record_id = None
-    elif not existing_a:
-        a_rec = DNSRecord(
-            zone_id=effective_zone_id,
-            name=ip.hostname,
-            fqdn=fqdn,
-            record_type=forward_rtype,
-            value=str(ip.address),
-            auto_generated=True,
-            ip_address_id=ip.id,
-            created_by_user_id=ip.created_by_user_id,
-        )
-        db.add(a_rec)
-        await db.flush()
-        ip.dns_record_id = a_rec.id
-        ip.forward_zone_id = effective_zone_id
-        await _enqueue_dns_op(db, zone, "create", ip.hostname, forward_rtype, str(ip.address), None)
     else:
-        for record in existing_a:
-            # If the zone changed OR the record_type changed (v4↔v6 swap),
-            # rewrite: delete the stale record and create a fresh one.
-            needs_rewrite = (
-                record.zone_id != effective_zone_id or record.record_type != forward_rtype
+        # Build a (zone_id → record) map of what exists today.
+        existing_by_zone: dict[uuid.UUID, DNSRecord] = {
+            rec.zone_id: rec for rec in existing_records
+        }
+
+        # Phase 1: cleanup zones that are no longer desired. Delete the
+        # record + enqueue the agent op so the live nameserver drops it.
+        # This is the "shrink" path — operator removed a zone from
+        # ``extra_zone_ids`` and we need to retract the record.
+        for rec in list(existing_records):
+            if rec.zone_id in desired_zone_ids:
+                continue
+            old_zone = await db.get(DNSZone, rec.zone_id)
+            if old_zone is not None:
+                await _enqueue_dns_op(
+                    db,
+                    old_zone,
+                    "delete",
+                    rec.name,
+                    rec.record_type,
+                    rec.value,
+                    rec.ttl,
+                )
+            await db.delete(rec)
+            existing_by_zone.pop(rec.zone_id, None)
+
+        # Phase 2: walk each desired zone, create or update.
+        for desired_zone_id in desired_zone_ids:
+            target_zone = (
+                zone
+                if desired_zone_id == effective_zone_id
+                else await db.get(DNSZone, desired_zone_id)
             )
-            if needs_rewrite:
-                old_zone = await db.get(DNSZone, record.zone_id)
-                if old_zone is not None:
-                    await _enqueue_dns_op(
-                        db,
-                        old_zone,
-                        "delete",
-                        record.name,
-                        record.record_type,
-                        record.value,
-                        record.ttl,
-                    )
-                await db.delete(record)
-                new_a = DNSRecord(
-                    zone_id=effective_zone_id,
+            if target_zone is None:
+                continue
+            target_zone_domain = target_zone.name.rstrip(".")
+            target_fqdn = f"{ip.hostname}.{target_zone_domain}"
+
+            existing = existing_by_zone.get(desired_zone_id)
+            if existing is None:
+                new_rec = DNSRecord(
+                    zone_id=desired_zone_id,
                     name=ip.hostname,
-                    fqdn=fqdn,
+                    fqdn=target_fqdn,
                     record_type=forward_rtype,
                     value=str(ip.address),
                     auto_generated=True,
                     ip_address_id=ip.id,
                     created_by_user_id=ip.created_by_user_id,
                 )
-                db.add(new_a)
+                db.add(new_rec)
                 await db.flush()
-                ip.dns_record_id = new_a.id
-                ip.forward_zone_id = effective_zone_id
+                if desired_zone_id == effective_zone_id:
+                    ip.dns_record_id = new_rec.id
+                    ip.forward_zone_id = effective_zone_id
                 await _enqueue_dns_op(
-                    db, zone, "create", ip.hostname, forward_rtype, str(ip.address), None
+                    db,
+                    target_zone,
+                    "create",
+                    ip.hostname,
+                    forward_rtype,
+                    str(ip.address),
+                    None,
+                )
+            elif existing.record_type != forward_rtype:
+                # Address family swap (v4↔v6) — delete the stale record
+                # in this zone and recreate with the new rtype.
+                await _enqueue_dns_op(
+                    db,
+                    target_zone,
+                    "delete",
+                    existing.name,
+                    existing.record_type,
+                    existing.value,
+                    existing.ttl,
+                )
+                await db.delete(existing)
+                new_rec = DNSRecord(
+                    zone_id=desired_zone_id,
+                    name=ip.hostname,
+                    fqdn=target_fqdn,
+                    record_type=forward_rtype,
+                    value=str(ip.address),
+                    auto_generated=True,
+                    ip_address_id=ip.id,
+                    created_by_user_id=ip.created_by_user_id,
+                )
+                db.add(new_rec)
+                await db.flush()
+                if desired_zone_id == effective_zone_id:
+                    ip.dns_record_id = new_rec.id
+                    ip.forward_zone_id = effective_zone_id
+                await _enqueue_dns_op(
+                    db,
+                    target_zone,
+                    "create",
+                    ip.hostname,
+                    forward_rtype,
+                    str(ip.address),
+                    None,
                 )
             else:
-                changed = record.name != ip.hostname or record.value != str(ip.address)
-                record.name = ip.hostname
-                record.fqdn = fqdn
-                record.value = str(ip.address)
+                changed = existing.name != ip.hostname or existing.value != str(ip.address)
+                existing.name = ip.hostname
+                existing.fqdn = target_fqdn
+                existing.value = str(ip.address)
+                if desired_zone_id == effective_zone_id:
+                    ip.dns_record_id = existing.id
+                    ip.forward_zone_id = effective_zone_id
                 if changed:
                     await _enqueue_dns_op(
                         db,
-                        zone,
+                        target_zone,
                         "update",
                         ip.hostname,
                         forward_rtype,
                         str(ip.address),
-                        record.ttl,
+                        existing.ttl,
                     )
 
     # ── Reverse PTR ─────────────────────────────────────────────────────────
@@ -1282,6 +1428,10 @@ class IPBlockCreate(BaseModel):
     dns_zone_id: str | None = None
     dns_additional_zone_ids: list[str] = []
     dns_inherit_settings: bool = True
+    # Issue #25 — opt-in for the multi-zone IP picker on descendant
+    # subnets. False by default; existing IPAM trees keep their
+    # single-zone publishing semantics.
+    dns_split_horizon: bool = False
     dhcp_server_group_id: uuid.UUID | None = None
     dhcp_inherit_settings: bool = True
     ddns_enabled: bool = False
@@ -1321,6 +1471,7 @@ class IPBlockUpdate(BaseModel):
     dns_zone_id: str | None = None
     dns_additional_zone_ids: list[str] | None = None
     dns_inherit_settings: bool | None = None
+    dns_split_horizon: bool | None = None
     dhcp_server_group_id: uuid.UUID | None = None
     dhcp_inherit_settings: bool | None = None
     ddns_enabled: bool | None = None
@@ -1351,6 +1502,7 @@ class IPBlockResponse(BaseModel):
     dns_zone_id: str | None
     dns_additional_zone_ids: list[str] | None
     dns_inherit_settings: bool
+    dns_split_horizon: bool = False
     dhcp_server_group_id: uuid.UUID | None = None
     dhcp_inherit_settings: bool = True
     ddns_enabled: bool = False
@@ -1406,6 +1558,8 @@ class SubnetCreate(BaseModel):
     dns_zone_id: str | None = None
     dns_additional_zone_ids: list[str] = []
     dns_inherit_settings: bool = True
+    # Issue #25 — opt-in for the multi-zone IP picker on this subnet.
+    dns_split_horizon: bool = False
     dhcp_server_group_id: uuid.UUID | None = None
     dhcp_inherit_settings: bool = True
     # DDNS — see Subnet model. Defaults mirror the DB: off by default,
@@ -1511,6 +1665,7 @@ class SubnetUpdate(BaseModel):
     dns_zone_id: str | None = None
     dns_additional_zone_ids: list[str] | None = None
     dns_inherit_settings: bool | None = None
+    dns_split_horizon: bool | None = None
     dhcp_server_group_id: uuid.UUID | None = None
     dhcp_inherit_settings: bool | None = None
     ddns_enabled: bool | None = None
@@ -1619,6 +1774,7 @@ class SubnetResponse(BaseModel):
     dns_zone_id: str | None
     dns_additional_zone_ids: list[str] | None
     dns_inherit_settings: bool
+    dns_split_horizon: bool = False
     dhcp_server_group_id: uuid.UUID | None = None
     dhcp_inherit_settings: bool = True
     ddns_enabled: bool = False
@@ -1726,6 +1882,12 @@ class IPAddressCreate(BaseModel):
     custom_fields: dict[str, Any] = {}
     tags: dict[str, Any] = {}
     dns_zone_id: str | None = None  # explicit zone override; falls back to subnet's effective DNS
+    # Issue #25 — split-horizon publishing. Additional zone UUIDs to
+    # publish A/AAAA records into beyond the singular primary. Each
+    # entry is a UUID stored as string (Pydantic accepts UUIDs as
+    # strings here so the JSONB column round-trips cleanly). Empty
+    # list = current behaviour (one record).
+    extra_zone_ids: list[str] = []
     aliases: list[AliasInput] = []
     # Optional role tag. See ``IP_ROLES`` for the set; null means
     # "ordinary host" and skips the badge in the UI. Roles in
@@ -1781,6 +1943,9 @@ class IPAddressUpdate(BaseModel):
     custom_fields: dict[str, Any] | None = None
     tags: dict[str, Any] | None = None
     dns_zone_id: str | None = None  # explicit zone override for DNS record
+    # See IPAddressCreate. Pass ``[]`` to explicitly clear; omit
+    # the field to leave the existing list untouched.
+    extra_zone_ids: list[str] | None = None
     role: str | None = None
     reserved_until: datetime | None = None
     # See IPAddressCreate.force.
@@ -1826,6 +1991,7 @@ class IPAddressResponse(BaseModel):
     tags: dict[str, Any]
     # Linkage (§3) — populated by Wave 3 DDNS/DHCP integration.
     forward_zone_id: uuid.UUID | None = None
+    extra_zone_ids: list[str] = []
     reverse_zone_id: uuid.UUID | None = None
     dns_record_id: uuid.UUID | None = None
     dhcp_lease_id: str | None = None
@@ -4924,6 +5090,17 @@ async def create_address(
             mac_address=body.mac_address,
             role=body.role,
         )
+        # Public-facing safety guard (issue #25). Append to the same
+        # warnings list so the operator sees both surfaces in one
+        # 409 — they only have to typed-CIDR-confirm once.
+        warnings.extend(
+            await _check_public_facing_warnings(
+                db,
+                address=body.address,
+                forward_zone_id=effective_zone,
+                extra_zone_ids=body.extra_zone_ids,
+            )
+        )
         if warnings:
             raise _collision_http_exc(warnings)
 
@@ -5098,7 +5275,8 @@ async def update_address(
     # exemption only matters when MAC was touched (otherwise no MAC
     # collision check runs anyway).
     effective_role = body.role if "role" in touched else ip.role
-    if not body.force and (hostname_or_zone_touched or mac_touched):
+    extra_zones_touched = "extra_zone_ids" in touched
+    if not body.force and (hostname_or_zone_touched or mac_touched or extra_zones_touched):
         subnet_for_check = await db.get(Subnet, ip.subnet_id)
         new_hostname = body.hostname if body.hostname is not None else ip.hostname
         if "dns_zone_id" in touched:
@@ -5114,6 +5292,18 @@ async def update_address(
             mac_address=body.mac_address if mac_touched else None,
             exclude_ip_id=ip.id,
             role=effective_role,
+        )
+        # Public-facing safety guard (issue #25). Run on every update
+        # that touches the zone bindings — adding an extra zone can
+        # quietly expose a private IP to a public-facing resolver.
+        new_extras = body.extra_zone_ids if extra_zones_touched else list(ip.extra_zone_ids or [])
+        warnings.extend(
+            await _check_public_facing_warnings(
+                db,
+                address=str(ip.address),
+                forward_zone_id=new_zone_id,
+                extra_zone_ids=new_extras,
+            )
         )
         if warnings:
             raise _collision_http_exc(warnings)
@@ -5162,7 +5352,12 @@ async def update_address(
         and ip.hostname
         and ip.forward_zone_id is not None
     )
-    if subnet and ("hostname" in changes or body.dns_zone_id is not None):
+    # Issue #25 — re-sync when ``extra_zone_ids`` changes too. The
+    # sync helper handles fanout + cleanup-on-shrink in one call so a
+    # pure extras edit (no hostname / zone change) still triggers the
+    # add / delete of the per-zone records.
+    extras_changed = "extra_zone_ids" in changes
+    if subnet and ("hostname" in changes or body.dns_zone_id is not None or extras_changed):
         zone_id = uuid.UUID(body.dns_zone_id) if body.dns_zone_id else None
         await _sync_dns_record(db, ip, subnet, zone_id=zone_id, action="update")
     elif subnet and restoring:

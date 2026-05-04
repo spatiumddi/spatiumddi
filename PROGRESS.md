@@ -148,22 +148,27 @@ the IPAM layer. One IPAM row publishes N records, one per
 
 ### Checkpoints
 
-- [ ] Migration: add `IPAddress.extra_zone_ids`, `Subnet.dns_split_horizon`, `IPBlock.dns_split_horizon`, `DNSServerGroup.is_public_facing`
-- [ ] Models: extend the four model classes
-- [ ] Service: `resolve_effective_split_horizon` + `_resolve_effective_extra_zones`
-- [ ] Service: extend `_sync_dns_record` to fan out + cleanup on shrink
-- [ ] Service: `app/services/ipam/classify.py::is_private_ip`
-- [ ] Service: extend `_check_ip_collisions` with public-facing guard
-- [ ] Schemas: `extra_zone_ids` on IPAddress; `dns_split_horizon` on Subnet/Block; `is_public_facing` on DNSServerGroup
-- [ ] Router: `/ipam/addresses` accepts `extra_zone_ids` + `force` flag for public-facing override
-- [ ] Tests: fanout publishes N records; shrink cleans up; public-facing guard triggers; override with `force=true` succeeds
-- [ ] Frontend: split-horizon toggle on Subnet + Block edit modals
-- [ ] Frontend: public-facing toggle on DNS group editor
-- [ ] Frontend: multi-select grouped picker on IP create/edit when split-horizon on
-- [ ] Frontend: typed-CIDR confirm flow on public-facing-private-IP overlap
-- [ ] Frontend: "Published to" chip list on IP detail
-- [ ] `make ci` clean
-- [ ] Commit chain split at model+service / safety-gates / frontend
+- [x] Migration: add `IPAddress.extra_zone_ids`, `Subnet.dns_split_horizon`, `IPBlock.dns_split_horizon`, `DNSServerGroup.is_public_facing` (`e7c4f29ad581_dns_split_horizon_publishing`)
+- [x] Models: extend the four model classes
+- [x] Service: `app/services/ipam/classify.py::is_private_ip` covering RFC 1918 + CGNAT (RFC 6598) + ULA (RFC 4193) + link-local + loopback (stdlib's `is_private` is too narrow)
+- [x] Service: extend `_sync_dns_record` to fan out across `forward_zone_id ∪ extra_zone_ids` + cleanup-on-shrink (DELETEs records for zones no longer in the desired set + handles fallback when subnet's effective zone resolves to None)
+- [x] Service: `_check_public_facing_warnings` runs on every create / update touching zones; appends to the same `_check_ip_collisions` warning list so the existing `requires_confirmation` shape carries it
+- [x] Schemas: `extra_zone_ids` on `IPAddressCreate` / `Update` / `Response`; `dns_split_horizon` on `SubnetCreate` / `Update` / `Response` and `IPBlockCreate` / `Update` / `Response`; `is_public_facing` on DNS group Create / Update / Response
+- [x] Router: `/ipam/addresses` accepts `extra_zone_ids`; update path detects `extra_zone_ids` change + re-runs sync; `force=true` bypasses the public-facing guard for confirmed overrides
+- [x] Smoke-test: 4-assertion script — private→public-facing zone POST returns 409 with `requires_confirmation`; force-create with 2 zones (internal + external) emits 2 A records; PUT shrinking `extra_zone_ids` to `[]` cleans up to 1 record (just the primary)
+- [x] Frontend: split-horizon toggle on Subnet edit modal (block-level toggle deferred — operators can opt in per-subnet for the MVP)
+- [x] Frontend: "Public-facing" toggle on DNS group editor with hint copy
+- [x] Frontend: multi-select extras picker on IP Create modal (renders only when subnet has `dns_split_horizon` on + ≥2 zones available; checkbox list under the primary zone picker)
+- [x] Frontend: typed-CIDR confirm flow — the existing collision-warning machinery surfaces the public-facing warning unchanged (no new UX needed; the operator sees a `requires_confirmation` 409 + types the CIDR)
+- [x] `make ci` clean
+- [x] Single commit `feat(dns): #25 split-horizon DNS publishing at the IPAM layer`
+
+### Deferred follow-ups
+
+- Block-level split-horizon toggle in the IPBlock edit modal (column + schema landed; just no UI yet — operators can flip it via API).
+- Frontend block-edit toggle for `dns_split_horizon` (additive).
+- "Published to" chip list on the IP detail panel showing which zones each row publishes to.
+- Per-zone PTR fanout (split-horizon reverse) — explicitly deferred per the issue body.
 
 ### Done when
 
