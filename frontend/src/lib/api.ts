@@ -5200,10 +5200,40 @@ export const conformityApi = {
     api
       .get<ConformityCheckCatalogEntry[]>("/conformity/checks")
       .then((r) => r.data),
-  exportPdfUrl: (framework?: string) =>
-    framework
-      ? `/api/v1/conformity/export.pdf?framework=${encodeURIComponent(framework)}`
-      : "/api/v1/conformity/export.pdf",
+  // Fetches the PDF via the authenticated axios client (Bearer token
+  // lives in axios memory, not cookies — a plain ``window.open`` to
+  // the same URL would 401 because the browser nav doesn't carry the
+  // header). Mirrors ``ipamIoApi.exportFile``: blob response, parse
+  // ``Content-Disposition`` for the backend's UTC-timestamped
+  // filename, trigger a synthetic anchor click for the download.
+  exportPdf: async (framework?: string): Promise<void> => {
+    const res = await api.get<Blob>("/conformity/export.pdf", {
+      params: framework ? { framework } : undefined,
+      responseType: "blob",
+    });
+    const disp = (res.headers["content-disposition"] as string) || "";
+    const match = disp.match(/filename="?([^";]+)"?/i);
+    const ts = new Date()
+      .toISOString()
+      .slice(0, 19)
+      .replace(/[-:]/g, "")
+      .replace("T", "-");
+    const fallback = framework
+      ? `spatiumddi-conformity-${framework.toLowerCase().replace(/[\s/]+/g, "-")}-${ts}.pdf`
+      : `spatiumddi-conformity-${ts}.pdf`;
+    const filename = match ? match[1] : fallback;
+    const blob = new Blob([res.data as BlobPart], {
+      type: "application/pdf",
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  },
 };
 
 // ── Domain registration (RDAP / WHOIS tracking) ─────────────────────────────

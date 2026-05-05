@@ -100,6 +100,17 @@ export function ConformityPage() {
     },
   });
 
+  const exportPdfMut = useMutation({
+    mutationFn: (framework: string | undefined) =>
+      conformityApi.exportPdf(framework),
+    onError: (e: unknown) => {
+      const err = e as { response?: { data?: { detail?: string } } };
+      alert(
+        `PDF export failed: ${err?.response?.data?.detail ?? "unknown error"}`,
+      );
+    },
+  });
+
   const policies = policiesQ.data ?? [];
   const summary = summaryQ.data;
 
@@ -122,12 +133,11 @@ export function ConformityPage() {
           <div className="flex shrink-0 flex-wrap items-center gap-1.5">
             <HeaderButton
               variant="secondary"
-              onClick={() =>
-                window.open(conformityApi.exportPdfUrl(), "_blank")
-              }
+              onClick={() => exportPdfMut.mutate(undefined)}
+              disabled={exportPdfMut.isPending}
             >
               <FileDown className="h-4 w-4" />
-              Export PDF
+              {exportPdfMut.isPending ? "Exporting…" : "Export PDF"}
             </HeaderButton>
             <HeaderButton variant="primary" onClick={() => setCreating(true)}>
               <Plus className="h-4 w-4" />
@@ -139,7 +149,11 @@ export function ConformityPage() {
 
       <div className="flex-1 overflow-auto p-6 space-y-6">
         {/* Summary cards */}
-        <SummaryRibbon summary={summary} loading={summaryQ.isLoading} />
+        <SummaryRibbon
+          summary={summary}
+          loading={summaryQ.isLoading}
+          onExport={(fw) => exportPdfMut.mutate(fw)}
+        />
 
         {/* Policies */}
         <section className="space-y-2">
@@ -343,9 +357,11 @@ export function ConformityPage() {
 function SummaryRibbon({
   summary,
   loading,
+  onExport,
 }: {
   summary: import("@/lib/api").ConformitySummary | undefined;
   loading: boolean;
+  onExport: (framework: string) => void;
 }) {
   if (loading || !summary) {
     return (
@@ -386,7 +402,11 @@ function SummaryRibbon({
         tone="zinc"
       />
       {summary.frameworks.map((fw) => (
-        <FrameworkCard key={fw.framework} framework={fw} />
+        <FrameworkCard
+          key={fw.framework}
+          framework={fw}
+          onExport={() => onExport(fw.framework)}
+        />
       ))}
     </div>
   );
@@ -429,8 +449,10 @@ function KpiCard({
 
 function FrameworkCard({
   framework,
+  onExport,
 }: {
   framework: import("@/lib/api").ConformityFrameworkRollup;
+  onExport: () => void;
 }) {
   const totalResults =
     framework.pass_count +
@@ -451,14 +473,14 @@ function FrameworkCard({
             enabled
           </p>
         </div>
-        <a
+        <button
+          type="button"
+          title={`Download ${framework.framework} PDF`}
           className="text-xs text-primary hover:underline"
-          href={`/api/v1/conformity/export.pdf?framework=${encodeURIComponent(framework.framework)}`}
-          target="_blank"
-          rel="noopener noreferrer"
+          onClick={onExport}
         >
           <Download className="inline h-3.5 w-3.5" />
-        </a>
+        </button>
       </div>
       <div className="mt-2 flex items-end gap-3">
         <p className="text-xl font-bold tabular-nums">{passPct}%</p>
