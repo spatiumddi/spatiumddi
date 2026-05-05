@@ -6956,3 +6956,138 @@ export const providersApi = {
       )
       .then((r) => r.data),
 };
+
+// ── WAN circuits (issue #93) ───────────────────────────────────────
+//
+// Carrier-supplied WAN pipes — the contract + transport class +
+// bandwidth + endpoints. Foundation for the future MPLS L3VPN
+// service catalog (#94) and SD-WAN overlay routing (#95) which both
+// reference circuits by ``transport_class``.
+
+export type TransportClass =
+  | "mpls"
+  | "internet_broadband"
+  | "fiber_direct"
+  | "wavelength"
+  | "lte"
+  | "satellite"
+  | "direct_connect_aws"
+  | "express_route_azure"
+  | "interconnect_gcp";
+
+export type CircuitStatus = "active" | "pending" | "suspended" | "decom";
+
+export interface CircuitRead {
+  id: string;
+  name: string;
+  ckt_id: string | null;
+  provider_id: string;
+  customer_id: string | null;
+  transport_class: TransportClass;
+  bandwidth_mbps_down: number;
+  bandwidth_mbps_up: number;
+  a_end_site_id: string | null;
+  a_end_subnet_id: string | null;
+  z_end_site_id: string | null;
+  z_end_subnet_id: string | null;
+  term_start_date: string | null;
+  term_end_date: string | null;
+  // Decimal serialised as a string by Pydantic; the frontend keeps it
+  // as a string so we don't round on display. Render via Number()
+  // only for math (sums, sorting).
+  monthly_cost: string | null;
+  currency: string;
+  status: CircuitStatus;
+  notes: string;
+  tags: Record<string, unknown>;
+  custom_fields: Record<string, unknown>;
+  previous_status: string | null;
+  last_status_change_at: string | null;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface CircuitCreate {
+  name: string;
+  ckt_id?: string | null;
+  provider_id: string;
+  customer_id?: string | null;
+  transport_class?: TransportClass;
+  bandwidth_mbps_down?: number;
+  bandwidth_mbps_up?: number;
+  a_end_site_id?: string | null;
+  a_end_subnet_id?: string | null;
+  z_end_site_id?: string | null;
+  z_end_subnet_id?: string | null;
+  term_start_date?: string | null;
+  term_end_date?: string | null;
+  monthly_cost?: string | null;
+  currency?: string;
+  status?: CircuitStatus;
+  notes?: string;
+  tags?: Record<string, unknown>;
+  custom_fields?: Record<string, unknown>;
+}
+
+export interface CircuitUpdate {
+  name?: string;
+  ckt_id?: string | null;
+  provider_id?: string;
+  customer_id?: string | null;
+  transport_class?: TransportClass;
+  bandwidth_mbps_down?: number;
+  bandwidth_mbps_up?: number;
+  a_end_site_id?: string | null;
+  a_end_subnet_id?: string | null;
+  z_end_site_id?: string | null;
+  z_end_subnet_id?: string | null;
+  term_start_date?: string | null;
+  term_end_date?: string | null;
+  monthly_cost?: string | null;
+  currency?: string;
+  status?: CircuitStatus;
+  notes?: string;
+  tags?: Record<string, unknown>;
+  custom_fields?: Record<string, unknown>;
+}
+
+export interface CircuitListResponse {
+  items: CircuitRead[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface CircuitListQuery {
+  limit?: number;
+  offset?: number;
+  provider_id?: string;
+  customer_id?: string;
+  site_id?: string;
+  subnet_id?: string;
+  transport_class?: TransportClass;
+  status?: CircuitStatus;
+  expiring_within_days?: number;
+  search?: string;
+}
+
+export const circuitsApi = {
+  list: (params?: CircuitListQuery) =>
+    api.get<CircuitListResponse>("/circuits", { params }).then((r) => r.data),
+  get: (id: string) =>
+    api.get<CircuitRead>(`/circuits/${id}`).then((r) => r.data),
+  create: (data: CircuitCreate) =>
+    api.post<CircuitRead>("/circuits", data).then((r) => r.data),
+  update: (id: string, data: CircuitUpdate) =>
+    api.put<CircuitRead>(`/circuits/${id}`, data).then((r) => r.data),
+  remove: (id: string) => api.delete(`/circuits/${id}`),
+  bulkDelete: (ids: string[]) =>
+    api
+      .post<{
+        deleted: number;
+        not_found: string[];
+      }>("/circuits/bulk-delete", { ids })
+      .then((r) => r.data),
+  bySite: (siteId: string) =>
+    api.get<CircuitRead[]>(`/circuits/by-site/${siteId}`).then((r) => r.data),
+};

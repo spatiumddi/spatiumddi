@@ -19,6 +19,7 @@ from typing import Any, Literal
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func, or_, select
+from sqlalchemy.exc import IntegrityError
 
 from app.api.deps import DB, CurrentUser
 from app.api.v1.ownership._audit import write_audit
@@ -228,7 +229,21 @@ async def delete_provider(provider_id: uuid.UUID, db: DB, user: CurrentUser) -> 
         resource_display=row.name,
     )
     await db.delete(row)
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError as exc:
+        # ``circuit.provider_id`` is ``ON DELETE RESTRICT`` (issue
+        # #93) — refuses provider deletion while any (incl. soft-
+        # deleted) circuit still references it. Surface as a clean
+        # 409 with a helpful pointer instead of a bare 500.
+        await db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Cannot delete provider while circuits reference it. "
+                "Delete or re-attach the circuits first."
+            ),
+        ) from exc
 
 
 @router.post("/bulk-delete")

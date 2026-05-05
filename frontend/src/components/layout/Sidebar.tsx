@@ -68,6 +68,7 @@ const baseMainNav = [
 // VRFs / ASNs are real first-class pages from issues #85 / #86.
 const networkNav = [
   { label: "ASNs", icon: Hash, to: "/network/asns" },
+  { label: "Circuits", icon: Waypoints, to: "/network/circuits" },
   { label: "Customers", icon: Briefcase, to: "/network/customers" },
   { label: "Devices", icon: Cable, to: "/network/devices" },
   { label: "Providers", icon: Truck, to: "/network/providers" },

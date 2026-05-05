@@ -23,6 +23,7 @@ import { NetworkPage } from "@/pages/network/NetworkPage";
 import { DeviceDetailView } from "@/pages/network/DeviceDetailView";
 import { AsnsPage } from "@/pages/network/AsnsPage";
 import { AsnDetailPage } from "@/pages/network/AsnDetailPage";
+import { CircuitsPage } from "@/pages/network/CircuitsPage";
 import { CustomersPage } from "@/pages/network/CustomersPage";
 import { ProvidersPage } from "@/pages/network/ProvidersPage";
 import { SitesPage } from "@/pages/network/SitesPage";
@@ -93,6 +94,7 @@ export default function App() {
         <Route path="network/vrfs/:id" element={<VRFDetailPage />} />
         <Route path="network/asns" element={<AsnsPage />} />
         <Route path="network/asns/:id" element={<AsnDetailPage />} />
+        <Route path="network/circuits" element={<CircuitsPage />} />
         <Route path="network/customers" element={<CustomersPage />} />
         <Route path="network/providers" element={<ProvidersPage />} />
         <Route path="network/sites" element={<SitesPage />} />

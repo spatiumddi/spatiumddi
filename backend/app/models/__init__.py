@@ -7,6 +7,7 @@ from app.models.audit_forward import AuditForwardTarget
 from app.models.auth import APIToken, Group, Role, User, UserSession, user_group
 from app.models.auth_provider import AuthGroupMapping, AuthProvider
 from app.models.base import Base
+from app.models.circuit import Circuit
 from app.models.dhcp import (
     DHCPClientClass,
     DHCPConfigOp,
@@ -152,4 +153,5 @@ __all__ = [
     "Customer",
     "Site",
     "Provider",
+    "Circuit",
 ]
