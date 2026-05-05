@@ -19,7 +19,14 @@ RUN apk add --no-cache \
  && addgroup -S spatium \
  && adduser -S -G spatium spatium \
  && mkdir -p /var/lib/spatium-dns-agent /var/cache/bind /var/run/named /var/log/named \
- && chown -R spatium:spatium /var/lib/spatium-dns-agent /var/cache/bind /var/run/named /var/log/named
+ && chown -R spatium:spatium /var/lib/spatium-dns-agent /var/cache/bind /var/run/named /var/log/named \
+ && { \
+      echo "alpine_release=$(cat /etc/alpine-release)"; \
+      apk info -v 2>/dev/null \
+        | grep -E '^(bind|bind-tools|bind-libs)-' \
+        | sort -u \
+        | sed 's/^\([a-z0-9-]*\)-\([0-9].*\)$/\1=\2/'; \
+    } > /etc/spatiumddi-versions
 
 COPY --from=agent-build /install /usr/local
 COPY agent/dns/images/bind9/entrypoint.sh /usr/local/bin/spatium-dns-entrypoint

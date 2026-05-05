@@ -26,7 +26,14 @@ RUN apk add --no-cache \
  && addgroup -S spatium \
  && adduser -S -G spatium spatium \
  && mkdir -p /var/lib/spatium-dhcp-agent /var/lib/kea /run/kea /etc/kea /var/log/kea \
- && chown -R spatium:spatium /var/lib/spatium-dhcp-agent /var/lib/kea /run/kea /etc/kea /var/log/kea
+ && chown -R spatium:spatium /var/lib/spatium-dhcp-agent /var/lib/kea /run/kea /etc/kea /var/log/kea \
+ && { \
+      echo "alpine_release=$(cat /etc/alpine-release)"; \
+      apk info -v 2>/dev/null \
+        | grep -E '^kea(-[a-z]+)?-' \
+        | sort -u \
+        | sed 's/^\([a-z0-9-]*\)-\([0-9].*\)$/\1=\2/'; \
+    } > /etc/spatiumddi-versions
 
 COPY --from=agent-build /install /usr/local
 COPY agent/dhcp/images/kea/kea-dhcp4.conf /etc/kea/kea-dhcp4.conf

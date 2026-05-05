@@ -225,6 +225,36 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Extract bundled component versions
+        id: bundled
+        # Pulls the just-published DNS + DHCP agent images and reads the
+        # ``/etc/spatiumddi-versions`` file each Dockerfile writes at build
+        # time (post ``apk add bind`` / ``apk add kea …``). Surfaces the
+        # exact BIND9 + Kea + Alpine package versions in the release notes
+        # so operators can map a release tag to the bytes inside.
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.meta.outputs.version }}"
+          DNS_IMG="${{ env.IMAGE_PREFIX }}/dns-bind9:${VERSION}"
+          DHCP_IMG="${{ env.IMAGE_PREFIX }}/dhcp-kea:${VERSION}"
+
+          docker pull --platform linux/amd64 "$DNS_IMG"
+          docker pull --platform linux/amd64 "$DHCP_IMG"
+
+          BIND_VERSIONS=$(docker run --rm --platform linux/amd64 --entrypoint cat \
+            "$DNS_IMG" /etc/spatiumddi-versions)
+          KEA_VERSIONS=$(docker run --rm --platform linux/amd64 --entrypoint cat \
+            "$DHCP_IMG" /etc/spatiumddi-versions)
+
+          {
+            echo "BIND_VERSIONS<<BV_EOF"
+            printf '%s\n' "$BIND_VERSIONS"
+            echo "BV_EOF"
+            echo "KEA_VERSIONS<<KV_EOF"
+            printf '%s\n' "$KEA_VERSIONS"
+            echo "KV_EOF"
+          } >> "$GITHUB_ENV"
+
       - name: Generate changelog
         id: changelog
         run: |
@@ -277,6 +307,22 @@ jobs:
             docker pull ghcr.io/${{ github.repository_owner }}/spatiumddi-frontend:${{ needs.meta.outputs.version }}
             docker pull ghcr.io/${{ github.repository_owner }}/dns-bind9:${{ needs.meta.outputs.version }}
             docker pull ghcr.io/${{ github.repository_owner }}/dhcp-kea:${{ needs.meta.outputs.version }}
+            ```
+
+            ## Bundled Component Versions
+
+            Resolved at build time by `apk info` inside the agent images and
+            also written to `/etc/spatiumddi-versions` inside each container
+            for runtime inspection.
+
+            **DNS agent image** (`dns-bind9:${{ needs.meta.outputs.version }}`)
+            ```
+            ${{ env.BIND_VERSIONS }}
+            ```
+
+            **DHCP agent image** (`dhcp-kea:${{ needs.meta.outputs.version }}`)
+            ```
+            ${{ env.KEA_VERSIONS }}
             ```
 
             ## Helm Chart
