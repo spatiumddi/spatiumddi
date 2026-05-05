@@ -201,6 +201,8 @@ export interface IPSpace {
   route_distinguisher?: string | null;
   route_targets?: string[] | null;
   asn_id?: string | null;
+  // Logical ownership (issue #91). NULL = unassigned.
+  customer_id?: string | null;
   created_at?: string;
   modified_at?: string;
 }
@@ -234,6 +236,8 @@ export interface IPBlock {
   ddns_inherit_settings?: boolean;
   vrf_id?: string | null;
   asn_id?: string | null;
+  customer_id?: string | null;
+  site_id?: string | null;
   applied_template_id?: string | null;
   created_at?: string;
   modified_at?: string;
@@ -501,6 +505,9 @@ export interface Subnet {
   dns_servers?: string[] | null;
   domain_name?: string | null;
   applied_template_id?: string | null;
+  // Logical ownership (issue #91). NULL = unassigned.
+  customer_id?: string | null;
+  site_id?: string | null;
   created_at?: string;
   modified_at?: string;
 }
@@ -1108,6 +1115,8 @@ export const ipamApi = {
         | "dhcp_inherit_settings"
         | "asn_id"
         | "vrf_id"
+        | "customer_id"
+        | "site_id"
       >
     >,
   ) => api.put<IPBlock>(`/ipam/blocks/${id}`, data).then((r) => r.data),
@@ -3109,6 +3118,8 @@ export interface DNSZone {
   // reconciler. The UI shows a read-only badge and disables edit /
   // delete controls on the zone + its records.
   tailscale_tenant_id: string | null;
+  // Logical ownership (issue #91). NULL = unassigned.
+  customer_id: string | null;
   created_at: string;
   modified_at: string;
 }
@@ -3915,6 +3926,7 @@ export interface VRF {
   export_targets: string[];
   tags: Record<string, unknown>;
   custom_fields: Record<string, unknown>;
+  customer_id: string | null;
   created_at: string;
   modified_at: string;
   space_count: number;
@@ -3930,6 +3942,7 @@ export interface VRFCreate {
   export_targets?: string[];
   tags?: Record<string, unknown>;
   custom_fields?: Record<string, unknown>;
+  customer_id?: string | null;
 }
 
 export type VRFUpdate = Partial<VRFCreate>;
@@ -5029,6 +5042,8 @@ export interface Domain {
   next_check_at: string | null;
   tags: Record<string, unknown>;
   custom_fields: Record<string, unknown>;
+  customer_id: string | null;
+  registrar_provider_id: string | null;
   created_at: string;
   modified_at: string;
 }
@@ -5038,6 +5053,8 @@ export interface DomainCreate {
   expected_nameservers?: string[];
   tags?: Record<string, unknown>;
   custom_fields?: Record<string, unknown>;
+  customer_id?: string | null;
+  registrar_provider_id?: string | null;
 }
 
 export interface DomainUpdate {
@@ -5045,6 +5062,8 @@ export interface DomainUpdate {
   expected_nameservers?: string[];
   tags?: Record<string, unknown>;
   custom_fields?: Record<string, unknown>;
+  customer_id?: string | null;
+  registrar_provider_id?: string | null;
 }
 
 export interface DomainListResponse {
@@ -5057,6 +5076,8 @@ export interface DomainListResponse {
 export interface DomainListParams {
   whois_state?: DomainWhoisState;
   expiring_within_days?: number;
+  customer_id?: string;
+  registrar_provider_id?: string;
   search?: string;
   page?: number;
   page_size?: number;
@@ -6562,6 +6583,8 @@ export interface ASNCreate {
   name?: string;
   description?: string;
   holder_org?: string | null;
+  customer_id?: string | null;
+  provider_id?: string | null;
   tags?: Record<string, unknown>;
   custom_fields?: Record<string, unknown>;
 }

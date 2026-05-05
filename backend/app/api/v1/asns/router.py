@@ -57,6 +57,8 @@ class ASNCreate(BaseModel):
     name: str = Field("", max_length=255)
     description: str = ""
     holder_org: str | None = Field(default=None, max_length=512)
+    customer_id: uuid.UUID | None = None
+    provider_id: uuid.UUID | None = None
     tags: dict[str, Any] = Field(default_factory=dict)
     custom_fields: dict[str, Any] = Field(default_factory=dict)
 
@@ -208,6 +210,8 @@ async def create_asn(body: ASNCreate, db: DB, user: CurrentUser) -> ASNRead:
         registry=registry,
         holder_org=body.holder_org,
         whois_state=whois_state,
+        customer_id=body.customer_id,
+        provider_id=body.provider_id,
         tags=body.tags or {},
         custom_fields=body.custom_fields or {},
     )

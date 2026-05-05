@@ -11,6 +11,7 @@ import {
 } from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
+import { CustomerPicker, ProviderPicker } from "@/components/ownership/pickers";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -120,6 +121,12 @@ function DomainEditorModal({
   const [expectedNs, setExpectedNs] = useState(
     (existing?.expected_nameservers ?? []).join("\n"),
   );
+  const [customerId, setCustomerId] = useState<string | null>(
+    existing?.customer_id ?? null,
+  );
+  const [registrarProviderId, setRegistrarProviderId] = useState<string | null>(
+    existing?.registrar_provider_id ?? null,
+  );
   const [tagsRaw, setTagsRaw] = useState(
     JSON.stringify(existing?.tags ?? {}, null, 2),
   );
@@ -149,6 +156,8 @@ function DomainEditorModal({
           expected_nameservers,
           tags,
           custom_fields,
+          customer_id: customerId,
+          registrar_provider_id: registrarProviderId,
         };
         return domainsApi.update(existing.id, body);
       }
@@ -157,6 +166,8 @@ function DomainEditorModal({
         expected_nameservers,
         tags,
         custom_fields,
+        customer_id: customerId,
+        registrar_provider_id: registrarProviderId,
       };
       return domainsApi.create(body);
     },
@@ -209,6 +220,33 @@ function DomainEditorModal({
             One per line (or comma / space separated). Drift is computed against
             the registry-reported list on the next refresh.
           </p>
+        </div>
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+          <div className="space-y-1">
+            <label className="text-xs font-medium text-muted-foreground">
+              Customer
+            </label>
+            <CustomerPicker
+              className={inputCls}
+              value={customerId}
+              onChange={setCustomerId}
+            />
+          </div>
+          <div className="space-y-1">
+            <label className="text-xs font-medium text-muted-foreground">
+              Registrar (Provider)
+            </label>
+            <ProviderPicker
+              className={inputCls}
+              value={registrarProviderId}
+              onChange={setRegistrarProviderId}
+              kind="registrar"
+            />
+            <p className="text-[11px] text-muted-foreground/80">
+              FK successor to the freeform registrar text. Pick a Provider of
+              kind "registrar".
+            </p>
+          </div>
         </div>
         <div className="space-y-1">
           <label className="text-xs font-medium text-muted-foreground">

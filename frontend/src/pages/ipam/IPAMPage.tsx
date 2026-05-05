@@ -78,6 +78,12 @@ import { Modal, ModalTabs } from "@/components/ui/modal";
 import { AsnPicker } from "@/components/ipam/asn-picker";
 import { VrfPicker } from "@/components/ipam/vrf-picker";
 import {
+  CustomerChip,
+  CustomerPicker,
+  SiteChip,
+  SitePicker,
+} from "@/components/ownership/pickers";
+import {
   MODAL_BACKDROP_CLS,
   useDraggableModal,
 } from "@/components/ui/use-draggable-modal";
@@ -426,9 +432,11 @@ function CustomFieldsSection({
 
 function Field({
   label,
+  hint,
   children,
 }: {
   label: string;
+  hint?: React.ReactNode;
   children: React.ReactNode;
 }) {
   return (
@@ -437,6 +445,7 @@ function Field({
         {label}
       </label>
       {children}
+      {hint && <p className="text-[11px] text-muted-foreground/80">{hint}</p>}
     </div>
   );
 }
@@ -533,6 +542,7 @@ function CreateSpaceModal({ onClose }: { onClose: () => void }) {
   // so most homelab operators can ignore it without scrolling past it.
   const [vrfId, setVrfId] = useState<string | null>(null);
   const [asnId, setAsnId] = useState<string | null>(null);
+  const [customerId, setCustomerId] = useState<string | null>(null);
   const [tab, setTab] = useState<"dns" | "dhcp" | "networking">("dns");
 
   const mutation = useMutation({
@@ -548,6 +558,7 @@ function CreateSpaceModal({ onClose }: { onClose: () => void }) {
         dhcp_server_group_id: dhcpServerGroupId,
         vrf_id: vrfId,
         asn_id: asnId,
+        customer_id: customerId,
       });
     },
     onSuccess: () => {
@@ -651,6 +662,13 @@ function CreateSpaceModal({ onClose }: { onClose: () => void }) {
           </Field>
           <Field label="Origin ASN (BGP)">
             <AsnPicker className={inputCls} value={asnId} onChange={setAsnId} />
+          </Field>
+          <Field label="Customer" hint="Logical owner of this space.">
+            <CustomerPicker
+              className={inputCls}
+              value={customerId}
+              onChange={setCustomerId}
+            />
           </Field>
         </div>
       )}
@@ -1786,6 +1804,9 @@ function CreateSubnetModal({
   const [pciScope, setPciScope] = useState(false);
   const [hipaaScope, setHipaaScope] = useState(false);
   const [internetFacing, setInternetFacing] = useState(false);
+  // Logical ownership (issue #91).
+  const [customerId, setCustomerId] = useState<string | null>(null);
+  const [siteId, setSiteId] = useState<string | null>(null);
   // Optional template pre-fill (issue #26).
   const [templateId, setTemplateId] = useState<string>("");
   const [tab, setTab] = useState<
@@ -1887,6 +1908,8 @@ function CreateSubnetModal({
         pci_scope: pciScope,
         hipaa_scope: hipaaScope,
         internet_facing: internetFacing,
+        customer_id: customerId,
+        site_id: siteId,
         ...(templateId ? { template_id: templateId } : {}),
       }),
     onSuccess: () => {
@@ -2104,6 +2127,20 @@ function CreateSubnetModal({
             />
             Skip network / broadcast / gateway records (loopback, P2P)
           </label>
+          <Field label="Customer" hint="Logical owner of this subnet.">
+            <CustomerPicker
+              className={inputCls}
+              value={customerId}
+              onChange={setCustomerId}
+            />
+          </Field>
+          <Field label="Site" hint="Physical location of this subnet.">
+            <SitePicker
+              className={inputCls}
+              value={siteId}
+              onChange={setSiteId}
+            />
+          </Field>
           <CustomFieldsSection
             definitions={cfDefs}
             values={customFields}
@@ -5719,6 +5756,11 @@ function EditSubnetModal({
   const [internetFacing, setInternetFacing] = useState(
     subnet.internet_facing ?? false,
   );
+  // Logical ownership (issue #91).
+  const [customerId, setCustomerId] = useState<string | null>(
+    subnet.customer_id ?? null,
+  );
+  const [siteId, setSiteId] = useState<string | null>(subnet.site_id ?? null);
   type SubnetEditTab =
     | "general"
     | "dns"
@@ -5825,6 +5867,8 @@ function EditSubnetModal({
         pci_scope: pciScope,
         hipaa_scope: hipaaScope,
         internet_facing: internetFacing,
+        customer_id: customerId,
+        site_id: siteId,
         ...(manageAuto !== undefined
           ? { manage_auto_addresses: manageAuto }
           : {}),
@@ -6065,6 +6109,20 @@ function EditSubnetModal({
               </p>
             </div>
           </label>
+          <Field label="Customer" hint="Logical owner of this subnet.">
+            <CustomerPicker
+              className={inputCls}
+              value={customerId}
+              onChange={setCustomerId}
+            />
+          </Field>
+          <Field label="Site" hint="Physical location of this subnet.">
+            <SitePicker
+              className={inputCls}
+              value={siteId}
+              onChange={setSiteId}
+            />
+          </Field>
           <CustomFieldsSection
             definitions={cfDefs}
             values={customFields}
@@ -8074,6 +8132,8 @@ function SubnetRow({
               </span>
             )}
           </div>
+          <CustomerChip customerId={subnet.customer_id} />
+          <SiteChip siteId={subnet.site_id} />
           <UtilizationDot percent={subnet.utilization_percent} />
         </div>
       </ContextMenuTrigger>
@@ -8451,6 +8511,9 @@ function EditSpaceModal({
   // below points at one.
   const [vrfId, setVrfId] = useState<string | null>(space.vrf_id ?? null);
   const [asnId, setAsnId] = useState<string | null>(space.asn_id ?? null);
+  const [customerId, setCustomerId] = useState<string | null>(
+    space.customer_id ?? null,
+  );
   const [tab, setTab] = useState<"dns" | "dhcp" | "networking" | "danger">(
     "dns",
   );
@@ -8467,6 +8530,7 @@ function EditSpaceModal({
         dhcp_server_group_id: dhcpServerGroupId,
         vrf_id: vrfId,
         asn_id: asnId,
+        customer_id: customerId,
       });
     },
     onSuccess: () => {
@@ -8684,6 +8748,13 @@ function EditSpaceModal({
           <Field label="Origin ASN (BGP)">
             <AsnPicker className={inputCls} value={asnId} onChange={setAsnId} />
           </Field>
+          <Field label="Customer" hint="Logical owner of this space.">
+            <CustomerPicker
+              className={inputCls}
+              value={customerId}
+              onChange={setCustomerId}
+            />
+          </Field>
         </div>
       )}
 
@@ -8831,6 +8902,8 @@ function CreateBlockModal({
   );
   const [asnId, setAsnId] = useState<string | null>(null);
   const [vrfId, setVrfId] = useState<string | null>(null);
+  const [customerId, setCustomerId] = useState<string | null>(null);
+  const [siteId, setSiteId] = useState<string | null>(null);
   // Optional template pre-fill (issue #26).
   const [templateId, setTemplateId] = useState<string>("");
   const [tab, setTab] = useState<"general" | "dns" | "dhcp" | "networking">(
@@ -8877,6 +8950,8 @@ function CreateBlockModal({
         ...(dhcpInherit ? {} : { dhcp_server_group_id: dhcpServerGroupId }),
         asn_id: asnId,
         vrf_id: vrfId,
+        customer_id: customerId,
+        site_id: siteId,
         ...(templateId ? { template_id: templateId } : {}),
       }),
     onSuccess: () => {
@@ -9031,6 +9106,20 @@ function CreateBlockModal({
           <Field label="Origin ASN (BGP)">
             <AsnPicker className={inputCls} value={asnId} onChange={setAsnId} />
           </Field>
+          <Field label="Customer" hint="Logical owner of this block.">
+            <CustomerPicker
+              className={inputCls}
+              value={customerId}
+              onChange={setCustomerId}
+            />
+          </Field>
+          <Field label="Site" hint="Physical location of this block.">
+            <SitePicker
+              className={inputCls}
+              value={siteId}
+              onChange={setSiteId}
+            />
+          </Field>
         </div>
       )}
 
@@ -9100,6 +9189,10 @@ function EditBlockModal({
   );
   const [asnId, setAsnId] = useState<string | null>(block.asn_id ?? null);
   const [vrfId, setVrfId] = useState<string | null>(block.vrf_id ?? null);
+  const [customerId, setCustomerId] = useState<string | null>(
+    block.customer_id ?? null,
+  );
+  const [siteId, setSiteId] = useState<string | null>(block.site_id ?? null);
   const [tab, setTab] = useState<
     "general" | "dns" | "dhcp" | "networking" | "danger"
   >("general");
@@ -9167,6 +9260,8 @@ function EditBlockModal({
         dhcp_server_group_id: dhcpInherit ? null : dhcpServerGroupId,
         asn_id: asnId,
         vrf_id: vrfId,
+        customer_id: customerId,
+        site_id: siteId,
       }),
     onSuccess: (updated) => {
       qc.invalidateQueries({ queryKey: ["blocks", block.space_id] });
@@ -9375,6 +9470,20 @@ function EditBlockModal({
           <Field label="Origin ASN (BGP)">
             <AsnPicker className={inputCls} value={asnId} onChange={setAsnId} />
           </Field>
+          <Field label="Customer" hint="Logical owner of this block.">
+            <CustomerPicker
+              className={inputCls}
+              value={customerId}
+              onChange={setCustomerId}
+            />
+          </Field>
+          <Field label="Site" hint="Physical location of this block.">
+            <SitePicker
+              className={inputCls}
+              value={siteId}
+              onChange={setSiteId}
+            />
+          </Field>
         </div>
       )}
 
@@ -9521,6 +9630,8 @@ function BlockTreeRow({
                   {node.block.name}
                 </span>
               )}
+              <CustomerChip customerId={node.block.customer_id} />
+              <SiteChip siteId={node.block.site_id} />
             </button>
           </div>
         </ContextMenuTrigger>
@@ -11801,6 +11912,7 @@ function SpaceSection({
               >
                 {space.name}
               </span>
+              <CustomerChip customerId={space.customer_id} />
             </button>
           </div>
         </ContextMenuTrigger>

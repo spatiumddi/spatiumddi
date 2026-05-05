@@ -221,6 +221,7 @@ class VRFCreate(BaseModel):
     name: str
     description: str = ""
     asn_id: uuid.UUID | None = None
+    customer_id: uuid.UUID | None = None
     route_distinguisher: str | None = None
     import_targets: list[str] = []
     export_targets: list[str] = []
@@ -263,6 +264,7 @@ class VRFUpdate(BaseModel):
     name: str | None = None
     description: str | None = None
     asn_id: uuid.UUID | None = None
+    customer_id: uuid.UUID | None = None
     route_distinguisher: str | None = None
     import_targets: list[str] | None = None
     export_targets: list[str] | None = None
@@ -306,6 +308,7 @@ class VRFResponse(BaseModel):
     name: str
     description: str
     asn_id: uuid.UUID | None
+    customer_id: uuid.UUID | None = None
     route_distinguisher: str | None
     import_targets: list[str]
     export_targets: list[str]
@@ -390,6 +393,7 @@ def _to_response(
         "name": v.name,
         "description": v.description,
         "asn_id": v.asn_id,
+        "customer_id": v.customer_id,
         "route_distinguisher": v.route_distinguisher,
         "import_targets": list(v.import_targets or []),
         "export_targets": list(v.export_targets or []),
@@ -479,6 +483,7 @@ async def create_vrf(body: VRFCreate, current_user: CurrentUser, db: DB) -> dict
         name=body.name,
         description=body.description,
         asn_id=body.asn_id,
+        customer_id=body.customer_id,
         route_distinguisher=body.route_distinguisher,
         import_targets=body.import_targets,
         export_targets=body.export_targets,

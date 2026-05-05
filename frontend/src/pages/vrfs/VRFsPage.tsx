@@ -13,6 +13,7 @@ import {
 import { Modal } from "@/components/ui/modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { AsnPicker } from "@/components/ipam/asn-picker";
+import { CustomerChip, CustomerPicker } from "@/components/ownership/pickers";
 import {
   asnsApi,
   vrfsApi,
@@ -155,6 +156,9 @@ export function VRFEditorModal({
     listToCsv(existing?.export_targets ?? []),
   );
   const [asnId, setAsnId] = useState<string | null>(existing?.asn_id ?? null);
+  const [customerId, setCustomerId] = useState<string | null>(
+    existing?.customer_id ?? null,
+  );
   const [error, setError] = useState<string | null>(null);
 
   const rdValid = rd.trim() === "" || isValidRdRt(rd);
@@ -175,6 +179,7 @@ export function VRFEditorModal({
         import_targets: importItems,
         export_targets: exportItems,
         asn_id: asnId,
+        customer_id: customerId,
       };
       if (existing) {
         return vrfsApi.update(existing.id, body);
@@ -254,6 +259,13 @@ export function VRFEditorModal({
           }
         >
           <AsnPicker className={inputCls} value={asnId} onChange={setAsnId} />
+        </Field>
+        <Field label="Customer" hint="Optional logical owner of this VRF.">
+          <CustomerPicker
+            className={inputCls}
+            value={customerId}
+            onChange={setCustomerId}
+          />
         </Field>
         <Field label="Route distinguisher (RD)" hint={rdHint}>
           <input
@@ -586,12 +598,15 @@ export function VRFsPage() {
                     />
                   </td>
                   <td className="px-2 py-1.5 font-mono text-xs">
-                    <Link
-                      to={`/network/vrfs/${v.id}`}
-                      className="hover:text-primary hover:underline"
-                    >
-                      {v.name}
-                    </Link>
+                    <span className="inline-flex items-center gap-1.5">
+                      <Link
+                        to={`/network/vrfs/${v.id}`}
+                        className="hover:text-primary hover:underline"
+                      >
+                        {v.name}
+                      </Link>
+                      <CustomerChip customerId={v.customer_id} />
+                    </span>
                   </td>
                   <td className="px-2 py-1.5 font-mono text-[11px]">
                     <AsnNumberCell asnId={v.asn_id} />

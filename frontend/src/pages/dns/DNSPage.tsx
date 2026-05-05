@@ -68,6 +68,7 @@ import { copyToClipboard } from "@/lib/clipboard";
 import { useTableSort, SortableTh } from "@/lib/useTableSort";
 import { cn, swatchCls, zebraBodyCls } from "@/lib/utils";
 import { SwatchPicker } from "@/components/ui/swatch-picker";
+import { CustomerChip, CustomerPicker } from "@/components/ownership/pickers";
 import {
   ContextMenu,
   ContextMenuContent,
@@ -1209,6 +1210,9 @@ function ZoneModal({
   const [domainId, setDomainId] = useState<string | null>(
     zone?.domain_id ?? null,
   );
+  const [customerId, setCustomerId] = useState<string | null>(
+    zone?.customer_id ?? null,
+  );
   const { data: domainList } = useQuery({
     queryKey: ["domains-picker"],
     queryFn: () => domainsApi.list({ page_size: 500 }),
@@ -1242,6 +1246,7 @@ function ZoneModal({
       dnssec_enabled: dnssec,
       color,
       domain_id: domainId,
+      customer_id: customerId,
     };
     if (zoneType === "forward") {
       const fwds = forwardersText
@@ -1411,6 +1416,13 @@ function ZoneModal({
             surfaces it under "Linked DNS Zones". Auto-matches by name when left
             blank.
           </p>
+        </Field>
+        <Field label="Customer (optional)">
+          <CustomerPicker
+            className={inputCls}
+            value={customerId}
+            onChange={setCustomerId}
+          />
         </Field>
         {error && <p className="text-sm text-destructive">{error}</p>}
         <Btns
@@ -4687,6 +4699,7 @@ function ZonesTab({
                   <span className="font-mono text-xs">
                     {z.name.replace(/\.$/, "")}
                   </span>
+                  <CustomerChip customerId={z.customer_id} />
                 </span>
               </td>
               <td className="py-1">

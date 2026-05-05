@@ -8,6 +8,7 @@ import {
   type ASNUpdate,
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
+import { CustomerPicker, ProviderPicker } from "@/components/ownership/pickers";
 import { cn } from "@/lib/utils";
 
 import { Field, errMsg } from "./_shared";
@@ -32,6 +33,12 @@ export function AsnFormModal({
   const [name, setName] = useState(asn?.name ?? "");
   const [description, setDescription] = useState(asn?.description ?? "");
   const [holderOrg, setHolderOrg] = useState(asn?.holder_org ?? "");
+  const [customerId, setCustomerId] = useState<string | null>(
+    asn?.customer_id ?? null,
+  );
+  const [providerId, setProviderId] = useState<string | null>(
+    asn?.provider_id ?? null,
+  );
   const [tagsRaw, setTagsRaw] = useState(
     asn?.tags ? JSON.stringify(asn.tags, null, 2) : "{}",
   );
@@ -70,6 +77,8 @@ export function AsnFormModal({
           name,
           description,
           holder_org: holderOrg || null,
+          customer_id: customerId,
+          provider_id: providerId,
           tags,
         };
         return asnsApi.update(asn.id, body);
@@ -85,6 +94,8 @@ export function AsnFormModal({
         name,
         description,
         holder_org: holderOrg || null,
+        customer_id: customerId,
+        provider_id: providerId,
         tags,
       };
       return asnsApi.create(body);
@@ -152,6 +163,25 @@ export function AsnFormModal({
             placeholder="e.g. CLOUDFLARENET"
           />
         </Field>
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+          <Field label="Customer" hint="Operator owning this AS, if any.">
+            <CustomerPicker
+              className={inputCls}
+              value={customerId}
+              onChange={setCustomerId}
+            />
+          </Field>
+          <Field
+            label="Provider"
+            hint="Upstream we lease / peer through, if any."
+          >
+            <ProviderPicker
+              className={inputCls}
+              value={providerId}
+              onChange={setProviderId}
+            />
+          </Field>
+        </div>
         <Field
           label="Tags (JSON)"
           hint='Free-form key/value object. Example: {"region": "us-east", "tier": "transit"}'
