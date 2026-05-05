@@ -14,6 +14,7 @@ import {
   Github,
   Hash,
   MapPin,
+  Package,
   Truck,
   Users,
   UsersRound,
@@ -68,9 +69,10 @@ const baseMainNav = [
 // Administration does — ``SubNavLabel`` rows split the contents
 // into two themed bunches:
 //
-// * **Logical** — operator-facing ownership tags from issue #91
-//   (Customers / Sites / Providers). These cross-cut every other
-//   resource type; not network entities themselves.
+// * **Logical** — operator-facing ownership / deliverable rows
+//   (Customers / Providers / Services / Sites from #91 + #94).
+//   These cross-cut every other resource type; not network entities
+//   themselves.
 // * **Infrastructure** — the actual network entities (ASNs,
 //   Circuits, Devices, VLANs, VRFs).
 //
@@ -79,6 +81,7 @@ const baseMainNav = [
 const networkLogicalNav = [
   { label: "Customers", icon: Briefcase, to: "/network/customers" },
   { label: "Providers", icon: Truck, to: "/network/providers" },
+  { label: "Services", icon: Package, to: "/network/services" },
   { label: "Sites", icon: MapPin, to: "/network/sites" },
 ];
 const networkInfrastructureNav = [

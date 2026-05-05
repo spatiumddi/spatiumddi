@@ -93,7 +93,9 @@ function RuleEditorModal({
         notify_smtp: notifySmtp,
         threshold_percent: ruleType === "subnet_utilization" ? threshold : null,
         threshold_days:
-          ruleType === "domain_expiring" || ruleType === "circuit_term_expiring"
+          ruleType === "domain_expiring" ||
+          ruleType === "circuit_term_expiring" ||
+          ruleType === "service_term_expiring"
             ? thresholdDays
             : null,
         server_type: ruleType === "server_unreachable" ? serverType : null,
@@ -176,6 +178,14 @@ function RuleEditorModal({
                   Circuit status changed (suspended / decom)
                 </option>
               </optgroup>
+              <optgroup label="Service catalog">
+                <option value="service_term_expiring">
+                  Service term expiring
+                </option>
+                <option value="service_resource_orphaned">
+                  Service resource orphaned (target deleted)
+                </option>
+              </optgroup>
             </select>
           </Field>
         )}
@@ -208,7 +218,8 @@ function RuleEditorModal({
           </Field>
         )}
         {(ruleType === "domain_expiring" ||
-          ruleType === "circuit_term_expiring") && (
+          ruleType === "circuit_term_expiring" ||
+          ruleType === "service_term_expiring") && (
           <Field
             label="Threshold (days)"
             hint="Soft fire at threshold; severity escalates to warning at threshold/4 and critical at threshold/12 (e.g. 30 → 7.5 → 2.5 d)."
@@ -251,6 +262,14 @@ function RuleEditorModal({
             <code>decom</code>. Routine <code>active</code> ↔{" "}
             <code>pending</code> flips during commissioning are excluded.
             Auto-resolves after 7 days; can be marked resolved manually.
+          </p>
+        )}
+        {ruleType === "service_resource_orphaned" && (
+          <p className="rounded-md border bg-muted/20 p-3 text-[11px] text-muted-foreground">
+            Fires when a service has a resource link (VRF / subnet / circuit /
+            etc.) whose target row was deleted out from under it. Resolves
+            automatically when the operator detaches the orphan link or
+            re-creates the target.
           </p>
         )}
         <Field label="Severity">
@@ -461,7 +480,8 @@ export function AlertsPage() {
                         : r.rule_type === "server_unreachable"
                           ? `type=${r.server_type ?? "any"}`
                           : r.rule_type === "domain_expiring" ||
-                              r.rule_type === "circuit_term_expiring"
+                              r.rule_type === "circuit_term_expiring" ||
+                              r.rule_type === "service_term_expiring"
                             ? `≤ ${r.threshold_days ?? 30} d`
                             : "—"}
                     </td>

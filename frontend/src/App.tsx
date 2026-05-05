@@ -26,6 +26,7 @@ import { AsnDetailPage } from "@/pages/network/AsnDetailPage";
 import { CircuitsPage } from "@/pages/network/CircuitsPage";
 import { CustomersPage } from "@/pages/network/CustomersPage";
 import { ProvidersPage } from "@/pages/network/ProvidersPage";
+import { ServicesPage } from "@/pages/network/ServicesPage";
 import { SitesPage } from "@/pages/network/SitesPage";
 import { NmapToolsPage } from "@/pages/nmap/NmapToolsPage";
 import { CidrCalculatorPage } from "@/pages/tools/CidrCalculatorPage";
@@ -97,6 +98,7 @@ export default function App() {
         <Route path="network/circuits" element={<CircuitsPage />} />
         <Route path="network/customers" element={<CustomersPage />} />
         <Route path="network/providers" element={<ProvidersPage />} />
+        <Route path="network/services" element={<ServicesPage />} />
         <Route path="network/sites" element={<SitesPage />} />
         <Route
           path="vlans"

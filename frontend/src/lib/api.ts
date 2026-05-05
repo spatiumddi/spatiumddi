@@ -4928,7 +4928,9 @@ export type AlertRuleType =
   | "domain_registrar_changed"
   | "domain_dnssec_status_changed"
   | "circuit_term_expiring"
-  | "circuit_status_changed";
+  | "circuit_status_changed"
+  | "service_term_expiring"
+  | "service_resource_orphaned";
 export type AlertSeverity = "info" | "warning" | "critical";
 export type AlertServerType = "dns" | "dhcp" | "any";
 
@@ -7092,4 +7094,194 @@ export const circuitsApi = {
       .then((r) => r.data),
   bySite: (siteId: string) =>
     api.get<CircuitRead[]>(`/circuits/by-site/${siteId}`).then((r) => r.data),
+};
+
+// ── Service catalog (issue #94) ────────────────────────────────────
+//
+// First-class customer-deliverable bundles. ``mpls_l3vpn`` is the
+// concrete kind in v1; ``custom`` is the catch-all. Other kinds (DIA,
+// hosted DNS / DHCP, SD-WAN, MPLS L2VPN, VPLS, EVPN) reserve names in
+// the backend enum and will surface as kind options here in later
+// phases. The polymorphic ``ServiceResource`` join row binds a service
+// to VRF / Subnet / IPBlock / DNSZone / DHCPScope / Circuit / Site
+// (overlay_network is reserved for SD-WAN #95 and rejected at attach
+// time).
+
+export type ServiceKind = "mpls_l3vpn" | "custom";
+export type ServiceStatus = "active" | "provisioning" | "suspended" | "decom";
+export type ServiceResourceKind =
+  | "vrf"
+  | "subnet"
+  | "ip_block"
+  | "dns_zone"
+  | "dhcp_scope"
+  | "circuit"
+  | "overlay_network"
+  | "site";
+
+export interface ServiceResourceRead {
+  id: string;
+  service_id: string;
+  resource_kind: ServiceResourceKind;
+  resource_id: string;
+  role: string | null;
+  created_at: string;
+}
+
+export interface ServiceRead {
+  id: string;
+  name: string;
+  kind: ServiceKind;
+  customer_id: string;
+  status: ServiceStatus;
+  term_start_date: string | null;
+  term_end_date: string | null;
+  // Decimal serialised as a string by Pydantic — see CircuitRead above.
+  monthly_cost_usd: string | null;
+  currency: string;
+  sla_tier: string | null;
+  notes: string;
+  tags: Record<string, unknown>;
+  custom_fields: Record<string, unknown>;
+  created_at: string;
+  modified_at: string;
+  resources: ServiceResourceRead[];
+  resource_count: number;
+}
+
+export interface ServiceCreate {
+  name: string;
+  kind?: ServiceKind;
+  customer_id: string;
+  status?: ServiceStatus;
+  term_start_date?: string | null;
+  term_end_date?: string | null;
+  monthly_cost_usd?: string | null;
+  currency?: string;
+  sla_tier?: string | null;
+  notes?: string;
+  tags?: Record<string, unknown>;
+  custom_fields?: Record<string, unknown>;
+}
+
+export interface ServiceUpdate {
+  name?: string;
+  kind?: ServiceKind;
+  customer_id?: string;
+  status?: ServiceStatus;
+  term_start_date?: string | null;
+  term_end_date?: string | null;
+  monthly_cost_usd?: string | null;
+  currency?: string;
+  sla_tier?: string | null;
+  notes?: string;
+  tags?: Record<string, unknown>;
+  custom_fields?: Record<string, unknown>;
+}
+
+export interface ServiceListResponse {
+  items: ServiceRead[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface ServiceListQuery {
+  limit?: number;
+  offset?: number;
+  customer_id?: string;
+  kind?: ServiceKind;
+  status?: ServiceStatus;
+  expiring_within_days?: number;
+  search?: string;
+}
+
+export interface ServiceResourceAttach {
+  resource_kind: ServiceResourceKind;
+  resource_id: string;
+  role?: string | null;
+}
+
+// Summary payload — kind-aware shape. The backend returns an L3VPN
+// shape for ``kind=mpls_l3vpn`` and a grouped-by-kind shape for
+// everything else. Discriminated by the ``kind`` field on the
+// payload itself so the frontend can switch on it.
+export interface L3VPNVrfSummary {
+  id: string;
+  name: string;
+  route_distinguisher: string | null;
+  import_targets: string[];
+  export_targets: string[];
+}
+
+export interface L3VPNSiteSummary {
+  id: string;
+  name: string;
+  code: string | null;
+  role: string | null;
+}
+
+export interface L3VPNCircuitSummary {
+  id: string;
+  name: string;
+  ckt_id: string | null;
+  transport_class: TransportClass;
+  bandwidth_mbps_down: number;
+  bandwidth_mbps_up: number;
+  role: string | null;
+}
+
+export interface L3VPNSubnetSummary {
+  id: string;
+  cidr: string;
+  vrf_id: string | null;
+  role: string | null;
+}
+
+export interface L3VPNSummary {
+  kind: "mpls_l3vpn";
+  vrf: L3VPNVrfSummary | null;
+  edge_sites: L3VPNSiteSummary[];
+  edge_circuits: L3VPNCircuitSummary[];
+  edge_subnets: L3VPNSubnetSummary[];
+  warnings: string[];
+}
+
+export interface CustomGroupedSummary {
+  kind: "custom";
+  by_kind: Record<string, number>;
+  resources: ServiceResourceRead[];
+}
+
+export type ServiceSummary = L3VPNSummary | CustomGroupedSummary;
+
+export const servicesApi = {
+  list: (params?: ServiceListQuery) =>
+    api.get<ServiceListResponse>("/services", { params }).then((r) => r.data),
+  get: (id: string) =>
+    api.get<ServiceRead>(`/services/${id}`).then((r) => r.data),
+  create: (data: ServiceCreate) =>
+    api.post<ServiceRead>("/services", data).then((r) => r.data),
+  update: (id: string, data: ServiceUpdate) =>
+    api.put<ServiceRead>(`/services/${id}`, data).then((r) => r.data),
+  remove: (id: string) => api.delete(`/services/${id}`),
+  bulkDelete: (ids: string[]) =>
+    api
+      .post<{
+        deleted: number;
+        not_found: string[];
+      }>("/services/bulk-delete", { ids })
+      .then((r) => r.data),
+  attachResource: (id: string, body: ServiceResourceAttach) =>
+    api
+      .post<ServiceResourceRead>(`/services/${id}/resources`, body)
+      .then((r) => r.data),
+  detachResource: (id: string, resourcePk: string) =>
+    api.delete(`/services/${id}/resources/${resourcePk}`),
+  summary: (id: string) =>
+    api.get<ServiceSummary>(`/services/${id}/summary`).then((r) => r.data),
+  byResource: (kind: ServiceResourceKind, resourceId: string) =>
+    api
+      .get<ServiceRead[]>(`/services/by-resource/${kind}/${resourceId}`)
+      .then((r) => r.data),
 };
