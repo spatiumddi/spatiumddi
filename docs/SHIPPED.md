@@ -2094,13 +2094,73 @@ Mirrors CLAUDE.md's three mixed sections:
   enforces scope intersection: token can do at most what the
   scope set allows AND what the user has permission for.
 
-- ✅ **Subnet classification tags** (issue #75). `subnet.pci_scope`,
-  `subnet.hipaa_scope`, `subnet.internet_facing`,
-  `subnet.contains_pii` boolean columns. List filters across
-  the IPAM page + the API. Compliance card on Platform
-  Insights shows rolled-up counts. Tags inherit through the
-  IP block tree (set on a parent block → all descendant
-  subnets get the tag) with an explicit override toggle.
+- ✅ **Subnet classification tags** (issue #75).
+  `subnet.pci_scope`, `subnet.hipaa_scope`,
+  `subnet.internet_facing` first-class boolean columns,
+  each individually indexed (partial index `WHERE col =
+  true`) so the auditor's "show me every PCI subnet"
+  filter hits an index without competing. List filters
+  across the IPAM page + the API. Compliance dashboard at
+  `/admin/compliance` shows the three buckets side-by-side.
+  Feeds the compliance-change alert rule (#105) and
+  conformity policy filters (#106). Inheritance through
+  the IP block tree is intentionally not implemented today
+  — flags live on the subnet row only; revisit when block
+  / space-level classification is needed.
+
+- ✅ **Compliance change alerts** (issue #105). New
+  `compliance_change` rule type plus three disabled seed
+  rules covering each classification flag. Migration
+  `e3f1c92a4d68` adds three columns to `alert_rule`:
+  `classification` (one of `pci_scope` / `hipaa_scope` /
+  `internet_facing`), `change_scope` (one of `any_change`
+  / `create` / `delete`), and `last_scanned_audit_at`
+  watermark. The evaluator scans `audit_log` on the
+  existing 60 s alert tick, opens one event per mutation
+  against a classification-flagged subnet (or descendant
+  IP / DHCP scope via the subnet FK), and auto-resolves
+  after 24 h. Watermark baselines to `now()` on first run
+  so historical audit rows don't retro-page operators.
+  Resource resolution falls back to
+  `audit_log.old_value.subnet_id` for delete actions
+  where the live row no longer exists. Per-pass scan
+  capped at 1000 audit rows so a long-disabled rule
+  flipping on doesn't pause the evaluator. Frontend
+  `AlertsPage` rule-type picker + form gain a Compliance
+  optgroup with classification + change-scope fields.
+
+- ✅ **Conformity evaluations + auditor PDF export**
+  (issue #106). Companion to the reactive #105 alerts:
+  declarative `ConformityPolicy` rows pin a `check_kind`
+  against a target set; a beat-driven engine ticks every
+  60 s and runs every enabled policy on its
+  `eval_interval_hours` cadence (default 24 h). On-demand
+  re-evaluation via `POST /conformity/policies/{id}/
+  evaluate`. Migration `b5d8a3f12c91` creates
+  `conformity_policy` (declarative check definitions) and
+  `conformity_result` (append-only history, indexed twice
+  on `(policy_id, evaluated_at)` and `(resource_kind,
+  resource_id, evaluated_at)` so both natural drilldowns
+  hit an index). Six starter `check_kind` evaluators ship
+  in `services/conformity/checks.py`: `has_field`,
+  `in_separate_vrf`, `no_open_ports` (warn-not-fail when
+  no recent scan), `alert_rule_covers`,
+  `last_seen_within`, `audit_log_immutable`. Eight
+  disabled seed policies span PCI-DSS / HIPAA / SOC2.
+  Built-in rows accept narrow updates only (enabled /
+  interval / severity / fail_alert_rule_id / description)
+  — clone first to author a variant. `pass→fail`
+  transitions emit `AlertEvent` rows against the policy's
+  wired alert rule (when set) so conformity drift surfaces
+  in the existing alerts dashboard. Synchronous
+  `reportlab`-based PDF export at `/conformity/
+  export.pdf` with per-framework section, failing-row
+  enumeration with diagnostic JSON, SHA-256 integrity
+  hash over `(result_id, status)` tuples in the trailer.
+  New `conformity` permission resource type plus two new
+  built-in roles (Auditor + Compliance Editor). Frontend
+  `/admin/conformity` page + Platform Insights conformity
+  card.
 
 ### UX polish
 

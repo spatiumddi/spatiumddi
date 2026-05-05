@@ -44,6 +44,22 @@
 
 ---
 
+## Contents
+
+- [Why SpatiumDDI](#why-spatiumddi) — the elevator pitch
+- [What's in the box](#whats-in-the-box) — quick capability tour
+- [Full feature detail](#full-feature-detail) — deep dive on every subsystem
+- [Screenshots](#screenshots)
+- [Architecture](#architecture)
+- [Getting Started](#getting-started) — Docker Compose quick start, demo seed, upgrade flow, admin reset
+- [Deployment Options](#deployment-options)
+- [Documentation](#documentation)
+- [Project Status](#project-status)
+- [Contributing](#contributing)
+- [License](#license)
+
+---
+
 ## Why SpatiumDDI
 
 **It runs DNS and DHCP — not just configures them.** A modern alternative to Infoblox and EfficientIP: most open-source IPAM tools are pretty dashboards over someone else's `/etc/bind/named.conf`. SpatiumDDI bundles BIND9 and Kea as first-class service containers; the control plane owns their config, they auto-register, and they keep serving if the control plane is down.
@@ -114,9 +130,10 @@
 |---|---|---|
 | 🔒 | **RBAC + external auth** | LDAP · OIDC · SAML · RADIUS · TACACS+ with backup-server failover · API tokens with auto-expiry · scoped API tokens (per-permission) |
 | 🛡 | **TOTP MFA** | local-user 2FA — QR enrolment via `pyotp` + `qrcode` · single-use backup codes · admin force-disable per user (audit-logged) |
-| 🏷 | **Subnet classification tags** | `pci_scope` · `hipaa_scope` · `internet_facing` · `contains_pii` — inheritable through the IP block tree · compliance roll-up card on Platform Insights |
-| 🤖 | **Operator Copilot (AI)** | grounded chat over your live IPAM / DNS / DHCP / Network data — multi-vendor (OpenAI / Anthropic / Azure OpenAI / Gemini / OpenAI-compat for Ollama, vLLM, etc.) with automatic failover · **34+ tools** (subnet / IP / DNS / DHCP / circuits / overlays / VRFs / ASNs / domains / nmap / ping / switchport finder, plus Apply-gated write proposals) · MCP HTTP endpoint for Claude Desktop / Cursor / Cline · "Ask AI about this" affordances on every resource · per-provider editable system prompt · OUI vendor enrichment baked in · live nmap results in chat · per-message token / latency footer · Markdown + GFM tables in replies · daily digest |
-| 🔔 | **Alerts + forwarding** | rule-based alerts · multi-target syslog (RFC 5424 / CEF / LEEF / RFC 3164) · HTTP webhooks · SMTP email · Slack / Teams / Discord chat |
+| 🏷 | **Subnet classification tags** | `pci_scope` · `hipaa_scope` · `internet_facing` first-class boolean columns on every subnet · indexed predicates · compliance roll-up card on Platform Insights · feeds the compliance-change alert + conformity policy filters |
+| 🤖 | **Operator Copilot (AI)** | grounded chat over your live IPAM / DNS / DHCP / Network data — multi-vendor (OpenAI / Anthropic / Azure OpenAI / Gemini / OpenAI-compat for Ollama, vLLM, etc.) with automatic failover · **35+ tools** (subnet / IP / DNS / DHCP / circuits / overlays / VRFs / ASNs / domains / nmap / ping / switchport finder, plus Apply-gated write proposals) · MCP HTTP endpoint for Claude Desktop / Cursor / Cline · "Ask AI about this" affordances on every resource · per-provider editable system prompt · per-provider tool allowlist · OUI vendor enrichment baked in · live nmap results in chat · per-message token / latency footer · Markdown + GFM tables in replies · daily digest |
+| 🔔 | **Alerts + forwarding** | rule-based alerts · `compliance_change` rule type (PCI / HIPAA / internet-facing audit-log scanner with 24 h auto-resolve, three disabled seed rules) · multi-target syslog (RFC 5424 / CEF / LEEF / RFC 3164) · HTTP webhooks · SMTP email · Slack / Teams / Discord chat |
+| 📑 | **Conformity evaluations** | declarative policy library scheduled against PCI-DSS / HIPAA / SOC2 frameworks · 6 starter check kinds (`has_field` · `in_separate_vrf` · `no_open_ports` · `alert_rule_covers` · `last_seen_within` · `audit_log_immutable`) · 8 disabled seed policies, opt-in toggle · pass→fail transitions emit alert events · auditor-facing PDF export with SHA-256 integrity hash · `Auditor` + `Compliance Editor` builtin roles |
 | 🪝 | **Typed-event webhooks** | 96 typed events (resource × verb) · HMAC-SHA256 signed · outbox-backed retry with backoff + dead-letter |
 | 🔐 | **ACME DNS-01** | `acme-dns`-compatible — certbot / lego / acme.sh issue public certs (wildcards included) |
 | 📋 | **Audit log** | every mutation logged, append-only, filterable in the UI |
@@ -372,21 +389,46 @@ The tables above are the elevator pitch. The bullets here are the same surface w
   - Admin can force-disable MFA per user (audit-logged)
 
 - 🏷 **Subnet classification tags** — first-class compliance flags on every subnet.
-  - `pci_scope` / `hipaa_scope` / `internet_facing` / `contains_pii` boolean columns
-  - Inherit through the IP block tree (set on a parent block → all descendant subnets get the tag) with explicit override toggle
+  - `pci_scope` / `hipaa_scope` / `internet_facing` boolean columns, each individually indexed (partial index `WHERE col = true`) so the auditor's "show me every PCI subnet" filter hits an index without competing
   - List filters across the IPAM page + the API
-  - Compliance card on Platform Insights shows rolled-up counts
+  - Compliance dashboard at `/admin/compliance` shows the three buckets side-by-side
+  - Feeds the compliance-change alert + conformity policy filters described below
 
-- 🤖 **Operator Copilot** — AI assistant grounded in your live IPAM / DNS / DHCP / Network data. Hosted-API or fully on-prem (Ollama). One provider config, ~34 tools, real conversations about your network.
+- 🛂 **Compliance change alerts** — reactive: catch every mutation against PCI / HIPAA / internet-facing scope.
+  - New `compliance_change` rule type with two params: `classification` (which Subnet flag the rule watches) and `change_scope` (`any_change` / `create` / `delete`)
+  - Audit-log scanner runs on the existing 60 s alert tick. Watermark column on the rule baselines to `now()` on first run so historical audit history doesn't retro-page operators when a rule is first enabled
+  - Resolves IP-address / DHCP-scope audit rows back to their parent subnet for classification lookup; deletes fall back to `audit_log.old_value.subnet_id` so a delete still resolves the originating subnet
+  - One event per matching audit row, auto-resolves after 24 h, fans through the existing audit-forward syslog / webhook / SMTP targets
+  - Three disabled seed rules ship at first boot: PCI scope changes, HIPAA scope changes, internet-facing scope changes — operator opts in by toggling enabled
+
+- 📑 **Conformity evaluations** — proactive: prove steady state and produce the auditor PDF.
+  - Declarative `ConformityPolicy` rows pin a `check_kind` against a target set (subnet / IP address / DNS zone / DHCP scope / platform). Beat-driven engine ticks every 60 s and runs every enabled policy on its `eval_interval_hours` cadence (default 24 h). On-demand re-eval via `POST /conformity/policies/{id}/evaluate`
+  - 6 starter check kinds:
+    - `has_field` — non-empty value on a named target column (e.g. PCI subnet must have `customer_id`)
+    - `in_separate_vrf` — subnet's effective VRF holds only classification-matched siblings (no PCI ↔ non-PCI mixing)
+    - `no_open_ports` — latest nmap scan within N days didn't expose forbidden ports (`warn` when no recent scan; never silent-pass)
+    - `alert_rule_covers` — at least one enabled alert rule of the named type covers this scope (positive coverage signal — confirms the reactive #105 channel is wired)
+    - `last_seen_within` — IP / subnet recency check (catches rows that should be decommissioned)
+    - `audit_log_immutable` — platform-level positive-presence signal for the auditor checkbox
+  - 8 disabled seed policies covering PCI-DSS / HIPAA / SOC2: PCI dedicated VRF, PCI owner_assigned, PCI no admin ports, PCI alert coverage, PCI no stale IPs, HIPAA dedicated VRF, internet-facing alert coverage, audit log immutable
+  - `pass→fail` transitions emit `AlertEvent` rows against the policy's wired alert rule when set, so conformity drift surfaces in the existing alerts dashboard
+  - Append-only `ConformityResult` history indexed twice (by policy and by resource) so both natural drilldowns hit an index — answers "every result for this policy" + "every policy that touched this resource" in O(log n)
+  - Auditor-facing **PDF export** via `reportlab` — per-framework summary table, per-policy section with pass / warn / fail counts, enumerated failing rows with diagnostic JSON pretty-printed beneath, trailer with a SHA-256 hash over `(result_id, status)` tuples so the auditor can verify post-generation tampering. `GET /conformity/export.pdf` with optional `?framework=` filter
+  - New `conformity` permission resource type plus two new built-in roles: **Auditor** (read-only) suitable for an external auditor account, **Compliance Editor** (admin) for the team that authors and tunes policies
+  - Frontend `/admin/conformity` page with per-framework summary cards, policies table (toggle / re-eval / edit / delete inline), filterable results panel with diagnostic JSON drill-in. Platform Insights gains a Conformity card with deep-link
+
+- 🤖 **Operator Copilot** — AI assistant grounded in your live IPAM / DNS / DHCP / Network data. Hosted-API or fully on-prem (Ollama). One provider config, ~35 tools, real conversations about your network.
 
   **Provider + model**
 
   - **Multi-vendor** — OpenAI, Anthropic (Claude), Azure OpenAI, Google Gemini, plus OpenAI-compat (Ollama, OpenWebUI, vLLM, LM Studio, llama.cpp server, LocalAI, Together, Groq, Fireworks). Add multiple providers in priority order; orchestrator picks the highest-priority enabled one
   - **Automatic failover chain** — on transient failure (5xx / timeout / rate-limit) the orchestrator walks remaining providers; first successful chunk wins. Permanent errors (4xx / auth) surface immediately
   - **Per-provider system prompt override** — admin-editable inside the AI Provider modal; baked-in default is also viewable inline so you can fork it. Snapshotted onto each session at creation so live edits don't break in-flight chats
+  - **Per-provider tool allowlist** — new "Tools" tab on the AI Provider modal, category-grouped checkbox list with "write" badges on `propose_*` rows. NULL = "use whatever the registry has"; non-empty list pins exactly those tools. Right call for small Ollama models that struggle with 35 tools, kiosk providers limited to read-only, and per-provider compliance posture
   - **Reasoning-channel fallback** — `qwen3.5` / DeepSeek-R1 / o1 / o3 family that route their answer to `reasoning` instead of `content` are handled transparently by the driver
+  - **Ollama context-window forwarding** — driver forwards `options.num_ctx` / `num_predict` / `extra_body` so Ollama respects the configured context window. Operators can also set `OLLAMA_CONTEXT_LENGTH` env var on the server side (recommended); without one or the other, Ollama silently truncates to 2048 tokens and small models hallucinate tool names from a half-cut tool list
 
-  **Tool registry (~34 tools)**
+  **Tool registry (~35 tools)**
 
   - **IPAM** — `list_ip_spaces`, `list_ip_blocks`, `list_subnets`, `get_subnet_summary`, `find_ip` (returns MAC + **vendor**), `find_by_tag`, `count_ipam_resources`. Name-or-UUID resolution on `space_id` / `block_id` so the model can pass `"home"` directly without a UUID-lookup hop
   - **DNS** — `list_dns_server_groups`, `list_dns_zones`, `query_dns_records`

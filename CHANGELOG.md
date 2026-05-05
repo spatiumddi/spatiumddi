@@ -7,7 +7,304 @@ Format follows [Keep a Changelog](https://keepachangelog.com/); versioning uses 
 
 ## Unreleased
 
-_(no entries yet — next release will add changes that land after `2026.05.05-1`)_
+_(no entries yet — next release will add changes that land after `2026.05.05-2`)_
+
+---
+
+## 2026.05.05-2 — 2026-05-05
+
+The **Operator Copilot polish + compliance loop** release. Three
+threads land together. **Operator Copilot polish** turns the chat
+into something operators can actually rely on — especially against
+self-hosted Ollama: the OpenAI-compat driver now forwards
+`options.num_ctx` / `num_predict` / `extra_body` so Ollama respects
+the configured context window (the silent 2048-token default was
+truncating the 8K-token prompt + tool schemas and caused every
+small model to hallucinate tool names from a half-cut list); a
+reasoning-channel fallback captures `delta.reasoning` from
+qwen3.5 / DeepSeek-R1 / o1-style models so post-tool answers don't
+disappear; a trailing-usage-chunk handler picks up Ollama's
+separate empty-choices `usage` chunk so per-message token counts
+are accurate. The tool registry expands from 22 to 35 read-only
+tools with new modules covering ASNs / domains / VRFs / circuits /
+services / overlays / applications, plus `find_switchport` (joins
+IP→MAC→FDB→interface), `ping_host`, nmap inspection +
+`propose_run_nmap_scan` write proposal, OUI vendor enrichment
+inline on `find_ip` / `find_dhcp_leases` / `find_switchport`, and
+name-or-UUID resolution on `space_id` / `block_id`. Per-provider
+**system prompt override** + per-provider **tool allowlist** ship
+as new tabs on the AI Provider modal — narrow Ollama down to the 8
+tools you actually use, restrict a kiosk provider to read-only,
+fork the prompt without losing the baked-in default. The chat
+drawer renders markdown via react-markdown / remark-gfm, persists
+the active session + composer draft to sessionStorage, surfaces
+per-message tokens / copy / info popover under every assistant
+reply, and grows multi-select bulk delete in the History panel.
+**Compliance change alerts (#105)** add a new `compliance_change`
+rule type plus three disabled seed rules (PCI / HIPAA /
+internet-facing): the alert evaluator scans the audit log on the
+existing 60 s tick, opens one event per mutation against a
+classification-flagged subnet (or descendant IP / DHCP scope), and
+auto-resolves after 24 h. **Conformity evaluations (#106)** are
+the proactive companion: declarative `ConformityPolicy` rows pin a
+`check_kind` against a target set; a beat-driven engine runs every
+enabled policy on its `eval_interval_hours` cadence, writes
+append-only `ConformityResult` rows, and emits AlertEvent on
+pass→fail transitions. Six starter check kinds cover the common
+shapes (`has_field`, `in_separate_vrf`, `no_open_ports`,
+`alert_rule_covers`, `last_seen_within`, `audit_log_immutable`),
+eight seed policies span PCI-DSS / HIPAA / SOC2, and a synchronous
+**reportlab PDF export** is the auditor-facing artifact (per-
+framework section, failing-row enumeration with diagnostic JSON,
+SHA-256 integrity hash over (id, status) tuples in the trailer for
+tamper detection). Two new built-in roles — **Auditor**
+(read-only) and **Compliance Editor** (admin) — drop into the
+RBAC seeder. #105 + #106 form the complete compliance loop:
+alerts catch the change in real time, evaluations prove steady
+state and produce the document auditors actually file. Plus
+ancillaries: nmap `quick` preset bumped from top-100 to top-1000
+(`udp_top100` preset renamed to `udp_top1000` with migration), a
+`PXE Profiles` button added to the DHCP server-group view, README
+gains a top-level table of contents, and a mypy fix on
+`network_modeling.py` unblocks the dependabot axios PR (#102).
+
+### Added
+
+- **Operator Copilot — Ollama context-window forwarding.**
+  `openai_compat` driver now forwards `provider.options.num_ctx` /
+  `num_predict` / `extra_body` via the OpenAI SDK's `extra_body`
+  parameter so Ollama respects the configured context. Without
+  this Ollama silently truncated to its 2048-token default and
+  cut the system prompt + tool schemas mid-stream, which caused
+  every small model (gemma4 / qwen2.5 / qwen3.5 / gpt-oss) to
+  hallucinate tool names. README documents the
+  `OLLAMA_CONTEXT_LENGTH` env-var route as the recommended
+  server-side default.
+- **Operator Copilot — reasoning-channel fallback in the streaming
+  driver.** qwen3.5 / DeepSeek-R1 / o1-style models route their
+  post-tool answer to `delta.reasoning` instead of
+  `delta.content`. The driver now captures both, flushes
+  `reasoning_buf` as content when the turn emitted no content and
+  no tool calls, and falls back to `model_extra["reasoning"]`
+  when the field isn't a first-class delta attribute.
+- **Operator Copilot — trailing usage-chunk handler.** Ollama
+  emits a separate empty-choices chunk carrying `usage` after the
+  `finish_reason` chunk. Driver now branches on `not choices and
+  chunk.usage`, the orchestrator captures token counts independent
+  of `finish_reason`, and the per-message footer renders accurate
+  prompt / completion totals.
+- **Operator Copilot — per-provider system prompt override.**
+  Migration `d6a39e84c512` adds `ai_provider.system_prompt_override`
+  TEXT column. New "System prompt" tab in the AI Provider
+  create/edit modal carries a textarea, "Reset to default", "Start
+  from default" copy-and-edit, and a collapsible inline view of
+  the baked-in default. Snapshotted into the chat session at
+  creation time so a mid-conversation provider edit doesn't break
+  in-flight chats. Baked-in default expanded ~10× — persona, DDI
+  domain primer, full tool taxonomy, response-style rules,
+  write-action gating, "no LaTeX" + "not a general-purpose coding
+  assistant" scope rules, three worked examples for the canonical
+  question shapes.
+- **Operator Copilot — per-provider tool allowlist.** Migration
+  `c4e8b71f0d23` adds `ai_provider.enabled_tools` JSONB column
+  (NULL = "all enabled" default; empty list = no tools at all;
+  non-empty list = exactly those names). New "Tools" tab in the
+  AI Provider modal renders a category-grouped checkbox list with
+  tool descriptions and "write" badges on `propose_*` rows.
+  Saving with every box checked writes back NULL so the provider
+  stays on "use whatever the registry has" rather than pinning a
+  stale snapshot. Orchestrator filters
+  `REGISTRY.read_only()` to `provider.enabled_tools` when set;
+  unknown names silently skipped at request build time so a tool
+  rename doesn't break a saved allowlist. The system prompt's
+  "Tools available: N" line mirrors the filtered count. New
+  `GET /api/v1/ai/providers/tools` returns the catalog
+  (name / description / category / writes flag), registered ahead
+  of `/{provider_id}` so Starlette matches the literal first.
+  Three use cases this addresses: small local Ollama models that
+  struggle with 35 tools, read-only kiosk providers, compliance
+  posture restricting `propose_*` writes per provider.
+- **Operator Copilot — tool registry expansion (22 → 35).** New
+  module `tools/network_modeling.py` covering recently-shipped
+  entities: `list_asns`, `get_asn`, `list_domains`, `list_vrfs`,
+  `list_circuits`, `list_network_services`,
+  `get_network_service_summary`, `list_overlay_networks`,
+  `get_overlay_topology`, `list_application_categories`. New
+  module `tools/nmap.py` with `list_nmap_scans` +
+  `get_nmap_scan_results` read tools, plus `propose_run_nmap_scan`
+  in `tools/proposals.py` wired through the existing
+  preview/apply operation pattern with audit hooks. New
+  `find_switchport` joins IP→MAC (IPAM or ARP) → FDB → interface
+  to answer "what port is X plugged into" — flags trunk uplinks
+  via `interpretation_hint` when the MAC matches multiple
+  interfaces. New `ping_host` runs argv-validated ICMP from the
+  SpatiumDDI host (read tool, no proposal — liveness checks
+  shouldn't need a confirm prompt). Name-or-UUID resolution on
+  `space_id` / `block_id` lets the model pass `"home"` instead of
+  a UUID. OUI vendor enrichment surfaced inline on `find_ip` /
+  `find_dhcp_leases` / `find_switchport` so no extra tool call
+  is needed. Tool-not-found errors echo the full registry list
+  + a `hint` so smaller models that hallucinate names can
+  self-correct.
+- **Operator Copilot — chat drawer markdown rendering.**
+  Assistant messages now render through `react-markdown` +
+  `remark-gfm` (tables, code fences, headings, links). Curated
+  override map keeps inline code distinct from block code via the
+  `language-` className regex. Streaming-compatible — partial
+  render on every chunk, blinking caret preserved.
+- **Operator Copilot — sessionStorage persistence.** Active
+  session ID + composer draft persist via `useSessionState` so
+  closing and reopening the drawer lands on the same conversation
+  with the half-typed message intact. Stale-id guard
+  (`detailQ.isError → setActiveSessionId(null)`) drops the
+  reference cleanly when the underlying session is deleted in
+  another tab.
+- **Operator Copilot — per-message footer + bulk delete.**
+  OpenWebUI-style footer under every assistant reply renders
+  prompt / completion tokens, a copy button, and an info popover
+  with provider / model / latency. History panel grows a checkbox
+  column + "Select all" + "Delete N" / "Delete all" toolbar
+  driven by a single `bulkDeleteMut` Promise.all fan-out. Both
+  delete paths invalidate `["ai-usage-me"]` so the daily token
+  chip drops live as messages cascade.
+- **Operator Copilot — anti-loop dedup guard.** Per-turn
+  `seen_calls: set[tuple[str, str]]` in the orchestrator catches
+  small models that loop on a successful tool call (qwen2.5:7b
+  reproducibly did this); the loop emits a synthetic warning
+  telling the model the result is already in context, breaking
+  the cycle without crashing the conversation.
+- **Compliance change alerts (#105) — `compliance_change` rule
+  type.** Migration `e3f1c92a4d68` adds three columns to
+  `alert_rule`: `classification` (one of `pci_scope` /
+  `hipaa_scope` / `internet_facing`), `change_scope` (one of
+  `any_change` / `create` / `delete`), and `last_scanned_audit_at`
+  watermark. The evaluator scans `audit_log` on the existing 60 s
+  alert tick, opens one event per mutation against a
+  classification-flagged subnet (or descendant IP / DHCP scope
+  via the subnet FK), and auto-resolves after 24 h. Watermark
+  baselines to `now()` on first run so historical audit rows
+  don't retro-page operators. Resource resolution falls back to
+  `audit_log.old_value.subnet_id` for delete actions where the
+  live row no longer exists. Per-pass scan capped at 1000 audit
+  rows so a long-disabled rule flipping on doesn't pause the
+  evaluator. Three disabled seed rules (PCI / HIPAA /
+  internet-facing) ship via the existing main.py role/seed
+  pipeline. Frontend `AlertsPage` rule-type picker + form gain a
+  Compliance optgroup with classification + change-scope fields.
+- **Conformity evaluations (#106) — declarative policies +
+  scheduled evaluator + auditor PDF.** Migration `b5d8a3f12c91`
+  adds `conformity_policy` (declarative check definitions —
+  framework / reference / severity / target_kind / target_filter
+  / check_kind / check_args / enabled / eval_interval_hours /
+  fail_alert_rule_id) and `conformity_result` (append-only
+  history, indexed twice on `(policy_id, evaluated_at)` and
+  `(resource_kind, resource_id, evaluated_at)` so both natural
+  drilldowns hit an index). Beat task `app.tasks.conformity`
+  ticks every 60 s; per-policy `eval_interval_hours` gating
+  (default 24 h) keeps the work cheap. On-demand re-evaluation
+  via `POST /conformity/policies/{id}/evaluate`. Six starter
+  `check_kind` evaluators in `services/conformity/checks.py`:
+  `has_field` (non-empty named field), `in_separate_vrf`
+  (subnet's effective VRF holds only classification-matched
+  siblings), `no_open_ports` (latest nmap scan didn't expose
+  forbidden ports — warn when no recent scan, never silent-pass),
+  `alert_rule_covers` (≥1 enabled alert rule of named rule_type
+  exists), `last_seen_within` (IP / subnet recency check), and
+  `audit_log_immutable` (platform-level positive-presence
+  signal). Eight seed policies covering PCI-DSS / HIPAA /
+  internet-facing / SOC2, all `is_builtin=True` and
+  `enabled=False` so the operator opts in. Built-in rows accept
+  narrow updates only (enabled / interval / severity /
+  fail_alert_rule_id / description) — clone first to author a
+  variant. pass→fail transitions emit `AlertEvent` rows against
+  the policy's wired alert rule when set, surfacing conformity
+  drift in the existing alerts dashboard. Permission resource
+  type `conformity` plus two new built-in roles seeded:
+  **Auditor** (read-only on conformity + audit + the underlying
+  resources, suitable for an external auditor account that can
+  pull the PDF and verify evidence without changes) and
+  **Compliance Editor** (admin on conformity + read on the
+  underlying resources, for the team that authors and tunes
+  policies). Frontend `/admin/conformity` page renders a
+  per-framework summary card row, policies table with inline
+  toggle / re-evaluate / edit / delete, and a filterable results
+  panel where each row expands to show the diagnostic JSON
+  inline. Platform Insights gains a Conformity card with deep-
+  link. Sidebar entry under the Auditing divider.
+- **Conformity — auditor-facing PDF export.** New `reportlab>=4.2`
+  dependency. `services/conformity/pdf.py` renders the latest
+  result per (policy, resource) tuple as a single PDF organised
+  by framework: per-framework summary table, per-policy section
+  with pass / warn / fail / not_applicable tally and enumerated
+  failing rows with the diagnostic JSON pretty-printed beneath,
+  trailer with a SHA-256 hash over (result_id, status) tuples
+  so the auditor can verify the underlying rows haven't been
+  edited post-generation. `GET /conformity/export.pdf` endpoint
+  with an optional `?framework=` filter. Per-framework "download
+  PDF" deep-link icon in each summary card.
+- **DHCP — PXE Profiles button on the server-group view.**
+  `GroupDetailView` header now carries a PXE Profiles
+  `HeaderButton` that navigates to `/dhcp/groups/:gid/pxe`.
+  Previously the page was only reachable from inside the scope
+  edit modal.
+- **README — top-level table of contents.** New `## Contents`
+  section between the alpha warning and the elevator pitch with
+  one anchor per top-level heading so the 700-line README is
+  scannable from the top.
+
+### Changed
+
+- **Operator Copilot — system prompt + safety rules.** Baked-in
+  default expanded ~10× to include the persona, DDI domain
+  primer, full tool taxonomy, write-action gating, formatting
+  conventions (no LaTeX), and three worked examples. Explicit
+  "you are not a general-purpose coding assistant" scope rule
+  (decline code generation outside narrow platform-config
+  snippets). Reads the per-provider override when set, falls
+  back to the baked-in default otherwise.
+- **nmap — `quick` preset bumped to top 1000.** Was `-T4 -F`
+  (top 100); now `-T4 --top-ports 1000`. The `udp_top100` preset
+  renamed to `udp_top1000` (`--top-ports 1000`) with migration
+  `a8d6e10f3b59` backfilling existing scan rows so historical
+  history doesn't silently mislabel its preset. Frontend
+  `NmapScanForm` + IPAM auto-profile preset enum updated.
+- **Compliance change alerts (#105) — fields surface on
+  AlertRuleResponse.** `classification` / `change_scope` /
+  `last_scanned_audit_at` flow through the REST surface; the
+  rule-list cell renders `pci_scope · any_change` instead of
+  the generic dash for compliance_change rows.
+- **README — Operator Copilot section rewritten.** ~13 lines →
+  ~60 lines covering accurate tool names, the Ollama 5-minute
+  self-host recipe, and the `OLLAMA_CONTEXT_LENGTH` gotcha
+  called out so operators don't repeat the truncation
+  diagnosis.
+
+### Fixed
+
+- **mypy — `network_modeling.py` `dict(rows.all())` typing.**
+  SQLAlchemy returns `Sequence[Row[tuple[UUID, int]]]` which
+  mypy can't narrow to `Iterable[tuple]` for `dict()`'s
+  constructor. Three count-rollup queries rewritten as
+  `{row[0]: row[1] for row in rows.all()}` dict comprehensions.
+  Same fix unblocks the dependabot axios 1.15.0 → 1.15.2 PR
+  (#102) — its CI was failing on the same three errors. After
+  this lands the PR can be rebased (`@dependabot rebase`) and
+  merged.
+
+### Migrations
+
+- `a8d6e10f3b59_nmap_udp_top100_to_top1000` — backfills
+  `nmap_scan.preset` from `udp_top100` → `udp_top1000`.
+- `c4e8b71f0d23_ai_provider_enabled_tools` — adds
+  `ai_provider.enabled_tools` JSONB column (NULL-default).
+- `d6a39e84c512_ai_provider_system_prompt_override` — adds
+  `ai_provider.system_prompt_override` TEXT column (NULL-default).
+- `e3f1c92a4d68_compliance_change_alerts` — adds three columns
+  to `alert_rule` (`classification` / `change_scope` /
+  `last_scanned_audit_at`) for the new rule type.
+- `b5d8a3f12c91_conformity_evaluations` — creates
+  `conformity_policy` + `conformity_result` tables with their
+  partial indexes.
 
 ---
 

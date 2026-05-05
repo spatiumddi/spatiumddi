@@ -623,10 +623,22 @@ Rule types shipped today:
 |---|---|
 | `subnet_utilization` | `Subnet.utilization_percent ≥ threshold`; honours `PlatformSettings.utilization_max_prefix_{ipv4,ipv6}` so PTP / loopback subnets can't trip the alarm. |
 | `server_unreachable` | Any DNS / DHCP server whose status is `unreachable` or `error`. `server_type` filters the family. |
+| `asn_holder_drift` / `asn_whois_unreachable` / `rpki_roa_expiring` / `rpki_roa_expired` | ASN / RPKI signals from the WHOIS + ROA refresh tasks (#85). |
+| `domain_expiring` / `domain_nameserver_drift` / `domain_registrar_changed` / `domain_dnssec_status_changed` | Registry-side domain signals (#87). The two transition-once rules latch their value into `last_observed_value` JSONB so a single flip fires exactly one event auto-resolved after 7 d. |
+| `circuit_term_expiring` / `circuit_status_changed` | WAN circuit alerts (#93). Status-changed only fires on `suspended` / `decom` transitions and auto-resolves after 7 d. |
+| `service_term_expiring` / `service_resource_orphaned` | Service-catalog alerts (#94). Orphan-sweep walks `network_service_resource` join rows whose target was deleted. |
+| `compliance_change` | Audit-log scanner rule type (#105). One event per mutation against a classification-flagged subnet (or descendant IP / DHCP scope). Params: `classification` (one of `pci_scope` / `hipaa_scope` / `internet_facing`) and `change_scope` (one of `any_change` / `create` / `delete`). Watermark column on the rule baselines to `now()` on first run so historical audit history doesn't retro-page operators. Resource resolution falls back to `audit_log.old_value.subnet_id` for delete actions where the live row no longer exists. Three disabled seed rules ship at first boot (PCI / HIPAA / internet-facing). Auto-resolves after 24 h. |
 
 Admin UI lives at `/admin/alerts` — rules CRUD + live events viewer
 (15 s refetch) + per-event `Resolve` to manually silence a known-
 noisy event.
+
+Conformity evaluations (#106) also feed this surface: a
+`ConformityPolicy` can pin `fail_alert_rule_id`, and a `pass→fail`
+transition on a (policy, resource) pair opens an `AlertEvent` row
+against the named alert rule with `subject_type="conformity"` so
+operators see drift in the same dashboard. Configure the wiring in
+the policy edit modal at `/admin/conformity`.
 
 ### 9.2 Prometheus alerting rules (external)
 
