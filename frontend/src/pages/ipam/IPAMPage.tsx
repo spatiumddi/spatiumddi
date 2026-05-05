@@ -533,9 +533,7 @@ function CreateSpaceModal({ onClose }: { onClose: () => void }) {
   // so most homelab operators can ignore it without scrolling past it.
   const [vrfId, setVrfId] = useState<string | null>(null);
   const [asnId, setAsnId] = useState<string | null>(null);
-  const [tab, setTab] = useState<"general" | "dns" | "dhcp" | "networking">(
-    "general",
-  );
+  const [tab, setTab] = useState<"dns" | "dhcp" | "networking">("dns");
 
   const mutation = useMutation({
     mutationFn: () => {
@@ -559,9 +557,34 @@ function CreateSpaceModal({ onClose }: { onClose: () => void }) {
   });
   return (
     <Modal title="New IP Space" onClose={onClose} wide>
+      {/* Identity fields stay pinned above the tab strip so the operator
+          always sees what they're working on as they click through DNS /
+          DHCP / Networking configuration. */}
+      <div className="space-y-3 pb-4">
+        <Field label="Name">
+          <input
+            className={inputCls}
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            placeholder="e.g. Corporate"
+            autoFocus
+          />
+        </Field>
+        <Field label="Description">
+          <input
+            className={inputCls}
+            value={description}
+            onChange={(e) => setDescription(e.target.value)}
+            placeholder="Optional"
+          />
+        </Field>
+        <Field label="Color">
+          <SwatchPicker value={color} onChange={setColor} />
+        </Field>
+      </div>
+
       <ModalTabs
         tabs={[
-          { key: "general", label: "General" },
           { key: "dns", label: "DNS" },
           { key: "dhcp", label: "DHCP" },
           { key: "networking", label: "Networking" },
@@ -569,31 +592,6 @@ function CreateSpaceModal({ onClose }: { onClose: () => void }) {
         active={tab}
         onChange={setTab}
       />
-
-      {tab === "general" && (
-        <div className="space-y-4">
-          <Field label="Name">
-            <input
-              className={inputCls}
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              placeholder="e.g. Corporate"
-              autoFocus
-            />
-          </Field>
-          <Field label="Description">
-            <input
-              className={inputCls}
-              value={description}
-              onChange={(e) => setDescription(e.target.value)}
-              placeholder="Optional"
-            />
-          </Field>
-          <Field label="Color">
-            <SwatchPicker value={color} onChange={setColor} />
-          </Field>
-        </div>
-      )}
 
       {tab === "dns" && (
         <div className="space-y-3">
@@ -1790,6 +1788,9 @@ function CreateSubnetModal({
   const [internetFacing, setInternetFacing] = useState(false);
   // Optional template pre-fill (issue #26).
   const [templateId, setTemplateId] = useState<string>("");
+  const [tab, setTab] = useState<
+    "general" | "dns" | "dhcp" | "ddns" | "advanced"
+  >("general");
 
   const { data: blocks } = useQuery({
     queryKey: ["blocks", spaceId],
@@ -1905,8 +1906,12 @@ function CreateSubnetModal({
 
   return (
     <Modal title="New Subnet" onClose={onClose} wide>
-      <div className="space-y-3 max-h-[75vh] overflow-y-auto pr-1">
-        {/* Mode toggle */}
+      {/* Identity fields stay pinned above the tab strip — block +
+          network + name are what makes a subnet a subnet, and they
+          have to be visible regardless of which configuration tab
+          the operator is on. */}
+      <div className="space-y-3 pb-4">
+        {/* Mode toggle — manual CIDR vs. carve from available list */}
         <div className="flex gap-2">
           {(["manual", "size"] as const).map((m) => (
             <button
@@ -1924,29 +1929,6 @@ function CreateSubnetModal({
             </button>
           ))}
         </div>
-
-        {(subnetTemplates ?? []).length > 0 && (
-          <Field label="Apply template (optional)">
-            <select
-              className={inputCls}
-              value={templateId}
-              onChange={(e) => setTemplateId(e.target.value)}
-            >
-              <option value="">— none —</option>
-              {(subnetTemplates ?? []).map((t) => (
-                <option key={t.id} value={t.id}>
-                  {t.name}
-                  {t.description ? ` — ${t.description}` : ""}
-                </option>
-              ))}
-            </select>
-            {templateId && (
-              <p className="mt-1 text-xs text-muted-foreground">
-                Operator-supplied fields below override the template's defaults.
-              </p>
-            )}
-          </Field>
-        )}
 
         <Field label="Block *">
           <select
@@ -1987,24 +1969,22 @@ function CreateSubnetModal({
           </Field>
         ) : (
           <div className="space-y-2">
-            <div className="flex items-center gap-2">
-              <Field label="Prefix size">
-                <select
-                  className={inputCls}
-                  value={prefixLen}
-                  onChange={(e) => {
-                    setPrefixLen(e.target.value);
-                    setSelectedNet("");
-                  }}
-                >
-                  {blockPrefixOptions.map((n) => (
-                    <option key={n} value={String(n)}>
-                      /{n}
-                    </option>
-                  ))}
-                </select>
-              </Field>
-            </div>
+            <Field label="Prefix size">
+              <select
+                className={inputCls}
+                value={prefixLen}
+                onChange={(e) => {
+                  setPrefixLen(e.target.value);
+                  setSelectedNet("");
+                }}
+              >
+                {blockPrefixOptions.map((n) => (
+                  <option key={n} value={String(n)}>
+                    /{n}
+                  </option>
+                ))}
+              </select>
+            </Field>
             {!blockId ? (
               <p className="text-xs text-muted-foreground italic">
                 Select a block first.
@@ -2055,78 +2035,126 @@ function CreateSubnetModal({
             placeholder="Optional"
           />
         </Field>
-        <Field label="Gateway">
-          <input
-            className={inputCls}
-            value={gateway}
-            onChange={(e) => setGateway(e.target.value)}
-            placeholder="Auto-assigned if blank"
-            disabled={skipAuto}
+      </div>
+
+      <ModalTabs
+        tabs={[
+          { key: "general", label: "General" },
+          { key: "dns", label: "DNS" },
+          { key: "dhcp", label: "DHCP" },
+          { key: "ddns", label: "DDNS" },
+          { key: "advanced", label: "Advanced" },
+        ]}
+        active={tab}
+        onChange={setTab}
+      />
+
+      {tab === "general" && (
+        <div className="space-y-3">
+          {(subnetTemplates ?? []).length > 0 && (
+            <Field label="Apply template (optional)">
+              <select
+                className={inputCls}
+                value={templateId}
+                onChange={(e) => setTemplateId(e.target.value)}
+              >
+                <option value="">— none —</option>
+                {(subnetTemplates ?? []).map((t) => (
+                  <option key={t.id} value={t.id}>
+                    {t.name}
+                    {t.description ? ` — ${t.description}` : ""}
+                  </option>
+                ))}
+              </select>
+              {templateId && (
+                <p className="mt-1 text-xs text-muted-foreground">
+                  Operator-supplied fields here override the template's
+                  defaults.
+                </p>
+              )}
+            </Field>
+          )}
+          <Field label="Gateway">
+            <input
+              className={inputCls}
+              value={gateway}
+              onChange={(e) => setGateway(e.target.value)}
+              placeholder="Auto-assigned if blank"
+              disabled={skipAuto}
+            />
+          </Field>
+          <VlanPicker vlanRefId={vlanRefId} onChange={setVlanRefId} />
+          <Field label="VXLAN ID (optional)">
+            <input
+              type="number"
+              min={1}
+              max={16777214}
+              placeholder="1 – 16777214"
+              value={vxlanId}
+              onChange={(e) => setVxlanId(e.target.value)}
+              className={inputCls}
+            />
+          </Field>
+          <label className="flex items-center gap-2 text-xs text-muted-foreground cursor-pointer">
+            <input
+              type="checkbox"
+              checked={skipAuto}
+              onChange={(e) => setSkipAuto(e.target.checked)}
+              className="rounded"
+            />
+            Skip network / broadcast / gateway records (loopback, P2P)
+          </label>
+          <CustomFieldsSection
+            definitions={cfDefs}
+            values={customFields}
+            onChange={(k, v) =>
+              setCustomFields((prev) => ({ ...prev, [k]: v }))
+            }
           />
-        </Field>
-        <VlanPicker vlanRefId={vlanRefId} onChange={setVlanRefId} />
-        <Field label="VXLAN ID (optional)">
-          <input
-            type="number"
-            min={1}
-            max={16777214}
-            placeholder="1 – 16777214"
-            value={vxlanId}
-            onChange={(e) => setVxlanId(e.target.value)}
-            className={inputCls}
-          />
-        </Field>
-        <label className="flex items-center gap-2 text-xs text-muted-foreground cursor-pointer">
-          <input
-            type="checkbox"
-            checked={skipAuto}
-            onChange={(e) => setSkipAuto(e.target.checked)}
-            className="rounded"
-          />
-          Skip network / broadcast / gateway records (loopback, P2P)
-        </label>
-        <CustomFieldsSection
-          definitions={cfDefs}
-          values={customFields}
-          onChange={(k, v) => setCustomFields((prev) => ({ ...prev, [k]: v }))}
+        </div>
+      )}
+
+      {tab === "dns" && (
+        <DnsSettingsSection
+          inherit={dnsInherit}
+          groupIds={dnsGroupIds}
+          zoneId={dnsZoneId}
+          additionalZoneIds={dnsAdditionalZoneIds}
+          onInheritChange={setDnsInherit}
+          onGroupIdsChange={setDnsGroupIds}
+          onZoneIdChange={setDnsZoneId}
+          onAdditionalZoneIdsChange={setDnsAdditionalZoneIds}
+          parentBlockId={blockId || null}
         />
-        <div className="border-t pt-3">
-          <DnsSettingsSection
-            inherit={dnsInherit}
-            groupIds={dnsGroupIds}
-            zoneId={dnsZoneId}
-            additionalZoneIds={dnsAdditionalZoneIds}
-            onInheritChange={setDnsInherit}
-            onGroupIdsChange={setDnsGroupIds}
-            onZoneIdChange={setDnsZoneId}
-            onAdditionalZoneIdsChange={setDnsAdditionalZoneIds}
-            parentBlockId={blockId || null}
-          />
-        </div>
-        <div className="border-t pt-3">
-          <DhcpSettingsSection
-            inherit={dhcpInherit}
-            serverGroupId={dhcpServerGroupId}
-            onInheritChange={setDhcpInherit}
-            onServerGroupIdChange={setDhcpServerGroupId}
-            parentBlockId={blockId || null}
-            fallbackSpaceId={spaceId}
-          />
-        </div>
-        <div className="border-t pt-3">
-          <DdnsSettingsSection
-            enabled={ddnsEnabled}
-            policy={ddnsPolicy}
-            domainOverride={ddnsDomainOverride}
-            ttl={ddnsTtl}
-            subnetNetwork={effectiveNetwork}
-            onEnabledChange={setDdnsEnabled}
-            onPolicyChange={setDdnsPolicy}
-            onDomainOverrideChange={setDdnsDomainOverride}
-            onTtlChange={setDdnsTtl}
-          />
-        </div>
-        <div className="border-t pt-3">
+      )}
+
+      {tab === "dhcp" && (
+        <DhcpSettingsSection
+          inherit={dhcpInherit}
+          serverGroupId={dhcpServerGroupId}
+          onInheritChange={setDhcpInherit}
+          onServerGroupIdChange={setDhcpServerGroupId}
+          parentBlockId={blockId || null}
+          fallbackSpaceId={spaceId}
+        />
+      )}
+
+      {tab === "ddns" && (
+        <DdnsSettingsSection
+          enabled={ddnsEnabled}
+          policy={ddnsPolicy}
+          domainOverride={ddnsDomainOverride}
+          ttl={ddnsTtl}
+          subnetNetwork={effectiveNetwork}
+          onEnabledChange={setDdnsEnabled}
+          onPolicyChange={setDdnsPolicy}
+          onDomainOverrideChange={setDdnsDomainOverride}
+          onTtlChange={setDdnsTtl}
+        />
+      )}
+
+      {tab === "advanced" && (
+        <div className="space-y-4">
           <ProfilingSettingsSection
             enabled={autoProfileEnabled}
             preset={autoProfilePreset}
@@ -2135,36 +2163,37 @@ function CreateSubnetModal({
             onPresetChange={setAutoProfilePreset}
             onRefreshDaysChange={setAutoProfileRefreshDays}
           />
+          <div className="border-t pt-4">
+            <ClassificationSection
+              pciScope={pciScope}
+              hipaaScope={hipaaScope}
+              internetFacing={internetFacing}
+              onPciChange={setPciScope}
+              onHipaaChange={setHipaaScope}
+              onInternetFacingChange={setInternetFacing}
+            />
+          </div>
         </div>
-        <div className="border-t pt-3">
-          <ClassificationSection
-            pciScope={pciScope}
-            hipaaScope={hipaaScope}
-            internetFacing={internetFacing}
-            onPciChange={setPciScope}
-            onHipaaChange={setHipaaScope}
-            onInternetFacingChange={setInternetFacing}
-          />
-        </div>
-        {error && <p className="text-xs text-destructive">{error}</p>}
-        <div className="flex justify-end gap-2 pt-2">
-          <button
-            onClick={onClose}
-            className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
-          >
-            Cancel
-          </button>
-          <button
-            onClick={() => {
-              setError(null);
-              mutation.mutate();
-            }}
-            disabled={!effectiveNetwork || !blockId || mutation.isPending}
-            className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
-          >
-            {mutation.isPending ? "Creating…" : "Create"}
-          </button>
-        </div>
+      )}
+
+      {error && <p className="mt-3 text-xs text-destructive">{error}</p>}
+      <div className="mt-6 flex justify-end gap-2 border-t pt-3">
+        <button
+          onClick={onClose}
+          className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
+        >
+          Cancel
+        </button>
+        <button
+          onClick={() => {
+            setError(null);
+            mutation.mutate();
+          }}
+          disabled={!effectiveNetwork || !blockId || mutation.isPending}
+          className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+        >
+          {mutation.isPending ? "Creating…" : "Create"}
+        </button>
       </div>
     </Modal>
   );
@@ -5690,6 +5719,14 @@ function EditSubnetModal({
   const [internetFacing, setInternetFacing] = useState(
     subnet.internet_facing ?? false,
   );
+  type SubnetEditTab =
+    | "general"
+    | "dns"
+    | "dhcp"
+    | "ddns"
+    | "advanced"
+    | "danger";
+  const [tab, setTab] = useState<SubnetEditTab>("general");
 
   // Detect whether network/broadcast records currently exist
   const { data: addresses } = useQuery({
@@ -5930,9 +5967,24 @@ function EditSubnetModal({
     );
   }
 
+  const tabsList: { key: SubnetEditTab; label: string }[] = [
+    { key: "general", label: "General" },
+    { key: "dns", label: "DNS" },
+    { key: "dhcp", label: "DHCP" },
+    { key: "ddns", label: "DDNS" },
+    { key: "advanced", label: "Advanced" },
+  ];
+  if (onDeleted) {
+    tabsList.push({ key: "danger", label: "Danger zone" });
+  }
+
   return (
-    <Modal title={`Edit ${subnet.network}`} onClose={() => onClose()}>
-      <div className="space-y-3">
+    <Modal title={`Edit ${subnet.network}`} onClose={() => onClose()} wide>
+      {/* Identity fields stay pinned above the tab strip — name +
+          description + status are what the operator most often
+          touches and they should be visible regardless of which
+          configuration tab is active. */}
+      <div className="space-y-3 pb-4">
         <Field label="Name">
           <input
             className={inputCls}
@@ -5950,32 +6002,6 @@ function EditSubnetModal({
             placeholder="Optional"
           />
         </Field>
-        <Field label="Gateway">
-          <input
-            className={inputCls}
-            value={gateway}
-            onChange={(e) => setGateway(e.target.value)}
-            placeholder="e.g. 10.0.1.1"
-          />
-        </Field>
-        <VlanPicker vlanRefId={vlanRefId} onChange={setVlanRefId} />
-        {subnet.vlan_id != null && !vlanRefId && (
-          <p className="text-[11px] text-muted-foreground italic">
-            Current VLAN tag: {subnet.vlan_id} (unassigned — create a Router /
-            VLAN to manage).
-          </p>
-        )}
-        <Field label="VXLAN ID (optional)">
-          <input
-            type="number"
-            min={1}
-            max={16777214}
-            placeholder="1 – 16777214"
-            value={vxlanId}
-            onChange={(e) => setVxlanId(e.target.value)}
-            className={inputCls}
-          />
-        </Field>
         <Field label="Status">
           <select
             className={inputCls}
@@ -5989,7 +6015,38 @@ function EditSubnetModal({
             ))}
           </select>
         </Field>
-        <div className="border-t pt-3">
+      </div>
+
+      <ModalTabs tabs={tabsList} active={tab} onChange={setTab} />
+
+      {tab === "general" && (
+        <div className="space-y-3">
+          <Field label="Gateway">
+            <input
+              className={inputCls}
+              value={gateway}
+              onChange={(e) => setGateway(e.target.value)}
+              placeholder="e.g. 10.0.1.1"
+            />
+          </Field>
+          <VlanPicker vlanRefId={vlanRefId} onChange={setVlanRefId} />
+          {subnet.vlan_id != null && !vlanRefId && (
+            <p className="text-[11px] text-muted-foreground italic">
+              Current VLAN tag: {subnet.vlan_id} (unassigned — create a Router /
+              VLAN to manage).
+            </p>
+          )}
+          <Field label="VXLAN ID (optional)">
+            <input
+              type="number"
+              min={1}
+              max={16777214}
+              placeholder="1 – 16777214"
+              value={vxlanId}
+              onChange={(e) => setVxlanId(e.target.value)}
+              className={inputCls}
+            />
+          </Field>
           <label className="flex items-start gap-3">
             <input
               type="checkbox"
@@ -6008,15 +6065,20 @@ function EditSubnetModal({
               </p>
             </div>
           </label>
+          <CustomFieldsSection
+            definitions={cfDefs}
+            values={customFields}
+            onChange={(k, v) =>
+              setCustomFields((prev) => ({ ...prev, [k]: v }))
+            }
+            inherited={cfInheritedValues}
+            inheritedLabels={cfInheritedLabels}
+          />
         </div>
-        <CustomFieldsSection
-          definitions={cfDefs}
-          values={customFields}
-          onChange={(k, v) => setCustomFields((prev) => ({ ...prev, [k]: v }))}
-          inherited={cfInheritedValues}
-          inheritedLabels={cfInheritedLabels}
-        />
-        <div className="border-t pt-3">
+      )}
+
+      {tab === "dns" && (
+        <div className="space-y-4">
           <DnsSettingsSection
             inherit={dnsInherit}
             groupIds={dnsGroupIds}
@@ -6028,49 +6090,56 @@ function EditSubnetModal({
             onAdditionalZoneIdsChange={setDnsAdditionalZoneIds}
             parentBlockId={subnet.block_id}
           />
-        </div>
-        <div className="border-t pt-3">
-          <DhcpSettingsSection
-            inherit={dhcpInherit}
-            serverGroupId={dhcpServerGroupId}
-            onInheritChange={setDhcpInherit}
-            onServerGroupIdChange={setDhcpServerGroupId}
-            parentBlockId={subnet.block_id}
-            fallbackSpaceId={subnet.space_id}
-          />
-        </div>
-        <div className="border-t pt-3">
-          <label className="flex items-start gap-2 text-xs cursor-pointer select-none">
-            <input
-              type="checkbox"
-              className="mt-0.5 h-3.5 w-3.5"
-              checked={dnsSplitHorizon}
-              onChange={(e) => setDnsSplitHorizon(e.target.checked)}
-            />
-            <span>
-              <span className="font-medium">DNS split-horizon publishing</span>
-              <span className="ml-1 text-muted-foreground">
-                — when on, the IP create / edit modal lets operators publish the
-                same name into additional zones (typically an internal +
-                external pair).
+          <div className="border-t pt-4">
+            <label className="flex items-start gap-2 text-xs cursor-pointer select-none">
+              <input
+                type="checkbox"
+                className="mt-0.5 h-3.5 w-3.5"
+                checked={dnsSplitHorizon}
+                onChange={(e) => setDnsSplitHorizon(e.target.checked)}
+              />
+              <span>
+                <span className="font-medium">
+                  DNS split-horizon publishing
+                </span>
+                <span className="ml-1 text-muted-foreground">
+                  — when on, the IP create / edit modal lets operators publish
+                  the same name into additional zones (typically an internal +
+                  external pair).
+                </span>
               </span>
-            </span>
-          </label>
+            </label>
+          </div>
         </div>
-        <div className="border-t pt-3">
-          <DdnsSettingsSection
-            enabled={ddnsEnabled}
-            policy={ddnsPolicy}
-            domainOverride={ddnsDomainOverride}
-            ttl={ddnsTtl}
-            subnetNetwork={subnet.network}
-            onEnabledChange={setDdnsEnabled}
-            onPolicyChange={setDdnsPolicy}
-            onDomainOverrideChange={setDdnsDomainOverride}
-            onTtlChange={setDdnsTtl}
-          />
-        </div>
-        <div className="border-t pt-3">
+      )}
+
+      {tab === "dhcp" && (
+        <DhcpSettingsSection
+          inherit={dhcpInherit}
+          serverGroupId={dhcpServerGroupId}
+          onInheritChange={setDhcpInherit}
+          onServerGroupIdChange={setDhcpServerGroupId}
+          parentBlockId={subnet.block_id}
+          fallbackSpaceId={subnet.space_id}
+        />
+      )}
+
+      {tab === "ddns" && (
+        <DdnsSettingsSection
+          enabled={ddnsEnabled}
+          policy={ddnsPolicy}
+          domainOverride={ddnsDomainOverride}
+          ttl={ddnsTtl}
+          subnetNetwork={subnet.network}
+          onEnabledChange={setDdnsEnabled}
+          onPolicyChange={setDdnsPolicy}
+          onDomainOverrideChange={setDdnsDomainOverride}
+          onTtlChange={setDdnsTtl}
+        />
+      )}
+
+      {tab === "advanced" && (
+        <div className="space-y-4">
           <ProfilingSettingsSection
             enabled={autoProfileEnabled}
             preset={autoProfilePreset}
@@ -6079,46 +6148,53 @@ function EditSubnetModal({
             onPresetChange={setAutoProfilePreset}
             onRefreshDaysChange={setAutoProfileRefreshDays}
           />
-        </div>
-        <div className="border-t pt-3">
-          <ClassificationSection
-            pciScope={pciScope}
-            hipaaScope={hipaaScope}
-            internetFacing={internetFacing}
-            onPciChange={setPciScope}
-            onHipaaChange={setHipaaScope}
-            onInternetFacingChange={setInternetFacing}
-          />
-        </div>
-        {error && <p className="text-xs text-destructive">{error}</p>}
-        <div className="flex justify-end gap-2 pt-2">
-          <button
-            onClick={() => onClose()}
-            className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
-          >
-            Cancel
-          </button>
-          <button
-            onClick={() => {
-              setError(null);
-              mutation.mutate();
-            }}
-            disabled={mutation.isPending}
-            className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
-          >
-            {mutation.isPending ? "Saving…" : "Save"}
-          </button>
-        </div>
-        {onDeleted && (
-          <div className="mt-2 border-t pt-3">
-            <button
-              onClick={() => setDeleteStep(1)}
-              className="text-xs text-destructive hover:underline"
-            >
-              Delete this subnet…
-            </button>
+          <div className="border-t pt-4">
+            <ClassificationSection
+              pciScope={pciScope}
+              hipaaScope={hipaaScope}
+              internetFacing={internetFacing}
+              onPciChange={setPciScope}
+              onHipaaChange={setHipaaScope}
+              onInternetFacingChange={setInternetFacing}
+            />
           </div>
-        )}
+        </div>
+      )}
+
+      {tab === "danger" && onDeleted && (
+        <div className="space-y-3">
+          <p className="text-sm text-muted-foreground">
+            Deleting a subnet permanently removes every IP address record inside
+            it, plus any DHCP scopes and DNS records derived from them. The
+            deletion is gated by a typed confirm in the next step.
+          </p>
+          <button
+            onClick={() => setDeleteStep(1)}
+            className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-1.5 text-sm text-destructive hover:bg-destructive/10"
+          >
+            Delete this subnet…
+          </button>
+        </div>
+      )}
+
+      {error && <p className="mt-3 text-xs text-destructive">{error}</p>}
+      <div className="mt-6 flex justify-end gap-2 border-t pt-3">
+        <button
+          onClick={() => onClose()}
+          className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
+        >
+          Cancel
+        </button>
+        <button
+          onClick={() => {
+            setError(null);
+            mutation.mutate();
+          }}
+          disabled={mutation.isPending}
+          className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+        >
+          {mutation.isPending ? "Saving…" : "Save"}
+        </button>
       </div>
     </Modal>
   );
@@ -8375,9 +8451,9 @@ function EditSpaceModal({
   // below points at one.
   const [vrfId, setVrfId] = useState<string | null>(space.vrf_id ?? null);
   const [asnId, setAsnId] = useState<string | null>(space.asn_id ?? null);
-  const [tab, setTab] = useState<
-    "general" | "dns" | "dhcp" | "networking" | "danger"
-  >("general");
+  const [tab, setTab] = useState<"dns" | "dhcp" | "networking" | "danger">(
+    "dns",
+  );
 
   const saveMutation = useMutation({
     mutationFn: () => {
@@ -8504,9 +8580,33 @@ function EditSpaceModal({
   // ── Normal edit view ──
   return (
     <Modal title="Edit IP Space" onClose={onClose} wide>
+      {/* Identity fields stay pinned above the tab strip so the operator
+          always sees what they're working on as they click through DNS /
+          DHCP / Networking / Danger-zone tabs. */}
+      <div className="space-y-3 pb-4">
+        <Field label="Name">
+          <input
+            className={inputCls}
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            autoFocus
+          />
+        </Field>
+        <Field label="Description">
+          <input
+            className={inputCls}
+            value={description}
+            onChange={(e) => setDescription(e.target.value)}
+            placeholder="Optional"
+          />
+        </Field>
+        <Field label="Color">
+          <SwatchPicker value={color} onChange={setColor} />
+        </Field>
+      </div>
+
       <ModalTabs
         tabs={[
-          { key: "general", label: "General" },
           { key: "dns", label: "DNS" },
           { key: "dhcp", label: "DHCP" },
           { key: "networking", label: "Networking" },
@@ -8515,30 +8615,6 @@ function EditSpaceModal({
         active={tab}
         onChange={setTab}
       />
-
-      {tab === "general" && (
-        <div className="space-y-4">
-          <Field label="Name">
-            <input
-              className={inputCls}
-              value={name}
-              onChange={(e) => setName(e.target.value)}
-              autoFocus
-            />
-          </Field>
-          <Field label="Description">
-            <input
-              className={inputCls}
-              value={description}
-              onChange={(e) => setDescription(e.target.value)}
-              placeholder="Optional"
-            />
-          </Field>
-          <Field label="Color">
-            <SwatchPicker value={color} onChange={setColor} />
-          </Field>
-        </div>
-      )}
 
       {tab === "dns" && (
         <div className="space-y-3">
@@ -8757,6 +8833,9 @@ function CreateBlockModal({
   const [vrfId, setVrfId] = useState<string | null>(null);
   // Optional template pre-fill (issue #26).
   const [templateId, setTemplateId] = useState<string>("");
+  const [tab, setTab] = useState<"general" | "dns" | "dhcp" | "networking">(
+    "general",
+  );
 
   const { data: existingBlocks } = useQuery({
     queryKey: ["blocks", spaceId],
@@ -8814,31 +8893,11 @@ function CreateBlockModal({
   });
 
   return (
-    <Modal title="New IP Block" onClose={onClose}>
-      <div className="space-y-3">
-        {(blockTemplates ?? []).length > 0 && (
-          <Field label="Apply template (optional)">
-            <select
-              className={inputCls}
-              value={templateId}
-              onChange={(e) => setTemplateId(e.target.value)}
-            >
-              <option value="">— none —</option>
-              {(blockTemplates ?? []).map((t) => (
-                <option key={t.id} value={t.id}>
-                  {t.name}
-                  {t.description ? ` — ${t.description}` : ""}
-                </option>
-              ))}
-            </select>
-            {templateId && (
-              <p className="mt-1 text-xs text-muted-foreground">
-                Operator-supplied fields below override the template's defaults.
-                Children defined in the template are carved automatically.
-              </p>
-            )}
-          </Field>
-        )}
+    <Modal title="New IP Block" onClose={onClose} wide>
+      {/* Identity fields stay pinned above the tab strip. CIDR /
+          name / description anchor the operator's context as they
+          click through DNS / DHCP / Networking. */}
+      <div className="space-y-3 pb-4">
         <Field label="Network (CIDR)">
           <input
             className={inputCls}
@@ -8867,83 +8926,132 @@ function CreateBlockModal({
             placeholder="Optional"
           />
         </Field>
-        {flatBlocks.length > 0 && (
-          <Field label="Parent Block (optional)">
-            <select
-              className={inputCls}
-              value={parentBlockId}
-              onChange={(e) => setParentBlockId(e.target.value)}
-            >
-              <option value="">— None (top-level) —</option>
-              {flatBlocks.map((b) => (
-                <option key={b.id} value={b.id}>
-                  {b.label}
-                </option>
-              ))}
-            </select>
-          </Field>
-        )}
-        <CustomFieldsSection
-          definitions={cfDefs}
-          values={customFields}
-          onChange={(k, v) => setCustomFields((prev) => ({ ...prev, [k]: v }))}
+      </div>
+
+      <ModalTabs
+        tabs={[
+          { key: "general", label: "General" },
+          { key: "dns", label: "DNS" },
+          { key: "dhcp", label: "DHCP" },
+          { key: "networking", label: "Networking" },
+        ]}
+        active={tab}
+        onChange={setTab}
+      />
+
+      {tab === "general" && (
+        <div className="space-y-3">
+          {(blockTemplates ?? []).length > 0 && (
+            <Field label="Apply template (optional)">
+              <select
+                className={inputCls}
+                value={templateId}
+                onChange={(e) => setTemplateId(e.target.value)}
+              >
+                <option value="">— none —</option>
+                {(blockTemplates ?? []).map((t) => (
+                  <option key={t.id} value={t.id}>
+                    {t.name}
+                    {t.description ? ` — ${t.description}` : ""}
+                  </option>
+                ))}
+              </select>
+              {templateId && (
+                <p className="mt-1 text-xs text-muted-foreground">
+                  Operator-supplied fields here override the template's
+                  defaults. Children defined in the template are carved
+                  automatically.
+                </p>
+              )}
+            </Field>
+          )}
+          {flatBlocks.length > 0 && (
+            <Field label="Parent Block (optional)">
+              <select
+                className={inputCls}
+                value={parentBlockId}
+                onChange={(e) => setParentBlockId(e.target.value)}
+              >
+                <option value="">— None (top-level) —</option>
+                {flatBlocks.map((b) => (
+                  <option key={b.id} value={b.id}>
+                    {b.label}
+                  </option>
+                ))}
+              </select>
+            </Field>
+          )}
+          <CustomFieldsSection
+            definitions={cfDefs}
+            values={customFields}
+            onChange={(k, v) =>
+              setCustomFields((prev) => ({ ...prev, [k]: v }))
+            }
+          />
+        </div>
+      )}
+
+      {tab === "dns" && (
+        <DnsSettingsSection
+          inherit={dnsInherit}
+          groupIds={dnsGroupIds}
+          zoneId={dnsZoneId}
+          additionalZoneIds={dnsAdditionalZoneIds}
+          onInheritChange={setDnsInherit}
+          onGroupIdsChange={setDnsGroupIds}
+          onZoneIdChange={setDnsZoneId}
+          onAdditionalZoneIdsChange={setDnsAdditionalZoneIds}
+          parentBlockId={parentBlockId || null}
+          fallbackSpaceId={!parentBlockId ? spaceId : null}
         />
-        <div className="border-t pt-3">
-          <DnsSettingsSection
-            inherit={dnsInherit}
-            groupIds={dnsGroupIds}
-            zoneId={dnsZoneId}
-            additionalZoneIds={dnsAdditionalZoneIds}
-            onInheritChange={setDnsInherit}
-            onGroupIdsChange={setDnsGroupIds}
-            onZoneIdChange={setDnsZoneId}
-            onAdditionalZoneIdsChange={setDnsAdditionalZoneIds}
-            parentBlockId={parentBlockId || null}
-            fallbackSpaceId={!parentBlockId ? spaceId : null}
-          />
-        </div>
-        <div className="border-t pt-3">
-          <DhcpSettingsSection
-            inherit={dhcpInherit}
-            serverGroupId={dhcpServerGroupId}
-            onInheritChange={setDhcpInherit}
-            onServerGroupIdChange={setDhcpServerGroupId}
-            parentBlockId={parentBlockId || null}
-            fallbackSpaceId={!parentBlockId ? spaceId : null}
-          />
-        </div>
-        <div className="border-t pt-3 space-y-3">
-          <Field label="VRF (optional)">
+      )}
+
+      {tab === "dhcp" && (
+        <DhcpSettingsSection
+          inherit={dhcpInherit}
+          serverGroupId={dhcpServerGroupId}
+          onInheritChange={setDhcpInherit}
+          onServerGroupIdChange={setDhcpServerGroupId}
+          parentBlockId={parentBlockId || null}
+          fallbackSpaceId={!parentBlockId ? spaceId : null}
+        />
+      )}
+
+      {tab === "networking" && (
+        <div className="space-y-3">
+          <p className="text-xs text-muted-foreground">
+            Pin a different VRF than the parent space when this block lives in a
+            separate routing context (e.g. hub-and-spoke fabrics). Leave blank
+            to inherit. Pure annotation — address allocation does not consult
+            these fields.
+          </p>
+          <Field label="VRF">
             <VrfPicker className={inputCls} value={vrfId} onChange={setVrfId} />
-            <p className="mt-1 text-[11px] text-muted-foreground">
-              Pin a different VRF than the parent space when this block lives in
-              a separate routing context (e.g. hub-and-spoke fabrics). Leave
-              blank to inherit from the space.
-            </p>
           </Field>
-          <Field label="Origin ASN (BGP, optional)">
+          <Field label="Origin ASN (BGP)">
             <AsnPicker className={inputCls} value={asnId} onChange={setAsnId} />
           </Field>
         </div>
-        {error && <p className="text-xs text-destructive">{error}</p>}
-        <div className="flex justify-end gap-2 pt-2">
-          <button
-            onClick={onClose}
-            className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
-          >
-            Cancel
-          </button>
-          <button
-            onClick={() => {
-              setError(null);
-              mutation.mutate();
-            }}
-            disabled={!network || mutation.isPending}
-            className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
-          >
-            {mutation.isPending ? "Creating…" : "Create Block"}
-          </button>
-        </div>
+      )}
+
+      {error && <p className="mt-3 text-xs text-destructive">{error}</p>}
+      <div className="mt-6 flex justify-end gap-2 border-t pt-3">
+        <button
+          onClick={onClose}
+          className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
+        >
+          Cancel
+        </button>
+        <button
+          onClick={() => {
+            setError(null);
+            mutation.mutate();
+          }}
+          disabled={!network || mutation.isPending}
+          className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+        >
+          {mutation.isPending ? "Creating…" : "Create Block"}
+        </button>
       </div>
     </Modal>
   );
@@ -8992,6 +9100,9 @@ function EditBlockModal({
   );
   const [asnId, setAsnId] = useState<string | null>(block.asn_id ?? null);
   const [vrfId, setVrfId] = useState<string | null>(block.vrf_id ?? null);
+  const [tab, setTab] = useState<
+    "general" | "dns" | "dhcp" | "networking" | "danger"
+  >("general");
 
   const { data: cfDefs = [] } = useQuery({
     queryKey: ["custom-fields", "ip_block"],
@@ -9180,8 +9291,11 @@ function EditBlockModal({
 
   // ── Normal edit view ──
   return (
-    <Modal title={`Edit ${block.network}`} onClose={() => onClose()}>
-      <div className="space-y-3">
+    <Modal title={`Edit ${block.network}`} onClose={() => onClose()} wide>
+      {/* Identity fields stay pinned above the tab strip. CIDR is the
+          modal title (resizing is a separate flow); name + description
+          are the editable identity. */}
+      <div className="space-y-3 pb-4">
         <Field label="Name">
           <input
             className={inputCls}
@@ -9199,6 +9313,21 @@ function EditBlockModal({
             placeholder="Optional"
           />
         </Field>
+      </div>
+
+      <ModalTabs
+        tabs={[
+          { key: "general", label: "General" },
+          { key: "dns", label: "DNS" },
+          { key: "dhcp", label: "DHCP" },
+          { key: "networking", label: "Networking" },
+          { key: "danger", label: "Danger zone" },
+        ]}
+        active={tab}
+        onChange={setTab}
+      />
+
+      {tab === "general" && (
         <CustomFieldsSection
           definitions={cfDefs}
           values={customFields}
@@ -9206,70 +9335,83 @@ function EditBlockModal({
           inherited={cfInheritedValues}
           inheritedLabels={cfInheritedLabels}
         />
-        <div className="border-t pt-3">
-          <DnsSettingsSection
-            inherit={dnsInherit}
-            groupIds={dnsGroupIds}
-            zoneId={dnsZoneId}
-            additionalZoneIds={dnsAdditionalZoneIds}
-            onInheritChange={setDnsInherit}
-            onGroupIdsChange={setDnsGroupIds}
-            onZoneIdChange={setDnsZoneId}
-            onAdditionalZoneIdsChange={setDnsAdditionalZoneIds}
-            parentBlockId={block.parent_block_id}
-          />
-        </div>
-        <div className="border-t pt-3">
-          <DhcpSettingsSection
-            inherit={dhcpInherit}
-            serverGroupId={dhcpServerGroupId}
-            onInheritChange={setDhcpInherit}
-            onServerGroupIdChange={setDhcpServerGroupId}
-            parentBlockId={block.parent_block_id}
-            fallbackSpaceId={
-              !block.parent_block_id ? block.space_id : undefined
-            }
-          />
-        </div>
-        <div className="border-t pt-3 space-y-3">
-          <Field label="VRF (optional)">
+      )}
+
+      {tab === "dns" && (
+        <DnsSettingsSection
+          inherit={dnsInherit}
+          groupIds={dnsGroupIds}
+          zoneId={dnsZoneId}
+          additionalZoneIds={dnsAdditionalZoneIds}
+          onInheritChange={setDnsInherit}
+          onGroupIdsChange={setDnsGroupIds}
+          onZoneIdChange={setDnsZoneId}
+          onAdditionalZoneIdsChange={setDnsAdditionalZoneIds}
+          parentBlockId={block.parent_block_id}
+        />
+      )}
+
+      {tab === "dhcp" && (
+        <DhcpSettingsSection
+          inherit={dhcpInherit}
+          serverGroupId={dhcpServerGroupId}
+          onInheritChange={setDhcpInherit}
+          onServerGroupIdChange={setDhcpServerGroupId}
+          parentBlockId={block.parent_block_id}
+          fallbackSpaceId={!block.parent_block_id ? block.space_id : undefined}
+        />
+      )}
+
+      {tab === "networking" && (
+        <div className="space-y-3">
+          <p className="text-xs text-muted-foreground">
+            Override the parent space's VRF / ASN when this block lives in a
+            different routing context. Leave blank to inherit. Pure annotation —
+            address allocation does not consult these fields.
+          </p>
+          <Field label="VRF">
             <VrfPicker className={inputCls} value={vrfId} onChange={setVrfId} />
-            <p className="mt-1 text-[11px] text-muted-foreground">
-              Override the parent space's VRF when this block lives in a
-              different routing context. Leave blank to inherit.
-            </p>
           </Field>
-          <Field label="Origin ASN (BGP, optional)">
+          <Field label="Origin ASN (BGP)">
             <AsnPicker className={inputCls} value={asnId} onChange={setAsnId} />
           </Field>
         </div>
-        {error && <p className="text-xs text-destructive">{error}</p>}
-        <div className="flex justify-end gap-2 pt-2">
-          <button
-            onClick={() => onClose()}
-            className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
-          >
-            Cancel
-          </button>
-          <button
-            onClick={() => {
-              setError(null);
-              mutation.mutate();
-            }}
-            disabled={mutation.isPending}
-            className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
-          >
-            {mutation.isPending ? "Saving…" : "Save"}
-          </button>
-        </div>
-        <div className="mt-2 border-t pt-3">
+      )}
+
+      {tab === "danger" && (
+        <div className="space-y-3">
+          <p className="text-sm text-muted-foreground">
+            Deleting a block permanently removes every subnet and IP address row
+            inside it. The deletion is gated by a typed confirm in the next
+            step.
+          </p>
           <button
             onClick={() => setDeleteStep(1)}
-            className="text-xs text-destructive hover:underline"
+            className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-1.5 text-sm text-destructive hover:bg-destructive/10"
           >
             Delete this block…
           </button>
         </div>
+      )}
+
+      {error && <p className="mt-3 text-xs text-destructive">{error}</p>}
+      <div className="mt-6 flex justify-end gap-2 border-t pt-3">
+        <button
+          onClick={() => onClose()}
+          className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
+        >
+          Cancel
+        </button>
+        <button
+          onClick={() => {
+            setError(null);
+            mutation.mutate();
+          }}
+          disabled={mutation.isPending}
+          className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+        >
+          {mutation.isPending ? "Saving…" : "Save"}
+        </button>
       </div>
     </Modal>
   );
