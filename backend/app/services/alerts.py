@@ -38,6 +38,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.alerts import AlertEvent, AlertRule
 from app.models.asn import ASN, ASNRpkiRoa
+from app.models.circuit import Circuit
 from app.models.dhcp import DHCPServer
 from app.models.dns import DNSServer
 from app.models.domain import Domain
@@ -60,6 +61,9 @@ RULE_TYPE_DOMAIN_EXPIRING = "domain_expiring"
 RULE_TYPE_DOMAIN_NS_DRIFT = "domain_nameserver_drift"
 RULE_TYPE_DOMAIN_REGISTRAR_CHANGED = "domain_registrar_changed"
 RULE_TYPE_DOMAIN_DNSSEC_CHANGED = "domain_dnssec_status_changed"
+# Circuit rule types — alerting hooks for issue #93.
+RULE_TYPE_CIRCUIT_TERM_EXPIRING = "circuit_term_expiring"
+RULE_TYPE_CIRCUIT_STATUS_CHANGED = "circuit_status_changed"
 
 RULE_TYPES = frozenset(
     {
@@ -73,8 +77,15 @@ RULE_TYPES = frozenset(
         RULE_TYPE_DOMAIN_NS_DRIFT,
         RULE_TYPE_DOMAIN_REGISTRAR_CHANGED,
         RULE_TYPE_DOMAIN_DNSSEC_CHANGED,
+        RULE_TYPE_CIRCUIT_TERM_EXPIRING,
+        RULE_TYPE_CIRCUIT_STATUS_CHANGED,
     }
 )
+
+# ``circuit_status_changed`` — destination statuses that are
+# operator-noteworthy. ``active`` ↔ ``pending`` flips during
+# commissioning are routine and don't fire.
+_CIRCUIT_STATUS_CHANGE_DESTS: frozenset[str] = frozenset({"suspended", "decom"})
 
 # Default consecutive-failure threshold for ``asn_whois_unreachable``.
 _ASN_WHOIS_UNREACHABLE_THRESHOLD = 3
@@ -518,6 +529,188 @@ async def _evaluate_domain_transition_rule(
     return opened, resolved, delivered_syslog, delivered_webhook, delivered_smtp
 
 
+# ── Circuit rule evaluators ─────────────────────────────────────────
+
+
+async def _matching_circuit_term_expiring_subjects(
+    db: AsyncSession,
+    rule: AlertRule,
+    now: datetime,
+) -> list[tuple[str, str, str, str]]:
+    """Return ``[(subject_id, display, message, severity)]`` for the
+    ``circuit_term_expiring`` rule type. Mirrors ``domain_expiring`` —
+    severity escalates per ``threshold/4`` / ``threshold/12`` so a
+    single rule covers info / warning / critical without three
+    separate rules.
+
+    ``status='decom'`` rows are excluded — a decommissioned circuit
+    expiring is not actionable. Soft-deleted rows are also excluded.
+    """
+    threshold_days = rule.threshold_days or _DEFAULT_EXPIRING_THRESHOLD_DAYS
+    cutoff = (now + timedelta(days=threshold_days)).date()
+
+    rows = (
+        (
+            await db.execute(
+                select(Circuit)
+                .where(Circuit.deleted_at.is_(None))
+                .where(Circuit.status != "decom")
+                .where(Circuit.term_end_date.is_not(None))
+                .where(Circuit.term_end_date <= cutoff)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    matches: list[tuple[str, str, str, str]] = []
+    today = now.date()
+    for c in rows:
+        if c.term_end_date is None:
+            continue
+        days_to_expiry = (c.term_end_date - today).days
+        sev = _escalate_severity_for_expiring(
+            rule.severity,
+            threshold_days=threshold_days,
+            days_to_expiry=days_to_expiry,
+        )
+        if days_to_expiry <= 0:
+            descriptor = "term has expired"
+        elif days_to_expiry == 1:
+            descriptor = "term expires tomorrow"
+        else:
+            descriptor = f"term expires in {days_to_expiry} day(s)"
+        message = (
+            f"Circuit {c.name} {descriptor} "
+            f"(term_end_date {c.term_end_date.isoformat()}, threshold "
+            f"{threshold_days} d)"
+        )
+        matches.append((str(c.id), c.name, message, sev))
+    return matches
+
+
+async def _evaluate_circuit_status_changed_rule(
+    db: AsyncSession,
+    rule: AlertRule,
+    now: datetime,
+) -> tuple[int, int, int, int, int]:
+    """``circuit_status_changed`` — fires once when a circuit's status
+    transitions into ``suspended`` or ``decom``.
+
+    The router stamps ``previous_status`` + ``last_status_change_at``
+    on every status update (see
+    ``backend/app/api/v1/circuits/router.py:_stamp_status_transition``)
+    so this evaluator just keys events on ``last_status_change_at``:
+    a new firing is keyed by the timestamp, and the most recent event
+    for the subject latches that timestamp into
+    ``last_observed_value.changed_at``. If we see a row whose current
+    timestamp doesn't match the latched one we have a fresh transition
+    to fire on. Auto-resolves after ``_TRANSITION_AUTO_RESOLVE_DAYS``.
+
+    Routine ``active`` ↔ ``pending`` flips during commissioning are
+    intentionally excluded — only the ``suspended`` / ``decom`` states
+    surface to the operator.
+    """
+    targets = await audit_forward._load_targets()  # noqa: SLF001
+
+    opened = 0
+    resolved = 0
+    delivered_syslog = 0
+    delivered_webhook = 0
+    delivered_smtp = 0
+
+    # All open events for this rule, keyed by subject.
+    open_res = await db.execute(
+        select(AlertEvent).where(
+            AlertEvent.rule_id == rule.id,
+            AlertEvent.resolved_at.is_(None),
+        )
+    )
+    open_events = list(open_res.scalars().all())
+    open_by_subject: dict[str, AlertEvent] = {ev.subject_id: ev for ev in open_events}
+
+    # Auto-resolve old open events.
+    cutoff = now - timedelta(days=_TRANSITION_AUTO_RESOLVE_DAYS)
+    for ev in list(open_events):
+        if ev.fired_at < cutoff:
+            ev.resolved_at = now
+            resolved += 1
+            del open_by_subject[ev.subject_id]
+
+    # Most recent event (open or resolved) per subject — needed so we
+    # can compare its latched ``changed_at`` against the row's current
+    # ``last_status_change_at``. Without that, every evaluation pass
+    # would re-fire on the same transition.
+    last_event_res = await db.execute(
+        select(AlertEvent)
+        .where(AlertEvent.rule_id == rule.id)
+        .order_by(AlertEvent.fired_at.desc())
+    )
+    last_event_by_subject: dict[str, AlertEvent] = {}
+    for ev in last_event_res.scalars().all():
+        if ev.subject_id not in last_event_by_subject:
+            last_event_by_subject[ev.subject_id] = ev
+
+    rows = (
+        (await db.execute(select(Circuit).where(Circuit.deleted_at.is_(None))))
+        .scalars()
+        .all()
+    )
+    for c in rows:
+        subject_id = str(c.id)
+        if c.last_status_change_at is None:
+            continue
+        if c.status not in _CIRCUIT_STATUS_CHANGE_DESTS:
+            continue
+
+        # Skip if there's an open event for this subject — wait for
+        # the auto-resolve cutoff above.
+        if subject_id in open_by_subject:
+            continue
+
+        # If the most recent event already latched this exact
+        # ``last_status_change_at``, we've already fired for it.
+        prior_event = last_event_by_subject.get(subject_id)
+        if prior_event is not None and isinstance(prior_event.last_observed_value, dict):
+            latched = prior_event.last_observed_value.get("changed_at")
+            if latched == c.last_status_change_at.isoformat():
+                continue
+
+        from_label = c.previous_status or "<unset>"
+        to_label = c.status
+        message = f"Circuit {c.name} status: {from_label} → {to_label}"
+
+        event = AlertEvent(
+            rule_id=rule.id,
+            subject_type="circuit",
+            subject_id=subject_id,
+            subject_display=c.name,
+            severity=rule.severity,
+            message=message,
+            fired_at=now,
+            last_observed_value={
+                "from": c.previous_status,
+                "to": c.status,
+                "changed_at": c.last_status_change_at.isoformat(),
+            },
+        )
+        db.add(event)
+        await db.flush()
+        ds, dw, dm = await _deliver(rule, event, targets)
+        event.delivered_syslog = ds
+        event.delivered_webhook = dw
+        event.delivered_smtp = dm
+        opened += 1
+        if ds:
+            delivered_syslog += 1
+        if dw:
+            delivered_webhook += 1
+        if dm:
+            delivered_smtp += 1
+
+    return opened, resolved, delivered_syslog, delivered_webhook, delivered_smtp
+
+
 # ── Delivery ───────────────────────────────────────────────────────────────
 
 
@@ -655,6 +848,23 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 drift = await _matching_domain_drift_subjects(db, rule)
                 matches = [(sid, disp, msg, None) for sid, disp, msg in drift]
                 subject_type = "domain"
+            elif rule.rule_type == RULE_TYPE_CIRCUIT_TERM_EXPIRING:
+                expiring = await _matching_circuit_term_expiring_subjects(db, rule, now)
+                matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in expiring]
+                subject_type = "circuit"
+            elif rule.rule_type == RULE_TYPE_CIRCUIT_STATUS_CHANGED:
+                # Transition-style rule with its own evaluator that
+                # latches ``(from, to, changed_at)`` snapshots and
+                # auto-resolves after ``_TRANSITION_AUTO_RESOLVE_DAYS``.
+                op_, res_, dsy, dwh, dsm = await _evaluate_circuit_status_changed_rule(
+                    db, rule, now
+                )
+                opened += op_
+                resolved += res_
+                delivered_syslog += dsy
+                delivered_webhook += dwh
+                delivered_smtp += dsm
+                continue
             elif rule.rule_type in (
                 RULE_TYPE_DOMAIN_REGISTRAR_CHANGED,
                 RULE_TYPE_DOMAIN_DNSSEC_CHANGED,

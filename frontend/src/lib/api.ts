@@ -4926,7 +4926,9 @@ export type AlertRuleType =
   | "domain_expiring"
   | "domain_nameserver_drift"
   | "domain_registrar_changed"
-  | "domain_dnssec_status_changed";
+  | "domain_dnssec_status_changed"
+  | "circuit_term_expiring"
+  | "circuit_status_changed";
 export type AlertSeverity = "info" | "warning" | "critical";
 export type AlertServerType = "dns" | "dhcp" | "any";
 

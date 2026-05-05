@@ -92,7 +92,10 @@ function RuleEditorModal({
         notify_webhook: notifyWebhook,
         notify_smtp: notifySmtp,
         threshold_percent: ruleType === "subnet_utilization" ? threshold : null,
-        threshold_days: ruleType === "domain_expiring" ? thresholdDays : null,
+        threshold_days:
+          ruleType === "domain_expiring" || ruleType === "circuit_term_expiring"
+            ? thresholdDays
+            : null,
         server_type: ruleType === "server_unreachable" ? serverType : null,
       };
       if (existing) {
@@ -165,6 +168,14 @@ function RuleEditorModal({
                   Domain DNSSEC status changed
                 </option>
               </optgroup>
+              <optgroup label="Circuits (WAN transport)">
+                <option value="circuit_term_expiring">
+                  Circuit term expiring
+                </option>
+                <option value="circuit_status_changed">
+                  Circuit status changed (suspended / decom)
+                </option>
+              </optgroup>
             </select>
           </Field>
         )}
@@ -196,7 +207,8 @@ function RuleEditorModal({
             </select>
           </Field>
         )}
-        {ruleType === "domain_expiring" && (
+        {(ruleType === "domain_expiring" ||
+          ruleType === "circuit_term_expiring") && (
           <Field
             label="Threshold (days)"
             hint="Soft fire at threshold; severity escalates to warning at threshold/4 and critical at threshold/12 (e.g. 30 → 7.5 → 2.5 d)."
@@ -230,6 +242,14 @@ function RuleEditorModal({
           <p className="rounded-md border bg-muted/20 p-3 text-[11px] text-muted-foreground">
             Fires once when a domain's <code>dnssec_signed</code> flag flips at
             the parent zone (DS records appearing or disappearing).
+            Auto-resolves after 7 days; can be marked resolved manually.
+          </p>
+        )}
+        {ruleType === "circuit_status_changed" && (
+          <p className="rounded-md border bg-muted/20 p-3 text-[11px] text-muted-foreground">
+            Fires once when a circuit transitions into <code>suspended</code> or{" "}
+            <code>decom</code>. Routine <code>active</code> ↔{" "}
+            <code>pending</code> flips during commissioning are excluded.
             Auto-resolves after 7 days; can be marked resolved manually.
           </p>
         )}
@@ -440,7 +460,8 @@ export function AlertsPage() {
                         ? `≥ ${r.threshold_percent}%`
                         : r.rule_type === "server_unreachable"
                           ? `type=${r.server_type ?? "any"}`
-                          : r.rule_type === "domain_expiring"
+                          : r.rule_type === "domain_expiring" ||
+                              r.rule_type === "circuit_term_expiring"
                             ? `≤ ${r.threshold_days ?? 30} d`
                             : "—"}
                     </td>
