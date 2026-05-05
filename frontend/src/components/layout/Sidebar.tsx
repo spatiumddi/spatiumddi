@@ -15,6 +15,7 @@ import {
   Hash,
   MapPin,
   Package,
+  Spline,
   Truck,
   Users,
   UsersRound,
@@ -88,6 +89,7 @@ const networkInfrastructureNav = [
   { label: "ASNs", icon: Hash, to: "/network/asns" },
   { label: "Circuits", icon: Waypoints, to: "/network/circuits" },
   { label: "Devices", icon: Cable, to: "/network/devices" },
+  { label: "Overlays", icon: Spline, to: "/network/overlays" },
   { label: "VLANs", icon: RouterIcon, to: "/network/vlans" },
   { label: "VRFs", icon: RouteIcon, to: "/network/vrfs" },
 ];

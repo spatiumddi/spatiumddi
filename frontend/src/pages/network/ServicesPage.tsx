@@ -7,6 +7,7 @@ import {
   dhcpApi,
   dnsApi,
   ipamApi,
+  overlaysApi,
   servicesApi,
   sitesApi,
   vrfsApi,
@@ -28,9 +29,10 @@ import { CustomerChip } from "@/components/ownership/pickers";
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
 
-const KINDS: ServiceKind[] = ["mpls_l3vpn", "custom"];
+const KINDS: ServiceKind[] = ["mpls_l3vpn", "sdwan", "custom"];
 const KIND_LABELS: Record<ServiceKind, string> = {
   mpls_l3vpn: "MPLS L3VPN",
+  sdwan: "SD-WAN",
   custom: "Custom bundle",
 };
 
@@ -41,9 +43,9 @@ const STATUSES: ServiceStatus[] = [
   "decom",
 ];
 
-// Resource kinds the v1 router accepts. ``overlay_network`` is reserved
-// for the SD-WAN roadmap (#95) and the picker shows it disabled with a
-// tooltip so operators know it's coming.
+// Resource kinds the v1 router accepts. ``overlay_network`` lit up
+// alongside #95 — services with ``kind=sdwan`` typically bundle one as
+// the central deliverable.
 const RESOURCE_KINDS: ServiceResourceKind[] = [
   "vrf",
   "subnet",
@@ -52,6 +54,7 @@ const RESOURCE_KINDS: ServiceResourceKind[] = [
   "dhcp_scope",
   "circuit",
   "site",
+  "overlay_network",
 ];
 
 const RESOURCE_KIND_LABELS: Record<ServiceResourceKind, string> = {
@@ -91,6 +94,8 @@ function KindBadge({ kind }: { kind: ServiceKind }) {
   const styles: Record<ServiceKind, string> = {
     mpls_l3vpn:
       "bg-violet-100 text-violet-700 dark:bg-violet-950/30 dark:text-violet-300",
+    sdwan:
+      "bg-fuchsia-100 text-fuchsia-700 dark:bg-fuchsia-950/30 dark:text-fuchsia-300",
     custom: "bg-zinc-100 text-zinc-700 dark:bg-zinc-800 dark:text-zinc-300",
   };
   return (
@@ -182,6 +187,11 @@ function useResourcePool() {
     queryFn: () => circuitsApi.list({ limit: 500 }),
     staleTime: 60_000,
   });
+  const overlays = useQuery({
+    queryKey: ["overlays", "all"],
+    queryFn: () => overlaysApi.list({ limit: 500 }),
+    staleTime: 60_000,
+  });
 
   const dnsGroups = useQuery({
     queryKey: ["dns-groups", "all"],
@@ -233,6 +243,7 @@ function useResourcePool() {
     ip_block: blocks.data ?? [],
     site: sites.data?.items ?? [],
     circuit: circuits.data?.items ?? [],
+    overlay_network: overlays.data?.items ?? [],
     dns_zone: dnsZones.data ?? [],
     dhcp_scope: dhcpScopes.data ?? [],
   };
@@ -277,8 +288,12 @@ function resourceLabel(
       const sc = pool.dhcp_scope.find((x) => x.id === id);
       return sc ? sc.name || `scope:${short}` : `scope:${short}`;
     }
-    case "overlay_network":
-      return `overlay:${short}`;
+    case "overlay_network": {
+      const o = pool.overlay_network.find((x) => x.id === id);
+      return o
+        ? `${o.name}${o.kind ? ` · ${o.kind}` : ""}`
+        : `overlay:${short}`;
+    }
   }
 }
 
@@ -379,7 +394,10 @@ function ResourcesTab({
           }`,
         }));
       case "overlay_network":
-        return [];
+        return pool.overlay_network.map((o) => ({
+          id: o.id,
+          label: `${o.name} · ${o.kind}${o.vendor ? ` (${o.vendor})` : ""}`,
+        }));
     }
   };
 
@@ -405,9 +423,6 @@ function ResourcesTab({
                 {RESOURCE_KIND_LABELS[k]}
               </option>
             ))}
-            <option value="overlay_network" disabled>
-              SD-WAN overlay (#95 — not yet supported)
-            </option>
           </select>
           <select
             className={inputCls}
@@ -804,8 +819,8 @@ function ServiceEditorModal({
               ))}
             </select>
             <p className="mt-0.5 text-[11px] text-muted-foreground/80">
-              Other kinds (DIA, hosted DNS / DHCP, SD-WAN, MPLS L2VPN, VPLS,
-              EVPN) light up in later phases.
+              Other kinds (DIA, hosted DNS / DHCP, MPLS L2VPN, VPLS, EVPN) light
+              up in later phases.
             </p>
           </div>
           <div>
@@ -1042,11 +1057,11 @@ export function ServicesPage() {
           <div className="min-w-0 flex-1">
             <h1 className="text-xl font-semibold">Services</h1>
             <p className="text-sm text-muted-foreground">
-              Customer-deliverable bundles. The first concrete kind is{" "}
-              <code>mpls_l3vpn</code> (VRF + edge sites + edge circuits sold to
-              one customer); <code>custom</code> is the catch-all bag of
-              resources. Other kinds (DIA, hosted DNS / DHCP, SD-WAN) light up
-              in later phases.
+              Customer-deliverable bundles. <code>mpls_l3vpn</code> is the VRF +
+              edge sites + edge circuits flavour; <code>sdwan</code> bundles an
+              overlay network + edge sites + circuits; <code>custom</code> is
+              the catch-all bag of resources. Other kinds (DIA, hosted DNS /
+              DHCP, MPLS L2VPN, VPLS, EVPN) light up in later phases.
             </p>
           </div>
           <div className="flex shrink-0 items-center gap-2">

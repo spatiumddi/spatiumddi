@@ -7107,7 +7107,7 @@ export const circuitsApi = {
 // (overlay_network is reserved for SD-WAN #95 and rejected at attach
 // time).
 
-export type ServiceKind = "mpls_l3vpn" | "custom";
+export type ServiceKind = "mpls_l3vpn" | "sdwan" | "custom";
 export type ServiceStatus = "active" | "provisioning" | "suspended" | "decom";
 export type ServiceResourceKind =
   | "vrf"
@@ -7284,4 +7284,351 @@ export const servicesApi = {
     api
       .get<ServiceRead[]>(`/services/by-resource/${kind}/${resourceId}`)
       .then((r) => r.data),
+};
+
+// ── SD-WAN overlay topology (issue #95) ────────────────────────────
+//
+// Vendor-neutral source of truth for overlay topology + routing
+// policy intent. ``overlay_network`` rows describe the logical
+// overlay; ``overlay_site`` rows bind sites with role + edge device
+// + ordered preferred-circuit list; ``routing_policy`` rows declare
+// per-overlay match → action policies. The ``application_category``
+// catalog is shared across overlays and seeded at startup.
+
+export type OverlayKind =
+  | "sdwan"
+  | "ipsec_mesh"
+  | "wireguard_mesh"
+  | "dmvpn"
+  | "vxlan_evpn"
+  | "gre_mesh";
+
+export type OverlayStatus = "active" | "building" | "suspended" | "decom";
+export type OverlayPathStrategy =
+  | "active_active"
+  | "active_backup"
+  | "load_balance"
+  | "app_aware";
+export type OverlaySiteRole = "hub" | "spoke" | "transit" | "gateway";
+export type RoutingMatchKind =
+  | "application"
+  | "dscp"
+  | "source_subnet"
+  | "destination_subnet"
+  | "port_range"
+  | "acl";
+export type RoutingAction =
+  | "steer_to_circuit"
+  | "steer_to_transport_class"
+  | "steer_to_site_via_path"
+  | "drop"
+  | "shape"
+  | "mark_dscp";
+
+export interface OverlayRead {
+  id: string;
+  name: string;
+  kind: OverlayKind;
+  customer_id: string | null;
+  vendor: string | null;
+  encryption_profile: string | null;
+  default_path_strategy: OverlayPathStrategy;
+  status: OverlayStatus;
+  notes: string;
+  tags: Record<string, unknown>;
+  custom_fields: Record<string, unknown>;
+  created_at: string;
+  modified_at: string;
+  site_count: number;
+  policy_count: number;
+}
+
+export interface OverlayCreate {
+  name: string;
+  kind?: OverlayKind;
+  customer_id?: string | null;
+  vendor?: string | null;
+  encryption_profile?: string | null;
+  default_path_strategy?: OverlayPathStrategy;
+  status?: OverlayStatus;
+  notes?: string;
+  tags?: Record<string, unknown>;
+  custom_fields?: Record<string, unknown>;
+}
+
+export interface OverlayUpdate {
+  name?: string;
+  kind?: OverlayKind;
+  customer_id?: string | null;
+  vendor?: string | null;
+  encryption_profile?: string | null;
+  default_path_strategy?: OverlayPathStrategy;
+  status?: OverlayStatus;
+  notes?: string;
+  tags?: Record<string, unknown>;
+  custom_fields?: Record<string, unknown>;
+}
+
+export interface OverlayListResponse {
+  items: OverlayRead[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface OverlayListQuery {
+  limit?: number;
+  offset?: number;
+  customer_id?: string;
+  kind?: OverlayKind;
+  status?: OverlayStatus;
+  search?: string;
+}
+
+export interface OverlaySiteRead {
+  id: string;
+  overlay_network_id: string;
+  site_id: string;
+  role: OverlaySiteRole;
+  device_id: string | null;
+  loopback_subnet_id: string | null;
+  preferred_circuits: string[];
+  notes: string;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface OverlaySiteCreate {
+  site_id: string;
+  role?: OverlaySiteRole;
+  device_id?: string | null;
+  loopback_subnet_id?: string | null;
+  preferred_circuits?: string[];
+  notes?: string;
+}
+
+export interface OverlaySiteUpdate {
+  role?: OverlaySiteRole;
+  device_id?: string | null;
+  loopback_subnet_id?: string | null;
+  preferred_circuits?: string[];
+  notes?: string;
+}
+
+export interface RoutingPolicyRead {
+  id: string;
+  overlay_network_id: string;
+  name: string;
+  priority: number;
+  match_kind: RoutingMatchKind;
+  match_value: string;
+  action: RoutingAction;
+  action_target: string | null;
+  enabled: boolean;
+  notes: string;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface RoutingPolicyCreate {
+  name: string;
+  priority?: number;
+  match_kind: RoutingMatchKind;
+  match_value: string;
+  action: RoutingAction;
+  action_target?: string | null;
+  enabled?: boolean;
+  notes?: string;
+}
+
+export interface RoutingPolicyUpdate {
+  name?: string;
+  priority?: number;
+  match_kind?: RoutingMatchKind;
+  match_value?: string;
+  action?: RoutingAction;
+  action_target?: string | null;
+  enabled?: boolean;
+  notes?: string;
+}
+
+export interface TopologyNode {
+  overlay_site_id: string;
+  site_id: string;
+  site_name: string;
+  site_code: string | null;
+  role: OverlaySiteRole;
+  device_id: string | null;
+  device_name: string | null;
+  preferred_circuits: string[];
+}
+
+export interface TopologyEdge {
+  a_overlay_site_id: string;
+  z_overlay_site_id: string;
+  shared_circuits: string[];
+}
+
+export interface TopologyResponse {
+  overlay: OverlayRead;
+  nodes: TopologyNode[];
+  edges: TopologyEdge[];
+  policies: RoutingPolicyRead[];
+}
+
+export interface SimulateRequest {
+  down_circuits: string[];
+}
+
+export interface SimulatedSiteResolution {
+  overlay_site_id: string;
+  site_name: string;
+  original_preferred_circuits: string[];
+  surviving_preferred_circuits: string[];
+  primary_circuit: string | null;
+  primary_circuit_name: string | null;
+  primary_transport_class: string | null;
+  blackholed: boolean;
+}
+
+export interface SimulatedPolicyResolution {
+  policy_id: string;
+  policy_name: string;
+  action: RoutingAction;
+  original_target: string | null;
+  effective_target: string | null;
+  impacted: boolean;
+  note: string | null;
+}
+
+export interface SimulateResponse {
+  overlay_id: string;
+  down_circuits: string[];
+  site_resolutions: SimulatedSiteResolution[];
+  policy_resolutions: SimulatedPolicyResolution[];
+}
+
+export const overlaysApi = {
+  list: (params?: OverlayListQuery) =>
+    api.get<OverlayListResponse>("/overlays", { params }).then((r) => r.data),
+  get: (id: string) =>
+    api.get<OverlayRead>(`/overlays/${id}`).then((r) => r.data),
+  create: (body: OverlayCreate) =>
+    api.post<OverlayRead>("/overlays", body).then((r) => r.data),
+  update: (id: string, body: OverlayUpdate) =>
+    api.put<OverlayRead>(`/overlays/${id}`, body).then((r) => r.data),
+  remove: (id: string) => api.delete(`/overlays/${id}`),
+  bulkDelete: (ids: string[]) =>
+    api
+      .post<{
+        deleted: number;
+        not_found: string[];
+      }>("/overlays/bulk-delete", { ids })
+      .then((r) => r.data),
+
+  // Site membership
+  listSites: (overlayId: string) =>
+    api
+      .get<OverlaySiteRead[]>(`/overlays/${overlayId}/sites`)
+      .then((r) => r.data),
+  attachSite: (overlayId: string, body: OverlaySiteCreate) =>
+    api
+      .post<OverlaySiteRead>(`/overlays/${overlayId}/sites`, body)
+      .then((r) => r.data),
+  updateSite: (overlayId: string, siteRowId: string, body: OverlaySiteUpdate) =>
+    api
+      .put<OverlaySiteRead>(`/overlays/${overlayId}/sites/${siteRowId}`, body)
+      .then((r) => r.data),
+  detachSite: (overlayId: string, siteRowId: string) =>
+    api.delete(`/overlays/${overlayId}/sites/${siteRowId}`),
+
+  // Routing policies
+  listPolicies: (overlayId: string) =>
+    api
+      .get<RoutingPolicyRead[]>(`/overlays/${overlayId}/policies`)
+      .then((r) => r.data),
+  createPolicy: (overlayId: string, body: RoutingPolicyCreate) =>
+    api
+      .post<RoutingPolicyRead>(`/overlays/${overlayId}/policies`, body)
+      .then((r) => r.data),
+  updatePolicy: (
+    overlayId: string,
+    policyId: string,
+    body: RoutingPolicyUpdate,
+  ) =>
+    api
+      .put<RoutingPolicyRead>(
+        `/overlays/${overlayId}/policies/${policyId}`,
+        body,
+      )
+      .then((r) => r.data),
+  deletePolicy: (overlayId: string, policyId: string) =>
+    api.delete(`/overlays/${overlayId}/policies/${policyId}`),
+
+  // Topology + simulate
+  topology: (overlayId: string) =>
+    api
+      .get<TopologyResponse>(`/overlays/${overlayId}/topology`)
+      .then((r) => r.data),
+  simulate: (overlayId: string, body: SimulateRequest) =>
+    api
+      .post<SimulateResponse>(`/overlays/${overlayId}/simulate`, body)
+      .then((r) => r.data),
+};
+
+// ── Application catalog (issue #95) ─────────────────────────────────
+
+export type ApplicationKind =
+  | "saas"
+  | "voice"
+  | "video"
+  | "file_transfer"
+  | "security"
+  | "collaboration"
+  | "ml"
+  | "custom";
+
+export interface ApplicationRead {
+  id: string;
+  name: string;
+  description: string;
+  default_dscp: number | null;
+  category: ApplicationKind;
+  is_builtin: boolean;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface ApplicationCreate {
+  name: string;
+  description?: string;
+  default_dscp?: number | null;
+  category?: ApplicationKind;
+}
+
+export interface ApplicationUpdate {
+  description?: string;
+  default_dscp?: number | null;
+  category?: ApplicationKind;
+}
+
+export interface ApplicationListResponse {
+  items: ApplicationRead[];
+  total: number;
+}
+
+export const applicationsApi = {
+  list: (params?: {
+    category?: ApplicationKind;
+    builtin?: boolean;
+    search?: string;
+  }) =>
+    api
+      .get<ApplicationListResponse>("/applications", { params })
+      .then((r) => r.data),
+  create: (body: ApplicationCreate) =>
+    api.post<ApplicationRead>("/applications", body).then((r) => r.data),
+  update: (id: string, body: ApplicationUpdate) =>
+    api.put<ApplicationRead>(`/applications/${id}`, body).then((r) => r.data),
+  remove: (id: string) => api.delete(`/applications/${id}`),
 };

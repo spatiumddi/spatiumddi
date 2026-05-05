@@ -25,6 +25,8 @@ import { AsnsPage } from "@/pages/network/AsnsPage";
 import { AsnDetailPage } from "@/pages/network/AsnDetailPage";
 import { CircuitsPage } from "@/pages/network/CircuitsPage";
 import { CustomersPage } from "@/pages/network/CustomersPage";
+import { OverlaysPage } from "@/pages/network/OverlaysPage";
+import { OverlayDetailPage } from "@/pages/network/OverlayDetailPage";
 import { ProvidersPage } from "@/pages/network/ProvidersPage";
 import { ServicesPage } from "@/pages/network/ServicesPage";
 import { SitesPage } from "@/pages/network/SitesPage";
@@ -97,6 +99,8 @@ export default function App() {
         <Route path="network/asns/:id" element={<AsnDetailPage />} />
         <Route path="network/circuits" element={<CircuitsPage />} />
         <Route path="network/customers" element={<CustomersPage />} />
+        <Route path="network/overlays" element={<OverlaysPage />} />
+        <Route path="network/overlays/:id" element={<OverlayDetailPage />} />
         <Route path="network/providers" element={<ProvidersPage />} />
         <Route path="network/services" element={<ServicesPage />} />
         <Route path="network/sites" element={<SitesPage />} />
