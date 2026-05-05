@@ -45,6 +45,9 @@ class AlertRuleCreate(BaseModel):
     threshold_percent: int | None = None
     threshold_days: int | None = None
     server_type: str | None = None
+    # ``compliance_change`` params — see issue #105.
+    classification: str | None = None
+    change_scope: str | None = None
     severity: str = "warning"
     notify_syslog: bool = True
     notify_webhook: bool = True
@@ -97,6 +100,30 @@ class AlertRuleCreate(BaseModel):
             raise ValueError("threshold_days must be 1..3650")
         return v
 
+    @field_validator("classification")
+    @classmethod
+    def _v_classification(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        if v not in alert_service.COMPLIANCE_CLASSIFICATIONS:
+            raise ValueError(
+                "classification must be one of: "
+                f"{', '.join(sorted(alert_service.COMPLIANCE_CLASSIFICATIONS))}"
+            )
+        return v
+
+    @field_validator("change_scope")
+    @classmethod
+    def _v_change_scope(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        if v not in alert_service.COMPLIANCE_CHANGE_SCOPES:
+            raise ValueError(
+                "change_scope must be one of: "
+                f"{', '.join(sorted(alert_service.COMPLIANCE_CHANGE_SCOPES))}"
+            )
+        return v
+
 
 class AlertRuleUpdate(BaseModel):
     name: str | None = None
@@ -105,6 +132,8 @@ class AlertRuleUpdate(BaseModel):
     threshold_percent: int | None = None
     threshold_days: int | None = None
     server_type: str | None = None
+    classification: str | None = None
+    change_scope: str | None = None
     severity: str | None = None
     notify_syslog: bool | None = None
     notify_webhook: bool | None = None
@@ -146,6 +175,30 @@ class AlertRuleUpdate(BaseModel):
             raise ValueError("threshold_days must be 1..3650")
         return v
 
+    @field_validator("classification")
+    @classmethod
+    def _v_classification(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        if v not in alert_service.COMPLIANCE_CLASSIFICATIONS:
+            raise ValueError(
+                "classification must be one of: "
+                f"{', '.join(sorted(alert_service.COMPLIANCE_CLASSIFICATIONS))}"
+            )
+        return v
+
+    @field_validator("change_scope")
+    @classmethod
+    def _v_change_scope(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        if v not in alert_service.COMPLIANCE_CHANGE_SCOPES:
+            raise ValueError(
+                "change_scope must be one of: "
+                f"{', '.join(sorted(alert_service.COMPLIANCE_CHANGE_SCOPES))}"
+            )
+        return v
+
 
 class AlertRuleResponse(BaseModel):
     id: uuid.UUID
@@ -156,6 +209,9 @@ class AlertRuleResponse(BaseModel):
     threshold_percent: int | None
     threshold_days: int | None
     server_type: str | None
+    classification: str | None
+    change_scope: str | None
+    last_scanned_audit_at: datetime | None
     severity: str
     notify_syslog: bool
     notify_webhook: bool

@@ -29,6 +29,7 @@ it resolved.
 from __future__ import annotations
 
 import ipaddress
+import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
 
@@ -38,11 +39,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.alerts import AlertEvent, AlertRule
 from app.models.asn import ASN, ASNRpkiRoa
+from app.models.audit import AuditLog
 from app.models.circuit import Circuit
 from app.models.dhcp import DHCPScope, DHCPServer
 from app.models.dns import DNSServer, DNSZone
 from app.models.domain import Domain
-from app.models.ipam import IPBlock, Subnet
+from app.models.ipam import IPAddress, IPBlock, Subnet
 from app.models.network_service import NetworkService, NetworkServiceResource
 from app.models.overlay import OverlayNetwork
 from app.models.ownership import Site
@@ -71,6 +73,10 @@ RULE_TYPE_CIRCUIT_STATUS_CHANGED = "circuit_status_changed"
 # Service catalog rule types — alerting hooks for issue #94.
 RULE_TYPE_SERVICE_TERM_EXPIRING = "service_term_expiring"
 RULE_TYPE_SERVICE_RESOURCE_ORPHANED = "service_resource_orphaned"
+# Compliance change alerts — issue #105. One rule type with two
+# params (``classification`` + ``change_scope``) covers every flag
+# without exploding into N near-identical rule_type rows.
+RULE_TYPE_COMPLIANCE_CHANGE = "compliance_change"
 
 RULE_TYPES = frozenset(
     {
@@ -88,8 +94,47 @@ RULE_TYPES = frozenset(
         RULE_TYPE_CIRCUIT_STATUS_CHANGED,
         RULE_TYPE_SERVICE_TERM_EXPIRING,
         RULE_TYPE_SERVICE_RESOURCE_ORPHANED,
+        RULE_TYPE_COMPLIANCE_CHANGE,
     }
 )
+
+# Compliance-change rule constants. Keep in lock-step with the
+# Subnet model in ``backend/app/models/ipam.py`` — only flags that
+# exist as Subnet columns can be matched. Inheritance from
+# block / space is intentionally deferred (the schema doesn't carry
+# the flags above subnet level today; revisit when block/space-level
+# classification lands).
+COMPLIANCE_CLASSIFICATIONS: frozenset[str] = frozenset(
+    {"pci_scope", "hipaa_scope", "internet_facing"}
+)
+_CLASSIFICATION_LABEL: dict[str, str] = {
+    "pci_scope": "PCI",
+    "hipaa_scope": "HIPAA",
+    "internet_facing": "internet-facing",
+}
+
+COMPLIANCE_CHANGE_SCOPES: frozenset[str] = frozenset({"any_change", "create", "delete"})
+_COMPLIANCE_CHANGE_SCOPE_ACTIONS: dict[str, frozenset[str]] = {
+    "any_change": frozenset({"create", "update", "delete"}),
+    "create": frozenset({"create"}),
+    "delete": frozenset({"delete"}),
+}
+
+# Compliance events are point-in-time notifications, not ongoing
+# conditions. Keep them open just long enough to surface on the
+# alerts dashboard, then auto-resolve.
+_COMPLIANCE_CHANGE_AUTO_RESOLVE_HOURS = 24
+
+# Cap the audit-row scan per pass — guards against a runaway backfill
+# if a rule sat disabled for a long time then got flipped on. The
+# watermark advances by however many rows we processed, so the next
+# tick picks up where this one left off.
+_COMPLIANCE_CHANGE_SCAN_LIMIT = 1000
+
+# Resource types in audit_log we know how to map back to a Subnet for
+# classification lookup. Anything outside this set is skipped with a
+# logged debug. The map values name a mapper function below.
+_COMPLIANCE_RESOURCE_TYPES: frozenset[str] = frozenset({"subnet", "ip_address", "dhcp_scope"})
 
 # Resource-kind → SQLAlchemy model for the orphan sweep. Mirrors the
 # router's ``_KIND_MODEL`` map. ``overlay_network`` lit up alongside
@@ -841,6 +886,324 @@ async def _matching_service_resource_orphaned_subjects(
     return matches
 
 
+# ── Compliance change rule evaluator ────────────────────────────────
+
+
+async def _resolve_compliance_subnet(
+    db: AsyncSession,
+    *,
+    resource_type: str,
+    resource_id: str,
+    old_value: dict[str, Any] | None,
+) -> Subnet | None:
+    """Map an audit_log row's ``(resource_type, resource_id)`` back to
+    the Subnet whose classification flags should be consulted.
+
+    For ``subnet`` rows the resource itself IS the subnet. For
+    ``ip_address`` and ``dhcp_scope`` rows we look up the live row to
+    find its ``subnet_id``. On ``delete`` actions the live row is gone,
+    so we fall back to the audit's ``old_value`` JSON if it carried a
+    ``subnet_id``. Returns None when the subnet can't be identified
+    — caller will skip the row.
+    """
+    try:
+        rid_uuid = uuid.UUID(resource_id)
+    except (ValueError, TypeError):
+        return None
+
+    if resource_type == "subnet":
+        return await db.get(Subnet, rid_uuid)
+
+    if resource_type == "ip_address":
+        ip = await db.get(IPAddress, rid_uuid)
+        if ip is not None:
+            return await db.get(Subnet, ip.subnet_id)
+        # Deleted — look in old_value.
+        if old_value and "subnet_id" in old_value:
+            try:
+                sid = uuid.UUID(str(old_value["subnet_id"]))
+            except (ValueError, TypeError):
+                return None
+            return await db.get(Subnet, sid)
+        return None
+
+    if resource_type == "dhcp_scope":
+        scope = await db.get(DHCPScope, rid_uuid)
+        if scope is not None and scope.subnet_id is not None:
+            return await db.get(Subnet, scope.subnet_id)
+        if old_value and "subnet_id" in old_value:
+            try:
+                sid = uuid.UUID(str(old_value["subnet_id"]))
+            except (ValueError, TypeError):
+                return None
+            return await db.get(Subnet, sid)
+        return None
+
+    return None
+
+
+async def _evaluate_compliance_change_rule(
+    db: AsyncSession,
+    rule: AlertRule,
+    now: datetime,
+) -> tuple[int, int, int, int, int]:
+    """``compliance_change`` — fire one event per audit-log mutation
+    against a subnet (or descendant IP / DHCP scope) whose
+    classification flag matches ``rule.classification``.
+
+    State model:
+
+    * ``rule.last_scanned_audit_at`` is the high-water mark. NULL on
+      a fresh rule means "never scanned" — we stamp it to ``now()``
+      on the first pass so historical rows don't retro-fire when an
+      operator first enables the rule.
+    * Each audit row that matches opens one ``AlertEvent`` keyed by
+      the audit row's UUID, so re-running the evaluator is idempotent.
+    * Open events auto-resolve after
+      ``_COMPLIANCE_CHANGE_AUTO_RESOLVE_HOURS``. Operators can also
+      manually mark them resolved on the alerts page.
+
+    Per-pass scan is capped at ``_COMPLIANCE_CHANGE_SCAN_LIMIT`` rows
+    so a long-disabled rule flipping on doesn't pause the evaluator.
+    """
+    targets = await audit_forward._load_targets()  # noqa: SLF001
+
+    opened = 0
+    resolved = 0
+    delivered_syslog = 0
+    delivered_webhook = 0
+    delivered_smtp = 0
+
+    classification = rule.classification or ""
+    if classification not in COMPLIANCE_CLASSIFICATIONS:
+        logger.warning(
+            "alert_compliance_unknown_classification",
+            rule=str(rule.id),
+            classification=classification,
+        )
+        return opened, resolved, delivered_syslog, delivered_webhook, delivered_smtp
+
+    actions = _COMPLIANCE_CHANGE_SCOPE_ACTIONS.get(
+        rule.change_scope or "any_change",
+        _COMPLIANCE_CHANGE_SCOPE_ACTIONS["any_change"],
+    )
+
+    # Auto-resolve old open events for this rule.
+    auto_resolve_cutoff = now - timedelta(hours=_COMPLIANCE_CHANGE_AUTO_RESOLVE_HOURS)
+    open_res = await db.execute(
+        select(AlertEvent).where(
+            AlertEvent.rule_id == rule.id,
+            AlertEvent.resolved_at.is_(None),
+        )
+    )
+    for ev in open_res.scalars().all():
+        if ev.fired_at < auto_resolve_cutoff:
+            ev.resolved_at = now
+            resolved += 1
+
+    # Watermark — first run baselines to ``now`` and exits without
+    # firing on history.
+    if rule.last_scanned_audit_at is None:
+        rule.last_scanned_audit_at = now
+        return opened, resolved, delivered_syslog, delivered_webhook, delivered_smtp
+
+    watermark = rule.last_scanned_audit_at
+
+    audit_rows = (
+        (
+            await db.execute(
+                select(AuditLog)
+                .where(AuditLog.timestamp > watermark)
+                .where(AuditLog.action.in_(actions))
+                .where(AuditLog.resource_type.in_(_COMPLIANCE_RESOURCE_TYPES))
+                .where(AuditLog.result == "success")
+                .order_by(AuditLog.timestamp)
+                .limit(_COMPLIANCE_CHANGE_SCAN_LIMIT)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    if not audit_rows:
+        return opened, resolved, delivered_syslog, delivered_webhook, delivered_smtp
+
+    label = _CLASSIFICATION_LABEL.get(classification, classification)
+
+    # Index existing events for this rule keyed by audit row UUID so
+    # repeated passes don't double-fire. Compliance events use the
+    # audit row's UUID as the subject_id, so the open-event index is
+    # also the dedup index.
+    existing_event_subjects = {
+        ev.subject_id
+        for ev in (await db.execute(select(AlertEvent).where(AlertEvent.rule_id == rule.id)))
+        .scalars()
+        .all()
+    }
+
+    last_seen_ts = watermark
+    for row in audit_rows:
+        last_seen_ts = row.timestamp
+
+        if str(row.id) in existing_event_subjects:
+            continue
+
+        subnet = await _resolve_compliance_subnet(
+            db,
+            resource_type=row.resource_type,
+            resource_id=row.resource_id,
+            old_value=row.old_value if isinstance(row.old_value, dict) else None,
+        )
+        if subnet is None:
+            continue
+        if not getattr(subnet, classification, False):
+            continue
+
+        actor = row.user_display_name or "<system>"
+        changed = (
+            ", ".join(row.changed_fields)
+            if isinstance(row.changed_fields, list) and row.changed_fields
+            else ""
+        )
+        descriptor = f"{row.action}"
+        if changed:
+            descriptor = f"{row.action} ({changed})"
+
+        display = f"{row.resource_type} {row.resource_display}"[:500]
+        subnet_label = f"{subnet.network}"
+        if subnet.name:
+            subnet_label += f" ({subnet.name})"
+        message = (
+            f"{label}-scoped {row.resource_type} {row.resource_display} "
+            f"in subnet {subnet_label} — {descriptor} by {actor}"
+        )
+
+        event = AlertEvent(
+            rule_id=rule.id,
+            subject_type=f"audit:{row.resource_type}",
+            subject_id=str(row.id),
+            subject_display=display,
+            severity=rule.severity,
+            message=message,
+            fired_at=now,
+            last_observed_value={
+                "audit_id": str(row.id),
+                "audit_timestamp": row.timestamp.isoformat(),
+                "subnet_id": str(subnet.id),
+                "classification": classification,
+                "action": row.action,
+                "actor": actor,
+                "changed_fields": (
+                    row.changed_fields if isinstance(row.changed_fields, list) else None
+                ),
+            },
+        )
+        db.add(event)
+        await db.flush()
+        ds, dw, dm = await _deliver(rule, event, targets)
+        event.delivered_syslog = ds
+        event.delivered_webhook = dw
+        event.delivered_smtp = dm
+        opened += 1
+        if ds:
+            delivered_syslog += 1
+        if dw:
+            delivered_webhook += 1
+        if dm:
+            delivered_smtp += 1
+
+    # Advance watermark past the last row we examined regardless of
+    # whether it matched — we don't want to re-scan the same window
+    # next pass.
+    rule.last_scanned_audit_at = last_seen_ts
+
+    return opened, resolved, delivered_syslog, delivered_webhook, delivered_smtp
+
+
+# Built-in compliance_change rules seeded on first start. Disabled by
+# default — the operator opts in by flipping ``enabled`` on the row
+# after wiring the audit-forward targets they want the alerts to fan
+# out to. We deliberately avoid auto-creating these only when at
+# least one classification flag is set, because that would create a
+# chicken-and-egg problem where flipping the first PCI flag wouldn't
+# also fire the rule on its own create event.
+_COMPLIANCE_RULE_SEEDS: list[dict[str, Any]] = [
+    {
+        "name": "PCI scope changes",
+        "description": (
+            "Fires whenever a PCI-scoped subnet (or an IP / DHCP scope inside "
+            "one) is created, updated, or deleted. Toggle on after configuring "
+            "an audit-forward target to receive the events."
+        ),
+        "rule_type": RULE_TYPE_COMPLIANCE_CHANGE,
+        "classification": "pci_scope",
+        "change_scope": "any_change",
+        "severity": "warning",
+    },
+    {
+        "name": "HIPAA scope changes",
+        "description": (
+            "Fires whenever a HIPAA-scoped subnet (or an IP / DHCP scope inside "
+            "one) is created, updated, or deleted."
+        ),
+        "rule_type": RULE_TYPE_COMPLIANCE_CHANGE,
+        "classification": "hipaa_scope",
+        "change_scope": "any_change",
+        "severity": "warning",
+    },
+    {
+        "name": "Internet-facing scope changes",
+        "description": (
+            "Fires whenever an internet-facing subnet (or an IP / DHCP scope "
+            "inside one) is created, updated, or deleted."
+        ),
+        "rule_type": RULE_TYPE_COMPLIANCE_CHANGE,
+        "classification": "internet_facing",
+        "change_scope": "any_change",
+        "severity": "warning",
+    },
+]
+
+
+async def seed_builtin_compliance_alert_rules() -> None:
+    """Insert the three disabled compliance-change rules on first
+    boot. Idempotent — only inserts a row when no rule with the same
+    ``(rule_type, classification)`` pair already exists.
+
+    Operators who toggle / rename / re-author one of these are never
+    overridden, because the seed key is the ``classification`` value
+    rather than ``name``. Renaming "PCI scope changes" → "PCI v4
+    cardholder data audit hook" still suppresses the seed.
+    """
+    from app.db import AsyncSessionLocal  # noqa: PLC0415 — late import to dodge cycles
+
+    async with AsyncSessionLocal() as session:
+        for seed in _COMPLIANCE_RULE_SEEDS:
+            existing = await session.scalar(
+                select(AlertRule).where(
+                    AlertRule.rule_type == seed["rule_type"],
+                    AlertRule.classification == seed["classification"],
+                )
+            )
+            if existing is not None:
+                continue
+            session.add(
+                AlertRule(
+                    name=seed["name"],
+                    description=seed["description"],
+                    rule_type=seed["rule_type"],
+                    classification=seed["classification"],
+                    change_scope=seed["change_scope"],
+                    severity=seed["severity"],
+                    enabled=False,
+                    notify_syslog=True,
+                    notify_webhook=True,
+                    notify_smtp=False,
+                )
+            )
+        await session.commit()
+
+
 # ── Delivery ───────────────────────────────────────────────────────────────
 
 
@@ -997,6 +1360,17 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 op_, res_, dsy, dwh, dsm = await _evaluate_circuit_status_changed_rule(
                     db, rule, now
                 )
+                opened += op_
+                resolved += res_
+                delivered_syslog += dsy
+                delivered_webhook += dwh
+                delivered_smtp += dsm
+                continue
+            elif rule.rule_type == RULE_TYPE_COMPLIANCE_CHANGE:
+                # Audit-log-driven; opens one event per matching audit
+                # row with its own auto-resolve window. Watermark stored
+                # on the rule itself.
+                op_, res_, dsy, dwh, dsm = await _evaluate_compliance_change_rule(db, rule, now)
                 opened += op_
                 resolved += res_
                 delivered_syslog += dsy

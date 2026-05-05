@@ -4956,9 +4956,18 @@ export type AlertRuleType =
   | "circuit_term_expiring"
   | "circuit_status_changed"
   | "service_term_expiring"
-  | "service_resource_orphaned";
+  | "service_resource_orphaned"
+  | "compliance_change";
 export type AlertSeverity = "info" | "warning" | "critical";
 export type AlertServerType = "dns" | "dhcp" | "any";
+// ``compliance_change`` rule type — keep in lock-step with
+// ``COMPLIANCE_CLASSIFICATIONS`` / ``COMPLIANCE_CHANGE_SCOPES`` in
+// ``backend/app/services/alerts.py``.
+export type AlertClassification =
+  | "pci_scope"
+  | "hipaa_scope"
+  | "internet_facing";
+export type AlertChangeScope = "any_change" | "create" | "delete";
 
 export interface AlertRule {
   id: string;
@@ -4969,6 +4978,9 @@ export interface AlertRule {
   threshold_percent: number | null;
   threshold_days: number | null;
   server_type: AlertServerType | null;
+  classification: AlertClassification | null;
+  change_scope: AlertChangeScope | null;
+  last_scanned_audit_at: string | null;
   severity: AlertSeverity;
   notify_syslog: boolean;
   notify_webhook: boolean;
@@ -4985,6 +4997,8 @@ export interface AlertRuleCreate {
   threshold_percent?: number | null;
   threshold_days?: number | null;
   server_type?: AlertServerType | null;
+  classification?: AlertClassification | null;
+  change_scope?: AlertChangeScope | null;
   severity?: AlertSeverity;
   notify_syslog?: boolean;
   notify_webhook?: boolean;
@@ -4998,6 +5012,8 @@ export interface AlertRuleUpdate {
   threshold_percent?: number | null;
   threshold_days?: number | null;
   server_type?: AlertServerType | null;
+  classification?: AlertClassification | null;
+  change_scope?: AlertChangeScope | null;
   severity?: AlertSeverity;
   notify_syslog?: boolean;
   notify_webhook?: boolean;

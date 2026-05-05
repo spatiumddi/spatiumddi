@@ -12,6 +12,8 @@ import {
 } from "lucide-react";
 import {
   alertsApi,
+  type AlertChangeScope,
+  type AlertClassification,
   type AlertRule,
   type AlertRuleType,
   type AlertServerType,
@@ -69,6 +71,12 @@ function RuleEditorModal({
   const [serverType, setServerType] = useState<AlertServerType>(
     (existing?.server_type as AlertServerType | null) ?? "any",
   );
+  const [classification, setClassification] = useState<AlertClassification>(
+    (existing?.classification as AlertClassification | null) ?? "pci_scope",
+  );
+  const [changeScope, setChangeScope] = useState<AlertChangeScope>(
+    (existing?.change_scope as AlertChangeScope | null) ?? "any_change",
+  );
   const [severity, setSeverity] = useState<AlertSeverity>(
     existing?.severity ?? "warning",
   );
@@ -99,6 +107,9 @@ function RuleEditorModal({
             ? thresholdDays
             : null,
         server_type: ruleType === "server_unreachable" ? serverType : null,
+        classification:
+          ruleType === "compliance_change" ? classification : null,
+        change_scope: ruleType === "compliance_change" ? changeScope : null,
       };
       if (existing) {
         return alertsApi.updateRule(existing.id, body);
@@ -186,6 +197,11 @@ function RuleEditorModal({
                   Service resource orphaned (target deleted)
                 </option>
               </optgroup>
+              <optgroup label="Compliance">
+                <option value="compliance_change">
+                  Compliance change (PCI / HIPAA / internet-facing)
+                </option>
+              </optgroup>
             </select>
           </Field>
         )}
@@ -271,6 +287,51 @@ function RuleEditorModal({
             automatically when the operator detaches the orphan link or
             re-creates the target.
           </p>
+        )}
+        {ruleType === "compliance_change" && (
+          <>
+            <Field
+              label="Classification"
+              hint="Subnet flag this rule watches. Mutations against subnets / IPs / DHCP scopes whose subnet has the flag fire one event per audit row."
+            >
+              <select
+                className={inputCls}
+                value={classification}
+                onChange={(e) =>
+                  setClassification(e.target.value as AlertClassification)
+                }
+              >
+                <option value="pci_scope">PCI scope</option>
+                <option value="hipaa_scope">HIPAA scope</option>
+                <option value="internet_facing">Internet-facing</option>
+              </select>
+            </Field>
+            <Field
+              label="Change scope"
+              hint="Which audit-log actions count. Update + create + delete cover the common cases; pick a narrower scope to reduce noise."
+            >
+              <select
+                className={inputCls}
+                value={changeScope}
+                onChange={(e) =>
+                  setChangeScope(e.target.value as AlertChangeScope)
+                }
+              >
+                <option value="any_change">
+                  Any change (create + update + delete)
+                </option>
+                <option value="create">Create only</option>
+                <option value="delete">Delete only</option>
+              </select>
+            </Field>
+            <p className="rounded-md border bg-muted/20 p-3 text-[11px] text-muted-foreground">
+              On first enable, the rule baselines its watermark to "now" — it
+              won't retro-fire on existing audit history. Each matching audit
+              row opens one event that auto-resolves after 24 h. Inheritance
+              from IP block / space is not supported today (classification flags
+              only exist on subnet rows).
+            </p>
+          </>
         )}
         <Field label="Severity">
           <select
@@ -483,7 +544,9 @@ export function AlertsPage() {
                               r.rule_type === "circuit_term_expiring" ||
                               r.rule_type === "service_term_expiring"
                             ? `≤ ${r.threshold_days ?? 30} d`
-                            : "—"}
+                            : r.rule_type === "compliance_change"
+                              ? `${r.classification ?? "?"} · ${r.change_scope ?? "any_change"}`
+                              : "—"}
                     </td>
                     <td className="px-4 py-2">
                       <SeverityBadge severity={r.severity} />

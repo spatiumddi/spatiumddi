@@ -72,6 +72,11 @@ class AlertRule(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     #                                    Auto-resolves after 7 days.
     #   "domain_dnssec_status_changed"— fires once per dnssec_signed flip.
     #                                    Auto-resolves after 7 days.
+    #   "compliance_change"           — fires on audit-log mutations to
+    #                                    subnets / IPs / DHCP scopes whose
+    #                                    classification flag matches the
+    #                                    rule's ``classification``. See
+    #                                    issue #105.
     rule_type: Mapped[str] = mapped_column(String(40), nullable=False)
 
     # Subnet utilization params.
@@ -87,6 +92,21 @@ class AlertRule(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # threshold/12 widens to "critical". Default 30 d (matches the
     # ``whois_state="expiring"`` bucket).
     threshold_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    # ``compliance_change`` params. ``classification`` names the column
+    # on Subnet to watch (``pci_scope`` | ``hipaa_scope`` |
+    # ``internet_facing``). ``change_scope`` filters which audit-log
+    # actions count (``any_change`` | ``create`` | ``delete``).
+    # ``last_scanned_audit_at`` is the high-water mark; the evaluator
+    # only fires for audit rows whose ``timestamp`` is strictly greater.
+    # NULL on a fresh rule means "never scanned" — the evaluator
+    # initialises it to NOW() on its first pass so historical audit
+    # rows don't retroactively page the operator.
+    classification: Mapped[str | None] = mapped_column(String(30), nullable=True)
+    change_scope: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    last_scanned_audit_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     # Severity (info | warning | critical). Maps to a syslog severity on
     # delivery and drives UI colour.

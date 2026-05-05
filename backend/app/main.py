@@ -201,6 +201,19 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await seed_builtin_applications()
     except Exception as exc:  # noqa: BLE001
         logger.debug("builtin_applications_seed_skipped", reason=str(exc))
+    # Compliance-change alert rules — three disabled stubs (PCI /
+    # HIPAA / internet-facing). Issue #105. Idempotent;
+    # failure-tolerant. The seeder only inserts a row when no rule
+    # of the matching ``rule_type + classification`` already exists,
+    # so operators who toggled / customised one are never overridden.
+    try:
+        from app.services.alerts import (  # noqa: PLC0415
+            seed_builtin_compliance_alert_rules,
+        )
+
+        await seed_builtin_compliance_alert_rules()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("compliance_alert_rules_seed_skipped", reason=str(exc))
     yield
     logger.info("shutdown", service="api")
 
