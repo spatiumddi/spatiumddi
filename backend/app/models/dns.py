@@ -553,6 +553,16 @@ class DNSZone(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
         Boolean, nullable=False, default=True, server_default=sa_text("true")
     )
 
+    # Logical ownership (issue #91). DNS zones often map 1:1 to a
+    # customer (managed-DNS engagements) or to a site (per-DC zones);
+    # the FK keeps that visible without resorting to tags.
+    customer_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("customer.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
     group: Mapped["DNSServerGroup"] = relationship("DNSServerGroup", back_populates="zones")
     view: Mapped["DNSView | None"] = relationship("DNSView", back_populates="zones")
     records: Mapped[list["DNSRecord"]] = relationship(

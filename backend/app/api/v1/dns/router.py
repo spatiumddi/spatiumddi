@@ -546,6 +546,10 @@ class ZoneCreate(BaseModel):
     # ignored otherwise.
     forwarders: list[str] = []
     forward_only: bool = True
+    # Logical ownership (issue #91). Optional FK to the Customer that
+    # owns this zone (managed-DNS engagements typically have one
+    # customer per zone).
+    customer_id: uuid.UUID | None = None
 
     @field_validator("zone_type")
     @classmethod
@@ -591,6 +595,7 @@ class ZoneUpdate(BaseModel):
     notify_enabled: str | None = None
     forwarders: list[str] | None = None
     forward_only: bool | None = None
+    customer_id: uuid.UUID | None = None
 
     @field_validator("zone_type")
     @classmethod
@@ -649,6 +654,7 @@ class ZoneResponse(BaseModel):
     # disable edit/delete controls; the API enforces it on the
     # write paths regardless of UI state.
     tailscale_tenant_id: uuid.UUID | None = None
+    customer_id: uuid.UUID | None = None
     created_at: datetime
     modified_at: datetime
 
@@ -2248,11 +2254,17 @@ async def delete_view(
 
 
 @router.get("/groups/{group_id}/zones", response_model=list[ZoneResponse])
-async def list_zones(group_id: uuid.UUID, db: DB, _: CurrentUser) -> list[DNSZone]:
+async def list_zones(
+    group_id: uuid.UUID,
+    db: DB,
+    _: CurrentUser,
+    customer_id: uuid.UUID | None = None,
+) -> list[DNSZone]:
     await _require_group(group_id, db)
-    result = await db.execute(
-        select(DNSZone).where(DNSZone.group_id == group_id).order_by(DNSZone.name)
-    )
+    stmt = select(DNSZone).where(DNSZone.group_id == group_id).order_by(DNSZone.name)
+    if customer_id is not None:
+        stmt = stmt.where(DNSZone.customer_id == customer_id)
+    result = await db.execute(stmt)
     return list(result.scalars().all())
 
 

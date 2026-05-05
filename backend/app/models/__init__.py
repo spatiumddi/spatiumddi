@@ -63,6 +63,7 @@ from app.models.network import (
 )
 from app.models.nmap import NmapScan
 from app.models.oui import OUIVendor
+from app.models.ownership import Customer, Provider, Site
 from app.models.proxmox import ProxmoxNode
 from app.models.settings import PlatformSettings
 from app.models.tailscale import TailscaleTenant
@@ -148,4 +149,7 @@ __all__ = [
     "NmapScan",
     "EventSubscription",
     "EventOutbox",
+    "Customer",
+    "Site",
+    "Provider",
 ]

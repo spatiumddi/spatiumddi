@@ -114,6 +114,7 @@ def _to_read(device: NetworkDevice, ip_space_name: str | None) -> NetworkDeviceR
         last_poll_neighbour_count=device.last_poll_neighbour_count,
         ip_space_id=device.ip_space_id,
         ip_space_name=ip_space_name,
+        site_id=device.site_id,
         is_active=device.is_active,
         tags=device.tags or {},
         created_at=device.created_at,
@@ -173,6 +174,7 @@ async def list_devices(
     active: bool | None = Query(None),
     device_type: str | None = Query(None),
     last_poll_status: str | None = Query(None),
+    site_id: uuid.UUID | None = Query(None),
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=500),
 ) -> NetworkDeviceListResponse:
@@ -186,6 +188,8 @@ async def list_devices(
         base = base.where(NetworkDevice.device_type == device_type)
     if last_poll_status is not None:
         base = base.where(NetworkDevice.last_poll_status == last_poll_status)
+    if site_id is not None:
+        base = base.where(NetworkDevice.site_id == site_id)
 
     count_stmt = select(func.count()).select_from(base.subquery())
     total = int((await db.execute(count_stmt)).scalar_one())
@@ -249,6 +253,7 @@ async def create_device(
         poll_lldp=body.poll_lldp,
         auto_create_discovered=body.auto_create_discovered,
         ip_space_id=body.ip_space_id,
+        site_id=body.site_id,
         is_active=body.is_active,
         tags=body.tags or {},
     )

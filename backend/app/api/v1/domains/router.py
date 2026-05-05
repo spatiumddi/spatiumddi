@@ -93,6 +93,11 @@ class DomainCreate(BaseModel):
     expected_nameservers: list[str] = Field(default_factory=list)
     tags: dict[str, Any] = Field(default_factory=dict)
     custom_fields: dict[str, Any] = Field(default_factory=dict)
+    # Logical ownership (issue #91). ``registrar_provider_id`` is the
+    # FK successor to the freeform ``registrar`` text on the model;
+    # both can co-exist while operators migrate to picking a Provider.
+    customer_id: uuid.UUID | None = None
+    registrar_provider_id: uuid.UUID | None = None
 
     @field_validator("name")
     @classmethod
@@ -113,6 +118,8 @@ class DomainUpdate(BaseModel):
     expected_nameservers: list[str] | None = None
     tags: dict[str, Any] | None = None
     custom_fields: dict[str, Any] | None = None
+    customer_id: uuid.UUID | None = None
+    registrar_provider_id: uuid.UUID | None = None
 
     @field_validator("name")
     @classmethod
@@ -147,6 +154,8 @@ class DomainRead(BaseModel):
     next_check_at: datetime | None
     tags: dict[str, Any]
     custom_fields: dict[str, Any]
+    customer_id: uuid.UUID | None = None
+    registrar_provider_id: uuid.UUID | None = None
     created_at: datetime
     modified_at: datetime
 
@@ -215,6 +224,8 @@ def _to_read(d: Domain) -> DomainRead:
         next_check_at=d.next_check_at,
         tags=dict(d.tags or {}),
         custom_fields=dict(d.custom_fields or {}),
+        customer_id=d.customer_id,
+        registrar_provider_id=d.registrar_provider_id,
         created_at=d.created_at,
         modified_at=d.modified_at,
     )
@@ -229,6 +240,8 @@ async def list_domains(
     current_user: CurrentUser,
     whois_state: str | None = Query(None),
     expiring_within_days: int | None = Query(None, ge=0, le=3650),
+    customer_id: uuid.UUID | None = Query(None),
+    registrar_provider_id: uuid.UUID | None = Query(None),
     search: str | None = Query(None, min_length=1, max_length=255),
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=500),
@@ -248,6 +261,10 @@ async def list_domains(
     if expiring_within_days is not None:
         cutoff = datetime.now(UTC) + timedelta(days=expiring_within_days)
         base = base.where(Domain.expires_at.is_not(None)).where(Domain.expires_at <= cutoff)
+    if customer_id is not None:
+        base = base.where(Domain.customer_id == customer_id)
+    if registrar_provider_id is not None:
+        base = base.where(Domain.registrar_provider_id == registrar_provider_id)
     if search:
         # Substring match on name or registrar — registrar can be NULL
         # so the OR has to tolerate that. Postgres ``ILIKE`` keeps it
@@ -291,6 +308,8 @@ async def create_domain(body: DomainCreate, db: DB, current_user: CurrentUser) -
         expected_nameservers=body.expected_nameservers,
         tags=body.tags or {},
         custom_fields=body.custom_fields or {},
+        customer_id=body.customer_id,
+        registrar_provider_id=body.registrar_provider_id,
     )
     db.add(d)
     await db.flush()

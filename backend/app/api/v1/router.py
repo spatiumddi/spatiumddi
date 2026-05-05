@@ -27,6 +27,11 @@ from app.api.v1.logs import logs_router
 from app.api.v1.metrics import router as metrics_router
 from app.api.v1.network import router as network_router
 from app.api.v1.nmap import router as nmap_router
+from app.api.v1.ownership import (
+    customers_router,
+    providers_router,
+    sites_router,
+)
 from app.api.v1.proxmox import router as proxmox_router
 from app.api.v1.roles.router import router as roles_router
 from app.api.v1.search.router import router as search_router
@@ -56,6 +61,7 @@ api_v1_router.include_router(
     auth_providers_router, prefix="/auth-providers", tags=["auth-providers"]
 )
 api_v1_router.include_router(custom_fields_router, prefix="/custom-fields", tags=["custom-fields"])
+api_v1_router.include_router(customers_router, prefix="/customers", tags=["customers"])
 api_v1_router.include_router(dhcp_router, prefix="/dhcp", tags=["dhcp"])
 api_v1_router.include_router(dns_router, prefix="/dns", tags=["dns"])
 api_v1_router.include_router(dns_agents_router, prefix="/dns", tags=["dns-agents"])
@@ -71,10 +77,12 @@ api_v1_router.include_router(logs_router, prefix="/logs", tags=["logs"])
 api_v1_router.include_router(metrics_router, prefix="/metrics", tags=["metrics"])
 api_v1_router.include_router(network_router, tags=["network"])
 api_v1_router.include_router(nmap_router, prefix="/nmap", tags=["nmap"])
+api_v1_router.include_router(providers_router, prefix="/providers", tags=["providers"])
 api_v1_router.include_router(proxmox_router, prefix="/proxmox", tags=["proxmox"])
 api_v1_router.include_router(roles_router, prefix="/roles", tags=["roles"])
 api_v1_router.include_router(search_router, prefix="/search", tags=["search"])
 api_v1_router.include_router(settings_router, prefix="/settings", tags=["settings"])
+api_v1_router.include_router(sites_router, prefix="/sites", tags=["sites"])
 api_v1_router.include_router(tailscale_router, prefix="/tailscale", tags=["tailscale"])
 api_v1_router.include_router(users_router, prefix="/users", tags=["users"])
 api_v1_router.include_router(version_router, prefix="/version", tags=["version"])

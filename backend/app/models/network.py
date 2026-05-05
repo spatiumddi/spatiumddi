@@ -145,6 +145,15 @@ class NetworkDevice(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         ForeignKey("ip_space.id", ondelete="RESTRICT"),
         nullable=False,
     )
+    # Logical site placement (issue #91). NULL = unassigned. ``ON
+    # DELETE SET NULL`` so deleting a Site doesn't take its devices
+    # with it.
+    site_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("site.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     is_active: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True, server_default="true"
     )

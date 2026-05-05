@@ -51,6 +51,7 @@ class NetworkDeviceCreate(BaseModel):
 
     # Binding
     ip_space_id: uuid.UUID
+    site_id: uuid.UUID | None = None
     is_active: bool = True
     tags: dict = Field(default_factory=dict)
 
@@ -120,6 +121,7 @@ class NetworkDeviceUpdate(BaseModel):
     auto_create_discovered: bool | None = None
 
     ip_space_id: uuid.UUID | None = None
+    site_id: uuid.UUID | None = None
     is_active: bool | None = None
     tags: dict | None = None
 
@@ -170,6 +172,7 @@ class NetworkDeviceRead(BaseModel):
 
     ip_space_id: uuid.UUID
     ip_space_name: str | None
+    site_id: uuid.UUID | None
     is_active: bool
     tags: dict
 

@@ -8,10 +8,13 @@ import {
   Server,
   Router as RouterIcon,
   Route as RouteIcon,
+  Briefcase,
   Cable,
   Code2,
   Github,
   Hash,
+  MapPin,
+  Truck,
   Users,
   UsersRound,
   KeyRound,
@@ -65,7 +68,10 @@ const baseMainNav = [
 // VRFs / ASNs are real first-class pages from issues #85 / #86.
 const networkNav = [
   { label: "ASNs", icon: Hash, to: "/network/asns" },
+  { label: "Customers", icon: Briefcase, to: "/network/customers" },
   { label: "Devices", icon: Cable, to: "/network/devices" },
+  { label: "Providers", icon: Truck, to: "/network/providers" },
+  { label: "Sites", icon: MapPin, to: "/network/sites" },
   { label: "VLANs", icon: RouterIcon, to: "/network/vlans" },
   { label: "VRFs", icon: RouteIcon, to: "/network/vrfs" },
 ];

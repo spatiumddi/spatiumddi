@@ -6509,6 +6509,8 @@ export interface ASNRead {
   whois_last_checked_at: string | null;
   whois_data: Record<string, unknown> | null;
   whois_state: ASNWhoisState;
+  customer_id: string | null;
+  provider_id: string | null;
   tags: Record<string, unknown>;
   custom_fields: Record<string, unknown>;
   created_at: string;
@@ -6550,6 +6552,8 @@ export interface ASNListQuery {
   kind?: ASNKind;
   registry?: ASNRegistry;
   whois_state?: ASNWhoisState;
+  customer_id?: string;
+  provider_id?: string;
   search?: string;
 }
 
@@ -6566,6 +6570,8 @@ export interface ASNUpdate {
   name?: string;
   description?: string;
   holder_org?: string | null;
+  customer_id?: string | null;
+  provider_id?: string | null;
   tags?: Record<string, unknown>;
   custom_fields?: Record<string, unknown>;
 }
@@ -6690,3 +6696,240 @@ export interface BGPCommunityUpdate {
   outbound_action?: string;
   tags?: Record<string, unknown>;
 }
+
+// ── Logical ownership entities (issue #91) ─────────────────────────
+//
+// Customer / Site / Provider are first-class operator-facing rows that
+// cross-cut IPAM / DNS / DHCP. The cross-reference FK columns
+// (subnet.customer_id, ip_block.site_id, dns_zone.customer_id, …) are
+// nullable on day one so existing trees stay valid; operators tag
+// resources at whatever level the assignment is meaningful.
+
+export type CustomerStatus = "active" | "inactive" | "decommissioning";
+
+export interface CustomerRead {
+  id: string;
+  name: string;
+  account_number: string | null;
+  contact_email: string | null;
+  contact_phone: string | null;
+  contact_address: string | null;
+  status: CustomerStatus;
+  notes: string;
+  tags: Record<string, unknown>;
+  custom_fields: Record<string, unknown>;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface CustomerCreate {
+  name: string;
+  account_number?: string | null;
+  contact_email?: string | null;
+  contact_phone?: string | null;
+  contact_address?: string | null;
+  status?: CustomerStatus;
+  notes?: string;
+  tags?: Record<string, unknown>;
+  custom_fields?: Record<string, unknown>;
+}
+
+export interface CustomerUpdate {
+  name?: string;
+  account_number?: string | null;
+  contact_email?: string | null;
+  contact_phone?: string | null;
+  contact_address?: string | null;
+  status?: CustomerStatus;
+  notes?: string;
+  tags?: Record<string, unknown>;
+  custom_fields?: Record<string, unknown>;
+}
+
+export interface CustomerListResponse {
+  items: CustomerRead[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface CustomerListQuery {
+  limit?: number;
+  offset?: number;
+  status?: CustomerStatus;
+  search?: string;
+}
+
+export const customersApi = {
+  list: (params?: CustomerListQuery) =>
+    api.get<CustomerListResponse>("/customers", { params }).then((r) => r.data),
+  get: (id: string) =>
+    api.get<CustomerRead>(`/customers/${id}`).then((r) => r.data),
+  create: (data: CustomerCreate) =>
+    api.post<CustomerRead>("/customers", data).then((r) => r.data),
+  update: (id: string, data: CustomerUpdate) =>
+    api.put<CustomerRead>(`/customers/${id}`, data).then((r) => r.data),
+  remove: (id: string) => api.delete(`/customers/${id}`),
+  bulkDelete: (ids: string[]) =>
+    api
+      .post<{ deleted: number; not_found: string[] }>(
+        "/customers/bulk-delete",
+        {
+          ids,
+        },
+      )
+      .then((r) => r.data),
+};
+
+export type SiteKind =
+  | "datacenter"
+  | "branch"
+  | "pop"
+  | "colo"
+  | "cloud_region"
+  | "customer_premise";
+
+export interface SiteRead {
+  id: string;
+  name: string;
+  code: string | null;
+  kind: SiteKind;
+  region: string | null;
+  parent_site_id: string | null;
+  notes: string;
+  tags: Record<string, unknown>;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface SiteCreate {
+  name: string;
+  code?: string | null;
+  kind?: SiteKind;
+  region?: string | null;
+  parent_site_id?: string | null;
+  notes?: string;
+  tags?: Record<string, unknown>;
+}
+
+export interface SiteUpdate {
+  name?: string;
+  code?: string | null;
+  kind?: SiteKind;
+  region?: string | null;
+  parent_site_id?: string | null;
+  notes?: string;
+  tags?: Record<string, unknown>;
+}
+
+export interface SiteListResponse {
+  items: SiteRead[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface SiteListQuery {
+  limit?: number;
+  offset?: number;
+  kind?: SiteKind;
+  region?: string;
+  parent_site_id?: string;
+  search?: string;
+}
+
+export const sitesApi = {
+  list: (params?: SiteListQuery) =>
+    api.get<SiteListResponse>("/sites", { params }).then((r) => r.data),
+  get: (id: string) => api.get<SiteRead>(`/sites/${id}`).then((r) => r.data),
+  create: (data: SiteCreate) =>
+    api.post<SiteRead>("/sites", data).then((r) => r.data),
+  update: (id: string, data: SiteUpdate) =>
+    api.put<SiteRead>(`/sites/${id}`, data).then((r) => r.data),
+  remove: (id: string) => api.delete(`/sites/${id}`),
+  bulkDelete: (ids: string[]) =>
+    api
+      .post<{ deleted: number; not_found: string[] }>("/sites/bulk-delete", {
+        ids,
+      })
+      .then((r) => r.data),
+};
+
+export type ProviderKind =
+  | "transit"
+  | "peering"
+  | "carrier"
+  | "cloud"
+  | "registrar"
+  | "sdwan_vendor";
+
+export interface ProviderRead {
+  id: string;
+  name: string;
+  kind: ProviderKind;
+  account_number: string | null;
+  contact_email: string | null;
+  contact_phone: string | null;
+  notes: string;
+  default_asn_id: string | null;
+  tags: Record<string, unknown>;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface ProviderCreate {
+  name: string;
+  kind?: ProviderKind;
+  account_number?: string | null;
+  contact_email?: string | null;
+  contact_phone?: string | null;
+  notes?: string;
+  default_asn_id?: string | null;
+  tags?: Record<string, unknown>;
+}
+
+export interface ProviderUpdate {
+  name?: string;
+  kind?: ProviderKind;
+  account_number?: string | null;
+  contact_email?: string | null;
+  contact_phone?: string | null;
+  notes?: string;
+  default_asn_id?: string | null;
+  tags?: Record<string, unknown>;
+}
+
+export interface ProviderListResponse {
+  items: ProviderRead[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface ProviderListQuery {
+  limit?: number;
+  offset?: number;
+  kind?: ProviderKind;
+  search?: string;
+}
+
+export const providersApi = {
+  list: (params?: ProviderListQuery) =>
+    api.get<ProviderListResponse>("/providers", { params }).then((r) => r.data),
+  get: (id: string) =>
+    api.get<ProviderRead>(`/providers/${id}`).then((r) => r.data),
+  create: (data: ProviderCreate) =>
+    api.post<ProviderRead>("/providers", data).then((r) => r.data),
+  update: (id: string, data: ProviderUpdate) =>
+    api.put<ProviderRead>(`/providers/${id}`, data).then((r) => r.data),
+  remove: (id: string) => api.delete(`/providers/${id}`),
+  bulkDelete: (ids: string[]) =>
+    api
+      .post<{ deleted: number; not_found: string[] }>(
+        "/providers/bulk-delete",
+        {
+          ids,
+        },
+      )
+      .then((r) => r.data),
+};

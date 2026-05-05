@@ -73,7 +73,8 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
     ),
     "IPAM Editor": (
         "Full CRUD on IPAM objects (spaces, blocks, subnets, addresses, VLANs, "
-        "NAT mappings, custom fields, IPAM templates).",
+        "NAT mappings, custom fields, IPAM templates) plus the logical "
+        "ownership tags (customer / site / provider) IPAM rows reference.",
         [
             {"action": "admin", "resource_type": "ip_space"},
             {"action": "admin", "resource_type": "ip_block"},
@@ -83,6 +84,9 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
             {"action": "admin", "resource_type": "nat_mapping"},
             {"action": "admin", "resource_type": "custom_field"},
             {"action": "admin", "resource_type": "manage_ipam_templates"},
+            {"action": "admin", "resource_type": "customer"},
+            {"action": "admin", "resource_type": "site"},
+            {"action": "admin", "resource_type": "provider"},
         ],
     ),
     "DNS Editor": (
@@ -110,12 +114,17 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
     ),
     "Network Editor": (
         "Full CRUD on SNMP-polled network devices (routers, switches, APs), "
-        "on-demand nmap scans, the ASN registry, and VRFs.",
+        "on-demand nmap scans, the ASN registry, VRFs, and the logical "
+        "ownership tags (customer / site / provider) those entities "
+        "reference.",
         [
             {"action": "admin", "resource_type": "manage_network_devices"},
             {"action": "admin", "resource_type": "manage_nmap_scans"},
             {"action": "admin", "resource_type": "manage_asns"},
             {"action": "admin", "resource_type": "vrf"},
+            {"action": "admin", "resource_type": "customer"},
+            {"action": "admin", "resource_type": "site"},
+            {"action": "admin", "resource_type": "provider"},
         ],
     ),
 }

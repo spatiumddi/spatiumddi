@@ -132,6 +132,23 @@ class ASN(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         passive_deletes=True,
     )
 
+    # Logical ownership (issue #91). ``customer_id`` is the operator
+    # owning the AS; ``provider_id`` is the upstream we lease /
+    # peer through. Both nullable, both ``ON DELETE SET NULL`` so
+    # tag deletions never cascade into AS rows.
+    customer_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("customer.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    provider_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("provider.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
 
 class ASNRpkiRoa(UUIDPrimaryKeyMixin, Base):
     """RPKI Route Origin Authorization (ROA) — `(asn, prefix, max_length)`

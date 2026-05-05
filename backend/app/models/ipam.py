@@ -142,6 +142,16 @@ class IPSpace(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
         index=True,
     )
 
+    # Logical ownership (issue #91). Spaces are routing domains and
+    # are deliberately not ``site``-scoped — that lives on subnets /
+    # blocks where it has crisp meaning.
+    customer_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("customer.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
     blocks: Mapped[list["IPBlock"]] = relationship(
         "IPBlock", back_populates="space", cascade="all, delete-orphan"
     )
@@ -294,6 +304,22 @@ class IPBlock(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     asn_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("asn.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
+    # Logical ownership (issue #91). Inheritance is *not* implicit —
+    # the issue ships an ownership tag, not a walk. Operators set
+    # the tag explicitly at the level they want to query on.
+    customer_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("customer.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    site_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("site.id", ondelete="SET NULL"),
         nullable=True,
         index=True,
     )
@@ -553,6 +579,23 @@ class Subnet(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
 
     custom_fields: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     tags: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+
+    # Logical ownership (issue #91). Same shape as IPBlock — explicit,
+    # no inheritance walk. Operators set these at the subnet level
+    # when the customer / site only owns the subnet, or up at the
+    # block level when the assignment is broader.
+    customer_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("customer.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    site_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("site.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
 
     # Back-reference to the IPAMTemplate (issue #26) that stamped this
     # subnet, if any. SET NULL on template delete.

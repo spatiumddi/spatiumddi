@@ -84,6 +84,8 @@ class ASNUpdate(BaseModel):
     name: str | None = None
     description: str | None = None
     holder_org: str | None = None
+    customer_id: uuid.UUID | None = None
+    provider_id: uuid.UUID | None = None
     tags: dict[str, Any] | None = None
     custom_fields: dict[str, Any] | None = None
 
@@ -99,6 +101,8 @@ class ASNRead(BaseModel):
     whois_last_checked_at: datetime | None
     whois_data: dict[str, Any] | None
     whois_state: str
+    customer_id: uuid.UUID | None
+    provider_id: uuid.UUID | None
     tags: dict[str, Any]
     custom_fields: dict[str, Any]
     created_at: datetime
@@ -130,6 +134,8 @@ async def list_asns(
     kind: Literal["public", "private"] | None = Query(default=None),
     registry: str | None = Query(default=None, description="RIR code, or `unknown`"),
     whois_state: Literal["ok", "drift", "unreachable", "n/a"] | None = Query(default=None),
+    customer_id: uuid.UUID | None = Query(default=None),
+    provider_id: uuid.UUID | None = Query(default=None),
     search: str | None = Query(
         default=None,
         description="Free-text match against number / name / holder_org (case-insensitive substring).",
@@ -148,6 +154,10 @@ async def list_asns(
         stmt = stmt.where(ASN.registry == registry)
     if whois_state is not None:
         stmt = stmt.where(ASN.whois_state == whois_state)
+    if customer_id is not None:
+        stmt = stmt.where(ASN.customer_id == customer_id)
+    if provider_id is not None:
+        stmt = stmt.where(ASN.provider_id == provider_id)
     if search:
         # Case-insensitive substring on the three operator-facing
         # fields. ``number`` is BigInteger so we cast to text for the

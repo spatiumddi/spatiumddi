@@ -84,5 +84,16 @@ class VRF(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         JSONB, nullable=False, default=dict, server_default="{}"
     )
 
+    # Logical ownership (issue #91). VRFs are tenant-scoped routing
+    # domains; the customer FK lets the new "Customer detail" surface
+    # gather everything (subnets / blocks / VRFs / zones) into one
+    # operator view.
+    customer_id: Mapped[str | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("customer.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+
 
 __all__ = ["VRF"]

@@ -418,6 +418,7 @@ async def list_vrfs(
     current_user: CurrentUser,
     db: DB,
     asn_id: uuid.UUID | None = Query(None),
+    customer_id: uuid.UUID | None = Query(None),
     search: str | None = Query(None, description="Substring match against name or RD"),
     limit: int = Query(500, ge=1, le=2000),
     offset: int = Query(0, ge=0),
@@ -425,6 +426,8 @@ async def list_vrfs(
     q = select(VRF).order_by(VRF.name)
     if asn_id is not None:
         q = q.where(VRF.asn_id == asn_id)
+    if customer_id is not None:
+        q = q.where(VRF.customer_id == customer_id)
     if search:
         like = f"%{search}%"
         q = q.where(

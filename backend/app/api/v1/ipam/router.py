@@ -1339,6 +1339,8 @@ class IPSpaceCreate(BaseModel):
     route_distinguisher: str | None = None
     route_targets: list[str] | None = None
     asn_id: uuid.UUID | None = None
+    # Logical ownership (issue #91).
+    customer_id: uuid.UUID | None = None
 
     @field_validator("color")
     @classmethod
@@ -1378,6 +1380,7 @@ class IPSpaceUpdate(BaseModel):
     route_distinguisher: str | None = None
     route_targets: list[str] | None = None
     asn_id: uuid.UUID | None = None
+    customer_id: uuid.UUID | None = None
 
     @field_validator("color")
     @classmethod
@@ -1414,6 +1417,7 @@ class IPSpaceResponse(BaseModel):
     route_distinguisher: str | None = None
     route_targets: list[str] | None = None
     asn_id: uuid.UUID | None = None
+    customer_id: uuid.UUID | None = None
     created_at: datetime
     modified_at: datetime
 
@@ -1450,6 +1454,9 @@ class IPBlockCreate(BaseModel):
     ddns_inherit_settings: bool = True
     asn_id: uuid.UUID | None = None
     vrf_id: uuid.UUID | None = None
+    # Logical ownership (issue #91).
+    customer_id: uuid.UUID | None = None
+    site_id: uuid.UUID | None = None
     # Optional IPAM template (issue #26). When set, the matching
     # template's defaults pre-fill any operator-supplied fields that
     # are still empty before the row commits. Operator overrides
@@ -1495,6 +1502,8 @@ class IPBlockUpdate(BaseModel):
     ddns_inherit_settings: bool | None = None
     asn_id: uuid.UUID | None = None
     vrf_id: uuid.UUID | None = None
+    customer_id: uuid.UUID | None = None
+    site_id: uuid.UUID | None = None
 
     @field_validator("ddns_hostname_policy")
     @classmethod
@@ -1532,6 +1541,8 @@ class IPBlockResponse(BaseModel):
     # at least one is unset.
     vrf_warning: str | None = None
     asn_id: uuid.UUID | None = None
+    customer_id: uuid.UUID | None = None
+    site_id: uuid.UUID | None = None
     applied_template_id: uuid.UUID | None = None
     created_at: datetime
     modified_at: datetime
@@ -1596,6 +1607,9 @@ class SubnetCreate(BaseModel):
     pci_scope: bool = False
     hipaa_scope: bool = False
     internet_facing: bool = False
+    # Logical ownership (issue #91).
+    customer_id: uuid.UUID | None = None
+    site_id: uuid.UUID | None = None
     # Optional IPAM template (issue #26). Same pre-fill semantics as
     # IPBlockCreate.template_id — operator-supplied fields win.
     template_id: uuid.UUID | None = None
@@ -1702,6 +1716,8 @@ class SubnetUpdate(BaseModel):
     pci_scope: bool | None = None
     hipaa_scope: bool | None = None
     internet_facing: bool | None = None
+    customer_id: uuid.UUID | None = None
+    site_id: uuid.UUID | None = None
 
     @field_validator("ipv6_allocation_policy")
     @classmethod
@@ -1814,6 +1830,8 @@ class SubnetResponse(BaseModel):
     pci_scope: bool = False
     hipaa_scope: bool = False
     internet_facing: bool = False
+    customer_id: uuid.UUID | None = None
+    site_id: uuid.UUID | None = None
     applied_template_id: uuid.UUID | None = None
     created_at: datetime
     modified_at: datetime
@@ -2116,8 +2134,15 @@ class NextIPRequest(BaseModel):
 
 
 @router.get("/spaces", response_model=list[IPSpaceResponse])
-async def list_spaces(current_user: CurrentUser, db: DB) -> list[IPSpace]:
-    result = await db.execute(select(IPSpace).order_by(IPSpace.name))
+async def list_spaces(
+    current_user: CurrentUser,
+    db: DB,
+    customer_id: uuid.UUID | None = None,
+) -> list[IPSpace]:
+    query = select(IPSpace).order_by(IPSpace.name)
+    if customer_id is not None:
+        query = query.where(IPSpace.customer_id == customer_id)
+    result = await db.execute(query)
     return list(result.scalars().all())
 
 
@@ -2391,6 +2416,10 @@ def _block_to_response(block: IPBlock, vrf_warning: str | None) -> dict[str, Any
         "ddns_inherit_settings": block.ddns_inherit_settings,
         "vrf_id": block.vrf_id,
         "vrf_warning": vrf_warning,
+        "asn_id": block.asn_id,
+        "customer_id": block.customer_id,
+        "site_id": block.site_id,
+        "applied_template_id": block.applied_template_id,
         "created_at": block.created_at,
         "modified_at": block.modified_at,
     }
@@ -2401,10 +2430,16 @@ async def list_blocks(
     current_user: CurrentUser,
     db: DB,
     space_id: uuid.UUID | None = None,
+    customer_id: uuid.UUID | None = None,
+    site_id: uuid.UUID | None = None,
 ) -> list[dict[str, Any]]:
     query = select(IPBlock).order_by(IPBlock.network)
     if space_id:
         query = query.where(IPBlock.space_id == space_id)
+    if customer_id is not None:
+        query = query.where(IPBlock.customer_id == customer_id)
+    if site_id is not None:
+        query = query.where(IPBlock.site_id == site_id)
     result = await db.execute(query)
     blocks = list(result.scalars().all())
     space_vrf_cache: dict[uuid.UUID, uuid.UUID | None] = {}
@@ -3181,6 +3216,8 @@ async def list_subnets(
     pci_scope: bool | None = None,
     hipaa_scope: bool | None = None,
     internet_facing: bool | None = None,
+    customer_id: uuid.UUID | None = None,
+    site_id: uuid.UUID | None = None,
 ) -> list[Subnet]:
     query = select(Subnet).order_by(Subnet.network)
     if space_id:
@@ -3195,6 +3232,10 @@ async def list_subnets(
         query = query.where(Subnet.hipaa_scope == hipaa_scope)
     if internet_facing is not None:
         query = query.where(Subnet.internet_facing == internet_facing)
+    if customer_id is not None:
+        query = query.where(Subnet.customer_id == customer_id)
+    if site_id is not None:
+        query = query.where(Subnet.site_id == site_id)
     result = await db.execute(query)
     return list(result.scalars().all())
 

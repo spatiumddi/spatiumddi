@@ -23,8 +23,10 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Index, String
-from sqlalchemy.dialects.postgresql import JSONB
+import uuid
+
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, String
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base, TimestampMixin, UUIDPrimaryKeyMixin
@@ -102,6 +104,26 @@ class Domain(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     tags: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict, server_default="{}")
     custom_fields: Mapped[dict] = mapped_column(
         JSONB, nullable=False, default=dict, server_default="{}"
+    )
+
+    # Logical ownership (issue #91).
+    #
+    # ``registrar_provider_id`` is the FK successor to the freeform
+    # ``registrar`` text column above. The text column stays through
+    # this release for back-compat — the issue defers the
+    # text-to-FK backfill to a follow-up so existing operator-
+    # populated values aren't silently lost on a name mismatch.
+    customer_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("customer.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    registrar_provider_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("provider.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
     )
 
 
