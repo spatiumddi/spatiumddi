@@ -83,6 +83,14 @@ class AIProvider(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # *new* sessions — existing sessions snapshot the prompt at
     # creation time on ``AIChatSession.system_prompt``.
     system_prompt_override: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # Optional per-provider tool allowlist. NULL → all registered
+    # tools enabled (default for new + existing rows). Empty list ``[]``
+    # = no tools at all (rare; useful for chat-only providers). Non-empty
+    # list = exactly these tools. Names that no longer match a
+    # registered tool are silently skipped at request-build time so the
+    # provider doesn't blow up after a tool rename — the admin sees the
+    # stale entry in the modal and can clear it.
+    enabled_tools: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
 
 
 CHAT_ROLES: tuple[str, ...] = ("system", "user", "assistant", "tool")

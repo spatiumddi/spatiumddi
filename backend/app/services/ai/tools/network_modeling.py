@@ -478,7 +478,7 @@ async def list_network_services(
             .where(NetworkServiceResource.service_id.in_([r.id for r in rows]))
             .group_by(NetworkServiceResource.service_id)
         )
-        counts = dict(cnt_rows.all())
+        counts = {row[0]: row[1] for row in cnt_rows.all()}
 
     return [
         {
@@ -614,13 +614,13 @@ async def list_overlay_networks(
             .where(OverlaySite.overlay_network_id.in_(ids))
             .group_by(OverlaySite.overlay_network_id)
         )
-        site_counts = dict(sc.all())
+        site_counts = {row[0]: row[1] for row in sc.all()}
         pc = await db.execute(
             select(RoutingPolicy.overlay_network_id, func.count())
             .where(RoutingPolicy.overlay_network_id.in_(ids))
             .group_by(RoutingPolicy.overlay_network_id)
         )
-        policy_counts = dict(pc.all())
+        policy_counts = {row[0]: row[1] for row in pc.all()}
 
     return [
         {

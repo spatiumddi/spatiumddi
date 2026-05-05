@@ -30,6 +30,7 @@ from app.drivers.llm import get_driver
 from app.drivers.llm.registry import known_kinds
 from app.models.ai import AI_PROVIDER_KINDS, AIProvider
 from app.services.ai.chat import _STATIC_SYSTEM_PROMPT
+from app.services.ai.tools import REGISTRY
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()
@@ -54,6 +55,9 @@ class ProviderCreate(BaseModel):
     # Optional Operator Copilot system-prompt override for sessions
     # that pick this provider. NULL/empty → baked-in default.
     system_prompt_override: str | None = None
+    # NULL = all tools enabled (default). Empty list = no tools.
+    # Non-empty list = exactly those tool names.
+    enabled_tools: list[str] | None = None
 
     @field_validator("kind")
     @classmethod
@@ -82,6 +86,12 @@ class ProviderUpdate(BaseModel):
     # None → leave override unchanged. ``""`` → clear (revert to
     # default). Non-empty → replace.
     system_prompt_override: str | None = None
+    # ``model_config={"extra":"ignore"}`` plus a sentinel: when the
+    # client wants to set this back to NULL ("revert to all enabled"),
+    # they explicitly send ``enabled_tools: null``. Pydantic
+    # ``exclude_unset`` distinguishes "absent → leave unchanged" from
+    # "explicit null → clear column".
+    enabled_tools: list[str] | None = None
 
 
 class ProviderResponse(BaseModel):
@@ -95,12 +105,24 @@ class ProviderResponse(BaseModel):
     priority: int
     options: dict[str, Any]
     system_prompt_override: str | None
+    enabled_tools: list[str] | None
     created_at: datetime
     modified_at: datetime
 
 
 class DefaultSystemPromptResponse(BaseModel):
     prompt: str
+
+
+class ToolCatalogEntry(BaseModel):
+    name: str
+    description: str
+    category: str
+    writes: bool
+
+
+class ToolCatalogResponse(BaseModel):
+    tools: list[ToolCatalogEntry]
 
 
 class TestConnectionRequest(BaseModel):
@@ -141,6 +163,7 @@ def _to_response(p: AIProvider) -> ProviderResponse:
         priority=p.priority,
         options=p.options or {},
         system_prompt_override=p.system_prompt_override,
+        enabled_tools=p.enabled_tools,
         created_at=p.created_at,
         modified_at=p.modified_at,
     )
@@ -206,6 +229,7 @@ async def create_provider(
         system_prompt_override=(
             body.system_prompt_override if body.system_prompt_override else None
         ),
+        enabled_tools=body.enabled_tools,
     )
     db.add(row)
     try:
@@ -232,6 +256,36 @@ async def create_provider(
     await db.refresh(row)
     logger.info("ai_provider_created", provider_id=str(row.id), kind=row.kind)
     return _to_response(row)
+
+
+@router.get(
+    "/providers/tools",
+    response_model=ToolCatalogResponse,
+)
+async def get_tool_catalog(current_user: SuperAdmin) -> ToolCatalogResponse:
+    """Return every registered Operator Copilot tool with its name,
+    description, category, and writes flag.
+
+    Used by the AI Provider modal's Tools tab to render the
+    category-grouped checkbox list. Read-only — does not depend on
+    DB state, so it stays useful for "preview the registry"
+    workflows independent of any saved provider.
+
+    Registered ahead of ``GET /providers/{provider_id}`` for the
+    same reason as default-system-prompt — Starlette matches by
+    path template.
+    """
+    return ToolCatalogResponse(
+        tools=[
+            ToolCatalogEntry(
+                name=t.name,
+                description=t.description,
+                category=t.category,
+                writes=t.writes,
+            )
+            for t in sorted(REGISTRY.all(), key=lambda x: (x.category, x.name))
+        ]
+    )
 
 
 @router.get(
@@ -285,6 +339,11 @@ async def update_provider(
             # override (= revert to default); a non-empty string
             # replaces it.
             row.system_prompt_override = v if v else None
+        elif k == "enabled_tools":
+            # ``exclude_unset`` distinguishes "absent" from "explicit
+            # null" — explicit null lands here as ``v is None`` and
+            # clears the column (revert to "all enabled").
+            row.enabled_tools = v
         else:
             setattr(row, k, v)
     try:

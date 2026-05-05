@@ -553,7 +553,15 @@ class ChatOrchestrator:
             if row is None or row.user_id != self.user.id:
                 raise PermissionError("session not found or not yours")
             return row
-        tools = REGISTRY.read_only()
+        # System prompt's "Tools available: N" line should reflect
+        # what's actually surfaced to this provider's session — if the
+        # operator narrowed the allowlist for a small model, the
+        # prompt should agree.
+        if provider is not None and provider.enabled_tools is not None:
+            allowed = set(provider.enabled_tools)
+            tools = [t for t in REGISTRY.read_only() if t.name in allowed]
+        else:
+            tools = REGISTRY.read_only()
         system_prompt = await build_system_prompt(self.db, self.user, tools, provider)
         # "Ask AI about this" — operator clicked a context affordance
         # in the IPAM / DNS / DHCP UI; the frontend supplied a
@@ -633,14 +641,31 @@ class ChatOrchestrator:
         return msgs
 
     @staticmethod
-    def _tools_for_request() -> list[ToolDefinition]:
+    def _tools_for_request(provider: AIProvider | None = None) -> list[ToolDefinition]:
+        """Build the tools-schema list to send to the LLM.
+
+        Honours ``AIProvider.enabled_tools`` when set:
+            * NULL  → all registered tools enabled (default)
+            * []    → no tools at all
+            * [...] → only those tool names
+
+        Names that no longer match a registered tool are silently
+        skipped — keeps a provider working through tool renames /
+        removals without 500'ing on every chat turn.
+        """
+        all_tools = REGISTRY.read_only()
+        if provider is not None and provider.enabled_tools is not None:
+            allowed = set(provider.enabled_tools)
+            filtered = [t for t in all_tools if t.name in allowed]
+        else:
+            filtered = all_tools
         return [
             ToolDefinition(
                 name=t.name,
                 description=t.description,
                 parameters=t.parameters_schema(),
             )
-            for t in REGISTRY.read_only()
+            for t in filtered
         ]
 
     async def _build_fallback_chain(self, primary: AIProvider) -> list[AIProvider]:
@@ -711,7 +736,7 @@ class ChatOrchestrator:
         # operator needs to see, not transient infrastructure flaps.
         # The snapshot stays untouched; the next turn tries primary again.
         fallback_chain = await self._build_fallback_chain(provider)
-        tools = self._tools_for_request()
+        tools = self._tools_for_request(provider)
 
         # Per-turn duplicate-call tracker. Some smaller open-weight
         # models loop on a successful tool call (we've seen qwen2.5:7b

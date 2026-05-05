@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   CheckCircle2,
@@ -21,6 +21,7 @@ import {
   type AIProviderKind,
   type AIProviderUpdate,
   type AITestConnectionResult,
+  type AIToolCatalogEntry,
 } from "@/lib/api";
 import { Modal, ModalTabs } from "@/components/ui/modal";
 
@@ -41,6 +42,8 @@ interface ProviderForm {
   // null on edit = leave override unchanged. "" = clear (revert to
   // baked-in default). Non-empty = use as override.
   system_prompt_override: string | null;
+  // null sentinel = "all enabled" (default). Set = exactly these tools.
+  enabled_tools: string[] | null;
 }
 
 const EMPTY: ProviderForm = {
@@ -53,6 +56,8 @@ const EMPTY: ProviderForm = {
   priority: "100",
   optionsJson: "{}",
   system_prompt_override: "",
+  // Default = all tools enabled (null sentinel = "no allowlist").
+  enabled_tools: null,
 };
 
 function formFromProvider(p: AIProvider): ProviderForm {
@@ -73,6 +78,7 @@ function formFromProvider(p: AIProvider): ProviderForm {
     // "null". The save path collapses an empty string back to
     // "no override" on the wire.
     system_prompt_override: p.system_prompt_override ?? "",
+    enabled_tools: p.enabled_tools,
   };
 }
 
@@ -100,6 +106,7 @@ function toCreatePayload(form: ProviderForm): AIProviderCreate {
       form.system_prompt_override && form.system_prompt_override.trim()
         ? form.system_prompt_override
         : null,
+    enabled_tools: form.enabled_tools,
   };
 }
 
@@ -131,6 +138,10 @@ function toUpdatePayload(form: ProviderForm): AIProviderUpdate {
   // so any save will carry the operator's intent. Empty string =
   // explicit clear (revert to default).
   update.system_prompt_override = form.system_prompt_override ?? "";
+  // ``enabled_tools`` carries explicit null on the wire to clear the
+  // allowlist (revert to "all enabled"). Pydantic's exclude_unset
+  // distinguishes that from absent on the backend.
+  update.enabled_tools = form.enabled_tools;
   return update;
 }
 
@@ -156,7 +167,9 @@ function ProviderEditor({
   onTest: (form: ProviderForm) => void;
 }) {
   const [form, setForm] = useState<ProviderForm>(initial);
-  const [tab, setTab] = useState<"connection" | "system_prompt">("connection");
+  const [tab, setTab] = useState<"connection" | "system_prompt" | "tools">(
+    "connection",
+  );
   const { data: defaultPrompt = "", isLoading: defaultPromptLoading } =
     useQuery({
       queryKey: ["ai-default-system-prompt"],
@@ -164,6 +177,13 @@ function ProviderEditor({
       // Static text — never changes within a session.
       staleTime: Infinity,
     });
+  const { data: toolCatalog = [], isLoading: toolCatalogLoading } = useQuery({
+    queryKey: ["ai-tool-catalog"],
+    queryFn: aiApi.getToolCatalog,
+    // Catalog only changes on backend deploy — refresh once per
+    // mount is plenty.
+    staleTime: 5 * 60 * 1000,
+  });
 
   function set<K extends keyof ProviderForm>(key: K, v: ProviderForm[K]) {
     setForm((p) => ({ ...p, [key]: v }));
@@ -186,6 +206,7 @@ function ProviderEditor({
           tabs={[
             { key: "connection", label: "Connection" },
             { key: "system_prompt", label: "System prompt" },
+            { key: "tools", label: "Tools" },
           ]}
           active={tab}
           onChange={setTab}
@@ -467,6 +488,15 @@ function ProviderEditor({
           </div>
         )}
 
+        {tab === "tools" && (
+          <ToolsAllowlistEditor
+            catalog={toolCatalog}
+            catalogLoading={toolCatalogLoading}
+            value={form.enabled_tools}
+            onChange={(next) => set("enabled_tools", next)}
+          />
+        )}
+
         <div className="flex items-center justify-between gap-2 border-t pt-3">
           <button
             disabled={testing || !form.name.trim()}
@@ -498,6 +528,155 @@ function ProviderEditor({
         </div>
       </div>
     </Modal>
+  );
+}
+
+/** Per-provider tool allowlist editor.
+ *
+ *  Renders the tool catalog grouped by category with a checkbox for
+ *  every tool. ``value === null`` means "all enabled" (the default);
+ *  the editor pre-fills checkboxes from the full catalog in that
+ *  state and only converts to an explicit allowlist on the first
+ *  uncheck. Saving with every box checked writes ``null`` back so the
+ *  provider stays on "use whatever the registry has" rather than
+ *  pinning a snapshot.
+ */
+function ToolsAllowlistEditor({
+  catalog,
+  catalogLoading,
+  value,
+  onChange,
+}: {
+  catalog: AIToolCatalogEntry[];
+  catalogLoading: boolean;
+  value: string[] | null;
+  onChange: (next: string[] | null) => void;
+}) {
+  // The set of tool names currently *enabled* on this provider. When
+  // ``value === null``, everything in the catalog is implicitly on.
+  const enabledSet = useMemo<Set<string>>(() => {
+    if (value === null) return new Set(catalog.map((t) => t.name));
+    return new Set(value);
+  }, [value, catalog]);
+
+  const allEnabled = value === null || enabledSet.size === catalog.length;
+
+  function toggle(name: string) {
+    const next = new Set(enabledSet);
+    if (next.has(name)) next.delete(name);
+    else next.add(name);
+    // Collapse "all enabled" back to null so we don't pin a stale
+    // allowlist if a new tool ships later.
+    if (next.size === catalog.length) {
+      onChange(null);
+    } else {
+      onChange(Array.from(next).sort());
+    }
+  }
+
+  function enableAll() {
+    onChange(null);
+  }
+  function disableAll() {
+    onChange([]);
+  }
+
+  // Group by category for display.
+  const byCategory = useMemo<[string, AIToolCatalogEntry[]][]>(() => {
+    const map = new Map<string, AIToolCatalogEntry[]>();
+    for (const t of catalog) {
+      const list = map.get(t.category) ?? [];
+      list.push(t);
+      map.set(t.category, list);
+    }
+    return [...map.entries()].sort(([a], [b]) => a.localeCompare(b));
+  }, [catalog]);
+
+  if (catalogLoading) {
+    return (
+      <div className="flex items-center gap-2 text-xs text-muted-foreground">
+        <Loader2 className="h-3 w-3 animate-spin" /> Loading tool catalog…
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-3">
+      <div className="rounded-md border border-blue-500/30 bg-blue-500/5 px-3 py-2 text-xs text-blue-800 dark:text-blue-300">
+        Pick which tools the Operator Copilot can call when this provider is
+        active. Useful for narrowing the surface for small local models that
+        struggle with too many tools, or for read-only kiosk providers. Default:
+        every tool enabled. Changes apply to <strong>new chat sessions</strong>{" "}
+        — existing sessions snapshot the active list at creation.
+      </div>
+
+      <div className="flex items-center justify-between gap-2 text-xs">
+        <span className="text-muted-foreground">
+          {allEnabled
+            ? `All ${catalog.length} tools enabled`
+            : `${enabledSet.size} of ${catalog.length} tools enabled`}
+        </span>
+        <div className="flex gap-2">
+          <button
+            type="button"
+            onClick={enableAll}
+            disabled={allEnabled}
+            className="rounded border px-2 py-0.5 hover:bg-accent disabled:opacity-50"
+          >
+            Enable all (default)
+          </button>
+          <button
+            type="button"
+            onClick={disableAll}
+            disabled={enabledSet.size === 0}
+            className="rounded border px-2 py-0.5 hover:bg-accent disabled:opacity-50"
+          >
+            Disable all
+          </button>
+        </div>
+      </div>
+
+      <div className="max-h-[55vh] space-y-3 overflow-y-auto rounded-md border bg-muted/20 p-3">
+        {byCategory.map(([category, tools]) => (
+          <div key={category}>
+            <div className="mb-1 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+              {category}
+            </div>
+            <div className="space-y-1">
+              {tools.map((t) => {
+                const checked = enabledSet.has(t.name);
+                return (
+                  <label
+                    key={t.name}
+                    className="flex cursor-pointer items-start gap-2 rounded px-2 py-1 hover:bg-accent/50"
+                  >
+                    <input
+                      type="checkbox"
+                      checked={checked}
+                      onChange={() => toggle(t.name)}
+                      className="mt-0.5 h-3.5 w-3.5 shrink-0 cursor-pointer accent-primary"
+                    />
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-center gap-2">
+                        <code className="font-mono text-[12px]">{t.name}</code>
+                        {t.writes && (
+                          <span className="rounded border border-amber-500/30 bg-amber-500/10 px-1 py-0.5 text-[9px] font-medium uppercase tracking-wider text-amber-700 dark:text-amber-300">
+                            write
+                          </span>
+                        )}
+                      </div>
+                      <div className="mt-0.5 text-[11px] leading-snug text-muted-foreground">
+                        {t.description}
+                      </div>
+                    </div>
+                  </label>
+                );
+              })}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
   );
 }
 

@@ -2381,6 +2381,9 @@ export interface AIProvider {
   options: Record<string, unknown>;
   /** null = use the baked-in default Operator Copilot system prompt. */
   system_prompt_override: string | null;
+  /** null = all registered tools enabled (default). [] = no tools.
+   *  list = exactly those tool names (unknown names skipped at runtime). */
+  enabled_tools: string[] | null;
   created_at: string;
   modified_at: string;
 }
@@ -2395,6 +2398,7 @@ export interface AIProviderCreate {
   priority?: number;
   options?: Record<string, unknown>;
   system_prompt_override?: string | null;
+  enabled_tools?: string[] | null;
 }
 
 export interface AIProviderUpdate {
@@ -2407,6 +2411,15 @@ export interface AIProviderUpdate {
   options?: Record<string, unknown>;
   /** null = leave override unchanged; "" = clear (revert to default). */
   system_prompt_override?: string | null;
+  /** null sentinel = revert to "all enabled". Field omitted = no change. */
+  enabled_tools?: string[] | null;
+}
+
+export interface AIToolCatalogEntry {
+  name: string;
+  description: string;
+  category: string;
+  writes: boolean;
 }
 
 export interface AITestConnectionResult {
@@ -2455,6 +2468,10 @@ export const aiApi = {
     api
       .get<{ prompt: string }>("/ai/providers/default-system-prompt")
       .then((r) => r.data.prompt),
+  getToolCatalog: () =>
+    api
+      .get<{ tools: AIToolCatalogEntry[] }>("/ai/providers/tools")
+      .then((r) => r.data.tools),
 
   // ── Chat sessions (Wave 3) ───────────────────────────────────────
   listSessions: (includeArchived = false) =>
