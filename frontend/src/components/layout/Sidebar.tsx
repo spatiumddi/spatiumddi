@@ -9,6 +9,7 @@ import {
   Router as RouterIcon,
   Route as RouteIcon,
   Cable,
+  Code2,
   Github,
   Hash,
   Users,
@@ -106,6 +107,20 @@ const adminInsightsNav = [
   { label: "Compliance", icon: ShieldCheck, to: "/admin/compliance" },
   { label: "Platform Insights", icon: Cpu, to: "/admin/platform-insights" },
   { label: "Trash", icon: Trash2, to: "/admin/trash" },
+];
+
+// External documentation links — opened in a new tab via
+// ``NavExternalItem``. Kept in their own group so the visual
+// separator below the in-app entries reads as "you're leaving the
+// app". Matches the pattern from issue #96 (preferred ReDoc for
+// browsing; Swagger UI for interactive try-it-out).
+const adminReferenceNav: {
+  label: string;
+  icon: React.ElementType;
+  href: string;
+}[] = [
+  { label: "API Docs", icon: Code2, href: "/api/redoc" },
+  { label: "API Docs (interactive)", icon: Code2, href: "/api/docs" },
 ];
 
 function NavSection({
@@ -211,6 +226,47 @@ function NavItem({
       <Icon className="h-4 w-4 flex-shrink-0" />
       {!collapsed && label}
     </NavLink>
+  );
+}
+
+/** External-link variant of :func:`NavItem`. Renders a plain ``<a>``
+ *  rather than a ``NavLink`` so links to non-SPA URLs (FastAPI's
+ *  ``/api/redoc`` etc.) leave the React Router tree cleanly. The
+ *  visual style mirrors ``NavItem``'s inactive state — there's no
+ *  "active" highlighting because we never navigate to it.
+ */
+function NavExternalItem({
+  label,
+  icon: Icon,
+  href,
+  collapsed,
+  title,
+}: {
+  label: string;
+  icon: React.ElementType;
+  href: string;
+  collapsed: boolean;
+  /** Override for the hover tooltip — defaults to the label. Used
+   *  when the collapsed-rail tooltip should differ from the visible
+   *  label (or when an external link wants to advertise it opens
+   *  in a new tab). */
+  title?: string;
+}) {
+  return (
+    <a
+      href={href}
+      target="_blank"
+      rel="noopener noreferrer"
+      title={title ?? (collapsed ? label : `${label} (opens in new tab)`)}
+      className={cn(
+        "flex items-center rounded-md px-3 py-2 text-sm font-medium transition-colors",
+        collapsed ? "justify-center gap-0" : "gap-3",
+        "text-sidebar-foreground/70 hover:bg-sidebar-accent hover:text-sidebar-accent-foreground",
+      )}
+    >
+      <Icon className="h-4 w-4 flex-shrink-0" />
+      {!collapsed && label}
+    </a>
   );
 }
 
@@ -452,6 +508,14 @@ export function Sidebar({
                 {...item}
                 collapsed={effectiveCollapsed}
                 onNavigate={mobileOpen ? onMobileClose : undefined}
+              />
+            ))}
+            <SubNavLabel label="Reference" collapsed={effectiveCollapsed} />
+            {adminReferenceNav.map((item) => (
+              <NavExternalItem
+                key={item.href}
+                {...item}
+                collapsed={effectiveCollapsed}
               />
             ))}
             <div className="my-1 border-t border-sidebar-border/60" />

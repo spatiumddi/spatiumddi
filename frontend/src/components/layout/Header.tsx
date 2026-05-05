@@ -1,7 +1,7 @@
 import { useAuth } from "@/hooks/useAuth";
 import { useTheme } from "@/hooks/useTheme";
 import { Link, useNavigate } from "react-router-dom";
-import { LogOut, Menu, Moon, Sun, UserCircle2 } from "lucide-react";
+import { Code2, LogOut, Menu, Moon, Sun, UserCircle2 } from "lucide-react";
 import { GlobalSearch } from "@/components/GlobalSearch";
 
 export function Header({ onMobileMenu }: { onMobileMenu?: () => void }) {
@@ -28,6 +28,20 @@ export function Header({ onMobileMenu }: { onMobileMenu?: () => void }) {
       <div className="flex-1" />
       <GlobalSearch />
       <div className="flex items-center gap-1">
+        {/* Issue #96 — discoverable API docs link for power users.
+            Sidebar has the labeled entry; this is the muscle-memory
+            shortcut. ReDoc is the primary surface (cleaner browsing);
+            operators who want Swagger UI can take the sidebar entry
+            or jump from ReDoc. */}
+        <a
+          href="/api/redoc"
+          target="_blank"
+          rel="noopener noreferrer"
+          title="API documentation (opens in new tab)"
+          className="rounded-md p-2 text-muted-foreground hover:bg-accent hover:text-accent-foreground"
+        >
+          <Code2 className="h-4 w-4" />
+        </a>
         <Link
           to="/account"
           title="Account — password & two-factor"
