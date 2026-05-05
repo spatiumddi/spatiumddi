@@ -26,7 +26,6 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base, SoftDeleteMixin, TimestampMixin, UUIDPrimaryKeyMixin
 
-
 # Customer status values. ``decommissioning`` flags rows that are
 # winding down so the dashboard / list views can de-emphasise them
 # without deleting the row (operators still want history).

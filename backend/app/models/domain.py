@@ -21,9 +21,8 @@ dialed in independently of the data-model landing.
 
 from __future__ import annotations
 
-from datetime import datetime
-
 import uuid
+from datetime import datetime
 
 from sqlalchemy import Boolean, DateTime, ForeignKey, Index, String
 from sqlalchemy.dialects.postgresql import JSONB, UUID

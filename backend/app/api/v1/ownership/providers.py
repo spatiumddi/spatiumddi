@@ -32,9 +32,7 @@ router = APIRouter(
 )
 
 
-ProviderKind = Literal[
-    "transit", "peering", "carrier", "cloud", "registrar", "sdwan_vendor"
-]
+ProviderKind = Literal["transit", "peering", "carrier", "cloud", "registrar", "sdwan_vendor"]
 
 
 class ProviderCreate(BaseModel):
@@ -139,9 +137,7 @@ async def _check_default_asn(db: Any, asn_id: uuid.UUID | None) -> None:
 async def create_provider(body: ProviderCreate, db: DB, user: CurrentUser) -> ProviderRead:
     existing = await db.scalar(select(Provider).where(Provider.name == body.name))
     if existing is not None:
-        raise HTTPException(
-            status_code=409, detail=f"Provider named {body.name!r} already exists"
-        )
+        raise HTTPException(status_code=409, detail=f"Provider named {body.name!r} already exists")
     await _check_default_asn(db, body.default_asn_id)
 
     row = Provider(
@@ -190,9 +186,7 @@ async def update_provider(
     changes = body.model_dump(exclude_unset=True)
     if "name" in changes and changes["name"] != row.name:
         clash = await db.scalar(
-            select(Provider).where(
-                Provider.name == changes["name"], Provider.id != provider_id
-            )
+            select(Provider).where(Provider.name == changes["name"], Provider.id != provider_id)
         )
         if clash is not None:
             raise HTTPException(
@@ -244,9 +238,7 @@ async def bulk_delete_providers(
     if not body.ids:
         return {"deleted": 0, "not_found": []}
 
-    rows = (
-        (await db.execute(select(Provider).where(Provider.id.in_(body.ids)))).scalars().all()
-    )
+    rows = (await db.execute(select(Provider).where(Provider.id.in_(body.ids)))).scalars().all()
     found_ids = {r.id for r in rows}
     not_found = [str(i) for i in body.ids if i not in found_ids]
 

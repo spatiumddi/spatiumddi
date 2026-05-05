@@ -29,9 +29,7 @@ router = APIRouter(
 )
 
 
-SiteKind = Literal[
-    "datacenter", "branch", "pop", "colo", "cloud_region", "customer_premise"
-]
+SiteKind = Literal["datacenter", "branch", "pop", "colo", "cloud_region", "customer_premise"]
 
 
 class SiteCreate(BaseModel):
@@ -124,7 +122,9 @@ async def list_sites(
     )
 
 
-async def _validate_parent(db: Any, parent_site_id: uuid.UUID | None, self_id: uuid.UUID | None) -> None:
+async def _validate_parent(
+    db: Any, parent_site_id: uuid.UUID | None, self_id: uuid.UUID | None
+) -> None:
     """Reject parents that don't exist or that would create a cycle.
 
     Cycle check is the conservative version: we walk up the parent

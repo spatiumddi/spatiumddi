@@ -290,181 +290,185 @@ export function ProvidersPage() {
   }
 
   return (
-    <div className="space-y-4">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <div className="min-w-0 flex-1">
-          <h1 className="text-xl font-semibold">Providers</h1>
-          <p className="text-sm text-muted-foreground">
-            External organisations supplying network capacity, cloud regions,
-            domain registrations, or SD-WAN services. Tag ASNs and Domains to
-            make "what does Cogent supply us?" a one-click filter.
-          </p>
+    <div className="h-full overflow-auto p-6">
+      <div className="space-y-4">
+        <div className="flex flex-wrap items-start justify-between gap-3">
+          <div className="min-w-0 flex-1">
+            <h1 className="text-xl font-semibold">Providers</h1>
+            <p className="text-sm text-muted-foreground">
+              External organisations supplying network capacity, cloud regions,
+              domain registrations, or SD-WAN services. Tag ASNs and Domains to
+              make "what does Cogent supply us?" a one-click filter.
+            </p>
+          </div>
+          <div className="flex shrink-0 items-center gap-2">
+            <HeaderButton
+              icon={RefreshCw}
+              onClick={() => query.refetch()}
+              iconClassName={query.isFetching ? "animate-spin" : undefined}
+            >
+              Refresh
+            </HeaderButton>
+            <HeaderButton
+              variant="primary"
+              icon={Plus}
+              onClick={() => setShowNew(true)}
+            >
+              New provider
+            </HeaderButton>
+          </div>
         </div>
-        <div className="flex shrink-0 items-center gap-2">
-          <HeaderButton
-            icon={RefreshCw}
-            onClick={() => query.refetch()}
-            iconClassName={query.isFetching ? "animate-spin" : undefined}
+
+        <div className="flex flex-wrap items-center gap-2">
+          <input
+            className={cn(inputCls, "max-w-xs")}
+            placeholder="Search name / account / email…"
+            value={search}
+            onChange={(e) => setSearch(e.target.value)}
+          />
+          <select
+            className={cn(inputCls, "max-w-[180px]")}
+            value={kindFilter}
+            onChange={(e) => setKindFilter(e.target.value as ProviderKind | "")}
           >
-            Refresh
-          </HeaderButton>
-          <HeaderButton
-            variant="primary"
-            icon={Plus}
-            onClick={() => setShowNew(true)}
-          >
-            New provider
-          </HeaderButton>
+            <option value="">All kinds</option>
+            {KINDS.map((k) => (
+              <option key={k} value={k}>
+                {KIND_LABELS[k]}
+              </option>
+            ))}
+          </select>
         </div>
-      </div>
 
-      <div className="flex flex-wrap items-center gap-2">
-        <input
-          className={cn(inputCls, "max-w-xs")}
-          placeholder="Search name / account / email…"
-          value={search}
-          onChange={(e) => setSearch(e.target.value)}
-        />
-        <select
-          className={cn(inputCls, "max-w-[180px]")}
-          value={kindFilter}
-          onChange={(e) => setKindFilter(e.target.value as ProviderKind | "")}
-        >
-          <option value="">All kinds</option>
-          {KINDS.map((k) => (
-            <option key={k} value={k}>
-              {KIND_LABELS[k]}
-            </option>
-          ))}
-        </select>
-      </div>
+        {selectedIds.size > 0 && (
+          <div className="flex items-center justify-between rounded-md border bg-muted/50 px-3 py-2 text-sm">
+            <span>{selectedIds.size} selected</span>
+            <HeaderButton
+              variant="destructive"
+              icon={Trash2}
+              disabled={bulkDelete.isPending}
+              onClick={() => {
+                if (window.confirm(`Delete ${selectedIds.size} provider(s)?`)) {
+                  bulkDelete.mutate(Array.from(selectedIds));
+                }
+              }}
+            >
+              Delete selected
+            </HeaderButton>
+          </div>
+        )}
 
-      {selectedIds.size > 0 && (
-        <div className="flex items-center justify-between rounded-md border bg-muted/50 px-3 py-2 text-sm">
-          <span>{selectedIds.size} selected</span>
-          <HeaderButton
-            variant="destructive"
-            icon={Trash2}
-            disabled={bulkDelete.isPending}
-            onClick={() => {
-              if (window.confirm(`Delete ${selectedIds.size} provider(s)?`)) {
-                bulkDelete.mutate(Array.from(selectedIds));
-              }
-            }}
-          >
-            Delete selected
-          </HeaderButton>
-        </div>
-      )}
-
-      <div className="overflow-x-auto rounded-lg border">
-        <table className="w-full text-sm">
-          <thead className="bg-muted/40 text-xs uppercase tracking-wider text-muted-foreground">
-            <tr>
-              <th className="w-8 px-3 py-2">
-                <input
-                  type="checkbox"
-                  checked={allChecked}
-                  onChange={toggleAll}
-                  aria-label="Select all"
-                />
-              </th>
-              <th className="px-3 py-2 text-left">Name</th>
-              <th className="px-3 py-2 text-left">Kind</th>
-              <th className="px-3 py-2 text-left">Account</th>
-              <th className="px-3 py-2 text-left">Default ASN</th>
-              <th className="px-3 py-2 text-left">Contact</th>
-              <th className="w-24 px-3 py-2 text-right">Actions</th>
-            </tr>
-          </thead>
-          <tbody className={zebraBodyCls}>
-            {query.isLoading && (
+        <div className="overflow-x-auto rounded-lg border">
+          <table className="w-full text-sm">
+            <thead className="bg-muted/40 text-xs uppercase tracking-wider text-muted-foreground">
               <tr>
-                <td
-                  className="px-3 py-6 text-center text-muted-foreground"
-                  colSpan={7}
-                >
-                  Loading…
-                </td>
+                <th className="w-8 px-3 py-2">
+                  <input
+                    type="checkbox"
+                    checked={allChecked}
+                    onChange={toggleAll}
+                    aria-label="Select all"
+                  />
+                </th>
+                <th className="px-3 py-2 text-left">Name</th>
+                <th className="px-3 py-2 text-left">Kind</th>
+                <th className="px-3 py-2 text-left">Account</th>
+                <th className="px-3 py-2 text-left">Default ASN</th>
+                <th className="px-3 py-2 text-left">Contact</th>
+                <th className="w-24 px-3 py-2 text-right">Actions</th>
               </tr>
-            )}
-            {!query.isLoading && items.length === 0 && (
-              <tr>
-                <td
-                  className="px-3 py-6 text-center text-muted-foreground"
-                  colSpan={7}
-                >
-                  No providers yet — click "New provider" to add one.
-                </td>
-              </tr>
-            )}
-            {items.map((p) => {
-              const asnNum = p.default_asn_id
-                ? asnByNumber.get(p.default_asn_id)
-                : undefined;
-              return (
-                <tr key={p.id} className="border-t">
-                  <td className="px-3 py-2">
-                    <input
-                      type="checkbox"
-                      checked={selectedIds.has(p.id)}
-                      onChange={() => toggle(p.id)}
-                    />
-                  </td>
-                  <td className="px-3 py-2 font-medium">{p.name}</td>
-                  <td className="px-3 py-2 text-muted-foreground">
-                    {KIND_LABELS[p.kind]}
-                  </td>
-                  <td className="px-3 py-2 text-muted-foreground">
-                    {p.account_number ?? "—"}
-                  </td>
-                  <td className="px-3 py-2 text-muted-foreground tabular-nums">
-                    {asnNum !== undefined ? `AS${asnNum}` : "—"}
-                  </td>
-                  <td className="px-3 py-2 text-muted-foreground">
-                    {p.contact_email ?? p.contact_phone ?? "—"}
-                  </td>
-                  <td className="px-3 py-2 text-right">
-                    <button
-                      type="button"
-                      title="Edit"
-                      onClick={() => setEditing(p)}
-                      className="rounded p-1 hover:bg-muted"
-                    >
-                      <Pencil className="h-3.5 w-3.5" />
-                    </button>
-                    <button
-                      type="button"
-                      title="Delete"
-                      onClick={() => {
-                        if (window.confirm(`Delete provider "${p.name}"?`)) {
-                          removeOne.mutate(p.id);
-                        }
-                      }}
-                      className="ml-1 rounded p-1 text-destructive hover:bg-destructive/10"
-                    >
-                      <Trash2 className="h-3.5 w-3.5" />
-                    </button>
+            </thead>
+            <tbody className={zebraBodyCls}>
+              {query.isLoading && (
+                <tr>
+                  <td
+                    className="px-3 py-6 text-center text-muted-foreground"
+                    colSpan={7}
+                  >
+                    Loading…
                   </td>
                 </tr>
-              );
-            })}
-          </tbody>
-        </table>
-      </div>
+              )}
+              {!query.isLoading && items.length === 0 && (
+                <tr>
+                  <td
+                    className="px-3 py-6 text-center text-muted-foreground"
+                    colSpan={7}
+                  >
+                    No providers yet — click "New provider" to add one.
+                  </td>
+                </tr>
+              )}
+              {items.map((p) => {
+                const asnNum = p.default_asn_id
+                  ? asnByNumber.get(p.default_asn_id)
+                  : undefined;
+                return (
+                  <tr key={p.id} className="border-t">
+                    <td className="px-3 py-2 align-top">
+                      <input
+                        type="checkbox"
+                        checked={selectedIds.has(p.id)}
+                        onChange={() => toggle(p.id)}
+                      />
+                    </td>
+                    <td className="px-3 py-2 align-top break-words font-medium">
+                      {p.name}
+                    </td>
+                    <td className="px-3 py-2 align-top text-muted-foreground">
+                      {KIND_LABELS[p.kind]}
+                    </td>
+                    <td className="px-3 py-2 align-top break-all text-muted-foreground">
+                      {p.account_number ?? "—"}
+                    </td>
+                    <td className="px-3 py-2 align-top text-muted-foreground tabular-nums">
+                      {asnNum !== undefined ? `AS${asnNum}` : "—"}
+                    </td>
+                    <td className="px-3 py-2 align-top break-all text-muted-foreground">
+                      {p.contact_email ?? p.contact_phone ?? "—"}
+                    </td>
+                    <td className="px-3 py-2 align-top text-right">
+                      <button
+                        type="button"
+                        title="Edit"
+                        onClick={() => setEditing(p)}
+                        className="rounded p-1 hover:bg-muted"
+                      >
+                        <Pencil className="h-3.5 w-3.5" />
+                      </button>
+                      <button
+                        type="button"
+                        title="Delete"
+                        onClick={() => {
+                          if (window.confirm(`Delete provider "${p.name}"?`)) {
+                            removeOne.mutate(p.id);
+                          }
+                        }}
+                        className="ml-1 rounded p-1 text-destructive hover:bg-destructive/10"
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </button>
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
 
-      {showNew && (
-        <ProviderEditorModal
-          existing={null}
-          onClose={() => setShowNew(false)}
-        />
-      )}
-      {editing && (
-        <ProviderEditorModal
-          existing={editing}
-          onClose={() => setEditing(null)}
-        />
-      )}
+        {showNew && (
+          <ProviderEditorModal
+            existing={null}
+            onClose={() => setShowNew(false)}
+          />
+        )}
+        {editing && (
+          <ProviderEditorModal
+            existing={editing}
+            onClose={() => setEditing(null)}
+          />
+        )}
+      </div>
     </div>
   );
 }

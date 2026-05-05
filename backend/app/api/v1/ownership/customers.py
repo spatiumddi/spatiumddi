@@ -137,14 +137,10 @@ async def create_customer(body: CustomerCreate, db: DB, user: CurrentUser) -> Cu
     # the explicit check fires a clean 409 instead of a 500
     # IntegrityError.
     existing = await db.scalar(
-        select(Customer).where(
-            Customer.name == body.name, Customer.deleted_at.is_(None)
-        )
+        select(Customer).where(Customer.name == body.name, Customer.deleted_at.is_(None))
     )
     if existing is not None:
-        raise HTTPException(
-            status_code=409, detail=f"Customer named {body.name!r} already exists"
-        )
+        raise HTTPException(status_code=409, detail=f"Customer named {body.name!r} already exists")
 
     row = Customer(
         name=body.name,
@@ -264,9 +260,7 @@ async def bulk_delete_customers(
     rows = (
         (
             await db.execute(
-                select(Customer).where(
-                    Customer.id.in_(body.ids), Customer.deleted_at.is_(None)
-                )
+                select(Customer).where(Customer.id.in_(body.ids), Customer.deleted_at.is_(None))
             )
         )
         .scalars()
