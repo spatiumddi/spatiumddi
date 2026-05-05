@@ -62,17 +62,29 @@ const baseMainNav = [
   { label: "Subnet Planner", icon: Workflow, to: "/ipam/plans" },
 ];
 
-// Network section — grouped under a non-clickable section header
-// (mirrors Administration). Devices replaces the old top-level
-// "Network" entry; VLANs lifts up from its own top-level slot;
-// VRFs / ASNs are real first-class pages from issues #85 / #86.
-const networkNav = [
-  { label: "ASNs", icon: Hash, to: "/network/asns" },
-  { label: "Circuits", icon: Waypoints, to: "/network/circuits" },
+// Network section — grouped under a collapsible header. As the
+// section grew (4 → 8 items, with #94/#95 still to come), a flat
+// list got hard to scan, so we sub-group it the same way
+// Administration does — ``SubNavLabel`` rows split the contents
+// into two themed bunches:
+//
+// * **Logical** — operator-facing ownership tags from issue #91
+//   (Customers / Sites / Providers). These cross-cut every other
+//   resource type; not network entities themselves.
+// * **Infrastructure** — the actual network entities (ASNs,
+//   Circuits, Devices, VLANs, VRFs).
+//
+// Each list is alphabetised so new entries slot in without
+// reshuffling.
+const networkLogicalNav = [
   { label: "Customers", icon: Briefcase, to: "/network/customers" },
-  { label: "Devices", icon: Cable, to: "/network/devices" },
   { label: "Providers", icon: Truck, to: "/network/providers" },
   { label: "Sites", icon: MapPin, to: "/network/sites" },
+];
+const networkInfrastructureNav = [
+  { label: "ASNs", icon: Hash, to: "/network/asns" },
+  { label: "Circuits", icon: Waypoints, to: "/network/circuits" },
+  { label: "Devices", icon: Cable, to: "/network/devices" },
   { label: "VLANs", icon: RouterIcon, to: "/network/vlans" },
   { label: "VRFs", icon: RouteIcon, to: "/network/vrfs" },
 ];
@@ -428,7 +440,20 @@ export function Sidebar({
             collapsed={effectiveCollapsed}
             showDivider
           >
-            {networkNav.map((item) => (
+            <SubNavLabel label="Logical" collapsed={effectiveCollapsed} />
+            {networkLogicalNav.map((item) => (
+              <NavItem
+                key={item.to}
+                {...item}
+                collapsed={effectiveCollapsed}
+                onNavigate={mobileOpen ? onMobileClose : undefined}
+              />
+            ))}
+            <SubNavLabel
+              label="Infrastructure"
+              collapsed={effectiveCollapsed}
+            />
+            {networkInfrastructureNav.map((item) => (
               <NavItem
                 key={item.to}
                 {...item}
