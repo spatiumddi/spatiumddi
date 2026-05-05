@@ -417,6 +417,16 @@ docker compose up -d
 
 Open `http://localhost:8077` and log in with `admin` / `admin` (you're forced to change the password on first login).
 
+### Seeding demo data
+
+To populate a fresh install with a representative dataset (DNS group + zones + records, DHCP scope + pool, ASNs + BGP peerings, VRFs, IP space + blocks + subnets + ~30 IPs, SNMP-stubbed network devices, VLANs, domains, custom fields, IPAM templates, alert rules, and a few shared AI prompts) — useful for screenshots, demos, or kicking the tyres on the AI Copilot:
+
+```bash
+python3 scripts/seed_demo.py http://localhost:8000 admin <your-password>
+```
+
+Idempotent — re-running the seed swallows 409s and PATCHes existing rows so foreign-key pointers converge as new entities are added in later releases. Out of scope: AI providers (secrets), webhooks (per-deployment URLs), audit-forward targets, API tokens — those need real credentials from you.
+
 ### Upgrading
 
 SpatiumDDI uses CalVer (`YYYY.MM.DD-N`) and ships every component
