@@ -62,6 +62,7 @@ from app.models.network import (
     NetworkInterface,
     NetworkNeighbour,
 )
+from app.models.network_service import NetworkService, NetworkServiceResource
 from app.models.nmap import NmapScan
 from app.models.oui import OUIVendor
 from app.models.ownership import Customer, Provider, Site
@@ -154,4 +155,6 @@ __all__ = [
     "Site",
     "Provider",
     "Circuit",
+    "NetworkService",
+    "NetworkServiceResource",
 ]

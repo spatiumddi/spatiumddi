@@ -74,7 +74,8 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
     "IPAM Editor": (
         "Full CRUD on IPAM objects (spaces, blocks, subnets, addresses, VLANs, "
         "NAT mappings, custom fields, IPAM templates) plus the logical "
-        "ownership tags (customer / site / provider) IPAM rows reference.",
+        "ownership tags (customer / site / provider) IPAM rows reference and "
+        "the customer-deliverable services (#94) those bundles belong to.",
         [
             {"action": "admin", "resource_type": "ip_space"},
             {"action": "admin", "resource_type": "ip_block"},
@@ -87,6 +88,7 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
             {"action": "admin", "resource_type": "customer"},
             {"action": "admin", "resource_type": "site"},
             {"action": "admin", "resource_type": "provider"},
+            {"action": "admin", "resource_type": "network_service"},
         ],
     ),
     "DNS Editor": (
@@ -114,8 +116,9 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
     ),
     "Network Editor": (
         "Full CRUD on SNMP-polled network devices (routers, switches, APs), "
-        "on-demand nmap scans, the ASN registry, VRFs, WAN circuits, and "
-        "the logical ownership tags (customer / site / provider) those "
+        "on-demand nmap scans, the ASN registry, VRFs, WAN circuits, the "
+        "customer-deliverable services (#94) those resources bundle into, "
+        "and the logical ownership tags (customer / site / provider) those "
         "entities reference.",
         [
             {"action": "admin", "resource_type": "manage_network_devices"},
@@ -123,6 +126,7 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
             {"action": "admin", "resource_type": "manage_asns"},
             {"action": "admin", "resource_type": "vrf"},
             {"action": "admin", "resource_type": "circuit"},
+            {"action": "admin", "resource_type": "network_service"},
             {"action": "admin", "resource_type": "customer"},
             {"action": "admin", "resource_type": "site"},
             {"action": "admin", "resource_type": "provider"},
