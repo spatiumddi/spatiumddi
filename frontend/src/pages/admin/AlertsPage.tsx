@@ -480,7 +480,9 @@ export function AlertsPage() {
                             r.threshold_days != null
                               ? `threshold: ${r.threshold_days} days`
                               : null,
-                            r.server_type ? `server type: ${r.server_type}` : null,
+                            r.server_type
+                              ? `server type: ${r.server_type}`
+                              : null,
                             r.enabled ? "enabled" : "disabled",
                             `rule_id: ${r.id}`,
                           ]

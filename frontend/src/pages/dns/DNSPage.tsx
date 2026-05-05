@@ -2354,7 +2354,9 @@ function ZoneDetailView({
                                   context={[
                                     `DNS record ${r.name} ${r.record_type} ${r.value}`,
                                     r.ttl != null ? `TTL: ${r.ttl}` : null,
-                                    r.priority != null ? `priority: ${r.priority}` : null,
+                                    r.priority != null
+                                      ? `priority: ${r.priority}`
+                                      : null,
                                     `zone: ${zone.name}`,
                                     `record_id: ${r.id}`,
                                   ]

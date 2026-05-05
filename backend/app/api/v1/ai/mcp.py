@@ -113,10 +113,16 @@ async def mcp_post(
     """
     try:
         raw = await request.json()
-    except Exception as exc:
+    except Exception:
+        # Don't echo the parser exception back — JSONDecodeError
+        # messages are usually safe but CodeQL py/stack-trace-exposure
+        # tracks any ``{exc}`` to the response, and the constant
+        # message tells the client everything they need to know
+        # (alerts #23 / #24).
+        logger.exception("mcp_bad_json_body")
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"invalid JSON body — {exc}",
+            detail="Request body is not valid JSON.",
         ) from None
 
     if isinstance(raw, list):
@@ -127,8 +133,14 @@ async def mcp_post(
 async def _dispatch_one(raw: Any, db: Any, user: Any) -> dict[str, Any]:
     try:
         req = JSONRPCRequest.model_validate(raw)
-    except Exception as exc:
-        return _err(None, _INVALID_REQUEST, f"invalid JSON-RPC frame — {exc}")
+    except Exception:
+        # Pydantic validation messages contain field paths that are
+        # safe to surface, but CodeQL py/stack-trace-exposure flags
+        # any ``{exc}`` flowing into a response. Send a constant
+        # message and rely on the request id being absent to signal
+        # which frame failed (the spec allows id=null on parse errs).
+        logger.exception("mcp_invalid_jsonrpc_frame")
+        return _err(None, _INVALID_REQUEST, "Invalid JSON-RPC frame.")
 
     method = req.method
     params = req.params or {}
@@ -223,10 +235,10 @@ async def _dispatch_one(raw: Any, db: Any, user: Any) -> dict[str, Any]:
             _METHOD_NOT_FOUND,
             f"method not implemented: {method}",
         )
-    except Exception as exc:  # noqa: BLE001
+    except Exception:  # noqa: BLE001
+        # Full exception (incl. stack) is logged server-side. The
+        # JSON-RPC client gets a constant message — exception strings
+        # can carry SQL fragments, file paths, etc. that CodeQL
+        # py/stack-trace-exposure correctly flags.
         logger.exception("mcp_internal_error", method=method)
-        return _err(
-            req.id,
-            _INTERNAL_ERROR,
-            f"internal error — {type(exc).__name__}: {exc}",
-        )
+        return _err(req.id, _INTERNAL_ERROR, "Internal error.")

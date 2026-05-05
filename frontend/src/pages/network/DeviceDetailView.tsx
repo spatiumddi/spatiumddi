@@ -183,7 +183,9 @@ export function DeviceDetailView() {
                 device.sys_name ? `sys_name: ${device.sys_name}` : null,
                 `SNMP: ${device.snmp_version}`,
                 `last poll status: ${device.last_poll_status ?? "unknown"}`,
-                device.last_poll_at ? `last poll at: ${device.last_poll_at}` : null,
+                device.last_poll_at
+                  ? `last poll at: ${device.last_poll_at}`
+                  : null,
                 device.is_active ? "active" : "inactive",
                 `device_id: ${device.id}`,
               ]

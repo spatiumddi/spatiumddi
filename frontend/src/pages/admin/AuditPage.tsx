@@ -347,7 +347,9 @@ export function AuditPage() {
                               ? ` (${entry.auth_source})`
                               : ""
                           }`,
-                          entry.source_ip ? `source_ip: ${entry.source_ip}` : null,
+                          entry.source_ip
+                            ? `source_ip: ${entry.source_ip}`
+                            : null,
                           `timestamp: ${entry.timestamp}`,
                           `audit_id: ${entry.id}`,
                         ]

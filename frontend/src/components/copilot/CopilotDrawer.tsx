@@ -609,7 +609,9 @@ function ProposalCard({
         <div className="flex items-center gap-2">
           <Sparkles className="h-3.5 w-3.5 text-primary" />
           <span className="font-medium">Proposed: {operation}</span>
-          <span className={`ml-auto rounded border px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wider ${badge.cls}`}>
+          <span
+            className={`ml-auto rounded border px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wider ${badge.cls}`}
+          >
             {badge.text}
           </span>
         </div>

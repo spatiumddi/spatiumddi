@@ -146,11 +146,7 @@ function PromptEditor({
           <button
             type="button"
             onClick={() => onSave(form)}
-            disabled={
-              saving ||
-              !form.name.trim() ||
-              !form.prompt_text.trim()
-            }
+            disabled={saving || !form.name.trim() || !form.prompt_text.trim()}
             className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
           >
             {saving ? "Saving…" : mode === "create" ? "Create" : "Save"}
@@ -296,7 +292,9 @@ export function AIPromptsPage() {
                   <th className="px-4 py-2 text-left font-medium">
                     Description
                   </th>
-                  <th className="px-4 py-2 text-left font-medium">Visibility</th>
+                  <th className="px-4 py-2 text-left font-medium">
+                    Visibility
+                  </th>
                   <th className="px-4 py-2 text-left font-medium">Modified</th>
                   <th className="px-4 py-2" />
                 </tr>

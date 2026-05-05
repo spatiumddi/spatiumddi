@@ -48,13 +48,22 @@ class Operation:
     """One write operation. ``preview`` produces the human-readable
     description (no side effects); ``apply`` performs the mutation
     and returns a JSON-serialisable result.
+
+    The third argument on the callables is typed ``Any`` rather than
+    ``BaseModel`` so concrete operations can declare their args
+    Pydantic subclass directly (mypy treats function args as
+    contravariant — a function that requires
+    ``CreateIPAddressArgs`` is not assignable where ``BaseModel`` is
+    expected). The registry validates against ``args_model`` on
+    dispatch, so the contract is preserved at runtime. Mirrors how
+    ``ToolExecutor`` in ``tools/base.py`` solves the same shape.
     """
 
     name: str
     description: str
     args_model: type[BaseModel]
-    preview: Callable[[AsyncSession, User, BaseModel], Awaitable[PreviewResult]]
-    apply: Callable[[AsyncSession, User, BaseModel], Awaitable[dict[str, Any]]]
+    preview: Callable[[AsyncSession, User, Any], Awaitable[PreviewResult]]
+    apply: Callable[[AsyncSession, User, Any], Awaitable[dict[str, Any]]]
     # Free-form category for grouping in the admin UI — same vocabulary
     # as the read-only tool registry ("ipam", "dns", "dhcp").
     category: str = "ops"

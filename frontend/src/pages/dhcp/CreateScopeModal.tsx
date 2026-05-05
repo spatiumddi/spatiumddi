@@ -574,7 +574,7 @@ function PXEProfileSection({
         Bind a PXE profile to render Kea client-classes for BIOS / UEFI / iPXE
         boot. Manage profiles at{" "}
         <a
-          href={`/dhcp/groups/${groupId}/pxe`}
+          href={`/dhcp/groups/${encodeURIComponent(groupId)}/pxe`}
           target="_blank"
           rel="noopener noreferrer"
           className="text-primary hover:underline"

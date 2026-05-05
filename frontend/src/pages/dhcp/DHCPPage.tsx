@@ -601,12 +601,16 @@ function ServerScopesTab({ server }: { server: DHCPServer }) {
                             <AskAIButton
                               context={[
                                 `DHCP scope ${sc.name}`,
-                                sc.subnet_network ? `subnet: ${sc.subnet_network}` : null,
+                                sc.subnet_network
+                                  ? `subnet: ${sc.subnet_network}`
+                                  : null,
                                 `enabled: ${sc.enabled ? "yes" : "no"}`,
                                 `lease time: ${sc.lease_time}s`,
                                 `DDNS: ${sc.ddns_enabled ? "on" : "off"}`,
                                 `scope_id: ${sc.id}`,
-                                sc.subnet_id ? `subnet_id: ${sc.subnet_id}` : null,
+                                sc.subnet_id
+                                  ? `subnet_id: ${sc.subnet_id}`
+                                  : null,
                               ]
                                 .filter(Boolean)
                                 .join(", ")}

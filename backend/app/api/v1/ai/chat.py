@@ -337,9 +337,17 @@ async def chat(body: ChatTurnRequest, current_user: CurrentUser, db: DB) -> Stre
                 session=session_row, user_text=body.message
             ):
                 yield _sse_frame(event.kind, event.data)
-        except Exception as exc:  # noqa: BLE001
+        except Exception:  # noqa: BLE001
+            # Log full exception server-side; surface a generic message
+            # to the client so the SSE stream doesn't leak stack-trace
+            # info (file paths, SQL fragments from IntegrityError-style
+            # exceptions, etc). The server-side log is the source of
+            # truth for triage. CodeQL py/stack-trace-exposure (#22).
             logger.exception("ai_chat_stream_error", session_id=str(session_row.id))
-            yield _sse_frame("error", {"message": f"{type(exc).__name__}: {exc}"})
+            yield _sse_frame(
+                "error",
+                {"message": "Chat stream failed — see server logs for details."},
+            )
 
     return StreamingResponse(
         _stream(),
