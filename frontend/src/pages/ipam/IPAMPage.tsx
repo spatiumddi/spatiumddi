@@ -74,7 +74,7 @@ import { SwatchPicker } from "@/components/ui/swatch-picker";
 import { useStickyLocation } from "@/lib/stickyLocation";
 import { useSessionState } from "@/lib/useSessionState";
 import { useRowHighlight } from "@/lib/useRowHighlight";
-import { Modal } from "@/components/ui/modal";
+import { Modal, ModalTabs } from "@/components/ui/modal";
 import { AsnPicker } from "@/components/ipam/asn-picker";
 import { VrfPicker } from "@/components/ipam/vrf-picker";
 import {
@@ -529,11 +529,13 @@ function CreateSpaceModal({ onClose }: { onClose: () => void }) {
   );
   // VRF / BGP annotation — pure metadata, parity with EditSpaceModal so
   // operators don't have to round-trip through Edit just to set their
-  // routing context on a freshly-created space. Collapsed by default
-  // since most homelab / SMB deployments don't run a multi-VRF fabric.
-  const [showVrf, setShowVrf] = useState<boolean>(false);
+  // routing context on a freshly-created space. Lives on its own tab
+  // so most homelab operators can ignore it without scrolling past it.
   const [vrfId, setVrfId] = useState<string | null>(null);
   const [asnId, setAsnId] = useState<string | null>(null);
+  const [tab, setTab] = useState<"general" | "dns" | "dhcp" | "networking">(
+    "general",
+  );
 
   const mutation = useMutation({
     mutationFn: () => {
@@ -557,30 +559,47 @@ function CreateSpaceModal({ onClose }: { onClose: () => void }) {
   });
   return (
     <Modal title="New IP Space" onClose={onClose} wide>
-      <div className="space-y-3">
-        <Field label="Name">
-          <input
-            className={inputCls}
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            placeholder="e.g. Corporate"
-            autoFocus
-          />
-        </Field>
-        <Field label="Description">
-          <input
-            className={inputCls}
-            value={description}
-            onChange={(e) => setDescription(e.target.value)}
-            placeholder="Optional"
-          />
-        </Field>
-        <Field label="Color">
-          <SwatchPicker value={color} onChange={setColor} />
-        </Field>
-        <div className="border-t pt-3">
-          <p className="mb-2 text-xs font-semibold text-muted-foreground uppercase tracking-wide">
-            DNS Defaults (inherited by child blocks and subnets)
+      <ModalTabs
+        tabs={[
+          { key: "general", label: "General" },
+          { key: "dns", label: "DNS" },
+          { key: "dhcp", label: "DHCP" },
+          { key: "networking", label: "Networking" },
+        ]}
+        active={tab}
+        onChange={setTab}
+      />
+
+      {tab === "general" && (
+        <div className="space-y-4">
+          <Field label="Name">
+            <input
+              className={inputCls}
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              placeholder="e.g. Corporate"
+              autoFocus
+            />
+          </Field>
+          <Field label="Description">
+            <input
+              className={inputCls}
+              value={description}
+              onChange={(e) => setDescription(e.target.value)}
+              placeholder="Optional"
+            />
+          </Field>
+          <Field label="Color">
+            <SwatchPicker value={color} onChange={setColor} />
+          </Field>
+        </div>
+      )}
+
+      {tab === "dns" && (
+        <div className="space-y-3">
+          <p className="text-xs text-muted-foreground">
+            DNS settings here cascade down to every block and subnet that keeps{" "}
+            <code>dns_inherit_settings</code> enabled (the default).
           </p>
           <DnsSettingsSection
             inherit={false}
@@ -594,9 +613,13 @@ function CreateSpaceModal({ onClose }: { onClose: () => void }) {
             onAdditionalZoneIdsChange={setDnsAdditionalZoneIds}
           />
         </div>
-        <div className="border-t pt-3">
-          <p className="mb-2 text-xs font-semibold text-muted-foreground uppercase tracking-wide">
-            DHCP Defaults (inherited by child blocks and subnets)
+      )}
+
+      {tab === "dhcp" && (
+        <div className="space-y-3">
+          <p className="text-xs text-muted-foreground">
+            DHCP server group here cascades down to scopes carved out from
+            blocks / subnets that inherit.
           </p>
           <DhcpSettingsSection
             inherit={false}
@@ -606,74 +629,48 @@ function CreateSpaceModal({ onClose }: { onClose: () => void }) {
             onServerGroupIdChange={setDhcpServerGroupId}
           />
         </div>
+      )}
 
-        {/* VRF / BGP annotation — collapsible to keep the form tidy
-            for operators who don't run multiple VRFs. Both fields are
-            FK pickers backed by first-class entities; RD / RT are
-            stored on the VRF row and surfaced read-only when picked. */}
-        <div className="border-t pt-3">
-          <button
-            type="button"
-            onClick={() => setShowVrf((s) => !s)}
-            className="flex items-center gap-1 text-xs font-semibold text-muted-foreground uppercase tracking-wide hover:text-foreground"
-          >
-            {showVrf ? (
-              <ChevronDown className="h-3 w-3" />
-            ) : (
-              <ChevronRight className="h-3 w-3" />
-            )}
-            VRF / BGP (optional)
-          </button>
-          {showVrf && (
-            <div className="mt-2 space-y-2">
-              <Field label="VRF">
-                <VrfPicker
-                  className={inputCls}
-                  value={vrfId}
-                  onChange={setVrfId}
-                />
-                <p className="mt-1 text-[11px] text-muted-foreground">
-                  Manage VRFs (RD + import / export RTs) under{" "}
-                  <a
-                    href="/network/vrfs"
-                    className="underline hover:text-foreground"
-                  >
-                    Network → VRFs
-                  </a>
-                  .
-                </p>
-              </Field>
-              <Field label="Origin ASN (BGP)">
-                <AsnPicker
-                  className={inputCls}
-                  value={asnId}
-                  onChange={setAsnId}
-                />
-              </Field>
-              <p className="text-xs text-muted-foreground">
-                Pure annotation — address allocation does not consult these
-                fields. Different VRFs with overlapping IPs already work via
-                separate IPSpace rows.
-              </p>
-            </div>
-          )}
+      {tab === "networking" && (
+        <div className="space-y-4">
+          <p className="text-xs text-muted-foreground">
+            Pure annotation — address allocation does not consult these fields.
+            Different VRFs with overlapping IPs already work via separate
+            IPSpace rows.
+          </p>
+          <Field label="VRF">
+            <VrfPicker className={inputCls} value={vrfId} onChange={setVrfId} />
+            <p className="mt-1 text-[11px] text-muted-foreground">
+              Manage VRFs (RD + import / export RTs) under{" "}
+              <a
+                href="/network/vrfs"
+                className="underline hover:text-foreground"
+              >
+                Network → VRFs
+              </a>
+              .
+            </p>
+          </Field>
+          <Field label="Origin ASN (BGP)">
+            <AsnPicker className={inputCls} value={asnId} onChange={setAsnId} />
+          </Field>
         </div>
+      )}
 
-        <div className="flex justify-end gap-2 pt-2">
-          <button
-            onClick={onClose}
-            className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
-          >
-            Cancel
-          </button>
-          <button
-            onClick={() => mutation.mutate()}
-            disabled={!name || mutation.isPending}
-            className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
-          >
-            {mutation.isPending ? "Creating…" : "Create"}
-          </button>
-        </div>
+      <div className="mt-6 flex justify-end gap-2 border-t pt-3">
+        <button
+          onClick={onClose}
+          className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
+        >
+          Cancel
+        </button>
+        <button
+          onClick={() => mutation.mutate()}
+          disabled={!name || mutation.isPending}
+          className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+        >
+          {mutation.isPending ? "Creating…" : "Create"}
+        </button>
       </div>
     </Modal>
   );
@@ -8371,13 +8368,16 @@ function EditSpaceModal({
     space.dhcp_server_group_id ?? null,
   );
   // VRF / BGP annotation — pure metadata, no semantic effect on
-  // address allocation. The collapsible section keeps the modal tidy
-  // for operators who don't run multiple VRFs. Legacy freeform values
-  // (vrf_name / RD / RTs) are migrated forward to first-class VRF
-  // entities — see issue #86 phase 1; the picker below points at one.
-  const [showVrf, setShowVrf] = useState<boolean>(true);
+  // address allocation. Lives on its own tab now so operators who
+  // don't run multiple VRFs can ignore it without scrolling past it.
+  // Legacy freeform values (vrf_name / RD / RTs) are migrated forward
+  // to first-class VRF entities — see issue #86 phase 1; the picker
+  // below points at one.
   const [vrfId, setVrfId] = useState<string | null>(space.vrf_id ?? null);
   const [asnId, setAsnId] = useState<string | null>(space.asn_id ?? null);
+  const [tab, setTab] = useState<
+    "general" | "dns" | "dhcp" | "networking" | "danger"
+  >("general");
 
   const saveMutation = useMutation({
     mutationFn: () => {
@@ -8504,31 +8504,47 @@ function EditSpaceModal({
   // ── Normal edit view ──
   return (
     <Modal title="Edit IP Space" onClose={onClose} wide>
-      <div className="space-y-3">
-        <Field label="Name">
-          <input
-            className={inputCls}
-            value={name}
-            onChange={(e) => setName(e.target.value)}
-            autoFocus
-          />
-        </Field>
-        <Field label="Description">
-          <input
-            className={inputCls}
-            value={description}
-            onChange={(e) => setDescription(e.target.value)}
-            placeholder="Optional"
-          />
-        </Field>
-        <Field label="Color">
-          <SwatchPicker value={color} onChange={setColor} />
-        </Field>
+      <ModalTabs
+        tabs={[
+          { key: "general", label: "General" },
+          { key: "dns", label: "DNS" },
+          { key: "dhcp", label: "DHCP" },
+          { key: "networking", label: "Networking" },
+          { key: "danger", label: "Danger zone" },
+        ]}
+        active={tab}
+        onChange={setTab}
+      />
 
-        {/* DNS defaults — propagate down to blocks/subnets that inherit */}
-        <div className="border-t pt-3">
-          <p className="mb-2 text-xs font-semibold text-muted-foreground uppercase tracking-wide">
-            DNS Defaults (inherited by child blocks and subnets)
+      {tab === "general" && (
+        <div className="space-y-4">
+          <Field label="Name">
+            <input
+              className={inputCls}
+              value={name}
+              onChange={(e) => setName(e.target.value)}
+              autoFocus
+            />
+          </Field>
+          <Field label="Description">
+            <input
+              className={inputCls}
+              value={description}
+              onChange={(e) => setDescription(e.target.value)}
+              placeholder="Optional"
+            />
+          </Field>
+          <Field label="Color">
+            <SwatchPicker value={color} onChange={setColor} />
+          </Field>
+        </div>
+      )}
+
+      {tab === "dns" && (
+        <div className="space-y-3">
+          <p className="text-xs text-muted-foreground">
+            DNS settings here cascade down to every block and subnet that keeps{" "}
+            <code>dns_inherit_settings</code> enabled (the default).
           </p>
           <DnsSettingsSection
             inherit={false}
@@ -8542,11 +8558,13 @@ function EditSpaceModal({
             onAdditionalZoneIdsChange={setDnsAdditionalZoneIds}
           />
         </div>
+      )}
 
-        {/* DHCP defaults — inherited by child blocks / subnets */}
-        <div className="border-t pt-3">
-          <p className="mb-2 text-xs font-semibold text-muted-foreground uppercase tracking-wide">
-            DHCP Defaults (inherited by child blocks and subnets)
+      {tab === "dhcp" && (
+        <div className="space-y-3">
+          <p className="text-xs text-muted-foreground">
+            DHCP server group here cascades down to scopes carved out from
+            blocks / subnets that inherit.
           </p>
           <DhcpSettingsSection
             inherit={false}
@@ -8556,91 +8574,73 @@ function EditSpaceModal({
             onServerGroupIdChange={setDhcpServerGroupId}
           />
         </div>
+      )}
 
-        {/* VRF / BGP annotation — collapsible because most homelab and
-            small deployments don't run a multi-VRF fabric. */}
-        <div className="border-t pt-3">
-          <button
-            type="button"
-            onClick={() => setShowVrf((s) => !s)}
-            className="flex items-center gap-1 text-xs font-semibold text-muted-foreground uppercase tracking-wide hover:text-foreground"
-          >
-            {showVrf ? (
-              <ChevronDown className="h-3 w-3" />
-            ) : (
-              <ChevronRight className="h-3 w-3" />
-            )}
-            VRF / BGP (optional)
-          </button>
-          {showVrf && (
-            <div className="mt-2 space-y-2">
-              <Field label="VRF">
-                <VrfPicker
-                  className={inputCls}
-                  value={vrfId}
-                  onChange={setVrfId}
-                />
-                <p className="mt-1 text-[11px] text-muted-foreground">
-                  Manage VRFs (RD + import / export RTs) under{" "}
-                  <a
-                    href="/network/vrfs"
-                    className="underline hover:text-foreground"
-                  >
-                    Network → VRFs
-                  </a>
-                  .
-                </p>
-                {space.vrf_name && !vrfId && (
-                  <p className="mt-1 text-[11px] text-amber-600 dark:text-amber-400">
-                    Legacy freeform VRF: <code>{space.vrf_name}</code>
-                    {space.route_distinguisher
-                      ? ` (RD ${space.route_distinguisher})`
-                      : ""}{" "}
-                    — pick a first-class VRF above to migrate.
-                  </p>
-                )}
-              </Field>
-              <Field label="Origin ASN (BGP)">
-                <AsnPicker
-                  className={inputCls}
-                  value={asnId}
-                  onChange={setAsnId}
-                />
-              </Field>
-              <p className="text-xs text-muted-foreground">
-                Pure annotation — address allocation does not consult these
-                fields. Different VRFs with overlapping IPs already work via
-                separate IPSpace rows.
+      {tab === "networking" && (
+        <div className="space-y-4">
+          <p className="text-xs text-muted-foreground">
+            Pure annotation — address allocation does not consult these fields.
+            Different VRFs with overlapping IPs already work via separate
+            IPSpace rows.
+          </p>
+          <Field label="VRF">
+            <VrfPicker className={inputCls} value={vrfId} onChange={setVrfId} />
+            <p className="mt-1 text-[11px] text-muted-foreground">
+              Manage VRFs (RD + import / export RTs) under{" "}
+              <a
+                href="/network/vrfs"
+                className="underline hover:text-foreground"
+              >
+                Network → VRFs
+              </a>
+              .
+            </p>
+            {space.vrf_name && !vrfId && (
+              <p className="mt-1 text-[11px] text-amber-600 dark:text-amber-400">
+                Legacy freeform VRF: <code>{space.vrf_name}</code>
+                {space.route_distinguisher
+                  ? ` (RD ${space.route_distinguisher})`
+                  : ""}{" "}
+                — pick a first-class VRF above to migrate.
               </p>
-            </div>
-          )}
+            )}
+          </Field>
+          <Field label="Origin ASN (BGP)">
+            <AsnPicker className={inputCls} value={asnId} onChange={setAsnId} />
+          </Field>
         </div>
+      )}
 
-        <div className="flex justify-end gap-2 pt-2">
-          <button
-            onClick={onClose}
-            className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
-          >
-            Cancel
-          </button>
-          <button
-            onClick={() => saveMutation.mutate()}
-            disabled={!name || saveMutation.isPending}
-            className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
-          >
-            {saveMutation.isPending ? "Saving…" : "Save"}
-          </button>
-        </div>
-
-        {/* Delete zone */}
-        <div className="mt-2 border-t pt-3">
+      {tab === "danger" && (
+        <div className="space-y-3">
+          <p className="text-sm text-muted-foreground">
+            Deleting an IP space permanently removes every block, subnet, and IP
+            address row inside it. The deletion is gated by a typed confirm in
+            the next step.
+          </p>
           <button
             onClick={() => setDeleteStep(1)}
-            className="text-xs text-destructive hover:underline"
+            className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-1.5 text-sm text-destructive hover:bg-destructive/10"
           >
             Delete this IP space…
           </button>
         </div>
+      )}
+
+      <div className="mt-6 flex justify-end gap-2 border-t pt-3">
+        <button
+          onClick={onClose}
+          className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
+        >
+          Cancel
+        </button>
+        <button
+          onClick={() => saveMutation.mutate()}
+          disabled={!name || saveMutation.isPending}
+          className="rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+        >
+          {saveMutation.isPending ? "Saving…" : "Save"}
+        </button>
       </div>
     </Modal>
   );

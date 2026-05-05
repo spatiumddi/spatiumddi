@@ -3,6 +3,51 @@ import { X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { MODAL_BACKDROP_CLS, useDraggableModal } from "./use-draggable-modal";
 
+/** Tab strip for breaking long modals into themed sub-sections.
+ *
+ * Single source of truth for the visual style — previously the IPAM
+ * Templates editor had a one-off implementation; the IPAM
+ * Space / Block / Subnet modals now reuse this so every tabbed
+ * modal in the app reads the same. Active tab gets a primary-coloured
+ * underline; disabled tabs grey out + reject clicks.
+ *
+ * Place above the per-tab content blocks; render content with a
+ * ``{tab === "..." && <div>…</div>}`` guard. The shared Modal above
+ * already gives you ``max-h-[90vh] overflow-y-auto`` on the dialog
+ * body, so long tab content scrolls within the modal itself.
+ */
+export function ModalTabs<T extends string>({
+  tabs,
+  active,
+  onChange,
+}: {
+  tabs: ReadonlyArray<{ key: T; label: string; disabled?: boolean }>;
+  active: T;
+  onChange: (key: T) => void;
+}) {
+  return (
+    <div className="mb-4 flex flex-wrap gap-1 border-b">
+      {tabs.map(({ key, label, disabled }) => (
+        <button
+          key={key}
+          type="button"
+          onClick={() => !disabled && onChange(key)}
+          disabled={disabled}
+          className={cn(
+            "-mb-px border-b-2 px-3 py-1.5 text-sm transition-colors",
+            active === key
+              ? "border-primary text-foreground"
+              : "border-transparent text-muted-foreground hover:text-foreground",
+            disabled && "opacity-40 cursor-not-allowed",
+          )}
+        >
+          {label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
 // Single shared Modal primitive. Previously each page carried a local copy
 // with minor CSS drift — this is the consolidated version.
 //
