@@ -115,7 +115,7 @@
 | 🔒 | **RBAC + external auth** | LDAP · OIDC · SAML · RADIUS · TACACS+ with backup-server failover · API tokens with auto-expiry · scoped API tokens (per-permission) |
 | 🛡 | **TOTP MFA** | local-user 2FA — QR enrolment via `pyotp` + `qrcode` · single-use backup codes · admin force-disable per user (audit-logged) |
 | 🏷 | **Subnet classification tags** | `pci_scope` · `hipaa_scope` · `internet_facing` · `contains_pii` — inheritable through the IP block tree · compliance roll-up card on Platform Insights |
-| 🤖 | **Operator Copilot (AI)** | multi-vendor — OpenAI / Anthropic (Claude) / Azure OpenAI / Google Gemini / OpenAI-compat (Ollama, vLLM, Together, Groq, Fireworks) · automatic failover across enabled providers · 18 read-only tools + MCP HTTP endpoint · "Ask AI about this" affordances on every resource · custom prompts library · Cmd-K palette · daily digest · token / cost observability with per-user caps · write tools with preview / apply flow |
+| 🤖 | **Operator Copilot (AI)** | grounded chat over your live IPAM / DNS / DHCP / Network data — multi-vendor (OpenAI / Anthropic / Azure OpenAI / Gemini / OpenAI-compat for Ollama, vLLM, etc.) with automatic failover · **34+ tools** (subnet / IP / DNS / DHCP / circuits / overlays / VRFs / ASNs / domains / nmap / ping / switchport finder, plus Apply-gated write proposals) · MCP HTTP endpoint for Claude Desktop / Cursor / Cline · "Ask AI about this" affordances on every resource · per-provider editable system prompt · OUI vendor enrichment baked in · live nmap results in chat · per-message token / latency footer · Markdown + GFM tables in replies · daily digest |
 | 🔔 | **Alerts + forwarding** | rule-based alerts · multi-target syslog (RFC 5424 / CEF / LEEF / RFC 3164) · HTTP webhooks · SMTP email · Slack / Teams / Discord chat |
 | 🪝 | **Typed-event webhooks** | 96 typed events (resource × verb) · HMAC-SHA256 signed · outbox-backed retry with backoff + dead-letter |
 | 🔐 | **ACME DNS-01** | `acme-dns`-compatible — certbot / lego / acme.sh issue public certs (wildcards included) |
@@ -377,18 +377,64 @@ The tables above are the elevator pitch. The bullets here are the same surface w
   - List filters across the IPAM page + the API
   - Compliance card on Platform Insights shows rolled-up counts
 
-- 🤖 **Operator Copilot** — AI assistant grounded in your live IPAM / DNS / DHCP / Network data.
-  - **Multi-vendor LLM support** — OpenAI, Anthropic (Claude), Azure OpenAI, Google Gemini, plus OpenAI-compat (Ollama / OpenWebUI / vLLM / LM Studio / llama.cpp server / LocalAI / Together / Groq / Fireworks). Add multiple providers in priority order and the orchestrator picks the highest-priority enabled one
-  - **Automatic failover chain** — on transient failures (5xx / timeout / rate-limit) the orchestrator walks providers in priority order; first successful chunk wins. Permanent errors (4xx / auth) surface immediately
-  - **Floating chat drawer** — right-side slide-in keyed on a global toggle; streams responses live via SSE, renders Markdown + code blocks + tool-call collapsed-by-default cards. Empty state shows clickable example prompts
-  - **18 read-only tools** in the registry — `list_subnets`, `get_subnet`, `list_ips`, `get_ip`, `list_zones`, `list_records`, `list_dhcp_scopes`, `list_leases`, `list_alerts`, `list_audit`, `list_devices`, `list_circuits`, `list_customers`, `list_sites`, `list_providers`, `list_asns`, `list_vrfs`, `list_overlays`
-  - **MCP HTTP endpoint** at `/api/v1/ai/mcp` exposes the same tool set so external MCP clients (Claude Desktop, Cursor, Cline) can connect directly
-  - **"Ask AI about this" affordances** — compact icon button on subnets / IPs / DNS zones / records / alerts / audit rows / DHCP scopes / leases / network devices that pre-fills the chat drawer with a templated prompt + the resource UUID
+- 🤖 **Operator Copilot** — AI assistant grounded in your live IPAM / DNS / DHCP / Network data. Hosted-API or fully on-prem (Ollama). One provider config, ~34 tools, real conversations about your network.
+
+  **Provider + model**
+
+  - **Multi-vendor** — OpenAI, Anthropic (Claude), Azure OpenAI, Google Gemini, plus OpenAI-compat (Ollama, OpenWebUI, vLLM, LM Studio, llama.cpp server, LocalAI, Together, Groq, Fireworks). Add multiple providers in priority order; orchestrator picks the highest-priority enabled one
+  - **Automatic failover chain** — on transient failure (5xx / timeout / rate-limit) the orchestrator walks remaining providers; first successful chunk wins. Permanent errors (4xx / auth) surface immediately
+  - **Per-provider system prompt override** — admin-editable inside the AI Provider modal; baked-in default is also viewable inline so you can fork it. Snapshotted onto each session at creation so live edits don't break in-flight chats
+  - **Reasoning-channel fallback** — `qwen3.5` / DeepSeek-R1 / o1 / o3 family that route their answer to `reasoning` instead of `content` are handled transparently by the driver
+
+  **Tool registry (~34 tools)**
+
+  - **IPAM** — `list_ip_spaces`, `list_ip_blocks`, `list_subnets`, `get_subnet_summary`, `find_ip` (returns MAC + **vendor**), `find_by_tag`, `count_ipam_resources`. Name-or-UUID resolution on `space_id` / `block_id` so the model can pass `"home"` directly without a UUID-lookup hop
+  - **DNS** — `list_dns_server_groups`, `list_dns_zones`, `query_dns_records`
+  - **DHCP** — `list_dhcp_server_groups`, `list_dhcp_servers`, `list_dhcp_scopes`, `find_dhcp_leases` (returns MAC + **vendor**)
+  - **Network modeling** — `list_asns` + `get_asn` (RDAP holder, RPKI ROAs, BGP peerings), `list_domains` (registrar / expiry / DNSSEC / NS drift), `list_vrfs` (RDs + RTs + ASN linkage), `list_circuits` (transport + bandwidth + cost + endpoints), `list_network_services` + `get_network_service_summary` (service-catalog deliverables — MPLS L3VPN, etc.), `list_overlay_networks` + `get_overlay_topology` (SD-WAN sites + policies), `list_application_categories` (RFC 4594 DSCP catalog)
+  - **Network operations** — `list_network_devices`, `find_switchport` (resolves IP→MAC via IPAM-or-ARP, joins through FDB → port name + VLAN + status; flags trunk uplinks vs access ports), `ping_host` (real ICMP from the SpatiumDDI host with strict argv validation), `list_nmap_scans` + `get_nmap_scan_results` (full scan history + open-port / OS-guess detail)
+  - **Ops + audit** — `list_alerts`, `list_alert_rules`, `get_audit_history`
+  - **Write proposals** (Apply-gated) — `propose_create_ip_address` (IPAM allocation with subnet + CIDR validation), `propose_run_nmap_scan` (operator clicks Apply before any nmap traffic hits the network — full preview shown, scan ID returned, results stream back into the chat card live as the scan completes)
+
+  **MCP integration**
+
+  - **MCP HTTP endpoint** at `/api/v1/ai/mcp` exposes the full read-only tool set so external MCP clients (Claude Desktop, Cursor, Cline, Continue.dev) can drop SpatiumDDI in as a tool source — no Copilot UI required
+
+  **Chat surface**
+
+  - **Floating chat drawer** — slide-in panel with sessionStorage-backed state (close + reopen lands on the same conversation, draft text survives), Markdown + GFM tables + code blocks, blinking caret during streaming. Opens via the floating "Ask AI" button, the Cmd-K palette entry, or the per-row "Ask AI about this" affordances on every IPAM / DNS / DHCP / alerts row
+  - **Per-message footer** — token-count + copy + info popover (sent timestamp, tokens in / out, latency, role) on every assistant reply; matches the OpenWebUI footer pattern
+  - **Daily token + cost chip** — live in the drawer header; refetches automatically when you delete chats
+  - **Multi-select session history** — checkbox column on every history row; "Select all" + "Delete N" + "Delete all" toolbar; bulk delete fans out per-id and updates the daily tally on success
+  - **Live nmap proposal results** — when a `propose_run_nmap_scan` Apply lands, the proposal card polls `GET /nmap/scans/{id}` every 2 s and renders the full results table (alive flag, open ports + service / version, OS guess, CIDR-host list) inline once status flips to `completed`
   - **Custom prompts library** — operator-curated templates persisted per platform; built-in starter pack (Find unused IPs, Audit recent changes, Summarize subnet utilization, Triage open alerts)
   - **Cmd-K palette "Ask AI" entry** — top entry in the global palette, pre-fills with the current page's context
+
+  **Reliability + safety**
+
+  - **Per-turn dedup loop guard** — if the model emits the exact same tool call twice in a turn (a known failure mode of smaller open-weight models), the orchestrator skips re-execution and feeds back a synthetic warning telling the model the result is already in context
+  - **Tool-not-found auto-correction** — when the model hallucinates a tool name, the error response includes the full list of real tool names + a hint, so the next iteration self-corrects rather than giving up
+  - **Scope rules in the system prompt** — Copilot is explicitly *not* a general-purpose coding assistant; refuses code-generation requests outside narrow platform-config contexts
+  - **Audit everything** — every tool call, every Apply, every chat turn writes through to the append-only audit log
+
+  **Token / cost observability + per-user caps**
+
+  - Per-request usage tracked in `ai_chat_message`; pricing table covers the major hosted models; per-user daily token + cost caps; AI usage card on Platform Insights aggregates the last 7 days by provider + model
   - **Daily digest** — optional 0900 local Operator Copilot summary fired through audit-forward / SMTP / webhook channels
-  - **Write tools with preview / apply flow** — model proposes via `propose_*` tools (returns the planned diff), operator clicks Apply in the chat drawer, frontend sends an `apply_change` follow-up that hits the real CRUD endpoint. Three pilot tools: `propose_create_ip`, `propose_update_ip_status`, `propose_create_dns_record`
-  - **Token / cost observability** — per-request usage tracked in `ai_usage_event`; pricing table covers the major hosted models; per-user daily token cap; live token chip in the drawer header; AI usage card on Platform Insights aggregates the last 7 days by provider + model
+
+  **Self-host with Ollama in five minutes**
+
+  ```bash
+  # On the Ollama host:
+  docker run -d --gpus all -p 11434:11434 \
+    -e OLLAMA_CONTEXT_LENGTH=32768 \
+    -e OLLAMA_KEEP_ALIVE=30m \
+    -v ollama:/root/.ollama --name ollama ollama/ollama:latest
+
+  docker exec ollama ollama pull qwen3.5:latest
+  ```
+
+  Then in SpatiumDDI: **Admin → AI Providers → New** → `kind: openai_compat`, `base_url: http://<ollama-host>:11434/v1`, `default_model: qwen3.5:latest`, save → click the floating "Ask AI" button. `OLLAMA_CONTEXT_LENGTH` is **required** — Ollama defaults to 2048 tokens which silently truncates the system prompt + tool schemas; the result is a model that hallucinates tool names. We recommend `qwen3.5:latest` for tool calling on the small open-weight class.
 
 - 🔔 **Alerts + audit forwarding** — multi-target delivery with pluggable wire formats.
   - Rule-based alerts framework (subnet utilization, server unreachable)

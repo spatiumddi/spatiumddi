@@ -75,6 +75,14 @@ class AIProvider(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # streaming-options overrides, etc. Drivers consume what they
     # recognize and ignore the rest.
     options: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    # Optional per-provider override of the baked-in Operator Copilot
+    # system prompt. NULL → use the default from
+    # ``app.services.ai.chat._STATIC_SYSTEM_PROMPT``. Empty string is
+    # treated the same as NULL so the UI's "clear" button doesn't have
+    # to delete-then-recreate the row. The override only applies to
+    # *new* sessions — existing sessions snapshot the prompt at
+    # creation time on ``AIChatSession.system_prompt``.
+    system_prompt_override: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
 CHAT_ROLES: tuple[str, ...] = ("system", "user", "assistant", "tool")

@@ -56,7 +56,7 @@ class NmapScan(UUIDPrimaryKeyMixin, TimestampMixin, Base):
 
     # ── Inputs ─────────────────────────────────────────────────────────
     # preset: quick | service_version | os_fingerprint | default_scripts
-    #         | udp_top100 | aggressive | custom
+    #         | udp_top1000 | aggressive | custom
     preset: Mapped[str] = mapped_column(
         String(32), nullable=False, default="quick", server_default="quick"
     )

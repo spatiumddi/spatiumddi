@@ -491,7 +491,7 @@ export interface Subnet {
     | "os_fingerprint"
     | "service_and_os"
     | "default_scripts"
-    | "udp_top100"
+    | "udp_top1000"
     | "aggressive";
   auto_profile_refresh_days?: number;
   // Compliance / classification flags. First-class booleans (rather
@@ -2379,6 +2379,8 @@ export interface AIProvider {
   is_enabled: boolean;
   priority: number;
   options: Record<string, unknown>;
+  /** null = use the baked-in default Operator Copilot system prompt. */
+  system_prompt_override: string | null;
   created_at: string;
   modified_at: string;
 }
@@ -2392,6 +2394,7 @@ export interface AIProviderCreate {
   is_enabled?: boolean;
   priority?: number;
   options?: Record<string, unknown>;
+  system_prompt_override?: string | null;
 }
 
 export interface AIProviderUpdate {
@@ -2402,6 +2405,8 @@ export interface AIProviderUpdate {
   is_enabled?: boolean;
   priority?: number;
   options?: Record<string, unknown>;
+  /** null = leave override unchanged; "" = clear (revert to default). */
+  system_prompt_override?: string | null;
 }
 
 export interface AITestConnectionResult {
@@ -2446,6 +2451,10 @@ export const aiApi = {
     api
       .get<{ models: AIModelInfo[] }>(`/ai/providers/${id}/models`)
       .then((r) => r.data.models),
+  getDefaultSystemPrompt: () =>
+    api
+      .get<{ prompt: string }>("/ai/providers/default-system-prompt")
+      .then((r) => r.data.prompt),
 
   // ── Chat sessions (Wave 3) ───────────────────────────────────────
   listSessions: (includeArchived = false) =>
@@ -6377,7 +6386,7 @@ export type NmapPreset =
   | "service_and_os"
   | "subnet_sweep"
   | "default_scripts"
-  | "udp_top100"
+  | "udp_top1000"
   | "aggressive"
   | "custom";
 

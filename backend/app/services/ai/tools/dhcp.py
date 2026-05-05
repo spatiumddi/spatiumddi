@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.auth import User
 from app.models.dhcp import DHCPLease, DHCPScope, DHCPServer, DHCPServerGroup
 from app.services.ai.tools.base import register_tool
+from app.services.oui import bulk_lookup_vendors, normalize_mac_key
 
 
 class ListDHCPServersArgs(BaseModel):
@@ -149,20 +150,25 @@ async def find_dhcp_leases(
         stmt = stmt.where(DHCPLease.state == args.state)
     stmt = stmt.order_by(DHCPLease.ends_at.desc()).limit(args.limit)
     rows = (await db.execute(stmt)).scalars().all()
-    return [
-        {
-            "id": str(le.id),
-            "server_id": str(le.server_id),
-            "scope_id": str(le.scope_id) if le.scope_id else None,
-            "ip_address": str(le.ip_address),
-            "mac_address": str(le.mac_address),
-            "hostname": le.hostname,
-            "state": le.state,
-            "starts_at": le.starts_at.isoformat() if le.starts_at else None,
-            "ends_at": le.ends_at.isoformat() if le.ends_at else None,
-        }
-        for le in rows
-    ]
+    vendors = await bulk_lookup_vendors(db, [str(le.mac_address) for le in rows])
+    out: list[dict[str, Any]] = []
+    for le in rows:
+        mac_key = normalize_mac_key(str(le.mac_address))
+        out.append(
+            {
+                "id": str(le.id),
+                "server_id": str(le.server_id),
+                "scope_id": str(le.scope_id) if le.scope_id else None,
+                "ip_address": str(le.ip_address),
+                "mac_address": str(le.mac_address),
+                "mac_vendor": vendors.get(mac_key) if mac_key else None,
+                "hostname": le.hostname,
+                "state": le.state,
+                "starts_at": le.starts_at.isoformat() if le.starts_at else None,
+                "ends_at": le.ends_at.isoformat() if le.ends_at else None,
+            }
+        )
+    return out
 
 
 class ListServerGroupsArgs(BaseModel):

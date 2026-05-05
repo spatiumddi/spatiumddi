@@ -22,7 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.ai import AIOperationProposal
 from app.models.auth import User
 from app.services.ai import operations
-from app.services.ai.operations import CreateIPAddressArgs
+from app.services.ai.operations import CreateIPAddressArgs, RunNmapScanArgs
 from app.services.ai.tools.base import register_tool
 
 
@@ -112,6 +112,49 @@ async def propose_create_ip_address(
         db,
         user=user,
         operation="create_ip_address",
+        args=args.model_dump(),
+        preview_text=preview.preview_text,
+    )
+    return _proposal_result(proposal, preview_text=preview.preview_text)
+
+
+# ── propose_run_nmap_scan ─────────────────────────────────────────────
+
+
+@register_tool(
+    name="propose_run_nmap_scan",
+    description=(
+        "Prepare an nmap scan proposal. The operator must explicitly "
+        "click Apply for the scan to actually run — nmap touches the "
+        "network so silent execution is never appropriate. Use this "
+        "for any operator question that requires *new* port / "
+        "service / OS data; for *existing* scan history use "
+        "list_nmap_scans + get_nmap_scan_results instead. Returns "
+        "kind='proposal' — surface the preview to the operator and "
+        "wait for their decision. Never call this twice for the "
+        "same target without operator instruction."
+    ),
+    args_model=RunNmapScanArgs,
+    writes=False,  # The propose tool is read-only; apply is the write.
+    category="network",
+)
+async def propose_run_nmap_scan(
+    db: AsyncSession, user: User, args: RunNmapScanArgs
+) -> dict[str, Any]:
+    op = operations.get_operation("run_nmap_scan")
+    if op is None:
+        return {"error": "Operation 'run_nmap_scan' is not registered"}
+    preview = await op.preview(db, user, args)
+    if not preview.ok:
+        return {
+            "kind": "proposal_rejected",
+            "operation": "run_nmap_scan",
+            "detail": preview.detail,
+        }
+    proposal = await _persist_proposal(
+        db,
+        user=user,
+        operation="run_nmap_scan",
         args=args.model_dump(),
         preview_text=preview.preview_text,
     )

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useSearchParams } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import { useStickyLocation } from "@/lib/stickyLocation";
 import {
   useMutation,
@@ -7,7 +7,15 @@ import {
   useQuery,
   useQueryClient,
 } from "@tanstack/react-query";
-import { Pencil, Plus, RefreshCw, Server, Trash2, Wifi } from "lucide-react";
+import {
+  HardDrive,
+  Pencil,
+  Plus,
+  RefreshCw,
+  Server,
+  Trash2,
+  Wifi,
+} from "lucide-react";
 import {
   dhcpApi,
   dhcpLeaseHistoryApi,
@@ -285,6 +293,7 @@ function GroupDetailView({
   onAddServer: () => void;
 }) {
   const qc = useQueryClient();
+  const navigate = useNavigate();
   const { data: servers = [], isFetching } = useQuery({
     queryKey: ["dhcp-servers", group.id],
     queryFn: () => dhcpApi.listServers(group.id),
@@ -342,6 +351,15 @@ function GroupDetailView({
               title="Refresh server list + HA state"
             >
               Refresh
+            </HeaderButton>
+            <HeaderButton
+              icon={HardDrive}
+              onClick={() =>
+                navigate(`/dhcp/groups/${encodeURIComponent(group.id)}/pxe`)
+              }
+              title="PXE / iPXE provisioning profiles for this group"
+            >
+              PXE Profiles
             </HeaderButton>
             <HeaderButton icon={Pencil} onClick={onEdit}>
               Edit

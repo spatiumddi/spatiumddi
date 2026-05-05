@@ -36,6 +36,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.auth import User
 from app.models.ipam import IPAddress, Subnet
+from app.services.nmap import NmapArgError, build_argv
 
 # Per-proposal TTL. 30 minutes is a generous window for a thoughtful
 # review without keeping yesterday's proposals lying around — the
@@ -275,6 +276,167 @@ async def _apply_create_ip_address(
         "status": args.status,
         "hostname": args.hostname,
     }
+
+
+# ── run_nmap_scan operation ────────────────────────────────────────────
+
+
+class RunNmapScanArgs(BaseModel):
+    """Args for the ``run_nmap_scan`` operation.
+
+    Mirrors :class:`app.api.v1.nmap.schemas.NmapScanCreate` but typed
+    looser (``preset`` as plain str so the LLM can supply any of the
+    documented presets without a Literal-of-Literals headache for
+    JSON-Schema generation in older clients).
+    """
+
+    target_ip: str = Field(
+        description=(
+            "IP address, hostname, or CIDR to scan. CIDR scans use the "
+            "``subnet_sweep`` preset by default and are capped on the "
+            "backend at /16 worth of hosts."
+        ),
+    )
+    preset: str = Field(
+        default="quick",
+        description=(
+            "Nmap preset: quick | service_version | service_and_os | "
+            "os_fingerprint | subnet_sweep | default_scripts | "
+            "udp_top1000 | aggressive | custom. ``service_and_os`` is "
+            "the right pick for device profiling. ``subnet_sweep`` "
+            "(-sn) for ping-sweep across a CIDR. Stick to ``quick`` "
+            "or ``service_version`` for routine port checks."
+        ),
+    )
+    port_spec: str | None = Field(
+        default=None,
+        description="Optional ``-p`` value (e.g. '22,80,443' or 'T:1-1024').",
+    )
+    extra_args: str | None = Field(
+        default=None,
+        description=(
+            "Optional extra nmap flags. Validated server-side — " "dangerous flags are rejected."
+        ),
+    )
+
+
+async def _preview_run_nmap_scan(
+    db: AsyncSession, user: User, args: RunNmapScanArgs
+) -> PreviewResult:
+    target = (args.target_ip or "").strip()
+    if not target:
+        return PreviewResult(ok=False, detail="target_ip is required")
+
+    try:
+        argv = build_argv(target, args.preset, args.port_spec, args.extra_args)
+    except NmapArgError as exc:
+        return PreviewResult(
+            ok=False,
+            detail=f"nmap arg validation failed: {exc}",
+        )
+
+    parts = [
+        f"Run nmap **{args.preset}** scan against `{target}`",
+    ]
+    if args.port_spec:
+        parts.append(f"ports={args.port_spec}")
+    if args.extra_args:
+        parts.append(f"extra={args.extra_args!r}")
+    parts.append(f"argv: `{' '.join(argv)}`")
+    parts.append(
+        "This will issue real network probes from the SpatiumDDI host. "
+        "Apply only if you're authorised to scan this target."
+    )
+    return PreviewResult(ok=True, detail="ready", preview_text="\n".join(parts))
+
+
+async def _apply_run_nmap_scan(
+    db: AsyncSession, user: User, args: RunNmapScanArgs
+) -> dict[str, Any]:
+    """Persist a queued nmap_scan row + dispatch the Celery task.
+
+    Mirrors the create_scan handler in
+    :mod:`app.api.v1.nmap.router` but skips the ip_address_id branch
+    (the AI surface always passes ``target_ip``). Audit row uses the
+    same ``resource_type='nmap_scan'`` shape.
+    """
+    from app.models.audit import AuditLog  # local import to avoid cycle
+    from app.models.nmap import NmapScan  # local import to avoid cycle
+
+    target = args.target_ip.strip()
+    # Re-validate at apply time too — argv builder gates dangerous flags.
+    try:
+        build_argv(target, args.preset, args.port_spec, args.extra_args)
+    except NmapArgError as exc:
+        raise ValueError(f"nmap arg validation failed: {exc}") from exc
+
+    scan = NmapScan(
+        target_ip=target,
+        preset=args.preset,
+        port_spec=args.port_spec,
+        extra_args=args.extra_args,
+        status="queued",
+        created_by_user_id=user.id,
+    )
+    db.add(scan)
+    await db.flush()
+    db.add(
+        AuditLog(
+            user_id=user.id,
+            user_display_name=user.display_name,
+            auth_source=getattr(user, "auth_source", "local") or "local",
+            action="create",
+            resource_type="nmap_scan",
+            resource_id=str(scan.id),
+            resource_display=f"nmap:{target}",
+            new_value={
+                "preset": args.preset,
+                "port_spec": args.port_spec,
+                "extra_args": args.extra_args,
+                "target_ip": target,
+                "via": "ai_proposal",
+            },
+        )
+    )
+    await db.commit()
+    await db.refresh(scan)
+
+    # Dispatch — broker outage shouldn't fail the apply (mirror
+    # router behaviour). The row is queued; operator can re-trigger.
+    try:
+        from app.tasks.nmap import run_scan_task  # noqa: PLC0415
+
+        run_scan_task.delay(str(scan.id))
+    except Exception:  # noqa: BLE001 — broker down
+        pass
+
+    return {
+        "id": str(scan.id),
+        "target_ip": target,
+        "preset": args.preset,
+        "status": "queued",
+        "hint": (
+            "Scan dispatched. Poll get_nmap_scan_results until "
+            "status == 'completed' to read the open ports / OS guess."
+        ),
+    }
+
+
+register(
+    Operation(
+        name="run_nmap_scan",
+        description=(
+            "Trigger an on-demand nmap scan. Always go through "
+            "propose_run_nmap_scan — never call this directly. The "
+            "scan touches the network, so operator approval is "
+            "required before each apply."
+        ),
+        args_model=RunNmapScanArgs,
+        preview=_preview_run_nmap_scan,
+        apply=_apply_run_nmap_scan,
+        category="network",
+    )
+)
 
 
 register(

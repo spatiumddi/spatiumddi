@@ -15,7 +15,7 @@ NmapPreset = Literal[
     "service_and_os",
     "subnet_sweep",
     "default_scripts",
-    "udp_top100",
+    "udp_top1000",
     "aggressive",
     "custom",
 ]

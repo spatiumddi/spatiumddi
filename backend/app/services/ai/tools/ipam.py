@@ -13,6 +13,7 @@ and avoids leaking secrets / large blobs.
 from __future__ import annotations
 
 import ipaddress
+import uuid
 from typing import Any
 
 from pydantic import BaseModel, Field
@@ -23,6 +24,46 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.auth import User
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
 from app.services.ai.tools.base import register_tool
+from app.services.oui import bulk_lookup_vendors, normalize_mac_key
+
+# ── Reference resolution ──────────────────────────────────────────────
+#
+# The LLM frequently passes a *name* where the schema declares a UUID
+# (e.g. ``space_id="home"`` because the operator said "the home space").
+# Rather than make the model take a two-step "look up the UUID, then
+# query" dance for every question, the IPAM read-tools accept either
+# form and resolve names case-insensitively. Returns ``None`` when the
+# name doesn't match any row — the caller raises a tool-level error
+# pointing the model at the right list_* tool.
+
+
+async def _resolve_space_ref(db: AsyncSession, value: str) -> uuid.UUID | None:
+    """Translate an ``id-or-name`` reference into an ``IPSpace.id``.
+
+    Tries UUID parse first, then case-insensitive name match. Returns
+    ``None`` if neither hits — the tool wrapper turns that into an
+    operator-readable error.
+    """
+    try:
+        return uuid.UUID(value)
+    except (ValueError, AttributeError):
+        pass
+    row = (
+        await db.execute(select(IPSpace.id).where(func.lower(IPSpace.name) == value.lower()))
+    ).scalar_one_or_none()
+    return row
+
+
+async def _resolve_block_ref(db: AsyncSession, value: str) -> uuid.UUID | None:
+    try:
+        return uuid.UUID(value)
+    except (ValueError, AttributeError):
+        pass
+    row = (
+        await db.execute(select(IPBlock.id).where(func.lower(IPBlock.name) == value.lower()))
+    ).scalar_one_or_none()
+    return row
+
 
 # ── list_ip_spaces ────────────────────────────────────────────────────
 
@@ -75,7 +116,13 @@ async def list_ip_spaces(
 
 
 class ListBlocksArgs(BaseModel):
-    space_id: str | None = Field(default=None, description="Filter by IP space UUID.")
+    space_id: str | None = Field(
+        default=None,
+        description=(
+            "Filter by IP space — accepts either the UUID or the "
+            "space name (case-insensitive). Omit to list across all spaces."
+        ),
+    )
     search: str | None = Field(
         default=None,
         description="Optional substring match on the block name or network CIDR.",
@@ -95,10 +142,16 @@ class ListBlocksArgs(BaseModel):
 )
 async def list_ip_blocks(
     db: AsyncSession, user: User, args: ListBlocksArgs
-) -> list[dict[str, Any]]:
+) -> list[dict[str, Any]] | dict[str, Any]:
     stmt = select(IPBlock).where(IPBlock.deleted_at.is_(None))
     if args.space_id:
-        stmt = stmt.where(IPBlock.space_id == args.space_id)
+        space_uuid = await _resolve_space_ref(db, args.space_id)
+        if space_uuid is None:
+            return {
+                "error": f"No IP space matched {args.space_id!r}.",
+                "hint": "Call list_ip_spaces to see available space names + UUIDs.",
+            }
+        stmt = stmt.where(IPBlock.space_id == space_uuid)
     if args.search:
         like = f"%{args.search.lower()}%"
         stmt = stmt.where(
@@ -127,8 +180,20 @@ async def list_ip_blocks(
 
 
 class ListSubnetsArgs(BaseModel):
-    space_id: str | None = None
-    block_id: str | None = None
+    space_id: str | None = Field(
+        default=None,
+        description=(
+            "Filter by IP space — accepts either the UUID or the "
+            "space name (case-insensitive). Omit to search across all spaces."
+        ),
+    )
+    block_id: str | None = Field(
+        default=None,
+        description=(
+            "Filter by parent IP block — accepts either the UUID or the "
+            "block name (case-insensitive)."
+        ),
+    )
     vlan_id: int | None = Field(default=None, description="Filter by VLAN tag (1–4094).")
     search: str | None = Field(
         default=None,
@@ -141,19 +206,37 @@ class ListSubnetsArgs(BaseModel):
     name="list_subnets",
     description=(
         "List subnets — the routable units that own IP addresses. "
-        "Filterable by space, parent block, VLAN tag, or name / CIDR "
-        "substring. Each summary includes utilization, allocated / "
-        "total IP counts, and DNS / DHCP linkage."
+        "Use this tool whenever the operator names a subnet by CIDR "
+        "(e.g. '192.168.0.0/24') or by substring; pass it as the "
+        "``search`` argument. The response carries ``total_ips``, "
+        "``allocated_ips``, ``utilization_percent``, ``gateway``, "
+        "and ``vlan_id`` for every match — one call answers most "
+        "subnet questions without needing a follow-up. Also "
+        "filterable by space, parent block, or VLAN tag."
     ),
     args_model=ListSubnetsArgs,
     category="ipam",
 )
-async def list_subnets(db: AsyncSession, user: User, args: ListSubnetsArgs) -> list[dict[str, Any]]:
+async def list_subnets(
+    db: AsyncSession, user: User, args: ListSubnetsArgs
+) -> list[dict[str, Any]] | dict[str, Any]:
     stmt = select(Subnet).where(Subnet.deleted_at.is_(None))
     if args.space_id:
-        stmt = stmt.where(Subnet.space_id == args.space_id)
+        space_uuid = await _resolve_space_ref(db, args.space_id)
+        if space_uuid is None:
+            return {
+                "error": f"No IP space matched {args.space_id!r}.",
+                "hint": "Call list_ip_spaces to see available space names + UUIDs.",
+            }
+        stmt = stmt.where(Subnet.space_id == space_uuid)
     if args.block_id:
-        stmt = stmt.where(Subnet.block_id == args.block_id)
+        block_uuid = await _resolve_block_ref(db, args.block_id)
+        if block_uuid is None:
+            return {
+                "error": f"No IP block matched {args.block_id!r}.",
+                "hint": "Call list_ip_blocks to see available block names + UUIDs.",
+            }
+        stmt = stmt.where(Subnet.block_id == block_uuid)
     if args.vlan_id is not None:
         stmt = stmt.where(Subnet.vlan_id == args.vlan_id)
     if args.search:
@@ -247,9 +330,14 @@ class FindIPArgs(BaseModel):
 @register_tool(
     name="find_ip",
     description=(
-        "Look up an IP address across every subnet. Returns the IP's "
-        "metadata (hostname / FQDN / MAC / status / role / owner / "
-        "tags) and which subnet it belongs to."
+        "Look up a single IP address by its dotted-decimal value "
+        "(e.g. ``192.168.0.4``) and return its full row: hostname, "
+        "FQDN, **MAC address**, status, role, owner, tags, custom "
+        "fields, and which subnet it belongs to. Use this for any "
+        "question of the form 'what is the X of IP Y' — host name, "
+        "MAC, owner, last-seen timestamp, custom field value, etc. "
+        "Do NOT use ``query_dns_records`` for IP→MAC lookups; PTR "
+        "records carry hostnames, not MACs."
     ),
     args_model=FindIPArgs,
     category="ipam",
@@ -265,9 +353,16 @@ async def find_ip(db: AsyncSession, user: User, args: FindIPArgs) -> dict[str, A
     rows = (await db.execute(stmt)).scalars().all()
     if not rows:
         return {"matches": []}
+    # OUI vendor enrichment — bulk_lookup_vendors short-circuits to {}
+    # when the lookup feature is disabled, so this is a no-op cost on
+    # deployments that haven't seeded the OUI table.
+    vendors = await bulk_lookup_vendors(
+        db, [str(ip.mac_address) if ip.mac_address else None for ip in rows]
+    )
     out: list[dict[str, Any]] = []
     for ip in rows:
         sub = await db.get(Subnet, ip.subnet_id)
+        mac_key = normalize_mac_key(str(ip.mac_address)) if ip.mac_address else None
         out.append(
             {
                 "id": str(ip.id),
@@ -280,6 +375,7 @@ async def find_ip(db: AsyncSession, user: User, args: FindIPArgs) -> dict[str, A
                 "hostname": ip.hostname,
                 "fqdn": ip.fqdn,
                 "mac_address": str(ip.mac_address) if ip.mac_address else None,
+                "mac_vendor": vendors.get(mac_key) if mac_key else None,
                 "description": ip.description,
                 "last_seen_at": ip.last_seen_at.isoformat() if ip.last_seen_at else None,
                 "last_seen_method": ip.last_seen_method,

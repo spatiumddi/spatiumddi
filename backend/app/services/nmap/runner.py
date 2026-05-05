@@ -46,7 +46,13 @@ logger = structlog.get_logger(__name__)
 
 
 PRESETS: dict[str, list[str]] = {
-    "quick": ["-T4", "-F"],
+    # ``quick`` formerly used ``-F`` (top 100 ports). Bumped to top
+    # 1000 — same wall-clock under -T4 on modern networks, but
+    # catches a meaningfully bigger slice of services (everything in
+    # IANA's well-known + the bulk of registered ports). Operators
+    # who genuinely need the original tiny scan can fall back to
+    # ``custom`` with ``--top-ports 100`` in extra_args.
+    "quick": ["-T4", "--top-ports", "1000"],
     "service_version": ["-T4", "-sV", "--version-light"],
     "os_fingerprint": ["-T4", "-O"],
     # service_and_os combines service detection + OS fingerprinting in
@@ -62,7 +68,7 @@ PRESETS: dict[str, list[str]] = {
     # alive IPs the operator can use for discovery + IPAM seeding.
     "subnet_sweep": ["-sn", "-T4"],
     "default_scripts": ["-T4", "-sC"],
-    "udp_top100": ["-T4", "-sU", "--top-ports", "100"],
+    "udp_top1000": ["-T4", "-sU", "--top-ports", "1000"],
     "aggressive": ["-T4", "-A"],
     "custom": [],
 }

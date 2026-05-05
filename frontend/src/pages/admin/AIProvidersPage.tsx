@@ -22,7 +22,7 @@ import {
   type AIProviderUpdate,
   type AITestConnectionResult,
 } from "@/lib/api";
-import { Modal } from "@/components/ui/modal";
+import { Modal, ModalTabs } from "@/components/ui/modal";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -38,6 +38,9 @@ interface ProviderForm {
   is_enabled: boolean;
   priority: string;
   optionsJson: string;
+  // null on edit = leave override unchanged. "" = clear (revert to
+  // baked-in default). Non-empty = use as override.
+  system_prompt_override: string | null;
 }
 
 const EMPTY: ProviderForm = {
@@ -49,6 +52,7 @@ const EMPTY: ProviderForm = {
   is_enabled: true,
   priority: "100",
   optionsJson: "{}",
+  system_prompt_override: "",
 };
 
 function formFromProvider(p: AIProvider): ProviderForm {
@@ -64,6 +68,11 @@ function formFromProvider(p: AIProvider): ProviderForm {
     is_enabled: p.is_enabled,
     priority: String(p.priority),
     optionsJson: JSON.stringify(p.options ?? {}, null, 2),
+    // Pre-fill with whatever is stored — empty string when no
+    // override is set so the textarea starts blank rather than
+    // "null". The save path collapses an empty string back to
+    // "no override" on the wire.
+    system_prompt_override: p.system_prompt_override ?? "",
   };
 }
 
@@ -85,6 +94,12 @@ function toCreatePayload(form: ProviderForm): AIProviderCreate {
     is_enabled: form.is_enabled,
     priority,
     options,
+    // Empty / whitespace-only → omit so the backend stores NULL
+    // (= use baked-in default). Otherwise persist verbatim.
+    system_prompt_override:
+      form.system_prompt_override && form.system_prompt_override.trim()
+        ? form.system_prompt_override
+        : null,
   };
 }
 
@@ -110,6 +125,12 @@ function toUpdatePayload(form: ProviderForm): AIProviderUpdate {
   if (form.api_key !== null) {
     update.api_key = form.api_key;
   }
+  // ``null`` here is the sentinel for "leave override unchanged".
+  // We never send null on the wire — but the dirty-tracking flag on
+  // the form initialises to the stored override (or "" when unset),
+  // so any save will carry the operator's intent. Empty string =
+  // explicit clear (revert to default).
+  update.system_prompt_override = form.system_prompt_override ?? "";
   return update;
 }
 
@@ -135,6 +156,14 @@ function ProviderEditor({
   onTest: (form: ProviderForm) => void;
 }) {
   const [form, setForm] = useState<ProviderForm>(initial);
+  const [tab, setTab] = useState<"connection" | "system_prompt">("connection");
+  const { data: defaultPrompt = "", isLoading: defaultPromptLoading } =
+    useQuery({
+      queryKey: ["ai-default-system-prompt"],
+      queryFn: aiApi.getDefaultSystemPrompt,
+      // Static text — never changes within a session.
+      staleTime: Infinity,
+    });
 
   function set<K extends keyof ProviderForm>(key: K, v: ProviderForm[K]) {
     setForm((p) => ({ ...p, [key]: v }));
@@ -153,153 +182,187 @@ function ProviderEditor({
           </div>
         )}
 
-        <div className="grid grid-cols-2 gap-4">
-          <div>
-            <label className="mb-1 block text-xs font-medium text-muted-foreground">
-              Name
-            </label>
-            <input
-              value={form.name}
-              onChange={(e) => set("name", e.target.value)}
-              placeholder="e.g. local-ollama"
-              className={inputCls}
-            />
-          </div>
-          <div>
-            <label className="mb-1 block text-xs font-medium text-muted-foreground">
-              Kind
-            </label>
-            <select
-              value={form.kind}
-              onChange={(e) => set("kind", e.target.value as AIProviderKind)}
-              disabled={mode === "edit"}
-              className={`${inputCls} disabled:opacity-60`}
-            >
-              {AI_PROVIDER_KIND_AVAILABLE.map((k) => (
-                <option key={k} value={k}>
-                  {AI_PROVIDER_KIND_LABELS[k]}
-                </option>
-              ))}
-            </select>
-            {mode === "edit" && (
-              <p className="mt-1 text-xs text-muted-foreground">
-                Cannot change after creation.
-              </p>
-            )}
-          </div>
-          <div className="col-span-2">
-            <label className="mb-1 block text-xs font-medium text-muted-foreground">
-              Base URL
-            </label>
-            <input
-              value={form.base_url}
-              onChange={(e) => set("base_url", e.target.value)}
-              placeholder="http://host.docker.internal:11434/v1"
-              className={`${inputCls} font-mono text-xs`}
-            />
-            <p className="mt-1 text-xs text-muted-foreground">
-              For Ollama:{" "}
-              <code className="font-mono">
-                http://host.docker.internal:11434/v1
-              </code>{" "}
-              (note the <code>/v1</code> suffix). For OpenAI: leave empty or use{" "}
-              <code>https://api.openai.com/v1</code>.
-            </p>
-          </div>
-          <div className="col-span-2">
-            <label className="mb-1 block text-xs font-medium text-muted-foreground">
-              API key{" "}
-              <span className="text-muted-foreground/60">
-                (leave blank to keep unchanged
-                {mode === "edit"
-                  ? ` — currently ${initial.api_key === null ? "stored" : "—"}`
-                  : ""}
-                )
-              </span>
-            </label>
-            <input
-              type="password"
-              value={form.api_key ?? ""}
-              onChange={(e) => set("api_key", e.target.value)}
-              placeholder={
-                mode === "edit"
-                  ? "Type to replace, or clear to remove"
-                  : "Optional — local providers (Ollama, LM Studio) don't need one"
-              }
-              className={`${inputCls} font-mono text-xs`}
-            />
-          </div>
-          <div>
-            <label className="mb-1 block text-xs font-medium text-muted-foreground">
-              Default model
-            </label>
-            <input
-              value={form.default_model}
-              onChange={(e) => set("default_model", e.target.value)}
-              placeholder="e.g. llama3.1:8b or gpt-4o-mini"
-              className={`${inputCls} font-mono text-xs`}
-            />
-            {testResult?.ok && testResult.sample_models.length > 0 && (
-              <div className="mt-1.5 flex flex-wrap gap-1">
-                <span className="text-xs text-muted-foreground">Detected:</span>
-                {testResult.sample_models.map((m) => (
-                  <button
-                    key={m}
-                    type="button"
-                    onClick={() => set("default_model", m)}
-                    className={`rounded border px-1.5 py-0.5 font-mono text-[10px] transition-colors ${
-                      form.default_model === m
-                        ? "border-primary bg-primary/10 text-foreground"
-                        : "text-muted-foreground hover:border-foreground/30 hover:text-foreground"
-                    }`}
-                    title={`Use ${m}`}
-                  >
-                    {m}
-                  </button>
-                ))}
-              </div>
-            )}
-          </div>
-          <div>
-            <label className="mb-1 block text-xs font-medium text-muted-foreground">
-              Priority{" "}
-              <span className="text-muted-foreground/60">
-                (lower = preferred)
-              </span>
-            </label>
-            <input
-              value={form.priority}
-              onChange={(e) => set("priority", e.target.value)}
-              className={inputCls}
-            />
-          </div>
-          <div className="col-span-2">
-            <label className="flex items-center gap-2 text-sm">
-              <input
-                type="checkbox"
-                checked={form.is_enabled}
-                onChange={(e) => set("is_enabled", e.target.checked)}
-              />
-              Enabled
-            </label>
-          </div>
-          <div className="col-span-2">
-            <label className="mb-1 block text-xs font-medium text-muted-foreground">
-              Options (JSON){" "}
-              <span className="text-muted-foreground/60">
-                — temperature, max_tokens, request_timeout_seconds, …
-              </span>
-            </label>
-            <textarea
-              value={form.optionsJson}
-              onChange={(e) => set("optionsJson", e.target.value)}
-              rows={4}
-              className={`${inputCls} font-mono text-xs`}
-            />
-          </div>
-        </div>
+        <ModalTabs
+          tabs={[
+            { key: "connection", label: "Connection" },
+            { key: "system_prompt", label: "System prompt" },
+          ]}
+          active={tab}
+          onChange={setTab}
+        />
 
-        {testResult && (
+        {tab === "connection" && (
+          <div className="grid grid-cols-2 gap-4">
+            <div>
+              <label className="mb-1 block text-xs font-medium text-muted-foreground">
+                Name
+              </label>
+              <input
+                value={form.name}
+                onChange={(e) => set("name", e.target.value)}
+                placeholder="e.g. local-ollama"
+                className={inputCls}
+              />
+            </div>
+            <div>
+              <label className="mb-1 block text-xs font-medium text-muted-foreground">
+                Kind
+              </label>
+              <select
+                value={form.kind}
+                onChange={(e) => set("kind", e.target.value as AIProviderKind)}
+                disabled={mode === "edit"}
+                className={`${inputCls} disabled:opacity-60`}
+              >
+                {AI_PROVIDER_KIND_AVAILABLE.map((k) => (
+                  <option key={k} value={k}>
+                    {AI_PROVIDER_KIND_LABELS[k]}
+                  </option>
+                ))}
+              </select>
+              {mode === "edit" && (
+                <p className="mt-1 text-xs text-muted-foreground">
+                  Cannot change after creation.
+                </p>
+              )}
+            </div>
+            <div className="col-span-2">
+              <label className="mb-1 block text-xs font-medium text-muted-foreground">
+                Base URL
+              </label>
+              <input
+                value={form.base_url}
+                onChange={(e) => set("base_url", e.target.value)}
+                placeholder="http://host.docker.internal:11434/v1"
+                className={`${inputCls} font-mono text-xs`}
+              />
+              <p className="mt-1 text-xs text-muted-foreground">
+                For Ollama:{" "}
+                <code className="font-mono">
+                  http://host.docker.internal:11434/v1
+                </code>{" "}
+                (note the <code>/v1</code> suffix). For OpenAI: leave empty or
+                use <code>https://api.openai.com/v1</code>.
+                <br />
+                <span className="font-medium">
+                  Recommended local model:
+                </span>{" "}
+                <code className="font-mono">qwen3.5:latest</code> — best
+                tool-calling on the small open-weight class. Set
+                <code className="font-mono">
+                  {" "}
+                  OLLAMA_CONTEXT_LENGTH=32768
+                </code>{" "}
+                on the Ollama server (default 2048 silently truncates the tool
+                list).
+              </p>
+            </div>
+            <div className="col-span-2">
+              <label className="mb-1 block text-xs font-medium text-muted-foreground">
+                API key{" "}
+                <span className="text-muted-foreground/60">
+                  (leave blank to keep unchanged
+                  {mode === "edit"
+                    ? ` — currently ${initial.api_key === null ? "stored" : "—"}`
+                    : ""}
+                  )
+                </span>
+              </label>
+              <input
+                type="password"
+                value={form.api_key ?? ""}
+                onChange={(e) => set("api_key", e.target.value)}
+                placeholder={
+                  mode === "edit"
+                    ? "Type to replace, or clear to remove"
+                    : "Optional — local providers (Ollama, LM Studio) don't need one"
+                }
+                className={`${inputCls} font-mono text-xs`}
+              />
+            </div>
+            <div>
+              <label className="mb-1 block text-xs font-medium text-muted-foreground">
+                Default model
+              </label>
+              <input
+                value={form.default_model}
+                onChange={(e) => set("default_model", e.target.value)}
+                placeholder="e.g. llama3.1:8b or gpt-4o-mini"
+                className={`${inputCls} font-mono text-xs`}
+              />
+              {testResult?.ok && testResult.sample_models.length > 0 && (
+                <div className="mt-1.5 flex flex-wrap gap-1">
+                  <span className="text-xs text-muted-foreground">
+                    Detected:
+                  </span>
+                  {testResult.sample_models.map((m) => (
+                    <button
+                      key={m}
+                      type="button"
+                      onClick={() => set("default_model", m)}
+                      className={`rounded border px-1.5 py-0.5 font-mono text-[10px] transition-colors ${
+                        form.default_model === m
+                          ? "border-primary bg-primary/10 text-foreground"
+                          : "text-muted-foreground hover:border-foreground/30 hover:text-foreground"
+                      }`}
+                      title={`Use ${m}`}
+                    >
+                      {m}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+            <div>
+              <label className="mb-1 block text-xs font-medium text-muted-foreground">
+                Priority{" "}
+                <span className="text-muted-foreground/60">
+                  (lower = preferred)
+                </span>
+              </label>
+              <input
+                value={form.priority}
+                onChange={(e) => set("priority", e.target.value)}
+                className={inputCls}
+              />
+            </div>
+            <div className="col-span-2">
+              <label className="flex items-center gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  checked={form.is_enabled}
+                  onChange={(e) => set("is_enabled", e.target.checked)}
+                />
+                Enabled
+              </label>
+            </div>
+            <div className="col-span-2">
+              <label className="mb-1 block text-xs font-medium text-muted-foreground">
+                Options (JSON){" "}
+                <span className="text-muted-foreground/60">
+                  — temperature, max_tokens, request_timeout_seconds, num_ctx, …
+                </span>
+              </label>
+              <textarea
+                value={form.optionsJson}
+                onChange={(e) => set("optionsJson", e.target.value)}
+                rows={4}
+                className={`${inputCls} font-mono text-xs`}
+              />
+              <p className="mt-1 text-xs text-muted-foreground">
+                Sane Ollama defaults:{" "}
+                <code className="font-mono">
+                  {`{"temperature":0.2,"request_timeout_seconds":180}`}
+                </code>
+                . The Ollama OpenAI-compat shim ignores per-request num_ctx —
+                set <code className="font-mono">OLLAMA_CONTEXT_LENGTH</code> as
+                an env var on the Ollama server instead.
+              </p>
+            </div>
+          </div>
+        )}
+
+        {tab === "connection" && testResult && (
           <div
             className={`rounded-md border px-3 py-2 text-sm ${
               testResult.ok
@@ -328,6 +391,79 @@ function ProviderEditor({
                 </span>
               </div>
             )}
+          </div>
+        )}
+
+        {tab === "system_prompt" && (
+          <div className="space-y-4">
+            <div className="rounded-md border border-amber-500/30 bg-amber-500/5 px-3 py-2 text-xs text-amber-800 dark:text-amber-300">
+              The Operator Copilot system prompt steers the LLM. The baked-in
+              default sets persona, tool-use rules, write-action gating, and
+              formatting conventions — leaving an override empty uses that
+              default. Changes take effect on{" "}
+              <strong>new chat sessions only</strong>; existing sessions
+              snapshot the prompt at creation time.
+            </div>
+
+            <div>
+              <label className="mb-1 flex items-center justify-between text-xs font-medium text-muted-foreground">
+                <span>Override (leave blank to use default)</span>
+                {form.system_prompt_override &&
+                  form.system_prompt_override.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => set("system_prompt_override", "")}
+                      className="rounded border px-2 py-0.5 text-[11px] hover:bg-accent"
+                      title="Clear the override and revert to the baked-in default"
+                    >
+                      Reset to default
+                    </button>
+                  )}
+              </label>
+              <textarea
+                value={form.system_prompt_override ?? ""}
+                onChange={(e) => set("system_prompt_override", e.target.value)}
+                rows={14}
+                spellCheck={false}
+                placeholder="Paste a custom system prompt here, or leave blank to use the baked-in default shown below."
+                className={`${inputCls} font-mono text-xs`}
+              />
+              <div className="mt-1 flex items-center justify-between">
+                <p className="text-[11px] text-muted-foreground">
+                  {form.system_prompt_override &&
+                  form.system_prompt_override.length > 0
+                    ? `${form.system_prompt_override.length.toLocaleString()} characters`
+                    : "Empty — Copilot will use the baked-in default."}
+                </p>
+                {defaultPrompt && (
+                  <button
+                    type="button"
+                    onClick={() => set("system_prompt_override", defaultPrompt)}
+                    className="rounded border px-2 py-0.5 text-[11px] hover:bg-accent"
+                    title="Copy the default prompt into the override field as a starting point"
+                  >
+                    Start from default
+                  </button>
+                )}
+              </div>
+            </div>
+
+            <details className="rounded-md border bg-muted/20">
+              <summary className="cursor-pointer px-3 py-2 text-xs font-medium">
+                View baked-in default prompt
+              </summary>
+              <div className="border-t p-3">
+                {defaultPromptLoading ? (
+                  <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                    <Loader2 className="h-3 w-3 animate-spin" /> Loading…
+                  </div>
+                ) : (
+                  <pre className="whitespace-pre-wrap break-words font-mono text-[11px] leading-relaxed text-muted-foreground">
+                    {defaultPrompt}
+                  </pre>
+                )}
+              </div>
+            </details>
           </div>
         )}
 

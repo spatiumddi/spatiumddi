@@ -1067,7 +1067,7 @@ type AutoProfilePreset =
   | "os_fingerprint"
   | "service_and_os"
   | "default_scripts"
-  | "udp_top100"
+  | "udp_top1000"
   | "aggressive";
 
 function ProfilingSettingsSection({
@@ -1129,7 +1129,9 @@ function ProfilingSettingsSection({
               <option value="service_and_os">
                 service_and_os — services + OS guess (default)
               </option>
-              <option value="quick">quick — top 100 ports, no banner</option>
+              <option value="quick">
+                quick — top 1000 TCP ports, no banner
+              </option>
               <option value="service_version">
                 service_version — top 1000 ports + service banners
               </option>
@@ -1139,7 +1141,9 @@ function ProfilingSettingsSection({
               <option value="default_scripts">
                 default_scripts — NSE -sC checks
               </option>
-              <option value="udp_top100">udp_top100 — UDP top 100 ports</option>
+              <option value="udp_top1000">
+                udp_top1000 — UDP top 1000 ports
+              </option>
               <option value="aggressive">
                 aggressive — -A (loud, slow, full)
               </option>

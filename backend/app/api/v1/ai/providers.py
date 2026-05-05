@@ -29,6 +29,7 @@ from app.core.crypto import encrypt_str
 from app.drivers.llm import get_driver
 from app.drivers.llm.registry import known_kinds
 from app.models.ai import AI_PROVIDER_KINDS, AIProvider
+from app.services.ai.chat import _STATIC_SYSTEM_PROMPT
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()
@@ -50,6 +51,9 @@ class ProviderCreate(BaseModel):
     is_enabled: bool = False
     priority: int = 100
     options: dict[str, Any] = Field(default_factory=dict)
+    # Optional Operator Copilot system-prompt override for sessions
+    # that pick this provider. NULL/empty → baked-in default.
+    system_prompt_override: str | None = None
 
     @field_validator("kind")
     @classmethod
@@ -75,6 +79,9 @@ class ProviderUpdate(BaseModel):
     is_enabled: bool | None = None
     priority: int | None = None
     options: dict[str, Any] | None = None
+    # None → leave override unchanged. ``""`` → clear (revert to
+    # default). Non-empty → replace.
+    system_prompt_override: str | None = None
 
 
 class ProviderResponse(BaseModel):
@@ -87,8 +94,13 @@ class ProviderResponse(BaseModel):
     is_enabled: bool
     priority: int
     options: dict[str, Any]
+    system_prompt_override: str | None
     created_at: datetime
     modified_at: datetime
+
+
+class DefaultSystemPromptResponse(BaseModel):
+    prompt: str
 
 
 class TestConnectionRequest(BaseModel):
@@ -128,6 +140,7 @@ def _to_response(p: AIProvider) -> ProviderResponse:
         is_enabled=p.is_enabled,
         priority=p.priority,
         options=p.options or {},
+        system_prompt_override=p.system_prompt_override,
         created_at=p.created_at,
         modified_at=p.modified_at,
     )
@@ -188,6 +201,11 @@ async def create_provider(
         is_enabled=body.is_enabled,
         priority=body.priority,
         options=body.options,
+        # Empty string treated as "no override" so the UI's clear
+        # button can post "" without our ORM holding empty text.
+        system_prompt_override=(
+            body.system_prompt_override if body.system_prompt_override else None
+        ),
     )
     db.add(row)
     try:
@@ -214,6 +232,24 @@ async def create_provider(
     await db.refresh(row)
     logger.info("ai_provider_created", provider_id=str(row.id), kind=row.kind)
     return _to_response(row)
+
+
+@router.get(
+    "/providers/default-system-prompt",
+    response_model=DefaultSystemPromptResponse,
+)
+async def get_default_system_prompt(current_user: SuperAdmin) -> DefaultSystemPromptResponse:
+    """Return the baked-in Operator Copilot system prompt.
+
+    The provider edit modal shows this read-only so the operator can
+    see what they're overriding, copy it, and paste it back as a
+    starting point for their own override.
+
+    Registered ahead of ``GET /providers/{provider_id}`` because
+    Starlette matches by path template, not type — a typed-UUID
+    route declared first would swallow the literal.
+    """
+    return DefaultSystemPromptResponse(prompt=_STATIC_SYSTEM_PROMPT)
 
 
 @router.get("/providers/{provider_id}", response_model=ProviderResponse)
@@ -244,6 +280,11 @@ async def update_provider(
                 row.api_key_encrypted = None
             else:
                 row.api_key_encrypted = encrypt_str(v)
+        elif k == "system_prompt_override":
+            # Same convention as api_key — empty string clears the
+            # override (= revert to default); a non-empty string
+            # replaces it.
+            row.system_prompt_override = v if v else None
         else:
             setattr(row, k, v)
     try:

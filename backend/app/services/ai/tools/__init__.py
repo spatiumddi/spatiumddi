@@ -13,6 +13,8 @@ from app.services.ai.tools import (  # noqa: F401, E402
     dns,
     ipam,
     network,
+    network_modeling,
+    nmap,
     proposals,
 )
 from app.services.ai.tools.base import (

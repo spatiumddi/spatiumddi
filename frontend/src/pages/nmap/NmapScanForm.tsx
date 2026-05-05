@@ -41,9 +41,9 @@ const PRESETS: { id: NmapPreset; label: string; hint: string }[] = [
     hint: "Run NSE 'default' category (-sC) — auth, broadcast, discovery scripts.",
   },
   {
-    id: "udp_top100",
-    label: "UDP Top 100",
-    hint: "UDP sweep of the 100 most common ports (-sU --top-ports 100). Slow.",
+    id: "udp_top1000",
+    label: "UDP Top 1000",
+    hint: "UDP sweep of the 1000 most common ports (-sU --top-ports 1000). Slow.",
   },
   {
     id: "aggressive",

@@ -117,22 +117,94 @@ class OpenAICompatDriver(LLMDriver):
         if request.stop:
             kwargs["stop"] = list(request.stop)
 
+        # Ollama-compat passthrough. The OpenAI SDK's ``extra_body`` is
+        # merged into the request body verbatim — Ollama's OpenAI shim
+        # picks up nested ``options.num_ctx`` / ``num_predict`` etc. from
+        # there. Without this, Ollama silently caps context at its server
+        # default (2048 tokens), which truncates chat history mid-session
+        # and the model "forgets" earlier turns.
+        #
+        # Convention on ``AIProvider.options``:
+        #   * ``num_ctx``        — shortcut, forwarded as
+        #                          ``extra_body.options.num_ctx``.
+        #   * ``num_predict``    — same shape.
+        #   * ``extra_body``     — escape hatch, merged in as-is for
+        #                          power users (Modelfile-style overrides).
+        #
+        # Real OpenAI rejects unknown body fields with 400, so this only
+        # fires when the operator opts in via provider.options.
+        opts = self.provider.options or {}
+        extra_body: dict[str, Any] = {}
+        ollama_options: dict[str, Any] = {}
+        if "num_ctx" in opts:
+            ollama_options["num_ctx"] = opts["num_ctx"]
+        if "num_predict" in opts:
+            ollama_options["num_predict"] = opts["num_predict"]
+        if ollama_options:
+            extra_body["options"] = ollama_options
+        operator_extra_body = opts.get("extra_body")
+        if isinstance(operator_extra_body, dict):
+            # Shallow-merge so ``extra_body.options`` from the operator
+            # wins over our num_ctx/num_predict shortcuts when both
+            # supplied — gives them an explicit override path.
+            for k, v in operator_extra_body.items():
+                if k == "options" and isinstance(v, dict) and "options" in extra_body:
+                    extra_body["options"] = {**extra_body["options"], **v}
+                else:
+                    extra_body[k] = v
+        if extra_body:
+            kwargs["extra_body"] = extra_body
+
         # Tool-call accumulator keyed by index. The OpenAI streaming
         # spec sends incremental deltas — name typically arrives first,
         # arguments span multiple chunks.
         pending: dict[int, dict[str, str]] = {}
 
+        # Reasoning-channel buffer. Reasoning models (qwen3 / qwen3.5,
+        # DeepSeek-R1, o1/o3) emit chain-of-thought tokens via a
+        # parallel ``delta.reasoning`` stream. After a tool call,
+        # qwen3.5 with our prompt routes its *entire post-tool answer*
+        # to reasoning instead of content — so if we don't capture it,
+        # the user sees a tool_call event followed by silence. We hold
+        # the reasoning text and flush it as content **only when
+        # content was empty for the whole turn**, so for non-reasoning
+        # models nothing changes.
+        reasoning_buf = ""
+        emitted_content = False
+
         stream = await client.chat.completions.create(**kwargs)
         async for chunk in stream:
-            # Final usage chunk — no choices, just usage. Some Ollama
-            # versions emit an empty list here; guard accordingly.
+            # OpenAI / Ollama with ``stream_options.include_usage``
+            # emit a TRAILING chunk after ``finish_reason`` carrying
+            # only ``usage`` and an empty choices list. Our finish
+            # path already fired by then, so handle this case
+            # explicitly: surface a token-count ChatChunk so the
+            # orchestrator can persist usage/cost.
             choices = chunk.choices or []
+            if not choices:
+                usage = getattr(chunk, "usage", None)
+                if usage is not None:
+                    yield ChatChunk(
+                        prompt_tokens=getattr(usage, "prompt_tokens", None),
+                        completion_tokens=getattr(usage, "completion_tokens", None),
+                    )
+                continue
             for choice in choices:
                 delta = choice.delta
                 if delta is None:
                     continue
                 if getattr(delta, "content", None):
+                    emitted_content = True
                     yield ChatChunk(content_delta=delta.content)
+                # ``reasoning`` is not part of the canonical OpenAI
+                # schema, so the typed SDK objects don't expose it
+                # directly — fall through to the model_extra dict.
+                reasoning_delta = getattr(delta, "reasoning", None)
+                if reasoning_delta is None:
+                    extra = getattr(delta, "model_extra", None) or {}
+                    reasoning_delta = extra.get("reasoning")
+                if reasoning_delta:
+                    reasoning_buf += reasoning_delta
                 tool_calls = getattr(delta, "tool_calls", None) or []
                 for tc in tool_calls:
                     idx = tc.index
@@ -147,6 +219,15 @@ class OpenAICompatDriver(LLMDriver):
                             slot["arguments"] += fn.arguments
 
                 if choice.finish_reason:
+                    # Reasoning fallback: if the model wrote its
+                    # entire answer to ``reasoning`` and emitted no
+                    # ``content`` for this turn, flush the reasoning
+                    # buffer as content. Only fires when ``content``
+                    # was empty AND there were no tool calls (a
+                    # tool-call turn legitimately has empty content).
+                    has_tool_calls = bool(pending) or choice.finish_reason == "tool_calls"
+                    if not emitted_content and not has_tool_calls and reasoning_buf:
+                        yield ChatChunk(content_delta=reasoning_buf)
                     # Flush any accumulated tool calls before the
                     # terminal chunk.
                     for slot in pending.values():

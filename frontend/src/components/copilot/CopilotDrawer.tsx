@@ -1,8 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import ReactMarkdown from "react-markdown";
+import remarkGfm from "remark-gfm";
+import { useSessionState } from "@/lib/useSessionState";
 import {
   Archive,
   BookOpen,
+  Check,
+  Copy,
+  History as HistoryIcon,
+  Info,
   Loader2,
   MessageSquarePlus,
   Pencil,
@@ -12,13 +19,121 @@ import {
   Wrench,
   X,
 } from "lucide-react";
+import { copyToClipboard } from "@/lib/clipboard";
 import {
   aiApi,
+  nmapApi,
   streamChatTurn,
   type AIChatMessage,
   type AIChatSessionSummary,
   type AIPrompt,
+  type NmapScanRead,
 } from "@/lib/api";
+
+/** Render assistant content as Markdown with a curated set of element
+ *  overrides tuned for the chat-bubble aesthetic. Used by both the
+ *  committed-message bubble and the in-flight streaming bubble — the
+ *  partial token stream during streaming may briefly show half-formed
+ *  ``**`` or fence markers, but every popular chat UI does this and the
+ *  end state always renders correctly.
+ *
+ *  GFM is enabled for tables, strikethrough, and task lists. We don't
+ *  load math or syntax-highlight plugins — code fences render as
+ *  monospace blocks (sufficient for the CIDR / shell snippet cases the
+ *  copilot actually emits).
+ */
+function MarkdownContent({ children }: { children: string }) {
+  return (
+    <div className="prose-chat space-y-2 text-sm leading-relaxed [overflow-wrap:anywhere]">
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          p: ({ children }) => <p className="my-0">{children}</p>,
+          ul: ({ children }) => (
+            <ul className="my-1 list-disc space-y-0.5 pl-5">{children}</ul>
+          ),
+          ol: ({ children }) => (
+            <ol className="my-1 list-decimal space-y-0.5 pl-5">{children}</ol>
+          ),
+          li: ({ children }) => <li className="my-0">{children}</li>,
+          strong: ({ children }) => (
+            <strong className="font-semibold">{children}</strong>
+          ),
+          em: ({ children }) => <em className="italic">{children}</em>,
+          h1: ({ children }) => (
+            <h1 className="mt-2 mb-1 text-base font-semibold">{children}</h1>
+          ),
+          h2: ({ children }) => (
+            <h2 className="mt-2 mb-1 text-sm font-semibold">{children}</h2>
+          ),
+          h3: ({ children }) => (
+            <h3 className="mt-2 mb-1 text-sm font-semibold">{children}</h3>
+          ),
+          a: ({ children, href }) => (
+            <a
+              href={href}
+              target="_blank"
+              rel="noreferrer noopener"
+              className="text-primary underline underline-offset-2 hover:text-primary/80"
+            >
+              {children}
+            </a>
+          ),
+          code: ({ children, className }) => {
+            // ``react-markdown`` v9 doesn't pass an ``inline`` prop —
+            // a code element with no language class is inline; one
+            // with ``language-*`` is a fenced block.
+            const isBlock = /language-/.test(className ?? "");
+            if (isBlock) {
+              return (
+                <code
+                  className={`block whitespace-pre-wrap rounded bg-background/60 px-2 py-1 font-mono text-xs ${className ?? ""}`}
+                >
+                  {children}
+                </code>
+              );
+            }
+            return (
+              <code className="rounded bg-background/60 px-1 py-0.5 font-mono text-[0.85em]">
+                {children}
+              </code>
+            );
+          },
+          pre: ({ children }) => (
+            <pre className="my-1 overflow-x-auto rounded border bg-background/60 p-2 text-xs">
+              {children}
+            </pre>
+          ),
+          blockquote: ({ children }) => (
+            <blockquote className="my-1 border-l-2 border-muted-foreground/30 pl-3 text-muted-foreground">
+              {children}
+            </blockquote>
+          ),
+          table: ({ children }) => (
+            <div className="my-1 overflow-x-auto">
+              <table className="w-full border-collapse text-xs">
+                {children}
+              </table>
+            </div>
+          ),
+          th: ({ children }) => (
+            <th className="border-b px-2 py-1 text-left font-medium">
+              {children}
+            </th>
+          ),
+          td: ({ children }) => (
+            <td className="border-b border-foreground/10 px-2 py-1">
+              {children}
+            </td>
+          ),
+          hr: () => <hr className="my-2 border-foreground/10" />,
+        }}
+      >
+        {children}
+      </ReactMarkdown>
+    </div>
+  );
+}
 
 /**
  * Chat drawer (issue #90 Wave 3). Slides in from the right when the
@@ -62,7 +177,14 @@ export function CopilotDrawer({
   onPromptConsumed?: () => void;
 }) {
   const qc = useQueryClient();
-  const [activeSessionId, setActiveSessionId] = useState<string | null>(null);
+  // Persist across drawer close/reopen within the same browser session
+  // so the operator doesn't lose their place when they click off the
+  // chat. Cleared by the "New session" / "Delete session" actions and
+  // when the active session id is no longer reachable on the backend.
+  const [activeSessionId, setActiveSessionId] = useSessionState<string | null>(
+    "spatium.copilot.activeSessionId",
+    null,
+  );
   // Local in-flight stream — mirror of what's also being persisted on
   // the backend. Reset whenever a stream ends (success or failure).
   const [streamingContent, setStreamingContent] = useState<string>("");
@@ -118,7 +240,20 @@ export function CopilotDrawer({
         ? aiApi.getSession(activeSessionId)
         : Promise.resolve(null),
     enabled: activeSessionId !== null,
+    // 404 here means the persisted session id (from sessionStorage)
+    // points at a session that no longer exists — relogin, manual
+    // delete from the DB, etc. Don't retry; we'll clear it below.
+    retry: false,
   });
+
+  // Drop a stale persisted session id when the backend says it's gone.
+  // Without this the drawer gets stuck showing a "session not found"
+  // error on every open.
+  useEffect(() => {
+    if (detailQ.isError && activeSessionId) {
+      setActiveSessionId(null);
+    }
+  }, [detailQ.isError, activeSessionId, setActiveSessionId]);
 
   // ``pendingContext`` arrives when the drawer was opened via
   // ``askAI({ context })`` (right-click "Ask AI about this"). Whenever
@@ -276,11 +411,43 @@ export function CopilotDrawer({
     mutationFn: (id: string) => aiApi.deleteSession(id),
     onSuccess: (_, id) => {
       qc.invalidateQueries({ queryKey: ["ai-sessions"] });
+      // Cascade-delete on ai_chat_message drops the row's tokens
+      // from the today-so-far rollup; refresh the usage chip so
+      // the operator doesn't see a stale tally.
+      qc.invalidateQueries({ queryKey: ["ai-usage-me"] });
       if (id === activeSessionId) {
         setActiveSessionId(null);
       }
     },
   });
+
+  // Multi-select for bulk delete in the History panel.
+  // Local-only state — the ids don't need to survive close/reopen.
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const bulkDeleteMut = useMutation({
+    // No dedicated bulk-delete endpoint — fan out per-id deletes in
+    // parallel. Practical chat-history sizes (single-digit to low-100s)
+    // are well within what the API can handle.
+    mutationFn: async (ids: string[]) => {
+      await Promise.all(ids.map((id) => aiApi.deleteSession(id)));
+    },
+    onSuccess: (_, ids) => {
+      qc.invalidateQueries({ queryKey: ["ai-sessions"] });
+      qc.invalidateQueries({ queryKey: ["ai-usage-me"] });
+      if (activeSessionId && ids.includes(activeSessionId)) {
+        setActiveSessionId(null);
+      }
+      setSelectedIds(new Set());
+    },
+  });
+  function toggleSelected(id: string) {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
 
   const messages = useMemo<AIChatMessage[]>(() => {
     if (!detailQ.data) return [];
@@ -336,20 +503,22 @@ export function CopilotDrawer({
               type="button"
               onClick={() => setActiveSessionId(null)}
               title="New chat"
-              className="rounded-md border px-2 py-1 text-xs text-muted-foreground hover:bg-accent"
+              className="inline-flex items-center gap-1 rounded-md border px-2 py-1 text-xs text-muted-foreground hover:bg-accent"
             >
               <MessageSquarePlus className="h-3.5 w-3.5" />
+              New chat
             </button>
             <button
               type="button"
               onClick={() => setShowHistory((v) => !v)}
               title="Recent chats"
-              className={`rounded-md border px-2 py-1 text-xs ${
+              className={`inline-flex items-center gap-1 rounded-md border px-2 py-1 text-xs ${
                 showHistory
                   ? "bg-accent text-foreground"
                   : "text-muted-foreground hover:bg-accent"
               }`}
             >
+              <HistoryIcon className="h-3.5 w-3.5" />
               History
             </button>
             <button
@@ -371,11 +540,85 @@ export function CopilotDrawer({
                 No chat history yet.
               </div>
             )}
+            {(sessionsQ.data ?? []).length > 0 && (
+              <div className="sticky top-0 z-10 flex items-center justify-between gap-2 border-b bg-card px-4 py-1.5 text-xs">
+                {selectedIds.size > 0 ? (
+                  <>
+                    <span className="text-muted-foreground">
+                      {selectedIds.size} selected
+                    </span>
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => setSelectedIds(new Set())}
+                        className="rounded border px-2 py-0.5 hover:bg-accent"
+                      >
+                        Cancel
+                      </button>
+                      <button
+                        type="button"
+                        disabled={bulkDeleteMut.isPending}
+                        onClick={() => {
+                          const ids = Array.from(selectedIds);
+                          if (
+                            confirm(
+                              `Delete ${ids.length} chat${ids.length === 1 ? "" : "s"}? This cannot be undone.`,
+                            )
+                          ) {
+                            bulkDeleteMut.mutate(ids);
+                          }
+                        }}
+                        className="rounded border border-destructive/40 bg-destructive/10 px-2 py-0.5 text-destructive hover:bg-destructive/20 disabled:opacity-50"
+                      >
+                        {bulkDeleteMut.isPending
+                          ? "Deleting…"
+                          : `Delete ${selectedIds.size}`}
+                      </button>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const all = new Set(
+                          (sessionsQ.data ?? []).map((s) => s.id),
+                        );
+                        setSelectedIds(all);
+                      }}
+                      className="rounded border px-2 py-0.5 text-muted-foreground hover:bg-accent"
+                    >
+                      Select all
+                    </button>
+                    <button
+                      type="button"
+                      disabled={bulkDeleteMut.isPending}
+                      onClick={() => {
+                        const ids = (sessionsQ.data ?? []).map((s) => s.id);
+                        if (
+                          ids.length > 0 &&
+                          confirm(
+                            `Delete all ${ids.length} chats? This cannot be undone.`,
+                          )
+                        ) {
+                          bulkDeleteMut.mutate(ids);
+                        }
+                      }}
+                      className="rounded border border-destructive/30 px-2 py-0.5 text-destructive hover:bg-destructive/10 disabled:opacity-50"
+                    >
+                      Delete all
+                    </button>
+                  </>
+                )}
+              </div>
+            )}
             {(sessionsQ.data ?? []).map((s) => (
               <SessionRow
                 key={s.id}
                 session={s}
                 active={s.id === activeSessionId}
+                selected={selectedIds.has(s.id)}
+                onToggleSelect={() => toggleSelected(s.id)}
                 onPick={() => {
                   setActiveSessionId(s.id);
                   setShowHistory(false);
@@ -499,7 +742,9 @@ function MessageBubble({ message }: { message: AIChatMessage }) {
   }
   const isUser = message.role === "user";
   return (
-    <div className={`mb-3 flex ${isUser ? "justify-end" : "justify-start"}`}>
+    <div
+      className={`mb-3 flex flex-col ${isUser ? "items-end" : "items-start"}`}
+    >
       <div
         className={`max-w-[85%] rounded-lg px-3 py-2 text-sm ${
           isUser
@@ -507,11 +752,15 @@ function MessageBubble({ message }: { message: AIChatMessage }) {
             : "bg-muted text-foreground"
         }`}
       >
-        {message.content && (
-          <pre className="whitespace-pre-wrap break-words font-sans">
-            {message.content}
-          </pre>
-        )}
+        {message.content &&
+          (isUser ? (
+            // User messages are plain text — they typed it, not Markdown.
+            <pre className="whitespace-pre-wrap break-words font-sans">
+              {message.content}
+            </pre>
+          ) : (
+            <MarkdownContent>{message.content}</MarkdownContent>
+          ))}
         {message.tool_calls && message.tool_calls.length > 0 && (
           <div className="mt-2 space-y-1">
             {message.tool_calls.map((tc) => (
@@ -526,6 +775,111 @@ function MessageBubble({ message }: { message: AIChatMessage }) {
                 </span>
               </div>
             ))}
+          </div>
+        )}
+      </div>
+      {!isUser && message.content && <MessageFooter message={message} />}
+    </div>
+  );
+}
+
+/** Sub-bubble metadata row rendered below assistant messages.
+ *
+ *  Mirrors the OpenWebUI footer pattern: token count, copy button,
+ *  info popover with timing + cost. Hidden during streaming because
+ *  ``StreamingBubble`` is the in-flight surface — the footer attaches
+ *  to the *committed* row that lands when the turn finishes.
+ */
+function MessageFooter({ message }: { message: AIChatMessage }) {
+  const [copied, setCopied] = useState(false);
+  const [showInfo, setShowInfo] = useState(false);
+  const tokensIn = message.tokens_in;
+  const tokensOut = message.tokens_out;
+  const totalTokens =
+    tokensIn !== null && tokensOut !== null ? tokensIn + tokensOut : null;
+
+  async function onCopy() {
+    const ok = await copyToClipboard(message.content);
+    if (ok) {
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1200);
+    }
+  }
+
+  return (
+    <div className="mt-1 flex items-center gap-2 text-[10px] text-muted-foreground">
+      {totalTokens !== null && (
+        <span className="tabular-nums">
+          {totalTokens.toLocaleString()} tokens
+          {tokensIn !== null && tokensOut !== null && (
+            <span className="opacity-70">
+              {" "}
+              ({tokensIn.toLocaleString()} in / {tokensOut.toLocaleString()}{" "}
+              out)
+            </span>
+          )}
+        </span>
+      )}
+      <button
+        type="button"
+        onClick={onCopy}
+        title="Copy message"
+        className="inline-flex items-center gap-1 rounded px-1 py-0.5 hover:bg-accent"
+      >
+        {copied ? (
+          <Check className="h-3 w-3 text-emerald-600" />
+        ) : (
+          <Copy className="h-3 w-3" />
+        )}
+      </button>
+      <div className="relative">
+        <button
+          type="button"
+          onClick={() => setShowInfo((v) => !v)}
+          title="Message details"
+          className={`inline-flex items-center rounded px-1 py-0.5 hover:bg-accent ${
+            showInfo ? "bg-accent text-foreground" : ""
+          }`}
+        >
+          <Info className="h-3 w-3" />
+        </button>
+        {showInfo && (
+          <div className="absolute z-10 mt-1 w-56 rounded-md border bg-popover p-2 text-[11px] shadow-md">
+            <div className="mb-1 font-medium text-foreground">
+              Message details
+            </div>
+            <dl className="space-y-0.5">
+              <div className="flex justify-between gap-2">
+                <dt className="text-muted-foreground">Sent</dt>
+                <dd className="tabular-nums">
+                  {new Date(message.created_at).toLocaleString()}
+                </dd>
+              </div>
+              {tokensIn !== null && (
+                <div className="flex justify-between gap-2">
+                  <dt className="text-muted-foreground">Tokens in</dt>
+                  <dd className="tabular-nums">{tokensIn.toLocaleString()}</dd>
+                </div>
+              )}
+              {tokensOut !== null && (
+                <div className="flex justify-between gap-2">
+                  <dt className="text-muted-foreground">Tokens out</dt>
+                  <dd className="tabular-nums">{tokensOut.toLocaleString()}</dd>
+                </div>
+              )}
+              {message.latency_ms !== null && (
+                <div className="flex justify-between gap-2">
+                  <dt className="text-muted-foreground">Latency</dt>
+                  <dd className="tabular-nums">
+                    {(message.latency_ms / 1000).toFixed(2)}s
+                  </dd>
+                </div>
+              )}
+              <div className="flex justify-between gap-2">
+                <dt className="text-muted-foreground">Role</dt>
+                <dd>{message.role}</dd>
+              </div>
+            </dl>
           </div>
         )}
       </div>
@@ -628,6 +982,14 @@ function ProposalCard({
             </pre>
           </details>
         )}
+        {applied &&
+          operation === "run_nmap_scan" &&
+          typeof (proposal?.result as { id?: string } | null)?.id ===
+            "string" && (
+            <NmapScanLiveResult
+              scanId={(proposal!.result as { id: string }).id}
+            />
+          )}
         {proposal?.error && (
           <div className="mt-2 rounded border border-destructive/30 bg-destructive/5 p-2 text-xs text-destructive">
             {proposal.error}
@@ -698,6 +1060,171 @@ function ToolCard({ message }: { message: AIChatMessage }) {
   );
 }
 
+/** Live nmap-scan progress + results rendered inside the proposal card.
+ *
+ *  Polls ``GET /nmap/scans/{id}`` every 2 s until the scan reaches a
+ *  terminal state. Shows status pill while running; on completion
+ *  renders host_state, open ports table, OS guess.
+ *
+ *  Single-host scans render the top-level summary; CIDR scans render
+ *  the per-host list when present.
+ */
+function NmapScanLiveResult({ scanId }: { scanId: string }) {
+  const scanQ = useQuery({
+    queryKey: ["nmap-scan", scanId],
+    queryFn: () => nmapApi.getScan(scanId),
+    // Poll until terminal state lands. ``refetchInterval`` returns
+    // false once we're done so React Query stops the timer.
+    refetchInterval: (q) => {
+      const s = (q.state.data as NmapScanRead | undefined)?.status;
+      if (s && ["completed", "failed", "cancelled"].includes(s)) return false;
+      return 2000;
+    },
+    refetchIntervalInBackground: false,
+  });
+
+  const scan = scanQ.data;
+  if (!scan) {
+    return (
+      <div className="mt-2 flex items-center gap-2 rounded border bg-background/40 px-2 py-1.5 text-[11px] text-muted-foreground">
+        <Loader2 className="h-3 w-3 animate-spin" /> Loading scan…
+      </div>
+    );
+  }
+
+  const terminal = ["completed", "failed", "cancelled"].includes(scan.status);
+  const statusCls =
+    scan.status === "completed"
+      ? "bg-emerald-500/10 text-emerald-600 border-emerald-500/30"
+      : scan.status === "failed"
+        ? "bg-destructive/10 text-destructive border-destructive/30"
+        : scan.status === "cancelled"
+          ? "bg-zinc-500/10 text-zinc-600 border-zinc-500/30"
+          : "bg-amber-500/10 text-amber-600 border-amber-500/30";
+
+  const ports = scan.summary?.ports ?? [];
+  const openPorts = ports.filter((p) => p.state === "open");
+  const hosts = scan.summary?.hosts ?? null;
+
+  return (
+    <div className="mt-2 rounded border bg-background/40 p-2 text-[11px]">
+      <div className="flex flex-wrap items-center gap-2">
+        <span className="font-medium">Scan</span>
+        <span
+          className={`rounded border px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wider ${statusCls}`}
+        >
+          {scan.status}
+        </span>
+        {!terminal && <Loader2 className="h-3 w-3 animate-spin" />}
+        {scan.duration_seconds !== null && terminal && (
+          <span className="text-muted-foreground">
+            {scan.duration_seconds.toFixed(1)}s
+          </span>
+        )}
+      </div>
+
+      {scan.status === "completed" && (
+        <div className="mt-2 space-y-2">
+          {scan.summary?.host_state && !hosts && (
+            <div>
+              <span className="text-muted-foreground">Host state: </span>
+              <span className="font-mono">{scan.summary.host_state}</span>
+            </div>
+          )}
+          {!hosts && openPorts.length > 0 && (
+            <div>
+              <div className="mb-1 text-muted-foreground">
+                Open ports ({openPorts.length})
+              </div>
+              <table className="w-full font-mono text-[10px]">
+                <thead className="text-muted-foreground">
+                  <tr>
+                    <th className="text-left">Port</th>
+                    <th className="text-left">Service</th>
+                    <th className="text-left">Version</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {openPorts.map((p) => (
+                    <tr
+                      key={`${p.proto}-${p.port}`}
+                      className="border-t border-foreground/10"
+                    >
+                      <td className="py-0.5 pr-2">
+                        {p.port}/{p.proto}
+                      </td>
+                      <td className="py-0.5 pr-2">{p.service ?? "—"}</td>
+                      <td className="py-0.5 break-all">
+                        {[p.product, p.version, p.extrainfo]
+                          .filter(Boolean)
+                          .join(" ") || "—"}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+          {!hosts && openPorts.length === 0 && (
+            <div className="text-muted-foreground">No open ports detected.</div>
+          )}
+          {scan.summary?.os?.name && (
+            <div>
+              <span className="text-muted-foreground">OS guess: </span>
+              <span className="font-mono">{scan.summary.os.name}</span>
+              {typeof scan.summary.os.accuracy === "number" && (
+                <span className="text-muted-foreground">
+                  {" "}
+                  ({scan.summary.os.accuracy}%)
+                </span>
+              )}
+            </div>
+          )}
+          {hosts && (
+            <div>
+              <div className="mb-1 text-muted-foreground">
+                {hosts.length} host{hosts.length === 1 ? "" : "s"}
+              </div>
+              <table className="w-full font-mono text-[10px]">
+                <thead className="text-muted-foreground">
+                  <tr>
+                    <th className="text-left">Address</th>
+                    <th className="text-left">State</th>
+                    <th className="text-left">Open ports</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {hosts.map((h) => (
+                    <tr
+                      key={h.address ?? Math.random()}
+                      className="border-t border-foreground/10"
+                    >
+                      <td className="py-0.5 pr-2">{h.address ?? "—"}</td>
+                      <td className="py-0.5 pr-2">{h.host_state}</td>
+                      <td className="py-0.5">
+                        {(h.ports ?? [])
+                          .filter((p) => p.state === "open")
+                          .map((p) => `${p.port}/${p.proto}`)
+                          .join(", ") || "—"}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+        </div>
+      )}
+
+      {scan.status === "failed" && scan.error_message && (
+        <div className="mt-2 rounded border border-destructive/30 bg-destructive/5 p-1.5 text-destructive">
+          {scan.error_message}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function StreamingBubble({
   content,
   tools,
@@ -755,10 +1282,10 @@ function StreamingBubble({
         {(content || (!content && tools.length === 0 && !error)) && (
           <div className="rounded-lg bg-muted px-3 py-2 text-sm">
             {content ? (
-              <pre className="whitespace-pre-wrap break-words font-sans">
-                {content}
-                <span className="ml-1 inline-block h-3 w-1 animate-pulse bg-foreground/50" />
-              </pre>
+              <div className="relative">
+                <MarkdownContent>{content}</MarkdownContent>
+                <span className="ml-1 inline-block h-3 w-1 animate-pulse bg-foreground/50 align-middle" />
+              </div>
             ) : (
               <Loader2 className="h-4 w-4 animate-spin" />
             )}
@@ -777,6 +1304,8 @@ function StreamingBubble({
 function SessionRow({
   session,
   active,
+  selected,
+  onToggleSelect,
   onPick,
   onRename,
   onArchive,
@@ -784,6 +1313,8 @@ function SessionRow({
 }: {
   session: AIChatSessionSummary;
   active: boolean;
+  selected: boolean;
+  onToggleSelect: () => void;
   onPick: () => void;
   onRename: (name: string) => void;
   onArchive: () => void;
@@ -795,6 +1326,14 @@ function SessionRow({
         active ? "bg-accent" : ""
       }`}
     >
+      <input
+        type="checkbox"
+        checked={selected}
+        onChange={onToggleSelect}
+        onClick={(e) => e.stopPropagation()}
+        title="Select for bulk action"
+        className="h-3.5 w-3.5 shrink-0 cursor-pointer accent-primary"
+      />
       <button
         type="button"
         onClick={onPick}
@@ -855,7 +1394,9 @@ function ChatComposer({
   pendingPrompt?: string | null;
   onPromptConsumed?: () => void;
 }) {
-  const [text, setText] = useState("");
+  // Persist the half-typed message across drawer close/reopen so the
+  // operator can step away mid-thought. Cleared on submit.
+  const [text, setText] = useSessionState<string>("spatium.copilot.draft", "");
   const [showPrompts, setShowPrompts] = useState(false);
   const taRef = useRef<HTMLTextAreaElement | null>(null);
 

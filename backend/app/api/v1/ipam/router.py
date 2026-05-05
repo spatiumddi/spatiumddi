@@ -1641,7 +1641,7 @@ class SubnetCreate(BaseModel):
             "os_fingerprint",
             "service_and_os",
             "default_scripts",
-            "udp_top100",
+            "udp_top1000",
             "aggressive",
         }
         if v not in allowed:
@@ -1760,7 +1760,7 @@ class SubnetUpdate(BaseModel):
             "os_fingerprint",
             "service_and_os",
             "default_scripts",
-            "udp_top100",
+            "udp_top1000",
             "aggressive",
         }
         if v not in allowed:
@@ -5840,7 +5840,7 @@ class ProfileScanRequest(BaseModel):
             "os_fingerprint",
             "service_and_os",
             "default_scripts",
-            "udp_top100",
+            "udp_top1000",
             "aggressive",
         }
         if v not in allowed:
