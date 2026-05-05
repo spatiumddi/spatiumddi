@@ -136,6 +136,34 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
             {"action": "admin", "resource_type": "provider"},
         ],
     ),
+    "Auditor": (
+        "Read-only on conformity evaluations (issue #106) plus read on "
+        "audit log + classifications. Suitable for an external auditor "
+        "account that should be able to pull the conformity PDF and "
+        "verify the underlying evidence without making changes.",
+        [
+            {"action": "read", "resource_type": "conformity"},
+            {"action": "read", "resource_type": "audit"},
+            {"action": "read", "resource_type": "subnet"},
+            {"action": "read", "resource_type": "ip_address"},
+            {"action": "read", "resource_type": "dns_zone"},
+            {"action": "read", "resource_type": "dhcp_scope"},
+        ],
+    ),
+    "Compliance Editor": (
+        "Full CRUD on conformity policies (issue #106) plus read on the "
+        "underlying resources (subnets / IPs / zones / scopes) so the "
+        "compliance team can author + tune policies without touching "
+        "operational config.",
+        [
+            {"action": "admin", "resource_type": "conformity"},
+            {"action": "read", "resource_type": "audit"},
+            {"action": "read", "resource_type": "subnet"},
+            {"action": "read", "resource_type": "ip_address"},
+            {"action": "read", "resource_type": "dns_zone"},
+            {"action": "read", "resource_type": "dhcp_scope"},
+        ],
+    ),
 }
 
 
@@ -214,6 +242,18 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await seed_builtin_compliance_alert_rules()
     except Exception as exc:  # noqa: BLE001
         logger.debug("compliance_alert_rules_seed_skipped", reason=str(exc))
+    # Conformity policies — eight starter rows covering PCI / HIPAA /
+    # internet-facing / SOC2 (issue #106). Disabled by default so
+    # they don't burn cycles until the operator opts in.
+    # Idempotent; failure-tolerant.
+    try:
+        from app.services.conformity import (  # noqa: PLC0415
+            seed_builtin_conformity_policies,
+        )
+
+        await seed_builtin_conformity_policies()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("conformity_policies_seed_skipped", reason=str(exc))
     yield
     logger.info("shutdown", service="api")
 

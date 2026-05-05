@@ -5060,6 +5060,152 @@ export const alertsApi = {
     api.post<AlertEvaluateResult>("/alerts/evaluate").then((r) => r.data),
 };
 
+// ── Conformity evaluations (issue #106) ─────────────────────────────────────
+
+export type ConformityTargetKind =
+  | "platform"
+  | "subnet"
+  | "ip_address"
+  | "dns_zone"
+  | "dhcp_scope";
+export type ConformityStatus = "pass" | "fail" | "warn" | "not_applicable";
+export type ConformitySeverity = "info" | "warning" | "critical";
+
+export interface ConformityPolicy {
+  id: string;
+  name: string;
+  description: string;
+  framework: string;
+  reference: string | null;
+  severity: ConformitySeverity;
+  target_kind: ConformityTargetKind;
+  target_filter: Record<string, unknown>;
+  check_kind: string;
+  check_args: Record<string, unknown>;
+  is_builtin: boolean;
+  enabled: boolean;
+  eval_interval_hours: number;
+  last_evaluated_at: string | null;
+  fail_alert_rule_id: string | null;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface ConformityPolicyCreate {
+  name: string;
+  description?: string;
+  framework?: string;
+  reference?: string | null;
+  severity?: ConformitySeverity;
+  target_kind: ConformityTargetKind;
+  target_filter?: Record<string, unknown>;
+  check_kind: string;
+  check_args?: Record<string, unknown>;
+  enabled?: boolean;
+  eval_interval_hours?: number;
+  fail_alert_rule_id?: string | null;
+}
+
+export type ConformityPolicyUpdate = Partial<ConformityPolicyCreate>;
+
+export interface ConformityResult {
+  id: string;
+  policy_id: string;
+  resource_kind: string;
+  resource_id: string;
+  resource_display: string;
+  evaluated_at: string;
+  status: ConformityStatus;
+  detail: string;
+  diagnostic: Record<string, unknown> | null;
+}
+
+export interface ConformityFrameworkRollup {
+  framework: string;
+  policies_total: number;
+  policies_enabled: number;
+  pass_count: number;
+  warn_count: number;
+  fail_count: number;
+  not_applicable_count: number;
+}
+
+export interface ConformitySummary {
+  overall_pass: number;
+  overall_warn: number;
+  overall_fail: number;
+  overall_not_applicable: number;
+  last_evaluated_at: string | null;
+  frameworks: ConformityFrameworkRollup[];
+}
+
+export interface ConformityCheckCatalogEntry {
+  name: string;
+  label: string;
+  supports: ConformityTargetKind[];
+  args: {
+    name: string;
+    type: string;
+    required: boolean;
+    label?: string;
+    default?: unknown;
+    options?: string[];
+  }[];
+}
+
+export interface ConformityEvaluateResult {
+  passed: number;
+  failed: number;
+  warned: number;
+  not_applicable: number;
+  total: number;
+}
+
+export const conformityApi = {
+  listPolicies: (params: { framework?: string; enabled_only?: boolean } = {}) =>
+    api
+      .get<ConformityPolicy[]>("/conformity/policies", { params })
+      .then((r) => r.data),
+  getPolicy: (id: string) =>
+    api.get<ConformityPolicy>(`/conformity/policies/${id}`).then((r) => r.data),
+  createPolicy: (body: ConformityPolicyCreate) =>
+    api
+      .post<ConformityPolicy>("/conformity/policies", body)
+      .then((r) => r.data),
+  updatePolicy: (id: string, body: ConformityPolicyUpdate) =>
+    api
+      .patch<ConformityPolicy>(`/conformity/policies/${id}`, body)
+      .then((r) => r.data),
+  deletePolicy: (id: string) => api.delete(`/conformity/policies/${id}`),
+  evaluatePolicyNow: (id: string) =>
+    api
+      .post<ConformityEvaluateResult>(`/conformity/policies/${id}/evaluate`)
+      .then((r) => r.data),
+  listResults: (
+    params: {
+      policy_id?: string;
+      resource_kind?: string;
+      resource_id?: string;
+      status?: ConformityStatus;
+      since?: string;
+      limit?: number;
+    } = {},
+  ) =>
+    api
+      .get<ConformityResult[]>("/conformity/results", { params })
+      .then((r) => r.data),
+  summary: () =>
+    api.get<ConformitySummary>("/conformity/summary").then((r) => r.data),
+  listCheckKinds: () =>
+    api
+      .get<ConformityCheckCatalogEntry[]>("/conformity/checks")
+      .then((r) => r.data),
+  exportPdfUrl: (framework?: string) =>
+    framework
+      ? `/api/v1/conformity/export.pdf?framework=${encodeURIComponent(framework)}`
+      : "/api/v1/conformity/export.pdf",
+};
+
 // ── Domain registration (RDAP / WHOIS tracking) ─────────────────────────────
 
 export type DomainWhoisState =

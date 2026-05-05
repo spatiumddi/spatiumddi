@@ -17,6 +17,7 @@ celery_app = Celery(
         "app.tasks.dhcp_mac_blocks",
         "app.tasks.dhcp_pull_leases",
         "app.tasks.alerts",
+        "app.tasks.conformity",
         "app.tasks.heartbeat",
         "app.tasks.oui_update",
         "app.tasks.prune_logs",
@@ -150,6 +151,14 @@ celery_app.conf.update(
         # audit-forward syslog + webhook targets.
         "alerts-evaluate": {
             "task": "app.tasks.alerts.evaluate_alerts",
+            "schedule": schedule(run_every=60.0),
+        },
+        # Every 60 s, tick the conformity evaluator. Per-policy
+        # gating via ``eval_interval_hours`` keeps the work cheap —
+        # default policies run once a day, on-demand re-eval is the
+        # immediate path for "did my fix turn this green?" workflows.
+        "conformity-evaluate": {
+            "task": "app.tasks.conformity.evaluate_conformity",
             "schedule": schedule(run_every=60.0),
         },
         # Every 10 s, drain the typed-event outbox (webhooks). Uses

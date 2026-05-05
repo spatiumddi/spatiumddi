@@ -129,6 +129,7 @@ const adminNotificationsNav = [
 const adminInsightsNav = [
   { label: "Audit Log", icon: ClipboardList, to: "/admin/audit" },
   { label: "Compliance", icon: ShieldCheck, to: "/admin/compliance" },
+  { label: "Conformity", icon: ShieldCheck, to: "/admin/conformity" },
   { label: "Platform Insights", icon: Cpu, to: "/admin/platform-insights" },
   { label: "Trash", icon: Trash2, to: "/admin/trash" },
 ];

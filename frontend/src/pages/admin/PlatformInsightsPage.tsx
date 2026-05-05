@@ -13,6 +13,7 @@ import {
 } from "lucide-react";
 import {
   aiApi,
+  conformityApi,
   postgresApi,
   containersApi,
   type PostgresOverview,
@@ -22,6 +23,8 @@ import {
   type ContainerStat,
 } from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
+import { Link } from "react-router-dom";
+import { ShieldCheck } from "lucide-react";
 
 type TabKey = "postgres" | "containers";
 
@@ -570,9 +573,114 @@ export function PlatformInsightsPage() {
         {tab === "postgres" && <PostgresPanel />}
         {tab === "containers" && <ContainersPanel />}
 
+        <ConformityPanel />
         <AIUsagePanel />
       </div>
     </div>
+  );
+}
+
+function ConformityPanel() {
+  const summaryQ = useQuery({
+    queryKey: ["conformity-summary"],
+    queryFn: () => conformityApi.summary(),
+    staleTime: 60 * 1000,
+    refetchOnWindowFocus: false,
+    retry: false,
+  });
+
+  if (summaryQ.isLoading || !summaryQ.data) {
+    return null;
+  }
+  const summary = summaryQ.data;
+  const total =
+    summary.overall_pass +
+    summary.overall_warn +
+    summary.overall_fail +
+    summary.overall_not_applicable;
+  return (
+    <section className="rounded-lg border bg-card p-4">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <h2 className="flex items-center gap-2 text-base font-semibold">
+            <ShieldCheck className="h-4 w-4" />
+            Conformity
+          </h2>
+          <p className="text-xs text-muted-foreground">
+            Latest policy results aggregated by framework. Drill into{" "}
+            <Link
+              to="/admin/conformity"
+              className="text-primary hover:underline"
+            >
+              Conformity admin
+            </Link>{" "}
+            to manage policies and pull the auditor PDF.
+          </p>
+        </div>
+        <div className="text-right text-[11px] text-muted-foreground">
+          {summary.last_evaluated_at ? (
+            <>
+              Last eval: {new Date(summary.last_evaluated_at).toLocaleString()}
+            </>
+          ) : (
+            <>No policies evaluated yet.</>
+          )}
+        </div>
+      </div>
+      {summary.frameworks.length === 0 ? (
+        <p className="mt-3 text-xs text-muted-foreground">
+          No conformity policies are configured.
+        </p>
+      ) : (
+        <div className="mt-3 grid gap-2 md:grid-cols-2 xl:grid-cols-4">
+          {summary.frameworks.map((fw) => {
+            const fwTotal =
+              fw.pass_count +
+              fw.warn_count +
+              fw.fail_count +
+              fw.not_applicable_count;
+            const passPct =
+              fwTotal > 0 ? Math.round((fw.pass_count / fwTotal) * 100) : 0;
+            return (
+              <div
+                key={fw.framework}
+                className="rounded-md border bg-background p-3"
+              >
+                <p className="text-xs font-semibold">{fw.framework}</p>
+                <p className="text-[11px] text-muted-foreground">
+                  {fw.policies_enabled}/{fw.policies_total} policies enabled
+                </p>
+                <p className="mt-1 text-lg font-bold tabular-nums">
+                  {passPct}%
+                </p>
+                <p className="text-[11px] text-muted-foreground">
+                  <span className="text-emerald-600 dark:text-emerald-400">
+                    {fw.pass_count} pass
+                  </span>{" "}
+                  ·{" "}
+                  <span className="text-amber-600 dark:text-amber-400">
+                    {fw.warn_count} warn
+                  </span>{" "}
+                  ·{" "}
+                  <span className="text-red-600 dark:text-red-400">
+                    {fw.fail_count} fail
+                  </span>
+                </p>
+              </div>
+            );
+          })}
+        </div>
+      )}
+      {total === 0 && (
+        <p className="mt-3 rounded-md border bg-muted/20 p-2 text-[11px] text-muted-foreground">
+          Built-in policies ship disabled. Toggle a policy on in{" "}
+          <Link to="/admin/conformity" className="text-primary hover:underline">
+            /admin/conformity
+          </Link>{" "}
+          to start collecting results.
+        </p>
+      )}
+    </section>
   );
 }
 
