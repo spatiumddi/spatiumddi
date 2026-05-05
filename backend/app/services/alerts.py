@@ -39,11 +39,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.alerts import AlertEvent, AlertRule
 from app.models.asn import ASN, ASNRpkiRoa
 from app.models.circuit import Circuit
-from app.models.dhcp import DHCPServer
-from app.models.dns import DNSServer
+from app.models.dhcp import DHCPScope, DHCPServer
+from app.models.dns import DNSServer, DNSZone
 from app.models.domain import Domain
-from app.models.ipam import Subnet
+from app.models.ipam import IPBlock, Subnet
+from app.models.network_service import NetworkService, NetworkServiceResource
+from app.models.ownership import Site
 from app.models.settings import PlatformSettings
+from app.models.vrf import VRF
 from app.services import audit_forward
 
 logger = structlog.get_logger(__name__)
@@ -64,6 +67,9 @@ RULE_TYPE_DOMAIN_DNSSEC_CHANGED = "domain_dnssec_status_changed"
 # Circuit rule types — alerting hooks for issue #93.
 RULE_TYPE_CIRCUIT_TERM_EXPIRING = "circuit_term_expiring"
 RULE_TYPE_CIRCUIT_STATUS_CHANGED = "circuit_status_changed"
+# Service catalog rule types — alerting hooks for issue #94.
+RULE_TYPE_SERVICE_TERM_EXPIRING = "service_term_expiring"
+RULE_TYPE_SERVICE_RESOURCE_ORPHANED = "service_resource_orphaned"
 
 RULE_TYPES = frozenset(
     {
@@ -79,8 +85,24 @@ RULE_TYPES = frozenset(
         RULE_TYPE_DOMAIN_DNSSEC_CHANGED,
         RULE_TYPE_CIRCUIT_TERM_EXPIRING,
         RULE_TYPE_CIRCUIT_STATUS_CHANGED,
+        RULE_TYPE_SERVICE_TERM_EXPIRING,
+        RULE_TYPE_SERVICE_RESOURCE_ORPHANED,
     }
 )
+
+# Resource-kind → SQLAlchemy model for the orphan sweep. Mirrors the
+# router's ``_KIND_MODEL`` map; ``overlay_network`` is intentionally
+# absent because the router rejects attach attempts for that kind, so
+# no orphan can exist.
+_ORPHAN_RESOURCE_MODELS: dict[str, Any] = {
+    "vrf": VRF,
+    "subnet": Subnet,
+    "ip_block": IPBlock,
+    "dns_zone": DNSZone,
+    "dhcp_scope": DHCPScope,
+    "circuit": Circuit,
+    "site": Site,
+}
 
 # ``circuit_status_changed`` — destination statuses that are
 # operator-noteworthy. ``active`` ↔ ``pending`` flips during
@@ -705,6 +727,119 @@ async def _evaluate_circuit_status_changed_rule(
     return opened, resolved, delivered_syslog, delivered_webhook, delivered_smtp
 
 
+# ── Service catalog rule evaluators ─────────────────────────────────
+
+
+async def _matching_service_term_expiring_subjects(
+    db: AsyncSession,
+    rule: AlertRule,
+    now: datetime,
+) -> list[tuple[str, str, str, str]]:
+    """Return ``[(subject_id, display, message, severity)]`` for the
+    ``service_term_expiring`` rule type. Mirrors the
+    ``circuit_term_expiring`` shape — same severity escalation, same
+    ``decom`` / soft-delete exclusions.
+    """
+    threshold_days = rule.threshold_days or _DEFAULT_EXPIRING_THRESHOLD_DAYS
+    cutoff = (now + timedelta(days=threshold_days)).date()
+
+    rows = (
+        (
+            await db.execute(
+                select(NetworkService)
+                .where(NetworkService.deleted_at.is_(None))
+                .where(NetworkService.status != "decom")
+                .where(NetworkService.term_end_date.is_not(None))
+                .where(NetworkService.term_end_date <= cutoff)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    matches: list[tuple[str, str, str, str]] = []
+    today = now.date()
+    for s in rows:
+        if s.term_end_date is None:
+            continue
+        days_to_expiry = (s.term_end_date - today).days
+        sev = _escalate_severity_for_expiring(
+            rule.severity,
+            threshold_days=threshold_days,
+            days_to_expiry=days_to_expiry,
+        )
+        if days_to_expiry <= 0:
+            descriptor = "term has expired"
+        elif days_to_expiry == 1:
+            descriptor = "term expires tomorrow"
+        else:
+            descriptor = f"term expires in {days_to_expiry} day(s)"
+        message = (
+            f"Service {s.name} {descriptor} "
+            f"(term_end_date {s.term_end_date.isoformat()}, threshold "
+            f"{threshold_days} d)"
+        )
+        matches.append((str(s.id), s.name, message, sev))
+    return matches
+
+
+async def _matching_service_resource_orphaned_subjects(
+    db: AsyncSession,
+    rule: AlertRule,  # noqa: ARG001 — symmetry with sibling evaluators
+) -> list[tuple[str, str, str]]:
+    """Every ``NetworkServiceResource`` join row whose target row no
+    longer exists or is soft-deleted.
+
+    The subject_id is the join row's own PK (not the missing target's
+    ID) so that detaching the orphan link resolves the alert via the
+    standard "subject no longer matches" branch in ``evaluate_all``.
+
+    Soft-deleted services are skipped — their join rows are
+    intentionally preserved during the trash window so a restore
+    brings the bundle back intact, and surfacing alerts for them while
+    they're in the trash bin would just be noise.
+    """
+    rows = (
+        await db.execute(
+            select(NetworkServiceResource, NetworkService.name)
+            .join(
+                NetworkService,
+                NetworkServiceResource.service_id == NetworkService.id,
+            )
+            .where(NetworkService.deleted_at.is_(None))
+        )
+    ).all()
+
+    matches: list[tuple[str, str, str]] = []
+    for link, svc_name in rows:
+        # ``overlay_network`` is reserved for #95 and the router blocks
+        # attach attempts, so no orphan is possible. If a row somehow
+        # exists, treat it as orphaned so the operator notices.
+        model = _ORPHAN_RESOURCE_MODELS.get(link.resource_kind)
+        if model is None:
+            display = f"{svc_name}::{link.resource_kind}::{link.resource_id}"
+            message = (
+                f"Service {svc_name!r} has a resource link of unknown kind "
+                f"{link.resource_kind!r} — manual review needed"
+            )
+            matches.append((str(link.id), display, message))
+            continue
+
+        target = await db.get(model, link.resource_id)
+        is_orphan = target is None or getattr(target, "deleted_at", None) is not None
+        if not is_orphan:
+            continue
+
+        display = f"{svc_name}::{link.resource_kind}::{link.resource_id}"
+        message = (
+            f"Service {svc_name!r} references {link.resource_kind} "
+            f"{link.resource_id} but the target row no longer exists — "
+            f"detach or re-attach to resolve"
+        )
+        matches.append((str(link.id), display, message))
+    return matches
+
+
 # ── Delivery ───────────────────────────────────────────────────────────────
 
 
@@ -846,6 +981,14 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 expiring = await _matching_circuit_term_expiring_subjects(db, rule, now)
                 matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in expiring]
                 subject_type = "circuit"
+            elif rule.rule_type == RULE_TYPE_SERVICE_TERM_EXPIRING:
+                expiring = await _matching_service_term_expiring_subjects(db, rule, now)
+                matches = [(sid, disp, msg, sev) for sid, disp, msg, sev in expiring]
+                subject_type = "network_service"
+            elif rule.rule_type == RULE_TYPE_SERVICE_RESOURCE_ORPHANED:
+                orphans = await _matching_service_resource_orphaned_subjects(db, rule)
+                matches = [(sid, disp, msg, None) for sid, disp, msg in orphans]
+                subject_type = "network_service_resource"
             elif rule.rule_type == RULE_TYPE_CIRCUIT_STATUS_CHANGED:
                 # Transition-style rule with its own evaluator that
                 # latches ``(from, to, changed_at)`` snapshots and

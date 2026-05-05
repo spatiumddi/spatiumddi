@@ -137,7 +137,9 @@ class AlertEvent(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     # What fired. `subject_type` mirrors the rule type family:
     #   "subnet"  — subject_id is a Subnet UUID, display is "<CIDR> — <name>"
     #   "server"  — subject_id is a DNS/DHCPServer UUID, display is the name
-    subject_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    # 40 chars accommodates the longest type today
+    # (``network_service_resource`` = 25) with room for future families.
+    subject_type: Mapped[str] = mapped_column(String(40), nullable=False)
     subject_id: Mapped[str] = mapped_column(String(64), nullable=False)
     subject_display: Mapped[str] = mapped_column(String(500), nullable=False, default="")
 
