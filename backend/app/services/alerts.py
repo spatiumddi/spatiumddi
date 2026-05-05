@@ -642,20 +642,14 @@ async def _evaluate_circuit_status_changed_rule(
     # ``last_status_change_at``. Without that, every evaluation pass
     # would re-fire on the same transition.
     last_event_res = await db.execute(
-        select(AlertEvent)
-        .where(AlertEvent.rule_id == rule.id)
-        .order_by(AlertEvent.fired_at.desc())
+        select(AlertEvent).where(AlertEvent.rule_id == rule.id).order_by(AlertEvent.fired_at.desc())
     )
     last_event_by_subject: dict[str, AlertEvent] = {}
     for ev in last_event_res.scalars().all():
         if ev.subject_id not in last_event_by_subject:
             last_event_by_subject[ev.subject_id] = ev
 
-    rows = (
-        (await db.execute(select(Circuit).where(Circuit.deleted_at.is_(None))))
-        .scalars()
-        .all()
-    )
+    rows = (await db.execute(select(Circuit).where(Circuit.deleted_at.is_(None)))).scalars().all()
     for c in rows:
         subject_id = str(c.id)
         if c.last_status_change_at is None:
