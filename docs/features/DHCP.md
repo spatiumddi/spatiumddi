@@ -765,3 +765,31 @@ a "Raw signature" disclosure) the option-55 / option-60 strings.
 The same surface lets operators force a re-lookup if they think the
 fingerbank result is wrong (the dispatched task ignores the cache
 window for that one MAC).
+
+## 16. PXE / iPXE provisioning profiles (issue #51)
+
+Operator-curated `pxe_profile` rows wrap the per-architecture TFTP
+boot story so the same scope can serve legacy PXE BIOS, EFI x86_64,
+EFI ARM64, and EFI x86 clients without hand-written client classes.
+
+**Data model.** New `pxe_profile` table — name + description +
+`next_server` (TFTP host) + four nullable `boot_filename_*` columns
+keyed on architecture (`bios_x86` / `efi_x86_64` / `efi_arm64` /
+`efi_x86`) + an optional `ipxe_script` body. Profiles live at the
+DHCP server-group level so the same profile serves every Kea
+server in the group.
+
+**Per-scope binding.** `DHCPScope.pxe_profile_id` is a SET-NULL FK
+to `pxe_profile`. The scope create / edit modal surfaces a "PXE
+profile" picker; null = no PXE on this scope.
+
+**Kea render.** When a scope has a PXE profile attached, the agent
+renders one `client-class` per arch-match (matching DHCP option 93
+via `option dhcp.client-arch`) plus one `iPXE` class guarded by a
+substring match on `option dhcp.user-class` so legacy PXE clients
+see the BIOS bootfile and iPXE clients (which loop back with the
+`iPXE` user-class set) jump straight to the chained iPXE script.
+
+**Admin UI.** New `/dhcp/groups/{id}/pxe` page lists profiles for a
+group with create / edit / delete + an in-line preview of the
+rendered Kea client-class block.

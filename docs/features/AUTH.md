@@ -56,6 +56,30 @@ SpatiumDDI's auth stack has three layers:
 - `admin` / `admin` is seeded on first start with `force_password_change=True`.
   Reset the password from the CLI with the one-liner in the README.
 
+## TOTP MFA (issue #69)
+
+Local-user 2FA stacks on top of the password flow. External-identity
+users (LDAP / OIDC / SAML / RADIUS / TACACS+) handle MFA at the
+provider, not in SpatiumDDI.
+
+- **Enrolment**: Settings → Security → "Enable MFA" generates a fresh
+  TOTP secret stored Fernet-encrypted in `user_mfa_secret`. The
+  backend emits the `otpauth://` provisioning URI via
+  `pyotp.TOTP(secret).provisioning_uri(...)`; the frontend renders
+  the QR code client-side from that URI. The operator scans with
+  Authenticator / Authy / 1Password / Bitwarden, enters a 6-digit code
+  to confirm enrolment, and the next page shows 10 single-use backup
+  codes (persisted hashed). Backup codes are only shown once.
+- **Login flow**: when MFA is enabled, the `POST /auth/login` response
+  carries a short-lived **pre-token** instead of the full access token.
+  The UI prompts for either a 6-digit TOTP code or a backup code and
+  exchanges the pre-token via `POST /auth/login/mfa-verify` for the
+  real `{access_token, refresh_token}` pair. Backup codes are
+  invalidated on use.
+- **Admin force-disable**: a superadmin can clear another user's MFA
+  via `DELETE /users/{id}/mfa`. The action lands in the audit log and
+  the affected user can re-enrol from scratch.
+
 ## External identity providers
 
 All providers are configured at runtime from `/admin/auth-providers`. The
@@ -292,10 +316,31 @@ in the audit viewer.
 ## API tokens
 
 Long-lived bearer credentials for scripts, CI pipelines, and
-automation. A token is equivalent to its owning user for permission
-purposes — no separate RBAC surface yet. Tokens are indistinguishable
-from JWTs on the wire (both use `Authorization: Bearer …`); the auth
-middleware peeks at the prefix to pick the validation path.
+automation. As of issue #74, tokens carry an explicit `scopes` set
+that **narrows** the owning user's permissions — a token can do at
+most what its scope set allows AND what the owning user has
+permission for. Tokens are indistinguishable from JWTs on the wire
+(both use `Authorization: Bearer …`); the auth middleware peeks at
+the prefix to pick the validation path.
+
+**Scopes (issue #74).** `APIToken.scopes` is a JSONB list of
+permission strings at resource-type granularity:
+
+- `subnet:read` / `subnet:admin` — read or full-CRUD on a single
+  resource type
+- `dns_zone:read` etc.
+- `*` — full inheritance (token can do everything the owning user
+  can do; equivalent to the pre-#74 behaviour)
+
+Empty scope set is treated as `["*"]` for backward compatibility on
+tokens minted before the column existed; new tokens default to
+explicit operator-picked scopes via the chip selector in the create
+modal.
+
+Authorization is the **intersection** of scope and user permission:
+a `subnet:read` token owned by an IPAM Editor can list subnets but
+cannot create one; the same scope owned by a Viewer can also only
+read because the user lacks admin to begin with.
 
 **Wire format.** Raw tokens start with `sddi_` followed by 40
 url-safe base64 characters. Operators typically see only the first

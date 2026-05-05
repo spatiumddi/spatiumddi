@@ -1070,6 +1070,58 @@ it. Numeric input added to Create + Edit subnet modals next to the
 VLAN picker; chip on the subnet detail header next to the existing
 VLAN chip when set.
 
+### ✅ 15.20 IPAM template classes (issue #26)
+
+Reusable stamp templates for blocks + subnets. New `ipam_template`
+table captures default tags / custom-fields / DNS / DHCP / DDNS
+settings (plus an optional sub-subnet `child_layout`) and stamps
+them onto blocks or subnets at apply time. ``applies_to`` locks
+each template to one of the two carriers so apply-time semantics
+stay unambiguous. ``force=False`` fills only empty/null target
+columns; ``force=True`` overwrites unconditionally and is the path
+``/reapply-all`` uses to refresh drift across every recorded
+instance (cap 200). ``IPBlockCreate.template_id`` /
+``SubnetCreate.template_id`` add optional pre-fill on the create
+paths; carrier rows now carry an ``applied_template_id`` SET-NULL
+FK so a "reapply across instances" sweep can find every row touched.
+Block templates with ``child_layout`` carve sub-subnets sequentially
+on apply (and on create); idempotent — sub-subnets already at a
+target CIDR are skipped. Admin → Platform → IPAM Templates page
+with list + tabbed editor (General / Tags + CFs + DNS-DHCP / DDNS /
+Child layout). New `manage_ipam_templates` permission seeded into
+the IPAM Editor builtin role.
+
+### ✅ 15.21 Block move across IP spaces (issue #27)
+
+`POST /ipam/blocks/{id}/move` accepts a target `space_id` + a
+typed-name confirmation. Pre-flight validates target space exists,
+no CIDR overlap in the target tree, every dependent row (DNS
+records, DHCP scopes, addresses with custom-field inheritance)
+survives the move. `MoveBlockModal` walks the operator through
+the consequences with a chevron-revealed list of affected resources
+before the typed-name confirm unlocks Move.
+
+### ✅ 15.22 Subnet classification tags (issue #75)
+
+Four boolean columns on `subnet` for compliance flags:
+`pci_scope`, `hipaa_scope`, `internet_facing`, `contains_pii`.
+Tags inherit through the IP block tree (set on a parent block →
+all descendant subnets get the tag) with an explicit override
+toggle on the subnet. List filters across the IPAM page + the API.
+Compliance card on Platform Insights shows rolled-up counts.
+
+### ✅ 15.23 Split-horizon DNS publishing at the IPAM layer (issue #25)
+
+`IPBlock.dns_split_horizon` boolean + the existing
+`dns_inherit_settings` walk. When set, descendant subnets publish
+records to `dns_zone_id` (internal) AND every entry in
+`dns_additional_zone_ids` (DMZ / external). Per-record routing is
+decided by the new `IPAddress.dns_zone_overrides` JSONB list
+(`[{zone_id, record_type}]`) so an operator can pin one address to
+publish only into the internal zone. Auto-sync task respects the
+split. Closes the IPAM-layer half of the split-horizon roadmap;
+DNS Views (#24) covers the recursive-resolver-side split.
+
 ## 16. Rules & constraints
 
 Server-side validations that reject requests with a human-readable

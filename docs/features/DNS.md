@@ -760,3 +760,29 @@ most of these feed the IPAM / DNS / DHCP UI error banners directly.
 - **`dnssec_validation` enum.** `auto`, `yes`, or `no`. Validator at
   `backend/app/api/v1/dns/router.py:336`.
 
+## 16. Multi-group / split-horizon publishing at the IPAM layer (issue #25)
+
+Distinct from §2's DNS Views (which split horizons at the
+recursive-resolver layer): #25 splits at the **IPAM** layer so an
+operator can publish the same address into both an internal zone
+and a public zone simultaneously, with per-record routing overrides
+when a single host should appear only inside.
+
+**Block-level flag.** `IPBlock.dns_split_horizon` is a boolean. When
+true, descendant subnets that inherit DNS settings publish records
+to **both** `dns_zone_id` (the internal / primary zone) AND every
+entry in `dns_additional_zone_ids` (DMZ / external zones). The
+existing `dns_inherit_settings` walk picks this up, so flipping the
+flag at the block level cascades down without per-subnet edits.
+
+**Per-record override.** `IPAddress.dns_zone_overrides` is a JSONB
+list of `[{zone_id, record_type}]` pairs. When set, the auto-sync
+emits records only into the listed zones for the listed record
+types — useful for "this one bastion should only have an A record
+in the internal zone, no PTR, no external A".
+
+**Auto-sync.** The scheduled IPAM ↔ DNS auto-sync respects the
+split: each address that lands in a split-horizon subnet emits one
+record per zone that survives the override filter. DDNS for DHCP
+leases follows the same path.
+

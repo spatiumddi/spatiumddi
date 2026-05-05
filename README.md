@@ -83,6 +83,10 @@
 | 🤝 | **BGP peering + communities** | peer / customer / provider / sibling graph between tracked ASNs · BGP communities catalog (RFC 1997 / 7611 / 7999 well-knowns + per-AS extensions, large communities per RFC 8092) |
 | 🛣 | **VRFs as first-class** | name / RD / import + export RTs / optional ASN linkage · cross-cutting RD/RT validator (warns or 422s on ASN-portion mismatch) · VRF picker on IPSpace + IPBlock modals · auto-backfill from existing freeform fields |
 | 📛 | **Domain registration tracking** | distinct from DNSZone — registrar / registrant / expiry / nameservers / DNSSEC · RDAP refresh (TLD → RDAP-base via IANA bootstrap) · NS-drift, registrar-changed, DNSSEC-status-changed alerts · explicit `dns_zone.domain_id` linkage with sub-zone tree fallback |
+| 🏢 | **Customer / Site / Provider** | logical ownership entities cross-cutting IPAM / DNS / DHCP / Network · `ON DELETE SET NULL` cross-references on every existing table so re-tagging is safe · shared pickers + chips wired into every modal |
+| 🛤 | **WAN circuits** | carrier-supplied logical pipe (provider + transport class + bandwidth + endpoints + term + cost) · 9 transport classes including AWS DX / Azure ER / GCP Interconnect cross-connects · soft-deletable (`status='decom'` is operator-visible end-of-life) · alerts for term-expiring + status-changed |
+| 📦 | **Service catalog** | bundles VRF / Subnet / IPBlock / DNSZone / DHCPScope / Circuit / Site / Overlay into a customer-deliverable · `mpls_l3vpn` + `sdwan` + `custom` kinds in v1 · kind-aware `/summary` endpoint with L3VPN canonical shape · alerts for term-expiring + resource-orphaned |
+| 🌐 | **SD-WAN overlays** | vendor-neutral overlay topology + routing-policy intent · 6 kinds (sdwan / ipsec / wireguard / dmvpn / vxlan-evpn / gre) · ordered preferred-circuit chain per site · 33 well-known SaaS apps in the catalog · pure read-only `/simulate` what-if when circuits go down · SVG circular-layout topology view |
 
 ### 🔍 Discovery & visibility
 
@@ -108,7 +112,10 @@
 
 | | Feature | Highlights |
 |---|---|---|
-| 🔒 | **RBAC + external auth** | LDAP · OIDC · SAML · RADIUS · TACACS+ with backup-server failover · API tokens with auto-expiry |
+| 🔒 | **RBAC + external auth** | LDAP · OIDC · SAML · RADIUS · TACACS+ with backup-server failover · API tokens with auto-expiry · scoped API tokens (per-permission) |
+| 🛡 | **TOTP MFA** | local-user 2FA — QR enrolment via `pyotp` + `qrcode` · single-use backup codes · admin force-disable per user (audit-logged) |
+| 🏷 | **Subnet classification tags** | `pci_scope` · `hipaa_scope` · `internet_facing` · `contains_pii` — inheritable through the IP block tree · compliance roll-up card on Platform Insights |
+| 🤖 | **Operator Copilot (AI)** | multi-vendor — OpenAI / Anthropic (Claude) / Azure OpenAI / Google Gemini / OpenAI-compat (Ollama, vLLM, Together, Groq, Fireworks) · automatic failover across enabled providers · 18 read-only tools + MCP HTTP endpoint · "Ask AI about this" affordances on every resource · custom prompts library · Cmd-K palette · daily digest · token / cost observability with per-user caps · write tools with preview / apply flow |
 | 🔔 | **Alerts + forwarding** | rule-based alerts · multi-target syslog (RFC 5424 / CEF / LEEF / RFC 3164) · HTTP webhooks · SMTP email · Slack / Teams / Discord chat |
 | 🪝 | **Typed-event webhooks** | 96 typed events (resource × verb) · HMAC-SHA256 signed · outbox-backed retry with backoff + dead-letter |
 | 🔐 | **ACME DNS-01** | `acme-dns`-compatible — certbot / lego / acme.sh issue public certs (wildcards included) |
@@ -252,6 +259,34 @@ The tables above are the elevator pitch. The bullets here are the same surface w
   - Per-row expiry countdown badges (green > 90 d / amber 30–90 d / red < 30 d / dark-red expired)
   - **Explicit `dns_zone.domain_id` linkage** with sub-zone suffix-match fallback — `test.example.com` shows up under `example.com`'s linked-zones tab; `example.com.au` correctly does NOT
 
+- 🏢 **Customer / Site / Provider** — three first-class logical ownership rows that cross-cut IPAM / DNS / DHCP / Network.
+  - **`Customer`** — soft-deletable; account number / contact info / status (active / inactive / decommissioning) / tags
+  - **`Site`** — hierarchical via `parent_site_id`; unique-per-parent `code` (NULLS NOT DISTINCT for top-level deduping); kinds (datacenter / branch / pop / colo / cloud_region / customer_premise) + free-form region label
+  - **`Provider`** — kinds (transit / peering / carrier / cloud / registrar / sdwan_vendor) + optional `default_asn_id` FK
+  - **Cross-reference FKs** added on subnet / ip_block / ip_space / vrf / dns_zone / asn / network_device / domain / circuit / network_service / overlay_network — every column is `ON DELETE SET NULL` so re-tagging is safe and operators never lose data
+  - Shared `CustomerPicker` / `SitePicker` / `ProviderPicker` (with optional kind filter) + matching Chip components plug into every IPAM / DNS / circuit / overlay create + edit modal
+
+- 🛤 **WAN circuits** — carrier-supplied logical pipe distinct from the equipment that lights it up.
+  - Data model: `circuit` table with `provider_id` (RESTRICT), optional `customer_id` (SET NULL), 4 endpoint refs (a/z-end site + subnet, all SET NULL), `transport_class` enum (mpls / internet_broadband / fiber_direct / wavelength / lte / satellite / direct_connect_aws / express_route_azure / interconnect_gcp), asymmetric `bandwidth_mbps_down` / `bandwidth_mbps_up`, `term_start_date` / `term_end_date`, `monthly_cost` + 3-letter ISO 4217 currency
+  - **Soft-deletable** — `status='decom'` is the operator-visible end-of-life flag; row stays restorable for "what carrier did Site-X use in 2024?" audits
+  - List page at `/network/circuits` with bulk-action table + tabbed editor modal (General / Endpoints / Term + cost / Notes) + colour-coded term-end badge
+  - **Alert rules** — `circuit_term_expiring` (severity escalates around `threshold_days`), `circuit_status_changed` (only fires on `suspended` / `decom` transitions; auto-resolves after 7 d)
+
+- 📦 **Service catalog** — bundles network resources into a customer-deliverable.
+  - `NetworkService` is one row per thing the operator delivers; polymorphic `NetworkServiceResource` join row binds to VRF / Subnet / IPBlock / DNSZone / DHCPScope / Circuit / Site / OverlayNetwork
+  - **Kinds in v1**: `mpls_l3vpn` (with hard at-most-one-VRF rule + soft warnings for missing VRF, fewer than 2 edge sites, edge subnet's enclosing block in a different VRF) and `custom`. `sdwan` lit up alongside the SD-WAN overlay roadmap. Future kinds reserved in the column: `mpls_l2vpn` / `vpls` / `evpn` / `dia` / `hosted_dns` / `hosted_dhcp`
+  - **Kind-aware `/summary` endpoint** — L3VPN view returns canonical VRF + edge sites + edge circuits + edge subnets + warnings
+  - **Reverse lookup** — `GET /by-resource/{kind}/{id}` returns every service referencing a given resource
+  - **Alert rules** — `service_term_expiring` (mirrors circuit shape), `service_resource_orphaned` (sweep over join rows whose target was deleted; auto-resolves on detach)
+  - List page at `/network/services` (bulk-action table) + tabbed editor modal (General / Resources / Term + cost / Notes / Summary)
+
+- 🌐 **SD-WAN overlays** — vendor-neutral source of truth for overlay topology and routing-policy intent.
+  - Vendor config push (vManage / Meraki Dashboard / FortiManager / Versa Director) and real-time path telemetry are **explicitly out of scope** — those stay NCM / observability concerns
+  - Data model: `overlay_network` (six kinds: sdwan / ipsec_mesh / wireguard_mesh / dmvpn / vxlan_evpn / gre_mesh), `overlay_site` (m2m binding sites with role hub / spoke / transit / gateway, edge device, loopback subnet, ordered `preferred_circuits` jsonb — first wins, fall through on outage), `routing_policy` (priority + match-kind + match-value + action + action-target + enabled), `application_category` (curated SaaS catalog seeded with 33 well-known apps — Office365 / Teams / Zoom / Slack / Salesforce / GitHub / AWS / Azure / GCP / SIP voice / OpenAI / Anthropic / …)
+  - **`/topology` endpoint** — nodes (sites + roles + device + loopback + preferred-circuits) + edges (site pairs whose `preferred_circuits` lists overlap; `shared_circuits` is the intersection so the UI can colour by transport class) + policies
+  - **`/simulate` endpoint** — pure read-only what-if; body specifies `down_circuits`, response shows per-site fallback resolution + per-policy effective-target with `impacted` flag and human-readable note
+  - List page at `/network/overlays` + detail page with five tabs: Overview / Topology (SVG circular layout with role-coloured nodes + transport-coloured edges) / Sites / Policies (priority-ordered with per-kind editors) / Simulate
+
 ### Discovery & visibility
 
 - 📡 **SNMP discovery** — v1 / v2c / v3 polling via standard MIBs.
@@ -328,6 +363,32 @@ The tables above are the elevator pitch. The bullets here are the same surface w
   - Backup-server failover for every protocol
   - Delegate IP ranges and zones by role
   - API tokens with auto-expiry
+  - **Scoped API tokens** — `scopes` JSONB column on `api_token` lists the resource_types the token is allowed to touch (vs. inheriting all of the user's permissions). Permission-name granularity (`subnet:read`, `subnet:admin`, `*` for full inheritance). Authorization enforces scope intersection — token can do at most what the scope set allows AND what the user has permission for.
+
+- 🛡 **TOTP MFA for local users** — second factor on top of password.
+  - Enrolment flow: Settings → Security → "Enable MFA" → scan QR (`pyotp` + `qrcode` libraries) → enter 6-digit code → backup codes shown once
+  - Login flow gains a second step when MFA is enabled — JWT pre-token issued on username+password, exchanged for full token after TOTP code or backup code accepted
+  - Backup codes are single-use and persisted hashed
+  - Admin can force-disable MFA per user (audit-logged)
+
+- 🏷 **Subnet classification tags** — first-class compliance flags on every subnet.
+  - `pci_scope` / `hipaa_scope` / `internet_facing` / `contains_pii` boolean columns
+  - Inherit through the IP block tree (set on a parent block → all descendant subnets get the tag) with explicit override toggle
+  - List filters across the IPAM page + the API
+  - Compliance card on Platform Insights shows rolled-up counts
+
+- 🤖 **Operator Copilot** — AI assistant grounded in your live IPAM / DNS / DHCP / Network data.
+  - **Multi-vendor LLM support** — OpenAI, Anthropic (Claude), Azure OpenAI, Google Gemini, plus OpenAI-compat (Ollama / OpenWebUI / vLLM / LM Studio / llama.cpp server / LocalAI / Together / Groq / Fireworks). Add multiple providers in priority order and the orchestrator picks the highest-priority enabled one
+  - **Automatic failover chain** — on transient failures (5xx / timeout / rate-limit) the orchestrator walks providers in priority order; first successful chunk wins. Permanent errors (4xx / auth) surface immediately
+  - **Floating chat drawer** — right-side slide-in keyed on a global toggle; streams responses live via SSE, renders Markdown + code blocks + tool-call collapsed-by-default cards. Empty state shows clickable example prompts
+  - **18 read-only tools** in the registry — `list_subnets`, `get_subnet`, `list_ips`, `get_ip`, `list_zones`, `list_records`, `list_dhcp_scopes`, `list_leases`, `list_alerts`, `list_audit`, `list_devices`, `list_circuits`, `list_customers`, `list_sites`, `list_providers`, `list_asns`, `list_vrfs`, `list_overlays`
+  - **MCP HTTP endpoint** at `/api/v1/ai/mcp` exposes the same tool set so external MCP clients (Claude Desktop, Cursor, Cline) can connect directly
+  - **"Ask AI about this" affordances** — compact icon button on subnets / IPs / DNS zones / records / alerts / audit rows / DHCP scopes / leases / network devices that pre-fills the chat drawer with a templated prompt + the resource UUID
+  - **Custom prompts library** — operator-curated templates persisted per platform; built-in starter pack (Find unused IPs, Audit recent changes, Summarize subnet utilization, Triage open alerts)
+  - **Cmd-K palette "Ask AI" entry** — top entry in the global palette, pre-fills with the current page's context
+  - **Daily digest** — optional 0900 local Operator Copilot summary fired through audit-forward / SMTP / webhook channels
+  - **Write tools with preview / apply flow** — model proposes via `propose_*` tools (returns the planned diff), operator clicks Apply in the chat drawer, frontend sends an `apply_change` follow-up that hits the real CRUD endpoint. Three pilot tools: `propose_create_ip`, `propose_update_ip_status`, `propose_create_dns_record`
+  - **Token / cost observability** — per-request usage tracked in `ai_usage_event`; pricing table covers the major hosted models; per-user daily token cap; live token chip in the drawer header; AI usage card on Platform Insights aggregates the last 7 days by provider + model
 
 - 🔔 **Alerts + audit forwarding** — multi-target delivery with pluggable wire formats.
   - Rule-based alerts framework (subnet utilization, server unreachable)

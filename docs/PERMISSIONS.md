@@ -60,9 +60,18 @@ Each entry in `Role.permissions` (JSONB) is an object with this shape:
 | `role`            | Roles — admin required                                |
 | `auth_provider`   | LDAP/OIDC/SAML providers — superadmin only            |
 | `custom_field`    | Custom field definitions                              |
+| `manage_ipam_templates` | IPAM template classes (#26)                     |
 | `settings`        | Platform settings                                     |
 | `api_token`       | API tokens                                            |
 | `acme_account`    | ACME DNS-01 provider credentials (`/api/v1/acme/`)    |
+| `customer`        | Customer logical-ownership entity (#91)               |
+| `site`            | Site logical-ownership entity (#91)                   |
+| `provider`        | Provider logical-ownership entity (#91)               |
+| `circuit`         | WAN circuit (#93)                                     |
+| `network_service` | Service-catalog row (#94) — bundles VRF/Subnet/IPBlock/DNSZone/DHCPScope/Circuit/Site/OverlayNetwork into a customer deliverable |
+| `overlay_network` | SD-WAN overlay topology + sites (#95)                 |
+| `routing_policy`  | Per-overlay declarative routing policies (#95)        |
+| `application_category` | SaaS application catalog used by `match_kind=application` (#95) |
 | `*`               | Wildcard — match any resource type                    |
 
 ## Evaluation rules
@@ -89,10 +98,10 @@ Each entry in `Role.permissions` (JSONB) is an object with this shape:
 | -------------- | ------------------------------------------------------------ |
 | `Superadmin`   | `[{"action": "*", "resource_type": "*"}]`                    |
 | `Viewer`       | `[{"action": "read", "resource_type": "*"}]`                 |
-| `IPAM Editor`  | `admin` on `ip_space`, `ip_block`, `subnet`, `ip_address`, `vlan`, `custom_field` |
-| `DNS Editor`   | `admin` on `dns_zone`, `dns_record`, `dns_group`, `dns_blocklist` |
+| `IPAM Editor`  | `admin` on `ip_space`, `ip_block`, `subnet`, `ip_address`, `vlan`, `nat_mapping`, `custom_field`, `manage_ipam_templates`, `customer`, `site`, `provider`, `network_service` |
+| `DNS Editor`   | `admin` on `dns_zone`, `dns_record`, `dns_group`, `dns_blocklist`, `manage_dns_pools` |
 | `DHCP Editor`  | `admin` on `dhcp_server`, `dhcp_scope`, `dhcp_pool`, `dhcp_static`, `dhcp_client_class`, `dhcp_option_template`, `dhcp_mac_block` |
-| `Network Editor` | `admin` on `manage_network_devices`, `manage_nmap_scans`, `manage_asns`, `vrf` (full CRUD on SNMP-polled devices, nmap scans, ASN registry, and VRFs) |
+| `Network Editor` | `admin` on `manage_network_devices`, `manage_nmap_scans`, `manage_asns`, `vrf`, `circuit`, `network_service`, `overlay_network`, `routing_policy`, `application_category`, `customer`, `site`, `provider` |
 
 Built-in roles (`is_builtin=True`) can be cloned but not deleted.
 

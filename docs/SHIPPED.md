@@ -851,6 +851,270 @@ Mirrors CLAUDE.md's three mixed sections:
     expected-vs-actual NS diff panel, raw WHOIS / Linked DNS
     Zones / Alert History tabs.
 
+- ✅ **Multi-group DNS publishing — split-horizon at the IPAM
+  layer** (issue #25). `IPBlock.dns_split_horizon` boolean +
+  the existing `dns_inherit_settings` walk. When set,
+  descendant subnets publish records to `dns_zone_id`
+  (internal) AND every entry in `dns_additional_zone_ids`
+  (DMZ / external). Per-record routing is decided by the new
+  `IPAddress.dns_zone_overrides` JSONB list
+  (`[{zone_id, record_type}]`) so an operator can pin one
+  address to publish only into the internal zone. Auto-sync
+  task respects the split. Closes the IPAM-layer half of the
+  split-horizon roadmap; DNS Views (#24) covers the
+  recursive-resolver-side split.
+
+- ✅ **IPAM template classes — reusable stamp templates with
+  child layouts** (issue #26). New `ipam_template` table
+  captures default tags / custom-fields / DNS / DHCP / DDNS
+  settings (plus an optional sub-subnet `child_layout`) and
+  stamps them onto blocks or subnets at apply time.
+  ``applies_to`` locks each template to one of the two
+  carriers so apply-time semantics stay unambiguous.
+  ``force=False`` fills only empty/null target columns;
+  ``force=True`` overwrites unconditionally and is the path
+  ``/reapply-all`` uses to refresh drift across every recorded
+  instance (cap 200). ``IPBlockCreate.template_id`` /
+  ``SubnetCreate.template_id`` add optional pre-fill on the
+  create paths; carrier rows now carry an
+  ``applied_template_id`` SET-NULL FK so a "reapply across
+  instances" sweep can find every row touched. Block templates
+  with ``child_layout`` carve sub-subnets sequentially on
+  apply (and on create); idempotent — sub-subnets already at a
+  target CIDR are skipped. ``/admin/ipam/templates`` page (list
+  + tabbed editor: General / Tags + CFs + DNS-DHCP / DDNS /
+  Child layout) + per-row Reapply with typed-name confirm. New
+  ``manage_ipam_templates`` permission seeded into the IPAM
+  Editor builtin role.
+
+- ✅ **Move IP block / space across IP spaces** (issue #27).
+  `POST /ipam/blocks/{id}/move` accepts a target `space_id` +
+  a typed-name confirmation. Pre-flight validates target
+  space exists, no CIDR overlap in the target tree, every
+  dependent row (DNS records, DHCP scopes, addresses with
+  custom-field inheritance) survives the move.
+  `MoveBlockModal` walks the operator through the
+  consequences with a chevron-revealed list of affected
+  resources before the typed-name confirm unlocks Move.
+
+- ✅ **Operator Copilot — Ask-AI everywhere with multi-vendor
+  failover** (issue #90). Two phases:
+  - **Phase 1 — provider config + LLM driver foundation, MCP
+    HTTP endpoint, chat orchestrator + SSE chat endpoint,
+    floating chat drawer, observability + caps.** Migration
+    `a4b8c2d619e7` adds `ai_provider` (Fernet-encrypted
+    api_key, kind discriminator, ordered priority for
+    failover, JSONB options bag). LLM driver ABC at
+    `app/drivers/llm/base.py` defines neutral
+    request / chunk / tool dataclasses; concrete drivers
+    translate at the SDK boundary. OpenAI-compat driver
+    covers OpenAI / Ollama / OpenWebUI / vLLM / LM Studio /
+    llama.cpp server / LocalAI / Together / Groq / Fireworks.
+    Tool registry mirrors the driver registry shape. 18
+    read-only tools cover the common operator asks
+    (`list_subnets`, `get_subnet`, `list_ips`, `get_ip`,
+    `list_zones`, `list_records`, `list_dhcp_scopes`,
+    `list_leases`, `list_alerts`, `list_audit`,
+    `list_devices`, `list_circuits`, `list_customers`,
+    `list_sites`, `list_providers`, `list_asns`, `list_vrfs`,
+    `list_overlays`). MCP-shaped HTTP endpoint at
+    `/api/v1/ai/mcp` exposes the same set so external MCP
+    clients (Claude Desktop / Cursor / Cline) can connect
+    directly. Chat orchestrator runs the iterative
+    tool-calling loop. SSE endpoint at
+    `POST /api/v1/ai/chat/{session_id}/messages` streams
+    `text-delta` / `tool-call-delta` / `tool-result` events;
+    sets `X-Accel-Buffering: no` so nginx doesn't batch the
+    stream. Floating chat drawer renders Markdown + code
+    blocks + tool-call collapsed-by-default cards;
+    optimistically renders the user's just-sent message.
+    Migration `c8e3a7f10b54` adds `ai_usage_event`; pricing
+    table at `services/ai/pricing.py` covers the major
+    hosted models; per-user daily cap enforced in the
+    orchestrator; live token chip in the drawer header; AI
+    usage card on Platform Insights aggregates the last 7
+    days by provider + model.
+  - **Phase 2 — Anthropic / Azure OpenAI / Google Gemini
+    drivers, failover chain, "Ask AI about this"
+    affordances, custom prompts library, Cmd-K palette
+    entry, daily digest, write tools.** Anthropic driver
+    translates to Messages API (system prompt as a top-level
+    field; tool-use blocks vs. tool-calls). Azure OpenAI
+    driver adapts the OpenAI-compat shape to per-deployment
+    URL + `?api-version=` query param. Google Gemini driver
+    translates to `generateContent` API and reassembles
+    streamed function calls. Orchestrator walks providers in
+    priority order on transient failures (5xx / timeout /
+    rate-limit) — first successful chunk wins; permanent
+    errors (4xx / auth) surface immediately. Compact "Ask AI
+    about this" icon button on subnets / IPs / DNS zones /
+    records / alerts / audit / DHCP / network devices
+    pre-fills the chat drawer with a templated prompt + the
+    resource UUID. Custom prompts library
+    (`ai_custom_prompt`) with a built-in starter pack (Find
+    unused IPs, Audit recent changes, Summarize subnet
+    utilization, Triage open alerts). Cmd-K palette top
+    entry; fixed shortcut conflict with the existing search
+    hotkey. Daily Operator Copilot digest fired by Celery
+    beat at 0900 local through audit-forward / SMTP /
+    webhook channels (off by default). Write tools follow a
+    two-phase preview / apply contract: model proposes via
+    `propose_*` returning a planned `proposed_change`
+    envelope, operator clicks Apply in the chat drawer,
+    frontend sends `apply_change` follow-up that hits the
+    real CRUD endpoint. Three pilot tools:
+    `propose_create_ip`, `propose_update_ip_status`,
+    `propose_create_dns_record`. System prompt now
+    interpolates platform stats (subnet count, alert count,
+    recent audit summary), the operator's role + scoped
+    permissions, and "today's interesting things" (services
+    expiring < 30 d, alerts opened in the last hour, devices
+    last seen > 7 d ago).
+
+- ✅ **Customer / Site / Provider — logical ownership
+  entities** (issue #91). Three first-class rows that
+  cross-cut IPAM / DNS / DHCP / Network so operators can
+  answer "who owns this?", "what's at NYC?", and "which
+  circuits does Cogent supply us?" without resorting to
+  free-form tags. `Customer` is soft-deletable; `Site` is
+  hierarchical (`parent_site_id`) with a unique-per-parent
+  `code` (NULLS NOT DISTINCT for top-level deduping);
+  `Provider` carries an optional `default_asn_id` FK + a
+  `kind` enum (transit / peering / carrier / cloud /
+  registrar / sdwan_vendor). Cross-reference columns added
+  on every existing IPAM/DNS/DHCP/Network table with
+  `ON DELETE SET NULL` so a customer/site/provider deletion
+  never cascades into core rows — operators want to re-tag,
+  not lose data. Three new admin pages (Customers / Sites /
+  Providers) + shared `CustomerPicker` / `SitePicker` /
+  `ProviderPicker` (with optional kind filter) + matching
+  Chip components plug into every IPAM / DNS / circuit /
+  overlay create + edit modal. RBAC seeded into Network
+  Editor + IPAM Editor. Migration
+  `c2a7e4f81b69_logical_ownership_entities`. **Deferred
+  follow-ups:** customer-scoped dashboard KPIs, site-scoped
+  DNS auto-pin, customer-bulk-assign tool, freeform
+  `Domain.registrar` text → FK backfill.
+
+- ✅ **WAN circuits — first-class transport tracking** (issue
+  #93). New `circuit` table — carrier-supplied logical pipe
+  (the contract + transport class + bandwidth + endpoints +
+  term + cost), distinct from the equipment lighting it up
+  (CMDB territory, intentionally out of scope).
+  `provider_id` is `ON DELETE RESTRICT` (carrier
+  relationship too load-bearing to silently null);
+  `customer_id` and the four endpoint refs (a/z-end site +
+  subnet) are `ON DELETE SET NULL`. Nine transport classes
+  (mpls / internet_broadband / fiber_direct / wavelength /
+  lte / satellite + three cloud cross-connects:
+  direct_connect_aws / express_route_azure /
+  interconnect_gcp). Soft-deletable so `status='decom'` is
+  the operator-visible end-of-life flag while history stays
+  restorable. CRUD under `/api/v1/circuits` with filters
+  (provider_id / customer_id / site_id matching either end /
+  subnet_id / transport_class / status / expiring_within_days
+  / search) + `/by-site/{site_id}` convenience endpoint.
+  `/network/circuits` page with bulk-action table + tabbed
+  editor modal (General / Endpoints / Term + cost / Notes) +
+  colour-coded term-end badge + asymmetric bandwidth display.
+  Two new alert rule types — `circuit_term_expiring` (mirrors
+  `domain_expiring` shape with severity escalation per
+  `threshold/4` / `threshold/12`) and `circuit_status_changed`
+  (transition-style — fires once on `suspended` or `decom`
+  with auto-resolve after 7 d; routine `active` ↔ `pending`
+  flips during commissioning are intentionally excluded).
+  Migration `d9f3b21e8c54_wan_circuits`.
+
+- ✅ **Service catalog — MPLS L3VPN service modeling
+  (extensible)** (issue #94). First-class
+  customer-deliverable bundle. `NetworkService` is one row
+  per thing the operator delivers (`mpls_l3vpn` + `custom`
+  shipped in v1; `sdwan` lit up alongside #95). Polymorphic
+  `NetworkServiceResource` join row binds a service to VRF
+  / Subnet / IPBlock / DNSZone / DHCPScope / Circuit / Site
+  / OverlayNetwork. `customer_id` is `ON DELETE RESTRICT`
+  (contractual weight too load-bearing to silently null).
+  Hard rule: `mpls_l3vpn` services may have at most one VRF
+  attached (422 on second VRF, 422 on kind-flip-to-L3VPN if
+  >1 VRF already linked). Soft rules surfaced as warnings on
+  `GET /summary`: missing VRF, fewer than 2 edge sites, edge
+  subnet's enclosing block in a different VRF than the
+  service. Endpoints: standard CRUD + bulk-delete,
+  `POST/DELETE /{id}/resources` for attach / detach,
+  `GET /{id}/summary` with kind-aware shape (L3VPN view
+  returns canonical VRF + edge sites + edge circuits + edge
+  subnets + warnings), `GET /by-resource/{kind}/{id}`
+  reverse lookup. Two new alert rule types —
+  `service_term_expiring` (mirrors circuit shape) and
+  `service_resource_orphaned` (sweep over join rows whose
+  target was deleted; auto-resolves on detach). Migration
+  `e1d8c92a4f73_network_service_catalog` +
+  `f2c8d49a1e76_alert_event_subject_type_widen` (VARCHAR(20)
+  → VARCHAR(40) to fit `network_service_resource`).
+  `/network/services` page (bulk-action table) + tabbed
+  editor modal (General / Resources / Term + cost / Notes /
+  Summary) with per-kind resource pickers (cross-group
+  fan-out for DNS zones + DHCP scopes). RBAC into Network
+  Editor + IPAM Editor. **Deferred follow-ups:** service
+  templates, per-customer monthly spend rollup, service
+  status timeline, L2VPN / VPLS / EVPN / DIA / hosted-DNS /
+  hosted-DHCP kinds, right-click "show services using this
+  resource" entry points (issue #99).
+
+- ✅ **SD-WAN — overlay networks + transport-aware routing
+  policies** (issue #95). Vendor-neutral source of truth for
+  SD-WAN overlay topology + routing-policy intent. Vendor
+  config push (vManage / Meraki Dashboard / FortiManager /
+  Versa Director) and real-time path telemetry are
+  explicitly out of scope. Four tables landing together:
+  `overlay_network` (soft-deletable; six kinds — sdwan /
+  ipsec_mesh / wireguard_mesh / dmvpn / vxlan_evpn /
+  gre_mesh; free-form vendor + encryption_profile so
+  non-curated vendors plug in without enum migration),
+  `overlay_site` (m2m binding sites with role hub / spoke /
+  transit / gateway, edge device, loopback subnet, ordered
+  `preferred_circuits` jsonb — first wins, fall through on
+  outage), `routing_policy` (declarative per-overlay policy
+  with priority + match-kind + match-value + action +
+  action-target + enabled), and `application_category`
+  (curated SaaS catalog used by `match_kind=application`,
+  seeded at startup with 33 well-known apps following the
+  BGP-communities pattern). CRUD under `/api/v1/overlays`
+  (with sites + policies sub-resources) and
+  `/api/v1/applications`. `GET /overlays/{id}/topology`
+  returns nodes (sites + roles + device + loopback +
+  preferred-circuits) + edges (site pairs whose
+  `preferred_circuits` lists overlap — `shared_circuits` is
+  the intersection so the UI can colour by transport class)
+  + policies. `POST /overlays/{id}/simulate` is pure
+  read-only what-if; body specifies `down_circuits`,
+  response shows per-site fallback resolution (surviving
+  preferred chain + primary circuit + `blackholed` flag) and
+  per-policy effective-target with `impacted` flag + a
+  human-readable note. Three new RBAC resource types
+  (`overlay_network` / `routing_policy` /
+  `application_category`) into Network Editor.
+  Service-catalog (#94) integration unlocked: `sdwan` added
+  to `SERVICE_KINDS_V1`, `overlay_network` lit up as a real
+  attach target, `service_resource_orphaned` alert sweep
+  covers deleted overlays. `/network/overlays` list page +
+  detail page at `/network/overlays/{id}` with five tabs —
+  Overview / Topology (SVG circular layout, role-coloured
+  nodes, transport-coloured edges with solid for
+  single-class and dashed for mixed) / Sites / Policies
+  (priority-ordered with up/down reorder + per-kind editors)
+  / Simulate (toggle circuits down + see per-site fallback
+  + per-policy impact). Migration
+  `c4f7e92d3a18_sdwan_overlay`. **Deferred follow-ups (issue
+  #100):** vendor read-only mirror integrations (Meraki /
+  Viptela / Fortinet / VeloCloud / Versa), topology diff,
+  cross-vendor policy lint, application catalog enrichment
+  from upstream feeds, path-quality SLA targets, overlay
+  templates, plus v1 UX polish — D3 force-directed topology
+  layout, drag-and-drop reordering, Applications admin UI
+  page, "Used by N services" link on the overlay detail
+  header.
+
 
 ## Integration roadmap
 
@@ -1793,4 +2057,57 @@ Mirrors CLAUDE.md's three mixed sections:
   `dict[str, Any]` (frontend type `Record<string, unknown>`),
   broken rows repaired with
   `UPDATE ip_address SET tags = '{}'::jsonb WHERE jsonb_typeof(tags) = 'array'`.
+
+- ✅ **PXE / iPXE provisioning profiles** (issue #51). New
+  `pxe_profile` table — operator-curated profiles per
+  architecture (`bios_x86` / `efi_x86_64` / `efi_arm64` /
+  `efi_x86`). Each profile binds to a TFTP `next-server` + a
+  `boot-filename` per arch, plus an optional iPXE script body.
+  `DHCPScope.pxe_profile_id` SET-NULL FK; on render, the Kea
+  driver emits one `client-class` per arch-match guarded by
+  `option dhcp.user-class` matching the iPXE signature so
+  legacy PXE clients see the BIOS bootfile and iPXE clients
+  see the iPXE script. New `/dhcp/groups/{id}/pxe` admin page
+  with profile CRUD and a per-scope "PXE profile" picker on
+  the scope editor.
+
+### Security & compliance
+
+- ✅ **TOTP MFA for local users** (issue #69). New
+  `user_mfa_secret` table with Fernet-encrypted TOTP shared
+  secret + backup-codes JSONB list. Enrolment flow: Settings
+  → Security → "Enable MFA" → scan QR (`pyotp` + `qrcode`
+  libraries) → enter 6-digit code to confirm → backup codes
+  shown once. Login flow gains a second step when MFA is
+  enabled — JWT pre-token issued on username+password,
+  exchanged for full token after TOTP code or backup code
+  accepted. Backup codes are single-use and persisted hashed.
+  Admin can force-disable MFA per user (audit-logged).
+
+- ✅ **API-token scopes** (issue #74). `api_token` rows gain
+  a `scopes` JSONB column listing the resource_types the
+  token is allowed to touch (vs. inheriting all of the user's
+  permissions). Scope set is permission-name granularity
+  (`subnet:read`, `subnet:admin`, `*` for full inheritance).
+  Token create modal lets the operator pick scopes via a
+  chip selector grouped by resource family. Authorization
+  enforces scope intersection: token can do at most what the
+  scope set allows AND what the user has permission for.
+
+- ✅ **Subnet classification tags** (issue #75). `subnet.pci_scope`,
+  `subnet.hipaa_scope`, `subnet.internet_facing`,
+  `subnet.contains_pii` boolean columns. List filters across
+  the IPAM page + the API. Compliance card on Platform
+  Insights shows rolled-up counts. Tags inherit through the
+  IP block tree (set on a parent block → all descendant
+  subnets get the tag) with an explicit override toggle.
+
+### UX polish
+
+- ✅ **API docs link in sidebar + header** (issue #96).
+  Surface the existing Swagger UI / ReDoc at `/docs` and
+  `/redoc` from the navigation itself instead of expecting
+  operators to know the URL. New "API Docs" entry under Help
+  in the sidebar; new external-link icon in the header next
+  to the user menu.
 
