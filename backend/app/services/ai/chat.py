@@ -31,11 +31,11 @@ import json
 import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 import structlog
-from sqlalchemy import select
+from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.drivers.llm import get_driver
@@ -46,7 +46,12 @@ from app.drivers.llm.base import (
     ToolDefinition,
 )
 from app.models.ai import AIChatMessage, AIChatSession, AIProvider
+from app.models.audit import AuditLog
 from app.models.auth import User
+from app.models.dhcp import DHCPScope, DHCPServerGroup
+from app.models.dns import DNSRecord, DNSServerGroup, DNSZone
+from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
+from app.models.network import NetworkDevice
 from app.models.settings import PlatformSettings
 from app.services.ai.pricing import compute_cost
 from app.services.ai.tools import REGISTRY, ToolArgumentError, ToolNotFound
@@ -130,23 +135,172 @@ When showing structured data, prefer concise tables or bullet lists. \
 Use Markdown formatting. Keep responses short and direct — the operator \
 is at a terminal, not reading a report.
 
-Wave 2 ships read-only tools only. If the operator asks you to create / \
-modify / delete something, explain that write tools are not yet \
-available and tell them which UI page to use instead.
+Most tools are read-only. A small set of ``propose_*`` write tools \
+exists for resource creation: those NEVER mutate state directly — \
+they return a ``kind="proposal"`` payload that the UI surfaces as an \
+Apply / Discard card the operator must click. Always go through a \
+``propose_*`` tool when the operator asks you to create / modify / \
+delete something. If no propose_* tool covers the request, explain \
+which UI page handles it instead.
 """
 
 
-def build_system_prompt(user: User, tools: list[Any]) -> str:
-    """Build the system prompt for a new session. Includes the static
-    base + a tiny bit of dynamic context (which user, today's date,
-    tool count). The full session uses this snapshot for every turn,
-    so the chat stays coherent if the global prompt later changes.
+# Recent-activity window — how far back the dynamic context should
+# look when building the "what changed lately" snapshot. Small enough
+# that the data is genuinely *recent* (not noise from days ago);
+# wide enough that quiet shops still surface something useful.
+_RECENT_ACTIVITY_WINDOW = timedelta(hours=24)
+_RECENT_ACTIVITY_LIMIT = 5
+
+
+async def gather_dynamic_context(db: AsyncSession, user: User) -> dict[str, Any]:
+    """Collect the topology counts + recent activity that flesh out the
+    system prompt. Pure read-only — runs on session creation only, so
+    we trade a few count queries for a markedly more useful first turn.
+
+    Counts are global (the operator is admin in v1); when group-scoped
+    visibility lands we'll filter these by ``user``'s permission set.
+    Soft-deleted rows are excluded — those don't exist for the operator.
+    """
+
+    async def _count(stmt: Any) -> int:
+        return int((await db.execute(stmt)).scalar_one() or 0)
+
+    spaces = await _count(
+        select(func.count()).select_from(IPSpace).where(IPSpace.deleted_at.is_(None))
+    )
+    blocks = await _count(
+        select(func.count()).select_from(IPBlock).where(IPBlock.deleted_at.is_(None))
+    )
+    subnets = await _count(
+        select(func.count()).select_from(Subnet).where(Subnet.deleted_at.is_(None))
+    )
+    addresses = await _count(select(func.count()).select_from(IPAddress))
+    dns_groups = await _count(select(func.count()).select_from(DNSServerGroup))
+    dns_zones = await _count(
+        select(func.count()).select_from(DNSZone).where(DNSZone.deleted_at.is_(None))
+    )
+    dns_records = await _count(
+        select(func.count()).select_from(DNSRecord).where(DNSRecord.deleted_at.is_(None))
+    )
+    dhcp_groups = await _count(select(func.count()).select_from(DHCPServerGroup))
+    dhcp_scopes = await _count(
+        select(func.count()).select_from(DHCPScope).where(DHCPScope.deleted_at.is_(None))
+    )
+    devices = await _count(select(func.count()).select_from(NetworkDevice))
+
+    cutoff = datetime.utcnow() - _RECENT_ACTIVITY_WINDOW
+    recent_audits = (
+        (
+            await db.execute(
+                select(AuditLog)
+                .where(AuditLog.timestamp >= cutoff)
+                .order_by(desc(AuditLog.timestamp))
+                .limit(_RECENT_ACTIVITY_LIMIT)
+            )
+        )
+        .scalars()
+        .all()
+    )
+
+    return {
+        "topology": {
+            "spaces": spaces,
+            "blocks": blocks,
+            "subnets": subnets,
+            "addresses": addresses,
+            "dns_groups": dns_groups,
+            "dns_zones": dns_zones,
+            "dns_records": dns_records,
+            "dhcp_groups": dhcp_groups,
+            "dhcp_scopes": dhcp_scopes,
+            "devices": devices,
+        },
+        "recent_activity": [
+            {
+                "timestamp": ev.timestamp.isoformat() if ev.timestamp else None,
+                "action": ev.action,
+                "resource_type": ev.resource_type,
+                "resource_display": ev.resource_display,
+                "user": ev.user_display_name,
+                "result": ev.result,
+            }
+            for ev in recent_audits
+        ],
+    }
+
+
+def _format_topology_line(topology: dict[str, int]) -> str:
+    """Render the topology counts as a single readable line. Skip
+    zero-valued resource families so the prompt isn't padded with
+    "0 DNS zones · 0 DHCP scopes" on a fresh install.
+    """
+    parts: list[tuple[str, int]] = [
+        ("space", topology["spaces"]),
+        ("block", topology["blocks"]),
+        ("subnet", topology["subnets"]),
+        ("IP", topology["addresses"]),
+        ("DNS group", topology["dns_groups"]),
+        ("DNS zone", topology["dns_zones"]),
+        ("DNS record", topology["dns_records"]),
+        ("DHCP group", topology["dhcp_groups"]),
+        ("DHCP scope", topology["dhcp_scopes"]),
+        ("network device", topology["devices"]),
+    ]
+    pieces: list[str] = []
+    for label, n in parts:
+        if n == 0:
+            continue
+        # English plural — close enough for prompt cosmetics.
+        plural = label + ("s" if n != 1 and not label.endswith("s") else "")
+        pieces.append(f"{n} {plural}")
+    return ", ".join(pieces) if pieces else "no resources tracked yet"
+
+
+def _format_recent_activity(events: list[dict[str, Any]]) -> str:
+    """Render the last few audit events as bullet lines. Capped at
+    ``_RECENT_ACTIVITY_LIMIT``; if the deployment is quiet, we say so.
+    """
+    if not events:
+        return "No audit activity in the last 24 h."
+    lines: list[str] = []
+    for ev in events:
+        ts = ev.get("timestamp", "")[:19].replace("T", " ")  # YYYY-MM-DD HH:MM:SS
+        lines.append(
+            f"- {ts} · {ev.get('user') or 'system'} → "
+            f"{ev.get('action')} {ev.get('resource_type')} "
+            f"({ev.get('resource_display') or '?'})"
+            + (f" [{ev.get('result')}]" if ev.get("result") not in (None, "success") else "")
+        )
+    return "\n".join(lines)
+
+
+async def build_system_prompt(db: AsyncSession, user: User, tools: list[Any]) -> str:
+    """Build the system prompt for a new session. Snapshotted onto
+    ``AIChatSession.system_prompt`` so the conversation stays coherent
+    if the global prompt later changes — every later turn replays from
+    the snapshot, not from a fresh build.
+
+    The dynamic block carries:
+        * Who: username + display name.
+        * When: today's UTC date.
+        * What: live topology counts (skipping zeros).
+        * What changed: last few audit events.
+    Total payload is well under 500 tokens for a typical deployment;
+    quiet installs come in under 200.
     """
     today = datetime.utcnow().strftime("%Y-%m-%d")
+    ctx = await gather_dynamic_context(db, user)
+    topology_line = _format_topology_line(ctx["topology"])
+    activity_block = _format_recent_activity(ctx["recent_activity"])
     dynamic = (
-        f"\n\nContext: you're talking to user {user.username!r} "
-        f"(display name {user.display_name!r}). Today's date is {today}. "
-        f"You have {len(tools)} tools available."
+        f"\n\n---\nContext for this session:\n"
+        f"- Operator: {user.username!r} (display name {user.display_name!r}).\n"
+        f"- Today (UTC): {today}.\n"
+        f"- Tools available: {len(tools)}.\n"
+        f"- Topology: {topology_line}.\n"
+        f"\nRecent activity (last 24 h):\n"
+        f"{activity_block}\n---"
     )
     return _STATIC_SYSTEM_PROMPT + dynamic
 
@@ -177,7 +331,7 @@ class ChatOrchestrator:
                 raise PermissionError("session not found or not yours")
             return row
         tools = REGISTRY.read_only()
-        system_prompt = build_system_prompt(self.user, tools)
+        system_prompt = await build_system_prompt(self.db, self.user, tools)
         # "Ask AI about this" — operator clicked a context affordance
         # in the IPAM / DNS / DHCP UI; the frontend supplied a
         # human-readable summary of what they were looking at. Append
