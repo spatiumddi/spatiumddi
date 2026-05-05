@@ -116,10 +116,11 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
     ),
     "Network Editor": (
         "Full CRUD on SNMP-polled network devices (routers, switches, APs), "
-        "on-demand nmap scans, the ASN registry, VRFs, WAN circuits, the "
-        "customer-deliverable services (#94) those resources bundle into, "
-        "and the logical ownership tags (customer / site / provider) those "
-        "entities reference.",
+        "on-demand nmap scans, the ASN registry, VRFs, WAN circuits, "
+        "SD-WAN overlay topology + routing policies + the application "
+        "catalog (#95), the customer-deliverable services (#94) those "
+        "resources bundle into, and the logical ownership tags (customer "
+        "/ site / provider) those entities reference.",
         [
             {"action": "admin", "resource_type": "manage_network_devices"},
             {"action": "admin", "resource_type": "manage_nmap_scans"},
@@ -127,6 +128,9 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
             {"action": "admin", "resource_type": "vrf"},
             {"action": "admin", "resource_type": "circuit"},
             {"action": "admin", "resource_type": "network_service"},
+            {"action": "admin", "resource_type": "overlay_network"},
+            {"action": "admin", "resource_type": "routing_policy"},
+            {"action": "admin", "resource_type": "application_category"},
             {"action": "admin", "resource_type": "customer"},
             {"action": "admin", "resource_type": "site"},
             {"action": "admin", "resource_type": "provider"},
@@ -187,6 +191,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await seed_standard_communities()
     except Exception as exc:  # noqa: BLE001
         logger.debug("bgp_communities_seed_skipped", reason=str(exc))
+    # Curated SD-WAN application catalog (Office365, Zoom, Slack,
+    # GitHub, …). Idempotent; failure-tolerant.
+    try:
+        from app.services.applications import (  # noqa: PLC0415
+            seed_builtin_applications,
+        )
+
+        await seed_builtin_applications()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("builtin_applications_seed_skipped", reason=str(exc))
     yield
     logger.info("shutdown", service="api")
 

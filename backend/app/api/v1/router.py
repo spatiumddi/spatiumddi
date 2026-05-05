@@ -7,6 +7,7 @@ from app.api.v1.admin.trash import router as trash_router
 from app.api.v1.ai import router as ai_router
 from app.api.v1.alerts.router import router as alerts_router
 from app.api.v1.api_tokens.router import router as api_tokens_router
+from app.api.v1.applications import router as applications_router
 from app.api.v1.asns import router as asns_router
 from app.api.v1.audit.router import router as audit_router
 from app.api.v1.auth.router import router as auth_router
@@ -28,6 +29,7 @@ from app.api.v1.logs import logs_router
 from app.api.v1.metrics import router as metrics_router
 from app.api.v1.network import router as network_router
 from app.api.v1.nmap import router as nmap_router
+from app.api.v1.overlays import router as overlays_router
 from app.api.v1.ownership import (
     customers_router,
     providers_router,
@@ -56,6 +58,7 @@ api_v1_router.include_router(postgres_router, prefix="/admin", tags=["admin-post
 api_v1_router.include_router(trash_router, prefix="/admin", tags=["admin-trash"])
 api_v1_router.include_router(alerts_router, prefix="/alerts", tags=["alerts"])
 api_v1_router.include_router(api_tokens_router, prefix="/api-tokens", tags=["api-tokens"])
+api_v1_router.include_router(applications_router, prefix="/applications", tags=["applications"])
 api_v1_router.include_router(asns_router, prefix="/asns", tags=["asns"])
 api_v1_router.include_router(audit_router, prefix="/audit", tags=["audit"])
 api_v1_router.include_router(auth_router, prefix="/auth", tags=["auth"])
@@ -80,6 +83,7 @@ api_v1_router.include_router(logs_router, prefix="/logs", tags=["logs"])
 api_v1_router.include_router(metrics_router, prefix="/metrics", tags=["metrics"])
 api_v1_router.include_router(network_router, tags=["network"])
 api_v1_router.include_router(nmap_router, prefix="/nmap", tags=["nmap"])
+api_v1_router.include_router(overlays_router, prefix="/overlays", tags=["overlays"])
 api_v1_router.include_router(providers_router, prefix="/providers", tags=["providers"])
 api_v1_router.include_router(proxmox_router, prefix="/proxmox", tags=["proxmox"])
 api_v1_router.include_router(roles_router, prefix="/roles", tags=["roles"])

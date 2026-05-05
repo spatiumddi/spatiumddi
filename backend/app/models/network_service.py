@@ -59,7 +59,9 @@ SERVICE_KINDS: frozenset[str] = frozenset(
 # Kinds the v1 router will accept on create / update. The wider
 # ``SERVICE_KINDS`` list above is what the column allows at the DB
 # level so a future release can add a kind without a column migration.
-SERVICE_KINDS_V1: frozenset[str] = frozenset({"mpls_l3vpn", "custom"})
+# ``sdwan`` lit up alongside #95 — services can now bundle an
+# OverlayNetwork as the central deliverable.
+SERVICE_KINDS_V1: frozenset[str] = frozenset({"mpls_l3vpn", "sdwan", "custom"})
 
 SERVICE_STATUSES: frozenset[str] = frozenset({"active", "provisioning", "suspended", "decom"})
 

@@ -44,6 +44,7 @@ from app.models.dns import DNSServer, DNSZone
 from app.models.domain import Domain
 from app.models.ipam import IPBlock, Subnet
 from app.models.network_service import NetworkService, NetworkServiceResource
+from app.models.overlay import OverlayNetwork
 from app.models.ownership import Site
 from app.models.settings import PlatformSettings
 from app.models.vrf import VRF
@@ -91,9 +92,8 @@ RULE_TYPES = frozenset(
 )
 
 # Resource-kind → SQLAlchemy model for the orphan sweep. Mirrors the
-# router's ``_KIND_MODEL`` map; ``overlay_network`` is intentionally
-# absent because the router rejects attach attempts for that kind, so
-# no orphan can exist.
+# router's ``_KIND_MODEL`` map. ``overlay_network`` lit up alongside
+# #95 so the sweep covers it too.
 _ORPHAN_RESOURCE_MODELS: dict[str, Any] = {
     "vrf": VRF,
     "subnet": Subnet,
@@ -102,6 +102,7 @@ _ORPHAN_RESOURCE_MODELS: dict[str, Any] = {
     "dhcp_scope": DHCPScope,
     "circuit": Circuit,
     "site": Site,
+    "overlay_network": OverlayNetwork,
 }
 
 # ``circuit_status_changed`` — destination statuses that are

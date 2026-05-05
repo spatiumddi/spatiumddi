@@ -37,6 +37,7 @@ from app.models.network_service import (
     NetworkService,
     NetworkServiceResource,
 )
+from app.models.overlay import OverlayNetwork
 from app.models.ownership import Customer, Site
 from app.models.vrf import VRF
 
@@ -46,7 +47,7 @@ router = APIRouter(
 )
 
 
-ServiceKind = Literal["mpls_l3vpn", "custom"]
+ServiceKind = Literal["mpls_l3vpn", "sdwan", "custom"]
 ServiceStatus = Literal["active", "provisioning", "suspended", "decom"]
 ResourceKind = Literal[
     "vrf",
@@ -60,9 +61,9 @@ ResourceKind = Literal[
 ]
 
 
-# Map resource_kind → SQLAlchemy model. ``overlay_network`` is reserved
-# for the SD-WAN roadmap (#95) and intentionally rejected at attach
-# time until that model lands.
+# Map resource_kind → SQLAlchemy model. ``overlay_network`` lit up
+# alongside #95 — services can now bundle an SD-WAN overlay as the
+# central deliverable for ``kind=sdwan`` services.
 _KIND_MODEL: dict[str, Any] = {
     "vrf": VRF,
     "subnet": Subnet,
@@ -71,6 +72,7 @@ _KIND_MODEL: dict[str, Any] = {
     "dhcp_scope": DHCPScope,
     "circuit": Circuit,
     "site": Site,
+    "overlay_network": OverlayNetwork,
 }
 
 
@@ -277,15 +279,10 @@ def _to_read(svc: NetworkService, resources: list[NetworkServiceResource]) -> Se
 async def _validate_attach_target(db: Any, kind: str, resource_id: uuid.UUID) -> Any:
     """Resolve the target row for an attach; raise 422 on miss.
 
-    ``overlay_network`` is reserved for the SD-WAN roadmap (#95) and
-    rejected up-front so operators don't accidentally write join rows
-    pointing at a model that doesn't exist yet.
+    ``overlay_network`` lit up alongside #95 and is now a real attach
+    target (services bundle overlays the same way they bundle VRFs /
+    circuits).
     """
-    if kind == "overlay_network":
-        raise HTTPException(
-            status_code=422,
-            detail="overlay_network attach not yet supported (issue #95)",
-        )
     model = _KIND_MODEL.get(kind)
     if model is None:
         raise HTTPException(status_code=422, detail=f"unknown resource_kind: {kind}")

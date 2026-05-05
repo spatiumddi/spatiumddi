@@ -65,6 +65,12 @@ from app.models.network import (
 from app.models.network_service import NetworkService, NetworkServiceResource
 from app.models.nmap import NmapScan
 from app.models.oui import OUIVendor
+from app.models.overlay import (
+    ApplicationCategory,
+    OverlayNetwork,
+    OverlaySite,
+    RoutingPolicy,
+)
 from app.models.ownership import Customer, Provider, Site
 from app.models.proxmox import ProxmoxNode
 from app.models.settings import PlatformSettings
@@ -157,4 +163,8 @@ __all__ = [
     "Circuit",
     "NetworkService",
     "NetworkServiceResource",
+    "OverlayNetwork",
+    "OverlaySite",
+    "RoutingPolicy",
+    "ApplicationCategory",
 ]
