@@ -44,6 +44,7 @@ from app.services.soft_delete import (
     apply_soft_delete,
     collect_soft_delete_batch,
 )
+from app.services.tags import apply_tag_filter
 
 logger = structlog.get_logger(__name__)
 
@@ -2138,10 +2139,12 @@ async def list_spaces(
     current_user: CurrentUser,
     db: DB,
     customer_id: uuid.UUID | None = None,
+    tag: list[str] = Query(default_factory=list),
 ) -> list[IPSpace]:
     query = select(IPSpace).order_by(IPSpace.name)
     if customer_id is not None:
         query = query.where(IPSpace.customer_id == customer_id)
+    query = apply_tag_filter(query, IPSpace.tags, tag)
     result = await db.execute(query)
     return list(result.scalars().all())
 
@@ -2432,6 +2435,7 @@ async def list_blocks(
     space_id: uuid.UUID | None = None,
     customer_id: uuid.UUID | None = None,
     site_id: uuid.UUID | None = None,
+    tag: list[str] = Query(default_factory=list),
 ) -> list[dict[str, Any]]:
     query = select(IPBlock).order_by(IPBlock.network)
     if space_id:
@@ -2440,6 +2444,7 @@ async def list_blocks(
         query = query.where(IPBlock.customer_id == customer_id)
     if site_id is not None:
         query = query.where(IPBlock.site_id == site_id)
+    query = apply_tag_filter(query, IPBlock.tags, tag)
     result = await db.execute(query)
     blocks = list(result.scalars().all())
     space_vrf_cache: dict[uuid.UUID, uuid.UUID | None] = {}
@@ -3218,6 +3223,7 @@ async def list_subnets(
     internet_facing: bool | None = None,
     customer_id: uuid.UUID | None = None,
     site_id: uuid.UUID | None = None,
+    tag: list[str] = Query(default_factory=list),
 ) -> list[Subnet]:
     query = select(Subnet).order_by(Subnet.network)
     if space_id:
@@ -3236,6 +3242,7 @@ async def list_subnets(
         query = query.where(Subnet.customer_id == customer_id)
     if site_id is not None:
         query = query.where(Subnet.site_id == site_id)
+    query = apply_tag_filter(query, Subnet.tags, tag)
     result = await db.execute(query)
     return list(result.scalars().all())
 
@@ -5301,6 +5308,7 @@ async def list_addresses(
     current_user: CurrentUser,
     db: DB,
     status_filter: str | None = None,
+    tag: list[str] = Query(default_factory=list),
 ) -> list[IPAddress]:
     if await db.get(Subnet, subnet_id) is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
@@ -5312,6 +5320,7 @@ async def list_addresses(
     )
     if status_filter:
         query = query.where(IPAddress.status == status_filter)
+    query = apply_tag_filter(query, IPAddress.tags, tag)
     rows = list((await db.execute(query)).scalars().all())
     counts = await _alias_counts_for(db, rows)
     nat_counts = await _nat_mapping_counts_for(db, rows)

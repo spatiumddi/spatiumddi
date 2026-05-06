@@ -47,6 +47,7 @@ from app.models.overlay import (
     RoutingPolicy,
 )
 from app.models.ownership import Customer, Site
+from app.services.tags import apply_tag_filter
 
 # Single router; sub-paths live as separate decorated handlers below.
 # Permission gate applies once at the router level — every endpoint
@@ -411,6 +412,7 @@ async def list_overlays(
     kind: OverlayKind | None = Query(default=None),
     status: OverlayStatus | None = Query(default=None),
     search: str | None = Query(default=None),
+    tag: list[str] = Query(default_factory=list),
 ) -> OverlayListResponse:
     stmt = select(OverlayNetwork).where(OverlayNetwork.deleted_at.is_(None))
     if customer_id is not None:
@@ -422,6 +424,7 @@ async def list_overlays(
     if search:
         needle = f"%{search.strip()}%"
         stmt = stmt.where(OverlayNetwork.name.ilike(needle))
+    stmt = apply_tag_filter(stmt, OverlayNetwork.tags, tag)
     total = await db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
     stmt = stmt.order_by(OverlayNetwork.name.asc()).limit(limit).offset(offset)
     rows = (await db.execute(stmt)).scalars().all()

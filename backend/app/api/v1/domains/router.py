@@ -33,6 +33,7 @@ from app.models.domain import Domain
 from app.models.settings import PlatformSettings
 from app.services.domain_refresh import build_refresh_audit_payload, refresh_one_domain
 from app.services.rdap import compute_nameserver_drift, derive_whois_state
+from app.services.tags import apply_tag_filter
 
 logger = structlog.get_logger(__name__)
 
@@ -245,6 +246,7 @@ async def list_domains(
     search: str | None = Query(None, min_length=1, max_length=255),
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=500),
+    tag: list[str] = Query(default_factory=list),
 ) -> DomainListResponse:
     if not user_has_permission(current_user, "read", PERMISSION):
         raise HTTPException(status_code=403, detail="Permission denied")
@@ -276,6 +278,7 @@ async def list_domains(
                 func.lower(func.coalesce(Domain.registrar, "")).like(like),
             )
         )
+    base = apply_tag_filter(base, Domain.tags, tag)
 
     count_stmt = select(func.count()).select_from(base.subquery())
     total = int((await db.execute(count_stmt)).scalar_one())

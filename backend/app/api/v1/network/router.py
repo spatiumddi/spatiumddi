@@ -42,6 +42,7 @@ from app.services.snmp.errors import (
     SNMPTimeoutError,
     SNMPTransportError,
 )
+from app.services.tags import apply_tag_filter
 
 from .schemas import (
     NetworkArpListResponse,
@@ -177,6 +178,7 @@ async def list_devices(
     site_id: uuid.UUID | None = Query(None),
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=500),
+    tag: list[str] = Query(default_factory=list),
 ) -> NetworkDeviceListResponse:
     if not user_has_permission(current_user, "read", PERMISSION):
         raise HTTPException(status_code=403, detail="Permission denied")
@@ -190,6 +192,7 @@ async def list_devices(
         base = base.where(NetworkDevice.last_poll_status == last_poll_status)
     if site_id is not None:
         base = base.where(NetworkDevice.site_id == site_id)
+    base = apply_tag_filter(base, NetworkDevice.tags, tag)
 
     count_stmt = select(func.count()).select_from(base.subquery())
     total = int((await db.execute(count_stmt)).scalar_one())

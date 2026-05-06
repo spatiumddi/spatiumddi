@@ -39,6 +39,7 @@ from app.models.audit import AuditLog
 from app.models.ipam import IPBlock, IPSpace
 from app.models.settings import PlatformSettings
 from app.models.vrf import VRF
+from app.services.tags import apply_tag_filter
 
 logger = structlog.get_logger(__name__)
 router = APIRouter(dependencies=[Depends(require_resource_permission("vrf"))])
@@ -426,6 +427,7 @@ async def list_vrfs(
     search: str | None = Query(None, description="Substring match against name or RD"),
     limit: int = Query(500, ge=1, le=2000),
     offset: int = Query(0, ge=0),
+    tag: list[str] = Query(default_factory=list),
 ) -> list[dict[str, Any]]:
     q = select(VRF).order_by(VRF.name)
     if asn_id is not None:
@@ -440,6 +442,7 @@ async def list_vrfs(
                 VRF.route_distinguisher.ilike(like),
             )
         )
+    q = apply_tag_filter(q, VRF.tags, tag)
     q = q.limit(limit).offset(offset)
     rows = list((await db.execute(q)).scalars().all())
     counts = await _fetch_counts(db, [r.id for r in rows])

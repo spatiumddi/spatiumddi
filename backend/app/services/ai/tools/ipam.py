@@ -21,10 +21,18 @@ from sqlalchemy import cast, func, literal, or_, select
 from sqlalchemy.dialects.postgresql import INET
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.models.asn import ASN
 from app.models.auth import User
+from app.models.circuit import Circuit
+from app.models.domain import Domain
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
+from app.models.network import NetworkDevice
+from app.models.network_service import NetworkService
+from app.models.overlay import OverlayNetwork
+from app.models.vrf import VRF
 from app.services.ai.tools.base import register_tool
 from app.services.oui import bulk_lookup_vendors, normalize_mac_key
+from app.services.tags import apply_tag_filter
 
 # ── Reference resolution ──────────────────────────────────────────────
 #
@@ -388,6 +396,117 @@ async def find_ip(db: AsyncSession, user: User, args: FindIPArgs) -> dict[str, A
 # ── find_by_tag ───────────────────────────────────────────────────────
 
 
+# Per-kind dispatch table for find_by_tag. Each entry: (model class,
+# whether the model has SoftDeleteMixin so we should hide tombstoned
+# rows, response-row renderer). Kept as data so adding a new tagged
+# resource kind in the future is one line, not a new branch.
+_TAG_KIND_TABLE: dict[str, tuple[type, bool, Any]] = {
+    "ip_space": (
+        IPSpace,
+        True,
+        lambda r: {"id": str(r.id), "name": r.name, "tags": r.tags or {}},
+    ),
+    "ip_block": (
+        IPBlock,
+        True,
+        lambda r: {
+            "id": str(r.id),
+            "network": str(r.network),
+            "name": r.name,
+            "tags": r.tags or {},
+        },
+    ),
+    "subnet": (
+        Subnet,
+        True,
+        lambda r: {
+            "id": str(r.id),
+            "network": str(r.network),
+            "name": r.name,
+            "tags": r.tags or {},
+        },
+    ),
+    "ip_address": (
+        IPAddress,
+        False,
+        lambda r: {
+            "id": str(r.id),
+            "address": str(r.address),
+            "hostname": r.hostname,
+            "status": r.status,
+            "tags": r.tags or {},
+        },
+    ),
+    "asn": (
+        ASN,
+        False,
+        lambda r: {
+            "id": str(r.id),
+            "number": r.number,
+            "name": r.name,
+            "tags": r.tags or {},
+        },
+    ),
+    "vrf": (
+        VRF,
+        False,
+        lambda r: {
+            "id": str(r.id),
+            "name": r.name,
+            "route_distinguisher": r.route_distinguisher,
+            "tags": r.tags or {},
+        },
+    ),
+    "network_device": (
+        NetworkDevice,
+        False,
+        lambda r: {
+            "id": str(r.id),
+            "name": r.name,
+            "device_type": r.device_type,
+            "tags": r.tags or {},
+        },
+    ),
+    "domain": (
+        Domain,
+        False,
+        lambda r: {"id": str(r.id), "name": r.name, "tags": r.tags or {}},
+    ),
+    "circuit": (
+        Circuit,
+        True,
+        lambda r: {
+            "id": str(r.id),
+            "name": r.name,
+            "ckt_id": r.ckt_id,
+            "tags": r.tags or {},
+        },
+    ),
+    "network_service": (
+        NetworkService,
+        True,
+        lambda r: {
+            "id": str(r.id),
+            "name": r.name,
+            "kind": r.kind,
+            "tags": r.tags or {},
+        },
+    ),
+    "overlay_network": (
+        OverlayNetwork,
+        True,
+        lambda r: {
+            "id": str(r.id),
+            "name": r.name,
+            "kind": r.kind,
+            "tags": r.tags or {},
+        },
+    ),
+}
+
+_TAG_KIND_DEFAULT = ["subnet", "ip_block", "ip_address", "ip_space"]
+
+
 class FindByTagArgs(BaseModel):
     key: str = Field(description="Tag key — case-sensitive.")
     value: str | None = Field(
@@ -398,10 +517,13 @@ class FindByTagArgs(BaseModel):
         ),
     )
     resource_kinds: list[str] = Field(
-        default_factory=lambda: ["subnet", "ip_block", "ip_address", "ip_space"],
+        default_factory=lambda: list(_TAG_KIND_DEFAULT),
         description=(
-            "Which resource kinds to search. Defaults to all four IPAM "
-            "kinds. Each kind is a separate JSONB query."
+            "Which resource kinds to search. Default is the four IPAM "
+            "kinds (preserves prior behaviour). Pass an extended list "
+            "to also search ASNs, VRFs, network devices, domains, "
+            "circuits, network services, or overlay networks. "
+            "Recognised values: " + ", ".join(_TAG_KIND_TABLE) + "."
         ),
     )
     limit_per_kind: int = Field(default=25, ge=1, le=100)
@@ -410,97 +532,43 @@ class FindByTagArgs(BaseModel):
 @register_tool(
     name="find_by_tag",
     description=(
-        "Find IPAM resources (spaces, blocks, subnets, IPs) tagged "
-        "with a specific key (and optionally a specific value). "
-        "Returns up to N results per resource kind. Useful for "
-        "questions like 'what's tagged owner=alice?' or 'which "
-        "subnets have env=prod?'."
+        "Find tagged resources across IPAM, network modeling, DNS / "
+        "DHCP scopes, etc. — every resource type that carries a "
+        "JSONB ``tags`` column. Filters at the database with the "
+        "JSONB ``?`` / ``@>`` operators (Postgres GIN-indexed). "
+        "Useful for questions like 'what's tagged owner=alice?', "
+        "'which subnets have env=prod?', or (with extended "
+        "resource_kinds) 'find every ASN tagged carrier=lumen'."
     ),
     args_model=FindByTagArgs,
     category="ipam",
 )
 async def find_by_tag(db: AsyncSession, user: User, args: FindByTagArgs) -> dict[str, Any]:
+    # Collapse (key, value) → the wire-level ``key:value`` form so the
+    # AI tool and the REST endpoints route through the *same* helper —
+    # any future change to the operator-facing tag syntax (case
+    # folding, glob support, etc.) lands in one place.
+    tag_param = f"{args.key}:{args.value}" if args.value is not None else args.key
+
     out: dict[str, list[dict[str, Any]]] = {}
-
-    def _matches(tags: dict | None) -> bool:
-        if not tags or args.key not in tags:
-            return False
-        if args.value is None:
-            return True
-        return str(tags[args.key]) == args.value
-
-    if "ip_space" in args.resource_kinds:
-        spaces = (
-            (
-                await db.execute(
-                    select(IPSpace)
-                    .where(IPSpace.deleted_at.is_(None))
-                    .limit(args.limit_per_kind * 4)
-                )
-            )
-            .scalars()
-            .all()
-        )
-        out["ip_space"] = [
-            {"id": str(s.id), "name": s.name, "tags": s.tags or {}}
-            for s in spaces
-            if _matches(s.tags)
-        ][: args.limit_per_kind]
-    if "ip_block" in args.resource_kinds:
-        blocks = (
-            (
-                await db.execute(
-                    select(IPBlock)
-                    .where(IPBlock.deleted_at.is_(None))
-                    .limit(args.limit_per_kind * 4)
-                )
-            )
-            .scalars()
-            .all()
-        )
-        out["ip_block"] = [
-            {
-                "id": str(b.id),
-                "network": str(b.network),
-                "name": b.name,
-                "tags": b.tags or {},
-            }
-            for b in blocks
-            if _matches(b.tags)
-        ][: args.limit_per_kind]
-    if "subnet" in args.resource_kinds:
-        subnets = (
-            (
-                await db.execute(
-                    select(Subnet).where(Subnet.deleted_at.is_(None)).limit(args.limit_per_kind * 4)
-                )
-            )
-            .scalars()
-            .all()
-        )
-        out["subnet"] = [
-            {
-                "id": str(s.id),
-                "network": str(s.network),
-                "name": s.name,
-                "tags": s.tags or {},
-            }
-            for s in subnets
-            if _matches(s.tags)
-        ][: args.limit_per_kind]
-    if "ip_address" in args.resource_kinds:
-        ips = (await db.execute(select(IPAddress).limit(args.limit_per_kind * 4))).scalars().all()
-        out["ip_address"] = [
-            {
-                "id": str(ip.id),
-                "address": str(ip.address),
-                "hostname": ip.hostname,
-                "status": ip.status,
-                "tags": ip.tags or {},
-            }
-            for ip in ips
-            if _matches(ip.tags)
-        ][: args.limit_per_kind]
+    for kind in args.resource_kinds:
+        entry = _TAG_KIND_TABLE.get(kind)
+        if entry is None:
+            out[kind] = [
+                {"error": f"unknown resource kind {kind!r}; recognised: {sorted(_TAG_KIND_TABLE)}"}
+            ]
+            continue
+        model, has_soft_delete, render = entry
+        # ``model`` carries ``type`` from the dispatch table, which mypy
+        # can't tighten into a ``Select[Any]`` for a generic select
+        # call — annotate explicitly.
+        stmt: Any = select(model)
+        if has_soft_delete:
+            stmt = stmt.where(model.deleted_at.is_(None))
+        stmt = apply_tag_filter(stmt, model.tags, [tag_param])
+        stmt = stmt.limit(args.limit_per_kind)
+        rows = (await db.execute(stmt)).scalars().all()
+        out[kind] = [render(r) for r in rows]
     return {"key": args.key, "value": args.value, "results": out}
 
 

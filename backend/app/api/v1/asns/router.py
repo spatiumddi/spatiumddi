@@ -29,6 +29,7 @@ from app.api.v1.asns._audit import write_audit
 from app.core.permissions import require_resource_permission
 from app.models.asn import ASN, ASNRpkiRoa, BGPCommunity, BGPPeering
 from app.services.asns.classifier import REGISTRIES, classify_asn
+from app.services.tags import apply_tag_filter
 
 # Router-level permission gate — covers GET (read), POST/PUT (write),
 # DELETE on every endpoint mounted below.
@@ -142,6 +143,7 @@ async def list_asns(
         default=None,
         description="Free-text match against number / name / holder_org (case-insensitive substring).",
     ),
+    tag: list[str] = Query(default_factory=list),
 ) -> ASNListResponse:
     if registry is not None and registry not in REGISTRIES:
         raise HTTPException(
@@ -173,6 +175,7 @@ async def list_asns(
                 ASN.holder_org.ilike(needle),
             )
         )
+    stmt = apply_tag_filter(stmt, ASN.tags, tag)
 
     total = await db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
 

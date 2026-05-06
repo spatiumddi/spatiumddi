@@ -40,6 +40,7 @@ from app.models.network_service import (
 from app.models.overlay import OverlayNetwork
 from app.models.ownership import Customer, Site
 from app.models.vrf import VRF
+from app.services.tags import apply_tag_filter
 
 router = APIRouter(
     tags=["services"],
@@ -357,6 +358,7 @@ async def list_services(
     status: ServiceStatus | None = Query(default=None),
     expiring_within_days: int | None = Query(default=None, ge=0, le=3650),
     search: str | None = Query(default=None, description="Case-insensitive substring on name."),
+    tag: list[str] = Query(default_factory=list),
 ) -> ServiceListResponse:
     stmt = select(NetworkService).where(NetworkService.deleted_at.is_(None))
     if customer_id is not None:
@@ -373,6 +375,7 @@ async def list_services(
     if search:
         needle = f"%{search.strip()}%"
         stmt = stmt.where(NetworkService.name.ilike(needle))
+    stmt = apply_tag_filter(stmt, NetworkService.tags, tag)
 
     total = await db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
     stmt = stmt.order_by(NetworkService.name.asc()).limit(limit).offset(offset)

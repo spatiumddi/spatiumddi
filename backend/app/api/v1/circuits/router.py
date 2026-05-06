@@ -31,6 +31,7 @@ from app.models.circuit import (
     Circuit,
 )
 from app.models.ownership import Customer, Provider, Site
+from app.services.tags import apply_tag_filter
 
 router = APIRouter(
     tags=["circuits"],
@@ -226,6 +227,7 @@ async def list_circuits(
         default=None,
         description="Case-insensitive substring on name / ckt_id.",
     ),
+    tag: list[str] = Query(default_factory=list),
 ) -> CircuitListResponse:
     stmt = select(Circuit).where(Circuit.deleted_at.is_(None))
     if provider_id is not None:
@@ -251,6 +253,7 @@ async def list_circuits(
     if search:
         needle = f"%{search.strip()}%"
         stmt = stmt.where(or_(Circuit.name.ilike(needle), Circuit.ckt_id.ilike(needle)))
+    stmt = apply_tag_filter(stmt, Circuit.tags, tag)
 
     total = await db.scalar(select(func.count()).select_from(stmt.subquery())) or 0
     stmt = stmt.order_by(Circuit.name.asc()).limit(limit).offset(offset)
