@@ -20,6 +20,7 @@ import {
 } from "@/lib/api";
 import { HeaderButton } from "@/components/ui/header-button";
 import { Modal } from "@/components/ui/modal";
+import { TagFilterChips } from "@/components/TagFilterChips";
 import { cn } from "@/lib/utils";
 
 import { errMsg, humanTime } from "./_shared";
@@ -308,6 +309,7 @@ export function AsnsPage() {
   );
   const [whoisFilter, setWhoisFilter] = useState<ASNWhoisState | "all">("all");
   const [search, setSearch] = useState("");
+  const [tagFilters, setTagFilters] = useState<string[]>([]);
 
   const [showCreate, setShowCreate] = useState(false);
   const [editing, setEditing] = useState<ASNRead | null>(null);
@@ -321,8 +323,9 @@ export function AsnsPage() {
     if (registryFilter !== "all") p.registry = registryFilter;
     if (whoisFilter !== "all") p.whois_state = whoisFilter;
     if (search.trim()) p.search = search.trim();
+    if (tagFilters.length > 0) p.tag = tagFilters;
     return p;
-  }, [kindFilter, registryFilter, whoisFilter, search]);
+  }, [kindFilter, registryFilter, whoisFilter, search, tagFilters]);
 
   const { data, isFetching } = useQuery({
     queryKey: ["asns", queryParams],
@@ -437,6 +440,14 @@ export function AsnsPage() {
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             className="ml-auto rounded-md border bg-background px-3 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-ring"
+          />
+        </div>
+
+        <div className="mt-2">
+          <TagFilterChips
+            value={tagFilters}
+            onChange={setTagFilters}
+            placeholder="Filter by tag — try env or env:prod…"
           />
         </div>
 

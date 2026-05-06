@@ -6,6 +6,13 @@ function createClient(): AxiosInstance {
   const client = axios.create({
     baseURL: API_BASE,
     headers: { "Content-Type": "application/json" },
+    // Serialise array query params as ``?tag=foo&tag=bar`` (repeated
+    // key without brackets) — that's the form FastAPI's
+    // ``Query(default_factory=list)`` parses natively. axios 1.x
+    // would otherwise emit ``?tag[]=foo`` which FastAPI ignores.
+    // ``indexes: null`` is the documented opt-in for "no brackets,
+    // no indices, just repeat the key".
+    paramsSerializer: { indexes: null },
   });
 
   // Attach Bearer token from localStorage on every request
@@ -1871,6 +1878,41 @@ export interface UserSessionRow {
   revoked: boolean;
   is_current: boolean;
 }
+
+// ── Tag autocomplete (issue #104 phase 2) ───────────────────────────
+
+export interface TagKeysResponse {
+  keys: string[];
+}
+
+export interface TagValuesResponse {
+  key: string;
+  values: string[];
+}
+
+export const tagsApi = {
+  /** Distinct tag keys across every tagged resource type. ``prefix``
+   *  is a case-insensitive substring filter for typeahead.
+   *  ``staleTime`` on the React Query consumer should be generous
+   *  (10–30s) — the result set turns over slowly as operators rarely
+   *  invent new keys. */
+  listKeys: (prefix?: string, limit = 200) => {
+    const qs = new URLSearchParams();
+    if (prefix) qs.set("prefix", prefix);
+    qs.set("limit", String(limit));
+    return api.get<TagKeysResponse>(`/tags/keys?${qs}`).then((r) => r.data);
+  },
+  /** Distinct values for a specific tag key, across every tagged
+   *  resource type. Used after the operator has picked a key in the
+   *  chip and is choosing the value side. */
+  listValues: (key: string, prefix?: string, limit = 200) => {
+    const qs = new URLSearchParams();
+    qs.set("key", key);
+    if (prefix) qs.set("prefix", prefix);
+    qs.set("limit", String(limit));
+    return api.get<TagValuesResponse>(`/tags/values?${qs}`).then((r) => r.data);
+  },
+};
 
 export const sessionsApi = {
   /** Sessions owned by the current user. Useful even for non-admins —
@@ -7084,6 +7126,9 @@ export interface ASNListQuery {
   customer_id?: string;
   provider_id?: string;
   search?: string;
+  /** Repeated as ``?tag=key`` (key present, any value) or
+   *  ``?tag=key:value`` (exact match). Multiple entries AND together. */
+  tag?: string[];
 }
 
 export interface ASNCreate {
