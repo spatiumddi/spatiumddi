@@ -1855,6 +1855,44 @@ export const usersApi = {
   delete: (id: string) => api.delete(`/users/${id}`),
 };
 
+// ── Sessions (issue #72) ────────────────────────────────────────────
+
+export interface UserSessionRow {
+  id: string;
+  user_id: string;
+  username: string;
+  display_name: string;
+  auth_source: string;
+  source_ip: string | null;
+  user_agent: string | null;
+  created_at: string;
+  last_seen_at: string | null;
+  expires_at: string;
+  revoked: boolean;
+  is_current: boolean;
+}
+
+export const sessionsApi = {
+  /** Sessions owned by the current user. Useful even for non-admins —
+   *  spot a session you don't recognise and revoke it. */
+  listMine: (includeExpired = false) =>
+    api
+      .get<UserSessionRow[]>("/sessions/me", {
+        params: { include_expired: includeExpired },
+      })
+      .then((r) => r.data),
+  /** All sessions across every user (superadmin only). */
+  listAll: (includeExpired = false) =>
+    api
+      .get<UserSessionRow[]>("/sessions", {
+        params: { include_expired: includeExpired },
+      })
+      .then((r) => r.data),
+  /** Force-logout. Returns 204; the in-flight access token using
+   *  this session's jti will start 401-ing on its next call. */
+  revoke: (id: string) => api.delete(`/sessions/${id}`),
+};
+
 export interface AuditLogEntry {
   id: string;
   timestamp: string;

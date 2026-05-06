@@ -42,6 +42,7 @@ import { AIPromptsPage } from "@/pages/admin/AIPromptsPage";
 import { CustomFieldsPage } from "@/pages/admin/CustomFieldsPage";
 import { IPAMTemplatesPage } from "@/pages/admin/IPAMTemplatesPage";
 import { ApiTokensPage } from "@/pages/admin/ApiTokensPage";
+import { SessionsPage } from "@/pages/admin/SessionsPage";
 import { AlertsPage } from "@/pages/admin/AlertsPage";
 import { AuthProvidersPage } from "@/pages/admin/AuthProvidersPage";
 import { DomainsPage } from "@/pages/admin/DomainsPage";
@@ -131,6 +132,7 @@ export default function App() {
         <Route path="admin/ipam/templates" element={<IPAMTemplatesPage />} />
         <Route path="admin/auth-providers" element={<AuthProvidersPage />} />
         <Route path="admin/api-tokens" element={<ApiTokensPage />} />
+        <Route path="admin/sessions" element={<SessionsPage />} />
         <Route path="admin/alerts" element={<AlertsPage />} />
         <Route path="admin/domains" element={<DomainsPage />} />
         <Route path="admin/domains/:id" element={<DomainDetailPage />} />

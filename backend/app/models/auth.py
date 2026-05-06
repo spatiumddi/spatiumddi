@@ -179,6 +179,17 @@ class UserSession(UUIDPrimaryKeyMixin, Base):
     )
     revoked: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
+    # Issue #72 — admin session viewer. ``auth_source`` mirrors the
+    # provider this session was minted against ("local" / provider
+    # name) so the viewer can show "Logged in via Okta" without a
+    # join. ``last_seen_at`` is bumped on each authenticated request
+    # (throttled to ~60 s in the auth dep) so the viewer can render
+    # a relative-age hint.
+    auth_source: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="local", server_default=sa_text("'local'")
+    )
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
     user: Mapped[User] = relationship("User", back_populates="sessions")
 
 

@@ -41,6 +41,7 @@ from app.api.v1.proxmox import router as proxmox_router
 from app.api.v1.roles.router import router as roles_router
 from app.api.v1.search.router import router as search_router
 from app.api.v1.services import router as services_router
+from app.api.v1.sessions.router import router as sessions_router
 from app.api.v1.settings.router import router as settings_router
 from app.api.v1.tailscale import router as tailscale_router
 from app.api.v1.users.router import router as users_router
@@ -93,6 +94,7 @@ api_v1_router.include_router(proxmox_router, prefix="/proxmox", tags=["proxmox"]
 api_v1_router.include_router(roles_router, prefix="/roles", tags=["roles"])
 api_v1_router.include_router(search_router, prefix="/search", tags=["search"])
 api_v1_router.include_router(services_router, prefix="/services", tags=["services"])
+api_v1_router.include_router(sessions_router, prefix="/sessions", tags=["sessions"])
 api_v1_router.include_router(settings_router, prefix="/settings", tags=["settings"])
 api_v1_router.include_router(sites_router, prefix="/sites", tags=["sites"])
 api_v1_router.include_router(tailscale_router, prefix="/tailscale", tags=["tailscale"])

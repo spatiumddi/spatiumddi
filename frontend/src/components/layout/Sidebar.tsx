@@ -45,6 +45,7 @@ import {
   Calculator,
   Webhook,
   Workflow,
+  Monitor,
   X,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -104,6 +105,7 @@ const adminIdentityNav = [
   { label: "Auth Providers", icon: ShieldCheck, to: "/admin/auth-providers" },
   { label: "Groups", icon: UsersRound, to: "/admin/groups" },
   { label: "Roles", icon: KeyRound, to: "/admin/roles" },
+  { label: "Sessions", icon: Monitor, to: "/admin/sessions" },
   { label: "Users", icon: Users, to: "/admin/users" },
 ];
 

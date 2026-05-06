@@ -180,19 +180,26 @@ async def _issue_tokens(db: DB, request: Request, user: User, auth_source: str) 
     # Reset lockout state on every successful login (issue #71). No-op
     # for users who weren't accumulating failures.
     register_success(user)
-    access_token = create_access_token(str(user.id))
     raw_refresh, refresh_hash = create_refresh_token(str(user.id))
 
-    db.add(
-        UserSession(
-            user_id=user.id,
-            refresh_token_hash=refresh_hash,
-            source_ip=_client_ip(request),
-            user_agent=request.headers.get("user-agent"),
-            created_at=datetime.now(UTC),
-            expires_at=datetime.now(UTC) + timedelta(days=settings.refresh_token_expire_days),
-        )
+    # Mint the session row first so we can embed ``session.id`` as the
+    # access token's ``jti`` (issue #72). Force-logout works by
+    # flipping ``UserSession.revoked`` — the auth dep cross-checks
+    # ``jti`` against the session on every request.
+    now = datetime.now(UTC)
+    session_row = UserSession(
+        user_id=user.id,
+        refresh_token_hash=refresh_hash,
+        source_ip=_client_ip(request),
+        user_agent=request.headers.get("user-agent"),
+        auth_source=auth_source,
+        created_at=now,
+        last_seen_at=now,
+        expires_at=now + timedelta(days=settings.refresh_token_expire_days),
     )
+    db.add(session_row)
+    await db.flush()  # populate session_row.id before we sign the JWT
+    access_token = create_access_token(str(user.id), jti=str(session_row.id))
     db.add(
         AuditLog(
             user_id=user.id,
@@ -630,20 +637,25 @@ async def refresh_token_endpoint(body: RefreshRequest, db: DB) -> TokenResponse:
             status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found or inactive"
         )
 
-    # Rotate: revoke old session, issue new tokens
+    # Rotate: revoke old session, issue new tokens. The new session
+    # row's UUID becomes the new access token's ``jti`` (issue #72).
     session.revoked = True
-    access_token = create_access_token(str(user.id))
     raw_refresh, refresh_hash = create_refresh_token(str(user.id))
 
+    now = datetime.now(UTC)
     new_session = UserSession(
         user_id=user.id,
         refresh_token_hash=refresh_hash,
         source_ip=session.source_ip,
         user_agent=session.user_agent,
-        created_at=datetime.now(UTC),
-        expires_at=datetime.now(UTC) + timedelta(days=settings.refresh_token_expire_days),
+        auth_source=session.auth_source,
+        created_at=now,
+        last_seen_at=now,
+        expires_at=now + timedelta(days=settings.refresh_token_expire_days),
     )
     db.add(new_session)
+    await db.flush()
+    access_token = create_access_token(str(user.id), jti=str(new_session.id))
     await db.commit()
 
     logger.info("token_refreshed", user_id=str(user.id))

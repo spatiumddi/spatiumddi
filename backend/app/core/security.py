@@ -27,9 +27,22 @@ def verify_password(plain: str, hashed: str) -> bool:
 # ── JWT ────────────────────────────────────────────────────────────────────────
 
 
-def create_access_token(subject: str, extra: dict[str, Any] | None = None) -> str:
+def create_access_token(
+    subject: str,
+    extra: dict[str, Any] | None = None,
+    *,
+    jti: str | None = None,
+) -> str:
+    """Mint an access JWT. ``jti`` ties the token to a ``UserSession``
+    row so a superadmin can force-logout an in-flight token by
+    flipping ``UserSession.revoked`` (issue #72). Tokens issued before
+    that landing carry no ``jti``; the auth dep treats those as still
+    valid (legacy compatibility) so existing sessions don't all 401
+    the moment the rolling deploy crosses two API instances."""
     expire = datetime.now(UTC) + timedelta(minutes=settings.access_token_expire_minutes)
     payload: dict[str, Any] = {"sub": subject, "exp": expire, "type": "access"}
+    if jti is not None:
+        payload["jti"] = jti
     if extra:
         payload.update(extra)
     return jwt.encode(payload, settings.secret_key, algorithm=ALGORITHM)
