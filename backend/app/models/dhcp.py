@@ -30,6 +30,7 @@ from sqlalchemy import (
     UniqueConstraint,
     func,
 )
+from sqlalchemy import text as sa_text
 from sqlalchemy.dialects.postgresql import INET, JSONB, MACADDR, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -233,6 +234,11 @@ class DHCPScope(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
         nullable=True,
     )
 
+    # Free-form ``key → value`` labels (issue #104).
+    tags: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=sa_text("'{}'::jsonb")
+    )
+
     group: Mapped[DHCPServerGroup] = relationship("DHCPServerGroup", back_populates="scopes")
     pools: Mapped[list[DHCPPool]] = relationship(
         "DHCPPool",
@@ -316,6 +322,11 @@ class DHCPStaticAssignment(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         UUID(as_uuid=True),
         ForeignKey("user.id", ondelete="SET NULL"),
         nullable=True,
+    )
+
+    # Free-form ``key → value`` labels (issue #104).
+    tags: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=sa_text("'{}'::jsonb")
     )
 
     scope: Mapped[DHCPScope] = relationship("DHCPScope", back_populates="statics")

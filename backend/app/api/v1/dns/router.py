@@ -10,9 +10,9 @@ from datetime import UTC, datetime
 from typing import Any
 
 import structlog
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Query, status
 from fastapi.responses import Response, StreamingResponse
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func, select
 from sqlalchemy.orm import selectinload
 
@@ -60,6 +60,7 @@ from app.services.soft_delete import (
     apply_soft_delete,
     collect_soft_delete_batch,
 )
+from app.services.tags import apply_tag_filter
 
 logger = structlog.get_logger(__name__)
 
@@ -550,6 +551,7 @@ class ZoneCreate(BaseModel):
     # owns this zone (managed-DNS engagements typically have one
     # customer per zone).
     customer_id: uuid.UUID | None = None
+    tags: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("zone_type")
     @classmethod
@@ -596,6 +598,7 @@ class ZoneUpdate(BaseModel):
     forwarders: list[str] | None = None
     forward_only: bool | None = None
     customer_id: uuid.UUID | None = None
+    tags: dict[str, Any] | None = None
 
     @field_validator("zone_type")
     @classmethod
@@ -655,6 +658,7 @@ class ZoneResponse(BaseModel):
     # write paths regardless of UI state.
     tailscale_tenant_id: uuid.UUID | None = None
     customer_id: uuid.UUID | None = None
+    tags: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime
     modified_at: datetime
 
@@ -673,6 +677,7 @@ class RecordCreate(BaseModel):
     weight: int | None = None
     port: int | None = None
     view_id: uuid.UUID | None = None
+    tags: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("record_type")
     @classmethod
@@ -691,6 +696,7 @@ class RecordUpdate(BaseModel):
     weight: int | None = None
     port: int | None = None
     view_id: uuid.UUID | None = None
+    tags: dict[str, Any] | None = None
 
 
 class RecordResponse(BaseModel):
@@ -711,6 +717,7 @@ class RecordResponse(BaseModel):
     # Non-null when the record is rendered by the DNS pool health-check
     # pipeline. Operator edits / deletes are blocked while non-null.
     pool_member_id: uuid.UUID | None = None
+    tags: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime
     modified_at: datetime
 
@@ -2259,11 +2266,13 @@ async def list_zones(
     db: DB,
     _: CurrentUser,
     customer_id: uuid.UUID | None = None,
+    tag: list[str] = Query(default_factory=list),
 ) -> list[DNSZone]:
     await _require_group(group_id, db)
     stmt = select(DNSZone).where(DNSZone.group_id == group_id).order_by(DNSZone.name)
     if customer_id is not None:
         stmt = stmt.where(DNSZone.customer_id == customer_id)
+    stmt = apply_tag_filter(stmt, DNSZone.tags, tag)
     result = await db.execute(stmt)
     return list(result.scalars().all())
 
@@ -3249,14 +3258,20 @@ async def list_group_records(
 
 @router.get("/groups/{group_id}/zones/{zone_id}/records", response_model=list[RecordResponse])
 async def list_records(
-    group_id: uuid.UUID, zone_id: uuid.UUID, db: DB, _: CurrentUser
+    group_id: uuid.UUID,
+    zone_id: uuid.UUID,
+    db: DB,
+    _: CurrentUser,
+    tag: list[str] = Query(default_factory=list),
 ) -> list[DNSRecord]:
     await _require_zone(group_id, zone_id, db)
-    result = await db.execute(
+    stmt = (
         select(DNSRecord)
         .where(DNSRecord.zone_id == zone_id)
         .order_by(DNSRecord.name, DNSRecord.record_type)
     )
+    stmt = apply_tag_filter(stmt, DNSRecord.tags, tag)
+    result = await db.execute(stmt)
     return list(result.scalars().all())
 
 

@@ -7,8 +7,8 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, field_validator
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
@@ -17,6 +17,7 @@ from app.core.permissions import require_resource_permission
 from app.models.dhcp import DHCPPool, DHCPScope, DHCPStaticAssignment
 from app.models.ipam import IPAddress, Subnet
 from app.services.dhcp.windows_writethrough import push_static_change
+from app.services.tags import apply_tag_filter
 
 router = APIRouter(
     tags=["dhcp"], dependencies=[Depends(require_resource_permission("dhcp_static"))]
@@ -31,6 +32,7 @@ class StaticCreate(BaseModel):
     client_id: str | None = None
     options_override: dict[str, Any] | None = None
     ip_address_id: uuid.UUID | None = None
+    tags: dict[str, Any] = Field(default_factory=dict)
 
 
 class StaticUpdate(BaseModel):
@@ -41,6 +43,7 @@ class StaticUpdate(BaseModel):
     client_id: str | None = None
     options_override: dict[str, Any] | None = None
     ip_address_id: uuid.UUID | None = None
+    tags: dict[str, Any] | None = None
 
 
 class StaticResponse(BaseModel):
@@ -53,6 +56,7 @@ class StaticResponse(BaseModel):
     client_id: str | None
     options_override: dict[str, Any] | None
     ip_address_id: uuid.UUID | None
+    tags: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime
     modified_at: datetime
 
@@ -168,10 +172,15 @@ async def _conflict_check(
 
 
 @router.get("/scopes/{scope_id}/statics", response_model=list[StaticResponse])
-async def list_statics(scope_id: uuid.UUID, db: DB, _: CurrentUser) -> list[DHCPStaticAssignment]:
-    res = await db.execute(
-        select(DHCPStaticAssignment).where(DHCPStaticAssignment.scope_id == scope_id)
-    )
+async def list_statics(
+    scope_id: uuid.UUID,
+    db: DB,
+    _: CurrentUser,
+    tag: list[str] = Query(default_factory=list),
+) -> list[DHCPStaticAssignment]:
+    stmt = select(DHCPStaticAssignment).where(DHCPStaticAssignment.scope_id == scope_id)
+    stmt = apply_tag_filter(stmt, DHCPStaticAssignment.tags, tag)
+    res = await db.execute(stmt)
     return list(res.scalars().all())
 
 

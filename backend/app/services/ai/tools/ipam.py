@@ -24,6 +24,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.asn import ASN
 from app.models.auth import User
 from app.models.circuit import Circuit
+from app.models.dhcp import DHCPScope, DHCPStaticAssignment
+from app.models.dns import DNSRecord, DNSZone
 from app.models.domain import Domain
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
 from app.models.network import NetworkDevice
@@ -499,6 +501,47 @@ _TAG_KIND_TABLE: dict[str, tuple[type, bool, Any]] = {
             "id": str(r.id),
             "name": r.name,
             "kind": r.kind,
+            "tags": r.tags or {},
+        },
+    ),
+    "dns_zone": (
+        DNSZone,
+        True,
+        lambda r: {
+            "id": str(r.id),
+            "name": r.name,
+            "zone_type": r.zone_type,
+            "tags": r.tags or {},
+        },
+    ),
+    "dns_record": (
+        DNSRecord,
+        True,
+        lambda r: {
+            "id": str(r.id),
+            "fqdn": r.fqdn,
+            "record_type": r.record_type,
+            "value": r.value,
+            "tags": r.tags or {},
+        },
+    ),
+    "dhcp_scope": (
+        DHCPScope,
+        True,
+        lambda r: {
+            "id": str(r.id),
+            "name": r.name,
+            "tags": r.tags or {},
+        },
+    ),
+    "dhcp_static_assignment": (
+        DHCPStaticAssignment,
+        False,
+        lambda r: {
+            "id": str(r.id),
+            "ip_address": str(r.ip_address),
+            "mac_address": str(r.mac_address),
+            "hostname": r.hostname,
             "tags": r.tags or {},
         },
     ),

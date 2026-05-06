@@ -10,8 +10,8 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from fastapi import APIRouter, Depends, HTTPException, status
-from pydantic import BaseModel, field_validator
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
@@ -27,6 +27,7 @@ from app.services.soft_delete import (
     apply_soft_delete,
     collect_soft_delete_batch,
 )
+from app.services.tags import apply_tag_filter
 
 router = APIRouter(tags=["dhcp"], dependencies=[Depends(require_resource_permission("dhcp_scope"))])
 
@@ -93,6 +94,7 @@ class ScopeCreate(BaseModel):
     ddns_hostname_policy: str | None = "client"
     hostname_to_ipam_sync: str = "on_static_only"
     hostname_sync_mode: str | None = None
+    tags: dict[str, Any] = Field(default_factory=dict)
 
     @field_validator("ddns_hostname_policy")
     @classmethod
@@ -130,6 +132,7 @@ class ScopeUpdate(BaseModel):
     # treats null + missing identically by default. We need this to
     # support detaching a previously-bound profile.
     clear_pxe_profile: bool | None = None
+    tags: dict[str, Any] | None = None
 
 
 _NAME_TO_CODE = {v: k for k, v in _CODE_TO_NAME.items()}
@@ -152,6 +155,7 @@ class ScopeResponse(BaseModel):
     hostname_sync_mode: str
     address_family: str = "ipv4"
     last_pushed_at: datetime | None
+    tags: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime
     modified_at: datetime
 
@@ -181,6 +185,7 @@ def _scope_to_response(scope: DHCPScope) -> ScopeResponse:
         hostname_sync_mode=scope.hostname_to_ipam_sync,
         address_family=getattr(scope, "address_family", "ipv4") or "ipv4",
         last_pushed_at=scope.last_pushed_at,
+        tags=scope.tags or {},
         created_at=scope.created_at,
         modified_at=scope.modified_at,
     )
@@ -188,15 +193,27 @@ def _scope_to_response(scope: DHCPScope) -> ScopeResponse:
 
 @router.get("/subnets/{subnet_id}/dhcp-scopes", response_model=list[ScopeResponse])
 async def list_scopes_for_subnet(
-    subnet_id: uuid.UUID, db: DB, _: CurrentUser
+    subnet_id: uuid.UUID,
+    db: DB,
+    _: CurrentUser,
+    tag: list[str] = Query(default_factory=list),
 ) -> list[ScopeResponse]:
-    res = await db.execute(select(DHCPScope).where(DHCPScope.subnet_id == subnet_id))
+    stmt = select(DHCPScope).where(DHCPScope.subnet_id == subnet_id)
+    stmt = apply_tag_filter(stmt, DHCPScope.tags, tag)
+    res = await db.execute(stmt)
     return [_scope_to_response(s) for s in res.unique().scalars().all()]
 
 
 @router.get("/server-groups/{group_id}/scopes", response_model=list[ScopeResponse])
-async def list_scopes_for_group(group_id: uuid.UUID, db: DB, _: CurrentUser) -> list[ScopeResponse]:
-    res = await db.execute(select(DHCPScope).where(DHCPScope.group_id == group_id))
+async def list_scopes_for_group(
+    group_id: uuid.UUID,
+    db: DB,
+    _: CurrentUser,
+    tag: list[str] = Query(default_factory=list),
+) -> list[ScopeResponse]:
+    stmt = select(DHCPScope).where(DHCPScope.group_id == group_id)
+    stmt = apply_tag_filter(stmt, DHCPScope.tags, tag)
+    res = await db.execute(stmt)
     return [_scope_to_response(s) for s in res.unique().scalars().all()]
 
 

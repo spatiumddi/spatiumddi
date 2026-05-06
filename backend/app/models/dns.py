@@ -563,6 +563,14 @@ class DNSZone(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
         index=True,
     )
 
+    # Free-form ``key → value`` labels — same JSONB column shape every
+    # other tagged resource type carries (issue #104). Indexed by the
+    # default JSONB GIN so ``apply_tag_filter`` matches via ``?`` /
+    # ``@>`` without an extra index.
+    tags: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=sa_text("'{}'::jsonb")
+    )
+
     group: Mapped["DNSServerGroup"] = relationship("DNSServerGroup", back_populates="zones")
     view: Mapped["DNSView | None"] = relationship("DNSView", back_populates="zones")
     records: Mapped[list["DNSRecord"]] = relationship(
@@ -635,6 +643,11 @@ class DNSRecord(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
         ForeignKey("dns_pool_member.id", ondelete="CASCADE"),
         nullable=True,
         index=True,
+    )
+
+    # Free-form ``key → value`` labels (issue #104).
+    tags: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=sa_text("'{}'::jsonb")
     )
 
     zone: Mapped["DNSZone"] = relationship("DNSZone", back_populates="records")

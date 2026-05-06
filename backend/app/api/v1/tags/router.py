@@ -63,6 +63,10 @@ router = APIRouter()
 _TAGGED_TABLES: tuple[str, ...] = (
     "asn",
     "circuit",
+    "dhcp_scope",
+    "dhcp_static_assignment",
+    "dns_record",
+    "dns_zone",
     "domain",
     "ip_address",
     "ip_block",
