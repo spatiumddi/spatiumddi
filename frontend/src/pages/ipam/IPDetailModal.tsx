@@ -107,6 +107,13 @@ export interface IPDetailModalProps {
   onEdit: () => void;
   onScan: () => void;
   onDelete?: () => void;
+  /** Click-to-filter affordance from the issue #104 spec. When the
+   *  operator clicks a tag pill, the modal closes and the parent
+   *  pushes the chip onto its own ``addressTagFilters`` so the
+   *  underlying address list filters to matching rows. The chip
+   *  string is the wire form (``key`` for key-only, ``key:value``
+   *  for exact match) — same shape ``<TagFilterChips>`` accepts. */
+  onTagClick?: (chip: string) => void;
 }
 
 /**
@@ -124,6 +131,7 @@ export function IPDetailModal({
   onEdit,
   onScan,
   onDelete,
+  onTagClick,
 }: IPDetailModalProps) {
   const { dialogStyle, dragHandleProps } = useDraggableModal(onClose);
   const zoneNames = zoneNameById ?? {};
@@ -368,19 +376,44 @@ export function IPDetailModal({
                 Tags
               </div>
               <div className="flex flex-wrap gap-1">
-                {tagEntries.map(([k, v]) => (
-                  <span
-                    key={k}
-                    className="inline-flex items-center rounded bg-muted px-1.5 py-0.5 text-[11px]"
-                  >
-                    <span className="font-medium">{k}</span>
-                    {v !== true && v !== "" && (
-                      <span className="ml-1 text-muted-foreground">
-                        {String(v)}
-                      </span>
-                    )}
-                  </span>
-                ))}
+                {tagEntries.map(([k, v]) => {
+                  // Wire shape matches ``<TagFilterChips>`` exactly —
+                  // ``key:value`` when there's a printable value,
+                  // bare ``key`` when the stored value is the
+                  // sentinel ``true`` / empty string.
+                  const chip = v !== true && v !== "" ? `${k}:${String(v)}` : k;
+                  const content = (
+                    <>
+                      <span className="font-medium">{k}</span>
+                      {v !== true && v !== "" && (
+                        <span className="ml-1 text-muted-foreground">
+                          {String(v)}
+                        </span>
+                      )}
+                    </>
+                  );
+                  if (onTagClick) {
+                    return (
+                      <button
+                        key={k}
+                        type="button"
+                        onClick={() => onTagClick(chip)}
+                        title={`Filter the address list by ${chip}`}
+                        className="inline-flex items-center rounded bg-muted px-1.5 py-0.5 text-[11px] hover:bg-primary/15 hover:ring-1 hover:ring-primary/30"
+                      >
+                        {content}
+                      </button>
+                    );
+                  }
+                  return (
+                    <span
+                      key={k}
+                      className="inline-flex items-center rounded bg-muted px-1.5 py-0.5 text-[11px]"
+                    >
+                      {content}
+                    </span>
+                  );
+                })}
               </div>
             </div>
           )}

@@ -4993,6 +4993,15 @@ function SubnetDetail({
             setViewingAddress(null);
             setConfirmDeleteAddr(a);
           }}
+          onTagClick={(chip) => {
+            // Click-a-tag-to-filter affordance from the issue spec.
+            // Dedupe — clicking the same tag twice on consecutive
+            // detail-modal opens shouldn't AND a chip with itself.
+            setAddressTagFilters((prev) =>
+              prev.includes(chip) ? prev : [...prev, chip],
+            );
+            setViewingAddress(null);
+          }}
         />
       )}
       {scanFromDetail && (
