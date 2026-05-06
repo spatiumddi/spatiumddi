@@ -7,8 +7,10 @@ import {
   Ban,
   Boxes,
   Check,
+  ClipboardCheck,
   Container as ContainerIcon,
   Cpu,
+  FileDown,
   FileText,
   Globe,
   Globe2,
@@ -21,6 +23,7 @@ import {
   Route,
   Server,
   Shield,
+  ShieldCheck,
   Waypoints,
 } from "lucide-react";
 import {
@@ -38,6 +41,8 @@ import {
   asnsApi,
   vrfsApi,
   domainsApi,
+  alertsApi,
+  conformityApi,
   type Subnet,
   type DNSServer,
   type DHCPServer,
@@ -51,6 +56,10 @@ import {
   type ASNRead,
   type VRF,
   type Domain,
+  type AlertEvent,
+  type AlertRule,
+  type ConformityResult,
+  type ConformitySummary,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { includeInUtilization } from "@/lib/utilization";
@@ -697,13 +706,29 @@ function DomainsSummaryCard() {
 
 // ── Page ────────────────────────────────────────────────────────────────────
 
-type DashboardTab = "overview" | "ipam" | "dns" | "dhcp";
+type DashboardTab =
+  | "overview"
+  | "ipam"
+  | "dns"
+  | "dhcp"
+  | "compliance"
+  | "conformity";
+
+const _PERSISTED_TABS: ReadonlySet<DashboardTab> = new Set([
+  "ipam",
+  "dns",
+  "dhcp",
+  "compliance",
+  "conformity",
+]);
 
 export function DashboardPage() {
   const qc = useQueryClient();
   const [tab, setTab] = useState<DashboardTab>(() => {
     const saved = localStorage.getItem("dashboard-tab");
-    if (saved === "ipam" || saved === "dns" || saved === "dhcp") return saved;
+    if (saved && _PERSISTED_TABS.has(saved as DashboardTab)) {
+      return saved as DashboardTab;
+    }
     return "overview";
   });
   function selectTab(next: DashboardTab) {
@@ -973,6 +998,12 @@ export function DashboardPage() {
                 { key: "ipam", label: "IPAM", Icon: Network },
                 { key: "dns", label: "DNS", Icon: Globe2 },
                 { key: "dhcp", label: "DHCP", Icon: Server },
+                { key: "compliance", label: "Compliance", Icon: ShieldCheck },
+                {
+                  key: "conformity",
+                  label: "Conformity",
+                  Icon: ClipboardCheck,
+                },
               ] as const
             ).map(({ key, label, Icon }) => (
               <button
@@ -993,83 +1024,91 @@ export function DashboardPage() {
           </div>
         </div>
 
-        {/* ── KPI grid (always visible — same data, different lens) ─── */}
-        <div className="grid gap-3 grid-cols-2 md:grid-cols-3 lg:grid-cols-6">
-          <KpiCard
-            label="IP Spaces"
-            value={spaces?.length ?? "—"}
-            sub={spaces?.[0]?.name?.toUpperCase()}
-            icon={Layers}
-            to="/ipam"
-          />
-          <KpiCard
-            label="Subnets"
-            value={subnets?.length ?? "—"}
-            sub={
-              <>
-                <span className="text-emerald-600 dark:text-emerald-400">
-                  {(subnets?.length ?? 0) - critical - warning} healthy
-                </span>
-                {(critical > 0 || warning > 0) && (
-                  <>
-                    {" · "}
-                    <span className="text-red-600 dark:text-red-400">
-                      {critical + warning} alert
-                      {critical + warning === 1 ? "" : "s"}
-                    </span>
-                  </>
-                )}
-              </>
-            }
-            icon={Network}
-            tone={critical > 0 ? "bad" : warning > 0 ? "warn" : "good"}
-            to="/ipam"
-          />
-          <KpiCard
-            label="Allocated IPs (IPv4)"
-            value={allocatedIPs.toLocaleString()}
-            sub={`${freeIPs.toLocaleString()} free`}
-            icon={Activity}
-            to="/ipam"
-          />
-          <KpiCard
-            label="Utilization (IPv4)"
-            value={`${overallUtil.toFixed(1)}%`}
-            sub={`${allocatedIPs.toLocaleString()} / ${totalIPs.toLocaleString()}`}
-            icon={Server}
-            tone={
-              overallUtil >= 95 ? "bad" : overallUtil >= 80 ? "warn" : "default"
-            }
-          />
-          <KpiCard
-            label="DNS Zones"
-            value={totalZones}
-            sub={
-              dnsGroups.length > 0
-                ? `${dnsGroups.length} group${dnsGroups.length === 1 ? "" : "s"}`
-                : "no groups"
-            }
-            icon={Globe2}
-            to="/dns"
-          />
-          <KpiCard
-            label="Servers"
-            value={allServers.length}
-            sub={
-              unhealthyServers > 0 ? (
-                <span className="text-red-600 dark:text-red-400">
-                  {activeServers} active · {unhealthyServers} unhealthy
-                </span>
-              ) : allServers.length > 0 ? (
-                `${activeServers} active`
-              ) : (
-                "none registered"
-              )
-            }
-            icon={Cpu}
-            tone={unhealthyServers > 0 ? "bad" : "default"}
-          />
-        </div>
+        {/* ── KPI grid (Overview / IPAM / DNS / DHCP — same data, different
+              lens. Compliance + Conformity tabs are focused views and own
+              their own headline KPIs). ───────────────────────────────── */}
+        {tab !== "compliance" && tab !== "conformity" && (
+          <div className="grid gap-3 grid-cols-2 md:grid-cols-3 lg:grid-cols-6">
+            <KpiCard
+              label="IP Spaces"
+              value={spaces?.length ?? "—"}
+              sub={spaces?.[0]?.name?.toUpperCase()}
+              icon={Layers}
+              to="/ipam"
+            />
+            <KpiCard
+              label="Subnets"
+              value={subnets?.length ?? "—"}
+              sub={
+                <>
+                  <span className="text-emerald-600 dark:text-emerald-400">
+                    {(subnets?.length ?? 0) - critical - warning} healthy
+                  </span>
+                  {(critical > 0 || warning > 0) && (
+                    <>
+                      {" · "}
+                      <span className="text-red-600 dark:text-red-400">
+                        {critical + warning} alert
+                        {critical + warning === 1 ? "" : "s"}
+                      </span>
+                    </>
+                  )}
+                </>
+              }
+              icon={Network}
+              tone={critical > 0 ? "bad" : warning > 0 ? "warn" : "good"}
+              to="/ipam"
+            />
+            <KpiCard
+              label="Allocated IPs (IPv4)"
+              value={allocatedIPs.toLocaleString()}
+              sub={`${freeIPs.toLocaleString()} free`}
+              icon={Activity}
+              to="/ipam"
+            />
+            <KpiCard
+              label="Utilization (IPv4)"
+              value={`${overallUtil.toFixed(1)}%`}
+              sub={`${allocatedIPs.toLocaleString()} / ${totalIPs.toLocaleString()}`}
+              icon={Server}
+              tone={
+                overallUtil >= 95
+                  ? "bad"
+                  : overallUtil >= 80
+                    ? "warn"
+                    : "default"
+              }
+            />
+            <KpiCard
+              label="DNS Zones"
+              value={totalZones}
+              sub={
+                dnsGroups.length > 0
+                  ? `${dnsGroups.length} group${dnsGroups.length === 1 ? "" : "s"}`
+                  : "no groups"
+              }
+              icon={Globe2}
+              to="/dns"
+            />
+            <KpiCard
+              label="Servers"
+              value={allServers.length}
+              sub={
+                unhealthyServers > 0 ? (
+                  <span className="text-red-600 dark:text-red-400">
+                    {activeServers} active · {unhealthyServers} unhealthy
+                  </span>
+                ) : allServers.length > 0 ? (
+                  `${activeServers} active`
+                ) : (
+                  "none registered"
+                )
+              }
+              icon={Cpu}
+              tone={unhealthyServers > 0 ? "bad" : "default"}
+            />
+          </div>
+        )}
 
         {/* ── Platform health (Overview only — sits directly below the
               KPI row so the colour-coded health ribbon is the next
@@ -1457,6 +1496,12 @@ export function DashboardPage() {
               tailscaleTenants={tailscaleTenants}
             />
           )}
+
+        {/* ── Compliance tab ────────────────────────────────────────── */}
+        {tab === "compliance" && <CompliancePanel subnets={subnets ?? []} />}
+
+        {/* ── Conformity tab ────────────────────────────────────────── */}
+        {tab === "conformity" && <ConformityPanel />}
 
         {/* ── Empty state (Overview only) ───────────────────────────── */}
         {tab === "overview" &&
@@ -1959,5 +2004,441 @@ function IntegrationRow({
             : "never"}
       </span>
     </Link>
+  );
+}
+
+// ── Compliance dashboard tab (issue #105 + classification roll-up) ──
+//
+// Static + reactive view of compliance state:
+//
+//   - Three KPI cards for the classification flag counts (PCI / HIPAA /
+//     internet-facing), click-through to the filtered IPAM list.
+//   - Compliance-change rule status — the three seed rules + their
+//     enabled / disabled state. Click-through to /admin/alerts.
+//   - Recent compliance-change events table — last 20 firings keyed
+//     off the ``audit:`` subject_type prefix the evaluator emits.
+//
+// Conformity (proactive policy evaluation) gets its own tab next to
+// this one — different audience question. This tab answers "is
+// anything *changing* in scope?", the conformity tab answers "is
+// scope still in policy *right now*?".
+function CompliancePanel({ subnets }: { subnets: Subnet[] }) {
+  const pciCount = subnets.filter((s) => s.pci_scope).length;
+  const hipaaCount = subnets.filter((s) => s.hipaa_scope).length;
+  const internetCount = subnets.filter((s) => s.internet_facing).length;
+
+  const { data: rules = [] } = useQuery<AlertRule[]>({
+    queryKey: ["alert-rules"],
+    queryFn: () => alertsApi.listRules(),
+    staleTime: 30_000,
+  });
+  const complianceRules = rules.filter(
+    (r) => r.rule_type === "compliance_change",
+  );
+
+  // Open + recently-resolved compliance-change events. ``subject_type``
+  // for these is ``audit:<resource_type>`` (see services/alerts.py).
+  const { data: events = [] } = useQuery<AlertEvent[]>({
+    queryKey: ["alert-events", { compliance: true }],
+    queryFn: () => alertsApi.listEvents({ limit: 200 }),
+    refetchInterval: 30_000,
+  });
+  const complianceEvents = events
+    .filter((e) => e.subject_type.startsWith("audit:"))
+    .slice(0, 20);
+
+  return (
+    <div className="space-y-5">
+      {/* Headline KPIs */}
+      <div className="grid gap-3 grid-cols-1 md:grid-cols-3">
+        <ComplianceKpi
+          label="PCI scope"
+          count={pciCount}
+          total={subnets.length}
+          to="/admin/compliance"
+          tone="bad"
+        />
+        <ComplianceKpi
+          label="HIPAA scope"
+          count={hipaaCount}
+          total={subnets.length}
+          to="/admin/compliance"
+          tone="warn"
+        />
+        <ComplianceKpi
+          label="Internet-facing"
+          count={internetCount}
+          total={subnets.length}
+          to="/admin/compliance"
+          tone="warn"
+        />
+      </div>
+
+      <div className="grid gap-5 lg:grid-cols-2">
+        {/* Rule coverage card */}
+        <div className="rounded-lg border bg-card">
+          <div className="flex items-center justify-between border-b px-4 py-2.5">
+            <h3 className="text-xs font-semibold uppercase tracking-wider">
+              Compliance-change rule coverage
+            </h3>
+            <Link
+              to="/admin/alerts"
+              className="text-[11px] text-primary hover:underline"
+            >
+              Manage rules →
+            </Link>
+          </div>
+          {complianceRules.length === 0 ? (
+            <div className="px-4 py-6 text-center text-xs text-muted-foreground">
+              No <code>compliance_change</code> rules yet. Three disabled seed
+              rules ship at first boot — toggle one on in{" "}
+              <Link to="/admin/alerts" className="text-primary hover:underline">
+                /admin/alerts
+              </Link>
+              .
+            </div>
+          ) : (
+            <ul className="divide-y">
+              {complianceRules.map((r) => (
+                <li
+                  key={r.id}
+                  className="flex items-center gap-3 px-4 py-2.5 text-xs"
+                >
+                  <span
+                    className={cn(
+                      "inline-block h-1.5 w-1.5 rounded-full",
+                      r.enabled ? "bg-emerald-500" : "bg-muted-foreground/40",
+                    )}
+                  />
+                  <span className="flex-1 truncate font-medium">{r.name}</span>
+                  <span className="font-mono text-[10px] text-muted-foreground">
+                    {r.classification ?? "—"}
+                  </span>
+                  <span className="font-mono text-[10px] text-muted-foreground">
+                    {r.change_scope ?? "—"}
+                  </span>
+                  <span
+                    className={cn(
+                      "rounded px-1.5 py-0.5 text-[10px] uppercase tracking-wider",
+                      r.enabled
+                        ? "bg-emerald-100 text-emerald-800 dark:bg-emerald-900/30 dark:text-emerald-300"
+                        : "bg-muted text-muted-foreground",
+                    )}
+                  >
+                    {r.enabled ? "active" : "off"}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+
+        {/* Recent events card */}
+        <div className="rounded-lg border bg-card">
+          <div className="flex items-center justify-between border-b px-4 py-2.5">
+            <div className="flex items-center gap-2">
+              <span className="relative inline-flex h-1.5 w-1.5">
+                <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-amber-400 opacity-50" />
+                <span className="relative inline-flex h-1.5 w-1.5 rounded-full bg-amber-500" />
+              </span>
+              <h3 className="text-xs font-semibold uppercase tracking-wider">
+                Recent compliance changes
+              </h3>
+            </div>
+            <Link
+              to="/admin/alerts"
+              className="text-[11px] text-primary hover:underline"
+            >
+              View all →
+            </Link>
+          </div>
+          {complianceEvents.length === 0 ? (
+            <div className="px-4 py-6 text-center text-xs text-muted-foreground">
+              No compliance-change events. Either no rules are enabled or
+              nothing scoped has been mutated yet.
+            </div>
+          ) : (
+            <ul className="divide-y max-h-96 overflow-auto">
+              {complianceEvents.map((e) => (
+                <li key={e.id} className="px-4 py-2 text-xs">
+                  <div className="flex items-baseline justify-between gap-2">
+                    <span className="truncate font-medium">
+                      {e.subject_display}
+                    </span>
+                    <span className="shrink-0 text-[10px] tabular-nums text-muted-foreground">
+                      {humanTime(e.fired_at)}
+                    </span>
+                  </div>
+                  <p className="mt-0.5 truncate text-[11px] text-muted-foreground">
+                    {e.message}
+                  </p>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      </div>
+
+      <p className="text-[11px] text-muted-foreground">
+        Static classification + reactive change view. The companion{" "}
+        <span className="font-medium">Conformity</span> tab (next to this one)
+        covers proactive evaluation against PCI / HIPAA / SOC2 policies +
+        auditor-facing PDF export.
+      </p>
+    </div>
+  );
+}
+
+function ComplianceKpi({
+  label,
+  count,
+  total,
+  to,
+  tone,
+}: {
+  label: string;
+  count: number;
+  total: number;
+  to: string;
+  tone: Tone;
+}) {
+  const cls = TONE_CLASS[tone];
+  const pct = total > 0 ? Math.round((count / total) * 100) : 0;
+  return (
+    <Link
+      to={to}
+      className="rounded-lg border bg-card p-4 transition-colors hover:bg-accent/40"
+    >
+      <p className="text-[11px] uppercase tracking-wider text-muted-foreground">
+        {label}
+      </p>
+      <p className={cn("mt-2 text-3xl font-bold tabular-nums", cls.value)}>
+        {count}
+      </p>
+      <p className="text-[11px] text-muted-foreground">
+        {pct}% of {total} subnets · click to filter
+      </p>
+    </Link>
+  );
+}
+
+// ── Conformity dashboard tab (issue #106) ───────────────────────────
+//
+// Proactive evaluation view:
+//
+//   - Per-framework summary cards (pulls /conformity/summary).
+//   - "Generate audit PDF" button (uses the authenticated blob fetch).
+//   - Recent failing results table (top 20 fail status).
+//   - Quick link to /admin/conformity for full management.
+//
+// The companion Compliance tab covers the static + reactive picture
+// (classification roll-up + audit-log change events).
+function ConformityPanel() {
+  const summaryQ = useQuery<ConformitySummary>({
+    queryKey: ["conformity-summary"],
+    queryFn: () => conformityApi.summary(),
+    refetchInterval: 60_000,
+  });
+  const failingQ = useQuery<ConformityResult[]>({
+    queryKey: ["conformity-results", "fail-recent"],
+    queryFn: () => conformityApi.listResults({ status: "fail", limit: 20 }),
+    refetchInterval: 60_000,
+  });
+
+  const summary = summaryQ.data;
+  const totalEvaluated = summary
+    ? summary.overall_pass +
+      summary.overall_warn +
+      summary.overall_fail +
+      summary.overall_not_applicable
+    : 0;
+  const totalPassPct =
+    summary && totalEvaluated > 0
+      ? Math.round((summary.overall_pass / totalEvaluated) * 100)
+      : 0;
+
+  return (
+    <div className="space-y-5">
+      {/* Headline */}
+      <div className="grid gap-3 grid-cols-2 md:grid-cols-4">
+        <div className="rounded-lg border bg-card p-4">
+          <p className="text-[11px] uppercase tracking-wider text-muted-foreground">
+            Overall pass rate
+          </p>
+          <p className="mt-2 text-3xl font-bold tabular-nums">
+            {totalEvaluated > 0 ? `${totalPassPct}%` : "—"}
+          </p>
+          <p className="text-[11px] text-muted-foreground">
+            {summary?.overall_pass ?? 0} pass · {summary?.overall_fail ?? 0}{" "}
+            fail · {summary?.overall_warn ?? 0} warn
+          </p>
+        </div>
+        <div className="rounded-lg border bg-card p-4">
+          <p className="text-[11px] uppercase tracking-wider text-muted-foreground">
+            Failing
+          </p>
+          <p
+            className={cn(
+              "mt-2 text-3xl font-bold tabular-nums",
+              (summary?.overall_fail ?? 0) > 0
+                ? TONE_CLASS.bad.value
+                : TONE_CLASS.good.value,
+            )}
+          >
+            {summary?.overall_fail ?? 0}
+          </p>
+          <p className="text-[11px] text-muted-foreground">
+            policy / resource pairs currently failing
+          </p>
+        </div>
+        <div className="rounded-lg border bg-card p-4">
+          <p className="text-[11px] uppercase tracking-wider text-muted-foreground">
+            Frameworks
+          </p>
+          <p className="mt-2 text-3xl font-bold tabular-nums">
+            {summary?.frameworks.length ?? 0}
+          </p>
+          <p className="text-[11px] text-muted-foreground">
+            {summary?.frameworks.reduce((s, f) => s + f.policies_enabled, 0) ??
+              0}{" "}
+            policies enabled
+          </p>
+        </div>
+        <div className="rounded-lg border bg-card p-4">
+          <p className="text-[11px] uppercase tracking-wider text-muted-foreground">
+            Last evaluated
+          </p>
+          <p className="mt-2 text-sm font-medium">
+            {summary?.last_evaluated_at
+              ? humanTime(summary.last_evaluated_at)
+              : "never"}
+          </p>
+          <p className="text-[11px] text-muted-foreground">
+            beat ticks every 60 s; per-policy interval gate
+          </p>
+        </div>
+      </div>
+
+      {/* Action bar */}
+      <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border bg-card px-4 py-2.5">
+        <div className="flex items-center gap-2 text-xs text-muted-foreground">
+          <ClipboardCheck className="h-4 w-4" />
+          Auditor PDF export covers every framework + policy + resource with the
+          latest result, plus a SHA-256 integrity hash.
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => conformityApi.exportPdf()}
+            className="inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs font-medium hover:bg-accent"
+          >
+            <FileDown className="h-3.5 w-3.5" />
+            Generate audit PDF
+          </button>
+          <Link
+            to="/admin/conformity"
+            className="inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs font-medium hover:bg-accent"
+          >
+            Manage policies →
+          </Link>
+        </div>
+      </div>
+
+      {/* Per-framework cards */}
+      {summary && summary.frameworks.length > 0 && (
+        <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
+          {summary.frameworks.map((fw) => {
+            const fwTotal =
+              fw.pass_count +
+              fw.warn_count +
+              fw.fail_count +
+              fw.not_applicable_count;
+            const passPct =
+              fwTotal > 0 ? Math.round((fw.pass_count / fwTotal) * 100) : 0;
+            return (
+              <Link
+                key={fw.framework}
+                to="/admin/conformity"
+                className="rounded-lg border bg-card p-3 transition-colors hover:bg-accent/40"
+              >
+                <p className="text-xs font-semibold">{fw.framework}</p>
+                <p className="text-[11px] text-muted-foreground">
+                  {fw.policies_enabled}/{fw.policies_total} policies enabled
+                </p>
+                <p
+                  className={cn(
+                    "mt-2 text-xl font-bold tabular-nums",
+                    fw.fail_count > 0
+                      ? TONE_CLASS.bad.value
+                      : passPct >= 95
+                        ? TONE_CLASS.good.value
+                        : TONE_CLASS.warn.value,
+                  )}
+                >
+                  {fwTotal === 0 ? "—" : `${passPct}%`}
+                </p>
+                <p className="text-[11px] text-muted-foreground">
+                  <span className="text-emerald-600 dark:text-emerald-400">
+                    {fw.pass_count}p
+                  </span>{" "}
+                  ·{" "}
+                  <span className="text-amber-600 dark:text-amber-400">
+                    {fw.warn_count}w
+                  </span>{" "}
+                  ·{" "}
+                  <span className="text-red-600 dark:text-red-400">
+                    {fw.fail_count}f
+                  </span>
+                </p>
+              </Link>
+            );
+          })}
+        </div>
+      )}
+
+      {/* Failing results */}
+      <div className="rounded-lg border bg-card">
+        <div className="flex items-center justify-between border-b px-4 py-2.5">
+          <h3 className="text-xs font-semibold uppercase tracking-wider">
+            Recent failing results
+          </h3>
+          <Link
+            to="/admin/conformity"
+            className="text-[11px] text-primary hover:underline"
+          >
+            View all →
+          </Link>
+        </div>
+        {failingQ.isLoading ? (
+          <div className="px-4 py-6 text-center text-xs text-muted-foreground">
+            Loading…
+          </div>
+        ) : (failingQ.data ?? []).length === 0 ? (
+          <div className="px-4 py-6 text-center text-xs text-muted-foreground">
+            <Check className="mx-auto mb-2 h-4 w-4 text-emerald-500" />
+            Nothing currently failing. Either no policies are enabled, or every
+            evaluated resource is in policy.
+          </div>
+        ) : (
+          <ul className="divide-y max-h-96 overflow-auto">
+            {(failingQ.data ?? []).map((r) => (
+              <li key={r.id} className="px-4 py-2 text-xs">
+                <div className="flex items-baseline justify-between gap-2">
+                  <span className="truncate font-medium">
+                    {r.resource_kind} {r.resource_display}
+                  </span>
+                  <span className="shrink-0 text-[10px] tabular-nums text-muted-foreground">
+                    {humanTime(r.evaluated_at)}
+                  </span>
+                </div>
+                <p className="mt-0.5 truncate text-[11px] text-muted-foreground">
+                  {r.detail || "(no detail)"}
+                </p>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+    </div>
   );
 }
