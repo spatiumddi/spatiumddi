@@ -785,7 +785,7 @@ function EmptyState({ onPick }: { onPick: (text: string) => void }) {
 
 function MessageBubble({ message }: { message: AIChatMessage }) {
   if (message.role === "tool") {
-    // Detect proposal-shape tool results — render the Apply / Discard
+    // Detect proposal-shape tool results — render the Approve / Reject
     // card instead of the raw JSON tool envelope. Pattern matches the
     // contract from ``app/services/ai/tools/proposals.py``.
     let parsed: unknown = null;
@@ -957,11 +957,12 @@ function MessageFooter({ message }: { message: AIChatMessage }) {
   );
 }
 
-/** Apply / Discard card rendered in place of a raw tool result for
+/** Approve / Reject card rendered in place of a raw tool result for
  *  proposal-shape payloads. Lazy-fetches the canonical proposal row
  *  on mount so it can show the latest terminal state when the chat
- *  history is replayed (e.g. the operator already applied or
- *  discarded earlier).
+ *  history is replayed (e.g. the operator already approved or
+ *  rejected earlier). The DB / API still call the fields
+ *  ``applied_at`` and ``discarded_at`` — the rename is UI-only.
  */
 function ProposalCard({
   proposalId,
@@ -1007,12 +1008,12 @@ function ProposalCard({
   let badge: { text: string; cls: string };
   if (applied) {
     badge = {
-      text: "applied",
+      text: "approved",
       cls: "bg-emerald-500/10 text-emerald-600 border-emerald-500/30",
     };
   } else if (discarded) {
     badge = {
-      text: "discarded",
+      text: "rejected",
       cls: "bg-zinc-500/10 text-zinc-600 border-zinc-500/30",
     };
   } else if (expired) {
@@ -1071,17 +1072,17 @@ function ProposalCard({
               type="button"
               onClick={() => applyMut.mutate()}
               disabled={applyMut.isPending || discardMut.isPending}
-              className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1 text-xs font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+              className="inline-flex items-center gap-1.5 rounded-md bg-emerald-600 px-3 py-1 text-xs font-medium text-white hover:bg-emerald-700 disabled:opacity-50 dark:bg-emerald-600 dark:hover:bg-emerald-500"
             >
-              {applyMut.isPending ? "Applying…" : "Apply"}
+              {applyMut.isPending ? "Approving…" : "Approve"}
             </button>
             <button
               type="button"
               onClick={() => discardMut.mutate()}
               disabled={applyMut.isPending || discardMut.isPending}
-              className="inline-flex items-center gap-1.5 rounded-md border px-3 py-1 text-xs hover:bg-accent disabled:opacity-50"
+              className="inline-flex items-center gap-1.5 rounded-md bg-destructive px-3 py-1 text-xs font-medium text-destructive-foreground hover:bg-destructive/90 disabled:opacity-50"
             >
-              {discardMut.isPending ? "Discarding…" : "Discard"}
+              {discardMut.isPending ? "Rejecting…" : "Reject"}
             </button>
             {proposal?.expires_at && (
               <span className="ml-auto text-[10px] text-muted-foreground">
