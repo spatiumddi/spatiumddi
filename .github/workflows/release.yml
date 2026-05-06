@@ -279,6 +279,20 @@ jobs:
             else
               NOTES=$(git log HEAD --oneline --no-merges | head -30)
             fi
+          else
+            # Run through the changelog transformer so the GitHub release
+            # body reads as flowing prose instead of a wall of forced
+            # `<br>`s. The release renderer applies GFM with breaks=true,
+            # so every `\n` in the source becomes a literal break — but
+            # CHANGELOG.md is hard-wrapped at ~70 chars for terminal
+            # reading. The transformer joins consecutive prose lines into
+            # one (preserving blank-line paragraph breaks, code fences,
+            # bullet lists, and headings), wraps the top summary in
+            # `### 🚀 Highlights`, and emoji-prefixes the standard
+            # Keep-a-Changelog section headers (`✨ Added`, `🔧 Changed`,
+            # `🐛 Fixed`, `🔒 Security`, `🗃️ Migrations`, …). Idempotent
+            # — re-running on already-transformed text is a no-op.
+            NOTES=$(printf '%s\n' "$NOTES" | python3 scripts/format_release_notes.py)
           fi
 
           {

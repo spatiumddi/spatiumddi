@@ -3,6 +3,21 @@
 All notable changes to SpatiumDDI are documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/); versioning uses [CalVer](https://calver.org/) (`YYYY.MM.DD-N`).
 
+This file is hard-wrapped at ~70 chars for terminal reading. The
+release workflow runs each section through `scripts/format_release_
+notes.py` before pasting it into the GitHub release body, which:
+
+* unwraps consecutive prose lines into single-line paragraphs (since
+  GitHub's release renderer turns every `\n` into a forced `<br>`),
+* wraps the top summary paragraph in `### 🚀 Highlights`,
+* emoji-prefixes the standard section headings (`### ✨ Added`,
+  `### 🔧 Changed`, `### 🐛 Fixed`, `### 🔒 Security`,
+  `### 🗃️ Migrations`, `### ⚠️ Deprecated`, `### 💥 Breaking`).
+
+So author each section here with the plain Keep-a-Changelog headings
+(`### Added`, `### Changed`, …) and a hard-wrapped summary paragraph;
+the formatter handles the rest.
+
 ---
 
 ## Unreleased
