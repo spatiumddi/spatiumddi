@@ -11,6 +11,7 @@ import {
 } from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
+import { TagFilterChips } from "@/components/TagFilterChips";
 import { CustomerPicker, ProviderPicker } from "@/components/ownership/pickers";
 
 const inputCls =
@@ -307,10 +308,12 @@ export function DomainsPage() {
   const [search, setSearch] = useState("");
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [refreshingId, setRefreshingId] = useState<string | null>(null);
+  const [tagFilters, setTagFilters] = useState<string[]>([]);
 
   const listParams = {
     ...(stateFilter ? { whois_state: stateFilter } : {}),
     ...(search.trim() ? { search: search.trim() } : {}),
+    ...(tagFilters.length > 0 ? { tag: tagFilters } : {}),
     page_size: 200,
   };
 
@@ -444,6 +447,13 @@ export function DomainsPage() {
           <span className="ml-auto text-xs text-muted-foreground">
             {items.length} of {data?.total ?? 0}
           </span>
+          <div className="basis-full">
+            <TagFilterChips
+              value={tagFilters}
+              onChange={setTagFilters}
+              placeholder="Filter by tag — try env or env:prod…"
+            />
+          </div>
         </div>
 
         {/* Bulk toolbar */}

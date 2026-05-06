@@ -15,6 +15,7 @@ import {
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
 import { HeaderButton } from "@/components/ui/header-button";
+import { TagFilterChips } from "@/components/TagFilterChips";
 import { CustomerChip } from "@/components/ownership/pickers";
 
 const inputCls =
@@ -345,6 +346,7 @@ export function OverlaysPage() {
   const [editing, setEditing] = useState<OverlayRead | null>(null);
   const [showNew, setShowNew] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [tagFilters, setTagFilters] = useState<string[]>([]);
 
   const customersQ = useQuery({
     queryKey: ["customers", "all"],
@@ -353,7 +355,14 @@ export function OverlaysPage() {
   });
 
   const query = useQuery({
-    queryKey: ["overlays", search, statusFilter, kindFilter, customerFilter],
+    queryKey: [
+      "overlays",
+      search,
+      statusFilter,
+      kindFilter,
+      customerFilter,
+      tagFilters,
+    ],
     queryFn: () =>
       overlaysApi.list({
         limit: 500,
@@ -361,6 +370,7 @@ export function OverlaysPage() {
         status: (statusFilter || undefined) as OverlayStatus | undefined,
         kind: (kindFilter || undefined) as OverlayKind | undefined,
         customer_id: customerFilter || undefined,
+        tag: tagFilters.length > 0 ? tagFilters : undefined,
       }),
   });
 
@@ -475,6 +485,12 @@ export function OverlaysPage() {
             ))}
           </select>
         </div>
+
+        <TagFilterChips
+          value={tagFilters}
+          onChange={setTagFilters}
+          placeholder="Filter by tag — try env or env:prod…"
+        />
 
         {selectedIds.size > 0 && (
           <div className="flex items-center justify-between rounded-md border bg-muted/50 px-3 py-2 text-sm">

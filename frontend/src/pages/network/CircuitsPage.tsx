@@ -15,6 +15,7 @@ import {
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal, ModalTabs } from "@/components/ui/modal";
 import { HeaderButton } from "@/components/ui/header-button";
+import { TagFilterChips } from "@/components/TagFilterChips";
 import {
   CustomerChip,
   ProviderChip,
@@ -583,6 +584,7 @@ export function CircuitsPage() {
   const [editing, setEditing] = useState<CircuitRead | null>(null);
   const [showNew, setShowNew] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [tagFilters, setTagFilters] = useState<string[]>([]);
 
   const providersQ = useQuery({
     queryKey: ["providers", "all"],
@@ -597,6 +599,7 @@ export function CircuitsPage() {
       statusFilter,
       transportFilter,
       providerFilter,
+      tagFilters,
     ],
     queryFn: () =>
       circuitsApi.list({
@@ -607,6 +610,7 @@ export function CircuitsPage() {
           | TransportClass
           | undefined,
         provider_id: providerFilter || undefined,
+        tag: tagFilters.length > 0 ? tagFilters : undefined,
       }),
   });
 
@@ -722,6 +726,12 @@ export function CircuitsPage() {
             ))}
           </select>
         </div>
+
+        <TagFilterChips
+          value={tagFilters}
+          onChange={setTagFilters}
+          placeholder="Filter by tag — try env or env:prod…"
+        />
 
         {selectedIds.size > 0 && (
           <div className="flex items-center justify-between rounded-md border bg-muted/50 px-3 py-2 text-sm">

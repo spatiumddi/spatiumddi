@@ -4151,7 +4151,7 @@ export interface VRFBulkDeleteResponse {
 }
 
 export const vrfsApi = {
-  list: (params?: { search?: string; asn_id?: string }) =>
+  list: (params?: { search?: string; asn_id?: string; tag?: string[] }) =>
     api.get<VRF[]>("/vrfs", { params }).then((r) => r.data),
   get: (id: string) => api.get<VRF>(`/vrfs/${id}`).then((r) => r.data),
   create: (body: VRFCreate) => api.post<VRF>("/vrfs", body).then((r) => r.data),
@@ -5631,6 +5631,7 @@ export interface DomainListParams {
   search?: string;
   page?: number;
   page_size?: number;
+  tag?: string[];
 }
 
 export const domainsApi = {
@@ -6634,6 +6635,7 @@ export interface NetworkDeviceListQuery {
   last_poll_status?: NetworkPollStatus;
   page?: number;
   page_size?: number;
+  tag?: string[];
 }
 
 export interface NetworkDeviceCreate {
@@ -7622,6 +7624,7 @@ export interface CircuitListQuery {
   status?: CircuitStatus;
   expiring_within_days?: number;
   search?: string;
+  tag?: string[];
 }
 
 export const circuitsApi = {
@@ -7743,6 +7746,7 @@ export interface ServiceListQuery {
   status?: ServiceStatus;
   expiring_within_days?: number;
   search?: string;
+  tag?: string[];
 }
 
 export interface ServiceResourceAttach {
@@ -7932,6 +7936,7 @@ export interface OverlayListQuery {
   kind?: OverlayKind;
   status?: OverlayStatus;
   search?: string;
+  tag?: string[];
 }
 
 export interface OverlaySiteRead {

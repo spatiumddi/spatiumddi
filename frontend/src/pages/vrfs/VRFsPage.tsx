@@ -12,6 +12,7 @@ import {
 } from "lucide-react";
 import { Modal } from "@/components/ui/modal";
 import { HeaderButton } from "@/components/ui/header-button";
+import { TagFilterChips } from "@/components/TagFilterChips";
 import { AsnPicker } from "@/components/ipam/asn-picker";
 import { CustomerChip, CustomerPicker } from "@/components/ownership/pickers";
 import {
@@ -449,14 +450,16 @@ export function VRFsPage() {
   const [showCreate, setShowCreate] = useState(false);
   const [confirmBulk, setConfirmBulk] = useState(false);
   const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [tagFilters, setTagFilters] = useState<string[]>([]);
 
   const {
     data: vrfs = [],
     isFetching,
     refetch,
   } = useQuery({
-    queryKey: ["vrfs"],
-    queryFn: () => vrfsApi.list(),
+    queryKey: ["vrfs", tagFilters],
+    queryFn: () =>
+      vrfsApi.list(tagFilters.length > 0 ? { tag: tagFilters } : undefined),
   });
 
   const allSelected = vrfs.length > 0 && vrfs.every((v) => selected.has(v.id));
@@ -521,6 +524,15 @@ export function VRFsPage() {
           </HeaderButton>
         </div>
       </header>
+
+      {/* Tag filter row */}
+      <div className="border-b bg-card px-4 py-2">
+        <TagFilterChips
+          value={tagFilters}
+          onChange={setTagFilters}
+          placeholder="Filter by tag — try env or env:prod…"
+        />
+      </div>
 
       {/* Bulk toolbar */}
       {selected.size > 0 && (

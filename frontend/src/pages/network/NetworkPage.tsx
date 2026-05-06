@@ -24,6 +24,7 @@ import {
 } from "@/lib/api";
 import { HeaderButton } from "@/components/ui/header-button";
 import { Modal } from "@/components/ui/modal";
+import { TagFilterChips } from "@/components/TagFilterChips";
 
 import {
   DEVICE_TYPE_OPTIONS,
@@ -199,6 +200,7 @@ export function NetworkPage() {
   const [activeFilter, setActiveFilter] = useState<
     "all" | "active" | "inactive"
   >("all");
+  const [tagFilters, setTagFilters] = useState<string[]>([]);
 
   const [showCreate, setShowCreate] = useState(false);
   const [editing, setEditing] = useState<NetworkDeviceRead | null>(null);
@@ -216,8 +218,9 @@ export function NetworkPage() {
     if (statusFilter !== "all") p.last_poll_status = statusFilter;
     if (activeFilter === "active") p.active = true;
     else if (activeFilter === "inactive") p.active = false;
+    if (tagFilters.length > 0) p.tag = tagFilters;
     return p;
-  }, [typeFilter, statusFilter, activeFilter]);
+  }, [typeFilter, statusFilter, activeFilter, tagFilters]);
 
   const { data, isFetching } = useQuery({
     queryKey: ["network-devices", queryParams],
@@ -385,6 +388,13 @@ export function NetworkPage() {
             onChange={(v) =>
               setActiveFilter(v as "active" | "inactive" | "all")
             }
+          />
+        </div>
+        <div className="mt-2">
+          <TagFilterChips
+            value={tagFilters}
+            onChange={setTagFilters}
+            placeholder="Filter by tag — try env or env:prod…"
           />
         </div>
         {selected.size > 0 && (
