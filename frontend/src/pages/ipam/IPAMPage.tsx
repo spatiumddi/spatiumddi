@@ -3402,6 +3402,11 @@ function SubnetDetail({
     dns: "",
     pool: "",
   });
+  // Chip-based tag filter (issue #104 phase 5b). Distinct from
+  // ``colFilters.tags`` (freetext substring) so power-users keep
+  // their fuzzy match while operators get the chip + autocomplete
+  // path. Both AND together when populated.
+  const [addressTagFilters, setAddressTagFilters] = useState<string[]>([]);
   const [filterModes, setFilterModes] = useState<Record<string, FilterMode>>(
     {},
   );
@@ -3421,6 +3426,7 @@ function SubnetDetail({
     });
     setFilterModes({});
     setShowFilters(false);
+    setAddressTagFilters([]);
     setSelectedIpIds(new Set());
   }, [subnet.id]);
 
@@ -3580,11 +3586,20 @@ function SubnetDetail({
       ].join("\n");
       if (!applyFilter(hay, cf.tags, fm.tags)) return false;
     }
+    if (
+      addressTagFilters.length > 0 &&
+      !matchesAllTagChips(
+        (a.tags as Record<string, unknown> | null) ?? {},
+        addressTagFilters,
+      )
+    )
+      return false;
     if (cf.status && a.status !== cf.status) return false;
     if (cf.dns && ipDnsState(a) !== cf.dns) return false;
     return true;
   });
-  const hasActiveFilter = Object.values(colFilters).some(Boolean);
+  const hasActiveFilter =
+    Object.values(colFilters).some(Boolean) || addressTagFilters.length > 0;
 
   // Interleave DHCP pool boundary markers with the IP rows so the user
   // can see where a pool begins / ends, even when no IPs are assigned
@@ -4071,6 +4086,13 @@ function SubnetDetail({
             </div>
           ) : (
             <>
+              <div className="mb-2 px-1">
+                <TagFilterChips
+                  value={addressTagFilters}
+                  onChange={setAddressTagFilters}
+                  placeholder="Filter addresses by tag — try env or env:prod…"
+                />
+              </div>
               {/* No nested overflow wrapper — Chrome/WebKit treat
                   ``overflow-x: auto`` as establishing a Y-scroll
                   context too (CSS spec: paired axis can't be
