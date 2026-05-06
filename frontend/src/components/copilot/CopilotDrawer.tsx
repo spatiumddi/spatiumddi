@@ -454,18 +454,20 @@ export function CopilotDrawer({
     return detailQ.data.messages.filter((m) => m.role !== "system");
   }, [detailQ.data]);
 
-  // The most recent user message in the persisted history. Used to
-  // suppress the optimistic ``pendingUserMessage`` bubble once the
-  // canonical version has shown up — without this, the first turn
-  // of a new session double-renders the user message: once from
+  // Every user message in the persisted history, oldest → newest.
+  // Powers the composer's ↑/↓ history walk. Index 0 = oldest,
+  // length-1 = newest.
+  const userMessages = useMemo<string[]>(
+    () => messages.filter((m) => m.role === "user").map((m) => m.content),
+    [messages],
+  );
+  // Used to suppress the optimistic ``pendingUserMessage`` bubble
+  // once the canonical version has shown up — without this, the first
+  // turn of a new session double-renders the user message: once from
   // ``pendingUserMessage`` (still set until onSettled), once from
   // detailQ (refetched the moment ``session_id`` arrives mid-stream).
-  const lastUserMessageContent = useMemo<string | null>(() => {
-    for (let i = messages.length - 1; i >= 0; i--) {
-      if (messages[i].role === "user") return messages[i].content;
-    }
-    return null;
-  }, [messages]);
+  const lastUserMessageContent =
+    userMessages.length > 0 ? userMessages[userMessages.length - 1] : null;
   const showPendingUserMessage =
     pendingUserMessage !== null &&
     pendingUserMessage !== lastUserMessageContent;
@@ -673,6 +675,7 @@ export function CopilotDrawer({
           isStreaming={sendMut.isPending}
           pendingPrompt={pendingPrompt ?? null}
           onPromptConsumed={onPromptConsumed}
+          userMessages={userMessages}
         />
       </div>
     </div>
@@ -1453,6 +1456,7 @@ function ChatComposer({
   isStreaming,
   pendingPrompt,
   onPromptConsumed,
+  userMessages,
 }: {
   disabled: boolean;
   onSend: (text: string) => void;
@@ -1460,12 +1464,42 @@ function ChatComposer({
   isStreaming: boolean;
   pendingPrompt?: string | null;
   onPromptConsumed?: () => void;
+  /** Every user message in the active session, oldest → newest.
+   *  Powers the ↑/↓ history walk in the textarea (Claude Code /
+   *  shell-style): ↑ from an empty textarea recalls the newest, each
+   *  subsequent ↑ steps further back, ↓ steps forward, and ↓ past the
+   *  newest returns to draft mode. */
+  userMessages: string[];
 }) {
   // Persist the half-typed message across drawer close/reopen so the
   // operator can step away mid-thought. Cleared on submit.
   const [text, setText] = useSessionState<string>("spatium.copilot.draft", "");
   const [showPrompts, setShowPrompts] = useState(false);
+  // History walk state. ``null`` means "drafting fresh"; a number
+  // means "currently showing the message at userMessages[idx]". The
+  // moment the operator edits the recalled value, we drop back to
+  // null so the next ↑ doesn't trample their edits.
+  const [historyIndex, setHistoryIndex] = useState<number | null>(null);
   const taRef = useRef<HTMLTextAreaElement | null>(null);
+
+  // Whenever the underlying message list shifts (session switched,
+  // chat deleted, new turn landed) drop any in-flight history walk so
+  // we never index off the end of a stale array.
+  useEffect(() => {
+    setHistoryIndex(null);
+  }, [userMessages]);
+
+  function recallAt(idx: number) {
+    const value = userMessages[idx];
+    setHistoryIndex(idx);
+    setText(value);
+    // Caret to the end so the textarea reads top-down with the
+    // cursor at the natural typing position.
+    setTimeout(() => {
+      const ta = taRef.current;
+      if (ta) ta.setSelectionRange(value.length, value.length);
+    }, 0);
+  }
 
   // Pull the prompt library lazily — only fires when the operator
   // clicks the "Prompts ▾" button to open the picker.
@@ -1482,6 +1516,7 @@ function ChatComposer({
   useEffect(() => {
     if (pendingPrompt) {
       setText(pendingPrompt);
+      setHistoryIndex(null);
       onPromptConsumed?.();
       setTimeout(() => taRef.current?.focus(), 0);
     }
@@ -1492,11 +1527,13 @@ function ChatComposer({
     if (!trimmed || disabled) return;
     onSend(trimmed);
     setText("");
+    setHistoryIndex(null);
     taRef.current?.focus();
   }
 
   function loadPrompt(p: AIPrompt) {
     setText(p.prompt_text);
+    setHistoryIndex(null);
     setShowPrompts(false);
     // Defer focus until after the popover unmounts so React's
     // synchronous reconciliation doesn't steal it back.
@@ -1515,11 +1552,62 @@ function ChatComposer({
         <textarea
           ref={taRef}
           value={text}
-          onChange={(e) => setText(e.target.value)}
+          onChange={(e) => {
+            const next = e.target.value;
+            setText(next);
+            // If the operator typed over a recalled message, exit
+            // history mode so further ↑ doesn't blow away their edits.
+            if (
+              historyIndex !== null &&
+              next !== userMessages[historyIndex]
+            ) {
+              setHistoryIndex(null);
+            }
+          }}
           onKeyDown={(e) => {
             if (e.key === "Enter" && !e.shiftKey) {
               e.preventDefault();
               submit();
+              return;
+            }
+            // ↑/↓ history walk. Modeled on shell readline + Claude
+            // Code: ↑ from empty enters at newest, subsequent ↑ steps
+            // older, ↓ steps newer, ↓ past newest returns to draft.
+            // Once you start editing a recalled value, history mode
+            // exits (handled in onChange) and ↑/↓ become no-ops.
+            if (e.key === "ArrowUp") {
+              if (userMessages.length === 0) return;
+              if (historyIndex === null) {
+                // Don't engage on a non-empty textarea — that would
+                // overwrite the operator's draft and they'd have no
+                // way to recover it.
+                if (text) return;
+                e.preventDefault();
+                recallAt(userMessages.length - 1);
+                return;
+              }
+              if (historyIndex > 0) {
+                e.preventDefault();
+                recallAt(historyIndex - 1);
+              } else {
+                // Already on the oldest — swallow ↑ so the caret
+                // doesn't jump to the start of the textarea, which
+                // would feel like the keystroke "didn't take".
+                e.preventDefault();
+              }
+              return;
+            }
+            if (e.key === "ArrowDown") {
+              if (historyIndex === null) return;
+              e.preventDefault();
+              if (historyIndex < userMessages.length - 1) {
+                recallAt(historyIndex + 1);
+              } else {
+                // Past newest — return to draft mode.
+                setHistoryIndex(null);
+                setText("");
+              }
+              return;
             }
           }}
           rows={2}
@@ -1555,7 +1643,7 @@ function ChatComposer({
           Prompts ▾
         </button>
         <span className="text-[11px] text-muted-foreground/60">
-          Enter to send · Shift+Enter for newline
+          Enter to send · Shift+Enter for newline · ↑/↓ to walk history
         </span>
       </div>
       {showPrompts && (

@@ -111,6 +111,11 @@ const adminIdentityNav = [
 
 // Administration → Platform was getting unwieldy at 9-10 items; split it
 // into three sub-groups rendered with small non-collapsible labels.
+// "Settings" deliberately lives in the sidebar footer (above the
+// GitHub link), not in this list — it was getting buried in
+// Administration → Configuration as the platform grew, and it's
+// the one entry every operator hits often enough that it earns
+// dedicated chrome.
 const adminConfigurationNav = [
   { label: "AI Providers", icon: Sparkles, to: "/admin/ai/providers" },
   { label: "AI Prompts", icon: Sparkles, to: "/admin/ai/prompts" },
@@ -121,7 +126,6 @@ const adminConfigurationNav = [
     icon: LayoutTemplate,
     to: "/admin/ipam/templates",
   },
-  { label: "Settings", icon: Settings, to: "/settings" },
 ];
 
 const adminNotificationsNav = [
@@ -600,6 +604,14 @@ export function Sidebar({
               <Sparkles className="h-4 w-4" />
             </a>
           )}
+
+          <NavItem
+            label="Settings"
+            icon={Settings}
+            to="/settings"
+            collapsed={effectiveCollapsed}
+            onNavigate={mobileOpen ? onMobileClose : undefined}
+          />
 
           <a
             href="https://github.com/spatiumddi/spatiumddi"

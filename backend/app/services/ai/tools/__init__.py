@@ -17,6 +17,7 @@ from app.services.ai.tools import (  # noqa: F401, E402
     nmap,
     ops,
     proposals,
+    vendor,
     whois,
 )
 from app.services.ai.tools.base import (
