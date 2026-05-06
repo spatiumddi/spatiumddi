@@ -121,6 +121,24 @@ last three releases retroactively.
   buckets), and `global_search` (cross-resource lookup that
   reuses the same internal helpers as the Cmd-K palette via lazy
   import to avoid pulling FastAPI router glue at boot).
+- **Operator Copilot — Tier 3 tool wave (issue \#101).** Ten new
+  read-only sub-resource tools that drill into the rows inside a
+  zone / scope. DNS side: `list_dns_records` (cross-zone with
+  name / fqdn / type / value substring filters — distinct from
+  the existing per-zone `query_dns_records`), `list_dns_blocklists`
+  (RPZ rows with category / source / sync state), `list_dns_pools`
+  (GSLB pools with eager-loaded members + per-member health
+  state), `list_dns_views` (split-horizon views). DHCP side:
+  `list_dhcp_pools` (dynamic / excluded / reserved ranges within
+  a scope), `list_dhcp_statics` (MAC → IP reservations with
+  hostname filter), `list_dhcp_client_classes` (group-scoped
+  conditional option-delivery), `list_dhcp_option_templates`
+  (named option bundles), `list_pxe_profiles` (PXE / iPXE
+  provisioning profiles with per-arch boot-file matches),
+  `list_dhcp_mac_blocks` (group-global blocked MACs with reason +
+  expiry). All default-enabled per the discovery argument; all
+  appended to the existing `tools/dns.py` and `tools/dhcp.py`
+  modules. Total tool count: 67 → 77.
 - **Operator Copilot — Tier 5 write proposals (issue \#101).**
   Four new `propose_*` tools that stage write actions for the
   operator to Approve / Reject in the chat drawer:

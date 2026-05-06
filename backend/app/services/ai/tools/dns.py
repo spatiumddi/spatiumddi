@@ -14,7 +14,15 @@ from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.auth import User
-from app.models.dns import DNSRecord, DNSServerGroup, DNSZone
+from app.models.dns import (
+    DNSBlockList,
+    DNSPool,
+    DNSPoolMember,
+    DNSRecord,
+    DNSServerGroup,
+    DNSView,
+    DNSZone,
+)
 from app.services.ai.tools.base import register_tool
 
 
@@ -314,3 +322,310 @@ async def reverse_dns(
         "rcode": "NOERROR",
         "answers": [str(a).rstrip(".") for a in answers],
     }
+
+
+# ── Tier 3 DNS sub-resource depth (issue #101) ────────────────────────
+
+
+# ── list_dns_records (cross-zone) ─────────────────────────────────────
+
+
+class ListDNSRecordsArgs(BaseModel):
+    name_contains: str | None = Field(
+        default=None,
+        description="Substring match on the relative record name (e.g. 'api' to find 'api.*').",
+    )
+    fqdn_contains: str | None = Field(
+        default=None,
+        description="Substring match on the full FQDN (e.g. 'foo.example.com').",
+    )
+    record_type: str | None = Field(
+        default=None,
+        description="Filter by type (A / AAAA / CNAME / MX / TXT / …). Case-insensitive.",
+    )
+    value_contains: str | None = Field(
+        default=None,
+        description="Substring match on the right-hand-side value (target IP / FQDN / TXT).",
+    )
+    zone_id: str | None = Field(default=None, description="Restrict to one zone by UUID.")
+    group_id: str | None = Field(
+        default=None,
+        description="Restrict to zones under one DNS server group by UUID.",
+    )
+    limit: int = Field(default=100, ge=1, le=500)
+
+
+@register_tool(
+    name="list_dns_records",
+    description=(
+        "Cross-zone DNS record search. Filterable by relative name "
+        "substring, FQDN substring, type, value substring, zone, or "
+        "server group. Each row carries id, zone_id + zone name, "
+        "name (relative), fqdn, record_type, value, ttl, priority, "
+        "and the auto_generated flag (rows mirrored from IPAM / "
+        "Kubernetes / Tailscale carry True). Use for 'where does "
+        "*.api point?', 'find every CNAME pointing at "
+        "old-host.example.com', or 'show me TXT records mentioning "
+        "verification'. Distinct from query_dns_records, which is "
+        "single-zone."
+    ),
+    args_model=ListDNSRecordsArgs,
+    category="dns",
+)
+async def list_dns_records(
+    db: AsyncSession, user: User, args: ListDNSRecordsArgs
+) -> list[dict[str, Any]]:
+    stmt = (
+        select(DNSRecord, DNSZone.name.label("zone_name"))
+        .join(DNSZone, DNSZone.id == DNSRecord.zone_id)
+        .where(DNSRecord.deleted_at.is_(None))
+        .where(DNSZone.deleted_at.is_(None))
+    )
+    if args.name_contains:
+        stmt = stmt.where(func.lower(DNSRecord.name).like(f"%{args.name_contains.lower()}%"))
+    if args.fqdn_contains:
+        stmt = stmt.where(func.lower(DNSRecord.fqdn).like(f"%{args.fqdn_contains.lower()}%"))
+    if args.record_type:
+        stmt = stmt.where(DNSRecord.record_type == args.record_type.upper())
+    if args.value_contains:
+        stmt = stmt.where(func.lower(DNSRecord.value).like(f"%{args.value_contains.lower()}%"))
+    if args.zone_id:
+        stmt = stmt.where(DNSRecord.zone_id == args.zone_id)
+    if args.group_id:
+        stmt = stmt.where(DNSZone.group_id == args.group_id)
+    stmt = stmt.order_by(DNSRecord.fqdn.asc(), DNSRecord.record_type.asc()).limit(args.limit)
+    rows = (await db.execute(stmt)).all()
+    return [
+        {
+            "id": str(r.DNSRecord.id),
+            "zone_id": str(r.DNSRecord.zone_id),
+            "zone_name": r.zone_name,
+            "name": r.DNSRecord.name,
+            "fqdn": r.DNSRecord.fqdn,
+            "record_type": r.DNSRecord.record_type,
+            "value": r.DNSRecord.value,
+            "ttl": r.DNSRecord.ttl,
+            "priority": r.DNSRecord.priority,
+            "auto_generated": r.DNSRecord.auto_generated,
+        }
+        for r in rows
+    ]
+
+
+# ── list_dns_blocklists ───────────────────────────────────────────────
+
+
+class ListDNSBlockListsArgs(BaseModel):
+    search: str | None = Field(
+        default=None,
+        description="Substring match on blocklist name or description.",
+    )
+    category: str | None = Field(
+        default=None,
+        description="Filter by category: ads / malware / tracking / adult / custom / …",
+    )
+    enabled: bool | None = Field(
+        default=None, description="Filter by ``enabled`` flag. None = both."
+    )
+    limit: int = Field(default=50, ge=1, le=500)
+
+
+@register_tool(
+    name="list_dns_blocklists",
+    description=(
+        "List DNS blocklists (RPZ rows). Each carries id, name, "
+        "description, category, source_type (manual / url / "
+        "file_upload), feed_url + feed_format when remote, "
+        "block_mode (nxdomain / sinkhole / refused), enabled, "
+        "entry_count, last_synced_at + last_sync_status / error. "
+        "Use for 'which blocklists are active?', 'is the malware "
+        "feed up to date?', or 'when did the ads blocklist last "
+        "sync?'."
+    ),
+    args_model=ListDNSBlockListsArgs,
+    category="dns",
+)
+async def list_dns_blocklists(
+    db: AsyncSession, user: User, args: ListDNSBlockListsArgs
+) -> list[dict[str, Any]]:
+    stmt = select(DNSBlockList)
+    if args.search:
+        like = f"%{args.search.lower()}%"
+        stmt = stmt.where(
+            or_(
+                func.lower(DNSBlockList.name).like(like),
+                func.lower(DNSBlockList.description).like(like),
+            )
+        )
+    if args.category:
+        stmt = stmt.where(DNSBlockList.category == args.category.lower())
+    if args.enabled is not None:
+        stmt = stmt.where(DNSBlockList.enabled.is_(args.enabled))
+    stmt = stmt.order_by(DNSBlockList.name.asc()).limit(args.limit)
+    rows = (await db.execute(stmt)).scalars().all()
+    return [
+        {
+            "id": str(r.id),
+            "name": r.name,
+            "description": r.description,
+            "category": r.category,
+            "source_type": r.source_type,
+            "feed_url": r.feed_url,
+            "feed_format": r.feed_format,
+            "update_interval_hours": r.update_interval_hours,
+            "block_mode": r.block_mode,
+            "sinkhole_ip": r.sinkhole_ip,
+            "enabled": r.enabled,
+            "entry_count": r.entry_count,
+            "last_synced_at": r.last_synced_at.isoformat() if r.last_synced_at else None,
+            "last_sync_status": r.last_sync_status,
+            "last_sync_error": r.last_sync_error,
+        }
+        for r in rows
+    ]
+
+
+# ── list_dns_pools ────────────────────────────────────────────────────
+
+
+class ListDNSPoolsArgs(BaseModel):
+    search: str | None = Field(
+        default=None,
+        description="Substring match on pool name or record_name.",
+    )
+    zone_id: str | None = Field(default=None, description="Restrict to one zone by UUID.")
+    group_id: str | None = Field(
+        default=None, description="Restrict to one DNS server group by UUID."
+    )
+    enabled: bool | None = Field(default=None, description="Filter by ``enabled`` flag.")
+    limit: int = Field(default=50, ge=1, le=500)
+
+
+@register_tool(
+    name="list_dns_pools",
+    description=(
+        "List GSLB pools (health-checked A/AAAA target sets sharing "
+        "one DNS name). Each row carries id, name, description, "
+        "zone_id, record_name + record_type, ttl, enabled, "
+        "hc_type / interval / threshold settings, last_checked_at, "
+        "and the per-member breakdown (address / weight / enabled / "
+        "last_check_state / last_check_error). Use for 'is the "
+        "www pool healthy?', 'which member of the api pool is "
+        "down?', or 'what's the TTL on the gslb pool?'."
+    ),
+    args_model=ListDNSPoolsArgs,
+    category="dns",
+)
+async def list_dns_pools(
+    db: AsyncSession, user: User, args: ListDNSPoolsArgs
+) -> list[dict[str, Any]]:
+    # Eager-load members so each pool returns its full breakdown in
+    # one trip — pools rarely exceed a handful of members.
+    from sqlalchemy.orm import selectinload  # local import keeps the top imports lean
+
+    stmt = select(DNSPool).options(selectinload(DNSPool.members))
+    if args.search:
+        like = f"%{args.search.lower()}%"
+        stmt = stmt.where(
+            or_(
+                func.lower(DNSPool.name).like(like),
+                func.lower(DNSPool.record_name).like(like),
+            )
+        )
+    if args.zone_id:
+        stmt = stmt.where(DNSPool.zone_id == args.zone_id)
+    if args.group_id:
+        stmt = stmt.where(DNSPool.group_id == args.group_id)
+    if args.enabled is not None:
+        stmt = stmt.where(DNSPool.enabled.is_(args.enabled))
+    stmt = stmt.order_by(DNSPool.name.asc()).limit(args.limit)
+    rows = (await db.execute(stmt)).scalars().unique().all()
+    return [
+        {
+            "id": str(p.id),
+            "name": p.name,
+            "description": p.description,
+            "zone_id": str(p.zone_id),
+            "group_id": str(p.group_id),
+            "record_name": p.record_name,
+            "record_type": p.record_type,
+            "ttl": p.ttl,
+            "enabled": p.enabled,
+            "hc_type": p.hc_type,
+            "hc_target_port": p.hc_target_port,
+            "hc_interval_seconds": p.hc_interval_seconds,
+            "hc_unhealthy_threshold": p.hc_unhealthy_threshold,
+            "hc_healthy_threshold": p.hc_healthy_threshold,
+            "last_checked_at": p.last_checked_at.isoformat() if p.last_checked_at else None,
+            "members": [
+                {
+                    "address": m.address,
+                    "weight": m.weight,
+                    "enabled": m.enabled,
+                    "last_check_state": m.last_check_state,
+                    "last_check_at": (m.last_check_at.isoformat() if m.last_check_at else None),
+                    "last_check_error": m.last_check_error,
+                }
+                for m in p.members
+            ],
+        }
+        for p in rows
+    ]
+
+
+# ── list_dns_views ────────────────────────────────────────────────────
+
+
+class ListDNSViewsArgs(BaseModel):
+    search: str | None = Field(default=None, description="Substring match on view name.")
+    group_id: str | None = Field(
+        default=None, description="Restrict to one DNS server group by UUID."
+    )
+    limit: int = Field(default=50, ge=1, le=500)
+
+
+@register_tool(
+    name="list_dns_views",
+    description=(
+        "List split-horizon DNS views — different clients see "
+        "different zone data. Each row carries id, name, "
+        "description, group_id, match_clients (CIDR/ACL list), "
+        "match_destinations, recursion flag, evaluation order, and "
+        "any per-view allow_query / allow_query_cache overrides. "
+        "Use for 'which views does the corp group have?' or 'what "
+        "clients does the internal view match?'."
+    ),
+    args_model=ListDNSViewsArgs,
+    category="dns",
+)
+async def list_dns_views(
+    db: AsyncSession, user: User, args: ListDNSViewsArgs
+) -> list[dict[str, Any]]:
+    stmt = select(DNSView)
+    if args.search:
+        stmt = stmt.where(func.lower(DNSView.name).like(f"%{args.search.lower()}%"))
+    if args.group_id:
+        stmt = stmt.where(DNSView.group_id == args.group_id)
+    stmt = stmt.order_by(DNSView.order.asc(), DNSView.name.asc()).limit(args.limit)
+    rows = (await db.execute(stmt)).scalars().all()
+    return [
+        {
+            "id": str(v.id),
+            "name": v.name,
+            "description": v.description,
+            "group_id": str(v.group_id),
+            "match_clients": v.match_clients,
+            "match_destinations": v.match_destinations,
+            "recursion": v.recursion,
+            "order": v.order,
+            "allow_query": v.allow_query,
+            "allow_query_cache": v.allow_query_cache,
+        }
+        for v in rows
+    ]
+
+
+# Silence false-positive on lifted imports — Python pulls them in at
+# module load, but the linters want at-least-one referent in module
+# scope.
+_ = (DNSPoolMember, DNSServerGroup)
