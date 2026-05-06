@@ -679,34 +679,101 @@ export function CopilotDrawer({
   );
 }
 
+// Curated starter prompts grouped by intent. The Operator Copilot's
+// tool surface is wide enough that a flat 5-prompt list under-sells
+// it; grouping helps operators discover what the chat can actually
+// do. Some prompts target tools that are default-disabled (WHOIS,
+// TLS check, live DNS) — clicking those on a fresh install surfaces
+// the "ask your admin to enable" path naturally, which is a good
+// first taste of the Tool Catalog.
+const STARTER_GROUPS: { label: string; examples: string[] }[] = [
+  {
+    label: "Triage",
+    examples: [
+      "What's broken right now?",
+      "Who changed something in the last hour?",
+      "Show me failed login attempts in the last 24 hours",
+      "Are there any open critical alerts?",
+    ],
+  },
+  {
+    label: "IPAM",
+    examples: [
+      "How many subnets do I have?",
+      "Find the IP 192.168.0.1",
+      "Which subnets are above 80% utilisation?",
+      "List the IP spaces",
+    ],
+  },
+  {
+    label: "DNS",
+    examples: [
+      "List my DNS zones",
+      "What records does example.com have?",
+      "Resolve cloudflare.com",
+      "What's the PTR for 1.1.1.1?",
+    ],
+  },
+  {
+    label: "DHCP",
+    examples: [
+      "What DHCP scopes are configured?",
+      "Show me recent leases",
+      "What's the current lease count by scope?",
+    ],
+  },
+  {
+    label: "Network",
+    examples: [
+      "List the ASNs I track",
+      "What overlays do I have?",
+      "Who owns 8.8.8.8?",
+      "Who registered cloudflare.com?",
+      "When does the cloudflare.com TLS cert expire?",
+    ],
+  },
+  {
+    label: "RBAC & audit",
+    examples: [
+      "How do I grant read-only on subnets to a group?",
+      "What did admin do today?",
+      "What did Bob change last week?",
+    ],
+  },
+];
+
 function EmptyState({ onPick }: { onPick: (text: string) => void }) {
-  const examples = [
-    "How many subnets do I have?",
-    "Find the IP 192.168.0.1",
-    "List my DNS zones",
-    "Who changed something in the last hour?",
-    "What DHCP scopes are configured?",
-  ];
   return (
-    <div className="mx-auto max-w-md py-8 text-center text-sm">
-      <Sparkles className="mx-auto mb-2 h-6 w-6 text-primary" />
-      <p className="font-medium">
-        Ask the copilot anything about your infrastructure.
-      </p>
-      <p className="mt-1 text-xs text-muted-foreground">
-        Read-only for now — questions about IPAM, DNS, DHCP, alerts, audit logs.
-        Click an example to try it, or type your own.
-      </p>
-      <div className="mt-4 space-y-1.5">
-        {examples.map((q) => (
-          <button
-            key={q}
-            type="button"
-            onClick={() => onPick(q)}
-            className="block w-full rounded-md border bg-muted/30 px-3 py-1.5 text-left text-xs text-muted-foreground transition-colors hover:border-primary/40 hover:bg-primary/5 hover:text-foreground"
-          >
-            {q}
-          </button>
+    <div className="mx-auto max-w-md py-6 text-sm">
+      <div className="text-center">
+        <Sparkles className="mx-auto mb-2 h-6 w-6 text-primary" />
+        <p className="font-medium">
+          Ask the copilot anything about your infrastructure.
+        </p>
+        <p className="mt-1 text-xs text-muted-foreground">
+          Click an example to try it, or type your own. Some examples need their
+          underlying tool turned on in Settings → AI → Tool Catalog.
+        </p>
+      </div>
+      <div className="mt-4 space-y-3">
+        {STARTER_GROUPS.map((group) => (
+          <div key={group.label}>
+            <div className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+              {group.label}
+            </div>
+            <div className="space-y-1">
+              {group.examples.map((q) => (
+                <button
+                  key={q}
+                  type="button"
+                  onClick={() => onPick(q)}
+                  className="block w-full rounded-md border bg-muted/30 px-3 py-1.5 text-left text-xs text-muted-foreground transition-colors hover:border-primary/40 hover:bg-primary/5 hover:text-foreground"
+                >
+                  {q}
+                </button>
+              ))}
+            </div>
+          </div>
         ))}
       </div>
     </div>
