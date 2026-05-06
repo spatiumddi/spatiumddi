@@ -3690,8 +3690,10 @@ export const dnsApi = {
     api.delete(`/dns/groups/${groupId}/views/${viewId}`),
 
   // Zones
-  listZones: (groupId: string) =>
-    api.get<DNSZone[]>(`/dns/groups/${groupId}/zones`).then((r) => r.data),
+  listZones: (groupId: string, params?: { tag?: string[] }) =>
+    api
+      .get<DNSZone[]>(`/dns/groups/${groupId}/zones`, { params })
+      .then((r) => r.data),
   createZone: (groupId: string, data: Partial<DNSZone>) =>
     api.post<DNSZone>(`/dns/groups/${groupId}/zones`, data).then((r) => r.data),
   updateZone: (groupId: string, zoneId: string, data: Partial<DNSZone>) =>
@@ -3763,9 +3765,11 @@ export const dnsApi = {
     api
       .get<DNSGroupRecord[]>(`/dns/groups/${groupId}/records`)
       .then((r) => r.data),
-  listRecords: (groupId: string, zoneId: string) =>
+  listRecords: (groupId: string, zoneId: string, params?: { tag?: string[] }) =>
     api
-      .get<DNSRecord[]>(`/dns/groups/${groupId}/zones/${zoneId}/records`)
+      .get<DNSRecord[]>(`/dns/groups/${groupId}/zones/${zoneId}/records`, {
+        params,
+      })
       .then((r) => r.data),
   createRecord: (groupId: string, zoneId: string, data: Partial<DNSRecord>) =>
     api
@@ -4473,13 +4477,13 @@ export const dhcpApi = {
       .get<DHCPLease[]>(`/dhcp/servers/${id}/leases`, { params })
       .then((r) => r.data),
 
-  listScopesBySubnet: (subnetId: string) =>
+  listScopesBySubnet: (subnetId: string, params?: { tag?: string[] }) =>
     api
-      .get<DHCPScope[]>(`/dhcp/subnets/${subnetId}/dhcp-scopes`)
+      .get<DHCPScope[]>(`/dhcp/subnets/${subnetId}/dhcp-scopes`, { params })
       .then((r) => r.data),
-  listScopesByGroup: (groupId: string) =>
+  listScopesByGroup: (groupId: string, params?: { tag?: string[] }) =>
     api
-      .get<DHCPScope[]>(`/dhcp/server-groups/${groupId}/scopes`)
+      .get<DHCPScope[]>(`/dhcp/server-groups/${groupId}/scopes`, { params })
       .then((r) => r.data),
   getScope: (id: string) =>
     api.get<DHCPScope>(`/dhcp/scopes/${id}`).then((r) => r.data),
@@ -4502,9 +4506,11 @@ export const dhcpApi = {
   deletePool: (_scopeId: string, poolId: string) =>
     api.delete(`/dhcp/pools/${poolId}`),
 
-  listStatics: (scopeId: string) =>
+  listStatics: (scopeId: string, params?: { tag?: string[] }) =>
     api
-      .get<DHCPStaticAssignment[]>(`/dhcp/scopes/${scopeId}/statics`)
+      .get<DHCPStaticAssignment[]>(`/dhcp/scopes/${scopeId}/statics`, {
+        params,
+      })
       .then((r) => r.data),
   createStatic: (scopeId: string, data: Partial<DHCPStaticAssignment>) =>
     api

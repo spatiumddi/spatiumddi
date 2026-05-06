@@ -42,6 +42,7 @@ import {
   ContextMenuTrigger,
 } from "@/components/ui/context-menu";
 import { HeaderButton } from "@/components/ui/header-button";
+import { TagFilterChips } from "@/components/TagFilterChips";
 import { AskAIButton } from "@/components/copilot/AskAIButton";
 import { CreateServerGroupModal } from "./CreateServerGroupModal";
 import { CreateServerModal } from "./CreateServerModal";
@@ -511,6 +512,7 @@ function ScopeDeleteModal({
 
 function ServerScopesTab({ server }: { server: DHCPServer }) {
   const qc = useQueryClient();
+  const [tagFilters, setTagFilters] = useState<string[]>([]);
   const { data: subnets = [] } = useQuery({
     queryKey: ["subnets"],
     queryFn: () => ipamApi.listSubnets(),
@@ -521,10 +523,13 @@ function ServerScopesTab({ server }: { server: DHCPServer }) {
   // We query by the server's group and join in each scope's subnet
   // CIDR (for display) via the subnet fetch above.
   const { data: groupScopes = [] } = useQuery({
-    queryKey: ["dhcp-scopes-group", server.server_group_id ?? ""],
+    queryKey: ["dhcp-scopes-group", server.server_group_id ?? "", tagFilters],
     queryFn: () =>
       server.server_group_id
-        ? dhcpApi.listScopesByGroup(server.server_group_id)
+        ? dhcpApi.listScopesByGroup(
+            server.server_group_id,
+            tagFilters.length > 0 ? { tag: tagFilters } : undefined,
+          )
         : Promise.resolve([]),
     enabled: !!server.server_group_id,
   });
@@ -551,6 +556,11 @@ function ServerScopesTab({ server }: { server: DHCPServer }) {
 
   return (
     <div className="space-y-3">
+      <TagFilterChips
+        value={tagFilters}
+        onChange={setTagFilters}
+        placeholder="Filter scopes by tag — try env or env:prod…"
+      />
       <div className="flex items-center justify-between">
         <p className="text-xs text-muted-foreground">
           {allScopes.length} scope{allScopes.length !== 1 ? "s" : ""} served by

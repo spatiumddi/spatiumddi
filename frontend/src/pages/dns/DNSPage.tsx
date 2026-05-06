@@ -34,6 +34,7 @@ import {
   KeyRound,
   Copy,
 } from "lucide-react";
+import { TagFilterChips } from "@/components/TagFilterChips";
 import { PropagationCheckModal } from "./PropagationCheckModal";
 import { BlocklistCatalogModal } from "./BlocklistCatalogModal";
 import { DelegationModal } from "./DelegationModal";
@@ -4578,12 +4579,17 @@ function ZonesTab({
   const [showZoneFilters, setShowZoneFilters] = useState(false);
   const [zoneNameFilter, setZoneNameFilter] = useState("");
   const [zoneTypeFilter, setZoneTypeFilter] = useState("");
+  const [tagFilters, setTagFilters] = useState<string[]>([]);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [confirmBulkDelete, setConfirmBulkDelete] = useState(false);
 
   const { data: zones = [], isFetching } = useQuery({
-    queryKey: ["dns-zones", group.id],
-    queryFn: () => dnsApi.listZones(group.id),
+    queryKey: ["dns-zones", group.id, tagFilters],
+    queryFn: () =>
+      dnsApi.listZones(
+        group.id,
+        tagFilters.length > 0 ? { tag: tagFilters } : undefined,
+      ),
   });
 
   const { data: views = [] } = useQuery({
@@ -4861,6 +4867,14 @@ function ZonesTab({
             <Plus className="h-3 w-3" /> Add Zone
           </button>
         </div>
+      </div>
+
+      <div className="mb-3">
+        <TagFilterChips
+          value={tagFilters}
+          onChange={setTagFilters}
+          placeholder="Filter zones by tag — try env or env:prod…"
+        />
       </div>
 
       {showZoneFilters && (
