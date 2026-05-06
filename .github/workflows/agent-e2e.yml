@@ -16,11 +16,18 @@ name: Agent E2E (kind)
 
 on:
   pull_request:
+    # Frontend-only PRs are deliberately *not* listed: this workflow
+    # smokes the umbrella chart against pre-built ``:latest`` images
+    # from the registry, so a frontend source change can't affect
+    # the install path until the frontend image rebuild + retag
+    # happens on a separate workflow on merge. Listing ``frontend/**``
+    # here would just attach a 10-minute helm install to dependabot
+    # JS-package bumps for no signal — see the chart pre-install hook
+    # bug tracked as a follow-up.
     paths:
       - "agent/**"
       - "charts/spatiumddi/**"
       - "backend/**"
-      - "frontend/**"
       - ".github/workflows/agent-e2e.yml"
   workflow_dispatch:
     inputs:
