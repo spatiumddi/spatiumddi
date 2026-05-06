@@ -254,6 +254,15 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await seed_builtin_conformity_policies()
     except Exception as exc:  # noqa: BLE001
         logger.debug("conformity_policies_seed_skipped", reason=str(exc))
+    # Audit-chain-broken alert rule — singleton, enabled by default
+    # (issue #73). Idempotent; if an operator has disabled it the
+    # seeder doesn't re-flip the toggle.
+    try:
+        from app.services.alerts import seed_audit_chain_alert_rule  # noqa: PLC0415
+
+        await seed_audit_chain_alert_rule()
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("audit_chain_alert_rule_seed_skipped", reason=str(exc))
     yield
     logger.info("shutdown", service="api")
 

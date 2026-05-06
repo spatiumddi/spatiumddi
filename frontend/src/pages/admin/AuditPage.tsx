@@ -1,6 +1,13 @@
 import { useState } from "react";
 import { useQuery } from "@tanstack/react-query";
-import { ClipboardList, ChevronLeft, ChevronRight, X } from "lucide-react";
+import {
+  ClipboardList,
+  ChevronLeft,
+  ChevronRight,
+  ShieldCheck,
+  ShieldAlert,
+  X,
+} from "lucide-react";
 import { auditApi, type AuditLogEntry } from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { AskAIButton } from "@/components/copilot/AskAIButton";
@@ -150,6 +157,7 @@ export function AuditPage() {
               All administrative actions recorded by the system
             </p>
           </div>
+          <ChainIntegrityBadge />
           <span className="text-sm text-muted-foreground">
             {total.toLocaleString()} {total === 1 ? "event" : "events"}
           </span>
@@ -393,5 +401,46 @@ export function AuditPage() {
         )}
       </div>
     </div>
+  );
+}
+
+function ChainIntegrityBadge() {
+  // Cap the on-page check at 1000 rows so opening the audit page on a
+  // huge deployment doesn't take seconds. The nightly Celery task
+  // does the full sweep + writes an alert event, so the badge is
+  // primarily here to give operators an at-a-glance "yes, we just
+  // checked" signal.
+  const { data } = useQuery({
+    queryKey: ["audit-integrity-1000"],
+    queryFn: () => auditApi.integrity(1000),
+    staleTime: 60_000,
+    refetchOnWindowFocus: false,
+  });
+  if (!data) {
+    return (
+      <span className="rounded-full border bg-muted/40 px-2 py-0.5 text-xs text-muted-foreground">
+        Checking integrity…
+      </span>
+    );
+  }
+  if (data.ok) {
+    return (
+      <span
+        className="inline-flex items-center gap-1 rounded-full bg-emerald-100 px-2 py-0.5 text-xs font-medium text-emerald-800 dark:bg-emerald-900/30 dark:text-emerald-300"
+        title={`Last ${data.rows_checked.toLocaleString()} rows verified`}
+      >
+        <ShieldCheck className="h-3 w-3" />
+        Chain verified
+      </span>
+    );
+  }
+  return (
+    <span
+      className="inline-flex items-center gap-1 rounded-full bg-red-100 px-2 py-0.5 text-xs font-medium text-red-800 dark:bg-red-900/30 dark:text-red-300"
+      title={`${data.breaks.length} broken row(s) — first at seq=${data.breaks[0]?.seq}`}
+    >
+      <ShieldAlert className="h-3 w-3" />
+      Tampering detected ({data.breaks.length})
+    </span>
   );
 }

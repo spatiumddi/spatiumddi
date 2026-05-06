@@ -149,6 +149,20 @@ def _statement_references(statement: Any, model: type) -> bool:
     return False
 
 
+@event.listens_for(Session, "before_flush")
+def _audit_chain_hash(session: Session, _flush_context: Any, _instances: Any) -> None:
+    """Hash every newly-added ``AuditLog`` row before it hits the DB
+    (issue #73). Lives on the global ``Session`` listener so it fires
+    for sync sessions, sync-bound flushes inside the AsyncSession, and
+    Celery task sessions alike.
+
+    Lazy import so ``app.db`` doesn't pull every model at module load.
+    """
+    from app.services.audit_chain import compute_audit_hashes
+
+    compute_audit_hashes(session)
+
+
 @event.listens_for(Session, "do_orm_execute")
 def _filter_soft_deleted(execute_state: Any) -> None:
     """Inject ``deleted_at IS NULL`` into every SELECT against in-scope models.

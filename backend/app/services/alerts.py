@@ -77,6 +77,7 @@ RULE_TYPE_SERVICE_RESOURCE_ORPHANED = "service_resource_orphaned"
 # params (``classification`` + ``change_scope``) covers every flag
 # without exploding into N near-identical rule_type rows.
 RULE_TYPE_COMPLIANCE_CHANGE = "compliance_change"
+RULE_TYPE_AUDIT_CHAIN_BROKEN = "audit_chain_broken"
 
 RULE_TYPES = frozenset(
     {
@@ -95,6 +96,7 @@ RULE_TYPES = frozenset(
         RULE_TYPE_SERVICE_TERM_EXPIRING,
         RULE_TYPE_SERVICE_RESOURCE_ORPHANED,
         RULE_TYPE_COMPLIANCE_CHANGE,
+        RULE_TYPE_AUDIT_CHAIN_BROKEN,
     }
 )
 
@@ -1163,6 +1165,47 @@ _COMPLIANCE_RULE_SEEDS: list[dict[str, Any]] = [
         "severity": "warning",
     },
 ]
+
+
+_AUDIT_CHAIN_RULE_NAME = "audit-chain-broken"
+
+
+async def seed_audit_chain_alert_rule() -> None:
+    """Seed the singleton ``audit-chain-broken`` rule (issue #73).
+
+    Enabled by default — tampering is one of the few signals every
+    deployment wants to know about; opt-out is for the rare operator
+    who genuinely doesn't want it. Keyed on ``name`` since there's
+    only one rule per platform.
+    """
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+    from app.models.alerts import AlertRule  # noqa: PLC0415
+
+    async with AsyncSessionLocal() as session:
+        existing = await session.scalar(
+            select(AlertRule).where(AlertRule.name == _AUDIT_CHAIN_RULE_NAME)
+        )
+        if existing is not None:
+            return
+        session.add(
+            AlertRule(
+                name=_AUDIT_CHAIN_RULE_NAME,
+                description=(
+                    "Fires when the nightly audit-log chain verifier finds a "
+                    "row whose hash doesn't match its predecessor — strong "
+                    "evidence of tampering with the audit trail. Critical "
+                    "severity by default; auto-resolves on the next pass "
+                    "that finds the chain back in sync."
+                ),
+                rule_type=RULE_TYPE_AUDIT_CHAIN_BROKEN,
+                severity="critical",
+                enabled=True,
+                notify_syslog=True,
+                notify_webhook=True,
+                notify_smtp=True,
+            )
+        )
+        await session.commit()
 
 
 async def seed_builtin_compliance_alert_rules() -> None:

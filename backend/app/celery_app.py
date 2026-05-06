@@ -38,6 +38,7 @@ celery_app = Celery(
         "app.tasks.asn_whois_refresh",
         "app.tasks.rpki_roa_refresh",
         "app.tasks.domain_whois_refresh",
+        "app.tasks.audit_chain_verify",
     ],
 )
 
@@ -88,6 +89,7 @@ celery_app.conf.update(
         "app.tasks.rpki_roa_refresh.*": {"queue": "default"},
         "app.tasks.domain_whois_refresh.*": {"queue": "default"},
         "app.tasks.ai_digest.*": {"queue": "default"},
+        "app.tasks.audit_chain_verify.*": {"queue": "default"},
     },
     beat_schedule={
         # Every 60s, fan-out health checks to every registered DNS server.
@@ -322,6 +324,17 @@ celery_app.conf.update(
         "ai-daily-digest": {
             "task": "app.tasks.ai_digest.send_daily_digest",
             "schedule": crontab(hour=8, minute=0),
+        },
+        # Nightly at 02:00 UTC, walk the audit_log chain and verify
+        # every row's hash. Issue #73. Read-only — never tries to
+        # repair, opens an AlertEvent against the
+        # ``audit-chain-broken`` rule when something doesn't line up.
+        # 02:00 UTC is intentionally off-peak for most deployments;
+        # the walk is O(rows) and we don't want it competing with
+        # the morning digest at 08:00.
+        "audit-chain-verify": {
+            "task": "app.tasks.audit_chain_verify.verify_audit_chain",
+            "schedule": crontab(hour=2, minute=0),
         },
     },
 )

@@ -1,7 +1,8 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import DateTime, Index, String, Text, func
+from sqlalchemy import BigInteger, DateTime, Index, String, Text, func
+from sqlalchemy import text as sa_text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -13,7 +14,15 @@ class AuditLog(Base):
     Append-only audit trail of all data mutations.
     Stored in PostgreSQL (not the log store) for queryability and compliance.
     No application-layer deletes are ever performed on this table.
-    A DB-level trigger prevents DELETE as an extra guard.
+    A DB-level trigger prevents DELETE as an extra guard (issue #73).
+
+    ``seq`` + ``row_hash`` + ``prev_hash`` form a tamper-evident chain
+    (issue #73). The hash is computed in
+    ``app.services.audit_chain.compute_audit_hashes`` via a SQLAlchemy
+    ``before_flush`` event listener — every new audit row goes through
+    that path, which takes a Postgres advisory lock to serialise the
+    "look up the previous row, hash, append" sequence so concurrent
+    inserts can't interleave and break the chain.
     """
 
     __tablename__ = "audit_log"
@@ -25,6 +34,17 @@ class AuditLog(Base):
     )
 
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    # Ordered position in the chain. Auto-assigned via ``audit_log_seq_seq``
+    # in the migration; the runtime hasher selects the row with
+    # ``seq = MAX(seq)`` to fetch ``prev_hash`` so the chain is contiguous
+    # even when two rows share a timestamp. ``server_default`` tells the
+    # ORM to omit the column on INSERT so Postgres picks the next value
+    # from the sequence.
+    seq: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        server_default=sa_text("nextval('audit_log_seq_seq')"),
+    )
     timestamp: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
@@ -55,3 +75,8 @@ class AuditLog(Base):
     # result: success | denied | error
     result: Mapped[str] = mapped_column(String(20), nullable=False, default="success")
     error_detail: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    # Tamper-evidence chain (issue #73). Set by the runtime hasher;
+    # ``prev_hash`` is NULL only on the very first row.
+    row_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    prev_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)

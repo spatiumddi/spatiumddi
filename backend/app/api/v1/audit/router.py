@@ -9,6 +9,7 @@ from sqlalchemy import func, select
 from app.api.deps import DB
 from app.core.permissions import require_permission
 from app.models.audit import AuditLog
+from app.services.audit_chain import verify_chain
 
 router = APIRouter(dependencies=[Depends(require_permission("read", "audit_log"))])
 
@@ -79,3 +80,63 @@ async def list_audit_log(
     rows = (await db.execute(q)).scalars().all()
 
     return AuditLogPage(total=total, items=list(rows))
+
+
+# ── Tamper-evidence verifier (issue #73) ────────────────────────────
+
+
+class ChainBreakResponse(BaseModel):
+    seq: int
+    audit_id: str
+    expected_hash: str
+    actual_hash: str
+    reason: str
+
+
+class IntegrityResponse(BaseModel):
+    """Result of running the chain verifier across the audit log.
+
+    ``ok`` is the bottom line — the headline pill on the Audit page.
+    ``rows_checked`` lets the operator confirm the verifier saw the
+    full table (vs. a half-finished spot check). ``breaks`` is empty
+    when ``ok`` is True and lists every tampered row otherwise; the
+    UI surfaces a quick-jump link from each break to the
+    ``audit/{seq}`` row in the table.
+    """
+
+    ok: bool
+    rows_checked: int
+    breaks: list[ChainBreakResponse]
+
+
+@router.get("/integrity", response_model=IntegrityResponse)
+async def get_audit_integrity(
+    db: DB,
+    max_rows: int | None = Query(
+        default=None,
+        ge=1,
+        description=(
+            "Cap the number of rows checked. Useful on huge tables where "
+            "the full walk is expensive — leave unset for a complete sweep."
+        ),
+    ),
+) -> IntegrityResponse:
+    """Walk the audit_log chain and report any tamper. Slow on tables
+    past ~1M rows — the nightly Celery task pre-computes the same
+    answer and writes an alert event when it breaks, so the UI hit
+    is mostly for ad-hoc operator confirmation."""
+    result = await verify_chain(db, max_rows=max_rows)
+    return IntegrityResponse(
+        ok=result.ok,
+        rows_checked=result.rows_checked,
+        breaks=[
+            ChainBreakResponse(
+                seq=b.seq,
+                audit_id=b.audit_id,
+                expected_hash=b.expected_hash,
+                actual_hash=b.actual_hash,
+                reason=b.reason,
+            )
+            for b in result.breaks
+        ],
+    )

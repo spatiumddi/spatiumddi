@@ -1911,6 +1911,20 @@ export interface AuditLogPage {
   items: AuditLogEntry[];
 }
 
+export interface AuditChainBreak {
+  seq: number;
+  audit_id: string;
+  expected_hash: string;
+  actual_hash: string;
+  reason: "row_hash_mismatch" | "prev_hash_mismatch";
+}
+
+export interface AuditIntegrity {
+  ok: boolean;
+  rows_checked: number;
+  breaks: AuditChainBreak[];
+}
+
 export const auditApi = {
   list: (params?: {
     limit?: number;
@@ -1922,6 +1936,15 @@ export const auditApi = {
     result?: string;
     source_ip?: string;
   }) => api.get<AuditLogPage>("/audit", { params }).then((r) => r.data),
+  /** Walk the chain and report any tampering (issue #73). The
+   *  ``max_rows`` cap is for huge tables — leave unset for a full
+   *  sweep. */
+  integrity: (maxRows?: number) =>
+    api
+      .get<AuditIntegrity>("/audit/integrity", {
+        params: maxRows ? { max_rows: maxRows } : undefined,
+      })
+      .then((r) => r.data),
 };
 
 // ── Search ─────────────────────────────────────────────────────────────────────
