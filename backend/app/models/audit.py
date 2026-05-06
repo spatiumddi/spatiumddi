@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime
 
-from sqlalchemy import BigInteger, DateTime, Index, String, Text, func
+from sqlalchemy import BigInteger, DateTime, Index, Sequence, String, Text, func
 from sqlalchemy import text as sa_text
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
@@ -40,8 +40,18 @@ class AuditLog(Base):
     # even when two rows share a timestamp. ``server_default`` tells the
     # ORM to omit the column on INSERT so Postgres picks the next value
     # from the sequence.
+    # ``Sequence("audit_log_seq_seq")`` is declared here so that
+    # ``Base.metadata.create_all`` (used by the test suite) creates the
+    # sequence alongside the table — without it, asyncpg raises
+    # ``UndefinedTableError: relation "audit_log_seq_seq" does not exist``
+    # the first time a row is inserted. Production still goes through
+    # the Alembic migration ``d92f4a18c763_audit_chain_hash`` which
+    # creates the same sequence; SQLAlchemy's ``CREATE SEQUENCE IF NOT
+    # EXISTS`` semantics + Alembic's idempotency keep the two paths in
+    # sync.
     seq: Mapped[int] = mapped_column(
         BigInteger,
+        Sequence("audit_log_seq_seq"),
         nullable=False,
         server_default=sa_text("nextval('audit_log_seq_seq')"),
     )

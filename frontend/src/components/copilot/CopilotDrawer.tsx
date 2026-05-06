@@ -1558,10 +1558,7 @@ function ChatComposer({
             setText(next);
             // If the operator typed over a recalled message, exit
             // history mode so further ↑ doesn't blow away their edits.
-            if (
-              historyIndex !== null &&
-              next !== userMessages[historyIndex]
-            ) {
+            if (historyIndex !== null && next !== userMessages[historyIndex]) {
               setHistoryIndex(null);
             }
           }}

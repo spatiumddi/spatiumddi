@@ -226,7 +226,10 @@ async def find_devices_by_vendor(
         lease_rows = (
             (await db.execute(select(DHCPLease).where(DHCPLease.state == "active"))).scalars().all()
         )
-        lease_macs = [str(le.mac_address) for le in lease_rows]
+        # mypy invariance — bulk_lookup_vendors signature is
+        # list[str | None]; spell it explicitly so the literal-comp
+        # type doesn't lock to list[str].
+        lease_macs: list[str | None] = [str(le.mac_address) for le in lease_rows]
         vendors_map = await bulk_lookup_vendors(db, lease_macs)
         for le in lease_rows:
             key = normalize_mac_key(str(le.mac_address))
