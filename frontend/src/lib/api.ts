@@ -1994,6 +1994,25 @@ export interface PlatformSettings {
    *  the highest-priority enabled AI provider for an executive
    *  summary, and dispatches via the audit-forward targets. */
   ai_daily_digest_enabled: boolean;
+  /** Password policy (issue #70). 0 disables history / max-age; the
+   *  complexity flags are independently toggleable. */
+  password_min_length: number;
+  password_require_uppercase: boolean;
+  password_require_lowercase: boolean;
+  password_require_digit: boolean;
+  password_require_symbol: boolean;
+  password_history_count: number;
+  password_max_age_days: number;
+}
+
+export interface PasswordPolicy {
+  min_length: number;
+  require_uppercase: boolean;
+  require_lowercase: boolean;
+  require_digit: boolean;
+  require_symbol: boolean;
+  history_count: number;
+  max_age_days: number;
 }
 
 export interface OUIStatus {
@@ -4616,6 +4635,11 @@ export const authApi = {
       .then((r) => r.data),
   publicProviders: () =>
     api.get<PublicAuthProvider[]>("/auth/providers").then((r) => r.data),
+  /** Public read of the active password policy. Returned unauthenticated
+   *  so the login + change-password forms can render the rule list
+   *  before the user even submits. */
+  passwordPolicy: () =>
+    api.get<PasswordPolicy>("/auth/password-policy").then((r) => r.data),
   logout: () => api.post("/auth/logout"),
   refresh: (refreshToken: string) =>
     api

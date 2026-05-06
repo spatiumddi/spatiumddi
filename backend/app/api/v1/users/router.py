@@ -1,6 +1,7 @@
 """User management endpoints (superadmin only)."""
 
 import uuid
+from datetime import UTC, datetime
 
 import bcrypt
 import structlog
@@ -11,6 +12,14 @@ from sqlalchemy import select
 from app.api.deps import DB, SuperAdmin
 from app.models.audit import AuditLog
 from app.models.auth import User
+from app.models.settings import PlatformSettings
+from app.services.password_policy import (
+    PasswordPolicy,
+    push_history,
+)
+from app.services.password_policy import (
+    validate as validate_password_policy,
+)
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()
@@ -106,6 +115,21 @@ async def list_users(current_user: SuperAdmin, db: DB) -> list[User]:
     return list(result.scalars().all())
 
 
+async def _enforce_policy(db: DB, password: str) -> tuple[PasswordPolicy, str]:
+    """Validate the candidate password against the active policy and
+    return ``(policy, hash)``. Raises 400 on violation. Reused across
+    the create-user + reset-password paths so the rules can't drift."""
+    settings_row = await db.get(PlatformSettings, 1)
+    policy = PasswordPolicy.from_row(settings_row)
+    result = validate_password_policy(password, policy)
+    if not result.ok:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"reason": "password_policy", "errors": result.errors},
+        )
+    return policy, bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+
+
 @router.post("", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
 async def create_user(body: CreateUserRequest, current_user: SuperAdmin, db: DB) -> User:
     # Check uniqueness
@@ -118,7 +142,8 @@ async def create_user(body: CreateUserRequest, current_user: SuperAdmin, db: DB)
             detail="Username or email already in use",
         )
 
-    hashed = bcrypt.hashpw(body.password.encode(), bcrypt.gensalt()).decode()
+    policy, hashed = await _enforce_policy(db, body.password)
+    history = push_history(hashed, None, policy.history_count)
     user = User(
         username=body.username,
         email=body.email,
@@ -128,6 +153,8 @@ async def create_user(body: CreateUserRequest, current_user: SuperAdmin, db: DB)
         force_password_change=body.force_password_change,
         auth_source="local",
         is_active=True,
+        password_changed_at=datetime.now(UTC),
+        password_history_encrypted=history,
     )
     db.add(user)
     await db.flush()
@@ -192,8 +219,17 @@ async def reset_password(
     if user is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
 
-    user.hashed_password = bcrypt.hashpw(body.new_password.encode(), bcrypt.gensalt()).decode()
+    # Admin reset bypasses history (an admin reset is by definition out
+    # of band — the user's prior choices are not in scope) but still
+    # honours the complexity rules so an operator can't side-step the
+    # policy via the admin path.
+    policy, hashed = await _enforce_policy(db, body.new_password)
+    user.hashed_password = hashed
     user.force_password_change = True
+    user.password_changed_at = datetime.now(UTC)
+    user.password_history_encrypted = push_history(
+        hashed, user.password_history_encrypted, policy.history_count
+    )
     db.add(
         _audit(current_user, "reset_password", str(user.id), f"Reset password for {user.username}")
     )

@@ -41,6 +41,34 @@ class PlatformSettings(Base):
     session_timeout_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=60)
     auto_logout_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
 
+    # Password policy (issue #70). Defaults are deliberately permissive so
+    # an upgrade doesn't suddenly invalidate working passwords; operators
+    # tighten in Settings → Security. ``password_history_count = 0``
+    # disables history checking; ``password_max_age_days = 0`` disables
+    # forced rotation. Validator + history live in
+    # ``app.services.password_policy``.
+    password_min_length: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=12, server_default=sa_text("12")
+    )
+    password_require_uppercase: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=sa_text("true")
+    )
+    password_require_lowercase: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=sa_text("true")
+    )
+    password_require_digit: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=sa_text("true")
+    )
+    password_require_symbol: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
+    password_history_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=5, server_default=sa_text("5")
+    )
+    password_max_age_days: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=sa_text("0")
+    )
+
     # Utilization alert thresholds
     utilization_warn_threshold: Mapped[int] = mapped_column(Integer, nullable=False, default=80)
     utilization_critical_threshold: Mapped[int] = mapped_column(Integer, nullable=False, default=95)

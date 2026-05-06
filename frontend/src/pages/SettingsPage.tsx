@@ -94,6 +94,7 @@ type SectionId =
   | "network-domains"
   | "network-vrf"
   | "ai-digest"
+  | "password-policy"
   | "session"
   | "subnet-tree"
   | "updates"
@@ -182,6 +183,15 @@ const SECTION_FIELDS: Record<SectionId, (keyof PlatformSettings)[]> = {
   "network-domains": ["domain_whois_interval_hours"],
   "network-vrf": ["vrf_strict_rd_validation"],
   "ai-digest": ["ai_daily_digest_enabled"],
+  "password-policy": [
+    "password_min_length",
+    "password_require_uppercase",
+    "password_require_lowercase",
+    "password_require_digit",
+    "password_require_symbol",
+    "password_history_count",
+    "password_max_age_days",
+  ],
   session: ["session_timeout_minutes", "auto_logout_minutes"],
   "subnet-tree": ["subnet_tree_default_expanded_depth"],
   updates: ["github_release_check_enabled"],
@@ -664,6 +674,31 @@ const SECTIONS: SectionDef[] = [
       "tls",
       "log",
       "export",
+    ],
+  },
+  {
+    id: "password-policy",
+    title: "Password Policy",
+    group: "Security",
+    description:
+      "Complexity, history, and rotation rules applied to local-auth users on every password set. Defaults are deliberately permissive — operators tighten as their compliance footprint grows.",
+    keywords: [
+      "password",
+      "policy",
+      "complexity",
+      "history",
+      "rotation",
+      "expire",
+      "expiry",
+      "max age",
+      "min length",
+      "uppercase",
+      "lowercase",
+      "digit",
+      "symbol",
+      "pci",
+      "hipaa",
+      "soc2",
     ],
   },
   {
@@ -1713,6 +1748,107 @@ export function SettingsPage() {
                   </span>
                 </div>
               </Field>
+            )}
+
+            {activeId === "password-policy" && (
+              <>
+                <Field
+                  label="Minimum length"
+                  description="Hard floor at 6 characters. Bcrypt truncates above 72 bytes — past that the extra characters aren't actually being checked."
+                >
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="number"
+                      min={6}
+                      max={128}
+                      value={values.password_min_length ?? 12}
+                      onChange={(e) =>
+                        set("password_min_length", Number(e.target.value))
+                      }
+                      disabled={!isSuperadmin}
+                      className={cn(inputCls, "w-24")}
+                    />
+                    <span className="text-xs text-muted-foreground">chars</span>
+                  </div>
+                </Field>
+                <Field
+                  label="Require uppercase letter"
+                  description="At least one A–Z."
+                >
+                  <Toggle
+                    checked={!!values.password_require_uppercase}
+                    onChange={(v) => set("password_require_uppercase", v)}
+                    disabled={!isSuperadmin}
+                  />
+                </Field>
+                <Field
+                  label="Require lowercase letter"
+                  description="At least one a–z."
+                >
+                  <Toggle
+                    checked={!!values.password_require_lowercase}
+                    onChange={(v) => set("password_require_lowercase", v)}
+                    disabled={!isSuperadmin}
+                  />
+                </Field>
+                <Field label="Require digit" description="At least one 0–9.">
+                  <Toggle
+                    checked={!!values.password_require_digit}
+                    onChange={(v) => set("password_require_digit", v)}
+                    disabled={!isSuperadmin}
+                  />
+                </Field>
+                <Field
+                  label="Require symbol"
+                  description="At least one ASCII punctuation character (e.g. ! @ # $)."
+                >
+                  <Toggle
+                    checked={!!values.password_require_symbol}
+                    onChange={(v) => set("password_require_symbol", v)}
+                    disabled={!isSuperadmin}
+                  />
+                </Field>
+                <Field
+                  label="Password history"
+                  description="Block reuse of the last N passwords. 0 disables. Capped at 24."
+                >
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="number"
+                      min={0}
+                      max={24}
+                      value={values.password_history_count ?? 5}
+                      onChange={(e) =>
+                        set("password_history_count", Number(e.target.value))
+                      }
+                      disabled={!isSuperadmin}
+                      className={cn(inputCls, "w-24")}
+                    />
+                    <span className="text-xs text-muted-foreground">
+                      previous
+                    </span>
+                  </div>
+                </Field>
+                <Field
+                  label="Maximum password age"
+                  description="Force a password change on the next login after this many days. 0 disables. Applies to local-auth users only — external-IdP users carry their own rotation policy."
+                >
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="number"
+                      min={0}
+                      max={3650}
+                      value={values.password_max_age_days ?? 0}
+                      onChange={(e) =>
+                        set("password_max_age_days", Number(e.target.value))
+                      }
+                      disabled={!isSuperadmin}
+                      className={cn(inputCls, "w-24")}
+                    />
+                    <span className="text-xs text-muted-foreground">days</span>
+                  </div>
+                </Field>
+              </>
             )}
 
             {activeId === "session" && (

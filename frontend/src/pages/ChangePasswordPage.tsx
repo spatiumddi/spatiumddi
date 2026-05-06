@@ -1,6 +1,13 @@
 import { useState, type FormEvent } from "react";
 import { useNavigate } from "react-router-dom";
+import { useQuery } from "@tanstack/react-query";
+import { isAxiosError } from "axios";
 import { authApi } from "@/lib/api";
+
+interface PolicyDetail {
+  reason?: string;
+  errors?: string[];
+}
 
 export function ChangePasswordPage() {
   const navigate = useNavigate();
@@ -8,18 +15,22 @@ export function ChangePasswordPage() {
   const [newPassword, setNewPassword] = useState("");
   const [confirmPassword, setConfirmPassword] = useState("");
   const [error, setError] = useState("");
+  const [policyErrors, setPolicyErrors] = useState<string[]>([]);
   const [loading, setLoading] = useState(false);
+
+  const { data: policy } = useQuery({
+    queryKey: ["password-policy"],
+    queryFn: () => authApi.passwordPolicy(),
+    staleTime: 60_000,
+  });
 
   async function handleSubmit(e: FormEvent) {
     e.preventDefault();
     setError("");
+    setPolicyErrors([]);
 
     if (newPassword !== confirmPassword) {
       setError("New passwords do not match.");
-      return;
-    }
-    if (newPassword.length < 8) {
-      setError("New password must be at least 8 characters.");
       return;
     }
 
@@ -27,10 +38,33 @@ export function ChangePasswordPage() {
     try {
       await authApi.changePassword(currentPassword, newPassword);
       navigate("/dashboard");
-    } catch {
-      setError(
-        "Failed to change password. Check your current password and try again.",
-      );
+    } catch (err) {
+      // Server emits ``{detail: {reason: 'password_policy'|'password_history',
+      // errors: [...]}}`` for rule violations and a plain string detail for
+      // bad-current-password / generic failure. Surface each rule on its own
+      // line so the operator can fix everything in one pass.
+      if (isAxiosError(err)) {
+        const detail = err.response?.data?.detail as
+          | string
+          | PolicyDetail
+          | undefined;
+        if (
+          detail &&
+          typeof detail === "object" &&
+          Array.isArray(detail.errors)
+        ) {
+          setPolicyErrors(detail.errors);
+          setError("");
+        } else if (typeof detail === "string") {
+          setError(detail);
+        } else {
+          setError(
+            "Failed to change password. Check your current password and try again.",
+          );
+        }
+      } else {
+        setError("Unexpected error — try again.");
+      }
     } finally {
       setLoading(false);
     }
@@ -73,6 +107,9 @@ export function ChangePasswordPage() {
               onChange={(e) => setNewPassword(e.target.value)}
               className="w-full rounded-md border bg-background px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
             />
+            {policy && (
+              <PolicyHintList policy={policy} candidate={newPassword} />
+            )}
           </div>
           <div className="space-y-2">
             <label htmlFor="confirm-password" className="text-sm font-medium">
@@ -89,6 +126,13 @@ export function ChangePasswordPage() {
             />
           </div>
           {error && <p className="text-sm text-destructive">{error}</p>}
+          {policyErrors.length > 0 && (
+            <ul className="list-disc space-y-1 pl-5 text-sm text-destructive">
+              {policyErrors.map((e) => (
+                <li key={e}>{e}</li>
+              ))}
+            </ul>
+          )}
           <button
             type="submit"
             disabled={loading}
@@ -99,5 +143,62 @@ export function ChangePasswordPage() {
         </form>
       </div>
     </div>
+  );
+}
+
+function PolicyHintList({
+  policy,
+  candidate,
+}: {
+  policy: import("@/lib/api").PasswordPolicy;
+  candidate: string;
+}) {
+  const rules: { ok: boolean; label: string }[] = [
+    {
+      ok: candidate.length >= policy.min_length,
+      label: `At least ${policy.min_length} characters`,
+    },
+  ];
+  if (policy.require_uppercase) {
+    rules.push({
+      ok: /[A-Z]/.test(candidate),
+      label: "Contains an uppercase letter",
+    });
+  }
+  if (policy.require_lowercase) {
+    rules.push({
+      ok: /[a-z]/.test(candidate),
+      label: "Contains a lowercase letter",
+    });
+  }
+  if (policy.require_digit) {
+    rules.push({
+      ok: /\d/.test(candidate),
+      label: "Contains a digit",
+    });
+  }
+  if (policy.require_symbol) {
+    rules.push({
+      ok: /[^A-Za-z0-9]/.test(candidate),
+      label: "Contains a symbol",
+    });
+  }
+  if (policy.history_count > 0) {
+    rules.push({
+      ok: candidate.length > 0,
+      label: `Cannot match the last ${policy.history_count} passwords (checked on submit)`,
+    });
+  }
+  return (
+    <ul className="space-y-0.5 text-xs text-muted-foreground">
+      {rules.map((r) => (
+        <li
+          key={r.label}
+          className={r.ok ? "text-emerald-500" : "text-muted-foreground"}
+        >
+          {r.ok ? "✓" : "○"} {r.label}
+        </li>
+      ))}
+    </ul>
   );
 }

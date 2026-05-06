@@ -73,6 +73,17 @@ class User(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_login_ip: Mapped[str | None] = mapped_column(String(45), nullable=True)
 
+    # Password-policy bookkeeping (issue #70). ``password_changed_at`` is
+    # NULL for external-auth users (no SpatiumDDI-side password) and is
+    # backfilled to ``created_at`` for existing local users on migration.
+    # ``password_history_encrypted`` is a Fernet blob over a JSON list of
+    # prior bcrypt hashes, most-recent-first, capped to the configured
+    # ``platform_settings.password_history_count``.
+    password_changed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    password_history_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+
     # lazy="selectin" so `user.groups` is always populated when the User is
     # fetched via `db.get(User, ...)` in `get_current_user`. The permissions
     # helper walks user.groups → group.roles on every request and cannot do

@@ -89,6 +89,15 @@ class SettingsResponse(BaseModel):
     # the highest-priority enabled AIProvider for an executive
     # summary, and pushes through audit-forward targets.
     ai_daily_digest_enabled: bool = False
+    # Password policy (issue #70). 0 disables history / max-age; the
+    # complexity flags are independently toggleable.
+    password_min_length: int = 12
+    password_require_uppercase: bool = True
+    password_require_lowercase: bool = True
+    password_require_digit: bool = True
+    password_require_symbol: bool = False
+    password_history_count: int = 5
+    password_max_age_days: int = 0
 
     model_config = {"from_attributes": True}
 
@@ -163,6 +172,39 @@ class SettingsUpdate(BaseModel):
     vrf_strict_rd_validation: bool | None = None
     # Operator Copilot daily digest (issue #90 Phase 2).
     ai_daily_digest_enabled: bool | None = None
+    # Password policy (issue #70).
+    password_min_length: int | None = None
+    password_require_uppercase: bool | None = None
+    password_require_lowercase: bool | None = None
+    password_require_digit: bool | None = None
+    password_require_symbol: bool | None = None
+    password_history_count: int | None = None
+    password_max_age_days: int | None = None
+
+    @field_validator("password_min_length")
+    @classmethod
+    def validate_password_min_length(cls, v: int | None) -> int | None:
+        # Floor at 6 even when operators relax the policy — anything
+        # shorter is a configuration mistake. Cap at 128 because bcrypt
+        # truncates inputs above 72 bytes; values past that are dead
+        # length the operator might assume is being checked.
+        if v is not None and not (6 <= v <= 128):
+            raise ValueError("Min password length must be between 6 and 128")
+        return v
+
+    @field_validator("password_history_count")
+    @classmethod
+    def validate_password_history_count(cls, v: int | None) -> int | None:
+        if v is not None and not (0 <= v <= 24):
+            raise ValueError("Password history must be 0–24 (0 disables)")
+        return v
+
+    @field_validator("password_max_age_days")
+    @classmethod
+    def validate_password_max_age_days(cls, v: int | None) -> int | None:
+        if v is not None and not (0 <= v <= 3650):
+            raise ValueError("Password max age must be 0–3650 days (0 disables)")
+        return v
 
     @field_validator("ip_allocation_strategy")
     @classmethod

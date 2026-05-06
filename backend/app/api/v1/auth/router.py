@@ -64,6 +64,17 @@ from app.services.mfa import (
     remaining_recovery_codes,
     verify_totp,
 )
+from app.services.password_policy import (
+    PasswordPolicy,
+    is_in_history,
+    push_history,
+)
+from app.services.password_policy import (
+    is_expired as password_is_expired,
+)
+from app.services.password_policy import (
+    validate as validate_password_policy,
+)
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()
@@ -122,6 +133,12 @@ class UserResponse(BaseModel):
 
 
 class ChangePasswordRequest(BaseModel):
+    """Self-service password change. Pydantic only enforces the absolute
+    floor (8 chars) here so legacy clients keep returning a 422 on
+    obviously-empty input; the real policy check runs server-side
+    against ``PlatformSettings`` and returns 400 with a per-rule error
+    list so the UI can surface them all at once."""
+
     current_password: str
     new_password: str
 
@@ -131,6 +148,21 @@ class ChangePasswordRequest(BaseModel):
         if len(v) < 8:
             raise ValueError("Password must be at least 8 characters")
         return v
+
+
+class PasswordPolicyResponse(BaseModel):
+    """Public read of the active policy. Returned unauthenticated so the
+    login + change-password forms can render the rule list before the
+    user even submits — fewer round-trips on a typo, and the rules are
+    not sensitive."""
+
+    min_length: int
+    require_uppercase: bool
+    require_lowercase: bool
+    require_digit: bool
+    require_symbol: bool
+    history_count: int
+    max_age_days: int
 
 
 def _client_ip(request: Request) -> str | None:
@@ -352,6 +384,15 @@ async def login(body: LoginRequest, request: Request, db: DB) -> LoginResponse:
                 db, request, body.username, reason="account_disabled", user=user
             )
             raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account disabled")
+        # Password-policy max-age check (issue #70). If rotation is on
+        # and the user's password is older than the threshold we flip
+        # ``force_password_change`` so the next session lands on the
+        # change-password screen. Doesn't block login — the user still
+        # needs to authenticate to reach that screen.
+        settings_row = await db.get(PlatformSettings, 1)
+        policy = PasswordPolicy.from_row(settings_row)
+        if password_is_expired(user, policy) and not user.force_password_change:
+            user.force_password_change = True
         # MFA gate (issue #69). Local users only — external providers
         # rely on their own IdP for MFA and don't run TOTP here. We don't
         # write an audit row for the password-success-but-MFA-pending case
@@ -540,6 +581,24 @@ async def refresh_token_endpoint(body: RefreshRequest, db: DB) -> TokenResponse:
     )
 
 
+@router.get("/password-policy", response_model=PasswordPolicyResponse)
+async def get_password_policy(db: DB) -> PasswordPolicyResponse:
+    """Public read of the active password policy. Unauthenticated so the
+    login + change-password forms can render the rule list immediately;
+    no secrets are exposed."""
+    settings_row = await db.get(PlatformSettings, 1)
+    policy = PasswordPolicy.from_row(settings_row)
+    return PasswordPolicyResponse(
+        min_length=policy.min_length,
+        require_uppercase=policy.require_uppercase,
+        require_lowercase=policy.require_lowercase,
+        require_digit=policy.require_digit,
+        require_symbol=policy.require_symbol,
+        history_count=policy.history_count,
+        max_age_days=policy.max_age_days,
+    )
+
+
 @router.post("/change-password", status_code=status.HTTP_204_NO_CONTENT)
 async def change_password(
     body: ChangePasswordRequest,
@@ -553,11 +612,36 @@ async def change_password(
             status_code=status.HTTP_400_BAD_REQUEST, detail="Current password is incorrect"
         )
 
-    await db.execute(
-        update(User)
-        .where(User.id == current_user.id)
-        .values(hashed_password=hash_password(body.new_password), force_password_change=False)
+    settings_row = await db.get(PlatformSettings, 1)
+    policy = PasswordPolicy.from_row(settings_row)
+    result = validate_password_policy(body.new_password, policy)
+    if not result.ok:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={"reason": "password_policy", "errors": result.errors},
+        )
+    if policy.history_count > 0 and is_in_history(
+        body.new_password, current_user.password_history_encrypted
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail={
+                "reason": "password_history",
+                "errors": [
+                    f"Password matches one of the last {policy.history_count} "
+                    "passwords; choose a new one."
+                ],
+            },
+        )
+
+    new_hash = hash_password(body.new_password)
+    new_history = push_history(
+        new_hash, current_user.password_history_encrypted, policy.history_count
     )
+    current_user.hashed_password = new_hash
+    current_user.force_password_change = False
+    current_user.password_changed_at = datetime.now(UTC)
+    current_user.password_history_encrypted = new_history
 
     audit = AuditLog(
         user_id=current_user.id,
@@ -567,7 +651,7 @@ async def change_password(
         resource_type="user",
         resource_id=str(current_user.id),
         resource_display=current_user.username,
-        changed_fields=["hashed_password", "force_password_change"],
+        changed_fields=["hashed_password", "force_password_change", "password_changed_at"],
         result="success",
     )
     db.add(audit)
