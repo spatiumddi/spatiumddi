@@ -1,4 +1,5 @@
 import { type ReactNode } from "react";
+import { createPortal } from "react-dom";
 import { X } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { MODAL_BACKDROP_CLS, useDraggableModal } from "./use-draggable-modal";
@@ -81,7 +82,14 @@ export function Modal({
 }) {
   const { dialogStyle, dragHandleProps } = useDraggableModal(onClose);
 
-  return (
+  // Portal to <body> so nested modals (e.g. the IPSpacePicker quick-create
+  // popping up from inside the UniFi / Proxmox / Docker / Kubernetes /
+  // Tailscale endpoint forms) don't end up as <form> inside <form>. The
+  // browser's HTML parser silently drops the inner <form> tag in nested-
+  // form scenarios — which both stops the inner submit handler from
+  // firing AND causes the inner submit button to submit the OUTER form
+  // instead, closing the parent modal.
+  const node = (
     <div className={MODAL_BACKDROP_CLS}>
       <div
         className={cn(
@@ -109,4 +117,5 @@ export function Modal({
       </div>
     </div>
   );
+  return createPortal(node, document.body);
 }

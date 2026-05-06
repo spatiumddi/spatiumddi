@@ -104,6 +104,13 @@ function QuickCreateSpaceModal({
 
   const submit = (e: FormEvent) => {
     e.preventDefault();
+    // Stop the synthetic submit from bubbling up to the parent
+    // modal's <form onSubmit> in React's component tree (portaling
+    // the modal fixes DOM-level nesting but React's synthetic events
+    // still bubble through the React tree). Without this, the parent
+    // modal's save mutation fires when the operator clicks "Create"
+    // on the quick-add space form.
+    e.stopPropagation();
     if (!name.trim()) return;
     createMut.mutate();
   };
