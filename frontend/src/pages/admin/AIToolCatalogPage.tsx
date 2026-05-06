@@ -18,7 +18,12 @@ const CATEGORY_LABELS: Record<string, string> = {
 export function AIToolCatalogPage() {
   const qc = useQueryClient();
   const { data, isLoading, refetch, isFetching } = useQuery({
-    queryKey: ["ai-tool-catalog"],
+    // Distinct from the ``ai-tool-catalog`` key used by the AI
+    // Providers modal — that one expects a bare array from
+    // /ai/providers/tools, this page calls /ai/tools (full envelope
+    // with default_enabled + enabled flags). Sharing the key would
+    // alias the cache + crash whichever consumer reads it second.
+    queryKey: ["ai-tool-catalog-admin"],
     queryFn: () => aiToolCatalogApi.list(),
   });
 
@@ -87,7 +92,7 @@ export function AIToolCatalogPage() {
     mutationFn: () => aiToolCatalogApi.update([...selected].sort()),
     onSuccess: () => {
       setDirty(false);
-      qc.invalidateQueries({ queryKey: ["ai-tool-catalog"] });
+      qc.invalidateQueries({ queryKey: ["ai-tool-catalog-admin"] });
     },
   });
 
@@ -95,7 +100,7 @@ export function AIToolCatalogPage() {
     mutationFn: () => aiToolCatalogApi.update(null),
     onSuccess: () => {
       setDirty(false);
-      qc.invalidateQueries({ queryKey: ["ai-tool-catalog"] });
+      qc.invalidateQueries({ queryKey: ["ai-tool-catalog-admin"] });
     },
   });
 
