@@ -8,6 +8,7 @@ import {
   Boxes,
   Check,
   ClipboardCheck,
+  Clock,
   Container as ContainerIcon,
   Cpu,
   FileDown,
@@ -16,7 +17,9 @@ import {
   Globe2,
   HardDrive,
   Hash,
+  KeyRound,
   Layers,
+  Lock,
   Network,
   Plug,
   RefreshCw,
@@ -43,6 +46,7 @@ import {
   domainsApi,
   alertsApi,
   conformityApi,
+  dashboardsApi,
   type Subnet,
   type DNSServer,
   type DHCPServer,
@@ -60,6 +64,10 @@ import {
   type AlertRule,
   type ConformityResult,
   type ConformitySummary,
+  type NetworkDashboardSummary,
+  type IntegrationsDashboardSummary,
+  type IntegrationsDashboardPanel,
+  type SecurityDashboardSummary,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { includeInUtilization } from "@/lib/utilization";
@@ -712,7 +720,10 @@ type DashboardTab =
   | "dns"
   | "dhcp"
   | "compliance"
-  | "conformity";
+  | "conformity"
+  | "network"
+  | "integrations"
+  | "security";
 
 const _PERSISTED_TABS: ReadonlySet<DashboardTab> = new Set([
   "ipam",
@@ -720,6 +731,9 @@ const _PERSISTED_TABS: ReadonlySet<DashboardTab> = new Set([
   "dhcp",
   "compliance",
   "conformity",
+  "network",
+  "integrations",
+  "security",
 ]);
 
 export function DashboardPage() {
@@ -998,12 +1012,15 @@ export function DashboardPage() {
                 { key: "ipam", label: "IPAM", Icon: Network },
                 { key: "dns", label: "DNS", Icon: Globe2 },
                 { key: "dhcp", label: "DHCP", Icon: Server },
+                { key: "network", label: "Network", Icon: Waypoints },
+                { key: "integrations", label: "Integrations", Icon: Plug },
                 { key: "compliance", label: "Compliance", Icon: ShieldCheck },
                 {
                   key: "conformity",
                   label: "Conformity",
                   Icon: ClipboardCheck,
                 },
+                { key: "security", label: "Security", Icon: Lock },
               ] as const
             ).map(({ key, label, Icon }) => (
               <button
@@ -1025,90 +1042,95 @@ export function DashboardPage() {
         </div>
 
         {/* ── KPI grid (Overview / IPAM / DNS / DHCP — same data, different
-              lens. Compliance + Conformity tabs are focused views and own
-              their own headline KPIs). ───────────────────────────────── */}
-        {tab !== "compliance" && tab !== "conformity" && (
-          <div className="grid gap-3 grid-cols-2 md:grid-cols-3 lg:grid-cols-6">
-            <KpiCard
-              label="IP Spaces"
-              value={spaces?.length ?? "—"}
-              sub={spaces?.[0]?.name?.toUpperCase()}
-              icon={Layers}
-              to="/ipam"
-            />
-            <KpiCard
-              label="Subnets"
-              value={subnets?.length ?? "—"}
-              sub={
-                <>
-                  <span className="text-emerald-600 dark:text-emerald-400">
-                    {(subnets?.length ?? 0) - critical - warning} healthy
-                  </span>
-                  {(critical > 0 || warning > 0) && (
-                    <>
-                      {" · "}
-                      <span className="text-red-600 dark:text-red-400">
-                        {critical + warning} alert
-                        {critical + warning === 1 ? "" : "s"}
-                      </span>
-                    </>
-                  )}
-                </>
-              }
-              icon={Network}
-              tone={critical > 0 ? "bad" : warning > 0 ? "warn" : "good"}
-              to="/ipam"
-            />
-            <KpiCard
-              label="Allocated IPs (IPv4)"
-              value={allocatedIPs.toLocaleString()}
-              sub={`${freeIPs.toLocaleString()} free`}
-              icon={Activity}
-              to="/ipam"
-            />
-            <KpiCard
-              label="Utilization (IPv4)"
-              value={`${overallUtil.toFixed(1)}%`}
-              sub={`${allocatedIPs.toLocaleString()} / ${totalIPs.toLocaleString()}`}
-              icon={Server}
-              tone={
-                overallUtil >= 95
-                  ? "bad"
-                  : overallUtil >= 80
-                    ? "warn"
-                    : "default"
-              }
-            />
-            <KpiCard
-              label="DNS Zones"
-              value={totalZones}
-              sub={
-                dnsGroups.length > 0
-                  ? `${dnsGroups.length} group${dnsGroups.length === 1 ? "" : "s"}`
-                  : "no groups"
-              }
-              icon={Globe2}
-              to="/dns"
-            />
-            <KpiCard
-              label="Servers"
-              value={allServers.length}
-              sub={
-                unhealthyServers > 0 ? (
-                  <span className="text-red-600 dark:text-red-400">
-                    {activeServers} active · {unhealthyServers} unhealthy
-                  </span>
-                ) : allServers.length > 0 ? (
-                  `${activeServers} active`
-                ) : (
-                  "none registered"
-                )
-              }
-              icon={Cpu}
-              tone={unhealthyServers > 0 ? "bad" : "default"}
-            />
-          </div>
-        )}
+              lens. The focused tabs (Compliance / Conformity / Network /
+              Integrations / Security) own their own headline KPIs and
+              skip this grid). ──────────────────────────────────────── */}
+        {tab !== "compliance" &&
+          tab !== "conformity" &&
+          tab !== "network" &&
+          tab !== "integrations" &&
+          tab !== "security" && (
+            <div className="grid gap-3 grid-cols-2 md:grid-cols-3 lg:grid-cols-6">
+              <KpiCard
+                label="IP Spaces"
+                value={spaces?.length ?? "—"}
+                sub={spaces?.[0]?.name?.toUpperCase()}
+                icon={Layers}
+                to="/ipam"
+              />
+              <KpiCard
+                label="Subnets"
+                value={subnets?.length ?? "—"}
+                sub={
+                  <>
+                    <span className="text-emerald-600 dark:text-emerald-400">
+                      {(subnets?.length ?? 0) - critical - warning} healthy
+                    </span>
+                    {(critical > 0 || warning > 0) && (
+                      <>
+                        {" · "}
+                        <span className="text-red-600 dark:text-red-400">
+                          {critical + warning} alert
+                          {critical + warning === 1 ? "" : "s"}
+                        </span>
+                      </>
+                    )}
+                  </>
+                }
+                icon={Network}
+                tone={critical > 0 ? "bad" : warning > 0 ? "warn" : "good"}
+                to="/ipam"
+              />
+              <KpiCard
+                label="Allocated IPs (IPv4)"
+                value={allocatedIPs.toLocaleString()}
+                sub={`${freeIPs.toLocaleString()} free`}
+                icon={Activity}
+                to="/ipam"
+              />
+              <KpiCard
+                label="Utilization (IPv4)"
+                value={`${overallUtil.toFixed(1)}%`}
+                sub={`${allocatedIPs.toLocaleString()} / ${totalIPs.toLocaleString()}`}
+                icon={Server}
+                tone={
+                  overallUtil >= 95
+                    ? "bad"
+                    : overallUtil >= 80
+                      ? "warn"
+                      : "default"
+                }
+              />
+              <KpiCard
+                label="DNS Zones"
+                value={totalZones}
+                sub={
+                  dnsGroups.length > 0
+                    ? `${dnsGroups.length} group${dnsGroups.length === 1 ? "" : "s"}`
+                    : "no groups"
+                }
+                icon={Globe2}
+                to="/dns"
+              />
+              <KpiCard
+                label="Servers"
+                value={allServers.length}
+                sub={
+                  unhealthyServers > 0 ? (
+                    <span className="text-red-600 dark:text-red-400">
+                      {activeServers} active · {unhealthyServers} unhealthy
+                    </span>
+                  ) : allServers.length > 0 ? (
+                    `${activeServers} active`
+                  ) : (
+                    "none registered"
+                  )
+                }
+                icon={Cpu}
+                tone={unhealthyServers > 0 ? "bad" : "default"}
+              />
+            </div>
+          )}
 
         {/* ── Platform health (Overview only — sits directly below the
               KPI row so the colour-coded health ribbon is the next
@@ -1498,6 +1520,12 @@ export function DashboardPage() {
           )}
 
         {/* ── Compliance tab ────────────────────────────────────────── */}
+        {tab === "network" && <NetworkPanel />}
+
+        {tab === "integrations" && <IntegrationsDashboardTabPanel />}
+
+        {tab === "security" && <SecurityPanel />}
+
         {tab === "compliance" && <CompliancePanel subnets={subnets ?? []} />}
 
         {/* ── Conformity tab ────────────────────────────────────────── */}
@@ -2439,6 +2467,676 @@ function ConformityPanel() {
           </ul>
         )}
       </div>
+    </div>
+  );
+}
+
+// ── Network dashboard tab (issue #107) ──────────────────────────────
+//
+// Single rollup endpoint at /dashboards/network/summary aggregates
+// the cross-entity network signals (ASN drift / RPKI ROA expiry /
+// circuit term + status / service orphans / overlay impact) into one
+// payload, so the front end does one query per tab visit.
+//
+// Layout:
+//
+//   - Six KPI cards (drift / ROA expiring / ROA expired / circuits /
+//     orphan services / overlay impact) — click-through to the
+//     canonical admin pages.
+//   - Two-column detail grid: ASN drift list + RPKI ROAs expiring
+//     soon (left), circuit alerts + orphan services + overlay
+//     impact (right).
+function NetworkPanel() {
+  const { data, isLoading } = useQuery<NetworkDashboardSummary>({
+    queryKey: ["dashboards", "network"],
+    queryFn: () => dashboardsApi.networkSummary(),
+    refetchInterval: 60_000,
+  });
+
+  if (isLoading || !data) {
+    return (
+      <div className="rounded-lg border bg-card p-8 text-center text-xs text-muted-foreground">
+        Loading network signals…
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-5">
+      {/* KPI ribbon */}
+      <div className="grid gap-3 grid-cols-2 md:grid-cols-3 xl:grid-cols-6">
+        <NetworkKpi
+          label="ASN drift"
+          value={data.asn_drift_count}
+          tone={data.asn_drift_count > 0 ? "warn" : "good"}
+          to="/network/asns"
+        />
+        <NetworkKpi
+          label="RPKI expiring"
+          value={data.rpki_expiring_count}
+          tone={data.rpki_expiring_count > 0 ? "warn" : "good"}
+          to="/network/asns"
+          hint="< 30 d"
+        />
+        <NetworkKpi
+          label="RPKI expired"
+          value={data.rpki_expired_count}
+          tone={data.rpki_expired_count > 0 ? "bad" : "good"}
+          to="/network/asns"
+        />
+        <NetworkKpi
+          label="Circuit alerts"
+          value={
+            data.circuit_term_expiring_count + data.circuit_status_changed_count
+          }
+          tone={
+            data.circuit_term_expiring_count +
+              data.circuit_status_changed_count >
+            0
+              ? "warn"
+              : "good"
+          }
+          to="/network/circuits"
+          hint={`${data.circuit_term_expiring_count} term · ${data.circuit_status_changed_count} status`}
+        />
+        <NetworkKpi
+          label="Orphan services"
+          value={data.service_orphan_count}
+          tone={data.service_orphan_count > 0 ? "bad" : "good"}
+          to="/network/services"
+        />
+        <NetworkKpi
+          label="Overlays impacted"
+          value={data.overlay_impacted_count}
+          tone={data.overlay_impacted_count > 0 ? "warn" : "good"}
+          to="/network/overlays"
+        />
+      </div>
+
+      <div className="grid gap-5 lg:grid-cols-2">
+        <DashboardListCard
+          title="ASN holder drift"
+          emptyHint="No ASNs in drift state right now."
+        >
+          {data.asn_drift.map((row) => (
+            <Link
+              key={row.id}
+              to={`/network/asns/${row.id}`}
+              className="block px-4 py-2 transition-colors hover:bg-accent/40"
+            >
+              <div className="flex items-baseline justify-between gap-2 text-xs">
+                <span className="font-medium">
+                  AS{row.number}
+                  {row.name ? ` · ${row.name}` : ""}
+                </span>
+                <span className="text-[10px] text-muted-foreground">drift</span>
+              </div>
+              <p className="mt-0.5 truncate text-[11px] text-muted-foreground">
+                {row.previous_holder ? `${row.previous_holder} → ` : ""}
+                {row.holder_org ?? "(unknown)"}
+              </p>
+            </Link>
+          ))}
+        </DashboardListCard>
+        <DashboardListCard
+          title="RPKI ROAs expiring soon"
+          emptyHint="No ROAs are expiring in the next 30 days."
+        >
+          {data.rpki_expiring.map((row) => (
+            <Link
+              key={row.id}
+              to={row.asn_id ? `/network/asns/${row.asn_id}` : "/network/asns"}
+              className="block px-4 py-2 transition-colors hover:bg-accent/40"
+            >
+              <div className="flex items-baseline justify-between gap-2 text-xs">
+                <span className="font-mono">
+                  AS{row.asn_number ?? "?"} {row.prefix}
+                  {row.max_length != null ? `-${row.max_length}` : ""}
+                </span>
+                <span className="text-[10px] text-muted-foreground tabular-nums">
+                  {row.valid_to ? humanTime(row.valid_to) : "—"}
+                </span>
+              </div>
+            </Link>
+          ))}
+        </DashboardListCard>
+        <DashboardListCard
+          title="Circuit alerts"
+          emptyHint="No circuits past term or in suspended/decom status."
+        >
+          {data.circuit_alerts.map((row) => (
+            <Link
+              key={row.id}
+              to="/network/circuits"
+              className="block px-4 py-2 transition-colors hover:bg-accent/40"
+            >
+              <div className="flex items-baseline justify-between gap-2 text-xs">
+                <span className="font-medium">{row.name}</span>
+                <span
+                  className={cn(
+                    "rounded px-1.5 py-0.5 text-[10px] uppercase tracking-wider",
+                    row.status === "decom"
+                      ? "bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300"
+                      : row.status === "suspended"
+                        ? "bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-300"
+                        : "bg-muted text-muted-foreground",
+                  )}
+                >
+                  {row.status}
+                </span>
+              </div>
+              <p className="mt-0.5 truncate text-[11px] text-muted-foreground">
+                {row.transport ?? "—"}
+                {row.term_end_date ? ` · term ${row.term_end_date}` : ""}
+              </p>
+            </Link>
+          ))}
+        </DashboardListCard>
+        <DashboardListCard
+          title="Orphan services + overlay impact"
+          emptyHint="Service catalog clean and no overlays touching down circuits."
+        >
+          {data.orphan_services.map((row) => (
+            <Link
+              key={row.service_id + row.resource_id}
+              to="/network/services"
+              className="block px-4 py-2 transition-colors hover:bg-accent/40"
+            >
+              <div className="flex items-baseline justify-between gap-2 text-xs">
+                <span className="font-medium">{row.service_name}</span>
+                <span className="text-[10px] text-red-600 dark:text-red-400">
+                  orphan {row.resource_kind}
+                </span>
+              </div>
+              <p className="mt-0.5 truncate font-mono text-[10px] text-muted-foreground">
+                {row.resource_id}
+              </p>
+            </Link>
+          ))}
+          {data.overlay_impact.map((row) => (
+            <Link
+              key={row.id}
+              to={`/network/overlays/${row.id}`}
+              className="block px-4 py-2 transition-colors hover:bg-accent/40"
+            >
+              <div className="flex items-baseline justify-between gap-2 text-xs">
+                <span className="font-medium">{row.name}</span>
+                <span className="text-[10px] text-amber-700 dark:text-amber-400">
+                  impacted
+                </span>
+              </div>
+              <p className="mt-0.5 truncate text-[11px] text-muted-foreground">
+                {row.note}
+              </p>
+            </Link>
+          ))}
+        </DashboardListCard>
+      </div>
+
+      <p className="text-[11px] text-muted-foreground">
+        Refreshes every 60 s. Click any row to deep-link into the canonical
+        admin page for triage.
+      </p>
+    </div>
+  );
+}
+
+function NetworkKpi({
+  label,
+  value,
+  tone,
+  to,
+  hint,
+}: {
+  label: string;
+  value: number | string;
+  tone: Tone;
+  to: string;
+  hint?: string;
+}) {
+  const cls = TONE_CLASS[tone];
+  return (
+    <Link
+      to={to}
+      className="rounded-lg border bg-card p-3 transition-colors hover:bg-accent/40"
+    >
+      <p className="text-[11px] uppercase tracking-wider text-muted-foreground">
+        {label}
+      </p>
+      <p className={cn("mt-1 text-2xl font-bold tabular-nums", cls.value)}>
+        {value}
+      </p>
+      {hint && <p className="text-[11px] text-muted-foreground">{hint}</p>}
+    </Link>
+  );
+}
+
+// ── Integrations dashboard tab (issue #108) ─────────────────────────
+//
+// Per-integration health rollup. Renders one card per *enabled*
+// integration; disabled ones get a one-line placeholder pointing to
+// /settings → integrations. Recent reconciler errors at the bottom
+// pull from the audit log via the same rollup endpoint.
+//
+// Named with the ``DashboardTab`` suffix so it doesn't collide with
+// the existing ``IntegrationsPanel`` component used inside the
+// Overview tab (the legacy one is per-target chips, this one is the
+// rollup-driven tab body).
+function IntegrationsDashboardTabPanel() {
+  const { data, isLoading } = useQuery<IntegrationsDashboardSummary>({
+    queryKey: ["dashboards", "integrations"],
+    queryFn: () => dashboardsApi.integrationsSummary(),
+    refetchInterval: 30_000,
+  });
+
+  if (isLoading || !data) {
+    return (
+      <div className="rounded-lg border bg-card p-8 text-center text-xs text-muted-foreground">
+        Loading integration health…
+      </div>
+    );
+  }
+
+  const enabledPanels = data.panels.filter((p) => p.enabled);
+  if (enabledPanels.length === 0) {
+    return (
+      <div className="rounded-lg border border-dashed p-10 text-center">
+        <Plug className="mx-auto mb-3 h-10 w-10 text-muted-foreground/30" />
+        <p className="text-sm font-medium">No integrations are enabled yet</p>
+        <p className="mt-1 text-xs text-muted-foreground">
+          Head to{" "}
+          <Link
+            to="/settings"
+            className="text-primary underline underline-offset-2"
+          >
+            Settings → Integrations
+          </Link>{" "}
+          to wire up Kubernetes / Docker / Proxmox / Tailscale mirrors.
+        </p>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-5">
+      <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+        {enabledPanels.map((p) => (
+          <IntegrationCard key={p.kind} panel={p} />
+        ))}
+      </div>
+
+      <DashboardListCard
+        title="Recent reconciler errors"
+        emptyHint="No reconciler errors in recent history."
+      >
+        {data.recent_errors.map((e) => (
+          <div key={e.id} className="px-4 py-2 text-xs">
+            <div className="flex items-baseline justify-between gap-2">
+              <span className="font-medium">
+                {e.integration} · {e.target_display || e.target_id}
+              </span>
+              <span className="text-[10px] tabular-nums text-muted-foreground">
+                {humanTime(e.timestamp)}
+              </span>
+            </div>
+            {e.error_detail && (
+              <p className="mt-0.5 truncate font-mono text-[10px] text-red-600 dark:text-red-400">
+                {e.error_detail}
+              </p>
+            )}
+          </div>
+        ))}
+      </DashboardListCard>
+
+      <p className="text-[11px] text-muted-foreground">
+        Refreshes every 30 s. A target is flagged stale when its last sync is
+        older than 2× its configured
+        <code className="mx-1 rounded bg-muted px-1 font-mono text-[10px]">
+          sync_interval_seconds
+        </code>
+        .
+      </p>
+    </div>
+  );
+}
+
+function IntegrationCard({ panel }: { panel: IntegrationsDashboardPanel }) {
+  const tone: Tone =
+    panel.error_count > 0 ? "bad" : panel.stale_count > 0 ? "warn" : "good";
+  const cls = TONE_CLASS[tone];
+  return (
+    <div className="rounded-lg border bg-card p-3">
+      <div className="flex items-center justify-between">
+        <p className="text-sm font-semibold">{panel.label}</p>
+        <span
+          className={cn("inline-block h-1.5 w-1.5 rounded-full", cls.accent)}
+        />
+      </div>
+      <p className={cn("mt-1 text-2xl font-bold tabular-nums", cls.value)}>
+        {panel.target_count}
+      </p>
+      <p className="text-[11px] text-muted-foreground">
+        <span className="text-emerald-600 dark:text-emerald-400">
+          {panel.healthy_count} healthy
+        </span>
+        {panel.stale_count > 0 && (
+          <>
+            {" · "}
+            <span className="text-amber-600 dark:text-amber-400">
+              {panel.stale_count} stale
+            </span>
+          </>
+        )}
+        {panel.error_count > 0 && (
+          <>
+            {" · "}
+            <span className="text-red-600 dark:text-red-400">
+              {panel.error_count} error
+            </span>
+          </>
+        )}
+      </p>
+      {panel.targets.length > 0 && (
+        <ul className="mt-2 space-y-1 text-[11px]">
+          {panel.targets.slice(0, 3).map((t) => (
+            <li
+              key={t.id}
+              className="flex items-baseline justify-between gap-2"
+            >
+              <span className="truncate" title={t.display}>
+                {t.display}
+              </span>
+              <span
+                className={cn(
+                  "shrink-0 tabular-nums",
+                  t.last_sync_error
+                    ? "text-red-600 dark:text-red-400"
+                    : t.is_stale
+                      ? "text-amber-600 dark:text-amber-400"
+                      : "text-muted-foreground",
+                )}
+              >
+                {t.last_synced_at ? humanTime(t.last_synced_at) : "never"}
+              </span>
+            </li>
+          ))}
+          {panel.targets.length > 3 && (
+            <li className="text-[10px] text-muted-foreground">
+              + {panel.targets.length - 3} more
+            </li>
+          )}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+// ── Security dashboard tab (issue #109) ─────────────────────────────
+//
+// MFA coverage / API token expiry / failed-login bursts / recent
+// permission changes. Single rollup endpoint at
+// /dashboards/security/summary to keep the front end down to one
+// query. MFA coverage uses local-auth users only — external-auth
+// users authenticate against the upstream provider.
+function SecurityPanel() {
+  const { data, isLoading } = useQuery<SecurityDashboardSummary>({
+    queryKey: ["dashboards", "security"],
+    queryFn: () => dashboardsApi.securitySummary(),
+    refetchInterval: 60_000,
+  });
+
+  if (isLoading || !data) {
+    return (
+      <div className="rounded-lg border bg-card p-8 text-center text-xs text-muted-foreground">
+        Loading security signals…
+      </div>
+    );
+  }
+
+  const mfaTone: Tone =
+    data.mfa_coverage_pct >= 90
+      ? "good"
+      : data.mfa_coverage_pct >= 50
+        ? "warn"
+        : "bad";
+
+  return (
+    <div className="space-y-5">
+      <div className="grid gap-3 md:grid-cols-2 xl:grid-cols-4">
+        <Link
+          to="/admin/users"
+          className="rounded-lg border bg-card p-3 transition-colors hover:bg-accent/40"
+        >
+          <div className="flex items-center justify-between">
+            <p className="text-[11px] uppercase tracking-wider text-muted-foreground">
+              MFA coverage
+            </p>
+            <Lock className="h-3.5 w-3.5 text-muted-foreground" />
+          </div>
+          <p
+            className={cn(
+              "mt-1 text-2xl font-bold tabular-nums",
+              TONE_CLASS[mfaTone].value,
+            )}
+          >
+            {data.mfa_total_local_users === 0
+              ? "—"
+              : `${data.mfa_coverage_pct.toFixed(0)}%`}
+          </p>
+          <p className="text-[11px] text-muted-foreground">
+            {data.mfa_enrolled_count}/{data.mfa_total_local_users} local users
+          </p>
+        </Link>
+        <Link
+          to="/admin/api-tokens"
+          className="rounded-lg border bg-card p-3 transition-colors hover:bg-accent/40"
+        >
+          <div className="flex items-center justify-between">
+            <p className="text-[11px] uppercase tracking-wider text-muted-foreground">
+              Tokens expiring
+            </p>
+            <KeyRound className="h-3.5 w-3.5 text-muted-foreground" />
+          </div>
+          <p
+            className={cn(
+              "mt-1 text-2xl font-bold tabular-nums",
+              data.api_tokens_expiring_count > 0
+                ? TONE_CLASS.warn.value
+                : TONE_CLASS.good.value,
+            )}
+          >
+            {data.api_tokens_expiring_count}
+          </p>
+          <p className="text-[11px] text-muted-foreground">
+            of {data.api_tokens_total} tokens · within 30 d
+          </p>
+        </Link>
+        <Link
+          to="/admin/audit"
+          className="rounded-lg border bg-card p-3 transition-colors hover:bg-accent/40"
+        >
+          <div className="flex items-center justify-between">
+            <p className="text-[11px] uppercase tracking-wider text-muted-foreground">
+              Failed logins
+            </p>
+            <Ban className="h-3.5 w-3.5 text-muted-foreground" />
+          </div>
+          <p
+            className={cn(
+              "mt-1 text-2xl font-bold tabular-nums",
+              data.failed_login_total > 0
+                ? TONE_CLASS.warn.value
+                : TONE_CLASS.good.value,
+            )}
+          >
+            {data.failed_login_total}
+          </p>
+          <p className="text-[11px] text-muted-foreground">
+            past {data.failed_login_window_hours} h
+          </p>
+        </Link>
+        <Link
+          to="/admin/audit"
+          className="rounded-lg border bg-card p-3 transition-colors hover:bg-accent/40"
+        >
+          <div className="flex items-center justify-between">
+            <p className="text-[11px] uppercase tracking-wider text-muted-foreground">
+              Permission changes
+            </p>
+            <Clock className="h-3.5 w-3.5 text-muted-foreground" />
+          </div>
+          <p className="mt-1 text-2xl font-bold tabular-nums">
+            {data.permission_change_count}
+          </p>
+          <p className="text-[11px] text-muted-foreground">
+            past {data.permission_change_window_days} d
+          </p>
+        </Link>
+      </div>
+
+      <div className="grid gap-5 lg:grid-cols-2">
+        <DashboardListCard
+          title={`Local users without MFA (${data.mfa_unenrolled.length})`}
+          emptyHint="Every local user has TOTP enrolled."
+        >
+          {data.mfa_unenrolled.map((u) => (
+            <Link
+              key={u.id}
+              to="/admin/users"
+              className="block px-4 py-2 transition-colors hover:bg-accent/40"
+            >
+              <div className="flex items-baseline justify-between gap-2 text-xs">
+                <span className="font-medium">{u.display_name}</span>
+                <span className="text-[10px] tabular-nums text-muted-foreground">
+                  {u.last_login_at
+                    ? `last seen ${humanTime(u.last_login_at)}`
+                    : "never logged in"}
+                </span>
+              </div>
+              <p className="mt-0.5 font-mono text-[11px] text-muted-foreground">
+                {u.username}
+              </p>
+            </Link>
+          ))}
+        </DashboardListCard>
+        <DashboardListCard
+          title="API tokens expiring < 30 d"
+          emptyHint="No tokens are expiring in the next 30 days."
+        >
+          {data.api_tokens_expiring.map((t) => (
+            <Link
+              key={t.id}
+              to="/admin/api-tokens"
+              className="block px-4 py-2 transition-colors hover:bg-accent/40"
+            >
+              <div className="flex items-baseline justify-between gap-2 text-xs">
+                <span className="font-medium">{t.name}</span>
+                <span className="text-[10px] tabular-nums text-muted-foreground">
+                  {t.days_remaining != null
+                    ? `${t.days_remaining} d remaining`
+                    : "—"}
+                </span>
+              </div>
+              <p className="mt-0.5 truncate text-[11px] text-muted-foreground">
+                {t.user_display ?? "(no owner)"} ·{" "}
+                {t.scopes.length === 0 ? "all scopes" : t.scopes.join(", ")}
+              </p>
+            </Link>
+          ))}
+        </DashboardListCard>
+        <DashboardListCard
+          title={`Failed logins past ${data.failed_login_window_hours} h`}
+          emptyHint="No failed logins in the last 24 h."
+        >
+          {data.failed_login_top_sources.map((row, i) => (
+            <div
+              key={`${row.user_display_name}-${row.source_ip ?? "na"}-${i}`}
+              className="px-4 py-2 text-xs"
+            >
+              <div className="flex items-baseline justify-between gap-2">
+                <span className="font-medium">{row.user_display_name}</span>
+                <span
+                  className={cn(
+                    "rounded px-1.5 py-0.5 text-[10px] tabular-nums",
+                    row.failure_count >= 5
+                      ? "bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300"
+                      : "bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-300",
+                  )}
+                >
+                  {row.failure_count}× fail
+                </span>
+              </div>
+              <p className="mt-0.5 truncate font-mono text-[10px] text-muted-foreground">
+                {row.source_ip ?? "(unknown source)"} · last{" "}
+                {humanTime(row.latest_at)}
+              </p>
+            </div>
+          ))}
+        </DashboardListCard>
+        <DashboardListCard
+          title={`Permission changes past ${data.permission_change_window_days} d`}
+          emptyHint="No role / group / token / auth-provider changes recorded."
+        >
+          {data.permission_changes.map((row) => (
+            <div key={row.id} className="px-4 py-2 text-xs">
+              <div className="flex items-baseline justify-between gap-2">
+                <span className="font-medium">{row.actor}</span>
+                <span className="text-[10px] tabular-nums text-muted-foreground">
+                  {humanTime(row.timestamp)}
+                </span>
+              </div>
+              <p className="mt-0.5 truncate text-[11px] text-muted-foreground">
+                <span className="font-mono">{row.action}</span>{" "}
+                {row.resource_type}{" "}
+                <span className="font-mono">
+                  {row.resource_display || row.resource_id}
+                </span>
+              </p>
+            </div>
+          ))}
+        </DashboardListCard>
+      </div>
+
+      <p className="text-[11px] text-muted-foreground">
+        MFA coverage is computed against local-auth users only — external-auth
+        users (LDAP / OIDC / SAML) authenticate against the upstream provider.
+        Refreshes every 60 s.
+      </p>
+    </div>
+  );
+}
+
+// ── Shared list-card scaffold for dashboard panels ──────────────────
+function DashboardListCard({
+  title,
+  emptyHint,
+  children,
+}: {
+  title: string;
+  emptyHint: string;
+  children: React.ReactNode;
+}) {
+  const childArray = (Array.isArray(children) ? children : [children]).filter(
+    Boolean,
+  );
+  return (
+    <div className="rounded-lg border bg-card">
+      <div className="flex items-center justify-between border-b px-4 py-2.5">
+        <h3 className="text-xs font-semibold uppercase tracking-wider">
+          {title}
+        </h3>
+      </div>
+      {childArray.length === 0 ? (
+        <div className="px-4 py-6 text-center text-xs text-muted-foreground">
+          {emptyHint}
+        </div>
+      ) : (
+        <ul className="divide-y max-h-96 overflow-auto">
+          {childArray.map((child, i) => (
+            <li key={i}>{child}</li>
+          ))}
+        </ul>
+      )}
     </div>
   );
 }

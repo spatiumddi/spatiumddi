@@ -5236,6 +5236,165 @@ export const conformityApi = {
   },
 };
 
+// ── Dashboard rollups (issues #107 / #108 / #109) ───────────────────────────
+
+// Network dashboard tab (#107)
+export interface NetworkDashboardASNDriftRow {
+  id: string;
+  number: number;
+  name: string | null;
+  holder_org: string | null;
+  previous_holder: string | null;
+}
+export interface NetworkDashboardRpkiRoaRow {
+  id: string;
+  asn_id: string;
+  asn_number: number | null;
+  prefix: string;
+  max_length: number | null;
+  valid_to: string | null;
+  state: string;
+}
+export interface NetworkDashboardCircuitRow {
+  id: string;
+  name: string;
+  status: string;
+  transport: string | null;
+  term_end_date: string | null;
+  customer_id: string | null;
+  provider_id: string | null;
+}
+export interface NetworkDashboardOrphanServiceRow {
+  service_id: string;
+  service_name: string;
+  resource_kind: string;
+  resource_id: string;
+}
+export interface NetworkDashboardOverlayImpactRow {
+  id: string;
+  name: string;
+  site_count: number;
+  note: string;
+}
+export interface NetworkDashboardSummary {
+  generated_at: string;
+  asn_drift_count: number;
+  rpki_expiring_count: number;
+  rpki_expired_count: number;
+  circuit_term_expiring_count: number;
+  circuit_status_changed_count: number;
+  service_orphan_count: number;
+  overlay_impacted_count: number;
+  asn_drift: NetworkDashboardASNDriftRow[];
+  rpki_expiring: NetworkDashboardRpkiRoaRow[];
+  circuit_alerts: NetworkDashboardCircuitRow[];
+  orphan_services: NetworkDashboardOrphanServiceRow[];
+  overlay_impact: NetworkDashboardOverlayImpactRow[];
+}
+
+// Integrations dashboard tab (#108)
+export type IntegrationDashboardKind =
+  | "kubernetes"
+  | "docker"
+  | "proxmox"
+  | "tailscale";
+export interface IntegrationsDashboardTargetRow {
+  id: string;
+  display: string;
+  sync_interval_seconds: number;
+  last_synced_at: string | null;
+  last_sync_error: string | null;
+  is_stale: boolean;
+}
+export interface IntegrationsDashboardPanel {
+  kind: IntegrationDashboardKind;
+  label: string;
+  enabled: boolean;
+  target_count: number;
+  healthy_count: number;
+  stale_count: number;
+  error_count: number;
+  targets: IntegrationsDashboardTargetRow[];
+}
+export interface IntegrationsDashboardErrorRow {
+  id: string;
+  integration: string;
+  target_id: string;
+  target_display: string;
+  error_detail: string | null;
+  timestamp: string;
+}
+export interface IntegrationsDashboardSummary {
+  generated_at: string;
+  panels: IntegrationsDashboardPanel[];
+  recent_errors: IntegrationsDashboardErrorRow[];
+}
+
+// Security dashboard tab (#109)
+export interface SecurityDashboardMFAUserRow {
+  id: string;
+  username: string;
+  display_name: string;
+  last_login_at: string | null;
+  auth_source: string;
+}
+export interface SecurityDashboardAPITokenRow {
+  id: string;
+  name: string;
+  user_id: string | null;
+  user_display: string | null;
+  expires_at: string | null;
+  days_remaining: number | null;
+  scopes: string[];
+}
+export interface SecurityDashboardFailedLoginRow {
+  user_display_name: string;
+  source_ip: string | null;
+  failure_count: number;
+  latest_at: string;
+}
+export interface SecurityDashboardPermissionChangeRow {
+  id: string;
+  timestamp: string;
+  actor: string;
+  action: string;
+  resource_type: string;
+  resource_id: string;
+  resource_display: string;
+  changed_fields: string[] | null;
+}
+export interface SecurityDashboardSummary {
+  generated_at: string;
+  mfa_total_local_users: number;
+  mfa_enrolled_count: number;
+  mfa_coverage_pct: number;
+  mfa_unenrolled: SecurityDashboardMFAUserRow[];
+  api_tokens_total: number;
+  api_tokens_expiring_count: number;
+  api_tokens_expiring: SecurityDashboardAPITokenRow[];
+  failed_login_window_hours: number;
+  failed_login_total: number;
+  failed_login_top_sources: SecurityDashboardFailedLoginRow[];
+  permission_change_window_days: number;
+  permission_change_count: number;
+  permission_changes: SecurityDashboardPermissionChangeRow[];
+}
+
+export const dashboardsApi = {
+  networkSummary: () =>
+    api
+      .get<NetworkDashboardSummary>("/dashboards/network/summary")
+      .then((r) => r.data),
+  integrationsSummary: () =>
+    api
+      .get<IntegrationsDashboardSummary>("/dashboards/integrations/summary")
+      .then((r) => r.data),
+  securitySummary: () =>
+    api
+      .get<SecurityDashboardSummary>("/dashboards/security/summary")
+      .then((r) => r.data),
+};
+
 // ── Domain registration (RDAP / WHOIS tracking) ─────────────────────────────
 
 export type DomainWhoisState =

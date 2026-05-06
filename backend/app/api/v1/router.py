@@ -15,6 +15,7 @@ from app.api.v1.auth_providers.router import router as auth_providers_router
 from app.api.v1.circuits import router as circuits_router
 from app.api.v1.conformity import router as conformity_router
 from app.api.v1.custom_fields.router import router as custom_fields_router
+from app.api.v1.dashboards import router as dashboards_router
 from app.api.v1.dhcp import router as dhcp_router
 from app.api.v1.dns.agents import router as dns_agents_router
 from app.api.v1.dns.blocklist_router import router as dns_blocklist_router
@@ -69,6 +70,7 @@ api_v1_router.include_router(
 api_v1_router.include_router(circuits_router, prefix="/circuits", tags=["circuits"])
 api_v1_router.include_router(conformity_router, prefix="/conformity", tags=["conformity"])
 api_v1_router.include_router(custom_fields_router, prefix="/custom-fields", tags=["custom-fields"])
+api_v1_router.include_router(dashboards_router, prefix="/dashboards", tags=["dashboards"])
 api_v1_router.include_router(customers_router, prefix="/customers", tags=["customers"])
 api_v1_router.include_router(dhcp_router, prefix="/dhcp", tags=["dhcp"])
 api_v1_router.include_router(dns_router, prefix="/dns", tags=["dns"])
