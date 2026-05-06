@@ -98,6 +98,10 @@ class SettingsResponse(BaseModel):
     password_require_symbol: bool = False
     password_history_count: int = 5
     password_max_age_days: int = 0
+    # Account lockout (issue #71). 0 disables.
+    lockout_threshold: int = 0
+    lockout_duration_minutes: int = 15
+    lockout_reset_minutes: int = 15
 
     model_config = {"from_attributes": True}
 
@@ -180,6 +184,24 @@ class SettingsUpdate(BaseModel):
     password_require_symbol: bool | None = None
     password_history_count: int | None = None
     password_max_age_days: int | None = None
+    # Account lockout (issue #71).
+    lockout_threshold: int | None = None
+    lockout_duration_minutes: int | None = None
+    lockout_reset_minutes: int | None = None
+
+    @field_validator("lockout_threshold")
+    @classmethod
+    def validate_lockout_threshold(cls, v: int | None) -> int | None:
+        if v is not None and not (0 <= v <= 100):
+            raise ValueError("Lockout threshold must be 0–100 (0 disables)")
+        return v
+
+    @field_validator("lockout_duration_minutes", "lockout_reset_minutes")
+    @classmethod
+    def validate_lockout_window(cls, v: int | None) -> int | None:
+        if v is not None and not (1 <= v <= 1440):
+            raise ValueError("Lockout window must be 1–1440 minutes")
+        return v
 
     @field_validator("password_min_length")
     @classmethod

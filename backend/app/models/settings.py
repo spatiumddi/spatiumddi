@@ -69,6 +69,23 @@ class PlatformSettings(Base):
         Integer, nullable=False, default=0, server_default=sa_text("0")
     )
 
+    # Account lockout (issue #71). ``lockout_threshold = 0`` disables
+    # the feature; that's the default so an upgrade never locks an
+    # admin out. Threshold counts failed logins inside a rolling
+    # ``lockout_reset_minutes`` window — anything older falls out.
+    # When the threshold is hit, the account is locked for
+    # ``lockout_duration_minutes``; superadmin unlock via /users/<id>/
+    # unlock clears both columns.
+    lockout_threshold: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=sa_text("0")
+    )
+    lockout_duration_minutes: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=15, server_default=sa_text("15")
+    )
+    lockout_reset_minutes: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=15, server_default=sa_text("15")
+    )
+
     # Utilization alert thresholds
     utilization_warn_threshold: Mapped[int] = mapped_column(Integer, nullable=False, default=80)
     utilization_critical_threshold: Mapped[int] = mapped_column(Integer, nullable=False, default=95)

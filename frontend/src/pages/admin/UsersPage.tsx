@@ -7,6 +7,8 @@ import {
   KeyRound,
   ShieldCheck,
   ShieldOff,
+  Lock,
+  LockOpen,
 } from "lucide-react";
 import { usersApi, type AppUser } from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
@@ -458,6 +460,20 @@ export function UsersPage() {
                     >
                       {user.is_active ? "active" : "disabled"}
                     </span>
+                    {user.locked && (
+                      <span
+                        className="ml-2 inline-flex items-center gap-1 rounded-full bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-800 dark:bg-amber-900/30 dark:text-amber-300"
+                        title={
+                          user.failed_login_locked_until
+                            ? `Locked until ${new Date(
+                                user.failed_login_locked_until,
+                              ).toLocaleString()}`
+                            : "Locked"
+                        }
+                      >
+                        <Lock className="h-3 w-3" /> locked
+                      </span>
+                    )}
                   </td>
                   <td className="px-4 py-3 text-xs text-muted-foreground">
                     {user.last_login_at ? (
@@ -482,6 +498,7 @@ export function UsersPage() {
                       >
                         <KeyRound className="h-3.5 w-3.5" />
                       </button>
+                      {user.locked && <UnlockButton userId={user.id} />}
                       <button
                         onClick={() => setDeleteUser(user)}
                         className="rounded p-1 text-muted-foreground hover:text-destructive"
@@ -515,5 +532,23 @@ export function UsersPage() {
         />
       )}
     </div>
+  );
+}
+
+function UnlockButton({ userId }: { userId: string }) {
+  const qc = useQueryClient();
+  const m = useMutation({
+    mutationFn: () => usersApi.unlock(userId),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["users"] }),
+  });
+  return (
+    <button
+      onClick={() => m.mutate()}
+      disabled={m.isPending}
+      className="rounded p-1 text-amber-600 hover:text-amber-700 disabled:opacity-50 dark:text-amber-400"
+      title="Clear lockout"
+    >
+      <LockOpen className="h-3.5 w-3.5" />
+    </button>
   );
 }

@@ -53,6 +53,12 @@ from app.models.audit import AuditLog
 from app.models.auth import User, UserSession
 from app.models.auth_provider import PASSWORD_PROVIDER_TYPES, AuthProvider
 from app.models.settings import PlatformSettings
+from app.services.account_lockout import (
+    LockoutPolicy,
+    is_locked,
+    register_failure,
+    register_success,
+)
 from app.services.mfa import (
     consume_recovery_code,
     decrypt_secret,
@@ -171,6 +177,9 @@ def _client_ip(request: Request) -> str | None:
 
 async def _issue_tokens(db: DB, request: Request, user: User, auth_source: str) -> TokenResponse:
     """Issue access + refresh tokens, create session, write success audit."""
+    # Reset lockout state on every successful login (issue #71). No-op
+    # for users who weren't accumulating failures.
+    register_success(user)
     access_token = create_access_token(str(user.id))
     raw_refresh, refresh_hash = create_refresh_token(str(user.id))
 
@@ -223,6 +232,30 @@ async def _audit_login_failure(
     auth_source: str = "local",
     user: User | None = None,
 ) -> None:
+    """Persist a login-failure audit row and, when the failure was
+    against a known local user, bump the lockout counter (issue #71).
+
+    The lockout side-effect runs only for ``auth_source == 'local'``
+    + bad-credential reasons — locking against ``account_locked`` /
+    ``account_disabled`` failures would just keep extending the lock
+    while the attacker pokes a locked account, and external-IdP
+    failures don't have a SpatiumDDI-side counter to bump.
+    """
+    just_locked = False
+    if (
+        user is not None
+        and user.auth_source == "local"
+        and reason
+        in {
+            "bad_password",
+            "mfa_code_invalid",
+            "mfa_challenge_invalid",
+        }
+    ):
+        settings_row = await db.get(PlatformSettings, 1)
+        policy = LockoutPolicy.from_row(settings_row)
+        just_locked = register_failure(user, policy)
+
     db.add(
         AuditLog(
             user_id=user.id if user else None,
@@ -238,6 +271,32 @@ async def _audit_login_failure(
             new_value={"reason": reason},
         )
     )
+    if just_locked and user is not None:
+        # Distinct audit row so an admin walking the log can tell
+        # "5th failure" from "automatically locked because of those
+        # 5 failures" without correlating timestamps by hand.
+        db.add(
+            AuditLog(
+                user_id=user.id,
+                user_display_name=user.display_name,
+                auth_source=auth_source,
+                source_ip=_client_ip(request),
+                user_agent=request.headers.get("user-agent"),
+                action="account.locked",
+                resource_type="user",
+                resource_id=str(user.id),
+                resource_display=user.username,
+                result="success",
+                new_value={
+                    "locked_until": (
+                        user.failed_login_locked_until.isoformat()
+                        if user.failed_login_locked_until
+                        else None
+                    ),
+                    "failed_count": user.failed_login_count,
+                },
+            )
+        )
     await db.commit()
     logger.warning(
         "login_failed",
@@ -245,6 +304,7 @@ async def _audit_login_failure(
         reason=reason,
         auth_source=auth_source,
         source_ip=_client_ip(request),
+        just_locked=just_locked,
     )
 
 
@@ -373,6 +433,19 @@ async def login(body: LoginRequest, request: Request, db: DB) -> LoginResponse:
 
     # ── Local-first ─────────────────────────────────────────────────────────
     if user is not None and user.auth_source == "local":
+        # Lockout short-circuit (issue #71). Runs BEFORE the password
+        # check so an attacker who hits a locked account doesn't get to
+        # learn whether the supplied password would have worked. Audit
+        # row records ``account_locked`` so an admin walking the log
+        # can tell brute-force attempts apart from real failed logins.
+        if is_locked(user):
+            await _audit_login_failure(
+                db, request, body.username, reason="account_locked", user=user
+            )
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Account is temporarily locked due to repeated failed logins.",
+            )
         if not user.hashed_password or not verify_password(body.password, user.hashed_password):
             await _audit_login_failure(db, request, body.username, reason="bad_password", user=user)
             raise HTTPException(

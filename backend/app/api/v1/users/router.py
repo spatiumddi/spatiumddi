@@ -6,13 +6,19 @@ from datetime import UTC, datetime
 import bcrypt
 import structlog
 from fastapi import APIRouter, HTTPException, status
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, model_validator
 from sqlalchemy import select
 
 from app.api.deps import DB, SuperAdmin
 from app.models.audit import AuditLog
 from app.models.auth import User
 from app.models.settings import PlatformSettings
+from app.services.account_lockout import (
+    is_locked as is_user_locked,
+)
+from app.services.account_lockout import (
+    unlock as unlock_user,
+)
 from app.services.password_policy import (
     PasswordPolicy,
     push_history,
@@ -38,6 +44,13 @@ class UserResponse(BaseModel):
     force_password_change: bool
     auth_source: str
     last_login_at: str | None = None
+    # Lockout state (issue #71). ``locked`` mirrors the live time
+    # check so the UI doesn't have to compare timestamps in JS;
+    # ``failed_login_count`` + ``failed_login_locked_until`` are
+    # surfaced for triage / admin display.
+    failed_login_count: int = 0
+    failed_login_locked_until: str | None = None
+    locked: bool = False
 
     model_config = {"from_attributes": True}
 
@@ -46,10 +59,24 @@ class UserResponse(BaseModel):
     def coerce_id(cls, v: object) -> str:
         return str(v)
 
-    @field_validator("last_login_at", mode="before")
+    @field_validator("last_login_at", "failed_login_locked_until", mode="before")
     @classmethod
     def coerce_dt(cls, v: object) -> str | None:
         return v.isoformat() if v is not None else None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _compute_locked(cls, data: object) -> object:
+        # Fold the ORM ``User`` into a dict so we can attach the
+        # computed ``locked`` flag without needing a relationship-side
+        # property. Mirrors ``account_lockout.is_locked``.
+        if isinstance(data, User):
+            cols: dict[str, object] = {
+                c.name: getattr(data, c.name) for c in data.__table__.columns
+            }
+            cols["locked"] = is_user_locked(data)
+            return cols
+        return data
 
 
 class CreateUserRequest(BaseModel):
@@ -235,6 +262,36 @@ async def reset_password(
     )
     await db.commit()
     logger.info("password_reset", target=user.username, by=current_user.username)
+
+
+@router.post("/{user_id}/unlock", status_code=status.HTTP_204_NO_CONTENT)
+async def unlock_account(
+    user_id: uuid.UUID,
+    current_user: SuperAdmin,
+    db: DB,
+) -> None:
+    """Clear an account's failed-login counter + locked-until (issue
+    #71). Idempotent: if the user wasn't locked, returns 204 without
+    writing an audit row."""
+    user = await db.get(User, user_id)
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+    changed = unlock_user(user)
+    if changed:
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                user_display_name=current_user.display_name,
+                auth_source=current_user.auth_source,
+                action="account.unlocked",
+                resource_type="user",
+                resource_id=str(user.id),
+                resource_display=user.username,
+                result="success",
+            )
+        )
+    await db.commit()
+    logger.info("account_unlocked", target=user.username, by=current_user.username)
 
 
 @router.delete("/{user_id}", status_code=status.HTTP_204_NO_CONTENT)

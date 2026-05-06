@@ -6,9 +6,13 @@ from sqlalchemy import (
     Column,
     DateTime,
     ForeignKey,
+    Integer,
     LargeBinary,
     String,
     Table,
+)
+from sqlalchemy import (
+    text as sa_text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -83,6 +87,22 @@ class User(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         DateTime(timezone=True), nullable=True
     )
     password_history_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+
+    # Account lockout (issue #71). ``failed_login_count`` is reset on
+    # any successful login or by an admin via /unlock. While
+    # ``failed_login_locked_until`` is set in the future the login
+    # handler short-circuits with 403 before checking the password.
+    # ``last_failed_login_at`` drives the windowed reset — see
+    # ``app.services.account_lockout``.
+    failed_login_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=sa_text("0")
+    )
+    failed_login_locked_until: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    last_failed_login_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     # lazy="selectin" so `user.groups` is always populated when the User is
     # fetched via `db.get(User, ...)` in `get_current_user`. The permissions

@@ -1815,6 +1815,13 @@ export interface AppUser {
   force_password_change: boolean;
   auth_source: string;
   last_login_at: string | null;
+  /** Lockout state (issue #71). ``locked`` is the live time check;
+   *  ``failed_login_locked_until`` is the wall-clock target so the UI
+   *  can render a relative "unlocks in 12 m" hint without recomputing
+   *  the rule. */
+  failed_login_count?: number;
+  failed_login_locked_until?: string | null;
+  locked?: boolean;
 }
 
 export const usersApi = {
@@ -1843,6 +1850,8 @@ export const usersApi = {
   ) => api.put<AppUser>(`/users/${id}`, data).then((r) => r.data),
   resetPassword: (id: string, newPassword: string) =>
     api.post(`/users/${id}/reset-password`, { new_password: newPassword }),
+  /** Clear lockout state on a user account (issue #71). */
+  unlock: (id: string) => api.post(`/users/${id}/unlock`),
   delete: (id: string) => api.delete(`/users/${id}`),
 };
 
@@ -2003,6 +2012,10 @@ export interface PlatformSettings {
   password_require_symbol: boolean;
   password_history_count: number;
   password_max_age_days: number;
+  /** Account lockout (issue #71). 0 disables. */
+  lockout_threshold: number;
+  lockout_duration_minutes: number;
+  lockout_reset_minutes: number;
 }
 
 export interface PasswordPolicy {

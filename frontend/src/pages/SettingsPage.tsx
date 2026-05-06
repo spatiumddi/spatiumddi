@@ -95,6 +95,7 @@ type SectionId =
   | "network-vrf"
   | "ai-digest"
   | "password-policy"
+  | "account-lockout"
   | "session"
   | "subnet-tree"
   | "updates"
@@ -191,6 +192,11 @@ const SECTION_FIELDS: Record<SectionId, (keyof PlatformSettings)[]> = {
     "password_require_symbol",
     "password_history_count",
     "password_max_age_days",
+  ],
+  "account-lockout": [
+    "lockout_threshold",
+    "lockout_duration_minutes",
+    "lockout_reset_minutes",
   ],
   session: ["session_timeout_minutes", "auto_logout_minutes"],
   "subnet-tree": ["subnet_tree_default_expanded_depth"],
@@ -696,6 +702,27 @@ const SECTIONS: SectionDef[] = [
       "lowercase",
       "digit",
       "symbol",
+      "pci",
+      "hipaa",
+      "soc2",
+    ],
+  },
+  {
+    id: "account-lockout",
+    title: "Account Lockout",
+    group: "Security",
+    description:
+      "Block local-auth login after N failed attempts inside a rolling window. Threshold of 0 disables. External-IdP users are unaffected — they're locked at the upstream provider, not here.",
+    keywords: [
+      "lockout",
+      "lock",
+      "brute",
+      "force",
+      "fail",
+      "attempt",
+      "rate",
+      "limit",
+      "throttle",
       "pci",
       "hipaa",
       "soc2",
@@ -1846,6 +1873,70 @@ export function SettingsPage() {
                       className={cn(inputCls, "w-24")}
                     />
                     <span className="text-xs text-muted-foreground">days</span>
+                  </div>
+                </Field>
+              </>
+            )}
+
+            {activeId === "account-lockout" && (
+              <>
+                <Field
+                  label="Failure threshold"
+                  description="Number of bad-password attempts inside the rolling window that triggers lockout. 0 disables the feature entirely."
+                >
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="number"
+                      min={0}
+                      max={100}
+                      value={values.lockout_threshold ?? 0}
+                      onChange={(e) =>
+                        set("lockout_threshold", Number(e.target.value))
+                      }
+                      disabled={!isSuperadmin}
+                      className={cn(inputCls, "w-24")}
+                    />
+                    <span className="text-xs text-muted-foreground">
+                      attempts
+                    </span>
+                  </div>
+                </Field>
+                <Field
+                  label="Lockout duration"
+                  description="How long the account stays locked once the threshold is hit. A superadmin can clear the lock manually from the Users page."
+                >
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="number"
+                      min={1}
+                      max={1440}
+                      value={values.lockout_duration_minutes ?? 15}
+                      onChange={(e) =>
+                        set("lockout_duration_minutes", Number(e.target.value))
+                      }
+                      disabled={!isSuperadmin}
+                      className={cn(inputCls, "w-24")}
+                    />
+                    <span className="text-xs text-muted-foreground">min</span>
+                  </div>
+                </Field>
+                <Field
+                  label="Failure reset window"
+                  description="Failures older than this many minutes are forgiven before the next attempt. So a 5-failure threshold with a 15 min window doesn't lock anyone out for one fail every hour."
+                >
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="number"
+                      min={1}
+                      max={1440}
+                      value={values.lockout_reset_minutes ?? 15}
+                      onChange={(e) =>
+                        set("lockout_reset_minutes", Number(e.target.value))
+                      }
+                      disabled={!isSuperadmin}
+                      className={cn(inputCls, "w-24")}
+                    />
+                    <span className="text-xs text-muted-foreground">min</span>
                   </div>
                 </Field>
               </>
