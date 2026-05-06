@@ -9,6 +9,7 @@ side-effect imports below register every read-only tool.
 # Side-effect imports — each module's @register_tool decorators run on
 # import and populate ``REGISTRY``.
 from app.services.ai.tools import (  # noqa: F401, E402
+    admin,
     dhcp,
     dns,
     ipam,
@@ -16,6 +17,7 @@ from app.services.ai.tools import (  # noqa: F401, E402
     network_modeling,
     nmap,
     ops,
+    ownership,
     proposals,
     vendor,
     whois,

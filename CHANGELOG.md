@@ -22,7 +22,145 @@ the formatter handles the rest.
 
 ## Unreleased
 
-_(no entries yet — next release will add changes that land after `2026.05.05-2`)_
+The **operator-toggleable platform** wave so far. Three batches
+landed: feature-module toggles + Settings → Features page that
+let admins hide whole sidebar / REST / MCP surfaces (Network
+ownership entities, AI Copilot, Conformity, Tools, plus the four
+integrations); a Tool Catalog rewrite that mirrors the Features
+page layout (3-col adaptive grid + pill toggle + auto-save on
+flip); and the Operator Copilot's Tier 2 tool wave from issue
+\#101 — six new read tools surfacing customers / sites /
+providers / users / groups / roles, plus a `get_customer_summary`
+roll-up that counts every owned resource type for one customer.
+Plus release-note formatting got a complete rework: the GitHub
+release body now reads as flowing prose with emoji section
+headings instead of a wall of forced `<br>`s, applied to the
+last three releases retroactively.
+
+### Added
+
+- **Operator feature toggles + Settings → Features page.** New
+  `feature_module` table seeded from a 17-entry catalog covering
+  Network (customer / provider / site / service / asn / circuit /
+  device / overlay / vlan / vrf), AI (copilot), Compliance
+  (conformity), Tools (nmap), and Integrations (kubernetes /
+  docker / proxmox / tailscale). Network / AI / Compliance / Tools
+  default-on for discovery; Integrations default-off (each one
+  needs operator-supplied credentials anyway). New
+  `require_module(...)` FastAPI dependency 404s when a module is
+  disabled, applied to every togglable router. The AI tool
+  registry gains a `module` attribute and `effective_tool_names`
+  strips disabled-module tools regardless of catalog overrides —
+  disabling `network.customer` removes the customer find / count
+  tools end-to-end. Toggle endpoint mirrors integration toggles
+  into the existing `PlatformSettings.integration_*_enabled`
+  columns in the same transaction so reconciler tasks
+  (`kubernetes_sync` / `docker_sync` / `proxmox_sync` /
+  `tailscale_sync`) keep gating on the settings column without
+  migration churn. Migration `d8b5e4a91f27` backfills the
+  feature_module rows from existing settings so on-toggles stay on
+  across the upgrade. Settings → Features page lays out modules
+  in a 3-column adaptive grid (wide groups full-width, narrow
+  groups cluster three-up so AI / Compliance / Tools sit
+  side-by-side), tab split between "Features" and "Integrations",
+  pill toggle that auto-saves on flip. Integration toggles moved
+  out of Settings → Integrations in the same wave — single home
+  for the on/off switch is now Features → Integrations. CLAUDE.md
+  Non-Negotiable \#14 documents the five-step checklist for
+  adding new togglable feature modules in future PRs.
+- **AI Tool Catalog page rewrite — auto-save + matching layout.**
+  Same 3-column adaptive grid as Features, same shared
+  `Toggle` pill, every flip fires `PUT /ai/tools/catalog` with
+  the recomputed enabled list — no more batch Save button. React
+  Query optimistic update via `setQueryData` so the toggle moves
+  instantly; reverts on error, refetches on settle. Per-category
+  "Enable all" / "Disable all" link in the section header still
+  fires a single batch PUT for bulk operations. "Reset to
+  defaults" sends NULL to revert to registry per-tool defaults.
+  Search filter + "registry defaults" badge preserved.
+- **Operator Copilot — Tier 2 tool wave (issue \#101).** Six new
+  read-only tools register on import via two new modules. New
+  `tools/ownership.py`: `list_customers` (filterable by status /
+  contact substring), `get_customer_summary` (deep roll-up
+  counting subnets / blocks / spaces / circuits / services / ASNs
+  / DNS zones / domains / overlays for one customer; accepts UUID
+  or exact name), `list_sites` (kind + region filters, surfaces
+  parent-site nesting), `list_providers` (kind + contact filters,
+  surfaces default-ASN linkage). New `tools/admin.py`: `list_users`
+  (auth source + active flag + superadmin filter, returns groups
+  / MFA / lockout state), `list_groups` (role assignments +
+  member counts + has-role filter), `list_roles` (built-in vs
+  custom filter, returns the full permission grants JSON +
+  groups holding the role). All three admin tools are
+  superadmin-gated inline — non-superadmin callers get a clear
+  "ask your platform admin" error rather than silent empty
+  results. Ownership tools tagged with the matching feature_module
+  (`network.customer` / `network.site` / `network.provider`) so
+  disabling a module removes the corresponding tools from the AI
+  surface in lock-step with the sidebar. Operators who pinned an
+  explicit `platform_override` won't auto-get the new tools — by
+  design; they'll appear as disabled rows in the Tool Catalog
+  page so the operator can opt in. Total tool count: 47 → 53.
+- **Release-note formatting — flowing prose + emoji section
+  headings.** New `scripts/format_release_notes.py` runs between
+  the changelog awk-extract and the GitHub release body in
+  `.github/workflows/release.yml`. The transformer joins
+  consecutive prose lines into single-line paragraphs (so GFM's
+  `breaks: true` mode renders them as one paragraph instead of
+  forced `<br>`s), preserves blank-line paragraph breaks + fenced
+  code blocks + bullet lists, and emoji-prefixes the
+  Keep-a-Changelog headings — `🚀 Highlights` (the top summary),
+  `✨ Added`, `🔧 Changed`, `🐛 Fixed`, `🔒 Security`,
+  `🗃️ Migrations`, `⚠️ Deprecated`, `💥 Breaking`. Soft-hyphen
+  edge case handled (`per-\nframework` joins to `per-framework`,
+  not `per- framework`). Idempotent — safe to re-run on
+  already-transformed input. Backfilled the last three releases
+  on GitHub (`2026.05.05-2`, `2026.05.05-1`, `2026.05.03-1`) via
+  `gh release edit` so they pick up the new format immediately.
+  CHANGELOG.md keeps its terminal-friendly hard-wrap; the
+  formatter handles release-time cleanup.
+- **Shared `Toggle` pill component.** Extracted from
+  `SettingsPage.tsx` into `components/ui/toggle.tsx` so the
+  Settings page, Features page, and Tool Catalog page all use
+  the same on/off pill with identical look + hit area.
+- **CLAUDE.md — Non-Negotiable \#13 (MCP coverage) + \#14 (feature
+  module gating).** Two new project-wide rules: when adding a new
+  resource / feature with REST endpoints, also expose matching
+  MCP tools (with an explicit per-tool default-enabled decision);
+  when adding a new top-level resource family, evaluate whether
+  it should be a togglable feature module and follow the
+  five-step checklist (catalog entry, seed migration, route gate,
+  MCP module attribute, sidebar nav module tag).
+
+### Changed
+
+- **Sidebar integration visibility moved to feature_module.** The
+  sidebar now reads `useFeatureModules().enabled("integrations.*")`
+  instead of `platformSettings.integration_*_enabled`. Behaviour
+  is identical (the toggle endpoint mirrors both columns) — but
+  the source of truth is the new feature_module catalog so future
+  toggles stay consistent.
+
+### Migrations
+
+- `c4f7a1d3e589_feature_module_table.py` — new `feature_module`
+  table seeded with 13 togglable ids (network.\* / ai.copilot /
+  compliance.conformity / tools.nmap).
+- `d8b5e4a91f27_integration_feature_modules.py` — adds the four
+  `integrations.*` rows + backfills `enabled` from existing
+  `PlatformSettings.integration_*_enabled` so existing on-toggles
+  stay on.
+
+### Fixed
+
+- **CodeQL alert \#25 — explicit TLS minimum version on the
+  copilot's `tls_cert_check` tool.** `_fetch_cert_sync` in
+  `app/services/ai/tools/ops.py` now sets
+  `ctx.minimum_version = ssl.TLSVersion.TLSv1_2` explicitly so
+  TLSv1.0 / 1.1 servers fail handshake with a clear error and
+  the contract is obvious to readers (modern OpenSSL already
+  disables them by default — explicit beats implicit, and CodeQL
+  no longer flags the call site).
 
 ---
 
