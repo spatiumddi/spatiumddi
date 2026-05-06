@@ -30,6 +30,7 @@ celery_app = Celery(
         "app.tasks.docker_sync",
         "app.tasks.proxmox_sync",
         "app.tasks.tailscale_sync",
+        "app.tasks.unifi_sync",
         "app.tasks.snmp_poll",
         "app.tasks.nmap",
         "app.tasks.dns_pool_healthcheck",
@@ -80,6 +81,7 @@ celery_app.conf.update(
         "app.tasks.docker_sync.*": {"queue": "default"},
         "app.tasks.proxmox_sync.*": {"queue": "default"},
         "app.tasks.tailscale_sync.*": {"queue": "default"},
+        "app.tasks.unifi_sync.*": {"queue": "default"},
         "app.tasks.snmp_poll.*": {"queue": "default"},
         "app.tasks.nmap.*": {"queue": "default"},
         "app.tasks.dns_pool_healthcheck.*": {"queue": "dns"},
@@ -258,6 +260,13 @@ celery_app.conf.update(
         # Gated overall by ``PlatformSettings.integration_tailscale_enabled``.
         "tailscale-sync-sweep": {
             "task": "app.tasks.tailscale_sync.sweep_tailscale_tenants",
+            "schedule": schedule(run_every=30.0),
+        },
+        # UniFi — same 30 s beat, per-controller interval gate.
+        # Gated overall by ``PlatformSettings.integration_unifi_enabled``.
+        # Cloud-mode controllers floor at 60 s inside the task.
+        "unifi-sync-sweep": {
+            "task": "app.tasks.unifi_sync.sweep_unifi_controllers",
             "schedule": schedule(run_every=30.0),
         },
         # Every 60 s, fan-out SNMP polls to network devices whose

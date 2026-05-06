@@ -179,6 +179,13 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         description="Read-only mirror of tailnet devices into IPAM. Connect tenants from the Tailscale page once enabled.",
         default_enabled=False,
     ),
+    ModuleSpec(
+        id="integrations.unifi",
+        label="UniFi",
+        group="Integrations",
+        description="Read-only mirror of UniFi networks + clients into IPAM. Supports local + cloud-hosted controllers; connect controllers from the UniFi page once enabled.",
+        default_enabled=False,
+    ),
 )
 
 # Map a feature_module id to the ``PlatformSettings`` column whose
@@ -191,6 +198,7 @@ INTEGRATION_SETTINGS_MIRROR: Final[dict[str, str]] = {
     "integrations.docker": "integration_docker_enabled",
     "integrations.proxmox": "integration_proxmox_enabled",
     "integrations.tailscale": "integration_tailscale_enabled",
+    "integrations.unifi": "integration_unifi_enabled",
 }
 
 MODULES_BY_ID: Final[dict[str, ModuleSpec]] = {m.id: m for m in MODULES}

@@ -32,6 +32,7 @@ from app.models.docker import DockerHost
 from app.models.kubernetes import KubernetesCluster
 from app.models.proxmox import ProxmoxNode
 from app.models.tailscale import TailscaleTenant
+from app.models.unifi import UnifiController
 from app.services.ai.tools.base import register_tool
 
 
@@ -296,3 +297,80 @@ async def list_tailscale_targets(
             }
         )
     return out
+
+
+# ── list_unifi_targets ────────────────────────────────────────────────
+
+
+class ListUnifiTargetsArgs(BaseModel):
+    search: str | None = _common_target_args()["search"]
+    enabled: bool | None = _common_target_args()["enabled"]
+    limit: int = _common_target_args()["limit"]
+
+
+@register_tool(
+    name="list_unifi_targets",
+    module="integrations.unifi",
+    description=(
+        "List configured UniFi controllers that SpatiumDDI mirrors "
+        "into IPAM. Each row carries id, name, description, mode "
+        "(local|cloud), host, cloud_host_id, enabled, ipam_space_id, "
+        "dns_group_id, mirror flags (mirror_networks / mirror_clients "
+        "/ mirror_fixed_ips), site_allowlist, sync_interval_seconds, "
+        "last_synced_at, last_sync_error, controller_version, "
+        "site_count, network_count, client_count. Use for 'which "
+        "UniFi controllers are connected?', 'is the cloud controller "
+        "syncing?', or 'how many networks does the home controller "
+        "expose?'. Credentials never appear."
+    ),
+    args_model=ListUnifiTargetsArgs,
+    category="integrations",
+)
+async def list_unifi_targets(
+    db: AsyncSession, user: User, args: ListUnifiTargetsArgs
+) -> list[dict[str, Any]]:
+    stmt = select(UnifiController)
+    if args.search:
+        like = f"%{args.search.lower()}%"
+        cols = [
+            func.lower(UnifiController.name).like(like),
+            func.lower(UnifiController.description).like(like),
+        ]
+        # ``host`` is nullable for cloud-mode rows; lowercase NULL is
+        # NULL, so the LIKE just doesn't match — no need to special-case.
+        cols.append(func.lower(func.coalesce(UnifiController.host, "")).like(like))
+        cols.append(func.lower(func.coalesce(UnifiController.cloud_host_id, "")).like(like))
+        stmt = stmt.where(or_(*cols))
+    if args.enabled is not None:
+        stmt = stmt.where(UnifiController.enabled.is_(args.enabled))
+    stmt = stmt.order_by(UnifiController.name.asc()).limit(args.limit)
+    rows = (await db.execute(stmt)).scalars().all()
+    return [
+        {
+            "id": str(r.id),
+            "name": r.name,
+            "description": r.description,
+            "mode": r.mode,
+            "host": r.host,
+            "cloud_host_id": r.cloud_host_id,
+            "port": r.port,
+            "enabled": r.enabled,
+            "ipam_space_id": str(r.ipam_space_id),
+            "dns_group_id": str(r.dns_group_id) if r.dns_group_id else None,
+            "mirror_networks": r.mirror_networks,
+            "mirror_clients": r.mirror_clients,
+            "mirror_fixed_ips": r.mirror_fixed_ips,
+            "site_allowlist": list(r.site_allowlist or []),
+            "include_wired": r.include_wired,
+            "include_wireless": r.include_wireless,
+            "include_vpn": r.include_vpn,
+            "sync_interval_seconds": r.sync_interval_seconds,
+            "last_synced_at": r.last_synced_at.isoformat() if r.last_synced_at else None,
+            "last_sync_error": r.last_sync_error,
+            "controller_version": r.controller_version,
+            "site_count": r.site_count,
+            "network_count": r.network_count,
+            "client_count": r.client_count,
+        }
+        for r in rows
+    ]

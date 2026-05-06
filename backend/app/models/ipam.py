@@ -241,6 +241,15 @@ class IPBlock(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
         nullable=True,
         index=True,
     )
+    # Set by the UniFi reconciler for wrapper blocks it creates when
+    # no operator block encloses a UniFi network's CIDR. Cascades on
+    # controller delete.
+    unifi_controller_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("unifi_controller.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
 
     # DNS assignment (propagates to child blocks and subnets unless overridden)
     dns_group_ids: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
@@ -567,6 +576,16 @@ class Subnet(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
         nullable=True,
         index=True,
     )
+    # UniFi integration provenance — networks pulled via the legacy
+    # ``rest/networkconf`` endpoint. UniFi networks are real LAN CIDRs
+    # with gateway + broadcast, so normal placeholder rows apply
+    # (same as Docker / Proxmox). Cascades on controller delete.
+    unifi_controller_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("unifi_controller.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
 
     # Computed / cached. ``total_ips`` is BigInteger because IPv6 subnets can
     # be as large as 2^64 addresses (a /64 — the standard LAN size) which
@@ -735,6 +754,14 @@ class IPAddress(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     tailscale_tenant_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("tailscale_tenant.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+    # UniFi provenance — set on rows mirrored from a UniFi client
+    # (active or fixed-IP reservation). Cascades on controller delete.
+    unifi_controller_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("unifi_controller.id", ondelete="CASCADE"),
         nullable=True,
         index=True,
     )

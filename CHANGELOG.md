@@ -39,6 +39,41 @@ last three releases retroactively.
 
 ### Added
 
+- **UniFi Network integration — Phase 1.** Issue #30. Read-only
+  mirror of UniFi networks + active clients into IPAM. Per
+  controller `unifi_controller` row, dual-transport (local +
+  cloud connector via api.ui.com), dual-API (public Integration
+  v1 surface for site enumeration + version probe; legacy
+  controller API for the actual rich data — `rest/networkconf`,
+  `stat/sta`, `rest/user` — which is the only place UniFi
+  exposes MAC, hostname, network_id, oui, fixed_ip, and CIDR
+  fields). Single `UnifiClient` parameterised by mode; cloud
+  mode prepends the `connector/consoles/<host_id>` segment.
+  Auth flavours: `api_key` (modern UniFi OS, required for
+  cloud) or `user_password` (legacy local-only via cookie +
+  CSRF login). Networks land as Subnets with gateway from
+  `ip_subnet`, VLAN tag preserved; clients land as IPAddress
+  rows keyed on MAC with hostname / OUI / `is_wired` carried
+  through. DHCP fixed-IP reservations from `rest/user` mirror
+  as `status="reserved"` so the UI surfaces them as static.
+  `mirror_networks` / `mirror_clients` / `mirror_fixed_ips`
+  per-row toggles, `site_allowlist` (empty = all sites),
+  `network_allowlist` per-site VLAN filter, `include_wired` /
+  `include_wireless` / `include_vpn` (default false) for the
+  client mirror. Same Celery beat shape as the other
+  integrations — 30 s tick, per-row interval gate, 60 s floor
+  in cloud mode (api.ui.com rate-limits). Sidebar entry,
+  admin CRUD page with mode-aware form (host vs. cloud_host_id),
+  per-row test-connection probe, MCP `list_unifi_targets` tool,
+  feature module `integrations.unifi` (default off — operator
+  must opt in via Settings → Features → Integrations).
+  Migration `b2c84f7a91d3` adds `unifi_controller` table +
+  `unifi_controller_id` cascade FK on `subnet` / `ip_block` /
+  `ip_address` and seeds the feature_module row. Phase 2 (DHCP
+  reservation surfacing in the controller detail view + WiFi
+  broadcast roster) and Phase 3 (write surface — propose-only
+  subnet/VLAN renames pushed back via the integration API) are
+  deferred per the issue's phasing.
 - **Operator feature toggles + Settings → Features page.** New
   `feature_module` table seeded from a 17-entry catalog covering
   Network (customer / provider / site / service / asn / circuit /
@@ -221,6 +256,11 @@ last three releases retroactively.
   `integrations.*` rows + backfills `enabled` from existing
   `PlatformSettings.integration_*_enabled` so existing on-toggles
   stay on.
+- `b2c84f7a91d3_unifi_integration.py` — new `unifi_controller`
+  table; `unifi_controller_id` cascade FK on `subnet` /
+  `ip_block` / `ip_address`; `integration_unifi_enabled` column
+  on `platform_settings`; seeds the `integrations.unifi`
+  feature_module row at `enabled=False`.
 
 ### Fixed
 

@@ -6203,6 +6203,165 @@ export const proxmoxApi = {
       .then((r) => r.data),
 };
 
+// ── UniFi integration (issue #30) ─────────────────────────────────
+
+export interface UnifiDiscoverySummary {
+  site_total: number;
+  network_total: number;
+  network_mirrored: number;
+  client_total: number;
+  client_mirrored: number;
+  addresses_skipped_no_subnet: number;
+}
+
+export interface UnifiDiscoverySite {
+  name: string;
+  desc: string;
+  networks: number;
+  mirrored: number;
+  clients: number;
+  clients_mirrored: number;
+}
+
+export interface UnifiDiscovery {
+  summary: UnifiDiscoverySummary;
+  sites: UnifiDiscoverySite[];
+  generated_at: string;
+}
+
+export interface UnifiController {
+  id: string;
+  name: string;
+  description: string;
+  enabled: boolean;
+  mode: "local" | "cloud";
+  host: string | null;
+  port: number;
+  cloud_host_id: string | null;
+  verify_tls: boolean;
+  ca_bundle_present: boolean;
+  auth_kind: "api_key" | "user_password";
+  api_key_present: boolean;
+  username_present: boolean;
+  password_present: boolean;
+  ipam_space_id: string;
+  dns_group_id: string | null;
+  mirror_networks: boolean;
+  mirror_clients: boolean;
+  mirror_fixed_ips: boolean;
+  site_allowlist: string[];
+  network_allowlist: Record<string, number[]>;
+  include_wired: boolean;
+  include_wireless: boolean;
+  include_vpn: boolean;
+  sync_interval_seconds: number;
+  last_synced_at: string | null;
+  last_sync_error: string | null;
+  controller_version: string | null;
+  site_count: number | null;
+  network_count: number | null;
+  client_count: number | null;
+  last_discovery: UnifiDiscovery | null;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface UnifiControllerCreate {
+  name: string;
+  description?: string;
+  enabled?: boolean;
+  mode: "local" | "cloud";
+  host?: string | null;
+  port?: number;
+  cloud_host_id?: string | null;
+  verify_tls?: boolean;
+  ca_bundle_pem?: string;
+  auth_kind: "api_key" | "user_password";
+  api_key?: string;
+  username?: string;
+  password?: string;
+  ipam_space_id: string;
+  dns_group_id?: string | null;
+  mirror_networks?: boolean;
+  mirror_clients?: boolean;
+  mirror_fixed_ips?: boolean;
+  site_allowlist?: string[];
+  network_allowlist?: Record<string, number[]>;
+  include_wired?: boolean;
+  include_wireless?: boolean;
+  include_vpn?: boolean;
+  sync_interval_seconds?: number;
+}
+
+export interface UnifiControllerUpdate {
+  name?: string;
+  description?: string;
+  enabled?: boolean;
+  mode?: "local" | "cloud";
+  host?: string | null;
+  port?: number;
+  cloud_host_id?: string | null;
+  verify_tls?: boolean;
+  ca_bundle_pem?: string;
+  auth_kind?: "api_key" | "user_password";
+  api_key?: string;
+  username?: string;
+  password?: string;
+  ipam_space_id?: string;
+  dns_group_id?: string | null;
+  mirror_networks?: boolean;
+  mirror_clients?: boolean;
+  mirror_fixed_ips?: boolean;
+  site_allowlist?: string[];
+  network_allowlist?: Record<string, number[]>;
+  include_wired?: boolean;
+  include_wireless?: boolean;
+  include_vpn?: boolean;
+  sync_interval_seconds?: number;
+}
+
+export interface UnifiTestResult {
+  ok: boolean;
+  message: string;
+  controller_version: string | null;
+  site_count: number | null;
+}
+
+export const unifiApi = {
+  listControllers: () =>
+    api.get<UnifiController[]>("/unifi/controllers").then((r) => r.data),
+  createController: (data: UnifiControllerCreate) =>
+    api.post<UnifiController>("/unifi/controllers", data).then((r) => r.data),
+  updateController: (id: string, data: UnifiControllerUpdate) =>
+    api
+      .put<UnifiController>(`/unifi/controllers/${id}`, data)
+      .then((r) => r.data),
+  deleteController: (id: string) => api.delete(`/unifi/controllers/${id}`),
+  testConnection: (body: {
+    controller_id?: string;
+    mode?: "local" | "cloud";
+    host?: string | null;
+    port?: number;
+    cloud_host_id?: string | null;
+    verify_tls?: boolean;
+    ca_bundle_pem?: string;
+    auth_kind?: "api_key" | "user_password";
+    api_key?: string;
+    username?: string;
+    password?: string;
+  }) =>
+    api
+      .post<UnifiTestResult>("/unifi/controllers/test", body)
+      .then((r) => r.data),
+  syncNow: (id: string) =>
+    api
+      .post<{
+        status: string;
+        task_id: string;
+      }>(`/unifi/controllers/${id}/sync`)
+      .then((r) => r.data),
+};
+
 // ── Tailscale integration ──────────────────────────────────────────
 
 export interface TailscaleTenant {

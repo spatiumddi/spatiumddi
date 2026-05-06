@@ -77,6 +77,7 @@ from app.models.ownership import Customer, Provider, Site
 from app.models.proxmox import ProxmoxNode
 from app.models.settings import PlatformSettings
 from app.models.tailscale import TailscaleTenant
+from app.models.unifi import UnifiController
 from app.models.vlans import VLAN, Router
 from app.models.vrf import VRF
 
@@ -151,6 +152,7 @@ __all__ = [
     "KubernetesCluster",
     "ProxmoxNode",
     "TailscaleTenant",
+    "UnifiController",
     "NetworkDevice",
     "NetworkInterface",
     "NetworkArpEntry",

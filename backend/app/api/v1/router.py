@@ -46,6 +46,7 @@ from app.api.v1.sessions.router import router as sessions_router
 from app.api.v1.settings.router import router as settings_router
 from app.api.v1.tags import router as tags_router
 from app.api.v1.tailscale import router as tailscale_router
+from app.api.v1.unifi import router as unifi_router
 from app.api.v1.users.router import router as users_router
 from app.api.v1.version import router as version_router
 from app.api.v1.vlans.router import router as vlans_router
@@ -178,6 +179,12 @@ api_v1_router.include_router(
     prefix="/tailscale",
     tags=["tailscale"],
     dependencies=[Depends(require_module("integrations.tailscale"))],
+)
+api_v1_router.include_router(
+    unifi_router,
+    prefix="/unifi",
+    tags=["unifi"],
+    dependencies=[Depends(require_module("integrations.unifi"))],
 )
 api_v1_router.include_router(users_router, prefix="/users", tags=["users"])
 api_v1_router.include_router(version_router, prefix="/version", tags=["version"])

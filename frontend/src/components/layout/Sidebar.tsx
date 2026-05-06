@@ -38,6 +38,7 @@ import {
   Earth,
   HardDrive,
   LayoutTemplate,
+  Wifi,
   Waypoints,
   Shuffle,
   Trash2,
@@ -456,6 +457,9 @@ export function Sidebar({
       : []),
     ...(moduleEnabled("integrations.tailscale")
       ? [{ label: "Tailscale", icon: Waypoints, to: "/tailscale" }]
+      : []),
+    ...(moduleEnabled("integrations.unifi")
+      ? [{ label: "UniFi", icon: Wifi, to: "/unifi" }]
       : []),
   ].sort((a, b) => a.label.localeCompare(b.label));
   const mainNav = baseMainNav;
