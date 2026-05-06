@@ -282,6 +282,16 @@ def _fetch_cert_sync(host: str, port: int, timeout: float) -> dict[str, Any]:
     # tool's whole job is to surface those problems. Accept any chain.
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
+    # Pin TLS 1.2+ explicitly. Modern OpenSSL defaults already
+    # disable TLSv1.0 / 1.1, but CodeQL's ``py/insecure-protocol``
+    # rule flags any ``create_default_context`` call without an
+    # explicit ``minimum_version``. Setting it here makes the
+    # contract obvious and satisfies the scanner. Operators who
+    # need to inspect a TLSv1.0-only legacy server can still see
+    # that condition via the connection error message — they
+    # don't need a successful handshake to learn the server's
+    # broken.
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
 
     with socket.create_connection((host, port), timeout=timeout) as sock:
         with ctx.wrap_socket(sock, server_hostname=host) as tls_sock:
