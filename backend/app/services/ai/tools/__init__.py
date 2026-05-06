@@ -15,14 +15,18 @@ from app.services.ai.tools import (  # noqa: F401, E402
     network,
     network_modeling,
     nmap,
+    ops,
     proposals,
+    whois,
 )
 from app.services.ai.tools.base import (
     REGISTRY,
     Tool,
     ToolArgumentError,
+    ToolDisabled,
     ToolNotFound,
     ToolRegistry,
+    effective_tool_names,
     register_tool,
 )
 
@@ -32,5 +36,7 @@ __all__ = [
     "ToolRegistry",
     "ToolNotFound",
     "ToolArgumentError",
+    "ToolDisabled",
     "register_tool",
+    "effective_tool_names",
 ]

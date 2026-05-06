@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
+import ipaddress
 from typing import Any
 
-from pydantic import BaseModel, Field
+import dns.exception
+import dns.resolver
+import dns.reversename
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -158,3 +163,154 @@ async def list_dns_server_groups(
         }
         for g in rows
     ]
+
+
+# ── Live DNS lookup tools ───────────────────────────────────────────
+#
+# ``forward_dns`` and ``reverse_dns`` wrap dnspython so the operator
+# can ask "what does the resolver actually return for hostname X?"
+# without leaving the chat. Configurable resolver lets operators
+# point at a SpatiumDDI-managed BIND9 view they can't easily query
+# from their workstation.
+
+
+_DEFAULT_RESOLVE_TIMEOUT = 5.0
+
+
+def _build_resolver(servers: list[str] | None) -> dns.resolver.Resolver:
+    resolver = dns.resolver.Resolver(configure=not servers)
+    if servers:
+        resolver.nameservers = servers
+    resolver.lifetime = _DEFAULT_RESOLVE_TIMEOUT
+    return resolver
+
+
+class ForwardDnsArgs(BaseModel):
+    name: str = Field(
+        ...,
+        description="Hostname / FQDN to resolve. Trailing dots are tolerated.",
+    )
+    rdtype: str = Field(
+        default="A",
+        description=(
+            "Record type — A, AAAA, CNAME, MX, NS, TXT, SOA, SRV, CAA. "
+            "Pick A for v4 forward, AAAA for v6, ANY only when the "
+            "operator explicitly wants every record at the name."
+        ),
+    )
+    servers: list[str] | None = Field(
+        default=None,
+        description=(
+            "Optional resolver IPs (e.g. ['10.0.0.53']). Defaults to "
+            "the host's /etc/resolv.conf — useful when querying the "
+            "platform's own BIND9 view from outside it."
+        ),
+    )
+
+    @field_validator("rdtype")
+    @classmethod
+    def upper_rdtype(cls, v: str) -> str:
+        v = v.strip().upper()
+        if not v:
+            raise ValueError("rdtype is required")
+        return v
+
+
+@register_tool(
+    name="forward_dns",
+    description=(
+        "Live forward DNS lookup ('dig <name> <rdtype>'). Resolves "
+        "against the host's resolver by default, or against operator-"
+        "supplied nameserver IPs. Returns every answer record verbatim. "
+        "Use this when the operator wants ground truth from the "
+        "resolver — DB lookups via list_dns_records show the configured "
+        "intent; this shows what the world actually sees."
+    ),
+    args_model=ForwardDnsArgs,
+    category="dns",
+    default_enabled=False,
+)
+async def forward_dns(
+    db: AsyncSession,  # noqa: ARG001
+    user: User,  # noqa: ARG001
+    args: ForwardDnsArgs,
+) -> dict[str, Any]:
+    target = args.name.strip().rstrip(".")
+    resolver = _build_resolver(args.servers)
+    try:
+        answers = await asyncio.to_thread(resolver.resolve, target, args.rdtype)
+    except dns.resolver.NXDOMAIN:
+        return {"name": target, "rdtype": args.rdtype, "rcode": "NXDOMAIN", "answers": []}
+    except dns.resolver.NoAnswer:
+        return {"name": target, "rdtype": args.rdtype, "rcode": "NOERROR", "answers": []}
+    except dns.resolver.NoNameservers as exc:
+        return {"name": target, "rdtype": args.rdtype, "error": f"no nameservers: {exc}"}
+    except dns.exception.Timeout:
+        return {"name": target, "rdtype": args.rdtype, "error": "resolver timeout"}
+    except dns.exception.DNSException as exc:
+        return {"name": target, "rdtype": args.rdtype, "error": f"{type(exc).__name__}: {exc}"}
+    return {
+        "name": target,
+        "rdtype": args.rdtype,
+        "rcode": "NOERROR",
+        "ttl": int(answers.rrset.ttl) if answers.rrset is not None else None,
+        "answers": [str(a) for a in answers],
+    }
+
+
+class ReverseDnsArgs(BaseModel):
+    address: str = Field(
+        ...,
+        description="IPv4 or IPv6 address. Built into the appropriate ``in-addr.arpa`` / ``ip6.arpa`` query.",
+    )
+    servers: list[str] | None = Field(
+        default=None,
+        description="Optional resolver IPs (see ``forward_dns``).",
+    )
+
+    @field_validator("address")
+    @classmethod
+    def valid_addr(cls, v: str) -> str:
+        try:
+            ipaddress.ip_address(v.strip())
+        except ValueError as exc:
+            raise ValueError("Invalid IP address") from exc
+        return v.strip()
+
+
+@register_tool(
+    name="reverse_dns",
+    description=(
+        "Live reverse-DNS lookup. Resolves the appropriate "
+        "``<addr>.in-addr.arpa`` / ``<addr>.ip6.arpa`` PTR record. "
+        "Returns every PTR answer; an empty list means no PTR exists. "
+        "Useful when the operator wants to confirm reverse delegation "
+        "is wired up correctly."
+    ),
+    args_model=ReverseDnsArgs,
+    category="dns",
+    default_enabled=False,
+)
+async def reverse_dns(
+    db: AsyncSession,  # noqa: ARG001
+    user: User,  # noqa: ARG001
+    args: ReverseDnsArgs,
+) -> dict[str, Any]:
+    arpa = dns.reversename.from_address(args.address).to_text(omit_final_dot=True)
+    resolver = _build_resolver(args.servers)
+    try:
+        answers = await asyncio.to_thread(resolver.resolve, arpa, "PTR")
+    except dns.resolver.NXDOMAIN:
+        return {"address": args.address, "arpa": arpa, "rcode": "NXDOMAIN", "answers": []}
+    except dns.resolver.NoAnswer:
+        return {"address": args.address, "arpa": arpa, "rcode": "NOERROR", "answers": []}
+    except dns.exception.Timeout:
+        return {"address": args.address, "arpa": arpa, "error": "resolver timeout"}
+    except dns.exception.DNSException as exc:
+        return {"address": args.address, "arpa": arpa, "error": f"{type(exc).__name__}: {exc}"}
+    return {
+        "address": args.address,
+        "arpa": arpa,
+        "rcode": "NOERROR",
+        "answers": [str(a).rstrip(".") for a in answers],
+    }

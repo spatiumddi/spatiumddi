@@ -59,6 +59,14 @@ class Tool:
     # Free-form category used by the admin "available tools" page to
     # group tools — "ipam", "dns", "dhcp", "network", "ops".
     category: str = "ops"
+    # ``default_enabled`` controls whether the tool appears in the
+    # effective set for a fresh install. Niche tools (TLS chain
+    # check, public WHOIS lookups, propose-* writes) ship as False so
+    # operators opt in via Settings → AI → Tool Catalog. The default
+    # can always be overridden per-platform via
+    # ``PlatformSettings.ai_tools_enabled`` and per-provider via
+    # ``AIProvider.enabled_tools``.
+    default_enabled: bool = True
 
     def parameters_schema(self) -> dict[str, Any]:
         """JSON Schema for the args. Both OpenAI and MCP consume this
@@ -119,14 +127,26 @@ class ToolRegistry:
         *,
         db: AsyncSession,
         user: User,
+        effective: set[str] | None = None,
     ) -> Any:
         """Validate ``raw_args`` against the tool's Pydantic model and
-        dispatch. Raises :class:`ToolNotFound` / :class:`ToolArgumentError`
-        on the obvious failure modes.
+        dispatch. Raises :class:`ToolNotFound` /
+        :class:`ToolArgumentError` / :class:`ToolDisabled` on the
+        obvious failure modes.
+
+        ``effective`` is the operator's resolved tool set
+        (Tool Catalog × per-provider allowlist). When supplied, the
+        registry refuses to dispatch tools outside the set so a
+        hallucinating LLM can't call something the operator
+        explicitly disabled. Pass None for "no gating" — legitimate
+        for the MCP HTTP endpoint where the caller has already
+        filtered against ``tools/list``.
         """
         tool = self.get(name)
         if tool is None:
             raise ToolNotFound(name)
+        if effective is not None and name not in effective:
+            raise ToolDisabled(name, scope="platform")
         try:
             args = tool.args_model.model_validate(raw_args or {})
         except Exception as exc:
@@ -159,6 +179,7 @@ def register_tool(
     args_model: type[BaseModel],
     writes: bool = False,
     category: str = "ops",
+    default_enabled: bool = True,
 ) -> Callable[[ToolExecutor], ToolExecutor]:
     """Decorator. Use on each tool's executor function.
 
@@ -188,8 +209,68 @@ def register_tool(
                 executor=fn,
                 writes=writes,
                 category=category,
+                default_enabled=default_enabled,
             )
         )
         return fn
 
     return decorator
+
+
+# ── Tool resolution ────────────────────────────────────────────────
+
+
+class ToolDisabled(KeyError):
+    """Raised when a tool is registered but disabled in the operator's
+    Tool Catalog or per-provider allowlist. The chat orchestrator
+    surfaces the failure as a tool-result message so the LLM can
+    explain to the user how to enable it."""
+
+    def __init__(self, name: str, scope: str) -> None:
+        super().__init__(name)
+        self.name = name
+        # ``scope`` is "platform" (operator-level disable) or
+        # "provider" (per-provider allowlist). Drives the message the
+        # user sees.
+        self.scope = scope
+
+
+def _platform_enabled_set(platform_enabled: list[str] | None) -> set[str] | None:
+    """Resolve ``PlatformSettings.ai_tools_enabled`` against the
+    registry defaults. Returns the explicit set when the setting is
+    non-NULL, else None meaning "use registry defaults"."""
+    if platform_enabled is None:
+        return None
+    return set(platform_enabled)
+
+
+def effective_tool_names(
+    *,
+    platform_enabled: list[str] | None,
+    provider_enabled: list[str] | None,
+) -> set[str]:
+    """Resolve which tools are enabled for *this* request.
+
+    Layering, narrow-down semantics:
+
+    1. Start with the registry's ``default_enabled=True`` set.
+    2. If ``platform_enabled`` is non-NULL, replace step 1 with that
+       explicit list (operator's Tool Catalog override).
+    3. If ``provider_enabled`` is non-NULL, intersect with it
+       (per-provider narrowing for small-context models).
+
+    NULL at any layer means "no override at this layer" — the
+    behaviour falls through to the wider layer.
+    """
+    platform = _platform_enabled_set(platform_enabled)
+    if platform is None:
+        eligible = {t.name for t in REGISTRY.all() if t.default_enabled and not t.writes}
+    else:
+        # Operator-explicit list. Filter to tools that actually exist
+        # so a renamed / removed tool doesn't break chat — same
+        # forward-compat we already do for provider allowlists.
+        registered = {t.name for t in REGISTRY.all() if not t.writes}
+        eligible = platform & registered
+    if provider_enabled is not None:
+        eligible &= set(provider_enabled)
+    return eligible

@@ -54,7 +54,13 @@ from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
 from app.models.network import NetworkDevice
 from app.models.settings import PlatformSettings
 from app.services.ai.pricing import compute_cost
-from app.services.ai.tools import REGISTRY, ToolArgumentError, ToolNotFound
+from app.services.ai.tools import (
+    REGISTRY,
+    ToolArgumentError,
+    ToolDisabled,
+    ToolNotFound,
+    effective_tool_names,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -516,6 +522,27 @@ async def build_system_prompt(
     ctx = await gather_dynamic_context(db, user)
     topology_line = _format_topology_line(ctx["topology"])
     activity_block = _format_recent_activity(ctx["recent_activity"])
+
+    # Disabled-tool block. Lists every registered tool that's NOT in
+    # the effective set, with its one-liner. The model uses this to
+    # tell the user "I'd answer that with X, but it's disabled —
+    # ask your admin to enable it under Settings → AI → Tool Catalog"
+    # instead of producing a generic "I can't help with that". Costs
+    # ~50 tokens per disabled tool — acceptable, and the operator
+    # can always trim the catalog if context is tight.
+    enabled_names = {getattr(t, "name", "") for t in tools}
+    disabled = [t for t in REGISTRY.read_only() if t.name not in enabled_names]
+    disabled_block = ""
+    if disabled:
+        lines = [f"- {t.name}: {t.description.splitlines()[0]}" for t in disabled]
+        disabled_block = (
+            "\n\nDisabled tools (the operator has turned these off in "
+            "Settings → AI → Tool Catalog or in this provider's allowlist; "
+            "do NOT call them — instead, when a user asks something one of "
+            "these would answer, tell them the tool is disabled and to ask "
+            "their administrator to enable it):\n" + "\n".join(lines)
+        )
+
     dynamic = (
         f"\n\n---\nContext for this session:\n"
         f"- Operator: {user.username!r} (display name {user.display_name!r}).\n"
@@ -523,7 +550,8 @@ async def build_system_prompt(
         f"- Tools available: {len(tools)}.\n"
         f"- Topology: {topology_line}.\n"
         f"\nRecent activity (last 24 h):\n"
-        f"{activity_block}\n---"
+        f"{activity_block}"
+        f"{disabled_block}\n---"
     )
     return _resolve_static_prompt(provider) + dynamic
 
@@ -554,14 +582,20 @@ class ChatOrchestrator:
                 raise PermissionError("session not found or not yours")
             return row
         # System prompt's "Tools available: N" line should reflect
-        # what's actually surfaced to this provider's session — if the
-        # operator narrowed the allowlist for a small model, the
-        # prompt should agree.
-        if provider is not None and provider.enabled_tools is not None:
-            allowed = set(provider.enabled_tools)
-            tools = [t for t in REGISTRY.read_only() if t.name in allowed]
-        else:
-            tools = REGISTRY.read_only()
+        # what's actually surfaced to this provider's session. The
+        # effective set composes platform-level (Tool Catalog) +
+        # per-provider allowlist over the registry's per-tool
+        # ``default_enabled`` defaults.
+        platform_settings = await self.db.get(PlatformSettings, 1)
+        platform_enabled = (
+            platform_settings.ai_tools_enabled if platform_settings is not None else None
+        )
+        provider_enabled = provider.enabled_tools if provider is not None else None
+        effective = effective_tool_names(
+            platform_enabled=platform_enabled,
+            provider_enabled=provider_enabled,
+        )
+        tools = [t for t in REGISTRY.read_only() if t.name in effective]
         system_prompt = await build_system_prompt(self.db, self.user, tools, provider)
         # "Ask AI about this" — operator clicked a context affordance
         # in the IPAM / DNS / DHCP UI; the frontend supplied a
@@ -640,32 +674,35 @@ class ChatOrchestrator:
             msgs = head + [m for m in tail if m.role != "system"]
         return msgs
 
-    @staticmethod
-    def _tools_for_request(provider: AIProvider | None = None) -> list[ToolDefinition]:
+    async def _tools_for_request(self, provider: AIProvider | None = None) -> list[ToolDefinition]:
         """Build the tools-schema list to send to the LLM.
 
-        Honours ``AIProvider.enabled_tools`` when set:
-            * NULL  → all registered tools enabled (default)
-            * []    → no tools at all
-            * [...] → only those tool names
+        Layers the operator's Tool Catalog
+        (``PlatformSettings.ai_tools_enabled``) on top of the
+        registry's per-tool ``default_enabled`` defaults, then
+        intersects with ``AIProvider.enabled_tools`` if set.
 
         Names that no longer match a registered tool are silently
         skipped — keeps a provider working through tool renames /
         removals without 500'ing on every chat turn.
         """
-        all_tools = REGISTRY.read_only()
-        if provider is not None and provider.enabled_tools is not None:
-            allowed = set(provider.enabled_tools)
-            filtered = [t for t in all_tools if t.name in allowed]
-        else:
-            filtered = all_tools
+        platform_settings = await self.db.get(PlatformSettings, 1)
+        platform_enabled = (
+            platform_settings.ai_tools_enabled if platform_settings is not None else None
+        )
+        provider_enabled = provider.enabled_tools if provider is not None else None
+        effective = effective_tool_names(
+            platform_enabled=platform_enabled,
+            provider_enabled=provider_enabled,
+        )
         return [
             ToolDefinition(
                 name=t.name,
                 description=t.description,
                 parameters=t.parameters_schema(),
             )
-            for t in filtered
+            for t in REGISTRY.read_only()
+            if t.name in effective
         ]
 
     async def _build_fallback_chain(self, primary: AIProvider) -> list[AIProvider]:
@@ -736,7 +773,13 @@ class ChatOrchestrator:
         # operator needs to see, not transient infrastructure flaps.
         # The snapshot stays untouched; the next turn tries primary again.
         fallback_chain = await self._build_fallback_chain(provider)
-        tools = self._tools_for_request(provider)
+        tools = await self._tools_for_request(provider)
+        # Effective tool name set drives both the LLM-visible schema
+        # list above AND the registry-side dispatch gate below — if a
+        # hallucinating model emits a tool the operator disabled, the
+        # registry refuses and we surface a helpful error in the
+        # tool-result so the model can pivot.
+        effective_tools = {t.name for t in tools}
 
         # Per-turn duplicate-call tracker. Some smaller open-weight
         # models loop on a successful tool call (we've seen qwen2.5:7b
@@ -964,7 +1007,13 @@ class ChatOrchestrator:
                 seen_calls.add(call_key)
 
                 try:
-                    result = await REGISTRY.call(tc.name, raw_args, db=self.db, user=self.user)
+                    result = await REGISTRY.call(
+                        tc.name,
+                        raw_args,
+                        db=self.db,
+                        user=self.user,
+                        effective=effective_tools,
+                    )
                     result_text = json.dumps(result, default=str)
                     is_error = False
                 except ToolNotFound:
@@ -974,7 +1023,7 @@ class ChatOrchestrator:
                     # back so the model can self-correct on the next
                     # iteration rather than giving up and emitting a
                     # generic greeting.
-                    available = sorted(t.name for t in REGISTRY.read_only())
+                    available = sorted(effective_tools)
                     result_text = json.dumps(
                         {
                             "error": f"tool not found: {tc.name}",
@@ -982,6 +1031,25 @@ class ChatOrchestrator:
                             "hint": (
                                 "You may only call tools listed in available_tools. "
                                 "Pick the closest match and try again."
+                            ),
+                        }
+                    )
+                    is_error = True
+                except ToolDisabled as exc:
+                    # The operator has disabled this tool in
+                    # Settings → AI → Tool Catalog (or in the
+                    # provider's allowlist). The model picked it
+                    # anyway — surface a clear message so it can
+                    # explain to the user how to enable it.
+                    result_text = json.dumps(
+                        {
+                            "error": f"tool {exc.name!r} is disabled by the operator",
+                            "hint": (
+                                "This tool exists but is not enabled in the operator's "
+                                "Tool Catalog. Tell the user the feature is disabled and "
+                                "to ask their administrator to enable "
+                                f"'{exc.name}' under Settings → AI → Tool Catalog. "
+                                "Do not retry this tool call."
                             ),
                         }
                     )

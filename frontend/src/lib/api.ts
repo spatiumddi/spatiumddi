@@ -1925,6 +1925,35 @@ export interface AuditIntegrity {
   breaks: AuditChainBreak[];
 }
 
+// ── AI tool catalog (issue #101 follow-up) ──────────────────────────
+
+export interface AIToolCatalogEntry {
+  name: string;
+  description: string;
+  category: string;
+  writes: boolean;
+  parameters_schema: Record<string, unknown>;
+  default_enabled: boolean;
+  enabled: boolean;
+}
+
+export interface AIToolCatalog {
+  tools: AIToolCatalogEntry[];
+  total: number;
+  /** Raw setting: ``null`` = registry per-tool defaults, list = explicit. */
+  platform_override: string[] | null;
+}
+
+export const aiToolCatalogApi = {
+  list: () => api.get<AIToolCatalog>("/ai/tools").then((r) => r.data),
+  /** Pass null to revert to registry defaults; pass an explicit list
+   *  to pin the platform allowlist. */
+  update: (enabled: string[] | null) =>
+    api
+      .put<AIToolCatalog>("/ai/tools/catalog", { enabled })
+      .then((r) => r.data),
+};
+
 export const auditApi = {
   list: (params?: {
     limit?: number;

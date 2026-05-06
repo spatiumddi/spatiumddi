@@ -28,6 +28,7 @@ from app.models.overlay import (
     OverlaySite,
     RoutingPolicy,
 )
+from app.models.ownership import Site
 from app.models.vrf import VRF
 from app.services.ai.tools.base import register_tool
 
@@ -775,6 +776,104 @@ async def list_application_categories(
     ]
 
 
+# ── trace_circuit_impact ────────────────────────────────────────────
+
+
+class TraceCircuitImpactArgs(BaseModel):
+    circuit: str = Field(
+        ...,
+        description=(
+            "Circuit UUID *or* exact circuit name. Name resolution is "
+            "exact (no wildcards) so an ambiguous match returns an error."
+        ),
+    )
+
+
+@register_tool(
+    name="trace_circuit_impact",
+    description=(
+        "Walk every overlay site whose preferred-circuit chain references "
+        "the given circuit, and report which sites would be primary / "
+        "demoted / blackholed if it went down. This is the 'what's at "
+        "stake?' query operators run mentally on incident calls — "
+        "answers it without running the full /simulate engine."
+    ),
+    args_model=TraceCircuitImpactArgs,
+    category="network",
+)
+async def trace_circuit_impact(
+    db: AsyncSession,
+    user: User,  # noqa: ARG001
+    args: TraceCircuitImpactArgs,
+) -> dict[str, Any]:
+    target_uuid = _try_uuid(args.circuit)
+    circuit_q = select(Circuit).where(Circuit.deleted_at.is_(None))
+    if target_uuid is not None:
+        circuit_q = circuit_q.where(Circuit.id == target_uuid)
+    else:
+        circuit_q = circuit_q.where(Circuit.name == args.circuit)
+    circuit_rows = (await db.execute(circuit_q)).scalars().all()
+    if not circuit_rows:
+        return {"error": f"no circuit matched {args.circuit!r}"}
+    if len(circuit_rows) > 1:
+        return {
+            "error": (
+                f"{len(circuit_rows)} circuits match name {args.circuit!r}; "
+                "pass the UUID to disambiguate."
+            ),
+            "candidates": [{"id": str(c.id), "name": c.name} for c in circuit_rows],
+        }
+    circuit = circuit_rows[0]
+
+    # Walk every overlay site; ``preferred_circuits`` is a JSON list
+    # of UUIDs in priority order. We don't filter at the SQL layer
+    # because JSONB array containment requires the right operator
+    # syntax — easier to load + filter in Python at the scale of
+    # operator-managed overlays (typically <1k sites).
+    overlay_sites = (
+        await db.execute(
+            select(OverlaySite, OverlayNetwork, Site)
+            .join(OverlayNetwork, OverlaySite.overlay_network_id == OverlayNetwork.id)
+            .outerjoin(Site, OverlaySite.site_id == Site.id)
+            .where(OverlayNetwork.deleted_at.is_(None))
+        )
+    ).all()
+
+    impacted: list[dict[str, Any]] = []
+    overlays_seen: set[uuid.UUID] = set()
+    for os_, overlay, site in overlay_sites:
+        chain = [str(c) for c in (os_.preferred_circuits or []) if c]
+        if str(circuit.id) not in chain:
+            continue
+        position = chain.index(str(circuit.id))
+        survivors = [c for c in chain if c != str(circuit.id)]
+        new_primary = survivors[0] if survivors else None
+        impacted.append(
+            {
+                "overlay_id": str(overlay.id),
+                "overlay_name": overlay.name,
+                "site_name": site.name if site else "<deleted>",
+                "circuit_position": position,
+                "is_currently_primary": position == 0,
+                "fallback_circuit_id": new_primary,
+                "blackholed": new_primary is None,
+            }
+        )
+        overlays_seen.add(overlay.id)
+
+    return {
+        "circuit_id": str(circuit.id),
+        "circuit_name": circuit.name,
+        "circuit_status": circuit.status,
+        "transport_class": circuit.transport_class,
+        "overlays_affected": len(overlays_seen),
+        "sites_affected": len(impacted),
+        "sites_blackholed_if_down": sum(1 for r in impacted if r["blackholed"]),
+        "sites_currently_primary": sum(1 for r in impacted if r["is_currently_primary"]),
+        "details": impacted,
+    }
+
+
 __all__ = [
     "list_asns",
     "get_asn",
@@ -786,4 +885,5 @@ __all__ = [
     "list_overlay_networks",
     "get_overlay_topology",
     "list_application_categories",
+    "trace_circuit_impact",
 ]

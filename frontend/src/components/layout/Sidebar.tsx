@@ -114,6 +114,7 @@ const adminIdentityNav = [
 const adminConfigurationNav = [
   { label: "AI Providers", icon: Sparkles, to: "/admin/ai/providers" },
   { label: "AI Prompts", icon: Sparkles, to: "/admin/ai/prompts" },
+  { label: "AI Tool Catalog", icon: Sparkles, to: "/admin/ai/tools" },
   { label: "Custom Fields", icon: Tags, to: "/admin/custom-fields" },
   {
     label: "IPAM Templates",

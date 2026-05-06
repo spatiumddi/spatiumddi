@@ -327,6 +327,16 @@ class PlatformSettings(Base):
         JSONB, nullable=False, default=dict, server_default=sa_text("'{}'::jsonb")
     )
 
+    # ── Operator Copilot tool catalog (issue #101 follow-up) ──────
+    # Operator-set explicit allowlist over the Operator Copilot's
+    # tool registry. NULL (default) = registry's per-tool
+    # ``default_enabled`` flag governs. Non-NULL = exactly these
+    # tools are enabled regardless of declared default. Empty list
+    # = no tools (chat still works without tools — sanitised demo).
+    # Per-provider ``AIProvider.enabled_tools`` narrows further; the
+    # two layers compose.
+    ai_tools_enabled: Mapped[list[str] | None] = mapped_column(JSONB, nullable=True)
+
     # ── Daily digest (issue #90 Phase 2) ────────────────────────────
     # When True, a Celery beat job once per day rolls up the previous
     # 24 h of audit / alert / lease activity, sends it to the highest-
