@@ -88,6 +88,8 @@ import {
   useDraggableModal,
 } from "@/components/ui/use-draggable-modal";
 import { HeaderButton } from "@/components/ui/header-button";
+import { TagFilterChips } from "@/components/TagFilterChips";
+import { matchesAllTagChips } from "@/components/tag-filter-utils";
 import { AskAIButton } from "@/components/copilot/AskAIButton";
 import {
   ImportModal,
@@ -9752,6 +9754,7 @@ function BlockDetailView({
     vlan: "",
     status: "",
   });
+  const [tagFilters, setTagFilters] = useState<string[]>([]);
   const [showBlockFilters, setShowBlockFilters] = useState(false);
   // Unified selection set with ``subnet:<id>`` / ``block:<id>`` keys —
   // mirrors the space-level view so a single bulk action can delete a
@@ -10237,6 +10240,13 @@ function BlockDetailView({
             />
           ) : null;
         })()}
+      <div className="border-b bg-muted/10 px-4 py-2">
+        <TagFilterChips
+          value={tagFilters}
+          onChange={setTagFilters}
+          placeholder="Filter subnets + child blocks by tag — try env or env:prod…"
+        />
+      </div>
       <div className="flex-1 overflow-auto">
         {(() => {
           // Build a synthetic BlockNode for the current block so flattenToTableRows
@@ -10255,10 +10265,17 @@ function BlockDetailView({
             .map((r) => ({ ...r, depth: Math.max(0, r.depth) }));
 
           // Apply filters
-          if (Object.values(blockFilter).some(Boolean)) {
+          const hasBlockFilter = Object.values(blockFilter).some(Boolean);
+          const hasTagFilter = tagFilters.length > 0;
+          if (hasBlockFilter || hasTagFilter) {
             allRows = allRows.filter((r) => {
               if (r.type === "block" && r.block) {
                 const b = r.block;
+                // Tag chips on a block row match the block's own tags;
+                // an unmatched block hides the whole subtree, which is
+                // the operator-expected "show only env=prod gear" view.
+                if (hasTagFilter && !matchesAllTagChips(b.tags, tagFilters))
+                  return false;
                 if (
                   blockFilter.network &&
                   !b.network.includes(blockFilter.network)
@@ -10275,6 +10292,8 @@ function BlockDetailView({
               }
               if (r.type === "subnet" && r.subnet) {
                 const s = r.subnet;
+                if (hasTagFilter && !matchesAllTagChips(s.tags, tagFilters))
+                  return false;
                 if (
                   blockFilter.network &&
                   !s.network.includes(blockFilter.network)
@@ -10317,7 +10336,7 @@ function BlockDetailView({
               <div className="flex flex-col items-center justify-center py-16 text-center">
                 <Layers className="mb-3 h-10 w-10 text-muted-foreground/20" />
                 <p className="text-sm text-muted-foreground">
-                  {Object.values(blockFilter).some(Boolean)
+                  {hasBlockFilter || hasTagFilter
                     ? "No results match the active filters."
                     : "This block has no child blocks or subnets yet."}
                 </p>

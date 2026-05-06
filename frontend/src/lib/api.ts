@@ -1210,6 +1210,7 @@ export const ipamApi = {
     pci_scope?: boolean;
     hipaa_scope?: boolean;
     internet_facing?: boolean;
+    tag?: string[];
   }) => api.get<Subnet[]>("/ipam/subnets", { params }).then((r) => r.data),
   getSubnet: (id: string) =>
     api.get<Subnet>(`/ipam/subnets/${id}`).then((r) => r.data),
