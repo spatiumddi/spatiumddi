@@ -1,12 +1,21 @@
-import { useEffect, useMemo, useState } from "react";
-import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { Boxes, RefreshCcw, RotateCcw, Save, Sparkles } from "lucide-react";
-import { aiToolCatalogApi, type AIToolCatalogEntry } from "@/lib/api";
-import { cn, zebraBodyCls } from "@/lib/utils";
+import { useMemo, useState } from "react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { Boxes, RefreshCcw, RotateCcw, Sparkles } from "lucide-react";
+import {
+  aiToolCatalogApi,
+  type AIToolCatalog,
+  type AIToolCatalogEntry,
+} from "@/lib/api";
+import { Toggle } from "@/components/ui/toggle";
+import { cn } from "@/lib/utils";
 
 const headerCls =
   "flex shrink-0 items-center gap-1.5 rounded-md border bg-background px-3 py-1.5 text-sm hover:bg-muted disabled:opacity-50";
 
+// Display-friendly names for the registry's `category` field (which
+// is a short lowercase string declared on each `register_tool(...)`
+// call in the backend tool registry). Anything not in this map falls
+// back to the raw category id, capitalised by group rendering.
 const CATEGORY_LABELS: Record<string, string> = {
   ipam: "IPAM",
   dns: "DNS",
@@ -15,34 +24,87 @@ const CATEGORY_LABELS: Record<string, string> = {
   ops: "Operations",
 };
 
+const CATALOG_QUERY_KEY = ["ai-tool-catalog-admin"];
+
+/** Settings → AI Tool Catalog.
+ *
+ * Layout mirrors the Features page: 3-col adaptive grid for wide
+ * groups, narrow groups (≤2 tools) cluster into shared 3-up rows,
+ * pill toggle on each row that auto-saves on flip via an optimistic
+ * React Query mutation. No batch Save button — every click hits
+ * `PUT /ai/tools/catalog` immediately so the change takes effect on
+ * the next chat turn without operator effort.
+ *
+ * Per-tool toggling computes the new explicit list from current
+ * `enabled` flags ± the toggled tool, then PUTs that list. This
+ * implicitly converts a NULL platform override into an explicit one
+ * — operators can revert via the "Reset to defaults" button which
+ * sends NULL back. Optimistic update prevents the toggle from
+ * snapping back during the round-trip.
+ */
 export function AIToolCatalogPage() {
   const qc = useQueryClient();
+  const [search, setSearch] = useState("");
+
   const { data, isLoading, refetch, isFetching } = useQuery({
-    // Distinct from the ``ai-tool-catalog`` key used by the AI
-    // Providers modal — that one expects a bare array from
-    // /ai/providers/tools, this page calls /ai/tools (full envelope
-    // with default_enabled + enabled flags). Sharing the key would
-    // alias the cache + crash whichever consumer reads it second.
-    queryKey: ["ai-tool-catalog-admin"],
+    queryKey: CATALOG_QUERY_KEY,
     queryFn: () => aiToolCatalogApi.list(),
   });
 
-  // Local-edit state mirrors the live catalog. Operator clicks
-  // checkboxes to add / remove tool names; "Save" PUTs the explicit
-  // list, "Reset to defaults" sends null (revert to registry
-  // per-tool defaults). Search filter narrows the visible rows
-  // without affecting the selection.
-  const [selected, setSelected] = useState<Set<string>>(new Set());
-  const [search, setSearch] = useState("");
-  const [dirty, setDirty] = useState(false);
+  const updateMutation = useMutation({
+    mutationFn: (enabledNames: string[] | null) =>
+      aiToolCatalogApi.update(enabledNames),
+    onMutate: async (enabledNames) => {
+      // Cancel any in-flight refetch so it doesn't clobber the
+      // optimistic state, then patch the cache so the row toggles
+      // visually before the server round-trip lands.
+      await qc.cancelQueries({ queryKey: CATALOG_QUERY_KEY });
+      const prev = qc.getQueryData<AIToolCatalog>(CATALOG_QUERY_KEY);
+      if (prev) {
+        const explicit = enabledNames !== null;
+        const enabledSet = explicit
+          ? new Set(enabledNames)
+          : // Null means "revert to registry defaults" — recompute
+            // each row's `enabled` from `default_enabled`.
+            null;
+        qc.setQueryData<AIToolCatalog>(CATALOG_QUERY_KEY, {
+          ...prev,
+          platform_override: enabledNames,
+          tools: prev.tools.map((t) => ({
+            ...t,
+            enabled: enabledSet ? enabledSet.has(t.name) : t.default_enabled,
+          })),
+        });
+      }
+      return { prev };
+    },
+    onError: (_err, _vars, ctx) => {
+      if (ctx?.prev) qc.setQueryData(CATALOG_QUERY_KEY, ctx.prev);
+    },
+    onSettled: () => {
+      qc.invalidateQueries({ queryKey: CATALOG_QUERY_KEY });
+    },
+  });
 
-  useEffect(() => {
-    if (!data) return;
-    setSelected(
-      new Set(data.tools.filter((t) => t.enabled).map((t) => t.name)),
-    );
-    setDirty(false);
-  }, [data]);
+  function currentEnabledNames(): string[] {
+    return (data?.tools ?? []).filter((t) => t.enabled).map((t) => t.name);
+  }
+
+  function toggleOne(name: string, next: boolean) {
+    const current = new Set(currentEnabledNames());
+    if (next) current.add(name);
+    else current.delete(name);
+    updateMutation.mutate([...current].sort());
+  }
+
+  function setGroup(names: string[], next: boolean) {
+    const current = new Set(currentEnabledNames());
+    for (const n of names) {
+      if (next) current.add(n);
+      else current.delete(n);
+    }
+    updateMutation.mutate([...current].sort());
+  }
 
   const grouped = useMemo(() => {
     if (!data) return [] as [string, AIToolCatalogEntry[]][];
@@ -63,210 +125,225 @@ export function AIToolCatalogPage() {
     return Object.entries(buckets).sort((a, b) => a[0].localeCompare(b[0]));
   }, [data, search]);
 
-  const totalEnabled = selected.size;
+  const totalEnabled = data?.tools.filter((t) => t.enabled).length ?? 0;
   const totalKnown = data?.total ?? 0;
-
-  function toggle(name: string) {
-    setSelected((prev) => {
-      const next = new Set(prev);
-      if (next.has(name)) next.delete(name);
-      else next.add(name);
-      return next;
-    });
-    setDirty(true);
-  }
-
-  function selectAll(names: string[], state: boolean) {
-    setSelected((prev) => {
-      const next = new Set(prev);
-      for (const n of names) {
-        if (state) next.add(n);
-        else next.delete(n);
-      }
-      return next;
-    });
-    setDirty(true);
-  }
-
-  const save = useMutation({
-    mutationFn: () => aiToolCatalogApi.update([...selected].sort()),
-    onSuccess: () => {
-      setDirty(false);
-      qc.invalidateQueries({ queryKey: ["ai-tool-catalog-admin"] });
-    },
-  });
-
-  const reset = useMutation({
-    mutationFn: () => aiToolCatalogApi.update(null),
-    onSuccess: () => {
-      setDirty(false);
-      qc.invalidateQueries({ queryKey: ["ai-tool-catalog-admin"] });
-    },
-  });
+  const usingDefaults = data?.platform_override === null;
 
   return (
-    <div className="h-full overflow-auto p-6">
-      <div className="space-y-4">
-        <div className="flex flex-wrap items-start justify-between gap-3">
-          <div className="min-w-0 flex-1">
-            <h1 className="flex items-center gap-2 text-2xl font-bold tracking-tight">
-              <Sparkles className="h-5 w-5" /> Tool Catalog
-            </h1>
-            <p className="mt-1 max-w-2xl text-sm text-muted-foreground">
+    <div className="flex h-full flex-col">
+      <div className="flex flex-wrap items-center gap-3 border-b p-4">
+        <div className="flex min-w-0 flex-1 items-center gap-2">
+          <Sparkles className="h-5 w-5 flex-shrink-0 text-primary" />
+          <div className="min-w-0">
+            <h1 className="text-lg font-semibold">Tool Catalog</h1>
+            <p className="text-xs text-muted-foreground">
               Each tool here is something the Operator Copilot can call on your
-              behalf. Disabled tools are still listed for the model so it can
-              tell users "ask your admin to enable X" instead of giving up.
-              Per-provider allowlists narrow this further on the AI Providers
-              page.
+              behalf. Disabled tools stay listed for the model so it can tell
+              users "ask your admin to enable X" instead of giving up. Per-
+              provider allowlists narrow this further on the AI Providers page.
             </p>
           </div>
-          <div className="flex shrink-0 flex-wrap items-center gap-2">
-            <input
-              value={search}
-              onChange={(e) => setSearch(e.target.value)}
-              placeholder="Search…"
-              className="w-44 rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
-            />
-            <button
-              onClick={() => refetch()}
-              disabled={isFetching}
-              className={headerCls}
-            >
-              <RefreshCcw
-                className={cn("h-3.5 w-3.5", isFetching && "animate-spin")}
-              />
-              Refresh
-            </button>
-            <button
-              onClick={() => reset.mutate()}
-              disabled={reset.isPending}
-              className={headerCls}
-              title="Discard the explicit list and use each tool's registry default."
-            >
-              <RotateCcw className="h-3.5 w-3.5" />
-              Reset to defaults
-            </button>
-            <button
-              onClick={() => save.mutate()}
-              disabled={!dirty || save.isPending}
-              className="flex shrink-0 items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
-            >
-              <Save className="h-3.5 w-3.5" />
-              {save.isPending ? "Saving…" : "Save"}
-            </button>
-          </div>
         </div>
-
-        <div className="flex flex-wrap items-center gap-3 rounded-lg border bg-muted/20 px-4 py-3 text-sm">
-          <Boxes className="h-4 w-4 text-muted-foreground" />
+        <div className="flex shrink-0 items-center gap-2 text-xs text-muted-foreground">
+          <Boxes className="h-3.5 w-3.5" />
           <span>
-            <span className="font-medium">{totalEnabled}</span> of {totalKnown}{" "}
-            tools enabled
+            {totalEnabled} of {totalKnown} enabled
           </span>
-          {data?.platform_override === null && (
-            <span className="rounded-full bg-emerald-100 px-2 py-0.5 text-xs font-medium text-emerald-800 dark:bg-emerald-900/30 dark:text-emerald-300">
-              Using registry defaults
-            </span>
-          )}
-          {dirty && (
-            <span className="rounded-full bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-800 dark:bg-amber-900/30 dark:text-amber-300">
-              Unsaved changes
+          {usingDefaults && (
+            <span className="rounded-full bg-emerald-500/15 px-2 py-0.5 text-[10px] font-medium text-emerald-700 dark:text-emerald-400">
+              registry defaults
             </span>
           )}
         </div>
+        <input
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          placeholder="Search…"
+          className="w-44 rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+        />
+        <button
+          type="button"
+          onClick={() => refetch()}
+          disabled={isFetching}
+          className={headerCls}
+          title="Reload from server"
+        >
+          <RefreshCcw
+            className={cn("h-3.5 w-3.5", isFetching && "animate-spin")}
+          />
+          Refresh
+        </button>
+        <button
+          type="button"
+          onClick={() => updateMutation.mutate(null)}
+          disabled={updateMutation.isPending || usingDefaults}
+          className={headerCls}
+          title="Discard the explicit list and use each tool's registry default."
+        >
+          <RotateCcw className="h-3.5 w-3.5" />
+          Reset to defaults
+        </button>
+      </div>
 
-        {isLoading && <p className="text-sm text-muted-foreground">Loading…</p>}
+      {isLoading && (
+        <div className="p-4 text-sm text-muted-foreground">Loading…</div>
+      )}
 
-        {grouped.map(([cat, tools]) => {
-          const allOn = tools.every((t) => selected.has(t.name));
-          const someOn = !allOn && tools.some((t) => selected.has(t.name));
-          return (
-            <section key={cat} className="overflow-hidden rounded-lg border">
-              <header className="flex items-center justify-between gap-3 border-b bg-muted/40 px-4 py-2.5">
-                <h2 className="text-sm font-semibold">
-                  {CATEGORY_LABELS[cat] ?? cat} ({tools.length})
-                </h2>
-                <button
-                  onClick={() =>
-                    selectAll(
-                      tools.map((t) => t.name),
-                      !allOn,
-                    )
-                  }
-                  className="text-xs text-muted-foreground hover:text-foreground"
+      {/* Same adaptive layout as Settings → Features:
+       *   - Wide groups (≥3 tools) lay out in a 3-col internal grid
+       *   - Narrow groups (≤2 tools) cluster into shared 3-up rows so
+       *     small categories don't strand toggles mid-page
+       *   - Trailing fillers keep the gap-px divider grid from
+       *     leaking stray bands. pb-24 reserves room for the floating
+       *     Copilot button. */}
+      <div className="flex-1 space-y-3 overflow-auto p-4 pb-24">
+        {(() => {
+          type Block =
+            | {
+                kind: "wide";
+                category: string;
+                tools: AIToolCatalogEntry[];
+              }
+            | {
+                kind: "cluster";
+                items: { category: string; tools: AIToolCatalogEntry[] }[];
+              };
+          const blocks: Block[] = [];
+          let buffer: { category: string; tools: AIToolCatalogEntry[] }[] = [];
+          const flush = () => {
+            if (buffer.length) {
+              blocks.push({ kind: "cluster", items: buffer });
+              buffer = [];
+            }
+          };
+          for (const [category, tools] of grouped) {
+            if (tools.length >= 3) {
+              flush();
+              blocks.push({ kind: "wide", category, tools });
+            } else {
+              buffer.push({ category, tools });
+            }
+          }
+          flush();
+
+          const renderSection = (
+            category: string,
+            tools: AIToolCatalogEntry[],
+            clustered: boolean,
+          ) => {
+            const cols = clustered ? 1 : Math.min(3, tools.length);
+            const fillerCount =
+              cols > 0 ? (cols - (tools.length % cols)) % cols : 0;
+            const colsClass =
+              cols === 3
+                ? "md:grid-cols-3"
+                : cols === 2
+                  ? "md:grid-cols-2"
+                  : "";
+            const allOn = tools.every((t) => t.enabled);
+            return (
+              <section
+                key={category}
+                className="overflow-hidden rounded-md border bg-background"
+              >
+                <header className="flex items-center justify-between gap-2 border-b bg-muted/30 px-3 py-1 text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+                  <span>
+                    {CATEGORY_LABELS[category] ?? category} ({tools.length})
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() =>
+                      setGroup(
+                        tools.map((t) => t.name),
+                        !allOn,
+                      )
+                    }
+                    disabled={updateMutation.isPending}
+                    className="text-[10px] font-normal normal-case tracking-normal text-muted-foreground hover:text-foreground disabled:opacity-50"
+                  >
+                    {allOn ? "Disable all" : "Enable all"}
+                  </button>
+                </header>
+                <div
+                  className={cn(
+                    "grid grid-cols-1 gap-px bg-border/40",
+                    colsClass,
+                  )}
                 >
-                  {allOn ? "Disable all" : someOn ? "Enable all" : "Enable all"}
-                </button>
-              </header>
-              <table className="w-full text-sm">
-                <thead>
-                  <tr className="border-b bg-muted/20 text-xs">
-                    <th className="w-10 px-3 py-2"></th>
-                    <th className="px-3 py-2 text-left font-medium">Name</th>
-                    <th className="px-3 py-2 text-left font-medium">
-                      Description
-                    </th>
-                    <th className="w-24 px-3 py-2 text-left font-medium">
-                      Default
-                    </th>
-                  </tr>
-                </thead>
-                <tbody className={zebraBodyCls}>
                   {tools.map((t) => {
-                    const checked = selected.has(t.name);
-                    const overridden = checked !== t.default_enabled;
+                    const overridden = t.enabled !== t.default_enabled;
                     return (
-                      <tr
+                      <div
                         key={t.name}
-                        className="border-b last:border-0 hover:bg-muted/20"
+                        className="flex items-start gap-3 bg-background px-3 py-2 hover:bg-muted/40"
                       >
-                        <td className="px-3 py-2 align-top">
-                          <input
-                            type="checkbox"
-                            checked={checked}
-                            onChange={() => toggle(t.name)}
-                          />
-                        </td>
-                        <td className="px-3 py-2 align-top">
-                          <div className="flex items-center gap-1.5">
-                            <code className="font-mono text-xs">{t.name}</code>
-                            {overridden && (
-                              <span
-                                className="rounded-full bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-800 dark:bg-amber-900/30 dark:text-amber-300"
-                                title="Overrides the registry default"
-                              >
-                                override
-                              </span>
-                            )}
+                        <div className="min-w-0 flex-1">
+                          <div className="flex flex-wrap items-baseline gap-x-2">
+                            <code className="font-mono text-xs font-medium">
+                              {t.name}
+                            </code>
                             {t.writes && (
-                              <span className="rounded-full bg-red-100 px-1.5 py-0.5 text-[10px] font-medium text-red-800 dark:bg-red-900/30 dark:text-red-300">
+                              <span className="rounded bg-red-500/15 px-1 py-px text-[9px] font-medium text-red-700 dark:text-red-400">
                                 writes
                               </span>
                             )}
+                            {overridden && (
+                              <span
+                                className="rounded bg-amber-500/15 px-1 py-px text-[9px] font-medium text-amber-700 dark:text-amber-400"
+                                title={`Default: ${t.default_enabled ? "on" : "off"}`}
+                              >
+                                overridden
+                              </span>
+                            )}
                           </div>
-                        </td>
-                        <td className="px-3 py-2 align-top text-muted-foreground">
-                          {t.description.split("\n")[0]}
-                        </td>
-                        <td className="px-3 py-2 align-top">
-                          {t.default_enabled ? (
-                            <span className="text-xs text-emerald-700 dark:text-emerald-400">
-                              on
-                            </span>
-                          ) : (
-                            <span className="text-xs text-muted-foreground">
-                              off
-                            </span>
-                          )}
-                        </td>
-                      </tr>
+                          <p className="mt-0.5 text-xs leading-snug text-muted-foreground">
+                            {t.description.split("\n")[0]}
+                          </p>
+                        </div>
+                        <div className="mt-0.5">
+                          <Toggle
+                            label={`${t.enabled ? "Disable" : "Enable"} ${t.name}`}
+                            checked={t.enabled}
+                            disabled={updateMutation.isPending}
+                            onChange={(v) => toggleOne(t.name, v)}
+                          />
+                        </div>
+                      </div>
                     );
                   })}
-                </tbody>
-              </table>
-            </section>
-          );
-        })}
+                  {Array.from({ length: fillerCount }).map((_, idx) => (
+                    <div
+                      key={`filler-${idx}`}
+                      className="hidden bg-background md:block"
+                      aria-hidden
+                    />
+                  ))}
+                </div>
+              </section>
+            );
+          };
+
+          return blocks.map((block, idx) => {
+            if (block.kind === "wide") {
+              return renderSection(block.category, block.tools, false);
+            }
+            return (
+              <div
+                key={`cluster-${idx}`}
+                className="grid grid-cols-1 gap-3 md:grid-cols-3"
+              >
+                {block.items.map(({ category, tools }) =>
+                  renderSection(category, tools, true),
+                )}
+              </div>
+            );
+          });
+        })()}
+        {!isLoading && grouped.length === 0 && (
+          <div className="rounded-md border bg-muted/20 p-6 text-center text-sm text-muted-foreground">
+            {search ? "No tools match this search." : "No tools registered."}
+          </div>
+        )}
       </div>
     </div>
   );
