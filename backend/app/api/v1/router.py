@@ -43,6 +43,7 @@ from app.api.v1.search.router import router as search_router
 from app.api.v1.services import router as services_router
 from app.api.v1.sessions.router import router as sessions_router
 from app.api.v1.settings.router import router as settings_router
+from app.api.v1.tags import router as tags_router
 from app.api.v1.tailscale import router as tailscale_router
 from app.api.v1.users.router import router as users_router
 from app.api.v1.version import router as version_router
@@ -97,6 +98,7 @@ api_v1_router.include_router(services_router, prefix="/services", tags=["service
 api_v1_router.include_router(sessions_router, prefix="/sessions", tags=["sessions"])
 api_v1_router.include_router(settings_router, prefix="/settings", tags=["settings"])
 api_v1_router.include_router(sites_router, prefix="/sites", tags=["sites"])
+api_v1_router.include_router(tags_router, prefix="/tags", tags=["tags"])
 api_v1_router.include_router(tailscale_router, prefix="/tailscale", tags=["tailscale"])
 api_v1_router.include_router(users_router, prefix="/users", tags=["users"])
 api_v1_router.include_router(version_router, prefix="/version", tags=["version"])
