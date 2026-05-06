@@ -22,7 +22,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.ai import AIOperationProposal
 from app.models.auth import User
 from app.services.ai import operations
-from app.services.ai.operations import CreateIPAddressArgs, RunNmapScanArgs
+from app.services.ai.operations import (
+    ArchiveSessionArgs,
+    CreateAlertRuleArgs,
+    CreateDHCPStaticArgs,
+    CreateDNSRecordArgs,
+    CreateIPAddressArgs,
+    RunNmapScanArgs,
+)
 from app.services.ai.tools.base import register_tool
 
 
@@ -160,3 +167,147 @@ async def propose_run_nmap_scan(
         preview_text=preview.preview_text,
     )
     return _proposal_result(proposal, preview_text=preview.preview_text)
+
+
+# ── Tier 5 propose_* tools (issue #101) ───────────────────────────────
+#
+# Each one mirrors the existing pattern: tool itself is read-only
+# (writes=False — the actual mutation happens at /apply time after
+# operator approval); the underlying registered Operation enforces
+# the preview + apply contract; ``_persist_proposal`` writes the
+# AIOperationProposal row that the chat drawer renders as an Approve
+# / Reject card.
+#
+# All four ship default-disabled so an operator who hasn't reviewed
+# the implications doesn't accidentally hand the LLM keys to their
+# DNS / DHCP / alert / chat tables. Enable per-tool via Settings →
+# AI → Tool Catalog (the catalog page now confirm-modals before
+# turning on any propose_* tool — see frontend treatment of the
+# ``propose_`` name prefix).
+
+
+async def _propose_via(
+    *,
+    db: AsyncSession,
+    user: User,
+    operation_name: str,
+    args: Any,
+) -> dict[str, Any]:
+    """Shared boilerplate — look up the Operation, run preview, persist
+    proposal on success, surface the rejection on failure."""
+    op = operations.get_operation(operation_name)
+    if op is None:
+        return {"error": f"Operation {operation_name!r} is not registered"}
+    preview = await op.preview(db, user, args)
+    if not preview.ok:
+        return {
+            "kind": "proposal_rejected",
+            "operation": operation_name,
+            "detail": preview.detail,
+        }
+    proposal = await _persist_proposal(
+        db,
+        user=user,
+        operation=operation_name,
+        args=args.model_dump(),
+        preview_text=preview.preview_text,
+    )
+    return _proposal_result(proposal, preview_text=preview.preview_text)
+
+
+# ── propose_create_dns_record ─────────────────────────────────────────
+
+
+@register_tool(
+    name="propose_create_dns_record",
+    description=(
+        "Prepare a DNS record creation proposal. Operator must click "
+        "Approve in the chat drawer to apply — DNS edits propagate to "
+        "live BIND9 / Windows DNS servers. Use when the operator says "
+        "'create an A record for foo pointing at 10.0.0.5' or similar. "
+        "Pass zone_id (UUID), name (relative — '@' for apex), "
+        "record_type, value; ttl + priority are optional. Returns a "
+        "kind='proposal' card; never call twice for the same change."
+    ),
+    args_model=CreateDNSRecordArgs,
+    writes=False,
+    category="dns",
+    default_enabled=False,
+)
+async def propose_create_dns_record(
+    db: AsyncSession, user: User, args: CreateDNSRecordArgs
+) -> dict[str, Any]:
+    return await _propose_via(db=db, user=user, operation_name="create_dns_record", args=args)
+
+
+# ── propose_create_dhcp_static ────────────────────────────────────────
+
+
+@register_tool(
+    name="propose_create_dhcp_static",
+    description=(
+        "Prepare a DHCP static reservation proposal. Operator must "
+        "click Approve to apply — the reservation propagates to the "
+        "Kea / Windows DHCP backend. Pass scope_id (UUID), ip_address "
+        "(must lie inside the scope), mac_address; hostname + "
+        "description are optional. Use when the operator says 'pin "
+        "11:22:33:44:55:66 to 10.0.0.7 in the corp scope'."
+    ),
+    args_model=CreateDHCPStaticArgs,
+    writes=False,
+    category="dhcp",
+    default_enabled=False,
+)
+async def propose_create_dhcp_static(
+    db: AsyncSession, user: User, args: CreateDHCPStaticArgs
+) -> dict[str, Any]:
+    return await _propose_via(db=db, user=user, operation_name="create_dhcp_static", args=args)
+
+
+# ── propose_create_alert_rule ─────────────────────────────────────────
+
+
+@register_tool(
+    name="propose_create_alert_rule",
+    description=(
+        "Prepare a subnet-utilization alert rule proposal. Pass name, "
+        "threshold_percent (1-100), severity (info / warning / "
+        "critical), and an optional description. Other rule_type "
+        "values keep their UI authoring path; this proposer is "
+        "scoped to subnet-utilization which is the most common "
+        "operator request. Returns a kind='proposal' card; operator "
+        "clicks Approve to actually create the rule."
+    ),
+    args_model=CreateAlertRuleArgs,
+    writes=False,
+    category="ops",
+    default_enabled=False,
+)
+async def propose_create_alert_rule(
+    db: AsyncSession, user: User, args: CreateAlertRuleArgs
+) -> dict[str, Any]:
+    return await _propose_via(db=db, user=user, operation_name="create_alert_rule", args=args)
+
+
+# ── propose_archive_session ───────────────────────────────────────────
+
+
+@register_tool(
+    name="propose_archive_session",
+    description=(
+        "Prepare a chat-session archive proposal. Hides the named "
+        "session from the History panel's default view without "
+        "deleting it; the row stays restorable. Operator can only "
+        "archive their own sessions — preview rejects cross-user "
+        "attempts. Use when the operator says 'archive this chat' or "
+        "'hide my old debugging sessions'."
+    ),
+    args_model=ArchiveSessionArgs,
+    writes=False,
+    category="ops",
+    default_enabled=False,
+)
+async def propose_archive_session(
+    db: AsyncSession, user: User, args: ArchiveSessionArgs
+) -> dict[str, Any]:
+    return await _propose_via(db=db, user=user, operation_name="archive_session", args=args)

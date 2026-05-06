@@ -100,7 +100,60 @@ last three releases retroactively.
   surface in lock-step with the sidebar. Operators who pinned an
   explicit `platform_override` won't auto-get the new tools — by
   design; they'll appear as disabled rows in the Tool Catalog
-  page so the operator can opt in. Total tool count: 47 → 53.
+  page so the operator can opt in.
+- **Operator Copilot — Tier 4 tool wave (issue \#101).** Ten new
+  read-only tools across two modules. New `tools/integrations.py`
+  with `list_kubernetes_targets` / `list_docker_targets` /
+  `list_proxmox_targets` / `list_tailscale_targets` — each gated
+  by the matching `integrations.*` feature_module so disabling
+  the integration in Settings → Features removes the tool from
+  the AI surface. Output is intentionally narrow — credentials,
+  CA bundles, encrypted keys never appear; just name / endpoint /
+  enabled flag / last-sync timestamp + error / IPAM space binding.
+  New `tools/observability.py` with `query_dns_query_log` (BIND9
+  query log; qname / qtype / client_ip / view / since-window
+  filters), `query_dhcp_activity_log` (Kea activity log; severity
+  / log code / MAC / IP filters), `query_logs` (inventory of which
+  log sources are populated in the last N hours — operators run
+  this once per chat to learn what's available), `get_dns_query_rate`
+  + `get_dhcp_lease_rate` (timeseries roll-ups from the
+  `dns_metric_sample` / `dhcp_metric_sample` tables, capped at 24
+  buckets), and `global_search` (cross-resource lookup that
+  reuses the same internal helpers as the Cmd-K palette via lazy
+  import to avoid pulling FastAPI router glue at boot).
+- **Operator Copilot — Tier 5 write proposals (issue \#101).**
+  Four new `propose_*` tools that stage write actions for the
+  operator to Approve / Reject in the chat drawer:
+  `propose_create_dns_record` (zone_id + name + record_type +
+  value + optional ttl/priority; preview probes for an identical
+  existing record and surfaces it as a hint without rejecting),
+  `propose_create_dhcp_static` (scope_id + ip_address + mac_address
+  + optional hostname/description; preview rejects on out-of-scope
+  IPs and warns on conflicting IP/MAC reservations),
+  `propose_create_alert_rule` (subnet-utilization rule_type only —
+  the simplest case; other rule_types keep their UI authoring
+  path), `propose_archive_session` (sets
+  `AIChatSession.archived_at = now()`; preview rejects cross-user
+  attempts so operators can only archive their own sessions). All
+  four ship default-disabled — operators opt in per-tool via
+  Settings → AI → Tool Catalog. Each underlying mutation lives
+  as a registered `Operation` in `services/ai/operations.py` with
+  a preview / apply pair and writes an audit row tagged
+  `via=ai_proposal` at apply time. **Double validation to enable**:
+  the Tool Catalog page now detects the `propose_` name prefix
+  and shows a confirm modal before turning on any such tool —
+  even bulk "Enable all" on a category routes write proposals
+  through the modal so the AI can't be silently armed with write
+  capability. Bonus visual cue: each propose_ tool now renders a
+  yellow "proposal" badge in the catalog so they read as distinct
+  from read-only tools at a glance. Total tool count: 47 → 67
+  (10 of those default-disabled, including the 4 propose_ tools
+  and the 4 integration list_targets gated behind their default-
+  off feature_module). Deferred from Tier 5 per the issue's
+  "needs UX thought" note: `propose_create_subnet` (too many edge
+  cases — auto-allocate network/broadcast rows, parent-block
+  overlap checks, allocation policy) and the `propose_delete_*`
+  family (cascade-impact preview is a separate design pass).
 - **Release-note formatting — flowing prose + emoji section
   headings.** New `scripts/format_release_notes.py` runs between
   the changelog awk-extract and the GitHub release body in

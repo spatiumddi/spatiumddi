@@ -1,13 +1,31 @@
 import { useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Boxes, RefreshCcw, RotateCcw, Sparkles } from "lucide-react";
+import {
+  AlertTriangle,
+  Boxes,
+  RefreshCcw,
+  RotateCcw,
+  Sparkles,
+} from "lucide-react";
 import {
   aiToolCatalogApi,
   type AIToolCatalog,
   type AIToolCatalogEntry,
 } from "@/lib/api";
+import { Modal } from "@/components/ui/modal";
 import { Toggle } from "@/components/ui/toggle";
 import { cn } from "@/lib/utils";
+
+// Tools whose name starts with this prefix stage write proposals
+// — operators see an Approve / Reject card in the chat drawer
+// after the LLM calls one. Enabling such a tool means the AI can
+// PREPARE a write; the human still has to click Approve. We gate
+// enable with a confirm modal so it's a deliberate two-step act.
+const WRITE_PROPOSAL_PREFIX = "propose_";
+
+function isWriteProposal(t: AIToolCatalogEntry): boolean {
+  return t.writes || t.name.startsWith(WRITE_PROPOSAL_PREFIX);
+}
 
 const headerCls =
   "flex shrink-0 items-center gap-1.5 rounded-md border bg-background px-3 py-1.5 text-sm hover:bg-muted disabled:opacity-50";
@@ -86,24 +104,57 @@ export function AIToolCatalogPage() {
     },
   });
 
+  // When the operator flips on a write-proposal tool we show a
+  // confirm modal first (per-issue-#101 "double validation to enable
+  // them"). Stash the pending toggle in state until the operator
+  // confirms; bulk "Enable all" on a category that contains write
+  // proposals also routes through the modal so it can't sneak by.
+  const [pendingEnable, setPendingEnable] = useState<{
+    label: string;
+    names: string[];
+  } | null>(null);
+
   function currentEnabledNames(): string[] {
     return (data?.tools ?? []).filter((t) => t.enabled).map((t) => t.name);
   }
 
-  function toggleOne(name: string, next: boolean) {
+  function commitToggle(toAdd: string[], toRemove: string[]) {
     const current = new Set(currentEnabledNames());
-    if (next) current.add(name);
-    else current.delete(name);
+    for (const n of toAdd) current.add(n);
+    for (const n of toRemove) current.delete(n);
     updateMutation.mutate([...current].sort());
   }
 
-  function setGroup(names: string[], next: boolean) {
-    const current = new Set(currentEnabledNames());
-    for (const n of names) {
-      if (next) current.add(n);
-      else current.delete(n);
+  function toggleOne(t: AIToolCatalogEntry, next: boolean) {
+    if (next && isWriteProposal(t)) {
+      setPendingEnable({ label: t.name, names: [t.name] });
+      return;
     }
-    updateMutation.mutate([...current].sort());
+    commitToggle(next ? [t.name] : [], next ? [] : [t.name]);
+  }
+
+  function setGroup(tools: AIToolCatalogEntry[], next: boolean) {
+    if (next) {
+      const writeProposals = tools.filter(isWriteProposal).map((t) => t.name);
+      const safe = tools.filter((t) => !isWriteProposal(t)).map((t) => t.name);
+      // Apply the safe ones immediately; gate the write proposals
+      // behind the confirm modal so a single "Enable all" click can't
+      // silently arm the LLM with write capability.
+      if (safe.length) {
+        commitToggle(safe, []);
+      }
+      if (writeProposals.length) {
+        setPendingEnable({
+          label: `${writeProposals.length} write-proposal tool(s)`,
+          names: writeProposals,
+        });
+      }
+      return;
+    }
+    commitToggle(
+      [],
+      tools.map((t) => t.name),
+    );
   }
 
   const grouped = useMemo(() => {
@@ -252,12 +303,7 @@ export function AIToolCatalogPage() {
                   </span>
                   <button
                     type="button"
-                    onClick={() =>
-                      setGroup(
-                        tools.map((t) => t.name),
-                        !allOn,
-                      )
-                    }
+                    onClick={() => setGroup(tools, !allOn)}
                     disabled={updateMutation.isPending}
                     className="text-[10px] font-normal normal-case tracking-normal text-muted-foreground hover:text-foreground disabled:opacity-50"
                   >
@@ -287,6 +333,15 @@ export function AIToolCatalogPage() {
                                 writes
                               </span>
                             )}
+                            {!t.writes &&
+                              t.name.startsWith(WRITE_PROPOSAL_PREFIX) && (
+                                <span
+                                  className="rounded bg-amber-500/15 px-1 py-px text-[9px] font-medium text-amber-700 dark:text-amber-400"
+                                  title="Stages a write proposal — operator must Approve in the chat drawer for the change to land"
+                                >
+                                  proposal
+                                </span>
+                              )}
                             {overridden && (
                               <span
                                 className="rounded bg-amber-500/15 px-1 py-px text-[9px] font-medium text-amber-700 dark:text-amber-400"
@@ -305,7 +360,7 @@ export function AIToolCatalogPage() {
                             label={`${t.enabled ? "Disable" : "Enable"} ${t.name}`}
                             checked={t.enabled}
                             disabled={updateMutation.isPending}
-                            onChange={(v) => toggleOne(t.name, v)}
+                            onChange={(v) => toggleOne(t, v)}
                           />
                         </div>
                       </div>
@@ -345,6 +400,54 @@ export function AIToolCatalogPage() {
           </div>
         )}
       </div>
+      {pendingEnable && (
+        <Modal
+          title="Enable write-proposal tool?"
+          onClose={() => setPendingEnable(null)}
+        >
+          <div className="space-y-3 text-sm">
+            <div className="flex items-start gap-2 rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-amber-900 dark:text-amber-200">
+              <AlertTriangle className="mt-0.5 h-4 w-4 flex-shrink-0" />
+              <div className="space-y-2">
+                <p className="font-medium">
+                  About to enable: {pendingEnable.label}
+                </p>
+                <p className="text-xs leading-snug">
+                  Tools whose name starts with <code>propose_</code> let the
+                  Operator Copilot <em>stage</em> write actions — DNS records,
+                  DHCP statics, alert rules, and so on. The actual change never
+                  runs until you click Approve on the proposal card in the chat
+                  drawer, but enabling these tools means the AI can prepare
+                  write payloads on your behalf.
+                </p>
+                <p className="text-xs leading-snug">
+                  If you're not sure, leave them disabled — the read-only tools
+                  above answer most operator questions without write access.
+                </p>
+              </div>
+            </div>
+            <div className="flex justify-end gap-2 pt-2">
+              <button
+                type="button"
+                onClick={() => setPendingEnable(null)}
+                className="rounded-md border bg-background px-3 py-1.5 text-sm hover:bg-muted"
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  commitToggle(pendingEnable.names, []);
+                  setPendingEnable(null);
+                }}
+                className="rounded-md bg-amber-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-amber-700"
+              >
+                Enable {pendingEnable.names.length === 1 ? "tool" : "tools"}
+              </button>
+            </div>
+          </div>
+        </Modal>
+      )}
     </div>
   );
 }
