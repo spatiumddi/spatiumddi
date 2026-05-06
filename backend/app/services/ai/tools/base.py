@@ -67,6 +67,14 @@ class Tool:
     # ``PlatformSettings.ai_tools_enabled`` and per-provider via
     # ``AIProvider.enabled_tools``.
     default_enabled: bool = True
+    # Optional feature-module id (see
+    # ``app.services.feature_modules.MODULES``). When set and the
+    # operator has disabled that module, the tool is stripped from
+    # the registry's effective set regardless of its
+    # ``default_enabled`` / per-platform / per-provider state. None
+    # means "always available" (the cross-cutting tools — IPAM/DNS/DHCP
+    # core lookups, ops helpers).
+    module: str | None = None
 
     def parameters_schema(self) -> dict[str, Any]:
         """JSON Schema for the args. Both OpenAI and MCP consume this
@@ -180,6 +188,7 @@ def register_tool(
     writes: bool = False,
     category: str = "ops",
     default_enabled: bool = True,
+    module: str | None = None,
 ) -> Callable[[ToolExecutor], ToolExecutor]:
     """Decorator. Use on each tool's executor function.
 
@@ -210,6 +219,7 @@ def register_tool(
                 writes=writes,
                 category=category,
                 default_enabled=default_enabled,
+                module=module,
             )
         )
         return fn
@@ -248,6 +258,7 @@ def effective_tool_names(
     *,
     platform_enabled: list[str] | None,
     provider_enabled: list[str] | None,
+    enabled_modules: set[str] | None = None,
 ) -> set[str]:
     """Resolve which tools are enabled for *this* request.
 
@@ -258,6 +269,12 @@ def effective_tool_names(
        explicit list (operator's Tool Catalog override).
     3. If ``provider_enabled`` is non-NULL, intersect with it
        (per-provider narrowing for small-context models).
+    4. If ``enabled_modules`` is non-NULL, drop every tool whose
+       ``module`` id isn't in that set. ``module=None`` is always
+       kept. This makes feature-module toggles a hard kill-switch
+       over the AI surface — disabling ``network.customer`` removes
+       the customer find/count tools regardless of any catalog or
+       provider override.
 
     NULL at any layer means "no override at this layer" — the
     behaviour falls through to the wider layer.
@@ -273,4 +290,11 @@ def effective_tool_names(
         eligible = platform & registered
     if provider_enabled is not None:
         eligible &= set(provider_enabled)
+    if enabled_modules is not None:
+        modules_by_tool = {t.name: t.module for t in REGISTRY.all()}
+        eligible = {
+            n
+            for n in eligible
+            if modules_by_tool.get(n) is None or modules_by_tool[n] in enabled_modules
+        }
     return eligible

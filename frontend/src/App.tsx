@@ -40,6 +40,7 @@ import { AuditPage } from "@/pages/admin/AuditPage";
 import { AIProvidersPage } from "@/pages/admin/AIProvidersPage";
 import { AIPromptsPage } from "@/pages/admin/AIPromptsPage";
 import { AIToolCatalogPage } from "@/pages/admin/AIToolCatalogPage";
+import { FeaturesPage } from "@/pages/admin/FeaturesPage";
 import { CustomFieldsPage } from "@/pages/admin/CustomFieldsPage";
 import { IPAMTemplatesPage } from "@/pages/admin/IPAMTemplatesPage";
 import { ApiTokensPage } from "@/pages/admin/ApiTokensPage";
@@ -130,6 +131,7 @@ export default function App() {
         <Route path="admin/ai/providers" element={<AIProvidersPage />} />
         <Route path="admin/ai/prompts" element={<AIPromptsPage />} />
         <Route path="admin/ai/tools" element={<AIToolCatalogPage />} />
+        <Route path="admin/features" element={<FeaturesPage />} />
         <Route path="admin/custom-fields" element={<CustomFieldsPage />} />
         <Route path="admin/ipam/templates" element={<IPAMTemplatesPage />} />
         <Route path="admin/auth-providers" element={<AuthProvidersPage />} />

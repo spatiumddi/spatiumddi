@@ -123,6 +123,7 @@ async def propose_create_ip_address(
 
 @register_tool(
     name="propose_run_nmap_scan",
+    module="tools.nmap",
     description=(
         "Prepare an nmap scan proposal. The operator must explicitly "
         "click Apply for the scan to actually run — nmap touches the "

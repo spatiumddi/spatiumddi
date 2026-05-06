@@ -46,10 +46,12 @@ import {
   Webhook,
   Workflow,
   Monitor,
+  ToggleLeft,
   X,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { settingsApi, versionApi } from "@/lib/api";
+import { versionApi } from "@/lib/api";
+import { useFeatureModules } from "@/hooks/useFeatureModules";
 import { useSessionState } from "@/lib/useSessionState";
 import logoIcon from "@/assets/logo-icon.svg";
 
@@ -80,24 +82,78 @@ const baseMainNav = [
 //
 // Each list is alphabetised so new entries slot in without
 // reshuffling.
+// Each network nav item carries the feature-module id that gates it
+// (see ``app.services.feature_modules.MODULES`` on the backend). The
+// renderer below filters by ``useFeatureModules.enabled(id)`` so a
+// disabled module disappears from the sidebar entirely.
 const networkLogicalNav = [
-  { label: "Customers", icon: Briefcase, to: "/network/customers" },
-  { label: "Providers", icon: Truck, to: "/network/providers" },
-  { label: "Services", icon: Package, to: "/network/services" },
-  { label: "Sites", icon: MapPin, to: "/network/sites" },
+  {
+    label: "Customers",
+    icon: Briefcase,
+    to: "/network/customers",
+    module: "network.customer",
+  },
+  {
+    label: "Providers",
+    icon: Truck,
+    to: "/network/providers",
+    module: "network.provider",
+  },
+  {
+    label: "Services",
+    icon: Package,
+    to: "/network/services",
+    module: "network.service",
+  },
+  {
+    label: "Sites",
+    icon: MapPin,
+    to: "/network/sites",
+    module: "network.site",
+  },
 ];
 const networkInfrastructureNav = [
-  { label: "ASNs", icon: Hash, to: "/network/asns" },
-  { label: "Circuits", icon: Waypoints, to: "/network/circuits" },
-  { label: "Devices", icon: Cable, to: "/network/devices" },
-  { label: "Overlays", icon: Spline, to: "/network/overlays" },
-  { label: "VLANs", icon: RouterIcon, to: "/network/vlans" },
-  { label: "VRFs", icon: RouteIcon, to: "/network/vrfs" },
+  {
+    label: "ASNs",
+    icon: Hash,
+    to: "/network/asns",
+    module: "network.asn",
+  },
+  {
+    label: "Circuits",
+    icon: Waypoints,
+    to: "/network/circuits",
+    module: "network.circuit",
+  },
+  {
+    label: "Devices",
+    icon: Cable,
+    to: "/network/devices",
+    module: "network.device",
+  },
+  {
+    label: "Overlays",
+    icon: Spline,
+    to: "/network/overlays",
+    module: "network.overlay",
+  },
+  {
+    label: "VLANs",
+    icon: RouterIcon,
+    to: "/network/vlans",
+    module: "network.vlan",
+  },
+  {
+    label: "VRFs",
+    icon: RouteIcon,
+    to: "/network/vrfs",
+    module: "network.vrf",
+  },
 ];
 
 const toolsNav = [
   { label: "CIDR Calculator", icon: Calculator, to: "/tools/cidr" },
-  { label: "Nmap", icon: Search, to: "/tools/nmap" },
+  { label: "Nmap", icon: Search, to: "/tools/nmap", module: "tools.nmap" },
 ];
 
 const adminIdentityNav = [
@@ -117,10 +173,26 @@ const adminIdentityNav = [
 // the one entry every operator hits often enough that it earns
 // dedicated chrome.
 const adminConfigurationNav = [
-  { label: "AI Providers", icon: Sparkles, to: "/admin/ai/providers" },
-  { label: "AI Prompts", icon: Sparkles, to: "/admin/ai/prompts" },
-  { label: "AI Tool Catalog", icon: Sparkles, to: "/admin/ai/tools" },
+  {
+    label: "AI Providers",
+    icon: Sparkles,
+    to: "/admin/ai/providers",
+    module: "ai.copilot",
+  },
+  {
+    label: "AI Prompts",
+    icon: Sparkles,
+    to: "/admin/ai/prompts",
+    module: "ai.copilot",
+  },
+  {
+    label: "AI Tool Catalog",
+    icon: Sparkles,
+    to: "/admin/ai/tools",
+    module: "ai.copilot",
+  },
   { label: "Custom Fields", icon: Tags, to: "/admin/custom-fields" },
+  { label: "Features", icon: ToggleLeft, to: "/admin/features" },
   {
     label: "IPAM Templates",
     icon: LayoutTemplate,
@@ -136,7 +208,12 @@ const adminNotificationsNav = [
 const adminInsightsNav = [
   { label: "Audit Log", icon: ClipboardList, to: "/admin/audit" },
   { label: "Compliance", icon: ShieldCheck, to: "/admin/compliance" },
-  { label: "Conformity", icon: ShieldCheck, to: "/admin/conformity" },
+  {
+    label: "Conformity",
+    icon: ShieldCheck,
+    to: "/admin/conformity",
+    module: "compliance.conformity",
+  },
   { label: "Platform Insights", icon: Cpu, to: "/admin/platform-insights" },
   { label: "Trash", icon: Trash2, to: "/admin/trash" },
 ];
@@ -348,34 +425,36 @@ export function Sidebar({
   const latestVersion = versionInfo?.latest_version ?? null;
   const latestReleaseUrl = versionInfo?.latest_release_url ?? null;
 
-  // Platform settings drive which integration nav items are visible.
-  // The settings endpoint is post-login only, so no need to guard —
-  // the sidebar itself doesn't render on the login page.
-  const { data: platformSettings } = useQuery({
-    queryKey: ["settings"],
-    queryFn: settingsApi.get,
-    staleTime: 5 * 60 * 1000,
-  });
+  // Feature-module toggles — disabled modules drop their nav items
+  // entirely (drive both the togglable feature surfaces and the
+  // integration visibility flags formerly read from PlatformSettings).
+  // Loading / error state defaults to "everything visible" so the
+  // sidebar never blinks empty on a slow network.
+  const { enabled: moduleEnabled } = useFeatureModules();
+  const filterByModule = <T extends { module?: string }>(items: T[]): T[] =>
+    items.filter((it) => !it.module || moduleEnabled(it.module));
 
   // Integrations live in their own sidebar section, rendered between
   // the main nav and the admin nav, but only when at least one
-  // integration is enabled. Each integration contributes one entry
-  // — kept declarative so adding a future integration is a one-line
-  // extension here and a toggle on PlatformSettings.
+  // integration is enabled. Each integration's visibility is gated
+  // by its feature_module id (Settings → Features → Integrations);
+  // the matching ``PlatformSettings.integration_*_enabled`` columns
+  // are kept in lock-step by the toggle endpoint so reconciler tasks
+  // don't need to migrate.
   // Sorted alphabetically by label so the order is stable regardless
   // of the order we added integrations here — adding a new one later
   // shouldn't re-shuffle the sidebar for operators already using it.
   const integrationsNav = [
-    ...(platformSettings?.integration_kubernetes_enabled
+    ...(moduleEnabled("integrations.kubernetes")
       ? [{ label: "Kubernetes", icon: Boxes, to: "/kubernetes" }]
       : []),
-    ...(platformSettings?.integration_docker_enabled
+    ...(moduleEnabled("integrations.docker")
       ? [{ label: "Docker", icon: ContainerIcon, to: "/docker" }]
       : []),
-    ...(platformSettings?.integration_proxmox_enabled
+    ...(moduleEnabled("integrations.proxmox")
       ? [{ label: "Proxmox", icon: HardDrive, to: "/proxmox" }]
       : []),
-    ...(platformSettings?.integration_tailscale_enabled
+    ...(moduleEnabled("integrations.tailscale")
       ? [{ label: "Tailscale", icon: Waypoints, to: "/tailscale" }]
       : []),
   ].sort((a, b) => a.label.localeCompare(b.label));
@@ -447,50 +526,76 @@ export function Sidebar({
             ))}
           </NavSection>
 
-          <NavSection
-            label="Network"
-            storageKey="sidebar-section-network-open"
-            collapsed={effectiveCollapsed}
-            showDivider
-          >
-            <SubNavLabel label="Logical" collapsed={effectiveCollapsed} />
-            {networkLogicalNav.map((item) => (
-              <NavItem
-                key={item.to}
-                {...item}
+          {(() => {
+            const visibleLogical = filterByModule(networkLogicalNav);
+            const visibleInfra = filterByModule(networkInfrastructureNav);
+            // Hide the whole Network section if everything inside is
+            // disabled — otherwise we'd render an empty header.
+            if (visibleLogical.length + visibleInfra.length === 0) return null;
+            return (
+              <NavSection
+                label="Network"
+                storageKey="sidebar-section-network-open"
                 collapsed={effectiveCollapsed}
-                onNavigate={mobileOpen ? onMobileClose : undefined}
-              />
-            ))}
-            <SubNavLabel
-              label="Infrastructure"
-              collapsed={effectiveCollapsed}
-            />
-            {networkInfrastructureNav.map((item) => (
-              <NavItem
-                key={item.to}
-                {...item}
-                collapsed={effectiveCollapsed}
-                onNavigate={mobileOpen ? onMobileClose : undefined}
-              />
-            ))}
-          </NavSection>
+                showDivider
+              >
+                {visibleLogical.length > 0 && (
+                  <>
+                    <SubNavLabel
+                      label="Logical"
+                      collapsed={effectiveCollapsed}
+                    />
+                    {visibleLogical.map((item) => (
+                      <NavItem
+                        key={item.to}
+                        {...item}
+                        collapsed={effectiveCollapsed}
+                        onNavigate={mobileOpen ? onMobileClose : undefined}
+                      />
+                    ))}
+                  </>
+                )}
+                {visibleInfra.length > 0 && (
+                  <>
+                    <SubNavLabel
+                      label="Infrastructure"
+                      collapsed={effectiveCollapsed}
+                    />
+                    {visibleInfra.map((item) => (
+                      <NavItem
+                        key={item.to}
+                        {...item}
+                        collapsed={effectiveCollapsed}
+                        onNavigate={mobileOpen ? onMobileClose : undefined}
+                      />
+                    ))}
+                  </>
+                )}
+              </NavSection>
+            );
+          })()}
 
-          <NavSection
-            label="Tools"
-            storageKey="sidebar-section-tools-open"
-            collapsed={effectiveCollapsed}
-            showDivider
-          >
-            {toolsNav.map((item) => (
-              <NavItem
-                key={item.to}
-                {...item}
+          {(() => {
+            const visibleTools = filterByModule(toolsNav);
+            if (visibleTools.length === 0) return null;
+            return (
+              <NavSection
+                label="Tools"
+                storageKey="sidebar-section-tools-open"
                 collapsed={effectiveCollapsed}
-                onNavigate={mobileOpen ? onMobileClose : undefined}
-              />
-            ))}
-          </NavSection>
+                showDivider
+              >
+                {visibleTools.map((item) => (
+                  <NavItem
+                    key={item.to}
+                    {...item}
+                    collapsed={effectiveCollapsed}
+                    onNavigate={mobileOpen ? onMobileClose : undefined}
+                  />
+                ))}
+              </NavSection>
+            );
+          })()}
 
           {integrationsNav.length > 0 && (
             <NavSection
@@ -526,7 +631,7 @@ export function Sidebar({
               />
             ))}
             <SubNavLabel label="Configuration" collapsed={effectiveCollapsed} />
-            {adminConfigurationNav.map((item) => (
+            {filterByModule(adminConfigurationNav).map((item) => (
               <NavItem
                 key={item.to}
                 {...item}
@@ -547,7 +652,7 @@ export function Sidebar({
               label="Insights & Audit"
               collapsed={effectiveCollapsed}
             />
-            {adminInsightsNav.map((item) => (
+            {filterByModule(adminInsightsNav).map((item) => (
               <NavItem
                 key={item.to}
                 {...item}

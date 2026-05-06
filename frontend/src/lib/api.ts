@@ -1997,6 +1997,29 @@ export const aiToolCatalogApi = {
       .then((r) => r.data),
 };
 
+// ── Feature modules ──────────────────────────────────────────────────
+//
+// Operator-controlled visibility for whole sidebar / REST / MCP
+// surfaces. The sidebar + Cmd-K palette query this on mount so a
+// disabled module disappears entirely. Toggling is superadmin-only.
+export interface FeatureModuleEntry {
+  id: string;
+  label: string;
+  group: string;
+  description: string;
+  default_enabled: boolean;
+  enabled: boolean;
+}
+
+export const featureModulesApi = {
+  list: () =>
+    api.get<FeatureModuleEntry[]>("/admin/feature-modules").then((r) => r.data),
+  toggle: (id: string, enabled: boolean) =>
+    api
+      .patch<FeatureModuleEntry>(`/admin/feature-modules/${id}`, { enabled })
+      .then((r) => r.data),
+};
+
 export const auditApi = {
   list: (params?: {
     limit?: number;

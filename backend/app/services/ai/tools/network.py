@@ -47,6 +47,7 @@ class ListDevicesArgs(BaseModel):
 
 @register_tool(
     name="list_network_devices",
+    module="network.device",
     description=(
         "List SNMP-polled network devices (routers / switches / APs / "
         "firewalls). Each summary includes name, IP, device type, "
@@ -275,6 +276,7 @@ def _normalize_mac(value: str) -> str:
 
 @register_tool(
     name="find_switchport",
+    module="network.device",
     description=(
         "Find which switch port an IP / MAC is plugged into. Joins "
         "the SNMP-polled FDB (MAC→port) with the ARP table or IPAM "

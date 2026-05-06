@@ -19,6 +19,7 @@ import {
 } from "lucide-react";
 import { cn } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
+import { Toggle } from "@/components/ui/toggle";
 import { AuditForwardTargets } from "@/components/AuditForwardTargets";
 
 const OUI_SOURCE_URL = "https://standards-oui.ieee.org/oui/oui.csv";
@@ -45,36 +46,6 @@ function Field({
   );
 }
 
-function Toggle({
-  checked,
-  onChange,
-  disabled,
-}: {
-  checked: boolean;
-  onChange: (v: boolean) => void;
-  disabled?: boolean;
-}) {
-  return (
-    <button
-      role="switch"
-      aria-checked={checked}
-      onClick={() => !disabled && onChange(!checked)}
-      disabled={disabled}
-      className={cn(
-        "relative inline-flex h-5 w-9 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors focus:outline-none disabled:opacity-60",
-        checked ? "bg-primary" : "bg-muted-foreground/30",
-      )}
-    >
-      <span
-        className={cn(
-          "pointer-events-none inline-block h-4 w-4 transform rounded-full bg-white shadow transition-transform",
-          checked ? "translate-x-4" : "translate-x-0",
-        )}
-      />
-    </button>
-  );
-}
-
 type SectionId =
   | "branding"
   | "dns"
@@ -83,10 +54,6 @@ type SectionId =
   | "dhcp"
   | "dhcp-lease-sync"
   | "audit-forward"
-  | "integrations-kubernetes"
-  | "integrations-docker"
-  | "integrations-proxmox"
-  | "integrations-tailscale"
   | "ip-allocation"
   | "oui-lookup"
   | "device-profiling"
@@ -108,7 +75,6 @@ type SectionGroup =
   | "DNS"
   | "DHCP"
   | "Network"
-  | "Integrations"
   | "AI";
 
 interface SectionDef {
@@ -130,7 +96,6 @@ const GROUP_ORDER: SectionGroup[] = [
   "DNS",
   "DHCP",
   "Network",
-  "Integrations",
 ];
 
 // Which PlatformSettings keys each section owns — drives the per-section
@@ -169,10 +134,6 @@ const SECTION_FIELDS: Record<SectionId, (keyof PlatformSettings)[]> = {
   // service); they're intentionally not listed here so the singleton
   // Save button doesn't hit them.
   "audit-forward": [],
-  "integrations-kubernetes": ["integration_kubernetes_enabled"],
-  "integrations-docker": ["integration_docker_enabled"],
-  "integrations-proxmox": ["integration_proxmox_enabled"],
-  "integrations-tailscale": ["integration_tailscale_enabled"],
   "ip-allocation": ["ip_allocation_strategy"],
   "oui-lookup": ["oui_lookup_enabled", "oui_update_interval_hours"],
   "device-profiling": ["fingerbank_api_key"],
@@ -934,86 +895,11 @@ const SECTIONS: SectionDef[] = [
     ],
   },
 
-  // ── Integrations ─────────────────────────────────────────────────────
-  {
-    id: "integrations-kubernetes",
-    title: "Kubernetes",
-    group: "Integrations",
-    description:
-      "Connect one or more Kubernetes clusters. When enabled, SpatiumDDI adds a Kubernetes menu item to the sidebar where you manage per-cluster connection configs. Read-only — SpatiumDDI polls the cluster's API server with a service-account token and mirrors LoadBalancer VIPs, Node IPs, cluster CIDRs, and Ingress hostnames into the bound IPAM space + DNS group. Never writes to the cluster.",
-    keywords: [
-      "kubernetes",
-      "k8s",
-      "cluster",
-      "integration",
-      "ingress",
-      "loadbalancer",
-      "ipam",
-      "dns",
-      "service account",
-    ],
-  },
-  {
-    id: "integrations-docker",
-    title: "Docker",
-    group: "Integrations",
-    description:
-      "Connect one or more Docker hosts over Unix socket or TCP+TLS. When enabled, SpatiumDDI adds a Docker menu item to the sidebar where you manage per-host connection configs. Read-only — SpatiumDDI polls each daemon and mirrors Docker networks into the bound IPAM space as subnets, with container IPs as opt-in. Never writes to the daemon.",
-    keywords: [
-      "docker",
-      "container",
-      "compose",
-      "swarm",
-      "integration",
-      "bridge",
-      "network",
-      "ipam",
-      "socket",
-      "tls",
-    ],
-  },
-  {
-    id: "integrations-proxmox",
-    title: "Proxmox",
-    group: "Integrations",
-    description:
-      "Connect one or more Proxmox VE endpoints via the REST API with an API token. A single endpoint can represent a whole cluster (the PVE API is homogeneous across members). Read-only — SpatiumDDI mirrors bridges + VLAN interfaces as subnets, and VMs + LXC containers as IP rows. Runtime IPs come from the QEMU guest-agent (VMs) or the LXC /interfaces endpoint. Never writes to PVE.",
-    keywords: [
-      "proxmox",
-      "pve",
-      "qemu",
-      "lxc",
-      "hypervisor",
-      "vm",
-      "container",
-      "bridge",
-      "cluster",
-      "integration",
-      "ipam",
-      "dns",
-      "token",
-    ],
-  },
-  {
-    id: "integrations-tailscale",
-    title: "Tailscale",
-    group: "Integrations",
-    description:
-      "Connect one or more Tailscale tenants (tailnets) via the Tailscale REST API with a personal-access token. Read-only — SpatiumDDI auto-creates the CGNAT 100.64.0.0/10 IPv4 block + the IPv6 ULA block under the bound IPAM space and mirrors every tailnet device's addresses as IP rows with OS / version / user / tags / routes in custom fields. Never writes to Tailscale.",
-    keywords: [
-      "tailscale",
-      "tailnet",
-      "wireguard",
-      "vpn",
-      "mesh",
-      "magicdns",
-      "cgnat",
-      "integration",
-      "ipam",
-      "pat",
-      "token",
-    ],
-  },
+  // Integrations were removed from this page in favor of a unified
+  // toggle in Settings → Features → Integrations. The corresponding
+  // ``PlatformSettings.integration_*_enabled`` columns are still
+  // mirrored by the toggle endpoint so reconciler tasks gating on
+  // them keep working.
 ];
 
 export function SettingsPage() {
@@ -1169,18 +1055,10 @@ export function SettingsPage() {
                 </button>
               ))
             : GROUP_ORDER.map((group, idx) => {
-                // Integrations: always alphabetical by title so the
-                // order is stable regardless of the source-order that
-                // new integration entries are appended in. Other
-                // groups keep their declared order (the grouping is
-                // intentional — e.g. IPAM Import/Export reads
+                // Each group keeps its declared order — the grouping
+                // is intentional (e.g. IPAM Import/Export reads
                 // naturally grouped, not alphabetized).
-                const entries =
-                  group === "Integrations"
-                    ? SECTIONS.filter((s) => s.group === group)
-                        .slice()
-                        .sort((a, b) => a.title.localeCompare(b.title))
-                    : SECTIONS.filter((s) => s.group === group);
+                const entries = SECTIONS.filter((s) => s.group === group);
                 if (entries.length === 0) return null;
                 return (
                   <div
@@ -2016,115 +1894,6 @@ export function SettingsPage() {
                   disabled={!isSuperadmin}
                 />
               </Field>
-            )}
-
-            {activeId === "integrations-kubernetes" && (
-              <>
-                <Field
-                  label="Enable Kubernetes integration"
-                  description="Adds a Kubernetes menu item to the sidebar. Per-cluster connection configs are managed there."
-                >
-                  <Toggle
-                    checked={!!values.integration_kubernetes_enabled}
-                    onChange={(v) => set("integration_kubernetes_enabled", v)}
-                    disabled={!isSuperadmin}
-                  />
-                </Field>
-                {values.integration_kubernetes_enabled && (
-                  <Field
-                    label="Clusters"
-                    description="Manage connected clusters."
-                  >
-                    <a
-                      href="/kubernetes"
-                      className="inline-flex items-center gap-1 rounded-md border px-3 py-1.5 text-xs hover:bg-accent"
-                    >
-                      Open Kubernetes page →
-                    </a>
-                  </Field>
-                )}
-              </>
-            )}
-
-            {activeId === "integrations-docker" && (
-              <>
-                <Field
-                  label="Enable Docker integration"
-                  description="Adds a Docker menu item to the sidebar. Per-host connection configs are managed there."
-                >
-                  <Toggle
-                    checked={!!values.integration_docker_enabled}
-                    onChange={(v) => set("integration_docker_enabled", v)}
-                    disabled={!isSuperadmin}
-                  />
-                </Field>
-                {values.integration_docker_enabled && (
-                  <Field label="Hosts" description="Manage connected hosts.">
-                    <a
-                      href="/docker"
-                      className="inline-flex items-center gap-1 rounded-md border px-3 py-1.5 text-xs hover:bg-accent"
-                    >
-                      Open Docker page →
-                    </a>
-                  </Field>
-                )}
-              </>
-            )}
-
-            {activeId === "integrations-proxmox" && (
-              <>
-                <Field
-                  label="Enable Proxmox integration"
-                  description="Adds a Proxmox menu item to the sidebar. Per-endpoint connection configs are managed there."
-                >
-                  <Toggle
-                    checked={!!values.integration_proxmox_enabled}
-                    onChange={(v) => set("integration_proxmox_enabled", v)}
-                    disabled={!isSuperadmin}
-                  />
-                </Field>
-                {values.integration_proxmox_enabled && (
-                  <Field
-                    label="Endpoints"
-                    description="Manage connected Proxmox VE endpoints."
-                  >
-                    <a
-                      href="/proxmox"
-                      className="inline-flex items-center gap-1 rounded-md border px-3 py-1.5 text-xs hover:bg-accent"
-                    >
-                      Open Proxmox page →
-                    </a>
-                  </Field>
-                )}
-              </>
-            )}
-
-            {activeId === "integrations-tailscale" && (
-              <>
-                <Field
-                  label="Enable Tailscale integration"
-                  description="Adds a Tailscale menu item to the sidebar. Per-tenant connection configs are managed there."
-                >
-                  <Toggle
-                    checked={!!values.integration_tailscale_enabled}
-                    onChange={(v) => set("integration_tailscale_enabled", v)}
-                    disabled={!isSuperadmin}
-                  />
-                </Field>
-                {values.integration_tailscale_enabled && (
-                  <Field
-                    label="Tenants"
-                    description="Manage connected Tailscale tenants (tailnets)."
-                  >
-                    <a
-                      href="/tailscale"
-                      className="inline-flex items-center gap-1 rounded-md border px-3 py-1.5 text-xs hover:bg-accent"
-                    >
-                      Open Tailscale page →
-                    </a>
-                  </Field>
-                )}
-              </>
             )}
 
             {activeId === "utilization" && (

@@ -73,6 +73,7 @@ class ListNmapScansArgs(BaseModel):
 
 @register_tool(
     name="list_nmap_scans",
+    module="tools.nmap",
     description=(
         "List nmap scans from the on-demand scanner history. Filter "
         "by target IP, IPAM address UUID, status, preset, or a "
@@ -142,6 +143,7 @@ class GetNmapScanResultsArgs(BaseModel):
 
 @register_tool(
     name="get_nmap_scan_results",
+    module="tools.nmap",
     description=(
         "Return full results for one nmap scan: alive / down state, "
         "every port + state + service / version, OS guess + accuracy, "

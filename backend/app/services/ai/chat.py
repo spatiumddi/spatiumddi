@@ -53,6 +53,7 @@ from app.models.dns import DNSRecord, DNSServerGroup, DNSZone
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
 from app.models.network import NetworkDevice
 from app.models.settings import PlatformSettings
+from app.services import feature_modules as fm_svc
 from app.services.ai.pricing import compute_cost
 from app.services.ai.tools import (
     REGISTRY,
@@ -591,9 +592,11 @@ class ChatOrchestrator:
             platform_settings.ai_tools_enabled if platform_settings is not None else None
         )
         provider_enabled = provider.enabled_tools if provider is not None else None
+        enabled_modules = await fm_svc.get_enabled_modules(self.db)
         effective = effective_tool_names(
             platform_enabled=platform_enabled,
             provider_enabled=provider_enabled,
+            enabled_modules=enabled_modules,
         )
         tools = [t for t in REGISTRY.read_only() if t.name in effective]
         system_prompt = await build_system_prompt(self.db, self.user, tools, provider)
@@ -691,9 +694,11 @@ class ChatOrchestrator:
             platform_settings.ai_tools_enabled if platform_settings is not None else None
         )
         provider_enabled = provider.enabled_tools if provider is not None else None
+        enabled_modules = await fm_svc.get_enabled_modules(self.db)
         effective = effective_tool_names(
             platform_enabled=platform_enabled,
             provider_enabled=provider_enabled,
+            enabled_modules=enabled_modules,
         )
         return [
             ToolDefinition(

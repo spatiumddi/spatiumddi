@@ -23,6 +23,7 @@ from pydantic import BaseModel
 
 from app.api.deps import DB, SuperAdmin
 from app.models.settings import PlatformSettings
+from app.services import feature_modules as fm_svc
 from app.services.ai.tools import REGISTRY, effective_tool_names
 
 router = APIRouter()
@@ -68,9 +69,11 @@ async def list_tools(current_user: SuperAdmin, db: DB) -> ToolCatalogResponse:
         if settings_row is not None and settings_row.ai_tools_enabled is not None
         else None
     )
+    enabled_modules = await fm_svc.get_enabled_modules(db)
     effective = effective_tool_names(
         platform_enabled=platform_override,
         provider_enabled=None,
+        enabled_modules=enabled_modules,
     )
     out = [
         ToolEntry(

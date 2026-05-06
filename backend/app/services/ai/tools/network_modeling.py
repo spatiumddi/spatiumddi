@@ -61,6 +61,7 @@ class ListASNsArgs(BaseModel):
 
 @register_tool(
     name="list_asns",
+    module="network.asn",
     description=(
         "List Autonomous Systems tracked in SpatiumDDI. Use for "
         "questions about AS numbers, RDAP holder org, registry / RIR, "
@@ -121,6 +122,7 @@ class GetASNArgs(BaseModel):
 
 @register_tool(
     name="get_asn",
+    module="network.asn",
     description=(
         "Return full detail for one AS: number, name, holder_org, "
         "RPKI ROA count, BGP peering count, customer / provider "
@@ -271,6 +273,7 @@ class ListVRFsArgs(BaseModel):
 
 @register_tool(
     name="list_vrfs",
+    module="network.vrf",
     description=(
         "List VRFs (virtual routing/forwarding domains). Each row "
         "carries name, description, route_distinguisher, import / "
@@ -359,6 +362,7 @@ class ListCircuitsArgs(BaseModel):
 
 @register_tool(
     name="list_circuits",
+    module="network.circuit",
     description=(
         "List WAN circuits — carrier-supplied logical pipes. Each row "
         "includes name, carrier ckt_id, transport_class, "
@@ -442,6 +446,7 @@ class ListNetworkServicesArgs(BaseModel):
 
 @register_tool(
     name="list_network_services",
+    module="network.service",
     description=(
         "List service-catalog rows (issue #94). A NetworkService "
         "bundles VRF / Subnet / IPBlock / DNSZone / DHCPScope / "
@@ -508,6 +513,7 @@ class GetServiceSummaryArgs(BaseModel):
 
 @register_tool(
     name="get_network_service_summary",
+    module="network.service",
     description=(
         "Full detail of a NetworkService: every attached resource by "
         "kind, plus the resource_count breakdown. Use after "
@@ -578,6 +584,7 @@ class ListOverlayNetworksArgs(BaseModel):
 
 @register_tool(
     name="list_overlay_networks",
+    module="network.overlay",
     description=(
         "List SD-WAN / IPsec / WireGuard / DMVPN / VXLAN / GRE "
         "overlay topologies (issue #95). Each row includes name, "
@@ -649,6 +656,7 @@ class GetOverlayTopologyArgs(BaseModel):
 
 @register_tool(
     name="get_overlay_topology",
+    module="network.overlay",
     description=(
         "Return the membership + policy detail of one overlay "
         "network: every site (with role + edge device + ordered "
@@ -741,6 +749,7 @@ class ListAppCategoriesArgs(BaseModel):
 
 @register_tool(
     name="list_application_categories",
+    module="network.overlay",
     description=(
         "List the SaaS application catalog used by overlay routing "
         "policies of match_kind=application. Each row is a curated "
@@ -791,6 +800,7 @@ class TraceCircuitImpactArgs(BaseModel):
 
 @register_tool(
     name="trace_circuit_impact",
+    module="network.circuit",
     description=(
         "Walk every overlay site whose preferred-circuit chain references "
         "the given circuit, and report which sites would be primary / "
