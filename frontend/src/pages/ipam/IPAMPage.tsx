@@ -3881,6 +3881,7 @@ function SubnetDetail({
                 .filter(Boolean)
                 .join(", ")}
               tooltip="Ask AI about this subnet"
+              prompt="Tell me about this subnet — utilisation, recent changes, and anything I should worry about."
             />
             <HeaderButton icon={Pencil} onClick={() => setShowEditSubnet(true)}>
               Edit

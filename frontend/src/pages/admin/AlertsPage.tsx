@@ -618,6 +618,7 @@ export function AlertsPage() {
                             .filter(Boolean)
                             .join(", ")}
                           tooltip="Ask AI about this rule"
+                          prompt="Explain what this alert rule does, when it would fire, and recommend tuning if relevant."
                           iconOnly
                           className="px-1.5 py-1"
                         />
@@ -741,6 +742,7 @@ export function AlertsPage() {
                             `event_id: ${ev.id}`,
                           ].join(", ")}
                           tooltip="Ask AI about this alert"
+                          prompt="Explain this alert — what tripped it, what it means, and the most likely remediation."
                           iconOnly
                           className="px-1.5 py-1"
                         />

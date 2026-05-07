@@ -228,6 +228,7 @@ export function IPDetailModal({
                 .filter(Boolean)
                 .join(", ")}
               tooltip="Ask AI about this IP"
+              prompt="Summarise this IP — owner, last-seen, services, vendor, and anything flagged."
             />
             <button
               type="button"

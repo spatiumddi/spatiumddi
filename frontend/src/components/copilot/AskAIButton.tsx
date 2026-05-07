@@ -20,12 +20,20 @@ import { askAI } from "./askAI";
  */
 export function AskAIButton({
   context,
+  prompt,
   tooltip = "Ask AI about this",
   size = "sm",
   iconOnly = false,
   className = "",
 }: {
   context: string;
+  /** Optional default question to prefill the chat composer
+   *  textarea. Operator can edit before sending — never auto-sent.
+   *  Use this to point the operator at the obvious first question
+   *  for the resource type ("Summarise this subnet", "Explain this
+   *  alert"). When omitted, the textarea opens empty and the
+   *  operator types whatever they like. */
+  prompt?: string;
   tooltip?: string;
   size?: "xs" | "sm";
   iconOnly?: boolean;
@@ -42,7 +50,7 @@ export function AskAIButton({
       type="button"
       onClick={(e) => {
         e.stopPropagation();
-        askAI({ context });
+        askAI({ context, prompt });
       }}
       title={tooltip}
       className={`inline-flex items-center gap-1.5 whitespace-nowrap rounded-md border px-3 py-1.5 text-sm transition-colors hover:border-primary/40 hover:bg-primary/5 hover:text-primary ${className}`}

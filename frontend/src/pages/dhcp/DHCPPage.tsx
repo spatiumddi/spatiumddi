@@ -381,6 +381,7 @@ function GroupDetailView({
                 .filter(Boolean)
                 .join(", ")}
               tooltip="Ask AI about this DHCP group"
+              prompt="Summarise this DHCP group — its servers, scopes, recent leases, and anything notable."
             />
             <HeaderButton
               icon={RefreshCw}
@@ -785,6 +786,7 @@ function ServerScopesTab({ groupId }: { groupId: string }) {
                                 .filter(Boolean)
                                 .join(", ")}
                               tooltip="Ask AI about this scope"
+                              prompt="Summarise this DHCP scope — utilisation, recent leases, any conflicts, anything notable."
                               iconOnly
                               className="px-1.5 py-1"
                             />

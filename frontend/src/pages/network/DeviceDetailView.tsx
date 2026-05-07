@@ -192,6 +192,7 @@ export function DeviceDetailView() {
                 .filter(Boolean)
                 .join(", ")}
               tooltip="Ask AI about this device"
+              prompt="Summarise this device — connected interfaces, MAC/ARP coverage, recent polls, and anything I should follow up on."
             />
             <HeaderButton
               icon={RefreshCw}

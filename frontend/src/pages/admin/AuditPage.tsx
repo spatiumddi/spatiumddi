@@ -364,6 +364,7 @@ export function AuditPage() {
                           .filter(Boolean)
                           .join(", ")}
                         tooltip="Ask AI about this event"
+                        prompt="Explain this audit entry in plain English — what happened, who did it, and what changed."
                         iconOnly
                         className="px-1.5 py-1"
                       />

@@ -872,6 +872,37 @@ export function CopilotDrawer({
         )}
       </div>
 
+      {/* "Asking about: …" chip — visible while ``pendingContext``
+          is set (operator opened the drawer via ``askAI({ context })``
+          from any "Ask AI about this" affordance). The chip is the
+          *only* visible signal that the system prompt has been
+          seeded; without it the empty drawer reads as "the button
+          did nothing." Clears once the first turn fires (via
+          ``onContextConsumed`` in ``sendMut.mutationFn``) or when
+          the operator hits ×. */}
+      {pendingContext && (
+        <div className="flex items-center gap-1.5 border-t border-amber-500/30 bg-amber-500/5 px-3 py-1.5 text-xs text-amber-700 dark:text-amber-300">
+          <Sparkles className="h-3 w-3 shrink-0" />
+          <span className="shrink-0 font-medium">Asking about:</span>
+          <span
+            className="truncate"
+            title={pendingContext}
+            aria-label={`Context attached: ${pendingContext}`}
+          >
+            {pendingContext}
+          </span>
+          <button
+            type="button"
+            onClick={() => onContextConsumed?.()}
+            title="Clear context"
+            aria-label="Clear context"
+            className="ml-auto inline-flex shrink-0 rounded p-0.5 hover:bg-amber-500/20"
+          >
+            <X className="h-3 w-3" />
+          </button>
+        </div>
+      )}
+
       {/* Composer */}
       <ChatComposer
         disabled={sendMut.isPending}

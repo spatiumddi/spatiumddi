@@ -1879,6 +1879,7 @@ function ZoneDetailView({
               .filter(Boolean)
               .join(", ")}
             tooltip="Ask AI about this zone"
+            prompt="Summarise this zone — record count, recent changes, and any drift between configured and authoritative state."
           />
           {!isForward && (
             <HeaderButton
@@ -2376,6 +2377,7 @@ function ZoneDetailView({
                                     .filter(Boolean)
                                     .join(", ")}
                                   tooltip="Ask AI about this record"
+                                  prompt="What does this record point to, and is anything else using the same target?"
                                   iconOnly
                                   className="h-6 px-1 py-0"
                                 />
