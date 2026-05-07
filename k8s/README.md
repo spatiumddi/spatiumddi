@@ -148,16 +148,32 @@ stand up DNS and DHCP agent StatefulSets alongside it. Published to
 full option surface.
 
 ```bash
+# BIND9 (default flavor)
 helm install ddi oci://ghcr.io/spatiumddi/charts/spatiumddi \
   --version <CHART_VERSION> \
   --namespace spatiumddi --create-namespace \
   --set dnsAgents.enabled=true \
   --set dnsAgents.agentKey.existingSecret=spatium-dns-agent-key \
   --set-json 'dnsAgents.servers=[{"name":"ns1","role":"primary","group":"internal-resolvers"}]'
+
+# PowerDNS (issue #127 — adds online DNSSEC, ALIAS, LUA, catalog zones)
+helm install ddi oci://ghcr.io/spatiumddi/charts/spatiumddi \
+  --version <CHART_VERSION> \
+  --namespace spatiumddi --create-namespace \
+  --set dnsAgents.enabled=true \
+  --set dnsAgents.agentKey.existingSecret=spatium-dns-agent-key \
+  --set-json 'dnsAgents.servers=[{"name":"ns1","flavor":"powerdns","role":"primary","group":"powerdns-edge"}]'
 ```
 
 Declare each DNS server under `.dnsAgents.servers[]` in `values.yaml`.
 The chart renders a StatefulSet + LoadBalancer Service per entry.
+Set `flavor: powerdns` on a server to pull the
+`ghcr.io/spatiumddi/dns-powerdns` image instead of BIND9 — same
+`DNS_AGENT_KEY` bootstrap, image-baked driver, mount path
+auto-switches to `/var/lib/powerdns` for the LMDB store.
+Mixed-driver groups are rejected by the control plane for the
+PowerDNS-only features (DNSSEC sign/unsign, ALIAS, LUA, catalog
+zones); spin up a separate group per driver.
 
 ### How servers register
 

@@ -18,6 +18,24 @@ stringData:
 {{- range $server := .Values.dnsAgents.servers }}
 {{- $flavor := $server.flavor | default "bind9" -}}
 {{- $instance := printf "dns-%s-%s" $flavor $server.name -}}
+{{- /* Per-flavor image lookup (issue #127). dnsAgents.flavors.<flavor>
+       optionally overrides repository + tag; missing keys (or the default
+       bind9 case) fall back to the top-level dnsAgents.image. Same
+       Chart.AppVersion fallback applies to either source. */ -}}
+{{- $flavorImg := dict -}}
+{{- if $root.Values.dnsAgents.flavors -}}
+  {{- $flavorImg = (get $root.Values.dnsAgents.flavors $flavor) | default (dict) -}}
+{{- end -}}
+{{- $repo := $flavorImg.repository | default $root.Values.dnsAgents.image.repository -}}
+{{- $imgTag := $flavorImg.tag | default $tag -}}
+{{- /* Volume mount path for the driver's zone-state volume. BIND9 caches
+       zone files under /var/cache/bind; PowerDNS LMDB lives at
+       /var/lib/powerdns. The volume claim itself ("dns-state") is the
+       same; only the mount path changes. */ -}}
+{{- $dnsStatePath := "/var/cache/bind" -}}
+{{- if eq $flavor "powerdns" -}}
+  {{- $dnsStatePath = "/var/lib/powerdns" -}}
+{{- end }}
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
@@ -58,7 +76,7 @@ spec:
       {{- end }}
       containers:
         - name: dns
-          image: "{{ $root.Values.dnsAgents.image.repository }}:{{ $tag }}"
+          image: "{{ $repo }}:{{ $imgTag }}"
           imagePullPolicy: {{ $root.Values.dnsAgents.image.pullPolicy }}
           env:
             - name: CONTROL_PLANE_URL
@@ -87,7 +105,7 @@ spec:
             {{- toYaml ($server.resources | default (dict "requests" (dict "cpu" "100m" "memory" "128Mi") "limits" (dict "cpu" "500m" "memory" "512Mi"))) | nindent 12 }}
           volumeMounts:
             - { name: agent-state, mountPath: /var/lib/spatium-dns-agent }
-            - { name: dns-state,   mountPath: /var/cache/bind }
+            - { name: dns-state,   mountPath: {{ $dnsStatePath | quote }} }
   volumeClaimTemplates:
     - metadata: { name: agent-state }
       spec:

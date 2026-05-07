@@ -180,16 +180,26 @@ externalRedis:
   existingSecret: ""
   existingSecretPasswordKey: "password"
 
-# ── DNS agents (optional — managed BIND9 StatefulSets) ───────────────────────
+# ── DNS agents (optional — managed BIND9 / PowerDNS StatefulSets) ────────────
 # One StatefulSet + Services pair per entry. `enabled: false` skips the
 # whole block; typical deployments run DNS agents in a separate cluster
 # closer to the network edge.
 dnsAgents:
   enabled: false
+  # Default image — used when a server entry doesn't override.
+  # Configures the BIND9 driver (the historical default flavor).
   image:
     repository: ghcr.io/spatiumddi/dns-bind9
     tag: ""                      # empty → use Chart.appVersion
     pullPolicy: IfNotPresent
+  # Per-driver image overrides (issue #127). Each key matches a
+  # ``servers[].flavor`` value; missing keys fall back to
+  # ``dnsAgents.image``. Add a ``powerdns`` server entry to enable
+  # PowerDNS-driver groups alongside BIND9.
+  flavors:
+    powerdns:
+      repository: ghcr.io/spatiumddi/dns-powerdns
+      tag: ""                    # empty → use Chart.appVersion
   # PSK carrying DNS_AGENT_KEY. Prefer `existingSecret`; `value` lives here
   # only to make lab walk-throughs runnable in one command.
   agentKey:
@@ -197,6 +207,7 @@ dnsAgents:
     value: ""
   servers: []
     # - name: ns1
+    #   flavor: bind9            # bind9 (default) | powerdns
     #   role: primary            # primary | secondary
     #   group: internal-resolvers
     #   storage: { agentState: 1Gi, dnsState: 2Gi }
@@ -204,6 +215,11 @@ dnsAgents:
     #   resources:
     #     requests: { cpu: 100m, memory: 128Mi }
     #     limits:   { cpu: 500m, memory: 512Mi }
+    # - name: ns1-pdns
+    #   flavor: powerdns         # PowerDNS group; LMDB-backed zone storage
+    #   role: primary
+    #   group: powerdns-internal
+    #   storage: { agentState: 1Gi, dnsState: 2Gi }   # dnsState → /var/lib/powerdns
 
 # ── DHCP agents (optional — managed Kea StatefulSets) ────────────────────────
 dhcpAgents:

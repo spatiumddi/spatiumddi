@@ -102,6 +102,7 @@ dnsAgents:
   agentKey:
     existingSecret: spatium-dns-agent-key   # must carry key DNS_AGENT_KEY
   servers:
+    # BIND9 (default flavor — RPZ blocklists, full views support)
     - name: ns1
       role: primary
       group: internal-resolvers
@@ -110,7 +111,22 @@ dnsAgents:
       role: secondary
       group: internal-resolvers
       service: { type: LoadBalancer }
+    # PowerDNS (issue #127 — online DNSSEC, ALIAS, LUA, catalog zones).
+    # Lives in its own group so PowerDNS-only features can engage; the
+    # control plane rejects mixed-driver groups for those features.
+    - name: pdns1
+      flavor: powerdns
+      role: primary
+      group: powerdns-edge
+      service: { type: LoadBalancer }
 ```
+
+Each server picks its image from `dnsAgents.image` (default,
+configures BIND9) or `dnsAgents.flavors.<flavor>` per-driver
+override (`powerdns` is pre-set out of the box). The `dns-state`
+volume mounts under `/var/cache/bind` for BIND9 and
+`/var/lib/powerdns` for PowerDNS LMDB — same volume claim, the
+template picks the path based on `flavor`.
 
 Pre-create the PSK secret (or use `agentKey.value` inline for lab use only):
 
@@ -182,9 +198,10 @@ subcharts verbatim — any option those charts accept works here. See:
 | Key | Default | Description |
 |-----|---------|-------------|
 | `dnsAgents.enabled` | `false` |  |
-| `dnsAgents.image.repository` | `ghcr.io/spatiumddi/dns-bind9` |  |
-| `dnsAgents.agentKey.existingSecret` | `""` | Carries `DNS_AGENT_KEY` |
-| `dnsAgents.servers` | `[]` | One entry → one StatefulSet + Services |
+| `dnsAgents.image.repository` | `ghcr.io/spatiumddi/dns-bind9` | Default image (BIND9 flavor) |
+| `dnsAgents.flavors.powerdns.repository` | `ghcr.io/spatiumddi/dns-powerdns` | Per-flavor image override (issue #127) |
+| `dnsAgents.agentKey.existingSecret` | `""` | Carries `DNS_AGENT_KEY` (shared between flavors) |
+| `dnsAgents.servers` | `[]` | One entry → one StatefulSet + Services. `flavor: bind9` (default) or `powerdns` |
 | `dhcpAgents.enabled` | `false` |  |
 | `dhcpAgents.image.repository` | `ghcr.io/spatiumddi/dhcp-kea` |  |
 | `dhcpAgents.agentKey.existingSecret` | `""` | Carries `SPATIUM_AGENT_KEY` |

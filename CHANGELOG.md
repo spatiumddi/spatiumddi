@@ -68,6 +68,26 @@ visibility.
   pipeline adds a parallel ``build-dns-powerdns`` job alongside
   the existing ``build-dns`` (BIND9) so every tag publishes both
   images with ``:<version>`` and ``:latest`` tags.
+- **PowerDNS Helm chart wiring, Phase 4b (\#127).** Umbrella chart
+  ``charts/spatiumddi`` learns to render PowerDNS-flavoured DNS
+  agents alongside BIND9. The existing ``servers[].flavor`` knob
+  (already in the schema, never used) now actually picks the image
+  + mount path: ``flavor: powerdns`` pulls
+  ``ghcr.io/spatiumddi/dns-powerdns`` (override comes from the new
+  ``dnsAgents.flavors.powerdns`` block in ``values.yaml``) and
+  mounts the ``dns-state`` PVC at ``/var/lib/powerdns`` for the LMDB
+  store; ``flavor: bind9`` (default) keeps the historical
+  ``/var/cache/bind`` mount. Both flavors share the same
+  ``DNS_AGENT_KEY`` PSK secret, so ``helm install`` with a mixed
+  ``servers[]`` list creates two StatefulSets that auto-register
+  into different DNSServerGroups. Per-driver feature gating happens
+  on the control plane — operators using PowerDNS-only features
+  (DNSSEC sign/unsign, ALIAS, LUA, catalog zones) declare a
+  PowerDNS-only group; mixing drivers in one group is still
+  rejected. ``charts/spatiumddi/README.md`` + ``k8s/README.md``
+  show the two-flavor mixed-server example. ``helm lint`` clean;
+  ``helm template`` rendered output verified for bind9-only,
+  powerdns-only, and both-side-by-side value sets.
 - **PowerDNS deployment plumbing, Phase 4a (\#127).** New
   ``docker-compose.agent-dns-powerdns.yml`` standalone-VM compose
   file mirrors the bind9 shape: one ``dns-powerdns`` service against
