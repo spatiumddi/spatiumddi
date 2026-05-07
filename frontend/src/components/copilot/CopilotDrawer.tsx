@@ -185,34 +185,82 @@ export function CopilotDrawer({
     "spatium.copilot.activeSessionId",
     null,
   );
-  // Persisted drawer width — operator can drag the left edge to resize
-  // and the value survives close/reopen via sessionStorage. Default 672
-  // matches the previous fixed ``max-w-2xl``. Clamped to a sane window
-  // on render so a stale value (e.g. from a wider monitor) doesn't paint
-  // the drawer wider than the current viewport.
-  const [drawerWidth, setDrawerWidth] = useSessionState<number>(
-    "spatium.copilot.width",
-    672,
+  // Persisted bubble geometry — top-left anchor + width + height.
+  // Survives close/reopen via sessionStorage. Default places the
+  // bubble in the lower-right corner with a Gmail-compose-ish size.
+  // Clamped on every render so a stale value (e.g. from a different
+  // monitor) doesn't paint off-screen.
+  type Geom = { left: number; top: number; width: number; height: number };
+  const computeDefault = (): Geom => {
+    const W = typeof window !== "undefined" ? window.innerWidth : 1280;
+    const H = typeof window !== "undefined" ? window.innerHeight : 800;
+    const width = 440;
+    const height = Math.min(680, Math.max(480, H - 120));
+    return {
+      width,
+      height,
+      left: Math.max(16, W - width - 24),
+      top: Math.max(16, H - height - 24),
+    };
+  };
+  const [geom, setGeom] = useSessionState<Geom>(
+    "spatium.copilot.geom",
+    computeDefault(),
   );
-  const resizingRef = useRef<{ startX: number; startWidth: number } | null>(
-    null,
-  );
+  // Drag state — captures the pointer offset on mousedown so the
+  // bubble follows the cursor rather than snapping its top-left to
+  // the cursor.
+  const dragRef = useRef<{ dx: number; dy: number } | null>(null);
+  // Resize state — captures starting pointer + starting size; the
+  // handle is on the top-left corner of the bubble (the only corner
+  // that can grow without crowding the bottom-right anchor).
+  const resizeRef = useRef<{
+    startX: number;
+    startY: number;
+    startW: number;
+    startH: number;
+    startLeft: number;
+    startTop: number;
+  } | null>(null);
+
   useEffect(() => {
     const onMove = (e: MouseEvent) => {
-      const r = resizingRef.current;
-      if (!r) return;
-      // Drawer is anchored to the right edge — dragging the handle LEFT
-      // (decreasing clientX) makes the panel WIDER. Apply a min/max
-      // clamp inline so the panel can't shrink past usable or grow past
-      // the viewport.
-      const next = Math.max(
-        320,
-        Math.min(window.innerWidth - 60, r.startWidth + (r.startX - e.clientX)),
-      );
-      setDrawerWidth(next);
+      const W = window.innerWidth;
+      const H = window.innerHeight;
+      if (dragRef.current) {
+        const left = Math.max(
+          0,
+          Math.min(W - 80, e.clientX - dragRef.current.dx),
+        );
+        const top = Math.max(
+          0,
+          Math.min(H - 40, e.clientY - dragRef.current.dy),
+        );
+        setGeom((g) => ({ ...g, left, top }));
+      } else if (resizeRef.current) {
+        const r = resizeRef.current;
+        // Top-left handle: dragging up/left grows the bubble. We move
+        // ``left`` + ``top`` inversely so the bottom-right corner
+        // stays pinned, and adjust width/height by the same delta.
+        const dx = e.clientX - r.startX;
+        const dy = e.clientY - r.startY;
+        const minW = 320;
+        const minH = 320;
+        const newWidth = Math.max(minW, Math.min(W - 24, r.startW - dx));
+        const newHeight = Math.max(minH, Math.min(H - 24, r.startH - dy));
+        const newLeft = r.startLeft + (r.startW - newWidth);
+        const newTop = r.startTop + (r.startH - newHeight);
+        setGeom({
+          left: Math.max(0, newLeft),
+          top: Math.max(0, newTop),
+          width: newWidth,
+          height: newHeight,
+        });
+      }
     };
     const onUp = () => {
-      resizingRef.current = null;
+      dragRef.current = null;
+      resizeRef.current = null;
       document.body.style.cursor = "";
       document.body.style.userSelect = "";
     };
@@ -222,20 +270,49 @@ export function CopilotDrawer({
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
     };
-  }, [setDrawerWidth]);
+  }, [setGeom]);
+
+  const startDrag = (e: React.MouseEvent) => {
+    // Don't start dragging when the click landed on an interactive
+    // control inside the title bar (close button, new-chat button,
+    // etc.) — same hit-test as ``useDraggableModal``.
+    const target = e.target as HTMLElement;
+    if (target.closest("button, input, select, textarea, a")) return;
+    dragRef.current = {
+      dx: e.clientX - geom.left,
+      dy: e.clientY - geom.top,
+    };
+    e.preventDefault();
+    document.body.style.cursor = "grabbing";
+    document.body.style.userSelect = "none";
+  };
   const startResize = (e: React.MouseEvent) => {
     e.preventDefault();
     e.stopPropagation();
-    resizingRef.current = { startX: e.clientX, startWidth: drawerWidth };
-    // Lock the global cursor + disable text selection while dragging so
-    // the handle doesn't fight with hover states underneath.
-    document.body.style.cursor = "col-resize";
+    resizeRef.current = {
+      startX: e.clientX,
+      startY: e.clientY,
+      startW: geom.width,
+      startH: geom.height,
+      startLeft: geom.left,
+      startTop: geom.top,
+    };
+    document.body.style.cursor = "nwse-resize";
     document.body.style.userSelect = "none";
   };
-  const effectiveWidth = useMemo(() => {
-    if (typeof window === "undefined") return drawerWidth;
-    return Math.max(320, Math.min(window.innerWidth - 60, drawerWidth));
-  }, [drawerWidth]);
+  const effectiveGeom = useMemo<Geom>(() => {
+    if (typeof window === "undefined") return geom;
+    const W = window.innerWidth;
+    const H = window.innerHeight;
+    const width = Math.max(320, Math.min(W - 24, geom.width));
+    const height = Math.max(320, Math.min(H - 24, geom.height));
+    return {
+      width,
+      height,
+      left: Math.max(0, Math.min(W - 80, geom.left)),
+      top: Math.max(0, Math.min(H - 40, geom.top)),
+    };
+  }, [geom]);
   // Local in-flight stream — mirror of what's also being persisted on
   // the backend. Reset whenever a stream ends (success or failure).
   const [streamingContent, setStreamingContent] = useState<string>("");
@@ -529,218 +606,224 @@ export function CopilotDrawer({
   }, [detailQ.data]);
 
   return (
+    // Bubble — positioned, draggable, resizable; doesn't block the
+    // page behind it (no backdrop). Operator can keep the chat open
+    // while clicking around IPAM / DNS / DHCP, dragging it out of the
+    // way as needed (Gmail-compose pattern).
     <div
-      className="fixed inset-0 z-50 flex justify-end bg-black/20"
-      onClick={onClose}
+      className="fixed z-50 flex flex-col rounded-lg border bg-card shadow-2xl"
+      style={{
+        left: `${effectiveGeom.left}px`,
+        top: `${effectiveGeom.top}px`,
+        width: `${effectiveGeom.width}px`,
+        height: `${effectiveGeom.height}px`,
+      }}
     >
+      {/* Resize handle — top-left corner; the only corner that can
+          grow without fighting the operator's mental model that the
+          bubble is anchored to the bottom-right. */}
       <div
-        onClick={(e) => e.stopPropagation()}
-        className="relative flex h-full flex-col border-l bg-card shadow-2xl"
-        style={{ width: `${effectiveWidth}px`, maxWidth: "100vw" }}
+        onMouseDown={startResize}
+        className="group absolute -top-1 -left-1 z-10 h-4 w-4 cursor-nwse-resize select-none"
+        title="Drag to resize"
       >
-        {/* Resize handle — thin vertical strip on the left edge of the
-            drawer. The 1-pixel inset is for a subtle accent on hover; the
-            full handle is 5 pixels wide so the cursor catches it without
-            having to be precise. */}
-        <div
-          onMouseDown={startResize}
-          className="group absolute inset-y-0 left-0 z-10 w-[5px] -translate-x-1/2 cursor-col-resize select-none"
-          title="Drag to resize"
-        >
-          <div className="absolute inset-y-0 left-1/2 w-px -translate-x-1/2 bg-border transition-colors group-hover:bg-primary/60 group-active:bg-primary" />
-        </div>
-        {/* Header */}
-        <div className="flex flex-wrap items-center justify-between gap-2 border-b px-4 py-3">
-          <div className="min-w-0 flex-1">
-            <div className="flex items-center gap-2">
-              <Sparkles className="h-4 w-4 text-primary" />
-              <h2 className="text-sm font-semibold">Operator Copilot</h2>
+        <div className="absolute inset-1 rounded-tl border-l-2 border-t-2 border-border transition-colors group-hover:border-primary/60 group-active:border-primary" />
+      </div>
+      {/* Header — also the drag handle. Click on empty header areas
+          drags; clicks on the buttons / session label stay scoped. */}
+      <div
+        onMouseDown={startDrag}
+        className="flex flex-wrap items-center justify-between gap-2 rounded-t-lg border-b px-4 py-3 cursor-grab active:cursor-grabbing select-none"
+      >
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2">
+            <Sparkles className="h-4 w-4 text-primary" />
+            <h2 className="text-sm font-semibold">Operator Copilot</h2>
+          </div>
+          {sessionLabel && (
+            <div className="mt-0.5 truncate text-xs text-muted-foreground font-mono">
+              {sessionLabel}
             </div>
-            {sessionLabel && (
-              <div className="mt-0.5 truncate text-xs text-muted-foreground font-mono">
-                {sessionLabel}
-              </div>
-            )}
-            {usageQ.data && <UsageChip usage={usageQ.data} />}
-          </div>
-          <div className="flex shrink-0 items-center gap-1">
-            <button
-              type="button"
-              onClick={() => setActiveSessionId(null)}
-              title="New chat"
-              className="inline-flex items-center gap-1 rounded-md border px-2 py-1 text-xs text-muted-foreground hover:bg-accent"
-            >
-              <MessageSquarePlus className="h-3.5 w-3.5" />
-              New chat
-            </button>
-            <button
-              type="button"
-              onClick={() => setShowHistory((v) => !v)}
-              title="Recent chats"
-              className={`inline-flex items-center gap-1 rounded-md border px-2 py-1 text-xs ${
-                showHistory
-                  ? "bg-accent text-foreground"
-                  : "text-muted-foreground hover:bg-accent"
-              }`}
-            >
-              <HistoryIcon className="h-3.5 w-3.5" />
-              History
-            </button>
-            <button
-              type="button"
-              onClick={onClose}
-              title="Close (Esc)"
-              className="rounded-md border px-2 py-1 text-xs text-muted-foreground hover:bg-accent"
-            >
-              <X className="h-3.5 w-3.5" />
-            </button>
-          </div>
+          )}
+          {usageQ.data && <UsageChip usage={usageQ.data} />}
         </div>
+        <div className="flex shrink-0 items-center gap-1">
+          <button
+            type="button"
+            onClick={() => setActiveSessionId(null)}
+            title="New chat"
+            className="inline-flex items-center gap-1 rounded-md border px-2 py-1 text-xs text-muted-foreground hover:bg-accent"
+          >
+            <MessageSquarePlus className="h-3.5 w-3.5" />
+            New chat
+          </button>
+          <button
+            type="button"
+            onClick={() => setShowHistory((v) => !v)}
+            title="Recent chats"
+            className={`inline-flex items-center gap-1 rounded-md border px-2 py-1 text-xs ${
+              showHistory
+                ? "bg-accent text-foreground"
+                : "text-muted-foreground hover:bg-accent"
+            }`}
+          >
+            <HistoryIcon className="h-3.5 w-3.5" />
+            History
+          </button>
+          <button
+            type="button"
+            onClick={onClose}
+            title="Close (Esc)"
+            className="rounded-md border px-2 py-1 text-xs text-muted-foreground hover:bg-accent"
+          >
+            <X className="h-3.5 w-3.5" />
+          </button>
+        </div>
+      </div>
 
-        {/* History dropdown */}
-        {showHistory && (
-          <div className="max-h-[40vh] overflow-y-auto border-b bg-muted/30">
-            {(sessionsQ.data ?? []).length === 0 && (
-              <div className="px-4 py-6 text-center text-xs text-muted-foreground">
-                No chat history yet.
-              </div>
-            )}
-            {(sessionsQ.data ?? []).length > 0 && (
-              <div className="sticky top-0 z-10 flex items-center justify-between gap-2 border-b bg-card px-4 py-1.5 text-xs">
-                {selectedIds.size > 0 ? (
-                  <>
-                    <span className="text-muted-foreground">
-                      {selectedIds.size} selected
-                    </span>
-                    <div className="flex items-center gap-2">
-                      <button
-                        type="button"
-                        onClick={() => setSelectedIds(new Set())}
-                        className="rounded border px-2 py-0.5 hover:bg-accent"
-                      >
-                        Cancel
-                      </button>
-                      <button
-                        type="button"
-                        disabled={bulkDeleteMut.isPending}
-                        onClick={() => {
-                          const ids = Array.from(selectedIds);
-                          if (
-                            confirm(
-                              `Delete ${ids.length} chat${ids.length === 1 ? "" : "s"}? This cannot be undone.`,
-                            )
-                          ) {
-                            bulkDeleteMut.mutate(ids);
-                          }
-                        }}
-                        className="rounded border border-destructive/40 bg-destructive/10 px-2 py-0.5 text-destructive hover:bg-destructive/20 disabled:opacity-50"
-                      >
-                        {bulkDeleteMut.isPending
-                          ? "Deleting…"
-                          : `Delete ${selectedIds.size}`}
-                      </button>
-                    </div>
-                  </>
-                ) : (
-                  <>
+      {/* History dropdown */}
+      {showHistory && (
+        <div className="max-h-[40vh] overflow-y-auto border-b bg-muted/30">
+          {(sessionsQ.data ?? []).length === 0 && (
+            <div className="px-4 py-6 text-center text-xs text-muted-foreground">
+              No chat history yet.
+            </div>
+          )}
+          {(sessionsQ.data ?? []).length > 0 && (
+            <div className="sticky top-0 z-10 flex items-center justify-between gap-2 border-b bg-card px-4 py-1.5 text-xs">
+              {selectedIds.size > 0 ? (
+                <>
+                  <span className="text-muted-foreground">
+                    {selectedIds.size} selected
+                  </span>
+                  <div className="flex items-center gap-2">
                     <button
                       type="button"
-                      onClick={() => {
-                        const all = new Set(
-                          (sessionsQ.data ?? []).map((s) => s.id),
-                        );
-                        setSelectedIds(all);
-                      }}
-                      className="rounded border px-2 py-0.5 text-muted-foreground hover:bg-accent"
+                      onClick={() => setSelectedIds(new Set())}
+                      className="rounded border px-2 py-0.5 hover:bg-accent"
                     >
-                      Select all
+                      Cancel
                     </button>
                     <button
                       type="button"
                       disabled={bulkDeleteMut.isPending}
                       onClick={() => {
-                        const ids = (sessionsQ.data ?? []).map((s) => s.id);
+                        const ids = Array.from(selectedIds);
                         if (
-                          ids.length > 0 &&
                           confirm(
-                            `Delete all ${ids.length} chats? This cannot be undone.`,
+                            `Delete ${ids.length} chat${ids.length === 1 ? "" : "s"}? This cannot be undone.`,
                           )
                         ) {
                           bulkDeleteMut.mutate(ids);
                         }
                       }}
-                      className="rounded border border-destructive/30 px-2 py-0.5 text-destructive hover:bg-destructive/10 disabled:opacity-50"
+                      className="rounded border border-destructive/40 bg-destructive/10 px-2 py-0.5 text-destructive hover:bg-destructive/20 disabled:opacity-50"
                     >
-                      Delete all
+                      {bulkDeleteMut.isPending
+                        ? "Deleting…"
+                        : `Delete ${selectedIds.size}`}
                     </button>
-                  </>
-                )}
-              </div>
-            )}
-            {(sessionsQ.data ?? []).map((s) => (
-              <SessionRow
-                key={s.id}
-                session={s}
-                active={s.id === activeSessionId}
-                selected={selectedIds.has(s.id)}
-                onToggleSelect={() => toggleSelected(s.id)}
-                onPick={() => {
-                  setActiveSessionId(s.id);
-                  setShowHistory(false);
-                }}
-                onRename={(name) => renameMut.mutate({ id: s.id, name })}
-                onArchive={() => archiveMut.mutate(s.id)}
-                onDelete={() => deleteMut.mutate(s.id)}
-              />
-            ))}
-          </div>
-        )}
-
-        {/* Message stream */}
-        <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 py-4">
-          {!activeSessionId && !sendMut.isPending && (
-            <EmptyState onPick={(q) => sendMut.mutate(q)} />
+                  </div>
+                </>
+              ) : (
+                <>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      const all = new Set(
+                        (sessionsQ.data ?? []).map((s) => s.id),
+                      );
+                      setSelectedIds(all);
+                    }}
+                    className="rounded border px-2 py-0.5 text-muted-foreground hover:bg-accent"
+                  >
+                    Select all
+                  </button>
+                  <button
+                    type="button"
+                    disabled={bulkDeleteMut.isPending}
+                    onClick={() => {
+                      const ids = (sessionsQ.data ?? []).map((s) => s.id);
+                      if (
+                        ids.length > 0 &&
+                        confirm(
+                          `Delete all ${ids.length} chats? This cannot be undone.`,
+                        )
+                      ) {
+                        bulkDeleteMut.mutate(ids);
+                      }
+                    }}
+                    className="rounded border border-destructive/30 px-2 py-0.5 text-destructive hover:bg-destructive/10 disabled:opacity-50"
+                  >
+                    Delete all
+                  </button>
+                </>
+              )}
+            </div>
           )}
-          {messages.map((m) => (
-            <MessageBubble key={m.id} message={m} />
+          {(sessionsQ.data ?? []).map((s) => (
+            <SessionRow
+              key={s.id}
+              session={s}
+              active={s.id === activeSessionId}
+              selected={selectedIds.has(s.id)}
+              onToggleSelect={() => toggleSelected(s.id)}
+              onPick={() => {
+                setActiveSessionId(s.id);
+                setShowHistory(false);
+              }}
+              onRename={(name) => renameMut.mutate({ id: s.id, name })}
+              onArchive={() => archiveMut.mutate(s.id)}
+              onDelete={() => deleteMut.mutate(s.id)}
+            />
           ))}
-          {/* Optimistic echo of the just-sent user message. Stays
+        </div>
+      )}
+
+      {/* Message stream */}
+      <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 py-4">
+        {!activeSessionId && !sendMut.isPending && (
+          <EmptyState onPick={(q) => sendMut.mutate(q)} />
+        )}
+        {messages.map((m) => (
+          <MessageBubble key={m.id} message={m} />
+        ))}
+        {/* Optimistic echo of the just-sent user message. Stays
               visible from the moment the operator hits Send until
               detailQ refetches with the persisted version after the
               stream closes — without this, second-and-later turns
               appear to swallow the user's message during the LLM's
               think time. */}
-          {showPendingUserMessage && (
-            <div className="mb-3 flex justify-end">
-              <div className="max-w-[85%] rounded-lg bg-primary px-3 py-2 text-sm text-primary-foreground">
-                <pre className="whitespace-pre-wrap break-words font-sans">
-                  {pendingUserMessage}
-                </pre>
-              </div>
+        {showPendingUserMessage && (
+          <div className="mb-3 flex justify-end">
+            <div className="max-w-[85%] rounded-lg bg-primary px-3 py-2 text-sm text-primary-foreground">
+              <pre className="whitespace-pre-wrap break-words font-sans">
+                {pendingUserMessage}
+              </pre>
             </div>
-          )}
-          {/* In-flight streaming */}
-          {sendMut.isPending && (
-            <StreamingBubble
-              content={streamingContent}
-              tools={streamingTools}
-              error={streamingError}
-              failover={streamingFailover}
-            />
-          )}
-        </div>
-
-        {/* Composer */}
-        <ChatComposer
-          disabled={sendMut.isPending}
-          onSend={(text) => sendMut.mutate(text)}
-          onCancel={() => abortRef.current?.abort()}
-          isStreaming={sendMut.isPending}
-          pendingPrompt={pendingPrompt ?? null}
-          onPromptConsumed={onPromptConsumed}
-          userMessages={userMessages}
-        />
+          </div>
+        )}
+        {/* In-flight streaming */}
+        {sendMut.isPending && (
+          <StreamingBubble
+            content={streamingContent}
+            tools={streamingTools}
+            error={streamingError}
+            failover={streamingFailover}
+          />
+        )}
       </div>
+
+      {/* Composer */}
+      <ChatComposer
+        disabled={sendMut.isPending}
+        onSend={(text) => sendMut.mutate(text)}
+        onCancel={() => abortRef.current?.abort()}
+        isStreaming={sendMut.isPending}
+        pendingPrompt={pendingPrompt ?? null}
+        onPromptConsumed={onPromptConsumed}
+        userMessages={userMessages}
+      />
     </div>
   );
 }
@@ -809,6 +892,15 @@ const STARTER_GROUPS: { label: string; examples: string[] }[] = [
 ];
 
 function EmptyState({ onPick }: { onPick: (text: string) => void }) {
+  // Dropdown-driven prompt picker. The previous flat list of all
+  // groups + examples scrolled forever in the resizable bubble; now
+  // operators pick a category and see just that category's prompts.
+  // Default starts on the first group ("Triage") so the panel isn't
+  // empty on first render.
+  const [groupLabel, setGroupLabel] = useState<string>(
+    STARTER_GROUPS[0]?.label ?? "",
+  );
+  const group = STARTER_GROUPS.find((g) => g.label === groupLabel);
   return (
     <div className="mx-auto max-w-md py-6 text-sm">
       <div className="text-center">
@@ -817,30 +909,40 @@ function EmptyState({ onPick }: { onPick: (text: string) => void }) {
           Ask the copilot anything about your infrastructure.
         </p>
         <p className="mt-1 text-xs text-muted-foreground">
-          Click an example to try it, or type your own. Some examples need their
-          underlying tool turned on in Settings → AI → Tool Catalog.
+          Pick a category to see example prompts, or type your own. Some
+          examples need their underlying tool turned on in Settings → AI → Tool
+          Catalog.
         </p>
       </div>
-      <div className="mt-4 space-y-3">
-        {STARTER_GROUPS.map((group) => (
-          <div key={group.label}>
-            <div className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
-              {group.label}
-            </div>
-            <div className="space-y-1">
-              {group.examples.map((q) => (
-                <button
-                  key={q}
-                  type="button"
-                  onClick={() => onPick(q)}
-                  className="block w-full rounded-md border bg-muted/30 px-3 py-1.5 text-left text-xs text-muted-foreground transition-colors hover:border-primary/40 hover:bg-primary/5 hover:text-foreground"
-                >
-                  {q}
-                </button>
-              ))}
-            </div>
-          </div>
-        ))}
+      <div className="mt-4 space-y-2">
+        <div className="flex items-center gap-2">
+          <label className="text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+            Examples
+          </label>
+          <select
+            value={groupLabel}
+            onChange={(e) => setGroupLabel(e.target.value)}
+            className="rounded-md border bg-background px-2 py-1 text-xs focus:outline-none focus:ring-2 focus:ring-ring"
+          >
+            {STARTER_GROUPS.map((g) => (
+              <option key={g.label} value={g.label}>
+                {g.label}
+              </option>
+            ))}
+          </select>
+        </div>
+        <div className="space-y-1">
+          {(group?.examples ?? []).map((q) => (
+            <button
+              key={q}
+              type="button"
+              onClick={() => onPick(q)}
+              className="block w-full rounded-md border bg-muted/30 px-3 py-1.5 text-left text-xs text-muted-foreground transition-colors hover:border-primary/40 hover:bg-primary/5 hover:text-foreground"
+            >
+              {q}
+            </button>
+          ))}
+        </div>
       </div>
     </div>
   );
