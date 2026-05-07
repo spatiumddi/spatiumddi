@@ -68,6 +68,23 @@ visibility.
   pipeline adds a parallel ``build-dns-powerdns`` job alongside
   the existing ``build-dns`` (BIND9) so every tag publishes both
   images with ``:<version>`` and ``:latest`` tags.
+- **PowerDNS kind smoke test, Phase 4c (\#127).** ``agent-e2e.yml``
+  workflow now installs both DNS-agent flavors side by side in the
+  kind cluster — the helm install passes a two-server list (one
+  ``flavor: bind9`` in group ``e2e-bind9``, one ``flavor: powerdns``
+  in group ``e2e-powerdns``), proving the chart renders + bootstraps
+  both StatefulSets coherently. The smoke probe split into two
+  steps: ``BIND9 daemon smoke`` runs the existing ``dig
+  version.bind CH TXT`` against the bind9 pod, and the new
+  ``PowerDNS daemon smoke`` runs ``dig id.server CH TXT`` (pdns's
+  CHAOS-class equivalent) against the powerdns pod, with a
+  six-attempt retry loop tolerating the slower first-boot LMDB
+  seed. The "agents registered" gate now iterates both flavors so a
+  powerdns-side regression can't slip past because the bind9 pod
+  looks fine. Pod selectors lean on the ``spatiumddi.org/dns-flavor``
+  label the chart already emits per Phase 4b. Closes the Phase 1
+  "kind-cluster smoke test" item that was deferred until the chart
+  had two-flavor support.
 - **PowerDNS Helm chart wiring, Phase 4b (\#127).** Umbrella chart
   ``charts/spatiumddi`` learns to render PowerDNS-flavoured DNS
   agents alongside BIND9. The existing ``servers[].flavor`` knob

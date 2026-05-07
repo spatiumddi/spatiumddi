@@ -1,12 +1,15 @@
 name: Agent E2E (kind)
 
-# Spins up a kind cluster, installs the umbrella Helm chart with a DNS
-# agent enabled, and verifies:
+# Spins up a kind cluster, installs the umbrella Helm chart with both
+# DNS-agent flavors (BIND9 + PowerDNS) enabled side by side, and
+# verifies:
 #   1. Every deployment + statefulset reaches Ready.
 #   2. The API's /health/live returns 200 via a port-forward.
-#   3. The DNS agent container registers and named answers dig for
-#      ``version.bind CH TXT`` — a cheap "daemon is alive" probe that
-#      doesn't require pre-seeded zone data.
+#   3. The BIND9 agent answers ``dig version.bind CH TXT`` — cheap
+#      "daemon is alive" probe that doesn't need pre-seeded zone data.
+#   4. The PowerDNS agent answers ``dig id.server CH TXT`` — pdns's
+#      CHAOS-class equivalent.
+#   5. Both pods register and stay stable (low restart count).
 #
 # Uses the ghcr.io/spatiumddi/*:latest images built by the dns /
 # dhcp / release workflows on main, so this exercises what a real
@@ -76,6 +79,12 @@ jobs:
           # deployment operators pre-create an external secret; the
           # inline value here is only safe because the cluster dies
           # with the workflow run.
+          # Both flavors get pinned to the same TAG so the test
+          # exercises a coherent build cohort. Mixed flavor list
+          # makes the chart render two StatefulSets that live in
+          # different DNSServerGroups (e2e-bind9 + e2e-powerdns) —
+          # mirrors the production "split groups by driver" model
+          # the control plane gates rely on.
           helm install ddi charts/spatiumddi \
             --namespace spatiumddi --create-namespace \
             --wait --timeout 10m \
@@ -89,7 +98,8 @@ jobs:
             --set dnsAgents.enabled=true \
             --set dnsAgents.agentKey.value=e2e-dns-key \
             --set dnsAgents.image.tag="${TAG}" \
-            --set-json 'dnsAgents.servers=[{"name":"ns1","role":"primary","group":"e2e","service":{"type":"ClusterIP"}}]'
+            --set dnsAgents.flavors.powerdns.tag="${TAG}" \
+            --set-json 'dnsAgents.servers=[{"name":"ns1","flavor":"bind9","role":"primary","group":"e2e-bind9","service":{"type":"ClusterIP"}},{"name":"pdns1","flavor":"powerdns","role":"primary","group":"e2e-powerdns","service":{"type":"ClusterIP"}}]'
 
       - name: Dump pod state
         if: always()
@@ -119,12 +129,14 @@ jobs:
           kubectl -n spatiumddi logs deploy/ddi-spatiumddi-api --tail=100 || true
           exit 1
 
-      - name: DNS daemon smoke (dig version.bind)
+      - name: BIND9 daemon smoke (dig version.bind CH TXT)
         run: |
-          POD=$(kubectl -n spatiumddi get pod -l app.kubernetes.io/component=dns-agent -o jsonpath='{.items[0].metadata.name}')
+          POD=$(kubectl -n spatiumddi get pod \
+            -l app.kubernetes.io/component=dns-agent,spatiumddi.org/dns-flavor=bind9 \
+            -o jsonpath='{.items[0].metadata.name}')
           if [ -z "$POD" ]; then
-            echo "no DNS agent pod found"
-            kubectl -n spatiumddi get pods
+            echo "no BIND9 agent pod found"
+            kubectl -n spatiumddi get pods --show-labels
             exit 1
           fi
           echo "→ probing named in pod $POD"
@@ -138,7 +150,39 @@ jobs:
             exit 1
           }
 
-      - name: DNS agent registered with control plane
+      - name: PowerDNS daemon smoke (dig id.server CH TXT)
+        run: |
+          POD=$(kubectl -n spatiumddi get pod \
+            -l app.kubernetes.io/component=dns-agent,spatiumddi.org/dns-flavor=powerdns \
+            -o jsonpath='{.items[0].metadata.name}')
+          if [ -z "$POD" ]; then
+            echo "no PowerDNS agent pod found"
+            kubectl -n spatiumddi get pods --show-labels
+            exit 1
+          fi
+          echo "→ probing pdns_server in pod $POD"
+          # id.server CH TXT is the PowerDNS analogue of BIND's
+          # version.bind — answered by pdns regardless of zone state,
+          # so this smoke-tests that pdns_server loaded and is
+          # listening on :53. The dns-powerdns image ships dig in its
+          # debug toolbox (confirm in agent/dns/images/powerdns/
+          # Dockerfile). Allow up to ~30s for first-boot LMDB seed
+          # before the answer lands — kind kicks pods harder than a
+          # warm prod cluster, and the entrypoint's lmdb create-bind-db
+          # is one-shot but slow on initial cold start.
+          for i in 1 2 3 4 5 6; do
+            if kubectl -n spatiumddi exec "$POD" -- dig +time=5 +tries=1 +short id.server CH TXT @127.0.0.1; then
+              echo "pdns answered on attempt $i"
+              exit 0
+            fi
+            echo "attempt $i: pdns not ready yet; sleeping…"
+            sleep 5
+          done
+          echo "pdns dig never succeeded — dumping logs:"
+          kubectl -n spatiumddi logs "$POD" --tail=120
+          exit 1
+
+      - name: DNS agents registered with control plane
         run: |
           kubectl -n spatiumddi port-forward svc/ddi-spatiumddi-api 18001:8000 &
           PF_PID=$!
@@ -146,16 +190,26 @@ jobs:
           sleep 3
           # Without an admin token we can only hit unauthenticated
           # endpoints; the agent register endpoint is open (trusts the
-          # PSK). A "server registered" signal is that the agent pod
-          # isn't restarting — crude but useful.
-          RESTARTS=$(kubectl -n spatiumddi get pod -l app.kubernetes.io/component=dns-agent \
-            -o jsonpath='{.items[0].status.containerStatuses[0].restartCount}')
-          if [ "${RESTARTS:-0}" -gt "2" ]; then
-            echo "DNS agent pod restarted ${RESTARTS} times — registration likely failing"
-            kubectl -n spatiumddi logs -l app.kubernetes.io/component=dns-agent --tail=200
-            exit 1
-          fi
-          echo "DNS agent pod stable (restarts=${RESTARTS:-0})"
+          # PSK). A "server registered" signal is that each agent pod
+          # isn't restarting — crude but useful, and we now check both
+          # flavors so a powerdns-side regression doesn't slip past
+          # because the bind9 pod looks fine.
+          set -u
+          fail=0
+          for flavor in bind9 powerdns; do
+            RESTARTS=$(kubectl -n spatiumddi get pod \
+              -l app.kubernetes.io/component=dns-agent,spatiumddi.org/dns-flavor=${flavor} \
+              -o jsonpath='{.items[0].status.containerStatuses[0].restartCount}')
+            if [ "${RESTARTS:-0}" -gt "2" ]; then
+              echo "${flavor} agent pod restarted ${RESTARTS} times — registration likely failing"
+              kubectl -n spatiumddi logs \
+                -l app.kubernetes.io/component=dns-agent,spatiumddi.org/dns-flavor=${flavor} --tail=200
+              fail=1
+            else
+              echo "${flavor} agent pod stable (restarts=${RESTARTS:-0})"
+            fi
+          done
+          exit $fail
 
       - name: Collect logs on failure
         if: failure()
