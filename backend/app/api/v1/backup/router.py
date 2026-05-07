@@ -41,6 +41,7 @@ from app.services.backup import (
     apply_backup_restore,
     build_backup_archive,
 )
+from app.services.backup.sections import SECTIONS
 
 router = APIRouter()
 logger = structlog.get_logger(__name__)
@@ -60,6 +61,32 @@ def _require_superadmin(current_user: object) -> None:
 
 
 # ── /backup/create-and-download ──────────────────────────────────────
+
+
+@router.get("/sections")
+async def list_backup_sections(current_user: CurrentUser) -> dict[str, Any]:
+    """Catalog of backup sections (issue #117 Phase 2a). Drives
+    the upcoming selective-backup + selective-restore checkboxes —
+    operators tick which sections to include / apply.
+    """
+    if not getattr(current_user, "is_superadmin", False):
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Backup is restricted to superadmin",
+        )
+    return {
+        "sections": [
+            {
+                "key": s.key,
+                "label": s.label,
+                "description": s.description,
+                "table_count": len(s.tables),
+                "volatile": s.volatile,
+                "selectable": s.selectable,
+            }
+            for s in SECTIONS
+        ]
+    }
 
 
 @router.post("/create-and-download")

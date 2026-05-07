@@ -93,25 +93,36 @@ def _pg_env_from_url(url: str) -> tuple[dict[str, str], str]:
 
 
 async def _run_pg_dump(out_path: Path) -> None:
-    """Invoke ``pg_dump --format=plain --no-owner --no-privileges``
+    """Invoke ``pg_dump --format=custom --no-owner --no-privileges``
     against the configured database, writing to ``out_path``.
 
     ``--no-owner`` + ``--no-privileges`` strip role/grant clauses
     from the dump so a restore onto a fresh install with a
-    different db role still works without manual editing. The
-    plain (SQL) format keeps the archive human-inspectable, which
-    operators expect from a "download my backup" feature.
+    different db role still works without manual editing.
+
+    ``--format=custom`` (Phase 2a) replaces ``--format=plain`` as
+    the default — it's the format ``pg_restore`` knows how to walk
+    selectively (``--table=...`` filtering for selective restore
+    in Phase 2b). Operators who want a human-readable SQL stream
+    can still get one via ``pg_restore -f - database.dump``. Phase
+    1 archives (plain SQL) stay restorable through the
+    auto-detection path in :mod:`app.services.backup.restore`.
     """
     pg_env, _dbname = _pg_env_from_url(str(settings.database_url))
     full_env = {**os.environ, **pg_env}
     cmd = [
         "pg_dump",
-        "--format=plain",
+        "--format=custom",
         "--no-owner",
         "--no-privileges",
-        "--clean",
-        "--if-exists",
         "--quote-all-identifiers",
+        # ``--clean`` / ``--if-exists`` belong on the *restore*
+        # side now (``pg_restore --clean --if-exists``) — the
+        # custom-format archive carries the schema + data; the
+        # restore path adds the DROP/CREATE preamble at apply
+        # time. We omit them here so the dump is reusable for
+        # selective restore (which doesn't want the global
+        # cleanup).
         f"--file={out_path}",
     ]
     proc = await asyncio.create_subprocess_exec(
@@ -148,17 +159,25 @@ async def _read_alembic_head(db: AsyncSession) -> str | None:
 
 
 def _readme_text(manifest: dict[str, Any]) -> str:
+    dump_format = manifest.get("dump_format", "plain")
+    dump_member = "database.dump" if dump_format == "custom" else "database.sql"
+    dump_summary = (
+        "pg_dump --format=custom (no-owner, no-privileges) — "
+        "read with pg_restore --list / pg_restore --table=<name>"
+        if dump_format == "custom"
+        else "pg_dump --format=plain (no-owner, no-privileges)"
+    )
     return f"""SpatiumDDI backup — {manifest.get("created_at", "(unknown time)")}
 
 This archive contains a snapshot of one SpatiumDDI install:
 
-  manifest.json  -  the table of contents below
-  database.sql   -  pg_dump --format=plain (no-owner, no-privileges)
-  secrets.enc    -  passphrase-wrapped envelope containing the source
-                    install's SECRET_KEY (and credential_encryption_key
-                    if separately set). Required for cross-install
-                    restores to be able to read Fernet-encrypted rows.
-                    DO NOT lose your passphrase — there is no recovery.
+  manifest.json   -  the table of contents below
+  {dump_member}   -  {dump_summary}
+  secrets.enc     -  passphrase-wrapped envelope containing the source
+                     install's SECRET_KEY (and credential_encryption_key
+                     if separately set). Required for cross-install
+                     restores to be able to read Fernet-encrypted rows.
+                     DO NOT lose your passphrase — there is no recovery.
 
 Source install:
   app version    {manifest.get("app_version", "?")}
@@ -206,16 +225,24 @@ async def build_backup_archive(
 
     manifest: dict[str, Any] = {
         "format": "spatiumddi-backup",
-        "format_version": 1,
+        # Phase 2a bumps to ``format_version: 2`` because the dump
+        # member name changed from ``database.sql`` to
+        # ``database.dump`` and ``dump_format`` is now declared
+        # explicitly. Restore detects + handles both versions —
+        # Phase 1 archives stay restorable.
+        "format_version": 2,
+        # Either ``"plain"`` (Phase 1, ``database.sql`` member) or
+        # ``"custom"`` (Phase 2+, ``database.dump`` member). The
+        # restore-side auto-detection still falls back on member-
+        # name sniffing for archives missing this field.
+        "dump_format": "custom",
         "app_version": settings.version,
         "schema_version": schema_head,
         "hostname": hostname,
         "created_at": created_at.isoformat(),
-        # Phase 1a always includes everything except the in-issue
-        # excluded set (DHCP leases, query / activity logs, nmap
-        # history, metrics, celery scratch). Tracking the toggle so
-        # phase-2 restore can detect partials — for now it's a
-        # constant.
+        # Phase 2 will narrow this when operators tick "exclude
+        # diagnostic sections" on backup; for now we still include
+        # every persistent section.
         "included_sections": ["all_persistent"],
         "secret_passphrase_hint": (passphrase_hint or "").strip()[:200],
     }
@@ -238,18 +265,21 @@ async def build_backup_archive(
     )
 
     with tempfile.TemporaryDirectory(prefix="spatium-backup-") as tmpdir:
-        sql_path = Path(tmpdir) / "database.sql"
-        await _run_pg_dump(sql_path)
+        # ``database.dump`` is the Phase 2+ member name (custom
+        # format). The restore-side reader still falls back on
+        # ``database.sql`` for Phase 1 archives.
+        dump_path = Path(tmpdir) / "database.dump"
+        await _run_pg_dump(dump_path)
         # Building the zip in memory keeps the StreamingResponse
         # path simple — install sizes that legitimately need
-        # disk-backed assembly are well past Phase 1a's target.
+        # disk-backed assembly are well past Phase 1's target.
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             zf.writestr(
                 "manifest.json",
                 json.dumps(manifest, indent=2, sort_keys=True),
             )
-            zf.write(sql_path, arcname="database.sql")
+            zf.write(dump_path, arcname="database.dump")
             zf.writestr("secrets.enc", secrets_envelope)
             zf.writestr("README.txt", _readme_text(manifest))
         archive_bytes = buf.getvalue()
@@ -290,22 +320,50 @@ def read_backup_manifest(archive_bytes: bytes) -> dict[str, Any]:
 
 def extract_archive_members(
     archive_bytes: bytes,
-) -> tuple[dict[str, Any], bytes, bytes]:
-    """Pull ``(manifest_dict, database_sql_bytes, secrets_enc_bytes)``
-    out of an archive in one pass. Restore uses this to avoid
-    juggling the zipfile across the apply path.
+) -> tuple[dict[str, Any], bytes, str, bytes]:
+    """Pull ``(manifest_dict, database_bytes, dump_format,
+    secrets_enc_bytes)`` out of an archive in one pass.
+
+    ``dump_format`` is ``"plain"`` (Phase 1 archives — the bytes
+    are SQL text, restore via psql) or ``"custom"`` (Phase 2+
+    archives — bytes are pg_restore's binary format). Detection
+    walks the manifest's explicit ``dump_format`` field first;
+    falls back on member-name sniffing (``database.sql`` →
+    plain, ``database.dump`` → custom) for archives that pre-date
+    the manifest field.
     """
     try:
         with zipfile.ZipFile(io.BytesIO(archive_bytes), "r") as zf:
             names = set(zf.namelist())
-            for required in ("manifest.json", "database.sql", "secrets.enc"):
-                if required not in names:
-                    raise BackupArchiveError(f"archive is missing required member: {required}")
+            if "manifest.json" not in names:
+                raise BackupArchiveError("archive is missing required member: manifest.json")
+            if "secrets.enc" not in names:
+                raise BackupArchiveError("archive is missing required member: secrets.enc")
             manifest = json.loads(zf.read("manifest.json").decode("utf-8"))
-            db_sql = zf.read("database.sql")
+            if not isinstance(manifest, dict):
+                raise BackupArchiveError("manifest.json is not a JSON object")
+            # Format detection — manifest field if present,
+            # otherwise fall back to member-name sniffing.
+            declared = manifest.get("dump_format")
+            if declared in ("plain", "custom"):
+                dump_format = declared
+            elif "database.dump" in names:
+                dump_format = "custom"
+            elif "database.sql" in names:
+                dump_format = "plain"
+            else:
+                raise BackupArchiveError(
+                    "archive is missing the database dump member "
+                    "(neither database.dump nor database.sql present)"
+                )
+            dump_member = "database.dump" if dump_format == "custom" else "database.sql"
+            if dump_member not in names:
+                raise BackupArchiveError(
+                    f"archive declares dump_format={dump_format!r} but "
+                    f"member {dump_member!r} is missing"
+                )
+            db_bytes = zf.read(dump_member)
             secrets_enc = zf.read("secrets.enc")
     except (zipfile.BadZipFile, json.JSONDecodeError) as exc:
         raise BackupArchiveError(f"archive is malformed: {exc}") from exc
-    if not isinstance(manifest, dict):
-        raise BackupArchiveError("manifest.json is not a JSON object")
-    return manifest, db_sql, secrets_enc
+    return manifest, db_bytes, dump_format, secrets_enc

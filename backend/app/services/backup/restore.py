@@ -46,12 +46,17 @@ from app.services.backup.crypto import BackupCryptoError, decrypt_secrets
 logger = structlog.get_logger(__name__)
 
 CONFIRM_PHRASE = "RESTORE-FROM-BACKUP"
-SUPPORTED_FORMAT_VERSION = 1
+# Phase 1 archives are version 1 (plain SQL); Phase 2+ are
+# version 2 (custom-format dump). Both are accepted at restore;
+# the dispatcher below routes to psql or pg_restore based on the
+# manifest's ``dump_format`` field.
+SUPPORTED_FORMAT_VERSIONS = {1, 2}
 PRE_RESTORE_DIR = Path("/var/lib/spatiumddi/backups")
 
-# psql can run for a while on a hefty install; same envelope as
-# pg_dump so the matched-pair runs are bounded together.
+# Either binary can run a while on a hefty install; same envelope
+# as pg_dump so the matched-pair runs are bounded together.
 _PSQL_TIMEOUT_SECONDS = 30 * 60
+_PG_RESTORE_TIMEOUT_SECONDS = 30 * 60
 
 
 class BackupRestoreError(Exception):
@@ -137,6 +142,51 @@ async def _run_psql(sql_path: Path, db_url: str) -> None:
         raise BackupRestoreError(f"psql failed (exit {proc.returncode}): {msg}")
 
 
+async def _run_pg_restore(dump_path: Path, db_url: str) -> None:
+    """Replay a ``--format=custom`` archive via pg_restore (Phase
+    2+). ``--clean --if-exists`` ensures the destination's
+    matching objects get dropped before recreate; ``--no-owner``
+    + ``--no-acl`` strip role/grant clauses (matched to pg_dump's
+    flags); ``--single-transaction`` makes the whole replay
+    atomic. ``--exit-on-error`` so the first failure aborts
+    instead of the default behaviour of trying to keep going.
+    """
+    pg_env, dbname = _pg_env_from_url(db_url)
+    await _terminate_other_db_connections(pg_env)
+    full_env = {**os.environ, **pg_env}
+    cmd = [
+        "pg_restore",
+        "--dbname",
+        dbname,
+        "--clean",
+        "--if-exists",
+        "--no-owner",
+        "--no-acl",
+        "--single-transaction",
+        "--exit-on-error",
+        str(dump_path),
+    ]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        env=full_env,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(), timeout=_PG_RESTORE_TIMEOUT_SECONDS
+        )
+    except TimeoutError as exc:
+        proc.kill()
+        await proc.wait()
+        raise BackupRestoreError(
+            f"pg_restore exceeded {_PG_RESTORE_TIMEOUT_SECONDS}s timeout"
+        ) from exc
+    if proc.returncode != 0:
+        msg = (stderr.decode(errors="replace") or stdout.decode(errors="replace"))[:1500]
+        raise BackupRestoreError(f"pg_restore failed (exit {proc.returncode}): {msg}")
+
+
 async def _write_pre_restore_safety_dump(db) -> str | None:
     """Take a passphrase-less local archive of the *current* state
     before clobbering anything. The passphrase is the literal
@@ -199,12 +249,12 @@ async def apply_backup_restore(
 
     # Phase 1: parse + validate the archive, fail fast if it's
     # malformed, before taking the destructive safety dump path.
-    manifest, db_sql, secrets_enc = extract_archive_members(archive_bytes)
+    manifest, db_bytes, dump_format, secrets_enc = extract_archive_members(archive_bytes)
     fmt_version = manifest.get("format_version")
-    if fmt_version != SUPPORTED_FORMAT_VERSION:
+    if fmt_version not in SUPPORTED_FORMAT_VERSIONS:
         raise BackupRestoreError(
             f"unsupported backup format_version: {fmt_version!r} "
-            f"(this build expects {SUPPORTED_FORMAT_VERSION}). "
+            f"(this build expects one of {sorted(SUPPORTED_FORMAT_VERSIONS)}). "
             f"Upgrade SpatiumDDI before restoring this archive."
         )
 
@@ -236,13 +286,20 @@ async def apply_backup_restore(
     await db.close()
     await global_engine.dispose()
 
-    # Phase 5: replay. psql under --single-transaction either
-    # commits the whole archive or rolls back; partial restores
-    # are impossible by construction.
+    # Phase 5: replay. Both paths run inside a single transaction
+    # so partial restores are impossible by construction.
+    # ``dump_format`` from extract_archive_members dispatches:
+    # plain → psql, custom → pg_restore. Phase 1 archives stay
+    # restorable through the psql path forever.
     with tempfile.TemporaryDirectory(prefix="spatium-restore-") as tmpdir:
-        sql_path = Path(tmpdir) / "database.sql"
-        sql_path.write_bytes(db_sql)
-        await _run_psql(sql_path, db_url)
+        if dump_format == "custom":
+            dump_path = Path(tmpdir) / "database.dump"
+            dump_path.write_bytes(db_bytes)
+            await _run_pg_restore(dump_path, db_url)
+        else:
+            sql_path = Path(tmpdir) / "database.sql"
+            sql_path.write_bytes(db_bytes)
+            await _run_psql(sql_path, db_url)
 
     duration_ms = int((datetime.now(UTC) - started).total_seconds() * 1000)
     logger.info(
