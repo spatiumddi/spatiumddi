@@ -1445,10 +1445,17 @@ function LeasesTab({ server }: { server: DHCPServer }) {
                     <td className="px-3 py-1.5 font-mono text-xs">
                       {l.mac_address}
                       {l.is_voip_phone && (
-                        <Phone
-                          className="ml-1 inline h-3 w-3 align-text-bottom text-sky-600 dark:text-sky-400"
-                          aria-label="VoIP phone"
-                        />
+                        <span
+                          title={
+                            l.vendor ? `VoIP phone — ${l.vendor}` : "VoIP phone"
+                          }
+                          className="inline-flex"
+                        >
+                          <Phone
+                            className="ml-1 inline h-3 w-3 align-text-bottom text-sky-600 dark:text-sky-400"
+                            aria-label="VoIP phone"
+                          />
+                        </span>
                       )}
                       {l.vendor && (
                         <span className="ml-1 font-sans text-[11px] text-muted-foreground">
