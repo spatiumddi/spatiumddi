@@ -62,8 +62,19 @@ services:
     # then set ``DOCKER_GID=<that number>`` in your .env. Common
     # values: 999 (Debian/Ubuntu), 998 or 989 (RHEL/Fedora), varies.
     # Without this the api user (uid 1000) gets EACCES on the socket.
+    #
+    # Backup local-volume target (issue #117) — uncomment the
+    # ``spatium_backups`` line below AND its entry under the
+    # top-level ``volumes:`` block AND the matching line on the
+    # worker service if you create a Backup Target with kind
+    # ``local_volume`` at the default path
+    # ``/var/lib/spatiumddi/backups``. Without this mount, archives
+    # land inside the container's writable layer and disappear on
+    # container recycle. Operators using only remote destinations
+    # (S3 / SCP / Azure / SMB / FTP / GCS) can leave it commented.
     # volumes:
     #   - /var/run/docker.sock:/var/run/docker.sock:ro
+    #   - spatium_backups:/var/lib/spatiumddi/backups
     # group_add:
     #   - "${DOCKER_GID:-999}"
     depends_on:
@@ -96,8 +107,13 @@ services:
     # also needs the host socket when polling a local daemon.
     # Uncomment alongside the matching entries on the api service
     # above — same ``DOCKER_GID`` comment applies.
+    #
+    # Backup local-volume target (issue #117) — the worker runs the
+    # scheduled backup sweep, so it must mount the same volume the
+    # api lists archives from. Uncomment alongside the api service.
     # volumes:
     #   - /var/run/docker.sock:/var/run/docker.sock:ro
+    #   - spatium_backups:/var/lib/spatiumddi/backups
     # group_add:
     #   - "${DOCKER_GID:-999}"
     depends_on:
@@ -314,3 +330,8 @@ volumes:
   dhcp_kea_leases:
   dhcp_kea_state_2:
   dhcp_kea_leases_2:
+  # Backup local-volume target (issue #117). Uncomment when using
+  # a Backup Target with kind ``local_volume``; see the comments
+  # on the api + worker services. Safe to leave commented for
+  # installs using only remote destinations.
+  # spatium_backups:
