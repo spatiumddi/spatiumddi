@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Check,
@@ -191,13 +192,16 @@ export function UnifiPage() {
                     return (
                       <tr key={c.id} className="border-b last:border-0">
                         <td className="whitespace-nowrap px-3 py-2 font-medium">
-                          <span
-                            className={
-                              c.enabled ? "" : "text-muted-foreground/60"
-                            }
+                          <Link
+                            to={`/unifi/${c.id}`}
+                            className={`hover:underline ${
+                              c.enabled
+                                ? "text-primary"
+                                : "text-muted-foreground/60"
+                            }`}
                           >
                             {c.name}
-                          </span>
+                          </Link>
                           {c.description && (
                             <div
                               className="max-w-md truncate text-[11px] text-muted-foreground"

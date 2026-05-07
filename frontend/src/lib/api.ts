@@ -6328,9 +6328,55 @@ export interface UnifiTestResult {
   site_count: number | null;
 }
 
+export interface UnifiDashboardSubnet {
+  id: string;
+  network: string;
+  name: string;
+  description: string;
+  gateway: string | null;
+  vlan_id: number | null;
+  vlan_ref_id: string | null;
+  total_ips: number;
+  allocated_ips: number;
+  utilization_percent: number;
+}
+
+export interface UnifiDashboardVlan {
+  id: string;
+  vlan_id: number;
+  name: string;
+  description: string;
+}
+
+export interface UnifiDashboardClient {
+  id: string;
+  address: string;
+  subnet_id: string | null;
+  hostname: string | null;
+  mac_address: string | null;
+  status: string;
+  description: string;
+  last_seen_at: string | null;
+}
+
+export interface UnifiDashboardResponse {
+  controller: UnifiController;
+  router_id: string | null;
+  subnets: UnifiDashboardSubnet[];
+  vlans: UnifiDashboardVlan[];
+  clients: UnifiDashboardClient[];
+  client_count_total: number;
+}
+
 export const unifiApi = {
   listControllers: () =>
     api.get<UnifiController[]>("/unifi/controllers").then((r) => r.data),
+  getController: (id: string) =>
+    api.get<UnifiController>(`/unifi/controllers/${id}`).then((r) => r.data),
+  getDashboard: (id: string) =>
+    api
+      .get<UnifiDashboardResponse>(`/unifi/controllers/${id}/dashboard`)
+      .then((r) => r.data),
   createController: (data: UnifiControllerCreate) =>
     api.post<UnifiController>("/unifi/controllers", data).then((r) => r.data),
   updateController: (id: string, data: UnifiControllerUpdate) =>

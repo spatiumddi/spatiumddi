@@ -30,8 +30,9 @@ from app.core.crypto import decrypt_str, encrypt_str
 from app.core.permissions import require_resource_permission
 from app.models.audit import AuditLog
 from app.models.dns import DNSServerGroup
-from app.models.ipam import IPSpace
+from app.models.ipam import IPAddress, IPSpace, Subnet
 from app.models.unifi import UnifiController
+from app.models.vlans import VLAN, Router
 
 router = APIRouter(
     tags=["unifi"],
@@ -464,6 +465,174 @@ async def _probe(
 async def list_controllers(db: DB, _: CurrentUser) -> list[ControllerResponse]:
     res = await db.execute(select(UnifiController).order_by(UnifiController.name))
     return [_to_response(c) for c in res.scalars().all()]
+
+
+@router.get("/controllers/{controller_id}", response_model=ControllerResponse)
+async def get_controller(
+    controller_id: uuid.UUID, db: DB, _: CurrentUser
+) -> ControllerResponse:
+    c = await db.get(UnifiController, controller_id)
+    if c is None:
+        raise HTTPException(status_code=404, detail="UniFi controller not found")
+    return _to_response(c)
+
+
+# ── Dashboard payload ────────────────────────────────────────────────
+#
+# Single-shot endpoint backing the per-controller detail page. Returns
+# the controller header + a denormalised view of every IPAM row owned
+# by the controller (subnets, addresses), every VLAN under its
+# auto-created Router, and the latest discovery snapshot. The page
+# uses this to render Overview / Subnets / VLANs / Clients tabs
+# without firing five queries on mount.
+
+
+class DashboardSubnet(BaseModel):
+    id: uuid.UUID
+    network: str
+    name: str
+    description: str
+    gateway: str | None
+    vlan_id: int | None
+    vlan_ref_id: uuid.UUID | None
+    total_ips: int
+    allocated_ips: int
+    utilization_percent: float
+
+
+class DashboardVlan(BaseModel):
+    id: uuid.UUID
+    vlan_id: int
+    name: str
+    description: str
+
+
+class DashboardClient(BaseModel):
+    id: uuid.UUID
+    address: str
+    subnet_id: uuid.UUID | None
+    hostname: str | None
+    mac_address: str | None
+    status: str
+    description: str
+    last_seen_at: datetime | None
+
+
+class DashboardResponse(BaseModel):
+    controller: ControllerResponse
+    router_id: uuid.UUID | None
+    subnets: list[DashboardSubnet]
+    vlans: list[DashboardVlan]
+    clients: list[DashboardClient]
+    client_count_total: int
+
+
+@router.get(
+    "/controllers/{controller_id}/dashboard",
+    response_model=DashboardResponse,
+)
+async def get_controller_dashboard(
+    controller_id: uuid.UUID, db: DB, _: CurrentUser
+) -> DashboardResponse:
+    """Render the full per-controller detail view in one round-trip.
+
+    Subnets + VLANs are scoped to the controller's auto-created
+    Router. Clients are capped at 500 newest first to keep the
+    payload bounded — the full list is paginated through
+    ``/ipam/addresses`` when the operator needs it.
+    """
+    c = await db.get(UnifiController, controller_id)
+    if c is None:
+        raise HTTPException(status_code=404, detail="UniFi controller not found")
+
+    subnet_rows = (
+        (
+            await db.execute(
+                select(Subnet)
+                .where(Subnet.unifi_controller_id == c.id)
+                .order_by(Subnet.network.asc())
+            )
+        )
+        .scalars()
+        .all()
+    )
+    subnets = [
+        DashboardSubnet(
+            id=s.id,
+            network=str(s.network),
+            name=s.name,
+            description=s.description,
+            gateway=str(s.gateway) if s.gateway else None,
+            vlan_id=s.vlan_id,
+            vlan_ref_id=s.vlan_ref_id,
+            total_ips=s.total_ips,
+            allocated_ips=s.allocated_ips,
+            utilization_percent=s.utilization_percent,
+        )
+        for s in subnet_rows
+    ]
+
+    router_row = (
+        await db.execute(select(Router).where(Router.unifi_controller_id == c.id))
+    ).scalar_one_or_none()
+    vlans: list[DashboardVlan] = []
+    if router_row is not None:
+        vlan_rows = (
+            (
+                await db.execute(
+                    select(VLAN)
+                    .where(VLAN.router_id == router_row.id)
+                    .order_by(VLAN.vlan_id.asc())
+                )
+            )
+            .scalars()
+            .all()
+        )
+        vlans = [
+            DashboardVlan(
+                id=v.id,
+                vlan_id=v.vlan_id,
+                name=v.name,
+                description=v.description,
+            )
+            for v in vlan_rows
+        ]
+
+    client_rows = (
+        (
+            await db.execute(
+                select(IPAddress)
+                .where(IPAddress.unifi_controller_id == c.id)
+                .order_by(IPAddress.modified_at.desc())
+                .limit(500)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    clients = [
+        DashboardClient(
+            id=row.id,
+            address=str(row.address),
+            subnet_id=row.subnet_id,
+            hostname=row.hostname or None,
+            mac_address=row.mac_address or None,
+            status=row.status,
+            description=row.description or "",
+            last_seen_at=getattr(row, "last_seen_at", None),
+        )
+        for row in client_rows
+    ]
+    client_count_total = c.client_count or len(client_rows)
+
+    return DashboardResponse(
+        controller=_to_response(c),
+        router_id=router_row.id if router_row else None,
+        subnets=subnets,
+        vlans=vlans,
+        clients=clients,
+        client_count_total=client_count_total,
+    )
 
 
 @router.post(

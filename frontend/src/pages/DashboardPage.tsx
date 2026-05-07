@@ -2020,7 +2020,7 @@ function IntegrationsPanel({
                 {unifiControllers.map((c) => (
                   <IntegrationRow
                     key={c.id}
-                    to={`/unifi`}
+                    to={`/unifi/${c.id}`}
                     name={c.name}
                     subtitle={
                       c.mode === "cloud"
@@ -2818,8 +2818,7 @@ function IntegrationsDashboardTabPanel() {
           >
             Features → Integrations
           </Link>{" "}
-          to wire up Kubernetes / Docker / Proxmox / Tailscale / UniFi
-          mirrors.
+          to wire up Kubernetes / Docker / Proxmox / Tailscale / UniFi mirrors.
         </p>
       </div>
     );

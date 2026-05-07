@@ -20,6 +20,7 @@ import { DockerPage } from "@/pages/docker/DockerPage";
 import { ProxmoxPage } from "@/pages/proxmox/ProxmoxPage";
 import { TailscalePage } from "@/pages/tailscale/TailscalePage";
 import { UnifiPage } from "@/pages/unifi/UnifiPage";
+import { UnifiControllerDetailPage } from "@/pages/unifi/UnifiControllerDetailPage";
 import { NetworkPage } from "@/pages/network/NetworkPage";
 import { DeviceDetailView } from "@/pages/network/DeviceDetailView";
 import { AsnsPage } from "@/pages/network/AsnsPage";
@@ -126,6 +127,7 @@ export default function App() {
         <Route path="proxmox" element={<ProxmoxPage />} />
         <Route path="tailscale" element={<TailscalePage />} />
         <Route path="unifi" element={<UnifiPage />} />
+        <Route path="unifi/:id" element={<UnifiControllerDetailPage />} />
         <Route path="admin/users" element={<UsersPage />} />
         <Route path="admin/groups" element={<GroupsPage />} />
         <Route path="admin/roles" element={<RolesPage />} />
