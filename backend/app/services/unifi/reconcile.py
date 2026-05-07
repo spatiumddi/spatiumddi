@@ -792,6 +792,35 @@ async def _apply_addresses(
             row = current[addr]
             changed = False
             if row.subnet_id != subnet.id:
+                # Before moving the row, check whether the target
+                # (subnet_id, address) tuple is already occupied by a
+                # different row — typically one written by SNMP
+                # discovery or hand-typed by an operator into the
+                # subnet that *now* encloses this IP. Moving in that
+                # case would hit ``uq_ip_address_subnet_address``.
+                # Drop the unifi-owned row (we'll re-claim the
+                # incumbent on the next reconcile pass via the
+                # adoption phase) instead of crashing the whole
+                # sweep.
+                conflict = (
+                    await db.execute(
+                        select(IPAddress).where(
+                            IPAddress.subnet_id == subnet.id,
+                            IPAddress.address == d.address,
+                            IPAddress.id != row.id,
+                        )
+                    )
+                ).scalar_one_or_none()
+                if conflict is not None:
+                    dirty_subnets.add(row.subnet_id)
+                    dirty_subnets.add(subnet.id)
+                    await db.delete(row)
+                    summary.addresses_deleted += 1
+                    summary.warnings.append(
+                        f"address {addr}: target subnet already has a row; "
+                        f"dropped unifi-owned duplicate (will re-adopt next pass)"
+                    )
+                    continue
                 dirty_subnets.add(row.subnet_id)
                 row.subnet_id = subnet.id
                 changed = True
@@ -812,6 +841,22 @@ async def _apply_addresses(
                 dirty_subnets.add(subnet.id)
                 summary.addresses_updated += 1
         else:
+            # New-to-unifi address. The adoption phase already claimed
+            # eligible existing rows at this address; if a row still
+            # exists at (target_subnet, address) it's owned by another
+            # integration (warned earlier) — don't try to insert
+            # alongside it, that would hit
+            # ``uq_ip_address_subnet_address``.
+            occupied = (
+                await db.execute(
+                    select(IPAddress.id).where(
+                        IPAddress.subnet_id == subnet.id,
+                        IPAddress.address == d.address,
+                    )
+                )
+            ).scalar_one_or_none()
+            if occupied is not None:
+                continue
             db.add(
                 IPAddress(
                     subnet_id=subnet.id,
