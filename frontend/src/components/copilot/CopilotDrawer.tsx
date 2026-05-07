@@ -820,8 +820,20 @@ export function CopilotDrawer({
         {!activeSessionId && !sendMut.isPending && (
           <EmptyState onPick={(q) => sendMut.mutate(q)} />
         )}
-        {messages.map((m) => (
-          <MessageBubble key={m.id} message={m} />
+        {messages.map((m, idx) => (
+          <MessageBubble
+            key={m.id}
+            message={m}
+            onAnswerYesNo={
+              // Only the very last message can be a "live" yes/no
+              // question — the orchestrator suspends the round loop
+              // right after it, so anything beyond it in history
+              // means the operator already answered (issue #120).
+              idx === messages.length - 1 && !sendMut.isPending
+                ? (answer) => sendMut.mutate(answer)
+                : undefined
+            }
+          />
         ))}
         {/* Optimistic echo of the just-sent user message. Stays
               visible from the moment the operator hits Send until
@@ -1037,7 +1049,16 @@ function EmptyState({ onPick }: { onPick: (text: string) => void }) {
   );
 }
 
-function MessageBubble({ message }: { message: AIChatMessage }) {
+function MessageBubble({
+  message,
+  onAnswerYesNo,
+}: {
+  message: AIChatMessage;
+  /** Called when the operator clicks a button in a YesNoCard. The
+   *  parent (CopilotDrawer) submits ``answer`` as a fresh user
+   *  message via the existing send mutation. */
+  onAnswerYesNo?: (answer: string) => void;
+}) {
   if (message.role === "tool") {
     // Detect proposal-shape tool results — render the Approve / Reject
     // card instead of the raw JSON tool envelope. Pattern matches the
@@ -1059,6 +1080,33 @@ function MessageBubble({ message }: { message: AIChatMessage }) {
           proposalId={(parsed as { proposal_id: string }).proposal_id}
           operation={(parsed as { operation?: string }).operation ?? ""}
           previewText={(parsed as { preview?: string }).preview ?? ""}
+        />
+      );
+    }
+    // ask_yes_no — render the Yes/No buttons (issue #120). Pattern
+    // matches the contract from
+    // ``app/services/ai/tools/copilot.py``. The card also detects
+    // whether the operator already answered (via a follow-up user
+    // message in the surrounding history) so a chat replay shows
+    // the answered state.
+    if (
+      parsed != null &&
+      typeof parsed === "object" &&
+      (parsed as { kind?: string }).kind === "yes_no_question"
+    ) {
+      const p = parsed as {
+        question?: string;
+        context?: string | null;
+        yes_label?: string;
+        no_label?: string;
+      };
+      return (
+        <YesNoCard
+          question={p.question ?? ""}
+          context={p.context ?? null}
+          yesLabel={p.yes_label || "Yes"}
+          noLabel={p.no_label || "No"}
+          onAnswer={onAnswerYesNo}
         />
       );
     }
@@ -1206,6 +1254,76 @@ function MessageFooter({ message }: { message: AIChatMessage }) {
             </dl>
           </div>
         )}
+      </div>
+    </div>
+  );
+}
+
+/** Yes / No card rendered in place of a raw tool result for
+ *  ``ask_yes_no`` payloads (issue #120). Buttons feed the answer
+ *  back as a fresh user message via the parent's send mutation. On
+ *  chat replay the buttons are disabled — the answer's already in
+ *  history a couple of messages later — but the question + context
+ *  still render for context. */
+function YesNoCard({
+  question,
+  context,
+  yesLabel,
+  noLabel,
+  onAnswer,
+}: {
+  question: string;
+  context: string | null;
+  yesLabel: string;
+  noLabel: string;
+  /** When undefined, the card renders as "answered" (buttons
+   *  disabled) — the parent decides this based on whether the
+   *  question still sits at the tail of the message list. */
+  onAnswer?: (answer: string) => void;
+}) {
+  const live = !!onAnswer;
+  return (
+    <div className="mb-3 flex justify-start">
+      <div className="max-w-[85%] rounded-lg border border-primary/30 bg-primary/5 p-3 text-sm">
+        <div className="flex items-center gap-2">
+          <Sparkles className="h-3.5 w-3.5 text-primary" />
+          <span className="font-medium">Question</span>
+          <span
+            className={`ml-auto rounded border px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wider ${
+              live
+                ? "border-primary/30 bg-primary/10 text-primary"
+                : "border-zinc-500/30 bg-zinc-500/10 text-zinc-600"
+            }`}
+          >
+            {live ? "pending" : "answered"}
+          </span>
+        </div>
+        <div className="mt-2 whitespace-pre-wrap break-words font-sans text-foreground/90">
+          {question}
+        </div>
+        {context && (
+          <div className="mt-1.5 whitespace-pre-wrap break-words text-xs text-muted-foreground">
+            {context}
+          </div>
+        )}
+        <div className="mt-3 flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => onAnswer?.(yesLabel)}
+            disabled={!live}
+            className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1 text-xs font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+          >
+            {yesLabel}
+          </button>
+          <button
+            type="button"
+            onClick={() => onAnswer?.(noLabel)}
+            disabled={!live}
+            className="inline-flex items-center gap-1.5 rounded-md border px-3 py-1 text-xs font-medium hover:bg-accent disabled:opacity-50"
+          >
+            {noLabel}
+          </button>
+        </div>
       </div>
     </div>
   );

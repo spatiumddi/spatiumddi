@@ -238,6 +238,19 @@ their work faster, not to teach them what DDI is.
    Tables only when you're comparing >2 things across the same
    attributes.
 
+10. **Use ``ask_yes_no`` for true binaries.** When you need a
+    yes-or-no answer from the operator ("continue with the
+    deletion?", "include disabled scopes?", "run this against
+    every subnet?"), call the ``ask_yes_no`` tool instead of
+    asking in plain text. The chat surface renders Yes / No
+    buttons and the operator's click feeds back as the next user
+    message — much faster than typing. After calling
+    ``ask_yes_no``, **STOP** — do not continue generating, do
+    not call other tools, just wait for the next user turn. Cap:
+    one ``ask_yes_no`` call per turn. Reserve plain-prose
+    questions for genuinely open-ended asks ("what hostname?",
+    "which zone?").
+
 ## Worked examples (do this, not the other thing)
 
 ### Example A — operator asks: "How many IPs are in 192.168.0.0/24?"
@@ -958,6 +971,14 @@ class ChatOrchestrator:
 
             # Dispatch each tool call, persist result messages,
             # then loop for another round of model output.
+            #
+            # ``ask_yes_no_pending`` flips to True the first time a
+            # tool result with ``kind: "yes_no_question"`` is
+            # produced this round. The orchestrator short-circuits
+            # the round loop in that case (issue #120) — the
+            # operator's button click submits a fresh user turn that
+            # restarts the loop normally.
+            ask_yes_no_pending = False
             for tc in tool_calls:
                 yield StreamEvent(
                     "tool_call",
@@ -1091,7 +1112,40 @@ class ChatOrchestrator:
                         "preview": result_text[:500],
                     },
                 )
+                # Issue #120 — flag a yes/no suspend on this round if
+                # the tool emitted the structured payload. Cheap
+                # substring check first; only parse when it looks
+                # promising. Multiple ask_yes_no calls in one round
+                # all collapse to the same suspend (the cap is
+                # documented in the system prompt; the orchestrator
+                # just respects whatever the model produced).
+                if tc.name == "ask_yes_no" and "yes_no_question" in result_text:
+                    try:
+                        parsed_result = json.loads(result_text)
+                        if (
+                            isinstance(parsed_result, dict)
+                            and parsed_result.get("kind") == "yes_no_question"
+                        ):
+                            ask_yes_no_pending = True
+                    except json.JSONDecodeError:
+                        pass
             await self.db.commit()
+
+            # Suspend the round loop on ``ask_yes_no`` (issue #120).
+            # No further LLM calls until the operator clicks Yes or
+            # No, which submits a fresh user turn carrying the
+            # answer.
+            if ask_yes_no_pending:
+                yield StreamEvent(
+                    "done",
+                    {
+                        "finish_reason": "ask_yes_no",
+                        "tokens_in": prompt_tokens,
+                        "tokens_out": completion_tokens,
+                        "latency_ms": elapsed_ms,
+                    },
+                )
+                return
 
         # Hit the round cap — bail with an error.
         yield StreamEvent(
