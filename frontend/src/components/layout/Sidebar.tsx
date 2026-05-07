@@ -193,7 +193,9 @@ const adminConfigurationNav = [
     module: "ai.copilot",
   },
   { label: "Custom Fields", icon: Tags, to: "/admin/custom-fields" },
-  { label: "Features", icon: ToggleLeft, to: "/admin/features" },
+  // ``Features`` lives in the footer next to Settings — it's a
+  // platform-wide control, not a per-area config, and ops teams expect
+  // to find it next to "Settings" rather than buried in the sidebar.
   {
     label: "IPAM Templates",
     icon: LayoutTemplate,
@@ -713,6 +715,14 @@ export function Sidebar({
               <Sparkles className="h-4 w-4" />
             </a>
           )}
+
+          <NavItem
+            label="Features"
+            icon={ToggleLeft}
+            to="/admin/features"
+            collapsed={effectiveCollapsed}
+            onNavigate={mobileOpen ? onMobileClose : undefined}
+          />
 
           <NavItem
             label="Settings"
