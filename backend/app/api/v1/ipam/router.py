@@ -1,10 +1,11 @@
 """IPAM API — IP spaces, blocks, subnets, and addresses."""
 
+import hashlib
 import ipaddress
 import re
 import string
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
 import structlog
@@ -33,6 +34,7 @@ from app.models.ipam import (
     Subnet,
     SubnetDomain,
 )
+from app.models.settings import PlatformSettings
 from app.models.vlans import VLAN
 from app.services.dhcp.config_bundle import build_config_bundle
 from app.services.dhcp.windows_writethrough import (
@@ -3078,6 +3080,40 @@ class AggregationSuggestion(BaseModel):
     total_size: int
     subnet_ids: list[str]
     subnet_networks: list[str]
+    # Stable identifier for the snooze map — hash of parent block + sorted
+    # child CIDRs so the entry still matches if collapse_addresses returns
+    # the children in a different order on a later pass. See
+    # ``_aggregation_candidate_key``.
+    candidate_key: str
+    # ``None`` (default) when the operator hasn't acted on this candidate.
+    # An ISO-8601 timestamp means snoozed-until-then; the literal
+    # ``"permanent"`` means dismissed permanently. Server filters these
+    # out by default; ``include_snoozed=true`` returns them so the popover
+    # can surface "show snoozed" for un-snoozing.
+    snoozed_until: str | None = None
+
+
+def _aggregation_candidate_key(block_id: uuid.UUID, child_cidrs: list[str]) -> str:
+    """Stable key for a candidate so the snooze entry matches across passes.
+
+    Hashed over the parent block UUID + the sorted set of child CIDRs —
+    independent of the order ``collapse_addresses`` happened to return.
+    """
+    payload = f"{block_id}|{','.join(sorted(child_cidrs))}"
+    return hashlib.sha256(payload.encode()).hexdigest()[:32]
+
+
+def _snooze_active(value: str, now: datetime) -> bool:
+    """``True`` if a snooze entry should still hide the candidate."""
+    if value == "permanent":
+        return True
+    try:
+        until = datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    if until.tzinfo is None:
+        until = until.replace(tzinfo=UTC)
+    return until > now
 
 
 @router.get(
@@ -3085,7 +3121,10 @@ class AggregationSuggestion(BaseModel):
     response_model=list[AggregationSuggestion],
 )
 async def get_aggregation_suggestions(
-    block_id: uuid.UUID, current_user: CurrentUser, db: DB
+    block_id: uuid.UUID,
+    current_user: CurrentUser,
+    db: DB,
+    include_snoozed: bool = False,
 ) -> list[AggregationSuggestion]:
     """Surface contiguous sibling subnets that could be merged into a supernet.
 
@@ -3093,6 +3132,10 @@ async def get_aggregation_suggestions(
     block's direct-child subnets — any output that subsumes more than one input
     is a clean merge opportunity (the inputs pack perfectly into the supernet
     with no gaps). Returns an empty list when nothing is aggregable.
+
+    Snoozed / dismissed candidates (``platform_settings.aggregation_snooze``)
+    are filtered out unless ``include_snoozed=true`` is passed — the popover
+    uses that to render a "Show snoozed" toggle.
     """
     block = await db.get(IPBlock, block_id)
     if block is None:
@@ -3114,6 +3157,10 @@ async def get_aggregation_suggestions(
         # meaningful to suggest in that case.
         return []
 
+    settings = (await db.execute(select(PlatformSettings).limit(1))).scalar_one_or_none()
+    snooze_map: dict[str, str] = dict(settings.aggregation_snooze) if settings else {}
+    now = datetime.now(UTC)
+
     out: list[AggregationSuggestion] = []
     for super_net in collapsed:
         members = [(rid, n) for rid, n in parsed if n.subnet_of(super_net)]  # type: ignore[arg-type]
@@ -3121,17 +3168,86 @@ async def get_aggregation_suggestions(
             continue
         if super_net.prefixlen >= max(n.prefixlen for _, n in members):
             continue
+        child_cidrs = [str(n) for _, n in members]
+        key = _aggregation_candidate_key(block_id, child_cidrs)
+        snooze_value = snooze_map.get(key)
+        if snooze_value and _snooze_active(snooze_value, now) and not include_snoozed:
+            continue
         out.append(
             AggregationSuggestion(
                 supernet=str(super_net),
                 prefix_len=super_net.prefixlen,
                 total_size=super_net.num_addresses,
                 subnet_ids=[str(rid) for rid, _ in members],
-                subnet_networks=[str(n) for _, n in members],
+                subnet_networks=child_cidrs,
+                candidate_key=key,
+                snoozed_until=(
+                    snooze_value if snooze_value and _snooze_active(snooze_value, now) else None
+                ),
             )
         )
     out.sort(key=lambda s: (-s.total_size, s.supernet))
     return out
+
+
+class AggregationSnoozeRequest(BaseModel):
+    candidate_key: str = Field(..., min_length=8, max_length=128)
+    days: int = Field(30, ge=1, le=3650)
+
+
+class AggregationDismissRequest(BaseModel):
+    candidate_key: str = Field(..., min_length=8, max_length=128)
+
+
+class AggregationClearRequest(BaseModel):
+    candidate_key: str = Field(..., min_length=8, max_length=128)
+
+
+async def _load_or_create_settings(db: AsyncSession) -> PlatformSettings:
+    settings = (await db.execute(select(PlatformSettings).limit(1))).scalar_one_or_none()
+    if settings is None:
+        settings = PlatformSettings(id=1)
+        db.add(settings)
+        await db.flush()
+    return settings
+
+
+@router.post("/aggregation-snoozes/snooze", status_code=status.HTTP_204_NO_CONTENT)
+async def snooze_aggregation_candidate(
+    body: AggregationSnoozeRequest, current_user: CurrentUser, db: DB
+) -> None:
+    """Hide a candidate from the badge for ``days`` days (default 30)."""
+    settings = await _load_or_create_settings(db)
+    until = datetime.now(UTC) + timedelta(days=body.days)
+    snooze = dict(settings.aggregation_snooze)
+    snooze[body.candidate_key] = until.isoformat()
+    settings.aggregation_snooze = snooze
+    await db.commit()
+
+
+@router.post("/aggregation-snoozes/dismiss", status_code=status.HTTP_204_NO_CONTENT)
+async def dismiss_aggregation_candidate(
+    body: AggregationDismissRequest, current_user: CurrentUser, db: DB
+) -> None:
+    """Hide a candidate permanently — operator-flagged "don't suggest again"."""
+    settings = await _load_or_create_settings(db)
+    snooze = dict(settings.aggregation_snooze)
+    snooze[body.candidate_key] = "permanent"
+    settings.aggregation_snooze = snooze
+    await db.commit()
+
+
+@router.post("/aggregation-snoozes/clear", status_code=status.HTTP_204_NO_CONTENT)
+async def clear_aggregation_snooze(
+    body: AggregationClearRequest, current_user: CurrentUser, db: DB
+) -> None:
+    """Remove a snooze / dismiss entry — operator changed their mind."""
+    settings = await _load_or_create_settings(db)
+    snooze = dict(settings.aggregation_snooze)
+    if body.candidate_key in snooze:
+        snooze.pop(body.candidate_key)
+        settings.aggregation_snooze = snooze
+        await db.commit()
 
 
 @router.get("/blocks/{block_id}/effective-dns", response_model=EffectiveDnsResponse)
@@ -3215,7 +3331,7 @@ async def get_effective_block_dhcp(
 async def list_subnets(
     current_user: CurrentUser,
     db: DB,
-    space_id: uuid.UUID | None = None,
+    space_id: list[uuid.UUID] = Query(default_factory=list),
     block_id: uuid.UUID | None = None,
     vlan_ref_id: uuid.UUID | None = None,
     pci_scope: bool | None = None,
@@ -3225,9 +3341,11 @@ async def list_subnets(
     site_id: uuid.UUID | None = None,
     tag: list[str] = Query(default_factory=list),
 ) -> list[Subnet]:
+    # ``space_id`` accepts repeated values (``?space_id=<uuid>&space_id=<uuid>``)
+    # for the dashboard multi-select filter; passing none returns every subnet.
     query = select(Subnet).order_by(Subnet.network)
     if space_id:
-        query = query.where(Subnet.space_id == space_id)
+        query = query.where(Subnet.space_id.in_(space_id))
     if block_id:
         query = query.where(Subnet.block_id == block_id)
     if vlan_ref_id:

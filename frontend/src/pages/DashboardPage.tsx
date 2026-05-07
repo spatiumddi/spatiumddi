@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useQuery, useQueries, useQueryClient } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
 import {
@@ -7,6 +7,7 @@ import {
   Ban,
   Boxes,
   Check,
+  ChevronDown,
   ClipboardCheck,
   Clock,
   Container as ContainerIcon,
@@ -29,6 +30,7 @@ import {
   ShieldCheck,
   Waypoints,
   Wifi,
+  X,
 } from "lucide-react";
 import {
   ipamApi,
@@ -49,6 +51,7 @@ import {
   alertsApi,
   conformityApi,
   dashboardsApi,
+  type IPSpace,
   type Subnet,
   type DNSServer,
   type DHCPServer,
@@ -74,6 +77,7 @@ import {
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { includeInUtilization } from "@/lib/utilization";
+import { useSessionState } from "@/lib/useSessionState";
 import { DHCPTrafficCard, DNSQueryRateCard } from "@/components/MetricsCharts";
 
 /**
@@ -880,11 +884,27 @@ export function DashboardPage() {
     refetchInterval: 30_000,
   });
 
+  // IPAM-tab IP-space filter (issue #115). Multi-select dropdown above
+  // the IPAM-tab cards scopes every subnet-derived stat to the chosen
+  // spaces. Empty list = "All spaces" (no filter). Persisted per-session
+  // so a refresh / drawer toggle keeps the selection.
+  const [ipamSpaceFilter, setIpamSpaceFilter] = useSessionState<string[]>(
+    "spatium.dashboard.ipam.space_filter",
+    [],
+  );
+  const ipamFilterActive = tab === "ipam" && ipamSpaceFilter.length > 0;
+  const filterSpaces = (rows: Subnet[] | undefined) =>
+    ipamFilterActive
+      ? (rows ?? []).filter((s) => ipamSpaceFilter.includes(s.space_id))
+      : (rows ?? []);
+
   // Derived stats — every utilization-driven counter reads from
   // `reportSubnets` so small PTP / loopback subnets don't skew the
   // dashboard. `subnets` (the unfiltered list) is still used for
-  // inventory counts like "N subnets".
-  const reporting = reportSubnets ?? [];
+  // inventory counts like "N subnets". Both feed through `filterSpaces`
+  // so the IPAM-tab filter, when active, scopes every downstream number.
+  const reporting = filterSpaces(reportSubnets);
+  const subnetsScoped = filterSpaces(subnets);
   // IPv6 subnets (typically /64) carry 2^64 hosts each — counting them in
   // "free addresses" or overall utilization makes the headline numbers
   // meaningless (a single /64 swamps every IPv4 subnet combined). Restrict
@@ -967,6 +987,13 @@ export function DashboardPage() {
             </p>
           </div>
           <div className="flex items-center gap-2">
+            {tab === "ipam" && (
+              <IpamSpaceFilter
+                spaces={spaces ?? []}
+                selected={ipamSpaceFilter}
+                onChange={setIpamSpaceFilter}
+              />
+            )}
             {alertCount > 0 && (
               <Link
                 to="/ipam"
@@ -1071,11 +1098,11 @@ export function DashboardPage() {
               />
               <KpiCard
                 label="Subnets"
-                value={subnets?.length ?? "—"}
+                value={subnetsScoped.length}
                 sub={
                   <>
                     <span className="text-emerald-600 dark:text-emerald-400">
-                      {(subnets?.length ?? 0) - critical - warning} healthy
+                      {subnetsScoped.length - critical - warning} healthy
                     </span>
                     {(critical > 0 || warning > 0) && (
                       <>
@@ -1369,7 +1396,7 @@ export function DashboardPage() {
                 </h3>
               </div>
               <span className="text-[11px] text-muted-foreground">
-                Showing {ipamTopSubnets.length} of {subnets?.length ?? 0}
+                Showing {ipamTopSubnets.length} of {subnetsScoped.length}
               </span>
             </div>
             <div className="divide-y">
@@ -1519,18 +1546,26 @@ export function DashboardPage() {
             proxmoxEnabled ||
             tailscaleEnabled ||
             unifiEnabled) && (
-            <IntegrationsPanel
-              kubernetesEnabled={kubernetesEnabled}
-              dockerEnabled={dockerEnabled}
-              proxmoxEnabled={proxmoxEnabled}
-              tailscaleEnabled={tailscaleEnabled}
-              unifiEnabled={unifiEnabled}
-              clusters={k8sClusters}
-              hosts={dockerHosts}
-              proxmoxNodes={proxmoxNodes}
-              tailscaleTenants={tailscaleTenants}
-              unifiControllers={unifiControllers}
-            />
+            <div className="space-y-1.5">
+              {ipamFilterActive && (
+                <p className="px-1 text-[10px] uppercase tracking-wide text-muted-foreground">
+                  Integrations are not space-scoped — the filter doesn't apply
+                  here.
+                </p>
+              )}
+              <IntegrationsPanel
+                kubernetesEnabled={kubernetesEnabled}
+                dockerEnabled={dockerEnabled}
+                proxmoxEnabled={proxmoxEnabled}
+                tailscaleEnabled={tailscaleEnabled}
+                unifiEnabled={unifiEnabled}
+                clusters={k8sClusters}
+                hosts={dockerHosts}
+                proxmoxNodes={proxmoxNodes}
+                tailscaleTenants={tailscaleTenants}
+                unifiControllers={unifiControllers}
+              />
+            </div>
           )}
 
         {/* ── Compliance tab ────────────────────────────────────────── */}
@@ -1565,6 +1600,142 @@ export function DashboardPage() {
             </div>
           )}
       </div>
+    </div>
+  );
+}
+
+/**
+ * Multi-select IP-space filter pill (issue #115). Default "All spaces";
+ * selecting a subset narrows every IPAM-tab card. Renders nothing when
+ * fewer than two spaces exist — there's nothing to filter against.
+ */
+function IpamSpaceFilter({
+  spaces,
+  selected,
+  onChange,
+}: {
+  spaces: IPSpace[];
+  selected: string[];
+  onChange: (next: string[]) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const wrapperRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    function onDoc(e: MouseEvent) {
+      if (
+        wrapperRef.current &&
+        !wrapperRef.current.contains(e.target as Node)
+      ) {
+        setOpen(false);
+      }
+    }
+    document.addEventListener("mousedown", onDoc);
+    return () => document.removeEventListener("mousedown", onDoc);
+  }, [open]);
+
+  const sortedSpaces = useMemo(
+    () => [...spaces].sort((a, b) => a.name.localeCompare(b.name)),
+    [spaces],
+  );
+
+  if (sortedSpaces.length < 2) return null;
+
+  const allSelected = selected.length === 0;
+  const label = allSelected
+    ? "Spaces: All"
+    : `Spaces: ${selected.length} selected`;
+
+  function toggle(id: string) {
+    if (selected.includes(id)) {
+      onChange(selected.filter((x) => x !== id));
+    } else {
+      onChange([...selected, id]);
+    }
+  }
+
+  return (
+    <div className="relative" ref={wrapperRef}>
+      <button
+        type="button"
+        onClick={() => setOpen(!open)}
+        title="Scope IPAM-tab cards to one or more IP spaces"
+        className={cn(
+          "inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-xs font-medium hover:bg-accent",
+          !allSelected &&
+            "border-primary/40 bg-primary/5 text-primary dark:bg-primary/10",
+        )}
+      >
+        <Layers className="h-3.5 w-3.5" />
+        {label}
+        <ChevronDown className="h-3 w-3 opacity-60" />
+      </button>
+
+      {open && (
+        <div className="absolute right-0 top-full z-30 mt-1 w-[260px] rounded-md border bg-popover shadow-lg">
+          <div className="flex items-center justify-between border-b px-3 py-2 text-[11px] text-muted-foreground">
+            <span className="font-medium uppercase tracking-wide">
+              IP Spaces
+            </span>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => onChange([])}
+                className="hover:text-foreground"
+                title="Show all spaces"
+              >
+                All
+              </button>
+              <span className="opacity-40">·</span>
+              <button
+                type="button"
+                onClick={() => onChange(sortedSpaces.map((s) => s.id))}
+                className="hover:text-foreground"
+                title="Select every space (effectively the same as All — kept for symmetry)"
+              >
+                None
+              </button>
+            </div>
+          </div>
+          <div className="max-h-[280px] overflow-auto py-1">
+            {sortedSpaces.map((s) => {
+              const checked = !allSelected && selected.includes(s.id);
+              return (
+                <label
+                  key={s.id}
+                  className="flex cursor-pointer items-center gap-2 px-3 py-1.5 text-xs hover:bg-accent"
+                >
+                  <input
+                    type="checkbox"
+                    checked={checked}
+                    onChange={() => toggle(s.id)}
+                    className="h-3.5 w-3.5"
+                  />
+                  <span className="truncate">{s.name}</span>
+                  {s.is_default && (
+                    <span className="ml-auto rounded bg-muted px-1.5 py-0 text-[10px] uppercase text-muted-foreground">
+                      Default
+                    </span>
+                  )}
+                </label>
+              );
+            })}
+          </div>
+          {!allSelected && (
+            <div className="border-t px-3 py-2">
+              <button
+                type="button"
+                onClick={() => onChange([])}
+                className="inline-flex items-center gap-1 text-[11px] text-muted-foreground hover:text-foreground"
+              >
+                <X className="h-3 w-3" />
+                Clear filter
+              </button>
+            </div>
+          )}
+        </div>
+      )}
     </div>
   );
 }

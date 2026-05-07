@@ -283,6 +283,12 @@ export interface AggregationSuggestion {
   total_size: number;
   subnet_ids: string[];
   subnet_networks: string[];
+  // Stable hash that ties the suggestion to a snooze entry. The popover
+  // sends this back when the operator snoozes or dismisses the candidate.
+  candidate_key: string;
+  // ISO timestamp (snoozed-until) or the literal ``"permanent"`` when
+  // dismissed. ``null`` for live, un-acted-on candidates.
+  snoozed_until: string | null;
 }
 
 export interface PlanAllocationResponse {
@@ -1138,11 +1144,26 @@ export const ipamApi = {
     api
       .get<FreeCidrRange[]>(`/ipam/blocks/${blockId}/free-space`)
       .then((r) => r.data),
-  blockAggregationSuggestions: (blockId: string) =>
+  blockAggregationSuggestions: (
+    blockId: string,
+    params?: { include_snoozed?: boolean },
+  ) =>
     api
       .get<
         AggregationSuggestion[]
-      >(`/ipam/blocks/${blockId}/aggregation-suggestions`)
+      >(`/ipam/blocks/${blockId}/aggregation-suggestions`, { params })
+      .then((r) => r.data),
+  snoozeAggregationCandidate: (candidate_key: string, days: number = 30) =>
+    api
+      .post<void>(`/ipam/aggregation-snoozes/snooze`, { candidate_key, days })
+      .then((r) => r.data),
+  dismissAggregationCandidate: (candidate_key: string) =>
+    api
+      .post<void>(`/ipam/aggregation-snoozes/dismiss`, { candidate_key })
+      .then((r) => r.data),
+  clearAggregationSnooze: (candidate_key: string) =>
+    api
+      .post<void>(`/ipam/aggregation-snoozes/clear`, { candidate_key })
       .then((r) => r.data),
   planBlockAllocation: (blockId: string, items: PlanRequestItem[]) =>
     api
@@ -1204,7 +1225,10 @@ export const ipamApi = {
       .then((r) => r.data),
 
   listSubnets: (params?: {
-    space_id?: string;
+    // ``space_id`` accepts a single id or an array — axios serialises an
+    // array as repeated ``?space_id=<uuid>&space_id=<uuid>`` thanks to the
+    // ``indexes: null`` paramsSerializer config.
+    space_id?: string | string[];
     block_id?: string;
     vlan_ref_id?: string;
     pci_scope?: boolean;

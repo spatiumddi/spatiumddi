@@ -115,7 +115,7 @@ import {
 import { cidrContains, compareNetwork } from "@/lib/cidr";
 import { FreeSpaceBand } from "@/components/ipam/FreeSpaceBand";
 import { PlanAllocationModal } from "@/components/ipam/PlanAllocationModal";
-import { AggregationSuggestions } from "@/components/ipam/AggregationSuggestions";
+import { AggregationCandidatesBadge } from "@/components/ipam/AggregationSuggestions";
 import { FreeSpaceTreemap } from "@/components/ipam/FreeSpaceTreemap";
 import {
   ContextMenu,
@@ -9980,6 +9980,7 @@ function BlockDetailView({
               </>
             ) : (
               <>
+                <AggregationCandidatesBadge blockId={block.id} />
                 <HeaderButton
                   icon={Globe2}
                   onClick={() => setShowDnsSync(true)}
@@ -10113,7 +10114,6 @@ function BlockDetailView({
             />
           )}
         </div>
-        <AggregationSuggestions blockId={block.id} />
       </div>
       {showPlanAllocation && (
         <PlanAllocationModal

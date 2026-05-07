@@ -39,6 +39,41 @@ last three releases retroactively.
 
 ### Added
 
+- **Aggregation candidates — passive badge with per-candidate
+  snooze (issue #114).** The inline "Aggregation suggestions"
+  banner that crowded the IPAM page on every load is replaced
+  with a small badge button in the block header — click expands
+  a popover showing the same candidate set with two new
+  per-row actions: **Snooze 30 days** (re-appears after the
+  timer) and **Don't suggest again** (permanent, operator-flagged
+  "I know, leave me alone"). Snooze entries persist in
+  `platform_settings.aggregation_snooze` JSONB keyed on a stable
+  hash of parent block + sorted child CIDRs, so a snooze still
+  matches the same candidate even if `collapse_addresses` returns
+  the children in a different order on a later pass. Filtered
+  server-side by default; the popover surfaces a "Show snoozed"
+  toggle so operators can revisit and Re-enable. Per-session
+  expand/collapse keyed on block id, so an operator working
+  through suggestions doesn't re-click on every nav. Migration
+  `d9e4c12a7f85`.
+- **Dashboard IPAM-tab IP-space filter (issue #115).** Multi-select
+  pill on the Dashboard's IPAM tab that scopes every space-aware
+  card to the selected spaces — IPv4/v6 split, capacity headroom,
+  utilization KPIs, subnet heatmap, top-subnets list, and the
+  shared KPI grid all narrow to the selection. Default "All
+  spaces"; persisted per session in `sessionStorage` keyed on
+  `spatium.dashboard.ipam.space_filter` so a refresh / drawer
+  toggle / nav-away-and-back keeps it. Pill is IPAM-tab-only —
+  switching to Overview / DNS / DHCP shows global numbers
+  unfiltered, which sidesteps the "the filter looks broken on
+  other tabs" trap. Non-IPAM-shaped surfaces on the IPAM tab
+  (the Integrations panel) carry a small "(not space-scoped)"
+  annotation when the filter is active so operators understand
+  the scope. Backend: `/ipam/subnets` `space_id` query param now
+  accepts repeated values (`?space_id=A&space_id=B`) — single-id
+  callers still work since FastAPI's repeated-key parsing returns
+  a 1-element list. axios's `paramsSerializer: { indexes: null }`
+  serialises arrays as repeated keys with no brackets.
 - **UniFi Network integration — Phase 1.** Issue #30. Read-only
   mirror of UniFi networks + active clients into IPAM. Per
   controller `unifi_controller` row, dual-transport (local +

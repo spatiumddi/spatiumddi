@@ -349,3 +349,15 @@ class PlatformSettings(Base):
     ai_daily_digest_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=sa_text("false")
     )
+
+    # ── Aggregation candidate snooze (issue #114) ───────────────────
+    # Operator-driven hide-list for the IPAM aggregation badge popover.
+    # Keys are stable per-candidate hashes derived from the parent
+    # block + sorted child CIDRs (so the same snooze still matches if
+    # collapse_addresses returns the children in a different order on
+    # a later pass). Values are ISO-8601 timestamps for time-bounded
+    # snoozes, or the literal string ``"permanent"`` for "don't suggest
+    # again". Filtered server-side in the suggestions endpoint.
+    aggregation_snooze: Mapped[dict] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=sa_text("'{}'::jsonb")
+    )
