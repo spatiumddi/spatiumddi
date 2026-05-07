@@ -22,6 +22,7 @@ from typing import Any
 import httpx
 import structlog
 
+from app.services.bgp._errors import classify_http_error
 from app.services.bgp.cache import PEERINGDB_TTL_SECONDS
 from app.services.bgp.cache import get as cache_get
 from app.services.bgp.cache import set_ as cache_set
@@ -60,10 +61,15 @@ async def _fetch(path: str, params: dict[str, Any], cache_key: str) -> Any:
             resp.raise_for_status()
             payload = resp.json()
     except httpx.HTTPError as exc:
+        # Full str(exc) lands in the structured log; the response
+        # carries only a sanitized category so we don't leak the
+        # upstream URL / hostname to the client (CodeQL
+        # py/stack-trace-exposure).
         logger.info("peeringdb_fetch_failed", path=path, error=str(exc))
-        return {"available": False, "error": str(exc)}
-    except ValueError as exc:
-        return {"available": False, "error": f"malformed response: {exc}"}
+        return {"available": False, "error": classify_http_error(exc)}
+    except ValueError:
+        logger.info("peeringdb_malformed_response", path=path)
+        return {"available": False, "error": "malformed_response"}
 
     cache_set("peeringdb", cache_key, payload)
     return payload

@@ -160,6 +160,11 @@ class FtpDestination(BackupDestination):
         ctx: ssl.SSLContext | None = None
         if mode in {"ftps_explicit", "ftps_implicit"}:
             ctx = ssl.create_default_context()
+            # Pin to TLS 1.2+ explicitly. Modern OpenSSL already
+            # disables 1.0 / 1.1 by default, but being explicit closes
+            # CodeQL py/insecure-protocol and makes the contract
+            # obvious to readers.
+            ctx.minimum_version = ssl.TLSVersion.TLSv1_2
             if not verify:
                 ctx.check_hostname = False
                 ctx.verify_mode = ssl.CERT_NONE
