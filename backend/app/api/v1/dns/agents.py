@@ -464,6 +464,65 @@ async def agent_zone_state(
     return {"updated": updated}
 
 
+class DNSSECStateReport(BaseModel):
+    """One zone's DNSSEC state, posted by the agent after signing.
+
+    The DS rrset strings come straight from PowerDNS's
+    ``GET /zones/{z}/cryptokeys`` response — operator copies them
+    into the parent registrar verbatim. Empty list = unsigned.
+    """
+
+    zone_name: str
+    ds_records: list[str]
+
+
+class DNSSECStateBatch(BaseModel):
+    zones: list[DNSSECStateReport]
+
+
+@router.post("/dnssec-state")
+async def agent_dnssec_state(
+    body: DNSSECStateBatch,
+    db: DB,
+    auth: tuple[DNSServer, dict[str, Any]] = Depends(_auth_agent),
+) -> dict[str, int]:
+    """Agents POST DS-record state per zone after a signing change
+    (issue #127, Phase 3c.fe).
+
+    Updates ``DNSZone.dnssec_ds_records`` + ``dnssec_synced_at`` so
+    the operator-facing zone-edit page can render the DS rrset
+    without round-tripping the agent on every page load.
+
+    Empty ``ds_records`` = the zone was just unsigned; we clear the
+    cache so the UI doesn't display stale records the parent zone
+    no longer trusts.
+
+    Unknown zone names are silently skipped (deleted between sign
+    and report) — same fail-soft semantic as ``/zone-state``.
+    """
+    _, _ = auth
+    now = datetime.now(UTC)
+    updated = 0
+
+    if not body.zones:
+        return {"updated": 0}
+
+    names = [e.zone_name.rstrip(".") for e in body.zones]
+    res = await db.execute(select(DNSZone).where(DNSZone.name.in_(names)))
+    zones_by_name: dict[str, DNSZone] = {z.name.rstrip("."): z for z in res.scalars().all()}
+
+    for entry in body.zones:
+        zone = zones_by_name.get(entry.zone_name.rstrip("."))
+        if zone is None:
+            continue
+        zone.dnssec_ds_records = entry.ds_records or None
+        zone.dnssec_synced_at = now
+        updated += 1
+
+    await db.commit()
+    return {"updated": updated}
+
+
 class DNSMetricReport(BaseModel):
     """One time-bucketed sample of BIND9 query counters.
 

@@ -2804,6 +2804,31 @@ async def update_zone(
     return zone
 
 
+@router.get("/groups/{group_id}/zones/{zone_id}/dnssec/info")
+async def get_zone_dnssec_info(
+    group_id: uuid.UUID,
+    zone_id: uuid.UUID,
+    db: DB,
+    _: CurrentUser,
+) -> dict[str, Any]:
+    """DNSSEC state + DS records for the zone-edit DNSSEC card.
+
+    Reads the cached ``dnssec_ds_records`` + ``dnssec_synced_at`` the
+    agent populates after a successful sign. No live agent round
+    trip — the cache is refreshed every time the agent applies a
+    sign / unsign op, so it tracks ground truth within one config
+    sync cycle (typically <30s after the operator clicks Sign).
+    """
+    zone = await _require_zone(group_id, zone_id, db)
+    return {
+        "zone_id": str(zone.id),
+        "zone_name": zone.name,
+        "dnssec_enabled": zone.dnssec_enabled,
+        "dnssec_ds_records": zone.dnssec_ds_records or [],
+        "dnssec_synced_at": (zone.dnssec_synced_at.isoformat() if zone.dnssec_synced_at else None),
+    }
+
+
 @router.post("/groups/{group_id}/zones/{zone_id}/dnssec/sign", response_model=ZoneResponse)
 async def sign_zone_dnssec(
     group_id: uuid.UUID,

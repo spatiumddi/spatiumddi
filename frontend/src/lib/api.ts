@@ -3884,6 +3884,8 @@ export interface DNSZone {
   linked_subnet_id: string | null;
   domain_id?: string | null;
   dnssec_enabled: boolean;
+  dnssec_ds_records: string[] | null;
+  dnssec_synced_at: string | null;
   color: string | null;
   last_serial: number;
   last_pushed_at: string | null;
@@ -4296,6 +4298,26 @@ export const dnsApi = {
       .get<ZoneServerState>(
         `/dns/groups/${groupId}/zones/${zoneId}/server-state`,
       )
+      .then((r) => r.data),
+
+  // PowerDNS online DNSSEC (issue #127, Phase 3c)
+  getZoneDnssecInfo: (groupId: string, zoneId: string) =>
+    api
+      .get<{
+        zone_id: string;
+        zone_name: string;
+        dnssec_enabled: boolean;
+        dnssec_ds_records: string[];
+        dnssec_synced_at: string | null;
+      }>(`/dns/groups/${groupId}/zones/${zoneId}/dnssec/info`)
+      .then((r) => r.data),
+  signZoneDnssec: (groupId: string, zoneId: string) =>
+    api
+      .post<DNSZone>(`/dns/groups/${groupId}/zones/${zoneId}/dnssec/sign`)
+      .then((r) => r.data),
+  unsignZoneDnssec: (groupId: string, zoneId: string) =>
+    api
+      .post<DNSZone>(`/dns/groups/${groupId}/zones/${zoneId}/dnssec/unsign`)
       .then((r) => r.data),
 
   // Delegation wizard

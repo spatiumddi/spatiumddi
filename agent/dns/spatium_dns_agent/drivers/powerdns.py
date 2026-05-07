@@ -244,8 +244,15 @@ class PowerDNSDriver(DriverBase):
 
     # ── Record ops (REST PATCH against loopback API) ───────────────────────
 
-    def apply_record_op(self, op: dict[str, Any]) -> None:
-        """Apply a single record op via the PowerDNS REST API."""
+    def apply_record_op(self, op: dict[str, Any]) -> dict[str, Any] | None:
+        """Apply a single record op via the PowerDNS REST API.
+
+        Returns an optional result dict the sync loop can pipe back
+        upstream — DNSSEC ops use this to ship the new DS rrset to
+        the control plane in the same tick the agent signed the zone.
+        ``None`` for ordinary record ops (the existing fire-and-forget
+        contract).
+        """
         api_key = self._load_or_generate_api_key()
         zone_raw = op["zone_name"]
         zone = zone_raw.rstrip(".") + "."
@@ -255,11 +262,21 @@ class PowerDNSDriver(DriverBase):
         # shaped. They flow through the same record-op queue but
         # branch off here rather than building a rrset PATCH.
         if op_kind == "dnssec_sign":
-            self._dnssec_sign(api_key, zone)
-            return
+            ds_records = self._dnssec_sign(api_key, zone)
+            return {
+                "dnssec_state": {
+                    "zone_name": zone,
+                    "ds_records": ds_records,
+                }
+            }
         if op_kind == "dnssec_unsign":
             self._dnssec_unsign(api_key, zone)
-            return
+            return {
+                "dnssec_state": {
+                    "zone_name": zone,
+                    "ds_records": [],
+                }
+            }
 
         rec = op["record"]
         name = _qualified_name(zone, rec.get("name") or "@")
@@ -306,8 +323,13 @@ class PowerDNSDriver(DriverBase):
 
     # ── DNSSEC ops (Phase 3c) ──────────────────────────────────────────────
 
-    def _dnssec_sign(self, api_key: str, zone: str) -> None:
+    def _dnssec_sign(self, api_key: str, zone: str) -> list[str]:
         """Generate KSK + ZSK, set PRESIGNED metadata, rectify zone.
+
+        Returns the DS rrset string list so the caller can ship it to the
+        control plane (operator pastes the DS into their parent registrar).
+        Empty list means we couldn't extract DS — log-only, not fatal,
+        operator can re-trigger sign to retry.
 
         Idempotent — if keys already exist for the zone, pdns refuses with
         a 409 / 422 and we treat that as success. Operators expect the
@@ -327,7 +349,7 @@ class PowerDNSDriver(DriverBase):
                 self._set_presigned_metadata(client, headers, zone, on=True)
                 self._rectify(client, headers, zone)
                 log.info("powerdns_dnssec_already_signed", zone=zone)
-                return
+                return self._extract_ds_records(existing.json())
 
             for kind, key_type in (("ksk", "ksk"), ("zsk", "zsk")):
                 resp = client.post(
@@ -350,7 +372,37 @@ class PowerDNSDriver(DriverBase):
 
             self._set_presigned_metadata(client, headers, zone, on=True)
             self._rectify(client, headers, zone)
-        log.info("powerdns_dnssec_signed", zone=zone)
+
+            # Re-fetch after creation so we get the freshly-rendered DS
+            # rrset (PowerDNS computes DS from the KSK we just made).
+            after = client.get(
+                f"{_PDNS_API_BASE}/zones/{zone}/cryptokeys", headers=headers
+            )
+            log.info("powerdns_dnssec_signed", zone=zone)
+            if after.status_code == 200:
+                return self._extract_ds_records(after.json())
+            return []
+
+    @staticmethod
+    def _extract_ds_records(cryptokeys: list[dict[str, Any]]) -> list[str]:
+        """Walk the PowerDNS cryptokeys response and pull out every DS
+        rrset string.
+
+        PowerDNS includes a ``ds`` field on each KSK entry (and not on
+        ZSKs — DS records only attest the KSK to the parent zone).
+        Each KSK typically yields one DS per supported digest algorithm
+        (SHA-1 + SHA-256 + SHA-384 by default), all of which the
+        operator should publish to cover validators of varying
+        sophistication.
+        """
+        out: list[str] = []
+        for k in cryptokeys or []:
+            if k.get("keytype") != "ksk":
+                continue
+            for ds in k.get("ds") or []:
+                if isinstance(ds, str) and ds.strip():
+                    out.append(ds.strip())
+        return out
 
     def _dnssec_unsign(self, api_key: str, zone: str) -> None:
         """Delete every cryptokey + clear PRESIGNED metadata.

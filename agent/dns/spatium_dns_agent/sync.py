@@ -150,18 +150,25 @@ class SyncLoop:
         self._current_etag = etag
 
         # Drain pending record ops via RFC 2136 (no daemon reload)
+        dnssec_states: list[dict[str, Any]] = []
         for op in bundle.get("pending_record_ops", []):
             try:
-                self.driver.apply_record_op(op)
+                result = self.driver.apply_record_op(op)
                 self.heartbeat.pending_acks.append({"op_id": op["op_id"], "result": "ok"})
                 log.info("record_op_applied", op_id=op["op_id"], op=op.get("op"),
                          zone=op.get("zone_name"))
+                # PowerDNS DNSSEC ops return the DS rrset so we can ship
+                # it back to the control plane in one batched POST below.
+                if isinstance(result, dict) and "dnssec_state" in result:
+                    dnssec_states.append(result["dnssec_state"])
             except Exception as e:
                 log.exception("op_apply_failed", op_id=op.get("op_id"))
                 self.heartbeat.pending_acks.append(
                     {"op_id": op["op_id"], "result": "error", "message": str(e)}
                 )
                 self.heartbeat.failed_ops_count += 1
+        if dnssec_states:
+            self._report_dnssec_state(dnssec_states)
 
     def _report_zone_state(self, bundle: dict[str, Any]) -> None:
         """POST ``{zones: [{zone_name, serial}, ...]}`` after a successful apply.
@@ -194,6 +201,32 @@ class SyncLoop:
                 )
         except httpx.HTTPError as e:
             log.warning("zone_state_report_failed", error=str(e))
+
+    def _report_dnssec_state(self, states: list[dict[str, Any]]) -> None:
+        """POST the DS rrset(s) the driver just produced after a sign /
+        unsign op (issue #127, Phase 3c.fe).
+
+        Best-effort. A failed POST never blocks the apply — operators
+        re-trigger sign in the UI to retry.
+        """
+        if not states:
+            return
+        headers = {"Authorization": f"Bearer {self.token_ref[0]}"}
+        try:
+            with self._client() as c:
+                resp = c.post(
+                    "/api/v1/dns/agents/dnssec-state",
+                    headers=headers,
+                    json={"zones": states},
+                )
+            if resp.status_code != 200:
+                log.warning(
+                    "dnssec_state_report_non200",
+                    status=resp.status_code,
+                    body=resp.text[:200],
+                )
+        except httpx.HTTPError as e:
+            log.warning("dnssec_state_report_failed", error=str(e))
 
     def run(self) -> None:
         while not self._stop.is_set():

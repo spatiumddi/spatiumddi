@@ -68,6 +68,27 @@ visibility.
   pipeline adds a parallel ``build-dns-powerdns`` job alongside
   the existing ``build-dns`` (BIND9) so every tag publishes both
   images with ``:<version>`` and ``:latest`` tags.
+- **PowerDNS online DNSSEC, Phase 3c.fe (\#127, frontend).** Zone
+  edit modal grows a dedicated DNSSEC card on every existing zone:
+  status indicator (signed / unsigned + last-sync timestamp), a
+  green "Sign zone" button (or amber "Re-sign" + red "Unsign" pair
+  when signed), and a copy-to-clipboard list of DS rrset strings
+  to paste into the parent registrar. Status auto-refreshes every
+  10 s while signed so DS records appear within one config-sync
+  cycle of clicking Sign. Driver-aware errors surface inline (the
+  API's 422 on non-PowerDNS groups renders as a destructive banner
+  inside the card, not a vanished button). Migration adds
+  ``dnssec_ds_records`` (JSONB) + ``dnssec_synced_at`` (timestamp)
+  columns to ``dns_zone`` (revision ``e7f94b21c8d5``); the agent
+  populates them via a new ``POST /api/v1/dns/agents/dnssec-state``
+  endpoint after every sign / unsign. New
+  ``GET /dns/groups/{g}/zones/{z}/dnssec/info`` operator-facing
+  endpoint returns the cached state for the FE without round-
+  tripping the agent on every page load. PowerDNS's DS rrset
+  extraction walks the cryptokeys response — KSK entries carry a
+  ``ds`` array with one entry per supported digest algorithm,
+  all of which the operator should publish. Catalog zones
+  (Phase 3d) still pending.
 - **PowerDNS online DNSSEC, Phase 3c (\#127, backend).** Operators
   can sign / unsign a PowerDNS zone via two new endpoints:
   ``POST /dns/groups/{g}/zones/{z}/dnssec/sign`` and

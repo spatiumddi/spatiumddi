@@ -1206,6 +1206,194 @@ function ServerModal({
   );
 }
 
+// ── DNSSEC card (Phase 3c.fe) ────────────────────────────────────────────
+
+/**
+ * Operator-facing DNSSEC management for a single zone. Renders the
+ * current state (signed / unsigned + last sync timestamp), the
+ * Sign / Unsign action buttons, and the DS rrset list with one-click
+ * copy so operators can paste into their parent registrar.
+ *
+ * Driver gating happens server-side — clicking "Sign" against a
+ * non-PowerDNS group returns 422 with a clear error which we surface
+ * via the mutation's onError. Operators get the message inline rather
+ * than the button being mysteriously absent.
+ */
+function DnssecCard({
+  groupId,
+  zoneId,
+  zoneName,
+  initiallyEnabled,
+}: {
+  groupId: string;
+  zoneId: string;
+  zoneName: string;
+  initiallyEnabled: boolean;
+}) {
+  const qc = useQueryClient();
+  const [error, setError] = useState<string | null>(null);
+  const [copiedIdx, setCopiedIdx] = useState<number | null>(null);
+
+  const info = useQuery({
+    queryKey: ["dns-zone-dnssec-info", groupId, zoneId],
+    queryFn: () => dnsApi.getZoneDnssecInfo(groupId, zoneId),
+    refetchOnWindowFocus: true,
+    refetchInterval: initiallyEnabled ? 10_000 : false,
+  });
+
+  const signMut = useMutation({
+    mutationFn: () => dnsApi.signZoneDnssec(groupId, zoneId),
+    onSuccess: () => {
+      setError(null);
+      qc.invalidateQueries({
+        queryKey: ["dns-zone-dnssec-info", groupId, zoneId],
+      });
+      qc.invalidateQueries({ queryKey: ["dns-zones", groupId] });
+    },
+    onError: (e: ApiError) => setError(formatApiError(e, "Sign failed")),
+  });
+  const unsignMut = useMutation({
+    mutationFn: () => dnsApi.unsignZoneDnssec(groupId, zoneId),
+    onSuccess: () => {
+      setError(null);
+      qc.invalidateQueries({
+        queryKey: ["dns-zone-dnssec-info", groupId, zoneId],
+      });
+      qc.invalidateQueries({ queryKey: ["dns-zones", groupId] });
+    },
+    onError: (e: ApiError) => setError(formatApiError(e, "Unsign failed")),
+  });
+
+  const enabled = info.data?.dnssec_enabled ?? initiallyEnabled;
+  const dsRecords = info.data?.dnssec_ds_records ?? [];
+  const syncedAt = info.data?.dnssec_synced_at ?? null;
+  const busy = signMut.isPending || unsignMut.isPending;
+
+  function copyDs(idx: number, value: string) {
+    navigator.clipboard.writeText(value).then(
+      () => {
+        setCopiedIdx(idx);
+        setTimeout(() => setCopiedIdx((c) => (c === idx ? null : c)), 1500);
+      },
+      () => setError("Copy to clipboard failed"),
+    );
+  }
+
+  return (
+    <div className="rounded-md border bg-muted/30 p-3 space-y-3">
+      <div className="flex items-center justify-between gap-3">
+        <div>
+          <div className="text-sm font-medium">DNSSEC</div>
+          <div className="text-xs text-muted-foreground">
+            {enabled ? (
+              <>
+                Zone is{" "}
+                <span className="font-medium text-emerald-600">signed</span>
+                {syncedAt ? (
+                  <>
+                    {" — last sync "}
+                    <time
+                      className="font-mono"
+                      title={new Date(syncedAt).toLocaleString()}
+                    >
+                      {new Date(syncedAt).toLocaleString()}
+                    </time>
+                  </>
+                ) : (
+                  " — agent has not yet reported DS records"
+                )}
+              </>
+            ) : (
+              <>
+                Zone is <span className="font-medium">unsigned</span>. Sign to
+                generate KSK + ZSK and publish DS records to the parent
+                registrar. PowerDNS-only.
+              </>
+            )}
+          </div>
+        </div>
+        <div className="flex shrink-0 gap-2">
+          {enabled ? (
+            <>
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => signMut.mutate()}
+                className="rounded border px-2 py-1 text-xs hover:bg-accent disabled:opacity-50"
+                title="Re-run sign — pdns regenerates keys + rectifies"
+              >
+                {signMut.isPending ? "Re-signing…" : "Re-sign"}
+              </button>
+              <button
+                type="button"
+                disabled={busy}
+                onClick={() => unsignMut.mutate()}
+                className="rounded border border-destructive/40 bg-destructive/10 px-2 py-1 text-xs text-destructive hover:bg-destructive/20 disabled:opacity-50"
+              >
+                {unsignMut.isPending ? "Unsigning…" : "Unsign"}
+              </button>
+            </>
+          ) : (
+            <button
+              type="button"
+              disabled={busy}
+              onClick={() => signMut.mutate()}
+              className="rounded bg-emerald-600 px-3 py-1 text-xs font-medium text-white hover:bg-emerald-700 disabled:opacity-50"
+            >
+              {signMut.isPending ? "Signing…" : "Sign zone"}
+            </button>
+          )}
+        </div>
+      </div>
+
+      {error && (
+        <div className="rounded border border-destructive/40 bg-destructive/10 px-2 py-1.5 text-xs text-destructive">
+          {error}
+        </div>
+      )}
+
+      {enabled && (
+        <div>
+          <div className="mb-1 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+            DS records — paste these at the parent registrar for{" "}
+            <code className="font-mono">{zoneName.replace(/\.$/, "")}</code>
+          </div>
+          {dsRecords.length === 0 ? (
+            <div className="rounded border border-amber-500/30 bg-amber-500/10 px-2 py-1.5 text-xs text-amber-700 dark:text-amber-300">
+              Waiting for the agent to report DS records (typically &lt;30 s
+              after signing).
+            </div>
+          ) : (
+            <ul className="space-y-1">
+              {dsRecords.map((ds, idx) => (
+                <li
+                  key={idx}
+                  className="flex items-center gap-2 rounded border bg-background px-2 py-1.5"
+                >
+                  <code className="flex-1 break-all font-mono text-[11px]">
+                    {ds}
+                  </code>
+                  <button
+                    type="button"
+                    onClick={() => copyDs(idx, ds)}
+                    className="shrink-0 rounded border px-2 py-0.5 text-[10px] hover:bg-accent"
+                  >
+                    {copiedIdx === idx ? "Copied" : "Copy"}
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+          <div className="mt-2 text-[11px] text-muted-foreground">
+            Multiple algorithms are normal — publish them all. PowerDNS rotates
+            keys automatically; this list refreshes after each rollover.
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 // ── Zone Modal (add / edit) ───────────────────────────────────────────────────
 
 function ZoneModal({
@@ -1414,17 +1602,31 @@ function ZoneModal({
             />
           </Field>
           <Field label="DNSSEC">
-            <label className="flex items-center gap-2 mt-2 cursor-pointer">
-              <input
-                type="checkbox"
-                checked={dnssec}
-                onChange={(e) => setDnssec(e.target.checked)}
-                className="h-4 w-4"
-              />
-              <span className="text-sm">Enable DNSSEC</span>
-            </label>
+            {zone ? (
+              <div className="mt-1 text-xs text-muted-foreground">
+                Manage signing in the panel below.
+              </div>
+            ) : (
+              <label className="flex items-center gap-2 mt-2 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={dnssec}
+                  onChange={(e) => setDnssec(e.target.checked)}
+                  className="h-4 w-4"
+                />
+                <span className="text-sm">Enable DNSSEC after creation</span>
+              </label>
+            )}
           </Field>
         </div>
+        {zone && (
+          <DnssecCard
+            groupId={groupId}
+            zoneId={zone.id}
+            zoneName={zone.name}
+            initiallyEnabled={zone.dnssec_enabled}
+          />
+        )}
         <Field label="Color">
           <SwatchPicker value={color} onChange={setColor} />
         </Field>

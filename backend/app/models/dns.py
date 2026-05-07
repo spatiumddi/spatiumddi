@@ -533,6 +533,15 @@ class DNSZone(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     # the allowed keys.
     color: Mapped[str | None] = mapped_column(String(20), nullable=True)
     dnssec_enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    # Populated by the agent after a successful PowerDNS online-signing
+    # apply. The DS rrset strings live here so the zone-edit page can
+    # surface them for the operator to paste into their parent registrar
+    # without round-tripping the agent on every render. Refreshed on every
+    # sign / re-sign report (issue #127, Phase 3c.fe).
+    dnssec_ds_records: Mapped[list | None] = mapped_column(JSONB, nullable=True)
+    dnssec_synced_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     last_serial: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     last_pushed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
