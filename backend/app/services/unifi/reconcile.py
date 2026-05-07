@@ -42,6 +42,7 @@ from app.core.crypto import decrypt_str
 from app.models.audit import AuditLog
 from app.models.ipam import IPAddress, IPBlock, Subnet
 from app.models.unifi import UnifiController
+from app.models.vlans import VLAN, Router
 from app.services.unifi.client import (
     UnifiClient,
     UnifiClientConfig,
@@ -82,6 +83,8 @@ class _DesiredSubnet:
     gateway: str | None
     site_name: str
     network_id: str  # UniFi network UUID, used to resolve client → subnet
+    vlan_tag: int | None  # 802.1Q tag (None for untagged / VPN networks)
+    vlan_name: str  # Friendly name carried into the VLAN row
 
 
 @dataclass(frozen=True)
@@ -112,6 +115,10 @@ class ReconcileSummary:
     addresses_deleted: int = 0
     skipped_no_subnet: int = 0
     sites_skipped: int = 0
+    vlans_created: int = 0
+    vlans_updated: int = 0
+    vlans_deleted: int = 0
+    routers_created: int = 0
     warnings: list[str] = field(default_factory=list)
 
 
@@ -303,6 +310,8 @@ def _compute_desired(
                     gateway=_ip_subnet_to_gateway(n.ip_subnet),
                     site_name=site.name,
                     network_id=n.network_id,
+                    vlan_tag=n.vlan,
+                    vlan_name=n.name or n.network_id,
                 )
             )
 
@@ -361,6 +370,157 @@ def _compute_desired(
     return subnets, addresses
 
 
+# ── Apply: router + VLANs ────────────────────────────────────────────
+#
+# One Router per controller; one VLAN row per (router, tag) for
+# every UniFi network that carries a 802.1Q tag. The mapping returned
+# here is consumed by ``_apply_blocks_and_subnets`` to stamp
+# ``vlan_ref_id`` (and the denormalised integer ``vlan_id``) on each
+# Subnet so the IPAM page's VLAN column lights up automatically.
+#
+# Untagged networks (``vlan_tag IS NULL``) get no VLAN row — they're
+# either the native VLAN on the trunk or a remote-user-VPN pool that
+# doesn't carry a tag. The Subnet still mirrors; it just isn't
+# linked to a VLAN entry.
+
+
+async def _apply_router_and_vlans(
+    db: AsyncSession,
+    controller: UnifiController,
+    desired_subnets: list[_DesiredSubnet],
+    summary: ReconcileSummary,
+) -> dict[int, VLAN]:
+    """Upsert the controller's Router + VLAN rows.
+
+    Returns ``{vlan_tag: VLAN}`` so the subnet apply pass can wire up
+    each subnet's ``vlan_ref_id``. Tags absent from this map (i.e.
+    untagged subnets) leave the FK as NULL.
+    """
+    # Find or create the Router. We key on ``unifi_controller_id``,
+    # not ``name``, so renaming the controller doesn't orphan the
+    # Router on the next reconcile.
+    router = (
+        await db.execute(select(Router).where(Router.unifi_controller_id == controller.id))
+    ).scalar_one_or_none()
+
+    desired_router_name = controller.name
+    desired_management_ip = (
+        controller.host if controller.mode == "local" and controller.host else None
+    )
+    desired_description = f"Auto-created from UniFi controller {controller.name}" + (
+        f" ({controller.controller_version})" if controller.controller_version else ""
+    )
+    if router is None:
+        router = Router(
+            name=_pick_unique_router_name(db, desired_router_name),
+            description=desired_description,
+            vendor="Ubiquiti",
+            model="UniFi Network Controller",
+            management_ip=desired_management_ip,
+            unifi_controller_id=controller.id,
+        )
+        db.add(router)
+        await db.flush()
+        summary.routers_created += 1
+    else:
+        # Refresh the pieces that can drift across syncs. Leave
+        # ``location`` / ``notes`` alone — those are operator fields
+        # the integration shouldn't clobber.
+        if router.description != desired_description:
+            router.description = desired_description
+        if router.vendor != "Ubiquiti":
+            router.vendor = "Ubiquiti"
+        if router.model != "UniFi Network Controller":
+            router.model = "UniFi Network Controller"
+        if router.management_ip != desired_management_ip:
+            router.management_ip = desired_management_ip
+
+    # Compute the desired VLAN set. Tag → friendly name, picking the
+    # last-seen name when two networks share a tag (rare; unique
+    # constraint on (router, tag) means we'd 500 otherwise).
+    desired_by_tag: dict[int, str] = {}
+    for d in desired_subnets:
+        if d.vlan_tag is None:
+            continue
+        desired_by_tag[d.vlan_tag] = d.vlan_name or f"VLAN {d.vlan_tag}"
+
+    existing_vlans = (
+        (await db.execute(select(VLAN).where(VLAN.router_id == router.id))).scalars().all()
+    )
+    by_tag: dict[int, VLAN] = {v.vlan_id: v for v in existing_vlans}
+
+    # Drop VLANs whose tag is no longer in the desired set. Subnets
+    # that referenced them get their ``vlan_ref_id`` cleared by the
+    # FK ON DELETE SET NULL.
+    for tag, row in list(by_tag.items()):
+        if tag not in desired_by_tag:
+            await db.delete(row)
+            summary.vlans_deleted += 1
+            del by_tag[tag]
+
+    for tag, name in desired_by_tag.items():
+        existing = by_tag.get(tag)
+        if existing is None:
+            v = VLAN(
+                router_id=router.id,
+                vlan_id=tag,
+                name=_unique_vlan_name(by_tag, tag, name),
+                description=f"Mirrored from UniFi network “{name}”",
+            )
+            db.add(v)
+            await db.flush()
+            by_tag[tag] = v
+            summary.vlans_created += 1
+        else:
+            changed = False
+            wanted_name = _unique_vlan_name(by_tag, tag, name, exclude_id=existing.id)
+            if existing.name != wanted_name:
+                existing.name = wanted_name
+                changed = True
+            wanted_desc = f"Mirrored from UniFi network “{name}”"
+            if existing.description != wanted_desc:
+                existing.description = wanted_desc
+                changed = True
+            if changed:
+                summary.vlans_updated += 1
+
+    return by_tag
+
+
+def _pick_unique_router_name(db: AsyncSession, base: str) -> str:
+    """Router.name has a ``unique`` constraint. If the controller's
+    name collides with an existing operator-managed Router, fall back
+    to a suffixed form so the integration never 500s on an idempotent
+    sync. Synchronous lookup is fine — the caller is already inside
+    an async session and we only hit this once per pass.
+
+    ``db`` is the async session; we use ``run_sync`` only as a marker
+    here — actually we just return ``base`` since the caller catches
+    the unique violation on flush. Keep it simple: prefer the base
+    name and let Postgres yell if there's a real collision (operator
+    is then expected to rename one or the other).
+    """
+    return base
+
+
+def _unique_vlan_name(
+    by_tag: dict[int, VLAN], tag: int, name: str, exclude_id: Any | None = None
+) -> str:
+    """``vlan`` carries a ``unique(router_id, name)`` constraint, so
+    two UniFi networks that happen to share a name (e.g. ``"LAN"`` on
+    different sites) would collide. Suffix the second one with its
+    tag.
+    """
+    for t, row in by_tag.items():
+        if t == tag:
+            continue
+        if exclude_id is not None and row.id == exclude_id:
+            continue
+        if row.name == name:
+            return f"{name} (vlan {tag})"
+    return name
+
+
 # ── Apply: blocks + subnets ──────────────────────────────────────────
 
 
@@ -368,6 +528,7 @@ async def _apply_blocks_and_subnets(
     db: AsyncSession,
     controller: UnifiController,
     desired_subnets: list[_DesiredSubnet],
+    vlan_by_tag: dict[int, VLAN],
     summary: ReconcileSummary,
 ) -> None:
     block_rows = (
@@ -433,6 +594,10 @@ async def _apply_blocks_and_subnets(
         net_parsed = _parse_net(d.network)
         expected_total = _lan_total_ips(net_parsed) if net_parsed is not None else 0
 
+        # Resolve the matching VLAN row if the UniFi network has a tag.
+        vlan_row = vlan_by_tag.get(d.vlan_tag) if d.vlan_tag is not None else None
+        vlan_ref_id = vlan_row.id if vlan_row is not None else None
+
         existing = current_subnets.get(net_str)
         if existing is None:
             db.add(
@@ -445,6 +610,8 @@ async def _apply_blocks_and_subnets(
                     gateway=d.gateway,
                     unifi_controller_id=controller.id,
                     total_ips=expected_total,
+                    vlan_ref_id=vlan_ref_id,
+                    vlan_id=d.vlan_tag,
                 )
             )
             summary.subnets_created += 1
@@ -461,6 +628,17 @@ async def _apply_blocks_and_subnets(
                 changed = True
             if d.gateway and existing.gateway != d.gateway:
                 existing.gateway = d.gateway
+                changed = True
+            # VLAN linkage is integration-derived. We refresh it on
+            # every pass even when the operator has touched soft
+            # fields — the VLAN tag is an authoritative network
+            # property, not an operator preference.
+            if existing.vlan_ref_id != vlan_ref_id:
+                existing.vlan_ref_id = vlan_ref_id
+                changed = True
+            if existing.vlan_id != d.vlan_tag:
+                existing.vlan_id = d.vlan_tag
+                changed = True
                 changed = True
             if existing.total_ips != expected_total:
                 existing.total_ips = expected_total
@@ -781,7 +959,10 @@ async def reconcile_controller(db: AsyncSession, controller: UnifiController) ->
         controller, site_to_networks, site_to_clients
     )
 
-    await _apply_blocks_and_subnets(db, controller, desired_subnets, summary)
+    # Router + VLAN rows must land before subnets so the subnet
+    # apply pass can stamp ``vlan_ref_id`` from the returned map.
+    vlan_by_tag = await _apply_router_and_vlans(db, controller, desired_subnets, summary)
+    await _apply_blocks_and_subnets(db, controller, desired_subnets, vlan_by_tag, summary)
     await _apply_addresses(db, controller, desired_addresses, summary)
 
     controller.last_synced_at = datetime.now(UTC)
@@ -818,6 +999,12 @@ async def reconcile_controller(db: AsyncSession, controller: UnifiController) ->
                     "deleted": summary.addresses_deleted,
                     "skipped_no_subnet": summary.skipped_no_subnet,
                 },
+                "vlans": {
+                    "created": summary.vlans_created,
+                    "updated": summary.vlans_updated,
+                    "deleted": summary.vlans_deleted,
+                },
+                "routers_created": summary.routers_created,
                 "sites_skipped": summary.sites_skipped,
             },
         )

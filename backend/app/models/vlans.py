@@ -32,6 +32,17 @@ class Router(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         index=True,
     )
 
+    # UniFi integration provenance — set by the UniFi reconciler when
+    # this router was auto-created from a UniFi controller. Cascades
+    # on controller delete; child VLANs follow via the existing
+    # cascade on the relationship below.
+    unifi_controller_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("unifi_controller.id", ondelete="CASCADE"),
+        nullable=True,
+        index=True,
+    )
+
     vlans: Mapped[list["VLAN"]] = relationship(
         "VLAN", back_populates="router", cascade="all, delete-orphan"
     )
