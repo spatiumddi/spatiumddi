@@ -677,6 +677,37 @@ async def _apply_addresses(
     for d in desired:
         desired_map.setdefault(d.address, d)
 
+    # Phase 0 — dedupe stale unifi-owned rows at the same address but
+    # in different subnets BEFORE the adoption pass. The race that
+    # creates these:
+    #   * SNMP discovery (cross-reference task) writes IPAddress rows
+    #     into whatever subnet currently encloses the IP. If routes
+    #     shift across two passes, the same IP can land in different
+    #     subnets across runs.
+    #   * Both rows are then adopted by the next UniFi reconcile.
+    #     Phase 3 tries to move both to the same target subnet and
+    #     hits the (subnet_id, address) unique violation.
+    # Keep the most-recently-modified row, soft-delete the rest. Done
+    # before adoption so the adopted set is already deduped.
+    pre_owned = (
+        (await db.execute(select(IPAddress).where(IPAddress.unifi_controller_id == controller.id)))
+        .scalars()
+        .all()
+    )
+    pre_groups: dict[str, list[IPAddress]] = {}
+    for row in pre_owned:
+        pre_groups.setdefault(str(row.address), []).append(row)
+    pre_dedup_dirty = False
+    for rows in pre_groups.values():
+        if len(rows) > 1:
+            rows.sort(key=lambda r: r.modified_at or datetime.min, reverse=True)
+            for stale in rows[1:]:
+                await db.delete(stale)
+                summary.addresses_deleted += 1
+                pre_dedup_dirty = True
+    if pre_dedup_dirty:
+        await db.flush()
+
     desired_addrs = list(desired_map.keys())
     if desired_addrs:
         existing = (
@@ -684,27 +715,57 @@ async def _apply_addresses(
             .scalars()
             .all()
         )
+        # Group by address so we can detect "multiple operator-owned
+        # rows at this address" before adopting any of them. Adopting
+        # both would re-create the duplicate we just cleaned up.
+        existing_by_addr: dict[str, list[IPAddress]] = {}
         for row in existing:
-            if row.unifi_controller_id == controller.id:
+            existing_by_addr.setdefault(str(row.address), []).append(row)
+
+        already_adopted: set[str] = {
+            str(r.address) for r in pre_owned if r.unifi_controller_id == controller.id
+        }
+        for addr, rows in existing_by_addr.items():
+            # If we already own a row at this address (after the
+            # phase 0 dedup), skip the entire adoption group — we'd
+            # only end up with two unifi-owned rows again.
+            if addr in already_adopted:
                 continue
-            if row.unifi_controller_id is not None:
-                summary.warnings.append(
-                    f"address {row.address} owned by another UniFi controller; not claiming"
-                )
+            # Otherwise pick the most-recently-modified candidate
+            # that's eligible for adoption (not owned by another
+            # integration / another unifi controller). Adopt only it.
+            eligible = [
+                r
+                for r in rows
+                if r.unifi_controller_id is None
+                and r.kubernetes_cluster_id is None
+                and r.docker_host_id is None
+                and r.proxmox_node_id is None
+                and r.tailscale_tenant_id is None
+            ]
+            if not eligible:
+                if any(
+                    r.unifi_controller_id and r.unifi_controller_id != controller.id for r in rows
+                ):
+                    summary.warnings.append(
+                        f"address {addr} owned by another UniFi controller; not claiming"
+                    )
+                elif any(
+                    r.kubernetes_cluster_id
+                    or r.docker_host_id
+                    or r.proxmox_node_id
+                    or r.tailscale_tenant_id
+                    for r in rows
+                ):
+                    summary.warnings.append(
+                        f"address {addr} owned by another integration; not claiming"
+                    )
                 continue
-            if (
-                row.kubernetes_cluster_id is not None
-                or row.docker_host_id is not None
-                or row.proxmox_node_id is not None
-                or row.tailscale_tenant_id is not None
-            ):
-                summary.warnings.append(
-                    f"address {row.address} owned by another integration; not claiming"
-                )
-                continue
-            row.unifi_controller_id = controller.id
-            if row.user_modified_at is None:
-                row.user_modified_at = datetime.now(UTC)
+            eligible.sort(key=lambda r: r.modified_at or datetime.min, reverse=True)
+            winner = eligible[0]
+            winner.unifi_controller_id = controller.id
+            if winner.user_modified_at is None:
+                winner.user_modified_at = datetime.now(UTC)
         await db.flush()
 
     res = await db.execute(select(IPAddress).where(IPAddress.unifi_controller_id == controller.id))
