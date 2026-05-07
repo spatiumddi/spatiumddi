@@ -22,7 +22,7 @@ from app.drivers.dhcp.windows import test_winrm_credentials
 from app.models.dhcp import DHCPConfigOp, DHCPLease, DHCPMACBlock, DHCPServer
 from app.services.dhcp.config_bundle import build_config_bundle
 from app.services.dhcp.pull_leases import pull_leases_from_server
-from app.services.oui import bulk_lookup_vendors, normalize_mac_key
+from app.services.oui import bulk_lookup_vendors, is_voip_phone_vendor, normalize_mac_key
 
 router = APIRouter(
     prefix="/servers",
@@ -187,6 +187,9 @@ class LeaseResponse(BaseModel):
     last_seen_at: datetime
     # IEEE OUI vendor for this MAC, when the feature is enabled.
     vendor: str | None = None
+    # ``True`` when the vendor matches the curated VoIP-phone list
+    # (issue #112 phase 3). Drives a Phone icon in the lease table.
+    is_voip_phone: bool = False
 
     model_config = {"from_attributes": True}
 
@@ -636,5 +639,7 @@ async def list_leases(
     )
     for lease in rows:
         key = normalize_mac_key(str(lease.mac_address)) if lease.mac_address else None
-        lease.vendor = vendors.get(key) if key else None  # type: ignore[attr-defined]
+        vendor = vendors.get(key) if key else None
+        lease.vendor = vendor  # type: ignore[attr-defined]
+        lease.is_voip_phone = is_voip_phone_vendor(vendor)  # type: ignore[attr-defined]
     return rows

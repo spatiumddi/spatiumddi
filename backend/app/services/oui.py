@@ -24,6 +24,59 @@ from app.models.settings import PlatformSettings
 _SINGLETON_ID = 1
 _MAC_DELIMS = re.compile(r"[:\-.\s]")
 
+# Curated VoIP-phone vendor name substrings (issue #112 phase 3). Matched
+# case-insensitively against the OUI vendor name returned by IEEE's
+# ``standards-oui.ieee.org`` registry. Operators can spot voice fleets in
+# the IPAM list without scanning 22 OUI strings — the UI flips a Phone
+# icon next to MACs whose vendor matches any of these.
+#
+# Names follow the IEEE registry's canonical strings (e.g. ``Polycom
+# Inc`` rather than ``Polycom``) but we substring-match so partial /
+# rebranded forms still hit. Aastra was acquired by Mitel (2014) but the
+# IEEE entry still reads ``AASTRA TELECOM SWEDEN AB``; both match here.
+_VOIP_VENDOR_SUBSTRINGS: frozenset[str] = frozenset(
+    {
+        "polycom",
+        "yealink",
+        "snom",
+        "grandstream",
+        "mitel",
+        "aastra",
+        "avaya",
+        "panasonic communications",  # Panasonic SIP phones
+        "obihai",
+        "fanvil",
+        "htek",
+        "audiocodes",
+        "sangoma",
+        "digium",
+        "spectralink",
+        # Cisco's OUI catalog mostly reads as ``Cisco Systems`` /
+        # ``Cisco-Linksys`` / ``Cisco SPA``; their phones share the
+        # generic registration so we can't reliably distinguish phone
+        # vs router from the OUI alone. We include the SPA-specific
+        # substrings + leave bare ``cisco`` out — operators on Cisco
+        # CallManager use option-150 fences in the phone profile (#112
+        # phase 1) which are more reliable than vendor-name matching.
+        "cisco-linksys",
+        "cisco spa",
+        "linksys",
+    }
+)
+
+
+def is_voip_phone_vendor(vendor_name: str | None) -> bool:
+    """``True`` when the OUI vendor name matches a curated VoIP-phone vendor.
+
+    Case-insensitive substring match — the IEEE registry capitalisation
+    isn't stable (``Polycom Inc`` vs ``Polycom, Inc.`` vs ``Polycom``)
+    and rebrands (Aastra → Mitel) leave both forms in the registry.
+    """
+    if not vendor_name:
+        return False
+    needle = vendor_name.lower()
+    return any(sub in needle for sub in _VOIP_VENDOR_SUBSTRINGS)
+
 
 def _prefix_from_mac(raw: str | None) -> str | None:
     """Return the first 6 hex chars (lowercase) from a MAC, or None.

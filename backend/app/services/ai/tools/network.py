@@ -24,7 +24,7 @@ from app.models.network import (
     NetworkInterface,
 )
 from app.services.ai.tools.base import register_tool
-from app.services.oui import lookup_vendor
+from app.services.oui import is_voip_phone_vendor, lookup_vendor
 
 # ── network devices ───────────────────────────────────────────────────
 
@@ -345,13 +345,16 @@ async def find_switchport(db: AsyncSession, user: User, args: FindSwitchportArgs
     # OUI vendor lookup for the resolved MAC — the operator usually
     # cares about the manufacturer of the host plugged into the
     # port (e.g. "this is a Raspberry Pi" or "this is a Cisco IP
-    # phone"). Single MAC, one lookup.
+    # phone"). Single MAC, one lookup. ``is_voip_phone`` flips the
+    # Phone-icon flag in the UI / Copilot answer (issue #112 phase 3).
     mac_vendor = await lookup_vendor(db, target_mac)
+    voip_phone = is_voip_phone_vendor(mac_vendor)
 
     if not fdb_rows:
         return {
             "mac_address": target_mac,
             "mac_vendor": mac_vendor,
+            "is_voip_phone": voip_phone,
             "ip": args.ip,
             "ip_source": ip_source,
             "matches": [],
@@ -373,6 +376,7 @@ async def find_switchport(db: AsyncSession, user: User, args: FindSwitchportArgs
     return {
         "mac_address": target_mac,
         "mac_vendor": mac_vendor,
+        "is_voip_phone": voip_phone,
         "ip": args.ip,
         "ip_source": ip_source,  # "ipam" | "arp" | None
         "match_count": len(fdb_rows),

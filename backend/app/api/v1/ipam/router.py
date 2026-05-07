@@ -42,7 +42,7 @@ from app.services.dhcp.windows_writethrough import (
     push_scope_delete,
     push_statics_bulk_delete,
 )
-from app.services.oui import bulk_lookup_vendors, normalize_mac_key
+from app.services.oui import bulk_lookup_vendors, is_voip_phone_vendor, normalize_mac_key
 from app.services.soft_delete import (
     apply_soft_delete,
     collect_soft_delete_batch,
@@ -2086,6 +2086,11 @@ class IPAddressResponse(BaseModel):
     # IEEE OUI vendor for this MAC, when the feature is enabled and we have
     # the prefix in our local DB. None on writes / unknown MACs / OUI off.
     vendor: str | None = None
+    # ``True`` when ``vendor`` matches the curated VoIP-phone vendor list
+    # (issue #112 phase 3). Drives the Phone icon next to the MAC in the
+    # IP detail modal + IPAM table + DHCP lease row. Always ``False`` when
+    # vendor is null.
+    is_voip_phone: bool = False
     # Device profile (Phase 1 — active layer). ``last_profiled_at`` is
     # the finished_at timestamp of the most recent successful nmap
     # profile scan; ``last_profile_scan_id`` deep-links to that scan
@@ -5485,7 +5490,9 @@ async def list_addresses(
         ip.alias_count = counts.get(ip.id, 0)  # type: ignore[attr-defined]
         ip.nat_mapping_count = nat_counts.get(str(ip.address), 0)  # type: ignore[attr-defined]
         key = normalize_mac_key(str(ip.mac_address)) if ip.mac_address else None
-        ip.vendor = vendors.get(key) if key else None  # type: ignore[attr-defined]
+        vendor = vendors.get(key) if key else None
+        ip.vendor = vendor  # type: ignore[attr-defined]
+        ip.is_voip_phone = is_voip_phone_vendor(vendor)  # type: ignore[attr-defined]
     return rows
 
 

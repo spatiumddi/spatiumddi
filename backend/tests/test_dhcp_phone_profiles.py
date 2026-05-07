@@ -26,7 +26,6 @@ from app.models.ipam import IPBlock, IPSpace, Subnet
 from app.services.dhcp.config_bundle import build_config_bundle
 from app.services.dhcp.voip_options import get_vendor, load_catalog
 
-
 # ── Catalog ───────────────────────────────────────────────────────────────
 
 

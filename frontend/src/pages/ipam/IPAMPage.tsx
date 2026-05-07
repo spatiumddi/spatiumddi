@@ -12,6 +12,7 @@ import {
   ChevronRight,
   Network,
   Layers,
+  Phone,
   Plus,
   Server,
   Trash2,
@@ -4632,6 +4633,12 @@ function SubnetDetail({
                               {addr.mac_address ? (
                                 <>
                                   {addr.mac_address}
+                                  {addr.is_voip_phone && (
+                                    <Phone
+                                      className="ml-1 inline h-3 w-3 align-text-bottom text-sky-600 dark:text-sky-400"
+                                      aria-label="VoIP phone"
+                                    />
+                                  )}
                                   {addr.vendor && (
                                     <span className="ml-1 font-sans text-[11px] text-muted-foreground">
                                       ({addr.vendor})

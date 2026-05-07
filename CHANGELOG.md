@@ -39,6 +39,29 @@ last three releases retroactively.
 
 ### Added
 
+- **VoIP OUI vendor enrichment — Phase 3 (issue #112).** Closes
+  the #112 phasing. The existing IEEE OUI lookup now flips an
+  `is_voip_phone` boolean on every IPAddress / DHCPLease /
+  switchport response when the vendor name matches the curated
+  VoIP-phone vendor list (Polycom / Yealink / Mitel / Aastra /
+  Avaya / Snom / Grandstream / Cisco SPA / Cisco-Linksys /
+  AudioCodes / Sangoma / Digium / Spectralink / Fanvil /
+  Obihai / Htek / Panasonic Communications). Substring,
+  case-insensitive — handles registry-string drift like
+  ``Polycom`` vs ``Polycom, Inc.`` and rebrands like
+  Aastra → Mitel. Generic Cisco strings are deliberately *not*
+  matched (Cisco's OUIs span both routers and phones; operators
+  on CallManager use option-150 fences in the phone profile
+  instead). Frontend renders a sky-blue Phone icon next to the
+  MAC in the IP detail modal, the IPAM IP table, and the DHCP
+  lease table — operators spot "16 Polycoms, 4 Yealinks, 2
+  random laptops" without scanning OUI strings. MCP `find_ip`
+  / `find_dhcp_leases` / `find_switchport` tools now carry
+  `is_voip_phone` on every match so the Operator Copilot answer
+  can prefix with a phone glyph too. 31 new tests lock the
+  matcher behaviour for every curated vendor + a representative
+  set of non-phone vendors that must not trip the flag.
+
 - **VoIP voice-segment metadata — Phase 2 (issue #112).** Flips
   voice-VLAN tagging from passive UI labelling into a real audit
   signal. Five additive surfaces:

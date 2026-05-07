@@ -25,7 +25,7 @@ from app.models.dhcp import (
     DHCPStaticAssignment,
 )
 from app.services.ai.tools.base import register_tool
-from app.services.oui import bulk_lookup_vendors, normalize_mac_key
+from app.services.oui import bulk_lookup_vendors, is_voip_phone_vendor, normalize_mac_key
 
 
 class ListDHCPServersArgs(BaseModel):
@@ -167,6 +167,7 @@ async def find_dhcp_leases(
     out: list[dict[str, Any]] = []
     for le in rows:
         mac_key = normalize_mac_key(str(le.mac_address))
+        vendor = vendors.get(mac_key) if mac_key else None
         out.append(
             {
                 "id": str(le.id),
@@ -174,7 +175,8 @@ async def find_dhcp_leases(
                 "scope_id": str(le.scope_id) if le.scope_id else None,
                 "ip_address": str(le.ip_address),
                 "mac_address": str(le.mac_address),
-                "mac_vendor": vendors.get(mac_key) if mac_key else None,
+                "mac_vendor": vendor,
+                "is_voip_phone": is_voip_phone_vendor(vendor),
                 "hostname": le.hostname,
                 "state": le.state,
                 "starts_at": le.starts_at.isoformat() if le.starts_at else None,

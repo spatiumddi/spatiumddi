@@ -5,6 +5,7 @@ import {
   ExternalLink,
   Loader2,
   Pencil,
+  Phone,
   Radar,
   RefreshCw,
   Trash2,
@@ -277,6 +278,14 @@ export function IPDetailModal({
               {addr.mac_address ? (
                 <span className="inline-flex items-center gap-1.5">
                   {addr.mac_address}
+                  {addr.is_voip_phone && (
+                    <span
+                      className="inline-flex items-center"
+                      title={`VoIP phone${addr.vendor ? ` — ${addr.vendor}` : ""}`}
+                    >
+                      <Phone className="h-3 w-3 text-sky-600 dark:text-sky-400" />
+                    </span>
+                  )}
                   {addr.vendor && (
                     <span className="font-sans text-[11px] text-muted-foreground">
                       {addr.vendor}

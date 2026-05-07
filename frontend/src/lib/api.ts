@@ -620,6 +620,10 @@ export interface IPAddress {
   nat_mapping_count?: number;
   // IEEE OUI vendor for this MAC (populated when OUI lookup is enabled).
   vendor?: string | null;
+  // ``true`` when ``vendor`` matches the curated VoIP-phone vendor list
+  // (issue #112 phase 3). Drives the Phone icon next to the MAC in the
+  // IP detail modal + IPAM table. Always false when vendor is null.
+  is_voip_phone?: boolean;
   // Device profile (active-layer Phase 1). ``last_profiled_at`` is the
   // finished_at of the most recent successful nmap profile scan;
   // ``last_profile_scan_id`` deep-links to the NmapScan row. Surfaced
@@ -4924,6 +4928,9 @@ export interface DHCPLease {
   expires_at: string | null;
   last_seen_at: string;
   vendor?: string | null;
+  // Issue #112 phase 3 — flag from the curated VoIP-phone vendor list.
+  // Drives a Phone icon next to the lease's MAC in the lease table.
+  is_voip_phone?: boolean;
 }
 
 export interface PublicAuthProvider {

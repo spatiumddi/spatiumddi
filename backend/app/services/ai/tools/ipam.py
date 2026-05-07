@@ -33,7 +33,7 @@ from app.models.network_service import NetworkService
 from app.models.overlay import OverlayNetwork
 from app.models.vrf import VRF
 from app.services.ai.tools.base import register_tool
-from app.services.oui import bulk_lookup_vendors, normalize_mac_key
+from app.services.oui import bulk_lookup_vendors, is_voip_phone_vendor, normalize_mac_key
 from app.services.tags import apply_tag_filter
 
 # ── Reference resolution ──────────────────────────────────────────────
@@ -373,6 +373,7 @@ async def find_ip(db: AsyncSession, user: User, args: FindIPArgs) -> dict[str, A
     for ip in rows:
         sub = await db.get(Subnet, ip.subnet_id)
         mac_key = normalize_mac_key(str(ip.mac_address)) if ip.mac_address else None
+        vendor = vendors.get(mac_key) if mac_key else None
         out.append(
             {
                 "id": str(ip.id),
@@ -385,7 +386,8 @@ async def find_ip(db: AsyncSession, user: User, args: FindIPArgs) -> dict[str, A
                 "hostname": ip.hostname,
                 "fqdn": ip.fqdn,
                 "mac_address": str(ip.mac_address) if ip.mac_address else None,
-                "mac_vendor": vendors.get(mac_key) if mac_key else None,
+                "mac_vendor": vendor,
+                "is_voip_phone": is_voip_phone_vendor(vendor),
                 "description": ip.description,
                 "last_seen_at": ip.last_seen_at.isoformat() if ip.last_seen_at else None,
                 "last_seen_method": ip.last_seen_method,
