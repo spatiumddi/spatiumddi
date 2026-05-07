@@ -20,24 +20,277 @@ the formatter handles the rest.
 
 ---
 
-## Unreleased
+## 2026.05.07-1 — 2026-05-07
 
-The **operator-toggleable platform** wave so far. Three batches
-landed: feature-module toggles + Settings → Features page that
-let admins hide whole sidebar / REST / MCP surfaces (Network
-ownership entities, AI Copilot, Conformity, Tools, plus the four
-integrations); a Tool Catalog rewrite that mirrors the Features
-page layout (3-col adaptive grid + pill toggle + auto-save on
-flip); and the Operator Copilot's Tier 2 tool wave from issue
-\#101 — six new read tools surfacing customers / sites /
-providers / users / groups / roles, plus a `get_customer_summary`
-roll-up that counts every owned resource type for one customer.
-Plus release-note formatting got a complete rework: the GitHub
-release body now reads as flowing prose with emoji section
-headings instead of a wall of forced `<br>`s, applied to the
-last three releases retroactively.
+The **backup + factory-reset** release. Issue \#117 (full system
+backup with remote destinations) closed end-to-end through Phase
+3, and issue \#116 (per-section factory reset back to defaults)
+shipped in a single commit alongside it. Backup now ships eight
+destination kinds — local volume, AWS S3 (and every S3-compatible
+endpoint), SCP/SFTP, Azure Blob, SMB/CIFS, FTP/FTPS, Google
+Cloud Storage, WebDAV — plus selective per-section restore,
+cross-install secret rewrap so cross-install operators no longer
+hand-copy `SECRET_KEY` to the destination's `.env`, automatic
+`alembic upgrade head` on restore (with drift auto-recovery
+when the dump's alembic_version row is stale relative to its
+schema), exclude-secrets diagnostic mode for shareable
+debug snapshots, scheduled cron + retention, restore-from-
+destination, archive proxy-download, "download latest" per-
+target, friendly cron presets, and `system.backup_*` /
+`system.restore_performed` / `system.factory_reset` typed
+events through the existing webhook event-outbox. Three
+read-only MCP tools (`list_backup_targets` /
+`list_backup_archives_at_target` / `find_backup_audit_history`)
+surface the backup state to the Operator Copilot. Factory
+reset runs per-section across 12 sections plus an
+"Everything" target, every guardrail enforced server-side
+(superadmin gate + fresh password re-check + per-section
+confirm phrase + in-flight-backup mutex + 6h cooldown +
+audit anchor that survives `audit_log` wipes). The page
+lives as a third tab on the Backup admin surface — backup
+snapshots state, factory reset wipes it, they're the two
+opposite ends of the same lifecycle.
+
+The release also closes out the **operator-toggleable platform**
+wave that started before backup landed: feature-module toggles
++ Settings → Features page that let admins hide whole sidebar /
+REST / MCP surfaces (Network ownership entities, AI Copilot,
+Conformity, Tools, plus the four integrations); the Tool
+Catalog rewrite that mirrors the Features page layout (3-col
+adaptive grid + pill toggle + auto-save on flip); and the
+Operator Copilot's Tier 2-5 tool wave from issue \#101 — read
+tools surfacing customers / sites / providers / users / groups
+/ roles plus DNS/DHCP sub-resource depth, integration mirrors,
+observability, and Apply-gated write proposals. The Copilot now
+ships **91 tools** total. Plus release-note formatting got a
+complete rework: the GitHub release body now reads as flowing
+prose with emoji section headings instead of a wall of forced
+`<br>`s.
+
+A new `docs/deployment/TOPOLOGIES.md` documents six reference
+production topologies — single VM through HA cloud + on-prem
+hybrid — with ASCII diagrams + sizing notes.
 
 ### Added
+
+- **Factory reset — every guardrail server-side (issue #116).**
+  Per-section "wipe back to defaults" surface for superadmins.
+  12 sections mapped from the issue body — IPAM, DNS, DHCP,
+  Network modeling, Integrations, AI / Copilot, Compliance,
+  Tools, Observability logs, Auth + RBAC, Settings + branding,
+  plus an "Everything" target. Three dispatch kinds: `truncate`
+  (9 sections, straight `TRUNCATE … RESTART IDENTITY CASCADE`
+  over the section's tables), `auth_rbac` (partial wipe that
+  preserves the calling user, every other superadmin, and
+  built-in roles), `settings_reset` (DELETE the singleton
+  platform_settings row; recreated with model defaults on next
+  request). Tables intentionally untouchable: `alembic_version`,
+  `oui_vendor`, `backup_target`, `feature_module`,
+  `event_outbox`, `internal_error`, `audit_forward_target` —
+  platform-housekeeping or safety-net state. Hard guardrails
+  enforced server-side: superadmin gate, password re-verification
+  (fresh bcrypt compare, NOT bearer-token check), exact-match
+  per-section confirm phrase (`DESTROY-IPAM`, `DESTROY-DNS`, …,
+  `FACTORY-RESET-ALL`), in-flight backup mutex, Redis lock
+  against concurrent resets, 6-hour cooldown, audit anchor
+  written via fresh `AsyncSessionLocal` so the event-publisher
+  hook fires `system.factory_reset` automatically. Pre-flight
+  backup as warn-only with `acknowledge_no_backup` override —
+  no enabled backup target → 412 unless explicitly acknowledged.
+  Endpoints at `/system/factory-reset/{sections,preview,execute}`.
+  UI lives as a third tab on the Backup admin page (after Manual
+  + Destinations) with red-bordered "Reset everything" card +
+  draggable modal that gates the password field on a green-
+  border phrase match. Closes \#116.
+
+- **Backup & restore — Phase 3 quick wins (issue #117).** Five
+  follow-ups landed in one commit: (1) **cron presets dropdown**
+  on the target form — 7 UTC presets (hourly / every 6h / 12h /
+  daily 02:00 / 04:00 / weekly Sun 03:00 / monthly 1st 03:00) +
+  custom-text fallback; (2) **`GET /backup/targets/{id}/archives/
+  latest/download`** — proxies the newest archive at a target
+  through the existing per-driver `download(filename)` method
+  for one-shot automation; (3) **typed-event fan-out** via the
+  existing event-outbox — `system.backup_completed` /
+  `system.backup_failed` / `system.restore_performed` plus
+  `backup.target.{created,updated,deleted}` lifecycle events
+  ride the existing HMAC-signed POST + retry infrastructure,
+  exposed via `GET /webhooks/event-types`; (4) **exclude-secrets
+  diagnostic mode** — checkbox on the build-and-download form
+  that switches to plain-format dump and post-processes the SQL
+  text in memory to scrub every Fernet-encrypted column +
+  `__enc__:`-prefixed JSONB field. The live database is never
+  touched (initial design used `pg_export_snapshot` with a side
+  transaction NULLing columns — but Postgres exports the
+  *committed* state, so plain-format dump + text post-processing
+  is the correct simpler approach); (5) **WebDAV destination
+  driver** — Tier 3, closes the Nextcloud / ownCloud / mod_dav /
+  IIS WebDAV market. Driven directly via `httpx` (existing
+  platform dep) using PUT / GET / PROPFIND / DELETE — no SDK
+  added. Form labels Nextcloud's "app password" requirement
+  explicitly so 2FA-enabled users don't fail mysteriously.
+
+- **Backup & restore — alembic upgrade-on-restore + drift
+  auto-recovery (issue #117 Phase 2 + Phase 3 follow-up).**
+  After the data replay, `alembic upgrade head` runs against
+  the freshly-restored database when the archive's
+  `schema_version` is older than the local install's expected
+  head. State machine surfaces `up_to_date` / `upgraded` /
+  `incompatible_newer` / `unknown` / `failed` /
+  `auto_recovered` in the response + audit row. The
+  `auto_recovered` state catches the real-world drift case: if
+  the backup was taken when alembic_version had drifted relative
+  to its schema (operator manually stamped head to fix earlier
+  inconsistency, then later restored from a backup taken before
+  the fix), the restore brings back BOTH the up-to-date schema
+  AND the stale alembic_version, and `alembic upgrade head` then
+  fails with "table already exists" on the first migration. The
+  migration step now detects that signature
+  (`DuplicateTableError` / `DuplicateColumnError` / "already
+  exists") and recovers by running `alembic stamp head` to align
+  — the schema is already correct, only the version row needed
+  catching up. Operator-facing note explains what happened in
+  plain English. Replaces the "currently version-skew is rejected
+  outright" Phase 1 behaviour from the issue body.
+
+- **Backup & restore — cross-install secret rewrap (issue #117
+  Phase 2).** After the data replay, `rewrap_secrets` walks every
+  Fernet-encrypted column (22 columns across 16 tables) plus the
+  `__enc__:`-prefixed fields inside `backup_target.config`
+  JSONB, decrypts each with the source key recovered from
+  `secrets.enc`, and re-encrypts with the destination's local
+  key. Same-install restores short-circuit with
+  `same_install=true` (counters all zero). Idempotent re-runs
+  (a row already encrypted with the dest key) count as
+  `skipped_idempotent` rather than failed. Failures are counted +
+  surfaced in the response + audit row, never raised — one bad
+  row mustn't kill an otherwise-clean restore. Fernet derivation
+  matches `app.core.crypto._fernet` exactly: explicit
+  `credential_encryption_key` wins when set; SHA-256 over
+  `secret_key` is the fallback. The connection lifecycle is
+  important: the restore phase intentionally disposes the
+  SQLAlchemy engine (so pg_restore / psql can run without pool
+  contention), so rewrap opens its own short-lived asyncpg
+  connection rather than reviving the pool prematurely. The
+  operator-facing note adapts to the rewrap state ("no key
+  rewrap was needed" / "re-encrypted N secret values" /
+  "re-encrypted N, but K rows could not be decrypted with either
+  key"). Closes the manual-`SECRET_KEY`-copy step from Phase 1's
+  cross-install restore caveat.
+
+- **Backup & restore — Tier 2 destinations (issue #117 Phase 2).**
+  Three new destination drivers slot into the same registry +
+  `BackupDestination` ABC the Tier 1 set used: (1) **SMB / CIFS**
+  — Windows / Samba shares via `smbprotocol`'s smbclient shim;
+  NTLM auth with optional NTLM domain + SMB3 encryption toggle;
+  atomic `.tmp → rename` writes; `delete_session` on
+  test-connection so probes don't pollute the cached session
+  pool. (2) **FTP / FTPS** via stdlib `ftplib` (no new dep) —
+  three modes: plain `ftp`, `ftps_explicit` (AUTH TLS),
+  `ftps_implicit` (port 990 wrapped before the first FTP
+  command). Passive + active; `verify_tls` toggle for self-
+  signed labs. MLSD listing with a LIST + SIZE + MDTM fallback
+  for legacy NAS. (3) **Google Cloud Storage** via
+  `google-cloud-storage` — auth via service-account JSON key the
+  operator pastes in (Fernet-wrapped at rest); ADC intentionally
+  not exposed because the api/worker containers don't carry GCP
+  metadata identity. Drive-by: replaced the hardcoded
+  `{local_volume, s3, scp, azure_blob}` allowlist on
+  `BackupTargetCreate.kind` with a registry-derived
+  `_valid_kinds()` so future drivers don't need a third-place
+  edit.
+
+- **Backup & restore — selective restore (issue #117 Phase 2b).**
+  Operators tick which sections to restore (IPAM only, DNS only,
+  etc.); the rest of the install stays untouched. Available on
+  both the upload-restore + restore-from-destination flows.
+  Section catalog (17 sections, 110 tables) doubles as the
+  factory-reset section catalog. Per-section flow: `TRUNCATE
+  TABLE … RESTART IDENTITY CASCADE` for the selected sections'
+  tables, then `pg_restore --data-only --disable-triggers
+  --table=<each>` to re-load just those tables. `platform_internal`
+  (alembic_version + oui_vendor) always rides along — the
+  schema-head pin + OUI cache are install-state, not user-data.
+  CASCADE is documented in the UI warning: cross-section FK
+  rows in non-selected sections that reference wiped data also
+  get cleared. Volatile sections (DHCP leases, DNS query log,
+  DHCP activity log, nmap scan history, metric samples, Celery
+  scratch) stay unticked by default but operators can opt in for
+  a diagnostic restore. The shared `BackupSectionsPicker`
+  component drives both the upload-restore modal and the
+  restore-from-destination modal. UI auto-ticks every
+  non-volatile selectable section the first time the operator
+  flips into selective mode.
+
+- **Backup & restore — Phase 2a foundation (issue #117).**
+  Section catalog primitive + custom-format dumps. Switches
+  `_run_pg_dump` from `--format=plain` to `--format=custom`
+  (the format `pg_restore --table=` knows how to walk
+  selectively); manifest carries `format_version: 2` +
+  `dump_format: "custom"` so Phase 1 plain-format archives stay
+  restorable through the auto-detection path. Member name
+  changes from `database.sql` → `database.dump`; restore-side
+  reader does `manifest.dump_format` first, falls back on
+  member-name sniffing for older archives. Section catalog at
+  `app/services/backup/sections.py` maps all 110 schema tables
+  to 17 logical sections (auth, audit, settings, ownership,
+  network_modeling, ipam, dns, dhcp, integrations, ai,
+  backup_self, diagnostics, logs, metrics, leases, nmap_history,
+  platform_internal). `volatile=True` flag on diagnostic
+  sections (default-excluded from selective backups);
+  `selectable=False` on `platform_internal` (always rides
+  along). Startup verification:
+  `assert_catalog_covers_models` — 110 tables in catalog, 0
+  missing.
+
+- **Backup & restore — proxy archive download from any
+  destination (issue #117).** `GET /backup/targets/{id}/archives/
+  {filename}/download` streams `driver.download(filename)`
+  straight back to the operator's browser as a zip download.
+  Works the same way for every destination kind (S3 / SCP /
+  Azure / SMB / FTP / GCS / WebDAV / local volume) — the
+  driver's existing `download(filename)` method does the heavy
+  lifting; the endpoint wraps the bytes in a `StreamingResponse`
+  with `Content-Disposition: attachment`. Operators can pull a
+  remote archive to a laptop without giving them the
+  destination's credentials.
+
+- **Operator Copilot — backup + factory-reset read tools (issues
+  #117 + #116).** Three read-only MCP tools, all superadmin-only:
+  `list_backup_targets` (every configured target with last-run
+  state, schedule, retention; `config` blob omitted from output
+  so destination credentials stay out of the LLM context),
+  `list_backup_archives_at_target` (calls the driver's
+  `list_archives` so the result matches the Backup admin
+  Archives drawer; resolves target by id-or-name; destination
+  errors returned in-band), `find_backup_audit_history`
+  (windowed timeline of `backup_created` /
+  `backup_target_run_success` / `-run_failed` / `backup_restored`
+  / `factory_reset_performed` audit rows, default 7d). No
+  `propose_*` write tools — restore + factory-reset are
+  password-gated + confirm-phrase-gated by design; inserting an
+  LLM intermediary into "should I restore?" adds friction
+  without value, and `propose_create_backup_target` involves
+  pasting destination credentials, which doesn't fit a
+  chat-driven flow. Operators reach for the Backup admin page
+  when they're about to mutate state.
+
+- **Deployment topologies guide.** New `docs/deployment/
+  TOPOLOGIES.md` walks six production topologies with ASCII
+  diagrams + sizing notes: (1) single VM (homelab); (2) control
+  plane + separated DNS/DHCP appliances via the existing
+  `docker-compose.agent-{dns,dhcp}.yml` files; (3) DNS + DHCP
+  HA pairs (server groups + Kea HA); (4) HA control plane
+  (Patroni + Redis Sentinel + multi-replica api/worker); (5)
+  hybrid cloud (control plane in cloud, on-prem agents reaching
+  back over HTTPS via VPN/WireGuard/Tailscale, with cloud-
+  component matrix for AWS/Azure/GCP); (6) Kubernetes via the
+  umbrella Helm chart. Plus closing sections on backup +
+  factory-reset semantics across topologies and an honest
+  "what's NOT supported yet" list (active-active across
+  regions, multi-tenant control plane, read replicas as query
+  routes). Cross-linked from `README.md`,
+  `docs/deployment/DOCKER.md`, and `CLAUDE.md`'s doc map.
 
 - **Backup & restore — Phase 1 finale (issue #117).** Two
   end-of-Phase-1 polish items: tabbed Backup admin page +
@@ -531,6 +784,23 @@ last three releases retroactively.
 
 ### Changed
 
+- **Factory reset surface moved from a sidebar entry to a Backup
+  page tab.** Backup snapshots state, factory reset wipes it —
+  they're the two opposite ends of the same lifecycle, so both
+  live on the Backup admin page now. Third tab after Manual +
+  Destinations. Removed the standalone `/admin/factory-reset`
+  route + sidebar entry; the section component renders only the
+  inner content (intro panel, section card grid, modal) and
+  the BackupPage owns the page chrome.
+- **Backup MCP coverage clarified.** Per CLAUDE.md non-negotiable
+  \#13, every new feature with REST endpoints gets matching MCP
+  tools — but for backup we deliberately ship READ-only tools
+  (`list_backup_targets`, `list_backup_archives_at_target`,
+  `find_backup_audit_history`) and SKIP write proposals. Restore
+  + factory-reset are password-gated + confirm-phrase-gated by
+  design; an LLM intermediary in "should I restore?" adds
+  friction without value. Documented with a clear rationale in
+  the backup tools module.
 - **Sidebar integration visibility moved to feature_module.** The
   sidebar now reads `useFeatureModules().enabled("integrations.*")`
   instead of `platformSettings.integration_*_enabled`. Behaviour
@@ -540,6 +810,10 @@ last three releases retroactively.
 
 ### Migrations
 
+- `d2a8e417b9f3_backup_target.py` — new `backup_target` table for
+  scheduled backups (Phase 1b of issue #117). Single-row-style
+  configurable destinations with Fernet-wrapped passphrase, cron
+  schedule, retention policy, last-run state.
 - `c4f7a1d3e589_feature_module_table.py` — new `feature_module`
   table seeded with 13 togglable ids (network.\* / ai.copilot /
   compliance.conformity / tools.nmap).
@@ -555,6 +829,23 @@ last three releases retroactively.
 
 ### Fixed
 
+- **BGP Footprint sticky header bleed-through.** The Announced
+  Prefixes table on the ASN detail page used `bg-muted/30` on
+  the sticky `<thead>`, and the 30% alpha let scrolled rows
+  show through the header — a "text overlay" appearance.
+  Switched to a solid `bg-card` (matches the surrounding card
+  chrome) and added `z-10` so the header floats above the
+  scrolled rows reliably.
+- **Backup restore — alembic upgrade fails when alembic_version
+  drifts inside the dump.** Real-world failure mode: a backup
+  taken at a moment when the live install's alembic_version was
+  drifted relative to its schema (operator stamped head later,
+  then restored an earlier backup) would land both the up-to-date
+  schema AND the stale alembic_version, then `alembic upgrade
+  head` would fail on the first migration with "table already
+  exists". The migration step now detects that error pattern
+  and recovers by running `alembic stamp head` instead — see
+  the Phase 3 entry above for the new `auto_recovered` state.
 - **CodeQL alert \#25 — explicit TLS minimum version on the
   copilot's `tls_cert_check` tool.** `_fetch_cert_sync` in
   `app/services/ai/tools/ops.py` now sets
@@ -563,6 +854,17 @@ last three releases retroactively.
   the contract is obvious to readers (modern OpenSSL already
   disables them by default — explicit beats implicit, and CodeQL
   no longer flags the call site).
+- **CI was red since `5d577fd` (~11h before backup work began)
+  and stayed red through Backup Phase 2/3.** Six mypy errors
+  surfaced during the release-prep `make ci` audit: 5 narrowing
+  fixes in the SCP/SMB/FTP destination drivers + the rewrap
+  module + ftplib socket type (`port not in (None, "")` →
+  `port is not None and port != ""` for mypy narrowing; `assert
+  client.sock is not None` before `wrap_socket`; `assert
+  new_value is not None` inside the rewrap success branch); 1
+  untyped variable annotation in `bgp/peeringdb.py:57`. Plus 2
+  prettier-formatting warnings on `BackupPage.tsx` +
+  `BackupTargetsSection.tsx` after the Phase 3 commits.
 
 ---
 
