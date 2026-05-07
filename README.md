@@ -627,6 +627,7 @@ docker compose up -d
 Bump the pinned version when you're ready to upgrade and re-run the same three commands.
 
 **Notes:**
+- **Take a backup before upgrading.** Click `Administration → Backup → Build + download` and save the archive somewhere off the host. If the upgrade goes sideways the archive is your one-click rollback. Phase 1a is local download + local upload restore; remote destinations (S3 / SCP / Azure / SMB) are tracked in follow-up issues. See the in-app page for the security-model details.
 - `docker compose run --rm migrate` runs alembic against your current schema — safe to run every upgrade. It exits as a no-op if there are no new migrations.
 - Downgrades are **not** supported. Database migrations are forward-only; if a release introduces a schema change you can't roll back to a tag that predates it without restoring a database backup. Always snapshot Postgres before a major-version upgrade you're not sure about.
 - Watch the **CHANGELOG.md** entry for your target version for any release-specific upgrade notes (e.g. "operators on Kea HA must read this before upgrading").

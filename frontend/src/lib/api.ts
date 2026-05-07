@@ -2095,6 +2095,105 @@ export const auditApi = {
       .then((r) => r.data),
 };
 
+// ── Backup + restore (issue #117 Phase 1a) ────────────────────────────────────
+
+export interface BackupManifest {
+  format?: string;
+  format_version?: number;
+  app_version?: string;
+  schema_version?: string | null;
+  hostname?: string;
+  created_at?: string;
+  included_sections?: string[];
+  secret_passphrase_hint?: string;
+}
+
+export interface BackupRestoreResponse {
+  success: boolean;
+  pre_restore_safety_path: string | null;
+  duration_ms: number;
+  manifest: BackupManifest;
+  secrets_payload_keys: string[];
+  note: string;
+}
+
+export interface BackupManifestPreviewResponse {
+  manifest: BackupManifest;
+  archive_bytes: number;
+  format_recognised: boolean;
+}
+
+export const backupApi = {
+  /**
+   * Build a backup archive on the backend and download it as a zip.
+   * Synchronous from the operator's perspective — the server holds
+   * the response open until ``pg_dump`` + zip assembly finish, then
+   * streams the file with ``Content-Disposition: attachment``.
+   * Mirrors the conformity PDF export shape.
+   */
+  createAndDownload: async (
+    passphrase: string,
+    passphraseHint: string,
+  ): Promise<void> => {
+    const fd = new FormData();
+    fd.append("passphrase", passphrase);
+    fd.append("passphrase_hint", passphraseHint);
+    const res = await api.post<Blob>("/backup/create-and-download", fd, {
+      responseType: "blob",
+    });
+    const disp = (res.headers["content-disposition"] as string) || "";
+    const match = disp.match(/filename="?([^";]+)"?/i);
+    const ts = new Date()
+      .toISOString()
+      .slice(0, 19)
+      .replace(/[-:]/g, "")
+      .replace("T", "-");
+    const fallback = `spatiumddi-backup-${ts}.zip`;
+    const filename = match ? match[1] : fallback;
+    const blob = new Blob([res.data as BlobPart], { type: "application/zip" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  },
+
+  /** Inspect an archive's manifest before committing to a restore.
+   *  The operator uploads the file, the server unpacks just
+   *  ``manifest.json``, and the UI shows them which install + when
+   *  this archive was taken. */
+  previewManifest: async (
+    file: File,
+  ): Promise<BackupManifestPreviewResponse> => {
+    const fd = new FormData();
+    fd.append("archive", file);
+    const res = await api.post<BackupManifestPreviewResponse>(
+      "/backup/manifest-preview",
+      fd,
+    );
+    return res.data;
+  },
+
+  /** Apply a backup archive to the running install. Hard overwrite —
+   *  the operator must type ``RESTORE-FROM-BACKUP`` in
+   *  ``confirmationPhrase`` server-side or the request 400s. */
+  restore: async (
+    file: File,
+    passphrase: string,
+    confirmationPhrase: string,
+  ): Promise<BackupRestoreResponse> => {
+    const fd = new FormData();
+    fd.append("archive", file);
+    fd.append("passphrase", passphrase);
+    fd.append("confirmation_phrase", confirmationPhrase);
+    const res = await api.post<BackupRestoreResponse>("/backup/restore", fd);
+    return res.data;
+  },
+};
+
 // ── BGP enrichment — RIPEstat + PeeringDB (issue #122) ───────────────────────
 
 export interface BgpAnnouncedPrefix {

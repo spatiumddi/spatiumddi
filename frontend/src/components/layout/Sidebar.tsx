@@ -49,6 +49,7 @@ import {
   Monitor,
   ToggleLeft,
   AlertTriangle,
+  Database,
   X,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -211,6 +212,10 @@ const adminNotificationsNav = [
 
 const adminInsightsNav = [
   { label: "Audit Log", icon: ClipboardList, to: "/admin/audit" },
+  // Backup + restore (issue #117 Phase 1a). Sits in the Insights
+  // group alongside Trash + Diagnostics — all "platform-state
+  // lifecycle" surfaces.
+  { label: "Backup", icon: Database, to: "/admin/backup" },
   { label: "Compliance", icon: ShieldCheck, to: "/admin/compliance" },
   {
     label: "Conformity",

@@ -49,13 +49,28 @@ WORKDIR /app
 # "TCP/IP fingerprinting requires root privileges" when invoked by
 # the non-root app user. The cap is in Docker's default bounding set
 # so this works without needing cap_add at the compose / k8s layer.
+# Add the official PostgreSQL apt repo so we can pin
+# ``postgresql-client-16`` (Debian trixie's default repos only carry
+# client-17). We need the client major to match the postgres SERVER
+# version we ship in compose/k8s — pg_dump 17 emits
+# ``SET transaction_timeout = 0;`` and ``\restrict`` directives that
+# a postgres-16 server rejects on replay. When we eventually bump
+# the postgres image to 17, bump this pin in lockstep.
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates wget gnupg \
+    && install -d /usr/share/postgresql-common/pgdg \
+    && wget -qO /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc \
+        https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+    && echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(. /etc/os-release && echo $VERSION_CODENAME)-pgdg main" \
+        > /etc/apt/sources.list.d/pgdg.list \
+    && apt-get update && apt-get install -y --no-install-recommends \
     libpq5 \
     libxml2 \
     libxmlsec1-openssl \
     nmap \
     iputils-ping \
     libcap2-bin \
+    postgresql-client-16 \
     && setcap cap_net_raw,cap_net_bind_service+eip /usr/bin/nmap \
     && rm -rf /var/lib/apt/lists/*
 

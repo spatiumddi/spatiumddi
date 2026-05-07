@@ -39,6 +39,37 @@ last three releases retroactively.
 
 ### Added
 
+- **Backup & restore — Phase 1a (issue #117).** The "download a
+  snapshot of my install" surface operators have been asking for.
+  New page at `Administration → Backup`. Two cards:
+  *Create + download* runs `pg_dump --format=plain --no-owner
+  --no-privileges --clean --if-exists` against the live database
+  and bundles the SQL dump alongside `manifest.json` (app version,
+  schema head, hostname, created_at) and `secrets.enc` (the source
+  install's SECRET_KEY, passphrase-wrapped via PBKDF2-HMAC-SHA256
+  600 k iterations + AES-256-GCM with a fresh per-backup salt + nonce)
+  into a single zip archive that streams back via
+  `Content-Disposition: attachment` (same shape as the conformity
+  PDF export). *Restore from file* takes an uploaded zip + the
+  passphrase + a typed `RESTORE-FROM-BACKUP` confirmation, takes
+  a pre-restore safety dump under
+  `/var/lib/spatiumddi/backups/pre-restore-{ts}.zip`, replays the
+  archive's SQL via `psql --single-transaction` so failures roll
+  back atomically, and writes a fresh audit row in the *restored*
+  database so the trail of evidence survives the wipe. Manifest
+  version + format checks reject archives newer than the running
+  build with a clear "upgrade SpatiumDDI before restoring this
+  archive." Wrong-passphrase yields `BackupCryptoError` (raised
+  from cryptography's `InvalidTag`) before any destructive step
+  runs, so you can never lose data to a typo. Both endpoints are
+  superadmin-gated; the entire flow is audited. The README upgrade
+  section now leads with "Take a backup before upgrading." Phase
+  1a deliberately does **not** ship remote destinations
+  (S3 / SCP / Azure / SMB / FTP / GCS) or scheduled backups —
+  those are tracked in follow-up issues so the local-only path
+  could ship cleanly. The api image gains `postgresql-client` so
+  `pg_dump` + `psql` are available at runtime.
+
 - **VoIP OUI vendor enrichment — Phase 3 (issue #112).** Closes
   the #112 phasing. The existing IEEE OUI lookup now flips an
   `is_voip_phone` boolean on every IPAddress / DHCPLease /
