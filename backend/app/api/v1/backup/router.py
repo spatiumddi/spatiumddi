@@ -167,6 +167,29 @@ class RewrapOutcomeResponse(BaseModel):
     failures: list[dict[str, Any]] = []
 
 
+class MigrationOutcomeResponse(BaseModel):
+    """Result of the alembic upgrade-on-restore pass (issue #117
+    Phase 2). ``state`` is one of:
+
+    * ``up_to_date`` — source + destination on the same head
+    * ``upgraded`` — source was on an older head; ``alembic
+      upgrade head`` ran and applied ``migrations_applied``
+    * ``incompatible_newer`` — source head isn't an ancestor of
+      this install's head; the operator must upgrade SpatiumDDI
+      before relying on this restored install
+    * ``unknown`` — manifest didn't carry a schema_version or
+      the local install has multiple alembic heads
+    * ``failed`` — alembic upgrade subprocess failed; ``error``
+      carries the message
+    """
+
+    state: str
+    source_head: str | None
+    local_head: str | None
+    migrations_applied: list[str]
+    error: str | None = None
+
+
 class RestoreOutcomeResponse(BaseModel):
     success: bool
     pre_restore_safety_path: str | None
@@ -176,6 +199,7 @@ class RestoreOutcomeResponse(BaseModel):
     note: str
     selective: bool = False
     restored_sections: list[str] | None = None
+    migration: MigrationOutcomeResponse | None = None
     rewrap: RewrapOutcomeResponse | None = None
 
 
@@ -262,6 +286,17 @@ async def restore_backup(
                     "manifest": outcome.manifest,
                     "pre_restore_safety_path": outcome.pre_restore_path,
                     "duration_ms": outcome.duration_ms,
+                    "migration": (
+                        {
+                            "state": outcome.migration.state,
+                            "source_head": outcome.migration.source_head,
+                            "local_head": outcome.migration.local_head,
+                            "migrations_applied": outcome.migration.migrations_applied,
+                            "error": outcome.migration.error,
+                        }
+                        if outcome.migration is not None
+                        else None
+                    ),
                     "rewrap": (
                         {
                             "same_install": outcome.rewrap.same_install,
@@ -279,6 +314,17 @@ async def restore_backup(
             )
         )
         await fresh.commit()
+
+    migration = outcome.migration
+    migration_resp: MigrationOutcomeResponse | None = None
+    if migration is not None:
+        migration_resp = MigrationOutcomeResponse(
+            state=migration.state,
+            source_head=migration.source_head,
+            local_head=migration.local_head,
+            migrations_applied=migration.migrations_applied,
+            error=migration.error,
+        )
 
     rewrap = outcome.rewrap
     rewrap_resp: RewrapOutcomeResponse | None = None
@@ -315,6 +361,32 @@ async def restore_backup(
             f"destination key. Those credentials must be re-entered "
             f"manually — see the failures list below."
         )
+
+    # Migration commentary is appended after the rewrap copy so
+    # operators see both stages in order on the success screen.
+    if migration is not None and migration.state == "upgraded":
+        n = len(migration.migrations_applied)
+        note += (
+            f" Schema upgraded from {migration.source_head!r} to "
+            f"{migration.local_head!r} ({n} migration{'s' if n != 1 else ''} "
+            f"applied)."
+        )
+    elif migration is not None and migration.state == "incompatible_newer":
+        note += (
+            f" WARNING: archive is from a newer release of SpatiumDDI "
+            f"(schema head {migration.source_head!r} is not in this "
+            f"install's chain). Upgrade SpatiumDDI on this destination, "
+            f"then re-run the restore."
+        )
+    elif migration is not None and migration.state == "failed":
+        note += (
+            f" WARNING: alembic upgrade failed after the data load — "
+            f"run `alembic upgrade head` manually before relying on this "
+            f"install. Reason: {migration.error}"
+        )
+    elif migration is not None and migration.state == "unknown":
+        note += f" Schema-version skew check skipped: {migration.error or 'unknown reason'}."
+
     if outcome.pre_restore_path is None:
         note += (
             " WARNING: pre-restore safety dump was NOT written "
@@ -332,6 +404,7 @@ async def restore_backup(
         note=note,
         selective=outcome.selective,
         restored_sections=outcome.restored_sections,
+        migration=migration_resp,
         rewrap=rewrap_resp,
     )
 

@@ -42,6 +42,7 @@ from app.services.backup.archive import (
     extract_archive_members,
 )
 from app.services.backup.crypto import BackupCryptoError, decrypt_secrets
+from app.services.backup.migrations import MigrationOutcome, maybe_upgrade_after_restore
 from app.services.backup.rewrap import RewrapOutcome, rewrap_secrets
 
 logger = structlog.get_logger(__name__)
@@ -75,6 +76,7 @@ class RestoreOutcome:
     selective: bool = False
     restored_sections: list[str] | None = None
     restored_tables: list[str] | None = None
+    migration: MigrationOutcome | None = None
     rewrap: RewrapOutcome | None = None
 
 
@@ -459,11 +461,36 @@ async def apply_backup_restore(
             sql_path.write_bytes(db_bytes)
             await _run_psql(sql_path, db_url)
 
-    # Phase 6: cross-install secret rewrap. Walks every Fernet-
+    # Phase 6: alembic upgrade-on-restore. The destination DB is now
+    # at the source's schema head; if local code expects a newer
+    # head, run ``alembic upgrade head`` over the just-restored DB
+    # so the install boots cleanly without operator intervention.
+    # Same-head + truly-newer-source cases are no-ops with diagnostic
+    # state. Failures are surfaced, never raised — operator can
+    # re-run ``alembic upgrade head`` manually.
+    try:
+        migration_outcome = await maybe_upgrade_after_restore(
+            manifest_schema_version=manifest.get("schema_version"),
+            db_url=db_url,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.error("backup_restore_migration_failed", error=str(exc))
+        migration_outcome = MigrationOutcome(
+            state="failed",
+            source_head=manifest.get("schema_version"),
+            local_head=None,
+            migrations_applied=[],
+            error=f"migration step aborted: {exc}",
+        )
+
+    # Phase 7: cross-install secret rewrap. Walks every Fernet-
     # encrypted column + the backup_target.config JSONB blob and
     # re-encrypts with the destination install's key. No-op when
     # source + dest keys match. Failures are counted, not raised —
     # one bad row mustn't kill an otherwise-clean restore.
+    # Runs AFTER the alembic upgrade so the schema is at the local
+    # code's expected shape (encrypted columns may have moved /
+    # been renamed across migrations).
     from app.config import settings as _settings  # noqa: PLC0415
 
     try:
@@ -493,6 +520,8 @@ async def apply_backup_restore(
         duration_ms=duration_ms,
         selective=selective,
         restored_sections=restored_sections,
+        migration_state=migration_outcome.state,
+        migrations_applied=len(migration_outcome.migrations_applied),
         rewrap_same_install=rewrap_outcome.same_install,
         rewrap_rows=rewrap_outcome.rewrapped_rows,
         rewrap_jsonb=rewrap_outcome.rewrapped_jsonb_fields,
@@ -507,5 +536,6 @@ async def apply_backup_restore(
         selective=selective,
         restored_sections=restored_sections,
         restored_tables=restored_tables,
+        migration=migration_outcome,
         rewrap=rewrap_outcome,
     )

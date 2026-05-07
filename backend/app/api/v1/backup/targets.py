@@ -596,6 +596,17 @@ async def restore_from_archive(
                     "selective": outcome.selective,
                     "restored_sections": outcome.restored_sections,
                     "pre_restore_safety_path": outcome.pre_restore_path,
+                    "migration": (
+                        {
+                            "state": outcome.migration.state,
+                            "source_head": outcome.migration.source_head,
+                            "local_head": outcome.migration.local_head,
+                            "migrations_applied": outcome.migration.migrations_applied,
+                            "error": outcome.migration.error,
+                        }
+                        if outcome.migration is not None
+                        else None
+                    ),
                     "rewrap": (
                         {
                             "same_install": outcome.rewrap.same_install,
@@ -622,6 +633,17 @@ async def restore_from_archive(
         "pre_restore_safety_path": outcome.pre_restore_path,
         "selective": outcome.selective,
         "restored_sections": outcome.restored_sections,
+        "migration": (
+            {
+                "state": outcome.migration.state,
+                "source_head": outcome.migration.source_head,
+                "local_head": outcome.migration.local_head,
+                "migrations_applied": outcome.migration.migrations_applied,
+                "error": outcome.migration.error,
+            }
+            if outcome.migration is not None
+            else None
+        ),
         "rewrap": (
             {
                 "same_install": outcome.rewrap.same_install,
