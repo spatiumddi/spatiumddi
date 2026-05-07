@@ -137,6 +137,22 @@ class LocalVolumeDestination(BackupDestination):
 
         return await asyncio.to_thread(_do)
 
+    async def download(self, *, config: dict[str, Any], filename: str) -> bytes:
+        root = self._path(config)
+        safe = _safe_name(filename)
+
+        def _do() -> bytes:
+            target = root / safe
+            if not target.is_file():
+                from app.services.backup.targets.base import (  # noqa: PLC0415
+                    BackupDestinationError,
+                )
+
+                raise BackupDestinationError(f"archive {safe!r} not found at {root}")
+            return target.read_bytes()
+
+        return await asyncio.to_thread(_do)
+
     async def delete(self, *, config: dict[str, Any], filename: str) -> None:
         root = self._path(config)
         safe = _safe_name(filename)

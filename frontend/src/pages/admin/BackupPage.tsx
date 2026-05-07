@@ -37,7 +37,10 @@ import { BackupTargetsSection } from "./BackupTargetsSection";
  * Phase 1a out-of-scope but coming later: scheduled targets
  * (S3 / SCP / Azure), backup-target rows, selective restore.
  */
+type Tab = "manual" | "destinations";
+
 export function BackupPage() {
+  const [tab, setTab] = useState<Tab>("manual");
   return (
     <div className="flex h-full flex-col overflow-hidden">
       <div className="border-b bg-card px-6 py-4">
@@ -46,24 +49,53 @@ export function BackupPage() {
           <h1 className="text-lg font-semibold">Backup &amp; Restore</h1>
         </div>
         <p className="mt-1 text-xs text-muted-foreground">
-          Phase 1a — manual download + restore. Phase 1b — scheduled backup
-          targets to local volumes. Remote destinations (S3 / SCP / Azure) are
-          tracked in follow-up issues.
+          <strong>Manual</strong> — one-off download + restore-from-file.{" "}
+          <strong>Destinations</strong> — configure local volumes, S3, SCP,
+          Azure Blob. Schedule a recurring backup, view archives at the
+          destination, restore from any archive.
         </p>
+        <div className="-mb-px mt-3 flex gap-1 border-b">
+          {(
+            [
+              ["manual", "Manual"],
+              ["destinations", "Destinations"],
+            ] as const
+          ).map(([key, label]) => (
+            <button
+              key={key}
+              type="button"
+              onClick={() => setTab(key)}
+              className={`-mb-px border-b-2 px-3 py-1.5 text-sm ${
+                tab === key
+                  ? "border-primary text-foreground"
+                  : "border-transparent text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
       </div>
 
       <div className="flex-1 overflow-auto p-6">
         <div className="mx-auto flex max-w-6xl flex-col gap-6">
-          {/* Manual download + restore — stack on narrow, sit
-              side-by-side on lg+ where there's room for both. */}
-          <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
-            <CreateBackupCard />
-            <RestoreBackupCard />
-          </div>
-          {/* Scheduled-targets section spans full width — its
-              internal grid handles the per-target tiling. */}
-          <BackupTargetsSection />
-          <SecurityNotes />
+          {tab === "manual" && (
+            <>
+              {/* Manual download + restore — stack on narrow, sit
+                  side-by-side on lg+ where there's room for both. */}
+              <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+                <CreateBackupCard />
+                <RestoreBackupCard />
+              </div>
+              <SecurityNotes />
+            </>
+          )}
+          {tab === "destinations" && (
+            <>
+              <BackupTargetsSection />
+              <SecurityNotes />
+            </>
+          )}
         </div>
       </div>
     </div>

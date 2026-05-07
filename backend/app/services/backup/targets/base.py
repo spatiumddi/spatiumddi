@@ -99,6 +99,15 @@ class BackupDestination(ABC):
         """
 
     @abstractmethod
+    async def download(self, *, config: dict[str, Any], filename: str) -> bytes:
+        """Fetch + return the archive bytes for ``filename``. The
+        restore-from-destination flow streams these straight into
+        :func:`app.services.backup.restore.apply_backup_restore`
+        without ever materialising the file on the api / worker
+        container's local disk.
+        """
+
+    @abstractmethod
     async def delete(self, *, config: dict[str, Any], filename: str) -> None:
         """Drop ``filename`` from this destination. Idempotent —
         deleting a missing file should not raise.

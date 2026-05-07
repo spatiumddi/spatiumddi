@@ -256,6 +256,24 @@ class S3Destination(BackupDestination):
 
         return await asyncio.to_thread(_do)
 
+    async def download(self, *, config: dict[str, Any], filename: str) -> bytes:
+        key = _key(config, filename)
+
+        def _do() -> bytes:
+            from botocore.exceptions import (  # noqa: PLC0415
+                BotoCoreError,
+                ClientError,
+            )
+
+            client = _client(config)
+            try:
+                resp = client.get_object(Bucket=config["bucket"], Key=key)
+                return resp["Body"].read()
+            except (ClientError, BotoCoreError) as exc:
+                raise BackupDestinationError(f"S3 get_object failed: {exc}") from exc
+
+        return await asyncio.to_thread(_do)
+
     async def delete(self, *, config: dict[str, Any], filename: str) -> None:
         key = _key(config, filename)
 

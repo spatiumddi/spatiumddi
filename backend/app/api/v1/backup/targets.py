@@ -457,6 +457,103 @@ async def list_target_archives(
     ]
 
 
+class RestoreFromArchiveBody(BaseModel):
+    filename: str = Field(..., min_length=1, max_length=255)
+    passphrase: str = Field(..., min_length=8, max_length=512)
+    confirmation_phrase: str
+
+
+@router.post("/{target_id}/archives/restore")
+async def restore_from_archive(
+    target_id: uuid.UUID,
+    body: RestoreFromArchiveBody,
+    db: DB,
+    current_user: CurrentUser,
+) -> dict[str, Any]:
+    """Pull ``filename`` from the destination, decrypt + replay
+    via the same code path as ``POST /backup/restore`` (Phase 1a).
+    Operator types the passphrase even though the target stores
+    one — symmetric with the upload-based restore + proves the
+    operator knows the key, so a stolen session token can't roll
+    back the install on a hunch.
+    """
+    _require_superadmin(current_user)
+    row = await db.get(BackupTarget, target_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="backup target not found")
+    driver = get_destination(row.kind)
+    try:
+        plain_config = decrypt_config_secrets(driver, row.config)
+        archive_bytes = await driver.download(config=plain_config, filename=body.filename)
+    except SecretFieldError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except BackupDestinationError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    if not archive_bytes:
+        raise HTTPException(
+            status_code=502,
+            detail=f"archive {body.filename!r} fetched empty from destination",
+        )
+
+    # Reuse the Phase 1a restore path so the safety dump +
+    # passphrase verify + psql replay + post-replay audit row all
+    # behave the same as the upload-based restore.
+    from app.config import settings  # noqa: PLC0415
+    from app.services.backup import (  # noqa: PLC0415
+        BackupArchiveError,
+        BackupCryptoError,
+        BackupRestoreError,
+        apply_backup_restore,
+    )
+
+    try:
+        outcome = await apply_backup_restore(
+            db,
+            archive_bytes=archive_bytes,
+            passphrase=body.passphrase,
+            confirmation_phrase=body.confirmation_phrase,
+            db_url=str(settings.database_url),
+        )
+    except (BackupArchiveError, BackupCryptoError, BackupRestoreError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    # Post-replay audit on a fresh session — the current ``db``
+    # session was closed inside ``apply_backup_restore`` (engine
+    # disposed). Same shape the Phase 1a upload-restore endpoint
+    # uses.
+    from app.db import AsyncSessionLocal  # noqa: PLC0415
+
+    async with AsyncSessionLocal() as fresh:
+        fresh.add(
+            AuditLog(
+                action="backup_restored",
+                resource_type="backup_target",
+                resource_id=str(row.id),
+                resource_display=row.name,
+                user_id=current_user.id,
+                user_display_name=current_user.username,
+                result="success",
+                new_value={
+                    "source": "destination",
+                    "target_kind": row.kind,
+                    "filename": body.filename,
+                    "manifest": outcome.manifest,
+                    "duration_ms": outcome.duration_ms,
+                    "pre_restore_safety_path": outcome.pre_restore_path,
+                },
+            )
+        )
+        await fresh.commit()
+
+    return {
+        "success": True,
+        "filename": body.filename,
+        "duration_ms": outcome.duration_ms,
+        "manifest": outcome.manifest,
+        "pre_restore_safety_path": outcome.pre_restore_path,
+    }
+
+
 @router.delete("/{target_id}/archives/{filename}", status_code=204)
 async def delete_target_archive(
     target_id: uuid.UUID,

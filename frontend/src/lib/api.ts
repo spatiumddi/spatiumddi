@@ -2327,6 +2327,23 @@ export const backupTargetsApi = {
         `/backup/targets/${id}/archives/${encodeURIComponent(filename)}`,
       )
       .then((r) => r.data),
+  restoreFromArchive: (
+    id: string,
+    body: {
+      filename: string;
+      passphrase: string;
+      confirmation_phrase: string;
+    },
+  ) =>
+    api
+      .post<{
+        success: boolean;
+        filename: string;
+        duration_ms: number;
+        manifest: BackupManifest;
+        pre_restore_safety_path: string | null;
+      }>(`/backup/targets/${id}/archives/restore`, body)
+      .then((r) => r.data),
 };
 
 // Read a blob-shaped error body and re-throw with the actual

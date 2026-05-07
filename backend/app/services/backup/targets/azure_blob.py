@@ -199,6 +199,28 @@ class AzureBlobDestination(BackupDestination):
 
         return await asyncio.to_thread(_do)
 
+    async def download(self, *, config: dict[str, Any], filename: str) -> bytes:
+        blob_name = self._blob_name(config, filename)
+
+        def _do() -> bytes:
+            from azure.core.exceptions import (  # noqa: PLC0415
+                AzureError,
+                ResourceNotFoundError,
+            )
+
+            client = self._container_client(config)
+            try:
+                stream = client.get_blob_client(blob_name).download_blob()
+                return stream.readall()
+            except ResourceNotFoundError as exc:
+                raise BackupDestinationError(
+                    f"archive {filename!r} not found in container " f"{config['container']!r}"
+                ) from exc
+            except AzureError as exc:
+                raise BackupDestinationError(f"Azure download_blob failed: {exc}") from exc
+
+        return await asyncio.to_thread(_do)
+
     async def delete(self, *, config: dict[str, Any], filename: str) -> None:
         blob_name = self._blob_name(config, filename)
 

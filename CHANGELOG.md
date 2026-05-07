@@ -39,6 +39,29 @@ last three releases retroactively.
 
 ### Added
 
+- **Backup & restore — Phase 1 finale (issue #117).** Two
+  end-of-Phase-1 polish items: tabbed Backup admin page +
+  restore-from-destination. The page splits into **Manual** (one-off
+  download + restore-from-uploaded-file) and **Destinations**
+  (configure local volumes / S3 / SCP / Azure Blob, run them on
+  cron, restore from any archive at any destination). The
+  per-archive drawer in the destinations tab gets a Restore icon
+  alongside Delete: click → confirmation modal → server fetches
+  the archive bytes from the destination via a new
+  ``download(config, filename)`` method on every driver,
+  decrypts ``secrets.enc`` with the operator-typed passphrase,
+  takes the standard pre-restore safety dump, replays via
+  ``psql --single-transaction``, writes the post-replay
+  ``backup_restored`` audit row in the freshly restored DB. New
+  endpoint: ``POST /backup/targets/{id}/archives/restore``
+  (``filename`` / ``passphrase`` / ``confirmation_phrase``;
+  superadmin-gated; same wrong-passphrase + wrong-confirmation
+  rejection semantics as the Phase 1a upload-restore endpoint).
+  Verified end-to-end against a local-volume target — wrong
+  passphrase + wrong confirmation both reject cleanly, happy
+  path restored a 2.7 MB archive in 2.8 s, api stays healthy
+  post-replay.
+
 - **Backup & restore — Phase 1d (issue #117).** Two more
   destination drivers slot into the Phase 1c scaffolding,
   closing out the Tier 1 destination set called for in the

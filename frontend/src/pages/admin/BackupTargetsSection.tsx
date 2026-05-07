@@ -321,6 +321,7 @@ function ArchiveList({
       onAfterChange();
     },
   });
+  const [restoring, setRestoring] = useState<string | null>(null);
 
   return (
     <div className="border-t bg-muted/30 px-3 py-2 text-xs">
@@ -370,6 +371,14 @@ function ArchiveList({
               </span>
               <button
                 type="button"
+                onClick={() => setRestoring(a.filename)}
+                title="Restore from this archive"
+                className="rounded p-1 hover:bg-primary/10"
+              >
+                <RefreshCw className="h-3 w-3 text-primary" />
+              </button>
+              <button
+                type="button"
                 onClick={() => {
                   if (confirm(`Delete archive ${a.filename}?`)) {
                     deleteMut.mutate(a.filename);
@@ -384,6 +393,137 @@ function ArchiveList({
           ))}
         </ul>
       )}
+      {restoring && (
+        <RestoreFromArchiveModal
+          targetId={targetId}
+          filename={restoring}
+          onClose={() => setRestoring(null)}
+          onSuccess={() => {
+            setRestoring(null);
+            onAfterChange();
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+function RestoreFromArchiveModal({
+  targetId,
+  filename,
+  onClose,
+  onSuccess,
+}: {
+  targetId: string;
+  filename: string;
+  onClose: () => void;
+  onSuccess: () => void;
+}) {
+  const [passphrase, setPassphrase] = useState("");
+  const [confirm, setConfirm] = useState("");
+  const restoreMut = useMutation({
+    mutationFn: () =>
+      backupTargetsApi.restoreFromArchive(targetId, {
+        filename,
+        passphrase,
+        confirmation_phrase: confirm,
+      }),
+    onSuccess,
+  });
+
+  const canSubmit =
+    passphrase.length >= 8 &&
+    confirm === "RESTORE-FROM-BACKUP" &&
+    !restoreMut.isPending;
+
+  return (
+    <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/30 text-sm">
+      <div className="w-full max-w-md rounded-lg border bg-card p-5 shadow-lg">
+        <div className="mb-3 flex items-center gap-2">
+          <RefreshCw className="h-4 w-4 text-primary" />
+          <h3 className="font-semibold">Restore from archive</h3>
+        </div>
+        <div className="mb-3 rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
+          <strong>Hard overwrite.</strong> The current install&apos;s data will
+          be replaced with the contents of{" "}
+          <code className="font-mono">{filename}</code>. A pre-restore safety
+          dump runs first; nothing about the destination archive is changed.
+        </div>
+        <form
+          className="space-y-3"
+          onSubmit={(e) => {
+            e.preventDefault();
+            if (canSubmit) restoreMut.mutate();
+          }}
+        >
+          <Field label="Passphrase" required>
+            <input
+              type="password"
+              value={passphrase}
+              onChange={(e) => setPassphrase(e.target.value)}
+              className="w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+              autoComplete="off"
+              autoFocus
+            />
+          </Field>
+          <Field
+            label="Confirmation phrase"
+            help={
+              <>
+                Type{" "}
+                <code className="rounded bg-muted px-1 py-0.5 text-[11px]">
+                  RESTORE-FROM-BACKUP
+                </code>{" "}
+                exactly to enable Apply.
+              </>
+            }
+            required
+          >
+            <input
+              type="text"
+              value={confirm}
+              onChange={(e) => setConfirm(e.target.value)}
+              placeholder="RESTORE-FROM-BACKUP"
+              className="w-full rounded-md border bg-background px-3 py-1.5 font-mono text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+              autoComplete="off"
+            />
+          </Field>
+          {restoreMut.isError && (
+            <div className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+              {(restoreMut.error as Error)?.message || "restore failed"}
+            </div>
+          )}
+          {restoreMut.data && (
+            <div className="rounded-md border border-emerald-500/30 bg-emerald-500/5 px-3 py-2 text-xs text-emerald-700 dark:text-emerald-300">
+              Restored <code className="font-mono">{filename}</code> in{" "}
+              {restoreMut.data.duration_ms} ms.
+            </div>
+          )}
+          <div className="flex items-center justify-end gap-2">
+            <button
+              type="button"
+              onClick={onClose}
+              className="rounded-md border px-3 py-1.5 text-xs hover:bg-accent"
+            >
+              Cancel
+            </button>
+            <button
+              type="submit"
+              disabled={!canSubmit}
+              className="rounded-md bg-destructive px-3 py-1.5 text-xs font-medium text-destructive-foreground hover:bg-destructive/90 disabled:opacity-50"
+            >
+              {restoreMut.isPending ? (
+                <>
+                  <Loader2 className="mr-1 inline h-3.5 w-3.5 animate-spin" />
+                  Restoring…
+                </>
+              ) : (
+                "Apply restore"
+              )}
+            </button>
+          </div>
+        </form>
+      </div>
     </div>
   );
 }

@@ -327,6 +327,28 @@ class ScpDestination(BackupDestination):
 
         return await asyncio.to_thread(_do)
 
+    async def download(self, *, config: dict[str, Any], filename: str) -> bytes:
+        safe = os.path.basename(filename)
+        remote = config["remote_path"].rstrip("/") + "/" + safe
+
+        def _do() -> bytes:
+            client = self._connect(config)
+            try:
+                sftp = client.open_sftp()
+                try:
+                    with sftp.file(remote, "rb") as fh:
+                        return fh.read()
+                except FileNotFoundError as exc:
+                    raise BackupDestinationError(f"archive {safe!r} not found at {remote}") from exc
+                except Exception as exc:  # noqa: BLE001
+                    raise BackupDestinationError(f"SFTP read failed: {exc}") from exc
+                finally:
+                    sftp.close()
+            finally:
+                client.close()
+
+        return await asyncio.to_thread(_do)
+
     async def delete(self, *, config: dict[str, Any], filename: str) -> None:
         safe = os.path.basename(filename)
         remote = config["remote_path"].rstrip("/") + "/" + safe
