@@ -53,9 +53,12 @@ import {
   asnsApi,
   vrfsApi,
   IP_ROLE_OPTIONS,
+  SUBNET_ROLES,
+  SUBNET_ROLE_LABELS,
   type IPSpace,
   type IPBlock,
   type Subnet,
+  type SubnetRole,
   type IPAddress,
   type IPRole,
   type CustomField,
@@ -1193,16 +1196,20 @@ function ClassificationSection({
   pciScope,
   hipaaScope,
   internetFacing,
+  subnetRole,
   onPciChange,
   onHipaaChange,
   onInternetFacingChange,
+  onSubnetRoleChange,
 }: {
   pciScope: boolean;
   hipaaScope: boolean;
   internetFacing: boolean;
+  subnetRole: SubnetRole | null;
   onPciChange: (v: boolean) => void;
   onHipaaChange: (v: boolean) => void;
   onInternetFacingChange: (v: boolean) => void;
+  onSubnetRoleChange: (v: SubnetRole | null) => void;
 }) {
   return (
     <div className="space-y-2">
@@ -1257,6 +1264,31 @@ function ClassificationSection({
             </span>
           </span>
         </label>
+      </div>
+      <div className="pt-2">
+        <label className="block text-[11px] font-medium text-muted-foreground">
+          Network role
+        </label>
+        <select
+          className="mt-1 w-full rounded-md border bg-background px-2.5 py-1.5 text-xs"
+          value={subnetRole ?? ""}
+          onChange={(e) =>
+            onSubnetRoleChange(
+              e.target.value ? (e.target.value as SubnetRole) : null,
+            )
+          }
+        >
+          <option value="">— unspecified —</option>
+          {SUBNET_ROLES.map((r) => (
+            <option key={r} value={r}>
+              {SUBNET_ROLE_LABELS[r]}
+            </option>
+          ))}
+        </select>
+        <p className="mt-1 text-[10px] text-muted-foreground/70">
+          Voice-tagged subnets unlock the voice-VLAN conformity check and the
+          voice-lease-count-below alert rule.
+        </p>
       </div>
     </div>
   );
@@ -1810,6 +1842,8 @@ function CreateSubnetModal({
   const [pciScope, setPciScope] = useState(false);
   const [hipaaScope, setHipaaScope] = useState(false);
   const [internetFacing, setInternetFacing] = useState(false);
+  // Network-role (issue #112 phase 2).
+  const [subnetRole, setSubnetRole] = useState<SubnetRole | null>(null);
   // Logical ownership (issue #91).
   const [customerId, setCustomerId] = useState<string | null>(null);
   const [siteId, setSiteId] = useState<string | null>(null);
@@ -1914,6 +1948,7 @@ function CreateSubnetModal({
         pci_scope: pciScope,
         hipaa_scope: hipaaScope,
         internet_facing: internetFacing,
+        subnet_role: subnetRole,
         customer_id: customerId,
         site_id: siteId,
         ...(templateId ? { template_id: templateId } : {}),
@@ -2211,9 +2246,11 @@ function CreateSubnetModal({
               pciScope={pciScope}
               hipaaScope={hipaaScope}
               internetFacing={internetFacing}
+              subnetRole={subnetRole}
               onPciChange={setPciScope}
               onHipaaChange={setHipaaScope}
               onInternetFacingChange={setInternetFacing}
+              onSubnetRoleChange={setSubnetRole}
             />
           </div>
         </div>
@@ -5793,6 +5830,10 @@ function EditSubnetModal({
   const [internetFacing, setInternetFacing] = useState(
     subnet.internet_facing ?? false,
   );
+  // Network-role (issue #112 phase 2).
+  const [subnetRole, setSubnetRole] = useState<SubnetRole | null>(
+    (subnet.subnet_role ?? null) as SubnetRole | null,
+  );
   // Logical ownership (issue #91).
   const [customerId, setCustomerId] = useState<string | null>(
     subnet.customer_id ?? null,
@@ -5904,6 +5945,7 @@ function EditSubnetModal({
         pci_scope: pciScope,
         hipaa_scope: hipaaScope,
         internet_facing: internetFacing,
+        subnet_role: subnetRole,
         customer_id: customerId,
         site_id: siteId,
         ...(manageAuto !== undefined
@@ -6248,9 +6290,11 @@ function EditSubnetModal({
               pciScope={pciScope}
               hipaaScope={hipaaScope}
               internetFacing={internetFacing}
+              subnetRole={subnetRole}
               onPciChange={setPciScope}
               onHipaaChange={setHipaaScope}
               onInternetFacingChange={setInternetFacing}
+              onSubnetRoleChange={setSubnetRole}
             />
           </div>
         </div>
@@ -9786,6 +9830,11 @@ function BlockDetailView({
     status: "",
   });
   const [tagFilters, setTagFilters] = useState<string[]>([]);
+  // Subnet-role filter (issue #112 phase 2). Empty Set = "all roles";
+  // any value present narrows to that role + hides everything else.
+  const [roleFilters, setRoleFilters] = useState<Set<SubnetRole>>(
+    () => new Set(),
+  );
   const [showBlockFilters, setShowBlockFilters] = useState(false);
   // Unified selection set with ``subnet:<id>`` / ``block:<id>`` keys —
   // mirrors the space-level view so a single bulk action can delete a
@@ -10272,11 +10321,51 @@ function BlockDetailView({
           ) : null;
         })()}
       <div className="border-b bg-muted/10 px-4 py-2">
-        <TagFilterChips
-          value={tagFilters}
-          onChange={setTagFilters}
-          placeholder="Filter subnets + child blocks by tag — try env or env:prod…"
-        />
+        <div className="flex flex-wrap items-center gap-2">
+          <TagFilterChips
+            value={tagFilters}
+            onChange={setTagFilters}
+            placeholder="Filter subnets + child blocks by tag — try env or env:prod…"
+          />
+          <span className="text-[10px] uppercase tracking-wide text-muted-foreground">
+            role:
+          </span>
+          {SUBNET_ROLES.map((r) => {
+            const active = roleFilters.has(r);
+            return (
+              <button
+                key={r}
+                type="button"
+                onClick={() =>
+                  setRoleFilters((prev) => {
+                    const next = new Set(prev);
+                    if (next.has(r)) next.delete(r);
+                    else next.add(r);
+                    return next;
+                  })
+                }
+                className={cn(
+                  "inline-flex rounded-full border px-2 py-0.5 text-[11px]",
+                  active
+                    ? "border-primary/40 bg-primary/10 text-primary"
+                    : "text-muted-foreground hover:bg-accent",
+                )}
+                title={`Show subnets tagged ${SUBNET_ROLE_LABELS[r]}`}
+              >
+                {SUBNET_ROLE_LABELS[r]}
+              </button>
+            );
+          })}
+          {roleFilters.size > 0 && (
+            <button
+              type="button"
+              onClick={() => setRoleFilters(new Set())}
+              className="text-[11px] text-muted-foreground hover:text-foreground"
+            >
+              clear
+            </button>
+          )}
+        </div>
       </div>
       <div className="flex-1 overflow-auto">
         {(() => {
@@ -10298,7 +10387,8 @@ function BlockDetailView({
           // Apply filters
           const hasBlockFilter = Object.values(blockFilter).some(Boolean);
           const hasTagFilter = tagFilters.length > 0;
-          if (hasBlockFilter || hasTagFilter) {
+          const hasRoleFilter = roleFilters.size > 0;
+          if (hasBlockFilter || hasTagFilter || hasRoleFilter) {
             allRows = allRows.filter((r) => {
               if (r.type === "block" && r.block) {
                 const b = r.block;
@@ -10324,6 +10414,14 @@ function BlockDetailView({
               if (r.type === "subnet" && r.subnet) {
                 const s = r.subnet;
                 if (hasTagFilter && !matchesAllTagChips(s.tags, tagFilters))
+                  return false;
+                if (
+                  hasRoleFilter &&
+                  !(
+                    s.subnet_role &&
+                    roleFilters.has(s.subnet_role as SubnetRole)
+                  )
+                )
                   return false;
                 if (
                   blockFilter.network &&

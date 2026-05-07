@@ -449,6 +449,22 @@ export interface SubnetVLANRef {
   name: string;
 }
 
+export type SubnetRole = "data" | "voice" | "management" | "guest";
+
+export const SUBNET_ROLES: readonly SubnetRole[] = [
+  "data",
+  "voice",
+  "management",
+  "guest",
+] as const;
+
+export const SUBNET_ROLE_LABELS: Record<SubnetRole, string> = {
+  data: "Data",
+  voice: "Voice",
+  management: "Management",
+  guest: "Guest",
+};
+
 export interface Subnet {
   id: string;
   space_id: string;
@@ -515,6 +531,11 @@ export interface Subnet {
   pci_scope?: boolean;
   hipaa_scope?: boolean;
   internet_facing?: boolean;
+  // Network-role classification (issue #112 phase 2). NULL means
+  // unspecified; values are ``data`` / ``voice`` / ``management`` /
+  // ``guest``. Drives the IPAM filter chip + VLAN-page voice tag +
+  // voice-segment conformity / alert rules.
+  subnet_role?: SubnetRole | null;
   dns_servers?: string[] | null;
   domain_name?: string | null;
   applied_template_id?: string | null;
@@ -1234,6 +1255,10 @@ export const ipamApi = {
     pci_scope?: boolean;
     hipaa_scope?: boolean;
     internet_facing?: boolean;
+    // Multi-value (e.g. ``["voice", "management"]``). axios serialises
+    // arrays as repeated keys so the FastAPI ``list[str]`` parses them
+    // natively.
+    subnet_role?: SubnetRole | SubnetRole[];
     tag?: string[];
   }) => api.get<Subnet[]>("/ipam/subnets", { params }).then((r) => r.data),
   getSubnet: (id: string) =>
@@ -5269,7 +5294,8 @@ export type AlertRuleType =
   | "circuit_status_changed"
   | "service_term_expiring"
   | "service_resource_orphaned"
-  | "compliance_change";
+  | "compliance_change"
+  | "voice_lease_count_below";
 export type AlertSeverity = "info" | "warning" | "critical";
 export type AlertServerType = "dns" | "dhcp" | "any";
 // ``compliance_change`` rule type — keep in lock-step with

@@ -84,12 +84,18 @@ async def _resolve_subnets(
       * ``classification`` — one of the known flag column names
         (``pci_scope`` / ``hipaa_scope`` / ``internet_facing``).
         Filters to subnets with the named flag set.
+      * ``subnet_role`` — one of the network-role enum values
+        (``data`` / ``voice`` / ``management`` / ``guest``). Filters
+        to subnets carrying that role tag.
     """
     q = select(Subnet)
     classification = target_filter.get("classification")
     if classification in ("pci_scope", "hipaa_scope", "internet_facing"):
         col = getattr(Subnet, classification)
         q = q.where(col.is_(True))
+    role = target_filter.get("subnet_role")
+    if isinstance(role, str) and role:
+        q = q.where(Subnet.subnet_role == role)
     rows = (await db.execute(q)).scalars().all()
     return [
         _ResolvedTarget(

@@ -69,6 +69,12 @@ IP_ROLES: frozenset[str] = frozenset(
 )
 IP_ROLES_SHARED: frozenset[str] = frozenset({"anycast", "vip", "vrrp"})
 
+# Network-role classification on Subnet (issue #112 phase 2). Operators
+# pick one when the subnet has a clear network function; null means
+# unspecified. Drives IPAM filter chips, VLAN page tags, voice-VLAN
+# conformity checks, and the voice-lease-count alert rule.
+SUBNET_ROLES: frozenset[str] = frozenset({"data", "voice", "management", "guest"})
+
 
 class IPSpace(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     """VRF / isolated routing domain. IPs in different spaces may overlap."""
@@ -524,6 +530,15 @@ class Subnet(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     internet_facing: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default=sa_text("false")
     )
+
+    # Network-role classification (issue #112 phase 2). Pure metadata —
+    # no behaviour change in the Kea / BIND drivers. Drives the IPAM
+    # filter chip, the VLAN page "Voice" tag, the
+    # ``voice_segment_not_internet_facing`` conformity check, and the
+    # ``voice_lease_count_below`` alert rule. NULL means "unspecified"
+    # so existing rows are not retroactively misclassified. Values:
+    # ``data`` / ``voice`` / ``management`` / ``guest``.
+    subnet_role: Mapped[str | None] = mapped_column(String(20), nullable=True)
 
     # Kubernetes integration provenance. When set, the subnet was auto-
     # created by the Kubernetes reconciler for this cluster; the FK

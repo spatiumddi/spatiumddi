@@ -525,6 +525,53 @@ async def check_audit_log_immutable(
     )
 
 
+# ── Check 7: voice_segment_not_internet_facing ──────────────────────
+
+
+@register("voice_segment_not_internet_facing")
+async def check_voice_segment_not_internet_facing(
+    db: AsyncSession,
+    *,
+    target: object | None,
+    target_kind: str,
+    args: dict[str, Any],
+    now: datetime,
+) -> CheckOutcome:
+    """Pass when a voice-VLAN subnet is not flagged ``internet_facing``.
+
+    Voice-segment metadata + the existing ``internet_facing``
+    classification combine here — phone fleets reaching the public
+    internet directly is almost always a misconfiguration (voice
+    traffic should be inside a private VRF / NAT'd through the SBC).
+    The check is meaningful only on subnets the operator has tagged
+    ``subnet_role='voice'``; everything else is not_applicable.
+
+    Issue #112 phase 2 — flips voice-segment metadata from passive
+    UI labelling into a real audit signal.
+    """
+    _ = args, now, db
+    if not isinstance(target, Subnet):
+        return CheckOutcome.not_applicable("requires target_kind=subnet")
+    if target.subnet_role != "voice":
+        return CheckOutcome.not_applicable(
+            "subnet is not tagged as a voice segment",
+            {"subnet_role": target.subnet_role},
+        )
+    if target.internet_facing:
+        return CheckOutcome.fail(
+            "voice subnet is also flagged internet_facing",
+            {
+                "subnet_role": target.subnet_role,
+                "internet_facing": True,
+                "network": str(target.network),
+            },
+        )
+    return CheckOutcome.passed(
+        "voice subnet is not flagged internet_facing",
+        {"subnet_role": target.subnet_role, "network": str(target.network)},
+    )
+
+
 # Suppress unused-import warning when this module is read in
 # isolation — referenced by check_no_open_ports.
 _ = ipaddress
@@ -617,6 +664,12 @@ CHECK_CATALOG: list[dict[str, Any]] = [
         "name": "audit_log_immutable",
         "label": "Audit log is reachable and append-only",
         "supports": ["platform"],
+        "args": [],
+    },
+    {
+        "name": "voice_segment_not_internet_facing",
+        "label": "Voice subnet is not flagged internet_facing",
+        "supports": ["subnet"],
         "args": [],
     },
 ]

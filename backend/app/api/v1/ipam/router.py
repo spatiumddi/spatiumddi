@@ -27,6 +27,7 @@ from app.models.ipam import (
     IP_ROLES_SHARED,
     IP_STATUSES,
     IP_STATUSES_OPERATOR_SETTABLE,
+    SUBNET_ROLES,
     IPAddress,
     IPBlock,
     IpMacHistory,
@@ -1610,6 +1611,9 @@ class SubnetCreate(BaseModel):
     pci_scope: bool = False
     hipaa_scope: bool = False
     internet_facing: bool = False
+    # Network-role classification (issue #112 phase 2). Pure metadata
+    # — null means unspecified.
+    subnet_role: str | None = None
     # Logical ownership (issue #91).
     customer_id: uuid.UUID | None = None
     site_id: uuid.UUID | None = None
@@ -1623,6 +1627,15 @@ class SubnetCreate(BaseModel):
         allowed = {"sequential", "random", "eui64"}
         if v not in allowed:
             raise ValueError(f"ipv6_allocation_policy must be one of: {', '.join(sorted(allowed))}")
+        return v
+
+    @field_validator("subnet_role")
+    @classmethod
+    def validate_subnet_role_create(cls, v: str | None) -> str | None:
+        if v is None or v == "":
+            return None
+        if v not in SUBNET_ROLES:
+            raise ValueError(f"subnet_role must be one of: {', '.join(sorted(SUBNET_ROLES))}")
         return v
 
     @field_validator("ddns_hostname_policy")
@@ -1719,8 +1732,18 @@ class SubnetUpdate(BaseModel):
     pci_scope: bool | None = None
     hipaa_scope: bool | None = None
     internet_facing: bool | None = None
+    subnet_role: str | None = None
     customer_id: uuid.UUID | None = None
     site_id: uuid.UUID | None = None
+
+    @field_validator("subnet_role")
+    @classmethod
+    def validate_subnet_role_update(cls, v: str | None) -> str | None:
+        if v is None or v == "":
+            return None
+        if v not in SUBNET_ROLES:
+            raise ValueError(f"subnet_role must be one of: {', '.join(sorted(SUBNET_ROLES))}")
+        return v
 
     @field_validator("ipv6_allocation_policy")
     @classmethod
@@ -1833,6 +1856,7 @@ class SubnetResponse(BaseModel):
     pci_scope: bool = False
     hipaa_scope: bool = False
     internet_facing: bool = False
+    subnet_role: str | None = None
     customer_id: uuid.UUID | None = None
     site_id: uuid.UUID | None = None
     applied_template_id: uuid.UUID | None = None
@@ -3337,6 +3361,7 @@ async def list_subnets(
     pci_scope: bool | None = None,
     hipaa_scope: bool | None = None,
     internet_facing: bool | None = None,
+    subnet_role: list[str] = Query(default_factory=list),
     customer_id: uuid.UUID | None = None,
     site_id: uuid.UUID | None = None,
     tag: list[str] = Query(default_factory=list),
@@ -3356,6 +3381,17 @@ async def list_subnets(
         query = query.where(Subnet.hipaa_scope == hipaa_scope)
     if internet_facing is not None:
         query = query.where(Subnet.internet_facing == internet_facing)
+    if subnet_role:
+        # Multi-value (``?subnet_role=voice&subnet_role=management``).
+        # Reject unknown values eagerly so the operator sees the typo
+        # instead of an empty result. Empty list = no filter.
+        unknown = [r for r in subnet_role if r not in SUBNET_ROLES]
+        if unknown:
+            raise HTTPException(
+                status_code=422,
+                detail=f"unknown subnet_role values: {', '.join(unknown)}",
+            )
+        query = query.where(Subnet.subnet_role.in_(subnet_role))
     if customer_id is not None:
         query = query.where(Subnet.customer_id == customer_id)
     if site_id is not None:

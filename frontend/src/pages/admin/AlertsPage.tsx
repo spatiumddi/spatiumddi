@@ -99,7 +99,11 @@ function RuleEditorModal({
         notify_syslog: notifySyslog,
         notify_webhook: notifyWebhook,
         notify_smtp: notifySmtp,
-        threshold_percent: ruleType === "subnet_utilization" ? threshold : null,
+        threshold_percent:
+          ruleType === "subnet_utilization" ||
+          ruleType === "voice_lease_count_below"
+            ? threshold
+            : null,
         threshold_days:
           ruleType === "domain_expiring" ||
           ruleType === "circuit_term_expiring" ||
@@ -202,7 +206,26 @@ function RuleEditorModal({
                   Compliance change (PCI / HIPAA / internet-facing)
                 </option>
               </optgroup>
+              <optgroup label="VoIP">
+                <option value="voice_lease_count_below">
+                  Voice VLAN lease count below threshold
+                </option>
+              </optgroup>
             </select>
+          </Field>
+        )}
+        {ruleType === "voice_lease_count_below" && (
+          <Field
+            label="Minimum active leases"
+            hint="Fires when any subnet tagged subnet_role='voice' has fewer active DHCP leases than this. Set to roughly 50% of the expected phone fleet so brief reboots don't trigger but a real mass-disconnect does."
+          >
+            <input
+              type="number"
+              min={0}
+              className={inputCls}
+              value={threshold}
+              onChange={(e) => setThreshold(Number(e.target.value))}
+            />
           </Field>
         )}
         {ruleType === "subnet_utilization" && (
@@ -538,15 +561,17 @@ export function AlertsPage() {
                     <td className="px-4 py-2 text-muted-foreground tabular-nums">
                       {r.rule_type === "subnet_utilization"
                         ? `≥ ${r.threshold_percent}%`
-                        : r.rule_type === "server_unreachable"
-                          ? `type=${r.server_type ?? "any"}`
-                          : r.rule_type === "domain_expiring" ||
-                              r.rule_type === "circuit_term_expiring" ||
-                              r.rule_type === "service_term_expiring"
-                            ? `≤ ${r.threshold_days ?? 30} d`
-                            : r.rule_type === "compliance_change"
-                              ? `${r.classification ?? "?"} · ${r.change_scope ?? "any_change"}`
-                              : "—"}
+                        : r.rule_type === "voice_lease_count_below"
+                          ? `< ${r.threshold_percent ?? 1} leases`
+                          : r.rule_type === "server_unreachable"
+                            ? `type=${r.server_type ?? "any"}`
+                            : r.rule_type === "domain_expiring" ||
+                                r.rule_type === "circuit_term_expiring" ||
+                                r.rule_type === "service_term_expiring"
+                              ? `≤ ${r.threshold_days ?? 30} d`
+                              : r.rule_type === "compliance_change"
+                                ? `${r.classification ?? "?"} · ${r.change_scope ?? "any_change"}`
+                                : "—"}
                     </td>
                     <td className="px-4 py-2">
                       <SeverityBadge severity={r.severity} />

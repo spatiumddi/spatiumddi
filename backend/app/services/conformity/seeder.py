@@ -142,6 +142,24 @@ _BUILTIN_POLICIES: list[dict[str, object]] = [
             "classification": "internet_facing",
         },
     },
+    # ── VoIP voice segments (issue #112 phase 2) ────────────────────
+    {
+        "name": "Voice subnets must not be internet-facing",
+        "description": (
+            "Voice-VLAN subnets reaching the public internet directly "
+            "is almost always a misconfiguration — phone fleet traffic "
+            "should be inside a private VRF or NAT'd through the SBC. "
+            "Catches the case where an operator tagged a subnet as "
+            "voice but also flipped the internet-facing classification."
+        ),
+        "framework": "custom",
+        "reference": None,
+        "severity": "critical",
+        "target_kind": "subnet",
+        "target_filter": {"subnet_role": "voice"},
+        "check_kind": "voice_segment_not_internet_facing",
+        "check_args": {},
+    },
     # ── Platform integrity ──────────────────────────────────────────
     {
         "name": "Audit log is reachable and append-only",

@@ -13,12 +13,40 @@ import { HeaderButton } from "@/components/ui/header-button";
 import {
   vlansApi,
   ipamApi,
+  SUBNET_ROLE_LABELS,
   type Router,
   type VLAN,
   type Subnet,
+  type SubnetRole,
 } from "@/lib/api";
 import { copyToClipboard } from "@/lib/clipboard";
 import { cn, zebraBodyCls } from "@/lib/utils";
+
+/** Small pill rendering for ``Subnet.subnet_role`` (issue #112 phase
+ *  2). Voice gets a sky-blue accent so a fleet of voice VLANs is
+ *  easy to spot in the VLAN list. Other roles + null get muted /
+ *  neutral styling so they don't compete visually. */
+function SubnetRoleChip({ role }: { role: SubnetRole | null }) {
+  if (!role) return <span className="text-muted-foreground/60">—</span>;
+  const cls =
+    role === "voice"
+      ? "bg-sky-500/10 text-sky-700 dark:text-sky-300"
+      : role === "management"
+        ? "bg-violet-500/10 text-violet-700 dark:text-violet-300"
+        : role === "guest"
+          ? "bg-amber-500/10 text-amber-700 dark:text-amber-300"
+          : "bg-muted text-muted-foreground";
+  return (
+    <span
+      className={cn(
+        "inline-flex rounded px-1.5 py-0.5 text-[11px] font-medium",
+        cls,
+      )}
+    >
+      {SUBNET_ROLE_LABELS[role]}
+    </span>
+  );
+}
 import { useTableSort, SortableTh } from "@/lib/useTableSort";
 import {
   ContextMenu,
@@ -639,6 +667,7 @@ function VLANDetail({
               <tr>
                 <th className="text-left px-3 py-1.5">Network</th>
                 <th className="text-left px-3 py-1.5">Name</th>
+                <th className="text-left px-3 py-1.5">Role</th>
                 <th className="text-left px-3 py-1.5">Status</th>
               </tr>
             </thead>
@@ -646,7 +675,7 @@ function VLANDetail({
               {subnets.length === 0 && (
                 <tr>
                   <td
-                    colSpan={3}
+                    colSpan={4}
                     className="px-3 py-3 text-center text-muted-foreground italic"
                   >
                     No subnets reference this VLAN.
@@ -657,6 +686,9 @@ function VLANDetail({
                 <tr key={s.id} className="border-t">
                   <td className="px-3 py-1.5 font-mono">{s.network}</td>
                   <td className="px-3 py-1.5">{s.name || "—"}</td>
+                  <td className="px-3 py-1.5">
+                    <SubnetRoleChip role={s.subnet_role ?? null} />
+                  </td>
                   <td className="px-3 py-1.5 text-muted-foreground">
                     {s.status}
                   </td>

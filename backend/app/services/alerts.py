@@ -34,14 +34,14 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import structlog
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.alerts import AlertEvent, AlertRule
 from app.models.asn import ASN, ASNRpkiRoa
 from app.models.audit import AuditLog
 from app.models.circuit import Circuit
-from app.models.dhcp import DHCPScope, DHCPServer
+from app.models.dhcp import DHCPLease, DHCPScope, DHCPServer
 from app.models.dns import DNSServer, DNSZone
 from app.models.domain import Domain
 from app.models.ipam import IPAddress, IPBlock, Subnet
@@ -78,6 +78,12 @@ RULE_TYPE_SERVICE_RESOURCE_ORPHANED = "service_resource_orphaned"
 # without exploding into N near-identical rule_type rows.
 RULE_TYPE_COMPLIANCE_CHANGE = "compliance_change"
 RULE_TYPE_AUDIT_CHAIN_BROKEN = "audit_chain_broken"
+# Voice-VLAN client-count drop — issue #112 phase 2. Counts active
+# DHCP leases on every subnet tagged ``subnet_role='voice'``; fires
+# when the count drops below ``threshold_percent`` (reused as a raw
+# count threshold for this rule type — operators set it to e.g. 10
+# meaning "alert me when fewer than 10 phones are reachable").
+RULE_TYPE_VOICE_LEASE_COUNT_BELOW = "voice_lease_count_below"
 
 RULE_TYPES = frozenset(
     {
@@ -97,6 +103,7 @@ RULE_TYPES = frozenset(
         RULE_TYPE_SERVICE_RESOURCE_ORPHANED,
         RULE_TYPE_COMPLIANCE_CHANGE,
         RULE_TYPE_AUDIT_CHAIN_BROKEN,
+        RULE_TYPE_VOICE_LEASE_COUNT_BELOW,
     }
 )
 
@@ -216,6 +223,57 @@ async def _matching_subnet_subjects(
         message = (
             f"Subnet {display} utilisation {pct:.1f}% (threshold {threshold}%) — "
             f"{s.allocated_ips}/{s.total_ips} IPs allocated"
+        )
+        matches.append((str(s.id), display, message))
+    return matches
+
+
+async def _matching_voice_lease_count_below_subjects(
+    db: AsyncSession,
+    rule: AlertRule,
+) -> list[tuple[str, str, str]]:
+    """Voice-VLAN subnets where active-lease count has fallen below
+    ``rule.threshold_percent`` (re-used as a raw count threshold).
+
+    Useful for catching mass-disconnect events on a phone fleet — if
+    a switch / PoE upstream / SBC goes down, every phone drops its
+    lease and the count plummets. Operator picks the threshold per
+    deployment (typical: ~50% of expected fleet size).
+    """
+    threshold = int(rule.threshold_percent) if rule.threshold_percent is not None else 1
+    # Voice-tagged subnets only — `subnet_role='voice'` is the gate.
+    voice_subnets = list(
+        (await db.execute(select(Subnet).where(Subnet.subnet_role == "voice"))).scalars().all()
+    )
+    if not voice_subnets:
+        return []
+
+    # Count active leases per voice subnet. ``DHCPLease`` carries
+    # ``ip_address`` (INET) + ``state`` — we count rows whose IP is
+    # inside the subnet CIDR and state == 'active'. PostgreSQL's
+    # ``<<`` (contained-by-network) is the natural operator.
+    matches: list[tuple[str, str, str]] = []
+    for s in voice_subnets:
+        cidr = str(s.network) if s.network else None
+        if not cidr:
+            continue
+        # ``<<`` is the Postgres "is contained by" operator on inet /
+        # cidr types. The bind parameter is a plain string so we cast
+        # it explicitly with ``::cidr`` — without the cast asyncpg
+        # picks VARCHAR and Postgres rejects the operator.
+        count = (
+            await db.execute(
+                select(func.count(DHCPLease.id))
+                .where(DHCPLease.state == "active")
+                .where(text("ip_address << CAST(:c AS cidr)").bindparams(c=cidr))
+            )
+        ).scalar_one()
+        if int(count or 0) >= threshold:
+            continue
+        display = f"{s.network}" + (f" — {s.name}" if s.name else "")
+        message = (
+            f"Voice subnet {display} has {int(count or 0)} active lease(s) "
+            f"(threshold {threshold}) — possible mass-disconnect event"
         )
         matches.append((str(s.id), display, message))
     return matches
@@ -1358,6 +1416,10 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
 
             if rule.rule_type == RULE_TYPE_SUBNET_UTILIZATION:
                 base = await _matching_subnet_subjects(db, rule, settings)
+                matches = [(sid, disp, msg, None) for sid, disp, msg in base]
+                subject_type = "subnet"
+            elif rule.rule_type == RULE_TYPE_VOICE_LEASE_COUNT_BELOW:
+                base = await _matching_voice_lease_count_below_subjects(db, rule)
                 matches = [(sid, disp, msg, None) for sid, disp, msg in base]
                 subject_type = "subnet"
             elif rule.rule_type == RULE_TYPE_SERVER_UNREACHABLE:

@@ -39,6 +39,42 @@ last three releases retroactively.
 
 ### Added
 
+- **VoIP voice-segment metadata — Phase 2 (issue #112).** Flips
+  voice-VLAN tagging from passive UI labelling into a real audit
+  signal. Five additive surfaces:
+  - **`Subnet.subnet_role` enum column** — `data` / `voice` /
+    `management` / `guest` (NULL = unspecified). Pure metadata
+    — no Kea / BIND driver behaviour change. Migration
+    `f1a3b8c52d04` with a partial index over the column for
+    role-filter queries.
+  - **`voice_segment_not_internet_facing` conformity check** —
+    fails when a voice-tagged subnet is also flagged
+    `internet_facing` (almost always a misconfiguration —
+    phones should be inside a private VRF / NAT'd through the
+    SBC). Plus a built-in disabled seed policy. The conformity
+    target-filter resolver now also recognises
+    `subnet_role: <role>` so future policies can scope to any
+    network role.
+  - **`voice_lease_count_below` alert rule type** — counts
+    active DHCP leases on every voice-tagged subnet and fires
+    when the count drops below the operator's threshold (set
+    to ~50% of the expected fleet size to catch
+    mass-disconnect events without firing on routine reboots).
+    Reuses the existing `threshold_percent` column as a raw
+    count threshold for this rule type.
+  - **IPAM page role filter chips** — multi-select chips next
+    to the existing tag filter narrow the subnet tree to
+    selected roles. Empty selection = all roles (no filter).
+  - **VLAN page chip rendering** — the per-VLAN subnet table
+    grows a Role column with a sky-blue Voice chip,
+    violet Management chip, and amber Guest chip so an operator
+    can spot voice VLANs at a glance.
+  - Subnet edit/create modals get a Network role select inside
+    the existing Compliance classification section. 6 new
+    tests cover the conformity check (pass / fail /
+    not_applicable) and the alert evaluator (fires below
+    threshold / silent at threshold / ignores non-voice subnets).
+
 - **VoIP phone profiles — Phase 1 (issue #112).** Reusable
   vendor-class-fenced DHCP option recipes for VoIP phones. Three
   pieces ship together:
