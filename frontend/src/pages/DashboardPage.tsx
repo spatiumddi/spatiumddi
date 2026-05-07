@@ -2813,12 +2813,13 @@ function IntegrationsDashboardTabPanel() {
         <p className="mt-1 text-xs text-muted-foreground">
           Head to{" "}
           <Link
-            to="/settings"
+            to="/admin/features"
             className="text-primary underline underline-offset-2"
           >
-            Settings → Integrations
+            Features → Integrations
           </Link>{" "}
-          to wire up Kubernetes / Docker / Proxmox / Tailscale mirrors.
+          to wire up Kubernetes / Docker / Proxmox / Tailscale / UniFi
+          mirrors.
         </p>
       </div>
     );
