@@ -55,14 +55,17 @@ from app.drivers.dns.base import (
 logger = structlog.get_logger(__name__)
 
 
-# Record types PowerDNS-Authoritative supports natively. ALIAS + LUA
-# are deliberately omitted — those are Phase 3 work; surfacing them in
-# Phase 1 would let operators create records the rest of SpatiumDDI
-# can't yet handle.
+# Record types the PowerDNS driver supports. ALIAS landed in Phase
+# 3a — PowerDNS resolves the target at query time and serves an A /
+# AAAA, giving operators CNAME-at-apex without the BIND-side workaround.
+# LUA records (Phase 3b) and synthesised record families remain out
+# of scope for now; surfacing them here would let operators create
+# records the rest of SpatiumDDI can't yet handle.
 _SUPPORTED_RECORD_TYPES = frozenset(
     {
         "A",
         "AAAA",
+        "ALIAS",
         "CNAME",
         "MX",
         "TXT",
@@ -363,9 +366,9 @@ class PowerDNSDriver(DNSDriver):
             "incremental_updates": "rest_api",
             "zone_types": ["primary", "secondary"],
             "record_types": sorted(_SUPPORTED_RECORD_TYPES),
-            "alias_records": False,  # Phase 3
-            "lua_records": False,  # Phase 3
-            "catalog_zones": False,  # Phase 3
+            "alias_records": True,  # Phase 3a — landed
+            "lua_records": False,  # Phase 3b
+            "catalog_zones": False,  # Phase 3c
         }
 
 

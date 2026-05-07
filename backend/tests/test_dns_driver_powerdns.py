@@ -211,10 +211,15 @@ def test_validate_config_rejects_unsupported_record_types(zone: ZoneData) -> Non
         admin_email=zone.admin_email,
         serial=zone.serial,
         records=(
-            # ALIAS is a PowerDNS-only type but Phase 1 explicitly
-            # excludes it — it'll surface in Phase 3 with control-plane
-            # support.
-            RecordData(name="@", record_type="ALIAS", value="other.example.net.", ttl=300),
+            # LUA is a PowerDNS-only computed-record type that Phase 3a
+            # explicitly excludes — it'll surface in Phase 3b alongside
+            # the control-plane Lua-snippet editor.
+            RecordData(
+                name="@",
+                record_type="LUA",
+                value='A \'pickrandom({"10.0.0.1","10.0.0.2"})\'',
+                ttl=300,
+            ),
         ),
     )
     bundle = ConfigBundle(
@@ -232,7 +237,65 @@ def test_validate_config_rejects_unsupported_record_types(zone: ZoneData) -> Non
     )
     ok, errors = PowerDNSDriver().validate_config(bundle)
     assert ok is False
-    assert any("ALIAS" in e for e in errors)
+    assert any("LUA" in e for e in errors)
+
+
+def test_validate_config_accepts_alias_record(zone: ZoneData) -> None:
+    # Phase 3a — ALIAS lands as a first-class record type.
+    aliased = ZoneData(
+        name="example.com.",
+        zone_type="primary",
+        kind="forward",
+        ttl=zone.ttl,
+        refresh=zone.refresh,
+        retry=zone.retry,
+        expire=zone.expire,
+        minimum=zone.minimum,
+        primary_ns=zone.primary_ns,
+        admin_email=zone.admin_email,
+        serial=zone.serial,
+        records=(
+            RecordData(
+                name="@",
+                record_type="ALIAS",
+                value="lb.elsewhere.example.net.",
+                ttl=300,
+            ),
+        ),
+    )
+    bundle = ConfigBundle(
+        server_id=str(uuid.uuid4()),
+        server_name="pdns1",
+        driver="powerdns",
+        roles=("authoritative",),
+        options=ServerOptions(),
+        acls=(),
+        views=(),
+        zones=(aliased,),
+        tsig_keys=(),
+        blocklists=(),
+        generated_at=datetime(2026, 5, 7, 12, 0, tzinfo=UTC),
+    )
+    ok, errors = PowerDNSDriver().validate_config(bundle)
+    assert ok is True
+    assert errors == []
+
+
+def test_render_zone_file_emits_alias_apex(zone: ZoneData) -> None:
+    # ALIAS at apex is the canonical reason to use it — CNAME-at-apex
+    # is illegal per RFC 1034 §3.6.2 and PowerDNS's ALIAS resolves the
+    # target at query time and serves the resulting A / AAAA. The
+    # rendered API payload is identical in shape to a CNAME — the
+    # type discriminator is enough.
+    records = [
+        RecordData(name="@", record_type="ALIAS", value="lb.example.net.", ttl=60),
+    ]
+    out = PowerDNSDriver().render_zone_file(zone, records)
+    payload = json.loads(out)
+    rrsets = {(r["name"], r["type"]): r for r in payload["rrsets"]}
+    alias = rrsets[("example.com.", "ALIAS")]
+    assert alias["records"][0]["content"] == "lb.example.net."
+    assert alias["ttl"] == 60
 
 
 def test_validate_config_blocklists_are_warned_not_errored(
@@ -266,15 +329,19 @@ def test_validate_config_blocklists_are_warned_not_errored(
 # ── Capabilities ──────────────────────────────────────────────────────────
 
 
-def test_capabilities_phase_1_omits_views_rpz_dnssec_alias_lua() -> None:
+def test_capabilities_alias_landed_dnssec_lua_catalog_pending() -> None:
     caps = PowerDNSDriver().capabilities()
+    # Phase 3a — ALIAS landed.
+    assert caps["alias_records"] is True
+    assert "ALIAS" in caps["record_types"]
+    # Still pending: views (#24 cross-design), RPZ (recursor-only),
+    # online DNSSEC (Phase 3 work), LUA records (Phase 3b), catalog
+    # zones (Phase 3c).
     assert caps["views"] is False
     assert caps["rpz"] is False
     assert caps["dnssec_inline_signing"] is False
-    assert caps["alias_records"] is False
     assert caps["lua_records"] is False
     assert caps["catalog_zones"] is False
     assert caps["incremental_updates"] == "rest_api"
     assert "A" in caps["record_types"]
     assert "AAAA" in caps["record_types"]
-    assert "ALIAS" not in caps["record_types"]

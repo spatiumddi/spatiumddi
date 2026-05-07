@@ -82,6 +82,7 @@ VALID_ZONE_TYPES = {"primary", "secondary", "stub", "forward"}
 VALID_RECORD_TYPES = {
     "A",
     "AAAA",
+    "ALIAS",
     "CNAME",
     "MX",
     "TXT",
@@ -93,6 +94,14 @@ VALID_RECORD_TYPES = {
     "SSHFP",
     "NAPTR",
     "LOC",
+}
+
+# Record types only some drivers support. Used to gate at the create /
+# update boundary so operators get a clear 422 from the API instead
+# of a confusing apply failure later. Map: type → frozenset of drivers
+# whose backend can serve it.
+_DRIVER_GATED_RECORD_TYPES: dict[str, frozenset[str]] = {
+    "ALIAS": frozenset({"powerdns"}),
 }
 VALID_FORWARD_POLICIES = {"first", "only"}
 VALID_DNSSEC = {"auto", "yes", "no"}
@@ -2943,6 +2952,7 @@ async def create_zone_from_template(
                 status_code=500,
                 detail=f"Template {body.template_id} produced invalid record type {r['record_type']}",
             )
+        await _check_driver_gated_record_type(r["record_type"], group_id, db)
         fqdn = (f"{r['name']}.{zone.name}" if r["name"] != "@" else zone.name).rstrip(".") + "."
         rec = DNSRecord(
             zone_id=zone.id,
@@ -3283,6 +3293,7 @@ async def create_record(
 ) -> DNSRecord:
     zone = await _require_zone(group_id, zone_id, db)
     _reject_if_synthesised_zone(zone, "add records to")
+    await _check_driver_gated_record_type(body.record_type, group_id, db)
     fqdn = f"{body.name}.{zone.name}" if body.name != "@" else zone.name
 
     record = DNSRecord(
@@ -4038,6 +4049,38 @@ async def _require_zone(group_id: uuid.UUID, zone_id: uuid.UUID, db: DB) -> DNSZ
     if not zone:
         raise HTTPException(status_code=404, detail="Zone not found")
     return zone
+
+
+async def _check_driver_gated_record_type(record_type: str, group_id: uuid.UUID, db: DB) -> None:
+    """Reject driver-specific record types on groups whose servers
+    can't actually serve them.
+
+    Currently used for ALIAS (PowerDNS-only — Phase 3a). If any
+    server in the zone's group runs a driver outside the allow-set,
+    raise 422 so operators get a clear error up front rather than a
+    confusing per-server apply failure later. Empty groups (no
+    servers configured yet) pass — no one to disagree, and the gate
+    re-runs at apply time once a driver is known.
+    """
+    allowed = _DRIVER_GATED_RECORD_TYPES.get(record_type.upper())
+    if allowed is None:
+        return
+    res = await db.execute(select(DNSServer.driver).where(DNSServer.group_id == group_id))
+    drivers = {d for d in res.scalars().all() if d}
+    if not drivers:
+        return
+    incompatible = drivers - allowed
+    if incompatible:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"{record_type.upper()} records require every server in "
+                f"the zone's group to run one of {sorted(allowed)}; this "
+                f"group also has {sorted(incompatible)}. Move the zone "
+                f"to a {sorted(allowed)[0]}-only group or replace the "
+                f"record with a CNAME (off-apex) / explicit A+AAAA pair."
+            ),
+        )
 
 
 async def _require_record(

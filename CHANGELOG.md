@@ -68,6 +68,22 @@ visibility.
   pipeline adds a parallel ``build-dns-powerdns`` job alongside
   the existing ``build-dns`` (BIND9) so every tag publishes both
   images with ``:<version>`` and ``:latest`` tags.
+- **PowerDNS ALIAS records, Phase 3a (\#127).** ALIAS lands as a
+  first-class record type for zones served by a PowerDNS-only
+  server group. Resolves CNAME-at-apex (which RFC 1034 §3.6.2
+  forbids for CNAME) by having PowerDNS resolve the target at
+  query time and serve the resulting A / AAAA. Driver-aware gate
+  in the API: ``POST/PUT /dns/groups/{g}/zones/{z}/records`` and
+  the template-instantiation path return 422 if any server in the
+  group runs a driver other than ``powerdns`` — operators get a
+  clear error up front pointing at the move-to-powerdns-group
+  remediation, not a confusing per-server apply failure later.
+  PowerDNS driver's ``capabilities()["alias_records"]`` flips to
+  True; ``_SUPPORTED_RECORD_TYPES`` gains ALIAS and the validator
+  no longer rejects it. Frontend record-create modal includes
+  ALIAS in the type dropdown with a contextual violet info banner
+  that surfaces only when ALIAS is selected. LUA records (Phase
+  3b) and online DNSSEC (Phase 3c-or-later) still pending.
 - **PowerDNS frontend driver picker, Phase 2 (\#127).** Server
   create/edit modal grows ``PowerDNS (agent-managed)`` as a third
   option in the Driver dropdown alongside BIND9 and Windows DNS.

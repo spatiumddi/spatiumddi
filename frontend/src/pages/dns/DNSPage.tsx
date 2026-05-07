@@ -1471,6 +1471,7 @@ function ZoneModal({
 const RECORD_TYPES = [
   "A",
   "AAAA",
+  "ALIAS",
   "CNAME",
   "MX",
   "TXT",
@@ -1580,13 +1581,24 @@ function RecordModal({
                 ? "10.0.0.1"
                 : type === "CNAME"
                   ? "other.example.com."
-                  : type === "PTR"
-                    ? "host.example.com."
-                    : "record value"
+                  : type === "ALIAS"
+                    ? "lb.elsewhere.example.net."
+                    : type === "PTR"
+                      ? "host.example.com."
+                      : "record value"
             }
             required
           />
         </Field>
+        {type === "ALIAS" && (
+          <div className="rounded-md border border-violet-500/30 bg-violet-500/10 px-3 py-2 text-xs text-violet-800 dark:text-violet-300">
+            <strong>ALIAS:</strong> PowerDNS-only. The server resolves the
+            target at query time and serves the resulting A / AAAA, so this is
+            the canonical CNAME-at-apex (which RFC 1034 §3.6.2 forbids). The
+            zone must live in a server group whose every server runs the
+            PowerDNS driver; the API will return 422 otherwise.
+          </div>
+        )}
         <div className="grid grid-cols-2 gap-3">
           <Field label="TTL (leave blank for zone default)">
             <input
