@@ -69,7 +69,30 @@ prose with emoji section headings instead of a wall of forced
 
 A new `docs/deployment/TOPOLOGIES.md` documents six reference
 production topologies — single VM through HA cloud + on-prem
-hybrid — with ASCII diagrams + sizing notes.
+hybrid — with hand-authored SVG diagrams + sizing notes.
+
+Also in this release: a **BGP enrichment** surface
+(\#122) wiring RIPEstat (announced prefixes / prefix-overview /
+routing-history / as-overview, 6 h cache) and PeeringDB (`net`
+/ `netixlan`, 24 h cache) into REST + 5 MCP tools + an ASN-
+detail "BGP Footprint" tab; a **diagnostics** surface (\#123)
+that captures every uncaught Python exception from API + Celery
+into a new `internal_error` table with fingerprint dedup +
+Acknowledge / Suppress / Submit-bug flow; the **tags wave**
+(\#104) shipping `?tag=` filtering on every REST list endpoint
++ autocomplete + tag chips across IPAM / DNS / DHCP / Network
+modeling pages; **three new dashboard tabs** — Network /
+Integrations / Security (\#107 / \#108 / \#109) — plus
+Compliance + Conformity sub-tabs front-of-house; the
+**security wave continuation** with password policy (\#70),
+account lockout after N failed logins (\#71), active session
+viewer + force-logout (\#72), and tamper-evident audit chain
+hash + nightly verifier (\#73); two more Operator Copilot
+features — `ask_yes_no` tool with chat-suspend semantics
+(\#120) and the visible context chip + per-call default prompt
+prefill (\#119); plus a Gmail-style draggable + resizable
+Copilot bubble that lets operators keep the chat open while
+clicking around the rest of the app.
 
 ### Added
 
@@ -276,8 +299,9 @@ hybrid — with ASCII diagrams + sizing notes.
   when they're about to mutate state.
 
 - **Deployment topologies guide.** New `docs/deployment/
-  TOPOLOGIES.md` walks six production topologies with ASCII
-  diagrams + sizing notes: (1) single VM (homelab); (2) control
+  TOPOLOGIES.md` walks six production topologies with
+  hand-authored SVG diagrams + sizing notes: (1) single VM
+  (homelab); (2) control
   plane + separated DNS/DHCP appliances via the existing
   `docker-compose.agent-{dns,dhcp}.yml` files; (3) DNS + DHCP
   HA pairs (server groups + Kea HA); (4) HA control plane
@@ -291,6 +315,389 @@ hybrid — with ASCII diagrams + sizing notes.
   regions, multi-tenant control plane, read replicas as query
   routes). Cross-linked from `README.md`,
   `docs/deployment/DOCKER.md`, and `CLAUDE.md`'s doc map.
+
+- **Diagnostics — captured uncaught exceptions + admin viewer
+  + Submit-bug button (issue #123).** Replaces "tail docker
+  compose logs and hope you catch the traceback" with a
+  queryable surface. New `internal_error` table — 16 columns
+  with a fingerprint (sha256 of class + top-2 frames) for
+  dedup, `occurrence_count` + `last_seen_at` to bump noisy
+  crashes instead of inserting fresh rows, `acknowledged_by`
+  / `acknowledged_at` for ack state, `suppressed_until` for
+  the "silence this for a day" flow, plus indexes on
+  timestamp / service / fingerprint and a partial unacked
+  index. `app.services.diagnostics.capture` walks request
+  headers (`Authorization` / `Cookie` / `X-API-Token`
+  stripped) + payload bodies (anything matching
+  `password|secret|token|key|credential` redacted),
+  truncates bodies > 4 KB and the whole `context_json` blob
+  > 16 KB, then either bumps the matching fingerprint row or
+  inserts fresh. Async + sync entry points share the same
+  shape — async for FastAPI, sync for Celery. New
+  **Admin → Diagnostics → Errors** page lists rows
+  newest-first with per-row Acknowledge / Suppress (1h / 1d
+  / 1w) / Delete actions; **Submit-bug** button collects the
+  redacted traceback + context into a pre-filled GitHub-issue
+  template URL operators copy-paste into the tracker. Daily
+  prune sweep (`internal_error_prune` Celery beat task) drops
+  rows older than the configured retention window so the
+  table doesn't grow unbounded.
+
+- **BGP enrichment — RIPEstat + PeeringDB (issue #122).** The
+  control plane already tracked the *registry* side of an ASN
+  (WHOIS / RDAP holder + RPKI ROAs); this adds the
+  *routing-table* side. Three pieces:
+
+  * **RIPEstat client** — async httpx fetch for
+    `announced-prefixes` / `prefix-overview` / `routing-history`
+    / `as-overview`. 6 h in-process TTL cache. Soft-failure
+    shape (`{available: false, error: "..."}`) so operators
+    behind tight egress get a useful message instead of a
+    crashed page. PeeringDB 404 mapped to "not registered" not
+    "unreachable" (only ~30 k of ~80 k allocated 16-bit ASNs
+    have PeeringDB records).
+  * **PeeringDB client** — async httpx fetch for `net`
+    (registered network record) and `netixlan` (IXP
+    membership). 24 h TTL.
+  * **REST surface** — six endpoints under `/api/v1/bgp/*`
+    surfacing the normalised shapes (`announced-prefixes`,
+    `prefix-overview`, `routing-history`, `as-overview`,
+    `peeringdb-net`, `peeringdb-ixps`). Authenticated, not
+    RBAC-gated — the underlying data is public; the auth
+    requirement just keeps the cache from being abused by
+    anonymous traffic.
+  * **Five new MCP tools** for the Operator Copilot —
+    `bgp_announced_prefixes`, `bgp_prefix_overview`,
+    `bgp_routing_history`, `bgp_as_overview`,
+    `bgp_peeringdb_summary`. Default-enabled.
+  * **BGP Footprint tab** on the ASN detail page — three
+    stacked sections (announced prefixes filterable + capped
+    at 1000 with refine-the-filter hint, peering profile from
+    PeeringDB `net` with policy badge + IRR AS-set +
+    looking-glass + website, IXP presence from `netixlan`
+    grouped by IX + city with humanised speed). Private ASNs
+    (`kind=private`) skip the queries with a clear "no public
+    BGP footprint" empty state.
+
+- **Operator Copilot — `ask_yes_no` tool with chat-suspend
+  semantics (issue #120).** When the model needs a binary
+  answer ("continue with the deletion?", "include disabled
+  scopes?"), it calls a new `ask_yes_no` tool. The chat drawer
+  renders Yes / No buttons in place of the raw tool result;
+  the operator clicks one and the answer feeds the next user
+  turn — no typing, no extra round-trip burned on parsing
+  "yes please". Implemented via the existing `propose_*`
+  short-circuit pattern: tool returns a structured
+  `kind: "yes_no_question"` payload, orchestrator's round
+  loop short-circuits the moment that result lands (no
+  further LLM call this turn), frontend pattern-matches on
+  `kind` and renders a `YesNoCard`, click fires a normal user
+  message which resumes the loop on the next turn with the
+  answer in context.
+
+- **Operator Copilot — visible context chip + per-call
+  default prompt prefill (issue #119).** Operators reported
+  clicking "Ask AI about this …" affordances and seeing the
+  drawer open with a blank empty state. Two changes close the
+  perception gap: (a) **context chip** above the composer —
+  amber-tinted strip "Asking about: <one-line context>" with
+  a × button to drop the seed, so the operator sees what the
+  model is being told and can dismiss before sending; (b)
+  optional `prompt` prop on `AskAIButton` forwards into the
+  existing `askAI({ context, prompt })` plumbing so the
+  composer textarea pre-fills with a tailored default
+  question (operator can edit before sending — never
+  auto-sent). Wired per-resource at every call site (IPAM
+  subnet → "Tell me about this subnet — utilisation, recent
+  changes, …", DNS zone → records summary, DHCP scope →
+  pool / static / lease summary, alerts row → "Why did this
+  fire?", audit row → "What changed and who did it?", etc.).
+
+- **Tag-filter system + autocomplete + chips across the UI
+  (issue #104, multi-phase).** A platform-wide tag surface
+  that turns the existing `tags JSONB` column on every
+  resource into something operators can actually filter and
+  navigate by. Phases:
+
+  * **Phase 1 — `?tag=` filter on every REST list endpoint.**
+    Multi-tag AND/OR semantics via repeated `?tag=`
+    parameters. Applies across IPAM (spaces / blocks / subnets
+    / IPs), Network modeling (ASNs / VRFs / circuits /
+    services / overlays / customers / sites / providers),
+    plus the DNS / DHCP surfaces in Phase 4.
+  * **Phase 2 — autocomplete endpoints** at
+    `/api/v1/tags/autocomplete?prefix=…&kinds=…` returning the
+    union of distinct tags across the requested resource
+    kinds, ranked by occurrence count. Drives the chip
+    autocomplete in modals + filter bars.
+  * **Phase 3a — ASNs page** gets the tag-filter chip bar +
+    autocomplete first as the reference implementation.
+  * **Phase 3b — six remaining network-modeling pages**
+    (VRFs / circuits / services / overlays / customers /
+    sites / providers) gain the same chip-bar pattern.
+  * **Phase 4 — DNS + DHCP tags.** `tags JSONB` columns added
+    to `dns_zone` / `dns_record` / `dhcp_scope` / `dhcp_pool`
+    / `dhcp_static_assignment`; `?tag=` filter wired through
+    every DNS + DHCP REST list endpoint.
+  * **Phase 4b — DNS zones list + DHCP scopes list** render
+    tag chips inline.
+  * **Phase 5a — IPAM block-detail subnet list** renders tag
+    chips on every subnet row.
+  * **Phase 5b — SubnetDetail address table** renders tag
+    chips on every IP row.
+  * **Phase 5c — clickable tag pills on IPDetailModal** —
+    click any tag to navigate to a filtered IPAM view of every
+    resource carrying that tag.
+
+  Migration `b7e29c4f5d18_dns_dhcp_tags.py` adds the JSONB
+  columns + GIN indexes for fast `?tag=` lookups.
+
+- **Dashboard tabs — Network + Integrations + Security
+  (issues #107 / #108 / #109).** Three new dashboard tabs
+  alongside the existing Overview / IPAM / DNS / DHCP set,
+  each backed by a single rollup endpoint under a new
+  `/api/v1/dashboards/` package — one query per tab, one
+  refresh tick.
+
+  * **Network (#107)** — `/dashboards/network/summary`
+    aggregates ASN drift count + top-N drifted, RPKI ROA
+    expiring + expired, circuits past `term_end_date` +
+    suspended/decom (deduped into one alerts panel),
+    service-catalog rows with at least one orphan resource,
+    overlay networks impacted by any down circuit. 6 KPI
+    cards + 4 detail-list cards laid out 2×2, refresh every
+    60 s, click-throughs to the canonical pages.
+  * **Integrations (#108)** —
+    `/dashboards/integrations/summary` shows per-mirror
+    counts (K8s clusters / Docker hosts / Proxmox nodes /
+    Tailscale tenants / UniFi controllers) with last-sync
+    staleness + any reconciler error counts surfaced from
+    the audit log.
+  * **Security (#109)** — `/dashboards/security/summary`
+    surfaces account lockout state (locked accounts +
+    failures-in-window), active session count + sessions by
+    auth source, pending API token expirations, audit-chain
+    verification status (last verifier run + result), MFA
+    enrolment ratio across local users.
+
+- **Compliance + Conformity dashboard tabs.** Two more
+  sub-tabs on the main dashboard surfacing the existing
+  `compliance_change` (#105) + conformity-evaluations (#106)
+  work front-of-house instead of buried under `/admin`.
+  Compliance tab: three KPI cards for the classification
+  flag counts (PCI / HIPAA / internet-facing) +
+  click-through to `/admin/compliance`. Conformity tab:
+  per-framework status cards (PCI-DSS / HIPAA / SOC2) with
+  pass / warn / fail tallies + the latest auditor PDF
+  download link.
+
+- **Password policy enforcement (issue #70).** Configurable
+  complexity / history / max-age rules applied to every
+  local-auth password set. Seven new `platform_settings.
+  password_*` knobs (min length, per-class requirements
+  upper / lower / digit / symbol, history depth, max age in
+  days). Defaults are deliberately permissive so an upgrade
+  doesn't suddenly invalidate working passwords; operators
+  tighten in **Settings → Security → Password Policy**. Two
+  new `user.*` columns: `password_changed_at` (backfilled
+  to `created_at` for existing users) and
+  `password_history_encrypted` (Fernet over a JSON list of
+  prior bcrypt hashes, capped at the configured depth).
+  New `app.services.password_policy` module with pure
+  validate / history / max-age helpers — same code path on
+  self-service change, admin reset, create-user. Public
+  `GET /auth/password-policy` so the change-password form
+  renders rule hints client-side and shows ✓ as the user
+  types. Login flow flips `force_password_change` when an
+  existing user's password is older than
+  `password_max_age_days` (0 = off). Server returns
+  `{detail: {reason, errors[]}}` on policy / history
+  violation so the UI surfaces every failed rule in one
+  pass.
+
+- **Account lockout after N failed logins (issue #71).**
+  Windowed-counter lockout for local-auth users.
+  `user.failed_login_count` + `failed_login_locked_until` +
+  `last_failed_login_at` track rolling state; reset on any
+  successful login or via superadmin **POST
+  /users/{id}/unlock**. Three new
+  `platform_settings.lockout_*` knobs: threshold (0 disables
+  — default 0 so an upgrade never locks anyone out),
+  duration in minutes, rolling-window reset minutes. So 5
+  fails inside 15 min trips the lock; 1 fail every 16 min
+  never accumulates. Login flow short-circuits with HTTP 403
+  before checking the password while the lock is live, so an
+  attacker hitting a locked account doesn't learn whether
+  the candidate password would have worked.
+  `account.locked` + `account.unlocked` audit actions land
+  as distinct rows from the underlying failures.
+  External-IdP / RADIUS / TACACS+ users are unaffected —
+  rate-limited at the upstream provider, not here. Settings
+  surface: **Security → Account Lockout**; Users page shows
+  a "locked" pill + 🔓 unlock button on rows.
+
+- **Active session viewer + force-logout (issue #72).**
+  Every login + refresh already created a `UserSession`
+  row; this lands the live JWT registry the operator can
+  browse and revoke from. Access tokens now carry a `jti`
+  claim equal to the session row's UUID;
+  `get_current_user` looks up the session by `jti` on every
+  request and rejects when `revoked=True` or `expires_at`
+  has passed — so flipping `UserSession.revoked = True` 401s
+  the in-flight access token on its next call. Tokens
+  minted before this landing carry no `jti` and stay valid
+  until their short TTL expires (rolling-deploy compat).
+  `user_session.auth_source` mirrors the provider this
+  session was minted against (local / OIDC name / SAML name
+  / etc.) so the viewer shows "Logged in via Okta" without a
+  join. `last_seen_at` is bumped on each authenticated
+  request, throttled to 60 s per session. Composite
+  `(revoked, expires_at)` index covers the hot lookup path.
+  New `/api/v1/sessions` router: `GET /sessions/me` (current
+  user's sessions, any user), `GET /sessions` (all sessions,
+  superadmin), `POST /sessions/{id}/revoke` (any user
+  revoking their own; superadmin revoking anyone's). New
+  **Admin → Sessions** page lists active sessions with
+  per-row Force-logout button.
+
+- **Tamper-evident audit chain hash + nightly verifier
+  (issue #73).** Every `audit_log` row now carries `seq` +
+  `row_hash` + `prev_hash` so the audit trail forms a
+  verifiable chain — any post-hoc edit / insert / delete
+  leaves a detectable break. `seq` is `bigserial`; the
+  runtime hasher orders rows by `(timestamp, id)` and looks
+  up `prev_hash = row WHERE seq = MAX(seq)` inside a
+  Postgres transaction-scoped advisory lock so concurrent
+  inserts can't fork the chain. `row_hash = sha256(prev_hash
+  || canonical_json(row))` over every content column (id,
+  timestamp, who, what, state-change, correlation, result);
+  `seq` itself is NOT in the payload — chain position, not
+  content. Hooked into the global `before_flush` event so
+  every audit row goes through the same path (async or
+  Celery `task_session()`). DB-level `BEFORE DELETE`
+  trigger raises an exception so even a superuser can't
+  silently snip a row to "fix" a break. The migration
+  backfills the entire existing table in `(timestamp, id)`
+  order so the chain is contiguous from row 1 — operators
+  don't start over with a fresh chain on upgrade.
+  `app.services.audit_chain.verify_chain` walks the table
+  in `seq` order, recomputes each row's hash, and returns
+  the first break with `reason=row_hash_mismatch` (someone
+  edited content) or `reason=prev_hash_mismatch` (someone
+  deleted or inserted a row mid-stream). Beat-driven nightly
+  verifier writes the result to a metric for the new
+  `audit_log_immutable` conformity check kind to surface in
+  the auditor's PDF.
+
+- **Operator Copilot — Tool Catalog infrastructure + 10 new
+  tools (issue #101).** The catalog framework that the
+  later Tier 2-5 waves layered onto. New
+  `Tool.default_enabled: bool` flag on every registered tool
+  — niche / network-egress / write tools ship as `False`,
+  so operators opt in. New
+  `platform_settings.ai_tools_enabled: list[str] | None`
+  (migration `e5a18c40729b`): `NULL` = use registry
+  defaults; non-NULL = exactly these tools regardless of
+  declared default. Per-provider `AIProvider.enabled_tools`
+  continues to narrow further — both layers compose.
+  `effective_tool_names()` helper centralises the layering
+  so every code path (system-prompt builder, tool-schema
+  list to the LLM, registry dispatch gate) reads from one
+  source of truth. `ToolDisabled` exception + registry-side
+  gate so a hallucinating model that calls a disabled tool
+  gets a clear "ask your admin to enable this tool" error.
+  Plus 10 new tools landing alongside the catalog: `find_ip`
+  vendor enrichment from `oui_vendor`, `find_dhcp_leases`
+  vendor enrichment, `find_switchport`, `ping_host`,
+  `tls_cert_check`, `lookup_whois_*` trio, `query_logs`
+  inventory, plus a `help_write_permission` self-service
+  helper. **Admin → AI → Tools** page renders the catalog
+  with per-tool toggle + category grouping + write/read
+  badges.
+
+- **Operator Copilot — MAC vendor rollup tools + composer
+  history walk.** Two new read-only tools:
+  `count_devices_by_vendor` (vendor → count buckets with
+  optional substring filter) and `find_devices_by_vendor`
+  (the actual rows behind those counts), pulling from IPAM,
+  active DHCP leases, or the deduplicated union. Short-
+  circuit cleanly when OUI lookup is disabled in platform
+  settings. Default-enabled in the registry; show up
+  disabled for operators with an explicit allowlist saved
+  (the catalog never auto-adds new tools to a curated list
+  — that's the upgrade-safety contract). Plus chat composer
+  ↑/↓ now walks the full user-message history of the active
+  session, not just the last one — ↑ from an empty textarea
+  recalls the newest, subsequent ↑ steps older, ↓ steps
+  newer, ↓ past the newest returns to draft mode.
+
+- **Operator Copilot — resizable + draggable Gmail-style
+  bubble.** Replaced the right-edge full-height drawer with
+  a Gmail-compose-style bubble that doesn't block the page
+  behind it. Operators can keep the chat open while
+  clicking around IPAM / DNS / DHCP and drag it out of the
+  way. Defaults to 440 × 680 anchored to the lower-right
+  corner; position + size persist across close/reopen via
+  sessionStorage. Title bar is the drag handle (clicks on
+  buttons / inputs don't drag). Top-left corner carries a
+  resize handle. Min 320 × 320, max `viewport - 24px`,
+  clamped on every render so a stale geometry from a
+  different monitor never paints off-screen. Empty-state
+  prompt list switched from a flat 6×4-5 enumeration to a
+  category dropdown so the bubble doesn't have to scroll
+  forever.
+
+- **UniFi mirror — VLANs + Router on top of Phase 1.** The
+  reconciler now creates one `router` row per controller
+  and one `vlan` row per UniFi network with an 802.1Q tag,
+  then points each mirrored Subnet's `vlan_ref_id` (and the
+  denormalised integer `vlan_id`) at the matching VLAN. The
+  IPAM page's VLAN column lights up automatically; the
+  VLAN page shows each UniFi tag under a `<controller-name>`
+  Router. Lifecycle: Router is keyed by
+  `unifi_controller_id` (new cascade FK) — deleting a
+  controller cascades the Router and any VLANs that were
+  only ever attached via it. Migration
+  `c3e8b57a2f14_unifi_router_link.py` carries the new FKs.
+
+- **UniFi per-controller detail page.** Clicking a
+  controller name on the dashboard or the UniFi list page
+  now opens `/unifi/:id` — a focused dashboard for that one
+  controller. Reads from a new single-shot endpoint `GET
+  /unifi/controllers/{id}/dashboard` that joins the
+  controller header + every IPAM row owned by the
+  controller (subnets / addresses) + every VLAN under its
+  auto-created Router + the latest discovery snapshot in
+  one round-trip. Three tabs: Subnets / VLANs / Clients.
+
+- **UniFi panel on both dashboard surfaces.** Per
+  CLAUDE.md non-negotiable \#15 (new integrations show up
+  on the Dashboard — both surfaces): the
+  `IntegrationsPanel` inside the IPAM tab on the main
+  dashboard now lists UniFi as the fifth column alongside
+  Kubernetes / Docker / Proxmox / Tailscale (controller
+  name, mode-aware endpoint hint, "N sites · N nets" meta,
+  last-sync staleness dot); and the dedicated Integrations
+  dashboard tab's `/dashboards/integrations/summary` rollup
+  + `_INTEGRATION_RESOURCE_TYPES` registry now include
+  UniFi so reconciler error-audit rows surface in the
+  recent-errors list there too.
+
+- **Build agents emit BIND9 + Kea versions.** Both DNS and
+  DHCP agent Dockerfiles now write
+  `/etc/spatiumddi-versions` after `apk add` — a small
+  key=value file with `alpine_release` plus every installed
+  bind* / kea* package version. Format is grep-friendly +
+  sortable; the file ships in the image so operators can
+  `docker run --rm --entrypoint cat … /etc/spatiumddi-versions`
+  to confirm what's actually inside a given image tag (the
+  same image tag built three months apart could carry
+  different package minor versions depending on Alpine's
+  patch cycle). Release workflow's "Create GitHub Release"
+  job pulls the just-published images, reads the versions
+  file, and renders a "Bundled BIND9 / Kea versions"
+  section into the release body so operators chasing a CVE
+  can pin to the exact upstream patch level.
 
 - **Backup & restore — Phase 1 finale (issue #117).** Two
   end-of-Phase-1 polish items: tabbed Backup admin page +
@@ -826,6 +1233,40 @@ hybrid — with ASCII diagrams + sizing notes.
   `ip_block` / `ip_address`; `integration_unifi_enabled` column
   on `platform_settings`; seeds the `integrations.unifi`
   feature_module row at `enabled=False`.
+- `c3e8b57a2f14_unifi_router_link.py` — `unifi_controller_id`
+  cascade FK on `router` and `vlan` so the Phase 1+ UniFi mirror
+  can keep its VLAN + Router rows in lock-step with the
+  controller they came from.
+- `f3a8c2d491e7_password_policy.py` — seven
+  `platform_settings.password_*` columns + two `user.*` columns
+  (`password_changed_at` backfilled to `created_at`,
+  `password_history_encrypted` Fernet-wrapped JSON). Issue #70.
+- `a7b3c8d92e14_account_lockout.py` — three `user.*` columns
+  (`failed_login_count`, `failed_login_locked_until`,
+  `last_failed_login_at`) + three
+  `platform_settings.lockout_*` columns. Defaults to lockout
+  disabled (threshold=0). Issue #71.
+- `c8e4f7a91d36_session_viewer.py` — `auth_source`,
+  `last_seen_at`, `revoked` columns on `user_session` + composite
+  `(revoked, expires_at)` index. Issue #72.
+- `d92f4a18c763_audit_chain_hash.py` — `seq` (bigserial) +
+  `prev_hash` + `row_hash` columns on `audit_log` plus the
+  `BEFORE DELETE` trigger that raises an exception. Backfills
+  the entire existing table in `(timestamp, id)` order so the
+  chain is contiguous from row 1. Issue #73.
+- `c7e9d4f81a26_internal_error_table.py` — new `internal_error`
+  table for captured uncaught exceptions (issue #123). 16
+  columns including `fingerprint` for dedup,
+  `occurrence_count` for noisy-crash bumping, ack + suppress
+  state.
+- `b7e29c4f5d18_dns_dhcp_tags.py` — `tags JSONB` columns on
+  `dns_zone` / `dns_record` / `dhcp_scope` / `dhcp_pool` /
+  `dhcp_static_assignment` + GIN indexes for fast `?tag=`
+  filter lookups. Issue #104 Phase 4.
+- `e5a18c40729b_ai_tool_catalog.py` — `ai_tools_enabled
+  list[str] | None` column on `platform_settings`. NULL = use
+  registry defaults; non-NULL = exactly these tools. Drives the
+  Tool Catalog page. Issue #101.
 
 ### Fixed
 
@@ -836,6 +1277,103 @@ hybrid — with ASCII diagrams + sizing notes.
   Switched to a solid `bg-card` (matches the surrounding card
   chrome) and added `z-10` so the header floats above the
   scrolled rows reliably.
+- **PeeringDB 404 → "not registered" not "unreachable".**
+  PeeringDB returns HTTP 404 when an ASN simply isn't
+  registered there — only ~30 k of the ~80 k allocated 16-bit
+  ASNs have PeeringDB records, so a 404 is the common case for
+  any AS that isn't a content provider, transit, or large
+  eyeball network. The previous client treated every
+  `HTTPError` as "upstream unreachable", surfacing this
+  misleading message in the BGP Footprint tab on AS15318 (and
+  any other AS without a PeeringDB record). 404 is now its
+  own branch with a clear "no PeeringDB record" empty state.
+  Cached at the same TTL as the success path so we don't
+  re-query on every page load.
+- **Frontend BGP query staleTime — 24 h → 60 s.** The backend
+  already caches RIPEstat for 6 h and PeeringDB for 24 h
+  in-process, so the source of truth for "how stale is this
+  data" lives there. Mirroring those windows on the frontend
+  meant a manual page refresh after a ROA change wouldn't
+  re-fetch for hours. Frontend stale window dropped to 60 s
+  so refresh-on-tab-focus does the right thing; the backend's
+  TTL cache still absorbs the volume.
+- **Conformity PDF export — fetch as blob, not
+  `window.open`.** `window.open` made a fresh browser
+  navigation that didn't carry the JWT (axios holds it in
+  memory, not as a cookie), so the API correctly replied
+  HTTP 401 and the operator saw a blank tab. Mirrored the
+  IPAM `exportFile` pattern: fetch the PDF via the
+  authenticated axios client with `responseType: "blob"`,
+  parse the backend's `Content-Disposition` for the UTC-
+  timestamped filename, trigger a synthetic anchor click for
+  the download. Both call sites updated — the top-of-page
+  "Export PDF" button and the per-framework download icon
+  inside `FrameworkCard`.
+- **`IPSpacePicker` quick-create no longer closes the parent
+  modal.** Two stacked bugs made the "+ New" IP space shortcut
+  inside the integration endpoint modals (UniFi / Proxmox /
+  Docker / Kubernetes / Tailscale / DeviceFormModal) close the
+  parent modal AND silently fail to create the space:
+  (1) the shared `Modal` rendered inline in the DOM so the
+  inner `QuickCreateSpaceModal` `<form>` ended up nested
+  inside the parent modal's `<form>`, the HTML parser silently
+  drops nested form tags, the inner submit button got
+  re-associated with the OUTER form; (2) even with the inner
+  form re-established via a portal, React's synthetic submit
+  event bubbles through the React component tree regardless
+  of DOM hierarchy. Fix: portal the Modal to `<body>` AND
+  `stopPropagation` on the inner submit handler.
+- **Operator Copilot — second message vanishes from drawer
+  on stream error (issue #121).** Operators reported their
+  second-and-later chat turn occasionally disappearing from
+  the drawer with no error message. The user message *is*
+  committed to the DB before the LLM stream starts so nothing
+  was actually lost — the disappearance was purely a display
+  race in the drawer. Two issues compounded: (1)
+  `sendMut.onSettled` cleared `pendingUserMessage` on every
+  completion, including stream errors; the optimistic echo
+  vanished before the React Query refetch could land the
+  persisted version. (2) `StreamingBubble` was gated on
+  `sendMut.isPending`; once the mutation settled, the bubble
+  unmounted, taking the inline error message with it. Fix
+  splits the lifecycle — `mutationFn` returns
+  `{ sessionId, error }` so `onSuccess` can preserve the
+  optimistic echo until the real refetch lands; the inline
+  error sticks on a separate state that isn't gated on
+  `isPending`.
+- **UniFi reconciler — three crash-loop fixes.** Phase-0
+  cleanup pass restored after a container-sync round-trip
+  overwrote it (the dedup logic in `_apply_addresses` got
+  silently lost when black-in-container synced an older copy
+  back to the host). Made `_UnifiSite` a frozen dataclass so
+  it gains `__hash__` — without it, every reconcile pass
+  crashed with `unhashable type: '_UnifiSite'` because the
+  reconciler keys `site_to_networks` + `site_to_clients` by
+  it, and zero IPAM rows were ever created. Cross-subnet IP
+  collision: `_apply_addresses` blew up the entire UniFi
+  sweep with `uq_ip_address_subnet_address` when a
+  unifi-owned row at IP X had to be moved into a subnet that
+  already held a non-unifi-owned row at the same IP (typical
+  source: SNMP discovery wrote the IP in whatever subnet
+  currently enclosed it before a route shifted) — added two
+  pre-checks (move path + insert path) that drop the
+  unifi-owned source row + append a warning to the summary
+  instead of crashing the sweep.
+- **VoIP phone icon tooltip on IPAM table + DHCP lease
+  list.** Hover-text was already on the IP detail modal but
+  missing from the two table renderings. Wrap the Phone icon
+  in a span with a title that reads "VoIP phone — <vendor>"
+  (or just "VoIP phone" when the vendor is null) so operators
+  can confirm at a glance which curated vendor lit up the
+  flag without opening the row.
+- **Network role select moved onto the subnet General tab.**
+  Operators routinely tag subnets with a network role (most
+  subnets get one), unlike PCI / HIPAA / internet-facing
+  flags which are infrequent. Burying the select inside the
+  Compliance section on the Advanced tab made it
+  discoverable mainly to operators who already knew it was
+  there. Lifted out of `ClassificationSection` into a
+  standalone `NetworkRoleField` rendered on the General tab.
 - **Backup restore — alembic upgrade fails when alembic_version
   drifts inside the dump.** Real-world failure mode: a backup
   taken at a moment when the live install's alembic_version was

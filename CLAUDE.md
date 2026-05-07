@@ -48,7 +48,7 @@ Always read the relevant spec doc(s) before writing code for a feature area.
 | `docs/deployment/APPLIANCE.md` | OS appliance build, base OS selection, licensing |
 | `docs/deployment/DNS_AGENT.md` | DNS agent/container architecture — image layout, auto-registration, config sync, K8s shape |
 | `docs/deployment/DOCKER.md` | Docker Compose setup, ports, first-time setup, TLS, HA, password reset |
-| `docs/deployment/TOPOLOGIES.md` | Six reference deployment topologies — single VM, separated agents, DNS+DHCP HA, HA control plane (Patroni / Redis Sentinel), hybrid cloud, K8s — with ASCII diagrams + sizing notes |
+| `docs/deployment/TOPOLOGIES.md` | Six reference deployment topologies — single VM, separated agents, DNS+DHCP HA, HA control plane (Patroni / Redis Sentinel), hybrid cloud, K8s — with SVG diagrams + sizing notes |
 | `docs/deployment/KUBERNETES.md` | Helm chart, operators, HPA, Ingress |
 | `docs/deployment/BAREMETAL.md` | Ansible playbooks, systemd services, Patroni |
 | `docs/deployment/WINDOWS.md` | Windows Server prerequisites — WinRM, service accounts (DnsAdmins / DHCP Users), firewall, zone dynamic-updates; shared by Windows DNS + Windows DHCP |

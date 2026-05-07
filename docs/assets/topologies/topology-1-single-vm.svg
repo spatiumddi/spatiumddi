@@ -1,0 +1,99 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="920" height="420" viewBox="0 0 920 420"
+     preserveAspectRatio="xMidYMid meet"
+     font-family="ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif">
+  <defs>
+    <linearGradient id="t1-host" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#f1f5f9"/>
+      <stop offset="100%" stop-color="#e2e8f0"/>
+    </linearGradient>
+    <linearGradient id="t1-api" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#8b5cf6"/>
+      <stop offset="100%" stop-color="#6d28d9"/>
+    </linearGradient>
+    <linearGradient id="t1-worker" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#a78bfa"/>
+      <stop offset="100%" stop-color="#7c3aed"/>
+    </linearGradient>
+    <linearGradient id="t1-store" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#34d399"/>
+      <stop offset="100%" stop-color="#059669"/>
+    </linearGradient>
+    <linearGradient id="t1-agent" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#fb923c"/>
+      <stop offset="100%" stop-color="#ea580c"/>
+    </linearGradient>
+    <linearGradient id="t1-volume" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#22d3ee"/>
+      <stop offset="100%" stop-color="#0891b2"/>
+    </linearGradient>
+  </defs>
+
+  <!-- VM host -->
+  <rect x="20" y="20" width="880" height="380" rx="16"
+        fill="url(#t1-host)" stroke="#94a3b8" stroke-width="2"/>
+  <text x="40" y="56" font-size="18" font-weight="600" fill="#0f172a">vm-spatium.lab.local</text>
+  <text x="40" y="78" font-size="12" fill="#475569">4 vCPU · 8 GB · 50 GB SSD — supports ~5,000 IPs / 50 subnets / 50 zones</text>
+
+  <!-- Compose stack outline -->
+  <rect x="40" y="100" width="840" height="240" rx="12"
+        fill="#ffffff" stroke="#cbd5e1" stroke-dasharray="4 4" stroke-width="1.5"/>
+  <text x="60" y="124" font-size="13" font-weight="600" fill="#334155">docker-compose.yml — single host</text>
+
+  <!-- Web tier: api / worker / beat / frontend / migrate -->
+  <g>
+    <rect x="64" y="148" width="120" height="64" rx="8" fill="url(#t1-api)"/>
+    <text x="124" y="180" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">api</text>
+    <text x="124" y="200" text-anchor="middle" font-size="11" fill="#ddd6fe">FastAPI</text>
+  </g>
+  <g>
+    <rect x="200" y="148" width="120" height="64" rx="8" fill="url(#t1-worker)"/>
+    <text x="260" y="180" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">worker</text>
+    <text x="260" y="200" text-anchor="middle" font-size="11" fill="#ddd6fe">Celery</text>
+  </g>
+  <g>
+    <rect x="336" y="148" width="120" height="64" rx="8" fill="url(#t1-worker)"/>
+    <text x="396" y="180" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">beat</text>
+    <text x="396" y="200" text-anchor="middle" font-size="11" fill="#ddd6fe">Scheduler</text>
+  </g>
+  <g>
+    <rect x="472" y="148" width="120" height="64" rx="8" fill="url(#t1-api)"/>
+    <text x="532" y="180" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">frontend</text>
+    <text x="532" y="200" text-anchor="middle" font-size="11" fill="#ddd6fe">nginx + Vite</text>
+  </g>
+  <g>
+    <rect x="608" y="148" width="120" height="64" rx="8" fill="#64748b"/>
+    <text x="668" y="180" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">migrate</text>
+    <text x="668" y="200" text-anchor="middle" font-size="11" fill="#cbd5e1">alembic</text>
+  </g>
+
+  <!-- Stores + agents -->
+  <g>
+    <rect x="64" y="244" width="180" height="64" rx="8" fill="url(#t1-store)"/>
+    <text x="154" y="276" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">postgres</text>
+    <text x="154" y="296" text-anchor="middle" font-size="11" fill="#bbf7d0">primary write source</text>
+  </g>
+  <g>
+    <rect x="260" y="244" width="140" height="64" rx="8" fill="url(#t1-store)"/>
+    <text x="330" y="276" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">redis</text>
+    <text x="330" y="296" text-anchor="middle" font-size="11" fill="#bbf7d0">cache · broker</text>
+  </g>
+  <g>
+    <rect x="416" y="244" width="160" height="64" rx="8" fill="url(#t1-agent)"/>
+    <text x="496" y="276" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">bind9</text>
+    <text x="496" y="296" text-anchor="middle" font-size="11" fill="#fed7aa">DNS — :53 udp/tcp</text>
+  </g>
+  <g>
+    <rect x="592" y="244" width="160" height="64" rx="8" fill="url(#t1-agent)"/>
+    <text x="672" y="276" text-anchor="middle" font-size="14" font-weight="600" fill="#ffffff">kea-dhcp</text>
+    <text x="672" y="296" text-anchor="middle" font-size="11" fill="#fed7aa">DHCP — :67 udp</text>
+  </g>
+
+  <!-- Backup volume -->
+  <g>
+    <rect x="40" y="354" width="840" height="34" rx="6" fill="url(#t1-volume)" opacity="0.85"/>
+    <text x="60" y="376" font-size="12" font-weight="500" fill="#ffffff">
+      Backup: local_volume → /var/lib/spatiumddi/backups (named volume)  ·  or remote — S3 / SCP / Azure / SMB / FTP / GCS / WebDAV
+    </text>
+  </g>
+</svg>

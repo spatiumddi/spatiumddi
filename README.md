@@ -95,7 +95,7 @@
 
 | | Feature | Highlights |
 |---|---|---|
-| 🌐 | **ASN management** | first-class ASN entity · RDAP holder refresh (per-RIR routing via IANA bootstrap) · RPKI ROA pull (Cloudflare or RIPE) with expiry tracking · holder-drift detection with side-by-side diff · alert rules for drift / unreachable / ROA expiry |
+| 🌐 | **ASN management** | first-class ASN entity · RDAP holder refresh (per-RIR routing via IANA bootstrap) · RPKI ROA pull (Cloudflare or RIPE) with expiry tracking · holder-drift detection with side-by-side diff · alert rules for drift / unreachable / ROA expiry · **BGP Footprint tab** with RIPEstat (announced prefixes / prefix-overview / routing history) + PeeringDB (peering profile / IXP presence) — REST + 5 MCP tools · in-process TTL cache (RIPEstat 6 h, PeeringDB 24 h) |
 | 🤝 | **BGP peering + communities** | peer / customer / provider / sibling graph between tracked ASNs · BGP communities catalog (RFC 1997 / 7611 / 7999 well-knowns + per-AS extensions, large communities per RFC 8092) |
 | 🛣 | **VRFs as first-class** | name / RD / import + export RTs / optional ASN linkage · cross-cutting RD/RT validator (warns or 422s on ASN-portion mismatch) · VRF picker on IPSpace + IPBlock modals · auto-backfill from existing freeform fields |
 | 📛 | **Domain registration tracking** | distinct from DNSZone — registrar / registrant / expiry / nameservers / DNSSEC · RDAP refresh (TLD → RDAP-base via IANA bootstrap) · NS-drift, registrar-changed, DNSSEC-status-changed alerts · explicit `dns_zone.domain_id` linkage with sub-zone tree fallback |
@@ -112,7 +112,7 @@
 | 🎯 | **Nmap scanner** | per-IP / per-subnet (CIDR sweep) / `/tools/nmap` · live SSE streaming · stamp alive hosts → IPAM |
 | 🛰 | **Device profiling** | passive DHCP fingerprinting (scapy + fingerbank) **and** opt-in auto-nmap on new DHCP lease — what kind of device is on every IP |
 | 🏷 | **OUI vendor lookup** | MAC → vendor names in IP tables, DHCP leases, search filters |
-| 🎨 | **Dashboards** | utilization heatmap · DNS query rate · DHCP traffic · platform health card |
+| 🎨 | **Dashboards** | nine sub-tabs — **Overview / IPAM / DNS / DHCP / Network / Integrations / Security / Compliance / Conformity** — each backed by a single rollup endpoint under `/api/v1/dashboards/`, refreshed every 60 s · utilization heatmap · DNS query rate · DHCP traffic · ASN drift + RPKI ROA expiry · circuit alerts · service-catalog orphans · per-mirror integration counts · account lockout state + active sessions + audit-chain verification · platform health card |
 | 📊 | **Platform Insights** | native Postgres diagnostics + per-container CPU / mem / IO. No extra agents |
 
 ### 🔌 Integrations (read-only mirrors)
@@ -130,11 +130,14 @@
 |---|---|---|
 | 🔒 | **RBAC + external auth** | LDAP · OIDC · SAML · RADIUS · TACACS+ with backup-server failover · API tokens with auto-expiry · scoped API tokens (per-permission) |
 | 🛡 | **TOTP MFA** | local-user 2FA — QR enrolment via `pyotp` + `qrcode` · single-use backup codes · admin force-disable per user (audit-logged) |
+| 🔐 | **Local-auth hardening** | configurable **password policy** (min length · per-class complexity · history depth · max-age) · **account lockout** after N failed logins inside a rolling window (default off; opt-in in Settings) · **active session viewer + force-logout** at `/admin/sessions` — every login carries a `jti` claim that resolves to a `UserSession` row, flip `revoked=True` to 401 the in-flight token on its next call |
 | 🏷 | **Subnet classification tags** | `pci_scope` · `hipaa_scope` · `internet_facing` first-class boolean columns on every subnet · indexed predicates · compliance roll-up card on Platform Insights · feeds the compliance-change alert + conformity policy filters |
 | 🤖 | **Operator Copilot (AI)** | grounded chat over your live IPAM / DNS / DHCP / Network data — multi-vendor (OpenAI / Anthropic / Azure OpenAI / Gemini / OpenAI-compat for Ollama, vLLM, etc.) with automatic failover · **91 tools** spanning IPAM, DNS (records / pools / blocklists / views), DHCP (pools / statics / classes / option templates / PXE / MAC blocks), network modeling (ASNs / VRFs / circuits / services / overlays / domains), ownership (customers / sites / providers), admin (users / groups / roles), integration mirrors (K8s / Docker / Proxmox / Tailscale / UniFi), observability (DNS query / DHCP activity / metrics / global search), and Apply-gated write proposals (`propose_create_ip_address` / `propose_create_dns_record` / `propose_create_dhcp_static` / `propose_create_alert_rule` / `propose_run_nmap_scan` / `propose_archive_session`) · MCP HTTP endpoint for Claude Desktop / Cursor / Cline · "Ask AI about this" affordances on every resource · per-provider editable system prompt · per-provider tool allowlist · OUI vendor enrichment baked in · live nmap results in chat · per-message token / latency footer · Markdown + GFM tables in replies · daily digest |
 | 🔔 | **Alerts + forwarding** | rule-based alerts · `compliance_change` rule type (PCI / HIPAA / internet-facing audit-log scanner with 24 h auto-resolve, three disabled seed rules) · multi-target syslog (RFC 5424 / CEF / LEEF / RFC 3164) · HTTP webhooks · SMTP email · Slack / Teams / Discord chat |
 | 📑 | **Conformity evaluations** | declarative policy library scheduled against PCI-DSS / HIPAA / SOC2 frameworks · 6 starter check kinds (`has_field` · `in_separate_vrf` · `no_open_ports` · `alert_rule_covers` · `last_seen_within` · `audit_log_immutable`) · 8 disabled seed policies, opt-in toggle · pass→fail transitions emit alert events · auditor-facing PDF export with SHA-256 integrity hash · `Auditor` + `Compliance Editor` builtin roles |
 | 🪝 | **Typed-event webhooks** | 96 typed events (resource × verb) · HMAC-SHA256 signed · outbox-backed retry with backoff + dead-letter |
+| 🐛 | **Diagnostics — captured uncaught exceptions** | every uncaught Python exception across API + Celery lands in a queryable `internal_error` table with **fingerprint dedup** (sha256 of class + top-2 frames), occurrence counter, last-seen-at bumping, redaction of headers + secret-shaped payload fields, `context_json` blob capped at 16 KB · admin viewer at `/admin/diagnostics/errors` with Acknowledge / Suppress (1 h / 1 d / 1 w) / Delete / **Submit-bug** (pre-filled GitHub-issue template URL) actions · daily prune sweep against the configured retention window |
+| 🏷 | **Platform-wide tags + filter** | `tags JSONB` columns across IPAM (spaces / blocks / subnets / IPs) · Network modeling (ASNs / VRFs / circuits / services / overlays / customers / sites / providers) · DNS (zones / records) · DHCP (scopes / pools / statics) · `?tag=` filter on every REST list endpoint with multi-tag AND/OR semantics · `/api/v1/tags/autocomplete` ranked by occurrence · tag chips on every list view + clickable pills on the IP detail modal that navigate to a filtered IPAM view |
 | 🔐 | **ACME DNS-01** | `acme-dns`-compatible — certbot / lego / acme.sh issue public certs (wildcards included) |
 | 📋 | **Audit log** | every mutation logged, append-only, filterable in the UI · **tamper-evident SHA-256 hash chain** — every row carries `seq` + `prev_hash` + `row_hash`; verifier walks the table, re-hashes, and pinpoints the first break |
 | 🗑 | **Soft-delete + 30-day Trash** | spaces / blocks / subnets / DNS zones / DNS records / DHCP scopes are recoverable for 30 days · cascade restore via `deletion_batch_id` (one click brings a subnet's DHCP scopes back together) · global ORM filter hides soft-deleted rows by default · nightly `trash_purge` Celery task hard-deletes past the retention window |
@@ -348,7 +351,7 @@ The tables above are the elevator pitch. The bullets here are the same surface w
   - Default-off everywhere — IDS-aware (nmap is loud; passive collection
     needs `cap_add: NET_RAW`)
 
-- 🎨 **Dashboard-at-a-glance** — sub-tabs for Overview / IPAM / DNS / DHCP.
+- 🎨 **Dashboard-at-a-glance** — nine sub-tabs: Overview / IPAM / DNS / DHCP / **Network** (ASN drift + RPKI expiry + circuit alerts + service orphans) / **Integrations** (per-mirror counts + last-sync staleness) / **Security** (lockout state + active sessions + audit-chain status + MFA enrolment) / **Compliance** (PCI / HIPAA / internet-facing flag counts) / **Conformity** (per-framework status + auditor PDF download).
   - Platform health card (API / Postgres / Redis / workers / beat)
   - Live DNS query rate + DHCP traffic charts — self-contained, no Prometheus needed
     - Sources: BIND9 statistics-channels + Kea `statistic-get-all`
@@ -743,7 +746,7 @@ Full docs at **[spatiumddi.github.io](https://spatiumddi.github.io)** (coming so
 | [Auth & Permissions](docs/features/AUTH.md) | LDAP, OIDC, SAML, RADIUS, TACACS+, roles, scoped permissions |
 | [System Admin](docs/features/SYSTEM_ADMIN.md) | Health dashboard, backup, notifications |
 | [Observability](docs/OBSERVABILITY.md) | Logging, metrics, alerting |
-| [Deployment Topologies](docs/deployment/TOPOLOGIES.md) | Six reference topologies — single VM through HA cloud + on-prem hybrid — with ASCII diagrams |
+| [Deployment Topologies](docs/deployment/TOPOLOGIES.md) | Six reference topologies — single VM through HA cloud + on-prem hybrid — with diagrams |
 | [Windows Server Setup](docs/deployment/WINDOWS.md) | WinRM, service accounts, firewall — Windows-side checklist |
 | [DNS Agent Design](docs/deployment/DNS_AGENT.md) | Agent protocol, auto-registration, config sync |
 | [DNS Driver Spec](docs/drivers/DNS_DRIVERS.md) | BIND9 + Windows DNS driver internals |

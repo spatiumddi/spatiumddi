@@ -42,25 +42,9 @@ config locally — non-negotiable #5 in `CLAUDE.md`.
 Everything in one Docker Compose stack. This is the default
 `make up` target and what most homelab installs run.
 
-```
-┌────────────────────────────────────────────────────────────────────┐
-│  vm-spatium.lab.local         (4 vCPU / 8 GB / 50 GB SSD)          │
-│                                                                    │
-│   ┌─────────────────────────────────────────────────────────┐      │
-│   │  docker-compose.yml                                     │      │
-│   │  ┌──────┐  ┌────────┐  ┌──────┐  ┌────────┐  ┌────────┐ │      │
-│   │  │ api  │  │ worker │  │ beat │  │frontend│  │migrate │ │      │
-│   │  └──┬───┘  └────┬───┘  └───┬──┘  └────────┘  └────┬───┘ │      │
-│   │     │           │          │                       │     │      │
-│   │  ┌──▼───────────▼──────────▼───────────────────────▼──┐ │      │
-│   │  │  postgres      redis      bind9      kea-dhcp     │ │      │
-│   │  └────────────────────────────────────────────────────┘ │      │
-│   └─────────────────────────────────────────────────────────┘      │
-│                                                                    │
-│   Backup: local_volume → /var/lib/spatiumddi/backups (named vol)   │
-│           or remote — S3 / SCP / Azure / etc.                      │
-└────────────────────────────────────────────────────────────────────┘
-```
+<p align="center">
+  <img src="../assets/topologies/topology-1-single-vm.svg" alt="Topology 1 — Single VM" width="900"/>
+</p>
 
 **Pros:** simplest to run, fastest to bring up, single backup unit.
 **Cons:** every service shares one host. A noisy neighbor (e.g. a DHCP
@@ -78,31 +62,9 @@ The shape most production deployments reach for first. Control plane
 on its own VM; DNS and DHCP agents on dedicated, network-edge
 machines. Agents long-poll the control plane's API.
 
-```
-                            Operators / API consumers
-                                       │
-                              ┌────────▼────────┐
-                              │   nginx / LB    │
-                              └────────┬────────┘
-                                       │
-┌──────────────────────────────────────▼──────────────────────────────┐
-│  vm-spatium-cp.corp.local        (control plane — 4 vCPU / 8 GB)    │
-│  api · worker · beat · frontend · postgres · redis · migrate         │
-│                                                                      │
-│  exposes: 8000 (api) / 80 (frontend) / 443 (LB-terminated)           │
-└────┬─────────────────────────────────────────────────────────┬───────┘
-     │ long-poll /api/v1/dns/agents/config (ETag)              │
-     │ long-poll /api/v1/dhcp/agents/config (ETag)             │
-     │                                                         │
-┌────▼──────────────────────┐                  ┌───────────────▼──────┐
-│  vm-dns.corp.local        │                  │  vm-dhcp.corp.local  │
-│   docker-compose          │                  │   docker-compose     │
-│   .agent-dns.yml          │                  │   .agent-dhcp.yml    │
-│                           │                  │                      │
-│   bind9 + dns-agent       │                  │   kea + dhcp-agent   │
-│   :53 udp/tcp             │                  │   :67 udp (DHCP)     │
-└───────────────────────────┘                  └──────────────────────┘
-```
+<p align="center">
+  <img src="../assets/topologies/topology-2-separated-agents.svg" alt="Topology 2 — Control plane + separated DNS/DHCP appliances" width="900"/>
+</p>
 
 **What this gets you:**
 
@@ -143,35 +105,9 @@ Production-grade availability. Multiple DNS servers in a server group
 (primary + secondary, or split-horizon views), Kea DHCP HA across
 two peers. Each DNS or DHCP host is its own VM.
 
-```
-                              ┌──────────────┐
-                              │   nginx LB   │
-                              └──────┬───────┘
-                                     │
-                              ┌──────▼───────┐
-                              │   API + DB   │  (still single-VM here; see
-                              │  (Topology 2)│   Topology 4 for HA control plane)
-                              └─┬──┬──┬──────┘
-                                │  │  │
-            ┌───────────────────┘  │  └────────────────────┐
-            │                      │                       │
-   ┌────────▼────────┐    ┌────────▼────────┐    ┌────────▼────────┐
-   │  vm-dns-01      │    │  vm-dns-02      │    │  vm-dns-int     │
-   │  (zone master)  │    │  (slave / xfer) │    │  (split horizon)│
-   │   bind9 :53     │    │   bind9 :53     │    │   bind9 :53     │
-   │  internal +     │    │  internal +     │    │  internal-only  │
-   │  external view  │    │  external view  │    │  view           │
-   └─────────────────┘    └─────────────────┘    └─────────────────┘
-
-   ┌─────────────────┐    ┌─────────────────┐
-   │  vm-dhcp-east   │    │  vm-dhcp-west   │
-   │  Kea HA peer 1  │◄──►│  Kea HA peer 2  │
-   │  (primary)      │    │  (standby)      │
-   │  :67 udp        │    │  :67 udp        │
-   └─────────────────┘    └─────────────────┘
-       Same dhcp_server_group, hot-standby mode
-       PeerResolveWatcher keeps peer-IP fresh
-```
+<p align="center">
+  <img src="../assets/topologies/topology-3-ha-pairs.svg" alt="Topology 3 — DNS + DHCP HA pairs" width="900"/>
+</p>
 
 Configured via the UI:
 
@@ -199,42 +135,11 @@ the standard quorum); Redis via Sentinel. Beat stays single-instance
 (see the table at the top — it's not horizontally scalable without
 leader-election).
 
-```
-                   Operators / API consumers
-                              │
-                    ┌─────────▼─────────┐
-                    │  nginx / haproxy  │  (TLS termination, sticky LB)
-                    └──┬─────────┬──────┘
-                       │         │
-        ┌──────────────▼──┐  ┌───▼──────────────┐
-        │ vm-api-01       │  │ vm-api-02        │
-        │ api + frontend  │  │ api + frontend   │
-        │ worker          │  │ worker           │
-        └────┬──────┬─────┘  └──┬──────┬────────┘
-             │      │           │      │
-             │   ┌──▼───────────▼───┐  │
-             │   │ vm-beat (single) │  │
-             │   │ celery beat      │  │
-             │   └──────────────────┘  │
-             │                         │
-        ┌────▼─────────────────────────▼────┐
-        │  Redis Sentinel (3 nodes)          │
-        │  vm-redis-01 (master)              │
-        │  vm-redis-02 (replica + sentinel)  │
-        │  vm-redis-03 (replica + sentinel)  │
-        └──────────────┬─────────────────────┘
-                       │
-        ┌──────────────▼─────────────────────┐
-        │  Patroni cluster (3 nodes)         │
-        │  vm-pg-01 (primary)                │
-        │  vm-pg-02 (replica + etcd member)  │
-        │  vm-pg-03 (replica + etcd member)  │
-        │  + HAProxy in front routing        │
-        │    primary on :5432 / replica :5433│
-        └────────────────────────────────────┘
+<p align="center">
+  <img src="../assets/topologies/topology-4-ha-control-plane.svg" alt="Topology 4 — HA control plane with Patroni + Redis Sentinel" width="900"/>
+</p>
 
-   DNS / DHCP agents per Topology 2 / 3 above, pointing at the LB URL
-```
+DNS / DHCP agents per Topology 2 / 3 above, pointing at the LB URL.
 
 **What's in the repo for this:**
 
@@ -270,37 +175,9 @@ on-prem because they're network-path dependencies — DNS recursion has
 to terminate close to the queriers, DHCP has to be on the same broadcast
 domain as its clients.
 
-```
-                           ┌───────────────────────────────┐
-                           │  Cloud region (eu-west-1)     │
-                           │                               │
-                           │  ┌────────────────────────┐   │
-                           │  │ Spatium control plane  │   │
-                           │  │ (Topology 4 stack —    │   │
-                           │  │  HA api + Patroni etc) │   │
-                           │  └──────────┬─────────────┘   │
-                           │             │                 │
-                           │  ┌──────────▼─────────────┐   │
-                           │  │ Cloud LB (TLS, public  │   │
-                           │  │ DNS spatium.example)   │   │
-                           │  └──────────┬─────────────┘   │
-                           └─────────────┼─────────────────┘
-                                         │
-                                         │  long-poll over HTTPS
-                                         │  via VPN / WireGuard / Tailscale
-                                         │
-       ┌─────────────────────────────────┼────────────────────────────────┐
-       │  Branch / on-prem corp network  │                                │
-       │                                 │                                │
-       │  ┌────────────┐  ┌──────────────▼──────────┐  ┌──────────────┐   │
-       │  │ vm-dns-east│  │ vm-dhcp-east (Kea HA)   │  │ vm-dns-west  │   │
-       │  │ bind9 + ag │  │ kea + agent             │  │ bind9 + ag   │   │
-       │  └────────────┘  └─────────────────────────┘  └──────────────┘   │
-       │                                                                  │
-       │  Clients on the LAN query the on-prem DNS / DHCP directly —      │
-       │  the cloud control plane is for management only.                 │
-       └──────────────────────────────────────────────────────────────────┘
-```
+<p align="center">
+  <img src="../assets/topologies/topology-5-hybrid-cloud.svg" alt="Topology 5 — Hybrid cloud control plane + on-prem agents" width="900"/>
+</p>
 
 **Why this works:**
 
@@ -346,30 +223,9 @@ The Kubernetes flavour of Topology 4. The umbrella Helm chart
 frontend / migrate / Postgres + Redis subcharts (or external
 endpoints) / optional DNS+DHCP agent StatefulSets.
 
-```
-   ┌─────────────────────────────────────────────────────────────────┐
-   │  Kubernetes cluster (3+ nodes, separate node pools optional)    │
-   │                                                                 │
-   │  ┌───────────┐  ┌────────────┐  ┌────────────┐  ┌───────────┐   │
-   │  │ api Pod×3 │  │ worker×N   │  │ beat Pod×1 │  │ migrate   │   │
-   │  │ Service   │  │ HPA-scaled │  │ (Singleton)│  │ Job       │   │
-   │  └─────┬─────┘  └────┬───────┘  └─────┬──────┘  └───────────┘   │
-   │        │             │                │                         │
-   │  ┌─────▼─────────────▼────────────────▼──────────────┐          │
-   │  │  CloudNativePG cluster (3 nodes)                   │          │
-   │  │  Redis Sentinel / Bitnami Redis HA                 │          │
-   │  └────────────────────────────────────────────────────┘          │
-   │                                                                  │
-   │  ┌────────────────────────┐   ┌─────────────────────────┐        │
-   │  │ dns-bind9 StatefulSet  │   │ dhcp-kea StatefulSet    │        │
-   │  │ + agent sidecar        │   │ + agent sidecar         │        │
-   │  │ Service (UDP 53, TCP)  │   │ Service (UDP 67)        │        │
-   │  └────────────────────────┘   └─────────────────────────┘        │
-   │                                                                  │
-   │  Ingress + cert-manager → spatium.example.com                    │
-   │  PVC: spatium_backups (RWX) for local_volume backup destination  │
-   └──────────────────────────────────────────────────────────────────┘
-```
+<p align="center">
+  <img src="../assets/topologies/topology-6-kubernetes.svg" alt="Topology 6 — Kubernetes via the umbrella Helm chart" width="900"/>
+</p>
 
 The chart's relevant values:
 
