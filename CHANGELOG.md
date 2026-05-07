@@ -68,6 +68,26 @@ visibility.
   pipeline adds a parallel ``build-dns-powerdns`` job alongside
   the existing ``build-dns`` (BIND9) so every tag publishes both
   images with ``:<version>`` and ``:latest`` tags.
+- **PowerDNS online DNSSEC, Phase 3c (\#127, backend).** Operators
+  can sign / unsign a PowerDNS zone via two new endpoints:
+  ``POST /dns/groups/{g}/zones/{z}/dnssec/sign`` and
+  ``/unsign``. Driver-aware via the new
+  ``_DRIVER_GATED_OPERATIONS`` map (PowerDNS-only — BIND9's manual
+  ``dnssec-keygen`` flow stays in the \#49 umbrella's scope). On
+  sign, the agent generates a KSK + ZSK via PowerDNS's
+  ``POST /zones/{z}/cryptokeys`` REST endpoint, sets
+  ``PRESIGNED=1`` zone metadata, and rectifies — pdns then serves
+  signed answers and handles automatic key rollover internally.
+  On unsign, every cryptokey is deleted and ``PRESIGNED`` cleared.
+  Both operations are idempotent (re-signing a signed zone or
+  re-unsigning an unsigned zone converges without error).
+  ``DNSZone.dnssec_enabled`` (already on the model) flips
+  synchronously with the API call so the UI reflects intent
+  immediately. PowerDNS driver's ``capabilities()
+  ["dnssec_inline_signing"]`` flips to True.
+  Frontend DNSSEC card with sign/unsign button + DS-record export
+  + NSEC3 settings come in Phase 3c.fe (next commit). Catalog
+  zones (Phase 3d) still pending.
 - **PowerDNS LUA records, Phase 3b (\#127).** LUA lands as a
   PowerDNS-only computed-record type for zones served by a
   PowerDNS-only server group. Operators write a snippet like

@@ -388,7 +388,7 @@ def test_validate_config_blocklists_are_warned_not_errored(
 # ── Capabilities ──────────────────────────────────────────────────────────
 
 
-def test_capabilities_alias_lua_landed_dnssec_catalog_pending() -> None:
+def test_capabilities_alias_lua_dnssec_landed_catalog_pending() -> None:
     caps = PowerDNSDriver().capabilities()
     # Phase 3a — ALIAS landed.
     assert caps["alias_records"] is True
@@ -396,11 +396,13 @@ def test_capabilities_alias_lua_landed_dnssec_catalog_pending() -> None:
     # Phase 3b — LUA landed.
     assert caps["lua_records"] is True
     assert "LUA" in caps["record_types"]
+    # Phase 3c — online DNSSEC landed (agent-side sign/unsign + REST
+    # gate via _DRIVER_GATED_OPERATIONS).
+    assert caps["dnssec_inline_signing"] is True
     # Still pending: views (#24 cross-design), RPZ (recursor-only),
-    # online DNSSEC (Phase 3c), catalog zones (Phase 3d).
+    # catalog zones (Phase 3d).
     assert caps["views"] is False
     assert caps["rpz"] is False
-    assert caps["dnssec_inline_signing"] is False
     assert caps["catalog_zones"] is False
     assert caps["incremental_updates"] == "rest_api"
     assert "A" in caps["record_types"]

@@ -249,12 +249,23 @@ class PowerDNSDriver(DriverBase):
         api_key = self._load_or_generate_api_key()
         zone_raw = op["zone_name"]
         zone = zone_raw.rstrip(".") + "."
+        op_kind = op["op"]
+
+        # DNSSEC operations (Phase 3c) are zone-level, not rrset-
+        # shaped. They flow through the same record-op queue but
+        # branch off here rather than building a rrset PATCH.
+        if op_kind == "dnssec_sign":
+            self._dnssec_sign(api_key, zone)
+            return
+        if op_kind == "dnssec_unsign":
+            self._dnssec_unsign(api_key, zone)
+            return
+
         rec = op["record"]
         name = _qualified_name(zone, rec.get("name") or "@")
         rtype = rec["type"].upper()
         ttl = rec.get("ttl") or 3600
 
-        op_kind = op["op"]
         if op_kind == "delete":
             rrset = {
                 "name": name,
@@ -292,6 +303,138 @@ class PowerDNSDriver(DriverBase):
             type=rtype,
             op=op_kind,
         )
+
+    # ── DNSSEC ops (Phase 3c) ──────────────────────────────────────────────
+
+    def _dnssec_sign(self, api_key: str, zone: str) -> None:
+        """Generate KSK + ZSK, set PRESIGNED metadata, rectify zone.
+
+        Idempotent — if keys already exist for the zone, pdns refuses with
+        a 409 / 422 and we treat that as success. Operators expect the
+        result of repeated 'Sign zone' clicks to converge to "signed",
+        not error out.
+        """
+        headers = {"X-API-Key": api_key, "Content-Type": "application/json"}
+        with httpx.Client(timeout=_PDNS_API_TIMEOUT) as client:
+            existing = client.get(
+                f"{_PDNS_API_BASE}/zones/{zone}/cryptokeys", headers=headers
+            )
+            if existing.status_code == 200 and existing.json():
+                # Keys already there — nothing to create. Make sure the
+                # PRESIGNED flag is on and rectify (idempotent). This
+                # covers the "operator clicked twice" case + the
+                # "agent restart, redo state" case.
+                self._set_presigned_metadata(client, headers, zone, on=True)
+                self._rectify(client, headers, zone)
+                log.info("powerdns_dnssec_already_signed", zone=zone)
+                return
+
+            for kind, key_type in (("ksk", "ksk"), ("zsk", "zsk")):
+                resp = client.post(
+                    f"{_PDNS_API_BASE}/zones/{zone}/cryptokeys",
+                    headers=headers,
+                    # ``active=true`` so pdns immediately uses the key
+                    # to sign; ``published=true`` so DNSKEY records appear
+                    # in queries (KSK is what the parent zone signs DS for).
+                    json={
+                        "keytype": key_type,
+                        "active": True,
+                        "published": True,
+                    },
+                )
+                if resp.status_code >= 400:
+                    raise RuntimeError(
+                        f"PowerDNS create {kind.upper()} for {zone} returned "
+                        f"{resp.status_code}: {resp.text[:200]}"
+                    )
+
+            self._set_presigned_metadata(client, headers, zone, on=True)
+            self._rectify(client, headers, zone)
+        log.info("powerdns_dnssec_signed", zone=zone)
+
+    def _dnssec_unsign(self, api_key: str, zone: str) -> None:
+        """Delete every cryptokey + clear PRESIGNED metadata.
+
+        Idempotent — missing keys / metadata are a no-op. Same convergence
+        semantic as ``_dnssec_sign``.
+        """
+        headers = {"X-API-Key": api_key, "Content-Type": "application/json"}
+        with httpx.Client(timeout=_PDNS_API_TIMEOUT) as client:
+            existing = client.get(
+                f"{_PDNS_API_BASE}/zones/{zone}/cryptokeys", headers=headers
+            )
+            if existing.status_code == 200:
+                for key in existing.json() or []:
+                    key_id = key.get("id")
+                    if key_id is None:
+                        continue
+                    del_resp = client.delete(
+                        f"{_PDNS_API_BASE}/zones/{zone}/cryptokeys/{key_id}",
+                        headers=headers,
+                    )
+                    if del_resp.status_code >= 400 and del_resp.status_code != 404:
+                        log.warning(
+                            "powerdns_dnssec_key_delete_failed",
+                            zone=zone,
+                            key_id=key_id,
+                            status=del_resp.status_code,
+                            body=del_resp.text[:200],
+                        )
+
+            self._set_presigned_metadata(client, headers, zone, on=False)
+        log.info("powerdns_dnssec_unsigned", zone=zone)
+
+    def _set_presigned_metadata(
+        self,
+        client: httpx.Client,
+        headers: dict[str, str],
+        zone: str,
+        *,
+        on: bool,
+    ) -> None:
+        """Set or clear ``PRESIGNED`` zone metadata.
+
+        Per the PowerDNS Authoritative Server docs, ``PRESIGNED=1`` tells
+        pdns to expect a fully-signed zone (it won't re-sign on serve).
+        For our online-signing flow we set this so pdns knows it owns
+        the keys + signatures it's serving. Clearing it on unsign is
+        good hygiene, though strictly redundant once the keys are gone.
+        """
+        resp = client.put(
+            f"{_PDNS_API_BASE}/zones/{zone}/metadata/PRESIGNED",
+            headers=headers,
+            json={
+                "kind": "PRESIGNED",
+                "metadata": ["1"] if on else [],
+            },
+        )
+        if resp.status_code >= 400:
+            log.warning(
+                "powerdns_dnssec_presigned_metadata_failed",
+                zone=zone,
+                on=on,
+                status=resp.status_code,
+                body=resp.text[:200],
+            )
+
+    def _rectify(
+        self, client: httpx.Client, headers: dict[str, str], zone: str
+    ) -> None:
+        """Re-sign + re-NSEC3 the zone after a key change. PowerDNS requires
+        an explicit rectify call after cryptokey changes; otherwise old
+        signatures linger until the next zone PATCH.
+        """
+        resp = client.put(
+            f"{_PDNS_API_BASE}/zones/{zone}/rectify",
+            headers=headers,
+        )
+        if resp.status_code >= 400:
+            log.warning(
+                "powerdns_dnssec_rectify_failed",
+                zone=zone,
+                status=resp.status_code,
+                body=resp.text[:200],
+            )
 
     # ── Lifecycle ───────────────────────────────────────────────────────────
 

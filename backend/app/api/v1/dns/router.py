@@ -105,6 +105,16 @@ _DRIVER_GATED_RECORD_TYPES: dict[str, frozenset[str]] = {
     "ALIAS": frozenset({"powerdns"}),
     "LUA": frozenset({"powerdns"}),
 }
+
+# Zone-level operations only some drivers support. Same shape as
+# ``_DRIVER_GATED_RECORD_TYPES`` but keyed by op name; used by the
+# DNSSEC sign/unsign endpoints (Phase 3c) where pdns can sign
+# online via REST and BIND9 needs the manual ``dnssec-keygen``
+# dance that's #49's umbrella scope.
+_DRIVER_GATED_OPERATIONS: dict[str, frozenset[str]] = {
+    "dnssec_sign": frozenset({"powerdns"}),
+    "dnssec_unsign": frozenset({"powerdns"}),
+}
 VALID_FORWARD_POLICIES = {"first", "only"}
 VALID_DNSSEC = {"auto", "yes", "no"}
 VALID_NOTIFY = {"yes", "no", "explicit", "master-only"}
@@ -2794,6 +2804,92 @@ async def update_zone(
     return zone
 
 
+@router.post("/groups/{group_id}/zones/{zone_id}/dnssec/sign", response_model=ZoneResponse)
+async def sign_zone_dnssec(
+    group_id: uuid.UUID,
+    zone_id: uuid.UUID,
+    db: DB,
+    current_user: SuperAdmin,
+) -> DNSZone:
+    """Trigger PowerDNS online DNSSEC signing for the zone (issue #127, Phase 3c).
+
+    Driver-aware — refuses if any server in the zone's group is non-PowerDNS
+    (BIND9's manual ``dnssec-keygen`` flow is the #49 umbrella). The agent
+    picks up the enqueued ``dnssec_sign`` op on its next long-poll, generates
+    KSK + ZSK via ``POST /zones/{z}/cryptokeys``, sets ``PRESIGNED`` zone
+    metadata, and rectifies. The zone's ``dnssec_enabled`` flag flips to
+    True synchronously so the UI reflects intent immediately; actual
+    signed-state confirmation lands when the agent reports back.
+    """
+    zone = await _require_zone(group_id, zone_id, db)
+    _reject_if_synthesised_zone(zone, "DNSSEC-sign")
+    await _check_driver_gated_operation("dnssec_sign", group_id, db)
+    zone.dnssec_enabled = True
+    await enqueue_record_op(
+        db,
+        zone,
+        "dnssec_sign",
+        {"name": "@", "type": "DNSSEC_OP"},
+    )
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="dnssec_sign",
+            resource_type="dns_zone",
+            resource_id=str(zone.id),
+            resource_display=zone.name,
+            result="success",
+        )
+    )
+    await db.commit()
+    await db.refresh(zone)
+    return zone
+
+
+@router.post("/groups/{group_id}/zones/{zone_id}/dnssec/unsign", response_model=ZoneResponse)
+async def unsign_zone_dnssec(
+    group_id: uuid.UUID,
+    zone_id: uuid.UUID,
+    db: DB,
+    current_user: SuperAdmin,
+) -> DNSZone:
+    """Disable PowerDNS DNSSEC signing for the zone (issue #127, Phase 3c).
+
+    Mirrors :func:`sign_zone_dnssec`. The agent deletes the cryptokeys via
+    REST, removes the ``PRESIGNED`` metadata, and the zone reverts to
+    unsigned answers. Operators with a parent registrar still pointing at
+    the old DS record will see SERVFAIL on validating resolvers — this
+    endpoint does NOT walk the parent zone for them.
+    """
+    zone = await _require_zone(group_id, zone_id, db)
+    _reject_if_synthesised_zone(zone, "DNSSEC-unsign")
+    await _check_driver_gated_operation("dnssec_unsign", group_id, db)
+    zone.dnssec_enabled = False
+    await enqueue_record_op(
+        db,
+        zone,
+        "dnssec_unsign",
+        {"name": "@", "type": "DNSSEC_OP"},
+    )
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="dnssec_unsign",
+            resource_type="dns_zone",
+            resource_id=str(zone.id),
+            resource_display=zone.name,
+            result="success",
+        )
+    )
+    await db.commit()
+    await db.refresh(zone)
+    return zone
+
+
 @router.delete("/groups/{group_id}/zones/{zone_id}", status_code=204)
 async def delete_zone(
     group_id: uuid.UUID,
@@ -4051,6 +4147,34 @@ async def _require_zone(group_id: uuid.UUID, zone_id: uuid.UUID, db: DB) -> DNSZ
     if not zone:
         raise HTTPException(status_code=404, detail="Zone not found")
     return zone
+
+
+async def _check_driver_gated_operation(op: str, group_id: uuid.UUID, db: DB) -> None:
+    """Reject driver-specific zone-level operations on groups whose
+    servers can't serve them. Used by Phase 3c DNSSEC sign/unsign
+    (PowerDNS-only). Empty groups (no servers configured yet) pass
+    with the same fail-soft semantics as
+    ``_check_driver_gated_record_type``.
+    """
+    allowed = _DRIVER_GATED_OPERATIONS.get(op)
+    if allowed is None:
+        return
+    res = await db.execute(select(DNSServer.driver).where(DNSServer.group_id == group_id))
+    drivers = {d for d in res.scalars().all() if d}
+    if not drivers:
+        return
+    incompatible = drivers - allowed
+    if incompatible:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"Operation '{op}' requires every server in the zone's "
+                f"group to run one of {sorted(allowed)}; this group also "
+                f"has {sorted(incompatible)}. Move the zone to a "
+                f"{sorted(allowed)[0]}-only group, or use a driver that "
+                f"supports manual DNSSEC key management (#49)."
+            ),
+        )
 
 
 async def _check_driver_gated_record_type(record_type: str, group_id: uuid.UUID, db: DB) -> None:

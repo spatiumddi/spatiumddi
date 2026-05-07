@@ -364,7 +364,7 @@ class PowerDNSDriver(DNSDriver):
             "name": "powerdns",
             "views": False,
             "rpz": False,
-            "dnssec_inline_signing": False,  # Phase 3
+            "dnssec_inline_signing": True,  # Phase 3c — landed (agent-side)
             "incremental_updates": "rest_api",
             "zone_types": ["primary", "secondary"],
             "record_types": sorted(_SUPPORTED_RECORD_TYPES),
