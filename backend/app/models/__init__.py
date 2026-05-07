@@ -23,6 +23,7 @@ from app.models.dhcp import (
     DHCPStaticAssignment,
 )
 from app.models.dhcp_fingerprint import DHCPFingerprint
+from app.models.diagnostics import InternalError
 from app.models.dns import (
     DNSAcl,
     DNSAclEntry,
@@ -174,4 +175,5 @@ __all__ = [
     "ConformityPolicy",
     "ConformityResult",
     "FeatureModule",
+    "InternalError",
 ]

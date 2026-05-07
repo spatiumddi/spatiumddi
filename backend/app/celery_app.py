@@ -20,6 +20,7 @@ celery_app = Celery(
         "app.tasks.conformity",
         "app.tasks.heartbeat",
         "app.tasks.oui_update",
+        "app.tasks.prune_internal_errors",
         "app.tasks.prune_logs",
         "app.tasks.prune_metrics",
         "app.tasks.trash_purge",
@@ -71,6 +72,7 @@ celery_app.conf.update(
         "app.tasks.alerts.*": {"queue": "default"},
         "app.tasks.heartbeat.*": {"queue": "default"},
         "app.tasks.oui_update.*": {"queue": "default"},
+        "app.tasks.prune_internal_errors.*": {"queue": "default"},
         "app.tasks.prune_logs.*": {"queue": "default"},
         "app.tasks.prune_metrics.*": {"queue": "default"},
         "app.tasks.trash_purge.*": {"queue": "default"},
@@ -345,5 +347,58 @@ celery_app.conf.update(
             "task": "app.tasks.audit_chain_verify.verify_audit_chain",
             "schedule": crontab(hour=2, minute=0),
         },
+        # Daily at 03:30 UTC, prune the diagnostics ``internal_error``
+        # table — acked rows after 30 d, unacked after 90 d (issue
+        # #123). Off-peak vs the morning AI digest at 08:00 and the
+        # audit-chain verify at 02:00.
+        "internal-errors-prune": {
+            "task": "app.tasks.prune_internal_errors.prune_internal_errors",
+            "schedule": crontab(hour=3, minute=30),
+        },
     },
 )
+
+
+# ── Diagnostics — Celery task_failure capture (issue #123) ──────────────
+#
+# Mirror of the FastAPI exception handler in ``app.main``. Every
+# uncaught task exception lands in the ``internal_error`` table so
+# operators can review crashes without tailing ``docker compose logs
+# worker``. ``task_revoked`` and ``task_unknown`` are deliberately
+# *not* hooked — those are operational signals, not bugs.
+from celery.signals import task_failure  # noqa: E402
+
+
+@task_failure.connect
+def _capture_task_failure(
+    sender: object | None = None,
+    task_id: str | None = None,
+    exception: BaseException | None = None,
+    args: tuple | None = None,
+    kwargs: dict | None = None,
+    traceback: object | None = None,
+    einfo: object | None = None,
+    **_: object,
+) -> None:
+    if exception is None:
+        return
+    # Lazy import — keeps the celery_app module light and avoids any
+    # accidental circular at import time (capture pulls in app.config
+    # + app.models.diagnostics).
+    from app.services.diagnostics import (  # noqa: PLC0415
+        record_unhandled_exception,
+    )
+
+    task_name = getattr(sender, "name", None) if sender else None
+    context = {
+        "task_id": task_id,
+        "task_args": args,
+        "task_kwargs": kwargs,
+    }
+    record_unhandled_exception(
+        service="worker",
+        exc=exception,
+        route_or_task=task_name,
+        request_id=task_id,
+        context=context,
+    )

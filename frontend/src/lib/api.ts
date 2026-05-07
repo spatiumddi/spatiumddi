@@ -2095,6 +2095,69 @@ export const auditApi = {
       .then((r) => r.data),
 };
 
+// ── Diagnostics — uncaught exceptions (issue #123) ────────────────────────────
+
+export interface InternalErrorListItem {
+  id: string;
+  timestamp: string;
+  service: string;
+  kind: string;
+  route_or_task: string | null;
+  exception_class: string;
+  message: string;
+  fingerprint: string;
+  occurrence_count: number;
+  last_seen_at: string;
+  acknowledged_by: string | null;
+  acknowledged_at: string | null;
+  suppressed_until: string | null;
+}
+
+export interface InternalErrorDetail extends InternalErrorListItem {
+  request_id: string | null;
+  traceback: string;
+  context_json: Record<string, unknown>;
+}
+
+export interface InternalErrorStats {
+  total: number;
+  unacknowledged: number;
+  noisy_unacked: number;
+}
+
+export const diagnosticsApi = {
+  list: (params?: {
+    service?: string;
+    acknowledged?: "yes" | "no";
+    since_hours?: number;
+    exception_class?: string;
+    limit?: number;
+  }) =>
+    api
+      .get<InternalErrorListItem[]>("/diagnostics/errors", { params })
+      .then((r) => r.data),
+  get: (id: string) =>
+    api
+      .get<InternalErrorDetail>(`/diagnostics/errors/${id}`)
+      .then((r) => r.data),
+  stats: () =>
+    api
+      .get<InternalErrorStats>("/diagnostics/errors/stats")
+      .then((r) => r.data),
+  acknowledge: (id: string) =>
+    api
+      .post<InternalErrorDetail>(`/diagnostics/errors/${id}/acknowledge`)
+      .then((r) => r.data),
+  suppress: (id: string, hours = 24) =>
+    api
+      .post<InternalErrorDetail>(`/diagnostics/errors/${id}/suppress`, {
+        hours,
+      })
+      .then((r) => r.data),
+  delete: (id: string) =>
+    api.delete<void>(`/diagnostics/errors/${id}`).then((r) => r.data),
+};
+
 // ── Search ─────────────────────────────────────────────────────────────────────
 
 export interface SearchResult {

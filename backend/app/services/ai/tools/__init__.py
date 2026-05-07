@@ -11,6 +11,7 @@ side-effect imports below register every read-only tool.
 from app.services.ai.tools import (  # noqa: F401, E402
     admin,
     dhcp,
+    diagnostics,
     dns,
     integrations,
     ipam,

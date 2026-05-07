@@ -48,6 +48,7 @@ import {
   Workflow,
   Monitor,
   ToggleLeft,
+  AlertTriangle,
   X,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -216,6 +217,15 @@ const adminInsightsNav = [
     icon: ShieldCheck,
     to: "/admin/conformity",
     module: "compliance.conformity",
+  },
+  // Diagnostics → Errors (issue #123). Visible to all admins; the
+  // backend enforces superadmin on read, so non-superadmins land on
+  // a 403 page. We don't gate the nav entry itself so superadmins
+  // discover it.
+  {
+    label: "Diagnostics",
+    icon: AlertTriangle,
+    to: "/admin/diagnostics/errors",
   },
   { label: "Platform Insights", icon: Cpu, to: "/admin/platform-insights" },
   { label: "Trash", icon: Trash2, to: "/admin/trash" },

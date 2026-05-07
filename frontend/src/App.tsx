@@ -39,6 +39,7 @@ import { SubnetPlannerEditorPage } from "@/pages/ipam/SubnetPlannerEditorPage";
 import { LogsPage } from "@/pages/LogsPage";
 import { UsersPage } from "@/pages/admin/UsersPage";
 import { AuditPage } from "@/pages/admin/AuditPage";
+import { DiagnosticsErrorsPage } from "@/pages/admin/DiagnosticsErrorsPage";
 import { AIProvidersPage } from "@/pages/admin/AIProvidersPage";
 import { AIPromptsPage } from "@/pages/admin/AIPromptsPage";
 import { AIToolCatalogPage } from "@/pages/admin/AIToolCatalogPage";
@@ -132,6 +133,10 @@ export default function App() {
         <Route path="admin/groups" element={<GroupsPage />} />
         <Route path="admin/roles" element={<RolesPage />} />
         <Route path="admin/audit" element={<AuditPage />} />
+        <Route
+          path="admin/diagnostics/errors"
+          element={<DiagnosticsErrorsPage />}
+        />
         <Route path="admin/ai/providers" element={<AIProvidersPage />} />
         <Route path="admin/ai/prompts" element={<AIPromptsPage />} />
         <Route path="admin/ai/tools" element={<AIToolCatalogPage />} />

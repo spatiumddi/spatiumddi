@@ -314,6 +314,64 @@ def create_app() -> FastAPI:
     if settings.prometheus_metrics_enabled:
         app.add_route("/metrics", metrics_endpoint)
 
+    # Unhandled-exception capture (issue #123). Registered last so it
+    # only catches what slipped past every other handler — auth /
+    # permission / validation errors raise typed HTTPException
+    # subclasses that FastAPI's own machinery turns into 4xx
+    # responses without ever hitting this path.
+    @app.exception_handler(Exception)
+    async def _capture_unhandled(request: Request, exc: Exception) -> Response:
+        # Lazy imports — keep app boot-time import graph small + avoid
+        # circulars (services/diagnostics imports models which imports
+        # base which Alembic also imports at migration time).
+        from fastapi.responses import JSONResponse  # noqa: PLC0415
+
+        from app.db import AsyncSessionLocal  # noqa: PLC0415
+        from app.services.diagnostics import (  # noqa: PLC0415
+            record_unhandled_exception_async,
+        )
+
+        request_id = request.headers.get("X-Request-ID")
+        try:
+            sanitised_headers = {
+                k: v
+                for k, v in request.headers.items()
+                if k.lower() not in {"authorization", "cookie", "x-api-token"}
+            }
+        except Exception:
+            sanitised_headers = {}
+        context = {
+            "method": request.method,
+            "path": request.url.path,
+            "query": dict(request.query_params),
+            "headers": sanitised_headers,
+            "client": request.client.host if request.client else None,
+        }
+        try:
+            async with AsyncSessionLocal() as db:
+                await record_unhandled_exception_async(
+                    db,
+                    service="api",
+                    exc=exc,
+                    route_or_task=f"{request.method} {request.url.path}",
+                    request_id=request_id,
+                    context=context,
+                )
+        except Exception:
+            # Capture failures must never replace the original
+            # exception's response. Eat it.
+            pass
+        logger.exception(
+            "unhandled_exception",
+            method=request.method,
+            path=request.url.path,
+            request_id=request_id,
+        )
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "Internal Server Error"},
+        )
+
     return app
 
 
