@@ -2138,9 +2138,21 @@ export const backupApi = {
     const fd = new FormData();
     fd.append("passphrase", passphrase);
     fd.append("passphrase_hint", passphraseHint);
-    const res = await api.post<Blob>("/backup/create-and-download", fd, {
-      responseType: "blob",
-    });
+    let res;
+    try {
+      res = await api.post<Blob>("/backup/create-and-download", fd, {
+        responseType: "blob",
+        // Override the global ``Content-Type: application/json`` so
+        // axios fills in the multipart boundary correctly.
+        headers: { "Content-Type": "multipart/form-data" },
+      });
+    } catch (err) {
+      // ``responseType: blob`` makes axios wrap the JSON error body
+      // in a Blob, which renders as a useless
+      // "Request failed with status code 422" string. Read it as
+      // text so the operator sees the actual validation message.
+      throw await _unwrapBlobError(err);
+    }
     const disp = (res.headers["content-disposition"] as string) || "";
     const match = disp.match(/filename="?([^";]+)"?/i);
     const ts = new Date()
@@ -2173,6 +2185,7 @@ export const backupApi = {
     const res = await api.post<BackupManifestPreviewResponse>(
       "/backup/manifest-preview",
       fd,
+      { headers: { "Content-Type": "multipart/form-data" } },
     );
     return res.data;
   },
@@ -2189,10 +2202,47 @@ export const backupApi = {
     fd.append("archive", file);
     fd.append("passphrase", passphrase);
     fd.append("confirmation_phrase", confirmationPhrase);
-    const res = await api.post<BackupRestoreResponse>("/backup/restore", fd);
+    const res = await api.post<BackupRestoreResponse>("/backup/restore", fd, {
+      headers: { "Content-Type": "multipart/form-data" },
+    });
     return res.data;
   },
 };
+
+// Read a blob-shaped error body and re-throw with the actual
+// ``detail`` (or whatever JSON the backend returned) attached so
+// the operator sees the real validation message instead of the
+// generic axios "Request failed with status code N".
+async function _unwrapBlobError(err: unknown): Promise<Error> {
+  const axiosErr = err as {
+    response?: { status?: number; data?: Blob | unknown };
+    message?: string;
+  };
+  const data = axiosErr?.response?.data;
+  if (data instanceof Blob) {
+    try {
+      const text = await data.text();
+      try {
+        const parsed = JSON.parse(text);
+        if (parsed && typeof parsed === "object") {
+          const detail = (parsed as { detail?: unknown }).detail;
+          if (typeof detail === "string") {
+            return new Error(detail);
+          }
+          // FastAPI 422 returns a list under ``detail``; fall back
+          // to the JSON-stringified version.
+          return new Error(JSON.stringify(parsed));
+        }
+      } catch {
+        // Body wasn't JSON — surface as plain text.
+      }
+      if (text) return new Error(text);
+    } catch {
+      // Couldn't read the blob — fall through to the generic.
+    }
+  }
+  return new Error(axiosErr?.message || "Request failed");
+}
 
 // ── BGP enrichment — RIPEstat + PeeringDB (issue #122) ───────────────────────
 
