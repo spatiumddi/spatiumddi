@@ -471,6 +471,36 @@ class PowerDNSDriver(DriverBase):
                         rrset_count=len(rrsets),
                     )
 
+                # Per-zone LUA-records gate (Phase 3b). PowerDNS only
+                # evaluates LUA records at query time when the zone has
+                # ``ENABLE-LUA-RECORDS`` metadata set; otherwise the
+                # snippet is served as a literal string. Set the
+                # metadata after the zone exists so the PUT lands. If
+                # the zone has no LUA records right now we still don't
+                # touch the metadata (idempotent — a no-op if
+                # already-set; nothing breaks if pre-existing).
+                has_lua = any(
+                    rs.get("type", "").upper() == "LUA"
+                    for rs in zone_payload.get("rrsets") or []
+                )
+                if has_lua:
+                    meta_resp = client.put(
+                        f"{_PDNS_API_BASE}/zones/{zone_name}/metadata/"
+                        "ENABLE-LUA-RECORDS",
+                        headers=headers,
+                        json={
+                            "kind": "ENABLE-LUA-RECORDS",
+                            "metadata": ["1"],
+                        },
+                    )
+                    if meta_resp.status_code >= 400:
+                        log.warning(
+                            "powerdns_lua_metadata_failed",
+                            zone=zone_name,
+                            status=meta_resp.status_code,
+                            body=meta_resp.text[:200],
+                        )
+
     # ── Reload (compatibility with bind9 daemon-pid signal pattern) ────────
 
     def _reload_via_api(self) -> None:

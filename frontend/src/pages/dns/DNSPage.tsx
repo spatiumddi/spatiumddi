@@ -1483,6 +1483,7 @@ const RECORD_TYPES = [
   "SSHFP",
   "NAPTR",
   "LOC",
+  "LUA",
 ];
 
 function RecordModal({
@@ -1572,23 +1573,34 @@ function RecordModal({
           </Field>
         </div>
         <Field label="Value">
-          <input
-            className={inputCls}
-            value={value}
-            onChange={(e) => setValue(e.target.value)}
-            placeholder={
-              type === "A"
-                ? "10.0.0.1"
-                : type === "CNAME"
-                  ? "other.example.com."
-                  : type === "ALIAS"
-                    ? "lb.elsewhere.example.net."
-                    : type === "PTR"
-                      ? "host.example.com."
-                      : "record value"
-            }
-            required
-          />
+          {type === "LUA" ? (
+            <textarea
+              className={`${inputCls} font-mono text-xs`}
+              value={value}
+              onChange={(e) => setValue(e.target.value)}
+              placeholder={`A 'pickrandom({"10.0.0.1","10.0.0.2"})'`}
+              rows={4}
+              required
+            />
+          ) : (
+            <input
+              className={inputCls}
+              value={value}
+              onChange={(e) => setValue(e.target.value)}
+              placeholder={
+                type === "A"
+                  ? "10.0.0.1"
+                  : type === "CNAME"
+                    ? "other.example.com."
+                    : type === "ALIAS"
+                      ? "lb.elsewhere.example.net."
+                      : type === "PTR"
+                        ? "host.example.com."
+                        : "record value"
+              }
+              required
+            />
+          )}
         </Field>
         {type === "ALIAS" && (
           <div className="rounded-md border border-violet-500/30 bg-violet-500/10 px-3 py-2 text-xs text-violet-800 dark:text-violet-300">
@@ -1597,6 +1609,35 @@ function RecordModal({
             the canonical CNAME-at-apex (which RFC 1034 §3.6.2 forbids). The
             zone must live in a server group whose every server runs the
             PowerDNS driver; the API will return 422 otherwise.
+          </div>
+        )}
+        {type === "LUA" && (
+          <div className="rounded-md border border-violet-500/30 bg-violet-500/10 px-3 py-2 text-xs text-violet-800 dark:text-violet-300">
+            <strong>LUA:</strong> PowerDNS-only computed-record snippet. Format
+            is{" "}
+            <code className="rounded bg-violet-500/20 px-1">
+              RTYPE 'lua-snippet'
+            </code>
+            {" — e.g. "}
+            <code className="rounded bg-violet-500/20 px-1">
+              A 'pickrandom(...)'
+            </code>
+            ,{" "}
+            <code className="rounded bg-violet-500/20 px-1">
+              AAAA 'ifportup(443, {"{...}"})'
+            </code>
+            , or{" "}
+            <code className="rounded bg-violet-500/20 px-1">
+              CNAME 'createReverse(...)'
+            </code>
+            . The snippet executes inside <em>pdns_server</em> at query time, so
+            an untrusted snippet is a server-side code-execution risk — keep
+            this surface admin-only. The agent automatically sets{" "}
+            <code className="rounded bg-violet-500/20 px-1">
+              ENABLE-LUA-RECORDS=1
+            </code>{" "}
+            metadata on the zone the first time you save a LUA record. Zone must
+            live in a powerdns-only group; API returns 422 otherwise.
           </div>
         )}
         <div className="grid grid-cols-2 gap-3">

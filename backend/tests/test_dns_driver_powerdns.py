@@ -211,13 +211,15 @@ def test_validate_config_rejects_unsupported_record_types(zone: ZoneData) -> Non
         admin_email=zone.admin_email,
         serial=zone.serial,
         records=(
-            # LUA is a PowerDNS-only computed-record type that Phase 3a
-            # explicitly excludes — it'll surface in Phase 3b alongside
-            # the control-plane Lua-snippet editor.
+            # DNSKEY is a real DNSSEC record type pdns serves natively
+            # but SpatiumDDI deliberately doesn't expose to operators —
+            # keys are auto-managed once Phase 3c online DNSSEC lands.
+            # Stand-in for "valid pdns type, intentionally not in our
+            # operator-facing supported set".
             RecordData(
                 name="@",
-                record_type="LUA",
-                value='A \'pickrandom({"10.0.0.1","10.0.0.2"})\'',
+                record_type="DNSKEY",
+                value="257 3 8 AwEAAa...",
                 ttl=300,
             ),
         ),
@@ -237,7 +239,7 @@ def test_validate_config_rejects_unsupported_record_types(zone: ZoneData) -> Non
     )
     ok, errors = PowerDNSDriver().validate_config(bundle)
     assert ok is False
-    assert any("LUA" in e for e in errors)
+    assert any("DNSKEY" in e for e in errors)
 
 
 def test_validate_config_accepts_alias_record(zone: ZoneData) -> None:
@@ -298,6 +300,63 @@ def test_render_zone_file_emits_alias_apex(zone: ZoneData) -> None:
     assert alias["ttl"] == 60
 
 
+def test_validate_config_accepts_lua_record(zone: ZoneData) -> None:
+    # Phase 3b — LUA records are first-class. Snippet text is
+    # opaque to the driver; pdns evaluates it at query time when
+    # ``ENABLE-LUA-RECORDS`` zone metadata is set.
+    luaful = ZoneData(
+        name="example.com.",
+        zone_type="primary",
+        kind="forward",
+        ttl=zone.ttl,
+        refresh=zone.refresh,
+        retry=zone.retry,
+        expire=zone.expire,
+        minimum=zone.minimum,
+        primary_ns=zone.primary_ns,
+        admin_email=zone.admin_email,
+        serial=zone.serial,
+        records=(
+            RecordData(
+                name="weighted",
+                record_type="LUA",
+                value="A \"pickrandom({'10.0.0.1', '10.0.0.2'})\"",
+                ttl=60,
+            ),
+        ),
+    )
+    bundle = ConfigBundle(
+        server_id=str(uuid.uuid4()),
+        server_name="pdns1",
+        driver="powerdns",
+        roles=("authoritative",),
+        options=ServerOptions(),
+        acls=(),
+        views=(),
+        zones=(luaful,),
+        tsig_keys=(),
+        blocklists=(),
+        generated_at=datetime(2026, 5, 7, 12, 0, tzinfo=UTC),
+    )
+    ok, errors = PowerDNSDriver().validate_config(bundle)
+    assert ok is True
+    assert errors == []
+
+
+def test_render_zone_file_emits_lua_snippet_verbatim(zone: ZoneData) -> None:
+    # The LUA value carries the whole RTYPE + snippet payload; the
+    # driver passes it through unmodified (no TXT-quote, no MX-prio
+    # stitching). PowerDNS parses it server-side.
+    snippet = 'A \'pickrandom({"10.0.0.1","10.0.0.2"})\''
+    records = [RecordData(name="weighted", record_type="LUA", value=snippet, ttl=60)]
+    out = PowerDNSDriver().render_zone_file(zone, records)
+    payload = json.loads(out)
+    rrsets = {(r["name"], r["type"]): r for r in payload["rrsets"]}
+    lua = rrsets[("weighted.example.com.", "LUA")]
+    assert lua["records"][0]["content"] == snippet
+    assert lua["ttl"] == 60
+
+
 def test_validate_config_blocklists_are_warned_not_errored(
     zone: ZoneData,
 ) -> None:
@@ -329,18 +388,19 @@ def test_validate_config_blocklists_are_warned_not_errored(
 # ── Capabilities ──────────────────────────────────────────────────────────
 
 
-def test_capabilities_alias_landed_dnssec_lua_catalog_pending() -> None:
+def test_capabilities_alias_lua_landed_dnssec_catalog_pending() -> None:
     caps = PowerDNSDriver().capabilities()
     # Phase 3a — ALIAS landed.
     assert caps["alias_records"] is True
     assert "ALIAS" in caps["record_types"]
+    # Phase 3b — LUA landed.
+    assert caps["lua_records"] is True
+    assert "LUA" in caps["record_types"]
     # Still pending: views (#24 cross-design), RPZ (recursor-only),
-    # online DNSSEC (Phase 3 work), LUA records (Phase 3b), catalog
-    # zones (Phase 3c).
+    # online DNSSEC (Phase 3c), catalog zones (Phase 3d).
     assert caps["views"] is False
     assert caps["rpz"] is False
     assert caps["dnssec_inline_signing"] is False
-    assert caps["lua_records"] is False
     assert caps["catalog_zones"] is False
     assert caps["incremental_updates"] == "rest_api"
     assert "A" in caps["record_types"]

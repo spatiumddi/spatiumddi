@@ -55,12 +55,13 @@ from app.drivers.dns.base import (
 logger = structlog.get_logger(__name__)
 
 
-# Record types the PowerDNS driver supports. ALIAS landed in Phase
-# 3a — PowerDNS resolves the target at query time and serves an A /
-# AAAA, giving operators CNAME-at-apex without the BIND-side workaround.
-# LUA records (Phase 3b) and synthesised record families remain out
-# of scope for now; surfacing them here would let operators create
-# records the rest of SpatiumDDI can't yet handle.
+# Record types the PowerDNS driver supports. ALIAS (Phase 3a) gives
+# operators CNAME-at-apex by having pdns resolve the target at query
+# time; LUA (Phase 3b) lets operators write computed-response snippets
+# (geo-routing, weighted random, ifportup health-checked failover).
+# Online DNSSEC + catalog zones (Phase 3c+) and synthesised record
+# families remain out of scope; surfacing them here would let
+# operators create records the rest of SpatiumDDI can't yet handle.
 _SUPPORTED_RECORD_TYPES = frozenset(
     {
         "A",
@@ -77,6 +78,7 @@ _SUPPORTED_RECORD_TYPES = frozenset(
         "SSHFP",
         "NAPTR",
         "LOC",
+        "LUA",
         "SOA",
     }
 )
@@ -367,8 +369,8 @@ class PowerDNSDriver(DNSDriver):
             "zone_types": ["primary", "secondary"],
             "record_types": sorted(_SUPPORTED_RECORD_TYPES),
             "alias_records": True,  # Phase 3a — landed
-            "lua_records": False,  # Phase 3b
-            "catalog_zones": False,  # Phase 3c
+            "lua_records": True,  # Phase 3b — landed
+            "catalog_zones": False,  # Phase 3d
         }
 
 

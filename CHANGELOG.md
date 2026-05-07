@@ -68,6 +68,24 @@ visibility.
   pipeline adds a parallel ``build-dns-powerdns`` job alongside
   the existing ``build-dns`` (BIND9) so every tag publishes both
   images with ``:<version>`` and ``:latest`` tags.
+- **PowerDNS LUA records, Phase 3b (\#127).** LUA lands as a
+  PowerDNS-only computed-record type for zones served by a
+  PowerDNS-only server group. Operators write a snippet like
+  ``A 'pickrandom({"10.0.0.1","10.0.0.2"})'`` and pdns evaluates
+  it at query time to produce the response — useful for
+  weighted-random load distribution, ``ifportup`` health-checked
+  failover, and geo-routing patterns. The agent automatically
+  sets ``ENABLE-LUA-RECORDS=1`` zone metadata via PUT
+  ``/zones/{zone}/metadata/ENABLE-LUA-RECORDS`` when a zone has
+  any LUA record (PowerDNS only evaluates LUA records when this
+  metadata is set; otherwise the snippet is served as a literal
+  string). Same driver-aware gate as ALIAS — API returns 422 if
+  any server in the zone's group runs a non-PowerDNS driver.
+  Frontend swaps the value ``<input>`` for a monospace
+  ``<textarea>`` when the type is LUA, and shows a violet info
+  banner explaining the format and the
+  server-side-code-execution caveat. Online DNSSEC (Phase 3c) and
+  catalog zones (Phase 3d) still pending.
 - **PowerDNS ALIAS records, Phase 3a (\#127).** ALIAS lands as a
   first-class record type for zones served by a PowerDNS-only
   server group. Resolves CNAME-at-apex (which RFC 1034 §3.6.2

@@ -94,6 +94,7 @@ VALID_RECORD_TYPES = {
     "SSHFP",
     "NAPTR",
     "LOC",
+    "LUA",
 }
 
 # Record types only some drivers support. Used to gate at the create /
@@ -102,6 +103,7 @@ VALID_RECORD_TYPES = {
 # whose backend can serve it.
 _DRIVER_GATED_RECORD_TYPES: dict[str, frozenset[str]] = {
     "ALIAS": frozenset({"powerdns"}),
+    "LUA": frozenset({"powerdns"}),
 }
 VALID_FORWARD_POLICIES = {"first", "only"}
 VALID_DNSSEC = {"auto", "yes", "no"}
