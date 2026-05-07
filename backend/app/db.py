@@ -31,6 +31,22 @@ engine = create_async_engine(
     max_overflow=settings.database_max_overflow,
     echo=settings.debug,
     json_serializer=_json_serializer,
+    # Probe each pooled connection with a ``SELECT 1`` before
+    # checkout. The cost is one tiny extra round-trip per request
+    # — negligible against a localhost socket — and the benefit is
+    # automatic recovery when something kills the underlying
+    # connection out from under the pool. Concretely:
+    #   * A backup restore (issue #117) calls
+    #     ``engine.dispose()`` + ``pg_terminate_backend`` to kick
+    #     stragglers; without pre-ping, agents' in-flight long-poll
+    #     requests would crash with
+    #     ``cannot call PreparedStatement.fetch(): the underlying
+    #     connection is closed`` on the next checkout.
+    #   * A postgres restart, a network blip, or a long idle period
+    #     (some firewalls drop NAT entries after 30 min) would
+    #     produce the same symptom without pre-ping; with it, the
+    #     pool quietly recycles and the request succeeds.
+    pool_pre_ping=True,
 )
 
 AsyncSessionLocal = async_sessionmaker(
