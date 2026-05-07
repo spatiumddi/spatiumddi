@@ -468,9 +468,7 @@ async def list_controllers(db: DB, _: CurrentUser) -> list[ControllerResponse]:
 
 
 @router.get("/controllers/{controller_id}", response_model=ControllerResponse)
-async def get_controller(
-    controller_id: uuid.UUID, db: DB, _: CurrentUser
-) -> ControllerResponse:
+async def get_controller(controller_id: uuid.UUID, db: DB, _: CurrentUser) -> ControllerResponse:
     c = await db.get(UnifiController, controller_id)
     if c is None:
         raise HTTPException(status_code=404, detail="UniFi controller not found")
@@ -580,9 +578,7 @@ async def get_controller_dashboard(
         vlan_rows = (
             (
                 await db.execute(
-                    select(VLAN)
-                    .where(VLAN.router_id == router_row.id)
-                    .order_by(VLAN.vlan_id.asc())
+                    select(VLAN).where(VLAN.router_id == router_row.id).order_by(VLAN.vlan_id.asc())
                 )
             )
             .scalars()

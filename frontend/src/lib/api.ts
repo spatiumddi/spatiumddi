@@ -5497,7 +5497,8 @@ export type IntegrationDashboardKind =
   | "kubernetes"
   | "docker"
   | "proxmox"
-  | "tailscale";
+  | "tailscale"
+  | "unifi";
 export interface IntegrationsDashboardTargetRow {
   id: string;
   display: string;

@@ -32,6 +32,7 @@ from app.models.kubernetes import KubernetesCluster
 from app.models.proxmox import ProxmoxNode
 from app.models.settings import PlatformSettings
 from app.models.tailscale import TailscaleTenant
+from app.models.unifi import UnifiController
 
 router = APIRouter()
 
@@ -85,6 +86,7 @@ _INTEGRATION_RESOURCE_TYPES = (
     "docker_host",
     "proxmox_node",
     "tailscale_tenant",
+    "unifi_controller",
 )
 
 
@@ -161,6 +163,7 @@ async def integrations_summary(
     docker_targets = list((await db.execute(select(DockerHost))).scalars().all())
     proxmox_targets = list((await db.execute(select(ProxmoxNode))).scalars().all())
     tailscale_targets = list((await db.execute(select(TailscaleTenant))).scalars().all())
+    unifi_targets = list((await db.execute(select(UnifiController))).scalars().all())
 
     panels = [
         _build_panel(
@@ -192,6 +195,14 @@ async def integrations_summary(
             label="Tailscale",
             enabled=getattr(settings, "integration_tailscale_enabled", False),
             targets=tailscale_targets,
+            display_attr="name",
+            now=now,
+        ),
+        _build_panel(
+            kind="unifi",
+            label="UniFi",
+            enabled=getattr(settings, "integration_unifi_enabled", False),
+            targets=unifi_targets,
             display_attr="name",
             now=now,
         ),
