@@ -721,6 +721,7 @@ Full docs at **[spatiumddi.github.io](https://spatiumddi.github.io)** (coming so
 | [Auth & Permissions](docs/features/AUTH.md) | LDAP, OIDC, SAML, RADIUS, TACACS+, roles, scoped permissions |
 | [System Admin](docs/features/SYSTEM_ADMIN.md) | Health dashboard, backup, notifications |
 | [Observability](docs/OBSERVABILITY.md) | Logging, metrics, alerting |
+| [Deployment Topologies](docs/deployment/TOPOLOGIES.md) | Six reference topologies — single VM through HA cloud + on-prem hybrid — with ASCII diagrams |
 | [Windows Server Setup](docs/deployment/WINDOWS.md) | WinRM, service accounts, firewall — Windows-side checklist |
 | [DNS Agent Design](docs/deployment/DNS_AGENT.md) | Agent protocol, auto-registration, config sync |
 | [DNS Driver Spec](docs/drivers/DNS_DRIVERS.md) | BIND9 + Windows DNS driver internals |

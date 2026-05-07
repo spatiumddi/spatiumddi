@@ -1,5 +1,10 @@
 # Docker Compose Deployment
 
+> **For multi-VM / HA / hybrid-cloud deployments**, see
+> [`TOPOLOGIES.md`](TOPOLOGIES.md) — six reference topologies with
+> ASCII diagrams, sizing tips, and a "you have X → start with
+> topology Y" picker.
+
 ## Prerequisites
 
 - Docker Engine 25+ and Docker Compose v2.20+
