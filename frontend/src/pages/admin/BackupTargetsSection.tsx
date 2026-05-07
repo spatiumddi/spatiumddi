@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   CheckCircle2,
@@ -416,6 +416,35 @@ function TargetFormModal({
       Object.entries(existing?.config ?? {}).map(([k, v]) => [k, String(v)]),
     ),
   );
+  // ``existing.config`` redacts secret fields to ``"<set>"`` so
+  // operators can see whether a value is configured. We don't
+  // want that sentinel echoed back into a password input — it
+  // looks like real text and would be sent on save (the backend's
+  // merge does drop it, but better to never offer the confusion).
+  // Once ``kindMeta`` loads, blank out any secret fields in the
+  // form state so the input is empty + the placeholder explains
+  // the merge semantics.
+  const kindsData = kindsQ.data;
+  useEffect(() => {
+    if (!kindsData) return;
+    const meta = kindsData.find((k) => k.kind === kind);
+    if (!meta) return;
+    const secretNames = meta.config_fields
+      .filter((f) => f.secret)
+      .map((f) => f.name);
+    if (secretNames.length === 0) return;
+    setConfig((prev) => {
+      const next = { ...prev };
+      let dirty = false;
+      for (const name of secretNames) {
+        if (next[name]) {
+          next[name] = "";
+          dirty = true;
+        }
+      }
+      return dirty ? next : prev;
+    });
+  }, [kindsData, kind]);
   const [passphrase, setPassphrase] = useState("");
   const [passphraseHint, setPassphraseHint] = useState(
     existing?.passphrase_hint ?? "",
@@ -535,23 +564,32 @@ function TargetFormModal({
             </Field>
           )}
 
-          {kindMeta?.config_fields.map((f) => (
-            <Field
-              key={f.name}
-              label={f.label}
-              required={f.required}
-              help={f.description}
-            >
-              <input
-                type={f.type === "password" ? "password" : "text"}
-                value={config[f.name] ?? ""}
-                onChange={(e) =>
-                  setConfig({ ...config, [f.name]: e.target.value })
-                }
-                className="w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
-              />
-            </Field>
-          ))}
+          {kindMeta?.config_fields.map((f) => {
+            const isSecretInEdit = f.secret && mode === "edit";
+            return (
+              <Field
+                key={f.name}
+                label={f.label}
+                required={f.required && !isSecretInEdit}
+                help={f.description}
+              >
+                <input
+                  type={f.type === "password" || f.secret ? "password" : "text"}
+                  value={config[f.name] ?? ""}
+                  onChange={(e) =>
+                    setConfig({ ...config, [f.name]: e.target.value })
+                  }
+                  placeholder={
+                    isSecretInEdit
+                      ? "(set — leave empty to keep, type to replace)"
+                      : undefined
+                  }
+                  autoComplete={f.secret ? "new-password" : undefined}
+                  className="w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+                />
+              </Field>
+            );
+          })}
 
           <Field
             label={mode === "create" ? "Passphrase" : "Passphrase (optional)"}

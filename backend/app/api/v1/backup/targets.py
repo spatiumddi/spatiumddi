@@ -35,14 +35,19 @@ from app.services.backup.schedule import (
 from app.services.backup.targets import (
     BackupDestinationError,
     DestinationConfigError,
+    SecretFieldError,
+    decrypt_config_secrets,
+    encrypt_config_secrets,
     get_destination,
     list_destination_kinds,
+    merge_config_for_update,
+    redact_config_secrets,
 )
 
 router = APIRouter()
 logger = structlog.get_logger(__name__)
 
-_VALID_KINDS = {"local_volume"}  # 1c / 1d add 's3', 'scp', 'azure_blob'
+_VALID_KINDS = {"local_volume", "s3"}  # 1d adds 'scp', 'azure_blob'
 
 
 def _require_superadmin(current_user: object) -> None:
@@ -122,13 +127,24 @@ class BackupTargetResponse(BaseModel):
 
 
 def _to_response(t: BackupTarget) -> BackupTargetResponse:
+    # Redact any secret fields per the driver's ``config_fields``
+    # spec — operators see ``"<set>"`` rather than the encrypted
+    # ciphertext (or, worse, the cleartext if a future bug bypasses
+    # encryption). The driver registry knows what's secret per kind.
+    try:
+        driver = get_destination(t.kind)
+        safe_config = redact_config_secrets(driver, t.config)
+    except DestinationConfigError:
+        # Unknown kind (left over from a kind we removed?). Fall
+        # back to the raw config; the kind is dead anyway.
+        safe_config = t.config
     return BackupTargetResponse(
         id=t.id,
         name=t.name,
         description=t.description,
         kind=t.kind,
         enabled=t.enabled,
-        config=t.config,
+        config=safe_config,
         passphrase_set=bool(t.passphrase_encrypted),
         passphrase_hint=t.passphrase_hint,
         schedule_cron=t.schedule_cron,
@@ -197,6 +213,11 @@ async def create_target(
     except DestinationConfigError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
+    # Encrypt any ``secret=True`` fields before they hit the
+    # JSONB column. Driver got plaintext for validation; storage
+    # gets ciphertext.
+    stored_config = encrypt_config_secrets(driver, body.config)
+
     next_run = None
     if body.schedule_cron is not None:
         try:
@@ -210,7 +231,7 @@ async def create_target(
         description=body.description,
         kind=body.kind,
         enabled=body.enabled,
-        config=body.config,
+        config=stored_config,
         passphrase_encrypted=encrypt_str(body.passphrase),
         passphrase_hint=body.passphrase_hint,
         schedule_cron=body.schedule_cron,
@@ -267,11 +288,21 @@ async def update_target(
 
     if "config" in payload:
         driver = get_destination(row.kind)
+        # PATCH semantics for secret fields: an operator who only
+        # changes the bucket name shouldn't have to retype the
+        # secret access key. ``merge_config_for_update`` keeps the
+        # existing encrypted value when the incoming payload omits
+        # the secret (or sends the redaction sentinel). Validation
+        # runs on the merged dict so shape checks see all fields.
+        merged = merge_config_for_update(driver, incoming=payload["config"], existing=row.config)
         try:
-            driver.validate_config(payload["config"])
+            driver.validate_config(merged)
         except DestinationConfigError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
-        row.config = payload["config"]
+        # Re-encrypt — fields carried over are already wrapped
+        # (the helper detects the prefix and skips them); newly
+        # supplied secrets get wrapped fresh.
+        row.config = encrypt_config_secrets(driver, merged)
         attributes.flag_modified(row, "config")
 
     if "schedule_cron" in payload:
@@ -384,7 +415,10 @@ async def test_target(target_id: uuid.UUID, db: DB, current_user: CurrentUser) -
         raise HTTPException(status_code=404, detail="backup target not found")
     driver = get_destination(row.kind)
     try:
-        outcome = await driver.test_connection(config=row.config)
+        plain_config = decrypt_config_secrets(driver, row.config)
+        outcome = await driver.test_connection(config=plain_config)
+    except SecretFieldError as exc:
+        outcome = {"ok": False, "error": str(exc)}
     except BackupDestinationError as exc:
         outcome = {"ok": False, "error": str(exc)}
     return outcome
@@ -407,7 +441,10 @@ async def list_target_archives(
         raise HTTPException(status_code=404, detail="backup target not found")
     driver = get_destination(row.kind)
     try:
-        archives = await driver.list_archives(config=row.config)
+        plain_config = decrypt_config_secrets(driver, row.config)
+        archives = await driver.list_archives(config=plain_config)
+    except SecretFieldError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except BackupDestinationError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     return [
@@ -434,7 +471,10 @@ async def delete_target_archive(
         raise HTTPException(status_code=404, detail="backup target not found")
     driver = get_destination(row.kind)
     try:
-        await driver.delete(config=row.config, filename=filename)
+        plain_config = decrypt_config_secrets(driver, row.config)
+        await driver.delete(config=plain_config, filename=filename)
+    except SecretFieldError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     except BackupDestinationError as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     db.add(

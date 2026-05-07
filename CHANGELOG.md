@@ -39,6 +39,32 @@ last three releases retroactively.
 
 ### Added
 
+- **Backup & restore — Phase 1c (issue #117).** Adds the
+  ``s3`` destination kind. One driver covers AWS S3 plus
+  every S3-compatible service via the optional ``endpoint_url``
+  config field — MinIO, Wasabi, Backblaze B2, Cloudflare R2,
+  DigitalOcean Spaces, Linode Object Storage. Config carries
+  bucket / region / optional key prefix / endpoint URL /
+  addressing style (virtual / path / auto) / access key ID /
+  Fernet-wrapped secret access key. boto3 joins the dep set;
+  every driver method wraps the sync client calls in
+  ``asyncio.to_thread`` so a slow upstream can't block the
+  event loop. Test connection writes + heads + deletes a probe
+  object so it distinguishes auth failure from no-such-bucket
+  cleanly. Implements per-driver secret-field handling via a
+  new helper module
+  (:mod:`app.services.backup.targets.secrets_config`) — fields
+  declared ``secret=True`` get Fernet-wrapped before storage
+  with an ``__enc__:`` prefix, redacted to ``<set>`` on every
+  read, and merged on PATCH so an operator updating bucket
+  metadata doesn't have to retype the secret. The frontend
+  recognises secret fields by their flag, never pre-fills them
+  on edit, and shows ``(set — leave empty to keep, type to
+  replace)`` as the placeholder. Verified end-to-end against
+  a MinIO container: create target, test connection, run-now
+  writes a real archive, PATCH-without-secret leaves the
+  existing wrap intact and the next run succeeds.
+
 - **Backup & restore — Phase 1b (issue #117).** Builds on
   Phase 1a with scheduled, retention-managed backups to
   configurable destinations. New `backup_target` table backs

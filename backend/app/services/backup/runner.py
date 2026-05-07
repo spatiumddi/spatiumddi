@@ -40,6 +40,8 @@ from app.services.backup.archive import (
 from app.services.backup.schedule import compute_next_run
 from app.services.backup.targets import (
     BackupDestinationError,
+    SecretFieldError,
+    decrypt_config_secrets,
     get_destination,
 )
 
@@ -146,15 +148,19 @@ async def run_backup_for_target(
     try:
         passphrase = _decrypt_passphrase(target)
         driver = get_destination(target.kind)
-        driver.validate_config(target.config)
+        # Decrypt the per-driver secret fields (S3 access keys,
+        # future SCP private keys, Azure account keys) once at the
+        # top so every downstream call sees plaintext.
+        plain_config = decrypt_config_secrets(driver, target.config)
+        driver.validate_config(plain_config)
 
         archive_bytes, filename = await build_backup_archive(
             db,
             passphrase=passphrase,
             passphrase_hint=target.passphrase_hint or None,
         )
-        await driver.write(config=target.config, filename=filename, archive_bytes=archive_bytes)
-        deleted = await _retention_sweep(db, target=target, config=target.config)
+        await driver.write(config=plain_config, filename=filename, archive_bytes=archive_bytes)
+        deleted = await _retention_sweep(db, target=target, config=plain_config)
 
         finished = datetime.now(UTC)
         duration_ms = int((finished - started).total_seconds() * 1000)
@@ -175,7 +181,7 @@ async def run_backup_for_target(
         )
         action = "backup_target_run_success"
         result_state = "success"
-    except (BackupArchiveError, BackupDestinationError) as exc:
+    except (BackupArchiveError, BackupDestinationError, SecretFieldError) as exc:
         finished = datetime.now(UTC)
         duration_ms = int((finished - started).total_seconds() * 1000)
         target.last_run_status = "failed"
