@@ -79,7 +79,7 @@ export function BackupTargetsSection() {
           schedule a recurring backup to a local volume.
         </div>
       ) : (
-        <div className="space-y-2">
+        <div className="grid grid-cols-1 gap-3 xl:grid-cols-2">
           {(targetsQ.data ?? []).map((t) => (
             <TargetRow
               key={t.id}

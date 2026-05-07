@@ -53,9 +53,15 @@ export function BackupPage() {
       </div>
 
       <div className="flex-1 overflow-auto p-6">
-        <div className="mx-auto flex max-w-3xl flex-col gap-6">
-          <CreateBackupCard />
-          <RestoreBackupCard />
+        <div className="mx-auto flex max-w-6xl flex-col gap-6">
+          {/* Manual download + restore — stack on narrow, sit
+              side-by-side on lg+ where there's room for both. */}
+          <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+            <CreateBackupCard />
+            <RestoreBackupCard />
+          </div>
+          {/* Scheduled-targets section spans full width — its
+              internal grid handles the per-target tiling. */}
           <BackupTargetsSection />
           <SecurityNotes />
         </div>
