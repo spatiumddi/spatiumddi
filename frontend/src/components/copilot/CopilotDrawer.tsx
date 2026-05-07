@@ -422,7 +422,9 @@ export function CopilotDrawer({
   ]);
 
   const sendMut = useMutation({
-    mutationFn: async (message: string) => {
+    mutationFn: async (
+      message: string,
+    ): Promise<{ sessionId: string | null; error: string | null }> => {
       const ctrl = new AbortController();
       abortRef.current = ctrl;
       setStreamingContent("");
@@ -431,6 +433,11 @@ export function CopilotDrawer({
       setStreamingFailover(null);
       setPendingUserMessage(message);
       let resolvedSessionId = activeSessionId;
+      // Track an SSE-emitted ``error`` event locally so onSuccess can
+      // distinguish "true success" from "stream completed but reported
+      // an error event" — the latter must keep the optimistic echo +
+      // banner around for the inline retry affordance to work.
+      let localError: string | null = null;
       // ``initial_context`` only matters on a *new* session — the
       // backend ignores it once a session has its system prompt
       // snapshotted. Notify the parent the moment we send it so it
@@ -489,7 +496,8 @@ export function CopilotDrawer({
               });
             }
           } else if (ev.event === "error") {
-            setStreamingError(ev.data.message as string);
+            localError = ev.data.message as string;
+            setStreamingError(localError);
           }
         }
       } finally {
@@ -501,12 +509,37 @@ export function CopilotDrawer({
           onContextConsumed?.();
         }
       }
-      return resolvedSessionId;
+      return { sessionId: resolvedSessionId, error: localError };
     },
-    onSettled: (sid) => {
+    onSuccess: ({ error }) => {
+      // True success → clear the optimistic echo so the refetched
+      // persisted version slides in cleanly. On SSE-emitted error
+      // (``error`` non-null) we deliberately keep both the echo and
+      // ``streamingError`` so the inline retry block downstream can
+      // re-send the same text without the operator retyping.
+      if (!error) {
+        setPendingUserMessage(null);
+      }
+    },
+    onError: (err: unknown) => {
+      // mutationFn threw — typically AbortError (operator hit Stop)
+      // or a network/parse error from the SSE stream itself. Treat
+      // AbortError as a soft cancel (clear everything; the operator
+      // explicitly asked to stop). Real exceptions surface as a
+      // retry affordance + keep the echo around.
+      const e = err as { name?: string; message?: string };
+      if (e?.name === "AbortError") {
+        setPendingUserMessage(null);
+        setStreamingError(null);
+      } else {
+        setStreamingError(e?.message || "Stream failed");
+      }
+    },
+    onSettled: (data) => {
       // Refetch the session detail + session list so the persisted
       // assistant message appears + the in-flight buffer drops.
       qc.invalidateQueries({ queryKey: ["ai-sessions"] });
+      const sid = data?.sessionId;
       if (sid) {
         qc.invalidateQueries({ queryKey: ["ai-session", sid] });
       }
@@ -515,7 +548,9 @@ export function CopilotDrawer({
       qc.invalidateQueries({ queryKey: ["ai-usage-me"] });
       setStreamingContent("");
       setStreamingTools([]);
-      setPendingUserMessage(null);
+      // Note: ``setPendingUserMessage(null)`` is in onSuccess (and
+      // the AbortError branch of onError) only — leaving it set on
+      // real errors keeps the echo + retry block usable.
     },
   });
 
@@ -810,6 +845,29 @@ export function CopilotDrawer({
             tools={streamingTools}
             error={streamingError}
             failover={streamingFailover}
+          />
+        )}
+        {/* Post-stream error + retry. Visible after the mutation
+            settles (``isPending`` false) when an SSE ``error`` event
+            arrived or the stream threw mid-flight. The user message
+            is kept around (see ``sendMut.onSuccess`` /
+            ``sendMut.onError``) so Retry can resend the same text. */}
+        {!sendMut.isPending && streamingError && (
+          <StreamErrorBlock
+            error={streamingError}
+            canRetry={Boolean(pendingUserMessage)}
+            onRetry={() => {
+              const text = pendingUserMessage;
+              if (!text) {
+                setStreamingError(null);
+                return;
+              }
+              sendMut.mutate(text);
+            }}
+            onDismiss={() => {
+              setStreamingError(null);
+              setPendingUserMessage(null);
+            }}
           />
         )}
       </div>
@@ -1457,6 +1515,50 @@ function NmapScanLiveResult({ scanId }: { scanId: string }) {
           {scan.error_message}
         </div>
       )}
+    </div>
+  );
+}
+
+function StreamErrorBlock({
+  error,
+  canRetry,
+  onRetry,
+  onDismiss,
+}: {
+  error: string;
+  canRetry: boolean;
+  onRetry: () => void;
+  onDismiss: () => void;
+}) {
+  // Renders after the mutation settles when the SSE stream emitted
+  // an error or the request threw. The user message stays in
+  // ``pendingUserMessage`` so the operator can resend the same text
+  // by clicking Retry — no retyping. Dismiss clears both the error
+  // and the optimistic echo (operator gave up on the turn).
+  return (
+    <div className="mb-3 flex justify-start">
+      <div className="max-w-[85%] rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-sm text-destructive">
+        <div className="mb-1 font-medium">Stream failed</div>
+        <div className="mb-2 break-words text-xs opacity-90">{error}</div>
+        <div className="flex gap-2">
+          {canRetry && (
+            <button
+              type="button"
+              onClick={onRetry}
+              className="rounded-md border border-destructive/40 bg-destructive/20 px-2 py-0.5 text-xs hover:bg-destructive/30"
+            >
+              Retry
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={onDismiss}
+            className="rounded-md border border-destructive/40 px-2 py-0.5 text-xs hover:bg-destructive/10"
+          >
+            Dismiss
+          </button>
+        </div>
+      </div>
     </div>
   );
 }
