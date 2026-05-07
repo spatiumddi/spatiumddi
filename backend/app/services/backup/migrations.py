@@ -56,10 +56,23 @@ _ALEMBIC_TIMEOUT_SECONDS = 30 * 60
 MigrationState = Literal[
     "up_to_date",
     "upgraded",
+    "auto_recovered",
     "incompatible_newer",
     "unknown",
     "failed",
 ]
+
+
+# Patterns alembic / asyncpg / psql emit when the schema is already
+# at (or past) the target head but ``alembic_version`` is stale.
+# Hitting one of these on ``alembic upgrade head`` after a restore
+# is the canonical drift-recovery signal — we stamp head instead.
+_DRIFT_ERROR_PATTERNS = (
+    "DuplicateTableError",
+    "DuplicateColumnError",
+    "DuplicateObjectError",
+    "already exists",
+)
 
 
 @dataclass
@@ -222,6 +235,52 @@ async def maybe_upgrade_after_restore(
             local_head=local_head,
             stderr=msg,
         )
+
+        # Drift-recovery path. The dump just restored carries the
+        # source's ``alembic_version`` row, which can be stale
+        # relative to the *schema* the dump emits — pg_dump
+        # captures whatever DDL is present regardless of the
+        # alembic_version value. Concretely: if a backup was
+        # taken when alembic_version had drifted (operator ran
+        # ``alembic stamp`` to fix an earlier inconsistency, then
+        # later restored from a backup taken before that fix),
+        # the restore brings back BOTH the up-to-date schema AND
+        # the stale alembic_version. ``alembic upgrade head`` then
+        # fails on the first migration with "table already exists".
+        #
+        # Detect that signature and recover by stamping head — the
+        # schema is already correct, alembic_version just needs to
+        # catch up.
+        if any(p in msg for p in _DRIFT_ERROR_PATTERNS):
+            stamp_ok, stamp_err = await _try_alembic_stamp_head(db_url)
+            if stamp_ok:
+                logger.info(
+                    "backup_restore_alembic_drift_recovered",
+                    source_head=source_head,
+                    local_head=local_head,
+                )
+                return MigrationOutcome(
+                    state="auto_recovered",
+                    source_head=source_head,
+                    local_head=local_head,
+                    migrations_applied=[],
+                    error=(
+                        "alembic_version was stale but the restored schema is "
+                        f"already at {local_head!r}; stamped head to align. "
+                        "No migrations actually ran."
+                    ),
+                )
+            return MigrationOutcome(
+                state="failed",
+                source_head=source_head,
+                local_head=local_head,
+                migrations_applied=[],
+                error=(
+                    f"alembic upgrade failed and stamp-head recovery also "
+                    f"failed. Upgrade error: {msg}; stamp error: {stamp_err}"
+                ),
+            )
+
         return MigrationOutcome(
             state="failed",
             source_head=source_head,
@@ -242,3 +301,31 @@ async def maybe_upgrade_after_restore(
         local_head=local_head,
         migrations_applied=planned,
     )
+
+
+async def _try_alembic_stamp_head(db_url: str) -> tuple[bool, str | None]:
+    """Run ``alembic stamp head`` against the configured database.
+    Returns ``(success, error_message)``. Used to recover from
+    schema-vs-alembic-version drift after a restore.
+    """
+    pg_env, _dbname = _pg_env_from_url(db_url)
+    full_env = {**os.environ, **pg_env, "DATABASE_URL": db_url}
+    cmd = ["alembic", "-c", str(_ALEMBIC_INI_PATH), "stamp", "head"]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        env=full_env,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(), timeout=_ALEMBIC_TIMEOUT_SECONDS
+        )
+    except TimeoutError:
+        proc.kill()
+        await proc.wait()
+        return False, f"alembic stamp timed out after {_ALEMBIC_TIMEOUT_SECONDS}s"
+    if proc.returncode != 0:
+        msg = (stderr.decode(errors="replace") or stdout.decode(errors="replace"))[:500]
+        return False, f"alembic stamp head failed (exit {proc.returncode}): {msg}"
+    return True, None

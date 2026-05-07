@@ -383,6 +383,14 @@ async def restore_backup(
             f"{migration.local_head!r} ({n} migration{'s' if n != 1 else ''} "
             f"applied)."
         )
+    elif migration is not None and migration.state == "auto_recovered":
+        note += (
+            f" Schema-version drift detected ({migration.source_head!r} → "
+            f"{migration.local_head!r}) and auto-recovered via "
+            f"`alembic stamp head` — the restored schema was already "
+            f"at the local install's expected head, so no migrations "
+            f"actually needed to run. The install is safe to use."
+        )
     elif migration is not None and migration.state == "incompatible_newer":
         note += (
             f" WARNING: archive is from a newer release of SpatiumDDI "
