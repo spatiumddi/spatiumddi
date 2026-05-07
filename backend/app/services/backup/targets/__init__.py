@@ -7,6 +7,7 @@ storage backend. Phase 1b ships ``local_volume`` only; ``s3`` /
 :class:`BackupDestination` ABC + module-level registry.
 """
 
+from app.services.backup.targets.azure_blob import AzureBlobDestination
 from app.services.backup.targets.base import (
     DESTINATIONS,
     ArchiveListing,
@@ -18,6 +19,7 @@ from app.services.backup.targets.base import (
 )
 from app.services.backup.targets.local_volume import LocalVolumeDestination
 from app.services.backup.targets.s3 import S3Destination
+from app.services.backup.targets.scp import ScpDestination
 from app.services.backup.targets.secrets_config import (
     REDACTED_SENTINEL,
     SecretFieldError,
@@ -27,18 +29,22 @@ from app.services.backup.targets.secrets_config import (
     redact_config_secrets,
 )
 
-# Side-effect register every driver. Future drivers (SCP, Azure
-# Blob in Phase 1d) import + register the same way.
+# Side-effect register every driver. New drivers register the
+# same way — no other code path needs to learn about them.
 DESTINATIONS["local_volume"] = LocalVolumeDestination()
 DESTINATIONS["s3"] = S3Destination()
+DESTINATIONS["scp"] = ScpDestination()
+DESTINATIONS["azure_blob"] = AzureBlobDestination()
 
 __all__ = [
     "ArchiveListing",
     "BackupDestination",
     "BackupDestinationError",
     "DestinationConfigError",
+    "AzureBlobDestination",
     "LocalVolumeDestination",
     "S3Destination",
+    "ScpDestination",
     "DESTINATIONS",
     "REDACTED_SENTINEL",
     "SecretFieldError",

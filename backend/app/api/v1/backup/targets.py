@@ -47,7 +47,7 @@ from app.services.backup.targets import (
 router = APIRouter()
 logger = structlog.get_logger(__name__)
 
-_VALID_KINDS = {"local_volume", "s3"}  # 1d adds 'scp', 'azure_blob'
+_VALID_KINDS = {"local_volume", "s3", "scp", "azure_blob"}
 
 
 def _require_superadmin(current_user: object) -> None:

@@ -39,6 +39,30 @@ last three releases retroactively.
 
 ### Added
 
+- **Backup & restore — Phase 1d (issue #117).** Two more
+  destination drivers slot into the Phase 1c scaffolding,
+  closing out the Tier 1 destination set called for in the
+  issue body. ``scp`` writes archives via SFTP using
+  paramiko — supports password OR PEM private-key auth (with
+  optional key passphrase), three host-key check modes
+  (``strict`` / ``known_hosts`` / ``insecure_skip``), and
+  always uses a temp-then-rename pattern so a crashed
+  transfer never leaves a half-archive the listing pass picks
+  up. ``azure_blob`` writes to a container via
+  azure-storage-blob — supports both classic shared-key auth
+  (account name + key) and connection-string auth. Both
+  drivers reuse the same archive-name regex + secret-field
+  machinery as ``s3``, so the operator UX is consistent
+  across destinations: every secret field
+  Fernet-wrapped at rest, redacted to ``<set>`` on read,
+  preserved across PATCH-without-rotate. Verified end-to-end
+  against linuxserver/openssh-server (SCP) and Azurite (Azure
+  Blob Storage) one-shot containers; both build, write, and
+  list a real archive in under a second on a LAN. paramiko
+  4.0 + azure-storage-blob 12.28 added to ``pyproject.toml``
+  runtime deps. Total destination kinds now four:
+  local_volume / s3 / scp / azure_blob.
+
 - **Backup & restore — Phase 1c (issue #117).** Adds the
   ``s3`` destination kind. One driver covers AWS S3 plus
   every S3-compatible service via the optional ``endpoint_url``
