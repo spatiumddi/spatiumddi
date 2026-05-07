@@ -1508,6 +1508,15 @@ async def evaluate_all(db: AsyncSession) -> dict[str, int]:
                 delivered_webhook += dwh
                 delivered_smtp += dsm
                 continue
+            elif rule.rule_type == RULE_TYPE_AUDIT_CHAIN_BROKEN:
+                # Externally driven — the dedicated
+                # ``app.tasks.audit_chain_verify.verify_audit_chain``
+                # Celery task creates / resolves AlertEvent rows for
+                # this rule on its own schedule (nightly + on-demand).
+                # The general evaluator just silently passes; without
+                # this branch the warning loop spammed once per
+                # 60s tick.
+                continue
             else:
                 logger.warning("alert_unknown_rule_type", rule=str(rule.id), type=rule.rule_type)
                 continue
