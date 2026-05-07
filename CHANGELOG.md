@@ -20,6 +20,57 @@ the formatter handles the rest.
 
 ---
 
+## Unreleased
+
+PowerDNS-Authoritative driver lands as the second authoritative DNS
+backend alongside BIND9 — Phase 1 of issue \#127. Operators choose
+per-server-group which driver to run; mixed installs work via
+multiple groups. Phase 1 ships the backend driver class, the
+agent-side driver, the new ``ghcr.io/spatiumddi/dns-powerdns`` image
+(Alpine + ``pdns_server`` + LMDB embedded backend, multi-arch
+linux/amd64 + linux/arm64), and the multi-arch build wired into
+both the image-build workflow matrix and the release-tag pipeline.
+The frontend is intentionally not yet aware of the driver choice —
+operators create PowerDNS server groups via the existing REST API
+(``driver: "powerdns"`` on ``POST /dns/server-groups``); the
+driver-picker UI lands in Phase 2 alongside the per-driver tab
+visibility.
+
+### Added
+
+- **PowerDNS driver, Phase 1 (\#127).** Full second authoritative
+  driver running side-by-side with BIND9. Backend stack is
+  PowerDNS-Authoritative with LMDB embedded zone storage — no
+  external database, no shared Postgres credentials, agent-isolated
+  the same way the BIND agent is. Phase 1 surface covers zone +
+  record CRUD via the local PowerDNS REST API
+  (``http://127.0.0.1:8081/api/v1/servers/localhost``), per-bundle
+  zone reconciliation on every config sync, and graceful skipping of
+  the BIND-specific telemetry threads (``rndc status``, statistics-
+  channels XML, query-log shipper) that don't apply on a PowerDNS
+  daemon. Per-driver picker UI, ALIAS / LUA records, online DNSSEC,
+  catalog zones, and views are deliberately out of Phase 1 — those
+  are Phase 2/3 work and the driver's ``capabilities()`` dict makes
+  the gaps explicit.
+- **``ghcr.io/spatiumddi/dns-powerdns`` container image.** Alpine
+  3.22 base + ``pdns`` 4.9.x + ``pdns-backend-lmdb``, multi-arch
+  ``linux/amd64`` and ``linux/arm64``. Same agent supervisor + JWT
+  bootstrap + long-poll ETag flow as the BIND9 image — the only
+  driver-specific bits are the entrypoint (generates the API key
+  on first boot, seeds an empty LMDB file, drops to the
+  unprivileged ``spatium`` user) and the supervisor's driver
+  dispatch. Health check uses ``dig id.server CH TXT`` (PowerDNS's
+  CHAOS analogue of BIND's ``version.bind``) so the probe is
+  independent of zone state.
+- **Multi-arch build matrix.** ``.github/workflows/build-dns-images.yml``
+  matrix grew from ``[bind9]`` to ``[bind9, powerdns]``; both
+  flavors build, push, and Trivy-scan in parallel. The release-tag
+  pipeline adds a parallel ``build-dns-powerdns`` job alongside
+  the existing ``build-dns`` (BIND9) so every tag publishes both
+  images with ``:<version>`` and ``:latest`` tags.
+
+---
+
 ## 2026.05.07-1 — 2026-05-07
 
 The **backup + factory-reset** release. Issue \#117 (full system

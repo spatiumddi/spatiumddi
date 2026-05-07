@@ -3,9 +3,9 @@
 Per CLAUDE.md non-negotiable #10, the service layer obtains a driver via
 ``get_driver(server_type)`` and speaks only to the abstract interface.
 
-SpatiumDDI ships with BIND9 as the single supported backend. The registry
-pattern is kept so alternative drivers (e.g. a hidden-primary over AXFR
-setup for a specific deployment) can be registered without touching the
+SpatiumDDI ships three authoritative DNS drivers: BIND9 (default), PowerDNS
+(issue #127, Phase 1 — agent-managed alongside BIND9), and Windows DNS
+(WinRM-driven, agentless). New drivers register here without touching the
 service layer.
 """
 
@@ -22,10 +22,12 @@ from app.drivers.dns.base import (
     ZoneData,
 )
 from app.drivers.dns.bind9 import BIND9Driver
+from app.drivers.dns.powerdns import PowerDNSDriver
 from app.drivers.dns.windows import WindowsDNSDriver
 
 _DRIVERS: dict[str, type[DNSDriver]] = {
     "bind9": BIND9Driver,
+    "powerdns": PowerDNSDriver,
     "windows_dns": WindowsDNSDriver,
 }
 

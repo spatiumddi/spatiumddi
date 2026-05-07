@@ -56,7 +56,7 @@ Always read the relevant spec doc(s) before writing code for a feature area.
 | `k8s/base/` | Core K8s manifests (namespace, API, worker, frontend, migrate job) |
 | `k8s/ha/` | HA add-ons: CloudNativePG cluster, Redis Sentinel, Patroni Compose |
 | `docs/drivers/DHCP_DRIVERS.md` | Kea + Windows DHCP driver internals |
-| `docs/drivers/DNS_DRIVERS.md` | BIND9 + Windows DNS (Path A + B) driver internals, incremental update strategy |
+| `docs/drivers/DNS_DRIVERS.md` | BIND9 + PowerDNS + Windows DNS (Path A + B) driver internals, incremental update strategy |
 
 ---
 
@@ -85,7 +85,7 @@ backend/app/            FastAPI app
   api/v1/               HTTP route handlers (ipam/, dns/, dhcp/, auth/, ...)
   models/               SQLAlchemy 2.x async models
   services/             Business logic (dns/, dhcp/, dns_io/, ipam_io/)
-  drivers/dns/          DNS backend abstraction + BIND9 impl
+  drivers/dns/          DNS backend abstraction + BIND9 / PowerDNS / Windows DNS impls
   drivers/dhcp/         DHCP backend abstraction + Kea impl
   tasks/                Celery tasks (dns_health, dhcp_health, sweep_expired_leases, …)
   core/, db.py, config.py, celery_app.py
@@ -95,7 +95,7 @@ frontend/src/
   components/           Shared UI; shadcn/ui primitives under components/ui/
   lib/api.ts            All API clients (ipamApi, dnsApi, dhcpApi, …)
   hooks/                Incl. useSessionState (sessionStorage-backed useState)
-agent/dns/              Standalone DNS agent (Python) + BIND9 container image
+agent/dns/              Standalone DNS agent (Python) + BIND9 / PowerDNS container images
 agent/dhcp/             Standalone DHCP agent (Python) + Kea container image
 k8s/base/               Core manifests (api, worker, frontend, migrate)
 k8s/{dns,dhcp}/         Per-service StatefulSets + services
@@ -236,6 +236,7 @@ further down.
 - ⬜ [**DNS Views — end-to-end split-horizon wiring**](https://github.com/spatiumddi/spatiumddi/issues/24)
 - ⬜ [**ACME embedded client — certs for SpatiumDDI's own services**](https://github.com/spatiumddi/spatiumddi/issues/28)
 - ⬜ [**Cloud DNS driver family — Route 53 / Azure DNS / Cisco DNA**](https://github.com/spatiumddi/spatiumddi/issues/29)
+- 🟡 [**PowerDNS authoritative driver**](https://github.com/spatiumddi/spatiumddi/issues/127) — Phase 1 shipped (driver class + agent + LMDB image + multi-arch build); Phases 2-5 (FE driver picker, ALIAS / LUA records, DNSSEC, Helm wiring) pending.
 
 ### Integration roadmap (⬜ pending)
 

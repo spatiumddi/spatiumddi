@@ -18,6 +18,7 @@ from .bootstrap import ensure_token
 from .config import AgentConfig
 from .drivers.base import DriverBase
 from .drivers.bind9 import Bind9Driver
+from .drivers.powerdns import PowerDNSDriver
 from .heartbeat import HeartbeatClient
 from .metrics import MetricsPoller
 from .query_log_shipper import QueryLogShipper
@@ -29,6 +30,8 @@ log = structlog.get_logger(__name__)
 def _select_driver(cfg: AgentConfig) -> DriverBase:
     if cfg.driver == "bind9":
         return Bind9Driver(state_dir=cfg.state_dir)
+    if cfg.driver == "powerdns":
+        return PowerDNSDriver(state_dir=cfg.state_dir)
     raise RuntimeError(f"Unknown driver: {cfg.driver}")
 
 
@@ -40,9 +43,6 @@ def run(cfg: AgentConfig) -> int:
     driver = _select_driver(cfg)
     heartbeat = HeartbeatClient(cfg, token_ref)
     syncer = SyncLoop(cfg, token_ref, driver, heartbeat)
-    metrics = MetricsPoller(cfg, token_ref)
-    query_log = QueryLogShipper(cfg, token_ref)
-    rndc_status = RndcStatusPoller(cfg, token_ref)
 
     # Spawn daemon before threads so the first poll can reload it if needed
     driver.start_daemon()
@@ -50,10 +50,27 @@ def run(cfg: AgentConfig) -> int:
     threads = [
         threading.Thread(target=syncer.run, name="sync", daemon=True),
         threading.Thread(target=heartbeat.run, name="heartbeat", daemon=True),
-        threading.Thread(target=metrics.run, name="metrics", daemon=True),
-        threading.Thread(target=query_log.run, name="query-log", daemon=True),
-        threading.Thread(target=rndc_status.run, name="rndc-status", daemon=True),
     ]
+
+    # BIND9-specific telemetry / admin threads. PowerDNS exposes its
+    # own statistics + log surfaces (Phase 2/3 work) — skipping the
+    # BIND-specific threads avoids spurious errors on a PowerDNS
+    # daemon that doesn't speak rndc / statistics-channels XML.
+    metrics: MetricsPoller | None = None
+    query_log: QueryLogShipper | None = None
+    rndc_status: RndcStatusPoller | None = None
+    if cfg.driver == "bind9":
+        metrics = MetricsPoller(cfg, token_ref)
+        query_log = QueryLogShipper(cfg, token_ref)
+        rndc_status = RndcStatusPoller(cfg, token_ref)
+        threads.extend(
+            [
+                threading.Thread(target=metrics.run, name="metrics", daemon=True),
+                threading.Thread(target=query_log.run, name="query-log", daemon=True),
+                threading.Thread(target=rndc_status.run, name="rndc-status", daemon=True),
+            ]
+        )
+
     for t in threads:
         t.start()
 
@@ -64,16 +81,24 @@ def run(cfg: AgentConfig) -> int:
         stopping.set()
         heartbeat.stop()
         syncer.stop()
-        metrics.stop()
-        query_log.stop()
-        rndc_status.stop()
+        if metrics is not None:
+            metrics.stop()
+        if query_log is not None:
+            query_log.stop()
+        if rndc_status is not None:
+            rndc_status.stop()
 
     signal.signal(signal.SIGTERM, _sig)
     signal.signal(signal.SIGINT, _sig)
 
+    # Every supported driver in this image manages its own daemon
+    # process (BIND9, PowerDNS). If the daemon dies, we exit non-zero
+    # so the orchestrator restarts the container — agent + daemon are
+    # bound lifecycle-wise.
+    daemon_managed_drivers = {"bind9", "powerdns"}
     while not stopping.is_set():
         time.sleep(1.0)
-        if not driver.daemon_running() and cfg.driver == "bind9":
+        if cfg.driver in daemon_managed_drivers and not driver.daemon_running():
             log.error("dns_daemon_exited", driver=cfg.driver)
             return 2
         # If any critical thread died (e.g. the sync loop dropped its
