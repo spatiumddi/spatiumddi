@@ -125,7 +125,7 @@ function AnnouncedPrefixesSection({ asn }: { asn: number }) {
           <div className="rounded-lg border">
             <div className="max-h-96 overflow-auto">
               <table className="w-full text-xs">
-                <thead className="sticky top-0 bg-muted/30 text-left">
+                <thead className="sticky top-0 z-10 bg-card text-left">
                   <tr className="border-b">
                     <th className="px-3 py-2 font-medium">Prefix</th>
                     <th className="px-3 py-2 font-medium">Family</th>
