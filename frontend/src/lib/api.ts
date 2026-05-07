@@ -2117,6 +2117,9 @@ export interface BackupRestoreResponse {
   note: string;
   selective?: boolean;
   restored_sections?: string[] | null;
+  // Operator-actionable post-restore advisories (issue #127 Phase 4d) —
+  // currently surfaces the PowerDNS DNSSEC re-sign / re-publish caveat.
+  warnings?: string[];
 }
 
 export interface BackupSection {

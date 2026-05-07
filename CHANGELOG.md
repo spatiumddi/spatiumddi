@@ -68,6 +68,21 @@ visibility.
   pipeline adds a parallel ``build-dns-powerdns`` job alongside
   the existing ``build-dns`` (BIND9) so every tag publishes both
   images with ``:<version>`` and ``:latest`` tags.
+- **PowerDNS DNSSEC restore advisory, Phase 4d (\#127).** Backup
+  restore now scans the post-restore database for DNSSEC-enabled
+  zones in PowerDNS groups and surfaces a registrar-republish
+  warning on the ``RestoreOutcomeResponse`` (and in the audit-log
+  payload). PowerDNS DNSSEC signing keys live in the agent's LMDB
+  volume, not in this archive — restoring a signed zone to a
+  fresh agent regenerates keys and produces NEW DS records, which
+  must be re-published to the parent registrar or external
+  validation will fail. The advisory enumerates up to ten zone
+  names plus a "(and N more)" suffix so operators know the scope
+  of the registrar-handoff work. ``BackupPage`` renders the
+  warnings as an amber callout under the success banner. The
+  ``dns`` section description in ``backup/sections.py`` now
+  documents the LMDB-not-archived caveat so operators see it
+  before they rely on cross-install DNSSEC continuity.
 - **PowerDNS kind smoke test, Phase 4c (\#127).** ``agent-e2e.yml``
   workflow now installs both DNS-agent flavors side by side in the
   kind cluster — the helm install passes a two-server list (one

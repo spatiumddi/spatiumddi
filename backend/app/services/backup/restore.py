@@ -28,7 +28,7 @@ from __future__ import annotations
 import asyncio
 import os
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -78,6 +78,13 @@ class RestoreOutcome:
     restored_tables: list[str] | None = None
     migration: MigrationOutcome | None = None
     rewrap: RewrapOutcome | None = None
+    # Operator-actionable post-restore advisories that don't block
+    # the restore. Currently used to flag PowerDNS DNSSEC zones —
+    # signing keys live in the agent's LMDB volume (not in this
+    # archive), so a restored DNSSEC-enabled zone re-signs on the
+    # destination agent and produces *new* DS records the operator
+    # must re-publish to the parent registrar.
+    warnings: list[str] = field(default_factory=list)
 
 
 async def _terminate_other_db_connections(pg_env: dict[str, str]) -> None:
@@ -323,6 +330,64 @@ async def _write_pre_restore_safety_dump(db) -> str | None:
     return str(out_path)
 
 
+async def _collect_post_restore_warnings(db_url: str) -> list[str]:
+    """Surface operator-actionable advisories after a restore.
+
+    Currently flags PowerDNS DNSSEC zones (issue #127 Phase 4d):
+    DNSSEC signing keys live in the agent's LMDB volume (NOT in
+    this archive), so the destination agent will regenerate keys
+    and produce *new* DS records on its first sync. The operator
+    must re-publish those DS records to the parent registrar or
+    DNSSEC validation will fail externally. The warning includes
+    the count + a sample of zone names so the operator knows how
+    much registrar work is queued up.
+    """
+    pg_env, _dbname = _pg_env_from_url(db_url)
+    full_env = {**os.environ, **pg_env}
+    sql = (
+        "SELECT z.name FROM dns_zone z "
+        "JOIN dns_server_group g ON g.id = z.group_id "
+        "JOIN dns_server s ON s.group_id = g.id "
+        "WHERE z.dnssec_enabled = TRUE "
+        "AND z.deleted_at IS NULL "
+        "AND s.driver = 'powerdns' "
+        "GROUP BY z.name ORDER BY z.name LIMIT 11;"
+    )
+    proc = await asyncio.create_subprocess_exec(
+        "psql",
+        "--no-align",
+        "--tuples-only",
+        "--set=ON_ERROR_STOP=0",
+        f"--command={sql}",
+        env=full_env,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, _stderr = await asyncio.wait_for(proc.communicate(), timeout=15)
+    except TimeoutError:
+        proc.kill()
+        await proc.wait()
+        return []
+    if proc.returncode != 0:
+        return []
+    zones = [line.strip() for line in stdout.decode(errors="replace").splitlines() if line.strip()]
+    if not zones:
+        return []
+    sample = ", ".join(zones[:10])
+    suffix = f" (and {len(zones) - 10} more)" if len(zones) > 10 else ""
+    return [
+        (
+            f"PowerDNS DNSSEC: {len(zones)} signed zone(s) restored — "
+            f"{sample}{suffix}. Signing keys live in the agent's LMDB "
+            f"volume (not in this archive), so the destination agent "
+            f"will regenerate keys on first sync and produce NEW DS "
+            f"records. Re-publish those DS records to each zone's "
+            f"parent registrar or external DNSSEC validation will fail."
+        )
+    ]
+
+
 async def apply_backup_restore(
     db,
     *,
@@ -511,6 +576,15 @@ async def apply_backup_restore(
         rewrap_outcome = RewrapOutcome()
         rewrap_outcome.failures.append({"reason": f"rewrap-aborted: {exc}"})
 
+    # Phase 4d (issue #127): scan the restored DB for PowerDNS
+    # DNSSEC-enabled zones and surface a registrar-republish
+    # advisory. Failure here is non-fatal — the data is in.
+    try:
+        post_warnings = await _collect_post_restore_warnings(db_url)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("backup_restore_warning_scan_failed", error=str(exc))
+        post_warnings = []
+
     duration_ms = int((datetime.now(UTC) - started).total_seconds() * 1000)
     logger.info(
         "backup_restore_applied",
@@ -527,6 +601,7 @@ async def apply_backup_restore(
         rewrap_jsonb=rewrap_outcome.rewrapped_jsonb_fields,
         rewrap_idempotent=rewrap_outcome.skipped_idempotent_rows,
         rewrap_failed=rewrap_outcome.failed_rows,
+        warning_count=len(post_warnings),
     )
     return RestoreOutcome(
         manifest=manifest,
@@ -538,4 +613,5 @@ async def apply_backup_restore(
         restored_tables=restored_tables,
         migration=migration_outcome,
         rewrap=rewrap_outcome,
+        warnings=post_warnings,
     )

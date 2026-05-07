@@ -487,23 +487,38 @@ function Row({
 }
 
 function RestoreResultCard({ outcome }: { outcome: BackupRestoreResponse }) {
+  const warnings = outcome.warnings ?? [];
   return (
-    <div className="rounded-md border border-emerald-500/30 bg-emerald-500/5 px-3 py-2 text-xs text-emerald-700 dark:text-emerald-300">
-      <div className="mb-1 font-medium">Restore complete</div>
-      <div className="space-y-0.5">
-        <div>Duration: {outcome.duration_ms} ms</div>
-        {outcome.pre_restore_safety_path && (
-          <div>
-            Pre-restore safety dump:{" "}
-            <code className="rounded bg-muted px-1 py-0.5 text-[11px]">
-              {outcome.pre_restore_safety_path}
-            </code>
+    <div className="space-y-2">
+      <div className="rounded-md border border-emerald-500/30 bg-emerald-500/5 px-3 py-2 text-xs text-emerald-700 dark:text-emerald-300">
+        <div className="mb-1 font-medium">Restore complete</div>
+        <div className="space-y-0.5">
+          <div>Duration: {outcome.duration_ms} ms</div>
+          {outcome.pre_restore_safety_path && (
+            <div>
+              Pre-restore safety dump:{" "}
+              <code className="rounded bg-muted px-1 py-0.5 text-[11px]">
+                {outcome.pre_restore_safety_path}
+              </code>
+            </div>
+          )}
+          <div className="mt-2 whitespace-pre-wrap text-foreground/80">
+            {outcome.note}
           </div>
-        )}
-        <div className="mt-2 whitespace-pre-wrap text-foreground/80">
-          {outcome.note}
         </div>
       </div>
+      {warnings.length > 0 && (
+        <div className="rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-800 dark:text-amber-300">
+          <div className="mb-1 font-medium">Post-restore action required</div>
+          <ul className="ml-4 list-disc space-y-1.5">
+            {warnings.map((w, i) => (
+              <li key={i} className="whitespace-pre-wrap">
+                {w}
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
     </div>
   );
 }

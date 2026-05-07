@@ -180,7 +180,14 @@ SECTIONS: tuple[Section, ...] = (
             "views, ACLs, blocklists + entries + exceptions, DNS "
             "GSLB pools + members, TSIG keys, trust anchors, "
             "per-server zone-state + runtime state, server "
-            "options, record-ops queue."
+            "options, record-ops queue. NOTE for PowerDNS-driver "
+            "groups: DNSSEC signing keys live in the agent's LMDB "
+            "store on its persistent volume — they are NOT inside "
+            "this archive. Restoring DNSSEC-enabled PowerDNS zones "
+            "to a fresh agent regenerates the keys and produces "
+            "new DS records, which must be re-published to the "
+            "parent registrar. The restore endpoint surfaces this "
+            "as a warning when applicable."
         ),
         tables=(
             "dns_server_group",

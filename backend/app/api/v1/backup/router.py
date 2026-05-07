@@ -213,6 +213,11 @@ class RestoreOutcomeResponse(BaseModel):
     restored_sections: list[str] | None = None
     migration: MigrationOutcomeResponse | None = None
     rewrap: RewrapOutcomeResponse | None = None
+    # Operator-actionable post-restore advisories (issue #127
+    # Phase 4d). Currently surfaces the PowerDNS DNSSEC re-sign
+    # caveat — the destination agent regenerates LMDB keys on
+    # first sync and produces new DS records.
+    warnings: list[str] = []
 
 
 @router.post("/restore", response_model=RestoreOutcomeResponse)
@@ -322,6 +327,7 @@ async def restore_backup(
                         if outcome.rewrap is not None
                         else None
                     ),
+                    "warnings": outcome.warnings,
                 },
             )
         )
@@ -426,6 +432,7 @@ async def restore_backup(
         restored_sections=outcome.restored_sections,
         migration=migration_resp,
         rewrap=rewrap_resp,
+        warnings=outcome.warnings,
     )
 
 
