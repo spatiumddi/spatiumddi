@@ -90,6 +90,91 @@ def _qualified_name(zone_name: str, name: str) -> str:
     return f"{name.rstrip('.')}.{zone}"
 
 
+def _render_catalog_zone_payload(catalog: dict[str, Any]) -> dict[str, Any]:
+    """Build the zones.json payload entry for an RFC 9432 catalog zone.
+
+    PowerDNS accepts the canonical catalog-zone shape verbatim: SOA + NS
+    + a ``version`` TXT pinned to ``"2"`` (the only schema PowerDNS
+    accepts) + one PTR per member zone. The PTR label is the SHA-1 of
+    the wire-format member zone name, exactly as BIND9's catalog-zone
+    renderer produces (RFC 9432 §4.1) — keeping the format identical
+    means a SpatiumDDI-managed catalog can be served by either driver
+    without consumers needing to special-case the producer kind.
+
+    Returns a dict in the same shape as the regular zones_payload
+    entries so the existing reconciler creates / patches it through
+    the same code path.
+    """
+    import hashlib
+    import time
+
+    zname = (catalog.get("zone_name") or "").rstrip(".") + "."
+    if not zname or zname == ".":
+        return {"name": "invalid.", "kind": "Native", "rrsets": []}
+
+    serial = int(time.time())
+    rrsets: list[dict[str, Any]] = [
+        {
+            "name": zname,
+            "type": "SOA",
+            "ttl": 86400,
+            "records": [
+                {
+                    "content": (
+                        f"invalid. invalid. {serial} 86400 3600 86400 86400"
+                    ),
+                    "disabled": False,
+                }
+            ],
+        },
+        {
+            "name": zname,
+            "type": "NS",
+            "ttl": 86400,
+            "records": [{"content": "invalid.", "disabled": False}],
+        },
+        {
+            "name": f"version.{zname}",
+            "type": "TXT",
+            "ttl": 86400,
+            "records": [{"content": '"2"', "disabled": False}],
+        },
+    ]
+
+    for member in catalog.get("members") or []:
+        member_name = (member.get("zone_name") or "").rstrip(".")
+        if not member_name:
+            continue
+        # RFC 9432 §4.1 — SHA-1 over the wire-format zone name (each
+        # label prefixed with its length byte, root null at the end).
+        wire = (
+            b"".join(
+                bytes([len(label)]) + label.encode("ascii")
+                for label in member_name.split(".")
+                if label
+            )
+            + b"\x00"
+        )
+        digest = hashlib.sha1(wire).hexdigest()
+        rrsets.append(
+            {
+                "name": f"{digest}.zones.{zname}",
+                "type": "PTR",
+                "ttl": 86400,
+                "records": [
+                    {"content": f"{member_name}.", "disabled": False}
+                ],
+            }
+        )
+
+    return {
+        "name": zname,
+        "kind": "Native",
+        "serial": serial,
+        "rrsets": rrsets,
+    }
+
+
 class PowerDNSDriver(DriverBase):
     """PowerDNS agent driver — Phase 1."""
 
@@ -161,6 +246,26 @@ class PowerDNSDriver(DriverBase):
                         for (qname, rtype), rrs in sorted(rrsets.items())
                     ],
                 }
+            )
+
+        # Catalog zones (RFC 9432, Phase 3d). Producer mode renders the
+        # catalog itself as a regular zone with the canonical record
+        # structure; PowerDNS authoritative serves it like any other
+        # zone, and operators can stand up secondaries via AXFR (the
+        # PowerDNS-native catalog-consumer mode lands in pdns 4.10+ and
+        # needs additional config we'll add in a follow-up).
+        catalog = bundle.get("catalog") or None
+        if catalog and catalog.get("mode") == "producer":
+            zones_payload.append(_render_catalog_zone_payload(catalog))
+        elif catalog and catalog.get("mode") == "consumer":
+            log.warning(
+                "powerdns_catalog_consumer_unsupported",
+                zone=catalog.get("zone_name"),
+                hint=(
+                    "PowerDNS 4.9 (current image) does not consume "
+                    "catalog zones automatically. Use AXFR-based "
+                    "secondaries against the producer instead."
+                ),
             )
 
         (new_dir / "zones.json").write_text(json.dumps(zones_payload, indent=2))

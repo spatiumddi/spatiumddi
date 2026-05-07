@@ -68,6 +68,30 @@ visibility.
   pipeline adds a parallel ``build-dns-powerdns`` job alongside
   the existing ``build-dns`` (BIND9) so every tag publishes both
   images with ``:<version>`` and ``:latest`` tags.
+- **PowerDNS catalog zones, Phase 3d (\#127).** RFC 9432 catalog
+  zones light up as **producer-only** for PowerDNS groups (BIND9
+  already shipped). When ``DNSServerGroup.catalog_zones_enabled`` is
+  on and this server is the group primary, the agent renders the
+  catalog zone alongside regular zones via the existing PowerDNS
+  REST reconciler — apex SOA + NS + ``version`` TXT pinned to
+  ``"2"`` + one PTR per primary zone under ``<sha1>.zones.<catalog>.``
+  using the same RFC 9432 §4.1 wire-format hash BIND9 emits.
+  Membership re-renders on every config sync; the ``int(time.time())``
+  serial guarantees AXFR consumers always pull on member changes.
+  Consumer mode logs a warning explaining that PowerDNS 4.9 (the
+  shipped image) doesn't auto-consume catalogs — operators stand
+  up secondaries via plain AXFR against the producer instead;
+  full consumer-side support waits for pdns 4.10+. Driver capability
+  reads ``catalog_zones: "producer-only"`` (string, not bool, to
+  carry the asymmetry in capabilities introspection). The
+  control-plane ``build_config_bundle`` gate flipped from
+  ``server.driver == "bind9"`` to ``server.driver in ("bind9",
+  "powerdns")``; producer detection now uses
+  ``DNSServer.driver == server.driver`` so each driver picks its
+  own primary independently. 16 / 16 backend driver tests still
+  pass; 5 / 5 new agent-side ``test_powerdns_catalog`` tests cover
+  the apex records, the SHA-1-hashed PTR labels, empty-member
+  skipping, trailing-dot normalisation, and serial monotonicity.
 - **PowerDNS online DNSSEC, Phase 3c.fe (\#127, frontend).** Zone
   edit modal grows a dedicated DNSSEC card on every existing zone:
   status indicator (signed / unsigned + last-sync timestamp), a

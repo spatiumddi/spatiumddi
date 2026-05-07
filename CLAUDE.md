@@ -236,7 +236,7 @@ further down.
 - ⬜ [**DNS Views — end-to-end split-horizon wiring**](https://github.com/spatiumddi/spatiumddi/issues/24)
 - ⬜ [**ACME embedded client — certs for SpatiumDDI's own services**](https://github.com/spatiumddi/spatiumddi/issues/28)
 - ⬜ [**Cloud DNS driver family — Route 53 / Azure DNS / Cisco DNA**](https://github.com/spatiumddi/spatiumddi/issues/29)
-- 🟡 [**PowerDNS authoritative driver**](https://github.com/spatiumddi/spatiumddi/issues/127) — Phases 1 + 2 + 3a + 3b + 3c (full) shipped (driver class + agent + LMDB image + multi-arch build + frontend driver picker + ALIAS records + LUA records + online DNSSEC sign/unsign + DS-record export); Phase 3d (catalog zones), Phases 4-5 (Helm wiring, kind-cluster smoke test, docs pass) still pending.
+- 🟡 [**PowerDNS authoritative driver**](https://github.com/spatiumddi/spatiumddi/issues/127) — Phases 1 + 2 + 3 (3a/3b/3c/3d all done) shipped (driver class + agent + LMDB image + multi-arch build + frontend driver picker + ALIAS records + LUA records + online DNSSEC sign/unsign + DS-record export + RFC 9432 catalog zones producer-side); Phases 4-5 (Helm wiring, kind-cluster smoke test, docs pass, migration recipes) still pending.
 
 ### Integration roadmap (⬜ pending)
 

@@ -370,7 +370,7 @@ class PowerDNSDriver(DNSDriver):
             "record_types": sorted(_SUPPORTED_RECORD_TYPES),
             "alias_records": True,  # Phase 3a — landed
             "lua_records": True,  # Phase 3b — landed
-            "catalog_zones": False,  # Phase 3d
+            "catalog_zones": "producer-only",  # Phase 3d — landed
         }
 
 

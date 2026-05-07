@@ -212,17 +212,19 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
             for e in eff_entries
         ]
 
-    # ── BIND9 catalog zones (RFC 9432) ──
+    # ── Catalog zones (RFC 9432) ──
     # When the group has the feature toggled on, build a producer or
     # consumer block depending on whether this server is the primary
-    # (is_primary=True). Non-bind9 servers always get None.
+    # (is_primary=True). Both BIND9 and PowerDNS (Phase 3d) consume
+    # the same producer payload — the catalog zone format is RFC 9432
+    # canonical, so the rendering driver doesn't need to fork.
     catalog_block: dict[str, Any] | None = None
-    if grp and grp.catalog_zones_enabled and server.driver == "bind9":
+    if grp and grp.catalog_zones_enabled and server.driver in ("bind9", "powerdns"):
         producer = (
             await db.execute(
                 select(DNSServer).where(
                     DNSServer.group_id == server.group_id,
-                    DNSServer.driver == "bind9",
+                    DNSServer.driver == server.driver,
                     DNSServer.is_primary.is_(True),
                 )
             )
