@@ -71,6 +71,9 @@ class RestoreOutcome:
     pre_restore_path: str | None
     secrets_payload_keys: list[str]
     duration_ms: int
+    selective: bool = False
+    restored_sections: list[str] | None = None
+    restored_tables: list[str] | None = None
 
 
 async def _terminate_other_db_connections(pg_env: dict[str, str]) -> None:
@@ -187,6 +190,99 @@ async def _run_pg_restore(dump_path: Path, db_url: str) -> None:
         raise BackupRestoreError(f"pg_restore failed (exit {proc.returncode}): {msg}")
 
 
+async def _truncate_tables(tables: list[str], db_url: str) -> None:
+    """``TRUNCATE … RESTART IDENTITY CASCADE`` for the supplied
+    table list. Used by selective restore — we wipe the selected
+    sections' tables before pg_restore re-loads their data.
+
+    CASCADE is intentional: when an operator restores "DNS only"
+    onto an install where IPAM rows reference DNS rows, the
+    cascading DELETE wipes those references too. Without CASCADE
+    the TRUNCATE would fail with a FK constraint error and the
+    operator would have to know the dependency graph in advance.
+    The restore UI warns about this up front.
+    """
+    if not tables:
+        return
+    pg_env, _dbname = _pg_env_from_url(db_url)
+    full_env = {**os.environ, **pg_env}
+    quoted = ", ".join(f'"{t}"' for t in tables)
+    cmd = [
+        "psql",
+        "--set=ON_ERROR_STOP=1",
+        "--single-transaction",
+        f"--command=TRUNCATE TABLE {quoted} RESTART IDENTITY CASCADE",
+    ]
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        env=full_env,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
+    except TimeoutError as exc:
+        proc.kill()
+        await proc.wait()
+        raise BackupRestoreError("TRUNCATE timed out (>5 min)") from exc
+    if proc.returncode != 0:
+        msg = (stderr.decode(errors="replace") or stdout.decode(errors="replace"))[:1500]
+        raise BackupRestoreError(f"TRUNCATE failed (exit {proc.returncode}): {msg}")
+
+
+async def _run_pg_restore_data_only(dump_path: Path, db_url: str, tables: list[str]) -> None:
+    """``pg_restore --data-only --disable-triggers --table=…``.
+
+    Used by selective restore. ``--data-only`` skips schema
+    commands (the tables already exist after TRUNCATE);
+    ``--disable-triggers`` lets the COPY apply rows in any order
+    without triggering FK checks mid-load (we re-enable triggers
+    when the transaction commits). ``--single-transaction`` keeps
+    the load atomic.
+
+    Important: pg_restore --table is repeatable; we pass each
+    table separately so the operator can pick a subset cleanly.
+    """
+    if not tables:
+        raise BackupRestoreError("selective restore: no tables to load")
+    pg_env, dbname = _pg_env_from_url(db_url)
+    await _terminate_other_db_connections(pg_env)
+    full_env = {**os.environ, **pg_env}
+    cmd = [
+        "pg_restore",
+        "--dbname",
+        dbname,
+        "--data-only",
+        "--disable-triggers",
+        "--no-owner",
+        "--no-acl",
+        "--single-transaction",
+        "--exit-on-error",
+    ]
+    for table in tables:
+        cmd.extend(["--table", table])
+    cmd.append(str(dump_path))
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        env=full_env,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(), timeout=_PG_RESTORE_TIMEOUT_SECONDS
+        )
+    except TimeoutError as exc:
+        proc.kill()
+        await proc.wait()
+        raise BackupRestoreError(
+            f"pg_restore --data-only exceeded {_PG_RESTORE_TIMEOUT_SECONDS}s timeout"
+        ) from exc
+    if proc.returncode != 0:
+        msg = (stderr.decode(errors="replace") or stdout.decode(errors="replace"))[:1500]
+        raise BackupRestoreError(f"pg_restore --data-only failed (exit {proc.returncode}): {msg}")
+
+
 async def _write_pre_restore_safety_dump(db) -> str | None:
     """Take a passphrase-less local archive of the *current* state
     before clobbering anything. The passphrase is the literal
@@ -230,15 +326,28 @@ async def apply_backup_restore(
     passphrase: str,
     confirmation_phrase: str,
     db_url: str,
+    sections: list[str] | None = None,
 ) -> RestoreOutcome:
     """Validate, decrypt-check, take a safety dump, then replay the
-    archive's SQL via ``psql --single-transaction``.
+    archive via psql (Phase 1 plain dumps) or pg_restore (Phase 2+
+    custom dumps).
+
+    When ``sections`` is None or empty → **full restore** (hard
+    overwrite of every table). When ``sections`` is a non-empty
+    list of section keys (from
+    :mod:`app.services.backup.sections`) → **selective restore**:
+    TRUNCATE the selected sections' tables CASCADE, then
+    ``pg_restore --data-only --disable-triggers --table=…`` for
+    just those tables. ``platform_internal`` is always included
+    (alembic_version + oui_vendor pin install state). Selective
+    restore requires the archive to be in custom format —
+    ``pg_restore --table=`` doesn't work on plain dumps.
 
     The async ``db`` session is used only to pull the alembic head
     for the safety dump and to dispose of the connection pool
-    cleanly before psql opens its own. The actual schema rewrite
-    happens out-of-process via psql to avoid the SQLAlchemy
-    connection pool fighting with the destructive replay.
+    cleanly before the subprocess runs. The actual schema rewrite
+    happens out-of-process to avoid the SQLAlchemy connection
+    pool fighting with the destructive replay.
     """
     if confirmation_phrase != CONFIRM_PHRASE:
         raise BackupRestoreError(f"confirmation phrase must be exactly '{CONFIRM_PHRASE}'")
@@ -286,13 +395,60 @@ async def apply_backup_restore(
     await db.close()
     await global_engine.dispose()
 
-    # Phase 5: replay. Both paths run inside a single transaction
-    # so partial restores are impossible by construction.
-    # ``dump_format`` from extract_archive_members dispatches:
-    # plain → psql, custom → pg_restore. Phase 1 archives stay
-    # restorable through the psql path forever.
+    # Phase 5: replay. Three paths:
+    #  - selective restore (sections supplied) — TRUNCATE +
+    #    ``pg_restore --data-only --disable-triggers --table=…``.
+    #    Requires custom format; plain archives can't be selective.
+    #  - full restore against custom format → ``pg_restore``.
+    #  - full restore against plain format → ``psql``. Phase 1
+    #    archives stay restorable through this path forever.
+    selective = bool(sections)
+    restored_sections: list[str] | None = None
+    restored_tables: list[str] | None = None
+
+    if selective and dump_format != "custom":
+        raise BackupRestoreError(
+            "selective restore requires a Phase 2+ archive (dump_format=custom). "
+            "This archive is plain SQL — only full restore is supported."
+        )
+
     with tempfile.TemporaryDirectory(prefix="spatium-restore-") as tmpdir:
-        if dump_format == "custom":
+        if selective:
+            # Lazy import — keeps the section catalog out of the
+            # restore module's import graph for callers that don't
+            # touch selective.
+            from app.services.backup.sections import (  # noqa: PLC0415
+                SECTIONS_BY_KEY,
+                tables_for_sections,
+            )
+
+            requested = list(sections or [])
+            unknown = [k for k in requested if k not in SECTIONS_BY_KEY]
+            if unknown:
+                raise BackupRestoreError(
+                    f"unknown section keys: {unknown}. Call GET /backup/sections "
+                    "for the catalog."
+                )
+            # ``platform_internal`` (alembic_version + oui_vendor)
+            # always rides along — the schema head pin + the OUI
+            # cache are install-state, not user-data, and a
+            # selective restore that omits them yields a confusing
+            # half-state.
+            effective = list(requested)
+            if "platform_internal" not in effective:
+                effective.append("platform_internal")
+            restored_tables = tables_for_sections(effective)
+            restored_sections = effective
+
+            dump_path = Path(tmpdir) / "database.dump"
+            dump_path.write_bytes(db_bytes)
+            # Step 1: wipe the selected sections' tables CASCADE
+            # (cross-section FK rows in non-selected sections also
+            # get cleared — this is documented in the operator UI).
+            await _truncate_tables(restored_tables, db_url)
+            # Step 2: data-only re-load from the archive.
+            await _run_pg_restore_data_only(dump_path, db_url, restored_tables)
+        elif dump_format == "custom":
             dump_path = Path(tmpdir) / "database.dump"
             dump_path.write_bytes(db_bytes)
             await _run_pg_restore(dump_path, db_url)
@@ -308,10 +464,15 @@ async def apply_backup_restore(
         manifest_schema_version=manifest.get("schema_version"),
         pre_restore_path=pre_restore_path,
         duration_ms=duration_ms,
+        selective=selective,
+        restored_sections=restored_sections,
     )
     return RestoreOutcome(
         manifest=manifest,
         pre_restore_path=pre_restore_path,
         secrets_payload_keys=sorted(secrets_payload.keys()),
         duration_ms=duration_ms,
+        selective=selective,
+        restored_sections=restored_sections,
+        restored_tables=restored_tables,
     )

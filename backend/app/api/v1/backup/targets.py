@@ -505,6 +505,10 @@ class RestoreFromArchiveBody(BaseModel):
     filename: str = Field(..., min_length=1, max_length=255)
     passphrase: str = Field(..., min_length=8, max_length=512)
     confirmation_phrase: str
+    #: Optional list of section keys (from ``GET /backup/sections``)
+    #: for selective restore. Empty / None → full hard-overwrite
+    #: restore (Phase 1 behaviour).
+    sections: list[str] | None = None
 
 
 @router.post("/{target_id}/archives/restore")
@@ -557,6 +561,7 @@ async def restore_from_archive(
             passphrase=body.passphrase,
             confirmation_phrase=body.confirmation_phrase,
             db_url=str(settings.database_url),
+            sections=body.sections or None,
         )
     except (BackupArchiveError, BackupCryptoError, BackupRestoreError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -583,6 +588,8 @@ async def restore_from_archive(
                     "filename": body.filename,
                     "manifest": outcome.manifest,
                     "duration_ms": outcome.duration_ms,
+                    "selective": outcome.selective,
+                    "restored_sections": outcome.restored_sections,
                     "pre_restore_safety_path": outcome.pre_restore_path,
                 },
             )
@@ -595,6 +602,8 @@ async def restore_from_archive(
         "duration_ms": outcome.duration_ms,
         "manifest": outcome.manifest,
         "pre_restore_safety_path": outcome.pre_restore_path,
+        "selective": outcome.selective,
+        "restored_sections": outcome.restored_sections,
     }
 
 

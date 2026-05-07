@@ -23,6 +23,7 @@ import {
   type BackupTargetKind,
   type BackupTargetUpdate,
 } from "@/lib/api";
+import { BackupSectionsPicker } from "./BackupSectionsPicker";
 
 /**
  * Backup Targets section on the Backup admin page (issue #117
@@ -446,12 +447,15 @@ function RestoreFromArchiveModal({
 }) {
   const [passphrase, setPassphrase] = useState("");
   const [confirm, setConfirm] = useState("");
+  const [mode, setMode] = useState<"full" | "selective">("full");
+  const [sections, setSections] = useState<string[]>([]);
   const restoreMut = useMutation({
     mutationFn: () =>
       backupTargetsApi.restoreFromArchive(targetId, {
         filename,
         passphrase,
         confirmation_phrase: confirm,
+        sections: mode === "selective" ? sections : null,
       }),
     onSuccess,
   });
@@ -459,20 +463,34 @@ function RestoreFromArchiveModal({
   const canSubmit =
     passphrase.length >= 8 &&
     confirm === "RESTORE-FROM-BACKUP" &&
-    !restoreMut.isPending;
+    !restoreMut.isPending &&
+    (mode !== "selective" || sections.length > 0);
 
   return (
     <div className="fixed inset-0 z-40 flex items-center justify-center bg-black/30 text-sm">
-      <div className="w-full max-w-md rounded-lg border bg-card p-5 shadow-lg">
+      <div className="max-h-[90vh] w-full max-w-lg overflow-auto rounded-lg border bg-card p-5 shadow-lg">
         <div className="mb-3 flex items-center gap-2">
           <RefreshCw className="h-4 w-4 text-primary" />
           <h3 className="font-semibold">Restore from archive</h3>
         </div>
         <div className="mb-3 rounded-md border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
-          <strong>Hard overwrite.</strong> The current install&apos;s data will
-          be replaced with the contents of{" "}
-          <code className="font-mono">{filename}</code>. A pre-restore safety
-          dump runs first; nothing about the destination archive is changed.
+          {mode === "full" ? (
+            <>
+              <strong>Hard overwrite.</strong> Every table on this install will
+              be replaced with the contents of{" "}
+              <code className="font-mono">{filename}</code>. A pre-restore
+              safety dump runs first; nothing about the destination archive is
+              changed.
+            </>
+          ) : (
+            <>
+              <strong>Selective restore.</strong> The selected sections will be
+              wiped + re-loaded from{" "}
+              <code className="font-mono">{filename}</code>. The rest of the
+              install is left untouched (with the FK-cascade caveat in the
+              section picker below).
+            </>
+          )}
         </div>
         <form
           className="space-y-3"
@@ -481,6 +499,12 @@ function RestoreFromArchiveModal({
             if (canSubmit) restoreMut.mutate();
           }}
         >
+          <BackupSectionsPicker
+            mode={mode}
+            onModeChange={setMode}
+            selected={sections}
+            onChange={setSections}
+          />
           <Field label="Passphrase" required>
             <input
               type="password"

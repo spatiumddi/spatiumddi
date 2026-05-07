@@ -2115,6 +2115,17 @@ export interface BackupRestoreResponse {
   manifest: BackupManifest;
   secrets_payload_keys: string[];
   note: string;
+  selective?: boolean;
+  restored_sections?: string[] | null;
+}
+
+export interface BackupSection {
+  key: string;
+  label: string;
+  description: string;
+  table_count: number;
+  volatile: boolean;
+  selectable: boolean;
 }
 
 export interface BackupManifestPreviewResponse {
@@ -2190,23 +2201,35 @@ export const backupApi = {
     return res.data;
   },
 
-  /** Apply a backup archive to the running install. Hard overwrite —
-   *  the operator must type ``RESTORE-FROM-BACKUP`` in
-   *  ``confirmationPhrase`` server-side or the request 400s. */
+  /** Apply a backup archive to the running install. Hard overwrite
+   *  by default; pass a non-empty ``sections`` list for selective
+   *  restore (Phase 2b). Operator must type
+   *  ``RESTORE-FROM-BACKUP`` in ``confirmationPhrase``. */
   restore: async (
     file: File,
     passphrase: string,
     confirmationPhrase: string,
+    sections?: string[],
   ): Promise<BackupRestoreResponse> => {
     const fd = new FormData();
     fd.append("archive", file);
     fd.append("passphrase", passphrase);
     fd.append("confirmation_phrase", confirmationPhrase);
+    if (sections && sections.length > 0) {
+      fd.append("sections", sections.join(","));
+    }
     const res = await api.post<BackupRestoreResponse>("/backup/restore", fd, {
       headers: { "Content-Type": "multipart/form-data" },
     });
     return res.data;
   },
+
+  /** Backup-section catalog (Phase 2a). Drives the selective-
+   *  restore checklist. */
+  listSections: () =>
+    api
+      .get<{ sections: BackupSection[] }>("/backup/sections")
+      .then((r) => r.data.sections),
 };
 
 // ── Backup targets (issue #117 Phase 1b) ──────────────────────────────────────
@@ -2367,6 +2390,7 @@ export const backupTargetsApi = {
       filename: string;
       passphrase: string;
       confirmation_phrase: string;
+      sections?: string[] | null;
     },
   ) =>
     api
@@ -2376,6 +2400,8 @@ export const backupTargetsApi = {
         duration_ms: number;
         manifest: BackupManifest;
         pre_restore_safety_path: string | null;
+        selective?: boolean;
+        restored_sections?: string[] | null;
       }>(`/backup/targets/${id}/archives/restore`, body)
       .then((r) => r.data),
 };

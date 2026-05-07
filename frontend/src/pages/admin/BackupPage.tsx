@@ -16,6 +16,7 @@ import {
   type BackupManifestPreviewResponse,
   type BackupRestoreResponse,
 } from "@/lib/api";
+import { BackupSectionsPicker } from "./BackupSectionsPicker";
 import { BackupTargetsSection } from "./BackupTargetsSection";
 
 /**
@@ -232,6 +233,8 @@ function RestoreBackupCard() {
   const [passphrase, setPassphrase] = useState("");
   const [confirm, setConfirm] = useState("");
   const [outcome, setOutcome] = useState<BackupRestoreResponse | null>(null);
+  const [mode, setMode] = useState<"full" | "selective">("full");
+  const [sections, setSections] = useState<string[]>([]);
 
   const previewMut = useMutation({
     mutationFn: (f: File) => backupApi.previewManifest(f),
@@ -248,7 +251,12 @@ function RestoreBackupCard() {
   const restoreMut = useMutation({
     mutationFn: () => {
       if (!file) throw new Error("no archive selected");
-      return backupApi.restore(file, passphrase, confirm);
+      return backupApi.restore(
+        file,
+        passphrase,
+        confirm,
+        mode === "selective" ? sections : undefined,
+      );
     },
     onSuccess: setOutcome,
   });
@@ -261,12 +269,20 @@ function RestoreBackupCard() {
     if (f) previewMut.mutate(f);
   }
 
+  const archiveIsCustomFormat =
+    preview?.manifest?.format_version === 2 ||
+    preview?.manifest?.format_version === undefined;
+  const selectiveBlockedByPlainFormat =
+    mode === "selective" && preview && !archiveIsCustomFormat;
+
   const canSubmit =
     !!file &&
     !!preview &&
     passphrase.length >= 8 &&
     confirm === CONFIRM_PHRASE &&
-    !restoreMut.isPending;
+    !restoreMut.isPending &&
+    !selectiveBlockedByPlainFormat &&
+    (mode !== "selective" || sections.length > 0);
 
   return (
     <section className="rounded-lg border bg-card p-5">
@@ -315,6 +331,22 @@ function RestoreBackupCard() {
           </div>
         )}
         {preview && <ManifestPreview preview={preview} />}
+
+        {preview && (
+          <BackupSectionsPicker
+            mode={mode}
+            onModeChange={setMode}
+            selected={sections}
+            onChange={setSections}
+          />
+        )}
+        {selectiveBlockedByPlainFormat && (
+          <div className="rounded-md border border-destructive/40 bg-destructive/5 px-3 py-2 text-xs text-destructive">
+            Selective restore requires a Phase 2+ archive (custom format). This
+            archive is plain SQL — switch to <em>Full restore</em> or re-export
+            the source install on a Phase 2+ build.
+          </div>
+        )}
 
         <Field label="Passphrase" required>
           <input

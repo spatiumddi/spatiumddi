@@ -158,6 +158,8 @@ class RestoreOutcomeResponse(BaseModel):
     manifest: dict[str, Any]
     secrets_payload_keys: list[str]
     note: str
+    selective: bool = False
+    restored_sections: list[str] | None = None
 
 
 @router.post("/restore", response_model=RestoreOutcomeResponse)
@@ -167,12 +169,20 @@ async def restore_backup(
     archive: UploadFile = File(...),
     passphrase: str = Form(..., min_length=8, max_length=512),
     confirmation_phrase: str = Form(...),
+    sections: str = Form(default=""),
 ) -> RestoreOutcomeResponse:
-    """Apply a backup archive — hard overwrite. The operator must
-    type the literal phrase ``RESTORE-FROM-BACKUP`` so accidental
-    drag-and-drops don't nuke the install. A pre-restore safety
-    dump is taken before any destructive change so botched
-    restores have a recovery path on the local filesystem.
+    """Apply a backup archive — hard overwrite OR selective per
+    sections. The operator must type the literal phrase
+    ``RESTORE-FROM-BACKUP`` so accidental drag-and-drops don't
+    nuke the install. A pre-restore safety dump is taken before
+    any destructive change so botched restores have a recovery
+    path on the local filesystem.
+
+    When ``sections`` is empty (Phase 1 default) the call is a
+    full restore. Pass a comma-separated list of section keys
+    (from ``GET /backup/sections``) for a selective restore;
+    those sections' tables are TRUNCATEd CASCADE and re-loaded
+    from the archive while the rest stay untouched.
     """
     _require_superadmin(current_user)
 
@@ -185,6 +195,7 @@ async def restore_backup(
             detail=f"archive exceeds {_MAX_UPLOAD_BYTES} bytes",
         )
 
+    sections_list = [s.strip() for s in sections.split(",") if s.strip()] or None
     try:
         outcome = await apply_backup_restore(
             db,
@@ -192,6 +203,7 @@ async def restore_backup(
             passphrase=passphrase,
             confirmation_phrase=confirmation_phrase,
             db_url=str(settings.database_url),
+            sections=sections_list,
         )
     except (BackupArchiveError, BackupCryptoError, BackupRestoreError) as exc:
         # Same shape for archive / crypto / restore errors — the
@@ -261,6 +273,8 @@ async def restore_backup(
         manifest=outcome.manifest,
         secrets_payload_keys=outcome.secrets_payload_keys,
         note=note,
+        selective=outcome.selective,
+        restored_sections=outcome.restored_sections,
     )
 
 
