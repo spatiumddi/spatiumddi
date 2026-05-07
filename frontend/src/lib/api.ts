@@ -2095,6 +2095,107 @@ export const auditApi = {
       .then((r) => r.data),
 };
 
+// ── BGP enrichment — RIPEstat + PeeringDB (issue #122) ───────────────────────
+
+export interface BgpAnnouncedPrefix {
+  prefix: string;
+  first_seen: string | null;
+  last_seen: string | null;
+}
+
+export interface BgpAnnouncedPrefixesResponse {
+  available: boolean;
+  asn: number;
+  prefixes?: BgpAnnouncedPrefix[];
+  ipv4_count?: number;
+  ipv6_count?: number;
+  error?: string;
+}
+
+export interface BgpPrefixOriginResponse {
+  available: boolean;
+  resource: string;
+  prefix?: string;
+  is_less_specific?: boolean;
+  asns?: { asn: number; holder: string | null }[];
+  block?: Record<string, unknown> | null;
+  announced?: boolean;
+  error?: string;
+}
+
+export interface BgpRoutingHistoryEvent {
+  asn: number;
+  starttime: string | null;
+  endtime: string | null;
+}
+
+export interface BgpRoutingHistoryResponse {
+  available: boolean;
+  resource: string;
+  events?: BgpRoutingHistoryEvent[];
+  error?: string;
+}
+
+export interface BgpIxpRow {
+  ix_name: string | null;
+  city: string | null;
+  speed_mbit: number | null;
+  ipv4: string | null;
+  ipv6: string | null;
+  is_rs_peer: boolean;
+  operational: boolean;
+}
+
+export interface BgpIxpsResponse {
+  available: boolean;
+  asn: number;
+  ixps?: BgpIxpRow[];
+  ixp_count?: number;
+  error?: string;
+}
+
+export interface BgpPeeringProfileResponse {
+  available: boolean;
+  asn: number;
+  found?: boolean;
+  name?: string | null;
+  aka?: string | null;
+  info_type?: string | null;
+  info_traffic?: string | null;
+  info_scope?: string | null;
+  policy_general?: string | null;
+  policy_locations?: string | null;
+  irr_as_set?: string | null;
+  looking_glass?: string | null;
+  website?: string | null;
+  error?: string;
+}
+
+export const bgpApi = {
+  announcedPrefixes: (asn: number) =>
+    api
+      .get<BgpAnnouncedPrefixesResponse>(`/bgp/asn/${asn}/announced-prefixes`)
+      .then((r) => r.data),
+  asnNetwork: (asn: number) =>
+    api
+      .get<BgpPeeringProfileResponse>(`/bgp/asn/${asn}/network`)
+      .then((r) => r.data),
+  asnIxps: (asn: number) =>
+    api.get<BgpIxpsResponse>(`/bgp/asn/${asn}/ixps`).then((r) => r.data),
+  prefixOrigin: (resource: string) =>
+    api
+      .get<BgpPrefixOriginResponse>("/bgp/prefix/origin", {
+        params: { resource },
+      })
+      .then((r) => r.data),
+  prefixRoutingHistory: (resource: string) =>
+    api
+      .get<BgpRoutingHistoryResponse>("/bgp/prefix/routing-history", {
+        params: { resource },
+      })
+      .then((r) => r.data),
+};
+
 // ── Diagnostics — uncaught exceptions (issue #123) ────────────────────────────
 
 export interface InternalErrorListItem {

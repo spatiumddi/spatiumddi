@@ -13,6 +13,7 @@ from app.api.v1.asns import router as asns_router
 from app.api.v1.audit.router import router as audit_router
 from app.api.v1.auth.router import router as auth_router
 from app.api.v1.auth_providers.router import router as auth_providers_router
+from app.api.v1.bgp import router as bgp_router
 from app.api.v1.circuits import router as circuits_router
 from app.api.v1.conformity import router as conformity_router
 from app.api.v1.custom_fields.router import router as custom_fields_router
@@ -86,6 +87,7 @@ api_v1_router.include_router(auth_router, prefix="/auth", tags=["auth"])
 api_v1_router.include_router(
     auth_providers_router, prefix="/auth-providers", tags=["auth-providers"]
 )
+api_v1_router.include_router(bgp_router, prefix="/bgp", tags=["bgp"])
 api_v1_router.include_router(
     circuits_router,
     prefix="/circuits",
