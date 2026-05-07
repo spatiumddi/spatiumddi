@@ -100,6 +100,28 @@ class PXEClassDef:
 
 
 @dataclass(frozen=True)
+class PhoneClassDef:
+    """A rendered VoIP phone client-class (issue #112 phase 1).
+
+    Same shape as :class:`ClientClassDef` — a name, a Kea ``test``
+    expression, and an option-data dict — but kept as a separate type
+    so the assembler / driver can layer phone-specific logic later
+    (subnet-scoped class evaluation, vendor-class chip rendering in
+    config diff, etc) without disturbing the generic client-classes
+    pipeline.
+
+    The ``options`` dict carries Kea ``option-data`` entries keyed by
+    the SpatiumDDI option-name lookup (same map the renderer applies
+    to scope-level options). Entries with no ``name`` mapping fall
+    back to ``code: <int>`` form which Kea also accepts.
+    """
+
+    name: str
+    match_expression: str
+    options: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(frozen=True)
 class MACBlockDef:
     """A blocked MAC address — group-global deny entry.
 
@@ -186,6 +208,7 @@ class ConfigBundle:
     generated_at: datetime
     mac_blocks: tuple[MACBlockDef, ...] = ()
     pxe_classes: tuple[PXEClassDef, ...] = ()
+    phone_classes: tuple[PhoneClassDef, ...] = ()
     etag: str = ""
     # Populated when the server's group has ≥ 2 Kea members. The
     # agent's Kea renderer injects ``libdhcp_ha.so`` + the ``high-
@@ -204,6 +227,7 @@ class ConfigBundle:
             "client_classes": [asdict(c) for c in self.client_classes],
             "mac_blocks": [asdict(m) for m in self.mac_blocks],
             "pxe_classes": [asdict(p) for p in self.pxe_classes],
+            "phone_classes": [asdict(c) for c in self.phone_classes],
             "failover": asdict(self.failover) if self.failover else None,
         }
         blob = json.dumps(payload, sort_keys=True, default=str).encode("utf-8")
@@ -415,6 +439,7 @@ __all__ = [
     "ExclusionResult",
     "MACBlockDef",
     "PXEClassDef",
+    "PhoneClassDef",
     "PoolDef",
     "RemoveReservationItem",
     "ReservationItem",

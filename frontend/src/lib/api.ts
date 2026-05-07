@@ -4469,6 +4469,64 @@ export interface PXEProfileUpdate {
   matches?: PXEArchMatchInput[];
 }
 
+// ── VoIP phone profiles (issue #112 phase 1) ────────────────────────────
+
+export interface VoIPVendorOption {
+  code: number;
+  name: string;
+  kind: string;
+  use: string;
+}
+
+export interface VoIPVendor {
+  vendor: string;
+  match_hint: string;
+  description: string;
+  options: VoIPVendorOption[];
+}
+
+export interface PhoneOption {
+  code: number;
+  name?: string | null;
+  value: string;
+}
+
+export interface PhoneProfile {
+  id: string;
+  group_id: string;
+  name: string;
+  description: string;
+  enabled: boolean;
+  vendor: string | null;
+  vendor_class_match: string | null;
+  option_set: PhoneOption[];
+  tags: Record<string, unknown>;
+  scope_ids: string[];
+  created_at: string;
+  modified_at: string;
+}
+
+export interface PhoneProfileCreate {
+  name: string;
+  description?: string;
+  enabled?: boolean;
+  vendor?: string | null;
+  vendor_class_match?: string | null;
+  option_set?: PhoneOption[];
+  tags?: Record<string, unknown>;
+  scope_ids?: string[];
+}
+
+export interface PhoneProfileUpdate {
+  name?: string;
+  description?: string;
+  enabled?: boolean;
+  vendor?: string | null;
+  vendor_class_match?: string | null;
+  option_set?: PhoneOption[];
+  tags?: Record<string, unknown>;
+}
+
 export const dhcpApi = {
   listGroups: () =>
     api.get<DHCPServerGroup[]>("/dhcp/server-groups").then((r) => r.data),
@@ -4655,6 +4713,36 @@ export const dhcpApi = {
       .then((r) => r.data),
   deletePxeProfile: (profileId: string) =>
     api.delete(`/dhcp/pxe-profiles/${profileId}`),
+
+  // ── VoIP phone profiles (issue #112 phase 1) ────────────────────────
+  listVoipVendors: () =>
+    api.get<VoIPVendor[]>(`/dhcp/voip-options`).then((r) => r.data),
+  listPhoneProfiles: (groupId: string) =>
+    api
+      .get<PhoneProfile[]>(`/dhcp/server-groups/${groupId}/phone-profiles`)
+      .then((r) => r.data),
+  createPhoneProfile: (groupId: string, body: PhoneProfileCreate) =>
+    api
+      .post<PhoneProfile>(`/dhcp/server-groups/${groupId}/phone-profiles`, body)
+      .then((r) => r.data),
+  updatePhoneProfile: (profileId: string, body: PhoneProfileUpdate) =>
+    api
+      .put<PhoneProfile>(`/dhcp/phone-profiles/${profileId}`, body)
+      .then((r) => r.data),
+  deletePhoneProfile: (profileId: string) =>
+    api.delete(`/dhcp/phone-profiles/${profileId}`),
+  setPhoneProfileScopes: (profileId: string, scope_ids: string[]) =>
+    api
+      .put<PhoneProfile>(`/dhcp/phone-profiles/${profileId}/scopes`, {
+        scope_ids,
+      })
+      .then((r) => r.data),
+  seedPhoneProfileStarterPack: (groupId: string) =>
+    api
+      .post<
+        PhoneProfile[]
+      >(`/dhcp/server-groups/${groupId}/phone-profiles/seed-starter-pack`)
+      .then((r) => r.data),
 
   listMacBlocks: (groupId: string) =>
     api

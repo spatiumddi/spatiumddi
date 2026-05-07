@@ -23,6 +23,7 @@ from app.drivers.dhcp.base import (
     ConfigBundle,
     FailoverConfig,
     MACBlockDef,
+    PhoneClassDef,
     PoolDef,
     PXEClassDef,
     ScopeDef,
@@ -32,6 +33,8 @@ from app.drivers.dhcp.base import (
 from app.models.dhcp import (
     DHCPClientClass,
     DHCPMACBlock,
+    DHCPPhoneProfile,
+    DHCPPhoneProfileScope,
     DHCPPXEArchMatch,
     DHCPScope,
     DHCPServer,
@@ -235,6 +238,7 @@ async def build_config_bundle(db: AsyncSession, server: DHCPServer) -> ConfigBun
     )
 
     pxe_classes = await _assemble_pxe_classes(db, scope_rows)
+    phone_classes = await _assemble_phone_classes(db, scope_rows)
 
     failover = await _resolve_failover(db, server, group)
     bundle = ConfigBundle(
@@ -247,6 +251,7 @@ async def build_config_bundle(db: AsyncSession, server: DHCPServer) -> ConfigBun
         client_classes=client_classes,
         mac_blocks=mac_blocks,
         pxe_classes=pxe_classes,
+        phone_classes=phone_classes,
         generated_at=datetime.now(UTC),
         failover=failover,
     )
@@ -336,6 +341,76 @@ async def _assemble_pxe_classes(
                 next_server=str(prof.next_server),
                 boot_file_name=m.boot_filename,
                 is_ipxe_chain=(m.match_kind == "ipxe_chain"),
+            )
+        )
+    return tuple(out)
+
+
+async def _assemble_phone_classes(
+    db: AsyncSession, scope_rows: list[DHCPScope]
+) -> tuple[PhoneClassDef, ...]:
+    """Walk phone profiles attached to any of the bundle's scopes and
+    emit one Kea client-class per enabled profile (issue #112).
+
+    A phone profile attached to *any* scope drives lease-time options
+    for matching clients group-wide — Kea evaluates classes globally.
+    Per-subnet gating is intentionally not enforced in Phase 1; vendor
+    fences are the primary scoping mechanism (a Polycom phone matches
+    the Polycom class regardless of which voice VLAN it landed in).
+
+    Class name: ``voip-{profile_id[:8]}``. Stable across runs so the
+    bundle ETag doesn't churn on rebuild.
+    """
+    if not scope_rows:
+        return ()
+    scope_ids = [s.id for s in scope_rows]
+
+    profile_ids_res = await db.execute(
+        select(DHCPPhoneProfileScope.profile_id)
+        .where(DHCPPhoneProfileScope.scope_id.in_(scope_ids))
+        .distinct()
+    )
+    profile_ids = [row[0] for row in profile_ids_res.all()]
+    if not profile_ids:
+        return ()
+
+    profiles_res = await db.execute(
+        select(DHCPPhoneProfile)
+        .where(DHCPPhoneProfile.id.in_(profile_ids))
+        .order_by(DHCPPhoneProfile.name)
+    )
+    profiles = list(profiles_res.scalars().all())
+
+    out: list[PhoneClassDef] = []
+    for prof in profiles:
+        if not prof.enabled:
+            continue
+        match_expr = ""
+        if prof.vendor_class_match:
+            n = len(prof.vendor_class_match)
+            match_expr = f"substring(option[60].hex,0,{n})=='{prof.vendor_class_match}'"
+        # Convert option_set list-of-dicts into Kea-flavoured option-data
+        # keyed by option-name. The renderer in ``drivers/dhcp/kea.py``
+        # walks the dict and falls back to ``code: <int>`` form when the
+        # entry has no recognised name. Trailing options with empty
+        # values get dropped so the class doesn't render an empty line.
+        options: dict[str, str] = {}
+        for opt in prof.option_set or []:
+            name = opt.get("name") if isinstance(opt, dict) else None
+            value = opt.get("value") if isinstance(opt, dict) else None
+            code = opt.get("code") if isinstance(opt, dict) else None
+            if not value:
+                continue
+            key = name or (f"code:{code}" if code else None)
+            if not key:
+                continue
+            options[str(key)] = str(value)
+
+        out.append(
+            PhoneClassDef(
+                name=f"voip-{str(prof.id)[:8]}",
+                match_expression=match_expr,
+                options=options,
             )
         )
     return tuple(out)

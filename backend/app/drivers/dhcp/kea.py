@@ -21,6 +21,7 @@ from app.drivers.dhcp.base import (
     ClientClassDef,
     ConfigBundle,
     DHCPDriver,
+    PhoneClassDef,
     PoolDef,
     PXEClassDef,
     ScopeDef,
@@ -84,6 +85,11 @@ def _render_option_data(
     ``address_family="ipv6"`` routes through the Dhcp6 name map and
     drops options that don't exist in DHCPv6 — emitting a v4 option
     under the Dhcp6 block would make Kea reject the config on reload.
+
+    Keys prefixed with ``code:NN`` are emitted with ``"code": NN`` form
+    rather than ``"name"`` — used by phone-profile classes for vendor-
+    specific options (option 160 / 161 / 242 / etc) that Kea doesn't
+    recognise by name without a separate ``option-def``.
     """
     is_v6 = address_family == "ipv6"
     name_map = _KEA_OPTION_NAMES_V6 if is_v6 else _KEA_OPTION_NAMES
@@ -96,11 +102,18 @@ def _render_option_data(
                 reason="no DHCPv6 equivalent",
             )
             continue
-        kea_name = name_map.get(key, key)
         if isinstance(val, list):
             data = ", ".join(str(x) for x in val)
         else:
             data = str(val)
+        if key.startswith("code:"):
+            try:
+                code_int = int(key[5:])
+            except ValueError:
+                continue
+            out.append({"code": code_int, "data": data})
+            continue
+        kea_name = name_map.get(key, key)
         out.append({"name": kea_name, "data": data})
     return out
 
@@ -171,6 +184,24 @@ def _render_client_class(c: ClientClassDef, *, address_family: str = "ipv4") -> 
     return d
 
 
+def _render_phone_class(p: PhoneClassDef) -> dict[str, Any]:
+    """Render a VoIP phone client-class for Dhcp4 ``client-classes``
+    (issue #112).
+
+    Same shape as a regular client-class — ``name``, ``test``,
+    ``option-data`` — but option-data goes through the
+    ``code:NN`` aware renderer so vendor options that Kea doesn't know
+    by name (160 / 161 / 242 / etc) emit with ``"code": NN`` form
+    instead of producing a load-time error.
+    """
+    d: dict[str, Any] = {"name": p.name}
+    if p.match_expression:
+        d["test"] = p.match_expression
+    if p.options:
+        d["option-data"] = _render_option_data(p.options, address_family="ipv4")
+    return d
+
+
 def _render_pxe_class(p: PXEClassDef) -> dict[str, Any]:
     """Render a PXE / iPXE class for Dhcp4 ``client-classes`` (issue #51).
 
@@ -222,7 +253,8 @@ class KeaDriver(DHCPDriver):
                 "client-classes": [
                     _render_client_class(c, address_family="ipv4") for c in bundle.client_classes
                 ]
-                + [_render_pxe_class(p) for p in bundle.pxe_classes],
+                + [_render_pxe_class(p) for p in bundle.pxe_classes]
+                + [_render_phone_class(p) for p in bundle.phone_classes],
                 "option-data": _render_option_data(bundle.options.options, address_family="ipv4"),
             }
         if v6_scopes:

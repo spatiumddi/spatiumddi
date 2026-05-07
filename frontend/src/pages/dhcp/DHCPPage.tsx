@@ -50,6 +50,7 @@ import { CreateScopeModal } from "./CreateScopeModal";
 import { CreateClientClassModal } from "./CreateClientClassModal";
 import { CreateOptionTemplateModal } from "./CreateOptionTemplateModal";
 import { MacBlocksTab } from "./MacBlocksTab";
+import { PhoneProfilesTab } from "./PhoneProfilesTab";
 import { DeleteConfirmModal, StatusDot } from "./_shared";
 
 type Selection =
@@ -307,7 +308,8 @@ type GroupTab =
   | "statics"
   | "classes"
   | "option-templates"
-  | "mac-blocks";
+  | "mac-blocks"
+  | "phone-profiles";
 
 function GroupDetailView({
   group,
@@ -455,6 +457,12 @@ function GroupDetailView({
             >
               MAC Blocks
             </TabButton>
+            <TabButton
+              active={tab === "phone-profiles"}
+              onClick={() => setTab("phone-profiles")}
+            >
+              Phone Profiles
+            </TabButton>
           </div>
         </div>
       )}
@@ -479,6 +487,9 @@ function GroupDetailView({
           <OptionTemplatesTab groupId={group.id} />
         )}
         {isKea && tab === "mac-blocks" && <MacBlocksTab groupId={group.id} />}
+        {isKea && tab === "phone-profiles" && (
+          <PhoneProfilesTab groupId={group.id} />
+        )}
       </div>
     </div>
   );

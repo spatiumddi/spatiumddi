@@ -654,6 +654,73 @@ class DHCPPXEArchMatch(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     profile: Mapped[DHCPPXEProfile] = relationship("DHCPPXEProfile", back_populates="matches")
 
 
+class DHCPPhoneProfile(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """A reusable VoIP phone provisioning profile (issue #112 phase 1).
+
+    Group-scoped (mirrors how scopes / pools / statics / PXE profiles
+    live on ``DHCPServerGroup``). One profile carries:
+
+    - a ``vendor_class_match`` substring (option-60 vendor-class-id)
+      that fences which clients receive its option set
+    - an ``option_set`` JSONB list of ``{code, name, value}`` triples
+      delivered as Kea ``option-data`` when the match fires
+
+    Attached to one or more scopes via the ``dhcp_phone_profile_scope``
+    join table — the same profile can be reused across multiple voice
+    VLANs without copy-pasting the option set. The Kea driver emits
+    one client-class per profile (gated by the vendor-class match);
+    Kea evaluates classes globally, so a profile attached to *any*
+    scope drives lease-time options for matching clients group-wide.
+    """
+
+    __tablename__ = "dhcp_phone_profile"
+    __table_args__ = (
+        UniqueConstraint("group_id", "name", name="uq_dhcp_phone_profile_group_name"),
+    )
+
+    group_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dhcp_server_group.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    # Curated vendor label from the VoIP options catalog (Polycom /
+    # Yealink / Cisco SPA / etc). Optional — operators can roll their
+    # own profile that doesn't map to a curated vendor.
+    vendor: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Substring match on DHCP option-60 (vendor-class-id). Empty / null
+    # means "always match" (paired with a low priority + scope
+    # attachment for fencing).
+    vendor_class_match: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # Option set delivered when the match fires. Shape:
+    # ``[{"code": 66, "name": "tftp-server-name", "value": "..."}, ...]``
+    # ``name`` is the Kea option-data name (or the SpatiumDDI alias);
+    # the renderer prefers the curated name from the option-code library
+    # when ``code`` is set and ``name`` is omitted.
+    option_set: Mapped[list[dict]] = mapped_column(JSONB, nullable=False, default=list)
+    tags: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+
+
+class DHCPPhoneProfileScope(Base):
+    """M:N join — a phone profile can attach to many scopes and vice versa."""
+
+    __tablename__ = "dhcp_phone_profile_scope"
+
+    profile_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dhcp_phone_profile.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    scope_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dhcp_scope.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+
+
 __all__ = [
     "DHCPServerGroup",
     "DHCPServer",
@@ -665,6 +732,8 @@ __all__ = [
     "DHCPMACBlock",
     "DHCPPXEProfile",
     "DHCPPXEArchMatch",
+    "DHCPPhoneProfile",
+    "DHCPPhoneProfileScope",
     "DHCPLease",
     "DHCPConfigOp",
     "DHCPRecordOp",

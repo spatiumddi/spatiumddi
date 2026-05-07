@@ -39,6 +39,44 @@ last three releases retroactively.
 
 ### Added
 
+- **VoIP phone profiles — Phase 1 (issue #112).** Reusable
+  vendor-class-fenced DHCP option recipes for VoIP phones. Three
+  pieces ship together:
+  - **Curated VoIP options catalog** (`dhcp_voip_options.json`,
+    `GET /dhcp/voip-options`) — 9 vendors (Polycom / Yealink /
+    Cisco SPA / Cisco IP Phone / Mitel / Avaya / Snom /
+    Grandstream / Aastra) with the DHCP options each vendor's
+    phones look for at boot (option 66 / 150 / 132 / 160 / 161 /
+    176 / 242 / 43 sub-options).
+  - **`DHCPPhoneProfile` + M:N scope attachment** — a profile is
+    a `vendor_class_match` (option-60 substring) plus an
+    `option_set` JSONB list of `{code, name, value}`. The same
+    profile attaches to multiple voice VLANs without duplication
+    via `dhcp_phone_profile_scope`. CRUD at
+    `/dhcp/server-groups/{group_id}/phone-profiles` with
+    starter-pack seeding at `…/seed-starter-pack` (creates
+    disabled profiles for all 9 vendors with placeholder
+    `CHANGE-ME` values; idempotent).
+  - **Kea driver render path** — the assembler walks every
+    profile attached to any of the bundle's scopes and emits one
+    `client-class` per enabled profile with the vendor-class
+    fence as the `test` expression. Vendor options Kea doesn't
+    know by name (160 / 161 / 242 / etc) render with `"code": NN`
+    form rather than tripping a load-time error. Phone classes
+    sit in Dhcp4 client-classes alongside regular + PXE classes.
+  - **Frontend Phone Profiles tab** on the Kea-managed group
+    page (added in #113), with vendor-grouped picker that auto-
+    fills the option set when the operator selects a curated
+    vendor, plus M:N scope-attachment checklist showing each
+    scope's CIDR + name. Only renders on Kea-managed groups —
+    Windows-DHCP groups don't see the tab.
+  - **MCP `list_phone_profiles`** for the Operator Copilot —
+    rolls up scope-attachment counts in one query rather than
+    walking per-row. Migration `e4d8c2a91f7b`. Phase 2 (subnet
+    voice-segment metadata + filter + alert rule + conformity
+    check) and Phase 3 (OUI vendor enrichment for phones) stay
+    deferred per the issue's phasing.
+
 - **DHCP group-centric UI — Kea servers only (issue #113).** The
   scopes / pools / static assignments / client classes / option
   templates / MAC blocks tabs now live on the **group detail

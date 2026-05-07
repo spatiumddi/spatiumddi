@@ -1,0 +1,83 @@
+{
+  "source": "Curated per-vendor VoIP DHCP-option roster (issue #112). Each vendor entry lists the DHCP options that vendor's phones look for when bootstrapping their TFTP / HTTP provisioning server. The match_hint is the DHCP option-60 (vendor-class-id) substring that operators most commonly use to fence the matching client-class.",
+  "vendors": [
+    {
+      "vendor": "Polycom",
+      "match_hint": "Polycom",
+      "description": "Polycom VVX / SoundPoint / SoundStation phones. Modern firmware reads option 160 first; older firmware falls back to option 66.",
+      "options": [
+        { "code": 66,  "name": "tftp-server-name",    "kind": "string",       "use": "Provisioning server hostname (legacy fallback)." },
+        { "code": 160, "name": "polycom-config-url",  "kind": "string",       "use": "Provisioning URL — recommended over option 66 for VVX firmware." }
+      ]
+    },
+    {
+      "vendor": "Yealink",
+      "match_hint": "yealink",
+      "description": "Yealink T-series phones (T19/T2x/T4x/T5x). Reads option 66 + option 161.",
+      "options": [
+        { "code": 66,  "name": "tftp-server-name",    "kind": "string",       "use": "Provisioning server hostname." },
+        { "code": 161, "name": "yealink-prov-server", "kind": "string",       "use": "Provisioning server URL — Yealink-specific." }
+      ]
+    },
+    {
+      "vendor": "Cisco SPA",
+      "match_hint": "Cisco SPA",
+      "description": "Cisco SPA / Linksys SPA series (SPA303/SPA50x/SPA52x). Reads option 66 + option 150 + option 132.",
+      "options": [
+        { "code": 66,  "name": "tftp-server-name",    "kind": "string",       "use": "Provisioning server hostname." },
+        { "code": 150, "name": "tftp-server-address", "kind": "ipv4-list",    "use": "TFTP server IP list (RFC 5859) — Cisco preferred over option 66." },
+        { "code": 132, "name": "voice-vlan-id",       "kind": "string",       "use": "Voice VLAN ID — Cisco SPA-specific." }
+      ]
+    },
+    {
+      "vendor": "Cisco IP Phone",
+      "match_hint": "Cisco IP Phone",
+      "description": "Cisco IP Phone 7800/8800 series (Enterprise CallManager-registered).",
+      "options": [
+        { "code": 150, "name": "tftp-server-address", "kind": "ipv4-list",    "use": "TFTP server IP list (CallManager TFTP)." }
+      ]
+    },
+    {
+      "vendor": "Mitel",
+      "match_hint": "Mitel",
+      "description": "Mitel phones (Aastra heritage). Uses option 43 vendor-specific sub-options.",
+      "options": [
+        { "code": 43,  "name": "vendor-encapsulated-options", "kind": "binhex", "use": "Vendor sub-option bundle — encode call server / TFTP / image URL per Mitel docs." }
+      ]
+    },
+    {
+      "vendor": "Avaya",
+      "match_hint": "Avaya",
+      "description": "Avaya 9600 / J-series phones. Modern firmware reads option 242; legacy firmware reads option 176.",
+      "options": [
+        { "code": 242, "name": "avaya-call-server",   "kind": "string",       "use": "Comma-separated call-server config string (modern Avaya)." },
+        { "code": 176, "name": "avaya-call-server-legacy", "kind": "string",  "use": "Legacy call-server config string." }
+      ]
+    },
+    {
+      "vendor": "Snom",
+      "match_hint": "snom",
+      "description": "Snom phones. Reads option 66 for the provisioning server hostname.",
+      "options": [
+        { "code": 66,  "name": "tftp-server-name",    "kind": "string",       "use": "Provisioning server hostname (HTTP / HTTPS / TFTP per Snom URL syntax)." }
+      ]
+    },
+    {
+      "vendor": "Grandstream",
+      "match_hint": "Grandstream",
+      "description": "Grandstream GXP / GXV phones. Reads option 66 for the provisioning server.",
+      "options": [
+        { "code": 66,  "name": "tftp-server-name",    "kind": "string",       "use": "Provisioning server hostname." }
+      ]
+    },
+    {
+      "vendor": "Aastra",
+      "match_hint": "AastraIPPhone",
+      "description": "Aastra phones (now Mitel — kept separate for older firmware that still identifies as Aastra).",
+      "options": [
+        { "code": 43,  "name": "vendor-encapsulated-options", "kind": "binhex", "use": "Aastra sub-option bundle." },
+        { "code": 66,  "name": "tftp-server-name",    "kind": "string",       "use": "Provisioning server hostname (newer firmware)." }
+      ]
+    }
+  ]
+}

@@ -15,6 +15,8 @@ from app.models.dhcp import (
     DHCPLease,
     DHCPMACBlock,
     DHCPOptionTemplate,
+    DHCPPhoneProfile,
+    DHCPPhoneProfileScope,
     DHCPPool,
     DHCPPXEProfile,
     DHCPScope,
@@ -486,6 +488,88 @@ async def list_pxe_profiles(
                 }
                 for m in (p.matches or [])
             ],
+        }
+        for p in rows
+    ]
+
+
+# ── list_phone_profiles ──────────────────────────────────────────────
+
+
+class ListPhoneProfilesArgs(BaseModel):
+    group_id: str | None = Field(default=None, description="Filter by DHCP server group UUID.")
+    enabled: bool | None = Field(default=None, description="Filter by ``enabled`` flag.")
+    vendor: str | None = Field(default=None, description="Filter by curated vendor label.")
+    search: str | None = Field(default=None, description="Substring match on profile name.")
+    limit: int = Field(default=50, ge=1, le=500)
+
+
+@register_tool(
+    name="list_phone_profiles",
+    description=(
+        "List VoIP phone provisioning profiles — group-scoped, attached "
+        "to scopes via the dhcp_phone_profile_scope join. Each row "
+        "carries id, group_id, name, vendor (curated label like "
+        "'Polycom' / 'Yealink' / 'Cisco SPA' or null for custom), "
+        "vendor_class_match (option-60 substring fence), enabled "
+        "flag, the option set delivered (DHCP option codes + values), "
+        "and the count of attached scopes. Use for 'is the Polycom "
+        "profile attached anywhere?' or 'which voice VLANs have phone "
+        "profiles?'."
+    ),
+    args_model=ListPhoneProfilesArgs,
+    category="dhcp",
+)
+async def list_phone_profiles(
+    db: AsyncSession, user: User, args: ListPhoneProfilesArgs
+) -> list[dict[str, Any]]:
+    stmt = select(DHCPPhoneProfile)
+    if args.group_id:
+        stmt = stmt.where(DHCPPhoneProfile.group_id == args.group_id)
+    if args.enabled is not None:
+        stmt = stmt.where(DHCPPhoneProfile.enabled.is_(args.enabled))
+    if args.vendor:
+        stmt = stmt.where(func.lower(DHCPPhoneProfile.vendor) == args.vendor.lower())
+    if args.search:
+        stmt = stmt.where(func.lower(DHCPPhoneProfile.name).like(f"%{args.search.lower()}%"))
+    stmt = stmt.order_by(DHCPPhoneProfile.name.asc()).limit(args.limit)
+    rows = list((await db.execute(stmt)).scalars().all())
+
+    if not rows:
+        return []
+
+    # Roll up scope-attachment counts in one query rather than per-row.
+    counts_stmt = (
+        select(
+            DHCPPhoneProfileScope.profile_id,
+            func.count(DHCPPhoneProfileScope.scope_id),
+        )
+        .where(DHCPPhoneProfileScope.profile_id.in_([p.id for p in rows]))
+        .group_by(DHCPPhoneProfileScope.profile_id)
+    )
+    counts: dict[Any, int] = {}
+    for pid, n in (await db.execute(counts_stmt)).all():
+        counts[pid] = int(n)
+
+    return [
+        {
+            "id": str(p.id),
+            "group_id": str(p.group_id),
+            "name": p.name,
+            "description": p.description,
+            "vendor": p.vendor,
+            "vendor_class_match": p.vendor_class_match,
+            "enabled": p.enabled,
+            "option_count": len(p.option_set or []),
+            "options": [
+                {
+                    "code": o.get("code"),
+                    "name": o.get("name"),
+                    "value": o.get("value"),
+                }
+                for o in (p.option_set or [])
+            ],
+            "scope_count": counts.get(p.id, 0),
         }
         for p in rows
     ]

@@ -8,12 +8,14 @@ from app.api.v1.dhcp.lease_history import router as lease_history_router
 from app.api.v1.dhcp.mac_blocks import router as mac_blocks_router
 from app.api.v1.dhcp.option_codes import router as option_codes_router
 from app.api.v1.dhcp.option_templates import router as option_templates_router
+from app.api.v1.dhcp.phone_profiles import router as phone_profiles_router
 from app.api.v1.dhcp.pools import router as pools_router
 from app.api.v1.dhcp.pxe_profiles import router as pxe_profiles_router
 from app.api.v1.dhcp.scopes import router as scopes_router
 from app.api.v1.dhcp.server_groups import router as server_groups_router
 from app.api.v1.dhcp.servers import router as servers_router
 from app.api.v1.dhcp.statics import router as statics_router
+from app.api.v1.dhcp.voip_options import router as voip_options_router
 
 router = APIRouter()
 router.include_router(server_groups_router)
@@ -22,11 +24,13 @@ router.include_router(lease_history_router)
 router.include_router(scopes_router)
 router.include_router(pools_router)
 router.include_router(pxe_profiles_router)
+router.include_router(phone_profiles_router)
 router.include_router(statics_router)
 router.include_router(client_classes_router)
 router.include_router(mac_blocks_router)
 router.include_router(option_codes_router)
 router.include_router(option_templates_router)
+router.include_router(voip_options_router)
 router.include_router(agents_router)
 
 __all__ = ["router"]
