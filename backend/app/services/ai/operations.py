@@ -657,6 +657,317 @@ register(
 )
 
 
+# ── create_dns_zone (issue #127 Phase 4e) ─────────────────────────────
+
+
+_DNS_DRIVER_HINTS = {"bind9", "powerdns", "windows_dns"}
+# DNSSEC online signing + ALIAS + LUA records require the PowerDNS
+# driver — the preview rejects when ``dnssec_enabled=true`` lands in a
+# group whose servers don't include any PowerDNS member, since signing
+# would fail at apply time and confuse the operator.
+_POWERDNS_ONLY_FEATURES = ("dnssec_enabled",)
+
+
+class CreateDNSZoneArgs(BaseModel):
+    """Args for the ``create_dns_zone`` operation.
+
+    ``driver_hint`` (issue #127 Phase 4e) lets the model express the
+    operator's intent — "I need DNSSEC online signing, so this zone
+    has to land on a PowerDNS group" — without forcing it to know the
+    exact group UUID. When supplied, the preview either:
+
+    * uses ``driver_hint`` to select a matching group when
+      ``group_id`` is omitted, OR
+    * cross-checks ``driver_hint`` against an explicit ``group_id``
+      and rejects on driver mismatch (e.g. operator picked a BIND9
+      group but asked for ``driver_hint="powerdns"``).
+    """
+
+    name: str = Field(
+        description=(
+            "Zone name (FQDN). Trailing dot is added automatically if "
+            "not present (e.g. ``example.com`` becomes ``example.com.``)."
+        )
+    )
+    group_id: str | None = Field(
+        default=None,
+        description=(
+            "UUID of the DNS server group that should own this zone. "
+            "Optional — when omitted, ``driver_hint`` (if supplied) "
+            "selects a matching group automatically; if neither is "
+            "supplied the preview returns the available groups so the "
+            "operator can pick."
+        ),
+    )
+    driver_hint: str | None = Field(
+        default=None,
+        description=(
+            "Preferred backend driver — one of ``bind9``, "
+            "``powerdns``, or ``windows_dns``. Required for "
+            "``dnssec_enabled=true`` (only PowerDNS supports online "
+            "signing). When ``group_id`` is set, this is validated "
+            "against the group's actual driver mix."
+        ),
+    )
+    zone_type: str = Field(
+        default="primary",
+        description="Zone type — ``primary``, ``secondary``, ``forward``, or ``stub``.",
+    )
+    kind: str = Field(
+        default="forward",
+        description="``forward`` (a normal name → record zone) or ``reverse`` (PTR zone).",
+    )
+    primary_ns: str = Field(
+        default="",
+        description="Primary nameserver FQDN (e.g. ``ns1.example.com.``). Recommended.",
+    )
+    admin_email: str = Field(
+        default="",
+        description="Zone admin email rendered into SOA RNAME (e.g. ``hostmaster@example.com``).",
+    )
+    dnssec_enabled: bool = Field(
+        default=False,
+        description=(
+            "Turn on DNSSEC for this zone. Requires a PowerDNS group "
+            "(BIND9 + Windows DNS don't support online signing here). "
+            'Pair with ``driver_hint="powerdns"`` to auto-select a '
+            "compatible group."
+        ),
+    )
+    ttl: int = Field(
+        default=3600,
+        description="Default record TTL in seconds.",
+        ge=60,
+        le=604_800,
+    )
+
+
+def _normalize_zone_name(raw: str) -> str:
+    name = raw.strip()
+    if not name:
+        return ""
+    return name if name.endswith(".") else name + "."
+
+
+async def _resolve_group_for_zone(
+    db: AsyncSession,
+    *,
+    group_id: str | None,
+    driver_hint: str | None,
+):
+    """Return ``(group, drivers_set, error_text)``. On success
+    ``error_text`` is empty; on failure ``group`` is ``None`` and
+    ``error_text`` is the operator-facing reason.
+    """
+    from app.models.dns import DNSServer, DNSServerGroup  # noqa: PLC0415
+
+    # Fetch every group + the distinct driver set so the preview can
+    # pick by hint or validate explicit selections in one round trip.
+    rows = (
+        await db.execute(
+            select(DNSServerGroup, DNSServer.driver)
+            .outerjoin(DNSServer, DNSServer.group_id == DNSServerGroup.id)
+            .order_by(DNSServerGroup.name)
+        )
+    ).all()
+    by_id: dict[str, tuple[Any, set[str]]] = {}
+    for grp, drv in rows:
+        slot = by_id.setdefault(str(grp.id), (grp, set()))
+        if drv:
+            slot[1].add(drv)
+
+    if group_id:
+        slot = by_id.get(str(group_id))
+        if slot is None:
+            return None, set(), f"DNS server group {group_id!r} not found."
+        grp, drivers = slot
+        if driver_hint and drivers and driver_hint not in drivers:
+            return (
+                None,
+                drivers,
+                (
+                    f"Group {grp.name!r} has drivers {sorted(drivers)} "
+                    f"which doesn't include the requested "
+                    f"driver_hint={driver_hint!r}. Pick a different "
+                    f"group or drop the hint."
+                ),
+            )
+        return grp, drivers, ""
+
+    if driver_hint:
+        candidates = [(grp, drivers) for grp, drivers in by_id.values() if driver_hint in drivers]
+        if not candidates:
+            available = sorted({d for _, ds in by_id.values() for d in ds})
+            return (
+                None,
+                set(),
+                (
+                    f"No DNS server group has any {driver_hint!r} "
+                    f"member. Available drivers: {available or '(none)'}."
+                ),
+            )
+        # Tie-break by name so picks are deterministic.
+        candidates.sort(key=lambda gd: gd[0].name)
+        grp, drivers = candidates[0]
+        return grp, drivers, ""
+
+    # Neither group_id nor hint — surface the inventory so the LLM can
+    # ask the operator for a pick instead of guessing.
+    listing = ", ".join(
+        f"{grp.name} ({sorted(ds) or ['no servers']})" for grp, ds in by_id.values()
+    )
+    return (
+        None,
+        set(),
+        (
+            "group_id or driver_hint is required. Available groups: "
+            f"{listing or '(none configured)'}."
+        ),
+    )
+
+
+async def _preview_create_dns_zone(
+    db: AsyncSession, user: User, args: CreateDNSZoneArgs
+) -> PreviewResult:
+    from app.api.v1.dns.router import VALID_ZONE_TYPES  # noqa: PLC0415
+    from app.models.dns import DNSZone  # noqa: PLC0415
+
+    name = _normalize_zone_name(args.name)
+    if not name:
+        return PreviewResult(ok=False, detail="Zone name is required.")
+
+    if args.zone_type not in VALID_ZONE_TYPES:
+        return PreviewResult(
+            ok=False, detail=f"zone_type must be one of {sorted(VALID_ZONE_TYPES)}."
+        )
+
+    if args.driver_hint is not None and args.driver_hint not in _DNS_DRIVER_HINTS:
+        return PreviewResult(
+            ok=False,
+            detail=f"driver_hint must be one of {sorted(_DNS_DRIVER_HINTS)}.",
+        )
+
+    grp, drivers, err = await _resolve_group_for_zone(
+        db, group_id=args.group_id, driver_hint=args.driver_hint
+    )
+    if grp is None:
+        return PreviewResult(ok=False, detail=err)
+
+    # PowerDNS-only features (currently DNSSEC) — reject if the
+    # selected group has no PowerDNS member. Without this guard the
+    # apply would land the row but the agent would refuse to sign.
+    for feat in _POWERDNS_ONLY_FEATURES:
+        if getattr(args, feat) and "powerdns" not in drivers:
+            return PreviewResult(
+                ok=False,
+                detail=(
+                    f"{feat}=true requires a PowerDNS-driver server in "
+                    f"the group, but {grp.name!r} has drivers "
+                    f"{sorted(drivers) or ['(none)']}. Add a PowerDNS "
+                    f"server to the group, pick a different group, or "
+                    f'set driver_hint="powerdns" without group_id.'
+                ),
+            )
+
+    existing = (
+        await db.execute(
+            select(DNSZone).where(
+                DNSZone.group_id == grp.id,
+                DNSZone.view_id.is_(None),
+                DNSZone.name == name,
+                DNSZone.deleted_at.is_(None),
+            )
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        return PreviewResult(
+            ok=False,
+            detail=f"A zone named {name!r} already exists in group {grp.name!r}.",
+        )
+
+    parts = [f"Create zone `{name}` in group `{grp.name}`"]
+    parts.append(f"drivers={sorted(drivers) or ['(none)']}")
+    parts.append(f"type={args.zone_type}/{args.kind}")
+    if args.dnssec_enabled:
+        parts.append("DNSSEC=on (PowerDNS online signing)")
+    return PreviewResult(ok=True, detail="ready", preview_text=", ".join(parts))
+
+
+async def _apply_create_dns_zone(
+    db: AsyncSession, user: User, args: CreateDNSZoneArgs
+) -> dict[str, Any]:
+    from app.models.audit import AuditLog  # noqa: PLC0415
+    from app.models.dns import DNSZone  # noqa: PLC0415
+
+    name = _normalize_zone_name(args.name)
+    grp, _drivers, err = await _resolve_group_for_zone(
+        db, group_id=args.group_id, driver_hint=args.driver_hint
+    )
+    if grp is None:
+        raise ValueError(err)
+
+    zone = DNSZone(
+        group_id=grp.id,
+        name=name,
+        zone_type=args.zone_type,
+        kind=args.kind,
+        ttl=args.ttl,
+        primary_ns=args.primary_ns,
+        admin_email=args.admin_email,
+        dnssec_enabled=args.dnssec_enabled,
+    )
+    db.add(zone)
+    await db.flush()
+
+    db.add(
+        AuditLog(
+            user_id=user.id,
+            user_display_name=user.display_name,
+            auth_source=user.auth_source,
+            action="create",
+            resource_type="dns_zone",
+            resource_id=str(zone.id),
+            resource_display=zone.name,
+            result="success",
+            new_value={
+                "group_id": str(grp.id),
+                "group": grp.name,
+                "zone_type": args.zone_type,
+                "kind": args.kind,
+                "dnssec_enabled": args.dnssec_enabled,
+                "driver_hint": args.driver_hint,
+                "via": "ai_proposal",
+            },
+        )
+    )
+    await db.commit()
+    await db.refresh(zone)
+    return {
+        "id": str(zone.id),
+        "group_id": str(grp.id),
+        "name": name,
+        "zone_type": args.zone_type,
+        "kind": args.kind,
+        "dnssec_enabled": args.dnssec_enabled,
+    }
+
+
+register(
+    Operation(
+        name="create_dns_zone",
+        description=(
+            "Create a new DNS zone. Honors driver_hint to route the "
+            "zone onto a PowerDNS / BIND9 / Windows DNS group; "
+            "DNSSEC zones require a PowerDNS group."
+        ),
+        args_model=CreateDNSZoneArgs,
+        preview=_preview_create_dns_zone,
+        apply=_apply_create_dns_zone,
+        category="dns",
+    )
+)
+
+
 # ── create_dhcp_static ────────────────────────────────────────────────
 
 

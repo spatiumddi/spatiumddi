@@ -27,6 +27,7 @@ from app.services.ai.operations import (
     CreateAlertRuleArgs,
     CreateDHCPStaticArgs,
     CreateDNSRecordArgs,
+    CreateDNSZoneArgs,
     CreateIPAddressArgs,
     RunNmapScanArgs,
 )
@@ -238,6 +239,33 @@ async def propose_create_dns_record(
     db: AsyncSession, user: User, args: CreateDNSRecordArgs
 ) -> dict[str, Any]:
     return await _propose_via(db=db, user=user, operation_name="create_dns_record", args=args)
+
+
+# ── propose_create_dns_zone (issue #127 Phase 4e) ─────────────────────
+
+
+@register_tool(
+    name="propose_create_dns_zone",
+    description=(
+        "Prepare a new DNS zone proposal. Pass name (FQDN — trailing "
+        "dot added automatically) plus either group_id (UUID of the "
+        "DNS server group) or driver_hint (one of 'bind9', "
+        "'powerdns', 'windows_dns'). When the operator asks for "
+        "DNSSEC, set dnssec_enabled=true and driver_hint='powerdns' — "
+        "online signing only works on the PowerDNS driver. "
+        "zone_type defaults to 'primary' / kind defaults to "
+        "'forward'. Operator must click Approve to apply — zone "
+        "creates propagate to live nameservers."
+    ),
+    args_model=CreateDNSZoneArgs,
+    writes=False,
+    category="dns",
+    default_enabled=False,
+)
+async def propose_create_dns_zone(
+    db: AsyncSession, user: User, args: CreateDNSZoneArgs
+) -> dict[str, Any]:
+    return await _propose_via(db=db, user=user, operation_name="create_dns_zone", args=args)
 
 
 # ── propose_create_dhcp_static ────────────────────────────────────────

@@ -68,6 +68,24 @@ visibility.
   pipeline adds a parallel ``build-dns-powerdns`` job alongside
   the existing ``build-dns`` (BIND9) so every tag publishes both
   images with ``:<version>`` and ``:latest`` tags.
+- **PowerDNS Operator-Copilot ``propose_create_dns_zone``, Phase 4e
+  (\#127).** New write-proposal tool + matching ``create_dns_zone``
+  operation in ``app.services.ai.operations``. Args carry an
+  optional ``driver_hint`` (one of ``bind9`` / ``powerdns`` /
+  ``windows_dns``) that lets the LLM express operator intent
+  without forcing it to know the exact server-group UUID — when
+  ``group_id`` is omitted, the preview picks the first group whose
+  servers expose the hinted driver; when ``group_id`` is set, the
+  hint is cross-checked against the group's actual driver mix and
+  rejects on mismatch with a remediation message. ``dnssec_enabled
+  =true`` requires a PowerDNS-driver server in the selected group;
+  the preview rejects DNSSEC requests against BIND9-only / Windows-
+  only groups before the operator approves the proposal. Apply
+  path mirrors the existing zone-create REST shape and writes a
+  ``create dns_zone`` audit row tagged ``via=ai_proposal``. Tool
+  ships ``default_enabled=False`` per the Tier-5 propose pattern;
+  surfaces in Settings → AI → Tool Catalog under category ``dns``.
+  Closes Phase 4e of the PowerDNS roadmap.
 - **PowerDNS DNSSEC restore advisory, Phase 4d (\#127).** Backup
   restore now scans the post-restore database for DNSSEC-enabled
   zones in PowerDNS groups and surfaces a registrar-republish
