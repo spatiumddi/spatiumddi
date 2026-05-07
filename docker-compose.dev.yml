@@ -77,7 +77,14 @@ services:
     #   stat -c '%g' /var/run/docker.sock
     # then set ``DOCKER_GID=<that number>`` in .env. Without the
     # group_add the api user gets EACCES on the socket.
-    # volumes:
+    volumes:
+      # Backup target storage (issue #117 Phase 1b). Named volume
+      # so archives survive container recycle. Mount path matches
+      # the default ``LocalVolumeDestination`` config.
+      - spatium_backups:/var/lib/spatiumddi/backups
+    # Docker integration — uncomment alongside the matching
+    # group_add. ``DOCKER_GID`` must match the gid of
+    # ``/var/run/docker.sock`` on the host.
     #   - /var/run/docker.sock:/var/run/docker.sock:ro
     # group_add:
     #   - "${DOCKER_GID:-999}"
@@ -108,10 +115,15 @@ services:
       REDIS_URL: redis://redis:6379/0
       CELERY_BROKER_URL: redis://redis:6379/1
       CELERY_RESULT_BACKEND: redis://redis:6379/2
+    volumes:
+      # Backup target storage (issue #117 Phase 1b). Same named
+      # volume the api mounts — the worker runs the scheduled
+      # sweep so it has to write the same files the api reads
+      # back from the "list archives" endpoint.
+      - spatium_backups:/var/lib/spatiumddi/backups
     # Docker integration — the worker runs the reconcile tasks, so it
     # needs the host socket too. Uncomment alongside the matching
     # entries on the api service above.
-    # volumes:
     #   - /var/run/docker.sock:/var/run/docker.sock:ro
     # group_add:
     #   - "${DOCKER_GID:-999}"
@@ -338,3 +350,4 @@ volumes:
   dhcp_kea_leases:
   dhcp_kea_state_2:
   dhcp_kea_leases_2:
+  spatium_backups:

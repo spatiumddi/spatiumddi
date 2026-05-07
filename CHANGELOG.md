@@ -39,6 +39,41 @@ last three releases retroactively.
 
 ### Added
 
+- **Backup & restore — Phase 1b (issue #117).** Builds on
+  Phase 1a with scheduled, retention-managed backups to
+  configurable destinations. New `backup_target` table backs
+  one row per destination (Phase 1b ships `local_volume`; the
+  same row + driver registry serves S3 / SCP / Azure in 1c /
+  1d without schema changes). Each target carries: a
+  Fernet-encrypted backup passphrase (so scheduled runs don't
+  re-prompt), an optional 5-field UTC cron expression
+  (`croniter`-parsed; manual-only when omitted), retention
+  (mutually-exclusive `keep_last_n` or `keep_days`), and full
+  last-run telemetry (status / filename / bytes / duration_ms
+  / error). A 60 s celery-beat sweep
+  (`app.tasks.backup_sweep.sweep_backup_targets`) walks every
+  enabled target whose `next_run_at` is now in the past, fires
+  `run_backup_for_target`, recomputes `next_run_at`, and
+  records an audit row — `last_run_status = "in_progress"`
+  acts as the per-target mutex so a slow run can't double up
+  on the next tick. New REST surface at
+  `/api/v1/backup/targets/*`: list / get / create / patch /
+  delete / `run-now` (synchronous; same path the schedule
+  uses) / `test` (write+verify+delete probe) / list-archives /
+  delete-archive. New `BackupTargetsSection` on the Backup
+  admin page renders configured destinations with last-run
+  state + per-row Run / Test / Edit / Delete + an expandable
+  archives drawer. The api / worker images now mount a named
+  `spatium_backups` docker volume at
+  `/var/lib/spatiumddi/backups` (the default `local_volume`
+  config path) — the Dockerfile pre-creates + chowns the path
+  so the volume inherits app-user ownership on first mount.
+  `croniter>=3.0.0` joins the dep set. New migration
+  `d2a8e417b9f3` adds the `backup_target` table + a partial
+  index on `next_run_at WHERE enabled AND schedule_cron IS NOT
+  NULL` so the beat sweep query stays cheap regardless of row
+  count.
+
 - **Backup & restore — Phase 1a (issue #117).** The "download a
   snapshot of my install" surface operators have been asking for.
   New page at `Administration → Backup`. Two cards:

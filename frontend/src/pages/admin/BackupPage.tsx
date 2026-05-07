@@ -16,6 +16,7 @@ import {
   type BackupManifestPreviewResponse,
   type BackupRestoreResponse,
 } from "@/lib/api";
+import { BackupTargetsSection } from "./BackupTargetsSection";
 
 /**
  * Admin → Platform → Backup (issue #117 Phase 1a).
@@ -45,8 +46,9 @@ export function BackupPage() {
           <h1 className="text-lg font-semibold">Backup &amp; Restore</h1>
         </div>
         <p className="mt-1 text-xs text-muted-foreground">
-          Phase 1a — local download + local upload restore. Remote destinations
-          and scheduled backups are tracked in follow-up issues.
+          Phase 1a — manual download + restore. Phase 1b — scheduled backup
+          targets to local volumes. Remote destinations (S3 / SCP / Azure) are
+          tracked in follow-up issues.
         </p>
       </div>
 
@@ -54,6 +56,7 @@ export function BackupPage() {
         <div className="mx-auto flex max-w-3xl flex-col gap-6">
           <CreateBackupCard />
           <RestoreBackupCard />
+          <BackupTargetsSection />
           <SecurityNotes />
         </div>
       </div>

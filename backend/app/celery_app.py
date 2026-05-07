@@ -20,6 +20,7 @@ celery_app = Celery(
         "app.tasks.conformity",
         "app.tasks.heartbeat",
         "app.tasks.oui_update",
+        "app.tasks.backup_sweep",
         "app.tasks.prune_internal_errors",
         "app.tasks.prune_logs",
         "app.tasks.prune_metrics",
@@ -72,6 +73,7 @@ celery_app.conf.update(
         "app.tasks.alerts.*": {"queue": "default"},
         "app.tasks.heartbeat.*": {"queue": "default"},
         "app.tasks.oui_update.*": {"queue": "default"},
+        "app.tasks.backup_sweep.*": {"queue": "default"},
         "app.tasks.prune_internal_errors.*": {"queue": "default"},
         "app.tasks.prune_logs.*": {"queue": "default"},
         "app.tasks.prune_metrics.*": {"queue": "default"},
@@ -354,6 +356,15 @@ celery_app.conf.update(
         "internal-errors-prune": {
             "task": "app.tasks.prune_internal_errors.prune_internal_errors",
             "schedule": crontab(hour=3, minute=30),
+        },
+        # Every 60 s, fire any backup target whose ``next_run_at``
+        # is now in the past (issue #117 Phase 1b). The sweep + the
+        # per-target ``last_run_status`` mutex keep the cost bounded
+        # — a single in-progress target won't be re-fired by the
+        # next tick.
+        "backup-target-sweep": {
+            "task": "app.tasks.backup_sweep.sweep_backup_targets",
+            "schedule": schedule(run_every=60.0),
         },
     },
 )

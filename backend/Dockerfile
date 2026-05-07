@@ -77,9 +77,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 COPY --from=builder /install /usr/local
 COPY . .
 
-# Non-root user
+# Non-root user. Pre-create + chown the backup-target path so a
+# named volume mounted at ``/var/lib/spatiumddi/backups`` (issue
+# #117 Phase 1b) inherits app-user ownership on first attach —
+# docker propagates the underlying directory's mode/owner to a
+# fresh anonymous-root volume only when the path exists on the
+# image. Without this, the api / worker hit EACCES on the first
+# write attempt.
 RUN useradd --no-create-home --shell /bin/false app \
-    && chown -R app:app /app
+    && mkdir -p /var/lib/spatiumddi/backups \
+    && chown -R app:app /app /var/lib/spatiumddi
 USER app
 
 EXPOSE 8000

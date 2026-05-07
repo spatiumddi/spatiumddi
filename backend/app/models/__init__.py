@@ -6,6 +6,7 @@ from app.models.audit import AuditLog
 from app.models.audit_forward import AuditForwardTarget
 from app.models.auth import APIToken, Group, Role, User, UserSession, user_group
 from app.models.auth_provider import AuthGroupMapping, AuthProvider
+from app.models.backup import BackupTarget
 from app.models.base import Base
 from app.models.circuit import Circuit
 from app.models.conformity import ConformityPolicy, ConformityResult
@@ -176,4 +177,5 @@ __all__ = [
     "ConformityResult",
     "FeatureModule",
     "InternalError",
+    "BackupTarget",
 ]

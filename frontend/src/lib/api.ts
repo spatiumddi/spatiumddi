@@ -2209,6 +2209,126 @@ export const backupApi = {
   },
 };
 
+// ── Backup targets (issue #117 Phase 1b) ──────────────────────────────────────
+
+export interface BackupTargetConfigField {
+  name: string;
+  label: string;
+  type: string;
+  required: boolean;
+  description: string | null;
+  secret: boolean;
+}
+
+export interface BackupTargetKind {
+  kind: string;
+  label: string;
+  config_fields: BackupTargetConfigField[];
+}
+
+export interface BackupTarget {
+  id: string;
+  name: string;
+  description: string;
+  kind: string;
+  enabled: boolean;
+  config: Record<string, unknown>;
+  passphrase_set: boolean;
+  passphrase_hint: string;
+  schedule_cron: string | null;
+  retention_keep_last_n: number | null;
+  retention_keep_days: number | null;
+  last_run_status: string;
+  last_run_at: string | null;
+  last_run_filename: string | null;
+  last_run_bytes: number | null;
+  last_run_duration_ms: number | null;
+  last_run_error: string | null;
+  next_run_at: string | null;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface BackupTargetCreate {
+  name: string;
+  description?: string;
+  kind: string;
+  enabled?: boolean;
+  config: Record<string, unknown>;
+  passphrase: string;
+  passphrase_hint?: string;
+  schedule_cron?: string | null;
+  retention_keep_last_n?: number | null;
+  retention_keep_days?: number | null;
+}
+
+export interface BackupTargetUpdate {
+  name?: string;
+  description?: string;
+  enabled?: boolean;
+  config?: Record<string, unknown>;
+  passphrase?: string;
+  passphrase_hint?: string;
+  schedule_cron?: string | null;
+  retention_keep_last_n?: number | null;
+  retention_keep_days?: number | null;
+}
+
+export interface BackupArchiveListing {
+  filename: string;
+  size_bytes: number;
+  created_at: string;
+}
+
+export interface BackupRunNowOutcome {
+  success: boolean;
+  filename: string | null;
+  bytes: number | null;
+  duration_ms: number | null;
+  deleted: number;
+  error: string | null;
+}
+
+export interface BackupTestOutcome {
+  ok: boolean;
+  detail?: string;
+  error?: string;
+}
+
+export const backupTargetsApi = {
+  listKinds: () =>
+    api
+      .get<{ kinds: BackupTargetKind[] }>("/backup/targets/kinds")
+      .then((r) => r.data.kinds),
+  list: () => api.get<BackupTarget[]>("/backup/targets").then((r) => r.data),
+  get: (id: string) =>
+    api.get<BackupTarget>(`/backup/targets/${id}`).then((r) => r.data),
+  create: (body: BackupTargetCreate) =>
+    api.post<BackupTarget>("/backup/targets", body).then((r) => r.data),
+  update: (id: string, body: BackupTargetUpdate) =>
+    api.patch<BackupTarget>(`/backup/targets/${id}`, body).then((r) => r.data),
+  remove: (id: string) =>
+    api.delete<void>(`/backup/targets/${id}`).then((r) => r.data),
+  runNow: (id: string) =>
+    api
+      .post<BackupRunNowOutcome>(`/backup/targets/${id}/run-now`)
+      .then((r) => r.data),
+  test: (id: string) =>
+    api
+      .post<BackupTestOutcome>(`/backup/targets/${id}/test`)
+      .then((r) => r.data),
+  listArchives: (id: string) =>
+    api
+      .get<BackupArchiveListing[]>(`/backup/targets/${id}/archives`)
+      .then((r) => r.data),
+  deleteArchive: (id: string, filename: string) =>
+    api
+      .delete<void>(
+        `/backup/targets/${id}/archives/${encodeURIComponent(filename)}`,
+      )
+      .then((r) => r.data),
+};
+
 // Read a blob-shaped error body and re-throw with the actual
 // ``detail`` (or whatever JSON the backend returned) attached so
 // the operator sees the real validation message instead of the
