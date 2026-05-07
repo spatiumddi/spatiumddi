@@ -46,6 +46,17 @@ async def _fetch(path: str, params: dict[str, Any], cache_key: str) -> Any:
                 params=params,
                 headers={"User-Agent": _USER_AGENT, "Accept": "application/json"},
             )
+            # PeeringDB returns 404 when the ASN simply isn't
+            # registered there (most ASes aren't — only ~30k of the
+            # ~80k allocated 16-bit ASNs have PeeringDB records).
+            # That's not "unreachable" — it's a clean "no record",
+            # which our normalised shape models as ``found: False``
+            # downstream. Cache it like a normal payload so we don't
+            # re-query for the next 24 h.
+            if resp.status_code == 404:
+                empty = {"data": []}
+                cache_set("peeringdb", cache_key, empty)
+                return empty
             resp.raise_for_status()
             payload = resp.json()
     except httpx.HTTPError as exc:
