@@ -185,6 +185,57 @@ export function CopilotDrawer({
     "spatium.copilot.activeSessionId",
     null,
   );
+  // Persisted drawer width — operator can drag the left edge to resize
+  // and the value survives close/reopen via sessionStorage. Default 672
+  // matches the previous fixed ``max-w-2xl``. Clamped to a sane window
+  // on render so a stale value (e.g. from a wider monitor) doesn't paint
+  // the drawer wider than the current viewport.
+  const [drawerWidth, setDrawerWidth] = useSessionState<number>(
+    "spatium.copilot.width",
+    672,
+  );
+  const resizingRef = useRef<{ startX: number; startWidth: number } | null>(
+    null,
+  );
+  useEffect(() => {
+    const onMove = (e: MouseEvent) => {
+      const r = resizingRef.current;
+      if (!r) return;
+      // Drawer is anchored to the right edge — dragging the handle LEFT
+      // (decreasing clientX) makes the panel WIDER. Apply a min/max
+      // clamp inline so the panel can't shrink past usable or grow past
+      // the viewport.
+      const next = Math.max(
+        320,
+        Math.min(window.innerWidth - 60, r.startWidth + (r.startX - e.clientX)),
+      );
+      setDrawerWidth(next);
+    };
+    const onUp = () => {
+      resizingRef.current = null;
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+    };
+  }, [setDrawerWidth]);
+  const startResize = (e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    resizingRef.current = { startX: e.clientX, startWidth: drawerWidth };
+    // Lock the global cursor + disable text selection while dragging so
+    // the handle doesn't fight with hover states underneath.
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+  };
+  const effectiveWidth = useMemo(() => {
+    if (typeof window === "undefined") return drawerWidth;
+    return Math.max(320, Math.min(window.innerWidth - 60, drawerWidth));
+  }, [drawerWidth]);
   // Local in-flight stream — mirror of what's also being persisted on
   // the backend. Reset whenever a stream ends (success or failure).
   const [streamingContent, setStreamingContent] = useState<string>("");
@@ -484,8 +535,20 @@ export function CopilotDrawer({
     >
       <div
         onClick={(e) => e.stopPropagation()}
-        className="flex h-full w-full max-w-2xl flex-col border-l bg-card shadow-2xl"
+        className="relative flex h-full flex-col border-l bg-card shadow-2xl"
+        style={{ width: `${effectiveWidth}px`, maxWidth: "100vw" }}
       >
+        {/* Resize handle — thin vertical strip on the left edge of the
+            drawer. The 1-pixel inset is for a subtle accent on hover; the
+            full handle is 5 pixels wide so the cursor catches it without
+            having to be precise. */}
+        <div
+          onMouseDown={startResize}
+          className="group absolute inset-y-0 left-0 z-10 w-[5px] -translate-x-1/2 cursor-col-resize select-none"
+          title="Drag to resize"
+        >
+          <div className="absolute inset-y-0 left-1/2 w-px -translate-x-1/2 bg-border transition-colors group-hover:bg-primary/60 group-active:bg-primary" />
+        </div>
         {/* Header */}
         <div className="flex flex-wrap items-center justify-between gap-2 border-b px-4 py-3">
           <div className="min-w-0 flex-1">
