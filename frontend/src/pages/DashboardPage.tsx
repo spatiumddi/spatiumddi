@@ -28,6 +28,7 @@ import {
   Shield,
   ShieldCheck,
   Waypoints,
+  Wifi,
 } from "lucide-react";
 import {
   ipamApi,
@@ -40,6 +41,7 @@ import {
   dockerApi,
   proxmoxApi,
   tailscaleApi,
+  unifiApi,
   platformHealthApi,
   asnsApi,
   vrfsApi,
@@ -55,6 +57,7 @@ import {
   type DockerHost,
   type ProxmoxNode,
   type TailscaleTenant,
+  type UnifiController,
   type PlatformHealthResponse,
   type PlatformHealthStatus,
   type ASNRead,
@@ -834,6 +837,7 @@ export function DashboardPage() {
   const dockerEnabled = settings?.integration_docker_enabled ?? false;
   const proxmoxEnabled = settings?.integration_proxmox_enabled ?? false;
   const tailscaleEnabled = settings?.integration_tailscale_enabled ?? false;
+  const unifiEnabled = settings?.integration_unifi_enabled ?? false;
   const { data: k8sClusters = [] } = useQuery<KubernetesCluster[]>({
     queryKey: ["kubernetes-clusters"],
     queryFn: kubernetesApi.listClusters,
@@ -856,6 +860,13 @@ export function DashboardPage() {
     queryKey: ["proxmox-nodes"],
     queryFn: proxmoxApi.listNodes,
     enabled: proxmoxEnabled,
+    refetchInterval: 30_000,
+  });
+
+  const { data: unifiControllers = [] } = useQuery<UnifiController[]>({
+    queryKey: ["unifi-controllers"],
+    queryFn: unifiApi.listControllers,
+    enabled: unifiEnabled,
     refetchInterval: 30_000,
   });
 
@@ -1506,16 +1517,19 @@ export function DashboardPage() {
           (kubernetesEnabled ||
             dockerEnabled ||
             proxmoxEnabled ||
-            tailscaleEnabled) && (
+            tailscaleEnabled ||
+            unifiEnabled) && (
             <IntegrationsPanel
               kubernetesEnabled={kubernetesEnabled}
               dockerEnabled={dockerEnabled}
               proxmoxEnabled={proxmoxEnabled}
               tailscaleEnabled={tailscaleEnabled}
+              unifiEnabled={unifiEnabled}
               clusters={k8sClusters}
               hosts={dockerHosts}
               proxmoxNodes={proxmoxNodes}
               tailscaleTenants={tailscaleTenants}
+              unifiControllers={unifiControllers}
             />
           )}
 
@@ -1776,32 +1790,38 @@ function IntegrationsPanel({
   dockerEnabled,
   proxmoxEnabled,
   tailscaleEnabled,
+  unifiEnabled,
   clusters,
   hosts,
   proxmoxNodes,
   tailscaleTenants,
+  unifiControllers,
 }: {
   kubernetesEnabled: boolean;
   dockerEnabled: boolean;
   proxmoxEnabled: boolean;
   tailscaleEnabled: boolean;
+  unifiEnabled: boolean;
   clusters: KubernetesCluster[];
   hosts: DockerHost[];
   proxmoxNodes: ProxmoxNode[];
   tailscaleTenants: TailscaleTenant[];
+  unifiControllers: UnifiController[];
 }) {
   const hasK8s = kubernetesEnabled;
   const hasDocker = dockerEnabled;
   const hasProxmox = proxmoxEnabled;
   const hasTailscale = tailscaleEnabled;
-  const cols = [hasK8s, hasDocker, hasProxmox, hasTailscale].filter(
+  const hasUnifi = unifiEnabled;
+  const cols = [hasK8s, hasDocker, hasProxmox, hasTailscale, hasUnifi].filter(
     Boolean,
   ).length;
   const totalTargets =
     clusters.length +
     hosts.length +
     proxmoxNodes.length +
-    tailscaleTenants.length;
+    tailscaleTenants.length +
+    unifiControllers.length;
   return (
     <div className="rounded-lg border bg-card">
       <div className="flex items-center justify-between border-b px-4 py-2.5">
@@ -1822,6 +1842,7 @@ function IntegrationsPanel({
           cols === 2 && "md:grid-cols-2 md:divide-x md:divide-y-0",
           cols === 3 && "md:grid-cols-3 md:divide-x md:divide-y-0",
           cols === 4 && "md:grid-cols-4 md:divide-x md:divide-y-0",
+          cols === 5 && "md:grid-cols-5 md:divide-x md:divide-y-0",
         )}
       >
         {hasK8s && (
@@ -1972,6 +1993,52 @@ function IntegrationsPanel({
                     lastSyncError={t.last_sync_error}
                     intervalSeconds={t.sync_interval_seconds}
                     enabled={t.enabled}
+                  />
+                ))}
+              </div>
+            )}
+          </div>
+        )}
+        {hasUnifi && (
+          <div className="min-w-0">
+            <Link
+              to="/unifi"
+              className="flex items-center gap-1.5 bg-muted/30 px-4 py-1.5 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground hover:bg-muted/50"
+            >
+              <Wifi className="h-3 w-3" />
+              UniFi ({unifiControllers.length})
+              <span className="ml-auto text-[10px] text-muted-foreground/70">
+                view all →
+              </span>
+            </Link>
+            {unifiControllers.length === 0 ? (
+              <p className="px-4 py-3 text-[11px] italic text-muted-foreground">
+                No controllers registered.
+              </p>
+            ) : (
+              <div className="divide-y">
+                {unifiControllers.map((c) => (
+                  <IntegrationRow
+                    key={c.id}
+                    to={`/unifi`}
+                    name={c.name}
+                    subtitle={
+                      c.mode === "cloud"
+                        ? `cloud · ${c.cloud_host_id ? c.cloud_host_id.slice(0, 8) + "…" : "?"}`
+                        : `${c.host ?? "?"}:${c.port}`
+                    }
+                    meta={
+                      c.site_count != null
+                        ? `${c.site_count} site${c.site_count === 1 ? "" : "s"}` +
+                          (c.network_count != null
+                            ? ` · ${c.network_count} net${c.network_count === 1 ? "" : "s"}`
+                            : "")
+                        : "—"
+                    }
+                    lastSyncedAt={c.last_synced_at}
+                    lastSyncError={c.last_sync_error}
+                    intervalSeconds={c.sync_interval_seconds}
+                    enabled={c.enabled}
                   />
                 ))}
               </div>

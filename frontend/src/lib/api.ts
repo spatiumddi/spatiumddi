@@ -2137,6 +2137,7 @@ export interface PlatformSettings {
   integration_docker_enabled: boolean;
   integration_proxmox_enabled: boolean;
   integration_tailscale_enabled: boolean;
+  integration_unifi_enabled: boolean;
   /** Domain WHOIS refresh cadence (hours). Beat ticks hourly; the
    *  task itself reads this on every fire so cadence changes take
    *  effect on the next tick without restarting beat. 1–168 h range
