@@ -31,10 +31,10 @@ import { BackupSectionsPicker } from "./BackupSectionsPicker";
  * next-run schedule, plus per-row Run / Test / Edit / Delete and
  * a per-row Archives drawer that lists what's currently stored.
  *
- * Phase 1b ships ``local_volume`` only; the picker reflects on
- * ``GET /backup/targets/kinds`` so 1c (S3) / 1d (SCP+Azure)
- * appear without frontend changes once their drivers are
- * registered.
+ * The kind picker reflects on ``GET /backup/targets/kinds`` so
+ * any new driver (Tier 1 local/S3/SCP/Azure, Tier 2 SMB/FTP/GCS,
+ * future kinds) appears without frontend changes once
+ * registered server-side.
  */
 export function BackupTargetsSection() {
   const qc = useQueryClient();

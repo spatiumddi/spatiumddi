@@ -1,13 +1,13 @@
-"""Backup-target CRUD + run-now + test endpoints (issue #117
-Phase 1b).
+"""Backup-target CRUD + run-now + test endpoints (issue #117).
 
 All gated to superadmin. Audit-logged on every mutation. Mounted
 at ``/backup/targets`` by the parent backup router.
 
-Phase 1b ships local-volume only; the same router serves
-``s3`` / ``scp`` / ``azure_blob`` in 1c / 1d via the
+The router accepts any kind registered in the
 :mod:`app.services.backup.targets` driver registry — the API
-layer doesn't need to learn each new kind.
+layer doesn't have to learn each new kind. Tier 1 (Phase 1):
+``local_volume`` / ``s3`` / ``scp`` / ``azure_blob``.
+Tier 2 (Phase 2): ``smb`` / ``ftp`` / ``gcs``.
 """
 
 from __future__ import annotations
@@ -47,7 +47,14 @@ from app.services.backup.targets import (
 router = APIRouter()
 logger = structlog.get_logger(__name__)
 
-_VALID_KINDS = {"local_volume", "s3", "scp", "azure_blob"}
+
+# Pulled from the driver registry rather than hardcoded so new
+# destination drivers are accepted by the API the moment they're
+# registered in ``app.services.backup.targets.__init__``.
+def _valid_kinds() -> set[str]:
+    from app.services.backup.targets.base import DESTINATIONS  # noqa: PLC0415
+
+    return set(DESTINATIONS)
 
 
 def _require_superadmin(current_user: object) -> None:
@@ -76,11 +83,9 @@ class BackupTargetCreate(BaseModel):
     @field_validator("kind")
     @classmethod
     def _v_kind(cls, v: str) -> str:
-        if v not in _VALID_KINDS:
-            raise ValueError(
-                f"kind must be one of {sorted(_VALID_KINDS)} "
-                f"(Phase 1b ships local_volume; S3 / SCP / Azure follow)"
-            )
+        valid = _valid_kinds()
+        if v not in valid:
+            raise ValueError(f"kind must be one of {sorted(valid)}")
         return v
 
 

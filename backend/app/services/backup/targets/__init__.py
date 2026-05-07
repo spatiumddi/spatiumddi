@@ -2,9 +2,10 @@
 
 Each destination is a thin driver that knows how to ``write``,
 ``list``, ``delete``, and ``test_connection`` against its own
-storage backend. Phase 1b ships ``local_volume`` only; ``s3`` /
-``scp`` / ``azure_blob`` follow in 1c / 1d under the same
-:class:`BackupDestination` ABC + module-level registry.
+storage backend. Phase 1b ships ``local_volume``; Phase 1c/1d
+add ``s3`` / ``scp`` / ``azure_blob``; Phase 2 Tier 2 adds
+``smb`` / ``ftp`` / ``gcs``. Every driver is mounted on the
+same :class:`BackupDestination` ABC + module-level registry.
 """
 
 from app.services.backup.targets.azure_blob import AzureBlobDestination
@@ -17,6 +18,8 @@ from app.services.backup.targets.base import (
     get_destination,
     list_destination_kinds,
 )
+from app.services.backup.targets.ftp import FtpDestination
+from app.services.backup.targets.gcs import GcsDestination
 from app.services.backup.targets.local_volume import LocalVolumeDestination
 from app.services.backup.targets.s3 import S3Destination
 from app.services.backup.targets.scp import ScpDestination
@@ -28,6 +31,7 @@ from app.services.backup.targets.secrets_config import (
     merge_config_for_update,
     redact_config_secrets,
 )
+from app.services.backup.targets.smb import SmbDestination
 
 # Side-effect register every driver. New drivers register the
 # same way — no other code path needs to learn about them.
@@ -35,6 +39,9 @@ DESTINATIONS["local_volume"] = LocalVolumeDestination()
 DESTINATIONS["s3"] = S3Destination()
 DESTINATIONS["scp"] = ScpDestination()
 DESTINATIONS["azure_blob"] = AzureBlobDestination()
+DESTINATIONS["smb"] = SmbDestination()
+DESTINATIONS["ftp"] = FtpDestination()
+DESTINATIONS["gcs"] = GcsDestination()
 
 __all__ = [
     "ArchiveListing",
@@ -42,9 +49,12 @@ __all__ = [
     "BackupDestinationError",
     "DestinationConfigError",
     "AzureBlobDestination",
+    "FtpDestination",
+    "GcsDestination",
     "LocalVolumeDestination",
     "S3Destination",
     "ScpDestination",
+    "SmbDestination",
     "DESTINATIONS",
     "REDACTED_SENTINEL",
     "SecretFieldError",
