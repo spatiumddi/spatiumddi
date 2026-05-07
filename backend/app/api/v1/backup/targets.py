@@ -596,6 +596,19 @@ async def restore_from_archive(
                     "selective": outcome.selective,
                     "restored_sections": outcome.restored_sections,
                     "pre_restore_safety_path": outcome.pre_restore_path,
+                    "rewrap": (
+                        {
+                            "same_install": outcome.rewrap.same_install,
+                            "rewrapped_rows": outcome.rewrap.rewrapped_rows,
+                            "rewrapped_jsonb_fields": (outcome.rewrap.rewrapped_jsonb_fields),
+                            "skipped_idempotent_rows": (outcome.rewrap.skipped_idempotent_rows),
+                            "failed_rows": outcome.rewrap.failed_rows,
+                            "columns_visited": outcome.rewrap.columns_visited,
+                            "failures": outcome.rewrap.failures,
+                        }
+                        if outcome.rewrap is not None
+                        else None
+                    ),
                 },
             )
         )
@@ -609,6 +622,19 @@ async def restore_from_archive(
         "pre_restore_safety_path": outcome.pre_restore_path,
         "selective": outcome.selective,
         "restored_sections": outcome.restored_sections,
+        "rewrap": (
+            {
+                "same_install": outcome.rewrap.same_install,
+                "rewrapped_rows": outcome.rewrap.rewrapped_rows,
+                "rewrapped_jsonb_fields": outcome.rewrap.rewrapped_jsonb_fields,
+                "skipped_idempotent_rows": outcome.rewrap.skipped_idempotent_rows,
+                "failed_rows": outcome.rewrap.failed_rows,
+                "columns_visited": outcome.rewrap.columns_visited,
+                "failures": outcome.rewrap.failures,
+            }
+            if outcome.rewrap is not None
+            else None
+        ),
     }
 
 

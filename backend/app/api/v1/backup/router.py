@@ -151,6 +151,22 @@ async def create_and_download_backup(
 # ── /backup/restore ──────────────────────────────────────────────────
 
 
+class RewrapOutcomeResponse(BaseModel):
+    """Per-restore counters for the cross-install secret rewrap
+    pass (issue #117 Phase 2). ``same_install=True`` means the
+    archive came from this install — the rewrap was skipped and
+    every other counter is zero.
+    """
+
+    same_install: bool
+    rewrapped_rows: int
+    rewrapped_jsonb_fields: int
+    skipped_idempotent_rows: int
+    failed_rows: int
+    columns_visited: int
+    failures: list[dict[str, Any]] = []
+
+
 class RestoreOutcomeResponse(BaseModel):
     success: bool
     pre_restore_safety_path: str | None
@@ -160,6 +176,7 @@ class RestoreOutcomeResponse(BaseModel):
     note: str
     selective: bool = False
     restored_sections: list[str] | None = None
+    rewrap: RewrapOutcomeResponse | None = None
 
 
 @router.post("/restore", response_model=RestoreOutcomeResponse)
@@ -245,19 +262,59 @@ async def restore_backup(
                     "manifest": outcome.manifest,
                     "pre_restore_safety_path": outcome.pre_restore_path,
                     "duration_ms": outcome.duration_ms,
+                    "rewrap": (
+                        {
+                            "same_install": outcome.rewrap.same_install,
+                            "rewrapped_rows": outcome.rewrap.rewrapped_rows,
+                            "rewrapped_jsonb_fields": (outcome.rewrap.rewrapped_jsonb_fields),
+                            "skipped_idempotent_rows": (outcome.rewrap.skipped_idempotent_rows),
+                            "failed_rows": outcome.rewrap.failed_rows,
+                            "columns_visited": outcome.rewrap.columns_visited,
+                            "failures": outcome.rewrap.failures,
+                        }
+                        if outcome.rewrap is not None
+                        else None
+                    ),
                 },
             )
         )
         await fresh.commit()
 
-    note = (
-        "Restore complete. Secret-bearing rows (auth provider creds, "
-        "agent PSKs, integration credentials) are encrypted with the "
-        "source install's SECRET_KEY. If you restored onto a different "
-        "install, decrypt secrets.enc with your passphrase and apply "
-        "the recovered SECRET_KEY to this install's environment, "
-        "then restart the api / worker / beat containers."
-    )
+    rewrap = outcome.rewrap
+    rewrap_resp: RewrapOutcomeResponse | None = None
+    if rewrap is not None:
+        rewrap_resp = RewrapOutcomeResponse(
+            same_install=rewrap.same_install,
+            rewrapped_rows=rewrap.rewrapped_rows,
+            rewrapped_jsonb_fields=rewrap.rewrapped_jsonb_fields,
+            skipped_idempotent_rows=rewrap.skipped_idempotent_rows,
+            failed_rows=rewrap.failed_rows,
+            columns_visited=rewrap.columns_visited,
+            failures=rewrap.failures,
+        )
+
+    if rewrap is None or rewrap.same_install:
+        note = (
+            "Restore complete. Source archive came from this install — " "no key rewrap was needed."
+        )
+    elif rewrap.failed_rows == 0:
+        rewrapped_total = rewrap.rewrapped_rows + rewrap.rewrapped_jsonb_fields
+        note = (
+            f"Restore complete. Cross-install rewrap re-encrypted "
+            f"{rewrapped_total} secret value{'s' if rewrapped_total != 1 else ''} "
+            f"with this install's SECRET_KEY. All credentials should be "
+            f"usable without manual key copy."
+        )
+    else:
+        rewrapped_total = rewrap.rewrapped_rows + rewrap.rewrapped_jsonb_fields
+        note = (
+            f"Restore complete. Cross-install rewrap re-encrypted "
+            f"{rewrapped_total} secret value{'s' if rewrapped_total != 1 else ''}, "
+            f"but {rewrap.failed_rows} row{'s' if rewrap.failed_rows != 1 else ''} "
+            f"could not be decrypted with either the source or "
+            f"destination key. Those credentials must be re-entered "
+            f"manually — see the failures list below."
+        )
     if outcome.pre_restore_path is None:
         note += (
             " WARNING: pre-restore safety dump was NOT written "
@@ -275,6 +332,7 @@ async def restore_backup(
         note=note,
         selective=outcome.selective,
         restored_sections=outcome.restored_sections,
+        rewrap=rewrap_resp,
     )
 
 

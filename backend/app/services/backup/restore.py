@@ -42,6 +42,7 @@ from app.services.backup.archive import (
     extract_archive_members,
 )
 from app.services.backup.crypto import BackupCryptoError, decrypt_secrets
+from app.services.backup.rewrap import RewrapOutcome, rewrap_secrets
 
 logger = structlog.get_logger(__name__)
 
@@ -74,6 +75,7 @@ class RestoreOutcome:
     selective: bool = False
     restored_sections: list[str] | None = None
     restored_tables: list[str] | None = None
+    rewrap: RewrapOutcome | None = None
 
 
 async def _terminate_other_db_connections(pg_env: dict[str, str]) -> None:
@@ -457,6 +459,31 @@ async def apply_backup_restore(
             sql_path.write_bytes(db_bytes)
             await _run_psql(sql_path, db_url)
 
+    # Phase 6: cross-install secret rewrap. Walks every Fernet-
+    # encrypted column + the backup_target.config JSONB blob and
+    # re-encrypts with the destination install's key. No-op when
+    # source + dest keys match. Failures are counted, not raised —
+    # one bad row mustn't kill an otherwise-clean restore.
+    from app.config import settings as _settings  # noqa: PLC0415
+
+    try:
+        rewrap_outcome = await rewrap_secrets(
+            db_url=db_url,
+            source_secret_key=secrets_payload.get("platform_secret_key", "") or "",
+            source_credential_key=secrets_payload.get("platform_credential_encryption_key", "")
+            or "",
+            dest_secret_key=_settings.secret_key,
+            dest_credential_key=_settings.credential_encryption_key or "",
+        )
+    except Exception as exc:  # noqa: BLE001
+        # Rewrap failure shouldn't blow away the whole restore —
+        # the data is in. Log loudly + surface in the response so
+        # the operator knows to apply the recovered SECRET_KEY
+        # manually.
+        logger.error("backup_restore_rewrap_failed", error=str(exc))
+        rewrap_outcome = RewrapOutcome()
+        rewrap_outcome.failures.append({"reason": f"rewrap-aborted: {exc}"})
+
     duration_ms = int((datetime.now(UTC) - started).total_seconds() * 1000)
     logger.info(
         "backup_restore_applied",
@@ -466,6 +493,11 @@ async def apply_backup_restore(
         duration_ms=duration_ms,
         selective=selective,
         restored_sections=restored_sections,
+        rewrap_same_install=rewrap_outcome.same_install,
+        rewrap_rows=rewrap_outcome.rewrapped_rows,
+        rewrap_jsonb=rewrap_outcome.rewrapped_jsonb_fields,
+        rewrap_idempotent=rewrap_outcome.skipped_idempotent_rows,
+        rewrap_failed=rewrap_outcome.failed_rows,
     )
     return RestoreOutcome(
         manifest=manifest,
@@ -475,4 +507,5 @@ async def apply_backup_restore(
         selective=selective,
         restored_sections=restored_sections,
         restored_tables=restored_tables,
+        rewrap=rewrap_outcome,
     )
