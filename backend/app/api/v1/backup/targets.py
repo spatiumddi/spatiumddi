@@ -457,6 +457,50 @@ async def list_target_archives(
     ]
 
 
+@router.get("/{target_id}/archives/{filename}/download")
+async def download_target_archive(
+    target_id: uuid.UUID,
+    filename: str,
+    db: DB,
+    current_user: CurrentUser,
+):
+    """Stream a stored archive back to the operator's browser as a
+    zip download. Works the same way for every destination kind —
+    the driver's ``download(filename)`` method does the heavy
+    lifting; we wrap the bytes in a ``StreamingResponse`` with
+    ``Content-Disposition: attachment``. For large archives this
+    fetches into memory before streaming; the existing 2 GB hard
+    cap on the api process catches anything pathological.
+    """
+    from fastapi.responses import StreamingResponse  # noqa: PLC0415
+
+    _require_superadmin(current_user)
+    row = await db.get(BackupTarget, target_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="backup target not found")
+    driver = get_destination(row.kind)
+    safe_name = filename.replace("/", "").replace("\\", "")
+    try:
+        plain_config = decrypt_config_secrets(driver, row.config)
+        archive_bytes = await driver.download(config=plain_config, filename=safe_name)
+    except SecretFieldError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except BackupDestinationError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    def _iter():
+        yield archive_bytes
+
+    return StreamingResponse(
+        _iter(),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{safe_name}"',
+            "Content-Length": str(len(archive_bytes)),
+        },
+    )
+
+
 class RestoreFromArchiveBody(BaseModel):
     filename: str = Field(..., min_length=1, max_length=255)
     passphrase: str = Field(..., min_length=8, max_length=512)

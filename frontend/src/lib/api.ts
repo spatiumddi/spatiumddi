@@ -2327,6 +2327,40 @@ export const backupTargetsApi = {
         `/backup/targets/${id}/archives/${encodeURIComponent(filename)}`,
       )
       .then((r) => r.data),
+  /**
+   * Stream an archive back from any destination (local volume /
+   * S3 / SCP / Azure Blob) to the operator's browser as a zip
+   * download. The api proxies the fetch — operators don't need
+   * direct credentials for the underlying destination. Same shape
+   * as ``backupApi.createAndDownload``: blob response, parse
+   * ``Content-Disposition`` for the filename, synthetic anchor
+   * click.
+   */
+  downloadArchive: async (id: string, filename: string): Promise<void> => {
+    let res;
+    try {
+      res = await api.get<Blob>(
+        `/backup/targets/${id}/archives/${encodeURIComponent(filename)}/download`,
+        { responseType: "blob" },
+      );
+    } catch (err) {
+      throw await _unwrapBlobError(err);
+    }
+    const disp = (res.headers["content-disposition"] as string) || "";
+    const match = disp.match(/filename="?([^";]+)"?/i);
+    const downloadName = match ? match[1] : filename;
+    const blob = new Blob([res.data as BlobPart], {
+      type: "application/zip",
+    });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = downloadName;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  },
   restoreFromArchive: (
     id: string,
     body: {

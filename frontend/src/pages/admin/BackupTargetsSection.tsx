@@ -4,6 +4,7 @@ import {
   CheckCircle2,
   ChevronDown,
   ChevronRight,
+  Download,
   Loader2,
   Pencil,
   Play,
@@ -321,6 +322,14 @@ function ArchiveList({
       onAfterChange();
     },
   });
+  // Download streams the archive bytes through the api (which
+  // proxies the destination's ``download(filename)``) so operators
+  // never need direct credentials for the underlying S3 / SCP /
+  // Azure account.
+  const downloadMut = useMutation({
+    mutationFn: (filename: string) =>
+      backupTargetsApi.downloadArchive(targetId, filename),
+  });
   const [restoring, setRestoring] = useState<string | null>(null);
 
   return (
@@ -369,6 +378,22 @@ function ArchiveList({
               <span className="text-muted-foreground">
                 {new Date(a.created_at).toLocaleString()}
               </span>
+              <button
+                type="button"
+                onClick={() => downloadMut.mutate(a.filename)}
+                disabled={
+                  downloadMut.isPending && downloadMut.variables === a.filename
+                }
+                title="Download to your computer"
+                className="rounded p-1 hover:bg-accent disabled:opacity-50"
+              >
+                {downloadMut.isPending &&
+                downloadMut.variables === a.filename ? (
+                  <Loader2 className="h-3 w-3 animate-spin" />
+                ) : (
+                  <Download className="h-3 w-3" />
+                )}
+              </button>
               <button
                 type="button"
                 onClick={() => setRestoring(a.filename)}
