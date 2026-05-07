@@ -194,6 +194,8 @@ The default single Redis container uses `maxmemory-policy allkeys-lru` for Celer
 
 ## 8. Upgrading
 
+> **Take a backup before upgrading.** Sign in as a superadmin → **System Admin → Backup → Manual → Build + download**, supply a passphrase you'll remember (or pick a configured destination's **Run now** button). The archive is the single rollback artifact if the upgrade goes sideways. See §9 below for the full backup / restore surface.
+
 ```bash
 # Pull latest code
 git pull
@@ -208,23 +210,52 @@ docker compose run --rm migrate
 docker compose up -d --force-recreate api worker beat frontend
 ```
 
+If you skipped the backup and need to roll back: every restore takes a `pre-restore-{ts}.zip` safety dump under `/var/lib/spatiumddi/backups/` automatically (passphrase is the literal string `pre-restore-safety`). That gets you back to wherever the last restore landed — but it does **not** cover an upgrade you ran without a restore in between, so the build-and-download nudge above is the durable hedge.
+
 ---
 
 ## 9. Backup and Restore
 
-### PostgreSQL backup
+The full backup + restore surface lives in **System Admin → Backup**: build-and-download, configured remote destinations (local volume, S3 / S3-compatible, SCP/SFTP, Azure Blob, SMB/CIFS, FTP/FTPS, Google Cloud Storage), scheduled cron + retention, restore-from-file, restore-from-destination, archive proxy-download, selective restore. See [`docs/features/SYSTEM_ADMIN.md`](../features/SYSTEM_ADMIN.md#29-backup-and-restore) for the full operator reference.
+
+The shape that's specific to Docker Compose:
+
+### Local-volume target
+
+A `local_volume` destination writes archives to a configured filesystem path on the api / worker container. To survive container recycle, that path **must** be a docker volume. The dev compose mounts `spatium_backups` into both api + worker at `/var/lib/spatiumddi/backups` automatically; the prod compose ships the same shape but commented out — installs that don't use a `local_volume` target leave it disabled, the rest uncomment three lines (one mount on `api`, one on `worker`, one entry under top-level `volumes:`):
+
+```yaml
+# docker-compose.yml
+services:
+  api:
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro     # already there if you use Docker integration
+      - spatium_backups:/var/lib/spatiumddi/backups      # uncomment for local_volume backup target
+  worker:
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - spatium_backups:/var/lib/spatiumddi/backups
+volumes:
+  spatium_backups:                                        # uncomment alongside the mounts above
+```
+
+The default mount path matches `LocalVolumeDestination`'s default config, so a freshly-created target at `/var/lib/spatiumddi/backups` works out of the box once the volume is enabled.
+
+### Out-of-band PostgreSQL dump (fallback only)
+
+The in-app backup is the supported path — it captures the encrypted master key, the alembic head, and every Fernet-encrypted column in a single zip. A bare `pg_dump` of the postgres container does **not** capture the master key (which lives in the api container's env), so cross-install restores from a raw dump need the operator to manually copy `SECRET_KEY` to the destination. Use the in-app backup unless you specifically need a SQL dump for a migration script.
 
 ```bash
-# Dump
-docker compose exec -T postgres pg_dump -U spatiumddi spatiumddi | gzip > backup-$(date +%Y%m%d).sql.gz
+# Out-of-band dump — diagnostic / migration-script use only
+docker compose exec -T postgres pg_dump -U spatiumddi spatiumddi | gzip > postgres-only-$(date +%Y%m%d).sql.gz
 
-# Restore
-gunzip -c backup-YYYYMMDD.sql.gz | docker compose exec -T postgres psql -U spatiumddi spatiumddi
+# Restore the SQL dump
+gunzip -c postgres-only-YYYYMMDD.sql.gz | docker compose exec -T postgres psql -U spatiumddi spatiumddi
 ```
 
 ### Redis backup
 
-Redis persistence (`appendonly yes`) is enabled. The RDB/AOF files are in the `redis_data` volume. For point-in-time backup, also copy that volume.
+Redis persistence (`appendonly yes`) is enabled. The RDB/AOF files are in the `redis_data` volume. There's no operator-facing data in Redis — Celery task scratch, session cache, ETag-poll bookkeeping — so a Redis backup is generally not needed. For point-in-time disaster recovery, copy the `redis_data` volume alongside the SpatiumDDI archive.
 
 ---
 

@@ -180,3 +180,69 @@ All manifests default to `:latest`. Pin to a specific version tag (e.g., `2026.0
 kubectl set image deployment/api api=ghcr.io/spatiumddi/spatiumddi-api:2026.04.13-1 -n spatiumddi
 kubectl set image deployment/frontend frontend=ghcr.io/spatiumddi/spatiumddi-frontend:2026.04.13-1 -n spatiumddi
 ```
+
+## Upgrading
+
+> **Take a backup before upgrading.** Sign in as a superadmin → **System Admin → Backup → Manual → Build + download**, supply a passphrase you'll remember (or pick a configured destination's **Run now** button). The archive is the single rollback artifact if the upgrade goes sideways. See [`docs/features/SYSTEM_ADMIN.md`](../docs/features/SYSTEM_ADMIN.md#29-backup-and-restore) for the full operator reference.
+
+```bash
+# Pin the new tag on every deployment
+NEW_TAG=2026.05.07-1
+for d in api worker beat frontend; do
+  kubectl set image deployment/$d $d=ghcr.io/spatiumddi/spatiumddi-$d:$NEW_TAG -n spatiumddi
+done
+
+# Run the migration job — Alembic is idempotent, safe to re-run
+kubectl delete job/spatiumddi-migrate -n spatiumddi --ignore-not-found
+kubectl apply -f base/migrate-job.yaml -n spatiumddi
+kubectl wait --for=condition=complete job/spatiumddi-migrate -n spatiumddi --timeout=10m
+```
+
+Helm chart users: `helm upgrade spatiumddi charts/spatiumddi -n spatiumddi --set image.tag=$NEW_TAG`. The chart's pre-upgrade hook re-runs the migrate job; the `alembic upgrade head` invocation honours the same DATABASE_URL the api uses.
+
+If you skipped the backup and need to roll back: every restore takes a `pre-restore-{ts}.zip` safety dump under the api pod's `/var/lib/spatiumddi/backups/` (passphrase is the literal string `pre-restore-safety`). For that path to survive pod recycle, mount it as a `PersistentVolumeClaim` on both the api and worker deployments — see Backup below.
+
+## Backup
+
+The full backup + restore surface (build-and-download, S3 / S3-compatible / SCP / Azure / SMB / FTP / GCS / local-volume destinations, scheduled cron, retention, selective restore, restore-from-destination, alembic upgrade-on-restore, cross-install secret rewrap) lives in **System Admin → Backup**. See [`docs/features/SYSTEM_ADMIN.md`](../docs/features/SYSTEM_ADMIN.md#29-backup-and-restore) for the full reference.
+
+The shape that's specific to Kubernetes:
+
+- **Operator-friendly default — no PVC.** Most installs pair SpatiumDDI with an off-cluster object store (S3 / Azure Blob / GCS) for backup. In that case neither the api nor the worker needs a PVC for backups; the in-app `Build + download` button streams archives straight to the operator's browser, and scheduled targets push to the configured remote destination. Pre-restore safety dumps land in the api pod's writable layer and disappear on recycle — that's an acceptable trade because the configured remote destination IS the rollback artifact.
+
+- **PVC mode — local_volume target.** Operators who want a `local_volume` destination (writes to a path on the pod's filesystem) MUST mount a `ReadWriteMany` PVC at the same path on both the api and worker deployments — the worker runs the scheduled sweep, so it has to write the same files the api lists back. Add to your overlay:
+
+  ```yaml
+  # k8s/overlays/yourenv/spatium-backups.yaml
+  apiVersion: v1
+  kind: PersistentVolumeClaim
+  metadata:
+    name: spatium-backups
+    namespace: spatiumddi
+  spec:
+    accessModes: [ReadWriteMany]
+    resources:
+      requests:
+        storage: 50Gi
+    storageClassName: <your-rwx-class>     # NFS / Ceph / Azure Files / EFS
+  ---
+  apiVersion: apps/v1
+  kind: Deployment
+  metadata: { name: api, namespace: spatiumddi }
+  spec:
+    template:
+      spec:
+        volumes:
+          - name: backups
+            persistentVolumeClaim:
+              claimName: spatium-backups
+        containers:
+          - name: api
+            volumeMounts:
+              - { name: backups, mountPath: /var/lib/spatiumddi/backups }
+  # ... same volume + volumeMount on the worker deployment
+  ```
+
+  RWX is required because the api pod (write side: `Build and download`, pre-restore safety dumps) and the worker pod (write side: scheduled sweep) both need write access concurrently. RWO will reject the second mount.
+
+- **Helm chart support is roadmap.** The umbrella chart at `charts/spatiumddi/` doesn't ship a `backup.localVolume` value yet — operators wanting a local_volume target on K8s today either patch the chart-rendered manifests with a kustomize overlay, or skip local_volume entirely and use a remote destination (which is what we recommend on K8s anyway).

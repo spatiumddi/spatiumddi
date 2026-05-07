@@ -245,44 +245,121 @@ Dashboard tiles showing platform-wide stats:
 
 ### 2.9 Backup and Restore
 
-**What is backed up:**
-- PostgreSQL database (full dump or WAL-based continuous backup)
-- System configuration (node network, firewall, time configs)
-- Syslog / notification configurations
-- API token definitions (hashes only — tokens themselves are not recoverable)
-- Custom field definitions
+The Backup admin page (`/admin/backup`) ships two tabs: **Manual** (build-and-download / restore-from-file) and **Destinations** (configured remote targets, scheduling, restore-from-destination). Everything described here is reachable from the UI; the same surface is exposed via REST under `/api/v1/backup` and `/api/v1/backup/targets` so operators can drive it from automation.
 
-**What is NOT backed up:**
-- DHCP daemon state (leases are ephemeral; static assignments are in DB)
-- DNS daemon state (all records are in DB; servers are rebuilt from DB)
+#### What's in the archive
 
-**Backup Targets:**
+A single `.zip` per backup, named `spatiumddi-backup-{hostname}-{YYYYMMDD-HHMMSS}.zip`:
+
+| Member | Role |
+|---|---|
+| `manifest.json` | `app_version`, `schema_version` (alembic head), `hostname`, `created_at`, `dump_format` (`plain` or `custom`), `secret_passphrase_hint` |
+| `database.dump` (or `database.sql` for Phase 1 archives) | Full `pg_dump --format=custom` of the SpatiumDDI database |
+| `secrets.enc` | Operator-passphrase-wrapped JSON envelope carrying the source install's `SECRET_KEY` + `CREDENTIAL_ENCRYPTION_KEY` (PBKDF2-HMAC-SHA256 600k → AES-256-GCM) |
+| `README.txt` | Human-readable note covering format, restore steps, version compatibility |
+
+The archive is the unit operators move around — single-file, easy to ship over SCP / drop into S3 / download to a laptop.
+
+#### Passphrase rules
+
+Operators supply a passphrase at backup time (min 8 chars). The passphrase wraps the `secrets.enc` envelope so the source install's master key never lands in clear on disk anywhere. The same passphrase is required at restore. There's also a `passphrase_hint` field — a free-text label (max 200 chars) that's stored alongside the envelope so operators with multiple archives can remember which key decrypts which one.
+
+The passphrase is **not** the destination's auth credential — every destination type has its own credential fields (S3 keys, SCP password / private key, Azure account key, etc.) which are Fernet-encrypted at rest in the `backup_target.config` JSONB.
+
+#### Destination kinds
+
+All seven destination kinds register in the same driver registry; the UI's destination picker reflects on `GET /backup/targets/kinds` so adding a new kind requires no frontend changes.
+
+| Kind | Tier | Notes |
+|---|---|---|
+| `local_volume` | 1 | Filesystem path on the api/worker container — production deployments mount this as a docker / k8s volume so archives survive container recycle |
+| `s3` | 1 | AWS S3 + S3-compatible (MinIO, Wasabi, Backblaze B2, Cloudflare R2, DigitalOcean Spaces) via the `endpoint_url` field |
+| `scp` | 1 | SSH password *or* PEM private key auth (`paramiko`); SFTP write/read; per-call connection lifecycle (no pooling) |
+| `azure_blob` | 1 | Azure Storage account via shared-key or full connection string |
+| `smb` | 2 | Windows / Samba shares (`smbprotocol`); NTLM auth, optional SMB3 encryption toggle |
+| `ftp` | 2 | Plain FTP / FTPS-explicit / FTPS-implicit; passive + active; `verify_tls` toggle for self-signed labs |
+| `gcs` | 2 | Google Cloud Storage; service-account JSON key (encrypted at rest) — no ADC by design |
+
+Every driver implements the same four operations: `write` / `list_archives` / `delete` / `download` + a `test_connection` probe (writes a 16-byte random payload, head/stats it, deletes it — same shape as the DNS / DHCP server probes).
+
+#### Schedule + retention
+
+Each target carries:
+
+| Field | Behaviour |
+|---|---|
+| `schedule_cron` | 5-field UTC cron (`0 2 * * *` for "daily at 02:00 UTC"). Optional — leave blank for manual-only. |
+| `retention_keep_last_n` | Keep the N newest archives matching the archive-name regex. |
+| `retention_keep_days` | Drop archives whose mtime is older than N days. |
+| `last_run_status` / `last_run_at` / `last_run_filename` / `last_run_bytes` / `last_run_duration_ms` / `last_run_error` | Surfaced inline on the target row. `last_run_status=in_progress` acts as a per-target mutex so a slow run can't double up on the next tick. |
+
+Set exactly one of `retention_keep_last_n` / `retention_keep_days`, or neither for no auto-prune. A single Celery beat task (every 60 s) walks all enabled targets, checks each one against its `next_run_at`, and dispatches a one-off backup task per target that's due.
+
+#### Manual triggers
+
+| Action | Endpoint |
+|---|---|
+| Build + download a fresh archive | `POST /backup/create-and-download` (StreamingResponse, browser saves the zip directly) |
+| Restore from a laptop-uploaded archive | `POST /backup/restore` (multipart upload) |
+| Run a configured target now | `POST /backup/targets/{id}/run` |
+| Test a configured target's connection | `POST /backup/targets/{id}/test` |
+| List archives at a configured target | `GET /backup/targets/{id}/archives` |
+| Restore from any archive at a target | `POST /backup/targets/{id}/archives/restore` |
+| Download an archive from a target through the proxy | `GET /backup/targets/{id}/archives/{filename}/download` |
+
+The proxy-download endpoint streams `driver.download(filename)` straight back to the operator's browser, so SCP / S3 / Azure / SMB / FTP / GCS archives can be pulled to a laptop without giving the operator the destination credentials.
+
+#### Restore — what the server does
+
+Same code path is hit whether the archive comes from an upload or a destination download.
+
+1. **Pre-flight.** Validates archive shape, manifest `format_version` (1 or 2 currently), passphrase. The passphrase verify happens **before** any destructive step so a wrong passphrase is rejected up front.
+2. **Pre-restore safety dump.** The current state of the database is snapshotted to `/var/lib/spatiumddi/backups/pre-restore-{ts}.zip` (passphrase `pre-restore-safety`). If the apply fails for any reason, the operator can roll back from this dump.
+3. **Connection pool teardown.** SQLAlchemy's engine is disposed and `pg_terminate_backend` kicks every other connection so psql's `--clean` doesn't deadlock against the worker / beat / agents.
+4. **Data replay.**
+   - Phase 2+ archives (`dump_format: custom`) → `pg_restore --clean --if-exists --no-owner --no-acl --single-transaction --exit-on-error`.
+   - Phase 1 archives (plain SQL) → `psql --single-transaction --set=ON_ERROR_STOP=1`.
+   - Selective restore (operator ticked specific sections) → `TRUNCATE … RESTART IDENTITY CASCADE` for the selected sections' tables, then `pg_restore --data-only --disable-triggers --table=…` for just those tables. `platform_internal` (alembic_version + oui_vendor) always rides along.
+5. **Alembic upgrade-on-restore.** If the archive's `schema_version` is older than this install's expected head, `alembic upgrade head` runs against the freshly-restored database. Same head → no-op. Source head not in this install's chain → restore succeeds, operator gets a clear `"upgrade SpatiumDDI on this destination, then re-run the restore"` warning. The restore returns a `migration` block with `state` (`up_to_date` / `upgraded` / `incompatible_newer` / `unknown` / `failed`), `source_head`, `local_head`, `migrations_applied`.
+6. **Cross-install secret rewrap.** Walks every Fernet-encrypted column (22 columns across 16 tables) plus the `__enc__:`-prefixed fields inside `backup_target.config` JSONB; decrypts each with the source key recovered from `secrets.enc`, re-encrypts with the destination's local key, UPDATEs in place. Same-install restores short-circuit with `same_install=true`. The operator no longer has to copy the recovered `SECRET_KEY` into the destination's `.env` manually — it just works.
+7. **Audit row.** Inserts a `backup_restored` row into the `audit_log` table on a fresh session — this row sits in the *restored* database (the trail of evidence survives the wipe), and carries the manifest, pre-restore safety path, migration counters, and rewrap counters.
+
+The restore endpoint is superadmin-only. Operators must type the literal phrase `RESTORE-FROM-BACKUP` server-side to confirm, so accidental drag-and-drops don't nuke the install. Selective restore is opt-in via the section checklist on the restore modal.
+
+#### Confirmation phrase + selective restore
+
+Selecting "Selective restore" on the modal reveals a section checklist driven by `GET /backup/sections`. The checklist auto-ticks every non-volatile selectable section the first time the operator flips into selective mode; volatile sections (DHCP leases, DNS query log, DHCP activity log, nmap scan history, metric samples, Celery scratch) stay unticked by default but can be ticked individually. `platform_internal` is forced-on (alembic_version + oui_vendor are install-state, not user data, so they always ride along).
+
+The UI surfaces a TRUNCATE-CASCADE warning on the selective panel because rows in *non-selected* sections that reference wiped data via foreign key are also removed. The reasoning is documented in the warning copy.
+
+#### Cross-install rewrap counters
+
+The restore response carries a `rewrap` block:
+
+```jsonc
+{
+  "same_install": false,            // true when source + dest keys derive identically
+  "rewrapped_rows": 7,              // column-level rewraps
+  "rewrapped_jsonb_fields": 0,      // backup_target.config __enc__: rewraps
+  "skipped_idempotent_rows": 0,     // already-dest-key-decryptable (re-run / post-restore-created)
+  "failed_rows": 0,                 // couldn't decrypt with either key — operator re-enters by hand
+  "columns_visited": 22,
+  "failures": []                    // first 10 failures with table / column / pk / reason
+}
 ```
-BackupTarget
-  id, name
-  type: enum(local, s3, sftp, azure_blob, gcs)
-  connection_config: JSONB (encrypted)
-  schedule: cron expression
-  retention_days: int
-  encryption_enabled: bool
-  encryption_key_reference: str   -- e.g., Vault path or env var name
-  last_backup_at: timestamp
-  last_backup_size_bytes: int
-  last_backup_status: enum(success, failed, running)
-```
 
-**Backup Operations:**
-- Manual backup trigger from UI
-- Restore from backup: lists available backups with timestamp and size
-- Restore preview: shows what would change before committing
-- Restore is always a full restore (partial restore not supported in Phase 1)
+Same-install restores return `{"same_install": true, ...counters all zero}`. The operator-facing `note` string adapts to the rewrap state ("no key rewrap was needed" / "re-encrypted N secret values" / "re-encrypted N, but K rows could not be decrypted with either key").
 
-**Restore Process:**
-1. Puts system in maintenance mode (API returns 503 with maintenance message)
-2. Takes a safety backup of current state
-3. Restores database from selected backup
-4. Restarts all services
-5. Validates system health before clearing maintenance mode
+#### What's NOT in the archive
+
+| Excluded | Why |
+|---|---|
+| DHCP daemon state (leases live in DB; binary state on the agent is regenerated from config) | Volatile — re-syncs from agents on next poll. Sectioned as `leases` (volatile) so operators can opt in for diagnostic backups. |
+| DNS daemon state | All records live in DB; the BIND9 zone files are templated by the agent on apply. |
+| DNS query log / DHCP activity log | Short-lived diagnostic data. Sectioned as `logs` (volatile). |
+| nmap scan history | Often huge, regenerable. Sectioned as `nmap_history` (volatile). |
+| Metric samples | Volatile, short retention. Sectioned as `metrics` (volatile). |
+| Uploaded asset directory | Phase 2 polish — uploaded files (custom-field attachments, future logo overrides) aren't a separately-tracked path yet. |
 
 ---
 
