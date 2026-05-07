@@ -39,6 +39,26 @@ last three releases retroactively.
 
 ### Added
 
+- **DHCP group-centric UI — Kea servers only (issue #113).** The
+  scopes / pools / static assignments / client classes / option
+  templates / MAC blocks tabs now live on the **group detail
+  page**, not the per-server detail page, for groups with at
+  least one Kea member. The data model has been group-scoped
+  since `2026.04.21-2`; this aligns the UI with that shape so
+  operators stop being misled by "edit scope on kea-1 → why did
+  it change on kea-2 too" (it always did, the UI just looked
+  per-server). Kea server detail page narrows to per-instance
+  surfaces (Leases / History / Server Options) plus a banner
+  pointing back to the group: `Configuration is managed at the
+  group level — Open group →`. Tab state on the group page is
+  per-group sessionStorage so navigating between groups doesn't
+  bounce off the active tab. Server list inside the group's
+  Servers tab is now click-through-able to drill into a peer.
+  **Windows DHCP servers are explicitly out of scope** — every
+  Windows-DHCP server detail page keeps all of its existing
+  tabs exactly as before; the gate is `kea_member_count > 0`
+  on the parent group, and groups are single-vendor today.
+
 - **Aggregation candidates — passive badge with per-candidate
   snooze (issue #114).** The inline "Aggregation suggestions"
   banner that crowded the IPAM page on every load is replaced

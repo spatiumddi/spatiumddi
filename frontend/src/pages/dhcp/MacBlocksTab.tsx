@@ -7,7 +7,6 @@ import {
   type DHCPMACBlock,
   type DHCPMACBlockReason,
   type DHCPMACBlockWrite,
-  type DHCPServer,
 } from "@/lib/api";
 import {
   Modal,
@@ -85,9 +84,8 @@ function StatusPill({ block }: { block: DHCPMACBlock }) {
   );
 }
 
-export function MacBlocksTab({ server }: { server: DHCPServer }) {
+export function MacBlocksTab({ groupId }: { groupId: string }) {
   const qc = useQueryClient();
-  const groupId = server.server_group_id ?? "";
   const { data: blocks = [], isFetching } = useQuery({
     queryKey: ["dhcp-mac-blocks", groupId],
     queryFn: () =>
@@ -127,8 +125,8 @@ export function MacBlocksTab({ server }: { server: DHCPServer }) {
   if (!groupId) {
     return (
       <p className="p-6 text-center text-sm text-muted-foreground">
-        This server is not attached to a group yet. MAC blocks are configured on
-        the server group — assign the server to a group first.
+        MAC blocks are configured on the server group — attach this server to a
+        group first.
       </p>
     );
   }

@@ -258,6 +258,24 @@ function GroupSidebar({
 // Group detail view
 // ─────────────────────────────────────────────────────────────────────────────
 
+/**
+ * A group is "Kea-managed" when it has at least one Kea member. Those
+ * groups host the canonical config tabs (scopes / pools / statics /
+ * classes / option templates / MAC blocks / PXE profiles) on the group
+ * detail page, since every Kea peer in the group renders the same
+ * config bundle.
+ *
+ * Windows-DHCP groups (or groups with no members yet) keep the legacy
+ * per-server layout — Windows operators expect to see scopes on the
+ * server they're administering, and group membership for Windows DHCP
+ * is typically a one-server group anyway. Per the project model,
+ * groups are single-vendor today (Kea OR Windows, not mixed), so the
+ * `kea_member_count >= 1` test is sufficient.
+ */
+function groupIsKeaManaged(group: DHCPServerGroup): boolean {
+  return group.kea_member_count > 0;
+}
+
 function TabButton({
   active,
   onClick,
@@ -282,24 +300,40 @@ function TabButton({
   );
 }
 
+type GroupTab =
+  | "servers"
+  | "scopes"
+  | "pools"
+  | "statics"
+  | "classes"
+  | "option-templates"
+  | "mac-blocks";
+
 function GroupDetailView({
   group,
   onEdit,
   onDelete,
   onAddServer,
+  onSelectServer,
 }: {
   group: DHCPServerGroup;
   onEdit: () => void;
   onDelete: () => void;
   onAddServer: () => void;
+  onSelectServer: (s: DHCPServer) => void;
 }) {
   const qc = useQueryClient();
   const navigate = useNavigate();
+  // Per-group tab persistence keyed on group id so navigating between
+  // groups in the sidebar doesn't bounce the operator off the tab they
+  // were just working on.
+  const [tab, setTab] = useSessionStateGroupTab(group.id);
   const { data: servers = [], isFetching } = useQuery({
     queryKey: ["dhcp-servers", group.id],
     queryFn: () => dhcpApi.listServers(group.id),
     refetchInterval: 30_000,
   });
+  const isKea = groupIsKeaManaged(group);
 
   // Server list carries ha_state and agent_last_seen, which both
   // change after a group mode edit (hot-standby ↔ load-balancing)
@@ -379,72 +413,162 @@ function GroupDetailView({
         </div>
       </div>
 
-      <div className="flex-1 overflow-auto p-6">
-        <div className="rounded-lg border">
-          <div className="border-b px-4 py-2 bg-muted/30">
-            <h2 className="text-sm font-semibold">Servers</h2>
+      {isKea && (
+        <div className="border-b px-6 bg-card">
+          <div className="flex gap-1">
+            <TabButton
+              active={tab === "servers"}
+              onClick={() => setTab("servers")}
+            >
+              Servers
+            </TabButton>
+            <TabButton
+              active={tab === "scopes"}
+              onClick={() => setTab("scopes")}
+            >
+              Scopes
+            </TabButton>
+            <TabButton active={tab === "pools"} onClick={() => setTab("pools")}>
+              Pools
+            </TabButton>
+            <TabButton
+              active={tab === "statics"}
+              onClick={() => setTab("statics")}
+            >
+              Static Assignments
+            </TabButton>
+            <TabButton
+              active={tab === "classes"}
+              onClick={() => setTab("classes")}
+            >
+              Client Classes
+            </TabButton>
+            <TabButton
+              active={tab === "option-templates"}
+              onClick={() => setTab("option-templates")}
+            >
+              Option Templates
+            </TabButton>
+            <TabButton
+              active={tab === "mac-blocks"}
+              onClick={() => setTab("mac-blocks")}
+            >
+              MAC Blocks
+            </TabButton>
           </div>
-          {servers.length === 0 ? (
-            <div className="p-8 text-center">
-              <p className="text-sm text-muted-foreground">
-                No servers in this group yet.
-              </p>
-              <button
-                onClick={onAddServer}
-                className="mt-3 inline-flex items-center gap-1 rounded-md border px-3 py-1.5 text-xs hover:bg-accent"
-              >
-                <Plus className="h-3 w-3" /> Add Server
-              </button>
-            </div>
-          ) : (
-            <div className="divide-y">
-              {servers.map((s) => {
-                // Kea agents send heartbeats; their ``agent_last_seen`` is
-                // the right liveness signal. Windows DHCP is polled, so
-                // ``last_sync_at`` (set when lease pull completes) is
-                // meaningful. Fall back to whichever is set.
-                const seenAt =
-                  s.driver === "kea"
-                    ? (s.agent_last_seen ?? s.last_sync_at)
-                    : (s.last_sync_at ?? s.agent_last_seen);
-                const label =
-                  s.driver === "kea"
-                    ? seenAt
-                      ? `seen ${new Date(seenAt).toLocaleString()}`
-                      : "never heard from"
-                    : seenAt
-                      ? `synced ${new Date(seenAt).toLocaleString()}`
-                      : "never synced";
-                return (
-                  <div
-                    key={s.id}
-                    className="flex items-center gap-3 px-4 py-2.5"
-                  >
-                    <StatusDot status={s.status} />
-                    <span className="w-48 truncate text-sm font-medium">
-                      {s.name}
-                    </span>
-                    <span className="w-48 truncate font-mono text-xs text-muted-foreground">
-                      {s.host}:{s.port}
-                    </span>
-                    <span className="rounded-full bg-muted px-2 py-0.5 text-xs">
-                      {s.driver}
-                    </span>
-                    {s.ha_state && (
-                      <span className="rounded-full bg-muted/60 px-2 py-0.5 text-[11px] text-muted-foreground">
-                        HA: {s.ha_state}
-                      </span>
-                    )}
-                    <span className="ml-auto text-xs text-muted-foreground">
-                      {label}
-                    </span>
-                  </div>
-                );
-              })}
-            </div>
-          )}
         </div>
+      )}
+
+      <div className="flex-1 overflow-auto p-6">
+        {(!isKea || tab === "servers") && (
+          <GroupServersList
+            servers={servers}
+            onAddServer={onAddServer}
+            onSelectServer={onSelectServer}
+          />
+        )}
+        {isKea && tab === "scopes" && <ServerScopesTab groupId={group.id} />}
+        {isKea && tab === "pools" && (
+          <ServerPoolsOrStaticsTab groupId={group.id} kind="pools" />
+        )}
+        {isKea && tab === "statics" && (
+          <ServerPoolsOrStaticsTab groupId={group.id} kind="statics" />
+        )}
+        {isKea && tab === "classes" && <ClientClassesTab groupId={group.id} />}
+        {isKea && tab === "option-templates" && (
+          <OptionTemplatesTab groupId={group.id} />
+        )}
+        {isKea && tab === "mac-blocks" && <MacBlocksTab groupId={group.id} />}
       </div>
+    </div>
+  );
+}
+
+// Per-group sessionStorage-backed tab state so each group remembers
+// the last-active tab independently. A bare `useSessionState` would key
+// the same storage slot for every group; we want one per group id.
+function useSessionStateGroupTab(
+  groupId: string,
+): [GroupTab, (next: GroupTab) => void] {
+  const key = `dhcp.group.${groupId}.tab`;
+  return useSessionState<GroupTab>(key, "servers");
+}
+
+function GroupServersList({
+  servers,
+  onAddServer,
+  onSelectServer,
+}: {
+  servers: DHCPServer[];
+  onAddServer: () => void;
+  onSelectServer: (s: DHCPServer) => void;
+}) {
+  return (
+    <div className="rounded-lg border">
+      <div className="border-b px-4 py-2 bg-muted/30">
+        <h2 className="text-sm font-semibold">Servers</h2>
+      </div>
+      {servers.length === 0 ? (
+        <div className="p-8 text-center">
+          <p className="text-sm text-muted-foreground">
+            No servers in this group yet.
+          </p>
+          <button
+            onClick={onAddServer}
+            className="mt-3 inline-flex items-center gap-1 rounded-md border px-3 py-1.5 text-xs hover:bg-accent"
+          >
+            <Plus className="h-3 w-3" /> Add Server
+          </button>
+        </div>
+      ) : (
+        <div className="divide-y">
+          {servers.map((s) => {
+            // Kea agents send heartbeats; their ``agent_last_seen`` is
+            // the right liveness signal. Windows DHCP is polled, so
+            // ``last_sync_at`` (set when lease pull completes) is
+            // meaningful. Fall back to whichever is set.
+            const seenAt =
+              s.driver === "kea"
+                ? (s.agent_last_seen ?? s.last_sync_at)
+                : (s.last_sync_at ?? s.agent_last_seen);
+            const label =
+              s.driver === "kea"
+                ? seenAt
+                  ? `seen ${new Date(seenAt).toLocaleString()}`
+                  : "never heard from"
+                : seenAt
+                  ? `synced ${new Date(seenAt).toLocaleString()}`
+                  : "never synced";
+            return (
+              <button
+                type="button"
+                key={s.id}
+                onClick={() => onSelectServer(s)}
+                className="flex w-full items-center gap-3 px-4 py-2.5 text-left transition-colors hover:bg-accent/40"
+              >
+                <StatusDot status={s.status} />
+                <span className="w-48 truncate text-sm font-medium">
+                  {s.name}
+                </span>
+                <span className="w-48 truncate font-mono text-xs text-muted-foreground">
+                  {s.host}:{s.port}
+                </span>
+                <span className="rounded-full bg-muted px-2 py-0.5 text-xs">
+                  {s.driver}
+                </span>
+                {s.ha_state && (
+                  <span className="rounded-full bg-muted/60 px-2 py-0.5 text-[11px] text-muted-foreground">
+                    HA: {s.ha_state}
+                  </span>
+                )}
+                <span className="ml-auto text-xs text-muted-foreground">
+                  {label}
+                </span>
+              </button>
+            );
+          })}
+        </div>
+      )}
     </div>
   );
 }
@@ -461,13 +585,13 @@ function GroupDetailView({
  */
 function ScopeDeleteModal({
   scope,
-  server,
+  groupId,
   onConfirm,
   onClose,
   isPending,
 }: {
   scope: DHCPScope;
-  server: DHCPServer;
+  groupId: string;
   onConfirm: () => void;
   onClose: () => void;
   isPending: boolean;
@@ -480,6 +604,14 @@ function ScopeDeleteModal({
     queryKey: ["dhcp-statics", scope.id],
     queryFn: () => dhcpApi.listStatics(scope.id),
   });
+  // The Windows-driver write-through note only applies when the group
+  // has at least one Windows DHCP member; pull the group's server list
+  // (cheap, already cached by the parent view) and check.
+  const { data: groupServers = [] } = useQuery({
+    queryKey: ["dhcp-servers", groupId],
+    queryFn: () => (groupId ? dhcpApi.listServers(groupId) : []),
+    enabled: !!groupId,
+  });
   const references: string[] = [];
   if (pools.length)
     references.push(`${pools.length} pool${pools.length === 1 ? "" : "s"}`);
@@ -487,10 +619,9 @@ function ScopeDeleteModal({
     references.push(
       `${statics.length} reservation${statics.length === 1 ? "" : "s"}`,
     );
-  const windowsNote =
-    server.driver === "windows_dhcp"
-      ? " The scope will also be removed from the Windows DHCP server via WinRM."
-      : "";
+  const windowsNote = groupServers.some((s) => s.driver === "windows_dhcp")
+    ? " The scope will also be removed from the Windows DHCP server via WinRM."
+    : "";
   return (
     <DeleteConfirmModal
       title="Delete DHCP Scope"
@@ -510,7 +641,7 @@ function ScopeDeleteModal({
   );
 }
 
-function ServerScopesTab({ server }: { server: DHCPServer }) {
+function ServerScopesTab({ groupId }: { groupId: string }) {
   const qc = useQueryClient();
   const [tagFilters, setTagFilters] = useState<string[]>([]);
   const { data: subnets = [] } = useQuery({
@@ -518,20 +649,19 @@ function ServerScopesTab({ server }: { server: DHCPServer }) {
     queryFn: () => ipamApi.listSubnets(),
   });
 
-  // Under the group-centric model, scopes belong to a server's GROUP,
-  // not the server. All servers in the group render the same scopes.
-  // We query by the server's group and join in each scope's subnet
-  // CIDR (for display) via the subnet fetch above.
+  // Scopes live on the DHCP server group, not on individual servers — every
+  // peer in the group renders the same set. Both the group detail view and
+  // the (legacy) Windows-server detail view feed in the same group id.
   const { data: groupScopes = [] } = useQuery({
-    queryKey: ["dhcp-scopes-group", server.server_group_id ?? "", tagFilters],
+    queryKey: ["dhcp-scopes-group", groupId, tagFilters],
     queryFn: () =>
-      server.server_group_id
+      groupId
         ? dhcpApi.listScopesByGroup(
-            server.server_group_id,
+            groupId,
             tagFilters.length > 0 ? { tag: tagFilters } : undefined,
           )
         : Promise.resolve([]),
-    enabled: !!server.server_group_id,
+    enabled: !!groupId,
   });
   const subnetById = new Map(subnets.map((s) => [s.id, s]));
   const allScopes: (DHCPScope & { subnet_network?: string })[] =
@@ -563,8 +693,8 @@ function ServerScopesTab({ server }: { server: DHCPServer }) {
       />
       <div className="flex items-center justify-between">
         <p className="text-xs text-muted-foreground">
-          {allScopes.length} scope{allScopes.length !== 1 ? "s" : ""} served by
-          this server.
+          {allScopes.length} scope{allScopes.length !== 1 ? "s" : ""} on this
+          group.
         </p>
         <div className="flex items-center gap-2">
           <select
@@ -699,7 +829,7 @@ function ServerScopesTab({ server }: { server: DHCPServer }) {
       {createForSubnet && (
         <CreateScopeModal
           subnetId={createForSubnet}
-          defaultGroupId={server.server_group_id ?? undefined}
+          defaultGroupId={groupId || undefined}
           onClose={() => setCreateForSubnet(null)}
         />
       )}
@@ -712,7 +842,7 @@ function ServerScopesTab({ server }: { server: DHCPServer }) {
       {delScope && (
         <ScopeDeleteModal
           scope={delScope}
-          server={server}
+          groupId={groupId}
           onConfirm={() => delMut.mutate(delScope.id)}
           onClose={() => setDelScope(null)}
           isPending={delMut.isPending}
@@ -723,22 +853,19 @@ function ServerScopesTab({ server }: { server: DHCPServer }) {
 }
 
 function ServerPoolsOrStaticsTab({
-  server,
+  groupId,
   kind,
 }: {
-  server: DHCPServer;
+  groupId: string;
   kind: "pools" | "statics";
 }) {
-  // Scopes belong to the server's group — pull them from there rather
-  // than iterating every subnet. Empty when the server has no group
-  // (groupless server = nothing to serve yet).
+  // Scopes belong to the group — pull them once and walk into each scope
+  // for its pool / static rows. Empty when the group has no scopes yet.
   const { data: groupScopes = [] } = useQuery({
-    queryKey: ["dhcp-scopes-group", server.server_group_id ?? ""],
+    queryKey: ["dhcp-scopes-group", groupId],
     queryFn: () =>
-      server.server_group_id
-        ? dhcpApi.listScopesByGroup(server.server_group_id)
-        : Promise.resolve([]),
-    enabled: !!server.server_group_id,
+      groupId ? dhcpApi.listScopesByGroup(groupId) : Promise.resolve([]),
+    enabled: !!groupId,
   });
   const allScopes = groupScopes;
 
@@ -971,9 +1098,8 @@ function ServerPoolsOrStaticsTab({
   );
 }
 
-function ClientClassesTab({ server }: { server: DHCPServer }) {
+function ClientClassesTab({ groupId }: { groupId: string }) {
   const qc = useQueryClient();
-  const groupId = server.server_group_id ?? "";
   const { data: classes = [] } = useQuery({
     queryKey: ["dhcp-client-classes", groupId],
     queryFn: () =>
@@ -996,8 +1122,8 @@ function ClientClassesTab({ server }: { server: DHCPServer }) {
   if (!groupId) {
     return (
       <p className="p-6 text-center text-sm text-muted-foreground">
-        This server is not attached to a group yet. Client classes are
-        configured on the server group — assign the server to a group first.
+        Client classes are configured on the server group — attach this server
+        to a group first.
       </p>
     );
   }
@@ -1088,9 +1214,8 @@ function ClientClassesTab({ server }: { server: DHCPServer }) {
   );
 }
 
-function OptionTemplatesTab({ server }: { server: DHCPServer }) {
+function OptionTemplatesTab({ groupId }: { groupId: string }) {
   const qc = useQueryClient();
-  const groupId = server.server_group_id ?? "";
   const { data: templates = [] } = useQuery({
     queryKey: ["dhcp-option-templates", groupId],
     queryFn: () =>
@@ -1113,8 +1238,8 @@ function OptionTemplatesTab({ server }: { server: DHCPServer }) {
   if (!groupId) {
     return (
       <p className="p-6 text-center text-sm text-muted-foreground">
-        This server is not attached to a group yet. Option templates are
-        configured on the server group — assign the server to a group first.
+        Option templates are configured on the server group — attach this server
+        to a group first.
       </p>
     );
   }
@@ -1574,14 +1699,24 @@ function ServerDetailView({
   group,
   onEdit,
   onDelete,
+  onSelectGroup,
 }: {
   server: DHCPServer;
   group: DHCPServerGroup | null;
   onEdit: () => void;
   onDelete: () => void;
+  onSelectGroup?: (group: DHCPServerGroup) => void;
 }) {
   const qc = useQueryClient();
-  const [tab, setTab] = useState<Tab>("scopes");
+  // For Kea servers attached to a Kea-managed group, scopes / pools /
+  // statics / classes / option templates / MAC blocks all live on the
+  // group, not on this individual peer — we hide those tabs here and
+  // surface a banner pointing the operator to the group page. Windows
+  // DHCP servers keep every tab on the per-server page exactly as
+  // before; that's the model their operators expect.
+  const groupOwnsConfig =
+    server.driver === "kea" && group !== null && groupIsKeaManaged(group);
+  const [tab, setTab] = useState<Tab>(groupOwnsConfig ? "leases" : "scopes");
   const [syncBanner, setSyncBanner] = useState<string | null>(null);
   const syncMut = useMutation({
     mutationFn: () => dhcpApi.syncServer(server.id),
@@ -1751,6 +1886,24 @@ function ServerDetailView({
             is a controller + mirror.
           </div>
         )}
+        {groupOwnsConfig && group && (
+          <div className="mt-3 flex items-center justify-between gap-3 rounded border border-amber-500/40 bg-amber-500/5 px-3 py-2 text-xs text-amber-800 dark:text-amber-300">
+            <span>
+              Configuration (scopes, pools, reservations, classes, option
+              templates, MAC blocks) is managed at the group level — every Kea
+              peer in {group.name} renders the same config bundle.
+            </span>
+            {onSelectGroup && (
+              <button
+                type="button"
+                onClick={() => onSelectGroup(group)}
+                className="flex-shrink-0 rounded-md border border-amber-500/50 bg-amber-500/10 px-2.5 py-1 font-medium hover:bg-amber-500/20"
+              >
+                Open group →
+              </button>
+            )}
+          </div>
+        )}
         {syncBanner && (
           <div className="mt-3 flex items-center justify-between gap-2 rounded border bg-muted/40 px-3 py-1.5 text-xs">
             <span className="truncate">{syncBanner}</span>
@@ -1767,36 +1920,46 @@ function ServerDetailView({
 
       <div className="border-b px-6 bg-card">
         <div className="flex gap-1">
-          <TabButton active={tab === "scopes"} onClick={() => setTab("scopes")}>
-            Scopes
-          </TabButton>
-          <TabButton active={tab === "pools"} onClick={() => setTab("pools")}>
-            Pools
-          </TabButton>
-          <TabButton
-            active={tab === "statics"}
-            onClick={() => setTab("statics")}
-          >
-            Static Assignments
-          </TabButton>
-          <TabButton
-            active={tab === "classes"}
-            onClick={() => setTab("classes")}
-          >
-            Client Classes
-          </TabButton>
-          <TabButton
-            active={tab === "option-templates"}
-            onClick={() => setTab("option-templates")}
-          >
-            Option Templates
-          </TabButton>
-          <TabButton
-            active={tab === "mac-blocks"}
-            onClick={() => setTab("mac-blocks")}
-          >
-            MAC Blocks
-          </TabButton>
+          {!groupOwnsConfig && (
+            <>
+              <TabButton
+                active={tab === "scopes"}
+                onClick={() => setTab("scopes")}
+              >
+                Scopes
+              </TabButton>
+              <TabButton
+                active={tab === "pools"}
+                onClick={() => setTab("pools")}
+              >
+                Pools
+              </TabButton>
+              <TabButton
+                active={tab === "statics"}
+                onClick={() => setTab("statics")}
+              >
+                Static Assignments
+              </TabButton>
+              <TabButton
+                active={tab === "classes"}
+                onClick={() => setTab("classes")}
+              >
+                Client Classes
+              </TabButton>
+              <TabButton
+                active={tab === "option-templates"}
+                onClick={() => setTab("option-templates")}
+              >
+                Option Templates
+              </TabButton>
+              <TabButton
+                active={tab === "mac-blocks"}
+                onClick={() => setTab("mac-blocks")}
+              >
+                MAC Blocks
+              </TabButton>
+            </>
+          )}
           <TabButton active={tab === "leases"} onClick={() => setTab("leases")}>
             Leases
           </TabButton>
@@ -1816,16 +1979,30 @@ function ServerDetailView({
       </div>
 
       <div className="flex-1 overflow-auto p-6">
-        {tab === "scopes" && <ServerScopesTab server={server} />}
-        {tab === "pools" && (
-          <ServerPoolsOrStaticsTab server={server} kind="pools" />
+        {!groupOwnsConfig && tab === "scopes" && (
+          <ServerScopesTab groupId={server.server_group_id ?? ""} />
         )}
-        {tab === "statics" && (
-          <ServerPoolsOrStaticsTab server={server} kind="statics" />
+        {!groupOwnsConfig && tab === "pools" && (
+          <ServerPoolsOrStaticsTab
+            groupId={server.server_group_id ?? ""}
+            kind="pools"
+          />
         )}
-        {tab === "classes" && <ClientClassesTab server={server} />}
-        {tab === "option-templates" && <OptionTemplatesTab server={server} />}
-        {tab === "mac-blocks" && <MacBlocksTab server={server} />}
+        {!groupOwnsConfig && tab === "statics" && (
+          <ServerPoolsOrStaticsTab
+            groupId={server.server_group_id ?? ""}
+            kind="statics"
+          />
+        )}
+        {!groupOwnsConfig && tab === "classes" && (
+          <ClientClassesTab groupId={server.server_group_id ?? ""} />
+        )}
+        {!groupOwnsConfig && tab === "option-templates" && (
+          <OptionTemplatesTab groupId={server.server_group_id ?? ""} />
+        )}
+        {!groupOwnsConfig && tab === "mac-blocks" && (
+          <MacBlocksTab groupId={server.server_group_id ?? ""} />
+        )}
         {tab === "leases" && <LeasesTab server={server} />}
         {tab === "history" && <LeaseHistoryTab server={server} />}
         {tab === "options" && (
@@ -1988,6 +2165,13 @@ export function DHCPPage() {
             onEdit={() => setEditGroup(selection.group)}
             onDelete={() => setDelGroup(selection.group)}
             onAddServer={() => setAddServerFor(selection.group.id)}
+            onSelectServer={(s) =>
+              setSelection({
+                type: "server",
+                group: selection.group,
+                server: s,
+              })
+            }
           />
         )}
         {selection?.type === "server" && effectiveServer && (
@@ -1996,6 +2180,7 @@ export function DHCPPage() {
             group={selection.group}
             onEdit={() => setEditServer(effectiveServer)}
             onDelete={() => setDelServer(effectiveServer)}
+            onSelectGroup={(g) => setSelection({ type: "group", group: g })}
           />
         )}
       </div>
