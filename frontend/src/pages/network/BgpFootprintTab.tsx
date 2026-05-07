@@ -73,7 +73,10 @@ function AnnouncedPrefixesSection({ asn }: { asn: number }) {
   const q = useQuery({
     queryKey: ["bgp-announced-prefixes", asn],
     queryFn: () => bgpApi.announcedPrefixes(asn),
-    staleTime: 6 * 60 * 60 * 1000,
+    // See note on the PeeringDB queries below — backend cache (6h
+    // here) is the source of truth; the frontend keeps a small
+    // window so tab-switching doesn't refetch needlessly.
+    staleTime: 60 * 1000,
   });
 
   const filtered = useMemo(() => {
@@ -166,7 +169,12 @@ function PeeringProfileSection({ asn }: { asn: number }) {
   const q = useQuery({
     queryKey: ["bgp-peering-profile", asn],
     queryFn: () => bgpApi.asnNetwork(asn),
-    staleTime: 24 * 60 * 60 * 1000,
+    // Backend caches the upstream response for 24h already; keeping
+    // a small frontend staleTime means an operator who reopens the
+    // tab gets the latest backend snapshot, not a possibly-stale
+    // browser-side copy. 60 s is enough to absorb tab-switching
+    // bounces without doubling up the long upstream cache.
+    staleTime: 60 * 1000,
   });
 
   return (
@@ -253,7 +261,12 @@ function IxpPresenceSection({ asn }: { asn: number }) {
   const q = useQuery({
     queryKey: ["bgp-ixps", asn],
     queryFn: () => bgpApi.asnIxps(asn),
-    staleTime: 24 * 60 * 60 * 1000,
+    // Backend caches the upstream response for 24h already; keeping
+    // a small frontend staleTime means an operator who reopens the
+    // tab gets the latest backend snapshot, not a possibly-stale
+    // browser-side copy. 60 s is enough to absorb tab-switching
+    // bounces without doubling up the long upstream cache.
+    staleTime: 60 * 1000,
   });
 
   // Group by IX name + city for readability — operators with multiple
