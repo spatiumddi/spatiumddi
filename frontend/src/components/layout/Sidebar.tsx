@@ -50,6 +50,7 @@ import {
   ToggleLeft,
   AlertTriangle,
   Database,
+  Eraser,
   X,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -216,6 +217,10 @@ const adminInsightsNav = [
   // group alongside Trash + Diagnostics — all "platform-state
   // lifecycle" surfaces.
   { label: "Backup", icon: Database, to: "/admin/backup" },
+  // Factory reset (issue #116). Sits next to Backup because they're
+  // the two opposite ends of the platform-state lifecycle —
+  // backup snapshots state, factory reset wipes it.
+  { label: "Factory Reset", icon: Eraser, to: "/admin/factory-reset" },
   { label: "Compliance", icon: ShieldCheck, to: "/admin/compliance" },
   {
     label: "Conformity",

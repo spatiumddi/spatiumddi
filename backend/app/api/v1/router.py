@@ -47,6 +47,7 @@ from app.api.v1.search.router import router as search_router
 from app.api.v1.services import router as services_router
 from app.api.v1.sessions.router import router as sessions_router
 from app.api.v1.settings.router import router as settings_router
+from app.api.v1.system import router as system_router
 from app.api.v1.tags import router as tags_router
 from app.api.v1.tailscale import router as tailscale_router
 from app.api.v1.unifi import router as unifi_router
@@ -179,6 +180,7 @@ api_v1_router.include_router(
     tags=["sites"],
     dependencies=[Depends(require_module("network.site"))],
 )
+api_v1_router.include_router(system_router, prefix="/system", tags=["system"])
 api_v1_router.include_router(tags_router, prefix="/tags", tags=["tags"])
 api_v1_router.include_router(
     tailscale_router,

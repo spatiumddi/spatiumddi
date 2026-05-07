@@ -9080,3 +9080,66 @@ export const applicationsApi = {
     api.put<ApplicationRead>(`/applications/${id}`, body).then((r) => r.data),
   remove: (id: string) => api.delete(`/applications/${id}`),
 };
+
+// ── Factory Reset (issue #116) ────────────────────────────────────────
+
+export interface FactoryResetSection {
+  key: string;
+  label: string;
+  description: string;
+  phrase: string;
+  kind: "truncate" | "auth_rbac" | "settings_reset" | "everything";
+  table_count: number;
+}
+
+export interface FactoryResetSectionPreview {
+  section_key: string;
+  label: string;
+  kind: string;
+  affected_rows: number;
+  table_counts: Record<string, number>;
+  notes: string[];
+}
+
+export interface FactoryResetPreviewResponse {
+  sections: FactoryResetSectionPreview[];
+  deleted_rows_total: number;
+  backup_warning: boolean;
+  backup_warning_detail: string | null;
+  cooldown_blocking: boolean;
+  cooldown_detail: string | null;
+}
+
+export interface FactoryResetExecuteRequest {
+  section_keys: string[];
+  password: string;
+  confirm_phrases: Record<string, string>;
+  acknowledge_no_backup?: boolean;
+}
+
+export interface FactoryResetExecuteResponse {
+  success: boolean;
+  sections: string[];
+  deleted_rows_total: number;
+  audit_anchor_id: string | null;
+  duration_ms: number;
+}
+
+export const factoryResetApi = {
+  listSections: () =>
+    api
+      .get<{
+        sections: FactoryResetSection[];
+      }>("/system/factory-reset/sections")
+      .then((r) => r.data.sections),
+  preview: (section_keys: string[]) =>
+    api
+      .post<FactoryResetPreviewResponse>("/system/factory-reset/preview", {
+        section_keys,
+      })
+      .then((r) => r.data),
+  execute: (body: FactoryResetExecuteRequest) =>
+    api
+      .post<FactoryResetExecuteResponse>("/system/factory-reset/execute", body)
+      .then((r) => r.data),
+};

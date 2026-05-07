@@ -127,6 +127,13 @@ _SPECIAL_EVENT_MAP: dict[tuple[str, str], str] = {
     ("backup_target_run_success", "backup_target"): "system.backup_completed",
     ("backup_target_run_failed", "backup_target"): "system.backup_failed",
     ("backup_restored", "backup_target"): "system.restore_performed",
+    # Factory reset (issue #116). The synthetic
+    # ``factory_reset_performed`` audit row is inserted by the
+    # runner via raw asyncpg (not the SQLAlchemy session) so the
+    # publisher's flush hook doesn't see it. The endpoint also
+    # writes a separate session-flush audit row so the event
+    # fires through the standard pipeline.
+    ("factory_reset_performed", "platform"): "system.factory_reset",
 }
 
 
