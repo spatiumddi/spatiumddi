@@ -39,7 +39,11 @@ from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.core.crypto import decrypt_str, encrypt_str
 from app.models.event_subscription import EventOutbox, EventSubscription
 from app.services import event_delivery
-from app.services.event_publisher import _RESOURCE_NAMESPACE, _VERB_MAP
+from app.services.event_publisher import (
+    _RESOURCE_NAMESPACE,
+    _SPECIAL_EVENT_MAP,
+    _VERB_MAP,
+)
 
 router = APIRouter(tags=["webhooks"])
 
@@ -173,10 +177,15 @@ async def list_event_types(_: CurrentUser) -> dict[str, list[str]]:
     uses (``_RESOURCE_NAMESPACE`` × ``_VERB_MAP``) so the surface
     stays in lock-step with what's actually fired.
     """
-    types: list[str] = []
-    for namespace in sorted(set(_RESOURCE_NAMESPACE.values())):
+    types: set[str] = set()
+    for namespace in set(_RESOURCE_NAMESPACE.values()):
         for verb in _VERB_MAP.values():
-            types.append(f"{namespace}.{verb}")
+            types.add(f"{namespace}.{verb}")
+    # Special-cased event names override the synthesised ``ns.verb``
+    # for cases like ``system.backup_completed`` that don't fit the
+    # create/update/delete trio. Surface them in the catalog so
+    # operators can subscribe.
+    types.update(_SPECIAL_EVENT_MAP.values())
     return {"event_types": sorted(types)}
 
 

@@ -36,6 +36,20 @@ import { BackupSectionsPicker } from "./BackupSectionsPicker";
  * future kinds) appears without frontend changes once
  * registered server-side.
  */
+
+// Friendly preset list for the schedule dropdown. UTC times so
+// operators don't have to think about TZ when they pick "daily
+// at 02:00". Same expressions croniter parses on the backend.
+const CRON_PRESETS: { label: string; value: string }[] = [
+  { label: "Hourly", value: "0 * * * *" },
+  { label: "Every 6 hours", value: "0 */6 * * *" },
+  { label: "Every 12 hours", value: "0 */12 * * *" },
+  { label: "Daily 02:00 UTC", value: "0 2 * * *" },
+  { label: "Daily 04:00 UTC", value: "0 4 * * *" },
+  { label: "Weekly Sunday 03:00 UTC", value: "0 3 * * 0" },
+  { label: "Monthly 1st 03:00 UTC", value: "0 3 1 * *" },
+];
+
 export function BackupTargetsSection() {
   const qc = useQueryClient();
   const targetsQ = useQuery({
@@ -811,21 +825,42 @@ function TargetFormModal({
             label="Schedule (cron, UTC)"
             help={
               <>
-                5-field UTC cron expression. Examples:{" "}
-                <code className="rounded bg-muted px-1 py-0.5">0 2 * * *</code>{" "}
-                = daily 02:00 UTC,{" "}
-                <code className="rounded bg-muted px-1 py-0.5">0 3 * * 0</code>{" "}
-                = Sundays 03:00 UTC. Leave blank for manual-only.
+                5-field UTC cron expression — pick a preset or type
+                your own. Leave blank for manual-only.
               </>
             }
           >
-            <input
-              type="text"
-              value={scheduleCron}
-              onChange={(e) => setScheduleCron(e.target.value)}
-              className="w-full rounded-md border bg-background px-3 py-1.5 font-mono text-sm focus:outline-none focus:ring-2 focus:ring-ring"
-              placeholder="0 2 * * *"
-            />
+            <div className="space-y-1.5">
+              <select
+                value={
+                  CRON_PRESETS.find((p) => p.value === scheduleCron)?.value ??
+                  (scheduleCron ? "__custom__" : "")
+                }
+                onChange={(e) => {
+                  if (e.target.value === "__custom__") return;
+                  setScheduleCron(e.target.value);
+                }}
+                className="w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+              >
+                <option value="">Manual only (no schedule)</option>
+                {CRON_PRESETS.map((p) => (
+                  <option key={p.value} value={p.value}>
+                    {p.label} ({p.value})
+                  </option>
+                ))}
+                {scheduleCron &&
+                  !CRON_PRESETS.some((p) => p.value === scheduleCron) && (
+                    <option value="__custom__">Custom: {scheduleCron}</option>
+                  )}
+              </select>
+              <input
+                type="text"
+                value={scheduleCron}
+                onChange={(e) => setScheduleCron(e.target.value)}
+                className="w-full rounded-md border bg-background px-3 py-1.5 font-mono text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+                placeholder="0 2 * * *"
+              />
+            </div>
           </Field>
 
           <fieldset className="space-y-2 rounded-md border bg-muted/30 px-3 py-2">

@@ -110,11 +110,31 @@ _RESOURCE_NAMESPACE: dict[str, str] = {
     "docker_host": "integration.docker",
     "proxmox_node": "integration.proxmox",
     "tailscale_tenant": "integration.tailscale",
+    # Backup + restore (issue #117 Phase 3)
+    "platform": "system",
+    "backup_target": "backup.target",
+}
+
+
+# Direct ``(action, resource_type)`` → event-name overrides for cases
+# where the regular ``namespace.verb`` synthesis produces an awkward
+# name. Backup is the headline use case: scheduled runs land as
+# ``backup_target_run_success`` audit rows but operators want to
+# subscribe to ``system.backup_completed``.
+_SPECIAL_EVENT_MAP: dict[tuple[str, str], str] = {
+    ("backup_created", "platform"): "system.backup_completed",
+    ("backup_restored", "platform"): "system.restore_performed",
+    ("backup_target_run_success", "backup_target"): "system.backup_completed",
+    ("backup_target_run_failed", "backup_target"): "system.backup_failed",
+    ("backup_restored", "backup_target"): "system.restore_performed",
 }
 
 
 def _audit_to_event_type(action: str, resource_type: str) -> str | None:
     """Translate ``(action, resource_type)`` → typed event name."""
+    special = _SPECIAL_EVENT_MAP.get((action, resource_type))
+    if special is not None:
+        return special
     namespace = _RESOURCE_NAMESPACE.get(resource_type)
     if namespace is None:
         return None

@@ -95,11 +95,21 @@ async def create_and_download_backup(
     current_user: CurrentUser,
     passphrase: str = Form(..., min_length=8, max_length=512),
     passphrase_hint: str = Form(default="", max_length=200),
+    exclude_secrets: bool = Form(default=False),
 ) -> StreamingResponse:
     """Build a backup archive synchronously and stream it as a
     zip download. Operator passphrase is required (min 8 chars) so
     the secret-bearing payload inside ``secrets.enc`` is never
     written in clear.
+
+    ``exclude_secrets`` (Phase 3 diagnostic mode): NULL every
+    Fernet-encrypted column inside a transaction whose snapshot
+    drives pg_dump, then roll back. The dumped archive contains
+    no decryptable credentials — operators can share it with
+    support / consultants without leaking integration creds /
+    auth-provider secrets / TSIG keys / etc. Restoring such an
+    archive yields an install with empty credential fields; the
+    operator re-enters them by hand.
     """
     _require_superadmin(current_user)
     try:
@@ -107,6 +117,7 @@ async def create_and_download_backup(
             db,
             passphrase=passphrase,
             passphrase_hint=passphrase_hint,
+            exclude_secrets=exclude_secrets,
         )
     except BackupArchiveError as exc:
         logger.warning("backup_create_failed", error=str(exc))
@@ -125,6 +136,7 @@ async def create_and_download_backup(
                 "filename": filename,
                 "bytes": len(archive_bytes),
                 "passphrase_hint": passphrase_hint or None,
+                "secrets_excluded": exclude_secrets,
             },
         )
     )

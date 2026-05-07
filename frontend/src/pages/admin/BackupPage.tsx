@@ -109,9 +109,11 @@ function CreateBackupCard() {
   const [passphrase, setPassphrase] = useState("");
   const [passphrase2, setPassphrase2] = useState("");
   const [hint, setHint] = useState("");
+  const [excludeSecrets, setExcludeSecrets] = useState(false);
 
   const downloadMut = useMutation({
-    mutationFn: () => backupApi.createAndDownload(passphrase, hint),
+    mutationFn: () =>
+      backupApi.createAndDownload(passphrase, hint, excludeSecrets),
   });
 
   const passphraseTooShort = passphrase.length > 0 && passphrase.length < 8;
@@ -190,6 +192,22 @@ function CreateBackupCard() {
             className="w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
           />
         </Field>
+        <label className="flex items-start gap-2 rounded-md border bg-muted/30 px-3 py-2 text-xs">
+          <input
+            type="checkbox"
+            checked={excludeSecrets}
+            onChange={(e) => setExcludeSecrets(e.target.checked)}
+            className="mt-0.5"
+          />
+          <span>
+            <strong>Exclude secrets (diagnostic mode).</strong> NULL every
+            credential / api-key / TSIG-key / TOTP secret in the archive at
+            dump time. Use when sharing a snapshot with support /
+            consultants — the archive is shareable but a restore yields an
+            install with empty credential fields, so operators re-enter
+            integration / auth-provider creds by hand.
+          </span>
+        </label>
         <div className="flex items-center gap-2">
           <button
             type="submit"

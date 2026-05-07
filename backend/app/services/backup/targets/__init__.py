@@ -32,6 +32,7 @@ from app.services.backup.targets.secrets_config import (
     redact_config_secrets,
 )
 from app.services.backup.targets.smb import SmbDestination
+from app.services.backup.targets.webdav import WebDAVDestination
 
 # Side-effect register every driver. New drivers register the
 # same way — no other code path needs to learn about them.
@@ -42,6 +43,7 @@ DESTINATIONS["azure_blob"] = AzureBlobDestination()
 DESTINATIONS["smb"] = SmbDestination()
 DESTINATIONS["ftp"] = FtpDestination()
 DESTINATIONS["gcs"] = GcsDestination()
+DESTINATIONS["webdav"] = WebDAVDestination()
 
 __all__ = [
     "ArchiveListing",
@@ -55,6 +57,7 @@ __all__ = [
     "S3Destination",
     "ScpDestination",
     "SmbDestination",
+    "WebDAVDestination",
     "DESTINATIONS",
     "REDACTED_SENTINEL",
     "SecretFieldError",

@@ -462,6 +462,54 @@ async def list_target_archives(
     ]
 
 
+@router.get("/{target_id}/archives/latest/download")
+async def download_latest_target_archive(
+    target_id: uuid.UUID,
+    db: DB,
+    current_user: CurrentUser,
+):
+    """One-shot 'give me the newest archive at this target'
+    download (issue #117 Phase 3). Resolves to the same code path
+    as the explicit-filename download below — we just look up the
+    newest entry from ``driver.list_archives`` first. Returns 404
+    when the target has no archives yet.
+    """
+    from fastapi.responses import StreamingResponse  # noqa: PLC0415
+
+    _require_superadmin(current_user)
+    row = await db.get(BackupTarget, target_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="backup target not found")
+    driver = get_destination(row.kind)
+    try:
+        plain_config = decrypt_config_secrets(driver, row.config)
+        archives = await driver.list_archives(config=plain_config)
+    except SecretFieldError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except BackupDestinationError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    if not archives:
+        raise HTTPException(status_code=404, detail=f"no archives at target {row.name!r}")
+    # ``list_archives`` already returns newest-first by contract.
+    newest = archives[0]
+    try:
+        archive_bytes = await driver.download(config=plain_config, filename=newest.filename)
+    except BackupDestinationError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    def _iter():
+        yield archive_bytes
+
+    return StreamingResponse(
+        _iter(),
+        media_type="application/zip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{newest.filename}"',
+            "Content-Length": str(len(archive_bytes)),
+        },
+    )
+
+
 @router.get("/{target_id}/archives/{filename}/download")
 async def download_target_archive(
     target_id: uuid.UUID,

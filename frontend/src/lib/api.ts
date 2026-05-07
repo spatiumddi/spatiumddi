@@ -2145,10 +2145,12 @@ export const backupApi = {
   createAndDownload: async (
     passphrase: string,
     passphraseHint: string,
+    excludeSecrets: boolean = false,
   ): Promise<void> => {
     const fd = new FormData();
     fd.append("passphrase", passphrase);
     fd.append("passphrase_hint", passphraseHint);
+    if (excludeSecrets) fd.append("exclude_secrets", "true");
     let res;
     try {
       res = await api.post<Blob>("/backup/create-and-download", fd, {
