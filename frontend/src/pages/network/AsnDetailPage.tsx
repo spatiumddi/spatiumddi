@@ -21,10 +21,18 @@ import { RdapPanel } from "@/components/network/rdap-panel";
 import { cn } from "@/lib/utils";
 import { CommunitiesTab } from "./CommunitiesTab";
 import { PeeringsTab } from "./PeeringsTab";
+import { BgpFootprintTab } from "./BgpFootprintTab";
 
 import { errMsg, humanTime } from "./_shared";
 
-type Tab = "whois" | "rpki" | "bgp" | "communities" | "ipam" | "alerts";
+type Tab =
+  | "whois"
+  | "rpki"
+  | "footprint"
+  | "bgp"
+  | "communities"
+  | "ipam"
+  | "alerts";
 
 // ── Badges ───────────────────────────────────────────────────────────
 
@@ -244,6 +252,7 @@ export function AsnDetailPage() {
   const TABS: Array<[Tab, string]> = [
     ["whois", "WHOIS"],
     ["rpki", "RPKI ROAs"],
+    ["footprint", "BGP Footprint"],
     ["bgp", "BGP Peering"],
     ["communities", "Communities"],
     ["ipam", "IP Spaces / Blocks"],
@@ -488,6 +497,10 @@ export function AsnDetailPage() {
               </table>
             )}
           </div>
+        )}
+
+        {tab === "footprint" && (
+          <BgpFootprintTab asnNumber={asn.number} kind={asn.kind} />
         )}
 
         {tab === "bgp" && <PeeringsTab asnId={id} />}
