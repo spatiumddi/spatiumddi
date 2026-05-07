@@ -270,8 +270,9 @@ For real production use you generally don't want the Kea DHCP agent and the BIND
 
 | File | Purpose |
 |---|---|
-| `docker-compose.agent-dhcp.yml` | Kea DHCP agent(s) only — no control plane |
-| `docker-compose.agent-dns.yml`  | BIND9 DNS agent only — no control plane |
+| `docker-compose.agent-dhcp.yml`         | Kea DHCP agent(s) only — no control plane |
+| `docker-compose.agent-dns-bind9.yml`    | BIND9 DNS agent only — no control plane (renamed from `docker-compose.agent-dns.yml` in `2026.05.07-2`) |
+| `docker-compose.agent-dns-powerdns.yml` | PowerDNS DNS agent only — no control plane (issue #127) |
 
 The agent containers long-poll the remote control plane's API and cache the last-known-good config locally (non-negotiable #5), so the DHCP / DNS services keep serving even if the control plane is briefly unreachable.
 
@@ -327,15 +328,36 @@ ships raw signatures, fingerbank lookups just don't run. See
 
 ### DNS-only VM
 
+Pick the compose file that matches the driver on the control plane's
+DNSServerGroup:
+
 ```bash
 export CONTROL_PLANE_URL=https://spatium.example.com
 export DNS_AGENT_KEY=$(openssl rand -hex 32)
-export DNS_HOSTNAME=dns-bind9-east
 
-docker compose -f docker-compose.agent-dns.yml up -d
+# BIND9 (default, ubiquitous, RNDC + RFC 2136 DDNS):
+export DNS_HOSTNAME=dns-bind9-east
+docker compose -f docker-compose.agent-dns-bind9.yml up -d
+
+# PowerDNS (issue #127, native REST API + LMDB embedded backend,
+# unlocks ALIAS / LUA / online DNSSEC / catalog zones in
+# PowerDNS-only groups):
+export DNS_HOSTNAME=dns-powerdns-east
+docker compose -f docker-compose.agent-dns-powerdns.yml up -d
 ```
 
-For authoritative + secondary pairs, run this on each additional DNS VM with a unique `DNS_HOSTNAME` and the same `AGENT_GROUP`. Zone assignments and view membership are configured on the control plane.
+Both compose files share the same `DNS_AGENT_KEY` bootstrap shape and
+register against `CONTROL_PLANE_URL` the same way; the only difference
+is the image (`dns-bind9` vs `dns-powerdns`) and the driver baked into
+the image's `AGENT_DRIVER` env. The control plane gates PowerDNS-only
+features (DNSSEC sign/unsign, ALIAS, LUA, catalog zones) on **every
+server in the group running the powerdns driver** — to run BIND9 +
+PowerDNS side-by-side, create two separate `DNSServerGroup`s.
+
+For authoritative + secondary pairs, run the same compose file on each
+additional DNS VM with a unique `DNS_HOSTNAME` and the same
+`AGENT_GROUP`. Zone assignments and view membership are configured on
+the control plane.
 
 ### Host vs bridge networking
 

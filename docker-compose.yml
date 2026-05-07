@@ -185,10 +185,13 @@ services:
         condition: service_healthy
     restart: "no"
 
-  # ── DNS agent ─────────────────────────────────────────────────────────
-  # Enable with: docker compose --profile dns up -d
+  # ── DNS agent (BIND9) ────────────────────────────────────────────────
+  # Enable with: docker compose --profile dns-bind9 up -d
+  # The legacy ``dns`` profile remains as a back-compat alias for the
+  # bind9 service so existing deployments don't break. PowerDNS users
+  # opt into the new ``dns-powerdns`` profile below.
   dns-bind9:
-    profiles: ["dns"]
+    profiles: ["dns", "dns-bind9"]
     image: ghcr.io/spatiumddi/dns-bind9:${SPATIUMDDI_VERSION:-latest}
     restart: unless-stopped
     networks:
@@ -206,6 +209,37 @@ services:
     ports:
       - "5353:53/udp"
       - "5353:53/tcp"
+    depends_on:
+      api:
+        condition: service_started
+
+  # ── DNS agent (PowerDNS) ─────────────────────────────────────────────
+  # Enable with: docker compose --profile dns-powerdns up -d
+  # Distinct profile from bind9 — pick whichever driver matches the
+  # server group on the control plane (issue #127). Running both in
+  # the same compose stack works (different host port + different
+  # AGENT_GROUP) but is unusual outside of dev / migration scenarios.
+  dns-powerdns:
+    profiles: ["dns-powerdns"]
+    image: ghcr.io/spatiumddi/dns-powerdns:${SPATIUMDDI_VERSION:-latest}
+    restart: unless-stopped
+    networks:
+      - spatiumddi
+    environment:
+      CONTROL_PLANE_URL: http://api:8000
+      DNS_AGENT_KEY: ${DNS_AGENT_KEY:-changeme-dns-agent-key}
+      SERVER_NAME: dns-powerdns
+      AGENT_GROUP: default-powerdns
+      AGENT_ROLES: authoritative
+      SPATIUM_INSECURE_SKIP_TLS_VERIFY: "1"
+    volumes:
+      - dns_powerdns_state:/var/lib/spatium-dns-agent
+      - dns_powerdns_lmdb:/var/lib/powerdns
+    ports:
+      # 5453 (not 5353) so a side-by-side bind9 + powerdns dev setup
+      # doesn't collide on the host port.
+      - "5453:53/udp"
+      - "5453:53/tcp"
     depends_on:
       api:
         condition: service_started
@@ -326,6 +360,8 @@ volumes:
   redis_data:
   dns_bind9_state:
   dns_bind9_cache:
+  dns_powerdns_state:
+  dns_powerdns_lmdb:
   dhcp_kea_state:
   dhcp_kea_leases:
   dhcp_kea_state_2:

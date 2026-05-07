@@ -68,6 +68,37 @@ visibility.
   pipeline adds a parallel ``build-dns-powerdns`` job alongside
   the existing ``build-dns`` (BIND9) so every tag publishes both
   images with ``:<version>`` and ``:latest`` tags.
+- **PowerDNS deployment plumbing, Phase 4a (\#127).** New
+  ``docker-compose.agent-dns-powerdns.yml`` standalone-VM compose
+  file mirrors the bind9 shape: one ``dns-powerdns`` service against
+  the ``ghcr.io/spatiumddi/dns-powerdns`` image with ``LMDB``-backed
+  zone storage volumes. Main ``docker-compose.yml`` +
+  ``docker-compose.dev.yml`` grow a ``dns-powerdns`` profile (host
+  port 5453 so a side-by-side bind9 + powerdns dev setup doesn't
+  collide), and the existing ``dns-bind9`` service now lists both
+  ``dns`` (back-compat alias) + ``dns-bind9`` profiles for
+  symmetry. ``.env.example`` documents the new profile alongside
+  ``dns-bind9``; ``DNS_AGENT_KEY`` is shared by both drivers
+  (single bootstrap PSK, image-baked driver). README + DOCKER.md +
+  GETTING_STARTED.md + TOPOLOGIES.md updated to surface the
+  driver choice everywhere ``--profile dns`` previously implied
+  bind9. **Breaking rename:**
+  ``docker-compose.agent-dns.yml`` → ``docker-compose.agent-dns-bind9.yml``
+  for symmetric naming with the new powerdns file. The legacy
+  ``--profile dns`` Compose alias is preserved so most operators
+  don't need to edit anything.
+
+### Migrations
+
+- ``e7f94b21c8d5_dns_zone_dnssec_ds_records`` — adds
+  ``dns_zone.dnssec_ds_records`` (JSONB, nullable) and
+  ``dns_zone.dnssec_synced_at`` (timestamptz, nullable) so the
+  agent can cache PowerDNS DS rrsets after a successful sign and
+  the operator-facing zone-edit page renders them without round-
+  tripping the agent on every page load.
+
+### Added (continued)
+
 - **PowerDNS catalog zones, Phase 3d (\#127).** RFC 9432 catalog
   zones light up as **producer-only** for PowerDNS groups (BIND9
   already shipped). When ``DNSServerGroup.catalog_zones_enabled`` is

@@ -1,36 +1,45 @@
-name: spatiumddi-agent-dns
+name: spatiumddi-agent-dns-powerdns
 
-# ── Standalone DNS agent compose file ─────────────────────────────────
+# ── Standalone PowerDNS DNS agent compose file (issue #127) ───────────
 #
-# For running a BIND9 DNS agent on a machine *without* the SpatiumDDI
-# control plane. Typical distributed deployment shape:
+# For running a PowerDNS-Authoritative DNS agent on a machine
+# *without* the SpatiumDDI control plane. Mirror of
+# ``docker-compose.agent-dns-bind9.yml`` for the second authoritative
+# driver — pick whichever image matches the server group's driver in
+# the control plane.
 #
-#   * Control plane runs on one VM (``docker-compose.yml``).
-#   * Each DNS server runs this compose file on its own VM, pointing
-#     at the control plane's API URL.
+# Phase 1 of #127 ships PowerDNS with the embedded LMDB backend, so
+# this compose file does NOT pull in an external Postgres / MySQL.
+# Zone state lives in ``/var/lib/powerdns/pdns.lmdb`` inside the
+# container's bound volume.
 #
 # Quickstart:
 #
 #   export CONTROL_PLANE_URL=https://spatium.example.com
 #   export DNS_AGENT_KEY=$(openssl rand -hex 32)
 #   # Register the key on the control plane first (Settings → Agent
-#   # Keys) so the agent can bootstrap.
+#   # Keys) so the agent can bootstrap. Create the matching
+#   # DNSServerGroup with driver="powerdns" via the UI or REST API.
 #
-#   docker compose -f docker-compose.agent-dns.yml up -d
+#   docker compose -f docker-compose.agent-dns-powerdns.yml up -d
 #
-# For secondary / authoritative pairs, run this compose file on each
-# additional DNS VM with DNS_HOSTNAME set to a unique server name and
+# For multi-server PowerDNS groups, run this compose file on each
+# additional VM with DNS_HOSTNAME set to a unique server name and
 # the same AGENT_GROUP — the control plane wires them into the same
-# view / zone set automatically.
+# PowerDNS-driver group automatically.
+#
+# Mixing drivers in one group is rejected by the control plane —
+# DNSSEC sign / unsign, ALIAS, LUA, and catalog records all gate on
+# every server in the group running the powerdns driver. To run BIND9
+# + PowerDNS side-by-side, create two separate groups.
 #
 # ──────────────────────────────────────────────────────────────────────
 
 services:
-
-  dns-bind9:
-    image: ghcr.io/spatiumddi/dns-bind9:${SPATIUMDDI_VERSION:-latest}
+  dns-powerdns:
+    image: ghcr.io/spatiumddi/dns-powerdns:${SPATIUMDDI_VERSION:-latest}
     restart: unless-stopped
-    hostname: ${DNS_HOSTNAME:-dns-bind9}
+    hostname: ${DNS_HOSTNAME:-dns-powerdns}
     networks:
       - spatiumddi-agent
     environment:
@@ -43,16 +52,20 @@ services:
       # ── Registration ──────────────────────────────────────────────
       # Server name used for auto-registration. MUST be unique across
       # the deployment.
-      SERVER_NAME: ${DNS_HOSTNAME:-dns-bind9}
+      SERVER_NAME: ${DNS_HOSTNAME:-dns-powerdns}
       AGENT_GROUP: ${DNS_AGENT_GROUP:-default}
       AGENT_ROLES: ${DNS_AGENT_ROLES:-authoritative}
+      # AGENT_DRIVER is baked into the image (powerdns); no override.
 
       # ── TLS ───────────────────────────────────────────────────────
       SPATIUM_INSECURE_SKIP_TLS_VERIFY: "${SPATIUM_INSECURE_SKIP_TLS_VERIFY:-1}"
       # TLS_CA_PATH: /etc/ssl/spatium-ca.crt
     volumes:
-      - dns_bind9_state:/var/lib/spatium-dns-agent
-      - dns_bind9_cache:/var/cache/bind
+      - dns_powerdns_state:/var/lib/spatium-dns-agent
+      # LMDB-backed zone storage. Keep this volume — losing it means
+      # losing every zone the agent has applied. Backups should
+      # snapshot this volume; the LMDB file is consistent on disk.
+      - dns_powerdns_lmdb:/var/lib/powerdns
       # Optional: mount a CA bundle to verify the control plane.
       # - /etc/ssl/certs:/etc/ssl/certs:ro
     ports:
@@ -68,5 +81,5 @@ networks:
     driver: bridge
 
 volumes:
-  dns_bind9_state:
-  dns_bind9_cache:
+  dns_powerdns_state:
+  dns_powerdns_lmdb:

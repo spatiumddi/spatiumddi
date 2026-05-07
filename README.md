@@ -658,18 +658,21 @@ Bump the pinned version when you're ready to upgrade and re-run the same three c
 - Watch the **CHANGELOG.md** entry for your target version for any release-specific upgrade notes (e.g. "operators on Kea HA must read this before upgrading").
 - The sidebar shows the running version in the bottom-left corner and surfaces an `update available` badge when a newer GitHub release exists — the version probe runs hourly.
 
-### Running the built-in BIND9 / Kea containers
+### Running the built-in BIND9 / PowerDNS / Kea containers
 
 The managed-service containers ship under Compose profiles — opt in when you want them:
 
 ```bash
-docker compose --profile dns up -d                 # DNS only
-docker compose --profile dns --profile dhcp up -d  # DNS + DHCP
+docker compose --profile dns-bind9 up -d                 # BIND9 (default)
+docker compose --profile dns-powerdns up -d              # PowerDNS (issue #127)
+docker compose --profile dns-bind9 --profile dhcp up -d  # BIND9 + DHCP
 ```
 
-Or set `COMPOSE_PROFILES=dns,dhcp` in your `.env` so plain `docker compose up -d` enables both automatically.
+`--profile dns` still works as a back-compat alias for `dns-bind9`. Pick whichever DNS driver matches the server group on the control plane — every PowerDNS-only feature (DNSSEC sign/unsign, ALIAS, LUA, catalog zones) gates on every server in the group running the powerdns driver.
 
-That starts `dns-bind9` bound to host port `5353` (udp + tcp). The agent registers with the control plane automatically using `DNS_AGENT_KEY` from your `.env` and appears in the UI under **DNS → Server Groups → default**.
+Or set `COMPOSE_PROFILES=dns-bind9,dhcp` in your `.env` so plain `docker compose up -d` enables both automatically.
+
+That starts `dns-bind9` bound to host port `5353` (udp + tcp), or `dns-powerdns` on `5453`. The agent registers with the control plane automatically using `DNS_AGENT_KEY` from your `.env` and appears in the UI under **DNS → Server Groups**.
 
 Create a zone + record in the UI, then verify with `dig`:
 

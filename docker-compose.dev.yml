@@ -197,10 +197,12 @@ services:
         condition: service_healthy
     restart: "no"
 
-  # ── DNS agent ─────────────────────────────────────────────────────────
-  # Enable with: docker compose --profile dns up -d
+  # ── DNS agent (BIND9) ────────────────────────────────────────────────
+  # Enable with: docker compose --profile dns-bind9 up -d
+  # ``dns`` profile remains as a back-compat alias for the bind9 dev
+  # build. ``dns-powerdns`` opts into the second authoritative driver.
   dns-bind9:
-    profiles: ["dns"]
+    profiles: ["dns", "dns-bind9"]
     build:
       context: .
       dockerfile: agent/dns/images/bind9/Dockerfile
@@ -220,6 +222,38 @@ services:
     ports:
       - "5353:53/udp"
       - "5353:53/tcp"
+    depends_on:
+      api:
+        condition: service_started
+
+  # ── DNS agent (PowerDNS) ─────────────────────────────────────────────
+  # Enable with: docker compose --profile dns-powerdns up -d
+  # Distinct host port (5453, not 5353) so a side-by-side BIND9 +
+  # PowerDNS dev setup doesn't collide. AGENT_GROUP defaults to
+  # ``default-powerdns`` so both groups exist in parallel; mixing
+  # drivers inside one group is rejected by the control plane (every
+  # PowerDNS-only feature gates on it).
+  dns-powerdns:
+    profiles: ["dns-powerdns"]
+    build:
+      context: .
+      dockerfile: agent/dns/images/powerdns/Dockerfile
+    restart: unless-stopped
+    networks:
+      - spatiumddi
+    environment:
+      CONTROL_PLANE_URL: http://api:8000
+      DNS_AGENT_KEY: ${DNS_AGENT_KEY:-changeme-dns-agent-key}
+      SERVER_NAME: dns-powerdns
+      AGENT_GROUP: default-powerdns
+      AGENT_ROLES: authoritative
+      SPATIUM_INSECURE_SKIP_TLS_VERIFY: "1"
+    volumes:
+      - dns_powerdns_state:/var/lib/spatium-dns-agent
+      - dns_powerdns_lmdb:/var/lib/powerdns
+    ports:
+      - "5453:53/udp"
+      - "5453:53/tcp"
     depends_on:
       api:
         condition: service_started
@@ -346,6 +380,8 @@ volumes:
   redis_data:
   dns_bind9_state:
   dns_bind9_cache:
+  dns_powerdns_state:
+  dns_powerdns_lmdb:
   dhcp_kea_state:
   dhcp_kea_leases:
   dhcp_kea_state_2:

@@ -68,7 +68,8 @@ Zones live under server groups, so this has to come before zones.
 
    | Backend | Setup | When to choose |
    |---|---|---|
-   | **Built-in BIND9** (`bind9`) | Run `docker compose --profile dns up -d`. The container auto-registers using `DNS_AGENT_KEY` and shows up in the group automatically. | New deployments; you want SpatiumDDI to own the whole DNS plane. |
+   | **Built-in BIND9** (`bind9`) | Run `docker compose --profile dns-bind9 up -d` (legacy `--profile dns` also works). The container auto-registers using `DNS_AGENT_KEY` and shows up in the group automatically. | New deployments; you want SpatiumDDI to own the whole DNS plane and the BIND ecosystem (RPZ, full views support). |
+   | **Built-in PowerDNS** (`powerdns`, issue #127) | Run `docker compose --profile dns-powerdns up -d`. Same `DNS_AGENT_KEY` bootstrap; auto-registers under group `default-powerdns`. | You want online DNSSEC with one-button sign-zone, ALIAS records (CNAME-at-apex), LUA computed records, or PowerDNS's REST-native operational model. |
    | **Windows DNS — Path A** (`windows_dns`, no credentials) | Point at an existing Windows DC. Enable "Secure and Nonsecure" dynamic updates on each zone in Windows DNS Manager and allow AXFR to SpatiumDDI's host. | You have an AD-integrated DNS already and just want record-level writes from SpatiumDDI. |
    | **Windows DNS — Path B** (`windows_dns` + credentials) | Same as above, but also provide WinRM credentials. Unlocks zone create/delete and lets SpatiumDDI list + pull zones without relying on AXFR. | You want the full experience without giving up Windows DNS Manager. Best for AD environments. |
 

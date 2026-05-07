@@ -80,11 +80,11 @@ machines. Agents long-poll the control plane's API.
 **The two compose files:**
 
 ```bash
-# On vm-dns:
+# On vm-dns (BIND9 — pick `agent-dns-powerdns.yml` instead for PowerDNS):
 export SPATIUM_API_URL=https://spatium-cp.corp.local
 export SPATIUM_AGENT_KEY=<paste-from-Settings→Agent Keys>
 export DNS_HOSTNAME=vm-dns.corp.local
-docker compose -f docker-compose.agent-dns.yml up -d
+docker compose -f docker-compose.agent-dns-bind9.yml up -d
 
 # On vm-dhcp:
 export SPATIUM_API_URL=https://spatium-cp.corp.local
