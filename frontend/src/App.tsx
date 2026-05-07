@@ -40,7 +40,6 @@ import { LogsPage } from "@/pages/LogsPage";
 import { UsersPage } from "@/pages/admin/UsersPage";
 import { AuditPage } from "@/pages/admin/AuditPage";
 import { BackupPage } from "@/pages/admin/BackupPage";
-import { FactoryResetPage } from "@/pages/admin/FactoryResetPage";
 import { DiagnosticsErrorsPage } from "@/pages/admin/DiagnosticsErrorsPage";
 import { AIProvidersPage } from "@/pages/admin/AIProvidersPage";
 import { AIPromptsPage } from "@/pages/admin/AIPromptsPage";
@@ -136,7 +135,6 @@ export default function App() {
         <Route path="admin/roles" element={<RolesPage />} />
         <Route path="admin/audit" element={<AuditPage />} />
         <Route path="admin/backup" element={<BackupPage />} />
-        <Route path="admin/factory-reset" element={<FactoryResetPage />} />
         <Route
           path="admin/diagnostics/errors"
           element={<DiagnosticsErrorsPage />}

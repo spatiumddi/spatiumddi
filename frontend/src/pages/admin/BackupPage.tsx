@@ -18,6 +18,7 @@ import {
 } from "@/lib/api";
 import { BackupSectionsPicker } from "./BackupSectionsPicker";
 import { BackupTargetsSection } from "./BackupTargetsSection";
+import { FactoryResetSection } from "./FactoryResetSection";
 
 /**
  * Admin → Platform → Backup (issue #117 Phase 1a).
@@ -38,7 +39,7 @@ import { BackupTargetsSection } from "./BackupTargetsSection";
  * Phase 1a out-of-scope but coming later: scheduled targets
  * (S3 / SCP / Azure), backup-target rows, selective restore.
  */
-type Tab = "manual" | "destinations";
+type Tab = "manual" | "destinations" | "factory-reset";
 
 export function BackupPage() {
   const [tab, setTab] = useState<Tab>("manual");
@@ -53,13 +54,16 @@ export function BackupPage() {
           <strong>Manual</strong> — one-off download + restore-from-file.{" "}
           <strong>Destinations</strong> — configure local volumes, S3, SCP,
           Azure Blob. Schedule a recurring backup, view archives at the
-          destination, restore from any archive.
+          destination, restore from any archive. <strong>Factory Reset</strong>{" "}
+          — wipe configuration back to defaults per-section or
+          everything-at-once.
         </p>
         <div className="-mb-px mt-3 flex gap-1 border-b">
           {(
             [
               ["manual", "Manual"],
               ["destinations", "Destinations"],
+              ["factory-reset", "Factory Reset"],
             ] as const
           ).map(([key, label]) => (
             <button
@@ -97,6 +101,7 @@ export function BackupPage() {
               <SecurityNotes />
             </>
           )}
+          {tab === "factory-reset" && <FactoryResetSection />}
         </div>
       </div>
     </div>

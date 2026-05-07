@@ -50,7 +50,6 @@ import {
   ToggleLeft,
   AlertTriangle,
   Database,
-  Eraser,
   X,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -216,11 +215,10 @@ const adminInsightsNav = [
   // Backup + restore (issue #117 Phase 1a). Sits in the Insights
   // group alongside Trash + Diagnostics — all "platform-state
   // lifecycle" surfaces.
+  // Backup admin (issue #117) — also hosts the Factory Reset tab
+  // (issue #116). Factory reset doesn't get its own sidebar entry;
+  // it lives as a third tab alongside Manual + Destinations.
   { label: "Backup", icon: Database, to: "/admin/backup" },
-  // Factory reset (issue #116). Sits next to Backup because they're
-  // the two opposite ends of the platform-state lifecycle —
-  // backup snapshots state, factory reset wipes it.
-  { label: "Factory Reset", icon: Eraser, to: "/admin/factory-reset" },
   { label: "Compliance", icon: ShieldCheck, to: "/admin/compliance" },
   {
     label: "Conformity",

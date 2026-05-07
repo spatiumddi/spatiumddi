@@ -20,10 +20,15 @@ import {
 } from "@/components/ui/use-draggable-modal";
 
 /**
- * Admin → Factory Reset (issue #116).
+ * Admin → Backup → Factory Reset tab (issue #116).
  *
- * One card per section + a separately-styled "Everything" card at
- * the bottom. Reset flow:
+ * Renders inside the Backup admin page as a third tab after
+ * Destinations. The backup page owns the page chrome (header,
+ * tabs, content scroller); this component renders only the
+ * inner content (intro blurb + section cards + modal).
+ *
+ * One card per section + a separately-styled "Everything" card
+ * at the bottom. Reset flow:
  *
  *   1. Click "Reset" on a card → modal opens, fires the preview.
  *   2. Modal shows the row counts that would be deleted.
@@ -31,9 +36,9 @@ import {
  *      account password.
  *   4. If no enabled backup target exists, a separate
  *      acknowledge-no-backup checkbox unlocks the submit button.
- *   5. Submit → POST /system/factory-reset/execute. On 204 we show
- *      the success toast + invalidate every cached query so the
- *      app re-loads cleanly against the wiped state.
+ *   5. Submit → POST /system/factory-reset/execute. On success we
+ *      invalidate every cached query so the app re-loads cleanly
+ *      against the wiped state.
  *
  * Hard guardrails (server-enforced):
  *  - Superadmin only.
@@ -42,7 +47,7 @@ import {
  *  - Mutex against in-flight backup / concurrent reset.
  *  - 6-hour cooldown.
  */
-export function FactoryResetPage() {
+export function FactoryResetSection() {
   const sectionsQ = useQuery({
     queryKey: ["factory-reset-sections"],
     queryFn: factoryResetApi.listSections,
@@ -60,56 +65,59 @@ export function FactoryResetPage() {
   );
 
   return (
-    <div className="flex h-full flex-col overflow-hidden">
-      <div className="border-b bg-card px-6 py-4">
-        <div className="flex items-center gap-2">
-          <Eraser className="h-5 w-5 text-muted-foreground" />
-          <h1 className="text-lg font-semibold">Factory Reset</h1>
+    <>
+      <section className="rounded-lg border bg-card p-4">
+        <div className="flex items-start gap-2">
+          <Eraser className="mt-0.5 h-4 w-4 text-destructive" />
+          <div>
+            <h2 className="text-sm font-semibold">About factory reset</h2>
+            <p className="mt-1 text-xs text-muted-foreground">
+              Reset SpatiumDDI back to defaults — per-section or
+              everything-at-once. The reset is destructive and there is no undo.
+              Each section requires a typed-confirm phrase + a re-typed password
+              before the destructive SQL runs. The calling superadmin and
+              built-in roles are preserved regardless of which section runs.
+              Configure a backup destination on the Destinations tab first;
+              without one, you must explicitly acknowledge there is no recovery
+              path.
+            </p>
+          </div>
         </div>
-        <p className="mt-1 max-w-3xl text-xs text-muted-foreground">
-          Reset SpatiumDDI back to defaults — per-section or everything-at-once.
-          The reset is destructive and there is no undo. Each section requires a
-          typed-confirm phrase + a re-typed password before the destructive SQL
-          runs. The calling superadmin and built-in roles are preserved
-          regardless of which section runs.
-        </p>
-      </div>
+      </section>
 
-      <div className="flex-1 overflow-auto p-6">
-        {sectionsQ.isLoading ? (
-          <div className="flex items-center gap-2 text-sm text-muted-foreground">
-            <Loader2 className="h-4 w-4 animate-spin" />
-            Loading section catalog…
-          </div>
-        ) : sectionsQ.isError ? (
-          <div className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-destructive">
-            Failed to load section catalog.
-          </div>
-        ) : (
-          <div className="mx-auto max-w-6xl space-y-6">
-            <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
-              {concrete.map((s) => (
-                <SectionCard
-                  key={s.key}
-                  section={s}
-                  onClick={() => setActive(s)}
-                />
-              ))}
-            </div>
-            {everything && (
-              <EverythingCard
-                section={everything}
-                onClick={() => setActive(everything)}
+      {sectionsQ.isLoading ? (
+        <div className="flex items-center gap-2 text-sm text-muted-foreground">
+          <Loader2 className="h-4 w-4 animate-spin" />
+          Loading section catalog…
+        </div>
+      ) : sectionsQ.isError ? (
+        <div className="rounded-md border border-destructive/30 bg-destructive/5 px-3 py-2 text-sm text-destructive">
+          Failed to load section catalog.
+        </div>
+      ) : (
+        <div className="space-y-6">
+          <div className="grid grid-cols-1 gap-4 lg:grid-cols-2">
+            {concrete.map((s) => (
+              <SectionCard
+                key={s.key}
+                section={s}
+                onClick={() => setActive(s)}
               />
-            )}
+            ))}
           </div>
-        )}
-      </div>
+          {everything && (
+            <EverythingCard
+              section={everything}
+              onClick={() => setActive(everything)}
+            />
+          )}
+        </div>
+      )}
 
       {active && (
         <ResetModal section={active} onClose={() => setActive(null)} />
       )}
-    </div>
+    </>
   );
 }
 
