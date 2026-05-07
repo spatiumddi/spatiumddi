@@ -68,7 +68,7 @@ class _UnifiVersion:
     version: str  # e.g. "9.0.114"
 
 
-@dataclass
+@dataclass(frozen=True)
 class _UnifiSite:
     """A site as returned by the legacy ``/api/self/sites`` (preferred,
     carries ``desc`` + ``name`` together) or the public Integration
@@ -78,6 +78,9 @@ class _UnifiSite:
     the human label. ``site_id`` is the controller's UUID for the
     site — the public Integration API requires this in URLs but the
     legacy API uses ``name`` instead. We populate both.
+
+    Frozen so the reconciler can use site objects as dict keys
+    without crashing the whole sweep on the first sync.
     """
 
     name: str  # short id ("default")
