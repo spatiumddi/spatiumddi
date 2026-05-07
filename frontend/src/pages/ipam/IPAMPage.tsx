@@ -1196,20 +1196,16 @@ function ClassificationSection({
   pciScope,
   hipaaScope,
   internetFacing,
-  subnetRole,
   onPciChange,
   onHipaaChange,
   onInternetFacingChange,
-  onSubnetRoleChange,
 }: {
   pciScope: boolean;
   hipaaScope: boolean;
   internetFacing: boolean;
-  subnetRole: SubnetRole | null;
   onPciChange: (v: boolean) => void;
   onHipaaChange: (v: boolean) => void;
   onInternetFacingChange: (v: boolean) => void;
-  onSubnetRoleChange: (v: SubnetRole | null) => void;
 }) {
   return (
     <div className="space-y-2">
@@ -1265,32 +1261,42 @@ function ClassificationSection({
           </span>
         </label>
       </div>
-      <div className="pt-2">
-        <label className="block text-[11px] font-medium text-muted-foreground">
-          Network role
-        </label>
-        <select
-          className="mt-1 w-full rounded-md border bg-background px-2.5 py-1.5 text-xs"
-          value={subnetRole ?? ""}
-          onChange={(e) =>
-            onSubnetRoleChange(
-              e.target.value ? (e.target.value as SubnetRole) : null,
-            )
-          }
-        >
-          <option value="">— unspecified —</option>
-          {SUBNET_ROLES.map((r) => (
-            <option key={r} value={r}>
-              {SUBNET_ROLE_LABELS[r]}
-            </option>
-          ))}
-        </select>
-        <p className="mt-1 text-[10px] text-muted-foreground/70">
-          Voice-tagged subnets unlock the voice-VLAN conformity check and the
-          voice-lease-count-below alert rule.
-        </p>
-      </div>
     </div>
+  );
+}
+
+/** Network-role select (issue #112 phase 2). Lives on the General tab
+ *  next to VLAN/VXLAN — operators tag this routinely on every subnet,
+ *  unlike the compliance flags which are infrequent. Voice unlocks
+ *  the voice-VLAN conformity check + voice-lease-count alert rule;
+ *  other roles are pure metadata for filter chips. */
+function NetworkRoleField({
+  value,
+  onChange,
+}: {
+  value: SubnetRole | null;
+  onChange: (v: SubnetRole | null) => void;
+}) {
+  return (
+    <Field
+      label="Network role"
+      hint="Voice unlocks the voice-VLAN conformity check + lease-count-below alert rule. Other roles are pure metadata used by IPAM filter chips + the VLAN page."
+    >
+      <select
+        className={inputCls}
+        value={value ?? ""}
+        onChange={(e) =>
+          onChange(e.target.value ? (e.target.value as SubnetRole) : null)
+        }
+      >
+        <option value="">— unspecified —</option>
+        {SUBNET_ROLES.map((r) => (
+          <option key={r} value={r}>
+            {SUBNET_ROLE_LABELS[r]}
+          </option>
+        ))}
+      </select>
+    </Field>
   );
 }
 
@@ -2148,6 +2154,7 @@ function CreateSubnetModal({
             />
           </Field>
           <VlanPicker vlanRefId={vlanRefId} onChange={setVlanRefId} />
+          <NetworkRoleField value={subnetRole} onChange={setSubnetRole} />
           <Field label="VXLAN ID (optional)">
             <input
               type="number"
@@ -2246,11 +2253,9 @@ function CreateSubnetModal({
               pciScope={pciScope}
               hipaaScope={hipaaScope}
               internetFacing={internetFacing}
-              subnetRole={subnetRole}
               onPciChange={setPciScope}
               onHipaaChange={setHipaaScope}
               onInternetFacingChange={setInternetFacing}
-              onSubnetRoleChange={setSubnetRole}
             />
           </div>
         </div>
@@ -6159,6 +6164,7 @@ function EditSubnetModal({
               VLAN to manage).
             </p>
           )}
+          <NetworkRoleField value={subnetRole} onChange={setSubnetRole} />
           <Field label="VXLAN ID (optional)">
             <input
               type="number"
@@ -6290,11 +6296,9 @@ function EditSubnetModal({
               pciScope={pciScope}
               hipaaScope={hipaaScope}
               internetFacing={internetFacing}
-              subnetRole={subnetRole}
               onPciChange={setPciScope}
               onHipaaChange={setHipaaScope}
               onInternetFacingChange={setInternetFacing}
-              onSubnetRoleChange={setSubnetRole}
             />
           </div>
         </div>
