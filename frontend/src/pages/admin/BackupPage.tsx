@@ -201,11 +201,11 @@ function CreateBackupCard() {
           />
           <span>
             <strong>Exclude secrets (diagnostic mode).</strong> NULL every
-            credential / api-key / TSIG-key / TOTP secret in the archive at
-            dump time. Use when sharing a snapshot with support /
-            consultants — the archive is shareable but a restore yields an
-            install with empty credential fields, so operators re-enter
-            integration / auth-provider creds by hand.
+            credential / api-key / TSIG-key / TOTP secret in the archive at dump
+            time. Use when sharing a snapshot with support / consultants — the
+            archive is shareable but a restore yields an install with empty
+            credential fields, so operators re-enter integration / auth-provider
+            creds by hand.
           </span>
         </label>
         <div className="flex items-center gap-2">

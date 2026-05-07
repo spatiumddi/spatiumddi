@@ -133,7 +133,7 @@ class FtpDestination(BackupDestination):
                     f"{required!r} is required and must be a non-empty string"
                 )
         port = config.get("port")
-        if port not in (None, ""):
+        if port is not None and port != "":
             try:
                 port_n = int(port)
             except (TypeError, ValueError) as exc:
@@ -172,7 +172,12 @@ class FtpDestination(BackupDestination):
                 # do this on its own; we have to wrap the socket
                 # right after ``connect`` and before ``login``.
                 client.connect(host=host, port=port)
-                client.sock = ctx.wrap_socket(  # type: ignore[union-attr]
+                # ``client.sock`` is annotated ``socket | None``;
+                # ``connect`` populates it. Assert for the type-
+                # narrow.
+                assert client.sock is not None
+                assert ctx is not None
+                client.sock = ctx.wrap_socket(
                     client.sock,
                     server_hostname=host,
                 )

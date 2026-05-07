@@ -825,8 +825,8 @@ function TargetFormModal({
             label="Schedule (cron, UTC)"
             help={
               <>
-                5-field UTC cron expression — pick a preset or type
-                your own. Leave blank for manual-only.
+                5-field UTC cron expression — pick a preset or type your own.
+                Leave blank for manual-only.
               </>
             }
           >

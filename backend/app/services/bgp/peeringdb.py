@@ -54,7 +54,7 @@ async def _fetch(path: str, params: dict[str, Any], cache_key: str) -> Any:
             # downstream. Cache it like a normal payload so we don't
             # re-query for the next 24 h.
             if resp.status_code == 404:
-                empty = {"data": []}
+                empty: dict[str, Any] = {"data": []}
                 cache_set("peeringdb", cache_key, empty)
                 return empty
             resp.raise_for_status()

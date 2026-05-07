@@ -361,6 +361,10 @@ async def _rewrap_backup_target_config(
                 ciphertext = value[len(_ENC_PREFIX) :].encode("utf-8")
                 new_value, status = _rewrap_value(source, dest, ciphertext)
                 if status == "rewrapped":
+                    # ``status == "rewrapped"`` ⇒ new_value is bytes
+                    # (see _rewrap_value), but mypy can't narrow
+                    # through the string literal.
+                    assert new_value is not None
                     config[key] = _ENC_PREFIX + new_value.decode("utf-8")
                     mutated = True
                     outcome.rewrapped_jsonb_fields += 1

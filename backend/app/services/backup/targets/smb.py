@@ -140,7 +140,7 @@ class SmbDestination(BackupDestination):
                     f"{required!r} is required and must be a non-empty string"
                 )
         port = config.get("port")
-        if port not in (None, ""):
+        if port is not None and port != "":
             try:
                 port_n = int(port)
             except (TypeError, ValueError) as exc:
