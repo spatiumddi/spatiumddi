@@ -314,6 +314,64 @@ def create_app() -> FastAPI:
     if settings.prometheus_metrics_enabled:
         app.add_route("/metrics", metrics_endpoint)
 
+    # Transient-DB-connection handler (issue #117). When a backup
+    # restore disposes the engine + ``pg_terminate_backend``s every
+    # connection, requests that had ALREADY checked one out get
+    # their underlying socket killed mid-flight. ``pool_pre_ping``
+    # only fires at checkout, so it can't recover those — they
+    # surface as ``InterfaceError: cannot call PreparedStatement
+    # .fetch(): the underlying connection is closed`` (or
+    # ``OperationalError`` for similar pool-level failures).
+    #
+    # Same self-healing logic applies: the very next request from
+    # the same caller will go through pool_pre_ping and succeed.
+    # Convert to a clean 503 + ``Retry-After: 1`` so agent
+    # long-polls back off and retry instead of cascading the
+    # failure into the diagnostics surface.
+    #
+    # Registered BEFORE the broader Exception handler so connection-
+    # closed errors take this path and skip the unhandled-exception
+    # capture (they're transient noise, not real bugs).
+    from sqlalchemy.exc import (  # noqa: PLC0415
+        InterfaceError as SAInterfaceError,
+    )
+    from sqlalchemy.exc import (
+        OperationalError as SAOperationalError,
+    )
+
+    @app.exception_handler(SAInterfaceError)
+    @app.exception_handler(SAOperationalError)
+    async def _transient_db_connection(request: Request, exc: Exception) -> Response:
+        from fastapi.responses import JSONResponse  # noqa: PLC0415
+
+        text = str(exc).lower()
+        is_connection_closed = (
+            "connection is closed" in text
+            or "connection was closed" in text
+            or "connection lost" in text
+            or "server closed the connection unexpectedly" in text
+        )
+        if not is_connection_closed:
+            # Some other InterfaceError — let it fall through to
+            # the unhandled-exception path so it gets captured.
+            raise exc
+        logger.info(
+            "db_connection_closed_transient",
+            method=request.method,
+            path=request.url.path,
+            error=str(exc)[:200],
+        )
+        return JSONResponse(
+            status_code=503,
+            content={
+                "detail": (
+                    "Database connection was closed mid-request "
+                    "(likely a backup restore in progress). Retry."
+                )
+            },
+            headers={"Retry-After": "1"},
+        )
+
     # Unhandled-exception capture (issue #123). Registered last so it
     # only catches what slipped past every other handler — auth /
     # permission / validation errors raise typed HTTPException
