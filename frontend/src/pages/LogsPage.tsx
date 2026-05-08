@@ -30,7 +30,20 @@ import { cn } from "@/lib/utils";
 /**
  * Logs page — central log viewer.
  *
- * Two tabs, two different data sources:
+ * Four tabs, two transports. Agent-driven (open-source) tabs ship
+ * first because that's what most operators run; Windows-only tabs
+ * are last so an all-Linux deployment doesn't open the page on a
+ * blank Windows-only surface.
+ *
+ *   • **DNS Queries** — BIND9 / PowerDNS query log (client → qname
+ *     → qtype). Pushed by the agent's QueryLogShipper after the
+ *     daemon writes its query-log file (BIND9 ``logging { ... }``
+ *     channel; PowerDNS ``log-dns-queries=yes``). Requires
+ *     ``query_log_enabled`` on the DNS server group.
+ *
+ *   • **DHCP Activity** — Kea DHCPv4 activity (DISCOVER / OFFER /
+ *     REQUEST / ACK, lease alloc, declines). Pushed by the Kea
+ *     agent's LogShipper from the file output_options channel.
  *
  *   • **Event Log** — Windows Event Log (admin / operational events
  *     from DNS + DHCP server roles). Pulled via
@@ -40,17 +53,19 @@ import { cn } from "@/lib/utils";
  *   • **DHCP Audit** — per-lease events (grants, renewals, releases,
  *     conflicts, DNS update results) parsed from
  *     ``C:\Windows\System32\dhcp\DhcpSrvLog-<Day>.log``. DHCP only.
- *     This is the actual "DHCP client requests" view; the Event Log
- *     tab covers service-level events like scope activation.
+ *     This is the actual "DHCP client requests" view for Windows;
+ *     the Event Log tab covers service-level events like scope
+ *     activation.
  *
- * Both tabs auto-fetch on mount and on filter change; staleTime is
- * Infinity so tab-switching doesn't re-hit the DC.
+ * All tabs auto-fetch on mount and on filter change; staleTime is
+ * Infinity for the WinRM tabs so tab-switching doesn't re-hit the
+ * DC, 5 s for the agent tabs since their backing rows update live.
  */
 
-type Tab = "events" | "audit" | "dns-queries" | "dhcp-activity";
+type Tab = "dns-queries" | "dhcp-activity" | "events" | "audit";
 
 export function LogsPage() {
-  const [tab, setTab] = useState<Tab>("events");
+  const [tab, setTab] = useState<Tab>("dns-queries");
 
   // Two source lists: Windows servers (Event Log + DHCP Audit) and
   // agent-driven servers (DNS Queries + DHCP Activity). They're
@@ -122,7 +137,8 @@ export function LogsPage() {
               Logs
             </h1>
             <p className="mt-1 text-xs text-muted-foreground">
-              Read-only. Windows DNS/DHCP via WinRM, BIND9/Kea via agent push.
+              Read-only. BIND9 / PowerDNS / Kea via agent push, Windows DNS /
+              DHCP via WinRM.
             </p>
           </div>
           <button
@@ -135,6 +151,22 @@ export function LogsPage() {
           </button>
         </div>
         <div className="mt-3 flex flex-wrap gap-1 border-b -mb-4">
+          <TabButton
+            active={tab === "dns-queries"}
+            onClick={() => setTab("dns-queries")}
+            icon={Search}
+            label="DNS Queries"
+            hint="BIND9 / PowerDNS query log (client → name → qtype). Requires query_log_enabled on the server group."
+            count={dnsAgentSources.length || undefined}
+          />
+          <TabButton
+            active={tab === "dhcp-activity"}
+            onClick={() => setTab("dhcp-activity")}
+            icon={Activity}
+            label="DHCP Activity"
+            hint="Kea DHCPv4 activity (DISCOVER / OFFER / REQUEST / ACK, lease alloc, declines)"
+            count={dhcpAgentSources.length || undefined}
+          />
           <TabButton
             active={tab === "events"}
             onClick={() => setTab("events")}
@@ -154,31 +186,15 @@ export function LogsPage() {
               undefined
             }
           />
-          <TabButton
-            active={tab === "dns-queries"}
-            onClick={() => setTab("dns-queries")}
-            icon={Search}
-            label="DNS Queries"
-            hint="BIND9 query log (client → name → qtype). Requires query_log_enabled on the server."
-            count={dnsAgentSources.length || undefined}
-          />
-          <TabButton
-            active={tab === "dhcp-activity"}
-            onClick={() => setTab("dhcp-activity")}
-            icon={Activity}
-            label="DHCP Activity"
-            hint="Kea DHCPv4 activity (DISCOVER / OFFER / REQUEST / ACK, lease alloc, declines)"
-            count={dhcpAgentSources.length || undefined}
-          />
         </div>
       </div>
 
-      {tab === "events" && <EventLogTab sources={tabSources} />}
-      {tab === "audit" && <DhcpAuditTab sources={tabSources} />}
       {tab === "dns-queries" && <DNSQueriesTab sources={dnsAgentSources} />}
       {tab === "dhcp-activity" && (
         <DHCPActivityTab sources={dhcpAgentSources} />
       )}
+      {tab === "events" && <EventLogTab sources={tabSources} />}
+      {tab === "audit" && <DhcpAuditTab sources={tabSources} />}
     </div>
   );
 }
@@ -318,6 +334,27 @@ function EventLogTab({ sources }: { sources: LogSource[] }) {
         String(e.id).includes(q),
     );
   }, [events, search]);
+
+  // Empty state — checked after every hook so React's hook-count
+  // stays stable across renders. Mirrors the DHCP Audit tab pattern.
+  if (sources.length === 0) {
+    return (
+      <div className="flex flex-1 items-center justify-center p-10">
+        <div className="max-w-md rounded-lg border border-dashed p-10 text-center">
+          <ScrollText className="mx-auto mb-3 h-10 w-10 text-muted-foreground/30" />
+          <p className="text-sm font-medium">No Windows servers configured</p>
+          <p className="mt-2 text-xs text-muted-foreground">
+            The Event Log tab is the Windows Event Viewer surface for the DNS
+            Server / DHCP Server roles — admin + operational events like zone
+            load, scope activation, and AD integration warnings. It requires a
+            Windows DNS or DHCP server registered with WinRM credentials. For
+            BIND9 / PowerDNS / Kea use the <strong>DNS Queries</strong> or{" "}
+            <strong>DHCP Activity</strong> tab instead.
+          </p>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <>
@@ -1067,7 +1104,7 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
   );
 
   if (sources.length === 0) {
-    return <EmptyAgentTab kind="DNS" drivers="bind9" />;
+    return <EmptyAgentTab kind="DNS" drivers="bind9 / powerdns" />;
   }
 
   return (
