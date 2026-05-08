@@ -361,7 +361,7 @@ the control plane.
 
 ### Host vs bridge networking
 
-Default ports in both files map to non-53 / non-67 host ports (5353/udp+tcp, 6767/udp) so the containers don't collide with systemd-resolved or a running dhcp client on the host.
+Default ports in both files map to non-53 / non-67 host ports (1053/udp+tcp for DNS, 6767/udp for DHCP) so the containers don't collide with systemd-resolved or a running dhcp client on the host. The DNS default was 5353 prior to release `2026.05.08-1`; it changed to 1053 because 5353 is the well-known mDNS port that avahi (default-on in Ubuntu desktop, Fedora, most lab distros) already binds. Existing deployments that want to keep the old port can set `DNS_HOST_PORT=5353` in `.env`.
 
 For **real DNS / DHCP serving** you want `network_mode: host` so the daemon binds 53 / 67 directly and, for DHCP, receives L2 broadcasts on the host NIC. Add to the service definition:
 

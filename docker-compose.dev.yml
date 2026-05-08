@@ -231,15 +231,15 @@ services:
       - dns_bind9_state:/var/lib/spatium-dns-agent
       - dns_bind9_cache:/var/cache/bind
     ports:
-      - "5353:53/udp"
-      - "5353:53/tcp"
+      - "1053:53/udp"
+      - "1053:53/tcp"
     depends_on:
       api:
         condition: service_started
 
   # ── DNS agent (PowerDNS) ─────────────────────────────────────────────
   # Enable with: docker compose --profile dns-powerdns up -d
-  # Distinct host port (5453, not 5353) so a side-by-side BIND9 +
+  # Distinct host port (5453, not 1053) so a side-by-side BIND9 +
   # PowerDNS dev setup doesn't collide. AGENT_GROUP defaults to
   # ``default-powerdns`` so both groups exist in parallel; mixing
   # drivers inside one group is rejected by the control plane (every

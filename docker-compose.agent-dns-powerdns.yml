@@ -69,12 +69,14 @@ services:
       # Optional: mount a CA bundle to verify the control plane.
       # - /etc/ssl/certs:/etc/ssl/certs:ro
     ports:
-      # DNS — UDP and TCP. The host-port defaults (5353) are lab-friendly
-      # to avoid colliding with systemd-resolved on 53. For a real DNS
-      # server use port 53 directly, typically with ``network_mode:
-      # host`` so clients can reach it without DNAT.
-      - "${DNS_HOST_PORT:-5353}:53/udp"
-      - "${DNS_HOST_PORT:-5353}:53/tcp"
+      # DNS — UDP and TCP. The host-port defaults (1053) are lab-friendly
+      # to avoid colliding with systemd-resolved on 53 *and* avahi-mDNS
+      # on 5353. For a real DNS server use port 53 directly, typically
+      # with ``network_mode: host`` so clients can reach it without
+      # DNAT. Existing deployments can pin the old default with
+      # ``DNS_HOST_PORT=5353`` in .env.
+      - "${DNS_HOST_PORT:-1053}:53/udp"
+      - "${DNS_HOST_PORT:-1053}:53/tcp"
 
 networks:
   spatiumddi-agent:

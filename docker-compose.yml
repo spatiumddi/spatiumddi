@@ -207,8 +207,8 @@ services:
       - dns_bind9_state:/var/lib/spatium-dns-agent
       - dns_bind9_cache:/var/cache/bind
     ports:
-      - "5353:53/udp"
-      - "5353:53/tcp"
+      - "1053:53/udp"
+      - "1053:53/tcp"
     depends_on:
       api:
         condition: service_started
@@ -236,7 +236,7 @@ services:
       - dns_powerdns_state:/var/lib/spatium-dns-agent
       - dns_powerdns_lmdb:/var/lib/powerdns
     ports:
-      # 5453 (not 5353) so a side-by-side bind9 + powerdns dev setup
+      # 5453 (not 1053) so a side-by-side bind9 + powerdns dev setup
       # doesn't collide on the host port.
       - "5453:53/udp"
       - "5453:53/tcp"

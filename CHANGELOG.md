@@ -350,6 +350,22 @@ visibility.
   ``--profile dns`` Compose alias is preserved so most operators
   don't need to edit anything.
 
+### Changed
+
+- **DNS host-port default flipped from 5353 → 1053.** The original
+  5353 was chosen to dodge the port-53 / systemd-resolved collision
+  but landed on the well-known mDNS port that avahi (default-on in
+  Ubuntu desktop, Fedora, and most lab distros) already binds —
+  operators were hitting the conflict on first run and reporting
+  it. 1053 is the conventional alternate (Kubernetes / CoreDNS use
+  it for the same reason) and has no IANA collision. The
+  ``DNS_HOST_PORT`` env var still overrides; existing deployments
+  that want to keep the old port can pin ``DNS_HOST_PORT=5353``
+  in ``.env`` and recreate the container. Updated across
+  ``docker-compose.yml``, ``docker-compose.dev.yml``, the two
+  standalone-agent compose files, ``.env.example``, the
+  ``GETTING_STARTED`` block in README, and ``DOCKER.md``.
+
 ### Migrations
 
 - ``e7f94b21c8d5_dns_zone_dnssec_ds_records`` — adds

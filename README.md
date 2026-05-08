@@ -672,13 +672,15 @@ docker compose --profile dns-bind9 --profile dhcp up -d  # BIND9 + DHCP
 
 Or set `COMPOSE_PROFILES=dns-bind9,dhcp` in your `.env` so plain `docker compose up -d` enables both automatically.
 
-That starts `dns-bind9` bound to host port `5353` (udp + tcp), or `dns-powerdns` on `5453`. The agent registers with the control plane automatically using `DNS_AGENT_KEY` from your `.env` and appears in the UI under **DNS → Server Groups**.
+That starts `dns-bind9` bound to host port `1053` (udp + tcp), or `dns-powerdns` on `5453`. The agent registers with the control plane automatically using `DNS_AGENT_KEY` from your `.env` and appears in the UI under **DNS → Server Groups**.
+
+> **Upgrading from a release that used port 5353?** The DNS host port default changed from `5353` to `1053` in release `2026.05.08-1` because 5353 is the well-known mDNS port and collides with avahi (default-on in Ubuntu desktop / Fedora / most lab distros). Either point your clients at the new port (`dig -p 1053 …`), or pin the old behaviour with `DNS_HOST_PORT=5353` in your `.env` and recreate the container.
 
 Create a zone + record in the UI, then verify with `dig`:
 
 ```bash
-dig @127.0.0.1 -p 5353 <your-record>.<your-zone> A +short
-dig @127.0.0.1 -p 5353 -x <your-ip> +short    # reverse (PTR)
+dig @127.0.0.1 -p 1053 <your-record>.<your-zone> A +short
+dig @127.0.0.1 -p 1053 -x <your-ip> +short    # reverse (PTR)
 ```
 
 Record changes propagate to BIND9 via RFC 2136 — typically sub-second, no daemon restart. Zone / ACL / view changes trigger a config reload.
