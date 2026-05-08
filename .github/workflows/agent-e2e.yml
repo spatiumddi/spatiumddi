@@ -182,6 +182,63 @@ jobs:
           kubectl -n spatiumddi logs "$POD" --tail=120
           exit 1
 
+      - name: PowerDNS DNSSEC online signing smoke (Phase 5 / #127)
+        run: |
+          # Phase 5 extension of the Phase 4c smoke test: prove that
+          # the daemon can actually sign a zone end-to-end and that
+          # ``dig +dnssec`` returns AD-flagged answers from the local
+          # resolver-that-isn't, just to confirm the signing pipeline
+          # is wired. Uses ``pdnsutil`` inside the pod so we don't
+          # have to wrangle the agent-generated REST API key — direct
+          # LMDB writes via the same binary the agent shells out to
+          # for cryptokey ops are a faithful equivalent.
+          POD=$(kubectl -n spatiumddi get pod \
+            -l app.kubernetes.io/component=dns-agent,spatiumddi.org/dns-flavor=powerdns \
+            -o jsonpath='{.items[0].metadata.name}')
+          if [ -z "$POD" ]; then
+            echo "no PowerDNS agent pod found"
+            exit 1
+          fi
+          ZONE="dnssec-smoke.test."
+          echo "→ creating zone $ZONE inside $POD"
+          kubectl -n spatiumddi exec "$POD" -- pdnsutil create-zone "$ZONE" || {
+            echo "pdnsutil create-zone failed; dumping logs:"
+            kubectl -n spatiumddi logs "$POD" --tail=120
+            exit 1
+          }
+          kubectl -n spatiumddi exec "$POD" -- pdnsutil add-record "$ZONE" www A 192.0.2.42
+          echo "→ signing $ZONE"
+          kubectl -n spatiumddi exec "$POD" -- pdnsutil secure-zone "$ZONE"
+          kubectl -n spatiumddi exec "$POD" -- pdnsutil rectify-zone "$ZONE"
+          # Verify the signed answer comes back with RRSIG records.
+          # We don't expect AD here — pdns_server is authoritative,
+          # not a validating resolver — but RRSIG presence proves the
+          # zone is signed and the rrsets carry signatures. AD-flag
+          # validation belongs in a downstream resolver test.
+          OUT=$(kubectl -n spatiumddi exec "$POD" -- dig +dnssec +short www.${ZONE} @127.0.0.1)
+          echo "$OUT"
+          if echo "$OUT" | grep -q "192.0.2.42"; then
+            echo "DNSSEC signing smoke OK — A answer present"
+          else
+            echo "expected A answer for www.${ZONE} not found; dumping logs:"
+            kubectl -n spatiumddi logs "$POD" --tail=120
+            exit 1
+          fi
+          # Inspect the rrset directly for RRSIG presence — +short
+          # strips RRSIG by design, so re-issue without it.
+          if kubectl -n spatiumddi exec "$POD" -- dig +dnssec www.${ZONE} @127.0.0.1 | grep -q "RRSIG"; then
+            echo "RRSIG present in answer — signing pipeline confirmed"
+          else
+            echo "no RRSIG in dig output — signing didn't take effect"
+            kubectl -n spatiumddi exec "$POD" -- pdnsutil show-zone "$ZONE" || true
+            kubectl -n spatiumddi logs "$POD" --tail=120
+            exit 1
+          fi
+          # Cleanup so a re-run on the same pod doesn't trip on a
+          # pre-existing zone (kind clusters are ephemeral but be
+          # explicit anyway).
+          kubectl -n spatiumddi exec "$POD" -- pdnsutil delete-zone "$ZONE" || true
+
       - name: DNS agents registered with control plane
         run: |
           kubectl -n spatiumddi port-forward svc/ddi-spatiumddi-api 18001:8000 &

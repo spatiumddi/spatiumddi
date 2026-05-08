@@ -68,6 +68,34 @@ visibility.
   pipeline adds a parallel ``build-dns-powerdns`` job alongside
   the existing ``build-dns`` (BIND9) so every tag publishes both
   images with ``:<version>`` and ``:latest`` tags.
+- **PowerDNS Phase 5 — operator polish + docs pass (\#127).** Closes
+  the documentation surface around the second authoritative driver.
+  ``docs/drivers/DNS_DRIVERS.md`` grows a full Section 4 PowerDNS
+  driver chapter (REST update strategy, API-key bootstrap, capability
+  matrix, LUA / DNSSEC / catalog-zone internals, LMDB cache + recovery
+  shape) and a Section 5.2 decision tree for when-to-pick-which-driver;
+  ``docs/features/DNS.md`` gains a Section 0 driver-choice subsection
+  with the three-driver capability matrix and "pick PowerDNS when…"
+  guidance, mentions the ``propose_create_dns_zone`` ``driver_hint``
+  argument, and updates the lead paragraph to drop the BIND9-only
+  framing; ``docs/deployment/TOPOLOGIES.md`` adds two new sections —
+  a "PowerDNS-primary + BIND-secondary hybrid" recipe (catalog-zone-
+  driven AXFR crossover, plus per-zone driver placement) and a
+  four-step "Migrating a BIND9 group to PowerDNS without DNS
+  downtime" walkthrough with rollback notes and a DNSSEC restore
+  caveat. ``agent-e2e.yml`` extends the Phase 4c kind smoke test
+  with a DNSSEC online-signing pass: ``pdnsutil create-zone`` →
+  ``add-record`` → ``secure-zone`` → ``rectify-zone`` → ``dig
+  +dnssec`` against the local pdns_server, with RRSIG presence
+  asserted in the response so the signing pipeline regression-
+  catches in PR review. Frontend record-create modal grows a "Insert
+  snippet…" dropdown when LUA is selected — six starter templates
+  (``pickrandom`` / ``ifportup`` / ``ifurlup`` / ``createReverse`` /
+  ``pickwhashed`` / ``pickclosest``) seed the textarea so operators
+  don't have to remember LUA syntax cold. Issue #127 is now
+  feature-complete; the only remaining tail is the gpgsql-backend
+  variant (operator-choice; LMDB stays default) and pdns 4.10+
+  catalog-consumer support.
 - **PowerDNS Operator-Copilot ``propose_create_dns_zone``, Phase 4e
   (\#127).** New write-proposal tool + matching ``create_dns_zone``
   operation in ``app.services.ai.operations``. Args carry an

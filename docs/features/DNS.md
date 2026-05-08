@@ -4,7 +4,7 @@
 
 ## Overview
 
-SpatiumDDI manages DNS servers as first-class resources. It acts as the **authoritative source of truth** for all DNS configuration, pushing changes to backend DNS servers (BIND9) via their respective drivers. The DNS subsystem supports:
+SpatiumDDI manages DNS servers as first-class resources. It acts as the **authoritative source of truth** for all DNS configuration, pushing changes to backend DNS servers via their respective drivers. The DNS subsystem supports:
 
 - Forward and reverse zones organized in a **tree hierarchy**
 - **Multiple DNS server groups** (e.g., internal, external, DMZ)
@@ -14,6 +14,38 @@ SpatiumDDI manages DNS servers as first-class resources. It acts as the **author
 - **Blocking lists** — integrated ad/malware blocking similar to Pi-hole
 - **Per-zone assignment** to IP ranges/subnets
 - Role-based access control on zones
+
+---
+
+## 0. Driver choice — BIND9, PowerDNS, or Windows DNS
+
+SpatiumDDI ships three authoritative DNS drivers. Pick **per server group** — every server inside a group runs the same driver, but mixed installs (one group on BIND, another on PowerDNS, a third on Windows) are first-class. The driver registry is in [`drivers/dns/registry.py`](../../backend/app/drivers/dns/registry.py); the per-driver internals are in [`docs/drivers/DNS_DRIVERS.md`](../drivers/DNS_DRIVERS.md).
+
+| Capability | BIND9 | PowerDNS | Windows DNS |
+|---|:---:|:---:|:---:|
+| Authoritative zone serving | ✅ | ✅ | ✅ |
+| Recursive resolver | ✅ | — (recursor is a separate daemon) | ✅ |
+| Record CRUD wire protocol | RFC 2136 + rndc | REST API (PATCH rrsets) | RFC 2136 (Path A) / WinRM (Path B) |
+| Zone CRUD wire protocol | rndc addzone / delzone | REST API | WinRM (Path B only) |
+| ALIAS records (CNAME at apex) | — | ✅ | — |
+| LUA records (computed responses) | — | ✅ | — |
+| Online DNSSEC signing | manual | ✅ one-toggle | manual |
+| Catalog zones (RFC 9432) — producer | ✅ | ✅ | — |
+| Catalog zones (RFC 9432) — consumer | ✅ | — (waits for pdns 4.10+) | — |
+| First-class views / split-horizon | ✅ | tag-based, not surfaced as views in UI | — (replication scope) |
+| RPZ blocklists | ✅ | — (recursor feature only) | — |
+| AD-integrated zones | — | — | ✅ |
+| Agent shape | sidecar agent + named | sidecar agent + pdns_server | agentless (control plane → WinRM) |
+
+**Default driver: BIND9.** It is the reference implementation, ubiquitous in operator muscle memory, and runs the catalog-zone consumer + RPZ paths SpatiumDDI ships.
+
+**Pick PowerDNS when** you need ALIAS records (CNAME-at-apex without the BIND-side workaround), LUA records (geo-routing / weighted answers / `pickrandom` / `ifportup`), or the simpler one-toggle online DNSSEC story. The shipped image (`ghcr.io/spatiumddi/dns-powerdns`) bundles `pdns 4.9 + pdns-backend-lmdb` for an agent-isolated zone store with no external Postgres dependency. See [issue #127](https://github.com/spatiumddi/spatiumddi/issues/127) for the full driver rationale.
+
+**Pick Windows DNS when** the zone is AD-integrated and operators expect to keep using DNS Manager / `Add-DnsServerResourceRecord` directly. Path A (RFC 2136 + AXFR) works without admin credentials; Path B (WinRM + PowerShell) unlocks zone CRUD and a JSON record-pull that sidesteps AXFR ACL configuration.
+
+PowerDNS-only features (ALIAS / LUA / online DNSSEC sign+unsign) are server-side gated by the API's `_DRIVER_GATED_RECORD_TYPES` and `_DRIVER_GATED_OPERATIONS` maps. Calling them against a BIND9 / Windows / mixed group returns 422 with a remediation message — move the zone to a PowerDNS-only group, or add a PowerDNS server to the group, before retrying.
+
+The Operator Copilot's `propose_create_dns_zone` tool accepts an explicit `driver_hint` argument (`bind9` / `powerdns` / `windows_dns`) so the LLM can route DNSSEC-required zones to PowerDNS groups without operators having to specify the group UUID by hand. See `app.services.ai.operations.CreateDNSZoneArgs`.
 
 ---
 

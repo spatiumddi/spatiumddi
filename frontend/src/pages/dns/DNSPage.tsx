@@ -1776,14 +1776,60 @@ function RecordModal({
         </div>
         <Field label="Value">
           {type === "LUA" ? (
-            <textarea
-              className={`${inputCls} font-mono text-xs`}
-              value={value}
-              onChange={(e) => setValue(e.target.value)}
-              placeholder={`A 'pickrandom({"10.0.0.1","10.0.0.2"})'`}
-              rows={4}
-              required
-            />
+            <div className="space-y-1">
+              <div className="flex items-center justify-between gap-2">
+                <select
+                  className="rounded-md border bg-background px-2 py-1 text-xs"
+                  value=""
+                  onChange={(e) => {
+                    if (e.target.value) {
+                      setValue(e.target.value);
+                      e.target.value = "";
+                    }
+                  }}
+                  aria-label="Insert LUA snippet template"
+                >
+                  <option value="">Insert snippet…</option>
+                  <option
+                    value={`A "pickrandom({'10.0.0.1','10.0.0.2','10.0.0.3'})"`}
+                  >
+                    pickrandom — round-robin A
+                  </option>
+                  <option value={`A "ifportup(443, {'10.0.0.1','10.0.0.2'})"`}>
+                    ifportup — failover by TCP probe
+                  </option>
+                  <option
+                    value={`A "ifurlup('https://example.com/health', {'10.0.0.1','10.0.0.2'})"`}
+                  >
+                    ifurlup — failover by HTTP(S) probe
+                  </option>
+                  <option
+                    value={`CNAME "createReverse('%5%.%4%.%3%.%2%.in-addr.arpa.')"`}
+                  >
+                    createReverse — generated PTR
+                  </option>
+                  <option
+                    value={`A "pickwhashed({{1, '10.0.0.1'}, {3, '10.0.0.2'}})"`}
+                  >
+                    pickwhashed — sticky weighted
+                  </option>
+                  <option value={`A "pickclosest({'10.0.0.1','192.168.1.1'})"`}>
+                    pickclosest — geo / latency
+                  </option>
+                </select>
+                <span className="text-[11px] text-muted-foreground">
+                  Templates are starting points — edit to fit your zone.
+                </span>
+              </div>
+              <textarea
+                className={`${inputCls} font-mono text-xs`}
+                value={value}
+                onChange={(e) => setValue(e.target.value)}
+                placeholder={`A 'pickrandom({"10.0.0.1","10.0.0.2"})'`}
+                rows={4}
+                required
+              />
+            </div>
           ) : (
             <input
               className={inputCls}

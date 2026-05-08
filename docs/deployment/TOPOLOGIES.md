@@ -246,6 +246,56 @@ targets, and the upgrade-flow recipe.
 
 ---
 
+## PowerDNS-primary + BIND-secondary hybrid (driver crossover)
+
+SpatiumDDI ships two authoritative DNS drivers: BIND9 (default) and PowerDNS. Each `DNSServerGroup` is single-driver — but **multiple groups, each on a different driver, can serve overlapping namespaces** via plain AXFR or RFC 9432 catalog zones. Two operator-relevant shapes:
+
+**Shape A — PowerDNS-primary + BIND-secondary on the same zones.** PowerDNS handles writes (online DNSSEC signing, ALIAS records, LUA records); BIND fans the zones out to a battle-tested edge. Catalog-zone-driven AXFR keeps both drivers in sync because the producer-side catalog renderer emits identical wire bytes from either driver (issue #127 Phase 3d).
+
+```
+Operators ─→ SpatiumDDI control plane
+                │
+                ├── DNSServerGroup "internal-pdns" (driver=powerdns)
+                │     ├── pdns1.corp  (primary, signs DNSSEC)
+                │     └── pdns2.corp  (secondary)
+                │
+                └── DNSServerGroup "edge-bind"  (driver=bind9)
+                      ├── bind1.edge  (catalog consumer of internal-pdns)
+                      └── bind2.edge  (catalog consumer of internal-pdns)
+```
+
+Wire it up:
+
+1. In `internal-pdns` set `catalog_zones_enabled=true` + `catalog_zone_name=catalog.example.com.`. The PowerDNS primary publishes the catalog zone alongside member zones via the agent's REST patch path.
+2. In `edge-bind` set `catalog_zones_enabled=true` + `catalog_zone_name=catalog.example.com.` + a `transfer_source` AXFR pointer at the PowerDNS primary. BIND auto-consumes the catalog and provisions secondary zones for every member it advertises.
+3. Operator changes land via the SpatiumDDI UI → write-through to PowerDNS REST → PowerDNS bumps zone serial → BIND notices via NOTIFY-then-IXFR.
+
+**Shape B — Per-zone driver placement (not crossover).** Some zones live on PowerDNS (those with ALIAS / LUA / DNSSEC needs), some on BIND9 (those with first-class views or RPZ blocklists). Each zone is owned by exactly one group; the operator picks the right group at zone-create time. The Operator Copilot's `propose_create_dns_zone` tool accepts a `driver_hint` arg that picks a matching group automatically — `dnssec_enabled=true` requires `driver_hint=powerdns` and rejects against any group with no PowerDNS member.
+
+The driver-feature gate (server-side, `_DRIVER_GATED_RECORD_TYPES` + `_DRIVER_GATED_OPERATIONS`) means a PowerDNS-only feature called against a BIND group returns 422 with a remediation message ("move the zone to a PowerDNS-only group"). Mixed-driver groups are also rejected — an "internal-pdns" group cannot have one PowerDNS plus one BIND9 server, by design.
+
+---
+
+## Migrating a BIND9 group to PowerDNS without DNS downtime
+
+Replacing a BIND9 group with a PowerDNS group on the same zones is a four-step recipe. The IPAM ↔ DNS sync, RBAC, and DDNS pipeline don't change — only the driver underneath the zones.
+
+**Pre-flight check.** Inventory zones with PowerDNS-incompatible features: classic views (PowerDNS does views via tags — no auto-translation today), RPZ blocklists (recursor-only, not authoritative). If any zone in the group uses these, leave that zone on BIND9 and only migrate the others. The control plane allows mixed installs precisely so you can split the unmigratable zones off into a separate group.
+
+**1. Stand up the PowerDNS group alongside BIND9.** Deploy a PowerDNS agent (Compose `--profile dns-powerdns`, Helm `dnsAgents.servers[].flavor: powerdns`, or a standalone-VM `docker-compose.agent-dns-powerdns.yml`) and let it auto-register. In the SpatiumDDI UI, create a new `DNSServerGroup` with `driver=powerdns` and the registered server as its primary. Both groups are now live; the BIND group still serves all zones.
+
+**2. Catalog-driven zone copy.** On the BIND group, set `catalog_zones_enabled=true` + a catalog zone name (`catalog.migration.local.`). On the PowerDNS group, set the same and point its `transfer_source` at the BIND primary. Wait one sync cycle (~60 s). Every member zone the BIND group advertises is now auto-provisioned as a secondary on PowerDNS via AXFR. Verify `dig +short SOA <zone> @<powerdns-pod>` matches the BIND primary's serial. **No record edits should land during this window** — schedule the migration for a low-write period.
+
+**3. Promote PowerDNS to primary.** In the UI, edit each zone and switch its `group_id` to the PowerDNS group. The control plane: (a) write-through-PATCHes the zone to PowerDNS as primary, (b) drops the catalog secondary and creates a primary entry, (c) rebuilds the SOA. BIND can stay on the zone as a plain catalog secondary (read-only) for a soft cutover, or be removed entirely. DDNS / IPAM auto-sync continue uninterrupted because they target the zone by ID, not by driver.
+
+**4. Sign zones (optional).** With the zones now on PowerDNS, signed zones are a single click — open the zone-edit modal, hit **Sign zone** in the DNSSEC card. PowerDNS generates KSK + ZSK, sets `PRESIGNED=1`, rectifies the zone, and the agent reports DS records back to the control plane. **Re-publish DS records to your registrar** — that's the only out-of-band step. The DNSSEC card has a per-DS copy-to-clipboard button. See [issue #127 Phase 3c](https://github.com/spatiumddi/spatiumddi/issues/127) for the full flow.
+
+**Rollback recipe.** If something goes wrong between step 2 and step 3, the BIND group is still authoritative — flip the zones back via the UI. If something goes wrong after step 3, the catalog-driven secondary on BIND is still serving the last-known-good zone state; promote it back to primary by switching the zone's group back to BIND. The IPAM ↔ DNS reconciler will pick up any record drift on the next 60-s sync cycle and re-stamp the zone.
+
+**Post-restore caveat for DNSSEC zones.** PowerDNS DNSSEC keys live on the agent's LMDB volume, not in the control-plane backup. A factory-reset + restore-from-backup that wipes the agent's volume regenerates keys and produces NEW DS records — which means a new round-trip to the registrar. The restore endpoint surfaces this as a `RestoreOutcomeResponse.warnings[]` advisory listing every signed zone; the BackupPage UI renders it as an amber callout. See [issue #127 Phase 4d](https://github.com/spatiumddi/spatiumddi/issues/127).
+
+---
+
 ## Picking a topology
 
 | You have... | Start with |
@@ -256,6 +306,7 @@ targets, and the upgrade-flow recipe.
 | Multi-DC or cloud-first ops team | Topology 4 |
 | Branch offices feeding back to a HQ control plane | Topology 5 |
 | Anything K8s-native | Topology 6 |
+| Need ALIAS / LUA / one-toggle DNSSEC | Add a PowerDNS group to any of the above |
 
 You can move between topologies without re-installing. Going from
 Topology 1 → 2 → 3 → 4 is purely additive: new VMs join the existing

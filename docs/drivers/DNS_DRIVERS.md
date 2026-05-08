@@ -288,7 +288,121 @@ $r | ConvertTo-Json -Compress -Depth 3
 
 ---
 
-## 4. Driver Selection and Registration
+## 4. PowerDNS Driver
+
+Located at [`app/drivers/dns/powerdns.py`](../../backend/app/drivers/dns/powerdns.py). Class: `PowerDNSDriver`. Shipped in issue #127.
+
+PowerDNS is a second authoritative driver running side-by-side with BIND9. It is **agent-managed** the same way BIND9 is — there is one DNS agent per server, the agent owns the local PowerDNS daemon (`pdns_server`), and the control plane never opens a connection to PowerDNS directly. The agent talks to PowerDNS's REST API on `127.0.0.1:8081`; the control plane talks to the agent through the existing long-poll `/config` channel.
+
+The shipped image (`ghcr.io/spatiumddi/dns-powerdns`) bundles `pdns 4.9.x` with the `pdns-backend-lmdb` backend. LMDB is a single-file embedded zone store — no external Postgres, no shared credentials, full operational symmetry with BIND9's "zone files on local disk" model. A `gpgsql`-backend image variant is on the Phase 5+ wishlist for operators who want PowerDNS-pod-replicas-against-shared-Postgres HA, but is not the default.
+
+### 4.1 Update Strategy: REST API (never daemon restart)
+
+| Operation | Mechanism | Notes |
+|---|---|---|
+| Add / update / delete record | `PATCH /api/v1/servers/localhost/zones/<zone>` rrset patch | Idempotent; one HTTP call per rrset; PowerDNS handles serial bump internally. |
+| Create zone | `POST /api/v1/servers/localhost/zones` | LMDB row created; available to query immediately. |
+| Delete zone | `DELETE /api/v1/servers/localhost/zones/<zone>` | LMDB row removed; idempotent. |
+| Reconcile zone (full sync) | `PUT /api/v1/servers/localhost/zones/<zone>` with full rrset list | Used on first sync or on detected drift. |
+| Online DNSSEC sign | `POST .../zones/<zone>/cryptokeys` (KSK + ZSK) + `PUT .../metadata/PRESIGNED` + `PUT .../zones/<zone>/rectify` | Idempotent — re-sign skips when keys exist. |
+| Online DNSSEC unsign | `DELETE .../cryptokeys/<id>` per key + clear `PRESIGNED` | Same idempotent shape. |
+| Catalog zone (RFC 9432) producer | Render apex SOA + NS + `version` TXT + per-member SHA-1-hashed PTR via the same rrset PATCH path | Producer-only; consumer waits for pdns 4.10+ (Phase 5 polish). |
+| **Full daemon restart** | ❌ NEVER for normal operations | Only for: image bump, zone-storage backend swap (LMDB → gpgsql). |
+
+The agent never reads `pdns.conf` to figure out what to do — it queries PowerDNS over REST and reconciles against the `ConfigBundle` shipped from the control plane. This is the same conceptual loop as the BIND9 driver, but the wire protocol is HTTP+JSON instead of RFC 2136+rndc.
+
+### 4.2 PowerDNS API key
+
+PowerDNS gates its REST API with a static API key (`api-key=...` in `pdns.conf`). The container's entrypoint generates a fresh key on first boot, writes it into the local `pdns.conf`, and exports it to the agent via a tmpfs-mounted env file. **Operators never touch this key.** The agent reads it on startup and rotates it on every container restart.
+
+The control plane has no knowledge of the API key — the trust boundary is between the agent and its co-located PowerDNS daemon, not between the control plane and PowerDNS.
+
+### 4.3 Capabilities
+
+```python
+class PowerDNSDriver(DNSDriver):
+    @classmethod
+    def capabilities(cls) -> dict[str, Any]:
+        return {
+            "alias_records": True,         # CNAME-at-apex via PATCH
+            "lua_records": True,           # ENABLE-LUA-RECORDS=1 zone metadata auto-set
+            "dnssec_inline_signing": True, # online sign / unsign / re-sign
+            "catalog_zones": "producer-only",  # consumer needs pdns 4.10+
+            "views": False,                # tag-based; not surfaced as views in UI yet
+            "rpz": False,                  # authoritative-only — RPZ is a recursor feature
+        }
+```
+
+`alias_records: True`, `lua_records: True`, and `dnssec_inline_signing: True` are the three operator-visible features that BIND9 doesn't ship today. Each is gated server-side by the API's `_DRIVER_GATED_RECORD_TYPES` / `_DRIVER_GATED_OPERATIONS` maps — calling them against a non-PowerDNS group returns 422 with a remediation message ("move to a PowerDNS-only group").
+
+### 4.4 LUA records
+
+LUA records are PowerDNS's mechanism for computed responses — geo-routing, weighted answers, conditional `pickrandom` / `ifportup` / `createReverse` snippets. The frontend exposes a `<textarea>` for the LUA value when the operator selects record type `LUA`; the agent auto-sets `ENABLE-LUA-RECORDS=1` zone metadata via the PowerDNS REST API the first time a zone gains a LUA record (idempotent — the metadata stays harmless when no LUA records remain).
+
+**Security note.** LUA records execute server-side at query time. Treat them as code. The frontend's contextual banner explains this; restrict who can create LUA records via the existing RBAC `dns.record.create` permission scoped to PowerDNS groups only.
+
+### 4.5 Online DNSSEC
+
+PowerDNS does the full DNSSEC dance internally:
+
+1. `POST /cryptokeys` with `keytype: ksk` (Algorithm 13 / ECDSAP256SHA256 by default). PowerDNS generates the key and starts publishing DNSKEY rrsets.
+2. `POST /cryptokeys` with `keytype: zsk` (same algorithm). PowerDNS now signs all rrsets in the zone with the ZSK on every query.
+3. `PUT /metadata/PRESIGNED` set to `0` — confirms the daemon manages signing online (vs. presigned zones loaded from disk).
+4. `PUT /zones/<zone>/rectify` — recomputes NSEC / NSEC3 chain.
+
+After signing, the agent enumerates DS records via `GET /cryptokeys` and POSTs them back to the control plane through the new `POST /api/v1/dns/agents/dnssec-state` endpoint. The control plane caches them in `dns_zone.dnssec_ds_records` (JSONB) so the operator-facing zone-edit page renders them without round-tripping the agent.
+
+**Backup integration.** DNSSEC keys live in the agent's LMDB store, **not** in the control-plane backup. Restoring a DNSSEC-signed zone to a fresh agent regenerates keys and produces NEW DS records, which must be re-published to the parent registrar. The restore endpoint surfaces this as a `RestoreOutcomeResponse.warnings[]` advisory. See [issue #127 Phase 4d](https://github.com/spatiumddi/spatiumddi/issues/127).
+
+### 4.6 Catalog zones (RFC 9432)
+
+Producer-side only. When `DNSServerGroup.catalog_zones_enabled` is on and this server is the group primary, the agent renders the catalog zone alongside regular zones via the same PATCH rrset path used for normal zones:
+
+- Apex SOA + NS
+- `version` TXT pinned to `"2"` (RFC 9432 §4.1)
+- One PTR per primary zone under `<sha1>.zones.<catalog-zone>.` using the canonical RFC 9432 wire-format hash. **Identical bytes to BIND9's catalog renderer** — a SpatiumDDI catalog can be served from either driver and consumed by either.
+
+Consumer mode logs a structured warning at agent startup: pdns 4.9 (the shipped image) does not auto-consume catalog zones. Operators with PowerDNS secondaries pull via plain AXFR against the producer; full consumer-side support waits for an image bump to pdns 4.10+.
+
+### 4.7 PowerDNSDriver Configuration
+
+```python
+@dataclass
+class PowerDNSDriverConfig:
+    api_url: str = "http://127.0.0.1:8081"   # local-only by design
+    api_key: str                             # generated by entrypoint, agent reads from env
+    api_timeout: float = 10.0
+```
+
+There is no `host` / `ssh_user` / `ssh_key` / RNDC counterpart — PowerDNS configuration is entirely REST-driven, and the REST endpoint is bound to loopback. This is significantly less surface area than the BIND9 driver maintains.
+
+### 4.8 LMDB cache + recovery
+
+LMDB is a single mmap'd file at `/var/lib/powerdns/pdns.lmdb`. The shipped Helm chart and standalone Compose file mount it on a persistent PVC / volume:
+
+```yaml
+# charts/spatiumddi/templates/dns-agent.yaml — flavor: powerdns branch
+volumeMounts:
+  - { name: dns-state, mountPath: /var/lib/powerdns }
+```
+
+```yaml
+# docker-compose.agent-dns-powerdns.yml
+volumes:
+  dns_powerdns_lmdb: {}
+services:
+  dns-powerdns:
+    volumes:
+      - dns_powerdns_lmdb:/var/lib/powerdns
+```
+
+On agent startup, the supervisor checks the LMDB file. If it's empty (fresh install), the entrypoint runs `pdnsutil create-bind-db` to seed an empty store; the long-poll then picks up the first ConfigBundle and reconciles the zones. If the LMDB file is populated (restart on existing volume), `pdns_server` boots straight into serving and the agent reconciles any DB drift on the next ConfigBundle ETag flip.
+
+LMDB cache survives control-plane outages — non-negotiable #5 in `CLAUDE.md`. The daemon keeps answering queries from the on-disk LMDB store regardless of whether the agent can reach the control plane.
+
+---
+
+## 5. Driver Selection and Registration
 
 Drivers are registered by name and instantiated by the service layer:
 
@@ -296,6 +410,7 @@ Drivers are registered by name and instantiated by the service layer:
 # app/drivers/dns/registry.py
 _DRIVERS: dict[str, type[DNSDriver]] = {
     "bind9": BIND9Driver,
+    "powerdns": PowerDNSDriver,
     "windows_dns": WindowsDNSDriver,
 }
 
@@ -308,9 +423,34 @@ def get_driver(server_type: str) -> DNSDriver:
     return cls()
 ```
 
+### 5.1 Per-group driver homogeneity
+
+Each `DNSServerGroup` is **single-driver**. The control plane rejects mixed BIND + PowerDNS within one group because catalog-zone semantics, AXFR/IXFR shape, and the gate logic for PowerDNS-only features (ALIAS / LUA / online DNSSEC) all assume every member of the group runs the same driver.
+
+Mixed installs work via multiple groups:
+
+- "Internal-zones" group runs PowerDNS (LMDB-backed, fast apply, ALIAS records for apex)
+- "External-zones" group runs BIND9 (battle-tested, RPZ for outbound blocklists, well-known operator surface)
+
+### 5.2 Decision tree — when to pick which driver
+
+| You want... | Pick |
+|---|---|
+| Reference impl, BIND muscle memory, RPZ blocking | **BIND9** |
+| ALIAS records (CNAME at apex) | **PowerDNS** |
+| LUA records (computed responses, geo-routing) | **PowerDNS** |
+| One-toggle online DNSSEC with auto NSEC3 | **PowerDNS** |
+| Manual NSEC3 + KSK / ZSK rollover control | **BIND9** |
+| First-class views / split-horizon (issue #24) | **BIND9** |
+| Catalog zones as **producer** | Either — same wire bytes |
+| Catalog zones as **consumer** | **BIND9** today (PowerDNS waits for 4.10+) |
+| Active Directory-integrated DNS | **Windows DNS** (separate path) |
+
+Both BIND9 and PowerDNS drivers are supported indefinitely. PowerDNS landed in issue #127 as a second driver, not a replacement.
+
 ---
 
-## 5. Error Handling
+## 6. Error Handling
 
 All driver methods must:
 - Raise `DriverConnectionError` for network/auth failures
@@ -323,7 +463,7 @@ The service layer handles retry logic via Celery task retries — drivers are no
 
 ---
 
-## 6. Local Config Cache (DNS Agent)
+## 7. Local Config Cache (DNS Agent)
 
 Same agent caching model as DHCP (see DHCP spec). For DNS:
 
@@ -336,4 +476,9 @@ Same agent caching model as DHCP (see DHCP spec). For DNS:
 - Zone files on local disk ARE the cache — BIND9 serves from them natively
 - Agent tracks which zone file versions were last pushed by SpatiumDDI
 - On reconnect: compare SpatiumDDI DB serial vs. zone file serial; apply missing changes
+
+### PowerDNS Cache
+- LMDB file at `/var/lib/powerdns/pdns.lmdb` IS the cache — `pdns_server` serves from it natively
+- Agent tracks the last-applied `ConfigBundle` ETag in `/var/lib/spatium-dns-agent/state.json`
+- On reconnect: long-poll picks up any new ETag, the agent reconciles by GET-ing PowerDNS's current zone list and PATCHing the rrset diff against the new ConfigBundle. Same convergence shape as BIND9.
 
