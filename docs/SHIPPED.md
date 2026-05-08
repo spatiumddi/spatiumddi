@@ -9,6 +9,57 @@ Mirrors CLAUDE.md's three mixed sections:
 
 ## Major roadmap items
 
+- ✅ **PowerDNS authoritative driver — second driver alongside BIND9**
+  ([#127](https://github.com/spatiumddi/spatiumddi/issues/127))
+  — Full second authoritative DNS driver with native REST API +
+  LMDB embedded backend, multi-arch (`linux/amd64` + `linux/arm64`)
+  `ghcr.io/spatiumddi/dns-powerdns` image, agent + supervisor +
+  long-poll integration, frontend driver picker, and per-driver
+  capability gating (ALIAS / LUA / online DNSSEC / catalog zones
+  reject 422 against non-PowerDNS groups). Five phases + two
+  post-test fix waves shipped across 15 commits between
+  2026.05.07 and 2026.05.08:
+
+  | Phase | Commit | What landed |
+  |---|---|---|
+  | 1 | `047fb66` | Driver class, agent driver, container image, multi-arch build matrix |
+  | 2 | `cd6311c` | Frontend driver picker (PowerDNS joins BIND9 + Windows DNS in the dropdown) |
+  | 3a | `559bafa` | ALIAS records (CNAME-at-apex) — `_DRIVER_GATED_RECORD_TYPES` |
+  | 3b | `5f8875f` | LUA records (computed responses — `pickrandom` / `ifportup` / `createReverse` …) |
+  | 3c.1 | `d967556` | DNSSEC online-signing backend (sign/unsign endpoints, agent dispatch via cryptokey API) |
+  | 3c.fe | `f8c5208` | DNSSEC frontend (`DnssecCard`, DS-rrset list with copy-to-clipboard); migration `e7f94b21c8d5` adds `dnssec_ds_records` + `dnssec_synced_at` |
+  | 3d | `c32bf0d` | RFC 9432 catalog zones, **producer-only** (consumer waits for pdns 4.10+) |
+  | 4a | `2e1901c` | Standalone-VM compose plumbing — new `docker-compose.agent-dns-powerdns.yml`; renamed `agent-dns.yml` → `agent-dns-bind9.yml` |
+  | 4b | `494f5d6` | Helm chart per-flavor StatefulSet — `dnsAgents.flavors.powerdns.{repository,tag}`; mount path swaps to `/var/lib/powerdns` for LMDB |
+  | 4c | `be5579d` | Kind-cluster smoke test extension — both bind9 + powerdns flavors install side-by-side; `dig id.server CH TXT` on the powerdns pod |
+  | 4d | `57004e1` | Backup DNSSEC restore advisory — `RestoreOutcomeResponse.warnings[]` flags signed zones whose keys live on the (un-archived) agent LMDB volume |
+  | 4e | `f3a08b5` | Operator Copilot `propose_create_dns_zone` write-tool with `driver_hint` (one of `bind9` / `powerdns` / `windows_dns`) |
+  | 5 | `8c7a7bd` | Docs pass — `DNS_DRIVERS.md` Section 4 chapter, `features/DNS.md` Section 0 driver-choice subsection, `TOPOLOGIES.md` PowerDNS-hybrid + BIND→PowerDNS migration recipe; LUA snippet dropdown; DNSSEC online-signing kind smoke test |
+  | post-test wave 1 | `00e5405` | 8 bugs from a live-test pass: `pdns_server` CLI flag-syntax (`--config-dir=/path` not space-separated); LMDB pre-seed (let pdns init the env on first start); ZSK creation needs explicit `algorithm=ecdsa256`; `PRESIGNED` metadata path removed (REST API rejects the kind for online-signing); DS state-sync handler trailing-dot bug; `enable-lua-records=yes` global flag instead of rejected per-zone metadata; `expand-alias=yes` + upstream resolver; multi-record rrset PATCH GET-merge-PATCH so pool fan-out works. Same drop pinned `docker-compose.dev.yml` build-able services to `image: spatiumddi-<svc>:dev` so `make dev` always builds locally |
+  | post-test wave 2 | `982bc1b` | (a) Server-group RecordsTab record-type colour-coding (shared `RECORD_TYPE_BADGE` map); (b) DNS Pools page deep-links into zone Pools sub-tab via `subtab=pools`; (c) destroy + recreate container restores config cleanly — `DNS_REQUIRE_AGENT_APPROVAL` now actually gates the fingerprint-mismatch lockout, cold-boot reconcile starts pdns + waits for the REST API + propagates errors so the structural_etag doesn't advance on a botched apply; (d) PowerDNS query logs surface in `/logs` end-to-end — `log-dns-queries=yes` + `loglevel=6` rendered when toggled, agent captures pdns stderr, new `pdns_parser`, ingest dispatches by `server.driver` |
+
+  **End-to-end verified** against a fresh `make dev` install with
+  the `dns-powerdns` profile: zone CRUD via API, dig answers for
+  every record type (A/AAAA/CNAME/MX/TXT/SOA), ALIAS at apex
+  resolves through the configured upstream, LUA `pickrandom`
+  rotates correctly, online DNSSEC produces RRSIG-signed answers
+  + 3 DS records (SHA-1/256/384) synced to the control plane,
+  GSLB pool with TCP health-check returns only healthy members
+  (multi-A fan-out works), container destroy + persistent volume
+  wipe + recreate-with-same-PSK re-pushes all zones + records,
+  and query logs flow into the DNS Queries tab within one batch
+  interval (~5 s).
+
+  **Operator-elective tail (deferred — open separate issues if
+  needed):** gpgsql-backend image variant (LMDB stays the
+  default); pdns 4.10+ catalog-zone consumer support (waiting on
+  upstream image bump); bundled-Postgres subchart for the gpgsql
+  variant. Plus a known soft-delete-on-PowerDNS limitation: the
+  soft-delete + trash-purge paths don't enqueue a `record_op` for
+  PowerDNS-driver groups (only `?permanent=true` deletes do), so
+  soft-deleted records keep getting served until the operator
+  hard-deletes via the trash UI.
+
 - ✅ **Windows DNS — Path A (RFC 2136, agentless)** — `WindowsDNSDriver`
   in `backend/app/drivers/dns/windows.py`. Record CRUD only (A / AAAA /
   CNAME / MX / TXT / PTR / SRV / NS / TLSA) via dnspython over RFC 2136;
