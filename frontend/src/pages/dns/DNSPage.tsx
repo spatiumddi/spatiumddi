@@ -81,6 +81,14 @@ import {
 
 // ── Shared primitives ─────────────────────────────────────────────────────────
 
+// Record-type badge colours live in ``./recordTypeBadge.ts`` so
+// fast-refresh stays happy (this file exports components + can't
+// also export constants without tripping the lint rule).
+import {
+  RECORD_TYPE_BADGE,
+  RECORD_TYPE_BADGE_FALLBACK,
+} from "./recordTypeBadge";
+
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
 
@@ -2116,8 +2124,29 @@ function ZoneDetailView({
   // Records / Pools sub-tab toggle. Pools live under the same zone but
   // need their own management surface — health-check config, member
   // states, manual enable toggles. Forward zones don't host records,
-  // so the tab strip is hidden there.
-  const [zoneView, setZoneView] = useState<"records" | "pools">("records");
+  // so the tab strip is hidden there. ``subtab=pools`` in the URL
+  // (set by the global DNS Pools page when an operator clicks a row)
+  // pre-selects the Pools tab so the deep-link lands on the right
+  // surface; otherwise default to Records.
+  const [zoneSearchParams, setZoneSearchParams] = useSearchParams();
+  const initialSubtab =
+    zoneSearchParams.get("subtab") === "pools" ? "pools" : "records";
+  const [zoneView, _setZoneView] = useState<"records" | "pools">(initialSubtab);
+  const setZoneView = (v: "records" | "pools") => {
+    _setZoneView(v);
+    // Keep the URL in sync so a refresh / back-navigation lands on
+    // the same tab. ``subtab=records`` is the default state — drop
+    // the param entirely rather than ship every URL with it.
+    setZoneSearchParams(
+      (prev: URLSearchParams) => {
+        const next = new URLSearchParams(prev);
+        if (v === "pools") next.set("subtab", "pools");
+        else next.delete("subtab");
+        return next;
+      },
+      { replace: true },
+    );
+  };
   const { data: poolsForCount = [] } = useQuery({
     queryKey: ["dns-pools", group.id, zone.id],
     queryFn: () => dnsApi.listPools(group.id, zone.id),
@@ -2141,15 +2170,9 @@ function ZoneDetailView({
     return true;
   });
 
-  const typeBadge: Record<string, string> = {
-    A: "bg-blue-500/15 text-blue-600",
-    AAAA: "bg-violet-500/15 text-violet-600",
-    CNAME: "bg-amber-500/15 text-amber-600",
-    MX: "bg-emerald-500/15 text-emerald-600",
-    TXT: "bg-muted text-muted-foreground",
-    NS: "bg-orange-500/15 text-orange-600",
-    PTR: "bg-cyan-500/15 text-cyan-600",
-  };
+  // Reuse the shared module-level RECORD_TYPE_BADGE map so the
+  // server-group records view and this zone-level view colour
+  // record types identically.
 
   return (
     <div className="flex flex-col h-full">
@@ -2635,7 +2658,7 @@ function ZoneDetailView({
                           </td>
                           <td className="py-1.5">
                             <span
-                              className={`inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium ${typeBadge[r.record_type] ?? "bg-muted text-muted-foreground"}`}
+                              className={`inline-flex items-center rounded px-1.5 py-0.5 text-xs font-medium ${RECORD_TYPE_BADGE[r.record_type] ?? RECORD_TYPE_BADGE_FALLBACK}`}
                             >
                               {r.record_type}
                             </span>
@@ -4760,7 +4783,9 @@ function RecordsTab({
                       </button>
                     </td>
                     <td className="px-4 py-2">
-                      <span className="inline-flex items-center rounded bg-muted px-1.5 py-0.5 text-[10px] font-medium">
+                      <span
+                        className={`inline-flex items-center rounded px-1.5 py-0.5 text-[10px] font-medium ${RECORD_TYPE_BADGE[rec.record_type] ?? RECORD_TYPE_BADGE_FALLBACK}`}
+                      >
                         {rec.record_type}
                       </span>
                     </td>

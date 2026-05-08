@@ -68,6 +68,98 @@ visibility.
   pipeline adds a parallel ``build-dns-powerdns`` job alongside
   the existing ``build-dns`` (BIND9) so every tag publishes both
   images with ``:<version>`` and ``:latest`` tags.
+- **PowerDNS — Phase 5+ second wave: query logs, recreate-from-zero,
+  pool-tab deep-link, group-record colours (\#127).** Operator
+  testing of the live install surfaced four operator-visible gaps;
+  all closed in this drop.
+
+  1. **Server-group records view: record-type badges weren't
+     colour-coded.** Per-zone view used a local ``typeBadge`` map;
+     the group-level Records tab fell back to a plain grey muted
+     badge for every type. Hoisted ``RECORD_TYPE_BADGE`` into a
+     dedicated ``frontend/src/pages/dns/recordTypeBadge.ts`` module
+     (separate file so the component-only fast-refresh rule stays
+     happy) and rewired both consumers. Colours match across the
+     two surfaces: A=blue, AAAA=violet, CNAME=amber, ALIAS=fuchsia,
+     LUA=rose, MX=emerald, NS=orange, PTR=cyan, SRV=teal, SOA=stone.
+  2. **DNS Pools click → zone-pools sub-tab.** ``DNSPoolsPage``
+     navigation appended ``&subtab=pools`` to the deep-link target
+     (``/dns?group=…&zone=…&subtab=pools``); ``ZoneDetailView``
+     reads it on mount via ``useSearchParams`` and pre-selects the
+     Pools sub-tab instead of defaulting to Records. The setter
+     keeps the URL in sync on tab toggle so refresh / back-nav
+     lands on the same surface.
+  3. **PowerDNS container destroy + recreate now restores config
+     cleanly.** Two real bugs blocked the destroy-then-recreate
+     workflow operators expect to be safe:
+     - The DNS register endpoint set ``pending_approval=True`` on
+       *every* fingerprint mismatch, ignoring the
+       ``DNS_REQUIRE_AGENT_APPROVAL`` env gate. A wiped agent
+       volume legitimately produces a new fingerprint, but the
+       agent already authenticates with the bootstrap PSK, so the
+       lockout was hostile to the legitimate redeploy case. Now
+       gated on the env flag (default false — same shape DHCP
+       has).
+     - Cold-boot ordering raced: the agent's ``start_daemon``
+       deferred (no pdns.conf yet), the sync loop rendered
+       pdns.conf and immediately tried to PATCH zones via REST,
+       got Connection refused, and silently swallowed the error
+       while still advancing ``_current_structural_etag``. Next
+       sync saw matching etag and skipped — leaving zero zones in
+       the freshly-wiped LMDB. Fixed by kicking ``start_daemon``
+       inside ``swap_and_reload`` after the conf lands, polling
+       the local REST API until it answers (10s budget), and
+       letting ``_reconcile_zones`` failure propagate so the
+       structural_etag doesn't advance on a botched apply.
+  4. **PowerDNS query logs surface in the Logs UI.** End-to-end
+     query log shipping for the second authoritative driver,
+     mirroring the BIND9 flow under the same
+     ``DNSServerOptions.query_log_enabled`` gate:
+     - Agent renders ``log-dns-queries=yes``,
+       ``log-dns-details=yes``, and bumps ``loglevel`` to 6 (Info,
+       the threshold pdns 4.9 needs to actually emit query lines)
+       when the operator toggles query logging on.
+     - ``start_daemon`` redirects ``pdns_server`` stderr into
+       ``/var/lib/spatium-dns-agent/pdns.log`` (writable as the
+       unprivileged ``spatium`` user; ``/var/log/pdns`` would have
+       needed a root-owned mkdir).
+     - ``QueryLogShipper`` now spawns for the ``powerdns`` driver
+       (previously gated to ``bind9`` only), tails the captured
+       stderr file, and POSTs batches to
+       ``/api/v1/dns/agents/query-log-entries`` like its BIND9
+       sibling.
+     - New ``app.services.logs.pdns_parser`` parses pdns's
+       ``May 08 02:11:22 Remote 192.0.2.5 wants
+       'qname|qtype'`` shape into the shared
+       :class:`ParsedQueryLine` dataclass. The optional ``:port``
+       suffix (omitted by pdns 4.9 in the basic log format) and
+       the bracketed-IPv6 form are both accepted.
+     - The query-log ingest endpoint dispatches by
+       ``server.driver`` so PowerDNS lines land via the new parser
+       and BIND9 lines stay on the existing one — same downstream
+       storage row shape.
+     - ``DNS_AGENT_DRIVERS`` in ``logs/router.py`` widens from
+       ``{"bind9"}`` to ``{"bind9", "powerdns"}`` so PowerDNS
+       servers appear in the Logs source picker. ``options_block``
+       in the agent config bundle now ships
+       ``query_log_enabled`` (it was being computed for the BIND9
+       template but never propagated through the bundle, so toggling
+       the UI knob never reached the agent).
+     - Bonus cleanup: removed the dead per-zone
+       ``ENABLE-LUA-RECORDS`` metadata PUT from the bulk-reconcile
+       path — it was rejected as "Unsupported metadata kind" by
+       pdns 4.9's API filter, generating one warning per
+       LUA-bearing zone on every structural reload. Global
+       ``enable-lua-records=yes`` in pdns.conf already covers the
+       feature.
+
+  Tested end-to-end: destroy-and-recreate against the same PSK
+  re-pushes 9 rrsets across pdnstest.local + serves dig answers
+  for A/AAAA/CNAME/MX/TXT/ALIAS/LUA/pool. With query logging
+  enabled, ``dig www.example.com`` flows through to the
+  ``/logs/dns-queries`` endpoint within one batch interval (~5
+  seconds default).
+
 - **PowerDNS — Phase 5+ live-test bug fixes (\#127).** End-to-end
   testing of the PowerDNS driver against a fresh local install
   surfaced eight real bugs that the unit tests didn't cover. All

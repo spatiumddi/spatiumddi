@@ -44,7 +44,7 @@ from app.models.logs import DHCPLogEntry, DNSQueryLogEntry
 # ``AGENTLESS_DRIVERS`` (Windows over WinRM) because the log-pull
 # transport is different — agent-driven sources push log lines to the
 # control plane on a tail thread, agentless drivers pull on demand.
-DNS_AGENT_DRIVERS: frozenset[str] = frozenset({"bind9"})
+DNS_AGENT_DRIVERS: frozenset[str] = frozenset({"bind9", "powerdns"})
 DHCP_AGENT_DRIVERS: frozenset[str] = frozenset({"kea"})
 
 logger = structlog.get_logger(__name__)

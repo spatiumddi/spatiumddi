@@ -31,6 +31,7 @@ import secrets
 import shutil
 import signal
 import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
@@ -199,10 +200,31 @@ class PowerDNSDriver(DriverBase):
 
         api_key = self._load_or_generate_api_key()
         opts = bundle.get("options", {}) or {}
+        # ``query_log_enabled`` toggles ``log-dns-queries=yes`` in the
+        # rendered pdns.conf so the daemon emits one stderr line per
+        # incoming query. The agent's ``QueryLogShipper`` thread tails
+        # the captured stderr file and ships parsed lines to the
+        # control plane (matching the BIND9 flow under the same
+        # ``DNSServerOptions.query_log_enabled`` gate).
+        query_log_enabled = bool(opts.get("query_log_enabled", False))
+        # PowerDNS gates ``log-dns-queries`` output at ``loglevel=6``
+        # (Info) — at the default 4 (Warning) the lines are filtered
+        # out before they reach stderr. Bump to 6 only when query
+        # logging is enabled so quiet operators don't get noisy logs
+        # for free; otherwise stick with the configured level (or 4
+        # default) so startup banners + errors still show through.
         log_level = int(opts.get("log_level", 4))
+        if query_log_enabled and log_level < 6:
+            log_level = 6
 
         conf_path = new_dir / "pdns.conf"
-        conf_path.write_text(self._render_conf(api_key=api_key, log_level=log_level))
+        conf_path.write_text(
+            self._render_conf(
+                api_key=api_key,
+                log_level=log_level,
+                query_log_enabled=query_log_enabled,
+            )
+        )
 
         # Stash the desired-state JSON for the API reconciler. The
         # supervisor calls ``apply_config`` (default impl) which calls
@@ -311,11 +333,15 @@ class PowerDNSDriver(DriverBase):
     def swap_and_reload(self) -> None:
         """Promote the new render into place and reconcile via REST.
 
-        The reconcile loop only runs once we've confirmed the daemon
-        is up — at first boot the supervisor calls ``start_daemon``
-        before the first ``apply_config``, but if the daemon crashed
-        between renders the API will be unreachable and the reconcile
-        is a soft no-op (the next bundle will retry).
+        Cold-boot ordering: at first boot the supervisor calls
+        ``start_daemon`` BEFORE ``apply_config`` runs, so pdns.conf
+        doesn't exist yet and the daemon-start no-ops with
+        ``pdns_conf_missing_startup_deferred``. Once we render the
+        config here, kick the daemon explicitly + wait briefly for
+        the REST API to come up before reconciling — otherwise the
+        first PATCH dies on Connection refused, the reconcile silently
+        gives up, and the structural_etag advances so the sync loop
+        never retries.
         """
         new_dir = self.state_dir / "rendered.new"
         current = self.state_dir / "rendered"
@@ -325,6 +351,15 @@ class PowerDNSDriver(DriverBase):
                 shutil.rmtree(backup)
             current.rename(backup)
         new_dir.rename(current)
+
+        # Cold-boot fix: kick start_daemon now that pdns.conf exists.
+        # ``daemon_running`` is the simplest "is pdns alive?" probe.
+        # On warm reload the daemon is already up and start_daemon's
+        # internal guard makes this a no-op.
+        if not self.daemon_running():
+            log.info("powerdns_daemon_starting_after_first_render")
+            self.start_daemon()
+            self._wait_for_api_up()
 
         api_key = self._load_or_generate_api_key()
         zones_path = current / "zones.json"
@@ -337,14 +372,37 @@ class PowerDNSDriver(DriverBase):
             log.error("powerdns_zones_payload_unreadable", error=str(exc))
             return
 
-        try:
-            self._reconcile_zones(api_key, payload)
-        except httpx.HTTPError as exc:
-            # Soft fail — the daemon may still be coming up at first
-            # boot. The supervisor's tick will keep the agent alive
-            # and the next config sync (or the heartbeat reconcile)
-            # will retry.
-            log.warning("powerdns_reconcile_http_error", error=str(exc))
+        # Let HTTPError propagate — the sync loop catches the
+        # exception, logs ``sync_apply_failed``, and crucially does
+        # NOT advance ``_current_structural_etag``, so the next
+        # bundle (or the next 304 retry) re-runs the apply. Silent
+        # failure here used to lose every record on cold-boot when
+        # the timing race fired.
+        self._reconcile_zones(api_key, payload)
+
+    def _wait_for_api_up(self, *, timeout_s: float = 10.0) -> None:
+        """Poll the local PowerDNS REST API until it answers (or
+        we exceed ``timeout_s``). Used after ``start_daemon`` to
+        avoid racing the daemon's UDP/53 + HTTP/8081 bring-up
+        before the first reconcile. Best-effort: a still-down API
+        after the timeout falls through to the reconcile attempt
+        which then surfaces the real error to the sync loop.
+        """
+        api_key = self._load_or_generate_api_key()
+        deadline = time.monotonic() + timeout_s
+        with httpx.Client(timeout=1.0) as client:
+            while time.monotonic() < deadline:
+                try:
+                    resp = client.get(
+                        f"{_PDNS_API_BASE}/zones",
+                        headers={"X-API-Key": api_key},
+                    )
+                    if resp.status_code < 500:
+                        return
+                except httpx.HTTPError:
+                    pass
+                time.sleep(0.2)
+        log.warning("powerdns_api_wait_timeout", timeout_s=timeout_s)
 
     # ── Record ops (REST PATCH against loopback API) ───────────────────────
 
@@ -646,11 +704,26 @@ class PowerDNSDriver(DriverBase):
         if not shutil.which("pdns_server"):
             log.error("pdns_server_binary_missing")
             return
-        # ``--daemon=no`` + foreground; pdns logs to stderr, captured
-        # by the container runtime same as named with ``-g``.
+        # ``--daemon=no`` + foreground; pdns logs to stderr.
         # All flags use ``--name=value`` form — pdns_server rejects
         # space-separated args with "perhaps a '--setting=123'
         # statement missed the '='?".
+        #
+        # We redirect pdns_server stderr into a file the agent's
+        # ``QueryLogShipper`` thread can tail, gated on
+        # ``log-dns-queries=yes`` being set in pdns.conf. The file
+        # lives inside the agent's own state dir
+        # (``/var/lib/spatium-dns-agent/pdns.log``) — the ``spatium``
+        # user owns that path, which avoids the permission denied
+        # we'd hit trying to write to ``/var/log/pdns/`` (owned by
+        # root inside the container). The supervisor's
+        # ``QueryLogShipper`` is configured against the same path
+        # in ``supervisor.run``.
+        log_path = self.state_dir / "pdns.log"
+        # Open append-mode so log rotates are non-destructive and the
+        # tail can resume across daemon restarts (the shipper handles
+        # inode-change rotation separately).
+        log_fh = log_path.open("ab", buffering=0)
         self.daemon_pid = subprocess.Popen(
             [
                 "pdns_server",
@@ -658,9 +731,18 @@ class PowerDNSDriver(DriverBase):
                 "--guardian=no",
                 f"--config-dir={current}",
                 "--config-name=",
-            ]
+            ],
+            stdout=log_fh,
+            stderr=subprocess.STDOUT,
         ).pid
-        log.info("pdns_server_started", pid=self.daemon_pid)
+        # Track the path so a future health-check / observability
+        # surface can find it without re-deriving.
+        self._daemon_log_path = log_path
+        log.info(
+            "pdns_server_started",
+            pid=self.daemon_pid,
+            log_path=str(log_path),
+        )
 
     def daemon_running(self) -> bool:
         if self.daemon_pid is None:
@@ -696,11 +778,18 @@ class PowerDNSDriver(DriverBase):
             pass
         return key
 
-    def _render_conf(self, *, api_key: str, log_level: int) -> str:
+    def _render_conf(
+        self,
+        *,
+        api_key: str,
+        log_level: int,
+        query_log_enabled: bool = False,
+    ) -> str:
         # Mirrors backend/app/drivers/dns/powerdns.py::render_pdns_conf.
         # Agent and control plane render the same shape; the agent
         # owns the API key while the control plane sees only the
         # placeholder.
+        log_queries_value = "yes" if query_log_enabled else "no"
         return "\n".join(
             [
                 "# pdns.conf — generated by SpatiumDDI DNS agent",
@@ -723,8 +812,13 @@ class PowerDNSDriver(DriverBase):
                 "webserver-allow-from=127.0.0.1,::1",
                 "",
                 f"loglevel={log_level}",
-                "log-dns-details=no",
-                "log-dns-queries=no",
+                # ``log-dns-details`` adds the question + answer detail
+                # we need to parse client_ip / qname / qtype out of the
+                # log; ``log-dns-queries`` is the toggle that emits one
+                # line per incoming query. Both gate on the operator-
+                # facing ``DNSServerOptions.query_log_enabled`` flag.
+                f"log-dns-details={log_queries_value}",
+                f"log-dns-queries={log_queries_value}",
                 "",
                 # ALIAS-record resolution requires both ``expand-alias=yes``
                 # and a ``resolver=`` upstream. PowerDNS Authoritative
@@ -825,35 +919,15 @@ class PowerDNSDriver(DriverBase):
                         rrset_count=len(rrsets),
                     )
 
-                # Per-zone LUA-records gate (Phase 3b). PowerDNS only
-                # evaluates LUA records at query time when the zone has
-                # ``ENABLE-LUA-RECORDS`` metadata set; otherwise the
-                # snippet is served as a literal string. Set the
-                # metadata after the zone exists so the PUT lands. If
-                # the zone has no LUA records right now we still don't
-                # touch the metadata (idempotent — a no-op if
-                # already-set; nothing breaks if pre-existing).
-                has_lua = any(
-                    rs.get("type", "").upper() == "LUA"
-                    for rs in zone_payload.get("rrsets") or []
-                )
-                if has_lua:
-                    meta_resp = client.put(
-                        f"{_PDNS_API_BASE}/zones/{zone_name}/metadata/"
-                        "ENABLE-LUA-RECORDS",
-                        headers=headers,
-                        json={
-                            "kind": "ENABLE-LUA-RECORDS",
-                            "metadata": ["1"],
-                        },
-                    )
-                    if meta_resp.status_code >= 400:
-                        log.warning(
-                            "powerdns_lua_metadata_failed",
-                            zone=zone_name,
-                            status=meta_resp.status_code,
-                            body=meta_resp.text[:200],
-                        )
+                # LUA records are enabled globally via
+                # ``enable-lua-records=yes`` in pdns.conf (see
+                # ``_render_conf``). Earlier code attempted a per-zone
+                # ``ENABLE-LUA-RECORDS`` metadata PUT here, but pdns
+                # 4.9 rejects that key via ``isValidMetadataKind`` as
+                # "Unsupported metadata kind" — which spammed a
+                # ``powerdns_lua_metadata_failed`` warning on every
+                # bulk reconcile of a LUA-bearing zone. The global
+                # knob makes the per-zone PUT unnecessary.
 
     # ── Reload (compatibility with bind9 daemon-pid signal pattern) ────────
 

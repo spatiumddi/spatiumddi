@@ -190,6 +190,12 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
         "dnssec_validation": getattr(opts, "dnssec_validation", "auto") if opts else "auto",
         "allow_query": getattr(opts, "allow_query", ["any"]) if opts else ["any"],
         "allow_transfer": getattr(opts, "allow_transfer", ["none"]) if opts else ["none"],
+        # Query logging — surfaced to BIND9's named.conf via template
+        # render and to PowerDNS's pdns.conf via the agent's
+        # ``_render_conf``. Keep ``query_log_enabled`` in the
+        # structural fingerprint so toggling it in the UI reliably
+        # triggers a daemon reload.
+        "query_log_enabled": bool(getattr(opts, "query_log_enabled", False)) if opts else False,
     }
     views_block = [
         {"id": str(v.id), "name": v.name, "match_clients": getattr(v, "match_clients", [])}

@@ -52,10 +52,15 @@ def run(cfg: AgentConfig) -> int:
         threading.Thread(target=heartbeat.run, name="heartbeat", daemon=True),
     ]
 
-    # BIND9-specific telemetry / admin threads. PowerDNS exposes its
-    # own statistics + log surfaces (Phase 2/3 work) — skipping the
-    # BIND-specific threads avoids spurious errors on a PowerDNS
-    # daemon that doesn't speak rndc / statistics-channels XML.
+    # BIND9-specific telemetry / admin threads (statistics-channels
+    # XML, rndc status). PowerDNS exposes its own surfaces via the
+    # REST API instead, so we skip those threads on a PowerDNS
+    # daemon to avoid spurious errors. The query-log shipper is
+    # driver-agnostic — both BIND9 and PowerDNS write a log file
+    # (BIND via ``query_log_file`` directive, PowerDNS via the
+    # agent's stderr-to-file capture in ``start_daemon``); the
+    # control plane dispatches parsing by ``server.driver`` so the
+    # ingest endpoint accepts either format.
     metrics: MetricsPoller | None = None
     query_log: QueryLogShipper | None = None
     rndc_status: RndcStatusPoller | None = None
@@ -69,6 +74,16 @@ def run(cfg: AgentConfig) -> int:
                 threading.Thread(target=query_log.run, name="query-log", daemon=True),
                 threading.Thread(target=rndc_status.run, name="rndc-status", daemon=True),
             ]
+        )
+    elif cfg.driver == "powerdns":
+        # PowerDNS log file is created by ``start_daemon`` redirecting
+        # ``pdns_server`` stderr into the agent's own state dir
+        # (so the unprivileged ``spatium`` user can write it).
+        # Override via ``DNS_QUERY_LOG_PATH`` env var in custom deploys.
+        pdns_log_path = str(cfg.state_dir / "pdns.log")
+        query_log = QueryLogShipper(cfg, token_ref, path=pdns_log_path)
+        threads.append(
+            threading.Thread(target=query_log.run, name="query-log", daemon=True),
         )
 
     for t in threads:

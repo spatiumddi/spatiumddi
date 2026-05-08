@@ -129,7 +129,9 @@ export function DNSPoolsPage() {
                     pool={p}
                     onCheckNow={() => checkNow.mutate(p.id)}
                     onOpen={() =>
-                      nav(`/dns?group=${p.group_id}&zone=${p.zone_id}`)
+                      nav(
+                        `/dns?group=${p.group_id}&zone=${p.zone_id}&subtab=pools`,
+                      )
                     }
                     onDelete={() => setConfirmDelete(p)}
                   />

@@ -191,6 +191,16 @@ async def agent_register(
     )
     has_primary = primary_res.scalar_one_or_none() is not None
 
+    # ``DNS_REQUIRE_AGENT_APPROVAL`` (env / settings) gates whether
+    # fingerprint changes lock the agent out pending operator approval.
+    # Default: false — wiping an agent's persistent volume + redeploying
+    # against the same PSK should "just work" because the agent is
+    # already authenticated by the bootstrap key. Operators running
+    # high-trust environments flip this to true, which engages the
+    # anti-hijack behaviour: any fingerprint mismatch on re-registration
+    # forces a manual approval step before the agent can pull config.
+    require_approval = os.environ.get("DNS_REQUIRE_AGENT_APPROVAL", "false").lower() == "true"
+
     pending_approval = False
     if server is None:
         agent_id = uuid.UUID(body.agent_id) if body.agent_id else uuid.uuid4()
@@ -204,15 +214,24 @@ async def agent_register(
             status="active",
             agent_id=agent_id,
             agent_fingerprint=body.fingerprint,
-            pending_approval=False,
+            pending_approval=require_approval,
             is_primary=not has_primary,
             notes=f"agent v{body.version}" if body.version else "auto-registered",
         )
+        pending_approval = require_approval
         db.add(server)
         await db.flush()
     else:
-        # Anti-hijack: fingerprint change → force approval
-        if server.agent_fingerprint and server.agent_fingerprint != body.fingerprint:
+        # Anti-hijack: fingerprint change → force approval IFF the
+        # operator has opted into the approval gate. Otherwise the
+        # agent's PSK authentication is enough — a wiped agent
+        # volume legitimately produces a new fingerprint and we
+        # don't want to lock the operator out of their own install.
+        if (
+            require_approval
+            and server.agent_fingerprint
+            and server.agent_fingerprint != body.fingerprint
+        ):
             server.pending_approval = True
             pending_approval = True
             logger.warning("dns_agent_fingerprint_mismatch", server_id=str(server.id))
@@ -609,22 +628,42 @@ async def agent_query_log_entries(
     db: DB,
     auth: tuple[DNSServer, dict[str, Any]] = Depends(_auth_agent),
 ) -> dict[str, Any]:
-    """Ingest a batch of BIND9 query log lines from the agent.
+    """Ingest a batch of query-log lines from the agent.
+
+    The ingest is driver-aware: BIND9 lines go through
+    ``bind9_parser`` (RFC 5424 + BIND's ``query: ...`` body), and
+    PowerDNS lines go through ``pdns_parser`` (``Remote ip:port
+    wants 'qname|qtype'`` shape). Both parsers normalise into the
+    shared :class:`ParsedQueryLine` dataclass so this endpoint
+    stays driver-agnostic past the dispatch.
 
     Capped at 1000 lines per request to keep individual transactions
     bounded. Anything beyond is dropped with a count returned so the
     agent can log + alert.
+
+    Lines that the parser couldn't pull a ``qname`` out of are
+    silently dropped — pdns mixes startup banners + status messages
+    into the same stderr stream the agent captures, so non-query
+    lines are expected and stored as noise without filling the DB.
     """
-    from app.services.logs.bind9_parser import parse_query_line  # noqa: PLC0415
+    from app.services.logs import bind9_parser, pdns_parser  # noqa: PLC0415
 
     server, _ = auth
+    if server.driver == "powerdns":
+        parse_fn = pdns_parser.parse_query_line
+    else:
+        # BIND9 (and any future driver until it ships its own parser)
+        # stays on the BIND parser. Mismatched-driver lines just won't
+        # parse and end up as noise rows the operator can ignore.
+        parse_fn = bind9_parser.parse_query_line
+
     capped = body.lines[:1000]
     dropped = max(0, len(body.lines) - len(capped))
     now = datetime.now(UTC)
     inserted = 0
     for raw in capped:
-        parsed = parse_query_line(raw, fallback_ts=now)
-        if parsed is None:
+        parsed = parse_fn(raw, fallback_ts=now)
+        if parsed is None or parsed.qname is None:
             continue
         db.add(
             DNSQueryLogEntry(
