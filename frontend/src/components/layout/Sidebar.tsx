@@ -40,6 +40,7 @@ import {
   LayoutTemplate,
   Wifi,
   Waypoints,
+  Radio,
   Shuffle,
   Trash2,
   Search,
@@ -133,6 +134,12 @@ const networkInfrastructureNav = [
     icon: Cable,
     to: "/network/devices",
     module: "network.device",
+  },
+  {
+    label: "Multicast",
+    icon: Radio,
+    to: "/network/multicast",
+    module: "network.multicast",
   },
   {
     label: "Overlays",

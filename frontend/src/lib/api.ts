@@ -8567,6 +8567,169 @@ export const circuitsApi = {
     api.get<CircuitRead[]>(`/circuits/by-site/${siteId}`).then((r) => r.data),
 };
 
+// ── Multicast groups (issue #126 Phase 1) ─────────────────────────
+//
+// First-class registry of multicast streams + producer/consumer
+// memberships. Phase 1 ships the registry only — Phase 2 adds PIM
+// domain context, Phase 3 adds observed populators (IGMP-snooping +
+// SAP), Phase 4 adds Operator Copilot tools.
+
+export type MulticastMembershipRole =
+  | "producer"
+  | "consumer"
+  | "rendezvous_point";
+export type MulticastMembershipSource =
+  | "manual"
+  | "igmp_snooping"
+  | "sap_announce";
+export type MulticastPortTransport = "udp" | "rtp" | "tcp" | "srt";
+
+export interface MulticastGroupRead {
+  id: string;
+  space_id: string;
+  address: string;
+  name: string;
+  description: string;
+  application: string;
+  rtp_payload_type: number | null;
+  // ``Numeric`` columns are serialised as strings by Pydantic to
+  // preserve precision across the wire — see CircuitRead.monthly_cost.
+  bandwidth_mbps_estimate: string | null;
+  vlan_id: string | null;
+  customer_id: string | null;
+  service_id: string | null;
+  domain_id: string | null;
+  tags: Record<string, unknown>;
+  custom_fields: Record<string, unknown>;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface MulticastGroupListResponse {
+  items: MulticastGroupRead[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface MulticastGroupListQuery {
+  limit?: number;
+  offset?: number;
+  space_id?: string;
+  vlan_id?: string;
+  customer_id?: string;
+  service_id?: string;
+  domain_id?: string;
+  search?: string;
+  tag?: string[];
+}
+
+export interface MulticastGroupCreate {
+  space_id: string;
+  address: string;
+  name: string;
+  description?: string;
+  application?: string;
+  rtp_payload_type?: number | null;
+  bandwidth_mbps_estimate?: string | null;
+  vlan_id?: string | null;
+  customer_id?: string | null;
+  service_id?: string | null;
+  domain_id?: string | null;
+  tags?: Record<string, unknown>;
+  custom_fields?: Record<string, unknown>;
+}
+
+export interface MulticastGroupUpdate {
+  address?: string;
+  name?: string;
+  description?: string;
+  application?: string;
+  rtp_payload_type?: number | null;
+  bandwidth_mbps_estimate?: string | null;
+  vlan_id?: string | null;
+  customer_id?: string | null;
+  service_id?: string | null;
+  domain_id?: string | null;
+  tags?: Record<string, unknown>;
+  custom_fields?: Record<string, unknown>;
+}
+
+export interface MulticastGroupPortRead {
+  id: string;
+  group_id: string;
+  port_start: number;
+  port_end: number | null;
+  transport: string;
+  notes: string;
+}
+
+export interface MulticastGroupPortCreate {
+  port_start: number;
+  port_end?: number | null;
+  transport?: MulticastPortTransport;
+  notes?: string;
+}
+
+export interface MulticastMembershipRead {
+  id: string;
+  group_id: string;
+  ip_address_id: string;
+  role: string;
+  seen_via: string;
+  last_seen_at: string | null;
+  notes: string;
+}
+
+export interface MulticastMembershipCreate {
+  ip_address_id: string;
+  role?: MulticastMembershipRole;
+  seen_via?: MulticastMembershipSource;
+  notes?: string;
+}
+
+export const multicastApi = {
+  list: (params?: MulticastGroupListQuery) =>
+    api
+      .get<MulticastGroupListResponse>("/multicast/groups", { params })
+      .then((r) => r.data),
+  get: (id: string) =>
+    api.get<MulticastGroupRead>(`/multicast/groups/${id}`).then((r) => r.data),
+  create: (data: MulticastGroupCreate) =>
+    api.post<MulticastGroupRead>("/multicast/groups", data).then((r) => r.data),
+  update: (id: string, data: MulticastGroupUpdate) =>
+    api
+      .put<MulticastGroupRead>(`/multicast/groups/${id}`, data)
+      .then((r) => r.data),
+  remove: (id: string) => api.delete(`/multicast/groups/${id}`),
+
+  listPorts: (groupId: string) =>
+    api
+      .get<MulticastGroupPortRead[]>(`/multicast/groups/${groupId}/ports`)
+      .then((r) => r.data),
+  createPort: (groupId: string, data: MulticastGroupPortCreate) =>
+    api
+      .post<MulticastGroupPortRead>(`/multicast/groups/${groupId}/ports`, data)
+      .then((r) => r.data),
+  deletePort: (portId: string) => api.delete(`/multicast/ports/${portId}`),
+
+  listMemberships: (groupId: string) =>
+    api
+      .get<
+        MulticastMembershipRead[]
+      >(`/multicast/groups/${groupId}/memberships`)
+      .then((r) => r.data),
+  createMembership: (groupId: string, data: MulticastMembershipCreate) =>
+    api
+      .post<MulticastMembershipRead>(
+        `/multicast/groups/${groupId}/memberships`,
+        data,
+      )
+      .then((r) => r.data),
+  deleteMembership: (membershipId: string) =>
+    api.delete(`/multicast/memberships/${membershipId}`),
+};
+
 // ── Service catalog (issue #94) ────────────────────────────────────
 //
 // First-class customer-deliverable bundles. ``mpls_l3vpn`` is the
