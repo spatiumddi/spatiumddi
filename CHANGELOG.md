@@ -68,6 +68,78 @@ visibility.
   pipeline adds a parallel ``build-dns-powerdns`` job alongside
   the existing ``build-dns`` (BIND9) so every tag publishes both
   images with ``:<version>`` and ``:latest`` tags.
+- **PowerDNS — Phase 5+ live-test bug fixes (\#127).** End-to-end
+  testing of the PowerDNS driver against a fresh local install
+  surfaced eight real bugs that the unit tests didn't cover. All
+  fixed in this drop:
+  1. **``pdns_server`` CLI syntax** — the agent's ``validate()`` and
+     ``start_daemon()`` paths invoked ``pdns_server --config-dir
+     /path`` (space-separated). PowerDNS rejects this with "perhaps
+     a '--setting=123' statement missed the '='?" and treats the
+     path as a positional. Switched both to ``--config-dir=/path``
+     plus ``--config=check`` for the validate path. The bogus
+     ``--no-config`` flag (also non-existent) is gone.
+  2. **LMDB pre-seeding on first boot** — the entrypoint called
+     ``pdnsutil create-bind-db`` (a BIND-backend SQL helper, not an
+     LMDB initialiser); on failure the ``||`` fallthrough
+     ``touch``-ed a 0-byte file that pdns then refused to mmap
+     (``mdb_env_open failed``). Removed the pre-seed entirely — pdns
+     creates the LMDB env on first start. Added an empty-file cleanup
+     for stale partial volumes from prior bad starts.
+  3. **DNSSEC ZSK creation** — the agent POSTed ``{"keytype":"zsk"}``
+     without ``algorithm``; pdns 4.9's default-picker resolved to
+     algorithm -1 (Unallocated) and rejected with "Creating an
+     algorithm -1 ... key requires the size (in bits) to be passed."
+     Pinned both KSK + ZSK to ``algorithm: ecdsa256`` (algo 13,
+     RFC 6605) — the current online-signing default per pdns docs.
+  4. **DNSSEC ``PRESIGNED`` metadata** — the agent set this on every
+     sign + cleared on unsign. PRESIGNED is for *externally-signed*
+     zones (operator runs ``dnssec-signzone`` offline + loads the
+     output); for online-signing pdns derives signing intent from
+     cryptokey presence, and the API filter rejects the kind via
+     ``isValidMetadataKind``. Removed both calls + the helper.
+  5. **DNSSEC DS-record state sync** — the control-plane handler
+     stripped trailing dots from incoming zone names but queried
+     ``DNSZone`` with the stripped form, while the DB stores zone
+     names *with* the trailing dot. The IN-clause never matched, so
+     every ``POST /dns/agents/dnssec-state`` was a 200-OK no-op and
+     ``dnssec_ds_records`` stayed empty in the operator UI. Fixed
+     by querying both forms.
+  6. **LUA records — global flag instead of per-zone metadata** —
+     the agent's per-record path tried to PUT
+     ``ENABLE-LUA-RECORDS`` zone metadata via the REST API; pdns
+     4.9 rejects with "Unsupported metadata kind". Replaced with the
+     global ``enable-lua-records=yes`` knob in ``pdns.conf``, which
+     is portable across versions and zero-cost for non-LUA zones.
+  7. **ALIAS records didn't resolve** — ``pdns.conf`` had
+     ``expand-alias=no`` hardcoded. PowerDNS Authoritative needs
+     both ``expand-alias=yes`` and a ``resolver=`` upstream to
+     synthesise A/AAAA at query time from an ALIAS rrset. Flipped
+     to ``expand-alias=yes`` + ``resolver=1.1.1.1,8.8.8.8`` for
+     out-of-the-box lab testing.
+  8. **Multi-record rrset PATCH (the bug that broke GSLB pools)** —
+     the per-record ``apply_record_op`` PATCH used ``changetype:
+     REPLACE`` with the single record as the entire rrset. Two
+     consecutive ``create www A`` calls collided — the second
+     overwrote the first. This silently broke pool fan-out: a
+     two-healthy-member pool only ever served the most recently
+     added IP. Fixed with a GET-merge-PATCH dance: read the current
+     rrset, splice the new content in (or out for delete), and
+     PATCH the merged set back. Pool dig now correctly returns the
+     full set of healthy members.
+  Same drop also pinned every ``docker-compose.dev.yml`` build-able
+  service to ``image: spatiumddi-<svc>:dev`` so ``make dev`` always
+  builds locally and never silently pulls the registry copy that
+  prod's compose declares — a source of half-mixed installs the
+  user spotted while testing. ``make up`` (prod) still tags as
+  ``ghcr.io/spatiumddi/...:latest`` for the release pipeline.
+
+  Known follow-up: soft-deleted DNS records on PowerDNS-driver
+  groups don't propagate to the daemon (only ``?permanent=true``
+  deletes enqueue a record op). The "wait until next render" docstring
+  on the soft-delete path assumes BIND9 zone-file rendering — for the
+  REST-driven PowerDNS path the agent never sees the disappearance.
+  Tracked separately; Phase 5+ tail.
 - **PowerDNS Phase 5 — operator polish + docs pass (\#127).** Closes
   the documentation surface around the second authoritative driver.
   ``docs/drivers/DNS_DRIVERS.md`` grows a full Section 4 PowerDNS

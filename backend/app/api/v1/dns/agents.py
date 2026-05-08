@@ -507,8 +507,20 @@ async def agent_dnssec_state(
     if not body.zones:
         return {"updated": 0}
 
-    names = [e.zone_name.rstrip(".") for e in body.zones]
-    res = await db.execute(select(DNSZone).where(DNSZone.name.in_(names)))
+    # DNSZone.name is stored *with* the trailing dot in the DB
+    # (per ZoneCreate.ensure_trailing_dot validator). The agent
+    # ships fully-qualified names that already carry the dot; we
+    # build both forms in the IN-clause so the lookup matches
+    # regardless of whether the agent normalised before sending,
+    # then key the dict by the canonical (trailing-dot) form.
+    name_set: set[str] = set()
+    for e in body.zones:
+        n = e.zone_name
+        name_set.add(n)
+        name_set.add(n.rstrip("."))
+        if not n.endswith("."):
+            name_set.add(n + ".")
+    res = await db.execute(select(DNSZone).where(DNSZone.name.in_(name_set)))
     zones_by_name: dict[str, DNSZone] = {z.name.rstrip("."): z for z in res.scalars().all()}
 
     for entry in body.zones:

@@ -56,7 +56,13 @@ services:
       retries: 5
 
   # ── API Backend ─────────────────────────────────────────────────────────────
+  # ``image:`` is set to a non-registry tag in every dev override so
+  # ``docker compose -f prod -f dev up`` always builds locally and never
+  # silently pulls the registry copy of ``ghcr.io/spatiumddi/...:latest``
+  # the prod compose declares. ``make build`` (prod-only) still tags as
+  # ``ghcr.io/spatiumddi/...:latest`` for the release pipeline.
   api:
+    image: spatiumddi-api:dev
     build:
       context: ./backend
       dockerfile: Dockerfile
@@ -102,6 +108,7 @@ services:
 
   # ── Celery Worker ───────────────────────────────────────────────────────────
   worker:
+    image: spatiumddi-worker:dev
     build:
       context: ./backend
       dockerfile: Dockerfile
@@ -144,6 +151,7 @@ services:
 
   # ── Celery Beat (Scheduler) ─────────────────────────────────────────────────
   beat:
+    image: spatiumddi-beat:dev
     build:
       context: ./backend
       dockerfile: Dockerfile
@@ -170,6 +178,7 @@ services:
 
   # ── Frontend (nginx + Vite build) ───────────────────────────────────────────
   frontend:
+    image: spatiumddi-frontend:dev
     build:
       context: ./frontend
       dockerfile: Dockerfile
@@ -183,6 +192,7 @@ services:
 
   # ── Migrations (runs once at startup) ──────────────────────────────────────
   migrate:
+    image: spatiumddi-migrate:dev
     build:
       context: ./backend
       dockerfile: Dockerfile
@@ -203,6 +213,7 @@ services:
   # build. ``dns-powerdns`` opts into the second authoritative driver.
   dns-bind9:
     profiles: ["dns", "dns-bind9"]
+    image: spatiumddi-dns-bind9:dev
     build:
       context: .
       dockerfile: agent/dns/images/bind9/Dockerfile
@@ -235,6 +246,7 @@ services:
   # PowerDNS-only feature gates on it).
   dns-powerdns:
     profiles: ["dns-powerdns"]
+    image: spatiumddi-dns-powerdns:dev
     build:
       context: .
       dockerfile: agent/dns/images/powerdns/Dockerfile
@@ -270,6 +282,7 @@ services:
   # images.
   dhcp-kea:
     profiles: ["dhcp"]
+    image: spatiumddi-dhcp-kea:dev
     build:
       context: .
       dockerfile: agent/dhcp/images/kea/Dockerfile
@@ -334,6 +347,7 @@ services:
   #   secondary_peer_url: http://dhcp-kea-2:8000/
   dhcp-kea-2:
     profiles: ["dhcp-ha"]
+    image: spatiumddi-dhcp-kea-2:dev
     build:
       context: .
       dockerfile: agent/dhcp/images/kea/Dockerfile

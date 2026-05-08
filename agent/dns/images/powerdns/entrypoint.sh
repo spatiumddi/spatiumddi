@@ -19,15 +19,26 @@ if [ ! -f "$API_KEY_FILE" ]; then
 fi
 chown spatium:spatium "$API_KEY_FILE" || true
 
-# Initialise an empty LMDB database on first boot if it isn't there
-# yet. ``pdnsutil create-zone`` would also do this lazily on first
-# zone creation, but pre-creating means the daemon starts cleanly
-# and reports "no zones" rather than "lmdb file missing".
-if [ ! -f /var/lib/powerdns/pdns.lmdb ]; then
-    su-exec spatium:spatium pdnsutil --config-dir=/var/lib/powerdns \
-        create-bind-db /var/lib/powerdns/pdns.lmdb 2>/dev/null \
-        || touch /var/lib/powerdns/pdns.lmdb
-    chown spatium:spatium /var/lib/powerdns/pdns.lmdb || true
+# LMDB backend self-initialises on first ``pdns_server`` start —
+# the daemon mmaps the configured ``lmdb-filename`` (and its sharded
+# siblings ``pdns.lmdb-0`` … ``pdns.lmdb-63`` per ``lmdb-shards``)
+# and creates them with the right env header. We deliberately do
+# NOT pre-create the file: an empty 0-byte ``pdns.lmdb`` is rejected
+# by ``mdb_env_open`` with "STL Exception while filling the zone
+# cache" because LMDB requires a non-empty env header to mmap.
+# ``pdnsutil create-bind-db`` is the wrong helper for this backend
+# (it's the BIND-backend SQL bootstrap; LMDB has no equivalent — the
+# daemon owns the file format on first open).
+#
+# If a stale empty / partial file is left over from a prior bad
+# start, remove it so the next start gets a clean LMDB env. The
+# unconditional cleanup is safe because LMDB pre-creation was never
+# correct — operators with real zone data on this volume already
+# have a properly-sized file that we won't touch (size > 0 means
+# pdns has fully initialised the env, so we leave it alone).
+if [ -f /var/lib/powerdns/pdns.lmdb ] \
+    && [ ! -s /var/lib/powerdns/pdns.lmdb ]; then
+    rm -f /var/lib/powerdns/pdns.lmdb /var/lib/powerdns/pdns.lmdb-lock
 fi
 
 # Supervise: agent process manages pdns_server lifecycle.

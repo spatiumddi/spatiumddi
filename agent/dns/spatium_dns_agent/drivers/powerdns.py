@@ -284,29 +284,28 @@ class PowerDNSDriver(DriverBase):
         if not conf.exists():
             raise RuntimeError("pdns.conf was not written")
         if shutil.which("pdns_server"):
+            # pdns_server uses ``--option=value`` syntax (the binary
+            # rejects space-separated form with "perhaps a
+            # '--setting=123' statement missed the '='?"). ``--config=
+            # check`` parses the config + exits; non-zero means a
+            # parse error in our file. We pass ``--config-name=`` (no
+            # name) so it reads ``pdns.conf`` directly out of the
+            # config-dir rather than expecting a ``pdns-<name>.conf``
+            # variant.
             res = subprocess.run(
                 [
                     "pdns_server",
-                    "--config-dir",
-                    str(new_dir),
-                    "--config-name",
-                    "",
-                    "--no-config",
+                    f"--config-dir={new_dir}",
+                    "--config-name=",
+                    "--config=check",
                 ],
                 capture_output=True,
                 text=True,
                 check=False,
                 timeout=10,
             )
-            # pdns_server with --no-config exits 0 after writing config
-            # to stdout. Non-zero indicates a parse error in our file.
-            if res.returncode not in (0,):
-                stderr = res.stderr.strip()
-                if "unknown option" in stderr.lower():
-                    # Older pdns versions don't support --no-config;
-                    # treat as soft success.
-                    log.warning("pdns_server_no_config_unsupported_skipping")
-                    return
+            if res.returncode != 0:
+                stderr = (res.stderr or res.stdout).strip()
                 raise RuntimeError(f"pdns_server config-check failed: {stderr}")
 
     def swap_and_reload(self) -> None:
@@ -388,36 +387,89 @@ class PowerDNSDriver(DriverBase):
         rtype = rec["type"].upper()
         ttl = rec.get("ttl") or 3600
 
-        if op_kind == "delete":
-            rrset = {
-                "name": name,
-                "type": rtype,
-                "changetype": "DELETE",
-            }
-        else:  # create | update
-            rrset = {
-                "name": name,
-                "type": rtype,
-                "ttl": ttl,
-                "changetype": "REPLACE",
-                "records": [
-                    {
-                        "content": _record_content(rec),
-                        "disabled": False,
-                    }
-                ],
-            }
-
         url = f"{_PDNS_API_BASE}/zones/{zone}"
         headers = {"X-API-Key": api_key, "Content-Type": "application/json"}
-        body = {"rrsets": [rrset]}
+        new_content = _record_content(rec) if op_kind != "delete" else None
+
+        # PowerDNS rrset PATCH semantics: ``REPLACE`` swaps the entire
+        # rrset contents and ``DELETE`` drops it. There is no
+        # ``INSERT`` / ``REMOVE-MEMBER`` granularity. Multiple records
+        # at the same (name, type) — round-robin A pools, multi-MX
+        # priorities, multi-NS apex — therefore require a
+        # GET-merge-PATCH dance: read the current rrset, splice the
+        # new content in (or out), and PATCH the merged set back.
+        # Without this, two consecutive ``create www A`` calls
+        # collide (the second overwrites the first), which broke
+        # GSLB pool fan-out among other things.
         with httpx.Client(timeout=_PDNS_API_TIMEOUT) as client:
+            zone_resp = client.get(url, headers=headers)
+            existing_records: list[dict[str, Any]] = []
+            if zone_resp.status_code == 200:
+                zone_doc = zone_resp.json()
+                for rs in zone_doc.get("rrsets", []) or []:
+                    if rs.get("name") == name and rs.get("type") == rtype:
+                        for rec_entry in rs.get("records") or []:
+                            content = rec_entry.get("content")
+                            if isinstance(content, str):
+                                existing_records.append(
+                                    {
+                                        "content": content,
+                                        "disabled": bool(rec_entry.get("disabled", False)),
+                                    }
+                                )
+                        break
+            # update = delete-the-old-content + add-the-new-content;
+            # we don't know the previous value here so update is
+            # treated as "ensure the new value is present + remove
+            # any duplicate of the same content". A separate explicit
+            # remove for the OLD value would need the upstream op
+            # payload to carry it; today the control plane sends
+            # update as a fresh-value-only payload, so if the operator
+            # *changes* the value we leave the old IP in the rrset
+            # until a delete op fires for the prior content.
+            merged: list[dict[str, Any]] = []
+            if op_kind == "delete":
+                merged = [r for r in existing_records if r["content"] != new_content]
+                if not merged:
+                    rrset: dict[str, Any] = {
+                        "name": name,
+                        "type": rtype,
+                        "changetype": "DELETE",
+                    }
+                else:
+                    rrset = {
+                        "name": name,
+                        "type": rtype,
+                        "ttl": ttl,
+                        "changetype": "REPLACE",
+                        "records": merged,
+                    }
+            else:  # create | update
+                merged = [r for r in existing_records if r["content"] != new_content]
+                merged.append({"content": new_content, "disabled": False})
+                rrset = {
+                    "name": name,
+                    "type": rtype,
+                    "ttl": ttl,
+                    "changetype": "REPLACE",
+                    "records": merged,
+                }
+
+            body = {"rrsets": [rrset]}
             resp = client.patch(url, headers=headers, json=body)
-        if resp.status_code >= 400:
-            raise RuntimeError(
-                f"PowerDNS PATCH {zone}/{name}/{rtype} returned "
-                f"{resp.status_code}: {resp.text[:200]}"
-            )
+            if resp.status_code >= 400:
+                raise RuntimeError(
+                    f"PowerDNS PATCH {zone}/{name}/{rtype} returned "
+                    f"{resp.status_code}: {resp.text[:200]}"
+                )
+        # LUA records: the global ``enable-lua-records=yes`` knob in
+        # pdns.conf (set in ``_render_conf`` above) makes every LUA
+        # rrset live at query time. We deliberately do NOT set the
+        # per-zone ``ENABLE-LUA-RECORDS`` metadata here — pdns 4.9's
+        # REST API rejects that key as "Unsupported metadata kind"
+        # via its ``isValidMetadataKind`` filter, even though the docs
+        # claim it works. The global flag is portable across versions
+        # and zero-cost for non-LUA zones.
         log.info(
             "powerdns_record_op_applied",
             zone=zone,
@@ -447,26 +499,32 @@ class PowerDNSDriver(DriverBase):
                 f"{_PDNS_API_BASE}/zones/{zone}/cryptokeys", headers=headers
             )
             if existing.status_code == 200 and existing.json():
-                # Keys already there — nothing to create. Make sure the
-                # PRESIGNED flag is on and rectify (idempotent). This
+                # Keys already there — nothing to create. Just rectify
+                # (idempotent) so NSEC/NSEC3 chains stay current. This
                 # covers the "operator clicked twice" case + the
                 # "agent restart, redo state" case.
-                self._set_presigned_metadata(client, headers, zone, on=True)
                 self._rectify(client, headers, zone)
                 log.info("powerdns_dnssec_already_signed", zone=zone)
                 return self._extract_ds_records(existing.json())
 
             for kind, key_type in (("ksk", "ksk"), ("zsk", "zsk")):
+                # PowerDNS 4.9 picks a sensible default algorithm for
+                # KSK creation when ``algorithm`` is omitted, but the
+                # ZSK default-picker resolves to algorithm -1
+                # (Unallocated) and the API rejects with "Creating an
+                # algorithm -1 (Unallocated/Reserved) key requires the
+                # size (in bits) to be passed." Pin both keys to
+                # ECDSAP256SHA256 (algorithm 13) — RFC 6605, the
+                # current online-signing default in pdns docs — so the
+                # call is portable across KSK/ZSK iterations.
                 resp = client.post(
                     f"{_PDNS_API_BASE}/zones/{zone}/cryptokeys",
                     headers=headers,
-                    # ``active=true`` so pdns immediately uses the key
-                    # to sign; ``published=true`` so DNSKEY records appear
-                    # in queries (KSK is what the parent zone signs DS for).
                     json={
                         "keytype": key_type,
                         "active": True,
                         "published": True,
+                        "algorithm": "ecdsa256",
                     },
                 )
                 if resp.status_code >= 400:
@@ -475,7 +533,15 @@ class PowerDNSDriver(DriverBase):
                         f"{resp.status_code}: {resp.text[:200]}"
                     )
 
-            self._set_presigned_metadata(client, headers, zone, on=True)
+            # Note: we deliberately do NOT set the ``PRESIGNED`` zone
+            # metadata for online-signing zones. ``PRESIGNED`` is for
+            # zones signed by an external signer (e.g. via
+            # ``dnssec-signzone``) and loaded as already-signed; for
+            # online signing pdns derives signing intent from the
+            # presence of cryptokeys + active/published flags. Setting
+            # it actually trips the API's metadata-kind filter on
+            # pdns 4.9 ("Unsupported metadata kind 'PRESIGNED'"), and
+            # the resulting warning is misleading.
             self._rectify(client, headers, zone)
 
             # Re-fetch after creation so we get the freshly-rendered DS
@@ -538,41 +604,11 @@ class PowerDNSDriver(DriverBase):
                             body=del_resp.text[:200],
                         )
 
-            self._set_presigned_metadata(client, headers, zone, on=False)
+            # Note: PRESIGNED metadata is intentionally NOT touched
+            # here — see _dnssec_sign for the full reason. With keys
+            # gone, pdns is back to serving unsigned answers
+            # automatically.
         log.info("powerdns_dnssec_unsigned", zone=zone)
-
-    def _set_presigned_metadata(
-        self,
-        client: httpx.Client,
-        headers: dict[str, str],
-        zone: str,
-        *,
-        on: bool,
-    ) -> None:
-        """Set or clear ``PRESIGNED`` zone metadata.
-
-        Per the PowerDNS Authoritative Server docs, ``PRESIGNED=1`` tells
-        pdns to expect a fully-signed zone (it won't re-sign on serve).
-        For our online-signing flow we set this so pdns knows it owns
-        the keys + signatures it's serving. Clearing it on unsign is
-        good hygiene, though strictly redundant once the keys are gone.
-        """
-        resp = client.put(
-            f"{_PDNS_API_BASE}/zones/{zone}/metadata/PRESIGNED",
-            headers=headers,
-            json={
-                "kind": "PRESIGNED",
-                "metadata": ["1"] if on else [],
-            },
-        )
-        if resp.status_code >= 400:
-            log.warning(
-                "powerdns_dnssec_presigned_metadata_failed",
-                zone=zone,
-                on=on,
-                status=resp.status_code,
-                body=resp.text[:200],
-            )
 
     def _rectify(
         self, client: httpx.Client, headers: dict[str, str], zone: str
@@ -612,15 +648,16 @@ class PowerDNSDriver(DriverBase):
             return
         # ``--daemon=no`` + foreground; pdns logs to stderr, captured
         # by the container runtime same as named with ``-g``.
+        # All flags use ``--name=value`` form — pdns_server rejects
+        # space-separated args with "perhaps a '--setting=123'
+        # statement missed the '='?".
         self.daemon_pid = subprocess.Popen(
             [
                 "pdns_server",
                 "--daemon=no",
                 "--guardian=no",
-                "--config-dir",
-                str(current),
-                "--config-name",
-                "",
+                f"--config-dir={current}",
+                "--config-name=",
             ]
         ).pid
         log.info("pdns_server_started", pid=self.daemon_pid)
@@ -689,7 +726,24 @@ class PowerDNSDriver(DriverBase):
                 "log-dns-details=no",
                 "log-dns-queries=no",
                 "",
-                "expand-alias=no",
+                # ALIAS-record resolution requires both ``expand-alias=yes``
+                # and a ``resolver=`` upstream. PowerDNS Authoritative
+                # synthesises A/AAAA at query time by recursing through
+                # the configured resolver. Default to a public resolver
+                # so labs work out of the box; operators with split-
+                # horizon needs override via custom config injection.
+                "expand-alias=yes",
+                "resolver=1.1.1.1,8.8.8.8",
+                # LUA records (PowerDNS-only computed responses —
+                # ``pickrandom`` / ``ifportup`` / ``createReverse`` etc.)
+                # are GLOBALLY enabled here rather than per-zone via
+                # ENABLE-LUA-RECORDS metadata. The per-zone metadata
+                # path is rejected by the pdns 4.9 REST filter as an
+                # "unsupported kind"; enabling globally is portable
+                # across versions and harmless for non-LUA zones (zones
+                # with zero LUA records simply don't trigger the LUA
+                # engine at query time).
+                "enable-lua-records=yes",
                 "dnsupdate=no",
                 "",
             ]
