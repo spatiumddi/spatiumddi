@@ -236,6 +236,8 @@ further down.
 - ⬜ [**DNS Views — end-to-end split-horizon wiring**](https://github.com/spatiumddi/spatiumddi/issues/24)
 - ⬜ [**ACME embedded client — certs for SpatiumDDI's own services**](https://github.com/spatiumddi/spatiumddi/issues/28)
 - ⬜ [**Cloud DNS driver family — Route 53 / Azure DNS / Cisco DNA**](https://github.com/spatiumddi/spatiumddi/issues/29)
+- ⬜ [**DNS configuration importer — BIND9, PowerDNS, Windows DNS**](https://github.com/spatiumddi/spatiumddi/issues/128)
+- ⬜ [**DHCP configuration importer — ISC DHCP, Kea, Windows DHCP**](https://github.com/spatiumddi/spatiumddi/issues/129)
 
 ### Integration roadmap (⬜ pending)
 
