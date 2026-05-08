@@ -59,6 +59,11 @@ from app.models.ipam import (
 from app.models.kubernetes import KubernetesCluster
 from app.models.logs import DHCPLogEntry, DNSQueryLogEntry
 from app.models.metrics import DHCPMetricSample, DNSMetricSample
+from app.models.multicast import (
+    MulticastGroup,
+    MulticastGroupPort,
+    MulticastMembership,
+)
 from app.models.network import (
     NetworkArpEntry,
     NetworkDevice,
@@ -160,6 +165,9 @@ __all__ = [
     "NetworkArpEntry",
     "NetworkFdbEntry",
     "NetworkNeighbour",
+    "MulticastGroup",
+    "MulticastGroupPort",
+    "MulticastMembership",
     "NmapScan",
     "EventSubscription",
     "EventOutbox",

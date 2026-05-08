@@ -119,6 +119,12 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         group="Network",
         description="VRF records replacing freeform RD/RT text on IPSpace.",
     ),
+    ModuleSpec(
+        id="network.multicast",
+        label="Multicast groups",
+        group="Network",
+        description="Multicast group registry — addresses + producer/consumer memberships for SMPTE 2110 / Dante / NDI / market-data deployments. Niche but high-value when operators need it.",
+    ),
     # AI — operator copilot, gated as a whole.
     ModuleSpec(
         id="ai.copilot",

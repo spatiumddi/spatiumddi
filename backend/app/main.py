@@ -127,6 +127,7 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
             {"action": "admin", "resource_type": "manage_asns"},
             {"action": "admin", "resource_type": "vrf"},
             {"action": "admin", "resource_type": "circuit"},
+            {"action": "admin", "resource_type": "multicast"},
             {"action": "admin", "resource_type": "network_service"},
             {"action": "admin", "resource_type": "overlay_network"},
             {"action": "admin", "resource_type": "routing_policy"},

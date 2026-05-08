@@ -33,6 +33,7 @@ from app.api.v1.ipam.router import router as ipam_router
 from app.api.v1.kubernetes import router as kubernetes_router
 from app.api.v1.logs import logs_router
 from app.api.v1.metrics import router as metrics_router
+from app.api.v1.multicast import router as multicast_router
 from app.api.v1.network import router as network_router
 from app.api.v1.nmap import router as nmap_router
 from app.api.v1.overlays import router as overlays_router
@@ -135,6 +136,12 @@ api_v1_router.include_router(
 )
 api_v1_router.include_router(logs_router, prefix="/logs", tags=["logs"])
 api_v1_router.include_router(metrics_router, prefix="/metrics", tags=["metrics"])
+api_v1_router.include_router(
+    multicast_router,
+    prefix="/multicast",
+    tags=["multicast"],
+    dependencies=[Depends(require_module("network.multicast"))],
+)
 api_v1_router.include_router(
     network_router,
     tags=["network"],
