@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 
 from app.services.logs.bind9_parser import parse_query_line
 from app.services.logs.kea_parser import parse_kea_line
+from app.services.logs.pdns_parser import parse_query_line as parse_pdns_query_line
 
 # ── BIND9 query log ───────────────────────────────────────────────────
 
@@ -164,3 +165,123 @@ def test_kea_uses_fallback_when_no_match() -> None:
     parsed = parse_kea_line(line, fallback_ts=fallback)
     assert parsed is not None
     assert parsed.ts == fallback
+
+
+# ── PowerDNS query log ────────────────────────────────────────────────
+
+
+def test_pdns_v4_with_port() -> None:
+    line = (
+        "May 08 02:11:22 Remote 192.0.2.5:54321 wants 'www.example.com|A', "
+        "do = 0, bufsize = 4096: 1 RR(s)"
+    )
+    parsed = parse_pdns_query_line(line)
+    assert parsed is not None
+    assert parsed.client_ip == "192.0.2.5"
+    assert parsed.client_port == 54321
+    assert parsed.qname == "www.example.com"
+    assert parsed.qtype == "A"
+    assert parsed.qclass == "IN"
+
+
+def test_pdns_v4_no_port() -> None:
+    line = (
+        "May 08 02:11:22 Remote 127.0.0.1 wants 'foo.example.com|AAAA', "
+        "do = 1, bufsize = 4096: packetcache HIT"
+    )
+    parsed = parse_pdns_query_line(line)
+    assert parsed is not None
+    assert parsed.client_ip == "127.0.0.1"
+    assert parsed.client_port is None
+    assert parsed.qname == "foo.example.com"
+    assert parsed.qtype == "AAAA"
+
+
+def test_pdns_v6_bracketed_with_port() -> None:
+    line = (
+        "May 08 02:11:22 Remote [2001:db8::1]:54321 wants 'v6.example|MX', "
+        "do = 0, bufsize = 4096: 2 RR(s)"
+    )
+    parsed = parse_pdns_query_line(line)
+    assert parsed is not None
+    assert parsed.client_ip == "2001:db8::1"
+    assert parsed.client_port == 54321
+    assert parsed.qname == "v6.example"
+    assert parsed.qtype == "MX"
+
+
+def test_pdns_v6_bracketed_no_port() -> None:
+    line = (
+        "May 08 02:11:22 Remote [2001:db8::1] wants 'v6no.example|TXT', "
+        "do = 0, bufsize = 4096: 0 RR(s)"
+    )
+    parsed = parse_pdns_query_line(line)
+    assert parsed is not None
+    assert parsed.client_ip == "2001:db8::1"
+    assert parsed.client_port is None
+
+
+def test_pdns_v6_bare_no_port() -> None:
+    # Some pdns builds emit IPv6 sources without brackets when no
+    # port follows. ``2001:db8::1`` must not be misparsed as
+    # ``2001:db8:`` + port=1.
+    line = (
+        "May 08 02:11:22 Remote 2001:db8::1 wants 'bare-v6.example|TXT', "
+        "do = 0, bufsize = 4096: 0 RR(s)"
+    )
+    parsed = parse_pdns_query_line(line)
+    assert parsed is not None
+    assert parsed.client_ip == "2001:db8::1"
+    assert parsed.client_port is None
+    assert parsed.qname == "bare-v6.example"
+
+
+def test_pdns_chaos_probe_is_dropped() -> None:
+    # CHAOS-class server-id probes are noise — must be dropped at
+    # parse time so they never hit the DB.
+    for qname in ("id.server", "version.bind", "version.server", "hostname.bind"):
+        line = (
+            f"May 08 02:11:22 Remote 127.0.0.1 wants '{qname}|TXT', "
+            "do = 0, bufsize = 4096: 1 RR(s)"
+        )
+        assert parse_pdns_query_line(line) is None, f"expected drop for {qname}"
+
+
+def test_pdns_banner_preserves_raw() -> None:
+    # Non-query line (no ``wants '`` separator) returns a raw-only
+    # ParsedQueryLine so the storage filter can drop it.
+    line = "May 08 02:11:22 [main] Auth-only powerdns server starting"
+    parsed = parse_pdns_query_line(line)
+    assert parsed is not None
+    assert parsed.qname is None
+    assert parsed.client_ip is None
+    assert parsed.raw == line
+
+
+def test_pdns_empty_line_returns_none() -> None:
+    assert parse_pdns_query_line("") is None
+    assert parse_pdns_query_line("   \n") is None
+
+
+def test_pdns_redos_regression_linear_time() -> None:
+    # CodeQL alert #40 (py/polynomial-redos): the previous parser
+    # combined ``[^\]]+``, an alternation fallback, and a lazy
+    # ``[0-9a-fA-F.:]+?`` that ``re.search`` could retry from every
+    # starting position. On adversarial input shaped like
+    # ``Remote [\\\\…\\\\`` the regex engine took O(n²) time.
+    # The new parser splits on the hard `` wants '`` separator and
+    # walks the head with a token split, so a pathological input
+    # is handled in linear time.
+    import time
+
+    adversary = "Remote [" + "\\" * 4000
+    t0 = time.perf_counter()
+    for _ in range(500):
+        parse_pdns_query_line(adversary)
+    elapsed = time.perf_counter() - t0
+    # 500 iterations of a 4 KB line should finish in well under a
+    # second on any reasonable CPU. The pre-fix code took multiple
+    # seconds. Pin a generous bound so this test isn't flaky on
+    # slow CI runners while still catching any future regression
+    # that reintroduces the polynomial backtracking.
+    assert elapsed < 2.0, f"adversarial parse took {elapsed:.2f}s — possible ReDoS regression"

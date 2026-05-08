@@ -44,17 +44,75 @@ _PDNS_TS_RE: Final = re.compile(
     r"^(?P<mon>[A-Za-z]{3})\s+(?P<day>\d{1,2})\s+" r"(?P<h>\d{2}):(?P<m>\d{2}):(?P<s>\d{2})\s+"
 )
 
-# Body: ``Remote <ip>[:<port>] wants '<qname>|<qtype>'``
-# - IPv6 clients are rendered as ``[2001:db8::1]:54321`` (some pdns
-#   builds) or as bare ``2001:db8::1`` (others).
-# - The ``:port`` suffix is omitted by pdns 4.9 in the basic log
-#   format, so it's optional.
-_PDNS_QUERY_RE: Final = re.compile(
-    r"Remote\s+"
-    r"(?:\[(?P<v6>[^\]]+)\]|(?P<v4>[0-9a-fA-F.:]+?))"
-    r"(?::(?P<port>\d+))?"
-    r"\s+wants\s+'(?P<qname>[^|']+)\|(?P<qtype>[^']+)'"
-)
+# Hard separator. pdns emits ``... wants '<qname>|<qtype>'`` on every
+# query line; the literal `` wants '`` substring can't appear inside
+# an IP literal, port number, or any of the free-text bits in the
+# source-IP block, so splitting on it first gives us two halves that
+# each parse independently and at linear cost. The previous one-shot
+# pattern combined a greedy ``[^\]]+``, an alternation fallback, and
+# a lazy ``[0-9a-fA-F.:]+?`` that ``re.search`` could retry from
+# every starting position — polynomial-time backtracking on inputs
+# like ``Remote [\\\\\\\\\\Remote [\\\\\\\\…``. CodeQL ``py/polynomial-
+# redos`` alert #40 was the canary; bind9_parser had the same class of
+# bug fixed in alerts #16 + #18 by the same split-on-hard-separator
+# trick.
+_PDNS_SEP_RE: Final = re.compile(r"\s+wants\s+'", re.IGNORECASE)
+
+# Body — anchored at the start of the right half (i.e. just after
+# the `` wants '`` separator we split on). qname is bounded by RFC
+# 1035 (255 chars max in presentation form); qtype is short ASCII.
+# Anything past the closing quote is discarded.
+_PDNS_BODY_RE: Final = re.compile(r"^(?P<qname>[^|']{1,255})\|(?P<qtype>[A-Za-z0-9\-]{1,16})'")
+
+
+def _parse_pdns_addr_port(token: str) -> tuple[str | None, int | None]:
+    """Split a source-IP token into ``(addr, port)``.
+
+    pdns 4.9 emits the source as one whitespace-delimited token after
+    ``Remote``. Five shapes:
+
+        ``192.0.2.5:54321``        IPv4 with port
+        ``192.0.2.5``              IPv4 no port
+        ``[2001:db8::1]:54321``    bracketed IPv6 with port
+        ``[2001:db8::1]``          bracketed IPv6 no port
+        ``2001:db8::1``            bare IPv6 (any pdns build that
+                                   omits the port)
+
+    Disambiguation is by colon-count + leading-bracket: bracketed
+    forms are unambiguous; for the unbracketed variant a single
+    colon is "address:port", anything else (zero or two-plus
+    colons) is the address itself. Implemented in plain Python
+    rather than regex to avoid the IPv4-port-vs-IPv6-colons
+    ambiguity that even bounded regex alternations can't resolve
+    cleanly. Cost is linear in ``len(token)``.
+    """
+    if not token:
+        return None, None
+    if token.startswith("["):
+        end = token.find("]")
+        if end <= 1:
+            return None, None
+        addr = token[1:end] or None
+        port: int | None = None
+        if end + 1 < len(token) and token[end + 1] == ":":
+            try:
+                port = int(token[end + 2 :])
+            except ValueError:
+                port = None
+        return addr, port
+    n_colons = token.count(":")
+    if n_colons == 0:
+        return token, None
+    if n_colons == 1:
+        addr, _, port_str = token.partition(":")
+        try:
+            return (addr or None), int(port_str)
+        except ValueError:
+            return (token or None), None
+    # >= 2 colons → bare IPv6 with no port (pdns brackets when port
+    # is present).
+    return token, None
+
 
 _MONTH_MAP: Final[dict[str, int]] = {
     m: i + 1
@@ -141,8 +199,13 @@ def parse_query_line(line: str, *, fallback_ts: datetime | None = None) -> Parse
     if ts is None:
         ts = now
 
-    m_q = _PDNS_QUERY_RE.search(rest)
-    if m_q is None:
+    # Split first on the hard `` wants '`` separator. The split is
+    # bounded (maxsplit=1) and the literal substring can't appear in
+    # any of the structured fields, so each side parses at linear
+    # cost — the head with a Python-level token walk, the body with
+    # a small anchored regex.
+    parts = _PDNS_SEP_RE.split(rest, maxsplit=1)
+    if len(parts) != 2:
         # Non-query log line (banner, status, error). Surface the raw
         # text without parsed fields so the storage filter can drop it.
         return ParsedQueryLine(
@@ -156,15 +219,35 @@ def parse_query_line(line: str, *, fallback_ts: datetime | None = None) -> Parse
             view=None,
             raw=line,
         )
+    head, body = parts
 
-    client_ip = m_q.group("v6") or m_q.group("v4")
-    try:
-        client_port: int | None = int(m_q.group("port"))
-    except (TypeError, ValueError):
-        client_port = None
+    # Head: ``[<prefix>] Remote <addr-token>``. Tokenise on whitespace
+    # and pull the token after ``Remote`` — that one token carries
+    # the IP plus optional port. ``str.split`` is linear.
+    head_tokens = head.split()
+    addr_token: str | None = None
+    for i, tok in enumerate(head_tokens):
+        if tok == "Remote" and i + 1 < len(head_tokens):
+            addr_token = head_tokens[i + 1]
+            break
+    client_ip, client_port = _parse_pdns_addr_port(addr_token) if addr_token else (None, None)
 
-    qname = (m_q.group("qname") or "").strip() or None
-    qtype = (m_q.group("qtype") or "").strip().upper() or None
+    m_b = _PDNS_BODY_RE.match(body)
+    if not addr_token or m_b is None:
+        return ParsedQueryLine(
+            ts=ts,
+            client_ip=None,
+            client_port=None,
+            qname=None,
+            qclass=None,
+            qtype=None,
+            flags=None,
+            view=None,
+            raw=line,
+        )
+
+    qname = (m_b.group("qname") or "").strip() or None
+    qtype = (m_b.group("qtype") or "").strip().upper() or None
 
     # Drop CHAOS-class probes — see ``_CHAOS_PROBE_QNAMES`` above.
     if qname and qname.rstrip(".").lower() in _CHAOS_PROBE_QNAMES:
