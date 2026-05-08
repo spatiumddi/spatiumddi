@@ -1,5 +1,6 @@
 import { Sparkles } from "lucide-react";
 import { askAI } from "./askAI";
+import { useAiAvailable } from "./useAiAvailable";
 
 /**
  * Button that opens the Operator Copilot drawer with a context block
@@ -39,6 +40,12 @@ export function AskAIButton({
   iconOnly?: boolean;
   className?: string;
 }) {
+  // Hide entirely when no AI provider is configured + enabled — clicking
+  // would otherwise open the chat drawer onto a "no providers" empty
+  // state. The shared hook is React Query-cached so this costs nothing
+  // beyond the floating CopilotButton's existing fetch.
+  if (!useAiAvailable()) return null;
+
   const sizing = size === "xs" ? "h-3 w-3" : "h-3.5 w-3.5";
   // Mirrors ``HeaderButton`` secondary variant exactly so the button
   // sits at the same visual weight as Edit / Refresh / etc. in a

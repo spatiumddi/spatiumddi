@@ -1,9 +1,8 @@
 import { useEffect, useState } from "react";
-import { useQuery } from "@tanstack/react-query";
 import { Sparkles } from "lucide-react";
-import { aiApi } from "@/lib/api";
 import { CopilotDrawer } from "./CopilotDrawer";
 import { onAskAIRequested } from "./askAI";
+import { useAiAvailable } from "./useAiAvailable";
 
 /**
  * Floating chat button + drawer (issue #90 Wave 3 + Phase 2).
@@ -31,17 +30,7 @@ export function CopilotButton() {
   const [pendingContext, setPendingContext] = useState<string | null>(null);
   const [pendingPrompt, setPendingPrompt] = useState<string | null>(null);
 
-  // Tiny query to gate visibility — fetches the provider list once
-  // every 5 minutes and renders the button only if ≥ 1 enabled.
-  const providersQ = useQuery({
-    queryKey: ["ai-providers", "any-enabled"],
-    queryFn: aiApi.listProviders,
-    staleTime: 5 * 60 * 1000,
-    // Fail silently — non-superadmins can't list providers, but they
-    // can still use the chat. Treat 403 as "we just don't know" and
-    // show the button anyway.
-    retry: false,
-  });
+  const aiAvailable = useAiAvailable();
 
   // ``askAI({ context, prompt })`` from any "Ask AI about this"
   // affordance — or the Cmd-K palette's "Ask AI: <query>" entry —
@@ -62,8 +51,7 @@ export function CopilotButton() {
 
   // Hide when we *know* no providers are enabled. Show optimistically
   // when we couldn't fetch (403) since non-superadmins still get to chat.
-  const enabledCount = providersQ.data?.filter((p) => p.is_enabled).length;
-  if (enabledCount === 0) return null;
+  if (!aiAvailable) return null;
 
   return (
     <>

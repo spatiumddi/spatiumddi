@@ -15,6 +15,7 @@ import { useQuery } from "@tanstack/react-query";
 import { searchApi, type SearchResult } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { askAI } from "@/components/copilot/askAI";
+import { useAiAvailable } from "@/components/copilot/useAiAvailable";
 
 function useDebounce<T>(value: T, delay: number): T {
   const [debounced, setDebounced] = useState(value);
@@ -251,7 +252,8 @@ export function GlobalSearch() {
   // something gives them a deterministic escape hatch — even if the
   // search service didn't match anything, they can hit ↓-Enter to
   // hand the query straight to the Copilot.
-  const askAIVisible = debouncedQuery.length > 0;
+  const aiAvailable = useAiAvailable();
+  const askAIVisible = aiAvailable && debouncedQuery.length > 0;
   const askAIIdx = results.length;
   const totalRows = results.length + (askAIVisible ? 1 : 0);
 
