@@ -5,9 +5,13 @@ set -eu
 : "${CONTROL_PLANE_URL:?CONTROL_PLANE_URL is required}"
 : "${DNS_AGENT_KEY:?DNS_AGENT_KEY is required}"
 
-# Ensure state dir is writable by the agent user
-mkdir -p /var/lib/spatium-dns-agent /var/cache/bind
-chown -R spatium:spatium /var/lib/spatium-dns-agent || true
+# Ensure state dir is writable by the agent user. /var/log/named is
+# the rendered query-log destination; named runs unprivileged as
+# spatium (see start_daemon — no `-u` flag), so the directory needs
+# to be owned by that user before the daemon can open the file. The
+# log file itself is created by named on first query.
+mkdir -p /var/lib/spatium-dns-agent /var/cache/bind /var/log/named
+chown -R spatium:spatium /var/lib/spatium-dns-agent /var/log/named || true
 
 # Agent-controlled rndc credentials. The alpine bind package's
 # /etc/bind/rndc.key lives in a directory `spatium` can't traverse,

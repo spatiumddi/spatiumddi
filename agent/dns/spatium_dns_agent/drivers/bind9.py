@@ -42,7 +42,28 @@ options {{
 statistics-channels {{
     inet 127.0.0.1 port 8053 allow {{ 127.0.0.1; }};
 }};
-{tsig_include}"""
+{logging_block}{tsig_include}"""
+
+# Query-log channel + category block. Path matches the QueryLogShipper
+# default (``/var/log/named/queries.log``) so the shipper can tail the
+# same file the daemon writes — the entrypoint script chowns this
+# directory to the unprivileged ``spatium`` user at boot. Severity +
+# print-* defaults match ``DNSServerOptions``' column defaults; we
+# don't plumb the per-field overrides through the agent yet because
+# the operator-facing UI surfaces the boolean toggle only.
+_QUERY_LOG_BLOCK = """\
+logging {
+    channel queries_channel {
+        file "/var/log/named/queries.log" versions 5 size 50m;
+        severity info;
+        print-category yes;
+        print-severity yes;
+        print-time yes;
+    };
+    category queries { queries_channel; };
+    category query-errors { queries_channel; };
+};
+"""
 
 
 class Bind9Driver(DriverBase):
@@ -97,12 +118,16 @@ class Bind9Driver(DriverBase):
                 f"    response-policy {{ {zones_list}; }} break-dnssec yes;\n"
             )
 
+        logging_block = (
+            _QUERY_LOG_BLOCK if bool(opts.get("query_log_enabled")) else ""
+        )
         conf = NAMED_CONF_SKELETON.format(
             recursion=recursion,
             allow_query=allow_query,
             dnssec=dnssec,
             forwarders=fwd_block,
             response_policy=response_policy_block,
+            logging_block=logging_block,
             tsig_include=tsig_include,
         )
 
@@ -487,11 +512,17 @@ class Bind9Driver(DriverBase):
         if not conf_path.exists():
             log.warning("named_conf_missing_startup_deferred")
             return
-        # -g: foreground, log to stderr. We're already running unprivileged
-        # as 'spatium' (entrypoint dropped privs via su-exec), so don't pass
-        # -u — named would try to setgid() to a different user and fail.
+        # -f (not -g): keep named in the foreground so subprocess.Popen
+        # can track the PID, but honour the user-defined ``logging {}``
+        # block in named.conf. ``-g`` *also* runs in the foreground but
+        # additionally forces every category to stderr regardless of
+        # named.conf — that silently breaks the query-log file channel
+        # we render when ``query_log_enabled=True``. We're already
+        # running unprivileged as ``spatium`` (entrypoint dropped privs
+        # via su-exec), so don't pass ``-u`` — named would try to
+        # setgid() to a different user and fail.
         self.daemon_pid = subprocess.Popen(
-            ["named", "-g", "-c", str(conf_path)]
+            ["named", "-f", "-c", str(conf_path)]
         ).pid
         log.info("named_started", pid=self.daemon_pid)
 

@@ -161,6 +161,22 @@ def _parse_iso_ts(value: str) -> datetime | None:
 
 _MAX_LINE_LEN: Final = 4096
 
+# CHAOS-class server-identification probes (id.server / version.bind /
+# version.server / hostname.bind / authors.bind). Monitoring tools
+# poll these every few seconds against any DNS server they discover —
+# pure noise in the operator-facing /logs UI. Drop at parse time so
+# they don't even hit the DB. Match lower-cased and trailing-dot-
+# stripped so case / FQDN variants ($qname or $qname.) are caught.
+_CHAOS_PROBE_QNAMES: Final[frozenset[str]] = frozenset(
+    {
+        "id.server",
+        "version.bind",
+        "version.server",
+        "hostname.bind",
+        "authors.bind",
+    }
+)
+
 
 def parse_query_line(line: str, *, fallback_ts: datetime | None = None) -> ParsedQueryLine | None:
     """Parse one BIND9 query log line.
@@ -252,11 +268,16 @@ def parse_query_line(line: str, *, fallback_ts: datetime | None = None) -> Parse
     except (TypeError, ValueError):
         client_port = None
 
+    qname = body_m.group("qname") or None
+    # Drop CHAOS-class probes — see ``_CHAOS_PROBE_QNAMES`` above.
+    if qname and qname.rstrip(".").lower() in _CHAOS_PROBE_QNAMES:
+        return None
+
     return ParsedQueryLine(
         ts=ts,
         client_ip=head_m.group("client_ip") or None,
         client_port=client_port,
-        qname=body_m.group("qname") or None,
+        qname=qname,
         qclass=body_m.group("qclass") or None,
         qtype=body_m.group("qtype") or None,
         flags=body_m.group("flags") or None,

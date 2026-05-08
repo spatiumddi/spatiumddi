@@ -65,6 +65,24 @@ _MONTH_MAP: Final[dict[str, int]] = {
 
 _MAX_LINE_LEN: Final = 4096
 
+# CHAOS-class server-identification probes (id.server / version.bind /
+# version.server / hostname.bind / authors.bind). Monitoring tools
+# poll these every few seconds against any DNS server they discover,
+# so an idle homelab daemon's query log is mostly noise from them.
+# We never want them in the operator-facing /logs UI; drop at parse
+# time so they don't even hit the DB. The names are case-insensitive
+# in DNS but PowerDNS preserves whatever the client sent — match
+# lower-cased so a client probing ``ID.SERVER`` is also caught.
+_CHAOS_PROBE_QNAMES: Final[frozenset[str]] = frozenset(
+    {
+        "id.server",
+        "version.bind",
+        "version.server",
+        "hostname.bind",
+        "authors.bind",
+    }
+)
+
 
 def _parse_pdns_ts(
     mon_name: str,
@@ -147,6 +165,10 @@ def parse_query_line(line: str, *, fallback_ts: datetime | None = None) -> Parse
 
     qname = (m_q.group("qname") or "").strip() or None
     qtype = (m_q.group("qtype") or "").strip().upper() or None
+
+    # Drop CHAOS-class probes — see ``_CHAOS_PROBE_QNAMES`` above.
+    if qname and qname.rstrip(".").lower() in _CHAOS_PROBE_QNAMES:
+        return None
 
     return ParsedQueryLine(
         ts=ts,

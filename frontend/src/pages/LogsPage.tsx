@@ -1121,7 +1121,23 @@ function DNSQueriesTab({ sources }: { sources: AgentLogSource[] }) {
         </label>
         <MaxEventsPicker value={maxEvents} onChange={setMaxEvents} />
         <FilterSearch value={q} onChange={setQ} />
-        <div className="ml-auto">
+        <div className="ml-auto flex items-center gap-2">
+          {(q || qtype || clientIp || since) && (
+            <button
+              type="button"
+              onClick={() => {
+                setQ("");
+                setQtype("");
+                setClientIp("");
+                setSince("");
+              }}
+              title="Clear all filters"
+              className="flex items-center gap-1.5 rounded-md border bg-background px-3 py-1.5 text-xs hover:bg-accent/50"
+            >
+              <XCircle className="h-3.5 w-3.5" />
+              Clear
+            </button>
+          )}
           <RefreshButton query={dnsQueriesQuery} enabled={enabled} />
         </div>
       </div>
