@@ -8734,6 +8734,48 @@ export interface MulticastBulkAllocateCommitResponse {
   group_ids: string[];
 }
 
+export type MulticastPIMMode = "sparse" | "dense" | "ssm" | "bidir" | "none";
+
+export interface MulticastDomainRead {
+  id: string;
+  name: string;
+  description: string;
+  pim_mode: string;
+  vrf_id: string | null;
+  rendezvous_point_device_id: string | null;
+  rendezvous_point_address: string | null;
+  ssm_range: string | null;
+  notes: string;
+  tags: Record<string, unknown>;
+  group_count: number;
+  created_at: string;
+  modified_at: string;
+}
+
+export interface MulticastDomainCreate {
+  name: string;
+  description?: string;
+  pim_mode?: MulticastPIMMode;
+  vrf_id?: string | null;
+  rendezvous_point_device_id?: string | null;
+  rendezvous_point_address?: string | null;
+  ssm_range?: string | null;
+  notes?: string;
+  tags?: Record<string, unknown>;
+}
+
+export interface MulticastDomainUpdate {
+  name?: string;
+  description?: string;
+  pim_mode?: MulticastPIMMode;
+  vrf_id?: string | null;
+  rendezvous_point_device_id?: string | null;
+  rendezvous_point_address?: string | null;
+  ssm_range?: string | null;
+  notes?: string;
+  tags?: Record<string, unknown>;
+}
+
 export const multicastApi = {
   list: (params?: MulticastGroupListQuery) =>
     api
@@ -8787,6 +8829,22 @@ export const multicastApi = {
       .then((r) => r.data),
   deleteMembership: (membershipId: string) =>
     api.delete(`/multicast/memberships/${membershipId}`),
+
+  listDomains: () =>
+    api.get<MulticastDomainRead[]>("/multicast/domains").then((r) => r.data),
+  getDomain: (id: string) =>
+    api
+      .get<MulticastDomainRead>(`/multicast/domains/${id}`)
+      .then((r) => r.data),
+  createDomain: (data: MulticastDomainCreate) =>
+    api
+      .post<MulticastDomainRead>("/multicast/domains", data)
+      .then((r) => r.data),
+  updateDomain: (id: string, data: MulticastDomainUpdate) =>
+    api
+      .put<MulticastDomainRead>(`/multicast/domains/${id}`, data)
+      .then((r) => r.data),
+  deleteDomain: (id: string) => api.delete(`/multicast/domains/${id}`),
 
   bulkAllocatePreview: (data: MulticastBulkAllocateRequest) =>
     api

@@ -26,6 +26,7 @@ import { DeviceDetailView } from "@/pages/network/DeviceDetailView";
 import { AsnsPage } from "@/pages/network/AsnsPage";
 import { AsnDetailPage } from "@/pages/network/AsnDetailPage";
 import { CircuitsPage } from "@/pages/network/CircuitsPage";
+import { MulticastDomainsPage } from "@/pages/network/MulticastDomainsPage";
 import { MulticastGroupsPage } from "@/pages/network/MulticastGroupsPage";
 import { CustomersPage } from "@/pages/network/CustomersPage";
 import { OverlaysPage } from "@/pages/network/OverlaysPage";
@@ -109,6 +110,10 @@ export default function App() {
         <Route path="network/circuits" element={<CircuitsPage />} />
         <Route path="network/customers" element={<CustomersPage />} />
         <Route path="network/multicast" element={<MulticastGroupsPage />} />
+        <Route
+          path="network/multicast/domains"
+          element={<MulticastDomainsPage />}
+        />
         <Route path="network/overlays" element={<OverlaysPage />} />
         <Route path="network/overlays/:id" element={<OverlayDetailPage />} />
         <Route path="network/providers" element={<ProvidersPage />} />

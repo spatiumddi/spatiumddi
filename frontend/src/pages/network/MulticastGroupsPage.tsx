@@ -1,6 +1,15 @@
 import { useEffect, useMemo, useState } from "react";
+import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ListPlus, Pencil, Plus, RefreshCw, Trash2, X } from "lucide-react";
+import {
+  ListPlus,
+  Network,
+  Pencil,
+  Plus,
+  RefreshCw,
+  Trash2,
+  X,
+} from "lucide-react";
 import {
   customersApi,
   ipamApi,
@@ -84,6 +93,9 @@ function MulticastGroupModal({
   const [customerId, setCustomerId] = useState<string | null>(
     existing?.customer_id ?? null,
   );
+  const [domainId, setDomainId] = useState<string | null>(
+    existing?.domain_id ?? null,
+  );
 
   const [error, setError] = useState<string | null>(null);
 
@@ -93,6 +105,13 @@ function MulticastGroupModal({
     staleTime: 60_000,
   });
   const customers = customersQ.data?.items ?? [];
+
+  const domainsQ = useQuery({
+    queryKey: ["multicast-domains"],
+    queryFn: () => multicastApi.listDomains(),
+    staleTime: 60_000,
+  });
+  const domains = domainsQ.data ?? [];
 
   const mut = useMutation({
     mutationFn: async () => {
@@ -108,6 +127,7 @@ function MulticastGroupModal({
         rtp_payload_type: rtpPayloadType ? Number(rtpPayloadType) : null,
         bandwidth_mbps_estimate: bandwidth || null,
         customer_id: customerId,
+        domain_id: domainId,
       };
       if (existing) {
         // PUT only — drop space_id since the backend update schema
@@ -226,6 +246,27 @@ function MulticastGroupModal({
                 </option>
               ))}
             </select>
+          </div>
+          <div className="sm:col-span-2">
+            <label className="text-xs font-medium text-muted-foreground">
+              PIM domain (optional)
+            </label>
+            <select
+              className={inputCls}
+              value={domainId ?? ""}
+              onChange={(e) => setDomainId(e.target.value || null)}
+            >
+              <option value="">— None —</option>
+              {domains.map((d) => (
+                <option key={d.id} value={d.id}>
+                  {d.name} · {d.pim_mode}
+                </option>
+              ))}
+            </select>
+            <p className="mt-1 text-[10px] text-muted-foreground">
+              Network-layer routing context — manage domains under{" "}
+              <strong>Multicast → View domains</strong>.
+            </p>
           </div>
           <div className="sm:col-span-2">
             <label className="text-xs font-medium text-muted-foreground">
@@ -1023,6 +1064,9 @@ export function MulticastGroupsPage() {
             </p>
           </div>
           <div className="flex shrink-0 items-center gap-2">
+            <Link to="/network/multicast/domains">
+              <HeaderButton icon={Network}>View domains</HeaderButton>
+            </Link>
             <HeaderButton
               icon={RefreshCw}
               onClick={() => query.refetch()}
