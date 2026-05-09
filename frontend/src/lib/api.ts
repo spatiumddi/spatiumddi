@@ -8748,6 +8748,13 @@ export const multicastApi = {
       .put<MulticastGroupRead>(`/multicast/groups/${id}`, data)
       .then((r) => r.data),
   remove: (id: string) => api.delete(`/multicast/groups/${id}`),
+  bulkDelete: (ids: string[]) =>
+    api
+      .post<{
+        deleted: number;
+        not_found: string[];
+      }>("/multicast/groups/bulk-delete", { ids })
+      .then((r) => r.data),
 
   listPorts: (groupId: string) =>
     api

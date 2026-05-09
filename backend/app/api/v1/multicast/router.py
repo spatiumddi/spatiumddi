@@ -263,6 +263,10 @@ class MulticastGroupListResponse(BaseModel):
     offset: int
 
 
+class MulticastGroupBulkDelete(BaseModel):
+    ids: list[uuid.UUID] = Field(..., max_length=500)
+
+
 # ── Helpers ─────────────────────────────────────────────────────────
 
 
@@ -401,6 +405,43 @@ async def update_group(
     await db.commit()
     await db.refresh(row)
     return MulticastGroupRead.model_validate(row)
+
+
+@router.post("/groups/bulk-delete")
+async def bulk_delete_groups(
+    body: MulticastGroupBulkDelete, db: DB, user: CurrentUser
+) -> dict[str, Any]:
+    """Hard-delete the named multicast groups in one transaction.
+
+    Cascades to ports + memberships per the FK declarations on
+    ``MulticastGroupPort.group_id`` and ``MulticastMembership.
+    group_id`` (both ``ON DELETE CASCADE``). Cap of 500 per call
+    matches Circuit's bulk-delete; the registry itself is bounded
+    in practice but we mirror the same shape so the operator UI
+    can lean on the standard pattern."""
+    if not body.ids:
+        return {"deleted": 0, "not_found": []}
+
+    rows = (
+        (await db.execute(select(MulticastGroup).where(MulticastGroup.id.in_(body.ids))))
+        .scalars()
+        .all()
+    )
+    found_ids = {r.id for r in rows}
+    not_found = [str(i) for i in body.ids if i not in found_ids]
+
+    for r in rows:
+        write_audit(
+            db,
+            user=user,
+            action="delete",
+            resource_type="multicast_group",
+            resource_id=str(r.id),
+            resource_display=f"{r.name} ({r.address})",
+        )
+        await db.delete(r)
+    await db.commit()
+    return {"deleted": len(rows), "not_found": not_found}
 
 
 @router.delete("/groups/{group_id:uuid}", status_code=status.HTTP_204_NO_CONTENT)

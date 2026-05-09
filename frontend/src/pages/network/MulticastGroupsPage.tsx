@@ -928,6 +928,7 @@ export function MulticastGroupsPage() {
   const [editing, setEditing] = useState<MulticastGroupRead | null>(null);
   const [showNew, setShowNew] = useState(false);
   const [showBulk, setShowBulk] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
 
   const spacesQ = useQuery({
     queryKey: ["ipam-spaces"],
@@ -957,6 +958,33 @@ export function MulticastGroupsPage() {
     mutationFn: (id: string) => multicastApi.remove(id),
     onSuccess: () => qc.invalidateQueries({ queryKey: ["multicast-groups"] }),
   });
+
+  const bulkDelete = useMutation({
+    mutationFn: (ids: string[]) => multicastApi.bulkDelete(ids),
+    onSuccess: () => {
+      setSelectedIds(new Set());
+      qc.invalidateQueries({ queryKey: ["multicast-groups"] });
+    },
+  });
+
+  const allChecked = useMemo(
+    () => items.length > 0 && items.every((g) => selectedIds.has(g.id)),
+    [items, selectedIds],
+  );
+
+  function toggleOne(id: string) {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  function toggleAll() {
+    if (allChecked) setSelectedIds(new Set());
+    else setSelectedIds(new Set(items.map((g) => g.id)));
+  }
 
   const customerNames = useMemo(() => {
     const map = new Map<string, string>();
@@ -1048,10 +1076,40 @@ export function MulticastGroupsPage() {
           </select>
         </div>
 
+        {selectedIds.size > 0 && (
+          <div className="flex items-center justify-between rounded-md border bg-muted/50 px-3 py-2 text-sm">
+            <span>{selectedIds.size} selected</span>
+            <HeaderButton
+              variant="destructive"
+              icon={Trash2}
+              disabled={bulkDelete.isPending}
+              onClick={() => {
+                if (
+                  window.confirm(
+                    `Delete ${selectedIds.size} multicast group(s)? Ports + memberships cascade.`,
+                  )
+                ) {
+                  bulkDelete.mutate(Array.from(selectedIds));
+                }
+              }}
+            >
+              Delete selected
+            </HeaderButton>
+          </div>
+        )}
+
         <div className="rounded-md border">
           <table className="w-full text-sm">
             <thead className="text-left text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
               <tr className="border-b bg-muted/30">
+                <th className="w-8 px-3 py-2">
+                  <input
+                    type="checkbox"
+                    checked={allChecked}
+                    onChange={toggleAll}
+                    aria-label="Select all"
+                  />
+                </th>
                 <th className="px-3 py-2">Address</th>
                 <th className="px-3 py-2">Name</th>
                 <th className="px-3 py-2">Application</th>
@@ -1065,7 +1123,7 @@ export function MulticastGroupsPage() {
               {items.length === 0 && !query.isFetching && (
                 <tr>
                   <td
-                    colSpan={7}
+                    colSpan={8}
                     className="px-3 py-10 text-center text-sm text-muted-foreground"
                   >
                     No multicast groups yet. Click <strong>New group</strong> to
@@ -1075,6 +1133,14 @@ export function MulticastGroupsPage() {
               )}
               {items.map((g) => (
                 <tr key={g.id} className="border-b hover:bg-muted/30">
+                  <td className="px-3 py-1.5">
+                    <input
+                      type="checkbox"
+                      checked={selectedIds.has(g.id)}
+                      onChange={() => toggleOne(g.id)}
+                      aria-label={`Select ${g.address}`}
+                    />
+                  </td>
                   <td className="px-3 py-1.5 font-mono">{g.address}</td>
                   <td className="px-3 py-1.5">{g.name}</td>
                   <td className="px-3 py-1.5 text-muted-foreground">
