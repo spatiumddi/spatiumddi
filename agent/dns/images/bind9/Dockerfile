@@ -11,11 +11,19 @@ COPY agent/dns/spatium_dns_agent /src/spatium_dns_agent
 RUN python3 -m pip install --prefix=/install --no-cache-dir --break-system-packages .
 
 FROM alpine:3.22 AS runtime
+# ``libcap`` brings in ``setcap`` so we can grant ``named`` the
+# CAP_NET_BIND_SERVICE file capability — without it, the unprivileged
+# ``spatium`` user the entrypoint drops to can't bind port 53 (named
+# starts but only ends up listening on the stats-channel port >1024,
+# silently failing on real DNS traffic). Alpine's ``bind`` package
+# does NOT set this cap automatically, unlike ``iputils-ping`` etc.
 RUN apk add --no-cache \
       bind bind-tools \
       tini su-exec \
       python3 py3-pip \
+      libcap \
       ca-certificates tzdata \
+ && setcap cap_net_bind_service=+ep /usr/sbin/named \
  && addgroup -S spatium \
  && adduser -S -G spatium spatium \
  && mkdir -p /var/lib/spatium-dns-agent /var/cache/bind /var/run/named /var/log/named \
