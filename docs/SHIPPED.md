@@ -9,6 +9,35 @@ Mirrors CLAUDE.md's three mixed sections:
 
 ## Major roadmap items
 
+- ✅ **Multicast group tracking — IPAM-native registry of streams + producer/consumer relationships**
+  ([#126](https://github.com/spatiumddi/spatiumddi/issues/126))
+  — Full multicast registry shipping the four-phase issue body
+  (registry → PIM domain → SNMP discovery → Operator Copilot tools)
+  end-to-end. Eleven commits between 2026-05-08 and 2026-05-09:
+
+  | Phase | Wave | Commit | What landed |
+  |---|---|---|---|
+  | 1 | 1 | `d56f3a6` | Data model — `multicast_group` + `multicast_group_port` + `multicast_membership` tables (migration `f1e7a3c92b40`), CHECK enforcing the IANA multicast classes (`224.0.0.0/4` v4 / `ff00::/8` v6) on `address`, UNIQUE `(group_id, ip_address_id, role)` on memberships, REST CRUD with `network.multicast` feature module gate (default-enabled per CLAUDE.md #14), permission grammar wired into the Network Editor builtin role |
+  | 1 | 2 | `7f3ffd9` | Operator UI — `/network/multicast` list page, three-tab editor modal (General / Ports / Memberships), sidebar entry with the Radio icon under Network → Infrastructure |
+  | 1 | 3 | `31749c5` | Bulk-allocate — `POST /multicast/groups/bulk-allocate/{preview,commit}` reusing the IPAM `_expand_bulk_template` grammar, `BulkAllocateModal` form→preview→commit flow, reusable `IPAddressPicker` component (debounced search via `/search?types=ip_address`) |
+  | 1 | 4 | `a11b5a4` | Cross-group `GET /multicast/memberships?ip_address_id=…` returning joined group info, IPDetailModal "Multicast memberships" section (module-gated), `no_multicast_collision` conformity check + seeded built-in policy + engine `multicast_group` target-kind resolver |
+  | 1 | bulk-delete | `2be4d59` | `POST /multicast/groups/bulk-delete` + checkbox column + select-all toolbar matching the Circuit pattern |
+  | 2 | 1 | `cea3fda` | PIM domain registry — `multicast_domain` table (migration `c8d2f47a90b3`) with PIM mode (sparse/dense/ssm/bidir/none) + VRF binding + RP (device FK + free-text address) + SSM range, REST CRUD with sparse/bidir-needs-RP validation, FK promotion of `multicast_group.domain_id` from placeholder UUID to real ON DELETE SET NULL |
+  | 2 | 2 | `f79f88b` | Domains UI + group→domain picker on the create modal |
+  | 2 | 3 | `00edc06` | `Subnet.kind` discriminator (migration `d3a9c5b71e84`) auto-detected from CIDR on create, IPAM allocation endpoints refuse on `kind="multicast"`, frontend badge in IPAM tree |
+  | 2 | tabs | `bfc99ef` | Sub-tab refactor — Groups + Domains live as `?tab=` sub-tabs of `/network/multicast`; legacy `/network/multicast/domains` route redirects to `?tab=domains` |
+  | 3 | 1 | `77d66cd` | SNMP IGMP-snooping populator — vendor-neutral RFC 2933 walker (`walk_igmp_cache`) + cross-reference matcher writing `MulticastMembership` rows tagged `seen_via='igmp_snooping'`, promotes `manual` → `igmp_snooping` when discovery validates a hand entry, opt-in `NetworkDevice.poll_igmp_snooping` toggle (migration `a1f4d97c8e25`) |
+  | 4 | 1 | `84aa308` | Operator Copilot tools — 4 read tools (`find_multicast_group` / `find_multicast_membership` / `find_multicast_domain` / `count_multicast_groups_by_vrf`, default-on, module-gated) + `propose_create_multicast_group` write proposal (default-off) + `create_multicast_group` Operation (preview/apply with multicast-class validation + collision soft-warn) |
+  | 4 | 2 | `3d8be70` | `propose_allocate_multicast_group` bulk-stamp proposal + IGMP membership reaper Celery beat task (drops `seen_via='igmp_snooping'` rows older than 30 min every 5 min, manual + sap_announce rows untouched) |
+
+  **Test coverage**: 40 cases in `backend/tests/test_multicast.py` covering CRUD + IPv4/IPv6 multicast-class validation + port range CHECK + unique-triplet membership + feature-module 404 gate + bulk-allocate flow + memberships-by-IP joined response + conformity check (pass/fail/cross-space) + PIM domain CRUD + sparse-without-RP rejection + Subnet.kind auto-detection + IPAM-allocation-refuses-on-multicast + IGMP cross-reference matcher + Operator Copilot read tools + module-disabled tool filtering + bulk-allocate operation preview/apply + IGMP reaper sweep.
+
+  **Phase 3 deferrals (explicit non-goals)**:
+  * **SAP listener (RFC 2974)** — needs raw multicast packet capture inside the agent (scapy + `NET_RAW` capability, like the DHCP fingerprint sniffer). Audience is legacy pro-AV / NDI; SNMP IGMP-snooping covers the same use case for >90% of operators.
+  * **NMOS IS-04 mirror** — fits the integration shelf shape (peer of UniFi / OPNsense / pfSense) better than baked into multicast core. Ship if/when an SMPTE 2110 broadcast operator asks for it.
+
+  Both deferrals captured in the issue close-out comment.
+
 - ✅ **PowerDNS authoritative driver — second driver alongside BIND9**
   ([#127](https://github.com/spatiumddi/spatiumddi/issues/127))
   — Full second authoritative DNS driver with native REST API +
