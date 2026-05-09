@@ -48,15 +48,29 @@ _PDNS_TS_RE: Final = re.compile(
 # query line; the literal `` wants '`` substring can't appear inside
 # an IP literal, port number, or any of the free-text bits in the
 # source-IP block, so splitting on it first gives us two halves that
-# each parse independently and at linear cost. The previous one-shot
-# pattern combined a greedy ``[^\]]+``, an alternation fallback, and
-# a lazy ``[0-9a-fA-F.:]+?`` that ``re.search`` could retry from
-# every starting position — polynomial-time backtracking on inputs
-# like ``Remote [\\\\\\\\\\Remote [\\\\\\\\…``. CodeQL ``py/polynomial-
-# redos`` alert #40 was the canary; bind9_parser had the same class of
-# bug fixed in alerts #16 + #18 by the same split-on-hard-separator
-# trick.
-_PDNS_SEP_RE: Final = re.compile(r"\s+wants\s+'", re.IGNORECASE)
+# each parse independently and at linear cost.
+#
+# Implementation history (CodeQL ``py/polynomial-redos`` alerts #40
+# + #41):
+#
+# * Alert #40 — the original one-shot ``re.search`` pattern combined
+#   a greedy ``[^\]]+``, an alternation fallback, and a lazy
+#   ``[0-9a-fA-F.:]+?`` — polynomial-time backtracking on inputs
+#   shaped like ``Remote [\\\\…\\\\``. Fixed by switching to a
+#   split-on-hard-separator structure.
+#
+# * Alert #41 — the *separator regex* itself
+#   (``r"\s+wants\s+'"``) had two ``\s+`` quantifiers around a
+#   literal token. On adversarial input with many leading+trailing
+#   spaces the two ``\s+`` groups can split a whitespace run in
+#   O(n²) ways before the trailing ``'`` mismatch finally fails.
+#   Fix: drop the regex entirely. Real pdns log lines always have a
+#   single literal space around ``wants`` (the daemon's format
+#   string is ``"Remote %s wants '%s|%s'"`` — see pdns 4.9 source),
+#   so ``str.split(" wants '", 1)`` is exact, fast, and trivially
+#   linear in the string length. Same fix the bind9 parser landed
+#   for alerts #16 + #18.
+_PDNS_SEP: Final = " wants '"
 
 # Body — anchored at the start of the right half (i.e. just after
 # the `` wants '`` separator we split on). qname is bounded by RFC
@@ -203,8 +217,10 @@ def parse_query_line(line: str, *, fallback_ts: datetime | None = None) -> Parse
     # bounded (maxsplit=1) and the literal substring can't appear in
     # any of the structured fields, so each side parses at linear
     # cost — the head with a Python-level token walk, the body with
-    # a small anchored regex.
-    parts = _PDNS_SEP_RE.split(rest, maxsplit=1)
+    # a small anchored regex. ``str.split`` (not ``re.split``) so
+    # there's no regex backtracking surface; see _PDNS_SEP comment
+    # above for the alert #41 history.
+    parts = rest.split(_PDNS_SEP, 1)
     if len(parts) != 2:
         # Non-query log line (banner, status, error). Surface the raw
         # text without parsed fields so the storage filter can drop it.
