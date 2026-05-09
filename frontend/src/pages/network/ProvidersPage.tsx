@@ -11,6 +11,7 @@ import {
 } from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
+import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
 
 const inputCls =
@@ -229,6 +230,12 @@ export function ProvidersPage() {
   const [kindFilter, setKindFilter] = useState<ProviderKind | "">("");
   const [editing, setEditing] = useState<ProviderRead | null>(null);
   const [showNew, setShowNew] = useState(false);
+  const [confirm, setConfirm] = useState<{
+    title: string;
+    message: string;
+    confirmLabel?: string;
+    onConfirm: () => void;
+  } | null>(null);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
 
   const query = useQuery({
@@ -348,9 +355,13 @@ export function ProvidersPage() {
               icon={Trash2}
               disabled={bulkDelete.isPending}
               onClick={() => {
-                if (window.confirm(`Delete ${selectedIds.size} provider(s)?`)) {
-                  bulkDelete.mutate(Array.from(selectedIds));
-                }
+                const ids = Array.from(selectedIds);
+                setConfirm({
+                  title: "Delete providers",
+                  message: `Delete ${ids.length} provider${ids.length === 1 ? "" : "s"}?`,
+                  confirmLabel: "Delete",
+                  onConfirm: () => bulkDelete.mutate(ids),
+                });
               }}
             >
               Delete selected
@@ -440,9 +451,12 @@ export function ProvidersPage() {
                         type="button"
                         title="Delete"
                         onClick={() => {
-                          if (window.confirm(`Delete provider "${p.name}"?`)) {
-                            removeOne.mutate(p.id);
-                          }
+                          setConfirm({
+                            title: "Delete provider",
+                            message: `Delete provider "${p.name}"?`,
+                            confirmLabel: "Delete",
+                            onConfirm: () => removeOne.mutate(p.id),
+                          });
                         }}
                         className="ml-1 rounded p-1 text-destructive hover:bg-destructive/10"
                       >
@@ -468,6 +482,18 @@ export function ProvidersPage() {
             onClose={() => setEditing(null)}
           />
         )}
+        <ConfirmModal
+          open={confirm !== null}
+          title={confirm?.title ?? ""}
+          message={confirm?.message ?? ""}
+          confirmLabel={confirm?.confirmLabel}
+          tone="destructive"
+          onConfirm={() => {
+            confirm?.onConfirm();
+            setConfirm(null);
+          }}
+          onClose={() => setConfirm(null)}
+        />
       </div>
     </div>
   );

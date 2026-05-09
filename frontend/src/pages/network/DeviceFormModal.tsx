@@ -21,6 +21,7 @@ import {
   type NetworkV3SecurityLevel,
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
+import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { IPSpacePicker } from "@/components/ipam/space-picker";
 
 import { DEVICE_TYPE_OPTIONS, Field, errMsg, inputCls } from "./_shared";
@@ -265,20 +266,14 @@ export function DeviceFormModal({
   });
 
   // Test only works on a saved device — the backend reads the stored
-  // (encrypted) credentials by ID. On create we save first.
+  // (encrypted) credentials by ID. On create we save first; the
+  // ConfirmModal below gates that path so a fat-fingered click on a
+  // brand-new form doesn't quietly create a stray device row.
+  const [showTestConfirm, setShowTestConfirm] = useState(false);
   const testMut = useMutation({
     mutationFn: async (): Promise<NetworkTestConnectionResult> => {
       let id = device?.id;
       if (!id) {
-        // Save first, then test. Confirm with the user so we don't
-        // create a stray device on a fat-fingered click.
-        if (
-          !window.confirm(
-            "Test Connection requires saving the device first. Save and run the test?",
-          )
-        ) {
-          throw new Error("Cancelled");
-        }
         const created = await networkApi.createDevice(buildCreatePayload());
         id = created.id;
         qc.invalidateQueries({ queryKey: ["network-devices"] });
@@ -687,7 +682,11 @@ export function DeviceFormModal({
                 return;
               }
               setError(null);
-              testMut.mutate();
+              if (device?.id) {
+                testMut.mutate();
+              } else {
+                setShowTestConfirm(true);
+              }
             }}
             disabled={testMut.isPending}
             className="inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm hover:bg-muted disabled:opacity-50"
@@ -717,6 +716,17 @@ export function DeviceFormModal({
           </div>
         </div>
       </form>
+      <ConfirmModal
+        open={showTestConfirm}
+        title="Save and test"
+        message="Test Connection requires saving the device first. Save and run the test?"
+        confirmLabel="Save and test"
+        onConfirm={() => {
+          setShowTestConfirm(false);
+          testMut.mutate();
+        }}
+        onClose={() => setShowTestConfirm(false)}
+      />
     </Modal>
   );
 }

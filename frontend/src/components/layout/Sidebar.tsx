@@ -742,7 +742,7 @@ export function Sidebar({
           )}
 
           <NavItem
-            label="Features"
+            label="Features & Integrations"
             icon={ToggleLeft}
             to="/admin/features"
             collapsed={effectiveCollapsed}

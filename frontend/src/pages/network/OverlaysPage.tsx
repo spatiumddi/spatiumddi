@@ -14,6 +14,7 @@ import {
 } from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
+import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { TagFilterChips } from "@/components/TagFilterChips";
 import { CustomerChip } from "@/components/ownership/pickers";
@@ -345,6 +346,12 @@ export function OverlaysPage() {
   const [customerFilter, setCustomerFilter] = useState("");
   const [editing, setEditing] = useState<OverlayRead | null>(null);
   const [showNew, setShowNew] = useState(false);
+  const [confirm, setConfirm] = useState<{
+    title: string;
+    message: string;
+    confirmLabel?: string;
+    onConfirm: () => void;
+  } | null>(null);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [tagFilters, setTagFilters] = useState<string[]>([]);
 
@@ -500,9 +507,13 @@ export function OverlaysPage() {
               icon={Trash2}
               disabled={bulkDelete.isPending}
               onClick={() => {
-                if (window.confirm(`Delete ${selectedIds.size} overlay(s)?`)) {
-                  bulkDelete.mutate(Array.from(selectedIds));
-                }
+                const ids = Array.from(selectedIds);
+                setConfirm({
+                  title: "Delete overlays",
+                  message: `Delete ${ids.length} overlay${ids.length === 1 ? "" : "s"}?`,
+                  confirmLabel: "Delete",
+                  onConfirm: () => bulkDelete.mutate(ids),
+                });
               }}
             >
               Delete selected
@@ -609,9 +620,12 @@ export function OverlaysPage() {
                       type="button"
                       title="Delete"
                       onClick={() => {
-                        if (window.confirm(`Delete overlay "${o.name}"?`)) {
-                          removeOne.mutate(o.id);
-                        }
+                        setConfirm({
+                          title: "Delete overlay",
+                          message: `Delete overlay "${o.name}"?`,
+                          confirmLabel: "Delete",
+                          onConfirm: () => removeOne.mutate(o.id),
+                        });
                       }}
                       className="ml-1 rounded p-1 text-destructive hover:bg-destructive/10"
                     >
@@ -636,6 +650,18 @@ export function OverlaysPage() {
             onClose={() => setEditing(null)}
           />
         )}
+        <ConfirmModal
+          open={confirm !== null}
+          title={confirm?.title ?? ""}
+          message={confirm?.message ?? ""}
+          confirmLabel={confirm?.confirmLabel}
+          tone="destructive"
+          onConfirm={() => {
+            confirm?.onConfirm();
+            setConfirm(null);
+          }}
+          onClose={() => setConfirm(null)}
+        />
       </div>
     </div>
   );

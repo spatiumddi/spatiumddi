@@ -10,6 +10,7 @@ import {
 } from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
+import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
 
 const inputCls =
@@ -227,6 +228,12 @@ export function SitesPage() {
   const [editing, setEditing] = useState<SiteRead | null>(null);
   const [showNew, setShowNew] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [confirm, setConfirm] = useState<{
+    title: string;
+    message: string;
+    confirmLabel?: string;
+    onConfirm: () => void;
+  } | null>(null);
 
   const query = useQuery({
     queryKey: ["sites", search, kindFilter],
@@ -347,9 +354,13 @@ export function SitesPage() {
               icon={Trash2}
               disabled={bulkDelete.isPending}
               onClick={() => {
-                if (window.confirm(`Delete ${selectedIds.size} site(s)?`)) {
-                  bulkDelete.mutate(Array.from(selectedIds));
-                }
+                const ids = Array.from(selectedIds);
+                setConfirm({
+                  title: "Delete sites",
+                  message: `Delete ${ids.length} site${ids.length === 1 ? "" : "s"}?`,
+                  confirmLabel: "Delete",
+                  onConfirm: () => bulkDelete.mutate(ids),
+                });
               }}
             >
               Delete selected
@@ -437,9 +448,12 @@ export function SitesPage() {
                       type="button"
                       title="Delete"
                       onClick={() => {
-                        if (window.confirm(`Delete site "${s.name}"?`)) {
-                          removeOne.mutate(s.id);
-                        }
+                        setConfirm({
+                          title: "Delete site",
+                          message: `Delete site "${s.name}"?`,
+                          confirmLabel: "Delete",
+                          onConfirm: () => removeOne.mutate(s.id),
+                        });
                       }}
                       className="ml-1 rounded p-1 text-destructive hover:bg-destructive/10"
                     >
@@ -466,6 +480,18 @@ export function SitesPage() {
             onClose={() => setEditing(null)}
           />
         )}
+        <ConfirmModal
+          open={confirm !== null}
+          title={confirm?.title ?? ""}
+          message={confirm?.message ?? ""}
+          confirmLabel={confirm?.confirmLabel}
+          tone="destructive"
+          onConfirm={() => {
+            confirm?.onConfirm();
+            setConfirm(null);
+          }}
+          onClose={() => setConfirm(null)}
+        />
       </div>
     </div>
   );

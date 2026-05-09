@@ -10,6 +10,7 @@ import {
 } from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
+import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
 
 const inputCls =
@@ -217,6 +218,12 @@ export function CustomersPage() {
   const [statusFilter, setStatusFilter] = useState<CustomerStatus | "">("");
   const [editing, setEditing] = useState<CustomerRead | null>(null);
   const [showNew, setShowNew] = useState(false);
+  const [confirm, setConfirm] = useState<{
+    title: string;
+    message: string;
+    confirmLabel?: string;
+    onConfirm: () => void;
+  } | null>(null);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
 
   const query = useQuery({
@@ -328,13 +335,13 @@ export function CustomersPage() {
               icon={Trash2}
               disabled={bulkDelete.isPending}
               onClick={() => {
-                if (
-                  window.confirm(
-                    `Soft-delete ${selectedIds.size} customer(s)? Cross-references on subnets / zones / ASNs will be cleared.`,
-                  )
-                ) {
-                  bulkDelete.mutate(Array.from(selectedIds));
-                }
+                const ids = Array.from(selectedIds);
+                setConfirm({
+                  title: "Delete customers",
+                  message: `Soft-delete ${ids.length} customer${ids.length === 1 ? "" : "s"}? Cross-references on subnets / zones / ASNs will be cleared.`,
+                  confirmLabel: "Delete",
+                  onConfirm: () => bulkDelete.mutate(ids),
+                });
               }}
             >
               Delete selected
@@ -416,13 +423,12 @@ export function CustomersPage() {
                       type="button"
                       title="Delete"
                       onClick={() => {
-                        if (
-                          window.confirm(
-                            `Soft-delete customer "${c.name}"? Cross-references will be cleared.`,
-                          )
-                        ) {
-                          removeOne.mutate(c.id);
-                        }
+                        setConfirm({
+                          title: "Delete customer",
+                          message: `Soft-delete customer "${c.name}"? Cross-references will be cleared.`,
+                          confirmLabel: "Delete",
+                          onConfirm: () => removeOne.mutate(c.id),
+                        });
                       }}
                       className="ml-1 rounded p-1 text-destructive hover:bg-destructive/10"
                     >
@@ -447,6 +453,18 @@ export function CustomersPage() {
             onClose={() => setEditing(null)}
           />
         )}
+        <ConfirmModal
+          open={confirm !== null}
+          title={confirm?.title ?? ""}
+          message={confirm?.message ?? ""}
+          confirmLabel={confirm?.confirmLabel}
+          tone="destructive"
+          onConfirm={() => {
+            confirm?.onConfirm();
+            setConfirm(null);
+          }}
+          onClose={() => setConfirm(null)}
+        />
       </div>
     </div>
   );

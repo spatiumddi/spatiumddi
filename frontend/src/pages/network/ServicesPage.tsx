@@ -23,6 +23,7 @@ import {
 } from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal, ModalTabs } from "@/components/ui/modal";
+import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { TagFilterChips } from "@/components/TagFilterChips";
 import { CustomerChip } from "@/components/ownership/pickers";
@@ -314,6 +315,10 @@ function ResourcesTab({
   const [addId, setAddId] = useState<string>("");
   const [addRole, setAddRole] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
+  const [confirm, setConfirm] = useState<{
+    message: string;
+    onConfirm: () => void;
+  } | null>(null);
 
   const attach = useMutation({
     mutationFn: () =>
@@ -499,13 +504,10 @@ function ResourcesTab({
                       type="button"
                       title="Detach"
                       onClick={() => {
-                        if (
-                          window.confirm(
-                            `Detach ${RESOURCE_KIND_LABELS[r.resource_kind]} from this service?`,
-                          )
-                        ) {
-                          detach.mutate(r.id);
-                        }
+                        setConfirm({
+                          message: `Detach ${RESOURCE_KIND_LABELS[r.resource_kind]} from this service?`,
+                          onConfirm: () => detach.mutate(r.id),
+                        });
                       }}
                       className="rounded p-1 text-destructive hover:bg-destructive/10"
                     >
@@ -518,6 +520,18 @@ function ResourcesTab({
           </table>
         )}
       </div>
+      <ConfirmModal
+        open={confirm !== null}
+        title="Detach resource"
+        message={confirm?.message ?? ""}
+        confirmLabel="Detach"
+        tone="destructive"
+        onConfirm={() => {
+          confirm?.onConfirm();
+          setConfirm(null);
+        }}
+        onClose={() => setConfirm(null)}
+      />
     </div>
   );
 }
@@ -990,6 +1004,12 @@ export function ServicesPage() {
   const [customerFilter, setCustomerFilter] = useState("");
   const [editing, setEditing] = useState<ServiceRead | null>(null);
   const [showNew, setShowNew] = useState(false);
+  const [confirm, setConfirm] = useState<{
+    title: string;
+    message: string;
+    confirmLabel?: string;
+    onConfirm: () => void;
+  } | null>(null);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [tagFilters, setTagFilters] = useState<string[]>([]);
 
@@ -1153,9 +1173,13 @@ export function ServicesPage() {
               icon={Trash2}
               disabled={bulkDelete.isPending}
               onClick={() => {
-                if (window.confirm(`Delete ${selectedIds.size} service(s)?`)) {
-                  bulkDelete.mutate(Array.from(selectedIds));
-                }
+                const ids = Array.from(selectedIds);
+                setConfirm({
+                  title: "Delete services",
+                  message: `Delete ${ids.length} service${ids.length === 1 ? "" : "s"}?`,
+                  confirmLabel: "Delete",
+                  onConfirm: () => bulkDelete.mutate(ids),
+                });
               }}
             >
               Delete selected
@@ -1253,9 +1277,12 @@ export function ServicesPage() {
                       type="button"
                       title="Delete"
                       onClick={() => {
-                        if (window.confirm(`Delete service "${s.name}"?`)) {
-                          removeOne.mutate(s.id);
-                        }
+                        setConfirm({
+                          title: "Delete service",
+                          message: `Delete service "${s.name}"?`,
+                          confirmLabel: "Delete",
+                          onConfirm: () => removeOne.mutate(s.id),
+                        });
                       }}
                       className="ml-1 rounded p-1 text-destructive hover:bg-destructive/10"
                     >
@@ -1280,6 +1307,18 @@ export function ServicesPage() {
             onClose={() => setEditing(null)}
           />
         )}
+        <ConfirmModal
+          open={confirm !== null}
+          title={confirm?.title ?? ""}
+          message={confirm?.message ?? ""}
+          confirmLabel={confirm?.confirmLabel}
+          tone="destructive"
+          onConfirm={() => {
+            confirm?.onConfirm();
+            setConfirm(null);
+          }}
+          onClose={() => setConfirm(null)}
+        />
       </div>
     </div>
   );

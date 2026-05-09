@@ -33,6 +33,7 @@ import {
 } from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
+import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { copyToClipboard } from "@/lib/clipboard";
 
 const inputCls =
@@ -529,6 +530,10 @@ export function WebhooksPage() {
   const [testFlash, setTestFlash] = useState<
     Record<string, WebhookTestResult | undefined>
   >({});
+  const [confirm, setConfirm] = useState<{
+    name: string;
+    onConfirm: () => void;
+  } | null>(null);
 
   const { data: subs = [], isLoading } = useQuery({
     queryKey: ["webhooks"],
@@ -650,13 +655,10 @@ export function WebhooksPage() {
                     <button
                       type="button"
                       onClick={() => {
-                        if (
-                          window.confirm(
-                            `Delete subscription "${s.name}"? Pending and dead-letter deliveries are removed too.`,
-                          )
-                        ) {
-                          del.mutate(s.id);
-                        }
+                        setConfirm({
+                          name: s.name,
+                          onConfirm: () => del.mutate(s.id),
+                        });
                       }}
                       className="inline-flex items-center gap-1 rounded border border-rose-300 px-2 py-1 text-xs text-rose-600 hover:bg-rose-50 dark:border-rose-900 dark:hover:bg-rose-900/20"
                     >
@@ -731,6 +733,18 @@ export function WebhooksPage() {
           onClose={() => setEditing(null)}
         />
       )}
+      <ConfirmModal
+        open={confirm !== null}
+        title="Delete subscription"
+        message={`Delete subscription "${confirm?.name ?? ""}"? Pending and dead-letter deliveries are removed too.`}
+        confirmLabel="Delete"
+        tone="destructive"
+        onConfirm={() => {
+          confirm?.onConfirm();
+          setConfirm(null);
+        }}
+        onClose={() => setConfirm(null)}
+      />
     </div>
   );
 }

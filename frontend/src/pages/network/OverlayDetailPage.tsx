@@ -35,6 +35,7 @@ import {
 } from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
+import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
 
 const inputCls =
@@ -427,6 +428,7 @@ function SitesTab({ overlayId }: { overlayId: string }) {
   });
   const [showAdd, setShowAdd] = useState(false);
   const [editing, setEditing] = useState<OverlaySiteRead | null>(null);
+  const [confirmDetachId, setConfirmDetachId] = useState<string | null>(null);
 
   const detach = useMutation({
     mutationFn: (rowId: string) => overlaysApi.detachSite(overlayId, rowId),
@@ -452,11 +454,7 @@ function SitesTab({ overlayId }: { overlayId: string }) {
       <SiteTable
         rows={sitesQ.data ?? []}
         onEdit={(r) => setEditing(r)}
-        onDelete={(r) => {
-          if (window.confirm("Detach this site from the overlay?")) {
-            detach.mutate(r.id);
-          }
-        }}
+        onDelete={(r) => setConfirmDetachId(r.id)}
       />
 
       {showAdd && (
@@ -473,6 +471,18 @@ function SitesTab({ overlayId }: { overlayId: string }) {
           onClose={() => setEditing(null)}
         />
       )}
+      <ConfirmModal
+        open={confirmDetachId !== null}
+        title="Detach site"
+        message="Detach this site from the overlay?"
+        confirmLabel="Detach"
+        tone="destructive"
+        onConfirm={() => {
+          if (confirmDetachId) detach.mutate(confirmDetachId);
+          setConfirmDetachId(null);
+        }}
+        onClose={() => setConfirmDetachId(null)}
+      />
     </div>
   );
 }
@@ -902,6 +912,10 @@ function PoliciesTab({ overlayId }: { overlayId: string }) {
   });
   const [showAdd, setShowAdd] = useState(false);
   const [editing, setEditing] = useState<RoutingPolicyRead | null>(null);
+  const [confirm, setConfirm] = useState<{
+    name: string;
+    onConfirm: () => void;
+  } | null>(null);
 
   const remove = useMutation({
     mutationFn: (id: string) => overlaysApi.deletePolicy(overlayId, id),
@@ -1036,8 +1050,10 @@ function PoliciesTab({ overlayId }: { overlayId: string }) {
                     type="button"
                     title="Delete"
                     onClick={() => {
-                      if (window.confirm(`Delete policy "${p.name}"?`))
-                        remove.mutate(p.id);
+                      setConfirm({
+                        name: p.name,
+                        onConfirm: () => remove.mutate(p.id),
+                      });
                     }}
                     className="rounded p-1 text-destructive hover:bg-destructive/10"
                   >
@@ -1064,6 +1080,18 @@ function PoliciesTab({ overlayId }: { overlayId: string }) {
           onClose={() => setEditing(null)}
         />
       )}
+      <ConfirmModal
+        open={confirm !== null}
+        title="Delete policy"
+        message={`Delete policy "${confirm?.name ?? ""}"?`}
+        confirmLabel="Delete"
+        tone="destructive"
+        onConfirm={() => {
+          confirm?.onConfirm();
+          setConfirm(null);
+        }}
+        onClose={() => setConfirm(null)}
+      />
     </div>
   );
 }

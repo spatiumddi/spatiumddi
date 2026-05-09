@@ -10,6 +10,7 @@ import {
 } from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
+import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
 
 const inputCls =
@@ -241,6 +242,12 @@ export function MulticastDomainsTab() {
   const qc = useQueryClient();
   const [editing, setEditing] = useState<MulticastDomainRead | null>(null);
   const [showNew, setShowNew] = useState(false);
+  const [confirm, setConfirm] = useState<{
+    title: string;
+    message: string;
+    confirmLabel?: string;
+    onConfirm: () => void;
+  } | null>(null);
 
   const query = useQuery({
     queryKey: ["multicast-domains"],
@@ -340,13 +347,12 @@ export function MulticastDomainsTab() {
                     <button
                       type="button"
                       onClick={() => {
-                        if (
-                          window.confirm(
-                            `Delete PIM domain "${d.name}"? Member groups stay; their domain_id orphans to NULL.`,
-                          )
-                        ) {
-                          removeOne.mutate(d.id);
-                        }
+                        setConfirm({
+                          title: "Delete PIM domain",
+                          message: `Delete PIM domain "${d.name}"? Member groups stay; their domain_id orphans to NULL.`,
+                          confirmLabel: "Delete",
+                          onConfirm: () => removeOne.mutate(d.id),
+                        });
                       }}
                       title="Delete"
                       className="ml-1 rounded p-1 text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
@@ -370,6 +376,18 @@ export function MulticastDomainsTab() {
           }}
         />
       )}
+      <ConfirmModal
+        open={confirm !== null}
+        title={confirm?.title ?? ""}
+        message={confirm?.message ?? ""}
+        confirmLabel={confirm?.confirmLabel}
+        tone="destructive"
+        onConfirm={() => {
+          confirm?.onConfirm();
+          setConfirm(null);
+        }}
+        onClose={() => setConfirm(null)}
+      />
     </>
   );
 }

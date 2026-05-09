@@ -95,7 +95,7 @@ export function FeaturesPage() {
         <div className="flex min-w-0 flex-1 items-center gap-2">
           <ToggleLeft className="h-5 w-5 flex-shrink-0 text-primary" />
           <div className="min-w-0">
-            <h1 className="text-lg font-semibold">Features</h1>
+            <h1 className="text-lg font-semibold">Features & Integrations</h1>
             <p className="text-xs text-muted-foreground">
               Hide platform features your deployment doesn't use. Disabled
               modules disappear from the sidebar, the REST API, and the AI

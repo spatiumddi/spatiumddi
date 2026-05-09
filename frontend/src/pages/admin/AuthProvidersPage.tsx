@@ -22,6 +22,7 @@ import {
   Loader2,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import { ConfirmModal } from "@/components/ui/confirm-modal";
 
 const TYPE_LABELS: Record<AuthProviderType, string> = {
   ldap: "LDAP / Active Directory",
@@ -1188,6 +1189,7 @@ function MappingsSection({ providerId }: { providerId: string }) {
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editExternal, setEditExternal] = useState("");
   const [editGroupId, setEditGroupId] = useState("");
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
 
   const createMut = useMutation({
     mutationFn: (body: { external_group: string; internal_group_id: string }) =>
@@ -1327,11 +1329,7 @@ function MappingsSection({ providerId }: { providerId: string }) {
                         <Pencil className="h-3 w-3" />
                       </button>
                       <button
-                        onClick={() => {
-                          if (window.confirm("Delete this mapping?")) {
-                            deleteMut.mutate(m.id);
-                          }
-                        }}
+                        onClick={() => setConfirmDeleteId(m.id)}
                         className="rounded-md p-1 text-muted-foreground hover:bg-accent hover:text-destructive"
                         title="Delete"
                       >
@@ -1398,6 +1396,18 @@ function MappingsSection({ providerId }: { providerId: string }) {
           </button>
         </div>
       )}
+      <ConfirmModal
+        open={confirmDeleteId !== null}
+        title="Delete mapping"
+        message="Delete this mapping?"
+        confirmLabel="Delete"
+        tone="destructive"
+        onConfirm={() => {
+          if (confirmDeleteId) deleteMut.mutate(confirmDeleteId);
+          setConfirmDeleteId(null);
+        }}
+        onClose={() => setConfirmDeleteId(null)}
+      />
     </div>
   );
 }
@@ -1786,6 +1796,7 @@ export function AuthProvidersPage() {
   const [editing, setEditing] = useState<AuthProvider | null>(null);
   const [initialForm, setInitialForm] = useState<ProviderForm>(emptyForm());
   const [mutateError, setMutateError] = useState<string>("");
+  const [confirmDelete, setConfirmDelete] = useState<AuthProvider | null>(null);
 
   const createMut = useMutation({
     mutationFn: authProvidersApi.create,
@@ -1943,15 +1954,8 @@ export function AuthProvidersPage() {
     }
   }
 
-  async function handleDelete(p: AuthProvider) {
-    if (
-      !window.confirm(
-        `Delete auth provider "${p.name}"? Mappings will be deleted too; already-provisioned users remain.`,
-      )
-    ) {
-      return;
-    }
-    await deleteMut.mutateAsync(p.id);
+  function handleDelete(p: AuthProvider) {
+    setConfirmDelete(p);
   }
 
   if (!isSuperadmin) {
@@ -2083,6 +2087,18 @@ export function AuthProvidersPage() {
           error={mutateError}
         />
       )}
+      <ConfirmModal
+        open={confirmDelete !== null}
+        title="Delete auth provider"
+        message={`Delete auth provider "${confirmDelete?.name ?? ""}"? Mappings will be deleted too; already-provisioned users remain.`}
+        confirmLabel="Delete"
+        tone="destructive"
+        onConfirm={() => {
+          if (confirmDelete) deleteMut.mutate(confirmDelete.id);
+          setConfirmDelete(null);
+        }}
+        onClose={() => setConfirmDelete(null)}
+      />
     </div>
   );
 }

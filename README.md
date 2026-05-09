@@ -119,10 +119,11 @@
 
 | | Source | What's mirrored |
 |---|---|---|
-| ☸️ | **Kubernetes** | cluster CIDRs · nodes · LoadBalancer VIPs · Ingress → DNS |
 | 🐳 | **Docker** | networks · optional container IPs |
+| ☸️ | **Kubernetes** | cluster CIDRs · nodes · LoadBalancer VIPs · Ingress → DNS |
 | 🖥 | **Proxmox VE** | bridges · SDN VNets + subnets · VM / LXC NICs (qemu-guest-agent) |
 | 🔐 | **Tailscale** | tailnet devices + synthetic `*.ts.net` zone |
+| 📡 | **UniFi Network** | controller sites · networks (VLANs / CIDRs) · clients (with hostnames + MAC) |
 
 ### 🛡 Identity & ops
 
@@ -373,6 +374,7 @@ The tables above are the elevator pitch. The bullets here are the same surface w
   - **Docker** — networks, optional container IPs
   - **Proxmox VE** — bridges, SDN VNets + subnets, VMs, LXC guests (runtime IPs via QEMU guest-agent); one row per cluster
   - **Tailscale** — device mirror + synthetic `*.ts.net` DNS zone
+  - **UniFi Network** — per-controller sites, networks (VLAN ID + CIDR → IPAM subnets), connected clients (hostname + MAC + IP); one row per controller
   - One-click setup guides per integration
   - Opt-in VNet-CIDR inference from guest NICs (for SDN deployments where PVE is L2-only)
   - Per-endpoint "Discovery" modal — which VMs aren't reporting IPs + copy-ready fix hints

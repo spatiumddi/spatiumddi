@@ -23,6 +23,7 @@ import {
 } from "@/lib/api";
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal, ModalTabs } from "@/components/ui/modal";
+import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { HeaderButton } from "@/components/ui/header-button";
 import { IPAddressPicker } from "@/components/IPAddressPicker";
 
@@ -1219,6 +1220,12 @@ function GroupsTabBody({
   setShowNew,
   setShowBulk,
 }: GroupsTabBodyProps) {
+  const [confirm, setConfirm] = useState<{
+    title: string;
+    message: string;
+    confirmLabel?: string;
+    onConfirm: () => void;
+  } | null>(null);
   return (
     <>
       <div className="flex justify-end gap-2">
@@ -1282,13 +1289,13 @@ function GroupsTabBody({
             icon={Trash2}
             disabled={bulkDelete.isPending}
             onClick={() => {
-              if (
-                window.confirm(
-                  `Delete ${selectedIds.size} multicast group(s)? Ports + memberships cascade.`,
-                )
-              ) {
-                bulkDelete.mutate(Array.from(selectedIds));
-              }
+              const ids = Array.from(selectedIds);
+              setConfirm({
+                title: "Delete multicast groups",
+                message: `Delete ${ids.length} multicast group${ids.length === 1 ? "" : "s"}? Ports + memberships cascade.`,
+                confirmLabel: "Delete",
+                onConfirm: () => bulkDelete.mutate(ids),
+              });
             }}
           >
             Delete selected
@@ -1370,11 +1377,12 @@ function GroupsTabBody({
                   <button
                     type="button"
                     onClick={() => {
-                      if (
-                        window.confirm(`Delete multicast group ${g.address}?`)
-                      ) {
-                        removeOne.mutate(g.id);
-                      }
+                      setConfirm({
+                        title: "Delete multicast group",
+                        message: `Delete multicast group ${g.address}?`,
+                        confirmLabel: "Delete",
+                        onConfirm: () => removeOne.mutate(g.id),
+                      });
                     }}
                     title="Delete"
                     className="ml-1 rounded p-1 text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
@@ -1387,6 +1395,18 @@ function GroupsTabBody({
           </tbody>
         </table>
       </div>
+      <ConfirmModal
+        open={confirm !== null}
+        title={confirm?.title ?? ""}
+        message={confirm?.message ?? ""}
+        confirmLabel={confirm?.confirmLabel}
+        tone="destructive"
+        onConfirm={() => {
+          confirm?.onConfirm();
+          setConfirm(null);
+        }}
+        onClose={() => setConfirm(null)}
+      />
     </>
   );
 }
