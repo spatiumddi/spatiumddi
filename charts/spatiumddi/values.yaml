@@ -100,11 +100,18 @@ beat:
   podAnnotations: {}
 
 # ── Migrate (Alembic upgrade head) ───────────────────────────────────────────
-# Runs as a Helm pre-install + pre-upgrade hook. Disable if you're driving
+# Regular Job (named per Helm revision so each install/upgrade creates
+# a fresh one). The Job's pod has a wait-for-postgres init container; the
+# api / worker / beat pods carry a matching wait-for-migrate init that
+# blocks rollout until the schema is in place. Disable if you're driving
 # migrations from CI/CD instead of Helm.
 migrate:
   enabled: true
   backoffLimit: 3
+  # Garbage-collect each migrate Job this many seconds after completion.
+  # Without a TTL the cluster would slowly accumulate one completed Job
+  # per Helm revision.
+  ttlSecondsAfterFinished: 600
   resources:
     requests: { cpu: 50m, memory: 128Mi }
     limits:   { cpu: 200m, memory: 256Mi }

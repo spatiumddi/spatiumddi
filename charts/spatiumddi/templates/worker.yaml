@@ -25,6 +25,8 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      initContainers:
+        {{- include "spatiumddi.waitForMigrateInit" . | nindent 8 }}
       containers:
         - name: worker
           image: {{ include "spatiumddi.image" (merge (dict "imageName" "spatiumddi-api") .) }}

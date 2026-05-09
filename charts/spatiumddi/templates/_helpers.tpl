@@ -204,3 +204,74 @@ $(REDIS_PASSWORD) reference secrets; everything else is inline.
   value: "redis://{{ include "spatiumddi.redisHost" . }}:{{ include "spatiumddi.redisPort" . }}/2"
 {{- end -}}
 {{- end -}}
+
+{{/*
+Init container that blocks until the bundled / external Postgres is
+accepting connections. Used by the migrate Job. ``pg_isready`` ships in
+the api image (postgresql-client-16, see backend/Dockerfile).
+*/}}
+{{- define "spatiumddi.waitForPostgresInit" -}}
+- name: wait-for-postgres
+  image: {{ include "spatiumddi.image" (merge (dict "imageName" "spatiumddi-api") .) }}
+  imagePullPolicy: {{ .Values.image.pullPolicy }}
+  command:
+    - sh
+    - -c
+    - |
+      until pg_isready -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" -t 3 >/dev/null 2>&1; do
+        echo "waiting for postgres at $PGHOST:$PGPORT..."
+        sleep 3
+      done
+      echo "postgres is accepting connections"
+  env:
+    - name: PGHOST
+      value: {{ include "spatiumddi.postgresHost" . | quote }}
+    - name: PGPORT
+      value: {{ include "spatiumddi.postgresPort" . | quote }}
+    - name: PGUSER
+      value: {{ include "spatiumddi.postgresUser" . | quote }}
+    - name: PGDATABASE
+      value: {{ include "spatiumddi.postgresDatabase" . | quote }}
+{{- end -}}
+
+{{/*
+Init container that blocks until alembic migrations have been applied
+(detected by presence of a row in the ``alembic_version`` table). Used
+by api / worker / beat so they don't roll out before the schema is in
+place. Uses ``psql`` from the api image.
+
+The DATABASE_URL on commonEnv uses the asyncpg driver scheme; psql
+needs the plain ``postgresql://`` scheme, so we build connection
+arguments from the discrete pieces instead of the URL.
+*/}}
+{{- define "spatiumddi.waitForMigrateInit" -}}
+- name: wait-for-migrate
+  image: {{ include "spatiumddi.image" (merge (dict "imageName" "spatiumddi-api") .) }}
+  imagePullPolicy: {{ .Values.image.pullPolicy }}
+  command:
+    - sh
+    - -c
+    - |
+      export PGPASSWORD="$POSTGRES_PASSWORD"
+      until psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" \
+            -tAc "SELECT version_num FROM alembic_version LIMIT 1" 2>/dev/null \
+          | grep -qE '[a-f0-9]'; do
+        echo "waiting for alembic migrations to land..."
+        sleep 3
+      done
+      echo "alembic schema present"
+  env:
+    - name: POSTGRES_PASSWORD
+      valueFrom:
+        secretKeyRef:
+          name: {{ include "spatiumddi.postgresSecretName" . }}
+          key: {{ include "spatiumddi.postgresSecretPasswordKey" . }}
+    - name: PGHOST
+      value: {{ include "spatiumddi.postgresHost" . | quote }}
+    - name: PGPORT
+      value: {{ include "spatiumddi.postgresPort" . | quote }}
+    - name: PGUSER
+      value: {{ include "spatiumddi.postgresUser" . | quote }}
+    - name: PGDATABASE
+      value: {{ include "spatiumddi.postgresDatabase" . | quote }}
+{{- end -}}
