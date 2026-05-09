@@ -178,6 +178,30 @@ jobs:
           kubectl -n spatiumddi get pods -o wide
           kubectl -n spatiumddi get svc
           kubectl -n spatiumddi get pvc
+          # Surface readiness/liveness probe failures + crash events.
+          # Without this, ``0/1 Running`` pods look identical between
+          # "probe failing on a healthy daemon" and "container crashed
+          # post-start" — describe disambiguates.
+          echo "─── DNS pod describe (events + probe state) ───"
+          for pod in $(kubectl -n spatiumddi get pods \
+              -l app.kubernetes.io/component=dns-agent \
+              -o jsonpath='{.items[*].metadata.name}'); do
+            echo "··· $pod ···"
+            kubectl -n spatiumddi describe pod "$pod" | tail -40
+          done
+          # Quick sanity: is the daemon actually listening on :53
+          # inside the agent pod? The chart's tcpSocket readiness
+          # probe relies on this. ``ss`` ships in busybox-style
+          # alpine so it's reliably available in both flavors.
+          echo "─── DNS pod listening sockets ───"
+          for pod in $(kubectl -n spatiumddi get pods \
+              -l app.kubernetes.io/component=dns-agent \
+              -o jsonpath='{.items[*].metadata.name}'); do
+            echo "··· $pod ···"
+            kubectl -n spatiumddi exec "$pod" -- ss -tlnp 2>/dev/null \
+              || kubectl -n spatiumddi exec "$pod" -- netstat -tlnp 2>/dev/null \
+              || echo "(no ss / netstat available)"
+          done
 
       - name: API health check
         run: |
