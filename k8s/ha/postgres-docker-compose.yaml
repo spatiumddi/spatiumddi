@@ -15,12 +15,21 @@ name: spatiumddi-ha
 
 services:
   # ── etcd cluster (Patroni consensus) ────────────────────────────────────────
+  # Uses the upstream etcd-io image at ``quay.io/coreos/etcd``. The
+  # previous ``bitnami/etcd:3.5`` was pruned from Docker Hub in late
+  # 2025 with the rest of the ``bitnami/*`` namespace; switching to
+  # the upstream image dodges the same future-pruning risk and keeps
+  # the env-var surface (``ETCD_*``) identical to vanilla etcd. The
+  # only Bitnami-ism we drop is ``ALLOW_NONE_AUTHENTICATION`` (no-op
+  # on upstream — etcd already defaults to no auth) and the data-dir
+  # mount path (``/bitnami/etcd`` → ``/var/lib/etcd``).
   etcd1:
-    image: bitnami/etcd:3.5
+    image: quay.io/coreos/etcd:v3.5.30
+    command: ["etcd"]
     networks: [spatiumddi]
     environment:
-      ALLOW_NONE_AUTHENTICATION: "yes"
       ETCD_NAME: etcd1
+      ETCD_DATA_DIR: /var/lib/etcd
       ETCD_INITIAL_ADVERTISE_PEER_URLS: http://etcd1:2380
       ETCD_LISTEN_PEER_URLS: http://0.0.0.0:2380
       ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
@@ -28,14 +37,15 @@ services:
       ETCD_INITIAL_CLUSTER: etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
       ETCD_INITIAL_CLUSTER_TOKEN: spatiumddi-etcd
       ETCD_INITIAL_CLUSTER_STATE: new
-    volumes: [etcd1_data:/bitnami/etcd]
+    volumes: [etcd1_data:/var/lib/etcd]
 
   etcd2:
-    image: bitnami/etcd:3.5
+    image: quay.io/coreos/etcd:v3.5.30
+    command: ["etcd"]
     networks: [spatiumddi]
     environment:
-      ALLOW_NONE_AUTHENTICATION: "yes"
       ETCD_NAME: etcd2
+      ETCD_DATA_DIR: /var/lib/etcd
       ETCD_INITIAL_ADVERTISE_PEER_URLS: http://etcd2:2380
       ETCD_LISTEN_PEER_URLS: http://0.0.0.0:2380
       ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
@@ -43,14 +53,15 @@ services:
       ETCD_INITIAL_CLUSTER: etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
       ETCD_INITIAL_CLUSTER_TOKEN: spatiumddi-etcd
       ETCD_INITIAL_CLUSTER_STATE: new
-    volumes: [etcd2_data:/bitnami/etcd]
+    volumes: [etcd2_data:/var/lib/etcd]
 
   etcd3:
-    image: bitnami/etcd:3.5
+    image: quay.io/coreos/etcd:v3.5.30
+    command: ["etcd"]
     networks: [spatiumddi]
     environment:
-      ALLOW_NONE_AUTHENTICATION: "yes"
       ETCD_NAME: etcd3
+      ETCD_DATA_DIR: /var/lib/etcd
       ETCD_INITIAL_ADVERTISE_PEER_URLS: http://etcd3:2380
       ETCD_LISTEN_PEER_URLS: http://0.0.0.0:2380
       ETCD_LISTEN_CLIENT_URLS: http://0.0.0.0:2379
@@ -58,7 +69,7 @@ services:
       ETCD_INITIAL_CLUSTER: etcd1=http://etcd1:2380,etcd2=http://etcd2:2380,etcd3=http://etcd3:2380
       ETCD_INITIAL_CLUSTER_TOKEN: spatiumddi-etcd
       ETCD_INITIAL_CLUSTER_STATE: new
-    volumes: [etcd3_data:/bitnami/etcd]
+    volumes: [etcd3_data:/var/lib/etcd]
 
   # ── Patroni PostgreSQL nodes ─────────────────────────────────────────────────
   pg1:

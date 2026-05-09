@@ -85,12 +85,13 @@ Name of the chart-owned secret carrying SECRET_KEY.
 
 {{/*
 Postgres connection parameters. Hostname + port + user + database come from
-either the bundled subchart or the externalDatabase block; the password is
-always referenced via a Secret keyRef — never inlined.
+either the in-chart Postgres StatefulSet (templates/postgres.yaml) or the
+externalDatabase block; the password is always referenced via a Secret
+keyRef — never inlined.
 */}}
 {{- define "spatiumddi.postgresHost" -}}
 {{- if .Values.postgresql.enabled -}}
-{{- printf "%s-postgresql" .Release.Name -}}
+{{- printf "%s-postgresql" (include "spatiumddi.fullname" .) -}}
 {{- else -}}
 {{- required "externalDatabase.host is required when postgresql.enabled=false" .Values.externalDatabase.host -}}
 {{- end -}}
@@ -109,14 +110,20 @@ always referenced via a Secret keyRef — never inlined.
 {{- end -}}
 
 {{/*
-Name of the secret carrying the Postgres user password. For the bundled
-subchart this is the Bitnami-managed `<release>-postgresql` secret
-(key `password`). For external DB it's whatever the user set in
+Name of the secret carrying the Postgres user password. For the in-
+chart Postgres this is the chart-owned ``<fullname>-postgresql`` Secret
+(key ``password``) — generated on first install via lookup() and
+preserved across upgrades. ``postgresql.auth.existingSecret`` overrides
+to a BYO secret. For external DB it's whatever the user set in
 externalDatabase.existingSecret.
 */}}
 {{- define "spatiumddi.postgresSecretName" -}}
 {{- if .Values.postgresql.enabled -}}
-{{- printf "%s-postgresql" .Release.Name -}}
+{{- if .Values.postgresql.auth.existingSecret -}}
+{{- .Values.postgresql.auth.existingSecret -}}
+{{- else -}}
+{{- printf "%s-postgresql" (include "spatiumddi.fullname" .) -}}
+{{- end -}}
 {{- else if .Values.externalDatabase.existingSecret -}}
 {{- .Values.externalDatabase.existingSecret -}}
 {{- else -}}
@@ -134,7 +141,7 @@ externalRedis.
 */}}
 {{- define "spatiumddi.redisHost" -}}
 {{- if .Values.redis.enabled -}}
-{{- printf "%s-redis-master" .Release.Name -}}
+{{- printf "%s-redis-master" (include "spatiumddi.fullname" .) -}}
 {{- else -}}
 {{- required "externalRedis.host is required when redis.enabled=false" .Values.externalRedis.host -}}
 {{- end -}}
@@ -154,7 +161,11 @@ externalRedis.
 
 {{- define "spatiumddi.redisSecretName" -}}
 {{- if .Values.redis.enabled -}}
-{{- printf "%s-redis" .Release.Name -}}
+{{- if .Values.redis.auth.existingSecret -}}
+{{- .Values.redis.auth.existingSecret -}}
+{{- else -}}
+{{- printf "%s-redis" (include "spatiumddi.fullname" .) -}}
+{{- end -}}
 {{- else if .Values.externalRedis.existingSecret -}}
 {{- .Values.externalRedis.existingSecret -}}
 {{- else -}}

@@ -20,12 +20,15 @@ keywords:
   - networking
 maintainers:
   - name: SpatiumDDI Contributors
-dependencies:
-  - name: postgresql
-    version: "~15.5.0"
-    repository: "oci://registry-1.docker.io/bitnamicharts"
-    condition: postgresql.enabled
-  - name: redis
-    version: "~20.6.0"
-    repository: "oci://registry-1.docker.io/bitnamicharts"
-    condition: redis.enabled
+# No subchart dependencies. Postgres + Redis ship as plain
+# StatefulSet + Service templates owned by this chart, using the
+# official ``postgres:16-alpine`` and ``redis:7-alpine`` images
+# (the same ones docker-compose.yml uses). The bundled subcharts
+# previously came from the Bitnami chart family, but Bitnami pruned
+# the ``bitnami/*`` Docker Hub namespace in late 2025 in favour of
+# their paid "Bitnami Secure Images", so the pinned image tags
+# stopped resolving and we'd have had to either pay or shim the
+# install around their parallel ``bitnamilegacy/*`` namespace.
+# Operators wanting a real HA Postgres should disable
+# ``postgresql.enabled`` and bring their own (CloudNativePG / Patroni
+# under k8s/ha/) via ``externalDatabase``.

@@ -1,0 +1,179 @@
+{{- if .Values.postgresql.enabled }}
+{{- $cmp := "postgresql" -}}
+{{- $secretName := printf "%s-postgresql" (include "spatiumddi.fullname" .) -}}
+# ─────────────────────────────────────────────────────────────────────────────
+# In-chart Postgres — single-node StatefulSet using the official
+# ``postgres:16-alpine`` image. Sized for a small lab / single-VM
+# deployment. Real production HA installs should set
+# ``postgresql.enabled=false`` and point ``externalDatabase`` at a
+# CloudNativePG / Patroni cluster (see k8s/ha/).
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Password Secret — generated once on first install and preserved
+# across upgrades via the ``lookup`` function. If the operator passes
+# ``postgresql.auth.password`` or ``postgresql.auth.existingSecret``,
+# we don't render this Secret at all.
+{{- if and (not .Values.postgresql.auth.existingSecret) (not .Values.postgresql.auth.password) }}
+{{- $existing := (lookup "v1" "Secret" .Release.Namespace $secretName) }}
+{{- $password := "" }}
+{{- if $existing }}
+{{- $password = index $existing.data "password" | b64dec }}
+{{- else }}
+{{- $password = randAlphaNum 32 }}
+{{- end }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $secretName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" $cmp) .) | nindent 4 }}
+  annotations:
+    "helm.sh/resource-policy": keep
+type: Opaque
+data:
+  password: {{ $password | b64enc | quote }}
+---
+{{- end }}
+{{- if .Values.postgresql.auth.password }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $secretName }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" $cmp) .) | nindent 4 }}
+type: Opaque
+data:
+  password: {{ .Values.postgresql.auth.password | b64enc | quote }}
+---
+{{- end }}
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ include "spatiumddi.fullname" . }}-postgresql
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" $cmp) .) | nindent 4 }}
+spec:
+  serviceName: {{ include "spatiumddi.fullname" . }}-postgresql-headless
+  replicas: 1
+  selector:
+    matchLabels:
+      {{- include "spatiumddi.componentSelectorLabels" (merge (dict "component" $cmp) .) | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "spatiumddi.componentSelectorLabels" (merge (dict "component" $cmp) .) | nindent 8 }}
+    spec:
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        # Match the postgres image's UID — the Alpine ``postgres`` user
+        # runs as 70:70. fsGroup makes the mounted PVC writable.
+        fsGroup: 70
+      containers:
+        - name: postgresql
+          image: "{{ .Values.postgresql.image.repository }}:{{ .Values.postgresql.image.tag }}"
+          imagePullPolicy: {{ .Values.postgresql.image.pullPolicy }}
+          ports:
+            - name: postgres
+              containerPort: 5432
+          env:
+            - name: POSTGRES_USER
+              value: {{ .Values.postgresql.auth.username | quote }}
+            - name: POSTGRES_DB
+              value: {{ .Values.postgresql.auth.database | quote }}
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "spatiumddi.postgresSecretName" . }}
+                  key: {{ include "spatiumddi.postgresSecretPasswordKey" . }}
+            # Alpine postgres mounts ``/var/lib/postgresql/data`` as the
+            # data dir but Kubernetes mounts can't be the data dir
+            # directly (``initdb`` refuses if the dir contains a
+            # ``lost+found`` from ext4 / a leading dot file). Point at
+            # a sub-path so initdb sees a clean tree.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-U", "{{ .Values.postgresql.auth.username }}", "-d", "{{ .Values.postgresql.auth.database }}"]
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-U", "{{ .Values.postgresql.auth.username }}", "-d", "{{ .Values.postgresql.auth.database }}"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          resources:
+            {{- toYaml .Values.postgresql.resources | nindent 12 }}
+      {{- with .Values.postgresql.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.postgresql.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.postgresql.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+  {{- if .Values.postgresql.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with .Values.postgresql.persistence.storageClass }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.postgresql.persistence.size | quote }}
+  {{- else }}
+      volumes:
+        - name: data
+          emptyDir: {}
+  {{- end }}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "spatiumddi.fullname" . }}-postgresql
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" $cmp) .) | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "spatiumddi.componentSelectorLabels" (merge (dict "component" $cmp) .) | nindent 4 }}
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "spatiumddi.fullname" . }}-postgresql-headless
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "spatiumddi.componentLabels" (merge (dict "component" $cmp) .) | nindent 4 }}
+spec:
+  type: ClusterIP
+  clusterIP: None
+  selector:
+    {{- include "spatiumddi.componentSelectorLabels" (merge (dict "component" $cmp) .) | nindent 4 }}
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+{{- end }}
