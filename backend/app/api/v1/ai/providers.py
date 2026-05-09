@@ -26,6 +26,7 @@ from sqlalchemy.exc import IntegrityError
 from app.api.deps import DB, SuperAdmin
 from app.api.v1.dhcp._audit import write_audit
 from app.core.crypto import encrypt_str
+from app.core.demo_mode import forbid_in_demo_mode
 from app.drivers.llm import get_driver
 from app.drivers.llm.registry import known_kinds
 from app.models.ai import AI_PROVIDER_KINDS, AIProvider
@@ -215,6 +216,7 @@ async def list_providers(current_user: SuperAdmin, db: DB) -> list[ProviderRespo
 async def create_provider(
     body: ProviderCreate, current_user: SuperAdmin, db: DB
 ) -> ProviderResponse:
+    forbid_in_demo_mode("AI provider creation is disabled")
     row = AIProvider(
         name=body.name,
         kind=body.kind,

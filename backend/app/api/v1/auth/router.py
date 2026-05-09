@@ -40,6 +40,7 @@ from app.core.auth.user_sync import (
     ExternalSyncRejected,
     sync_external_user,
 )
+from app.core.demo_mode import forbid_in_demo_mode
 from app.core.security import (
     create_access_token,
     create_mfa_challenge_token,
@@ -690,6 +691,7 @@ async def change_password(
     current_user: CurrentUser,
     db: DB,
 ) -> None:
+    forbid_in_demo_mode("Password change is disabled")
     if not current_user.hashed_password or not verify_password(
         body.current_password, current_user.hashed_password
     ):

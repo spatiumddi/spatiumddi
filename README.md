@@ -596,6 +596,16 @@ The driver abstraction is backend-neutral — services speak to `DNSDriver` / `D
 
 > 📘 For the full setup order (servers → zones/scopes → subnets → addresses) see **[docs/GETTING_STARTED.md](docs/GETTING_STARTED.md)**. For Windows DC integration see **[docs/deployment/WINDOWS.md](docs/deployment/WINDOWS.md)**.
 
+### Try the demo in GitHub Codespaces
+
+[![Open in GitHub Codespaces](https://github.com/codespaces/badge.svg)](https://codespaces.new/spatiumddi/spatiumddi)
+
+One click brings up a full SpatiumDDI stack in a fresh Codespace, builds the images from `main`, runs migrations, and seeds realistic IPAM / DNS / DHCP / network-modeling demo data so every screen has something to look at. Sign in with **`admin / admin`**.
+
+The demo Codespace runs in **DEMO_MODE** — abusable surfaces are server-side locked: nmap, the AI Copilot, every read-only integration mirror (Kubernetes / Docker / Proxmox / Tailscale / UniFi), webhook subscriptions, audit-forward / SMTP, backup target creation, factory reset, and password change all return 403. IPAM / DNS / DHCP CRUD on the seeded data stays open so you can play with it.
+
+Cold start is ~5–8 minutes (image build) on a 4-core machine; the Codespace's free-tier hours come from your own GitHub account, and trashing the data only affects your own copy. To start fresh, delete the Codespace and click the badge again.
+
 ### Quick start with Docker Compose
 
 ```bash

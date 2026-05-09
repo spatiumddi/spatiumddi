@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Outlet } from "react-router-dom";
 import { Sidebar } from "./Sidebar";
 import { Header } from "./Header";
+import { DemoBanner } from "./DemoBanner";
 import { CopilotButton } from "@/components/copilot/CopilotButton";
 import { useFeatureModules } from "@/hooks/useFeatureModules";
 
@@ -23,6 +24,7 @@ export function AppLayout() {
         onMobileClose={() => setMobileOpen(false)}
       />
       <div className="flex flex-1 flex-col overflow-hidden">
+        <DemoBanner />
         <Header onMobileMenu={() => setMobileOpen(true)} />
         <main className="flex-1 overflow-auto">
           <Outlet />

@@ -6850,6 +6850,7 @@ export interface PlatformHealthComponent {
 export interface PlatformHealthResponse {
   status: "ok" | "degraded";
   components: PlatformHealthComponent[];
+  demo_mode?: boolean;
 }
 
 export const platformHealthApi = {

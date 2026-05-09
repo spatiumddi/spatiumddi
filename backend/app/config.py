@@ -65,5 +65,13 @@ class Settings(BaseSettings):
     # so forks can point their update check at their own repo.
     github_repo: str = "spatiumddi/spatiumddi"
 
+    # Demo mode — locks down abusable mutation surfaces (nmap, AI
+    # provider creates, webhook targets, integration targets,
+    # outbound mail/audit/backup, factory reset, password change)
+    # and force-disables a curated set of feature modules. Used by
+    # the GitHub Codespaces public demo so a visitor can't weaponise
+    # it as a scanner / SSRF / relay. See app.core.demo_mode.
+    demo_mode: bool = False
+
 
 settings = Settings()

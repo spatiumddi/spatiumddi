@@ -10,6 +10,7 @@ from pydantic import BaseModel, field_validator, model_validator
 from sqlalchemy import select
 
 from app.api.deps import DB, SuperAdmin
+from app.core.demo_mode import forbid_in_demo_mode
 from app.models.audit import AuditLog
 from app.models.auth import User
 from app.models.settings import PlatformSettings
@@ -242,6 +243,7 @@ async def reset_password(
     current_user: SuperAdmin,
     db: DB,
 ) -> None:
+    forbid_in_demo_mode("Admin password reset is disabled")
     user = await db.get(User, user_id)
     if user is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")

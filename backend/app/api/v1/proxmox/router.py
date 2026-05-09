@@ -18,6 +18,7 @@ from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.core.crypto import decrypt_str, encrypt_str
+from app.core.demo_mode import forbid_in_demo_mode
 from app.core.permissions import require_resource_permission
 from app.models.audit import AuditLog
 from app.models.dns import DNSServerGroup
@@ -352,6 +353,7 @@ async def list_nodes(db: DB, _: CurrentUser) -> list[NodeResponse]:
     status_code=status.HTTP_201_CREATED,
 )
 async def create_node(body: NodeCreate, db: DB, user: SuperAdmin) -> NodeResponse:
+    forbid_in_demo_mode("Proxmox endpoint registration is disabled")
     await _validate_bindings(db, body.ipam_space_id, body.dns_group_id)
 
     existing = await db.execute(select(ProxmoxNode).where(ProxmoxNode.name == body.name))

@@ -11,6 +11,7 @@ from pydantic import BaseModel, field_validator, model_validator
 from sqlalchemy import func, select
 
 from app.api.deps import DB, CurrentUser
+from app.core.demo_mode import forbid_in_demo_mode
 from app.core.permissions import user_has_permission
 from app.models.audit_forward import AuditForwardTarget
 from app.models.oui import OUIVendor
@@ -391,6 +392,7 @@ async def get_settings_defaults(current_user: CurrentUser) -> dict[str, Any]:
 async def update_settings(
     body: SettingsUpdate, current_user: CurrentUser, db: DB
 ) -> PlatformSettings:
+    forbid_in_demo_mode("Platform settings updates are disabled")
     # Superadmin passes via user_has_permission shortcut; users with an
     # explicit `write`/`admin` grant on `settings` also pass.
     if not user_has_permission(current_user, "write", "settings"):
@@ -740,6 +742,7 @@ async def list_audit_targets(current_user: CurrentUser, db: DB) -> list[AuditTar
 async def create_audit_target(
     body: AuditTargetBody, current_user: CurrentUser, db: DB
 ) -> AuditTargetResponse:
+    forbid_in_demo_mode("Audit-forward target creation is disabled")
     if not current_user.is_superadmin:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
     row = AuditForwardTarget()
@@ -758,6 +761,7 @@ async def create_audit_target(
 async def update_audit_target(
     target_id: str, body: AuditTargetBody, current_user: CurrentUser, db: DB
 ) -> AuditTargetResponse:
+    forbid_in_demo_mode("Audit-forward target updates are disabled")
     if not current_user.is_superadmin:
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN)
     row = await db.get(AuditForwardTarget, target_id)

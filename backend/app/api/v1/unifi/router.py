@@ -27,6 +27,7 @@ from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.core.crypto import decrypt_str, encrypt_str
+from app.core.demo_mode import forbid_in_demo_mode
 from app.core.permissions import require_resource_permission
 from app.models.audit import AuditLog
 from app.models.dns import DNSServerGroup
@@ -637,6 +638,7 @@ async def get_controller_dashboard(
     status_code=status.HTTP_201_CREATED,
 )
 async def create_controller(body: ControllerCreate, db: DB, user: SuperAdmin) -> ControllerResponse:
+    forbid_in_demo_mode("UniFi controller registration is disabled")
     await _validate_bindings(db, body.ipam_space_id, body.dns_group_id)
     _validate_mode_consistency(
         mode=body.mode,

@@ -209,7 +209,17 @@ async def platform_health() -> JSONResponse:
         if c["status"] == "warn" and rollup == "ok":
             rollup = "degraded"
 
+    # Surface demo-mode to the frontend so AppLayout can render a
+    # persistent banner. Cheap to bundle here — every authenticated
+    # page already polls /health/platform for the status dots, so we
+    # avoid a separate round-trip on every page load.
+    from app.config import settings as _settings
+
     return JSONResponse(
         status_code=status.HTTP_200_OK,
-        content={"status": rollup, "components": components},
+        content={
+            "status": rollup,
+            "components": components,
+            "demo_mode": bool(_settings.demo_mode),
+        },
     )

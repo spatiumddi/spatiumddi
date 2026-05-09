@@ -38,6 +38,10 @@ async def _seed_default_admin() -> None:
         try:
             count = await session.scalar(select(func.count()).select_from(User))
             if count == 0:
+                # Demo deployments lock the password (admin/admin
+                # sticks for the next visitor); skip the
+                # force-password-change flag so the demo lands on the
+                # dashboard instead of a redirect to a 403'd form.
                 admin = User(
                     username="admin",
                     email="admin@localhost",
@@ -46,7 +50,7 @@ async def _seed_default_admin() -> None:
                     is_superadmin=True,
                     is_active=True,
                     auth_source="local",
-                    force_password_change=True,
+                    force_password_change=not settings.demo_mode,
                 )
                 session.add(admin)
                 await session.commit()
@@ -264,6 +268,42 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await seed_audit_chain_alert_rule()
     except Exception as exc:  # noqa: BLE001
         logger.debug("audit_chain_alert_rule_seed_skipped", reason=str(exc))
+    # Demo-mode lockdown — force the restricted feature modules off
+    # and mirror the integration toggles into PlatformSettings so the
+    # beat reconcilers stop. Idempotent; failure-tolerant. The PATCH
+    # endpoint refuses to re-enable any restricted module while
+    # ``DEMO_MODE=1`` is in effect (see app.core.demo_mode).
+    if settings.demo_mode:
+        try:
+            from sqlalchemy import select  # noqa: PLC0415
+
+            from app.core.demo_mode import (  # noqa: PLC0415
+                DEMO_RESTRICTED_MODULES,
+            )
+            from app.db import AsyncSessionLocal  # noqa: PLC0415
+            from app.models.settings import PlatformSettings  # noqa: PLC0415
+            from app.services import feature_modules as fm_svc  # noqa: PLC0415
+
+            async with AsyncSessionLocal() as session:
+                for module_id in DEMO_RESTRICTED_MODULES:
+                    if not fm_svc.is_known(module_id):
+                        continue
+                    await fm_svc.set_module_enabled(session, module_id, False, user_id=None)
+                    mirror = fm_svc.INTEGRATION_SETTINGS_MIRROR.get(module_id)
+                    if mirror is not None:
+                        ps = await session.scalar(
+                            select(PlatformSettings).where(PlatformSettings.id == 1)
+                        )
+                        if ps is not None:
+                            setattr(ps, mirror, False)
+                await session.commit()
+            fm_svc.invalidate_cache()
+            logger.info(
+                "demo_mode_lockdown_applied",
+                restricted_modules=sorted(DEMO_RESTRICTED_MODULES),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("demo_mode_lockdown_skipped", reason=str(exc))
     yield
     logger.info("shutdown", service="api")
 

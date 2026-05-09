@@ -24,6 +24,7 @@ from pydantic import BaseModel
 from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
+from app.core.demo_mode import DEMO_RESTRICTED_MODULES, is_demo_mode
 from app.models.audit import AuditLog
 from app.models.feature_module import FeatureModule
 from app.models.settings import PlatformSettings
@@ -80,6 +81,18 @@ async def toggle_feature_module(
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=f"Unknown feature module: {module_id}",
+        )
+
+    # Demo-mode lockdown — re-enable attempts on the curated
+    # abusable surface (nmap, AI, integrations) get 403'd. Disabling
+    # is always allowed (operator can voluntarily turn off more).
+    if is_demo_mode() and body.enabled and module_id in DEMO_RESTRICTED_MODULES:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                f"Feature '{module_id}' cannot be enabled while this "
+                "instance is running in demo mode."
+            ),
         )
 
     spec = fm_svc.MODULES_BY_ID[module_id]

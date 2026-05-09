@@ -26,6 +26,7 @@ from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser
 from app.config import settings
+from app.core.demo_mode import forbid_in_demo_mode
 from app.models.backup import BackupTarget
 from app.services.factory_reset import (
     FACTORY_SECTIONS,
@@ -196,6 +197,7 @@ async def execute(body: ExecuteRequest, db: DB, current_user: CurrentUser) -> Ex
     """Run the destructive factory reset. Validates every guardrail
     server-side before any TRUNCATE runs.
     """
+    forbid_in_demo_mode("Factory reset is disabled")
     _require_superadmin(current_user)
 
     # 1. Validate section keys.

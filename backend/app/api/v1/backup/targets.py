@@ -24,6 +24,7 @@ from sqlalchemy.orm import attributes
 
 from app.api.deps import DB, CurrentUser
 from app.core.crypto import encrypt_str
+from app.core.demo_mode import forbid_in_demo_mode
 from app.models.audit import AuditLog
 from app.models.backup import BackupTarget
 from app.services.backup.runner import run_backup_for_target
@@ -202,6 +203,7 @@ async def get_target(
 async def create_target(
     body: BackupTargetCreate, db: DB, current_user: CurrentUser
 ) -> BackupTargetResponse:
+    forbid_in_demo_mode("Backup target creation is disabled")
     _require_superadmin(current_user)
     if body.retention_keep_last_n is not None and body.retention_keep_days is not None:
         raise HTTPException(

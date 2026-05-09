@@ -37,6 +37,7 @@ from sqlalchemy import desc, select
 
 from app.api.deps import DB, CurrentUser, SuperAdmin
 from app.core.crypto import decrypt_str, encrypt_str
+from app.core.demo_mode import forbid_in_demo_mode
 from app.models.event_subscription import EventOutbox, EventSubscription
 from app.services import event_delivery
 from app.services.event_publisher import (
@@ -203,6 +204,7 @@ async def list_subscriptions(_user: SuperAdmin, db: DB) -> list[WebhookSubscript
 async def create_subscription(
     body: WebhookSubscriptionWrite, _user: SuperAdmin, db: DB
 ) -> WebhookSubscriptionResponse:
+    forbid_in_demo_mode("Webhook subscription creation is disabled")
     sub = EventSubscription()
     plaintext = _apply_body(sub, body, creating=True)
     db.add(sub)
@@ -232,6 +234,7 @@ async def update_subscription(
     _user: SuperAdmin,
     db: DB,
 ) -> WebhookSubscriptionResponse:
+    forbid_in_demo_mode("Webhook subscription updates are disabled")
     sub = await db.get(EventSubscription, sub_id)
     if sub is None:
         raise HTTPException(status_code=404, detail="Subscription not found")
