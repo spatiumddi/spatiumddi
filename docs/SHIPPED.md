@@ -38,6 +38,42 @@ Mirrors CLAUDE.md's three mixed sections:
 
   Both deferrals captured in the issue close-out comment.
 
+- ✅ **DNS configuration importer — BIND9, PowerDNS, Windows DNS**
+  ([#128](https://github.com/spatiumddi/spatiumddi/issues/128))
+  — One-shot migration tool that turns three common upstream DNS
+  sources into native SpatiumDDI zones + records. Three phases
+  shipped 2026-05-09 across seven commits; all three sources feed
+  the same source-agnostic canonical IR (`ImportedZone` /
+  `ImportedRecord` / `ImportedSOA` / `ZoneConflict` /
+  `ImportPreview`) so conflict handling + per-zone savepoint
+  commit + audit logging stay in lock-step. Explicit one-shot
+  semantics — once imported, SpatiumDDI is the source of truth
+  with no continuous two-way mirror; operators wanting a running
+  mirror are served by the existing read-only Path A drivers.
+  Imported rows carry `import_source` (`bind9 | windows_dns |
+  powerdns`) + `imported_at` provenance columns + audit-log
+  `new_value` blob so re-imports dedupe and operators can answer
+  "where did this come from" later.
+
+  | Phase | Wave | Commit | What landed |
+  |---|---|---|---|
+  | 1 | 1 | `787a328` | Data model — migration `b7e2d9a5f314` adds `import_source` + `imported_at` to `dns_zone` + `dns_record` with partial index `WHERE import_source IS NOT NULL`; seeds `dns.import` feature module (default-enabled, new "DNS" group on Settings → Features) |
+  | 1 | 2 | `32f4059` | BIND9 archive parser — `services/dns_import/bind9.py` unpacks `.zip` / `.tar(.gz/.bz2/.xz)` (50 MB archive cap, 200 MB unpacked cap, path-traversal rejection, regular-files-only filter), tokenises `named.conf` for `zone "..." { ... };` declarations including nested `view {} ` blocks, four-strategy `file` directive resolution (absolute-as-archive-relative → `options.directory` → named.conf parent dir → basename search), reuses `dns_io.parser.parse_zone_file` (dnspython-backed) for per-zone master file parsing. DNSSEC records (DNSKEY/RRSIG/NSEC*/DS/CDS/CDNSKEY) stripped with per-zone "stripped N records, re-sign post-import" warning |
+  | 1 | 3 | `920b31f` | Preview/commit endpoints — `POST /dns/import/bind9/{preview,commit}` (preview is multipart, commit is JSON carrying the previewed plan + per-zone `conflict_actions`), source-agnostic `commit_import` write layer with per-zone savepoints (failure on zone N rolls back N but keeps zones 1..N-1) + audit log per zone tagged `new_value.import_source=bind9` |
+  | 1 | 4 | `196e1a2` | Admin UI — `/admin/dns-import` page with three tabs (BIND9 active, Windows DNS / PowerDNS placeholder), preview + commit panels with per-row Action-on-conflict select (skip/overwrite/rename), action pills + records-created/deleted columns on the result panel, sidebar entry under Administration → Configuration |
+  | 1 | 5 | `cddd82a` | 17 tests — parser layer (basic .tar.gz + .zip, reverse zone, view block, DNSSEC strip, missing named.conf, empty zone list, path traversal, partial import, comment styles) + commit layer (preview, commit with provenance, default skip-on-conflict, overwrite, rename, missing target group → 422). Companion: `dns_io.parser.ParsedZone` gains `skipped_types` histogram so callers can warn about DNSSEC + experimental rdtypes. View warning fires on any view, not just multi-view |
+  | 2 | — | `a2900bb` | Windows DNS live pull — `services/dns_import/windows_dns.py` reuses `WindowsDNSDriver.pull_zones_from_server` + `pull_zone_records` (Path B WinRM read methods the Logs surface already drives). Maps Windows zone-types (Primary/Secondary/Stub/Forwarder), honours `IsReverseLookupZone` flag, applies SOA defaults with "edit primary_ns/admin_email post-import" warning (Windows owns SOA on the server side), per-zone record-pull failures become warnings rather than aborting. System-zone awareness for TrustAnchors / RootDNSServers / `_msdcs.*` / DomainDnsZones / ForestDnsZones / 0.in-addr.arpa with both per-zone + top-level preview warnings (not silently filtered — some shops replicate `_msdcs` for staging). New `GET /dns/import/windows-dns/servers` for the picker (lists driver=windows_dns servers with `has_credentials` flag), `POST .../{preview,commit}`. UI tab parallels BIND9 with server dropdown instead of file picker; servers without WinRM creds listed-but-disabled. 8 new tests with `WindowsDNSDriver.pull_*` monkeypatched |
+  | 3 | — | `0fe73df` | PowerDNS REST live pull — `services/dns_import/powerdns.py` is a fresh httpx-backed REST client that walks `GET /api/v1/servers/{id}/zones` then per-zone `GET /zones/{zone_id}` for the rrset payload. SOA hoisted from rrset content (PowerDNS encodes it as one space-separated string), MX preference + SRV priority/weight/port split out of `content` into the dedicated columns, `kind` mapping (Native/Master → primary, Slave → secondary, Producer/Consumer → primary for now, Forward → forward). Disabled records (`disabled: true` operator soft-delete) dropped with a warning, DNSSEC + PowerDNS-specific (LUA, ALIAS) rdtypes dropped with two distinct warnings, hard cap of 5000 zones per pull. `test_powerdns_connection()` probes `/api/v1/servers/{id}` for daemon info so the UI's "Test connection" button can confirm a live API. URL accepts both `http://host:8081` and `http://host:8081/api/v1`. New `POST /dns/import/powerdns/{test-connection,preview,commit}` (credentials in body, never persisted — upstream isn't managed by SpatiumDDI). UI tab with API URL + password-masked API key + server-name + Test connection button (shows daemon version pill on success). 9 new tests with `httpx.AsyncClient` monkeypatched via `MockTransport` |
+
+  **Test coverage**: 34 cases total in `backend/tests/test_dns_import.py` + `test_dns_import_windows.py` + `test_dns_import_powerdns.py` covering all three sources end-to-end through the FastAPI test client.
+
+  **Phase 4 polish split out to [#130](https://github.com/spatiumddi/spatiumddi/issues/130)** — gated on real operator demand:
+  * **Catalog-zone awareness** — current "imports as a regular zone" is fine for most cases (catalog zones are rare in BIND9/PowerDNS deployments people migrate *from*); operator can delete post-import. Build trigger: a real operator hits this and is surprised.
+  * **Multi-view → per-view import** — hard blocked on [#24 DNS Views](https://github.com/spatiumddi/spatiumddi/issues/24); current behavior collapses to default view with a warning.
+  * **`propose_dns_import` MCP tool** — low value over the UI; build if specifically asked.
+
+  **One item dropped, not deferred**: DNSSEC re-sign automation. Current "strip on import + warn + operator re-enables in zone editor" is the right UX — auto-enabling at import time would bake in algorithm/KSK/ZSK choices the operator should make on the SpatiumDDI side. Don't re-pitch.
+
 - ✅ **PowerDNS authoritative driver — second driver alongside BIND9**
   ([#127](https://github.com/spatiumddi/spatiumddi/issues/127))
   — Full second authoritative DNS driver with native REST API +
