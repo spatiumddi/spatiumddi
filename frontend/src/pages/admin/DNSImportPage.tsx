@@ -9,6 +9,7 @@ import {
   FileArchive,
   Loader2,
   RotateCcw,
+  Server as ServerIcon,
   Trash2,
   Upload,
 } from "lucide-react";
@@ -21,6 +22,7 @@ import {
   type DNSImportPreview,
   type DNSImportSource,
   type DNSImportZoneConflict,
+  type WindowsDNSServerOption,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { HeaderButton } from "@/components/ui/header-button";
@@ -53,10 +55,9 @@ const TABS: TabDef[] = [
     id: "windows_dns",
     label: "Windows DNS",
     short: "WinRM live pull",
-    available: false,
-    badge: "Phase 2",
+    available: true,
     description:
-      "Live-pull every zone + record from a Windows DNS server using the same WinRM read driver the Logs surface uses. Pick a server group + an existing Windows DNS server in that group and the importer walks Get-DnsServerZone + Get-DnsServerResourceRecord. Coming in Phase 2.",
+      "Live-pull every zone + record from a Windows DNS server using the same WinRM read driver the Logs surface uses. Pick a Windows DNS server already registered in SpatiumDDI (with WinRM credentials configured) and the importer walks Get-DnsServerZone + Get-DnsServerResourceRecord. Windows owns SOA on the server side — imported zones get default SOA values that you can edit via the zone editor post-import.",
   },
   {
     id: "powerdns",
@@ -151,10 +152,11 @@ export function DNSImportPage() {
         </div>
 
         {tab === "bind9" && <BindTab />}
-        {tab !== "bind9" && (
+        {tab === "windows_dns" && <WindowsDNSTab />}
+        {tab === "powerdns" && (
           <div className="rounded-md border border-dashed p-8 text-center text-sm text-muted-foreground">
             <CircleDashed className="mx-auto mb-2 h-6 w-6" />
-            {active.label} import is not yet available — see the badge above.
+            PowerDNS import is not yet available — see the badge above.
           </div>
         )}
       </div>
@@ -296,6 +298,302 @@ function BindTab() {
           )}
         </>
       )}
+    </div>
+  );
+}
+
+// ── Windows DNS tab body ─────────────────────────────────────────────
+
+interface WindowsDNSState {
+  serverId: string;
+  groupId: string;
+  viewId: string;
+  preview: DNSImportPreview | null;
+  decisions: Record<string, DNSImportConflictDecision>;
+  result: DNSImportCommitResult | null;
+  phase: Phase;
+  error: string | null;
+}
+
+function emptyWindowsState(): WindowsDNSState {
+  return {
+    serverId: "",
+    groupId: "",
+    viewId: "",
+    preview: null,
+    decisions: {},
+    result: null,
+    phase: "select",
+    error: null,
+  };
+}
+
+function WindowsDNSTab() {
+  const [state, setState] = useState<WindowsDNSState>(emptyWindowsState());
+
+  const groupsQ = useQuery({
+    queryKey: ["dns-groups"],
+    queryFn: () => dnsApi.listGroups(),
+  });
+  const viewsQ = useQuery({
+    queryKey: ["dns-views", state.groupId],
+    queryFn: () =>
+      state.groupId ? dnsApi.listViews(state.groupId) : Promise.resolve([]),
+    enabled: Boolean(state.groupId),
+  });
+  const serversQ = useQuery({
+    queryKey: ["dns-import-windows-servers"],
+    queryFn: () => dnsImportApi.windowsDNSServers(),
+  });
+
+  const previewMut = useMutation({
+    mutationFn: () => {
+      if (!state.serverId || !state.groupId) {
+        throw new Error(
+          "Pick a Windows DNS server and target server group first",
+        );
+      }
+      return dnsImportApi.windowsDNSPreview({
+        server_id: state.serverId,
+        target_group_id: state.groupId,
+        target_view_id: state.viewId || null,
+      });
+    },
+    onSuccess: (preview) => {
+      const decisions: Record<string, DNSImportConflictDecision> = {};
+      for (const c of preview.conflicts) {
+        decisions[c.zone_name] = { action: c.action, rename_to: c.rename_to };
+      }
+      setState((s) => ({
+        ...s,
+        preview,
+        decisions,
+        phase: "ready",
+        error: null,
+      }));
+    },
+    onError: (err: unknown) => {
+      const detail =
+        (err as { response?: { data?: { detail?: string } } })?.response?.data
+          ?.detail ?? (err as Error).message;
+      setState((s) => ({ ...s, phase: "select", error: detail }));
+    },
+  });
+
+  const commitMut = useMutation({
+    mutationFn: () => {
+      if (!state.preview) throw new Error("Preview the server first");
+      return dnsImportApi.windowsDNSCommit({
+        target_group_id: state.groupId,
+        target_view_id: state.viewId || null,
+        plan: state.preview,
+        conflict_actions: state.decisions,
+      });
+    },
+    onSuccess: (result) => {
+      setState((s) => ({ ...s, result, phase: "result", error: null }));
+    },
+    onError: (err: unknown) => {
+      const detail =
+        (err as { response?: { data?: { detail?: string } } })?.response?.data
+          ?.detail ?? (err as Error).message;
+      setState((s) => ({ ...s, phase: "ready", error: detail }));
+    },
+  });
+
+  const conflictByZone = useMemo(() => {
+    const m = new Map<string, DNSImportZoneConflict>();
+    for (const c of state.preview?.conflicts ?? []) m.set(c.zone_name, c);
+    return m;
+  }, [state.preview]);
+
+  const reset = () => setState(emptyWindowsState());
+
+  return (
+    <div className="space-y-4">
+      {state.error && (
+        <div className="flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/10 p-3 text-xs text-destructive">
+          <AlertTriangle className="mt-0.5 h-4 w-4 flex-shrink-0" />
+          <div>{state.error}</div>
+        </div>
+      )}
+
+      {state.phase === "result" && state.result ? (
+        <CommitResultPanel result={state.result} onReset={reset} />
+      ) : (
+        <>
+          <WindowsDNSPullForm
+            state={state}
+            setState={setState}
+            servers={serversQ.data ?? []}
+            serversLoading={serversQ.isLoading}
+            groups={groupsQ.data ?? []}
+            views={viewsQ.data ?? []}
+            onPreview={() => {
+              setState((s) => ({ ...s, phase: "previewing", error: null }));
+              previewMut.mutate();
+            }}
+            previewing={previewMut.isPending}
+          />
+
+          {state.preview && state.phase !== "previewing" && (
+            <PreviewPanel
+              preview={state.preview}
+              decisions={state.decisions}
+              setDecisions={(updater) =>
+                setState((s) => ({ ...s, decisions: updater(s.decisions) }))
+              }
+              conflictByZone={conflictByZone}
+              onCommit={() => {
+                setState((s) => ({ ...s, phase: "committing", error: null }));
+                commitMut.mutate();
+              }}
+              committing={commitMut.isPending}
+              onReset={reset}
+            />
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+function WindowsDNSPullForm({
+  state,
+  setState,
+  servers,
+  serversLoading,
+  groups,
+  views,
+  onPreview,
+  previewing,
+}: {
+  state: WindowsDNSState;
+  setState: React.Dispatch<React.SetStateAction<WindowsDNSState>>;
+  servers: WindowsDNSServerOption[];
+  serversLoading: boolean;
+  groups: { id: string; name: string }[];
+  views: { id: string; name: string }[];
+  onPreview: () => void;
+  previewing: boolean;
+}) {
+  const canPreview = Boolean(state.serverId && state.groupId) && !previewing;
+  const eligible = servers.filter((s) => s.has_credentials);
+  const hasIneligible = servers.length > eligible.length;
+
+  return (
+    <div className="rounded-md border bg-muted/20 p-4">
+      <div className="mb-3 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+        1. Pick source + target
+      </div>
+      <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+        <div>
+          <label className="block text-sm font-medium">
+            Windows DNS server
+          </label>
+          <p className="mb-2 text-[11px] text-muted-foreground">
+            Pick a registered windows_dns server with WinRM credentials already
+            configured. The pull walks Get-DnsServerZone +
+            Get-DnsServerResourceRecord. Servers without credentials are greyed
+            out — open the DNS server modal to add them.
+          </p>
+          <select
+            value={state.serverId}
+            onChange={(e) =>
+              setState((s) => ({
+                ...s,
+                serverId: e.target.value,
+                preview: null,
+                error: null,
+              }))
+            }
+            disabled={serversLoading}
+            className="w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+          >
+            <option value="">
+              {serversLoading
+                ? "Loading…"
+                : eligible.length === 0
+                  ? "— no eligible servers —"
+                  : "— select —"}
+            </option>
+            {servers.map((srv) => (
+              <option
+                key={srv.id}
+                value={srv.id}
+                disabled={!srv.has_credentials}
+              >
+                {srv.group_name} / {srv.name} ({srv.host})
+                {!srv.has_credentials ? " — no creds" : ""}
+              </option>
+            ))}
+          </select>
+          {hasIneligible && (
+            <p className="mt-1 text-[11px] text-amber-700 dark:text-amber-400">
+              Some servers are listed but disabled — they don't have WinRM
+              credentials configured yet.
+            </p>
+          )}
+        </div>
+        <div className="space-y-3">
+          <div>
+            <label className="block text-sm font-medium">
+              Target server group
+            </label>
+            <p className="mb-2 text-[11px] text-muted-foreground">
+              Imported zones land in this group — usually the same one the
+              source server already belongs to, but you can land them in a
+              different group (e.g., a staging group) for review.
+            </p>
+            <select
+              value={state.groupId}
+              onChange={(e) =>
+                setState((s) => ({ ...s, groupId: e.target.value, viewId: "" }))
+              }
+              className="w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+            >
+              <option value="">— select —</option>
+              {groups.map((g) => (
+                <option key={g.id} value={g.id}>
+                  {g.name}
+                </option>
+              ))}
+            </select>
+          </div>
+          {views.length > 0 && (
+            <div>
+              <label className="block text-sm font-medium">
+                Target view (optional)
+              </label>
+              <select
+                value={state.viewId}
+                onChange={(e) =>
+                  setState((s) => ({ ...s, viewId: e.target.value }))
+                }
+                className="w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+              >
+                <option value="">Default view</option>
+                {views.map((v) => (
+                  <option key={v.id} value={v.id}>
+                    {v.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
+        </div>
+      </div>
+      <div className="mt-4 flex justify-end gap-2">
+        <HeaderButton
+          variant="primary"
+          icon={previewing ? Loader2 : ServerIcon}
+          iconClassName={previewing ? "animate-spin" : undefined}
+          onClick={onPreview}
+          disabled={!canPreview}
+        >
+          {previewing ? "Pulling zones…" : "Preview import"}
+        </HeaderButton>
+      </div>
     </div>
   );
 }

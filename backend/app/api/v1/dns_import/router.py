@@ -19,12 +19,16 @@ from typing import Literal
 import structlog
 from fastapi import APIRouter, Body, File, Form, HTTPException, UploadFile, status
 from pydantic import BaseModel, Field
+from sqlalchemy import select
 
 from app.api.deps import DB, SuperAdmin
+from app.models.dns import DNSServer, DNSServerGroup
 from app.services.dns_import import (
     CommitResult,
     ImportSourceError,
+    WindowsDNSImportError,
     parse_bind9_archive,
+    parse_windows_dns_server,
 )
 from app.services.dns_import.canonical import (
     ConflictAction,
@@ -115,6 +119,32 @@ class CommitIn(BaseModel):
     # left untouched can be omitted; the commit defaults them to
     # skip-on-conflict / create-otherwise.
     conflict_actions: dict[str, ConflictDecision] = Field(default_factory=dict)
+
+
+class WindowsDNSPreviewIn(BaseModel):
+    """Body shape for ``POST /dns/import/windows-dns/preview``.
+
+    Unlike BIND9 (which takes a multipart upload), Windows DNS is a
+    live pull — the operator picks a pre-registered Windows DNS
+    server row and the server pulls zones + records over WinRM.
+    """
+
+    server_id: uuid.UUID
+    target_group_id: uuid.UUID
+    target_view_id: uuid.UUID | None = None
+
+
+class WindowsDNSServerOption(BaseModel):
+    """One row in the windows_dns server picker — drives the UI's
+    server dropdown (filtered to ``driver=windows_dns`` rows that
+    have credentials configured)."""
+
+    id: uuid.UUID
+    name: str
+    host: str
+    group_id: uuid.UUID
+    group_name: str
+    has_credentials: bool
 
 
 class CommitZoneOut(BaseModel):
@@ -339,6 +369,156 @@ async def bind9_commit(
 
     logger.info(
         "dns_import_bind9_commit",
+        target_group_id=str(body.target_group_id),
+        zones_created=result.total_zones_created,
+        zones_overwrote=result.total_zones_overwrote,
+        zones_renamed=result.total_zones_renamed,
+        zones_skipped=result.total_zones_skipped,
+        zones_failed=result.total_zones_failed,
+        records_created=result.total_records_created,
+        user=current_user.display_name,
+    )
+    return _commit_result_to_pydantic(result)
+
+
+# ── Windows DNS endpoints (Phase 2) ──────────────────────────────────
+
+
+@router.get("/windows-dns/servers", response_model=list[WindowsDNSServerOption])
+async def windows_dns_servers(
+    _: SuperAdmin,
+    db: DB,
+) -> list[WindowsDNSServerOption]:
+    """List every ``driver=windows_dns`` server with its group, for
+    the UI's server picker.
+
+    Returns the server's ``has_credentials`` flag so the picker can
+    grey out servers that haven't had WinRM creds configured yet —
+    Path B requires them, and the UI shouldn't let the operator
+    pick a server we know will fail at preview time.
+    """
+
+    rows = (
+        await db.execute(
+            select(DNSServer, DNSServerGroup)
+            .join(DNSServerGroup, DNSServer.group_id == DNSServerGroup.id)
+            .where(DNSServer.driver == "windows_dns")
+            .order_by(DNSServerGroup.name, DNSServer.name)
+        )
+    ).all()
+    return [
+        WindowsDNSServerOption(
+            id=server.id,
+            name=server.name,
+            host=server.host or "",
+            group_id=group.id,
+            group_name=group.name,
+            has_credentials=bool(server.credentials_encrypted),
+        )
+        for (server, group) in rows
+    ]
+
+
+@router.post("/windows-dns/preview", response_model=PreviewOut)
+async def windows_dns_preview(
+    current_user: SuperAdmin,
+    db: DB,
+    body: WindowsDNSPreviewIn = Body(...),
+) -> PreviewOut:
+    """Live-pull every zone + record from a Windows DNS server.
+
+    Validates the server row + WinRM creds before delegating to
+    :func:`parse_windows_dns_server`. The pull blocks until every
+    zone's records have been walked — a 50-zone server takes a few
+    seconds; a 5000-zone server takes minutes. The UI shows a
+    progress spinner during the wait.
+    """
+
+    server = (
+        await db.execute(select(DNSServer).where(DNSServer.id == body.server_id))
+    ).scalar_one_or_none()
+    if server is None:
+        raise HTTPException(status_code=404, detail=f"DNS server {body.server_id} not found")
+    if server.driver != "windows_dns":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Server {server.name!r} is driver {server.driver!r}; expected windows_dns",
+        )
+    if not server.credentials_encrypted:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Server {server.name!r} has no WinRM credentials configured. "
+                "Add them via the DNS server modal before importing."
+            ),
+        )
+
+    try:
+        preview = await parse_windows_dns_server(server)
+    except WindowsDNSImportError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+    zone_names = [(z.name if z.name.endswith(".") else z.name + ".").lower() for z in preview.zones]
+    preview.conflicts = await detect_conflicts(
+        db,
+        zone_names=zone_names,
+        target_group_id=body.target_group_id,
+        target_view_id=body.target_view_id,
+    )
+
+    logger.info(
+        "dns_import_windows_dns_preview",
+        server_id=str(body.server_id),
+        zone_count=len(preview.zones),
+        record_count=preview.total_records,
+        conflict_count=len(preview.conflicts),
+        warning_count=len(preview.warnings),
+        target_group_id=str(body.target_group_id),
+        target_view_id=str(body.target_view_id) if body.target_view_id else None,
+        user=current_user.display_name,
+    )
+    return _preview_to_pydantic(preview)
+
+
+@router.post("/windows-dns/commit", response_model=CommitOut)
+async def windows_dns_commit(
+    current_user: SuperAdmin,
+    db: DB,
+    body: CommitIn = Body(...),
+) -> CommitOut:
+    """Apply a previously-previewed Windows DNS import.
+
+    Identical pipeline as the BIND9 commit — re-detect conflicts,
+    per-zone savepoints, audit log per zone — just dispatched via
+    a different endpoint so the operator-side UI is keyed by source.
+    """
+
+    if body.plan.source != "windows_dns":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Plan source mismatch: endpoint=windows_dns plan={body.plan.source}",
+        )
+
+    preview = _preview_from_pydantic(body.plan)
+    actions: dict[str, tuple[ConflictAction, str | None]] = {
+        zone_name: (decision.action, decision.rename_to)
+        for zone_name, decision in body.conflict_actions.items()
+    }
+
+    try:
+        result = await commit_import(
+            db,
+            preview=preview,
+            target_group_id=body.target_group_id,
+            target_view_id=body.target_view_id,
+            conflict_actions=actions,
+            current_user=current_user,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    logger.info(
+        "dns_import_windows_dns_commit",
         target_group_id=str(body.target_group_id),
         zones_created=result.total_zones_created,
         zones_overwrote=result.total_zones_overwrote,

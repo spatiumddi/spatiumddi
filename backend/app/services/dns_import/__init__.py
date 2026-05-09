@@ -21,6 +21,7 @@ from .canonical import (
     ZoneConflict,
 )
 from .commit import CommitResult, CommitZoneResult, commit_import, detect_conflicts
+from .windows_dns import WindowsDNSImportError, parse_windows_dns_server
 
 __all__ = [
     "CommitResult",
@@ -32,8 +33,10 @@ __all__ = [
     "ImportPreview",
     "ImportSource",
     "ImportSourceError",
+    "WindowsDNSImportError",
     "ZoneConflict",
     "commit_import",
     "detect_conflicts",
     "parse_bind9_archive",
+    "parse_windows_dns_server",
 ]

@@ -4693,6 +4693,15 @@ export interface DNSImportCommitResult {
   total_records_created: number;
 }
 
+export interface WindowsDNSServerOption {
+  id: string;
+  name: string;
+  host: string;
+  group_id: string;
+  group_name: string;
+  has_credentials: boolean;
+}
+
 export const dnsImportApi = {
   bind9Preview: (
     file: File,
@@ -4715,6 +4724,29 @@ export const dnsImportApi = {
   }) =>
     api
       .post<DNSImportCommitResult>("/dns/import/bind9/commit", body)
+      .then((r) => r.data),
+
+  // Windows DNS — server-side live pull.
+  windowsDNSServers: () =>
+    api
+      .get<WindowsDNSServerOption[]>("/dns/import/windows-dns/servers")
+      .then((r) => r.data),
+  windowsDNSPreview: (body: {
+    server_id: string;
+    target_group_id: string;
+    target_view_id?: string | null;
+  }) =>
+    api
+      .post<DNSImportPreview>("/dns/import/windows-dns/preview", body)
+      .then((r) => r.data),
+  windowsDNSCommit: (body: {
+    target_group_id: string;
+    target_view_id?: string | null;
+    plan: DNSImportPreview;
+    conflict_actions: Record<string, DNSImportConflictDecision>;
+  }) =>
+    api
+      .post<DNSImportCommitResult>("/dns/import/windows-dns/commit", body)
       .then((r) => r.data),
 };
 
