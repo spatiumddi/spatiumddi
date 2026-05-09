@@ -296,15 +296,15 @@ jobs:
           fi
           ZONE="dnssec-smoke.test."
           echo "→ creating zone $ZONE inside $POD"
-          kubectl -n spatiumddi exec "$POD" -- pdnsutil create-zone "$ZONE" || {
+          kubectl -n spatiumddi exec "$POD" -- pdnsutil --config-dir=/var/lib/spatium-dns-agent/rendered create-zone "$ZONE" || {
             echo "pdnsutil create-zone failed; dumping logs:"
             kubectl -n spatiumddi logs "$POD" --tail=120
             exit 1
           }
-          kubectl -n spatiumddi exec "$POD" -- pdnsutil add-record "$ZONE" www A 192.0.2.42
+          kubectl -n spatiumddi exec "$POD" -- pdnsutil --config-dir=/var/lib/spatium-dns-agent/rendered add-record "$ZONE" www A 192.0.2.42
           echo "→ signing $ZONE"
-          kubectl -n spatiumddi exec "$POD" -- pdnsutil secure-zone "$ZONE"
-          kubectl -n spatiumddi exec "$POD" -- pdnsutil rectify-zone "$ZONE"
+          kubectl -n spatiumddi exec "$POD" -- pdnsutil --config-dir=/var/lib/spatium-dns-agent/rendered secure-zone "$ZONE"
+          kubectl -n spatiumddi exec "$POD" -- pdnsutil --config-dir=/var/lib/spatium-dns-agent/rendered rectify-zone "$ZONE"
           # Verify the signed answer comes back with RRSIG records.
           # We don't expect AD here — pdns_server is authoritative,
           # not a validating resolver — but RRSIG presence proves the
@@ -325,14 +325,14 @@ jobs:
             echo "RRSIG present in answer — signing pipeline confirmed"
           else
             echo "no RRSIG in dig output — signing didn't take effect"
-            kubectl -n spatiumddi exec "$POD" -- pdnsutil show-zone "$ZONE" || true
+            kubectl -n spatiumddi exec "$POD" -- pdnsutil --config-dir=/var/lib/spatium-dns-agent/rendered show-zone "$ZONE" || true
             kubectl -n spatiumddi logs "$POD" --tail=120
             exit 1
           fi
           # Cleanup so a re-run on the same pod doesn't trip on a
           # pre-existing zone (kind clusters are ephemeral but be
           # explicit anyway).
-          kubectl -n spatiumddi exec "$POD" -- pdnsutil delete-zone "$ZONE" || true
+          kubectl -n spatiumddi exec "$POD" -- pdnsutil --config-dir=/var/lib/spatium-dns-agent/rendered delete-zone "$ZONE" || true
 
       - name: DNS agents registered with control plane
         run: |
