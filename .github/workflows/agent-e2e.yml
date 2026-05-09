@@ -11,11 +11,13 @@ name: Agent E2E (kind)
 #      CHAOS-class equivalent.
 #   5. Both pods register and stay stable (low restart count).
 #
-# Uses the ghcr.io/spatiumddi/*:latest images built by the dns /
-# dhcp / release workflows on main, so this exercises what a real
-# operator would pull down today. Changes to any of those pipelines
-# should trigger this workflow so a broken image gets caught in PR
-# review instead of by a user's first `helm install`.
+# Uses the ghcr.io/spatiumddi/*:main images, which the dns / dhcp /
+# release workflows republish on every push to main. ``:main`` is
+# preferred over ``:latest`` here because ``:latest`` is only stamped
+# by the CalVer release workflow — newly-added images (like
+# ``dns-powerdns``) don't get a ``:latest`` tag until the next release
+# is cut. Smoking against ``:main`` means we test what's actually on
+# main *today*, which is closer to what a PR would break.
 
 on:
   pull_request:
@@ -35,9 +37,9 @@ on:
   workflow_dispatch:
     inputs:
       image_tag:
-        description: "Image tag to deploy (defaults to 'latest')"
+        description: "Image tag to deploy (defaults to 'main')"
         required: false
-        default: "latest"
+        default: "main"
 
 # Least-privilege default — this workflow only needs to read the repo
 # to pull the chart + manifests. No contents/packages/issues/PR
@@ -68,10 +70,36 @@ jobs:
       - name: Pull chart subcharts
         run: helm dependency update charts/spatiumddi
 
+      - name: Preload Bitnami subchart images into kind
+        # Sidesteps Docker Hub anonymous rate-limits for the bundled
+        # postgresql + redis subcharts. Pulling once on the runner
+        # host and side-loading into kind means the cluster never
+        # talks to docker.io directly — kind's containerd serves
+        # both pods from its own loaded set. The tags must match
+        # what the umbrella chart resolves at template time; bump
+        # them in lockstep with the postgresql + redis subchart
+        # version pins in charts/spatiumddi/Chart.yaml.
+        run: |
+          PG_IMAGE=$(helm template ddi charts/spatiumddi 2>/dev/null \
+            | grep -E "image: docker.io/bitnami/postgresql:" -m1 \
+            | awk '{print $2}')
+          RD_IMAGE=$(helm template ddi charts/spatiumddi 2>/dev/null \
+            | grep -E "image: docker.io/bitnami/redis:" -m1 \
+            | awk '{print $2}')
+          echo "preloading $PG_IMAGE + $RD_IMAGE into kind"
+          for img in "$PG_IMAGE" "$RD_IMAGE"; do
+            for attempt in 1 2 3; do
+              if docker pull "$img"; then break; fi
+              echo "pull attempt $attempt failed; retrying after 10s..."
+              sleep 10
+            done
+            kind load docker-image "$img" --name spatium-e2e
+          done
+
       - name: Install chart
         id: install
         run: |
-          TAG="${{ github.event.inputs.image_tag || 'latest' }}"
+          TAG="${{ github.event.inputs.image_tag || 'main' }}"
           echo "Installing chart with image.tag=${TAG}"
           # The agent PSK has to be pre-shared with the control plane
           # before the agent first connects — we set it explicitly so
