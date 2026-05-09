@@ -46,9 +46,9 @@ on:
         required: false
         default: "latest"
       agent_tag:
-        description: "Agent image tag (dns-bind9 / dns-powerdns / dhcp-kea)"
+        description: "Agent image tag — defaults to 'pr-test' (built from this branch)"
         required: false
-        default: "main"
+        default: "pr-test"
 
 # Least-privilege default — this workflow only needs to read the repo
 # to pull the chart + manifests. No contents/packages/issues/PR
@@ -82,6 +82,31 @@ jobs:
         # so adding a future dep doesn't need a workflow edit.
         run: helm dependency update charts/spatiumddi
 
+      - name: Build agent images from PR source + load into kind
+        # Agent code changes (under ``agent/dns/**``) don't reach
+        # ``ghcr.io/spatiumddi/dns-{bind9,powerdns}:main`` until the
+        # PR merges — ``build-dns-images.yml`` only pushes on push to
+        # main. Without this step, agent-e2e on a PR perpetually tests
+        # the pre-PR image instead of the PR's actual code.
+        #
+        # Build each flavor for linux/amd64 only (the runner arch),
+        # tag as ``:pr-test``, and ``kind load`` so containerd serves
+        # from the loaded set when the chart asks for that tag.
+        # ``--load`` keeps the image in the host's docker daemon
+        # without pushing anywhere.
+        run: |
+          set -euxo pipefail
+          docker buildx create --use --name e2e-builder >/dev/null 2>&1 || docker buildx use e2e-builder
+          for flavor in bind9 powerdns; do
+            docker buildx build \
+              --platform linux/amd64 \
+              --file "agent/dns/images/${flavor}/Dockerfile" \
+              --tag "ghcr.io/spatiumddi/dns-${flavor}:pr-test" \
+              --load \
+              .
+            kind load docker-image "ghcr.io/spatiumddi/dns-${flavor}:pr-test" --name spatium-e2e
+          done
+
       - name: Preload official postgres + redis images into kind
         # Sidesteps Docker Hub anonymous-pull rate limits (100/6h/IP)
         # on shared GH runners. ``library/postgres`` and
@@ -113,7 +138,11 @@ jobs:
         id: install
         run: |
           CONTROL_TAG="${{ github.event.inputs.control_tag || 'latest' }}"
-          AGENT_TAG="${{ github.event.inputs.agent_tag || 'main' }}"
+          # Default to ``pr-test`` so the chart pulls the just-built
+          # local images side-loaded into kind in the previous step.
+          # On workflow_dispatch the operator can override to ``main``
+          # / ``latest`` / a CalVer tag for a registry-image smoke test.
+          AGENT_TAG="${{ github.event.inputs.agent_tag || 'pr-test' }}"
           echo "Installing chart with control-plane tag=${CONTROL_TAG}, agent tag=${AGENT_TAG}"
           # The agent PSK has to be pre-shared with the control plane
           # before the agent first connects — we set it explicitly so
