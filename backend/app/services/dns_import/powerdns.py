@@ -174,6 +174,11 @@ def _split_priority(rtype: str, content: str) -> tuple[str, int | None, int | No
                 priority = int(parts[0])
                 content = parts[1]
             except ValueError:
+                # Malformed preference field — tolerate it: leave
+                # ``priority`` as None and pass ``content`` through
+                # unchanged so the operator still sees the original
+                # rdata in the import preview rather than losing the
+                # row entirely.
                 pass
     elif rtype == "SRV":
         # ``<priority> <weight> <port> <target>``
@@ -185,6 +190,10 @@ def _split_priority(rtype: str, content: str) -> tuple[str, int | None, int | No
                 port = int(parts[2])
                 content = parts[3]
             except ValueError:
+                # Same tolerance as the MX branch above: any
+                # non-numeric field leaves all three priority
+                # columns at None and preserves the original
+                # ``content`` for operator review.
                 pass
     return content, priority, weight, port
 
