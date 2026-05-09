@@ -1,15 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
-import { Link } from "react-router-dom";
+import { useSearchParams } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import {
-  ListPlus,
-  Network,
-  Pencil,
-  Plus,
-  RefreshCw,
-  Trash2,
-  X,
-} from "lucide-react";
+import { ListPlus, Pencil, Plus, RefreshCw, Trash2, X } from "lucide-react";
+
+import { MulticastDomainsTab } from "./MulticastDomainsPage";
 import {
   customersApi,
   ipamApi,
@@ -970,6 +964,21 @@ export function MulticastGroupsPage() {
   const [showNew, setShowNew] = useState(false);
   const [showBulk, setShowBulk] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [searchParams, setSearchParams] = useSearchParams();
+  const tab: "groups" | "domains" =
+    searchParams.get("tab") === "domains" ? "domains" : "groups";
+
+  function selectTab(next: "groups" | "domains") {
+    setSearchParams(
+      (prev) => {
+        const params = new URLSearchParams(prev);
+        if (next === "groups") params.delete("tab");
+        else params.set("tab", next);
+        return params;
+      },
+      { replace: true },
+    );
+  }
 
   const spacesQ = useQuery({
     queryKey: ["ipam-spaces"],
@@ -1054,185 +1063,59 @@ export function MulticastGroupsPage() {
   return (
     <div className="h-full overflow-auto p-6">
       <div className="space-y-4">
-        <div className="flex flex-wrap items-start justify-between gap-3">
-          <div className="min-w-0 flex-1">
-            <h1 className="text-xl font-semibold">Multicast groups</h1>
-            <p className="text-sm text-muted-foreground">
-              Stream identities for SMPTE 2110 / Dante / NDI / market-data
-              deployments. Each group is an address (+ optional ports) with
-              producer / consumer / rendezvous-point memberships.
-            </p>
-          </div>
-          <div className="flex shrink-0 items-center gap-2">
-            <Link to="/network/multicast/domains">
-              <HeaderButton icon={Network}>View domains</HeaderButton>
-            </Link>
-            <HeaderButton
-              icon={RefreshCw}
-              onClick={() => query.refetch()}
-              iconClassName={query.isFetching ? "animate-spin" : undefined}
-            >
-              Refresh
-            </HeaderButton>
-            <HeaderButton icon={ListPlus} onClick={() => setShowBulk(true)}>
-              Bulk allocate…
-            </HeaderButton>
-            <HeaderButton
-              variant="primary"
-              icon={Plus}
-              onClick={() => setShowNew(true)}
-            >
-              New group
-            </HeaderButton>
-          </div>
+        <div>
+          <h1 className="text-xl font-semibold">Multicast</h1>
+          <p className="text-sm text-muted-foreground">
+            Stream identities for SMPTE 2110 / Dante / NDI / market-data
+            deployments. Each group is an address (+ optional ports) with
+            producer / consumer / rendezvous-point memberships; PIM domains
+            carry the network-layer routing context.
+          </p>
         </div>
 
-        <div className="flex flex-wrap items-center gap-2">
-          <input
-            className={cn(inputCls, "max-w-xs")}
-            placeholder="Search name / application / address…"
-            value={search}
-            onChange={(e) => setSearch(e.target.value)}
+        {/* Sub-tab bar — switches between the groups list (default)
+            and the PIM-domain registry. URL param ``?tab=domains``
+            keeps the choice deep-linkable. */}
+        <div className="flex gap-1 border-b">
+          <TabPill
+            active={tab === "groups"}
+            onClick={() => selectTab("groups")}
+            label="Groups"
           />
-          <select
-            className={cn(inputCls, "max-w-[220px]")}
-            value={spaceFilter}
-            onChange={(e) => setSpaceFilter(e.target.value)}
-          >
-            <option value="">All spaces</option>
-            {(spacesQ.data ?? []).map((s) => (
-              <option key={s.id} value={s.id}>
-                {s.name}
-              </option>
-            ))}
-          </select>
-          <select
-            className={cn(inputCls, "max-w-[200px]")}
-            value={customerFilter}
-            onChange={(e) => setCustomerFilter(e.target.value)}
-          >
-            <option value="">All customers</option>
-            {(customersQ.data?.items ?? []).map((c) => (
-              <option key={c.id} value={c.id}>
-                {c.name}
-              </option>
-            ))}
-          </select>
+          <TabPill
+            active={tab === "domains"}
+            onClick={() => selectTab("domains")}
+            label="Domains"
+          />
         </div>
 
-        {selectedIds.size > 0 && (
-          <div className="flex items-center justify-between rounded-md border bg-muted/50 px-3 py-2 text-sm">
-            <span>{selectedIds.size} selected</span>
-            <HeaderButton
-              variant="destructive"
-              icon={Trash2}
-              disabled={bulkDelete.isPending}
-              onClick={() => {
-                if (
-                  window.confirm(
-                    `Delete ${selectedIds.size} multicast group(s)? Ports + memberships cascade.`,
-                  )
-                ) {
-                  bulkDelete.mutate(Array.from(selectedIds));
-                }
-              }}
-            >
-              Delete selected
-            </HeaderButton>
-          </div>
+        {tab === "domains" ? (
+          <MulticastDomainsTab />
+        ) : (
+          <GroupsTabBody
+            query={query}
+            items={items}
+            spaceFilter={spaceFilter}
+            setSpaceFilter={setSpaceFilter}
+            customerFilter={customerFilter}
+            setCustomerFilter={setCustomerFilter}
+            search={search}
+            setSearch={setSearch}
+            spaces={spacesQ.data ?? []}
+            customers={customersQ.data?.items ?? []}
+            spaceNames={spaceNames}
+            customerNames={customerNames}
+            selectedIds={selectedIds}
+            allChecked={allChecked}
+            toggleAll={toggleAll}
+            toggleOne={toggleOne}
+            removeOne={removeOne}
+            bulkDelete={bulkDelete}
+            setEditing={setEditing}
+            setShowNew={setShowNew}
+            setShowBulk={setShowBulk}
+          />
         )}
-
-        <div className="rounded-md border">
-          <table className="w-full text-sm">
-            <thead className="text-left text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
-              <tr className="border-b bg-muted/30">
-                <th className="w-8 px-3 py-2">
-                  <input
-                    type="checkbox"
-                    checked={allChecked}
-                    onChange={toggleAll}
-                    aria-label="Select all"
-                  />
-                </th>
-                <th className="px-3 py-2">Address</th>
-                <th className="px-3 py-2">Name</th>
-                <th className="px-3 py-2">Application</th>
-                <th className="px-3 py-2">Space</th>
-                <th className="px-3 py-2">Customer</th>
-                <th className="px-3 py-2">Bandwidth</th>
-                <th className="px-3 py-2"></th>
-              </tr>
-            </thead>
-            <tbody className={zebraBodyCls}>
-              {items.length === 0 && !query.isFetching && (
-                <tr>
-                  <td
-                    colSpan={8}
-                    className="px-3 py-10 text-center text-sm text-muted-foreground"
-                  >
-                    No multicast groups yet. Click <strong>New group</strong> to
-                    add the first.
-                  </td>
-                </tr>
-              )}
-              {items.map((g) => (
-                <tr key={g.id} className="border-b hover:bg-muted/30">
-                  <td className="px-3 py-1.5">
-                    <input
-                      type="checkbox"
-                      checked={selectedIds.has(g.id)}
-                      onChange={() => toggleOne(g.id)}
-                      aria-label={`Select ${g.address}`}
-                    />
-                  </td>
-                  <td className="px-3 py-1.5 font-mono">{g.address}</td>
-                  <td className="px-3 py-1.5">{g.name}</td>
-                  <td className="px-3 py-1.5 text-muted-foreground">
-                    {g.application || "—"}
-                  </td>
-                  <td className="px-3 py-1.5 text-muted-foreground">
-                    {spaceNames.get(g.space_id) ?? g.space_id.slice(0, 8)}
-                  </td>
-                  <td className="px-3 py-1.5 text-muted-foreground">
-                    {g.customer_id
-                      ? (customerNames.get(g.customer_id) ??
-                        g.customer_id.slice(0, 8))
-                      : "—"}
-                  </td>
-                  <td className="px-3 py-1.5 tabular-nums text-muted-foreground">
-                    {g.bandwidth_mbps_estimate
-                      ? `${g.bandwidth_mbps_estimate} Mbps`
-                      : "—"}
-                  </td>
-                  <td className="px-3 py-1.5 text-right">
-                    <button
-                      type="button"
-                      onClick={() => setEditing(g)}
-                      title="Edit"
-                      className="rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
-                    >
-                      <Pencil className="h-3.5 w-3.5" />
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        if (
-                          window.confirm(`Delete multicast group ${g.address}?`)
-                        ) {
-                          removeOne.mutate(g.id);
-                        }
-                      }}
-                      title="Delete"
-                      className="ml-1 rounded p-1 text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
-                    >
-                      <Trash2 className="h-3.5 w-3.5" />
-                    </button>
-                  </td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
       </div>
 
       {(showNew || editing) && (
@@ -1252,5 +1135,258 @@ export function MulticastGroupsPage() {
         />
       )}
     </div>
+  );
+}
+
+// ── Tab pill ────────────────────────────────────────────────────────
+
+function TabPill({
+  active,
+  onClick,
+  label,
+}: {
+  active: boolean;
+  onClick: () => void;
+  label: string;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={cn(
+        "border-b-2 px-3 py-2 text-sm font-medium transition-colors -mb-px",
+        active
+          ? "border-primary text-foreground"
+          : "border-transparent text-muted-foreground hover:text-foreground",
+      )}
+    >
+      {label}
+    </button>
+  );
+}
+
+// ── Groups tab body ─────────────────────────────────────────────────
+//
+// Lifted out of the page wrapper so the wrapper can render either
+// this body or ``<MulticastDomainsTab />`` based on the active sub-
+// tab. State stays at the wrapper level so a tab-flip away and back
+// preserves the operator's filter / selection in the same session.
+
+type GroupsTabBodyProps = {
+  query: { refetch: () => void; isFetching: boolean };
+  items: MulticastGroupRead[];
+  spaceFilter: string;
+  setSpaceFilter: (v: string) => void;
+  customerFilter: string;
+  setCustomerFilter: (v: string) => void;
+  search: string;
+  setSearch: (v: string) => void;
+  spaces: IPSpace[];
+  customers: { id: string; name: string }[];
+  spaceNames: Map<string, string>;
+  customerNames: Map<string, string>;
+  selectedIds: Set<string>;
+  allChecked: boolean;
+  toggleAll: () => void;
+  toggleOne: (id: string) => void;
+  removeOne: { mutate: (id: string) => void };
+  bulkDelete: { mutate: (ids: string[]) => void; isPending: boolean };
+  setEditing: (g: MulticastGroupRead | null) => void;
+  setShowNew: (v: boolean) => void;
+  setShowBulk: (v: boolean) => void;
+};
+
+function GroupsTabBody({
+  query,
+  items,
+  spaceFilter,
+  setSpaceFilter,
+  customerFilter,
+  setCustomerFilter,
+  search,
+  setSearch,
+  spaces,
+  customers,
+  spaceNames,
+  customerNames,
+  selectedIds,
+  allChecked,
+  toggleAll,
+  toggleOne,
+  removeOne,
+  bulkDelete,
+  setEditing,
+  setShowNew,
+  setShowBulk,
+}: GroupsTabBodyProps) {
+  return (
+    <>
+      <div className="flex justify-end gap-2">
+        <HeaderButton
+          icon={RefreshCw}
+          onClick={() => query.refetch()}
+          iconClassName={query.isFetching ? "animate-spin" : undefined}
+        >
+          Refresh
+        </HeaderButton>
+        <HeaderButton icon={ListPlus} onClick={() => setShowBulk(true)}>
+          Bulk allocate…
+        </HeaderButton>
+        <HeaderButton
+          variant="primary"
+          icon={Plus}
+          onClick={() => setShowNew(true)}
+        >
+          New group
+        </HeaderButton>
+      </div>
+
+      <div className="flex flex-wrap items-center gap-2">
+        <input
+          className={cn(inputCls, "max-w-xs")}
+          placeholder="Search name / application / address…"
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+        />
+        <select
+          className={cn(inputCls, "max-w-[220px]")}
+          value={spaceFilter}
+          onChange={(e) => setSpaceFilter(e.target.value)}
+        >
+          <option value="">All spaces</option>
+          {spaces.map((s) => (
+            <option key={s.id} value={s.id}>
+              {s.name}
+            </option>
+          ))}
+        </select>
+        <select
+          className={cn(inputCls, "max-w-[200px]")}
+          value={customerFilter}
+          onChange={(e) => setCustomerFilter(e.target.value)}
+        >
+          <option value="">All customers</option>
+          {customers.map((c) => (
+            <option key={c.id} value={c.id}>
+              {c.name}
+            </option>
+          ))}
+        </select>
+      </div>
+
+      {selectedIds.size > 0 && (
+        <div className="flex items-center justify-between rounded-md border bg-muted/50 px-3 py-2 text-sm">
+          <span>{selectedIds.size} selected</span>
+          <HeaderButton
+            variant="destructive"
+            icon={Trash2}
+            disabled={bulkDelete.isPending}
+            onClick={() => {
+              if (
+                window.confirm(
+                  `Delete ${selectedIds.size} multicast group(s)? Ports + memberships cascade.`,
+                )
+              ) {
+                bulkDelete.mutate(Array.from(selectedIds));
+              }
+            }}
+          >
+            Delete selected
+          </HeaderButton>
+        </div>
+      )}
+
+      <div className="rounded-md border">
+        <table className="w-full text-sm">
+          <thead className="text-left text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+            <tr className="border-b bg-muted/30">
+              <th className="w-8 px-3 py-2">
+                <input
+                  type="checkbox"
+                  checked={allChecked}
+                  onChange={toggleAll}
+                  aria-label="Select all"
+                />
+              </th>
+              <th className="px-3 py-2">Address</th>
+              <th className="px-3 py-2">Name</th>
+              <th className="px-3 py-2">Application</th>
+              <th className="px-3 py-2">Space</th>
+              <th className="px-3 py-2">Customer</th>
+              <th className="px-3 py-2">Bandwidth</th>
+              <th className="px-3 py-2"></th>
+            </tr>
+          </thead>
+          <tbody className={zebraBodyCls}>
+            {items.length === 0 && !query.isFetching && (
+              <tr>
+                <td
+                  colSpan={8}
+                  className="px-3 py-10 text-center text-sm text-muted-foreground"
+                >
+                  No multicast groups yet. Click <strong>New group</strong> to
+                  add the first.
+                </td>
+              </tr>
+            )}
+            {items.map((g) => (
+              <tr key={g.id} className="border-b hover:bg-muted/30">
+                <td className="px-3 py-1.5">
+                  <input
+                    type="checkbox"
+                    checked={selectedIds.has(g.id)}
+                    onChange={() => toggleOne(g.id)}
+                    aria-label={`Select ${g.address}`}
+                  />
+                </td>
+                <td className="px-3 py-1.5 font-mono">{g.address}</td>
+                <td className="px-3 py-1.5">{g.name}</td>
+                <td className="px-3 py-1.5 text-muted-foreground">
+                  {g.application || "—"}
+                </td>
+                <td className="px-3 py-1.5 text-muted-foreground">
+                  {spaceNames.get(g.space_id) ?? g.space_id.slice(0, 8)}
+                </td>
+                <td className="px-3 py-1.5 text-muted-foreground">
+                  {g.customer_id
+                    ? (customerNames.get(g.customer_id) ??
+                      g.customer_id.slice(0, 8))
+                    : "—"}
+                </td>
+                <td className="px-3 py-1.5 tabular-nums text-muted-foreground">
+                  {g.bandwidth_mbps_estimate
+                    ? `${g.bandwidth_mbps_estimate} Mbps`
+                    : "—"}
+                </td>
+                <td className="px-3 py-1.5 text-right">
+                  <button
+                    type="button"
+                    onClick={() => setEditing(g)}
+                    title="Edit"
+                    className="rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
+                  >
+                    <Pencil className="h-3.5 w-3.5" />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (
+                        window.confirm(`Delete multicast group ${g.address}?`)
+                      ) {
+                        removeOne.mutate(g.id);
+                      }
+                    }}
+                    title="Delete"
+                    className="ml-1 rounded p-1 text-muted-foreground hover:bg-destructive/10 hover:text-destructive"
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                  </button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </>
   );
 }

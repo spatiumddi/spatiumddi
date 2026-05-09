@@ -1,7 +1,6 @@
 import { useState } from "react";
-import { Link } from "react-router-dom";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Pencil, Plus, RefreshCw, Trash2, Radio } from "lucide-react";
+import { Pencil, Plus, RefreshCw, Trash2 } from "lucide-react";
 import {
   multicastApi,
   type MulticastDomainCreate,
@@ -230,9 +229,15 @@ function MulticastDomainModal({
   );
 }
 
-// ── Page ────────────────────────────────────────────────────────────
+// ── Tab body ────────────────────────────────────────────────────────
+//
+// Renders inside the parent ``MulticastGroupsPage`` when the operator
+// selects the ``Domains`` tab. The page-level chrome (h1, sidebar
+// gating, route) lives one level up; this body owns just the
+// per-tab intro text, the action header (Refresh + New), and the
+// domain table + modal.
 
-export function MulticastDomainsPage() {
+export function MulticastDomainsTab() {
   const qc = useQueryClient();
   const [editing, setEditing] = useState<MulticastDomainRead | null>(null);
   const [showNew, setShowNew] = useState(false);
@@ -250,21 +255,15 @@ export function MulticastDomainsPage() {
   });
 
   return (
-    <div className="h-full overflow-auto p-6">
+    <>
       <div className="space-y-4">
         <div className="flex flex-wrap items-start justify-between gap-3">
-          <div className="min-w-0 flex-1">
-            <h1 className="text-xl font-semibold">Multicast PIM domains</h1>
-            <p className="text-sm text-muted-foreground">
-              Network-layer routing context for multicast groups — PIM mode,
-              rendezvous point, optional VRF binding. Groups attach to a domain
-              via the General tab on each group's editor.
-            </p>
-          </div>
+          <p className="min-w-0 flex-1 text-sm text-muted-foreground">
+            Network-layer routing context for multicast groups — PIM mode,
+            rendezvous point, optional VRF binding. Groups attach to a domain
+            via the General tab on each group's editor.
+          </p>
           <div className="flex shrink-0 items-center gap-2">
-            <Link to="/network/multicast">
-              <HeaderButton icon={Radio}>View groups</HeaderButton>
-            </Link>
             <HeaderButton
               icon={RefreshCw}
               onClick={() => query.refetch()}
@@ -371,6 +370,6 @@ export function MulticastDomainsPage() {
           }}
         />
       )}
-    </div>
+    </>
   );
 }
