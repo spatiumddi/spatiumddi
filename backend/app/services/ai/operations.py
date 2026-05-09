@@ -1279,3 +1279,189 @@ register(
         category="ops",
     )
 )
+
+
+# ── create_multicast_group (issue #126 Phase 4) ─────────────────────
+
+
+_IPV4_MULTICAST = ipaddress.ip_network("224.0.0.0/4")
+_IPV6_MULTICAST = ipaddress.ip_network("ff00::/8")
+
+
+class CreateMulticastGroupArgs(BaseModel):
+    """Args for the ``create_multicast_group`` operation.
+
+    The address must sit inside ``224.0.0.0/4`` (IPv4) or
+    ``ff00::/8`` (IPv6) — same CHECK constraint the DB layer
+    enforces, surfaced here for clean preview rejection.
+    """
+
+    space_id: str = Field(description="UUID of the parent IPSpace that hosts this group.")
+    address: str = Field(
+        description=(
+            "Multicast address. IPv4 inside 224.0.0.0/4 (e.g. "
+            "239.5.7.42) or IPv6 inside ff00::/8 (e.g. ff05::1:3)."
+        )
+    )
+    name: str = Field(description="Human-friendly name (e.g. 'Cam7 Studio-B HD').")
+    application: str = Field(
+        default="",
+        description=(
+            "Free-text application label — what's flowing on the "
+            "wire. Examples: 'SMPTE 2110-20 video', 'Dante audio', "
+            "'AAPL options L2'."
+        ),
+    )
+    domain_id: str | None = Field(
+        default=None,
+        description=(
+            "Optional PIM domain UUID. When supplied, the group "
+            "binds to the domain's routing context."
+        ),
+    )
+    rtp_payload_type: int | None = Field(
+        default=None, ge=0, le=127, description="RTP payload type for media flows."
+    )
+
+
+def _validate_multicast_address(addr: str) -> str | None:
+    """Returns an error string when ``addr`` isn't inside the IANA
+    multicast ranges. ``None`` on success."""
+    try:
+        parsed = ipaddress.ip_address(addr)
+    except ValueError as exc:
+        return f"Invalid IP literal: {exc}"
+    if isinstance(parsed, ipaddress.IPv4Address) and parsed in _IPV4_MULTICAST:
+        return None
+    if isinstance(parsed, ipaddress.IPv6Address) and parsed in _IPV6_MULTICAST:
+        return None
+    return (
+        "Address must be inside 224.0.0.0/4 (IPv4) or ff00::/8 "
+        "(IPv6) — the multicast registry only accepts addresses in "
+        "those ranges."
+    )
+
+
+async def _preview_create_multicast_group(
+    db: AsyncSession, user: User, args: CreateMulticastGroupArgs
+) -> PreviewResult:
+    from app.models.ipam import IPSpace  # noqa: PLC0415
+    from app.models.multicast import (  # noqa: PLC0415
+        MulticastDomain,
+        MulticastGroup,
+    )
+
+    space = await db.get(IPSpace, args.space_id)
+    if space is None:
+        return PreviewResult(ok=False, detail=f"IPSpace {args.space_id!r} not found.")
+
+    err = _validate_multicast_address(args.address)
+    if err is not None:
+        return PreviewResult(ok=False, detail=err)
+
+    if args.domain_id is not None:
+        if (await db.get(MulticastDomain, args.domain_id)) is None:
+            return PreviewResult(ok=False, detail=f"Multicast domain {args.domain_id!r} not found.")
+
+    # Soft-warn on duplicates (the registry doesn't enforce
+    # uniqueness — the conformity check does — but a stale
+    # MulticastGroup at the same address is almost always an
+    # operator error).
+    dup = (
+        await db.execute(
+            select(MulticastGroup.id, MulticastGroup.name).where(
+                MulticastGroup.space_id == args.space_id,
+                MulticastGroup.address == args.address,
+            )
+        )
+    ).first()
+    dup_note = ""
+    if dup is not None:
+        dup_note = (
+            f"\n  - WARNING: address {args.address} is already used by "
+            f"group {dup[1]!r} ({dup[0]}) in this space — the "
+            "no_multicast_collision conformity rule will fire."
+        )
+
+    return PreviewResult(
+        ok=True,
+        detail="ready",
+        preview_text=(
+            f"Create multicast group:\n"
+            f"  - address: {args.address}\n"
+            f"  - name: {args.name}\n"
+            f"  - application: {args.application or '(none)'}\n"
+            f"  - space: {space.name} ({args.space_id})\n"
+            f"  - domain_id: {args.domain_id or '(none)'}"
+            f"{dup_note}"
+        ),
+    )
+
+
+async def _apply_create_multicast_group(
+    db: AsyncSession, user: User, args: CreateMulticastGroupArgs
+) -> dict[str, Any]:
+    from app.models.audit import AuditLog  # noqa: PLC0415
+    from app.models.multicast import MulticastGroup  # noqa: PLC0415
+
+    err = _validate_multicast_address(args.address)
+    if err is not None:
+        raise ValueError(err)
+
+    row = MulticastGroup(
+        space_id=args.space_id,
+        address=args.address,
+        name=args.name,
+        application=args.application,
+        domain_id=args.domain_id,
+        rtp_payload_type=args.rtp_payload_type,
+    )
+    db.add(row)
+    await db.flush()
+
+    db.add(
+        AuditLog(
+            user_id=user.id,
+            user_display_name=user.display_name,
+            auth_source=user.auth_source,
+            action="create",
+            resource_type="multicast_group",
+            resource_id=str(row.id),
+            resource_display=f"{row.name} ({row.address})",
+            result="success",
+            new_value={
+                "space_id": args.space_id,
+                "address": args.address,
+                "name": args.name,
+                "application": args.application,
+                "domain_id": args.domain_id,
+                "via": "ai_proposal",
+            },
+        )
+    )
+    await db.commit()
+    await db.refresh(row)
+    return {
+        "id": str(row.id),
+        "address": str(row.address),
+        "name": row.name,
+        "application": row.application,
+        "space_id": str(row.space_id),
+        "domain_id": str(row.domain_id) if row.domain_id else None,
+    }
+
+
+register(
+    Operation(
+        name="create_multicast_group",
+        description=(
+            "Create a multicast group registry entry. Address must "
+            "be inside the IANA multicast ranges; the operator can "
+            "rename / re-tag from the UI after the LLM-driven create."
+        ),
+        args_model=CreateMulticastGroupArgs,
+        preview=_preview_create_multicast_group,
+        apply=_apply_create_multicast_group,
+        category="multicast",
+    )
+)

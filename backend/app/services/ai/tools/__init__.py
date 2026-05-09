@@ -18,6 +18,7 @@ from app.services.ai.tools import (  # noqa: F401, E402
     dns,
     integrations,
     ipam,
+    multicast,
     network,
     network_modeling,
     nmap,

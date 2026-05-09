@@ -29,6 +29,7 @@ from app.services.ai.operations import (
     CreateDNSRecordArgs,
     CreateDNSZoneArgs,
     CreateIPAddressArgs,
+    CreateMulticastGroupArgs,
     RunNmapScanArgs,
 )
 from app.services.ai.tools.base import register_tool
@@ -266,6 +267,33 @@ async def propose_create_dns_zone(
     db: AsyncSession, user: User, args: CreateDNSZoneArgs
 ) -> dict[str, Any]:
     return await _propose_via(db=db, user=user, operation_name="create_dns_zone", args=args)
+
+
+# ── propose_create_multicast_group (issue #126 Phase 4) ──────────────
+
+
+@register_tool(
+    name="propose_create_multicast_group",
+    description=(
+        "Prepare a multicast group registry entry. Pass space_id "
+        "(UUID of the parent IPSpace), address (must be inside "
+        "224.0.0.0/4 IPv4 or ff00::/8 IPv6), and name. Optional: "
+        "application label, domain_id (PIM domain), rtp_payload_type. "
+        "Use when the operator says 'create a multicast group for "
+        "Cam7 at 239.5.7.42 in the studio space'. Operator must "
+        "click Approve in the chat drawer; preview soft-warns when "
+        "the address collides with an existing group."
+    ),
+    args_model=CreateMulticastGroupArgs,
+    writes=False,
+    category="multicast",
+    default_enabled=False,
+    module="network.multicast",
+)
+async def propose_create_multicast_group(
+    db: AsyncSession, user: User, args: CreateMulticastGroupArgs
+) -> dict[str, Any]:
+    return await _propose_via(db=db, user=user, operation_name="create_multicast_group", args=args)
 
 
 # ── propose_create_dhcp_static ────────────────────────────────────────

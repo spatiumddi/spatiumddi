@@ -693,6 +693,181 @@ async def test_delete_domain_orphans_groups(client: AsyncClient, db_session: Asy
     assert group.domain_id is None
 
 
+# ── Operator Copilot tools (Phase 4 Wave 1) ─────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_find_multicast_group_tool(
+    db_session: AsyncSession,
+) -> None:
+    from app.services.ai.tools.multicast import (
+        FindMulticastGroupArgs,
+        find_multicast_group,
+    )
+
+    space = await _make_space(db_session)
+    db_session.add_all(
+        [
+            MulticastGroup(
+                space_id=space.id,
+                address="239.10.10.1",
+                name="cam-1",
+                application="video",
+            ),
+            MulticastGroup(
+                space_id=space.id,
+                address="239.10.10.2",
+                name="cam-2",
+                application="audio",
+            ),
+        ]
+    )
+    await db_session.commit()
+    user = User(
+        username="ai-user",
+        email="ai-user@example.test",
+        display_name="AI",
+        hashed_password=hash_password("x"),
+        is_superadmin=True,
+    )
+    db_session.add(user)
+    await db_session.flush()
+
+    rows = await find_multicast_group(
+        db_session,
+        user,
+        FindMulticastGroupArgs(space_id=str(space.id)),
+    )
+    assert len(rows) == 2
+    addresses = {r["address"] for r in rows}
+    assert addresses == {"239.10.10.1", "239.10.10.2"}
+
+    # Substring search hits the application column.
+    rows = await find_multicast_group(
+        db_session,
+        user,
+        FindMulticastGroupArgs(space_id=str(space.id), search="audio"),
+    )
+    assert len(rows) == 1
+    assert rows[0]["name"] == "cam-2"
+
+
+@pytest.mark.asyncio
+async def test_find_multicast_membership_tool(
+    db_session: AsyncSession,
+) -> None:
+    from app.services.ai.tools.multicast import (
+        FindMulticastMembershipArgs,
+        find_multicast_membership,
+    )
+
+    space = await _make_space(db_session)
+    ip = await _make_ip(db_session, space, "10.0.0.42")
+    group = MulticastGroup(space_id=space.id, address="239.20.0.1", name="copilot-test")
+    db_session.add(group)
+    await db_session.flush()
+    db_session.add(
+        MulticastMembership(
+            group_id=group.id,
+            ip_address_id=ip.id,
+            role="consumer",
+            seen_via="igmp_snooping",
+        )
+    )
+    user = User(
+        username="ai-user-2",
+        email="ai-user-2@example.test",
+        display_name="AI",
+        hashed_password=hash_password("x"),
+        is_superadmin=True,
+    )
+    db_session.add(user)
+    await db_session.commit()
+
+    # Filter by role.
+    rows = await find_multicast_membership(
+        db_session, user, FindMulticastMembershipArgs(role="consumer")
+    )
+    assert any(r["role"] == "consumer" and r["seen_via"] == "igmp_snooping" for r in rows)
+
+    # Invalid role surfaces as an error dict (not an exception).
+    rows = await find_multicast_membership(
+        db_session, user, FindMulticastMembershipArgs(role="bogus")
+    )
+    assert "error" in rows[0]
+
+
+@pytest.mark.asyncio
+async def test_count_multicast_groups_by_vrf_tool(
+    db_session: AsyncSession,
+) -> None:
+    from app.services.ai.tools.multicast import (
+        CountGroupsByVRFArgs,
+        count_multicast_groups_by_vrf,
+    )
+
+    # Two groups without a domain → bucket as ``no_domain``.
+    space = await _make_space(db_session)
+    db_session.add_all(
+        [
+            MulticastGroup(space_id=space.id, address="239.30.0.1", name="g1"),
+            MulticastGroup(space_id=space.id, address="239.30.0.2", name="g2"),
+        ]
+    )
+    user = User(
+        username="ai-user-3",
+        email="ai-user-3@example.test",
+        display_name="AI",
+        hashed_password=hash_password("x"),
+        is_superadmin=True,
+    )
+    db_session.add(user)
+    await db_session.commit()
+
+    rows = await count_multicast_groups_by_vrf(db_session, user, CountGroupsByVRFArgs())
+    no_domain = next((r for r in rows if r["vrf_name"] == "no_domain"), None)
+    assert no_domain is not None
+    assert no_domain["group_count"] >= 2
+
+
+@pytest.mark.asyncio
+async def test_multicast_tools_filtered_when_module_disabled() -> None:
+    """``effective_tool_names`` drops every tool whose ``module``
+    isn't in the enabled set. Operators who turn ``network.multicast``
+    off see the registry shrink rather than the tools 404."""
+    from app.services.ai.tools import REGISTRY, effective_tool_names
+
+    # ``effective_tool_names`` only considers default-enabled reads,
+    # so the propose tool (default_enabled=False) is naturally
+    # excluded — the assertion narrows to the four read tools.
+    multicast_read_tool_names = {
+        tool.name
+        for tool in REGISTRY.all()
+        if tool.module == "network.multicast" and tool.default_enabled and not tool.writes
+    }
+    assert multicast_read_tool_names, "expected multicast read tools to be registered"
+
+    # When ``network.multicast`` is in the enabled set, our tools survive.
+    enabled = effective_tool_names(
+        platform_enabled=None,
+        provider_enabled=None,
+        enabled_modules={
+            "network.multicast",
+            "ai.copilot",
+        },
+    )
+    assert multicast_read_tool_names.issubset(enabled)
+
+    # When ``network.multicast`` is absent from the enabled set, our
+    # tools drop out entirely.
+    enabled = effective_tool_names(
+        platform_enabled=None,
+        provider_enabled=None,
+        enabled_modules={"ai.copilot"},
+    )
+    assert not multicast_read_tool_names.intersection(enabled)
+
+
 # ── IGMP-snooping populator (Phase 3 Wave 1) ────────────────────────
 
 
