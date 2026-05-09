@@ -29,10 +29,10 @@ import io
 import re
 import tarfile
 import zipfile
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from typing import Iterable
 
 from app.services.dns_io.parser import (
     ZoneParseError,
@@ -311,7 +311,9 @@ def _find_named_conf(root: Path) -> Path | None:
     return candidates[0] if candidates else None
 
 
-def _resolve_zone_file(root: Path, conf_dir: Path, options_dir: str | None, file_value: str) -> Path | None:
+def _resolve_zone_file(
+    root: Path, conf_dir: Path, options_dir: str | None, file_value: str
+) -> Path | None:
     """Resolve a ``file "..."`` directive to an actual path on disk.
 
     Strategy:
@@ -374,7 +376,9 @@ def _normalize_zone_name(name: str) -> str:
     return name if name.endswith(".") else name + "."
 
 
-def _parse_one_zone(decl: _NamedConfZone, root: Path, conf_dir: Path, options_dir: str | None) -> ImportedZone:
+def _parse_one_zone(
+    decl: _NamedConfZone, root: Path, conf_dir: Path, options_dir: str | None
+) -> ImportedZone:
     """Turn one named.conf zone declaration into the canonical
     :class:`ImportedZone` shape. Per-zone parse errors land in
     ``parse_warnings`` so a bad zone doesn't kill the whole import.
@@ -434,11 +438,6 @@ def _parse_one_zone(decl: _NamedConfZone, root: Path, conf_dir: Path, options_di
                             ttl=parsed.soa.ttl,
                         )
                     for r in parsed.records:
-                        # Strip DNSSEC records — re-signed post-import
-                        # via the online-signing pipeline.
-                        if r.record_type in _DNSSEC_RECORDS:
-                            skipped[r.record_type] = skipped.get(r.record_type, 0) + 1
-                            continue
                         records.append(
                             ImportedRecord(
                                 name=r.name,
@@ -450,11 +449,27 @@ def _parse_one_zone(decl: _NamedConfZone, root: Path, conf_dir: Path, options_di
                                 port=r.port,
                             )
                         )
-                    if skipped:
-                        total = sum(skipped.values())
+                    # ``parsed.skipped_types`` is the dnspython-side
+                    # filter result — every rdtype seen but dropped
+                    # because it isn't in SUPPORTED_RECORD_TYPES.
+                    # DNSSEC records (DNSKEY/RRSIG/NSEC/NSEC3/DS/...)
+                    # land here with a count; we surface them as a
+                    # warning so the operator knows to re-sign via
+                    # the zone DNSSEC tab post-import.
+                    skipped = dict(parsed.skipped_types)
+                    dnssec_skipped = {k: v for k, v in skipped.items() if k in _DNSSEC_RECORDS}
+                    if dnssec_skipped:
+                        total = sum(dnssec_skipped.values())
                         warnings.append(
                             f"Zone {fqdn!r}: stripped {total} DNSSEC record(s) "
-                            f"({', '.join(f'{k}={v}' for k, v in sorted(skipped.items()))}) — re-sign post-import via the zone DNSSEC tab"
+                            f"({', '.join(f'{k}={v}' for k, v in sorted(dnssec_skipped.items()))}) — re-sign post-import via the zone DNSSEC tab"
+                        )
+                    other_skipped = {k: v for k, v in skipped.items() if k not in _DNSSEC_RECORDS}
+                    if other_skipped:
+                        warnings.append(
+                            f"Zone {fqdn!r}: dropped {sum(other_skipped.values())} "
+                            f"unsupported record(s) "
+                            f"({', '.join(f'{k}={v}' for k, v in sorted(other_skipped.items()))})"
                         )
 
     return ImportedZone(
@@ -499,9 +514,7 @@ def parse_bind9_archive(payload: bytes) -> ImportPreview:
                 "referenced zone files."
             )
 
-        conf_text = _strip_comments(
-            named_conf.read_text(encoding="utf-8", errors="replace")
-        )
+        conf_text = _strip_comments(named_conf.read_text(encoding="utf-8", errors="replace"))
         options_dir = _parse_options_directory(conf_text)
         decls = list(_walk_zones(conf_text))
 
@@ -521,11 +534,10 @@ def parse_bind9_archive(payload: bytes) -> ImportPreview:
                 seen_views.add(decl.view)
 
         # View handling: Phase 1 collapses everything to default view
-        # and warns. The flag is per-import so split-horizon configs
-        # produce one warning instead of one per zone.
-        if len(seen_views) > 1 or (
-            len(seen_views) == 1 and any(z.view_name is None for z in zones)
-        ):
+        # and warns. The flag fires whenever any view is present —
+        # single-view configs are still meaningfully losing the view
+        # tag on the way in, so the operator should know.
+        if seen_views:
             warnings.append(
                 f"Source carries {len(seen_views)} view(s): {sorted(seen_views)}. "
                 "Phase 1 collapses everything to the default view; enable issue #24 (DNS Views) "

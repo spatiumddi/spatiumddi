@@ -69,7 +69,6 @@ const TABS: TabDef[] = [
   },
 ];
 
-
 type Phase = "select" | "previewing" | "ready" | "committing" | "result";
 
 interface BindUploadState {
@@ -96,7 +95,6 @@ function emptyState(): BindUploadState {
   };
 }
 
-
 export function DNSImportPage() {
   const [tab, setTab] = useState<TabId>("bind9");
   const active = TABS.find((t) => t.id === tab) ?? TABS[0];
@@ -110,9 +108,8 @@ export function DNSImportPage() {
             <h1 className="text-lg font-semibold">DNS configuration import</h1>
             <p className="text-xs text-muted-foreground">
               One-shot import of zones + records from BIND9 / Windows DNS /
-              PowerDNS into native SpatiumDDI rows. Once imported,
-              SpatiumDDI is the source of truth — there is no continuous
-              two-way mirror.
+              PowerDNS into native SpatiumDDI rows. Once imported, SpatiumDDI is
+              the source of truth — there is no continuous two-way mirror.
             </p>
           </div>
         </div>
@@ -147,7 +144,9 @@ export function DNSImportPage() {
 
       <div className="min-h-0 flex-1 overflow-auto p-4">
         <div className="mb-4 rounded-md border bg-muted/30 p-3 text-xs text-muted-foreground">
-          <div className="mb-1 font-medium text-foreground">{active.label} — {active.short}</div>
+          <div className="mb-1 font-medium text-foreground">
+            {active.label} — {active.short}
+          </div>
           {active.description}
         </div>
 
@@ -163,9 +162,7 @@ export function DNSImportPage() {
   );
 }
 
-
 // ── BIND9 tab body ───────────────────────────────────────────────────
-
 
 function BindTab() {
   const [state, setState] = useState<BindUploadState>(emptyState());
@@ -245,7 +242,14 @@ function BindTab() {
   const reset = () => setState(emptyState());
 
   const onFileChange = (f: File | null) => {
-    setState((s) => ({ ...s, file: f, preview: null, result: null, phase: "select", error: null }));
+    setState((s) => ({
+      ...s,
+      file: f,
+      preview: null,
+      result: null,
+      phase: "select",
+      error: null,
+    }));
   };
 
   return (
@@ -295,7 +299,6 @@ function BindTab() {
     </div>
   );
 }
-
 
 function UploadForm({
   state,
@@ -349,7 +352,9 @@ function UploadForm({
         </div>
         <div className="space-y-3">
           <div>
-            <label className="block text-sm font-medium">Target server group</label>
+            <label className="block text-sm font-medium">
+              Target server group
+            </label>
             <p className="mb-2 text-[11px] text-muted-foreground">
               Imported zones land in this group. Pick one with at least one
               registered server so the agent picks them up on its next sync.
@@ -371,7 +376,9 @@ function UploadForm({
           </div>
           {views.length > 0 && (
             <div>
-              <label className="block text-sm font-medium">Target view (optional)</label>
+              <label className="block text-sm font-medium">
+                Target view (optional)
+              </label>
               <select
                 value={state.viewId}
                 onChange={(e) =>
@@ -405,7 +412,6 @@ function UploadForm({
   );
 }
 
-
 function PreviewPanel({
   preview,
   decisions,
@@ -436,7 +442,8 @@ function PreviewPanel({
           </div>
           <div className="flex items-center gap-3 text-xs text-muted-foreground">
             <span>
-              <strong>{preview.zones.length}</strong> zone{preview.zones.length === 1 ? "" : "s"}
+              <strong>{preview.zones.length}</strong> zone
+              {preview.zones.length === 1 ? "" : "s"}
             </span>
             <span>·</span>
             <span>
@@ -453,7 +460,9 @@ function PreviewPanel({
 
         {preview.warnings.length > 0 && (
           <div className="mb-3 space-y-1 rounded-md border border-amber-500/40 bg-amber-500/5 p-3 text-xs">
-            <div className="font-medium text-amber-700 dark:text-amber-400">Warnings</div>
+            <div className="font-medium text-amber-700 dark:text-amber-400">
+              Warnings
+            </div>
             {preview.warnings.map((w, i) => (
               <div key={i} className="text-amber-700/90 dark:text-amber-300/90">
                 {w}
@@ -493,9 +502,13 @@ function PreviewPanel({
             <tbody>
               {preview.zones.map((z) => {
                 const conflict = conflictByZone.get(
-                  z.name.endsWith(".") ? z.name.toLowerCase() : (z.name + ".").toLowerCase(),
+                  z.name.endsWith(".")
+                    ? z.name.toLowerCase()
+                    : (z.name + ".").toLowerCase(),
                 );
-                const decision: DNSImportConflictDecision = decisions[z.name] ?? {
+                const decision: DNSImportConflictDecision = decisions[
+                  z.name
+                ] ?? {
                   action: "skip",
                   rename_to: null,
                 };
@@ -509,7 +522,9 @@ function PreviewPanel({
                         </div>
                       )}
                     </td>
-                    <td className="px-3 py-2 align-top text-xs">{z.zone_type}</td>
+                    <td className="px-3 py-2 align-top text-xs">
+                      {z.zone_type}
+                    </td>
                     <td className="px-3 py-2 align-top text-xs">{z.kind}</td>
                     <td className="px-3 py-2 align-top text-right text-xs tabular-nums">
                       {z.records.length}
@@ -600,7 +615,6 @@ function PreviewPanel({
   );
 }
 
-
 function CommitResultPanel({
   result,
   onReset,
@@ -616,13 +630,37 @@ function CommitResultPanel({
             Import complete
           </div>
           <div className="flex items-center gap-3 text-xs">
-            <Stat label="Created" value={result.total_zones_created} tone="success" />
-            <Stat label="Overwrote" value={result.total_zones_overwrote} tone="amber" />
-            <Stat label="Renamed" value={result.total_zones_renamed} tone="amber" />
-            <Stat label="Skipped" value={result.total_zones_skipped} tone="muted" />
-            <Stat label="Failed" value={result.total_zones_failed} tone="destructive" />
+            <Stat
+              label="Created"
+              value={result.total_zones_created}
+              tone="success"
+            />
+            <Stat
+              label="Overwrote"
+              value={result.total_zones_overwrote}
+              tone="amber"
+            />
+            <Stat
+              label="Renamed"
+              value={result.total_zones_renamed}
+              tone="amber"
+            />
+            <Stat
+              label="Skipped"
+              value={result.total_zones_skipped}
+              tone="muted"
+            />
+            <Stat
+              label="Failed"
+              value={result.total_zones_failed}
+              tone="destructive"
+            />
             <span className="text-muted-foreground">·</span>
-            <Stat label="Records" value={result.total_records_created} tone="success" />
+            <Stat
+              label="Records"
+              value={result.total_records_created}
+              tone="success"
+            />
           </div>
         </div>
 
@@ -640,7 +678,9 @@ function CommitResultPanel({
             <tbody>
               {result.zones.map((z) => (
                 <tr key={z.zone_name} className="border-t">
-                  <td className="px-3 py-2 align-top font-mono text-xs">{z.zone_name}</td>
+                  <td className="px-3 py-2 align-top font-mono text-xs">
+                    {z.zone_name}
+                  </td>
                   <td className="px-3 py-2 align-top">
                     <ActionPill action={z.action_taken} />
                   </td>
@@ -661,7 +701,9 @@ function CommitResultPanel({
 
         {result.warnings.length > 0 && (
           <div className="mt-3 space-y-1 rounded-md border border-amber-500/40 bg-amber-500/5 p-3 text-xs">
-            <div className="font-medium text-amber-700 dark:text-amber-400">Warnings</div>
+            <div className="font-medium text-amber-700 dark:text-amber-400">
+              Warnings
+            </div>
             {result.warnings.map((w, i) => (
               <div key={i} className="text-amber-700/90 dark:text-amber-300/90">
                 {w}
@@ -680,7 +722,6 @@ function CommitResultPanel({
   );
 }
 
-
 function Stat({
   label,
   value,
@@ -698,12 +739,13 @@ function Stat({
   };
   return (
     <span className="inline-flex items-baseline gap-1">
-      <span className={cn("font-semibold tabular-nums", tones[tone])}>{value}</span>
+      <span className={cn("font-semibold tabular-nums", tones[tone])}>
+        {value}
+      </span>
       <span className="text-muted-foreground">{label}</span>
     </span>
   );
 }
-
 
 function ActionPill({ action }: { action: string }) {
   const map: Record<string, { tone: string; label: string }> = {

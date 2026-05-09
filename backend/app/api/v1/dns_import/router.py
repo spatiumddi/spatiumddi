@@ -255,7 +255,9 @@ async def _read_archive(file: UploadFile) -> bytes:
 async def bind9_preview(
     current_user: SuperAdmin,
     db: DB,
-    file: UploadFile = File(..., description="ZIP or tar(.gz/.bz2/.xz) archive containing named.conf + zone files"),
+    file: UploadFile = File(
+        ..., description="ZIP or tar(.gz/.bz2/.xz) archive containing named.conf + zone files"
+    ),
     target_group_id: uuid.UUID = Form(..., description="DNS server group the import will land in"),
     target_view_id: uuid.UUID | None = Form(default=None),
 ) -> PreviewOut:
@@ -276,10 +278,7 @@ async def bind9_preview(
     # Conflict detection runs against the target group + view here so
     # the UI's per-zone strategy picker has accurate data. Re-checked
     # at commit time in case the world moved.
-    zone_names = [
-        z.name if z.name.endswith(".") else z.name + "."
-        for z in preview.zones
-    ]
+    zone_names = [z.name if z.name.endswith(".") else z.name + "." for z in preview.zones]
     zone_names = [n.lower() for n in zone_names]
     preview.conflicts = await detect_conflicts(
         db,

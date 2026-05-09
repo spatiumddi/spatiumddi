@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import dns.exception
 import dns.name
@@ -72,10 +72,19 @@ class ParsedSOA:
 
 @dataclass(frozen=True)
 class ParsedZone:
-    """Full parsing result for a zone file."""
+    """Full parsing result for a zone file.
+
+    ``skipped_types`` is a histogram of rdtypes the parser saw but
+    chose not to surface as ``ParsedRecord`` rows because they're
+    not in :data:`SUPPORTED_RECORD_TYPES` (DNSKEY, RRSIG, NSEC, …).
+    Callers like the DNS import pipeline use this to warn the
+    operator about DNSSEC + experimental record types that won't
+    survive the round trip into SpatiumDDI's record table.
+    """
 
     soa: ParsedSOA | None
     records: list[ParsedRecord]
+    skipped_types: dict[str, int] = field(default_factory=dict)
 
 
 def _normalize_zone_name(name: str) -> str:
@@ -139,6 +148,7 @@ def parse_zone_file(text: str, zone_name: str) -> ParsedZone:
     origin = dns.name.from_text(origin_str)
     soa: ParsedSOA | None = None
     records: list[ParsedRecord] = []
+    skipped_types: dict[str, int] = {}
 
     for name, node in zone.nodes.items():
         for rdataset in node.rdatasets:
@@ -162,7 +172,11 @@ def parse_zone_file(text: str, zone_name: str) -> ParsedZone:
 
             if rtype_text not in SUPPORTED_RECORD_TYPES:
                 # Skip unsupported record types rather than fail the whole
-                # import — they will show up as "skipped" on preview.
+                # import. Record the count by type so callers (e.g. the
+                # DNS configuration importer, issue #128) can warn the
+                # operator that DNSSEC / experimental rdtypes were
+                # dropped on the way in.
+                skipped_types[rtype_text] = skipped_types.get(rtype_text, 0) + len(rdataset)
                 continue
 
             for rdata in rdataset:
@@ -179,4 +193,4 @@ def parse_zone_file(text: str, zone_name: str) -> ParsedZone:
                     )
                 )
 
-    return ParsedZone(soa=soa, records=records)
+    return ParsedZone(soa=soa, records=records, skipped_types=skipped_types)
