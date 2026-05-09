@@ -71,14 +71,26 @@ jobs:
         run: helm dependency update charts/spatiumddi
 
       - name: Preload Bitnami subchart images into kind
-        # Sidesteps Docker Hub anonymous rate-limits for the bundled
-        # postgresql + redis subcharts. Pulling once on the runner
-        # host and side-loading into kind means the cluster never
-        # talks to docker.io directly — kind's containerd serves
-        # both pods from its own loaded set. The tags must match
-        # what the umbrella chart resolves at template time; bump
-        # them in lockstep with the postgresql + redis subchart
-        # version pins in charts/spatiumddi/Chart.yaml.
+        # Sidesteps two unrelated upstream issues at once:
+        #
+        # 1. Docker Hub anonymous-pull rate limits (100/6h/IP) bite hard
+        #    on shared GH runners, so the kind nodes can't reliably
+        #    pull docker.io/bitnami/* images when the chart deploys.
+        #
+        # 2. Bitnami pruned the public ``bitnami/*`` Docker Hub
+        #    namespace in late 2025 in favour of their paid "Bitnami
+        #    Secure Images". Old pinned tags like
+        #    ``bitnami/postgresql:16.4.0-debian-12-r14`` (referenced by
+        #    the bundled postgresql + redis subcharts) now return
+        #    ``manifest unknown`` — they're only available under the
+        #    parallel ``bitnamilegacy/*`` namespace.
+        #
+        # We pull from ``bitnamilegacy`` once on the runner host then
+        # ``docker tag`` to the canonical ``bitnami/`` ref the chart
+        # asks for, side-load into kind, and let containerd serve from
+        # its own loaded set. The cluster never talks to docker.io.
+        # Tags come from ``helm template`` so they stay in lockstep
+        # with the subchart version pins in Chart.yaml automatically.
         run: |
           PG_IMAGE=$(helm template ddi charts/spatiumddi 2>/dev/null \
             | grep -E "image: docker.io/bitnami/postgresql:" -m1 \
@@ -86,14 +98,17 @@ jobs:
           RD_IMAGE=$(helm template ddi charts/spatiumddi 2>/dev/null \
             | grep -E "image: docker.io/bitnami/redis:" -m1 \
             | awk '{print $2}')
-          echo "preloading $PG_IMAGE + $RD_IMAGE into kind"
-          for img in "$PG_IMAGE" "$RD_IMAGE"; do
+          echo "chart wants: $PG_IMAGE + $RD_IMAGE"
+          for canonical in "$PG_IMAGE" "$RD_IMAGE"; do
+            legacy=$(echo "$canonical" | sed 's|/bitnami/|/bitnamilegacy/|')
+            echo "→ pulling $legacy"
             for attempt in 1 2 3; do
-              if docker pull "$img"; then break; fi
+              if docker pull "$legacy"; then break; fi
               echo "pull attempt $attempt failed; retrying after 10s..."
               sleep 10
             done
-            kind load docker-image "$img" --name spatium-e2e
+            docker tag "$legacy" "$canonical"
+            kind load docker-image "$canonical" --name spatium-e2e
           done
 
       - name: Install chart
