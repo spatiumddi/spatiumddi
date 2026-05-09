@@ -580,6 +580,14 @@ class DNSZone(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
         JSONB, nullable=False, default=dict, server_default=sa_text("'{}'::jsonb")
     )
 
+    # Provenance for the DNS configuration importer (issue #128).
+    # ``bind9 | windows_dns | powerdns`` for rows that came in through
+    # /dns/import; NULL for everything else. ``imported_at`` is the
+    # wall-clock commit timestamp — re-imports of the same source key
+    # off ``(import_source, name)`` to decide skip-vs-overwrite.
+    import_source: Mapped[str | None] = mapped_column(String(20), nullable=True, index=True)
+    imported_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
     group: Mapped["DNSServerGroup"] = relationship("DNSServerGroup", back_populates="zones")
     view: Mapped["DNSView | None"] = relationship("DNSView", back_populates="zones")
     records: Mapped[list["DNSRecord"]] = relationship(
@@ -658,6 +666,14 @@ class DNSRecord(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     tags: Mapped[dict] = mapped_column(
         JSONB, nullable=False, default=dict, server_default=sa_text("'{}'::jsonb")
     )
+
+    # Provenance for the DNS configuration importer (issue #128). Same
+    # shape as ``DNSZone.import_source`` / ``imported_at`` — the
+    # importer stamps both on every row it creates so re-imports
+    # dedupe and operators can answer "where did this record come
+    # from" later. NULL on hand-created or auto-generated rows.
+    import_source: Mapped[str | None] = mapped_column(String(20), nullable=True, index=True)
+    imported_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     zone: Mapped["DNSZone"] = relationship("DNSZone", back_populates="records")
 

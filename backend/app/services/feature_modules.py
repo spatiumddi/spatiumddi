@@ -146,6 +146,20 @@ MODULES: Final[tuple[ModuleSpec, ...]] = (
         group="Tools",
         description="On-demand nmap with live SSE output + history. Subnet/IP scan buttons hide when off.",
     ),
+    # DNS — togglable extras under the Settings → Import surface and
+    # the DNS sidebar group. The importer is one-shot (issue #128) —
+    # operators upload BIND9 configs / live-pull from Windows DNS or
+    # PowerDNS to seed SpatiumDDI with their existing zones, then the
+    # importer's job is done. Default-enabled because there's no
+    # blast radius from having the toggle on (importer endpoints are
+    # gated separately by RBAC); operators who want to hide the
+    # surface can flip it off.
+    ModuleSpec(
+        id="dns.import",
+        label="DNS configuration import",
+        group="DNS",
+        description="One-shot import from BIND9 / Windows DNS / PowerDNS into SpatiumDDI's native zones + records. Settings → Import → DNS surface; sources gate behind their own credential / file-upload step.",
+    ),
     # Integrations — read-only mirrors of external orchestrators.
     # Default-disabled: each one needs operator-supplied credentials
     # before it does anything useful, and the kickoff lives behind
