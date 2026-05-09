@@ -4612,6 +4612,112 @@ export interface BlocklistCatalogResponse {
   sources: BlocklistCatalogSource[];
 }
 
+// ── DNS configuration importer (issue #128) ─────────────────────────
+
+export type DNSImportSource = "bind9" | "windows_dns" | "powerdns";
+export type DNSImportConflictAction = "skip" | "overwrite" | "rename";
+
+export interface DNSImportedRecord {
+  name: string;
+  record_type: string;
+  value: string;
+  ttl: number | null;
+  priority: number | null;
+  weight: number | null;
+  port: number | null;
+}
+
+export interface DNSImportedSOA {
+  primary_ns: string;
+  admin_email: string;
+  serial: number;
+  refresh: number;
+  retry: number;
+  expire: number;
+  minimum: number;
+  ttl: number;
+}
+
+export interface DNSImportedZone {
+  name: string;
+  zone_type: string;
+  kind: string;
+  soa: DNSImportedSOA | null;
+  records: DNSImportedRecord[];
+  view_name: string | null;
+  forwarders: string[];
+  skipped_record_types: Record<string, number>;
+  parse_warnings: string[];
+}
+
+export interface DNSImportZoneConflict {
+  zone_name: string;
+  existing_zone_id: string;
+  existing_record_count: number;
+  action: DNSImportConflictAction;
+  rename_to: string | null;
+}
+
+export interface DNSImportPreview {
+  source: DNSImportSource;
+  zones: DNSImportedZone[];
+  conflicts: DNSImportZoneConflict[];
+  warnings: string[];
+  total_records: number;
+  record_type_histogram: Record<string, number>;
+}
+
+export interface DNSImportConflictDecision {
+  action: DNSImportConflictAction;
+  rename_to?: string | null;
+}
+
+export interface DNSImportCommitResultZone {
+  zone_name: string;
+  action_taken: "created" | "overwrote" | "renamed" | "skipped" | "failed";
+  zone_id: string | null;
+  records_created: number;
+  records_deleted: number;
+  error: string | null;
+}
+
+export interface DNSImportCommitResult {
+  target_group_id: string;
+  zones: DNSImportCommitResultZone[];
+  warnings: string[];
+  total_zones_created: number;
+  total_zones_overwrote: number;
+  total_zones_renamed: number;
+  total_zones_skipped: number;
+  total_zones_failed: number;
+  total_records_created: number;
+}
+
+export const dnsImportApi = {
+  bind9Preview: (
+    file: File,
+    target_group_id: string,
+    target_view_id?: string,
+  ) => {
+    const fd = new FormData();
+    fd.append("file", file);
+    fd.append("target_group_id", target_group_id);
+    if (target_view_id) fd.append("target_view_id", target_view_id);
+    return api
+      .post<DNSImportPreview>("/dns/import/bind9/preview", fd)
+      .then((r) => r.data);
+  },
+  bind9Commit: (body: {
+    target_group_id: string;
+    target_view_id?: string | null;
+    plan: DNSImportPreview;
+    conflict_actions: Record<string, DNSImportConflictDecision>;
+  }) =>
+    api
+      .post<DNSImportCommitResult>("/dns/import/bind9/commit", body)
+      .then((r) => r.data),
+};
+
 export const dnsBlocklistApi = {
   list: () => api.get<DNSBlockList[]>("/dns/blocklists").then((r) => r.data),
   catalog: () =>

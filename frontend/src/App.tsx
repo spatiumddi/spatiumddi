@@ -40,6 +40,7 @@ import { SubnetPlannerEditorPage } from "@/pages/ipam/SubnetPlannerEditorPage";
 import { LogsPage } from "@/pages/LogsPage";
 import { UsersPage } from "@/pages/admin/UsersPage";
 import { AuditPage } from "@/pages/admin/AuditPage";
+import { DNSImportPage } from "@/pages/admin/DNSImportPage";
 import { BackupPage } from "@/pages/admin/BackupPage";
 import { DiagnosticsErrorsPage } from "@/pages/admin/DiagnosticsErrorsPage";
 import { AIProvidersPage } from "@/pages/admin/AIProvidersPage";
@@ -142,6 +143,7 @@ export default function App() {
         <Route path="admin/groups" element={<GroupsPage />} />
         <Route path="admin/roles" element={<RolesPage />} />
         <Route path="admin/audit" element={<AuditPage />} />
+        <Route path="admin/dns-import" element={<DNSImportPage />} />
         <Route path="admin/backup" element={<BackupPage />} />
         <Route
           path="admin/diagnostics/errors"

@@ -49,6 +49,7 @@ import {
   Workflow,
   Monitor,
   ToggleLeft,
+  Upload,
   AlertTriangle,
   Database,
   X,
@@ -202,6 +203,15 @@ const adminConfigurationNav = [
     module: "ai.copilot",
   },
   { label: "Custom Fields", icon: Tags, to: "/admin/custom-fields" },
+  // DNS configuration importer (issue #128). Module-gated so
+  // operators who don't need the surface can hide it via Settings →
+  // Features.
+  {
+    label: "DNS Import",
+    icon: Upload,
+    to: "/admin/dns-import",
+    module: "dns.import",
+  },
   // ``Features`` lives in the footer next to Settings — it's a
   // platform-wide control, not a per-area config, and ops teams expect
   // to find it next to "Settings" rather than buried in the sidebar.
