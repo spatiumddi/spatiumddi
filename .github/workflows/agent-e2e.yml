@@ -305,6 +305,14 @@ jobs:
           echo "→ signing $ZONE"
           kubectl -n spatiumddi exec "$POD" -- pdnsutil --config-dir=/var/lib/spatium-dns-agent/rendered secure-zone "$ZONE"
           kubectl -n spatiumddi exec "$POD" -- pdnsutil --config-dir=/var/lib/spatium-dns-agent/rendered rectify-zone "$ZONE"
+          # pdns_server caches zone contents on the LMDB backend —
+          # pdnsutil writes go into the database but the running
+          # daemon's in-memory state lags. Purge the daemon's cache
+          # via the control socket so the next dig sees fresh data.
+          # The control socket is in the agent's rendered config dir
+          # (same dir as pdns.conf) when pdns_server was launched
+          # with --config-dir.
+          kubectl -n spatiumddi exec "$POD" -- pdns_control --config-dir=/var/lib/spatium-dns-agent/rendered purge || true
           # Verify the signed answer comes back with RRSIG records.
           # We don't expect AD here — pdns_server is authoritative,
           # not a validating resolver — but RRSIG presence proves the
