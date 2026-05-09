@@ -61,6 +61,7 @@ from app.models.multicast import (
 )
 from app.models.network import NetworkDevice
 from app.models.vrf import VRF
+from app.services.multicast.auto_block import ensure_enclosing_block
 from app.services.tags import apply_tag_filter
 
 router = APIRouter(
@@ -660,6 +661,12 @@ async def create_group(body: MulticastGroupCreate, db: DB, user: CurrentUser) ->
     await _check_space(db, body.space_id)
     await _check_domain(db, body.domain_id)
 
+    # Auto-create a 224.0.0.0/4 (or ff00::/8) block in this IPSpace
+    # if none encloses the group address yet, so the IPAM tree shows
+    # a parent for the multicast groups. See app.services.multicast
+    # .auto_block for the no-op cases.
+    await ensure_enclosing_block(db, body.space_id, body.address)
+
     row = MulticastGroup(
         space_id=body.space_id,
         address=body.address,
@@ -1166,6 +1173,12 @@ async def bulk_allocate_commit(
                 "conflicts": [it.address for it in conflicts],
             },
         )
+
+    # Auto-create a 224.0.0.0/4 (or ff00::/8) block in this IPSpace
+    # if none encloses the start address yet — one call covers every
+    # item since they all share the same supernet by construction.
+    if items:
+        await ensure_enclosing_block(db, body.space_id, items[0].address)
 
     created_ids: list[uuid.UUID] = []
     for item in items:

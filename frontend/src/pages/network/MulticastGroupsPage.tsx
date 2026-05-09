@@ -958,16 +958,33 @@ function BulkAllocateModal({
 
 export function MulticastGroupsPage() {
   const qc = useQueryClient();
+  const [searchParams, setSearchParams] = useSearchParams();
+  // ``?space=<uuid>`` deep-links from the IPAM page so clicking
+  // through from a multicast IPSpace lands here pre-filtered.
   const [search, setSearch] = useState("");
-  const [spaceFilter, setSpaceFilter] = useState("");
+  const [spaceFilter, setSpaceFilter] = useState(
+    () => searchParams.get("space") ?? "",
+  );
   const [customerFilter, setCustomerFilter] = useState("");
   const [editing, setEditing] = useState<MulticastGroupRead | null>(null);
   const [showNew, setShowNew] = useState(false);
   const [showBulk, setShowBulk] = useState(false);
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
-  const [searchParams, setSearchParams] = useSearchParams();
   const tab: "groups" | "domains" =
     searchParams.get("tab") === "domains" ? "domains" : "groups";
+
+  // Keep ``?space=<uuid>`` in the URL in sync with the dropdown.
+  useEffect(() => {
+    setSearchParams(
+      (prev) => {
+        const params = new URLSearchParams(prev);
+        if (spaceFilter) params.set("space", spaceFilter);
+        else params.delete("space");
+        return params;
+      },
+      { replace: true },
+    );
+  }, [spaceFilter, setSearchParams]);
 
   function selectTab(next: "groups" | "domains") {
     setSearchParams(

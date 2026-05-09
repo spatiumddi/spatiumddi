@@ -6,7 +6,7 @@ import {
   useMutation,
   useQueryClient,
 } from "@tanstack/react-query";
-import { useLocation, useSearchParams } from "react-router-dom";
+import { Link, useLocation, useSearchParams } from "react-router-dom";
 import {
   ChevronDown,
   ChevronRight,
@@ -33,6 +33,7 @@ import {
   GitMerge,
   Maximize2,
   ShieldCheck,
+  Radio,
 } from "lucide-react";
 import {
   DndContext,
@@ -53,6 +54,7 @@ import {
   networkApi,
   asnsApi,
   vrfsApi,
+  multicastApi,
   IP_ROLE_OPTIONS,
   SUBNET_ROLES,
   SUBNET_ROLE_LABELS,
@@ -9731,7 +9733,11 @@ function BlockTreeRow({
                   : "text-muted-foreground hover:text-foreground",
               )}
             >
-              <Layers className="h-3 w-3 flex-shrink-0" />
+              {isMulticastCidr(node.block.network) ? (
+                <Radio className="h-3 w-3 flex-shrink-0 text-violet-500" />
+              ) : (
+                <Layers className="h-3 w-3 flex-shrink-0" />
+              )}
               <span className="font-mono font-medium flex-1 truncate">
                 {node.block.network}
               </span>
@@ -10110,7 +10116,11 @@ function BlockDetailView({
         </div>
         {/* Identity row */}
         <div className="flex items-center gap-3 px-6 pb-2">
-          <Layers className="h-4 w-4 text-violet-500" />
+          {isMulticastCidr(block.network) ? (
+            <Radio className="h-4 w-4 text-violet-500" />
+          ) : (
+            <Layers className="h-4 w-4 text-violet-500" />
+          )}
           <span className="font-mono text-xl font-bold tracking-tight">
             {block.network}
           </span>
@@ -10397,6 +10407,11 @@ function BlockDetailView({
         </div>
       </div>
       <div className="flex-1 overflow-auto">
+        {space && (
+          <div className="px-6 pt-3">
+            <MulticastGroupsPanel space={space} block={block} />
+          </div>
+        )}
         {(() => {
           // Build a synthetic BlockNode for the current block so flattenToTableRows
           // renders its full subtree (child blocks + direct subnets) at depth 0
@@ -10940,6 +10955,150 @@ function flattenToTableRows(nodes: BlockNode[], depth = 0): TreeTableItem[] {
 function cidrSize(network: string): number {
   const prefix = parseInt(network.split("/")[1] ?? "32");
   return Math.pow(2, 32 - prefix);
+}
+
+/**
+ * Renders multicast groups whose addresses fall within an IPBlock's
+ * CIDR. Multicast groups are first-class entities (their own
+ * ``multicast_group`` table) and don't fit the block/subnet/IP tree,
+ * so this panel surfaces them in the block detail view with
+ * click-through to ``/network/multicast?space=<space.id>`` for full
+ * management.
+ *
+ * Hidden when the block contains zero matching groups so unicast
+ * blocks stay clean. Wave-1 surface — wave 2 will render groups
+ * inline as a row kind in the main tree alongside subnets.
+ */
+function ipv4InCidr(addr: string, cidr: string): boolean {
+  // Ignore IPv6 / non-v4 addresses; multicast IPv6 ff00::/8 needs
+  // a separate path in wave 2.
+  const [base, prefStr] = cidr.split("/");
+  const prefix = parseInt(prefStr ?? "32", 10);
+  const toInt = (s: string): number | null => {
+    const parts = s.split(".");
+    if (parts.length !== 4) return null;
+    let n = 0;
+    for (const p of parts) {
+      const v = parseInt(p, 10);
+      if (Number.isNaN(v) || v < 0 || v > 255) return null;
+      n = (n << 8) | v;
+    }
+    return n >>> 0;
+  };
+  const ai = toInt(addr);
+  const bi = toInt(base);
+  if (ai === null || bi === null) return false;
+  if (prefix === 0) return true;
+  const mask = prefix === 32 ? 0xffffffff : ~((1 << (32 - prefix)) - 1) >>> 0;
+  return (ai & mask) === (bi & mask);
+}
+
+/**
+ * True when ``cidr`` lies inside the multicast range — IPv4
+ * ``224.0.0.0/4`` or IPv6 ``ff00::/8``. Used to swap the
+ * tree-row icon from ``Layers`` to ``Radio`` for multicast
+ * blocks so they're visually distinct.
+ */
+function isMulticastCidr(cidr: string): boolean {
+  if (!cidr) return false;
+  const base = cidr.split("/")[0] ?? "";
+  if (base.includes(":")) {
+    // IPv6 ff00::/8 — anything starting with "ff" (case-insensitive)
+    return base.toLowerCase().startsWith("ff");
+  }
+  // IPv4: first octet 224..239 lies inside 224.0.0.0/4
+  const first = parseInt(base.split(".")[0] ?? "0", 10);
+  return first >= 224 && first <= 239;
+}
+
+function MulticastGroupsPanel({
+  space,
+  block,
+}: {
+  space: IPSpace;
+  block: IPBlock;
+}) {
+  const { data, isLoading } = useQuery({
+    queryKey: ["multicast-groups", "by-space", space.id],
+    queryFn: () =>
+      multicastApi.list({ space_id: space.id, limit: 500, offset: 0 }),
+    staleTime: 30_000,
+  });
+
+  if (isLoading) return null;
+  const allItems = data?.items ?? [];
+  // Filter to addresses that fall inside this block's CIDR. The
+  // backend list endpoint doesn't have a "by-CIDR" filter, so we
+  // pull the per-space set (capped at 500) and slice client-side.
+  const items = allItems.filter((g) => ipv4InCidr(g.address, block.network));
+  const total = items.length;
+  if (total === 0) return null;
+
+  return (
+    <div className="mb-3 rounded-md border bg-violet-50/40 dark:bg-violet-950/20">
+      <div className="flex items-center justify-between gap-3 border-b px-4 py-2">
+        <div className="flex items-center gap-2 text-sm font-semibold">
+          <Radio className="h-4 w-4 text-violet-600 dark:text-violet-400" />
+          Multicast Groups
+          <span className="text-xs font-normal text-muted-foreground">
+            {total} group{total === 1 ? "" : "s"} in {block.network}
+          </span>
+        </div>
+        <Link
+          to={`/network/multicast?space=${space.id}`}
+          className="inline-flex items-center gap-1 rounded-md border bg-background px-3 py-1.5 text-xs font-medium hover:bg-muted"
+        >
+          Manage Groups →
+        </Link>
+      </div>
+      <div className="overflow-x-auto">
+        <table className="w-full min-w-[480px] text-sm">
+          <thead>
+            <tr className="border-b text-xs text-muted-foreground">
+              <th className="px-2 py-1.5 text-left font-medium">Address</th>
+              <th className="px-2 py-1.5 text-left font-medium">Name</th>
+              <th className="px-2 py-1.5 text-left font-medium">Application</th>
+              <th className="w-24 px-2 py-1.5 text-right font-medium">VLAN</th>
+            </tr>
+          </thead>
+          <tbody>
+            {items.slice(0, 50).map((g) => (
+              <tr
+                key={g.id}
+                className="border-b last:border-b-0 hover:bg-violet-100/40 dark:hover:bg-violet-900/30"
+              >
+                <td className="px-2 py-1.5 font-mono text-xs">
+                  <Link
+                    to={`/network/multicast?space=${space.id}`}
+                    className="hover:underline"
+                  >
+                    {g.address}
+                  </Link>
+                </td>
+                <td className="px-2 py-1.5">{g.name || "—"}</td>
+                <td className="px-2 py-1.5 text-xs text-muted-foreground">
+                  {g.application || "—"}
+                </td>
+                <td className="px-2 py-1.5 text-right text-xs text-muted-foreground">
+                  {g.vlan_id ? "set" : "—"}
+                </td>
+              </tr>
+            ))}
+            {items.length > 50 && (
+              <tr>
+                <td
+                  colSpan={4}
+                  className="px-2 py-1.5 text-center text-xs text-muted-foreground"
+                >
+                  + {total - 50} more — use Manage Groups to see all
+                </td>
+              </tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
 }
 
 function SpaceTableView({
