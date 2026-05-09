@@ -213,6 +213,29 @@ $(REDIS_PASSWORD) reference secrets; everything else is inline.
   value: "redis://{{ include "spatiumddi.redisHost" . }}:{{ include "spatiumddi.redisPort" . }}/1"
 - name: CELERY_RESULT_BACKEND
   value: "redis://{{ include "spatiumddi.redisHost" . }}:{{ include "spatiumddi.redisPort" . }}/2"
+{{- end }}
+{{- if .Values.dnsAgents.enabled }}
+{{/* DNS agent PSK — agents bootstrap-register against the api with
+     this key, so the api / worker pods need it to verify the
+     incoming registration handshake. The Secret is rendered by
+     templates/dns-agent.yaml under the same name + key. */}}
+- name: DNS_AGENT_KEY
+  valueFrom:
+    secretKeyRef:
+      name: {{ .Values.dnsAgents.agentKey.existingSecret | default (printf "%s-dns-agent-key" (include "spatiumddi.fullname" .)) }}
+      key: DNS_AGENT_KEY
+{{- end }}
+{{- if .Values.dhcpAgents.enabled }}
+{{/* DHCP agent PSK. Agent side env var is SPATIUM_AGENT_KEY, but the
+     control plane reads DHCP_AGENT_KEY (see backend/app/api/v1/dhcp/
+     agents.py). The dhcp-agent Secret stores under SPATIUM_AGENT_KEY
+     so we name the env var differently while pointing at the same
+     value. */}}
+- name: DHCP_AGENT_KEY
+  valueFrom:
+    secretKeyRef:
+      name: {{ .Values.dhcpAgents.agentKey.existingSecret | default (printf "%s-dhcp-agent-key" (include "spatiumddi.fullname" .)) }}
+      key: SPATIUM_AGENT_KEY
 {{- end -}}
 {{- end -}}
 
