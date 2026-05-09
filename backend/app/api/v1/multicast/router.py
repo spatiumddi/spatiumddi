@@ -1,13 +1,17 @@
 """Multicast group CRUD — issue #126 Phase 1.
 
-Three sub-resources behind one router prefix:
+Endpoints under ``/multicast``:
 
-* ``/multicast/groups`` — group create / list / read / update / delete
-* ``/multicast/groups/{id}/ports`` — port range CRUD on a group
-* ``/multicast/groups/{id}/memberships`` — producer/consumer/RP rows
-* ``/multicast/memberships/{id}`` — direct delete (the membership id
-  is operator-visible in lists, so a flat delete URL avoids forcing
+* ``/groups`` — group create / list / read / update / delete
+* ``/groups/{id}/ports`` — port range CRUD on a group
+* ``/groups/{id}/memberships`` — producer/consumer/RP rows
+* ``/memberships/{id}`` — direct delete (the membership id is
+  operator-visible in lists, so a flat delete URL avoids forcing
   a round-trip to look up the group_id)
+* ``/groups/bulk-allocate/{preview,commit}`` — stamp N sequential
+  multicast addresses with a name template in one shot. Bounded
+  to 256 per call (the registry is curated; large fan-outs that
+  exceed the cap are an operator-error signal, not a workflow).
 
 Permissions: every endpoint is gated on ``multicast`` (admin via
 the seeded Network Editor builtin role; superadmin always passes).
@@ -23,9 +27,10 @@ Server-side validation in this layer:
 * Membership ``role`` and ``seen_via`` validated against the
   frozensets in the model module.
 
-Phase 1 is registry-only. Bulk-allocate (Wave 3), the Conformity
-collision check (Wave 3), and Operator Copilot tools (Phase 4)
-land in follow-up commits.
+Bulk-allocate uses the same ``{n}`` / ``{n:03d}`` / ``{n:x}`` /
+``{oct1-4}`` template grammar as the IPAM bulk-allocate endpoint
+(``app.api.v1.ipam.router``); helpers are imported there to keep
+the two surfaces in lock-step.
 """
 
 from __future__ import annotations
@@ -565,3 +570,204 @@ async def delete_membership(membership_id: uuid.UUID, db: DB, user: CurrentUser)
     )
     await db.delete(row)
     await db.commit()
+
+
+# ── Bulk allocate ─────────────────────────────────────────────────
+#
+# Stamp a contiguous run of N multicast addresses with templated
+# names in one shot. Two endpoints — ``/preview`` (read-only blast
+# radius, surfaces conflicts before the operator commits) and the
+# bare commit (transactional, refuses if any conflicts remain).
+#
+# Grammar reuse — ``{n}`` / ``{n:03d}`` / ``{oct1-4}`` etc — is
+# imported from the IPAM bulk-allocate path so the two stay in
+# lock-step. Same upper cap on a single call shape (256 here vs
+# 1024 there): the multicast registry is curated, not a sweep.
+
+_BULK_MAX_GROUPS = 256
+
+
+class MulticastBulkAllocateItem(BaseModel):
+    address: str
+    name: str
+    conflict: str | None = None  # ``in_use`` when the address already exists in-space
+
+
+class MulticastBulkAllocateRequest(BaseModel):
+    space_id: uuid.UUID
+    count: int = Field(..., ge=1, le=_BULK_MAX_GROUPS)
+    name_template: str = Field(..., min_length=1, max_length=128)
+    start_address: str = Field(..., min_length=1, max_length=45)
+    template_start: int = Field(default=1, ge=0)
+    application: str = Field(default="", max_length=255)
+    description: str = ""
+    vlan_id: uuid.UUID | None = None
+    customer_id: uuid.UUID | None = None
+    service_id: uuid.UUID | None = None
+    domain_id: uuid.UUID | None = None
+    tags: dict[str, Any] = Field(default_factory=dict)
+    custom_fields: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("start_address")
+    @classmethod
+    def _v_start(cls, v: str) -> str:
+        return _validate_multicast_addr(v)
+
+
+class MulticastBulkAllocatePreviewResponse(BaseModel):
+    items: list[MulticastBulkAllocateItem]
+    conflict_count: int
+    cap: int = _BULK_MAX_GROUPS
+
+
+class MulticastBulkAllocateCommitResponse(BaseModel):
+    created: int
+    group_ids: list[uuid.UUID]
+
+
+async def _build_bulk_candidates(
+    db: Any, body: MulticastBulkAllocateRequest
+) -> list[MulticastBulkAllocateItem]:
+    """Walk the address sequence + flag in-use rows. Address-class
+    is already validated by ``_v_start``; we only have to refuse
+    when the run would step outside the multicast range (e.g. count
+    too high to fit between start and the upper bound)."""
+    # Reuse the IPAM-side template helpers — keeping one grammar +
+    # one parser across both surfaces avoids drift. Local import to
+    # dodge any module-load-order cost for endpoints that never use
+    # bulk-allocate.
+    from app.api.v1.ipam.router import _expand_bulk_template  # noqa: PLC0415
+
+    base = ipaddress.ip_address(body.start_address)
+    family = "v4" if isinstance(base, ipaddress.IPv4Address) else "v6"
+    base_int = int(base)
+
+    # Build the candidate addresses + verify they all stay inside
+    # the multicast range (top of v4 range is 239.255.255.255 =
+    # 4026531839; top of v6 ff::/8 range is well past anything
+    # operators would ever bulk-stamp).
+    upper_bound = (
+        int(ipaddress.IPv4Address("239.255.255.255"))
+        if family == "v4"
+        else int(ipaddress.IPv6Address("ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff"))
+    )
+    candidates: list[ipaddress.IPv4Address | ipaddress.IPv6Address] = []
+    for i in range(body.count):
+        next_int = base_int + i
+        if next_int > upper_bound:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    f"start_address + count - 1 walks past the multicast range "
+                    f"(item {i + 1} of {body.count} would land at an out-of-range address)"
+                ),
+            )
+        candidates.append(
+            ipaddress.IPv4Address(next_int) if family == "v4" else ipaddress.IPv6Address(next_int)
+        )
+
+    # In-space already-allocated check. Single query against the
+    # candidate set rather than N round-trips.
+    addr_strings = [str(a) for a in candidates]
+    used_rows = (
+        await db.execute(
+            select(MulticastGroup.address).where(
+                MulticastGroup.space_id == body.space_id,
+                MulticastGroup.address.in_(addr_strings),
+            )
+        )
+    ).all()
+    used: set[str] = {str(r[0]) for r in used_rows}
+
+    items: list[MulticastBulkAllocateItem] = []
+    for idx, ip_obj in enumerate(candidates):
+        n = body.template_start + idx
+        rendered_name = _expand_bulk_template(body.name_template, ip_obj, n)
+        addr_str = str(ip_obj)
+        items.append(
+            MulticastBulkAllocateItem(
+                address=addr_str,
+                name=rendered_name,
+                conflict=("in_use" if addr_str in used else None),
+            )
+        )
+    return items
+
+
+@router.post(
+    "/groups/bulk-allocate/preview",
+    response_model=MulticastBulkAllocatePreviewResponse,
+)
+async def bulk_allocate_preview(
+    body: MulticastBulkAllocateRequest, db: DB, _: CurrentUser
+) -> MulticastBulkAllocatePreviewResponse:
+    """Read-only blast radius for a bulk-allocate. Surfaces address
+    conflicts so the operator can change ``start_address`` /
+    ``count`` before committing."""
+    await _check_space(db, body.space_id)
+    items = await _build_bulk_candidates(db, body)
+    conflicts = sum(1 for it in items if it.conflict is not None)
+    return MulticastBulkAllocatePreviewResponse(items=items, conflict_count=conflicts)
+
+
+@router.post(
+    "/groups/bulk-allocate/commit",
+    response_model=MulticastBulkAllocateCommitResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def bulk_allocate_commit(
+    body: MulticastBulkAllocateRequest, db: DB, user: CurrentUser
+) -> MulticastBulkAllocateCommitResponse:
+    """Commit a bulk-allocate. Refuses if any candidate address
+    already has a multicast group in the same space — the operator
+    runs ``/preview`` first to see + resolve conflicts."""
+    await _check_space(db, body.space_id)
+    items = await _build_bulk_candidates(db, body)
+    conflicts = [it for it in items if it.conflict is not None]
+    if conflicts:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": (
+                    f"{len(conflicts)} address(es) already in use; "
+                    "adjust start_address or count and re-preview"
+                ),
+                "conflicts": [it.address for it in conflicts],
+            },
+        )
+
+    created_ids: list[uuid.UUID] = []
+    for item in items:
+        row = MulticastGroup(
+            space_id=body.space_id,
+            address=item.address,
+            name=item.name,
+            description=body.description,
+            application=body.application,
+            vlan_id=body.vlan_id,
+            customer_id=body.customer_id,
+            service_id=body.service_id,
+            domain_id=body.domain_id,
+            tags=body.tags or {},
+            custom_fields=body.custom_fields or {},
+        )
+        db.add(row)
+        await db.flush()
+        created_ids.append(row.id)
+
+    write_audit(
+        db,
+        user=user,
+        action="bulk_allocate",
+        resource_type="multicast_group",
+        resource_id=str(body.space_id),
+        resource_display=(f"{len(created_ids)} group(s) starting at {body.start_address}"),
+        new_value={
+            "count": len(created_ids),
+            "start_address": body.start_address,
+            "name_template": body.name_template,
+            "space_id": str(body.space_id),
+        },
+    )
+    await db.commit()
+    return MulticastBulkAllocateCommitResponse(created=len(created_ids), group_ids=created_ids)

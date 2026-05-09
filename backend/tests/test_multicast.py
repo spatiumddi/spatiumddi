@@ -383,6 +383,147 @@ async def test_membership_rejects_invalid_role(
     assert resp.status_code == 422
 
 
+# ── Bulk allocate ─────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_bulk_allocate_happy_path(client: AsyncClient, db_session: AsyncSession) -> None:
+    _, token = await _make_admin(db_session)
+    space = await _make_space(db_session)
+    headers = {"Authorization": f"Bearer {token}"}
+    await db_session.commit()
+
+    body = {
+        "space_id": str(space.id),
+        "count": 4,
+        "name_template": "stream-{n:02d}",
+        "start_address": "239.10.0.0",
+        "application": "smpte 2110",
+    }
+
+    resp = await client.post(
+        "/api/v1/multicast/groups/bulk-allocate/preview",
+        headers=headers,
+        json=body,
+    )
+    assert resp.status_code == 200, resp.text
+    preview = resp.json()
+    assert preview["conflict_count"] == 0
+    assert [it["address"] for it in preview["items"]] == [
+        "239.10.0.0",
+        "239.10.0.1",
+        "239.10.0.2",
+        "239.10.0.3",
+    ]
+    assert [it["name"] for it in preview["items"]] == [
+        "stream-01",
+        "stream-02",
+        "stream-03",
+        "stream-04",
+    ]
+
+    resp = await client.post(
+        "/api/v1/multicast/groups/bulk-allocate/commit",
+        headers=headers,
+        json=body,
+    )
+    assert resp.status_code == 201, resp.text
+    out = resp.json()
+    assert out["created"] == 4
+
+    # Listing the space now returns the four created rows.
+    resp = await client.get(
+        f"/api/v1/multicast/groups?space_id={space.id}",
+        headers=headers,
+    )
+    assert resp.json()["total"] == 4
+
+
+@pytest.mark.asyncio
+async def test_bulk_allocate_preview_surfaces_conflicts(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    _, token = await _make_admin(db_session)
+    space = await _make_space(db_session)
+    # Pre-existing group at 239.20.0.1 — second slot of the run will
+    # collide.
+    db_session.add(MulticastGroup(space_id=space.id, address="239.20.0.1", name="prior"))
+    await db_session.commit()
+    headers = {"Authorization": f"Bearer {token}"}
+
+    body = {
+        "space_id": str(space.id),
+        "count": 3,
+        "name_template": "x-{n}",
+        "start_address": "239.20.0.0",
+    }
+
+    resp = await client.post(
+        "/api/v1/multicast/groups/bulk-allocate/preview",
+        headers=headers,
+        json=body,
+    )
+    assert resp.status_code == 200
+    preview = resp.json()
+    assert preview["conflict_count"] == 1
+    flagged = [it for it in preview["items"] if it["conflict"]]
+    assert flagged == [{"address": "239.20.0.1", "name": "x-2", "conflict": "in_use"}]
+
+    # Commit refuses while a conflict is in the run.
+    resp = await client.post(
+        "/api/v1/multicast/groups/bulk-allocate/commit",
+        headers=headers,
+        json=body,
+    )
+    assert resp.status_code == 409
+    assert resp.json()["detail"]["conflicts"] == ["239.20.0.1"]
+
+
+@pytest.mark.asyncio
+async def test_bulk_allocate_count_cap_is_enforced(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    _, token = await _make_admin(db_session)
+    space = await _make_space(db_session)
+    headers = {"Authorization": f"Bearer {token}"}
+    await db_session.commit()
+
+    resp = await client.post(
+        "/api/v1/multicast/groups/bulk-allocate/preview",
+        headers=headers,
+        json={
+            "space_id": str(space.id),
+            "count": 9999,
+            "name_template": "x-{n}",
+            "start_address": "239.5.0.0",
+        },
+    )
+    assert resp.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_bulk_allocate_rejects_unicast_start(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    _, token = await _make_admin(db_session)
+    space = await _make_space(db_session)
+    headers = {"Authorization": f"Bearer {token}"}
+    await db_session.commit()
+
+    resp = await client.post(
+        "/api/v1/multicast/groups/bulk-allocate/preview",
+        headers=headers,
+        json={
+            "space_id": str(space.id),
+            "count": 2,
+            "name_template": "x-{n}",
+            "start_address": "10.0.0.0",
+        },
+    )
+    assert resp.status_code == 422
+    assert any("224.0.0.0/4" in str(item) for item in resp.json()["detail"])
+
+
 # ── Feature-module gate ───────────────────────────────────────────────
 
 

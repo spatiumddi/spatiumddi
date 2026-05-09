@@ -8688,6 +8688,39 @@ export interface MulticastMembershipCreate {
   notes?: string;
 }
 
+export interface MulticastBulkAllocateRequest {
+  space_id: string;
+  count: number;
+  name_template: string;
+  start_address: string;
+  template_start?: number;
+  application?: string;
+  description?: string;
+  vlan_id?: string | null;
+  customer_id?: string | null;
+  service_id?: string | null;
+  domain_id?: string | null;
+  tags?: Record<string, unknown>;
+  custom_fields?: Record<string, unknown>;
+}
+
+export interface MulticastBulkAllocateItem {
+  address: string;
+  name: string;
+  conflict: string | null;
+}
+
+export interface MulticastBulkAllocatePreviewResponse {
+  items: MulticastBulkAllocateItem[];
+  conflict_count: number;
+  cap: number;
+}
+
+export interface MulticastBulkAllocateCommitResponse {
+  created: number;
+  group_ids: string[];
+}
+
 export const multicastApi = {
   list: (params?: MulticastGroupListQuery) =>
     api
@@ -8728,6 +8761,21 @@ export const multicastApi = {
       .then((r) => r.data),
   deleteMembership: (membershipId: string) =>
     api.delete(`/multicast/memberships/${membershipId}`),
+
+  bulkAllocatePreview: (data: MulticastBulkAllocateRequest) =>
+    api
+      .post<MulticastBulkAllocatePreviewResponse>(
+        "/multicast/groups/bulk-allocate/preview",
+        data,
+      )
+      .then((r) => r.data),
+  bulkAllocateCommit: (data: MulticastBulkAllocateRequest) =>
+    api
+      .post<MulticastBulkAllocateCommitResponse>(
+        "/multicast/groups/bulk-allocate/commit",
+        data,
+      )
+      .then((r) => r.data),
 };
 
 // ── Service catalog (issue #94) ────────────────────────────────────

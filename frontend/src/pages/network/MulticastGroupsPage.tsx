@@ -1,11 +1,13 @@
 import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Pencil, Plus, RefreshCw, Trash2, X } from "lucide-react";
+import { ListPlus, Pencil, Plus, RefreshCw, Trash2, X } from "lucide-react";
 import {
   customersApi,
   ipamApi,
   multicastApi,
   type IPSpace,
+  type MulticastBulkAllocateItem,
+  type MulticastBulkAllocateRequest,
   type MulticastGroupCreate,
   type MulticastGroupPortCreate,
   type MulticastGroupPortRead,
@@ -19,6 +21,7 @@ import {
 import { cn, zebraBodyCls } from "@/lib/utils";
 import { Modal, ModalTabs } from "@/components/ui/modal";
 import { HeaderButton } from "@/components/ui/header-button";
+import { IPAddressPicker } from "@/components/IPAddressPicker";
 
 const inputCls =
   "w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring";
@@ -464,7 +467,8 @@ function PortRow({
 
 function MembershipsTab({ groupId }: { groupId: string }) {
   const qc = useQueryClient();
-  const [ipId, setIpId] = useState("");
+  const [ipId, setIpId] = useState<string | null>(null);
+  const [_ipLabel, setIpLabel] = useState<string | null>(null);
   const [role, setRole] = useState<MulticastMembershipRole>("consumer");
   const [notes, setNotes] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -481,7 +485,8 @@ function MembershipsTab({ groupId }: { groupId: string }) {
       qc.invalidateQueries({
         queryKey: ["multicast-memberships", groupId],
       });
-      setIpId("");
+      setIpId(null);
+      setIpLabel(null);
       setNotes("");
       setError(null);
     },
@@ -509,11 +514,12 @@ function MembershipsTab({ groupId }: { groupId: string }) {
           Attach a producer / consumer / RP
         </p>
         <div className="grid grid-cols-1 gap-2 sm:grid-cols-[1fr_180px_1fr_auto]">
-          <input
-            className={cn(inputCls, "font-mono text-[11px]")}
-            placeholder="IP address ID (UUID)"
+          <IPAddressPicker
             value={ipId}
-            onChange={(e) => setIpId(e.target.value)}
+            onChange={(id, label) => {
+              setIpId(id);
+              setIpLabel(label);
+            }}
           />
           <select
             className={inputCls}
@@ -534,10 +540,11 @@ function MembershipsTab({ groupId }: { groupId: string }) {
           />
           <button
             type="button"
-            disabled={add.isPending || !ipId.trim()}
+            disabled={add.isPending || !ipId}
             onClick={() =>
+              ipId &&
               add.mutate({
-                ip_address_id: ipId.trim(),
+                ip_address_id: ipId,
                 role,
                 notes,
               })
@@ -547,10 +554,6 @@ function MembershipsTab({ groupId }: { groupId: string }) {
             Add
           </button>
         </div>
-        <p className="mt-2 text-[11px] text-muted-foreground">
-          Paste an IPAM IP address ID (UUID). A picker lands in a follow-up wave
-          alongside the IP-detail "Multicast" tab.
-        </p>
         {error && <p className="mt-2 text-xs text-destructive">{error}</p>}
       </div>
 
@@ -617,6 +620,304 @@ function MembershipRow({
   );
 }
 
+// ── Bulk allocate modal ─────────────────────────────────────────────
+
+function BulkAllocateModal({
+  spaces,
+  onClose,
+}: {
+  spaces: IPSpace[];
+  onClose: () => void;
+}) {
+  const qc = useQueryClient();
+  const [spaceId, setSpaceId] = useState(spaces[0]?.id ?? "");
+  const [startAddress, setStartAddress] = useState("239.10.0.0");
+  const [count, setCount] = useState("8");
+  const [nameTemplate, setNameTemplate] = useState("stream-{n:03d}");
+  const [templateStart, setTemplateStart] = useState("1");
+  const [application, setApplication] = useState("");
+  const [customerId, setCustomerId] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [preview, setPreview] = useState<MulticastBulkAllocateItem[] | null>(
+    null,
+  );
+  const [conflictCount, setConflictCount] = useState(0);
+
+  const customersQ = useQuery({
+    queryKey: ["customers", "all"],
+    queryFn: () => customersApi.list({ limit: 500 }),
+    staleTime: 60_000,
+  });
+  const customers = customersQ.data?.items ?? [];
+
+  function buildBody(): MulticastBulkAllocateRequest {
+    return {
+      space_id: spaceId,
+      count: Number(count),
+      name_template: nameTemplate,
+      start_address: startAddress.trim(),
+      template_start: Number(templateStart) || 0,
+      application,
+      customer_id: customerId,
+    };
+  }
+
+  const previewMut = useMutation({
+    mutationFn: () => multicastApi.bulkAllocatePreview(buildBody()),
+    onSuccess: (res) => {
+      setPreview(res.items);
+      setConflictCount(res.conflict_count);
+      setError(null);
+    },
+    onError: (e: unknown) => {
+      const err = e as {
+        response?: { data?: { detail?: string | { msg?: string }[] } };
+      };
+      const detail = err?.response?.data?.detail;
+      if (Array.isArray(detail)) {
+        setError(detail.map((d) => d.msg ?? "validation error").join("; "));
+      } else {
+        setError(detail ?? "Preview failed");
+      }
+    },
+  });
+
+  const commitMut = useMutation({
+    mutationFn: () => multicastApi.bulkAllocateCommit(buildBody()),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["multicast-groups"] });
+      onClose();
+    },
+    onError: (e: unknown) => {
+      const err = e as {
+        response?: {
+          data?: {
+            detail?: string | { message?: string; conflicts?: string[] };
+          };
+        };
+      };
+      const detail = err?.response?.data?.detail;
+      if (typeof detail === "object" && detail && "message" in detail) {
+        const conflicts = detail.conflicts?.slice(0, 5).join(", ") ?? "";
+        setError(
+          `${detail.message ?? "Commit failed"}${conflicts ? ` — ${conflicts}…` : ""}`,
+        );
+      } else if (typeof detail === "string") {
+        setError(detail);
+      } else {
+        setError("Commit failed");
+      }
+    },
+  });
+
+  return (
+    <Modal onClose={onClose} title="Bulk allocate multicast groups" wide>
+      <div className="space-y-4">
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+          <div>
+            <label className="text-xs font-medium text-muted-foreground">
+              IP space
+            </label>
+            <select
+              className={inputCls}
+              value={spaceId}
+              onChange={(e) => {
+                setSpaceId(e.target.value);
+                setPreview(null);
+              }}
+            >
+              <option value="">— select —</option>
+              {spaces.map((s) => (
+                <option key={s.id} value={s.id}>
+                  {s.name}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label className="text-xs font-medium text-muted-foreground">
+              Customer (optional)
+            </label>
+            <select
+              className={inputCls}
+              value={customerId ?? ""}
+              onChange={(e) => setCustomerId(e.target.value || null)}
+            >
+              <option value="">— None —</option>
+              {customers.map((c) => (
+                <option key={c.id} value={c.id}>
+                  {c.name}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div>
+            <label className="text-xs font-medium text-muted-foreground">
+              Start address
+            </label>
+            <input
+              className={cn(inputCls, "font-mono")}
+              value={startAddress}
+              onChange={(e) => {
+                setStartAddress(e.target.value);
+                setPreview(null);
+              }}
+              placeholder="239.10.0.0"
+            />
+          </div>
+          <div>
+            <label className="text-xs font-medium text-muted-foreground">
+              Count (max 256)
+            </label>
+            <input
+              className={inputCls}
+              value={count}
+              onChange={(e) => {
+                setCount(e.target.value);
+                setPreview(null);
+              }}
+              inputMode="numeric"
+            />
+          </div>
+          <div className="sm:col-span-2">
+            <label className="text-xs font-medium text-muted-foreground">
+              Name template
+            </label>
+            <input
+              className={cn(inputCls, "font-mono")}
+              value={nameTemplate}
+              onChange={(e) => {
+                setNameTemplate(e.target.value);
+                setPreview(null);
+              }}
+              placeholder="stream-{n:03d}"
+            />
+            <p className="mt-1 text-[10px] text-muted-foreground">
+              Tokens: <code>{`{n}`}</code> / <code>{`{n:03d}`}</code> /{" "}
+              <code>{`{n:x}`}</code> / <code>{`{oct1}`}</code>–
+              <code>{`{oct4}`}</code>. Same grammar as the IPAM bulk-allocate.
+            </p>
+          </div>
+          <div>
+            <label className="text-xs font-medium text-muted-foreground">
+              Template start (n initial value)
+            </label>
+            <input
+              className={inputCls}
+              value={templateStart}
+              onChange={(e) => {
+                setTemplateStart(e.target.value);
+                setPreview(null);
+              }}
+              inputMode="numeric"
+            />
+          </div>
+          <div>
+            <label className="text-xs font-medium text-muted-foreground">
+              Application
+            </label>
+            <input
+              className={inputCls}
+              value={application}
+              onChange={(e) => setApplication(e.target.value)}
+              placeholder="e.g. SMPTE 2110-20 video"
+            />
+          </div>
+        </div>
+
+        {preview && (
+          <div className="rounded-md border">
+            <div className="flex items-center justify-between border-b bg-muted/30 px-3 py-1.5 text-xs">
+              <span className="font-medium">
+                Preview — {preview.length} address(es)
+                {conflictCount > 0 && (
+                  <span className="ml-2 text-destructive">
+                    ({conflictCount} conflict{conflictCount === 1 ? "" : "s"})
+                  </span>
+                )}
+              </span>
+              <span className="text-muted-foreground">
+                Commit refuses if any conflicts remain.
+              </span>
+            </div>
+            <div className="max-h-72 overflow-auto">
+              <table className="w-full text-xs">
+                <thead className="text-left text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+                  <tr className="border-b">
+                    <th className="px-3 py-1.5">#</th>
+                    <th className="px-3 py-1.5">Address</th>
+                    <th className="px-3 py-1.5">Name</th>
+                    <th className="px-3 py-1.5">Status</th>
+                  </tr>
+                </thead>
+                <tbody className={zebraBodyCls}>
+                  {preview.map((item, idx) => (
+                    <tr
+                      key={item.address}
+                      className={cn(
+                        "border-b",
+                        item.conflict && "bg-destructive/5",
+                      )}
+                    >
+                      <td className="px-3 py-1 tabular-nums text-muted-foreground">
+                        {idx + 1}
+                      </td>
+                      <td className="px-3 py-1 font-mono">{item.address}</td>
+                      <td className="px-3 py-1">{item.name}</td>
+                      <td className="px-3 py-1">
+                        {item.conflict ? (
+                          <span className="text-destructive">in use</span>
+                        ) : (
+                          <span className="text-emerald-600 dark:text-emerald-400">
+                            free
+                          </span>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        )}
+
+        {error && <p className="text-sm text-destructive">{error}</p>}
+
+        <div className="flex justify-end gap-2 border-t pt-3">
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
+          >
+            Cancel
+          </button>
+          <button
+            type="button"
+            disabled={previewMut.isPending || !spaceId || !startAddress}
+            onClick={() => previewMut.mutate()}
+            className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted disabled:opacity-50"
+          >
+            {previewMut.isPending ? "Previewing…" : "Preview"}
+          </button>
+          <button
+            type="button"
+            disabled={
+              !preview ||
+              conflictCount > 0 ||
+              commitMut.isPending ||
+              previewMut.isPending
+            }
+            onClick={() => commitMut.mutate()}
+            className="rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+          >
+            {commitMut.isPending ? "Creating…" : "Commit"}
+          </button>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
 // ── Page ────────────────────────────────────────────────────────────
 
 export function MulticastGroupsPage() {
@@ -626,6 +927,7 @@ export function MulticastGroupsPage() {
   const [customerFilter, setCustomerFilter] = useState("");
   const [editing, setEditing] = useState<MulticastGroupRead | null>(null);
   const [showNew, setShowNew] = useState(false);
+  const [showBulk, setShowBulk] = useState(false);
 
   const spacesQ = useQuery({
     queryKey: ["ipam-spaces"],
@@ -699,6 +1001,9 @@ export function MulticastGroupsPage() {
               iconClassName={query.isFetching ? "animate-spin" : undefined}
             >
               Refresh
+            </HeaderButton>
+            <HeaderButton icon={ListPlus} onClick={() => setShowBulk(true)}>
+              Bulk allocate…
             </HeaderButton>
             <HeaderButton
               variant="primary"
@@ -828,6 +1133,12 @@ export function MulticastGroupsPage() {
             setShowNew(false);
             setEditing(null);
           }}
+        />
+      )}
+      {showBulk && (
+        <BulkAllocateModal
+          spaces={spacesQ.data ?? []}
+          onClose={() => setShowBulk(false)}
         />
       )}
     </div>
