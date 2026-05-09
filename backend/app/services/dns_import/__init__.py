@@ -21,6 +21,11 @@ from .canonical import (
     ZoneConflict,
 )
 from .commit import CommitResult, CommitZoneResult, commit_import, detect_conflicts
+from .powerdns import (
+    PowerDNSImportError,
+    parse_powerdns_server,
+    test_powerdns_connection,
+)
 from .windows_dns import WindowsDNSImportError, parse_windows_dns_server
 
 __all__ = [
@@ -33,10 +38,13 @@ __all__ = [
     "ImportPreview",
     "ImportSource",
     "ImportSourceError",
+    "PowerDNSImportError",
     "WindowsDNSImportError",
     "ZoneConflict",
     "commit_import",
     "detect_conflicts",
     "parse_bind9_archive",
+    "parse_powerdns_server",
     "parse_windows_dns_server",
+    "test_powerdns_connection",
 ]

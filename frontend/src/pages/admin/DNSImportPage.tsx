@@ -3,11 +3,12 @@ import { useMutation, useQuery } from "@tanstack/react-query";
 import {
   AlertTriangle,
   CheckCircle2,
-  CircleDashed,
   Database,
   Download,
   FileArchive,
+  Globe,
   Loader2,
+  Plug,
   RotateCcw,
   Server as ServerIcon,
   Trash2,
@@ -22,6 +23,7 @@ import {
   type DNSImportPreview,
   type DNSImportSource,
   type DNSImportZoneConflict,
+  type PowerDNSConnectionInfo,
   type WindowsDNSServerOption,
 } from "@/lib/api";
 import { cn } from "@/lib/utils";
@@ -63,10 +65,9 @@ const TABS: TabDef[] = [
     id: "powerdns",
     label: "PowerDNS",
     short: "REST API live pull",
-    available: false,
-    badge: "Phase 3",
+    available: true,
     description:
-      "Live-pull every zone + record from a PowerDNS Authoritative API. Provide the API URL + API key; the importer walks /api/v1/servers/localhost/zones and resolves each zone's full record set. Coming in Phase 3.",
+      "Live-pull every zone + record from a PowerDNS Authoritative REST API. Provide the API URL + API key; the importer walks /api/v1/servers/{server}/zones and resolves each zone's full record set. Credentials are read-once and never persisted. DNSSEC records get stripped — re-sign post-import via the zone DNSSEC tab.",
   },
 ];
 
@@ -153,12 +154,7 @@ export function DNSImportPage() {
 
         {tab === "bind9" && <BindTab />}
         {tab === "windows_dns" && <WindowsDNSTab />}
-        {tab === "powerdns" && (
-          <div className="rounded-md border border-dashed p-8 text-center text-sm text-muted-foreground">
-            <CircleDashed className="mx-auto mb-2 h-6 w-6" />
-            PowerDNS import is not yet available — see the badge above.
-          </div>
-        )}
+        {tab === "powerdns" && <PowerDNSTab />}
       </div>
     </div>
   );
@@ -587,6 +583,360 @@ function WindowsDNSPullForm({
         <HeaderButton
           variant="primary"
           icon={previewing ? Loader2 : ServerIcon}
+          iconClassName={previewing ? "animate-spin" : undefined}
+          onClick={onPreview}
+          disabled={!canPreview}
+        >
+          {previewing ? "Pulling zones…" : "Preview import"}
+        </HeaderButton>
+      </div>
+    </div>
+  );
+}
+
+// ── PowerDNS tab body ────────────────────────────────────────────────
+
+interface PowerDNSState {
+  apiUrl: string;
+  apiKey: string;
+  serverName: string;
+  groupId: string;
+  viewId: string;
+  testInfo: PowerDNSConnectionInfo | null;
+  preview: DNSImportPreview | null;
+  decisions: Record<string, DNSImportConflictDecision>;
+  result: DNSImportCommitResult | null;
+  phase: Phase;
+  error: string | null;
+}
+
+function emptyPowerDNSState(): PowerDNSState {
+  return {
+    apiUrl: "",
+    apiKey: "",
+    serverName: "localhost",
+    groupId: "",
+    viewId: "",
+    testInfo: null,
+    preview: null,
+    decisions: {},
+    result: null,
+    phase: "select",
+    error: null,
+  };
+}
+
+function PowerDNSTab() {
+  const [state, setState] = useState<PowerDNSState>(emptyPowerDNSState());
+
+  const groupsQ = useQuery({
+    queryKey: ["dns-groups"],
+    queryFn: () => dnsApi.listGroups(),
+  });
+  const viewsQ = useQuery({
+    queryKey: ["dns-views", state.groupId],
+    queryFn: () =>
+      state.groupId ? dnsApi.listViews(state.groupId) : Promise.resolve([]),
+    enabled: Boolean(state.groupId),
+  });
+
+  const testMut = useMutation({
+    mutationFn: () => {
+      if (!state.apiUrl || !state.apiKey) {
+        throw new Error("Provide an API URL and API key first");
+      }
+      return dnsImportApi.powerDNSTestConnection({
+        api_url: state.apiUrl,
+        api_key: state.apiKey,
+        server_name: state.serverName || "localhost",
+      });
+    },
+    onSuccess: (info) => {
+      setState((s) => ({ ...s, testInfo: info, error: null }));
+    },
+    onError: (err: unknown) => {
+      const detail =
+        (err as { response?: { data?: { detail?: string } } })?.response?.data
+          ?.detail ?? (err as Error).message;
+      setState((s) => ({ ...s, testInfo: null, error: detail }));
+    },
+  });
+
+  const previewMut = useMutation({
+    mutationFn: () => {
+      if (!state.apiUrl || !state.apiKey || !state.groupId) {
+        throw new Error(
+          "Provide an API URL, API key, and target server group first",
+        );
+      }
+      return dnsImportApi.powerDNSPreview({
+        api_url: state.apiUrl,
+        api_key: state.apiKey,
+        server_name: state.serverName || "localhost",
+        target_group_id: state.groupId,
+        target_view_id: state.viewId || null,
+      });
+    },
+    onSuccess: (preview) => {
+      const decisions: Record<string, DNSImportConflictDecision> = {};
+      for (const c of preview.conflicts) {
+        decisions[c.zone_name] = { action: c.action, rename_to: c.rename_to };
+      }
+      setState((s) => ({
+        ...s,
+        preview,
+        decisions,
+        phase: "ready",
+        error: null,
+      }));
+    },
+    onError: (err: unknown) => {
+      const detail =
+        (err as { response?: { data?: { detail?: string } } })?.response?.data
+          ?.detail ?? (err as Error).message;
+      setState((s) => ({ ...s, phase: "select", error: detail }));
+    },
+  });
+
+  const commitMut = useMutation({
+    mutationFn: () => {
+      if (!state.preview) throw new Error("Preview the server first");
+      return dnsImportApi.powerDNSCommit({
+        target_group_id: state.groupId,
+        target_view_id: state.viewId || null,
+        plan: state.preview,
+        conflict_actions: state.decisions,
+      });
+    },
+    onSuccess: (result) => {
+      setState((s) => ({ ...s, result, phase: "result", error: null }));
+    },
+    onError: (err: unknown) => {
+      const detail =
+        (err as { response?: { data?: { detail?: string } } })?.response?.data
+          ?.detail ?? (err as Error).message;
+      setState((s) => ({ ...s, phase: "ready", error: detail }));
+    },
+  });
+
+  const conflictByZone = useMemo(() => {
+    const m = new Map<string, DNSImportZoneConflict>();
+    for (const c of state.preview?.conflicts ?? []) m.set(c.zone_name, c);
+    return m;
+  }, [state.preview]);
+
+  const reset = () => setState(emptyPowerDNSState());
+
+  return (
+    <div className="space-y-4">
+      {state.error && (
+        <div className="flex items-start gap-2 rounded-md border border-destructive/40 bg-destructive/10 p-3 text-xs text-destructive">
+          <AlertTriangle className="mt-0.5 h-4 w-4 flex-shrink-0" />
+          <div>{state.error}</div>
+        </div>
+      )}
+
+      {state.phase === "result" && state.result ? (
+        <CommitResultPanel result={state.result} onReset={reset} />
+      ) : (
+        <>
+          <PowerDNSPullForm
+            state={state}
+            setState={setState}
+            groups={groupsQ.data ?? []}
+            views={viewsQ.data ?? []}
+            onTest={() => testMut.mutate()}
+            testing={testMut.isPending}
+            onPreview={() => {
+              setState((s) => ({ ...s, phase: "previewing", error: null }));
+              previewMut.mutate();
+            }}
+            previewing={previewMut.isPending}
+          />
+
+          {state.preview && state.phase !== "previewing" && (
+            <PreviewPanel
+              preview={state.preview}
+              decisions={state.decisions}
+              setDecisions={(updater) =>
+                setState((s) => ({ ...s, decisions: updater(s.decisions) }))
+              }
+              conflictByZone={conflictByZone}
+              onCommit={() => {
+                setState((s) => ({ ...s, phase: "committing", error: null }));
+                commitMut.mutate();
+              }}
+              committing={commitMut.isPending}
+              onReset={reset}
+            />
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+function PowerDNSPullForm({
+  state,
+  setState,
+  groups,
+  views,
+  onTest,
+  testing,
+  onPreview,
+  previewing,
+}: {
+  state: PowerDNSState;
+  setState: React.Dispatch<React.SetStateAction<PowerDNSState>>;
+  groups: { id: string; name: string }[];
+  views: { id: string; name: string }[];
+  onTest: () => void;
+  testing: boolean;
+  onPreview: () => void;
+  previewing: boolean;
+}) {
+  const canTest =
+    Boolean(state.apiUrl && state.apiKey) && !testing && !previewing;
+  const canPreview =
+    Boolean(state.apiUrl && state.apiKey && state.groupId) &&
+    !previewing &&
+    !testing;
+
+  return (
+    <div className="rounded-md border bg-muted/20 p-4">
+      <div className="mb-3 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
+        1. PowerDNS source + target
+      </div>
+      <div className="grid grid-cols-1 gap-4 md:grid-cols-2">
+        <div className="space-y-3">
+          <div>
+            <label className="block text-sm font-medium">API URL</label>
+            <p className="mb-2 text-[11px] text-muted-foreground">
+              Base URL of the PowerDNS Authoritative API. Example:{" "}
+              <code>http://pdns.internal:8081</code>. Don't include the{" "}
+              <code>/api/v1</code> suffix — we append it.
+            </p>
+            <input
+              value={state.apiUrl}
+              onChange={(e) =>
+                setState((s) => ({
+                  ...s,
+                  apiUrl: e.target.value,
+                  testInfo: null,
+                }))
+              }
+              placeholder="http://pdns.internal:8081"
+              className="w-full rounded-md border bg-background px-3 py-1.5 font-mono text-xs focus:outline-none focus:ring-2 focus:ring-ring"
+            />
+          </div>
+          <div>
+            <label className="block text-sm font-medium">API key</label>
+            <p className="mb-2 text-[11px] text-muted-foreground">
+              The PowerDNS <code className="text-[10px]">api-key</code> setting
+              from <code>pdns.conf</code>. Read once and never persisted — if
+              you re-import you'll re-paste.
+            </p>
+            <input
+              type="password"
+              value={state.apiKey}
+              onChange={(e) =>
+                setState((s) => ({
+                  ...s,
+                  apiKey: e.target.value,
+                  testInfo: null,
+                }))
+              }
+              placeholder="pdns api key"
+              className="w-full rounded-md border bg-background px-3 py-1.5 font-mono text-xs focus:outline-none focus:ring-2 focus:ring-ring"
+            />
+          </div>
+          <div>
+            <label className="block text-sm font-medium">
+              Server name (optional)
+            </label>
+            <p className="mb-2 text-[11px] text-muted-foreground">
+              PowerDNS's <code className="text-[10px]">server-id</code> for the
+              daemon. Defaults to <code>localhost</code> — only change this if
+              your upstream is fronted by a multi-server API.
+            </p>
+            <input
+              value={state.serverName}
+              onChange={(e) =>
+                setState((s) => ({ ...s, serverName: e.target.value }))
+              }
+              placeholder="localhost"
+              className="w-full rounded-md border bg-background px-3 py-1.5 font-mono text-xs focus:outline-none focus:ring-2 focus:ring-ring"
+            />
+          </div>
+          <div className="flex items-center gap-2">
+            <HeaderButton
+              icon={testing ? Loader2 : Plug}
+              iconClassName={testing ? "animate-spin" : undefined}
+              onClick={onTest}
+              disabled={!canTest}
+            >
+              {testing ? "Testing…" : "Test connection"}
+            </HeaderButton>
+            {state.testInfo && (
+              <span className="inline-flex items-center gap-1 rounded-full bg-emerald-500/15 px-2 py-0.5 text-[11px] font-medium text-emerald-700 dark:text-emerald-400">
+                <CheckCircle2 className="h-3 w-3" />
+                {state.testInfo.daemon_type || "PowerDNS"}{" "}
+                {state.testInfo.version || ""}
+              </span>
+            )}
+          </div>
+        </div>
+        <div className="space-y-3">
+          <div>
+            <label className="block text-sm font-medium">
+              Target server group
+            </label>
+            <p className="mb-2 text-[11px] text-muted-foreground">
+              Imported zones land in this group. Pick one with at least one
+              registered server so the agent picks them up on its next sync.
+            </p>
+            <select
+              value={state.groupId}
+              onChange={(e) =>
+                setState((s) => ({ ...s, groupId: e.target.value, viewId: "" }))
+              }
+              className="w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+            >
+              <option value="">— select —</option>
+              {groups.map((g) => (
+                <option key={g.id} value={g.id}>
+                  {g.name}
+                </option>
+              ))}
+            </select>
+          </div>
+          {views.length > 0 && (
+            <div>
+              <label className="block text-sm font-medium">
+                Target view (optional)
+              </label>
+              <select
+                value={state.viewId}
+                onChange={(e) =>
+                  setState((s) => ({ ...s, viewId: e.target.value }))
+                }
+                className="w-full rounded-md border bg-background px-3 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+              >
+                <option value="">Default view</option>
+                {views.map((v) => (
+                  <option key={v.id} value={v.id}>
+                    {v.name}
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
+        </div>
+      </div>
+      <div className="mt-4 flex justify-end gap-2">
+        <HeaderButton
+          variant="primary"
+          icon={previewing ? Loader2 : Globe}
           iconClassName={previewing ? "animate-spin" : undefined}
           onClick={onPreview}
           disabled={!canPreview}
