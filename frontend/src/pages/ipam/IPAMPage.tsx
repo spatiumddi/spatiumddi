@@ -3902,6 +3902,14 @@ function SubnetDetail({
             {subnet.network}
           </span>
           <StatusBadge status={subnet.status} />
+          {subnet.kind === "multicast" && (
+            <span
+              className="inline-flex items-center rounded px-2 py-0.5 text-[11px] font-medium uppercase tracking-wider bg-violet-100 text-violet-700 dark:bg-violet-950/30 dark:text-violet-400"
+              title="Multicast subnet — addresses are stream identities, managed under /network/multicast"
+            >
+              multicast
+            </span>
+          )}
           {subnet.name && (
             <span className="text-sm text-muted-foreground">{subnet.name}</span>
           )}

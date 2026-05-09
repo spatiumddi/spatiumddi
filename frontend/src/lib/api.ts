@@ -472,6 +472,14 @@ export interface Subnet {
   network: string;
   name: string;
   description: string;
+  /**
+   * Auto-detected from the CIDR on create:
+   *   - ``"unicast"`` (default) — endpoints + per-IP allocation
+   *   - ``"multicast"`` — stream-identity range (224.0.0.0/4 v4 /
+   *     ff00::/8 v6); IPAM allocation endpoints refuse, multicast
+   *     groups are managed under /multicast/groups instead.
+   */
+  kind?: string;
   vlan_id: number | null;
   vxlan_id: number | null;
   vlan_ref_id?: string | null;

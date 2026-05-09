@@ -1824,6 +1824,11 @@ class SubnetResponse(BaseModel):
     network: str
     name: str
     description: str
+    # ``unicast`` (default) | ``multicast``. Auto-detected from
+    # the CIDR on create — multicast subnets sit inside the IANA
+    # ranges (issue #126 Phase 2). Operator-readable; not
+    # operator-settable.
+    kind: str = "unicast"
     vlan_id: int | None
     vxlan_id: int | None
     vlan_ref_id: uuid.UUID | None = None
@@ -3439,6 +3444,17 @@ async def create_subnet(body: SubnetCreate, current_user: CurrentUser, db: DB) -
     net = _parse_network(body.network)
     canonical = str(net)  # normalise e.g. "10.0.0.1/24" → "10.0.0.0/24"
 
+    # Auto-detect subnet kind from the CIDR (issue #126 Phase 2):
+    # ``multicast`` for any subnet inside the IANA multicast ranges,
+    # ``unicast`` otherwise. Operators don't (and shouldn't have to)
+    # set ``kind`` manually — the wire shape determines it. Forks
+    # placeholder-row generation + IP-allocation gating below.
+    if isinstance(net, ipaddress.IPv4Network):
+        is_multicast_subnet = net.subnet_of(ipaddress.IPv4Network("224.0.0.0/4"))
+    else:
+        is_multicast_subnet = net.subnet_of(ipaddress.IPv6Network("ff00::/8"))
+    subnet_kind = "multicast" if is_multicast_subnet else "unicast"
+
     await _assert_no_overlap(db, body.space_id, canonical)
 
     # Validate gateway is within the subnet if explicitly provided
@@ -3486,6 +3502,7 @@ async def create_subnet(body: SubnetCreate, current_user: CurrentUser, db: DB) -
             ),
             "network": canonical,
         },
+        kind=subnet_kind,
         total_ips=total,
         utilization_percent=0.0,
         allocated_ips=0,
@@ -3499,9 +3516,13 @@ async def create_subnet(body: SubnetCreate, current_user: CurrentUser, db: DB) -
     # unless skip_auto_addresses is set (e.g. loopbacks, point-to-point links).
     # IPv6 has no broadcast; the network address itself is usable, but we
     # still create a "network" pseudo-row (same UX) plus the gateway row.
+    # Multicast subnets skip placeholder rows entirely — multicast
+    # addresses are stream identities (tracked by MulticastGroup),
+    # not endpoint slots, so the network/broadcast/gateway concept
+    # doesn't apply.
     auto_created: list[str] = []
     is_v6 = isinstance(net, ipaddress.IPv6Network)
-    if net.prefixlen < 31 and not body.skip_auto_addresses:
+    if net.prefixlen < 31 and not body.skip_auto_addresses and subnet_kind != "multicast":
         # Network address (e.g. 10.0.1.0 / 2001:db8::)
         db.add(
             IPAddress(
@@ -5508,6 +5529,19 @@ async def create_address(
     if subnet is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
 
+    # Multicast subnets don't allocate per-IP endpoint rows. Use the
+    # multicast group registry under ``/multicast/groups`` instead —
+    # the address there is a stream identity, not an endpoint.
+    if subnet.kind == "multicast":
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "This is a multicast subnet — addresses are stream identities. "
+                "Create a multicast group under /multicast/groups instead of an "
+                "IPAM address row."
+            ),
+        )
+
     # Validate address belongs to subnet
     try:
         addr = ipaddress.ip_address(body.address)
@@ -6621,6 +6655,14 @@ async def bulk_allocate_commit(
     subnet = result.unique().scalar_one_or_none()
     if subnet is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
+    if subnet.kind == "multicast":
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Subnet is multicast; use /multicast/groups/bulk-allocate "
+                "for sequential address stamping."
+            ),
+        )
 
     items, _warnings, _ = await _build_bulk_allocate_candidates(db, subnet, body)
 
@@ -6772,6 +6814,16 @@ async def preview_next_ip(
     subnet = await db.get(Subnet, subnet_id)
     if subnet is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
+    if subnet.kind == "multicast":
+        # No "next available" semantics for multicast — addresses
+        # are operator-named stream identities, not endpoint slots.
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Subnet is multicast; use /multicast/groups/bulk-allocate "
+                "for sequential address stamping."
+            ),
+        )
     chosen = await _pick_next_available_ip(db, subnet, strategy=strategy, mac_address=mac_address)
     return NextIPPreview(address=str(chosen) if chosen else None, strategy=strategy)
 
@@ -6795,6 +6847,13 @@ async def allocate_next_ip(
     subnet = result.unique().scalar_one_or_none()
     if subnet is None:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Subnet not found")
+    if subnet.kind == "multicast":
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "Subnet is multicast; allocate stream identities via " "/multicast/groups instead."
+            ),
+        )
 
     if body.status == "static_dhcp" and not body.mac_address:
         raise HTTPException(

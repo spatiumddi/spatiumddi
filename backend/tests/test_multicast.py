@@ -693,6 +693,124 @@ async def test_delete_domain_orphans_groups(client: AsyncClient, db_session: Asy
     assert group.domain_id is None
 
 
+# ── Subnet.kind discriminator (Phase 2 Wave 3) ───────────────────────
+
+
+@pytest.mark.asyncio
+async def test_create_subnet_in_multicast_range_auto_kinds_multicast(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """A subnet whose CIDR sits inside the IANA multicast range
+    auto-stamps ``kind='multicast'`` and skips the network /
+    broadcast / gateway placeholder rows."""
+    _, token = await _make_admin(db_session)
+    space = IPSpace(name=f"mc-kind-{uuid.uuid4().hex[:8]}")
+    db_session.add(space)
+    await db_session.flush()
+    block = IPBlock(space_id=space.id, name="mc-block", network="239.0.0.0/8")
+    db_session.add(block)
+    await db_session.commit()
+    headers = {"Authorization": f"Bearer {token}"}
+
+    resp = await client.post(
+        "/api/v1/ipam/subnets",
+        headers=headers,
+        json={
+            "space_id": str(space.id),
+            "block_id": str(block.id),
+            "network": "239.10.10.0/24",
+            "name": "studio-streams",
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["kind"] == "multicast"
+    subnet_id = body["id"]
+
+    # No placeholder rows on a multicast subnet.
+    resp = await client.get(
+        f"/api/v1/ipam/subnets/{subnet_id}/addresses",
+        headers=headers,
+    )
+    assert resp.status_code == 200
+    assert resp.json() == []
+
+
+@pytest.mark.asyncio
+async def test_create_unicast_subnet_default_kind_unicast(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    _, token = await _make_admin(db_session)
+    space = IPSpace(name=f"uc-{uuid.uuid4().hex[:8]}")
+    db_session.add(space)
+    await db_session.flush()
+    block = IPBlock(space_id=space.id, name="uc", network="10.0.0.0/8")
+    db_session.add(block)
+    await db_session.commit()
+    headers = {"Authorization": f"Bearer {token}"}
+
+    resp = await client.post(
+        "/api/v1/ipam/subnets",
+        headers=headers,
+        json={
+            "space_id": str(space.id),
+            "block_id": str(block.id),
+            "network": "10.0.0.0/24",
+            "name": "regular",
+        },
+    )
+    assert resp.status_code == 201
+    assert resp.json()["kind"] == "unicast"
+
+
+@pytest.mark.asyncio
+async def test_multicast_subnet_refuses_ipam_allocation(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """``POST /subnets/{id}/addresses`` and ``/subnets/{id}/next``
+    both 422 when the subnet is multicast — the operator is
+    redirected to the multicast group registry."""
+    _, token = await _make_admin(db_session)
+    space = IPSpace(name=f"mc-refuse-{uuid.uuid4().hex[:8]}")
+    db_session.add(space)
+    await db_session.flush()
+    block = IPBlock(space_id=space.id, name="mc-r", network="239.0.0.0/8")
+    db_session.add(block)
+    await db_session.commit()
+    headers = {"Authorization": f"Bearer {token}"}
+
+    resp = await client.post(
+        "/api/v1/ipam/subnets",
+        headers=headers,
+        json={
+            "space_id": str(space.id),
+            "block_id": str(block.id),
+            "network": "239.20.20.0/24",
+            "name": "refuses",
+        },
+    )
+    subnet_id = resp.json()["id"]
+
+    # Create-address rejected. The body includes ``hostname`` so we
+    # get past Pydantic body-validation and into our kind=multicast
+    # short-circuit (which surfaces a string detail, not the list
+    # shape FastAPI uses for body-validation errors).
+    resp = await client.post(
+        f"/api/v1/ipam/subnets/{subnet_id}/addresses",
+        headers=headers,
+        json={"address": "239.20.20.1", "hostname": "x"},
+    )
+    assert resp.status_code == 422
+    assert "multicast" in resp.json()["detail"].lower()
+
+    # next-ip-preview rejected.
+    resp = await client.get(
+        f"/api/v1/ipam/subnets/{subnet_id}/next-ip-preview",
+        headers=headers,
+    )
+    assert resp.status_code == 422
+
+
 # ── Memberships-by-IP cross-group lookup ──────────────────────────────
 
 

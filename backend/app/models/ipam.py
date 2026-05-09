@@ -384,6 +384,21 @@ class Subnet(UUIDPrimaryKeyMixin, TimestampMixin, SoftDeleteMixin, Base):
     name: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     description: Mapped[str] = mapped_column(Text, nullable=False, default="")
 
+    # Discriminator that forks IPAM tree rendering + endpoint
+    # behaviour (issue #126 Phase 2). Auto-set from the network
+    # CIDR on create:
+    #   - ``unicast`` (default) for any subnet outside the IANA
+    #     multicast ranges
+    #   - ``multicast`` when the CIDR sits inside ``224.0.0.0/4``
+    #     (v4) or ``ff00::/8`` (v6)
+    #
+    # IP-allocation endpoints refuse on ``multicast`` subnets —
+    # multicast addresses are stream identities tracked by
+    # ``MulticastGroup`` rather than per-endpoint IPAM rows.
+    kind: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="unicast", server_default="unicast"
+    )
+
     # Layer 2
     vlan_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
     vxlan_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
