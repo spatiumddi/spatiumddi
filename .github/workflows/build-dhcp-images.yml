@@ -47,13 +47,31 @@ jobs:
             type=ref,event=tag
             type=sha,format=short
 
-      - name: Build and push
+      - name: Build (PR — single-arch, load locally for Trivy)
+        if: github.event_name == 'pull_request'
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: agent/dhcp/images/${{ matrix.flavor }}/Dockerfile
+          # Single-arch on PR: ``--load`` only accepts one platform,
+          # and the runner is amd64. Release builds (push branch) do
+          # the multi-arch manifest list.
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: ghcr.io/spatiumddi/dhcp-${{ matrix.flavor }}:pr-scan
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=dhcp-${{ matrix.flavor }}
+          cache-to: type=gha,mode=max,scope=dhcp-${{ matrix.flavor }}
+
+      - name: Build and push (main / tag — multi-arch, push to ghcr)
+        if: github.event_name != 'pull_request'
         uses: docker/build-push-action@v5
         with:
           context: .
           file: agent/dhcp/images/${{ matrix.flavor }}/Dockerfile
           platforms: linux/amd64,linux/arm64
-          push: ${{ github.event_name != 'pull_request' }}
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=dhcp-${{ matrix.flavor }}
@@ -63,7 +81,13 @@ jobs:
         if: github.event_name == 'pull_request'
         uses: aquasecurity/trivy-action@master
         with:
-          image-ref: ghcr.io/spatiumddi/dhcp-${{ matrix.flavor }}:${{ github.sha }}
+          # Reference the locally-loaded image from the PR build
+          # step above. Same fix as build-dns-images.yml — the
+          # previous ``ghcr.io/...:${{ github.sha }}`` reference
+          # never resolved (metadata-action emits ``sha-<short>``,
+          # not raw full SHAs, and on PR nothing gets pushed) so
+          # Trivy 404'd with MANIFEST_UNKNOWN.
+          image-ref: ghcr.io/spatiumddi/dhcp-${{ matrix.flavor }}:pr-scan
           format: table
           severity: HIGH,CRITICAL
           # Fail the PR on any HIGH/CRITICAL CVE that has a fix
