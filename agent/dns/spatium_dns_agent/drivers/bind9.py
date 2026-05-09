@@ -399,6 +399,14 @@ class Bind9Driver(DriverBase):
                 shutil.rmtree(backup)
             current.rename(backup)
         new_dir.rename(current)
+        # If start_daemon deferred at boot (no rendered config existed
+        # yet), this is the moment we have one — start named now. Without
+        # this, a fresh agent that joins a brand-new control plane (no
+        # zones yet) never launches the daemon, port 53 stays unbound,
+        # and the K8s readiness probe (tcpSocket: 53) never passes.
+        if not self.daemon_running():
+            self.start_daemon()
+            return
         # Signal daemon. Try rndc first; if it isn't configured (no rndc.key),
         # fall back to SIGHUP which named handles as a config + zone reload.
         rndc_ok = False
