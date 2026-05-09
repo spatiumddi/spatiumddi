@@ -23,6 +23,7 @@ from app.models.ai import AIOperationProposal
 from app.models.auth import User
 from app.services.ai import operations
 from app.services.ai.operations import (
+    AllocateMulticastGroupsArgs,
     ArchiveSessionArgs,
     CreateAlertRuleArgs,
     CreateDHCPStaticArgs,
@@ -294,6 +295,37 @@ async def propose_create_multicast_group(
     db: AsyncSession, user: User, args: CreateMulticastGroupArgs
 ) -> dict[str, Any]:
     return await _propose_via(db=db, user=user, operation_name="create_multicast_group", args=args)
+
+
+# ── propose_allocate_multicast_group (Phase 4 Wave 2) ────────────────
+
+
+@register_tool(
+    name="propose_allocate_multicast_group",
+    description=(
+        "Prepare a bulk multicast-group allocation proposal — stamps "
+        "N sequential addresses with a name template in one shot. "
+        "Pass space_id, count (1..256), start_address (must sit "
+        "inside the IANA multicast ranges), and name_template using "
+        "{n} / {n:03d} / {n:x} / {oct1}-{oct4} tokens. Optional: "
+        "application label, domain_id, template_start. Use when the "
+        "operator says 'allocate 16 streams starting at 239.10.0.0 "
+        "named cam-{n:02d}'. Operator must click Approve in the "
+        "chat drawer; preview shows the planned addresses inline "
+        "and refuses if any are already taken in the target space."
+    ),
+    args_model=AllocateMulticastGroupsArgs,
+    writes=False,
+    category="multicast",
+    default_enabled=False,
+    module="network.multicast",
+)
+async def propose_allocate_multicast_group(
+    db: AsyncSession, user: User, args: AllocateMulticastGroupsArgs
+) -> dict[str, Any]:
+    return await _propose_via(
+        db=db, user=user, operation_name="allocate_multicast_groups", args=args
+    )
 
 
 # ── propose_create_dhcp_static ────────────────────────────────────────

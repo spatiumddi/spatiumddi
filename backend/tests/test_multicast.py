@@ -13,7 +13,7 @@ import uuid
 
 import pytest
 from httpx import AsyncClient
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.security import create_access_token, hash_password
@@ -866,6 +866,178 @@ async def test_multicast_tools_filtered_when_module_disabled() -> None:
         enabled_modules={"ai.copilot"},
     )
     assert not multicast_read_tool_names.intersection(enabled)
+
+
+# ── Phase 4 Wave 2: propose_allocate + reaper ────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_allocate_multicast_groups_preview_then_apply(
+    db_session: AsyncSession,
+) -> None:
+    """The bulk-allocate operation's preview returns a clean ok=True
+    on a fresh range; the apply path stamps every group + writes a
+    single audit_log entry tagged via=ai_proposal."""
+    from app.services.ai.operations import (
+        AllocateMulticastGroupsArgs,
+        get_operation,
+    )
+
+    space = await _make_space(db_session)
+    await db_session.commit()
+    user = User(
+        username="ai-bulk",
+        email="ai-bulk@example.test",
+        display_name="AI",
+        hashed_password=hash_password("x"),
+        is_superadmin=True,
+    )
+    db_session.add(user)
+    await db_session.commit()
+
+    op = get_operation("allocate_multicast_groups")
+    assert op is not None
+
+    args = AllocateMulticastGroupsArgs(
+        space_id=str(space.id),
+        count=4,
+        name_template="cam-{n:02d}",
+        start_address="239.40.40.0",
+    )
+    preview = await op.preview(db_session, user, args)
+    assert preview.ok, preview.detail
+    assert "Bulk-allocate 4" in preview.preview_text
+
+    result = await op.apply(db_session, user, args)
+    assert result["created"] == 4
+
+    rows = (
+        (
+            await db_session.execute(
+                select(MulticastGroup).where(MulticastGroup.space_id == space.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert {str(r.address) for r in rows} == {
+        "239.40.40.0",
+        "239.40.40.1",
+        "239.40.40.2",
+        "239.40.40.3",
+    }
+    assert {r.name for r in rows} == {"cam-01", "cam-02", "cam-03", "cam-04"}
+
+
+@pytest.mark.asyncio
+async def test_allocate_multicast_groups_preview_rejects_collisions(
+    db_session: AsyncSession,
+) -> None:
+    """Existing groups in the target run cause preview to reject
+    with the colliding addresses inline so the LLM can present a
+    redirect to the operator without a separate apply round-trip."""
+    from app.services.ai.operations import (
+        AllocateMulticastGroupsArgs,
+        get_operation,
+    )
+
+    space = await _make_space(db_session)
+    db_session.add(MulticastGroup(space_id=space.id, address="239.50.0.1", name="prior"))
+    await db_session.commit()
+    user = User(
+        username="ai-collide",
+        email="ai-collide@example.test",
+        display_name="AI",
+        hashed_password=hash_password("x"),
+        is_superadmin=True,
+    )
+    db_session.add(user)
+    await db_session.commit()
+
+    op = get_operation("allocate_multicast_groups")
+    assert op is not None
+    args = AllocateMulticastGroupsArgs(
+        space_id=str(space.id),
+        count=3,
+        name_template="x-{n}",
+        start_address="239.50.0.0",
+    )
+    preview = await op.preview(db_session, user, args)
+    assert preview.ok is False
+    assert "239.50.0.1" in preview.detail
+
+
+@pytest.mark.asyncio
+async def test_igmp_membership_reaper_drops_stale_rows(
+    db_session: AsyncSession,
+) -> None:
+    """Membership rows tagged ``seen_via='igmp_snooping'`` whose
+    ``last_seen_at`` is older than the staleness window get pruned;
+    manual rows + recent IGMP rows survive."""
+    from datetime import UTC
+    from datetime import datetime as _dt
+    from datetime import timedelta as _td
+
+    from app.tasks.prune_multicast_memberships import (
+        DEFAULT_STALENESS_MINUTES,
+        _sweep_with_session,
+    )
+
+    space = await _make_space(db_session)
+    ip_a = await _make_ip(db_session, space, "10.0.0.5")
+    ip_b = await _make_ip(db_session, space, "10.0.0.6")
+    ip_c = await _make_ip(db_session, space, "10.0.0.7")
+    group = MulticastGroup(space_id=space.id, address="239.60.0.1", name="reaper-test")
+    db_session.add(group)
+    await db_session.flush()
+
+    now = _dt.now(UTC)
+    stale_cutoff = now - _td(minutes=DEFAULT_STALENESS_MINUTES + 5)
+    fresh = now - _td(minutes=2)
+
+    db_session.add_all(
+        [
+            # Stale igmp_snooping → reaped.
+            MulticastMembership(
+                group_id=group.id,
+                ip_address_id=ip_a.id,
+                role="consumer",
+                seen_via="igmp_snooping",
+                last_seen_at=stale_cutoff,
+            ),
+            # Fresh igmp_snooping → survives.
+            MulticastMembership(
+                group_id=group.id,
+                ip_address_id=ip_b.id,
+                role="consumer",
+                seen_via="igmp_snooping",
+                last_seen_at=fresh,
+            ),
+            # Stale manual → never reaped.
+            MulticastMembership(
+                group_id=group.id,
+                ip_address_id=ip_c.id,
+                role="producer",
+                seen_via="manual",
+                last_seen_at=stale_cutoff,
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    result = await _sweep_with_session(db_session)
+    assert result["removed"] == 1
+
+    survivors = (
+        (
+            await db_session.execute(
+                select(MulticastMembership.seen_via).where(MulticastMembership.group_id == group.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert sorted(survivors) == sorted(["igmp_snooping", "manual"])
 
 
 # ── IGMP-snooping populator (Phase 3 Wave 1) ────────────────────────

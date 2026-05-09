@@ -24,6 +24,7 @@ celery_app = Celery(
         "app.tasks.prune_internal_errors",
         "app.tasks.prune_logs",
         "app.tasks.prune_metrics",
+        "app.tasks.prune_multicast_memberships",
         "app.tasks.trash_purge",
         "app.tasks.ipam_reservation_sweep",
         "app.tasks.dhcp_lease_history_prune",
@@ -77,6 +78,7 @@ celery_app.conf.update(
         "app.tasks.prune_internal_errors.*": {"queue": "default"},
         "app.tasks.prune_logs.*": {"queue": "default"},
         "app.tasks.prune_metrics.*": {"queue": "default"},
+        "app.tasks.prune_multicast_memberships.*": {"queue": "default"},
         "app.tasks.trash_purge.*": {"queue": "default"},
         "app.tasks.ipam_reservation_sweep.*": {"queue": "ipam"},
         "app.tasks.dhcp_lease_history_prune.*": {"queue": "dhcp"},
@@ -205,6 +207,13 @@ celery_app.conf.update(
         "log-entries-prune": {
             "task": "app.tasks.prune_logs.prune_log_entries",
             "schedule": schedule(run_every=24 * 3600.0),
+        },
+        # Every 5 min, reap IGMP-snooping membership rows whose
+        # ``last_seen_at`` is older than 30 min — see issue #126
+        # Phase 4 Wave 2. Manual / sap_announce rows survive.
+        "multicast-igmp-membership-reaper": {
+            "task": ("app.tasks.prune_multicast_memberships." "prune_stale_igmp_memberships"),
+            "schedule": schedule(run_every=5 * 60.0),
         },
         # Daily at 03:00 UTC, hard-delete soft-deleted rows older than the
         # configured retention window (default 30 d). Gated on

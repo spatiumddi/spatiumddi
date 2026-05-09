@@ -1465,3 +1465,229 @@ register(
         category="multicast",
     )
 )
+
+
+# ── allocate_multicast_groups (issue #126 Phase 4 Wave 2) ────────────
+
+
+_MULTICAST_BULK_MAX = 256
+
+
+class AllocateMulticastGroupsArgs(BaseModel):
+    """Args for the ``allocate_multicast_groups`` bulk-stamp
+    operation. Mirrors the shape of the existing
+    ``POST /multicast/groups/bulk-allocate`` endpoint so the LLM
+    learns one grammar that maps cleanly onto operator muscle
+    memory."""
+
+    space_id: str = Field(description="UUID of the parent IPSpace.")
+    count: int = Field(
+        ge=1,
+        le=_MULTICAST_BULK_MAX,
+        description=(
+            f"Number of contiguous addresses to stamp (1..{_MULTICAST_BULK_MAX}). "
+            "The cap matches the underlying REST endpoint — multicast "
+            "registries are curated, not swept."
+        ),
+    )
+    name_template: str = Field(
+        min_length=1,
+        max_length=128,
+        description=(
+            "Name template using the standard token set: ``{n}`` (counter), "
+            "``{n:03d}`` (zero-padded), ``{n:x}`` (hex), and "
+            "``{oct1}``-``{oct4}`` (octets of the rendered IP). Example: "
+            "``cam-{n:02d}`` -> ``cam-01``, ``cam-02``..."
+        ),
+    )
+    start_address: str = Field(
+        description=(
+            "First address in the run. Must sit inside 224.0.0.0/4 "
+            "(IPv4) or ff00::/8 (IPv6); the run walks forward from "
+            "here and 422s if it would exit the multicast range."
+        ),
+    )
+    template_start: int = Field(
+        default=1,
+        ge=0,
+        description="Initial value for the ``{n}`` token (default 1).",
+    )
+    application: str = Field(
+        default="",
+        description="Free-text application label applied to every group (e.g. 'SMPTE 2110 video').",
+    )
+    domain_id: str | None = Field(
+        default=None,
+        description="Optional PIM domain UUID to bind every new group to.",
+    )
+
+
+async def _bulk_allocate_helper(
+    db: AsyncSession, args: AllocateMulticastGroupsArgs
+) -> tuple[list[Any], int, str | None]:
+    """Re-runs the same candidate builder the REST bulk-allocate
+    endpoint uses (``api.v1.multicast.router._build_bulk_candidates``)
+    so the LLM-driven flow shares one validation path with the UI.
+
+    Returns ``(items, conflict_count, error_message)``. ``error_message``
+    is non-None when a hard validation fails (bad address class, run
+    walks past the multicast range, etc) — the operation surfaces it
+    as a preview rejection.
+    """
+    from fastapi import HTTPException  # noqa: PLC0415
+
+    from app.api.v1.multicast.router import (  # noqa: PLC0415
+        MulticastBulkAllocateRequest,
+        _build_bulk_candidates,
+    )
+
+    try:
+        body = MulticastBulkAllocateRequest(
+            space_id=args.space_id,  # type: ignore[arg-type]
+            count=args.count,
+            name_template=args.name_template,
+            start_address=args.start_address,
+            template_start=args.template_start,
+            application=args.application,
+            domain_id=args.domain_id,  # type: ignore[arg-type]
+        )
+    except Exception as exc:  # pydantic ValidationError or similar
+        return [], 0, str(exc)
+
+    try:
+        items = await _build_bulk_candidates(db, body)
+    except HTTPException as exc:
+        # ``_build_bulk_candidates`` raises 422 when the run would
+        # walk past the multicast range. Surface the operator-
+        # friendly detail rather than the HTTP shape.
+        return [], 0, str(exc.detail)
+
+    conflicts = sum(1 for it in items if it.conflict is not None)
+    return items, conflicts, None
+
+
+async def _preview_allocate_multicast_groups(
+    db: AsyncSession, user: User, args: AllocateMulticastGroupsArgs
+) -> PreviewResult:
+    from app.models.ipam import IPSpace  # noqa: PLC0415
+    from app.models.multicast import MulticastDomain  # noqa: PLC0415
+
+    if (await db.get(IPSpace, args.space_id)) is None:
+        return PreviewResult(ok=False, detail=f"IPSpace {args.space_id!r} not found.")
+    if args.domain_id is not None:
+        if (await db.get(MulticastDomain, args.domain_id)) is None:
+            return PreviewResult(
+                ok=False,
+                detail=f"Multicast domain {args.domain_id!r} not found.",
+            )
+
+    items, conflict_count, err = await _bulk_allocate_helper(db, args)
+    if err is not None:
+        return PreviewResult(ok=False, detail=err)
+
+    if conflict_count > 0:
+        # Render the colliding addresses inline so the operator sees
+        # what to renumber. The chat surface clips long previews
+        # gracefully; the proposal can still be applied if the LLM
+        # presents it (the apply layer re-runs the candidate
+        # builder + 409s cleanly).
+        conflict_lines = "\n".join(f"    - {it.address} (in use)" for it in items if it.conflict)[
+            :1000
+        ]
+        return PreviewResult(
+            ok=False,
+            detail=(
+                f"{conflict_count} of {len(items)} addresses are already "
+                f"taken — adjust ``start_address`` or ``count``:\n"
+                f"{conflict_lines}"
+            ),
+        )
+
+    sample = ", ".join(f"{it.address}={it.name}" for it in items[:3])
+    if len(items) > 3:
+        sample += f", … (+{len(items) - 3} more)"
+    return PreviewResult(
+        ok=True,
+        detail="ready",
+        preview_text=(
+            f"Bulk-allocate {len(items)} multicast group(s) starting at "
+            f"{args.start_address}:\n"
+            f"  - template: {args.name_template} (start {args.template_start})\n"
+            f"  - application: {args.application or '(none)'}\n"
+            f"  - domain_id: {args.domain_id or '(none)'}\n"
+            f"  - sample: {sample}"
+        ),
+    )
+
+
+async def _apply_allocate_multicast_groups(
+    db: AsyncSession, user: User, args: AllocateMulticastGroupsArgs
+) -> dict[str, Any]:
+    from app.models.audit import AuditLog  # noqa: PLC0415
+    from app.models.multicast import MulticastGroup  # noqa: PLC0415
+
+    items, conflict_count, err = await _bulk_allocate_helper(db, args)
+    if err is not None:
+        raise ValueError(err)
+    if conflict_count > 0:
+        raise ValueError(
+            f"{conflict_count} address(es) already in use; re-run preview "
+            "after adjusting start_address or count."
+        )
+
+    created_ids: list[str] = []
+    for item in items:
+        row = MulticastGroup(
+            space_id=args.space_id,
+            address=item.address,
+            name=item.name,
+            application=args.application,
+            domain_id=args.domain_id,
+        )
+        db.add(row)
+        await db.flush()
+        created_ids.append(str(row.id))
+
+    db.add(
+        AuditLog(
+            user_id=user.id,
+            user_display_name=user.display_name,
+            auth_source=user.auth_source,
+            action="bulk_allocate",
+            resource_type="multicast_group",
+            resource_id=str(args.space_id),
+            resource_display=(f"{len(created_ids)} group(s) starting at {args.start_address}"),
+            result="success",
+            new_value={
+                "count": len(created_ids),
+                "start_address": args.start_address,
+                "name_template": args.name_template,
+                "space_id": args.space_id,
+                "domain_id": args.domain_id,
+                "via": "ai_proposal",
+            },
+        )
+    )
+    await db.commit()
+    return {
+        "created": len(created_ids),
+        "group_ids": created_ids,
+        "start_address": args.start_address,
+    }
+
+
+register(
+    Operation(
+        name="allocate_multicast_groups",
+        description=(
+            "Bulk-stamp N sequential multicast groups with a name "
+            "template. Capped at 256. Refuses if any candidate "
+            "address already has a group in the same space; "
+            "operator must re-preview after adjusting start / count."
+        ),
+        args_model=AllocateMulticastGroupsArgs,
+        preview=_preview_allocate_multicast_groups,
+        apply=_apply_allocate_multicast_groups,
+        category="multicast",
+    )
+)
