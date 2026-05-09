@@ -133,4 +133,24 @@ __all__ = [
     "OID_LLDP_REM_SYS_DESC",
     "OID_LLDP_REM_SYS_CAP_ENABLED",
     "OID_LLDP_REM_MAN_ADDR_IF_SUBTYPE",
+    "OID_IGMP_CACHE_SELF",
+    "OID_IGMP_CACHE_LAST_REPORTER",
+    "OID_IGMP_CACHE_UP_TIME",
+    "OID_IGMP_CACHE_STATUS",
 ]
+
+
+# ── IGMP-STD-MIB (RFC 2933) — issue #126 Phase 3 ────────────────────
+#
+# ``igmpCacheTable`` (1.3.6.1.2.1.85.1) carries the per-interface
+# IGMP join state. Index is ``(igmpCacheAddress, igmpCacheIfIndex)``
+# — the multicast group + the interface that received the most
+# recent IGMP report. ``igmpCacheLastReporter`` is the single
+# most-actionable column for the multicast registry: it's the IP
+# of the host whose last IGMPv2 / v3 membership-report packet
+# arrived on the interface, i.e. the consumer endpoint.
+
+OID_IGMP_CACHE_SELF: Final[str] = "1.3.6.1.2.1.85.1.2.1.3"
+OID_IGMP_CACHE_LAST_REPORTER: Final[str] = "1.3.6.1.2.1.85.1.2.1.4"
+OID_IGMP_CACHE_UP_TIME: Final[str] = "1.3.6.1.2.1.85.1.2.1.5"
+OID_IGMP_CACHE_STATUS: Final[str] = "1.3.6.1.2.1.85.1.2.1.7"

@@ -187,6 +187,19 @@ class NetworkDevice(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         Boolean, nullable=False, default=True, server_default="true"
     )
 
+    # IGMP-snooping populator (issue #126 Phase 3). Walks the
+    # standard ``IGMP-STD-MIB.igmpCacheTable`` (RFC 2933) to
+    # discover which IPs are joined to which multicast groups, then
+    # upserts ``MulticastMembership`` rows tagged
+    # ``seen_via='igmp_snooping'``. Default-off because the walk
+    # surfaces churn (transient joins / leaves) and operators
+    # should opt in once they know they want to track multicast
+    # consumers.
+    poll_igmp_snooping: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    last_poll_igmp_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
 
 class NetworkInterface(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     """One physical / logical interface on a polled device.

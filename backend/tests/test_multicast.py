@@ -693,6 +693,148 @@ async def test_delete_domain_orphans_groups(client: AsyncClient, db_session: Asy
     assert group.domain_id is None
 
 
+# ── IGMP-snooping populator (Phase 3 Wave 1) ────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_igmp_xref_creates_membership_when_group_and_ip_match(
+    db_session: AsyncSession,
+) -> None:
+    """The cross-reference matcher creates a consumer membership
+    when both the group address and reporter IP resolve."""
+    from app.models.network import NetworkDevice
+    from app.services.snmp.igmp import (
+        IGMPCacheRow,
+        cross_reference_igmp_memberships,
+    )
+
+    space = await _make_space(db_session)
+    await _make_ip(db_session, space, "10.0.0.99")
+    group = MulticastGroup(space_id=space.id, address="239.50.50.50", name="cam")
+    db_session.add(group)
+    device = NetworkDevice(
+        name="sw-1",
+        hostname="sw-1.lab",
+        ip_address="10.0.0.1",
+        ip_space_id=space.id,
+    )
+    db_session.add(device)
+    await db_session.flush()
+
+    rows = [
+        IGMPCacheRow(
+            group_address="239.50.50.50",
+            if_index=1,
+            last_reporter_ip="10.0.0.99",
+            up_time_seconds=42,
+            status=1,
+        )
+    ]
+    counts = await cross_reference_igmp_memberships(db_session, device, rows)
+    assert counts["created"] == 1
+    assert counts["updated"] == 0
+    assert counts["skipped_no_group"] == 0
+    assert counts["skipped_no_ip"] == 0
+
+    # Re-running the matcher only refreshes last_seen_at — the
+    # unique (group, ip, role) triplet keeps it idempotent.
+    counts = await cross_reference_igmp_memberships(db_session, device, rows)
+    assert counts["created"] == 0
+    assert counts["updated"] == 1
+
+
+@pytest.mark.asyncio
+async def test_igmp_xref_skips_when_group_unknown(
+    db_session: AsyncSession,
+) -> None:
+    from app.models.network import NetworkDevice
+    from app.services.snmp.igmp import (
+        IGMPCacheRow,
+        cross_reference_igmp_memberships,
+    )
+
+    space = await _make_space(db_session)
+    await _make_ip(db_session, space, "10.0.0.50")
+    device = NetworkDevice(
+        name="sw-skip-group",
+        hostname="sw-skip-group.lab",
+        ip_address="10.0.0.2",
+        ip_space_id=space.id,
+    )
+    db_session.add(device)
+    await db_session.flush()
+
+    counts = await cross_reference_igmp_memberships(
+        db_session,
+        device,
+        [
+            IGMPCacheRow(
+                group_address="239.99.99.99",
+                if_index=1,
+                last_reporter_ip="10.0.0.50",
+                up_time_seconds=None,
+                status=1,
+            )
+        ],
+    )
+    assert counts["skipped_no_group"] == 1
+    assert counts["created"] == 0
+
+
+@pytest.mark.asyncio
+async def test_igmp_xref_promotes_manual_to_igmp_snooping(
+    db_session: AsyncSession,
+) -> None:
+    """When the matcher finds an existing manual membership, it
+    refreshes ``last_seen_at`` AND promotes the ``seen_via`` tag
+    to ``igmp_snooping``. Operators can see when discovery
+    confirmed a manual entry."""
+    from app.models.network import NetworkDevice
+    from app.services.snmp.igmp import (
+        IGMPCacheRow,
+        cross_reference_igmp_memberships,
+    )
+
+    space = await _make_space(db_session)
+    ip = await _make_ip(db_session, space, "10.0.0.77")
+    group = MulticastGroup(space_id=space.id, address="239.77.77.77", name="cam77")
+    db_session.add(group)
+    await db_session.flush()
+    membership = MulticastMembership(
+        group_id=group.id,
+        ip_address_id=ip.id,
+        role="consumer",
+        seen_via="manual",
+    )
+    db_session.add(membership)
+    device = NetworkDevice(
+        name="sw-promote",
+        hostname="sw-promote.lab",
+        ip_address="10.0.0.3",
+        ip_space_id=space.id,
+    )
+    db_session.add(device)
+    await db_session.flush()
+
+    counts = await cross_reference_igmp_memberships(
+        db_session,
+        device,
+        [
+            IGMPCacheRow(
+                group_address="239.77.77.77",
+                if_index=2,
+                last_reporter_ip="10.0.0.77",
+                up_time_seconds=10,
+                status=1,
+            )
+        ],
+    )
+    assert counts["updated"] == 1
+    await db_session.refresh(membership)
+    assert membership.seen_via == "igmp_snooping"
+    assert membership.last_seen_at is not None
+
+
 # ── Subnet.kind discriminator (Phase 2 Wave 3) ───────────────────────
 
 

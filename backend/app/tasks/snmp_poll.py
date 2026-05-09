@@ -300,6 +300,7 @@ async def _poll_device_async(device_id: str) -> dict[str, Any]:
             fdb_count = 0
             interface_count = 0
             neighbour_count = 0
+            igmp_count = 0
             errors: list[str] = []
 
             # ── 1. sys-group probe (always run) ───────────────────────
@@ -374,9 +375,36 @@ async def _poll_device_async(device_id: str) -> dict[str, Any]:
                 except Exception as exc:  # noqa: BLE001
                     errors.append(f"lldp: {exc}")
 
-            # ── 6. Status roll-up ────────────────────────────────────
+            # ── 6. IGMP-snooping (issue #126 Phase 3) ────────────────
+            # Default-off; opt-in per device. Failures here don't
+            # affect the rest of the poll — IGMP-STD-MIB is widely
+            # implemented but conservatively (some platforms return
+            # noSuchObject), so a missing table just gives us zero
+            # rows + an empty-string-cast logger.debug.
+            if row.poll_igmp_snooping:
+                try:
+                    from app.services.snmp.igmp import (  # noqa: PLC0415
+                        cross_reference_igmp_memberships,
+                        walk_igmp_cache,
+                    )
+
+                    igmp_rows = await walk_igmp_cache(row)
+                    counts = await cross_reference_igmp_memberships(db, row, igmp_rows)
+                    igmp_count = counts["created"] + counts["updated"]
+                    summary["igmp_xref"] = counts
+                except Exception as exc:  # noqa: BLE001
+                    errors.append(f"igmp: {exc}")
+
+            # ── 7. Status roll-up ────────────────────────────────────
             requested = sum(
-                int(x) for x in (row.poll_arp, row.poll_fdb, row.poll_interfaces, row.poll_lldp)
+                int(x)
+                for x in (
+                    row.poll_arp,
+                    row.poll_fdb,
+                    row.poll_interfaces,
+                    row.poll_lldp,
+                    row.poll_igmp_snooping,
+                )
             )
             failed = len(errors)
             if failed == 0:
@@ -394,6 +422,7 @@ async def _poll_device_async(device_id: str) -> dict[str, Any]:
             row.last_poll_fdb_count = fdb_count
             row.last_poll_interface_count = interface_count
             row.last_poll_neighbour_count = neighbour_count
+            row.last_poll_igmp_count = igmp_count
             row.next_poll_at = now + timedelta(seconds=row.poll_interval_seconds)
 
             await db.commit()
@@ -404,6 +433,7 @@ async def _poll_device_async(device_id: str) -> dict[str, Any]:
                     "fdb_count": fdb_count,
                     "interface_count": interface_count,
                     "neighbour_count": neighbour_count,
+                    "igmp_count": igmp_count,
                     "errors": errors,
                 }
             )
