@@ -60,6 +60,7 @@ from app.models.kubernetes import KubernetesCluster
 from app.models.logs import DHCPLogEntry, DNSQueryLogEntry
 from app.models.metrics import DHCPMetricSample, DNSMetricSample
 from app.models.multicast import (
+    MulticastDomain,
     MulticastGroup,
     MulticastGroupPort,
     MulticastMembership,
@@ -165,6 +166,7 @@ __all__ = [
     "NetworkArpEntry",
     "NetworkFdbEntry",
     "NetworkNeighbour",
+    "MulticastDomain",
     "MulticastGroup",
     "MulticastGroupPort",
     "MulticastMembership",

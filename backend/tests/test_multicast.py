@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.security import create_access_token, hash_password
 from app.models.auth import User
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
-from app.models.multicast import MulticastGroup, MulticastMembership
+from app.models.multicast import MulticastDomain, MulticastGroup, MulticastMembership
 
 
 async def _make_admin(db: AsyncSession) -> tuple[User, str]:
@@ -522,6 +522,175 @@ async def test_bulk_allocate_rejects_unicast_start(
     )
     assert resp.status_code == 422
     assert any("224.0.0.0/4" in str(item) for item in resp.json()["detail"])
+
+
+# ── PIM domains (Phase 2 Wave 1) ─────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_create_domain_sparse_with_rp(client: AsyncClient, db_session: AsyncSession) -> None:
+    _, token = await _make_admin(db_session)
+    await db_session.commit()
+
+    resp = await client.post(
+        "/api/v1/multicast/domains",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "name": "Studio-A PIM",
+            "pim_mode": "sparse",
+            "rendezvous_point_address": "10.0.0.1",
+            "ssm_range": "232.0.0.0/8",
+        },
+    )
+    assert resp.status_code == 201, resp.text
+    body = resp.json()
+    assert body["name"] == "Studio-A PIM"
+    assert body["pim_mode"] == "sparse"
+    assert body["group_count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_create_domain_sparse_without_rp_rejected(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    _, token = await _make_admin(db_session)
+    await db_session.commit()
+
+    resp = await client.post(
+        "/api/v1/multicast/domains",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"name": "Bare sparse", "pim_mode": "sparse"},
+    )
+    assert resp.status_code == 422
+    assert "rendezvous_point" in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_create_domain_ssm_no_rp_required(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    """SSM doesn't need an RP — sources signal directly."""
+    _, token = await _make_admin(db_session)
+    await db_session.commit()
+
+    resp = await client.post(
+        "/api/v1/multicast/domains",
+        headers={"Authorization": f"Bearer {token}"},
+        json={"name": "Trade-Floor SSM", "pim_mode": "ssm"},
+    )
+    assert resp.status_code == 201
+
+
+@pytest.mark.asyncio
+async def test_update_domain_pim_mode_revalidates_rp(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    _, token = await _make_admin(db_session)
+    headers = {"Authorization": f"Bearer {token}"}
+
+    resp = await client.post(
+        "/api/v1/multicast/domains",
+        headers=headers,
+        json={"name": "Switchable", "pim_mode": "ssm"},
+    )
+    domain_id = resp.json()["id"]
+
+    # Flip to sparse without an RP — should fail.
+    resp = await client.put(
+        f"/api/v1/multicast/domains/{domain_id}",
+        headers=headers,
+        json={"pim_mode": "sparse"},
+    )
+    assert resp.status_code == 422
+
+    # Flip with RP set succeeds.
+    resp = await client.put(
+        f"/api/v1/multicast/domains/{domain_id}",
+        headers=headers,
+        json={"pim_mode": "sparse", "rendezvous_point_address": "10.1.1.1"},
+    )
+    assert resp.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_group_with_unknown_domain_id_rejected(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    _, token = await _make_admin(db_session)
+    space = await _make_space(db_session)
+    await db_session.commit()
+
+    resp = await client.post(
+        "/api/v1/multicast/groups",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "space_id": str(space.id),
+            "address": "239.30.30.30",
+            "name": "x",
+            "domain_id": str(uuid.uuid4()),
+        },
+    )
+    assert resp.status_code == 422
+    assert "domain_id" in resp.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_group_with_real_domain_id_round_trips(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    _, token = await _make_admin(db_session)
+    space = await _make_space(db_session)
+    domain = MulticastDomain(name="Round-trip", pim_mode="ssm")
+    db_session.add(domain)
+    await db_session.commit()
+
+    resp = await client.post(
+        "/api/v1/multicast/groups",
+        headers={"Authorization": f"Bearer {token}"},
+        json={
+            "space_id": str(space.id),
+            "address": "239.40.40.40",
+            "name": "with-domain",
+            "domain_id": str(domain.id),
+        },
+    )
+    assert resp.status_code == 201
+    assert resp.json()["domain_id"] == str(domain.id)
+
+    # Domain detail endpoint reflects the new group_count.
+    resp = await client.get(
+        f"/api/v1/multicast/domains/{domain.id}",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.json()["group_count"] == 1
+
+
+@pytest.mark.asyncio
+async def test_delete_domain_orphans_groups(client: AsyncClient, db_session: AsyncSession) -> None:
+    """ON DELETE SET NULL on multicast_group.domain_id."""
+    _, token = await _make_admin(db_session)
+    space = await _make_space(db_session)
+    domain = MulticastDomain(name="Decom-me", pim_mode="ssm")
+    db_session.add(domain)
+    await db_session.flush()
+    group = MulticastGroup(
+        space_id=space.id,
+        address="239.55.55.55",
+        name="orphan-after",
+        domain_id=domain.id,
+    )
+    db_session.add(group)
+    await db_session.commit()
+
+    resp = await client.delete(
+        f"/api/v1/multicast/domains/{domain.id}",
+        headers={"Authorization": f"Bearer {token}"},
+    )
+    assert resp.status_code == 204
+
+    # Group survives, domain_id orphans to NULL.
+    await db_session.refresh(group)
+    assert group.domain_id is None
 
 
 # ── Memberships-by-IP cross-group lookup ──────────────────────────────

@@ -1,4 +1,4 @@
-"""Multicast group registry — issue #126 Phase 1.
+"""Multicast registry — issue #126 Phase 1 + Phase 2 (Wave 1).
 
 Tracks multicast groups as first-class IPAM entities: address +
 optional ports + producer/consumer memberships. Sits inside the
@@ -81,6 +81,94 @@ MEMBERSHIP_SOURCES: frozenset[str] = frozenset({"manual", "igmp_snooping", "sap_
 # need a migration.
 PORT_TRANSPORTS: frozenset[str] = frozenset({"udp", "rtp", "tcp", "srt"})
 
+# PIM modes a multicast domain can run in. ``none`` covers the
+# manual / static-RP case (no PIM signalling, the operator just
+# pins receivers manually) which is real in some pro-audio
+# deployments. ``ssm`` is source-specific multicast (RFC 4607);
+# the SSM range is captured per-domain so cross-domain audits
+# can flag the well-known 232.0.0.0/8 (v4) / ff3x::/96 (v6)
+# defaults vs operator-pinned alternatives.
+PIM_MODES: frozenset[str] = frozenset({"sparse", "dense", "ssm", "bidir", "none"})
+
+
+class MulticastDomain(UUIDPrimaryKeyMixin, TimestampMixin, Base):
+    """A PIM routing domain — the network-layer context a group
+    flows in.
+
+    A domain ties together: which VRF the multicast traffic runs
+    in, what PIM mode the routers speak, which device (if any) is
+    the rendezvous point for sparse / bidir modes, and the SSM
+    range when the domain is SSM-mode.
+
+    Phase 2 ships the registry only — the actual MSDP peerings
+    between domains land alongside the multi-domain UX in Phase
+    2.5 / 3, when SNMP-driven topology population gives operators
+    a reason to model the inter-domain connections.
+
+    FK semantics:
+
+    * ``vrf_id`` — ``ON DELETE SET NULL``. A VRF can vanish (mass
+      decom, merger consolidation); the domain row should orphan
+      the binding, not cascade-delete the topology metadata.
+    * ``rendezvous_point_device_id`` — ``ON DELETE SET NULL``.
+      Replacing an RP router shouldn't cascade-delete the domain.
+    """
+
+    __tablename__ = "multicast_domain"
+    __table_args__ = (
+        Index("ix_multicast_domain_vrf_id", "vrf_id"),
+        Index(
+            "ix_multicast_domain_rp_device",
+            "rendezvous_point_device_id",
+        ),
+    )
+
+    name: Mapped[str] = mapped_column(String(255), nullable=False, unique=True)
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default="")
+
+    # ``sparse`` | ``dense`` | ``ssm`` | ``bidir`` | ``none``
+    pim_mode: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="sparse", server_default="sparse"
+    )
+
+    vrf_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("vrf.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
+    # Rendezvous point. Stored as an explicit FK to NetworkDevice
+    # *and* a free-text address so operators can record the RP
+    # before the device is in the SNMP inventory (or for
+    # third-party-managed RPs that we don't poll). Either may be
+    # populated; both null means "no RP defined yet". Validated at
+    # the API layer: PIM modes that require an RP (``sparse`` /
+    # ``bidir``) raise 422 when neither is set.
+    rendezvous_point_device_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("network_device.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    rendezvous_point_address: Mapped[str | None] = mapped_column(String(45), nullable=True)
+
+    # SSM range. Only meaningful when ``pim_mode='ssm'``; ignored
+    # otherwise. Default to the IANA-blessed 232.0.0.0/8 when
+    # mode flips to SSM and the operator hasn't pinned an
+    # alternative, so domains are usable out of the box.
+    ssm_range: Mapped[str | None] = mapped_column(String(45), nullable=True)
+
+    notes: Mapped[str] = mapped_column(Text, nullable=False, default="", server_default="")
+
+    tags: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default="{}"
+    )
+
+    groups: Mapped[list[MulticastGroup]] = relationship(
+        "MulticastGroup",
+        back_populates="domain",
+        passive_deletes=True,
+    )
+
 
 class MulticastGroup(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     """A multicast group address — the stream identity.
@@ -146,13 +234,15 @@ class MulticastGroup(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         nullable=True,
     )
 
-    # Forward placeholder — the ``multicast_domain`` table lands in
-    # Phase 2, at which point the migration replaces this with a
-    # proper FK. Until then it's a plain UUID column with no
-    # referential integrity, so callers must treat NULL as "no
-    # domain assigned" and an unknown UUID as "stale, treat as
-    # NULL".
-    domain_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+    # FK to the PIM domain this group flows in. Promoted from a
+    # plain UUID column to a real FK by the Phase 2 migration.
+    # ``ON DELETE SET NULL`` — a domain decom shouldn't take its
+    # member groups with it.
+    domain_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("multicast_domain.id", ondelete="SET NULL"),
+        nullable=True,
+    )
 
     tags: Mapped[dict[str, Any]] = mapped_column(
         JSONB, nullable=False, default=dict, server_default="{}"
@@ -161,6 +251,9 @@ class MulticastGroup(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         JSONB, nullable=False, default=dict, server_default="{}"
     )
 
+    domain: Mapped[MulticastDomain | None] = relationship(
+        "MulticastDomain", back_populates="groups"
+    )
     ports: Mapped[list[MulticastGroupPort]] = relationship(
         "MulticastGroupPort",
         back_populates="group",
@@ -257,8 +350,10 @@ class MulticastMembership(UUIDPrimaryKeyMixin, Base):
 __all__ = [
     "MEMBERSHIP_ROLES",
     "MEMBERSHIP_SOURCES",
+    "MulticastDomain",
     "MulticastGroup",
     "MulticastGroupPort",
     "MulticastMembership",
+    "PIM_MODES",
     "PORT_TRANSPORTS",
 ]

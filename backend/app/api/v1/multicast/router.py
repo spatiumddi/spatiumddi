@@ -52,11 +52,15 @@ from app.models.ipam import IPAddress, IPSpace
 from app.models.multicast import (
     MEMBERSHIP_ROLES,
     MEMBERSHIP_SOURCES,
+    PIM_MODES,
     PORT_TRANSPORTS,
+    MulticastDomain,
     MulticastGroup,
     MulticastGroupPort,
     MulticastMembership,
 )
+from app.models.network import NetworkDevice
+from app.models.vrf import VRF
 from app.services.tags import apply_tag_filter
 
 router = APIRouter(
@@ -67,6 +71,14 @@ router = APIRouter(
 MembershipRole = Literal["producer", "consumer", "rendezvous_point"]
 MembershipSource = Literal["manual", "igmp_snooping", "sap_announce"]
 PortTransport = Literal["udp", "rtp", "tcp", "srt"]
+PIMMode = Literal["sparse", "dense", "ssm", "bidir", "none"]
+
+# PIM modes that route via a Rendezvous Point. These shapes
+# require either ``rendezvous_point_device_id`` or
+# ``rendezvous_point_address`` to be set; a 422 is raised
+# otherwise. ``ssm`` does not need an RP (sources signal
+# directly), ``dense`` floods, ``none`` is manual / static.
+_PIM_MODES_REQUIRING_RP: frozenset[str] = frozenset({"sparse", "bidir"})
 
 
 # IANA-blessed multicast ranges. The DB CHECK constraint mirrors
@@ -282,6 +294,311 @@ async def _check_space(db: Any, space_id: uuid.UUID) -> None:
         raise HTTPException(status_code=422, detail="space_id not found")
 
 
+async def _check_domain(db: Any, domain_id: uuid.UUID | None) -> None:
+    if domain_id is None:
+        return
+    if (await db.get(MulticastDomain, domain_id)) is None:
+        raise HTTPException(status_code=422, detail="domain_id not found")
+
+
+async def _check_vrf(db: Any, vrf_id: uuid.UUID | None) -> None:
+    if vrf_id is None:
+        return
+    if (await db.get(VRF, vrf_id)) is None:
+        raise HTTPException(status_code=422, detail="vrf_id not found")
+
+
+async def _check_device(db: Any, device_id: uuid.UUID | None) -> None:
+    if device_id is None:
+        return
+    if (await db.get(NetworkDevice, device_id)) is None:
+        raise HTTPException(status_code=422, detail="rendezvous_point_device_id not found")
+
+
+def _validate_rp_for_mode(
+    pim_mode: str,
+    rp_device: uuid.UUID | None,
+    rp_address: str | None,
+) -> None:
+    """Sparse/bidir modes need an RP set somehow. Other modes don't
+    care about the RP fields (they're stored regardless so a mode
+    flip back to sparse re-uses what's there)."""
+    if pim_mode in _PIM_MODES_REQUIRING_RP and rp_device is None and not rp_address:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                f"pim_mode={pim_mode!r} requires either "
+                "rendezvous_point_device_id or rendezvous_point_address"
+            ),
+        )
+
+
+# ── Domain schemas + endpoints ─────────────────────────────────────
+
+
+class MulticastDomainCreate(BaseModel):
+    name: str = Field(..., min_length=1, max_length=255)
+    description: str = ""
+    pim_mode: PIMMode = "sparse"
+    vrf_id: uuid.UUID | None = None
+    rendezvous_point_device_id: uuid.UUID | None = None
+    rendezvous_point_address: str | None = Field(default=None, max_length=45)
+    ssm_range: str | None = Field(default=None, max_length=45)
+    notes: str = ""
+    tags: dict[str, Any] = Field(default_factory=dict)
+
+    @field_validator("pim_mode")
+    @classmethod
+    def _v_mode(cls, v: str) -> str:
+        if v not in PIM_MODES:
+            raise ValueError(f"pim_mode must be one of {sorted(PIM_MODES)}")
+        return v
+
+
+class MulticastDomainUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=255)
+    description: str | None = None
+    pim_mode: PIMMode | None = None
+    vrf_id: uuid.UUID | None = None
+    rendezvous_point_device_id: uuid.UUID | None = None
+    rendezvous_point_address: str | None = Field(default=None, max_length=45)
+    ssm_range: str | None = Field(default=None, max_length=45)
+    notes: str | None = None
+    tags: dict[str, Any] | None = None
+
+    @field_validator("pim_mode")
+    @classmethod
+    def _v_mode(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        if v not in PIM_MODES:
+            raise ValueError(f"pim_mode must be one of {sorted(PIM_MODES)}")
+        return v
+
+
+class MulticastDomainRead(BaseModel):
+    id: uuid.UUID
+    name: str
+    description: str
+    pim_mode: str
+    vrf_id: uuid.UUID | None
+    rendezvous_point_device_id: uuid.UUID | None
+    rendezvous_point_address: str | None
+    ssm_range: str | None
+    notes: str
+    tags: dict[str, Any]
+    group_count: int
+    created_at: datetime
+    modified_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+@router.get("/domains", response_model=list[MulticastDomainRead])
+async def list_domains(db: DB, _: CurrentUser) -> list[MulticastDomainRead]:
+    """List PIM domains. Includes a lightweight ``group_count`` so
+    the operator UI can show how many groups each domain hosts
+    without a per-row roundtrip."""
+    rows = (
+        (await db.execute(select(MulticastDomain).order_by(MulticastDomain.name.asc())))
+        .scalars()
+        .all()
+    )
+    count_rows = (
+        await db.execute(
+            select(MulticastGroup.domain_id, func.count(MulticastGroup.id))
+            .where(MulticastGroup.domain_id.is_not(None))
+            .group_by(MulticastGroup.domain_id)
+        )
+    ).all()
+    # Same row→dict pattern the network-modeling rollups use; mypy
+    # unhappy with raw ``dict(rows.all())`` on SQLAlchemy ``Row``s.
+    counts: dict[uuid.UUID, int] = {row[0]: row[1] for row in count_rows if row[0] is not None}
+    return [
+        MulticastDomainRead(
+            id=d.id,
+            name=d.name,
+            description=d.description,
+            pim_mode=d.pim_mode,
+            vrf_id=d.vrf_id,
+            rendezvous_point_device_id=d.rendezvous_point_device_id,
+            rendezvous_point_address=d.rendezvous_point_address,
+            ssm_range=d.ssm_range,
+            notes=d.notes,
+            tags=d.tags,
+            group_count=int(counts.get(d.id, 0)),
+            created_at=d.created_at,
+            modified_at=d.modified_at,
+        )
+        for d in rows
+    ]
+
+
+@router.post("/domains", response_model=MulticastDomainRead, status_code=status.HTTP_201_CREATED)
+async def create_domain(
+    body: MulticastDomainCreate, db: DB, user: CurrentUser
+) -> MulticastDomainRead:
+    await _check_vrf(db, body.vrf_id)
+    await _check_device(db, body.rendezvous_point_device_id)
+    _validate_rp_for_mode(
+        body.pim_mode,
+        body.rendezvous_point_device_id,
+        body.rendezvous_point_address,
+    )
+
+    row = MulticastDomain(
+        name=body.name,
+        description=body.description,
+        pim_mode=body.pim_mode,
+        vrf_id=body.vrf_id,
+        rendezvous_point_device_id=body.rendezvous_point_device_id,
+        rendezvous_point_address=body.rendezvous_point_address,
+        ssm_range=body.ssm_range,
+        notes=body.notes,
+        tags=body.tags or {},
+    )
+    db.add(row)
+    await db.flush()
+
+    write_audit(
+        db,
+        user=user,
+        action="create",
+        resource_type="multicast_domain",
+        resource_id=str(row.id),
+        resource_display=row.name,
+        new_value=body.model_dump(mode="json"),
+    )
+    await db.commit()
+    await db.refresh(row)
+    return MulticastDomainRead(
+        id=row.id,
+        name=row.name,
+        description=row.description,
+        pim_mode=row.pim_mode,
+        vrf_id=row.vrf_id,
+        rendezvous_point_device_id=row.rendezvous_point_device_id,
+        rendezvous_point_address=row.rendezvous_point_address,
+        ssm_range=row.ssm_range,
+        notes=row.notes,
+        tags=row.tags,
+        group_count=0,
+        created_at=row.created_at,
+        modified_at=row.modified_at,
+    )
+
+
+@router.get("/domains/{domain_id:uuid}", response_model=MulticastDomainRead)
+async def get_domain(domain_id: uuid.UUID, db: DB, _: CurrentUser) -> MulticastDomainRead:
+    row = await db.get(MulticastDomain, domain_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Multicast domain not found")
+    count = (
+        await db.execute(
+            select(func.count(MulticastGroup.id)).where(MulticastGroup.domain_id == domain_id)
+        )
+    ).scalar_one()
+    return MulticastDomainRead(
+        id=row.id,
+        name=row.name,
+        description=row.description,
+        pim_mode=row.pim_mode,
+        vrf_id=row.vrf_id,
+        rendezvous_point_device_id=row.rendezvous_point_device_id,
+        rendezvous_point_address=row.rendezvous_point_address,
+        ssm_range=row.ssm_range,
+        notes=row.notes,
+        tags=row.tags,
+        group_count=int(count),
+        created_at=row.created_at,
+        modified_at=row.modified_at,
+    )
+
+
+@router.put("/domains/{domain_id:uuid}", response_model=MulticastDomainRead)
+async def update_domain(
+    domain_id: uuid.UUID,
+    body: MulticastDomainUpdate,
+    db: DB,
+    user: CurrentUser,
+) -> MulticastDomainRead:
+    row = await db.get(MulticastDomain, domain_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Multicast domain not found")
+
+    changes = body.model_dump(exclude_unset=True)
+    if "vrf_id" in changes:
+        await _check_vrf(db, changes["vrf_id"])
+    if "rendezvous_point_device_id" in changes:
+        await _check_device(db, changes["rendezvous_point_device_id"])
+
+    for k, v in changes.items():
+        setattr(row, k, v)
+
+    # Re-validate RP requirement against the *post-update* state so
+    # an operator flipping mode → sparse without setting an RP fails
+    # cleanly.
+    _validate_rp_for_mode(
+        row.pim_mode,
+        row.rendezvous_point_device_id,
+        row.rendezvous_point_address,
+    )
+
+    write_audit(
+        db,
+        user=user,
+        action="update",
+        resource_type="multicast_domain",
+        resource_id=str(row.id),
+        resource_display=row.name,
+        changed_fields=list(changes.keys()),
+        new_value=body.model_dump(mode="json", exclude_unset=True),
+    )
+    await db.commit()
+    await db.refresh(row)
+    count = (
+        await db.execute(
+            select(func.count(MulticastGroup.id)).where(MulticastGroup.domain_id == domain_id)
+        )
+    ).scalar_one()
+    return MulticastDomainRead(
+        id=row.id,
+        name=row.name,
+        description=row.description,
+        pim_mode=row.pim_mode,
+        vrf_id=row.vrf_id,
+        rendezvous_point_device_id=row.rendezvous_point_device_id,
+        rendezvous_point_address=row.rendezvous_point_address,
+        ssm_range=row.ssm_range,
+        notes=row.notes,
+        tags=row.tags,
+        group_count=int(count),
+        created_at=row.created_at,
+        modified_at=row.modified_at,
+    )
+
+
+@router.delete("/domains/{domain_id:uuid}", status_code=status.HTTP_204_NO_CONTENT)
+async def delete_domain(domain_id: uuid.UUID, db: DB, user: CurrentUser) -> None:
+    """Hard-delete the domain. Member groups have ``ON DELETE SET
+    NULL`` on ``domain_id`` so they orphan rather than cascade —
+    operators who want to drop the groups too do that as a
+    separate bulk-delete on the groups page."""
+    row = await db.get(MulticastDomain, domain_id)
+    if row is None:
+        raise HTTPException(status_code=404, detail="Multicast domain not found")
+    write_audit(
+        db,
+        user=user,
+        action="delete",
+        resource_type="multicast_domain",
+        resource_id=str(row.id),
+        resource_display=row.name,
+    )
+    await db.delete(row)
+    await db.commit()
+
+
 # ── Group endpoints ─────────────────────────────────────────────────
 
 
@@ -341,6 +658,7 @@ async def list_groups(
 @router.post("/groups", response_model=MulticastGroupRead, status_code=status.HTTP_201_CREATED)
 async def create_group(body: MulticastGroupCreate, db: DB, user: CurrentUser) -> MulticastGroupRead:
     await _check_space(db, body.space_id)
+    await _check_domain(db, body.domain_id)
 
     row = MulticastGroup(
         space_id=body.space_id,
@@ -389,6 +707,8 @@ async def update_group(
     addr_before = str(row.address)
 
     changes = body.model_dump(exclude_unset=True)
+    if "domain_id" in changes:
+        await _check_domain(db, changes["domain_id"])
     for field, value in changes.items():
         setattr(row, field, value)
 
@@ -832,6 +1152,7 @@ async def bulk_allocate_commit(
     already has a multicast group in the same space — the operator
     runs ``/preview`` first to see + resolve conflicts."""
     await _check_space(db, body.space_id)
+    await _check_domain(db, body.domain_id)
     items = await _build_bulk_candidates(db, body)
     conflicts = [it for it in items if it.conflict is not None]
     if conflicts:
