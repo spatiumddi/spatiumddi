@@ -11,13 +11,18 @@ name: Agent E2E (kind)
 #      CHAOS-class equivalent.
 #   5. Both pods register and stay stable (low restart count).
 #
-# Uses the ghcr.io/spatiumddi/*:main images, which the dns / dhcp /
-# release workflows republish on every push to main. ``:main`` is
-# preferred over ``:latest`` here because ``:latest`` is only stamped
-# by the CalVer release workflow — newly-added images (like
-# ``dns-powerdns``) don't get a ``:latest`` tag until the next release
-# is cut. Smoking against ``:main`` means we test what's actually on
-# main *today*, which is closer to what a PR would break.
+# Tag selection — control-plane vs agent images publish on different
+# cadences, so they need different tags:
+#
+# * ``ghcr.io/spatiumddi/spatiumddi-{api,frontend}`` — built only by
+#   ``release.yml`` on CalVer tag push. ``:latest`` exists; ``:main``
+#   does not. So control-plane workloads pin ``:latest``.
+# * ``ghcr.io/spatiumddi/{dns-bind9,dns-powerdns,dhcp-kea}`` — built
+#   by ``build-dns-images.yml`` / ``build-dhcp-images.yml`` on every
+#   push to main, so ``:main`` is fresh. We use ``:main`` here so PR
+#   smokes exercise the actually-current agent image, and to dodge
+#   the ``dns-powerdns:latest`` gap (Phase 4b landed after the most
+#   recent CalVer release, so the latest tag isn't stamped yet).
 
 on:
   pull_request:
@@ -36,8 +41,12 @@ on:
       - ".github/workflows/agent-e2e.yml"
   workflow_dispatch:
     inputs:
-      image_tag:
-        description: "Image tag to deploy (defaults to 'main')"
+      control_tag:
+        description: "Control-plane image tag (api / frontend / worker / beat)"
+        required: false
+        default: "latest"
+      agent_tag:
+        description: "Agent image tag (dns-bind9 / dns-powerdns / dhcp-kea)"
         required: false
         default: "main"
 
@@ -103,8 +112,9 @@ jobs:
       - name: Install chart
         id: install
         run: |
-          TAG="${{ github.event.inputs.image_tag || 'main' }}"
-          echo "Installing chart with image.tag=${TAG}"
+          CONTROL_TAG="${{ github.event.inputs.control_tag || 'latest' }}"
+          AGENT_TAG="${{ github.event.inputs.agent_tag || 'main' }}"
+          echo "Installing chart with control-plane tag=${CONTROL_TAG}, agent tag=${AGENT_TAG}"
           # The agent PSK has to be pre-shared with the control plane
           # before the agent first connects — we set it explicitly so
           # the auto-registration path can authenticate. For a real
@@ -120,7 +130,7 @@ jobs:
           helm install ddi charts/spatiumddi \
             --namespace spatiumddi --create-namespace \
             --wait --timeout 10m \
-            --set image.tag="${TAG}" \
+            --set image.tag="${CONTROL_TAG}" \
             --set postgresql.persistence.size=1Gi \
             --set postgresql.resources.requests.cpu=100m \
             --set postgresql.resources.requests.memory=128Mi \
@@ -129,8 +139,8 @@ jobs:
             --set redis.resources.requests.memory=64Mi \
             --set dnsAgents.enabled=true \
             --set dnsAgents.agentKey.value=e2e-dns-key \
-            --set dnsAgents.image.tag="${TAG}" \
-            --set dnsAgents.flavors.powerdns.tag="${TAG}" \
+            --set dnsAgents.image.tag="${AGENT_TAG}" \
+            --set dnsAgents.flavors.powerdns.tag="${AGENT_TAG}" \
             --set-json 'dnsAgents.servers=[{"name":"ns1","flavor":"bind9","role":"primary","group":"e2e-bind9","service":{"type":"ClusterIP"}},{"name":"pdns1","flavor":"powerdns","role":"primary","group":"e2e-powerdns","service":{"type":"ClusterIP"}}]'
 
       - name: Dump pod state
