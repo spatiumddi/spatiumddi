@@ -46,6 +46,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.models.alerts import AlertRule
 from app.models.audit import AuditLog
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
+from app.models.multicast import MulticastGroup
 from app.models.nmap import NmapScan
 from app.services import alerts as alert_service
 
@@ -577,6 +578,62 @@ async def check_voice_segment_not_internet_facing(
 _ = ipaddress
 
 
+# ── Check: no_multicast_collision ──────────────────────────────────
+
+
+@register("no_multicast_collision")
+async def check_no_multicast_collision(
+    db: AsyncSession,
+    *,
+    target: object | None,
+    target_kind: str,
+    args: dict[str, Any],
+    now: datetime,
+) -> CheckOutcome:
+    """Multicast group address must be unique within an IPSpace.
+
+    Two groups holding the same address inside the same space
+    indicate a misconfiguration — the operator-facing IPAM tree
+    treats ``(space_id, address)`` as the stream identity, and
+    duplicates surface as silent renderer ambiguity (which row
+    "wins" when an ARP lookup or pool dispatch consults the
+    registry). The DB layer doesn't enforce uniqueness because
+    Phase 1 hasn't established whether deliberate dual-stack
+    overlap (e.g. one row in IPv4 view + one in IPv6 view tagged
+    on the same logical stream) is a pattern operators want;
+    this conformity rule surfaces the cases as a soft warning so
+    the operator decides per-incident.
+    """
+    if target is None or not isinstance(target, MulticastGroup):
+        return CheckOutcome.not_applicable(
+            "Target row missing or wrong kind for no_multicast_collision"
+        )
+    siblings = (
+        await db.execute(
+            select(MulticastGroup.id, MulticastGroup.name).where(
+                MulticastGroup.space_id == target.space_id,
+                MulticastGroup.address == target.address,
+                MulticastGroup.id != target.id,
+            )
+        )
+    ).all()
+    if not siblings:
+        return CheckOutcome.passed(f"Address {target.address} is unique within space")
+    sibling_summary = ", ".join(f"{r._mapping['name']} ({r._mapping['id']})" for r in siblings)
+    return CheckOutcome.fail(
+        detail=(
+            f"Address {target.address} collides with "
+            f"{len(siblings)} other group(s) in the same IPSpace: "
+            f"{sibling_summary}"
+        ),
+        diagnostic={
+            "address": str(target.address),
+            "space_id": str(target.space_id),
+            "colliding_group_ids": [str(r._mapping["id"]) for r in siblings],
+        },
+    )
+
+
 # ── Catalog (frontend uses to render the policy editor) ──────────────
 
 
@@ -670,6 +727,12 @@ CHECK_CATALOG: list[dict[str, Any]] = [
         "name": "voice_segment_not_internet_facing",
         "label": "Voice subnet is not flagged internet_facing",
         "supports": ["subnet"],
+        "args": [],
+    },
+    {
+        "name": "no_multicast_collision",
+        "label": "Multicast group address is unique within its IPSpace",
+        "supports": ["multicast_group"],
         "args": [],
     },
 ]

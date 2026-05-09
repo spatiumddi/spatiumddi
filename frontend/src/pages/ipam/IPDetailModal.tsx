@@ -7,6 +7,7 @@ import {
   Pencil,
   Phone,
   Radar,
+  Radio,
   RefreshCw,
   Trash2,
   X,
@@ -14,9 +15,11 @@ import {
 
 import {
   ipamApi,
+  multicastApi,
   nmapApi,
   type DHCPFingerprintResponse,
   type IPAddress,
+  type MulticastMembershipReadWithGroup,
   type NmapScanRead,
   type Subnet,
 } from "@/lib/api";
@@ -28,6 +31,7 @@ import {
 import { AskAIButton } from "@/components/copilot/AskAIButton";
 import { IPNetworkTab } from "./IPNetworkTab";
 import { SeenDot } from "./SeenDot";
+import { useFeatureModules } from "@/hooks/useFeatureModules";
 
 // ── Helpers ──────────────────────────────────────────────────────────
 
@@ -467,9 +471,108 @@ export function IPDetailModal({
 
           {/* Device profile (active layer — Phase 1 nmap auto-profile) */}
           <DeviceProfileSection addr={addr} canEdit={canEdit} />
+
+          {/* Multicast memberships (issue #126 Wave 4). Hidden when
+              the network.multicast feature module is disabled. */}
+          <MulticastMembershipsSection addressId={addr.id} />
         </div>
       </div>
     </div>
+  );
+}
+
+// ── Multicast memberships ─────────────────────────────────────────
+//
+// Surfaces the multicast groups this IP is a member of (producer /
+// consumer / RP). Hidden when the network.multicast feature module
+// is off, so non-multicast deployments don't see chrome they don't
+// need.
+
+function MulticastMembershipsSection({ addressId }: { addressId: string }) {
+  const { enabled } = useFeatureModules();
+  const multicastEnabled = enabled("network.multicast");
+
+  const q = useQuery({
+    queryKey: ["multicast-memberships-by-ip", addressId],
+    queryFn: () => multicastApi.listMembershipsByIP(addressId),
+    enabled: multicastEnabled,
+    staleTime: 30_000,
+  });
+
+  if (!multicastEnabled) return null;
+  // Hide the section entirely when the IP isn't in any multicast
+  // group. The fanout for a typical IP is zero so most callers
+  // won't render anything; only stream-bearing endpoints carry
+  // memberships.
+  const memberships = q.data ?? [];
+  if (q.isFetching && memberships.length === 0) return null;
+  if (memberships.length === 0) return null;
+
+  return (
+    <div>
+      <div className="mb-1 flex items-center gap-1 text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+        <Radio className="h-3 w-3" /> Multicast memberships
+      </div>
+      <div className="rounded-md border">
+        <table className="w-full text-xs">
+          <thead className="text-left text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
+            <tr className="border-b bg-muted/30">
+              <th className="px-3 py-1.5">Group</th>
+              <th className="px-3 py-1.5">Application</th>
+              <th className="px-3 py-1.5">Role</th>
+              <th className="px-3 py-1.5">Source</th>
+            </tr>
+          </thead>
+          <tbody>
+            {memberships.map((m) => (
+              <MulticastMembershipRow key={m.id} row={m} />
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
+function MulticastMembershipRow({
+  row,
+}: {
+  row: MulticastMembershipReadWithGroup;
+}) {
+  const roleStyles: Record<string, string> = {
+    producer:
+      "bg-emerald-100 text-emerald-700 dark:bg-emerald-950/30 dark:text-emerald-400",
+    consumer: "bg-sky-100 text-sky-700 dark:bg-sky-950/30 dark:text-sky-400",
+    rendezvous_point:
+      "bg-violet-100 text-violet-700 dark:bg-violet-950/30 dark:text-violet-400",
+  };
+  return (
+    <tr className="border-b last:border-b-0">
+      <td className="px-3 py-1.5">
+        <div className="flex flex-col">
+          <span className="font-mono text-[12px]">{row.group_address}</span>
+          <span className="text-[11px] text-muted-foreground">
+            {row.group_name}
+          </span>
+        </div>
+      </td>
+      <td className="px-3 py-1.5 text-muted-foreground">
+        {row.group_application || "—"}
+      </td>
+      <td className="px-3 py-1.5">
+        <span
+          className={cn(
+            "inline-flex items-center rounded px-2 py-0.5 text-[10px] font-medium uppercase tracking-wider",
+            roleStyles[row.role] ?? "bg-zinc-200 text-zinc-700",
+          )}
+        >
+          {row.role.replace("_", " ")}
+        </span>
+      </td>
+      <td className="px-3 py-1.5 text-muted-foreground">
+        {row.seen_via.replace("_", " ")}
+      </td>
+    </tr>
   );
 }
 

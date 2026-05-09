@@ -8688,6 +8688,19 @@ export interface MulticastMembershipCreate {
   notes?: string;
 }
 
+export interface MulticastMembershipReadWithGroup {
+  id: string;
+  group_id: string;
+  group_address: string;
+  group_name: string;
+  group_application: string;
+  ip_address_id: string;
+  role: string;
+  seen_via: string;
+  last_seen_at: string | null;
+  notes: string;
+}
+
 export interface MulticastBulkAllocateRequest {
   space_id: string;
   count: number;
@@ -8751,6 +8764,12 @@ export const multicastApi = {
       .get<
         MulticastMembershipRead[]
       >(`/multicast/groups/${groupId}/memberships`)
+      .then((r) => r.data),
+  listMembershipsByIP: (ipAddressId: string) =>
+    api
+      .get<MulticastMembershipReadWithGroup[]>("/multicast/memberships", {
+        params: { ip_address_id: ipAddressId },
+      })
       .then((r) => r.data),
   createMembership: (groupId: string, data: MulticastMembershipCreate) =>
     api

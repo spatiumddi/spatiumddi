@@ -160,6 +160,26 @@ _BUILTIN_POLICIES: list[dict[str, object]] = [
         "check_kind": "voice_segment_not_internet_facing",
         "check_args": {},
     },
+    # ── Multicast hygiene (issue #126) ──────────────────────────────
+    {
+        "name": "No multicast group address collisions within an IPSpace",
+        "description": (
+            "Every multicast group address is unique within its parent "
+            "IPSpace. Two groups sharing an address indicate a "
+            "misconfiguration — the registry treats (space_id, address) "
+            "as the stream identity and duplicates surface as silent "
+            "ambiguity in the IPAM tree. Rule fails per-group when the "
+            "scan finds a sibling sharing its address; auto-resolves "
+            "when one of the two is renamed or deleted."
+        ),
+        "framework": "custom",
+        "reference": None,
+        "severity": "warning",
+        "target_kind": "multicast_group",
+        "target_filter": {},
+        "check_kind": "no_multicast_collision",
+        "check_args": {},
+    },
     # ── Platform integrity ──────────────────────────────────────────
     {
         "name": "Audit log is reachable and append-only",

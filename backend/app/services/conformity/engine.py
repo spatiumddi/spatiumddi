@@ -46,6 +46,7 @@ from app.models.conformity import ConformityPolicy, ConformityResult
 from app.models.dhcp import DHCPScope
 from app.models.dns import DNSZone
 from app.models.ipam import IPAddress, Subnet
+from app.models.multicast import MulticastGroup
 from app.services import audit_forward
 from app.services.alerts import _deliver
 from app.services.conformity.checks import (
@@ -59,7 +60,7 @@ logger = structlog.get_logger(__name__)
 
 
 _TARGET_KINDS: frozenset[str] = frozenset(
-    {"platform", "subnet", "ip_address", "dns_zone", "dhcp_scope"}
+    {"platform", "subnet", "ip_address", "dns_zone", "dhcp_scope", "multicast_group"}
 )
 
 
@@ -182,6 +183,27 @@ async def _resolve_dhcp_scopes(
     ]
 
 
+async def _resolve_multicast_groups(
+    db: AsyncSession,
+    target_filter: dict[str, Any],
+) -> Sequence[_ResolvedTarget]:
+    """Pull every multicast group. ``target_filter`` is currently
+    unused — the only built-in policy (``no_multicast_collision``)
+    runs across all groups in every space, so a per-space filter
+    here would only narrow what gets evaluated and that's a
+    deferred refinement (issue #126 Phase 2)."""
+    rows = (await db.execute(select(MulticastGroup))).scalars().all()
+    return [
+        _ResolvedTarget(
+            kind="multicast_group",
+            row_id=str(g.id),
+            display=f"{g.address} ({g.name})",
+            row=g,
+        )
+        for g in rows
+    ]
+
+
 async def _resolve_targets(
     db: AsyncSession,
     policy: ConformityPolicy,
@@ -204,6 +226,8 @@ async def _resolve_targets(
         return await _resolve_dns_zones(db, target_filter)
     if policy.target_kind == "dhcp_scope":
         return await _resolve_dhcp_scopes(db, target_filter)
+    if policy.target_kind == "multicast_group":
+        return await _resolve_multicast_groups(db, target_filter)
     return []
 
 

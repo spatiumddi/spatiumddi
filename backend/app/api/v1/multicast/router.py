@@ -159,6 +159,27 @@ class MulticastMembershipRead(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class MulticastMembershipReadWithGroup(BaseModel):
+    """Membership row plus a small slice of its parent group.
+
+    Used by the IP-detail "Multicast" tab so the operator-facing
+    list can render group address + name without a second
+    round-trip per row. The full group is still fetchable via the
+    standard ``/groups/{id}`` endpoint.
+    """
+
+    id: uuid.UUID
+    group_id: uuid.UUID
+    group_address: str
+    group_name: str
+    group_application: str
+    ip_address_id: uuid.UUID
+    role: str
+    seen_via: str
+    last_seen_at: datetime | None
+    notes: str
+
+
 class MulticastGroupCreate(BaseModel):
     space_id: uuid.UUID
     address: str = Field(..., min_length=1, max_length=45)
@@ -570,6 +591,54 @@ async def delete_membership(membership_id: uuid.UUID, db: DB, user: CurrentUser)
     )
     await db.delete(row)
     await db.commit()
+
+
+# ── Memberships by IP (cross-group lookup) ────────────────────────
+
+
+@router.get(
+    "/memberships",
+    response_model=list[MulticastMembershipReadWithGroup],
+)
+async def list_memberships_by_filter(
+    db: DB,
+    _: CurrentUser,
+    ip_address_id: uuid.UUID = Query(
+        ...,
+        description=(
+            "Required: filter to memberships involving this IPAM "
+            "address. Returns each membership with a small slice of "
+            "its parent group (address / name / application) so "
+            "callers don't need to round-trip."
+        ),
+    ),
+) -> list[MulticastMembershipReadWithGroup]:
+    """Cross-group membership lookup. Drives the IP-detail page's
+    Multicast tab; an IP can be a member of N groups under different
+    roles, so the result is naturally a list."""
+    rows = (
+        await db.execute(
+            select(MulticastMembership, MulticastGroup)
+            .join(MulticastGroup, MulticastGroup.id == MulticastMembership.group_id)
+            .where(MulticastMembership.ip_address_id == ip_address_id)
+            .order_by(MulticastGroup.address.asc(), MulticastMembership.role.asc())
+        )
+    ).all()
+    return [
+        MulticastMembershipReadWithGroup(
+            id=m.id,
+            group_id=m.group_id,
+            group_address=str(g.address),
+            group_name=g.name,
+            group_application=g.application,
+            ip_address_id=m.ip_address_id,
+            role=m.role,
+            seen_via=m.seen_via,
+            last_seen_at=m.last_seen_at,
+            notes=m.notes,
+        )
+        for m, g in rows
+    ]
 
 
 # ── Bulk allocate ─────────────────────────────────────────────────

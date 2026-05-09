@@ -19,7 +19,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.security import create_access_token, hash_password
 from app.models.auth import User
 from app.models.ipam import IPAddress, IPBlock, IPSpace, Subnet
-from app.models.multicast import MulticastGroup
+from app.models.multicast import MulticastGroup, MulticastMembership
 
 
 async def _make_admin(db: AsyncSession) -> tuple[User, str]:
@@ -522,6 +522,155 @@ async def test_bulk_allocate_rejects_unicast_start(
     )
     assert resp.status_code == 422
     assert any("224.0.0.0/4" in str(item) for item in resp.json()["detail"])
+
+
+# ── Memberships-by-IP cross-group lookup ──────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_memberships_by_ip_returns_joined_group_info(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    _, token = await _make_admin(db_session)
+    space = await _make_space(db_session)
+    ip = await _make_ip(db_session, space, "10.0.0.50")
+
+    g1 = MulticastGroup(
+        space_id=space.id,
+        address="239.10.10.1",
+        name="cam-1",
+        application="video",
+    )
+    g2 = MulticastGroup(
+        space_id=space.id,
+        address="239.10.10.2",
+        name="cam-2",
+        application="audio",
+    )
+    db_session.add_all([g1, g2])
+    await db_session.flush()
+
+    db_session.add_all(
+        [
+            MulticastMembership(group_id=g1.id, ip_address_id=ip.id, role="producer"),
+            MulticastMembership(group_id=g2.id, ip_address_id=ip.id, role="consumer"),
+        ]
+    )
+    await db_session.commit()
+
+    headers = {"Authorization": f"Bearer {token}"}
+    resp = await client.get(
+        f"/api/v1/multicast/memberships?ip_address_id={ip.id}",
+        headers=headers,
+    )
+    assert resp.status_code == 200, resp.text
+    rows = resp.json()
+    assert len(rows) == 2
+    # Ordered by address asc — cam-1 first.
+    assert rows[0]["group_address"] == "239.10.10.1"
+    assert rows[0]["group_name"] == "cam-1"
+    assert rows[0]["group_application"] == "video"
+    assert rows[0]["role"] == "producer"
+    assert rows[1]["group_address"] == "239.10.10.2"
+    assert rows[1]["role"] == "consumer"
+
+
+@pytest.mark.asyncio
+async def test_memberships_by_ip_for_unseen_ip_returns_empty(
+    client: AsyncClient, db_session: AsyncSession
+) -> None:
+    _, token = await _make_admin(db_session)
+    headers = {"Authorization": f"Bearer {token}"}
+    await db_session.commit()
+
+    resp = await client.get(
+        f"/api/v1/multicast/memberships?ip_address_id={uuid.uuid4()}",
+        headers=headers,
+    )
+    assert resp.status_code == 200
+    assert resp.json() == []
+
+
+# ── Conformity: no_multicast_collision ────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_no_multicast_collision_check_passes_for_unique_address(
+    db_session: AsyncSession,
+) -> None:
+    from datetime import UTC
+    from datetime import datetime as _dt
+
+    from app.services.conformity.checks import check_no_multicast_collision
+
+    space = await _make_space(db_session)
+    group = MulticastGroup(space_id=space.id, address="239.50.50.50", name="lonely")
+    db_session.add(group)
+    await db_session.flush()
+
+    outcome = await check_no_multicast_collision(
+        db_session,
+        target=group,
+        target_kind="multicast_group",
+        args={},
+        now=_dt.now(UTC),
+    )
+    assert outcome.status == "pass"
+
+
+@pytest.mark.asyncio
+async def test_no_multicast_collision_check_fails_when_dup_in_same_space(
+    db_session: AsyncSession,
+) -> None:
+    from datetime import UTC
+    from datetime import datetime as _dt
+
+    from app.services.conformity.checks import check_no_multicast_collision
+
+    space = await _make_space(db_session)
+    g1 = MulticastGroup(space_id=space.id, address="239.99.99.99", name="a")
+    g2 = MulticastGroup(space_id=space.id, address="239.99.99.99", name="b")
+    db_session.add_all([g1, g2])
+    await db_session.flush()
+
+    outcome = await check_no_multicast_collision(
+        db_session,
+        target=g1,
+        target_kind="multicast_group",
+        args={},
+        now=_dt.now(UTC),
+    )
+    assert outcome.status == "fail"
+    assert "239.99.99.99" in outcome.detail
+    assert str(g2.id) in outcome.diagnostic["colliding_group_ids"]
+
+
+@pytest.mark.asyncio
+async def test_no_multicast_collision_check_passes_across_spaces(
+    db_session: AsyncSession,
+) -> None:
+    """Same address in two *different* spaces is allowed — the
+    collision rule is scoped per-space."""
+    from datetime import UTC
+    from datetime import datetime as _dt
+
+    from app.services.conformity.checks import check_no_multicast_collision
+
+    space_a = await _make_space(db_session, "A")
+    space_b = await _make_space(db_session, "B")
+    g_a = MulticastGroup(space_id=space_a.id, address="239.42.0.1", name="a")
+    g_b = MulticastGroup(space_id=space_b.id, address="239.42.0.1", name="b")
+    db_session.add_all([g_a, g_b])
+    await db_session.flush()
+
+    outcome = await check_no_multicast_collision(
+        db_session,
+        target=g_a,
+        target_kind="multicast_group",
+        args={},
+        now=_dt.now(UTC),
+    )
+    assert outcome.status == "pass"
 
 
 # ── Feature-module gate ───────────────────────────────────────────────
