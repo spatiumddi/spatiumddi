@@ -25,6 +25,7 @@ from app.api.v1.dns.agents import router as dns_agents_router
 from app.api.v1.dns.blocklist_router import router as dns_blocklist_router
 from app.api.v1.dns.pool_router import router as dns_pool_router
 from app.api.v1.dns.router import router as dns_router
+from app.api.v1.dns_import.router import router as dns_import_router
 from app.api.v1.dns_tools import router as dns_tools_router
 from app.api.v1.docker import router as docker_router
 from app.api.v1.domains import router as domains_router
@@ -117,6 +118,12 @@ api_v1_router.include_router(diagnostics_router, prefix="/diagnostics", tags=["d
 api_v1_router.include_router(dns_router, prefix="/dns", tags=["dns"])
 api_v1_router.include_router(dns_agents_router, prefix="/dns", tags=["dns-agents"])
 api_v1_router.include_router(dns_blocklist_router, prefix="/dns", tags=["dns-blocklists"])
+api_v1_router.include_router(
+    dns_import_router,
+    prefix="/dns/import",
+    tags=["dns-import"],
+    dependencies=[Depends(require_module("dns.import"))],
+)
 api_v1_router.include_router(dns_pool_router, prefix="/dns", tags=["dns-pools"])
 api_v1_router.include_router(dns_tools_router, prefix="/dns", tags=["dns-tools"])
 api_v1_router.include_router(

@@ -20,8 +20,11 @@ from .canonical import (
     ImportSource,
     ZoneConflict,
 )
+from .commit import CommitResult, CommitZoneResult, commit_import, detect_conflicts
 
 __all__ = [
+    "CommitResult",
+    "CommitZoneResult",
     "ConflictAction",
     "ImportedRecord",
     "ImportedSOA",
@@ -30,5 +33,7 @@ __all__ = [
     "ImportSource",
     "ImportSourceError",
     "ZoneConflict",
+    "commit_import",
+    "detect_conflicts",
     "parse_bind9_archive",
 ]
