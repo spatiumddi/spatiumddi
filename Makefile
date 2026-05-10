@@ -178,7 +178,7 @@ appliance-iso:
 	fi; \
 	iso=$${raw%.raw}.iso; \
 	echo "→ Wrapping $$raw → $$iso (hybrid USB/CD)…"; \
-	docker run --rm \
+	docker run --rm --privileged \
 	    --entrypoint /work/scripts/wrap-iso.sh \
 	    -v $(PWD)/$(APPLIANCE_DIR):/work \
 	    $(APPLIANCE_BUILDER) \

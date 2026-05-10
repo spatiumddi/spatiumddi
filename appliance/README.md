@@ -71,34 +71,37 @@ make appliance-builder                                   # builds spatiumddi-app
 make appliance APPLIANCE_BUILDER=spatiumddi-appliance-builder:dev
 ```
 
-### Phase 2 — hybrid USB/CD ISO
+### Phase 2 — tri-mode hybrid live ISO
 
-After Phase 1 produces a raw image, wrap it as a hybrid ISO:
+After Phase 1 produces a raw image, wrap it as a hybrid live ISO:
 
 ```sh
 make appliance-iso
 ```
 
-Output: `appliance/build/spatiumddi-appliance_0.1.0.iso` (~2.1 GiB —
-ISOs don't compress, the Phase 1 qcow2's compression is lost on wrap).
+Output: `appliance/build/spatiumddi-appliance_0.1.0.iso` (~260 MiB —
+the rootfs is squashfs-compressed with xz, much smaller than the
+underlying raw).
 
-The ISO has a hybrid GPT layout (verified with `fdisk -l`):
-- Partition 1 (~70 KiB): ISO9660 metadata
-- Partition 2 (~2.1 GiB): EFI System partition holding the entire Phase 1 raw image
-- Partition 3 (~300 KiB): GPT backup tail
+The script extracts the kernel + initrd that mkosi staged alongside
+the raw, mounts the raw's root partition by GPT type GUID
+(`4F68BCE3-…` = root-x86-64), builds a squashfs of it, and drives
+`grub-mkrescue` to produce a tri-mode hybrid ISO:
 
-Boots in:
-- **UEFI** mode (firmware reads GPT, finds the EFI System partition,
-  chains into the appliance's grub) — Hyper-V, modern QEMU, AWS/Azure,
-  most post-2012 hypervisors
-- **USB** when `dd`'d (`sudo dd if=spatiumddi-appliance_0.1.0.iso of=/dev/sdX bs=4M conv=fsync`)
-- **Hypervisors with UEFI CSM** (almost all of them) — Proxmox, VMware
+| Boot path     | Mechanism                                           |
+|---            |---                                                  |
+| BIOS-CD       | El Torito → `boot/grub/i386-pc/eltorito.img`        |
+| UEFI-CD       | El Torito alt-boot → `/efi.img` (FAT ESP with grub) |
+| USB-`dd`'d    | Hybrid MBR + GPT, boots via either MBR (BIOS) or GPT (UEFI) |
 
-Phase 2.x gap: classic El Torito BIOS-CD boot needs kernel + initrd +
-grub.cfg copied into the ISO9660 tree as a separate boot image (`-b`
-in xorriso). xorriso refuses `-isohybrid-mbr` + `-append_partition`
-together, so we either wrap the raw (current — UEFI/USB only) or
-build a true live ISO from scratch with squashfs (later).
+At runtime, **live-boot** (baked into the appliance's initrd by
+`mkosi.conf` Packages=) detects the boot medium, loop-mounts
+`/live/filesystem.squashfs` from the ISO, and overlays it with a
+tmpfs so writes work in RAM. The `spatiumddi-firstboot` service
+then runs the same way as on the qcow2 (docker compose up, wait for
+`/health/live`).
+
+Verify the boot records with `xorriso -indev <iso> -report_el_torito plain`.
 
 ### Cleaning
 
@@ -179,8 +182,6 @@ To pin a release tag instead of `:latest`, drop a
 
 Tracked in [#134](https://github.com/spatiumddi/spatiumddi/issues/134):
 
-- **Classic El Torito BIOS-CD boot** (Phase 2.x) — current ISO is
-  UEFI/USB hybrid, doesn't boot on pure-BIOS-CD hypervisors
 - **arm64 / Raspberry Pi** (Phase 3) — builder image is amd64-only
 - **Role-split images** (Phase 4) — single all-in-one only
 - **Cloud images** (Phase 5) — no AWS/Azure/GCP datasource testing

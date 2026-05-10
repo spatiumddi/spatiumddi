@@ -45,12 +45,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         systemd-ukify \
         grub2-common \
         grub-pc-bin \
-        # Phase 2 — hybrid ISO wrapping. xorriso for the ISO9660 +
-        # GPT layout, isolinux for the BIOS isohybrid MBR
-        # (`/usr/lib/ISOLINUX/isohdpfx.bin`), mtools for accessing
-        # the FAT-formatted ESP partition during wrap.
+        grub-efi-amd64-bin \
+        # Phase 2 — true hybrid live ISO. grub-mkrescue (in
+        # grub-common) builds the ISO with BIOS El Torito + UEFI El
+        # Torito + USB-dd-bootable hybrid MBR. grub-pc-bin supplies
+        # the i386-pc modules + BIOS eltorito.img. grub-efi-amd64-bin
+        # supplies the x86_64-efi modules for the UEFI El Torito
+        # image. squashfs-tools for the rootfs filesystem; xorriso is
+        # the actual ISO writer.
         xorriso \
-        isolinux \
+        squashfs-tools \
+        # mtools provides mformat — grub-mkrescue uses it to build
+        # the FAT12 ESP image embedded as the UEFI El Torito boot
+        # image. Without it the ISO produces no UEFI boot path.
         mtools \
     && rm -rf /var/lib/apt/lists/*
 
