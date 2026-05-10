@@ -1,5 +1,6 @@
 .PHONY: help up down dev build migrate lint test lint-backend lint-frontend test-backend \
-        ci ci-backend-lint ci-frontend-lint ci-frontend-build screenshots
+        ci ci-backend-lint ci-frontend-lint ci-frontend-build screenshots \
+        appliance appliance-builder appliance-clean
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 COMPOSE        = docker compose
@@ -20,6 +21,7 @@ help:
 	@echo "  make test        Run backend tests against a live DB"
 	@echo "  make ci          Run the exact same lint + typecheck + build jobs CI runs"
 	@echo "  make screenshots Re-capture docs/assets/screenshots/ via headless chromium"
+	@echo "  make appliance   Build the OS-appliance qcow2 (Phase 1 — Alpine amd64)"
 	@echo ""
 
 # ── Stack ──────────────────────────────────────────────────────────────────────
@@ -110,3 +112,62 @@ screenshots:
 	@test -d scripts/screenshots/node_modules || \
 	  (cd scripts/screenshots && npm install --no-audit --no-fund)
 	node scripts/screenshots/capture.mjs $(SCREENSHOT_ARGS)
+
+# ── OS Appliance (Phase 1: Debian 13 amd64 qcow2 MVP) ──────────────────────────
+# See appliance/README.md for the full design + prereqs.
+#
+# The build runs inside a published builder container so the only host
+# requirement is Docker. Override APPLIANCE_BUILDER to point at a
+# locally-built image (e.g. for iterating on appliance/builder/Dockerfile):
+#   make appliance APPLIANCE_BUILDER=spatiumddi-appliance-builder:dev
+APPLIANCE_DIR     = appliance
+APPLIANCE_OUT     = $(APPLIANCE_DIR)/build
+# mkosi names the output `<ImageId>_<ImageVersion>.raw` — derive both
+# at runtime from whatever appears in build/ so a version bump in
+# mkosi.conf doesn't break the Makefile.
+APPLIANCE_BUILDER = ghcr.io/spatiumddi/appliance-builder:latest
+
+appliance:
+	@command -v docker >/dev/null || \
+	  (echo "docker not found — the appliance build runs inside a container"; exit 1)
+	mkdir -p $(APPLIANCE_OUT)
+	@echo "→ Pulling builder image $(APPLIANCE_BUILDER)…"
+	@docker pull $(APPLIANCE_BUILDER) 2>/dev/null || \
+	  echo "  (couldn't pull — assuming a local image with that tag exists)"
+	@echo "→ Building appliance image (this takes ~5–10 min)…"
+	docker run --rm --privileged \
+	    -v $(PWD)/$(APPLIANCE_DIR):/work \
+	    $(APPLIANCE_BUILDER) \
+	    --output-directory=build --force build
+	@raw=$$(ls $(APPLIANCE_OUT)/spatiumddi-appliance*.raw 2>/dev/null | head -1); \
+	if [ -n "$$raw" ]; then \
+	  qcow2=$${raw%.raw}.qcow2; \
+	  echo "→ Converting raw → qcow2…"; \
+	  docker run --rm --entrypoint qemu-img \
+	      -v $(PWD)/$(APPLIANCE_OUT):/build \
+	      $(APPLIANCE_BUILDER) \
+	      convert -O qcow2 "/build/$$(basename $$raw)" "/build/$$(basename $$qcow2)"; \
+	  ls -lh "$$qcow2"; \
+	  echo ""; \
+	  echo "✓ Built: $$qcow2"; \
+	  echo "  Boot it with: qemu-system-x86_64 -enable-kvm -m 4G -smp 2 \\"; \
+	  echo "                -drive file=$$qcow2,if=virtio \\"; \
+	  echo "                -nic user,hostfwd=tcp::8080-:80,hostfwd=tcp::2222-:22"; \
+	else \
+	  echo "✗ mkosi did not produce a .raw file in $(APPLIANCE_OUT) — check the log above."; \
+	  exit 1; \
+	fi
+
+# Build the builder container locally (e.g. when iterating on its
+# Dockerfile before pushing to ghcr.io).
+appliance-builder:
+	docker build -t spatiumddi-appliance-builder:dev $(APPLIANCE_DIR)/builder
+	@echo ""
+	@echo "✓ Built: spatiumddi-appliance-builder:dev"
+	@echo "  Use it via: make appliance APPLIANCE_BUILDER=spatiumddi-appliance-builder:dev"
+
+appliance-clean:
+	@if [ -d $(APPLIANCE_OUT) ]; then \
+	  echo "Removing $(APPLIANCE_OUT) (may need sudo — mkosi outputs are root-owned)"; \
+	  rm -rf $(APPLIANCE_OUT) 2>/dev/null || sudo rm -rf $(APPLIANCE_OUT); \
+	fi

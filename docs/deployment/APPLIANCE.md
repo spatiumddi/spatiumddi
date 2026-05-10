@@ -8,13 +8,21 @@ SpatiumDDI can be shipped as a **self-contained OS appliance image** — a boota
 
 ## 1. Base OS Selection
 
-### Decision: Dual-track approach
+### Decision (2026-05): Debian for the appliance, Alpine for containers
 
 | Use Case | Base OS | Rationale |
 |---|---|---|
 | **Container images** (Docker/K8s) | Alpine Linux 3.x | Minimal footprint (~5MB base), musl libc, APK packages, Docker-native |
-| **Bare-metal / VM appliance ISO** | Debian 12 "Bookworm" (Stable) | Broad hardware support, glibc, mature installer, LTS support, wide driver coverage |
-| **VM appliance (lightweight)** | Alpine Linux 3.x | When minimal footprint matters more than hardware compatibility |
+| **OS appliance** (qcow2 / ISO / cloud) | **Debian 13 "Trixie" (Stable)** | mkosi-supported (Alpine support was dropped from mkosi ≥ 23), broad hardware support, mature installer, glibc, systemd-native |
+
+The earlier "dual-track Alpine + Debian" plan got narrowed once the
+build tool was chosen. mkosi 25 (current Debian-trixie package)
+dropped Alpine as a supported `Distribution=`, and the alternatives
+(`alpine-make-vm-image`, raw `mkimage.sh`) would have meant carrying
+two divergent build pipelines for the same artifact set. Debian gives
+us one toolchain across qcow2 / ISO / cloud images and aligns with
+APPLIANCE.md's pre-existing Option B. The **bundled service
+containers stay Alpine-based** — only the appliance host OS shifts.
 
 ---
 
@@ -103,7 +111,7 @@ SpatiumDDI can be shipped as a **self-contained OS appliance image** — a boota
 
 ## 3. Appliance Build Process
 
-### Build Tool: `mkosi` (systemd project, works for both Debian and Alpine)
+### Build tool: `mkosi` (systemd project)
 
 `mkosi` produces reproducible OS images from a declarative config. It handles:
 - Base OS package installation
@@ -111,37 +119,92 @@ SpatiumDDI can be shipped as a **self-contained OS appliance image** — a boota
 - First-boot setup scripts
 - Image format conversion
 
-### Build Pipeline (GitHub Actions)
+### Build runs inside a published builder container
+
+The build's host dependencies (mkosi, qemu-utils, debian-archive-keyring,
+grub-pc-bin + grub-efi-amd64-bin, python3-cryptography, …) live inside
+`ghcr.io/spatiumddi/appliance-builder:latest`. The only host requirement
+for `make appliance` is **Docker with privileged-container support**.
+mkosi needs loop devices + namespaces + bind-mounts to bootstrap the
+rootfs — same constraint as `packer`, `live-build`, `diskimage-builder`.
+
+The builder image's `Dockerfile` lives at `appliance/builder/Dockerfile`
+and republishes via `.github/workflows/build-appliance-builder.yml` on
+changes to `appliance/builder/**`.
+
+### Phase 1 (current — landed 2026-05)
 
 ```
-trigger: tag push (v*.*.*)
+make appliance
   ↓
-1. Build Docker images (Alpine-based)
-   - ghcr.io/spatiumddi/api:v*
-   - ghcr.io/spatiumddi/worker:v*
-   - ghcr.io/spatiumddi/agent:v*
+docker pull ghcr.io/spatiumddi/appliance-builder:latest
   ↓
-2. Build Alpine appliance (VM + ISO)
-   - Run mkosi with Alpine config
-   - Produces: spatiumddi-alpine-*.iso, spatiumddi-alpine-*.qcow2
+docker run --privileged appliance-builder
+  → mkosi build → spatiumddi-appliance_0.1.0.raw   (2.1 GiB sparse)
   ↓
-3. Build Debian appliance (VM + ISO)
-   - Run mkosi with Debian config
-   - Produces: spatiumddi-debian-*.iso, spatiumddi-debian-*.qcow2
+qemu-img convert -O qcow2
+  → spatiumddi-appliance_0.1.0.qcow2  (~790 MiB)
+```
+
+Hybrid BIOS + UEFI boot via grub (`Bootable=yes`, `Bootloader=grub`,
+`BiosBootloader=grub`). Same qcow2 boots on default-firmware QEMU/Proxmox
+*and* UEFI Hyper-V/AWS/Azure.
+
+### Future build pipeline (Phases 2–5)
+
+```
+trigger: tag push (CalVer)
   ↓
-4. Convert formats
+1. Reuse the existing image-build workflows
+   - ghcr.io/spatiumddi/spatiumddi-api:<calver>
+   - ghcr.io/spatiumddi/spatiumddi-frontend:<calver>
+   - ghcr.io/spatiumddi/dns-{bind9,powerdns}:<calver>
+   - ghcr.io/spatiumddi/dhcp-kea:<calver>
+  ↓
+2. Build appliance images via the builder container
+   - Phase 1: amd64 qcow2 (all-in-one)
+   - Phase 2: amd64 ISO installer
+   - Phase 3: arm64 qcow2 + Raspberry Pi image
+   - Phase 4: role-split (control / dns / dhcp)
+   - Phase 5: cloud variants (AWS AMI / Azure VHD / GCP raw)
+  ↓
+3. Convert formats
    - qcow2 → vmdk, vhd, ova
   ↓
-5. Sign images (GPG)
+4. Sign images (cosign + GPG)
   ↓
-6. Publish to GitHub Releases + object storage
+5. Publish to GitHub Releases + object storage (Cloudflare R2)
 ```
 
 ---
 
 ## 4. Appliance First-Boot Setup
 
-On first boot, the appliance runs an interactive **first-boot wizard** (served via the web UI on port 80 before TLS is configured):
+### Phase 1 (current): headless via cloud-init NoCloud
+
+Phase 1 ships with `cloud-init` enabled and the NoCloud datasource
+active. Operators drop a CIDATA ISO with `user-data` + `meta-data`,
+attach it as a secondary drive, and the appliance configures itself
+on first power-on.
+
+The `spatiumddi-firstboot.service` systemd unit runs after
+`cloud-final.service`:
+
+1. Generates `/etc/spatiumddi/.env` (POSTGRES_PASSWORD, SECRET_KEY,
+   CREDENTIAL_ENCRYPTION_KEY, DNS_AGENT_KEY, DHCP_AGENT_KEY) on first
+   run only — preserved across reboots.
+2. `docker-compose pull` (first run) + `docker-compose up -d`.
+3. Polls `http://127.0.0.1:8000/health/live` for up to 5 min.
+
+Default web-UI login is `admin / admin` with `force_password_change=True`.
+
+Recipe + examples: `appliance/cloud-init/README.md` and
+`appliance/cloud-init/user-data.example`.
+
+### Future: interactive first-boot wizard (Phase 1.x)
+
+For operators with console access (no cloud-init datasource), an
+interactive wizard served on port 80 before TLS is configured:
 
 **Step 1: Network Configuration**
 - Interface selection

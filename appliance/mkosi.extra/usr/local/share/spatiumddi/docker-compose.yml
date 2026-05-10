@@ -1,0 +1,163 @@
+# SpatiumDDI all-in-one appliance compose stack.
+#
+# Lives at /usr/local/share/spatiumddi/docker-compose.yml in the
+# appliance image. The first-boot orchestrator (`spatiumddi-firstboot`)
+# generates /etc/spatiumddi/.env on first power-on and symlinks it in
+# as ./.env so the variable substitutions below resolve.
+#
+# Operators editing this file should keep the deltas surgical — the
+# appliance image rebuild flow expects this layout to track the
+# top-level docker-compose.yml in tag-for-tag releases.
+
+name: spatiumddi
+
+services:
+
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    networks: [spatiumddi]
+    environment:
+      POSTGRES_USER: spatiumddi
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: spatiumddi
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U spatiumddi"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    networks: [spatiumddi]
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  migrate:
+    image: ghcr.io/spatiumddi/spatiumddi-api:${SPATIUMDDI_VERSION:-latest}
+    networks: [spatiumddi]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://spatiumddi:${POSTGRES_PASSWORD}@postgres:5432/spatiumddi
+      SECRET_KEY: ${SECRET_KEY}
+      CREDENTIAL_ENCRYPTION_KEY: ${CREDENTIAL_ENCRYPTION_KEY}
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    image: ghcr.io/spatiumddi/spatiumddi-api:${SPATIUMDDI_VERSION:-latest}
+    restart: unless-stopped
+    networks: [spatiumddi]
+    ports: ["8000:8000"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://spatiumddi:${POSTGRES_PASSWORD}@postgres:5432/spatiumddi
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      SECRET_KEY: ${SECRET_KEY}
+      CREDENTIAL_ENCRYPTION_KEY: ${CREDENTIAL_ENCRYPTION_KEY}
+      DNS_AGENT_KEY: ${DNS_AGENT_KEY}
+      DHCP_AGENT_KEY: ${DHCP_AGENT_KEY}
+      VERSION: ${SPATIUMDDI_VERSION:-latest}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  worker:
+    image: ghcr.io/spatiumddi/spatiumddi-api:${SPATIUMDDI_VERSION:-latest}
+    restart: unless-stopped
+    networks: [spatiumddi]
+    command: ["celery", "-A", "app.celery_app", "worker", "-l", "info"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://spatiumddi:${POSTGRES_PASSWORD}@postgres:5432/spatiumddi
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      SECRET_KEY: ${SECRET_KEY}
+      CREDENTIAL_ENCRYPTION_KEY: ${CREDENTIAL_ENCRYPTION_KEY}
+      DNS_AGENT_KEY: ${DNS_AGENT_KEY}
+      DHCP_AGENT_KEY: ${DHCP_AGENT_KEY}
+    depends_on:
+      api:
+        condition: service_started
+
+  beat:
+    image: ghcr.io/spatiumddi/spatiumddi-api:${SPATIUMDDI_VERSION:-latest}
+    restart: unless-stopped
+    networks: [spatiumddi]
+    command: ["celery", "-A", "app.celery_app", "beat", "-l", "info"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://spatiumddi:${POSTGRES_PASSWORD}@postgres:5432/spatiumddi
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      SECRET_KEY: ${SECRET_KEY}
+      CREDENTIAL_ENCRYPTION_KEY: ${CREDENTIAL_ENCRYPTION_KEY}
+    depends_on:
+      api:
+        condition: service_started
+
+  frontend:
+    image: ghcr.io/spatiumddi/spatiumddi-frontend:${SPATIUMDDI_VERSION:-latest}
+    restart: unless-stopped
+    networks: [spatiumddi]
+    ports: ["80:80"]
+    depends_on:
+      api:
+        condition: service_started
+
+  # ── DNS (BIND9) — default profile ───────────────────────────────────────────
+  dns-bind9:
+    profiles: ["dns"]
+    image: ghcr.io/spatiumddi/dns-bind9:${SPATIUMDDI_VERSION:-latest}
+    restart: unless-stopped
+    networks: [spatiumddi]
+    ports:
+      - "53:53/udp"
+      - "53:53/tcp"
+    environment:
+      CONTROL_PLANE_URL: http://api:8000
+      DNS_AGENT_KEY: ${DNS_AGENT_KEY}
+    volumes:
+      - dns_bind9_data:/var/lib/spatium-dns-agent
+    depends_on:
+      api:
+        condition: service_started
+
+  # ── DHCP (Kea) — default profile ────────────────────────────────────────────
+  dhcp-kea:
+    profiles: ["dhcp"]
+    image: ghcr.io/spatiumddi/dhcp-kea:${SPATIUMDDI_VERSION:-latest}
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      CONTROL_PLANE_URL: http://127.0.0.1:8000
+      DHCP_AGENT_KEY: ${DHCP_AGENT_KEY}
+    volumes:
+      - dhcp_kea_data:/var/lib/spatium-dhcp-agent
+    depends_on:
+      api:
+        condition: service_started
+
+networks:
+  spatiumddi:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  dns_bind9_data:
+  dhcp_kea_data:

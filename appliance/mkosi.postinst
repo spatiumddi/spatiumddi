@@ -1,0 +1,58 @@
+#!/bin/sh
+# mkosi post-install hook — runs once after package installation.
+# Enables systemd services + applies hardening from
+# docs/deployment/APPLIANCE.md §7.
+#
+# mkosi 25 runs scripts in a sandbox where the host filesystem is
+# read-only and the image rootfs is exposed at $BUILDROOT. All paths
+# below must be prefixed accordingly. (Earlier mkosi versions ran
+# scripts inside chroot which is why some examples online use bare
+# paths — those don't work here.)
+set -eu
+
+[ -n "${BUILDROOT:-}" ] || { echo "BUILDROOT not set"; exit 1; }
+
+# ── Service enablement ────────────────────────────────────────────────────────
+# Manual multi-user.target.wants/ symlinks. cloud-init enables itself
+# via Debian's debhelper preset during package install (visible as
+# "Created symlink ..." lines in the build log) — no work needed here
+# for cloud-init-local / cloud-init / cloud-config / cloud-final.
+mkdir -p "$BUILDROOT/etc/systemd/system/multi-user.target.wants"
+for unit in docker.service chrony.service ssh.service \
+            spatiumddi-firstboot.service; do
+    src=
+    for candidate in /lib/systemd/system /etc/systemd/system /usr/lib/systemd/system; do
+        if [ -f "$BUILDROOT$candidate/$unit" ]; then
+            src="$candidate/$unit"
+            break
+        fi
+    done
+    if [ -z "$src" ]; then
+        echo "WARN: $unit not found in image — service won't auto-start." >&2
+        continue
+    fi
+    ln -sfn "$src" "$BUILDROOT/etc/systemd/system/multi-user.target.wants/$unit"
+done
+
+# ── Hardening (subset of APPLIANCE.md §7 — full pass in Phase 1.x) ────────────
+# Disable root SSH login, key-only auth.
+sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin no/' "$BUILDROOT/etc/ssh/sshd_config"
+sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' "$BUILDROOT/etc/ssh/sshd_config"
+
+# /tmp as tmpfs.
+if ! grep -q '^tmpfs /tmp ' "$BUILDROOT/etc/fstab" 2>/dev/null; then
+    echo 'tmpfs /tmp tmpfs nosuid,nodev,noexec,mode=1777 0 0' >> "$BUILDROOT/etc/fstab"
+fi
+
+# ASLR.
+echo 'kernel.randomize_va_space = 2' > "$BUILDROOT/etc/sysctl.d/99-spatiumddi.conf"
+
+# Make first-boot orchestrator + helpers executable.
+chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-firstboot"
+chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-stack-status"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-firstboot.service"
+
+# State directories owned by the spatiumddi-firstboot service.
+install -d -m 0755 "$BUILDROOT/etc/spatiumddi"
+install -d -m 0755 "$BUILDROOT/var/lib/spatiumddi"
+install -d -m 0755 "$BUILDROOT/var/log/spatiumddi"

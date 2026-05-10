@@ -1,0 +1,18 @@
+[Unit]
+Description=SpatiumDDI appliance first-boot orchestrator + stack supervisor
+After=docker.service network-online.target cloud-final.service
+Wants=docker.service network-online.target cloud-final.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStartSec=10min
+ExecStart=/usr/local/bin/spatiumddi-firstboot
+ExecStop=/bin/sh -c 'cd /usr/local/share/spatiumddi && /usr/bin/docker-compose down --remove-orphans'
+# Log routing: the firstboot script self-redirects to
+# /var/log/spatiumddi/firstboot.log via `exec >>`. We don't double-capture
+# here so the file isn't written twice. `journalctl -u spatiumddi-firstboot`
+# still shows systemd's start/stop transitions.
+
+[Install]
+WantedBy=multi-user.target

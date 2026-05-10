@@ -1,0 +1,19 @@
+# mkosi build outputs.
+build/
+*.raw
+*.qcow2
+*.vhd
+*.vmdk
+*.iso
+*.tar.zst
+*.manifest
+
+# Generated cloud-init seed.
+cloud-init/cidata.iso
+cloud-init/user-data
+cloud-init/meta-data
+
+# mkosi caches.
+.mkosi-*/
+mkosi.cache/
+mkosi.workspace/

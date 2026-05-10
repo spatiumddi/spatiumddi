@@ -1,0 +1,18 @@
+
+  ____             _   _                  ____  ____  ___
+ / ___| _ __   __ _| |_(_)_   _ _ __ ___ |  _ \|  _ \|_ _|
+ \___ \| '_ \ / _` | __| | | | | '_ ` _ \| |_) | | | || |
+  ___) | |_) | (_| | |_| | |_| | | | | | |  __/| |_| || |
+ |____/| .__/ \__,_|\__|_|\__,_|_| |_| |_|_|   |____/|___|
+       |_|
+
+ SpatiumDDI Appliance — all-in-one DDI control plane.
+
+ First commands:
+   spatiumddi-stack-status         service rollup
+   docker compose -f /usr/local/share/spatiumddi/docker-compose.yml logs
+   tail -f /var/log/spatiumddi/firstboot.log
+
+ Web UI:  http://<appliance-ip>/    (default: admin / admin, force-change on first login)
+ Docs:    https://spatiumddi.github.io/spatiumddi/
+

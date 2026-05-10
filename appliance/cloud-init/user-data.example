@@ -1,0 +1,61 @@
+#cloud-config
+# SpatiumDDI Appliance — NoCloud user-data example.
+#
+# Pair with meta-data.example, pack into a CIDATA ISO with:
+#
+#   genisoimage -output cidata.iso -volid CIDATA -joliet -rock \
+#               user-data meta-data
+#
+# then attach the ISO as a second drive in your hypervisor (Proxmox /
+# QEMU / libvirt / VMware all support this). On first boot cloud-init
+# reads it from the NoCloud datasource and applies the config below.
+
+hostname: spatiumddi
+manage_etc_hosts: true
+timezone: UTC
+
+# ── Operator account (for SSH access) ─────────────────────────────────────────
+# Root SSH login is disabled out of the box. Create a sudo-able admin
+# user with your SSH key here.
+users:
+  - name: admin
+    groups: [wheel, docker]
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    lock_passwd: true
+    ssh_authorized_keys:
+      # - ssh-ed25519 AAAA... operator@laptop
+
+# ── Optional: pin a SpatiumDDI release tag ────────────────────────────────────
+# Without this, the appliance pulls :latest on first boot. For
+# production use, pin to a known-good CalVer tag.
+#
+# write_files:
+#   - path: /etc/spatiumddi/release
+#     permissions: '0644'
+#     content: |
+#       SPATIUMDDI_VERSION=2026.05.07-1
+
+# ── Optional: distributed agent appliance ─────────────────────────────────────
+# Phase 4 of the appliance roadmap (not Phase 1). Placeholder for
+# forward-compat — point a DNS-only or DHCP-only appliance at an
+# external control plane.
+#
+# write_files:
+#   - path: /etc/spatiumddi/agent.env
+#     permissions: '0600'
+#     content: |
+#       APPLIANCE_ROLE=dns
+#       CONTROL_PLANE_URL=https://spatiumddi.example.com
+#       DNS_AGENT_KEY=<paste-key-from-control-plane>
+
+# ── First-boot behaviour ──────────────────────────────────────────────────────
+# Nothing else required. The spatiumddi-firstboot OpenRC service runs
+# automatically after cloud-final, generates secrets, brings the docker
+# compose stack up, and waits for the control plane to answer
+# /health/live. Watch progress with:
+#
+#   tail -f /var/log/spatiumddi/firstboot.log
+#
+# Default web-UI login: admin / admin (forces password change on first
+# login).
