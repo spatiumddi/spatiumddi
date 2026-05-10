@@ -47,13 +47,32 @@ jobs:
             type=ref,event=tag
             type=sha,format=short
 
-      - name: Build and push
+      - name: Build (PR — single-arch, load locally for Trivy)
+        if: github.event_name == 'pull_request'
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: agent/dns/images/${{ matrix.flavor }}/Dockerfile
+          # Single-arch on PR: ``--load`` only accepts one platform,
+          # and the runner is amd64, so this is what fits in the
+          # local docker daemon. The release builds (push branch) do
+          # the multi-arch manifest list.
+          platforms: linux/amd64
+          push: false
+          load: true
+          tags: ghcr.io/spatiumddi/dns-${{ matrix.flavor }}:pr-scan
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=dns-${{ matrix.flavor }}
+          cache-to: type=gha,mode=max,scope=dns-${{ matrix.flavor }}
+
+      - name: Build and push (main / tag — multi-arch, push to ghcr)
+        if: github.event_name != 'pull_request'
         uses: docker/build-push-action@v5
         with:
           context: .
           file: agent/dns/images/${{ matrix.flavor }}/Dockerfile
           platforms: linux/amd64,linux/arm64
-          push: ${{ github.event_name != 'pull_request' }}
+          push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=dns-${{ matrix.flavor }}
@@ -63,7 +82,14 @@ jobs:
         if: github.event_name == 'pull_request'
         uses: aquasecurity/trivy-action@master
         with:
-          image-ref: ghcr.io/spatiumddi/dns-${{ matrix.flavor }}:${{ github.sha }}
+          # Reference the locally-loaded image from the PR build
+          # step above. Previously this referenced
+          # ``ghcr.io/...:${{ github.sha }}`` which is never produced
+          # — metadata-action emits ``sha-<short>``-prefixed tags,
+          # not raw full SHAs, and on PR the image isn't pushed at
+          # all. Trivy resolved the missing tag against ghcr and
+          # blew up with MANIFEST_UNKNOWN.
+          image-ref: ghcr.io/spatiumddi/dns-${{ matrix.flavor }}:pr-scan
           format: table
           severity: HIGH,CRITICAL
           # Fail the PR on any HIGH/CRITICAL CVE that has a fix

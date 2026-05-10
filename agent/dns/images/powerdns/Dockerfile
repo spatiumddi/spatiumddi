@@ -14,13 +14,18 @@ RUN python3 -m pip install --prefix=/install --no-cache-dir --break-system-packa
 FROM alpine:3.22 AS runtime
 # pdns + the LMDB backend; bind-tools only for `dig` so the smoke test
 # in agent-e2e.yml works against the PowerDNS pod the same way it
-# does against the BIND pod.
+# does against the BIND pod. ``libcap`` brings in ``setcap`` so we
+# can grant ``pdns_server`` CAP_NET_BIND_SERVICE — without it, the
+# unprivileged ``spatium`` user can't bind port 53 (the daemon starts
+# but silently fails on the privileged-port bind).
 RUN apk add --no-cache \
       pdns pdns-backend-lmdb \
       bind-tools \
       tini su-exec \
       python3 py3-pip \
+      libcap \
       ca-certificates tzdata \
+ && setcap cap_net_bind_service=+ep /usr/sbin/pdns_server \
  && addgroup -S spatium \
  && adduser -S -G spatium spatium \
  && mkdir -p /var/lib/spatium-dns-agent /var/lib/powerdns /var/run/pdns \

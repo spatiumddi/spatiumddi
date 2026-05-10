@@ -1,19 +1,32 @@
 {{- if .Values.migrate.enabled }}
-# Runs as a Helm hook before install + upgrade so migrations land
-# before the new API pods roll out.
+# Regular Job (no helm.sh/hook). The previous pre-install-hook design
+# raced the bundled postgresql subchart: hooks run before any subchart
+# resource is applied, so the migrate pod failed CreateContainerConfigError
+# trying to mount the not-yet-created <release>-postgresql Secret. The
+# install would then time out waiting for a hook that could never start.
+#
+# As a regular Job we land in normal apply order alongside the subchart;
+# the wait-for-postgres init container blocks until Postgres is accepting
+# connections, then alembic upgrade runs to head. api / worker / beat
+# carry a matching wait-for-migrate init container so their pods don't
+# come up before the schema lands.
+#
+# Job specs are immutable for fields like ``template`` after first
+# create. We sidestep that on ``helm upgrade`` by suffixing the name
+# with .Release.Revision so each install/upgrade creates a fresh Job.
+# Old Jobs (and their pods, with TTL) are garbage-collected by
+# ``ttlSecondsAfterFinished`` below — operators don't have to clean up
+# revisions manually.
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: {{ include "spatiumddi.fullname" . }}-migrate
+  name: {{ include "spatiumddi.fullname" . }}-migrate-r{{ .Release.Revision }}
   namespace: {{ .Release.Namespace }}
   labels:
     {{- include "spatiumddi.componentLabels" (merge (dict "component" "migrate") .) | nindent 4 }}
-  annotations:
-    "helm.sh/hook": pre-install,pre-upgrade
-    "helm.sh/hook-weight": "-5"
-    "helm.sh/hook-delete-policy": before-hook-creation,hook-succeeded
 spec:
   backoffLimit: {{ .Values.migrate.backoffLimit }}
+  ttlSecondsAfterFinished: {{ .Values.migrate.ttlSecondsAfterFinished | default 600 }}
   template:
     metadata:
       labels:
@@ -24,6 +37,8 @@ spec:
       imagePullSecrets:
         {{- toYaml . | nindent 8 }}
       {{- end }}
+      initContainers:
+        {{- include "spatiumddi.waitForPostgresInit" . | nindent 8 }}
       containers:
         - name: migrate
           image: {{ include "spatiumddi.image" (merge (dict "imageName" "spatiumddi-api") .) }}

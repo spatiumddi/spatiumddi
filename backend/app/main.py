@@ -268,6 +268,22 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await seed_audit_chain_alert_rule()
     except Exception as exc:  # noqa: BLE001
         logger.debug("audit_chain_alert_rule_seed_skipped", reason=str(exc))
+    # Backfill enclosing IPBlocks for any pre-existing multicast
+    # groups (issue #126 — IPAM-side rendering). Idempotent; only
+    # creates blocks where missing. Cheap enough to run on every
+    # boot since it's a single pass over ``multicast_group``.
+    try:
+        from app.db import AsyncSessionLocal  # noqa: PLC0415
+        from app.services.multicast.auto_block import (  # noqa: PLC0415
+            backfill_blocks_for_existing_groups,
+        )
+
+        async with AsyncSessionLocal() as session:
+            n = await backfill_blocks_for_existing_groups(session)
+        if n > 0:
+            logger.info("multicast_blocks_backfilled", created=n)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("multicast_block_backfill_skipped", reason=str(exc))
     # Demo-mode lockdown — force the restricted feature modules off
     # and mirror the integration toggles into PlatformSettings so the
     # beat reconcilers stop. Idempotent; failure-tolerant. The PATCH

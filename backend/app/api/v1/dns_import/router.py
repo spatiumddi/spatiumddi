@@ -26,9 +26,12 @@ from app.models.dns import DNSServer, DNSServerGroup
 from app.services.dns_import import (
     CommitResult,
     ImportSourceError,
+    PowerDNSImportError,
     WindowsDNSImportError,
     parse_bind9_archive,
+    parse_powerdns_server,
     parse_windows_dns_server,
+    test_powerdns_connection,
 )
 from app.services.dns_import.canonical import (
     ConflictAction,
@@ -145,6 +148,47 @@ class WindowsDNSServerOption(BaseModel):
     group_id: uuid.UUID
     group_name: str
     has_credentials: bool
+
+
+class PowerDNSPreviewIn(BaseModel):
+    """Body shape for ``POST /dns/import/powerdns/preview``.
+
+    PowerDNS imports target a *non-managed* upstream — the
+    operator is migrating *from* it, so we don't expect a
+    DNSServer row to exist for it. Credentials live in the body
+    and are read-once (never persisted).
+    """
+
+    api_url: str
+    api_key: str
+    server_name: str = "localhost"
+    target_group_id: uuid.UUID
+    target_view_id: uuid.UUID | None = None
+
+
+class PowerDNSTestIn(BaseModel):
+    """Body shape for ``POST /dns/import/powerdns/test-connection`` —
+    same auth fields as the preview body but without a target
+    group, since the test endpoint never touches the DB."""
+
+    api_url: str
+    api_key: str
+    server_name: str = "localhost"
+
+
+class PowerDNSTestOut(BaseModel):
+    """Response shape from ``POST /dns/import/powerdns/test-connection``.
+
+    Mirrors the PowerDNS server-info object's identifying fields
+    so the operator can confirm "yes, that's the daemon I expected"
+    before kicking off a 5000-zone pull.
+    """
+
+    type: str
+    id: str
+    daemon_type: str
+    version: str
+    url: str
 
 
 class CommitZoneOut(BaseModel):
@@ -519,6 +563,126 @@ async def windows_dns_commit(
 
     logger.info(
         "dns_import_windows_dns_commit",
+        target_group_id=str(body.target_group_id),
+        zones_created=result.total_zones_created,
+        zones_overwrote=result.total_zones_overwrote,
+        zones_renamed=result.total_zones_renamed,
+        zones_skipped=result.total_zones_skipped,
+        zones_failed=result.total_zones_failed,
+        records_created=result.total_records_created,
+        user=current_user.display_name,
+    )
+    return _commit_result_to_pydantic(result)
+
+
+# ── PowerDNS endpoints (Phase 3) ─────────────────────────────────────
+
+
+@router.post("/powerdns/test-connection", response_model=PowerDNSTestOut)
+async def powerdns_test_connection(
+    _: SuperAdmin,
+    body: PowerDNSTestIn = Body(...),
+) -> PowerDNSTestOut:
+    """Probe the PowerDNS REST API and return the daemon's
+    identifying info. Operator clicks this before kicking off a
+    full pull on a giant server."""
+
+    try:
+        info = await test_powerdns_connection(
+            api_url=body.api_url,
+            api_key=body.api_key,
+            server_name=body.server_name,
+        )
+    except PowerDNSImportError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+    return PowerDNSTestOut(**info)
+
+
+@router.post("/powerdns/preview", response_model=PreviewOut)
+async def powerdns_preview(
+    current_user: SuperAdmin,
+    db: DB,
+    body: PowerDNSPreviewIn = Body(...),
+) -> PreviewOut:
+    """Live-pull every zone + record from a PowerDNS REST API.
+
+    Credentials live in the body, never persisted. The pull is
+    blocking — a 500-zone server takes a few seconds; a 5000-zone
+    server takes minutes. Above 5000 the importer rejects the pull
+    and asks the operator to split the migration.
+    """
+
+    try:
+        preview = await parse_powerdns_server(
+            api_url=body.api_url,
+            api_key=body.api_key,
+            server_name=body.server_name,
+        )
+    except PowerDNSImportError as exc:
+        raise HTTPException(status_code=502, detail=str(exc))
+
+    zone_names = [(z.name if z.name.endswith(".") else z.name + ".").lower() for z in preview.zones]
+    preview.conflicts = await detect_conflicts(
+        db,
+        zone_names=zone_names,
+        target_group_id=body.target_group_id,
+        target_view_id=body.target_view_id,
+    )
+
+    logger.info(
+        "dns_import_powerdns_preview",
+        api_url=body.api_url,
+        server_name=body.server_name,
+        zone_count=len(preview.zones),
+        record_count=preview.total_records,
+        conflict_count=len(preview.conflicts),
+        warning_count=len(preview.warnings),
+        target_group_id=str(body.target_group_id),
+        target_view_id=str(body.target_view_id) if body.target_view_id else None,
+        user=current_user.display_name,
+    )
+    return _preview_to_pydantic(preview)
+
+
+@router.post("/powerdns/commit", response_model=CommitOut)
+async def powerdns_commit(
+    current_user: SuperAdmin,
+    db: DB,
+    body: CommitIn = Body(...),
+) -> CommitOut:
+    """Apply a previously-previewed PowerDNS import.
+
+    Same shared pipeline as bind9 + windows_dns — the canonical IR
+    reuse means audit + per-zone savepoints + RBAC stay in
+    lock-step across all three sources.
+    """
+
+    if body.plan.source != "powerdns":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Plan source mismatch: endpoint=powerdns plan={body.plan.source}",
+        )
+
+    preview = _preview_from_pydantic(body.plan)
+    actions: dict[str, tuple[ConflictAction, str | None]] = {
+        zone_name: (decision.action, decision.rename_to)
+        for zone_name, decision in body.conflict_actions.items()
+    }
+
+    try:
+        result = await commit_import(
+            db,
+            preview=preview,
+            target_group_id=body.target_group_id,
+            target_view_id=body.target_view_id,
+            conflict_actions=actions,
+            current_user=current_user,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+    logger.info(
+        "dns_import_powerdns_commit",
         target_group_id=str(body.target_group_id),
         zones_created=result.total_zones_created,
         zones_overwrote=result.total_zones_overwrote,

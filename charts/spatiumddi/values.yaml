@@ -6,10 +6,12 @@
 #   auth                  SECRET_KEY for app; generated on first install if empty
 #   api / frontend /      Control-plane workloads
 #     worker / beat
-#   migrate               One-shot Alembic Job (Helm pre-install/pre-upgrade hook)
+#   migrate               One-shot Alembic Job (regular, gated on Postgres)
 #   ingress               Frontend ingress
-#   postgresql            Bitnami subchart toggle + overrides (bring-your-own via externalDatabase)
-#   redis                 Bitnami subchart toggle + overrides (bring-your-own via externalRedis)
+#   postgresql            In-chart Postgres StatefulSet using postgres:16-alpine
+#                         (matches docker-compose.yml). BYO via externalDatabase.
+#   redis                 In-chart Redis StatefulSet using redis:7-alpine.
+#                         BYO via externalRedis.
 #   dnsAgents             Optional BIND9 agent StatefulSets (one per DNSServer row)
 #   dhcpAgents            Optional Kea agent StatefulSets (one per DHCPServer row)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -100,11 +102,18 @@ beat:
   podAnnotations: {}
 
 # ── Migrate (Alembic upgrade head) ───────────────────────────────────────────
-# Runs as a Helm pre-install + pre-upgrade hook. Disable if you're driving
+# Regular Job (named per Helm revision so each install/upgrade creates
+# a fresh one). The Job's pod has a wait-for-postgres init container; the
+# api / worker / beat pods carry a matching wait-for-migrate init that
+# blocks rollout until the schema is in place. Disable if you're driving
 # migrations from CI/CD instead of Helm.
 migrate:
   enabled: true
   backoffLimit: 3
+  # Garbage-collect each migrate Job this many seconds after completion.
+  # Without a TTL the cluster would slowly accumulate one completed Job
+  # per Helm revision.
+  ttlSecondsAfterFinished: 600
   resources:
     requests: { cpu: 50m, memory: 128Mi }
     limits:   { cpu: 200m, memory: 256Mi }
@@ -127,24 +136,36 @@ ingress:
     #     - spatiumddi.example.com
 
 # ── Postgres ─────────────────────────────────────────────────────────────────
-# Bitnami subchart. Full option surface at:
-# https://github.com/bitnami/charts/tree/main/bitnami/postgresql
+# In-chart single-node Postgres StatefulSet using the official
+# ``postgres:16-alpine`` image (matches docker-compose.yml). Sized for
+# small lab / single-VM deployments. For HA production set
+# ``postgresql.enabled=false`` and point ``externalDatabase`` at a
+# CloudNativePG / Patroni cluster (see k8s/ha/).
 postgresql:
   enabled: true
+  image:
+    repository: postgres
+    tag: "16-alpine"
+    pullPolicy: IfNotPresent
   auth:
     username: spatiumddi
     database: spatiumddi
-    # Password for the chart-managed user. If empty we generate a random
-    # password on first install (persisted on the secret we own). Set
-    # `existingSecret` to BYO.
+    # Password for the chart-managed user. If empty we generate a
+    # random password on first install (persisted on the chart-owned
+    # secret via lookup() across upgrades). Set ``existingSecret`` to
+    # BYO.
     password: ""
     existingSecret: ""           # external secret with key `password`
-  primary:
-    persistence:
-      enabled: true
-      size: 8Gi
-  # Architecture: "standalone" (default) or "replication". For HA
-  # production you probably want CloudNativePG outside the chart.
+  persistence:
+    enabled: true
+    size: 8Gi
+    storageClass: ""             # empty → cluster default StorageClass
+  resources:
+    requests: { cpu: 100m, memory: 256Mi }
+    limits:   { cpu: 1000m, memory: 1Gi }
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
 
 # Used when postgresql.enabled=false.
 externalDatabase:
@@ -157,17 +178,33 @@ externalDatabase:
   existingSecretPasswordKey: "password"
 
 # ── Redis ────────────────────────────────────────────────────────────────────
-# Bitnami subchart. Full option surface at:
-# https://github.com/bitnami/charts/tree/main/bitnami/redis
+# In-chart single-node Redis StatefulSet using the official
+# ``redis:7-alpine`` image (matches docker-compose.yml). For HA
+# production set ``redis.enabled=false`` and point ``externalRedis`` at
+# a Redis Sentinel cluster (see k8s/ha/redis-sentinel.yaml).
 redis:
   enabled: true
-  architecture: standalone       # "standalone" | "replication"
+  image:
+    repository: redis
+    tag: "7-alpine"
+    pullPolicy: IfNotPresent
+  # Cap and eviction policy match docker-compose.yml's redis-server
+  # CLI flags. Bump if your install needs a larger cache.
+  maxmemory: "256mb"
   auth:
-    enabled: false               # internal cluster traffic; enable if shared
-  master:
-    persistence:
-      enabled: true
-      size: 2Gi
+    enabled: false               # internal cluster traffic; flip to true if shared
+    password: ""                 # empty → generated on first install when auth.enabled=true
+    existingSecret: ""           # external secret with key `redis-password`
+  persistence:
+    enabled: true
+    size: 2Gi
+    storageClass: ""
+  resources:
+    requests: { cpu: 50m, memory: 64Mi }
+    limits:   { cpu: 500m, memory: 512Mi }
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
 
 # Used when redis.enabled=false.
 externalRedis:

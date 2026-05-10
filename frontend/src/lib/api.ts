@@ -4748,7 +4748,50 @@ export const dnsImportApi = {
     api
       .post<DNSImportCommitResult>("/dns/import/windows-dns/commit", body)
       .then((r) => r.data),
+
+  // PowerDNS — REST API live pull.
+  powerDNSTestConnection: (body: {
+    api_url: string;
+    api_key: string;
+    server_name?: string;
+  }) =>
+    api
+      .post<PowerDNSConnectionInfo>("/dns/import/powerdns/test-connection", {
+        ...body,
+        server_name: body.server_name || "localhost",
+      })
+      .then((r) => r.data),
+  powerDNSPreview: (body: {
+    api_url: string;
+    api_key: string;
+    server_name?: string;
+    target_group_id: string;
+    target_view_id?: string | null;
+  }) =>
+    api
+      .post<DNSImportPreview>("/dns/import/powerdns/preview", {
+        ...body,
+        server_name: body.server_name || "localhost",
+      })
+      .then((r) => r.data),
+  powerDNSCommit: (body: {
+    target_group_id: string;
+    target_view_id?: string | null;
+    plan: DNSImportPreview;
+    conflict_actions: Record<string, DNSImportConflictDecision>;
+  }) =>
+    api
+      .post<DNSImportCommitResult>("/dns/import/powerdns/commit", body)
+      .then((r) => r.data),
 };
+
+export interface PowerDNSConnectionInfo {
+  type: string;
+  id: string;
+  daemon_type: string;
+  version: string;
+  url: string;
+}
 
 export const dnsBlocklistApi = {
   list: () => api.get<DNSBlockList[]>("/dns/blocklists").then((r) => r.data),

@@ -17,12 +17,22 @@ FROM alpine:3.22 AS runtime
 # scapy itself is pure-python so the install works on amd64 + arm64
 # without compilation. The container also needs CAP_NET_RAW at run-time
 # for the sniffer to bind the socket — see docs/deployment/DOCKER.md.
+#
+# ``libcap`` brings in ``setcap`` so we can grant ``kea-dhcp4`` the
+# CAP_NET_BIND_SERVICE file capability — without it, the unprivileged
+# ``spatium`` user the entrypoint drops to can't bind UDP/67 (the
+# DHCPv4 server port). Compose-side ``cap_add: NET_BIND_SERVICE``
+# only sets the container bounding set; for a non-root process to
+# actually use the cap, the binary needs file caps. Same fix as
+# named + pdns_server in the DNS image family.
 RUN apk add --no-cache \
       kea kea-dhcp4 kea-ctrl-agent kea-admin \
       kea-hook-lease-cmds kea-hook-ha \
       tini su-exec \
       python3 py3-pip libpcap \
+      libcap \
       ca-certificates tzdata \
+ && setcap cap_net_bind_service=+ep /usr/sbin/kea-dhcp4 \
  && addgroup -S spatium \
  && adduser -S -G spatium spatium \
  && mkdir -p /var/lib/spatium-dhcp-agent /var/lib/kea /run/kea /etc/kea /var/log/kea \

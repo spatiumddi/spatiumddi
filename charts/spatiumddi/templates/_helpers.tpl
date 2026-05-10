@@ -85,12 +85,13 @@ Name of the chart-owned secret carrying SECRET_KEY.
 
 {{/*
 Postgres connection parameters. Hostname + port + user + database come from
-either the bundled subchart or the externalDatabase block; the password is
-always referenced via a Secret keyRef — never inlined.
+either the in-chart Postgres StatefulSet (templates/postgres.yaml) or the
+externalDatabase block; the password is always referenced via a Secret
+keyRef — never inlined.
 */}}
 {{- define "spatiumddi.postgresHost" -}}
 {{- if .Values.postgresql.enabled -}}
-{{- printf "%s-postgresql" .Release.Name -}}
+{{- printf "%s-postgresql" (include "spatiumddi.fullname" .) -}}
 {{- else -}}
 {{- required "externalDatabase.host is required when postgresql.enabled=false" .Values.externalDatabase.host -}}
 {{- end -}}
@@ -109,14 +110,20 @@ always referenced via a Secret keyRef — never inlined.
 {{- end -}}
 
 {{/*
-Name of the secret carrying the Postgres user password. For the bundled
-subchart this is the Bitnami-managed `<release>-postgresql` secret
-(key `password`). For external DB it's whatever the user set in
+Name of the secret carrying the Postgres user password. For the in-
+chart Postgres this is the chart-owned ``<fullname>-postgresql`` Secret
+(key ``password``) — generated on first install via lookup() and
+preserved across upgrades. ``postgresql.auth.existingSecret`` overrides
+to a BYO secret. For external DB it's whatever the user set in
 externalDatabase.existingSecret.
 */}}
 {{- define "spatiumddi.postgresSecretName" -}}
 {{- if .Values.postgresql.enabled -}}
-{{- printf "%s-postgresql" .Release.Name -}}
+{{- if .Values.postgresql.auth.existingSecret -}}
+{{- .Values.postgresql.auth.existingSecret -}}
+{{- else -}}
+{{- printf "%s-postgresql" (include "spatiumddi.fullname" .) -}}
+{{- end -}}
 {{- else if .Values.externalDatabase.existingSecret -}}
 {{- .Values.externalDatabase.existingSecret -}}
 {{- else -}}
@@ -134,7 +141,7 @@ externalRedis.
 */}}
 {{- define "spatiumddi.redisHost" -}}
 {{- if .Values.redis.enabled -}}
-{{- printf "%s-redis-master" .Release.Name -}}
+{{- printf "%s-redis-master" (include "spatiumddi.fullname" .) -}}
 {{- else -}}
 {{- required "externalRedis.host is required when redis.enabled=false" .Values.externalRedis.host -}}
 {{- end -}}
@@ -154,7 +161,11 @@ externalRedis.
 
 {{- define "spatiumddi.redisSecretName" -}}
 {{- if .Values.redis.enabled -}}
-{{- printf "%s-redis" .Release.Name -}}
+{{- if .Values.redis.auth.existingSecret -}}
+{{- .Values.redis.auth.existingSecret -}}
+{{- else -}}
+{{- printf "%s-redis" (include "spatiumddi.fullname" .) -}}
+{{- end -}}
 {{- else if .Values.externalRedis.existingSecret -}}
 {{- .Values.externalRedis.existingSecret -}}
 {{- else -}}
@@ -202,5 +213,99 @@ $(REDIS_PASSWORD) reference secrets; everything else is inline.
   value: "redis://{{ include "spatiumddi.redisHost" . }}:{{ include "spatiumddi.redisPort" . }}/1"
 - name: CELERY_RESULT_BACKEND
   value: "redis://{{ include "spatiumddi.redisHost" . }}:{{ include "spatiumddi.redisPort" . }}/2"
+{{- end }}
+{{- if .Values.dnsAgents.enabled }}
+{{/* DNS agent PSK — agents bootstrap-register against the api with
+     this key, so the api / worker pods need it to verify the
+     incoming registration handshake. The Secret is rendered by
+     templates/dns-agent.yaml under the same name + key. */}}
+- name: DNS_AGENT_KEY
+  valueFrom:
+    secretKeyRef:
+      name: {{ .Values.dnsAgents.agentKey.existingSecret | default (printf "%s-dns-agent-key" (include "spatiumddi.fullname" .)) }}
+      key: DNS_AGENT_KEY
+{{- end }}
+{{- if .Values.dhcpAgents.enabled }}
+{{/* DHCP agent PSK. Agent side env var is SPATIUM_AGENT_KEY, but the
+     control plane reads DHCP_AGENT_KEY (see backend/app/api/v1/dhcp/
+     agents.py). The dhcp-agent Secret stores under SPATIUM_AGENT_KEY
+     so we name the env var differently while pointing at the same
+     value. */}}
+- name: DHCP_AGENT_KEY
+  valueFrom:
+    secretKeyRef:
+      name: {{ .Values.dhcpAgents.agentKey.existingSecret | default (printf "%s-dhcp-agent-key" (include "spatiumddi.fullname" .)) }}
+      key: SPATIUM_AGENT_KEY
 {{- end -}}
+{{- end -}}
+
+{{/*
+Init container that blocks until the bundled / external Postgres is
+accepting connections. Used by the migrate Job. ``pg_isready`` ships in
+the api image (postgresql-client-16, see backend/Dockerfile).
+*/}}
+{{- define "spatiumddi.waitForPostgresInit" -}}
+- name: wait-for-postgres
+  image: {{ include "spatiumddi.image" (merge (dict "imageName" "spatiumddi-api") .) }}
+  imagePullPolicy: {{ .Values.image.pullPolicy }}
+  command:
+    - sh
+    - -c
+    - |
+      until pg_isready -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" -t 3 >/dev/null 2>&1; do
+        echo "waiting for postgres at $PGHOST:$PGPORT..."
+        sleep 3
+      done
+      echo "postgres is accepting connections"
+  env:
+    - name: PGHOST
+      value: {{ include "spatiumddi.postgresHost" . | quote }}
+    - name: PGPORT
+      value: {{ include "spatiumddi.postgresPort" . | quote }}
+    - name: PGUSER
+      value: {{ include "spatiumddi.postgresUser" . | quote }}
+    - name: PGDATABASE
+      value: {{ include "spatiumddi.postgresDatabase" . | quote }}
+{{- end -}}
+
+{{/*
+Init container that blocks until alembic migrations have been applied
+(detected by presence of a row in the ``alembic_version`` table). Used
+by api / worker / beat so they don't roll out before the schema is in
+place. Uses ``psql`` from the api image.
+
+The DATABASE_URL on commonEnv uses the asyncpg driver scheme; psql
+needs the plain ``postgresql://`` scheme, so we build connection
+arguments from the discrete pieces instead of the URL.
+*/}}
+{{- define "spatiumddi.waitForMigrateInit" -}}
+- name: wait-for-migrate
+  image: {{ include "spatiumddi.image" (merge (dict "imageName" "spatiumddi-api") .) }}
+  imagePullPolicy: {{ .Values.image.pullPolicy }}
+  command:
+    - sh
+    - -c
+    - |
+      export PGPASSWORD="$POSTGRES_PASSWORD"
+      until psql -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDATABASE" \
+            -tAc "SELECT version_num FROM alembic_version LIMIT 1" 2>/dev/null \
+          | grep -qE '[a-f0-9]'; do
+        echo "waiting for alembic migrations to land..."
+        sleep 3
+      done
+      echo "alembic schema present"
+  env:
+    - name: POSTGRES_PASSWORD
+      valueFrom:
+        secretKeyRef:
+          name: {{ include "spatiumddi.postgresSecretName" . }}
+          key: {{ include "spatiumddi.postgresSecretPasswordKey" . }}
+    - name: PGHOST
+      value: {{ include "spatiumddi.postgresHost" . | quote }}
+    - name: PGPORT
+      value: {{ include "spatiumddi.postgresPort" . | quote }}
+    - name: PGUSER
+      value: {{ include "spatiumddi.postgresUser" . | quote }}
+    - name: PGDATABASE
+      value: {{ include "spatiumddi.postgresDatabase" . | quote }}
 {{- end -}}

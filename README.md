@@ -87,6 +87,8 @@
 | ⚖️ | **GSLB-lite** | health-checked DNS pools — tcp / http / https / icmp / none probes flip A/AAAA records in/out of the rendered rrset; manual enable per member |
 | 🔄 | **DHCP** | Kea container · group-centric Kea HA (load-balanced or hot-standby) with self-healing peer drift · option templates · 95-entry option-code library |
 | 🪟 | **Windows DNS + DHCP** | agentless — RFC 2136 + WinRM, no software on the DC |
+| 📥 | **DNS configuration import** | one-shot migration from BIND9 (`named.conf` archive upload), Windows DNS (live WinRM pull), and PowerDNS (live REST pull) · preview-before-commit · per-zone savepoint so partial failures don't abort the batch · provenance stamps (`import_source` + `imported_at`) on every imported zone + record |
+| 📡 | **Multicast group registry** | RFC 5771 catalog seeded · per-IPSpace groups + PIM rendezvous-point domains · auto-created enclosing `224.0.0.0/4` / `ff00::/8` IPBlock for tree visibility · per-IP collision conformity check · bulk-allocate from RFC 2365 admin-scoped ranges |
 | 🔁 | **NAT cross-reference** | 1:1 / PAT / hide-NAT tracked in IPAM with FK links to live IP rows |
 | 📜 | **DHCP lease history** | forensic trail of every expiry, MAC reassignment, absence-delete |
 | 🗑 | **Soft-delete trash** | 30-day Trash with cascade restore for spaces, blocks, subnets, zones, scopes |
@@ -250,6 +252,27 @@ The tables above are the elevator pitch. The bullets here are the same surface w
   - RFC 2136 + WinRM for DNS
   - Near-real-time WinRM lease-mirroring for DHCP
   - No software installed on the Windows side
+
+- 📥 **DNS configuration importer** — one-shot migration tool that turns existing zone data into native SpatiumDDI zones + records.
+  - Three sources, one canonical IR + commit pipeline:
+    - **BIND9** — upload a `.zip` / `.tar.gz` of the `named.conf` tree; the parser walks `include` directives, resolves zone files via four strategies (relative path, absolute path, `directory` option, search), tolerates `view {}` blocks, and feeds the same canonical-zone shape the other two sources do
+    - **Windows DNS** — live pull over WinRM via the existing `WindowsDNSDriver`; honours system zones (TrustAnchors / `_msdcs.*`) by routing them through a dedicated branch instead of trying to migrate them
+    - **PowerDNS** — live pull over the authoritative REST API (`X-API-Key` auth, hard cap of 5000 zones / 60 s socket timeout); hoists SOA from rrset content, splits MX / SRV priority into the dedicated columns, drops disabled records + DNSSEC + LUA / ALIAS with distinct warnings
+  - Preview-before-commit on every source — operator sees the conflict picker (overwrite / skip / merge) before any rows are written
+  - Per-zone savepoint commit so a failure on zone N rolls back N but keeps zones 1..N-1 — no all-or-nothing import abort
+  - Provenance stamping — `import_source` + `imported_at` columns on `dns_zone` + `dns_record` flag everything that came in from the importer (UI surfaces a chip)
+  - Three-tab admin page at `/admin/dns/import` — one tab per source, all three rendered by a shared preview panel + commit-result panel
+  - Once imported, SpatiumDDI is the source of truth — there is no continuous two-way mirror
+
+- 📡 **Multicast group registry** — IPv4 + IPv6 multicast groups as first-class entities.
+  - RFC 5771 IANA registry seeded as platform-provided rows (e.g. `224.0.0.1` All-Hosts, `224.0.0.5` OSPF, …)
+  - Operator catalog of business-defined groups (per-IPSpace) with description, owner, scope (link-local / admin-local / org-local / global)
+  - **PIM rendezvous-point domains** — `pim_rp_domain` table tracking RP routers + group ranges they serve
+  - **IPAM tree integration** — creating a group in an IPSpace auto-creates the enclosing `224.0.0.0/4` (v4) or `ff00::/8` (v6) IPBlock when none exists; a startup hook backfills blocks for pre-existing groups so the upgrade is seamless
+  - **Tree rendering** — multicast IPBlocks render with a violet 📡 Radio icon in both the tree row and BlockDetailView identity row; inside a multicast block, a "Multicast Groups" panel surfaces the streams whose addresses fall within the block's CIDR (queries `multicast_group` directly — no mirror IPAddress rows)
+  - **Click-through** opens the multicast page pre-scoped to the IPSpace via `?space=<uuid>`
+  - **Bulk-allocate** from RFC 2365 admin-scoped ranges with name templating
+  - Per-IP collision conformity check — flags addresses that overlap a known multicast registration before allocation
 
 ### Network entities
 
