@@ -45,6 +45,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         systemd-ukify \
         grub2-common \
         grub-pc-bin \
+        # Phase 2 — hybrid ISO wrapping. xorriso for the ISO9660 +
+        # GPT layout, isolinux for the BIOS isohybrid MBR
+        # (`/usr/lib/ISOLINUX/isohdpfx.bin`), mtools for accessing
+        # the FAT-formatted ESP partition during wrap.
+        xorriso \
+        isolinux \
+        mtools \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /work

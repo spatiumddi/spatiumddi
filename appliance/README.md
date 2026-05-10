@@ -71,7 +71,37 @@ make appliance-builder                                   # builds spatiumddi-app
 make appliance APPLIANCE_BUILDER=spatiumddi-appliance-builder:dev
 ```
 
-To clean:
+### Phase 2 — hybrid USB/CD ISO
+
+After Phase 1 produces a raw image, wrap it as a hybrid ISO:
+
+```sh
+make appliance-iso
+```
+
+Output: `appliance/build/spatiumddi-appliance_0.1.0.iso` (~2.1 GiB —
+ISOs don't compress, the Phase 1 qcow2's compression is lost on wrap).
+
+The ISO has a hybrid GPT layout (verified with `fdisk -l`):
+- Partition 1 (~70 KiB): ISO9660 metadata
+- Partition 2 (~2.1 GiB): EFI System partition holding the entire Phase 1 raw image
+- Partition 3 (~300 KiB): GPT backup tail
+
+Boots in:
+- **UEFI** mode (firmware reads GPT, finds the EFI System partition,
+  chains into the appliance's grub) — Hyper-V, modern QEMU, AWS/Azure,
+  most post-2012 hypervisors
+- **USB** when `dd`'d (`sudo dd if=spatiumddi-appliance_0.1.0.iso of=/dev/sdX bs=4M conv=fsync`)
+- **Hypervisors with UEFI CSM** (almost all of them) — Proxmox, VMware
+
+Phase 2.x gap: classic El Torito BIOS-CD boot needs kernel + initrd +
+grub.cfg copied into the ISO9660 tree as a separate boot image (`-b`
+in xorriso). xorriso refuses `-isohybrid-mbr` + `-append_partition`
+together, so we either wrap the raw (current — UEFI/USB only) or
+build a true live ISO from scratch with squashfs (later).
+
+### Cleaning
+
 ```sh
 make appliance-clean
 ```
@@ -124,8 +154,10 @@ appliance/
 │       └── share/spatiumddi/
 │           └── docker-compose.yml          # all-in-one stack
 ├── builder/
-│   ├── Dockerfile           # the appliance-builder image (mkosi + qemu-img + ...)
+│   ├── Dockerfile           # the appliance-builder image (mkosi + qemu-img + xorriso + ...)
 │   └── .dockerignore
+├── scripts/
+│   └── wrap-iso.sh          # Phase 2 — wrap raw image as hybrid USB/CD ISO via xorriso
 └── cloud-init/
     ├── README.md
     ├── user-data.example
@@ -147,7 +179,8 @@ To pin a release tag instead of `:latest`, drop a
 
 Tracked in [#134](https://github.com/spatiumddi/spatiumddi/issues/134):
 
-- **ISO installer** (Phase 2) — qcow2 only for now
+- **Classic El Torito BIOS-CD boot** (Phase 2.x) — current ISO is
+  UEFI/USB hybrid, doesn't boot on pure-BIOS-CD hypervisors
 - **arm64 / Raspberry Pi** (Phase 3) — builder image is amd64-only
 - **Role-split images** (Phase 4) — single all-in-one only
 - **Cloud images** (Phase 5) — no AWS/Azure/GCP datasource testing

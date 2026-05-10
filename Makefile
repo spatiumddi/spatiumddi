@@ -1,6 +1,6 @@
 .PHONY: help up down dev build migrate lint test lint-backend lint-frontend test-backend \
         ci ci-backend-lint ci-frontend-lint ci-frontend-build screenshots \
-        appliance appliance-builder appliance-clean
+        appliance appliance-builder appliance-iso appliance-clean
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 COMPOSE        = docker compose
@@ -21,7 +21,8 @@ help:
 	@echo "  make test        Run backend tests against a live DB"
 	@echo "  make ci          Run the exact same lint + typecheck + build jobs CI runs"
 	@echo "  make screenshots Re-capture docs/assets/screenshots/ via headless chromium"
-	@echo "  make appliance   Build the OS-appliance qcow2 (Phase 1 — Alpine amd64)"
+	@echo "  make appliance      Build the OS-appliance qcow2 (Phase 1 — Debian 13 amd64)"
+	@echo "  make appliance-iso  Wrap the Phase 1 raw image as a hybrid USB/CD ISO (Phase 2)"
 	@echo ""
 
 # ── Stack ──────────────────────────────────────────────────────────────────────
@@ -165,6 +166,28 @@ appliance-builder:
 	@echo ""
 	@echo "✓ Built: spatiumddi-appliance-builder:dev"
 	@echo "  Use it via: make appliance APPLIANCE_BUILDER=spatiumddi-appliance-builder:dev"
+
+# Phase 2 — wrap the raw image as a hybrid USB/CD ISO. Requires
+# `make appliance` to have run first (or for a raw image to exist
+# in $(APPLIANCE_OUT)).
+appliance-iso:
+	@raw=$$(ls $(APPLIANCE_OUT)/spatiumddi-appliance*.raw 2>/dev/null | head -1); \
+	if [ -z "$$raw" ]; then \
+	  echo "✗ no raw image found in $(APPLIANCE_OUT) — run 'make appliance' first."; \
+	  exit 1; \
+	fi; \
+	iso=$${raw%.raw}.iso; \
+	echo "→ Wrapping $$raw → $$iso (hybrid USB/CD)…"; \
+	docker run --rm \
+	    --entrypoint /work/scripts/wrap-iso.sh \
+	    -v $(PWD)/$(APPLIANCE_DIR):/work \
+	    $(APPLIANCE_BUILDER) \
+	    "/work/build/$$(basename $$raw)" \
+	    "/work/build/$$(basename $$iso)"; \
+	echo ""; \
+	echo "✓ Built: $$iso"; \
+	echo "  Burn to USB:  sudo dd if=$$iso of=/dev/sdX bs=4M conv=fsync"; \
+	echo "  Or attach as CD-ROM in your hypervisor."
 
 appliance-clean:
 	@if [ -d $(APPLIANCE_OUT) ]; then \
