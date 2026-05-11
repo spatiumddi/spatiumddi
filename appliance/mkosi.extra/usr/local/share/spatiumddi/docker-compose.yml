@@ -1,13 +1,22 @@
 # SpatiumDDI all-in-one appliance compose stack.
 #
 # Lives at /usr/local/share/spatiumddi/docker-compose.yml in the
-# appliance image. The first-boot orchestrator (`spatiumddi-firstboot`)
-# generates /etc/spatiumddi/.env on first power-on and symlinks it in
-# as ./.env so the variable substitutions below resolve.
+# appliance image. spatiumddi-firstboot generates /etc/spatiumddi/.env
+# on first boot and symlinks it in as ./.env so the env_file
+# directives resolve.
 #
-# Operators editing this file should keep the deltas surgical — the
-# appliance image rebuild flow expects this layout to track the
-# top-level docker-compose.yml in tag-for-tag releases.
+# This file mirrors the top-level docker-compose.yml in the repo.
+# Surgical appliance-only deltas:
+#   - frontend on host port 80 (not 8077): the appliance is the
+#     dedicated SpatiumDDI host — no port-collision risk
+#   - dhcp-kea on network_mode: host (not bridge + 6767:67) because
+#     a real DHCP server needs raw broadcasts, not a port-mapped
+#     unicast endpoint
+#   - dns-bind9 on host port 53 (not 1053): the appliance serves
+#     DNS for downstream clients on the standard port
+#   - no docker-socket / spatium_backups mount commentary —
+#     operators bake those in via /etc/spatiumddi/.env or the
+#     compose-file override path
 
 name: spatiumddi
 
@@ -45,10 +54,9 @@ services:
   migrate:
     image: ghcr.io/spatiumddi/spatiumddi-api:${SPATIUMDDI_VERSION:-latest}
     networks: [spatiumddi]
+    env_file: .env
     environment:
       DATABASE_URL: postgresql+asyncpg://spatiumddi:${POSTGRES_PASSWORD}@postgres:5432/spatiumddi
-      SECRET_KEY: ${SECRET_KEY}
-      CREDENTIAL_ENCRYPTION_KEY: ${CREDENTIAL_ENCRYPTION_KEY}
     command: ["alembic", "upgrade", "head"]
     depends_on:
       postgres:
@@ -60,68 +68,91 @@ services:
     restart: unless-stopped
     networks: [spatiumddi]
     ports: ["8000:8000"]
+    env_file: .env
     environment:
       DATABASE_URL: postgresql+asyncpg://spatiumddi:${POSTGRES_PASSWORD}@postgres:5432/spatiumddi
       REDIS_URL: redis://redis:6379/0
       CELERY_BROKER_URL: redis://redis:6379/1
       CELERY_RESULT_BACKEND: redis://redis:6379/2
-      SECRET_KEY: ${SECRET_KEY}
-      CREDENTIAL_ENCRYPTION_KEY: ${CREDENTIAL_ENCRYPTION_KEY}
-      DNS_AGENT_KEY: ${DNS_AGENT_KEY}
-      DHCP_AGENT_KEY: ${DHCP_AGENT_KEY}
       VERSION: ${SPATIUMDDI_VERSION:-latest}
     depends_on:
       migrate:
         condition: service_completed_successfully
       redis:
         condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health/live')\""]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
 
   worker:
     image: ghcr.io/spatiumddi/spatiumddi-api:${SPATIUMDDI_VERSION:-latest}
     restart: unless-stopped
     networks: [spatiumddi]
-    command: ["celery", "-A", "app.celery_app", "worker", "-l", "info"]
+    # CRITICAL: subscribe to all four queues. Production routes
+    # IPAM tasks to `ipam`, DNS to `dns`, DHCP to `dhcp`, everything
+    # else to `default`. A worker that only listens on the default
+    # `celery` queue (the implicit default when -Q is omitted)
+    # silently drops every IPAM/DNS/DHCP task — auto-sync,
+    # lease cleanup, scheduled jobs all stop working.
+    command: celery -A app.celery_app worker --loglevel=info --concurrency=4 -Q ipam,dns,dhcp,default
+    env_file: .env
     environment:
       DATABASE_URL: postgresql+asyncpg://spatiumddi:${POSTGRES_PASSWORD}@postgres:5432/spatiumddi
       REDIS_URL: redis://redis:6379/0
       CELERY_BROKER_URL: redis://redis:6379/1
       CELERY_RESULT_BACKEND: redis://redis:6379/2
-      SECRET_KEY: ${SECRET_KEY}
-      CREDENTIAL_ENCRYPTION_KEY: ${CREDENTIAL_ENCRYPTION_KEY}
-      DNS_AGENT_KEY: ${DNS_AGENT_KEY}
-      DHCP_AGENT_KEY: ${DHCP_AGENT_KEY}
+      VERSION: ${SPATIUMDDI_VERSION:-latest}
     depends_on:
       api:
         condition: service_started
+    # The api container's HEALTHCHECK pings /health/live over HTTP —
+    # wrong for a worker (it has no HTTP listener). Override with a
+    # Celery-native ping that round-trips to this worker via the broker.
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.celery_app inspect ping -d celery@$$HOSTNAME --timeout 5 >/dev/null 2>&1"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
 
   beat:
     image: ghcr.io/spatiumddi/spatiumddi-api:${SPATIUMDDI_VERSION:-latest}
     restart: unless-stopped
     networks: [spatiumddi]
-    command: ["celery", "-A", "app.celery_app", "beat", "-l", "info"]
+    command: celery -A app.celery_app beat --loglevel=info
+    env_file: .env
     environment:
       DATABASE_URL: postgresql+asyncpg://spatiumddi:${POSTGRES_PASSWORD}@postgres:5432/spatiumddi
       REDIS_URL: redis://redis:6379/0
       CELERY_BROKER_URL: redis://redis:6379/1
       CELERY_RESULT_BACKEND: redis://redis:6379/2
-      SECRET_KEY: ${SECRET_KEY}
-      CREDENTIAL_ENCRYPTION_KEY: ${CREDENTIAL_ENCRYPTION_KEY}
+      VERSION: ${SPATIUMDDI_VERSION:-latest}
     depends_on:
-      api:
-        condition: service_started
+      - redis
+    # Beat has no broker-reachable identity and no HTTP listener.
+    # Cheapest liveness signal is "the celery process is still pid 1".
+    healthcheck:
+      test: ["CMD-SHELL", "grep -q 'celery' /proc/1/cmdline"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
 
   frontend:
     image: ghcr.io/spatiumddi/spatiumddi-frontend:${SPATIUMDDI_VERSION:-latest}
     restart: unless-stopped
     networks: [spatiumddi]
-    ports: ["80:80"]
+    ports: ["${HTTP_PORT:-80}:80"]
     depends_on:
       api:
         condition: service_started
 
   # ── DNS (BIND9) — default profile ───────────────────────────────────────────
   dns-bind9:
-    profiles: ["dns"]
+    profiles: ["dns", "dns-bind9"]
     image: ghcr.io/spatiumddi/dns-bind9:${SPATIUMDDI_VERSION:-latest}
     restart: unless-stopped
     networks: [spatiumddi]
@@ -131,26 +162,46 @@ services:
     environment:
       CONTROL_PLANE_URL: http://api:8000
       DNS_AGENT_KEY: ${DNS_AGENT_KEY}
+      SERVER_NAME: dns-bind9
+      AGENT_GROUP: default
+      AGENT_ROLES: authoritative
+      SPATIUM_INSECURE_SKIP_TLS_VERIFY: "1"
     volumes:
-      - dns_bind9_data:/var/lib/spatium-dns-agent
+      - dns_bind9_state:/var/lib/spatium-dns-agent
+      - dns_bind9_cache:/var/cache/bind
     depends_on:
       api:
         condition: service_started
 
   # ── DHCP (Kea) — default profile ────────────────────────────────────────────
+  # Host networking is required for DHCP broadcast (DDI appliance
+  # vs lab compose's bridge + port-mapping). With host networking
+  # the container shares the host's network namespace so it can
+  # receive L2 broadcasts on the LAN.
+  #
+  # CRITICAL: env var names — the Kea agent reads SPATIUM_* not
+  # CONTROL_PLANE_URL/DHCP_AGENT_KEY. Earlier appliance builds had
+  # the wrong names and the agent silently failed to bootstrap.
   dhcp-kea:
     profiles: ["dhcp"]
     image: ghcr.io/spatiumddi/dhcp-kea:${SPATIUMDDI_VERSION:-latest}
     restart: unless-stopped
     network_mode: host
     environment:
-      CONTROL_PLANE_URL: http://127.0.0.1:8000
-      DHCP_AGENT_KEY: ${DHCP_AGENT_KEY}
+      SPATIUM_API_URL: http://127.0.0.1:8000
+      SPATIUM_AGENT_KEY: ${DHCP_AGENT_KEY}
+      SPATIUM_SERVER_NAME: dhcp-kea
+      AGENT_GROUP: default
+      AGENT_ROLES: primary
+      SPATIUM_INSECURE_SKIP_TLS_VERIFY: "1"
     volumes:
-      - dhcp_kea_data:/var/lib/spatium-dhcp-agent
+      - dhcp_kea_state:/var/lib/spatium-dhcp-agent
+      - dhcp_kea_leases:/var/lib/kea
     depends_on:
       api:
         condition: service_started
+    cap_add:
+      - NET_BIND_SERVICE
 
 networks:
   spatiumddi:
@@ -159,5 +210,7 @@ networks:
 volumes:
   postgres_data:
   redis_data:
-  dns_bind9_data:
-  dhcp_kea_data:
+  dns_bind9_state:
+  dns_bind9_cache:
+  dhcp_kea_state:
+  dhcp_kea_leases:

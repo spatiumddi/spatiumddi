@@ -104,3 +104,18 @@ install -d -m 0755 "$BUILDROOT/etc/nftables.d"
 # Mode 2755 + group systemd-journal is what systemd expects.
 install -d -m 2755 "$BUILDROOT/var/log/journal"
 chgrp systemd-journal "$BUILDROOT/var/log/journal" 2>/dev/null || true
+
+# Make /etc/resolv.conf the systemd-resolved-managed one.
+# resolved publishes upstream-DNS info (picked up from networkd's
+# DHCP) at /run/systemd/resolve/resolv.conf. Without this symlink,
+# /etc/resolv.conf is whatever rsync brought from the live system
+# (often a dangling stub pointing at ::1) and docker pull fails on
+# every fresh install with "lookup registry-1.docker.io on [::1]:53".
+ln -sfn /run/systemd/resolve/resolv.conf "$BUILDROOT/etc/resolv.conf"
+
+# Enable resolved alongside the rest of the service set. (Manually
+# in the for-loop above would have worked, but resolved deserves a
+# comment in the same spot as the symlink so the link between the
+# two is obvious.)
+ln -sfn /lib/systemd/system/systemd-resolved.service \
+    "$BUILDROOT/etc/systemd/system/multi-user.target.wants/systemd-resolved.service"

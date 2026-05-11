@@ -72,12 +72,59 @@ ln -sfn "$ENV_FILE" "$COMPOSE_DIR/.env"
 
 cd "$COMPOSE_DIR"
 
+# Wait for the docker daemon socket to be ready. systemd's
+# After=docker.service only means docker.service was STARTED, not
+# that dockerd has finished initialising and accepting connections
+# on /var/run/docker.sock. Without this wait, docker-compose pull
+# can race and emit "Cannot connect to the Docker daemon" for a
+# subset of services.
+echo "Waiting for docker daemon..."
+for i in $(seq 1 30); do
+    if docker info >/dev/null 2>&1; then break; fi
+    sleep 1
+done
+docker info >/dev/null 2>&1 || {
+    echo "ERROR: docker daemon never came up after 30 s"
+    exit 1
+}
+
+# Wait for DNS resolution. systemd-resolved is the resolver but it
+# needs networkd to have an IP + DNS info from DHCP. With a slow
+# DHCP server we'd otherwise race and `docker-compose pull` would
+# fail on the first image with "lookup registry-1.docker.io on
+# ::1:53: read: connection refused" because /etc/resolv.conf is
+# resolved's symlink and resolved hasn't been told a DNS server yet.
+echo "Waiting for DNS resolution..."
+for i in $(seq 1 30); do
+    if getent hosts registry-1.docker.io >/dev/null 2>&1; then break; fi
+    sleep 2
+done
+getent hosts registry-1.docker.io >/dev/null 2>&1 || {
+    echo "WARN: DNS for registry-1.docker.io didn't resolve after 60 s — pull will likely fail."
+    echo "      Check 'resolvectl status' and the wildcard DHCP networkd config."
+}
+
 if [ ! -f "$STAMP" ]; then
-    echo "Pulling SpatiumDDI image set (first boot)…"
-    docker-compose pull
+    echo "Pulling SpatiumDDI image set (first boot)..."
+    # Retry pull on transient failures (slow image hosts, partial
+    # download). set -e at the script top would otherwise kill us
+    # on the first transient blip.
+    pull_ok=0
+    for i in 1 2 3; do
+        if docker-compose pull; then
+            pull_ok=1
+            break
+        fi
+        echo "Pull attempt $i failed; retrying in 10 s..."
+        sleep 10
+    done
+    [ "$pull_ok" = 1 ] || {
+        echo "ERROR: docker-compose pull failed 3 times. Check network + DNS."
+        exit 1
+    }
 fi
 
-echo "Bringing stack up…"
+echo "Bringing stack up..."
 docker-compose up -d
 
 # Wait up to 5 min for the control plane to answer /health/live.
