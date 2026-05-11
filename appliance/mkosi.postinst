@@ -18,8 +18,13 @@ set -eu
 # "Created symlink ..." lines in the build log) — no work needed here
 # for cloud-init-local / cloud-init / cloud-config / cloud-final.
 mkdir -p "$BUILDROOT/etc/systemd/system/multi-user.target.wants"
+# Install + Live mode services are kept WantedBy=multi-user.target
+# but gate themselves with ConditionKernelCommandLine=spatium-mode=…
+# so only one runs per boot, depending on the GRUB menu choice.
 for unit in docker.service chrony.service ssh.service \
-            spatiumddi-firstboot.service; do
+            spatiumddi-firstboot.service \
+            spatium-install.service \
+            spatium-live-banner.service; do
     src=
     for candidate in /lib/systemd/system /etc/systemd/system /usr/lib/systemd/system; do
         if [ -f "$BUILDROOT$candidate/$unit" ]; then
@@ -47,10 +52,14 @@ fi
 # ASLR.
 echo 'kernel.randomize_va_space = 2' > "$BUILDROOT/etc/sysctl.d/99-spatiumddi.conf"
 
-# Make first-boot orchestrator + helpers executable.
+# Make orchestrator + installer + helpers executable.
 chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-firstboot"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-stack-status"
+chmod 0755 "$BUILDROOT/usr/local/bin/spatium-install"
+chmod 0755 "$BUILDROOT/usr/local/bin/spatium-live-banner"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-firstboot.service"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-install.service"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-live-banner.service"
 
 # State directories owned by the spatiumddi-firstboot service.
 install -d -m 0755 "$BUILDROOT/etc/spatiumddi"

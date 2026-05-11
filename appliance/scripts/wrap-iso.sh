@@ -153,7 +153,7 @@ mksquashfs "$MOUNT_DIR" "$ISO_ROOT/live/filesystem.squashfs" \
 
 # ── grub.cfg ──────────────────────────────────────────────────────────────────
 cat > "$ISO_ROOT/boot/grub/grub.cfg" <<'EOF'
-set timeout=3
+set timeout=5
 set default=0
 
 # Serial console mirror for headless boots (IPMI SoL, Proxmox
@@ -164,24 +164,24 @@ serial --unit=0 --speed=115200
 terminal_input  console serial
 terminal_output console serial
 
-# `cloud-init=disabled` suppresses cloud-init in live-ISO mode. The
-# appliance image bakes cloud-init in for the qcow2 disk-boot path
-# (NoCloud datasource for headless bootstrap), but a plain CD-ROM
-# live boot has no datasource attached and cloud-init's failure
-# emits noisy errors + creates a systemd ordering cycle.
-# spatiumddi-firstboot.service does all the actual orchestration —
-# generate secrets, docker compose up, wait for /health/live —
-# without needing cloud-init.
+# Shared kernel cmdline. spatium-mode= picks which boot-time
+# service takes over tty1 (install wizard vs live banner).
+# cloud-init=disabled skips cloud-init in both modes since neither
+# has a NoCloud datasource attached.
+set common="boot=live components cloud-init=disabled console=tty0 console=ttyS0,115200n8"
 
-menuentry "SpatiumDDI Appliance - Live" {
-    linux /live/vmlinuz boot=live components quiet cloud-init=disabled \
-        console=tty0 console=ttyS0,115200n8
+menuentry "Install SpatiumDDI to disk" {
+    linux /live/vmlinuz $common spatium-mode=install
     initrd /live/initrd.img
 }
 
-menuentry "SpatiumDDI Appliance - Live (verbose)" {
-    linux /live/vmlinuz boot=live components cloud-init=disabled \
-        console=tty0 console=ttyS0,115200n8
+menuentry "Try SpatiumDDI live (run from CD/USB without installing)" {
+    linux /live/vmlinuz $common spatium-mode=live quiet
+    initrd /live/initrd.img
+}
+
+menuentry "Try SpatiumDDI live (verbose)" {
+    linux /live/vmlinuz $common spatium-mode=live
     initrd /live/initrd.img
 }
 EOF

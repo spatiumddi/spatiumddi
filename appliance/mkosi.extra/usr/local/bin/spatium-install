@@ -1,0 +1,344 @@
+#!/bin/bash
+# spatium-install — Proxmox-style installer wizard for the
+# SpatiumDDI appliance.
+#
+# Asks the operator for target disk, hostname, admin user/password,
+# network (DHCP or static), and timezone; then partitions the disk
+# (GPT: 512 MiB ESP + rest root), rsyncs the live rootfs onto it,
+# regenerates the initrd for disk boot, installs grub for both BIOS
+# and UEFI, injects the answers, and reboots.
+#
+# Runs automatically on boot when `spatium-mode=install` is in the
+# kernel cmdline (set by the "Install SpatiumDDI to disk" GRUB
+# entry). Also available as a CLI tool from the live shell.
+set -euo pipefail
+
+BACKTITLE="SpatiumDDI Appliance Installer 0.1.0"
+INSTALL_LOG=/var/log/spatium-install.log
+MOUNT=/mnt/target
+
+mkdir -p /var/log
+: > "$INSTALL_LOG"
+log() { echo "[$(date -Iseconds)] $*" | tee -a "$INSTALL_LOG"; }
+
+# Wizard state — all set by the prompt functions below.
+TARGET_DISK=""
+HOSTNAME="spatiumddi"
+ADMIN_USER="admin"
+ADMIN_PASSWORD=""
+NET_MODE="dhcp"
+NET_INTERFACE=""
+NET_IP=""
+NET_PREFIX="24"
+NET_GATEWAY=""
+NET_DNS="1.1.1.1 1.0.0.1"
+TIMEZONE="UTC"
+
+# ── Prompts ───────────────────────────────────────────────────────────────────
+
+welcome() {
+    whiptail --backtitle "$BACKTITLE" --title "Welcome" \
+        --msgbox "Welcome to the SpatiumDDI Appliance Installer.\n\n\
+This installer will ERASE a target disk and install SpatiumDDI to it.\n\n\
+You'll be asked for:\n\
+  - Target disk\n\
+  - Hostname\n\
+  - Admin OS user + password (web-UI login is separate)\n\
+  - Network (DHCP or static)\n\
+  - Timezone\n\n\
+Press OK to begin, or Ctrl-C to drop to a shell." 18 70
+}
+
+pick_disk() {
+    local options=()
+    local live_src
+    live_src=$(findmnt -no SOURCE /run/live/medium 2>/dev/null || \
+               findmnt -no SOURCE /lib/live/mount/medium 2>/dev/null || true)
+    # Strip partition suffix to compare against the disk node.
+    local live_disk
+    live_disk=$(lsblk -no PKNAME "$live_src" 2>/dev/null || true)
+    [ -n "$live_disk" ] && live_disk="/dev/$live_disk"
+
+    while IFS= read -r line; do
+        local name size model
+        name=$(echo "$line" | awk '{print $1}')
+        size=$(echo "$line" | awk '{print $2}')
+        model=$(echo "$line" | cut -d' ' -f3- | sed 's/  */ /g')
+        [ -z "$model" ] && model="(no model)"
+        # Skip the live medium itself.
+        [ "/dev/$name" = "$live_disk" ] && continue
+        options+=("/dev/$name" "$size — $model")
+    done < <(lsblk -dn -o NAME,SIZE,MODEL -r 2>/dev/null | grep -vE "^(sr|loop|fd|ram|zram)")
+
+    if [ ${#options[@]} -eq 0 ]; then
+        whiptail --backtitle "$BACKTITLE" --title "No disks" \
+            --msgbox "No installable disks found.\n\nAttach a target disk to the VM and reboot." 10 60
+        exit 1
+    fi
+
+    TARGET_DISK=$(whiptail --backtitle "$BACKTITLE" --title "Target Disk" \
+        --menu "Select the disk to install SpatiumDDI to.\nALL DATA on the chosen disk will be DESTROYED." \
+        20 70 10 "${options[@]}" 3>&1 1>&2 2>&3)
+}
+
+ask_hostname() {
+    HOSTNAME=$(whiptail --backtitle "$BACKTITLE" --title "Hostname" \
+        --inputbox "System hostname (also shown in shell prompts + audit logs):" \
+        10 70 "$HOSTNAME" 3>&1 1>&2 2>&3)
+    [ -z "$HOSTNAME" ] && HOSTNAME="spatiumddi"
+}
+
+ask_user_password() {
+    ADMIN_USER=$(whiptail --backtitle "$BACKTITLE" --title "Admin OS user" \
+        --inputbox "OS-level admin username (for SSH + sudo).\n\nThe SpatiumDDI web UI uses 'admin/admin' separately — change it on first login." \
+        12 70 "$ADMIN_USER" 3>&1 1>&2 2>&3)
+    [ -z "$ADMIN_USER" ] && ADMIN_USER="admin"
+
+    while true; do
+        local p1 p2
+        p1=$(whiptail --backtitle "$BACKTITLE" --title "Admin password" \
+            --passwordbox "Password for '$ADMIN_USER' (and root):" 10 60 \
+            3>&1 1>&2 2>&3)
+        p2=$(whiptail --backtitle "$BACKTITLE" --title "Confirm password" \
+            --passwordbox "Repeat:" 10 60 3>&1 1>&2 2>&3)
+        if [ "$p1" = "$p2" ] && [ -n "$p1" ]; then
+            ADMIN_PASSWORD="$p1"
+            break
+        fi
+        whiptail --backtitle "$BACKTITLE" \
+            --msgbox "Passwords don't match or are empty. Try again." 8 50
+    done
+}
+
+ask_network() {
+    NET_MODE=$(whiptail --backtitle "$BACKTITLE" --title "Network" \
+        --menu "How should the appliance configure its network?" 12 70 2 \
+        "dhcp"   "Automatic via DHCP (recommended for evaluation)" \
+        "static" "Static IP" \
+        3>&1 1>&2 2>&3)
+
+    if [ "$NET_MODE" = "static" ]; then
+        local ifs=()
+        for iface in $(ls /sys/class/net 2>/dev/null | grep -E "^(en|eth)"); do
+            ifs+=("$iface" "$(cat /sys/class/net/$iface/address 2>/dev/null || echo "?")")
+        done
+        if [ ${#ifs[@]} -eq 0 ]; then
+            whiptail --msgbox "No ethernet interfaces found — falling back to DHCP." 8 60
+            NET_MODE="dhcp"
+            return
+        fi
+        NET_INTERFACE=$(whiptail --backtitle "$BACKTITLE" --title "Static IP — interface" \
+            --menu "Pick an interface:" 12 60 5 "${ifs[@]}" 3>&1 1>&2 2>&3)
+        NET_IP=$(whiptail --backtitle "$BACKTITLE" --title "Static IP — address" \
+            --inputbox "IPv4 address (e.g. 192.168.1.10):" 10 60 "" 3>&1 1>&2 2>&3)
+        NET_PREFIX=$(whiptail --backtitle "$BACKTITLE" --title "Static IP — prefix" \
+            --inputbox "Prefix length:" 10 60 "$NET_PREFIX" 3>&1 1>&2 2>&3)
+        NET_GATEWAY=$(whiptail --backtitle "$BACKTITLE" --title "Static IP — gateway" \
+            --inputbox "Gateway:" 10 60 "" 3>&1 1>&2 2>&3)
+        NET_DNS=$(whiptail --backtitle "$BACKTITLE" --title "Static IP — DNS" \
+            --inputbox "DNS servers (space-separated):" 10 60 "$NET_DNS" 3>&1 1>&2 2>&3)
+    fi
+}
+
+ask_timezone() {
+    TIMEZONE=$(whiptail --backtitle "$BACKTITLE" --title "Timezone" \
+        --inputbox "Timezone (IANA name, e.g. America/Toronto, Europe/Berlin, UTC):" \
+        10 70 "$TIMEZONE" 3>&1 1>&2 2>&3)
+    [ -z "$TIMEZONE" ] && TIMEZONE="UTC"
+}
+
+confirm() {
+    local s
+    s="Target disk: $TARGET_DISK\n"
+    s+="Hostname:    $HOSTNAME\n"
+    s+="OS user:     $ADMIN_USER\n"
+    s+="Network:     $NET_MODE"
+    if [ "$NET_MODE" = "static" ]; then
+        s+=" ($NET_INTERFACE: $NET_IP/$NET_PREFIX via $NET_GATEWAY)"
+    fi
+    s+="\nTimezone:    $TIMEZONE\n\n"
+    s+="WARNING: $TARGET_DISK will be ERASED. There is no undo.\n\n"
+    s+="Proceed with installation?"
+    whiptail --backtitle "$BACKTITLE" --title "Confirm" \
+        --yesno "$s" 18 70 \
+        || { echo "Cancelled."; exit 1; }
+}
+
+# ── Install ───────────────────────────────────────────────────────────────────
+
+partition_node() {
+    # Translate $TARGET_DISK + index → /dev/sdaN or /dev/nvme0n1pN
+    local idx="$1"
+    case "$TARGET_DISK" in
+        *nvme*|*mmcblk*) echo "${TARGET_DISK}p${idx}" ;;
+        *)               echo "${TARGET_DISK}${idx}"  ;;
+    esac
+}
+
+do_install() {
+    local ESP ROOT
+    ESP=$(partition_node 1)
+    ROOT=$(partition_node 2)
+
+    log "Install starting: target=$TARGET_DISK ESP=$ESP ROOT=$ROOT"
+
+    {
+        echo "5"; echo "XXX"; echo "Partitioning $TARGET_DISK..."; echo "XXX"
+        wipefs -af "$TARGET_DISK"           >> "$INSTALL_LOG" 2>&1
+        sgdisk -Z "$TARGET_DISK"            >> "$INSTALL_LOG" 2>&1
+        sgdisk -n1:0:+512M -t1:ef00 -c1:ESP \
+               -n2:0:0     -t2:8300 -c2:root \
+               "$TARGET_DISK"               >> "$INSTALL_LOG" 2>&1
+        partprobe "$TARGET_DISK"            >> "$INSTALL_LOG" 2>&1 || true
+        udevadm settle                      >> "$INSTALL_LOG" 2>&1 || true
+        sleep 1
+
+        echo "10"; echo "XXX"; echo "Formatting partitions..."; echo "XXX"
+        mkfs.fat -F32 -n ESP "$ESP"         >> "$INSTALL_LOG" 2>&1
+        mkfs.ext4 -F -L root "$ROOT"        >> "$INSTALL_LOG" 2>&1
+
+        echo "15"; echo "XXX"; echo "Mounting target..."; echo "XXX"
+        mkdir -p "$MOUNT"
+        mount "$ROOT" "$MOUNT"
+        mkdir -p "$MOUNT/boot/efi"
+        mount "$ESP" "$MOUNT/boot/efi"
+
+        echo "20"; echo "XXX"; echo "Copying root filesystem (3-5 min)..."; echo "XXX"
+        rsync -aAXH \
+            --exclude="/dev/*" \
+            --exclude="/proc/*" \
+            --exclude="/sys/*" \
+            --exclude="/tmp/*" \
+            --exclude="/run/*" \
+            --exclude="/mnt/*" \
+            --exclude="/media/*" \
+            --exclude="/lib/live" \
+            --exclude="/var/log/*" \
+            --exclude="/var/cache/apt/archives/*" \
+            --exclude="/var/lib/spatiumddi/firstboot.done" \
+            --exclude="/etc/spatiumddi/.env" \
+            / "$MOUNT/" >> "$INSTALL_LOG" 2>&1
+
+        echo "65"; echo "XXX"; echo "Writing system config..."; echo "XXX"
+        echo "$HOSTNAME" > "$MOUNT/etc/hostname"
+        cat > "$MOUNT/etc/hosts" <<EOF
+127.0.0.1 localhost
+127.0.1.1 $HOSTNAME
+::1 ip6-localhost ip6-loopback
+ff02::1 ip6-allnodes
+ff02::2 ip6-allrouters
+EOF
+
+        local ROOT_UUID ESP_UUID
+        ROOT_UUID=$(blkid -s UUID -o value "$ROOT")
+        ESP_UUID=$(blkid -s UUID -o value "$ESP")
+        cat > "$MOUNT/etc/fstab" <<EOF
+UUID=$ROOT_UUID  /          ext4  defaults                       0 1
+UUID=$ESP_UUID   /boot/efi  vfat  umask=0077,shortname=winnt     0 2
+EOF
+
+        # Timezone
+        if [ -e "/usr/share/zoneinfo/$TIMEZONE" ]; then
+            ln -sf "/usr/share/zoneinfo/$TIMEZONE" "$MOUNT/etc/localtime"
+            echo "$TIMEZONE" > "$MOUNT/etc/timezone"
+        else
+            log "WARN: timezone $TIMEZONE not found, defaulting to UTC"
+            ln -sf "/usr/share/zoneinfo/UTC" "$MOUNT/etc/localtime"
+            echo "UTC" > "$MOUNT/etc/timezone"
+        fi
+
+        # Static-IP override (DHCP is already covered by 20-dhcp-all.network)
+        if [ "$NET_MODE" = "static" ]; then
+            mkdir -p "$MOUNT/etc/systemd/network"
+            {
+                echo "[Match]"
+                echo "Name=$NET_INTERFACE"
+                echo
+                echo "[Network]"
+                echo "Address=$NET_IP/$NET_PREFIX"
+                echo "Gateway=$NET_GATEWAY"
+                for dns in $NET_DNS; do
+                    echo "DNS=$dns"
+                done
+            } > "$MOUNT/etc/systemd/network/10-spatium-static.network"
+            # Remove the wildcard DHCP so it doesn't race with our static.
+            rm -f "$MOUNT/etc/systemd/network/20-dhcp-all.network"
+        fi
+
+        echo "75"; echo "XXX"; echo "Creating admin user..."; echo "XXX"
+        # Bind /proc /sys /dev for chroot operations.
+        for d in proc sys dev; do
+            mount --bind "/$d" "$MOUNT/$d"
+        done
+
+        # User + password. -m creates home; -G adds to sudo + docker groups.
+        chroot "$MOUNT" useradd -m -G sudo,docker -s /bin/bash "$ADMIN_USER" \
+            >> "$INSTALL_LOG" 2>&1 || true
+        echo "$ADMIN_USER:$ADMIN_PASSWORD" | chroot "$MOUNT" chpasswd \
+            >> "$INSTALL_LOG" 2>&1
+        echo "root:$ADMIN_PASSWORD" | chroot "$MOUNT" chpasswd \
+            >> "$INSTALL_LOG" 2>&1
+
+        # Disable cloud-init on the installed system (we configured
+        # everything ourselves; cloud-init would just sit waiting for a
+        # datasource that isn't there).
+        chroot "$MOUNT" systemctl mask \
+            cloud-init.service cloud-init-local.service \
+            cloud-config.service cloud-final.service \
+            >> "$INSTALL_LOG" 2>&1 || true
+
+        echo "80"; echo "XXX"; echo "Installing bootloader (BIOS + UEFI)..."; echo "XXX"
+        chroot "$MOUNT" grub-install --target=i386-pc "$TARGET_DISK" \
+            >> "$INSTALL_LOG" 2>&1
+        chroot "$MOUNT" grub-install --target=x86_64-efi \
+            --efi-directory=/boot/efi \
+            --bootloader-id=SPATIUMDDI \
+            --removable \
+            >> "$INSTALL_LOG" 2>&1 || true
+        chroot "$MOUNT" update-grub >> "$INSTALL_LOG" 2>&1
+
+        echo "90"; echo "XXX"; echo "Regenerating initrd for disk boot..."; echo "XXX"
+        # The squashfs-derived initrd has live-boot active. The
+        # installed system needs a regular disk-boot initrd. Regenerate
+        # in chroot — without `boot=live` on the cmdline it'll be a
+        # normal initrd.
+        chroot "$MOUNT" update-initramfs -u >> "$INSTALL_LOG" 2>&1
+
+        echo "95"; echo "XXX"; echo "Unmounting..."; echo "XXX"
+        for d in dev sys proc; do
+            umount "$MOUNT/$d" 2>/dev/null || true
+        done
+        umount "$MOUNT/boot/efi"
+        umount "$MOUNT"
+        sync
+
+        echo "100"; echo "XXX"; echo "Done."; echo "XXX"
+        sleep 1
+    } | whiptail --backtitle "$BACKTITLE" --title "Installing SpatiumDDI" \
+        --gauge "" 10 70 0
+
+    whiptail --backtitle "$BACKTITLE" --title "Complete" \
+        --msgbox "Installation complete.\n\nThe system will reboot. Remove the install media before it comes back up.\n\nFirst boot will take 2-5 min while it pulls the SpatiumDDI container images. The web UI will then be reachable at\n\n   http://<the appliance's IP>/\n\nDefault login: admin / admin (forces password change on first login)." 18 70
+
+    log "Install complete. Rebooting."
+    systemctl reboot
+}
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+main() {
+    if [ "$(id -u)" -ne 0 ]; then
+        echo "Run as root." >&2
+        exit 1
+    fi
+    welcome
+    pick_disk
+    ask_hostname
+    ask_user_password
+    ask_network
+    ask_timezone
+    confirm
+    do_install
+}
+
+main "$@"
