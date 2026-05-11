@@ -1,21 +1,24 @@
 #!/bin/sh
 # Quick at-a-glance status for the SpatiumDDI appliance stack.
 # Intended to be the operator's first command after SSH'ing in.
+# Runs as the unprivileged admin user; reads only world-readable
+# state. /etc/spatiumddi/.env is mode 0600 (it has secrets) so we
+# never touch it from this script.
 set -eu
 
 COMPOSE_DIR=/usr/local/share/spatiumddi
-ENV_FILE=/etc/spatiumddi/.env
+RELEASE_FILE=/etc/spatiumddi/release
 
 cd "$COMPOSE_DIR"
 
 echo "── SpatiumDDI appliance ──────────────────────────────────────"
-if [ -f /etc/spatiumddi/release ]; then
-    awk '/^SPATIUMDDI_VERSION=/{ sub(/^SPATIUMDDI_VERSION=/, "Release pin: "); print }' /etc/spatiumddi/release
-elif [ -f "$ENV_FILE" ]; then
-    awk '/^SPATIUMDDI_VERSION=/{ sub(/^SPATIUMDDI_VERSION=/, "Release pin: "); print }' "$ENV_FILE"
+if [ -r "$RELEASE_FILE" ]; then
+    awk '/^SPATIUMDDI_VERSION=/{ sub(/^SPATIUMDDI_VERSION=/, "Release pin: "); print }' "$RELEASE_FILE"
+else
+    echo "Release pin: latest  (no /etc/spatiumddi/release override)"
 fi
 
-if [ -f /var/lib/spatiumddi/firstboot.done ]; then
+if [ -r /var/lib/spatiumddi/firstboot.done ]; then
     echo "First boot:  $(cat /var/lib/spatiumddi/firstboot.done)"
 else
     echo "First boot:  NOT YET COMPLETED — see /var/log/spatiumddi/firstboot.log"
@@ -24,4 +27,16 @@ fi
 IP=$(ip -4 -o addr show scope global | awk '{print $4}' | cut -d/ -f1 | head -1)
 echo "Web UI:      http://${IP:-<appliance-ip>}/"
 echo
-docker-compose ps
+
+# docker-compose ps needs the .env to resolve image tags. We don't
+# have permission to read it as the admin user (it's 0600 root:root
+# because of POSTGRES_PASSWORD + SECRET_KEY + Fernet key). Two
+# options: pass --env-file with a workaround, or require sudo. We
+# go with sudo here — it's the operationally normal pattern and
+# the user is in the sudo group.
+if [ "$(id -u)" -eq 0 ]; then
+    docker-compose ps
+else
+    sudo docker-compose ps 2>/dev/null || \
+        echo "  (run 'sudo docker-compose -f $COMPOSE_DIR/docker-compose.yml ps' for container state)"
+fi
