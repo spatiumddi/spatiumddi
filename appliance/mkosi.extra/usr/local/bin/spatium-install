@@ -24,7 +24,13 @@ MOUNT=/mnt/target
 
 mkdir -p /var/log
 : > "$INSTALL_LOG"
-log() { echo "[$(date -Iseconds)] $*" | tee -a "$INSTALL_LOG"; }
+# Log to file only — NOT stdout. The do_install brace group below
+# pipes stdout to whiptail's --gauge protocol parser, which expects
+# only "XXX" / percentage / prompt-text lines. If log() tee'd to
+# stdout it would inject timestamped lines into the gauge stream
+# between XXX blocks and break the prompt update protocol — that's
+# exactly the "progress text never changes" symptom we hit.
+log() { echo "[$(date -Iseconds)] $*" >> "$INSTALL_LOG"; }
 
 # Full bash trace to a separate file — when the wizard bails
 # unexpectedly, this captures every command + variable expansion so
