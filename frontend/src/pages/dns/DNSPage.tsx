@@ -3310,6 +3310,14 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
                 </div>
                 <p className="text-xs text-muted-foreground">
                   {s.host}:{s.port}
+                  {s.last_seen_ip && (
+                    <span
+                      className="ml-1.5 font-mono"
+                      title="Source IP of the most recent agent heartbeat"
+                    >
+                      ({s.last_seen_ip})
+                    </span>
+                  )}
                   {s.roles.length > 0 && ` · ${s.roles.join(", ")}`}
                   {s.last_sync_at &&
                     ` · synced ${new Date(s.last_sync_at).toLocaleDateString()}`}

@@ -268,7 +268,10 @@ services:
       CONTROL_PLANE_URL: ${CONTROL_PLANE_URL:-http://api:8000}
       DNS_AGENT_KEY: ${DNS_AGENT_KEY}
       SERVER_NAME: ${APPLIANCE_HOSTNAME:-dns-bind9}
-      AGENT_GROUP: default
+      # Phase 6 — operator picks the group at install time; firstboot
+      # writes ``AGENT_GROUP`` into .env. Default keeps the AIO box
+      # registering into "default" if .env wasn't seeded.
+      AGENT_GROUP: ${AGENT_GROUP:-default}
       AGENT_ROLES: authoritative
       SPATIUM_INSECURE_SKIP_TLS_VERIFY: "1"
     volumes:
@@ -299,7 +302,11 @@ services:
       CONTROL_PLANE_URL: ${CONTROL_PLANE_URL:-http://api:8000}
       DNS_AGENT_KEY: ${DNS_AGENT_KEY}
       SERVER_NAME: ${APPLIANCE_HOSTNAME:-dns-powerdns}
-      AGENT_GROUP: default-powerdns
+      # Default differs from bind9 — group features (DNSSEC sign/
+      # unsign, ALIAS, LUA, catalog zones) gate on every server in
+      # a group running the powerdns driver, so we don't want a
+      # bind9 + powerdns mix in the "default" group by accident.
+      AGENT_GROUP: ${AGENT_GROUP:-default-powerdns}
       AGENT_ROLES: authoritative
       SPATIUM_INSECURE_SKIP_TLS_VERIFY: "1"
     volumes:
@@ -328,7 +335,7 @@ services:
       SPATIUM_API_URL: ${CONTROL_PLANE_URL:-http://127.0.0.1:8000}
       SPATIUM_AGENT_KEY: ${DHCP_AGENT_KEY}
       SPATIUM_SERVER_NAME: ${APPLIANCE_HOSTNAME:-dhcp-kea}
-      AGENT_GROUP: default
+      AGENT_GROUP: ${AGENT_GROUP:-default}
       AGENT_ROLES: primary
       SPATIUM_INSECURE_SKIP_TLS_VERIFY: "1"
     volumes:

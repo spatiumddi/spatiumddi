@@ -13,7 +13,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 import structlog
-from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
 from jose import JWTError
 from pydantic import BaseModel
 from sqlalchemy import select
@@ -322,6 +322,7 @@ async def agent_config_longpoll(
 
 @router.post("/heartbeat", response_model=AgentHeartbeatResponseV2)
 async def agent_heartbeat(
+    request: Request,
     body: AgentHeartbeatRequest,
     db: DB,
     auth: tuple[DNSServer, dict[str, Any]] = Depends(_auth_agent),
@@ -332,6 +333,12 @@ async def agent_heartbeat(
     server.last_seen_at = now
     server.last_health_check_at = now
     server.status = "active"
+    # Capture the source IP so the operator can identify which host
+    # this agent is running on — the operator-set ``host`` column is
+    # just a label that may not match the real machine in NAT /
+    # distributed deployments.
+    if request.client is not None:
+        server.last_seen_ip = request.client.host
 
     # Process op ACKs
     for ack in body.ops_ack:

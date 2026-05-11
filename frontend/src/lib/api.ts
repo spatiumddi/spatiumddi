@@ -3798,6 +3798,10 @@ export interface DNSServer {
   /** Agent-state fields surfaced for the Server Detail modal. */
   agent_id: string | null;
   last_seen_at: string | null;
+  /** Source IP of the most recent agent heartbeat — operator-visible
+   *  to identify which host an agent is on (the operator-set ``host``
+   *  is just a label; doesn't reflect NAT / distributed deployments). */
+  last_seen_ip: string | null;
   last_config_etag: string | null;
   pending_approval: boolean;
   is_primary: boolean;
@@ -5061,6 +5065,10 @@ export interface DHCPServer {
   agent_registered: boolean;
   agent_approved: boolean;
   agent_last_seen: string | null;
+  /** Source IP of the most recent agent heartbeat — operator-visible
+   *  to identify which host an agent runs on (the operator-set ``host``
+   *  is just a label; doesn't reflect NAT / distributed deployments). */
+  last_seen_ip: string | null;
   agent_version: string | null;
   config_etag: string | null;
   config_pushed_at: string | null;

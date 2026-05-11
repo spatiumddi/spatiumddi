@@ -14,7 +14,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 import structlog
-from fastapi import APIRouter, Depends, Header, HTTPException, Response, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Request, Response, status
 from jose import JWTError
 from pydantic import BaseModel
 from sqlalchemy import select
@@ -401,6 +401,7 @@ async def agent_config_longpoll(
 
 @router.post("/heartbeat", response_model=AgentHeartbeatResponse)
 async def agent_heartbeat(
+    request: Request,
     body: AgentHeartbeatRequest,
     db: DB,
     auth: tuple[DHCPServer, dict[str, Any]] = Depends(_auth_agent),
@@ -410,6 +411,11 @@ async def agent_heartbeat(
     server.agent_last_seen = now
     server.last_health_check_at = now
     server.status = "active"
+    # Capture the source IP so the operator can identify which host
+    # the agent is on — the operator-set ``host`` column may not
+    # match the real machine in NAT / distributed deployments.
+    if request.client is not None:
+        server.last_seen_ip = request.client.host
     if body.agent_version:
         server.agent_version = body.agent_version
 

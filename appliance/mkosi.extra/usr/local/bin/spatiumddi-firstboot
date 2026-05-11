@@ -104,12 +104,14 @@ if [ ! -f "$ENV_FILE" ]; then
     INSTALL_CONTROL_PLANE_URL=""
     INSTALL_DNS_AGENT_KEY=""
     INSTALL_DHCP_AGENT_KEY=""
+    INSTALL_AGENT_GROUP=""
     if [ -f /etc/spatiumddi/role-config ]; then
         # shellcheck disable=SC1091
         . /etc/spatiumddi/role-config
         INSTALL_CONTROL_PLANE_URL="$CONTROL_PLANE_URL"
         INSTALL_DNS_AGENT_KEY="$DNS_AGENT_KEY"
         INSTALL_DHCP_AGENT_KEY="$DHCP_AGENT_KEY"
+        INSTALL_AGENT_GROUP="$AGENT_GROUP"
     fi
 
     # COMPOSE_PROFILES drives which services come up.
@@ -129,18 +131,21 @@ if [ ! -f "$ENV_FILE" ]; then
             DNS_AGENT_KEY_VAL="$INSTALL_DNS_AGENT_KEY"
             DHCP_AGENT_KEY_VAL=""
             CONTROL_PLANE_URL_VAL="$INSTALL_CONTROL_PLANE_URL"
+            AGENT_GROUP_VAL="${INSTALL_AGENT_GROUP:-default}"
             ;;
         dns-agent-powerdns)
             COMPOSE_PROFILES_VAL="dns-powerdns,agent"
             DNS_AGENT_KEY_VAL="$INSTALL_DNS_AGENT_KEY"
             DHCP_AGENT_KEY_VAL=""
             CONTROL_PLANE_URL_VAL="$INSTALL_CONTROL_PLANE_URL"
+            AGENT_GROUP_VAL="${INSTALL_AGENT_GROUP:-default-powerdns}"
             ;;
         dhcp-agent)
             COMPOSE_PROFILES_VAL="dhcp,agent"
             DNS_AGENT_KEY_VAL=""
             DHCP_AGENT_KEY_VAL="$INSTALL_DHCP_AGENT_KEY"
             CONTROL_PLANE_URL_VAL="$INSTALL_CONTROL_PLANE_URL"
+            AGENT_GROUP_VAL="${INSTALL_AGENT_GROUP:-default}"
             ;;
         control-only)
             # Control plane only — no bundled DNS/DHCP. Agent keys
@@ -148,20 +153,26 @@ if [ ! -f "$ENV_FILE" ]; then
             # for picking this role is to register external agents.
             # They reveal the keys via Settings -> Security -> Agent
             # bootstrap keys and paste them into agent installs
-            # elsewhere.
+            # elsewhere. AGENT_GROUP is irrelevant here (no local
+            # agent to register) but the .env carries a default
+            # value so the compose env subst doesn't error.
             COMPOSE_PROFILES_VAL="control"
             DNS_AGENT_KEY_VAL=$(gen_hex 24)
             DHCP_AGENT_KEY_VAL=$(gen_hex 24)
             CONTROL_PLANE_URL_VAL=""
+            AGENT_GROUP_VAL="default"
             ;;
         *)
             # ``control`` (default) — control plane + bundled DNS +
-            # DHCP. Single-box AIO deployment.
+            # DHCP. Single-box AIO deployment. Bundled agents register
+            # into the same default group so an external agent joining
+            # later lands alongside them.
             ROLE=control
             COMPOSE_PROFILES_VAL="control,dns-bind9,dhcp"
             DNS_AGENT_KEY_VAL=$(gen_hex 24)
             DHCP_AGENT_KEY_VAL=$(gen_hex 24)
             CONTROL_PLANE_URL_VAL=""
+            AGENT_GROUP_VAL="default"
             ;;
     esac
     cat > "$ENV_FILE" <<EOF
@@ -176,6 +187,7 @@ DNS_AGENT_KEY=${DNS_AGENT_KEY_VAL}
 DHCP_AGENT_KEY=${DHCP_AGENT_KEY_VAL}
 COMPOSE_PROFILES=${COMPOSE_PROFILES_VAL}
 CONTROL_PLANE_URL=${CONTROL_PLANE_URL_VAL}
+AGENT_GROUP=${AGENT_GROUP_VAL}
 APPLIANCE_ROLE=${ROLE}
 APPLIANCE_VERSION=${APPLIANCE_VERSION_VAL}
 APPLIANCE_HOSTNAME=${APPLIANCE_HOSTNAME_VAL}

@@ -282,6 +282,7 @@ class ServerResponse(BaseModel):
     # without crawling the database.
     agent_id: uuid.UUID | None
     last_seen_at: datetime | None
+    last_seen_ip: str | None
     last_config_etag: str | None
     pending_approval: bool
     is_primary: bool
@@ -310,6 +311,7 @@ class ServerResponse(BaseModel):
             is_agentless=is_agentless(s.driver),
             agent_id=s.agent_id,
             last_seen_at=s.last_seen_at,
+            last_seen_ip=s.last_seen_ip,
             last_config_etag=s.last_config_etag,
             pending_approval=s.pending_approval,
             is_primary=s.is_primary,

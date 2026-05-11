@@ -120,6 +120,12 @@ ROLE="control"
 CONTROL_PLANE_URL=""
 DNS_AGENT_KEY=""
 DHCP_AGENT_KEY=""
+# Agent group on the control plane this appliance joins. Auto-
+# created on first registration if it doesn't exist. Operators
+# managing multiple sites (us-east-dns / eu-prod-dhcp / lab-dns)
+# pick a group name at install time; the value drives which
+# zones / scopes get pushed to this agent.
+AGENT_GROUP=""
 
 # ── Prompts ───────────────────────────────────────────────────────────────────
 
@@ -217,6 +223,25 @@ ask_agent_config() {
     else
         DHCP_AGENT_KEY="$key_val"
     fi
+
+    # Per-role default group name. powerdns uses a separate default
+    # because group-level features gate on every server in a group
+    # running the same driver (mixing bind9 + powerdns in one group
+    # is invalid).
+    local default_group
+    case "$ROLE" in
+        dns-agent-powerdns) default_group="default-powerdns" ;;
+        *)                  default_group="default" ;;
+    esac
+    AGENT_GROUP=$(whiptail --backtitle "$BACKTITLE" --title "Agent group" \
+        --inputbox "Which group on the control plane should this agent join?\n\nEnter an existing group's name to register this agent into it. Type a new name to have the control plane auto-create the group on first registration.\n\nMultiple agents in the same group serve the same zones / scopes (DNS) or share lease state (DHCP HA pair). Leave the default for single-site deployments; pick a descriptive name for multi-site / multi-tenant ('us-east-dns', 'lab-dhcp', 'site-toronto')." \
+        16 76 "$default_group" 3>&1 1>&2 2>&3) \
+        || on_cancel "agent group"
+    AGENT_GROUP=$(echo "$AGENT_GROUP" | tr -d '[:space:]')
+    if [ -z "$AGENT_GROUP" ]; then
+        AGENT_GROUP="$default_group"
+    fi
+    log "Agent group: $AGENT_GROUP"
 }
 
 pick_disk() {
@@ -377,6 +402,7 @@ confirm() {
     case "$ROLE" in
         dns-agent-bind9|dns-agent-powerdns|dhcp-agent)
             s+="Control URL: $CONTROL_PLANE_URL\n"
+            s+="Agent group: $AGENT_GROUP\n"
             ;;
     esac
     s+="Target disk: $TARGET_DISK\n"
@@ -504,6 +530,7 @@ ROLE=$ROLE
 CONTROL_PLANE_URL=$CONTROL_PLANE_URL
 DNS_AGENT_KEY=$DNS_AGENT_KEY
 DHCP_AGENT_KEY=$DHCP_AGENT_KEY
+AGENT_GROUP=$AGENT_GROUP
 EOF
         # Operator-supplied agent key is sensitive even before
         # firstboot transcribes it into .env — restrict the
