@@ -1,9 +1,9 @@
-"""Appliance management — Phase 4a frame.
+"""Appliance management — Phase 4 root router.
 
-Phase 4a (issue #134) lands just the visibility gating + a minimal
-``/info`` endpoint so the frontend can render the Appliance management
-hub. Every sub-phase below extends the same router family with the
-real surfaces (TLS upload, release manager, containers, etc.).
+Phase 4a landed visibility gating + ``/info``. Sub-phases attach their
+endpoints by including a sub-router into this APIRouter — keeps each
+surface (TLS / releases / containers / etc.) in its own file but they
+all share the same ``/api/v1/appliance`` prefix + permission gate.
 
 Gating model:
 
@@ -22,10 +22,16 @@ from __future__ import annotations
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
 
+from app.api.v1.appliance.tls import router as tls_router
 from app.config import settings
 from app.core.permissions import require_permission
 
 router = APIRouter()
+
+# Sub-routers — each Phase 4 sub-surface adds itself here as its
+# file lands. Prefixes are scoped under the appliance namespace so
+# the URL stays /api/v1/appliance/<surface>/...
+router.include_router(tls_router, prefix="/tls")
 
 
 class ApplianceInfo(BaseModel):

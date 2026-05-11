@@ -113,6 +113,8 @@ _RESOURCE_NAMESPACE: dict[str, str] = {
     # Backup + restore (issue #117 Phase 3)
     "platform": "system",
     "backup_target": "backup.target",
+    # Appliance management (issue #134 Phase 4)
+    "appliance_certificate": "appliance.tls",
 }
 
 
@@ -134,6 +136,12 @@ _SPECIAL_EVENT_MAP: dict[tuple[str, str], str] = {
     # writes a separate session-flush audit row so the event
     # fires through the standard pipeline.
     ("factory_reset_performed", "platform"): "system.factory_reset",
+    # Appliance certificate activation — the upload path fires
+    # ``appliance.tls.created`` (via the namespace map); explicit
+    # activation of an existing cert fires a distinct event so
+    # operators can subscribe specifically to "the appliance just
+    # switched serving certs".
+    ("activate_certificate", "appliance_certificate"): "appliance.tls.activated",
 }
 
 

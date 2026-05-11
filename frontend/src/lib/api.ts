@@ -6723,6 +6723,63 @@ export const applianceApi = {
   getInfo: () => api.get<ApplianceInfo>("/appliance/info").then((r) => r.data),
 };
 
+// Appliance Web UI certificate management (Phase 4b.1). Mounted at
+// /api/v1/appliance/tls. Phase 4b.1 ships upload + list + activate +
+// delete; CSR generation lands in 4b.3, Let's Encrypt in 4b.4.
+export type CertificateSource =
+  | "uploaded"
+  | "csr"
+  | "letsencrypt"
+  | "self-signed";
+
+export interface ApplianceCertificate {
+  id: string;
+  name: string;
+  source: CertificateSource;
+  is_active: boolean;
+  activated_at: string | null;
+  subject_cn: string;
+  issuer_cn: string;
+  sans: string[];
+  fingerprint_sha256: string;
+  valid_from: string;
+  valid_to: string;
+  notes: string | null;
+  created_at: string;
+  created_by_user_id: string | null;
+}
+
+export interface ApplianceCertificateDetail extends ApplianceCertificate {
+  cert_pem: string;
+}
+
+export interface CertificateUploadPayload {
+  name: string;
+  cert_pem: string;
+  key_pem: string;
+  notes?: string | null;
+  activate?: boolean;
+}
+
+export const applianceTlsApi = {
+  list: () =>
+    api.get<ApplianceCertificate[]>("/appliance/tls").then((r) => r.data),
+  get: (id: string) =>
+    api
+      .get<ApplianceCertificateDetail>(`/appliance/tls/${id}`)
+      .then((r) => r.data),
+  upload: (body: CertificateUploadPayload) =>
+    api
+      .post<ApplianceCertificate>("/appliance/tls/upload", body)
+      .then((r) => r.data),
+  activate: (id: string) =>
+    api
+      .post<ApplianceCertificate>(`/appliance/tls/${id}/activate`)
+      .then((r) => r.data),
+  remove: (id: string) =>
+    api.delete<void>(`/appliance/tls/${id}`).then((r) => r.data),
+};
+
 // ── Kubernetes integration ─────────────────────────────────────────
 
 export interface KubernetesCluster {

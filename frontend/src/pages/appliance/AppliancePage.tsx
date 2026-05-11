@@ -11,6 +11,7 @@ import {
 
 import { applianceApi } from "@/lib/api";
 import { useSessionState } from "@/lib/useSessionState";
+import { CertificatesTab } from "./CertificatesTab";
 
 /**
  * SpatiumDDI OS appliance management hub (issue #134, Phase 4).
@@ -151,7 +152,11 @@ export function AppliancePage() {
       </div>
 
       <div className="flex-1 overflow-auto bg-background p-6">
-        <PhasePlaceholder spec={active} />
+        {tab === "tls" ? (
+          <CertificatesTab />
+        ) : (
+          <PhasePlaceholder spec={active} />
+        )}
       </div>
     </div>
   );
