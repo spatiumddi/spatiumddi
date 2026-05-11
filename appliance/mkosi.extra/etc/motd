@@ -1,18 +1,23 @@
 
-  ____             _   _                  ____  ____  ___
- / ___| _ __   __ _| |_(_)_   _ _ __ ___ |  _ \|  _ \|_ _|
- \___ \| '_ \ / _` | __| | | | | '_ ` _ \| |_) | | | || |
-  ___) | |_) | (_| | |_| | |_| | | | | | |  __/| |_| || |
- |____/| .__/ \__,_|\__|_|\__,_|_| |_| |_|_|   |____/|___|
-       |_|
+SpatiumDDI Appliance — useful commands
+──────────────────────────────────────────────────────────────────────
 
- SpatiumDDI Appliance — all-in-one DDI control plane.
+  spatiumddi-stack-status
+        Quick rollup: docker compose state + appliance version pin
+        + web-UI reachable
 
- First commands:
-   spatiumddi-stack-status         service rollup
-   docker compose -f /usr/local/share/spatiumddi/docker-compose.yml logs
-   tail -f /var/log/spatiumddi/firstboot.log
+  sudo systemctl status spatiumddi-firstboot
+        First-boot orchestrator state (generates secrets,
+        pulls ghcr.io images, brings docker-compose stack up,
+        waits for /health/live)
 
- Web UI:  http://<appliance-ip>/    (default: admin / admin, force-change on first login)
- Docs:    https://spatiumddi.github.io/spatiumddi/
+  sudo tail -f /var/log/spatiumddi/firstboot.log
+        Live tail of the orchestrator's output
 
+  sudo docker-compose -f /usr/local/share/spatiumddi/docker-compose.yml ps
+  sudo docker-compose -f /usr/local/share/spatiumddi/docker-compose.yml logs -f
+
+──────────────────────────────────────────────────────────────────────
+Docs:    https://spatiumddi.github.io/spatiumddi/
+Issues:  https://github.com/spatiumddi/spatiumddi/issues
+──────────────────────────────────────────────────────────────────────

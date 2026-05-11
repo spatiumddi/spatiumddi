@@ -1,0 +1,24 @@
+
+   SpatiumDDI Appliance   —   Debian \r
+
+   ──────────────────────────────────────────────────────────────────
+
+   Hostname:        \n
+   IP address:      \4
+
+   Web UI:          http://\4/
+   Web UI login:    admin / admin   (forces change on first login)
+
+   SSH login:       ssh <username>@\4
+                    (user + password were set at install time)
+
+   ──────────────────────────────────────────────────────────────────
+
+   On this console after login:
+     spatiumddi-stack-status                        service rollup
+     sudo systemctl status spatiumddi-firstboot     boot orchestrator state
+     sudo tail -f /var/log/spatiumddi/firstboot.log
+
+   Docs:  https://spatiumddi.github.io/spatiumddi/
+
+\n login:
