@@ -252,7 +252,7 @@ do_install() {
     log "Install starting: target=$TARGET_DISK BBP=$BBP ESP=$ESP ROOT=$ROOT"
 
     {
-        echo "3"; echo "XXX"; echo "Releasing existing partitions on $TARGET_DISK..."; echo "XXX"
+        echo "XXX"; echo "3"; echo "Releasing existing partitions on $TARGET_DISK..."; echo "XXX"
         # Pre-existing install on the target disk leaves partitions
         # that the live system's systemd-gpt-auto-generator may have
         # auto-mounted (ESP → /boot/efi, root → /sysroot) or that
@@ -272,7 +272,7 @@ do_install() {
             done
         fi
 
-        echo "5"; echo "XXX"; echo "Partitioning $TARGET_DISK..."; echo "XXX"
+        echo "XXX"; echo "5"; echo "Partitioning $TARGET_DISK..."; echo "XXX"
         wipefs -af "$TARGET_DISK"           >> "$INSTALL_LOG" 2>&1
         sgdisk -Z "$TARGET_DISK"            >> "$INSTALL_LOG" 2>&1
         # Force the kernel to forget the old partition table before
@@ -287,17 +287,17 @@ do_install() {
         udevadm settle                      >> "$INSTALL_LOG" 2>&1 || true
         sleep 1
 
-        echo "10"; echo "XXX"; echo "Formatting partitions..."; echo "XXX"
+        echo "XXX"; echo "10"; echo "Formatting partitions..."; echo "XXX"
         mkfs.fat -F32 -n ESP "$ESP"         >> "$INSTALL_LOG" 2>&1
         mkfs.ext4 -F -L root "$ROOT"        >> "$INSTALL_LOG" 2>&1
 
-        echo "15"; echo "XXX"; echo "Mounting target..."; echo "XXX"
+        echo "XXX"; echo "15"; echo "Mounting target..."; echo "XXX"
         mkdir -p "$MOUNT"
         mount "$ROOT" "$MOUNT"
         mkdir -p "$MOUNT/boot/efi"
         mount "$ESP" "$MOUNT/boot/efi"
 
-        echo "20"; echo "XXX"; echo "Copying root filesystem (3-5 min)..."; echo "XXX"
+        echo "XXX"; echo "20"; echo "Copying root filesystem (3-5 min)..."; echo "XXX"
         rsync -aAXH \
             --exclude="/dev/*" \
             --exclude="/proc/*" \
@@ -313,7 +313,7 @@ do_install() {
             --exclude="/etc/spatiumddi/.env" \
             / "$MOUNT/" >> "$INSTALL_LOG" 2>&1
 
-        echo "65"; echo "XXX"; echo "Writing system config..."; echo "XXX"
+        echo "XXX"; echo "65"; echo "Writing system config..."; echo "XXX"
         echo "$HOSTNAME" > "$MOUNT/etc/hostname"
         cat > "$MOUNT/etc/hosts" <<EOF
 127.0.0.1 localhost
@@ -359,7 +359,7 @@ EOF
             rm -f "$MOUNT/etc/systemd/network/20-dhcp-all.network"
         fi
 
-        echo "75"; echo "XXX"; echo "Creating admin user..."; echo "XXX"
+        echo "XXX"; echo "75"; echo "Creating admin user..."; echo "XXX"
         # Bind /proc /sys /dev for chroot operations.
         for d in proc sys dev; do
             mount --bind "/$d" "$MOUNT/$d"
@@ -381,7 +381,7 @@ EOF
             cloud-config.service cloud-final.service \
             >> "$INSTALL_LOG" 2>&1 || true
 
-        echo "78"; echo "XXX"; echo "Installing kernel into /boot..."; echo "XXX"
+        echo "XXX"; echo "78"; echo "Installing kernel into /boot..."; echo "XXX"
         # mkosi strips /boot from the rootfs during image build —
         # it stages the kernel and initrd as separate output files
         # for its own bootable image, then deletes them from /boot.
@@ -413,7 +413,7 @@ EOF
         install -m 0644 "$LIVE_KERNEL" "$MOUNT/boot/vmlinuz-$KVER"
         ln -sf "vmlinuz-$KVER" "$MOUNT/boot/vmlinuz"
 
-        echo "80"; echo "XXX"; echo "Configuring initramfs (virtio + storage modules)..."; echo "XXX"
+        echo "XXX"; echo "80"; echo "Configuring initramfs (virtio + storage modules)..."; echo "XXX"
         # Force the storage / virtio drivers into the initrd so the
         # installed kernel can find its root partition. MODULES=most
         # is the Debian default but is overly conservative on slim
@@ -434,14 +434,26 @@ virtio_ring
 ext4
 EOF
 
-        echo "82"; echo "XXX"; echo "Regenerating initrd for disk boot..."; echo "XXX"
-        # Generate a fresh disk-boot initrd in chroot. -c creates a
-        # new initrd (vs -u for updating an existing one — there's
-        # nothing to update, /boot is empty). live-boot scripts are
-        # still in the rootfs but inert without `boot=live` cmdline.
-        # Explicit PATH so update-initramfs can find its mkinitramfs
-        # + cpio + xz helpers (chroot inherits an undefined PATH
-        # from systemd).
+        echo "XXX"; echo "82"; echo "Regenerating initrd for disk boot..."; echo "XXX"
+        # live-tools dpkg-diverts /usr/sbin/update-initramfs into a
+        # no-op symlink that points at /usr/bin/live-update-initramfs
+        # (the live-update-initramfs binary prints "I: update-initramfs
+        # is disabled (live system is running...)" and exits 0). The
+        # rsync'd rootfs inherits that diversion, so a naive
+        # `chroot $MOUNT update-initramfs` is silently the no-op and
+        # /boot/initrd.img-<kver> never lands. Two fixes here:
+        # (1) undivert in the chroot so update-initramfs is the real
+        #     binary again. The diverted-aside original is at
+        #     /usr/sbin/update-initramfs.orig.initramfs-tools — the
+        #     --remove --rename of the divert moves it back into
+        #     place AND deletes the symlink.
+        # (2) Generate a fresh disk-boot initrd. -c creates a new
+        #     initrd (vs -u for updating an existing one — there's
+        #     nothing to update, /boot is empty).
+        log "Undiverting update-initramfs (live-tools shadowed it as a no-op)"
+        chroot "$MOUNT" /usr/bin/dpkg-divert --rename --remove \
+            /usr/sbin/update-initramfs >> "$INSTALL_LOG" 2>&1 || true
+
         chroot "$MOUNT" env \
             PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
             /usr/sbin/update-initramfs -c -k "$KVER" \
@@ -463,7 +475,7 @@ EOF
         log "initrd written: $(ls -lh "$MOUNT/boot/initrd.img-$KVER" | awk '{print $5}')"
         ln -sf "initrd.img-$KVER" "$MOUNT/boot/initrd.img"
 
-        echo "85"; echo "XXX"; echo "Writing /etc/default/grub + /boot/grub/grub.cfg..."; echo "XXX"
+        echo "XXX"; echo "85"; echo "Writing /etc/default/grub + /boot/grub/grub.cfg..."; echo "XXX"
         # Write /etc/default/grub explicitly so future `update-grub`
         # runs (e.g. on kernel upgrade) get the same cmdline. We
         # don't rely on update-grub at install time — we write
@@ -517,7 +529,7 @@ menuentry "SpatiumDDI Appliance (verbose, recovery)" {
 }
 EOF
 
-        echo "88"; echo "XXX"; echo "Installing bootloader (BIOS + UEFI)..."; echo "XXX"
+        echo "XXX"; echo "88"; echo "Installing bootloader (BIOS + UEFI)..."; echo "XXX"
         chroot "$MOUNT" /usr/sbin/grub-install --target=i386-pc "$TARGET_DISK" \
             >> "$INSTALL_LOG" 2>&1
         chroot "$MOUNT" /usr/sbin/grub-install --target=x86_64-efi \
@@ -526,7 +538,7 @@ EOF
             --removable \
             >> "$INSTALL_LOG" 2>&1 || true
 
-        echo "95"; echo "XXX"; echo "Unmounting..."; echo "XXX"
+        echo "XXX"; echo "95"; echo "Unmounting..."; echo "XXX"
         for d in dev sys proc; do
             umount "$MOUNT/$d" 2>/dev/null || true
         done
@@ -534,7 +546,7 @@ EOF
         umount "$MOUNT"
         sync
 
-        echo "100"; echo "XXX"; echo "Done."; echo "XXX"
+        echo "XXX"; echo "100"; echo "Done."; echo "XXX"
         sleep 1
     } | whiptail --backtitle "$BACKTITLE" --title "Installing SpatiumDDI" \
         --gauge "" 10 70 0
