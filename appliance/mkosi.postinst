@@ -34,6 +34,7 @@ for unit in docker.service chrony.service ssh.service \
             spatiumddi-firstboot.service \
             spatium-install.service \
             spatium-live-banner.service \
+            spatium-live-bootstrap.service \
             qemu-guest-agent.service \
             open-vm-tools.service \
             nftables.service \
@@ -86,9 +87,11 @@ chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-firstboot"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-stack-status"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatium-install"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatium-live-banner"
+chmod 0755 "$BUILDROOT/usr/local/bin/spatium-live-bootstrap"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-firstboot.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-install.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-live-banner.service"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-live-bootstrap.service"
 
 # State directories owned by the spatiumddi-firstboot service.
 install -d -m 0755 "$BUILDROOT/etc/spatiumddi"

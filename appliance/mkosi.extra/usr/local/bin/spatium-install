@@ -11,6 +11,33 @@
 # Runs automatically on boot when `spatium-mode=install` is in the
 # kernel cmdline (set by the "Install SpatiumDDI to disk" GRUB
 # entry). Also available as a CLI tool from the live shell.
+
+# Bulletproof launch log — first thing we do, BEFORE any set/trap/
+# redirect setup or even nounset. If /var/log/spatium-install-launch.log
+# is empty after a failure, bash did not parse the script at all
+# (interpreter issue, shebang corruption, etc.). If it has at least
+# one LAUNCH entry, we know the script body started executing and
+# can compare timestamps against journalctl + the install / trace
+# logs to pinpoint the bail.
+#
+# Uses only shell builtins + utilities present in every Debian
+# rootfs (date, tty, id, cat, command, ls) so the logger itself
+# can't fail in a way the diagnostic forgets to record.
+{
+    printf '[%s] LAUNCH\n'      "$(date -Iseconds 2>/dev/null || echo '?')"
+    printf '  pid=%s ppid=%s\n' "$$" "$PPID"
+    printf '  tty=%s\n'         "$(tty 2>/dev/null || echo '?')"
+    printf '  uid=%s\n'         "$(id -u 2>/dev/null || echo '?')"
+    printf '  bash=%s\n'        "${BASH_VERSION:-?}"
+    printf '  pwd=%s\n'         "$(pwd 2>/dev/null || echo '?')"
+    printf '  cmdline=%s\n'     "$(tr '\n' ' ' </proc/cmdline 2>/dev/null)"
+    printf '  whiptail=%s\n'    "$(command -v whiptail 2>/dev/null || echo MISSING)"
+    printf '  sgdisk=%s\n'      "$(command -v sgdisk 2>/dev/null || echo MISSING)"
+    printf '  rsync=%s\n'       "$(command -v rsync 2>/dev/null || echo MISSING)"
+    printf '  varlog=%s\n'      "$(ls -ld /var/log 2>&1)"
+    printf -- '----\n'
+} >> /var/log/spatium-install-launch.log 2>&1 || true
+
 # pipefail + nounset for the wizard, but NOT -e: whiptail returns
 # non-zero on Cancel/Esc and we want to handle that explicitly with
 # on_cancel rather than crashing the script. -e is re-enabled inside
@@ -324,6 +351,8 @@ do_install() {
             --exclude="/var/cache/apt/archives/*" \
             --exclude="/var/lib/spatiumddi/firstboot.done" \
             --exclude="/etc/spatiumddi/.env" \
+            --exclude="/etc/ssh/sshd_config.d/00-spatium-live.conf" \
+            --exclude="/etc/issue.d/zz-spatium-live.issue" \
             / "$MOUNT/" >> "$INSTALL_LOG" 2>&1
 
         echo "XXX"; echo "65"; echo "Writing system config..."; echo "XXX"
@@ -612,12 +641,31 @@ on_failure() {
     set +x
     clear
     echo
-    echo "Installer exited with status $exit_code — last lines of $INSTALL_LOG:"
-    echo "──────────────────────────────────────────────────────────────────"
-    tail -20 "$INSTALL_LOG" 2>/dev/null || echo "(no log captured)"
+    echo "Installer exited with status $exit_code"
+    echo
+    echo "── Last 20 lines of $INSTALL_LOG ──"
+    tail -20 "$INSTALL_LOG" 2>/dev/null \
+        || echo "  (install log empty or missing — script bailed before any log() call)"
+    echo
+    echo "── Last 20 lines of /var/log/spatium-install-launch.log ──"
+    tail -20 /var/log/spatium-install-launch.log 2>/dev/null \
+        || echo "  (launch log missing — bash didn't even parse the script)"
+    echo
+    echo "── Last 30 lines of $TRACE_LOG ──"
+    tail -30 "$TRACE_LOG" 2>/dev/null \
+        || echo "  (trace log empty — script bailed before set -x at line 51)"
     echo "──────────────────────────────────────────────────────────────────"
     echo
-    echo "Full bash trace at: $TRACE_LOG  (tail -30 for the bail point)"
+    if [ -r /var/log/spatium-live-ssh-password ]; then
+        echo "Live-mode SSH (for log capture from a real terminal):"
+        echo "  user:     root"
+        echo "  password: $(cat /var/log/spatium-live-ssh-password)"
+        echo "  address:  $(ip -4 -br addr 2>/dev/null | awk '$1!="lo" && $3!="" {print $3; exit}' || echo '?')"
+        echo
+    fi
+    echo "Also useful from the shell:"
+    echo "  journalctl -u spatium-install.service --no-pager"
+    echo "  systemctl cat spatium-install.service"
     echo
     echo "Press Enter to drop to a root shell."
     echo "(From the shell you can re-run 'spatium-install' or 'reboot'.)"

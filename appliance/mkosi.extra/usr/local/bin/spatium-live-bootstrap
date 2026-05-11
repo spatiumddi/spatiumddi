@@ -1,0 +1,82 @@
+#!/bin/sh
+# spatium-live-bootstrap — sets up SSH access during the live ISO
+# session so operators can capture installer diagnostics from a real
+# terminal. Runs once on boot, gated by spatium-mode={install,live}
+# (see spatium-live-bootstrap.service).
+#
+# What it does:
+#   - generates a random 12-char alphanumeric root password
+#   - drops /etc/ssh/sshd_config.d/00-spatium-live.conf to allow root
+#     login + password auth during the live session (the 00- prefix
+#     sorts before the install-time 10-spatiumddi-password-auth.conf
+#     so this override wins for live mode)
+#   - writes the password to /var/log/spatium-live-ssh-password
+#     (world-readable; rsync exclude in spatium-install keeps it off
+#     the installed system)
+#   - appends an /etc/issue.d/zz-spatium-live.issue banner with the
+#     password and \4 IP escape so every VT shows the credentials
+#     pre-login
+#   - drops a matching /etc/motd so the on_failure recovery shell
+#     prints the same info on login
+#
+# Nothing here survives reboot: the password is set on a live tmpfs
+# overlay (chpasswd updates /etc/shadow which lives on the overlay,
+# not on real storage), and the wizard explicitly excludes the live
+# sshd_config drop-in + password file from the install-time rsync.
+
+set -eu
+
+# 12 char from /dev/urandom — alphanumeric only so it's easy to
+# type at a remote console keyboard with no layout assumptions.
+PWD=$(LC_ALL=C tr -dc 'A-Za-z0-9' </dev/urandom | head -c 12)
+
+echo "root:${PWD}" | chpasswd
+
+cat > /etc/ssh/sshd_config.d/00-spatium-live.conf <<EOF
+# Live ISO ONLY — created at boot by spatium-live-bootstrap.service.
+# Excluded from rsync in spatium-install's do_install so the override
+# never reaches the installed system. The installed sshd reverts to
+# /etc/ssh/sshd_config's "PermitRootLogin no" and the install-time
+# 10-spatiumddi-password-auth.conf drop-in (PasswordAuthentication yes
+# for the operator-created admin user).
+PermitRootLogin yes
+PasswordAuthentication yes
+EOF
+
+mkdir -p /etc/issue.d
+cat > /etc/issue.d/zz-spatium-live.issue <<EOF
+
+  ┌──────────────────────────────────────────────────────────────────┐
+  │  LIVE INSTALL MODE — SSH AVAILABLE FOR LOG CAPTURE              │
+  │                                                                  │
+  │    Address:  \4                                                  │
+  │    User:     root                                                │
+  │    Password: ${PWD}                                       │
+  │                                                                  │
+  │  Recover the password from a console shell:                      │
+  │    cat /var/log/spatium-live-ssh-password                        │
+  │                                                                  │
+  │  All of this disappears on reboot — the installed system uses    │
+  │  the credentials you set in the wizard.                          │
+  └──────────────────────────────────────────────────────────────────┘
+
+EOF
+
+cat > /etc/motd <<EOF
+
+LIVE INSTALL MODE — log-capture credentials:
+  ssh root@<this VM's IP>          (try: ip -4 -br addr)
+  Password: ${PWD}
+
+Wizard logs:
+  /var/log/spatium-install-launch.log    (bash launch evidence)
+  /var/log/spatium-install.log           (operator-facing log)
+  /var/log/spatium-install-trace.log     (full bash xtrace)
+  journalctl -u spatium-install.service  (systemd's view)
+
+EOF
+
+# Console-shell convenience — operator stuck on tty1 with a failed
+# wizard can read this file directly without re-running this script.
+printf '%s\n' "${PWD}" > /var/log/spatium-live-ssh-password
+chmod 0644 /var/log/spatium-live-ssh-password

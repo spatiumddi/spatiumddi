@@ -23,7 +23,14 @@ After=systemd-networkd.service
 [Service]
 Type=idle
 ExecStartPre=-/usr/bin/systemctl stop getty@tty1.service
-ExecStart=/usr/local/bin/spatium-install
+# bash -x forces the trace flag from line 1, so any bail in the
+# pre-set-x setup block (lines 19-50 in the script) writes trace
+# lines to stderr (tty1) before the on_failure handler kicks in.
+# Once the script reaches `exec 19> $TRACE_LOG; export BASH_XTRACEFD=19`
+# (line 41/49), subsequent trace output is captured to the trace log
+# instead. Belt-and-braces diagnostic — set -x at line 51 still
+# enables locally too, so removing `-x` here is harmless.
+ExecStart=/bin/bash -x /usr/local/bin/spatium-install
 StandardInput=tty
 StandardOutput=tty
 StandardError=tty
