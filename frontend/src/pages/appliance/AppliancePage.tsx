@@ -12,6 +12,11 @@ import {
 import { applianceApi } from "@/lib/api";
 import { useSessionState } from "@/lib/useSessionState";
 import { CertificatesTab } from "./CertificatesTab";
+import { ContainersTab } from "./ContainersTab";
+import { LogsTab } from "./LogsTab";
+import { MaintenanceTab } from "./MaintenanceTab";
+import { NetworkTab } from "./NetworkTab";
+import { ReleasesTab } from "./ReleasesTab";
 
 /**
  * SpatiumDDI OS appliance management hub (issue #134, Phase 4).
@@ -154,6 +159,16 @@ export function AppliancePage() {
       <div className="flex-1 overflow-auto bg-background p-6">
         {tab === "tls" ? (
           <CertificatesTab />
+        ) : tab === "releases" ? (
+          <ReleasesTab />
+        ) : tab === "containers" ? (
+          <ContainersTab />
+        ) : tab === "logs" ? (
+          <LogsTab />
+        ) : tab === "network" ? (
+          <NetworkTab />
+        ) : tab === "maintenance" ? (
+          <MaintenanceTab />
         ) : (
           <PhasePlaceholder spec={active} />
         )}

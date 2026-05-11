@@ -100,7 +100,13 @@ async def ensure_self_signed_cert() -> None:
 
         # Path B — generate a self-signed default.
         hostname = settings.appliance_hostname or socket.gethostname()
-        ips = _detect_local_ips()
+        # Prefer host IPs detected by firstboot — those are the IPs a
+        # browser will actually connect to. Fall back to in-container
+        # detection only when running outside the appliance (no
+        # APPLIANCE_HOST_IPS env) or when the host had no globally-
+        # scoped addresses at firstboot time (rare; firstboot writes
+        # an empty list which we treat as "ask the local socket").
+        ips = _parse_host_ips(settings.appliance_host_ips) or _detect_local_ips()
         cert_pem, key_pem, info = _generate_self_signed_cert(hostname, ips)
 
         row = ApplianceCertificate(
@@ -155,6 +161,30 @@ def _unique_name(base: str) -> str:
     the appliance came up. Belt-and-braces.
     """
     return f"{base}-{uuid.uuid4().hex[:8]}"
+
+
+def _parse_host_ips(env: str) -> list[str]:
+    """Parse the comma-separated APPLIANCE_HOST_IPS env into a clean list.
+
+    Drops loopback / link-local / unspecified entries and anything that
+    fails to parse as an IP — firstboot's ``ip -o addr`` output should
+    only produce sane values, but be defensive against shell-escaping
+    quirks or future format changes.
+    """
+    out: list[str] = []
+    for raw in env.split(","):
+        s = raw.strip()
+        if not s:
+            continue
+        try:
+            ip = ipaddress.ip_address(s)
+        except ValueError:
+            continue
+        if ip.is_loopback or ip.is_link_local or ip.is_unspecified:
+            continue
+        if s not in out:
+            out.append(s)
+    return out
 
 
 def _detect_local_ips() -> list[str]:

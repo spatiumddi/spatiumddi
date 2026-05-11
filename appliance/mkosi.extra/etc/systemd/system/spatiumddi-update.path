@@ -1,0 +1,14 @@
+[Unit]
+Description=Watch for SpatiumDDI release-apply trigger (Phase 4c)
+# Skip on the live ISO — the trigger file path doesn't exist there
+# and there's no installed compose stack to recycle.
+ConditionKernelCommandLine=!boot=live
+
+[Path]
+# PathChanged fires on close-after-write. The api atomically renames
+# a .new sibling onto the trigger path so this only fires once per
+# apply (not multiple times for incremental writes).
+PathChanged=/var/lib/spatiumddi/release-state/release-pending
+
+[Install]
+WantedBy=multi-user.target

@@ -50,6 +50,14 @@ if [ -f /etc/spatiumddi/release ]; then
     . /etc/spatiumddi/release
 fi
 
+# Host-side state dirs the api container bind-mounts (Phase 4c/4e/4f).
+# 1000 is the uid+gid of the ``app`` user inside the api image —
+# chown'ing here lets the unprivileged container write trigger files
+# / read diagnostic data without anyone running docker exec --user root.
+mkdir -p /var/lib/spatiumddi/release-state /var/log/spatiumddi
+chown -R 1000:1000 /var/lib/spatiumddi/release-state
+chmod 0755 /var/log/spatiumddi
+
 if [ ! -f "$ENV_FILE" ]; then
     echo "Generating $ENV_FILE (first boot)"
     umask 077
@@ -66,6 +74,18 @@ if [ ! -f "$ENV_FILE" ]; then
         APPLIANCE_VERSION_VAL="${APPLIANCE_VERSION:-0.1.0}"
     fi
     APPLIANCE_HOSTNAME_VAL=$(hostname 2>/dev/null || echo "spatiumddi")
+    # Host's globally-scoped IPv4/IPv6 addresses, comma-separated.
+    # The api container is on docker's bridge network and can't see
+    # the host's real IPs from inside; without this env var the
+    # self-signed cert (Phase 4b.5) would only carry the docker-bridge
+    # IP (e.g. 172.18.0.5) as a SAN, which browsers pointing at the
+    # host IP see as a SAN mismatch. By exporting the real host IPs
+    # here, ensure_self_signed_cert() puts the right SANs in the cert
+    # and the warning becomes just "unknown CA" instead of
+    # "subject mismatch + unknown CA". Operator-uploaded certs are
+    # unaffected (the operator supplies whatever SANs they need).
+    APPLIANCE_HOST_IPS_VAL=$(ip -o addr show scope global 2>/dev/null \
+        | awk '{print $4}' | cut -d/ -f1 | paste -sd, -)
     # Docker socket gid — the api container's `app` user needs
     # supplementary group access to /var/run/docker.sock for the
     # Phase 4b.2 cert-deployer SIGHUP + Phase 4d container management.
@@ -87,6 +107,7 @@ DHCP_AGENT_KEY=$(gen_hex 24)
 COMPOSE_PROFILES=dns,dhcp
 APPLIANCE_VERSION=${APPLIANCE_VERSION_VAL}
 APPLIANCE_HOSTNAME=${APPLIANCE_HOSTNAME_VAL}
+APPLIANCE_HOST_IPS=${APPLIANCE_HOST_IPS_VAL}
 DOCKER_GID=${DOCKER_GID_VAL}
 EOF
     chmod 600 "$ENV_FILE"

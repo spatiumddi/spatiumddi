@@ -32,6 +32,8 @@ ln -sfn /usr/lib/systemd/system/getty@.service \
 # so only one runs per boot, depending on the GRUB menu choice.
 for unit in docker.service chrony.service ssh.service \
             spatiumddi-firstboot.service \
+            spatiumddi-update.path \
+            spatiumddi-reboot.path \
             spatium-install.service \
             spatium-live-banner.service \
             spatium-live-bootstrap.service \
@@ -88,10 +90,15 @@ chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-stack-status"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatium-install"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatium-live-banner"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatium-live-bootstrap"
+chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-update"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-firstboot.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-install.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-live-banner.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-live-bootstrap.service"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-update.path"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-update.service"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-reboot.path"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-reboot.service"
 
 # State directories owned by the spatiumddi-firstboot service.
 install -d -m 0755 "$BUILDROOT/etc/spatiumddi"

@@ -6,6 +6,7 @@ import { LoginCallbackPage } from "@/pages/LoginCallbackPage";
 import { ChangePasswordPage } from "@/pages/ChangePasswordPage";
 import { AccountPage } from "@/pages/AccountPage";
 import { AppliancePage } from "@/pages/appliance/AppliancePage";
+import { SetupWizardPage } from "@/pages/appliance/SetupWizardPage";
 import { DashboardPage } from "@/pages/DashboardPage";
 import { IPAMPage } from "@/pages/ipam/IPAMPage";
 import { NATPage } from "@/pages/ipam/NATPage";
@@ -88,6 +89,7 @@ export default function App() {
         <Route index element={<Navigate to="/dashboard" replace />} />
         <Route path="account" element={<AccountPage />} />
         <Route path="appliance" element={<AppliancePage />} />
+        <Route path="appliance/setup" element={<SetupWizardPage />} />
         <Route path="dashboard" element={<DashboardPage />} />
         <Route path="ipam" element={<IPAMPage />} />
         <Route path="ipam/nat" element={<NATPage />} />

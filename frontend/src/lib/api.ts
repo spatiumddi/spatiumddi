@@ -6818,6 +6818,219 @@ export const applianceTlsApi = {
     api.delete<void>(`/appliance/tls/${id}`).then((r) => r.data),
 };
 
+// ── Appliance: release management (Phase 4c) ───────────────────────
+export interface ApplianceRelease {
+  tag: string;
+  name: string;
+  published_at: string;
+  body: string;
+  html_url: string;
+  is_prerelease: boolean;
+  is_installed: boolean;
+}
+
+export interface ApplianceReleasesResponse {
+  installed_version: string;
+  apply_in_flight: boolean;
+  releases: ApplianceRelease[];
+  update_log_tail: string;
+}
+
+export const applianceReleasesApi = {
+  list: () =>
+    api
+      .get<ApplianceReleasesResponse>("/appliance/releases")
+      .then((r) => r.data),
+  apply: (tag: string) =>
+    api
+      .post<{ scheduled: string }>("/appliance/releases/apply", { tag })
+      .then((r) => r.data),
+  log: () =>
+    api
+      .get<{ apply_in_flight: boolean; log_tail: string }>(
+        "/appliance/releases/log",
+      )
+      .then((r) => r.data),
+};
+
+// ── Appliance: container management (Phase 4d) ─────────────────────
+export interface ApplianceContainer {
+  name: string;
+  image: string;
+  state: string;
+  status: string;
+  health: string | null;
+  short_id: string;
+  started_at: string | null;
+  is_spatium: boolean;
+}
+
+export type ContainerAction = "start" | "stop" | "restart";
+
+export const applianceContainersApi = {
+  list: () =>
+    api
+      .get<ApplianceContainer[]>("/appliance/containers")
+      .then((r) => r.data),
+  action: (name: string, action: ContainerAction) =>
+    api
+      .post<{ name: string; action: string; status: string }>(
+        `/appliance/containers/${encodeURIComponent(name)}/${action}`,
+      )
+      .then((r) => r.data),
+  logs: (name: string, tail = 200) =>
+    api
+      .get<{ name: string; tail: string }>(
+        `/appliance/containers/${encodeURIComponent(name)}/logs`,
+        { params: { tail } },
+      )
+      .then((r) => r.data),
+};
+
+// ── Appliance: system info + lifecycle (Phase 4f) ──────────────────
+export interface ApplianceSystemInfo {
+  hostname: string;
+  host_ips: string[];
+  uptime_seconds: number | null;
+  maintenance_mode: boolean;
+  reboot_pending_from_host: boolean;
+  reboot_scheduled: boolean;
+  appliance_version: string;
+  appliance_mode: boolean;
+}
+
+export const applianceSystemApi = {
+  info: () =>
+    api
+      .get<ApplianceSystemInfo>("/appliance/system/info")
+      .then((r) => r.data),
+  setMaintenance: (enabled: boolean) =>
+    api
+      .post<{ maintenance_mode: boolean }>("/appliance/system/maintenance", {
+        enabled,
+      })
+      .then((r) => r.data),
+  reboot: () =>
+    api
+      .post<{ scheduled: boolean; grace_seconds: number }>(
+        "/appliance/system/reboot",
+      )
+      .then((r) => r.data),
+};
+
+// Phase 4g setup wizard state (lives under /system but separate
+// concern from network/lifecycle — kept as its own API surface).
+export interface ApplianceSetupState {
+  complete: boolean;
+  completed_at: string | null;
+  completed_by: string | null;
+}
+
+export const applianceSetupApi = {
+  state: () =>
+    api
+      .get<ApplianceSetupState>("/appliance/system/setup")
+      .then((r) => r.data),
+  complete: () =>
+    api
+      .post<{ complete: boolean; completed_at: string }>(
+        "/appliance/system/setup/complete",
+      )
+      .then((r) => r.data),
+};
+
+// ── Appliance: diagnostics (Phase 4e) ──────────────────────────────
+export interface ApplianceLogListResponse {
+  sources: string[];
+}
+
+export interface ApplianceLogTailResponse {
+  name: string;
+  lines: number;
+  tail: string;
+}
+
+export interface ApplianceSelfTestCheck {
+  name: string;
+  ok: boolean;
+  detail: string;
+}
+
+export interface ApplianceSelfTestReport {
+  run_at: string;
+  overall_ok: boolean;
+  checks: ApplianceSelfTestCheck[];
+}
+
+export const applianceDiagnosticsApi = {
+  listLogs: () =>
+    api
+      .get<ApplianceLogListResponse>("/appliance/diagnostics/logs")
+      .then((r) => r.data),
+  tailLog: (name: string, lines = 500) =>
+    api
+      .get<ApplianceLogTailResponse>(
+        `/appliance/diagnostics/logs/${encodeURIComponent(name)}`,
+        { params: { lines } },
+      )
+      .then((r) => r.data),
+  selfTest: () =>
+    api
+      .post<ApplianceSelfTestReport>("/appliance/diagnostics/self-test")
+      .then((r) => r.data),
+  // Bundle download uses a direct URL — the browser handles the
+  // attachment + filename via Content-Disposition.
+  bundleUrl: () => "/api/v1/appliance/diagnostics/bundle",
+};
+
+/**
+ * Stream container logs as SSE. Mirrors streamChatTurn — uses fetch
+ * (not EventSource) so we can send the Bearer token in Authorization.
+ * Yields each parsed log line; cancel via the AbortSignal.
+ */
+export async function* streamApplianceContainerLogs(
+  name: string,
+  signal?: AbortSignal,
+  tail = 100,
+): AsyncIterable<string> {
+  const token = localStorage.getItem("access_token");
+  const url = `/api/v1/appliance/containers/${encodeURIComponent(name)}/logs/stream?tail=${tail}`;
+  const res = await fetch(url, {
+    headers: {
+      ...(token ? { Authorization: `Bearer ${token}` } : {}),
+      Accept: "text/event-stream",
+    },
+    signal,
+  });
+  if (!res.ok || !res.body) {
+    throw new Error(`log stream failed: HTTP ${res.status}`);
+  }
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const frames = buffer.split("\n\n");
+    buffer = frames.pop() ?? "";
+    for (const frame of frames) {
+      if (!frame.trim()) continue;
+      let data = "";
+      for (const line of frame.split("\n")) {
+        if (line.startsWith("data: ")) data += line.slice(6);
+      }
+      if (!data) continue;
+      try {
+        const parsed = JSON.parse(data) as { line: string };
+        if (typeof parsed.line === "string") yield parsed.line;
+      } catch {
+        // skip malformed frames
+      }
+    }
+  }
+}
+
 // ── Kubernetes integration ─────────────────────────────────────────
 
 export interface KubernetesCluster {

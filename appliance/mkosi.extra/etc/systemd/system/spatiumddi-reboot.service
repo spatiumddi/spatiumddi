@@ -1,0 +1,11 @@
+[Unit]
+Description=Reboot SpatiumDDI appliance after web-UI request (Phase 4f)
+
+[Service]
+Type=oneshot
+# 10-second grace so the api's 202-Accepted response actually reaches
+# the browser before the host kills the network stack.
+ExecStartPre=/bin/sleep 10
+# Rename the trigger to .done so it doesn't re-fire on next boot.
+ExecStartPre=/bin/mv /var/lib/spatiumddi/release-state/reboot-pending /var/lib/spatiumddi/release-state/reboot-pending.done
+ExecStart=/usr/bin/systemctl reboot

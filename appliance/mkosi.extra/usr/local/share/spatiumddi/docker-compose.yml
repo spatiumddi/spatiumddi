@@ -87,6 +87,11 @@ services:
       APPLIANCE_MODE: "true"
       APPLIANCE_VERSION: ${APPLIANCE_VERSION:-0.1.0}
       APPLIANCE_HOSTNAME: ${APPLIANCE_HOSTNAME:-}
+      # Host IPs detected by firstboot — used by the self-signed cert
+      # bootstrap (Phase 4b.5) so the SAN list includes the IPs a
+      # browser actually connects to, not just the docker bridge IP
+      # the api container sees from inside its own namespace.
+      APPLIANCE_HOST_IPS: ${APPLIANCE_HOST_IPS:-}
       # Cert deployer (Phase 4b.2). The active cert from
       # appliance_certificate is written here; the frontend container
       # mounts the same volume at /etc/nginx/certs and nginx reads
@@ -103,12 +108,27 @@ services:
       # tokens; frontend nginx serves them as static files. Empty
       # outside an active Let's Encrypt flow (Phase 4b.4).
       - appliance_acme:/var/www/acme-challenge
-      # Docker socket — only required for the cert-deployer SIGHUP
-      # and (Phase 4d) container management. The api container's
-      # ``app`` user gets supplementary group access via ``group_add``
-      # below (the gid matches the host's ``docker`` group, which
-      # owns /var/run/docker.sock with mode 0660). Read-write because
-      # the docker SDK opens the socket bidirectionally for the API
+      # Phase 4c release manager — api drops trigger files into
+      # /var/lib/spatiumddi/release-state/release-pending on the host
+      # (sub-dir is chown'd to 1000:1000 by firstboot so the api's
+      # ``app`` user can write). The host's spatiumddi-update.path
+      # unit notices + runs the actual upgrade. The same trigger dir
+      # is reused for the Phase 4f reboot-pending file.
+      # /var/log/spatiumddi/update.log is the apply log the UI tails.
+      - /var/lib/spatiumddi/release-state:/var/lib/spatiumddi-host/release-state:rw
+      - /var/log/spatiumddi:/var/log/spatiumddi-host:ro
+      # Phase 4f reboot-pending detection — Debian writes
+      # /var/run/reboot-required after unattended-upgrades installs a
+      # kernel or libc update. The api shows a "reboot pending" banner
+      # when it sees the file. /var/run is tmpfs on the host so the
+      # mount goes through cleanly even without firstboot setup.
+      - /var/run:/var/run-host:ro
+      # Docker socket — required for the cert-deployer SIGHUP and
+      # (Phase 4d) container management. The api container's ``app``
+      # user gets supplementary group access via ``group_add`` below
+      # (the gid matches the host's ``docker`` group, which owns
+      # /var/run/docker.sock with mode 0660). Read-write because the
+      # docker SDK opens the socket bidirectionally for the API
       # exchange — the *permissions* are still scoped by the API's
       # own RBAC layer.
       - /var/run/docker.sock:/var/run/docker.sock

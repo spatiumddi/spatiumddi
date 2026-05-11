@@ -88,6 +88,13 @@ class Settings(BaseSettings):
     appliance_mode: bool = False
     appliance_version: str = ""
     appliance_hostname: str = ""
+    # Comma-separated list of the host's real IPv4/IPv6 addresses,
+    # detected by spatiumddi-firstboot via `ip -o addr show scope global`
+    # and threaded through .env. Used by the self-signed cert bootstrap
+    # so the SAN list carries the IPs a browser will see (the api
+    # container's own socket-level view only knows the docker bridge IP).
+    # Empty on non-appliance deploys.
+    appliance_host_ips: str = ""
 
     # Where the cert deployer (Phase 4b.2) writes the currently-active
     # TLS cert + key. Mounted as a shared volume between the api

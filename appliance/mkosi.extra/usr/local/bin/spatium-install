@@ -626,37 +626,43 @@ EOF
         eject "$dev" >> "$INSTALL_LOG" 2>&1 || true
     done
 
-    # Title kept short (8 chars) so it doesn't collide with the 36-char
+    # Title kept short (4 chars) so it doesn't collide with the 36-char
     # BACKTITLE on the dialog top frame — whiptail renders backtitle on
     # row 0 + dialog title on the immediately-adjacent dialog top
-    # border, and overlong combined widths produce the
-    # "0.1.0ation complete" overlap glitch.
-    # Body uses ASCII-only line drawing — the live ISO's console font
-    # ships glyphs for `+ - | =` but not `║ ═ ╔ ╗ → —`, so Unicode
-    # box-drawing renders as broken squares on tty1.
+    # border, and overlong combined widths cause the title to overflow
+    # into the backtitle (visible as e.g. "0.1.0ation complete").
+    #
+    # No inner box-drawing in the body: whiptail's own dialog frame
+    # is the visual container, an inner ASCII box renders inconsistently
+    # across console fonts (right edge alignment depends on each
+    # content line being padded to the exact same column, which is
+    # fragile + ugly) and the console font on the live ISO doesn't
+    # render Unicode box-drawing chars at all. Plain indented text +
+    # the `*** … ***` attention rule scans cleanly on tty1, in serial
+    # consoles, and over SSH.
     whiptail --backtitle "$BACKTITLE" --title "Done" \
         --msgbox "\
 SpatiumDDI is installed on $TARGET_DISK.
 
-  +============================================================+
-  |  REMOVE THE INSTALL MEDIA before the reboot completes,    |
-  |  otherwise the BIOS will boot back into this installer.   |
-  |                                                            |
-  |   Virtual:   detach the ISO from the VM's CD-ROM drive    |
-  |              Proxmox: Hardware -> CD/DVD -> 'Do not use'  |
-  |   Physical:  unplug the USB stick                         |
-  |                                                            |
-  |  The installer already issued an ATA EJECT -- most         |
-  |  hypervisors honor it and the ISO is already unmapped,    |
-  |  but detach it from the VM config too so it doesn't       |
-  |  reattach on the next boot.                                |
-  +============================================================+
+
+   *** REMOVE THE INSTALL MEDIA before the reboot ***
+
+   Otherwise the BIOS will boot back into this installer.
+
+      Virtual:   detach the ISO from the VM's CD-ROM drive
+                 Proxmox: Hardware -> CD/DVD -> 'Do not use'
+      Physical:  unplug the USB stick
+
+   The installer already issued an ATA EJECT - most hypervisors
+   honor it and the ISO is already unmapped, but detach it from
+   the VM config too so it doesn't reattach on the next boot.
+
 
 First boot of the installed system takes 2-5 min while it pulls
 the SpatiumDDI container images.
 
-  Web UI:  http://<appliance IP>/
-  Login:   admin / admin   (forces password change on first login)
+   Web UI:  http://<appliance IP>/
+   Login:   admin / admin   (change forced on first login)
 
 Press OK to reboot." 24 72
 

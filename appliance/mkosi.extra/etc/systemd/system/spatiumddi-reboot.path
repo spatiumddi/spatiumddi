@@ -1,0 +1,9 @@
+[Unit]
+Description=Watch for SpatiumDDI reboot-pending trigger (Phase 4f)
+ConditionKernelCommandLine=!boot=live
+
+[Path]
+PathChanged=/var/lib/spatiumddi/release-state/reboot-pending
+
+[Install]
+WantedBy=multi-user.target
