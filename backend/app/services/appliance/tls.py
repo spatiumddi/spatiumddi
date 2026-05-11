@@ -18,6 +18,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+from typing import Any
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -31,6 +32,43 @@ class TLSValidationError(ValueError):
     The router translates these into a 422 with the message string
     visible to the operator.
     """
+
+
+# Supported key types for CSR generation. RSA-2048 stays the default
+# because it's universally accepted by public CAs and private intermediates;
+# EC-P256 is the modern alternative (smaller key, faster handshakes); EC-P384
+# for compliance regimes that mandate stronger curves; RSA-3072/4096 for
+# the rare CA that won't sign anything below 3072.
+KEY_TYPES = ("rsa-2048", "rsa-3072", "rsa-4096", "ec-p256", "ec-p384")
+
+
+@dataclass(frozen=True)
+class CSRSubject:
+    """Operator-supplied subject fields for a CSR.
+
+    All optional except common_name. The router accepts an open-ended
+    dict and constructs this dataclass so future fields don't need
+    a service-layer signature change.
+    """
+
+    common_name: str
+    organization: str | None = None
+    organizational_unit: str | None = None
+    country: str | None = None  # 2-letter ISO code
+    state: str | None = None
+    locality: str | None = None
+    email: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "common_name": self.common_name,
+            "organization": self.organization,
+            "organizational_unit": self.organizational_unit,
+            "country": self.country,
+            "state": self.state,
+            "locality": self.locality,
+            "email": self.email,
+        }
 
 
 @dataclass(frozen=True)
@@ -194,3 +232,125 @@ def _extract_sans(cert: x509.Certificate) -> list[str]:
 def _format_fingerprint(raw: bytes) -> str:
     """Render as ``AB:CD:EF:…`` (matches OpenSSL output, easy to compare)."""
     return ":".join(f"{b:02X}" for b in raw)
+
+
+# ── CSR generation (Phase 4b.3) ─────────────────────────────────────
+
+
+def generate_csr_and_key(
+    subject: CSRSubject,
+    sans: list[str],
+    key_type: str = "rsa-2048",
+) -> tuple[str, str]:
+    """Generate a fresh private key + signed CSR for the given subject.
+
+    Returns ``(csr_pem, key_pem)`` — both PKCS-standard PEM strings.
+    The router caller is responsible for Fernet-encrypting the key
+    before persisting; this helper deals only in unwrapped PEM so it
+    stays testable without app config.
+
+    SANs go into a SubjectAlternativeName extension. Mostly-DNS list
+    is the common case; bare IPs (``192.168.1.10``) are auto-detected
+    and routed into IPAddress entries so private-CA workflows that
+    want IP SANs Just Work.
+
+    Raises:
+        TLSValidationError: invalid key_type, no common_name, or
+            (theoretically unreachable) a cryptography library error.
+    """
+    if key_type not in KEY_TYPES:
+        raise TLSValidationError(
+            f"unsupported key_type {key_type!r} — pick one of {', '.join(KEY_TYPES)}"
+        )
+    cn = subject.common_name.strip()
+    if not cn:
+        raise TLSValidationError("common_name is required")
+
+    private_key = _generate_private_key(key_type)
+
+    name_attrs: list[x509.NameAttribute] = [x509.NameAttribute(NameOID.COMMON_NAME, cn)]
+    if subject.country:
+        name_attrs.append(x509.NameAttribute(NameOID.COUNTRY_NAME, subject.country))
+    if subject.state:
+        name_attrs.append(
+            x509.NameAttribute(NameOID.STATE_OR_PROVINCE_NAME, subject.state)
+        )
+    if subject.locality:
+        name_attrs.append(x509.NameAttribute(NameOID.LOCALITY_NAME, subject.locality))
+    if subject.organization:
+        name_attrs.append(
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME, subject.organization)
+        )
+    if subject.organizational_unit:
+        name_attrs.append(
+            x509.NameAttribute(
+                NameOID.ORGANIZATIONAL_UNIT_NAME, subject.organizational_unit
+            )
+        )
+    if subject.email:
+        name_attrs.append(x509.NameAttribute(NameOID.EMAIL_ADDRESS, subject.email))
+
+    builder = (
+        x509.CertificateSigningRequestBuilder()
+        .subject_name(x509.Name(name_attrs))
+    )
+
+    san_entries = _build_san_entries(sans)
+    if san_entries:
+        builder = builder.add_extension(
+            x509.SubjectAlternativeName(san_entries), critical=False
+        )
+
+    # RSA + ECDSA use SHA-256; Ed25519/Ed448 don't take a hash arg, but
+    # we don't generate those here (no public CA supports them yet so
+    # they'd be a dead-end CSR).
+    try:
+        csr = builder.sign(private_key, hashes.SHA256())
+    except Exception as exc:  # pragma: no cover — cryptography is well-tested
+        raise TLSValidationError(f"CSR signing failed: {exc}") from exc
+
+    csr_pem = csr.public_bytes(serialization.Encoding.PEM).decode("utf-8")
+    key_pem = private_key.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    ).decode("utf-8")
+    return csr_pem, key_pem
+
+
+def _generate_private_key(key_type: str):
+    if key_type == "rsa-2048":
+        return rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    if key_type == "rsa-3072":
+        return rsa.generate_private_key(public_exponent=65537, key_size=3072)
+    if key_type == "rsa-4096":
+        return rsa.generate_private_key(public_exponent=65537, key_size=4096)
+    if key_type == "ec-p256":
+        return ec.generate_private_key(ec.SECP256R1())
+    if key_type == "ec-p384":
+        return ec.generate_private_key(ec.SECP384R1())
+    # Should never reach — KEY_TYPES check in caller. Defensive.
+    raise TLSValidationError(f"unsupported key_type {key_type}")
+
+
+def _build_san_entries(sans: list[str]) -> list[x509.GeneralName]:
+    """Translate a flat string list into typed SAN entries.
+
+    Detect IPs (v4 + v6) so a SAN like ``"192.168.1.10"`` becomes an
+    IPAddress entry, not a DNSName the cert verifier will refuse.
+    DNS hostnames (`*.example.com` / `example.com`) become DNSName.
+    Empty / whitespace-only entries dropped.
+    """
+    import ipaddress
+
+    entries: list[x509.GeneralName] = []
+    for raw in sans:
+        s = raw.strip()
+        if not s:
+            continue
+        try:
+            ip = ipaddress.ip_address(s)
+            entries.append(x509.IPAddress(ip))
+        except ValueError:
+            entries.append(x509.DNSName(s))
+    return entries

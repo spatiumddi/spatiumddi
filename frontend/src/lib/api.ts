@@ -6739,18 +6739,22 @@ export interface ApplianceCertificate {
   is_active: boolean;
   activated_at: string | null;
   subject_cn: string;
-  issuer_cn: string;
+  issuer_cn: string | null;
   sans: string[];
-  fingerprint_sha256: string;
-  valid_from: string;
-  valid_to: string;
+  fingerprint_sha256: string | null;
+  valid_from: string | null;
+  valid_to: string | null;
   notes: string | null;
   created_at: string;
   created_by_user_id: string | null;
+  // CSR-pending state — true when the row was created via /tls/csr
+  // and is waiting for the operator to paste back the signed cert.
+  pending: boolean;
+  csr_pem: string | null;
 }
 
 export interface ApplianceCertificateDetail extends ApplianceCertificate {
-  cert_pem: string;
+  cert_pem: string | null;
 }
 
 export interface CertificateUploadPayload {
@@ -6758,6 +6762,32 @@ export interface CertificateUploadPayload {
   cert_pem: string;
   key_pem: string;
   notes?: string | null;
+  activate?: boolean;
+}
+
+export type CSRKeyType =
+  | "rsa-2048"
+  | "rsa-3072"
+  | "rsa-4096"
+  | "ec-p256"
+  | "ec-p384";
+
+export interface CSRGeneratePayload {
+  name: string;
+  common_name: string;
+  organization?: string | null;
+  organizational_unit?: string | null;
+  country?: string | null;
+  state?: string | null;
+  locality?: string | null;
+  email?: string | null;
+  sans?: string[];
+  key_type?: CSRKeyType;
+  notes?: string | null;
+}
+
+export interface CSRImportPayload {
+  cert_pem: string;
   activate?: boolean;
 }
 
@@ -6771,6 +6801,14 @@ export const applianceTlsApi = {
   upload: (body: CertificateUploadPayload) =>
     api
       .post<ApplianceCertificate>("/appliance/tls/upload", body)
+      .then((r) => r.data),
+  generateCsr: (body: CSRGeneratePayload) =>
+    api
+      .post<ApplianceCertificate>("/appliance/tls/csr", body)
+      .then((r) => r.data),
+  importSignedCert: (id: string, body: CSRImportPayload) =>
+    api
+      .post<ApplianceCertificate>(`/appliance/tls/${id}/import-cert`, body)
       .then((r) => r.data),
   activate: (id: string) =>
     api

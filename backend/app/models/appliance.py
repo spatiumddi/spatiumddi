@@ -65,7 +65,12 @@ class ApplianceCertificate(Base):
     # PEM-encoded certificate chain. Operators paste the full chain
     # (leaf + intermediates); we don't split because nginx wants the
     # concatenated file anyway. Plain text — public material.
-    cert_pem: Mapped[str] = mapped_column(Text, nullable=False)
+    #
+    # NULLable since Phase 4b.3 — a CSR-pending row carries a stored
+    # private key + the generated CSR but no cert yet. cert_pem stays
+    # NULL until the operator pastes back the signed cert. Treat
+    # ``cert_pem IS NULL`` as the canonical "CSR pending" sentinel.
+    cert_pem: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # PEM-encoded private key, Fernet-encrypted at rest. NEVER returned
     # in any API response — only written to /etc/nginx/certs/active.key
@@ -89,19 +94,30 @@ class ApplianceCertificate(Base):
     # is the leaf's CN; sans_json is the full SubjectAlternativeName
     # list (DNS names + IP addresses). issuer_cn is the CN of the
     # immediate issuer in the chain.
+    #
+    # For CSR-pending rows (Phase 4b.3) subject_cn + sans come from the
+    # operator's CSR form (they're known up-front); issuer_cn /
+    # fingerprint / validity dates aren't known until the signed cert
+    # comes back, so those three are nullable.
     subject_cn: Mapped[str] = mapped_column(String(255), nullable=False)
     sans_json: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
-    issuer_cn: Mapped[str] = mapped_column(String(255), nullable=False)
+    issuer_cn: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
     # SHA-256 fingerprint of the leaf DER, hex-encoded with colons
-    # (matches `openssl x509 -fingerprint -sha256` output).
-    fingerprint_sha256: Mapped[str] = mapped_column(String(95), nullable=False)
+    # (matches `openssl x509 -fingerprint -sha256` output). NULL on
+    # CSR-pending rows.
+    fingerprint_sha256: Mapped[str | None] = mapped_column(String(95), nullable=True)
 
     # NotBefore / NotAfter from the leaf cert. Used by the UI to
     # render "expires in N days" badges and by a future renewal task
-    # (Phase 4b.4) to schedule Let's Encrypt rotations.
-    valid_from: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
-    valid_to: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    # (Phase 4b.4) to schedule Let's Encrypt rotations. NULL on
+    # CSR-pending rows.
+    valid_from: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    valid_to: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     # Operator notes — purely descriptive. UI shows them on the card
     # for context ("Let's Encrypt prod cert — renew script in cron").
