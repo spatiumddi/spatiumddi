@@ -612,8 +612,44 @@ EOF
     } | whiptail --backtitle "$BACKTITLE" --title "Installing SpatiumDDI" \
         --gauge "" 10 70 0
 
-    whiptail --backtitle "$BACKTITLE" --title "Complete" \
-        --msgbox "Installation complete.\n\nThe system will reboot. Remove the install media before it comes back up.\n\nFirst boot will take 2-5 min while it pulls the SpatiumDDI container images. The web UI will then be reachable at\n\n   http://<the appliance's IP>/\n\nDefault login: admin / admin (forces password change on first login)." 18 70
+    # Best-effort eject of the install media BEFORE the operator
+    # confirms reboot. Real CD-ROM drives obviously unmount and pop
+    # the tray; QEMU/Proxmox virtual CD-ROMs honor the guest's ATA
+    # EJECT — the device stays present in the VM but the ISO is
+    # unmapped, so even if BIOS boot order still prefers CD it gets
+    # "no media" and falls through to the disk. Errors are
+    # ignored: ejecting a USB stick from inside the running guest
+    # can't actually disconnect it electrically; the message below
+    # tells the operator to pull it manually.
+    for dev in /dev/sr0 /dev/sr1 /dev/cdrom; do
+        [ -b "$dev" ] || continue
+        eject "$dev" >> "$INSTALL_LOG" 2>&1 || true
+    done
+
+    whiptail --backtitle "$BACKTITLE" --title "Installation complete" \
+        --msgbox "\
+SpatiumDDI is installed on $TARGET_DISK.
+
+╔════════════════════════════════════════════════════════════════╗
+║  REMOVE THE INSTALL MEDIA before the reboot completes,        ║
+║  otherwise the BIOS will boot back into this installer.       ║
+║                                                                ║
+║    Virtual:   detach the ISO from the VM's CD-ROM drive       ║
+║               Proxmox: Hardware → CD/DVD Drive → 'Do not use' ║
+║    Physical:  unplug the USB stick                            ║
+║                                                                ║
+║  The installer already issued an ATA EJECT — most hypervisors ║
+║  honor it and the ISO is already unmapped, but detach it from ║
+║  the VM config too so it doesn't reattach on next boot.       ║
+╚════════════════════════════════════════════════════════════════╝
+
+First boot of the installed system takes 2-5 min while it pulls
+the SpatiumDDI container images.
+
+  Web UI:  http://<appliance IP>/
+  Login:   admin / admin   (forces password change on first login)
+
+Press OK to reboot." 24 72
 
     log "Install complete. Rebooting."
     systemctl reboot
