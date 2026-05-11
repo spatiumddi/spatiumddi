@@ -189,9 +189,17 @@ EOF
     # where the agent-landing nginx:alpine container mounts it
     # read-only. ``control-only`` doesn't need the landing page —
     # the SpatiumDDI frontend serves the web UI on that role.
+    #
+    # The ``umask 077`` set earlier (for the .env's secrets) leaks
+    # into the mkdir + sed > index.html and would leave the file
+    # mode 600 + dir 700 — nginx-the-process runs as uid 101 inside
+    # the alpine image and can't read root-owned 600 files, so the
+    # landing page would return 403. Reset umask before the write.
+    umask 022
     case "$ROLE" in
         dns-agent-bind9|dns-agent-powerdns|dhcp-agent)
             mkdir -p /var/lib/spatiumddi/agent-landing
+            chmod 0755 /var/lib/spatiumddi/agent-landing
             case "$ROLE" in
                 dns-agent-bind9)    ROLE_LABEL="DNS (BIND9)";    ROLE_SHORT="dns-bind9" ;;
                 dns-agent-powerdns) ROLE_LABEL="DNS (PowerDNS)"; ROLE_SHORT="dns-powerdns" ;;
@@ -206,6 +214,7 @@ EOF
                 -e "s|__APPLIANCE_VERSION__|${APPLIANCE_VERSION_VAL}|g" \
                 /usr/local/share/spatiumddi/agent-landing/index.html.in \
                 > /var/lib/spatiumddi/agent-landing/index.html
+            chmod 0644 /var/lib/spatiumddi/agent-landing/index.html
             ;;
     esac
 fi
@@ -214,6 +223,16 @@ fi
 ln -sfn "$ENV_FILE" "$COMPOSE_DIR/.env"
 
 cd "$COMPOSE_DIR"
+
+# Re-runs of firstboot (post-reboot) need APPLIANCE_ROLE to drive
+# the role-aware readiness check below. The fresh-install branch
+# already sets it inline; on re-runs we reload it from .env so the
+# variable is in scope no matter which path got us here.
+if [ -z "${APPLIANCE_ROLE:-}" ] && [ -f "$ENV_FILE" ]; then
+    APPLIANCE_ROLE=$(grep -E '^APPLIANCE_ROLE=' "$ENV_FILE" | tail -1 | cut -d= -f2-)
+    CONTROL_PLANE_URL=$(grep -E '^CONTROL_PLANE_URL=' "$ENV_FILE" | tail -1 | cut -d= -f2-)
+    export APPLIANCE_ROLE CONTROL_PLANE_URL
+fi
 
 # Wait for the docker daemon socket to be ready. systemd's
 # After=docker.service only means docker.service was STARTED, not
@@ -298,18 +317,55 @@ fi
 echo "Bringing stack up..."
 docker-compose up -d
 
-# Wait up to 5 min for the control plane to answer /health/live.
-echo "Waiting for control plane on http://127.0.0.1:8000/health/live …"
-for i in $(seq 1 60); do
-    if curl -fsS --max-time 3 http://127.0.0.1:8000/health/live >/dev/null 2>&1; then
-        date -Iseconds > "$STAMP"
-        IP=$(ip -4 -o addr show scope global | awk '{print $4}' | cut -d/ -f1 | head -1)
-        echo "Ready: http://${IP:-<appliance-ip>}/"
-        exit 0
-    fi
-    sleep 5
-done
-
-echo "WARN: /health/live did not respond within 5 minutes." >&2
-echo "      Check 'docker-compose -f $COMPOSE_DIR/docker-compose.yml logs'." >&2
-exit 1
+# Role-aware readiness check.
+#
+# Control / control-only roles run the api container, which exposes
+# /health/live on port 8000 (port-mapped to the host). Poll until it
+# answers; that's the "the operator can sign in now" signal.
+#
+# Agent roles (dns-* / dhcp-*) don't run a local api — there's no
+# /health/live to poll on this box. Instead, confirm every container
+# in the active compose profile reports state=running. The agent
+# itself retries forever against the remote control plane, so
+# "containers up" is the strongest signal we can give without a
+# round trip across the LAN.
+case "${APPLIANCE_ROLE:-control}" in
+    control|control-only)
+        echo "Waiting for control plane on http://127.0.0.1:8000/health/live …"
+        for i in $(seq 1 60); do
+            if curl -fsS --max-time 3 http://127.0.0.1:8000/health/live >/dev/null 2>&1; then
+                date -Iseconds > "$STAMP"
+                IP=$(ip -4 -o addr show scope global | awk '{print $4}' | cut -d/ -f1 | head -1)
+                echo "Ready: http://${IP:-<appliance-ip>}/"
+                exit 0
+            fi
+            sleep 5
+        done
+        echo "WARN: /health/live did not respond within 5 minutes." >&2
+        echo "      Check 'docker-compose -f $COMPOSE_DIR/docker-compose.yml logs'." >&2
+        exit 1
+        ;;
+    *)
+        echo "Waiting for agent container(s) to start (role=${APPLIANCE_ROLE}) …"
+        for i in $(seq 1 30); do
+            # Every service that COULD be running per the profile set
+            # must report state=running. Allow up to 2.5 min before we
+            # give up; agent images may need to docker-pull on first
+            # boot if they weren't baked into the ISO.
+            non_running=$(docker-compose ps --status=created --status=exited --status=dead --status=restarting -q 2>/dev/null | wc -l)
+            total=$(docker-compose ps -q 2>/dev/null | wc -l)
+            if [ "$total" -gt 0 ] && [ "$non_running" -eq 0 ]; then
+                date -Iseconds > "$STAMP"
+                IP=$(ip -4 -o addr show scope global | awk '{print $4}' | cut -d/ -f1 | head -1)
+                echo "Ready: agent appliance up at http://${IP:-<appliance-ip>}/"
+                echo "       Agent registers against: ${CONTROL_PLANE_URL:-<not set>}"
+                echo "       Live state: docker logs spatiumddi-*-1"
+                exit 0
+            fi
+            sleep 5
+        done
+        echo "WARN: agent containers did not all report 'running' within 2.5 minutes." >&2
+        echo "      Check 'docker-compose -f $COMPOSE_DIR/docker-compose.yml logs'." >&2
+        exit 1
+        ;;
+esac

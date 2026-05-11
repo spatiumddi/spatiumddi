@@ -96,7 +96,7 @@ EOF
 
 # Wizard state — all set by the prompt functions below.
 TARGET_DISK=""
-HOSTNAME="spatiumddi"
+HOSTNAME=""
 ADMIN_USER="admin"
 ADMIN_PASSWORD=""
 NET_MODE="dhcp"
@@ -257,11 +257,35 @@ pick_disk() {
 
 ask_hostname() {
     log "Step: ask_hostname"
-    HOSTNAME=$(whiptail --backtitle "$BACKTITLE" --title "Hostname" \
-        --inputbox "System hostname (also shown in shell prompts + audit logs):" \
-        10 70 "$HOSTNAME" 3>&1 1>&2 2>&3) \
-        || on_cancel "hostname"
-    [ -z "$HOSTNAME" ] && HOSTNAME="spatiumddi"
+    # No pre-filled default — multiple appliances on the same network
+    # all named "spatiumddi" caused real-world server-name collisions
+    # (the agent registers its SERVER_NAME with the control plane;
+    # two agents on the same name conflict). Require operator input.
+    while true; do
+        HOSTNAME=$(whiptail --backtitle "$BACKTITLE" --title "Hostname" \
+            --inputbox "System hostname (also used as the SERVER_NAME this appliance registers under for DNS / DHCP agent roles, and shown in shell prompts + audit logs).\n\nGive each appliance a unique name (e.g. dns-east-1, dhcp-prod-a, ddi-control)." \
+            14 72 "$HOSTNAME" 3>&1 1>&2 2>&3) \
+            || on_cancel "hostname"
+        HOSTNAME=$(echo "$HOSTNAME" | tr -d '[:space:]')
+        if [ -z "$HOSTNAME" ]; then
+            whiptail --msgbox "Hostname is required. Pick something descriptive for this appliance — it shouldn't collide with any other SpatiumDDI box." 9 60 || true
+            continue
+        fi
+        # Loose RFC 1123 sanity: lower-case alphanum + hyphen, no
+        # leading / trailing hyphen, length <= 63. Reject anything
+        # that systemd-hostnamed would later refuse silently.
+        case "$HOSTNAME" in
+            *[!a-zA-Z0-9-]*|-*|*-)
+                whiptail --msgbox "Hostname must be alphanumeric + hyphen, not start or end with a hyphen, and contain no spaces or dots. Try again." 10 64 || true
+                continue
+                ;;
+        esac
+        if [ "${#HOSTNAME}" -gt 63 ]; then
+            whiptail --msgbox "Hostname must be 63 characters or fewer." 8 60 || true
+            continue
+        fi
+        break
+    done
 }
 
 ask_user_password() {
