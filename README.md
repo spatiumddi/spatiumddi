@@ -153,7 +153,7 @@
 |---|---|---|
 | 🐳 | **Docker Compose** | `docker compose up -d` |
 | ☸️ | **Kubernetes** | Helm umbrella chart, OCI-published |
-| 🖥 | **Bare metal / OS appliance** | bare metal today · self-contained appliance image (roadmap) |
+| 🖥 | **Bare metal / OS appliance** | bare metal today · self-contained appliance ISO (alpha — Debian 13 + full stack, hybrid USB/CD, see [Getting Started](#quick-start-with-the-os-appliance-iso)) |
 
 ---
 
@@ -573,7 +573,7 @@ The tables above are the elevator pitch. The bullets here are the same surface w
   - Docker Compose
   - Kubernetes — Helm umbrella chart, OCI-published
   - Bare metal
-  - OS appliance (roadmap)
+  - OS appliance ISO — alpha (Debian 13 + full stack pre-installed, dedicated `/appliance` management hub with TLS, releases, containers, logs, host config; see [Getting Started](#quick-start-with-the-os-appliance-iso) + [`docs/deployment/APPLIANCE.md`](docs/deployment/APPLIANCE.md))
 
 ---
 
@@ -804,7 +804,7 @@ EOF
 | **Docker Compose** | Dev, small single-host production | ✅ Supported |
 | **Kubernetes + Helm** | Multi-node production, scalable | ✅ Umbrella chart (`charts/spatiumddi`, published OCI to `ghcr.io/spatiumddi/charts/spatiumddi`) |
 | **Bare metal / VM (Ansible)** | On-prem without containers | 📋 Planned |
-| **OS Appliance (ISO / qcow2)** | Air-gapped, zero-dependency | 📋 Planned |
+| **OS Appliance (ISO / qcow2)** | Air-gapped, zero-dependency, dedicated `/appliance` management hub | 🔄 Alpha — Debian 13 + full stack, hybrid USB/CD, web first-boot wizard, in-UI TLS / releases / containers / logs / diagnostics / maintenance + reboot. Build with `make appliance && make appliance-iso`. See [`docs/deployment/APPLIANCE.md`](docs/deployment/APPLIANCE.md) + [issue #134](https://github.com/spatiumddi/spatiumddi/issues/134) |
 
 ---
 
@@ -826,7 +826,7 @@ Full docs at **[spatiumddi.github.io](https://spatiumddi.github.io)** (coming so
 | [DNS Agent Design](docs/deployment/DNS_AGENT.md) | Agent protocol, auto-registration, config sync |
 | [DNS Driver Spec](docs/drivers/DNS_DRIVERS.md) | BIND9 + Windows DNS driver internals |
 | [DHCP Driver Spec](docs/drivers/DHCP_DRIVERS.md) | Kea + Windows DHCP driver internals |
-| [Appliance Deployment](docs/deployment/APPLIANCE.md) | OS image build and licensing |
+| [Appliance Deployment](docs/deployment/APPLIANCE.md) | OS appliance ISO — base OS selection, build pipeline, first-boot orchestration, `/appliance` management hub spec |
 
 ---
 
@@ -837,7 +837,7 @@ Full docs at **[spatiumddi.github.io](https://spatiumddi.github.io)** (coming so
 | Phase 1 | Core IPAM, auth, user management, audit log, Docker Compose | ✅ Done — LDAP/OIDC/SAML + RADIUS/TACACS+, group-based RBAC, bulk-edit, inheritance, mobile-responsive UI, and full IPv6 `/next-address` (EUI-64 + random /128 + sequential) all shipped |
 | Phase 2 | DHCP (Kea), DNS (BIND9), DDNS, zone/subnet tree UI | ✅ Done — DNS, Kea DHCPv4, subnet-level DDNS, agent-side Kea DDNS, block/space DDNS inheritance, per-server zone serial reporting all shipped |
 | Phase 3 | DNS views, server groups, blocking lists, VLAN/VXLAN, system admin, Kea HA | 🔄 DNS features + health dashboard + alerts framework + group-centric Kea HA (self-healing peer-IP drift + supervised daemons) landed; DNS Views end-to-end + HA state-transition actions still pending |
-| Phase 4 | OS appliance, Terraform provider, SAML, backup/restore, ACME | 🔄 SAML + full backup/restore + factory-reset all landed (8 destination kinds, selective restore, cross-install secret rewrap, alembic-upgrade-on-restore); appliance + providers + ACME embedded client pending |
+| Phase 4 | OS appliance, Terraform provider, SAML, backup/restore, ACME | 🔄 SAML + full backup/restore + factory-reset + OS appliance alpha (Debian 13 ISO with `/appliance` management hub: TLS upload + CSR-on-server, GitHub release apply, container start/stop/restart + live logs, host log viewer + self-test + diagnostic bundle, maintenance mode + reboot, web first-boot wizard) all landed. Terraform/Ansible providers + ACME embedded client (Let's Encrypt auto-issue) still pending |
 | Phase 5 | Multi-tenancy, IP request workflows, advanced reporting | 📋 Planned |
 
 See [CHANGELOG.md](CHANGELOG.md) for the per-release feature list and
