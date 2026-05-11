@@ -11,7 +11,12 @@
 # Runs automatically on boot when `spatium-mode=install` is in the
 # kernel cmdline (set by the "Install SpatiumDDI to disk" GRUB
 # entry). Also available as a CLI tool from the live shell.
-set -euo pipefail
+# pipefail + nounset for the wizard, but NOT -e: whiptail returns
+# non-zero on Cancel/Esc and we want to handle that explicitly with
+# on_cancel rather than crashing the script. -e is re-enabled inside
+# do_install where we DO want any partition / rsync / chroot failure
+# to abort.
+set -uo pipefail
 
 BACKTITLE="SpatiumDDI Appliance Installer 0.1.0"
 INSTALL_LOG=/var/log/spatium-install.log
@@ -20,6 +25,19 @@ MOUNT=/mnt/target
 mkdir -p /var/log
 : > "$INSTALL_LOG"
 log() { echo "[$(date -Iseconds)] $*" | tee -a "$INSTALL_LOG"; }
+
+on_cancel() {
+    clear
+    cat <<EOF
+
+Installation cancelled at: $1
+
+Run 'spatium-install' to start the wizard again,
+or 'reboot' to leave the live ISO and try a different boot path.
+
+EOF
+    exec /bin/bash --login
+}
 
 # Wizard state — all set by the prompt functions below.
 TARGET_DISK=""
@@ -46,7 +64,8 @@ You'll be asked for:\n\
   - Admin OS user + password (web-UI login is separate)\n\
   - Network (DHCP or static)\n\
   - Timezone\n\n\
-Press OK to begin, or Ctrl-C to drop to a shell." 18 70
+Press OK to begin, or Cancel to drop to a shell." 18 70 \
+        || on_cancel "welcome"
 }
 
 pick_disk() {
@@ -78,35 +97,41 @@ pick_disk() {
 
     TARGET_DISK=$(whiptail --backtitle "$BACKTITLE" --title "Target Disk" \
         --menu "Select the disk to install SpatiumDDI to.\nALL DATA on the chosen disk will be DESTROYED." \
-        20 70 10 "${options[@]}" 3>&1 1>&2 2>&3)
+        20 70 10 "${options[@]}" 3>&1 1>&2 2>&3) \
+        || on_cancel "target disk"
 }
 
 ask_hostname() {
     HOSTNAME=$(whiptail --backtitle "$BACKTITLE" --title "Hostname" \
         --inputbox "System hostname (also shown in shell prompts + audit logs):" \
-        10 70 "$HOSTNAME" 3>&1 1>&2 2>&3)
+        10 70 "$HOSTNAME" 3>&1 1>&2 2>&3) \
+        || on_cancel "hostname"
     [ -z "$HOSTNAME" ] && HOSTNAME="spatiumddi"
 }
 
 ask_user_password() {
     ADMIN_USER=$(whiptail --backtitle "$BACKTITLE" --title "Admin OS user" \
         --inputbox "OS-level admin username (for SSH + sudo).\n\nThe SpatiumDDI web UI uses 'admin/admin' separately — change it on first login." \
-        12 70 "$ADMIN_USER" 3>&1 1>&2 2>&3)
+        12 70 "$ADMIN_USER" 3>&1 1>&2 2>&3) \
+        || on_cancel "admin user"
     [ -z "$ADMIN_USER" ] && ADMIN_USER="admin"
 
     while true; do
         local p1 p2
         p1=$(whiptail --backtitle "$BACKTITLE" --title "Admin password" \
             --passwordbox "Password for '$ADMIN_USER' (and root):" 10 60 \
-            3>&1 1>&2 2>&3)
+            3>&1 1>&2 2>&3) \
+            || on_cancel "password"
         p2=$(whiptail --backtitle "$BACKTITLE" --title "Confirm password" \
-            --passwordbox "Repeat:" 10 60 3>&1 1>&2 2>&3)
+            --passwordbox "Repeat:" 10 60 3>&1 1>&2 2>&3) \
+            || on_cancel "password confirmation"
         if [ "$p1" = "$p2" ] && [ -n "$p1" ]; then
             ADMIN_PASSWORD="$p1"
             break
         fi
         whiptail --backtitle "$BACKTITLE" \
-            --msgbox "Passwords don't match or are empty. Try again." 8 50
+            --msgbox "Passwords don't match or are empty. Try again." 8 50 \
+            || true
     done
 }
 
@@ -115,7 +140,8 @@ ask_network() {
         --menu "How should the appliance configure its network?" 12 70 2 \
         "dhcp"   "Automatic via DHCP (recommended for evaluation)" \
         "static" "Static IP" \
-        3>&1 1>&2 2>&3)
+        3>&1 1>&2 2>&3) \
+        || on_cancel "network mode"
 
     if [ "$NET_MODE" = "static" ]; then
         local ifs=()
@@ -123,27 +149,33 @@ ask_network() {
             ifs+=("$iface" "$(cat /sys/class/net/$iface/address 2>/dev/null || echo "?")")
         done
         if [ ${#ifs[@]} -eq 0 ]; then
-            whiptail --msgbox "No ethernet interfaces found — falling back to DHCP." 8 60
+            whiptail --msgbox "No ethernet interfaces found — falling back to DHCP." 8 60 || true
             NET_MODE="dhcp"
             return
         fi
         NET_INTERFACE=$(whiptail --backtitle "$BACKTITLE" --title "Static IP — interface" \
-            --menu "Pick an interface:" 12 60 5 "${ifs[@]}" 3>&1 1>&2 2>&3)
+            --menu "Pick an interface:" 12 60 5 "${ifs[@]}" 3>&1 1>&2 2>&3) \
+            || on_cancel "static interface"
         NET_IP=$(whiptail --backtitle "$BACKTITLE" --title "Static IP — address" \
-            --inputbox "IPv4 address (e.g. 192.168.1.10):" 10 60 "" 3>&1 1>&2 2>&3)
+            --inputbox "IPv4 address (e.g. 192.168.1.10):" 10 60 "" 3>&1 1>&2 2>&3) \
+            || on_cancel "static IP"
         NET_PREFIX=$(whiptail --backtitle "$BACKTITLE" --title "Static IP — prefix" \
-            --inputbox "Prefix length:" 10 60 "$NET_PREFIX" 3>&1 1>&2 2>&3)
+            --inputbox "Prefix length:" 10 60 "$NET_PREFIX" 3>&1 1>&2 2>&3) \
+            || on_cancel "static prefix"
         NET_GATEWAY=$(whiptail --backtitle "$BACKTITLE" --title "Static IP — gateway" \
-            --inputbox "Gateway:" 10 60 "" 3>&1 1>&2 2>&3)
+            --inputbox "Gateway:" 10 60 "" 3>&1 1>&2 2>&3) \
+            || on_cancel "static gateway"
         NET_DNS=$(whiptail --backtitle "$BACKTITLE" --title "Static IP — DNS" \
-            --inputbox "DNS servers (space-separated):" 10 60 "$NET_DNS" 3>&1 1>&2 2>&3)
+            --inputbox "DNS servers (space-separated):" 10 60 "$NET_DNS" 3>&1 1>&2 2>&3) \
+            || on_cancel "static DNS"
     fi
 }
 
 ask_timezone() {
     TIMEZONE=$(whiptail --backtitle "$BACKTITLE" --title "Timezone" \
         --inputbox "Timezone (IANA name, e.g. America/Toronto, Europe/Berlin, UTC):" \
-        10 70 "$TIMEZONE" 3>&1 1>&2 2>&3)
+        10 70 "$TIMEZONE" 3>&1 1>&2 2>&3) \
+        || on_cancel "timezone"
     [ -z "$TIMEZONE" ] && TIMEZONE="UTC"
 }
 
@@ -161,7 +193,7 @@ confirm() {
     s+="Proceed with installation?"
     whiptail --backtitle "$BACKTITLE" --title "Confirm" \
         --yesno "$s" 18 70 \
-        || { echo "Cancelled."; exit 1; }
+        || on_cancel "final confirmation"
 }
 
 # ── Install ───────────────────────────────────────────────────────────────────
@@ -176,6 +208,11 @@ partition_node() {
 }
 
 do_install() {
+    # Now we're past all the prompts — enable -e so any failure
+    # inside the partitioning / rsync / chroot block aborts cleanly
+    # and the EXIT trap drops the operator to a shell with the log.
+    set -e
+
     local ESP ROOT
     ESP=$(partition_node 1)
     ROOT=$(partition_node 2)
