@@ -24,7 +24,9 @@ mkdir -p "$BUILDROOT/etc/systemd/system/multi-user.target.wants"
 for unit in docker.service chrony.service ssh.service \
             spatiumddi-firstboot.service \
             spatium-install.service \
-            spatium-live-banner.service; do
+            spatium-live-banner.service \
+            qemu-guest-agent.service \
+            open-vm-tools.service; do
     src=
     for candidate in /lib/systemd/system /etc/systemd/system /usr/lib/systemd/system; do
         if [ -f "$BUILDROOT$candidate/$unit" ]; then
