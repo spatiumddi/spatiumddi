@@ -70,7 +70,7 @@ echo "→ Root partition: offset=$ROOT_OFFSET ($((ROOT_OFFSET / 1024 / 1024)) Mi
 ISO_ROOT="$WORKDIR/iso"
 mkdir -p "$ISO_ROOT/live" "$ISO_ROOT/boot/grub"
 
-# ── Mount the root partition (offset+sizelimit) ───────────────────────────────
+# ── Mount the root partition rw (we need to regenerate the initrd) ────────────
 # Release any stale loop devices left over from a previous failed run
 # against the same file. Without this, mount errors with
 # "overlapping loop device exists" on retry.
@@ -78,19 +78,66 @@ losetup -j "$RAW" 2>/dev/null | cut -d: -f1 | xargs -r -n1 losetup -d 2>/dev/nul
 
 MOUNT_DIR="$WORKDIR/mnt"
 mkdir -p "$MOUNT_DIR"
-mount -o ro,loop,offset=$ROOT_OFFSET,sizelimit=$ROOT_SIZE "$RAW" "$MOUNT_DIR"
+# Mount rw — we chroot in below and run update-initramfs so the
+# initrd we ship in the ISO has live-boot hooks. mkosi's own initrd
+# (next to the raw on disk) is a systemd-style minimal rootfs purpose-
+# built for disk boot and ignores Debian initramfs-tools hooks
+# entirely. It stays as the qcow2's disk-boot initrd; the ISO needs
+# a different one.
+mount -o rw,loop,offset=$ROOT_OFFSET,sizelimit=$ROOT_SIZE "$RAW" "$MOUNT_DIR"
 
-# ── Kernel + initrd ───────────────────────────────────────────────────────────
-if [ -f "$KERNEL" ] && [ -f "$INITRD" ]; then
-    cp "$KERNEL" "$ISO_ROOT/live/vmlinuz"
-    cp "$INITRD" "$ISO_ROOT/live/initrd.img"
-else
-    echo "kernel/initrd not staged beside raw — extracting from /boot" >&2
-    cp "$MOUNT_DIR"/boot/vmlinuz-* "$ISO_ROOT/live/vmlinuz"
-    cp "$MOUNT_DIR"/boot/initrd.img-* "$ISO_ROOT/live/initrd.img"
+# ── Regenerate the initrd with live-boot hooks inside the chroot ──────────────
+echo "→ Regenerating initrd with live-boot hooks (chroot into rootfs)…"
+for d in proc sys dev; do
+    mount --bind "/$d" "$MOUNT_DIR/$d"
+done
+cleanup_chroot() {
+    for d in dev sys proc; do
+        umount "$MOUNT_DIR/$d" 2>/dev/null || true
+    done
+}
+trap 'cleanup_chroot; cleanup' EXIT
+
+# Pick the kernel version from /lib/modules/<kver>/. update-initramfs
+# needs an explicit version when /boot/vmlinuz isn't there — mkosi
+# strips the kernel from /boot during build (it stages vmlinuz
+# separately for disk boot).
+KVER=$(ls "$MOUNT_DIR/lib/modules" 2>/dev/null | head -1)
+if [ -z "$KVER" ]; then
+    echo "no kernel modules found in /lib/modules — can't regenerate initrd" >&2
+    exit 1
+fi
+echo "→ Kernel version: $KVER"
+
+# update-initramfs -c -k <ver> creates /boot/initrd.img-<ver> using
+# every initramfs-tools hook now present in the rootfs (including
+# /usr/share/initramfs-tools/scripts/live from the live-boot package).
+chroot "$MOUNT_DIR" update-initramfs -c -k "$KVER" 2>&1 | grep -vE "^(I:|W: Possible missing firmware)" | tail -10
+
+if [ ! -f "$MOUNT_DIR/boot/initrd.img-$KVER" ]; then
+    echo "update-initramfs did not produce /boot/initrd.img-$KVER" >&2
+    ls -la "$MOUNT_DIR/boot/" >&2
+    exit 1
 fi
 
+# ── Kernel + initrd ───────────────────────────────────────────────────────────
+# mkosi's staged vmlinuz (next to the raw) + the chroot-regenerated
+# Debian initrd. Different artefacts, intentionally — mkosi's own
+# .initrd is a systemd-style minimal-rootfs purpose-built for disk
+# boot and ignores Debian initramfs-tools hooks. Using mkosi's
+# vmlinuz is fine since both initrds target the same kernel ABI.
+cp "$KERNEL" "$ISO_ROOT/live/vmlinuz"
+cp "$MOUNT_DIR/boot/initrd.img-$KVER" "$ISO_ROOT/live/initrd.img"
+echo "→ Live initrd: $(ls -lh "$ISO_ROOT/live/initrd.img" | awk '{print $5}')"
+
 # ── Squashfs of the rootfs ────────────────────────────────────────────────────
+# Unmount the bind mounts before snapshotting — squashfs would
+# otherwise descend into /proc and /sys and try to pack their
+# contents, which fails on synthetic kernel files.
+for d in dev sys proc; do
+    umount "$MOUNT_DIR/$d" 2>/dev/null || true
+done
+trap cleanup EXIT
 
 echo "→ Building squashfs (this is the slow step — ~2 min)…"
 # -comp xz: tightest compression, optimal for read-mostly live boot
@@ -109,12 +156,12 @@ cat > "$ISO_ROOT/boot/grub/grub.cfg" <<'EOF'
 set timeout=3
 set default=0
 
-menuentry "SpatiumDDI Appliance — Live" {
+menuentry "SpatiumDDI Appliance - Live" {
     linux /live/vmlinuz boot=live components quiet
     initrd /live/initrd.img
 }
 
-menuentry "SpatiumDDI Appliance — Live (verbose)" {
+menuentry "SpatiumDDI Appliance - Live (verbose)" {
     linux /live/vmlinuz boot=live components
     initrd /live/initrd.img
 }
