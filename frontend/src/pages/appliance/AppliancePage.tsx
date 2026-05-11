@@ -129,10 +129,9 @@ export function AppliancePage() {
           )}
         </div>
         <p className="mt-1 text-xs text-muted-foreground">
-          Manage the SpatiumDDI OS appliance — TLS, releases,
-          containers, logs, host network, and lifecycle. This surface
-          is appliance-only; on plain Docker / Kubernetes deployments
-          the sidebar entry is hidden.
+          Manage the SpatiumDDI OS appliance — TLS, releases, containers, logs,
+          host network, and lifecycle. This surface is appliance-only; on plain
+          Docker / Kubernetes deployments the sidebar entry is hidden.
         </p>
         <div className="-mb-px mt-3 flex flex-wrap gap-1 border-b">
           {TABS.map((t) => {

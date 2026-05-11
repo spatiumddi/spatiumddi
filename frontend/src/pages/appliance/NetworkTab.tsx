@@ -127,8 +127,8 @@ function RebootBanner() {
     <div className="flex items-start gap-2 rounded-md border border-amber-500/50 bg-amber-500/10 p-3 text-xs">
       <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
       <div className="text-amber-700 dark:text-amber-400">
-        <strong>Reboot pending.</strong> An unattended-upgrades run installed
-        a kernel or libc update that requires a reboot. Schedule one from the
+        <strong>Reboot pending.</strong> An unattended-upgrades run installed a
+        kernel or libc update that requires a reboot. Schedule one from the
         Maintenance tab when convenient.
       </div>
     </div>

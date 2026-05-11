@@ -22,7 +22,7 @@ from typing import Any
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import dsa, ec, ed25519, ed448, rsa
+from cryptography.hazmat.primitives.asymmetric import dsa, ec, ed448, ed25519, rsa
 from cryptography.x509.oid import NameOID
 
 
@@ -157,9 +157,7 @@ def validate_key_matches_cert(cert_pem: str, key_pem: str) -> None:
         # password=None — encrypted keys aren't supported here; operators
         # can decrypt before uploading. We could add a passphrase field
         # later but the value is marginal vs. the UX cost.
-        private_key = serialization.load_pem_private_key(
-            key_pem.encode("utf-8"), password=None
-        )
+        private_key = serialization.load_pem_private_key(key_pem.encode("utf-8"), password=None)
     except (ValueError, TypeError) as exc:
         raise TLSValidationError(
             f"key parse failed (encrypted keys not supported — decrypt first): {exc}"
@@ -175,9 +173,7 @@ def validate_key_matches_cert(cert_pem: str, key_pem: str) -> None:
             dsa.DSAPrivateKey,
         ),
     ):
-        raise TLSValidationError(
-            f"unsupported key algorithm: {type(private_key).__name__}"
-        )
+        raise TLSValidationError(f"unsupported key algorithm: {type(private_key).__name__}")
 
     cert_pub_bytes = leaf.public_key().public_bytes(
         encoding=serialization.Encoding.DER,
@@ -189,9 +185,7 @@ def validate_key_matches_cert(cert_pem: str, key_pem: str) -> None:
     )
 
     if cert_pub_bytes != key_pub_bytes:
-        raise TLSValidationError(
-            "private key does not match the certificate's public key"
-        )
+        raise TLSValidationError("private key does not match the certificate's public key")
 
 
 # ── Helpers (private) ───────────────────────────────────────────────
@@ -272,34 +266,23 @@ def generate_csr_and_key(
     if subject.country:
         name_attrs.append(x509.NameAttribute(NameOID.COUNTRY_NAME, subject.country))
     if subject.state:
-        name_attrs.append(
-            x509.NameAttribute(NameOID.STATE_OR_PROVINCE_NAME, subject.state)
-        )
+        name_attrs.append(x509.NameAttribute(NameOID.STATE_OR_PROVINCE_NAME, subject.state))
     if subject.locality:
         name_attrs.append(x509.NameAttribute(NameOID.LOCALITY_NAME, subject.locality))
     if subject.organization:
-        name_attrs.append(
-            x509.NameAttribute(NameOID.ORGANIZATION_NAME, subject.organization)
-        )
+        name_attrs.append(x509.NameAttribute(NameOID.ORGANIZATION_NAME, subject.organization))
     if subject.organizational_unit:
         name_attrs.append(
-            x509.NameAttribute(
-                NameOID.ORGANIZATIONAL_UNIT_NAME, subject.organizational_unit
-            )
+            x509.NameAttribute(NameOID.ORGANIZATIONAL_UNIT_NAME, subject.organizational_unit)
         )
     if subject.email:
         name_attrs.append(x509.NameAttribute(NameOID.EMAIL_ADDRESS, subject.email))
 
-    builder = (
-        x509.CertificateSigningRequestBuilder()
-        .subject_name(x509.Name(name_attrs))
-    )
+    builder = x509.CertificateSigningRequestBuilder().subject_name(x509.Name(name_attrs))
 
     san_entries = _build_san_entries(sans)
     if san_entries:
-        builder = builder.add_extension(
-            x509.SubjectAlternativeName(san_entries), critical=False
-        )
+        builder = builder.add_extension(x509.SubjectAlternativeName(san_entries), critical=False)
 
     # RSA + ECDSA use SHA-256; Ed25519/Ed448 don't take a hash arg, but
     # we don't generate those here (no public CA supports them yet so

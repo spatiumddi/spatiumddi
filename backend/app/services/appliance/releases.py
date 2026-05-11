@@ -22,7 +22,7 @@ without burning the budget.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
@@ -68,7 +68,7 @@ async def list_releases() -> list[Release]:
     Empty list on any error (rate-limited, network unreachable,
     repo name typo). The UI shows the empty state cleanly.
     """
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     cached = _CACHE.get("releases")
     if cached and (now - cached[0]).total_seconds() < _CACHE_TTL_SECONDS:
         return cached[1]
@@ -95,9 +95,7 @@ async def list_releases() -> list[Release]:
             continue
         published = r.get("published_at") or r.get("created_at")
         try:
-            published_at = datetime.fromisoformat(
-                published.replace("Z", "+00:00")
-            )
+            published_at = datetime.fromisoformat(published.replace("Z", "+00:00"))
         except (AttributeError, ValueError):
             published_at = now
         releases.append(
@@ -123,9 +121,7 @@ def schedule_apply(tag: str) -> None:
     writable (e.g. dev environment without the appliance volume).
     """
     if not settings.appliance_mode:
-        raise RuntimeError(
-            "release apply is only supported on the SpatiumDDI OS appliance"
-        )
+        raise RuntimeError("release apply is only supported on the SpatiumDDI OS appliance")
     _TRIGGER_FILE.parent.mkdir(parents=True, exist_ok=True)
     tmp = _TRIGGER_FILE.with_suffix(".new")
     tmp.write_text(f"{tag.strip()}\n", encoding="utf-8")

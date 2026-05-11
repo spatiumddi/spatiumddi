@@ -49,7 +49,7 @@ class VersionResponse(BaseModel):
     appliance_hostname: str | None
 
 
-def _appliance_fields() -> dict[str, str | None]:
+def _appliance_fields() -> dict[str, str | bool | None]:
     return {
         "appliance_mode": settings.appliance_mode,
         "appliance_version": settings.appliance_version or None,

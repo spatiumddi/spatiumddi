@@ -21,7 +21,6 @@ from sqlalchemy.orm import Mapped, mapped_column
 
 from app.models.base import Base
 
-
 # Certificate sources — also the operator-facing label on each
 # certificate card. "uploaded" is Phase 4b.1; the other three land
 # in 4b.3 / 4b.4 / 4b.5 respectively, but we put the column in now
@@ -46,9 +45,7 @@ class ApplianceCertificate(Base):
 
     __tablename__ = "appliance_certificate"
 
-    id: Mapped[uuid.UUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True, default=uuid.uuid4
-    )
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
 
     # Operator-chosen label. Unique so audit log lines + UI cards can
     # refer to "letsencrypt-2026.05" without ambiguity. Distinct from
@@ -85,9 +82,7 @@ class ApplianceCertificate(Base):
     # the most recent activation timestamp so the UI can show "active
     # since X" without consulting the audit log.
     is_active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
-    activated_at: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    activated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     # Identity extracted from the cert at upload time (so listing
     # doesn't need to re-parse every PEM on every request). subject_cn
@@ -112,12 +107,8 @@ class ApplianceCertificate(Base):
     # render "expires in N days" badges and by a future renewal task
     # (Phase 4b.4) to schedule Let's Encrypt rotations. NULL on
     # CSR-pending rows.
-    valid_from: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
-    valid_to: Mapped[datetime | None] = mapped_column(
-        DateTime(timezone=True), nullable=True
-    )
+    valid_from: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    valid_to: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     # Operator notes — purely descriptive. UI shows them on the card
     # for context ("Let's Encrypt prod cert — renew script in cron").

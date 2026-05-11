@@ -21,7 +21,7 @@ so we don't need a second compose mount.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import structlog
@@ -55,11 +55,7 @@ class SystemInfo:
 def get_system_info() -> SystemInfo:
     return SystemInfo(
         hostname=settings.appliance_hostname or "spatiumddi",
-        host_ips=[
-            ip.strip()
-            for ip in settings.appliance_host_ips.split(",")
-            if ip.strip()
-        ],
+        host_ips=[ip.strip() for ip in settings.appliance_host_ips.split(",") if ip.strip()],
         uptime_seconds=_read_uptime_seconds(),
         maintenance_mode=is_maintenance_mode(),
         reboot_pending_from_host=_HOST_REBOOT_REQUIRED.exists(),
@@ -77,13 +73,11 @@ def is_maintenance_mode() -> bool:
 def set_maintenance_mode(enabled: bool) -> bool:
     """Create / remove the flag file. Returns the new state."""
     if not settings.appliance_mode:
-        raise RuntimeError(
-            "maintenance mode is only supported on the SpatiumDDI OS appliance"
-        )
+        raise RuntimeError("maintenance mode is only supported on the SpatiumDDI OS appliance")
     _STATE_DIR.mkdir(parents=True, exist_ok=True)
     if enabled:
         _MAINT_FLAG.write_text(
-            datetime.now(tz=timezone.utc).isoformat() + "\n",
+            datetime.now(tz=UTC).isoformat() + "\n",
             encoding="utf-8",
         )
     else:
@@ -103,13 +97,10 @@ def request_reboot(grace_seconds: int = 10) -> None:
     responses can flush, then runs ``systemctl reboot``.
     """
     if not settings.appliance_mode:
-        raise RuntimeError(
-            "reboot is only supported on the SpatiumDDI OS appliance"
-        )
+        raise RuntimeError("reboot is only supported on the SpatiumDDI OS appliance")
     _STATE_DIR.mkdir(parents=True, exist_ok=True)
     _REBOOT_TRIGGER.write_text(
-        f"requested_at={datetime.now(tz=timezone.utc).isoformat()}\n"
-        f"grace_seconds={grace_seconds}\n",
+        f"requested_at={datetime.now(tz=UTC).isoformat()}\n" f"grace_seconds={grace_seconds}\n",
         encoding="utf-8",
     )
     logger.info("appliance_reboot_requested", grace=grace_seconds)
@@ -121,7 +112,7 @@ def _read_uptime_seconds() -> float | None:
     counter is host-wide, so this works regardless of mount strategy.
     """
     try:
-        with open("/proc/uptime", "r") as f:
+        with open("/proc/uptime") as f:
             first = f.read().split(maxsplit=1)[0]
         return float(first)
     except (OSError, ValueError):

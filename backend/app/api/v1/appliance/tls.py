@@ -15,8 +15,7 @@ superadmin bypasses both.
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
-from typing import Annotated
+from datetime import UTC, datetime
 
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, status
@@ -252,7 +251,7 @@ async def upload_certificate(
                 "source": row.source,
                 "subject_cn": row.subject_cn,
                 "fingerprint_sha256": row.fingerprint_sha256,
-                "valid_to": row.valid_to.isoformat(),
+                "valid_to": row.valid_to.isoformat() if row.valid_to else None,
                 "is_active": row.is_active,
             },
             result="success",
@@ -602,14 +601,13 @@ async def _activate_only(db: DB, target: ApplianceCertificate) -> None:
     Done in one transaction so we never have two active rows or zero
     active rows visible to a concurrent read. Caller commits.
     """
-    from datetime import timezone as _tz
 
     from sqlalchemy import update
 
     # target.valid_to can be None for a CSR-pending row, but those are
     # rejected upstream by the activate endpoint — keep a safe fallback
     # anyway so the helper doesn't crash if a future caller drifts.
-    tzinfo = target.valid_to.tzinfo if target.valid_to else _tz.utc
+    tzinfo = target.valid_to.tzinfo if target.valid_to else UTC
     now = datetime.now(tz=tzinfo)
     await db.execute(
         update(ApplianceCertificate)

@@ -74,10 +74,10 @@ export function AgentBootstrapKeysSection() {
         </p>
         <p className="mt-1 text-xs text-muted-foreground">
           Same keys work for every agent topology: appliance role-split
-          installs, docker-compose agents on another host, the k8s agent
-          chart, or a bare-metal install. The agent exchanges the
-          pre-shared key for a rotating JWT on first contact + caches it
-          locally so it only needs the bootstrap key once.
+          installs, docker-compose agents on another host, the k8s agent chart,
+          or a bare-metal install. The agent exchanges the pre-shared key for a
+          rotating JWT on first contact + caches it locally so it only needs the
+          bootstrap key once.
         </p>
       </div>
 
@@ -163,8 +163,8 @@ export function AgentBootstrapKeysSection() {
           </li>
           <li>
             <strong>Docker / docker-compose agent</strong> — set the matching
-            env var in the agent container's <code>.env</code> or compose
-            file. See <code>docker-compose.standalone-dns.yml</code> /{" "}
+            env var in the agent container's <code>.env</code> or compose file.
+            See <code>docker-compose.standalone-dns.yml</code> /{" "}
             <code>docker-compose.standalone-dhcp.yml</code>.
           </li>
           <li>
@@ -174,10 +174,10 @@ export function AgentBootstrapKeysSection() {
             <code>values.yaml</code>.
           </li>
           <li>
-            The agent exchanges this key for a rotating JWT on first
-            contact. Subsequent registrations don't need it; rotate it
-            here only if the secret has leaked or you want to invalidate
-            every existing agent in one shot.
+            The agent exchanges this key for a rotating JWT on first contact.
+            Subsequent registrations don't need it; rotate it here only if the
+            secret has leaked or you want to invalidate every existing agent in
+            one shot.
           </li>
         </ul>
       </details>
@@ -219,8 +219,8 @@ function KeyCard({
         <p className="mt-1 text-xs text-muted-foreground">
           The control plane's {envVar} env var is empty — set it on the api
           container (in <code>.env</code> for docker-compose, Helm values for
-          k8s, <code>/etc/spatiumddi/.env</code> on the appliance) and
-          restart the api before deploying matching agents.
+          k8s, <code>/etc/spatiumddi/.env</code> on the appliance) and restart
+          the api before deploying matching agents.
         </p>
       </div>
     );
@@ -250,11 +250,7 @@ function KeyCard({
           title={shown ? "Hide" : "Show"}
           className="shrink-0 rounded-md border bg-background px-1.5 py-0.5 text-[11px] hover:bg-accent"
         >
-          {shown ? (
-            <EyeOff className="h-3 w-3" />
-          ) : (
-            <Eye className="h-3 w-3" />
-          )}
+          {shown ? <EyeOff className="h-3 w-3" /> : <Eye className="h-3 w-3" />}
         </button>
         <button
           type="button"

@@ -25,8 +25,10 @@ from app.services.appliance.containers import (
     DockerUnavailableError,
     container_action,
     get_container_logs,
-    list_containers as svc_list_containers,
     stream_container_logs,
+)
+from app.services.appliance.containers import (
+    list_containers as svc_list_containers,
 )
 
 logger = structlog.get_logger(__name__)
@@ -109,9 +111,7 @@ async def post_container_action(
 )
 async def get_logs(name: str, tail: int = 200) -> dict[str, str]:
     if tail < 1 or tail > 5000:
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST, "tail must be between 1 and 5000"
-        )
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "tail must be between 1 and 5000")
     try:
         text = get_container_logs(name, tail=tail)
     except DockerUnavailableError as exc:

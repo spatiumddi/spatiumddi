@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 import anyio
@@ -55,22 +55,16 @@ def _client():
     import cost. Raises DockerUnavailableError on any failure.
     """
     if not _DOCKER_SOCK.exists():
-        raise DockerUnavailableError(
-            "docker socket not mounted into the api container"
-        )
+        raise DockerUnavailableError("docker socket not mounted into the api container")
     try:
         import docker  # noqa: PLC0415
         from docker.errors import DockerException  # noqa: PLC0415
     except ImportError as exc:
-        raise DockerUnavailableError(
-            f"docker SDK not installed: {exc}"
-        ) from exc
+        raise DockerUnavailableError(f"docker SDK not installed: {exc}") from exc
     try:
         return docker.from_env()
     except DockerException as exc:
-        raise DockerUnavailableError(
-            f"docker client init failed: {exc}"
-        ) from exc
+        raise DockerUnavailableError(f"docker client init failed: {exc}") from exc
 
 
 def list_containers() -> list[ContainerSummary]:
@@ -132,9 +126,7 @@ def container_action(name: str, action: str) -> None:
     logger.info("appliance_container_action", name=name, action=action)
 
 
-def get_container_logs(
-    name: str, tail: int = 200, since_seconds: int | None = None
-) -> str:
+def get_container_logs(name: str, tail: int = 200, since_seconds: int | None = None) -> str:
     """Return the last ``tail`` log lines (or lines since N seconds ago).
 
     Combined stdout+stderr, decoded to UTF-8 with replacement for
@@ -153,18 +145,16 @@ def get_container_logs(
         "timestamps": True,
     }
     if since_seconds is not None:
-        from datetime import timedelta, timezone as _tz
+        from datetime import timedelta
 
-        kwargs["since"] = datetime.now(_tz.utc) - timedelta(seconds=since_seconds)
+        kwargs["since"] = datetime.now(UTC) - timedelta(seconds=since_seconds)
     raw = container.logs(**kwargs)
     if isinstance(raw, bytes):
         return raw.decode("utf-8", errors="replace")
     return str(raw)
 
 
-async def stream_container_logs(
-    name: str, tail: int = 100
-) -> AsyncGenerator[str, None]:
+async def stream_container_logs(name: str, tail: int = 100) -> AsyncGenerator[str, None]:
     """Yield log lines from the named container as they arrive.
 
     Wraps the docker SDK's blocking iterator with anyio.to_thread so

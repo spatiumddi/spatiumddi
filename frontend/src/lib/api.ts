@@ -6855,9 +6855,10 @@ export const applianceReleasesApi = {
       .then((r) => r.data),
   log: () =>
     api
-      .get<{ apply_in_flight: boolean; log_tail: string }>(
-        "/appliance/releases/log",
-      )
+      .get<{
+        apply_in_flight: boolean;
+        log_tail: string;
+      }>("/appliance/releases/log")
       .then((r) => r.data),
 };
 
@@ -6877,21 +6878,23 @@ export type ContainerAction = "start" | "stop" | "restart";
 
 export const applianceContainersApi = {
   list: () =>
-    api
-      .get<ApplianceContainer[]>("/appliance/containers")
-      .then((r) => r.data),
+    api.get<ApplianceContainer[]>("/appliance/containers").then((r) => r.data),
   action: (name: string, action: ContainerAction) =>
     api
-      .post<{ name: string; action: string; status: string }>(
-        `/appliance/containers/${encodeURIComponent(name)}/${action}`,
-      )
+      .post<{
+        name: string;
+        action: string;
+        status: string;
+      }>(`/appliance/containers/${encodeURIComponent(name)}/${action}`)
       .then((r) => r.data),
   logs: (name: string, tail = 200) =>
     api
-      .get<{ name: string; tail: string }>(
-        `/appliance/containers/${encodeURIComponent(name)}/logs`,
-        { params: { tail } },
-      )
+      .get<{
+        name: string;
+        tail: string;
+      }>(`/appliance/containers/${encodeURIComponent(name)}/logs`, {
+        params: { tail },
+      })
       .then((r) => r.data),
 };
 
@@ -6928,9 +6931,7 @@ export interface ApplianceSystemInfo {
 
 export const applianceSystemApi = {
   info: () =>
-    api
-      .get<ApplianceSystemInfo>("/appliance/system/info")
-      .then((r) => r.data),
+    api.get<ApplianceSystemInfo>("/appliance/system/info").then((r) => r.data),
   setMaintenance: (enabled: boolean) =>
     api
       .post<{ maintenance_mode: boolean }>("/appliance/system/maintenance", {
@@ -6939,9 +6940,10 @@ export const applianceSystemApi = {
       .then((r) => r.data),
   reboot: () =>
     api
-      .post<{ scheduled: boolean; grace_seconds: number }>(
-        "/appliance/system/reboot",
-      )
+      .post<{
+        scheduled: boolean;
+        grace_seconds: number;
+      }>("/appliance/system/reboot")
       .then((r) => r.data),
 };
 
@@ -6955,14 +6957,13 @@ export interface ApplianceSetupState {
 
 export const applianceSetupApi = {
   state: () =>
-    api
-      .get<ApplianceSetupState>("/appliance/system/setup")
-      .then((r) => r.data),
+    api.get<ApplianceSetupState>("/appliance/system/setup").then((r) => r.data),
   complete: () =>
     api
-      .post<{ complete: boolean; completed_at: string }>(
-        "/appliance/system/setup/complete",
-      )
+      .post<{
+        complete: boolean;
+        completed_at: string;
+      }>("/appliance/system/setup/complete")
       .then((r) => r.data),
 };
 

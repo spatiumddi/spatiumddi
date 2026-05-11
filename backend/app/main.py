@@ -293,9 +293,7 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
 
         await ensure_self_signed_cert()
     except Exception as exc:  # noqa: BLE001
-        logger.warning(
-            "appliance_self_signed_bootstrap_failed", error=str(exc)
-        )
+        logger.warning("appliance_self_signed_bootstrap_failed", error=str(exc))
     # Backfill enclosing IPBlocks for any pre-existing multicast
     # groups (issue #126 — IPAM-side rendering). Idempotent; only
     # creates blocks where missing. Cheap enough to run on every

@@ -68,9 +68,7 @@ async def ensure_self_signed_cert() -> None:
     async with AsyncSessionLocal() as db:
         active_row = (
             await db.execute(
-                select(ApplianceCertificate).where(
-                    ApplianceCertificate.is_active.is_(True)
-                )
+                select(ApplianceCertificate).where(ApplianceCertificate.is_active.is_(True))
             )
         ).scalar_one_or_none()
 
@@ -87,9 +85,7 @@ async def ensure_self_signed_cert() -> None:
                     error=str(exc),
                 )
                 return
-            deploy_and_reload(
-                active_row.cert_pem, key_pem, name=active_row.name
-            )
+            deploy_and_reload(active_row.cert_pem, key_pem, name=active_row.name)
             logger.info(
                 "appliance_active_cert_redeployed",
                 cert_id=str(active_row.id),
@@ -115,7 +111,7 @@ async def ensure_self_signed_cert() -> None:
             cert_pem=cert_pem,
             key_encrypted=encrypt_str(key_pem),
             is_active=True,
-            activated_at=_dt.datetime.now(_dt.timezone.utc),
+            activated_at=_dt.datetime.now(_dt.UTC),
             subject_cn=info["subject_cn"],
             sans_json=info["sans"],
             issuer_cn=info["issuer_cn"],
@@ -199,12 +195,10 @@ def _detect_local_ips() -> list[str]:
     ips: list[str] = []
     try:
         hostname = socket.gethostname()
-        for family, _, _, _, sockaddr in socket.getaddrinfo(
-            hostname, None
-        ):
+        for family, _, _, _, sockaddr in socket.getaddrinfo(hostname, None):
             if family not in (socket.AF_INET, socket.AF_INET6):
                 continue
-            ip_str = sockaddr[0]
+            ip_str = str(sockaddr[0])
             try:
                 ip = ipaddress.ip_address(ip_str)
             except ValueError:
@@ -218,9 +212,7 @@ def _detect_local_ips() -> list[str]:
     return ips
 
 
-def _generate_self_signed_cert(
-    hostname: str, ips: list[str]
-) -> tuple[str, str, dict[str, object]]:
+def _generate_self_signed_cert(hostname: str, ips: list[str]) -> tuple[str, str, dict[str, object]]:
     """Generate a fresh RSA-2048 self-signed cert + key.
 
     Subject + Issuer are both ``CN=<hostname>`` so OpenSSL renders
@@ -228,9 +220,7 @@ def _generate_self_signed_cert(
     the hostname (browsers only check SANs since 2017, ignore CN).
     """
     key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    subject = issuer = x509.Name(
-        [x509.NameAttribute(NameOID.COMMON_NAME, hostname)]
-    )
+    subject = issuer = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, hostname)])
 
     san_entries: list[x509.GeneralName] = [x509.DNSName(hostname)]
     for ip in ips:
@@ -239,7 +229,7 @@ def _generate_self_signed_cert(
         except ValueError:
             pass
 
-    now = _dt.datetime.now(_dt.timezone.utc)
+    now = _dt.datetime.now(_dt.UTC)
     not_after = now + _dt.timedelta(days=_SELF_SIGNED_DAYS)
 
     cert = (
@@ -251,9 +241,7 @@ def _generate_self_signed_cert(
         .not_valid_before(now)
         .not_valid_after(not_after)
         .add_extension(x509.SubjectAlternativeName(san_entries), critical=False)
-        .add_extension(
-            x509.BasicConstraints(ca=False, path_length=None), critical=True
-        )
+        .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
         .sign(key, hashes.SHA256())
     )
 
@@ -268,9 +256,7 @@ def _generate_self_signed_cert(
         "subject_cn": hostname,
         "issuer_cn": hostname,
         "sans": [hostname, *ips],
-        "fingerprint_sha256": _format_fingerprint(
-            cert.fingerprint(hashes.SHA256())
-        ),
+        "fingerprint_sha256": _format_fingerprint(cert.fingerprint(hashes.SHA256())),
         "valid_from": now,
         "valid_to": not_after,
     }

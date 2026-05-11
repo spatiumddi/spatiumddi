@@ -100,6 +100,7 @@ __all__ = [
     "AuditForwardTarget",
     "AlertRule",
     "AlertEvent",
+    "ApplianceCertificate",
     "ASN",
     "ASNRpkiRoa",
     "BGPCommunity",

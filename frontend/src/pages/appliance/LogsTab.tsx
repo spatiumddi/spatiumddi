@@ -38,8 +38,8 @@ export function LogsTab() {
           Logs &amp; Diagnostics
         </h2>
         <p className="mt-1 text-xs text-muted-foreground">
-          Host-side logs the appliance can reach, a one-click health check,
-          and a redacted diagnostic bundle for sharing with support.
+          Host-side logs the appliance can reach, a one-click health check, and
+          a redacted diagnostic bundle for sharing with support.
         </p>
       </div>
 
@@ -69,8 +69,8 @@ function SelfTestCard() {
             Self-test
           </h3>
           <p className="mt-0.5 text-[11px] text-muted-foreground">
-            Runs five checks: DNS resolution, every spatium container's
-            health, internal API reachability, DHCP daemon, DNS daemon.
+            Runs five checks: DNS resolution, every spatium container's health,
+            internal API reachability, DHCP daemon, DNS daemon.
           </p>
         </div>
         <button
@@ -176,7 +176,9 @@ function LogViewerCard() {
           disabled={!selected || tail.isFetching}
           className="inline-flex items-center gap-1 rounded-md border bg-background px-2 py-1 text-xs hover:bg-accent disabled:opacity-50"
         >
-          <RefreshCw className={`h-3 w-3 ${tail.isFetching ? "animate-spin" : ""}`} />
+          <RefreshCw
+            className={`h-3 w-3 ${tail.isFetching ? "animate-spin" : ""}`}
+          />
           Refresh
         </button>
       </div>

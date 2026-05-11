@@ -59,8 +59,8 @@ export function MaintenanceTab() {
         </h2>
         <p className="mt-1 text-xs text-muted-foreground">
           Maintenance mode is a soft flag (future tasks read it to drain
-          DNS/DHCP traffic). Reboot is a real reboot — the api schedules it
-          via a host-side service with a 10-second grace.
+          DNS/DHCP traffic). Reboot is a real reboot — the api schedules it via
+          a host-side service with a 10-second grace.
         </p>
       </div>
 
@@ -68,8 +68,8 @@ export function MaintenanceTab() {
         <div className="flex items-start gap-2 rounded-md border border-amber-500/50 bg-amber-500/10 p-3 text-xs">
           <Activity className="mt-0.5 h-4 w-4 shrink-0 animate-pulse text-amber-600 dark:text-amber-400" />
           <div className="text-amber-700 dark:text-amber-400">
-            <strong>Reboot in flight.</strong> The host's systemd Path unit
-            has the trigger; it'll call <code>systemctl reboot</code> after a
+            <strong>Reboot in flight.</strong> The host's systemd Path unit has
+            the trigger; it'll call <code>systemctl reboot</code> after a
             10-second grace. The browser will lose connection shortly.
           </div>
         </div>
@@ -79,8 +79,8 @@ export function MaintenanceTab() {
         <div className="flex items-start gap-2 rounded-md border border-amber-500/50 bg-amber-500/10 p-3 text-xs">
           <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600 dark:text-amber-400" />
           <div className="text-amber-700 dark:text-amber-400">
-            Unattended-upgrades installed a kernel or libc update — a reboot
-            is needed to actually activate it.
+            Unattended-upgrades installed a kernel or libc update — a reboot is
+            needed to actually activate it.
           </div>
         </div>
       )}
@@ -93,9 +93,9 @@ export function MaintenanceTab() {
               Maintenance mode
             </h3>
             <p className="mt-0.5 text-[11px] text-muted-foreground">
-              When enabled, scheduled tasks check this flag and refuse to
-              issue / renew DNS records or DHCP leases until you flip it back
-              off. Existing leases keep being served.
+              When enabled, scheduled tasks check this flag and refuse to issue
+              / renew DNS records or DHCP leases until you flip it back off.
+              Existing leases keep being served.
             </p>
           </div>
           <button
@@ -123,8 +123,8 @@ export function MaintenanceTab() {
             </h3>
             <p className="mt-0.5 text-[11px] text-muted-foreground">
               Reboots the OS (not just the container stack). Useful after an
-              unattended-upgrade kernel install. 10-second grace before the
-              host actually issues <code>systemctl reboot</code>.
+              unattended-upgrade kernel install. 10-second grace before the host
+              actually issues <code>systemctl reboot</code>.
             </p>
           </div>
           <button
@@ -144,9 +144,9 @@ export function MaintenanceTab() {
         title="Reboot appliance?"
         message={
           <span>
-            The host will power-cycle in ~10 seconds. Existing DHCP leases
-            keep their state (DB-backed); DNS zones reload from the served
-            config; the web UI will be unreachable for ~1 minute.
+            The host will power-cycle in ~10 seconds. Existing DHCP leases keep
+            their state (DB-backed); DNS zones reload from the served config;
+            the web UI will be unreachable for ~1 minute.
           </span>
         }
         confirmLabel="Reboot now"

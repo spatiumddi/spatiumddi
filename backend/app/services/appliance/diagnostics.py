@@ -22,7 +22,7 @@ import re
 import socket
 import zipfile
 from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -124,7 +124,7 @@ def run_self_test() -> SelfTestReport:
     checks.append(_check_dhcp_running())
     checks.append(_check_dns_container_running())
     return SelfTestReport(
-        run_at=datetime.now(tz=timezone.utc),
+        run_at=datetime.now(tz=UTC),
         overall_ok=all(c.ok for c in checks),
         checks=checks,
     )
@@ -166,9 +166,7 @@ def _check_containers_healthy() -> CheckResult:
             detail="no spatiumddi-* containers found",
         )
     bad = [c for c in spatium if c.state != "running"]
-    unhealthy = [
-        c for c in spatium if c.health and c.health == "unhealthy"
-    ]
+    unhealthy = [c for c in spatium if c.health and c.health == "unhealthy"]
     if bad:
         names = ", ".join(c.name for c in bad)
         return CheckResult(
@@ -196,16 +194,14 @@ def _check_api_reachable() -> CheckResult:
     import urllib.request  # noqa: PLC0415
 
     try:
-        with urllib.request.urlopen(
-            "http://127.0.0.1:8000/health/live", timeout=3
-        ) as resp:
+        with urllib.request.urlopen("http://127.0.0.1:8000/health/live", timeout=3) as resp:
             ok = resp.status == 200
             return CheckResult(
                 name="Internal API health",
                 ok=ok,
                 detail=f"HTTP {resp.status}",
             )
-    except (urllib.error.URLError, socket.timeout, OSError) as exc:
+    except (TimeoutError, urllib.error.URLError, OSError) as exc:
         return CheckResult(
             name="Internal API health",
             ok=False,
@@ -217,9 +213,7 @@ def _check_dhcp_running() -> CheckResult:
     try:
         rows = list_containers()
     except DockerUnavailableError as exc:
-        return CheckResult(
-            name="DHCP daemon", ok=False, detail=f"docker unreachable: {exc}"
-        )
+        return CheckResult(name="DHCP daemon", ok=False, detail=f"docker unreachable: {exc}")
     dhcp = [c for c in rows if "dhcp" in c.name.lower() and c.is_spatium]
     if not dhcp:
         return CheckResult(
@@ -239,9 +233,7 @@ def _check_dns_container_running() -> CheckResult:
     try:
         rows = list_containers()
     except DockerUnavailableError as exc:
-        return CheckResult(
-            name="DNS daemon", ok=False, detail=f"docker unreachable: {exc}"
-        )
+        return CheckResult(name="DNS daemon", ok=False, detail=f"docker unreachable: {exc}")
     dns = [c for c in rows if "dns" in c.name.lower() and c.is_spatium]
     if not dns:
         return CheckResult(
@@ -272,9 +264,7 @@ _SECRET_RE = re.compile(
 
 
 def _redact_env(text: str) -> str:
-    return _SECRET_RE.sub(
-        lambda m: f"{m.group(0).split('=', 1)[0]}=[REDACTED]", text
-    )
+    return _SECRET_RE.sub(lambda m: f"{m.group(0).split('=', 1)[0]}=[REDACTED]", text)
 
 
 def generate_diagnostic_bundle() -> bytes:
@@ -287,7 +277,7 @@ def generate_diagnostic_bundle() -> bytes:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         manifest = {
-            "generated_at": datetime.now(tz=timezone.utc).isoformat(),
+            "generated_at": datetime.now(tz=UTC).isoformat(),
             "appliance_mode": settings.appliance_mode,
             "appliance_version": settings.appliance_version,
             "appliance_hostname": settings.appliance_hostname,
@@ -308,9 +298,7 @@ def generate_diagnostic_bundle() -> bytes:
         # Every host log file we can see
         for name in list_log_sources():
             try:
-                content = (_log_dir() / name).read_text(
-                    encoding="utf-8", errors="replace"
-                )
+                content = (_log_dir() / name).read_text(encoding="utf-8", errors="replace")
                 zf.writestr(f"logs/{name}", content)
             except OSError:
                 pass

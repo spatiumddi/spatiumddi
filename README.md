@@ -676,7 +676,7 @@ docker compose up -d                  # recreate api/worker/beat/frontend on the
 
 ```bash
 # In your .env:
-SPATIUMDDI_VERSION=2026.05.03-1
+SPATIUMDDI_VERSION=2026.05.11-1
 
 # Then:
 docker compose pull
@@ -709,7 +709,7 @@ Or set `COMPOSE_PROFILES=dns-bind9,dhcp` in your `.env` so plain `docker compose
 
 That starts `dns-bind9` bound to host port `1053` (udp + tcp), or `dns-powerdns` on `5453`. The agent registers with the control plane automatically using `DNS_AGENT_KEY` from your `.env` and appears in the UI under **DNS → Server Groups**.
 
-> **Upgrading from a release that used port 5353?** The DNS host port default changed from `5353` to `1053` in release `2026.05.08-1` because 5353 is the well-known mDNS port and collides with avahi (default-on in Ubuntu desktop / Fedora / most lab distros). Either point your clients at the new port (`dig -p 1053 …`), or pin the old behaviour with `DNS_HOST_PORT=5353` in your `.env` and recreate the container.
+> **Upgrading from a release that used port 5353?** The DNS host port default changed from `5353` to `1053` in release `2026.05.11-1` because 5353 is the well-known mDNS port and collides with avahi (default-on in Ubuntu desktop / Fedora / most lab distros). Either point your clients at the new port (`dig -p 1053 …`), or pin the old behaviour with `DNS_HOST_PORT=5353` in your `.env` and recreate the container.
 
 Create a zone + record in the UI, then verify with `dig`:
 

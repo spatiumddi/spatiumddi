@@ -10,6 +10,8 @@ Mounted at ``/api/v1/appliance/diagnostics``:
 
 from __future__ import annotations
 
+from datetime import UTC
+
 import structlog
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import StreamingResponse
@@ -46,9 +48,7 @@ async def list_logs() -> dict[str, list[str]]:
 )
 async def get_log(name: str, lines: int = 500) -> dict[str, str | int]:
     if lines < 1 or lines > 5000:
-        raise HTTPException(
-            status.HTTP_400_BAD_REQUEST, "lines must be between 1 and 5000"
-        )
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "lines must be between 1 and 5000")
     try:
         text = read_log_tail(name, lines=lines)
     except ValueError as exc:
@@ -104,9 +104,9 @@ async def get_bundle(db: DB, user: CurrentUser):
         size_bytes=len(blob),
         user=user.username,
     )
-    from datetime import datetime, timezone as _tz
+    from datetime import datetime
 
-    stamp = datetime.now(tz=_tz.utc).strftime("%Y%m%d-%H%M%S")
+    stamp = datetime.now(tz=UTC).strftime("%Y%m%d-%H%M%S")
     filename = f"spatium-diagnostic-{stamp}.zip"
     return StreamingResponse(
         iter([blob]),

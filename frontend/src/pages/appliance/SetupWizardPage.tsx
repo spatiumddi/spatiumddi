@@ -64,8 +64,7 @@ export function SetupWizardPage() {
   });
 
   const activeCert = certs.data?.find((c) => c.is_active && !c.pending);
-  const certIsCustom =
-    !!activeCert && activeCert.source !== "self-signed";
+  const certIsCustom = !!activeCert && activeCert.source !== "self-signed";
 
   return (
     <div className="mx-auto max-w-3xl space-y-6 px-6 py-8">
@@ -76,8 +75,8 @@ export function SetupWizardPage() {
         </h1>
         <p className="mt-2 text-sm text-muted-foreground">
           Welcome. This page walks through the optional polish steps after a
-          fresh install. The appliance is already serving HTTPS on a
-          self-signed cert; you can run it as-is and come back later.
+          fresh install. The appliance is already serving HTTPS on a self-signed
+          cert; you can run it as-is and come back later.
         </p>
         {setup.data?.complete && (
           <div className="mt-3 inline-flex items-center gap-2 rounded-md border border-emerald-500/40 bg-emerald-500/10 px-3 py-1.5 text-xs text-emerald-700 dark:text-emerald-400">
@@ -153,8 +152,8 @@ export function SetupWizardPage() {
 
       <div className="flex flex-wrap items-center justify-between gap-3">
         <p className="max-w-md text-xs text-muted-foreground">
-          Hitting <strong>Finish setup</strong> dismisses this wizard.
-          Re-open from the Appliance management hub at any time —{" "}
+          Hitting <strong>Finish setup</strong> dismisses this wizard. Re-open
+          from the Appliance management hub at any time —{" "}
           <code className="rounded bg-muted px-1">/appliance/setup</code>.
         </p>
         <div className="flex gap-2">

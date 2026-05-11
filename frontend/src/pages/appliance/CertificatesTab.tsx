@@ -45,7 +45,9 @@ export function CertificatesTab() {
   const qc = useQueryClient();
   const [uploadOpen, setUploadOpen] = useState(false);
   const [csrOpen, setCsrOpen] = useState(false);
-  const [csrViewing, setCsrViewing] = useState<ApplianceCertificate | null>(null);
+  const [csrViewing, setCsrViewing] = useState<ApplianceCertificate | null>(
+    null,
+  );
   const [importTarget, setImportTarget] = useState<ApplianceCertificate | null>(
     null,
   );
@@ -83,11 +85,10 @@ export function CertificatesTab() {
           </h2>
           <p className="mt-1 text-xs text-muted-foreground">
             The certificate nginx serves on the appliance's HTTPS frontend.
-            Upload a PEM cert + private key from an existing CA, or generate
-            a CSR locally (key stays on the server) and bring back the
-            signed cert. Phase 4b.2 wires the active row into nginx; until
-            then this stores certs but nginx still uses the self-signed
-            default.
+            Upload a PEM cert + private key from an existing CA, or generate a
+            CSR locally (key stays on the server) and bring back the signed
+            cert. Phase 4b.2 wires the active row into nginx; until then this
+            stores certs but nginx still uses the self-signed default.
           </p>
         </div>
         <div className="flex shrink-0 gap-2">
@@ -198,9 +199,9 @@ export function CertificatesTab() {
               {deleteTarget.pending ? (
                 <>
                   {" "}
-                  This is a CSR-pending row — the generated private key will
-                  be lost. If the CA later issues a cert against this CSR you
-                  won't be able to import it.
+                  This is a CSR-pending row — the generated private key will be
+                  lost. If the CA later issues a cert against this CSR you won't
+                  be able to import it.
                 </>
               ) : (
                 <> This cannot be undone. The PEM and private key are wiped.</>
@@ -225,9 +226,9 @@ function EmptyState() {
       <h3 className="mt-3 text-sm font-medium">No certificates yet</h3>
       <p className="mt-1 text-xs text-muted-foreground">
         Use the buttons above to upload an existing cert + key, or generate a
-        CSR so a CA can sign a fresh cert for this appliance. Until you
-        activate something, nginx serves the self-signed default the
-        appliance generated on first boot.
+        CSR so a CA can sign a fresh cert for this appliance. Until you activate
+        something, nginx serves the self-signed default the appliance generated
+        on first boot.
       </p>
     </div>
   );
@@ -316,9 +317,7 @@ function CertificateCard({
             />
             <Field
               label="Fingerprint"
-              value={
-                cert.fingerprint_sha256 ?? "— (cert not signed yet)"
-              }
+              value={cert.fingerprint_sha256 ?? "— (cert not signed yet)"}
               mono
               span={2}
               truncate
@@ -374,8 +373,7 @@ function CertificateCard({
                 type="button"
                 onClick={onActivate}
                 disabled={
-                  activating ||
-                  (expiresInDays !== null && expiresInDays < 0)
+                  activating || (expiresInDays !== null && expiresInDays < 0)
                 }
                 className="inline-flex items-center gap-1 rounded-md border bg-background px-2 py-1 text-xs hover:bg-accent disabled:opacity-50"
                 title={
@@ -506,7 +504,9 @@ function UploadCertificateModal({
           value={certPem}
           onChange={setCertPem}
           rows={6}
-          placeholder={"-----BEGIN CERTIFICATE-----\n…\n-----END CERTIFICATE-----"}
+          placeholder={
+            "-----BEGIN CERTIFICATE-----\n…\n-----END CERTIFICATE-----"
+          }
           hint="Paste the full chain (leaf + intermediates concatenated)."
         />
         <FieldTextarea
@@ -515,7 +515,9 @@ function UploadCertificateModal({
           value={keyPem}
           onChange={setKeyPem}
           rows={6}
-          placeholder={"-----BEGIN PRIVATE KEY-----\n…\n-----END PRIVATE KEY-----"}
+          placeholder={
+            "-----BEGIN PRIVATE KEY-----\n…\n-----END PRIVATE KEY-----"
+          }
           hint="Encrypted at rest with the appliance's credential key. Encrypted private keys aren't supported — decrypt before uploading."
         />
         <FieldText
@@ -615,10 +617,10 @@ function GenerateCsrModal({
         className="space-y-3"
       >
         <p className="rounded-md bg-muted/50 p-2.5 text-xs text-muted-foreground">
-          The appliance generates a fresh private key locally — the key
-          never leaves the server. You'll receive a CSR PEM to hand to
-          your CA; when the CA returns the signed cert, paste it back via
-          the row's "Paste signed cert" button.
+          The appliance generates a fresh private key locally — the key never
+          leaves the server. You'll receive a CSR PEM to hand to your CA; when
+          the CA returns the signed cert, paste it back via the row's "Paste
+          signed cert" button.
         </p>
 
         <FieldText
@@ -641,7 +643,9 @@ function GenerateCsrModal({
           value={sans}
           onChange={setSans}
           rows={3}
-          placeholder={"appliance.example.com\nappliance-alt.example.com\n192.168.1.10"}
+          placeholder={
+            "appliance.example.com\nappliance-alt.example.com\n192.168.1.10"
+          }
           hint="One per line (or comma-separated). DNS names + IPs both accepted; the form auto-detects IP literals."
         />
 
@@ -702,8 +706,8 @@ function GenerateCsrModal({
           </select>
           <p className="mt-0.5 text-[10px] text-muted-foreground">
             RSA-2048 is the safe default (universally accepted). EC keys
-            handshake faster and produce shorter chains — pick those if
-            your CA supports them.
+            handshake faster and produce shorter chains — pick those if your CA
+            supports them.
           </p>
         </div>
 
@@ -838,7 +842,11 @@ function ImportSignedCertModal({
   });
 
   return (
-    <Modal title={`Paste signed certificate · ${cert.name}`} onClose={onClose} wide>
+    <Modal
+      title={`Paste signed certificate · ${cert.name}`}
+      onClose={onClose}
+      wide
+    >
       <form
         onSubmit={(e) => {
           e.preventDefault();
@@ -850,8 +858,8 @@ function ImportSignedCertModal({
         <div className="rounded-md bg-muted/50 p-2.5 text-xs text-muted-foreground">
           <p>
             Paste the certificate your CA returned for{" "}
-            <span className="font-mono text-foreground">{cert.subject_cn}</span>.
-            The appliance pairs it with the private key you generated for this
+            <span className="font-mono text-foreground">{cert.subject_cn}</span>
+            . The appliance pairs it with the private key you generated for this
             row.
           </p>
           <p className="mt-2">
@@ -866,7 +874,9 @@ function ImportSignedCertModal({
           value={certPem}
           onChange={setCertPem}
           rows={10}
-          placeholder={"-----BEGIN CERTIFICATE-----\n…\n-----END CERTIFICATE-----"}
+          placeholder={
+            "-----BEGIN CERTIFICATE-----\n…\n-----END CERTIFICATE-----"
+          }
           hint="Paste the full chain — leaf + intermediates."
         />
 
@@ -928,7 +938,9 @@ function FieldText({
         placeholder={placeholder}
         className="mt-1 w-full rounded-md border bg-background px-2 py-1.5 text-sm"
       />
-      {hint && <p className="mt-0.5 text-[10px] text-muted-foreground">{hint}</p>}
+      {hint && (
+        <p className="mt-0.5 text-[10px] text-muted-foreground">{hint}</p>
+      )}
     </div>
   );
 }
@@ -964,7 +976,9 @@ function FieldTextarea({
         rows={rows}
         className="mt-1 w-full rounded-md border bg-background px-2 py-1.5 font-mono text-xs"
       />
-      {hint && <p className="mt-0.5 text-[10px] text-muted-foreground">{hint}</p>}
+      {hint && (
+        <p className="mt-0.5 text-[10px] text-muted-foreground">{hint}</p>
+      )}
     </div>
   );
 }

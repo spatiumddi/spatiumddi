@@ -147,7 +147,9 @@ function ContainerCard({
         <StatusDot state={container.state} />
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
-            <span className="truncate text-sm font-medium">{container.name}</span>
+            <span className="truncate text-sm font-medium">
+              {container.name}
+            </span>
             <span className="font-mono text-[10px] text-muted-foreground">
               {container.short_id}
             </span>
@@ -227,7 +229,9 @@ function ActionButton({
       disabled={disabled}
       title={label}
       className={`inline-flex items-center gap-1 rounded-md border bg-background px-2 py-1 text-xs disabled:cursor-not-allowed disabled:opacity-50 ${
-        destructive ? "text-destructive hover:bg-destructive/10" : "hover:bg-accent"
+        destructive
+          ? "text-destructive hover:bg-destructive/10"
+          : "hover:bg-accent"
       }`}
     >
       <Icon className="h-3 w-3" />
@@ -245,7 +249,9 @@ function StatusDot({ state }: { state: string }) {
         : state === "exited" || state === "dead"
           ? "bg-destructive"
           : "bg-muted-foreground/50";
-  return <span className={`h-2 w-2 shrink-0 rounded-full ${cls}`} title={state} />;
+  return (
+    <span className={`h-2 w-2 shrink-0 rounded-full ${cls}`} title={state} />
+  );
 }
 
 function LogsStreamModal({
@@ -332,9 +338,7 @@ function LogsStreamModal({
           className="h-96 overflow-auto rounded-md border bg-muted/30 px-3 py-2 font-mono text-[11px] leading-tight"
         >
           {lines.length === 0 && !error ? (
-            <span className="text-muted-foreground">
-              Waiting for logs…
-            </span>
+            <span className="text-muted-foreground">Waiting for logs…</span>
           ) : (
             lines.map((line, i) => (
               <div key={i} className="whitespace-pre-wrap">

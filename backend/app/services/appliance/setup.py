@@ -16,7 +16,7 @@ deliberately skip optional steps and we should respect that.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import structlog
@@ -37,11 +37,9 @@ def is_setup_complete() -> bool:
 def mark_setup_complete(by_username: str) -> str:
     """Create the flag file. Returns the ISO timestamp written."""
     if not settings.appliance_mode:
-        raise RuntimeError(
-            "setup wizard is only supported on the SpatiumDDI OS appliance"
-        )
+        raise RuntimeError("setup wizard is only supported on the SpatiumDDI OS appliance")
     _FLAG_FILE.parent.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now(tz=timezone.utc).isoformat()
+    stamp = datetime.now(tz=UTC).isoformat()
     _FLAG_FILE.write_text(
         f"completed_at={stamp}\ncompleted_by={by_username}\n",
         encoding="utf-8",

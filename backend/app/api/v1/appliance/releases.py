@@ -25,8 +25,10 @@ from app.services.appliance.releases import (
     get_installed_version,
     get_update_log_tail,
     is_apply_in_flight,
-    list_releases as svc_list_releases,
     schedule_apply,
+)
+from app.services.appliance.releases import (
+    list_releases as svc_list_releases,
 )
 
 logger = structlog.get_logger(__name__)

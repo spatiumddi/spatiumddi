@@ -10,10 +10,7 @@ import {
   RefreshCw,
 } from "lucide-react";
 
-import {
-  applianceReleasesApi,
-  type ApplianceRelease,
-} from "@/lib/api";
+import { applianceReleasesApi, type ApplianceRelease } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
 
 /**
@@ -62,10 +59,10 @@ export function ReleasesTab() {
           </h2>
           <p className="mt-1 text-xs text-muted-foreground">
             Updates pull new container images from{" "}
-            <code className="rounded bg-muted px-1">ghcr.io/spatiumddi</code> and
-            recycle the stack via a host-side systemd unit so the api can
-            replace itself cleanly. The web UI reconnects automatically once
-            the new version is healthy.
+            <code className="rounded bg-muted px-1">ghcr.io/spatiumddi</code>{" "}
+            and recycle the stack via a host-side systemd unit so the api can
+            replace itself cleanly. The web UI reconnects automatically once the
+            new version is healthy.
           </p>
         </div>
         <div className="shrink-0 rounded-md border bg-muted px-2 py-1.5 text-xs">
@@ -101,7 +98,10 @@ export function ReleasesTab() {
       )}
 
       {(data?.update_log_tail ?? "").length > 0 && (
-        <details className="rounded-md border bg-card" open={data?.apply_in_flight}>
+        <details
+          className="rounded-md border bg-card"
+          open={data?.apply_in_flight}
+        >
           <summary className="cursor-pointer px-3 py-2 text-xs font-medium text-muted-foreground hover:bg-muted/50">
             Update log (tail) — last apply
           </summary>
@@ -121,8 +121,7 @@ export function ReleasesTab() {
           <p className="mt-3 font-medium">No releases found</p>
           <p className="mt-1 text-xs">
             GitHub API may be rate-limiting unauthenticated requests, or no
-            releases have been published for this repo yet. Refresh in a
-            minute.
+            releases have been published for this repo yet. Refresh in a minute.
           </p>
         </div>
       ) : (
@@ -259,8 +258,8 @@ function ApplyConfirmModal({
         </p>
         <p className="text-xs text-muted-foreground">
           The host will pull the new image set and recycle every container.
-          Expect a ~30 second blackout while the api container restarts. DNS
-          and DHCP service continue serving from cache during the recycle.
+          Expect a ~30 second blackout while the api container restarts. DNS and
+          DHCP service continue serving from cache during the recycle.
         </p>
         {release.is_prerelease && (
           <div className="flex items-start gap-2 rounded-md border border-amber-500/50 bg-amber-500/10 p-2 text-xs">
