@@ -354,8 +354,11 @@ def generate_diagnostic_bundle() -> bytes:
                     f"system{proc}",
                     Path(proc).read_text(encoding="utf-8", errors="replace"),
                 )
-            except OSError:
-                pass
+            except OSError as exc:
+                # Record the failure inline so support can see why a
+                # given /proc file is missing from the bundle instead
+                # of guessing from its absence.
+                zf.writestr(f"system{proc}.error", f"{type(exc).__name__}: {exc}")
 
         # Environment variables visible to the api (handy for support)
         env_dump = "\n".join(f"{k}={v}" for k, v in sorted(os.environ.items()))
