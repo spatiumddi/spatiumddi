@@ -156,6 +156,14 @@ cat > "$ISO_ROOT/boot/grub/grub.cfg" <<'EOF'
 set timeout=3
 set default=0
 
+# Serial console mirror for headless boots (IPMI SoL, Proxmox
+# serial0, RPi UART, embedded boards). The same grub menu shows on
+# both VGA and ttyS0 @115200,8n1, and the kernel cmdline routes its
+# own messages + getty to both consoles.
+serial --unit=0 --speed=115200
+terminal_input  console serial
+terminal_output console serial
+
 # `cloud-init=disabled` suppresses cloud-init in live-ISO mode. The
 # appliance image bakes cloud-init in for the qcow2 disk-boot path
 # (NoCloud datasource for headless bootstrap), but a plain CD-ROM
@@ -166,12 +174,14 @@ set default=0
 # without needing cloud-init.
 
 menuentry "SpatiumDDI Appliance - Live" {
-    linux /live/vmlinuz boot=live components quiet cloud-init=disabled
+    linux /live/vmlinuz boot=live components quiet cloud-init=disabled \
+        console=tty0 console=ttyS0,115200n8
     initrd /live/initrd.img
 }
 
 menuentry "SpatiumDDI Appliance - Live (verbose)" {
-    linux /live/vmlinuz boot=live components cloud-init=disabled
+    linux /live/vmlinuz boot=live components cloud-init=disabled \
+        console=tty0 console=ttyS0,115200n8
     initrd /live/initrd.img
 }
 EOF
