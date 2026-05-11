@@ -105,6 +105,34 @@ install -d -m 0755 "$BUILDROOT/etc/nftables.d"
 install -d -m 2755 "$BUILDROOT/var/log/journal"
 chgrp systemd-journal "$BUILDROOT/var/log/journal" 2>/dev/null || true
 
+# ── Docker client CLI ─────────────────────────────────────────────────────────
+# Debian trixie's docker.io package (26.1.5+dfsg1-9+b12) ships ONLY
+# the daemon — dockerd, docker-proxy, docker-init. It does NOT ship
+# /usr/bin/docker, the CLI client most operators expect. Download
+# the upstream static binary and drop it in /usr/local/bin/docker so
+# `docker ps`, `docker logs`, `docker exec` etc. work for
+# troubleshooting. /usr/local/ takes priority over /usr/ in $PATH so
+# no conflict if Debian ever ships the CLI again.
+# Docker CLI version — docker.com's static binaries only go back so
+# far. 27.x CLIs are backward-compatible with the Debian-shipped
+# 26.x daemon (Docker keeps the API stable for at least one major).
+DOCKER_VERSION=27.5.1
+if [ ! -x "$BUILDROOT/usr/local/bin/docker" ]; then
+    echo "Downloading docker CLI ${DOCKER_VERSION}..."
+    tmpd=$(mktemp -d)
+    # The mkosi sandbox doesn't put curl on PATH but the host has it
+    # at /usr/bin/curl. Use it explicitly. Same for tar.
+    if /usr/bin/curl -fsSL "https://download.docker.com/linux/static/stable/x86_64/docker-${DOCKER_VERSION}.tgz" \
+            -o "$tmpd/docker.tgz"; then
+        /usr/bin/tar -xzf "$tmpd/docker.tgz" -C "$tmpd" docker/docker
+        install -m 0755 "$tmpd/docker/docker" "$BUILDROOT/usr/local/bin/docker"
+        echo "  installed: $(ls -lh $BUILDROOT/usr/local/bin/docker | awk '{print $5}')"
+    else
+        echo "WARN: docker CLI download failed — operators will only have docker-compose"
+    fi
+    rm -rf "$tmpd"
+fi
+
 # Make /etc/resolv.conf the systemd-resolved-managed one.
 # resolved publishes upstream-DNS info (picked up from networkd's
 # DHCP) at /run/systemd/resolve/resolv.conf. Without this symlink,
