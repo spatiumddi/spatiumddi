@@ -252,9 +252,33 @@ do_install() {
     log "Install starting: target=$TARGET_DISK BBP=$BBP ESP=$ESP ROOT=$ROOT"
 
     {
+        echo "3"; echo "XXX"; echo "Releasing existing partitions on $TARGET_DISK..."; echo "XXX"
+        # Pre-existing install on the target disk leaves partitions
+        # that the live system's systemd-gpt-auto-generator may have
+        # auto-mounted (ESP → /boot/efi, root → /sysroot) or that
+        # the kernel still holds open via stale device-mapper or
+        # swap entries. sgdisk -Z, mkfs.fat, and the subsequent
+        # mount all fail on a busy device, so unconditionally
+        # release everything before partitioning.
+        for part in $(lsblk -nr -o NAME "$TARGET_DISK" 2>/dev/null | tail -n +2); do
+            swapoff "/dev/$part" >> "$INSTALL_LOG" 2>&1 || true
+            umount "/dev/$part"  >> "$INSTALL_LOG" 2>&1 || true
+            umount -l "/dev/$part" >> "$INSTALL_LOG" 2>&1 || true
+        done
+        # device-mapper entries (LVM / dm-crypt) backed by this disk
+        if command -v dmsetup >/dev/null 2>&1; then
+            for dm in $(dmsetup ls --target linear 2>/dev/null | awk '{print $1}'); do
+                dmsetup remove "$dm" >> "$INSTALL_LOG" 2>&1 || true
+            done
+        fi
+
         echo "5"; echo "XXX"; echo "Partitioning $TARGET_DISK..."; echo "XXX"
         wipefs -af "$TARGET_DISK"           >> "$INSTALL_LOG" 2>&1
         sgdisk -Z "$TARGET_DISK"            >> "$INSTALL_LOG" 2>&1
+        # Force the kernel to forget the old partition table before
+        # we lay down a new one. Without this, mkfs against the new
+        # partition nodes can race with udev rebuilding /dev/disk/.
+        blockdev --rereadpt "$TARGET_DISK"  >> "$INSTALL_LOG" 2>&1 || true
         sgdisk -n1:0:+1M    -t1:ef02 -c1:bios_boot \
                -n2:0:+512M  -t2:ef00 -c2:ESP \
                -n3:0:0      -t3:8300 -c3:root \
@@ -415,8 +439,28 @@ EOF
         # new initrd (vs -u for updating an existing one — there's
         # nothing to update, /boot is empty). live-boot scripts are
         # still in the rootfs but inert without `boot=live` cmdline.
-        chroot "$MOUNT" /usr/sbin/update-initramfs -c -k "$KVER" \
+        # Explicit PATH so update-initramfs can find its mkinitramfs
+        # + cpio + xz helpers (chroot inherits an undefined PATH
+        # from systemd).
+        chroot "$MOUNT" env \
+            PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            /usr/sbin/update-initramfs -c -k "$KVER" \
             >> "$INSTALL_LOG" 2>&1
+
+        # Verify the initrd actually landed. The wrap-iso pipeline
+        # to whiptail --gauge has surprised us before by swallowing
+        # the failure (subshell + pipefail interactions); on the
+        # previous install attempt update-initramfs silently failed
+        # and the installed system grub then couldn't find
+        # /boot/initrd.img-<kver>.
+        if [ ! -f "$MOUNT/boot/initrd.img-$KVER" ]; then
+            log "ERROR: update-initramfs did NOT produce /boot/initrd.img-$KVER"
+            log "Contents of $MOUNT/boot:"
+            ls -la "$MOUNT/boot" >> "$INSTALL_LOG" 2>&1
+            log "End of install log — see above for update-initramfs output."
+            exit 1
+        fi
+        log "initrd written: $(ls -lh "$MOUNT/boot/initrd.img-$KVER" | awk '{print $5}')"
         ln -sf "initrd.img-$KVER" "$MOUNT/boot/initrd.img"
 
         echo "85"; echo "XXX"; echo "Writing /etc/default/grub + /boot/grub/grub.cfg..."; echo "XXX"
