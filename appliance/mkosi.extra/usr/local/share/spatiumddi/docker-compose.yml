@@ -278,6 +278,34 @@ services:
     # this compose, and the agent already retries forever on bootstrap
     # 401/404 (it caches a JWT after the first success).
 
+  # ── DNS (PowerDNS) — opt-in profile ─────────────────────────────────────────
+  # Mirror of dns-bind9 but on the PowerDNS engine. Group-level
+  # features like DNSSEC sign/unsign, ALIAS, LUA, catalog zones gate
+  # on every server in the group running the powerdns driver, so the
+  # operator picks one engine per DNS server group. On the appliance,
+  # the Phase 6 role-split installer's "DNS agent — PowerDNS" choice
+  # writes ``COMPOSE_PROFILES=dns-powerdns,agent`` to .env. Port 53 is
+  # reused (not 5453 like in dev) because an agent-mode appliance
+  # only ever runs one DNS engine.
+  dns-powerdns:
+    profiles: ["dns-powerdns"]
+    image: ghcr.io/spatiumddi/dns-powerdns:${SPATIUMDDI_VERSION:-latest}
+    restart: unless-stopped
+    networks: [spatiumddi]
+    ports:
+      - "53:53/udp"
+      - "53:53/tcp"
+    environment:
+      CONTROL_PLANE_URL: ${CONTROL_PLANE_URL:-http://api:8000}
+      DNS_AGENT_KEY: ${DNS_AGENT_KEY}
+      SERVER_NAME: ${APPLIANCE_HOSTNAME:-dns-powerdns}
+      AGENT_GROUP: default-powerdns
+      AGENT_ROLES: authoritative
+      SPATIUM_INSECURE_SKIP_TLS_VERIFY: "1"
+    volumes:
+      - dns_powerdns_state:/var/lib/spatium-dns-agent
+      - dns_powerdns_lmdb:/var/lib/powerdns
+
   # ── DHCP (Kea) — default profile ────────────────────────────────────────────
   # Host networking is required for DHCP broadcast (DDI appliance
   # vs lab compose's bridge + port-mapping). With host networking
@@ -343,6 +371,8 @@ volumes:
   redis_data:
   dns_bind9_state:
   dns_bind9_cache:
+  dns_powerdns_state:
+  dns_powerdns_lmdb:
   dhcp_kea_state:
   dhcp_kea_leases:
   # Phase 4b.2 — shared TLS cert volume. api writes active.{pem,key};

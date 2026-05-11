@@ -124,8 +124,14 @@ if [ ! -f "$ENV_FILE" ]; then
     # time (writing nothing for the OTHER agent's key — the unused
     # service won't run, so an empty value is harmless).
     case "$ROLE" in
-        dns-agent)
+        dns-agent-bind9)
             COMPOSE_PROFILES_VAL="dns-bind9,agent"
+            DNS_AGENT_KEY_VAL="$INSTALL_DNS_AGENT_KEY"
+            DHCP_AGENT_KEY_VAL=""
+            CONTROL_PLANE_URL_VAL="$INSTALL_CONTROL_PLANE_URL"
+            ;;
+        dns-agent-powerdns)
+            COMPOSE_PROFILES_VAL="dns-powerdns,agent"
             DNS_AGENT_KEY_VAL="$INSTALL_DNS_AGENT_KEY"
             DHCP_AGENT_KEY_VAL=""
             CONTROL_PLANE_URL_VAL="$INSTALL_CONTROL_PLANE_URL"
@@ -136,7 +142,22 @@ if [ ! -f "$ENV_FILE" ]; then
             DHCP_AGENT_KEY_VAL="$INSTALL_DHCP_AGENT_KEY"
             CONTROL_PLANE_URL_VAL="$INSTALL_CONTROL_PLANE_URL"
             ;;
+        control-only)
+            # Control plane only — no bundled DNS/DHCP. Agent keys
+            # are still generated because the operator's whole reason
+            # for picking this role is to register external agents.
+            # They reveal the keys via Settings -> Security -> Agent
+            # bootstrap keys and paste them into agent installs
+            # elsewhere.
+            COMPOSE_PROFILES_VAL="control"
+            DNS_AGENT_KEY_VAL=$(gen_hex 24)
+            DHCP_AGENT_KEY_VAL=$(gen_hex 24)
+            CONTROL_PLANE_URL_VAL=""
+            ;;
         *)
+            # ``control`` (default) — control plane + bundled DNS +
+            # DHCP. Single-box AIO deployment.
+            ROLE=control
             COMPOSE_PROFILES_VAL="control,dns-bind9,dhcp"
             DNS_AGENT_KEY_VAL=$(gen_hex 24)
             DHCP_AGENT_KEY_VAL=$(gen_hex 24)
@@ -163,26 +184,30 @@ DOCKER_GID=${DOCKER_GID_VAL}
 EOF
     chmod 600 "$ENV_FILE"
 
-    # Phase 6 — for agent-mode installs, render the agent landing page
-    # from the template into /var/lib/spatiumddi/agent-landing/ where
-    # the agent-landing nginx:alpine container mounts it read-only.
-    if [ "$ROLE" != "control" ]; then
-        mkdir -p /var/lib/spatiumddi/agent-landing
-        case "$ROLE" in
-            dns-agent)  ROLE_LABEL="DNS"; ROLE_SHORT="dns-bind9" ;;
-            dhcp-agent) ROLE_LABEL="DHCP"; ROLE_SHORT="dhcp-kea" ;;
-            *)          ROLE_LABEL="unknown"; ROLE_SHORT="agent" ;;
-        esac
-        sed \
-            -e "s|__ROLE__|${ROLE}|g" \
-            -e "s|__ROLE_LABEL__|${ROLE_LABEL}|g" \
-            -e "s|__ROLE_SHORT__|${ROLE_SHORT}|g" \
-            -e "s|__HOSTNAME__|${APPLIANCE_HOSTNAME_VAL}|g" \
-            -e "s|__CONTROL_PLANE_URL__|${INSTALL_CONTROL_PLANE_URL}|g" \
-            -e "s|__APPLIANCE_VERSION__|${APPLIANCE_VERSION_VAL}|g" \
-            /usr/local/share/spatiumddi/agent-landing/index.html.in \
-            > /var/lib/spatiumddi/agent-landing/index.html
-    fi
+    # Phase 6 — for agent-mode installs only, render the agent landing
+    # page from the template into /var/lib/spatiumddi/agent-landing/
+    # where the agent-landing nginx:alpine container mounts it
+    # read-only. ``control-only`` doesn't need the landing page —
+    # the SpatiumDDI frontend serves the web UI on that role.
+    case "$ROLE" in
+        dns-agent-bind9|dns-agent-powerdns|dhcp-agent)
+            mkdir -p /var/lib/spatiumddi/agent-landing
+            case "$ROLE" in
+                dns-agent-bind9)    ROLE_LABEL="DNS (BIND9)";    ROLE_SHORT="dns-bind9" ;;
+                dns-agent-powerdns) ROLE_LABEL="DNS (PowerDNS)"; ROLE_SHORT="dns-powerdns" ;;
+                dhcp-agent)         ROLE_LABEL="DHCP (Kea)";     ROLE_SHORT="dhcp-kea" ;;
+            esac
+            sed \
+                -e "s|__ROLE__|${ROLE}|g" \
+                -e "s|__ROLE_LABEL__|${ROLE_LABEL}|g" \
+                -e "s|__ROLE_SHORT__|${ROLE_SHORT}|g" \
+                -e "s|__HOSTNAME__|${APPLIANCE_HOSTNAME_VAL}|g" \
+                -e "s|__CONTROL_PLANE_URL__|${INSTALL_CONTROL_PLANE_URL}|g" \
+                -e "s|__APPLIANCE_VERSION__|${APPLIANCE_VERSION_VAL}|g" \
+                /usr/local/share/spatiumddi/agent-landing/index.html.in \
+                > /var/lib/spatiumddi/agent-landing/index.html
+            ;;
+    esac
 fi
 
 # docker-compose looks for .env in the compose file's directory.

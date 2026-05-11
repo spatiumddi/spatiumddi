@@ -143,24 +143,41 @@ ask_role() {
     log "Step: ask_role"
     # whiptail --radiolist returns the selected tag on stdout. The third
     # column is the initial-selection flag (ON for control, OFF for the
-    # others) — operators installing a full SpatiumDDI hit Enter twice.
+    # others). Five roles:
+    #   control              — control plane + bundled BIND9 + Kea
+    #                          (single-box AIO; default).
+    #   control-only         — control plane only, no bundled agents.
+    #                          Agent keys are still generated so the
+    #                          operator can register external agents
+    #                          via the Settings reveal UI.
+    #   dns-agent-bind9      — BIND9 agent only; needs a remote control
+    #                          plane.
+    #   dns-agent-powerdns   — PowerDNS agent only; needs a remote
+    #                          control plane. Group features differ
+    #                          (DNSSEC sign/unsign, ALIAS, LUA, catalog
+    #                          zones gate on the powerdns driver).
+    #   dhcp-agent           — Kea agent only; needs a remote control
+    #                          plane.
     ROLE=$(whiptail --backtitle "$BACKTITLE" --title "Appliance role" \
-        --radiolist "What role does this appliance play?\n\nA control plane runs the full SpatiumDDI stack (api / worker / beat / postgres / redis / web UI + bundled DNS+DHCP agents).\n\nA DNS or DHCP agent runs only that service container and registers with a remote control plane. Useful for distributed deployments where DNS/DHCP live closer to the clients they serve." \
-        20 78 3 \
-        "control"    "Control plane (full SpatiumDDI stack)" ON \
-        "dns-agent"  "DNS agent only (BIND9 + agent process)" OFF \
-        "dhcp-agent" "DHCP agent only (Kea + agent process)" OFF \
+        --radiolist "What role does this appliance play?\n\nAll-in-one runs everything on one box (default — good for labs / small sites). Control-plane-only suits distributed deployments where DNS and DHCP live closer to the clients they serve as separate agent appliances.\n\nDNS-agent (BIND9) is the universal default. DNS-agent (PowerDNS) is the alternative engine — group features like DNSSEC sign/unsign + ALIAS + LUA + catalog zones gate on every server in a group running powerdns." \
+        24 80 5 \
+        "control"             "Control plane + bundled BIND9 + Kea (all-in-one)" ON \
+        "control-only"        "Control plane only (no bundled agents)"           OFF \
+        "dns-agent-bind9"     "DNS agent — BIND9 + agent process"                OFF \
+        "dns-agent-powerdns"  "DNS agent — PowerDNS + agent process"             OFF \
+        "dhcp-agent"          "DHCP agent — Kea + agent process"                 OFF \
         3>&1 1>&2 2>&3) \
         || on_cancel "role selection"
     log "Selected role: $ROLE"
 }
 
 ask_agent_config() {
-    # Only fires when ROLE != control. Collects the control-plane URL
-    # the agent will register against + the matching pre-shared agent
-    # key. The agent persists a rotating JWT to disk after the first
-    # successful bootstrap, so this key is only used on cold start.
-    [ "$ROLE" = "control" ] && return 0
+    # Only fires for agent roles (dns-agent / dhcp-agent). The control
+    # and control-only roles ARE the control plane — they don't need
+    # to be told where one is.
+    case "$ROLE" in
+        control|control-only) return 0 ;;
+    esac
     log "Step: ask_agent_config (role=$ROLE)"
 
     CONTROL_PLANE_URL=$(whiptail --backtitle "$BACKTITLE" \
@@ -174,25 +191,28 @@ ask_agent_config() {
         return
     fi
 
-    local key_var key_label
-    if [ "$ROLE" = "dns-agent" ]; then
-        key_label="DNS agent key"
-        key_var="DNS_AGENT_KEY"
-    else
-        key_label="DHCP agent key"
-        key_var="DHCP_AGENT_KEY"
-    fi
+    local key_label is_dns
+    case "$ROLE" in
+        dns-agent-bind9|dns-agent-powerdns)
+            key_label="DNS agent key"
+            is_dns=1
+            ;;
+        dhcp-agent)
+            key_label="DHCP agent key"
+            is_dns=0
+            ;;
+    esac
     local key_val
     key_val=$(whiptail --backtitle "$BACKTITLE" --title "$key_label" \
-        --inputbox "Pre-shared $key_label for first-boot registration.\n\nFind it in the control plane:  Settings -> DNS or DHCP agents -> Bootstrap key.\nThe agent exchanges this key for a rotating JWT on first contact + caches the JWT under /var/lib/spatium-${ROLE%-agent}-agent/ for subsequent runs." \
-        14 72 "" 3>&1 1>&2 2>&3) \
+        --inputbox "Pre-shared $key_label for first-boot registration.\n\nReveal it on the control plane: Settings -> Security -> Agent bootstrap keys -> type your password -> Reveal keys.\n\nThe agent exchanges this key for a rotating JWT on first contact + caches the JWT under /var/lib/spatium-{dns,dhcp}-agent/ for subsequent runs." \
+        16 78 "" 3>&1 1>&2 2>&3) \
         || on_cancel "agent key"
     if [ -z "$key_val" ]; then
         whiptail --msgbox "$key_label is required for agent installs." 8 60 || true
         ask_agent_config
         return
     fi
-    if [ "$ROLE" = "dns-agent" ]; then
+    if [ "$is_dns" = 1 ]; then
         DNS_AGENT_KEY="$key_val"
     else
         DHCP_AGENT_KEY="$key_val"
@@ -321,16 +341,20 @@ confirm() {
     log "Step: confirm"
     local role_label
     case "$ROLE" in
-        control)    role_label="Control plane (full stack)" ;;
-        dns-agent)  role_label="DNS agent only" ;;
-        dhcp-agent) role_label="DHCP agent only" ;;
-        *)          role_label="$ROLE" ;;
+        control)             role_label="Control plane + BIND9 + Kea (all-in-one)" ;;
+        control-only)        role_label="Control plane only (no bundled agents)" ;;
+        dns-agent-bind9)     role_label="DNS agent (BIND9)" ;;
+        dns-agent-powerdns)  role_label="DNS agent (PowerDNS)" ;;
+        dhcp-agent)          role_label="DHCP agent (Kea)" ;;
+        *)                   role_label="$ROLE" ;;
     esac
     local s
     s="Role:        $role_label\n"
-    if [ "$ROLE" != "control" ]; then
-        s+="Control URL: $CONTROL_PLANE_URL\n"
-    fi
+    case "$ROLE" in
+        dns-agent-bind9|dns-agent-powerdns|dhcp-agent)
+            s+="Control URL: $CONTROL_PLANE_URL\n"
+            ;;
+    esac
     s+="Target disk: $TARGET_DISK\n"
     s+="Hostname:    $HOSTNAME\n"
     s+="OS user:     $ADMIN_USER\n"
