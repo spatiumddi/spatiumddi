@@ -130,23 +130,51 @@ getent hosts registry-1.docker.io >/dev/null 2>&1 || {
 }
 
 if [ ! -f "$STAMP" ]; then
-    echo "Pulling SpatiumDDI image set (first boot)..."
-    # Retry pull on transient failures (slow image hosts, partial
-    # download). set -e at the script top would otherwise kill us
-    # on the first transient blip.
-    pull_ok=0
-    for i in 1 2 3; do
-        if docker-compose pull; then
-            pull_ok=1
-            break
-        fi
-        echo "Pull attempt $i failed; retrying in 10 s..."
-        sleep 10
-    done
-    [ "$pull_ok" = 1 ] || {
-        echo "ERROR: docker-compose pull failed 3 times. Check network + DNS."
-        exit 1
-    }
+    # Phase 4 dev-iteration support — if this ISO was built with
+    # ``bake-images.sh``, it ships locally-built image tarballs at
+    # /usr/local/share/spatiumddi/images/*.tar.zst. Load each one
+    # into the daemon BEFORE attempting any pull, so the operator's
+    # in-flight changes take precedence over whatever's pullable
+    # from ghcr.io. The marker file ``BAKED_AT`` is dropped by
+    # bake-images.sh; its presence is the signal "this ISO carries
+    # offline images". When present we skip docker-compose pull
+    # entirely (pulls of unpublished tags would 404 against ghcr).
+    IMAGES_DIR=/usr/local/share/spatiumddi/images
+    BAKED=0
+    if [ -f "$IMAGES_DIR/BAKED_AT" ]; then
+        echo "Loading pre-baked container images from $IMAGES_DIR (baked $(cat "$IMAGES_DIR/BAKED_AT"))..."
+        for img in "$IMAGES_DIR"/*.tar.zst; do
+            [ -f "$img" ] || continue
+            echo "  → $(basename "$img")"
+            zstd -dc "$img" | docker load
+        done
+        BAKED=1
+    fi
+
+    if [ "$BAKED" = 1 ]; then
+        # Locally baked images are now in the daemon, named to match
+        # the compose ``image:`` refs (ghcr.io/spatiumddi/...:latest).
+        # docker-compose up will use them without a pull.
+        echo "Skipping docker-compose pull (locally-baked images installed)."
+    else
+        echo "Pulling SpatiumDDI image set (first boot)..."
+        # Retry pull on transient failures (slow image hosts, partial
+        # download). set -e at the script top would otherwise kill us
+        # on the first transient blip.
+        pull_ok=0
+        for i in 1 2 3; do
+            if docker-compose pull; then
+                pull_ok=1
+                break
+            fi
+            echo "Pull attempt $i failed; retrying in 10 s..."
+            sleep 10
+        done
+        [ "$pull_ok" = 1 ] || {
+            echo "ERROR: docker-compose pull failed 3 times. Check network + DNS."
+            exit 1
+        }
+    fi
 fi
 
 echo "Bringing stack up..."

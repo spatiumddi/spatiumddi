@@ -194,3 +194,26 @@ appliance-clean:
 	  echo "Removing $(APPLIANCE_OUT) (may need sudo — mkosi outputs are root-owned)"; \
 	  rm -rf $(APPLIANCE_OUT) 2>/dev/null || sudo rm -rf $(APPLIANCE_OUT); \
 	fi
+
+# Bake the local ``spatiumddi-{api,frontend}:dev`` images into the
+# appliance overlay so the next ``make appliance`` ships them inside
+# the ISO. Avoids needing to push WIP images to ghcr.io during
+# iteration. See appliance/scripts/bake-images.sh for details.
+appliance-bake-images:
+	@bash $(APPLIANCE_DIR)/scripts/bake-images.sh
+
+# Convenience for the Phase 4 iteration loop:
+#   1. Bake the existing spatiumddi-{api,frontend}:dev images into
+#      the appliance overlay
+#   2. Build the appliance raw image
+#   3. Wrap as a hybrid USB/CD ISO
+# After this completes, attach the ISO to a VM + boot — firstboot
+# loads the baked images instead of pulling from ghcr.io.
+#
+# Prerequisite: the dev images must exist locally. Run
+#     docker compose -f docker-compose.dev.yml build api frontend
+# (or just `make build` if you wired the prod compose) first.
+appliance-dev-iso: appliance-bake-images appliance appliance-iso
+	@echo ""
+	@echo "✓ Dev-flavored appliance ISO ready at $(APPLIANCE_OUT)/spatiumddi-appliance_0.1.0.iso"
+	@echo "  Ships WIP api+frontend images — DNS/DHCP still pull from ghcr.io as usual."
