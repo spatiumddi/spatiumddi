@@ -76,13 +76,17 @@ def list_log_sources() -> list[str]:
 def read_log_tail(name: str, lines: int = _DEFAULT_TAIL) -> str:
     """Return the last ``lines`` lines of a host log file.
 
-    Refuses paths with separators / parents so the caller can't escape
-    out of the log directory. 404-equivalent on miss — returns empty
-    string + the router translates that.
+    Resolves the candidate path and verifies it sits directly under
+    the log directory so the caller can't traverse out via separators,
+    parent references, or symlinks. 404-equivalent on miss — returns
+    empty string + the router translates that.
     """
     if "/" in name or ".." in name or "\\" in name:
         raise ValueError("invalid log name")
-    path = _log_dir() / name
+    base = _log_dir().resolve()
+    path = (base / name).resolve()
+    if path.parent != base:
+        raise ValueError("invalid log name")
     if not path.is_file():
         return ""
     try:
