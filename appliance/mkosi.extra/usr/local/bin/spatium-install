@@ -365,6 +365,27 @@ EOF
         install -m 0644 "$LIVE_KERNEL" "$MOUNT/boot/vmlinuz-$KVER"
         ln -sf "vmlinuz-$KVER" "$MOUNT/boot/vmlinuz"
 
+        echo "80"; echo "XXX"; echo "Configuring initramfs (virtio + storage modules)..."; echo "XXX"
+        # Force the storage / virtio drivers into the initrd so the
+        # installed kernel can find its root partition. MODULES=most
+        # is the Debian default but is overly conservative on slim
+        # cloud-amd64 — explicit module list guarantees they're in.
+        # Without virtio_blk the kernel panics at boot with
+        # "VFS: Unable to mount root fs on unknown-block(0,0)" on
+        # any VM hypervisor.
+        sed -i 's/^MODULES=.*/MODULES=most/' \
+            "$MOUNT/etc/initramfs-tools/initramfs.conf" 2>/dev/null || true
+        cat > "$MOUNT/etc/initramfs-tools/modules" <<'EOF'
+# Forced into the initrd by spatium-install for VM compatibility.
+virtio
+virtio_pci
+virtio_blk
+virtio_scsi
+virtio_net
+virtio_ring
+ext4
+EOF
+
         echo "82"; echo "XXX"; echo "Regenerating initrd for disk boot..."; echo "XXX"
         # Generate a fresh disk-boot initrd in chroot. -c creates a
         # new initrd (vs -u for updating an existing one — there's
@@ -374,6 +395,60 @@ EOF
             >> "$INSTALL_LOG" 2>&1
         ln -sf "initrd.img-$KVER" "$MOUNT/boot/initrd.img"
 
+        echo "85"; echo "XXX"; echo "Writing /etc/default/grub + /boot/grub/grub.cfg..."; echo "XXX"
+        # Write /etc/default/grub explicitly so future `update-grub`
+        # runs (e.g. on kernel upgrade) get the same cmdline. We
+        # don't rely on update-grub at install time — we write
+        # grub.cfg directly below — but installed-system tooling
+        # will read this file later.
+        cat > "$MOUNT/etc/default/grub" <<EOF
+GRUB_DEFAULT=0
+GRUB_TIMEOUT=3
+GRUB_DISTRIBUTOR="SpatiumDDI"
+GRUB_CMDLINE_LINUX_DEFAULT="quiet"
+GRUB_CMDLINE_LINUX="console=tty0 console=ttyS0,115200n8"
+GRUB_TERMINAL_INPUT="console serial"
+GRUB_TERMINAL_OUTPUT="console serial"
+GRUB_SERIAL_COMMAND="serial --unit=0 --speed=115200"
+GRUB_DISABLE_OS_PROBER=true
+GRUB_DISABLE_LINUX_UUID=false
+EOF
+
+        # Write grub.cfg directly with the correct root=UUID. We
+        # bypass update-grub because grub-mkconfig's grub-probe reads
+        # /proc/mounts inside the chroot — and /proc is bind-mounted
+        # from the host, so grub-probe returns the LIVE OVERLAY's
+        # device rather than the target disk's root partition. The
+        # resulting grub.cfg has a wrong/missing root= line and the
+        # kernel panics at boot.
+        mkdir -p "$MOUNT/boot/grub"
+        cat > "$MOUNT/boot/grub/grub.cfg" <<EOF
+set timeout=3
+set default=0
+
+# Serial console mirror for headless installs.
+serial --unit=0 --speed=115200
+terminal_input  console serial
+terminal_output console serial
+
+insmod part_gpt
+insmod ext2
+insmod search_fs_uuid
+search --no-floppy --fs-uuid --set=root $ROOT_UUID
+
+menuentry "SpatiumDDI Appliance" {
+    linux /boot/vmlinuz-$KVER root=UUID=$ROOT_UUID ro quiet \\
+        console=tty0 console=ttyS0,115200n8
+    initrd /boot/initrd.img-$KVER
+}
+
+menuentry "SpatiumDDI Appliance (verbose, recovery)" {
+    linux /boot/vmlinuz-$KVER root=UUID=$ROOT_UUID ro \\
+        console=tty0 console=ttyS0,115200n8 systemd.unit=rescue.target
+    initrd /boot/initrd.img-$KVER
+}
+EOF
+
         echo "88"; echo "XXX"; echo "Installing bootloader (BIOS + UEFI)..."; echo "XXX"
         chroot "$MOUNT" /usr/sbin/grub-install --target=i386-pc "$TARGET_DISK" \
             >> "$INSTALL_LOG" 2>&1
@@ -382,11 +457,6 @@ EOF
             --bootloader-id=SPATIUMDDI \
             --removable \
             >> "$INSTALL_LOG" 2>&1 || true
-        # update-grub scans /boot/vmlinuz-* + /boot/initrd.img-* and
-        # writes /boot/grub/grub.cfg. Without the kernel copy above
-        # this would produce an empty menu and grub would drop to a
-        # rescue prompt on boot.
-        chroot "$MOUNT" /usr/sbin/update-grub >> "$INSTALL_LOG" 2>&1
 
         echo "95"; echo "XXX"; echo "Unmounting..."; echo "XXX"
         for d in dev sys proc; do
