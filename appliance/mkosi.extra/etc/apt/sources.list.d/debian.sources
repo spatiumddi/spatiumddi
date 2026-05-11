@@ -1,0 +1,22 @@
+# Debian 13 (trixie) apt sources in the deb822 format that ships
+# as the default on fresh Debian 13 installs. mkosi bootstraps from
+# its own apt config during build but doesn't seed the rootfs with
+# sources, so without this file `apt-get update` on the installed
+# system would error with "no entries found". The
+# unattended-upgrades stack also needs working sources to pull
+# security patches.
+#
+# Operators on a slow/firewalled link can edit URIs to a closer
+# mirror (e.g. deb.debian.org → mirror.lst.fi or similar).
+
+Types: deb
+URIs: http://deb.debian.org/debian
+Suites: trixie trixie-updates
+Components: main contrib non-free-firmware
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg
+
+Types: deb
+URIs: http://security.debian.org/debian-security
+Suites: trixie-security
+Components: main contrib non-free-firmware
+Signed-By: /usr/share/keyrings/debian-archive-keyring.gpg

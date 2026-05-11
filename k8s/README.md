@@ -203,7 +203,7 @@ kubectl set image deployment/frontend frontend=ghcr.io/spatiumddi/spatiumddi-fro
 
 ```bash
 # Pin the new tag on every deployment
-NEW_TAG=2026.05.07-1
+NEW_TAG=2026.05.11-1
 for d in api worker beat frontend; do
   kubectl set image deployment/$d $d=ghcr.io/spatiumddi/spatiumddi-$d:$NEW_TAG -n spatiumddi
 done

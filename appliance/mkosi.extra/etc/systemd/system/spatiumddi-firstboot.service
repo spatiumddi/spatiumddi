@@ -1,0 +1,35 @@
+[Unit]
+Description=SpatiumDDI appliance first-boot orchestrator + stack supervisor
+# Skip on the live ISO. live-boot puts `boot=live` in the kernel
+# cmdline; the installed system doesn't carry that token. This
+# matters because firstboot fallocate's a 2 GiB swapfile at
+# /var/lib/spatiumddi/swapfile and pulls multi-GiB Docker images
+# — fine on a real disk, fatal on the live ISO's ~1 GiB tmpfs
+# overlay (fills it in one second, every subsequent write — incl.
+# the spatium-install wizard's log + trace fds — fails with ENOSPC
+# and the wizard exits silently).
+ConditionKernelCommandLine=!boot=live
+# docker.service is the only hard dependency. We previously also
+# pinned `network-online.target` and `cloud-final.service`, but in
+# live-ISO mode that chain creates an ordering cycle with live-config
+# and systemd deletes our unit to break it (visible as
+# "Ordering cycle found, skipping spatiumddi-firstboot.service"
+# during boot). docker.service already pulls in network.target via
+# its own deps, and the orchestrator's `docker compose pull` step
+# tolerates network coming up a bit late.
+After=docker.service
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStartSec=10min
+ExecStart=/usr/local/bin/spatiumddi-firstboot
+ExecStop=/bin/sh -c 'cd /usr/local/share/spatiumddi && /usr/bin/docker-compose down --remove-orphans'
+# Log routing: the firstboot script self-redirects to
+# /var/log/spatiumddi/firstboot.log via `exec >>`. We don't double-capture
+# here so the file isn't written twice. `journalctl -u spatiumddi-firstboot`
+# still shows systemd's start/stop transitions.
+
+[Install]
+WantedBy=multi-user.target

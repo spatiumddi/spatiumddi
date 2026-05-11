@@ -1,0 +1,24 @@
+[Unit]
+Description=SpatiumDDI live-ISO SSH bootstrap (random root pwd + sshd drop-in)
+# Trigger conditions — at least one of the two must match. The `|`
+# prefix puts both Conditions in an OR pool, so the unit activates
+# on either spatium-mode=install (installer wizard) or spatium-mode=live
+# (banner-only live boot). On the installed system (no spatium-mode=
+# in cmdline) the unit is condition-skipped, so it never runs and
+# /etc/ssh/sshd_config.d/00-spatium-live.conf never gets written.
+ConditionKernelCommandLine=|spatium-mode=install
+ConditionKernelCommandLine=|spatium-mode=live
+# Need to run before sshd starts so it picks up the new
+# /etc/ssh/sshd_config.d/00-spatium-live.conf at startup, and before
+# the spatium-install / spatium-live-banner units claim tty1 (so
+# /etc/issue.d/ updates are visible on other VT login prompts).
+Before=ssh.service spatium-install.service spatium-live-banner.service
+After=local-fs.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/spatium-live-bootstrap
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

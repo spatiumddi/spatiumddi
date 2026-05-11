@@ -1,0 +1,392 @@
+# SpatiumDDI all-in-one appliance compose stack.
+#
+# Lives at /usr/local/share/spatiumddi/docker-compose.yml in the
+# appliance image. spatiumddi-firstboot generates /etc/spatiumddi/.env
+# on first boot and symlinks it in as ./.env so the env_file
+# directives resolve.
+#
+# This file mirrors the top-level docker-compose.yml in the repo.
+# Surgical appliance-only deltas:
+#   - frontend on host port 80 (not 8077): the appliance is the
+#     dedicated SpatiumDDI host — no port-collision risk
+#   - dhcp-kea on network_mode: host (not bridge + 6767:67) because
+#     a real DHCP server needs raw broadcasts, not a port-mapped
+#     unicast endpoint
+#   - dns-bind9 on host port 53 (not 1053): the appliance serves
+#     DNS for downstream clients on the standard port
+#   - no docker-socket / spatium_backups mount commentary —
+#     operators bake those in via /etc/spatiumddi/.env or the
+#     compose-file override path
+
+name: spatiumddi
+
+services:
+
+  postgres:
+    # Phase 6 role-split — control-plane services live behind the
+    # ``control`` profile so a DNS-agent / DHCP-agent appliance (which
+    # registers against a remote control plane) doesn't bring up its
+    # own postgres / redis / api / worker / beat / frontend.
+    # spatiumddi-firstboot reads /etc/spatiumddi/role-config and
+    # exports COMPOSE_PROFILES accordingly: ``control,dns-bind9,dhcp``
+    # for the control role; ``dns-bind9`` or ``dhcp-kea`` (+ ``agent``
+    # for the landing page) for the matching agent roles.
+    profiles: ["control"]
+    image: postgres:16-alpine
+    restart: unless-stopped
+    networks: [spatiumddi]
+    environment:
+      POSTGRES_USER: spatiumddi
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: spatiumddi
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U spatiumddi"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    profiles: ["control"]
+    image: redis:7-alpine
+    restart: unless-stopped
+    networks: [spatiumddi]
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  migrate:
+    profiles: ["control"]
+    image: ghcr.io/spatiumddi/spatiumddi-api:${SPATIUMDDI_VERSION:-latest}
+    networks: [spatiumddi]
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://spatiumddi:${POSTGRES_PASSWORD}@postgres:5432/spatiumddi
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  api:
+    profiles: ["control"]
+    image: ghcr.io/spatiumddi/spatiumddi-api:${SPATIUMDDI_VERSION:-latest}
+    restart: unless-stopped
+    networks: [spatiumddi]
+    ports: ["8000:8000"]
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://spatiumddi:${POSTGRES_PASSWORD}@postgres:5432/spatiumddi
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      VERSION: ${SPATIUMDDI_VERSION:-latest}
+      # Appliance management surface (Phase 4, issue #134). The
+      # frontend reads /api/v1/version → appliance_mode and only
+      # renders the "Appliance" sidebar entry + /appliance route on
+      # installs that ship this flag. APPLIANCE_VERSION ships the
+      # ISO version (separate from SPATIUMDDI_VERSION which is the
+      # container image tag); APPLIANCE_HOSTNAME is sourced from
+      # `hostname` by spatiumddi-firstboot and threaded through the
+      # .env file so the management hub can show it without an
+      # extra round-trip into the OS.
+      APPLIANCE_MODE: "true"
+      APPLIANCE_VERSION: ${APPLIANCE_VERSION:-0.1.0}
+      APPLIANCE_HOSTNAME: ${APPLIANCE_HOSTNAME:-}
+      # Host IPs detected by firstboot — used by the self-signed cert
+      # bootstrap (Phase 4b.5) so the SAN list includes the IPs a
+      # browser actually connects to, not just the docker bridge IP
+      # the api container sees from inside its own namespace.
+      APPLIANCE_HOST_IPS: ${APPLIANCE_HOST_IPS:-}
+      # Cert deployer (Phase 4b.2). The active cert from
+      # appliance_certificate is written here; the frontend container
+      # mounts the same volume at /etc/nginx/certs and nginx reads
+      # active.{pem,key} from there. The deployer SIGHUPs the frontend
+      # container via docker socket on activation so nginx reloads
+      # without dropping in-flight connections.
+      APPLIANCE_CERT_DIR: /var/lib/spatiumddi/certs
+      APPLIANCE_FRONTEND_CONTAINER: spatiumddi-frontend
+    volumes:
+      # Shared cert volume — api writes active.pem + active.key,
+      # frontend mounts r/o for nginx.
+      - appliance_certs:/var/lib/spatiumddi/certs
+      # ACME HTTP-01 challenge token volume — api writes per-issuance
+      # tokens; frontend nginx serves them as static files. Empty
+      # outside an active Let's Encrypt flow (Phase 4b.4).
+      - appliance_acme:/var/www/acme-challenge
+      # Phase 4c release manager — api drops trigger files into
+      # /var/lib/spatiumddi/release-state/release-pending on the host
+      # (sub-dir is chown'd to 1000:1000 by firstboot so the api's
+      # ``app`` user can write). The host's spatiumddi-update.path
+      # unit notices + runs the actual upgrade. The same trigger dir
+      # is reused for the Phase 4f reboot-pending file.
+      # /var/log/spatiumddi/update.log is the apply log the UI tails.
+      - /var/lib/spatiumddi/release-state:/var/lib/spatiumddi-host/release-state:rw
+      - /var/log/spatiumddi:/var/log/spatiumddi-host:ro
+      # Phase 4f reboot-pending detection — Debian writes
+      # /var/run/reboot-required after unattended-upgrades installs a
+      # kernel or libc update. The api shows a "reboot pending" banner
+      # when it sees the file. /var/run is tmpfs on the host so the
+      # mount goes through cleanly even without firstboot setup.
+      - /var/run:/var/run-host:ro
+      # Docker socket — required for the cert-deployer SIGHUP and
+      # (Phase 4d) container management. The api container's ``app``
+      # user gets supplementary group access via ``group_add`` below
+      # (the gid matches the host's ``docker`` group, which owns
+      # /var/run/docker.sock with mode 0660). Read-write because the
+      # docker SDK opens the socket bidirectionally for the API
+      # exchange — the *permissions* are still scoped by the API's
+      # own RBAC layer.
+      - /var/run/docker.sock:/var/run/docker.sock
+    group_add:
+      # Host docker group gid. ``spatiumddi-firstboot`` detects this
+      # from ``stat -c '%g' /var/run/docker.sock`` at first boot and
+      # writes ``DOCKER_GID=<value>`` to .env. 999 is the Debian
+      # default but can drift on rebuilds — never hard-code.
+      - "${DOCKER_GID:-999}"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8000/health/live')\""]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+
+  worker:
+    profiles: ["control"]
+    image: ghcr.io/spatiumddi/spatiumddi-api:${SPATIUMDDI_VERSION:-latest}
+    restart: unless-stopped
+    networks: [spatiumddi]
+    # CRITICAL: subscribe to all four queues. Production routes
+    # IPAM tasks to `ipam`, DNS to `dns`, DHCP to `dhcp`, everything
+    # else to `default`. A worker that only listens on the default
+    # `celery` queue (the implicit default when -Q is omitted)
+    # silently drops every IPAM/DNS/DHCP task — auto-sync,
+    # lease cleanup, scheduled jobs all stop working.
+    command: celery -A app.celery_app worker --loglevel=info --concurrency=4 -Q ipam,dns,dhcp,default
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://spatiumddi:${POSTGRES_PASSWORD}@postgres:5432/spatiumddi
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      VERSION: ${SPATIUMDDI_VERSION:-latest}
+    depends_on:
+      api:
+        condition: service_started
+    # The api container's HEALTHCHECK pings /health/live over HTTP —
+    # wrong for a worker (it has no HTTP listener). Override with a
+    # Celery-native ping that round-trips to this worker via the broker.
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.celery_app inspect ping -d celery@$$HOSTNAME --timeout 5 >/dev/null 2>&1"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
+
+  beat:
+    profiles: ["control"]
+    image: ghcr.io/spatiumddi/spatiumddi-api:${SPATIUMDDI_VERSION:-latest}
+    restart: unless-stopped
+    networks: [spatiumddi]
+    command: celery -A app.celery_app beat --loglevel=info
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://spatiumddi:${POSTGRES_PASSWORD}@postgres:5432/spatiumddi
+      REDIS_URL: redis://redis:6379/0
+      CELERY_BROKER_URL: redis://redis:6379/1
+      CELERY_RESULT_BACKEND: redis://redis:6379/2
+      VERSION: ${SPATIUMDDI_VERSION:-latest}
+    depends_on:
+      - redis
+    # Beat has no broker-reachable identity and no HTTP listener.
+    # Cheapest liveness signal is "the celery process is still pid 1".
+    healthcheck:
+      test: ["CMD-SHELL", "grep -q 'celery' /proc/1/cmdline"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+
+  frontend:
+    profiles: ["control"]
+    image: ghcr.io/spatiumddi/spatiumddi-frontend:${SPATIUMDDI_VERSION:-latest}
+    container_name: spatiumddi-frontend
+    restart: unless-stopped
+    networks: [spatiumddi]
+    # Phase 4b.2 — appliance frontend listens on both HTTP and HTTPS.
+    # 80 → 301 redirect to HTTPS (except /.well-known/acme-challenge/
+    # which 4b.4's Let's Encrypt HTTP-01 challenge will use).
+    # 443 → the real HTTPS surface; cert from the shared volume.
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+    volumes:
+      # Override the baked-in /etc/nginx/conf.d/default.conf with the
+      # appliance-flavored config that handles TLS termination.
+      - /usr/local/share/spatiumddi/nginx-appliance.conf:/etc/nginx/conf.d/default.conf:ro
+      # Shared cert volume — the api container writes active.pem +
+      # active.key here; nginx reads them. SIGHUP via docker socket
+      # reloads nginx when the operator activates a different cert.
+      - appliance_certs:/etc/nginx/certs:ro
+      # ACME HTTP-01 challenge directory (Phase 4b.4) — the api
+      # container writes tokens here so nginx can serve them as
+      # static files at /.well-known/acme-challenge/<token>.
+      - appliance_acme:/var/www/acme-challenge:ro
+    depends_on:
+      # ``service_healthy`` (not just ``service_started``) so the api
+      # has finished ensure_self_signed_cert() before nginx starts —
+      # otherwise nginx would fail to load active.pem on first boot.
+      api:
+        condition: service_healthy
+
+  # ── DNS (BIND9) — default profile ───────────────────────────────────────────
+  dns-bind9:
+    profiles: ["dns", "dns-bind9"]
+    image: ghcr.io/spatiumddi/dns-bind9:${SPATIUMDDI_VERSION:-latest}
+    restart: unless-stopped
+    networks: [spatiumddi]
+    ports:
+      - "53:53/udp"
+      - "53:53/tcp"
+    environment:
+      # CONTROL_PLANE_URL defaults to the in-compose api (control-plane
+      # mode); on a Phase 6 role-split DNS-agent appliance, firstboot
+      # writes the operator-supplied remote URL to .env so this
+      # variable points at a different host. Same env-substitution
+      # pattern as the rest of the stack.
+      CONTROL_PLANE_URL: ${CONTROL_PLANE_URL:-http://api:8000}
+      DNS_AGENT_KEY: ${DNS_AGENT_KEY}
+      SERVER_NAME: ${APPLIANCE_HOSTNAME:-dns-bind9}
+      # Phase 6 — operator picks the group at install time; firstboot
+      # writes ``AGENT_GROUP`` into .env. Default keeps the AIO box
+      # registering into "default" if .env wasn't seeded.
+      AGENT_GROUP: ${AGENT_GROUP:-default}
+      AGENT_ROLES: authoritative
+      SPATIUM_INSECURE_SKIP_TLS_VERIFY: "1"
+    volumes:
+      - dns_bind9_state:/var/lib/spatium-dns-agent
+      - dns_bind9_cache:/var/cache/bind
+    # No depends_on: api — on agent-mode appliances the api isn't in
+    # this compose, and the agent already retries forever on bootstrap
+    # 401/404 (it caches a JWT after the first success).
+
+  # ── DNS (PowerDNS) — opt-in profile ─────────────────────────────────────────
+  # Mirror of dns-bind9 but on the PowerDNS engine. Group-level
+  # features like DNSSEC sign/unsign, ALIAS, LUA, catalog zones gate
+  # on every server in the group running the powerdns driver, so the
+  # operator picks one engine per DNS server group. On the appliance,
+  # the Phase 6 role-split installer's "DNS agent — PowerDNS" choice
+  # writes ``COMPOSE_PROFILES=dns-powerdns,agent`` to .env. Port 53 is
+  # reused (not 5453 like in dev) because an agent-mode appliance
+  # only ever runs one DNS engine.
+  dns-powerdns:
+    profiles: ["dns-powerdns"]
+    image: ghcr.io/spatiumddi/dns-powerdns:${SPATIUMDDI_VERSION:-latest}
+    restart: unless-stopped
+    networks: [spatiumddi]
+    ports:
+      - "53:53/udp"
+      - "53:53/tcp"
+    environment:
+      CONTROL_PLANE_URL: ${CONTROL_PLANE_URL:-http://api:8000}
+      DNS_AGENT_KEY: ${DNS_AGENT_KEY}
+      SERVER_NAME: ${APPLIANCE_HOSTNAME:-dns-powerdns}
+      # Default differs from bind9 — group features (DNSSEC sign/
+      # unsign, ALIAS, LUA, catalog zones) gate on every server in
+      # a group running the powerdns driver, so we don't want a
+      # bind9 + powerdns mix in the "default" group by accident.
+      AGENT_GROUP: ${AGENT_GROUP:-default-powerdns}
+      AGENT_ROLES: authoritative
+      SPATIUM_INSECURE_SKIP_TLS_VERIFY: "1"
+    volumes:
+      - dns_powerdns_state:/var/lib/spatium-dns-agent
+      - dns_powerdns_lmdb:/var/lib/powerdns
+
+  # ── DHCP (Kea) — default profile ────────────────────────────────────────────
+  # Host networking is required for DHCP broadcast (DDI appliance
+  # vs lab compose's bridge + port-mapping). With host networking
+  # the container shares the host's network namespace so it can
+  # receive L2 broadcasts on the LAN.
+  #
+  # CRITICAL: env var names — the Kea agent reads SPATIUM_* not
+  # CONTROL_PLANE_URL/DHCP_AGENT_KEY. Earlier appliance builds had
+  # the wrong names and the agent silently failed to bootstrap.
+  dhcp-kea:
+    profiles: ["dhcp"]
+    image: ghcr.io/spatiumddi/dhcp-kea:${SPATIUMDDI_VERSION:-latest}
+    restart: unless-stopped
+    network_mode: host
+    environment:
+      # On control-plane mode this defaults to localhost (the api
+      # binds 8000 on the host net via the api service's port-map).
+      # On Phase 6 role-split DHCP-agent appliances, firstboot writes
+      # the remote control-plane URL to CONTROL_PLANE_URL in .env.
+      SPATIUM_API_URL: ${CONTROL_PLANE_URL:-http://127.0.0.1:8000}
+      SPATIUM_AGENT_KEY: ${DHCP_AGENT_KEY}
+      SPATIUM_SERVER_NAME: ${APPLIANCE_HOSTNAME:-dhcp-kea}
+      AGENT_GROUP: ${AGENT_GROUP:-default}
+      AGENT_ROLES: primary
+      SPATIUM_INSECURE_SKIP_TLS_VERIFY: "1"
+    volumes:
+      - dhcp_kea_state:/var/lib/spatium-dhcp-agent
+      - dhcp_kea_leases:/var/lib/kea
+    # No depends_on: api — agent retries until the control plane is
+    # reachable; on agent-mode installs the api isn't even in this
+    # compose.
+    cap_add:
+      - NET_BIND_SERVICE
+
+  # ── Agent-landing page (Phase 6) ────────────────────────────────────────────
+  # Tiny static-HTML status page served on port 80 of an agent-mode
+  # appliance (DNS or DHCP role). Operators get *something* at the
+  # appliance IP that confirms which role this box plays and which
+  # control plane it points at — without dragging in the full
+  # spatiumddi-frontend image. Lives behind the ``agent`` compose
+  # profile so the control-plane role doesn't activate it.
+  #
+  # The page is generated by spatiumddi-firstboot from a template at
+  # /usr/local/share/spatiumddi/agent-landing/index.html.in with the
+  # role + CONTROL_PLANE_URL + appliance hostname substituted in.
+  agent-landing:
+    profiles: ["agent"]
+    image: nginx:1.27-alpine
+    container_name: spatiumddi-agent-landing
+    restart: unless-stopped
+    networks: [spatiumddi]
+    ports:
+      - "${HTTP_PORT:-80}:80"
+    volumes:
+      - /var/lib/spatiumddi/agent-landing:/usr/share/nginx/html:ro
+
+networks:
+  spatiumddi:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  dns_bind9_state:
+  dns_bind9_cache:
+  dns_powerdns_state:
+  dns_powerdns_lmdb:
+  dhcp_kea_state:
+  dhcp_kea_leases:
+  # Phase 4b.2 — shared TLS cert volume. api writes active.{pem,key};
+  # frontend mounts r/o for nginx. Survives container recycles so an
+  # activated cert sticks across `docker-compose up -d --force-recreate`.
+  appliance_certs:
+  # Phase 4b.4 — ACME HTTP-01 challenge directory. api drops tokens
+  # here, nginx serves them at /.well-known/acme-challenge/. Empty
+  # outside an in-flight Let's Encrypt issuance.
+  appliance_acme:

@@ -566,6 +566,14 @@ function GroupServersList({
                 <span className="w-48 truncate font-mono text-xs text-muted-foreground">
                   {s.host}:{s.port}
                 </span>
+                {s.last_seen_ip && (
+                  <span
+                    className="truncate font-mono text-xs text-muted-foreground"
+                    title="Source IP of the most recent agent heartbeat"
+                  >
+                    ({s.last_seen_ip})
+                  </span>
+                )}
                 <span className="rounded-full bg-muted px-2 py-0.5 text-xs">
                   {s.driver}
                 </span>

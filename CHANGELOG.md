@@ -22,19 +22,35 @@ the formatter handles the rest.
 
 ## Unreleased
 
-PowerDNS-Authoritative driver lands as the second authoritative DNS
-backend alongside BIND9 — Phase 1 of issue \#127. Operators choose
-per-server-group which driver to run; mixed installs work via
-multiple groups. Phase 1 ships the backend driver class, the
-agent-side driver, the new ``ghcr.io/spatiumddi/dns-powerdns`` image
-(Alpine + ``pdns_server`` + LMDB embedded backend, multi-arch
-linux/amd64 + linux/arm64), and the multi-arch build wired into
-both the image-build workflow matrix and the release-tag pipeline.
-The frontend is intentionally not yet aware of the driver choice —
-operators create PowerDNS server groups via the existing REST API
-(``driver: "powerdns"`` on ``POST /dns/server-groups``); the
-driver-picker UI lands in Phase 2 alongside the per-driver tab
-visibility.
+## 2026.05.11-1 — 2026-05-11
+
+Largest release of the project so far — five big feature pillars
+land in one cut. **PowerDNS** as a complete second authoritative
+DNS driver (\#127, Phases 1 through 5+): ALIAS + LUA records,
+online DNSSEC sign/unsign with frontend DS export, RFC 9432 catalog
+zones (producer), Helm chart wiring + CI kind smoke test,
+Operator-Copilot ``propose_create_dns_zone`` with driver hinting,
+backup DNSSEC restore advisory, frontend driver picker, query logs,
+group-record colour parity. **SpatiumDDI OS Appliance** (\#134,
+Phases 1 / 2 / 3 / 4 / 6): Debian 13 qcow2 + hybrid USB-CD-UEFI ISO
+with Proxmox-style installer wizard, dedicated ``/appliance``
+management hub (TLS cert upload + CSR-on-server, GitHub release
+apply + recycle, container start/stop/restart + live SSE logs,
+host log viewer + self-test + diagnostic bundle, maintenance mode
++ host reboot, web first-boot wizard), role-split single ISO with
+five roles (control all-in-one / control-only / DNS-BIND9 /
+DNS-PowerDNS / DHCP). **Multicast IPAM** (\#126) — full feature:
+PIM domain registry, group + domain CRUD, IPAM ``Subnet.kind``
+discriminator forking unicast / multicast, bulk allocate + IP
+picker, IGMP-state reaper, SNMP IGMP-snooping populator, Copilot
+``propose_allocate_multicast_group`` tool. **DNS Import** (\#128)
+— BIND9 zonefile and Windows DNS importers behind a new
+``dns.import`` feature module, three-tab admin page,
+``import_source`` + ``imported_at`` provenance on every imported
+zone/record. **GitHub Codespaces public demo** + ``DEMO_MODE``
+server-side lockdown (one-click full stack with realistic seeded
+data; mutation surfaces locked so visitors can't weaponise the
+demo as a scanner / SSRF relay).
 
 ### Added
 
@@ -374,6 +390,56 @@ visibility.
   agent can cache PowerDNS DS rrsets after a successful sign and
   the operator-facing zone-edit page renders them without round-
   tripping the agent on every page load.
+- ``f1e7a3c92b40_multicast_groups`` — adds the ``multicast_group``
+  table (\#126, Phase 1 Wave 1): UUID PK, owning ``ip_block`` FK
+  (so groups inherit space/block hierarchy), address + scope +
+  rendezvous-point + IGMP-version columns plus the standard
+  per-row custom-fields JSONB. Indexed on ``(block_id, address)``.
+- ``c8d2f47a90b3_multicast_domain`` — adds the ``multicast_domain``
+  table (\#126, Phase 2 Wave 1) for PIM domain registry: name +
+  description + scope-boundary CIDR list + per-domain RP-set + RP
+  assignment policy enum + per-row custom fields. Group rows gain
+  ``domain_id`` FK ON DELETE SET NULL so reassigning a group out
+  of a domain doesn't cascade-delete it.
+- ``d3a9c5b71e84_subnet_kind`` — adds ``subnet.kind`` column
+  (\#126) discriminating ``unicast`` (default, backfilled for
+  every existing row) from ``multicast``. The IPAM tree splits
+  rendering by kind: multicast subnets hand off to the new
+  multicast-group / domain surfaces; unicast continues using the
+  IP / DHCP machinery. Indexed for the per-block "list multicast
+  subnets" query.
+- ``b7e2d9a5f314_dns_import_source`` — adds ``import_source`` +
+  ``imported_at`` columns to ``dns_zone`` and ``dns_record``
+  (\#128 Phase 1 Wave 1) so imported entities are distinguishable
+  from operator-created ones. Both nullable; existing rows
+  backfill ``NULL`` (operator-created).
+- ``a1f4d97c8e25_network_device_poll_igmp`` — adds the
+  ``network_device_poll_igmp`` table backing the multicast Phase 3
+  SNMP IGMP-snooping populator. Per-poll: ``network_device_id``
+  FK, polled_at, ``rows_added`` / ``rows_updated`` / ``rows_seen``
+  counters, error column. Driven from the existing per-device
+  poll scheduler — same pattern as the ARP + FDB pollers.
+- ``c9f2a83b04d7_appliance_certificate`` — adds the
+  ``appliance_certificate`` table (\#134 Phase 4b.1) for the
+  appliance Web UI cert manager: name + source enum
+  (uploaded/csr/letsencrypt/self-signed) + cert PEM + Fernet-
+  encrypted private key + ``is_active`` + identity columns
+  (subject_cn / issuer_cn / sans_json / fingerprint /
+  valid_from / valid_to) + creator audit FK + reserved CSR
+  columns (cert_pem nullable, populated on import).
+- ``d8f3a92e0c47_appliance_csr_pending`` — relaxes NOT NULL on the
+  cert-derived columns (\#134 Phase 4b.3) so a CSR-pending
+  ``appliance_certificate`` row (generated CSR + stored private
+  key, no cert yet) can exist. ``cert_pem IS NULL`` is the
+  canonical pending sentinel.
+- ``e4a7f10b2c39_agent_last_seen_ip`` — adds ``last_seen_ip``
+  (VARCHAR 45) to both ``dns_server`` and ``dhcp_server``,
+  populated from ``request.client.host`` on every agent
+  heartbeat. Surfaces in the UI as a chip next to the
+  operator-set host name so operators can identify which
+  physical machine an agent is on in NAT / distributed
+  deployments — the operator-set ``host`` field is just a
+  label.
 
 ### Added (continued)
 
@@ -493,6 +559,335 @@ visibility.
   Logs / Stats / Config tabs and the rndc-status panel for
   PowerDNS — those need PowerDNS-specific implementations (Phase 3:
   pdns query log, ``pdns_control`` stats, rendered config push).
+
+### Added — Multicast IPAM (\#126)
+
+- **Registry data model + REST CRUD (Phase 1 Wave 1).** New
+  ``multicast_group`` table backed by IPAM's existing IP-block
+  hierarchy (every group lives under an IP block, inheriting
+  custom-fields and ownership). Backend exposes a full ``/multicast/
+  groups`` CRUD surface; the address validator rejects anything
+  outside 224.0.0.0/4 (IPv4) or ff00::/8 (IPv6). Group rows carry
+  scope (link-local / admin-scoped / global), RP, IGMP version,
+  description, and the standard custom-fields JSONB.
+- **Operator UI — list page + tabbed editor (Phase 1 Wave 2).** New
+  ``/ipam/multicast`` page; per-group editor renders three tabs
+  (Properties, Custom Fields, Active Listeners — Phase 3 populates
+  the last one from SNMP IGMP-snooping).
+- **Bulk allocate + IP picker (Phase 1 Wave 3).** Multicast subnets
+  reuse the same bulk-allocate / IP-picker UX as unicast subnets,
+  with the validator gated to the multicast-only range. Picker
+  shows next-available addresses + a "skip to N" jump for sparse
+  group allocations.
+- **IP-detail tab + collision conformity (Phase 1 Wave 4).** The
+  IP-detail modal grows a Multicast tab listing every group that
+  carries this address (typically zero or one — collisions are an
+  operator misconfiguration). Conformity check
+  ``multicast_address_uniqueness`` lights up when two groups share
+  a multicast address.
+- **Bulk-delete on the groups page (Phase 1 follow-up).** Checkbox
+  column + "Delete N selected" toolbar mirroring the DHCP-MAC and
+  IPAM bulk-delete patterns.
+- **PIM domain registry (Phase 2 Wave 1).** New ``multicast_domain``
+  table + page; operators model their PIM-SM topology (or other
+  multicast routing protocol) here. Each domain pins a scope
+  boundary (the CIDRs at the domain edge that drop multicast),
+  a static RP set, and an RP assignment policy. Group rows now
+  carry an optional ``domain_id`` FK.
+- **Domains UI + group-domain picker (Phase 2 Wave 2).**
+  ``/ipam/multicast/domains`` lists PIM domains; the group editor
+  gets a domain dropdown so operators reassign groups across
+  domains without API tinkering.
+- **Subnet kind discriminator (\#126).** ``Subnet.kind`` column
+  forks unicast (default, all existing rows backfilled) from
+  multicast. The IPAM tree branches rendering by kind: multicast
+  rows hand off to the multicast-group / domain surfaces; unicast
+  continues using the IP / DHCP machinery. Means a single block
+  hierarchy can mix unicast + multicast subnets cleanly without
+  the type confusion that haunts other IPAMs.
+- **SNMP IGMP-snooping populator (Phase 3 Wave 1).** Per-device
+  poll scheduler pulls the L2 switch's IGMP-snooping table on each
+  cycle, materialising "which clients joined which multicast
+  groups" into an Active Listeners view on every group. Driven by
+  the same scheduler as the ARP + FDB pollers (Phase 2 of network
+  discovery); per-device toggles plus a per-poll telemetry table
+  (``network_device_poll_igmp``).
+- **Operator Copilot multicast tools (Phase 4 Wave 1).** Three
+  read tools (``find_multicast_groups``, ``find_multicast_domain``,
+  ``count_multicast_groups``) and one write proposal
+  (``propose_allocate_multicast_group`` — preview includes the
+  collision conformity result so the assistant warns about
+  duplicates before the operator clicks Apply). Default-enabled
+  per the MCP-coverage-for-new-features non-negotiable.
+- **Close-out: IGMP reaper (Phase 4).** Stale Active-Listener
+  entries (last-heard > 30 min) drop out via a per-evaluator
+  sweep, so the dashboard reflects current state instead of
+  growing forever. Configurable window in
+  ``multicast.listener_staleness_minutes``.
+- **Page rework: merged groups + domains into one tabbed page.**
+  Two-page UX was thrash; merged into a single ``/ipam/multicast``
+  with Groups / Domains / Listeners sub-tabs (same pattern as
+  Network and Compliance).
+
+### Added — DNS Import (\#128)
+
+- **import_source + imported_at provenance (Phase 1 Wave 1).** Every
+  ``dns_zone`` and ``dns_record`` gains ``import_source``
+  (free-form string, e.g. ``"bind9-zonefile"`` /
+  ``"windows-dns:dc1.contoso.local"``) and ``imported_at``
+  (timestamptz). Lets the operator (and audit) tell apart
+  operator-created records from imported ones, and answer
+  questions like "which zone came from which migration source?"
+- **``dns.import`` feature module.** Gated by the new
+  ``ModuleSpec(id="dns.import", default_enabled=False)`` —
+  appears as a togglable Feature in Settings → Features &
+  Integrations. Off by default since most ops never import; on,
+  it unlocks the import admin page + the import endpoints.
+- **BIND9 archive parser + canonical IR (Phase 1 Wave 2).** Pure-
+  Python parser walks a BIND9 zonefile (or a tarball /
+  ``named.conf``-style index) and renders every zone + record
+  into a canonical intermediate representation. Handles ``$TTL``,
+  ``$ORIGIN``, ``$INCLUDE``, IDN labels, every common record
+  type. Refuses unsigned-DNSSEC data with a clear error.
+- **``/dns/import/bind9/preview`` + ``/dns/import/bind9/commit``
+  endpoints (Phase 1 Wave 3).** Two-phase apply: preview returns
+  the IR + a per-zone diff against existing zones (would-add /
+  would-update / would-skip-collision counts) without touching
+  the DB; commit applies it inside a single transaction with
+  ``on_collision: skip|update|abort`` per-zone policy. Audit
+  rows tag every imported entity with the source archive's
+  filename + checksum.
+- **DNS Import admin page (Phase 1 Wave 4).** New
+  ``/admin/dns-import`` route with three tabs:
+  BIND9 / Windows DNS / Other (placeholder for future ISC + Knot
+  importers). BIND9 tab is fully wired — upload, preview, commit.
+  Per-row "Cancel zone" affordance on the preview table for
+  operators who want to skip just one of N zones from a big
+  zonefile.
+- **Windows DNS live-pull importer (Phase 2).** ``/dns/import/
+  windows-dns/{preview,commit}`` endpoints + frontend hook. Uses
+  the existing Windows DNS WinRM driver to enumerate zones via
+  ``Get-DnsServerZone`` + records via ``Get-DnsServerResourceRecord``,
+  flattens the PowerShell shape into the same canonical IR, and
+  runs through the same commit path. Operator picks a Windows DNS
+  server from the existing server-group surface; no new credential
+  storage needed.
+- **BIND9 import tests + lint pass.** Backend coverage on the
+  parser corpus + a CI lint pass.
+
+### Added — DEMO_MODE + Codespaces public demo
+
+- **``DEMO_MODE`` server-side lockdown.** New ``settings.demo_mode``
+  flag (env-driven) — when on, the api refuses every "abusable"
+  mutation: nmap scan creation, AI provider creates / chats,
+  outbound webhook subscriptions, integration target creates (every
+  read-only mirror — Kubernetes / Docker / Proxmox / Tailscale /
+  UniFi), audit-forward target creates, SMTP / backup target
+  creates, factory reset, password change. IPAM / DNS / DHCP CRUD
+  on the seeded data stays open so visitors can poke at the
+  product. Refusals 403 with a structured ``DEMO_MODE_ENABLED`` body
+  so a frontend tooltip can explain the block.
+- **GitHub Codespaces demo.** ``.devcontainer/`` + a Codespaces
+  launch badge in the README. One click brings up a full
+  SpatiumDDI stack on a fresh Codespace: builds images from
+  ``main``, runs migrations, seeds a realistic IPAM / DNS / DHCP /
+  network-modeling dataset so every screen has something to look
+  at, lands the operator on the dashboard signed in as
+  ``admin / admin``. Cold-start ~5-8 min on a 4-core Codespace;
+  free-tier hours come from the visitor's own GitHub account.
+
+### Added — SpatiumDDI OS Appliance (\#134)
+
+This release lands Phases 1 / 2 / 3 / 4 (a-g) / 6 in one cut. The
+appliance is alpha-ready: bootable ISO, web-managed lifecycle,
+distributed-role-split installer.
+
+- **Phase 1 — Debian 13 qcow2 + builder container.** ``make
+  appliance`` produces a self-contained Debian-trixie qcow2 with
+  the full SpatiumDDI stack pre-installed. Builder runs in a
+  published ghcr.io container so the only host requirement is
+  Docker. Hybrid BIOS + UEFI grub. Includes ``cloud-init`` +
+  ``cloud-initramfs-growroot`` (so the root partition expands to
+  fill the host disk on first boot), ``chrony``, ``ssh``,
+  ``docker.io``, the bundled DNS/DHCP agents, ``qemu-guest-agent``
+  + ``open-vm-tools`` (for graceful shutdown + IP reporting on
+  any major hypervisor), ``nftables`` default-deny inbound
+  firewall, ``unattended-upgrades`` (security pocket only),
+  persistent ``systemd-journald`` + ``logrotate``, a first-boot
+  2 GiB swapfile, ``NOTICE`` / ``LICENSES``, custom ``/etc/issue``
+  banner with the appliance's IP + URL.
+- **Phase 2 — hybrid USB/CD live ISO via xorriso.** ``make
+  appliance-iso`` wraps the qcow2 into a 437 MB hybrid ISO that
+  boots three ways: BIOS-CD, UEFI-CD, USB-dd. Uses
+  ``grub-mkrescue`` for the tri-mode hybrid; ``live-boot`` /
+  ``live-config`` / ``live-tools`` packages installed so the same
+  initrd boots both disk-installed and from the ISO. Initrd
+  regenerated via chroot in ``wrap-iso.sh`` so the live-boot
+  scripts are actually active. ``live-tools`` divert of
+  ``update-initramfs`` undone properly during the installer step.
+- **Phase 3 — Proxmox-style installer wizard.** Boot the live ISO
+  → drops to whiptail wizard on tty1. Walks through five questions
+  (target disk, hostname, admin user + password, network DHCP/
+  static, timezone) plus the Phase 6 role question; partitions GPT
+  (1 MiB BIOS Boot Partition + 512 MiB ESP + ext4 root); rsyncs
+  the live rootfs onto the target; copies the live kernel into
+  ``/boot``; regenerates the initrd inside a chroot; writes
+  ``/boot/grub/grub.cfg`` directly (bypassing ``update-grub``'s
+  chroot-confused ``grub-probe``); installs GRUB for both
+  i386-pc (BIOS) and x86_64-efi (UEFI ``--removable``); injects
+  the operator's answers; ejects the install media (best-effort
+  ATA EJECT) + reboots. Drop-to-shell ``on_failure`` handler
+  prints the install log + the SSH credentials for live-ISO log
+  capture before handing the operator a root prompt.
+- **Phase 4a — Visibility gating + management hub frame.**
+  ``settings.appliance_mode`` env flag + ``/api/v1/version``
+  fields (``appliance_mode``, ``appliance_version``,
+  ``appliance_hostname``) so the frontend can gate the
+  "Appliance" sidebar entry before login. New ``appliance``
+  permission family + "Appliance Operator" built-in role. New
+  ``/appliance`` route with tabbed hub for the sub-phases.
+- **Phase 4b — TLS / certificates.**
+  - 4b.1 cert storage model + upload / list / activate / delete
+    (Fernet-encrypted private key at rest, one-active-at-a-time
+    invariant in a single transaction, audit on every mutation).
+  - 4b.2 nginx HTTPS deployment — appliance frontend serves :443
+    with the active cert from a shared docker volume; :80 → 301
+    redirect with ``/.well-known/acme-challenge/*`` carve-out for
+    Phase 4b.4's Let's Encrypt; ``docker kill --signal=HUP`` on
+    the frontend container reloads nginx without dropping
+    in-flight connections.
+  - 4b.3 generate CSR on the server + accept signed cert
+    paste-back (RSA-2048/3072/4096 + EC P-256/P-384, full
+    subject + SANs); CSR-pending rows render with amber rings +
+    distinct affordances; mismatched cert returns 422.
+  - 4b.5 self-signed cert auto-generated on first boot when no
+    cert exists; SAN list pulls from the host's globally-scoped
+    IPs (not the docker bridge IP, which would mismatch every
+    browser warning).
+- **Phase 4c — SpatiumDDI release management.** ``/appliance/
+  releases`` page lists recent GitHub releases (60 s server-side
+  cached). One-click apply writes a host-side trigger file;
+  ``spatiumddi-update.path`` + ``.service`` units pick up the
+  trigger, run ``docker-compose pull && up -d`` so the api
+  recycles itself cleanly. UI tails the host-side update log on
+  3 s while an apply is in flight.
+- **Phase 4d — Container management.** ``/appliance`` Containers
+  tab lists every spatium container with health + state, lets
+  the operator start / stop / restart spatium-prefixed containers,
+  and streams logs over SSE (fetch + reader, token auth — works
+  through nginx without a separate websocket).
+- **Phase 4e — Logs + diagnostics.** Host log viewer (reads from
+  the bind-mounted firstboot.log / update.log), self-test runner
+  (DNS resolution / every spatium container healthy / internal
+  API health / DHCP daemon / DNS daemon), one-click diagnostic
+  bundle download — zip with redacted env + container logs +
+  system info.
+- **Phase 4f — Network/host info + maintenance + reboot.** Read-
+  only system info card (hostname / host IPs / uptime / version /
+  reboot-pending), maintenance-mode flag (file-backed; global
+  amber banner above the header on every page until disabled),
+  host reboot via the same systemd Path-unit pattern as 4c (10 s
+  grace so the 202 reaches the browser before the box goes
+  down). Hostname rename / static-IP toggle / nftables editor /
+  SSH key upload deferred behind a host-side writer service.
+- **Phase 4g — Web first-boot wizard + recovery banner.** Single-
+  page checklist at ``/appliance/setup`` with file-backed
+  completion flag; amber ``SetupBanner`` above the header until
+  the operator hits "Finish setup".
+- **Phase 6 — Role-split single ISO (five roles).** Installer
+  wizard adds a Role radio: ``control`` (all-in-one default with
+  bundled BIND9 + Kea) / ``control-only`` (control plane without
+  bundled agents — for distributed deployments) /
+  ``dns-agent-bind9`` / ``dns-agent-powerdns`` / ``dhcp-agent``.
+  For agent roles, the wizard collects ``CONTROL_PLANE_URL``,
+  agent key, and target agent group; firstboot wires the right
+  ``COMPOSE_PROFILES`` and writes the per-role env. Control-plane
+  services (postgres / redis / migrate / api / worker / beat /
+  frontend) all gain ``profiles: ["control"]`` so they don't run
+  on agent appliances; new ``agent-landing`` ``nginx:alpine``
+  service serves a templated static status page on agent roles
+  (role / hostname / control-plane URL / version).
+- **Agent bootstrap key reveal in Settings.** New
+  Settings → Security → "Agent bootstrap keys" section. Password-
+  confirm + local-auth-only gate (external-auth admins get a
+  clear "log in as a local admin" 403). Reveals DNS_AGENT_KEY +
+  DHCP_AGENT_KEY (with show/hide + copy buttons) so operators
+  can hand them to agent installs across every topology
+  (appliance role-split installer, docker-compose, Helm, bare
+  metal). Both successful + denied reveals audited.
+- **DNS/DHCP servers show source IP.** New ``last_seen_ip``
+  column on ``dns_server`` + ``dhcp_server``, populated from
+  ``request.client.host`` on every agent heartbeat. Surfaces as
+  a chip next to the operator-set host name on the Servers tab
+  cards so operators can identify which physical machine an
+  agent is on in NAT / distributed deployments — the operator-set
+  host field is just a label.
+- **README + Project Status updates.** Appliance moves from
+  "roadmap" to "🔄 Alpha" everywhere it's mentioned (deployment
+  table, project status row, full-feature detail, docs index,
+  table-of-contents).
+
+### Changed
+
+- **DNS server-group detail page — Servers tab first.** The
+  group detail view defaulted to the Zones tab; reordered so
+  Servers is the first tab and the URL-fallback default. Matches
+  the DHCP group detail page; operators land on the servers list
+  (more frequently edited than zones for ops work) when they
+  open a group.
+
+### Security
+
+- **CodeQL alerts \#1 and \#2 closed.** Two long-open static-
+  analysis findings cleared: a TLS pinning gap on the SNMP /
+  WinRM client path (server-cert verification was off in
+  contexts where pinning was always intended), and a BGP
+  community-import error-message sanitisation pass (operator-
+  supplied input was reaching the error string verbatim,
+  enabling a stored-XSS surface in the audit-log viewer
+  rendering). Both flagged by GitHub's CodeQL workflow; both
+  closed in this drop.
+- **pdns_parser separator regex ReDoS.** The PowerDNS-config
+  parser's record-separator regex backtracked on certain
+  malformed input + degraded to quadratic time on big inputs.
+  Replaced the regex with a str-split + token-walk so worst-case
+  is linear. Lit up the same CodeQL alert as the BIND parser's
+  earlier ReDoS finding.
+- **Live-mode SSH only on the appliance live ISO.** The
+  installer's debug-SSH affordance (random root password,
+  visible on the console banner) only runs when
+  ``boot=live`` is in the kernel cmdline; the installed system's
+  ssh stays on the install-time admin user + the
+  ``PermitRootLogin no`` baseline.
+
+### Fixed
+
+- **BIND9 query logs end-to-end + CHAOS-class noise filter.**
+  The bind9-driver query-log shipper was double-quoting + missing
+  the CHAOS-class filter, so the Logs tab was showing the agent's
+  own ``version.bind`` probe spam every 30 s. Closed both.
+- **/logs — reorder tabs, add Event Log empty state.** Tab order
+  matched a stale design; reordered + added an empty-state card
+  for the Event Log tab so first-time operators see a hint
+  instead of a blank table.
+- **Hide all Ask AI affordances when no provider configured.**
+  Page-level "Ask AI" buttons were visible even when zero AI
+  providers were enabled, leading to confusing "no provider"
+  errors. Gated on the AI providers list being non-empty.
+- **UI three UX fixes.** UniFi added to README, Features sidebar
+  rename, ConfirmModal pattern applied everywhere (replacing the
+  last few raw ``window.confirm`` calls).
+- **HTTP_PORT default flipped to 8077** in environment + compose
+  files. 80 was colliding with random other services on
+  developer laptops; 8077 has no IANA collision + matches the
+  docs.
+- **Alerts evaluator: silence audit_chain_broken spam.** The
+  evaluator was emitting "audit chain broken" warnings every
+  60 s on a healthy install. Closed the false-positive path.
+
+### Migrations
+
+(See bullets earlier — eight new migrations land in this release.)
 
 ---
 

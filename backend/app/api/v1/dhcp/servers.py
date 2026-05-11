@@ -119,6 +119,7 @@ class ServerResponse(BaseModel):
     agent_registered: bool
     agent_approved: bool
     agent_last_seen: datetime | None
+    last_seen_ip: str | None
     agent_version: str | None
     config_etag: str | None
     config_pushed_at: datetime | None
@@ -159,6 +160,7 @@ class ServerResponse(BaseModel):
             # create-path auto-approve landed).
             agent_approved=True if agentless else s.agent_approved,
             agent_last_seen=s.agent_last_seen,
+            last_seen_ip=s.last_seen_ip,
             agent_version=s.agent_version,
             config_etag=s.config_etag,
             config_pushed_at=s.config_pushed_at,

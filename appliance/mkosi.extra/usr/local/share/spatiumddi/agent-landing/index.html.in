@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>SpatiumDDI __ROLE_LABEL__ agent</title>
+<style>
+  :root { color-scheme: dark light; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, "Segoe UI", system-ui, sans-serif;
+    background: #0f172a;
+    color: #e2e8f0;
+    min-height: 100vh;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 2rem 1rem;
+  }
+  .card {
+    max-width: 640px;
+    width: 100%;
+    background: #1e293b;
+    border: 1px solid #334155;
+    border-radius: 0.75rem;
+    padding: 1.75rem;
+    box-shadow: 0 10px 30px rgba(0,0,0,0.35);
+  }
+  h1 {
+    margin: 0 0 0.25rem 0;
+    font-size: 1.25rem;
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+  }
+  h1 .dot {
+    width: 0.625rem;
+    height: 0.625rem;
+    border-radius: 999px;
+    background: #10b981;
+  }
+  .subtitle {
+    color: #94a3b8;
+    font-size: 0.875rem;
+    margin: 0 0 1.5rem 0;
+  }
+  dl {
+    margin: 0;
+    display: grid;
+    grid-template-columns: max-content 1fr;
+    gap: 0.5rem 1rem;
+    font-size: 0.875rem;
+  }
+  dt {
+    color: #94a3b8;
+    font-weight: 500;
+    text-transform: uppercase;
+    font-size: 0.75rem;
+    letter-spacing: 0.02em;
+    align-self: center;
+  }
+  dd {
+    margin: 0;
+    font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    word-break: break-all;
+  }
+  .note {
+    margin: 1.5rem 0 0 0;
+    padding: 1rem;
+    background: #0f172a;
+    border-left: 3px solid #38bdf8;
+    border-radius: 0.25rem;
+    font-size: 0.8125rem;
+    color: #cbd5e1;
+    line-height: 1.5;
+  }
+  .note code {
+    color: #fbbf24;
+  }
+  a { color: #60a5fa; }
+</style>
+</head>
+<body>
+<main class="card">
+  <h1><span class="dot"></span>SpatiumDDI __ROLE_LABEL__ agent</h1>
+  <p class="subtitle">
+    This appliance is a distributed agent — it registers against a
+    remote control plane. There's no web UI here; this is just a
+    confirmation page that the box is up and which control plane it
+    points at.
+  </p>
+  <dl>
+    <dt>Role</dt>          <dd>__ROLE__</dd>
+    <dt>Hostname</dt>      <dd>__HOSTNAME__</dd>
+    <dt>Control plane</dt> <dd><a href="__CONTROL_PLANE_URL__">__CONTROL_PLANE_URL__</a></dd>
+    <dt>Version</dt>       <dd>__APPLIANCE_VERSION__</dd>
+  </dl>
+  <p class="note">
+    To check live agent state — heartbeat status, last config push,
+    cached JWT validity — SSH in as the OS admin user you created at
+    install and run <code>docker logs spatiumddi-__ROLE_SHORT__-1</code>.
+    For the full SpatiumDDI UI, browse to the control plane URL above.
+  </p>
+</main>
+</body>
+</html>

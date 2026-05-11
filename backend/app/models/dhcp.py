@@ -125,6 +125,10 @@ class DHCPServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     agent_registered: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     agent_token_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
     agent_last_seen: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Source IP of the most recent agent heartbeat — operator-visible
+    # to identify which host runs each agent in NAT / distributed
+    # deployments. See dns_server.last_seen_ip for the same field.
+    last_seen_ip: Mapped[str | None] = mapped_column(String(45), nullable=True)
     agent_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
     agent_approved: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     agent_fingerprint: Mapped[str | None] = mapped_column(String(128), nullable=True)

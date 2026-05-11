@@ -45,3 +45,10 @@ charts/**/Chart.lock
 Thumbs.db
 .claude/
 scripts/take_screenshots.py
+
+# Appliance — mkosi build outputs + locally-baked image tarballs.
+# The tarballs are large (~300 MB compressed for api+frontend) and
+# only meaningful as build inputs to the next mkosi run, so they
+# don't belong in git history.
+appliance/build/
+appliance/mkosi.extra/usr/local/share/spatiumddi/images/

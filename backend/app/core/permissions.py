@@ -48,6 +48,20 @@ _ADMIN_IMPLIES = frozenset({"read", "write", "delete", "admin"})
 # role grants ``admin`` on this type; superadmin always bypasses.
 RESOURCE_TYPE_VRF = "vrf"
 
+# Appliance management surface (issue #134, Phase 4). Every
+# /api/v1/appliance/* router gates on ``read`` or ``admin`` against
+# this resource_type. The "Appliance Operator" builtin role grants
+# ``admin``; the read-only "Appliance Viewer" role can be added later
+# if a NOC team wants visibility without lifecycle control.
+#
+# Note: the gate is independent from ``settings.appliance_mode``.
+# appliance_mode is a deployment-time flag (is the API running on
+# the SpatiumDDI OS appliance?); the permission is an authorization
+# flag (does THIS user get to drive it?). The router stays mounted
+# either way; on a non-appliance deploy every endpoint will 404 or
+# return empty data because the underlying OS surfaces aren't there.
+RESOURCE_TYPE_APPLIANCE = "appliance"
+
 
 def _action_matches(granted: str, requested: str) -> bool:
     """Return True if a granted `action` string covers the requested action."""

@@ -1,0 +1,51 @@
+[Unit]
+Description=SpatiumDDI installer wizard (runs when boot cmdline has spatium-mode=install)
+ConditionKernelCommandLine=spatium-mode=install
+# NOTE: do NOT use `Conflicts=getty@tty1.service` here. systemd
+# evaluates Conflicts= at unit-load time even when the unit's
+# ConditionKernelCommandLine prevents activation — so on the
+# *installed* system (no spatium-mode= flag), getty@tty1 ends up
+# in ConflictedBy with this unit and never auto-starts.
+#
+# Gate is on getty@tty1 itself via a drop-in:
+#   /etc/systemd/system/getty@tty1.service.d/spatium-mode-skip.conf
+# That drop-in skips agetty when spatium-mode={install,live} is in
+# the cmdline, so on the live ISO getty@tty1 never starts (no race,
+# no autologin flash) and on the installed system it auto-starts
+# as Debian intended.
+#
+# The ExecStartPre stop below is belt-and-braces in case anything
+# else (live-config hooks, manual `systemctl start`) tries to fire
+# agetty on tty1 while the wizard owns it.
+After=getty@tty1.service systemd-user-sessions.service plymouth-quit.service
+After=systemd-networkd.service
+
+[Service]
+Type=idle
+ExecStartPre=-/usr/bin/systemctl stop getty@tty1.service
+# bash -x forces the trace flag from line 1, so any bail in the
+# pre-set-x setup block (lines 19-50 in the script) writes trace
+# lines to stderr (tty1) before the on_failure handler kicks in.
+# Once the script reaches `exec 19> $TRACE_LOG; export BASH_XTRACEFD=19`
+# (line 41/49), subsequent trace output is captured to the trace log
+# instead. Belt-and-braces diagnostic — set -x at line 51 still
+# enables locally too, so removing `-x` here is harmless.
+ExecStart=/bin/bash -x /usr/local/bin/spatium-install
+StandardInput=tty
+StandardOutput=tty
+StandardError=tty
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=yes
+KillMode=process
+IgnoreSIGPIPE=no
+SendSIGHUP=yes
+# DO NOT auto-restart. The wizard handles its own failure path
+# (drops to shell with an error). Restarting would loop the
+# operator back to question 1, which is what they hit before
+# the kernel-console-spam fix landed.
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

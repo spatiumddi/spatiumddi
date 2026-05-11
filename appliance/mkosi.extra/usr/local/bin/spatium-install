@@ -1,0 +1,909 @@
+#!/bin/bash
+# spatium-install — Proxmox-style installer wizard for the
+# SpatiumDDI appliance.
+#
+# Asks the operator for target disk, hostname, admin user/password,
+# network (DHCP or static), and timezone; then partitions the disk
+# (GPT: 512 MiB ESP + rest root), rsyncs the live rootfs onto it,
+# regenerates the initrd for disk boot, installs grub for both BIOS
+# and UEFI, injects the answers, and reboots.
+#
+# Runs automatically on boot when `spatium-mode=install` is in the
+# kernel cmdline (set by the "Install SpatiumDDI to disk" GRUB
+# entry). Also available as a CLI tool from the live shell.
+
+# Bulletproof launch log — first thing we do, BEFORE any set/trap/
+# redirect setup or even nounset. If /var/log/spatium-install-launch.log
+# is empty after a failure, bash did not parse the script at all
+# (interpreter issue, shebang corruption, etc.). If it has at least
+# one LAUNCH entry, we know the script body started executing and
+# can compare timestamps against journalctl + the install / trace
+# logs to pinpoint the bail.
+#
+# Uses only shell builtins + utilities present in every Debian
+# rootfs (date, tty, id, cat, command, ls) so the logger itself
+# can't fail in a way the diagnostic forgets to record.
+{
+    printf '[%s] LAUNCH\n'      "$(date -Iseconds 2>/dev/null || echo '?')"
+    printf '  pid=%s ppid=%s\n' "$$" "$PPID"
+    printf '  tty=%s\n'         "$(tty 2>/dev/null || echo '?')"
+    printf '  uid=%s\n'         "$(id -u 2>/dev/null || echo '?')"
+    printf '  bash=%s\n'        "${BASH_VERSION:-?}"
+    printf '  pwd=%s\n'         "$(pwd 2>/dev/null || echo '?')"
+    printf '  cmdline=%s\n'     "$(tr '\n' ' ' </proc/cmdline 2>/dev/null)"
+    printf '  whiptail=%s\n'    "$(command -v whiptail 2>/dev/null || echo MISSING)"
+    printf '  sgdisk=%s\n'      "$(command -v sgdisk 2>/dev/null || echo MISSING)"
+    printf '  rsync=%s\n'       "$(command -v rsync 2>/dev/null || echo MISSING)"
+    printf '  varlog=%s\n'      "$(ls -ld /var/log 2>&1)"
+    printf -- '----\n'
+} >> /var/log/spatium-install-launch.log 2>&1 || true
+
+# pipefail + nounset for the wizard, but NOT -e: whiptail returns
+# non-zero on Cancel/Esc and we want to handle that explicitly with
+# on_cancel rather than crashing the script. -e is re-enabled inside
+# do_install where we DO want any partition / rsync / chroot failure
+# to abort.
+set -uo pipefail
+
+BACKTITLE="SpatiumDDI Appliance Installer 0.1.0"
+INSTALL_LOG=/var/log/spatium-install.log
+MOUNT=/mnt/target
+
+mkdir -p /var/log
+: > "$INSTALL_LOG"
+# Log to file only — NOT stdout. The do_install brace group below
+# pipes stdout to whiptail's --gauge protocol parser, which expects
+# only "XXX" / percentage / prompt-text lines. If log() tee'd to
+# stdout it would inject timestamped lines into the gauge stream
+# between XXX blocks and break the prompt update protocol — that's
+# exactly the "progress text never changes" symptom we hit.
+log() { echo "[$(date -Iseconds)] $*" >> "$INSTALL_LOG"; }
+
+# Full bash trace to a separate file — when the wizard bails
+# unexpectedly, this captures every command + variable expansion so
+# we can pinpoint the exact line. Doesn't pollute the user-facing
+# install log.
+TRACE_LOG=/var/log/spatium-install-trace.log
+: > "$TRACE_LOG"
+exec 19> "$TRACE_LOG"
+# Export so the gauge subshell pipeline below inherits the same
+# trace fd. Without export, the subshell's BASH_XTRACEFD defaults
+# to stderr — and the install pipeline pipes stdout to whiptail
+# while stderr is the terminal, so every traced command writes
+# garbage to the same TTY whiptail is trying to redraw. Result:
+# whiptail's progress dialog never updates because its display
+# fights with set -x output.
+export BASH_XTRACEFD=19
+PS4='+ ${BASH_SOURCE##*/}:${LINENO}: ${FUNCNAME[0]:-main}() '
+set -x
+
+log "===== spatium-install wizard started at $(date -Iseconds) ====="
+
+on_cancel() {
+    set +x
+    clear
+    cat <<EOF
+
+Installation cancelled at: $1
+
+Run 'spatium-install' to start the wizard again,
+or 'reboot' to leave the live ISO and try a different boot path.
+
+EOF
+    log "Wizard cancelled at: $1"
+    exec /bin/bash --login
+}
+
+# Wizard state — all set by the prompt functions below.
+TARGET_DISK=""
+HOSTNAME=""
+ADMIN_USER="admin"
+ADMIN_PASSWORD=""
+NET_MODE="dhcp"
+NET_INTERFACE=""
+NET_IP=""
+NET_PREFIX="24"
+NET_GATEWAY=""
+NET_DNS="1.1.1.1 1.0.0.1"
+TIMEZONE="UTC"
+# Role-split appliance (Phase 6, issue #134). One of:
+#   control     — full SpatiumDDI stack (api + worker + beat + db
+#                 + redis + frontend + bundled DNS/DHCP agents).
+#   dns-agent   — BIND9 agent only; needs to register with a
+#                 remote control plane via CONTROL_PLANE_URL +
+#                 DNS_AGENT_KEY. Minimal HTTPS landing page.
+#   dhcp-agent  — Kea agent only; same shape as dns-agent but with
+#                 DHCP_AGENT_KEY.
+# Every role still creates an OS admin account so the operator can
+# SSH in and manage the appliance, irrespective of which web UI runs.
+ROLE="control"
+CONTROL_PLANE_URL=""
+DNS_AGENT_KEY=""
+DHCP_AGENT_KEY=""
+# Agent group on the control plane this appliance joins. Auto-
+# created on first registration if it doesn't exist. Operators
+# managing multiple sites (us-east-dns / eu-prod-dhcp / lab-dns)
+# pick a group name at install time; the value drives which
+# zones / scopes get pushed to this agent.
+AGENT_GROUP=""
+
+# ── Prompts ───────────────────────────────────────────────────────────────────
+
+welcome() {
+    log "Step: welcome"
+    whiptail --backtitle "$BACKTITLE" --title "Welcome" \
+        --msgbox "Welcome to the SpatiumDDI Appliance Installer.\n\n\
+This installer will ERASE a target disk and install SpatiumDDI to it.\n\n\
+You'll be asked for:\n\
+  - Role (full control plane, or DNS / DHCP agent)\n\
+  - Target disk\n\
+  - Hostname\n\
+  - Admin OS user + password (for SSH access)\n\
+  - Network (DHCP or static)\n\
+  - Timezone\n\n\
+Press OK to begin, or Cancel to drop to a shell." 18 70 \
+        || on_cancel "welcome"
+}
+
+ask_role() {
+    log "Step: ask_role"
+    # whiptail --radiolist returns the selected tag on stdout. The third
+    # column is the initial-selection flag (ON for control, OFF for the
+    # others). Five roles:
+    #   control              — control plane + bundled BIND9 + Kea
+    #                          (single-box AIO; default).
+    #   control-only         — control plane only, no bundled agents.
+    #                          Agent keys are still generated so the
+    #                          operator can register external agents
+    #                          via the Settings reveal UI.
+    #   dns-agent-bind9      — BIND9 agent only; needs a remote control
+    #                          plane.
+    #   dns-agent-powerdns   — PowerDNS agent only; needs a remote
+    #                          control plane. Group features differ
+    #                          (DNSSEC sign/unsign, ALIAS, LUA, catalog
+    #                          zones gate on the powerdns driver).
+    #   dhcp-agent           — Kea agent only; needs a remote control
+    #                          plane.
+    ROLE=$(whiptail --backtitle "$BACKTITLE" --title "Appliance role" \
+        --radiolist "What role does this appliance play?\n\nAll-in-one runs everything on one box (default — good for labs / small sites). Control-plane-only suits distributed deployments where DNS and DHCP live closer to the clients they serve as separate agent appliances.\n\nDNS-agent (BIND9) is the universal default. DNS-agent (PowerDNS) is the alternative engine — group features like DNSSEC sign/unsign + ALIAS + LUA + catalog zones gate on every server in a group running powerdns." \
+        24 80 5 \
+        "control"             "Control plane + bundled BIND9 + Kea (all-in-one)" ON \
+        "control-only"        "Control plane only (no bundled agents)"           OFF \
+        "dns-agent-bind9"     "DNS agent — BIND9 + agent process"                OFF \
+        "dns-agent-powerdns"  "DNS agent — PowerDNS + agent process"             OFF \
+        "dhcp-agent"          "DHCP agent — Kea + agent process"                 OFF \
+        3>&1 1>&2 2>&3) \
+        || on_cancel "role selection"
+    log "Selected role: $ROLE"
+}
+
+ask_agent_config() {
+    # Only fires for agent roles (dns-agent / dhcp-agent). The control
+    # and control-only roles ARE the control plane — they don't need
+    # to be told where one is.
+    case "$ROLE" in
+        control|control-only) return 0 ;;
+    esac
+    log "Step: ask_agent_config (role=$ROLE)"
+
+    CONTROL_PLANE_URL=$(whiptail --backtitle "$BACKTITLE" \
+        --title "Control plane URL" \
+        --inputbox "Where does this agent register?\n\nFormat: https://<control-plane-host>/  — the URL of the SpatiumDDI control plane this agent connects to. The agent posts heartbeats + long-polls /config from here.\n\nUse https:// in production; http:// is acceptable for lab installs but the agent key crosses the wire in clear." \
+        14 72 "https://" 3>&1 1>&2 2>&3) \
+        || on_cancel "control-plane URL"
+    if [ -z "$CONTROL_PLANE_URL" ] || [ "$CONTROL_PLANE_URL" = "https://" ]; then
+        whiptail --msgbox "Control-plane URL is required for agent installs." 8 60 || true
+        ask_agent_config
+        return
+    fi
+
+    local key_label is_dns
+    case "$ROLE" in
+        dns-agent-bind9|dns-agent-powerdns)
+            key_label="DNS agent key"
+            is_dns=1
+            ;;
+        dhcp-agent)
+            key_label="DHCP agent key"
+            is_dns=0
+            ;;
+    esac
+    local key_val
+    key_val=$(whiptail --backtitle "$BACKTITLE" --title "$key_label" \
+        --inputbox "Pre-shared $key_label for first-boot registration.\n\nReveal it on the control plane: Settings -> Security -> Agent bootstrap keys -> type your password -> Reveal keys.\n\nThe agent exchanges this key for a rotating JWT on first contact + caches the JWT under /var/lib/spatium-{dns,dhcp}-agent/ for subsequent runs." \
+        16 78 "" 3>&1 1>&2 2>&3) \
+        || on_cancel "agent key"
+    if [ -z "$key_val" ]; then
+        whiptail --msgbox "$key_label is required for agent installs." 8 60 || true
+        ask_agent_config
+        return
+    fi
+    if [ "$is_dns" = 1 ]; then
+        DNS_AGENT_KEY="$key_val"
+    else
+        DHCP_AGENT_KEY="$key_val"
+    fi
+
+    # Per-role default group name. powerdns uses a separate default
+    # because group-level features gate on every server in a group
+    # running the same driver (mixing bind9 + powerdns in one group
+    # is invalid).
+    local default_group
+    case "$ROLE" in
+        dns-agent-powerdns) default_group="default-powerdns" ;;
+        *)                  default_group="default" ;;
+    esac
+    AGENT_GROUP=$(whiptail --backtitle "$BACKTITLE" --title "Agent group" \
+        --inputbox "Which group on the control plane should this agent join?\n\nEnter an existing group's name to register this agent into it. Type a new name to have the control plane auto-create the group on first registration.\n\nMultiple agents in the same group serve the same zones / scopes (DNS) or share lease state (DHCP HA pair). Leave the default for single-site deployments; pick a descriptive name for multi-site / multi-tenant ('us-east-dns', 'lab-dhcp', 'site-toronto')." \
+        16 76 "$default_group" 3>&1 1>&2 2>&3) \
+        || on_cancel "agent group"
+    AGENT_GROUP=$(echo "$AGENT_GROUP" | tr -d '[:space:]')
+    if [ -z "$AGENT_GROUP" ]; then
+        AGENT_GROUP="$default_group"
+    fi
+    log "Agent group: $AGENT_GROUP"
+}
+
+pick_disk() {
+    log "Step: pick_disk"
+    local options=()
+    local live_src
+    live_src=$(findmnt -no SOURCE /run/live/medium 2>/dev/null || \
+               findmnt -no SOURCE /lib/live/mount/medium 2>/dev/null || true)
+    # Strip partition suffix to compare against the disk node.
+    local live_disk
+    live_disk=$(lsblk -no PKNAME "$live_src" 2>/dev/null || true)
+    [ -n "$live_disk" ] && live_disk="/dev/$live_disk"
+
+    while IFS= read -r line; do
+        local name size model
+        name=$(echo "$line" | awk '{print $1}')
+        size=$(echo "$line" | awk '{print $2}')
+        model=$(echo "$line" | cut -d' ' -f3- | sed 's/  */ /g')
+        [ -z "$model" ] && model="(no model)"
+        # Skip the live medium itself.
+        [ "/dev/$name" = "$live_disk" ] && continue
+        options+=("/dev/$name" "$size - $model")
+    done < <(lsblk -dn -o NAME,SIZE,MODEL -r 2>/dev/null | grep -vE "^(sr|loop|fd|ram|zram)")
+
+    if [ ${#options[@]} -eq 0 ]; then
+        log "No installable disks found (lsblk: $(lsblk -dn -o NAME,SIZE,TYPE 2>&1 | tr '\n' ';'))"
+        whiptail --backtitle "$BACKTITLE" --title "No disks" \
+            --msgbox "No installable disks found.\n\nAttach a target disk to the VM and reboot." 10 60 \
+            || true
+        on_cancel "disk picker (no disks present)"
+    fi
+
+    TARGET_DISK=$(whiptail --backtitle "$BACKTITLE" --title "Target Disk" \
+        --menu "Select the disk to install SpatiumDDI to.\nALL DATA on the chosen disk will be DESTROYED." \
+        20 70 10 "${options[@]}" 3>&1 1>&2 2>&3) \
+        || on_cancel "target disk"
+}
+
+ask_hostname() {
+    log "Step: ask_hostname"
+    # No pre-filled default — multiple appliances on the same network
+    # all named "spatiumddi" caused real-world server-name collisions
+    # (the agent registers its SERVER_NAME with the control plane;
+    # two agents on the same name conflict). Require operator input.
+    while true; do
+        HOSTNAME=$(whiptail --backtitle "$BACKTITLE" --title "Hostname" \
+            --inputbox "System hostname (also used as the SERVER_NAME this appliance registers under for DNS / DHCP agent roles, and shown in shell prompts + audit logs).\n\nGive each appliance a unique name (e.g. dns-east-1, dhcp-prod-a, ddi-control)." \
+            14 72 "$HOSTNAME" 3>&1 1>&2 2>&3) \
+            || on_cancel "hostname"
+        HOSTNAME=$(echo "$HOSTNAME" | tr -d '[:space:]')
+        if [ -z "$HOSTNAME" ]; then
+            whiptail --msgbox "Hostname is required. Pick something descriptive for this appliance — it shouldn't collide with any other SpatiumDDI box." 9 60 || true
+            continue
+        fi
+        # Loose RFC 1123 sanity: lower-case alphanum + hyphen, no
+        # leading / trailing hyphen, length <= 63. Reject anything
+        # that systemd-hostnamed would later refuse silently.
+        case "$HOSTNAME" in
+            *[!a-zA-Z0-9-]*|-*|*-)
+                whiptail --msgbox "Hostname must be alphanumeric + hyphen, not start or end with a hyphen, and contain no spaces or dots. Try again." 10 64 || true
+                continue
+                ;;
+        esac
+        if [ "${#HOSTNAME}" -gt 63 ]; then
+            whiptail --msgbox "Hostname must be 63 characters or fewer." 8 60 || true
+            continue
+        fi
+        break
+    done
+}
+
+ask_user_password() {
+    log "Step: ask_user_password"
+    ADMIN_USER=$(whiptail --backtitle "$BACKTITLE" --title "Admin OS user" \
+        --inputbox "OS-level admin username (for SSH + sudo).\n\nThe SpatiumDDI web UI uses 'admin/admin' separately - change it on first login." \
+        12 70 "$ADMIN_USER" 3>&1 1>&2 2>&3) \
+        || on_cancel "admin user"
+    [ -z "$ADMIN_USER" ] && ADMIN_USER="admin"
+
+    while true; do
+        local p1 p2
+        p1=$(whiptail --backtitle "$BACKTITLE" --title "Admin password" \
+            --passwordbox "Password for '$ADMIN_USER' (and root):" 10 60 \
+            3>&1 1>&2 2>&3) \
+            || on_cancel "password"
+        p2=$(whiptail --backtitle "$BACKTITLE" --title "Confirm password" \
+            --passwordbox "Repeat:" 10 60 3>&1 1>&2 2>&3) \
+            || on_cancel "password confirmation"
+        if [ "$p1" = "$p2" ] && [ -n "$p1" ]; then
+            ADMIN_PASSWORD="$p1"
+            break
+        fi
+        whiptail --backtitle "$BACKTITLE" \
+            --msgbox "Passwords don't match or are empty. Try again." 8 50 \
+            || true
+    done
+}
+
+ask_network() {
+    log "Step: ask_network"
+    NET_MODE=$(whiptail --backtitle "$BACKTITLE" --title "Network" \
+        --menu "How should the appliance configure its network?" 12 70 2 \
+        "dhcp"   "Automatic via DHCP (recommended for evaluation)" \
+        "static" "Static IP" \
+        3>&1 1>&2 2>&3) \
+        || on_cancel "network mode"
+
+    if [ "$NET_MODE" = "static" ]; then
+        local ifs=()
+        for iface in $(ls /sys/class/net 2>/dev/null | grep -E "^(en|eth)"); do
+            ifs+=("$iface" "$(cat /sys/class/net/$iface/address 2>/dev/null || echo "?")")
+        done
+        if [ ${#ifs[@]} -eq 0 ]; then
+            whiptail --msgbox "No ethernet interfaces found - falling back to DHCP." 8 60 || true
+            NET_MODE="dhcp"
+            return
+        fi
+        NET_INTERFACE=$(whiptail --backtitle "$BACKTITLE" --title "Static IP -interface" \
+            --menu "Pick an interface:" 12 60 5 "${ifs[@]}" 3>&1 1>&2 2>&3) \
+            || on_cancel "static interface"
+        NET_IP=$(whiptail --backtitle "$BACKTITLE" --title "Static IP -address" \
+            --inputbox "IPv4 address (e.g. 192.168.1.10):" 10 60 "" 3>&1 1>&2 2>&3) \
+            || on_cancel "static IP"
+        NET_PREFIX=$(whiptail --backtitle "$BACKTITLE" --title "Static IP -prefix" \
+            --inputbox "Prefix length:" 10 60 "$NET_PREFIX" 3>&1 1>&2 2>&3) \
+            || on_cancel "static prefix"
+        NET_GATEWAY=$(whiptail --backtitle "$BACKTITLE" --title "Static IP -gateway" \
+            --inputbox "Gateway:" 10 60 "" 3>&1 1>&2 2>&3) \
+            || on_cancel "static gateway"
+        NET_DNS=$(whiptail --backtitle "$BACKTITLE" --title "Static IP -DNS" \
+            --inputbox "DNS servers (space-separated):" 10 60 "$NET_DNS" 3>&1 1>&2 2>&3) \
+            || on_cancel "static DNS"
+    fi
+}
+
+ask_timezone() {
+    log "Step: ask_timezone"
+    TIMEZONE=$(whiptail --backtitle "$BACKTITLE" --title "Timezone" \
+        --inputbox "Timezone (IANA name, e.g. America/Toronto, Europe/Berlin, UTC):" \
+        10 70 "$TIMEZONE" 3>&1 1>&2 2>&3) \
+        || on_cancel "timezone"
+    [ -z "$TIMEZONE" ] && TIMEZONE="UTC"
+}
+
+confirm() {
+    log "Step: confirm"
+    local role_label
+    case "$ROLE" in
+        control)             role_label="Control plane + BIND9 + Kea (all-in-one)" ;;
+        control-only)        role_label="Control plane only (no bundled agents)" ;;
+        dns-agent-bind9)     role_label="DNS agent (BIND9)" ;;
+        dns-agent-powerdns)  role_label="DNS agent (PowerDNS)" ;;
+        dhcp-agent)          role_label="DHCP agent (Kea)" ;;
+        *)                   role_label="$ROLE" ;;
+    esac
+    local s
+    s="Role:        $role_label\n"
+    case "$ROLE" in
+        dns-agent-bind9|dns-agent-powerdns|dhcp-agent)
+            s+="Control URL: $CONTROL_PLANE_URL\n"
+            s+="Agent group: $AGENT_GROUP\n"
+            ;;
+    esac
+    s+="Target disk: $TARGET_DISK\n"
+    s+="Hostname:    $HOSTNAME\n"
+    s+="OS user:     $ADMIN_USER\n"
+    s+="Network:     $NET_MODE"
+    if [ "$NET_MODE" = "static" ]; then
+        s+=" ($NET_INTERFACE: $NET_IP/$NET_PREFIX via $NET_GATEWAY)"
+    fi
+    s+="\nTimezone:    $TIMEZONE\n\n"
+    s+="WARNING: $TARGET_DISK will be ERASED. There is no undo.\n\n"
+    s+="Proceed with installation?"
+    whiptail --backtitle "$BACKTITLE" --title "Confirm" \
+        --yesno "$s" 20 72 \
+        || on_cancel "final confirmation"
+}
+
+# ── Install ───────────────────────────────────────────────────────────────────
+
+partition_node() {
+    # Translate $TARGET_DISK + index → /dev/sdaN or /dev/nvme0n1pN
+    local idx="$1"
+    case "$TARGET_DISK" in
+        *nvme*|*mmcblk*) echo "${TARGET_DISK}p${idx}" ;;
+        *)               echo "${TARGET_DISK}${idx}"  ;;
+    esac
+}
+
+do_install() {
+    # Now we're past all the prompts — enable -e so any failure
+    # inside the partitioning / rsync / chroot block aborts cleanly
+    # and the EXIT trap drops the operator to a shell with the log.
+    set -e
+
+    # GPT layout: 1 MiB BIOS Boot Partition (type ef02) + 512 MiB
+    # EFI System Partition (ef00, FAT32) + rest ext4 root (8300).
+    # The BBP holds grub-i386-pc's core.img — without it
+    # grub-install fails on GPT disks with "no BIOS Boot Partition;
+    # embedding won't be possible". MBR boot record on GPT only
+    # has 446 bytes between the partition table and the protective
+    # MBR slot; grub stage-1 doesn't fit, hence the BBP.
+    local BBP ESP ROOT
+    BBP=$(partition_node 1)
+    ESP=$(partition_node 2)
+    ROOT=$(partition_node 3)
+
+    log "Install starting: target=$TARGET_DISK BBP=$BBP ESP=$ESP ROOT=$ROOT"
+
+    {
+        echo "XXX"; echo "3"; echo "Releasing existing partitions on $TARGET_DISK..."; echo "XXX"
+        # Pre-existing install on the target disk leaves partitions
+        # that the live system's systemd-gpt-auto-generator may have
+        # auto-mounted (ESP → /boot/efi, root → /sysroot) or that
+        # the kernel still holds open via stale device-mapper or
+        # swap entries. sgdisk -Z, mkfs.fat, and the subsequent
+        # mount all fail on a busy device, so unconditionally
+        # release everything before partitioning.
+        for part in $(lsblk -nr -o NAME "$TARGET_DISK" 2>/dev/null | tail -n +2); do
+            swapoff "/dev/$part" >> "$INSTALL_LOG" 2>&1 || true
+            umount "/dev/$part"  >> "$INSTALL_LOG" 2>&1 || true
+            umount -l "/dev/$part" >> "$INSTALL_LOG" 2>&1 || true
+        done
+        # device-mapper entries (LVM / dm-crypt) backed by this disk
+        if command -v dmsetup >/dev/null 2>&1; then
+            for dm in $(dmsetup ls --target linear 2>/dev/null | awk '{print $1}'); do
+                dmsetup remove "$dm" >> "$INSTALL_LOG" 2>&1 || true
+            done
+        fi
+
+        echo "XXX"; echo "5"; echo "Partitioning $TARGET_DISK..."; echo "XXX"
+        wipefs -af "$TARGET_DISK"           >> "$INSTALL_LOG" 2>&1
+        sgdisk -Z "$TARGET_DISK"            >> "$INSTALL_LOG" 2>&1
+        # Force the kernel to forget the old partition table before
+        # we lay down a new one. Without this, mkfs against the new
+        # partition nodes can race with udev rebuilding /dev/disk/.
+        blockdev --rereadpt "$TARGET_DISK"  >> "$INSTALL_LOG" 2>&1 || true
+        sgdisk -n1:0:+1M    -t1:ef02 -c1:bios_boot \
+               -n2:0:+512M  -t2:ef00 -c2:ESP \
+               -n3:0:0      -t3:8300 -c3:root \
+               "$TARGET_DISK"               >> "$INSTALL_LOG" 2>&1
+        partprobe "$TARGET_DISK"            >> "$INSTALL_LOG" 2>&1 || true
+        udevadm settle                      >> "$INSTALL_LOG" 2>&1 || true
+        sleep 1
+
+        echo "XXX"; echo "10"; echo "Formatting partitions..."; echo "XXX"
+        mkfs.fat -F32 -n ESP "$ESP"         >> "$INSTALL_LOG" 2>&1
+        mkfs.ext4 -F -L root "$ROOT"        >> "$INSTALL_LOG" 2>&1
+
+        echo "XXX"; echo "15"; echo "Mounting target..."; echo "XXX"
+        mkdir -p "$MOUNT"
+        mount "$ROOT" "$MOUNT"
+        mkdir -p "$MOUNT/boot/efi"
+        mount "$ESP" "$MOUNT/boot/efi"
+
+        echo "XXX"; echo "20"; echo "Copying root filesystem (3-5 min)..."; echo "XXX"
+        rsync -aAXH \
+            --exclude="/dev/*" \
+            --exclude="/proc/*" \
+            --exclude="/sys/*" \
+            --exclude="/tmp/*" \
+            --exclude="/run/*" \
+            --exclude="/mnt/*" \
+            --exclude="/media/*" \
+            --exclude="/lib/live" \
+            --exclude="/var/log/*" \
+            --exclude="/var/cache/apt/archives/*" \
+            --exclude="/var/lib/spatiumddi/firstboot.done" \
+            --exclude="/var/lib/spatiumddi/swapfile" \
+            --exclude="/etc/spatiumddi/.env" \
+            --exclude="/etc/ssh/sshd_config.d/00-spatium-live.conf" \
+            --exclude="/etc/issue.d/zz-spatium-live.issue" \
+            / "$MOUNT/" >> "$INSTALL_LOG" 2>&1
+
+        echo "XXX"; echo "65"; echo "Writing system config..."; echo "XXX"
+        echo "$HOSTNAME" > "$MOUNT/etc/hostname"
+        # Phase 6 — role config consumed by spatiumddi-firstboot to
+        # set COMPOSE_PROFILES + write CONTROL_PLANE_URL / agent keys
+        # to /etc/spatiumddi/.env. World-readable on the installed
+        # system (no secrets — the agent key only lives transiently
+        # here on the live ISO and gets moved into the 0600 .env at
+        # first boot).
+        mkdir -p "$MOUNT/etc/spatiumddi"
+        cat > "$MOUNT/etc/spatiumddi/role-config" <<EOF
+ROLE=$ROLE
+CONTROL_PLANE_URL=$CONTROL_PLANE_URL
+DNS_AGENT_KEY=$DNS_AGENT_KEY
+DHCP_AGENT_KEY=$DHCP_AGENT_KEY
+AGENT_GROUP=$AGENT_GROUP
+EOF
+        # Operator-supplied agent key is sensitive even before
+        # firstboot transcribes it into .env — restrict the
+        # role-config file to root.
+        chmod 0600 "$MOUNT/etc/spatiumddi/role-config"
+        cat > "$MOUNT/etc/hosts" <<EOF
+127.0.0.1 localhost
+127.0.1.1 $HOSTNAME
+::1 ip6-localhost ip6-loopback
+ff02::1 ip6-allnodes
+ff02::2 ip6-allrouters
+EOF
+
+        local ROOT_UUID ESP_UUID
+        ROOT_UUID=$(blkid -s UUID -o value "$ROOT")
+        ESP_UUID=$(blkid -s UUID -o value "$ESP")
+        cat > "$MOUNT/etc/fstab" <<EOF
+UUID=$ROOT_UUID  /          ext4  defaults                       0 1
+UUID=$ESP_UUID   /boot/efi  vfat  umask=0077,shortname=winnt     0 2
+EOF
+
+        # Timezone
+        if [ -e "/usr/share/zoneinfo/$TIMEZONE" ]; then
+            ln -sf "/usr/share/zoneinfo/$TIMEZONE" "$MOUNT/etc/localtime"
+            echo "$TIMEZONE" > "$MOUNT/etc/timezone"
+        else
+            log "WARN: timezone $TIMEZONE not found, defaulting to UTC"
+            ln -sf "/usr/share/zoneinfo/UTC" "$MOUNT/etc/localtime"
+            echo "UTC" > "$MOUNT/etc/timezone"
+        fi
+
+        # Static-IP override (DHCP is already covered by 20-dhcp-all.network)
+        if [ "$NET_MODE" = "static" ]; then
+            mkdir -p "$MOUNT/etc/systemd/network"
+            {
+                echo "[Match]"
+                echo "Name=$NET_INTERFACE"
+                echo
+                echo "[Network]"
+                echo "Address=$NET_IP/$NET_PREFIX"
+                echo "Gateway=$NET_GATEWAY"
+                for dns in $NET_DNS; do
+                    echo "DNS=$dns"
+                done
+            } > "$MOUNT/etc/systemd/network/10-spatium-static.network"
+            # Remove the wildcard DHCP so it doesn't race with our static.
+            rm -f "$MOUNT/etc/systemd/network/20-dhcp-all.network"
+        fi
+
+        echo "XXX"; echo "75"; echo "Creating admin user..."; echo "XXX"
+        # Bind /proc /sys /dev for chroot operations.
+        for d in proc sys dev; do
+            mount --bind "/$d" "$MOUNT/$d"
+        done
+
+        # User + password. -m creates home; -G adds to sudo + docker groups.
+        chroot "$MOUNT" useradd -m -G sudo,docker -s /bin/bash "$ADMIN_USER" \
+            >> "$INSTALL_LOG" 2>&1 || true
+        echo "$ADMIN_USER:$ADMIN_PASSWORD" | chroot "$MOUNT" chpasswd \
+            >> "$INSTALL_LOG" 2>&1
+        echo "root:$ADMIN_PASSWORD" | chroot "$MOUNT" chpasswd \
+            >> "$INSTALL_LOG" 2>&1
+
+        # Disable cloud-init on the installed system (we configured
+        # everything ourselves; cloud-init would just sit waiting for a
+        # datasource that isn't there).
+        chroot "$MOUNT" systemctl mask \
+            cloud-init.service cloud-init-local.service \
+            cloud-config.service cloud-final.service \
+            >> "$INSTALL_LOG" 2>&1 || true
+
+        echo "XXX"; echo "78"; echo "Installing kernel into /boot..."; echo "XXX"
+        # mkosi strips /boot from the rootfs during image build —
+        # it stages the kernel and initrd as separate output files
+        # for its own bootable image, then deletes them from /boot.
+        # The rsync above brought across an empty /boot, so we need
+        # to put the kernel binary back before update-grub can scan
+        # for boot menu entries.
+        local KVER
+        KVER=$(ls "$MOUNT/lib/modules" 2>/dev/null | head -1)
+        if [ -z "$KVER" ]; then
+            log "ERROR: no /lib/modules in target — rsync didn't copy modules?"
+            exit 1
+        fi
+        log "Target kernel version: $KVER"
+
+        local LIVE_KERNEL=""
+        for path in /run/live/medium/live/vmlinuz \
+                    /lib/live/mount/medium/live/vmlinuz \
+                    /run/live/medium/live/vmlinuz1 \
+                    /lib/live/mount/medium/live/vmlinuz1; do
+            [ -f "$path" ] && LIVE_KERNEL="$path" && break
+        done
+        if [ -z "$LIVE_KERNEL" ]; then
+            log "ERROR: couldn't find live kernel binary to install"
+            ls /run/live/medium/live/ >> "$INSTALL_LOG" 2>&1 || true
+            ls /lib/live/mount/medium/live/ >> "$INSTALL_LOG" 2>&1 || true
+            exit 1
+        fi
+        log "Copying $LIVE_KERNEL -> /boot/vmlinuz-$KVER"
+        install -m 0644 "$LIVE_KERNEL" "$MOUNT/boot/vmlinuz-$KVER"
+        ln -sf "vmlinuz-$KVER" "$MOUNT/boot/vmlinuz"
+
+        echo "XXX"; echo "80"; echo "Configuring initramfs (virtio + storage modules)..."; echo "XXX"
+        # Force the storage / virtio drivers into the initrd so the
+        # installed kernel can find its root partition. MODULES=most
+        # is the Debian default but is overly conservative on slim
+        # cloud-amd64 — explicit module list guarantees they're in.
+        # Without virtio_blk the kernel panics at boot with
+        # "VFS: Unable to mount root fs on unknown-block(0,0)" on
+        # any VM hypervisor.
+        sed -i 's/^MODULES=.*/MODULES=most/' \
+            "$MOUNT/etc/initramfs-tools/initramfs.conf" 2>/dev/null || true
+        cat > "$MOUNT/etc/initramfs-tools/modules" <<'EOF'
+# Forced into the initrd by spatium-install for VM compatibility.
+virtio
+virtio_pci
+virtio_blk
+virtio_scsi
+virtio_net
+virtio_ring
+ext4
+EOF
+
+        echo "XXX"; echo "82"; echo "Regenerating initrd for disk boot..."; echo "XXX"
+        # live-tools dpkg-diverts /usr/sbin/update-initramfs into a
+        # no-op symlink that points at /usr/bin/live-update-initramfs
+        # (the live-update-initramfs binary prints "I: update-initramfs
+        # is disabled (live system is running...)" and exits 0). The
+        # rsync'd rootfs inherits that diversion, so a naive
+        # `chroot $MOUNT update-initramfs` is silently the no-op and
+        # /boot/initrd.img-<kver> never lands. Fix in three steps:
+        # (1) `rm` the live-tools symlink at /usr/sbin/update-initramfs.
+        #     A bare `dpkg-divert --rename --remove` errors with
+        #     "rename involves overwriting ... with different file ...
+        #     not allowed" because the symlink is in the way.
+        # (2) `dpkg-divert --rename --remove` then moves the parked
+        #     /usr/sbin/update-initramfs.orig.initramfs-tools back
+        #     into /usr/sbin/update-initramfs cleanly.
+        # (3) update-initramfs is now the real binary and future
+        #     kernel upgrades on the installed system regenerate
+        #     initrds normally.
+        log "Undiverting update-initramfs (live-tools shadowed it as a no-op)"
+        chroot "$MOUNT" rm -f /usr/sbin/update-initramfs \
+            >> "$INSTALL_LOG" 2>&1 || true
+        chroot "$MOUNT" /usr/bin/dpkg-divert --rename --remove \
+            /usr/sbin/update-initramfs >> "$INSTALL_LOG" 2>&1 || true
+
+        chroot "$MOUNT" env \
+            PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+            /usr/sbin/update-initramfs -c -k "$KVER" \
+            >> "$INSTALL_LOG" 2>&1
+
+        # Verify the initrd actually landed. The wrap-iso pipeline
+        # to whiptail --gauge has surprised us before by swallowing
+        # the failure (subshell + pipefail interactions); on the
+        # previous install attempt update-initramfs silently failed
+        # and the installed system grub then couldn't find
+        # /boot/initrd.img-<kver>.
+        if [ ! -f "$MOUNT/boot/initrd.img-$KVER" ]; then
+            log "ERROR: update-initramfs did NOT produce /boot/initrd.img-$KVER"
+            log "Contents of $MOUNT/boot:"
+            ls -la "$MOUNT/boot" >> "$INSTALL_LOG" 2>&1
+            log "End of install log — see above for update-initramfs output."
+            exit 1
+        fi
+        log "initrd written: $(ls -lh "$MOUNT/boot/initrd.img-$KVER" | awk '{print $5}')"
+        ln -sf "initrd.img-$KVER" "$MOUNT/boot/initrd.img"
+
+        echo "XXX"; echo "85"; echo "Writing /etc/default/grub + /boot/grub/grub.cfg..."; echo "XXX"
+        # Write /etc/default/grub explicitly so future `update-grub`
+        # runs (e.g. on kernel upgrade) get the same cmdline. We
+        # don't rely on update-grub at install time — we write
+        # grub.cfg directly below — but installed-system tooling
+        # will read this file later.
+        cat > "$MOUNT/etc/default/grub" <<EOF
+GRUB_DEFAULT=0
+GRUB_TIMEOUT=3
+GRUB_DISTRIBUTOR="SpatiumDDI"
+GRUB_CMDLINE_LINUX_DEFAULT="quiet"
+GRUB_CMDLINE_LINUX="console=tty0 console=ttyS0,115200n8"
+GRUB_TERMINAL_INPUT="console serial"
+GRUB_TERMINAL_OUTPUT="console serial"
+GRUB_SERIAL_COMMAND="serial --unit=0 --speed=115200"
+GRUB_DISABLE_OS_PROBER=true
+GRUB_DISABLE_LINUX_UUID=false
+EOF
+
+        # Write grub.cfg directly with the correct root=UUID. We
+        # bypass update-grub because grub-mkconfig's grub-probe reads
+        # /proc/mounts inside the chroot — and /proc is bind-mounted
+        # from the host, so grub-probe returns the LIVE OVERLAY's
+        # device rather than the target disk's root partition. The
+        # resulting grub.cfg has a wrong/missing root= line and the
+        # kernel panics at boot.
+        mkdir -p "$MOUNT/boot/grub"
+        cat > "$MOUNT/boot/grub/grub.cfg" <<EOF
+set timeout=3
+set default=0
+
+# Serial console mirror for headless installs.
+serial --unit=0 --speed=115200
+terminal_input  console serial
+terminal_output console serial
+
+insmod part_gpt
+insmod ext2
+insmod search_fs_uuid
+search --no-floppy --fs-uuid --set=root $ROOT_UUID
+
+menuentry "SpatiumDDI Appliance" {
+    linux /boot/vmlinuz-$KVER root=UUID=$ROOT_UUID ro quiet \\
+        loglevel=3 audit=0 systemd.show_status=false \\
+        console=tty0 console=ttyS0,115200n8
+    initrd /boot/initrd.img-$KVER
+}
+
+menuentry "SpatiumDDI Appliance (verbose boot)" {
+    # Same as default, just without the quiet/loglevel/audit/
+    # show_status flags — useful when you want to see what's
+    # happening during boot. Still runs multi-user.target so
+    # getty@tty1 + serial-getty@ttyS0 both come up normally.
+    linux /boot/vmlinuz-$KVER root=UUID=$ROOT_UUID ro \\
+        console=tty0 console=ttyS0,115200n8
+    initrd /boot/initrd.img-$KVER
+}
+
+menuentry "SpatiumDDI Appliance (rescue / single-user)" {
+    # Boots into rescue.target — single-user, root shell only, no
+    # docker, no getty@tty1. Asks for the root password from the
+    # installer at "Press Enter for maintenance" prompt.
+    linux /boot/vmlinuz-$KVER root=UUID=$ROOT_UUID ro \\
+        console=tty0 console=ttyS0,115200n8 systemd.unit=rescue.target
+    initrd /boot/initrd.img-$KVER
+}
+EOF
+
+        echo "XXX"; echo "88"; echo "Installing bootloader (BIOS + UEFI)..."; echo "XXX"
+        chroot "$MOUNT" /usr/sbin/grub-install --target=i386-pc "$TARGET_DISK" \
+            >> "$INSTALL_LOG" 2>&1
+        chroot "$MOUNT" /usr/sbin/grub-install --target=x86_64-efi \
+            --efi-directory=/boot/efi \
+            --bootloader-id=SPATIUMDDI \
+            --removable \
+            >> "$INSTALL_LOG" 2>&1 || true
+
+        echo "XXX"; echo "95"; echo "Unmounting..."; echo "XXX"
+        for d in dev sys proc; do
+            umount "$MOUNT/$d" 2>/dev/null || true
+        done
+        umount "$MOUNT/boot/efi"
+        umount "$MOUNT"
+        sync
+
+        echo "XXX"; echo "100"; echo "Done."; echo "XXX"
+        sleep 1
+    } | whiptail --backtitle "$BACKTITLE" --title "Installing SpatiumDDI" \
+        --gauge "" 10 70 0
+
+    # Best-effort eject of the install media BEFORE the operator
+    # confirms reboot. Real CD-ROM drives obviously unmount and pop
+    # the tray; QEMU/Proxmox virtual CD-ROMs honor the guest's ATA
+    # EJECT — the device stays present in the VM but the ISO is
+    # unmapped, so even if BIOS boot order still prefers CD it gets
+    # "no media" and falls through to the disk. Errors are
+    # ignored: ejecting a USB stick from inside the running guest
+    # can't actually disconnect it electrically; the message below
+    # tells the operator to pull it manually.
+    for dev in /dev/sr0 /dev/sr1 /dev/cdrom; do
+        [ -b "$dev" ] || continue
+        eject "$dev" >> "$INSTALL_LOG" 2>&1 || true
+    done
+
+    # Title kept short (4 chars) so it doesn't collide with the 36-char
+    # BACKTITLE on the dialog top frame — whiptail renders backtitle on
+    # row 0 + dialog title on the immediately-adjacent dialog top
+    # border, and overlong combined widths cause the title to overflow
+    # into the backtitle (visible as e.g. "0.1.0ation complete").
+    #
+    # No inner box-drawing in the body: whiptail's own dialog frame
+    # is the visual container, an inner ASCII box renders inconsistently
+    # across console fonts (right edge alignment depends on each
+    # content line being padded to the exact same column, which is
+    # fragile + ugly) and the console font on the live ISO doesn't
+    # render Unicode box-drawing chars at all. Plain indented text +
+    # the `*** … ***` attention rule scans cleanly on tty1, in serial
+    # consoles, and over SSH.
+    whiptail --backtitle "$BACKTITLE" --title "Done" \
+        --msgbox "\
+SpatiumDDI is installed on $TARGET_DISK.
+
+
+   *** REMOVE THE INSTALL MEDIA before the reboot ***
+
+   Otherwise the BIOS will boot back into this installer.
+
+      Virtual:   detach the ISO from the VM's CD-ROM drive
+                 Proxmox: Hardware -> CD/DVD -> 'Do not use'
+      Physical:  unplug the USB stick
+
+   The installer already issued an ATA EJECT - most hypervisors
+   honor it and the ISO is already unmapped, but detach it from
+   the VM config too so it doesn't reattach on the next boot.
+
+
+First boot of the installed system takes 2-5 min while it pulls
+the SpatiumDDI container images.
+
+   Web UI:  http://<appliance IP>/
+   Login:   admin / admin   (change forced on first login)
+
+Press OK to reboot." 24 72
+
+    log "Install complete. Rebooting."
+    systemctl reboot
+}
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+main() {
+    if [ "$(id -u)" -ne 0 ]; then
+        echo "Run as root." >&2
+        exit 1
+    fi
+    welcome
+    ask_role
+    pick_disk
+    ask_hostname
+    ask_user_password
+    ask_network
+    ask_timezone
+    ask_agent_config
+    confirm
+    do_install
+}
+
+on_failure() {
+    local exit_code=$?
+    [ "$exit_code" -eq 0 ] && exit 0
+    set +x
+    clear
+    echo
+    echo "Installer exited with status $exit_code"
+    echo
+    echo "-- Last 20 lines of $INSTALL_LOG --"
+    tail -20 "$INSTALL_LOG" 2>/dev/null \
+        || echo "  (install log empty or missing - script bailed before any log() call)"
+    echo
+    echo "-- Last 20 lines of /var/log/spatium-install-launch.log --"
+    tail -20 /var/log/spatium-install-launch.log 2>/dev/null \
+        || echo "  (launch log missing - bash didn't even parse the script)"
+    echo
+    echo "-- Last 30 lines of $TRACE_LOG --"
+    tail -30 "$TRACE_LOG" 2>/dev/null \
+        || echo "  (trace log empty - script bailed before set -x at line 51)"
+    echo "------------------------------------------------------------------"
+    echo
+    if [ -r /var/log/spatium-live-ssh-password ]; then
+        echo "Live-mode SSH (for log capture from a real terminal):"
+        echo "  user:     root"
+        echo "  password: $(cat /var/log/spatium-live-ssh-password)"
+        echo "  address:  $(ip -4 -br addr 2>/dev/null | awk '$1!="lo" && $3!="" {print $3; exit}' || echo '?')"
+        echo
+    fi
+    echo "Also useful from the shell:"
+    echo "  journalctl -u spatium-install.service --no-pager"
+    echo "  systemctl cat spatium-install.service"
+    echo
+    echo "Press Enter to drop to a root shell."
+    echo "(From the shell you can re-run 'spatium-install' or 'reboot'.)"
+    read -r _ || true
+    exec /bin/bash --login
+}
+trap on_failure EXIT
+
+main "$@"

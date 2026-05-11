@@ -1,0 +1,20 @@
+/var/log/spatiumddi/*.log {
+    weekly
+    rotate 12
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0644 root root
+    sharedscripts
+}
+
+/var/log/spatium-install.log {
+    rotate 4
+    weekly
+    compress
+    delaycompress
+    missingok
+    notifempty
+    create 0600 root root
+}

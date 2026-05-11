@@ -39,6 +39,22 @@ class VersionResponse(BaseModel):
     # Most recent error, if any. Null on success or if the check has
     # never run.
     latest_check_error: str | None
+    # Appliance-mode signal — true when the API runs on the SpatiumDDI
+    # OS appliance ISO (set by the appliance compose env). Gates the
+    # "Appliance" sidebar entry + /api/v1/appliance/* router family.
+    # Phase 4, issue #134. On plain Docker / K8s deploys this is false
+    # and the appliance management surface stays hidden.
+    appliance_mode: bool
+    appliance_version: str | None
+    appliance_hostname: str | None
+
+
+def _appliance_fields() -> dict[str, str | bool | None]:
+    return {
+        "appliance_mode": settings.appliance_mode,
+        "appliance_version": settings.appliance_version or None,
+        "appliance_hostname": settings.appliance_hostname or None,
+    }
 
 
 @router.get("", response_model=VersionResponse)
@@ -56,6 +72,7 @@ async def get_version(db: DB) -> VersionResponse:
             latest_checked_at=None,
             release_check_enabled=True,
             latest_check_error=None,
+            **_appliance_fields(),
         )
     return VersionResponse(
         version=settings.version,
@@ -65,4 +82,5 @@ async def get_version(db: DB) -> VersionResponse:
         latest_checked_at=ps.latest_checked_at,
         release_check_enabled=ps.github_release_check_enabled,
         latest_check_error=ps.latest_check_error,
+        **_appliance_fields(),
     )

@@ -1,0 +1,178 @@
+#!/bin/sh
+# mkosi post-install hook — runs once after package installation.
+# Enables systemd services + applies hardening from
+# docs/deployment/APPLIANCE.md §7.
+#
+# mkosi 25 runs scripts in a sandbox where the host filesystem is
+# read-only and the image rootfs is exposed at $BUILDROOT. All paths
+# below must be prefixed accordingly. (Earlier mkosi versions ran
+# scripts inside chroot which is why some examples online use bare
+# paths — those don't work here.)
+set -eu
+
+[ -n "${BUILDROOT:-}" ] || { echo "BUILDROOT not set"; exit 1; }
+
+# ── Service enablement ────────────────────────────────────────────────────────
+# Manual multi-user.target.wants/ symlinks. cloud-init enables itself
+# via Debian's debhelper preset during package install (visible as
+# "Created symlink ..." lines in the build log) — no work needed here
+# for cloud-init-local / cloud-init / cloud-config / cloud-final.
+mkdir -p "$BUILDROOT/etc/systemd/system/multi-user.target.wants"
+
+# Belt-and-braces: explicitly enable getty@tty1 so VGA console has
+# a login prompt. Debian's systemd preset normally does this but
+# mkosi has been observed to skip the preset step on some builds.
+# Without this symlink, booting with a VGA-attached console (e.g.
+# Proxmox noVNC) shows kernel messages but no agetty.
+mkdir -p "$BUILDROOT/etc/systemd/system/getty.target.wants"
+ln -sfn /usr/lib/systemd/system/getty@.service \
+    "$BUILDROOT/etc/systemd/system/getty.target.wants/getty@tty1.service"
+# Install + Live mode services are kept WantedBy=multi-user.target
+# but gate themselves with ConditionKernelCommandLine=spatium-mode=…
+# so only one runs per boot, depending on the GRUB menu choice.
+for unit in docker.service chrony.service ssh.service \
+            spatiumddi-firstboot.service \
+            spatiumddi-update.path \
+            spatiumddi-reboot.path \
+            spatium-install.service \
+            spatium-live-banner.service \
+            spatium-live-bootstrap.service \
+            qemu-guest-agent.service \
+            open-vm-tools.service \
+            nftables.service \
+            apt-daily.timer \
+            apt-daily-upgrade.timer; do
+    src=
+    for candidate in /lib/systemd/system /etc/systemd/system /usr/lib/systemd/system; do
+        if [ -f "$BUILDROOT$candidate/$unit" ]; then
+            src="$candidate/$unit"
+            break
+        fi
+    done
+    if [ -z "$src" ]; then
+        echo "WARN: $unit not found in image — service won't auto-start." >&2
+        continue
+    fi
+    ln -sfn "$src" "$BUILDROOT/etc/systemd/system/multi-user.target.wants/$unit"
+done
+
+# ── Hardening (subset of APPLIANCE.md §7 — full pass in Phase 1.x) ────────────
+# SSH: root login disabled, password login allowed.
+#
+# - `PermitRootLogin no`: operators SSH as the admin user they
+#   created during install, then `sudo` for root. Closes the
+#   obvious "ssh root@…" attack surface.
+# - `PasswordAuthentication yes`: the installer wizard takes the
+#   admin password as its only credential input, so disabling
+#   password auth would leave the operator locked out until they
+#   physically attached a key. Pragmatic default for a fresh
+#   appliance — operators upload an SSH key + `PasswordAuthentication
+#   no` themselves once they've keyed in.
+sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin no/' "$BUILDROOT/etc/ssh/sshd_config"
+sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' "$BUILDROOT/etc/ssh/sshd_config"
+# Newer sshd ships drop-ins under /etc/ssh/sshd_config.d/ that can
+# override the main file. Debian 13's default disables password
+# auth there for cloud-init/no-password setups. Overwrite it.
+echo "PasswordAuthentication yes" \
+    > "$BUILDROOT/etc/ssh/sshd_config.d/10-spatiumddi-password-auth.conf"
+
+# /tmp as tmpfs.
+if ! grep -q '^tmpfs /tmp ' "$BUILDROOT/etc/fstab" 2>/dev/null; then
+    echo 'tmpfs /tmp tmpfs nosuid,nodev,noexec,mode=1777 0 0' >> "$BUILDROOT/etc/fstab"
+fi
+
+# ASLR.
+echo 'kernel.randomize_va_space = 2' > "$BUILDROOT/etc/sysctl.d/99-spatiumddi.conf"
+
+# Make orchestrator + installer + helpers executable.
+chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-firstboot"
+chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-stack-status"
+chmod 0755 "$BUILDROOT/usr/local/bin/spatium-install"
+chmod 0755 "$BUILDROOT/usr/local/bin/spatium-live-banner"
+chmod 0755 "$BUILDROOT/usr/local/bin/spatium-live-bootstrap"
+chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-update"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-firstboot.service"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-install.service"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-live-banner.service"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-live-bootstrap.service"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-update.path"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-update.service"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-reboot.path"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-reboot.service"
+
+# State directories owned by the spatiumddi-firstboot service.
+install -d -m 0755 "$BUILDROOT/etc/spatiumddi"
+install -d -m 0755 "$BUILDROOT/var/lib/spatiumddi"
+install -d -m 0755 "$BUILDROOT/var/log/spatiumddi"
+
+# nftables operator drop-in directory — anything *.nft here gets
+# appended to the input chain on each `nft -f /etc/nftables.conf`.
+install -d -m 0755 "$BUILDROOT/etc/nftables.d"
+
+# Persistent systemd journal. The mere existence of /var/log/journal
+# flips systemd-journald from volatile (in-memory) to persistent.
+# Mode 2755 + group systemd-journal is what systemd expects.
+install -d -m 2755 "$BUILDROOT/var/log/journal"
+chgrp systemd-journal "$BUILDROOT/var/log/journal" 2>/dev/null || true
+
+# ── Docker client CLI ─────────────────────────────────────────────────────────
+# Debian trixie's docker.io package (26.1.5+dfsg1-9+b12) ships ONLY
+# the daemon — dockerd, docker-proxy, docker-init. It does NOT ship
+# /usr/bin/docker, the CLI client most operators expect. Download
+# the upstream static binary and drop it in /usr/local/bin/docker so
+# `docker ps`, `docker logs`, `docker exec` etc. work for
+# troubleshooting. /usr/local/ takes priority over /usr/ in $PATH so
+# no conflict if Debian ever ships the CLI again.
+# Docker CLI version — docker.com's static binaries only go back so
+# far. 27.x CLIs are backward-compatible with the Debian-shipped
+# 26.x daemon (Docker keeps the API stable for at least one major).
+DOCKER_VERSION=27.5.1
+if [ ! -x "$BUILDROOT/usr/local/bin/docker" ]; then
+    echo "Downloading docker CLI ${DOCKER_VERSION}..."
+    tmpd=$(mktemp -d)
+    # The mkosi sandbox exposes neither host curl nor host tar on
+    # PATH or at /usr/bin/. But python3 IS available (mkosi is
+    # python-based) — fetch + extract entirely in stdlib so we
+    # don't depend on host tooling.
+    if python3 - "$tmpd/docker" <<EOF
+import sys, urllib.request, tarfile, shutil, pathlib
+url = "https://download.docker.com/linux/static/stable/x86_64/docker-${DOCKER_VERSION}.tgz"
+out_file = pathlib.Path(sys.argv[1])
+out_file.parent.mkdir(parents=True, exist_ok=True)
+tarball = out_file.parent / "docker.tgz"
+print(f"  fetching {url}")
+with urllib.request.urlopen(url, timeout=60) as r, open(tarball, "wb") as f:
+    shutil.copyfileobj(r, f)
+size = tarball.stat().st_size
+print(f"  extracting docker/docker from {size}-byte tarball")
+# Use extractfile() + manual write so we don't trip Python 3.13's
+# new tar-filter machinery (it rejects extract() of files with
+# non-portable metadata, but extractfile() returns a plain stream).
+with tarfile.open(tarball) as t, \
+     t.extractfile("docker/docker") as src, \
+     open(out_file, "wb") as dst:
+    shutil.copyfileobj(src, dst)
+EOF
+    then
+        install -m 0755 "$tmpd/docker" "$BUILDROOT/usr/local/bin/docker"
+        echo "  installed: $(ls -lh "$BUILDROOT/usr/local/bin/docker" | awk '{print $5}')"
+    else
+        echo "WARN: docker CLI download failed — operators will only have docker-compose"
+    fi
+    rm -rf "$tmpd"
+fi
+
+# Make /etc/resolv.conf the systemd-resolved-managed one.
+# resolved publishes upstream-DNS info (picked up from networkd's
+# DHCP) at /run/systemd/resolve/resolv.conf. Without this symlink,
+# /etc/resolv.conf is whatever rsync brought from the live system
+# (often a dangling stub pointing at ::1) and docker pull fails on
+# every fresh install with "lookup registry-1.docker.io on [::1]:53".
+ln -sfn /run/systemd/resolve/resolv.conf "$BUILDROOT/etc/resolv.conf"
+
+# Enable resolved alongside the rest of the service set. (Manually
+# in the for-loop above would have worked, but resolved deserves a
+# comment in the same spot as the symlink so the link between the
+# two is obvious.)
+ln -sfn /lib/systemd/system/systemd-resolved.service \
+    "$BUILDROOT/etc/systemd/system/multi-user.target.wants/systemd-resolved.service"

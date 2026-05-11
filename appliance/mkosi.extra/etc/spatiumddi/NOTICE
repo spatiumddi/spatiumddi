@@ -1,0 +1,107 @@
+SpatiumDDI Appliance — Bundled Open-Source Components
+
+This appliance image bundles software from the projects listed below.
+SpatiumDDI itself is licensed under the Apache License 2.0 (see
+/usr/share/doc/spatiumddi/LICENSE in the SpatiumDDI containers, or
+https://github.com/spatiumddi/spatiumddi/blob/main/LICENSE).
+
+The full text of each license is available on the system at
+/usr/share/doc/<package>/copyright. Source for each component is
+available via Debian's source tree:
+
+   apt-get source <package>
+
+or upstream:
+
+   https://sources.debian.org/
+
+────────────────────────────────────────────────────────────────────
+
+Operating system base
+   Debian GNU/Linux 13 (trixie)
+   https://www.debian.org/
+
+Kernel
+   Linux                                  GPL v2
+
+C library
+   glibc                                  LGPL v2.1+
+
+Init / service manager
+   systemd                                LGPL v2.1+
+
+Bootloader
+   GRUB 2                                 GPL v3
+   shim                                   BSD (not bundled — SB
+                                          support is Phase 4 work)
+
+Container runtime
+   Docker (docker.io)                     Apache 2.0
+   docker-compose (Python v1)             Apache 2.0
+   runc                                   Apache 2.0
+   containerd                             Apache 2.0
+
+DNS server (in container)
+   BIND 9                                 MPL 2.0
+
+DHCP server (in container)
+   ISC Kea                                MPL 2.0
+
+Database (in container)
+   PostgreSQL 16                          PostgreSQL License
+                                          (permissive)
+   Redis 7                                BSD-3-Clause
+
+SpatiumDDI control plane (in containers)
+   Python 3                               PSF License
+   FastAPI                                MIT
+   SQLAlchemy                             MIT
+   Celery                                 BSD
+   structlog                              MIT / Apache 2.0
+   React, TypeScript                      MIT
+   shadcn/ui                              MIT
+   Tailwind                               MIT
+   Vite                                   MIT
+
+Live ISO / installer
+   live-boot, live-config, live-tools     GPL v3
+   whiptail (newt)                        LGPL v2
+   gdisk, sgdisk                          GPL v2
+   rsync                                  GPL v3
+   xorriso, libisofs                      GPL v3
+   mksquashfs                             GPL v2
+
+Bootstrap + maintenance tooling
+   mkosi                                  LGPL v2.1
+   apt                                    GPL v2
+   unattended-upgrades                    GPL v2
+   nftables, libnftnl                     GPL v2
+
+VM guest agents
+   qemu-guest-agent                       GPL v2
+   open-vm-tools                          GPL v2 / LGPL v2.1
+
+NTP
+   chrony                                 GPL v2
+
+Hardware support
+   linux-image-cloud-amd64                GPL v2
+   firmware-* (where used)                see individual licenses
+
+────────────────────────────────────────────────────────────────────
+
+GPL-licensed component source availability:
+   - Kernel + GNU utilities: https://sources.debian.org/src/
+   - GRUB 2: https://www.gnu.org/software/grub/
+   - systemd: https://github.com/systemd/systemd
+   - live-boot: https://salsa.debian.org/live-team/live-boot
+
+MPL 2.0 component source availability:
+   - BIND 9: https://gitlab.isc.org/isc-projects/bind9
+   - ISC Kea: https://gitlab.isc.org/isc-projects/kea
+
+────────────────────────────────────────────────────────────────────
+
+NO WARRANTY: This appliance image is provided "as is" without
+warranty of any kind. See individual component LICENSE files for
+the warranty terms applicable to each.

@@ -3310,6 +3310,14 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
                 </div>
                 <p className="text-xs text-muted-foreground">
                   {s.host}:{s.port}
+                  {s.last_seen_ip && (
+                    <span
+                      className="ml-1.5 font-mono"
+                      title="Source IP of the most recent agent heartbeat"
+                    >
+                      ({s.last_seen_ip})
+                    </span>
+                  )}
                   {s.roles.length > 0 && ` · ${s.roles.join(", ")}`}
                   {s.last_sync_at &&
                     ` · synced ${new Date(s.last_sync_at).toLocaleDateString()}`}
@@ -6591,7 +6599,7 @@ function GroupDetailView({
   }
 
   const [searchParams, setSearchParams] = useSearchParams();
-  const tab = (searchParams.get("tab") as GroupTab) || "zones";
+  const tab = (searchParams.get("tab") as GroupTab) || "servers";
   const setTab = (t: GroupTab) =>
     setSearchParams(
       (prev: URLSearchParams) => {
@@ -6602,10 +6610,12 @@ function GroupDetailView({
       { replace: true },
     );
 
+  // Tab order mirrors DHCP — Servers first (the agents driving the
+  // group), then content (zones / records), then ancillary surfaces.
   const tabs: { id: GroupTab; label: string; icon: React.ElementType }[] = [
+    { id: "servers", label: "Servers", icon: Cpu },
     { id: "zones", label: "Zones", icon: FileText },
     { id: "records", label: "Records", icon: ListTree },
-    { id: "servers", label: "Servers", icon: Cpu },
     { id: "views", label: "Views", icon: Eye },
     { id: "acls", label: "ACLs", icon: Shield },
     { id: "blocklists", label: "Blocking Lists", icon: Ban },

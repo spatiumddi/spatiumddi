@@ -51,7 +51,7 @@
 - [Full feature detail](#full-feature-detail) — deep dive on every subsystem
 - [Screenshots](#screenshots)
 - [Architecture](#architecture)
-- [Getting Started](#getting-started) — Docker Compose quick start, demo seed, upgrade flow, admin reset
+- [Getting Started](#getting-started) — Docker Compose quick start, OS appliance ISO, demo seed, upgrade flow, admin reset
 - [Deployment Options](#deployment-options)
 - [Documentation](#documentation)
 - [Project Status](#project-status)
@@ -153,7 +153,7 @@
 |---|---|---|
 | 🐳 | **Docker Compose** | `docker compose up -d` |
 | ☸️ | **Kubernetes** | Helm umbrella chart, OCI-published |
-| 🖥 | **Bare metal / OS appliance** | bare metal today · self-contained appliance image (roadmap) |
+| 🖥 | **Bare metal / OS appliance** | bare metal today · self-contained appliance ISO (alpha — Debian 13 + full stack, hybrid USB/CD, see [Getting Started](#quick-start-with-the-os-appliance-iso)) |
 
 ---
 
@@ -573,7 +573,7 @@ The tables above are the elevator pitch. The bullets here are the same surface w
   - Docker Compose
   - Kubernetes — Helm umbrella chart, OCI-published
   - Bare metal
-  - OS appliance (roadmap)
+  - OS appliance ISO — alpha (Debian 13 + full stack pre-installed, dedicated `/appliance` management hub with TLS, releases, containers, logs, host config; see [Getting Started](#quick-start-with-the-os-appliance-iso) + [`docs/deployment/APPLIANCE.md`](docs/deployment/APPLIANCE.md))
 
 ---
 
@@ -676,7 +676,7 @@ docker compose up -d                  # recreate api/worker/beat/frontend on the
 
 ```bash
 # In your .env:
-SPATIUMDDI_VERSION=2026.05.03-1
+SPATIUMDDI_VERSION=2026.05.11-1
 
 # Then:
 docker compose pull
@@ -709,7 +709,7 @@ Or set `COMPOSE_PROFILES=dns-bind9,dhcp` in your `.env` so plain `docker compose
 
 That starts `dns-bind9` bound to host port `1053` (udp + tcp), or `dns-powerdns` on `5453`. The agent registers with the control plane automatically using `DNS_AGENT_KEY` from your `.env` and appears in the UI under **DNS → Server Groups**.
 
-> **Upgrading from a release that used port 5353?** The DNS host port default changed from `5353` to `1053` in release `2026.05.08-1` because 5353 is the well-known mDNS port and collides with avahi (default-on in Ubuntu desktop / Fedora / most lab distros). Either point your clients at the new port (`dig -p 1053 …`), or pin the old behaviour with `DNS_HOST_PORT=5353` in your `.env` and recreate the container.
+> **Upgrading from a release that used port 5353?** The DNS host port default changed from `5353` to `1053` in release `2026.05.11-1` because 5353 is the well-known mDNS port and collides with avahi (default-on in Ubuntu desktop / Fedora / most lab distros). Either point your clients at the new port (`dig -p 1053 …`), or pin the old behaviour with `DNS_HOST_PORT=5353` in your `.env` and recreate the container.
 
 Create a zone + record in the UI, then verify with `dig`:
 
@@ -721,6 +721,41 @@ dig @127.0.0.1 -p 1053 -x <your-ip> +short    # reverse (PTR)
 Record changes propagate to BIND9 via RFC 2136 — typically sub-second, no daemon restart. Zone / ACL / view changes trigger a config reload.
 
 **Production**: point the agent at your real control plane, expose `53/udp` + `53/tcp`, and run one container per DNS server you want in the cluster. All servers in a group share the same TSIG key for dynamic updates.
+
+### Quick start with the OS appliance ISO
+
+If you'd rather skip the Docker setup entirely, SpatiumDDI ships a self-contained OS appliance image — Debian 13 with the full stack pre-installed. Boot it, run a five-question installer, and you're on HTTPS with all the SpatiumDDI services running. No prior Docker or Linux setup required.
+
+**Get the ISO:**
+
+- Each [GitHub release](https://github.com/spatiumddi/spatiumddi/releases) attaches `spatiumddi-appliance-<version>.iso` (~440 MB, hybrid USB/CD).
+- Or build from source: `make appliance && make appliance-iso` produces the ISO in `appliance/build/`. See [`docs/deployment/APPLIANCE.md`](docs/deployment/APPLIANCE.md) for the build prerequisites.
+
+**Install:**
+
+1. Attach the ISO as a CD-ROM in your hypervisor (Proxmox / VMware / Hyper-V / QEMU) or `dd` it to a USB stick for bare metal.
+2. Boot it. The live ISO drops you into a Proxmox-style whiptail wizard — pick a target disk, hostname, admin password, DHCP-or-static network, and timezone.
+3. The wizard partitions the disk (GPT: BIOS Boot + ESP + ext4 root), `rsync`s the live rootfs onto it, installs GRUB for both BIOS and UEFI, and reboots.
+4. First boot brings up the SpatiumDDI stack (api, worker, beat, postgres, redis, frontend) and auto-generates a self-signed TLS cert. Total time: ~2-5 minutes.
+
+**Access:**
+
+Browse to `https://<appliance-ip>/`. Your browser will warn about the self-signed cert — accept once, then sign in with `admin / admin` (forces password change on first login). Plain HTTP gets 301-redirected to HTTPS.
+
+**Appliance management (`/appliance`):**
+
+The appliance ships with a dedicated management hub in the sidebar covering everything an OS-level operator needs without an SSH session:
+
+- **Web UI Certificate** — replace the self-signed cert: paste a PEM cert + key, generate a CSR (key stays on the server) and import the signed cert, or upload a Let's Encrypt cert. Activating a cert hot-reloads nginx.
+- **Releases** — list recent GitHub releases, one-click upgrade — the host-side path-unit recycles the stack so the api can recreate itself cleanly.
+- **Containers** — list every container, start/stop/restart, live-stream logs over SSE.
+- **Logs & Diagnostics** — host log viewer (firstboot, update log), self-test runner (DNS / container health / API / DHCP / DNS daemon checks), one-click diagnostic bundle download (secrets redacted).
+- **Network & Host** — read-only hostname / host IPs / uptime / reboot-pending banner.
+- **Maintenance** — maintenance-mode flag + reboot button (10 s grace).
+
+Operators stuck without a working web UI can still SSH in as the admin user they created during install and use `journalctl -u spatiumddi-firstboot`, `docker compose -f /usr/local/share/spatiumddi/docker-compose.yml ps`, etc.
+
+> The appliance is alpha (Phase 4 — issue [#134](https://github.com/spatiumddi/spatiumddi/issues/134)). See [`docs/deployment/APPLIANCE.md`](docs/deployment/APPLIANCE.md) for the full design, build pipeline, and known limitations.
 
 ### API & interactive docs
 
@@ -769,7 +804,7 @@ EOF
 | **Docker Compose** | Dev, small single-host production | ✅ Supported |
 | **Kubernetes + Helm** | Multi-node production, scalable | ✅ Umbrella chart (`charts/spatiumddi`, published OCI to `ghcr.io/spatiumddi/charts/spatiumddi`) |
 | **Bare metal / VM (Ansible)** | On-prem without containers | 📋 Planned |
-| **OS Appliance (ISO / qcow2)** | Air-gapped, zero-dependency | 📋 Planned |
+| **OS Appliance (ISO / qcow2)** | Air-gapped, zero-dependency, dedicated `/appliance` management hub | 🔄 Alpha — Debian 13 + full stack, hybrid USB/CD, web first-boot wizard, in-UI TLS / releases / containers / logs / diagnostics / maintenance + reboot. Build with `make appliance && make appliance-iso`. See [`docs/deployment/APPLIANCE.md`](docs/deployment/APPLIANCE.md) + [issue #134](https://github.com/spatiumddi/spatiumddi/issues/134) |
 
 ---
 
@@ -791,7 +826,7 @@ Full docs at **[spatiumddi.github.io](https://spatiumddi.github.io)** (coming so
 | [DNS Agent Design](docs/deployment/DNS_AGENT.md) | Agent protocol, auto-registration, config sync |
 | [DNS Driver Spec](docs/drivers/DNS_DRIVERS.md) | BIND9 + Windows DNS driver internals |
 | [DHCP Driver Spec](docs/drivers/DHCP_DRIVERS.md) | Kea + Windows DHCP driver internals |
-| [Appliance Deployment](docs/deployment/APPLIANCE.md) | OS image build and licensing |
+| [Appliance Deployment](docs/deployment/APPLIANCE.md) | OS appliance ISO — base OS selection, build pipeline, first-boot orchestration, `/appliance` management hub spec |
 
 ---
 
@@ -802,7 +837,7 @@ Full docs at **[spatiumddi.github.io](https://spatiumddi.github.io)** (coming so
 | Phase 1 | Core IPAM, auth, user management, audit log, Docker Compose | ✅ Done — LDAP/OIDC/SAML + RADIUS/TACACS+, group-based RBAC, bulk-edit, inheritance, mobile-responsive UI, and full IPv6 `/next-address` (EUI-64 + random /128 + sequential) all shipped |
 | Phase 2 | DHCP (Kea), DNS (BIND9), DDNS, zone/subnet tree UI | ✅ Done — DNS, Kea DHCPv4, subnet-level DDNS, agent-side Kea DDNS, block/space DDNS inheritance, per-server zone serial reporting all shipped |
 | Phase 3 | DNS views, server groups, blocking lists, VLAN/VXLAN, system admin, Kea HA | 🔄 DNS features + health dashboard + alerts framework + group-centric Kea HA (self-healing peer-IP drift + supervised daemons) landed; DNS Views end-to-end + HA state-transition actions still pending |
-| Phase 4 | OS appliance, Terraform provider, SAML, backup/restore, ACME | 🔄 SAML + full backup/restore + factory-reset all landed (8 destination kinds, selective restore, cross-install secret rewrap, alembic-upgrade-on-restore); appliance + providers + ACME embedded client pending |
+| Phase 4 | OS appliance, Terraform provider, SAML, backup/restore, ACME | 🔄 SAML + full backup/restore + factory-reset + OS appliance alpha (Debian 13 ISO with `/appliance` management hub: TLS upload + CSR-on-server, GitHub release apply, container start/stop/restart + live logs, host log viewer + self-test + diagnostic bundle, maintenance mode + reboot, web first-boot wizard) all landed. Terraform/Ansible providers + ACME embedded client (Let's Encrypt auto-issue) still pending |
 | Phase 5 | Multi-tenancy, IP request workflows, advanced reporting | 📋 Planned |
 
 See [CHANGELOG.md](CHANGELOG.md) for the per-release feature list and

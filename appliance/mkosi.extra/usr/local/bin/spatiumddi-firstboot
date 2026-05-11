@@ -1,0 +1,383 @@
+#!/bin/sh
+# SpatiumDDI appliance first-boot orchestrator.
+#
+# Runs on every boot but only performs first-boot setup once. On first
+# run: generates secrets, writes /etc/spatiumddi/.env, pulls the
+# ghcr.io image set, and brings up the docker-compose stack. On
+# subsequent boots: just `docker-compose up -d` to ensure the stack is
+# running.
+#
+# Output is mirrored to /var/log/spatiumddi/firstboot.log so the
+# operator can debug from the console without journalctl.
+
+set -eu
+
+LOG=/var/log/spatiumddi/firstboot.log
+ENV_FILE=/etc/spatiumddi/.env
+COMPOSE_DIR=/usr/local/share/spatiumddi
+STAMP=/var/lib/spatiumddi/firstboot.done
+
+mkdir -p "$(dirname "$LOG")" "$(dirname "$STAMP")"
+exec >>"$LOG" 2>&1
+echo "=== spatiumddi-firstboot $(date -Iseconds) ==="
+
+# ── Swap (created once, idempotent) ──────────────────────────────────────────
+# 2 GiB swapfile if the system has no active swap. Protects docker
+# containers (Postgres / api / worker) from OOM when memory tightens.
+# Sized small — operators with bigger workloads can grow it.
+SWAPFILE=/var/lib/spatiumddi/swapfile
+if [ "$(swapon --show=NAME --noheadings | wc -l)" = "0" ] && [ ! -f "$SWAPFILE" ]; then
+    echo "Creating 2 GiB swapfile at $SWAPFILE"
+    if fallocate -l 2G "$SWAPFILE" 2>/dev/null || \
+       dd if=/dev/zero of="$SWAPFILE" bs=1M count=2048 status=none; then
+        chmod 0600 "$SWAPFILE"
+        mkswap "$SWAPFILE" && swapon "$SWAPFILE"
+        if ! grep -q "^$SWAPFILE " /etc/fstab 2>/dev/null; then
+            echo "$SWAPFILE none swap sw 0 0" >> /etc/fstab
+        fi
+    else
+        echo "WARN: couldn't create swapfile — continuing without swap"
+    fi
+fi
+
+gen_hex()    { openssl rand -hex "${1:-32}"; }
+gen_fernet() { openssl rand 32 | base64 | tr -d '\n' | tr '+/' '-_'; }
+
+# Read optional release pin dropped by cloud-init.
+SPATIUMDDI_VERSION="latest"
+if [ -f /etc/spatiumddi/release ]; then
+    # shellcheck disable=SC1091
+    . /etc/spatiumddi/release
+fi
+
+# Host-side state dirs the api container bind-mounts (Phase 4c/4e/4f).
+# 1000 is the uid+gid of the ``app`` user inside the api image —
+# chown'ing here lets the unprivileged container write trigger files
+# / read diagnostic data without anyone running docker exec --user root.
+mkdir -p /var/lib/spatiumddi/release-state /var/log/spatiumddi
+chown -R 1000:1000 /var/lib/spatiumddi/release-state
+chmod 0755 /var/log/spatiumddi
+
+if [ ! -f "$ENV_FILE" ]; then
+    echo "Generating $ENV_FILE (first boot)"
+    umask 077
+    # Appliance metadata for the Phase 4 management hub. APPLIANCE_VERSION
+    # tracks the ISO release (set from /etc/spatiumddi/appliance-release
+    # if dropped at build time, otherwise the placeholder 0.1.0).
+    # APPLIANCE_HOSTNAME is the kernel's view of `hostname` at first
+    # boot; the management UI displays it as a chip next to the title.
+    # Both flow through the api container's compose env into Settings.
+    APPLIANCE_VERSION_VAL="0.1.0"
+    if [ -f /etc/spatiumddi/appliance-release ]; then
+        # shellcheck disable=SC1091
+        . /etc/spatiumddi/appliance-release
+        APPLIANCE_VERSION_VAL="${APPLIANCE_VERSION:-0.1.0}"
+    fi
+    APPLIANCE_HOSTNAME_VAL=$(hostname 2>/dev/null || echo "spatiumddi")
+    # Host's globally-scoped IPv4/IPv6 addresses, comma-separated.
+    # The api container is on docker's bridge network and can't see
+    # the host's real IPs from inside; without this env var the
+    # self-signed cert (Phase 4b.5) would only carry the docker-bridge
+    # IP (e.g. 172.18.0.5) as a SAN, which browsers pointing at the
+    # host IP see as a SAN mismatch. By exporting the real host IPs
+    # here, ensure_self_signed_cert() puts the right SANs in the cert
+    # and the warning becomes just "unknown CA" instead of
+    # "subject mismatch + unknown CA". Operator-uploaded certs are
+    # unaffected (the operator supplies whatever SANs they need).
+    APPLIANCE_HOST_IPS_VAL=$(ip -o addr show scope global 2>/dev/null \
+        | awk '{print $4}' | cut -d/ -f1 | paste -sd, -)
+    # Docker socket gid — the api container's `app` user needs
+    # supplementary group access to /var/run/docker.sock for the
+    # Phase 4b.2 cert-deployer SIGHUP + Phase 4d container management.
+    # Read the gid off the live socket so we track whatever the
+    # docker.io package install picked (defaults to 999 on Debian
+    # but can drift). Falls back to 999 if the socket doesn't exist
+    # yet (firstboot races docker.service); the compose group_add
+    # has the same default.
+    DOCKER_GID_VAL=$(stat -c '%g' /var/run/docker.sock 2>/dev/null || echo "999")
+    # Phase 6 role-split — spatium-install dropped /etc/spatiumddi/
+    # role-config carrying ROLE + (for agents) CONTROL_PLANE_URL +
+    # the operator-supplied agent key. Default to ``control`` when
+    # the file isn't present (fresh build before any installer wizard
+    # ran — happens during dev iteration without the installer).
+    ROLE=control
+    INSTALL_CONTROL_PLANE_URL=""
+    INSTALL_DNS_AGENT_KEY=""
+    INSTALL_DHCP_AGENT_KEY=""
+    INSTALL_AGENT_GROUP=""
+    if [ -f /etc/spatiumddi/role-config ]; then
+        # shellcheck disable=SC1091
+        . /etc/spatiumddi/role-config
+        INSTALL_CONTROL_PLANE_URL="$CONTROL_PLANE_URL"
+        INSTALL_DNS_AGENT_KEY="$DNS_AGENT_KEY"
+        INSTALL_DHCP_AGENT_KEY="$DHCP_AGENT_KEY"
+        INSTALL_AGENT_GROUP="$AGENT_GROUP"
+    fi
+
+    # COMPOSE_PROFILES drives which services come up.
+    #   control     → full stack + bundled DNS+DHCP agents (today's
+    #                 default), so the control-plane appliance is a
+    #                 self-contained box.
+    #   dns-agent   → only dns-bind9 + the agent-landing static page
+    #                 (CONTROL_PLANE_URL points at a remote api).
+    #   dhcp-agent  → only dhcp-kea + the agent-landing static page.
+    # The agent keys: on control mode we generate fresh ones; on
+    # agent modes we re-use whatever the operator pasted at install
+    # time (writing nothing for the OTHER agent's key — the unused
+    # service won't run, so an empty value is harmless).
+    case "$ROLE" in
+        dns-agent-bind9)
+            COMPOSE_PROFILES_VAL="dns-bind9,agent"
+            DNS_AGENT_KEY_VAL="$INSTALL_DNS_AGENT_KEY"
+            DHCP_AGENT_KEY_VAL=""
+            CONTROL_PLANE_URL_VAL="$INSTALL_CONTROL_PLANE_URL"
+            AGENT_GROUP_VAL="${INSTALL_AGENT_GROUP:-default}"
+            ;;
+        dns-agent-powerdns)
+            COMPOSE_PROFILES_VAL="dns-powerdns,agent"
+            DNS_AGENT_KEY_VAL="$INSTALL_DNS_AGENT_KEY"
+            DHCP_AGENT_KEY_VAL=""
+            CONTROL_PLANE_URL_VAL="$INSTALL_CONTROL_PLANE_URL"
+            AGENT_GROUP_VAL="${INSTALL_AGENT_GROUP:-default-powerdns}"
+            ;;
+        dhcp-agent)
+            COMPOSE_PROFILES_VAL="dhcp,agent"
+            DNS_AGENT_KEY_VAL=""
+            DHCP_AGENT_KEY_VAL="$INSTALL_DHCP_AGENT_KEY"
+            CONTROL_PLANE_URL_VAL="$INSTALL_CONTROL_PLANE_URL"
+            AGENT_GROUP_VAL="${INSTALL_AGENT_GROUP:-default}"
+            ;;
+        control-only)
+            # Control plane only — no bundled DNS/DHCP. Agent keys
+            # are still generated because the operator's whole reason
+            # for picking this role is to register external agents.
+            # They reveal the keys via Settings -> Security -> Agent
+            # bootstrap keys and paste them into agent installs
+            # elsewhere. AGENT_GROUP is irrelevant here (no local
+            # agent to register) but the .env carries a default
+            # value so the compose env subst doesn't error.
+            COMPOSE_PROFILES_VAL="control"
+            DNS_AGENT_KEY_VAL=$(gen_hex 24)
+            DHCP_AGENT_KEY_VAL=$(gen_hex 24)
+            CONTROL_PLANE_URL_VAL=""
+            AGENT_GROUP_VAL="default"
+            ;;
+        *)
+            # ``control`` (default) — control plane + bundled DNS +
+            # DHCP. Single-box AIO deployment. Bundled agents register
+            # into the same default group so an external agent joining
+            # later lands alongside them.
+            ROLE=control
+            COMPOSE_PROFILES_VAL="control,dns-bind9,dhcp"
+            DNS_AGENT_KEY_VAL=$(gen_hex 24)
+            DHCP_AGENT_KEY_VAL=$(gen_hex 24)
+            CONTROL_PLANE_URL_VAL=""
+            AGENT_GROUP_VAL="default"
+            ;;
+    esac
+    cat > "$ENV_FILE" <<EOF
+# Auto-generated by spatiumddi-firstboot on $(date -Iseconds).
+# Edit + run \`docker-compose -f $COMPOSE_DIR/docker-compose.yml up -d\` to apply.
+# Appliance role (Phase 6): $ROLE
+SPATIUMDDI_VERSION=${SPATIUMDDI_VERSION}
+POSTGRES_PASSWORD=$(gen_hex 24)
+SECRET_KEY=$(gen_hex 32)
+CREDENTIAL_ENCRYPTION_KEY=$(gen_fernet)
+DNS_AGENT_KEY=${DNS_AGENT_KEY_VAL}
+DHCP_AGENT_KEY=${DHCP_AGENT_KEY_VAL}
+COMPOSE_PROFILES=${COMPOSE_PROFILES_VAL}
+CONTROL_PLANE_URL=${CONTROL_PLANE_URL_VAL}
+AGENT_GROUP=${AGENT_GROUP_VAL}
+APPLIANCE_ROLE=${ROLE}
+APPLIANCE_VERSION=${APPLIANCE_VERSION_VAL}
+APPLIANCE_HOSTNAME=${APPLIANCE_HOSTNAME_VAL}
+APPLIANCE_HOST_IPS=${APPLIANCE_HOST_IPS_VAL}
+DOCKER_GID=${DOCKER_GID_VAL}
+EOF
+    chmod 600 "$ENV_FILE"
+
+    # Phase 6 — for agent-mode installs only, render the agent landing
+    # page from the template into /var/lib/spatiumddi/agent-landing/
+    # where the agent-landing nginx:alpine container mounts it
+    # read-only. ``control-only`` doesn't need the landing page —
+    # the SpatiumDDI frontend serves the web UI on that role.
+    #
+    # The ``umask 077`` set earlier (for the .env's secrets) leaks
+    # into the mkdir + sed > index.html and would leave the file
+    # mode 600 + dir 700 — nginx-the-process runs as uid 101 inside
+    # the alpine image and can't read root-owned 600 files, so the
+    # landing page would return 403. Reset umask before the write.
+    umask 022
+    case "$ROLE" in
+        dns-agent-bind9|dns-agent-powerdns|dhcp-agent)
+            mkdir -p /var/lib/spatiumddi/agent-landing
+            chmod 0755 /var/lib/spatiumddi/agent-landing
+            case "$ROLE" in
+                dns-agent-bind9)    ROLE_LABEL="DNS (BIND9)";    ROLE_SHORT="dns-bind9" ;;
+                dns-agent-powerdns) ROLE_LABEL="DNS (PowerDNS)"; ROLE_SHORT="dns-powerdns" ;;
+                dhcp-agent)         ROLE_LABEL="DHCP (Kea)";     ROLE_SHORT="dhcp-kea" ;;
+            esac
+            sed \
+                -e "s|__ROLE__|${ROLE}|g" \
+                -e "s|__ROLE_LABEL__|${ROLE_LABEL}|g" \
+                -e "s|__ROLE_SHORT__|${ROLE_SHORT}|g" \
+                -e "s|__HOSTNAME__|${APPLIANCE_HOSTNAME_VAL}|g" \
+                -e "s|__CONTROL_PLANE_URL__|${INSTALL_CONTROL_PLANE_URL}|g" \
+                -e "s|__APPLIANCE_VERSION__|${APPLIANCE_VERSION_VAL}|g" \
+                /usr/local/share/spatiumddi/agent-landing/index.html.in \
+                > /var/lib/spatiumddi/agent-landing/index.html
+            chmod 0644 /var/lib/spatiumddi/agent-landing/index.html
+            ;;
+    esac
+fi
+
+# docker-compose looks for .env in the compose file's directory.
+ln -sfn "$ENV_FILE" "$COMPOSE_DIR/.env"
+
+cd "$COMPOSE_DIR"
+
+# Re-runs of firstboot (post-reboot) need APPLIANCE_ROLE to drive
+# the role-aware readiness check below. The fresh-install branch
+# already sets it inline; on re-runs we reload it from .env so the
+# variable is in scope no matter which path got us here.
+if [ -z "${APPLIANCE_ROLE:-}" ] && [ -f "$ENV_FILE" ]; then
+    APPLIANCE_ROLE=$(grep -E '^APPLIANCE_ROLE=' "$ENV_FILE" | tail -1 | cut -d= -f2-)
+    CONTROL_PLANE_URL=$(grep -E '^CONTROL_PLANE_URL=' "$ENV_FILE" | tail -1 | cut -d= -f2-)
+    export APPLIANCE_ROLE CONTROL_PLANE_URL
+fi
+
+# Wait for the docker daemon socket to be ready. systemd's
+# After=docker.service only means docker.service was STARTED, not
+# that dockerd has finished initialising and accepting connections
+# on /var/run/docker.sock. Without this wait, docker-compose pull
+# can race and emit "Cannot connect to the Docker daemon" for a
+# subset of services.
+echo "Waiting for docker daemon..."
+for i in $(seq 1 30); do
+    if docker info >/dev/null 2>&1; then break; fi
+    sleep 1
+done
+docker info >/dev/null 2>&1 || {
+    echo "ERROR: docker daemon never came up after 30 s"
+    exit 1
+}
+
+# Wait for DNS resolution. systemd-resolved is the resolver but it
+# needs networkd to have an IP + DNS info from DHCP. With a slow
+# DHCP server we'd otherwise race and `docker-compose pull` would
+# fail on the first image with "lookup registry-1.docker.io on
+# ::1:53: read: connection refused" because /etc/resolv.conf is
+# resolved's symlink and resolved hasn't been told a DNS server yet.
+echo "Waiting for DNS resolution..."
+for i in $(seq 1 30); do
+    if getent hosts registry-1.docker.io >/dev/null 2>&1; then break; fi
+    sleep 2
+done
+getent hosts registry-1.docker.io >/dev/null 2>&1 || {
+    echo "WARN: DNS for registry-1.docker.io didn't resolve after 60 s — pull will likely fail."
+    echo "      Check 'resolvectl status' and the wildcard DHCP networkd config."
+}
+
+if [ ! -f "$STAMP" ]; then
+    # Phase 4 dev-iteration support — if this ISO was built with
+    # ``bake-images.sh``, it ships locally-built image tarballs at
+    # /usr/local/share/spatiumddi/images/*.tar.zst. Load each one
+    # into the daemon BEFORE attempting any pull, so the operator's
+    # in-flight changes take precedence over whatever's pullable
+    # from ghcr.io. The marker file ``BAKED_AT`` is dropped by
+    # bake-images.sh; its presence is the signal "this ISO carries
+    # offline images". When present we skip docker-compose pull
+    # entirely (pulls of unpublished tags would 404 against ghcr).
+    IMAGES_DIR=/usr/local/share/spatiumddi/images
+    BAKED=0
+    if [ -f "$IMAGES_DIR/BAKED_AT" ]; then
+        echo "Loading pre-baked container images from $IMAGES_DIR (baked $(cat "$IMAGES_DIR/BAKED_AT"))..."
+        for img in "$IMAGES_DIR"/*.tar.zst; do
+            [ -f "$img" ] || continue
+            echo "  → $(basename "$img")"
+            zstd -dc "$img" | docker load
+        done
+        BAKED=1
+    fi
+
+    if [ "$BAKED" = 1 ]; then
+        # Locally baked images are now in the daemon, named to match
+        # the compose ``image:`` refs (ghcr.io/spatiumddi/...:latest).
+        # docker-compose up will use them without a pull.
+        echo "Skipping docker-compose pull (locally-baked images installed)."
+    else
+        echo "Pulling SpatiumDDI image set (first boot)..."
+        # Retry pull on transient failures (slow image hosts, partial
+        # download). set -e at the script top would otherwise kill us
+        # on the first transient blip.
+        pull_ok=0
+        for i in 1 2 3; do
+            if docker-compose pull; then
+                pull_ok=1
+                break
+            fi
+            echo "Pull attempt $i failed; retrying in 10 s..."
+            sleep 10
+        done
+        [ "$pull_ok" = 1 ] || {
+            echo "ERROR: docker-compose pull failed 3 times. Check network + DNS."
+            exit 1
+        }
+    fi
+fi
+
+echo "Bringing stack up..."
+docker-compose up -d
+
+# Role-aware readiness check.
+#
+# Control / control-only roles run the api container, which exposes
+# /health/live on port 8000 (port-mapped to the host). Poll until it
+# answers; that's the "the operator can sign in now" signal.
+#
+# Agent roles (dns-* / dhcp-*) don't run a local api — there's no
+# /health/live to poll on this box. Instead, confirm every container
+# in the active compose profile reports state=running. The agent
+# itself retries forever against the remote control plane, so
+# "containers up" is the strongest signal we can give without a
+# round trip across the LAN.
+case "${APPLIANCE_ROLE:-control}" in
+    control|control-only)
+        echo "Waiting for control plane on http://127.0.0.1:8000/health/live …"
+        for i in $(seq 1 60); do
+            if curl -fsS --max-time 3 http://127.0.0.1:8000/health/live >/dev/null 2>&1; then
+                date -Iseconds > "$STAMP"
+                IP=$(ip -4 -o addr show scope global | awk '{print $4}' | cut -d/ -f1 | head -1)
+                echo "Ready: http://${IP:-<appliance-ip>}/"
+                exit 0
+            fi
+            sleep 5
+        done
+        echo "WARN: /health/live did not respond within 5 minutes." >&2
+        echo "      Check 'docker-compose -f $COMPOSE_DIR/docker-compose.yml logs'." >&2
+        exit 1
+        ;;
+    *)
+        echo "Waiting for agent container(s) to start (role=${APPLIANCE_ROLE}) …"
+        for i in $(seq 1 30); do
+            # Every service that COULD be running per the profile set
+            # must report state=running. Allow up to 2.5 min before we
+            # give up; agent images may need to docker-pull on first
+            # boot if they weren't baked into the ISO.
+            non_running=$(docker-compose ps --status=created --status=exited --status=dead --status=restarting -q 2>/dev/null | wc -l)
+            total=$(docker-compose ps -q 2>/dev/null | wc -l)
+            if [ "$total" -gt 0 ] && [ "$non_running" -eq 0 ]; then
+                date -Iseconds > "$STAMP"
+                IP=$(ip -4 -o addr show scope global | awk '{print $4}' | cut -d/ -f1 | head -1)
+                echo "Ready: agent appliance up at http://${IP:-<appliance-ip>}/"
+                echo "       Agent registers against: ${CONTROL_PLANE_URL:-<not set>}"
+                echo "       Live state: docker logs spatiumddi-*-1"
+                exit 0
+            fi
+            sleep 5
+        done
+        echo "WARN: agent containers did not all report 'running' within 2.5 minutes." >&2
+        echo "      Check 'docker-compose -f $COMPOSE_DIR/docker-compose.yml logs'." >&2
+        exit 1
+        ;;
+esac

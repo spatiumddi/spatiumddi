@@ -1,0 +1,31 @@
+// SpatiumDDI appliance unattended-upgrades override.
+// Sources: Debian's 50unattended-upgrades is left alone; this
+// drop-in adds the appliance-specific policy on top so distro
+// updates to 50 don't get clobbered.
+
+// Only the security pocket — no major version upgrades. Kernel
+// updates ARE allowed in the security pocket but they need a
+// reboot to take effect (the appliance dashboard will surface
+// /var/run/reboot-required once Phase 6 fleet-management lands).
+Unattended-Upgrade::Origins-Pattern {
+    "origin=Debian,codename=${distro_codename},label=Debian-Security";
+};
+
+// No mail — the appliance has no MTA and we don't want operators
+// to need to configure one to install the image.
+Unattended-Upgrade::Mail "";
+
+// Auto-remove unused dependencies after upgrade.
+Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
+Unattended-Upgrade::Remove-New-Unused-Dependencies "true";
+Unattended-Upgrade::Remove-Unused-Dependencies "true";
+
+// If the upgrade requires reboot, set a stamp file — the
+// appliance dashboard can surface this. Don't auto-reboot
+// (operator gets to decide; Phase 6 work).
+Unattended-Upgrade::Automatic-Reboot "false";
+
+// Don't hold updates if the package isn't installed cleanly —
+// log + continue.
+Unattended-Upgrade::OnlyOnACPower "false";
+Unattended-Upgrade::Skip-Updates-On-Metered-Connections "true";

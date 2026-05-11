@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends
 
 from app.api.v1.acme import router as acme_router
+from app.api.v1.admin.agent_keys import router as agent_keys_router
 from app.api.v1.admin.containers import router as containers_router
 from app.api.v1.admin.feature_modules import router as feature_modules_router
 from app.api.v1.admin.postgres import router as postgres_router
@@ -8,6 +9,7 @@ from app.api.v1.admin.trash import router as trash_router
 from app.api.v1.ai import router as ai_router
 from app.api.v1.alerts.router import router as alerts_router
 from app.api.v1.api_tokens.router import router as api_tokens_router
+from app.api.v1.appliance import router as appliance_router
 from app.api.v1.applications import router as applications_router
 from app.api.v1.asns import router as asns_router
 from app.api.v1.audit.router import router as audit_router
@@ -71,6 +73,7 @@ api_v1_router.include_router(
     tags=["ai"],
     dependencies=[Depends(require_module("ai.copilot"))],
 )
+api_v1_router.include_router(agent_keys_router, prefix="/admin", tags=["admin-agent-keys"])
 api_v1_router.include_router(containers_router, prefix="/admin", tags=["admin-containers"])
 api_v1_router.include_router(
     feature_modules_router, prefix="/admin", tags=["admin-feature-modules"]
@@ -79,6 +82,7 @@ api_v1_router.include_router(postgres_router, prefix="/admin", tags=["admin-post
 api_v1_router.include_router(trash_router, prefix="/admin", tags=["admin-trash"])
 api_v1_router.include_router(alerts_router, prefix="/alerts", tags=["alerts"])
 api_v1_router.include_router(api_tokens_router, prefix="/api-tokens", tags=["api-tokens"])
+api_v1_router.include_router(appliance_router, prefix="/appliance", tags=["appliance"])
 api_v1_router.include_router(applications_router, prefix="/applications", tags=["applications"])
 api_v1_router.include_router(
     asns_router,

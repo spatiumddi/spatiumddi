@@ -211,6 +211,11 @@ class DNSServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     agent_jwt_hash: Mapped[str | None] = mapped_column(String(128), nullable=True)
     agent_fingerprint: Mapped[str | None] = mapped_column(String(128), nullable=True)
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    # Source IP of the most recent agent heartbeat — visible in the UI
+    # so operators can identify which host an agent is actually on
+    # (the operator-set ``host``/``name`` is just a label; a NAT'd
+    # agent in a different subnet would otherwise be invisible).
+    last_seen_ip: Mapped[str | None] = mapped_column(String(45), nullable=True)
     last_config_etag: Mapped[str | None] = mapped_column(String(128), nullable=True)
     pending_approval: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     is_primary: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)

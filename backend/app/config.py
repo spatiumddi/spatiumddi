@@ -73,5 +73,40 @@ class Settings(BaseSettings):
     # it as a scanner / SSRF / relay. See app.core.demo_mode.
     demo_mode: bool = False
 
+    # Appliance mode — set true by the appliance ISO compose env so
+    # the API knows it's running on an appliance image (vs. plain
+    # docker-compose / k8s). Gates the "Appliance" sidebar section
+    # and the /api/v1/appliance/* router family that surfaces
+    # appliance-only management (TLS cert upload, release manager,
+    # container live-logs, host network config, maintenance mode,
+    # diagnostic bundle download). Phase 4 — see issue #134.
+    #
+    # appliance_version and appliance_hostname are populated by
+    # spatiumddi-firstboot at install time so the management UI can
+    # render "SpatiumDDI Appliance v0.1.0 @ host-name" without an
+    # extra round-trip into the OS.
+    appliance_mode: bool = False
+    appliance_version: str = ""
+    appliance_hostname: str = ""
+    # Comma-separated list of the host's real IPv4/IPv6 addresses,
+    # detected by spatiumddi-firstboot via `ip -o addr show scope global`
+    # and threaded through .env. Used by the self-signed cert bootstrap
+    # so the SAN list carries the IPs a browser will see (the api
+    # container's own socket-level view only knows the docker bridge IP).
+    # Empty on non-appliance deploys.
+    appliance_host_ips: str = ""
+
+    # Where the cert deployer (Phase 4b.2) writes the currently-active
+    # TLS cert + key. Mounted as a shared volume between the api
+    # container (writes) and the appliance frontend nginx container
+    # (reads from the same path on its side, conventionally
+    # /etc/nginx/certs). On dev / non-appliance deploys the directory
+    # may not exist; the deployer no-ops gracefully in that case.
+    appliance_cert_dir: str = "/var/lib/spatiumddi/certs"
+    # Name (or label) of the frontend container the deployer signals
+    # SIGHUP to when a new cert is activated, so nginx reloads its
+    # TLS context. Matches the compose service name on the appliance.
+    appliance_frontend_container: str = "spatiumddi-frontend"
+
 
 settings = Settings()

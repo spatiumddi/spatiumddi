@@ -1,0 +1,25 @@
+[Unit]
+Description=SpatiumDDI live-mode banner (runs when boot cmdline has spatium-mode=live)
+ConditionKernelCommandLine=spatium-mode=live
+# Same gate-on-getty@tty1 pattern as spatium-install.service. See
+# the long comment block there + the drop-in at
+# /etc/systemd/system/getty@tty1.service.d/spatium-mode-skip.conf
+# for the full rationale.
+After=getty@tty1.service systemd-user-sessions.service plymouth-quit.service
+After=spatiumddi-firstboot.service
+
+[Service]
+Type=idle
+ExecStartPre=-/usr/bin/systemctl stop getty@tty1.service
+ExecStart=/usr/local/bin/spatium-live-banner
+StandardInput=tty
+StandardOutput=tty
+StandardError=tty
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=yes
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
