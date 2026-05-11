@@ -535,6 +535,7 @@ search --no-floppy --fs-uuid --set=root $ROOT_UUID
 
 menuentry "SpatiumDDI Appliance" {
     linux /boot/vmlinuz-$KVER root=UUID=$ROOT_UUID ro quiet \\
+        loglevel=3 audit=0 systemd.show_status=false \\
         console=tty0 console=ttyS0,115200n8
     initrd /boot/initrd.img-$KVER
 }
