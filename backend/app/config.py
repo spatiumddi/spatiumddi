@@ -73,5 +73,21 @@ class Settings(BaseSettings):
     # it as a scanner / SSRF / relay. See app.core.demo_mode.
     demo_mode: bool = False
 
+    # Appliance mode — set true by the appliance ISO compose env so
+    # the API knows it's running on an appliance image (vs. plain
+    # docker-compose / k8s). Gates the "Appliance" sidebar section
+    # and the /api/v1/appliance/* router family that surfaces
+    # appliance-only management (TLS cert upload, release manager,
+    # container live-logs, host network config, maintenance mode,
+    # diagnostic bundle download). Phase 4 — see issue #134.
+    #
+    # appliance_version and appliance_hostname are populated by
+    # spatiumddi-firstboot at install time so the management UI can
+    # render "SpatiumDDI Appliance v0.1.0 @ host-name" without an
+    # extra round-trip into the OS.
+    appliance_mode: bool = False
+    appliance_version: str = ""
+    appliance_hostname: str = ""
+
 
 settings = Settings()

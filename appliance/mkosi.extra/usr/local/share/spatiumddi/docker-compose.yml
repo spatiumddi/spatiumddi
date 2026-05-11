@@ -75,6 +75,18 @@ services:
       CELERY_BROKER_URL: redis://redis:6379/1
       CELERY_RESULT_BACKEND: redis://redis:6379/2
       VERSION: ${SPATIUMDDI_VERSION:-latest}
+      # Appliance management surface (Phase 4, issue #134). The
+      # frontend reads /api/v1/version → appliance_mode and only
+      # renders the "Appliance" sidebar entry + /appliance route on
+      # installs that ship this flag. APPLIANCE_VERSION ships the
+      # ISO version (separate from SPATIUMDDI_VERSION which is the
+      # container image tag); APPLIANCE_HOSTNAME is sourced from
+      # `hostname` by spatiumddi-firstboot and threaded through the
+      # .env file so the management hub can show it without an
+      # extra round-trip into the OS.
+      APPLIANCE_MODE: "true"
+      APPLIANCE_VERSION: ${APPLIANCE_VERSION:-0.1.0}
+      APPLIANCE_HOSTNAME: ${APPLIANCE_HOSTNAME:-}
     depends_on:
       migrate:
         condition: service_completed_successfully

@@ -169,6 +169,19 @@ _BUILTIN_ROLES: dict[str, tuple[str, list[dict[str, object]]]] = {
             {"action": "read", "resource_type": "dhcp_scope"},
         ],
     ),
+    "Appliance Operator": (
+        "Full control of the SpatiumDDI OS appliance management surface "
+        "(issue #134, Phase 4): TLS cert upload, release manager, "
+        "container start/stop/restart + live logs, host network + "
+        "firewall config, maintenance mode, diagnostic bundle download. "
+        "Intended for ops staff who manage the appliance lifecycle "
+        "without needing full superadmin over the DDI data plane. "
+        "Granted ``admin`` on resource_type=appliance; superadmin "
+        "always bypasses anyway.",
+        [
+            {"action": "admin", "resource_type": "appliance"},
+        ],
+    ),
 }
 
 

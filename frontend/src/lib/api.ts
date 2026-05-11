@@ -6696,10 +6696,31 @@ export interface VersionInfo {
   latest_checked_at: string | null;
   release_check_enabled: boolean;
   latest_check_error: string | null;
+  // Appliance mode — true when the API runs on the SpatiumDDI OS
+  // appliance ISO. Gates the "Appliance" sidebar entry and the
+  // /appliance route. Phase 4 (issue #134).
+  appliance_mode: boolean;
+  appliance_version: string | null;
+  appliance_hostname: string | null;
 }
 
 export const versionApi = {
   get: () => api.get<VersionInfo>("/version").then((r) => r.data),
+};
+
+// ── Appliance management (Phase 4) ─────────────────────────────────
+// Mounted at /api/v1/appliance. Phase 4a ships only /info — sub-phases
+// 4b-4g extend this client with the real management surfaces (TLS
+// cert upload, release manager, containers, logs, network/host
+// config, web first-boot wizard).
+export interface ApplianceInfo {
+  appliance_mode: boolean;
+  appliance_version: string | null;
+  appliance_hostname: string | null;
+}
+
+export const applianceApi = {
+  getInfo: () => api.get<ApplianceInfo>("/appliance/info").then((r) => r.data),
 };
 
 // ── Kubernetes integration ─────────────────────────────────────────

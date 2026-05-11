@@ -52,6 +52,7 @@ import {
   Upload,
   AlertTriangle,
   Database,
+  Wrench,
   X,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -749,6 +750,24 @@ export function Sidebar({
             >
               <Sparkles className="h-4 w-4" />
             </a>
+          )}
+
+          {/*
+            Appliance management — only rendered when the API reports
+            appliance_mode=true (set by the SpatiumDDI OS appliance
+            ISO's compose env). The single entry routes to a tabbed
+            hub at /appliance that hosts Phase 4b-4g sub-surfaces
+            (TLS, releases, containers, logs, network/host,
+            maintenance). On non-appliance deploys this stays hidden.
+          */}
+          {versionInfo?.appliance_mode && (
+            <NavItem
+              label="Appliance"
+              icon={Wrench}
+              to="/appliance"
+              collapsed={effectiveCollapsed}
+              onNavigate={mobileOpen ? onMobileClose : undefined}
+            />
           )}
 
           <NavItem
