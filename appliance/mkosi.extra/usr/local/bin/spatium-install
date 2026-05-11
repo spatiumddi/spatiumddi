@@ -26,7 +26,21 @@ mkdir -p /var/log
 : > "$INSTALL_LOG"
 log() { echo "[$(date -Iseconds)] $*" | tee -a "$INSTALL_LOG"; }
 
+# Full bash trace to a separate file — when the wizard bails
+# unexpectedly, this captures every command + variable expansion so
+# we can pinpoint the exact line. Doesn't pollute the user-facing
+# install log.
+TRACE_LOG=/var/log/spatium-install-trace.log
+: > "$TRACE_LOG"
+exec 19> "$TRACE_LOG"
+BASH_XTRACEFD=19
+PS4='+ ${BASH_SOURCE##*/}:${LINENO}: ${FUNCNAME[0]:-main}() '
+set -x
+
+log "===== spatium-install wizard started at $(date -Iseconds) ====="
+
 on_cancel() {
+    set +x
     clear
     cat <<EOF
 
@@ -36,6 +50,7 @@ Run 'spatium-install' to start the wizard again,
 or 'reboot' to leave the live ISO and try a different boot path.
 
 EOF
+    log "Wizard cancelled at: $1"
     exec /bin/bash --login
 }
 
@@ -55,6 +70,7 @@ TIMEZONE="UTC"
 # ── Prompts ───────────────────────────────────────────────────────────────────
 
 welcome() {
+    log "Step: welcome"
     whiptail --backtitle "$BACKTITLE" --title "Welcome" \
         --msgbox "Welcome to the SpatiumDDI Appliance Installer.\n\n\
 This installer will ERASE a target disk and install SpatiumDDI to it.\n\n\
@@ -69,6 +85,7 @@ Press OK to begin, or Cancel to drop to a shell." 18 70 \
 }
 
 pick_disk() {
+    log "Step: pick_disk"
     local options=()
     local live_src
     live_src=$(findmnt -no SOURCE /run/live/medium 2>/dev/null || \
@@ -90,9 +107,11 @@ pick_disk() {
     done < <(lsblk -dn -o NAME,SIZE,MODEL -r 2>/dev/null | grep -vE "^(sr|loop|fd|ram|zram)")
 
     if [ ${#options[@]} -eq 0 ]; then
+        log "No installable disks found (lsblk: $(lsblk -dn -o NAME,SIZE,TYPE 2>&1 | tr '\n' ';'))"
         whiptail --backtitle "$BACKTITLE" --title "No disks" \
-            --msgbox "No installable disks found.\n\nAttach a target disk to the VM and reboot." 10 60
-        exit 1
+            --msgbox "No installable disks found.\n\nAttach a target disk to the VM and reboot." 10 60 \
+            || true
+        on_cancel "disk picker (no disks present)"
     fi
 
     TARGET_DISK=$(whiptail --backtitle "$BACKTITLE" --title "Target Disk" \
@@ -102,6 +121,7 @@ pick_disk() {
 }
 
 ask_hostname() {
+    log "Step: ask_hostname"
     HOSTNAME=$(whiptail --backtitle "$BACKTITLE" --title "Hostname" \
         --inputbox "System hostname (also shown in shell prompts + audit logs):" \
         10 70 "$HOSTNAME" 3>&1 1>&2 2>&3) \
@@ -110,6 +130,7 @@ ask_hostname() {
 }
 
 ask_user_password() {
+    log "Step: ask_user_password"
     ADMIN_USER=$(whiptail --backtitle "$BACKTITLE" --title "Admin OS user" \
         --inputbox "OS-level admin username (for SSH + sudo).\n\nThe SpatiumDDI web UI uses 'admin/admin' separately — change it on first login." \
         12 70 "$ADMIN_USER" 3>&1 1>&2 2>&3) \
@@ -136,6 +157,7 @@ ask_user_password() {
 }
 
 ask_network() {
+    log "Step: ask_network"
     NET_MODE=$(whiptail --backtitle "$BACKTITLE" --title "Network" \
         --menu "How should the appliance configure its network?" 12 70 2 \
         "dhcp"   "Automatic via DHCP (recommended for evaluation)" \
@@ -172,6 +194,7 @@ ask_network() {
 }
 
 ask_timezone() {
+    log "Step: ask_timezone"
     TIMEZONE=$(whiptail --backtitle "$BACKTITLE" --title "Timezone" \
         --inputbox "Timezone (IANA name, e.g. America/Toronto, Europe/Berlin, UTC):" \
         10 70 "$TIMEZONE" 3>&1 1>&2 2>&3) \
@@ -180,6 +203,7 @@ ask_timezone() {
 }
 
 confirm() {
+    log "Step: confirm"
     local s
     s="Target disk: $TARGET_DISK\n"
     s+="Hostname:    $HOSTNAME\n"
@@ -498,12 +522,15 @@ main() {
 on_failure() {
     local exit_code=$?
     [ "$exit_code" -eq 0 ] && exit 0
+    set +x
     clear
     echo
     echo "Installer exited with status $exit_code — last lines of $INSTALL_LOG:"
     echo "──────────────────────────────────────────────────────────────────"
     tail -20 "$INSTALL_LOG" 2>/dev/null || echo "(no log captured)"
     echo "──────────────────────────────────────────────────────────────────"
+    echo
+    echo "Full bash trace at: $TRACE_LOG  (tail -30 for the bail point)"
     echo
     echo "Press Enter to drop to a root shell."
     echo "(From the shell you can re-run 'spatium-install' or 'reboot'.)"
