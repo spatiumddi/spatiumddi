@@ -156,13 +156,22 @@ cat > "$ISO_ROOT/boot/grub/grub.cfg" <<'EOF'
 set timeout=3
 set default=0
 
+# `cloud-init=disabled` suppresses cloud-init in live-ISO mode. The
+# appliance image bakes cloud-init in for the qcow2 disk-boot path
+# (NoCloud datasource for headless bootstrap), but a plain CD-ROM
+# live boot has no datasource attached and cloud-init's failure
+# emits noisy errors + creates a systemd ordering cycle.
+# spatiumddi-firstboot.service does all the actual orchestration —
+# generate secrets, docker compose up, wait for /health/live —
+# without needing cloud-init.
+
 menuentry "SpatiumDDI Appliance - Live" {
-    linux /live/vmlinuz boot=live components quiet
+    linux /live/vmlinuz boot=live components quiet cloud-init=disabled
     initrd /live/initrd.img
 }
 
 menuentry "SpatiumDDI Appliance - Live (verbose)" {
-    linux /live/vmlinuz boot=live components
+    linux /live/vmlinuz boot=live components cloud-init=disabled
     initrd /live/initrd.img
 }
 EOF

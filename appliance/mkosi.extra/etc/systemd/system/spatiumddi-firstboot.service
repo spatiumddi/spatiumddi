@@ -1,7 +1,15 @@
 [Unit]
 Description=SpatiumDDI appliance first-boot orchestrator + stack supervisor
-After=docker.service network-online.target cloud-final.service
-Wants=docker.service network-online.target cloud-final.service
+# docker.service is the only hard dependency. We previously also
+# pinned `network-online.target` and `cloud-final.service`, but in
+# live-ISO mode that chain creates an ordering cycle with live-config
+# and systemd deletes our unit to break it (visible as
+# "Ordering cycle found, skipping spatiumddi-firstboot.service"
+# during boot). docker.service already pulls in network.target via
+# its own deps, and the orchestrator's `docker compose pull` step
+# tolerates network coming up a bit late.
+After=docker.service
+Requires=docker.service
 
 [Service]
 Type=oneshot
