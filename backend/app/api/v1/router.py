@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends
 
 from app.api.v1.acme import router as acme_router
+from app.api.v1.admin.agent_keys import router as agent_keys_router
 from app.api.v1.admin.containers import router as containers_router
 from app.api.v1.admin.feature_modules import router as feature_modules_router
 from app.api.v1.admin.postgres import router as postgres_router
@@ -72,6 +73,7 @@ api_v1_router.include_router(
     tags=["ai"],
     dependencies=[Depends(require_module("ai.copilot"))],
 )
+api_v1_router.include_router(agent_keys_router, prefix="/admin", tags=["admin-agent-keys"])
 api_v1_router.include_router(containers_router, prefix="/admin", tags=["admin-containers"])
 api_v1_router.include_router(
     feature_modules_router, prefix="/admin", tags=["admin-feature-modules"]

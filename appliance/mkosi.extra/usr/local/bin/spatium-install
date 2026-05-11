@@ -106,6 +106,20 @@ NET_PREFIX="24"
 NET_GATEWAY=""
 NET_DNS="1.1.1.1 1.0.0.1"
 TIMEZONE="UTC"
+# Role-split appliance (Phase 6, issue #134). One of:
+#   control     — full SpatiumDDI stack (api + worker + beat + db
+#                 + redis + frontend + bundled DNS/DHCP agents).
+#   dns-agent   — BIND9 agent only; needs to register with a
+#                 remote control plane via CONTROL_PLANE_URL +
+#                 DNS_AGENT_KEY. Minimal HTTPS landing page.
+#   dhcp-agent  — Kea agent only; same shape as dns-agent but with
+#                 DHCP_AGENT_KEY.
+# Every role still creates an OS admin account so the operator can
+# SSH in and manage the appliance, irrespective of which web UI runs.
+ROLE="control"
+CONTROL_PLANE_URL=""
+DNS_AGENT_KEY=""
+DHCP_AGENT_KEY=""
 
 # ── Prompts ───────────────────────────────────────────────────────────────────
 
@@ -115,13 +129,74 @@ welcome() {
         --msgbox "Welcome to the SpatiumDDI Appliance Installer.\n\n\
 This installer will ERASE a target disk and install SpatiumDDI to it.\n\n\
 You'll be asked for:\n\
+  - Role (full control plane, or DNS / DHCP agent)\n\
   - Target disk\n\
   - Hostname\n\
-  - Admin OS user + password (web-UI login is separate)\n\
+  - Admin OS user + password (for SSH access)\n\
   - Network (DHCP or static)\n\
   - Timezone\n\n\
 Press OK to begin, or Cancel to drop to a shell." 18 70 \
         || on_cancel "welcome"
+}
+
+ask_role() {
+    log "Step: ask_role"
+    # whiptail --radiolist returns the selected tag on stdout. The third
+    # column is the initial-selection flag (ON for control, OFF for the
+    # others) — operators installing a full SpatiumDDI hit Enter twice.
+    ROLE=$(whiptail --backtitle "$BACKTITLE" --title "Appliance role" \
+        --radiolist "What role does this appliance play?\n\nA control plane runs the full SpatiumDDI stack (api / worker / beat / postgres / redis / web UI + bundled DNS+DHCP agents).\n\nA DNS or DHCP agent runs only that service container and registers with a remote control plane. Useful for distributed deployments where DNS/DHCP live closer to the clients they serve." \
+        20 78 3 \
+        "control"    "Control plane (full SpatiumDDI stack)" ON \
+        "dns-agent"  "DNS agent only (BIND9 + agent process)" OFF \
+        "dhcp-agent" "DHCP agent only (Kea + agent process)" OFF \
+        3>&1 1>&2 2>&3) \
+        || on_cancel "role selection"
+    log "Selected role: $ROLE"
+}
+
+ask_agent_config() {
+    # Only fires when ROLE != control. Collects the control-plane URL
+    # the agent will register against + the matching pre-shared agent
+    # key. The agent persists a rotating JWT to disk after the first
+    # successful bootstrap, so this key is only used on cold start.
+    [ "$ROLE" = "control" ] && return 0
+    log "Step: ask_agent_config (role=$ROLE)"
+
+    CONTROL_PLANE_URL=$(whiptail --backtitle "$BACKTITLE" \
+        --title "Control plane URL" \
+        --inputbox "Where does this agent register?\n\nFormat: https://<control-plane-host>/  — the URL of the SpatiumDDI control plane this agent connects to. The agent posts heartbeats + long-polls /config from here.\n\nUse https:// in production; http:// is acceptable for lab installs but the agent key crosses the wire in clear." \
+        14 72 "https://" 3>&1 1>&2 2>&3) \
+        || on_cancel "control-plane URL"
+    if [ -z "$CONTROL_PLANE_URL" ] || [ "$CONTROL_PLANE_URL" = "https://" ]; then
+        whiptail --msgbox "Control-plane URL is required for agent installs." 8 60 || true
+        ask_agent_config
+        return
+    fi
+
+    local key_var key_label
+    if [ "$ROLE" = "dns-agent" ]; then
+        key_label="DNS agent key"
+        key_var="DNS_AGENT_KEY"
+    else
+        key_label="DHCP agent key"
+        key_var="DHCP_AGENT_KEY"
+    fi
+    local key_val
+    key_val=$(whiptail --backtitle "$BACKTITLE" --title "$key_label" \
+        --inputbox "Pre-shared $key_label for first-boot registration.\n\nFind it in the control plane:  Settings -> DNS or DHCP agents -> Bootstrap key.\nThe agent exchanges this key for a rotating JWT on first contact + caches the JWT under /var/lib/spatium-${ROLE%-agent}-agent/ for subsequent runs." \
+        14 72 "" 3>&1 1>&2 2>&3) \
+        || on_cancel "agent key"
+    if [ -z "$key_val" ]; then
+        whiptail --msgbox "$key_label is required for agent installs." 8 60 || true
+        ask_agent_config
+        return
+    fi
+    if [ "$ROLE" = "dns-agent" ]; then
+        DNS_AGENT_KEY="$key_val"
+    else
+        DHCP_AGENT_KEY="$key_val"
+    fi
 }
 
 pick_disk() {
@@ -244,8 +319,19 @@ ask_timezone() {
 
 confirm() {
     log "Step: confirm"
+    local role_label
+    case "$ROLE" in
+        control)    role_label="Control plane (full stack)" ;;
+        dns-agent)  role_label="DNS agent only" ;;
+        dhcp-agent) role_label="DHCP agent only" ;;
+        *)          role_label="$ROLE" ;;
+    esac
     local s
-    s="Target disk: $TARGET_DISK\n"
+    s="Role:        $role_label\n"
+    if [ "$ROLE" != "control" ]; then
+        s+="Control URL: $CONTROL_PLANE_URL\n"
+    fi
+    s+="Target disk: $TARGET_DISK\n"
     s+="Hostname:    $HOSTNAME\n"
     s+="OS user:     $ADMIN_USER\n"
     s+="Network:     $NET_MODE"
@@ -256,7 +342,7 @@ confirm() {
     s+="WARNING: $TARGET_DISK will be ERASED. There is no undo.\n\n"
     s+="Proceed with installation?"
     whiptail --backtitle "$BACKTITLE" --title "Confirm" \
-        --yesno "$s" 18 70 \
+        --yesno "$s" 20 72 \
         || on_cancel "final confirmation"
 }
 
@@ -358,6 +444,23 @@ do_install() {
 
         echo "XXX"; echo "65"; echo "Writing system config..."; echo "XXX"
         echo "$HOSTNAME" > "$MOUNT/etc/hostname"
+        # Phase 6 — role config consumed by spatiumddi-firstboot to
+        # set COMPOSE_PROFILES + write CONTROL_PLANE_URL / agent keys
+        # to /etc/spatiumddi/.env. World-readable on the installed
+        # system (no secrets — the agent key only lives transiently
+        # here on the live ISO and gets moved into the 0600 .env at
+        # first boot).
+        mkdir -p "$MOUNT/etc/spatiumddi"
+        cat > "$MOUNT/etc/spatiumddi/role-config" <<EOF
+ROLE=$ROLE
+CONTROL_PLANE_URL=$CONTROL_PLANE_URL
+DNS_AGENT_KEY=$DNS_AGENT_KEY
+DHCP_AGENT_KEY=$DHCP_AGENT_KEY
+EOF
+        # Operator-supplied agent key is sensitive even before
+        # firstboot transcribes it into .env — restrict the
+        # role-config file to root.
+        chmod 0600 "$MOUNT/etc/spatiumddi/role-config"
         cat > "$MOUNT/etc/hosts" <<EOF
 127.0.0.1 localhost
 127.0.1.1 $HOSTNAME
@@ -678,11 +781,13 @@ main() {
         exit 1
     fi
     welcome
+    ask_role
     pick_disk
     ask_hostname
     ask_user_password
     ask_network
     ask_timezone
+    ask_agent_config
     confirm
     do_install
 }

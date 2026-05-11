@@ -6887,6 +6887,25 @@ export const applianceContainersApi = {
       .then((r) => r.data),
 };
 
+// ── Agent bootstrap keys (Phase 6 prerequisite) ────────────────────
+// Reveal the DNS_AGENT_KEY + DHCP_AGENT_KEY the control plane uses
+// to validate first-boot agent registration. Applies to every
+// deployment topology (docker, k8s, appliance) — the keys live in
+// the api container's env regardless of how it's deployed.
+export interface AgentBootstrapKeysReveal {
+  dns_agent_key: string;
+  dhcp_agent_key: string;
+  dns_agent_configured: boolean;
+  dhcp_agent_configured: boolean;
+}
+
+export const agentBootstrapKeysApi = {
+  reveal: (password: string) =>
+    api
+      .post<AgentBootstrapKeysReveal>("/admin/agent-keys/reveal", { password })
+      .then((r) => r.data),
+};
+
 // ── Appliance: system info + lifecycle (Phase 4f) ──────────────────
 export interface ApplianceSystemInfo {
   hostname: string;

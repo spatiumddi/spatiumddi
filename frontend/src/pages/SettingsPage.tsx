@@ -21,6 +21,7 @@ import { cn } from "@/lib/utils";
 import { Modal } from "@/components/ui/modal";
 import { Toggle } from "@/components/ui/toggle";
 import { AuditForwardTargets } from "@/components/AuditForwardTargets";
+import { AgentBootstrapKeysSection } from "@/components/AgentBootstrapKeysSection";
 
 const OUI_SOURCE_URL = "https://standards-oui.ieee.org/oui/oui.csv";
 
@@ -63,6 +64,7 @@ type SectionId =
   | "ai-digest"
   | "password-policy"
   | "account-lockout"
+  | "agent-bootstrap-keys"
   | "session"
   | "subnet-tree"
   | "updates"
@@ -159,6 +161,11 @@ const SECTION_FIELDS: Record<SectionId, (keyof PlatformSettings)[]> = {
     "lockout_duration_minutes",
     "lockout_reset_minutes",
   ],
+  // Agent bootstrap keys aren't PlatformSettings columns — they're env
+  // vars on the api container. The reveal section drives no
+  // "Reset to defaults" button, so this key just exists for the
+  // type-completeness check.
+  "agent-bootstrap-keys": [],
   session: ["session_timeout_minutes", "auto_logout_minutes"],
   "subnet-tree": ["subnet_tree_default_expanded_depth"],
   updates: ["github_release_check_enabled"],
@@ -695,6 +702,27 @@ const SECTIONS: SectionDef[] = [
     group: "Security",
     description: "Login session lifetime and idle behavior.",
     keywords: ["timeout", "logout", "expiry", "auth"],
+  },
+  {
+    id: "agent-bootstrap-keys",
+    title: "Agent bootstrap keys",
+    group: "Security",
+    description:
+      "Reveal the DNS_AGENT_KEY + DHCP_AGENT_KEY this control plane uses to validate first-boot agent registration. Password-confirm gate; superadmin only; every reveal is audited. Same keys work for appliance role-split installs, docker / k8s agents, and bare-metal deployments.",
+    keywords: [
+      "agent",
+      "bootstrap",
+      "key",
+      "dns_agent_key",
+      "dhcp_agent_key",
+      "registration",
+      "psk",
+      "preshared",
+      "distributed",
+      "appliance",
+      "role",
+      "split",
+    ],
   },
 
   // ── IPAM ─────────────────────────────────────────────────────────────
@@ -1859,6 +1887,10 @@ export function SettingsPage() {
                   </div>
                 </Field>
               </>
+            )}
+
+            {activeId === "agent-bootstrap-keys" && (
+              <AgentBootstrapKeysSection />
             )}
 
             {activeId === "subnet-tree" && (
