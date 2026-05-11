@@ -51,7 +51,7 @@
 - [Full feature detail](#full-feature-detail) — deep dive on every subsystem
 - [Screenshots](#screenshots)
 - [Architecture](#architecture)
-- [Getting Started](#getting-started) — Docker Compose quick start, demo seed, upgrade flow, admin reset
+- [Getting Started](#getting-started) — Docker Compose quick start, OS appliance ISO, demo seed, upgrade flow, admin reset
 - [Deployment Options](#deployment-options)
 - [Documentation](#documentation)
 - [Project Status](#project-status)
@@ -721,6 +721,41 @@ dig @127.0.0.1 -p 1053 -x <your-ip> +short    # reverse (PTR)
 Record changes propagate to BIND9 via RFC 2136 — typically sub-second, no daemon restart. Zone / ACL / view changes trigger a config reload.
 
 **Production**: point the agent at your real control plane, expose `53/udp` + `53/tcp`, and run one container per DNS server you want in the cluster. All servers in a group share the same TSIG key for dynamic updates.
+
+### Quick start with the OS appliance ISO
+
+If you'd rather skip the Docker setup entirely, SpatiumDDI ships a self-contained OS appliance image — Debian 13 with the full stack pre-installed. Boot it, run a five-question installer, and you're on HTTPS with all the SpatiumDDI services running. No prior Docker or Linux setup required.
+
+**Get the ISO:**
+
+- Each [GitHub release](https://github.com/spatiumddi/spatiumddi/releases) attaches `spatiumddi-appliance-<version>.iso` (~440 MB, hybrid USB/CD).
+- Or build from source: `make appliance && make appliance-iso` produces the ISO in `appliance/build/`. See [`docs/deployment/APPLIANCE.md`](docs/deployment/APPLIANCE.md) for the build prerequisites.
+
+**Install:**
+
+1. Attach the ISO as a CD-ROM in your hypervisor (Proxmox / VMware / Hyper-V / QEMU) or `dd` it to a USB stick for bare metal.
+2. Boot it. The live ISO drops you into a Proxmox-style whiptail wizard — pick a target disk, hostname, admin password, DHCP-or-static network, and timezone.
+3. The wizard partitions the disk (GPT: BIOS Boot + ESP + ext4 root), `rsync`s the live rootfs onto it, installs GRUB for both BIOS and UEFI, and reboots.
+4. First boot brings up the SpatiumDDI stack (api, worker, beat, postgres, redis, frontend) and auto-generates a self-signed TLS cert. Total time: ~2-5 minutes.
+
+**Access:**
+
+Browse to `https://<appliance-ip>/`. Your browser will warn about the self-signed cert — accept once, then sign in with `admin / admin` (forces password change on first login). Plain HTTP gets 301-redirected to HTTPS.
+
+**Appliance management (`/appliance`):**
+
+The appliance ships with a dedicated management hub in the sidebar covering everything an OS-level operator needs without an SSH session:
+
+- **Web UI Certificate** — replace the self-signed cert: paste a PEM cert + key, generate a CSR (key stays on the server) and import the signed cert, or upload a Let's Encrypt cert. Activating a cert hot-reloads nginx.
+- **Releases** — list recent GitHub releases, one-click upgrade — the host-side path-unit recycles the stack so the api can recreate itself cleanly.
+- **Containers** — list every container, start/stop/restart, live-stream logs over SSE.
+- **Logs & Diagnostics** — host log viewer (firstboot, update log), self-test runner (DNS / container health / API / DHCP / DNS daemon checks), one-click diagnostic bundle download (secrets redacted).
+- **Network & Host** — read-only hostname / host IPs / uptime / reboot-pending banner.
+- **Maintenance** — maintenance-mode flag + reboot button (10 s grace).
+
+Operators stuck without a working web UI can still SSH in as the admin user they created during install and use `journalctl -u spatiumddi-firstboot`, `docker compose -f /usr/local/share/spatiumddi/docker-compose.yml ps`, etc.
+
+> The appliance is alpha (Phase 4 — issue [#134](https://github.com/spatiumddi/spatiumddi/issues/134)). See [`docs/deployment/APPLIANCE.md`](docs/deployment/APPLIANCE.md) for the full design, build pipeline, and known limitations.
 
 ### API & interactive docs
 
