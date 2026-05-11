@@ -325,21 +325,21 @@ EOF
             >> "$INSTALL_LOG" 2>&1 || true
 
         echo "80"; echo "XXX"; echo "Installing bootloader (BIOS + UEFI)..."; echo "XXX"
-        chroot "$MOUNT" grub-install --target=i386-pc "$TARGET_DISK" \
+        chroot "$MOUNT" /usr/sbin/grub-install --target=i386-pc "$TARGET_DISK" \
             >> "$INSTALL_LOG" 2>&1
-        chroot "$MOUNT" grub-install --target=x86_64-efi \
+        chroot "$MOUNT" /usr/sbin/grub-install --target=x86_64-efi \
             --efi-directory=/boot/efi \
             --bootloader-id=SPATIUMDDI \
             --removable \
             >> "$INSTALL_LOG" 2>&1 || true
-        chroot "$MOUNT" update-grub >> "$INSTALL_LOG" 2>&1
+        chroot "$MOUNT" /usr/sbin/update-grub >> "$INSTALL_LOG" 2>&1
 
         echo "90"; echo "XXX"; echo "Regenerating initrd for disk boot..."; echo "XXX"
         # The squashfs-derived initrd has live-boot active. The
         # installed system needs a regular disk-boot initrd. Regenerate
         # in chroot — without `boot=live` on the cmdline it'll be a
         # normal initrd.
-        chroot "$MOUNT" update-initramfs -u >> "$INSTALL_LOG" 2>&1
+        chroot "$MOUNT" /usr/sbin/update-initramfs -u >> "$INSTALL_LOG" 2>&1
 
         echo "95"; echo "XXX"; echo "Unmounting..."; echo "XXX"
         for d in dev sys proc; do
