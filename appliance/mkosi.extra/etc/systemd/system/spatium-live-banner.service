@@ -1,10 +1,10 @@
 [Unit]
 Description=SpatiumDDI live-mode banner (runs when boot cmdline has spatium-mode=live)
 ConditionKernelCommandLine=spatium-mode=live
-# See spatium-install.service for the Conflicts= → ExecStartPre
-# swap rationale. Short version: Conflicts= is registered at
-# unit-load even when this unit's Condition prevents it from
-# activating, blocking getty@tty1 on installed systems.
+# Same gate-on-getty@tty1 pattern as spatium-install.service. See
+# the long comment block there + the drop-in at
+# /etc/systemd/system/getty@tty1.service.d/spatium-mode-skip.conf
+# for the full rationale.
 After=getty@tty1.service systemd-user-sessions.service plymouth-quit.service
 After=spatiumddi-firstboot.service
 

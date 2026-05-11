@@ -5,10 +5,18 @@ ConditionKernelCommandLine=spatium-mode=install
 # evaluates Conflicts= at unit-load time even when the unit's
 # ConditionKernelCommandLine prevents activation — so on the
 # *installed* system (no spatium-mode= flag), getty@tty1 ends up
-# in ConflictedBy with this unit and never auto-starts. VGA
-# console then has no login prompt. The stop is done as
-# ExecStartPre below instead — only fires when this unit
-# actually activates on the live ISO.
+# in ConflictedBy with this unit and never auto-starts.
+#
+# Gate is on getty@tty1 itself via a drop-in:
+#   /etc/systemd/system/getty@tty1.service.d/spatium-mode-skip.conf
+# That drop-in skips agetty when spatium-mode={install,live} is in
+# the cmdline, so on the live ISO getty@tty1 never starts (no race,
+# no autologin flash) and on the installed system it auto-starts
+# as Debian intended.
+#
+# The ExecStartPre stop below is belt-and-braces in case anything
+# else (live-config hooks, manual `systemctl start`) tries to fire
+# agetty on tty1 while the wizard owns it.
 After=getty@tty1.service systemd-user-sessions.service plymouth-quit.service
 After=systemd-networkd.service
 
