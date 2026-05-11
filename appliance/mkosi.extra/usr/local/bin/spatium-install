@@ -33,7 +33,14 @@ log() { echo "[$(date -Iseconds)] $*" | tee -a "$INSTALL_LOG"; }
 TRACE_LOG=/var/log/spatium-install-trace.log
 : > "$TRACE_LOG"
 exec 19> "$TRACE_LOG"
-BASH_XTRACEFD=19
+# Export so the gauge subshell pipeline below inherits the same
+# trace fd. Without export, the subshell's BASH_XTRACEFD defaults
+# to stderr — and the install pipeline pipes stdout to whiptail
+# while stderr is the terminal, so every traced command writes
+# garbage to the same TTY whiptail is trying to redraw. Result:
+# whiptail's progress dialog never updates because its display
+# fights with set -x output.
+export BASH_XTRACEFD=19
 PS4='+ ${BASH_SOURCE##*/}:${LINENO}: ${FUNCNAME[0]:-main}() '
 set -x
 
@@ -441,16 +448,20 @@ EOF
         # is disabled (live system is running...)" and exits 0). The
         # rsync'd rootfs inherits that diversion, so a naive
         # `chroot $MOUNT update-initramfs` is silently the no-op and
-        # /boot/initrd.img-<kver> never lands. Two fixes here:
-        # (1) undivert in the chroot so update-initramfs is the real
-        #     binary again. The diverted-aside original is at
-        #     /usr/sbin/update-initramfs.orig.initramfs-tools — the
-        #     --remove --rename of the divert moves it back into
-        #     place AND deletes the symlink.
-        # (2) Generate a fresh disk-boot initrd. -c creates a new
-        #     initrd (vs -u for updating an existing one — there's
-        #     nothing to update, /boot is empty).
+        # /boot/initrd.img-<kver> never lands. Fix in three steps:
+        # (1) `rm` the live-tools symlink at /usr/sbin/update-initramfs.
+        #     A bare `dpkg-divert --rename --remove` errors with
+        #     "rename involves overwriting ... with different file ...
+        #     not allowed" because the symlink is in the way.
+        # (2) `dpkg-divert --rename --remove` then moves the parked
+        #     /usr/sbin/update-initramfs.orig.initramfs-tools back
+        #     into /usr/sbin/update-initramfs cleanly.
+        # (3) update-initramfs is now the real binary and future
+        #     kernel upgrades on the installed system regenerate
+        #     initrds normally.
         log "Undiverting update-initramfs (live-tools shadowed it as a no-op)"
+        chroot "$MOUNT" rm -f /usr/sbin/update-initramfs \
+            >> "$INSTALL_LOG" 2>&1 || true
         chroot "$MOUNT" /usr/bin/dpkg-divert --rename --remove \
             /usr/sbin/update-initramfs >> "$INSTALL_LOG" 2>&1 || true
 
