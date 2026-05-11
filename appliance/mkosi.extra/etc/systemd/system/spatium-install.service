@@ -1,12 +1,20 @@
 [Unit]
 Description=SpatiumDDI installer wizard (runs when boot cmdline has spatium-mode=install)
 ConditionKernelCommandLine=spatium-mode=install
-Conflicts=getty@tty1.service
+# NOTE: do NOT use `Conflicts=getty@tty1.service` here. systemd
+# evaluates Conflicts= at unit-load time even when the unit's
+# ConditionKernelCommandLine prevents activation — so on the
+# *installed* system (no spatium-mode= flag), getty@tty1 ends up
+# in ConflictedBy with this unit and never auto-starts. VGA
+# console then has no login prompt. The stop is done as
+# ExecStartPre below instead — only fires when this unit
+# actually activates on the live ISO.
 After=getty@tty1.service systemd-user-sessions.service plymouth-quit.service
 After=systemd-networkd.service
 
 [Service]
 Type=idle
+ExecStartPre=-/usr/bin/systemctl stop getty@tty1.service
 ExecStart=/usr/local/bin/spatium-install
 StandardInput=tty
 StandardOutput=tty
