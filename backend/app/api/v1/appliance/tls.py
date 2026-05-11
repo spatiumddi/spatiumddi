@@ -24,6 +24,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy import select
 
 from app.api.deps import DB, CurrentUser
+from app.config import settings
 from app.core.crypto import encrypt_str
 from app.core.permissions import require_permission
 from app.models.appliance import (
@@ -32,6 +33,7 @@ from app.models.appliance import (
     ApplianceCertificate,
 )
 from app.models.audit import AuditLog
+from app.services.appliance.deployment import deploy_and_reload
 from app.services.appliance.tls import (
     KEY_TYPES,
     CSRSubject,
@@ -265,6 +267,9 @@ async def upload_certificate(
         subject_cn=row.subject_cn,
         is_active=row.is_active,
     )
+    # Pass body.key_pem so the deployer doesn't have to re-decrypt
+    # what we just encrypted milliseconds ago.
+    _deploy_if_active(row, body.key_pem)
     return _to_summary(row)
 
 
@@ -454,6 +459,9 @@ async def import_signed_cert(
         subject_cn=row.subject_cn,
         is_active=row.is_active,
     )
+    # ``stored_key_pem`` is in scope from earlier in this function
+    # — reuse it so we don't decrypt twice.
+    _deploy_if_active(row, stored_key_pem)
     return _to_summary(row)
 
 
@@ -506,6 +514,8 @@ async def activate_certificate(
     await db.commit()
     await db.refresh(row)
     logger.info("appliance_cert_activated", cert_id=str(row.id), name=row.name)
+    # Decrypt + write cert files + HUP nginx. No-op on non-appliance.
+    _deploy_if_active(row, None)
     return _to_summary(row)
 
 
@@ -548,6 +558,42 @@ async def delete_certificate(
 
 
 # ── Internal helpers ────────────────────────────────────────────────
+
+
+def _deploy_if_active(row: ApplianceCertificate, key_pem: str | None) -> None:
+    """Materialise an active cert onto disk + signal nginx to reload.
+
+    Called from the three endpoints that flip is_active=True after
+    the DB commit lands. ``key_pem`` is the decrypted private key —
+    callers that have it in hand (upload / import) pass it through
+    so we don't double-decrypt; activate-only calls pass None and we
+    re-decrypt from ``row.key_encrypted``.
+
+    Failure inside the deployer is logged but never raised — the DB
+    is the source of truth ("this cert IS active"); the cert-on-disk
+    is just the materialisation. A stuck nginx reload still leaves
+    the API state correct, and Path A of ensure_self_signed_cert will
+    re-deploy on next api boot.
+
+    No-op when settings.appliance_mode is false.
+    """
+    if not row.is_active or not row.cert_pem:
+        return
+    if not settings.appliance_mode:
+        return
+    if key_pem is None:
+        from app.core.crypto import decrypt_str  # noqa: PLC0415
+
+        try:
+            key_pem = decrypt_str(row.key_encrypted)
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "appliance_cert_deploy_decrypt_failed",
+                cert_id=str(row.id),
+                error=str(exc),
+            )
+            return
+    deploy_and_reload(row.cert_pem, key_pem, name=row.name)
 
 
 async def _activate_only(db: DB, target: ApplianceCertificate) -> None:

@@ -45,6 +45,12 @@ dependencies = [
     "azure-storage-blob>=12.20.0",
     "smbprotocol>=1.13.0",
     "google-cloud-storage>=2.18.0",
+    # docker SDK — only used on the SpatiumDDI OS appliance to send
+    # SIGHUP to the frontend container when a new TLS cert is
+    # activated (Phase 4b.2, issue #134). The cert deployer is gated
+    # on settings.appliance_mode + presence of /var/run/docker.sock,
+    # so plain Docker / K8s deploys pay zero cost.
+    "docker>=7.1.0",
 ]
 
 [project.optional-dependencies]

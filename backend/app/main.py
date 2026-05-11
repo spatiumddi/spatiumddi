@@ -281,6 +281,21 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
         await seed_audit_chain_alert_rule()
     except Exception as exc:  # noqa: BLE001
         logger.debug("audit_chain_alert_rule_seed_skipped", reason=str(exc))
+    # Appliance Web UI cert bootstrap (issue #134, Phase 4b.5). On
+    # appliance installs without an active row in appliance_certificate,
+    # generate a self-signed default + deploy it to /etc/nginx/certs
+    # so the frontend container has something to serve from the very
+    # first HTTPS hit. No-op on plain Docker / K8s deploys (gated on
+    # settings.appliance_mode). Failure-tolerant — the appliance must
+    # still come up on a non-TLS path even if cert bootstrap fails.
+    try:
+        from app.services.appliance.bootstrap import ensure_self_signed_cert  # noqa: PLC0415
+
+        await ensure_self_signed_cert()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning(
+            "appliance_self_signed_bootstrap_failed", error=str(exc)
+        )
     # Backfill enclosing IPBlocks for any pre-existing multicast
     # groups (issue #126 — IPAM-side rendering). Idempotent; only
     # creates blocks where missing. Cheap enough to run on every

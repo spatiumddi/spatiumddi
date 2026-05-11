@@ -89,5 +89,17 @@ class Settings(BaseSettings):
     appliance_version: str = ""
     appliance_hostname: str = ""
 
+    # Where the cert deployer (Phase 4b.2) writes the currently-active
+    # TLS cert + key. Mounted as a shared volume between the api
+    # container (writes) and the appliance frontend nginx container
+    # (reads from the same path on its side, conventionally
+    # /etc/nginx/certs). On dev / non-appliance deploys the directory
+    # may not exist; the deployer no-ops gracefully in that case.
+    appliance_cert_dir: str = "/var/lib/spatiumddi/certs"
+    # Name (or label) of the frontend container the deployer signals
+    # SIGHUP to when a new cert is activated, so nginx reloads its
+    # TLS context. Matches the compose service name on the appliance.
+    appliance_frontend_container: str = "spatiumddi-frontend"
+
 
 settings = Settings()

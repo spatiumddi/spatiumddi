@@ -87,6 +87,37 @@ services:
       APPLIANCE_MODE: "true"
       APPLIANCE_VERSION: ${APPLIANCE_VERSION:-0.1.0}
       APPLIANCE_HOSTNAME: ${APPLIANCE_HOSTNAME:-}
+      # Cert deployer (Phase 4b.2). The active cert from
+      # appliance_certificate is written here; the frontend container
+      # mounts the same volume at /etc/nginx/certs and nginx reads
+      # active.{pem,key} from there. The deployer SIGHUPs the frontend
+      # container via docker socket on activation so nginx reloads
+      # without dropping in-flight connections.
+      APPLIANCE_CERT_DIR: /var/lib/spatiumddi/certs
+      APPLIANCE_FRONTEND_CONTAINER: spatiumddi-frontend
+    volumes:
+      # Shared cert volume — api writes active.pem + active.key,
+      # frontend mounts r/o for nginx.
+      - appliance_certs:/var/lib/spatiumddi/certs
+      # ACME HTTP-01 challenge token volume — api writes per-issuance
+      # tokens; frontend nginx serves them as static files. Empty
+      # outside an active Let's Encrypt flow (Phase 4b.4).
+      - appliance_acme:/var/www/acme-challenge
+      # Docker socket — only required for the cert-deployer SIGHUP
+      # and (Phase 4d) container management. The api container's
+      # ``app`` user gets supplementary group access via ``group_add``
+      # below (the gid matches the host's ``docker`` group, which
+      # owns /var/run/docker.sock with mode 0660). Read-write because
+      # the docker SDK opens the socket bidirectionally for the API
+      # exchange — the *permissions* are still scoped by the API's
+      # own RBAC layer.
+      - /var/run/docker.sock:/var/run/docker.sock
+    group_add:
+      # Host docker group gid. ``spatiumddi-firstboot`` detects this
+      # from ``stat -c '%g' /var/run/docker.sock`` at first boot and
+      # writes ``DOCKER_GID=<value>`` to .env. 999 is the Debian
+      # default but can drift on rebuilds — never hard-code.
+      - "${DOCKER_GID:-999}"
     depends_on:
       migrate:
         condition: service_completed_successfully
@@ -155,12 +186,34 @@ services:
 
   frontend:
     image: ghcr.io/spatiumddi/spatiumddi-frontend:${SPATIUMDDI_VERSION:-latest}
+    container_name: spatiumddi-frontend
     restart: unless-stopped
     networks: [spatiumddi]
-    ports: ["${HTTP_PORT:-80}:80"]
+    # Phase 4b.2 — appliance frontend listens on both HTTP and HTTPS.
+    # 80 → 301 redirect to HTTPS (except /.well-known/acme-challenge/
+    # which 4b.4's Let's Encrypt HTTP-01 challenge will use).
+    # 443 → the real HTTPS surface; cert from the shared volume.
+    ports:
+      - "${HTTP_PORT:-80}:80"
+      - "${HTTPS_PORT:-443}:443"
+    volumes:
+      # Override the baked-in /etc/nginx/conf.d/default.conf with the
+      # appliance-flavored config that handles TLS termination.
+      - /usr/local/share/spatiumddi/nginx-appliance.conf:/etc/nginx/conf.d/default.conf:ro
+      # Shared cert volume — the api container writes active.pem +
+      # active.key here; nginx reads them. SIGHUP via docker socket
+      # reloads nginx when the operator activates a different cert.
+      - appliance_certs:/etc/nginx/certs:ro
+      # ACME HTTP-01 challenge directory (Phase 4b.4) — the api
+      # container writes tokens here so nginx can serve them as
+      # static files at /.well-known/acme-challenge/<token>.
+      - appliance_acme:/var/www/acme-challenge:ro
     depends_on:
+      # ``service_healthy`` (not just ``service_started``) so the api
+      # has finished ensure_self_signed_cert() before nginx starts —
+      # otherwise nginx would fail to load active.pem on first boot.
       api:
-        condition: service_started
+        condition: service_healthy
 
   # ── DNS (BIND9) — default profile ───────────────────────────────────────────
   dns-bind9:
@@ -226,3 +279,11 @@ volumes:
   dns_bind9_cache:
   dhcp_kea_state:
   dhcp_kea_leases:
+  # Phase 4b.2 — shared TLS cert volume. api writes active.{pem,key};
+  # frontend mounts r/o for nginx. Survives container recycles so an
+  # activated cert sticks across `docker-compose up -d --force-recreate`.
+  appliance_certs:
+  # Phase 4b.4 — ACME HTTP-01 challenge directory. api drops tokens
+  # here, nginx serves them at /.well-known/acme-challenge/. Empty
+  # outside an in-flight Let's Encrypt issuance.
+  appliance_acme:

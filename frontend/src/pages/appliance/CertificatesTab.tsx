@@ -121,10 +121,7 @@ export function CertificatesTab() {
           Loading…
         </div>
       ) : !data || data.length === 0 ? (
-        <EmptyState
-          onUpload={() => setUploadOpen(true)}
-          onGenerateCsr={() => setCsrOpen(true)}
-        />
+        <EmptyState />
       ) : (
         <div className="space-y-3">
           {data.map((cert) => (
@@ -221,40 +218,17 @@ export function CertificatesTab() {
   );
 }
 
-function EmptyState({
-  onUpload,
-  onGenerateCsr,
-}: {
-  onUpload: () => void;
-  onGenerateCsr: () => void;
-}) {
+function EmptyState() {
   return (
     <div className="rounded-lg border border-dashed bg-muted/30 px-6 py-12 text-center">
       <ShieldCheck className="mx-auto h-8 w-8 text-muted-foreground/50" />
       <h3 className="mt-3 text-sm font-medium">No certificates yet</h3>
       <p className="mt-1 text-xs text-muted-foreground">
-        Upload an existing cert + key, or generate a CSR so a CA can sign
-        a fresh cert for this appliance. Until you activate something nginx
-        serves the self-signed default the appliance generated on first boot.
+        Use the buttons above to upload an existing cert + key, or generate a
+        CSR so a CA can sign a fresh cert for this appliance. Until you
+        activate something, nginx serves the self-signed default the
+        appliance generated on first boot.
       </p>
-      <div className="mt-4 flex justify-center gap-2">
-        <button
-          type="button"
-          onClick={onGenerateCsr}
-          className="inline-flex items-center gap-1.5 rounded-md border bg-background px-3 py-1.5 text-sm font-medium hover:bg-accent"
-        >
-          <FilePlus2 className="h-3.5 w-3.5" />
-          Generate CSR
-        </button>
-        <button
-          type="button"
-          onClick={onUpload}
-          className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground hover:bg-primary/90"
-        >
-          <Upload className="h-3.5 w-3.5" />
-          Upload certificate
-        </button>
-      </div>
     </div>
   );
 }
