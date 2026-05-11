@@ -1,0 +1,8 @@
+// Enable the apt-daily.timer + apt-daily-upgrade.timer chain.
+// apt-daily fetches package lists; apt-daily-upgrade applies the
+// upgrades that unattended-upgrades is configured to allow.
+APT::Periodic::Update-Package-Lists "1";
+APT::Periodic::Unattended-Upgrade "1";
+// AutocleanInterval drops the local .deb cache every N days so
+// /var/cache/apt doesn't grow forever.
+APT::Periodic::AutocleanInterval "7";
