@@ -170,17 +170,29 @@ terminal_output console serial
 # has a NoCloud datasource attached.
 set common="boot=live components cloud-init=disabled console=tty0 console=ttyS0,115200n8"
 
+# Quiet-console flags for the install + live entries: without these
+# the kernel + systemd spam type=1130/1131 audit records and unit
+# start/stop status onto tty1, which scrolls over the whiptail
+# wizard the operator is trying to read. The combination:
+#   quiet                       -- suppress most boot-time prints
+#   loglevel=3                  -- only ERR + worse to console
+#   audit=0                     -- disable kernel audit subsystem
+#                                  (no auditd shipped; messages
+#                                  default to /dev/console)
+#   systemd.show_status=false   -- systemd doesn't narrate units
+set quietkbd="quiet loglevel=3 audit=0 systemd.show_status=false"
+
 menuentry "Install SpatiumDDI to disk" {
-    linux /live/vmlinuz $common spatium-mode=install
+    linux /live/vmlinuz $common $quietkbd spatium-mode=install
     initrd /live/initrd.img
 }
 
 menuentry "Try SpatiumDDI live (run from CD/USB without installing)" {
-    linux /live/vmlinuz $common spatium-mode=live quiet
+    linux /live/vmlinuz $common $quietkbd spatium-mode=live
     initrd /live/initrd.img
 }
 
-menuentry "Try SpatiumDDI live (verbose)" {
+menuentry "Try SpatiumDDI live (verbose, for debugging)" {
     linux /live/vmlinuz $common spatium-mode=live
     initrd /live/initrd.img
 }
