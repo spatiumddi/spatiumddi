@@ -45,9 +45,24 @@ for unit in docker.service chrony.service ssh.service \
 done
 
 # ── Hardening (subset of APPLIANCE.md §7 — full pass in Phase 1.x) ────────────
-# Disable root SSH login, key-only auth.
+# SSH: root login disabled, password login allowed.
+#
+# - `PermitRootLogin no`: operators SSH as the admin user they
+#   created during install, then `sudo` for root. Closes the
+#   obvious "ssh root@…" attack surface.
+# - `PasswordAuthentication yes`: the installer wizard takes the
+#   admin password as its only credential input, so disabling
+#   password auth would leave the operator locked out until they
+#   physically attached a key. Pragmatic default for a fresh
+#   appliance — operators upload an SSH key + `PasswordAuthentication
+#   no` themselves once they've keyed in.
 sed -i 's/^#\?PermitRootLogin.*/PermitRootLogin no/' "$BUILDROOT/etc/ssh/sshd_config"
-sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication no/' "$BUILDROOT/etc/ssh/sshd_config"
+sed -i 's/^#\?PasswordAuthentication.*/PasswordAuthentication yes/' "$BUILDROOT/etc/ssh/sshd_config"
+# Newer sshd ships drop-ins under /etc/ssh/sshd_config.d/ that can
+# override the main file. Debian 13's default disables password
+# auth there for cloud-init/no-password setups. Overwrite it.
+echo "PasswordAuthentication yes" \
+    > "$BUILDROOT/etc/ssh/sshd_config.d/10-spatiumddi-password-auth.conf"
 
 # /tmp as tmpfs.
 if ! grep -q '^tmpfs /tmp ' "$BUILDROOT/etc/fstab" 2>/dev/null; then
