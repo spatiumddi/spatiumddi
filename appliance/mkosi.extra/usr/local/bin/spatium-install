@@ -350,6 +350,7 @@ do_install() {
             --exclude="/var/log/*" \
             --exclude="/var/cache/apt/archives/*" \
             --exclude="/var/lib/spatiumddi/firstboot.done" \
+            --exclude="/var/lib/spatiumddi/swapfile" \
             --exclude="/etc/spatiumddi/.env" \
             --exclude="/etc/ssh/sshd_config.d/00-spatium-live.conf" \
             --exclude="/etc/issue.d/zz-spatium-live.issue" \

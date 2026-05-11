@@ -1,5 +1,14 @@
 [Unit]
 Description=SpatiumDDI appliance first-boot orchestrator + stack supervisor
+# Skip on the live ISO. live-boot puts `boot=live` in the kernel
+# cmdline; the installed system doesn't carry that token. This
+# matters because firstboot fallocate's a 2 GiB swapfile at
+# /var/lib/spatiumddi/swapfile and pulls multi-GiB Docker images
+# — fine on a real disk, fatal on the live ISO's ~1 GiB tmpfs
+# overlay (fills it in one second, every subsequent write — incl.
+# the spatium-install wizard's log + trace fds — fails with ENOSPC
+# and the wizard exits silently).
+ConditionKernelCommandLine=!boot=live
 # docker.service is the only hard dependency. We previously also
 # pinned `network-online.target` and `cloud-final.service`, but in
 # live-ISO mode that chain creates an ordering cycle with live-config
