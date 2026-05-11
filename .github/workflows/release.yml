@@ -243,6 +243,81 @@ jobs:
             "./dist/spatiumddi-${CHART_VERSION}.tgz" \
             "oci://ghcr.io/${{ github.repository_owner }}/charts"
 
+  # ── Build appliance ISO ─────────────────────────────────────────────────────
+  # Drives mkosi inside the published appliance-builder container the
+  # same way ``make appliance && make appliance-iso`` does on a laptop,
+  # then publishes the resulting hybrid USB/CD ISO as a release asset.
+  #
+  # The ISO is the "slim" variant — no images baked into mkosi.extra/.
+  # spatiumddi-firstboot does ``docker compose pull`` from ghcr.io on
+  # first boot, which is why this job hangs off the image-build jobs
+  # in ``needs`` even though it doesn't actually consume their outputs:
+  # if any image build fails, the ISO would land on an appliance that
+  # then can't pull its services, so we'd rather not publish it.
+  build-appliance-iso:
+    name: Build appliance ISO
+    runs-on: ubuntu-latest
+    needs:
+      [meta, build-api, build-frontend, build-dns, build-dns-powerdns, build-dhcp]
+    permissions:
+      contents: read
+      packages: read
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build raw image (mkosi)
+        run: |
+          set -euo pipefail
+          BUILDER=${{ env.IMAGE_PREFIX }}/appliance-builder:latest
+          echo "→ Pulling $BUILDER"
+          docker pull "$BUILDER"
+          mkdir -p appliance/build
+          echo "→ Running mkosi build (this takes 5–10 min)"
+          docker run --rm --privileged \
+            -v "$PWD/appliance:/work" \
+            "$BUILDER" \
+            --output-directory=build --force build
+          ls -lh appliance/build/
+      - name: Wrap as hybrid USB/CD ISO
+        id: wrap
+        run: |
+          set -euo pipefail
+          BUILDER=${{ env.IMAGE_PREFIX }}/appliance-builder:latest
+          VERSION="${{ needs.meta.outputs.version }}"
+          RAW=$(ls appliance/build/spatiumddi-appliance*.raw | head -1)
+          [ -f "$RAW" ] || { echo "✗ no raw image found"; exit 1; }
+          ISO_INTERIM="${RAW%.raw}.iso"
+          docker run --rm --privileged \
+            --entrypoint /work/scripts/wrap-iso.sh \
+            -v "$PWD/appliance:/work" \
+            "$BUILDER" \
+            "/work/build/$(basename "$RAW")" \
+            "/work/build/$(basename "$ISO_INTERIM")"
+          # Rename so the published artifact carries the CalVer tag —
+          # mkosi's filename uses the ``ImageVersion=`` from mkosi.conf
+          # (currently ``0.1.0``), which is internal scheme, not the
+          # operator-visible release identity.
+          FINAL="appliance/build/spatiumddi-appliance-${VERSION}.iso"
+          mv "$ISO_INTERIM" "$FINAL"
+          ls -lh "$FINAL"
+          echo "iso_path=$FINAL" >> "$GITHUB_OUTPUT"
+          echo "iso_name=spatiumddi-appliance-${VERSION}.iso" >> "$GITHUB_OUTPUT"
+      - name: Upload ISO as workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: appliance-iso
+          path: appliance/build/spatiumddi-appliance-*.iso
+          retention-days: 7
+          if-no-files-found: error
+    outputs:
+      iso_name: ${{ steps.wrap.outputs.iso_name }}
+
   # ── Create GitHub Release ──────────────────────────────────────────────────
   release:
     name: Create GitHub Release
@@ -255,6 +330,7 @@ jobs:
         build-dns,
         build-dns-powerdns,
         build-dhcp,
+        build-appliance-iso,
         publish-chart,
       ]
     permissions:
@@ -345,13 +421,31 @@ jobs:
             echo "PREV_TAG=$PREV_TAG" >> "$GITHUB_ENV"
           fi
 
+      - name: Download appliance ISO artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: appliance-iso
+          path: dist/
+
       - uses: softprops/action-gh-release@v2
         with:
           name: "SpatiumDDI ${{ needs.meta.outputs.version }}"
+          files: |
+            dist/spatiumddi-appliance-*.iso
           body: |
             ## What's Changed
 
             ${{ env.CHANGELOG }}
+
+            ## OS Appliance ISO
+
+            Hybrid USB/CD installer image attached as a release asset
+            (``${{ needs.build-appliance-iso.outputs.iso_name }}``). Burn
+            to USB with ``sudo dd if=… of=/dev/sdX bs=4M conv=fsync`` or
+            attach as a CD-ROM in your hypervisor. See
+            [docs/deployment/APPLIANCE.md](https://github.com/${{ github.repository }}/blob/${{ needs.meta.outputs.version }}/docs/deployment/APPLIANCE.md)
+            for the install walkthrough. The ISO is the **slim** variant —
+            no images baked in; first boot pulls every service from ghcr.io.
 
             ## Docker Images
 
@@ -359,6 +453,7 @@ jobs:
             docker pull ghcr.io/${{ github.repository_owner }}/spatiumddi-api:${{ needs.meta.outputs.version }}
             docker pull ghcr.io/${{ github.repository_owner }}/spatiumddi-frontend:${{ needs.meta.outputs.version }}
             docker pull ghcr.io/${{ github.repository_owner }}/dns-bind9:${{ needs.meta.outputs.version }}
+            docker pull ghcr.io/${{ github.repository_owner }}/dns-powerdns:${{ needs.meta.outputs.version }}
             docker pull ghcr.io/${{ github.repository_owner }}/dhcp-kea:${{ needs.meta.outputs.version }}
             ```
 
