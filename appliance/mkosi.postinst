@@ -120,13 +120,32 @@ DOCKER_VERSION=27.5.1
 if [ ! -x "$BUILDROOT/usr/local/bin/docker" ]; then
     echo "Downloading docker CLI ${DOCKER_VERSION}..."
     tmpd=$(mktemp -d)
-    # The mkosi sandbox doesn't put curl on PATH but the host has it
-    # at /usr/bin/curl. Use it explicitly. Same for tar.
-    if /usr/bin/curl -fsSL "https://download.docker.com/linux/static/stable/x86_64/docker-${DOCKER_VERSION}.tgz" \
-            -o "$tmpd/docker.tgz"; then
-        /usr/bin/tar -xzf "$tmpd/docker.tgz" -C "$tmpd" docker/docker
-        install -m 0755 "$tmpd/docker/docker" "$BUILDROOT/usr/local/bin/docker"
-        echo "  installed: $(ls -lh $BUILDROOT/usr/local/bin/docker | awk '{print $5}')"
+    # The mkosi sandbox exposes neither host curl nor host tar on
+    # PATH or at /usr/bin/. But python3 IS available (mkosi is
+    # python-based) — fetch + extract entirely in stdlib so we
+    # don't depend on host tooling.
+    if python3 - "$tmpd/docker" <<EOF
+import sys, urllib.request, tarfile, shutil, pathlib
+url = "https://download.docker.com/linux/static/stable/x86_64/docker-${DOCKER_VERSION}.tgz"
+out_file = pathlib.Path(sys.argv[1])
+out_file.parent.mkdir(parents=True, exist_ok=True)
+tarball = out_file.parent / "docker.tgz"
+print(f"  fetching {url}")
+with urllib.request.urlopen(url, timeout=60) as r, open(tarball, "wb") as f:
+    shutil.copyfileobj(r, f)
+size = tarball.stat().st_size
+print(f"  extracting docker/docker from {size}-byte tarball")
+# Use extractfile() + manual write so we don't trip Python 3.13's
+# new tar-filter machinery (it rejects extract() of files with
+# non-portable metadata, but extractfile() returns a plain stream).
+with tarfile.open(tarball) as t, \
+     t.extractfile("docker/docker") as src, \
+     open(out_file, "wb") as dst:
+    shutil.copyfileobj(src, dst)
+EOF
+    then
+        install -m 0755 "$tmpd/docker" "$BUILDROOT/usr/local/bin/docker"
+        echo "  installed: $(ls -lh "$BUILDROOT/usr/local/bin/docker" | awk '{print $5}')"
     else
         echo "WARN: docker CLI download failed — operators will only have docker-compose"
     fi
