@@ -46,25 +46,25 @@ EOF
 mkdir -p /etc/issue.d
 cat > /etc/issue.d/zz-spatium-live.issue <<EOF
 
-  ┌──────────────────────────────────────────────────────────────────┐
-  │  LIVE INSTALL MODE — SSH AVAILABLE FOR LOG CAPTURE              │
-  │                                                                  │
-  │    Address:  \4                                                  │
-  │    User:     root                                                │
-  │    Password: ${PWD}                                       │
-  │                                                                  │
-  │  Recover the password from a console shell:                      │
-  │    cat /var/log/spatium-live-ssh-password                        │
-  │                                                                  │
-  │  All of this disappears on reboot — the installed system uses    │
-  │  the credentials you set in the wizard.                          │
-  └──────────────────────────────────────────────────────────────────┘
+  +------------------------------------------------------------------+
+  |  LIVE INSTALL MODE - SSH AVAILABLE FOR LOG CAPTURE              |
+  |                                                                  |
+  |    Address:  \4                                                  |
+  |    User:     root                                                |
+  |    Password: ${PWD}                                       |
+  |                                                                  |
+  |  Recover the password from a console shell:                      |
+  |    cat /var/log/spatium-live-ssh-password                        |
+  |                                                                  |
+  |  All of this disappears on reboot - the installed system uses    |
+  |  the credentials you set in the wizard.                          |
+  +------------------------------------------------------------------+
 
 EOF
 
 cat > /etc/motd <<EOF
 
-LIVE INSTALL MODE — log-capture credentials:
+LIVE INSTALL MODE - log-capture credentials:
   ssh root@<this VM's IP>          (try: ip -4 -br addr)
   Password: ${PWD}
 

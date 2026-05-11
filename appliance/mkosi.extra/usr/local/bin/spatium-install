@@ -143,7 +143,7 @@ pick_disk() {
         [ -z "$model" ] && model="(no model)"
         # Skip the live medium itself.
         [ "/dev/$name" = "$live_disk" ] && continue
-        options+=("/dev/$name" "$size — $model")
+        options+=("/dev/$name" "$size - $model")
     done < <(lsblk -dn -o NAME,SIZE,MODEL -r 2>/dev/null | grep -vE "^(sr|loop|fd|ram|zram)")
 
     if [ ${#options[@]} -eq 0 ]; then
@@ -172,7 +172,7 @@ ask_hostname() {
 ask_user_password() {
     log "Step: ask_user_password"
     ADMIN_USER=$(whiptail --backtitle "$BACKTITLE" --title "Admin OS user" \
-        --inputbox "OS-level admin username (for SSH + sudo).\n\nThe SpatiumDDI web UI uses 'admin/admin' separately — change it on first login." \
+        --inputbox "OS-level admin username (for SSH + sudo).\n\nThe SpatiumDDI web UI uses 'admin/admin' separately - change it on first login." \
         12 70 "$ADMIN_USER" 3>&1 1>&2 2>&3) \
         || on_cancel "admin user"
     [ -z "$ADMIN_USER" ] && ADMIN_USER="admin"
@@ -211,23 +211,23 @@ ask_network() {
             ifs+=("$iface" "$(cat /sys/class/net/$iface/address 2>/dev/null || echo "?")")
         done
         if [ ${#ifs[@]} -eq 0 ]; then
-            whiptail --msgbox "No ethernet interfaces found — falling back to DHCP." 8 60 || true
+            whiptail --msgbox "No ethernet interfaces found - falling back to DHCP." 8 60 || true
             NET_MODE="dhcp"
             return
         fi
-        NET_INTERFACE=$(whiptail --backtitle "$BACKTITLE" --title "Static IP — interface" \
+        NET_INTERFACE=$(whiptail --backtitle "$BACKTITLE" --title "Static IP -interface" \
             --menu "Pick an interface:" 12 60 5 "${ifs[@]}" 3>&1 1>&2 2>&3) \
             || on_cancel "static interface"
-        NET_IP=$(whiptail --backtitle "$BACKTITLE" --title "Static IP — address" \
+        NET_IP=$(whiptail --backtitle "$BACKTITLE" --title "Static IP -address" \
             --inputbox "IPv4 address (e.g. 192.168.1.10):" 10 60 "" 3>&1 1>&2 2>&3) \
             || on_cancel "static IP"
-        NET_PREFIX=$(whiptail --backtitle "$BACKTITLE" --title "Static IP — prefix" \
+        NET_PREFIX=$(whiptail --backtitle "$BACKTITLE" --title "Static IP -prefix" \
             --inputbox "Prefix length:" 10 60 "$NET_PREFIX" 3>&1 1>&2 2>&3) \
             || on_cancel "static prefix"
-        NET_GATEWAY=$(whiptail --backtitle "$BACKTITLE" --title "Static IP — gateway" \
+        NET_GATEWAY=$(whiptail --backtitle "$BACKTITLE" --title "Static IP -gateway" \
             --inputbox "Gateway:" 10 60 "" 3>&1 1>&2 2>&3) \
             || on_cancel "static gateway"
-        NET_DNS=$(whiptail --backtitle "$BACKTITLE" --title "Static IP — DNS" \
+        NET_DNS=$(whiptail --backtitle "$BACKTITLE" --title "Static IP -DNS" \
             --inputbox "DNS servers (space-separated):" 10 60 "$NET_DNS" 3>&1 1>&2 2>&3) \
             || on_cancel "static DNS"
     fi
@@ -626,22 +626,31 @@ EOF
         eject "$dev" >> "$INSTALL_LOG" 2>&1 || true
     done
 
-    whiptail --backtitle "$BACKTITLE" --title "Installation complete" \
+    # Title kept short (8 chars) so it doesn't collide with the 36-char
+    # BACKTITLE on the dialog top frame — whiptail renders backtitle on
+    # row 0 + dialog title on the immediately-adjacent dialog top
+    # border, and overlong combined widths produce the
+    # "0.1.0ation complete" overlap glitch.
+    # Body uses ASCII-only line drawing — the live ISO's console font
+    # ships glyphs for `+ - | =` but not `║ ═ ╔ ╗ → —`, so Unicode
+    # box-drawing renders as broken squares on tty1.
+    whiptail --backtitle "$BACKTITLE" --title "Done" \
         --msgbox "\
 SpatiumDDI is installed on $TARGET_DISK.
 
-╔════════════════════════════════════════════════════════════════╗
-║  REMOVE THE INSTALL MEDIA before the reboot completes,        ║
-║  otherwise the BIOS will boot back into this installer.       ║
-║                                                                ║
-║    Virtual:   detach the ISO from the VM's CD-ROM drive       ║
-║               Proxmox: Hardware → CD/DVD Drive → 'Do not use' ║
-║    Physical:  unplug the USB stick                            ║
-║                                                                ║
-║  The installer already issued an ATA EJECT — most hypervisors ║
-║  honor it and the ISO is already unmapped, but detach it from ║
-║  the VM config too so it doesn't reattach on next boot.       ║
-╚════════════════════════════════════════════════════════════════╝
+  +============================================================+
+  |  REMOVE THE INSTALL MEDIA before the reboot completes,    |
+  |  otherwise the BIOS will boot back into this installer.   |
+  |                                                            |
+  |   Virtual:   detach the ISO from the VM's CD-ROM drive    |
+  |              Proxmox: Hardware -> CD/DVD -> 'Do not use'  |
+  |   Physical:  unplug the USB stick                         |
+  |                                                            |
+  |  The installer already issued an ATA EJECT -- most         |
+  |  hypervisors honor it and the ISO is already unmapped,    |
+  |  but detach it from the VM config too so it doesn't       |
+  |  reattach on the next boot.                                |
+  +============================================================+
 
 First boot of the installed system takes 2-5 min while it pulls
 the SpatiumDDI container images.
@@ -680,18 +689,18 @@ on_failure() {
     echo
     echo "Installer exited with status $exit_code"
     echo
-    echo "── Last 20 lines of $INSTALL_LOG ──"
+    echo "-- Last 20 lines of $INSTALL_LOG --"
     tail -20 "$INSTALL_LOG" 2>/dev/null \
-        || echo "  (install log empty or missing — script bailed before any log() call)"
+        || echo "  (install log empty or missing - script bailed before any log() call)"
     echo
-    echo "── Last 20 lines of /var/log/spatium-install-launch.log ──"
+    echo "-- Last 20 lines of /var/log/spatium-install-launch.log --"
     tail -20 /var/log/spatium-install-launch.log 2>/dev/null \
-        || echo "  (launch log missing — bash didn't even parse the script)"
+        || echo "  (launch log missing - bash didn't even parse the script)"
     echo
-    echo "── Last 30 lines of $TRACE_LOG ──"
+    echo "-- Last 30 lines of $TRACE_LOG --"
     tail -30 "$TRACE_LOG" 2>/dev/null \
-        || echo "  (trace log empty — script bailed before set -x at line 51)"
-    echo "──────────────────────────────────────────────────────────────────"
+        || echo "  (trace log empty - script bailed before set -x at line 51)"
+    echo "------------------------------------------------------------------"
     echo
     if [ -r /var/log/spatium-live-ssh-password ]; then
         echo "Live-mode SSH (for log capture from a real terminal):"

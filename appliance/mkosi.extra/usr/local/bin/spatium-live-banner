@@ -13,7 +13,7 @@ cat <<'BANNER'
  |____/| .__/ \__,_|\__|_|\__,_|_| |_| |_|_|   |____/|___|
        |_|
 
- SpatiumDDI Appliance — live mode (running from CD/USB, no install).
+ SpatiumDDI Appliance - live mode (running from CD/USB, no install).
 
 BANNER
 
@@ -21,7 +21,7 @@ IP=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f
 if [ -n "$IP" ]; then
     echo "   Web UI:   http://$IP/"
 else
-    echo "   Web UI:   (waiting for network — check 'ip a')"
+    echo "   Web UI:   (waiting for network - check 'ip a')"
 fi
 echo "   Default:  admin / admin   (forces password change on first login)"
 echo
@@ -29,7 +29,7 @@ echo "   First-boot orchestrator status:"
 echo "     systemctl status spatiumddi-firstboot"
 echo "     tail -f /var/log/spatiumddi/firstboot.log"
 echo
-echo "─────────────────────────────────────────────────────────────────"
+echo "================================================================="
 echo
 echo "   To install to disk:    sudo spatium-install"
 echo "   To get a shell:        press Enter, then Ctrl-D when done"
