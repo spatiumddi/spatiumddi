@@ -540,7 +540,20 @@ menuentry "SpatiumDDI Appliance" {
     initrd /boot/initrd.img-$KVER
 }
 
-menuentry "SpatiumDDI Appliance (verbose, recovery)" {
+menuentry "SpatiumDDI Appliance (verbose boot)" {
+    # Same as default, just without the quiet/loglevel/audit/
+    # show_status flags — useful when you want to see what's
+    # happening during boot. Still runs multi-user.target so
+    # getty@tty1 + serial-getty@ttyS0 both come up normally.
+    linux /boot/vmlinuz-$KVER root=UUID=$ROOT_UUID ro \\
+        console=tty0 console=ttyS0,115200n8
+    initrd /boot/initrd.img-$KVER
+}
+
+menuentry "SpatiumDDI Appliance (rescue / single-user)" {
+    # Boots into rescue.target — single-user, root shell only, no
+    # docker, no getty@tty1. Asks for the root password from the
+    # installer at "Press Enter for maintenance" prompt.
     linux /boot/vmlinuz-$KVER root=UUID=$ROOT_UUID ro \\
         console=tty0 console=ttyS0,115200n8 systemd.unit=rescue.target
     initrd /boot/initrd.img-$KVER

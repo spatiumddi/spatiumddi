@@ -18,6 +18,15 @@ set -eu
 # "Created symlink ..." lines in the build log) — no work needed here
 # for cloud-init-local / cloud-init / cloud-config / cloud-final.
 mkdir -p "$BUILDROOT/etc/systemd/system/multi-user.target.wants"
+
+# Belt-and-braces: explicitly enable getty@tty1 so VGA console has
+# a login prompt. Debian's systemd preset normally does this but
+# mkosi has been observed to skip the preset step on some builds.
+# Without this symlink, booting with a VGA-attached console (e.g.
+# Proxmox noVNC) shows kernel messages but no agetty.
+mkdir -p "$BUILDROOT/etc/systemd/system/getty.target.wants"
+ln -sfn /usr/lib/systemd/system/getty@.service \
+    "$BUILDROOT/etc/systemd/system/getty.target.wants/getty@tty1.service"
 # Install + Live mode services are kept WantedBy=multi-user.target
 # but gate themselves with ConditionKernelCommandLine=spatium-mode=…
 # so only one runs per boot, depending on the GRUB menu choice.
