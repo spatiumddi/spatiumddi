@@ -213,18 +213,27 @@ do_install() {
     # and the EXIT trap drops the operator to a shell with the log.
     set -e
 
-    local ESP ROOT
-    ESP=$(partition_node 1)
-    ROOT=$(partition_node 2)
+    # GPT layout: 1 MiB BIOS Boot Partition (type ef02) + 512 MiB
+    # EFI System Partition (ef00, FAT32) + rest ext4 root (8300).
+    # The BBP holds grub-i386-pc's core.img — without it
+    # grub-install fails on GPT disks with "no BIOS Boot Partition;
+    # embedding won't be possible". MBR boot record on GPT only
+    # has 446 bytes between the partition table and the protective
+    # MBR slot; grub stage-1 doesn't fit, hence the BBP.
+    local BBP ESP ROOT
+    BBP=$(partition_node 1)
+    ESP=$(partition_node 2)
+    ROOT=$(partition_node 3)
 
-    log "Install starting: target=$TARGET_DISK ESP=$ESP ROOT=$ROOT"
+    log "Install starting: target=$TARGET_DISK BBP=$BBP ESP=$ESP ROOT=$ROOT"
 
     {
         echo "5"; echo "XXX"; echo "Partitioning $TARGET_DISK..."; echo "XXX"
         wipefs -af "$TARGET_DISK"           >> "$INSTALL_LOG" 2>&1
         sgdisk -Z "$TARGET_DISK"            >> "$INSTALL_LOG" 2>&1
-        sgdisk -n1:0:+512M -t1:ef00 -c1:ESP \
-               -n2:0:0     -t2:8300 -c2:root \
+        sgdisk -n1:0:+1M    -t1:ef02 -c1:bios_boot \
+               -n2:0:+512M  -t2:ef00 -c2:ESP \
+               -n3:0:0      -t3:8300 -c3:root \
                "$TARGET_DISK"               >> "$INSTALL_LOG" 2>&1
         partprobe "$TARGET_DISK"            >> "$INSTALL_LOG" 2>&1 || true
         udevadm settle                      >> "$INSTALL_LOG" 2>&1 || true
