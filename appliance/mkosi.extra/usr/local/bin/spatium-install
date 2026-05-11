@@ -341,4 +341,21 @@ main() {
     do_install
 }
 
+on_failure() {
+    local exit_code=$?
+    [ "$exit_code" -eq 0 ] && exit 0
+    clear
+    echo
+    echo "Installer exited with status $exit_code — last lines of $INSTALL_LOG:"
+    echo "──────────────────────────────────────────────────────────────────"
+    tail -20 "$INSTALL_LOG" 2>/dev/null || echo "(no log captured)"
+    echo "──────────────────────────────────────────────────────────────────"
+    echo
+    echo "Press Enter to drop to a root shell."
+    echo "(From the shell you can re-run 'spatium-install' or 'reboot'.)"
+    read -r _ || true
+    exec /bin/bash --login
+}
+trap on_failure EXIT
+
 main "$@"

@@ -18,7 +18,11 @@ TTYVTDisallocate=yes
 KillMode=process
 IgnoreSIGPIPE=no
 SendSIGHUP=yes
-Restart=on-failure
+# DO NOT auto-restart. The wizard handles its own failure path
+# (drops to shell with an error). Restarting would loop the
+# operator back to question 1, which is what they hit before
+# the kernel-console-spam fix landed.
+Restart=no
 
 [Install]
 WantedBy=multi-user.target
