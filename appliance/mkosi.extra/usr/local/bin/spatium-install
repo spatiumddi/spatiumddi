@@ -333,7 +333,48 @@ EOF
             cloud-config.service cloud-final.service \
             >> "$INSTALL_LOG" 2>&1 || true
 
-        echo "80"; echo "XXX"; echo "Installing bootloader (BIOS + UEFI)..."; echo "XXX"
+        echo "78"; echo "XXX"; echo "Installing kernel into /boot..."; echo "XXX"
+        # mkosi strips /boot from the rootfs during image build —
+        # it stages the kernel and initrd as separate output files
+        # for its own bootable image, then deletes them from /boot.
+        # The rsync above brought across an empty /boot, so we need
+        # to put the kernel binary back before update-grub can scan
+        # for boot menu entries.
+        local KVER
+        KVER=$(ls "$MOUNT/lib/modules" 2>/dev/null | head -1)
+        if [ -z "$KVER" ]; then
+            log "ERROR: no /lib/modules in target — rsync didn't copy modules?"
+            exit 1
+        fi
+        log "Target kernel version: $KVER"
+
+        local LIVE_KERNEL=""
+        for path in /run/live/medium/live/vmlinuz \
+                    /lib/live/mount/medium/live/vmlinuz \
+                    /run/live/medium/live/vmlinuz1 \
+                    /lib/live/mount/medium/live/vmlinuz1; do
+            [ -f "$path" ] && LIVE_KERNEL="$path" && break
+        done
+        if [ -z "$LIVE_KERNEL" ]; then
+            log "ERROR: couldn't find live kernel binary to install"
+            ls /run/live/medium/live/ >> "$INSTALL_LOG" 2>&1 || true
+            ls /lib/live/mount/medium/live/ >> "$INSTALL_LOG" 2>&1 || true
+            exit 1
+        fi
+        log "Copying $LIVE_KERNEL -> /boot/vmlinuz-$KVER"
+        install -m 0644 "$LIVE_KERNEL" "$MOUNT/boot/vmlinuz-$KVER"
+        ln -sf "vmlinuz-$KVER" "$MOUNT/boot/vmlinuz"
+
+        echo "82"; echo "XXX"; echo "Regenerating initrd for disk boot..."; echo "XXX"
+        # Generate a fresh disk-boot initrd in chroot. -c creates a
+        # new initrd (vs -u for updating an existing one — there's
+        # nothing to update, /boot is empty). live-boot scripts are
+        # still in the rootfs but inert without `boot=live` cmdline.
+        chroot "$MOUNT" /usr/sbin/update-initramfs -c -k "$KVER" \
+            >> "$INSTALL_LOG" 2>&1
+        ln -sf "initrd.img-$KVER" "$MOUNT/boot/initrd.img"
+
+        echo "88"; echo "XXX"; echo "Installing bootloader (BIOS + UEFI)..."; echo "XXX"
         chroot "$MOUNT" /usr/sbin/grub-install --target=i386-pc "$TARGET_DISK" \
             >> "$INSTALL_LOG" 2>&1
         chroot "$MOUNT" /usr/sbin/grub-install --target=x86_64-efi \
@@ -341,14 +382,11 @@ EOF
             --bootloader-id=SPATIUMDDI \
             --removable \
             >> "$INSTALL_LOG" 2>&1 || true
+        # update-grub scans /boot/vmlinuz-* + /boot/initrd.img-* and
+        # writes /boot/grub/grub.cfg. Without the kernel copy above
+        # this would produce an empty menu and grub would drop to a
+        # rescue prompt on boot.
         chroot "$MOUNT" /usr/sbin/update-grub >> "$INSTALL_LOG" 2>&1
-
-        echo "90"; echo "XXX"; echo "Regenerating initrd for disk boot..."; echo "XXX"
-        # The squashfs-derived initrd has live-boot active. The
-        # installed system needs a regular disk-boot initrd. Regenerate
-        # in chroot — without `boot=live` on the cmdline it'll be a
-        # normal initrd.
-        chroot "$MOUNT" /usr/sbin/update-initramfs -u >> "$INSTALL_LOG" 2>&1
 
         echo "95"; echo "XXX"; echo "Unmounting..."; echo "XXX"
         for d in dev sys proc; do
