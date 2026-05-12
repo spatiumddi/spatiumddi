@@ -1,0 +1,109 @@
+#!/bin/bash
+# spatiumddi-slot-upgrade — host-side slot-image upgrade runner
+# (Phase 8b-3, issue #138).
+#
+# The api container writes /var/lib/spatiumddi/release-state/
+# slot-upgrade-pending with one line: either a URL or a local file
+# path to a slot .raw.xz image. Optionally a second line carries
+# the SHA-256 checksum URL or path.
+#
+# Then `spatiumddi-slot-upgrade.path` notices the file and runs this
+# script as root. It:
+#   1. Reads the trigger file
+#   2. Invokes /usr/local/bin/spatium-upgrade-slot apply <url>
+#      [--checksum <url>]
+#   3. On success, invokes spatium-upgrade-slot set-next-boot
+#   4. Renames the trigger to .done or .failed so the .path unit
+#      doesn't re-fire on the next watch
+#
+# The api / UI then polls /api/v1/appliance/slot-upgrade/status to
+# show progress + result (parses /var/log/spatiumddi/slot-upgrade.log).
+
+set -euo pipefail
+
+TRIGGER=/var/lib/spatiumddi/release-state/slot-upgrade-pending
+LOG_DIR=/var/log/spatiumddi
+LOG="$LOG_DIR/slot-upgrade.log"
+
+mkdir -p "$LOG_DIR"
+exec >> "$LOG" 2>&1
+echo
+echo "[$(date -Iseconds)] === spatiumddi-slot-upgrade fired ==="
+
+if [ ! -f "$TRIGGER" ]; then
+    echo "  no trigger file at $TRIGGER, nothing to do"
+    exit 0
+fi
+
+# Trigger file format:
+#   line 1: URL or absolute path to slot .raw.xz
+#   line 2 (optional): URL or absolute path to .sha256 sidecar
+IMAGE_SRC=$(sed -n '1p' "$TRIGGER" | tr -d '\r\n')
+CHECKSUM_SRC=$(sed -n '2p' "$TRIGGER" | tr -d '\r\n' || true)
+
+if [ -z "$IMAGE_SRC" ]; then
+    echo "  ERROR: trigger file empty, aborting"
+    mv "$TRIGGER" "${TRIGGER}.invalid.$(date +%s)"
+    exit 1
+fi
+
+# Reject anything that doesn't look like a URL or absolute path —
+# basic guard against shell metachars.
+case "$IMAGE_SRC" in
+    https://*|http://*|/*)  ;;
+    *)
+        echo "  ERROR: image src must be http(s):// or absolute path: $IMAGE_SRC"
+        mv "$TRIGGER" "${TRIGGER}.invalid.$(date +%s)"
+        exit 1
+        ;;
+esac
+if [ -n "$CHECKSUM_SRC" ]; then
+    case "$CHECKSUM_SRC" in
+        https://*|http://*|/*)  ;;
+        *)
+            echo "  ERROR: checksum src must be http(s):// or absolute path: $CHECKSUM_SRC"
+            mv "$TRIGGER" "${TRIGGER}.invalid.$(date +%s)"
+            exit 1
+            ;;
+    esac
+fi
+
+echo "  image:    $IMAGE_SRC"
+if [ -n "$CHECKSUM_SRC" ]; then
+    echo "  checksum: $CHECKSUM_SRC"
+fi
+echo
+
+# Mark trigger as in-flight so the UI can show "applying" state.
+# We don't rename it (the .path unit fires on close-after-write,
+# not on every read) but we do touch a sibling marker.
+echo "in-flight $(date -Iseconds)" > "${TRIGGER}.state"
+
+APPLY_ARGS=("apply" "$IMAGE_SRC")
+if [ -n "$CHECKSUM_SRC" ]; then
+    APPLY_ARGS+=("--checksum" "$CHECKSUM_SRC")
+fi
+
+echo "  → /usr/local/bin/spatium-upgrade-slot ${APPLY_ARGS[*]}"
+if /usr/local/bin/spatium-upgrade-slot "${APPLY_ARGS[@]}"; then
+    echo
+    echo "  apply succeeded — calling set-next-boot"
+    if /usr/local/bin/spatium-upgrade-slot set-next-boot; then
+        echo
+        echo "  ✓ next-boot armed. Operator needs to reboot to switch slots."
+        echo "done $(date -Iseconds)" > "${TRIGGER}.state"
+        mv "$TRIGGER" "${TRIGGER}.done.$(date +%s)"
+    else
+        echo
+        echo "  ✗ set-next-boot failed (image is written but next-boot not armed)"
+        echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
+        mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
+        exit 1
+    fi
+else
+    echo
+    echo "  ✗ apply failed — inactive slot may be partially written"
+    echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
+    mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
+    exit 1
+fi

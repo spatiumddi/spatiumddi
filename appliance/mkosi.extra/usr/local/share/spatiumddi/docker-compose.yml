@@ -135,6 +135,13 @@ services:
       # when it sees the file. /var/run is tmpfs on the host so the
       # mount goes through cleanly even without firstboot setup.
       - /var/run:/var/run-host:ro
+      # Phase 8b-3 slot upgrade — the api needs to read grubenv to
+      # surface "which slot is the durable default" + the trial-boot
+      # state in the OS Upgrade card. Mounted read-only because grub-
+      # editenv writes happen host-side via spatium-upgrade-slot, not
+      # from the api container. /boot/efi is auto-mounted via gpt-
+      # auto-generator on the appliance (EFI System partition type).
+      - /boot/efi:/boot/efi-host:ro
       # Docker socket — required for the cert-deployer SIGHUP and
       # (Phase 4d) container management. The api container's ``app``
       # user gets supplementary group access via ``group_add`` below

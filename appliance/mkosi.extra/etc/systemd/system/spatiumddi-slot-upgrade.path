@@ -1,0 +1,15 @@
+[Unit]
+Description=Watch for SpatiumDDI slot-upgrade trigger (Phase 8b-3)
+Documentation=https://github.com/spatiumddi/spatiumddi/issues/138
+# Skip on the live ISO — there are no installed slot partitions to
+# upgrade, and the trigger file path doesn't exist.
+ConditionKernelCommandLine=!boot=live
+
+[Path]
+# PathChanged fires on close-after-write. The api container atomically
+# renames a .new sibling onto the trigger path so this only fires once
+# per apply (not on every incremental write).
+PathChanged=/var/lib/spatiumddi/release-state/slot-upgrade-pending
+
+[Install]
+WantedBy=multi-user.target
