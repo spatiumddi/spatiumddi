@@ -946,12 +946,12 @@ set timeout=3
 load_env
 
 # Phase 8c boot counting:
-#   * next_entry → one-shot, set by `grub-reboot <slot>`. We honor it
+#   * next_entry → one-shot, set by \`grub-reboot <slot>\`. We honor it
 #     once, clear it (so the next-but-one boot reverts), then boot.
 #     If the chosen slot panics or fails /health/live, it's already
 #     cleared from grubenv → operator falls back to saved_entry on
 #     the next reboot. This is the rollback safety net.
-#   * saved_entry → durable default. Set by `grub-set-default <slot>`
+#   * saved_entry → durable default. Set by \`grub-set-default <slot>\`
 #     either manually (spatium-upgrade-slot rollback) or by
 #     spatiumddi-firstboot.service after a trial slot proves healthy.
 if [ "\${next_entry}" ]; then
