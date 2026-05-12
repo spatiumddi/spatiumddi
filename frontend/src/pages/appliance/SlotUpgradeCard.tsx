@@ -7,9 +7,11 @@ import {
   Loader2,
   PlayCircle,
   RefreshCw,
+  RotateCcw,
   Shield,
 } from "lucide-react";
 
+import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { applianceSlotApi, type ApplianceSlot } from "@/lib/api";
 
 /**
@@ -45,6 +47,7 @@ export function SlotUpgradeCard() {
   const qc = useQueryClient();
   const [imageUrl, setImageUrl] = useState(DEFAULT_IMAGE_URL);
   const [checksumUrl, setChecksumUrl] = useState(DEFAULT_CHECKSUM_URL);
+  const [rollbackConfirm, setRollbackConfirm] = useState(false);
 
   const { data, isLoading, error, refetch } = useQuery({
     queryKey: ["appliance", "slot-upgrade"],
@@ -58,6 +61,17 @@ export function SlotUpgradeCard() {
     mutationFn: () =>
       applianceSlotApi.apply(imageUrl.trim(), checksumUrl.trim() || null),
     onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["appliance", "slot-upgrade"] });
+    },
+  });
+
+  const rollback = useMutation({
+    // Phase 8c-3 — flip the durable default to the inactive slot.
+    // ``target_slot: null`` lets the host-side runner auto-pick the
+    // inactive slot (matches the "go back to the previous slot" intent).
+    mutationFn: () => applianceSlotApi.rollback(null),
+    onSuccess: () => {
+      setRollbackConfirm(false);
       qc.invalidateQueries({ queryKey: ["appliance", "slot-upgrade"] });
     },
   });
@@ -93,15 +107,39 @@ export function SlotUpgradeCard() {
             come up. Active slot is never touched during apply.
           </p>
         </div>
-        <button
-          type="button"
-          className="inline-flex shrink-0 items-center gap-1.5 rounded-md border bg-background px-2 py-1 text-xs text-muted-foreground hover:bg-muted"
-          onClick={() => refetch()}
-          disabled={isLoading}
-        >
-          <RefreshCw className={`h-3 w-3 ${isLoading ? "animate-spin" : ""}`} />
-          Refresh
-        </button>
+        <div className="flex shrink-0 items-center gap-1.5">
+          {/* Phase 8c-3 — rollback button. Hidden when there's no
+              inactive slot to roll back to (fresh install, no upgrade
+              ever applied) and during a trial boot — in a trial boot
+              the "inactive" slot is the durable one, so a "rollback
+              to inactive" would commit the trial, which is the
+              opposite of the operator's intent. During a trial boot
+              the right action is just reboot (which reverts), handled
+              via the Maintenance tab. */}
+          {data?.current_slot && inactiveSlot && !trial && (
+            <button
+              type="button"
+              className="inline-flex items-center gap-1.5 rounded-md border bg-background px-2 py-1 text-xs text-muted-foreground hover:bg-muted disabled:opacity-50"
+              onClick={() => setRollbackConfirm(true)}
+              disabled={inFlight || rollback.isPending}
+              title={`Durably switch back to ${slotLabel(inactiveSlot)} (reboot required to take effect).`}
+            >
+              <RotateCcw className="h-3 w-3" />
+              Rollback to {inactiveSlot === "slot_a" ? "A" : "B"}
+            </button>
+          )}
+          <button
+            type="button"
+            className="inline-flex items-center gap-1.5 rounded-md border bg-background px-2 py-1 text-xs text-muted-foreground hover:bg-muted"
+            onClick={() => refetch()}
+            disabled={isLoading}
+          >
+            <RefreshCw
+              className={`h-3 w-3 ${isLoading ? "animate-spin" : ""}`}
+            />
+            Refresh
+          </button>
+        </div>
       </div>
 
       {error && (
@@ -257,6 +295,47 @@ export function SlotUpgradeCard() {
           </pre>
         </div>
       )}
+
+      <ConfirmModal
+        open={rollbackConfirm}
+        title={`Rollback to ${slotLabel(inactiveSlot)}?`}
+        message={
+          <div className="space-y-2">
+            <p>
+              This durably flips the boot default from{" "}
+              <code className="rounded bg-muted px-1 font-mono">
+                {data?.current_slot ?? "—"}
+              </code>{" "}
+              to{" "}
+              <code className="rounded bg-muted px-1 font-mono">
+                {inactiveSlot ?? "—"}
+              </code>
+              . The active slot keeps running until you reboot — the swap
+              doesn’t take effect until then.
+            </p>
+            <p>
+              Operator state on <code>/var</code> (databases, container images,
+              certs, audit log) is shared across slots and is not touched. The
+              OS layer (kernel, systemd units, host binaries) reverts to
+              whatever shipped on the target slot. If the target slot is
+              unstamped or carries a broken image, reboot will fail and the next
+              reboot reverts to the current slot automatically (Phase 8c safety
+              net).
+            </p>
+            {rollback.isError && (
+              <p className="text-destructive">
+                {(rollback.error as Error).message}
+              </p>
+            )}
+          </div>
+        }
+        confirmLabel="Rollback"
+        cancelLabel="Cancel"
+        tone="destructive"
+        loading={rollback.isPending}
+        onConfirm={() => rollback.mutate()}
+        onClose={() => !rollback.isPending && setRollbackConfirm(false)}
+      />
     </div>
   );
 }

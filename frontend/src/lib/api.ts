@@ -6890,6 +6890,13 @@ export const applianceSlotApi = {
         checksum_url: checksum_url || null,
       })
       .then((r) => r.data),
+  rollback: (target_slot: ApplianceSlot | null) =>
+    api
+      .post<{
+        scheduled: string;
+        target_slot: ApplianceSlot | null;
+      }>("/appliance/slot-upgrade/rollback", { target_slot })
+      .then((r) => r.data),
 };
 
 // ── Appliance: container management (Phase 4d) ─────────────────────

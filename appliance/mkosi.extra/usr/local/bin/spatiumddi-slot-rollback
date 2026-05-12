@@ -1,0 +1,83 @@
+#!/bin/bash
+# spatiumddi-slot-rollback — host-side rollback runner (Phase 8c-3,
+# issue #138).
+#
+# The api container writes /var/lib/spatiumddi/release-state/
+# slot-rollback-pending with one optional line: the explicit target
+# slot ("slot_a" or "slot_b"). When the line is empty or absent the
+# runner auto-picks "the inactive slot" via spatium-upgrade-slot.
+#
+# Then `spatiumddi-slot-rollback.path` notices the file and runs this
+# script as root. It:
+#   1. Reads the trigger file (target slot, optional)
+#   2. Invokes /usr/local/bin/spatium-upgrade-slot commit [<slot>]
+#      which calls grub-set-default — durably flips saved_entry. The
+#      swap doesn't take effect until the operator reboots; the active
+#      slot keeps running until then.
+#   3. Renames the trigger to .done or .failed so the .path unit
+#      doesn't re-fire on the next watch.
+#
+# This is the "I just upgraded and want to go back to the previous
+# slot" path — separate from the trial-boot auto-revert (which is
+# the kernel-panic-or-/health/live-fail safety net during the trial
+# boot window). Rollback is the operator's explicit choice.
+
+set -euo pipefail
+
+TRIGGER=/var/lib/spatiumddi/release-state/slot-rollback-pending
+LOG_DIR=/var/log/spatiumddi
+LOG="$LOG_DIR/slot-upgrade.log"
+
+mkdir -p "$LOG_DIR"
+exec >> "$LOG" 2>&1
+echo
+echo "[$(date -Iseconds)] === spatiumddi-slot-rollback fired ==="
+
+if [ ! -f "$TRIGGER" ]; then
+    echo "  no trigger file at $TRIGGER, nothing to do"
+    exit 0
+fi
+
+# Trigger file format:
+#   line 1 (optional): explicit target slot — "slot_a" or "slot_b".
+#                      When empty, spatium-upgrade-slot commit defaults
+#                      to the inactive slot.
+TARGET_SLOT=$(sed -n '1p' "$TRIGGER" | tr -d '\r\n' || true)
+
+# Reject anything that isn't an expected slot name.
+case "$TARGET_SLOT" in
+    ""|slot_a|slot_b|root_a|root_b|a|b|A|B)  ;;
+    *)
+        echo "  ERROR: target slot must be empty or one of slot_a/slot_b: $TARGET_SLOT"
+        mv "$TRIGGER" "${TRIGGER}.invalid.$(date +%s)"
+        exit 1
+        ;;
+esac
+
+if [ -n "$TARGET_SLOT" ]; then
+    echo "  target: $TARGET_SLOT (explicit)"
+else
+    echo "  target: (auto — spatium-upgrade-slot will pick the inactive slot)"
+fi
+echo
+
+# Mark trigger as in-flight so the UI can show "applying" state.
+echo "in-flight $(date -Iseconds)" > "${TRIGGER}.state"
+
+COMMIT_ARGS=("commit")
+[ -n "$TARGET_SLOT" ] && COMMIT_ARGS+=("$TARGET_SLOT")
+
+echo "  → /usr/local/bin/spatium-upgrade-slot ${COMMIT_ARGS[*]}"
+if /usr/local/bin/spatium-upgrade-slot "${COMMIT_ARGS[@]}"; then
+    echo
+    echo "  ✓ rollback committed — durable default updated."
+    echo "  Operator needs to reboot to switch slots."
+    echo "done $(date -Iseconds)" > "${TRIGGER}.state"
+    mv "$TRIGGER" "${TRIGGER}.done.$(date +%s)"
+else
+    echo
+    echo "  ✗ rollback (grub-set-default) failed — durable default unchanged"
+    echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
+    mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
+    exit 1
+fi
