@@ -443,18 +443,19 @@ do_install() {
     #
     #   p1  BIOS Boot     1 MiB     ef02   legacy chain-load (grub i386-pc)
     #   p2  ESP          512 MiB    ef00   FAT32, /boot/efi
-    #   p3  root_A         8 GiB    8304   active slot (this install lands here)
-    #   p4  root_B         8 GiB    8304   inactive slot (staging next image)
+    #   p3  root_A         4 GiB    8304   active slot (this install lands here)
+    #   p4  root_B         4 GiB    8304   inactive slot (staging next image)
     #   p5  var          rest       8300   /var, persisted across slot swaps
     #
-    # Slot sizes: 8 GiB each is comfortable headroom for the appliance's
-    # ~3 GiB rootfs + room for image growth. /var carries operator state
-    # (postgres data, docker volumes, audit log, backups, overlay upper
-    # for /etc) and gets the remainder of the disk.
+    # Slot sizing — current rootfs is ~1.8 GiB (Python, kernel, system
+    # packages, /etc baseline). 4 GiB gives ~2.2× headroom which covers
+    # the Phase 4-7 roadmap (additional daemons, expanded Python stack,
+    # future kernel upgrades). If we ever outgrow it, "spatium-upgrade-
+    # slot --grow" is a future affordance — easier to grow than shrink.
     #
-    # Hard floor: 24 GiB target disk (= 0.5 GiB ESP + 16 GiB slots +
-    # at least 7 GiB usable /var). Below that, IPAM data + container
-    # images outgrow /var quickly.
+    # Hard floor: 16 GiB target disk (= 1 MiB BBP + 512 MiB ESP + 2× 4
+    # GiB slots + at least 7 GiB usable /var). Below that, postgres +
+    # docker volumes + audit log outgrow /var quickly.
     local BBP ESP ROOT_A ROOT_B VAR
     BBP=$(partition_node 1)
     ESP=$(partition_node 2)
@@ -465,11 +466,11 @@ do_install() {
     # Check target disk size — bail before destroying anything.
     local DISK_BYTES MIN_BYTES
     DISK_BYTES=$(blockdev --getsize64 "$TARGET_DISK" 2>/dev/null || echo 0)
-    MIN_BYTES=$((24 * 1024 * 1024 * 1024))
+    MIN_BYTES=$((16 * 1024 * 1024 * 1024))
     if [ "$DISK_BYTES" -lt "$MIN_BYTES" ]; then
-        log "ERROR: target disk $TARGET_DISK is $((DISK_BYTES / 1024 / 1024 / 1024)) GiB — need at least 24 GiB for A/B layout"
+        log "ERROR: target disk $TARGET_DISK is $((DISK_BYTES / 1024 / 1024 / 1024)) GiB — need at least 16 GiB for A/B layout"
         whiptail --backtitle "$BACKTITLE" --title "Disk too small" --msgbox \
-            "Target disk $TARGET_DISK is only $((DISK_BYTES / 1024 / 1024 / 1024)) GiB.\n\nSpatiumDDI's A/B atomic-upgrade layout needs at least 24 GiB:\n  ESP        512 MiB\n  root_A       8 GiB\n  root_B       8 GiB\n  var       remainder (≥7 GiB usable)\n\nAttach a larger disk and re-run the installer." 16 70
+            "Target disk $TARGET_DISK is only $((DISK_BYTES / 1024 / 1024 / 1024)) GiB.\n\nSpatiumDDI's A/B atomic-upgrade layout needs at least 16 GiB:\n  ESP        512 MiB\n  root_A       4 GiB\n  root_B       4 GiB\n  var       remainder (≥7 GiB usable)\n\nAttach a larger disk and re-run the installer." 16 70
         exit 1
     fi
 
@@ -512,8 +513,8 @@ do_install() {
         #   8300 = generic Linux fs  (var; we mount via /etc/fstab)
         sgdisk -n1:0:+1M    -t1:ef02 -c1:bios_boot \
                -n2:0:+512M  -t2:ef00 -c2:ESP \
-               -n3:0:+8G    -t3:8304 -c3:root_A \
-               -n4:0:+8G    -t4:8304 -c4:root_B \
+               -n3:0:+4G    -t3:8304 -c3:root_A \
+               -n4:0:+4G    -t4:8304 -c4:root_B \
                -n5:0:0      -t5:8300 -c5:var \
                "$TARGET_DISK"               >> "$INSTALL_LOG" 2>&1
         partprobe "$TARGET_DISK"            >> "$INSTALL_LOG" 2>&1 || true
