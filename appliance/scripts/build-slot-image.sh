@@ -121,9 +121,9 @@ echo "→ Copying rootfs into slot image…"
 # writes for slot_a at install time, so both slots agree.
 echo "→ Writing image-baseline /etc/fstab into slot…"
 cat > "$WORK/slot-mnt/etc/fstab" <<'FSTAB'
-LABEL=var  /var       ext4   defaults                             0 2
-LABEL=ESP  /boot/efi  vfat   umask=0077,shortname=winnt           0 2
-tmpfs      /tmp       tmpfs  nosuid,nodev,noexec,mode=1777        0 0
+LABEL=var  /var       ext4   defaults                              0 2
+LABEL=ESP  /boot/efi  vfat   fmask=0133,dmask=0022,shortname=winnt 0 2
+tmpfs      /tmp       tmpfs  nosuid,nodev,noexec,mode=1777         0 0
 FSTAB
 
 # /etc/hostname is image-baseline only — empty file, so before the

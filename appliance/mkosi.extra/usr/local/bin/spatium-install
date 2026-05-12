@@ -618,6 +618,14 @@ do_install() {
         #                    LABEL=var in fstab is a reliable fallback.
         #
         # /boot/efi        — LABEL=ESP (set by `mkfs.fat -n ESP`).
+        #                    fmask=0133 / dmask=0022 makes files 0644
+        #                    and dirs 0755 so the api container (uid
+        #                    1000) can read grubenv through the read-
+        #                    only /boot/efi:/boot/efi-host bind mount
+        #                    that drives the SlotUpgradeCard. No
+        #                    secrets live on the ESP — just grub.cfg
+        #                    + grubenv + boot loader binaries —
+        #                    relaxing perms here is fine.
         #
         # /tmp             — tmpfs, image-baseline.
         #
@@ -625,9 +633,9 @@ do_install() {
         #                    at /etc/systemd/system/home.mount +
         #                    root.mount). Not in fstab.
         cat > "$MOUNT/etc/fstab" <<'EOF'
-LABEL=var  /var       ext4   defaults                             0 2
-LABEL=ESP  /boot/efi  vfat   umask=0077,shortname=winnt           0 2
-tmpfs      /tmp       tmpfs  nosuid,nodev,noexec,mode=1777        0 0
+LABEL=var  /var       ext4   defaults                              0 2
+LABEL=ESP  /boot/efi  vfat   fmask=0133,dmask=0022,shortname=winnt 0 2
+tmpfs      /tmp       tmpfs  nosuid,nodev,noexec,mode=1777         0 0
 EOF
         echo "$HOSTNAME" > "$MOUNT/etc/hostname"
 
