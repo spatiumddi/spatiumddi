@@ -6,6 +6,7 @@ import {
   HardDrive,
   Loader2,
   PlayCircle,
+  Power,
   RefreshCw,
   RotateCcw,
   Shield,
@@ -15,6 +16,7 @@ import { ConfirmModal } from "@/components/ui/confirm-modal";
 import {
   applianceReleasesApi,
   applianceSlotApi,
+  applianceSystemApi,
   type ApplianceSlot,
 } from "@/lib/api";
 
@@ -56,7 +58,9 @@ export function SlotUpgradeCard() {
   const [selectedTag, setSelectedTag] = useState<string>("");
   const [customImageUrl, setCustomImageUrl] = useState("");
   const [customChecksumUrl, setCustomChecksumUrl] = useState("");
+  const [applyConfirm, setApplyConfirm] = useState(false);
   const [rollbackConfirm, setRollbackConfirm] = useState(false);
+  const [rebootConfirm, setRebootConfirm] = useState(false);
 
   const { data, isLoading, error, refetch } = useQuery({
     queryKey: ["appliance", "slot-upgrade"],
@@ -107,7 +111,19 @@ export function SlotUpgradeCard() {
     mutationFn: () =>
       applianceSlotApi.apply(resolvedImageUrl, resolvedChecksumUrl || null),
     onSuccess: () => {
+      setApplyConfirm(false);
       qc.invalidateQueries({ queryKey: ["appliance", "slot-upgrade"] });
+    },
+  });
+
+  // Reuses the same host-side reboot trigger Maintenance tab uses
+  // (systemd path unit, 10 s grace). Surfaced here so the operator
+  // doesn't have to navigate tabs after a successful apply/rollback.
+  const reboot = useMutation({
+    mutationFn: applianceSystemApi.reboot,
+    onSuccess: () => {
+      setRebootConfirm(false);
+      qc.invalidateQueries({ queryKey: ["appliance", "system"] });
     },
   });
 
@@ -217,23 +233,38 @@ export function SlotUpgradeCard() {
       </div>
 
       {trial && (
-        <div className="flex items-start gap-2 rounded-md border border-amber-500/50 bg-amber-500/10 p-2.5 text-xs text-amber-700 dark:text-amber-300">
-          <Shield className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-          <div>
-            <div className="font-semibold">Trial boot</div>
-            <div className="mt-0.5">
-              You’re on{" "}
-              <code className="rounded bg-amber-500/10 px-1">
-                {data?.current_slot}
-              </code>{" "}
-              but the durable default is still{" "}
-              <code className="rounded bg-amber-500/10 px-1">
-                {data?.durable_default}
-              </code>
-              . Once <code>/health/live</code> confirms, the swap commits
-              automatically. A reboot before commit reverts.
+        <div className="flex items-start justify-between gap-3 rounded-md border border-amber-500/50 bg-amber-500/10 p-2.5 text-xs text-amber-700 dark:text-amber-300">
+          <div className="flex items-start gap-2">
+            <Shield className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+            <div>
+              <div className="font-semibold">
+                Slot mismatch — reboot pending
+              </div>
+              <div className="mt-0.5">
+                Active slot{" "}
+                <code className="rounded bg-amber-500/10 px-1">
+                  {data?.current_slot}
+                </code>{" "}
+                differs from the durable default{" "}
+                <code className="rounded bg-amber-500/10 px-1">
+                  {data?.durable_default}
+                </code>
+                . Reboot to land on the durable. After an apply, the new slot's{" "}
+                <code>/health/live</code> determines whether the swap stays
+                committed; after a manual rollback the durable is already set
+                explicitly.
+              </div>
             </div>
           </div>
+          <button
+            type="button"
+            className="inline-flex shrink-0 items-center gap-1.5 self-center rounded-md border border-amber-600/40 bg-amber-50 px-2.5 py-1 text-xs font-semibold text-amber-800 hover:bg-amber-100 disabled:opacity-50 dark:bg-amber-900/30 dark:text-amber-100 dark:hover:bg-amber-900/50"
+            onClick={() => setRebootConfirm(true)}
+            disabled={reboot.isPending}
+          >
+            <Power className="h-3.5 w-3.5" />
+            Reboot now
+          </button>
         </div>
       )}
 
@@ -351,7 +382,7 @@ export function SlotUpgradeCard() {
           <button
             type="button"
             className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-xs font-semibold text-primary-foreground disabled:opacity-50"
-            onClick={() => apply.mutate()}
+            onClick={() => setApplyConfirm(true)}
             disabled={inFlight || !resolvedImageUrl || apply.isPending}
           >
             {inFlight || apply.isPending ? (
@@ -384,15 +415,27 @@ export function SlotUpgradeCard() {
       )}
 
       {data?.upgrade_state === "done" && (
-        <div className="flex items-start gap-2 rounded-md border border-green-500/50 bg-green-500/10 p-2.5 text-xs text-green-700 dark:text-green-300">
-          <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-          <div>
-            <div className="font-semibold">Apply complete</div>
-            <div className="mt-0.5">
-              {slotLabel(inactiveSlot)} is ready and armed for next boot. Reboot
-              to switch — health-check passes will commit it automatically.
+        <div className="flex items-start justify-between gap-3 rounded-md border border-green-500/50 bg-green-500/10 p-2.5 text-xs text-green-700 dark:text-green-300">
+          <div className="flex items-start gap-2">
+            <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+            <div>
+              <div className="font-semibold">Apply complete</div>
+              <div className="mt-0.5">
+                {slotLabel(inactiveSlot)} is ready and armed for next boot.
+                Reboot to switch — health-check passes will commit it
+                automatically.
+              </div>
             </div>
           </div>
+          <button
+            type="button"
+            className="inline-flex shrink-0 items-center gap-1.5 self-center rounded-md border border-green-600/40 bg-green-50 px-2.5 py-1 text-xs font-semibold text-green-800 hover:bg-green-100 disabled:opacity-50 dark:bg-green-900/30 dark:text-green-100 dark:hover:bg-green-900/50"
+            onClick={() => setRebootConfirm(true)}
+            disabled={reboot.isPending}
+          >
+            <Power className="h-3.5 w-3.5" />
+            Reboot now
+          </button>
         </div>
       )}
 
@@ -420,6 +463,60 @@ export function SlotUpgradeCard() {
           </pre>
         </div>
       )}
+
+      <ConfirmModal
+        open={applyConfirm}
+        title={`Apply${
+          sourceMode === "release" && effectiveTag ? ` ${effectiveTag}` : ""
+        } to ${slotLabel(inactiveSlot)}?`}
+        message={
+          <div className="space-y-2">
+            <p>
+              This streams the slot image into{" "}
+              <code className="rounded bg-muted px-1 font-mono">
+                {inactiveSlot ?? "—"}
+              </code>{" "}
+              via dd, arms grub one-shot, and rolls back automatically if{" "}
+              <code>/health/live</code> doesn’t come up on the new slot. The
+              active slot{" "}
+              <code className="rounded bg-muted px-1 font-mono">
+                {data?.current_slot ?? "—"}
+              </code>{" "}
+              is never touched during apply.
+            </p>
+            <p>
+              Source:{" "}
+              <code className="rounded bg-muted px-1 font-mono break-all">
+                {resolvedImageUrl || "—"}
+              </code>
+              {resolvedChecksumUrl && (
+                <>
+                  <br />
+                  Checksum:{" "}
+                  <code className="rounded bg-muted px-1 font-mono break-all">
+                    {resolvedChecksumUrl}
+                  </code>
+                </>
+              )}
+            </p>
+            <p>
+              The swap doesn’t take effect until you reboot — the active slot
+              keeps running uninterrupted until then. Worst case is one wasted
+              reboot that lands back on the current slot.
+            </p>
+            {apply.isError && (
+              <p className="text-destructive">
+                {(apply.error as Error).message}
+              </p>
+            )}
+          </div>
+        }
+        confirmLabel="Apply"
+        cancelLabel="Cancel"
+        loading={apply.isPending}
+        onConfirm={() => apply.mutate()}
+        onClose={() => !apply.isPending && setApplyConfirm(false)}
+      />
 
       <ConfirmModal
         open={rollbackConfirm}
@@ -460,6 +557,42 @@ export function SlotUpgradeCard() {
         loading={rollback.isPending}
         onConfirm={() => rollback.mutate()}
         onClose={() => !rollback.isPending && setRollbackConfirm(false)}
+      />
+
+      <ConfirmModal
+        open={rebootConfirm}
+        title="Reboot appliance?"
+        message={
+          <div className="space-y-2">
+            <p>
+              The host reboots after a 10 s grace window. All SpatiumDDI
+              services stop while the appliance restarts — typical downtime is
+              30–60 s before HTTPS comes back. DHCP and DNS pause during this
+              window.
+            </p>
+            <p>
+              On boot, the appliance loads slot{" "}
+              <code className="rounded bg-muted px-1 font-mono">
+                {data?.durable_default ?? data?.current_slot ?? "—"}
+              </code>
+              .{" "}
+              {data?.is_trial_boot
+                ? "The slot mismatch resolves on this reboot."
+                : "No slot change pending — this just reboots the current slot."}
+            </p>
+            {reboot.isError && (
+              <p className="text-destructive">
+                {(reboot.error as Error).message}
+              </p>
+            )}
+          </div>
+        }
+        confirmLabel="Reboot now"
+        cancelLabel="Cancel"
+        tone="destructive"
+        loading={reboot.isPending}
+        onConfirm={() => reboot.mutate()}
+        onClose={() => !reboot.isPending && setRebootConfirm(false)}
       />
     </div>
   );
