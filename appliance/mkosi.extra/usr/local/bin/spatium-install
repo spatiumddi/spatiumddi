@@ -583,13 +583,23 @@ do_install() {
         # systemd reads them at boot BEFORE etc.mount can fire. If they
         # were in the overlay only, systemd would never see them, /var
         # wouldn't mount, and the overlay would never mount either —
-        # which is the build030 install bug.
+        # which was the build030 install bug.
         #
-        # Belt + braces: /var also has GPT type Linux /var
+        # Belt + braces: /var has GPT type Linux /var
         # (4d21b016-b534-45c2-a9fb-5c16e091fd2d, sgdisk code 8310, set
         # earlier in the partitioning step) so systemd-gpt-auto-
-        # generator auto-mounts it even without an fstab entry on slot
-        # swaps to a future image where root_B's fstab might lack one.
+        # generator auto-mounts it even without an fstab entry. On a
+        # Phase 8b slot swap to image v2, root_B will ship its own
+        # vanilla fstab that lacks our /var UUID — gpt-auto picks up
+        # the slack.
+        #
+        # /home + /root bind mounts deliberately NOT in fstab. They
+        # ship as systemd .mount unit files
+        # (/etc/systemd/system/home.mount + root.mount) baked into the
+        # image baseline, so EVERY image slot's /etc has them. fstab
+        # entries would get reset to vanilla on slot swap → operator
+        # data masked because /home wouldn't bind-mount; the .mount
+        # files are immune to that failure mode.
         local ROOT_A_UUID ESP_UUID VAR_UUID
         ROOT_A_UUID=$(blkid -s UUID -o value "$ROOT_A")
         ESP_UUID=$(blkid -s UUID -o value "$ESP")
@@ -598,8 +608,6 @@ do_install() {
 UUID=$ROOT_A_UUID  /          ext4  defaults                       0 1
 UUID=$VAR_UUID     /var       ext4  defaults                       0 2
 UUID=$ESP_UUID     /boot/efi  vfat  umask=0077,shortname=winnt     0 2
-/var/home          /home      none  bind                           0 0
-/var/root          /root      none  bind                           0 0
 tmpfs              /tmp       tmpfs nosuid,nodev,noexec,mode=1777  0 0
 EOF
         echo "$HOSTNAME" > "$MOUNT/etc/hostname"
@@ -635,14 +643,20 @@ EOF
             "$MOUNT/etc" >> "$INSTALL_LOG" 2>&1
 
         # Phase 8a — /home + /root on /var so operator home dirs
-        # survive slot swaps. useradd inside the upcoming chroot writes
-        # to /home/admin → transparent via the bind mount → /var/home/
-        # admin. fstab entry below replays the bind on every boot.
+        # survive slot swaps. The bind mounts are wired via shipped
+        # systemd unit files (home.mount + root.mount, baked into the
+        # image) rather than fstab — fstab gets reset to image vanilla
+        # on slot swap, but every image slot ships the same .mount unit
+        # files, so binds are immune to that reset path.
+        #
+        # useradd inside the upcoming chroot writes to /home/admin →
+        # transparent via the install-time bind mount → /var/home/admin
+        # on disk → ready for the .mount unit to re-bind at every boot.
         mkdir -p "$MOUNT/var/home" "$MOUNT/home"
         mkdir -p "$MOUNT/var/root"
         # /root already exists in the image rootfs with the live-system
-        # contents — move them over before bind-mounting so they're
-        # captured on the persistent side.
+        # contents — move them to /var/root so they live on the
+        # persistent side, then re-create an empty /root mountpoint.
         if [ -d "$MOUNT/root" ] && [ -z "$(ls -A "$MOUNT/var/root" 2>/dev/null)" ]; then
             cp -a "$MOUNT/root/." "$MOUNT/var/root/" >> "$INSTALL_LOG" 2>&1 || true
             rm -rf "$MOUNT/root"
@@ -650,6 +664,13 @@ EOF
         mkdir -p "$MOUNT/root"
         mount --bind "$MOUNT/var/home" "$MOUNT/home" >> "$INSTALL_LOG" 2>&1
         mount --bind "$MOUNT/var/root" "$MOUNT/root" >> "$INSTALL_LOG" 2>&1
+
+        # Write operator's hostname through the overlay too — lands in
+        # /var/persist/etc/hostname on disk → persists across slot
+        # swaps verbatim. The underlying root_A /etc/hostname (written
+        # earlier) covers the brief window before the overlay mounts
+        # on first boot; the overlay upper covers everything else.
+        echo "$HOSTNAME" > "$MOUNT/etc/hostname"
 
         echo "XXX"; echo "65"; echo "Writing system config..."; echo "XXX"
         # fstab + /etc/hostname were already written to the underlying

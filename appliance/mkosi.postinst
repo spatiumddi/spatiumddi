@@ -99,6 +99,17 @@ if [ -f "$BUILDROOT/etc/systemd/system/etc.mount" ]; then
         "$BUILDROOT/etc/systemd/system/local-fs.target.wants/etc.mount"
 fi
 
+# Phase 8a — /home + /root bind-mount units (issue #138). These ship
+# in every image slot so they're immune to fstab being reset to
+# image vanilla on slot swap. Operator home dirs persist via the var
+# partition's /var/home + /var/root subdirs.
+for bind_unit in home.mount root.mount; do
+    if [ -f "$BUILDROOT/etc/systemd/system/$bind_unit" ]; then
+        ln -sfn "/etc/systemd/system/$bind_unit" \
+            "$BUILDROOT/etc/systemd/system/local-fs.target.wants/$bind_unit"
+    fi
+done
+
 # Phase 8a-3 — tmpfiles.d entry to ensure /var/persist/etc{,-work}
 # exists. The installer creates them at install time too, but on a
 # Phase 8a-1 → 8a-3 in-place upgrade (no reinstall) this is the only
@@ -163,6 +174,8 @@ chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-console.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-console@.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/etc.mount"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-etc-reconcile.service"
+chmod 0644 "$BUILDROOT/etc/systemd/system/home.mount"
+chmod 0644 "$BUILDROOT/etc/systemd/system/root.mount"
 
 # State directories owned by the spatiumddi-firstboot service.
 install -d -m 0755 "$BUILDROOT/etc/spatiumddi"
