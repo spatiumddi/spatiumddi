@@ -12,6 +12,7 @@ import structlog
 from . import __version__
 from .cache import save_token
 from .config import AgentConfig
+from .slot_state import collect as collect_slot_state
 
 log = structlog.get_logger(__name__)
 
@@ -39,7 +40,7 @@ class HeartbeatClient:
         return httpx.Client(base_url=self.cfg.control_plane_url, verify=verify, timeout=15.0)
 
     def send_once(self) -> None:
-        body = {
+        body: dict[str, Any] = {
             "agent_version": __version__,
             "daemon": self.daemon_status,
             "config": {},
@@ -47,6 +48,12 @@ class HeartbeatClient:
             "failed_ops_count": self.failed_ops_count,
             "zone_serials": self.zone_serials,
         }
+        # Phase 8f-2 — agent reports its slot + deployment state. On
+        # docker / k8s deploys most fields come back None and the
+        # control plane's heartbeat handler skips them; the only field
+        # that's always set is ``deployment_kind`` so the Fleet view
+        # can still render the row with the right affordances.
+        body.update(collect_slot_state())
         try:
             with self._client() as c:
                 resp = c.post(

@@ -76,6 +76,17 @@ class AgentHeartbeatRequest(BaseModel):
     failed_ops_count: int = 0
     disk_free_bytes: int | None = None
     zone_serials: dict[str, int] = {}
+    # Phase 8f-2 — agent reports its slot state + deployment environment.
+    # All optional so older agents that haven't been upgraded keep
+    # heartbeating without a 422. Server-side fills the matching
+    # ``dns_server`` columns when present.
+    deployment_kind: str | None = None
+    installed_appliance_version: str | None = None
+    current_slot: str | None = None
+    durable_default: str | None = None
+    is_trial_boot: bool | None = None
+    last_upgrade_state: str | None = None
+    last_upgrade_state_at: datetime | None = None
 
 
 class AgentHeartbeatResponseV2(BaseModel):
@@ -339,6 +350,25 @@ async def agent_heartbeat(
     # distributed deployments.
     if request.client is not None:
         server.last_seen_ip = request.client.host
+
+    # Phase 8f-2 — persist whatever slot state the agent reported. Only
+    # overwrite when the agent actually sent a value (older agents
+    # leave these as None, in which case we leave the DB columns
+    # untouched rather than nulling out previously-known state).
+    if body.deployment_kind is not None:
+        server.deployment_kind = body.deployment_kind
+    if body.installed_appliance_version is not None:
+        server.installed_appliance_version = body.installed_appliance_version
+    if body.current_slot is not None:
+        server.current_slot = body.current_slot
+    if body.durable_default is not None:
+        server.durable_default = body.durable_default
+    if body.is_trial_boot is not None:
+        server.is_trial_boot = body.is_trial_boot
+    if body.last_upgrade_state is not None:
+        server.last_upgrade_state = body.last_upgrade_state
+    if body.last_upgrade_state_at is not None:
+        server.last_upgrade_state_at = body.last_upgrade_state_at
 
     # Process op ACKs
     for ack in body.ops_ack:

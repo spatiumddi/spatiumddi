@@ -220,6 +220,31 @@ class DNSServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     pending_approval: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     is_primary: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
+    # Phase 8f fleet upgrade orchestration (issue #138). Operator-intent
+    # fields (``desired_*``) are set from the Fleet view in /appliance and
+    # carried to the agent via ConfigBundle long-poll; agent-reality
+    # fields are written from the heartbeat path with values from
+    # ``spatium-upgrade-slot status`` on the agent host. All nullable so
+    # pre-8f rows + docker / k8s deployments keep working unchanged —
+    # the agent populates them on its next check-in.
+    desired_appliance_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    desired_slot_image_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    # ``appliance`` / ``docker`` / ``k8s`` / NULL. Agent reports this on
+    # registration based on environment introspection (presence of
+    # ``/etc/spatiumddi/role-config`` ⇒ appliance, ``KUBERNETES_SERVICE_HOST``
+    # ⇒ k8s, else docker / unknown).
+    deployment_kind: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    installed_appliance_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    current_slot: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    durable_default: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    is_trial_boot: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    last_upgrade_state: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    last_upgrade_state_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
     # Fernet-encrypted JSON blob for driver-specific admin credentials.
     # windows_dns Path B stores a dict:
     #   {"username", "password", "winrm_port", "transport", "use_tls",

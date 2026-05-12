@@ -137,6 +137,24 @@ class DHCPServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
         DateTime(timezone=True), nullable=True
     )
 
+    # Phase 8f fleet upgrade orchestration (issue #138). Mirror of the
+    # ``DNSServer`` columns — same schema because both server kinds
+    # share the agent bookkeeping shape and Fleet view treats them
+    # uniformly. See DNSServer for the per-field description.
+    desired_appliance_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    desired_slot_image_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    deployment_kind: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    installed_appliance_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    current_slot: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    durable_default: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    is_trial_boot: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    last_upgrade_state: Mapped[str | None] = mapped_column(String(20), nullable=True)
+    last_upgrade_state_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
     # Fernet-encrypted JSON blob for driver-specific admin credentials.
     # windows_dhcp stores a dict: {"username", "password", "winrm_port",
     # "transport", "use_tls", "verify_tls"}. Agent-based drivers (kea)
