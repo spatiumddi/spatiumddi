@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertCircle,
   CheckCircle2,
+  Copy,
   HardDrive,
   Loader2,
   RefreshCw,
@@ -12,6 +13,7 @@ import {
 } from "lucide-react";
 
 import { ConfirmModal } from "@/components/ui/confirm-modal";
+import { Modal } from "@/components/ui/modal";
 import {
   applianceFleetApi,
   applianceReleasesApi,
@@ -66,7 +68,9 @@ export function FleetTab() {
   const [upgradeTarget, setUpgradeTarget] = useState<FleetAgentRow | null>(
     null,
   );
+  const [manualTarget, setManualTarget] = useState<FleetAgentRow | null>(null);
   const [selectedTag, setSelectedTag] = useState<string>("");
+  const [manualSelectedTag, setManualSelectedTag] = useState<string>("");
 
   const { data, isLoading, error, refetch } = useQuery({
     queryKey: ["appliance", "fleet"],
@@ -273,18 +277,17 @@ export function FleetTab() {
                         Upgrade
                       </button>
                     ) : (
-                      <span
-                        className="text-muted-foreground"
-                        title={
-                          a.deployment_kind === "docker"
-                            ? "Run on agent host: docker compose pull && up -d"
-                            : a.deployment_kind === "k8s"
-                              ? "helm upgrade … --set image.tag=<version>"
-                              : "Slot upgrade not supported on this deployment"
-                        }
+                      <button
+                        type="button"
+                        className="inline-flex items-center gap-1.5 rounded-md border bg-background px-2.5 py-1 text-xs text-muted-foreground hover:bg-muted"
+                        onClick={() => {
+                          setManualTarget(a);
+                          setManualSelectedTag("");
+                        }}
+                        title="Show the operator-run upgrade command for this deployment kind"
                       >
-                        manual
-                      </span>
+                        Manual upgrade…
+                      </button>
                     )}
                   </td>
                 </tr>
@@ -387,6 +390,138 @@ export function FleetTab() {
           }
         }}
       />
+
+      {manualTarget && (
+        <ManualUpgradeModal
+          target={manualTarget}
+          selectedTag={manualSelectedTag}
+          onSelectTag={setManualSelectedTag}
+          releases={releases}
+          onClose={() => {
+            setManualTarget(null);
+            setManualSelectedTag("");
+          }}
+        />
+      )}
     </div>
+  );
+}
+
+function ManualUpgradeModal({
+  target,
+  selectedTag,
+  onSelectTag,
+  releases,
+  onClose,
+}: {
+  target: FleetAgentRow;
+  selectedTag: string;
+  onSelectTag: (tag: string) => void;
+  releases: { tag: string; published_at: string; is_prerelease: boolean }[];
+  onClose: () => void;
+}) {
+  // Default tag: newest non-prerelease (releases come back newest-first).
+  // Selecting "" keeps the placeholder option so operators see commands
+  // with ``<release-tag>`` rather than a stale tag.
+  const effectiveTag =
+    selectedTag ||
+    releases.find((r) => !r.is_prerelease)?.tag ||
+    releases[0]?.tag ||
+    "<release-tag>";
+
+  const dockerCmd = [
+    "# On the agent host, in the directory holding docker-compose.yml:",
+    `SPATIUMDDI_VERSION=${effectiveTag} docker compose pull && \\`,
+    `SPATIUMDDI_VERSION=${effectiveTag} docker compose up -d`,
+  ].join("\n");
+
+  // Service name varies by helm release; ``spatiumddi-${kind}`` is the
+  // chart convention. Operator can rename in their command if their
+  // release uses a different name.
+  const helmServiceName =
+    target.kind === "dns" ? "spatiumddi-dns-bind9" : "spatiumddi-dhcp-kea";
+  const k8sCmd = [
+    "# On a workstation with kubectl + helm pointed at the agent's cluster:",
+    `helm upgrade ${helmServiceName} \\`,
+    "  oci://ghcr.io/spatiumddi/charts/spatiumddi \\",
+    `  --set image.tag=${effectiveTag} \\`,
+    "  --reuse-values",
+  ].join("\n");
+
+  const cmd = target.deployment_kind === "k8s" ? k8sCmd : dockerCmd;
+  const kindLabelText =
+    target.deployment_kind === "k8s" ? "Kubernetes" : "Docker";
+
+  return (
+    <Modal
+      title={`Manual upgrade — ${target.name} (${kindLabelText})`}
+      onClose={onClose}
+      wide
+    >
+      <div className="space-y-3 text-sm">
+        <p className="text-muted-foreground">
+          Agents running outside the SpatiumDDI OS appliance can't be
+          slot-upgraded from this UI — there's no A/B partition to dd into. Roll
+          the agent's container image instead. Pick the release tag, copy the
+          command, and run it on the agent's host.
+        </p>
+        <label className="block text-xs font-medium">
+          Release
+          <select
+            value={selectedTag}
+            onChange={(e) => onSelectTag(e.target.value)}
+            className="mt-1 block w-full rounded-md border bg-background px-2 py-1.5 font-mono text-xs"
+            autoFocus
+          >
+            <option value="">— pick a release —</option>
+            {releases.map((r) => {
+              const date = new Date(r.published_at).toLocaleDateString();
+              const pre = r.is_prerelease ? " · pre-release" : "";
+              return (
+                <option key={r.tag} value={r.tag}>
+                  {r.tag} — {date}
+                  {pre}
+                </option>
+              );
+            })}
+          </select>
+        </label>
+        <div>
+          <div className="mb-1 flex items-center justify-between gap-2">
+            <span className="text-xs font-medium">{kindLabelText} command</span>
+            <button
+              type="button"
+              className="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground"
+              onClick={() => {
+                if (navigator.clipboard) {
+                  void navigator.clipboard.writeText(cmd);
+                }
+              }}
+              title="Copy command to clipboard"
+            >
+              <Copy className="h-3 w-3" />
+              Copy
+            </button>
+          </div>
+          <pre className="overflow-x-auto rounded-md border bg-muted/40 p-2 font-mono text-[11px] leading-tight">
+            {cmd}
+          </pre>
+        </div>
+        <p className="text-[11px] text-muted-foreground">
+          The agent reports back the new ``installed_appliance_version`` on its
+          next heartbeat once the container restarts. The Fleet table's
+          ``Installed`` column updates within ~30 s.
+        </p>
+        <div className="flex justify-end">
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
+          >
+            Close
+          </button>
+        </div>
+      </div>
+    </Modal>
   );
 }

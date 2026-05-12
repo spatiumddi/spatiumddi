@@ -370,6 +370,22 @@ async def agent_heartbeat(
     if body.last_upgrade_state_at is not None:
         server.last_upgrade_state_at = body.last_upgrade_state_at
 
+    # Phase 8f-7 — auto-clear the operator-intent stamp once the agent
+    # confirms it landed. The Fleet view's "pending" indicator drops
+    # to None as soon as installed_appliance_version matches the
+    # desired one + the slot upgrade reported done. Cancellation flow
+    # (operator cleared desired_ manually before the agent picked it
+    # up) is handled by the Fleet endpoint's clear handler — that
+    # already nulls both fields directly.
+    if (
+        server.desired_appliance_version is not None
+        and server.installed_appliance_version
+        and server.installed_appliance_version == server.desired_appliance_version
+        and (server.last_upgrade_state in ("done", None))
+    ):
+        server.desired_appliance_version = None
+        server.desired_slot_image_url = None
+
     # Process op ACKs
     for ack in body.ops_ack:
         op_id = ack.get("op_id")

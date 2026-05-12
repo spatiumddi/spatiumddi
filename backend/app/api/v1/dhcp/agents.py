@@ -463,6 +463,17 @@ async def agent_heartbeat(
     if body.last_upgrade_state_at is not None:
         server.last_upgrade_state_at = body.last_upgrade_state_at
 
+    # Phase 8f-7 — auto-clear operator intent once the agent confirms
+    # the upgrade landed. See dns/agents.py for the full rationale.
+    if (
+        server.desired_appliance_version is not None
+        and server.installed_appliance_version
+        and server.installed_appliance_version == server.desired_appliance_version
+        and (server.last_upgrade_state in ("done", None))
+    ):
+        server.desired_appliance_version = None
+        server.desired_slot_image_url = None
+
     for ack in body.ops_ack:
         op_id = ack.get("op_id")
         result = ack.get("result", "error")
