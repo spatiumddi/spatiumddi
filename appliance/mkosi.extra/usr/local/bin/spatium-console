@@ -274,6 +274,75 @@ def disk_summary() -> list[tuple[str, float, float, float]]:
     return rows
 
 
+def detect_slot_info() -> tuple[str, str] | None:
+    """Return (current_slot, durable_default) — both "slot_a"/"slot_b" or
+    None if we can't determine. Phase 8c A/B boot detection:
+      * current = which slot we booted from, derived from /proc/cmdline's
+        root=UUID= → lsblk PARTLABEL.
+      * durable = grubenv's saved_entry (the committed default that
+        future boots will land on; differs from current during a
+        TRIAL boot before spatiumddi-firstboot commits via
+        grub-set-default after /health/live passes).
+    Cached for the life of the process — neither value changes at
+    runtime under normal operation."""
+    cmdline = ""
+    try:
+        cmdline = Path("/proc/cmdline").read_text()
+    except OSError:
+        return None
+    import re as _re
+    m = _re.search(r"root=UUID=([0-9a-fA-F-]+)", cmdline)
+    if not m:
+        return None
+    root_uuid = m.group(1).lower()
+    current = ""
+    try:
+        out = subprocess.run(
+            ["lsblk", "-no", "PARTLABEL,UUID"],
+            capture_output=True, text=True, check=True, timeout=2,
+        ).stdout
+        for line in out.splitlines():
+            parts = line.strip().split()
+            if len(parts) >= 2 and parts[-1].lower() == root_uuid:
+                label = parts[0].lower()
+                if label.startswith("root_"):
+                    current = "slot_" + label.split("_", 1)[1]
+                break
+    except (FileNotFoundError, subprocess.CalledProcessError,
+            subprocess.TimeoutExpired):
+        pass
+
+    durable = ""
+    try:
+        out = subprocess.run(
+            ["grub-editenv", "/boot/efi/grub/grubenv", "list"],
+            capture_output=True, text=True, check=True, timeout=2,
+        ).stdout
+        for line in out.splitlines():
+            if line.startswith("saved_entry="):
+                durable = line.split("=", 1)[1].strip()
+                break
+    except (FileNotFoundError, subprocess.CalledProcessError,
+            subprocess.TimeoutExpired):
+        pass
+
+    if not current:
+        return None
+    return current, durable
+
+
+_SLOT_INFO_CACHE: tuple[str, str] | None = None
+_SLOT_INFO_PROBED = False
+
+
+def slot_info() -> tuple[str, str] | None:
+    global _SLOT_INFO_CACHE, _SLOT_INFO_PROBED
+    if not _SLOT_INFO_PROBED:
+        _SLOT_INFO_PROBED = True
+        _SLOT_INFO_CACHE = detect_slot_info()
+    return _SLOT_INFO_CACHE
+
+
 def appliance_version_string(env: dict[str, str]) -> str:
     """Resolve the appliance + image versions for the header.
 
@@ -517,6 +586,28 @@ def render_header(state: "DashboardState", mono_t: float) -> Panel:
     line3.append("Build ", style="dim")
     line3.append(build)
 
+    # Line 3b — Phase 8c A/B slot indicator. Only renders on the
+    # appliance (where slot detection succeeds). On dev/non-appliance
+    # boxes detect_slot_info() returns None and we skip the line.
+    slots = slot_info()
+    slot_line: Text | None = None
+    if slots is not None:
+        current, durable = slots
+        slot_line = Text()
+        slot_line.append("Slot  ", style="dim")
+        slot_line.append(current, style="bold cyan")
+        if durable and durable != current:
+            slot_line.append("  ", style="dim")
+            slot_line.append(
+                f"TRIAL — durable default is {durable}", style="bold bright_yellow"
+            )
+        elif durable:
+            slot_line.append("  ", style="dim")
+            slot_line.append("(committed default)", style="dim")
+        else:
+            slot_line.append("  ", style="dim")
+            slot_line.append("(grubenv unreadable)", style="dim")
+
     # Rule — horizontal divider between identity and vitals.
     rule = Rule(style="cyan dim", characters="─")
 
@@ -542,7 +633,11 @@ def render_header(state: "DashboardState", mono_t: float) -> Panel:
     else:
         line5.append("—")
 
-    body = Group(line1, line2, line3, rule, line4, line5)
+    body_parts: list = [line1, line2, line3]
+    if slot_line is not None:
+        body_parts.append(slot_line)
+    body_parts += [rule, line4, line5]
+    body = Group(*body_parts)
     return Panel(body, box=SQUARE, border_style="cyan", padding=(0, 1),
                  title="[bold]SpatiumDDI[/bold]", title_align="left")
 
@@ -677,7 +772,10 @@ def render_frame(state: "DashboardState", mono_t: float) -> Layout:
     # many rows. Each panel claims exactly content + 2 border rows;
     # footer is a borderless 1-row strip.
     services_count = len(ROLE_SERVICES.get(state.role, []))
-    HEADER_ROWS = 8   # 5 lines content + 1 rule + 2 border
+    # Header layout: 5-6 content lines (slot line added on appliance) +
+    # 1 horizontal rule + 2 panel border. Detect slot presence and
+    # size accordingly so we don't waste a row on non-appliance dev runs.
+    HEADER_ROWS = 9 if slot_info() is not None else 8
     AGENT_ROWS = 5    # 3 lines of content + 2 border
     SVC_ROWS = services_count + 2   # tight: just borders, no padding
     FOOTER_ROWS = 1   # single-line borderless strip

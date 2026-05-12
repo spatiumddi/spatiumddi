@@ -936,8 +936,24 @@ EOF
 # the safety net for failed upgrades).
 set timeout=3
 load_env
-set default=\${saved_entry}
-if [ -z "\${saved_entry}" ]; then set default=slot_a; fi
+
+# Phase 8c boot counting:
+#   * next_entry → one-shot, set by `grub-reboot <slot>`. We honor it
+#     once, clear it (so the next-but-one boot reverts), then boot.
+#     If the chosen slot panics or fails /health/live, it's already
+#     cleared from grubenv → operator falls back to saved_entry on
+#     the next reboot. This is the rollback safety net.
+#   * saved_entry → durable default. Set by `grub-set-default <slot>`
+#     either manually (spatium-upgrade-slot rollback) or by
+#     spatiumddi-firstboot.service after a trial slot proves healthy.
+if [ "\${next_entry}" ]; then
+    set default="\${next_entry}"
+    set next_entry=
+    save_env next_entry
+else
+    set default="\${saved_entry}"
+fi
+if [ -z "\${default}" ]; then set default=slot_a; fi
 
 # Serial console mirror for headless installs.
 serial --unit=0 --speed=115200
@@ -1006,6 +1022,42 @@ EOF
             --bootloader-id=SPATIUMDDI \
             --removable \
             >> "$INSTALL_LOG" 2>&1 || true
+
+        echo "XXX"; echo "93"; echo "Cloning root_A → root_B (slot redundancy)..."; echo "XXX"
+        # Phase 8c — install BOTH slots with the same content so an
+        # operator can `spatium-upgrade-slot set-next-boot slot_b`
+        # immediately after install. Without this, root_B is mkfs'd
+        # but empty — the first set-next-boot fails at the grub prompt
+        # with "no such device: <root_B-UUID>" and "file /boot/vmlinuz
+        # not found", leaving the system stuck at the grub menu.
+        #
+        # Source: /target with the overlay /etc + var/home/root binds
+        # mounted. We rsync the merged view of /etc (so root_B's
+        # underlying /etc has the same hostname/fstab as root_A's
+        # snapshot did at install) but skip the mount-targets for
+        # /var, /home, /root, /boot/efi (those are bind/auto-mounted
+        # at runtime, root_B doesn't carry their content).
+        mkdir -p /mnt/spatium-root-b
+        mount "$ROOT_B" /mnt/spatium-root-b
+        rsync -aAXH \
+            --exclude="/var/*" \
+            --exclude="/home/*" \
+            --exclude="/root/*" \
+            --exclude="/boot/efi/*" \
+            --exclude="/dev/*" \
+            --exclude="/proc/*" \
+            --exclude="/sys/*" \
+            --exclude="/tmp/*" \
+            --exclude="/run/*" \
+            --exclude="/mnt/*" \
+            "$MOUNT/" /mnt/spatium-root-b/ >> "$INSTALL_LOG" 2>&1
+        # rsync excludes ./var/* but it can still create the empty
+        # /var dir — make sure all the mount-points exist as empty
+        # directories on root_B so the boot-time mount units succeed.
+        mkdir -p /mnt/spatium-root-b/var /mnt/spatium-root-b/home \
+                 /mnt/spatium-root-b/root /mnt/spatium-root-b/boot/efi
+        umount /mnt/spatium-root-b
+        rmdir /mnt/spatium-root-b
 
         echo "XXX"; echo "95"; echo "Unmounting..."; echo "XXX"
         for d in dev sys proc; do
