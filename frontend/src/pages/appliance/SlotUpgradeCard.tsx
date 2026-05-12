@@ -33,10 +33,18 @@ function slotLabel(s: ApplianceSlot | null): string {
   return "—";
 }
 
+// Phase 8b-4 — stable GitHub Release URLs the workflow emits per cut.
+// The SlotUpgradeCard pre-fills these so the operator's "Apply"
+// click against a fresh install just works without typing.
+const DEFAULT_IMAGE_URL =
+  "https://github.com/spatiumddi/spatiumddi/releases/latest/download/spatiumddi-appliance-slot-amd64.raw.xz";
+const DEFAULT_CHECKSUM_URL =
+  "https://github.com/spatiumddi/spatiumddi/releases/latest/download/spatiumddi-appliance-slot-amd64.sha256";
+
 export function SlotUpgradeCard() {
   const qc = useQueryClient();
-  const [imageUrl, setImageUrl] = useState("");
-  const [checksumUrl, setChecksumUrl] = useState("");
+  const [imageUrl, setImageUrl] = useState(DEFAULT_IMAGE_URL);
+  const [checksumUrl, setChecksumUrl] = useState(DEFAULT_CHECKSUM_URL);
 
   const { data, isLoading, error, refetch } = useQuery({
     queryKey: ["appliance", "slot-upgrade"],

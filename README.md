@@ -46,6 +46,7 @@
 
 ## Contents
 
+- [Why I built this](#why-i-built-this) — the story
 - [Why SpatiumDDI](#why-spatiumddi) — the elevator pitch
 - [What's in the box](#whats-in-the-box) — quick capability tour
 - [Full feature detail](#full-feature-detail) — deep dive on every subsystem
@@ -59,6 +60,14 @@
 - [License](#license)
 
 ---
+
+## Why I built this
+
+I'm a network engineer. I've spent years working with enterprise DDI platforms, and while they're solid pieces of software, the licensing puts them out of reach for smaller teams, homelabs, and folks who just want to learn how this stuff fits together.
+
+The open source world has excellent standalone tools — NetBox for IPAM, BIND9 and PowerDNS for DNS, Kea for DHCP — but nothing that pulls them into a single control plane the way the commercial platforms do. So I started building one on nights and weekends.
+
+If SpatiumDDI ends up being useful to you, that's the whole point. If you want to file an issue, send a PR, or just tell me what's broken, I'd genuinely appreciate it.
 
 ## Why SpatiumDDI
 
