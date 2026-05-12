@@ -1,0 +1,282 @@
+#!/usr/bin/env python3
+"""Phase 8b — atomic A/B slot upgrade (issue #138).
+
+Operator CLI for writing a new image to the inactive A/B slot and
+flipping GRUB to boot it on next start. The grub-flip + boot-counting
++ auto-rollback half lives in Phase 8c; THIS tool handles the
+foundation: detect slots, fetch image, verify checksum, write to
+inactive slot.
+
+Subcommands:
+  status                 — Show current vs inactive slot + versions
+  apply <URL|FILE>       — Download (if URL) + verify + write to inactive
+                           slot. Does NOT reboot or flip default boot.
+  set-next-boot <slot>   — Mark slot A or B as the next-boot target
+                           (requires Phase 8c grub-flip — stubbed here)
+  rollback               — Set inactive slot as next boot (Phase 8c)
+
+The current slot is detected from /proc/cmdline's root=UUID=... by
+looking up the matching partition via blkid. Inactive slot is the
+OTHER 8304-typed partition on the same disk.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import os
+import re
+import shutil
+import subprocess
+import sys
+import urllib.request
+from pathlib import Path
+
+
+# Standard slot locations on a Phase 8a appliance install. These are
+# GPT partition names set by `sgdisk -c3:root_A -c4:root_B` in
+# spatium-install — distinct from the ext4 filesystem labels.
+SLOT_PARTLABELS = {"root_a", "root_b"}
+
+
+def run(cmd: list[str], check: bool = True, capture: bool = True) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        cmd,
+        check=check,
+        capture_output=capture,
+        text=True,
+    )
+
+
+def parse_cmdline_root_uuid() -> str | None:
+    """Pull the `root=UUID=...` value out of /proc/cmdline."""
+    try:
+        cmdline = Path("/proc/cmdline").read_text()
+    except OSError:
+        return None
+    m = re.search(r"root=UUID=([0-9a-fA-F-]+)", cmdline)
+    return m.group(1) if m else None
+
+
+def find_slot_partitions() -> list[dict[str, str]]:
+    """Enumerate the A/B slot partitions on the active disk.
+
+    Returns a list of dicts: {device, uuid, partlabel, fslabel}.
+    """
+    try:
+        out = run(["lsblk", "-J", "-o", "NAME,PATH,UUID,PARTLABEL,LABEL,PARTTYPE,FSTYPE"]).stdout
+    except subprocess.CalledProcessError:
+        return []
+    import json
+    data = json.loads(out)
+
+    slots: list[dict[str, str]] = []
+
+    def walk(node: dict) -> None:
+        partlabel = (node.get("partlabel") or "").lower()
+        if partlabel in SLOT_PARTLABELS:
+            slots.append({
+                "device": node.get("path") or "",
+                "uuid": node.get("uuid") or "",
+                "partlabel": partlabel,
+                "fslabel": node.get("label") or "",
+            })
+        for child in node.get("children") or []:
+            walk(child)
+
+    for top in data.get("blockdevices") or []:
+        walk(top)
+    return slots
+
+
+def detect_active_inactive() -> tuple[dict[str, str], dict[str, str]] | None:
+    slots = find_slot_partitions()
+    if len(slots) != 2:
+        return None
+    active_uuid = parse_cmdline_root_uuid()
+    if not active_uuid:
+        return None
+    active_uuid = active_uuid.lower()
+    active = next((s for s in slots if s["uuid"].lower() == active_uuid), None)
+    inactive = next((s for s in slots if s["uuid"].lower() != active_uuid), None)
+    if not active or not inactive:
+        return None
+    return active, inactive
+
+
+def slot_version_label(slot: dict[str, str]) -> str:
+    """Mount the slot read-only, read /etc/spatiumddi/appliance-release
+    + /usr/lib/etc.image/spatiumddi/appliance-release. Falls back to
+    "unknown" if neither file exists (empty/staging slot)."""
+    if not slot.get("fslabel"):
+        return "unknown"
+    # Quick probe — mount RO, read, unmount.
+    mountpoint = Path(f"/run/spatium-slot-probe-{slot['partlabel']}")
+    mountpoint.mkdir(parents=True, exist_ok=True)
+    try:
+        try:
+            run(["mount", "-o", "ro", slot["device"], str(mountpoint)])
+        except subprocess.CalledProcessError:
+            return "unreadable"
+        for rel in (
+            "etc/spatiumddi/appliance-release",
+            "usr/lib/etc.image/spatiumddi/appliance-release",
+        ):
+            p = mountpoint / rel
+            if p.exists():
+                for line in p.read_text().splitlines():
+                    if line.startswith("APPLIANCE_VERSION="):
+                        return line.split("=", 1)[1].strip().strip('"')
+        return "unstamped"
+    finally:
+        try:
+            run(["umount", str(mountpoint)], check=False)
+        except Exception:
+            pass
+        try:
+            mountpoint.rmdir()
+        except OSError:
+            pass
+
+
+def cmd_status(_args) -> int:
+    pair = detect_active_inactive()
+    if not pair:
+        print("ERROR: couldn't detect A/B slots — is this an appliance install?",
+              file=sys.stderr)
+        return 2
+    active, inactive = pair
+    print(f"Active slot:    {active['partlabel']:8}  {active['device']:14}  version={slot_version_label(active)}")
+    print(f"Inactive slot:  {inactive['partlabel']:8}  {inactive['device']:14}  version={slot_version_label(inactive)}")
+    return 0
+
+
+def fetch_to(src: str, dst: Path) -> None:
+    """Stream-copy from URL or local file path into dst."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if src.startswith(("http://", "https://")):
+        print(f"  fetching {src}")
+        with urllib.request.urlopen(src) as r, open(dst, "wb") as f:
+            shutil.copyfileobj(r, f, length=1024 * 1024)
+    else:
+        srcpath = Path(src)
+        if not srcpath.exists():
+            raise FileNotFoundError(f"image source not found: {src}")
+        print(f"  copying {srcpath}")
+        shutil.copy2(srcpath, dst)
+
+
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8 * 1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def cmd_apply(args) -> int:
+    if os.geteuid() != 0:
+        print("ERROR: must run as root (writes to a block device)", file=sys.stderr)
+        return 2
+
+    pair = detect_active_inactive()
+    if not pair:
+        print("ERROR: couldn't detect A/B slots", file=sys.stderr)
+        return 2
+    active, inactive = pair
+    target_dev = inactive["device"]
+    print(f"Writing image into INACTIVE slot {inactive['partlabel']} ({target_dev})")
+    print(f"(Active slot stays untouched: {active['partlabel']} {active['device']})")
+
+    workdir = Path("/var/lib/spatiumddi/slot-staging")
+    workdir.mkdir(parents=True, exist_ok=True)
+    staged = workdir / "slot.raw.xz"
+
+    # Fetch.
+    fetch_to(args.image, staged)
+
+    # Verify SHA256 if a sidecar checksum file is present (URL only).
+    if args.checksum:
+        sha_path = workdir / "slot.sha256"
+        fetch_to(args.checksum, sha_path)
+        expected = sha_path.read_text().strip().split()[0]
+        actual = sha256_file(staged)
+        if expected.lower() != actual.lower():
+            print(f"ERROR: checksum mismatch (expected {expected}, got {actual})",
+                  file=sys.stderr)
+            return 3
+        print(f"  checksum OK: {actual}")
+
+    # Decompress + dd directly into the inactive partition. xz can
+    # stream-decompress so we don't need disk space for an intermediate
+    # uncompressed file.
+    print(f"  writing → {target_dev}")
+    xz = subprocess.Popen(["xz", "--decompress", "--stdout", str(staged)],
+                          stdout=subprocess.PIPE)
+    dd = subprocess.run(["dd", f"of={target_dev}", "bs=4M", "conv=fsync",
+                         "status=progress"],
+                        stdin=xz.stdout, check=True)
+    xz.wait()
+    if xz.returncode != 0:
+        print("ERROR: xz exited non-zero", file=sys.stderr)
+        return 4
+
+    print("  flushing kernel buffers + re-reading filesystem metadata…")
+    subprocess.run(["partprobe", "/dev/" + os.path.basename(target_dev).rstrip("0123456789p")],
+                   check=False)
+    subprocess.run(["udevadm", "settle"], check=False)
+    staged.unlink(missing_ok=True)
+
+    print()
+    print("✓ Image written to inactive slot.")
+    print()
+    print(f"  Active (current boot):  {active['partlabel']} {active['device']}")
+    print(f"  Inactive (just wrote):  {inactive['partlabel']} {target_dev}")
+    print()
+    print("Next steps (Phase 8c — boot counting):")
+    print(f"  spatium-upgrade-slot set-next-boot {inactive['partlabel']}")
+    print("  reboot")
+    print()
+    print("Until Phase 8c lands, manually flip the GRUB default by editing")
+    print("/boot/grub/grub.cfg's `root=UUID=...` to the inactive slot's UUID:")
+    print(f"  {inactive['uuid']}")
+    return 0
+
+
+def cmd_set_next_boot(args) -> int:
+    print(f"set-next-boot {args.slot}: stub — Phase 8c (boot counting + grub-reboot --once)")
+    return 1
+
+
+def cmd_rollback(_args) -> int:
+    print("rollback: stub — Phase 8c (atomic GRUB default flip)")
+    return 1
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("status", help="show active + inactive slot details")
+
+    apply_p = sub.add_parser("apply", help="write a slot image to the inactive slot")
+    apply_p.add_argument("image", help="URL or local file path to a slot .raw.xz image")
+    apply_p.add_argument("--checksum", help="URL or path to a SHA-256 sidecar file")
+
+    nxt = sub.add_parser("set-next-boot",
+                         help="mark a slot as the next boot target (Phase 8c — stub)")
+    nxt.add_argument("slot", choices=["root_a", "root_b"])
+
+    sub.add_parser("rollback", help="rollback to the previous slot (Phase 8c — stub)")
+
+    args = parser.parse_args()
+    return {
+        "status": cmd_status,
+        "apply": cmd_apply,
+        "set-next-boot": cmd_set_next_boot,
+        "rollback": cmd_rollback,
+    }[args.cmd](args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
