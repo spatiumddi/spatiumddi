@@ -626,6 +626,50 @@ const SECTIONS: SectionDef[] = [
   },
 
   // ── Security ─────────────────────────────────────────────────────────
+  // Sorted alphabetically by title (operator request — Agent bootstrap
+  // keys was previously at the bottom).
+  {
+    id: "account-lockout",
+    title: "Account Lockout",
+    group: "Security",
+    description:
+      "Block local-auth login after N failed attempts inside a rolling window. Threshold of 0 disables. External-IdP users are unaffected — they're locked at the upstream provider, not here.",
+    keywords: [
+      "lockout",
+      "lock",
+      "brute",
+      "force",
+      "fail",
+      "attempt",
+      "rate",
+      "limit",
+      "throttle",
+      "pci",
+      "hipaa",
+      "soc2",
+    ],
+  },
+  {
+    id: "agent-bootstrap-keys",
+    title: "Agent bootstrap keys",
+    group: "Security",
+    description:
+      "Reveal the DNS_AGENT_KEY + DHCP_AGENT_KEY this control plane uses to validate first-boot agent registration. Password-confirm gate; superadmin only; every reveal is audited. Same keys work for appliance role-split installs, docker / k8s agents, and bare-metal deployments.",
+    keywords: [
+      "agent",
+      "bootstrap",
+      "key",
+      "dns_agent_key",
+      "dhcp_agent_key",
+      "registration",
+      "psk",
+      "preshared",
+      "distributed",
+      "appliance",
+      "role",
+      "split",
+    ],
+  },
   {
     id: "audit-forward",
     title: "Audit Event Forwarding",
@@ -676,53 +720,11 @@ const SECTIONS: SectionDef[] = [
     ],
   },
   {
-    id: "account-lockout",
-    title: "Account Lockout",
-    group: "Security",
-    description:
-      "Block local-auth login after N failed attempts inside a rolling window. Threshold of 0 disables. External-IdP users are unaffected — they're locked at the upstream provider, not here.",
-    keywords: [
-      "lockout",
-      "lock",
-      "brute",
-      "force",
-      "fail",
-      "attempt",
-      "rate",
-      "limit",
-      "throttle",
-      "pci",
-      "hipaa",
-      "soc2",
-    ],
-  },
-  {
     id: "session",
     title: "Session & Security",
     group: "Security",
     description: "Login session lifetime and idle behavior.",
     keywords: ["timeout", "logout", "expiry", "auth"],
-  },
-  {
-    id: "agent-bootstrap-keys",
-    title: "Agent bootstrap keys",
-    group: "Security",
-    description:
-      "Reveal the DNS_AGENT_KEY + DHCP_AGENT_KEY this control plane uses to validate first-boot agent registration. Password-confirm gate; superadmin only; every reveal is audited. Same keys work for appliance role-split installs, docker / k8s agents, and bare-metal deployments.",
-    keywords: [
-      "agent",
-      "bootstrap",
-      "key",
-      "dns_agent_key",
-      "dhcp_agent_key",
-      "registration",
-      "psk",
-      "preshared",
-      "distributed",
-      "appliance",
-      "role",
-      "split",
-    ],
   },
 
   // ── IPAM ─────────────────────────────────────────────────────────────
