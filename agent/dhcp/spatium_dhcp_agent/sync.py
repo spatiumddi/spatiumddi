@@ -248,6 +248,28 @@ class SyncLoop:
             return
 
         save_config(self.cfg.state_dir, bundle, etag)
+
+        # Phase 8f-4 — fleet upgrade trigger. The control plane stamps
+        # desired_appliance_version on the server row via the Fleet
+        # view; the bundle's ``fleet_upgrade`` block carries it down
+        # here. If the desired version doesn't match what's installed
+        # AND we're on an appliance AND no trigger is already pending,
+        # write the slot-upgrade trigger file. The host-side
+        # spatiumddi-slot-upgrade.path unit picks it up (same path as
+        # the manual /appliance OS Image card).
+        fleet = bundle.get("fleet_upgrade") or {}
+        if fleet.get("desired_appliance_version"):
+            from .slot_state import maybe_fire_fleet_upgrade
+            fired = maybe_fire_fleet_upgrade(
+                fleet.get("desired_appliance_version"),
+                fleet.get("desired_slot_image_url"),
+            )
+            if fired:
+                log.info(
+                    "fleet_upgrade_triggered",
+                    desired_version=fleet.get("desired_appliance_version"),
+                )
+
         try:
             self._apply_bundle(bundle, reload_kea=True)
         except Exception as e:

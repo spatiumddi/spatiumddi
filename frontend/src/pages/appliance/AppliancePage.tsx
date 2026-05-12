@@ -6,6 +6,7 @@ import {
   HardDrive,
   Network,
   ScrollText,
+  Server,
   ShieldCheck,
   Wrench,
 } from "lucide-react";
@@ -14,6 +15,7 @@ import { applianceApi } from "@/lib/api";
 import { useSessionState } from "@/lib/useSessionState";
 import { CertificatesTab } from "./CertificatesTab";
 import { ContainersTab } from "./ContainersTab";
+import { FleetTab } from "./FleetTab";
 import { LogsTab } from "./LogsTab";
 import { MaintenanceTab } from "./MaintenanceTab";
 import { NetworkTab } from "./NetworkTab";
@@ -39,6 +41,7 @@ type Tab =
   | "tls"
   | "releases"
   | "os-image"
+  | "fleet"
   | "containers"
   | "logs"
   | "network"
@@ -76,6 +79,14 @@ const TABS: TabSpec[] = [
     icon: HardDrive,
     summary:
       "Atomic A/B OS image upgrade (Phase 8). Writes a slot .raw.xz into the inactive partition, arms grub one-shot, and rolls back automatically if /health/live doesn't come up on the new slot. Distinct from container-stack releases above — this upgrades the host OS + kernel + bundled tooling, not just the SpatiumDDI containers.",
+  },
+  {
+    key: "fleet",
+    label: "Fleet",
+    phase: "8f",
+    icon: Server,
+    summary:
+      "Drive slot upgrades for every registered DNS + DHCP agent from one screen. Per-row Upgrade button stamps the operator's picked release tag onto the agent's server row; the agent's ConfigBundle long-poll picks it up and fires the local slot-upgrade trigger. Docker / k8s rows show copy-paste commands instead.",
   },
   {
     key: "containers",
@@ -173,6 +184,8 @@ export function AppliancePage() {
           <ReleasesTab />
         ) : tab === "os-image" ? (
           <SlotUpgradeCard />
+        ) : tab === "fleet" ? (
+          <FleetTab />
         ) : tab === "containers" ? (
           <ContainersTab />
         ) : tab === "logs" ? (

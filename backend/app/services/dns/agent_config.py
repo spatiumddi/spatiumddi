@@ -52,6 +52,12 @@ except ImportError:  # fallback local adapter — same shape as canonical type
         forwarders: list[str]
         blocklists: list[dict[str, Any]]
         pending_record_ops: list[dict[str, Any]]
+        # Phase 8f-3 — fleet upgrade orchestration carries the desired
+        # appliance version + slot image URL the operator set from the
+        # Fleet view. The agent reads these on every long-poll bundle
+        # and fires the local slot-upgrade trigger when its installed
+        # version doesn't match. None / absent when no upgrade pending.
+        fleet_upgrade: dict[str, Any]
 
 
 if TYPE_CHECKING:
@@ -276,6 +282,18 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
             }
         )
 
+    # Phase 8f-3 — fleet upgrade intent. Only set when the operator
+    # stamped a desired_appliance_version on this server row from the
+    # Fleet view; the agent's existing long-poll picks it up on the
+    # next ETag change and fires the local slot-upgrade trigger if
+    # its installed version doesn't match. Always-present key (None
+    # values when nothing pending) keeps the etag stable when the
+    # operator clears intent on a healthy upgrade.
+    fleet_upgrade_block: dict[str, Any] = {
+        "desired_appliance_version": server.desired_appliance_version,
+        "desired_slot_image_url": server.desired_slot_image_url,
+    }
+
     bundle_body: dict[str, Any] = {
         "server_id": str(server.id),
         "driver": server.driver,
@@ -288,6 +306,7 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
         "blocklists": blocklists_payload,
         "pending_record_ops": pending_ops,
         "catalog": catalog_block,
+        "fleet_upgrade": fleet_upgrade_block,
     }
 
     # Structural fingerprint excludes records and pending ops so record-only

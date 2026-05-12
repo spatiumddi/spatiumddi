@@ -7,6 +7,7 @@ protocol shape — DHCP reuses identical semantics.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import hmac
 import os
 import uuid
@@ -308,7 +309,12 @@ async def agent_config_longpoll(
     deadline = asyncio.get_event_loop().time() + LONGPOLL_TIMEOUT_SECONDS
     while True:
         bundle = await build_config_bundle(db, server)
-        etag = bundle.etag
+        # Phase 8f-3 — mix the fleet-upgrade intent into the ETag so a
+        # Fleet view change wakes the agent's long-poll even when the
+        # driver-side bundle is unchanged. Deterministic — re-reading
+        # the same DB state yields the same combined ETag.
+        fleet_marker = f"{server.desired_appliance_version}|{server.desired_slot_image_url}"
+        etag = "sha256:" + hashlib.sha256(f"{bundle.etag}|{fleet_marker}".encode()).hexdigest()
 
         # Pending ops fast-path
         ops_res = await db.execute(
@@ -403,6 +409,15 @@ async def agent_config_longpoll(
                     ),
                 },
                 "pending_ops": pending_ops,
+                # Phase 8f-3 — fleet upgrade intent the operator set
+                # from the Fleet view. Agent reads desired_*, compares
+                # against its own installed version on next heartbeat /
+                # bundle pickup, and writes the slot-upgrade trigger
+                # if mismatched. Both values None when nothing pending.
+                "fleet_upgrade": {
+                    "desired_appliance_version": server.desired_appliance_version,
+                    "desired_slot_image_url": server.desired_slot_image_url,
+                },
             }
         if asyncio.get_event_loop().time() >= deadline:
             return Response(status_code=304, headers={"ETag": etag})

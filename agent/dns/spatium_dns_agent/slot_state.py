@@ -162,6 +162,60 @@ def _last_upgrade_state_from_sidecar() -> tuple[str | None, datetime | None]:
     return state, stamp
 
 
+_TRIGGER_FILE = Path(
+    "/var/lib/spatiumddi-host/release-state/slot-upgrade-pending"
+)
+
+
+def maybe_fire_fleet_upgrade(
+    desired_version: str | None,
+    desired_url: str | None,
+) -> bool:
+    """Phase 8f-4 — write the slot-upgrade trigger when the control
+    plane's desired version doesn't match what's installed.
+
+    Returns True if a trigger was fired (caller should log it), False
+    otherwise. Idempotent — multiple long-poll cycles with the same
+    desired_version produce one trigger, not many: we check whether
+    the trigger file already exists (the host-side path unit hasn't
+    picked it up yet) before writing a fresh one. We also skip when
+    the desired version equals what's already installed.
+
+    Conditions for firing:
+      - Not running on an appliance (no /etc/spatiumddi-host) → skip.
+      - desired_version is None / empty → skip.
+      - desired_version equals installed_appliance_version → skip.
+      - Trigger file already present → skip (path unit hasn't picked
+        it up yet; don't stack).
+      - desired_url is missing → skip (nothing to apply).
+    """
+    if detect_deployment_kind() != "appliance":
+        return False
+    if not desired_version or not desired_url:
+        return False
+    installed = read_installed_version()
+    if installed and installed == desired_version:
+        return False
+    if _TRIGGER_FILE.exists():
+        return False
+    # The trigger file's parent should already exist on the appliance
+    # (firstboot creates /var/lib/spatiumddi/release-state). Bail
+    # silently if it doesn't — host setup is broken; the operator
+    # will see "upgrade requested but agent couldn't write trigger"
+    # in the audit log on the control plane side once the heartbeat
+    # comes back without a state change.
+    try:
+        _TRIGGER_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _TRIGGER_FILE.with_suffix(".new")
+        # Two-line format the host runner expects (Phase 8b-3 contract):
+        # line 1 = image URL (or path), line 2 = optional checksum URL.
+        tmp.write_text(desired_url + "\n", encoding="utf-8")
+        tmp.replace(_TRIGGER_FILE)
+        return True
+    except OSError:
+        return False
+
+
 def collect() -> dict[str, object]:
     """Snapshot the agent's slot + deployment state for the heartbeat.
 

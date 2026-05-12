@@ -6899,6 +6899,61 @@ export const applianceSlotApi = {
       .then((r) => r.data),
 };
 
+// ── Appliance: fleet upgrade orchestration (Phase 8f, issue #138) ──
+export type FleetAgentKind = "dns" | "dhcp";
+export type ApplianceDeploymentKind =
+  | "appliance"
+  | "docker"
+  | "k8s"
+  | "unknown"
+  | null;
+
+export interface FleetAgentRow {
+  kind: FleetAgentKind;
+  id: string;
+  name: string;
+  host: string;
+  deployment_kind: ApplianceDeploymentKind;
+  installed_appliance_version: string | null;
+  current_slot: ApplianceSlot | null;
+  durable_default: ApplianceSlot | null;
+  is_trial_boot: boolean;
+  last_upgrade_state: string | null;
+  last_upgrade_state_at: string | null;
+  last_seen_at: string | null;
+  last_seen_ip: string | null;
+  desired_appliance_version: string | null;
+  desired_slot_image_url: string | null;
+}
+
+export const applianceFleetApi = {
+  list: () =>
+    api
+      .get<{ agents: FleetAgentRow[] }>("/appliance/fleet")
+      .then((r) => r.data),
+  scheduleUpgrade: (
+    kind: FleetAgentKind,
+    server_id: string,
+    desired_appliance_version: string,
+    desired_slot_image_url: string,
+  ) =>
+    api
+      .post<{
+        kind: FleetAgentKind;
+        id: string;
+        desired_appliance_version: string;
+        desired_slot_image_url: string;
+      }>(`/appliance/fleet/${kind}/${server_id}/upgrade`, {
+        desired_appliance_version,
+        desired_slot_image_url,
+      })
+      .then((r) => r.data),
+  clearUpgrade: (kind: FleetAgentKind, server_id: string) =>
+    api
+      .post<FleetAgentRow>(`/appliance/fleet/${kind}/${server_id}/clear`)
+      .then((r) => r.data),
+};
+
 // ── Appliance: container management (Phase 4d) ─────────────────────
 export interface ApplianceContainer {
   name: string;
