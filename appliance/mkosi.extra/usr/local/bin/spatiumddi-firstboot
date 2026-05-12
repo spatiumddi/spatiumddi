@@ -278,52 +278,74 @@ getent hosts registry-1.docker.io >/dev/null 2>&1 || {
     echo "      Check 'resolvectl status' and the wildcard DHCP networkd config."
 }
 
-if [ ! -f "$STAMP" ]; then
-    # Phase 4 dev-iteration support — if this ISO was built with
-    # ``bake-images.sh``, it ships locally-built image tarballs at
-    # /usr/local/share/spatiumddi/images/*.tar.zst. Load each one
-    # into the daemon BEFORE attempting any pull, so the operator's
-    # in-flight changes take precedence over whatever's pullable
-    # from ghcr.io. The marker file ``BAKED_AT`` is dropped by
-    # bake-images.sh; its presence is the signal "this ISO carries
-    # offline images". When present we skip docker-compose pull
-    # entirely (pulls of unpublished tags would 404 against ghcr).
-    IMAGES_DIR=/usr/local/share/spatiumddi/images
-    BAKED=0
-    if [ -f "$IMAGES_DIR/BAKED_AT" ]; then
-        echo "Loading pre-baked container images from $IMAGES_DIR (baked $(cat "$IMAGES_DIR/BAKED_AT"))..."
+# Phase 4 dev-iteration support — if this ISO was built with
+# ``bake-images.sh``, it ships locally-built image tarballs at
+# /usr/local/share/spatiumddi/images/*.tar.zst. Load each one
+# into the daemon BEFORE attempting any pull, so the operator's
+# in-flight changes take precedence over whatever's pullable
+# from ghcr.io. The marker file ``BAKED_AT`` is dropped by
+# bake-images.sh; its presence is the signal "this slot carries
+# offline images". When present we skip docker-compose pull
+# entirely (pulls of unpublished tags would 404 against ghcr).
+#
+# Slot-upgrade aware: each slot rootfs ships its own BAKED_AT
+# stamp. We persist the last-loaded BAKED_AT timestamp on the
+# shared /var partition; if the rootfs's BAKED_AT is newer, we
+# re-load the tarballs even on a non-first boot. This is what
+# makes ``spatium-upgrade-slot apply`` followed by a reboot
+# actually pick up the new container images — without it, the
+# previous slot's STAMP shorts out the load and docker-compose
+# happily reuses the stale images already on /var/lib/docker.
+IMAGES_DIR=/usr/local/share/spatiumddi/images
+BAKED_AT_FILE="$IMAGES_DIR/BAKED_AT"
+LOADED_AT_FILE=/var/lib/spatiumddi/images-loaded-at
+BAKED=0
+LOAD_REASON=""
+
+if [ -f "$BAKED_AT_FILE" ]; then
+    rootfs_baked_at=$(cat "$BAKED_AT_FILE")
+    loaded_baked_at=""
+    [ -f "$LOADED_AT_FILE" ] && loaded_baked_at=$(cat "$LOADED_AT_FILE")
+    if [ ! -f "$STAMP" ]; then
+        LOAD_REASON="first boot (baked $rootfs_baked_at)"
+    elif [ "$rootfs_baked_at" != "$loaded_baked_at" ]; then
+        LOAD_REASON="rootfs BAKED_AT changed (was $loaded_baked_at, now $rootfs_baked_at) — slot upgrade detected"
+    fi
+
+    if [ -n "$LOAD_REASON" ]; then
+        echo "Loading pre-baked container images from $IMAGES_DIR — $LOAD_REASON"
         for img in "$IMAGES_DIR"/*.tar.zst; do
             [ -f "$img" ] || continue
             echo "  → $(basename "$img")"
             zstd -dc "$img" | docker load
         done
+        echo "$rootfs_baked_at" > "$LOADED_AT_FILE"
         BAKED=1
     fi
+fi
 
-    if [ "$BAKED" = 1 ]; then
-        # Locally baked images are now in the daemon, named to match
-        # the compose ``image:`` refs (ghcr.io/spatiumddi/...:latest).
-        # docker-compose up will use them without a pull.
-        echo "Skipping docker-compose pull (locally-baked images installed)."
-    else
-        echo "Pulling SpatiumDDI image set (first boot)..."
-        # Retry pull on transient failures (slow image hosts, partial
-        # download). set -e at the script top would otherwise kill us
-        # on the first transient blip.
-        pull_ok=0
-        for i in 1 2 3; do
-            if docker-compose pull; then
-                pull_ok=1
-                break
-            fi
-            echo "Pull attempt $i failed; retrying in 10 s..."
-            sleep 10
-        done
-        [ "$pull_ok" = 1 ] || {
-            echo "ERROR: docker-compose pull failed 3 times. Check network + DNS."
-            exit 1
-        }
-    fi
+if [ ! -f "$STAMP" ] && [ "$BAKED" = 0 ]; then
+    # No locally-baked images present (clean ISO from ghcr.io
+    # release artefact) — first boot must pull.
+    echo "Pulling SpatiumDDI image set (first boot)..."
+    # Retry pull on transient failures (slow image hosts, partial
+    # download). set -e at the script top would otherwise kill us
+    # on the first transient blip.
+    pull_ok=0
+    for i in 1 2 3; do
+        if docker-compose pull; then
+            pull_ok=1
+            break
+        fi
+        echo "Pull attempt $i failed; retrying in 10 s..."
+        sleep 10
+    done
+    [ "$pull_ok" = 1 ] || {
+        echo "ERROR: docker-compose pull failed 3 times. Check network + DNS."
+        exit 1
+    }
+elif [ "$BAKED" = 1 ]; then
+    echo "Skipping docker-compose pull (locally-baked images installed)."
 fi
 
 echo "Bringing stack up..."
