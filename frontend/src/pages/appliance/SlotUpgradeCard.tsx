@@ -12,7 +12,11 @@ import {
 } from "lucide-react";
 
 import { ConfirmModal } from "@/components/ui/confirm-modal";
-import { applianceSlotApi, type ApplianceSlot } from "@/lib/api";
+import {
+  applianceReleasesApi,
+  applianceSlotApi,
+  type ApplianceSlot,
+} from "@/lib/api";
 
 /**
  * Phase 8b-3 — Appliance OS slot upgrade UI.
@@ -35,18 +39,23 @@ function slotLabel(s: ApplianceSlot | null): string {
   return "—";
 }
 
-// Phase 8b-4 — stable GitHub Release URLs the workflow emits per cut.
-// The SlotUpgradeCard pre-fills these so the operator's "Apply"
-// click against a fresh install just works without typing.
-const DEFAULT_IMAGE_URL =
-  "https://github.com/spatiumddi/spatiumddi/releases/latest/download/spatiumddi-appliance-slot-amd64.raw.xz";
-const DEFAULT_CHECKSUM_URL =
-  "https://github.com/spatiumddi/spatiumddi/releases/latest/download/spatiumddi-appliance-slot-amd64.sha256";
+// Phase 8b-4 — stable GitHub Release URL convention the release
+// workflow emits per cut. ``<tag>`` slots in as the release CalVer
+// (e.g. ``2026.05.12-1``) for versioned URLs, or ``latest`` for the
+// stable un-versioned URL the un-pinned operator wants.
+const SLOT_IMAGE_URL = (tag: string) =>
+  `https://github.com/spatiumddi/spatiumddi/releases/download/${tag}/spatiumddi-appliance-slot-amd64.raw.xz`;
+const SLOT_CHECKSUM_URL = (tag: string) =>
+  `https://github.com/spatiumddi/spatiumddi/releases/download/${tag}/spatiumddi-appliance-slot-amd64.sha256`;
+
+type SourceMode = "release" | "custom";
 
 export function SlotUpgradeCard() {
   const qc = useQueryClient();
-  const [imageUrl, setImageUrl] = useState(DEFAULT_IMAGE_URL);
-  const [checksumUrl, setChecksumUrl] = useState(DEFAULT_CHECKSUM_URL);
+  const [sourceMode, setSourceMode] = useState<SourceMode>("release");
+  const [selectedTag, setSelectedTag] = useState<string>("");
+  const [customImageUrl, setCustomImageUrl] = useState("");
+  const [customChecksumUrl, setCustomChecksumUrl] = useState("");
   const [rollbackConfirm, setRollbackConfirm] = useState(false);
 
   const { data, isLoading, error, refetch } = useQuery({
@@ -57,9 +66,46 @@ export function SlotUpgradeCard() {
       q.state.data?.upgrade_state === "in-flight" ? 3_000 : 30_000,
   });
 
+  // GitHub releases — feeds the release picker. The list call is the
+  // same one Releases tab uses (cached 60 s server-side) so opening
+  // the OS Image tab won't fire a duplicate GitHub API hit.
+  const {
+    data: releasesData,
+    isLoading: releasesLoading,
+    error: releasesError,
+  } = useQuery({
+    queryKey: ["appliance", "releases"],
+    queryFn: applianceReleasesApi.list,
+    staleTime: 60_000,
+  });
+  const releases = releasesData?.releases ?? [];
+
+  // Default selection — first non-prerelease (releases come back
+  // newest-first from the api). Falls through to "" if nothing is
+  // available; the Apply button stays disabled until a tag resolves.
+  const defaultTag =
+    releases.find((r) => !r.is_prerelease)?.tag ?? releases[0]?.tag ?? "";
+  const effectiveTag = selectedTag || defaultTag;
+
+  // Resolve the URLs the apply mutation actually submits, branched
+  // on source mode. Release mode derives both URLs from the picked
+  // tag; custom mode reads the two text inputs verbatim.
+  const resolvedImageUrl =
+    sourceMode === "release"
+      ? effectiveTag
+        ? SLOT_IMAGE_URL(effectiveTag)
+        : ""
+      : customImageUrl.trim();
+  const resolvedChecksumUrl =
+    sourceMode === "release"
+      ? effectiveTag
+        ? SLOT_CHECKSUM_URL(effectiveTag)
+        : ""
+      : customChecksumUrl.trim();
+
   const apply = useMutation({
     mutationFn: () =>
-      applianceSlotApi.apply(imageUrl.trim(), checksumUrl.trim() || null),
+      applianceSlotApi.apply(resolvedImageUrl, resolvedChecksumUrl || null),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["appliance", "slot-upgrade"] });
     },
@@ -193,28 +239,107 @@ export function SlotUpgradeCard() {
 
       {/* Apply form */}
       <div className="space-y-2">
-        <label className="text-xs font-medium">
-          Slot image URL or local path
-          <input
-            type="text"
-            value={imageUrl}
-            onChange={(e) => setImageUrl(e.target.value)}
-            placeholder="https://github.com/spatiumddi/spatiumddi/releases/download/.../spatiumddi-appliance-slot-amd64.raw.xz"
-            disabled={inFlight}
-            className="mt-1 block w-full rounded-md border bg-background px-2 py-1.5 font-mono text-xs disabled:opacity-50"
-          />
-        </label>
-        <label className="text-xs font-medium">
-          SHA-256 sidecar URL (optional)
-          <input
-            type="text"
-            value={checksumUrl}
-            onChange={(e) => setChecksumUrl(e.target.value)}
-            placeholder="https://.../spatiumddi-appliance-slot-amd64.sha256"
-            disabled={inFlight}
-            className="mt-1 block w-full rounded-md border bg-background px-2 py-1.5 font-mono text-xs disabled:opacity-50"
-          />
-        </label>
+        {sourceMode === "release" ? (
+          <>
+            <label className="text-xs font-medium">
+              <div className="flex items-center justify-between gap-2">
+                <span>SpatiumDDI release</span>
+                <button
+                  type="button"
+                  className="text-xs font-normal text-muted-foreground underline-offset-2 hover:underline"
+                  onClick={() => setSourceMode("custom")}
+                  disabled={inFlight}
+                >
+                  Use custom URL or local path →
+                </button>
+              </div>
+              <select
+                value={effectiveTag}
+                onChange={(e) => setSelectedTag(e.target.value)}
+                disabled={inFlight || releasesLoading || releases.length === 0}
+                className="mt-1 block w-full rounded-md border bg-background px-2 py-1.5 font-mono text-xs disabled:opacity-50"
+              >
+                {releasesLoading && (
+                  <option value="">Loading releases from GitHub…</option>
+                )}
+                {!releasesLoading && releases.length === 0 && (
+                  <option value="">
+                    No GitHub releases found — switch to custom URL
+                  </option>
+                )}
+                {releases.map((r) => {
+                  const date = new Date(r.published_at).toLocaleDateString();
+                  const installed = r.is_installed ? " · installed stack" : "";
+                  const pre = r.is_prerelease ? " · pre-release" : "";
+                  return (
+                    <option key={r.tag} value={r.tag}>
+                      {r.tag} — {date}
+                      {installed}
+                      {pre}
+                    </option>
+                  );
+                })}
+              </select>
+            </label>
+            {effectiveTag && (
+              <p className="text-[11px] text-muted-foreground">
+                Will fetch{" "}
+                <code className="rounded bg-muted px-1 font-mono">
+                  spatiumddi-appliance-slot-amd64.raw.xz
+                </code>{" "}
+                + matching{" "}
+                <code className="rounded bg-muted px-1 font-mono">.sha256</code>{" "}
+                from the{" "}
+                <code className="rounded bg-muted px-1 font-mono">
+                  {effectiveTag}
+                </code>{" "}
+                release.
+              </p>
+            )}
+            {releasesError && (
+              <p className="text-[11px] text-destructive">
+                Couldn’t load the GitHub releases list (
+                {(releasesError as Error).message}). Switch to custom URL to
+                apply manually.
+              </p>
+            )}
+          </>
+        ) : (
+          <>
+            <label className="text-xs font-medium">
+              <div className="flex items-center justify-between gap-2">
+                <span>Slot image URL or local path</span>
+                <button
+                  type="button"
+                  className="text-xs font-normal text-muted-foreground underline-offset-2 hover:underline"
+                  onClick={() => setSourceMode("release")}
+                  disabled={inFlight}
+                >
+                  ← Pick a GitHub release instead
+                </button>
+              </div>
+              <input
+                type="text"
+                value={customImageUrl}
+                onChange={(e) => setCustomImageUrl(e.target.value)}
+                placeholder="https://… or /absolute/path/to/spatiumddi-appliance-slot-amd64.raw.xz"
+                disabled={inFlight}
+                className="mt-1 block w-full rounded-md border bg-background px-2 py-1.5 font-mono text-xs disabled:opacity-50"
+              />
+            </label>
+            <label className="text-xs font-medium">
+              SHA-256 sidecar URL (optional)
+              <input
+                type="text"
+                value={customChecksumUrl}
+                onChange={(e) => setCustomChecksumUrl(e.target.value)}
+                placeholder="https://…/spatiumddi-appliance-slot-amd64.sha256"
+                disabled={inFlight}
+                className="mt-1 block w-full rounded-md border bg-background px-2 py-1.5 font-mono text-xs disabled:opacity-50"
+              />
+            </label>
+          </>
+        )}
         <div className="flex items-center justify-between gap-2">
           <div className="text-xs text-muted-foreground">
             Writes to{" "}
@@ -227,7 +352,7 @@ export function SlotUpgradeCard() {
             type="button"
             className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-xs font-semibold text-primary-foreground disabled:opacity-50"
             onClick={() => apply.mutate()}
-            disabled={inFlight || !imageUrl.trim() || apply.isPending}
+            disabled={inFlight || !resolvedImageUrl || apply.isPending}
           >
             {inFlight || apply.isPending ? (
               <>
