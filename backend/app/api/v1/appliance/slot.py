@@ -7,6 +7,7 @@ Mounted at ``/api/v1/appliance/slot-upgrade``. Endpoints:
 
 from __future__ import annotations
 
+import structlog
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel, Field
 
@@ -19,8 +20,6 @@ from app.services.appliance.slot import (
     is_apply_in_flight,
     schedule_apply,
 )
-
-import structlog
 
 logger = structlog.get_logger(__name__)
 

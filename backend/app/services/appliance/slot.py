@@ -216,8 +216,14 @@ def schedule_apply(image_url: str, checksum_url: str | None = None) -> None:
     if _STATE_FILE.exists():
         try:
             _STATE_FILE.unlink()
-        except OSError:
-            pass
+        except OSError as exc:
+            # Best-effort cleanup — the host-side runner will overwrite
+            # .state once it picks up the trigger, so a stale .state from
+            # the previous run is at worst a brief UI mis-read.
+            logger.warning(
+                "appliance_slot_upgrade_state_cleanup_failed",
+                state_file=str(_STATE_FILE), error=str(exc),
+            )
     tmp = _TRIGGER_FILE.with_suffix(".new")
     tmp.write_text(body, encoding="utf-8")
     tmp.replace(_TRIGGER_FILE)

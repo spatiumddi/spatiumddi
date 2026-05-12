@@ -310,6 +310,9 @@ def detect_slot_info() -> tuple[str, str] | None:
                 break
     except (FileNotFoundError, subprocess.CalledProcessError,
             subprocess.TimeoutExpired):
+        # Optional probe — when blkid isn't present (dev container) or
+        # the call times out, leave `current` empty and fall through to
+        # the "no slot info" branch below.
         pass
 
     durable = ""
@@ -324,6 +327,10 @@ def detect_slot_info() -> tuple[str, str] | None:
                 break
     except (FileNotFoundError, subprocess.CalledProcessError,
             subprocess.TimeoutExpired):
+        # Optional probe — grubenv may not exist on a pre-Phase-8c
+        # install, and we don't want a probe failure to suppress the
+        # current_slot we already detected. Leave `durable` empty so
+        # the renderer falls back to the un-committed display.
         pass
 
     if not current:
@@ -331,16 +338,18 @@ def detect_slot_info() -> tuple[str, str] | None:
     return current, durable
 
 
-_SLOT_INFO_CACHE: tuple[str, str] | None = None
-_SLOT_INFO_PROBED = False
+# Sentinel that distinguishes "we haven't probed yet" from "we probed
+# but detect_slot_info() returned None". Without this, every call to
+# slot_info() on a non-appliance build would re-run blkid + grub-editenv.
+_UNPROBED: object = object()
+_SLOT_INFO_CACHE: tuple[str, str] | None | object = _UNPROBED
 
 
 def slot_info() -> tuple[str, str] | None:
-    global _SLOT_INFO_CACHE, _SLOT_INFO_PROBED
-    if not _SLOT_INFO_PROBED:
-        _SLOT_INFO_PROBED = True
+    global _SLOT_INFO_CACHE
+    if _SLOT_INFO_CACHE is _UNPROBED:
         _SLOT_INFO_CACHE = detect_slot_info()
-    return _SLOT_INFO_CACHE
+    return _SLOT_INFO_CACHE  # type: ignore[return-value]
 
 
 def appliance_version_string(env: dict[str, str]) -> str:
@@ -359,6 +368,9 @@ def appliance_version_string(env: dict[str, str]) -> str:
                 if line.startswith("APPLIANCE_VERSION="):
                     appliance = line.split("=", 1)[1].strip().strip('"')
         except OSError:
+            # /etc/spatiumddi/appliance-release is optional; fall back
+            # to whatever .env carried in `appliance` (default "?"). A
+            # missing release stamp shouldn't blank the header.
             pass
     return f"appliance {appliance} · stack {spddi}"
 
@@ -382,7 +394,10 @@ class JournalTail(threading.Thread):
         if self._proc and self._proc.poll() is None:
             try:
                 self._proc.terminate()
-            except Exception:
+            except (ProcessLookupError, OSError):
+                # Race with natural exit — journalctl already terminated
+                # between our poll() check and the terminate() call.
+                # Nothing to clean up.
                 pass
 
     def run(self) -> None:
@@ -518,6 +533,10 @@ class KeyReader(threading.Thread):
             try:
                 termios.tcsetattr(self.tty_fd, termios.TCSANOW, saved)
             except termios.error:
+                # Restoring termios on tty teardown can race the kernel
+                # closing the fd (e.g. operator pressed F1 → execvp'd
+                # agetty and the parent's tty_fd is already gone). Cosmetic
+                # at worst since the parent is about to exit anyway.
                 pass
 
 
@@ -860,6 +879,10 @@ class DashboardState:
             try:
                 self.env = read_env()
             except Exception:
+                # .env may be missing on a fresh image before firstboot
+                # writes it, or transiently locked while firstboot
+                # generates secrets. Keep the previous self.env (already
+                # has sensible defaults) so the dashboard doesn't blank.
                 pass
             new_role = role_from_env(self.env)
             if new_role:

@@ -132,10 +132,15 @@ def slot_version_label(slot: dict[str, str]) -> str:
         try:
             run(["umount", str(mountpoint)], check=False)
         except Exception:
+            # Best-effort cleanup — if umount fails the kernel will reap
+            # the mount on process exit; we don't want a failure here to
+            # mask the actual status return value from the try body.
             pass
         try:
             mountpoint.rmdir()
         except OSError:
+            # Same: cleanup-only. Leaving the empty tmpdir behind is
+            # cosmetic — it's under /tmp and tmpfs reclaims on reboot.
             pass
 
 
@@ -213,9 +218,9 @@ def cmd_apply(args) -> int:
     print(f"  writing → {target_dev}")
     xz = subprocess.Popen(["xz", "--decompress", "--stdout", str(staged)],
                           stdout=subprocess.PIPE)
-    dd = subprocess.run(["dd", f"of={target_dev}", "bs=4M", "conv=fsync",
-                         "status=progress"],
-                        stdin=xz.stdout, check=True)
+    subprocess.run(["dd", f"of={target_dev}", "bs=4M", "conv=fsync",
+                     "status=progress"],
+                    stdin=xz.stdout, check=True)
     xz.wait()
     if xz.returncode != 0:
         print("ERROR: xz exited non-zero", file=sys.stderr)
