@@ -18,6 +18,7 @@ import {
   applianceSlotApi,
   applianceSystemApi,
   type ApplianceSlot,
+  type ApplianceSlotStatus,
 } from "@/lib/api";
 
 /**
@@ -39,6 +40,23 @@ function slotLabel(s: ApplianceSlot | null): string {
   if (s === "slot_a") return "Slot A (root_a)";
   if (s === "slot_b") return "Slot B (root_b)";
   return "—";
+}
+
+// Resolve the version string the OS Image card renders under each
+// slot column. Returns "—" when the sidecar is missing entirely OR
+// the slot is "unstamped" / "unreadable" / "unknown" (i.e. nothing
+// usable to display). Otherwise returns the actual CalVer tag.
+function slotVersion(
+  data: ApplianceSlotStatus | undefined,
+  slot: ApplianceSlot | null,
+): string {
+  if (!data || !slot) return "—";
+  const value = slot === "slot_a" ? data.slot_a_version : data.slot_b_version;
+  if (!value) return "—";
+  if (value === "unstamped" || value === "unreadable" || value === "unknown") {
+    return "—";
+  }
+  return value;
 }
 
 // Phase 8b-4 — stable GitHub Release URL convention the release
@@ -210,12 +228,19 @@ export function SlotUpgradeCard() {
         </div>
       )}
 
-      {/* Slot status — current / durable / target */}
+      {/* Slot status — current / durable / target. Each column shows
+          the slot label + the installed APPLIANCE_VERSION underneath
+          (sourced from slot-versions.json). The version line is muted
+          + falls back to "—" when the sidecar is missing or the slot
+          is unstamped. */}
       <div className="grid grid-cols-3 gap-2 text-xs">
         <div className="rounded-md border bg-muted/40 p-2">
           <div className="text-muted-foreground">Active (booted)</div>
           <div className="mt-0.5 font-mono font-semibold">
             {slotLabel(data?.current_slot ?? null)}
+          </div>
+          <div className="mt-0.5 font-mono text-[10px] text-muted-foreground">
+            {slotVersion(data, data?.current_slot ?? null)}
           </div>
         </div>
         <div className="rounded-md border bg-muted/40 p-2">
@@ -223,11 +248,17 @@ export function SlotUpgradeCard() {
           <div className="mt-0.5 font-mono font-semibold">
             {slotLabel(data?.durable_default ?? null)}
           </div>
+          <div className="mt-0.5 font-mono text-[10px] text-muted-foreground">
+            {slotVersion(data, data?.durable_default ?? null)}
+          </div>
         </div>
         <div className="rounded-md border bg-muted/40 p-2">
           <div className="text-muted-foreground">Target (inactive)</div>
           <div className="mt-0.5 font-mono font-semibold">
             {slotLabel(inactiveSlot)}
+          </div>
+          <div className="mt-0.5 font-mono text-[10px] text-muted-foreground">
+            {slotVersion(data, inactiveSlot)}
           </div>
         </div>
       </div>

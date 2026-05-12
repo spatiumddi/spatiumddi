@@ -945,6 +945,24 @@ EOF
         # commits saved_entry via grub-set-default once the new slot
         # passes /health/live. grub-reboot from spatium-upgrade-slot
         # is the one-shot "try this slot once" mechanism.
+        #
+        # APPLIANCE_VERSION_LABEL feeds the menuentry titles so the
+        # grub menu shows "SpatiumDDI Appliance <ver> (slot A)" instead
+        # of the bare slot letter. Both slots get the same version at
+        # install time (they're identical copies after the rsync at
+        # line 1060); spatium-upgrade-slot apply re-stamps the
+        # inactive slot's title after each dd via _patch_grub_cfg_slot_
+        # _label so the menu stays accurate across upgrades.
+        local APPLIANCE_VERSION_LABEL=""
+        if [ -f "$MOUNT/etc/spatiumddi/appliance-release" ]; then
+            APPLIANCE_VERSION_LABEL=$(awk -F= '/^APPLIANCE_VERSION=/{
+                gsub(/^"|"$|^'\''|'\''$/, "", $2); print $2; exit
+            }' "$MOUNT/etc/spatiumddi/appliance-release" || true)
+        fi
+        local SLOT_TITLE_PREFIX="SpatiumDDI Appliance"
+        if [ -n "$APPLIANCE_VERSION_LABEL" ]; then
+            SLOT_TITLE_PREFIX="SpatiumDDI Appliance $APPLIANCE_VERSION_LABEL"
+        fi
         mkdir -p "$MOUNT/boot/efi/grub"
         cat > "$MOUNT/boot/efi/grub/grub.cfg" <<EOF
 # SpatiumDDI A/B boot config (Phase 8c, issue #138).
@@ -983,7 +1001,7 @@ insmod ext2
 insmod ext4
 insmod search_fs_uuid
 
-menuentry "SpatiumDDI Appliance (slot A)" --id=slot_a {
+menuentry "$SLOT_TITLE_PREFIX (slot A)" --id=slot_a {
     search --no-floppy --fs-uuid --set=root $ROOT_A_UUID
     linux /boot/vmlinuz root=UUID=$ROOT_A_UUID rw \\
         loglevel=3 audit=0 \\
@@ -991,7 +1009,7 @@ menuentry "SpatiumDDI Appliance (slot A)" --id=slot_a {
     initrd /boot/initrd.img
 }
 
-menuentry "SpatiumDDI Appliance (slot B)" --id=slot_b {
+menuentry "$SLOT_TITLE_PREFIX (slot B)" --id=slot_b {
     search --no-floppy --fs-uuid --set=root $ROOT_B_UUID
     linux /boot/vmlinuz root=UUID=$ROOT_B_UUID rw \\
         loglevel=3 audit=0 \\
@@ -999,7 +1017,7 @@ menuentry "SpatiumDDI Appliance (slot B)" --id=slot_b {
     initrd /boot/initrd.img
 }
 
-menuentry "SpatiumDDI Appliance (slot A, verbose boot)" --id=slot_a_verbose {
+menuentry "$SLOT_TITLE_PREFIX (slot A, verbose boot)" --id=slot_a_verbose {
     # Drops loglevel + audit too. Use when you need to capture every
     # kernel message for a bug report. Also passes spatium-console=off
     # so getty@tty1 wins tty1 (no dashboard overpainting the log).
@@ -1010,7 +1028,7 @@ menuentry "SpatiumDDI Appliance (slot A, verbose boot)" --id=slot_a_verbose {
     initrd /boot/initrd.img
 }
 
-menuentry "SpatiumDDI Appliance (rescue / single-user)" --id=rescue {
+menuentry "$SLOT_TITLE_PREFIX (rescue / single-user)" --id=rescue {
     # Boots slot_a into rescue.target — single-user, root shell only,
     # no docker, no getty@tty1.
     search --no-floppy --fs-uuid --set=root $ROOT_A_UUID
