@@ -62,6 +62,11 @@ def detect_deployment_kind() -> str:
         if "docker" in cgroup or "containerd" in cgroup:
             return "docker"
     except OSError:
+        # /proc/1/cgroup is optional fallback for runtimes that don't
+        # drop /.dockerenv (podman / rootless). When the read fails
+        # (cgroups v1 / v2 layout mismatch, namespaced /proc that
+        # hides PID 1) we just fall through to "unknown" — the
+        # Fleet UI handles that case explicitly.
         pass
     return "unknown"
 
