@@ -228,39 +228,15 @@ export function SlotUpgradeCard() {
         </div>
       )}
 
-      {/* Slot status — current / durable / target. Each column shows
-          the slot label + the installed APPLIANCE_VERSION underneath
-          (sourced from slot-versions.json). The version line is muted
-          + falls back to "—" when the sidecar is missing or the slot
-          is unstamped. */}
-      <div className="grid grid-cols-3 gap-2 text-xs">
-        <div className="rounded-md border bg-muted/40 p-2">
-          <div className="text-muted-foreground">Active (booted)</div>
-          <div className="mt-0.5 font-mono font-semibold">
-            {slotLabel(data?.current_slot ?? null)}
-          </div>
-          <div className="mt-0.5 font-mono text-[10px] text-muted-foreground">
-            {slotVersion(data, data?.current_slot ?? null)}
-          </div>
-        </div>
-        <div className="rounded-md border bg-muted/40 p-2">
-          <div className="text-muted-foreground">Durable default</div>
-          <div className="mt-0.5 font-mono font-semibold">
-            {slotLabel(data?.durable_default ?? null)}
-          </div>
-          <div className="mt-0.5 font-mono text-[10px] text-muted-foreground">
-            {slotVersion(data, data?.durable_default ?? null)}
-          </div>
-        </div>
-        <div className="rounded-md border bg-muted/40 p-2">
-          <div className="text-muted-foreground">Target (inactive)</div>
-          <div className="mt-0.5 font-mono font-semibold">
-            {slotLabel(inactiveSlot)}
-          </div>
-          <div className="mt-0.5 font-mono text-[10px] text-muted-foreground">
-            {slotVersion(data, inactiveSlot)}
-          </div>
-        </div>
+      {/* Slot cards — one per A/B slot in fixed order, regardless of
+          which is currently booted. Each card carries the installed
+          APPLIANCE_VERSION (from slot-versions.json) + role badges
+          showing the slot's current relationship to grub (booted /
+          default / target for next apply / trial). Side-by-side on
+          ≥sm viewports, stacked on small screens. */}
+      <div className="grid gap-2 sm:grid-cols-2">
+        <SlotCardView slot="slot_a" data={data} inactiveSlot={inactiveSlot} />
+        <SlotCardView slot="slot_b" data={data} inactiveSlot={inactiveSlot} />
       </div>
 
       {trial && (
@@ -625,6 +601,99 @@ export function SlotUpgradeCard() {
         onConfirm={() => reboot.mutate()}
         onClose={() => !reboot.isPending && setRebootConfirm(false)}
       />
+    </div>
+  );
+}
+
+// ── Per-slot card ──────────────────────────────────────────────────
+//
+// Two of these render side-by-side (Slot A on the left, Slot B on
+// the right) showing the slot's installed version + role badges:
+//
+//   🟢 BOOTED   — this slot is currently running
+//   🔵 DEFAULT  — grubenv saved_entry points here (next normal boot)
+//   🟠 TARGET   — next Apply writes here (the inactive slot)
+//   🟡 TRIAL    — booted slot ≠ durable default (apply armed but
+//                 not yet committed; reboot before /health/live
+//                 commits = revert)
+
+function SlotCardView({
+  slot,
+  data,
+  inactiveSlot,
+}: {
+  slot: ApplianceSlot;
+  data: ApplianceSlotStatus | undefined;
+  inactiveSlot: ApplianceSlot | null;
+}) {
+  const isBooted = data?.current_slot === slot;
+  const isDefault = data?.durable_default === slot;
+  const isTarget = inactiveSlot === slot;
+  const isTrial = isBooted && !!data?.is_trial_boot;
+  const version = slotVersion(data, slot);
+
+  // One subtext line per card explaining the slot's current role
+  // in plain English. Priorities: trial state > booted > durable >
+  // target > unused.
+  let subtext: string;
+  if (isTrial) {
+    subtext = `Trial boot — reverts to ${slotLabel(data?.durable_default ?? null)} on reboot unless /health/live commits`;
+  } else if (isBooted && isDefault) {
+    subtext = "Active · this is where you'll boot on next reboot";
+  } else if (isDefault && !isBooted) {
+    subtext = "Durable default · grub will boot here next time";
+  } else if (isTarget) {
+    subtext = "Inactive · next Apply writes here, active slot untouched";
+  } else if (isBooted) {
+    subtext = "Active · trial state without durable backing";
+  } else {
+    subtext = "Inactive";
+  }
+
+  // Outer card colouring follows the most-relevant role so the
+  // pair has visual rhythm at a glance: booted = emerald edge,
+  // target = amber edge, otherwise muted.
+  const borderClass = isTrial
+    ? "border-amber-500/50 bg-amber-500/5"
+    : isBooted
+      ? "border-emerald-500/40 bg-emerald-500/5"
+      : isTarget
+        ? "border-amber-500/30 bg-amber-500/5"
+        : "border-border bg-muted/40";
+
+  return (
+    <div
+      className={`flex flex-col rounded-md border p-2.5 text-xs ${borderClass}`}
+    >
+      <div className="flex items-center justify-between gap-2">
+        <div className="font-mono font-semibold">{slotLabel(slot)}</div>
+        <div className="flex flex-wrap items-center gap-1">
+          {isBooted && (
+            <span className="inline-flex items-center rounded-md bg-emerald-500/10 px-1.5 py-0.5 text-[10px] font-semibold uppercase text-emerald-700 dark:text-emerald-300">
+              Booted
+            </span>
+          )}
+          {isDefault && (
+            <span className="inline-flex items-center rounded-md bg-blue-500/10 px-1.5 py-0.5 text-[10px] font-semibold uppercase text-blue-700 dark:text-blue-300">
+              Default
+            </span>
+          )}
+          {isTarget && (
+            <span className="inline-flex items-center rounded-md bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-semibold uppercase text-amber-700 dark:text-amber-300">
+              Target
+            </span>
+          )}
+          {isTrial && (
+            <span className="inline-flex items-center rounded-md bg-yellow-500/15 px-1.5 py-0.5 text-[10px] font-semibold uppercase text-yellow-700 dark:text-yellow-300">
+              Trial
+            </span>
+          )}
+        </div>
+      </div>
+      <div className="mt-1 font-mono text-[11px] text-muted-foreground">
+        {version}
+      </div>
+      <div className="mt-1 text-[11px] text-muted-foreground">{subtext}</div>
     </div>
   );
 }
