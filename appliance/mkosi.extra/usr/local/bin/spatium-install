@@ -437,19 +437,44 @@ do_install() {
     # and the EXIT trap drops the operator to a shell with the log.
     set -e
 
-    # GPT layout: 1 MiB BIOS Boot Partition (type ef02) + 512 MiB
-    # EFI System Partition (ef00, FAT32) + rest ext4 root (8300).
-    # The BBP holds grub-i386-pc's core.img — without it
-    # grub-install fails on GPT disks with "no BIOS Boot Partition;
-    # embedding won't be possible". MBR boot record on GPT only
-    # has 446 bytes between the partition table and the protective
-    # MBR slot; grub stage-1 doesn't fit, hence the BBP.
-    local BBP ESP ROOT
+    # Phase 8a-1 GPT layout — Atomic A/B image upgrade support (issue #138).
+    # Replaces the previous single-root layout with an A/B + /var
+    # split:
+    #
+    #   p1  BIOS Boot     1 MiB     ef02   legacy chain-load (grub i386-pc)
+    #   p2  ESP          512 MiB    ef00   FAT32, /boot/efi
+    #   p3  root_A         4 GiB    8304   active slot (this install lands here)
+    #   p4  root_B         4 GiB    8304   inactive slot (staging next image)
+    #   p5  var          rest       8300   /var, persisted across slot swaps
+    #
+    # Slot sizing — current rootfs is ~1.8 GiB (Python, kernel, system
+    # packages, /etc baseline). 4 GiB gives ~2.2× headroom which covers
+    # the Phase 4-7 roadmap (additional daemons, expanded Python stack,
+    # future kernel upgrades). If we ever outgrow it, "spatium-upgrade-
+    # slot --grow" is a future affordance — easier to grow than shrink.
+    #
+    # Hard floor: 16 GiB target disk (= 1 MiB BBP + 512 MiB ESP + 2× 4
+    # GiB slots + at least 7 GiB usable /var). Below that, postgres +
+    # docker volumes + audit log outgrow /var quickly.
+    local BBP ESP ROOT_A ROOT_B VAR
     BBP=$(partition_node 1)
     ESP=$(partition_node 2)
-    ROOT=$(partition_node 3)
+    ROOT_A=$(partition_node 3)
+    ROOT_B=$(partition_node 4)
+    VAR=$(partition_node 5)
 
-    log "Install starting: target=$TARGET_DISK BBP=$BBP ESP=$ESP ROOT=$ROOT"
+    # Check target disk size — bail before destroying anything.
+    local DISK_BYTES MIN_BYTES
+    DISK_BYTES=$(blockdev --getsize64 "$TARGET_DISK" 2>/dev/null || echo 0)
+    MIN_BYTES=$((16 * 1024 * 1024 * 1024))
+    if [ "$DISK_BYTES" -lt "$MIN_BYTES" ]; then
+        log "ERROR: target disk $TARGET_DISK is $((DISK_BYTES / 1024 / 1024 / 1024)) GiB — need at least 16 GiB for A/B layout"
+        whiptail --backtitle "$BACKTITLE" --title "Disk too small" --msgbox \
+            "Target disk $TARGET_DISK is only $((DISK_BYTES / 1024 / 1024 / 1024)) GiB.\n\nSpatiumDDI's A/B atomic-upgrade layout needs at least 16 GiB:\n  ESP        512 MiB\n  root_A       4 GiB\n  root_B       4 GiB\n  var       remainder (≥7 GiB usable)\n\nAttach a larger disk and re-run the installer." 16 70
+        exit 1
+    fi
+
+    log "Install starting: target=$TARGET_DISK BBP=$BBP ESP=$ESP ROOT_A=$ROOT_A ROOT_B=$ROOT_B VAR=$VAR"
 
     {
         echo "XXX"; echo "3"; echo "Releasing existing partitions on $TARGET_DISK..."; echo "XXX"
@@ -472,16 +497,41 @@ do_install() {
             done
         fi
 
-        echo "XXX"; echo "5"; echo "Partitioning $TARGET_DISK..."; echo "XXX"
+        echo "XXX"; echo "5"; echo "Partitioning $TARGET_DISK (A/B + var layout)..."; echo "XXX"
         wipefs -af "$TARGET_DISK"           >> "$INSTALL_LOG" 2>&1
         sgdisk -Z "$TARGET_DISK"            >> "$INSTALL_LOG" 2>&1
         # Force the kernel to forget the old partition table before
         # we lay down a new one. Without this, mkfs against the new
         # partition nodes can race with udev rebuilding /dev/disk/.
         blockdev --rereadpt "$TARGET_DISK"  >> "$INSTALL_LOG" 2>&1 || true
+        # GPT type codes — sgdisk shortcuts:
+        #   ef02 = BIOS Boot         (i386-pc grub core.img target)
+        #   ef00 = EFI System        (FAT32 /boot/efi)
+        #   8304 = Linux root (x86-64) — systemd-gpt-auto-generator
+        #          can find /usr-aware slots by partition type, used
+        #          by 8b's sysupdate slot picker
+        #   8300 = generic Linux fs  (var; we mount via /etc/fstab)
+        # Partition type codes:
+        #   ef02 = BIOS Boot                  (grub i386-pc core.img target)
+        #   ef00 = EFI System                 (FAT32 /boot/efi)
+        #   8304 = Linux root x86-64          (systemd-gpt-auto-generator
+        #                                      hint for root slot — used
+        #                                      by 8b's slot-write logic)
+        #   8310 = Linux /var (4d21b016-...)  (sysd-gpt-auto-generator
+        #                                      auto-mounts /var without
+        #                                      needing an /etc/fstab
+        #                                      entry — critical because
+        #                                      the operator-overlay's
+        #                                      fstab is INSIDE the
+        #                                      overlay we're trying to
+        #                                      mount; chicken+egg
+        #                                      otherwise. Sets the var
+        #                                      partition discoverable.)
         sgdisk -n1:0:+1M    -t1:ef02 -c1:bios_boot \
                -n2:0:+512M  -t2:ef00 -c2:ESP \
-               -n3:0:0      -t3:8300 -c3:root \
+               -n3:0:+4G    -t3:8304 -c3:root_A \
+               -n4:0:+4G    -t4:8304 -c4:root_B \
+               -n5:0:0      -t5:8310 -c5:var \
                "$TARGET_DISK"               >> "$INSTALL_LOG" 2>&1
         partprobe "$TARGET_DISK"            >> "$INSTALL_LOG" 2>&1 || true
         udevadm settle                      >> "$INSTALL_LOG" 2>&1 || true
@@ -489,11 +539,22 @@ do_install() {
 
         echo "XXX"; echo "10"; echo "Formatting partitions..."; echo "XXX"
         mkfs.fat -F32 -n ESP "$ESP"         >> "$INSTALL_LOG" 2>&1
-        mkfs.ext4 -F -L root "$ROOT"        >> "$INSTALL_LOG" 2>&1
+        # Label the slots distinctly so the boot loader / sysupdate
+        # can pick them by label rather than position. root_a is the
+        # active slot for this install; root_b is empty until 8b's
+        # `spatium-update` writes the next image there.
+        mkfs.ext4 -F -L root_a "$ROOT_A"    >> "$INSTALL_LOG" 2>&1
+        mkfs.ext4 -F -L root_b "$ROOT_B"    >> "$INSTALL_LOG" 2>&1
+        mkfs.ext4 -F -L var    "$VAR"       >> "$INSTALL_LOG" 2>&1
 
         echo "XXX"; echo "15"; echo "Mounting target..."; echo "XXX"
+        # Mount layout for rsync: root_A as / and var as /var BEFORE
+        # rsync runs, so files going to /var land on the var partition
+        # automatically (rsync follows the mount tree).
         mkdir -p "$MOUNT"
-        mount "$ROOT" "$MOUNT"
+        mount "$ROOT_A" "$MOUNT"
+        mkdir -p "$MOUNT/var"
+        mount "$VAR" "$MOUNT/var"
         mkdir -p "$MOUNT/boot/efi"
         mount "$ESP" "$MOUNT/boot/efi"
 
@@ -516,14 +577,140 @@ do_install() {
             --exclude="/etc/issue.d/zz-spatium-live.issue" \
             / "$MOUNT/" >> "$INSTALL_LOG" 2>&1
 
-        echo "XXX"; echo "65"; echo "Writing system config..."; echo "XXX"
+        echo "XXX"; echo "60"; echo "Writing boot-critical config to root baseline..."; echo "XXX"
+        # IMPORTANT: fstab + /etc/hostname need to land on the
+        # UNDERLYING root_A partition (not in the overlay upper), since
+        # systemd reads them at boot BEFORE etc.mount can fire. If they
+        # were in the overlay only, systemd would never see them, /var
+        # wouldn't mount, and the overlay would never mount either —
+        # which was the build030 install bug.
+        #
+        # Belt + braces: /var has GPT type Linux /var
+        # (4d21b016-b534-45c2-a9fb-5c16e091fd2d, sgdisk code 8310, set
+        # earlier in the partitioning step) so systemd-gpt-auto-
+        # generator auto-mounts it even without an fstab entry. On a
+        # Phase 8b slot swap to image v2, root_B will ship its own
+        # vanilla fstab that lacks our /var UUID — gpt-auto picks up
+        # the slack.
+        #
+        # /home + /root bind mounts deliberately NOT in fstab. They
+        # ship as systemd .mount unit files
+        # (/etc/systemd/system/home.mount + root.mount) baked into the
+        # image baseline, so EVERY image slot's /etc has them. fstab
+        # entries would get reset to vanilla on slot swap → operator
+        # data masked because /home wouldn't bind-mount; the .mount
+        # files are immune to that failure mode.
+        # Phase 8a-7 — fstab is IMAGE-BASELINE (no operator-specific
+        # UUIDs). Every slot's image-shipped /etc/fstab carries the
+        # same content, so a slot swap to image v2 doesn't need any
+        # fstab rewrite — root_B's image-baseline fstab is identical.
+        #
+        # Each mountpoint uses a slot-stable identifier:
+        #
+        # / (root)         — NOT in fstab. Mounted by kernel via
+        #                    root=UUID=… on the cmdline (set per-slot
+        #                    in grub.cfg menuentries via grub-install).
+        #
+        # /var             — LABEL=var. Belt-and-braces with
+        #                    systemd-gpt-auto-generator (GPT type
+        #                    8310 / 4d21b016-…). gpt-auto's machine-id
+        #                    matching can be finicky on first boot;
+        #                    LABEL=var in fstab is a reliable fallback.
+        #
+        # /boot/efi        — LABEL=ESP (set by `mkfs.fat -n ESP`).
+        #                    fmask=0133 / dmask=0022 makes files 0644
+        #                    and dirs 0755 so the api container (uid
+        #                    1000) can read grubenv through the read-
+        #                    only /boot/efi:/boot/efi-host bind mount
+        #                    that drives the SlotUpgradeCard. No
+        #                    secrets live on the ESP — just grub.cfg
+        #                    + grubenv + boot loader binaries —
+        #                    relaxing perms here is fine.
+        #
+        # /tmp             — tmpfs, image-baseline.
+        #
+        # /home + /root    — systemd .mount unit files (image-shipped
+        #                    at /etc/systemd/system/home.mount +
+        #                    root.mount). Not in fstab.
+        cat > "$MOUNT/etc/fstab" <<'EOF'
+LABEL=var  /var       ext4   defaults                              0 2
+LABEL=ESP  /boot/efi  vfat   fmask=0133,dmask=0022,shortname=winnt 0 2
+tmpfs      /tmp       tmpfs  nosuid,nodev,noexec,mode=1777         0 0
+EOF
         echo "$HOSTNAME" > "$MOUNT/etc/hostname"
-        # Phase 6 — role config consumed by spatiumddi-firstboot to
-        # set COMPOSE_PROFILES + write CONTROL_PLANE_URL / agent keys
-        # to /etc/spatiumddi/.env. World-readable on the installed
-        # system (no secrets — the agent key only lives transiently
-        # here on the live ISO and gets moved into the 0600 .env at
-        # first boot).
+
+        echo "XXX"; echo "62"; echo "Snapshotting /etc baseline + mounting overlay (Phase 8a)..."; echo "XXX"
+        # Phase 8a-2 — Atomic A/B image upgrade (#138).
+        # /usr/lib/etc.image is the slot's "image-shipped /etc"
+        # baseline. We snapshot AFTER fstab + hostname write so the
+        # snapshot has working boot config (root_B will get its own
+        # snapshot from image v2 — sysupdate updates the lower layer).
+        # Operator-mutable config (passwd, shadow, network, certs) goes
+        # through the overlay later in this install + persists via the
+        # /var/persist/etc upper layer across slot swaps.
+        #
+        # Use cp -a to preserve perms / xattrs / symlinks. /etc is
+        # only ~10 MiB so the copy is fast (<2 s on any disk worth
+        # running an appliance on).
+        mkdir -p "$MOUNT/usr/lib/etc.image"
+        cp -a "$MOUNT/etc/." "$MOUNT/usr/lib/etc.image/" >> "$INSTALL_LOG" 2>&1
+
+        # Phase 8a-3 — overlay layout on /var:
+        #   /var/persist/etc       upperdir  (operator writes land here)
+        #   /var/persist/etc-work  workdir   (overlay scratch space)
+        mkdir -p "$MOUNT/var/persist/etc" "$MOUNT/var/persist/etc-work"
+
+        # Mount overlay over /target/etc for the REMAINDER of the
+        # install. Every chroot useradd / chpasswd / file write that
+        # would normally land in /etc instead lands in the upper layer
+        # on /var/persist/etc — which persists across slot swaps. The
+        # subsequent unmount step has to release this BEFORE /var.
+        mount -t overlay overlay \
+            -o "lowerdir=$MOUNT/usr/lib/etc.image,upperdir=$MOUNT/var/persist/etc,workdir=$MOUNT/var/persist/etc-work" \
+            "$MOUNT/etc" >> "$INSTALL_LOG" 2>&1
+
+        # Phase 8a — /home + /root on /var so operator home dirs
+        # survive slot swaps. The bind mounts are wired via shipped
+        # systemd unit files (home.mount + root.mount, baked into the
+        # image) rather than fstab — fstab gets reset to image vanilla
+        # on slot swap, but every image slot ships the same .mount unit
+        # files, so binds are immune to that reset path.
+        #
+        # useradd inside the upcoming chroot writes to /home/admin →
+        # transparent via the install-time bind mount → /var/home/admin
+        # on disk → ready for the .mount unit to re-bind at every boot.
+        mkdir -p "$MOUNT/var/home" "$MOUNT/home"
+        mkdir -p "$MOUNT/var/root"
+        # /root already exists in the image rootfs with the live-system
+        # contents — move them to /var/root so they live on the
+        # persistent side, then re-create an empty /root mountpoint.
+        if [ -d "$MOUNT/root" ] && [ -z "$(ls -A "$MOUNT/var/root" 2>/dev/null)" ]; then
+            cp -a "$MOUNT/root/." "$MOUNT/var/root/" >> "$INSTALL_LOG" 2>&1 || true
+            rm -rf "$MOUNT/root"
+        fi
+        mkdir -p "$MOUNT/root"
+        mount --bind "$MOUNT/var/home" "$MOUNT/home" >> "$INSTALL_LOG" 2>&1
+        mount --bind "$MOUNT/var/root" "$MOUNT/root" >> "$INSTALL_LOG" 2>&1
+
+        # Write operator's hostname through the overlay too — lands in
+        # /var/persist/etc/hostname on disk → persists across slot
+        # swaps verbatim. The underlying root_A /etc/hostname (written
+        # earlier) covers the brief window before the overlay mounts
+        # on first boot; the overlay upper covers everything else.
+        echo "$HOSTNAME" > "$MOUNT/etc/hostname"
+
+        echo "XXX"; echo "65"; echo "Writing system config..."; echo "XXX"
+        # fstab + /etc/hostname were already written to the underlying
+        # root_A /etc earlier (before the overlay was mounted) so boot
+        # can find them. The overlay's lower layer (/usr/lib/etc.image)
+        # captured those writes in the snapshot — so they appear in the
+        # merged view even though we don't re-write them through the
+        # overlay here.
+        #
+        # role-config + /etc/hosts go through the overlay → upper. The
+        # role-config IS operator state (carries the agent key + control
+        # plane URL the wizard captured); /etc/hosts carries the
+        # operator's hostname. Both must persist across slot swaps.
         mkdir -p "$MOUNT/etc/spatiumddi"
         cat > "$MOUNT/etc/spatiumddi/role-config" <<EOF
 ROLE=$ROLE
@@ -542,14 +729,6 @@ EOF
 ::1 ip6-localhost ip6-loopback
 ff02::1 ip6-allnodes
 ff02::2 ip6-allrouters
-EOF
-
-        local ROOT_UUID ESP_UUID
-        ROOT_UUID=$(blkid -s UUID -o value "$ROOT")
-        ESP_UUID=$(blkid -s UUID -o value "$ESP")
-        cat > "$MOUNT/etc/fstab" <<EOF
-UUID=$ROOT_UUID  /          ext4  defaults                       0 1
-UUID=$ESP_UUID   /boot/efi  vfat  umask=0077,shortname=winnt     0 2
 EOF
 
         # Timezone
@@ -633,6 +812,10 @@ EOF
         log "Copying $LIVE_KERNEL -> /boot/vmlinuz-$KVER"
         install -m 0644 "$LIVE_KERNEL" "$MOUNT/boot/vmlinuz-$KVER"
         ln -sf "vmlinuz-$KVER" "$MOUNT/boot/vmlinuz"
+        # Phase 8c — initrd.img symlink alongside vmlinuz so grub.cfg
+        # can reference stable paths regardless of kernel version. The
+        # symlink target is created by update-initramfs below.
+        ln -sf "initrd.img-$KVER" "$MOUNT/boot/initrd.img"
 
         echo "XXX"; echo "80"; echo "Configuring initramfs (virtio + storage modules)..."; echo "XXX"
         # Force the storage / virtio drivers into the initrd so the
@@ -700,17 +883,34 @@ EOF
         log "initrd written: $(ls -lh "$MOUNT/boot/initrd.img-$KVER" | awk '{print $5}')"
         ln -sf "initrd.img-$KVER" "$MOUNT/boot/initrd.img"
 
-        echo "XXX"; echo "85"; echo "Writing /etc/default/grub + /boot/grub/grub.cfg..."; echo "XXX"
+        echo "XXX"; echo "85"; echo "Writing GRUB config (Phase 8c A/B + boot counting)..."; echo "XXX"
+        # GRUB still needs the slot UUIDs for `search --fs-uuid` (so
+        # it can find each slot's /boot/vmlinuz regardless of disk
+        # ordering) and `root=UUID=…` on the kernel cmdline. fstab no
+        # longer carries them (Phase 8a-7 — image-baseline fstab uses
+        # LABEL= only); grub.cfg keeps using per-slot UUIDs because
+        # it's WHERE the boot menu lives + the menuentries are
+        # per-slot anyway.
+        local ROOT_A_UUID ROOT_B_UUID
+        ROOT_A_UUID=$(blkid -s UUID -o value "$ROOT_A")
+        ROOT_B_UUID=$(blkid -s UUID -o value "$ROOT_B")
+
         # Write /etc/default/grub explicitly so future `update-grub`
         # runs (e.g. on kernel upgrade) get the same cmdline. We
         # don't rely on update-grub at install time — we write
         # grub.cfg directly below — but installed-system tooling
         # will read this file later.
         cat > "$MOUNT/etc/default/grub" <<EOF
-GRUB_DEFAULT=0
+GRUB_DEFAULT=saved
 GRUB_TIMEOUT=3
 GRUB_DISTRIBUTOR="SpatiumDDI"
-GRUB_CMDLINE_LINUX_DEFAULT="quiet"
+GRUB_SAVEDEFAULT=true
+# Issue #136: do NOT hide boot output ("quiet" / show_status=false).
+# spatium-console.service claims tty1 seconds after kernel boot and
+# overpaints whatever was there, so the brief visible boot text only
+# matters when something is wrong (a panic, a missed module, plymouth
+# eating keystrokes — all silently undebuggable otherwise).
+GRUB_CMDLINE_LINUX_DEFAULT="loglevel=3 audit=0"
 GRUB_CMDLINE_LINUX="console=tty0 console=ttyS0,115200n8"
 GRUB_TERMINAL_INPUT="console serial"
 GRUB_TERMINAL_OUTPUT="console serial"
@@ -719,17 +919,49 @@ GRUB_DISABLE_OS_PROBER=true
 GRUB_DISABLE_LINUX_UUID=false
 EOF
 
-        # Write grub.cfg directly with the correct root=UUID. We
-        # bypass update-grub because grub-mkconfig's grub-probe reads
-        # /proc/mounts inside the chroot — and /proc is bind-mounted
-        # from the host, so grub-probe returns the LIVE OVERLAY's
-        # device rather than the target disk's root partition. The
-        # resulting grub.cfg has a wrong/missing root= line and the
-        # kernel panics at boot.
-        mkdir -p "$MOUNT/boot/grub"
-        cat > "$MOUNT/boot/grub/grub.cfg" <<EOF
+        # Phase 8c — grub.cfg + grubenv on the ESP (/boot/efi/grub/),
+        # NOT on each slot's /boot/grub/. Reasons:
+        #   * ESP is shared between slots → single source of truth for
+        #     the boot menu. spatium-upgrade-slot doesn't need to keep
+        #     two grub.cfg copies in sync.
+        #   * grub-reboot / grub-set-default write to grubenv on the
+        #     same filesystem as grub.cfg — keeping both on ESP means
+        #     they survive verbatim across slot swaps.
+        #   * If an operator wipes /var, the boot menu still works
+        #     (it's on the ESP, untouched).
+        #
+        # Two slot menuentries with --id=slot_a / slot_b. default reads
+        # ${saved_entry} from grubenv. spatiumddi-firstboot.service
+        # commits saved_entry via grub-set-default once the new slot
+        # passes /health/live. grub-reboot from spatium-upgrade-slot
+        # is the one-shot "try this slot once" mechanism.
+        mkdir -p "$MOUNT/boot/efi/grub"
+        cat > "$MOUNT/boot/efi/grub/grub.cfg" <<EOF
+# SpatiumDDI A/B boot config (Phase 8c, issue #138).
+# Default boot is whichever slot grubenv's saved_entry points at; on
+# first install that's slot_a. grub-reboot <slot> from spatium-upgrade-
+# slot sets it for ONE BOOT only (auto-reverts on next boot — that's
+# the safety net for failed upgrades).
 set timeout=3
-set default=0
+load_env
+
+# Phase 8c boot counting:
+#   * next_entry → one-shot, set by `grub-reboot <slot>`. We honor it
+#     once, clear it (so the next-but-one boot reverts), then boot.
+#     If the chosen slot panics or fails /health/live, it's already
+#     cleared from grubenv → operator falls back to saved_entry on
+#     the next reboot. This is the rollback safety net.
+#   * saved_entry → durable default. Set by `grub-set-default <slot>`
+#     either manually (spatium-upgrade-slot rollback) or by
+#     spatiumddi-firstboot.service after a trial slot proves healthy.
+if [ "\${next_entry}" ]; then
+    set default="\${next_entry}"
+    set next_entry=
+    save_env next_entry
+else
+    set default="\${saved_entry}"
+fi
+if [ -z "\${default}" ]; then set default=slot_a; fi
 
 # Serial console mirror for headless installs.
 serial --unit=0 --speed=115200
@@ -738,57 +970,134 @@ terminal_output console serial
 
 insmod part_gpt
 insmod ext2
+insmod ext4
 insmod search_fs_uuid
-search --no-floppy --fs-uuid --set=root $ROOT_UUID
 
-menuentry "SpatiumDDI Appliance" {
-    linux /boot/vmlinuz-$KVER root=UUID=$ROOT_UUID ro quiet \\
-        loglevel=3 audit=0 systemd.show_status=false \\
+menuentry "SpatiumDDI Appliance (slot A)" --id=slot_a {
+    search --no-floppy --fs-uuid --set=root $ROOT_A_UUID
+    linux /boot/vmlinuz root=UUID=$ROOT_A_UUID rw \\
+        loglevel=3 audit=0 \\
         console=tty0 console=ttyS0,115200n8
-    initrd /boot/initrd.img-$KVER
+    initrd /boot/initrd.img
 }
 
-menuentry "SpatiumDDI Appliance (verbose boot)" {
-    # Same as default, just without the quiet/loglevel/audit/
-    # show_status flags — useful when you want to see what's
-    # happening during boot. Still runs multi-user.target so
-    # getty@tty1 + serial-getty@ttyS0 both come up normally.
-    linux /boot/vmlinuz-$KVER root=UUID=$ROOT_UUID ro \\
+menuentry "SpatiumDDI Appliance (slot B)" --id=slot_b {
+    search --no-floppy --fs-uuid --set=root $ROOT_B_UUID
+    linux /boot/vmlinuz root=UUID=$ROOT_B_UUID rw \\
+        loglevel=3 audit=0 \\
         console=tty0 console=ttyS0,115200n8
-    initrd /boot/initrd.img-$KVER
+    initrd /boot/initrd.img
 }
 
-menuentry "SpatiumDDI Appliance (rescue / single-user)" {
-    # Boots into rescue.target — single-user, root shell only, no
-    # docker, no getty@tty1. Asks for the root password from the
-    # installer at "Press Enter for maintenance" prompt.
-    linux /boot/vmlinuz-$KVER root=UUID=$ROOT_UUID ro \\
+menuentry "SpatiumDDI Appliance (slot A, verbose boot)" --id=slot_a_verbose {
+    # Drops loglevel + audit too. Use when you need to capture every
+    # kernel message for a bug report. Also passes spatium-console=off
+    # so getty@tty1 wins tty1 (no dashboard overpainting the log).
+    search --no-floppy --fs-uuid --set=root $ROOT_A_UUID
+    linux /boot/vmlinuz root=UUID=$ROOT_A_UUID rw \\
+        spatium-console=off \\
+        console=tty0 console=ttyS0,115200n8
+    initrd /boot/initrd.img
+}
+
+menuentry "SpatiumDDI Appliance (rescue / single-user)" --id=rescue {
+    # Boots slot_a into rescue.target — single-user, root shell only,
+    # no docker, no getty@tty1.
+    search --no-floppy --fs-uuid --set=root $ROOT_A_UUID
+    linux /boot/vmlinuz root=UUID=$ROOT_A_UUID rw \\
         console=tty0 console=ttyS0,115200n8 systemd.unit=rescue.target
-    initrd /boot/initrd.img-$KVER
+    initrd /boot/initrd.img
 }
 EOF
-
-        echo "XXX"; echo "88"; echo "Installing bootloader (BIOS + UEFI)..."; echo "XXX"
-        chroot "$MOUNT" /usr/sbin/grub-install --target=i386-pc "$TARGET_DISK" \
+        # Seed grubenv with default + saved_entry pointing at slot_a so
+        # the very first boot lands on slot_a unambiguously. grub-editenv
+        # creates the file with the right size (1024 bytes, zero-padded).
+        chroot "$MOUNT" /usr/bin/grub-editenv /boot/efi/grub/grubenv set saved_entry=slot_a \
             >> "$INSTALL_LOG" 2>&1
+
+        echo "XXX"; echo "88"; echo "Installing bootloader (BIOS + UEFI to ESP)..."; echo "XXX"
+        # Use --boot-directory=/boot/efi so BOTH BIOS and UEFI grub
+        # read their config (and grubenv) from the ESP. Without this,
+        # BIOS grub embeds slot_a's UUID + /boot/grub path into
+        # core.img — meaning a damaged slot_a breaks the boot menu
+        # even when slot_b is healthy.
+        chroot "$MOUNT" /usr/sbin/grub-install --target=i386-pc \
+            --boot-directory=/boot/efi \
+            "$TARGET_DISK" >> "$INSTALL_LOG" 2>&1
         chroot "$MOUNT" /usr/sbin/grub-install --target=x86_64-efi \
             --efi-directory=/boot/efi \
+            --boot-directory=/boot/efi \
             --bootloader-id=SPATIUMDDI \
             --removable \
             >> "$INSTALL_LOG" 2>&1 || true
+
+        echo "XXX"; echo "93"; echo "Cloning root_A → root_B (slot redundancy)..."; echo "XXX"
+        # Phase 8c — install BOTH slots with the same content so an
+        # operator can `spatium-upgrade-slot set-next-boot slot_b`
+        # immediately after install. Without this, root_B is mkfs'd
+        # but empty — the first set-next-boot fails at the grub prompt
+        # with "no such device: <root_B-UUID>" and "file /boot/vmlinuz
+        # not found", leaving the system stuck at the grub menu.
+        #
+        # Source: /target with the overlay /etc + var/home/root binds
+        # mounted. We rsync the merged view of /etc (so root_B's
+        # underlying /etc has the same hostname/fstab as root_A's
+        # snapshot did at install) but skip the mount-targets for
+        # /var, /home, /root, /boot/efi (those are bind/auto-mounted
+        # at runtime, root_B doesn't carry their content).
+        mkdir -p /mnt/spatium-root-b
+        mount "$ROOT_B" /mnt/spatium-root-b
+        rsync -aAXH \
+            --exclude="/var/*" \
+            --exclude="/home/*" \
+            --exclude="/root/*" \
+            --exclude="/boot/efi/*" \
+            --exclude="/dev/*" \
+            --exclude="/proc/*" \
+            --exclude="/sys/*" \
+            --exclude="/tmp/*" \
+            --exclude="/run/*" \
+            --exclude="/mnt/*" \
+            "$MOUNT/" /mnt/spatium-root-b/ >> "$INSTALL_LOG" 2>&1
+        # rsync excludes ./var/* but it can still create the empty
+        # /var dir — make sure all the mount-points exist as empty
+        # directories on root_B so the boot-time mount units succeed.
+        mkdir -p /mnt/spatium-root-b/var /mnt/spatium-root-b/home \
+                 /mnt/spatium-root-b/root /mnt/spatium-root-b/boot/efi
+        umount /mnt/spatium-root-b
+        rmdir /mnt/spatium-root-b
 
         echo "XXX"; echo "95"; echo "Unmounting..."; echo "XXX"
         for d in dev sys proc; do
             umount "$MOUNT/$d" 2>/dev/null || true
         done
         umount "$MOUNT/boot/efi"
+        # Phase 8a unmount order matters:
+        #   1. /home, /root    — bind mounts onto /var subdirs
+        #   2. /etc (overlay)  — upper is on /var, must release first
+        #   3. /var partition  — must be after /etc overlay + binds
+        #   4. root_A          — last
+        umount "$MOUNT/home"
+        umount "$MOUNT/root"
+        umount "$MOUNT/etc"
+        umount "$MOUNT/var"
         umount "$MOUNT"
         sync
 
         echo "XXX"; echo "100"; echo "Done."; echo "XXX"
         sleep 1
     } | whiptail --backtitle "$BACKTITLE" --title "Installing SpatiumDDI" \
-        --gauge "" 10 70 0
+        --gauge "Starting installation…" 12 76 0
+    # Notes on the --gauge args:
+    #   * Initial text MUST be non-empty. newt-based whiptail (Debian)
+    #     skips drawing the message line entirely when the initial text
+    #     is "", and subsequent XXX/N/message/XXX update blocks then
+    #     don't bring it back. The operator sees only the % bar and no
+    #     "Creating admin user" / "Installing bootloader" copy.
+    #   * Height 12 (was 10) gives enough vertical space for a wrapped
+    #     line — a few of the step messages run ~50 chars and on the
+    #     fbcon=font:VGA8x8 console they can wrap before width=70 fits.
+    #   * Width 76 (was 70) for the same wrap-headroom reason.
 
     # Best-effort eject of the install media BEFORE the operator
     # confirms reboot. Real CD-ROM drives obviously unmount and pop

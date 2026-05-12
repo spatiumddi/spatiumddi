@@ -19,14 +19,19 @@ set -eu
 # for cloud-init-local / cloud-init / cloud-config / cloud-final.
 mkdir -p "$BUILDROOT/etc/systemd/system/multi-user.target.wants"
 
-# Belt-and-braces: explicitly enable getty@tty1 so VGA console has
-# a login prompt. Debian's systemd preset normally does this but
-# mkosi has been observed to skip the preset step on some builds.
-# Without this symlink, booting with a VGA-attached console (e.g.
-# Proxmox noVNC) shows kernel messages but no agetty.
-mkdir -p "$BUILDROOT/etc/systemd/system/getty.target.wants"
-ln -sfn /usr/lib/systemd/system/getty@.service \
-    "$BUILDROOT/etc/systemd/system/getty.target.wants/getty@tty1.service"
+# NOTE on tty1: we deliberately do NOT force-enable getty@tty1.service
+# here anymore. Phase 4h ships spatium-console.service which claims
+# tty1 on the installed system (Conflicts=getty@tty1.service +
+# ConditionKernelCommandLine gates that match getty's drop-in). For
+# the installer and live ISO modes the existing spatium-install /
+# spatium-live-banner units own tty1 — both still gate themselves via
+# kernel cmdline. Operators who want stock getty back can pass
+# `spatium-console=off` on the kernel cmdline or
+# `systemctl disable spatium-console.service && systemctl enable getty@tty1.service`.
+#
+# Alt+F2..F6 still spawn getty on demand via systemd-logind's NAutoVTs
+# (Debian default = 6), so the operator always has a shell escape hatch
+# even when spatium-console is on tty1.
 # Install + Live mode services are kept WantedBy=multi-user.target
 # but gate themselves with ConditionKernelCommandLine=spatium-mode=…
 # so only one runs per boot, depending on the GRUB menu choice.
@@ -34,9 +39,12 @@ for unit in docker.service chrony.service ssh.service \
             spatiumddi-firstboot.service \
             spatiumddi-update.path \
             spatiumddi-reboot.path \
+            spatiumddi-slot-upgrade.path \
             spatium-install.service \
             spatium-live-banner.service \
             spatium-live-bootstrap.service \
+            spatium-console.service \
+            spatium-etc-reconcile.service \
             qemu-guest-agent.service \
             open-vm-tools.service \
             nftables.service \
@@ -55,6 +63,67 @@ for unit in docker.service chrony.service ssh.service \
     fi
     ln -sfn "$src" "$BUILDROOT/etc/systemd/system/multi-user.target.wants/$unit"
 done
+
+# Issue #136 — mask plymouth.
+#
+# Plymouth was the prime suspect for the "VGA console login won't take
+# keystrokes" bug: a stuck plymouth process retains tty1 even after
+# multi-user.target is reached, silently eating input meant for
+# agetty. mkosi.conf doesn't list plymouth in Packages= and
+# --no-install-recommends is mkosi's default, so plymouth SHOULD NOT
+# be installed — but Debian's package ecosystem changes, and a future
+# Recommends from live-config / live-tools / systemd-sysv could pull
+# it in transitively without us noticing. Masking is cheap: if the
+# unit doesn't exist the symlink-to-/dev/null is harmless, and if it
+# ever does get installed it can't start.
+for plym_unit in plymouth-start.service plymouth-quit.service \
+                 plymouth-quit-wait.service plymouth-read-write.service \
+                 plymouth-switch-root.service; do
+    ln -sfn /dev/null "$BUILDROOT/etc/systemd/system/$plym_unit"
+done
+
+# Template-unit instance for the serial console (Phase 4h, issue #134).
+# Template units are loaded from `<name>@.service` with %i substituted
+# at activation, so the symlink target is the bare template file but
+# the symlink itself carries the instance suffix.
+if [ -f "$BUILDROOT/etc/systemd/system/spatium-console@.service" ]; then
+    ln -sfn /etc/systemd/system/spatium-console@.service \
+        "$BUILDROOT/etc/systemd/system/multi-user.target.wants/spatium-console@ttyS0.service"
+fi
+
+# Phase 8a-3 — /etc overlay mount unit (issue #138). Wants etc.mount
+# at local-fs.target so the overlay is in place before any user-mode
+# service reads operator config.
+if [ -f "$BUILDROOT/etc/systemd/system/etc.mount" ]; then
+    mkdir -p "$BUILDROOT/etc/systemd/system/local-fs.target.wants"
+    ln -sfn /etc/systemd/system/etc.mount \
+        "$BUILDROOT/etc/systemd/system/local-fs.target.wants/etc.mount"
+fi
+
+# Phase 8a — /home + /root bind-mount units (issue #138). These ship
+# in every image slot so they're immune to fstab being reset to
+# image vanilla on slot swap. Operator home dirs persist via the var
+# partition's /var/home + /var/root subdirs.
+for bind_unit in home.mount root.mount; do
+    if [ -f "$BUILDROOT/etc/systemd/system/$bind_unit" ]; then
+        ln -sfn "/etc/systemd/system/$bind_unit" \
+            "$BUILDROOT/etc/systemd/system/local-fs.target.wants/$bind_unit"
+    fi
+done
+
+# Phase 8a-3 — tmpfiles.d entry to ensure /var/persist/etc{,-work}
+# exists. The installer creates them at install time too, but on a
+# Phase 8a-1 → 8a-3 in-place upgrade (no reinstall) this is the only
+# path that populates them.
+install -d -m 0755 "$BUILDROOT/usr/lib/tmpfiles.d"
+cat > "$BUILDROOT/usr/lib/tmpfiles.d/spatium-etc-overlay.conf" <<'EOF'
+# Phase 8a /etc overlay (issue #138). The overlay's upper + work
+# directories must exist before etc.mount fires. /var is on its own
+# partition (Phase 8a-1) so these survive slot swaps verbatim.
+d /var/persist           0755 root root - -
+d /var/persist/etc       0755 root root - -
+d /var/persist/etc-work  0755 root root - -
+EOF
 
 # ── Hardening (subset of APPLIANCE.md §7 — full pass in Phase 1.x) ────────────
 # SSH: root login disabled, password login allowed.
@@ -91,14 +160,26 @@ chmod 0755 "$BUILDROOT/usr/local/bin/spatium-install"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatium-live-banner"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatium-live-bootstrap"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-update"
+chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-slot-upgrade"
+chmod 0755 "$BUILDROOT/usr/local/bin/spatium-console"
+chmod 0755 "$BUILDROOT/usr/local/bin/spatium-etc-reconcile"
+chmod 0755 "$BUILDROOT/usr/local/bin/spatium-upgrade-slot"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-firstboot.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-install.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-live-banner.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-live-bootstrap.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-update.path"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-update.service"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-slot-upgrade.path"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-slot-upgrade.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-reboot.path"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-reboot.service"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-console.service"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-console@.service"
+chmod 0644 "$BUILDROOT/etc/systemd/system/etc.mount"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-etc-reconcile.service"
+chmod 0644 "$BUILDROOT/etc/systemd/system/home.mount"
+chmod 0644 "$BUILDROOT/etc/systemd/system/root.mount"
 
 # State directories owned by the spatiumddi-firstboot service.
 install -d -m 0755 "$BUILDROOT/etc/spatiumddi"

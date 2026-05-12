@@ -278,52 +278,74 @@ getent hosts registry-1.docker.io >/dev/null 2>&1 || {
     echo "      Check 'resolvectl status' and the wildcard DHCP networkd config."
 }
 
-if [ ! -f "$STAMP" ]; then
-    # Phase 4 dev-iteration support — if this ISO was built with
-    # ``bake-images.sh``, it ships locally-built image tarballs at
-    # /usr/local/share/spatiumddi/images/*.tar.zst. Load each one
-    # into the daemon BEFORE attempting any pull, so the operator's
-    # in-flight changes take precedence over whatever's pullable
-    # from ghcr.io. The marker file ``BAKED_AT`` is dropped by
-    # bake-images.sh; its presence is the signal "this ISO carries
-    # offline images". When present we skip docker-compose pull
-    # entirely (pulls of unpublished tags would 404 against ghcr).
-    IMAGES_DIR=/usr/local/share/spatiumddi/images
-    BAKED=0
-    if [ -f "$IMAGES_DIR/BAKED_AT" ]; then
-        echo "Loading pre-baked container images from $IMAGES_DIR (baked $(cat "$IMAGES_DIR/BAKED_AT"))..."
+# Phase 4 dev-iteration support — if this ISO was built with
+# ``bake-images.sh``, it ships locally-built image tarballs at
+# /usr/local/share/spatiumddi/images/*.tar.zst. Load each one
+# into the daemon BEFORE attempting any pull, so the operator's
+# in-flight changes take precedence over whatever's pullable
+# from ghcr.io. The marker file ``BAKED_AT`` is dropped by
+# bake-images.sh; its presence is the signal "this slot carries
+# offline images". When present we skip docker-compose pull
+# entirely (pulls of unpublished tags would 404 against ghcr).
+#
+# Slot-upgrade aware: each slot rootfs ships its own BAKED_AT
+# stamp. We persist the last-loaded BAKED_AT timestamp on the
+# shared /var partition; if the rootfs's BAKED_AT is newer, we
+# re-load the tarballs even on a non-first boot. This is what
+# makes ``spatium-upgrade-slot apply`` followed by a reboot
+# actually pick up the new container images — without it, the
+# previous slot's STAMP shorts out the load and docker-compose
+# happily reuses the stale images already on /var/lib/docker.
+IMAGES_DIR=/usr/local/share/spatiumddi/images
+BAKED_AT_FILE="$IMAGES_DIR/BAKED_AT"
+LOADED_AT_FILE=/var/lib/spatiumddi/images-loaded-at
+BAKED=0
+LOAD_REASON=""
+
+if [ -f "$BAKED_AT_FILE" ]; then
+    rootfs_baked_at=$(cat "$BAKED_AT_FILE")
+    loaded_baked_at=""
+    [ -f "$LOADED_AT_FILE" ] && loaded_baked_at=$(cat "$LOADED_AT_FILE")
+    if [ ! -f "$STAMP" ]; then
+        LOAD_REASON="first boot (baked $rootfs_baked_at)"
+    elif [ "$rootfs_baked_at" != "$loaded_baked_at" ]; then
+        LOAD_REASON="rootfs BAKED_AT changed (was $loaded_baked_at, now $rootfs_baked_at) — slot upgrade detected"
+    fi
+
+    if [ -n "$LOAD_REASON" ]; then
+        echo "Loading pre-baked container images from $IMAGES_DIR — $LOAD_REASON"
         for img in "$IMAGES_DIR"/*.tar.zst; do
             [ -f "$img" ] || continue
             echo "  → $(basename "$img")"
             zstd -dc "$img" | docker load
         done
+        echo "$rootfs_baked_at" > "$LOADED_AT_FILE"
         BAKED=1
     fi
+fi
 
-    if [ "$BAKED" = 1 ]; then
-        # Locally baked images are now in the daemon, named to match
-        # the compose ``image:`` refs (ghcr.io/spatiumddi/...:latest).
-        # docker-compose up will use them without a pull.
-        echo "Skipping docker-compose pull (locally-baked images installed)."
-    else
-        echo "Pulling SpatiumDDI image set (first boot)..."
-        # Retry pull on transient failures (slow image hosts, partial
-        # download). set -e at the script top would otherwise kill us
-        # on the first transient blip.
-        pull_ok=0
-        for i in 1 2 3; do
-            if docker-compose pull; then
-                pull_ok=1
-                break
-            fi
-            echo "Pull attempt $i failed; retrying in 10 s..."
-            sleep 10
-        done
-        [ "$pull_ok" = 1 ] || {
-            echo "ERROR: docker-compose pull failed 3 times. Check network + DNS."
-            exit 1
-        }
-    fi
+if [ ! -f "$STAMP" ] && [ "$BAKED" = 0 ]; then
+    # No locally-baked images present (clean ISO from ghcr.io
+    # release artefact) — first boot must pull.
+    echo "Pulling SpatiumDDI image set (first boot)..."
+    # Retry pull on transient failures (slow image hosts, partial
+    # download). set -e at the script top would otherwise kill us
+    # on the first transient blip.
+    pull_ok=0
+    for i in 1 2 3; do
+        if docker-compose pull; then
+            pull_ok=1
+            break
+        fi
+        echo "Pull attempt $i failed; retrying in 10 s..."
+        sleep 10
+    done
+    [ "$pull_ok" = 1 ] || {
+        echo "ERROR: docker-compose pull failed 3 times. Check network + DNS."
+        exit 1
+    }
+elif [ "$BAKED" = 1 ]; then
+    echo "Skipping docker-compose pull (locally-baked images installed)."
 fi
 
 echo "Bringing stack up..."
@@ -341,6 +363,50 @@ docker-compose up -d
 # itself retries forever against the remote control plane, so
 # "containers up" is the strongest signal we can give without a
 # round trip across the LAN.
+# Phase 8c — commit the active slot as the durable default after a
+# successful trial boot. spatium-upgrade-slot set-next-boot writes a
+# one-shot saved_entry to grubenv via grub-reboot; that's auto-cleared
+# on this boot. If THIS boot is healthy, we make the swap permanent
+# via grub-set-default. If anything fails before this point, the
+# previous slot's saved_entry stays in grubenv → next reboot reverts.
+commit_slot_if_healthy() {
+    local grub_boot_dir=/boot/efi
+    if [ ! -f "${grub_boot_dir}/grub/grubenv" ]; then
+        # Pre-Phase-8c install (grub.cfg on /boot/grub) — nothing to commit.
+        return 0
+    fi
+    # Which slot are we booted from? Read root= partition UUID from
+    # /proc/cmdline, look it up against partition labels.
+    local root_uuid="" current_slot=""
+    root_uuid=$(awk 'BEGIN{RS=" "} /^root=UUID=/{print substr($0,11)}' /proc/cmdline 2>/dev/null | head -1)
+    if [ -n "$root_uuid" ]; then
+        # blkid returns the device; lsblk gives us PARTLABEL.
+        local root_dev
+        root_dev=$(blkid -U "$root_uuid" 2>/dev/null)
+        if [ -n "$root_dev" ]; then
+            current_slot=$(lsblk -no PARTLABEL "$root_dev" 2>/dev/null | tr 'A-Z' 'a-z' | head -1)
+        fi
+    fi
+    case "$current_slot" in
+        root_a) current_slot=slot_a ;;
+        root_b) current_slot=slot_b ;;
+        *)      return 0 ;;
+    esac
+    # Read grubenv's current default. If it already matches us,
+    # nothing to do (we're the durable default — no in-flight upgrade).
+    local saved
+    saved=$(grub-editenv "${grub_boot_dir}/grub/grubenv" list 2>/dev/null \
+            | awk -F= '/^saved_entry=/{print $2}')
+    if [ "$saved" = "$current_slot" ]; then
+        echo "  slot $current_slot is already the durable default — nothing to commit."
+        return 0
+    fi
+    echo "  trial boot detected (booted=$current_slot, durable=${saved:-unset})."
+    echo "  /health/live passed — committing $current_slot as the new default."
+    grub-set-default --boot-directory="$grub_boot_dir" "$current_slot" \
+        >> "$LOG" 2>&1 || true
+}
+
 case "${APPLIANCE_ROLE:-control}" in
     control|control-only)
         echo "Waiting for control plane on http://127.0.0.1:8000/health/live …"
@@ -349,6 +415,7 @@ case "${APPLIANCE_ROLE:-control}" in
                 date -Iseconds > "$STAMP"
                 IP=$(ip -4 -o addr show scope global | awk '{print $4}' | cut -d/ -f1 | head -1)
                 echo "Ready: http://${IP:-<appliance-ip>}/"
+                commit_slot_if_healthy
                 exit 0
             fi
             sleep 5
@@ -372,6 +439,7 @@ case "${APPLIANCE_ROLE:-control}" in
                 echo "Ready: agent appliance up at http://${IP:-<appliance-ip>}/"
                 echo "       Agent registers against: ${CONTROL_PLANE_URL:-<not set>}"
                 echo "       Live state: docker logs spatiumddi-*-1"
+                commit_slot_if_healthy
                 exit 0
             fi
             sleep 5

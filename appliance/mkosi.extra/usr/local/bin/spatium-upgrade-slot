@@ -1,0 +1,469 @@
+#!/usr/bin/env python3
+"""Phase 8b — atomic A/B slot upgrade (issue #138).
+
+Operator CLI for writing a new image to the inactive A/B slot and
+flipping GRUB to boot it on next start. The grub-flip + boot-counting
++ auto-rollback half lives in Phase 8c; THIS tool handles the
+foundation: detect slots, fetch image, verify checksum, write to
+inactive slot.
+
+Subcommands:
+  status                 — Show current vs inactive slot + versions
+  apply <URL|FILE>       — Download (if URL) + verify + write to inactive
+                           slot. Does NOT reboot or flip default boot.
+  set-next-boot <slot>   — Mark slot A or B as the next-boot target
+                           (requires Phase 8c grub-flip — stubbed here)
+  rollback               — Set inactive slot as next boot (Phase 8c)
+
+The current slot is detected from /proc/cmdline's root=UUID=... by
+looking up the matching partition via blkid. Inactive slot is the
+OTHER 8304-typed partition on the same disk.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
+import os
+import re
+import shutil
+import subprocess
+import sys
+import urllib.request
+from pathlib import Path
+
+
+# Standard slot locations on a Phase 8a appliance install. These are
+# GPT partition names set by `sgdisk -c3:root_A -c4:root_B` in
+# spatium-install — distinct from the ext4 filesystem labels.
+SLOT_PARTLABELS = {"root_a", "root_b"}
+
+
+def run(cmd: list[str], check: bool = True, capture: bool = True) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        cmd,
+        check=check,
+        capture_output=capture,
+        text=True,
+    )
+
+
+def parse_cmdline_root_uuid() -> str | None:
+    """Pull the `root=UUID=...` value out of /proc/cmdline."""
+    try:
+        cmdline = Path("/proc/cmdline").read_text()
+    except OSError:
+        return None
+    m = re.search(r"root=UUID=([0-9a-fA-F-]+)", cmdline)
+    return m.group(1) if m else None
+
+
+def find_slot_partitions() -> list[dict[str, str]]:
+    """Enumerate the A/B slot partitions on the active disk.
+
+    Returns a list of dicts: {device, uuid, partlabel, fslabel}.
+    """
+    try:
+        out = run(["lsblk", "-J", "-o", "NAME,PATH,UUID,PARTLABEL,LABEL,PARTTYPE,FSTYPE"]).stdout
+    except subprocess.CalledProcessError:
+        return []
+    import json
+    data = json.loads(out)
+
+    slots: list[dict[str, str]] = []
+
+    def walk(node: dict) -> None:
+        partlabel = (node.get("partlabel") or "").lower()
+        if partlabel in SLOT_PARTLABELS:
+            slots.append({
+                "device": node.get("path") or "",
+                "uuid": node.get("uuid") or "",
+                "partlabel": partlabel,
+                "fslabel": node.get("label") or "",
+            })
+        for child in node.get("children") or []:
+            walk(child)
+
+    for top in data.get("blockdevices") or []:
+        walk(top)
+    return slots
+
+
+def detect_active_inactive() -> tuple[dict[str, str], dict[str, str]] | None:
+    slots = find_slot_partitions()
+    if len(slots) != 2:
+        return None
+    active_uuid = parse_cmdline_root_uuid()
+    if not active_uuid:
+        return None
+    active_uuid = active_uuid.lower()
+    active = next((s for s in slots if s["uuid"].lower() == active_uuid), None)
+    inactive = next((s for s in slots if s["uuid"].lower() != active_uuid), None)
+    if not active or not inactive:
+        return None
+    return active, inactive
+
+
+def slot_version_label(slot: dict[str, str]) -> str:
+    """Mount the slot read-only, read /etc/spatiumddi/appliance-release
+    + /usr/lib/etc.image/spatiumddi/appliance-release. Falls back to
+    "unknown" if neither file exists (empty/staging slot)."""
+    if not slot.get("fslabel"):
+        return "unknown"
+    # Quick probe — mount RO, read, unmount.
+    mountpoint = Path(f"/run/spatium-slot-probe-{slot['partlabel']}")
+    mountpoint.mkdir(parents=True, exist_ok=True)
+    try:
+        try:
+            run(["mount", "-o", "ro", slot["device"], str(mountpoint)])
+        except subprocess.CalledProcessError:
+            return "unreadable"
+        for rel in (
+            "etc/spatiumddi/appliance-release",
+            "usr/lib/etc.image/spatiumddi/appliance-release",
+        ):
+            p = mountpoint / rel
+            if p.exists():
+                for line in p.read_text().splitlines():
+                    if line.startswith("APPLIANCE_VERSION="):
+                        return line.split("=", 1)[1].strip().strip('"')
+        return "unstamped"
+    finally:
+        try:
+            run(["umount", str(mountpoint)], check=False)
+        except Exception:
+            # Best-effort cleanup — if umount fails the kernel will reap
+            # the mount on process exit; we don't want a failure here to
+            # mask the actual status return value from the try body.
+            pass
+        try:
+            mountpoint.rmdir()
+        except OSError:
+            # Same: cleanup-only. Leaving the empty tmpdir behind is
+            # cosmetic — it's under /tmp and tmpfs reclaims on reboot.
+            pass
+
+
+def cmd_status(_args) -> int:
+    pair = detect_active_inactive()
+    if not pair:
+        print("ERROR: couldn't detect A/B slots — is this an appliance install?",
+              file=sys.stderr)
+        return 2
+    active, inactive = pair
+    print(f"Active slot:    {active['partlabel']:8}  {active['device']:14}  version={slot_version_label(active)}")
+    print(f"Inactive slot:  {inactive['partlabel']:8}  {inactive['device']:14}  version={slot_version_label(inactive)}")
+    return 0
+
+
+def fetch_to(src: str, dst: Path) -> None:
+    """Stream-copy from URL or local file path into dst."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if src.startswith(("http://", "https://")):
+        print(f"  fetching {src}")
+        with urllib.request.urlopen(src) as r, open(dst, "wb") as f:
+            shutil.copyfileobj(r, f, length=1024 * 1024)
+    else:
+        srcpath = Path(src)
+        if not srcpath.exists():
+            raise FileNotFoundError(f"image source not found: {src}")
+        print(f"  copying {srcpath}")
+        shutil.copy2(srcpath, dst)
+
+
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8 * 1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def cmd_apply(args) -> int:
+    if os.geteuid() != 0:
+        print("ERROR: must run as root (writes to a block device)", file=sys.stderr)
+        return 2
+
+    pair = detect_active_inactive()
+    if not pair:
+        print("ERROR: couldn't detect A/B slots", file=sys.stderr)
+        return 2
+    active, inactive = pair
+    target_dev = inactive["device"]
+    print(f"Writing image into INACTIVE slot {inactive['partlabel']} ({target_dev})")
+    print(f"(Active slot stays untouched: {active['partlabel']} {active['device']})")
+
+    workdir = Path("/var/lib/spatiumddi/slot-staging")
+    workdir.mkdir(parents=True, exist_ok=True)
+    staged = workdir / "slot.raw.xz"
+
+    # Fetch.
+    fetch_to(args.image, staged)
+
+    # Verify SHA256 if a sidecar checksum file is present (URL only).
+    if args.checksum:
+        sha_path = workdir / "slot.sha256"
+        fetch_to(args.checksum, sha_path)
+        expected = sha_path.read_text().strip().split()[0]
+        actual = sha256_file(staged)
+        if expected.lower() != actual.lower():
+            print(f"ERROR: checksum mismatch (expected {expected}, got {actual})",
+                  file=sys.stderr)
+            return 3
+        print(f"  checksum OK: {actual}")
+
+    # Decompress + dd directly into the inactive partition. xz can
+    # stream-decompress so we don't need disk space for an intermediate
+    # uncompressed file.
+    print(f"  writing → {target_dev}")
+    xz = subprocess.Popen(["xz", "--decompress", "--stdout", str(staged)],
+                          stdout=subprocess.PIPE)
+    subprocess.run(["dd", f"of={target_dev}", "bs=4M", "conv=fsync",
+                     "status=progress"],
+                    stdin=xz.stdout, check=True)
+    xz.wait()
+    if xz.returncode != 0:
+        print("ERROR: xz exited non-zero", file=sys.stderr)
+        return 4
+
+    print("  flushing kernel buffers + re-reading filesystem metadata…")
+    subprocess.run(["partprobe", "/dev/" + os.path.basename(target_dev).rstrip("0123456789p")],
+                   check=False)
+    subprocess.run(["udevadm", "settle"], check=False)
+    staged.unlink(missing_ok=True)
+
+    # The dd overwrote the partition with the slot image's ext4
+    # filesystem, which has its OWN UUID (mkfs at slot-image build
+    # time). The partition's GPT name (PARTLABEL=root_b) is preserved
+    # because it lives in the GPT header, not in the filesystem.
+    # grub.cfg's slot_b menuentry still references the OLD fs UUID
+    # though — re-stamp it now so set-next-boot + reboot works.
+    new_uuid = _blkid_uuid(target_dev)
+    if new_uuid:
+        _patch_grub_cfg_slot_uuid(inactive["partlabel"], new_uuid)
+        # Refresh our cached view so set-next-boot reflects the new UUID.
+        inactive["uuid"] = new_uuid
+
+    print()
+    print("✓ Image written to inactive slot.")
+    print()
+    print(f"  Active (current boot):  {active['partlabel']} {active['device']}")
+    print(f"  Inactive (just wrote):  {inactive['partlabel']} {target_dev}")
+    if new_uuid:
+        print(f"  New filesystem UUID:    {new_uuid} (patched into grub.cfg)")
+    print()
+    print("Next steps:")
+    print(f"  spatium-upgrade-slot set-next-boot")
+    print("  reboot")
+    return 0
+
+
+def _blkid_uuid(device: str) -> str | None:
+    """Return the filesystem UUID of the given block device, or None
+    if blkid fails (uninitialised filesystem, missing tool, etc.)."""
+    try:
+        proc = subprocess.run(
+            ["blkid", "-s", "UUID", "-o", "value", device],
+            capture_output=True, text=True, check=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return None
+    uuid = proc.stdout.strip()
+    return uuid or None
+
+
+_UUID_RE = re.compile(
+    r'[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}'
+)
+
+
+def _patch_grub_cfg_slot_uuid(partlabel: str, new_uuid: str,
+                              cfg_path: str = "/boot/efi/grub/grub.cfg") -> None:
+    """Rewrite the slot_<x> menuentry's UUID references to new_uuid.
+
+    Finds the `menuentry ... --id=slot_<x> { ... }` block in grub.cfg
+    and replaces every UUID inside the block body (covers both the
+    `search --fs-uuid <UUID>` and the `root=UUID=<UUID>` reference)
+    with the just-applied filesystem UUID.
+
+    Idempotent: re-stamps even when grub.cfg already has the right
+    value (cheap no-op rewrite of the same content). Safe when
+    grub.cfg is missing — silently skips.
+    """
+    if not new_uuid:
+        return
+    try:
+        cfg = Path(cfg_path).read_text()
+    except OSError as exc:
+        print(f"WARN: couldn't read {cfg_path}: {exc} — grub.cfg not updated",
+              file=sys.stderr)
+        return
+    slot_id = "slot_" + partlabel[-1].lower()  # root_a → slot_a, root_b → slot_b
+    block_re = re.compile(
+        r'(menuentry [^\n]*--id=' + re.escape(slot_id) + r'[^\n]*\{)(.*?)(\n\})',
+        re.DOTALL,
+    )
+
+    patched_count = 0
+
+    def replace_block(match: re.Match[str]) -> str:
+        nonlocal patched_count
+        head, body, tail = match.groups()
+        new_body, n = _UUID_RE.subn(new_uuid, body)
+        patched_count += n
+        return head + new_body + tail
+
+    new_cfg = block_re.sub(replace_block, cfg, count=1)
+    if patched_count == 0:
+        print(f"WARN: couldn't locate {slot_id} menuentry in {cfg_path}; "
+              "grub.cfg not updated", file=sys.stderr)
+        return
+    if new_cfg == cfg:
+        # Already had the right UUID — nothing to do.
+        return
+    print(f"  patching grub.cfg: {slot_id} UUID → {new_uuid} "
+          f"({patched_count} reference{'s' if patched_count != 1 else ''})")
+    try:
+        Path(cfg_path).write_text(new_cfg)
+    except OSError as exc:
+        print(f"WARN: couldn't write {cfg_path}: {exc}", file=sys.stderr)
+
+
+GRUB_BOOT_DIR = "/boot/efi"   # Phase 8c — grub.cfg + grubenv live on ESP
+GRUBENV = Path("/boot/efi/grub/grubenv")
+
+
+def _read_grubenv_default() -> str:
+    """Return current saved_entry from grubenv (e.g. 'slot_a'). Falls
+    back to 'slot_a' if grubenv is missing or unparseable."""
+    if not GRUBENV.exists():
+        return "slot_a"
+    try:
+        proc = subprocess.run(
+            ["grub-editenv", str(GRUBENV), "list"],
+            capture_output=True, text=True, check=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return "slot_a"
+    for line in proc.stdout.splitlines():
+        if line.startswith("saved_entry="):
+            return line.split("=", 1)[1].strip()
+    return "slot_a"
+
+
+def cmd_set_next_boot(args) -> int:
+    """Set the inactive slot as the next boot's default — ONE SHOT.
+
+    Uses `grub-reboot` which sets saved_entry to the target for the
+    next boot only; after that boot, grub auto-reverts to the previous
+    saved_entry. The safety net: if the new slot fails to boot (kernel
+    panic, /health/live timeout, etc.) the system falls back to the
+    last-good slot automatically — no operator intervention needed.
+
+    spatiumddi-firstboot.service is responsible for COMMITTING the
+    new slot via `grub-set-default` once /health/live confirms the
+    upgraded slot is healthy. Without that commit, even a successful
+    boot reverts to the previous slot on next reboot.
+    """
+    if os.geteuid() != 0:
+        print("ERROR: must run as root (writes to grubenv)", file=sys.stderr)
+        return 2
+
+    pair = detect_active_inactive()
+    if not pair:
+        print("ERROR: couldn't detect A/B slots", file=sys.stderr)
+        return 2
+    active, inactive = pair
+
+    target = args.slot or inactive["partlabel"]
+    target = target.lower()
+    if target not in ("slot_a", "root_a", "a"):
+        if target not in ("slot_b", "root_b", "b"):
+            print(f"ERROR: unknown slot '{args.slot}', expected root_a/slot_a/A or root_b/slot_b/B",
+                  file=sys.stderr)
+            return 2
+        target = "slot_b"
+    else:
+        target = "slot_a"
+
+    print(f"Setting next-boot to {target} (one-shot — will auto-revert if boot fails)")
+    try:
+        subprocess.run(
+            ["grub-reboot", "--boot-directory=" + GRUB_BOOT_DIR, target],
+            check=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError) as exc:
+        print(f"ERROR: grub-reboot failed: {exc}", file=sys.stderr)
+        return 3
+    current = _read_grubenv_default()
+    print(f"  grubenv saved_entry now = {current} (next boot only)")
+    print()
+    print(f"Active slot stays {active['partlabel']} until you `reboot`.")
+    print(f"On reboot you'll boot into {target}; if /health/live passes,")
+    print(f"spatiumddi-firstboot will commit it as the new default. If not,")
+    print(f"the next reboot after that falls back to {active['partlabel']}.")
+    return 0
+
+
+def cmd_rollback(_args) -> int:
+    """Flip the persistent default to the inactive slot — durable.
+
+    Different from set-next-boot: this commits the swap (grub-set-default)
+    so every future boot uses the new slot until another rollback or
+    upgrade. Use this when you want to permanently revert to a known-
+    good previous slot, not just try it once.
+    """
+    if os.geteuid() != 0:
+        print("ERROR: must run as root (writes to grubenv)", file=sys.stderr)
+        return 2
+
+    pair = detect_active_inactive()
+    if not pair:
+        print("ERROR: couldn't detect A/B slots", file=sys.stderr)
+        return 2
+    active, inactive = pair
+    target = "slot_a" if inactive["partlabel"] == "root_a" else "slot_b"
+    print(f"Committing rollback: default boot → {target} ({inactive['device']})")
+    try:
+        subprocess.run(
+            ["grub-set-default", "--boot-directory=" + GRUB_BOOT_DIR, target],
+            check=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError) as exc:
+        print(f"ERROR: grub-set-default failed: {exc}", file=sys.stderr)
+        return 3
+    print(f"  grubenv saved_entry = {_read_grubenv_default()}")
+    print()
+    print(f"Run `reboot` when ready to switch.")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("status", help="show active + inactive slot details")
+
+    apply_p = sub.add_parser("apply", help="write a slot image to the inactive slot")
+    apply_p.add_argument("image", help="URL or local file path to a slot .raw.xz image")
+    apply_p.add_argument("--checksum", help="URL or path to a SHA-256 sidecar file")
+
+    nxt = sub.add_parser("set-next-boot",
+                         help="set the next boot to a slot ONCE (grub-reboot — auto-reverts on failure)")
+    nxt.add_argument("slot", nargs="?", default=None,
+                     help="slot_a / slot_b / a / b — defaults to the inactive slot")
+
+    sub.add_parser("rollback",
+                   help="durably set the inactive slot as default (grub-set-default — commits the swap)")
+
+    args = parser.parse_args()
+    return {
+        "status": cmd_status,
+        "apply": cmd_apply,
+        "set-next-boot": cmd_set_next_boot,
+        "rollback": cmd_rollback,
+    }[args.cmd](args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,33 @@
+[Unit]
+Description=overlay /etc (Phase 8a A/B atomic upgrade — issue #138)
+Documentation=https://github.com/spatiumddi/spatiumddi/issues/138
+DefaultDependencies=no
+# Must mount before any service that reads /etc as configured by the
+# operator. local-fs.target is the standard hand-off point — it waits
+# for non-API filesystems to be ready, and most service units order
+# After=local-fs.target.
+#
+# Conflicts with umount.target ensures the mount unit shuts down
+# cleanly on reboot/poweroff.
+After=local-fs-pre.target var.mount
+Before=local-fs.target
+Conflicts=umount.target
+Before=umount.target
+# Reconcile runs after this mount so it sees the merged view.
+RequiredBy=spatium-etc-reconcile.service
+
+[Mount]
+What=overlay
+Where=/etc
+Type=overlay
+# lower = /usr/lib/etc.image: image-shipped /etc baseline, captured
+#         by the installer (cp -a /etc /usr/lib/etc.image) and shipped
+#         in each slot's read-only root.
+# upper = /var/persist/etc: operator + firstboot writes go here.
+# work  = /var/persist/etc-work: overlay scratch (must be on the same
+#         filesystem as upper; /var partition).
+Options=lowerdir=/usr/lib/etc.image,upperdir=/var/persist/etc,workdir=/var/persist/etc-work
+TimeoutSec=10s
+
+[Install]
+WantedBy=local-fs.target

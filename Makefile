@@ -189,6 +189,25 @@ appliance-iso:
 	echo "  Burn to USB:  sudo dd if=$$iso of=/dev/sdX bs=4M conv=fsync"; \
 	echo "  Or attach as CD-ROM in your hypervisor."
 
+# Phase 8b-1 — build a slot image (.raw.xz of just the rootfs) suitable
+# for sysupdate / spatium-upgrade-slot to write to an inactive A/B
+# partition. Requires `make appliance` to have run first (consumes the
+# raw output). Output: spatiumddi-appliance-slot-<version>.raw.xz +
+# .sha256 next to the existing artifacts in $(APPLIANCE_OUT).
+appliance-slot-image:
+	@raw=$$(ls $(APPLIANCE_OUT)/spatiumddi-appliance*.raw 2>/dev/null | head -1); \
+	if [ -z "$$raw" ]; then \
+	  echo "✗ no raw image found in $(APPLIANCE_OUT) — run 'make appliance' first."; \
+	  exit 1; \
+	fi; \
+	echo "→ Building slot image from $$raw …"; \
+	docker run --rm --privileged \
+	    --entrypoint /work/scripts/build-slot-image.sh \
+	    -v $(PWD)/$(APPLIANCE_DIR):/work \
+	    $(APPLIANCE_BUILDER) \
+	    "/work/build/$$(basename $$raw)" \
+	    "/work/build"
+
 appliance-clean:
 	@if [ -d $(APPLIANCE_OUT) ]; then \
 	  echo "Removing $(APPLIANCE_OUT) (may need sudo — mkosi outputs are root-owned)"; \

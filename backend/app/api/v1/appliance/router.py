@@ -25,6 +25,7 @@ from pydantic import BaseModel
 from app.api.v1.appliance.containers import router as containers_router
 from app.api.v1.appliance.diagnostics import router as diagnostics_router
 from app.api.v1.appliance.releases import router as releases_router
+from app.api.v1.appliance.slot import router as slot_router
 from app.api.v1.appliance.system import router as system_router
 from app.api.v1.appliance.tls import router as tls_router
 from app.config import settings
@@ -37,6 +38,7 @@ router = APIRouter()
 # the URL stays /api/v1/appliance/<surface>/...
 router.include_router(tls_router, prefix="/tls")
 router.include_router(releases_router, prefix="/releases")
+router.include_router(slot_router, prefix="/slot-upgrade")
 router.include_router(containers_router, prefix="/containers")
 router.include_router(diagnostics_router, prefix="/diagnostics")
 router.include_router(system_router, prefix="/system")

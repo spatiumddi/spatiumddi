@@ -22,6 +22,235 @@ the formatter handles the rest.
 
 ## Unreleased
 
+## 2026.05.12-1 — 2026-05-12
+
+Two appliance pillars land back-to-back. **Phase 4h** rewrites the
+appliance's `tty1` from a plain Debian getty into a Talos-style
+refresh-on-tick console dashboard: rich + psutil, per-role identity
+header, real-time vitals, compose-service health rollup, journalctl
+live-log pane, and an F-key strip across the bottom — F1 Login,
+F12 Shell, F5 Reboot / F6 Shutdown gated behind an arrow-key
+confirm modal because destructive ops shouldn't fire on a careless
+Enter. **Phase 8 atomic A/B image upgrades** (\#138) ships the
+complete dual-slot upgrade story end-to-end: the installer now
+carves five partitions (BIOS boot + ESP + root_A + root_B + var)
+with `/etc` rendered through an overlayfs so operator state on
+`/var/persist/etc` survives a slot swap, the release pipeline
+attaches a 4 GiB slot `.raw.xz` to every cut release at a stable
+`/latest/` URL, the `/appliance` UI grows an OS Image card with
+**Apply to inactive slot** + live `slot-upgrade.log` tail, and
+boot counting + health-gated commit via grub `next_entry` makes
+the swap auto-revert if `/health/live` doesn't come up on the new
+slot. Operators can now upgrade the appliance with a single click
+that's safe to undo.
+
+### Added
+
+- **Phase 4h Talos-style console dashboard.** Replaces
+  `getty@tty1` with a new `spatium-console` Python script (rich +
+  psutil) that paints a refresh-on-tick dashboard. Same renderer
+  on the serial console via a `spatium-console@.service` template
+  unit. Header is per-role identity (control AIO / control-only /
+  dns-agent-bind9 / dns-agent-powerdns / dhcp-agent) plus vitals
+  (load, mem, swap, uptime) plus root + var disk usage, split by
+  a horizontal rule with a real-time spinner + wall clock in the
+  top-right (spinner ticks at 2 Hz via the 0.25 s render loop;
+  vitals cached at 1 s, `docker ps` + env at 2 s). Services pane
+  shows compose service health verdicts (missing / healthy /
+  running / completed / unhealthy / exited) with the `migrate`
+  one-shot renderable as ✓ when it exits 0. Live-log pane tails
+  `journalctl`. Footer is a borderless F-key strip — F1 Login /
+  F2 Monitor / F3 Containers / F4 Network / F5 Reboot /
+  F6 Shutdown / F9 Diag / F12 Shell — bold black on bright blue
+  chips for high-contrast readability on the Linux console.
+- **Arrow-key confirm modal** for destructive console ops.
+  F5 (reboot) and F6 (shutdown) open an arrow-key navigable
+  modal (← → / Tab / Y / N shortcuts, Enter confirms, Esc
+  cancels; default selection is "No" because reboot/shutdown
+  shouldn't fire on a careless Enter). The KeyReader thread
+  joins on stop() so the modal doesn't race with the dashboard's
+  input loop. F1 hands off to agetty via execvp; F12 shells out
+  to `su -l admin`.
+- **Active partition slot displayed in the console dashboard.**
+  The vitals header on `spatium-console` now reads the active
+  slot from `/proc/cmdline` + grubenv (saved_entry +
+  next_entry) so operators glancing at the appliance TTY can
+  immediately see which slot they're on, the durable default,
+  and a "trial boot" amber chip if the durable default doesn't
+  match the running slot yet. Closes the visibility gap left
+  by Phase 8c — without this, you had to ssh in and run
+  `spatium-upgrade-slot status` to know which side was active.
+- **Phase 8a — A/B + var partition layout.** Installer carves
+  five partitions:
+  - p1 BIOS Boot 1 MiB ef02
+  - p2 ESP 512 MiB ef00 (`/boot/efi`, FAT32 with relaxed
+    `fmask=0133,dmask=0022` so the api container can read
+    grubenv through the bind mount)
+  - p3 root_A 4 GiB 8304 (active slot at install time)
+  - p4 root_B 4 GiB 8304 (inactive slot — staged by
+    `spatium-upgrade-slot apply`)
+  - p5 var balance 8300 (persistent across slot swaps; carries
+    `/var/lib/docker`, `/var/persist/etc`, `/var/home`,
+    `/var/root`, operator state)
+  Hard floor: 16 GiB target disk. Smaller disks fail with a
+  whiptail "Disk too small" modal *before* any destructive
+  operation.
+- **Phase 8a — `/etc` overlayfs.** Each slot ships an image-
+  baseline `/etc` snapshot at `/usr/lib/etc.image/` (taken
+  after fstab + hostname write so the snapshot is bootable).
+  At every boot, a new `etc.mount` systemd unit mounts an
+  overlayfs over `/etc` with lower=`/usr/lib/etc.image`,
+  upper=`/var/persist/etc`, work=`/var/persist/etc-work`. All
+  operator edits — useradd, chpasswd, fstab, hostname, network
+  config, ssh host keys — land in the `/var/persist/etc` upper
+  and therefore survive a slot swap unchanged. New
+  `spatium-etc-reconcile` runs at every boot to merge system
+  uid/gid/shadow entries from lower → upper so a new slot
+  baseline can introduce new system users without clobbering
+  the operator's.
+- **Phase 8b — slot-image build + `spatium-upgrade-slot` CLI.**
+  `make appliance-slot-image` extracts the root partition from
+  the freshly-built appliance raw, repacks it as a 4 GiB ext4
+  `spatiumddi-appliance-slot-amd64.raw.xz` with the kernel +
+  initrd baked in + the image-baseline fstab + a snapshotted
+  `/usr/lib/etc.image/`. Operator CLI `spatium-upgrade-slot`
+  has four subcommands: `status` (per-slot dev + UUID +
+  version), `apply <url-or-path> [--checksum]` (streams +
+  decompresses to the *inactive* partition via dd, optionally
+  verifies SHA-256, re-stamps the slot UUID into the boot
+  config — the active slot is never touched), `set-next-boot`
+  (one-shot grub-reboot — auto-reverts on next boot if the new
+  slot fails to come up), `commit` (durable grub-set-default;
+  intended for emergencies — the firstboot service does this
+  automatically when `/health/live` passes).
+- **Phase 8b-3 — A/B slot upgrade in the /appliance UI.**
+  Adds an "Appliance OS Image (atomic A/B upgrade)" card to
+  the Releases tab. Shows active slot / durable default /
+  inactive target as a three-column grid + a trial-boot amber
+  warning when the running slot doesn't match the durable
+  default. Operator pastes (or accepts the pre-filled
+  `https://github.com/spatiumddi/spatiumddi/releases/latest/`
+  URL for) a slot image + optional sha256 sidecar; pressing
+  Apply writes a trigger file the host-side
+  `spatiumddi-slot-upgrade.path` unit watches, the runner
+  invokes `spatium-upgrade-slot apply` + `set-next-boot`, and
+  the UI tails `/var/log/spatiumddi/slot-upgrade.log` until
+  the host-side state file flips to `done` or `failed`. Active
+  slot stays untouched until reboot.
+- **Phase 8b-4 — slot `.raw.xz` attached to every GitHub
+  release.** The release workflow now adds two artefacts per
+  cut: `spatiumddi-appliance-slot-amd64.raw.xz` + its
+  `.sha256` sidecar. SlotUpgradeCard pre-fills the
+  `releases/latest/download/` URL so a fresh-install
+  operator's "Apply" click against an unmodified field just
+  works. Older releases stay reachable by replacing `latest`
+  with the version tag.
+- **Phase 8c — A/B boot counting + health-gated commit.**
+  Adds grub `next_entry` one-shot wiring + a
+  `spatiumddi-firstboot` commit step that runs
+  `grub-set-default <current_slot>` only after
+  `/health/live` returns 200. If the new slot kernel-panics,
+  initramfs fails, the API stack never comes healthy, or any
+  earlier step in firstboot exits non-zero, the next reboot
+  reverts to the prior `saved_entry` automatically. Net:
+  a bad image can't soft-brick the appliance — the worst case
+  is one wasted reboot back to the previous slot.
+
+### Changed
+
+- **Right-size A/B slots — 4 GiB each, 16 GiB disk floor.**
+  Earlier Phase 8a draft sized slot_A + slot_B at 8 GiB each
+  (24 GiB hard floor) for headroom. Real-world container image
+  sizes plus the image-baseline `/etc` snapshot land well
+  under 4 GiB, and the goal of the appliance is to be easy to
+  drop into a homelab VM with a 16 GiB disk. Net: install
+  fits comfortably under a 16 GiB target now, with a clear
+  message on smaller disks rather than a partition-table
+  surprise.
+- **Image-baseline fstab strips operator UUIDs.** Phase 8a-7.
+  Earlier draft baked the install-time partition UUIDs into
+  `/etc/fstab` on each slot, which broke when a slot image
+  cut on machine A was applied on machine B (different UUIDs).
+  Switched to `LABEL=var` and `LABEL=ESP` so any host that
+  carries the same partition labels boots either slot
+  unchanged. The labels are pinned by `mkfs.ext4 -L var` and
+  `mkfs.fat -n ESP` at install time.
+- **ESP mount masks** — `fmask=0133,dmask=0022` on `/boot/efi`
+  so the api container (uid 1000) can read grubenv via the
+  read-only bind mount that drives SlotUpgradeCard. No
+  secrets live on the ESP (just grub.cfg + grubenv + the
+  boot loader binaries) so world-readable is fine.
+- **Settings → Security section sorts alphabetically.**
+  Account Lockout, Agent bootstrap keys, Audit Event
+  Forwarding, Password Policy, Session & Security — the
+  order was previously "by-when-it-shipped", which buried
+  agent bootstrap at the bottom even though most operators
+  on a fresh appliance install need it first.
+
+### Fixed
+
+- **firstboot reloads baked images on slot upgrade (\#138).**
+  Phase 4's `bake-images.sh` drops `BAKED_AT` + image tarballs
+  into each slot's rootfs so `spatiumddi-firstboot` loads
+  operator WIP code without a ghcr.io pull. The load was
+  gated on the absence of `/var/lib/spatiumddi/firstboot.done`
+  — and that stamp lives on the *shared* `/var` partition, so
+  after a slot upgrade the new slot's load was silently
+  skipped and docker-compose re-used the previously-cached
+  images from `/var/lib/docker`. Now tracked through a
+  separate `/var/lib/spatiumddi/images-loaded-at` sidecar; if
+  the rootfs's `BAKED_AT` differs from the persisted
+  loaded-at, the new tarballs are loaded even on a non-first
+  boot.
+- **Install wizard writes fstab + hostname BEFORE the overlay
+  snapshot** so the baseline `/etc` captured into
+  `/usr/lib/etc.image/` is actually bootable. Earlier draft
+  snapshotted *after* the overlay mounted, so the snapshot's
+  fstab pointed at `/dev/sdaN` UUIDs the rsync had not yet
+  set, and slot_B booted with the overlay's live-config
+  `overlay / overlay rw 0 0` line — `/var` never mounted,
+  `etc.mount` couldn't fire.
+- **`/home` + `/root` are now `/var/home` + `/var/root` bind
+  mounts.** Slot-swap-safe: operator-created users + the
+  root account's history / ssh keys / .gnupg all survive a
+  slot upgrade because they live on the persistent `/var`,
+  not on the slot rootfs. New `home.mount` + `root.mount`
+  systemd units, image-shipped (not fstab).
+- **Kernel cmdline `rw` instead of `ro`** since the
+  image-baseline fstab has no `/` entry. Without this,
+  systemd couldn't remount root rw on a non-overlay-managed
+  rootfs.
+- **slot-image's `/etc/fstab` rewritten by build-slot-image**
+  so a freshly-cut slot ships with the same image-baseline
+  fstab the installer writes (mkosi otherwise leaves the
+  live-config overlay line, which won't boot once dd'd onto
+  a partition).
+- **slot-image's `/boot/` kernel + initrd reinstall** inside
+  the chroot during `build-slot-image.sh`. mkosi strips
+  `/boot/` from its output to keep the image lean; without
+  this, dd'ing the resulting raw to a slot partition gave
+  grub a working menuentry but a missing vmlinuz on boot.
+- **grub.cfg slot UUID re-stamp after dd.** When operator A's
+  slot raw.xz is applied to operator B's machine, the slot's
+  ext4 filesystem keeps its baked-in UUID and the grub
+  menuentry needs to be rewritten to match. `spatium-upgrade-
+  slot apply` now reads the live UUID of the freshly-written
+  slot via `blkid` and runs an in-place regex replace of the
+  slot's UUID line in `/boot/efi/grub/grub.cfg`. Idempotent
+  — re-runs with an unchanged UUID are a no-op.
+- **`make appliance-slot-image` runs inside the builder
+  container.** Earlier draft tried to run the slot-extract +
+  ext4-mkfs + xz-compress directly on the host, which broke
+  on hosts that didn't have e2fsprogs / xz / qemu-img. Now
+  the same builder container that produces the raw also
+  produces the slot, so the host only needs Docker.
+### Migrations
+
+- None. Phase 8 is appliance-only — touches the installer +
+  the host-side `spatium-*` CLIs + grub config + a new
+  `spatiumddi-slot-upgrade.path` unit. The control-plane
+  database is untouched.
+
 ## 2026.05.11-1 — 2026-05-11
 
 Largest release of the project so far — five big feature pillars

@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+"""Phase 8a-4 — reconcile system accounts after image slot swap.
+
+After an A/B slot swap (Phase 8b), the new slot ships its own
+`/usr/lib/etc.image` baseline. If image v2 added a daemon (e.g.
+`_prometheus`, uid 990), that uid is in the new baseline's passwd
+but NOT in the operator's `/var/persist/etc/passwd` upper layer.
+Overlay's upper-hides-lower semantics would mask the new entry,
+and the prometheus service would fail with "getpwuid: no such user".
+
+This oneshot runs before multi-user.target on every boot. For each of
+the 6 account files, it appends entries with uid < 1000 from the
+image's baseline (lower) into the operator's upper if they're missing.
+
+- passwd / group / gshadow: append missing system entries.
+- shadow: for any new passwd entry, write a locked shadow row.
+- subuid / subgid: append missing system mappings.
+
+We touch UPPER directly via /var/persist/etc/. The overlay would
+copy-up on a write to /etc/passwd from a process, but we want a
+purely additive merge with no in-line semantics — so write directly.
+
+Idempotent: re-runs are no-ops once the entries already exist.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+import sys
+from pathlib import Path
+
+LOWER = Path("/usr/lib/etc.image")
+UPPER = Path("/var/persist/etc")
+
+# System uid/gid range. Debian convention: 0-999 reserved for system
+# users; >= 1000 for regular accounts that the operator manages.
+SYSTEM_UID_MAX = 999
+
+
+def merge_accounts(lower: Path, upper: Path, id_field: int, max_id: int) -> int:
+    """Append entries in lower not present in upper, where the int
+    field at index `id_field` is <= max_id. Match on the username
+    (first colon-separated field). Returns count of appended rows.
+    """
+    if not lower.exists():
+        return 0
+    if not upper.exists():
+        # Upper missing entirely — copy lower in full. Happens on a
+        # fresh appliance where /var/persist/etc hasn't been populated.
+        upper.parent.mkdir(parents=True, exist_ok=True)
+        upper.write_bytes(lower.read_bytes())
+        return 0
+
+    upper_names: set[str] = set()
+    for line in upper.read_text().splitlines():
+        if line.strip() and not line.startswith("#"):
+            upper_names.add(line.split(":", 1)[0])
+
+    appended: list[str] = []
+    for line in lower.read_text().splitlines():
+        if not line.strip() or line.startswith("#"):
+            continue
+        parts = line.split(":")
+        name = parts[0]
+        if name in upper_names:
+            continue
+        try:
+            uid_or_gid = int(parts[id_field])
+        except (ValueError, IndexError):
+            continue
+        if uid_or_gid > max_id:
+            continue
+        appended.append(line)
+
+    if not appended:
+        return 0
+
+    with upper.open("a") as f:
+        if upper.stat().st_size > 0 and not upper.read_text().endswith("\n"):
+            f.write("\n")
+        for line in appended:
+            f.write(line + "\n")
+    return len(appended)
+
+
+def ensure_shadow_rows(passwd_path: Path, shadow_path: Path) -> int:
+    """For every passwd entry without a corresponding shadow row,
+    append a locked shadow entry (`!*` password — disabled login).
+
+    Without this, useradd / pam_unix surface "user not found in
+    shadow database" errors for system accounts the merge just added.
+    """
+    if not passwd_path.exists() or not shadow_path.exists():
+        return 0
+    shadow_names: set[str] = set()
+    for line in shadow_path.read_text().splitlines():
+        if line.strip() and not line.startswith("#"):
+            shadow_names.add(line.split(":", 1)[0])
+    appended: list[str] = []
+    for line in passwd_path.read_text().splitlines():
+        if not line.strip() or line.startswith("#"):
+            continue
+        name = line.split(":", 1)[0]
+        if name in shadow_names:
+            continue
+        # Locked password ("!*"), last-change=1 (epoch+1d so chage is
+        # happy), no expiry. Same shape Debian's adduser uses for
+        # system accounts.
+        appended.append(f"{name}:!*:1:0:99999:7:::")
+    if not appended:
+        return 0
+    with shadow_path.open("a") as f:
+        if shadow_path.stat().st_size > 0 and not shadow_path.read_text().endswith("\n"):
+            f.write("\n")
+        for line in appended:
+            f.write(line + "\n")
+    os.chmod(shadow_path, 0o640)
+    return len(appended)
+
+
+def main() -> int:
+    logging.basicConfig(
+        format="spatium-etc-reconcile: %(message)s",
+        level=logging.INFO,
+        stream=sys.stderr,
+    )
+
+    if not LOWER.is_dir():
+        logging.info("no /usr/lib/etc.image — overlay not in use yet, skipping")
+        return 0
+    if not UPPER.is_dir():
+        logging.info("no /var/persist/etc — first boot or overlay disabled, skipping")
+        return 0
+
+    summary: dict[str, int] = {}
+
+    # passwd / shadow / group / gshadow share format: ID at field [2].
+    # subuid / subgid: ID at field [1] (uid:subuid_start:count). Same
+    # merge rule applies — only system mappings (uid < 1000).
+    for fname, id_field in [
+        ("passwd",   2),
+        ("group",    2),
+        ("gshadow",  2),
+        ("subuid",   1),
+        ("subgid",   1),
+    ]:
+        appended = merge_accounts(LOWER / fname, UPPER / fname, id_field, SYSTEM_UID_MAX)
+        if appended:
+            summary[fname] = appended
+
+    shadow_added = ensure_shadow_rows(UPPER / "passwd", UPPER / "shadow")
+    if shadow_added:
+        summary["shadow"] = shadow_added
+
+    if summary:
+        parts = [f"{k}=+{v}" for k, v in summary.items()]
+        logging.info("merged system accounts: %s", " ".join(parts))
+    else:
+        logging.info("no changes (overlay already matches image baseline)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

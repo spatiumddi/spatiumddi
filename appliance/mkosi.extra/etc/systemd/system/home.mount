@@ -1,0 +1,21 @@
+[Unit]
+Description=/home (bind from /var/home — Phase 8a slot-safe binding, issue #138)
+Documentation=https://github.com/spatiumddi/spatiumddi/issues/138
+DefaultDependencies=no
+# Must run AFTER /var is mounted (where /var/home lives) and BEFORE
+# local-fs.target completes (which gates many other services).
+# /var auto-mounts via systemd-gpt-auto-generator (Linux /var GPT
+# type 4d21b016-b534-45c2-a9fb-5c16e091fd2d, set by spatium-install).
+After=var.mount
+Before=local-fs.target umount.target
+Conflicts=umount.target
+
+[Mount]
+What=/var/home
+Where=/home
+Type=none
+Options=bind
+TimeoutSec=10s
+
+[Install]
+WantedBy=local-fs.target

@@ -6862,6 +6862,36 @@ export const applianceReleasesApi = {
       .then((r) => r.data),
 };
 
+// ── Appliance: A/B slot upgrade (Phase 8b-3, issue #138) ──────────
+export type ApplianceSlot = "slot_a" | "slot_b";
+export type ApplianceSlotUpgradeState =
+  | "idle"
+  | "in-flight"
+  | "done"
+  | "failed";
+
+export interface ApplianceSlotStatus {
+  appliance_mode: boolean;
+  current_slot: ApplianceSlot | null;
+  durable_default: ApplianceSlot | null;
+  is_trial_boot: boolean;
+  upgrade_state: ApplianceSlotUpgradeState;
+  upgrade_state_at: string | null;
+  log_tail: string;
+}
+
+export const applianceSlotApi = {
+  status: () =>
+    api.get<ApplianceSlotStatus>("/appliance/slot-upgrade").then((r) => r.data),
+  apply: (image_url: string, checksum_url?: string | null) =>
+    api
+      .post<{ scheduled: string }>("/appliance/slot-upgrade/apply", {
+        image_url,
+        checksum_url: checksum_url || null,
+      })
+      .then((r) => r.data),
+};
+
 // ── Appliance: container management (Phase 4d) ─────────────────────
 export interface ApplianceContainer {
   name: string;

@@ -1,0 +1,63 @@
+[Unit]
+Description=SpatiumDDI appliance console dashboard (tty1)
+Documentation=https://github.com/spatiumddi/spatiumddi/issues/134
+# Skip on installer/live ISO modes — those have their own tty1 units
+# (spatium-install.service / spatium-live-banner.service). Operators
+# can also force-disable with `spatium-console=off` on the kernel
+# cmdline for debugging.
+ConditionKernelCommandLine=!spatium-mode=install
+ConditionKernelCommandLine=!spatium-mode=live
+ConditionKernelCommandLine=!spatium-console=off
+# Start as early as possible — operators want a visible console
+# during boot, NOT a black screen until firstboot finishes pulling
+# images (which can take ~4 min on first power-on while multi-user
+# .target waits on spatiumddi-firstboot.service to complete).
+#
+# Same After= set getty@.service uses: user-sessions + getty-pre. We
+# deliberately do NOT wait for multi-user.target / docker.service —
+# the dashboard renders "not running" rows correctly when docker
+# isn't up yet, and operators see progress (live log of firstboot)
+# in the meantime.
+After=systemd-user-sessions.service getty-pre.target
+Before=getty.target
+Conflicts=getty@tty1.service
+
+[Service]
+# `idle` defers ExecStart until pending jobs settle — same trick
+# getty@tty1 uses so we don't fight kernel boot output for the TTY.
+Type=idle
+# Belt + braces: if some earlier unit started getty@tty1, stop it
+# before we claim the TTY. Mirrors spatium-live-banner.service's
+# pattern. Leading `-` keeps the unit healthy if getty isn't running.
+ExecStartPre=-/usr/bin/systemctl stop getty@tty1.service
+# Switch to a compact 8x8 font BEFORE python starts so rich's
+# Console picks up the bigger terminal size on its first probe.
+# Lat15-VGA8 is the Debian default tiny font shipped by console-setup.
+# Without KMS (legacy text mode) this still works — VGA hardware
+# supports a separate text mode at 80x50 when an 8x8 font is loaded.
+# With KMS (full kernel) we additionally get higher-density rendering
+# at the hypervisor's advertised resolution. Falls back silently if
+# the font file isn't present.
+ExecStartPre=-/usr/bin/setfont -C /dev/tty1 Lat15-VGA16
+ExecStart=/usr/local/bin/spatium-console --tty /dev/tty1
+StandardInput=tty
+StandardOutput=tty
+StandardError=journal
+TTYPath=/dev/tty1
+TTYReset=yes
+TTYVHangup=yes
+TTYVTDisallocate=yes
+# Restart whenever the script exits — on F1 the dashboard exec's
+# agetty which itself exits when the operator logs out, and we want
+# the dashboard back on the next tty1 switch.
+Restart=always
+RestartSec=2
+UtmpIdentifier=spc1
+UtmpMode=user
+# Same nicety getty@.service applies — keep us out of the OOM killer
+# so the operator's only console doesn't disappear under memory
+# pressure.
+OOMScoreAdjust=-100
+
+[Install]
+WantedBy=multi-user.target

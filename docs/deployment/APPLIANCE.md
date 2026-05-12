@@ -236,15 +236,117 @@ After completion, the appliance reboots into normal operation.
 
 ## 5. Appliance Update Mechanism
 
-Updates are delivered as:
-- **Full image**: download new ISO/qcow2, redeploy (for VMs — simplest, stateless OS)
-- **In-place update**: `spatiumddi-update` CLI tool that:
-  1. Downloads new application packages/containers
-  2. Runs database migrations
-  3. Restarts services with zero downtime (rolling restart)
-  4. Rolls back automatically on health check failure
+Two update paths land in 2026.05.12-1, addressing different
+operator workflows:
 
-Update channel configuration:
+### 5a. Container-stack release recycle (Phase 4c)
+
+For incremental SpatiumDDI releases that don't change the host
+OS. The `/appliance` Releases card lists recent GitHub releases;
+operator clicks Apply, the api container writes a trigger file
+the host-side `spatiumddi-release-update.path` unit watches, the
+runner runs `docker-compose pull && docker-compose up -d` and
+records progress in `/var/log/spatiumddi/release-update.log`.
+The api container can recreate itself cleanly because the host
+process owns the docker-compose command. No host reboot needed.
+
+### 5b. Phase 8 atomic A/B image upgrades (slot upgrade)
+
+For upgrades that change the host OS (kernel, systemd units,
+host packages, partition layout). Phase 8 (issue #138) ships a
+dual-slot architecture: every install carves two equal-sized
+root partitions (`root_A` + `root_B`) plus a shared `/var`;
+the appliance always boots one slot while the other sits idle.
+Apply a new slot image, reboot, `/health/live` confirms, grub
+auto-commits the swap — or auto-reverts on next reboot if the
+new slot didn't come up.
+
+**Partition layout (2026.05.12-1):**
+
+```
+p1 BIOS Boot    1 MiB    ef02
+p2 ESP        512 MiB    ef00   /boot/efi (FAT32, fmask=0133,dmask=0022)
+p3 root_A       4 GiB    8304   active slot (this install)
+p4 root_B       4 GiB    8304   inactive slot (staged by slot-upgrade)
+p5 var         balance   8300   shared across slots (/var/lib/docker,
+                                /var/persist/etc, /var/home, /var/root)
+```
+
+Hard floor: 16 GiB target disk.
+
+**/etc overlayfs:** each slot ships an image-baseline `/etc`
+at `/usr/lib/etc.image/`. At boot, a systemd `etc.mount` unit
+mounts an overlay over `/etc` (lower=image-baseline,
+upper=`/var/persist/etc`). All operator edits — fstab, network
+config, ssh host keys, user accounts — land in the upper on the
+persistent `/var` partition, so they survive a slot swap
+verbatim. A `spatium-etc-reconcile` boot step merges system uid
+/gid/shadow entries from lower → upper so new system users
+introduced by an upgrade don't clobber operator-created ones.
+
+**Slot upgrade flow:**
+
+1. Operator opens the **OS Image** card in `/appliance` →
+   Releases. The image-URL field is pre-filled with
+   `https://github.com/spatiumddi/spatiumddi/releases/latest/
+   download/spatiumddi-appliance-slot-amd64.raw.xz` so a
+   first-time operator just clicks Apply.
+2. The api container writes a trigger file the host-side
+   `spatiumddi-slot-upgrade.path` unit watches.
+3. The runner (`/usr/local/bin/spatiumddi-slot-upgrade`)
+   invokes `spatium-upgrade-slot apply <url>`:
+   - Streams + decompresses the `.raw.xz` to the inactive
+     partition via dd.
+   - Verifies SHA-256 against the sidecar.
+   - Re-stamps the slot filesystem UUID into `/boot/efi/grub/
+     grub.cfg` (since the slot raw.xz carries its own UUID
+     baked at build time, the menuentry has to be patched).
+   - The active slot is never touched.
+4. `spatium-upgrade-slot set-next-boot` writes
+   `next_entry=slot_b` (one-shot) via grub-reboot.
+5. Operator reboots. Grub honours `next_entry`, clears it,
+   and falls back to `saved_entry` (the durable default) if
+   anything in steps 6-8 fails before they finish.
+6. New slot boots. `spatiumddi-firstboot.service` waits for
+   `/health/live` to return 200.
+7. On health-OK: `grub-set-default <new_slot>` commits the
+   swap durably. The next reboot stays on the new slot.
+8. On health-fail (kernel panic, initramfs failure, api stack
+   broken): no commit happens. Next reboot reverts to the
+   previous `saved_entry` automatically. Worst case is one
+   wasted reboot.
+
+**CLI access (for emergency / scripted upgrades):**
+
+```bash
+# Inspect both slots
+spatium-upgrade-slot status
+
+# Apply (URL or local file path)
+sudo spatium-upgrade-slot apply \
+    https://github.com/.../spatiumddi-appliance-slot-amd64.raw.xz \
+    --checksum https://.../spatiumddi-appliance-slot-amd64.sha256
+
+# Arm one-shot next-boot
+sudo spatium-upgrade-slot set-next-boot
+
+# Reboot — the swap is automatic
+sudo reboot
+
+# Emergency: durably commit without waiting for firstboot
+sudo spatium-upgrade-slot commit slot_b
+```
+
+**Build-time slot image:** `make appliance-slot-image`
+extracts the root partition from the freshly-built appliance
+raw, repacks it as a 4 GiB ext4 `spatiumddi-appliance-slot-
+amd64.raw.xz` with the kernel + initrd baked in + the image-
+baseline fstab + a snapshotted `/usr/lib/etc.image/`. Every
+GitHub release attaches the slot image + its SHA-256 sidecar
+at versioned + `/latest/` URLs.
+
+### Future: update channels (Phase 8d, pending)
+
 ```
 UpdateConfig
   channel: enum(stable, beta, nightly)

@@ -12,6 +12,7 @@ import {
 
 import { applianceReleasesApi, type ApplianceRelease } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
+import { SlotUpgradeCard } from "./SlotUpgradeCard";
 
 /**
  * Phase 4c — Release management.
@@ -147,6 +148,11 @@ export function ReleasesTab() {
           error={apply.isError ? (apply.error as Error).message : null}
         />
       )}
+
+      {/* Phase 8b-3 — OS image slot upgrade. Renders only on the
+          appliance (the card itself short-circuits when
+          appliance_mode is false from /api/v1/appliance/slot-upgrade). */}
+      <SlotUpgradeCard />
     </div>
   );
 }

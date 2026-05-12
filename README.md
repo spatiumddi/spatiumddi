@@ -46,6 +46,7 @@
 
 ## Contents
 
+- [Why I built this](#why-i-built-this) — the story
 - [Why SpatiumDDI](#why-spatiumddi) — the elevator pitch
 - [What's in the box](#whats-in-the-box) — quick capability tour
 - [Full feature detail](#full-feature-detail) — deep dive on every subsystem
@@ -59,6 +60,14 @@
 - [License](#license)
 
 ---
+
+## Why I built this
+
+I'm a network engineer. I've spent years working with enterprise DDI platforms, and while they're solid pieces of software, the licensing puts them out of reach for smaller teams, homelabs, and folks who just want to learn how this stuff fits together.
+
+The open source world has excellent standalone tools — NetBox for IPAM, BIND9 and PowerDNS for DNS, Kea for DHCP — but nothing that pulls them into a single control plane the way the commercial platforms do. So I started building one on nights and weekends.
+
+If SpatiumDDI ends up being useful to you, that's the whole point. If you want to file an issue, send a PR, or just tell me what's broken, I'd genuinely appreciate it.
 
 ## Why SpatiumDDI
 
@@ -748,6 +757,8 @@ The appliance ships with a dedicated management hub in the sidebar covering ever
 
 - **Web UI Certificate** — replace the self-signed cert: paste a PEM cert + key, generate a CSR (key stays on the server) and import the signed cert, or upload a Let's Encrypt cert. Activating a cert hot-reloads nginx.
 - **Releases** — list recent GitHub releases, one-click upgrade — the host-side path-unit recycles the stack so the api can recreate itself cleanly.
+- **OS Image (atomic A/B upgrade)** — Phase 8 (issue [#138](https://github.com/spatiumddi/spatiumddi/issues/138)). The installer carves two equal-sized root partitions (`root_A` + `root_B`); the appliance always boots one slot while the other sits idle. Apply a new `spatiumddi-appliance-slot-amd64.raw.xz` from the GitHub release artefacts (pre-filled URL in the card) — it writes to the *inactive* slot via dd while the active slot is untouched, arms grub `next_entry` as one-shot, and on the next reboot `/health/live` confirms before grub-set-default commits the swap. Bad image? Reboot reverts automatically. Operator state on `/var/persist/etc`, `/var/home`, `/var/root`, and the entire Docker image cache lives on a third persistent `/var` partition that's shared across slots, so a slot swap can't lose user data.
+- **Talos-style console dashboard** — Phase 4h. `tty1` and the serial console paint a refresh-on-tick rich + psutil dashboard: per-role identity, vitals (load / mem / swap / uptime / disk), compose service health rollup, journalctl live-log pane, and an F-key strip across the bottom (F1 Login / F12 Shell / F5 Reboot / F6 Shutdown). Active partition slot + durable default + trial-boot chip render in the header so the operator knows which slot they're on at a glance.
 - **Containers** — list every container, start/stop/restart, live-stream logs over SSE.
 - **Logs & Diagnostics** — host log viewer (firstboot, update log), self-test runner (DNS / container health / API / DHCP / DNS daemon checks), one-click diagnostic bundle download (secrets redacted).
 - **Network & Host** — read-only hostname / host IPs / uptime / reboot-pending banner.

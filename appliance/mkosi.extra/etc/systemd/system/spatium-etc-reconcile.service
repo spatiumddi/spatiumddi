@@ -1,0 +1,23 @@
+[Unit]
+Description=Reconcile /etc overlay system accounts after image swap (Phase 8a)
+Documentation=https://github.com/spatiumddi/spatiumddi/issues/138
+DefaultDependencies=no
+# Must run AFTER etc.mount so we see the merged-view paths, and BEFORE
+# any service that needs to resolve a uid/gid against /etc/passwd
+# (which is basically everything — sysinit.target is the right gate).
+After=etc.mount local-fs.target
+Before=sysinit.target
+# Only meaningful when the etc overlay actually mounted.
+ConditionPathIsMountPoint=/etc
+ConditionPathExists=/usr/lib/etc.image
+ConditionPathExists=/var/persist/etc
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/spatium-etc-reconcile
+RemainAfterExit=yes
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=sysinit.target

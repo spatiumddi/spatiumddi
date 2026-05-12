@@ -299,24 +299,69 @@ jobs:
             "$BUILDER" \
             "/work/build/$(basename "$RAW")" \
             "/work/build/$(basename "$ISO_INTERIM")"
-          # Rename so the published artifact carries the CalVer tag —
-          # mkosi's filename uses the ``ImageVersion=`` from mkosi.conf
-          # (currently ``0.1.0``), which is internal scheme, not the
-          # operator-visible release identity.
-          FINAL="appliance/build/spatiumddi-appliance-${VERSION}.iso"
-          mv "$ISO_INTERIM" "$FINAL"
-          ls -lh "$FINAL"
-          echo "iso_path=$FINAL" >> "$GITHUB_OUTPUT"
+          # Two copies attached per release:
+          #   - Versioned (archive trail of every release ever cut)
+          #   - Stable filename (un-versioned, so the README can link to
+          #     https://.../releases/latest/download/spatiumddi-appliance-amd64.iso
+          #     and that URL always 302s to the current release's ISO)
+          # mkosi's own ImageVersion in mkosi.conf is ``0.1.0`` (internal
+          # scheme); we rename to operator-visible CalVer here.
+          VERSIONED="appliance/build/spatiumddi-appliance-${VERSION}.iso"
+          STABLE="appliance/build/spatiumddi-appliance-amd64.iso"
+          mv "$ISO_INTERIM" "$VERSIONED"
+          cp "$VERSIONED" "$STABLE"
+          ls -lh "$VERSIONED" "$STABLE"
+          echo "iso_path=$VERSIONED" >> "$GITHUB_OUTPUT"
           echo "iso_name=spatiumddi-appliance-${VERSION}.iso" >> "$GITHUB_OUTPUT"
-      - name: Upload ISO as workflow artifact
+      # Phase 8b-4 — build the slot upgrade image alongside the ISO so
+      # operators can apply atomic OS upgrades from the /appliance UI
+      # without manually building images locally. Same docker invocation
+      # the local Makefile uses, just inlined for CI.
+      - name: Build slot-upgrade image (.raw.xz + sha256)
+        id: slot
+        run: |
+          set -euo pipefail
+          BUILDER=${{ env.IMAGE_PREFIX }}/appliance-builder:latest
+          VERSION="${{ needs.meta.outputs.version }}"
+          RAW=$(ls appliance/build/spatiumddi-appliance*.raw | head -1)
+          [ -f "$RAW" ] || { echo "✗ no raw image found"; exit 1; }
+          chmod +x appliance/scripts/build-slot-image.sh
+          docker run --rm --privileged \
+            --entrypoint /work/scripts/build-slot-image.sh \
+            -v "$PWD/appliance:/work" \
+            "$BUILDER" \
+            "/work/build/$(basename "$RAW")" \
+            "/work/build"
+          # build-slot-image.sh writes spatiumddi-appliance-slot-<mkosi-
+          # ImageVersion>.{raw.xz,sha256}. Rename to operator-visible
+          # names: versioned (archive) + stable (latest-link target).
+          SRC_XZ=$(ls appliance/build/spatiumddi-appliance-slot-*.raw.xz | head -1)
+          [ -f "$SRC_XZ" ] || { echo "✗ no slot .raw.xz built"; exit 1; }
+          VERSIONED_XZ="appliance/build/spatiumddi-appliance-slot-${VERSION}-amd64.raw.xz"
+          STABLE_XZ="appliance/build/spatiumddi-appliance-slot-amd64.raw.xz"
+          VERSIONED_SHA="appliance/build/spatiumddi-appliance-slot-${VERSION}-amd64.sha256"
+          STABLE_SHA="appliance/build/spatiumddi-appliance-slot-amd64.sha256"
+          mv "$SRC_XZ" "$VERSIONED_XZ"
+          cp "$VERSIONED_XZ" "$STABLE_XZ"
+          # Regenerate sha files so the hash inside them references the
+          # correct (renamed) filename — important for `sha256sum -c`.
+          ( cd appliance/build && sha256sum "$(basename "$VERSIONED_XZ")" > "$(basename "$VERSIONED_SHA")" )
+          ( cd appliance/build && sha256sum "$(basename "$STABLE_XZ")" > "$(basename "$STABLE_SHA")" )
+          ls -lh "$VERSIONED_XZ" "$STABLE_XZ" "$VERSIONED_SHA" "$STABLE_SHA"
+          echo "slot_name=spatiumddi-appliance-slot-${VERSION}-amd64.raw.xz" >> "$GITHUB_OUTPUT"
+      - name: Upload appliance artifacts (ISO + slot image)
         uses: actions/upload-artifact@v4
         with:
-          name: appliance-iso
-          path: appliance/build/spatiumddi-appliance-*.iso
+          name: appliance-artifacts
+          path: |
+            appliance/build/spatiumddi-appliance-*.iso
+            appliance/build/spatiumddi-appliance-slot-*.raw.xz
+            appliance/build/spatiumddi-appliance-slot-*.sha256
           retention-days: 7
           if-no-files-found: error
     outputs:
       iso_name: ${{ steps.wrap.outputs.iso_name }}
+      slot_name: ${{ steps.slot.outputs.slot_name }}
 
   # ── Create GitHub Release ──────────────────────────────────────────────────
   release:
@@ -421,10 +466,10 @@ jobs:
             echo "PREV_TAG=$PREV_TAG" >> "$GITHUB_ENV"
           fi
 
-      - name: Download appliance ISO artifact
+      - name: Download appliance artifacts (ISO + slot image)
         uses: actions/download-artifact@v4
         with:
-          name: appliance-iso
+          name: appliance-artifacts
           path: dist/
 
       - uses: softprops/action-gh-release@v2
@@ -432,6 +477,8 @@ jobs:
           name: "SpatiumDDI ${{ needs.meta.outputs.version }}"
           files: |
             dist/spatiumddi-appliance-*.iso
+            dist/spatiumddi-appliance-slot-*.raw.xz
+            dist/spatiumddi-appliance-slot-*.sha256
           body: |
             ## What's Changed
 
@@ -446,6 +493,31 @@ jobs:
             [docs/deployment/APPLIANCE.md](https://github.com/${{ github.repository }}/blob/${{ needs.meta.outputs.version }}/docs/deployment/APPLIANCE.md)
             for the install walkthrough. The ISO is the **slim** variant —
             no images baked in; first boot pulls every service from ghcr.io.
+
+            **Stable URL** (always points at the latest release):
+
+            ```
+            https://github.com/${{ github.repository }}/releases/latest/download/spatiumddi-appliance-amd64.iso
+            ```
+
+            ## OS Appliance Slot Upgrade Image
+
+            For Phase 8 atomic A/B upgrades on the installed appliance.
+            Paste this URL into the OS Image card on ``/appliance``'s
+            Releases tab, or run on the appliance:
+
+            ```
+            spatium-upgrade-slot apply \
+              https://github.com/${{ github.repository }}/releases/latest/download/spatiumddi-appliance-slot-amd64.raw.xz \
+              --checksum https://github.com/${{ github.repository }}/releases/latest/download/spatiumddi-appliance-slot-amd64.sha256
+            ```
+
+            Writes the image into the inactive A/B slot, arms grub to
+            try it on next boot, auto-rolls back if `/health/live`
+            doesn't come up healthy. Active slot is never touched
+            during apply. Versioned filename
+            (``${{ needs.build-appliance-iso.outputs.slot_name }}``)
+            attached too for archival.
 
             ## Docker Images
 
