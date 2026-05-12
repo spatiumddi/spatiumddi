@@ -59,15 +59,16 @@ def detect_deployment_kind() -> str:
         return "docker"
     try:
         cgroup = Path("/proc/1/cgroup").read_text(encoding="utf-8", errors="replace")
-        if "docker" in cgroup or "containerd" in cgroup:
-            return "docker"
     except OSError:
         # /proc/1/cgroup is optional fallback for runtimes that don't
         # drop /.dockerenv (podman / rootless). When the read fails
         # (cgroups v1 / v2 layout mismatch, namespaced /proc that
-        # hides PID 1) we just fall through to "unknown" — the
-        # Fleet UI handles that case explicitly.
-        pass
+        # hides PID 1) treat it as "unknown" — the Fleet UI renders
+        # those rows with a Manual upgrade modal instead of an
+        # Upgrade button.
+        return "unknown"
+    if "docker" in cgroup or "containerd" in cgroup:
+        return "docker"
     return "unknown"
 
 
@@ -112,7 +113,11 @@ def _current_slot_from_cmdline() -> str | None:
             check=True,
             timeout=3,
         )
-    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+    except (
+        FileNotFoundError,
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+    ):
         return None
     for line in proc.stdout.splitlines():
         parts = line.strip().split()
@@ -167,9 +172,7 @@ def _last_upgrade_state_from_sidecar() -> tuple[str | None, datetime | None]:
     return state, stamp
 
 
-_TRIGGER_FILE = Path(
-    "/var/lib/spatiumddi-host/release-state/slot-upgrade-pending"
-)
+_TRIGGER_FILE = Path("/var/lib/spatiumddi-host/release-state/slot-upgrade-pending")
 
 
 def maybe_fire_fleet_upgrade(
@@ -244,7 +247,9 @@ def collect() -> dict[str, object]:
 
     return {
         "deployment_kind": deployment_kind,
-        "installed_appliance_version": read_installed_version() if is_appliance else None,
+        "installed_appliance_version": (
+            read_installed_version() if is_appliance else None
+        ),
         "current_slot": current_slot,
         "durable_default": durable_default,
         "is_trial_boot": is_trial_boot,
