@@ -335,7 +335,31 @@ sudo reboot
 
 # Emergency: durably commit without waiting for firstboot
 sudo spatium-upgrade-slot commit slot_b
+
+# Refresh /var/lib/spatiumddi/release-state/slot-versions.json
+# (called automatically by spatiumddi-firstboot at every boot + at
+# the end of every apply; only invoke directly when debugging the
+# OS Image card's per-slot version display).
+sudo spatium-upgrade-slot sync-versions
 ```
+
+**Per-slot version visibility (since 2026.05.12-3).** The OS Image
+card shows the installed `APPLIANCE_VERSION` under each slot label
+and the GRUB boot menu labels carry the version too. Source of
+truth is `/var/lib/spatiumddi/release-state/slot-versions.json`,
+a `{"slot_a": "<ver>", "slot_b": "<ver>"}` map that
+`spatium-upgrade-slot sync-versions` maintains. Active slot reads
+its own `/etc/spatiumddi/appliance-release` directly; inactive
+slot is probed via a quick read-only mount + read of the same
+file. The sidecar refreshes at every boot (`spatiumddi-firstboot`
+calls `sync-versions`) and at the end of every successful apply
+(`spatium-upgrade-slot apply` also calls it). The grub.cfg
+menuentry label is rewritten by `spatium-upgrade-slot apply` via
+the `_patch_grub_cfg_slot_label` helper — idempotent across both
+the original `(slot A)` form and the already-stamped
+`<ver> (slot A)` form. `spatium-install` writes the initial
+labels with the install-time `APPLIANCE_VERSION` so both slots
+get a consistent stamp at first boot.
 
 **Build-time slot image:** `make appliance-slot-image`
 extracts the root partition from the freshly-built appliance
