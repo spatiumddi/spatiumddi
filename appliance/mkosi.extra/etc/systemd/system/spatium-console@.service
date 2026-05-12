@@ -1,0 +1,44 @@
+[Unit]
+Description=SpatiumDDI appliance console dashboard (%I)
+Documentation=https://github.com/spatiumddi/spatiumddi/issues/134
+# Same gates as spatium-console.service. The serial console matters
+# most for headless installs (Proxmox `serial0`, IPMI SoL, RPi UART,
+# cloud VM consoles) — operators on those paths benefit from the
+# dashboard more than VGA users do.
+ConditionKernelCommandLine=!spatium-mode=install
+ConditionKernelCommandLine=!spatium-mode=live
+ConditionKernelCommandLine=!spatium-console=off
+ConditionPathExists=/dev/%I
+# Same early-start motivation as spatium-console.service — operators
+# on serial consoles (Proxmox serial0, IPMI SoL) most want the
+# dashboard during boot, when they can't yet ssh in.
+After=systemd-user-sessions.service getty-pre.target
+Before=getty.target
+# Replace the serial-getty systemd-getty-generator auto-spawns from
+# the kernel cmdline `console=ttyS0,115200n8`. Same Conflicts pattern
+# as the tty1 unit.
+Conflicts=serial-getty@%i.service
+
+[Service]
+Type=idle
+ExecStartPre=-/usr/bin/systemctl stop serial-getty@%i.service
+# Serial consoles already drive arbitrary character grids (the
+# software terminal on the host picks the size), so setfont is a
+# no-op here — left in for symmetry with the tty1 unit.
+ExecStartPre=-/usr/bin/setfont -C /dev/%I Lat15-VGA16
+ExecStart=/usr/local/bin/spatium-console --tty /dev/%I
+StandardInput=tty
+StandardOutput=tty
+StandardError=journal
+TTYPath=/dev/%I
+TTYReset=yes
+TTYVHangup=yes
+Restart=always
+RestartSec=2
+UtmpIdentifier=%I
+UtmpMode=user
+OOMScoreAdjust=-100
+# Common serial-console env. systemd-getty-generator passes baud via
+# the template arg; we drive agetty with --keep-baud on the F1
+# handoff so whatever the kernel set up stays.
+Environment=TERM=vt220

@@ -1,0 +1,1065 @@
+#!/usr/bin/env python3
+# Phase 4h appliance console dashboard (issue #134). Replaces
+# getty@tty1 on the installed appliance with a Talos-style
+# auto-refreshing view: header / per-role services pane /
+# live journalctl tail / F-key footer.
+#
+# Service: /etc/systemd/system/spatium-console.service (tty1) plus
+# the spatium-console@.service template for serial consoles.
+# F1 hands off to agetty for traditional login. F12 prompts the
+# admin password and exec's `su -l admin` for a shell. F5 / F6
+# reboot / poweroff with a confirm modal. F2 / F3 / F4 / F9 are
+# stubs in v1 (status bar message).
+#
+# Role-awareness reads APPLIANCE_ROLE from /etc/spatiumddi/.env —
+# the same value spatiumddi-firstboot writes after the installer
+# wizard picked a role (control / control-only / dns-agent-bind9 /
+# dns-agent-powerdns / dhcp-agent). Each role gets a different
+# Services pane.
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import select
+import signal
+import subprocess
+import sys
+import termios
+import threading
+import time
+import tty
+from collections import deque
+from datetime import datetime
+from pathlib import Path
+from typing import Iterable
+
+import psutil
+from rich.align import Align
+from rich.box import SQUARE
+from rich.console import Console, Group
+from rich.layout import Layout
+from rich.live import Live
+from rich.panel import Panel
+from rich.rule import Rule
+from rich.table import Table
+from rich.text import Text
+
+
+ENV_FILE = Path("/etc/spatiumddi/.env")
+COMPOSE_FILE = Path("/usr/local/share/spatiumddi/docker-compose.yml")
+FIRSTBOOT_LOG = Path("/var/log/spatiumddi/firstboot.log")
+FIRSTBOOT_STAMP = Path("/var/lib/spatiumddi/firstboot.done")
+APPLIANCE_RELEASE = Path("/etc/spatiumddi/appliance-release")
+
+
+ROLE_LABELS = {
+    "control": "Control plane + BIND9 + Kea (all-in-one)",
+    "control-only": "Control plane only",
+    "dns-agent-bind9": "DNS agent (BIND9)",
+    "dns-agent-powerdns": "DNS agent (PowerDNS)",
+    "dhcp-agent": "DHCP agent (Kea)",
+}
+
+# Container service names we render per role. Names match the
+# docker-compose service-name; spatiumddi-firstboot's COMPOSE_PROFILES
+# already decides which subset actually runs, but we render the full
+# expected set so a missing-from-`docker ps` service shows up as
+# `(not running)` instead of being silently absent.
+ROLE_SERVICES = {
+    "control": [
+        "postgres", "redis", "migrate", "api", "worker", "beat",
+        "frontend", "dns-bind9", "dhcp-kea",
+    ],
+    "control-only": [
+        "postgres", "redis", "migrate", "api", "worker", "beat", "frontend",
+    ],
+    "dns-agent-bind9": ["dns-bind9", "agent-landing"],
+    "dns-agent-powerdns": ["dns-powerdns", "agent-landing"],
+    "dhcp-agent": ["dhcp-kea", "agent-landing"],
+}
+
+# journalctl units the live-log pane tails. Same set on every role —
+# operators want to see firstboot / release manager output regardless
+# of which containers ran. docker.service catches everything else
+# (every container's stdout/stderr is shipped to docker → journald).
+JOURNAL_UNITS = [
+    "docker.service",
+    "spatiumddi-firstboot.service",
+    "spatiumddi-update.service",
+    "spatiumddi-reboot.service",
+    "spatium-console.service",
+]
+
+REFRESH_INTERVAL = 0.25  # seconds — render tick (drives spinner animation)
+VITALS_EVERY = 1.0       # seconds — CPU / RAM / Load / clock / disk poll
+DATA_REFRESH_EVERY = 2.0 # seconds — docker / env poll cadence
+SPINNER_CHARS = "|/-\\"
+
+
+# ── env / role detection ──────────────────────────────────────────────
+
+
+def read_env(path: Path = ENV_FILE) -> dict[str, str]:
+    if not path.exists():
+        return {}
+    out: dict[str, str] = {}
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        out[k.strip()] = v.strip()
+    return out
+
+
+def role_from_env(env: dict[str, str]) -> str:
+    raw = (env.get("APPLIANCE_ROLE") or "control").strip()
+    return raw if raw in ROLE_LABELS else "control"
+
+
+def role_label(role: str) -> str:
+    return ROLE_LABELS.get(role, role)
+
+
+# ── docker / system state ─────────────────────────────────────────────
+
+
+_STATUS_HEALTH_RE = re.compile(r"\(([^)]+)\)")
+
+
+def docker_ps() -> list[dict]:
+    """Run `docker ps --format` and parse one JSON object per line.
+
+    Returns [] on any failure (daemon down, docker binary missing,
+    parse error). The renderer surfaces this as "(not running)" rows
+    so the dashboard stays usable even when docker is fully broken.
+    """
+    try:
+        proc = subprocess.run(
+            ["docker", "ps", "--all", "--format", "{{json .}}"],
+            capture_output=True, text=True, timeout=3,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return []
+    if proc.returncode != 0:
+        return []
+    rows: list[dict] = []
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rows.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return rows
+
+
+def container_service_name(row: dict) -> str:
+    """Pull the docker-compose service name out of a ps row.
+
+    Compose names containers `<project>-<service>-<replica>`; project
+    is `spatiumddi` on the appliance compose. Falls back to the bare
+    Names field if the prefix doesn't match.
+    """
+    names = (row.get("Names") or "").split(",")[0].strip().lstrip("/")
+    if names.startswith("spatiumddi-"):
+        rest = names[len("spatiumddi-"):]
+        # strip trailing -1 / -2 replica numbers
+        if "-" in rest:
+            last = rest.rsplit("-", 1)[1]
+            if last.isdigit():
+                return rest.rsplit("-", 1)[0]
+        return rest
+    return names
+
+
+def health_from_status(status: str) -> str:
+    """Extract the docker healthcheck verdict from a ps Status string.
+
+    Status looks like "Up 2 hours (healthy)" / "Up 4 seconds (health:
+    starting)" / "Up 2 hours" (no healthcheck) / "Exited (1) 5m ago".
+    Returns "healthy" / "unhealthy" / "starting" / "running" / "exited"
+    / "created" / "restarting" — the last four when no healthcheck is
+    declared and we just have the state.
+    """
+    if not status:
+        return "unknown"
+    m = _STATUS_HEALTH_RE.search(status)
+    if m:
+        h = m.group(1).lower()
+        if "healthy" in h and "unhealthy" not in h:
+            return "healthy"
+        if "unhealthy" in h:
+            return "unhealthy"
+        if "starting" in h:
+            return "starting"
+    s = status.lower()
+    if s.startswith("up"):
+        return "running"
+    if s.startswith("exit"):
+        return "exited"
+    if s.startswith("restart"):
+        return "restarting"
+    if s.startswith("created"):
+        return "created"
+    return "unknown"
+
+
+def host_ips() -> list[str]:
+    out: list[str] = []
+    for name, addrs in psutil.net_if_addrs().items():
+        if name == "lo" or name.startswith("docker") or name.startswith("br-") \
+                or name.startswith("veth") or name.startswith("virbr"):
+            continue
+        for addr in addrs:
+            fam = getattr(addr, "family", None)
+            value = addr.address
+            if not value:
+                continue
+            # Strip the IPv6 scope-id suffix on link-local addresses.
+            v = value.split("%", 1)[0]
+            # IPv4 = AF_INET = 2 ; IPv6 = AF_INET6 = 10 on Linux. Use
+            # the value rather than psutil's enum so a heredoc / mocked
+            # test doesn't depend on AF_PACKET being 17.
+            if fam in (2,) and not v.startswith("169.254."):
+                out.append(v)
+            elif fam in (10,) and not v.startswith("fe80"):
+                out.append(v)
+    return out
+
+
+def uptime_str() -> str:
+    secs = int(time.time() - psutil.boot_time())
+    d, rem = divmod(secs, 86400)
+    h, rem = divmod(rem, 3600)
+    m, _ = divmod(rem, 60)
+    if d:
+        return f"{d}d {h}h {m}m"
+    if h:
+        return f"{h}h {m}m"
+    return f"{m}m"
+
+
+def disk_summary() -> list[tuple[str, float, float, float]]:
+    """List of (mountpoint, used_GiB, total_GiB, percent) for real disks.
+
+    Skips synthetic filesystems (tmpfs, devtmpfs, overlay, squashfs,
+    proc, sysfs, …) and the EFI partition (small, never interesting
+    for capacity tracking). Sorted by mountpoint length so / appears
+    before /var, /boot/efi, etc.
+    """
+    skip_fstypes = {
+        "tmpfs", "devtmpfs", "squashfs", "overlay", "proc", "sysfs",
+        "cgroup", "cgroup2", "mqueue", "pstore", "bpf", "tracefs",
+        "debugfs", "configfs", "securityfs", "fusectl", "ramfs",
+        "binfmt_misc", "autofs", "nsfs", "hugetlbfs", "fuse.gvfsd-fuse",
+    }
+    skip_mounts = {"/boot/efi"}
+    rows: list[tuple[str, float, float, float]] = []
+    for part in psutil.disk_partitions(all=False):
+        if part.fstype in skip_fstypes:
+            continue
+        if part.mountpoint in skip_mounts:
+            continue
+        try:
+            u = psutil.disk_usage(part.mountpoint)
+        except OSError:
+            continue
+        rows.append((part.mountpoint, u.used / 2**30, u.total / 2**30, u.percent))
+    rows.sort(key=lambda r: (len(r[0]), r[0]))
+    return rows
+
+
+def appliance_version_string(env: dict[str, str]) -> str:
+    """Resolve the appliance + image versions for the header.
+
+    /etc/spatiumddi/appliance-release is the build-time stamp written
+    by mkosi.postinst. SPATIUMDDI_VERSION in .env is the container
+    image tag (CalVer or "latest"). Show both because they DO diverge
+    after a release apply (Phase 4c) without a partition re-image.
+    """
+    appliance = env.get("APPLIANCE_VERSION") or "?"
+    spddi = env.get("SPATIUMDDI_VERSION") or "?"
+    if APPLIANCE_RELEASE.exists():
+        try:
+            for line in APPLIANCE_RELEASE.read_text().splitlines():
+                if line.startswith("APPLIANCE_VERSION="):
+                    appliance = line.split("=", 1)[1].strip().strip('"')
+        except OSError:
+            pass
+    return f"appliance {appliance} · stack {spddi}"
+
+
+# ── live log tailing ──────────────────────────────────────────────────
+
+
+class JournalTail(threading.Thread):
+    """Tail journalctl into a deque so the renderer can read recent
+    lines without blocking on subprocess I/O each refresh."""
+
+    def __init__(self, units: Iterable[str], maxlen: int = 200):
+        super().__init__(daemon=True)
+        self.units = list(units)
+        self.lines: deque[str] = deque(maxlen=maxlen)
+        self._stop = threading.Event()
+        self._proc: subprocess.Popen | None = None
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._proc and self._proc.poll() is None:
+            try:
+                self._proc.terminate()
+            except Exception:
+                pass
+
+    def run(self) -> None:
+        while not self._stop.is_set():
+            argv = [
+                "journalctl",
+                "--no-pager",
+                "--output", "short-iso",
+                "--since", "10 minutes ago",
+                "-f",
+            ]
+            for u in self.units:
+                argv += ["-u", u]
+            try:
+                self._proc = subprocess.Popen(
+                    argv,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                    text=True,
+                    bufsize=1,
+                )
+            except FileNotFoundError:
+                # journalctl not on PATH — exotic build. Bail gracefully.
+                self.lines.append("[journalctl not available on this host]")
+                return
+            assert self._proc.stdout is not None
+            for line in self._proc.stdout:
+                if self._stop.is_set():
+                    break
+                line = line.rstrip("\n")
+                if line:
+                    self.lines.append(line)
+            # Subprocess exited (rotate / journald restart). Restart in
+            # 2 s unless we're stopping.
+            self._proc = None
+            if self._stop.is_set():
+                return
+            time.sleep(2)
+
+
+# ── key handling ──────────────────────────────────────────────────────
+
+
+# F-key escape sequences. Linux console + xterm + vt100/vt220 variants
+# all coexist (tty1 uses Linux console encoding by default; ttyS0
+# typically reports TERM=vt220). Map every known sequence onto the
+# logical key.
+KEY_SEQUENCES: dict[bytes, str] = {
+    # Linux console (TERM=linux)
+    b"\x1b[[A": "F1", b"\x1b[[B": "F2", b"\x1b[[C": "F3",
+    b"\x1b[[D": "F4", b"\x1b[[E": "F5",
+    # xterm / vt100 / vt220 (PF keys)
+    b"\x1bOP": "F1", b"\x1bOQ": "F2", b"\x1bOR": "F3", b"\x1bOS": "F4",
+    # Numeric form (rxvt, screen, tmux, many serial terms)
+    b"\x1b[11~": "F1", b"\x1b[12~": "F2", b"\x1b[13~": "F3",
+    b"\x1b[14~": "F4", b"\x1b[15~": "F5", b"\x1b[17~": "F6",
+    b"\x1b[18~": "F7", b"\x1b[19~": "F8", b"\x1b[20~": "F9",
+    b"\x1b[21~": "F10", b"\x1b[23~": "F11", b"\x1b[24~": "F12",
+}
+
+
+class KeyReader(threading.Thread):
+    """Read keypresses from stdin in cbreak mode and post matched
+    F-keys to a callback. Buffer accumulates bytes until either a
+    known sequence matches or 100 ms passes with no further input."""
+
+    def __init__(self, on_key, tty_fd: int = 0):
+        super().__init__(daemon=True)
+        self.on_key = on_key
+        self.tty_fd = tty_fd
+        self._stop = threading.Event()
+
+    def stop(self) -> None:
+        self._stop.set()
+        # Block until the thread has actually exited and restored the
+        # tty's termios state. Without this join the modal that takes
+        # over after stop() can race with our select() and eat the
+        # operator's first keystroke (or worse, the keyreader can
+        # tcsetattr-back to our cbreak settings just after the modal
+        # has set its own).
+        if self.is_alive():
+            self.join(timeout=2.0)
+
+    def run(self) -> None:
+        # cbreak (not raw): keep ISIG so SIGTERM/SIGINT from systemd
+        # still drop us; we just want non-canonical, no-echo input.
+        try:
+            saved = termios.tcgetattr(self.tty_fd)
+        except termios.error:
+            return
+        try:
+            tty.setcbreak(self.tty_fd)
+            # Disable echo explicitly — cbreak leaves it on so the F-key
+            # escape sequence would otherwise print as garbage.
+            new = termios.tcgetattr(self.tty_fd)
+            new[3] = new[3] & ~termios.ECHO  # lflags
+            termios.tcsetattr(self.tty_fd, termios.TCSANOW, new)
+
+            buf = b""
+            while not self._stop.is_set():
+                r, _, _ = select.select([self.tty_fd], [], [], 0.1)
+                if not r:
+                    if buf and buf in KEY_SEQUENCES:
+                        self.on_key(KEY_SEQUENCES[buf])
+                    buf = b""
+                    continue
+                try:
+                    chunk = os.read(self.tty_fd, 32)
+                except OSError:
+                    continue
+                if not chunk:
+                    continue
+                buf += chunk
+                # Try longest-prefix match repeatedly so a burst of
+                # bytes (e.g. operator pasting) drains cleanly.
+                while buf:
+                    matched = None
+                    for k in sorted(KEY_SEQUENCES, key=len, reverse=True):
+                        if buf.startswith(k):
+                            matched = k
+                            break
+                    if not matched:
+                        # No prefix matched — could still be incomplete
+                        # (b"\x1b[" pending the rest). If it doesn't
+                        # look like the start of any known sequence,
+                        # drop it.
+                        if not any(s.startswith(buf) for s in KEY_SEQUENCES):
+                            buf = b""
+                        break
+                    self.on_key(KEY_SEQUENCES[matched])
+                    buf = buf[len(matched):]
+        finally:
+            try:
+                termios.tcsetattr(self.tty_fd, termios.TCSANOW, saved)
+            except termios.error:
+                pass
+
+
+# ── rendering ────────────────────────────────────────────────────────
+
+
+HEALTH_STYLES = {
+    "healthy":    ("●", "bold green"),
+    "running":    ("●", "bold green"),
+    "completed":  ("✓", "bold green"),   # one-shot exit 0 (e.g. migrate)
+    "starting":   ("◐", "bold yellow"),
+    "unhealthy":  ("●", "bold red"),
+    "restarting": ("◐", "bold yellow"),
+    "exited":     ("○", "bold red"),
+    "created":    ("○", "dim"),
+    "missing":    ("○", "dim"),
+    "unknown":    ("?", "dim"),
+}
+
+# Compose services that are expected one-shots — they run to
+# completion and exit 0. The dashboard renders their "Exited (0)"
+# state as "completed" (green) instead of "exited" (red).
+ONE_SHOT_SERVICES = {"migrate"}
+
+
+def render_header(state: "DashboardState", mono_t: float) -> Panel:
+    """6-row header with identity / vitals / disk sections separated by a Rule.
+
+    All values come from state.* (cached at the vitals tier, 1 s
+    cadence). Only the spinner is derived live from mono_t so its
+    rotation animates at the render cadence (4 Hz) — that's the one
+    thing operators want jittery (visible "alive" indicator).
+    """
+    env = state.env
+    role = state.role
+    hostname = env.get("APPLIANCE_HOSTNAME") or os.uname().nodename
+    ips = host_ips()
+    cpu = state.cpu_percent
+    load = " ".join(f"{x:.2f}" for x in state.load_avg)
+    build = appliance_version_string(env)
+    clock = state.clock_str
+    spinner = SPINNER_CHARS[int(mono_t * 2) % len(SPINNER_CHARS)]
+
+    # Line 1 — identity on the left, clock + spinner on the right.
+    line1 = Table.grid(expand=True)
+    line1.add_column(ratio=1, no_wrap=False)
+    line1.add_column(justify="right", no_wrap=True)
+    left1 = Text()
+    left1.append("Host ", style="dim")
+    left1.append(hostname, style="bold")
+    left1.append("   Role ", style="dim")
+    left1.append(role_label(role), style="bold cyan")
+    right1 = Text()
+    right1.append(clock, style="bold")
+    right1.append("  ")
+    right1.append(spinner, style="bold bright_yellow")
+    line1.add_row(left1, right1)
+
+    # Line 2 — IPs
+    line2 = Text()
+    line2.append("IPs  ", style="dim")
+    line2.append(", ".join(ips) if ips else "—")
+
+    # Line 3 — build / version
+    line3 = Text()
+    line3.append("Build ", style="dim")
+    line3.append(build)
+
+    # Rule — horizontal divider between identity and vitals.
+    rule = Rule(style="cyan dim", characters="─")
+
+    # Line 4 — vitals: uptime / cpu / ram / load
+    line4 = Text()
+    line4.append("Up ", style="dim"); line4.append(uptime_str(), style="bold")
+    line4.append("   CPU ", style="dim"); line4.append(f"{cpu:.0f}%", style="bold")
+    line4.append("   RAM ", style="dim")
+    line4.append(f"{state.ram_used_gib:.1f}/{state.ram_total_gib:.1f} GiB ({state.ram_percent:.0f}%)", style="bold")
+    line4.append("   Load ", style="dim"); line4.append(load, style="bold")
+
+    # Line 5 — disks. Skip if no real partitions surface (shouldn't
+    # happen on a Debian appliance install but keeps the dashboard
+    # resilient).
+    disks = state.disks
+    line5 = Text()
+    line5.append("Disk ", style="dim")
+    if disks:
+        bits: list[str] = []
+        for mp, used_g, total_g, pct in disks:
+            bits.append(f"{mp} {used_g:.1f}/{total_g:.1f} GiB ({pct:.0f}%)")
+        line5.append("   ".join(bits))
+    else:
+        line5.append("—")
+
+    body = Group(line1, line2, line3, rule, line4, line5)
+    return Panel(body, box=SQUARE, border_style="cyan", padding=(0, 1),
+                 title="[bold]SpatiumDDI[/bold]", title_align="left")
+
+
+def render_services(role: str, ps_rows: list[dict]) -> Panel:
+    expected = ROLE_SERVICES.get(role, ROLE_SERVICES["control"])
+    # Index ps by compose-service name.
+    by_service: dict[str, dict] = {}
+    for r in ps_rows:
+        svc = container_service_name(r)
+        # Pick the most-recently-created replica if multiple exist.
+        if svc not in by_service:
+            by_service[svc] = r
+
+    tbl = Table.grid(padding=(0, 1), expand=True)
+    tbl.add_column(width=2, no_wrap=True)        # health glyph
+    tbl.add_column(width=14, no_wrap=True)       # service name
+    tbl.add_column(width=11, no_wrap=True)       # state
+    tbl.add_column(min_width=14, no_wrap=False)  # image / detail
+    tbl.add_column(justify="right", no_wrap=True)  # status text
+
+    for svc in expected:
+        row = by_service.get(svc)
+        if row is None:
+            verdict = "missing"
+            glyph, style = HEALTH_STYLES[verdict]
+            tbl.add_row(
+                Text(glyph, style=style),
+                Text(svc, style="dim"),
+                Text("not running", style="dim"),
+                Text("", style="dim"),
+                Text("—", style="dim"),
+            )
+            continue
+        status = row.get("Status") or ""
+        verdict = health_from_status(status)
+        # One-shot services: a clean exit (code 0) is the desired
+        # end-state, not a failure. Migrate finishes after alembic
+        # upgrade head completes — operators shouldn't see red there.
+        if svc in ONE_SHOT_SERVICES and status.startswith("Exited (0)"):
+            verdict = "completed"
+        glyph, style = HEALTH_STYLES[verdict]
+        image = row.get("Image") or ""
+        # Trim ghcr.io/spatiumddi/ + :tag for compact display.
+        short_image = image
+        if "/" in short_image:
+            short_image = short_image.rsplit("/", 1)[1]
+        tbl.add_row(
+            Text(glyph, style=style),
+            Text(svc, style="bold"),
+            Text(verdict, style=style),
+            Text(short_image, style="dim"),
+            Text(status, style="dim"),
+        )
+
+    return Panel(tbl, box=SQUARE, border_style="cyan",
+                 title=f"[bold]Services[/bold]  ({role_label(role)})",
+                 title_align="left")
+
+
+def render_agent_context(env: dict[str, str], role: str) -> Panel | None:
+    """Render the small 'Control plane' panel agent roles show.
+
+    Returns None for control / control-only — there's nothing to
+    surface there beyond what Services already shows.
+    """
+    if role in ("control", "control-only"):
+        return None
+    url = env.get("CONTROL_PLANE_URL") or "(not configured)"
+    group = env.get("AGENT_GROUP") or "default"
+
+    grid = Table.grid(padding=(0, 2), expand=True)
+    grid.add_column(width=14, no_wrap=True)
+    grid.add_column(no_wrap=False)
+    grid.add_row(Text("Control plane", style="dim"), Text(url, style="bold"))
+    grid.add_row(Text("Group", style="dim"), Text(group))
+    grid.add_row(Text("Hostname", style="dim"),
+                 Text(env.get("APPLIANCE_HOSTNAME") or os.uname().nodename))
+    # Live registration / ETag would require talking to the local agent
+    # container's HTTP surface — deferred to v2 of this panel. Today the
+    # operator gets group + URL + container health (from Services).
+
+    return Panel(grid, box=SQUARE, border_style="cyan",
+                 title="[bold]Agent[/bold]", title_align="left")
+
+
+def render_log(tail: JournalTail, height: int) -> Panel:
+    # Take the last `height-2` lines (room for borders). On a fresh
+    # boot the deque can be empty for a few seconds — render a
+    # placeholder rather than an empty frame.
+    if not tail.lines:
+        body: Group | Text = Text("(waiting for log output…)", style="dim italic")
+    else:
+        body = Group(*(
+            Text(line, style="dim", overflow="ellipsis", no_wrap=True)
+            for line in list(tail.lines)[-(max(height - 2, 1)):]
+        ))
+    return Panel(body, box=SQUARE, border_style="cyan",
+                 title="[bold]Live log[/bold]", title_align="left")
+
+
+def render_footer(message: str = "") -> Text:
+    """Borderless single-line F-key strip. Returns a Text (not Panel)
+    so the Layout cell claims exactly one row, with no border padding
+    eating vertical space."""
+    keys = [
+        ("F1", "Login"),
+        ("F2", "Monitor"),
+        ("F3", "Containers"),
+        ("F4", "Network"),
+        ("F5", "Reboot"),
+        ("F6", "Shutdown"),
+        ("F9", "Diag"),
+        ("F12", "Shell"),
+    ]
+    t = Text(no_wrap=True, overflow="ellipsis")
+    t.append(" ")
+    for i, (k, label) in enumerate(keys):
+        if i:
+            t.append("  ")
+        # bold black on bright_blue chip + bold white label.
+        t.append(f" {k} ", style="bold black on bright_blue")
+        t.append(f" {label}", style="bold white")
+    if message:
+        t.append("   ")
+        t.append(message, style="bold bright_yellow")
+    return t
+
+
+def render_frame(state: "DashboardState", mono_t: float) -> Layout:
+    # Compact sizing — feedback was that the dashboard occupied too
+    # many rows. Each panel claims exactly content + 2 border rows;
+    # footer is a borderless 1-row strip.
+    services_count = len(ROLE_SERVICES.get(state.role, []))
+    HEADER_ROWS = 8   # 5 lines content + 1 rule + 2 border
+    AGENT_ROWS = 5    # 3 lines of content + 2 border
+    SVC_ROWS = services_count + 2   # tight: just borders, no padding
+    FOOTER_ROWS = 1   # single-line borderless strip
+
+    layout = Layout()
+    layout.split_column(
+        Layout(name="header", size=HEADER_ROWS),
+        Layout(name="body", ratio=1),
+        Layout(name="footer", size=FOOTER_ROWS),
+    )
+    agent_panel = render_agent_context(state.env, state.role)
+    if agent_panel is None:
+        layout["body"].split_column(
+            Layout(name="services", size=SVC_ROWS),
+            Layout(name="log", ratio=1),
+        )
+    else:
+        layout["body"].split_column(
+            Layout(name="agent", size=AGENT_ROWS),
+            Layout(name="services", size=SVC_ROWS),
+            Layout(name="log", ratio=1),
+        )
+        layout["body"]["agent"].update(agent_panel)
+    layout["header"].update(render_header(state, mono_t))
+    layout["body"]["services"].update(render_services(state.role, state.ps_rows))
+    fixed = HEADER_ROWS + SVC_ROWS + FOOTER_ROWS + (AGENT_ROWS if agent_panel else 0)
+    log_height = max(state.term_size[1] - fixed, 4)
+    layout["body"]["log"].update(render_log(state.tail, log_height))
+    layout["footer"].update(render_footer(state.status_message))
+    return layout
+
+
+# ── action handling ───────────────────────────────────────────────────
+
+
+class DashboardState:
+    def __init__(self, env: dict[str, str], tail: JournalTail, tty_path: str):
+        self.env = env
+        self.role = role_from_env(env)
+        self.tail = tail
+        self.tty_path = tty_path
+        self.ps_rows: list[dict] = []
+        self.status_message = ""
+        self.status_expires = 0.0
+        self.pending_action: str | None = None
+        self.term_size = (80, 24)
+        self.lock = threading.Lock()
+        # Three refresh tiers — operator feedback was that CPU % +
+        # clock were flickering when sampled at 4 Hz (the render
+        # cadence). Keep render fast for the spinner only; cache
+        # everything else at 1 s (vitals) or 2 s (docker / env).
+        self._last_vitals_refresh = 0.0
+        self._last_data_refresh = 0.0
+        # Cached vitals + clock (read by render_header each tick).
+        self.cpu_percent: float = 0.0
+        self.ram_used_gib: float = 0.0
+        self.ram_total_gib: float = 0.0
+        self.ram_percent: float = 0.0
+        self.load_avg: tuple[float, float, float] = (0.0, 0.0, 0.0)
+        self.clock_str: str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.disks: list[tuple[str, float, float, float]] = []
+
+    def refresh(self, force: bool = False) -> None:
+        now = time.monotonic()
+
+        # Vitals tier (1 s) — CPU sample / RAM / Load / clock / disk.
+        if force or (now - self._last_vitals_refresh) >= VITALS_EVERY:
+            self._last_vitals_refresh = now
+            self.cpu_percent = psutil.cpu_percent(interval=None)
+            vm = psutil.virtual_memory()
+            self.ram_used_gib = vm.used / 2**30
+            self.ram_total_gib = vm.total / 2**30
+            self.ram_percent = vm.percent
+            self.load_avg = os.getloadavg()
+            self.clock_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self.disks = disk_summary()
+
+        # Data tier (2 s) — docker ps + env re-read.
+        if force or (now - self._last_data_refresh) >= DATA_REFRESH_EVERY:
+            self._last_data_refresh = now
+            self.ps_rows = docker_ps()
+            try:
+                self.env = read_env()
+            except Exception:
+                pass
+            new_role = role_from_env(self.env)
+            if new_role:
+                self.role = new_role
+
+        # Status-message TTL ticks on every call regardless.
+        if self.status_expires and time.time() > self.status_expires:
+            self.status_message = ""
+            self.status_expires = 0.0
+
+    def flash(self, msg: str, ttl: float = 3.0) -> None:
+        self.status_message = msg
+        self.status_expires = time.time() + ttl
+
+    def set_action(self, action: str) -> None:
+        with self.lock:
+            self.pending_action = action
+
+
+def _draw_confirm(console: Console, question: str, yes_selected: bool) -> None:
+    """Render the confirm modal at vertical centre with one button
+    highlighted. Called once on open and again each time the selection
+    flips, never on every input tick (would flicker)."""
+    if yes_selected:
+        yes_chip = "[bold black on bright_green]  Yes  [/bold black on bright_green]"
+        no_chip = "[bold white]  No   [/bold white]"
+    else:
+        yes_chip = "[bold white]  Yes  [/bold white]"
+        no_chip = "[bold black on bright_red]  No   [/bold black on bright_red]"
+
+    body = Group(
+        Align.center(Text(question, style="bold")),
+        Text(""),
+        Align.center(Text.from_markup(f"{yes_chip}      {no_chip}")),
+        Text(""),
+        Align.center(Text.from_markup(
+            "[dim]← → switch  ·  Enter confirm  ·  Esc cancel  ·  Y / N shortcut[/dim]"
+        )),
+    )
+    panel = Panel(
+        body, box=SQUARE, border_style="yellow", padding=(1, 4),
+        title="[bold yellow] Confirm [/bold yellow]",
+        title_align="center",
+        width=min(64, console.size.width - 4),
+    )
+
+    console.clear()
+    pad = max(console.size.height // 3, 1)
+    for _ in range(pad):
+        console.print("")
+    console.print(Align.center(panel))
+
+
+def confirm_modal(console: Console, question: str, ttl: float = 30.0) -> bool:
+    """Arrow-key navigable Yes/No popup. Returns True if the operator
+    picks Yes (highlighted + Enter), False on No/Esc/timeout.
+
+    Default selection is No — destructive ops shouldn't fire on a
+    careless Enter. Single-key shortcuts (Y/N) still work for muscle
+    memory.
+
+    Caller is responsible for tearing down whatever owns the TTY
+    before calling (KeyReader stopped + Live stopped) so this function
+    has clean ownership of stdin/stdout.
+    """
+    try:
+        saved = termios.tcgetattr(0)
+    except termios.error:
+        return False
+
+    selected = False  # default: No
+    confirmed: bool | None = None
+    last_drawn: bool | None = None
+    buf = b""
+
+    try:
+        tty.setcbreak(0)
+        attrs = termios.tcgetattr(0)
+        attrs[3] &= ~termios.ECHO
+        termios.tcsetattr(0, termios.TCSANOW, attrs)
+
+        deadline = time.time() + ttl
+        while confirmed is None and time.time() < deadline:
+            if last_drawn != selected:
+                _draw_confirm(console, question, selected)
+                last_drawn = selected
+
+            # Tight poll so a lone Esc disambiguates from the start of
+            # an arrow-key escape sequence — arrow keys arrive as a
+            # 3-byte burst (\x1b [ C) within milliseconds, lone Esc
+            # stands alone. 80 ms is more than enough wall time for
+            # the trailing bytes to land but short enough for Esc to
+            # feel responsive.
+            r, _, _ = select.select([0], [], [], 0.08 if buf else 0.5)
+            if not r:
+                # No follow-up bytes — if buf is a lone Esc, treat as cancel.
+                if buf == b"\x1b":
+                    confirmed = False
+                buf = b""
+                continue
+            try:
+                chunk = os.read(0, 16)
+            except OSError:
+                continue
+            if not chunk:
+                continue
+            buf += chunk
+
+            # ── Match complete sequences from longest first ──────────
+            # Left / Right arrows: ESC[D / ESC[C (xterm), ESCO D / ESCO C (vt220)
+            if buf in (b"\x1b[D", b"\x1b[C", b"\x1bOD", b"\x1bOC",
+                       b"\x1b[A", b"\x1b[B"):  # also Up/Down — same effect
+                selected = not selected
+                buf = b""
+                continue
+            # Tab also flips selection.
+            if buf == b"\t":
+                selected = not selected
+                buf = b""
+                continue
+            # Y / N shortcuts (immediate confirm).
+            if buf in (b"y", b"Y"):
+                confirmed = True
+                break
+            if buf in (b"n", b"N", b"q", b"Q"):
+                confirmed = False
+                break
+            # Enter / Space — confirm CURRENT selection.
+            if buf in (b"\r", b"\n", b" "):
+                confirmed = selected
+                break
+            # Ctrl-C — cancel.
+            if buf == b"\x03":
+                confirmed = False
+                break
+            # Incomplete escape sequence — keep buffering, the
+            # 80 ms select above will give the rest a chance to land.
+            if buf.startswith(b"\x1b") and len(buf) < 4:
+                continue
+            # Unknown — drop and keep waiting.
+            buf = b""
+
+        return confirmed if confirmed is not None else False
+    finally:
+        try:
+            termios.tcsetattr(0, termios.TCSANOW, saved)
+        except termios.error:
+            pass
+
+
+def do_login(tty_path: str) -> None:
+    """Hand off tty to agetty. Never returns (execvp). systemd's
+    Restart=always brings spatium-console back when the operator
+    logs out."""
+    tty_name = os.path.basename(tty_path) if tty_path else "tty1"
+    # Linux's agetty is at /sbin/agetty on Debian; --keep-baud is a
+    # no-op on virtual consoles, harmless on serial. --noclear keeps
+    # the dashboard's last frame visible until the operator types.
+    args = ["agetty", "-o", "-p -- \\u", "--noclear", "--keep-baud",
+            tty_name, "linux"]
+    try:
+        os.execvp(args[0], args)
+    except FileNotFoundError:
+        # Fallback to `login` if agetty is somehow missing.
+        os.execvp("login", ["login"])
+
+
+def do_shell(console: Console) -> None:
+    """Drop to admin shell. su -l does its own PAM password check.
+
+    Restores cooked tty mode for the duration so su can read the
+    password without our cbreak munging it. The KeyReader thread is
+    paused by the caller before this runs.
+    """
+    console.clear()
+    console.print("[bold]Switching to admin shell — exit (Ctrl-D or `exit`) returns to the dashboard.[/bold]\n")
+    try:
+        subprocess.run(["su", "-l", "admin"], check=False)
+    except Exception as exc:
+        console.print(f"[red]su failed: {exc}[/red]")
+        time.sleep(2)
+
+
+def do_reboot(console: Console) -> None:
+    if confirm_modal(console, "Reboot the appliance now?"):
+        console.clear()
+        console.print("\n\n[bold yellow]Rebooting…[/bold yellow]\n")
+        subprocess.run(["systemctl", "reboot"], check=False)
+
+
+def do_shutdown(console: Console) -> None:
+    if confirm_modal(console, "Power off the appliance now?"):
+        console.clear()
+        console.print("\n\n[bold yellow]Powering off…[/bold yellow]\n")
+        subprocess.run(["systemctl", "poweroff"], check=False)
+
+
+# ── main loop ─────────────────────────────────────────────────────────
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--tty", default=os.ttyname(0) if sys.stdin.isatty() else "/dev/tty1",
+                    help="TTY device path (default: stdin's tty or /dev/tty1)")
+    ap.add_argument("--dev", action="store_true",
+                    help="Dev mode: synthetic env + skip privileged actions")
+    args = ap.parse_args()
+
+    # Don't die on SIGHUP — systemd sends one when the TTY hangs up
+    # briefly during the F1 → agetty handoff. SIGTERM is honoured.
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+
+    env = read_env() if not args.dev else {
+        "APPLIANCE_ROLE": "control",
+        "APPLIANCE_HOSTNAME": "ddi-dev-01",
+        "APPLIANCE_VERSION": "0.1.0-dev",
+        "SPATIUMDDI_VERSION": "dev",
+        "CONTROL_PLANE_URL": "https://ddi.example.com",
+        "AGENT_GROUP": "default",
+    }
+
+    tail = JournalTail(JOURNAL_UNITS)
+    tail.start()
+
+    # Prime psutil's CPU sampler so the first frame doesn't show 0.0% —
+    # cpu_percent(None) returns the delta since the last call; the
+    # first call always returns 0.0 because there's no baseline yet.
+    psutil.cpu_percent(interval=None)
+
+    state = DashboardState(env, tail, args.tty)
+    state.refresh(force=True)  # prime cached vitals so first frame isn't all zeros
+
+    console = Console(soft_wrap=False, force_terminal=True, safe_box=True)
+    state.term_size = console.size
+
+    def on_key(key: str) -> None:
+        if key == "F1":
+            state.set_action("login")
+        elif key == "F5":
+            state.set_action("reboot")
+        elif key == "F6":
+            state.set_action("shutdown")
+        elif key == "F12":
+            state.set_action("shell")
+        elif key in {"F2", "F3", "F4"}:
+            state.flash(f"{key} — coming in v2 (use /appliance UI for now)")
+        elif key == "F9":
+            state.flash("F9 Diag bundle — coming in v2 (use /appliance → Logs for now)")
+
+    keys = KeyReader(on_key)
+    keys.start()
+
+    try:
+        first_t = time.monotonic()
+        with Live(render_frame(state, first_t), console=console,
+                  refresh_per_second=4, screen=True, transient=False) as live:
+            while True:
+                mono_t = time.monotonic()
+                state.refresh()  # self-throttling — only polls docker every DATA_REFRESH_EVERY
+                state.term_size = console.size
+                live.update(render_frame(state, mono_t))
+
+                # Drain pending action if any.
+                action = None
+                with state.lock:
+                    if state.pending_action:
+                        action = state.pending_action
+                        state.pending_action = None
+                if action:
+                    if args.dev:
+                        state.flash(f"[dev] would invoke action: {action}", ttl=4)
+                    else:
+                        # Tear down keypress raw mode + Live so the action
+                        # has a clean cooked-tty.
+                        keys.stop()
+                        live.stop()
+                        try:
+                            if action == "login":
+                                do_login(args.tty)  # noreturn
+                            elif action == "shell":
+                                do_shell(console)
+                            elif action == "reboot":
+                                do_reboot(console)
+                            elif action == "shutdown":
+                                do_shutdown(console)
+                        finally:
+                            # Re-arm keypress capture, re-enter Live.
+                            keys = KeyReader(on_key)
+                            keys.start()
+                            live.start()
+
+                time.sleep(REFRESH_INTERVAL)
+    except KeyboardInterrupt:
+        return 0
+    finally:
+        tail.stop()
+        keys.stop()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

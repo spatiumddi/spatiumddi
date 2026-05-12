@@ -710,7 +710,12 @@ EOF
 GRUB_DEFAULT=0
 GRUB_TIMEOUT=3
 GRUB_DISTRIBUTOR="SpatiumDDI"
-GRUB_CMDLINE_LINUX_DEFAULT="quiet"
+# Issue #136: do NOT hide boot output ("quiet" / show_status=false).
+# spatium-console.service claims tty1 seconds after kernel boot and
+# overpaints whatever was there, so the brief visible boot text only
+# matters when something is wrong (a panic, a missed module, plymouth
+# eating keystrokes — all silently undebuggable otherwise).
+GRUB_CMDLINE_LINUX_DEFAULT="loglevel=3 audit=0"
 GRUB_CMDLINE_LINUX="console=tty0 console=ttyS0,115200n8"
 GRUB_TERMINAL_INPUT="console serial"
 GRUB_TERMINAL_OUTPUT="console serial"
@@ -742,18 +747,28 @@ insmod search_fs_uuid
 search --no-floppy --fs-uuid --set=root $ROOT_UUID
 
 menuentry "SpatiumDDI Appliance" {
-    linux /boot/vmlinuz-$KVER root=UUID=$ROOT_UUID ro quiet \\
-        loglevel=3 audit=0 systemd.show_status=false \\
+    # Issue #136: dropped "quiet" + systemd.show_status=false so any
+    # boot-time failure is visible on tty1 before spatium-console
+    # paints over it. loglevel=3 still suppresses non-error kernel
+    # info, audit=0 keeps the audit subsystem off.
+    #
+    # Font is set by spatium-console.service's ExecStartPre (setfont
+    # Lat15-VGA16), not via fbcon=font:VGA8x8 on the cmdline — the
+    # latter gave a cramped 8x8 cell that operators couldn't read.
+    # Setfont in userspace lets us pick a readable font that gives a
+    # natural 160x50 grid on a 1280x800 framebuffer.
+    linux /boot/vmlinuz-$KVER root=UUID=$ROOT_UUID ro \\
+        loglevel=3 audit=0 \\
         console=tty0 console=ttyS0,115200n8
     initrd /boot/initrd.img-$KVER
 }
 
-menuentry "SpatiumDDI Appliance (verbose boot)" {
-    # Same as default, just without the quiet/loglevel/audit/
-    # show_status flags — useful when you want to see what's
-    # happening during boot. Still runs multi-user.target so
-    # getty@tty1 + serial-getty@ttyS0 both come up normally.
+menuentry "SpatiumDDI Appliance (full verbose boot)" {
+    # Drops loglevel + audit too. Use when you need to capture every
+    # kernel message for a bug report. Also passes spatium-console=off
+    # so getty@tty1 wins tty1 (no dashboard overpainting the log).
     linux /boot/vmlinuz-$KVER root=UUID=$ROOT_UUID ro \\
+        spatium-console=off \\
         console=tty0 console=ttyS0,115200n8
     initrd /boot/initrd.img-$KVER
 }
@@ -788,7 +803,17 @@ EOF
         echo "XXX"; echo "100"; echo "Done."; echo "XXX"
         sleep 1
     } | whiptail --backtitle "$BACKTITLE" --title "Installing SpatiumDDI" \
-        --gauge "" 10 70 0
+        --gauge "Starting installation…" 12 76 0
+    # Notes on the --gauge args:
+    #   * Initial text MUST be non-empty. newt-based whiptail (Debian)
+    #     skips drawing the message line entirely when the initial text
+    #     is "", and subsequent XXX/N/message/XXX update blocks then
+    #     don't bring it back. The operator sees only the % bar and no
+    #     "Creating admin user" / "Installing bootloader" copy.
+    #   * Height 12 (was 10) gives enough vertical space for a wrapped
+    #     line — a few of the step messages run ~50 chars and on the
+    #     fbcon=font:VGA8x8 console they can wrap before width=70 fits.
+    #   * Width 76 (was 70) for the same wrap-headroom reason.
 
     # Best-effort eject of the install media BEFORE the operator
     # confirms reboot. Real CD-ROM drives obviously unmount and pop
