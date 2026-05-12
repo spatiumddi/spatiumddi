@@ -86,12 +86,11 @@ export function SlotUpgradeCard() {
             Appliance OS Image (atomic A/B upgrade)
           </h2>
           <p className="mt-1 text-xs text-muted-foreground">
-            Writes a slot{" "}
-            <code className="rounded bg-muted px-1">.raw.xz</code> image
-            into the inactive A/B partition, arms grub to try it on
-            next boot, and rolls back automatically if{" "}
-            <code className="rounded bg-muted px-1">/health/live</code>{" "}
-            doesn’t come up. Active slot is never touched during apply.
+            Writes a slot <code className="rounded bg-muted px-1">.raw.xz</code>{" "}
+            image into the inactive A/B partition, arms grub to try it on next
+            boot, and rolls back automatically if{" "}
+            <code className="rounded bg-muted px-1">/health/live</code> doesn’t
+            come up. Active slot is never touched during apply.
           </p>
         </div>
         <button
@@ -100,9 +99,7 @@ export function SlotUpgradeCard() {
           onClick={() => refetch()}
           disabled={isLoading}
         >
-          <RefreshCw
-            className={`h-3 w-3 ${isLoading ? "animate-spin" : ""}`}
-          />
+          <RefreshCw className={`h-3 w-3 ${isLoading ? "animate-spin" : ""}`} />
           Refresh
         </button>
       </div>
@@ -216,8 +213,8 @@ export function SlotUpgradeCard() {
           <div>
             <div className="font-semibold">Apply running</div>
             <div className="mt-0.5">
-              Streaming + decompressing → writing to {slotLabel(inactiveSlot)}{" "}
-              → patching grub.cfg → arming next-boot. Watch the log below.
+              Streaming + decompressing → writing to {slotLabel(inactiveSlot)} →
+              patching grub.cfg → arming next-boot. Watch the log below.
             </div>
           </div>
         </div>
@@ -229,9 +226,8 @@ export function SlotUpgradeCard() {
           <div>
             <div className="font-semibold">Apply complete</div>
             <div className="mt-0.5">
-              {slotLabel(inactiveSlot)} is ready and armed for next boot.
-              Reboot to switch — health-check passes will commit it
-              automatically.
+              {slotLabel(inactiveSlot)} is ready and armed for next boot. Reboot
+              to switch — health-check passes will commit it automatically.
             </div>
           </div>
         </div>
@@ -243,8 +239,8 @@ export function SlotUpgradeCard() {
           <div>
             <div className="font-semibold">Apply failed</div>
             <div className="mt-0.5">
-              See the log below for details. Active slot is untouched —
-              you can re-try with a different image.
+              See the log below for details. Active slot is untouched — you can
+              re-try with a different image.
             </div>
           </div>
         </div>

@@ -6882,9 +6882,7 @@ export interface ApplianceSlotStatus {
 
 export const applianceSlotApi = {
   status: () =>
-    api
-      .get<ApplianceSlotStatus>("/appliance/slot-upgrade")
-      .then((r) => r.data),
+    api.get<ApplianceSlotStatus>("/appliance/slot-upgrade").then((r) => r.data),
   apply: (image_url: string, checksum_url?: string | null) =>
     api
       .post<{ scheduled: string }>("/appliance/slot-upgrade/apply", {
