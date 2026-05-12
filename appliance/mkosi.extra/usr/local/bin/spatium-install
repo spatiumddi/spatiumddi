@@ -785,6 +785,10 @@ EOF
         log "Copying $LIVE_KERNEL -> /boot/vmlinuz-$KVER"
         install -m 0644 "$LIVE_KERNEL" "$MOUNT/boot/vmlinuz-$KVER"
         ln -sf "vmlinuz-$KVER" "$MOUNT/boot/vmlinuz"
+        # Phase 8c — initrd.img symlink alongside vmlinuz so grub.cfg
+        # can reference stable paths regardless of kernel version. The
+        # symlink target is created by update-initramfs below.
+        ln -sf "initrd.img-$KVER" "$MOUNT/boot/initrd.img"
 
         echo "XXX"; echo "80"; echo "Configuring initramfs (virtio + storage modules)..."; echo "XXX"
         # Force the storage / virtio drivers into the initrd so the
@@ -852,16 +856,17 @@ EOF
         log "initrd written: $(ls -lh "$MOUNT/boot/initrd.img-$KVER" | awk '{print $5}')"
         ln -sf "initrd.img-$KVER" "$MOUNT/boot/initrd.img"
 
-        echo "XXX"; echo "85"; echo "Writing /etc/default/grub + /boot/grub/grub.cfg..."; echo "XXX"
+        echo "XXX"; echo "85"; echo "Writing GRUB config (Phase 8c A/B + boot counting)..."; echo "XXX"
         # Write /etc/default/grub explicitly so future `update-grub`
         # runs (e.g. on kernel upgrade) get the same cmdline. We
         # don't rely on update-grub at install time — we write
         # grub.cfg directly below — but installed-system tooling
         # will read this file later.
         cat > "$MOUNT/etc/default/grub" <<EOF
-GRUB_DEFAULT=0
+GRUB_DEFAULT=saved
 GRUB_TIMEOUT=3
 GRUB_DISTRIBUTOR="SpatiumDDI"
+GRUB_SAVEDEFAULT=true
 # Issue #136: do NOT hide boot output ("quiet" / show_status=false).
 # spatium-console.service claims tty1 seconds after kernel boot and
 # overpaints whatever was there, so the brief visible boot text only
@@ -876,17 +881,33 @@ GRUB_DISABLE_OS_PROBER=true
 GRUB_DISABLE_LINUX_UUID=false
 EOF
 
-        # Write grub.cfg directly with the correct root=UUID. We
-        # bypass update-grub because grub-mkconfig's grub-probe reads
-        # /proc/mounts inside the chroot — and /proc is bind-mounted
-        # from the host, so grub-probe returns the LIVE OVERLAY's
-        # device rather than the target disk's root partition. The
-        # resulting grub.cfg has a wrong/missing root= line and the
-        # kernel panics at boot.
-        mkdir -p "$MOUNT/boot/grub"
-        cat > "$MOUNT/boot/grub/grub.cfg" <<EOF
+        # Phase 8c — grub.cfg + grubenv on the ESP (/boot/efi/grub/),
+        # NOT on each slot's /boot/grub/. Reasons:
+        #   * ESP is shared between slots → single source of truth for
+        #     the boot menu. spatium-upgrade-slot doesn't need to keep
+        #     two grub.cfg copies in sync.
+        #   * grub-reboot / grub-set-default write to grubenv on the
+        #     same filesystem as grub.cfg — keeping both on ESP means
+        #     they survive verbatim across slot swaps.
+        #   * If an operator wipes /var, the boot menu still works
+        #     (it's on the ESP, untouched).
+        #
+        # Two slot menuentries with --id=slot_a / slot_b. default reads
+        # ${saved_entry} from grubenv. spatiumddi-firstboot.service
+        # commits saved_entry via grub-set-default once the new slot
+        # passes /health/live. grub-reboot from spatium-upgrade-slot
+        # is the one-shot "try this slot once" mechanism.
+        mkdir -p "$MOUNT/boot/efi/grub"
+        cat > "$MOUNT/boot/efi/grub/grub.cfg" <<EOF
+# SpatiumDDI A/B boot config (Phase 8c, issue #138).
+# Default boot is whichever slot grubenv's saved_entry points at; on
+# first install that's slot_a. grub-reboot <slot> from spatium-upgrade-
+# slot sets it for ONE BOOT only (auto-reverts on next boot — that's
+# the safety net for failed upgrades).
 set timeout=3
-set default=0
+load_env
+set default=\${saved_entry}
+if [ -z "\${saved_entry}" ]; then set default=slot_a; fi
 
 # Serial console mirror for headless installs.
 serial --unit=0 --speed=115200
@@ -895,51 +916,63 @@ terminal_output console serial
 
 insmod part_gpt
 insmod ext2
+insmod ext4
 insmod search_fs_uuid
-search --no-floppy --fs-uuid --set=root $ROOT_A_UUID
 
-menuentry "SpatiumDDI Appliance" {
-    # Issue #136: dropped "quiet" + systemd.show_status=false so any
-    # boot-time failure is visible on tty1 before spatium-console
-    # paints over it. loglevel=3 still suppresses non-error kernel
-    # info, audit=0 keeps the audit subsystem off.
-    #
-    # Font is set by spatium-console.service's ExecStartPre (setfont
-    # Lat15-VGA16), not via fbcon=font:VGA8x8 on the cmdline — the
-    # latter gave a cramped 8x8 cell that operators couldn't read.
-    # Setfont in userspace lets us pick a readable font that gives a
-    # natural 160x50 grid on a 1280x800 framebuffer.
-    linux /boot/vmlinuz-$KVER root=UUID=$ROOT_A_UUID ro \\
+menuentry "SpatiumDDI Appliance (slot A)" --id=slot_a {
+    search --no-floppy --fs-uuid --set=root $ROOT_A_UUID
+    linux /boot/vmlinuz root=UUID=$ROOT_A_UUID ro \\
         loglevel=3 audit=0 \\
         console=tty0 console=ttyS0,115200n8
-    initrd /boot/initrd.img-$KVER
+    initrd /boot/initrd.img
 }
 
-menuentry "SpatiumDDI Appliance (full verbose boot)" {
+menuentry "SpatiumDDI Appliance (slot B)" --id=slot_b {
+    search --no-floppy --fs-uuid --set=root $ROOT_B_UUID
+    linux /boot/vmlinuz root=UUID=$ROOT_B_UUID ro \\
+        loglevel=3 audit=0 \\
+        console=tty0 console=ttyS0,115200n8
+    initrd /boot/initrd.img
+}
+
+menuentry "SpatiumDDI Appliance (slot A, verbose boot)" --id=slot_a_verbose {
     # Drops loglevel + audit too. Use when you need to capture every
     # kernel message for a bug report. Also passes spatium-console=off
     # so getty@tty1 wins tty1 (no dashboard overpainting the log).
-    linux /boot/vmlinuz-$KVER root=UUID=$ROOT_A_UUID ro \\
+    search --no-floppy --fs-uuid --set=root $ROOT_A_UUID
+    linux /boot/vmlinuz root=UUID=$ROOT_A_UUID ro \\
         spatium-console=off \\
         console=tty0 console=ttyS0,115200n8
-    initrd /boot/initrd.img-$KVER
+    initrd /boot/initrd.img
 }
 
-menuentry "SpatiumDDI Appliance (rescue / single-user)" {
-    # Boots into rescue.target — single-user, root shell only, no
-    # docker, no getty@tty1. Asks for the root password from the
-    # installer at "Press Enter for maintenance" prompt.
-    linux /boot/vmlinuz-$KVER root=UUID=$ROOT_A_UUID ro \\
+menuentry "SpatiumDDI Appliance (rescue / single-user)" --id=rescue {
+    # Boots slot_a into rescue.target — single-user, root shell only,
+    # no docker, no getty@tty1.
+    search --no-floppy --fs-uuid --set=root $ROOT_A_UUID
+    linux /boot/vmlinuz root=UUID=$ROOT_A_UUID ro \\
         console=tty0 console=ttyS0,115200n8 systemd.unit=rescue.target
-    initrd /boot/initrd.img-$KVER
+    initrd /boot/initrd.img
 }
 EOF
-
-        echo "XXX"; echo "88"; echo "Installing bootloader (BIOS + UEFI)..."; echo "XXX"
-        chroot "$MOUNT" /usr/sbin/grub-install --target=i386-pc "$TARGET_DISK" \
+        # Seed grubenv with default + saved_entry pointing at slot_a so
+        # the very first boot lands on slot_a unambiguously. grub-editenv
+        # creates the file with the right size (1024 bytes, zero-padded).
+        chroot "$MOUNT" /usr/bin/grub-editenv /boot/efi/grub/grubenv set saved_entry=slot_a \
             >> "$INSTALL_LOG" 2>&1
+
+        echo "XXX"; echo "88"; echo "Installing bootloader (BIOS + UEFI to ESP)..."; echo "XXX"
+        # Use --boot-directory=/boot/efi so BOTH BIOS and UEFI grub
+        # read their config (and grubenv) from the ESP. Without this,
+        # BIOS grub embeds slot_a's UUID + /boot/grub path into
+        # core.img — meaning a damaged slot_a breaks the boot menu
+        # even when slot_b is healthy.
+        chroot "$MOUNT" /usr/sbin/grub-install --target=i386-pc \
+            --boot-directory=/boot/efi \
+            "$TARGET_DISK" >> "$INSTALL_LOG" 2>&1
         chroot "$MOUNT" /usr/sbin/grub-install --target=x86_64-efi \
             --efi-directory=/boot/efi \
+            --boot-directory=/boot/efi \
             --bootloader-id=SPATIUMDDI \
             --removable \
             >> "$INSTALL_LOG" 2>&1 || true

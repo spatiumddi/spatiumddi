@@ -243,14 +243,113 @@ def cmd_apply(args) -> int:
     return 0
 
 
+GRUB_BOOT_DIR = "/boot/efi"   # Phase 8c — grub.cfg + grubenv live on ESP
+GRUBENV = Path("/boot/efi/grub/grubenv")
+
+
+def _read_grubenv_default() -> str:
+    """Return current saved_entry from grubenv (e.g. 'slot_a'). Falls
+    back to 'slot_a' if grubenv is missing or unparseable."""
+    if not GRUBENV.exists():
+        return "slot_a"
+    try:
+        proc = subprocess.run(
+            ["grub-editenv", str(GRUBENV), "list"],
+            capture_output=True, text=True, check=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return "slot_a"
+    for line in proc.stdout.splitlines():
+        if line.startswith("saved_entry="):
+            return line.split("=", 1)[1].strip()
+    return "slot_a"
+
+
 def cmd_set_next_boot(args) -> int:
-    print(f"set-next-boot {args.slot}: stub — Phase 8c (boot counting + grub-reboot --once)")
-    return 1
+    """Set the inactive slot as the next boot's default — ONE SHOT.
+
+    Uses `grub-reboot` which sets saved_entry to the target for the
+    next boot only; after that boot, grub auto-reverts to the previous
+    saved_entry. The safety net: if the new slot fails to boot (kernel
+    panic, /health/live timeout, etc.) the system falls back to the
+    last-good slot automatically — no operator intervention needed.
+
+    spatiumddi-firstboot.service is responsible for COMMITTING the
+    new slot via `grub-set-default` once /health/live confirms the
+    upgraded slot is healthy. Without that commit, even a successful
+    boot reverts to the previous slot on next reboot.
+    """
+    if os.geteuid() != 0:
+        print("ERROR: must run as root (writes to grubenv)", file=sys.stderr)
+        return 2
+
+    pair = detect_active_inactive()
+    if not pair:
+        print("ERROR: couldn't detect A/B slots", file=sys.stderr)
+        return 2
+    active, inactive = pair
+
+    target = args.slot or inactive["partlabel"]
+    target = target.lower()
+    if target not in ("slot_a", "root_a", "a"):
+        if target not in ("slot_b", "root_b", "b"):
+            print(f"ERROR: unknown slot '{args.slot}', expected root_a/slot_a/A or root_b/slot_b/B",
+                  file=sys.stderr)
+            return 2
+        target = "slot_b"
+    else:
+        target = "slot_a"
+
+    print(f"Setting next-boot to {target} (one-shot — will auto-revert if boot fails)")
+    try:
+        subprocess.run(
+            ["grub-reboot", "--boot-directory=" + GRUB_BOOT_DIR, target],
+            check=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError) as exc:
+        print(f"ERROR: grub-reboot failed: {exc}", file=sys.stderr)
+        return 3
+    current = _read_grubenv_default()
+    print(f"  grubenv saved_entry now = {current} (next boot only)")
+    print()
+    print(f"Active slot stays {active['partlabel']} until you `reboot`.")
+    print(f"On reboot you'll boot into {target}; if /health/live passes,")
+    print(f"spatiumddi-firstboot will commit it as the new default. If not,")
+    print(f"the next reboot after that falls back to {active['partlabel']}.")
+    return 0
 
 
 def cmd_rollback(_args) -> int:
-    print("rollback: stub — Phase 8c (atomic GRUB default flip)")
-    return 1
+    """Flip the persistent default to the inactive slot — durable.
+
+    Different from set-next-boot: this commits the swap (grub-set-default)
+    so every future boot uses the new slot until another rollback or
+    upgrade. Use this when you want to permanently revert to a known-
+    good previous slot, not just try it once.
+    """
+    if os.geteuid() != 0:
+        print("ERROR: must run as root (writes to grubenv)", file=sys.stderr)
+        return 2
+
+    pair = detect_active_inactive()
+    if not pair:
+        print("ERROR: couldn't detect A/B slots", file=sys.stderr)
+        return 2
+    active, inactive = pair
+    target = "slot_a" if inactive["partlabel"] == "root_a" else "slot_b"
+    print(f"Committing rollback: default boot → {target} ({inactive['device']})")
+    try:
+        subprocess.run(
+            ["grub-set-default", "--boot-directory=" + GRUB_BOOT_DIR, target],
+            check=True,
+        )
+    except (FileNotFoundError, subprocess.CalledProcessError) as exc:
+        print(f"ERROR: grub-set-default failed: {exc}", file=sys.stderr)
+        return 3
+    print(f"  grubenv saved_entry = {_read_grubenv_default()}")
+    print()
+    print(f"Run `reboot` when ready to switch.")
+    return 0
 
 
 def main() -> int:
@@ -264,10 +363,12 @@ def main() -> int:
     apply_p.add_argument("--checksum", help="URL or path to a SHA-256 sidecar file")
 
     nxt = sub.add_parser("set-next-boot",
-                         help="mark a slot as the next boot target (Phase 8c — stub)")
-    nxt.add_argument("slot", choices=["root_a", "root_b"])
+                         help="set the next boot to a slot ONCE (grub-reboot — auto-reverts on failure)")
+    nxt.add_argument("slot", nargs="?", default=None,
+                     help="slot_a / slot_b / a / b — defaults to the inactive slot")
 
-    sub.add_parser("rollback", help="rollback to the previous slot (Phase 8c — stub)")
+    sub.add_parser("rollback",
+                   help="durably set the inactive slot as default (grub-set-default — commits the swap)")
 
     args = parser.parse_args()
     return {
