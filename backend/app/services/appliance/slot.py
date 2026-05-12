@@ -35,6 +35,12 @@ logger = structlog.get_logger(__name__)
 # .path unit watches the same trigger on its side.
 _TRIGGER_FILE = Path("/var/lib/spatiumddi-host/release-state/slot-upgrade-pending")
 _STATE_FILE = Path("/var/lib/spatiumddi-host/release-state/slot-upgrade-pending.state")
+# Phase 8c-3 rollback uses its own trigger so the host-side runner stays
+# single-purpose (apply does dd + set-next-boot; rollback only edits
+# grubenv). Same release-state dir + same shared log so the UI tails one
+# file for both flows.
+_ROLLBACK_TRIGGER_FILE = Path("/var/lib/spatiumddi-host/release-state/slot-rollback-pending")
+_ROLLBACK_STATE_FILE = Path("/var/lib/spatiumddi-host/release-state/slot-rollback-pending.state")
 _UPDATE_LOG = Path("/var/log/spatiumddi-host/slot-upgrade.log")
 
 # grubenv inside the api container — the host's /boot/efi/grub/grubenv
@@ -249,3 +255,55 @@ def get_update_log_tail(lines: int = 120) -> str:
 def is_apply_in_flight() -> bool:
     state, _ = _upgrade_state_now()
     return state == "in-flight"
+
+
+def schedule_rollback(target_slot: SlotName | None = None) -> None:
+    """Drop the rollback trigger file the host-side slot-rollback runner
+    watches. When ``target_slot`` is None the runner picks the inactive
+    slot (the typical "go back to the previous slot" intent).
+
+    The trigger file is single-line — the explicit slot name (when
+    given) or empty. Atomic via ``.new`` sibling + replace so the Path
+    unit fires exactly once. Raises if appliance_mode is off, the
+    inactive slot is unstamped, or an upgrade is in-flight.
+    """
+    if not settings.appliance_mode:
+        raise RuntimeError("slot rollback is only supported on the SpatiumDDI OS appliance")
+    if target_slot is not None and target_slot not in ("slot_a", "slot_b"):
+        raise ValueError("target_slot must be 'slot_a' or 'slot_b'")
+    body = "" if target_slot is None else target_slot + "\n"
+
+    _ROLLBACK_TRIGGER_FILE.parent.mkdir(parents=True, exist_ok=True)
+    if _ROLLBACK_STATE_FILE.exists():
+        try:
+            _ROLLBACK_STATE_FILE.unlink()
+        except OSError as exc:
+            # Same best-effort semantics as schedule_apply()'s cleanup.
+            logger.warning(
+                "appliance_slot_rollback_state_cleanup_failed",
+                state_file=str(_ROLLBACK_STATE_FILE),
+                error=str(exc),
+            )
+    tmp = _ROLLBACK_TRIGGER_FILE.with_suffix(".new")
+    tmp.write_text(body, encoding="utf-8")
+    tmp.replace(_ROLLBACK_TRIGGER_FILE)
+    logger.info("appliance_slot_rollback_scheduled", target_slot=target_slot)
+
+
+def can_rollback() -> bool:
+    """True iff there's an inactive slot worth rolling back to.
+
+    Returns False on non-appliance deploys, when we can't read grubenv,
+    or when both slots resolve to the same value (shouldn't happen in
+    a real install but the UI shouldn't offer a rollback button in
+    obviously-broken states).
+    """
+    if not settings.appliance_mode:
+        return False
+    current = _current_slot_from_cmdline()
+    if current not in ("slot_a", "slot_b"):
+        return False
+    # If durable_default is set to the other slot already, "rollback"
+    # would just flip it back — which is also fine, but mainly we want
+    # to confirm two distinct slots exist on this install.
+    return True

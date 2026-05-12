@@ -6,11 +6,19 @@ import {
   HardDrive,
   Loader2,
   PlayCircle,
+  Power,
   RefreshCw,
+  RotateCcw,
   Shield,
 } from "lucide-react";
 
-import { applianceSlotApi, type ApplianceSlot } from "@/lib/api";
+import { ConfirmModal } from "@/components/ui/confirm-modal";
+import {
+  applianceReleasesApi,
+  applianceSlotApi,
+  applianceSystemApi,
+  type ApplianceSlot,
+} from "@/lib/api";
 
 /**
  * Phase 8b-3 — Appliance OS slot upgrade UI.
@@ -33,18 +41,26 @@ function slotLabel(s: ApplianceSlot | null): string {
   return "—";
 }
 
-// Phase 8b-4 — stable GitHub Release URLs the workflow emits per cut.
-// The SlotUpgradeCard pre-fills these so the operator's "Apply"
-// click against a fresh install just works without typing.
-const DEFAULT_IMAGE_URL =
-  "https://github.com/spatiumddi/spatiumddi/releases/latest/download/spatiumddi-appliance-slot-amd64.raw.xz";
-const DEFAULT_CHECKSUM_URL =
-  "https://github.com/spatiumddi/spatiumddi/releases/latest/download/spatiumddi-appliance-slot-amd64.sha256";
+// Phase 8b-4 — stable GitHub Release URL convention the release
+// workflow emits per cut. ``<tag>`` slots in as the release CalVer
+// (e.g. ``2026.05.12-1``) for versioned URLs, or ``latest`` for the
+// stable un-versioned URL the un-pinned operator wants.
+const SLOT_IMAGE_URL = (tag: string) =>
+  `https://github.com/spatiumddi/spatiumddi/releases/download/${tag}/spatiumddi-appliance-slot-amd64.raw.xz`;
+const SLOT_CHECKSUM_URL = (tag: string) =>
+  `https://github.com/spatiumddi/spatiumddi/releases/download/${tag}/spatiumddi-appliance-slot-amd64.sha256`;
+
+type SourceMode = "release" | "custom";
 
 export function SlotUpgradeCard() {
   const qc = useQueryClient();
-  const [imageUrl, setImageUrl] = useState(DEFAULT_IMAGE_URL);
-  const [checksumUrl, setChecksumUrl] = useState(DEFAULT_CHECKSUM_URL);
+  const [sourceMode, setSourceMode] = useState<SourceMode>("release");
+  const [selectedTag, setSelectedTag] = useState<string>("");
+  const [customImageUrl, setCustomImageUrl] = useState("");
+  const [customChecksumUrl, setCustomChecksumUrl] = useState("");
+  const [applyConfirm, setApplyConfirm] = useState(false);
+  const [rollbackConfirm, setRollbackConfirm] = useState(false);
+  const [rebootConfirm, setRebootConfirm] = useState(false);
 
   const { data, isLoading, error, refetch } = useQuery({
     queryKey: ["appliance", "slot-upgrade"],
@@ -54,10 +70,70 @@ export function SlotUpgradeCard() {
       q.state.data?.upgrade_state === "in-flight" ? 3_000 : 30_000,
   });
 
+  // GitHub releases — feeds the release picker. The list call is the
+  // same one Releases tab uses (cached 60 s server-side) so opening
+  // the OS Image tab won't fire a duplicate GitHub API hit.
+  const {
+    data: releasesData,
+    isLoading: releasesLoading,
+    error: releasesError,
+  } = useQuery({
+    queryKey: ["appliance", "releases"],
+    queryFn: applianceReleasesApi.list,
+    staleTime: 60_000,
+  });
+  const releases = releasesData?.releases ?? [];
+
+  // Default selection — first non-prerelease (releases come back
+  // newest-first from the api). Falls through to "" if nothing is
+  // available; the Apply button stays disabled until a tag resolves.
+  const defaultTag =
+    releases.find((r) => !r.is_prerelease)?.tag ?? releases[0]?.tag ?? "";
+  const effectiveTag = selectedTag || defaultTag;
+
+  // Resolve the URLs the apply mutation actually submits, branched
+  // on source mode. Release mode derives both URLs from the picked
+  // tag; custom mode reads the two text inputs verbatim.
+  const resolvedImageUrl =
+    sourceMode === "release"
+      ? effectiveTag
+        ? SLOT_IMAGE_URL(effectiveTag)
+        : ""
+      : customImageUrl.trim();
+  const resolvedChecksumUrl =
+    sourceMode === "release"
+      ? effectiveTag
+        ? SLOT_CHECKSUM_URL(effectiveTag)
+        : ""
+      : customChecksumUrl.trim();
+
   const apply = useMutation({
     mutationFn: () =>
-      applianceSlotApi.apply(imageUrl.trim(), checksumUrl.trim() || null),
+      applianceSlotApi.apply(resolvedImageUrl, resolvedChecksumUrl || null),
     onSuccess: () => {
+      setApplyConfirm(false);
+      qc.invalidateQueries({ queryKey: ["appliance", "slot-upgrade"] });
+    },
+  });
+
+  // Reuses the same host-side reboot trigger Maintenance tab uses
+  // (systemd path unit, 10 s grace). Surfaced here so the operator
+  // doesn't have to navigate tabs after a successful apply/rollback.
+  const reboot = useMutation({
+    mutationFn: applianceSystemApi.reboot,
+    onSuccess: () => {
+      setRebootConfirm(false);
+      qc.invalidateQueries({ queryKey: ["appliance", "system"] });
+    },
+  });
+
+  const rollback = useMutation({
+    // Phase 8c-3 — flip the durable default to the inactive slot.
+    // ``target_slot: null`` lets the host-side runner auto-pick the
+    // inactive slot (matches the "go back to the previous slot" intent).
+    mutationFn: () => applianceSlotApi.rollback(null),
+    onSuccess: () => {
+      setRollbackConfirm(false);
       qc.invalidateQueries({ queryKey: ["appliance", "slot-upgrade"] });
     },
   });
@@ -93,15 +169,39 @@ export function SlotUpgradeCard() {
             come up. Active slot is never touched during apply.
           </p>
         </div>
-        <button
-          type="button"
-          className="inline-flex shrink-0 items-center gap-1.5 rounded-md border bg-background px-2 py-1 text-xs text-muted-foreground hover:bg-muted"
-          onClick={() => refetch()}
-          disabled={isLoading}
-        >
-          <RefreshCw className={`h-3 w-3 ${isLoading ? "animate-spin" : ""}`} />
-          Refresh
-        </button>
+        <div className="flex shrink-0 items-center gap-1.5">
+          {/* Phase 8c-3 — rollback button. Hidden when there's no
+              inactive slot to roll back to (fresh install, no upgrade
+              ever applied) and during a trial boot — in a trial boot
+              the "inactive" slot is the durable one, so a "rollback
+              to inactive" would commit the trial, which is the
+              opposite of the operator's intent. During a trial boot
+              the right action is just reboot (which reverts), handled
+              via the Maintenance tab. */}
+          {data?.current_slot && inactiveSlot && !trial && (
+            <button
+              type="button"
+              className="inline-flex items-center gap-1.5 rounded-md border bg-background px-2 py-1 text-xs text-muted-foreground hover:bg-muted disabled:opacity-50"
+              onClick={() => setRollbackConfirm(true)}
+              disabled={inFlight || rollback.isPending}
+              title={`Durably switch back to ${slotLabel(inactiveSlot)} (reboot required to take effect).`}
+            >
+              <RotateCcw className="h-3 w-3" />
+              Rollback to {inactiveSlot === "slot_a" ? "A" : "B"}
+            </button>
+          )}
+          <button
+            type="button"
+            className="inline-flex items-center gap-1.5 rounded-md border bg-background px-2 py-1 text-xs text-muted-foreground hover:bg-muted"
+            onClick={() => refetch()}
+            disabled={isLoading}
+          >
+            <RefreshCw
+              className={`h-3 w-3 ${isLoading ? "animate-spin" : ""}`}
+            />
+            Refresh
+          </button>
+        </div>
       </div>
 
       {error && (
@@ -133,50 +233,144 @@ export function SlotUpgradeCard() {
       </div>
 
       {trial && (
-        <div className="flex items-start gap-2 rounded-md border border-amber-500/50 bg-amber-500/10 p-2.5 text-xs text-amber-700 dark:text-amber-300">
-          <Shield className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-          <div>
-            <div className="font-semibold">Trial boot</div>
-            <div className="mt-0.5">
-              You’re on{" "}
-              <code className="rounded bg-amber-500/10 px-1">
-                {data?.current_slot}
-              </code>{" "}
-              but the durable default is still{" "}
-              <code className="rounded bg-amber-500/10 px-1">
-                {data?.durable_default}
-              </code>
-              . Once <code>/health/live</code> confirms, the swap commits
-              automatically. A reboot before commit reverts.
+        <div className="flex items-start justify-between gap-3 rounded-md border border-amber-500/50 bg-amber-500/10 p-2.5 text-xs text-amber-700 dark:text-amber-300">
+          <div className="flex items-start gap-2">
+            <Shield className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+            <div>
+              <div className="font-semibold">
+                Slot mismatch — reboot pending
+              </div>
+              <div className="mt-0.5">
+                Active slot{" "}
+                <code className="rounded bg-amber-500/10 px-1">
+                  {data?.current_slot}
+                </code>{" "}
+                differs from the durable default{" "}
+                <code className="rounded bg-amber-500/10 px-1">
+                  {data?.durable_default}
+                </code>
+                . Reboot to land on the durable. After an apply, the new slot's{" "}
+                <code>/health/live</code> determines whether the swap stays
+                committed; after a manual rollback the durable is already set
+                explicitly.
+              </div>
             </div>
           </div>
+          <button
+            type="button"
+            className="inline-flex shrink-0 items-center gap-1.5 self-center rounded-md border border-amber-600/40 bg-amber-50 px-2.5 py-1 text-xs font-semibold text-amber-800 hover:bg-amber-100 disabled:opacity-50 dark:bg-amber-900/30 dark:text-amber-100 dark:hover:bg-amber-900/50"
+            onClick={() => setRebootConfirm(true)}
+            disabled={reboot.isPending}
+          >
+            <Power className="h-3.5 w-3.5" />
+            Reboot now
+          </button>
         </div>
       )}
 
       {/* Apply form */}
       <div className="space-y-2">
-        <label className="text-xs font-medium">
-          Slot image URL or local path
-          <input
-            type="text"
-            value={imageUrl}
-            onChange={(e) => setImageUrl(e.target.value)}
-            placeholder="https://github.com/spatiumddi/spatiumddi/releases/download/.../spatiumddi-appliance-slot-amd64.raw.xz"
-            disabled={inFlight}
-            className="mt-1 block w-full rounded-md border bg-background px-2 py-1.5 font-mono text-xs disabled:opacity-50"
-          />
-        </label>
-        <label className="text-xs font-medium">
-          SHA-256 sidecar URL (optional)
-          <input
-            type="text"
-            value={checksumUrl}
-            onChange={(e) => setChecksumUrl(e.target.value)}
-            placeholder="https://.../spatiumddi-appliance-slot-amd64.sha256"
-            disabled={inFlight}
-            className="mt-1 block w-full rounded-md border bg-background px-2 py-1.5 font-mono text-xs disabled:opacity-50"
-          />
-        </label>
+        {sourceMode === "release" ? (
+          <>
+            <label className="text-xs font-medium">
+              <div className="flex items-center justify-between gap-2">
+                <span>SpatiumDDI release</span>
+                <button
+                  type="button"
+                  className="text-xs font-normal text-muted-foreground underline-offset-2 hover:underline"
+                  onClick={() => setSourceMode("custom")}
+                  disabled={inFlight}
+                >
+                  Use custom URL or local path →
+                </button>
+              </div>
+              <select
+                value={effectiveTag}
+                onChange={(e) => setSelectedTag(e.target.value)}
+                disabled={inFlight || releasesLoading || releases.length === 0}
+                className="mt-1 block w-full rounded-md border bg-background px-2 py-1.5 font-mono text-xs disabled:opacity-50"
+              >
+                {releasesLoading && (
+                  <option value="">Loading releases from GitHub…</option>
+                )}
+                {!releasesLoading && releases.length === 0 && (
+                  <option value="">
+                    No GitHub releases found — switch to custom URL
+                  </option>
+                )}
+                {releases.map((r) => {
+                  const date = new Date(r.published_at).toLocaleDateString();
+                  const installed = r.is_installed ? " · installed stack" : "";
+                  const pre = r.is_prerelease ? " · pre-release" : "";
+                  return (
+                    <option key={r.tag} value={r.tag}>
+                      {r.tag} — {date}
+                      {installed}
+                      {pre}
+                    </option>
+                  );
+                })}
+              </select>
+            </label>
+            {effectiveTag && (
+              <p className="text-[11px] text-muted-foreground">
+                Will fetch{" "}
+                <code className="rounded bg-muted px-1 font-mono">
+                  spatiumddi-appliance-slot-amd64.raw.xz
+                </code>{" "}
+                + matching{" "}
+                <code className="rounded bg-muted px-1 font-mono">.sha256</code>{" "}
+                from the{" "}
+                <code className="rounded bg-muted px-1 font-mono">
+                  {effectiveTag}
+                </code>{" "}
+                release.
+              </p>
+            )}
+            {releasesError && (
+              <p className="text-[11px] text-destructive">
+                Couldn’t load the GitHub releases list (
+                {(releasesError as Error).message}). Switch to custom URL to
+                apply manually.
+              </p>
+            )}
+          </>
+        ) : (
+          <>
+            <label className="text-xs font-medium">
+              <div className="flex items-center justify-between gap-2">
+                <span>Slot image URL or local path</span>
+                <button
+                  type="button"
+                  className="text-xs font-normal text-muted-foreground underline-offset-2 hover:underline"
+                  onClick={() => setSourceMode("release")}
+                  disabled={inFlight}
+                >
+                  ← Pick a GitHub release instead
+                </button>
+              </div>
+              <input
+                type="text"
+                value={customImageUrl}
+                onChange={(e) => setCustomImageUrl(e.target.value)}
+                placeholder="https://… or /absolute/path/to/spatiumddi-appliance-slot-amd64.raw.xz"
+                disabled={inFlight}
+                className="mt-1 block w-full rounded-md border bg-background px-2 py-1.5 font-mono text-xs disabled:opacity-50"
+              />
+            </label>
+            <label className="text-xs font-medium">
+              SHA-256 sidecar URL (optional)
+              <input
+                type="text"
+                value={customChecksumUrl}
+                onChange={(e) => setCustomChecksumUrl(e.target.value)}
+                placeholder="https://…/spatiumddi-appliance-slot-amd64.sha256"
+                disabled={inFlight}
+                className="mt-1 block w-full rounded-md border bg-background px-2 py-1.5 font-mono text-xs disabled:opacity-50"
+              />
+            </label>
+          </>
+        )}
         <div className="flex items-center justify-between gap-2">
           <div className="text-xs text-muted-foreground">
             Writes to{" "}
@@ -188,8 +382,8 @@ export function SlotUpgradeCard() {
           <button
             type="button"
             className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-xs font-semibold text-primary-foreground disabled:opacity-50"
-            onClick={() => apply.mutate()}
-            disabled={inFlight || !imageUrl.trim() || apply.isPending}
+            onClick={() => setApplyConfirm(true)}
+            disabled={inFlight || !resolvedImageUrl || apply.isPending}
           >
             {inFlight || apply.isPending ? (
               <>
@@ -221,15 +415,27 @@ export function SlotUpgradeCard() {
       )}
 
       {data?.upgrade_state === "done" && (
-        <div className="flex items-start gap-2 rounded-md border border-green-500/50 bg-green-500/10 p-2.5 text-xs text-green-700 dark:text-green-300">
-          <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0" />
-          <div>
-            <div className="font-semibold">Apply complete</div>
-            <div className="mt-0.5">
-              {slotLabel(inactiveSlot)} is ready and armed for next boot. Reboot
-              to switch — health-check passes will commit it automatically.
+        <div className="flex items-start justify-between gap-3 rounded-md border border-green-500/50 bg-green-500/10 p-2.5 text-xs text-green-700 dark:text-green-300">
+          <div className="flex items-start gap-2">
+            <CheckCircle2 className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+            <div>
+              <div className="font-semibold">Apply complete</div>
+              <div className="mt-0.5">
+                {slotLabel(inactiveSlot)} is ready and armed for next boot.
+                Reboot to switch — health-check passes will commit it
+                automatically.
+              </div>
             </div>
           </div>
+          <button
+            type="button"
+            className="inline-flex shrink-0 items-center gap-1.5 self-center rounded-md border border-green-600/40 bg-green-50 px-2.5 py-1 text-xs font-semibold text-green-800 hover:bg-green-100 disabled:opacity-50 dark:bg-green-900/30 dark:text-green-100 dark:hover:bg-green-900/50"
+            onClick={() => setRebootConfirm(true)}
+            disabled={reboot.isPending}
+          >
+            <Power className="h-3.5 w-3.5" />
+            Reboot now
+          </button>
         </div>
       )}
 
@@ -257,6 +463,137 @@ export function SlotUpgradeCard() {
           </pre>
         </div>
       )}
+
+      <ConfirmModal
+        open={applyConfirm}
+        title={`Apply${
+          sourceMode === "release" && effectiveTag ? ` ${effectiveTag}` : ""
+        } to ${slotLabel(inactiveSlot)}?`}
+        message={
+          <div className="space-y-2">
+            <p>
+              This streams the slot image into{" "}
+              <code className="rounded bg-muted px-1 font-mono">
+                {inactiveSlot ?? "—"}
+              </code>{" "}
+              via dd, arms grub one-shot, and rolls back automatically if{" "}
+              <code>/health/live</code> doesn’t come up on the new slot. The
+              active slot{" "}
+              <code className="rounded bg-muted px-1 font-mono">
+                {data?.current_slot ?? "—"}
+              </code>{" "}
+              is never touched during apply.
+            </p>
+            <p>
+              Source:{" "}
+              <code className="rounded bg-muted px-1 font-mono break-all">
+                {resolvedImageUrl || "—"}
+              </code>
+              {resolvedChecksumUrl && (
+                <>
+                  <br />
+                  Checksum:{" "}
+                  <code className="rounded bg-muted px-1 font-mono break-all">
+                    {resolvedChecksumUrl}
+                  </code>
+                </>
+              )}
+            </p>
+            <p>
+              The swap doesn’t take effect until you reboot — the active slot
+              keeps running uninterrupted until then. Worst case is one wasted
+              reboot that lands back on the current slot.
+            </p>
+            {apply.isError && (
+              <p className="text-destructive">
+                {(apply.error as Error).message}
+              </p>
+            )}
+          </div>
+        }
+        confirmLabel="Apply"
+        cancelLabel="Cancel"
+        loading={apply.isPending}
+        onConfirm={() => apply.mutate()}
+        onClose={() => !apply.isPending && setApplyConfirm(false)}
+      />
+
+      <ConfirmModal
+        open={rollbackConfirm}
+        title={`Rollback to ${slotLabel(inactiveSlot)}?`}
+        message={
+          <div className="space-y-2">
+            <p>
+              This durably flips the boot default from{" "}
+              <code className="rounded bg-muted px-1 font-mono">
+                {data?.current_slot ?? "—"}
+              </code>{" "}
+              to{" "}
+              <code className="rounded bg-muted px-1 font-mono">
+                {inactiveSlot ?? "—"}
+              </code>
+              . The active slot keeps running until you reboot — the swap
+              doesn’t take effect until then.
+            </p>
+            <p>
+              Operator state on <code>/var</code> (databases, container images,
+              certs, audit log) is shared across slots and is not touched. The
+              OS layer (kernel, systemd units, host binaries) reverts to
+              whatever shipped on the target slot. If the target slot is
+              unstamped or carries a broken image, reboot will fail and the next
+              reboot reverts to the current slot automatically (Phase 8c safety
+              net).
+            </p>
+            {rollback.isError && (
+              <p className="text-destructive">
+                {(rollback.error as Error).message}
+              </p>
+            )}
+          </div>
+        }
+        confirmLabel="Rollback"
+        cancelLabel="Cancel"
+        tone="destructive"
+        loading={rollback.isPending}
+        onConfirm={() => rollback.mutate()}
+        onClose={() => !rollback.isPending && setRollbackConfirm(false)}
+      />
+
+      <ConfirmModal
+        open={rebootConfirm}
+        title="Reboot appliance?"
+        message={
+          <div className="space-y-2">
+            <p>
+              The host reboots after a 10 s grace window. All SpatiumDDI
+              services stop while the appliance restarts — typical downtime is
+              30–60 s before HTTPS comes back. DHCP and DNS pause during this
+              window.
+            </p>
+            <p>
+              On boot, the appliance loads slot{" "}
+              <code className="rounded bg-muted px-1 font-mono">
+                {data?.durable_default ?? data?.current_slot ?? "—"}
+              </code>
+              .{" "}
+              {data?.is_trial_boot
+                ? "The slot mismatch resolves on this reboot."
+                : "No slot change pending — this just reboots the current slot."}
+            </p>
+            {reboot.isError && (
+              <p className="text-destructive">
+                {(reboot.error as Error).message}
+              </p>
+            )}
+          </div>
+        }
+        confirmLabel="Reboot now"
+        cancelLabel="Cancel"
+        tone="destructive"
+        loading={reboot.isPending}
+        onConfirm={() => reboot.mutate()}
+        onClose={() => !reboot.isPending && setRebootConfirm(false)}
+      />
     </div>
   );
 }

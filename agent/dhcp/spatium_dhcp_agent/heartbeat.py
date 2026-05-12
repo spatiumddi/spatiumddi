@@ -13,6 +13,7 @@ import structlog
 from . import __version__
 from .cache import save_token
 from .config import AgentConfig
+from .slot_state import collect as collect_slot_state
 
 log = structlog.get_logger(__name__)
 
@@ -44,7 +45,7 @@ class HeartbeatClient:
         if acks is not None:
             while acks:
                 ops_ack.append(acks.pop(0))
-        body = {
+        body: dict[str, Any] = {
             "agent_version": __version__,
             "pid": os.getpid(),
             "status": self.daemon_status.get("status", "ok"),
@@ -52,6 +53,11 @@ class HeartbeatClient:
             "lease_count_since_start": self.lease_count_since_start,
             "ops_ack": ops_ack,
         }
+        # Phase 8f-2 — agent reports its slot + deployment state. On
+        # docker / k8s deploys most fields come back None; only
+        # ``deployment_kind`` is always populated so the Fleet view
+        # can render the row correctly even without slot info.
+        body.update(collect_slot_state())
         try:
             with self._client() as c:
                 resp = c.post(

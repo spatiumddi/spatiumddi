@@ -284,6 +284,16 @@ services:
     volumes:
       - dns_bind9_state:/var/lib/spatium-dns-agent
       - dns_bind9_cache:/var/cache/bind
+      # Phase 8f-2 — agent reports its slot + deployment state on every
+      # heartbeat so the control plane's Fleet view can drive fleet
+      # upgrades. Read-only mounts of the appliance host's role/release
+      # stamps + grubenv + slot-upgrade .state sidecar. Same mount
+      # convention the api container uses (``…-host`` suffix). On
+      # docker / k8s deploys these host paths don't exist; the agent's
+      # slot_state.py silently falls through to None values.
+      - /etc/spatiumddi:/etc/spatiumddi-host:ro
+      - /boot/efi:/boot/efi-host:ro
+      - /var/lib/spatiumddi/release-state:/var/lib/spatiumddi-host/release-state:ro
     # No depends_on: api — on agent-mode appliances the api isn't in
     # this compose, and the agent already retries forever on bootstrap
     # 401/404 (it caches a JWT after the first success).
@@ -319,6 +329,10 @@ services:
     volumes:
       - dns_powerdns_state:/var/lib/spatium-dns-agent
       - dns_powerdns_lmdb:/var/lib/powerdns
+      # Phase 8f-2 — see dns-bind9 above for the mount rationale.
+      - /etc/spatiumddi:/etc/spatiumddi-host:ro
+      - /boot/efi:/boot/efi-host:ro
+      - /var/lib/spatiumddi/release-state:/var/lib/spatiumddi-host/release-state:ro
 
   # ── DHCP (Kea) — default profile ────────────────────────────────────────────
   # Host networking is required for DHCP broadcast (DDI appliance
@@ -348,6 +362,10 @@ services:
     volumes:
       - dhcp_kea_state:/var/lib/spatium-dhcp-agent
       - dhcp_kea_leases:/var/lib/kea
+      # Phase 8f-2 — see dns-bind9 above for the mount rationale.
+      - /etc/spatiumddi:/etc/spatiumddi-host:ro
+      - /boot/efi:/boot/efi-host:ro
+      - /var/lib/spatiumddi/release-state:/var/lib/spatiumddi-host/release-state:ro
     # No depends_on: api — agent retries until the control plane is
     # reachable; on agent-mode installs the api isn't even in this
     # compose.

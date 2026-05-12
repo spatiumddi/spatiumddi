@@ -7,6 +7,7 @@ protocol shape — DHCP reuses identical semantics.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import hmac
 import os
 import uuid
@@ -72,6 +73,16 @@ class AgentHeartbeatRequest(BaseModel):
     config: dict[str, Any] = {}
     ops_ack: list[dict[str, Any]] = []
     failed_ops_count: int = 0
+    # Phase 8f-2 — agent reports its slot state + deployment environment.
+    # See DNSServer agents.py for the per-field semantics. All optional
+    # so older agents keep heartbeating without a 422.
+    deployment_kind: str | None = None
+    installed_appliance_version: str | None = None
+    current_slot: str | None = None
+    durable_default: str | None = None
+    is_trial_boot: bool | None = None
+    last_upgrade_state: str | None = None
+    last_upgrade_state_at: datetime | None = None
 
 
 class AgentHeartbeatResponse(BaseModel):
@@ -298,7 +309,12 @@ async def agent_config_longpoll(
     deadline = asyncio.get_event_loop().time() + LONGPOLL_TIMEOUT_SECONDS
     while True:
         bundle = await build_config_bundle(db, server)
-        etag = bundle.etag
+        # Phase 8f-3 — mix the fleet-upgrade intent into the ETag so a
+        # Fleet view change wakes the agent's long-poll even when the
+        # driver-side bundle is unchanged. Deterministic — re-reading
+        # the same DB state yields the same combined ETag.
+        fleet_marker = f"{server.desired_appliance_version}|{server.desired_slot_image_url}"
+        etag = "sha256:" + hashlib.sha256(f"{bundle.etag}|{fleet_marker}".encode()).hexdigest()
 
         # Pending ops fast-path
         ops_res = await db.execute(
@@ -393,6 +409,15 @@ async def agent_config_longpoll(
                     ),
                 },
                 "pending_ops": pending_ops,
+                # Phase 8f-3 — fleet upgrade intent the operator set
+                # from the Fleet view. Agent reads desired_*, compares
+                # against its own installed version on next heartbeat /
+                # bundle pickup, and writes the slot-upgrade trigger
+                # if mismatched. Both values None when nothing pending.
+                "fleet_upgrade": {
+                    "desired_appliance_version": server.desired_appliance_version,
+                    "desired_slot_image_url": server.desired_slot_image_url,
+                },
             }
         if asyncio.get_event_loop().time() >= deadline:
             return Response(status_code=304, headers={"ETag": etag})
@@ -418,6 +443,36 @@ async def agent_heartbeat(
         server.last_seen_ip = request.client.host
     if body.agent_version:
         server.agent_version = body.agent_version
+
+    # Phase 8f-2 — persist whatever slot state the agent reported. Only
+    # overwrite when the agent actually sent a value (older agents
+    # leave these as None, in which case we leave the DB columns
+    # untouched rather than nulling out previously-known state).
+    if body.deployment_kind is not None:
+        server.deployment_kind = body.deployment_kind
+    if body.installed_appliance_version is not None:
+        server.installed_appliance_version = body.installed_appliance_version
+    if body.current_slot is not None:
+        server.current_slot = body.current_slot
+    if body.durable_default is not None:
+        server.durable_default = body.durable_default
+    if body.is_trial_boot is not None:
+        server.is_trial_boot = body.is_trial_boot
+    if body.last_upgrade_state is not None:
+        server.last_upgrade_state = body.last_upgrade_state
+    if body.last_upgrade_state_at is not None:
+        server.last_upgrade_state_at = body.last_upgrade_state_at
+
+    # Phase 8f-7 — auto-clear operator intent once the agent confirms
+    # the upgrade landed. See dns/agents.py for the full rationale.
+    if (
+        server.desired_appliance_version is not None
+        and server.installed_appliance_version
+        and server.installed_appliance_version == server.desired_appliance_version
+        and (server.last_upgrade_state in ("done", None))
+    ):
+        server.desired_appliance_version = None
+        server.desired_slot_image_url = None
 
     for ack in body.ops_ack:
         op_id = ack.get("op_id")

@@ -22,6 +22,171 @@ the formatter handles the rest.
 
 ## Unreleased
 
+## 2026.05.12-2 — 2026-05-12
+
+Closes Phase 8 (issue #138, OS appliance atomic A/B upgrade). The
+previous release shipped the per-box machinery (Phase 8a-8c); this
+one adds the **fleet orchestration** side — control plane drives
+slot upgrades for every registered DNS + DHCP agent from a single
+Fleet tab. Operator picks a release tag, clicks Upgrade against
+N rows, and the agents fire the local slot-upgrade trigger via
+the ConfigBundle long-poll within ~60 s. Docker / k8s agents get
+copy-paste commands instead, since they have no A/B partition to
+dd into. Plus a wave of per-box UX polish around the OS Image
+card: rollback button, GitHub release picker dropdown, apply +
+reboot confirmation modals, and the card promoted from buried-at-
+bottom-of-Releases to its own top-level Appliance tab.
+
+### Added
+
+- **Phase 8f-1 — agent slot state on the server tables.** Nine
+  new columns on both `dns_server` and `dhcp_server`:
+  `desired_appliance_version`, `desired_slot_image_url`,
+  `deployment_kind` (`appliance` / `docker` / `k8s` / `unknown`),
+  `installed_appliance_version`, `current_slot`, `durable_default`,
+  `is_trial_boot`, `last_upgrade_state`, `last_upgrade_state_at`.
+  Migration `f8b1c20d3e72`. All nullable so pre-8f rows and
+  docker / k8s deploys keep working; agent fills them in on its
+  next heartbeat.
+- **Phase 8f-2 — agent heartbeat carries slot state.** New
+  `slot_state.py` module on DNS + DHCP agents introspects the
+  appliance host via bind-mounted paths (`/etc/spatiumddi-host/
+  role-config`, `/etc/spatiumddi-host/appliance-release`,
+  `/boot/efi-host/grub/grubenv`, `/var/lib/spatiumddi-host/
+  release-state/slot-upgrade-pending.state`). Heartbeat clients
+  on both agents merge the collected state into the outbound
+  payload. Server-side heartbeat handlers persist whatever the
+  agent reported, leaving columns the agent didn't send
+  untouched. Appliance docker-compose now mounts the three
+  required host paths on dns-bind9, dns-powerdns, dhcp-kea.
+- **Phase 8f-3 — ConfigBundle plumb-down.** Both DNS and DHCP
+  long-poll responses carry a `fleet_upgrade` block with the
+  desired version + URL. DNS bundle includes them in the etag
+  directly; DHCP wraps the driver-dataclass etag with a fleet
+  marker so a Fleet view change still wakes the agent's long-
+  poll even when the driver bundle is unchanged.
+- **Phase 8f-4 — agent-side trigger fire.** New
+  `maybe_fire_fleet_upgrade()` on each agent's `slot_state`
+  module. Gated on four conditions (deployment is appliance,
+  desired version + URL both set, desired ≠ installed, trigger
+  file not already present). Writes the same
+  `/var/lib/spatiumddi-host/release-state/slot-upgrade-pending`
+  trigger file the per-appliance OS Image card uses, so the
+  host-side `spatiumddi-slot-upgrade.path` unit drives dd +
+  grub-reboot identically.
+- **Phase 8f-5 — Fleet view UI.** New `/appliance/fleet` tab
+  between OS Image and Containers. Single table covering both
+  DNS + DHCP agents: kind chip, name + host + last-seen-ip,
+  deployment chip, installed version, slot (with "(trial)"
+  suffix when current ≠ durable), upgrade-state pill (idle /
+  in-flight blue / done green / failed red), relative last-
+  seen, pending-upgrade chip with inline clear button, Upgrade
+  action. New `/api/v1/appliance/fleet` API surface: `GET /`
+  for the list, `POST /{kind}/{server_id}/upgrade` to stamp
+  desired version, `POST /{kind}/{server_id}/clear` to drop
+  pending intent. Upgrade modal reuses
+  `applianceReleasesApi.list` so the operator picks from the
+  same GitHub release dropdown as the per-box flow. Audit log
+  entry on every fleet write. Auto-refresh every 15 s so the
+  pending → done transition lands within one agent long-poll
+  cycle (~30–60 s).
+- **Phase 8f-6 — manual-upgrade modal for docker / k8s rows.**
+  Docker and k8s agents can't take slot upgrades (no A/B
+  partition). Clicking Manual upgrade… opens a wide modal with
+  the same release picker the appliance flow uses, plus a
+  pre-filled copy-paste command tailored to deployment_kind:
+  `SPATIUMDDI_VERSION=<tag> docker compose pull && up -d` or
+  `helm upgrade spatiumddi-<dns|dhcp> oci://ghcr.io/spatiumddi/
+  charts/spatiumddi --set image.tag=<tag> --reuse-values`. One-
+  click Copy button. The agent reports the new
+  `installed_appliance_version` via its next heartbeat after the
+  operator runs the command, so the Fleet row's Installed
+  column updates without further input.
+- **Phase 8f-7 — auto-clear desired stamp on successful
+  upgrade.** Heartbeat handler on both agents clears
+  `desired_appliance_version` + `desired_slot_image_url` once
+  the agent reports `installed_appliance_version` equal to the
+  desired one and `last_upgrade_state` is `done` (or NULL).
+  The Fleet view's pending-upgrade chip drops on the next
+  refresh.
+- **Phase 8c-3 — rollback button in the OS Image card.**
+  Operator can now flip the durable default back to the
+  previous slot from the UI without SSH'ing in to run
+  `spatium-upgrade-slot commit slot_a`. New host-side
+  `spatiumddi-slot-rollback.path` + `.service` units watch a
+  separate `slot-rollback-pending` trigger file; runner calls
+  `spatium-upgrade-slot commit [<slot>]` (grub-set-default).
+  Backend endpoint `POST /api/v1/appliance/slot-upgrade/rollback`
+  audit-logged via the same pattern as apply. UI button hidden
+  during trial boot (where "rollback to inactive" would commit
+  the trial slot — opposite of operator intent).
+- **GitHub release picker on the OS Image card.** Replaces the
+  two URL text inputs with a single dropdown sourced from
+  `applianceReleasesApi.list`. Operator picks a CalVer tag
+  (e.g. `2026.05.12-1`); both `.raw.xz` and `.sha256` URLs
+  derive from the release workflow's stable URL convention.
+  "Use custom URL or local path →" toggle keeps the old text-
+  input flow available for air-gapped sneakernet, mirrors,
+  and local dev builds. Default-selects the newest non-pre-
+  release tag.
+- **Apply confirmation modal + Reboot-now buttons.** Apply
+  now opens a confirm modal naming the release + both URLs +
+  target slot before any dd. "Reboot now" button on the green
+  "Apply complete" banner triggers the same host-side reboot
+  Maintenance tab uses (10 s grace), so the operator doesn't
+  navigate tabs between apply and reboot. The amber slot-
+  mismatch banner gained the same button + had its copy
+  rewritten to accurately describe both apply-trial and
+  rollback-pending cases (the old wording assumed apply-trial
+  only and was misleading after a rollback).
+
+### Changed
+
+- **OS Image card promoted to its own Appliance tab.** It was
+  buried at the bottom of the Releases tab, below a 25-row
+  GitHub releases list — operators were missing it entirely.
+  Now lives between Releases and Containers with a HardDrive
+  icon and a tab summary that's explicit about the distinction
+  (Releases = container-stack pull-and-recycle; OS Image =
+  atomic A/B host OS upgrade).
+- **Slot-mismatch banner copy rewritten.** The old text said
+  "Once /health/live confirms, the swap commits automatically.
+  A reboot before commit reverts" — true only for apply-trial.
+  After a manual rollback (durable was already set explicitly
+  via grub-set-default; reboot lands on it and stays there)
+  the old copy was actively misleading. New copy is factual
+  about the current ≠ durable state plus a clarification that
+  the swap dynamics depend on whether the operator got there
+  via apply or rollback.
+- **README Getting Started Contents reorganised.** Single
+  "Getting Started" bullet expanded to three entry-point bullets
+  (Codespaces demo, Docker Compose, OS appliance ISO) so first-
+  time visitors can jump straight to their path.
+
+### Fixed
+
+- **grub.cfg heredoc backticks escaped.** Phase 8c's
+  install-time grub.cfg heredoc is intentionally unquoted so
+  `$ROOT_A_UUID` / `$ROOT_B_UUID` expand into the rendered
+  file. The comments inside used raw backticks to reference
+  `grub-reboot <slot>` / `grub-set-default <slot>` — bash
+  parsed those as command substitution, tried to execute
+  `grub-reboot <slot>` (where `<slot>` looks like a redirect
+  to a file with no name), and emitted "syntax error near
+  unexpected token `newline`" on the installer screen. The
+  install actually completed (failed substitutions just write
+  empty strings into the comment lines, and the real
+  menuentries were intact) but the red errors on screen were
+  unnerving. Backticks now backslash-escaped in the heredoc
+  body so bash treats them as literal — same way
+  `\${next_entry}` works on the lines below.
+
+### Migrations
+
+- `f8b1c20d3e72` (Phase 8f-1) — `dns_server` and `dhcp_server`
+  gain nine agent-slot-state columns. All nullable except
+  `is_trial_boot` (server-default `false`). Reversible.
+
 ## 2026.05.12-1 — 2026-05-12
 
 Two appliance pillars land back-to-back. **Phase 4h** rewrites the

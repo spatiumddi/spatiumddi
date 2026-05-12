@@ -345,6 +345,84 @@ baseline fstab + a snapshotted `/usr/lib/etc.image/`. Every
 GitHub release attaches the slot image + its SHA-256 sidecar
 at versioned + `/latest/` URLs.
 
+### 5c. Phase 8f fleet upgrade orchestration
+
+The Phase 8b/8c machinery covers one appliance at a time —
+operator opens that appliance's `/appliance` UI and applies a
+slot upgrade. For deployments with multiple agent appliances
+(role-split DNS + DHCP boxes registered against a remote control
+plane), the **Fleet** tab in the control plane's `/appliance` UI
+drives upgrades for all of them from a single screen.
+
+**How it works:**
+
+* Each registered agent (DNS-BIND / DNS-PowerDNS / DHCP) reports
+  its slot state on every heartbeat — `deployment_kind`
+  (appliance / docker / k8s / unknown), `installed_appliance_version`,
+  `current_slot`, `durable_default`, `is_trial_boot`,
+  `last_upgrade_state`. The agent introspects via bind-mounted host
+  paths the appliance docker-compose drops in (`/etc/spatiumddi-host`,
+  `/boot/efi-host/grub/grubenv`, `/var/lib/spatiumddi-host/
+  release-state`). On docker / k8s deploys these mounts don't
+  exist; slot fields stay NULL and only `deployment_kind` populates.
+* Control plane persists everything to `dns_server.*` /
+  `dhcp_server.*` columns added in migration `f8b1c20d3e72`.
+* Operator opens the **Fleet** tab — one row per agent showing
+  kind, deployment, installed version, slot (with `(trial)` suffix
+  when current ≠ durable), upgrade-state pill, last-seen, and any
+  pending operator-set desired version.
+* Clicking **Upgrade** on an appliance row opens a release picker
+  (same `applianceReleasesApi.list` source as the per-box UI).
+  The picked CalVer tag is written to that agent's
+  `desired_appliance_version` + `desired_slot_image_url` columns.
+* The agent's next ConfigBundle long-poll picks it up via the new
+  `fleet_upgrade` block on the bundle. The agent's
+  `slot_state.maybe_fire_fleet_upgrade()` compares `desired` to its
+  own installed version; on mismatch it writes the slot-upgrade
+  trigger file — the SAME `/var/lib/spatiumddi-host/release-state/
+  slot-upgrade-pending` file the per-box `/appliance` UI uses. The
+  host-side `spatiumddi-slot-upgrade.path` unit then drives the
+  same dd → grub-reboot → /health/live → grub-set-default flow
+  documented above.
+* Once the agent's next heartbeat reports `installed_appliance_version`
+  matching the operator's `desired_appliance_version` (and
+  `last_upgrade_state ∈ {done, NULL}`), the server-side handler
+  auto-clears both `desired_*` columns. The Fleet view's pending
+  chip drops on the next refresh.
+
+**Docker / k8s rows** don't have an A/B partition to dd into, so
+the Fleet table renders a **Manual upgrade…** button instead of
+Upgrade. That button opens a wide modal with the same release
+picker plus a pre-filled copy-paste command:
+
+  ```
+  # Docker:
+  SPATIUMDDI_VERSION=2026.05.12-2 docker compose pull && \
+  SPATIUMDDI_VERSION=2026.05.12-2 docker compose up -d
+
+  # Kubernetes:
+  helm upgrade spatiumddi-dns-bind9 \
+    oci://ghcr.io/spatiumddi/charts/spatiumddi \
+    --set image.tag=2026.05.12-2 \
+    --reuse-values
+  ```
+
+One-click Copy button. The agent reports the new
+`installed_appliance_version` via heartbeat once the container
+restarts; the Fleet table updates within ~30 s without further
+operator input.
+
+**No SSH from control plane to agent.** Everything flows through
+the existing agent → control-plane HTTP poll loop with the agent's
+trusted JWT; the operator never gives the control plane SSH
+credentials. Same trust model as DNS / DHCP config sync.
+
+**Audit log.** Every Fleet write is audit-logged
+(`fleet_schedule_upgrade` / `fleet_clear_upgrade` action) with the
+target version + agent ID; failed upgrades surface via the
+heartbeat's `last_upgrade_state = "failed"` so the Fleet UI can
+render a red state pill without polling per-agent endpoints.
+
 ### Future: update channels (Phase 8d, pending)
 
 ```
