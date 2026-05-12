@@ -600,15 +600,34 @@ do_install() {
         # entries would get reset to vanilla on slot swap → operator
         # data masked because /home wouldn't bind-mount; the .mount
         # files are immune to that failure mode.
-        local ROOT_A_UUID ESP_UUID VAR_UUID
-        ROOT_A_UUID=$(blkid -s UUID -o value "$ROOT_A")
-        ESP_UUID=$(blkid -s UUID -o value "$ESP")
-        VAR_UUID=$(blkid -s UUID -o value "$VAR")
-        cat > "$MOUNT/etc/fstab" <<EOF
-UUID=$ROOT_A_UUID  /          ext4  defaults                       0 1
-UUID=$VAR_UUID     /var       ext4  defaults                       0 2
-UUID=$ESP_UUID     /boot/efi  vfat  umask=0077,shortname=winnt     0 2
-tmpfs              /tmp       tmpfs nosuid,nodev,noexec,mode=1777  0 0
+        # Phase 8a-7 — fstab is IMAGE-BASELINE (no operator-specific
+        # UUIDs). Every slot's image-shipped /etc/fstab carries the
+        # same content, so a slot swap to image v2 doesn't need any
+        # fstab rewrite — root_B's image-baseline fstab is identical.
+        #
+        # Each mountpoint uses a slot-stable identifier:
+        #
+        # / (root)         — NOT in fstab. Mounted by kernel via
+        #                    root=UUID=… on the cmdline (set per-slot
+        #                    in grub.cfg menuentries via grub-install).
+        #
+        # /var             — LABEL=var. Belt-and-braces with
+        #                    systemd-gpt-auto-generator (GPT type
+        #                    8310 / 4d21b016-…). gpt-auto's machine-id
+        #                    matching can be finicky on first boot;
+        #                    LABEL=var in fstab is a reliable fallback.
+        #
+        # /boot/efi        — LABEL=ESP (set by `mkfs.fat -n ESP`).
+        #
+        # /tmp             — tmpfs, image-baseline.
+        #
+        # /home + /root    — systemd .mount unit files (image-shipped
+        #                    at /etc/systemd/system/home.mount +
+        #                    root.mount). Not in fstab.
+        cat > "$MOUNT/etc/fstab" <<'EOF'
+LABEL=var  /var       ext4   defaults                             0 2
+LABEL=ESP  /boot/efi  vfat   umask=0077,shortname=winnt           0 2
+tmpfs      /tmp       tmpfs  nosuid,nodev,noexec,mode=1777        0 0
 EOF
         echo "$HOSTNAME" > "$MOUNT/etc/hostname"
 
@@ -857,6 +876,17 @@ EOF
         ln -sf "initrd.img-$KVER" "$MOUNT/boot/initrd.img"
 
         echo "XXX"; echo "85"; echo "Writing GRUB config (Phase 8c A/B + boot counting)..."; echo "XXX"
+        # GRUB still needs the slot UUIDs for `search --fs-uuid` (so
+        # it can find each slot's /boot/vmlinuz regardless of disk
+        # ordering) and `root=UUID=…` on the kernel cmdline. fstab no
+        # longer carries them (Phase 8a-7 — image-baseline fstab uses
+        # LABEL= only); grub.cfg keeps using per-slot UUIDs because
+        # it's WHERE the boot menu lives + the menuentries are
+        # per-slot anyway.
+        local ROOT_A_UUID ROOT_B_UUID
+        ROOT_A_UUID=$(blkid -s UUID -o value "$ROOT_A")
+        ROOT_B_UUID=$(blkid -s UUID -o value "$ROOT_B")
+
         # Write /etc/default/grub explicitly so future `update-grub`
         # runs (e.g. on kernel upgrade) get the same cmdline. We
         # don't rely on update-grub at install time — we write
