@@ -52,7 +52,11 @@
 - [Full feature detail](#full-feature-detail) — deep dive on every subsystem
 - [Screenshots](#screenshots)
 - [Architecture](#architecture)
-- [Getting Started](#getting-started) — Docker Compose quick start, OS appliance ISO, demo seed, upgrade flow, admin reset
+- [Getting Started](#getting-started) — three ways to run SpatiumDDI:
+  - [Try the demo in GitHub Codespaces](#try-the-demo-in-github-codespaces) — one-click full stack with seeded data, browser-only, free 60 h/month
+  - [Quick start with Docker Compose](#quick-start-with-docker-compose) — `docker compose up` on any Docker host, full control
+  - [Quick start with the OS appliance ISO](#quick-start-with-the-os-appliance-iso) — boot a Debian 13 VM/baremetal image, five-question installer, atomic A/B upgrades
+  - Plus: [demo seed](#seeding-demo-data) · [in-place upgrade flow](#upgrading) · [built-in DNS/DHCP containers](#running-the-built-in-bind9--powerdns--kea-containers) · [API docs](#api--interactive-docs)
 - [Deployment Options](#deployment-options)
 - [Documentation](#documentation)
 - [Project Status](#project-status)
