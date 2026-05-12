@@ -951,7 +951,7 @@ insmod search_fs_uuid
 
 menuentry "SpatiumDDI Appliance (slot A)" --id=slot_a {
     search --no-floppy --fs-uuid --set=root $ROOT_A_UUID
-    linux /boot/vmlinuz root=UUID=$ROOT_A_UUID ro \\
+    linux /boot/vmlinuz root=UUID=$ROOT_A_UUID rw \\
         loglevel=3 audit=0 \\
         console=tty0 console=ttyS0,115200n8
     initrd /boot/initrd.img
@@ -959,7 +959,7 @@ menuentry "SpatiumDDI Appliance (slot A)" --id=slot_a {
 
 menuentry "SpatiumDDI Appliance (slot B)" --id=slot_b {
     search --no-floppy --fs-uuid --set=root $ROOT_B_UUID
-    linux /boot/vmlinuz root=UUID=$ROOT_B_UUID ro \\
+    linux /boot/vmlinuz root=UUID=$ROOT_B_UUID rw \\
         loglevel=3 audit=0 \\
         console=tty0 console=ttyS0,115200n8
     initrd /boot/initrd.img
@@ -970,7 +970,7 @@ menuentry "SpatiumDDI Appliance (slot A, verbose boot)" --id=slot_a_verbose {
     # kernel message for a bug report. Also passes spatium-console=off
     # so getty@tty1 wins tty1 (no dashboard overpainting the log).
     search --no-floppy --fs-uuid --set=root $ROOT_A_UUID
-    linux /boot/vmlinuz root=UUID=$ROOT_A_UUID ro \\
+    linux /boot/vmlinuz root=UUID=$ROOT_A_UUID rw \\
         spatium-console=off \\
         console=tty0 console=ttyS0,115200n8
     initrd /boot/initrd.img
@@ -980,7 +980,7 @@ menuentry "SpatiumDDI Appliance (rescue / single-user)" --id=rescue {
     # Boots slot_a into rescue.target — single-user, root shell only,
     # no docker, no getty@tty1.
     search --no-floppy --fs-uuid --set=root $ROOT_A_UUID
-    linux /boot/vmlinuz root=UUID=$ROOT_A_UUID ro \\
+    linux /boot/vmlinuz root=UUID=$ROOT_A_UUID rw \\
         console=tty0 console=ttyS0,115200n8 systemd.unit=rescue.target
     initrd /boot/initrd.img
 }
