@@ -6878,6 +6878,10 @@ export interface ApplianceSlotStatus {
   upgrade_state: ApplianceSlotUpgradeState;
   upgrade_state_at: string | null;
   log_tail: string;
+  // Per-slot installed APPLIANCE_VERSION from the slot-versions.json
+  // sidecar. Null when the sidecar's missing.
+  slot_a_version: string | null;
+  slot_b_version: string | null;
 }
 
 export const applianceSlotApi = {

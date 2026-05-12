@@ -142,6 +142,14 @@ services:
       # from the api container. /boot/efi is auto-mounted via gpt-
       # auto-generator on the appliance (EFI System partition type).
       - /boot/efi:/boot/efi-host:ro
+      # Phase 8c — lsblk inside containers can read /sys + /proc for
+      # the topology but PARTLABEL + UUID live in udev's runtime
+      # state under /run/udev/data/. Without this bind mount the
+      # ``_current_slot_from_cmdline`` helper sees ``partlabel: null``
+      # for every partition + returns None, so the OS Image card
+      # renders "Active (booted) — —" instead of "Slot A (root_a)".
+      # ro because the api only reads udev state, never writes.
+      - /run/udev:/run/udev:ro
       # Docker socket — required for the cert-deployer SIGHUP and
       # (Phase 4d) container management. The api container's ``app``
       # user gets supplementary group access via ``group_add`` below
@@ -291,9 +299,13 @@ services:
       # convention the api container uses (``…-host`` suffix). On
       # docker / k8s deploys these host paths don't exist; the agent's
       # slot_state.py silently falls through to None values.
+      # ``/run/udev`` is needed for ``lsblk`` to see PARTLABEL/UUID
+      # (without it the slot-state collector reports current_slot=None
+      # because lsblk can't map root=UUID= to root_a / root_b).
       - /etc/spatiumddi:/etc/spatiumddi-host:ro
       - /boot/efi:/boot/efi-host:ro
       - /var/lib/spatiumddi/release-state:/var/lib/spatiumddi-host/release-state:ro
+      - /run/udev:/run/udev:ro
     # No depends_on: api — on agent-mode appliances the api isn't in
     # this compose, and the agent already retries forever on bootstrap
     # 401/404 (it caches a JWT after the first success).
@@ -333,6 +345,7 @@ services:
       - /etc/spatiumddi:/etc/spatiumddi-host:ro
       - /boot/efi:/boot/efi-host:ro
       - /var/lib/spatiumddi/release-state:/var/lib/spatiumddi-host/release-state:ro
+      - /run/udev:/run/udev:ro
 
   # ── DHCP (Kea) — default profile ────────────────────────────────────────────
   # Host networking is required for DHCP broadcast (DDI appliance
@@ -366,6 +379,7 @@ services:
       - /etc/spatiumddi:/etc/spatiumddi-host:ro
       - /boot/efi:/boot/efi-host:ro
       - /var/lib/spatiumddi/release-state:/var/lib/spatiumddi-host/release-state:ro
+      - /run/udev:/run/udev:ro
     # No depends_on: api — agent retries until the control plane is
     # reachable; on agent-mode installs the api isn't even in this
     # compose.

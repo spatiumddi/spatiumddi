@@ -351,6 +351,15 @@ fi
 echo "Bringing stack up..."
 docker-compose up -d
 
+# Phase 8 — refresh /var/lib/spatiumddi/release-state/slot-versions.json
+# so the OS Image card + Fleet view show the right APPLIANCE_VERSION
+# per slot. Best-effort: a failure here doesn't block the stack from
+# coming up, the api just falls back to "unknown" for both slots.
+if [ -x /usr/local/bin/spatium-upgrade-slot ] && [ -e /etc/spatiumddi/role-config ]; then
+    /usr/local/bin/spatium-upgrade-slot sync-versions || \
+        echo "WARN: sync-versions failed — OS Image card will show 'unknown' for slot versions"
+fi
+
 # Role-aware readiness check.
 #
 # Control / control-only roles run the api container, which exposes

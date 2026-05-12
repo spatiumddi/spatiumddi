@@ -257,8 +257,13 @@ jobs:
   build-appliance-iso:
     name: Build appliance ISO
     runs-on: ubuntu-latest
-    needs:
-      [meta, build-api, build-frontend, build-dns, build-dns-powerdns, build-dhcp]
+    # Only needs `meta` (for the version stamp). The container images
+    # are NOT baked into the ISO — firstboot pulls them from ghcr.io
+    # at first boot via the compose's ``image: ghcr.io/spatiumddi/…``
+    # references. So the ISO build can run in parallel with the five
+    # image builds; the only true cross-job dependency is the final
+    # ``release`` job that fans in on everyone to attach artefacts.
+    needs: meta
     permissions:
       contents: read
       packages: read
@@ -271,6 +276,24 @@ jobs:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Stamp /etc/spatiumddi/appliance-release with CalVer
+        run: |
+          set -euo pipefail
+          VERSION="${{ needs.meta.outputs.version }}"
+          # Drop the build-time version stamp into mkosi.extra so it
+          # gets baked into the rootfs at build. ``spatiumddi-firstboot``
+          # + ``spatium-upgrade-slot`` + ``spatium-console`` all read
+          # this file to surface APPLIANCE_VERSION. Without this stamp
+          # every released appliance reports the placeholder "0.1.0"
+          # regardless of which release ISO they came from.
+          mkdir -p appliance/mkosi.extra/etc/spatiumddi
+          {
+              echo "APPLIANCE_VERSION=\"${VERSION}\""
+              echo "BUILD_TIME=\"$(date -u -Iseconds)\""
+              echo "GIT_SHA=\"${GITHUB_SHA}\""
+          } > appliance/mkosi.extra/etc/spatiumddi/appliance-release
+          echo "→ Stamped appliance-release:"
+          cat appliance/mkosi.extra/etc/spatiumddi/appliance-release
       - name: Build raw image (mkosi)
         run: |
           set -euo pipefail

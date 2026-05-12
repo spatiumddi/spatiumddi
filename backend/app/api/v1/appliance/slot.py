@@ -41,6 +41,13 @@ class SlotStatusResponse(BaseModel):
     upgrade_state: str
     upgrade_state_at: str | None
     log_tail: str
+    # Per-slot installed APPLIANCE_VERSION sourced from the
+    # ``slot-versions.json`` sidecar that spatium-upgrade-slot maintains.
+    # None when the sidecar is missing (pre-Phase-8 install, or this
+    # appliance hasn't booted post-upgrade yet so firstboot hasn't
+    # written it).
+    slot_a_version: str | None
+    slot_b_version: str | None
 
 
 class ApplyRequest(BaseModel):
@@ -69,6 +76,8 @@ def _serialise(s: SlotStatus) -> SlotStatusResponse:
         upgrade_state=s.upgrade_state,
         upgrade_state_at=s.upgrade_state_at,
         log_tail=s.log_tail,
+        slot_a_version=s.slot_a_version,
+        slot_b_version=s.slot_b_version,
     )
 
 

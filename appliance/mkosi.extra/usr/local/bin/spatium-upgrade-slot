@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -244,6 +245,15 @@ def cmd_apply(args) -> int:
         # Refresh our cached view so set-next-boot reflects the new UUID.
         inactive["uuid"] = new_uuid
 
+    # Read the freshly-written slot's APPLIANCE_VERSION so we can both
+    # patch the grub.cfg menu label + update the sidecar that drives
+    # the OS Image card's per-slot version display. Both operations
+    # are best-effort — apply succeeded regardless of label/sidecar.
+    new_version = slot_version_label(inactive)
+    if new_version and new_version not in ("unstamped", "unreadable", "unknown"):
+        _patch_grub_cfg_slot_label(inactive["partlabel"], new_version)
+    sync_slot_versions()
+
     print()
     print("✓ Image written to inactive slot.")
     print()
@@ -327,6 +337,134 @@ def _patch_grub_cfg_slot_uuid(partlabel: str, new_uuid: str,
         Path(cfg_path).write_text(new_cfg)
     except OSError as exc:
         print(f"WARN: couldn't write {cfg_path}: {exc}", file=sys.stderr)
+
+
+# Pattern that matches the SpatiumDDI Appliance menuentry title line and
+# captures the (optional) version chunk. The version chunk is everything
+# between "SpatiumDDI Appliance " and " (slot X" — we replace it as a
+# unit so re-stamping is idempotent regardless of whether a version was
+# present before.
+_SLOT_LABEL_RE = re.compile(
+    r'(menuentry ")SpatiumDDI Appliance(?: [^"(]*?)?( \(slot [AB][^"]*"[^\n]*--id=slot_)([ab])(\b)',
+)
+
+
+def _patch_grub_cfg_slot_label(partlabel: str, version: str,
+                               cfg_path: str = "/boot/efi/grub/grub.cfg") -> None:
+    """Re-stamp the menuentry title for slot_<x> to include ``version``.
+
+    ``menuentry "SpatiumDDI Appliance (slot A)" --id=slot_a {`` becomes
+    ``menuentry "SpatiumDDI Appliance 2026.05.12-2 (slot A)" --id=slot_a {``.
+    Operator skimming the grub menu sees which release lives on each
+    slot — useful for triage when the system is half-upgraded or
+    standing at the menu after a failed health check.
+
+    Idempotent re-stamping: matches both the original
+    "SpatiumDDI Appliance (slot X)" form and the already-stamped
+    "SpatiumDDI Appliance <version> (slot X)" form, replaces the
+    version chunk in-place.
+    """
+    if not version:
+        return
+    try:
+        cfg = Path(cfg_path).read_text()
+    except OSError as exc:
+        print(f"WARN: couldn't read {cfg_path}: {exc} — grub.cfg label not updated",
+              file=sys.stderr)
+        return
+    target_letter = partlabel[-1].lower()  # root_a → "a"
+
+    def replace(match: re.Match[str]) -> str:
+        head, mid, letter, tail = match.groups()
+        if letter != target_letter:
+            return match.group(0)
+        return f'{head}SpatiumDDI Appliance {version}{mid}{letter}{tail}'
+
+    new_cfg = _SLOT_LABEL_RE.sub(replace, cfg)
+    if new_cfg == cfg:
+        return
+    print(f"  patching grub.cfg: slot_{target_letter} label → "
+          f"SpatiumDDI Appliance {version} (slot {target_letter.upper()})")
+    try:
+        Path(cfg_path).write_text(new_cfg)
+    except OSError as exc:
+        print(f"WARN: couldn't write {cfg_path}: {exc}", file=sys.stderr)
+
+
+# Sidecar the api container reads to surface per-slot version on the
+# OS Image card. Host path is /var/lib/spatiumddi/release-state/; the
+# api container bind-mounts that at /var/lib/spatiumddi-host/release-
+# state/. Updated by sync_slot_versions() called from cmd_apply and
+# cmd_status, plus on every boot by spatiumddi-firstboot.
+_SLOT_VERSIONS_FILE = Path("/var/lib/spatiumddi/release-state/slot-versions.json")
+_ACTIVE_RELEASE_FILE = Path("/etc/spatiumddi/appliance-release")
+
+
+def _read_active_appliance_version() -> str:
+    """Parse APPLIANCE_VERSION= from /etc/spatiumddi/appliance-release.
+
+    This file lives on the currently-booted slot, so it always reports
+    the active slot's installed version. Returns "unstamped" if the
+    file doesn't exist (pre-Phase-8 install with no release stamp).
+    """
+    if not _ACTIVE_RELEASE_FILE.exists():
+        return "unstamped"
+    try:
+        for line in _ACTIVE_RELEASE_FILE.read_text().splitlines():
+            if line.startswith("APPLIANCE_VERSION="):
+                return line.split("=", 1)[1].strip().strip('"').strip("'")
+    except OSError:
+        return "unreadable"
+    return "unstamped"
+
+
+def sync_slot_versions() -> dict[str, str]:
+    """Probe both slots' installed versions and write the sidecar.
+
+    Active slot's version comes from the booted /etc/spatiumddi/
+    appliance-release directly (no mount needed). Inactive slot's
+    version requires a temporary read-only mount via ``slot_version_label``.
+
+    Returns the {slot_a: ver, slot_b: ver} dict that was just written
+    (so callers can log it). On any failure to write the sidecar,
+    logs a warning + returns the in-memory map anyway — the caller's
+    UI degrades gracefully when the sidecar's missing.
+    """
+    pair = detect_active_inactive()
+    if not pair:
+        return {}
+    active, inactive = pair
+
+    versions: dict[str, str] = {}
+    active_slot = "slot_a" if active["partlabel"].lower() == "root_a" else "slot_b"
+    inactive_slot = "slot_a" if active_slot == "slot_b" else "slot_b"
+    versions[active_slot] = _read_active_appliance_version()
+    versions[inactive_slot] = slot_version_label(inactive)
+
+    try:
+        _SLOT_VERSIONS_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _SLOT_VERSIONS_FILE.with_suffix(".new")
+        tmp.write_text(json.dumps(versions, indent=2, sort_keys=True) + "\n")
+        tmp.replace(_SLOT_VERSIONS_FILE)
+    except OSError as exc:
+        print(f"WARN: couldn't write {_SLOT_VERSIONS_FILE}: {exc}", file=sys.stderr)
+    return versions
+
+
+def cmd_sync_versions(_args) -> int:
+    """Refresh /var/lib/spatiumddi/release-state/slot-versions.json.
+
+    Called by spatiumddi-firstboot at every boot so the OS Image card
+    + Fleet view never go stale, and by spatium-upgrade-slot's own
+    apply path after a successful dd.
+    """
+    versions = sync_slot_versions()
+    if not versions:
+        print("ERROR: couldn't detect A/B slots", file=sys.stderr)
+        return 2
+    for slot, ver in sorted(versions.items()):
+        print(f"  {slot}: {ver}")
+    return 0
 
 
 GRUB_BOOT_DIR = "/boot/efi"   # Phase 8c — grub.cfg + grubenv live on ESP
@@ -456,12 +594,18 @@ def main() -> int:
     sub.add_parser("rollback",
                    help="durably set the inactive slot as default (grub-set-default — commits the swap)")
 
+    sub.add_parser("sync-versions",
+                   help="refresh /var/lib/spatiumddi/release-state/slot-versions.json "
+                        "(both slots' installed APPLIANCE_VERSION). Called by "
+                        "spatiumddi-firstboot at every boot + at the end of apply.")
+
     args = parser.parse_args()
     return {
         "status": cmd_status,
         "apply": cmd_apply,
         "set-next-boot": cmd_set_next_boot,
         "rollback": cmd_rollback,
+        "sync-versions": cmd_sync_versions,
     }[args.cmd](args)
 
 

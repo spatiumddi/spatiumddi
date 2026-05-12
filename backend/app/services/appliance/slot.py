@@ -48,6 +48,12 @@ _UPDATE_LOG = Path("/var/log/spatiumddi-host/slot-upgrade.log")
 # socket gymnastics.
 _GRUBENV = Path("/boot/efi-host/grub/grubenv")
 _PROC_CMDLINE = Path("/proc/cmdline")
+# Phase 8 — per-slot version sidecar maintained by ``spatium-upgrade-slot
+# sync-versions`` (called by spatiumddi-firstboot at every boot + at
+# the end of every apply). Maps {"slot_a": "<version>", "slot_b":
+# "<version>"} so the OS Image card can show which release lives on
+# each slot.
+_SLOT_VERSIONS_FILE = Path("/var/lib/spatiumddi-host/release-state/slot-versions.json")
 
 
 _UUID_RE = re.compile(r"root=UUID=([0-9a-fA-F-]+)")
@@ -68,6 +74,32 @@ class SlotStatus:
     upgrade_state: UpgradeState
     upgrade_state_at: str | None
     log_tail: str
+    # Phase 8 per-slot version (Phase 8 #138). slot_a_version / slot_b_
+    # _version are the APPLIANCE_VERSION installed on each slot, read
+    # from the slot-versions.json sidecar that ``spatium-upgrade-slot
+    # sync-versions`` maintains. None when the sidecar is missing
+    # (pre-this-release install) or unreadable.
+    slot_a_version: str | None
+    slot_b_version: str | None
+
+
+def _read_slot_versions() -> dict[str, str]:
+    """Read the per-slot version sidecar maintained by
+    ``spatium-upgrade-slot sync-versions``.
+
+    Returns ``{}`` on missing / malformed file — UI then falls back
+    to showing nothing under the slot labels.
+    """
+    if not _SLOT_VERSIONS_FILE.exists():
+        return {}
+    try:
+        text = _SLOT_VERSIONS_FILE.read_text(encoding="utf-8", errors="replace")
+        data = json.loads(text)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    return {k: str(v) for k, v in data.items() if isinstance(v, str)}
 
 
 def _read_grubenv() -> dict[str, str]:
@@ -171,6 +203,8 @@ def get_slot_status() -> SlotStatus:
             upgrade_state="idle",
             upgrade_state_at=None,
             log_tail="",
+            slot_a_version=None,
+            slot_b_version=None,
         )
 
     current = _current_slot_from_cmdline()
@@ -181,6 +215,7 @@ def get_slot_status() -> SlotStatus:
     )
     is_trial = bool(current and durable and current != durable)
     state, stamp = _upgrade_state_now()
+    versions = _read_slot_versions()
 
     return SlotStatus(
         appliance_mode=True,
@@ -190,6 +225,8 @@ def get_slot_status() -> SlotStatus:
         upgrade_state=state,
         upgrade_state_at=stamp,
         log_tail=get_update_log_tail(),
+        slot_a_version=versions.get("slot_a"),
+        slot_b_version=versions.get("slot_b"),
     )
 
 

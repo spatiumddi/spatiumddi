@@ -17,3 +17,9 @@ cloud-init/meta-data
 .mkosi-*/
 mkosi.cache/
 mkosi.workspace/
+
+# Build-time stamp written by .github/workflows/release.yml (CalVer)
+# or by hand for local dev slot builds. Never tracked — committing
+# a stale stamp would either get clobbered by the next CI run or
+# ship as the real APPLIANCE_VERSION on a production cut.
+mkosi.extra/etc/spatiumddi/appliance-release

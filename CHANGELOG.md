@@ -22,6 +22,117 @@ the formatter handles the rest.
 
 ## Unreleased
 
+## 2026.05.12-3 — 2026-05-12
+
+OS Image card polish + per-slot visibility. The big behaviour fix is
+that the api container can finally see partition labels through
+`lsblk` (a missing `/run/udev` bind mount left the Active column
+reading `—` and the Apply confirm modal titled "Apply 2026.05.12-2
+to —?" — fixed). On top of that: the card now shows the installed
+`APPLIANCE_VERSION` under each slot (sourced from a new
+`slot-versions.json` sidecar the upgrade CLI maintains), the GRUB
+boot menu labels carry the version too (`SpatiumDDI Appliance
+2026.05.12-3 (slot A)`), the three "Active / Durable / Target"
+columns get replaced with two stacked slot cards carrying
+colour-coded role badges (BOOTED / DEFAULT / TARGET / TRIAL), and
+the installer's disk-too-small check fires immediately after the
+operator picks a disk instead of burying the failure at the end of
+the wizard after they've typed hostname + admin + network +
+timezone.
+
+### Added
+
+- **Per-slot installed-version display.** The OS Image card now
+  reads `/var/lib/spatiumddi/release-state/slot-versions.json` and
+  surfaces `slot_a_version` + `slot_b_version` on the
+  `/api/v1/appliance/slot-upgrade` response. Each slot card on the
+  redesigned layout (see Changed below) shows the installed
+  `APPLIANCE_VERSION` directly under the slot label, falling back
+  to `—` when the sidecar is missing / the slot is unstamped /
+  unreadable.
+- **`slot-versions.json` sidecar with autonomous refresh.** New
+  `spatium-upgrade-slot sync-versions` subcommand probes both
+  slots (active via `/etc/spatiumddi/appliance-release`, inactive
+  via a quick read-only mount + read), writes the JSON atomically
+  to `/var/lib/spatiumddi/release-state/slot-versions.json`.
+  Called by `spatiumddi-firstboot` on every boot so the sidecar
+  stays fresh across power cycles, and by `spatium-upgrade-slot
+  apply` at the end of its apply path so the OS Image card
+  reflects an upgrade within one polling tick.
+- **GRUB menu labels carry the version.** `spatium-install` reads
+  `APPLIANCE_VERSION` from the freshly-installed
+  `/etc/spatiumddi/appliance-release` and writes grub.cfg
+  menuentries as `SpatiumDDI Appliance <ver> (slot A)` instead of
+  the bare `(slot A)`. Operator skimming the grub menu sees which
+  release lives on each slot — useful for triage when the system
+  is half-upgraded or standing at the menu after a failed health
+  check. `spatium-upgrade-slot apply` patches just the *inactive*
+  slot's menuentry label after each dd via a new
+  `_patch_grub_cfg_slot_label` helper that's idempotent across
+  both the original "(slot A)" form and the already-stamped
+  "<ver> (slot A)" form.
+- **Release workflow stamps `appliance-release`.** Every prior
+  appliance reported `APPLIANCE_VERSION=0.1.0` because the
+  build-time stamp file was never written — the CI workflow now
+  writes `/etc/spatiumddi/appliance-release` into the rootfs via
+  `mkosi.extra/etc/spatiumddi/appliance-release` before mkosi
+  builds, sourcing the CalVer from `GITHUB_REF_NAME`. The file is
+  gitignored so dev builds can use placeholder stamps without
+  surfacing as pending commits.
+
+### Changed
+
+- **OS Image card redesigned: two stacked slot cards, not three
+  columns.** Replaces the "Active / Durable / Target" grid with
+  per-slot cards (Slot A on the left, Slot B on the right) each
+  carrying the installed version + colour-coded role badges:
+  🟢 BOOTED (emerald), 🔵 DEFAULT (blue), 🟠 TARGET (amber),
+  🟡 TRIAL (yellow). Card border colour follows the most-relevant
+  role so the pair has visual rhythm at a glance. The three-column
+  layout duplicated info (Active and Durable are the same slot
+  outside of a trial boot) and made operators translate role
+  headings back into slot identities — the new shape leads with
+  the slot identity. Subtext line on each card explains the
+  current role in plain English. Side-by-side on ≥sm viewports,
+  stacked on small screens.
+- **Disk-too-small check fires after disk pick.** The 16 GiB
+  hard-floor check used to live inside `do_install`, which runs
+  AFTER role → disk → hostname → admin → network → timezone →
+  agent-config → final confirm. An operator with a small disk
+  typed all of that out before getting told their disk was too
+  small. Moved into `pick_disk` immediately after the menu
+  selection; a too-small pick now opens the explainer modal and
+  bounces back to the disk-picker menu (operator might have a
+  second, larger disk attached they can switch to).
+- **CI release pipeline parallelisation.** `build-appliance-iso`
+  used to wait on all five container image builds before starting
+  — but the ISO doesn't bake them (firstboot pulls from ghcr.io
+  at first boot). Dropped the unnecessary `needs:` deps so the
+  ISO build runs in parallel with the image builds. Saves
+  ~5 min on a typical release cut.
+
+### Fixed
+
+- **`/run/udev` bind mount on api + agent containers so lsblk
+  sees PARTLABEL.** lsblk inside a container can read `/sys` +
+  `/proc` for partition topology but PARTLABEL + UUID live in
+  udev's runtime state under `/run/udev/data/`. Without the bind
+  mount, the api container's `_current_slot_from_cmdline` helper
+  saw `partlabel: null` for every partition and returned None —
+  the OS Image card then rendered "Active (booted) —" and the
+  Apply confirm modal titled "Apply 2026.05.12-2 to —?". Same
+  root cause hit the DNS + DHCP agents' Phase 8f-2 slot-state
+  collector. Fix is one extra read-only mount each on api,
+  dns-bind9, dns-powerdns, dhcp-kea services in the appliance
+  docker-compose.
+
+### Migrations
+
+- None. All work is appliance-only (installer / host-side
+  scripts / appliance docker-compose / OS Image card UI) plus
+  read-only API additions on `/api/v1/appliance/slot-upgrade`.
+  The control-plane database is untouched.
+
 ## 2026.05.12-2 — 2026-05-12
 
 Closes Phase 8 (issue #138, OS appliance atomic A/B upgrade). The
