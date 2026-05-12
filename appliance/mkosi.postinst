@@ -43,6 +43,7 @@ for unit in docker.service chrony.service ssh.service \
             spatium-live-banner.service \
             spatium-live-bootstrap.service \
             spatium-console.service \
+            spatium-etc-reconcile.service \
             qemu-guest-agent.service \
             open-vm-tools.service \
             nftables.service \
@@ -89,6 +90,29 @@ if [ -f "$BUILDROOT/etc/systemd/system/spatium-console@.service" ]; then
         "$BUILDROOT/etc/systemd/system/multi-user.target.wants/spatium-console@ttyS0.service"
 fi
 
+# Phase 8a-3 — /etc overlay mount unit (issue #138). Wants etc.mount
+# at local-fs.target so the overlay is in place before any user-mode
+# service reads operator config.
+if [ -f "$BUILDROOT/etc/systemd/system/etc.mount" ]; then
+    mkdir -p "$BUILDROOT/etc/systemd/system/local-fs.target.wants"
+    ln -sfn /etc/systemd/system/etc.mount \
+        "$BUILDROOT/etc/systemd/system/local-fs.target.wants/etc.mount"
+fi
+
+# Phase 8a-3 — tmpfiles.d entry to ensure /var/persist/etc{,-work}
+# exists. The installer creates them at install time too, but on a
+# Phase 8a-1 → 8a-3 in-place upgrade (no reinstall) this is the only
+# path that populates them.
+install -d -m 0755 "$BUILDROOT/usr/lib/tmpfiles.d"
+cat > "$BUILDROOT/usr/lib/tmpfiles.d/spatium-etc-overlay.conf" <<'EOF'
+# Phase 8a /etc overlay (issue #138). The overlay's upper + work
+# directories must exist before etc.mount fires. /var is on its own
+# partition (Phase 8a-1) so these survive slot swaps verbatim.
+d /var/persist           0755 root root - -
+d /var/persist/etc       0755 root root - -
+d /var/persist/etc-work  0755 root root - -
+EOF
+
 # ── Hardening (subset of APPLIANCE.md §7 — full pass in Phase 1.x) ────────────
 # SSH: root login disabled, password login allowed.
 #
@@ -125,6 +149,7 @@ chmod 0755 "$BUILDROOT/usr/local/bin/spatium-live-banner"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatium-live-bootstrap"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-update"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatium-console"
+chmod 0755 "$BUILDROOT/usr/local/bin/spatium-etc-reconcile"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-firstboot.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-install.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-live-banner.service"
@@ -135,6 +160,8 @@ chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-reboot.path"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-reboot.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-console.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-console@.service"
+chmod 0644 "$BUILDROOT/etc/systemd/system/etc.mount"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-etc-reconcile.service"
 
 # State directories owned by the spatiumddi-firstboot service.
 install -d -m 0755 "$BUILDROOT/etc/spatiumddi"

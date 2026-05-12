@@ -437,19 +437,43 @@ do_install() {
     # and the EXIT trap drops the operator to a shell with the log.
     set -e
 
-    # GPT layout: 1 MiB BIOS Boot Partition (type ef02) + 512 MiB
-    # EFI System Partition (ef00, FAT32) + rest ext4 root (8300).
-    # The BBP holds grub-i386-pc's core.img — without it
-    # grub-install fails on GPT disks with "no BIOS Boot Partition;
-    # embedding won't be possible". MBR boot record on GPT only
-    # has 446 bytes between the partition table and the protective
-    # MBR slot; grub stage-1 doesn't fit, hence the BBP.
-    local BBP ESP ROOT
+    # Phase 8a-1 GPT layout — Atomic A/B image upgrade support (issue #138).
+    # Replaces the previous single-root layout with an A/B + /var
+    # split:
+    #
+    #   p1  BIOS Boot     1 MiB     ef02   legacy chain-load (grub i386-pc)
+    #   p2  ESP          512 MiB    ef00   FAT32, /boot/efi
+    #   p3  root_A         8 GiB    8304   active slot (this install lands here)
+    #   p4  root_B         8 GiB    8304   inactive slot (staging next image)
+    #   p5  var          rest       8300   /var, persisted across slot swaps
+    #
+    # Slot sizes: 8 GiB each is comfortable headroom for the appliance's
+    # ~3 GiB rootfs + room for image growth. /var carries operator state
+    # (postgres data, docker volumes, audit log, backups, overlay upper
+    # for /etc) and gets the remainder of the disk.
+    #
+    # Hard floor: 24 GiB target disk (= 0.5 GiB ESP + 16 GiB slots +
+    # at least 7 GiB usable /var). Below that, IPAM data + container
+    # images outgrow /var quickly.
+    local BBP ESP ROOT_A ROOT_B VAR
     BBP=$(partition_node 1)
     ESP=$(partition_node 2)
-    ROOT=$(partition_node 3)
+    ROOT_A=$(partition_node 3)
+    ROOT_B=$(partition_node 4)
+    VAR=$(partition_node 5)
 
-    log "Install starting: target=$TARGET_DISK BBP=$BBP ESP=$ESP ROOT=$ROOT"
+    # Check target disk size — bail before destroying anything.
+    local DISK_BYTES MIN_BYTES
+    DISK_BYTES=$(blockdev --getsize64 "$TARGET_DISK" 2>/dev/null || echo 0)
+    MIN_BYTES=$((24 * 1024 * 1024 * 1024))
+    if [ "$DISK_BYTES" -lt "$MIN_BYTES" ]; then
+        log "ERROR: target disk $TARGET_DISK is $((DISK_BYTES / 1024 / 1024 / 1024)) GiB — need at least 24 GiB for A/B layout"
+        whiptail --backtitle "$BACKTITLE" --title "Disk too small" --msgbox \
+            "Target disk $TARGET_DISK is only $((DISK_BYTES / 1024 / 1024 / 1024)) GiB.\n\nSpatiumDDI's A/B atomic-upgrade layout needs at least 24 GiB:\n  ESP        512 MiB\n  root_A       8 GiB\n  root_B       8 GiB\n  var       remainder (≥7 GiB usable)\n\nAttach a larger disk and re-run the installer." 16 70
+        exit 1
+    fi
+
+    log "Install starting: target=$TARGET_DISK BBP=$BBP ESP=$ESP ROOT_A=$ROOT_A ROOT_B=$ROOT_B VAR=$VAR"
 
     {
         echo "XXX"; echo "3"; echo "Releasing existing partitions on $TARGET_DISK..."; echo "XXX"
@@ -472,16 +496,25 @@ do_install() {
             done
         fi
 
-        echo "XXX"; echo "5"; echo "Partitioning $TARGET_DISK..."; echo "XXX"
+        echo "XXX"; echo "5"; echo "Partitioning $TARGET_DISK (A/B + var layout)..."; echo "XXX"
         wipefs -af "$TARGET_DISK"           >> "$INSTALL_LOG" 2>&1
         sgdisk -Z "$TARGET_DISK"            >> "$INSTALL_LOG" 2>&1
         # Force the kernel to forget the old partition table before
         # we lay down a new one. Without this, mkfs against the new
         # partition nodes can race with udev rebuilding /dev/disk/.
         blockdev --rereadpt "$TARGET_DISK"  >> "$INSTALL_LOG" 2>&1 || true
+        # GPT type codes — sgdisk shortcuts:
+        #   ef02 = BIOS Boot         (i386-pc grub core.img target)
+        #   ef00 = EFI System        (FAT32 /boot/efi)
+        #   8304 = Linux root (x86-64) — systemd-gpt-auto-generator
+        #          can find /usr-aware slots by partition type, used
+        #          by 8b's sysupdate slot picker
+        #   8300 = generic Linux fs  (var; we mount via /etc/fstab)
         sgdisk -n1:0:+1M    -t1:ef02 -c1:bios_boot \
                -n2:0:+512M  -t2:ef00 -c2:ESP \
-               -n3:0:0      -t3:8300 -c3:root \
+               -n3:0:+8G    -t3:8304 -c3:root_A \
+               -n4:0:+8G    -t4:8304 -c4:root_B \
+               -n5:0:0      -t5:8300 -c5:var \
                "$TARGET_DISK"               >> "$INSTALL_LOG" 2>&1
         partprobe "$TARGET_DISK"            >> "$INSTALL_LOG" 2>&1 || true
         udevadm settle                      >> "$INSTALL_LOG" 2>&1 || true
@@ -489,11 +522,22 @@ do_install() {
 
         echo "XXX"; echo "10"; echo "Formatting partitions..."; echo "XXX"
         mkfs.fat -F32 -n ESP "$ESP"         >> "$INSTALL_LOG" 2>&1
-        mkfs.ext4 -F -L root "$ROOT"        >> "$INSTALL_LOG" 2>&1
+        # Label the slots distinctly so the boot loader / sysupdate
+        # can pick them by label rather than position. root_a is the
+        # active slot for this install; root_b is empty until 8b's
+        # `spatium-update` writes the next image there.
+        mkfs.ext4 -F -L root_a "$ROOT_A"    >> "$INSTALL_LOG" 2>&1
+        mkfs.ext4 -F -L root_b "$ROOT_B"    >> "$INSTALL_LOG" 2>&1
+        mkfs.ext4 -F -L var    "$VAR"       >> "$INSTALL_LOG" 2>&1
 
         echo "XXX"; echo "15"; echo "Mounting target..."; echo "XXX"
+        # Mount layout for rsync: root_A as / and var as /var BEFORE
+        # rsync runs, so files going to /var land on the var partition
+        # automatically (rsync follows the mount tree).
         mkdir -p "$MOUNT"
-        mount "$ROOT" "$MOUNT"
+        mount "$ROOT_A" "$MOUNT"
+        mkdir -p "$MOUNT/var"
+        mount "$VAR" "$MOUNT/var"
         mkdir -p "$MOUNT/boot/efi"
         mount "$ESP" "$MOUNT/boot/efi"
 
@@ -515,6 +559,52 @@ do_install() {
             --exclude="/etc/ssh/sshd_config.d/00-spatium-live.conf" \
             --exclude="/etc/issue.d/zz-spatium-live.issue" \
             / "$MOUNT/" >> "$INSTALL_LOG" 2>&1
+
+        echo "XXX"; echo "62"; echo "Snapshotting /etc baseline + mounting overlay (Phase 8a)..."; echo "XXX"
+        # Phase 8a-2 — Atomic A/B image upgrade (#138).
+        # /usr/lib/etc.image is the slot's "image-shipped /etc"
+        # baseline. We snapshot it BEFORE any operator-config write
+        # so subsequent writes go through the overlay → upper → on
+        # the var partition. Each slot carries its own
+        # /usr/lib/etc.image; on slot swap the overlay's lower changes
+        # with the image, but upper (operator state) is untouched.
+        #
+        # Use cp -a to preserve perms / xattrs / symlinks. /etc is
+        # only ~10 MiB so the copy is fast (<2 s on any disk worth
+        # running an appliance on).
+        mkdir -p "$MOUNT/usr/lib/etc.image"
+        cp -a "$MOUNT/etc/." "$MOUNT/usr/lib/etc.image/" >> "$INSTALL_LOG" 2>&1
+
+        # Phase 8a-3 — overlay layout on /var:
+        #   /var/persist/etc       upperdir  (operator writes land here)
+        #   /var/persist/etc-work  workdir   (overlay scratch space)
+        mkdir -p "$MOUNT/var/persist/etc" "$MOUNT/var/persist/etc-work"
+
+        # Mount overlay over /target/etc for the REMAINDER of the
+        # install. Every chroot useradd / chpasswd / file write that
+        # would normally land in /etc instead lands in the upper layer
+        # on /var/persist/etc — which persists across slot swaps. The
+        # subsequent unmount step has to release this BEFORE /var.
+        mount -t overlay overlay \
+            -o "lowerdir=$MOUNT/usr/lib/etc.image,upperdir=$MOUNT/var/persist/etc,workdir=$MOUNT/var/persist/etc-work" \
+            "$MOUNT/etc" >> "$INSTALL_LOG" 2>&1
+
+        # Phase 8a — /home + /root on /var so operator home dirs
+        # survive slot swaps. useradd inside the upcoming chroot writes
+        # to /home/admin → transparent via the bind mount → /var/home/
+        # admin. fstab entry below replays the bind on every boot.
+        mkdir -p "$MOUNT/var/home" "$MOUNT/home"
+        mkdir -p "$MOUNT/var/root"
+        # /root already exists in the image rootfs with the live-system
+        # contents — move them over before bind-mounting so they're
+        # captured on the persistent side.
+        if [ -d "$MOUNT/root" ] && [ -z "$(ls -A "$MOUNT/var/root" 2>/dev/null)" ]; then
+            cp -a "$MOUNT/root/." "$MOUNT/var/root/" >> "$INSTALL_LOG" 2>&1 || true
+            rm -rf "$MOUNT/root"
+        fi
+        mkdir -p "$MOUNT/root"
+        mount --bind "$MOUNT/var/home" "$MOUNT/home" >> "$INSTALL_LOG" 2>&1
+        mount --bind "$MOUNT/var/root" "$MOUNT/root" >> "$INSTALL_LOG" 2>&1
 
         echo "XXX"; echo "65"; echo "Writing system config..."; echo "XXX"
         echo "$HOSTNAME" > "$MOUNT/etc/hostname"
@@ -544,12 +634,21 @@ ff02::1 ip6-allnodes
 ff02::2 ip6-allrouters
 EOF
 
-        local ROOT_UUID ESP_UUID
-        ROOT_UUID=$(blkid -s UUID -o value "$ROOT")
+        local ROOT_A_UUID ESP_UUID VAR_UUID
+        ROOT_A_UUID=$(blkid -s UUID -o value "$ROOT_A")
         ESP_UUID=$(blkid -s UUID -o value "$ESP")
+        VAR_UUID=$(blkid -s UUID -o value "$VAR")
+        # Phase 8a-1 fstab — root_A is the active slot at install time;
+        # 8c (boot counting) will rewrite this on slot swap. /var is on
+        # its own partition so it persists across slot swaps verbatim.
+        # /home and /root are bind-mounted from /var so operator data
+        # follows the var partition across slot swaps (Phase 8a).
         cat > "$MOUNT/etc/fstab" <<EOF
-UUID=$ROOT_UUID  /          ext4  defaults                       0 1
-UUID=$ESP_UUID   /boot/efi  vfat  umask=0077,shortname=winnt     0 2
+UUID=$ROOT_A_UUID  /          ext4  defaults                       0 1
+UUID=$VAR_UUID     /var       ext4  defaults                       0 2
+UUID=$ESP_UUID     /boot/efi  vfat  umask=0077,shortname=winnt     0 2
+/var/home          /home      none  bind                           0 0
+/var/root          /root      none  bind                           0 0
 EOF
 
         # Timezone
@@ -744,7 +843,7 @@ terminal_output console serial
 insmod part_gpt
 insmod ext2
 insmod search_fs_uuid
-search --no-floppy --fs-uuid --set=root $ROOT_UUID
+search --no-floppy --fs-uuid --set=root $ROOT_A_UUID
 
 menuentry "SpatiumDDI Appliance" {
     # Issue #136: dropped "quiet" + systemd.show_status=false so any
@@ -757,7 +856,7 @@ menuentry "SpatiumDDI Appliance" {
     # latter gave a cramped 8x8 cell that operators couldn't read.
     # Setfont in userspace lets us pick a readable font that gives a
     # natural 160x50 grid on a 1280x800 framebuffer.
-    linux /boot/vmlinuz-$KVER root=UUID=$ROOT_UUID ro \\
+    linux /boot/vmlinuz-$KVER root=UUID=$ROOT_A_UUID ro \\
         loglevel=3 audit=0 \\
         console=tty0 console=ttyS0,115200n8
     initrd /boot/initrd.img-$KVER
@@ -767,7 +866,7 @@ menuentry "SpatiumDDI Appliance (full verbose boot)" {
     # Drops loglevel + audit too. Use when you need to capture every
     # kernel message for a bug report. Also passes spatium-console=off
     # so getty@tty1 wins tty1 (no dashboard overpainting the log).
-    linux /boot/vmlinuz-$KVER root=UUID=$ROOT_UUID ro \\
+    linux /boot/vmlinuz-$KVER root=UUID=$ROOT_A_UUID ro \\
         spatium-console=off \\
         console=tty0 console=ttyS0,115200n8
     initrd /boot/initrd.img-$KVER
@@ -777,7 +876,7 @@ menuentry "SpatiumDDI Appliance (rescue / single-user)" {
     # Boots into rescue.target — single-user, root shell only, no
     # docker, no getty@tty1. Asks for the root password from the
     # installer at "Press Enter for maintenance" prompt.
-    linux /boot/vmlinuz-$KVER root=UUID=$ROOT_UUID ro \\
+    linux /boot/vmlinuz-$KVER root=UUID=$ROOT_A_UUID ro \\
         console=tty0 console=ttyS0,115200n8 systemd.unit=rescue.target
     initrd /boot/initrd.img-$KVER
 }
@@ -797,6 +896,15 @@ EOF
             umount "$MOUNT/$d" 2>/dev/null || true
         done
         umount "$MOUNT/boot/efi"
+        # Phase 8a unmount order matters:
+        #   1. /home, /root    — bind mounts onto /var subdirs
+        #   2. /etc (overlay)  — upper is on /var, must release first
+        #   3. /var partition  — must be after /etc overlay + binds
+        #   4. root_A          — last
+        umount "$MOUNT/home"
+        umount "$MOUNT/root"
+        umount "$MOUNT/etc"
+        umount "$MOUNT/var"
         umount "$MOUNT"
         sync
 
