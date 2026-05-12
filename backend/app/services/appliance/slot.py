@@ -109,7 +109,7 @@ def _current_slot_from_cmdline() -> SlotName | None:
     except json.JSONDecodeError:
         return None
 
-    def walk(node: dict) -> str | None:
+    def walk(node: dict) -> SlotName | None:
         if (node.get("uuid") or "").lower() == root_uuid:
             partlabel = (node.get("partlabel") or "").lower()
             if partlabel == "root_a":
