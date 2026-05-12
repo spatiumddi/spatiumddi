@@ -274,10 +274,27 @@ pick_disk() {
         on_cancel "disk picker (no disks present)"
     fi
 
-    TARGET_DISK=$(whiptail --backtitle "$BACKTITLE" --title "Target Disk" \
-        --menu "Select the disk to install SpatiumDDI to.\nALL DATA on the chosen disk will be DESTROYED." \
-        20 70 10 "${options[@]}" 3>&1 1>&2 2>&3) \
-        || on_cancel "target disk"
+    # Pick-and-validate loop. If the operator picks a disk that's too
+    # small for the A/B layout, show the error immediately + send them
+    # back to the menu — used to fire much later from inside
+    # do_install AFTER the operator had already filled out hostname /
+    # admin user / network / timezone, which was wasted typing.
+    local MIN_BYTES=$((16 * 1024 * 1024 * 1024))
+    while true; do
+        TARGET_DISK=$(whiptail --backtitle "$BACKTITLE" --title "Target Disk" \
+            --menu "Select the disk to install SpatiumDDI to.\nALL DATA on the chosen disk will be DESTROYED." \
+            20 70 10 "${options[@]}" 3>&1 1>&2 2>&3) \
+            || on_cancel "target disk"
+        local DISK_BYTES
+        DISK_BYTES=$(blockdev --getsize64 "$TARGET_DISK" 2>/dev/null || echo 0)
+        if [ "$DISK_BYTES" -ge "$MIN_BYTES" ]; then
+            log "Picked target disk $TARGET_DISK ($((DISK_BYTES / 1024 / 1024 / 1024)) GiB)"
+            break
+        fi
+        log "Operator picked $TARGET_DISK ($((DISK_BYTES / 1024 / 1024 / 1024)) GiB) — below 16 GiB minimum; re-prompting"
+        whiptail --backtitle "$BACKTITLE" --title "Disk too small" --msgbox \
+            "Target disk $TARGET_DISK is only $((DISK_BYTES / 1024 / 1024 / 1024)) GiB.\n\nSpatiumDDI's A/B atomic-upgrade layout needs at least 16 GiB:\n  ESP        512 MiB\n  root_A       4 GiB\n  root_B       4 GiB\n  var       remainder (≥7 GiB usable)\n\nPick a different disk, or Cancel out to attach a larger one." 16 70
+    done
 }
 
 ask_hostname() {
@@ -463,16 +480,9 @@ do_install() {
     ROOT_B=$(partition_node 4)
     VAR=$(partition_node 5)
 
-    # Check target disk size — bail before destroying anything.
-    local DISK_BYTES MIN_BYTES
-    DISK_BYTES=$(blockdev --getsize64 "$TARGET_DISK" 2>/dev/null || echo 0)
-    MIN_BYTES=$((16 * 1024 * 1024 * 1024))
-    if [ "$DISK_BYTES" -lt "$MIN_BYTES" ]; then
-        log "ERROR: target disk $TARGET_DISK is $((DISK_BYTES / 1024 / 1024 / 1024)) GiB — need at least 16 GiB for A/B layout"
-        whiptail --backtitle "$BACKTITLE" --title "Disk too small" --msgbox \
-            "Target disk $TARGET_DISK is only $((DISK_BYTES / 1024 / 1024 / 1024)) GiB.\n\nSpatiumDDI's A/B atomic-upgrade layout needs at least 16 GiB:\n  ESP        512 MiB\n  root_A       4 GiB\n  root_B       4 GiB\n  var       remainder (≥7 GiB usable)\n\nAttach a larger disk and re-run the installer." 16 70
-        exit 1
-    fi
+    # Disk-size validation lives in ``pick_disk`` now (fires right
+    # after the operator picks rather than at the end of the wizard
+    # after they've typed hostname / admin / network / timezone).
 
     log "Install starting: target=$TARGET_DISK BBP=$BBP ESP=$ESP ROOT_A=$ROOT_A ROOT_B=$ROOT_B VAR=$VAR"
 
