@@ -97,7 +97,10 @@ def _current_slot_from_cmdline() -> SlotName | None:
     try:
         proc = subprocess.run(
             ["lsblk", "-J", "-o", "NAME,PATH,UUID,PARTLABEL"],
-            capture_output=True, text=True, check=True, timeout=3,
+            capture_output=True,
+            text=True,
+            check=True,
+            timeout=3,
         )
     except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
         return None
@@ -168,9 +171,7 @@ def get_slot_status() -> SlotStatus:
     grubenv = _read_grubenv()
     durable_raw = grubenv.get("saved_entry") or ""
     durable: SlotName | None = (
-        "slot_a" if durable_raw == "slot_a"
-        else "slot_b" if durable_raw == "slot_b"
-        else None
+        "slot_a" if durable_raw == "slot_a" else "slot_b" if durable_raw == "slot_b" else None
     )
     is_trial = bool(current and durable and current != durable)
     state, stamp = _upgrade_state_now()
@@ -222,13 +223,15 @@ def schedule_apply(image_url: str, checksum_url: str | None = None) -> None:
             # the previous run is at worst a brief UI mis-read.
             logger.warning(
                 "appliance_slot_upgrade_state_cleanup_failed",
-                state_file=str(_STATE_FILE), error=str(exc),
+                state_file=str(_STATE_FILE),
+                error=str(exc),
             )
     tmp = _TRIGGER_FILE.with_suffix(".new")
     tmp.write_text(body, encoding="utf-8")
     tmp.replace(_TRIGGER_FILE)
-    logger.info("appliance_slot_upgrade_scheduled", image_url=image_url,
-                checksum=bool(checksum_url))
+    logger.info(
+        "appliance_slot_upgrade_scheduled", image_url=image_url, checksum=bool(checksum_url)
+    )
 
 
 def get_update_log_tail(lines: int = 120) -> str:

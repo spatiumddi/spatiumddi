@@ -38,11 +38,13 @@ class SlotStatusResponse(BaseModel):
 
 class ApplyRequest(BaseModel):
     image_url: str = Field(
-        min_length=1, max_length=2048,
+        min_length=1,
+        max_length=2048,
         description="URL or absolute filesystem path to a slot .raw.xz image",
     )
     checksum_url: str | None = Field(
-        default=None, max_length=2048,
+        default=None,
+        max_length=2048,
         description="Optional URL or path to a SHA-256 sidecar (single hash + filename line)",
     )
 
@@ -109,6 +111,7 @@ async def apply(
         )
     )
     await db.commit()
-    logger.info("appliance_slot_upgrade_apply_requested",
-                image_url=body.image_url, user=user.username)
+    logger.info(
+        "appliance_slot_upgrade_apply_requested", image_url=body.image_url, user=user.username
+    )
     return ApplyResponse(scheduled=body.image_url)
