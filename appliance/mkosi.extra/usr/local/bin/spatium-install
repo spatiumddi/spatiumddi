@@ -511,11 +511,27 @@ do_install() {
         #          can find /usr-aware slots by partition type, used
         #          by 8b's sysupdate slot picker
         #   8300 = generic Linux fs  (var; we mount via /etc/fstab)
+        # Partition type codes:
+        #   ef02 = BIOS Boot                  (grub i386-pc core.img target)
+        #   ef00 = EFI System                 (FAT32 /boot/efi)
+        #   8304 = Linux root x86-64          (systemd-gpt-auto-generator
+        #                                      hint for root slot — used
+        #                                      by 8b's slot-write logic)
+        #   8310 = Linux /var (4d21b016-...)  (sysd-gpt-auto-generator
+        #                                      auto-mounts /var without
+        #                                      needing an /etc/fstab
+        #                                      entry — critical because
+        #                                      the operator-overlay's
+        #                                      fstab is INSIDE the
+        #                                      overlay we're trying to
+        #                                      mount; chicken+egg
+        #                                      otherwise. Sets the var
+        #                                      partition discoverable.)
         sgdisk -n1:0:+1M    -t1:ef02 -c1:bios_boot \
                -n2:0:+512M  -t2:ef00 -c2:ESP \
                -n3:0:+4G    -t3:8304 -c3:root_A \
                -n4:0:+4G    -t4:8304 -c4:root_B \
-               -n5:0:0      -t5:8300 -c5:var \
+               -n5:0:0      -t5:8310 -c5:var \
                "$TARGET_DISK"               >> "$INSTALL_LOG" 2>&1
         partprobe "$TARGET_DISK"            >> "$INSTALL_LOG" 2>&1 || true
         udevadm settle                      >> "$INSTALL_LOG" 2>&1 || true
@@ -561,14 +577,42 @@ do_install() {
             --exclude="/etc/issue.d/zz-spatium-live.issue" \
             / "$MOUNT/" >> "$INSTALL_LOG" 2>&1
 
+        echo "XXX"; echo "60"; echo "Writing boot-critical config to root baseline..."; echo "XXX"
+        # IMPORTANT: fstab + /etc/hostname need to land on the
+        # UNDERLYING root_A partition (not in the overlay upper), since
+        # systemd reads them at boot BEFORE etc.mount can fire. If they
+        # were in the overlay only, systemd would never see them, /var
+        # wouldn't mount, and the overlay would never mount either —
+        # which is the build030 install bug.
+        #
+        # Belt + braces: /var also has GPT type Linux /var
+        # (4d21b016-b534-45c2-a9fb-5c16e091fd2d, sgdisk code 8310, set
+        # earlier in the partitioning step) so systemd-gpt-auto-
+        # generator auto-mounts it even without an fstab entry on slot
+        # swaps to a future image where root_B's fstab might lack one.
+        local ROOT_A_UUID ESP_UUID VAR_UUID
+        ROOT_A_UUID=$(blkid -s UUID -o value "$ROOT_A")
+        ESP_UUID=$(blkid -s UUID -o value "$ESP")
+        VAR_UUID=$(blkid -s UUID -o value "$VAR")
+        cat > "$MOUNT/etc/fstab" <<EOF
+UUID=$ROOT_A_UUID  /          ext4  defaults                       0 1
+UUID=$VAR_UUID     /var       ext4  defaults                       0 2
+UUID=$ESP_UUID     /boot/efi  vfat  umask=0077,shortname=winnt     0 2
+/var/home          /home      none  bind                           0 0
+/var/root          /root      none  bind                           0 0
+tmpfs              /tmp       tmpfs nosuid,nodev,noexec,mode=1777  0 0
+EOF
+        echo "$HOSTNAME" > "$MOUNT/etc/hostname"
+
         echo "XXX"; echo "62"; echo "Snapshotting /etc baseline + mounting overlay (Phase 8a)..."; echo "XXX"
         # Phase 8a-2 — Atomic A/B image upgrade (#138).
         # /usr/lib/etc.image is the slot's "image-shipped /etc"
-        # baseline. We snapshot it BEFORE any operator-config write
-        # so subsequent writes go through the overlay → upper → on
-        # the var partition. Each slot carries its own
-        # /usr/lib/etc.image; on slot swap the overlay's lower changes
-        # with the image, but upper (operator state) is untouched.
+        # baseline. We snapshot AFTER fstab + hostname write so the
+        # snapshot has working boot config (root_B will get its own
+        # snapshot from image v2 — sysupdate updates the lower layer).
+        # Operator-mutable config (passwd, shadow, network, certs) goes
+        # through the overlay later in this install + persists via the
+        # /var/persist/etc upper layer across slot swaps.
         #
         # Use cp -a to preserve perms / xattrs / symlinks. /etc is
         # only ~10 MiB so the copy is fast (<2 s on any disk worth
@@ -608,13 +652,17 @@ do_install() {
         mount --bind "$MOUNT/var/root" "$MOUNT/root" >> "$INSTALL_LOG" 2>&1
 
         echo "XXX"; echo "65"; echo "Writing system config..."; echo "XXX"
-        echo "$HOSTNAME" > "$MOUNT/etc/hostname"
-        # Phase 6 — role config consumed by spatiumddi-firstboot to
-        # set COMPOSE_PROFILES + write CONTROL_PLANE_URL / agent keys
-        # to /etc/spatiumddi/.env. World-readable on the installed
-        # system (no secrets — the agent key only lives transiently
-        # here on the live ISO and gets moved into the 0600 .env at
-        # first boot).
+        # fstab + /etc/hostname were already written to the underlying
+        # root_A /etc earlier (before the overlay was mounted) so boot
+        # can find them. The overlay's lower layer (/usr/lib/etc.image)
+        # captured those writes in the snapshot — so they appear in the
+        # merged view even though we don't re-write them through the
+        # overlay here.
+        #
+        # role-config + /etc/hosts go through the overlay → upper. The
+        # role-config IS operator state (carries the agent key + control
+        # plane URL the wizard captured); /etc/hosts carries the
+        # operator's hostname. Both must persist across slot swaps.
         mkdir -p "$MOUNT/etc/spatiumddi"
         cat > "$MOUNT/etc/spatiumddi/role-config" <<EOF
 ROLE=$ROLE
@@ -633,23 +681,6 @@ EOF
 ::1 ip6-localhost ip6-loopback
 ff02::1 ip6-allnodes
 ff02::2 ip6-allrouters
-EOF
-
-        local ROOT_A_UUID ESP_UUID VAR_UUID
-        ROOT_A_UUID=$(blkid -s UUID -o value "$ROOT_A")
-        ESP_UUID=$(blkid -s UUID -o value "$ESP")
-        VAR_UUID=$(blkid -s UUID -o value "$VAR")
-        # Phase 8a-1 fstab — root_A is the active slot at install time;
-        # 8c (boot counting) will rewrite this on slot swap. /var is on
-        # its own partition so it persists across slot swaps verbatim.
-        # /home and /root are bind-mounted from /var so operator data
-        # follows the var partition across slot swaps (Phase 8a).
-        cat > "$MOUNT/etc/fstab" <<EOF
-UUID=$ROOT_A_UUID  /          ext4  defaults                       0 1
-UUID=$VAR_UUID     /var       ext4  defaults                       0 2
-UUID=$ESP_UUID     /boot/efi  vfat  umask=0077,shortname=winnt     0 2
-/var/home          /home      none  bind                           0 0
-/var/root          /root      none  bind                           0 0
 EOF
 
         # Timezone
