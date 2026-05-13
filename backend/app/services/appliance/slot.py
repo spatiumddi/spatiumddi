@@ -7,18 +7,18 @@ invokes ``spatium-upgrade-slot apply`` + ``set-next-boot``, and renames
 the trigger to ``.done`` or ``.failed``. Mirrors the existing
 ``releases.py`` (Phase 4c) shape — same trigger-watcher pattern.
 
-Status detection (``get_slot_status``) reads /proc/cmdline + lsblk +
-grubenv directly (no need to shell out to spatium-upgrade-slot status
-when the api container can do it itself), and surfaces the trial-boot
-state so the UI can warn the operator that a slot has been set as the
-next boot but not yet committed.
+Status detection (``get_slot_status``) reads /proc/cmdline + udev
+runtime data (/run/udev/data) + grubenv directly (no need to shell
+out to spatium-upgrade-slot status when the api container can do it
+itself), and surfaces the trial-boot state so the UI can warn the
+operator that a slot has been set as the next boot but not yet
+committed.
 """
 
 from __future__ import annotations
 
 import json
 import re
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -48,6 +48,7 @@ _UPDATE_LOG = Path("/var/log/spatiumddi-host/slot-upgrade.log")
 # socket gymnastics.
 _GRUBENV = Path("/boot/efi-host/grub/grubenv")
 _PROC_CMDLINE = Path("/proc/cmdline")
+_UDEV_DATA = Path("/run/udev/data")
 # Phase 8 — per-slot version sidecar maintained by ``spatium-upgrade-slot
 # sync-versions`` (called by spatiumddi-firstboot at every boot + at
 # the end of every apply). Maps {"slot_a": "<version>", "slot_b":
@@ -123,7 +124,18 @@ def _read_grubenv() -> dict[str, str]:
 
 def _current_slot_from_cmdline() -> SlotName | None:
     """Resolve which slot we booted from by matching /proc/cmdline's
-    root=UUID= against the partition labels via lsblk."""
+    root=UUID= against the partition labels via udev runtime data.
+
+    Reads ``/run/udev/data/b<major>:<minor>`` files directly rather than
+    shelling out to ``lsblk``. lsblk inside a container without
+    ``/dev/sda*`` bind-mounted can list block topology (from /sys) but
+    can't read PARTLABEL / UUID, which it derives from the device
+    inode. udev populates the same data into /run/udev/data with
+    ``S:`` (symlink) lines like ``S:disk/by-partlabel/root_A`` and
+    ``S:disk/by-uuid/aa1311ba-...``; parsing those gives us a
+    container-friendly lookup with no extra mounts beyond the
+    ``/run/udev`` bind the appliance compose already adds.
+    """
     try:
         cmdline = _PROC_CMDLINE.read_text()
     except OSError:
@@ -133,37 +145,36 @@ def _current_slot_from_cmdline() -> SlotName | None:
         return None
     root_uuid = m.group(1).lower()
     try:
-        proc = subprocess.run(
-            ["lsblk", "-J", "-o", "NAME,PATH,UUID,PARTLABEL"],
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=3,
-        )
-    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        entries = list(_UDEV_DATA.iterdir())
+    except OSError:
         return None
-    try:
-        data = json.loads(proc.stdout)
-    except json.JSONDecodeError:
-        return None
-
-    def walk(node: dict) -> SlotName | None:
-        if (node.get("uuid") or "").lower() == root_uuid:
-            partlabel = (node.get("partlabel") or "").lower()
-            if partlabel == "root_a":
+    for entry in entries:
+        # udev data files for block devices are named ``b<major>:<minor>``.
+        # Other entries (``+acpi:…`` for ACPI tags, ``c…`` for char devs,
+        # ``n…`` for net devs) aren't relevant here.
+        if not entry.name.startswith("b"):
+            continue
+        try:
+            text = entry.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        partlabel: str | None = None
+        matches_uuid = False
+        for line in text.splitlines():
+            if not line.startswith("S:"):
+                continue
+            value = line[2:].strip()
+            if value.startswith("disk/by-partlabel/"):
+                partlabel = value.rsplit("/", 1)[-1]
+            elif value.startswith("disk/by-uuid/"):
+                if value.rsplit("/", 1)[-1].lower() == root_uuid:
+                    matches_uuid = True
+        if matches_uuid and partlabel:
+            lower = partlabel.lower()
+            if lower == "root_a":
                 return "slot_a"
-            if partlabel == "root_b":
+            if lower == "root_b":
                 return "slot_b"
-        for child in node.get("children") or []:
-            r = walk(child)
-            if r:
-                return r
-        return None
-
-    for top in data.get("blockdevices") or []:
-        r = walk(top)
-        if r:
-            return r
     return None
 
 

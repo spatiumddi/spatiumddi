@@ -32,7 +32,6 @@ RUN apk add --no-cache \
       python3 py3-pip libpcap \
       libcap \
       ca-certificates tzdata \
-      lsblk \
  && setcap cap_net_bind_service=+ep /usr/sbin/kea-dhcp4 \
  && addgroup -S spatium \
  && adduser -S -G spatium spatium \
