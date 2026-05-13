@@ -1,0 +1,59 @@
+#!/bin/bash
+# spatiumddi-reboot-agent — host-side runner for operator-triggered
+# reboot requests from the control plane's Fleet view (Phase 8f-8,
+# issue #138).
+#
+# Flow:
+#   1. Operator clicks Reboot in the OS Versions table → backend
+#      stamps ``reboot_requested=true`` on the agent's server row.
+#   2. ConfigBundle long-poll carries the field down → agent writes
+#      ``/var/lib/spatiumddi-host/release-state/reboot-pending`` via
+#      the bind-mounted release-state directory.
+#   3. ``spatiumddi-reboot-agent.path`` notices the file and runs this
+#      script as root.
+#   4. Script:
+#        a. Logs the request to /var/log/spatiumddi/reboot-agent.log
+#           so the operator can audit from the appliance UI / SSH
+#        b. Renames the trigger to .done so the path unit doesn't
+#           re-fire after the box comes back up (next-boot will see
+#           the same dir contents otherwise — we want a clean state)
+#        c. Issues ``systemctl reboot`` with a small grace window so
+#           in-flight DNS / DHCP responses can finish.
+#
+# Idempotent — if a stale .done file already exists it's overwritten;
+# if no trigger file is present the script no-ops with a warning.
+
+set -euo pipefail
+
+TRIGGER=/var/lib/spatiumddi/release-state/reboot-pending
+LOG_DIR=/var/log/spatiumddi
+LOG="$LOG_DIR/reboot-agent.log"
+GRACE_SECONDS=5
+
+mkdir -p "$LOG_DIR"
+
+log() {
+    printf '[%s] %s\n' "$(date -Iseconds)" "$*" | tee -a "$LOG"
+}
+
+if [ ! -f "$TRIGGER" ]; then
+    log "reboot-agent invoked without a trigger file — nothing to do"
+    exit 0
+fi
+
+# Read the trigger payload (just a timestamp from the agent) for the
+# audit log, then move it aside so the path unit doesn't re-fire.
+TRIGGER_PAYLOAD="$(cat "$TRIGGER" 2>/dev/null || true)"
+mv -f "$TRIGGER" "${TRIGGER}.done" || true
+
+log "operator-triggered reboot accepted (agent stamp: ${TRIGGER_PAYLOAD:-unknown})"
+log "scheduling reboot in ${GRACE_SECONDS}s"
+
+# systemd-shutdown sends SIGTERM (then SIGKILL) to running services;
+# container shutdown happens via docker.service's stop sequence, so
+# in-flight queries get a chance to drain. The grace window above is
+# in addition to that.
+sleep "$GRACE_SECONDS"
+
+log "issuing systemctl reboot"
+exec systemctl reboot

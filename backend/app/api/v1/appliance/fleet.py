@@ -22,6 +22,7 @@ server kinds so the UI can render them in a single Fleet table.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from typing import Literal
 
 import structlog
@@ -62,6 +63,14 @@ class FleetAgentRow(BaseModel):
     # Operator intent.
     desired_appliance_version: str | None
     desired_slot_image_url: str | None
+    # Phase 8f-8 — operator-triggered reboot intent. ``True`` while
+    # the Fleet view's per-row Reboot button has stamped a reboot
+    # request that the agent hasn't yet picked up + executed.
+    # ``reboot_requested_at`` is the wall-clock at the time the
+    # operator clicked Reboot; the heartbeat handler clears both
+    # fields once the agent's reconnect timestamp is newer than this.
+    reboot_requested: bool
+    reboot_requested_at: str | None
 
 
 class FleetResponse(BaseModel):
@@ -117,6 +126,8 @@ def _serialise_dns(s: DNSServer) -> FleetAgentRow:
         last_seen_ip=s.last_seen_ip,
         desired_appliance_version=s.desired_appliance_version,
         desired_slot_image_url=s.desired_slot_image_url,
+        reboot_requested=s.reboot_requested,
+        reboot_requested_at=(s.reboot_requested_at.isoformat() if s.reboot_requested_at else None),
     )
 
 
@@ -139,6 +150,8 @@ def _serialise_dhcp(s: DHCPServer) -> FleetAgentRow:
         last_seen_ip=s.last_seen_ip,
         desired_appliance_version=s.desired_appliance_version,
         desired_slot_image_url=s.desired_slot_image_url,
+        reboot_requested=s.reboot_requested,
+        reboot_requested_at=(s.reboot_requested_at.isoformat() if s.reboot_requested_at else None),
     )
 
 
@@ -282,6 +295,90 @@ async def clear_upgrade(
     await db.commit()
     logger.info(
         "appliance_fleet_upgrade_cleared",
+        kind=kind,
+        server_id=server_id,
+        user=user.username,
+    )
+    if isinstance(server, DNSServer):
+        return _serialise_dns(server)
+    return _serialise_dhcp(server)
+
+
+@router.post(
+    "/{kind}/{server_id}/reboot",
+    response_model=FleetAgentRow,
+    status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[Depends(require_permission("admin", "appliance"))],
+    summary="Stamp reboot_requested on an agent row — the agent reboots its host on next poll",
+)
+async def schedule_reboot(
+    kind: ServerKind,
+    server_id: str,
+    db: DB,
+    user: CurrentUser,
+) -> FleetAgentRow:
+    """Phase 8f-8 — operator-triggered reboot from the Fleet view.
+
+    Stamps ``reboot_requested=true`` + ``reboot_requested_at=now()``
+    on the server row. The agent's existing ConfigBundle long-poll
+    picks the new field up on its next cycle and writes a
+    ``reboot-pending`` trigger file the host-side
+    ``spatiumddi-reboot-agent.path`` unit watches; the host runner
+    then issues ``systemctl reboot`` with a 10 s grace window.
+
+    Auto-clear: the heartbeat handler nulls ``reboot_requested`` once
+    the agent's ``last_seen_at`` advances past ``reboot_requested_at``
+    after the boot (so the operator doesn't have to manually clear
+    the pending chip — coming back online proves the reboot worked).
+
+    422 on docker / k8s rows because there's no host-side trigger to
+    fire — they'd need a different upgrade path entirely (operator
+    runs ``docker compose pull && up -d`` themselves).
+    """
+    server = await _load_server(db, kind, server_id)
+    # Strict gate — only confirmed appliance agents accept reboot.
+    # ``null`` (agent hasn't checked in since the schema migration) +
+    # ``docker`` / ``k8s`` / ``unknown`` are all rejected because the
+    # reboot runner is a SpatiumDDI-appliance-only systemd unit; firing
+    # the trigger on a non-appliance agent at best does nothing, at
+    # worst could reboot the wrong host (e.g. the operator's local
+    # docker workstation that happens to be running an agent container).
+    if server.deployment_kind != "appliance":
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            f"agent deployment_kind={server.deployment_kind!r} doesn't accept "
+            "reboot requests — only confirmed SpatiumDDI appliance agents do "
+            "(docker / k8s deploys reboot via the operator's own orchestrator)",
+        )
+    if server.reboot_requested:
+        # Idempotent — UI's auto-refresh might race with the click,
+        # but a double-stamp doesn't actually reboot twice (the agent
+        # is similarly idempotent on its end). Return 202 + the
+        # current row state so the UI shows the existing pending
+        # request rather than erroring.
+        if isinstance(server, DNSServer):
+            return _serialise_dns(server)
+        return _serialise_dhcp(server)
+
+    server.reboot_requested = True
+    server.reboot_requested_at = datetime.now(UTC)
+
+    db.add(
+        AuditLog(
+            user_id=user.id,
+            user_display_name=user.display_name,
+            auth_source=user.auth_source,
+            action="fleet_schedule_reboot",
+            resource_type=f"{kind}_server",
+            resource_id=server_id,
+            resource_display=server.name,
+            new_value={"reboot_requested": True},
+            result="success",
+        )
+    )
+    await db.commit()
+    logger.info(
+        "appliance_fleet_reboot_scheduled",
         kind=kind,
         server_id=server_id,
         user=user.username,

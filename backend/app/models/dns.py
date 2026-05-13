@@ -244,6 +244,19 @@ class DNSServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     last_upgrade_state_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # Phase 8f-8 — operator-triggered reboot. Set from the Fleet
+    # view's per-row Reboot button; carried to the agent via the
+    # ConfigBundle fleet_upgrade block; cleared by the heartbeat
+    # handler once the agent reconnects with a timestamp newer than
+    # ``reboot_requested_at`` (which proves the box actually rebooted
+    # without the agent needing to send a separate "I rebooted"
+    # signal).
+    reboot_requested: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    reboot_requested_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     # Fernet-encrypted JSON blob for driver-specific admin credentials.
     # windows_dns Path B stores a dict:

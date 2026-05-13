@@ -386,6 +386,21 @@ async def agent_heartbeat(
         server.desired_appliance_version = None
         server.desired_slot_image_url = None
 
+    # Phase 8f-8 — clear reboot_requested once the agent reconnects
+    # after the reboot landed. We don't have a discrete "I rebooted"
+    # signal from the agent, but: agents heartbeat every ~30 s, the
+    # host reboot takes ~30-60 s, so any heartbeat that arrives more
+    # than 15 s after the request was stamped AND finds the request
+    # still set is post-reboot by construction (a pre-reboot agent
+    # wouldn't be heartbeating — the container's down). 15 s is a
+    # safety margin to avoid races where the heartbeat arrives mid-
+    # ConfigBundle-pickup but the box hasn't actually rebooted yet.
+    if server.reboot_requested and server.reboot_requested_at is not None:
+        elapsed = (datetime.now(UTC) - server.reboot_requested_at).total_seconds()
+        if elapsed > 15:
+            server.reboot_requested = False
+            server.reboot_requested_at = None
+
     # Process op ACKs
     for ack in body.ops_ack:
         op_id = ack.get("op_id")

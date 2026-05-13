@@ -1,4 +1,4 @@
-import { type ReactNode } from "react";
+import { useEffect, useState, type ReactNode } from "react";
 
 import { cn } from "@/lib/utils";
 
@@ -10,6 +10,12 @@ import { Modal } from "./modal";
 // extra "I understand this can't be undone" checkbox plus a list of
 // referenced rows, use ``pages/dhcp/_shared.tsx``'s
 // ``DeleteConfirmModal`` instead — this one is the routine yes/no.
+//
+// Pass ``requireCheckboxLabel`` to require an explicit "yes I mean
+// it" checkbox before the Confirm button enables. Used for actions
+// that are non-destructive but operationally heavy (e.g. fleet
+// reboot — won't lose data but will take an agent offline for
+// 30-60 s).
 export function ConfirmModal({
   open,
   title,
@@ -18,6 +24,7 @@ export function ConfirmModal({
   cancelLabel = "Cancel",
   tone = "default",
   loading = false,
+  requireCheckboxLabel,
   onConfirm,
   onClose,
 }: {
@@ -28,14 +35,37 @@ export function ConfirmModal({
   cancelLabel?: string;
   tone?: "default" | "destructive";
   loading?: boolean;
+  requireCheckboxLabel?: string;
   onConfirm: () => void;
   onClose: () => void;
 }) {
+  const [checked, setChecked] = useState(false);
+
+  // Reset the checkbox when the modal opens — otherwise it stays
+  // checked across re-opens, which is the opposite of the safety
+  // valve we want it to be.
+  useEffect(() => {
+    if (open) setChecked(false);
+  }, [open]);
+
   if (!open) return null;
+  const disabled = loading || (!!requireCheckboxLabel && !checked);
   return (
     <Modal title={title} onClose={onClose}>
       <div className="space-y-4">
         <div className="text-sm text-muted-foreground">{message}</div>
+        {requireCheckboxLabel && (
+          <label className="flex items-start gap-2 text-sm">
+            <input
+              type="checkbox"
+              className="mt-0.5 cursor-pointer"
+              checked={checked}
+              onChange={(e) => setChecked(e.target.checked)}
+              disabled={loading}
+            />
+            <span>{requireCheckboxLabel}</span>
+          </label>
+        )}
         <div className="flex justify-end gap-2">
           <button
             type="button"
@@ -47,7 +77,7 @@ export function ConfirmModal({
           </button>
           <button
             type="button"
-            disabled={loading}
+            disabled={disabled}
             onClick={onConfirm}
             className={cn(
               "rounded-md px-3 py-1.5 text-sm disabled:opacity-50",

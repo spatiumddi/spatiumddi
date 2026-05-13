@@ -292,6 +292,11 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
     fleet_upgrade_block: dict[str, Any] = {
         "desired_appliance_version": server.desired_appliance_version,
         "desired_slot_image_url": server.desired_slot_image_url,
+        # Phase 8f-8 — operator-triggered reboot. Agent fires the
+        # ``reboot-pending`` trigger file when this flips to True; the
+        # heartbeat handler clears it once the agent reconnects post-
+        # reboot.
+        "reboot_requested": server.reboot_requested,
     }
 
     bundle_body: dict[str, Any] = {

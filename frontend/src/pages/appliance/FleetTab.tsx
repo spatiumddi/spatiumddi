@@ -6,6 +6,7 @@ import {
   Copy,
   HardDrive,
   Loader2,
+  Power,
   RefreshCw,
   Server,
   Settings2,
@@ -91,6 +92,7 @@ export function FleetTab() {
   );
   const [bulkOpen, setBulkOpen] = useState(false);
   const [bulkTag, setBulkTag] = useState<string>("");
+  const [rebootTarget, setRebootTarget] = useState<FleetAgentRow | null>(null);
 
   const { data, isLoading, error, refetch } = useQuery({
     queryKey: ["appliance", "fleet"],
@@ -146,6 +148,15 @@ export function FleetTab() {
     mutationFn: ({ kind, id }: { kind: FleetAgentKind; id: string }) =>
       applianceFleetApi.clearUpgrade(kind, id),
     onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["appliance", "fleet"] });
+    },
+  });
+
+  const reboot = useMutation({
+    mutationFn: ({ kind, id }: { kind: FleetAgentKind; id: string }) =>
+      applianceFleetApi.scheduleReboot(kind, id),
+    onSuccess: () => {
+      setRebootTarget(null);
       qc.invalidateQueries({ queryKey: ["appliance", "fleet"] });
     },
   });
@@ -212,6 +223,8 @@ export function FleetTab() {
       last_seen_ip: null,
       desired_appliance_version: null,
       desired_slot_image_url: null,
+      reboot_requested: false,
+      reboot_requested_at: null,
     };
   }, [slotData, info]);
 
@@ -370,6 +383,11 @@ export function FleetTab() {
                 onManual={() => setSelfModalOpen(true)}
                 onClearPending={() => {}}
                 clearPending={false}
+                onReboot={() => {
+                  /* Self-row reboot is reachable via the OS Image
+                     modal's Reboot button — the fleet Reboot button
+                     is only rendered on remote agent rows. */
+                }}
               />
             )}
 
@@ -401,6 +419,7 @@ export function FleetTab() {
                 }}
                 onClearPending={() => clear.mutate({ kind: a.kind, id: a.id })}
                 clearPending={clear.isPending}
+                onReboot={() => setRebootTarget(a)}
               />
             ))}
           </tbody>
@@ -623,6 +642,73 @@ export function FleetTab() {
           }}
         />
       )}
+
+      {/* Phase 8f-8 — operator-triggered reboot. Double-confirm via
+          the ``requireCheckboxLabel`` prop so a single misclick can't
+          take an agent offline — operator has to tick the box before
+          the Reboot button enables. Tone="destructive" makes the
+          confirm button red even though no data is lost; reboot is
+          operationally heavy enough to warrant the warning colour. */}
+      <ConfirmModal
+        open={!!rebootTarget}
+        title={
+          rebootTarget
+            ? `Reboot ${kindLabel(rebootTarget.kind)} agent "${rebootTarget.name}"?`
+            : ""
+        }
+        message={
+          rebootTarget && (
+            <div className="space-y-2">
+              <p>
+                Issues{" "}
+                <code className="rounded bg-muted px-1 font-mono">
+                  systemctl reboot
+                </code>{" "}
+                on the agent's host via the ConfigBundle long-poll. Typical
+                offline window is 30–60 s while the appliance restarts —{" "}
+                <strong>
+                  {rebootTarget.kind === "dns" ? "DNS" : "DHCP"} service from
+                  this agent pauses during that window.
+                </strong>
+              </p>
+              <p className="text-xs text-muted-foreground">
+                Host: <code className="font-mono">{rebootTarget.host}</code>
+                {rebootTarget.last_seen_ip
+                  ? ` · ${rebootTarget.last_seen_ip}`
+                  : ""}
+                {rebootTarget.installed_appliance_version
+                  ? ` · running ${rebootTarget.installed_appliance_version}`
+                  : ""}
+              </p>
+              {reboot.isError && (
+                <p className="text-destructive">
+                  {(reboot.error as Error).message}
+                </p>
+              )}
+            </div>
+          )
+        }
+        confirmLabel="Reboot agent"
+        cancelLabel="Cancel"
+        tone="destructive"
+        requireCheckboxLabel={
+          rebootTarget
+            ? `I understand "${rebootTarget.name}" will go offline for ~30–60 s.`
+            : undefined
+        }
+        loading={reboot.isPending}
+        onConfirm={() => {
+          if (rebootTarget) {
+            reboot.mutate({
+              kind: rebootTarget.kind,
+              id: rebootTarget.id,
+            });
+          }
+        }}
+        onClose={() => {
+          if (!reboot.isPending) setRebootTarget(null);
+        }}
+      />
     </div>
   );
 }
@@ -644,6 +730,7 @@ function FleetRow({
   onManual,
   onClearPending,
   clearPending,
+  onReboot,
 }: {
   row: FleetAgentRow;
   isSelf: boolean;
@@ -653,6 +740,7 @@ function FleetRow({
   onManual: () => void;
   onClearPending: () => void;
   clearPending: boolean;
+  onReboot: () => void;
 }) {
   // Strict: only ``appliance`` rows get the slot-upgrade button. The
   // previous fallback (``|| deployment_kind === null``) was a compat
@@ -772,36 +860,60 @@ function FleetRow({
         )}
       </td>
       <td className="px-3 py-2 text-right">
-        {isSelf ? (
-          <button
-            type="button"
-            className="inline-flex items-center gap-1.5 rounded-md border border-primary/40 bg-background px-2.5 py-1 text-xs font-semibold text-primary hover:bg-primary/5"
-            onClick={onUpgrade}
-            title="Open the full A/B slot detail (per-slot versions, log tail, rollback)"
-          >
-            <Settings2 className="h-3 w-3" />
-            Manage…
-          </button>
-        ) : canUpgrade ? (
-          <button
-            type="button"
-            className="inline-flex items-center gap-1.5 rounded-md bg-primary px-2.5 py-1 text-xs font-semibold text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
-            onClick={onUpgrade}
-            disabled={!!row.desired_appliance_version}
-          >
-            <Upload className="h-3 w-3" />
-            Upgrade
-          </button>
-        ) : (
-          <button
-            type="button"
-            className="inline-flex items-center gap-1.5 rounded-md border bg-background px-2.5 py-1 text-xs text-muted-foreground hover:bg-muted"
-            onClick={onManual}
-            title="Show the operator-run upgrade command for this deployment kind"
-          >
-            Manual upgrade…
-          </button>
-        )}
+        <div className="inline-flex items-center justify-end gap-1.5">
+          {/* Reboot button — only on confirmed appliance agent rows
+              (not docker/k8s/null, not the self row). Self row's
+              reboot is reachable via the OS Image modal that opens
+              from the Manage… button below. Showing Reboot for non-
+              appliance rows would risk the operator rebooting their
+              local docker workstation by accident. */}
+          {!isSelf && canUpgrade && (
+            <button
+              type="button"
+              className="inline-flex items-center gap-1 rounded-md border border-destructive/40 bg-background px-2 py-1 text-xs text-destructive hover:bg-destructive/5 disabled:opacity-50"
+              onClick={onReboot}
+              disabled={row.reboot_requested}
+              title={
+                row.reboot_requested
+                  ? "Reboot already in flight — clears when the agent reconnects"
+                  : "Reboot this agent (host-side systemctl reboot with a short grace window)"
+              }
+            >
+              <Power className="h-3 w-3" />
+              {row.reboot_requested ? "Rebooting…" : "Reboot"}
+            </button>
+          )}
+          {isSelf ? (
+            <button
+              type="button"
+              className="inline-flex items-center gap-1.5 rounded-md border border-primary/40 bg-background px-2.5 py-1 text-xs font-semibold text-primary hover:bg-primary/5"
+              onClick={onUpgrade}
+              title="Open the full A/B slot detail (per-slot versions, log tail, rollback)"
+            >
+              <Settings2 className="h-3 w-3" />
+              Manage…
+            </button>
+          ) : canUpgrade ? (
+            <button
+              type="button"
+              className="inline-flex items-center gap-1.5 rounded-md bg-primary px-2.5 py-1 text-xs font-semibold text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+              onClick={onUpgrade}
+              disabled={!!row.desired_appliance_version}
+            >
+              <Upload className="h-3 w-3" />
+              Upgrade
+            </button>
+          ) : (
+            <button
+              type="button"
+              className="inline-flex items-center gap-1.5 rounded-md border bg-background px-2.5 py-1 text-xs text-muted-foreground hover:bg-muted"
+              onClick={onManual}
+              title="Show the operator-run upgrade command for this deployment kind"
+            >
+              Manual upgrade…
+            </button>
+          )}
+        </div>
       </td>
     </tr>
   );

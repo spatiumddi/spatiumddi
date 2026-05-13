@@ -197,6 +197,7 @@ def _last_upgrade_state_from_sidecar() -> tuple[str | None, datetime | None]:
 
 
 _TRIGGER_FILE = Path("/var/lib/spatiumddi-host/release-state/slot-upgrade-pending")
+_REBOOT_TRIGGER_FILE = Path("/var/lib/spatiumddi-host/release-state/reboot-pending")
 
 
 def maybe_fire_fleet_upgrade(
@@ -243,6 +244,41 @@ def maybe_fire_fleet_upgrade(
         # line 1 = image URL (or path), line 2 = optional checksum URL.
         tmp.write_text(desired_url + "\n", encoding="utf-8")
         tmp.replace(_TRIGGER_FILE)
+        return True
+    except OSError:
+        return False
+
+
+def maybe_fire_reboot(reboot_requested: bool) -> bool:
+    """Phase 8f-8 — write the reboot trigger when the control plane
+    has stamped ``reboot_requested=True`` on the server row.
+
+    Strict appliance-only gate: a docker / k8s / unknown agent NEVER
+    fires the trigger even if the field somehow flips through. The
+    host-side ``spatiumddi-reboot-agent.path`` unit + the
+    ``/var/lib/spatiumddi-host/release-state`` bind mount only exist
+    on a SpatiumDDI appliance — but defence in depth is cheap.
+
+    Returns True if a trigger was fired, False otherwise. Idempotent —
+    if the trigger file already exists (host runner hasn't picked it
+    up yet) we skip rather than stacking writes.
+    """
+    if detect_deployment_kind() != "appliance":
+        return False
+    if not reboot_requested:
+        return False
+    if _REBOOT_TRIGGER_FILE.exists():
+        return False
+    try:
+        _REBOOT_TRIGGER_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _REBOOT_TRIGGER_FILE.with_suffix(".new")
+        # One-line marker — the host runner doesn't actually need any
+        # payload, just the path-changed event. Stamp + UTC time so
+        # the operator can debug from /var/log/spatiumddi if needed.
+        tmp.write_text(
+            datetime.utcnow().isoformat() + "Z\n", encoding="utf-8"
+        )
+        tmp.replace(_REBOOT_TRIGGER_FILE)
         return True
     except OSError:
         return False
