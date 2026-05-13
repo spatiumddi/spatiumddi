@@ -145,11 +145,18 @@ case "$MARKER" in
             # here so v3 + v2c share the same plumbing. Operators
             # who want extra defence-in-depth can drop a more-
             # restrictive *.nft in /etc/nftables.d/ themselves.
+            # Note: /etc/nftables.conf's ``include "/etc/nftables.d/*.nft"``
+            # lives INSIDE the input chain definition, so this file
+            # must contain a chain-rule fragment (``udp dport 161
+            # accept``), not a top-level ``add rule …`` directive.
+            # Verified on Debian trixie: ``add rule inet filter
+            # input …`` 422s the reload with
+            # ``syntax error, unexpected rule, expecting @ or '$'``.
             cat > "$NFT_DROPIN" <<'EOF'
 # Managed by spatiumddi-snmp-reload — do not edit manually.
 # SpatiumDDI SNMP is currently enabled; this rule opens UDP 161
 # inbound. Removed automatically when SNMP is disabled via the UI.
-add rule inet filter input udp dport 161 accept
+udp dport 161 accept
 EOF
             chmod 0644 "$NFT_DROPIN"
             nft_reload
