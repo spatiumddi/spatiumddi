@@ -234,11 +234,23 @@ def cmd_apply(args) -> int:
     staged.unlink(missing_ok=True)
 
     # The dd overwrote the partition with the slot image's ext4
-    # filesystem, which has its OWN UUID (mkfs at slot-image build
-    # time). The partition's GPT name (PARTLABEL=root_b) is preserved
-    # because it lives in the GPT header, not in the filesystem.
-    # grub.cfg's slot_b menuentry still references the OLD fs UUID
-    # though — re-stamp it now so set-next-boot + reboot works.
+    # filesystem. That filesystem's UUID was baked at slot-image build
+    # time and is the SAME for every slot dd'd from the same image —
+    # which means slot_a and slot_b end up with identical filesystem
+    # UUIDs after a re-apply. ``spatium-upgrade-slot status`` (and
+    # ``set-next-boot``) key off UUID to identify which slot is which,
+    # so a UUID collision wedges the script with
+    # "couldn't detect A/B slots". Randomise the freshly-written
+    # filesystem's UUID before reading it so each slot stays unique.
+    print(f"  randomising filesystem UUID on {target_dev} (tune2fs -U random)…")
+    subprocess.run(["tune2fs", "-U", "random", target_dev], check=False)
+    # udev tag files cache UUIDs; nudge a re-read so the next blkid
+    # call doesn't return the stale baked-in value.
+    subprocess.run(["udevadm", "trigger", "--settle", target_dev], check=False)
+
+    # Re-read the partition's now-unique UUID + patch grub.cfg's
+    # slot_<x> menuentry to point at it. PARTLABEL is preserved because
+    # it lives in the GPT header, not the filesystem.
     new_uuid = _blkid_uuid(target_dev)
     if new_uuid:
         _patch_grub_cfg_slot_uuid(inactive["partlabel"], new_uuid)
