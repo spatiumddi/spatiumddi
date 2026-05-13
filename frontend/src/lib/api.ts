@@ -6865,7 +6865,7 @@ export const applianceReleasesApi = {
 // ── Appliance: A/B slot upgrade (Phase 8b-3, issue #138) ──────────
 export type ApplianceSlot = "slot_a" | "slot_b";
 export type ApplianceSlotUpgradeState =
-  | "idle"
+  | "ready"
   | "in-flight"
   | "done"
   | "failed";

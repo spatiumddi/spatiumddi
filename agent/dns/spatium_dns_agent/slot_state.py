@@ -184,26 +184,33 @@ def _last_upgrade_state_from_sidecar() -> tuple[str | None, datetime | None]:
     isn't present, the failure has already been recorded + processed
     — by definition the operator has had time to observe it (typical
     heartbeat cadence is 30 s) so the Fleet view's State pill
-    shouldn't stick on ``failed`` forever. Flip back to ``idle`` so
+    shouldn't stick on ``failed`` forever. Flip back to ``ready`` so
     the agent's heartbeat naturally clears the chip on the control
     plane within one cycle. The ``.failed.<ts>`` sidecar file still
     exists on disk for forensic / audit lookup.
+
+    Fresh appliances that have never run an upgrade have no .state
+    file at all — return ``ready`` rather than ``None`` so the Fleet
+    view's State column reads as a positive "healthy + no pending
+    work" signal instead of an empty cell that visually looks like
+    "agent hasn't reported yet". ``None`` is reserved for genuinely-
+    unknown rows (docker / k8s / pre-8f-2).
     """
     if not _HOST_SLOT_STATE.exists():
-        return None, None
+        return "ready", None
     try:
         text = _HOST_SLOT_STATE.read_text(encoding="utf-8", errors="replace").strip()
     except OSError:
         return None, None
     parts = text.split(maxsplit=1)
     state = parts[0] if parts else None
-    if state not in ("idle", "in-flight", "done", "failed"):
+    if state not in ("ready", "in-flight", "done", "failed"):
         return None, None
     # Stale-failed auto-heal — only when no apply is currently in
     # flight (trigger file is the "in-flight" marker; rename to
     # .failed.<ts> on finish).
     if state == "failed" and not _TRIGGER_FILE.exists():
-        return "idle", None
+        return "ready", None
     stamp = None
     if len(parts) > 1:
         try:

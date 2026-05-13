@@ -61,7 +61,7 @@ _UUID_RE = re.compile(r"root=UUID=([0-9a-fA-F-]+)")
 
 
 SlotName = Literal["slot_a", "slot_b"]
-UpgradeState = Literal["idle", "in-flight", "done", "failed"]
+UpgradeState = Literal["ready", "in-flight", "done", "failed"]
 
 
 @dataclass
@@ -180,22 +180,35 @@ def _current_slot_from_cmdline() -> SlotName | None:
 
 def _upgrade_state_now() -> tuple[UpgradeState, str | None]:
     """Read the .state sidecar the host-side runner maintains. Returns
-    ('idle', None) when no upgrade has run recently. Trigger present
-    but no .state yet means the runner hasn't picked it up — counts
-    as 'in-flight' from the operator's perspective."""
+    ('ready', None) when no upgrade has run recently — ``ready`` is
+    the green-chip default that signals "agent is healthy + no pending
+    work". Trigger present but no .state yet means the runner hasn't
+    picked it up — counts as 'in-flight' from the operator's
+    perspective.
+
+    Stale-failed auto-heal: when state == failed AND the un-suffixed
+    trigger isn't present, the host runner has already renamed it to
+    .failed.<ts>. Flip back to ``ready`` so the chip doesn't stick on
+    failed forever after the operator has observed it; the
+    .failed.<ts> sidecar stays on disk for forensics.
+    """
     if _TRIGGER_FILE.exists() and not _STATE_FILE.exists():
         return "in-flight", None
     if _STATE_FILE.exists():
         try:
             text = _STATE_FILE.read_text(encoding="utf-8", errors="replace").strip()
         except OSError:
-            return "idle", None
+            return "ready", None
         parts = text.split(maxsplit=1)
         state = parts[0] if parts else ""
         stamp = parts[1] if len(parts) > 1 else None
         if state in ("in-flight", "done", "failed"):
+            # Auto-heal: failed + no pending trigger == operator has
+            # had time to see it; flip green.
+            if state == "failed" and not _TRIGGER_FILE.exists():
+                return "ready", None
             return state, stamp  # type: ignore[return-value]
-    return "idle", None
+    return "ready", None
 
 
 def get_slot_status() -> SlotStatus:
@@ -211,7 +224,7 @@ def get_slot_status() -> SlotStatus:
             current_slot=None,
             durable_default=None,
             is_trial_boot=False,
-            upgrade_state="idle",
+            upgrade_state="ready",
             upgrade_state_at=None,
             log_tail="",
             slot_a_version=None,

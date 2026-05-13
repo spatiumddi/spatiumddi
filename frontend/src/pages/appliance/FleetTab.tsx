@@ -216,8 +216,7 @@ export function FleetTab() {
       current_slot: slotData.current_slot,
       durable_default: slotData.durable_default,
       is_trial_boot: slotData.is_trial_boot,
-      last_upgrade_state:
-        slotData.upgrade_state === "idle" ? null : slotData.upgrade_state,
+      last_upgrade_state: slotData.upgrade_state,
       last_upgrade_state_at: slotData.upgrade_state_at,
       last_seen_at: new Date().toISOString(),
       last_seen_ip: null,
@@ -812,6 +811,11 @@ function FleetRow({
         {row.last_upgrade_state ? (
           <span
             className={`inline-flex items-center gap-1 rounded-md px-1.5 py-0.5 text-[10px] font-medium ${
+              // ``ready`` and ``done`` both render green — agent is
+              // healthy + no pending issues. ``failed`` is red,
+              // ``in-flight`` is blue. Anything else falls back to
+              // muted (shouldn't happen post-Phase-8f-2 rename).
+              row.last_upgrade_state === "ready" ||
               row.last_upgrade_state === "done"
                 ? "bg-green-500/10 text-green-700 dark:text-green-300"
                 : row.last_upgrade_state === "failed"
@@ -821,7 +825,8 @@ function FleetRow({
                     : "bg-muted text-muted-foreground"
             }`}
           >
-            {row.last_upgrade_state === "done" && (
+            {(row.last_upgrade_state === "done" ||
+              row.last_upgrade_state === "ready") && (
               <CheckCircle2 className="h-3 w-3" />
             )}
             {row.last_upgrade_state === "failed" && (
