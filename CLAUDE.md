@@ -397,8 +397,8 @@ make migrate                           # apply
 # Lint, typecheck, test
 make lint                              # ruff + black + mypy, eslint + prettier
 make ci                                # same three lint jobs CI runs (backend-lint + frontend-lint + frontend-build). Run before pushing.
-make test                              # backend pytest
-make test-one T=tests/test_health.py::test_liveness
+make test                              # backend pytest — runs `-n auto` via pytest-xdist; one worker per CPU, each carving its own `spatiumddi_test_gw<N>` DB (conftest sets that up automatically). ~3-4× faster than serial.
+make test-one T=tests/test_health.py::test_liveness   # single test runs serial — xdist overhead isn't worth it for one
 
 # Logs
 docker compose logs -f api worker

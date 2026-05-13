@@ -114,7 +114,11 @@ jobs:
           CELERY_BROKER_URL: redis://localhost:6379/1
           CELERY_RESULT_BACKEND: redis://localhost:6379/2
           SECRET_KEY: ci-test-secret-key-not-for-production
-        run: python -m pytest --cov=app --cov-report=xml
+        # ``-n auto`` runs one worker per CPU via pytest-xdist; each worker
+        # carves its own throwaway ``spatiumddi_test_gw<N>`` database in
+        # conftest so they can't trample each other's state. GitHub-hosted
+        # Linux runners are 4 vCPU, so this typically lands 4 workers.
+        run: python -m pytest -n auto --cov=app --cov-report=xml
 
       - name: Upload coverage
         uses: codecov/codecov-action@v4

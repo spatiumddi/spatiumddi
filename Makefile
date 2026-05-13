@@ -64,7 +64,7 @@ lint-frontend:
 test: test-backend
 
 test-backend:
-	cd $(BACKEND_DIR) && python -m pytest
+	cd $(BACKEND_DIR) && python -m pytest -n auto
 
 test-one:
 	@test -n "$(T)" || (echo "Usage: make test-one T=tests/test_health.py::test_liveness"; exit 1)
