@@ -176,6 +176,18 @@ def _last_upgrade_state_from_sidecar() -> tuple[str | None, datetime | None]:
     """Read ``state stamp`` from the .state sidecar the host-side
     runner maintains. Returns (state, when) or (None, None) when no
     upgrade has ever run on this agent.
+
+    Auto-heals stale ``failed`` states: the host runner renames the
+    pending trigger to ``.failed.<ts>`` once it finishes, so the
+    presence of the un-suffixed trigger file is the marker of an
+    in-flight apply. If state == failed AND the un-suffixed trigger
+    isn't present, the failure has already been recorded + processed
+    — by definition the operator has had time to observe it (typical
+    heartbeat cadence is 30 s) so the Fleet view's State pill
+    shouldn't stick on ``failed`` forever. Flip back to ``idle`` so
+    the agent's heartbeat naturally clears the chip on the control
+    plane within one cycle. The ``.failed.<ts>`` sidecar file still
+    exists on disk for forensic / audit lookup.
     """
     if not _HOST_SLOT_STATE.exists():
         return None, None
@@ -187,6 +199,11 @@ def _last_upgrade_state_from_sidecar() -> tuple[str | None, datetime | None]:
     state = parts[0] if parts else None
     if state not in ("idle", "in-flight", "done", "failed"):
         return None, None
+    # Stale-failed auto-heal — only when no apply is currently in
+    # flight (trigger file is the "in-flight" marker; rename to
+    # .failed.<ts> on finish).
+    if state == "failed" and not _TRIGGER_FILE.exists():
+        return "idle", None
     stamp = None
     if len(parts) > 1:
         try:
