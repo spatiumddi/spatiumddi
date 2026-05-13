@@ -6,10 +6,11 @@
 #
 # Service: /etc/systemd/system/spatium-console.service (tty1) plus
 # the spatium-console@.service template for serial consoles.
-# F1 hands off to agetty for traditional login. F12 prompts the
-# admin password and exec's `su -l admin` for a shell. F5 / F6
-# reboot / poweroff with a confirm modal. F2 / F3 / F4 / F9 are
-# stubs in v1 (status bar message).
+# F1 hands off to agetty for traditional login (the only way to
+# get a shell on this appliance — by design). F5 / F6 reboot /
+# poweroff with a confirm modal. F2 / F3 / F4 / F9 surface
+# operator-useful read-only views (monitor / containers / network /
+# diagnostic bundle).
 #
 # Role-awareness reads APPLIANCE_ROLE from /etc/spatiumddi/.env —
 # the same value spatiumddi-firstboot writes after the installer
@@ -770,7 +771,6 @@ def render_footer(message: str = "") -> Text:
         ("F5", "Reboot"),
         ("F6", "Shutdown"),
         ("F9", "Diag"),
-        ("F12", "Shell"),
     ]
     t = Text(no_wrap=True, overflow="ellipsis")
     t.append(" ")
@@ -1050,22 +1050,6 @@ def do_login(tty_path: str) -> None:
         os.execvp("login", ["login"])
 
 
-def do_shell(console: Console) -> None:
-    """Drop to admin shell. su -l does its own PAM password check.
-
-    Restores cooked tty mode for the duration so su can read the
-    password without our cbreak munging it. The KeyReader thread is
-    paused by the caller before this runs.
-    """
-    console.clear()
-    console.print("[bold]Switching to admin shell — exit (Ctrl-D or `exit`) returns to the dashboard.[/bold]\n")
-    try:
-        subprocess.run(["su", "-l", "admin"], check=False)
-    except Exception as exc:
-        console.print(f"[red]su failed: {exc}[/red]")
-        time.sleep(2)
-
-
 def do_reboot(console: Console) -> None:
     if confirm_modal(console, "Reboot the appliance now?"):
         console.clear()
@@ -1078,6 +1062,63 @@ def do_shutdown(console: Console) -> None:
         console.clear()
         console.print("\n\n[bold yellow]Powering off…[/bold yellow]\n")
         subprocess.run(["systemctl", "poweroff"], check=False)
+
+
+def do_monitor(console: Console) -> None:
+    """Launch htop as the unprivileged ``admin`` user.
+
+    Running as ``admin`` (not root) means htop's interactive kill /
+    renice features can only target processes that user actually owns,
+    so a physical-console operator can't ctrl-K the api container or
+    SIGKILL pid 1 by accident. htop itself only needs /proc reads to
+    *display* every process, which any user can do — so the view stays
+    full-system, only the actions are scoped.
+    """
+    console.clear()
+    console.print("[bold]Launching htop — q or F10 to exit.[/bold]\n")
+    try:
+        subprocess.run(["runuser", "-u", "admin", "--", "htop"], check=False)
+    except FileNotFoundError:
+        # htop missing on this image — fall back to top, which is in
+        # procps and effectively always present on Debian.
+        console.print("[yellow]htop not installed; falling back to top.[/yellow]")
+        subprocess.run(["runuser", "-u", "admin", "--", "top"], check=False)
+
+
+def do_containers(console: Console) -> None:
+    """Stream ``docker stats`` until the operator quits.
+
+    docker stats already speaks the cooked-tty / ncurses-like idiom
+    (auto-refreshing table, Ctrl-C to exit) so we just hand the tty
+    over to it. No filtering on container name: every container the
+    daemon knows about is interesting on a single-box appliance.
+    """
+    console.clear()
+    console.print("[bold]docker stats — Ctrl-C to return to the dashboard.[/bold]\n")
+    subprocess.run(["docker", "stats"], check=False)
+
+
+def do_network(console: Console) -> None:
+    """Hand off to nmtui for network reconfiguration.
+
+    Runs as root because every meaningful nmtui action (add / edit /
+    activate a connection) calls into NetworkManager via D-Bus and
+    needs the network-manager polkit privilege — root is the simplest
+    way to grant that without configuring polkit rules. The operator
+    at the physical console is already trusted enough to reboot /
+    power off the appliance, so privilege-escalation isn't the threat
+    model here.
+    """
+    console.clear()
+    try:
+        subprocess.run(["nmtui"], check=False)
+    except FileNotFoundError:
+        console.print(
+            "[red]nmtui not installed — this appliance image predates the "
+            "NetworkManager switch. Edit /etc/systemd/network/ files and run "
+            "`systemctl restart systemd-networkd` to reconfigure.[/red]"
+        )
+        time.sleep(4)
 
 
 # ── main loop ─────────────────────────────────────────────────────────
@@ -1125,12 +1166,14 @@ def main() -> int:
             state.set_action("reboot")
         elif key == "F6":
             state.set_action("shutdown")
-        elif key == "F12":
-            state.set_action("shell")
-        elif key in {"F2", "F3", "F4"}:
-            state.flash(f"{key} — coming in v2 (use /appliance UI for now)")
+        elif key == "F2":
+            state.set_action("monitor")
+        elif key == "F3":
+            state.set_action("containers")
+        elif key == "F4":
+            state.set_action("network")
         elif key == "F9":
-            state.flash("F9 Diag bundle — coming in v2 (use /appliance → Logs for now)")
+            state.set_action("diag")
 
     keys = KeyReader(on_key)
     keys.start()
@@ -1162,12 +1205,18 @@ def main() -> int:
                         try:
                             if action == "login":
                                 do_login(args.tty)  # noreturn
-                            elif action == "shell":
-                                do_shell(console)
                             elif action == "reboot":
                                 do_reboot(console)
                             elif action == "shutdown":
                                 do_shutdown(console)
+                            elif action == "monitor":
+                                do_monitor(console)
+                            elif action == "containers":
+                                do_containers(console)
+                            elif action == "network":
+                                do_network(console)
+                            elif action == "diag":
+                                do_diag(console)
                         finally:
                             # Re-arm keypress capture, re-enter Live.
                             keys = KeyReader(on_key)
