@@ -304,7 +304,7 @@ services:
       # because lsblk can't map root=UUID= to root_a / root_b).
       - /etc/spatiumddi:/etc/spatiumddi-host:ro
       - /boot/efi:/boot/efi-host:ro
-      - /var/lib/spatiumddi/release-state:/var/lib/spatiumddi-host/release-state:ro
+      - /var/lib/spatiumddi/release-state:/var/lib/spatiumddi-host/release-state:rw
       - /run/udev:/run/udev:ro
     # No depends_on: api — on agent-mode appliances the api isn't in
     # this compose, and the agent already retries forever on bootstrap
@@ -344,7 +344,7 @@ services:
       # Phase 8f-2 — see dns-bind9 above for the mount rationale.
       - /etc/spatiumddi:/etc/spatiumddi-host:ro
       - /boot/efi:/boot/efi-host:ro
-      - /var/lib/spatiumddi/release-state:/var/lib/spatiumddi-host/release-state:ro
+      - /var/lib/spatiumddi/release-state:/var/lib/spatiumddi-host/release-state:rw
       - /run/udev:/run/udev:ro
 
   # ── DHCP (Kea) — default profile ────────────────────────────────────────────
@@ -378,7 +378,7 @@ services:
       # Phase 8f-2 — see dns-bind9 above for the mount rationale.
       - /etc/spatiumddi:/etc/spatiumddi-host:ro
       - /boot/efi:/boot/efi-host:ro
-      - /var/lib/spatiumddi/release-state:/var/lib/spatiumddi-host/release-state:ro
+      - /var/lib/spatiumddi/release-state:/var/lib/spatiumddi-host/release-state:rw
       - /run/udev:/run/udev:ro
     # No depends_on: api — agent retries until the control plane is
     # reachable; on agent-mode installs the api isn't even in this

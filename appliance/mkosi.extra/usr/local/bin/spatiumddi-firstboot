@@ -56,6 +56,14 @@ fi
 # / read diagnostic data without anyone running docker exec --user root.
 mkdir -p /var/lib/spatiumddi/release-state /var/log/spatiumddi
 chown -R 1000:1000 /var/lib/spatiumddi/release-state
+# 1777 (rwxrwxrwt) — Phase 8f-4 fleet upgrade also has the DNS / DHCP
+# agent containers write into this directory (their unprivileged
+# ``spatium`` user has a different uid than the api's ``app`` user, so
+# 0755 + chown 1000:1000 wouldn't let them through). Sticky bit
+# prevents one container from removing another's pending trigger. The
+# directory only carries trigger files + state sidecars — no secrets,
+# no operator data — so world-write is acceptable here.
+chmod 1777 /var/lib/spatiumddi/release-state
 chmod 0755 /var/log/spatiumddi
 
 if [ ! -f "$ENV_FILE" ]; then
