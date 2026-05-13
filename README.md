@@ -48,6 +48,7 @@
 
 - [Why I built this](#why-i-built-this) — the story
 - [Why SpatiumDDI](#why-spatiumddi) — the elevator pitch
+- [Support the project](#support-the-project) — sponsors, tip jar, getting involved
 - [What's in the box](#whats-in-the-box) — quick capability tour
 - [Full feature detail](#full-feature-detail) — deep dive on every subsystem
 - [Screenshots](#screenshots)
@@ -72,6 +73,18 @@ I'm a network engineer. I've spent years working with enterprise DDI platforms, 
 The open source world has excellent standalone tools — NetBox for IPAM, BIND9 and PowerDNS for DNS, Kea for DHCP — but nothing that pulls them into a single control plane the way the commercial platforms do. So I started building one on nights and weekends.
 
 If SpatiumDDI ends up being useful to you, that's the whole point. If you want to file an issue, send a PR, or just tell me what's broken, I'd genuinely appreciate it.
+
+## Support the project
+
+SpatiumDDI is built on nights and weekends with no commercial backing — every release ships off my own time, my own homelab hardware, and a steady supply of chocolate. If the project is saving your team work, or you just want to keep me building, there are a few ways to chip in. Anything is genuinely appreciated and goes straight back into the hardware-to-test-against fund.
+
+**Individuals**
+
+<p align="left">
+  <a href="https://buymeacoffee.com/mzac"><img src="https://img.shields.io/badge/Buy%20me%20a%20coffee-FFDD00?logo=buy-me-a-coffee&logoColor=000000" alt="Buy me a coffee" /></a>
+</p>
+
+**Organizations** — if your team is running SpatiumDDI in production and you'd like to sponsor specific features, get priority on bug reports, or just say hi, [open an issue](https://github.com/spatiumddi/spatiumddi/issues/new) or reach out directly. Happy to talk.
 
 ## Why SpatiumDDI
 
