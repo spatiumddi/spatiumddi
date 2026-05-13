@@ -2910,6 +2910,17 @@ export const settingsApi = {
     api
       .get<Partial<PlatformSettings>>("/settings/defaults")
       .then((r) => r.data),
+  /** Issue #153 — reveal the configured SNMP v2c community after a
+   *  password re-verify. Superadmin + local-auth only; every reveal
+   *  is audit-logged. ``community`` is null when nothing is
+   *  configured (in which case ``configured`` is false). */
+  revealSnmpCommunity: (password: string) =>
+    api
+      .post<{
+        configured: boolean;
+        community: string | null;
+      }>("/settings/snmp/reveal-community", { password })
+      .then((r) => r.data),
   getOUIStatus: () =>
     api.get<OUIStatus>("/settings/oui/status").then((r) => r.data),
   refreshOUI: () =>

@@ -25,9 +25,38 @@
 #   2. Truncate /etc/snmp/snmpd.conf to a "managed off" stub
 #   3. Write the hash sidecar (empty) + status sidecar (stopped)
 #
-# All paths use the persistent /var partition (survives slot swaps)
-# so the agent's idempotency sidecar lookup stays correct across
-# A/B upgrades.
+# Persistence across A/B slot swaps (Phase 8a, issue #138):
+#
+# Every file the runner touches lives on either the persistent
+# /var partition or the /etc overlay's upper layer (which IS on
+# /var/persist/etc). Concretely:
+#
+#   /etc/snmp/snmpd.conf            → /var/persist/etc/snmp/snmpd.conf
+#   /etc/nftables.d/50-spatium-snmp.nft
+#                                   → /var/persist/etc/nftables.d/...
+#   /etc/systemd/system/multi-user.target.wants/snmpd.service
+#                                   → /var/persist/etc/systemd/...
+#                                     (created by ``systemctl enable``)
+#   /var/lib/snmp/snmpd.conf        → on /var directly (USM state,
+#                                     snmpd's authoritative hashed
+#                                     pass store after first start)
+#   /var/lib/spatiumddi/release-state/snmp-config-{hash,status,pending}
+#                                   → on /var directly (agent's
+#                                     idempotency + ack sidecars)
+#
+# So a slot upgrade or rollback preserves operator SNMP config + the
+# firewall hole + snmpd's enable state automatically — no reapply is
+# needed after the reboot. The agent's hash sidecar matches the
+# control plane bundle's config_hash on the first long-poll after
+# reboot and short-circuits the trigger write.
+#
+# Rollback caveat: if an operator rolls back to a slot built BEFORE
+# the SNMP work, the persisted snmpd.conf + nftables drop-in are
+# still on /var but the snmpd binary, .path/.service units, and this
+# runner script don't exist on that older slot. nftables still
+# applies the drop-in (UDP 161 opens at the firewall, harmlessly,
+# since nothing is listening); snmpd just stays down. No data is
+# lost; rolling forward again restores full SNMP operation.
 
 set -euo pipefail
 

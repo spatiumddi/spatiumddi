@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
-import { Plus, Trash2, AlertCircle } from "lucide-react";
+import { AlertCircle, Copy, Eye, EyeOff, Plus, Trash2 } from "lucide-react";
 import {
   settingsApi,
   type PlatformSettings,
@@ -37,80 +37,190 @@ function CommunityField({
 }) {
   const isSet = !!values.snmp_community_set;
   const [replacing, setReplacing] = useState(false);
+  const [revealing, setRevealing] = useState(false);
+  const [revealPassword, setRevealPassword] = useState("");
+  const [revealed, setRevealed] = useState<string | null>(null);
+
+  // Operator-driven reveal — gated server-side on password +
+  // superadmin + local-auth. Every reveal (success or failure) is
+  // audit-logged so abuse is visible. UI surfaces the plaintext until
+  // the operator clicks Hide; we deliberately don't auto-hide on a
+  // timer because the operator just typed a password to get here and
+  // wants the value long enough to paste it into an NMS / snmpwalk.
+  const revealMutation = useMutation({
+    mutationFn: (password: string) => settingsApi.revealSnmpCommunity(password),
+    onSuccess: (data) => {
+      setRevealed(data.community ?? "(no community configured)");
+      setRevealing(false);
+      setRevealPassword("");
+    },
+  });
+
   const clearPending = isSet && draft === "";
   const showInput =
     !isSet || replacing || (draft !== undefined && draft !== "");
+
   return (
     <Field
       label="Community string (v2c)"
-      description="Read-only community for SNMPv2c queries. Stored Fernet-encrypted server-side; the plaintext is never returned. ``public`` is intentionally NOT pre-seeded — leaving the field empty disables SNMP queries even when the master toggle is on."
+      description="Read-only community for SNMPv2c queries. Stored Fernet-encrypted server-side; the Reveal button surfaces the plaintext after a password re-confirm (every reveal is audited). ``public`` is intentionally NOT pre-seeded — leaving the field empty disables SNMP queries even when the master toggle is on."
     >
-      {clearPending ? (
-        <div className="flex items-center gap-2">
-          <span className="rounded bg-amber-500/10 px-2 py-1 text-xs font-medium text-amber-700 dark:text-amber-400">
-            Pending clear — save to apply
-          </span>
-          <button
-            type="button"
-            onClick={() => setDraft(undefined)}
-            disabled={!isSuperadmin}
-            className="rounded-md border px-2 py-1 text-xs hover:bg-accent disabled:opacity-40"
-          >
-            Undo
-          </button>
-        </div>
-      ) : showInput ? (
-        <div className="flex items-center gap-2">
-          <input
-            type="password"
-            autoComplete="off"
-            spellCheck={false}
-            value={draft ?? ""}
-            onChange={(e) => setDraft(e.target.value)}
-            placeholder={
-              isSet ? "(replace existing community)" : "Enter community string"
-            }
-            disabled={!isSuperadmin}
-            className={cn(inputCls, "w-96 max-w-full font-mono")}
-          />
-          {isSet && (
+      <div className="flex flex-col items-end gap-2">
+        {clearPending ? (
+          <div className="flex items-center gap-2">
+            <span className="rounded bg-amber-500/10 px-2 py-1 text-xs font-medium text-amber-700 dark:text-amber-400">
+              Pending clear — save to apply
+            </span>
+            <button
+              type="button"
+              onClick={() => setDraft(undefined)}
+              disabled={!isSuperadmin}
+              className="rounded-md border px-2 py-1 text-xs hover:bg-accent disabled:opacity-40"
+            >
+              Undo
+            </button>
+          </div>
+        ) : showInput ? (
+          <div className="flex items-center gap-2">
+            <input
+              type="password"
+              autoComplete="off"
+              spellCheck={false}
+              value={draft ?? ""}
+              onChange={(e) => setDraft(e.target.value)}
+              placeholder={
+                isSet
+                  ? "(replace existing community)"
+                  : "Enter community string"
+              }
+              disabled={!isSuperadmin}
+              className={cn(inputCls, "w-96 max-w-full font-mono")}
+            />
+            {isSet && (
+              <button
+                type="button"
+                onClick={() => {
+                  setDraft(undefined);
+                  setReplacing(false);
+                }}
+                disabled={!isSuperadmin}
+                className="rounded-md border px-2 py-1 text-xs hover:bg-accent disabled:opacity-40"
+                title="Cancel — keep the existing community"
+              >
+                Cancel
+              </button>
+            )}
+          </div>
+        ) : (
+          <div className="flex items-center gap-2">
+            <span className="rounded bg-emerald-500/10 px-2 py-1 text-xs font-medium text-emerald-700 dark:text-emerald-400">
+              Configured ✓
+            </span>
             <button
               type="button"
               onClick={() => {
-                setDraft(undefined);
-                setReplacing(false);
+                setRevealing(true);
+                setRevealed(null);
               }}
+              disabled={!isSuperadmin || revealing}
+              className="inline-flex items-center gap-1 rounded-md border px-2 py-1 text-xs hover:bg-accent disabled:opacity-40"
+              title="Show the configured community after password re-confirm"
+            >
+              <Eye className="h-3 w-3" />
+              Reveal
+            </button>
+            <button
+              type="button"
+              onClick={() => setReplacing(true)}
               disabled={!isSuperadmin}
               className="rounded-md border px-2 py-1 text-xs hover:bg-accent disabled:opacity-40"
-              title="Cancel — keep the existing community"
+            >
+              Replace…
+            </button>
+            <button
+              type="button"
+              onClick={() => setDraft("")}
+              disabled={!isSuperadmin}
+              className="rounded-md border border-destructive/40 px-2 py-1 text-xs text-destructive hover:bg-destructive/10 disabled:opacity-40"
+            >
+              Clear
+            </button>
+          </div>
+        )}
+
+        {/* Reveal — password-confirm input. Stays open until the
+            mutation succeeds; failure (bad password / not
+            superadmin / external-auth) surfaces the server's error
+            message inline so the operator knows why. */}
+        {revealing && (
+          <form
+            className="flex items-center gap-2"
+            onSubmit={(e) => {
+              e.preventDefault();
+              if (revealPassword) revealMutation.mutate(revealPassword);
+            }}
+          >
+            <input
+              type="password"
+              autoComplete="current-password"
+              value={revealPassword}
+              onChange={(e) => setRevealPassword(e.target.value)}
+              placeholder="Confirm your password"
+              className={cn(inputCls, "w-56 font-mono")}
+              autoFocus
+            />
+            <button
+              type="submit"
+              disabled={!revealPassword || revealMutation.isPending}
+              className="rounded-md border bg-primary px-2 py-1 text-xs font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-40"
+            >
+              {revealMutation.isPending ? "Verifying…" : "Reveal"}
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setRevealing(false);
+                setRevealPassword("");
+                revealMutation.reset();
+              }}
+              className="rounded-md border px-2 py-1 text-xs hover:bg-accent"
             >
               Cancel
             </button>
-          )}
-        </div>
-      ) : (
-        <div className="flex items-center gap-2">
-          <span className="rounded bg-emerald-500/10 px-2 py-1 text-xs font-medium text-emerald-700 dark:text-emerald-400">
-            Configured ✓
+          </form>
+        )}
+        {revealMutation.isError && (
+          <span className="text-xs text-destructive">
+            {(revealMutation.error as Error).message}
           </span>
-          <button
-            type="button"
-            onClick={() => setReplacing(true)}
-            disabled={!isSuperadmin}
-            className="rounded-md border px-2 py-1 text-xs hover:bg-accent disabled:opacity-40"
-          >
-            Replace…
-          </button>
-          <button
-            type="button"
-            onClick={() => setDraft("")}
-            disabled={!isSuperadmin}
-            className="rounded-md border border-destructive/40 px-2 py-1 text-xs text-destructive hover:bg-destructive/10 disabled:opacity-40"
-          >
-            Clear
-          </button>
-        </div>
-      )}
+        )}
+
+        {/* Revealed plaintext — operator-visible until they click Hide
+            or navigate away. No auto-hide timer: the operator just
+            password-confirmed to get here; making it disappear on a
+            timer would surprise them mid-paste. */}
+        {revealed !== null && (
+          <div className="flex items-center gap-2 rounded-md border border-emerald-500/40 bg-emerald-500/5 px-2 py-1">
+            <span className="font-mono text-xs">{revealed}</span>
+            <button
+              type="button"
+              onClick={() => navigator.clipboard.writeText(revealed)}
+              className="rounded p-1 hover:bg-accent"
+              title="Copy to clipboard"
+            >
+              <Copy className="h-3 w-3" />
+            </button>
+            <button
+              type="button"
+              onClick={() => setRevealed(null)}
+              className="rounded p-1 hover:bg-accent"
+              title="Hide"
+            >
+              <EyeOff className="h-3 w-3" />
+            </button>
+          </div>
+        )}
+      </div>
     </Field>
   );
 }

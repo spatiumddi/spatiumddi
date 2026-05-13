@@ -695,6 +695,122 @@ async def get_oui_status(current_user: CurrentUser, db: DB) -> OUIStatusResponse
     )
 
 
+# ── SNMP community reveal ──────────────────────────────────────────
+#
+# Operators legitimately need to look up the configured v2c community
+# string — it's the credential they paste into their NMS / snmpwalk
+# command. The flat ``GET /settings/`` response never returns the
+# plaintext (only ``snmp_community_set: bool``), so this dedicated
+# endpoint behind a password-confirm + superadmin gate is the path.
+# Mirrors the agent-bootstrap-keys reveal pattern (see
+# ``backend/app/api/v1/admin/agent_keys.py``).
+
+
+class RevealCommunityRequest(BaseModel):
+    password: str
+
+
+class RevealCommunityResponse(BaseModel):
+    configured: bool
+    community: str | None
+
+
+@router.post(
+    "/snmp/reveal-community",
+    response_model=RevealCommunityResponse,
+    summary="Reveal the configured SNMP v2c community (superadmin + password)",
+)
+async def reveal_snmp_community(
+    body: RevealCommunityRequest,
+    current_user: CurrentUser,
+    db: DB,
+) -> RevealCommunityResponse:
+    """Return the v2c community string after password re-verification.
+
+    Same shape as ``POST /api/v1/admin/agent-keys/reveal`` — both the
+    success path and every denial path emit an audit row so abuse is
+    at least visible. Local-auth users only; external-auth users have
+    no local password to re-confirm.
+    """
+    from app.core.crypto import decrypt_str
+    from app.core.security import verify_password
+    from app.models.audit import AuditLog
+
+    def _audit_denied(reason: str) -> None:
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                user_display_name=current_user.display_name,
+                auth_source=current_user.auth_source,
+                action="snmp_community_reveal_denied",
+                resource_type="platform_settings",
+                resource_id="snmp",
+                resource_display="SNMP community",
+                result="forbidden",
+                new_value={"reason": reason},
+            )
+        )
+
+    if not current_user.is_superadmin:
+        _audit_denied("non_superadmin")
+        await db.commit()
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Only superadmins can reveal the SNMP community",
+        )
+
+    if current_user.auth_source != "local":
+        _audit_denied("external_auth")
+        await db.commit()
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "SNMP community reveal requires a local-auth superadmin "
+            f"(your account authenticates via {current_user.auth_source}). "
+            "Log in as a local admin to reveal the community.",
+        )
+
+    if not current_user.hashed_password or not verify_password(
+        body.password, current_user.hashed_password
+    ):
+        _audit_denied("password_mismatch")
+        await db.commit()
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Password is incorrect")
+
+    settings = await _get_or_create(db)
+    if not settings.snmp_community_encrypted:
+        # No reveal-denied audit row — there's nothing to reveal, the
+        # password-confirm path completed cleanly, and an empty row
+        # is genuinely informational.
+        return RevealCommunityResponse(configured=False, community=None)
+
+    try:
+        plaintext = decrypt_str(settings.snmp_community_encrypted)
+    except Exception:
+        _audit_denied("decrypt_failed")
+        await db.commit()
+        raise HTTPException(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "Stored community could not be decrypted (key mismatch?). "
+            "Re-set the community in Settings → Appliance → SNMP.",
+        ) from None
+
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="snmp_community_revealed",
+            resource_type="platform_settings",
+            resource_id="snmp",
+            resource_display="SNMP community",
+            result="success",
+        )
+    )
+    await db.commit()
+    logger.info("snmp_community_revealed", user=current_user.username)
+    return RevealCommunityResponse(configured=True, community=plaintext)
+
+
 @router.post(
     "/oui/refresh",
     response_model=OUIRefreshResponse,
