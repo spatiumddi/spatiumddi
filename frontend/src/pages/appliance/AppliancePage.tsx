@@ -220,7 +220,7 @@ export function AppliancePage() {
         {effectiveTab === "tls" ? (
           <CertificatesTab />
         ) : effectiveTab === "releases" ? (
-          <ReleasesTab />
+          <ReleasesTab applianceMode={isApplianceHost} />
         ) : effectiveTab === "fleet" ? (
           <FleetTab />
         ) : effectiveTab === "containers" ? (

@@ -654,8 +654,17 @@ function FleetRow({
   onClearPending: () => void;
   clearPending: boolean;
 }) {
-  const canUpgrade =
-    row.deployment_kind === "appliance" || row.deployment_kind === null;
+  // Strict: only ``appliance`` rows get the slot-upgrade button. The
+  // previous fallback (``|| deployment_kind === null``) was a compat
+  // shim for agents registered before 8f-2 shipped the heartbeat
+  // extension — there are no such agents in the wild (8f-2 landed in
+  // the same release as the schema migration). On docker / k8s / null
+  // (never reported) rows, the Manual upgrade modal is the right path
+  // since slot dd isn't available there. ``null`` typically means
+  // "agent hasn't checked in since the schema migration" — could be
+  // docker, k8s, appliance, or anything; showing the Upgrade button
+  // would lie about what's possible.
+  const canUpgrade = row.deployment_kind === "appliance";
   const slot =
     row.current_slot &&
     row.durable_default &&
