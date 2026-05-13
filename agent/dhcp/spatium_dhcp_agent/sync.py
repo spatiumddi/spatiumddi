@@ -109,6 +109,20 @@ class SyncLoop:
 
                     if maybe_fire_reboot(True):
                         log.info("fleet_reboot_triggered_from_cache")
+                # Issue #153 — SNMP config rollout (cache-bootstrap
+                # path; mirrors the 200-response path below). Without
+                # this an agent restart while a non-default SNMP
+                # config is cached would 304-forever and never write
+                # the snmp-config trigger file.
+                snmp_block = bundle.get("snmp_settings")
+                if snmp_block:
+                    from .slot_state import maybe_fire_snmp_reload
+
+                    if maybe_fire_snmp_reload(snmp_block):
+                        log.info(
+                            "snmp_reload_triggered_from_cache",
+                            config_hash=snmp_block.get("config_hash"),
+                        )
             except Exception:
                 log.exception("bootstrap_cache_apply_failed")
 
@@ -300,6 +314,16 @@ class SyncLoop:
             from .slot_state import maybe_fire_reboot
             if maybe_fire_reboot(True):
                 log.info("fleet_reboot_triggered")
+        # Issue #153 — SNMP config rollout. Same idempotent shape as
+        # the cache-bootstrap path above; safe to call on every 200.
+        snmp_block = bundle.get("snmp_settings")
+        if snmp_block:
+            from .slot_state import maybe_fire_snmp_reload
+            if maybe_fire_snmp_reload(snmp_block):
+                log.info(
+                    "snmp_reload_triggered",
+                    config_hash=snmp_block.get("config_hash"),
+                )
 
         try:
             self._apply_bundle(bundle, reload_kea=True)

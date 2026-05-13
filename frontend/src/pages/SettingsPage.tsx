@@ -3,6 +3,7 @@ import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   settingsApi,
   authApi,
+  versionApi,
   type OUITaskStatus,
   type PlatformSettings,
 } from "@/lib/api";
@@ -22,6 +23,7 @@ import { Modal } from "@/components/ui/modal";
 import { Toggle } from "@/components/ui/toggle";
 import { AuditForwardTargets } from "@/components/AuditForwardTargets";
 import { AgentBootstrapKeysSection } from "@/components/AgentBootstrapKeysSection";
+import { SNMPSection } from "@/components/SNMPSection";
 
 const OUI_SOURCE_URL = "https://standards-oui.ieee.org/oui/oui.csv";
 
@@ -66,6 +68,7 @@ type SectionId =
   | "account-lockout"
   | "agent-bootstrap-keys"
   | "session"
+  | "snmp"
   | "subnet-tree"
   | "updates"
   | "utilization";
@@ -77,6 +80,7 @@ type SectionGroup =
   | "DNS"
   | "DHCP"
   | "Network"
+  | "Appliance"
   | "AI";
 
 interface SectionDef {
@@ -98,6 +102,7 @@ const GROUP_ORDER: SectionGroup[] = [
   "DNS",
   "DHCP",
   "Network",
+  "Appliance",
 ];
 
 // Which PlatformSettings keys each section owns — drives the per-section
@@ -167,6 +172,18 @@ const SECTION_FIELDS: Record<SectionId, (keyof PlatformSettings)[]> = {
   // type-completeness check.
   "agent-bootstrap-keys": [],
   session: ["session_timeout_minutes", "auto_logout_minutes"],
+  // SNMP — has its own atomic Save (see SNMPSection.tsx) because v3
+  // user pass merging doesn't fit the flat key→value diff model used
+  // by the global Save button. SECTION_FIELDS keeps the simple ones
+  // so the per-section "Reset to defaults" button still works on
+  // toggle + version + sources + sysContact + sysLocation.
+  snmp: [
+    "snmp_enabled",
+    "snmp_version",
+    "snmp_allowed_sources",
+    "snmp_sys_contact",
+    "snmp_sys_location",
+  ],
   "subnet-tree": ["subnet_tree_default_expanded_depth"],
   updates: ["github_release_check_enabled"],
   utilization: [
@@ -906,6 +923,35 @@ const SECTIONS: SectionDef[] = [
     ],
   },
 
+  // ── Appliance ─────────────────────────────────────────────────────────
+  {
+    id: "snmp",
+    title: "SNMP",
+    group: "Appliance",
+    description:
+      "snmpd on every SpatiumDDI appliance host — local + every registered remote agent. Operators configure v2c (community string) or v3 (USM users) here; the rendered snmpd.conf is shipped through the ConfigBundle long-poll, validated host-side via snmpd -t, and applied atomically. Non-appliance deployments see this page with a banner — settings still propagate to any appliance agents in a hybrid topology.",
+    keywords: [
+      "snmp",
+      "snmpd",
+      "monitoring",
+      "v2c",
+      "v3",
+      "community",
+      "rocommunity",
+      "usm",
+      "createuser",
+      "sysContact",
+      "sysLocation",
+      "appliance",
+      "host",
+      "nms",
+      "prometheus",
+      "exporter",
+      "mib",
+      "oid",
+    ],
+  },
+
   // ── AI ────────────────────────────────────────────────────────────────
   {
     id: "ai-digest",
@@ -951,6 +997,17 @@ export function SettingsPage() {
     queryFn: settingsApi.getDefaults,
     staleTime: Infinity,
   });
+
+  // Issue #153 — SNMPSection uses this to decide whether to show the
+  // "snmpd is only configured on appliance hosts" notice. Treat
+  // undefined as ``true`` while loading so the notice doesn't flash
+  // on every page open against an appliance.
+  const { data: versionInfo } = useQuery({
+    queryKey: ["version"],
+    queryFn: versionApi.get,
+    staleTime: 60 * 60 * 1000,
+  });
+  const applianceMode = versionInfo?.appliance_mode ?? true;
 
   const [form, setForm] = useState<Partial<PlatformSettings>>({});
   const [saved, setSaved] = useState(false);
@@ -1563,6 +1620,15 @@ export function SettingsPage() {
                 values={values}
                 set={set}
                 isSuperadmin={isSuperadmin}
+                inputCls={inputCls}
+              />
+            )}
+
+            {activeId === "snmp" && (
+              <SNMPSection
+                values={values}
+                isSuperadmin={isSuperadmin}
+                applianceMode={applianceMode}
                 inputCls={inputCls}
               />
             )}

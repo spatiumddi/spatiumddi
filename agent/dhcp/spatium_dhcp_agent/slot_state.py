@@ -222,6 +222,13 @@ def _last_upgrade_state_from_sidecar() -> tuple[str | None, datetime | None]:
 
 _TRIGGER_FILE = Path("/var/lib/spatiumddi-host/release-state/slot-upgrade-pending")
 _REBOOT_TRIGGER_FILE = Path("/var/lib/spatiumddi-host/release-state/reboot-pending")
+# Issue #153 — SNMP config rollout. The trigger file carries the
+# rendered snmpd.conf body so the host runner doesn't need to re-
+# render. The hash sidecar lets the agent skip re-firing after an
+# unchanged config bundle picks up across an agent restart.
+_SNMP_TRIGGER_FILE = Path("/var/lib/spatiumddi-host/release-state/snmp-config-pending")
+_SNMP_HASH_SIDECAR = Path("/var/lib/spatiumddi-host/release-state/snmp-config-hash")
+_SNMP_STATUS_SIDECAR = Path("/var/lib/spatiumddi-host/release-state/snmp-status")
 
 
 def maybe_fire_fleet_upgrade(
@@ -308,6 +315,85 @@ def maybe_fire_reboot(reboot_requested: bool) -> bool:
         return False
 
 
+def maybe_fire_snmp_reload(bundle_block: object) -> bool:
+    """Issue #153 — write the snmp-config trigger when the control
+    plane's rendered snmpd.conf hash differs from the last one this
+    agent applied.
+
+    Strict appliance-only gate — same reasoning as
+    ``maybe_fire_reboot``: the host-side ``spatiumddi-snmp-reload``
+    units don't exist on docker / k8s deploys; firing the trigger
+    there would just leave dead files in a directory that may not
+    even exist.
+
+    Returns True if a trigger was fired, False otherwise. Idempotent
+    via the hash sidecar — multiple long-poll cycles with the same
+    config_hash produce zero triggers. The host runner writes the
+    sidecar on successful apply so the next agent restart doesn't
+    re-fire either.
+    """
+    if detect_deployment_kind() != "appliance":
+        return False
+    if not isinstance(bundle_block, dict):
+        return False
+    config_hash = str(bundle_block.get("config_hash") or "")
+    snmpd_conf = str(bundle_block.get("snmpd_conf") or "")
+    enabled = bool(bundle_block.get("enabled"))
+    # Empty hash = SNMP disabled and no config to push. Only fire a
+    # disable trigger if the agent previously applied a non-empty
+    # config (sidecar present and non-empty) — otherwise this is the
+    # default "never configured" state and there's nothing to undo.
+    last_hash = ""
+    if _SNMP_HASH_SIDECAR.exists():
+        try:
+            last_hash = _SNMP_HASH_SIDECAR.read_text(encoding="utf-8").strip()
+        except OSError:
+            last_hash = ""
+    if config_hash == last_hash:
+        return False
+    if _SNMP_TRIGGER_FILE.exists():
+        return False
+    try:
+        _SNMP_TRIGGER_FILE.parent.mkdir(parents=True, exist_ok=True)
+        # Three-section payload the host runner reads:
+        #   line 1:    ``enabled`` | ``disabled`` marker
+        #   line 2:    config_hash (sha256 hex, blank when disabled)
+        #   line 3+:   rendered snmpd.conf body (already ends with \n)
+        # The hash is on the wire (rather than recomputed by the
+        # runner) so the agent and host agree on exactly which body
+        # was applied — useful when the runner writes the sidecar
+        # the agent reads on next bundle to short-circuit re-firing.
+        payload = (
+            ("enabled\n" if enabled else "disabled\n")
+            + (config_hash + "\n")
+            + snmpd_conf
+        )
+        tmp = _SNMP_TRIGGER_FILE.with_suffix(".new")
+        tmp.write_text(payload, encoding="utf-8")
+        tmp.replace(_SNMP_TRIGGER_FILE)
+        return True
+    except OSError:
+        return False
+
+
+def read_snmpd_running() -> bool | None:
+    """Read snmpd's last-reported status from the sidecar the host-
+    side runner writes after each apply. ``True`` = snmpd is running,
+    ``False`` = stopped, ``None`` = unknown (sidecar missing /
+    unreadable / non-appliance)."""
+    if not _SNMP_STATUS_SIDECAR.exists():
+        return None
+    try:
+        text = _SNMP_STATUS_SIDECAR.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if text == "running":
+        return True
+    if text == "stopped":
+        return False
+    return None
+
+
 def collect() -> dict[str, object]:
     """Snapshot the agent's slot + deployment state for the heartbeat.
 
@@ -339,4 +425,8 @@ def collect() -> dict[str, object]:
         "is_trial_boot": is_trial_boot,
         "last_upgrade_state": last_state,
         "last_upgrade_state_at": last_state_at.isoformat() if last_state_at else None,
+        # Issue #153 — surfaces in the Fleet view next to deployment
+        # kind so operators see at a glance which appliances actually
+        # have snmpd running. None on non-appliance deploys.
+        "snmpd_running": read_snmpd_running() if is_appliance else None,
     }

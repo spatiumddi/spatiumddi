@@ -1,0 +1,159 @@
+#!/bin/bash
+# spatiumddi-snmp-reload — host-side snmpd config-apply runner
+# (issue #153).
+#
+# The api / agent container writes
+# /var/lib/spatiumddi/release-state/snmp-config-pending whenever the
+# control plane's rendered snmpd.conf body changes vs. what's been
+# applied here. File format (no JSON to keep the runner dependency-
+# free):
+#   line 1:    "enabled" | "disabled"
+#   line 2:    sha256 hex of the body (blank when disabled)
+#   line 3+:   rendered /etc/snmp/snmpd.conf body
+#
+# Apply flow when enabled:
+#   1. Extract body, write to /tmp staging
+#   2. ``snmpd -t -C -c <tmp>`` (config syntax check); abort on fail
+#   3. systemctl stop snmpd (if running)
+#   4. rm /var/lib/snmp/snmpd.conf so createUser lines re-run fresh
+#   5. Atomically swap /etc/snmp/snmpd.conf
+#   6. systemctl enable --now snmpd
+#   7. Verify it's up; write the hash sidecar + status sidecar
+#
+# Apply flow when disabled:
+#   1. systemctl disable --now snmpd (idempotent)
+#   2. Truncate /etc/snmp/snmpd.conf to a "managed off" stub
+#   3. Write the hash sidecar (empty) + status sidecar (stopped)
+#
+# All paths use the persistent /var partition (survives slot swaps)
+# so the agent's idempotency sidecar lookup stays correct across
+# A/B upgrades.
+
+set -euo pipefail
+
+TRIGGER=/var/lib/spatiumddi/release-state/snmp-config-pending
+HASH_SIDECAR=/var/lib/spatiumddi/release-state/snmp-config-hash
+STATUS_SIDECAR=/var/lib/spatiumddi/release-state/snmp-status
+LOG_DIR=/var/log/spatiumddi
+LOG="$LOG_DIR/snmp-reload.log"
+ETC_CONF=/etc/snmp/snmpd.conf
+USM_STATE=/var/lib/snmp/snmpd.conf
+LOCK=/run/spatiumddi-snmp-reload.lock
+
+mkdir -p "$LOG_DIR" "$(dirname "$HASH_SIDECAR")"
+exec >> "$LOG" 2>&1
+echo
+echo "[$(date -Iseconds)] === spatiumddi-snmp-reload fired ==="
+
+if [ ! -f "$TRIGGER" ]; then
+    echo "  no trigger file at $TRIGGER, nothing to do"
+    exit 0
+fi
+
+# Serialise concurrent invocations — the .path unit fires once per
+# write, but operator-driven reapplies + agent retries could overlap.
+exec 9>"$LOCK"
+if ! flock -n 9; then
+    echo "  another reload in progress, deferring"
+    exit 0
+fi
+
+MARKER=$(sed -n '1p' "$TRIGGER" | tr -d '\r\n')
+HASH=$(sed -n '2p' "$TRIGGER" | tr -d '\r\n')
+TMP_BODY=$(mktemp /tmp/spatium-snmpd.conf.XXXXXX)
+trap 'rm -f "$TMP_BODY"' EXIT
+tail -n +3 "$TRIGGER" > "$TMP_BODY"
+
+echo "  marker:    $MARKER"
+echo "  hash:      ${HASH:-<empty>}"
+echo "  body size: $(wc -c < "$TMP_BODY") bytes"
+
+case "$MARKER" in
+    enabled)
+        # Validate syntax against snmpd -C -c (don't fall back to the
+        # system path; the operator-supplied body is the only thing
+        # under test here). ``snmpd -H`` is the help flag that exits
+        # 0 after dumping options; we use it as a quick "does snmpd
+        # exist?" check before the real syntax test.
+        if ! command -v snmpd >/dev/null 2>&1; then
+            echo "  ✗ snmpd binary not found — is net-snmp installed?"
+            echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
+            mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
+            exit 1
+        fi
+        # ``-t`` tests config + exits, ``-C`` ignores the default conf
+        # paths so only our staging file is checked.
+        if ! snmpd -t -C -c "$TMP_BODY" >/tmp/spatium-snmpd-validate.log 2>&1; then
+            echo "  ✗ snmpd -t failed for staged config:"
+            sed 's/^/      /' /tmp/spatium-snmpd-validate.log
+            echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
+            mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
+            exit 1
+        fi
+        echo "  ✓ snmpd -t passed"
+
+        # Stop snmpd cleanly so the createUser lines we're about to
+        # ship are read fresh on next start. Ignore failure when the
+        # service was never enabled — first-time apply.
+        systemctl stop snmpd >/dev/null 2>&1 || true
+        # Wipe the persisted USM state. snmpd rewrites this file on
+        # startup from createUser lines in /etc/snmp/snmpd.conf; if we
+        # leave the old hashed entries in place a rotated pass won't
+        # be honoured.
+        rm -f "$USM_STATE"
+
+        # Atomic swap. Owner root, group root, mode 0640 — snmpd reads
+        # as the snmp user but the file may contain plaintext community
+        # strings, so block other-world reads.
+        install -o root -g root -m 0640 "$TMP_BODY" "$ETC_CONF"
+
+        if ! systemctl enable --now snmpd; then
+            echo "  ✗ systemctl enable --now snmpd failed"
+            echo "stopped" > "$STATUS_SIDECAR"
+            echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
+            mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
+            exit 1
+        fi
+        # Brief wait + active-state probe. systemctl returns 0 the
+        # moment the unit transitions to "starting"; we want to catch
+        # the case where snmpd reaches start-up but exits with an
+        # error within the first couple of seconds.
+        sleep 2
+        if systemctl is-active --quiet snmpd; then
+            echo "  ✓ snmpd is active"
+            echo "running" > "$STATUS_SIDECAR"
+            echo "$HASH" > "$HASH_SIDECAR"
+            echo "done $(date -Iseconds)" > "${TRIGGER}.state"
+            mv "$TRIGGER" "${TRIGGER}.done.$(date +%s)"
+        else
+            echo "  ✗ snmpd not active after start"
+            systemctl status snmpd --no-pager | sed 's/^/      /' || true
+            echo "stopped" > "$STATUS_SIDECAR"
+            echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
+            mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
+            exit 1
+        fi
+        ;;
+    disabled)
+        systemctl disable --now snmpd >/dev/null 2>&1 || true
+        # Leave a "managed off" stub so an operator who SSHes in sees
+        # the source-of-truth note rather than a stale runtime config.
+        cat > "$ETC_CONF" <<'EOF'
+# Managed by SpatiumDDI — SNMP is currently disabled.
+# To enable, toggle Settings → Appliance → SNMP in the SpatiumDDI UI.
+EOF
+        chown root:root "$ETC_CONF"
+        chmod 0640 "$ETC_CONF"
+        echo "stopped" > "$STATUS_SIDECAR"
+        : > "$HASH_SIDECAR"
+        echo "  ✓ snmpd stopped + disabled, config stubbed"
+        echo "done $(date -Iseconds)" > "${TRIGGER}.state"
+        mv "$TRIGGER" "${TRIGGER}.done.$(date +%s)"
+        ;;
+    *)
+        echo "  ✗ unknown marker line: ${MARKER:-<empty>}"
+        echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
+        mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
+        exit 1
+        ;;
+esac

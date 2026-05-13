@@ -31,6 +31,8 @@ from app.models.dns import (
     DNSView,
     DNSZone,
 )
+from app.models.settings import PlatformSettings
+from app.services.appliance.snmp import snmp_bundle
 from app.services.dns_blocklist import (
     build_effective_for_group,
     build_effective_for_view,
@@ -58,6 +60,11 @@ except ImportError:  # fallback local adapter — same shape as canonical type
         # and fires the local slot-upgrade trigger when its installed
         # version doesn't match. None / absent when no upgrade pending.
         fleet_upgrade: dict[str, Any]
+        # Issue #153 — singleton snmpd.conf body + content hash. Agent
+        # writes a host-side trigger when the hash changes vs. its
+        # last-rendered config; the host's spatiumddi-snmp-reload.path
+        # unit picks the file up + reloads snmpd.
+        snmp_settings: dict[str, Any]
 
 
 if TYPE_CHECKING:
@@ -299,6 +306,18 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
         "reboot_requested": server.reboot_requested,
     }
 
+    # Issue #153 — appliance SNMP. Singleton platform_settings drives
+    # snmpd.conf on every fleet host; agent compares the bundle's
+    # ``config_hash`` against its last-rendered hash and writes the
+    # snmp-reload trigger when they differ. Always-present key keeps
+    # the etag stable while SNMP stays disabled.
+    settings_row = await db.get(PlatformSettings, 1)
+    snmp_block: dict[str, Any] = (
+        snmp_bundle(settings_row)
+        if settings_row is not None
+        else {"enabled": False, "config_hash": "", "snmpd_conf": ""}
+    )
+
     bundle_body: dict[str, Any] = {
         "server_id": str(server.id),
         "driver": server.driver,
@@ -312,6 +331,7 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
         "pending_record_ops": pending_ops,
         "catalog": catalog_block,
         "fleet_upgrade": fleet_upgrade_block,
+        "snmp_settings": snmp_block,
     }
 
     # Structural fingerprint excludes records and pending ops so record-only

@@ -30,6 +30,8 @@ from app.models.dhcp import (
 )
 from app.models.logs import DHCPLogEntry
 from app.models.metrics import DHCPMetricSample
+from app.models.settings import PlatformSettings
+from app.services.appliance.snmp import snmp_bundle
 from app.services.dhcp.agent_token import (
     hash_token,
     mint_agent_token,
@@ -309,6 +311,16 @@ async def agent_config_longpoll(
     deadline = asyncio.get_event_loop().time() + LONGPOLL_TIMEOUT_SECONDS
     while True:
         bundle = await build_config_bundle(db, server)
+        # Issue #153 — fold the rendered snmpd.conf hash into the ETag
+        # mix below so a Settings → Appliance → SNMP change wakes the
+        # agent's long-poll even when nothing in the DHCP driver
+        # bundle changed.
+        settings_row = await db.get(PlatformSettings, 1)
+        snmp_block = (
+            snmp_bundle(settings_row)
+            if settings_row is not None
+            else {"enabled": False, "config_hash": "", "snmpd_conf": ""}
+        )
         # Phase 8f-3 — mix the fleet-upgrade intent into the ETag so a
         # Fleet view change wakes the agent's long-poll even when the
         # driver-side bundle is unchanged. Deterministic — re-reading
@@ -317,6 +329,7 @@ async def agent_config_longpoll(
             f"{server.desired_appliance_version}"
             f"|{server.desired_slot_image_url}"
             f"|{int(server.reboot_requested)}"
+            f"|snmp:{int(bool(snmp_block.get('enabled')))}:{snmp_block.get('config_hash', '')}"
         )
         etag = "sha256:" + hashlib.sha256(f"{bundle.etag}|{fleet_marker}".encode()).hexdigest()
 
@@ -427,6 +440,12 @@ async def agent_config_longpoll(
                     # post-reconnect.
                     "reboot_requested": server.reboot_requested,
                 },
+                # Issue #153 — rendered snmpd.conf body + config hash.
+                # Agent writes the snmp-reload trigger when the hash
+                # differs from its last-rendered config; host-side
+                # spatiumddi-snmp-reload.path picks the file up and
+                # reloads snmpd.
+                "snmp_settings": snmp_block,
             }
         if asyncio.get_event_loop().time() >= deadline:
             return Response(status_code=304, headers={"ETag": etag})

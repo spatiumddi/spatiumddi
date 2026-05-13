@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
+from ipaddress import ip_network
 from typing import Any
 
 import structlog
@@ -17,6 +18,16 @@ from app.models.audit_forward import AuditForwardTarget
 from app.models.oui import OUIVendor
 from app.models.settings import PlatformSettings
 from app.services import audit_forward as audit_forward_svc
+
+# SNMP v3 protocol allow-lists. Sticking to the protocols net-snmp's
+# Debian build ships out of the box — DES/AES for priv, MD5/SHA for
+# auth, plus a sentinel "none" for noAuth/noPriv. Stronger AES-256 +
+# SHA-256/384/512 land in net-snmp 5.9+ which Debian trixie carries,
+# but we leave that to a follow-up so the first cut works against
+# every snmpd build operators are likely to see.
+_SNMP_VERSIONS: set[str] = {"v2c", "v3"}
+_SNMP_AUTH_PROTOCOLS: set[str] = {"none", "MD5", "SHA"}
+_SNMP_PRIV_PROTOCOLS: set[str] = {"none", "DES", "AES"}
 
 logger = structlog.get_logger(__name__)
 router = APIRouter()
@@ -103,22 +114,143 @@ class SettingsResponse(BaseModel):
     lockout_threshold: int = 0
     lockout_duration_minutes: int = 15
     lockout_reset_minutes: int = 15
+    # ── Appliance SNMP (issue #153) ───────────────────────────────
+    # Ciphertext columns are folded into ``*_set`` booleans by the
+    # model validator below; v3 user pass fields likewise.
+    snmp_enabled: bool = False
+    snmp_version: str = "v2c"
+    snmp_community_set: bool = False
+    snmp_v3_users: list[dict[str, Any]] = []
+    snmp_allowed_sources: list[str] = []
+    snmp_sys_contact: str = ""
+    snmp_sys_location: str = ""
 
     model_config = {"from_attributes": True}
 
     @model_validator(mode="before")
     @classmethod
-    def _attach_fb_set(cls, data: Any) -> Any:
-        # When serializing a PlatformSettings ORM instance, fold the
-        # ciphertext-bearing ``fingerbank_api_key_encrypted`` column
-        # into a boolean ``fingerbank_api_key_set`` so the payload
-        # never leaks the encrypted bytes — the UI only needs to know
-        # whether a key is configured.
+    def _redact_secrets(cls, data: Any) -> Any:
+        # When serializing a PlatformSettings ORM instance, fold every
+        # ciphertext-bearing column into a boolean ``*_set`` marker so
+        # the payload never leaks Fernet bytes — the UI only needs to
+        # know whether a value is configured. v3 users get the same
+        # treatment per-entry (auth_pass_enc / priv_pass_enc → bool
+        # ``*_set`` flags).
         if isinstance(data, PlatformSettings):
             cols = {c.name: getattr(data, c.name) for c in data.__table__.columns}
             cols["fingerbank_api_key_set"] = bool(cols.pop("fingerbank_api_key_encrypted", None))
+            cols["snmp_community_set"] = bool(cols.pop("snmp_community_encrypted", None))
+            raw_users = cols.get("snmp_v3_users") or []
+            cols["snmp_v3_users"] = [_redact_v3_user(u) for u in raw_users]
             return cols
         return data
+
+
+def _redact_v3_user(u: dict[str, Any]) -> dict[str, Any]:
+    """Strip ciphertext from a stored v3-user dict for response shape."""
+    return {
+        "username": u.get("username", ""),
+        "auth_protocol": u.get("auth_protocol") or "none",
+        "auth_pass_set": bool(u.get("auth_pass_enc")),
+        "priv_protocol": u.get("priv_protocol") or "none",
+        "priv_pass_set": bool(u.get("priv_pass_enc")),
+    }
+
+
+def _merge_snmp_v3_users(
+    existing: list[dict[str, Any]], incoming: list[dict[str, Any]]
+) -> list[dict[str, Any]]:
+    """Atomic replace + per-user pass merge keyed on username.
+
+    ``incoming`` is the full new list — usernames not present are
+    dropped. For each entry, ``auth_pass`` / ``priv_pass`` of
+    ``None`` preserves the existing ciphertext for the same
+    username; ``""`` clears; anything else is encrypted fresh.
+
+    Encrypted bytes are stored as the URL-safe-base64 string Fernet
+    emits so the column stays JSON-friendly.
+    """
+    from app.core.crypto import encrypt_str
+
+    by_name = {u.get("username"): u for u in existing}
+    out: list[dict[str, Any]] = []
+    for entry in incoming:
+        username = entry["username"]
+        prior = by_name.get(username, {})
+
+        def _resolve(submitted: str | None, prior_enc: Any) -> str | None:
+            if submitted is None:
+                return prior_enc if isinstance(prior_enc, str) and prior_enc else None
+            if submitted == "":
+                return None
+            return encrypt_str(submitted).decode("ascii")
+
+        auth_proto = entry.get("auth_protocol", "none")
+        priv_proto = entry.get("priv_protocol", "none")
+        out.append(
+            {
+                "username": username,
+                "auth_protocol": auth_proto,
+                "auth_pass_enc": (
+                    _resolve(entry.get("auth_pass"), prior.get("auth_pass_enc"))
+                    if auth_proto != "none"
+                    else None
+                ),
+                "priv_protocol": priv_proto,
+                "priv_pass_enc": (
+                    _resolve(entry.get("priv_pass"), prior.get("priv_pass_enc"))
+                    if priv_proto != "none"
+                    else None
+                ),
+            }
+        )
+    return out
+
+
+class SNMPV3UserUpdate(BaseModel):
+    """One row in the v3 user list on PUT.
+
+    ``auth_pass`` / ``priv_pass`` semantics mirror the audit-forward
+    ``smtp_password`` pattern:
+
+    * ``None`` — leave the existing ciphertext alone (matched by
+      ``username`` against the stored list). Used when an operator
+      edits sysContact and shouldn't have to retype passwords.
+    * ``""`` — clear any existing ciphertext (downgrades the user to
+      noAuth or noPriv).
+    * non-empty string — encrypt and replace.
+    """
+
+    username: str
+    auth_protocol: str = "none"
+    auth_pass: str | None = None
+    priv_protocol: str = "none"
+    priv_pass: str | None = None
+
+    @field_validator("username")
+    @classmethod
+    def _username_nonempty(cls, v: str) -> str:
+        # snmpd's USM treats whitespace-only and empty usernames as
+        # parse errors — reject early so the operator's PUT is the
+        # error site, not a downstream snmpd reload.
+        s = v.strip()
+        if not s:
+            raise ValueError("username may not be empty")
+        return s
+
+    @field_validator("auth_protocol")
+    @classmethod
+    def _valid_auth_proto(cls, v: str) -> str:
+        if v not in _SNMP_AUTH_PROTOCOLS:
+            raise ValueError(f"auth_protocol must be one of {sorted(_SNMP_AUTH_PROTOCOLS)}")
+        return v
+
+    @field_validator("priv_protocol")
+    @classmethod
+    def _valid_priv_proto(cls, v: str) -> str:
+        if v not in _SNMP_PRIV_PROTOCOLS:
+            raise ValueError(f"priv_protocol must be one of {sorted(_SNMP_PRIV_PROTOCOLS)}")
+        return v
 
 
 class SettingsUpdate(BaseModel):
@@ -189,6 +321,19 @@ class SettingsUpdate(BaseModel):
     lockout_threshold: int | None = None
     lockout_duration_minutes: int | None = None
     lockout_reset_minutes: int | None = None
+    # ── Appliance SNMP (issue #153) ───────────────────────────────
+    snmp_enabled: bool | None = None
+    snmp_version: str | None = None
+    # ``None`` = leave alone, ``""`` = clear stored community,
+    # non-empty = encrypt + replace. Plaintext on the wire (TLS).
+    snmp_community: str | None = None
+    # When provided, this list is the new full set — usernames not in
+    # the incoming list are removed. Per-user pass semantics see
+    # ``SNMPV3UserUpdate`` docstring.
+    snmp_v3_users: list[SNMPV3UserUpdate] | None = None
+    snmp_allowed_sources: list[str] | None = None
+    snmp_sys_contact: str | None = None
+    snmp_sys_location: str | None = None
 
     @field_validator("lockout_threshold")
     @classmethod
@@ -334,6 +479,35 @@ class SettingsUpdate(BaseModel):
             raise ValueError("Syslog facility must be 0–23 (RFC 5424)")
         return v
 
+    @field_validator("snmp_version")
+    @classmethod
+    def _valid_snmp_version(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        if v not in _SNMP_VERSIONS:
+            raise ValueError(f"snmp_version must be one of {sorted(_SNMP_VERSIONS)}")
+        return v
+
+    @field_validator("snmp_allowed_sources")
+    @classmethod
+    def _valid_snmp_sources(cls, v: list[str] | None) -> list[str] | None:
+        # Each entry must parse as a CIDR (or single host). Normalise
+        # to the canonical network string so duplicates produced by
+        # different host-bit inputs collapse on the way in.
+        if v is None:
+            return None
+        out: list[str] = []
+        for raw in v:
+            s = raw.strip()
+            if not s:
+                continue
+            try:
+                net = ip_network(s, strict=False)
+            except ValueError as exc:
+                raise ValueError(f"invalid CIDR or host: {raw!r} ({exc})") from exc
+            out.append(str(net))
+        return out
+
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -421,11 +595,49 @@ async def update_settings(
             # that a value was set.
             changes["fingerbank_api_key_set"] = True
 
+    # snmp_community: same encrypt-and-redact shape as fingerbank.
+    if "snmp_community" in changes:
+        from app.core.crypto import encrypt_str
+
+        raw = changes.pop("snmp_community")
+        if raw == "":
+            settings.snmp_community_encrypted = None
+            changes["snmp_community_cleared"] = True
+        else:
+            settings.snmp_community_encrypted = encrypt_str(raw)
+            changes["snmp_community_set"] = True
+
+    # snmp_v3_users: atomic replace with per-user pass merge. Match
+    # by username so an operator editing one user's protocol doesn't
+    # have to retype every other user's passwords. Drop from
+    # ``changes`` so the generic setattr loop below doesn't clobber
+    # the merged form with the audit-redacted shape we re-stash for
+    # logging.
+    snmp_users_audit: list[dict[str, Any]] | None = None
+    if "snmp_v3_users" in changes:
+        incoming = changes.pop("snmp_v3_users")
+        existing = list(settings.snmp_v3_users or [])
+        merged = _merge_snmp_v3_users(existing, incoming)
+        settings.snmp_v3_users = merged
+        # Stash the redacted shape for the audit-log call only — never
+        # put it back on ``changes`` because the setattr loop would
+        # then write the redacted dict back over ``settings.snmp_v3_users``,
+        # losing every encrypted pass.
+        snmp_users_audit = [_redact_v3_user(u) for u in merged]
+
     for field, value in changes.items():
         # Skip the synthetic audit-only flags we just inserted.
-        if field in ("fingerbank_api_key_cleared", "fingerbank_api_key_set"):
+        if field in (
+            "fingerbank_api_key_cleared",
+            "fingerbank_api_key_set",
+            "snmp_community_cleared",
+            "snmp_community_set",
+        ):
             continue
         setattr(settings, field, value)
+
+    if snmp_users_audit is not None:
+        changes["snmp_v3_users"] = snmp_users_audit
 
     await db.commit()
     await db.refresh(settings)

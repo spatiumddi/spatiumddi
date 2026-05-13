@@ -2749,6 +2749,48 @@ export interface PlatformSettings {
   lockout_threshold: number;
   lockout_duration_minutes: number;
   lockout_reset_minutes: number;
+  /** Appliance SNMP (issue #153). Toggle + version pick + sysContact /
+   *  sysLocation are straightforward; community + v3 user passes are
+   *  redacted on the wire (``*_set`` booleans), with write-only
+   *  ``snmp_community`` + per-user ``auth_pass`` / ``priv_pass`` on
+   *  the update payload. ``snmp_v3_users`` carries the read shape
+   *  on response, write shape on update. */
+  snmp_enabled: boolean;
+  snmp_version: SnmpVersion;
+  snmp_community_set: boolean;
+  /** Write-only — Fernet-encrypted server-side. Set to a non-empty
+   *  string to store; set to "" to clear; omit to leave unchanged. */
+  snmp_community?: string;
+  /** Read shape on response; on update, send the new full list with
+   *  per-user ``auth_pass`` / ``priv_pass`` semantics (None = leave,
+   *  "" = clear, non-empty = encrypt + replace). */
+  snmp_v3_users: SnmpV3User[];
+  snmp_allowed_sources: string[];
+  snmp_sys_contact: string;
+  snmp_sys_location: string;
+}
+
+export type SnmpVersion = "v2c" | "v3";
+export type SnmpAuthProtocol = "none" | "MD5" | "SHA";
+export type SnmpPrivProtocol = "none" | "DES" | "AES";
+
+/** Read shape — the server never returns the ciphertext. */
+export interface SnmpV3User {
+  username: string;
+  auth_protocol: SnmpAuthProtocol;
+  auth_pass_set: boolean;
+  priv_protocol: SnmpPrivProtocol;
+  priv_pass_set: boolean;
+}
+
+/** Write shape — passes are plaintext on the wire (TLS); None / omit
+ *  preserves the existing ciphertext for the same username; "" clears. */
+export interface SnmpV3UserWrite {
+  username: string;
+  auth_protocol: SnmpAuthProtocol;
+  auth_pass?: string | null;
+  priv_protocol: SnmpPrivProtocol;
+  priv_pass?: string | null;
 }
 
 export interface PasswordPolicy {
