@@ -25,6 +25,7 @@ RUN apk add --no-cache \
       python3 py3-pip \
       libcap \
       ca-certificates tzdata \
+      lsblk \
  && setcap cap_net_bind_service=+ep /usr/sbin/pdns_server \
  && addgroup -S spatium \
  && adduser -S -G spatium spatium \
