@@ -1,6 +1,8 @@
 .PHONY: help up down dev build migrate lint test lint-backend lint-frontend test-backend \
         ci ci-backend-lint ci-frontend-lint ci-frontend-build screenshots \
-        appliance appliance-builder appliance-iso appliance-clean
+        appliance appliance-builder appliance-iso appliance-clean \
+        appliance-bake-images appliance-clean-baked-images appliance-dev-iso \
+        appliance-slot-image
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 COMPOSE        = docker compose
@@ -221,18 +223,43 @@ appliance-clean:
 appliance-bake-images:
 	@bash $(APPLIANCE_DIR)/scripts/bake-images.sh
 
-# Convenience for the Phase 4 iteration loop:
-#   1. Bake the existing spatiumddi-{api,frontend}:dev images into
-#      the appliance overlay
-#   2. Build the appliance raw image
-#   3. Wrap as a hybrid USB/CD ISO
-# After this completes, attach the ISO to a VM + boot — firstboot
-# loads the baked images instead of pulling from ghcr.io.
+# Convenience for the Phase 4 iteration loop — appliance-level changes
+# (installer, firstboot, console dashboard, partition layout, networking
+# stack, etc) where you want a bootable ISO without re-pushing api +
+# frontend images:
+#   1. Build the appliance raw image (without baking docker images in)
+#   2. Wrap as a hybrid USB/CD ISO
+# After this completes, copy the ISO to a NAS share / hypervisor library
+# and boot a VM from it. firstboot pulls api + frontend (and the DNS /
+# DHCP agent images) from ghcr.io on first boot, same as a real release.
 #
-# Prerequisite: the dev images must exist locally. Run
-#     docker compose -f docker-compose.dev.yml build api frontend
-# (or just `make build` if you wired the prod compose) first.
-appliance-dev-iso: appliance-bake-images appliance appliance-iso
+# NOTE: this target used to depend on ``appliance-bake-images`` (which
+# tarballs the local ``spatiumddi-{api,frontend}:dev`` images into the
+# rootfs at /usr/local/share/spatiumddi/images/). That worked when the
+# rootfs was a single open-ended partition. Phase 8a-1 (#138) carved
+# the disk into ESP + root_A 4 GiB + root_B 4 GiB + var; the baked
+# image tarballs push the slot rootfs past the 4 GiB ceiling and the
+# slot build either fails or doesn't fit the partition. Operators
+# iterating on the api + frontend specifically should push WIP tags
+# to ghcr.io and pin SPATIUMDDI_VERSION in /etc/spatiumddi/.env on the
+# booted appliance, or call ``make appliance-bake-images`` directly and
+# then ``make appliance appliance-iso`` (accepting that the slot raw.xz
+# build will fail — useful for first-boot-only ISO testing).
+appliance-dev-iso: appliance-clean-baked-images appliance appliance-iso
 	@echo ""
 	@echo "✓ Dev-flavored appliance ISO ready at $(APPLIANCE_OUT)/spatiumddi-appliance_0.1.0.iso"
-	@echo "  Ships WIP api+frontend images — DNS/DHCP still pull from ghcr.io as usual."
+	@echo "  All container images (api / frontend / DNS / DHCP agents) pull from"
+	@echo "  ghcr.io on first boot. Copy this ISO to your NAS / hypervisor library"
+	@echo "  and boot a VM from it."
+
+# Wipe any tarballs that a previous ``appliance-bake-images`` left
+# under the mkosi.extra overlay. mkosi copies the overlay verbatim
+# into the rootfs, so leftover tarballs would still be baked even
+# after we dropped the ``appliance-bake-images`` dep from
+# ``appliance-dev-iso``. The directory itself is gitignored.
+appliance-clean-baked-images:
+	@d=$(APPLIANCE_DIR)/mkosi.extra/usr/local/share/spatiumddi/images; \
+	if ls $$d/*.tar.zst >/dev/null 2>&1 || [ -f $$d/BAKED_AT ]; then \
+	  echo "→ Cleaning previously-baked image tarballs from $$d …"; \
+	  rm -f $$d/*.tar.zst $$d/BAKED_AT; \
+	fi
