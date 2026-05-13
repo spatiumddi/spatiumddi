@@ -6865,7 +6865,7 @@ export const applianceReleasesApi = {
 // ── Appliance: A/B slot upgrade (Phase 8b-3, issue #138) ──────────
 export type ApplianceSlot = "slot_a" | "slot_b";
 export type ApplianceSlotUpgradeState =
-  | "idle"
+  | "ready"
   | "in-flight"
   | "done"
   | "failed";
@@ -6928,6 +6928,11 @@ export interface FleetAgentRow {
   last_seen_ip: string | null;
   desired_appliance_version: string | null;
   desired_slot_image_url: string | null;
+  // Phase 8f-8 — operator-triggered reboot. True while a request is
+  // in flight (operator clicked Reboot but agent hasn't reconnected
+  // post-reboot yet).
+  reboot_requested: boolean;
+  reboot_requested_at: string | null;
 }
 
 export const applianceFleetApi = {
@@ -6955,6 +6960,10 @@ export const applianceFleetApi = {
   clearUpgrade: (kind: FleetAgentKind, server_id: string) =>
     api
       .post<FleetAgentRow>(`/appliance/fleet/${kind}/${server_id}/clear`)
+      .then((r) => r.data),
+  scheduleReboot: (kind: FleetAgentKind, server_id: string) =>
+    api
+      .post<FleetAgentRow>(`/appliance/fleet/${kind}/${server_id}/reboot`)
       .then((r) => r.data),
 };
 

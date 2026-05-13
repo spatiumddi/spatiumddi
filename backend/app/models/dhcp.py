@@ -154,6 +154,14 @@ class DHCPServer(UUIDPrimaryKeyMixin, TimestampMixin, Base):
     last_upgrade_state_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # Phase 8f-8 — operator-triggered reboot. See DNSServer for full
+    # rationale; same schema both sides for uniform Fleet handling.
+    reboot_requested: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    reboot_requested_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     # Fernet-encrypted JSON blob for driver-specific admin credentials.
     # windows_dhcp stores a dict: {"username", "password", "winrm_port",

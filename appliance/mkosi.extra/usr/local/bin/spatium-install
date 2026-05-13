@@ -751,22 +751,43 @@ EOF
             echo "UTC" > "$MOUNT/etc/timezone"
         fi
 
-        # Static-IP override (DHCP is already covered by 20-dhcp-all.network)
+        # Static-IP override. The appliance runs NetworkManager (since
+        # the 2026.05.12 switch from systemd-networkd) — operator-set
+        # static config is a keyfile-format connection profile dropped
+        # under /etc/NetworkManager/system-connections/. NM auto-DHCPs
+        # every other ethernet interface by default, so we don't need
+        # an explicit "wired-default" file.
         if [ "$NET_MODE" = "static" ]; then
-            mkdir -p "$MOUNT/etc/systemd/network"
-            {
-                echo "[Match]"
-                echo "Name=$NET_INTERFACE"
-                echo
-                echo "[Network]"
-                echo "Address=$NET_IP/$NET_PREFIX"
-                echo "Gateway=$NET_GATEWAY"
-                for dns in $NET_DNS; do
-                    echo "DNS=$dns"
-                done
-            } > "$MOUNT/etc/systemd/network/10-spatium-static.network"
-            # Remove the wildcard DHCP so it doesn't race with our static.
-            rm -f "$MOUNT/etc/systemd/network/20-dhcp-all.network"
+            install -d -m 0755 "$MOUNT/etc/NetworkManager/system-connections"
+            net_dns_csv=$(echo "$NET_DNS" | tr -s ' ' ';')
+            # NM keyfile UUIDs aren't load-bearing for our flow but
+            # must be present + unique. uuidgen is in util-linux on
+            # Debian; spatium-install runs in the live image where
+            # uuidgen is available.
+            net_uuid=$(uuidgen 2>/dev/null || python3 -c 'import uuid; print(uuid.uuid4())')
+            cat > "$MOUNT/etc/NetworkManager/system-connections/10-spatium-static.nmconnection" <<EOF
+[connection]
+id=spatium-static
+uuid=$net_uuid
+type=ethernet
+interface-name=$NET_INTERFACE
+autoconnect=true
+
+[ethernet]
+
+[ipv4]
+method=manual
+address1=$NET_IP/$NET_PREFIX,$NET_GATEWAY
+dns=$net_dns_csv;
+
+[ipv6]
+method=auto
+EOF
+            # NM refuses to load system-connection keyfiles that
+            # aren't mode 600 (security check — they may carry wifi
+            # passphrases or VPN secrets). Same constraint applies to
+            # ethernet profiles for consistency.
+            chmod 0600 "$MOUNT/etc/NetworkManager/system-connections/10-spatium-static.nmconnection"
         fi
 
         echo "XXX"; echo "75"; echo "Creating admin user..."; echo "XXX"

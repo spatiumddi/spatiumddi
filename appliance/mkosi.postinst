@@ -36,11 +36,13 @@ mkdir -p "$BUILDROOT/etc/systemd/system/multi-user.target.wants"
 # but gate themselves with ConditionKernelCommandLine=spatium-mode=…
 # so only one runs per boot, depending on the GRUB menu choice.
 for unit in docker.service chrony.service ssh.service \
+            NetworkManager.service \
             spatiumddi-firstboot.service \
             spatiumddi-update.path \
             spatiumddi-reboot.path \
             spatiumddi-slot-upgrade.path \
             spatiumddi-slot-rollback.path \
+            spatiumddi-reboot-agent.path \
             spatium-install.service \
             spatium-live-banner.service \
             spatium-live-bootstrap.service \
@@ -63,6 +65,18 @@ for unit in docker.service chrony.service ssh.service \
         continue
     fi
     ln -sfn "$src" "$BUILDROOT/etc/systemd/system/multi-user.target.wants/$unit"
+done
+
+# Mask systemd-networkd so it doesn't fight NetworkManager for
+# the same interfaces. The package stays installed (it ships in
+# systemd-sysv's transitive dep set on Debian) — masking the
+# units is enough. Same treatment for resolvconf in case some
+# Recommends pulled it in: NetworkManager publishes DNS info
+# through systemd-resolved over D-Bus, not by writing
+# /etc/resolv.conf directly.
+for nd_unit in systemd-networkd.service systemd-networkd.socket \
+               systemd-networkd-wait-online.service; do
+    ln -sfn /dev/null "$BUILDROOT/etc/systemd/system/$nd_unit"
 done
 
 # Issue #136 — mask plymouth.
@@ -176,6 +190,9 @@ chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-slot-upgrade.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-slot-rollback.path"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-slot-rollback.service"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-slot-rollback"
+chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-reboot-agent"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-reboot-agent.path"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-reboot-agent.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-reboot.path"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-reboot.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-console.service"

@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import os
 import re
-import subprocess
 from datetime import datetime
 from pathlib import Path
 
@@ -36,6 +35,7 @@ _HOST_SLOT_STATE = Path(
     "/var/lib/spatiumddi-host/release-state/slot-upgrade-pending.state"
 )
 _PROC_CMDLINE = Path("/proc/cmdline")
+_UDEV_DATA = Path("/run/udev/data")
 
 _UUID_RE = re.compile(r"root=UUID=([0-9a-fA-F-]+)")
 
@@ -91,11 +91,21 @@ def read_installed_version() -> str | None:
 
 
 def _current_slot_from_cmdline() -> str | None:
-    """Match /proc/cmdline's ``root=UUID=`` against lsblk's PARTLABEL.
+    """Match /proc/cmdline's ``root=UUID=`` against udev's PARTLABEL.
 
     Mirror of the api-side ``services/appliance/slot.py`` helper; kept
     independent so the agent doesn't pull in the backend package. The
     PARTLABEL of the booted slot maps to ``slot_a`` or ``slot_b``.
+
+    Reads ``/run/udev/data/b<major>:<minor>`` files directly instead of
+    shelling out to lsblk — lsblk inside a container without
+    ``/dev/sda*`` bind-mounted can list block topology (from /sys) but
+    can't read PARTLABEL / UUID, which it derives from the device
+    inode. udev populates the same data into /run/udev/data with
+    ``S:`` (symlink) lines like ``S:disk/by-partlabel/root_A`` and
+    ``S:disk/by-uuid/aa1311ba-...``; parsing those gives us a
+    container-friendly lookup with no extra mounts beyond the
+    ``/run/udev`` bind we already have.
     """
     try:
         cmdline = _PROC_CMDLINE.read_text()
@@ -106,26 +116,40 @@ def _current_slot_from_cmdline() -> str | None:
         return None
     root_uuid = m.group(1).lower()
     try:
-        proc = subprocess.run(
-            ["lsblk", "-n", "-o", "PARTLABEL,UUID"],
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=3,
-        )
-    except (
-        FileNotFoundError,
-        subprocess.CalledProcessError,
-        subprocess.TimeoutExpired,
-    ):
+        entries = list(_UDEV_DATA.iterdir())
+    except OSError:
         return None
-    for line in proc.stdout.splitlines():
-        parts = line.strip().split()
-        if len(parts) >= 2 and parts[-1].lower() == root_uuid:
-            label = parts[0].lower()
-            if label == "root_a":
+    for entry in entries:
+        # udev data files for block devices are named ``b<major>:<minor>``.
+        # Other entries (``+acpi:…`` for ACPI tags, ``c…`` for char devs,
+        # ``n…`` for net devs) aren't relevant here.
+        if not entry.name.startswith("b"):
+            continue
+        try:
+            text = entry.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        # ``S:`` lines are symlinks udev creates under /dev/disk/. We
+        # pull PARTLABEL + UUID from the matching subdirectory prefix.
+        partlabel: str | None = None
+        matches_uuid = False
+        for line in text.splitlines():
+            if not line.startswith("S:"):
+                continue
+            value = line[2:].strip()
+            if value.startswith("disk/by-partlabel/"):
+                # Last segment is the PARTLABEL (preserving GPT case
+                # would matter for downstream consumers, but we only
+                # compare case-insensitively to root_a / root_b).
+                partlabel = value.rsplit("/", 1)[-1]
+            elif value.startswith("disk/by-uuid/"):
+                if value.rsplit("/", 1)[-1].lower() == root_uuid:
+                    matches_uuid = True
+        if matches_uuid and partlabel:
+            lower = partlabel.lower()
+            if lower == "root_a":
                 return "slot_a"
-            if label == "root_b":
+            if lower == "root_b":
                 return "slot_b"
     return None
 
@@ -152,17 +176,41 @@ def _last_upgrade_state_from_sidecar() -> tuple[str | None, datetime | None]:
     """Read ``state stamp`` from the .state sidecar the host-side
     runner maintains. Returns (state, when) or (None, None) when no
     upgrade has ever run on this agent.
+
+    Auto-heals stale ``failed`` states: the host runner renames the
+    pending trigger to ``.failed.<ts>`` once it finishes, so the
+    presence of the un-suffixed trigger file is the marker of an
+    in-flight apply. If state == failed AND the un-suffixed trigger
+    isn't present, the failure has already been recorded + processed
+    — by definition the operator has had time to observe it (typical
+    heartbeat cadence is 30 s) so the Fleet view's State pill
+    shouldn't stick on ``failed`` forever. Flip back to ``ready`` so
+    the agent's heartbeat naturally clears the chip on the control
+    plane within one cycle. The ``.failed.<ts>`` sidecar file still
+    exists on disk for forensic / audit lookup.
+
+    Fresh appliances that have never run an upgrade have no .state
+    file at all — return ``ready`` rather than ``None`` so the Fleet
+    view's State column reads as a positive "healthy + no pending
+    work" signal instead of an empty cell that visually looks like
+    "agent hasn't reported yet". ``None`` is reserved for genuinely-
+    unknown rows (docker / k8s / pre-8f-2).
     """
     if not _HOST_SLOT_STATE.exists():
-        return None, None
+        return "ready", None
     try:
         text = _HOST_SLOT_STATE.read_text(encoding="utf-8", errors="replace").strip()
     except OSError:
         return None, None
     parts = text.split(maxsplit=1)
     state = parts[0] if parts else None
-    if state not in ("idle", "in-flight", "done", "failed"):
+    if state not in ("ready", "in-flight", "done", "failed"):
         return None, None
+    # Stale-failed auto-heal — only when no apply is currently in
+    # flight (trigger file is the "in-flight" marker; rename to
+    # .failed.<ts> on finish).
+    if state == "failed" and not _TRIGGER_FILE.exists():
+        return "ready", None
     stamp = None
     if len(parts) > 1:
         try:
@@ -173,6 +221,7 @@ def _last_upgrade_state_from_sidecar() -> tuple[str | None, datetime | None]:
 
 
 _TRIGGER_FILE = Path("/var/lib/spatiumddi-host/release-state/slot-upgrade-pending")
+_REBOOT_TRIGGER_FILE = Path("/var/lib/spatiumddi-host/release-state/reboot-pending")
 
 
 def maybe_fire_fleet_upgrade(
@@ -219,6 +268,41 @@ def maybe_fire_fleet_upgrade(
         # line 1 = image URL (or path), line 2 = optional checksum URL.
         tmp.write_text(desired_url + "\n", encoding="utf-8")
         tmp.replace(_TRIGGER_FILE)
+        return True
+    except OSError:
+        return False
+
+
+def maybe_fire_reboot(reboot_requested: bool) -> bool:
+    """Phase 8f-8 — write the reboot trigger when the control plane
+    has stamped ``reboot_requested=True`` on the server row.
+
+    Strict appliance-only gate: a docker / k8s / unknown agent NEVER
+    fires the trigger even if the field somehow flips through. The
+    host-side ``spatiumddi-reboot-agent.path`` unit + the
+    ``/var/lib/spatiumddi-host/release-state`` bind mount only exist
+    on a SpatiumDDI appliance — but defence in depth is cheap.
+
+    Returns True if a trigger was fired, False otherwise. Idempotent —
+    if the trigger file already exists (host runner hasn't picked it
+    up yet) we skip rather than stacking writes.
+    """
+    if detect_deployment_kind() != "appliance":
+        return False
+    if not reboot_requested:
+        return False
+    if _REBOOT_TRIGGER_FILE.exists():
+        return False
+    try:
+        _REBOOT_TRIGGER_FILE.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _REBOOT_TRIGGER_FILE.with_suffix(".new")
+        # One-line marker — the host runner doesn't actually need any
+        # payload, just the path-changed event. Stamp + UTC time so
+        # the operator can debug from /var/log/spatiumddi if needed.
+        tmp.write_text(
+            datetime.utcnow().isoformat() + "Z\n", encoding="utf-8"
+        )
+        tmp.replace(_REBOOT_TRIGGER_FILE)
         return True
     except OSError:
         return False

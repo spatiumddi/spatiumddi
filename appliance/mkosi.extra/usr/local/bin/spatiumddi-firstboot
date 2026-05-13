@@ -56,6 +56,14 @@ fi
 # / read diagnostic data without anyone running docker exec --user root.
 mkdir -p /var/lib/spatiumddi/release-state /var/log/spatiumddi
 chown -R 1000:1000 /var/lib/spatiumddi/release-state
+# 1777 (rwxrwxrwt) — Phase 8f-4 fleet upgrade also has the DNS / DHCP
+# agent containers write into this directory (their unprivileged
+# ``spatium`` user has a different uid than the api's ``app`` user, so
+# 0755 + chown 1000:1000 wouldn't let them through). Sticky bit
+# prevents one container from removing another's pending trigger. The
+# directory only carries trigger files + state sidecars — no secrets,
+# no operator data — so world-write is acceptable here.
+chmod 1777 /var/lib/spatiumddi/release-state
 chmod 0755 /var/log/spatiumddi
 
 if [ ! -f "$ENV_FILE" ]; then
@@ -263,11 +271,12 @@ docker info >/dev/null 2>&1 || {
 }
 
 # Wait for DNS resolution. systemd-resolved is the resolver but it
-# needs networkd to have an IP + DNS info from DHCP. With a slow
-# DHCP server we'd otherwise race and `docker-compose pull` would
-# fail on the first image with "lookup registry-1.docker.io on
-# ::1:53: read: connection refused" because /etc/resolv.conf is
-# resolved's symlink and resolved hasn't been told a DNS server yet.
+# needs NetworkManager to have an IP + DNS info from DHCP first
+# (NM hands DNS info to resolved over D-Bus). With a slow DHCP
+# server we'd otherwise race and `docker-compose pull` would fail
+# on the first image with "lookup registry-1.docker.io on ::1:53:
+# read: connection refused" because /etc/resolv.conf is resolved's
+# symlink and resolved hasn't been told a DNS server yet.
 echo "Waiting for DNS resolution..."
 for i in $(seq 1 30); do
     if getent hosts registry-1.docker.io >/dev/null 2>&1; then break; fi
@@ -275,7 +284,7 @@ for i in $(seq 1 30); do
 done
 getent hosts registry-1.docker.io >/dev/null 2>&1 || {
     echo "WARN: DNS for registry-1.docker.io didn't resolve after 60 s — pull will likely fail."
-    echo "      Check 'resolvectl status' and the wildcard DHCP networkd config."
+    echo "      Check 'resolvectl status' and 'nmcli device status'."
 }
 
 # Phase 4 dev-iteration support — if this ISO was built with

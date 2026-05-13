@@ -7,18 +7,18 @@ invokes ``spatium-upgrade-slot apply`` + ``set-next-boot``, and renames
 the trigger to ``.done`` or ``.failed``. Mirrors the existing
 ``releases.py`` (Phase 4c) shape — same trigger-watcher pattern.
 
-Status detection (``get_slot_status``) reads /proc/cmdline + lsblk +
-grubenv directly (no need to shell out to spatium-upgrade-slot status
-when the api container can do it itself), and surfaces the trial-boot
-state so the UI can warn the operator that a slot has been set as the
-next boot but not yet committed.
+Status detection (``get_slot_status``) reads /proc/cmdline + udev
+runtime data (/run/udev/data) + grubenv directly (no need to shell
+out to spatium-upgrade-slot status when the api container can do it
+itself), and surfaces the trial-boot state so the UI can warn the
+operator that a slot has been set as the next boot but not yet
+committed.
 """
 
 from __future__ import annotations
 
 import json
 import re
-import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -48,6 +48,7 @@ _UPDATE_LOG = Path("/var/log/spatiumddi-host/slot-upgrade.log")
 # socket gymnastics.
 _GRUBENV = Path("/boot/efi-host/grub/grubenv")
 _PROC_CMDLINE = Path("/proc/cmdline")
+_UDEV_DATA = Path("/run/udev/data")
 # Phase 8 — per-slot version sidecar maintained by ``spatium-upgrade-slot
 # sync-versions`` (called by spatiumddi-firstboot at every boot + at
 # the end of every apply). Maps {"slot_a": "<version>", "slot_b":
@@ -60,7 +61,7 @@ _UUID_RE = re.compile(r"root=UUID=([0-9a-fA-F-]+)")
 
 
 SlotName = Literal["slot_a", "slot_b"]
-UpgradeState = Literal["idle", "in-flight", "done", "failed"]
+UpgradeState = Literal["ready", "in-flight", "done", "failed"]
 
 
 @dataclass
@@ -123,7 +124,18 @@ def _read_grubenv() -> dict[str, str]:
 
 def _current_slot_from_cmdline() -> SlotName | None:
     """Resolve which slot we booted from by matching /proc/cmdline's
-    root=UUID= against the partition labels via lsblk."""
+    root=UUID= against the partition labels via udev runtime data.
+
+    Reads ``/run/udev/data/b<major>:<minor>`` files directly rather than
+    shelling out to ``lsblk``. lsblk inside a container without
+    ``/dev/sda*`` bind-mounted can list block topology (from /sys) but
+    can't read PARTLABEL / UUID, which it derives from the device
+    inode. udev populates the same data into /run/udev/data with
+    ``S:`` (symlink) lines like ``S:disk/by-partlabel/root_A`` and
+    ``S:disk/by-uuid/aa1311ba-...``; parsing those gives us a
+    container-friendly lookup with no extra mounts beyond the
+    ``/run/udev`` bind the appliance compose already adds.
+    """
     try:
         cmdline = _PROC_CMDLINE.read_text()
     except OSError:
@@ -133,58 +145,70 @@ def _current_slot_from_cmdline() -> SlotName | None:
         return None
     root_uuid = m.group(1).lower()
     try:
-        proc = subprocess.run(
-            ["lsblk", "-J", "-o", "NAME,PATH,UUID,PARTLABEL"],
-            capture_output=True,
-            text=True,
-            check=True,
-            timeout=3,
-        )
-    except (FileNotFoundError, subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        entries = list(_UDEV_DATA.iterdir())
+    except OSError:
         return None
-    try:
-        data = json.loads(proc.stdout)
-    except json.JSONDecodeError:
-        return None
-
-    def walk(node: dict) -> SlotName | None:
-        if (node.get("uuid") or "").lower() == root_uuid:
-            partlabel = (node.get("partlabel") or "").lower()
-            if partlabel == "root_a":
+    for entry in entries:
+        # udev data files for block devices are named ``b<major>:<minor>``.
+        # Other entries (``+acpi:…`` for ACPI tags, ``c…`` for char devs,
+        # ``n…`` for net devs) aren't relevant here.
+        if not entry.name.startswith("b"):
+            continue
+        try:
+            text = entry.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        partlabel: str | None = None
+        matches_uuid = False
+        for line in text.splitlines():
+            if not line.startswith("S:"):
+                continue
+            value = line[2:].strip()
+            if value.startswith("disk/by-partlabel/"):
+                partlabel = value.rsplit("/", 1)[-1]
+            elif value.startswith("disk/by-uuid/"):
+                if value.rsplit("/", 1)[-1].lower() == root_uuid:
+                    matches_uuid = True
+        if matches_uuid and partlabel:
+            lower = partlabel.lower()
+            if lower == "root_a":
                 return "slot_a"
-            if partlabel == "root_b":
+            if lower == "root_b":
                 return "slot_b"
-        for child in node.get("children") or []:
-            r = walk(child)
-            if r:
-                return r
-        return None
-
-    for top in data.get("blockdevices") or []:
-        r = walk(top)
-        if r:
-            return r
     return None
 
 
 def _upgrade_state_now() -> tuple[UpgradeState, str | None]:
     """Read the .state sidecar the host-side runner maintains. Returns
-    ('idle', None) when no upgrade has run recently. Trigger present
-    but no .state yet means the runner hasn't picked it up — counts
-    as 'in-flight' from the operator's perspective."""
+    ('ready', None) when no upgrade has run recently — ``ready`` is
+    the green-chip default that signals "agent is healthy + no pending
+    work". Trigger present but no .state yet means the runner hasn't
+    picked it up — counts as 'in-flight' from the operator's
+    perspective.
+
+    Stale-failed auto-heal: when state == failed AND the un-suffixed
+    trigger isn't present, the host runner has already renamed it to
+    .failed.<ts>. Flip back to ``ready`` so the chip doesn't stick on
+    failed forever after the operator has observed it; the
+    .failed.<ts> sidecar stays on disk for forensics.
+    """
     if _TRIGGER_FILE.exists() and not _STATE_FILE.exists():
         return "in-flight", None
     if _STATE_FILE.exists():
         try:
             text = _STATE_FILE.read_text(encoding="utf-8", errors="replace").strip()
         except OSError:
-            return "idle", None
+            return "ready", None
         parts = text.split(maxsplit=1)
         state = parts[0] if parts else ""
         stamp = parts[1] if len(parts) > 1 else None
         if state in ("in-flight", "done", "failed"):
+            # Auto-heal: failed + no pending trigger == operator has
+            # had time to see it; flip green.
+            if state == "failed" and not _TRIGGER_FILE.exists():
+                return "ready", None
             return state, stamp  # type: ignore[return-value]
-    return "idle", None
+    return "ready", None
 
 
 def get_slot_status() -> SlotStatus:
@@ -200,7 +224,7 @@ def get_slot_status() -> SlotStatus:
             current_slot=None,
             durable_default=None,
             is_trial_boot=False,
-            upgrade_state="idle",
+            upgrade_state="ready",
             upgrade_state_at=None,
             log_tail="",
             slot_a_version=None,

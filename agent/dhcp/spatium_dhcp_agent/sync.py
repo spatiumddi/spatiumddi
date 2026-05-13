@@ -83,6 +83,32 @@ class SyncLoop:
                     reload_retry_timeout=_BOOTSTRAP_RELOAD_TIMEOUT,
                 )
                 log.info("dhcp_agent_bootstrap_from_cache", etag=etag)
+                # Phase 8f-4 — re-evaluate the cached bundle's
+                # ``fleet_upgrade`` block at startup. The poll-loop
+                # only calls maybe_fire_fleet_upgrade on 200
+                # responses; without this, an agent restart while a
+                # desired_appliance_version is already stamped on the
+                # control plane sees 304-forever (cached etag matches
+                # current bundle) and the trigger file never gets
+                # written. Idempotent — skips when the trigger
+                # already exists or installed equals desired.
+                fleet = bundle.get("fleet_upgrade") or {}
+                if fleet.get("desired_appliance_version"):
+                    from .slot_state import maybe_fire_fleet_upgrade
+
+                    if maybe_fire_fleet_upgrade(
+                        fleet.get("desired_appliance_version"),
+                        fleet.get("desired_slot_image_url"),
+                    ):
+                        log.info(
+                            "fleet_upgrade_triggered_from_cache",
+                            desired_version=fleet.get("desired_appliance_version"),
+                        )
+                if fleet.get("reboot_requested"):
+                    from .slot_state import maybe_fire_reboot
+
+                    if maybe_fire_reboot(True):
+                        log.info("fleet_reboot_triggered_from_cache")
             except Exception:
                 log.exception("bootstrap_cache_apply_failed")
 
@@ -269,6 +295,11 @@ class SyncLoop:
                     "fleet_upgrade_triggered",
                     desired_version=fleet.get("desired_appliance_version"),
                 )
+        # Phase 8f-8 — operator-triggered reboot. Same pattern.
+        if fleet.get("reboot_requested"):
+            from .slot_state import maybe_fire_reboot
+            if maybe_fire_reboot(True):
+                log.info("fleet_reboot_triggered")
 
         try:
             self._apply_bundle(bundle, reload_kea=True)

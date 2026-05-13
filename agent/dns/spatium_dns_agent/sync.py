@@ -45,6 +45,38 @@ class SyncLoop:
                 self.driver.apply_config(bundle)
                 self._current_structural_etag = bundle.get("structural_etag")
                 log.info("dns_agent_bootstrap_from_cache", etag=etag)
+                # Phase 8f-4 — re-evaluate the cached bundle's
+                # ``fleet_upgrade`` block at startup. The poll-loop
+                # path below only calls maybe_fire_fleet_upgrade on
+                # 200 responses; without this, an agent restart while
+                # a desired_appliance_version is already stamped on
+                # the control plane goes straight to 304-forever (the
+                # cached etag matches the current bundle, so no 200
+                # ever arrives) and the trigger file never gets
+                # written. Idempotent: maybe_fire_fleet_upgrade skips
+                # when the trigger already exists or installed equals
+                # desired.
+                fleet = bundle.get("fleet_upgrade") or {}
+                if fleet.get("desired_appliance_version"):
+                    from .slot_state import maybe_fire_fleet_upgrade
+
+                    if maybe_fire_fleet_upgrade(
+                        fleet.get("desired_appliance_version"),
+                        fleet.get("desired_slot_image_url"),
+                    ):
+                        log.info(
+                            "fleet_upgrade_triggered_from_cache",
+                            desired_version=fleet.get("desired_appliance_version"),
+                        )
+                # Phase 8f-8 — same cache-driven evaluation for the
+                # operator-triggered reboot field. Without this an
+                # agent restart while reboot_requested=True is cached
+                # would 304-forever and the reboot would never fire.
+                if fleet.get("reboot_requested"):
+                    from .slot_state import maybe_fire_reboot
+
+                    if maybe_fire_reboot(True):
+                        log.info("fleet_reboot_triggered_from_cache")
                 # Push the rendered tree once at bootstrap so operators
                 # get a Config-tab snapshot the moment the agent comes
                 # up — without this, the snapshot only lands on the
@@ -136,6 +168,13 @@ class SyncLoop:
                     "fleet_upgrade_triggered",
                     desired_version=fleet.get("desired_appliance_version"),
                 )
+        # Phase 8f-8 — operator-triggered reboot. Writes the
+        # reboot-pending trigger the host runner watches. Strict
+        # appliance-only gate is inside maybe_fire_reboot itself.
+        if fleet.get("reboot_requested"):
+            from .slot_state import maybe_fire_reboot
+            if maybe_fire_reboot(True):
+                log.info("fleet_reboot_triggered")
 
         # Re-render + reload daemon ONLY when structural fingerprint changes.
         # Record CRUD bumps the full etag but not structural_etag, so the

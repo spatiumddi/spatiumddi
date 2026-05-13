@@ -22,6 +22,282 @@ the formatter handles the rest.
 
 ## Unreleased
 
+## 2026.05.13-1 — 2026-05-13
+
+Fleet management gets its real shape: the per-box ``OS Image`` tab and
+the per-fleet ``Fleet`` tab merge into a single unified ``OS Versions``
+table where the local appliance pins at the top as a ``SELF`` row + every
+registered DNS/DHCP agent sits below, all with the same Upgrade /
+Manual-upgrade / per-row Reboot affordances. Phase 8f-8 lands the
+operator-triggered fleet reboot button (double-confirm modal with a
+required "I understand this agent will go offline for 30-60 s"
+checkbox), and three real Phase 8f-4 bugs that kept the fleet-upgrade
+trigger from ever writing the trigger file in production get fixed
+end-to-end: the agent's bind mount on ``/var/lib/spatiumddi/release-
+state`` was ``:ro`` (Phase 8f-2 only had the agent reading the .state
+sidecar; the trigger-write half added in 8f-4 needed ``:rw``), the
+firstboot-chowned dir was mode 0755 owned by uid 1000 which locked the
+agent's unprivileged ``spatium`` user out (now 1777 sticky), and the
+sync.py poll-loop only called ``maybe_fire_fleet_upgrade`` inside the
+200-response code path so an agent that restarted with a
+``desired_appliance_version`` already cached on disk would 304-forever
+and never fire (now also evaluated at startup right after
+``load_config``). Plus ``spatium-upgrade-slot apply`` now randomises
+the freshly-written slot's filesystem UUID via ``tune2fs -U random`` —
+the dd-from-slot-image step was leaving both A and B with identical
+UUIDs after a re-apply, which broke ``find_slot_partitions()`` and
+wedged ``set-next-boot`` with ``ERROR: couldn't detect A/B slots``.
+Slot detection in the api + both agents rewrites to parse ``/run/udev/
+data/b<maj>:<min>`` files directly instead of shelling out to lsblk
+(lsblk can list block topology in a container without ``/dev/sda*``
+but returns empty PARTLABEL / UUID because libblkid needs the device
+inode — udev publishes the same data into ``/run/udev/data`` which the
+existing bind mount covers). The Talos-style console dashboard's
+F-keys also get wired up (F2 → htop as the unprivileged ``admin``
+user, F3 → ``docker stats``, F4 → nmtui, F9 dropped) and **F12 Shell
+is removed entirely** — a console-attached operator shouldn't get an
+admin shell that easily; F1 still hands off to agetty for the standard
+login path. To unblock F4/nmtui the appliance's networking stack
+flips from ``systemd-networkd`` to ``NetworkManager`` (systemd-
+resolved still owns ``/etc/resolv.conf`` — NM pushes per-interface
+DNS into resolved over D-Bus); the installer's static-IP step writes
+a keyfile-format ``.nmconnection`` instead of a ``.network`` file.
+Plus a wave of polish: ``OS Versions`` per-row Reboot button, bulk-
+select checkboxes + ``Apply to selected`` modal across multiple
+appliance agents in one click (each agent does its own dd on its own
+inactive slot so there's no fleet-wide outage), slot upgrade ``State``
+column renamed ``idle`` → ``ready`` with green chip styling (operator
+feedback: ``idle`` reads as "this agent is doing nothing useful"; the
+chip should be positive + green so a glance tells you everything's
+fine), stale-``failed`` auto-heal on the agent so the chip clears
+itself once the failure has been observed instead of sticking forever,
+Platform Insights's previously-buried Conformity + Operator Copilot
+Usage panels promoted to top-level tabs alongside Postgres +
+Containers, the ``/appliance`` sidebar entry is now always visible
+(was gated on ``appliance_mode=true``; on docker/k8s control planes
+the host-level tabs hide but Releases + OS Versions stay so an
+operator with appliance *agents* registered against a docker/k8s
+control plane can still drive fleet upgrades), and the Releases tab's
+Apply button is replaced with a copy-paste ``docker compose pull`` /
+``helm upgrade`` modal on non-appliance hosts (where the host-side
+``spatiumddi-update.path`` systemd unit doesn't exist). Backend tests
+parallelise via pytest-xdist (~10 min → ~3-4 min on CI). Plus
+README's new ``Support the project`` section, the appliance-dev-iso
+Makefile drops the container-image bake step so the slot rootfs fits
+the 4 GiB partition Phase 8a-1 carved, a Makefile ``appliance-stamp-
+dev`` target writes a ``dev-<short-sha>`` stamp into ``/etc/spatiumddi
+/appliance-release`` for local-build ISOs so installed_version
+populates in the Fleet view, and PR #148's funding-sources update
+lands the GitHub Sponsors + BMC links in ``.github/FUNDING.yml``.
+
+### Added
+
+- **Phase 8f-8 — operator-triggered fleet reboot.** Per-row Reboot
+  button on the OS Versions table (only on rows whose
+  ``deployment_kind=appliance`` — strict gate at every layer so a
+  misclick can't reboot the local docker workstation). Confirm modal
+  uses the new ``ConfirmModal.requireCheckboxLabel`` prop: the
+  Reboot button stays disabled until the operator ticks "I
+  understand <agent name> will go offline for ~30–60 s". Backend
+  endpoint ``POST /api/v1/appliance/fleet/{kind}/{server_id}/
+  reboot`` stamps ``reboot_requested=true`` +
+  ``reboot_requested_at=now()``; ConfigBundle long-poll carries it
+  to the agent; ``maybe_fire_reboot`` writes
+  ``/var/lib/spatiumddi-host/release-state/reboot-pending``; the
+  new host-side ``spatiumddi-reboot-agent.{path,service}`` unit
+  picks it up + invokes ``systemctl reboot`` after a 5 s grace
+  window. Heartbeat handler auto-clears ``reboot_requested`` once a
+  heartbeat arrives more than 15 s after the request was stamped —
+  by construction post-reboot, since a pre-reboot agent can't
+  heartbeat (container's down during shutdown). Migration
+  ``a72f4c89e15d`` adds the two columns to both ``dns_server`` +
+  ``dhcp_server``.
+
+- **OS Versions unified table.** Merges the per-box ``OS Image`` tab
+  + the per-fleet ``Fleet`` tab into one screen: a pinned ``SELF``
+  row at the top (left-border accent + ``SELF`` chip) opens the
+  full A/B slot detail (per-slot versions, apply log, rollback) in
+  a modal via the existing ``SlotUpgradeCard`` component, with
+  every registered DNS/DHCP agent below carrying the same Upgrade /
+  Manual-upgrade / Reboot affordances. Bulk-select checkboxes on
+  appliance rows + an "Apply to selected" modal fires
+  ``scheduleUpgrade`` in parallel via ``Promise.allSettled`` so one
+  agent's failure doesn't block the others. Docker / k8s rows
+  excluded from bulk select (their upgrade path is the manual
+  copy-paste modal, which doesn't bulk).
+
+- **Console F-key wiring (#134 Phase 4h follow-up).** F2 →
+  ``runuser -u admin -- htop`` (htop reads /proc for all-system
+  process display but interactive kill/renice is scoped to admin's
+  own processes — operator can't ctrl-K the api container by
+  accident from the physical console). F3 → ``docker stats`` (live
+  resource view, Ctrl-C returns). F4 → ``nmtui`` (unblocked by the
+  systemd-networkd → NetworkManager switch below; runs as root
+  because NM polkit needs it). F9 dropped from the footer entirely.
+  F12 Shell removed — physical-console operators should not get
+  admin shells that easily; F1 still hands off to agetty for the
+  traditional login.
+
+- **NetworkManager replaces systemd-networkd as the appliance's
+  network stack.** Required to unblock F4/nmtui (nmtui only speaks
+  to NetworkManager). systemd-resolved still owns
+  ``/etc/resolv.conf`` — NM pushes per-interface DNS over D-Bus via
+  the new ``/etc/NetworkManager/conf.d/10-spatiumddi.conf``
+  (``dns=systemd-resolved`` + ``plugins=keyfile``). Installer's
+  static-IP step writes a keyfile-format
+  ``/etc/NetworkManager/system-connections/10-spatium-static.
+  nmconnection`` (mode 0600) instead of the old ``10-spatium-
+  static.network``. ``NetworkManager-wait-online.service.d/timeout.
+  conf`` drop-in preserves the 10-second any-interface boot timeout
+  the old networkd drop-in provided. postinst masks
+  ``systemd-networkd.{service,socket}`` +
+  ``systemd-networkd-wait-online.service`` so the two stacks don't
+  fight.
+
+- **OS Versions "ready" state with green chip.** Renames the
+  slot-upgrade ``idle`` state to ``ready`` across the agent
+  (``slot_state.py``), backend (``UpgradeState`` Literal),
+  ConfigBundle field, and frontend chip styling. ``ready`` and
+  ``done`` share green styling + CheckCircle2 icon (positive
+  states); ``in-flight`` stays blue (Loader2); ``failed`` stays red
+  (AlertCircle) until the agent auto-heals it. Fresh appliances
+  with no .state file default to ``ready`` instead of None so the
+  chip is green from first heartbeat.
+
+- **Stale-failed auto-heal on the agent.** When ``slot_state.
+  _last_upgrade_state_from_sidecar()`` sees ``failed`` AND the
+  un-suffixed trigger file is gone (host runner already renamed it
+  to ``.failed.<ts>``), report ``ready`` instead. Failure history
+  stays on disk as ``.failed.<ts>`` sidecars for forensic lookup;
+  the heartbeat just stops re-asserting the failure once the
+  operator has had time to observe it.
+
+- **Backend test parallelisation (#145).** ``pytest -n auto`` via
+  pytest-xdist; each worker carves its own
+  ``spatiumddi_test_gw<N>`` Postgres database in conftest. Verified
+  locally: 947 s → 285 s, 556/556 pass.
+
+- **Always-visible ``/appliance`` sidebar entry.** Was gated on
+  ``versionInfo.appliance_mode``; now visible on every deployment.
+  Inside the page, host-level tabs (TLS, Containers, Logs, Network,
+  Maintenance) hide when the API host isn't an appliance, leaving
+  Releases + OS Versions for operators whose control plane is
+  docker/k8s but who have appliance *agents* registered against it
+  (hybrid topology). Header gains a ``docker/k8s`` chip on
+  non-appliance hosts.
+
+- **Platform Insights tab promotion.** Conformity and Operator
+  Copilot Usage panels (previously rendered unconditionally below
+  the tab switch and easy to miss on tall screens) promoted to
+  their own top-level tabs in the same tab strip as Postgres +
+  Containers. Panels grow loading / empty / forbidden fallback
+  messages so a clicked-but-empty tab doesn't look broken.
+
+- **Makefile ``appliance-stamp-dev``** writes ``APPLIANCE_VERSION=
+  "dev-<short-sha>"`` into ``mkosi.extra/etc/spatiumddi/appliance-
+  release`` before each local-build ISO so a freshly-installed dev
+  appliance reports a non-empty ``installed_appliance_version`` in
+  the Fleet view. The release workflow already does this for CI
+  builds with the real CalVer tag; this just covers the local-
+  iteration case.
+
+- **README ``Support the project`` section** with a Buy Me a Coffee
+  link, an Individuals blurb explaining what tips fund, and an
+  Organisations paragraph as a stub for future commercial
+  sponsorships. Added to the Contents index near the top.
+
+### Changed
+
+- **Slot detection rewrites to parse ``/run/udev/data`` directly.**
+  Three call sites updated identically — DNS agent slot_state.py,
+  DHCP agent slot_state.py, backend
+  ``services/appliance/slot.py``. lsblk inside a container can list
+  block topology from /sys but PARTLABEL + UUID columns come back
+  empty because libblkid probes the device inode and containers
+  don't have ``/dev/sda*`` bind-mounted. udev publishes the same
+  data into ``/run/udev/data/b<maj>:<min>`` with ``S:`` symlink
+  lines like ``S:disk/by-partlabel/root_A`` and ``S:disk/by-uuid/
+  aa1311ba-…``; parsing those gives a container-friendly lookup
+  with no extra mounts beyond the existing ``/run/udev`` bind.
+
+- **Strict ``deployment_kind`` gating on fleet operations.** Upgrade
+  + Reboot buttons + bulk-select only render for rows where
+  ``deployment_kind === "appliance"`` (previously the lenient
+  ``"appliance" || null`` fallback would render Upgrade on rows
+  that hadn't checked in yet — could lie about what's possible).
+  Backend ``/fleet/{kind}/{id}/upgrade`` + ``/reboot`` endpoints
+  return 422 for docker / k8s rows.
+
+- **Releases tab Apply replaced with Manual modal on non-appliance
+  hosts.** The host-side ``spatiumddi-update.path`` systemd unit
+  the Apply button relies on only exists on a SpatiumDDI appliance;
+  on docker/k8s control planes Apply now opens a modal with the
+  matching ``SPATIUMDDI_VERSION=<tag> docker compose pull && up
+  -d`` or ``helm upgrade spatiumddi --set image.tag=<tag>`` command
+  for the operator to copy + run on the control-plane host.
+
+- **``appliance-dev-iso`` Makefile target no longer bakes container
+  images.** Phase 8a-1 (#138) carved the disk into ESP + root_A
+  4 GiB + root_B 4 GiB + var; the ~480 MiB baked image tarballs
+  pushed the slot rootfs past the 4 GiB ceiling. firstboot pulls
+  every container image from ghcr.io on first boot exactly as a
+  real release does. New ``appliance-clean-baked-images`` target
+  wipes leftover tarballs from a prior bake. ``appliance-bake-
+  images`` stays as a standalone target for the rare case someone
+  needs WIP api+frontend baked in.
+
+- **Agent runtime images (bind9 + powerdns + kea) drop the
+  short-lived ``lsblk`` add** that landed in an interim iteration
+  of #138 Phase 8f-2. lsblk turned out to be insufficient
+  (containers without ``/dev/sda*`` access can't read PARTLABEL /
+  UUID even with lsblk installed); the udev-parsing rewrite above
+  replaces it entirely.
+
+### Fixed
+
+- **Fleet upgrade trigger never landed in production (Phase 8f-4).**
+  Three independent bugs kept the agent from writing the
+  ``slot-upgrade-pending`` trigger file the host-side
+  ``spatiumddi-slot-upgrade.path`` unit watches: (1) the appliance
+  compose mounted ``/var/lib/spatiumddi/release-state`` as ``:ro``
+  on the DNS/DHCP agent services (8f-2 only had the agent reading
+  the .state sidecar; 8f-4 added the write half but the mount mode
+  wasn't updated), (2) firstboot chowned the dir to ``1000:1000``
+  with mode ``0755`` so the agent's unprivileged ``spatium`` user
+  was locked out of write access (now 1777 sticky — same trade-off
+  as /tmp, no secrets stored in this dir), and (3) sync.py only
+  called ``maybe_fire_fleet_upgrade`` inside the 200-response code
+  path so an agent that restarted with a desired-version already
+  cached on disk would 304-forever and the trigger would never be
+  re-evaluated (now also fires from the bootstrap-from-cache path
+  right after ``load_config``).
+
+- **``spatium-upgrade-slot apply`` left both slots with identical
+  filesystem UUIDs after a re-apply.** The slot image's ext4 UUID
+  was baked at slot-image build time so two dd's from the same
+  source produced the same filesystem UUID. ``find_slot_
+  partitions()`` keys off UUID to identify slot_a vs slot_b →
+  ``set-next-boot`` + ``status`` both wedged with "couldn't detect
+  A/B slots". Now inserts ``tune2fs -U random <target_dev>`` +
+  ``udevadm trigger --settle`` between dd and the blkid read so
+  each slot gets a fresh random UUID.
+
+- **Stale upgrade state validator rejection.** Backend's heartbeat
+  handler preserves the previously-stored ``last_upgrade_state``
+  when the agent reports ``None`` (the agent's slot_state
+  validator rejected unknown tokens like ``idle`` post-rename so it
+  reported None) — would have left rows stuck on ``idle`` forever
+  in the DB. Migration not needed; agent + frontend rename handles
+  it for new heartbeats and the auto-heal clears stale rows once
+  the .state file is cleared.
+
+### Migrations
+
+- ``a72f4c89e15d`` — adds ``reboot_requested`` (bool, default
+  ``false``) and ``reboot_requested_at`` (timestamptz, nullable) to
+  both ``dns_server`` and ``dhcp_server`` for Phase 8f-8 fleet
+  reboot intent.
+
 ## 2026.05.12-3 — 2026-05-12
 
 OS Image card polish + per-slot visibility. The big behaviour fix is

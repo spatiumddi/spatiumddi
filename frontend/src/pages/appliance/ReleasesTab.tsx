@@ -26,8 +26,18 @@ import { Modal } from "@/components/ui/modal";
  * a "Update log" card auto-tails /var/log/spatiumddi/update.log via
  * a 3-second poll. Once /api/v1/version reports a different version
  * the upgrade is complete (poll interval bumps back down).
+ *
+ * Apply is gated on ``applianceMode`` — the host-side systemd Path
+ * unit (``spatiumddi-update.path``) only exists on a SpatiumDDI OS
+ * appliance. On docker / k8s control planes, Apply is replaced with a
+ * "manual upgrade" command modal carrying the appropriate
+ * ``docker compose pull`` / ``helm upgrade`` invocation.
  */
-export function ReleasesTab() {
+export function ReleasesTab({
+  applianceMode = false,
+}: {
+  applianceMode?: boolean;
+}) {
   const qc = useQueryClient();
   const [confirmTarget, setConfirmTarget] = useState<ApplianceRelease | null>(
     null,
@@ -131,6 +141,7 @@ export function ReleasesTab() {
               key={rel.tag}
               release={rel}
               disabled={data.apply_in_flight}
+              applianceMode={applianceMode}
               onApply={() => setConfirmTarget(rel)}
             />
           ))}
@@ -154,12 +165,15 @@ export function ReleasesTab() {
 function ReleaseCard({
   release,
   disabled,
+  applianceMode,
   onApply,
 }: {
   release: ApplianceRelease;
   disabled: boolean;
+  applianceMode: boolean;
   onApply: () => void;
 }) {
+  const [manualOpen, setManualOpen] = useState(false);
   return (
     <div
       className={`rounded-lg border bg-card p-4 shadow-sm ${
@@ -210,7 +224,7 @@ function ReleaseCard({
         <div className="shrink-0">
           {release.is_installed ? (
             <span className="text-xs text-muted-foreground">Active</span>
-          ) : (
+          ) : applianceMode ? (
             <button
               type="button"
               onClick={onApply}
@@ -220,10 +234,111 @@ function ReleaseCard({
               <Download className="h-3 w-3" />
               Apply
             </button>
+          ) : (
+            <button
+              type="button"
+              onClick={() => setManualOpen(true)}
+              className="inline-flex items-center gap-1 rounded-md border bg-background px-2 py-1 text-xs text-muted-foreground hover:bg-accent"
+              title="Show the operator-run upgrade command for docker / k8s"
+            >
+              <Download className="h-3 w-3" />
+              Manual…
+            </button>
           )}
         </div>
       </div>
+      {manualOpen && (
+        <ManualApplyModal
+          tag={release.tag}
+          onClose={() => setManualOpen(false)}
+        />
+      )}
     </div>
+  );
+}
+
+// Replaces the Apply button on docker / k8s control planes. The
+// host-side systemd Path unit that the appliance flow relies on
+// (``spatiumddi-update.path``) doesn't exist here, so a one-click
+// apply isn't possible. Operator copies a command + runs it against
+// the deployment they manage.
+function ManualApplyModal({
+  tag,
+  onClose,
+}: {
+  tag: string;
+  onClose: () => void;
+}) {
+  const dockerCmd = [
+    "# On the control-plane host, in the directory holding docker-compose.yml:",
+    `SPATIUMDDI_VERSION=${tag} docker compose pull && \\`,
+    `SPATIUMDDI_VERSION=${tag} docker compose up -d`,
+  ].join("\n");
+  const k8sCmd = [
+    "# On a workstation with kubectl + helm pointed at the cluster:",
+    "helm upgrade spatiumddi \\",
+    "  oci://ghcr.io/spatiumddi/charts/spatiumddi \\",
+    `  --set image.tag=${tag} \\`,
+    "  --reuse-values",
+  ].join("\n");
+  return (
+    <Modal title={`Manual upgrade — ${tag}`} onClose={onClose} wide>
+      <div className="space-y-3 text-sm">
+        <p className="text-muted-foreground">
+          This control plane runs on docker / kubernetes — there's no host-side
+          update unit to trigger a one-click apply. Pick the deploy shape that
+          matches your install, copy the command, and run it on the
+          control-plane host.
+        </p>
+        <div>
+          <div className="mb-1 flex items-center justify-between gap-2">
+            <span className="text-xs font-medium">Docker compose</span>
+            <button
+              type="button"
+              className="text-xs text-muted-foreground hover:text-foreground"
+              onClick={() => {
+                if (navigator.clipboard) {
+                  void navigator.clipboard.writeText(dockerCmd);
+                }
+              }}
+            >
+              Copy
+            </button>
+          </div>
+          <pre className="overflow-x-auto rounded-md border bg-muted/40 p-2 font-mono text-[11px] leading-tight">
+            {dockerCmd}
+          </pre>
+        </div>
+        <div>
+          <div className="mb-1 flex items-center justify-between gap-2">
+            <span className="text-xs font-medium">Kubernetes (helm)</span>
+            <button
+              type="button"
+              className="text-xs text-muted-foreground hover:text-foreground"
+              onClick={() => {
+                if (navigator.clipboard) {
+                  void navigator.clipboard.writeText(k8sCmd);
+                }
+              }}
+            >
+              Copy
+            </button>
+          </div>
+          <pre className="overflow-x-auto rounded-md border bg-muted/40 p-2 font-mono text-[11px] leading-tight">
+            {k8sCmd}
+          </pre>
+        </div>
+        <div className="flex justify-end">
+          <button
+            type="button"
+            onClick={onClose}
+            className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
+          >
+            Close
+          </button>
+        </div>
+      </div>
+    </Modal>
   );
 }
 

@@ -1,0 +1,15 @@
+[Unit]
+Description=Watch for SpatiumDDI fleet-reboot trigger (Phase 8f-8)
+Documentation=https://github.com/spatiumddi/spatiumddi/issues/138
+# Skip on the live ISO — the trigger is meaningful only on installed
+# appliances. The live image's container compose doesn't write here.
+ConditionKernelCommandLine=!boot=live
+
+[Path]
+# PathChanged fires on close-after-write. Agent containers atomically
+# rename a .new sibling onto the trigger path so this only fires once
+# per reboot request.
+PathChanged=/var/lib/spatiumddi/release-state/reboot-pending
+
+[Install]
+WantedBy=multi-user.target

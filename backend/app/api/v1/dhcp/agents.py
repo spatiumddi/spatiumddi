@@ -313,7 +313,11 @@ async def agent_config_longpoll(
         # Fleet view change wakes the agent's long-poll even when the
         # driver-side bundle is unchanged. Deterministic — re-reading
         # the same DB state yields the same combined ETag.
-        fleet_marker = f"{server.desired_appliance_version}|{server.desired_slot_image_url}"
+        fleet_marker = (
+            f"{server.desired_appliance_version}"
+            f"|{server.desired_slot_image_url}"
+            f"|{int(server.reboot_requested)}"
+        )
         etag = "sha256:" + hashlib.sha256(f"{bundle.etag}|{fleet_marker}".encode()).hexdigest()
 
         # Pending ops fast-path
@@ -417,6 +421,11 @@ async def agent_config_longpoll(
                 "fleet_upgrade": {
                     "desired_appliance_version": server.desired_appliance_version,
                     "desired_slot_image_url": server.desired_slot_image_url,
+                    # Phase 8f-8 — operator-triggered reboot intent.
+                    # Agent fires the reboot-pending trigger when this
+                    # flips to True; heartbeat handler clears it
+                    # post-reconnect.
+                    "reboot_requested": server.reboot_requested,
                 },
             }
         if asyncio.get_event_loop().time() >= deadline:
@@ -473,6 +482,15 @@ async def agent_heartbeat(
     ):
         server.desired_appliance_version = None
         server.desired_slot_image_url = None
+
+    # Phase 8f-8 — clear reboot_requested once the agent reconnects
+    # post-reboot. See dns/agents.py for the full rationale; ~15 s
+    # safety margin so a near-instant heartbeat doesn't false-clear.
+    if server.reboot_requested and server.reboot_requested_at is not None:
+        elapsed = (datetime.now(UTC) - server.reboot_requested_at).total_seconds()
+        if elapsed > 15:
+            server.reboot_requested = False
+            server.reboot_requested_at = None
 
     for ack in body.ops_ack:
         op_id = ack.get("op_id")
