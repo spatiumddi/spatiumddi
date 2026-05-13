@@ -3,7 +3,6 @@ import {
   Activity,
   Box,
   Container as ContainerIcon,
-  HardDrive,
   Network,
   ScrollText,
   Server,
@@ -20,7 +19,6 @@ import { LogsTab } from "./LogsTab";
 import { MaintenanceTab } from "./MaintenanceTab";
 import { NetworkTab } from "./NetworkTab";
 import { ReleasesTab } from "./ReleasesTab";
-import { SlotUpgradeCard } from "./SlotUpgradeCard";
 
 /**
  * SpatiumDDI OS appliance management hub (issue #134, Phase 4).
@@ -40,7 +38,6 @@ import { SlotUpgradeCard } from "./SlotUpgradeCard";
 type Tab =
   | "tls"
   | "releases"
-  | "os-image"
   | "fleet"
   | "containers"
   | "logs"
@@ -73,20 +70,12 @@ const TABS: TabSpec[] = [
       "GitHub Releases list with one-click pull-and-recycle, a rollback target picker, and the release notes inline so operators see what they're applying before they apply it.",
   },
   {
-    key: "os-image",
-    label: "OS Image",
-    phase: "8b-3",
-    icon: HardDrive,
-    summary:
-      "Atomic A/B OS image upgrade (Phase 8). Writes a slot .raw.xz into the inactive partition, arms grub one-shot, and rolls back automatically if /health/live doesn't come up on the new slot. Distinct from container-stack releases above — this upgrades the host OS + kernel + bundled tooling, not just the SpatiumDDI containers.",
-  },
-  {
     key: "fleet",
-    label: "Fleet",
+    label: "OS Versions",
     phase: "8f",
     icon: Server,
     summary:
-      "Drive slot upgrades for every registered DNS + DHCP agent from one screen. Per-row Upgrade button stamps the operator's picked release tag onto the agent's server row; the agent's ConfigBundle long-poll picks it up and fires the local slot-upgrade trigger. Docker / k8s rows show copy-paste commands instead.",
+      "Manage the OS version on this appliance and every registered DNS + DHCP agent from one screen. The pinned self row at the top opens the full A/B slot detail (versions per slot, apply log, rollback) in a modal — same machinery the per-row Upgrade button uses for remote agents. Roll a release out to multiple agents at once via the checkbox column + 'Apply to selected'. Docker / k8s rows show copy-paste commands instead.",
   },
   {
     key: "containers",
@@ -182,8 +171,6 @@ export function AppliancePage() {
           <CertificatesTab />
         ) : tab === "releases" ? (
           <ReleasesTab />
-        ) : tab === "os-image" ? (
-          <SlotUpgradeCard />
         ) : tab === "fleet" ? (
           <FleetTab />
         ) : tab === "containers" ? (
