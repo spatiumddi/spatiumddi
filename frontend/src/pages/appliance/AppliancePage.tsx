@@ -3,6 +3,7 @@ import {
   Activity,
   Box,
   Container as ContainerIcon,
+  Gauge,
   Network,
   ScrollText,
   Server,
@@ -19,6 +20,7 @@ import { LogsTab } from "./LogsTab";
 import { MaintenanceTab } from "./MaintenanceTab";
 import { NetworkTab } from "./NetworkTab";
 import { ReleasesTab } from "./ReleasesTab";
+import { SNMPTab } from "./SNMPTab";
 
 /**
  * SpatiumDDI OS appliance management hub (issue #134, Phase 4).
@@ -39,6 +41,7 @@ type Tab =
   | "tls"
   | "releases"
   | "fleet"
+  | "snmp"
   | "containers"
   | "logs"
   | "network"
@@ -86,6 +89,20 @@ const TABS: TabSpec[] = [
     icon: Server,
     summary:
       "Manage the OS version on this appliance and every registered DNS + DHCP agent from one screen. The pinned self row at the top opens the full A/B slot detail (versions per slot, apply log, rollback) in a modal — same machinery the per-row Upgrade button uses for remote agents. Roll a release out to multiple agents at once via the checkbox column + 'Apply to selected'. Docker / k8s rows show copy-paste commands instead.",
+  },
+  {
+    // Issue #153 — fleet-wide config (singleton platform_settings
+    // drives every appliance host's snmpd), so not selfOnly. On
+    // docker / k8s control planes the SNMP form is visible with a
+    // banner explaining the local control plane doesn't run snmpd
+    // but the settings still flow to any registered appliance agents
+    // (hybrid topology).
+    key: "snmp",
+    label: "SNMP",
+    phase: "153",
+    icon: Gauge,
+    summary:
+      "Configure snmpd on every appliance host — local + every registered remote agent. v2c with community + source-CIDR allowlist, or v3 USM with per-user auth/priv. Rendered snmpd.conf ships through the ConfigBundle long-poll, validated host-side before activation. Disabled by default — operators opt in here.",
   },
   {
     key: "containers",
@@ -223,6 +240,8 @@ export function AppliancePage() {
           <ReleasesTab applianceMode={isApplianceHost} />
         ) : effectiveTab === "fleet" ? (
           <FleetTab />
+        ) : effectiveTab === "snmp" ? (
+          <SNMPTab />
         ) : effectiveTab === "containers" ? (
           <ContainersTab />
         ) : effectiveTab === "logs" ? (

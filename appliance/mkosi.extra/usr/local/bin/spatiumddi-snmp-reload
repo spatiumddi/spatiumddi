@@ -39,9 +39,27 @@ LOG="$LOG_DIR/snmp-reload.log"
 ETC_CONF=/etc/snmp/snmpd.conf
 USM_STATE=/var/lib/snmp/snmpd.conf
 LOCK=/run/spatiumddi-snmp-reload.lock
+# Firewall drop-in — added when SNMP is enabled, removed when disabled.
+# /etc/nftables.conf includes /etc/nftables.d/*.nft so a reload picks
+# the file up without editing the main config.
+NFT_DROPIN=/etc/nftables.d/50-spatium-snmp.nft
 
-mkdir -p "$LOG_DIR" "$(dirname "$HASH_SIDECAR")"
+mkdir -p "$LOG_DIR" "$(dirname "$HASH_SIDECAR")" "$(dirname "$NFT_DROPIN")"
 exec >> "$LOG" 2>&1
+
+
+# Helper — reload nftables so /etc/nftables.d/ drop-in changes take
+# effect. nftables.service's ExecReload runs ``nft -f /etc/nftables.conf``
+# which flushes + re-applies including the drop-in dir. Best-effort:
+# a failed reload doesn't roll back snmpd, but does log the diagnostic.
+nft_reload() {
+    if systemctl reload nftables.service >/dev/null 2>&1; then
+        echo "  ✓ nftables reloaded"
+    else
+        echo "  ! nftables reload failed (snmpd may be unreachable until next boot)"
+        systemctl status nftables.service --no-pager 2>&1 | sed 's/^/      /' | head -10 || true
+    fi
+}
 echo
 echo "[$(date -Iseconds)] === spatiumddi-snmp-reload fired ==="
 
@@ -121,6 +139,20 @@ case "$MARKER" in
         sleep 2
         if systemctl is-active --quiet snmpd; then
             echo "  ✓ snmpd is active"
+            # Open UDP 161 in the host firewall. snmpd does its own
+            # source-CIDR filtering (rocommunity <comm> <CIDR>); the
+            # firewall rule is intentionally not source-restricted
+            # here so v3 + v2c share the same plumbing. Operators
+            # who want extra defence-in-depth can drop a more-
+            # restrictive *.nft in /etc/nftables.d/ themselves.
+            cat > "$NFT_DROPIN" <<'EOF'
+# Managed by spatiumddi-snmp-reload — do not edit manually.
+# SpatiumDDI SNMP is currently enabled; this rule opens UDP 161
+# inbound. Removed automatically when SNMP is disabled via the UI.
+add rule inet filter input udp dport 161 accept
+EOF
+            chmod 0644 "$NFT_DROPIN"
+            nft_reload
             echo "running" > "$STATUS_SIDECAR"
             echo "$HASH" > "$HASH_SIDECAR"
             echo "done $(date -Iseconds)" > "${TRIGGER}.state"
@@ -144,9 +176,15 @@ case "$MARKER" in
 EOF
         chown root:root "$ETC_CONF"
         chmod 0640 "$ETC_CONF"
+        # Close UDP 161 in the host firewall (idempotent — file
+        # might not exist on the very first apply).
+        if [ -f "$NFT_DROPIN" ]; then
+            rm -f "$NFT_DROPIN"
+            nft_reload
+        fi
         echo "stopped" > "$STATUS_SIDECAR"
         : > "$HASH_SIDECAR"
-        echo "  ✓ snmpd stopped + disabled, config stubbed"
+        echo "  ✓ snmpd stopped + disabled, config stubbed, firewall closed"
         echo "done $(date -Iseconds)" > "${TRIGGER}.state"
         mv "$TRIGGER" "${TRIGGER}.done.$(date +%s)"
         ;;
