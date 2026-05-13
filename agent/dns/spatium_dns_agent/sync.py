@@ -91,6 +91,16 @@ class SyncLoop:
                             "snmp_reload_triggered_from_cache",
                             config_hash=snmp_block.get("config_hash"),
                         )
+                # Issue #154 — same shape for NTP / chrony.
+                ntp_block = bundle.get("ntp_settings")
+                if ntp_block:
+                    from .slot_state import maybe_fire_ntp_reload
+
+                    if maybe_fire_ntp_reload(ntp_block):
+                        log.info(
+                            "ntp_reload_triggered_from_cache",
+                            config_hash=ntp_block.get("config_hash"),
+                        )
                 # Push the rendered tree once at bootstrap so operators
                 # get a Config-tab snapshot the moment the agent comes
                 # up — without this, the snapshot only lands on the
@@ -200,6 +210,15 @@ class SyncLoop:
                 log.info(
                     "snmp_reload_triggered",
                     config_hash=snmp_block.get("config_hash"),
+                )
+        # Issue #154 — NTP / chrony config rollout. Identical shape.
+        ntp_block = bundle.get("ntp_settings")
+        if ntp_block:
+            from .slot_state import maybe_fire_ntp_reload
+            if maybe_fire_ntp_reload(ntp_block):
+                log.info(
+                    "ntp_reload_triggered",
+                    config_hash=ntp_block.get("config_hash"),
                 )
 
         # Re-render + reload daemon ONLY when structural fingerprint changes.

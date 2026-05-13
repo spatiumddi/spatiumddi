@@ -29,6 +29,15 @@ _SNMP_VERSIONS: set[str] = {"v2c", "v3"}
 _SNMP_AUTH_PROTOCOLS: set[str] = {"none", "MD5", "SHA"}
 _SNMP_PRIV_PROTOCOLS: set[str] = {"none", "DES", "AES"}
 
+# Issue #154 — NTP source modes.
+#   ``pool``    — use ``ntp_pool_servers`` only (default for the
+#                 stock cloud-init pool.ntp.org configuration).
+#   ``servers`` — use ``ntp_custom_servers`` only (air-gapped + shops
+#                 that mandate internal NTP).
+#   ``mixed``   — use both (operator wants internal primary +
+#                 public pool as a fallback).
+_NTP_SOURCE_MODES: set[str] = {"pool", "servers", "mixed"}
+
 logger = structlog.get_logger(__name__)
 router = APIRouter()
 
@@ -124,6 +133,14 @@ class SettingsResponse(BaseModel):
     snmp_allowed_sources: list[str] = []
     snmp_sys_contact: str = ""
     snmp_sys_location: str = ""
+    # ── Appliance NTP (issue #154) ────────────────────────────────
+    # No secrets in NTP — server hostnames are not sensitive, so
+    # the read shape mirrors the stored shape directly.
+    ntp_source_mode: str = "pool"
+    ntp_pool_servers: list[str] = ["pool.ntp.org"]
+    ntp_custom_servers: list[dict[str, Any]] = []
+    ntp_allow_clients: bool = False
+    ntp_allow_client_networks: list[str] = []
 
     model_config = {"from_attributes": True}
 
@@ -253,6 +270,34 @@ class SNMPV3UserUpdate(BaseModel):
         return v
 
 
+class NTPCustomServerUpdate(BaseModel):
+    """One entry in ``ntp_custom_servers`` on PUT.
+
+    ``host`` is the NTP server hostname or IP. ``iburst`` accelerates
+    initial sync (chrony sends a burst of 8 packets at startup);
+    ``prefer`` tags this server as the canonical source — chrony
+    biases toward it for selection when ``prefer`` matches. Both
+    flags default off because the safe choice is a neutral
+    operator-equal-weight pool; operators flip them as needed.
+    """
+
+    host: str
+    iburst: bool = False
+    prefer: bool = False
+
+    @field_validator("host")
+    @classmethod
+    def _host_nonempty(cls, v: str) -> str:
+        s = v.strip()
+        if not s:
+            raise ValueError("host may not be empty")
+        # chrony's parser treats whitespace as a separator inside the
+        # server directive, so reject whitespace in the hostname here.
+        if any(c.isspace() for c in s):
+            raise ValueError("host may not contain whitespace")
+        return s
+
+
 class SettingsUpdate(BaseModel):
     app_title: str | None = None
     app_base_url: str | None = None
@@ -334,6 +379,12 @@ class SettingsUpdate(BaseModel):
     snmp_allowed_sources: list[str] | None = None
     snmp_sys_contact: str | None = None
     snmp_sys_location: str | None = None
+    # ── Appliance NTP (issue #154) ────────────────────────────────
+    ntp_source_mode: str | None = None
+    ntp_pool_servers: list[str] | None = None
+    ntp_custom_servers: list[NTPCustomServerUpdate] | None = None
+    ntp_allow_clients: bool | None = None
+    ntp_allow_client_networks: list[str] | None = None
 
     @field_validator("lockout_threshold")
     @classmethod
@@ -505,6 +556,52 @@ class SettingsUpdate(BaseModel):
                 net = ip_network(s, strict=False)
             except ValueError as exc:
                 raise ValueError(f"invalid CIDR or host: {raw!r} ({exc})") from exc
+            out.append(str(net))
+        return out
+
+    @field_validator("ntp_source_mode")
+    @classmethod
+    def _valid_ntp_source_mode(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        if v not in _NTP_SOURCE_MODES:
+            raise ValueError(f"ntp_source_mode must be one of {sorted(_NTP_SOURCE_MODES)}")
+        return v
+
+    @field_validator("ntp_pool_servers")
+    @classmethod
+    def _valid_ntp_pool_servers(cls, v: list[str] | None) -> list[str] | None:
+        # Pool hostnames are free-form per chrony's parser. Strip
+        # whitespace + drop empties; reject embedded whitespace
+        # (chrony reads the directive as space-separated tokens).
+        if v is None:
+            return None
+        out: list[str] = []
+        for raw in v:
+            s = raw.strip()
+            if not s:
+                continue
+            if any(c.isspace() for c in s):
+                raise ValueError(f"pool hostname may not contain whitespace: {raw!r}")
+            out.append(s)
+        return out
+
+    @field_validator("ntp_allow_client_networks")
+    @classmethod
+    def _valid_ntp_allow_networks(cls, v: list[str] | None) -> list[str] | None:
+        # Same CIDR canonicalisation as snmp_allowed_sources — chrony's
+        # ``allow`` directive accepts both v4 + v6 networks.
+        if v is None:
+            return None
+        out: list[str] = []
+        for raw in v:
+            s = raw.strip()
+            if not s:
+                continue
+            try:
+                net = ip_network(s, strict=False)
+            except ValueError as exc:
+                raise ValueError(f"invalid CIDR: {raw!r} ({exc})") from exc
             out.append(str(net))
         return out
 

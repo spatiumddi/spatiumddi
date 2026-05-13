@@ -1,0 +1,198 @@
+#!/bin/bash
+# spatiumddi-chrony-reload — host-side chrony config-apply runner
+# (issue #154).
+#
+# The api / agent container writes
+# /var/lib/spatiumddi/release-state/ntp-config-pending whenever the
+# control plane's rendered chrony.conf body changes vs. what's been
+# applied here. File format (kept JSON-free for runner simplicity):
+#
+#   line 1:    "enabled" — placeholder for future "disable chrony
+#              entirely" support; today always "enabled"
+#   line 2:    "true" | "false" — ntp_allow_clients
+#              (drives the UDP 123 nftables drop-in)
+#   line 3:    sha256 hex of the body
+#   line 4+:   rendered /etc/chrony/chrony.conf body
+#
+# Apply flow:
+#   1. Extract body, write to /tmp staging
+#   2. ``chronyd -t -f <tmp>`` — chrony's syntax check; abort on fail
+#   3. Atomically swap /etc/chrony/chrony.conf
+#   4. ``systemctl reload chrony`` (in-place re-read of conf)
+#   5. Manage /etc/nftables.d/50-spatium-ntp.nft per allow_clients
+#   6. Capture sync state via ``chronyc tracking`` into the status
+#      sidecar so the heartbeat can surface it
+#
+# Persistence across A/B slot swaps (Phase 8a, issue #138):
+#
+#   /etc/chrony/chrony.conf          → /var/persist/etc/chrony/...
+#   /etc/nftables.d/50-spatium-ntp.nft → /var/persist/etc/nftables.d/...
+#   /var/lib/chrony/*                → on /var directly (chrony state)
+#   /var/lib/spatiumddi/release-state/ntp-config-{hash,status,pending}
+#                                    → on /var directly
+#
+# Slot upgrades / rollbacks preserve operator NTP config + the
+# firewall hole automatically — same overlay-on-/etc + /var-backed-
+# sidecar story as the SNMP runner.
+
+set -euo pipefail
+
+TRIGGER=/var/lib/spatiumddi/release-state/ntp-config-pending
+HASH_SIDECAR=/var/lib/spatiumddi/release-state/ntp-config-hash
+STATUS_SIDECAR=/var/lib/spatiumddi/release-state/ntp-status
+LOG_DIR=/var/log/spatiumddi
+LOG="$LOG_DIR/chrony-reload.log"
+ETC_CONF=/etc/chrony/chrony.conf
+LOCK=/run/spatiumddi-chrony-reload.lock
+# Firewall drop-in for the "serve NTP to clients" mode. Mirrors the
+# SNMP runner's drop-in: file present = port open, file absent =
+# port closed (default-deny inbound chain refuses UDP 123).
+NFT_DROPIN=/etc/nftables.d/50-spatium-ntp.nft
+
+mkdir -p "$LOG_DIR" "$(dirname "$HASH_SIDECAR")" "$(dirname "$NFT_DROPIN")"
+exec >> "$LOG" 2>&1
+echo
+echo "[$(date -Iseconds)] === spatiumddi-chrony-reload fired ==="
+
+
+nft_reload() {
+    if systemctl reload nftables.service >/dev/null 2>&1; then
+        echo "  ✓ nftables reloaded"
+    else
+        echo "  ! nftables reload failed (UDP 123 may not be open until next boot)"
+        systemctl status nftables.service --no-pager 2>&1 | sed 's/^/      /' | head -10 || true
+    fi
+}
+
+
+# Capture ``chronyc tracking`` output → status sidecar. Run after
+# each apply so the heartbeat picks up the post-reload sync state.
+# chrony usually needs a few seconds after a reload to resync;
+# rather than block here we record the current state and let the
+# heartbeat re-read on each tick — eventually-consistent.
+update_sync_status() {
+    if ! command -v chronyc >/dev/null 2>&1; then
+        echo "unknown" > "$STATUS_SIDECAR"
+        return
+    fi
+    # ``chronyc tracking`` exits 0 even when unsynchronised — we
+    # parse the ``Leap status`` line. Values:
+    #   Normal               — synchronised
+    #   Insert/Delete second — synchronised (leap pending)
+    #   Not synchronised     — unsynchronised
+    local leap
+    leap=$(chronyc -h 127.0.0.1 tracking 2>/dev/null | awk -F': *' '/^Leap status/ {print $2}')
+    case "$leap" in
+        "Normal"|"Insert second"|"Delete second")
+            echo "synchronized" > "$STATUS_SIDECAR"
+            ;;
+        "Not synchronised")
+            echo "unsynchronized" > "$STATUS_SIDECAR"
+            ;;
+        *)
+            echo "unknown" > "$STATUS_SIDECAR"
+            ;;
+    esac
+}
+
+
+if [ ! -f "$TRIGGER" ]; then
+    echo "  no trigger file at $TRIGGER, nothing to do"
+    exit 0
+fi
+
+# Serialise concurrent invocations.
+exec 9>"$LOCK"
+if ! flock -n 9; then
+    echo "  another reload in progress, deferring"
+    exit 0
+fi
+
+MARKER=$(sed -n '1p' "$TRIGGER" | tr -d '\r\n')
+ALLOW_CLIENTS=$(sed -n '2p' "$TRIGGER" | tr -d '\r\n')
+HASH=$(sed -n '3p' "$TRIGGER" | tr -d '\r\n')
+TMP_BODY=$(mktemp /tmp/spatium-chrony.conf.XXXXXX)
+trap 'rm -f "$TMP_BODY"' EXIT
+tail -n +4 "$TRIGGER" > "$TMP_BODY"
+
+echo "  marker:        $MARKER"
+echo "  allow_clients: $ALLOW_CLIENTS"
+echo "  hash:          ${HASH:-<empty>}"
+echo "  body size:     $(wc -c < "$TMP_BODY") bytes"
+
+if [ "$MARKER" != "enabled" ]; then
+    echo "  ✗ unknown marker line: ${MARKER:-<empty>}"
+    echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
+    mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
+    exit 1
+fi
+
+# Syntax-check the staged config against chrony's own parser.
+# ``chronyd -t -f <file>`` reads the config + exits 0 / non-0 on
+# parse success / failure without touching the running daemon.
+if ! command -v chronyd >/dev/null 2>&1; then
+    echo "  ✗ chronyd binary not found — is chrony installed?"
+    echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
+    mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
+    exit 1
+fi
+if ! chronyd -t -f "$TMP_BODY" >/tmp/spatium-chrony-validate.log 2>&1; then
+    echo "  ✗ chronyd -t failed for staged config:"
+    sed 's/^/      /' /tmp/spatium-chrony-validate.log
+    echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
+    mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
+    exit 1
+fi
+echo "  ✓ chronyd -t passed"
+
+# Atomic swap. Owner root, group root, mode 0644 — chrony reads as
+# root + the file has no secrets (server hostnames are operator-
+# visible anyway), so world-readable is fine.
+install -o root -g root -m 0644 "$TMP_BODY" "$ETC_CONF"
+
+# Reload chrony to pick up the new config. ``systemctl reload`` runs
+# chrony's reload handler which re-reads the conf + reconfigures
+# sources + ``allow`` lines without restarting the daemon (no clock
+# discontinuity, no state lost).
+if systemctl reload chrony.service >/dev/null 2>&1; then
+    echo "  ✓ chrony reloaded"
+elif systemctl restart chrony.service >/dev/null 2>&1; then
+    # Fallback for chrony unit versions that don't ship ExecReload.
+    echo "  ✓ chrony restarted (reload not supported on this build)"
+else
+    echo "  ✗ chrony reload + restart both failed"
+    systemctl status chrony.service --no-pager 2>&1 | sed 's/^/      /' | head -10 || true
+    echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
+    mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
+    exit 1
+fi
+
+# Firewall drop-in for the "serve NTP to clients" mode. CIDR-scoped
+# filtering is done by chrony itself via ``allow <cidr>`` directives;
+# the firewall rule is intentionally not source-restricted here so
+# chrony's policy and the nft rule don't drift.
+if [ "$ALLOW_CLIENTS" = "true" ]; then
+    cat > "$NFT_DROPIN" <<'EOF'
+# Managed by spatiumddi-chrony-reload — do not edit manually.
+# SpatiumDDI NTP server mode is currently enabled; this rule opens
+# UDP 123 inbound. Removed automatically when allow-clients is off.
+udp dport 123 accept
+EOF
+    chmod 0644 "$NFT_DROPIN"
+    nft_reload
+    echo "  ✓ firewall opened for UDP 123 (NTP server mode)"
+else
+    if [ -f "$NFT_DROPIN" ]; then
+        rm -f "$NFT_DROPIN"
+        nft_reload
+        echo "  ✓ firewall closed for UDP 123 (NTP server mode off)"
+    fi
+fi
+
+# Capture post-reload sync state for the heartbeat.
+update_sync_status
+
+echo "$HASH" > "$HASH_SIDECAR"
+echo "done $(date -Iseconds)" > "${TRIGGER}.state"
+mv "$TRIGGER" "${TRIGGER}.done.$(date +%s)"
+echo "  ✓ done — sync state: $(cat "$STATUS_SIDECAR")"

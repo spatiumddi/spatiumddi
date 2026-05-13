@@ -1,0 +1,15 @@
+[Unit]
+Description=Watch for SpatiumDDI chrony config-reload trigger (issue #154)
+Documentation=https://github.com/spatiumddi/spatiumddi/issues/154
+# Skip on the live ISO — installer environment doesn't drive chrony
+# configs through SpatiumDDI.
+ConditionKernelCommandLine=!boot=live
+
+[Path]
+# Same atomic-rename trigger pattern the SNMP + slot-upgrade units
+# use: agent writes <name>.new, then mv → <name>. PathChanged fires
+# once per applied config (close-after-write semantics).
+PathChanged=/var/lib/spatiumddi/release-state/ntp-config-pending
+
+[Install]
+WantedBy=multi-user.target

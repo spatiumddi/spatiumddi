@@ -123,6 +123,16 @@ class SyncLoop:
                             "snmp_reload_triggered_from_cache",
                             config_hash=snmp_block.get("config_hash"),
                         )
+                # Issue #154 — same cache-bootstrap path for NTP.
+                ntp_block = bundle.get("ntp_settings")
+                if ntp_block:
+                    from .slot_state import maybe_fire_ntp_reload
+
+                    if maybe_fire_ntp_reload(ntp_block):
+                        log.info(
+                            "ntp_reload_triggered_from_cache",
+                            config_hash=ntp_block.get("config_hash"),
+                        )
             except Exception:
                 log.exception("bootstrap_cache_apply_failed")
 
@@ -323,6 +333,15 @@ class SyncLoop:
                 log.info(
                     "snmp_reload_triggered",
                     config_hash=snmp_block.get("config_hash"),
+                )
+        # Issue #154 — same shape for NTP / chrony.
+        ntp_block = bundle.get("ntp_settings")
+        if ntp_block:
+            from .slot_state import maybe_fire_ntp_reload
+            if maybe_fire_ntp_reload(ntp_block):
+                log.info(
+                    "ntp_reload_triggered",
+                    config_hash=ntp_block.get("config_hash"),
                 )
 
         try:

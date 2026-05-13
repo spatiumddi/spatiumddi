@@ -2768,6 +2768,22 @@ export interface PlatformSettings {
   snmp_allowed_sources: string[];
   snmp_sys_contact: string;
   snmp_sys_location: string;
+  /** Appliance NTP / chrony (issue #154). No secrets — server
+   *  hostnames are not sensitive, so the read shape and the write
+   *  shape match (no ``*_set`` redaction). */
+  ntp_source_mode: NtpSourceMode;
+  ntp_pool_servers: string[];
+  ntp_custom_servers: NtpCustomServer[];
+  ntp_allow_clients: boolean;
+  ntp_allow_client_networks: string[];
+}
+
+export type NtpSourceMode = "pool" | "servers" | "mixed";
+
+export interface NtpCustomServer {
+  host: string;
+  iburst: boolean;
+  prefer: boolean;
 }
 
 export type SnmpVersion = "v2c" | "v3";

@@ -229,6 +229,10 @@ _REBOOT_TRIGGER_FILE = Path("/var/lib/spatiumddi-host/release-state/reboot-pendi
 _SNMP_TRIGGER_FILE = Path("/var/lib/spatiumddi-host/release-state/snmp-config-pending")
 _SNMP_HASH_SIDECAR = Path("/var/lib/spatiumddi-host/release-state/snmp-config-hash")
 _SNMP_STATUS_SIDECAR = Path("/var/lib/spatiumddi-host/release-state/snmp-status")
+# Issue #154 — NTP / chrony equivalents. Same shape as SNMP.
+_NTP_TRIGGER_FILE = Path("/var/lib/spatiumddi-host/release-state/ntp-config-pending")
+_NTP_HASH_SIDECAR = Path("/var/lib/spatiumddi-host/release-state/ntp-config-hash")
+_NTP_STATUS_SIDECAR = Path("/var/lib/spatiumddi-host/release-state/ntp-status")
 
 
 def maybe_fire_fleet_upgrade(
@@ -394,6 +398,73 @@ def read_snmpd_running() -> bool | None:
     return None
 
 
+def maybe_fire_ntp_reload(bundle_block: object) -> bool:
+    """Issue #154 — write the ntp-config trigger when the control
+    plane's rendered chrony.conf hash differs from the last applied.
+
+    Identical idempotency shape to ``maybe_fire_snmp_reload``:
+    appliance-only gate, hash sidecar lookup, single trigger file
+    rename, fail silent on OSError. Different paths so the SNMP and
+    NTP pipelines never collide.
+    """
+    if detect_deployment_kind() != "appliance":
+        return False
+    if not isinstance(bundle_block, dict):
+        return False
+    config_hash = str(bundle_block.get("config_hash") or "")
+    chrony_conf = str(bundle_block.get("chrony_conf") or "")
+    allow_clients = bool(bundle_block.get("allow_clients"))
+    last_hash = ""
+    if _NTP_HASH_SIDECAR.exists():
+        try:
+            last_hash = _NTP_HASH_SIDECAR.read_text(encoding="utf-8").strip()
+        except OSError:
+            last_hash = ""
+    if config_hash == last_hash:
+        return False
+    if _NTP_TRIGGER_FILE.exists():
+        return False
+    try:
+        _NTP_TRIGGER_FILE.parent.mkdir(parents=True, exist_ok=True)
+        # Four-line header:
+        #   line 1: marker — ``enabled`` is always the case for
+        #           chrony (it's always running on the appliance);
+        #           kept for shape-parity with the SNMP runner.
+        #   line 2: ``allow_clients`` — ``true`` / ``false`` so the
+        #           runner knows whether to open the UDP 123 nft
+        #           drop-in.
+        #   line 3: config_hash (sha256 hex)
+        #   line 4+: rendered chrony.conf body
+        payload = (
+            "enabled\n"
+            + ("true\n" if allow_clients else "false\n")
+            + (config_hash + "\n")
+            + chrony_conf
+        )
+        tmp = _NTP_TRIGGER_FILE.with_suffix(".new")
+        tmp.write_text(payload, encoding="utf-8")
+        tmp.replace(_NTP_TRIGGER_FILE)
+        return True
+    except OSError:
+        return False
+
+
+def read_ntp_sync_state() -> str | None:
+    """Read chrony's last-reported sync state from the sidecar the
+    host-side runner refreshes on each apply. One of ``synchronized``
+    / ``unsynchronized`` / ``unknown``, or ``None`` on docker / k8s
+    (no sidecar mounted)."""
+    if not _NTP_STATUS_SIDECAR.exists():
+        return None
+    try:
+        text = _NTP_STATUS_SIDECAR.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if text in ("synchronized", "unsynchronized", "unknown"):
+        return text
+    return None
+
+
 def collect() -> dict[str, object]:
     """Snapshot the agent's slot + deployment state for the heartbeat.
 
@@ -429,4 +500,10 @@ def collect() -> dict[str, object]:
         # kind so operators see at a glance which appliances actually
         # have snmpd running. None on non-appliance deploys.
         "snmpd_running": read_snmpd_running() if is_appliance else None,
+        # Issue #154 — chrony sync state from ``chronyc tracking``,
+        # captured by the host-side runner on apply. ``synchronized``
+        # = leap status OK + reference set; ``unsynchronized`` = no
+        # reference / stratum >= 16; ``unknown`` = chronyc unreadable
+        # (transient at boot). None on non-appliance deploys.
+        "ntp_sync_state": read_ntp_sync_state() if is_appliance else None,
     }
