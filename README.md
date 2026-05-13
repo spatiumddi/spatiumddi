@@ -78,7 +78,7 @@ If SpatiumDDI ends up being useful to you, that's the whole point. If you want t
 
 SpatiumDDI is built on nights and weekends with no commercial backing — every release ships off my own time, my own homelab hardware, and a steady supply of chocolate. If the project is saving your team work, or you just want to keep me building, there are a few ways to chip in. Anything is genuinely appreciated and goes straight back into the hardware-to-test-against fund.
 
-**Individuals**
+**Individuals** — small tips help cover the boring stuff (a domain, a homelab SSD, the occasional cloud VM I spin up to test a deploy topology I don't have locally). No tier system, no perks list, no obligation — just a "thanks, here's a coffee" button if the project saved you an afternoon. Every contribution is genuinely appreciated.
 
 <p align="left">
   <a href="https://buymeacoffee.com/mzac"><img src="https://img.shields.io/badge/Buy%20me%20a%20coffee-FFDD00?logo=buy-me-a-coffee&logoColor=000000" alt="Buy me a coffee" /></a>
