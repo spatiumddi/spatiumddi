@@ -50,6 +50,15 @@ interface TabSpec {
   phase: string;
   icon: typeof ShieldCheck;
   summary: string;
+  // Self-only tabs operate on local host state (TLS cert files, the
+  // local docker socket, journalctl, hostname / network config,
+  // reboot / shutdown). They only make sense when the control plane
+  // itself is running on the SpatiumDDI OS appliance ISO. On a
+  // docker / k8s control plane we hide these — the operator manages
+  // host-level concerns through their own tooling. Releases + OS
+  // Versions are universally useful (release catalog, fleet
+  // management of remote appliance agents) so they stay visible.
+  selfOnly?: boolean;
 }
 
 const TABS: TabSpec[] = [
@@ -58,6 +67,7 @@ const TABS: TabSpec[] = [
     label: "Web UI Certificate",
     phase: "4b",
     icon: ShieldCheck,
+    selfOnly: true,
     summary:
       "Upload an existing certificate + key, generate a CSR, or have the appliance issue a Let's Encrypt cert against a public DNS name. Reuses the existing ACME service (app/services/acme/).",
   },
@@ -82,6 +92,7 @@ const TABS: TabSpec[] = [
     label: "Containers",
     phase: "4d",
     icon: ContainerIcon,
+    selfOnly: true,
     summary:
       "Container list driven off the docker socket, with start / stop / restart and live log streaming over websocket. Drives the spatium stack — the appliance compose mounts /var/run/docker.sock read-write for this surface.",
   },
@@ -90,6 +101,7 @@ const TABS: TabSpec[] = [
     label: "Logs & Diagnostics",
     phase: "4e",
     icon: ScrollText,
+    selfOnly: true,
     summary:
       'System log viewer wired to journalctl, the "Run self-test" health-check button (DNS resolution + DHCP issuance + web reachability), and the "Download diagnostic bundle" one-click zip with secrets redacted.',
   },
@@ -98,6 +110,7 @@ const TABS: TabSpec[] = [
     label: "Network & Host",
     phase: "4f",
     icon: Network,
+    selfOnly: true,
     summary:
       "Hostname, NTP, DNS resolvers, IPv4/IPv6 mode (DHCP vs static, with the wizard's same form), nftables drop-in editor for /etc/nftables.d/, SSH key upload, proxy config, and a reboot-pending banner.",
   },
@@ -106,21 +119,38 @@ const TABS: TabSpec[] = [
     label: "Maintenance",
     phase: "4f",
     icon: Activity,
+    selfOnly: true,
     summary:
       "Maintenance-mode toggle that drains DNS/DHCP traffic before letting the operator perform host work, plus reboot / shutdown buttons with confirmation prompts so accidental clicks don't take an appliance offline.",
   },
 ];
 
 export function AppliancePage() {
-  const [tab, setTab] = useSessionState<Tab>("appliance.tab", "tls");
-
   const { data: info } = useQuery({
     queryKey: ["appliance", "info"],
     queryFn: applianceApi.getInfo,
     staleTime: 5 * 60 * 1000,
   });
 
-  const active = TABS.find((t) => t.key === tab) ?? TABS[0];
+  // On docker / k8s control planes, hide every tab that only makes
+  // sense for a local-appliance host. The page still ships Releases +
+  // OS Versions so operators with appliance *agents* (registered
+  // against this docker/k8s control plane) can manage them.
+  const isApplianceHost = !!info?.appliance_mode;
+  const visibleTabs = TABS.filter((t) => !t.selfOnly || isApplianceHost);
+
+  // Default tab — first self-only tab on appliance hosts (TLS),
+  // first universal tab (Releases) otherwise. Keeps the session-stored
+  // value if it's still in the visible set; falls back if the operator
+  // last visited a now-hidden tab (e.g. after a deployment-kind change).
+  const defaultTab: Tab = isApplianceHost ? "tls" : "releases";
+  const [tab, setTab] = useSessionState<Tab>("appliance.tab", defaultTab);
+  const effectiveTab: Tab = visibleTabs.some((t) => t.key === tab)
+    ? tab
+    : defaultTab;
+
+  const active =
+    visibleTabs.find((t) => t.key === effectiveTab) ?? visibleTabs[0];
 
   return (
     <div className="flex h-full flex-col overflow-hidden">
@@ -138,14 +168,34 @@ export function AppliancePage() {
               {info.appliance_hostname}
             </span>
           )}
+          {!isApplianceHost && (
+            <span
+              className="rounded-md bg-muted px-1.5 py-0.5 font-mono text-xs text-muted-foreground"
+              title="This control plane is running on Docker or Kubernetes. Host-level tabs (TLS, Containers, Logs, Network, Maintenance) are hidden — the OS Versions tab still drives slot upgrades on any registered appliance agents."
+            >
+              docker/k8s
+            </span>
+          )}
         </div>
         <p className="mt-1 text-xs text-muted-foreground">
-          Manage the SpatiumDDI OS appliance — TLS, releases, containers, logs,
-          host network, and lifecycle. This surface is appliance-only; on plain
-          Docker / Kubernetes deployments the sidebar entry is hidden.
+          {isApplianceHost ? (
+            <>
+              Manage the SpatiumDDI OS appliance — TLS, releases, containers,
+              logs, host network, and lifecycle. The OS Versions tab also drives
+              slot upgrades on every registered remote DNS + DHCP agent.
+            </>
+          ) : (
+            <>
+              This control plane is running on Docker / Kubernetes. Host-level
+              tabs (TLS, Containers, Logs, Network, Maintenance) only apply to
+              an appliance-hosted control plane and are hidden here. The OS
+              Versions tab still drives slot upgrades on any registered
+              appliance agents.
+            </>
+          )}
         </p>
         <div className="-mb-px mt-3 flex flex-wrap gap-1 border-b">
-          {TABS.map((t) => {
+          {visibleTabs.map((t) => {
             const Icon = t.icon;
             return (
               <button
@@ -153,7 +203,7 @@ export function AppliancePage() {
                 type="button"
                 onClick={() => setTab(t.key)}
                 className={`-mb-px inline-flex items-center gap-1.5 border-b-2 px-3 py-1.5 text-sm ${
-                  tab === t.key
+                  effectiveTab === t.key
                     ? "border-primary text-foreground"
                     : "border-transparent text-muted-foreground hover:text-foreground"
                 }`}
@@ -167,23 +217,23 @@ export function AppliancePage() {
       </div>
 
       <div className="flex-1 overflow-auto bg-background p-6">
-        {tab === "tls" ? (
+        {effectiveTab === "tls" ? (
           <CertificatesTab />
-        ) : tab === "releases" ? (
+        ) : effectiveTab === "releases" ? (
           <ReleasesTab />
-        ) : tab === "fleet" ? (
+        ) : effectiveTab === "fleet" ? (
           <FleetTab />
-        ) : tab === "containers" ? (
+        ) : effectiveTab === "containers" ? (
           <ContainersTab />
-        ) : tab === "logs" ? (
+        ) : effectiveTab === "logs" ? (
           <LogsTab />
-        ) : tab === "network" ? (
+        ) : effectiveTab === "network" ? (
           <NetworkTab />
-        ) : tab === "maintenance" ? (
+        ) : effectiveTab === "maintenance" ? (
           <MaintenanceTab />
-        ) : (
+        ) : active ? (
           <PhasePlaceholder spec={active} />
-        )}
+        ) : null}
       </div>
     </div>
   );

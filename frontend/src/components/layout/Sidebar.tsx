@@ -753,22 +753,26 @@ export function Sidebar({
           )}
 
           {/*
-            Appliance management — only rendered when the API reports
-            appliance_mode=true (set by the SpatiumDDI OS appliance
-            ISO's compose env). The single entry routes to a tabbed
-            hub at /appliance that hosts Phase 4b-4g sub-surfaces
-            (TLS, releases, containers, logs, network/host,
-            maintenance). On non-appliance deploys this stays hidden.
+            Appliance management — always visible. When the API host
+            itself runs the SpatiumDDI OS appliance ISO, /appliance
+            shows the full tab set (TLS, releases, OS versions,
+            containers, host logs, network, maintenance). On
+            docker/k8s control planes, the page is still useful for
+            the Releases catalog + the OS Versions table (which lets
+            operators drive slot upgrades on *remote* appliance
+            agents that registered against this control plane); the
+            self-only tabs are hidden inside the page. Hiding the
+            entry entirely was overly aggressive — the hybrid topology
+            (docker/k8s control plane + appliance agents) is a real
+            deployment shape.
           */}
-          {versionInfo?.appliance_mode && (
-            <NavItem
-              label="Appliance"
-              icon={Wrench}
-              to="/appliance"
-              collapsed={effectiveCollapsed}
-              onNavigate={mobileOpen ? onMobileClose : undefined}
-            />
-          )}
+          <NavItem
+            label="Appliance"
+            icon={Wrench}
+            to="/appliance"
+            collapsed={effectiveCollapsed}
+            onNavigate={mobileOpen ? onMobileClose : undefined}
+          />
 
           <NavItem
             label="Features & Integrations"
