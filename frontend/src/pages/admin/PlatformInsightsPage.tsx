@@ -26,7 +26,7 @@ import { cn, zebraBodyCls } from "@/lib/utils";
 import { Link } from "react-router-dom";
 import { ShieldCheck } from "lucide-react";
 
-type TabKey = "postgres" | "containers";
+type TabKey = "postgres" | "containers" | "conformity" | "copilot";
 
 function formatBytes(n: number | null | undefined): string {
   if (n == null) return "—";
@@ -567,14 +567,37 @@ export function PlatformInsightsPage() {
               <Box className="mr-1 inline h-3.5 w-3.5" />
               Containers
             </button>
+            <button
+              onClick={() => setTab("conformity")}
+              className={cn(
+                "border-b-2 px-3 py-2 text-sm font-medium -mb-px transition-colors",
+                tab === "conformity"
+                  ? "border-primary text-foreground"
+                  : "border-transparent text-muted-foreground hover:text-foreground",
+              )}
+            >
+              <ShieldCheck className="mr-1 inline h-3.5 w-3.5" />
+              Conformity
+            </button>
+            <button
+              onClick={() => setTab("copilot")}
+              className={cn(
+                "border-b-2 px-3 py-2 text-sm font-medium -mb-px transition-colors",
+                tab === "copilot"
+                  ? "border-primary text-foreground"
+                  : "border-transparent text-muted-foreground hover:text-foreground",
+              )}
+            >
+              <Sparkles className="mr-1 inline h-3.5 w-3.5" />
+              Copilot Usage
+            </button>
           </div>
         </div>
 
         {tab === "postgres" && <PostgresPanel />}
         {tab === "containers" && <ContainersPanel />}
-
-        <ConformityPanel />
-        <AIUsagePanel />
+        {tab === "conformity" && <ConformityPanel />}
+        {tab === "copilot" && <AIUsagePanel />}
       </div>
     </div>
   );
@@ -589,8 +612,17 @@ function ConformityPanel() {
     retry: false,
   });
 
-  if (summaryQ.isLoading || !summaryQ.data) {
-    return null;
+  if (summaryQ.isLoading) {
+    return (
+      <p className="text-sm text-muted-foreground">Loading conformity data…</p>
+    );
+  }
+  if (!summaryQ.data) {
+    return (
+      <p className="text-sm text-muted-foreground">
+        No conformity data available.
+      </p>
+    );
   }
   const summary = summaryQ.data;
   const total =
@@ -694,12 +726,20 @@ function AIUsagePanel() {
   });
 
   if (usageQ.isLoading) {
-    return null;
+    return (
+      <p className="text-sm text-muted-foreground">Loading copilot usage…</p>
+    );
   }
   if (usageQ.error || !usageQ.data) {
-    // Endpoint is SuperAdmin-only — non-superadmins get a 403 here
-    // and we just hide the card. Network errors bail the same way.
-    return null;
+    // Endpoint is SuperAdmin-only — non-superadmins 403 here. Before
+    // moving this into its own tab the panel just hid itself; now that
+    // it owns the tab content, explain why the table is empty rather
+    // than rendering a blank page.
+    return (
+      <p className="text-sm text-muted-foreground">
+        Operator Copilot usage data is only visible to superadmins.
+      </p>
+    );
   }
   const { today, last_7d, last_30d, top_users_today } = usageQ.data;
 
