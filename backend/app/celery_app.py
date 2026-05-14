@@ -25,6 +25,7 @@ celery_app = Celery(
         "app.tasks.prune_logs",
         "app.tasks.prune_metrics",
         "app.tasks.prune_multicast_memberships",
+        "app.tasks.prune_pairing_codes",
         "app.tasks.trash_purge",
         "app.tasks.ipam_reservation_sweep",
         "app.tasks.dhcp_lease_history_prune",
@@ -79,6 +80,7 @@ celery_app.conf.update(
         "app.tasks.prune_logs.*": {"queue": "default"},
         "app.tasks.prune_metrics.*": {"queue": "default"},
         "app.tasks.prune_multicast_memberships.*": {"queue": "default"},
+        "app.tasks.prune_pairing_codes.*": {"queue": "default"},
         "app.tasks.trash_purge.*": {"queue": "default"},
         "app.tasks.ipam_reservation_sweep.*": {"queue": "ipam"},
         "app.tasks.dhcp_lease_history_prune.*": {"queue": "dhcp"},
@@ -365,6 +367,15 @@ celery_app.conf.update(
         "internal-errors-prune": {
             "task": "app.tasks.prune_internal_errors.prune_internal_errors",
             "schedule": crontab(hour=3, minute=30),
+        },
+        # Every 30 min, sweep stale appliance pairing codes — claimed
+        # rows after 30 d, revoked after 7 d, expired after 24 h of
+        # grace (issue #169). High-cadence vs. the nightly prunes
+        # because the operator-facing list endpoint should reflect
+        # the rolling-window state of recent codes without a long lag.
+        "pairing-codes-prune": {
+            "task": "app.tasks.prune_pairing_codes.prune_pairing_codes",
+            "schedule": schedule(run_every=1800.0),
         },
         # Every 60 s, fire any backup target whose ``next_run_at``
         # is now in the past (issue #117 Phase 1b). The sweep + the

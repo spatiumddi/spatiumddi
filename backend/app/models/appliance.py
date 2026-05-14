@@ -1,12 +1,15 @@
 """SpatiumDDI OS appliance management models — Phase 4 (issue #134).
 
-Only the Web UI certificate is modeled here today (Phase 4b.1). The
-broader management surface (releases, container state, host network
-config, maintenance mode) doesn't need DB persistence — those endpoints
-read from / write to systemd, docker, nftables directly. The certificate
-is different because it carries a Fernet-encrypted private key, has
-identity (subject/SAN/fingerprint) we want to display historically, and
-needs an explicit "which one is active" pointer that survives reboot.
+Two persistence surfaces live here:
+
+* ``ApplianceCertificate`` (Phase 4b.1) — Web UI TLS cert with a
+  Fernet-encrypted private key.
+* ``PairingCode`` (#169) — short-lived, single-use 8-digit codes that
+  swap for the real agent bootstrap key. See the model docstring.
+
+The broader management surface (releases, container state, host
+network config, maintenance mode) doesn't need DB persistence — those
+endpoints read from / write to systemd, docker, nftables directly.
 """
 
 from __future__ import annotations
@@ -129,3 +132,94 @@ class ApplianceCertificate(Base):
     # migration; ignored by 4b.1's upload flow.
     csr_pem: Mapped[str | None] = mapped_column(Text, nullable=True)
     csr_subject: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
+
+
+# Deployment kinds a pairing code may target. ``"agent"`` is reserved
+# for the future generic-agent role (#170) and isn't accepted at the
+# API layer today.
+PAIRING_KIND_DNS = "dns"
+PAIRING_KIND_DHCP = "dhcp"
+PAIRING_KINDS = (PAIRING_KIND_DNS, PAIRING_KIND_DHCP)
+
+
+class PairingCode(Base):
+    """Short-lived, single-use code that an agent installer swaps for
+    the real ``DNS_AGENT_KEY`` / ``DHCP_AGENT_KEY`` bootstrap key.
+
+    Operator generates the code on the control plane (8 decimal
+    digits, default 15-min expiry, optional pre-assigned group). Agent
+    POSTs ``/api/v1/appliance/pair {code, hostname}`` to redeem it.
+
+    Security model:
+
+    * Code is stored as sha256 — the cleartext is shown exactly once
+      on creation and never persisted. An attacker with read access
+      to this table can't trivially replay a pending code, though
+      sha256 of 8-digit decimal IS rainbow-tableable; this is
+      defense-in-depth, not the primary gate.
+    * Single-use: ``used_at`` non-null disqualifies subsequent
+      attempts.
+    * Time-bound: ``expires_at`` enforced at consume time, plus a
+      Celery reaper that DELETEs old rows.
+    * Audit log captures create / claim / revoke / expire so abusive
+      consume attempts are at least visible after the fact.
+    """
+
+    __tablename__ = "pairing_code"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+
+    # sha256 hex digest of the cleartext code. UNIQUE so the consume
+    # endpoint can look up by hash in O(log n) without collision risk.
+    code_hash: Mapped[str] = mapped_column(String(64), nullable=False, unique=True, index=True)
+
+    # Last two digits of the cleartext code. Surfaced in the list
+    # endpoint for visual correlation ("which row is the code I just
+    # wrote down?"). Two digits is trivial entropy — security comes
+    # from the full 8 digits + expiry + single-use, not from this.
+    code_last_two: Mapped[str] = mapped_column(String(2), nullable=False)
+
+    # ``dns`` | ``dhcp`` — picks which bootstrap key the consume endpoint
+    # returns. Enforced at the DB layer by a CHECK constraint (see
+    # migration) so we can never silently issue a code for an unknown
+    # kind even if the API layer bug-paths around its own validator.
+    deployment_kind: Mapped[str] = mapped_column(String(16), nullable=False)
+
+    # Optional pre-assignment. Stored as a free-form UUID rather than
+    # a FK because the column is polymorphic across
+    # ``dns_server_group`` and ``dhcp_server_group``; the kind picks
+    # which table the UUID points into. The create endpoint validates
+    # the group actually exists for the given kind.
+    server_group_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
+
+    # Wall-clock expiry. Codes past their expiry are refused at consume
+    # time even before the reaper sweeps them.
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+
+    # Claim state. All three set atomically when the consume endpoint
+    # succeeds; ``used_at`` non-null is the canonical "this code is
+    # dead" signal.
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    used_by_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    used_by_hostname: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+    # Operator-driven cancellation. Independent of ``used_at`` —
+    # revoking a code that's already been claimed is a no-op for the
+    # consume endpoint but still useful audit signal.
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    revoked_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("user.id", ondelete="SET NULL"), nullable=True
+    )
+
+    # Free-form operator note, e.g. "for dns-west-2". Surfaced in the
+    # codes list + audit log.
+    note: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+    created_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("user.id", ondelete="SET NULL"), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )

@@ -25,6 +25,7 @@ from pydantic import BaseModel
 from app.api.v1.appliance.containers import router as containers_router
 from app.api.v1.appliance.diagnostics import router as diagnostics_router
 from app.api.v1.appliance.fleet import router as fleet_router
+from app.api.v1.appliance.pairing import router as pairing_router
 from app.api.v1.appliance.releases import router as releases_router
 from app.api.v1.appliance.slot import router as slot_router
 from app.api.v1.appliance.system import router as system_router
@@ -44,6 +45,10 @@ router.include_router(fleet_router, prefix="/fleet")
 router.include_router(containers_router, prefix="/containers")
 router.include_router(diagnostics_router, prefix="/diagnostics")
 router.include_router(system_router, prefix="/system")
+# Pairing routes use no nested prefix so the URLs are
+# ``/api/v1/appliance/pairing-codes`` + ``/api/v1/appliance/pair``
+# rather than burying them under a redundant ``/pairing/`` segment.
+router.include_router(pairing_router)
 
 
 class ApplianceInfo(BaseModel):
