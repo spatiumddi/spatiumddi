@@ -57,6 +57,28 @@ The **agent is the same Python codebase** (`spatium_dns_agent`) in both images; 
 
 **Pre-shared bootstrap key (`DNS_AGENT_KEY`) for first-contact registration, then per-server JWT (`agent_token`) issued by the control plane, rotated on each heartbeat.** The existing `/api/v1/dns/agents/register` + `/agents/{id}/heartbeat` endpoints are extended — the current shared-key model is kept as the *bootstrap* step and a token is issued on success.
 
+#### Alternative: short pairing code (#169)
+
+Since 2026.05.13, operators can paste an 8-digit pairing code on
+first boot instead of the 64-char hex key. The agent's resolver
+swaps the code for the real key on first contact via
+``POST /api/v1/appliance/pair``, then continues with the standard
+PSK → JWT bootstrap flow. Resolution priority is:
+
+1. ``DNS_AGENT_KEY`` env var if set (operator-pasted long form
+   wins; lets a re-bootstrap with the explicit key work).
+2. Cached resolved key at ``<state_dir>/bootstrap.key`` (mode 0600)
+   from a previous successful pair — survives ``rm agent_token.jwt``
+   without burning a fresh code.
+3. ``BOOTSTRAP_PAIRING_CODE`` env var → exchanged via ``/pair``,
+   cached for the next run.
+
+A 403 from ``/pair`` (invalid / expired / already used) is fatal —
+``PairingError`` exits the agent so the supervisor surfaces a clear
+error rather than backoff-looping against a dead code. See
+``docs/deployment/APPLIANCE.md §10`` for the end-to-end operator
+workflow.
+
 ### Flow
 
 ```

@@ -1,0 +1,15 @@
+[Unit]
+Description=Watch for SpatiumDDI SNMP config-reload trigger (issue #153)
+Documentation=https://github.com/spatiumddi/spatiumddi/issues/153
+# Skip on the live ISO — snmpd isn't part of the installer environment.
+ConditionKernelCommandLine=!boot=live
+
+[Path]
+# PathChanged fires on close-after-write. The api container (control
+# plane) and the agent containers (fleet hosts) both write this file
+# the same way — atomic .new → mv rename — so the unit only fires once
+# per applied config.
+PathChanged=/var/lib/spatiumddi/release-state/snmp-config-pending
+
+[Install]
+WantedBy=multi-user.target

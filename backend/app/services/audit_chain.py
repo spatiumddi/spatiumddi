@@ -32,7 +32,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import uuid
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any
 
 import structlog
@@ -98,8 +100,24 @@ def compute_audit_hashes(session: Session) -> None:
     if not new_rows:
         return
 
-    # Stable order: timestamp first (already set on every audit row
-    # the codebase produces), id as tie-breaker.
+    # Materialise the Python + server defaults BEFORE we hash. ``id``
+    # uses Python ``default=uuid.uuid4`` and ``timestamp`` uses
+    # ``server_default=now()`` — both fire during SQLAlchemy's flush
+    # phase, AFTER this ``before_flush`` event. Without this step the
+    # hash sees ``id=None`` + ``timestamp=None`` while the DB later
+    # stores real values, and the verifier reports row_hash_mismatch
+    # on every row. Setting the attributes here forces SQLAlchemy to
+    # carry the explicit values through to the INSERT, overriding
+    # both defaults with the same values we just hashed over.
+    now = datetime.now(UTC)
+    for row in new_rows:
+        if row.id is None:
+            row.id = uuid.uuid4()
+        if row.timestamp is None:
+            row.timestamp = now
+
+    # Stable order: timestamp first (now guaranteed set above), id as
+    # tie-breaker.
     new_rows.sort(key=lambda r: (r.timestamp, str(r.id)))
 
     # Transaction-scoped advisory lock; auto-released at COMMIT/ROLLBACK.

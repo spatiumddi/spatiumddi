@@ -31,6 +31,9 @@ from app.models.dns import (
     DNSView,
     DNSZone,
 )
+from app.models.settings import PlatformSettings
+from app.services.appliance.ntp import ntp_bundle
+from app.services.appliance.snmp import snmp_bundle
 from app.services.dns_blocklist import (
     build_effective_for_group,
     build_effective_for_view,
@@ -58,6 +61,14 @@ except ImportError:  # fallback local adapter — same shape as canonical type
         # and fires the local slot-upgrade trigger when its installed
         # version doesn't match. None / absent when no upgrade pending.
         fleet_upgrade: dict[str, Any]
+        # Issue #153 — singleton snmpd.conf body + content hash. Agent
+        # writes a host-side trigger when the hash changes vs. its
+        # last-rendered config; the host's spatiumddi-snmp-reload.path
+        # unit picks the file up + reloads snmpd.
+        snmp_settings: dict[str, Any]
+        # Issue #154 — singleton chrony.conf body + content hash. Same
+        # trigger pipeline as snmp_settings.
+        ntp_settings: dict[str, Any]
 
 
 if TYPE_CHECKING:
@@ -299,6 +310,30 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
         "reboot_requested": server.reboot_requested,
     }
 
+    # Issue #153 — appliance SNMP. Singleton platform_settings drives
+    # snmpd.conf on every fleet host; agent compares the bundle's
+    # ``config_hash`` against its last-rendered hash and writes the
+    # snmp-reload trigger when they differ. Always-present key keeps
+    # the etag stable while SNMP stays disabled.
+    settings_row = await db.get(PlatformSettings, 1)
+    snmp_block: dict[str, Any] = (
+        snmp_bundle(settings_row)
+        if settings_row is not None
+        else {"enabled": False, "config_hash": "", "snmpd_conf": ""}
+    )
+    # Issue #154 — appliance NTP. Same shape as SNMP. chrony is
+    # always running on the appliance (default pool config seeded
+    # by cloud-init), so the agent always has a config_hash to
+    # compare against. The fields default to ``pool pool.ntp.org``
+    # so a fresh install produces the same bytes the baseline
+    # chrony.conf shipped — agent stamps the hash sidecar on first
+    # apply and stays idempotent thereafter.
+    ntp_block: dict[str, Any] = (
+        ntp_bundle(settings_row)
+        if settings_row is not None
+        else {"enabled": False, "allow_clients": False, "config_hash": "", "chrony_conf": ""}
+    )
+
     bundle_body: dict[str, Any] = {
         "server_id": str(server.id),
         "driver": server.driver,
@@ -312,6 +347,8 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
         "pending_record_ops": pending_ops,
         "catalog": catalog_block,
         "fleet_upgrade": fleet_upgrade_block,
+        "snmp_settings": snmp_block,
+        "ntp_settings": ntp_block,
     }
 
     # Structural fingerprint excludes records and pending ops so record-only

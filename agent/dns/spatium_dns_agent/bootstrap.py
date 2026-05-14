@@ -1,6 +1,10 @@
 """Bootstrap / registration loop for the DNS agent.
 
 Attempts the cached JWT first; on 401 falls back to PSK registration.
+The PSK itself is resolved through ``pairing.resolve_bootstrap_key``
+— operator may supply either the long ``DNS_AGENT_KEY`` directly or
+the short ``BOOTSTRAP_PAIRING_CODE`` (#169 Phase 3) which the agent
+swaps for the real key on first boot.
 """
 
 from __future__ import annotations
@@ -14,6 +18,7 @@ import structlog
 
 from .cache import load_or_create_agent_id, load_token, save_token
 from .config import AgentConfig
+from .pairing import resolve_bootstrap_key
 
 log = structlog.get_logger(__name__)
 
@@ -34,8 +39,22 @@ def _client(cfg: AgentConfig) -> httpx.Client:
 
 
 def register(cfg: AgentConfig) -> tuple[str, str, dict]:
-    """Perform PSK bootstrap. Returns (agent_id, token, response_body)."""
+    """Perform PSK bootstrap. Returns (agent_id, token, response_body).
+
+    The bootstrap key is resolved lazily — env var wins; if unset we
+    fall back to a cached resolved key, then to a one-shot pairing
+    code exchange (#169 Phase 3). The resolver raises
+    ``PairingError`` on a dead code so the agent process exits with
+    a clear error rather than backoff-looping forever.
+    """
     agent_id = load_or_create_agent_id(cfg.state_dir)
+    bootstrap_key = resolve_bootstrap_key(
+        explicit_key=cfg.dns_agent_key,
+        pairing_code=cfg.bootstrap_pairing_code,
+        state_dir=cfg.state_dir,
+        hostname=cfg.server_name,
+        client_factory=lambda: _client(cfg),
+    )
     body = {
         "hostname": cfg.server_name,
         "driver": cfg.driver,
@@ -52,7 +71,7 @@ def register(cfg: AgentConfig) -> tuple[str, str, dict]:
                 resp = c.post(
                     "/api/v1/dns/agents/register",
                     json=body,
-                    headers={"X-DNS-Agent-Key": cfg.dns_agent_key},
+                    headers={"X-DNS-Agent-Key": bootstrap_key},
                 )
             if resp.status_code == 200:
                 data = resp.json()
@@ -63,7 +82,9 @@ def register(cfg: AgentConfig) -> tuple[str, str, dict]:
                     pending_approval=data.get("pending_approval", False),
                 )
                 return agent_id, data["agent_token"], data
-            log.warning("register_failed", status=resp.status_code, body=resp.text[:400])
+            log.warning(
+                "register_failed", status=resp.status_code, body=resp.text[:400]
+            )
         except httpx.HTTPError as e:
             log.warning("register_http_error", error=str(e))
         # jittered backoff, cap 5 min

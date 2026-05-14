@@ -1,0 +1,18 @@
+[Unit]
+Description=Apply pending SpatiumDDI snmpd config (issue #153)
+Documentation=https://github.com/spatiumddi/spatiumddi/issues/153
+# Defensive — the runner writes to /etc/snmp/snmpd.conf and
+# /etc/nftables.d/50-spatium-snmp.nft, both of which need the
+# /etc overlay (Phase 8a, lower=/usr/lib/etc.image,
+# upper=/var/persist/etc) mounted so the writes land on the
+# /var-backed upper layer and persist across A/B slot swaps. The
+# .path unit's trigger file lives under /var/lib/spatiumddi which
+# isn't available until local-fs.target either.
+After=etc.mount local-fs.target
+Requires=etc.mount
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/spatiumddi-snmp-reload
+# No Install section — only invoked by the matching .path unit, never
+# directly enabled at boot.

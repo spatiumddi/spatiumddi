@@ -191,8 +191,11 @@ The `spatiumddi-firstboot.service` systemd unit runs after
 `cloud-final.service`:
 
 1. Generates `/etc/spatiumddi/.env` (POSTGRES_PASSWORD, SECRET_KEY,
-   CREDENTIAL_ENCRYPTION_KEY, DNS_AGENT_KEY, DHCP_AGENT_KEY) on first
-   run only — preserved across reboots.
+   CREDENTIAL_ENCRYPTION_KEY, DNS_AGENT_KEY, DHCP_AGENT_KEY,
+   BOOTSTRAP_PAIRING_CODE) on first run only — preserved across
+   reboots. ``BOOTSTRAP_PAIRING_CODE`` carries the operator-supplied
+   8-digit code from the installer through to the agent containers
+   on Phase 6 role-split agent appliances (see §10).
 2. `docker-compose pull` (first run) + `docker-compose up -d`.
 3. Polls `http://127.0.0.1:8000/health/live` for up to 5 min.
 
@@ -514,3 +517,67 @@ OPENIPAM_APPLIANCE_MODE=true     # Enables appliance-specific UI flows
 OPENIPAM_UPDATE_CHANNEL=stable
 OPENIPAM_LICENSE_ACCEPTED=false  # Must be true to complete first-boot
 ```
+
+---
+
+## 10. Joining an agent appliance to a control plane
+
+Phase 6 role-split appliances (``dns-agent-bind9`` / ``dns-agent-powerdns``
+/ ``dhcp-agent``) need a control-plane URL + a bootstrap secret on
+first boot. The installer wizard offers two methods at the
+**Bootstrap method** prompt:
+
+### Pairing code (recommended) — issue #169
+
+The control-plane operator generates a short-lived 8-digit code on
+the web UI; the agent's installer prompts for that code instead of
+the long ``DNS_AGENT_KEY`` / ``DHCP_AGENT_KEY`` hex string.
+
+1. On the control plane, open **Appliance → Pairing**.
+2. Click **New pairing code**, pick the agent kind (DNS / DHCP /
+   DNS+DHCP for combined boxes), optionally pre-assign a server
+   group, set the expiry (default 15 min, max 1 h), click
+   **Generate code**.
+3. The 8 digits appear in a large monospace box with a live
+   countdown + copy button. Write them down or copy them to a
+   second device.
+4. On the agent appliance's installer console, pick **Pairing code**
+   at the **Bootstrap method** radio, paste/type the 8 digits.
+5. The installer validates ``^[0-9]{8}$`` locally (won't accept a
+   typo) and writes ``BOOTSTRAP_PAIRING_CODE=<digits>`` to
+   ``/etc/spatiumddi/role-config``. ``spatiumddi-firstboot`` copies
+   it to ``/etc/spatiumddi/.env`` so docker-compose surfaces it in
+   the agent container's environment.
+6. On first contact, the agent POSTs
+   ``/api/v1/appliance/pair {code, hostname}``; the control plane
+   atomically marks the code claimed + returns the real bootstrap
+   key. The agent caches the resolved key to
+   ``/var/lib/spatium-<dns|dhcp>-agent/bootstrap.key`` (mode 0600)
+   so subsequent re-registrations don't need a fresh code.
+7. The console dashboard's **Pairing** row (on agent-role
+   appliances) shows ``Paired ✓`` (green), ``Pairing in progress…``
+   /  ``Registering…`` (yellow), or ``Pair failed — regenerate
+   code on control plane`` (red).
+
+Codes are single-use + time-bound. ``deployment_kind="both"`` returns
+both DNS + DHCP bootstrap keys in one consume call — useful for a
+combined BIND9 + Kea agent box (future ``agent`` install role,
+issue #170).
+
+### Bootstrap key (advanced)
+
+For re-installs, air-gapped sites, or cases where a pairing code
+expired before the installer reached its prompt. Operator pastes
+the long 64-char hex key. Reveal it on the control plane via
+**Settings → Security → Agent bootstrap keys** (password
+re-confirm + audit row).
+
+### Which to use
+
+| Scenario | Recommended |
+|---|---|
+| First install of a new agent | Pairing code |
+| Re-install / replacement hardware | Bootstrap key |
+| Air-gapped site with the key saved out-of-band | Bootstrap key |
+| Cloud-init / unattended installs | ``BOOTSTRAP_PAIRING_CODE`` env (cloud-init) or the key |
+| Pairing code expired between generation and install | Bootstrap key, or generate a new code |

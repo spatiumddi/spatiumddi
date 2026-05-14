@@ -2749,6 +2749,64 @@ export interface PlatformSettings {
   lockout_threshold: number;
   lockout_duration_minutes: number;
   lockout_reset_minutes: number;
+  /** Appliance SNMP (issue #153). Toggle + version pick + sysContact /
+   *  sysLocation are straightforward; community + v3 user passes are
+   *  redacted on the wire (``*_set`` booleans), with write-only
+   *  ``snmp_community`` + per-user ``auth_pass`` / ``priv_pass`` on
+   *  the update payload. ``snmp_v3_users`` carries the read shape
+   *  on response, write shape on update. */
+  snmp_enabled: boolean;
+  snmp_version: SnmpVersion;
+  snmp_community_set: boolean;
+  /** Write-only — Fernet-encrypted server-side. Set to a non-empty
+   *  string to store; set to "" to clear; omit to leave unchanged. */
+  snmp_community?: string;
+  /** Read shape on response; on update, send the new full list with
+   *  per-user ``auth_pass`` / ``priv_pass`` semantics (None = leave,
+   *  "" = clear, non-empty = encrypt + replace). */
+  snmp_v3_users: SnmpV3User[];
+  snmp_allowed_sources: string[];
+  snmp_sys_contact: string;
+  snmp_sys_location: string;
+  /** Appliance NTP / chrony (issue #154). No secrets — server
+   *  hostnames are not sensitive, so the read shape and the write
+   *  shape match (no ``*_set`` redaction). */
+  ntp_source_mode: NtpSourceMode;
+  ntp_pool_servers: string[];
+  ntp_custom_servers: NtpCustomServer[];
+  ntp_allow_clients: boolean;
+  ntp_allow_client_networks: string[];
+}
+
+export type NtpSourceMode = "pool" | "servers" | "mixed";
+
+export interface NtpCustomServer {
+  host: string;
+  iburst: boolean;
+  prefer: boolean;
+}
+
+export type SnmpVersion = "v2c" | "v3";
+export type SnmpAuthProtocol = "none" | "MD5" | "SHA";
+export type SnmpPrivProtocol = "none" | "DES" | "AES";
+
+/** Read shape — the server never returns the ciphertext. */
+export interface SnmpV3User {
+  username: string;
+  auth_protocol: SnmpAuthProtocol;
+  auth_pass_set: boolean;
+  priv_protocol: SnmpPrivProtocol;
+  priv_pass_set: boolean;
+}
+
+/** Write shape — passes are plaintext on the wire (TLS); None / omit
+ *  preserves the existing ciphertext for the same username; "" clears. */
+export interface SnmpV3UserWrite {
+  username: string;
+  auth_protocol: SnmpAuthProtocol;
+  auth_pass?: string | null;
+  priv_protocol: SnmpPrivProtocol;
+  priv_pass?: string | null;
 }
 
 export interface PasswordPolicy {
@@ -2867,6 +2925,17 @@ export const settingsApi = {
   getDefaults: () =>
     api
       .get<Partial<PlatformSettings>>("/settings/defaults")
+      .then((r) => r.data),
+  /** Issue #153 — reveal the configured SNMP v2c community after a
+   *  password re-verify. Superadmin + local-auth only; every reveal
+   *  is audit-logged. ``community`` is null when nothing is
+   *  configured (in which case ``configured`` is false). */
+  revealSnmpCommunity: (password: string) =>
+    api
+      .post<{
+        configured: boolean;
+        community: string | null;
+      }>("/settings/snmp/reveal-community", { password })
       .then((r) => r.data),
   getOUIStatus: () =>
     api.get<OUIStatus>("/settings/oui/status").then((r) => r.data),
@@ -6965,6 +7034,65 @@ export const applianceFleetApi = {
     api
       .post<FleetAgentRow>(`/appliance/fleet/${kind}/${server_id}/reboot`)
       .then((r) => r.data),
+};
+
+// ── Appliance: pairing codes (issue #169) ──────────────────────────
+// Short-lived 8-digit codes the agent installer swaps for the real
+// DNS_AGENT_KEY / DHCP_AGENT_KEY bootstrap key. The cleartext code is
+// returned exactly once in the create response — the list endpoint
+// only ever surfaces the last two digits.
+// ``both`` mints a single code that hands back both DNS + DHCP
+// bootstrap keys on consume — for an appliance running BIND9 + Kea
+// simultaneously.
+export type PairingDeploymentKind = "dns" | "dhcp" | "both";
+export type PairingCodeState = "pending" | "claimed" | "expired" | "revoked";
+
+export interface PairingCodeCreate {
+  deployment_kind: PairingDeploymentKind;
+  server_group_id?: string | null;
+  expires_in_minutes?: number;
+  note?: string | null;
+}
+
+export interface PairingCodeCreated {
+  id: string;
+  // 8-digit cleartext code. Shown once on create + never persisted.
+  code: string;
+  deployment_kind: PairingDeploymentKind;
+  server_group_id: string | null;
+  note: string | null;
+  expires_at: string;
+  created_at: string;
+}
+
+export interface PairingCodeRow {
+  id: string;
+  code_last_two: string;
+  deployment_kind: PairingDeploymentKind;
+  server_group_id: string | null;
+  server_group_name: string | null;
+  note: string | null;
+  state: PairingCodeState;
+  expires_at: string;
+  used_at: string | null;
+  used_by_ip: string | null;
+  used_by_hostname: string | null;
+  revoked_at: string | null;
+  created_at: string;
+  created_by_user_id: string | null;
+}
+
+export const appliancePairingApi = {
+  list: (params: { include_terminal?: boolean } = {}) =>
+    api
+      .get<{ codes: PairingCodeRow[] }>("/appliance/pairing-codes", { params })
+      .then((r) => r.data),
+  create: (body: PairingCodeCreate) =>
+    api
+      .post<PairingCodeCreated>("/appliance/pairing-codes", body)
+      .then((r) => r.data),
+  revoke: (id: string) =>
+    api.delete<void>(`/appliance/pairing-codes/${id}`).then((r) => r.data),
 };
 
 // ── Appliance: container management (Phase 4d) ─────────────────────

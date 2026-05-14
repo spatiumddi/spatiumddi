@@ -1,7 +1,14 @@
 from app.models.acme import ACMEAccount
 from app.models.ai import AIChatMessage, AIChatSession, AIProvider
 from app.models.alerts import AlertEvent, AlertRule
-from app.models.appliance import ApplianceCertificate
+from app.models.appliance import (
+    PAIRING_KIND_BOTH,
+    PAIRING_KIND_DHCP,
+    PAIRING_KIND_DNS,
+    PAIRING_KINDS,
+    ApplianceCertificate,
+    PairingCode,
+)
 from app.models.asn import ASN, ASNRpkiRoa, BGPCommunity, BGPPeering
 from app.models.audit import AuditLog
 from app.models.audit_forward import AuditForwardTarget
@@ -101,6 +108,11 @@ __all__ = [
     "AlertRule",
     "AlertEvent",
     "ApplianceCertificate",
+    "PairingCode",
+    "PAIRING_KIND_DNS",
+    "PAIRING_KIND_DHCP",
+    "PAIRING_KIND_BOTH",
+    "PAIRING_KINDS",
     "ASN",
     "ASNRpkiRoa",
     "BGPCommunity",

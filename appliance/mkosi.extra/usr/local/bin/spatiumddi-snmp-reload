@@ -1,0 +1,233 @@
+#!/bin/bash
+# spatiumddi-snmp-reload — host-side snmpd config-apply runner
+# (issue #153).
+#
+# The api / agent container writes
+# /var/lib/spatiumddi/release-state/snmp-config-pending whenever the
+# control plane's rendered snmpd.conf body changes vs. what's been
+# applied here. File format (no JSON to keep the runner dependency-
+# free):
+#   line 1:    "enabled" | "disabled"
+#   line 2:    sha256 hex of the body (blank when disabled)
+#   line 3+:   rendered /etc/snmp/snmpd.conf body
+#
+# Apply flow when enabled:
+#   1. Extract body, write to /tmp staging
+#   2. ``snmpd -t -C -c <tmp>`` (config syntax check); abort on fail
+#   3. systemctl stop snmpd (if running)
+#   4. rm /var/lib/snmp/snmpd.conf so createUser lines re-run fresh
+#   5. Atomically swap /etc/snmp/snmpd.conf
+#   6. systemctl enable --now snmpd
+#   7. Verify it's up; write the hash sidecar + status sidecar
+#
+# Apply flow when disabled:
+#   1. systemctl disable --now snmpd (idempotent)
+#   2. Truncate /etc/snmp/snmpd.conf to a "managed off" stub
+#   3. Write the hash sidecar (empty) + status sidecar (stopped)
+#
+# Persistence across A/B slot swaps (Phase 8a, issue #138):
+#
+# Every file the runner touches lives on either the persistent
+# /var partition or the /etc overlay's upper layer (which IS on
+# /var/persist/etc). Concretely:
+#
+#   /etc/snmp/snmpd.conf            → /var/persist/etc/snmp/snmpd.conf
+#   /etc/nftables.d/50-spatium-snmp.nft
+#                                   → /var/persist/etc/nftables.d/...
+#   /etc/systemd/system/multi-user.target.wants/snmpd.service
+#                                   → /var/persist/etc/systemd/...
+#                                     (created by ``systemctl enable``)
+#   /var/lib/snmp/snmpd.conf        → on /var directly (USM state,
+#                                     snmpd's authoritative hashed
+#                                     pass store after first start)
+#   /var/lib/spatiumddi/release-state/snmp-config-{hash,status,pending}
+#                                   → on /var directly (agent's
+#                                     idempotency + ack sidecars)
+#
+# So a slot upgrade or rollback preserves operator SNMP config + the
+# firewall hole + snmpd's enable state automatically — no reapply is
+# needed after the reboot. The agent's hash sidecar matches the
+# control plane bundle's config_hash on the first long-poll after
+# reboot and short-circuits the trigger write.
+#
+# Rollback caveat: if an operator rolls back to a slot built BEFORE
+# the SNMP work, the persisted snmpd.conf + nftables drop-in are
+# still on /var but the snmpd binary, .path/.service units, and this
+# runner script don't exist on that older slot. nftables still
+# applies the drop-in (UDP 161 opens at the firewall, harmlessly,
+# since nothing is listening); snmpd just stays down. No data is
+# lost; rolling forward again restores full SNMP operation.
+
+set -euo pipefail
+
+TRIGGER=/var/lib/spatiumddi/release-state/snmp-config-pending
+HASH_SIDECAR=/var/lib/spatiumddi/release-state/snmp-config-hash
+STATUS_SIDECAR=/var/lib/spatiumddi/release-state/snmp-status
+LOG_DIR=/var/log/spatiumddi
+LOG="$LOG_DIR/snmp-reload.log"
+ETC_CONF=/etc/snmp/snmpd.conf
+USM_STATE=/var/lib/snmp/snmpd.conf
+LOCK=/run/spatiumddi-snmp-reload.lock
+# Firewall drop-in — added when SNMP is enabled, removed when disabled.
+# /etc/nftables.conf includes /etc/nftables.d/*.nft so a reload picks
+# the file up without editing the main config.
+NFT_DROPIN=/etc/nftables.d/50-spatium-snmp.nft
+
+mkdir -p "$LOG_DIR" "$(dirname "$HASH_SIDECAR")" "$(dirname "$NFT_DROPIN")"
+exec >> "$LOG" 2>&1
+
+
+# Helper — reload nftables so /etc/nftables.d/ drop-in changes take
+# effect. nftables.service's ExecReload runs ``nft -f /etc/nftables.conf``
+# which flushes + re-applies including the drop-in dir. Best-effort:
+# a failed reload doesn't roll back snmpd, but does log the diagnostic.
+nft_reload() {
+    if systemctl reload nftables.service >/dev/null 2>&1; then
+        echo "  ✓ nftables reloaded"
+    else
+        echo "  ! nftables reload failed (snmpd may be unreachable until next boot)"
+        systemctl status nftables.service --no-pager 2>&1 | sed 's/^/      /' | head -10 || true
+    fi
+}
+echo
+echo "[$(date -Iseconds)] === spatiumddi-snmp-reload fired ==="
+
+if [ ! -f "$TRIGGER" ]; then
+    echo "  no trigger file at $TRIGGER, nothing to do"
+    exit 0
+fi
+
+# Serialise concurrent invocations — the .path unit fires once per
+# write, but operator-driven reapplies + agent retries could overlap.
+exec 9>"$LOCK"
+if ! flock -n 9; then
+    echo "  another reload in progress, deferring"
+    exit 0
+fi
+
+MARKER=$(sed -n '1p' "$TRIGGER" | tr -d '\r\n')
+HASH=$(sed -n '2p' "$TRIGGER" | tr -d '\r\n')
+TMP_BODY=$(mktemp /tmp/spatium-snmpd.conf.XXXXXX)
+trap 'rm -f "$TMP_BODY"' EXIT
+tail -n +3 "$TRIGGER" > "$TMP_BODY"
+
+echo "  marker:    $MARKER"
+echo "  hash:      ${HASH:-<empty>}"
+echo "  body size: $(wc -c < "$TMP_BODY") bytes"
+
+case "$MARKER" in
+    enabled)
+        # Validate syntax against snmpd -C -c (don't fall back to the
+        # system path; the operator-supplied body is the only thing
+        # under test here). ``snmpd -H`` is the help flag that exits
+        # 0 after dumping options; we use it as a quick "does snmpd
+        # exist?" check before the real syntax test.
+        if ! command -v snmpd >/dev/null 2>&1; then
+            echo "  ✗ snmpd binary not found — is net-snmp installed?"
+            echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
+            mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
+            exit 1
+        fi
+        # ``-t`` tests config + exits, ``-C`` ignores the default conf
+        # paths so only our staging file is checked.
+        if ! snmpd -t -C -c "$TMP_BODY" >/tmp/spatium-snmpd-validate.log 2>&1; then
+            echo "  ✗ snmpd -t failed for staged config:"
+            sed 's/^/      /' /tmp/spatium-snmpd-validate.log
+            echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
+            mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
+            exit 1
+        fi
+        echo "  ✓ snmpd -t passed"
+
+        # Stop snmpd cleanly so the createUser lines we're about to
+        # ship are read fresh on next start. Ignore failure when the
+        # service was never enabled — first-time apply.
+        systemctl stop snmpd >/dev/null 2>&1 || true
+        # Wipe the persisted USM state. snmpd rewrites this file on
+        # startup from createUser lines in /etc/snmp/snmpd.conf; if we
+        # leave the old hashed entries in place a rotated pass won't
+        # be honoured.
+        rm -f "$USM_STATE"
+
+        # Atomic swap. Owner root, group root, mode 0640 — snmpd reads
+        # as the snmp user but the file may contain plaintext community
+        # strings, so block other-world reads.
+        install -o root -g root -m 0640 "$TMP_BODY" "$ETC_CONF"
+
+        if ! systemctl enable --now snmpd; then
+            echo "  ✗ systemctl enable --now snmpd failed"
+            echo "stopped" > "$STATUS_SIDECAR"
+            echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
+            mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
+            exit 1
+        fi
+        # Brief wait + active-state probe. systemctl returns 0 the
+        # moment the unit transitions to "starting"; we want to catch
+        # the case where snmpd reaches start-up but exits with an
+        # error within the first couple of seconds.
+        sleep 2
+        if systemctl is-active --quiet snmpd; then
+            echo "  ✓ snmpd is active"
+            # Open UDP 161 in the host firewall. snmpd does its own
+            # source-CIDR filtering (rocommunity <comm> <CIDR>); the
+            # firewall rule is intentionally not source-restricted
+            # here so v3 + v2c share the same plumbing. Operators
+            # who want extra defence-in-depth can drop a more-
+            # restrictive *.nft in /etc/nftables.d/ themselves.
+            # Note: /etc/nftables.conf's ``include "/etc/nftables.d/*.nft"``
+            # lives INSIDE the input chain definition, so this file
+            # must contain a chain-rule fragment (``udp dport 161
+            # accept``), not a top-level ``add rule …`` directive.
+            # Verified on Debian trixie: ``add rule inet filter
+            # input …`` 422s the reload with
+            # ``syntax error, unexpected rule, expecting @ or '$'``.
+            cat > "$NFT_DROPIN" <<'EOF'
+# Managed by spatiumddi-snmp-reload — do not edit manually.
+# SpatiumDDI SNMP is currently enabled; this rule opens UDP 161
+# inbound. Removed automatically when SNMP is disabled via the UI.
+udp dport 161 accept
+EOF
+            chmod 0644 "$NFT_DROPIN"
+            nft_reload
+            echo "running" > "$STATUS_SIDECAR"
+            echo "$HASH" > "$HASH_SIDECAR"
+            echo "done $(date -Iseconds)" > "${TRIGGER}.state"
+            mv "$TRIGGER" "${TRIGGER}.done.$(date +%s)"
+        else
+            echo "  ✗ snmpd not active after start"
+            systemctl status snmpd --no-pager | sed 's/^/      /' || true
+            echo "stopped" > "$STATUS_SIDECAR"
+            echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
+            mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
+            exit 1
+        fi
+        ;;
+    disabled)
+        systemctl disable --now snmpd >/dev/null 2>&1 || true
+        # Leave a "managed off" stub so an operator who SSHes in sees
+        # the source-of-truth note rather than a stale runtime config.
+        cat > "$ETC_CONF" <<'EOF'
+# Managed by SpatiumDDI — SNMP is currently disabled.
+# To enable, toggle Settings → Appliance → SNMP in the SpatiumDDI UI.
+EOF
+        chown root:root "$ETC_CONF"
+        chmod 0640 "$ETC_CONF"
+        # Close UDP 161 in the host firewall (idempotent — file
+        # might not exist on the very first apply).
+        if [ -f "$NFT_DROPIN" ]; then
+            rm -f "$NFT_DROPIN"
+            nft_reload
+        fi
+        echo "stopped" > "$STATUS_SIDECAR"
+        : > "$HASH_SIDECAR"
+        echo "  ✓ snmpd stopped + disabled, config stubbed, firewall closed"
+        echo "done $(date -Iseconds)" > "${TRIGGER}.state"
+        mv "$TRIGGER" "${TRIGGER}.done.$(date +%s)"
+        ;;
+    *)
+        echo "  ✗ unknown marker line: ${MARKER:-<empty>}"
+        echo "failed $(date -Iseconds)" > "${TRIGGER}.state"
+        mv "$TRIGGER" "${TRIGGER}.failed.$(date +%s)"
+        exit 1
+        ;;
+esac

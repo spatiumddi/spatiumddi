@@ -2,7 +2,10 @@ import { useQuery } from "@tanstack/react-query";
 import {
   Activity,
   Box,
+  Clock,
   Container as ContainerIcon,
+  Gauge,
+  KeyRound,
   Network,
   ScrollText,
   Server,
@@ -18,7 +21,10 @@ import { FleetTab } from "./FleetTab";
 import { LogsTab } from "./LogsTab";
 import { MaintenanceTab } from "./MaintenanceTab";
 import { NetworkTab } from "./NetworkTab";
+import { NTPTab } from "./NTPTab";
+import { PairingTab } from "./PairingTab";
 import { ReleasesTab } from "./ReleasesTab";
+import { SNMPTab } from "./SNMPTab";
 
 /**
  * SpatiumDDI OS appliance management hub (issue #134, Phase 4).
@@ -39,6 +45,9 @@ type Tab =
   | "tls"
   | "releases"
   | "fleet"
+  | "pairing"
+  | "snmp"
+  | "ntp"
   | "containers"
   | "logs"
   | "network"
@@ -61,32 +70,15 @@ interface TabSpec {
   selfOnly?: boolean;
 }
 
+// ── IMPORTANT: keep this array sorted alphabetically by ``label`` ────
+// Tabs render in the order they appear here. Operators expect a
+// stable alphabetised list across releases (otherwise a new tab
+// landing somewhere in the middle visually shuffles every adjacent
+// label). When adding a new tab, slot it in by alphabetical position
+// rather than appending at the bottom. The list intentionally
+// includes selfOnly tabs in the same sort order — hiding them on
+// docker / k8s control planes happens at render time, not here.
 const TABS: TabSpec[] = [
-  {
-    key: "tls",
-    label: "Web UI Certificate",
-    phase: "4b",
-    icon: ShieldCheck,
-    selfOnly: true,
-    summary:
-      "Upload an existing certificate + key, generate a CSR, or have the appliance issue a Let's Encrypt cert against a public DNS name. Reuses the existing ACME service (app/services/acme/).",
-  },
-  {
-    key: "releases",
-    label: "Releases",
-    phase: "4c",
-    icon: Box,
-    summary:
-      "GitHub Releases list with one-click pull-and-recycle, a rollback target picker, and the release notes inline so operators see what they're applying before they apply it.",
-  },
-  {
-    key: "fleet",
-    label: "OS Versions",
-    phase: "8f",
-    icon: Server,
-    summary:
-      "Manage the OS version on this appliance and every registered DNS + DHCP agent from one screen. The pinned self row at the top opens the full A/B slot detail (versions per slot, apply log, rollback) in a modal — same machinery the per-row Upgrade button uses for remote agents. Roll a release out to multiple agents at once via the checkbox column + 'Apply to selected'. Docker / k8s rows show copy-paste commands instead.",
-  },
   {
     key: "containers",
     label: "Containers",
@@ -106,15 +98,6 @@ const TABS: TabSpec[] = [
       'System log viewer wired to journalctl, the "Run self-test" health-check button (DNS resolution + DHCP issuance + web reachability), and the "Download diagnostic bundle" one-click zip with secrets redacted.',
   },
   {
-    key: "network",
-    label: "Network & Host",
-    phase: "4f",
-    icon: Network,
-    selfOnly: true,
-    summary:
-      "Hostname, NTP, DNS resolvers, IPv4/IPv6 mode (DHCP vs static, with the wizard's same form), nftables drop-in editor for /etc/nftables.d/, SSH key upload, proxy config, and a reboot-pending banner.",
-  },
-  {
     key: "maintenance",
     label: "Maintenance",
     phase: "4f",
@@ -122,6 +105,80 @@ const TABS: TabSpec[] = [
     selfOnly: true,
     summary:
       "Maintenance-mode toggle that drains DNS/DHCP traffic before letting the operator perform host work, plus reboot / shutdown buttons with confirmation prompts so accidental clicks don't take an appliance offline.",
+  },
+  {
+    key: "network",
+    label: "Network & Host",
+    phase: "4f",
+    icon: Network,
+    selfOnly: true,
+    summary:
+      "Hostname, DNS resolvers, IPv4/IPv6 mode (DHCP vs static, with the wizard's same form), nftables drop-in editor for /etc/nftables.d/, SSH key upload, proxy config, and a reboot-pending banner.",
+  },
+  {
+    // Issue #154 — fleet-wide chrony config (singleton
+    // platform_settings drives every appliance host). Not selfOnly:
+    // hybrid deployments (docker / k8s control plane with appliance
+    // agents in the fleet) still need to configure NTP for those
+    // agents; the form shows a "chrony is only on appliance hosts"
+    // banner explaining what runs where.
+    key: "ntp",
+    label: "NTP",
+    phase: "154",
+    icon: Clock,
+    summary:
+      "Configure chrony on every appliance host. Pool / unicast servers / mixed; optional NTP-server mode that opens UDP 123 inbound for isolated networks. Rendered chrony.conf ships through the ConfigBundle long-poll, validated host-side before activation, reloaded without a daemon restart.",
+  },
+  {
+    key: "fleet",
+    label: "OS Versions",
+    phase: "8f",
+    icon: Server,
+    summary:
+      "Manage the OS version on this appliance and every registered DNS + DHCP agent from one screen. The pinned self row at the top opens the full A/B slot detail (versions per slot, apply log, rollback) in a modal — same machinery the per-row Upgrade button uses for remote agents. Roll a release out to multiple agents at once via the checkbox column + 'Apply to selected'. Docker / k8s rows show copy-paste commands instead.",
+  },
+  {
+    // Issue #169 — short-lived pairing codes that replace hand-typed
+    // DNS_AGENT_KEY / DHCP_AGENT_KEY entry on the agent installer.
+    // Not selfOnly: a docker / k8s control plane still mints codes
+    // for its remote appliance agents.
+    key: "pairing",
+    label: "Pairing",
+    phase: "169",
+    icon: KeyRound,
+    summary:
+      "Mint short-lived single-use 8-digit codes that an agent installer swaps for the real bootstrap key. Operators no longer have to retype the 64-char hex key over IPMI / Proxmox consoles. Phase 1+2 (this tab) ships the mint + table; Phase 4 wires the installer wizard so the workflow is one-click on both ends.",
+  },
+  {
+    key: "releases",
+    label: "Releases",
+    phase: "4c",
+    icon: Box,
+    summary:
+      "GitHub Releases list with one-click pull-and-recycle, a rollback target picker, and the release notes inline so operators see what they're applying before they apply it.",
+  },
+  {
+    // Issue #153 — fleet-wide config (singleton platform_settings
+    // drives every appliance host's snmpd), so not selfOnly. On
+    // docker / k8s control planes the SNMP form is visible with a
+    // banner explaining the local control plane doesn't run snmpd
+    // but the settings still flow to any registered appliance agents
+    // (hybrid topology).
+    key: "snmp",
+    label: "SNMP",
+    phase: "153",
+    icon: Gauge,
+    summary:
+      "Configure snmpd on every appliance host — local + every registered remote agent. v2c with community + source-CIDR allowlist, or v3 USM with per-user auth/priv. Rendered snmpd.conf ships through the ConfigBundle long-poll, validated host-side before activation. Disabled by default — operators opt in here.",
+  },
+  {
+    key: "tls",
+    label: "Web UI Certificate",
+    phase: "4b",
+    icon: ShieldCheck,
+    selfOnly: true,
+    summary:
+      "Upload an existing certificate + key, generate a CSR, or have the appliance issue a Let's Encrypt cert against a public DNS name. Reuses the existing ACME service (app/services/acme/).",
   },
 ];
 
@@ -223,6 +280,12 @@ export function AppliancePage() {
           <ReleasesTab applianceMode={isApplianceHost} />
         ) : effectiveTab === "fleet" ? (
           <FleetTab />
+        ) : effectiveTab === "pairing" ? (
+          <PairingTab />
+        ) : effectiveTab === "snmp" ? (
+          <SNMPTab />
+        ) : effectiveTab === "ntp" ? (
+          <NTPTab />
         ) : effectiveTab === "containers" ? (
           <ContainersTab />
         ) : effectiveTab === "logs" ? (

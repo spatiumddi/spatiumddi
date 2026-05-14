@@ -43,6 +43,8 @@ for unit in docker.service chrony.service ssh.service \
             spatiumddi-slot-upgrade.path \
             spatiumddi-slot-rollback.path \
             spatiumddi-reboot-agent.path \
+            spatiumddi-snmp-reload.path \
+            spatiumddi-chrony-reload.path \
             spatium-install.service \
             spatium-live-banner.service \
             spatium-live-bootstrap.service \
@@ -66,6 +68,16 @@ for unit in docker.service chrony.service ssh.service \
     fi
     ln -sfn "$src" "$BUILDROOT/etc/systemd/system/multi-user.target.wants/$unit"
 done
+
+# Issue #153 — snmpd is installed but NOT auto-started. The Debian
+# net-snmp package's postinst symlinks snmpd.service into
+# multi-user.target.wants by default; we remove that here so the
+# fresh appliance comes up with snmpd inactive. Operator opts in via
+# Settings → Appliance → SNMP in the UI, which writes the
+# snmp-config-pending trigger; the runner then does
+# ``systemctl enable --now snmpd``. Disable (not mask) so the
+# runner's enable+start works without an unmask step.
+rm -f "$BUILDROOT/etc/systemd/system/multi-user.target.wants/snmpd.service"
 
 # Mask systemd-networkd so it doesn't fight NetworkManager for
 # the same interfaces. The package stays installed (it ships in
@@ -193,6 +205,12 @@ chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-slot-rollback"
 chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-reboot-agent"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-reboot-agent.path"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-reboot-agent.service"
+chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-snmp-reload"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-snmp-reload.path"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-snmp-reload.service"
+chmod 0755 "$BUILDROOT/usr/local/bin/spatiumddi-chrony-reload"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-chrony-reload.path"
+chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-chrony-reload.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-reboot.path"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatiumddi-reboot.service"
 chmod 0644 "$BUILDROOT/etc/systemd/system/spatium-console.service"

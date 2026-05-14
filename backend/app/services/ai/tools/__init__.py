@@ -22,10 +22,13 @@ from app.services.ai.tools import (  # noqa: F401, E402
     network,
     network_modeling,
     nmap,
+    ntp,
     observability,
     ops,
     ownership,
+    pairing,
     proposals,
+    snmp,
     vendor,
     whois,
 )

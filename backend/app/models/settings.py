@@ -350,6 +350,68 @@ class PlatformSettings(Base):
         Boolean, nullable=False, default=False, server_default=sa_text("false")
     )
 
+    # ── Appliance SNMP support (issue #153) ─────────────────────────
+    # snmpd runs at the Debian host level on the appliance image, not
+    # in a container — HOST-RESOURCES-MIB needs unfiltered /proc + /sys
+    # which a containerised snmpd can't see cleanly. The columns here
+    # are the singleton source of truth that every appliance host
+    # (local + remote agents) renders ``/etc/snmp/snmpd.conf`` from
+    # via the Phase 8f-4 ConfigBundle → trigger-file pipeline.
+    # ``snmp_community_encrypted`` mirrors the fingerbank shape — Fernet
+    # ciphertext bytes, NULL = not configured. ``snmp_v3_users`` keeps
+    # encrypted passes inline (URL-safe-base64 ciphertext, the string
+    # form Fernet emits) so the JSONB shape stays JSON-friendly.
+    snmp_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
+    snmp_version: Mapped[str] = mapped_column(
+        String(8), nullable=False, default="v2c", server_default=sa_text("'v2c'")
+    )
+    snmp_community_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+    snmp_v3_users: Mapped[list[dict]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=sa_text("'[]'::jsonb")
+    )
+    snmp_allowed_sources: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=sa_text("'[]'::jsonb")
+    )
+    snmp_sys_contact: Mapped[str] = mapped_column(
+        String(255), nullable=False, default="", server_default=sa_text("''")
+    )
+    snmp_sys_location: Mapped[str] = mapped_column(
+        String(255), nullable=False, default="", server_default=sa_text("''")
+    )
+
+    # ── Appliance NTP support (issue #154) ──────────────────────────
+    # chrony runs at the Debian host level on every appliance host.
+    # ``ntp_source_mode`` selects between the public pool default
+    # (cloud-init seeds pool.ntp.org), operator-supplied unicast
+    # servers (air-gapped sites), or a mix. ``ntp_custom_servers`` is
+    # a list of ``{host, iburst, prefer}`` dicts; ``iburst`` speeds
+    # initial sync, ``prefer`` tags a canonical source. No Fernet
+    # encryption — NTP server hostnames are not sensitive (unlike
+    # the SNMP community in #153). ``ntp_allow_clients`` plus
+    # ``ntp_allow_client_networks`` turn the appliance into a
+    # time server for the listed CIDRs and open UDP 123 inbound
+    # via the same ``/etc/nftables.d/`` drop-in pattern.
+    ntp_source_mode: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="pool", server_default=sa_text("'pool'")
+    )
+    ntp_pool_servers: Mapped[list[str]] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=lambda: ["pool.ntp.org"],
+        server_default=sa_text("'[\"pool.ntp.org\"]'::jsonb"),
+    )
+    ntp_custom_servers: Mapped[list[dict]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=sa_text("'[]'::jsonb")
+    )
+    ntp_allow_clients: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa_text("false")
+    )
+    ntp_allow_client_networks: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=sa_text("'[]'::jsonb")
+    )
+
     # ── Aggregation candidate snooze (issue #114) ───────────────────
     # Operator-driven hide-list for the IPAM aggregation badge popover.
     # Keys are stable per-candidate hashes derived from the parent

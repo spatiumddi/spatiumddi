@@ -282,6 +282,10 @@ services:
       # pattern as the rest of the stack.
       CONTROL_PLANE_URL: ${CONTROL_PLANE_URL:-http://api:8000}
       DNS_AGENT_KEY: ${DNS_AGENT_KEY}
+      # #169 Phase 4 — operator may have pasted a short pairing code
+      # instead of the long key. The agent's Phase 3 resolver picks
+      # whichever is non-empty (explicit key wins when both are set).
+      BOOTSTRAP_PAIRING_CODE: ${BOOTSTRAP_PAIRING_CODE:-}
       SERVER_NAME: ${APPLIANCE_HOSTNAME:-dns-bind9}
       # Phase 6 — operator picks the group at install time; firstboot
       # writes ``AGENT_GROUP`` into .env. Default keeps the AIO box
@@ -330,6 +334,8 @@ services:
     environment:
       CONTROL_PLANE_URL: ${CONTROL_PLANE_URL:-http://api:8000}
       DNS_AGENT_KEY: ${DNS_AGENT_KEY}
+      # #169 Phase 4 — see dns-bind9 above for the rationale.
+      BOOTSTRAP_PAIRING_CODE: ${BOOTSTRAP_PAIRING_CODE:-}
       SERVER_NAME: ${APPLIANCE_HOSTNAME:-dns-powerdns}
       # Default differs from bind9 — group features (DNSSEC sign/
       # unsign, ALIAS, LUA, catalog zones) gate on every server in
@@ -368,6 +374,10 @@ services:
       # the remote control-plane URL to CONTROL_PLANE_URL in .env.
       SPATIUM_API_URL: ${CONTROL_PLANE_URL:-http://127.0.0.1:8000}
       SPATIUM_AGENT_KEY: ${DHCP_AGENT_KEY}
+      # #169 Phase 4 — operator may have pasted a short pairing code
+      # instead of the long key. The agent's Phase 3 resolver picks
+      # whichever is non-empty (explicit key wins when both are set).
+      BOOTSTRAP_PAIRING_CODE: ${BOOTSTRAP_PAIRING_CODE:-}
       SPATIUM_SERVER_NAME: ${APPLIANCE_HOSTNAME:-dhcp-kea}
       AGENT_GROUP: ${AGENT_GROUP:-default}
       AGENT_ROLES: primary

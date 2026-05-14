@@ -112,6 +112,7 @@ if [ ! -f "$ENV_FILE" ]; then
     INSTALL_CONTROL_PLANE_URL=""
     INSTALL_DNS_AGENT_KEY=""
     INSTALL_DHCP_AGENT_KEY=""
+    INSTALL_BOOTSTRAP_PAIRING_CODE=""
     INSTALL_AGENT_GROUP=""
     if [ -f /etc/spatiumddi/role-config ]; then
         # shellcheck disable=SC1091
@@ -119,6 +120,12 @@ if [ ! -f "$ENV_FILE" ]; then
         INSTALL_CONTROL_PLANE_URL="$CONTROL_PLANE_URL"
         INSTALL_DNS_AGENT_KEY="$DNS_AGENT_KEY"
         INSTALL_DHCP_AGENT_KEY="$DHCP_AGENT_KEY"
+        # #169 Phase 4 — operator may have chosen to paste a short
+        # pairing code instead of the long agent key. Empty when the
+        # operator went the long-key route; the agent honours
+        # whichever is non-empty (with the long key winning when
+        # both are set, per the Phase 3 resolver).
+        INSTALL_BOOTSTRAP_PAIRING_CODE="${BOOTSTRAP_PAIRING_CODE:-}"
         INSTALL_AGENT_GROUP="$AGENT_GROUP"
     fi
 
@@ -133,11 +140,16 @@ if [ ! -f "$ENV_FILE" ]; then
     # agent modes we re-use whatever the operator pasted at install
     # time (writing nothing for the OTHER agent's key — the unused
     # service won't run, so an empty value is harmless).
+    # BOOTSTRAP_PAIRING_CODE only flows on agent roles — the control
+    # / control-only roles ARE the control plane (they hand out
+    # pairing codes; they don't claim them). Default empty.
+    BOOTSTRAP_PAIRING_CODE_VAL=""
     case "$ROLE" in
         dns-agent-bind9)
             COMPOSE_PROFILES_VAL="dns-bind9,agent"
             DNS_AGENT_KEY_VAL="$INSTALL_DNS_AGENT_KEY"
             DHCP_AGENT_KEY_VAL=""
+            BOOTSTRAP_PAIRING_CODE_VAL="$INSTALL_BOOTSTRAP_PAIRING_CODE"
             CONTROL_PLANE_URL_VAL="$INSTALL_CONTROL_PLANE_URL"
             AGENT_GROUP_VAL="${INSTALL_AGENT_GROUP:-default}"
             ;;
@@ -145,6 +157,7 @@ if [ ! -f "$ENV_FILE" ]; then
             COMPOSE_PROFILES_VAL="dns-powerdns,agent"
             DNS_AGENT_KEY_VAL="$INSTALL_DNS_AGENT_KEY"
             DHCP_AGENT_KEY_VAL=""
+            BOOTSTRAP_PAIRING_CODE_VAL="$INSTALL_BOOTSTRAP_PAIRING_CODE"
             CONTROL_PLANE_URL_VAL="$INSTALL_CONTROL_PLANE_URL"
             AGENT_GROUP_VAL="${INSTALL_AGENT_GROUP:-default-powerdns}"
             ;;
@@ -152,6 +165,7 @@ if [ ! -f "$ENV_FILE" ]; then
             COMPOSE_PROFILES_VAL="dhcp,agent"
             DNS_AGENT_KEY_VAL=""
             DHCP_AGENT_KEY_VAL="$INSTALL_DHCP_AGENT_KEY"
+            BOOTSTRAP_PAIRING_CODE_VAL="$INSTALL_BOOTSTRAP_PAIRING_CODE"
             CONTROL_PLANE_URL_VAL="$INSTALL_CONTROL_PLANE_URL"
             AGENT_GROUP_VAL="${INSTALL_AGENT_GROUP:-default}"
             ;;
@@ -193,6 +207,7 @@ SECRET_KEY=$(gen_hex 32)
 CREDENTIAL_ENCRYPTION_KEY=$(gen_fernet)
 DNS_AGENT_KEY=${DNS_AGENT_KEY_VAL}
 DHCP_AGENT_KEY=${DHCP_AGENT_KEY_VAL}
+BOOTSTRAP_PAIRING_CODE=${BOOTSTRAP_PAIRING_CODE_VAL}
 COMPOSE_PROFILES=${COMPOSE_PROFILES_VAL}
 CONTROL_PLANE_URL=${CONTROL_PLANE_URL_VAL}
 AGENT_GROUP=${AGENT_GROUP_VAL}

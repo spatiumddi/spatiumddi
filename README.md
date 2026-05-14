@@ -161,7 +161,7 @@ SpatiumDDI is built on nights and weekends with no commercial backing — every 
 | 🛡 | **TOTP MFA** | local-user 2FA — QR enrolment via `pyotp` + `qrcode` · single-use backup codes · admin force-disable per user (audit-logged) |
 | 🔐 | **Local-auth hardening** | configurable **password policy** (min length · per-class complexity · history depth · max-age) · **account lockout** after N failed logins inside a rolling window (default off; opt-in in Settings) · **active session viewer + force-logout** at `/admin/sessions` — every login carries a `jti` claim that resolves to a `UserSession` row, flip `revoked=True` to 401 the in-flight token on its next call |
 | 🏷 | **Subnet classification tags** | `pci_scope` · `hipaa_scope` · `internet_facing` first-class boolean columns on every subnet · indexed predicates · compliance roll-up card on Platform Insights · feeds the compliance-change alert + conformity policy filters |
-| 🤖 | **Operator Copilot (AI)** | grounded chat over your live IPAM / DNS / DHCP / Network data — multi-vendor (OpenAI / Anthropic / Azure OpenAI / Gemini / OpenAI-compat for Ollama, vLLM, etc.) with automatic failover · **91 tools** spanning IPAM, DNS (records / pools / blocklists / views), DHCP (pools / statics / classes / option templates / PXE / MAC blocks), network modeling (ASNs / VRFs / circuits / services / overlays / domains), ownership (customers / sites / providers), admin (users / groups / roles), integration mirrors (K8s / Docker / Proxmox / Tailscale / UniFi), observability (DNS query / DHCP activity / metrics / global search), and Apply-gated write proposals (`propose_create_ip_address` / `propose_create_dns_record` / `propose_create_dhcp_static` / `propose_create_alert_rule` / `propose_run_nmap_scan` / `propose_archive_session`) · MCP HTTP endpoint for Claude Desktop / Cursor / Cline · "Ask AI about this" affordances on every resource · per-provider editable system prompt · per-provider tool allowlist · OUI vendor enrichment baked in · live nmap results in chat · per-message token / latency footer · Markdown + GFM tables in replies · daily digest |
+| 🤖 | **Operator Copilot (AI)** | grounded chat over your live IPAM / DNS / DHCP / Network data — multi-vendor (OpenAI / Anthropic / Azure OpenAI / Gemini / OpenAI-compat for Ollama, vLLM, etc.) with automatic failover · **101 tools** spanning IPAM, DNS (records / pools / blocklists / views), DHCP (pools / statics / classes / option templates / PXE / MAC blocks), network modeling (ASNs / VRFs / circuits / services / overlays / domains), ownership (customers / sites / providers), admin (users / groups / roles), integration mirrors (K8s / Docker / Proxmox / Tailscale / UniFi), observability (DNS query / DHCP activity / metrics / global search), and Apply-gated write proposals (`propose_create_ip_address` / `propose_create_dns_record` / `propose_create_dhcp_static` / `propose_create_alert_rule` / `propose_run_nmap_scan` / `propose_archive_session`) · MCP HTTP endpoint for Claude Desktop / Cursor / Cline · "Ask AI about this" affordances on every resource · per-provider editable system prompt · per-provider tool allowlist · OUI vendor enrichment baked in · live nmap results in chat · per-message token / latency footer · Markdown + GFM tables in replies · daily digest |
 | 🔔 | **Alerts + forwarding** | rule-based alerts · `compliance_change` rule type (PCI / HIPAA / internet-facing audit-log scanner with 24 h auto-resolve, three disabled seed rules) · multi-target syslog (RFC 5424 / CEF / LEEF / RFC 3164) · HTTP webhooks · SMTP email · Slack / Teams / Discord chat |
 | 📑 | **Conformity evaluations** | declarative policy library scheduled against PCI-DSS / HIPAA / SOC2 frameworks · 6 starter check kinds (`has_field` · `in_separate_vrf` · `no_open_ports` · `alert_rule_covers` · `last_seen_within` · `audit_log_immutable`) · 8 disabled seed policies, opt-in toggle · pass→fail transitions emit alert events · auditor-facing PDF export with SHA-256 integrity hash · `Auditor` + `Compliance Editor` builtin roles |
 | 🪝 | **Typed-event webhooks** | 96 typed events (resource × verb) · HMAC-SHA256 signed · outbox-backed retry with backoff + dead-letter |
@@ -508,7 +508,7 @@ The tables above are the elevator pitch. The bullets here are the same surface w
   - **Pre-flight backup as warn-only with override** — if no enabled backup target exists, `POST /system/factory-reset/execute` returns 412 unless the operator passes `acknowledge_no_backup=true`. The Backup admin tab surfaces the warning + checkbox up front
   - UI lives as a third tab on the Backup admin page (after Manual + Destinations) — backup snapshots state, factory reset wipes it, two ends of the same lifecycle. Per-section cards in a 2-col grid + red-bordered "Reset everything" card. Modal gates the password field on a green-border phrase match
 
-- 🤖 **Operator Copilot** — AI assistant grounded in your live IPAM / DNS / DHCP / Network data. Hosted-API or fully on-prem (Ollama). One provider config, **91 tools**, real conversations about your network.
+- 🤖 **Operator Copilot** — AI assistant grounded in your live IPAM / DNS / DHCP / Network data. Hosted-API or fully on-prem (Ollama). One provider config, **101 tools**, real conversations about your network.
 
   **Provider + model**
 
@@ -519,7 +519,7 @@ The tables above are the elevator pitch. The bullets here are the same surface w
   - **Reasoning-channel fallback** — `qwen3.5` / DeepSeek-R1 / o1 / o3 family that route their answer to `reasoning` instead of `content` are handled transparently by the driver
   - **Ollama context-window forwarding** — driver forwards `options.num_ctx` / `num_predict` / `extra_body` so Ollama respects the configured context window. Operators can also set `OLLAMA_CONTEXT_LENGTH` env var on the server side (recommended); without one or the other, Ollama silently truncates to 2048 tokens and small models hallucinate tool names from a half-cut tool list
 
-  **Tool registry (91 tools)**
+  **Tool registry (101 tools)**
 
   Each tool is gated by both the `feature_module` it belongs to (`integrations.unifi` off → UniFi tool disappears from the registry) and an admin-controlled per-tool allowlist at **Admin → AI → Tools**, so operators can trim what the model can see without touching code. Every tool can also be flipped per-provider via the AI Provider modal's Tools tab — the right call for small Ollama models that struggle with 91 tool schemas.
 
@@ -529,6 +529,7 @@ The tables above are the elevator pitch. The bullets here are the same surface w
   - **Network modeling (17)** — `list_asns` + `get_asn` (RDAP holder, RPKI ROAs, BGP peerings), `list_domains` (registrar / expiry / DNSSEC / NS drift), `list_vrfs` (RDs + RTs + ASN linkage), `list_circuits` (transport + bandwidth + cost + endpoints), `trace_circuit_impact` (down-circuit blast radius across services + sites), `list_network_services` + `get_network_service_summary` (service-catalog deliverables — MPLS L3VPN, etc.), `list_overlay_networks` + `get_overlay_topology` (SD-WAN sites + policies), `list_application_categories` (RFC 4594 DSCP catalog), `list_network_devices`, `find_switchport`, `ping_host`, `list_nmap_scans`, `get_nmap_scan_results`, `propose_run_nmap_scan`
   - **Ownership (4)** — `list_customers`, `list_sites`, `list_providers`, `get_customer_summary` (per-customer rollup of subnets / blocks / spaces / circuits / services / ASNs / zones / domains / overlays in one call)
   - **Admin (3)** — `list_users`, `list_groups`, `list_roles` (superadmin-gated inline; the orchestrator returns an error dict for non-admins)
+  - **Appliance fleet config (3)** — `find_snmp_settings`, `find_ntp_settings`, `find_pairing_codes`. All three superadmin-gated; pairing codes also redact the cleartext code + sha256 hash, only the last two digits ever leave the database. No `propose_*` write companions by design — the create response for a pairing code carries the cleartext code, which we don't want in chat transcripts
   - **Backup + factory-reset (3)** — `list_backup_targets` (every configured destination with last-run state, schedule, retention; `config` blob deliberately omitted so destination credentials stay out of the LLM context), `list_backup_archives_at_target` (calls the driver's `list_archives` so the result matches the Backup admin Archives drawer), `find_backup_audit_history` (windowed timeline of backup_created / target-run-success/failed / backup_restored / factory_reset_performed audit rows). All three superadmin-gated. **No `propose_*` writes by design** — restore + factory-reset are password-gated + confirm-phrase-gated, an LLM intermediary in "should I restore?" adds friction without value
   - **Integration mirrors (5)** — `list_kubernetes_targets`, `list_docker_targets`, `list_proxmox_targets`, `list_tailscale_targets`, `list_unifi_targets` (each tagged with the matching `integrations.*` module so disabling the integration removes the tool in lock-step with the sidebar entry; credentials never enter the response)
   - **Ops, observability + audit (18)** — `list_alerts`, `list_alert_rules`, `get_audit_history`, `audit_walk` (paginated chronology), `current_state` (platform health snapshot), `query_dns_query_log`, `query_dhcp_activity_log`, `query_logs`, `get_dns_query_rate` / `get_dhcp_lease_rate` (24-bucket timeseries), `global_search`, `lookup_whois_asn` / `lookup_whois_domain` / `lookup_whois_ip`, `tls_cert_check`, `help_write_permission`, `propose_create_alert_rule`, `propose_archive_session`
@@ -750,44 +751,108 @@ Record changes propagate to BIND9 via RFC 2136 — typically sub-second, no daem
 
 ### Quick start with the OS appliance ISO
 
-If you'd rather skip the Docker setup entirely, SpatiumDDI ships a self-contained OS appliance image — Debian 13 with the full stack pre-installed. Boot it, run a five-question installer, and you're on HTTPS with all the SpatiumDDI services running. No prior Docker or Linux setup required.
+Prefer to skip Docker setup entirely? SpatiumDDI ships a self-contained
+OS appliance image — Debian 13 with the full stack pre-installed. Boot
+it, answer the installer's questions, and you're on HTTPS with
+everything running. No prior Docker or Linux experience needed.
 
-**Get the ISO:**
+#### Get the ISO
 
-- Each [GitHub release](https://github.com/spatiumddi/spatiumddi/releases) attaches `spatiumddi-appliance-<version>.iso` (~440 MB, hybrid USB/CD).
-- Or build from source: `make appliance && make appliance-iso` produces the ISO in `appliance/build/`. See [`docs/deployment/APPLIANCE.md`](docs/deployment/APPLIANCE.md) for the build prerequisites.
+- **Pre-built:** grab `spatiumddi-appliance-<version>.iso` (~440 MB
+  hybrid USB/CD) from the
+  [latest release](https://github.com/spatiumddi/spatiumddi/releases).
+- **Build from source:** `make appliance-dev-iso` produces an ISO in
+  `appliance/build/`. See
+  [`docs/deployment/APPLIANCE.md`](docs/deployment/APPLIANCE.md) for
+  prerequisites.
 
-**Install:**
+#### Install
 
-1. Attach the ISO as a CD-ROM in your hypervisor (Proxmox / VMware / Hyper-V / QEMU) or `dd` it to a USB stick for bare metal.
-2. Boot it. The live ISO drops you into a Proxmox-style whiptail wizard — pick a target disk, hostname, admin password, DHCP-or-static network, and timezone.
-3. The wizard partitions the disk (GPT: BIOS Boot + ESP + ext4 root), `rsync`s the live rootfs onto it, installs GRUB for both BIOS and UEFI, and reboots.
-4. First boot brings up the SpatiumDDI stack (api, worker, beat, postgres, redis, frontend) and auto-generates a self-signed TLS cert. Total time: ~2-5 minutes.
+1. Attach the ISO as a CD-ROM in your hypervisor (Proxmox / VMware /
+   Hyper-V / QEMU), or `dd` it to a USB stick for bare metal.
+2. Boot. The installer asks for **role** (control plane all-in-one,
+   control-only, or one of the agent roles), **target disk**,
+   **hostname**, **admin password**, **network** (DHCP or static), and
+   **timezone**.
+3. For agent roles, the wizard also asks for a **control plane URL**
+   and a **bootstrap method** — see the next section.
+4. The installer partitions, copies the system, installs GRUB, and
+   reboots. First boot finishes in 2-5 minutes.
 
-**Access:**
+#### Access
 
-Browse to `https://<appliance-ip>/`. Your browser will warn about the self-signed cert — accept once, then sign in with `admin / admin` (forces password change on first login). Plain HTTP gets 301-redirected to HTTPS.
+Browse to `https://<appliance-ip>/`. Accept the self-signed cert
+warning, then sign in with `admin / admin` — you'll be forced to set
+a real password on first login.
 
-**Appliance management (`/appliance`):**
+#### Joining DNS / DHCP agents
 
-The appliance ships with a dedicated management hub in the sidebar covering everything an OS-level operator needs without an SSH session:
+For distributed deployments where DNS and DHCP live on separate boxes,
+the installer offers role-split appliances (`dns-agent-bind9`,
+`dns-agent-powerdns`, `dhcp-agent`). Each agent needs a bootstrap
+secret to register with the control plane. Two ways to provide it:
 
-- **Web UI Certificate** — replace the self-signed cert: paste a PEM cert + key, generate a CSR (key stays on the server) and import the signed cert, or upload a Let's Encrypt cert. Activating a cert hot-reloads nginx.
-- **Releases** — list recent GitHub releases, one-click upgrade — the host-side path-unit recycles the stack so the api can recreate itself cleanly.
-- **OS Versions** — unified table in `/appliance` (merges the per-box OS Image + per-fleet Fleet tabs that lived separately pre-2026.05.13-1). The local appliance pins at the top as a `SELF` row with a left-border accent + chip; clicking **Manage…** opens the full A/B slot detail (per-slot versions, apply log, rollback) in a modal. Every registered DNS + DHCP agent sits below with the same Upgrade / Manual-upgrade / **Reboot** affordances. Bulk-select checkboxes on appliance rows + "Apply to selected" modal fires the upgrade in parallel across every checked row — each agent does its own dd on its own inactive slot so there's no fleet-wide outage. State column reads `ready` (green chip + CheckCircle2 icon) when the agent is healthy + no pending work; `in-flight` (blue) while a slot dd runs; `done` (green) when a recent apply finished; `failed` (red) on apply errors, auto-healing back to `ready` once the failure has been observed (the `.failed.<ts>` sidecar stays on disk for forensic lookup). Docker / k8s rows get a Manual upgrade modal with copy-paste `docker compose pull && up -d` / `helm upgrade … --set image.tag=…` commands instead, since they have no A/B partition to dd into. The `/appliance` sidebar entry is now always visible — on docker / k8s control planes the host-level tabs (TLS, Containers, Logs, Network, Maintenance) hide automatically but Releases + OS Versions stay reachable, so operators with appliance *agents* registered against a docker/k8s control plane can still drive fleet upgrades (hybrid topology).
-- **OS Image atomic A/B upgrade (per-box detail)** — Phase 8 (issue [#138](https://github.com/spatiumddi/spatiumddi/issues/138)). Reached via the **Manage…** button on the OS Versions table's SELF row. The installer carves two equal-sized root partitions (`root_A` + `root_B`); the appliance always boots one slot while the other sits idle. The card shows two per-slot panels with colour-coded role badges (🟢 BOOTED, 🔵 DEFAULT, 🟠 TARGET, 🟡 TRIAL) and the installed `APPLIANCE_VERSION` on each slot. Pick a release tag from the dropdown (sourced from GitHub Releases) — the slot `.raw.xz` + sha256 URLs derive automatically. Apply writes to the *inactive* slot via dd while the active slot is untouched (with `tune2fs -U random` between dd and the grub.cfg patch so the freshly-written slot gets a unique filesystem UUID — a re-apply would otherwise leave both slots with identical UUIDs and wedge `set-next-boot`), arms grub `next_entry` as one-shot, and on the next reboot `/health/live` confirms before grub-set-default commits the swap. The GRUB boot menu labels carry the per-slot version too (`SpatiumDDI Appliance 2026.05.12-3 (slot A)`), so an operator standing at the menu after a failed health check knows which release is on each slot. Bad image? Reboot reverts automatically. Rollback button flips the durable default back to the previous slot from the same card (no SSH); Reboot-now button on the success banner avoids the trip to Maintenance. Operator state on `/var/persist/etc`, `/var/home`, `/var/root`, and the entire Docker image cache lives on a third persistent `/var` partition that's shared across slots, so a slot swap can't lose user data.
-- **Fleet reboot** — Phase 8f-8 (issue [#138](https://github.com/spatiumddi/spatiumddi/issues/138)). Per-row **Reboot** button on the OS Versions table (only on rows whose `deployment_kind=appliance` — strict gate at every layer so a misclick can't reboot the local docker workstation). Double-confirm modal stays disabled until the operator ticks "I understand <agent name> will go offline for 30-60 s". Backend stamps `reboot_requested=true` on the row → agent's ConfigBundle long-poll picks it up (~30-60 s) → agent writes `/var/lib/spatiumddi-host/release-state/reboot-pending` → host-side `spatiumddi-reboot-agent.{path,service}` unit runs `systemctl reboot` with a 5 s grace window. Heartbeat handler auto-clears the request 15 s after the stamp — by construction post-reboot since a pre-reboot agent can't heartbeat. No more SSH'ing into agent boxes to run `sudo reboot` after a slot upgrade lands.
-- **Fleet upgrade** — Phase 8f (issue [#138](https://github.com/spatiumddi/spatiumddi/issues/138)). Per-row Upgrade button on the OS Versions table stamps the picked release tag on the agent's server row; the agent's ConfigBundle long-poll picks it up and fires the same slot-upgrade trigger the per-box flow uses. Auto-clear on success — the pending chip drops as soon as the agent reports the matching installed version.
-- **Talos-style console dashboard** — Phase 4h. `tty1` and the serial console paint a refresh-on-tick rich + psutil dashboard: per-role identity, vitals (load / mem / swap / uptime / disk), compose service health rollup, journalctl live-log pane, and an F-key strip across the bottom (**F1** Login → agetty for the standard local login / **F2** Monitor → `runuser -u admin -- htop` so the unprivileged operator can see all-system process state but can't ctrl-K root-owned processes from htop's kill menu / **F3** Containers → `docker stats` live resource view / **F4** Network → `nmtui` (NetworkManager) / **F5** Reboot + **F6** Shutdown with confirm modals / **F9** Diag). **F12 Shell removed** — physical-console operators don't get an admin shell that easily; F1 still hands off to the standard login. Active partition slot + durable default + trial-boot chip render in the header so the operator knows which slot they're on at a glance.
-- **NetworkManager network stack** (replaces systemd-networkd as of 2026.05.13-1). The installer wizard's static-IP step writes a keyfile-format `.nmconnection` profile under `/etc/NetworkManager/system-connections/` instead of a `.network` file; `nmtui` from the console F4 key (or `nmcli` over SSH) edits all subsequent connections. systemd-resolved still owns `/etc/resolv.conf` — NM pushes per-interface DNS over D-Bus (`dns=systemd-resolved` in `/etc/NetworkManager/conf.d/10-spatiumddi.conf`). **Migration note for existing installs**: an operator who set a static IP via the installer pre-2026.05.13-1 has `/etc/systemd/network/10-spatium-static.network` in their persistent /etc overlay. After a slot upgrade past 2026.05.13-1, systemd-networkd is masked → the static config goes inert → interface falls back to DHCP. Reconfigure via F4 → nmtui at the console or `nmcli connection add` from SSH.
-- **Containers** — list every container, start/stop/restart, live-stream logs over SSE.
-- **Logs & Diagnostics** — host log viewer (firstboot, update log), self-test runner (DNS / container health / API / DHCP / DNS daemon checks), one-click diagnostic bundle download (secrets redacted).
-- **Network & Host** — read-only hostname / host IPs / uptime / reboot-pending banner.
-- **Maintenance** — maintenance-mode flag + reboot button (10 s grace).
+**Pairing code (recommended).** Easy to type, even over an IPMI /
+serial console.
 
-Operators stuck without a working web UI can still SSH in as the admin user they created during install and use `journalctl -u spatiumddi-firstboot`, `docker compose -f /usr/local/share/spatiumddi/docker-compose.yml ps`, etc.
+1. On the control plane, open **Appliance → Pairing** and click
+   **New pairing code**. Pick the agent kind (DNS / DHCP / DNS + DHCP
+   for combined boxes), an optional server group, and an expiry (15
+   min default).
+2. The UI shows an 8-digit code with a live countdown.
+3. On the agent appliance, pick "Pairing code" at the installer's
+   **Bootstrap method** prompt and type the 8 digits. The agent
+   redeems the code for the real key on first boot and registers
+   itself.
 
-> The appliance is alpha (Phase 4 — issue [#134](https://github.com/spatiumddi/spatiumddi/issues/134)). See [`docs/deployment/APPLIANCE.md`](docs/deployment/APPLIANCE.md) for the full design, build pipeline, and known limitations.
+**Bootstrap key (advanced).** For re-installs, air-gapped sites with a
+saved key, or when a pairing code expired before you got to the
+installer. Reveal the 64-char hex key on the control plane via
+**Settings → Security → Agent bootstrap keys** and paste it.
+
+The console dashboard's **Pairing** row shows whether the agent has
+paired successfully — green ✓ when registered, yellow while in
+progress, red with a regenerate-the-code hint on failure.
+
+#### Managing the appliance
+
+The **Appliance** section in the sidebar groups everything you'd
+otherwise need SSH for:
+
+- **OS Versions** — atomic A/B slot upgrades for this appliance and
+  every registered remote agent. Pick a release, optionally bulk-
+  select agents, click Apply. Failed upgrades auto-revert on the
+  next reboot; rollback is a single click.
+- **Pairing** — generate single-use codes to onboard agents (see
+  above).
+- **Releases** — GitHub releases list with one-click container-stack
+  upgrades.
+- **Web UI Certificate** — replace the self-signed cert with a
+  pasted PEM + key, an in-server CSR, or a Let's Encrypt cert.
+- **NTP** — chrony config that propagates to every registered
+  agent appliance.
+- **SNMP** — read-only monitoring access (v2c with community + CIDR
+  allowlist, or v3 USM).
+- **Containers** — start / stop / restart, live SSE log streaming.
+- **Logs & Diagnostics** — journal viewer, self-test runner,
+  one-click diagnostic bundle (secrets redacted).
+- **Maintenance** — drain traffic, reboot, shutdown.
+
+The **console dashboard** on the appliance's physical or serial
+console shows live vitals, container health, and a journalctl tail.
+F-keys give you local-login (F1), htop (F2), `docker stats` (F3),
+`nmtui` for networking (F4), and confirmed reboot / shutdown
+(F5 / F6).
+
+Stuck without a working web UI? SSH in as the OS admin user you
+created during install and check `journalctl -u spatiumddi-firstboot`
+or
+`docker compose -f /usr/local/share/spatiumddi/docker-compose.yml ps`.
+
+> The appliance is alpha — see issue
+> [#134](https://github.com/spatiumddi/spatiumddi/issues/134) for the
+> roadmap and [`docs/deployment/APPLIANCE.md`](docs/deployment/APPLIANCE.md)
+> for the full design, build pipeline, and known limitations.
 
 ### API & interactive docs
 

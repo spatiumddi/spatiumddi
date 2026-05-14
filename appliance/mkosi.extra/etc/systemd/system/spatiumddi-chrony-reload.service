@@ -1,0 +1,16 @@
+[Unit]
+Description=Apply pending SpatiumDDI chrony config (issue #154)
+Documentation=https://github.com/spatiumddi/spatiumddi/issues/154
+# Defensive ordering — the runner writes /etc/chrony/chrony.conf and
+# /etc/nftables.d/50-spatium-ntp.nft, both of which need the /etc
+# overlay (Phase 8a) mounted so the writes land on the /var-backed
+# upper layer. The trigger file lives under /var/lib/spatiumddi
+# which isn't available until local-fs.target either.
+After=etc.mount local-fs.target
+Requires=etc.mount
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/spatiumddi-chrony-reload
+# No Install section — only invoked by the matching .path unit, never
+# directly enabled at boot.

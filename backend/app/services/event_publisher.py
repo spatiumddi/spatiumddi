@@ -144,6 +144,16 @@ _SPECIAL_EVENT_MAP: dict[tuple[str, str], str] = {
     ("activate_certificate", "appliance_certificate"): "appliance.tls.activated",
     ("generate_csr", "appliance_certificate"): "appliance.tls.csr_generated",
     ("import_signed_cert", "appliance_certificate"): "appliance.tls.csr_signed",
+    # Appliance pairing-code lifecycle (issue #169 Phase 5). Maps the
+    # audit ``action`` strings to clean event names downstream
+    # subscribers can pattern-match on — e.g. wire a Slack webhook to
+    # ``appliance.pairing_code.claimed`` to celebrate the moment a new
+    # agent finishes joining. ``consume_denied`` is deliberately left
+    # out: it's high-frequency noise (every wrong-code attempt fires
+    # one) and operators who actually want it can read the audit log.
+    ("appliance.pairing_code_created", "pairing_code"): "appliance.pairing_code.created",
+    ("appliance.pairing_code_claimed", "pairing_code"): "appliance.pairing_code.claimed",
+    ("appliance.pairing_code_revoked", "pairing_code"): "appliance.pairing_code.revoked",
 }
 
 

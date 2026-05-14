@@ -77,6 +77,30 @@ class SyncLoop:
 
                     if maybe_fire_reboot(True):
                         log.info("fleet_reboot_triggered_from_cache")
+                # Issue #153 — same cache-driven evaluation for the
+                # SNMP config block. ``maybe_fire_snmp_reload`` is
+                # itself idempotent (compares the bundle's config_hash
+                # to the on-disk sidecar) so this call is safe even
+                # when the prior run already applied the same config.
+                snmp_block = bundle.get("snmp_settings")
+                if snmp_block:
+                    from .slot_state import maybe_fire_snmp_reload
+
+                    if maybe_fire_snmp_reload(snmp_block):
+                        log.info(
+                            "snmp_reload_triggered_from_cache",
+                            config_hash=snmp_block.get("config_hash"),
+                        )
+                # Issue #154 — same shape for NTP / chrony.
+                ntp_block = bundle.get("ntp_settings")
+                if ntp_block:
+                    from .slot_state import maybe_fire_ntp_reload
+
+                    if maybe_fire_ntp_reload(ntp_block):
+                        log.info(
+                            "ntp_reload_triggered_from_cache",
+                            config_hash=ntp_block.get("config_hash"),
+                        )
                 # Push the rendered tree once at bootstrap so operators
                 # get a Config-tab snapshot the moment the agent comes
                 # up — without this, the snapshot only lands on the
@@ -175,6 +199,27 @@ class SyncLoop:
             from .slot_state import maybe_fire_reboot
             if maybe_fire_reboot(True):
                 log.info("fleet_reboot_triggered")
+        # Issue #153 — SNMP config rollout. Same pattern: agent reads
+        # the rendered snmpd.conf body + content hash from the bundle,
+        # fires the snmp-config-pending trigger when the hash differs
+        # from what's been applied on this host.
+        snmp_block = bundle.get("snmp_settings")
+        if snmp_block:
+            from .slot_state import maybe_fire_snmp_reload
+            if maybe_fire_snmp_reload(snmp_block):
+                log.info(
+                    "snmp_reload_triggered",
+                    config_hash=snmp_block.get("config_hash"),
+                )
+        # Issue #154 — NTP / chrony config rollout. Identical shape.
+        ntp_block = bundle.get("ntp_settings")
+        if ntp_block:
+            from .slot_state import maybe_fire_ntp_reload
+            if maybe_fire_ntp_reload(ntp_block):
+                log.info(
+                    "ntp_reload_triggered",
+                    config_hash=ntp_block.get("config_hash"),
+                )
 
         # Re-render + reload daemon ONLY when structural fingerprint changes.
         # Record CRUD bumps the full etag but not structural_etag, so the
