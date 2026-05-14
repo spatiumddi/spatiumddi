@@ -22,6 +22,291 @@ the formatter handles the rest.
 
 ## Unreleased
 
+## 2026.05.14-1 — 2026-05-14
+
+Big-feature release closing out two appliance arcs back-to-back.
+**Pairing codes (#169)** replace the 64-char hex bootstrap key on the
+agent installer with a single-use 8-digit code minted on the control
+plane — operators no longer have to read a wall of hex over an IPMI /
+serial console. The arc ships in five phases across the same release:
+Phase 1 lays the backend (``pairing_code`` table, four endpoints —
+create / list / revoke + the unauthenticated ``/api/v1/appliance/pair``
+consume — Celery beat reaper, four audit event types, a superadmin-
+gated ``find_pairing_codes`` MCP tool, 15 pytest cases); Phase 2 ships
+the ``Appliance → Pairing`` tab (card-style radio for kind, generate
+modal with copy + live countdown + regenerate loop, table with state
+chips and an idempotent revoke action) and adds a third
+``deployment_kind="both"`` returning DNS + DHCP keys in one consume
+call for combined-agent boxes; Phase 3 wires both DNS + DHCP agents to
+accept ``BOOTSTRAP_PAIRING_CODE`` alongside the long PSK env via a
+three-tier resolver (explicit env > cached resolved key on disk >
+pairing-code exchange) with fatal-on-403 semantics so a dead code
+doesn't crash-loop; Phase 4 lands the installer wizard ``Bootstrap
+method`` radio (Pairing code recommended / Bootstrap key advanced),
+the firstboot env propagation, and a colour-coded ``Pairing`` row on
+the console dashboard (Paired ✓ green / Registering… or Pairing in
+progress… yellow / Pair failed — regenerate code red); Phase 5 adds
+docs + three new typed webhook events (``appliance.pairing_code.created
+/.claimed / .revoked``) and switches the Pairing tab to adaptive
+polling (2 s when at least one pending code exists, 15 s when idle).
+**SNMP support (#153)** lands the second big feature: snmpd runs at
+the OS level on every appliance host — local + every registered remote
+agent — driven by a ``platform_settings`` singleton that ships through
+the ConfigBundle long-poll, with both v2c (community + source-CIDR
+allowlist) and v3 USM (per-user auth/priv) modes, a host-side
+``spatium-snmp-reload`` runner that validates with ``snmpd -t`` before
+atomic install, automatic nftables UDP 161 drop-in management when the
+SNMP toggle flips, and an ``A/B persistence contract`` documented in
+the runner header so the config survives slot swaps via the ``/etc``
+overlay → ``/var/persist/etc``. The Settings → Security page grows a
+password-confirm Reveal flow for the SNMP community string mirroring
+the agent-bootstrap-keys pattern. The SNMP page lives under
+``/appliance`` (not Settings, where it landed first then moved per
+operator feedback) so all fleet-rollout config sits together. SNMP is
+disabled by default — operators opt in. Also fixes **audit-log
+tamper-detection false positive (#73)** that hit every install: the
+``before_flush`` event listener was hashing ``id=None`` +
+``timestamp=None`` because both columns' SQLAlchemy defaults
+(``default=uuid.uuid4`` for id, ``server_default=now()`` for
+timestamp) fire AFTER the ``before_flush`` event, not before — so
+runtime hashes never matched what Postgres later persisted, and the
+verifier reported ``row_hash_mismatch`` on every row. Fixed by pre-
+populating both defaults before computing the hash, with a one-shot
+data migration (``d4f8c91a2e35``) walking every existing
+``audit_log`` row in ``seq`` order and re-hashing with the current
+populated values so post-upgrade ``verify_chain`` reports
+``ok=True``. Plus polish: the Appliance tabs are now sorted
+alphabetically (Containers / Logs / Maintenance / Network / NTP / OS
+Versions / Pairing / Releases / SNMP / Web UI Certificate) with a
+keep-this-sorted note in the file so future tab additions stay
+alphabetical; the **Releases** tab collapses anything older than the
+top 3 behind a ``▶ Show N older releases`` disclosure (with a
+``installed: <tag>`` chip on the disclosure summary when the
+currently-running version sits in the older bucket) so the tab stays
+scannable after a project ships dozens of releases; the **README**'s
+``Quick start with the OS appliance ISO`` section is rewritten from a
+single CLAUDE.md-style mega-paragraph into five skimmable sub-sections
+with hard-wrapped lines (~70-80 chars), gaining a ``Joining DNS / DHCP
+agents`` sub-section that documents the pairing-code workflow as the
+recommended path; and a follow-up fix on the agent container
+entrypoints (caught live on a fresh agent appliance install) relaxes
+the ``DNS_AGENT_KEY:?`` / ``SPATIUM_AGENT_KEY:?`` pre-check across
+bind9 / powerdns / kea so a container booted with only
+``BOOTSTRAP_PAIRING_CODE`` doesn't crash-loop before the Python
+resolver runs.
+
+### Added
+
+- **Appliance pairing codes (#169).** Short-lived (default 15 min,
+  max 1 h) single-use 8-digit codes that replace the long hex
+  bootstrap key on the agent installer. End-to-end arc:
+  - Backend ``pairing_code`` table (migration ``e2c91d5f7a48``;
+    follow-up ``f8a92c1d3b65`` widens the CHECK constraint to accept
+    ``deployment_kind='both'``) with sha256 ``code_hash`` (unique
+    indexed for O(log n) consume lookup) + ``code_last_two`` (UX
+    affordance) + polymorphic ``server_group_id`` (UUID, no FK
+    — disambiguated by kind) + ``expires_at`` / ``used_at`` /
+    ``revoked_at`` lifecycle columns. Four endpoints under
+    ``/api/v1/appliance``: ``POST /pairing-codes`` (create —
+    superadmin gate, optional pre-assigned ``server_group_id`` and
+    ``note``, refuses if no ``*_AGENT_KEY`` is configured); ``GET
+    /pairing-codes`` (list — superadmin, ``include_terminal`` flag);
+    ``DELETE /pairing-codes/{id}`` (revoke — idempotent on terminal
+    rows); ``POST /pair`` (consume — UNAUTHENTICATED, hash-compare
+    lookup, atomic claim, generic 403 + 500 ms friction-sleep on every
+    failure mode so timing / response shape don't leak whether a code
+    is unknown / expired / claimed / revoked).
+  - Four audit event types: ``appliance.pairing_code_created`` /
+    ``_claimed`` / ``_revoked`` / ``_consume_denied``. Three of those
+    (skipping ``consume_denied`` to avoid scan-noise) map through
+    ``event_publisher._SPECIAL_EVENT_MAP`` to the typed webhook
+    surface so external integrations can subscribe to
+    ``appliance.pairing_code.{created,claimed,revoked}`` (auto-appears
+    in the ``/api/v1/webhooks/event-types`` catalog — total event-type
+    count went 112 → 115).
+  - Superadmin-gated ``find_pairing_codes`` MCP tool with
+    ``module="appliance.pairing"``, ``default_enabled=True``. Filters
+    by ``deployment_kind`` + ``state``, never surfaces the cleartext
+    code or the sha256 hash, only ``code_last_two``. No
+    ``propose_create_pairing_code`` write companion by design — the
+    create response carries cleartext code we don't want in chat
+    transcripts.
+  - Celery beat reaper (``app.tasks.prune_pairing_codes``) sweeps stale
+    rows every 30 min: 30 d claimed / 7 d revoked / 24 h post-grace
+    expired.
+  - Frontend ``Appliance → Pairing`` tab — card-style radio buttons for
+    agent kind (DNS / DHCP / DNS + DHCP), kind-filtered group dropdown
+    (disabled when kind=both with an inline note explaining
+    per-service group configuration is post-registration), expiry
+    select + free-form note, generate-code button. Success view shows
+    the cleartext code in a 3xl monospace box with copy button
+    + live countdown + generate-another loop. Table renders codes
+    with last-2-digits only (``••••••XX``), kind chip (blue DNS /
+    purple DHCP / emerald DNS + DHCP), state chip (pending blue /
+    claimed emerald / expired amber / revoked zinc), per-row revoke
+    via shared ``ConfirmModal``. Adaptive polling: 2 s while at least
+    one pending code exists, 15 s otherwise.
+  - Both DNS + DHCP agents accept ``BOOTSTRAP_PAIRING_CODE`` alongside
+    ``DNS_AGENT_KEY`` / ``SPATIUM_AGENT_KEY``. Three-tier resolver
+    (``pairing.resolve_bootstrap_key``): explicit env key wins; falls
+    back to ``<state_dir>/bootstrap.key`` on disk (mode 0600, cached
+    from a previous successful pair so re-bootstraps survive ``rm
+    agent_token.jwt`` without burning a fresh code); falls back to
+    pairing-code exchange. 403 / wrong-kind / no-inputs are fatal —
+    ``PairingError`` exits the agent so the supervisor surfaces a
+    clear error rather than backoff-looping against a dead code. 7
+    pytest cases per agent.
+  - ``spatium-install`` whiptail wizard grows a ``Bootstrap method``
+    radio (Pairing code recommended / Bootstrap key advanced) with
+    ``^[0-9]{8}$`` validation + retry-on-typo loop. Operator's
+    chosen value flows through ``/etc/spatiumddi/role-config`` →
+    firstboot's ``BOOTSTRAP_PAIRING_CODE_VAL`` per-role propagation →
+    ``/etc/spatiumddi/.env`` → ``${BOOTSTRAP_PAIRING_CODE:-}`` in
+    the appliance compose's dns-bind9 / dns-powerdns / dhcp-kea env.
+  - Console dashboard's ``render_agent_context`` adds a ``Pairing``
+    row that reads three signals (``BOOTSTRAP_PAIRING_CODE`` in
+    ``.env`` for "was a code in play?"; ``agent_token.jwt`` in the
+    agent's docker volume for "registered?"; ``bootstrap.key`` for
+    "resolved?"; docker ps state for "failed-exit?") and renders
+    ``Paired ✓`` (green) / ``Registering…`` or ``Pairing in
+    progress…`` (yellow) / ``Pair failed — regenerate code on control
+    plane`` (red). ``AGENT_ROWS`` bumps from 5 → 6 when the row will
+    render so the panel doesn't clip.
+- **Appliance SNMP support (#153).** snmpd runs at the OS level on
+  every appliance host (local + every registered remote agent),
+  configured from a single ``platform_settings`` row driven through
+  the ConfigBundle long-poll like SNMP / NTP / chrony. v2c mode
+  (Fernet-encrypted community at rest + JSONB source-CIDR allowlist
+  rendered into ``rocommunity <community> <cidr>`` per-source); v3
+  USM mode (per-user table — username + auth_protocol +
+  auth_pass_enc + priv_protocol + priv_pass_enc rendered into
+  ``createUser`` + ``rouser``). Host-side ``spatium-snmp-reload``
+  bash runner validates with ``snmpd -t`` before atomic install,
+  manages an nftables drop-in (``/etc/nftables.d/spatium-snmp.nft``)
+  that opens UDP 161 when SNMP is enabled and tears it down when
+  disabled. A/B-persistence-contract documented in the runner
+  header — config + nftables drop-in survive slot swaps via the
+  ``/etc`` overlay → ``/var/persist/etc``. ``Settings → Security``
+  grows a Reveal flow for the SNMP community (password-confirm,
+  audited, local-auth only — mirrors agent-bootstrap-keys reveal).
+  SNMP page slotted into ``/appliance`` (moved from Settings per
+  operator feedback so all fleet-rollout config lives together).
+  10 unit tests for the renderer + bundle. Disabled by default.
+- **Adaptive polling on Releases tab** so the tab stays scannable as
+  the project ships dozens of releases. Top 3 releases render as the
+  existing full cards; the rest collapse behind a ``▶ Show N older
+  releases`` disclosure (auto-opens while an apply is in flight,
+  consistent with the existing update-log disclosure). Inside the
+  disclosure, each release renders as a one-line compact row with
+  a per-row release-notes sub-disclosure so the older list stays
+  scannable. When the operator's currently-installed version sits in
+  the older bucket (they're behind on upgrades), the disclosure label
+  carries a primary-coloured ``installed: <tag>`` chip so it's
+  findable without expand-and-scan.
+- **GUI-configurable NTP / chrony (#154).** Companion to the SNMP
+  flow: same ``platform_settings`` → ConfigBundle → host-side
+  ``spatium-chrony-reload`` shape. Three source modes — pool /
+  servers / mixed — with hygiene-block-always-emitted (driftfile,
+  makestep, rtcsync, leapsectz). Optional NTP-serve-to-clients with
+  per-CIDR allow list + automatic UDP 123 nftables drop-in. 10 unit
+  tests + a banner explaining "chrony is only configured on appliance
+  hosts" for non-appliance docker / k8s control planes (where the
+  settings still flow to registered appliance agents through the
+  bundle).
+
+### Changed
+
+- **Appliance tabs sorted alphabetically.** The ``/appliance`` page's
+  ``TABS`` array previously rendered tabs in the order new ones
+  shipped (chronological), causing visual reshuffling for operators
+  every release. Now alphabetised by label (Containers / Logs &
+  Diagnostics / Maintenance / Network & Host / NTP / OS Versions /
+  Pairing / Releases / SNMP / Web UI Certificate) with a
+  prominent ``IMPORTANT: keep this array sorted alphabetically by
+  ``label```` comment at the top so future tab additions slot in
+  by position rather than appended.
+- **README appliance-ISO section rewrite.** ``### Quick start with
+  the OS appliance ISO`` had drifted into a CLAUDE.md-style dense
+  single-paragraph format with parenthetical asides about UUID
+  collisions and Phase-N citations on every bullet. Rewritten as
+  five skimmable sub-sections (Get the ISO / Install / Access /
+  Joining DNS / DHCP agents / Managing the appliance) with hard-
+  wrapped ~70-80 char lines. Adds the pairing-code workflow as a
+  first-class step. Deep technical detail (A/B slot internals,
+  NetworkManager migration gotcha, fleet-reboot mechanism) stays in
+  ``docs/deployment/APPLIANCE.md`` instead of duplicated in the
+  README.
+- ``make appliance-dev-iso`` named in the README as the recommended
+  one-stop local-build target (vs. the previous ``make appliance &&
+  make appliance-iso`` two-step).
+- Pairing tab's React Query ``refetchInterval`` flipped from a flat
+  5 s to a callback returning 2 000 (pending codes exist) or 15 000
+  (idle). Operator watching for an agent to pair gets near-real-time
+  feedback; idle tab doesn't burn cycles.
+
+### Fixed
+
+- **Audit-log ``row_hash_mismatch`` on every install (#73).** The
+  ``before_flush`` event listener (``app.services.audit_chain.
+  compute_audit_hashes``) was hashing ``id=None`` + ``timestamp=None``
+  on every row because both columns' SQLAlchemy defaults fire AFTER
+  ``before_flush`` — ``id`` uses Python ``default=uuid.uuid4``,
+  ``timestamp`` uses ``server_default=now()``, both materialise during
+  flush — so the runtime hash never matched what Postgres later
+  stored, and every nightly ``verify_chain`` reported tampering.
+  Fixed by pre-populating both defaults before hashing
+  (``row.id = uuid.uuid4()`` + ``row.timestamp = datetime.now(UTC)``
+  if either is None) so the values we hash over are the same ones
+  the INSERT carries.
+- **Agent container entrypoints crash-loop with only
+  ``BOOTSTRAP_PAIRING_CODE``.** The shell entrypoints baked into
+  ``ghcr.io/spatiumddi/dns-bind9`` / ``dns-powerdns`` / ``dhcp-kea``
+  did ``: ${DNS_AGENT_KEY:?DNS_AGENT_KEY is required}`` (and
+  equivalents) before the Python supervisor ran — that fired before
+  the new Phase 3 resolver got a chance to look at
+  ``BOOTSTRAP_PAIRING_CODE``. Containers booted with only the pairing
+  code set crash-looped at the entrypoint with
+  ``DNS_AGENT_KEY is required``. Caught live on a fresh appliance
+  install at 192.168.0.134. Fix: relax all three entrypoints to
+  require AT LEAST ONE of (kind-specific PSK, ``BOOTSTRAP_PAIRING_
+  CODE``); the Python resolver still does the real
+  resolve-and-cache work.
+- **SNMP nftables drop-in syntax.** Initial ``spatium-snmp-reload``
+  runner wrote ``add rule inet filter input udp dport 161 accept`` to
+  ``/etc/nftables.d/spatium-snmp.nft`` and got
+  ``syntax error, unexpected rule, expecting @ or '`` from nft.
+  Root cause: ``/etc/nftables.conf``'s ``include "/etc/nftables.d/
+  *.nft"`` lives INSIDE the input chain block, so the drop-in must
+  be a chain-rule fragment (``udp dport 161 accept``) not a top-level
+  ``add rule`` directive. Caught live on the 192.168.0.100 test
+  appliance during the SNMP smoke pass.
+
+### Migrations
+
+- ``e2c91d5f7a48_appliance_pairing_codes`` — adds the ``pairing_code``
+  table (UUID PK with ``gen_random_uuid()`` server-default, sha256
+  ``code_hash`` unique index, ``code_last_two`` for UX, polymorphic
+  ``server_group_id``, ``expires_at`` / ``used_at`` / ``revoked_at``
+  lifecycle columns, CHECK constraint on ``deployment_kind IN ('dns',
+  'dhcp')``, FKs to ``user`` table for created / revoked actors with
+  ``ON DELETE SET NULL``).
+- ``f8a92c1d3b65_pairing_code_kind_both`` — widens the CHECK
+  constraint to also accept ``'both'`` for combined-agent codes.
+- ``b95e2d71f042_appliance_snmp_settings`` — adds 7 ``snmp_*``
+  columns to ``platform_settings`` (master toggle, version,
+  Fernet-encrypted community, v3 users JSONB, allowed-sources JSONB,
+  sysContact, sysLocation).
+- ``c87a3f29d108_appliance_ntp_settings`` — adds 5 ``ntp_*`` columns
+  to ``platform_settings`` (source mode, pool servers JSONB, custom
+  servers JSONB, serve-to-clients toggle, allow-client-networks
+  JSONB).
+- ``d4f8c91a2e35_audit_chain_repair`` — one-shot data migration that
+  walks every existing ``audit_log`` row in ``seq`` order and
+  re-hashes with the now-correct defaults-pre-populated logic. No-op
+  on fresh installs (no rows). Operator-visible columns (action,
+  user, timestamp, old_value / new_value, …) preserved verbatim;
+  only ``row_hash`` + ``prev_hash`` chain fields rewritten.
+
 ## 2026.05.13-1 — 2026-05-13
 
 Fleet management gets its real shape: the per-box ``OS Image`` tab and

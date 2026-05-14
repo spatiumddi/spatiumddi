@@ -493,10 +493,7 @@ def test_event_mapping_translates_pairing_audit_actions() -> None:
         == "appliance.pairing_code.revoked"
     )
     # ``consume_denied`` is intentionally not in the map.
-    assert (
-        _audit_to_event_type("appliance.pairing_code_consume_denied", "pairing_code")
-        is None
-    )
+    assert _audit_to_event_type("appliance.pairing_code_consume_denied", "pairing_code") is None
 
 
 # ── MCP tool ────────────────────────────────────────────────────────

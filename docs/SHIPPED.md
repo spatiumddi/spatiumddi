@@ -2189,6 +2189,29 @@ Mirrors CLAUDE.md's three mixed sections:
 
 ### Security & compliance
 
+- ✅ **Audit-log tamper detection** (issue #73). Append-only
+  hash chain over the ``audit_log`` table: every row carries a
+  ``row_hash = sha256(prev_hash || canonical_json(row))``
+  computed in the SQLAlchemy ``before_flush`` event listener
+  inside a Postgres transaction-scoped advisory lock (so
+  concurrent inserts can't fork the chain). A nightly
+  Celery task ``verify_chain`` walks the table in ``seq``
+  order, recomputes each hash, and surfaces breaks as
+  ``prev_hash_mismatch`` (insert / delete / hash rewrite) or
+  ``row_hash_mismatch`` (content edit on the row). 2026.05.14-1
+  fixed a defaults-vs-flush ordering bug where the listener
+  was hashing ``id=None`` + ``timestamp=None`` because both
+  columns' SQLAlchemy defaults fire AFTER ``before_flush`` —
+  the runtime hash never matched what Postgres later stored,
+  so the verifier reported tampering on every row. Fix
+  pre-populates both defaults before hashing; one-shot data
+  migration ``d4f8c91a2e35_audit_chain_repair`` re-hashed
+  every existing row in ``seq`` order with the now-correct
+  values so post-upgrade ``verify_chain`` reports
+  ``ok=True``. Operator-visible columns (action, user,
+  timestamp, old/new value, …) preserved verbatim — only
+  the chain fields the verifier owns were rewritten.
+
 - ✅ **TOTP MFA for local users** (issue #69). New
   `user_mfa_secret` table with Fernet-encrypted TOTP shared
   secret + backup-codes JSONB list. Enrolment flow: Settings
