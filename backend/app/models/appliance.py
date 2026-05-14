@@ -1,11 +1,14 @@
 """SpatiumDDI OS appliance management models — Phase 4 (issue #134).
 
-Two persistence surfaces live here:
+Three persistence surfaces live here:
 
 * ``ApplianceCertificate`` (Phase 4b.1) — Web UI TLS cert with a
   Fernet-encrypted private key.
 * ``PairingCode`` (#169) — short-lived, single-use 8-digit codes that
   swap for the real agent bootstrap key. See the model docstring.
+* ``Appliance`` (#170 Wave A2) — one row per supervisor that's claimed
+  a pairing code. Carries the supervisor's Ed25519 public key +
+  identity metadata. See the model docstring.
 
 The broader management surface (releases, container state, host
 network config, maintenance mode) doesn't need DB persistence — those
@@ -224,5 +227,114 @@ class PairingCode(Base):
         UUID(as_uuid=True), ForeignKey("user.id", ondelete="SET NULL"), nullable=True
     )
     created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+
+# Supervisor lifecycle states (#170 Wave A2). State machine:
+#
+#   pending_approval ──(admin Approve in B1)──▶ approved
+#         │                                        │
+#         └────────(admin Reject)─────────────┐    │
+#                                             ▼    ▼
+#                                          (row DELETEd, supervisor
+#                                           re-bootstraps on next poll)
+#
+# ``rejected`` is reserved for an optional intermediate state in B1
+# where admin "rejects but retains audit trail" — A2 never writes it.
+APPLIANCE_STATE_PENDING_APPROVAL = "pending_approval"
+APPLIANCE_STATE_APPROVED = "approved"
+APPLIANCE_STATE_REJECTED = "rejected"
+APPLIANCE_STATES = (
+    APPLIANCE_STATE_PENDING_APPROVAL,
+    APPLIANCE_STATE_APPROVED,
+    APPLIANCE_STATE_REJECTED,
+)
+
+
+class Appliance(Base):
+    """One row per supervisor that's claimed a pairing code (#170).
+
+    The supervisor generates an Ed25519 keypair on first boot, posts
+    its public key + a pairing code to
+    ``POST /api/v1/appliance/supervisor/register``, and the control
+    plane lands an ``Appliance`` row in ``pending_approval`` state.
+    Wave B1 wires admin approval + cert signing on top.
+
+    Identity model:
+
+    * ``public_key_der`` is the supervisor's Ed25519 pubkey, DER-
+      encoded. Stored verbatim so the B1 cert signer can re-derive
+      identity material without re-parsing.
+    * ``public_key_fingerprint`` is sha256(public_key_der) hex-encoded.
+      UNIQUE — a supervisor that resubmits the same pubkey (typical
+      restart-after-crash) hits the same row and the register endpoint
+      replies "already registered" idempotently. A NEW pubkey from the
+      same hostname creates a NEW row (admin sees two pending entries
+      and approves the real one).
+
+    Reject / delete semantics:
+
+    * The state column carries ``pending_approval`` → ``approved`` /
+      ``rejected``, but in practice admins drop pending or approved
+      rows by DELETE — the supervisor sees its ``appliance_id`` 404
+      on next poll and falls back into "waiting for pairing code"
+      state. We keep the column for audit-trail-style states the B1
+      / Wave-D fleet UI may want.
+
+    No FK to ``pairing_code`` is enforced beyond ON DELETE SET NULL,
+    so Wave A3's pairing-code reaper sweeping terminal codes doesn't
+    take down the appliances those codes provisioned.
+    """
+
+    __tablename__ = "appliance"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+
+    hostname: Mapped[str] = mapped_column(String(255), nullable=False)
+
+    # Raw Ed25519 public key, DER-encoded.
+    public_key_der: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+
+    # sha256(public_key_der) hex-encoded — 64 chars. Globally unique
+    # across the fleet; a duplicate submission = re-register-from-cache
+    # and short-circuits to "you already exist".
+    public_key_fingerprint: Mapped[str] = mapped_column(
+        String(64), nullable=False, unique=True, index=True
+    )
+
+    # Free-form version string reported by the supervisor at register
+    # time, e.g. "2026.05.14-1". Used by the fleet UI's needs-upgrade
+    # banner.
+    supervisor_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    paired_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    paired_from_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    # Pointer at the pairing_code row that admitted this register. ON
+    # DELETE SET NULL — Wave A3's pairing-code reaper sweeps old
+    # terminal codes; we don't want those sweeps to take down the
+    # appliances they provisioned.
+    paired_via_code_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("pairing_code.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+
+    state: Mapped[str] = mapped_column(
+        String(32), nullable=False, default=APPLIANCE_STATE_PENDING_APPROVAL
+    )
+
+    # Updated by Wave A2+'s supervisor heartbeat path. Stays NULL
+    # until the supervisor's first post-register check-in.
+    last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_seen_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

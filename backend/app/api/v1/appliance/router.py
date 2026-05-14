@@ -28,6 +28,7 @@ from app.api.v1.appliance.fleet import router as fleet_router
 from app.api.v1.appliance.pairing import router as pairing_router
 from app.api.v1.appliance.releases import router as releases_router
 from app.api.v1.appliance.slot import router as slot_router
+from app.api.v1.appliance.supervisor import router as supervisor_router
 from app.api.v1.appliance.system import router as system_router
 from app.api.v1.appliance.tls import router as tls_router
 from app.config import settings
@@ -49,6 +50,10 @@ router.include_router(system_router, prefix="/system")
 # ``/api/v1/appliance/pairing-codes`` + ``/api/v1/appliance/pair``
 # rather than burying them under a redundant ``/pairing/`` segment.
 router.include_router(pairing_router)
+# Supervisor register routes — same no-prefix shape as pairing so the
+# URL is ``/api/v1/appliance/supervisor/register`` rather than
+# ``/api/v1/appliance/supervisor/supervisor/register``.
+router.include_router(supervisor_router)
 
 
 class ApplianceInfo(BaseModel):
