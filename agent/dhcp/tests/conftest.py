@@ -20,6 +20,7 @@ def agent_cfg(tmp_state: Path) -> AgentConfig:
     return AgentConfig(
         control_plane_url="http://localhost:8000",
         agent_key="test-key",
+        bootstrap_pairing_code="",
         server_name="dhcp-test",
         state_dir=tmp_state,
         kea_config_path=tmp_state / "kea-dhcp4.conf",

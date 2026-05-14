@@ -1,7 +1,10 @@
 """Bootstrap / registration loop for the DHCP agent.
 
-Tries the cached JWT first; on 401 (or missing) falls back to PSK registration
-against ``POST /api/v1/dhcp/agents/register``.
+Tries the cached JWT first; on 401 (or missing) falls back to PSK
+registration against ``POST /api/v1/dhcp/agents/register``. The PSK
+itself is resolved through ``pairing.resolve_bootstrap_key`` so
+operators can supply either ``SPATIUM_AGENT_KEY`` (long hex string)
+or ``BOOTSTRAP_PAIRING_CODE`` (8-digit short-lived code via #169).
 """
 
 from __future__ import annotations
@@ -16,6 +19,7 @@ import structlog
 from . import __version__
 from .cache import load_or_create_agent_id, load_token, save_token
 from .config import AgentConfig
+from .pairing import resolve_bootstrap_key
 
 log = structlog.get_logger(__name__)
 
@@ -37,6 +41,13 @@ def _client(cfg: AgentConfig) -> httpx.Client:
 def register(cfg: AgentConfig) -> tuple[str, str, dict]:
     """Perform PSK bootstrap. Returns (agent_id, token, response_body)."""
     agent_id = load_or_create_agent_id(cfg.state_dir)
+    bootstrap_key = resolve_bootstrap_key(
+        explicit_key=cfg.agent_key,
+        pairing_code=cfg.bootstrap_pairing_code,
+        state_dir=cfg.state_dir,
+        hostname=cfg.server_name,
+        client_factory=lambda: _client(cfg),
+    )
     body = {
         "hostname": cfg.server_name,
         "driver": "kea",
@@ -53,7 +64,7 @@ def register(cfg: AgentConfig) -> tuple[str, str, dict]:
                 resp = c.post(
                     "/api/v1/dhcp/agents/register",
                     json=body,
-                    headers={"X-DHCP-Agent-Key": cfg.agent_key},
+                    headers={"X-DHCP-Agent-Key": bootstrap_key},
                 )
             if resp.status_code == 200:
                 data = resp.json()
@@ -69,7 +80,9 @@ def register(cfg: AgentConfig) -> tuple[str, str, dict]:
                     )
                     return agent_id, token, data
             else:
-                log.warning("register_failed", status=resp.status_code, body=resp.text[:400])
+                log.warning(
+                    "register_failed", status=resp.status_code, body=resp.text[:400]
+                )
         except httpx.HTTPError as e:
             log.warning("register_http_error", error=str(e))
         # jittered exponential backoff, cap 5 min

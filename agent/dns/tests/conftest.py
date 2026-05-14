@@ -14,6 +14,7 @@ def agent_cfg(tmp_path: Path) -> AgentConfig:
     return AgentConfig(
         control_plane_url="http://localhost:8000",
         dns_agent_key="test-key",
+        bootstrap_pairing_code="",
         server_name="dns-test",
         driver="bind9",
         roles=["authoritative"],

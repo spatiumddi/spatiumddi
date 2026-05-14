@@ -62,6 +62,7 @@ def _poller(tmp_path) -> MetricsPoller:
     cfg = AgentConfig(
         control_plane_url="http://api.invalid",
         agent_key="unused",
+        bootstrap_pairing_code="",
         server_name="dhcp-test",
         state_dir=tmp_path,
         kea_config_path=tmp_path / "kea.conf",
@@ -78,35 +79,107 @@ def _poller(tmp_path) -> MetricsPoller:
 def test_first_tick_establishes_baseline(tmp_path):
     p = _poller(tmp_path)
     # First snapshot — no previous baseline, poller should not emit.
-    delta = p._compute_delta({"discover": 5, "offer": 5, "request": 5, "ack": 5, "nak": 0,
-                              "decline": 0, "release": 0, "inform": 0})
+    delta = p._compute_delta(
+        {
+            "discover": 5,
+            "offer": 5,
+            "request": 5,
+            "ack": 5,
+            "nak": 0,
+            "decline": 0,
+            "release": 0,
+            "inform": 0,
+        }
+    )
     assert delta is None
 
 
 def test_second_tick_emits_delta(tmp_path):
     p = _poller(tmp_path)
-    p._compute_delta({"discover": 5, "offer": 5, "request": 5, "ack": 5, "nak": 0,
-                      "decline": 0, "release": 0, "inform": 0})
-    delta = p._compute_delta({"discover": 8, "offer": 8, "request": 8, "ack": 8, "nak": 1,
-                              "decline": 0, "release": 1, "inform": 0})
+    p._compute_delta(
+        {
+            "discover": 5,
+            "offer": 5,
+            "request": 5,
+            "ack": 5,
+            "nak": 0,
+            "decline": 0,
+            "release": 0,
+            "inform": 0,
+        }
+    )
+    delta = p._compute_delta(
+        {
+            "discover": 8,
+            "offer": 8,
+            "request": 8,
+            "ack": 8,
+            "nak": 1,
+            "decline": 0,
+            "release": 1,
+            "inform": 0,
+        }
+    )
     assert delta == {
-        "discover": 3, "offer": 3, "request": 3, "ack": 3,
-        "nak": 1, "decline": 0, "release": 1, "inform": 0,
+        "discover": 3,
+        "offer": 3,
+        "request": 3,
+        "ack": 3,
+        "nak": 1,
+        "decline": 0,
+        "release": 1,
+        "inform": 0,
     }
 
 
 def test_counter_reset_drops_bucket(tmp_path):
     p = _poller(tmp_path)
-    p._compute_delta({"discover": 100, "offer": 100, "request": 100, "ack": 100,
-                      "nak": 0, "decline": 0, "release": 0, "inform": 0})
+    p._compute_delta(
+        {
+            "discover": 100,
+            "offer": 100,
+            "request": 100,
+            "ack": 100,
+            "nak": 0,
+            "decline": 0,
+            "release": 0,
+            "inform": 0,
+        }
+    )
     # Kea restart: counters back to zero.
-    delta = p._compute_delta({"discover": 0, "offer": 0, "request": 0, "ack": 0,
-                              "nak": 0, "decline": 0, "release": 0, "inform": 0})
+    delta = p._compute_delta(
+        {
+            "discover": 0,
+            "offer": 0,
+            "request": 0,
+            "ack": 0,
+            "nak": 0,
+            "decline": 0,
+            "release": 0,
+            "inform": 0,
+        }
+    )
     assert delta is None
     # Next normal tick produces a delta against the restart baseline.
-    delta2 = p._compute_delta({"discover": 2, "offer": 2, "request": 2, "ack": 2,
-                               "nak": 0, "decline": 0, "release": 0, "inform": 0})
+    delta2 = p._compute_delta(
+        {
+            "discover": 2,
+            "offer": 2,
+            "request": 2,
+            "ack": 2,
+            "nak": 0,
+            "decline": 0,
+            "release": 0,
+            "inform": 0,
+        }
+    )
     assert delta2 == {
-        "discover": 2, "offer": 2, "request": 2, "ack": 2,
-        "nak": 0, "decline": 0, "release": 0, "inform": 0,
+        "discover": 2,
+        "offer": 2,
+        "request": 2,
+        "ack": 2,
+        "nak": 0,
+        "decline": 0,
+        "release": 0,
+        "inform": 0,
     }

@@ -28,7 +28,12 @@ class AgentConfig:
     """
 
     control_plane_url: str
+    # Either ``agent_key`` (long hex PSK from SPATIUM_AGENT_KEY) OR
+    # ``bootstrap_pairing_code`` (short-lived code via #169) must be
+    # set. The resolved key is computed at bootstrap time — see
+    # ``pairing.resolve_bootstrap_key``.
     agent_key: str
+    bootstrap_pairing_code: str
     server_name: str
     state_dir: Path
     kea_config_path: Path
@@ -47,13 +52,20 @@ class AgentConfig:
         if not cp:
             raise RuntimeError("SPATIUM_API_URL is required")
         key = os.environ.get("SPATIUM_AGENT_KEY", "")
-        if not key:
-            raise RuntimeError("SPATIUM_AGENT_KEY is required")
+        pairing_code = os.environ.get("BOOTSTRAP_PAIRING_CODE", "")
+        # One-of validation. A cached resolved key on disk would also
+        # suffice but we can't see it from here; the resolver raises
+        # a clearer error if every source is exhausted.
+        if not key and not pairing_code:
+            raise RuntimeError(
+                "One of SPATIUM_AGENT_KEY or BOOTSTRAP_PAIRING_CODE must be set."
+            )
         roles_raw = os.environ.get("AGENT_ROLES", "primary")
         roles = [r.strip() for r in roles_raw.split(",") if r.strip()]
         return cls(
             control_plane_url=cp,
             agent_key=key,
+            bootstrap_pairing_code=pairing_code,
             server_name=(
                 os.environ.get("SPATIUM_SERVER_NAME")
                 or os.environ.get("AGENT_HOSTNAME")
@@ -72,7 +84,8 @@ class AgentConfig:
             group_name=os.environ.get("AGENT_GROUP") or None,
             roles=roles,
             tls_ca_path=os.environ.get("TLS_CA_PATH") or None,
-            insecure_skip_tls_verify=os.environ.get("SPATIUM_INSECURE_SKIP_TLS_VERIFY") == "1",
+            insecure_skip_tls_verify=os.environ.get("SPATIUM_INSECURE_SKIP_TLS_VERIFY")
+            == "1",
             heartbeat_interval=float(os.environ.get("HEARTBEAT_INTERVAL", "30")),
             longpoll_timeout=float(os.environ.get("LONGPOLL_TIMEOUT", "30")),
         )
