@@ -750,44 +750,108 @@ Record changes propagate to BIND9 via RFC 2136 — typically sub-second, no daem
 
 ### Quick start with the OS appliance ISO
 
-If you'd rather skip the Docker setup entirely, SpatiumDDI ships a self-contained OS appliance image — Debian 13 with the full stack pre-installed. Boot it, run a five-question installer, and you're on HTTPS with all the SpatiumDDI services running. No prior Docker or Linux setup required.
+Prefer to skip Docker setup entirely? SpatiumDDI ships a self-contained
+OS appliance image — Debian 13 with the full stack pre-installed. Boot
+it, answer the installer's questions, and you're on HTTPS with
+everything running. No prior Docker or Linux experience needed.
 
-**Get the ISO:**
+#### Get the ISO
 
-- Each [GitHub release](https://github.com/spatiumddi/spatiumddi/releases) attaches `spatiumddi-appliance-<version>.iso` (~440 MB, hybrid USB/CD).
-- Or build from source: `make appliance && make appliance-iso` produces the ISO in `appliance/build/`. See [`docs/deployment/APPLIANCE.md`](docs/deployment/APPLIANCE.md) for the build prerequisites.
+- **Pre-built:** grab `spatiumddi-appliance-<version>.iso` (~440 MB
+  hybrid USB/CD) from the
+  [latest release](https://github.com/spatiumddi/spatiumddi/releases).
+- **Build from source:** `make appliance-dev-iso` produces an ISO in
+  `appliance/build/`. See
+  [`docs/deployment/APPLIANCE.md`](docs/deployment/APPLIANCE.md) for
+  prerequisites.
 
-**Install:**
+#### Install
 
-1. Attach the ISO as a CD-ROM in your hypervisor (Proxmox / VMware / Hyper-V / QEMU) or `dd` it to a USB stick for bare metal.
-2. Boot it. The live ISO drops you into a Proxmox-style whiptail wizard — pick a target disk, hostname, admin password, DHCP-or-static network, and timezone.
-3. The wizard partitions the disk (GPT: BIOS Boot + ESP + ext4 root), `rsync`s the live rootfs onto it, installs GRUB for both BIOS and UEFI, and reboots.
-4. First boot brings up the SpatiumDDI stack (api, worker, beat, postgres, redis, frontend) and auto-generates a self-signed TLS cert. Total time: ~2-5 minutes.
+1. Attach the ISO as a CD-ROM in your hypervisor (Proxmox / VMware /
+   Hyper-V / QEMU), or `dd` it to a USB stick for bare metal.
+2. Boot. The installer asks for **role** (control plane all-in-one,
+   control-only, or one of the agent roles), **target disk**,
+   **hostname**, **admin password**, **network** (DHCP or static), and
+   **timezone**.
+3. For agent roles, the wizard also asks for a **control plane URL**
+   and a **bootstrap method** — see the next section.
+4. The installer partitions, copies the system, installs GRUB, and
+   reboots. First boot finishes in 2-5 minutes.
 
-**Access:**
+#### Access
 
-Browse to `https://<appliance-ip>/`. Your browser will warn about the self-signed cert — accept once, then sign in with `admin / admin` (forces password change on first login). Plain HTTP gets 301-redirected to HTTPS.
+Browse to `https://<appliance-ip>/`. Accept the self-signed cert
+warning, then sign in with `admin / admin` — you'll be forced to set
+a real password on first login.
 
-**Appliance management (`/appliance`):**
+#### Joining DNS / DHCP agents
 
-The appliance ships with a dedicated management hub in the sidebar covering everything an OS-level operator needs without an SSH session:
+For distributed deployments where DNS and DHCP live on separate boxes,
+the installer offers role-split appliances (`dns-agent-bind9`,
+`dns-agent-powerdns`, `dhcp-agent`). Each agent needs a bootstrap
+secret to register with the control plane. Two ways to provide it:
 
-- **Web UI Certificate** — replace the self-signed cert: paste a PEM cert + key, generate a CSR (key stays on the server) and import the signed cert, or upload a Let's Encrypt cert. Activating a cert hot-reloads nginx.
-- **Releases** — list recent GitHub releases, one-click upgrade — the host-side path-unit recycles the stack so the api can recreate itself cleanly.
-- **OS Versions** — unified table in `/appliance` (merges the per-box OS Image + per-fleet Fleet tabs that lived separately pre-2026.05.13-1). The local appliance pins at the top as a `SELF` row with a left-border accent + chip; clicking **Manage…** opens the full A/B slot detail (per-slot versions, apply log, rollback) in a modal. Every registered DNS + DHCP agent sits below with the same Upgrade / Manual-upgrade / **Reboot** affordances. Bulk-select checkboxes on appliance rows + "Apply to selected" modal fires the upgrade in parallel across every checked row — each agent does its own dd on its own inactive slot so there's no fleet-wide outage. State column reads `ready` (green chip + CheckCircle2 icon) when the agent is healthy + no pending work; `in-flight` (blue) while a slot dd runs; `done` (green) when a recent apply finished; `failed` (red) on apply errors, auto-healing back to `ready` once the failure has been observed (the `.failed.<ts>` sidecar stays on disk for forensic lookup). Docker / k8s rows get a Manual upgrade modal with copy-paste `docker compose pull && up -d` / `helm upgrade … --set image.tag=…` commands instead, since they have no A/B partition to dd into. The `/appliance` sidebar entry is now always visible — on docker / k8s control planes the host-level tabs (TLS, Containers, Logs, Network, Maintenance) hide automatically but Releases + OS Versions stay reachable, so operators with appliance *agents* registered against a docker/k8s control plane can still drive fleet upgrades (hybrid topology).
-- **OS Image atomic A/B upgrade (per-box detail)** — Phase 8 (issue [#138](https://github.com/spatiumddi/spatiumddi/issues/138)). Reached via the **Manage…** button on the OS Versions table's SELF row. The installer carves two equal-sized root partitions (`root_A` + `root_B`); the appliance always boots one slot while the other sits idle. The card shows two per-slot panels with colour-coded role badges (🟢 BOOTED, 🔵 DEFAULT, 🟠 TARGET, 🟡 TRIAL) and the installed `APPLIANCE_VERSION` on each slot. Pick a release tag from the dropdown (sourced from GitHub Releases) — the slot `.raw.xz` + sha256 URLs derive automatically. Apply writes to the *inactive* slot via dd while the active slot is untouched (with `tune2fs -U random` between dd and the grub.cfg patch so the freshly-written slot gets a unique filesystem UUID — a re-apply would otherwise leave both slots with identical UUIDs and wedge `set-next-boot`), arms grub `next_entry` as one-shot, and on the next reboot `/health/live` confirms before grub-set-default commits the swap. The GRUB boot menu labels carry the per-slot version too (`SpatiumDDI Appliance 2026.05.12-3 (slot A)`), so an operator standing at the menu after a failed health check knows which release is on each slot. Bad image? Reboot reverts automatically. Rollback button flips the durable default back to the previous slot from the same card (no SSH); Reboot-now button on the success banner avoids the trip to Maintenance. Operator state on `/var/persist/etc`, `/var/home`, `/var/root`, and the entire Docker image cache lives on a third persistent `/var` partition that's shared across slots, so a slot swap can't lose user data.
-- **Fleet reboot** — Phase 8f-8 (issue [#138](https://github.com/spatiumddi/spatiumddi/issues/138)). Per-row **Reboot** button on the OS Versions table (only on rows whose `deployment_kind=appliance` — strict gate at every layer so a misclick can't reboot the local docker workstation). Double-confirm modal stays disabled until the operator ticks "I understand <agent name> will go offline for 30-60 s". Backend stamps `reboot_requested=true` on the row → agent's ConfigBundle long-poll picks it up (~30-60 s) → agent writes `/var/lib/spatiumddi-host/release-state/reboot-pending` → host-side `spatiumddi-reboot-agent.{path,service}` unit runs `systemctl reboot` with a 5 s grace window. Heartbeat handler auto-clears the request 15 s after the stamp — by construction post-reboot since a pre-reboot agent can't heartbeat. No more SSH'ing into agent boxes to run `sudo reboot` after a slot upgrade lands.
-- **Fleet upgrade** — Phase 8f (issue [#138](https://github.com/spatiumddi/spatiumddi/issues/138)). Per-row Upgrade button on the OS Versions table stamps the picked release tag on the agent's server row; the agent's ConfigBundle long-poll picks it up and fires the same slot-upgrade trigger the per-box flow uses. Auto-clear on success — the pending chip drops as soon as the agent reports the matching installed version.
-- **Talos-style console dashboard** — Phase 4h. `tty1` and the serial console paint a refresh-on-tick rich + psutil dashboard: per-role identity, vitals (load / mem / swap / uptime / disk), compose service health rollup, journalctl live-log pane, and an F-key strip across the bottom (**F1** Login → agetty for the standard local login / **F2** Monitor → `runuser -u admin -- htop` so the unprivileged operator can see all-system process state but can't ctrl-K root-owned processes from htop's kill menu / **F3** Containers → `docker stats` live resource view / **F4** Network → `nmtui` (NetworkManager) / **F5** Reboot + **F6** Shutdown with confirm modals / **F9** Diag). **F12 Shell removed** — physical-console operators don't get an admin shell that easily; F1 still hands off to the standard login. Active partition slot + durable default + trial-boot chip render in the header so the operator knows which slot they're on at a glance.
-- **NetworkManager network stack** (replaces systemd-networkd as of 2026.05.13-1). The installer wizard's static-IP step writes a keyfile-format `.nmconnection` profile under `/etc/NetworkManager/system-connections/` instead of a `.network` file; `nmtui` from the console F4 key (or `nmcli` over SSH) edits all subsequent connections. systemd-resolved still owns `/etc/resolv.conf` — NM pushes per-interface DNS over D-Bus (`dns=systemd-resolved` in `/etc/NetworkManager/conf.d/10-spatiumddi.conf`). **Migration note for existing installs**: an operator who set a static IP via the installer pre-2026.05.13-1 has `/etc/systemd/network/10-spatium-static.network` in their persistent /etc overlay. After a slot upgrade past 2026.05.13-1, systemd-networkd is masked → the static config goes inert → interface falls back to DHCP. Reconfigure via F4 → nmtui at the console or `nmcli connection add` from SSH.
-- **Containers** — list every container, start/stop/restart, live-stream logs over SSE.
-- **Logs & Diagnostics** — host log viewer (firstboot, update log), self-test runner (DNS / container health / API / DHCP / DNS daemon checks), one-click diagnostic bundle download (secrets redacted).
-- **Network & Host** — read-only hostname / host IPs / uptime / reboot-pending banner.
-- **Maintenance** — maintenance-mode flag + reboot button (10 s grace).
+**Pairing code (recommended).** Easy to type, even over an IPMI /
+serial console.
 
-Operators stuck without a working web UI can still SSH in as the admin user they created during install and use `journalctl -u spatiumddi-firstboot`, `docker compose -f /usr/local/share/spatiumddi/docker-compose.yml ps`, etc.
+1. On the control plane, open **Appliance → Pairing** and click
+   **New pairing code**. Pick the agent kind (DNS / DHCP / DNS + DHCP
+   for combined boxes), an optional server group, and an expiry (15
+   min default).
+2. The UI shows an 8-digit code with a live countdown.
+3. On the agent appliance, pick "Pairing code" at the installer's
+   **Bootstrap method** prompt and type the 8 digits. The agent
+   redeems the code for the real key on first boot and registers
+   itself.
 
-> The appliance is alpha (Phase 4 — issue [#134](https://github.com/spatiumddi/spatiumddi/issues/134)). See [`docs/deployment/APPLIANCE.md`](docs/deployment/APPLIANCE.md) for the full design, build pipeline, and known limitations.
+**Bootstrap key (advanced).** For re-installs, air-gapped sites with a
+saved key, or when a pairing code expired before you got to the
+installer. Reveal the 64-char hex key on the control plane via
+**Settings → Security → Agent bootstrap keys** and paste it.
+
+The console dashboard's **Pairing** row shows whether the agent has
+paired successfully — green ✓ when registered, yellow while in
+progress, red with a regenerate-the-code hint on failure.
+
+#### Managing the appliance
+
+The **Appliance** section in the sidebar groups everything you'd
+otherwise need SSH for:
+
+- **OS Versions** — atomic A/B slot upgrades for this appliance and
+  every registered remote agent. Pick a release, optionally bulk-
+  select agents, click Apply. Failed upgrades auto-revert on the
+  next reboot; rollback is a single click.
+- **Pairing** — generate single-use codes to onboard agents (see
+  above).
+- **Releases** — GitHub releases list with one-click container-stack
+  upgrades.
+- **Web UI Certificate** — replace the self-signed cert with a
+  pasted PEM + key, an in-server CSR, or a Let's Encrypt cert.
+- **NTP** — chrony config that propagates to every registered
+  agent appliance.
+- **SNMP** — read-only monitoring access (v2c with community + CIDR
+  allowlist, or v3 USM).
+- **Containers** — start / stop / restart, live SSE log streaming.
+- **Logs & Diagnostics** — journal viewer, self-test runner,
+  one-click diagnostic bundle (secrets redacted).
+- **Maintenance** — drain traffic, reboot, shutdown.
+
+The **console dashboard** on the appliance's physical or serial
+console shows live vitals, container health, and a journalctl tail.
+F-keys give you local-login (F1), htop (F2), `docker stats` (F3),
+`nmtui` for networking (F4), and confirmed reboot / shutdown
+(F5 / F6).
+
+Stuck without a working web UI? SSH in as the OS admin user you
+created during install and check `journalctl -u spatiumddi-firstboot`
+or
+`docker compose -f /usr/local/share/spatiumddi/docker-compose.yml ps`.
+
+> The appliance is alpha — see issue
+> [#134](https://github.com/spatiumddi/spatiumddi/issues/134) for the
+> roadmap and [`docs/deployment/APPLIANCE.md`](docs/deployment/APPLIANCE.md)
+> for the full design, build pipeline, and known limitations.
 
 ### API & interactive docs
 
