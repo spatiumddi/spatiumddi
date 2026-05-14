@@ -66,6 +66,12 @@ services:
     build:
       context: ./backend
       dockerfile: Dockerfile
+      # Target the ``dev`` stage so pytest + pytest-xdist + pytest-
+      # asyncio + pytest-cov are available for ``make test`` /
+      # ``make test-one`` running inside the container. The release
+      # build stops at ``runtime`` so the production image stays
+      # minimal — see backend/Dockerfile.
+      target: dev
     restart: unless-stopped
     networks:
       - spatiumddi
@@ -77,6 +83,11 @@ services:
       REDIS_URL: redis://redis:6379/0
       CELERY_BROKER_URL: redis://redis:6379/1
       CELERY_RESULT_BACKEND: redis://redis:6379/2
+      # pytest looks at TEST_DATABASE_URL on import (conftest.py picks
+      # the per-worker DB name suffix from it). Pre-set it here so
+      # ``make test`` doesn't need to thread it via -e on every call;
+      # CI runners override via env where appropriate.
+      TEST_DATABASE_URL: postgresql+asyncpg://spatiumddi:${POSTGRES_PASSWORD:-changeme}@postgres:5432/spatiumddi_test
     # Docker integration — uncomment both entries to poll the host
     # daemon over Unix socket. ``DOCKER_GID`` must match the gid of
     # ``/var/run/docker.sock`` on the host:

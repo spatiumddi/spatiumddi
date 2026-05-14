@@ -107,3 +107,22 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 # from inside the compose / k8s network — the frontend nginx is the
 # only entity talking to it, and nginx is under our control.
 CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1", "--proxy-headers", "--forwarded-allow-ips", "*"]
+
+
+# ── Stage 3: dev (used by docker-compose.dev.yml) ─────────────────────────────
+# Adds the ``[dev]`` extras (pytest + pytest-asyncio + pytest-xdist +
+# pytest-cov) on top of the runtime stage so ``make test`` can run pytest
+# inside the api container without bloating the production image. The dev
+# compose's ``build.target: dev`` selects this stage; the release pipeline
+# stops at ``runtime``.
+#
+# We install as root (the runtime stage's USER app would block site-packages
+# writes), then switch back to ``app`` so the runtime CMD stays unchanged.
+FROM runtime AS dev
+USER root
+RUN pip install --no-cache-dir --root-user-action=ignore \
+        "pytest>=8.3.0" \
+        "pytest-asyncio>=0.24.0" \
+        "pytest-cov>=6.0.0" \
+        "pytest-xdist>=3.6.0"
+USER app

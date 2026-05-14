@@ -63,14 +63,26 @@ lint-frontend:
 	  npm run format:check
 
 # ── Tests ──────────────────────────────────────────────────────────────────────
+#
+# pytest runs *inside* the api container so the suite is exactly the
+# version-pinned interpreter + deps the rest of CI uses, without
+# requiring the operator to have python3 + pyproject's [dev] extras
+# installed on the host. The dev compose's api ``build.target: dev``
+# bakes pytest into the image; ``TEST_DATABASE_URL`` is pre-set on the
+# environment so the conftest carves its per-worker test DB against
+# the dev compose's postgres service.
+#
+# ``-T`` on ``docker compose exec`` disables TTY allocation so the
+# output streams cleanly on CI runners + pipes to ``tee`` / grep
+# without ANSI artefacts.
 test: test-backend
 
 test-backend:
-	cd $(BACKEND_DIR) && python -m pytest -n auto
+	docker compose -f docker-compose.yml -f docker-compose.dev.yml exec -T api python -m pytest -n auto
 
 test-one:
 	@test -n "$(T)" || (echo "Usage: make test-one T=tests/test_health.py::test_liveness"; exit 1)
-	cd $(BACKEND_DIR) && python -m pytest $(T) -v
+	docker compose -f docker-compose.yml -f docker-compose.dev.yml exec -T api python -m pytest $(T) -v
 
 # ── CI parity ──────────────────────────────────────────────────────────────────
 # `make ci` runs the same lint + typecheck + build jobs GitHub Actions runs on
