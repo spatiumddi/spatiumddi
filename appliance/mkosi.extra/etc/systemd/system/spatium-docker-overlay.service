@@ -1,0 +1,38 @@
+[Unit]
+# Issue #170 Phase E1 — overlay-mount the per-slot baked docker
+# data-root on top of /var/lib/docker before docker.service starts.
+#
+# The baked image at /usr/lib/spatiumddi/docker-overlay.img carries
+# a populated /var/lib/docker built at appliance-bake time. We
+# loop-mount it read-only as the overlayfs lowerdir; the upperdir
+# lives on /var (operator-mutable, image-pull cache for any
+# post-bake docker activity); the merged view becomes the active
+# /var/lib/docker.
+#
+# Slot upgrade = new overlay image lands on the inactive slot's
+# rootfs. After reboot into that slot, this unit mounts the new
+# lowerdir + the upperdir/workdir on /var/persist/docker-overlay-
+# upper{,-work} get fresh-started by clearing them — keeps the
+# upper from accumulating bytes that don't match the new lower's
+# layer fingerprints.
+#
+# Strict appliance-only — the unit's ConditionPathExists gate
+# refuses to run if the overlay image isn't present (e.g. dev
+# laptop running the same systemd unit set without the image
+# baked in).
+Description=SpatiumDDI baked docker overlay
+Documentation=https://github.com/spatiumddi/spatiumddi/issues/170
+ConditionPathExists=/usr/lib/spatiumddi/docker-overlay.img
+DefaultDependencies=no
+After=local-fs.target var.mount
+Before=docker.service
+RequiredBy=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/spatium-docker-overlay mount
+ExecStop=/usr/local/bin/spatium-docker-overlay umount
+
+[Install]
+WantedBy=multi-user.target

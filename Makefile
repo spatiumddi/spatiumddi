@@ -252,16 +252,24 @@ appliance-baked-iso: appliance-bake-images appliance appliance-iso appliance-slo
 	@echo "✓ Baked appliance ISO ready at $(APPLIANCE_OUT)/"
 	@echo "  All container images embedded. Air-gap-ready. First boot does no docker pull."
 
-# Wipe any tarballs that a previous ``appliance-bake-images`` left
-# under the mkosi.extra overlay. mkosi copies the overlay verbatim
-# into the rootfs, so leftover tarballs would still be baked even
-# after we dropped the ``appliance-bake-images`` dep from
-# ``appliance-dev-iso``. The directory itself is gitignored.
+# Wipe any baked overlay artefacts that a previous
+# ``appliance-bake-images`` left under the mkosi.extra overlay. mkosi
+# copies the overlay verbatim into the rootfs, so a stale image file
+# would still be baked even after we dropped the ``appliance-bake-
+# images`` dep from ``appliance-dev-iso``. The artefacts are
+# gitignored.
 appliance-clean-baked-images:
-	@d=$(APPLIANCE_DIR)/mkosi.extra/usr/local/share/spatiumddi/images; \
-	if ls $$d/*.tar.zst >/dev/null 2>&1 || [ -f $$d/BAKED_AT ]; then \
-	  echo "→ Cleaning previously-baked image tarballs from $$d …"; \
-	  rm -f $$d/*.tar.zst $$d/BAKED_AT; \
+	@d=$(APPLIANCE_DIR)/mkosi.extra/usr/lib/spatiumddi; \
+	if [ -f $$d/docker-overlay.img ] || [ -f $$d/docker-overlay.manifest ]; then \
+	  echo "→ Cleaning previously-baked docker overlay from $$d …"; \
+	  rm -f $$d/docker-overlay.img $$d/docker-overlay.manifest $$d/docker-overlay.version; \
+	fi
+	@# Pre-E1 tarball layout — wipe any leftovers from an older bake.
+	@d2=$(APPLIANCE_DIR)/mkosi.extra/usr/local/share/spatiumddi/images; \
+	if ls $$d2/*.tar.zst >/dev/null 2>&1 || [ -f $$d2/BAKED_AT ]; then \
+	  echo "→ Cleaning pre-E1 image tarballs from $$d2 …"; \
+	  rm -f $$d2/*.tar.zst $$d2/BAKED_AT $$d2/VERSION $$d2/MANIFEST; \
+	  rmdir $$d2 2>/dev/null || true; \
 	fi
 
 # Stamp a dev version into mkosi.extra/etc/spatiumddi/appliance-release

@@ -600,6 +600,11 @@ class SupervisorHeartbeatRequest(BaseModel):
     last_upgrade_state_at: datetime | None = None
     snmpd_running: bool | None = None
     ntp_sync_state: Literal["synchronized", "unsynchronized", "unknown"] | None = None
+    # #170 Phase E2 — host-side port conflicts probed by the
+    # supervisor. Free-form dict keyed by ``<proto>_<port>``; values
+    # are the ``users`` string from ``ss -p`` (process name / pid).
+    # None / omitted = supervisor didn't run the probe this tick.
+    port_conflicts: dict[str, str] | None = None
 
 
 class SupervisorRoleAssignment(BaseModel):
@@ -732,6 +737,11 @@ async def supervisor_heartbeat(
         row.snmpd_running = body.snmpd_running
     if body.ntp_sync_state is not None:
         row.ntp_sync_state = body.ntp_sync_state
+    if body.port_conflicts is not None:
+        # Overwrite verbatim — the supervisor's probe is the source of
+        # truth. Empty dict explicitly clears prior conflicts; the
+        # operator-visible banner stops showing on the next render.
+        row.port_conflicts = dict(body.port_conflicts)
 
     # Auto-clear desired_appliance_version once installed matches +
     # the upgrade landed cleanly. Same shape as #138 Phase 8f-4's
@@ -861,6 +871,8 @@ class ApplianceRow(BaseModel):
     tags: dict[str, str]
     # #170 Wave C3 — operator-pasted nft fragment.
     firewall_extra: str | None
+    # #170 Phase E2 — supervisor-reported host-side port conflicts.
+    port_conflicts: dict[str, str]
     created_at: datetime
 
 
@@ -912,6 +924,7 @@ def _row_to_schema(row: Appliance) -> ApplianceRow:
         assigned_dhcp_group_id=row.assigned_dhcp_group_id,
         tags=dict(row.tags or {}),
         firewall_extra=row.firewall_extra,
+        port_conflicts=dict(row.port_conflicts or {}),
         created_at=row.created_at,
     )
 

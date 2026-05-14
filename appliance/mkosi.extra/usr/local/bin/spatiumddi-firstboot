@@ -277,75 +277,21 @@ getent hosts registry-1.docker.io >/dev/null 2>&1 || {
     echo "      Check 'resolvectl status' and 'nmcli device status'."
 }
 
-# Phase 4 dev-iteration support — if this ISO was built with
-# ``bake-images.sh``, it ships locally-built image tarballs at
-# /usr/local/share/spatiumddi/images/*.tar.zst. Load each one
-# into the daemon BEFORE attempting any pull, so the operator's
-# in-flight changes take precedence over whatever's pullable
-# from ghcr.io. The marker file ``BAKED_AT`` is dropped by
-# bake-images.sh; its presence is the signal "this slot carries
-# offline images". When present we skip docker-compose pull
-# entirely (pulls of unpublished tags would 404 against ghcr).
+# #170 Phase E1 — the docker-overlay.img bake produces a populated
+# /var/lib/docker snapshot that ``spatium-docker-overlay.service``
+# loop-mounts on top of /var/lib/docker BEFORE docker.service runs.
+# By the time firstboot reaches this point the appliance's docker
+# daemon already has every baked image available — no ``docker load``
+# step needed, no slot-skew risk between the rootfs and /var.
 #
-# Slot-upgrade aware: each slot rootfs ships its own BAKED_AT
-# stamp. We persist the last-loaded BAKED_AT timestamp on the
-# shared /var partition; if the rootfs's BAKED_AT is newer, we
-# re-load the tarballs even on a non-first boot. This is what
-# makes ``spatium-upgrade-slot apply`` followed by a reboot
-# actually pick up the new container images — without it, the
-# previous slot's STAMP shorts out the load and docker-compose
-# happily reuses the stale images already on /var/lib/docker.
-IMAGES_DIR=/usr/local/share/spatiumddi/images
-BAKED_AT_FILE="$IMAGES_DIR/BAKED_AT"
-LOADED_AT_FILE=/var/lib/spatiumddi/images-loaded-at
+# The presence of /usr/lib/spatiumddi/docker-overlay.img is the
+# "this slot carries offline images" signal. Without it (dev runs
+# without baked images), firstboot falls through to ``docker-compose
+# pull`` against ghcr.io.
+OVERLAY_IMG=/usr/lib/spatiumddi/docker-overlay.img
 BAKED=0
-LOAD_REASON=""
-
-if [ -f "$BAKED_AT_FILE" ]; then
-    rootfs_baked_at=$(cat "$BAKED_AT_FILE")
-    loaded_baked_at=""
-    [ -f "$LOADED_AT_FILE" ] && loaded_baked_at=$(cat "$LOADED_AT_FILE")
-    if [ ! -f "$STAMP" ]; then
-        LOAD_REASON="first boot (baked $rootfs_baked_at)"
-    elif [ "$rootfs_baked_at" != "$loaded_baked_at" ]; then
-        LOAD_REASON="rootfs BAKED_AT changed (was $loaded_baked_at, now $rootfs_baked_at) — slot upgrade detected"
-    fi
-
-    if [ -n "$LOAD_REASON" ]; then
-        echo "Loading pre-baked container images from $IMAGES_DIR — $LOAD_REASON"
-        for img in "$IMAGES_DIR"/*.tar.zst; do
-            [ -f "$img" ] || continue
-            echo "  → $(basename "$img")"
-            zstd -dc "$img" | docker load
-        done
-
-        # #170 Phase A4 — stamp the ``<image>:slot-baked`` alias on
-        # every SpatiumDDI image loaded above. The supervisor's
-        # air-gap-strict mode (Wave C polish) references images by
-        # this stable local tag so a compose template doesn't have to
-        # carry the CalVer version through env substitution. Reading
-        # the version from the bake's VERSION sidecar (which the bake
-        # script writes alongside BAKED_AT) avoids re-parsing the
-        # tarball filenames.
-        if [ -f "$IMAGES_DIR/VERSION" ]; then
-            baked_version=$(cat "$IMAGES_DIR/VERSION")
-            for image in \
-                ghcr.io/spatiumddi/spatiumddi-api \
-                ghcr.io/spatiumddi/spatiumddi-frontend \
-                ghcr.io/spatiumddi/spatium-supervisor \
-                ghcr.io/spatiumddi/dns-bind9 \
-                ghcr.io/spatiumddi/dns-powerdns \
-                ghcr.io/spatiumddi/dhcp-kea; do
-                if docker image inspect "${image}:${baked_version}" >/dev/null 2>&1; then
-                    docker tag "${image}:${baked_version}" "${image}:slot-baked" \
-                        2>/dev/null || true
-                fi
-            done
-        fi
-
-        echo "$rootfs_baked_at" > "$LOADED_AT_FILE"
-        BAKED=1
-    fi
+if [ -f "$OVERLAY_IMG" ]; then
+    BAKED=1
 fi
 
 if [ ! -f "$STAMP" ] && [ "$BAKED" = 0 ]; then

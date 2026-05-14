@@ -7196,6 +7196,11 @@ export interface ApplianceRow {
   // #170 Wave C3 — operator-pasted nft fragment rendered after the
   // role-driven mgmt + per-role blocks.
   firewall_extra: string | null;
+  // #170 Phase E2 — supervisor-reported host-side port conflicts.
+  // Keyed by ``<proto>_<port>`` (e.g. ``udp_53`` / ``tcp_53`` /
+  // ``udp_67``); values are the ss ``users`` string (pid+name when
+  // available, else local-address fallback).
+  port_conflicts: Record<string, string>;
   created_at: string;
 }
 

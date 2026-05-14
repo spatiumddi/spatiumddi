@@ -1079,6 +1079,13 @@ function ApplianceRoleAssignmentSection({ row }: { row: ApplianceRow }) {
         </div>
       )}
 
+      {/* #170 Phase E2 — banner conflicts the operator should action
+          before the role they just picked would actually bind on the
+          host. We map the role chip to the port(s) it needs + only
+          show the warning when there's a conflict on a port the
+          chosen role would bind. */}
+      <PortConflictBanner row={row} roles={roles} />
+
       {/* #170 Wave C3 — firewall preview + operator-override textarea.
           The preview mirrors the supervisor's firewall_renderer.py
           output for the currently-selected roles so the operator can
@@ -1650,6 +1657,77 @@ function SlotImageManager() {
           </tbody>
         </table>
       )}
+    </div>
+  );
+}
+
+// ── PortConflictBanner (#170 Phase E2) ──────────────────────────
+
+// Map a role-chip token to the heartbeat-body keys it would bind.
+// Mirrors the supervisor's role_orchestrator probe list so the banner
+// only fires when there's a conflict on a port the operator's picked
+// role would actually need.
+const _ROLE_PORT_KEYS: Record<string, string[]> = {
+  "dns-bind9": ["udp_53", "tcp_53"],
+  "dns-powerdns": ["udp_53", "tcp_53"],
+  dhcp: ["udp_67"],
+};
+
+function _formatPortKey(key: string): string {
+  // udp_53 → "UDP/53", tcp_53 → "TCP/53"
+  const [proto, port] = key.split("_", 2);
+  return `${proto.toUpperCase()}/${port}`;
+}
+
+function PortConflictBanner({
+  row,
+  roles,
+}: {
+  row: ApplianceRow;
+  roles: Set<string>;
+}) {
+  const conflicts = row.port_conflicts ?? {};
+  // Surface only conflicts on a port a currently-picked role would
+  // bind. Operators on idle appliances don't care about a stray UDP/53
+  // listener; they care once they assign a DNS role.
+  const relevant: { key: string; users: string }[] = [];
+  for (const role of roles) {
+    for (const key of _ROLE_PORT_KEYS[role] ?? []) {
+      if (conflicts[key] && !relevant.some((r) => r.key === key)) {
+        relevant.push({ key, users: conflicts[key] });
+      }
+    }
+  }
+  if (relevant.length === 0) return null;
+  return (
+    <div className="mt-4 rounded-md border border-rose-500/40 bg-rose-500/10 p-3 text-xs">
+      <div className="flex items-start gap-2">
+        <AlertCircle className="mt-0.5 h-4 w-4 flex-shrink-0 text-rose-700 dark:text-rose-300" />
+        <div>
+          <p className="font-medium text-rose-700 dark:text-rose-300">
+            Host port conflict — supervisor pre-flight failed
+          </p>
+          <p className="mt-1 text-muted-foreground">
+            The supervisor probed{" "}
+            {relevant.map((r, i) => (
+              <span key={r.key}>
+                {i > 0 ? ", " : ""}
+                <code className="text-foreground">{_formatPortKey(r.key)}</code>
+              </span>
+            ))}{" "}
+            and found a competing listener on the host. The service
+            container&apos;s bind will silently lose to that daemon. SSH in +
+            stop the conflicting process before applying the role assignment.
+          </p>
+          <ul className="mt-2 space-y-0.5 text-[11px]">
+            {relevant.map((r) => (
+              <li key={r.key} className="font-mono">
+                {_formatPortKey(r.key)} → {r.users}
+              </li>
+            ))}
+          </ul>
+        </div>
+      </div>
     </div>
   );
 }

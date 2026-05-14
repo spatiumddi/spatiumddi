@@ -45,7 +45,11 @@ from . import appliance_state
 from .config import SupervisorConfig
 from .firewall_renderer import FirewallProfile, render_drop_in
 from .identity import Identity
-from .role_orchestrator import compute_target_env, render_env_file
+from .role_orchestrator import (
+    compute_target_env,
+    probe_port_conflicts,
+    render_env_file,
+)
 
 
 # #170 Wave C2 — role-driven compose env file. Written under the
@@ -222,6 +226,12 @@ def heartbeat_once(
         "session_token": session_token,
         "capabilities": _capabilities_payload(),
         **state,
+        # #170 Phase E2 — probe UDP/67 every tick. Empty dict
+        # explicitly clears any prior conflict server-side; ``None``
+        # would skip the overwrite, which isn't what we want if the
+        # conflict went away. The probe is cheap (``ss -uln``) so
+        # running it every heartbeat is fine.
+        "port_conflicts": probe_port_conflicts(),
     }
     url = cfg.control_plane_url.rstrip("/") + "/api/v1/appliance/supervisor/heartbeat"
     try:

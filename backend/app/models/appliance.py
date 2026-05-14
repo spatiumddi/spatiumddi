@@ -482,6 +482,18 @@ class Appliance(Base):
     # closes the firewall mid-render.
     firewall_extra: Mapped[str | None] = mapped_column(Text, nullable=True)
 
+    # #170 Phase E2 — supervisor-reported host-side port conflicts.
+    # Shape: ``{"udp_67": "<users-from-ss>", ...}``. Surfaces a red
+    # banner on the Fleet drilldown's role-assignment section when
+    # the operator's chosen DHCP server-group is in bridged mode AND
+    # udp_67 is non-empty.
+    port_conflicts: Mapped[dict[str, str]] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=dict,
+        server_default=sa.text("'{}'::jsonb"),
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

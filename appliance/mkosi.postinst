@@ -37,6 +37,7 @@ mkdir -p "$BUILDROOT/etc/systemd/system/multi-user.target.wants"
 # so only one runs per boot, depending on the GRUB menu choice.
 for unit in docker.service chrony.service ssh.service \
             NetworkManager.service \
+            spatium-docker-overlay.service \
             spatiumddi-firstboot.service \
             spatiumddi-update.path \
             spatiumddi-reboot.path \
