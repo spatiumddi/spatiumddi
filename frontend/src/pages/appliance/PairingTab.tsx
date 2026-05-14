@@ -5,7 +5,10 @@ import {
   CheckCircle2,
   Clock,
   Copy,
+  Eye,
   Loader2,
+  Pause,
+  Play,
   Plus,
   RefreshCw,
   Trash2,
@@ -14,61 +17,30 @@ import {
 import {
   appliancePairingApi,
   authApi,
-  dhcpApi,
-  dnsApi,
   type PairingCodeCreated,
   type PairingCodeRow,
-  type PairingDeploymentKind,
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { cn } from "@/lib/utils";
 
 /**
- * Appliance → Pairing codes tab (issue #169).
+ * Appliance → Pairing codes tab (#169 + #170 Wave A3 reshape).
  *
- * Operator clicks "New pairing code" → modal lets them pick the agent
- * kind (DNS / DHCP), optionally pin a server group + expiry, click
- * "Generate" → the cleartext 8-digit code is shown in a large mono
- * box with a copy button + live countdown. The same modal carries an
- * inline "Regenerate" button so an operator who left and came back
- * just mints another code without re-opening anything.
+ * Operator clicks "New pairing code" → modal asks ephemeral
+ * (single-use) or persistent (multi-claim), optional expiry +
+ * max_claims, generates an 8-digit code shown once in a large mono
+ * box. Persistent codes can be re-revealed later via a password-
+ * gated reveal action; ephemeral codes are gone after the create
+ * response is closed.
  *
- * The table below shows every code (pending + recent terminal rows).
- * Polls every 5 s while the tab is open so a freshly-claimed code's
- * row state flips from "pending" → "claimed" without the operator
- * having to refresh.
+ * The table below polls every 2s while at least one pending code
+ * exists (so a freshly-claimed ephemeral code flips state without
+ * a refresh), 15s when nothing is pending.
  */
-
-const EXPIRY_OPTIONS = [
-  { value: 5, label: "5 minutes" },
-  { value: 15, label: "15 minutes" },
-  { value: 30, label: "30 minutes" },
-  { value: 60, label: "1 hour" },
-];
 
 const inputCls =
   "rounded-md border bg-background px-3 py-1.5 text-sm disabled:opacity-60";
-
-// Shared kind → human label map for chips + confirm prose.
-const KIND_LABEL: Record<PairingDeploymentKind, string> = {
-  dns: "DNS",
-  dhcp: "DHCP",
-  both: "DNS + DHCP",
-};
-
-// Card-style radio options for the Agent kind picker — three pinned
-// values map 1:1 to the API's deployment_kind. Lives at module scope
-// so it isn't rebuilt on every modal render.
-const KIND_OPTIONS: {
-  value: PairingDeploymentKind;
-  title: string;
-  subtitle: string;
-}[] = [
-  { value: "dns", title: "DNS", subtitle: "BIND9 / PowerDNS" },
-  { value: "dhcp", title: "DHCP", subtitle: "Kea" },
-  { value: "both", title: "DNS + DHCP", subtitle: "BIND9 + Kea, one box" },
-];
 
 export function PairingTab() {
   const qc = useQueryClient();
@@ -79,12 +51,6 @@ export function PairingTab() {
   });
   const isSuperadmin = me?.is_superadmin ?? false;
 
-  // Codes table refresh. Adaptive polling — 2 s while at least one
-  // code is still in ``pending`` state (operator is actively watching
-  // for an agent to claim), 15 s when nothing's waiting (cheap idle
-  // tick for the rare 'claimed' / 'expired' / 'revoked' state changes
-  // that don't originate from this UI). Phase-5 polish over the
-  // previous flat 5 s tick.
   const { data, isLoading, isFetching, refetch } = useQuery({
     queryKey: ["appliance", "pairing-codes"],
     queryFn: () => appliancePairingApi.list({ include_terminal: true }),
@@ -98,11 +64,19 @@ export function PairingTab() {
 
   const [modalOpen, setModalOpen] = useState(false);
   const [revokeTarget, setRevokeTarget] = useState<PairingCodeRow | null>(null);
+  const [revealTarget, setRevealTarget] = useState<PairingCodeRow | null>(null);
   const revokeMutation = useMutation({
     mutationFn: (id: string) => appliancePairingApi.revoke(id),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["appliance", "pairing-codes"] });
       setRevokeTarget(null);
+    },
+  });
+  const toggleMutation = useMutation({
+    mutationFn: ({ id, enable }: { id: string; enable: boolean }) =>
+      enable ? appliancePairingApi.enable(id) : appliancePairingApi.disable(id),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["appliance", "pairing-codes"] });
     },
   });
 
@@ -136,12 +110,13 @@ export function PairingTab() {
         <div>
           <h2 className="text-base font-semibold">Appliance pairing codes</h2>
           <p className="mt-1 text-xs text-muted-foreground">
-            Short-lived 8-digit codes the agent installer swaps for the real{" "}
-            <code className="rounded bg-muted px-1">DNS_AGENT_KEY</code> /{" "}
-            <code className="rounded bg-muted px-1">DHCP_AGENT_KEY</code> on
-            first boot. Default 15-minute expiry, single-use. The cleartext code
-            is shown exactly once at generation; this table only ever displays
-            the last two digits for visual correlation.
+            8-digit codes that a new supervisor appliance swaps for a
+            pending-approval registration on{" "}
+            <code className="rounded bg-muted px-1">
+              /api/v1/appliance/supervisor/register
+            </code>
+            . Ephemeral codes are single-use with a short expiry; persistent
+            codes admit many appliances and can be re-revealed.
           </p>
         </div>
         <div className="flex flex-shrink-0 gap-2">
@@ -179,7 +154,15 @@ export function PairingTab() {
           <span className="font-medium">New pairing code</span> to mint one.
         </div>
       ) : (
-        <CodesTable codes={codes} onRevoke={(row) => setRevokeTarget(row)} />
+        <CodesTable
+          codes={codes}
+          onRevoke={(row) => setRevokeTarget(row)}
+          onReveal={(row) => setRevealTarget(row)}
+          onToggleEnabled={(row) =>
+            toggleMutation.mutate({ id: row.id, enable: !row.enabled })
+          }
+          toggleInFlight={toggleMutation.isPending}
+        />
       )}
 
       {modalOpen && (
@@ -197,11 +180,10 @@ export function PairingTab() {
         message={
           revokeTarget ? (
             <>
-              Revoke the pending{" "}
-              <span className="font-mono">••{revokeTarget.code_last_two}</span>{" "}
-              {KIND_LABEL[revokeTarget.deployment_kind]} code? Any agent still
-              holding it will get a generic "invalid code" response on its next
-              pair attempt — they'll need a fresh code.
+              Revoke this {revokeTarget.persistent ? "persistent" : "ephemeral"}{" "}
+              pairing code? Already-claimed appliances keep working — only new
+              claims are blocked. This is permanent; revoked codes can't be
+              re-enabled.
             </>
           ) : (
             ""
@@ -210,51 +192,113 @@ export function PairingTab() {
         confirmLabel="Revoke"
         tone="destructive"
         loading={revokeMutation.isPending}
-        onConfirm={() => {
-          if (revokeTarget) revokeMutation.mutate(revokeTarget.id);
-        }}
         onClose={() => setRevokeTarget(null)}
+        onConfirm={() => revokeTarget && revokeMutation.mutate(revokeTarget.id)}
       />
+
+      {revealTarget && (
+        <RevealModal row={revealTarget} onClose={() => setRevealTarget(null)} />
+      )}
     </div>
   );
 }
 
-// ── Active codes table ─────────────────────────────────────────────
+// ── Table ───────────────────────────────────────────────────────────
 
 function CodesTable({
   codes,
   onRevoke,
+  onReveal,
+  onToggleEnabled,
+  toggleInFlight,
 }: {
   codes: PairingCodeRow[];
   onRevoke: (row: PairingCodeRow) => void;
+  onReveal: (row: PairingCodeRow) => void;
+  onToggleEnabled: (row: PairingCodeRow) => void;
+  toggleInFlight: boolean;
 }) {
-  // Re-render every second so the "expires in" countdown stays live —
-  // without this the column would stay frozen at the value it had on
-  // last query refresh.
-  const [, setTick] = useState(0);
-  useEffect(() => {
-    const t = setInterval(() => setTick((n) => n + 1), 1000);
-    return () => clearInterval(t);
-  }, []);
-
   return (
     <div className="overflow-x-auto rounded-md border">
-      <table className="w-full text-sm">
-        <thead className="bg-muted/40 text-left text-xs text-muted-foreground">
+      <table className="min-w-full text-sm">
+        <thead className="bg-muted/40 text-left text-xs font-medium text-muted-foreground">
           <tr>
             <th className="px-3 py-2">Code</th>
             <th className="px-3 py-2">Kind</th>
-            <th className="px-3 py-2">Group</th>
             <th className="px-3 py-2">State</th>
+            <th className="px-3 py-2">Claims</th>
+            <th className="px-3 py-2">Expires</th>
             <th className="px-3 py-2">Note</th>
-            <th className="px-3 py-2">Created</th>
-            <th className="px-3 py-2">Expires / claimed</th>
             <th className="px-3 py-2"></th>
           </tr>
         </thead>
         <tbody>
           {codes.map((row) => (
-            <CodeRow key={row.id} row={row} onRevoke={onRevoke} />
+            <tr key={row.id} className="border-t">
+              <td className="px-3 py-2 font-mono text-xs">
+                ••{row.code_last_two}
+              </td>
+              <td className="px-3 py-2">
+                <KindChip persistent={row.persistent} />
+              </td>
+              <td className="px-3 py-2">
+                <StateChip state={row.state} />
+              </td>
+              <td className="px-3 py-2 text-xs">
+                {row.claim_count}
+                {row.max_claims != null && (
+                  <span className="text-muted-foreground">
+                    {" "}
+                    / {row.max_claims}
+                  </span>
+                )}
+              </td>
+              <td className="px-3 py-2 text-xs text-muted-foreground">
+                {row.expires_at ? <RelativeTime iso={row.expires_at} /> : "—"}
+              </td>
+              <td className="px-3 py-2 max-w-[16rem] truncate text-xs">
+                {row.note ?? "—"}
+              </td>
+              <td className="px-3 py-2">
+                <div className="flex justify-end gap-1">
+                  {row.persistent && row.state !== "revoked" && (
+                    <button
+                      type="button"
+                      onClick={() => onReveal(row)}
+                      title="Reveal code"
+                      className="rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground"
+                    >
+                      <Eye className="h-3.5 w-3.5" />
+                    </button>
+                  )}
+                  {row.persistent && row.state !== "revoked" && (
+                    <button
+                      type="button"
+                      onClick={() => onToggleEnabled(row)}
+                      disabled={toggleInFlight}
+                      title={row.enabled ? "Pause new claims" : "Resume claims"}
+                      className="rounded p-1 text-muted-foreground hover:bg-muted hover:text-foreground disabled:opacity-50"
+                    >
+                      {row.enabled ? (
+                        <Pause className="h-3.5 w-3.5" />
+                      ) : (
+                        <Play className="h-3.5 w-3.5" />
+                      )}
+                    </button>
+                  )}
+                  {row.state !== "revoked" && (
+                    <button
+                      type="button"
+                      onClick={() => onRevoke(row)}
+                      title="Revoke"
+                      className="rounded p-1 text-destructive hover:bg-destructive/10"
+                    >
+                      <Trash2 className="h-3.5 w-3.5" />
+                    </button>
+                  )}
+                </div>
+              </td>
+            </tr>
           ))}
         </tbody>
       </table>
@@ -262,182 +306,56 @@ function CodesTable({
   );
 }
 
-function CodeRow({
-  row,
-  onRevoke,
-}: {
-  row: PairingCodeRow;
-  onRevoke: (row: PairingCodeRow) => void;
-}) {
-  const isPending = row.state === "pending";
-  return (
-    <tr className="border-t hover:bg-muted/20">
-      <td className="px-3 py-2 font-mono text-xs">••••••{row.code_last_two}</td>
-      <td className="px-3 py-2">
-        <KindChip kind={row.deployment_kind} />
-      </td>
-      <td className="px-3 py-2 text-xs">
-        {row.server_group_name || (
-          <span className="text-muted-foreground">—</span>
-        )}
-      </td>
-      <td className="px-3 py-2">
-        <StateChip state={row.state} />
-      </td>
-      <td className="px-3 py-2 text-xs text-muted-foreground">
-        {row.note || "—"}
-      </td>
-      <td className="px-3 py-2 text-xs text-muted-foreground">
-        {formatRelative(row.created_at)}
-      </td>
-      <td className="px-3 py-2 text-xs">
-        {row.state === "pending" ? (
-          <CountdownCell expiresAt={row.expires_at} />
-        ) : row.state === "claimed" && row.used_at ? (
-          <span className="text-emerald-700 dark:text-emerald-300">
-            claimed {formatRelative(row.used_at)}
-            {row.used_by_hostname && (
-              <span className="ml-1 text-muted-foreground">
-                · {row.used_by_hostname}
-              </span>
-            )}
-          </span>
-        ) : row.state === "revoked" && row.revoked_at ? (
-          <span className="text-muted-foreground">
-            revoked {formatRelative(row.revoked_at)}
-          </span>
-        ) : (
-          <span className="text-muted-foreground">
-            expired {formatRelative(row.expires_at)}
-          </span>
-        )}
-      </td>
-      <td className="px-3 py-2 text-right">
-        {isPending && (
-          <button
-            type="button"
-            onClick={() => onRevoke(row)}
-            className="rounded p-1 text-destructive hover:bg-destructive/10"
-            title="Revoke code"
-          >
-            <Trash2 className="h-3.5 w-3.5" />
-          </button>
-        )}
-      </td>
-    </tr>
-  );
-}
-
-function KindChip({ kind }: { kind: PairingDeploymentKind }) {
-  // 'both' gets emerald to telegraph "more than one service" at a
-  // glance — visually distinct from the per-service blue / purple.
-  const styles: Record<PairingDeploymentKind, string> = {
-    dns: "bg-blue-500/10 text-blue-700 dark:text-blue-300",
-    dhcp: "bg-purple-500/10 text-purple-700 dark:text-purple-300",
-    both: "bg-emerald-500/10 text-emerald-700 dark:text-emerald-300",
-  };
+function KindChip({ persistent }: { persistent: boolean }) {
   return (
     <span
       className={cn(
-        "rounded-md px-1.5 py-0.5 text-xs font-medium",
-        styles[kind],
+        "inline-flex rounded px-1.5 py-0.5 text-xs",
+        persistent
+          ? "bg-violet-100 text-violet-700 dark:bg-violet-500/15 dark:text-violet-300"
+          : "bg-sky-100 text-sky-700 dark:bg-sky-500/15 dark:text-sky-300",
       )}
     >
-      {KIND_LABEL[kind]}
+      {persistent ? "persistent" : "ephemeral"}
     </span>
   );
 }
 
 function StateChip({ state }: { state: PairingCodeRow["state"] }) {
-  const styles: Record<PairingCodeRow["state"], string> = {
-    pending: "bg-blue-500/10 text-blue-700 dark:text-blue-300",
-    claimed: "bg-emerald-500/10 text-emerald-700 dark:text-emerald-300",
-    expired: "bg-amber-500/10 text-amber-700 dark:text-amber-300",
-    revoked: "bg-zinc-500/10 text-muted-foreground",
+  const cls: Record<PairingCodeRow["state"], string> = {
+    pending:
+      "bg-emerald-100 text-emerald-700 dark:bg-emerald-500/15 dark:text-emerald-300",
+    claimed: "bg-blue-100 text-blue-700 dark:bg-blue-500/15 dark:text-blue-300",
+    disabled:
+      "bg-amber-100 text-amber-700 dark:bg-amber-500/15 dark:text-amber-300",
+    expired: "bg-zinc-100 text-zinc-700 dark:bg-zinc-500/15 dark:text-zinc-300",
+    revoked: "bg-red-100 text-red-700 dark:bg-red-500/15 dark:text-red-300",
   };
   return (
     <span
-      className={cn(
-        "rounded-md px-1.5 py-0.5 text-xs font-medium",
-        styles[state],
-      )}
+      className={cn("inline-flex rounded px-1.5 py-0.5 text-xs", cls[state])}
     >
       {state}
     </span>
   );
 }
 
-function CountdownCell({ expiresAt }: { expiresAt: string }) {
-  const ms = new Date(expiresAt).getTime() - Date.now();
-  if (ms <= 0)
-    return (
-      <span className="text-amber-600 dark:text-amber-400">expiring…</span>
-    );
-  const totalSec = Math.floor(ms / 1000);
-  const mins = Math.floor(totalSec / 60);
-  const secs = totalSec % 60;
-  const pad = (n: number) => n.toString().padStart(2, "0");
-  return (
-    <span className="inline-flex items-center gap-1 font-mono">
-      <Clock className="h-3 w-3 text-muted-foreground" />
-      {mins}:{pad(secs)}
-    </span>
-  );
+function RelativeTime({ iso }: { iso: string }) {
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const t = window.setInterval(() => setNow(Date.now()), 30_000);
+    return () => window.clearInterval(t);
+  }, []);
+  const target = useMemo(() => new Date(iso).getTime(), [iso]);
+  const diffSec = Math.round((target - now) / 1000);
+  if (diffSec < 0) return <span>expired</span>;
+  if (diffSec < 60) return <span>in {diffSec}s</span>;
+  if (diffSec < 3600) return <span>in {Math.round(diffSec / 60)}m</span>;
+  if (diffSec < 86400) return <span>in {Math.round(diffSec / 3600)}h</span>;
+  return <span>in {Math.round(diffSec / 86400)}d</span>;
 }
 
-function formatRelative(iso: string): string {
-  const ms = Date.now() - new Date(iso).getTime();
-  if (ms < 60_000) return "just now";
-  const mins = Math.floor(ms / 60_000);
-  if (mins < 60) return `${mins} min ago`;
-  const hrs = Math.floor(mins / 60);
-  if (hrs < 24) return `${hrs} h ago`;
-  const days = Math.floor(hrs / 24);
-  return `${days} d ago`;
-}
-
-// Card-style radio button for the Agent kind picker. The whole card
-// is clickable; selected state gets a primary border + subtle bg
-// tint so it's obvious at a glance which kind is active.
-function KindRadio({
-  value,
-  title,
-  subtitle,
-  checked,
-  onChange,
-}: {
-  value: PairingDeploymentKind;
-  title: string;
-  subtitle: string;
-  checked: boolean;
-  onChange: () => void;
-}) {
-  return (
-    <label
-      className={cn(
-        "flex cursor-pointer items-start gap-2 rounded-md border p-2.5 text-sm transition-colors",
-        checked
-          ? "border-primary bg-primary/5"
-          : "border-input hover:bg-muted/50",
-      )}
-    >
-      <input
-        type="radio"
-        name="deployment_kind"
-        value={value}
-        checked={checked}
-        onChange={onChange}
-        className="mt-0.5 cursor-pointer"
-      />
-      <div className="min-w-0">
-        <div className="font-medium leading-tight">{title}</div>
-        <div className="text-xs text-muted-foreground">{subtitle}</div>
-      </div>
-    </label>
-  );
-}
-
-// ── Generate-code modal ────────────────────────────────────────────
+// ── Generate modal ──────────────────────────────────────────────────
 
 function GenerateCodeModal({
   onClose,
@@ -446,297 +364,236 @@ function GenerateCodeModal({
   onClose: () => void;
   onCreated: () => void;
 }) {
-  const [deploymentKind, setDeploymentKind] =
-    useState<PairingDeploymentKind>("dns");
-  const [serverGroupId, setServerGroupId] = useState<string>("");
-  const [expiresInMinutes, setExpiresInMinutes] = useState<number>(15);
-  const [note, setNote] = useState<string>("");
+  const [persistent, setPersistent] = useState(false);
+  const [expiresInMinutes, setExpiresInMinutes] = useState<number | null>(15);
+  const [maxClaims, setMaxClaims] = useState<number | "">("");
+  const [note, setNote] = useState("");
   const [generated, setGenerated] = useState<PairingCodeCreated | null>(null);
-  const [copied, setCopied] = useState<boolean>(false);
-  const copiedTimer = useRef<number | null>(null);
 
-  const { data: dnsGroups } = useQuery({
-    queryKey: ["dns-groups"],
-    queryFn: dnsApi.listGroups,
-    staleTime: 60_000,
-  });
-  const { data: dhcpGroups } = useQuery({
-    queryKey: ["dhcp-groups"],
-    queryFn: dhcpApi.listGroups,
-    staleTime: 60_000,
-  });
-
-  // 'both' codes can't pre-assign a group (one column would have to
-  // carry either a DNS or DHCP group id ambiguously). Empty list keeps
-  // the dropdown rendered but disabled.
-  const groupOptions = useMemo(() => {
-    if (deploymentKind === "dns") return dnsGroups ?? [];
-    if (deploymentKind === "dhcp") return dhcpGroups ?? [];
-    return [];
-  }, [deploymentKind, dnsGroups, dhcpGroups]);
-  const groupPickerDisabled = deploymentKind === "both";
-
-  // Reset the group selection whenever the kind changes — a DNS group
-  // id makes no sense paired with a DHCP code, and 'both' rejects any
-  // group entirely.
+  // Reset expiry default when toggling persistent: ephemeral defaults
+  // to 15 min, persistent defaults to "no expiry" (null).
   useEffect(() => {
-    setServerGroupId("");
-  }, [deploymentKind]);
+    setExpiresInMinutes(persistent ? null : 15);
+    if (!persistent) setMaxClaims("");
+  }, [persistent]);
 
-  const createMutation = useMutation({
+  const mutation = useMutation({
     mutationFn: () =>
       appliancePairingApi.create({
-        deployment_kind: deploymentKind,
-        // ``both`` ignores server_group_id at the API layer; sending
-        // null keeps the wire shape clean.
-        server_group_id: groupPickerDisabled ? null : serverGroupId || null,
+        persistent,
         expires_in_minutes: expiresInMinutes,
+        max_claims: persistent && maxClaims !== "" ? Number(maxClaims) : null,
         note: note.trim() || null,
       }),
-    onSuccess: (result) => {
-      setGenerated(result);
+    onSuccess: (body) => {
+      setGenerated(body);
       onCreated();
     },
   });
 
-  async function handleCopy() {
-    if (!generated) return;
-    try {
-      await navigator.clipboard.writeText(generated.code);
-      setCopied(true);
-      if (copiedTimer.current) window.clearTimeout(copiedTimer.current);
-      copiedTimer.current = window.setTimeout(() => setCopied(false), 2000);
-    } catch {
-      // Clipboard may be blocked on insecure contexts. The big mono
-      // box stays selectable — operator can select-and-copy manually.
-    }
-  }
-
-  function handleRegenerate() {
-    setGenerated(null);
-    setCopied(false);
-    // Pre-fill stays — operator just wants another code with the same
-    // shape. The create button below re-triggers the mutation.
-  }
-
-  const errMsg =
-    createMutation.error instanceof Error
-      ? createMutation.error.message
-      : createMutation.error
-        ? String(createMutation.error)
-        : null;
-
   return (
-    <Modal title="New pairing code" onClose={onClose}>
-      <div className="space-y-4">
-        {generated ? (
-          <GeneratedView
-            generated={generated}
-            copied={copied}
-            onCopy={handleCopy}
-            onRegenerate={handleRegenerate}
-            onClose={onClose}
-          />
-        ) : (
-          <>
-            <div className="space-y-3 text-sm">
-              <fieldset>
-                <legend className="text-xs font-medium text-muted-foreground">
-                  Agent kind
-                </legend>
-                <div className="mt-1 grid gap-2 sm:grid-cols-3">
-                  {KIND_OPTIONS.map((opt) => (
-                    <KindRadio
-                      key={opt.value}
-                      value={opt.value}
-                      title={opt.title}
-                      subtitle={opt.subtitle}
-                      checked={deploymentKind === opt.value}
-                      onChange={() => setDeploymentKind(opt.value)}
-                    />
-                  ))}
-                </div>
-              </fieldset>
-
-              <label className="block">
-                <span className="text-xs font-medium text-muted-foreground">
-                  Pre-assign group (optional)
-                </span>
-                <select
-                  value={serverGroupId}
-                  onChange={(e) => setServerGroupId(e.target.value)}
-                  disabled={groupPickerDisabled}
-                  className={cn(inputCls, "mt-1 w-full")}
+    <Modal onClose={onClose} title="New pairing code">
+      {generated ? (
+        <GeneratedView code={generated} onClose={onClose} />
+      ) : (
+        <form
+          onSubmit={(e) => {
+            e.preventDefault();
+            mutation.mutate();
+          }}
+          className="flex flex-col gap-4"
+        >
+          {/* Persistent toggle — two card-style radios */}
+          <fieldset className="flex flex-col gap-2">
+            <legend className="text-sm font-medium">Flavour</legend>
+            <div className="grid grid-cols-2 gap-2">
+              {[
+                {
+                  value: false,
+                  title: "Ephemeral",
+                  subtitle: "Single-use, short expiry",
+                },
+                {
+                  value: true,
+                  title: "Persistent",
+                  subtitle: "Multi-claim, re-revealable",
+                },
+              ].map((opt) => (
+                <label
+                  key={String(opt.value)}
+                  className={cn(
+                    "cursor-pointer rounded-md border p-2",
+                    persistent === opt.value
+                      ? "border-primary bg-primary/5"
+                      : "hover:bg-muted",
+                  )}
                 >
-                  <option value="">— No pre-assignment —</option>
-                  {groupOptions.map((g) => (
-                    <option key={g.id} value={g.id}>
-                      {g.name}
-                    </option>
-                  ))}
-                </select>
-                <p className="mt-1 text-xs text-muted-foreground">
-                  {groupPickerDisabled
-                    ? "Combined DNS + DHCP codes don't support pre-assignment — set the agent's per-service groups through the existing DNS / DHCP UI after it registers."
-                    : "When set, the agent joins this group directly on first contact instead of landing in the default group."}
-                </p>
-              </label>
-
-              <label className="block">
-                <span className="text-xs font-medium text-muted-foreground">
-                  Expires in
-                </span>
-                <select
-                  value={expiresInMinutes}
-                  onChange={(e) => setExpiresInMinutes(Number(e.target.value))}
-                  className={cn(inputCls, "mt-1 w-full")}
-                >
-                  {EXPIRY_OPTIONS.map((opt) => (
-                    <option key={opt.value} value={opt.value}>
-                      {opt.label}
-                    </option>
-                  ))}
-                </select>
-              </label>
-
-              <label className="block">
-                <span className="text-xs font-medium text-muted-foreground">
-                  Note (optional)
-                </span>
-                <input
-                  type="text"
-                  value={note}
-                  onChange={(e) => setNote(e.target.value)}
-                  placeholder="e.g. for dns-west-2"
-                  maxLength={255}
-                  className={cn(inputCls, "mt-1 w-full")}
-                />
-              </label>
+                  <input
+                    type="radio"
+                    className="sr-only"
+                    checked={persistent === opt.value}
+                    onChange={() => setPersistent(opt.value)}
+                  />
+                  <div className="text-sm font-medium">{opt.title}</div>
+                  <div className="text-xs text-muted-foreground">
+                    {opt.subtitle}
+                  </div>
+                </label>
+              ))}
             </div>
+          </fieldset>
 
-            {errMsg && (
-              <div className="rounded-md border border-destructive/40 bg-destructive/10 p-2 text-xs text-destructive">
-                {errMsg}
-              </div>
-            )}
+          <label className="flex flex-col gap-1 text-sm">
+            <span className="text-xs font-medium">
+              Expiry{" "}
+              <span className="text-muted-foreground">
+                {persistent
+                  ? "(optional — leave 0 for no expiry)"
+                  : "(minutes)"}
+              </span>
+            </span>
+            <input
+              type="number"
+              className={inputCls}
+              min={persistent ? 0 : 5}
+              max={persistent ? undefined : 60}
+              value={expiresInMinutes ?? 0}
+              onChange={(e) => {
+                const v = Number(e.target.value);
+                setExpiresInMinutes(persistent && v === 0 ? null : v);
+              }}
+            />
+          </label>
 
-            <div className="flex justify-end gap-2">
-              <button
-                type="button"
-                onClick={onClose}
-                className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                onClick={() => createMutation.mutate()}
-                disabled={createMutation.isPending}
-                className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
-              >
-                {createMutation.isPending ? (
-                  <>
-                    <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                    Generating…
-                  </>
-                ) : (
-                  "Generate code"
-                )}
-              </button>
+          {persistent && (
+            <label className="flex flex-col gap-1 text-sm">
+              <span className="text-xs font-medium">
+                Max claims{" "}
+                <span className="text-muted-foreground">
+                  (blank = unlimited)
+                </span>
+              </span>
+              <input
+                type="number"
+                className={inputCls}
+                min={1}
+                value={maxClaims}
+                onChange={(e) =>
+                  setMaxClaims(e.target.value ? Number(e.target.value) : "")
+                }
+              />
+            </label>
+          )}
+
+          <label className="flex flex-col gap-1 text-sm">
+            <span className="text-xs font-medium">
+              Note <span className="text-muted-foreground">(optional)</span>
+            </span>
+            <input
+              type="text"
+              className={inputCls}
+              maxLength={255}
+              value={note}
+              onChange={(e) => setNote(e.target.value)}
+              placeholder="e.g. staging fleet"
+            />
+          </label>
+
+          {mutation.error && (
+            <div className="rounded-md border border-destructive/40 bg-destructive/10 p-2 text-xs text-destructive">
+              {String((mutation.error as Error).message ?? mutation.error)}
             </div>
-          </>
-        )}
-      </div>
+          )}
+
+          <div className="flex justify-end gap-2">
+            <button
+              type="button"
+              onClick={onClose}
+              className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
+            >
+              Cancel
+            </button>
+            <button
+              type="submit"
+              disabled={mutation.isPending}
+              className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-60"
+            >
+              {mutation.isPending && (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              )}
+              Generate
+            </button>
+          </div>
+        </form>
+      )}
     </Modal>
   );
 }
 
 function GeneratedView({
-  generated,
-  copied,
-  onCopy,
-  onRegenerate,
+  code,
   onClose,
 }: {
-  generated: PairingCodeCreated;
-  copied: boolean;
-  onCopy: () => void;
-  onRegenerate: () => void;
+  code: PairingCodeCreated;
   onClose: () => void;
 }) {
+  const [copied, setCopied] = useState(false);
+  const copyRef = useRef<number | null>(null);
+  const onCopy = async () => {
+    await navigator.clipboard.writeText(code.code);
+    setCopied(true);
+    if (copyRef.current !== null) window.clearTimeout(copyRef.current);
+    copyRef.current = window.setTimeout(() => setCopied(false), 1500);
+  };
   return (
-    <div className="space-y-4">
-      <div className="rounded-md border border-emerald-500/40 bg-emerald-500/10 p-3 text-xs">
-        <div className="flex items-start gap-2">
-          <CheckCircle2 className="mt-0.5 h-4 w-4 flex-shrink-0 text-emerald-700 dark:text-emerald-300" />
-          <div className="space-y-1">
-            <p className="font-medium text-emerald-700 dark:text-emerald-300">
-              Code generated
-            </p>
-            <p className="text-muted-foreground">
-              Note it down or copy it — it is shown only this once. Anyone with
-              this code can claim{" "}
-              {generated.deployment_kind === "both"
-                ? "both DNS + DHCP agent bootstrap keys"
-                : "one agent bootstrap key"}
-              .
-            </p>
-          </div>
-        </div>
-      </div>
-
-      <div className="flex items-center justify-between gap-2 rounded-md border bg-muted/30 px-4 py-3">
-        <span className="select-all text-3xl font-mono tracking-[0.2em]">
-          {generated.code}
-        </span>
+    <div className="flex flex-col gap-3">
+      <p className="text-sm">
+        {code.persistent ? (
+          <>
+            Persistent code minted. The cleartext is{" "}
+            <strong>also recoverable</strong> later via the{" "}
+            <Eye className="inline h-3 w-3" /> reveal action.
+          </>
+        ) : (
+          <>
+            Ephemeral code minted. <strong>Copy it now</strong> — the cleartext
+            is shown exactly once and not recoverable later.
+          </>
+        )}
+      </p>
+      <div className="flex items-center gap-2">
+        <code className="flex-1 rounded-md border bg-muted px-4 py-3 text-center font-mono text-2xl tracking-widest">
+          {code.code}
+        </code>
         <button
           type="button"
           onClick={onCopy}
-          className="inline-flex items-center gap-1.5 rounded-md border bg-background px-2 py-1 text-xs hover:bg-muted"
+          className="rounded-md border p-2 hover:bg-muted"
+          title="Copy"
         >
           {copied ? (
-            <>
-              <CheckCircle2 className="h-3.5 w-3.5 text-emerald-600" />
-              Copied
-            </>
+            <CheckCircle2 className="h-4 w-4 text-emerald-500" />
           ) : (
-            <>
-              <Copy className="h-3.5 w-3.5" />
-              Copy
-            </>
+            <Copy className="h-4 w-4" />
           )}
         </button>
       </div>
-
-      <ExpiryCountdown expiresAt={generated.expires_at} />
-
-      <p className="text-xs text-muted-foreground">
-        On the agent appliance, hit{" "}
-        <code className="rounded bg-muted px-1">
-          POST /api/v1/appliance/pair
-        </code>{" "}
-        with{" "}
-        <code className="rounded bg-muted px-1">
-          {"{"}"code": "{generated.code}", "hostname": "&lt;name&gt;"{"}"}
-        </code>{" "}
-        to swap the code for the real {KIND_LABEL[generated.deployment_kind]}{" "}
-        bootstrap {generated.deployment_kind === "both" ? "keys" : "key"}. The
-        installer wizard prompt for this lands in Phase 4.
-      </p>
-
-      <div className="flex justify-end gap-2">
-        <button
-          type="button"
-          onClick={onRegenerate}
-          className="inline-flex items-center gap-1.5 rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
-        >
-          <RefreshCw className="h-3.5 w-3.5" />
-          Generate another
-        </button>
+      {code.expires_at && (
+        <p className="flex items-center gap-1.5 text-xs text-muted-foreground">
+          <Clock className="h-3 w-3" />
+          Expires <RelativeTime iso={code.expires_at} />
+        </p>
+      )}
+      {code.max_claims != null && (
+        <p className="text-xs text-muted-foreground">
+          Max claims: {code.max_claims}
+        </p>
+      )}
+      <div className="flex justify-end">
         <button
           type="button"
           onClick={onClose}
-          className="rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground hover:bg-primary/90"
+          className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
         >
           Done
         </button>
@@ -745,31 +602,110 @@ function GeneratedView({
   );
 }
 
-function ExpiryCountdown({ expiresAt }: { expiresAt: string }) {
-  const [now, setNow] = useState(() => Date.now());
-  useEffect(() => {
-    const t = setInterval(() => setNow(Date.now()), 1000);
-    return () => clearInterval(t);
-  }, []);
-  const ms = new Date(expiresAt).getTime() - now;
-  if (ms <= 0) {
-    return (
-      <div className="rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
-        This code has expired. Generate another.
-      </div>
-    );
-  }
-  const totalSec = Math.floor(ms / 1000);
-  const mins = Math.floor(totalSec / 60);
-  const secs = totalSec % 60;
-  const pad = (n: number) => n.toString().padStart(2, "0");
+// ── Reveal modal ────────────────────────────────────────────────────
+
+function RevealModal({
+  row,
+  onClose,
+}: {
+  row: PairingCodeRow;
+  onClose: () => void;
+}) {
+  const [password, setPassword] = useState("");
+  const [revealed, setRevealed] = useState<string | null>(null);
+  const [copied, setCopied] = useState(false);
+
+  const mutation = useMutation({
+    mutationFn: () => appliancePairingApi.reveal(row.id, password),
+    onSuccess: (body) => setRevealed(body.code),
+  });
+
+  const onCopy = async () => {
+    if (!revealed) return;
+    await navigator.clipboard.writeText(revealed);
+    setCopied(true);
+    window.setTimeout(() => setCopied(false), 1500);
+  };
+
   return (
-    <div className="flex items-center gap-2 text-xs text-muted-foreground">
-      <Clock className="h-3.5 w-3.5" />
-      Expires in{" "}
-      <span className="font-mono">
-        {mins}:{pad(secs)}
-      </span>
-    </div>
+    <Modal onClose={onClose} title="Reveal pairing code">
+      {revealed ? (
+        <div className="flex flex-col gap-3">
+          <div className="flex items-center gap-2">
+            <code className="flex-1 rounded-md border bg-muted px-4 py-3 text-center font-mono text-2xl tracking-widest">
+              {revealed}
+            </code>
+            <button
+              type="button"
+              onClick={onCopy}
+              className="rounded-md border p-2 hover:bg-muted"
+              title="Copy"
+            >
+              {copied ? (
+                <CheckCircle2 className="h-4 w-4 text-emerald-500" />
+              ) : (
+                <Copy className="h-4 w-4" />
+              )}
+            </button>
+          </div>
+          <div className="flex justify-end">
+            <button
+              type="button"
+              onClick={onClose}
+              className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
+            >
+              Done
+            </button>
+          </div>
+        </div>
+      ) : (
+        <form
+          onSubmit={(e) => {
+            e.preventDefault();
+            mutation.mutate();
+          }}
+          className="flex flex-col gap-3"
+        >
+          <p className="text-xs text-muted-foreground">
+            Re-display the cleartext of this persistent code. Requires
+            confirming your current password (local-auth only).
+          </p>
+          <label className="flex flex-col gap-1 text-sm">
+            <span className="text-xs font-medium">Current password</span>
+            <input
+              type="password"
+              className={inputCls}
+              value={password}
+              onChange={(e) => setPassword(e.target.value)}
+              autoFocus
+            />
+          </label>
+          {mutation.error && (
+            <div className="rounded-md border border-destructive/40 bg-destructive/10 p-2 text-xs text-destructive">
+              {String((mutation.error as Error).message ?? mutation.error)}
+            </div>
+          )}
+          <div className="flex justify-end gap-2">
+            <button
+              type="button"
+              onClick={onClose}
+              className="rounded-md border px-3 py-1.5 text-sm hover:bg-muted"
+            >
+              Cancel
+            </button>
+            <button
+              type="submit"
+              disabled={mutation.isPending || password.length === 0}
+              className="inline-flex items-center gap-1.5 rounded-md bg-primary px-3 py-1.5 text-sm font-medium text-primary-foreground hover:bg-primary/90 disabled:opacity-60"
+            >
+              {mutation.isPending && (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              )}
+              Reveal
+            </button>
+          </div>
+        </form>
+      )}
+    </Modal>
   );
 }

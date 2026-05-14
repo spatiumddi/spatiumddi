@@ -37,6 +37,7 @@ from app.api.v1.appliance import supervisor as supervisor_mod
 from app.models.appliance import (
     APPLIANCE_STATE_PENDING_APPROVAL,
     Appliance,
+    PairingClaim,
     PairingCode,
 )
 from app.models.audit import AuditLog
@@ -61,8 +62,10 @@ async def _make_pairing_code(
     db: AsyncSession,
     *,
     code: str = "12345678",
-    deployment_kind: str = "dns",
     expires_in_minutes: int = 15,
+    persistent: bool = False,
+    enabled: bool = True,
+    max_claims: int | None = None,
     used: bool = False,
     revoked: bool = False,
 ) -> PairingCode:
@@ -70,13 +73,48 @@ async def _make_pairing_code(
         id=uuid.uuid4(),
         code_hash=hashlib.sha256(code.encode("ascii")).hexdigest(),
         code_last_two=code[-2:],
-        deployment_kind=deployment_kind,
+        persistent=persistent,
+        enabled=enabled,
+        max_claims=max_claims,
         expires_at=datetime.now(UTC) + timedelta(minutes=expires_in_minutes),
-        used_at=datetime.now(UTC) if used else None,
         revoked_at=datetime.now(UTC) if revoked else None,
     )
     db.add(row)
     await db.flush()
+    if used:
+        # Wave A3 — single-use status is derived from any
+        # ``pairing_claim`` row, not a column on pairing_code. Plant a
+        # fake appliance + claim row so the code reads as already-used.
+        from cryptography.hazmat.primitives.asymmetric.ed25519 import (
+            Ed25519PrivateKey,
+        )
+        from cryptography.hazmat.primitives.serialization import (
+            Encoding,
+            PublicFormat,
+        )
+
+        fake_priv = Ed25519PrivateKey.generate()
+        fake_der = fake_priv.public_key().public_bytes(
+            encoding=Encoding.DER, format=PublicFormat.SubjectPublicKeyInfo
+        )
+        fake_fp = hashlib.sha256(fake_der).hexdigest()
+        fake_appliance = Appliance(
+            id=uuid.uuid4(),
+            hostname="prior-supervisor",
+            public_key_der=fake_der,
+            public_key_fingerprint=fake_fp,
+            paired_via_code_id=row.id,
+            state=APPLIANCE_STATE_PENDING_APPROVAL,
+        )
+        db.add(fake_appliance)
+        db.add(
+            PairingClaim(
+                pairing_code_id=row.id,
+                appliance_id=fake_appliance.id,
+                hostname="prior-supervisor",
+            )
+        )
+        await db.flush()
     return row
 
 
@@ -124,9 +162,9 @@ async def test_register_404s_while_flag_disabled(
     )
     assert resp.status_code == 404, resp.text
 
-    # Pairing code untouched.
-    row = (await db_session.execute(select(PairingCode))).scalars().one()
-    assert row.used_at is None
+    # Pairing code untouched — no claim row written.
+    claim_count = (await db_session.execute(select(PairingClaim))).scalars().first()
+    assert claim_count is None
     assert (await db_session.execute(select(Appliance))).scalars().first() is None
 
 
@@ -153,10 +191,18 @@ async def test_register_happy_path(db_session: AsyncSession, client: AsyncClient
     assert body["state"] == APPLIANCE_STATE_PENDING_APPROVAL
     assert body["public_key_fingerprint"] == fingerprint
 
-    # Pairing code burned.
-    await db_session.refresh(code_row)
-    assert code_row.used_at is not None
-    assert code_row.used_by_hostname == "dns-east-1"
+    # Pairing claim row written (replaces #169's used_at columns).
+    claim = (
+        (
+            await db_session.execute(
+                select(PairingClaim).where(PairingClaim.pairing_code_id == code_row.id)
+            )
+        )
+        .scalars()
+        .one()
+    )
+    assert claim.hostname == "dns-east-1"
+    assert claim.appliance_id == appliance_id
 
     # Appliance row written.
     appliance = await db_session.get(Appliance, appliance_id)
@@ -225,13 +271,22 @@ async def test_register_is_idempotent_for_same_pubkey(
     assert second.status_code == 200, second.text
     assert second.json()["appliance_id"] == first_id
 
-    # The SECOND pairing code is still unused (idempotent path
-    # short-circuits before touching it).
+    # The SECOND pairing code is still unused — no claim row written
+    # against it (idempotent path short-circuits before touching).
     stmt = select(PairingCode).where(
         PairingCode.code_hash == hashlib.sha256(b"44444444").hexdigest()
     )
     second_code = (await db_session.execute(stmt)).scalar_one()
-    assert second_code.used_at is None
+    second_claims = (
+        (
+            await db_session.execute(
+                select(PairingClaim).where(PairingClaim.pairing_code_id == second_code.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert second_claims == []
 
     # Version was updated on the existing row.
     appliance = await db_session.get(Appliance, uuid.UUID(first_id))
@@ -257,8 +312,17 @@ async def test_register_rejects_malformed_pubkey_without_burning_code(
     )
     assert resp.status_code == 422, resp.text
 
-    await db_session.refresh(code_row)
-    assert code_row.used_at is None
+    # No claim row written — 422 hits before the pairing-code touch.
+    claims = (
+        (
+            await db_session.execute(
+                select(PairingClaim).where(PairingClaim.pairing_code_id == code_row.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert claims == []
 
 
 @pytest.mark.asyncio
@@ -334,22 +398,103 @@ async def test_register_collapses_pairing_failure_modes_to_403(
 
 
 @pytest.mark.asyncio
-async def test_register_works_with_any_deployment_kind(
+async def test_register_persistent_code_admits_multiple_supervisors(
     db_session: AsyncSession, client: AsyncClient
 ) -> None:
-    """The supervisor flow doesn't care which deployment_kind the
-    pairing code was minted for — A3 will drop the column, but in A2
-    we just don't gate on it."""
+    """A3 persistent-code semantics — same code can be claimed by N
+    distinct supervisors; the pairing_claim child table accumulates
+    one row per claim."""
     await _enable_supervisor_registration(db_session)
-    await _make_pairing_code(db_session, code="88888888", deployment_kind="dhcp")
+    code_row = await _make_pairing_code(db_session, code="88888888", persistent=True, max_claims=3)
+    await db_session.commit()
+
+    # Three distinct supervisors all claim the same persistent code.
+    appliance_ids: list[str] = []
+    for n in range(3):
+        _, _, _, pubkey_b64 = _new_keypair()
+        resp = await client.post(
+            "/api/v1/appliance/supervisor/register",
+            json={
+                "pairing_code": "88888888",
+                "hostname": f"dns-edge-{n}",
+                "public_key_der_b64": pubkey_b64,
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        appliance_ids.append(resp.json()["appliance_id"])
+
+    # Three claim rows + three appliance rows, all distinct.
+    claims = (
+        (
+            await db_session.execute(
+                select(PairingClaim).where(PairingClaim.pairing_code_id == code_row.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(claims) == 3
+    assert {str(c.appliance_id) for c in claims} == set(appliance_ids)
+
+    # Fourth claim hits max_claims → 403 (exhausted).
+    _, _, _, pubkey_b64 = _new_keypair()
+    resp = await client.post(
+        "/api/v1/appliance/supervisor/register",
+        json={
+            "pairing_code": "88888888",
+            "hostname": "dns-edge-overflow",
+            "public_key_der_b64": pubkey_b64,
+        },
+    )
+    assert resp.status_code == 403, resp.text
+
+
+@pytest.mark.asyncio
+async def test_register_persistent_disabled_code_rejects_new_claims(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    """Persistent code with enabled=False — new claims get 403; the
+    audit_log denial reason carries 'disabled'."""
+    await _enable_supervisor_registration(db_session)
+    await _make_pairing_code(db_session, code="55555555", persistent=True, enabled=False)
     await db_session.commit()
     _, _, _, pubkey_b64 = _new_keypair()
 
     resp = await client.post(
         "/api/v1/appliance/supervisor/register",
         json={
-            "pairing_code": "88888888",
-            "hostname": "dhcp-east-1",
+            "pairing_code": "55555555",
+            "hostname": "dns-paused-fleet",
+            "public_key_der_b64": pubkey_b64,
+        },
+    )
+    assert resp.status_code == 403, resp.text
+
+
+@pytest.mark.asyncio
+async def test_register_no_expiry_persistent_code_accepts(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    """A3 lets persistent codes carry expires_at=NULL ('no expiry').
+    The endpoint must not 403 such a code as 'expired'."""
+    await _enable_supervisor_registration(db_session)
+    row = PairingCode(
+        id=uuid.uuid4(),
+        code_hash=hashlib.sha256(b"66666660").hexdigest(),
+        code_last_two="60",
+        persistent=True,
+        enabled=True,
+        expires_at=None,
+    )
+    db_session.add(row)
+    await db_session.commit()
+
+    _, _, _, pubkey_b64 = _new_keypair()
+    resp = await client.post(
+        "/api/v1/appliance/supervisor/register",
+        json={
+            "pairing_code": "66666660",
+            "hostname": "dns-no-expiry",
             "public_key_der_b64": pubkey_b64,
         },
     )

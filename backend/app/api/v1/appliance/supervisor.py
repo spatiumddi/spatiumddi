@@ -51,12 +51,14 @@ from cryptography.hazmat.primitives.serialization import (
 )
 from fastapi import APIRouter, HTTPException, Request, status
 from pydantic import BaseModel, Field, field_validator
+from sqlalchemy import func as sa_func
 from sqlalchemy import select
 
 from app.api.deps import DB
 from app.models.appliance import (
     APPLIANCE_STATE_PENDING_APPROVAL,
     Appliance,
+    PairingClaim,
     PairingCode,
 )
 from app.models.audit import AuditLog
@@ -263,15 +265,40 @@ async def supervisor_register(
     stmt = select(PairingCode).where(PairingCode.code_hash == submitted_hash)
     code_row = (await db.execute(stmt)).scalar_one_or_none()
 
+    # Claim count for the code — disambiguates ephemeral (single-use)
+    # from persistent (multi-use) gating below.
+    claim_count = 0
+    if code_row is not None:
+        claim_count = int(
+            (
+                await db.execute(
+                    select(sa_func.count(PairingClaim.id)).where(
+                        PairingClaim.pairing_code_id == code_row.id
+                    )
+                )
+            ).scalar_one()
+        )
+
     failure_reason: str | None = None
     if code_row is None:
         failure_reason = "unknown_code"
-    elif code_row.used_at is not None:
-        failure_reason = "already_used"
     elif code_row.revoked_at is not None:
         failure_reason = "revoked"
-    elif code_row.expires_at <= now:
+    elif code_row.expires_at is not None and code_row.expires_at <= now:
         failure_reason = "expired"
+    elif not code_row.persistent and claim_count > 0:
+        # Ephemeral codes: any prior claim disqualifies the code from
+        # future claims (today's #169 single-use semantics).
+        failure_reason = "already_used"
+    elif code_row.persistent and not code_row.enabled:
+        # Persistent code paused by admin.
+        failure_reason = "disabled"
+    elif (
+        code_row.persistent
+        and code_row.max_claims is not None
+        and claim_count >= code_row.max_claims
+    ):
+        failure_reason = "exhausted"
 
     if failure_reason is not None:
         db.add(
@@ -316,12 +343,10 @@ async def supervisor_register(
     if not hmac.compare_digest(code_row.code_hash, submitted_hash):  # pragma: no cover
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Hash mismatch.")
 
-    # Burn the code + create the appliance row atomically.
+    # Create the appliance row + the pairing_claim audit row
+    # atomically. PairingCode no longer carries used_at semantics —
+    # claim accounting lives in pairing_claim now (A3).
     appliance_id = uuid.uuid4()
-    code_row.used_at = now
-    code_row.used_by_ip = client_ip
-    code_row.used_by_hostname = body.hostname
-
     appliance_row = Appliance(
         id=appliance_id,
         hostname=body.hostname,
@@ -334,6 +359,15 @@ async def supervisor_register(
         state=APPLIANCE_STATE_PENDING_APPROVAL,
     )
     db.add(appliance_row)
+    db.add(
+        PairingClaim(
+            pairing_code_id=code_row.id,
+            appliance_id=appliance_id,
+            claimed_at=now,
+            claimed_from_ip=client_ip,
+            hostname=body.hostname,
+        )
+    )
 
     # Audit row pair — claim + registration. Two rows make it easier
     # to filter for "appliance lifecycle" in the audit UI without

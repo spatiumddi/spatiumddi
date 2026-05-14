@@ -21,7 +21,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, LargeBinary, String, Text, func
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, LargeBinary, String, Text, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -137,38 +137,39 @@ class ApplianceCertificate(Base):
     csr_subject: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
 
 
-# Deployment kinds a pairing code may target. ``"both"`` provisions an
-# agent appliance that runs BIND9 + Kea simultaneously (one box, both
-# services) — the consume endpoint returns both bootstrap keys in that
-# case. The fully generic ``"agent"`` role (post-join role assignment
-# from the control plane) is #170.
-PAIRING_KIND_DNS = "dns"
-PAIRING_KIND_DHCP = "dhcp"
-PAIRING_KIND_BOTH = "both"
-PAIRING_KINDS = (PAIRING_KIND_DNS, PAIRING_KIND_DHCP, PAIRING_KIND_BOTH)
-
-
 class PairingCode(Base):
-    """Short-lived, single-use code that an agent installer swaps for
-    the real ``DNS_AGENT_KEY`` / ``DHCP_AGENT_KEY`` bootstrap key.
+    """Pairing code minted by an admin so a new supervisor appliance
+    can join the fleet (#169 + #170 Wave A3 reshape).
 
-    Operator generates the code on the control plane (8 decimal
-    digits, default 15-min expiry, optional pre-assigned group). Agent
-    POSTs ``/api/v1/appliance/pair {code, hostname}`` to redeem it.
+    Two flavours:
+
+    * **Ephemeral** (``persistent=False``, today's behaviour). Single-
+      use, short expiry (default 15 min). Operator mints one per
+      install. Consumed via ``POST /api/v1/appliance/supervisor/
+      register`` — the consume side writes a ``pairing_claim`` row
+      against the new ``appliance`` and the code is dead.
+    * **Persistent** (``persistent=True``). Re-usable across N
+      appliances (think "the staging-fleet code"). Default no expiry;
+      admin can set one. ``enabled`` toggles whether new claims are
+      accepted without revoking the code. ``max_claims`` optionally
+      caps the number of claims; NULL = unlimited.
 
     Security model:
 
     * Code is stored as sha256 — the cleartext is shown exactly once
-      on creation and never persisted. An attacker with read access
-      to this table can't trivially replay a pending code, though
-      sha256 of 8-digit decimal IS rainbow-tableable; this is
-      defense-in-depth, not the primary gate.
-    * Single-use: ``used_at`` non-null disqualifies subsequent
-      attempts.
-    * Time-bound: ``expires_at`` enforced at consume time, plus a
-      Celery reaper that DELETEs old rows.
-    * Audit log captures create / claim / revoke / expire so abusive
-      consume attempts are at least visible after the fact.
+      on creation and persisted nowhere. Persistent codes can be
+      *re-displayed* via a password-gated reveal endpoint that rotates
+      the code (mint a new cleartext + replace code_hash atomically;
+      existing claims are unaffected since FKs live on ``id``).
+      Ephemeral codes are NOT re-displayable — losing the cleartext
+      means minting a new ephemeral code.
+    * ``revoked_at`` permanently kills a code. ``enabled=False`` on
+      a persistent code temporarily pauses new claims without
+      losing the row.
+    * Claim accounting lives in the ``pairing_claim`` child table —
+      one row per (code, supervisor) successful claim. The presence
+      of any claim against an ephemeral code disqualifies it from
+      future claims.
     """
 
     __tablename__ = "pairing_code"
@@ -185,35 +186,40 @@ class PairingCode(Base):
     # from the full 8 digits + expiry + single-use, not from this.
     code_last_two: Mapped[str] = mapped_column(String(2), nullable=False)
 
-    # ``dns`` | ``dhcp`` — picks which bootstrap key the consume endpoint
-    # returns. Enforced at the DB layer by a CHECK constraint (see
-    # migration) so we can never silently issue a code for an unknown
-    # kind even if the API layer bug-paths around its own validator.
-    deployment_kind: Mapped[str] = mapped_column(String(16), nullable=False)
-
-    # Optional pre-assignment. Stored as a free-form UUID rather than
-    # a FK because the column is polymorphic across
-    # ``dns_server_group`` and ``dhcp_server_group``; the kind picks
-    # which table the UUID points into. The create endpoint validates
-    # the group actually exists for the given kind.
-    server_group_id: Mapped[uuid.UUID | None] = mapped_column(UUID(as_uuid=True), nullable=True)
-
-    # Wall-clock expiry. Codes past their expiry are refused at consume
-    # time even before the reaper sweeps them.
-    expires_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, index=True
+    # Wall-clock expiry. NULL = no expiry (persistent codes default
+    # to this; admin can override). Ephemeral codes always carry an
+    # expiry — validated at the API layer.
+    expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, index=True
     )
 
-    # Claim state. All three set atomically when the consume endpoint
-    # succeeds; ``used_at`` non-null is the canonical "this code is
-    # dead" signal.
-    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    used_by_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    used_by_hostname: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    # When True the code can be claimed by N appliances; when False
+    # it's single-use (today's #169 default). A claim sweep at the
+    # supervisor-register endpoint enforces single-use by checking
+    # for any existing pairing_claim row.
+    persistent: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
 
-    # Operator-driven cancellation. Independent of ``used_at`` —
-    # revoking a code that's already been claimed is a no-op for the
-    # consume endpoint but still useful audit signal.
+    # Only meaningful for persistent=True. Admin can pause new claims
+    # without deleting the code (e.g. "freeze the staging fleet code
+    # until the migration finishes"). Already-claimed appliances are
+    # unaffected — their cert lives on its own track.
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+    # Optional ceiling on claims for persistent codes. NULL = unlimited.
+    # Lets an operator hand out a "this code admits up to 50 boxes"
+    # token without re-issuing.
+    max_claims: Mapped[int | None] = mapped_column(Integer, nullable=True)
+
+    # Fernet-encrypted cleartext of the 8-digit code. Populated ONLY
+    # for persistent codes — the /reveal endpoint decrypts it after a
+    # password re-check. Ephemeral codes leave this NULL (cleartext is
+    # shown once on create and gone forever, matching #169 semantics).
+    code_encrypted: Mapped[bytes | None] = mapped_column(LargeBinary, nullable=True)
+
+    # Operator-driven cancellation. Independent of enabled —
+    # revoking a code is permanent ("dead row"), disabling is
+    # reversible ("paused"). Revoking a claimed code is a no-op for
+    # already-issued certs but still useful audit signal.
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     revoked_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("user.id", ondelete="SET NULL"), nullable=True
@@ -229,6 +235,44 @@ class PairingCode(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
+
+
+class PairingClaim(Base):
+    """One row per (pairing_code, supervisor) successful claim.
+
+    Ephemeral codes: at most one row (subsequent claim attempts hit
+    the single-use gate). Persistent codes: many rows, one per
+    registered supervisor. The UNIQUE(pairing_code_id, appliance_id)
+    constraint makes the re-register-from-cache idempotent path
+    (supervisor restarts mid-claim, retries with same pubkey) safe:
+    the second call hits the existing row instead of writing a
+    duplicate.
+
+    ON DELETE CASCADE both ways — deleting a pairing code drops its
+    claim audit; deleting an approved appliance drops its claim row.
+    The permanent audit-log row carries the durable history.
+    """
+
+    __tablename__ = "pairing_claim"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    pairing_code_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("pairing_code.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    appliance_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("appliance.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    claimed_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    claimed_from_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    hostname: Mapped[str | None] = mapped_column(String(255), nullable=True)
 
 
 # Supervisor lifecycle states (#170 Wave A2). State machine:

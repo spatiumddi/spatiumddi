@@ -7037,49 +7037,64 @@ export const applianceFleetApi = {
 };
 
 // ── Appliance: pairing codes (issue #169) ──────────────────────────
-// Short-lived 8-digit codes the agent installer swaps for the real
-// DNS_AGENT_KEY / DHCP_AGENT_KEY bootstrap key. The cleartext code is
-// returned exactly once in the create response — the list endpoint
-// only ever surfaces the last two digits.
-// ``both`` mints a single code that hands back both DNS + DHCP
-// bootstrap keys on consume — for an appliance running BIND9 + Kea
-// simultaneously.
-export type PairingDeploymentKind = "dns" | "dhcp" | "both";
-export type PairingCodeState = "pending" | "claimed" | "expired" | "revoked";
+// Pairing codes (#169 + #170 Wave A3 reshape).
+//
+// Two flavours:
+//   * Ephemeral (persistent=false) — single-use, short expiry,
+//     cleartext shown once on create.
+//   * Persistent (persistent=true) — multi-claim; default no expiry;
+//     admin can disable / re-reveal the cleartext via Fernet decrypt
+//     after a password re-check.
+//
+// The consume side is no longer /pair — supervisors claim via
+// POST /api/v1/appliance/supervisor/register (Wave A2). Legacy
+// /pair is gone in Wave A3.
+export type PairingCodeState =
+  | "pending"
+  | "claimed"
+  | "expired"
+  | "revoked"
+  | "disabled";
 
 export interface PairingCodeCreate {
-  deployment_kind: PairingDeploymentKind;
-  server_group_id?: string | null;
-  expires_in_minutes?: number;
+  persistent: boolean;
+  expires_in_minutes?: number | null;
+  max_claims?: number | null;
   note?: string | null;
 }
 
 export interface PairingCodeCreated {
   id: string;
-  // 8-digit cleartext code. Shown once on create + never persisted.
+  // 8-digit cleartext code. Shown once on create. For persistent
+  // codes the cleartext is also recoverable via /reveal; for
+  // ephemeral codes this is the only chance to record it.
   code: string;
-  deployment_kind: PairingDeploymentKind;
-  server_group_id: string | null;
+  persistent: boolean;
+  enabled: boolean;
+  expires_at: string | null;
+  max_claims: number | null;
   note: string | null;
-  expires_at: string;
   created_at: string;
 }
 
 export interface PairingCodeRow {
   id: string;
   code_last_two: string;
-  deployment_kind: PairingDeploymentKind;
-  server_group_id: string | null;
-  server_group_name: string | null;
-  note: string | null;
+  persistent: boolean;
+  enabled: boolean;
   state: PairingCodeState;
-  expires_at: string;
-  used_at: string | null;
-  used_by_ip: string | null;
-  used_by_hostname: string | null;
+  expires_at: string | null;
+  max_claims: number | null;
+  claim_count: number;
   revoked_at: string | null;
+  note: string | null;
   created_at: string;
   created_by_user_id: string | null;
+}
+
+export interface PairingCodeRevealResponse {
+  id: string;
+  code: string;
 }
 
 export const appliancePairingApi = {
@@ -7093,6 +7108,19 @@ export const appliancePairingApi = {
       .then((r) => r.data),
   revoke: (id: string) =>
     api.delete<void>(`/appliance/pairing-codes/${id}`).then((r) => r.data),
+  enable: (id: string) =>
+    api.post<void>(`/appliance/pairing-codes/${id}/enable`).then((r) => r.data),
+  disable: (id: string) =>
+    api
+      .post<void>(`/appliance/pairing-codes/${id}/disable`)
+      .then((r) => r.data),
+  reveal: (id: string, password: string) =>
+    api
+      .post<PairingCodeRevealResponse>(
+        `/appliance/pairing-codes/${id}/reveal`,
+        { password },
+      )
+      .then((r) => r.data),
 };
 
 // ── Appliance: container management (Phase 4d) ─────────────────────
