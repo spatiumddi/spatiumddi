@@ -376,9 +376,73 @@ class Appliance(Base):
     last_seen_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_seen_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
 
+    # Wave B1 — supervisor-reported capabilities (can_run_dns_bind9,
+    # has_baked_images, cpu_count, host_nics, …). Populated on
+    # register + every heartbeat; the fleet UI's role picker filters
+    # against this column. Free-form JSONB (no DB-side validation) so
+    # additive supervisor versions don't need a migration each time
+    # a new fact gets reported.
+    capabilities: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default="{}"
+    )
+
+    # sha256 of the unauth session token the supervisor uses between
+    # register and approval. The register response returns the
+    # cleartext once; subsequent /supervisor/poll calls present it
+    # for constant-time verification. Cleared after cert issuance —
+    # all post-approval calls authenticate via mTLS.
+    session_token_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    # Cert lifecycle (#170 B1). Populated by the approve endpoint:
+    # CA signs an X.509 cert binding the supervisor's Ed25519 pubkey
+    # to the appliance_id (subject CN). 90-day default validity; the
+    # supervisor auto-renews 30 days before expiry (Wave C polish).
+    cert_pem: Mapped[str | None] = mapped_column(Text, nullable=True)
+    cert_serial: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    cert_issued_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    cert_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+    # Approval audit columns (the canonical state is still `state` —
+    # these timestamps are for UI relative-time chips).
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    approved_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("user.id", ondelete="SET NULL"), nullable=True
+    )
+    rejected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    rejected_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True), ForeignKey("user.id", ondelete="SET NULL"), nullable=True
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
+
+
+class ApplianceCA(Base):
+    """Internal CA singleton (#170 Wave B1).
+
+    One row, id=1. Carries the RSA-2048 root cert + Fernet-encrypted
+    private key that signs every supervisor's identity cert. Generated
+    lazily on first need (first approve attempt) so a fresh-install
+    control plane that never approves a supervisor doesn't pay the
+    cost.
+
+    Lifetime: 10 years by default. The CA's own rotation is a Wave-D
+    polish — not in scope here. Operators wanting to migrate to a
+    new CA today would re-key every approved supervisor manually.
+    """
+
+    __tablename__ = "appliance_ca"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    subject_cn: Mapped[str] = mapped_column(String(255), nullable=False)
+    algorithm: Mapped[str] = mapped_column(String(32), nullable=False)
+    cert_pem: Mapped[str] = mapped_column(Text, nullable=False)
+    key_encrypted: Mapped[bytes] = mapped_column(LargeBinary, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)

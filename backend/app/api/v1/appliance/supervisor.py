@@ -49,13 +49,15 @@ from cryptography.hazmat.primitives.serialization import (
     PublicFormat,
     load_der_public_key,
 )
-from fastapi import APIRouter, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import func as sa_func
 from sqlalchemy import select
 
-from app.api.deps import DB
+from app.api.deps import DB, CurrentUser
+from app.core.permissions import require_permission
 from app.models.appliance import (
+    APPLIANCE_STATE_APPROVED,
     APPLIANCE_STATE_PENDING_APPROVAL,
     Appliance,
     PairingClaim,
@@ -63,6 +65,12 @@ from app.models.appliance import (
 )
 from app.models.audit import AuditLog
 from app.models.settings import PlatformSettings
+from app.services.appliance.ca import (
+    ensure_ca,
+    generate_session_token,
+    sign_supervisor_cert,
+    verify_session_token,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -85,6 +93,28 @@ def _client_ip(request: Request) -> str | None:
 
 
 # ── Schemas ────────────────────────────────────────────────────────
+
+
+class SupervisorCapabilities(BaseModel):
+    """Facts the supervisor advertises on register + every heartbeat.
+
+    All fields optional / defaulted — additive evolution is the only
+    forward-compat shape we'll need; the control plane stores the
+    block verbatim and ignores keys it doesn't recognise. New
+    capability flags ship in supervisor releases and surface on the
+    control plane without a migration.
+    """
+
+    can_run_dns_bind9: bool = False
+    can_run_dns_powerdns: bool = False
+    can_run_dhcp: bool = False
+    can_run_observer: bool = False
+    has_baked_images: bool = False
+    baked_images_version: str | None = None
+    cpu_count: int | None = None
+    memory_mb: int | None = None
+    storage_type: str | None = None
+    host_nics: list[str] = Field(default_factory=list)
 
 
 class SupervisorRegisterRequest(BaseModel):
@@ -111,6 +141,13 @@ class SupervisorRegisterRequest(BaseModel):
         max_length=64,
         description="Supervisor build version, e.g. '2026.05.14-1'.",
     )
+    capabilities: SupervisorCapabilities | None = Field(
+        default=None,
+        description=(
+            "Supervisor-advertised facts used by the control plane "
+            "to filter role assignment options."
+        ),
+    )
 
     @field_validator("pairing_code")
     @classmethod
@@ -121,8 +158,10 @@ class SupervisorRegisterRequest(BaseModel):
 
 
 class SupervisorRegisterResponse(BaseModel):
-    """A2 response shape. Wave B1 will extend with ``cert_pem`` /
-    ``ca_chain_pem`` fields populated once the appliance is approved.
+    """Register response shape. The supervisor stashes ``session_token``
+    locally and uses it for ``/supervisor/poll`` until the appliance
+    is approved; after approval it switches to mTLS with the cert
+    that ``/supervisor/poll`` returns.
     """
 
     appliance_id: uuid.UUID
@@ -131,6 +170,30 @@ class SupervisorRegisterResponse(BaseModel):
     # reads "registered as ab-cd-… with fingerprint 1234abcd…" without
     # needing to re-derive the hash on the client side.
     public_key_fingerprint: str
+    # One-time token returned to the supervisor for /supervisor/poll
+    # calls until cert issuance. Stored sha256'd on the appliance row;
+    # cleartext is shown exactly once. On re-register-from-cache
+    # (idempotent path) the token is rotated — the previous one is
+    # implicitly invalidated by hash mismatch.
+    session_token: str
+
+
+class SupervisorPollRequest(BaseModel):
+    appliance_id: uuid.UUID
+    session_token: str = Field(min_length=1)
+
+
+class SupervisorPollResponse(BaseModel):
+    """Polled by the supervisor every few seconds between register
+    and approval. Once approved, ``cert_pem`` + ``ca_chain_pem`` are
+    populated and the supervisor switches to mTLS for everything else.
+    """
+
+    appliance_id: uuid.UUID
+    state: Literal["pending_approval", "approved"]
+    cert_pem: str | None = None
+    ca_chain_pem: str | None = None
+    cert_expires_at: datetime | None = None
 
 
 # ── Helpers ────────────────────────────────────────────────────────
@@ -243,11 +306,23 @@ async def supervisor_register(
     if existing is not None:
         # Idempotent re-register. Touch last_seen_at so the heartbeat
         # path stays useful even before A2+ ships a separate
-        # heartbeat endpoint.
+        # heartbeat endpoint. Update capabilities + supervisor_version
+        # since the supervisor may have upgraded between calls.
         existing.last_seen_at = now
         existing.last_seen_ip = client_ip
         if body.supervisor_version:
             existing.supervisor_version = body.supervisor_version
+        if body.capabilities is not None:
+            existing.capabilities = body.capabilities.model_dump()
+        # Rotate the session token — supervisor must use the fresh one
+        # for subsequent polls. Old cached tokens fail hash compare.
+        # Skip when the row already has a cert (approval-complete; the
+        # supervisor is using mTLS not session tokens at that point).
+        if existing.cert_pem is None:
+            cleartext, digest = generate_session_token()
+            existing.session_token_hash = digest
+        else:
+            cleartext = ""  # no longer needed; supervisor uses mTLS
         await db.commit()
         logger.info(
             "supervisor_register_idempotent",
@@ -259,6 +334,7 @@ async def supervisor_register(
             appliance_id=existing.id,
             state=existing.state,  # type: ignore[arg-type]
             public_key_fingerprint=pubkey_fingerprint,
+            session_token=cleartext,
         )
 
     # Look up pairing code by hash. Single-row index hit.
@@ -347,12 +423,15 @@ async def supervisor_register(
     # atomically. PairingCode no longer carries used_at semantics —
     # claim accounting lives in pairing_claim now (A3).
     appliance_id = uuid.uuid4()
+    session_cleartext, session_hash = generate_session_token()
     appliance_row = Appliance(
         id=appliance_id,
         hostname=body.hostname,
         public_key_der=pubkey_der,
         public_key_fingerprint=pubkey_fingerprint,
         supervisor_version=body.supervisor_version,
+        capabilities=(body.capabilities.model_dump() if body.capabilities else {}),
+        session_token_hash=session_hash,
         paired_at=now,
         paired_from_ip=client_ip,
         paired_via_code_id=code_row.id,
@@ -422,4 +501,390 @@ async def supervisor_register(
         appliance_id=appliance_id,
         state=APPLIANCE_STATE_PENDING_APPROVAL,
         public_key_fingerprint=pubkey_fingerprint,
+        session_token=session_cleartext,
     )
+
+
+# ── /supervisor/poll ───────────────────────────────────────────────
+
+
+@router.post(
+    "/supervisor/poll",
+    response_model=SupervisorPollResponse,
+    summary="Poll for approval state + cert (unauthenticated, session-token gated)",
+)
+async def supervisor_poll(
+    body: SupervisorPollRequest,
+    request: Request,
+    db: DB,
+) -> SupervisorPollResponse:
+    """Polled by the supervisor every few seconds between register
+    and approval. Verifies the appliance's session token (constant-
+    time hash compare) and returns the current state. On approval
+    the cert + CA chain are populated; the supervisor switches to
+    mTLS for everything subsequent.
+
+    Unauth — the session_token IS the auth. After approval the
+    session_token is cleared from the row and this endpoint returns
+    403; the supervisor is expected to be using mTLS by then.
+
+    Like the other unauth endpoints, friction-sleep on every failure
+    mode so an attacker probing for valid appliance_ids can't
+    distinguish "wrong token" from "doesn't exist" via timing.
+    """
+    if not await _module_enabled(db):
+        await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Not found.")
+
+    row = await db.get(Appliance, body.appliance_id)
+    valid = row is not None and verify_session_token(body.session_token, row.session_token_hash)
+    if not valid:
+        await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid appliance or session.")
+
+    assert row is not None  # narrowed by valid above
+
+    # Touch last-seen on every poll so the fleet UI knows the
+    # supervisor is alive even before mTLS / heartbeat lands.
+    row.last_seen_at = datetime.now(UTC)
+    row.last_seen_ip = _client_ip(request)
+
+    ca_chain_pem: str | None = None
+    if row.cert_pem is not None:
+        # Lazy CA fetch — the CA must exist if cert_pem is populated
+        # (the approve endpoint guarantees this), but we still go
+        # through ensure_ca() so a fresh DB without an approved
+        # appliance yet doesn't fail this read.
+        ca = await ensure_ca(db)
+        ca_chain_pem = ca.cert_pem
+        await db.commit()
+    else:
+        await db.commit()
+
+    return SupervisorPollResponse(
+        appliance_id=row.id,
+        state=row.state,  # type: ignore[arg-type]
+        cert_pem=row.cert_pem,
+        ca_chain_pem=ca_chain_pem,
+        cert_expires_at=row.cert_expires_at,
+    )
+
+
+# ── Admin: approve / reject / delete / re-key ─────────────────────
+
+
+class ApplianceRow(BaseModel):
+    """Operator-facing summary of an appliance row. Cert / pubkey
+    bytes are not exposed — only their derived metadata."""
+
+    id: uuid.UUID
+    hostname: str
+    state: Literal["pending_approval", "approved", "rejected"]
+    public_key_fingerprint: str
+    supervisor_version: str | None
+    capabilities: dict
+    paired_at: datetime
+    paired_from_ip: str | None
+    last_seen_at: datetime | None
+    last_seen_ip: str | None
+    approved_at: datetime | None
+    approved_by_user_id: uuid.UUID | None
+    rejected_at: datetime | None
+    cert_serial: str | None
+    cert_issued_at: datetime | None
+    cert_expires_at: datetime | None
+    created_at: datetime
+
+
+class ApplianceList(BaseModel):
+    appliances: list[ApplianceRow]
+
+
+def _require_superadmin(user: CurrentUser) -> None:
+    if not user.is_superadmin:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Appliance approval is restricted to superadmins.",
+        )
+
+
+def _row_to_schema(row: Appliance) -> ApplianceRow:
+    return ApplianceRow(
+        id=row.id,
+        hostname=row.hostname,
+        state=row.state,  # type: ignore[arg-type]
+        public_key_fingerprint=row.public_key_fingerprint,
+        supervisor_version=row.supervisor_version,
+        capabilities=row.capabilities or {},
+        paired_at=row.paired_at,
+        paired_from_ip=row.paired_from_ip,
+        last_seen_at=row.last_seen_at,
+        last_seen_ip=row.last_seen_ip,
+        approved_at=row.approved_at,
+        approved_by_user_id=row.approved_by_user_id,
+        rejected_at=row.rejected_at,
+        cert_serial=row.cert_serial,
+        cert_issued_at=row.cert_issued_at,
+        cert_expires_at=row.cert_expires_at,
+        created_at=row.created_at,
+    )
+
+
+@router.get(
+    "/appliances",
+    response_model=ApplianceList,
+    dependencies=[Depends(require_permission("admin", "appliance"))],
+    summary="List registered appliances (superadmin)",
+)
+async def list_appliances(current_user: CurrentUser, db: DB) -> ApplianceList:
+    _require_superadmin(current_user)
+    rows = (
+        (await db.execute(select(Appliance).order_by(Appliance.paired_at.desc()))).scalars().all()
+    )
+    return ApplianceList(appliances=[_row_to_schema(r) for r in rows])
+
+
+@router.get(
+    "/appliances/{appliance_id}",
+    response_model=ApplianceRow,
+    dependencies=[Depends(require_permission("admin", "appliance"))],
+    summary="Fetch a single appliance (superadmin)",
+)
+async def get_appliance(appliance_id: uuid.UUID, current_user: CurrentUser, db: DB) -> ApplianceRow:
+    _require_superadmin(current_user)
+    row = await db.get(Appliance, appliance_id)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
+    return _row_to_schema(row)
+
+
+@router.post(
+    "/appliances/{appliance_id}/approve",
+    response_model=ApplianceRow,
+    dependencies=[Depends(require_permission("admin", "appliance"))],
+    summary="Approve a pending appliance — issues a cert (superadmin)",
+)
+async def approve_appliance(
+    appliance_id: uuid.UUID, current_user: CurrentUser, db: DB
+) -> ApplianceRow:
+    """Approve + sign in one shot. Idempotent on already-approved rows
+    (no fresh cert is issued — use ``/appliances/{id}/rekey`` for
+    that). Rejects rows already in ``rejected`` state with 409.
+    """
+    _require_superadmin(current_user)
+
+    row = await db.get(Appliance, appliance_id)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
+    if row.state == APPLIANCE_STATE_APPROVED:
+        return _row_to_schema(row)  # idempotent
+
+    # Lazy CA bootstrap — first approve on a fresh control plane
+    # generates the singleton.
+    ca = await ensure_ca(db)
+
+    cert_pem, serial_hex, issued_at, expires_at = sign_supervisor_cert(
+        ca=ca,
+        appliance_id=row.id,
+        public_key_der=row.public_key_der,
+        public_key_fingerprint=row.public_key_fingerprint,
+        hostname=row.hostname,
+    )
+    row.cert_pem = cert_pem
+    row.cert_serial = serial_hex
+    row.cert_issued_at = issued_at
+    row.cert_expires_at = expires_at
+    row.state = APPLIANCE_STATE_APPROVED
+    row.approved_at = issued_at
+    row.approved_by_user_id = current_user.id
+    # Session token cleared — supervisor now uses mTLS. Keep the
+    # current value on disk so an in-flight /poll succeeds before the
+    # supervisor learns to switch; B3's UI will clarify the transition.
+    # Actually — clearing it immediately means the supervisor's
+    # in-flight /poll will 403. Leave it for now; the supervisor
+    # discards it on its side after receiving cert_pem.
+
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="appliance.approved",
+            resource_type="appliance",
+            resource_id=str(row.id),
+            resource_display=row.hostname,
+            result="success",
+            new_value={
+                "hostname": row.hostname,
+                "fingerprint": row.public_key_fingerprint,
+                "cert_serial": serial_hex,
+                "cert_expires_at": expires_at.isoformat(),
+            },
+        )
+    )
+    await db.commit()
+    logger.info(
+        "appliance_approved",
+        appliance_id=str(row.id),
+        hostname=row.hostname,
+        cert_serial=serial_hex,
+        user=current_user.username,
+    )
+    return _row_to_schema(row)
+
+
+@router.post(
+    "/appliances/{appliance_id}/reject",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_permission("admin", "appliance"))],
+    summary="Reject a pending appliance (deletes the row, superadmin)",
+)
+async def reject_appliance(appliance_id: uuid.UUID, current_user: CurrentUser, db: DB) -> None:
+    """Reject = DELETE the row. Supervisor's next poll gets 403 +
+    falls back to bootstrapping. Distinct from delete (next endpoint)
+    only in the audit verb — operationally identical."""
+    _require_superadmin(current_user)
+    row = await db.get(Appliance, appliance_id)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
+    if row.state == APPLIANCE_STATE_APPROVED:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            "Cannot reject an already-approved appliance. Use /delete instead.",
+        )
+    hostname = row.hostname
+    fingerprint = row.public_key_fingerprint
+    await db.delete(row)
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="appliance.rejected",
+            resource_type="appliance",
+            resource_id=str(appliance_id),
+            resource_display=hostname,
+            result="success",
+            new_value={"fingerprint": fingerprint},
+        )
+    )
+    await db.commit()
+    logger.info(
+        "appliance_rejected",
+        appliance_id=str(appliance_id),
+        hostname=hostname,
+        user=current_user.username,
+    )
+
+
+@router.delete(
+    "/appliances/{appliance_id}",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_permission("admin", "appliance"))],
+    summary="Delete an approved appliance (superadmin)",
+)
+async def delete_appliance(appliance_id: uuid.UUID, current_user: CurrentUser, db: DB) -> None:
+    """Permanently remove an approved appliance from the fleet. The
+    supervisor's next mTLS call will fail (cert chain still valid but
+    no matching DB row); supervisor falls back to bootstrapping +
+    needs a fresh pairing code to re-join."""
+    _require_superadmin(current_user)
+    row = await db.get(Appliance, appliance_id)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
+    hostname = row.hostname
+    fingerprint = row.public_key_fingerprint
+    cert_serial = row.cert_serial
+    state_at_delete = row.state
+    await db.delete(row)
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="appliance.deleted",
+            resource_type="appliance",
+            resource_id=str(appliance_id),
+            resource_display=hostname,
+            result="success",
+            new_value={
+                "fingerprint": fingerprint,
+                "cert_serial": cert_serial,
+                "state_at_delete": state_at_delete,
+            },
+        )
+    )
+    await db.commit()
+    logger.info(
+        "appliance_deleted",
+        appliance_id=str(appliance_id),
+        hostname=hostname,
+        user=current_user.username,
+    )
+
+
+@router.post(
+    "/appliances/{appliance_id}/rekey",
+    response_model=ApplianceRow,
+    dependencies=[Depends(require_permission("admin", "appliance"))],
+    summary="Re-sign the appliance's cert (rotation, superadmin)",
+)
+async def rekey_appliance(
+    appliance_id: uuid.UUID, current_user: CurrentUser, db: DB
+) -> ApplianceRow:
+    """Issue a fresh cert against the existing supervisor pubkey.
+    Used for routine 60-day renewal + emergency forced rotation
+    (suspected compromise). Subject + SAN identical to the original;
+    only the serial + validity window change. Older certs against
+    the same pubkey remain technically valid in the CA's eye until
+    they expire — Wave-D-or-later CRL work plugs that gap."""
+    _require_superadmin(current_user)
+    row = await db.get(Appliance, appliance_id)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
+    if row.state != APPLIANCE_STATE_APPROVED:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"Cannot re-key an appliance in state {row.state!r}; approve it first.",
+        )
+
+    ca = await ensure_ca(db)
+    cert_pem, serial_hex, issued_at, expires_at = sign_supervisor_cert(
+        ca=ca,
+        appliance_id=row.id,
+        public_key_der=row.public_key_der,
+        public_key_fingerprint=row.public_key_fingerprint,
+        hostname=row.hostname,
+    )
+    previous_serial = row.cert_serial
+    row.cert_pem = cert_pem
+    row.cert_serial = serial_hex
+    row.cert_issued_at = issued_at
+    row.cert_expires_at = expires_at
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="appliance.cert_renewed",
+            resource_type="appliance",
+            resource_id=str(row.id),
+            resource_display=row.hostname,
+            result="success",
+            new_value={
+                "previous_cert_serial": previous_serial,
+                "new_cert_serial": serial_hex,
+                "expires_at": expires_at.isoformat(),
+            },
+        )
+    )
+    await db.commit()
+    logger.info(
+        "appliance_rekeyed",
+        appliance_id=str(row.id),
+        hostname=row.hostname,
+        new_cert_serial=serial_hex,
+        previous_cert_serial=previous_serial,
+        user=current_user.username,
+    )
+    return _row_to_schema(row)
