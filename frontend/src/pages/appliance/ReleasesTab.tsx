@@ -4,6 +4,7 @@ import {
   AlertCircle,
   Box,
   CheckCircle2,
+  ChevronRight,
   Download,
   ExternalLink,
   Loader2,
@@ -12,6 +13,11 @@ import {
 
 import { applianceReleasesApi, type ApplianceRelease } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
+
+// Number of most-recent releases rendered as full cards. Anything older
+// collapses behind a "Show N older releases" disclosure so the tab
+// stays scannable even after dozens of releases have shipped.
+const FULL_CARDS = 3;
 
 /**
  * Phase 4c — Release management.
@@ -135,17 +141,12 @@ export function ReleasesTab({
           </p>
         </div>
       ) : (
-        <div className="space-y-3">
-          {data.releases.map((rel) => (
-            <ReleaseCard
-              key={rel.tag}
-              release={rel}
-              disabled={data.apply_in_flight}
-              applianceMode={applianceMode}
-              onApply={() => setConfirmTarget(rel)}
-            />
-          ))}
-        </div>
+        <ReleasesList
+          releases={data.releases}
+          applyInFlight={data.apply_in_flight}
+          applianceMode={applianceMode}
+          onApply={(rel) => setConfirmTarget(rel)}
+        />
       )}
 
       {confirmTarget && (
@@ -156,6 +157,161 @@ export function ReleasesTab({
           onConfirm={() => apply.mutate(confirmTarget.tag)}
           submitting={apply.isPending}
           error={apply.isError ? (apply.error as Error).message : null}
+        />
+      )}
+    </div>
+  );
+}
+
+function ReleasesList({
+  releases,
+  applyInFlight,
+  applianceMode,
+  onApply,
+}: {
+  releases: ApplianceRelease[];
+  applyInFlight: boolean;
+  applianceMode: boolean;
+  onApply: (rel: ApplianceRelease) => void;
+}) {
+  // Always render the top ``FULL_CARDS`` as full-detail cards. The
+  // remainder collapses behind a disclosure to keep the page scannable
+  // once the project has shipped dozens of releases. Releases are
+  // returned newest-first from the backend, so a simple slice is fine.
+  const recent = releases.slice(0, FULL_CARDS);
+  const older = releases.slice(FULL_CARDS);
+
+  // If the operator's currently-installed version sits inside the
+  // older bucket (they're behind on upgrades), flag it on the disclosure
+  // so they can find their row without expanding-and-scanning.
+  const installedInOlder = older.find((r) => r.is_installed);
+
+  return (
+    <div className="space-y-3">
+      {recent.map((rel) => (
+        <ReleaseCard
+          key={rel.tag}
+          release={rel}
+          disabled={applyInFlight}
+          applianceMode={applianceMode}
+          onApply={() => onApply(rel)}
+        />
+      ))}
+      {older.length > 0 && (
+        <details
+          className="group rounded-lg border bg-card"
+          open={applyInFlight}
+        >
+          <summary className="flex cursor-pointer items-center gap-2 px-4 py-2.5 text-sm hover:bg-muted/50">
+            <ChevronRight className="h-3.5 w-3.5 shrink-0 text-muted-foreground transition-transform group-open:rotate-90" />
+            <span className="font-medium">
+              Show {older.length} older release{older.length === 1 ? "" : "s"}
+            </span>
+            {installedInOlder && (
+              <span className="inline-flex items-center gap-1 rounded-full bg-primary/10 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-primary">
+                <CheckCircle2 className="h-3 w-3" />
+                installed: {installedInOlder.tag}
+              </span>
+            )}
+          </summary>
+          <div className="divide-y border-t">
+            {older.map((rel) => (
+              <CompactReleaseRow
+                key={rel.tag}
+                release={rel}
+                disabled={applyInFlight}
+                applianceMode={applianceMode}
+                onApply={() => onApply(rel)}
+              />
+            ))}
+          </div>
+        </details>
+      )}
+    </div>
+  );
+}
+
+// One-line compact row used inside the "older releases" disclosure.
+// Notes are collapsed by default behind a click-to-expand — operators
+// scanning for a specific tag shouldn't have to scroll past every
+// release's notes preview.
+function CompactReleaseRow({
+  release,
+  disabled,
+  applianceMode,
+  onApply,
+}: {
+  release: ApplianceRelease;
+  disabled: boolean;
+  applianceMode: boolean;
+  onApply: () => void;
+}) {
+  const [manualOpen, setManualOpen] = useState(false);
+  return (
+    <div className={release.is_installed ? "bg-primary/5" : ""}>
+      <div className="flex items-center gap-2 px-4 py-2">
+        <span className="min-w-0 flex-1 font-mono text-xs">{release.tag}</span>
+        {release.is_installed && (
+          <span className="inline-flex items-center gap-1 rounded-full bg-primary/10 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-primary">
+            <CheckCircle2 className="h-3 w-3" />
+            Installed
+          </span>
+        )}
+        {release.is_prerelease && (
+          <span className="rounded-full bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium uppercase tracking-wide text-amber-700 dark:text-amber-400">
+            Pre
+          </span>
+        )}
+        <span className="shrink-0 text-xs text-muted-foreground">
+          {fmtDate(release.published_at)}
+        </span>
+        <a
+          href={release.html_url}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="inline-flex shrink-0 items-center text-muted-foreground hover:text-foreground"
+          title="Open on GitHub"
+        >
+          <ExternalLink className="h-3 w-3" />
+        </a>
+        {release.is_installed ? (
+          <span className="shrink-0 text-xs text-muted-foreground">Active</span>
+        ) : applianceMode ? (
+          <button
+            type="button"
+            onClick={onApply}
+            disabled={disabled}
+            className="inline-flex shrink-0 items-center gap-1 rounded-md border bg-background px-2 py-1 text-xs font-medium hover:bg-accent disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            <Download className="h-3 w-3" />
+            Apply
+          </button>
+        ) : (
+          <button
+            type="button"
+            onClick={() => setManualOpen(true)}
+            className="inline-flex shrink-0 items-center gap-1 rounded-md border bg-background px-2 py-1 text-xs text-muted-foreground hover:bg-accent"
+            title="Show the operator-run upgrade command for docker / k8s"
+          >
+            <Download className="h-3 w-3" />
+            Manual…
+          </button>
+        )}
+      </div>
+      {release.body && (
+        <details className="px-4 pb-2">
+          <summary className="cursor-pointer text-[11px] text-muted-foreground hover:text-foreground">
+            Release notes
+          </summary>
+          <pre className="mt-1 max-h-48 overflow-auto whitespace-pre-wrap rounded border bg-muted/30 px-2 py-1.5 text-[11px] leading-tight">
+            {release.body}
+          </pre>
+        </details>
+      )}
+      {manualOpen && (
+        <ManualApplyModal
+          tag={release.tag}
+          onClose={() => setManualOpen(false)}
         />
       )}
     </div>
