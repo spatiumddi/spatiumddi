@@ -7236,12 +7236,16 @@ export const applianceApprovalApi = {
   scheduleUpgrade: (
     id: string,
     desired_appliance_version: string,
-    desired_slot_image_url: string,
+    source:
+      | { kind: "url"; url: string }
+      | { kind: "uploaded"; slot_image_id: string },
   ) =>
     api
       .post<ApplianceRow>(`/appliance/appliances/${id}/upgrade`, {
         desired_appliance_version,
-        desired_slot_image_url,
+        ...(source.kind === "url"
+          ? { desired_slot_image_url: source.url }
+          : { slot_image_id: source.slot_image_id }),
       })
       .then((r) => r.data),
   clearUpgrade: (id: string) =>
@@ -7252,6 +7256,56 @@ export const applianceApprovalApi = {
     api
       .post<ApplianceRow>(`/appliance/appliances/${id}/reboot`)
       .then((r) => r.data),
+};
+
+// ── Slot image uploads (#170 follow-up) ────────────────────────────
+// Air-gapped operators upload the .raw.xz directly to the control
+// plane; the backend stores it on a local volume + serves it back
+// under an authenticated internal URL. The supervisor's existing
+// heartbeat → trigger-file → host runner pipeline picks it up
+// unchanged via the appliance row's ``desired_slot_image_url``.
+export interface SlotImage {
+  id: string;
+  filename: string;
+  size_bytes: number;
+  sha256: string;
+  appliance_version: string;
+  uploaded_by_user_id: string | null;
+  uploaded_at: string;
+  notes: string | null;
+}
+
+export const applianceSlotImagesApi = {
+  list: () =>
+    api
+      .get<{ images: SlotImage[] }>("/appliance/slot-images")
+      .then((r) => r.data.images),
+  upload: (
+    file: File,
+    sha256: string,
+    appliance_version: string,
+    notes: string | undefined,
+    onProgress?: (loaded: number, total: number) => void,
+  ) => {
+    const fd = new FormData();
+    fd.append("file", file);
+    fd.append("sha256", sha256);
+    fd.append("appliance_version", appliance_version);
+    if (notes) fd.append("notes", notes);
+    return api
+      .post<SlotImage>("/appliance/slot-images", fd, {
+        // Axios picks the right multipart boundary automatically
+        // when the body is a FormData; explicit Content-Type would
+        // strip the boundary.
+        headers: { "Content-Type": undefined },
+        onUploadProgress: (e) => {
+          if (onProgress && e.total) onProgress(e.loaded, e.total);
+        },
+      })
+      .then((r) => r.data);
+  },
+  remove: (id: string) =>
+    api.delete<void>(`/appliance/slot-images/${id}`).then((r) => r.data),
 };
 
 // ── Appliance: container management (Phase 4d) ─────────────────────

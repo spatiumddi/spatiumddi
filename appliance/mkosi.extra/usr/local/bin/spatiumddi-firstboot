@@ -103,49 +103,18 @@ if [ ! -f "$ENV_FILE" ]; then
     # yet (firstboot races docker.service); the compose group_add
     # has the same default.
     DOCKER_GID_VAL=$(stat -c '%g' /var/run/docker.sock 2>/dev/null || echo "999")
-    # #170 Wave B2 role rename: control → full-stack, control-only →
-    # frontend-core, dns-agent-* / dhcp-agent → application (single
-    # generic agent role; the control plane assigns per-role
-    # behaviour after admin approval). spatium-install drops
-    # /etc/spatiumddi/role-config with ROLE + CONTROL_PLANE_URL +
-    # BOOTSTRAP_PAIRING_CODE (application role only). The pre-B2
-    # legacy keys (DNS_AGENT_KEY / DHCP_AGENT_KEY / AGENT_GROUP) are
-    # still parsed for backwards-compat with appliances installed
-    # off an A4-era ISO; the legacy roles below alias to their
-    # post-B2 equivalents so an in-field appliance keeps booting
-    # after a slot upgrade.
+    # spatium-install drops /etc/spatiumddi/role-config with ROLE
+    # (full-stack / frontend-core / application) +
+    # CONTROL_PLANE_URL + BOOTSTRAP_PAIRING_CODE (application only).
     ROLE=full-stack
     INSTALL_CONTROL_PLANE_URL=""
     INSTALL_BOOTSTRAP_PAIRING_CODE=""
-    # Legacy (pre-B2) bridges, only read when the role-config carries
-    # one of the old role names.
-    INSTALL_DNS_AGENT_KEY=""
-    INSTALL_DHCP_AGENT_KEY=""
-    INSTALL_AGENT_GROUP=""
     if [ -f /etc/spatiumddi/role-config ]; then
         # shellcheck disable=SC1091
         . /etc/spatiumddi/role-config
         INSTALL_CONTROL_PLANE_URL="${CONTROL_PLANE_URL:-}"
         INSTALL_BOOTSTRAP_PAIRING_CODE="${BOOTSTRAP_PAIRING_CODE:-}"
-        INSTALL_DNS_AGENT_KEY="${DNS_AGENT_KEY:-}"
-        INSTALL_DHCP_AGENT_KEY="${DHCP_AGENT_KEY:-}"
-        INSTALL_AGENT_GROUP="${AGENT_GROUP:-}"
     fi
-
-    # Map legacy role names onto the new shape. Existing dev / lab
-    # appliances installed off an A4-era ISO keep booting through this
-    # alias path. New installs (B2+) write the post-B2 names directly.
-    case "$ROLE" in
-        control)             ROLE=full-stack ;;
-        control-only)        ROLE=frontend-core ;;
-        dns-agent-bind9|dns-agent-powerdns|dhcp-agent)
-            # Old per-service agents become Application. The control
-            # plane assigns the role + group + DNS engine after admin
-            # approval in the fleet UI; the supervisor pulls the
-            # matching service container then.
-            ROLE=application
-            ;;
-    esac
 
     # COMPOSE_PROFILES drives which services come up.
     #   full-stack    → full control plane + bundled BIND9 + Kea.
@@ -154,12 +123,11 @@ if [ ! -f "$ENV_FILE" ]; then
     #                   page; no service container until the control
     #                   plane assigns a role (Wave C).
     # Agent keys: control planes (full-stack / frontend-core)
-    # generate fresh DNS+DHCP agent keys so the operator can reveal
-    # + paste them into legacy agent installs from the Settings UI.
-    # Application appliances don't need them — the supervisor's
-    # Ed25519 keypair + control-plane-CA-signed cert is the only
-    # identity. .env still carries empty values so compose's env
-    # subst doesn't error.
+    # generate fresh DNS+DHCP agent keys for any legacy in-field
+    # agents still using the PSK path; Application appliances don't
+    # need them — the supervisor's Ed25519 keypair + control-plane-CA-
+    # signed cert is the only identity. .env still carries empty
+    # values so compose's env subst doesn't error.
     BOOTSTRAP_PAIRING_CODE_VAL=""
     case "$ROLE" in
         application)
@@ -422,9 +390,8 @@ fi
 # exposes /health/live on port 8000 (port-mapped to the host). Poll
 # until it answers; that's the "the operator can sign in now" signal.
 #
-# application (and legacy dns-* / dhcp-* roles still running from
-# pre-B2 installs) don't run a local api — there's no /health/live
-# to poll on this box. Instead, confirm every container in the active
+# application doesn't run a local api — there's no /health/live to
+# poll on this box. Instead, confirm every container in the active
 # compose profile reports state=running. The supervisor itself
 # retries forever against the remote control plane, so "containers
 # up" is the strongest signal we can give without a round trip across
@@ -474,7 +441,7 @@ commit_slot_if_healthy() {
 }
 
 case "${APPLIANCE_ROLE:-full-stack}" in
-    full-stack|frontend-core|control|control-only)
+    full-stack|frontend-core)
         echo "Waiting for control plane on http://127.0.0.1:8000/health/live …"
         for i in $(seq 1 60); do
             if curl -fsS --max-time 3 http://127.0.0.1:8000/health/live >/dev/null 2>&1; then

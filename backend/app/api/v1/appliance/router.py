@@ -24,10 +24,10 @@ from pydantic import BaseModel
 
 from app.api.v1.appliance.containers import router as containers_router
 from app.api.v1.appliance.diagnostics import router as diagnostics_router
-from app.api.v1.appliance.fleet import router as fleet_router
 from app.api.v1.appliance.pairing import router as pairing_router
 from app.api.v1.appliance.releases import router as releases_router
 from app.api.v1.appliance.slot import router as slot_router
+from app.api.v1.appliance.slot_images import router as slot_images_router
 from app.api.v1.appliance.supervisor import router as supervisor_router
 from app.api.v1.appliance.system import router as system_router
 from app.api.v1.appliance.tls import router as tls_router
@@ -42,7 +42,10 @@ router = APIRouter()
 router.include_router(tls_router, prefix="/tls")
 router.include_router(releases_router, prefix="/releases")
 router.include_router(slot_router, prefix="/slot-upgrade")
-router.include_router(fleet_router, prefix="/fleet")
+# Slot-image upload for air-gapped fleets — routes already include
+# the ``/slot-images`` prefix in their decorators, so no nested
+# prefix here (matches the supervisor + pairing routers' shape).
+router.include_router(slot_images_router)
 router.include_router(containers_router, prefix="/containers")
 router.include_router(diagnostics_router, prefix="/diagnostics")
 router.include_router(system_router, prefix="/system")

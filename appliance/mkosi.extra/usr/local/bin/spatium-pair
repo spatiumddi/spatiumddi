@@ -1,0 +1,179 @@
+#!/bin/bash
+# spatium-pair — re-enter control plane URL + pairing code on a
+# SpatiumDDI Application appliance after install.
+#
+# When the operator installs an Application appliance, the wizard
+# asks for ``CONTROL_PLANE_URL`` + ``BOOTSTRAP_PAIRING_CODE`` and
+# writes them to ``/etc/spatiumddi/role-config``. The supervisor
+# reads those on first boot, claims the pairing code, and stamps
+# its identity. If the operator typed the wrong code or URL, or the
+# control plane was rebuilt and the appliance needs to re-pair, this
+# tool rewrites the role-config + bounces the supervisor container
+# without a reinstall.
+#
+# Strict appliance-only — refuses to run on docker / k8s deployments
+# (no /etc/spatiumddi/role-config there). Strict ROLE=application
+# only — re-pairing a control plane (full-stack / frontend-core)
+# doesn't apply.
+#
+# Usage:
+#   sudo spatium-pair           # interactive whiptail wizard
+#   sudo spatium-pair --reset   # also clears the supervisor's
+#                                 cached identity (Ed25519 keypair +
+#                                 appliance_id + session_token) so a
+#                                 fully-fresh pair against the new
+#                                 control plane works. Use this when
+#                                 the control plane has been wiped /
+#                                 rebuilt and rejects the existing
+#                                 supervisor identity.
+
+set -uo pipefail
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "spatium-pair must run as root (try: sudo spatium-pair)" >&2
+    exit 1
+fi
+
+ROLE_CONFIG=/etc/spatiumddi/role-config
+ENV_FILE=/etc/spatiumddi/.env
+
+# Strict appliance-only gate — the role-config file is the marker.
+if [ ! -f "$ROLE_CONFIG" ]; then
+    echo "spatium-pair: $ROLE_CONFIG missing — not a SpatiumDDI appliance" >&2
+    echo "(docker / k8s deployments don't use this surface)" >&2
+    exit 1
+fi
+
+# Load + check ROLE.
+# shellcheck disable=SC1090
+. "$ROLE_CONFIG"
+case "${ROLE:-}" in
+    application) ;;
+    *)
+        cat >&2 <<EOF
+spatium-pair: ROLE=${ROLE:-(unset)} in $ROLE_CONFIG
+
+Re-pairing only applies to the ``application`` role — full-stack /
+frontend-core appliances ARE the control plane and don't pair.
+
+If this appliance was installed in the wrong role, reinstall with
+``spatium-install`` against the right role choice.
+EOF
+        exit 1
+        ;;
+esac
+
+RESET_IDENTITY=0
+if [ "${1:-}" = "--reset" ]; then
+    RESET_IDENTITY=1
+fi
+
+# Whiptail wizard: current URL + code shown as the defaults so the
+# operator can fix a typo without re-typing the whole thing.
+NEW_URL=$(whiptail --title "Control plane URL" \
+    --inputbox "Where does this Application appliance pair against?\n\nFormat: https://<control-plane-host>/" \
+    14 78 "${CONTROL_PLANE_URL:-https://}" 3>&1 1>&2 2>&3) || exit 1
+
+if [ -z "$NEW_URL" ] || [ "$NEW_URL" = "https://" ]; then
+    echo "spatium-pair: control-plane URL is required" >&2
+    exit 1
+fi
+
+while true; do
+    NEW_CODE=$(whiptail --title "Pairing code" \
+        --inputbox "Paste the 8-digit pairing code minted at\n\n  $NEW_URL/appliance → Pairing → New pairing code\n\nSingle-use ephemeral codes expire after the duration set at\nmint time (default 15 min)." \
+        16 78 "" 3>&1 1>&2 2>&3) || exit 1
+    NEW_CODE=$(echo "$NEW_CODE" | tr -d '[:space:]')
+    if [[ "$NEW_CODE" =~ ^[0-9]{8}$ ]]; then
+        break
+    fi
+    whiptail --msgbox "Pairing code must be exactly 8 decimal digits.\n\nGot: $NEW_CODE" 10 60 || true
+done
+
+# Confirm before writing — visualise the role-config we're about to
+# replace so the operator catches any typo.
+SUMMARY="Re-pair this appliance with:\n\n"
+SUMMARY+="  Control plane: $NEW_URL\n"
+SUMMARY+="  Pairing code:  ●●●●●●●●\n\n"
+if [ "$RESET_IDENTITY" -eq 1 ]; then
+    SUMMARY+="--reset is set — the supervisor's existing Ed25519 keypair\n"
+    SUMMARY+="+ appliance_id + session token will be wiped.\n\n"
+fi
+SUMMARY+="The supervisor container will restart and claim the new code.\n\n"
+SUMMARY+="Proceed?"
+whiptail --yesno "$SUMMARY" 18 76 || {
+    echo "spatium-pair: cancelled"
+    exit 1
+}
+
+# Rewrite role-config atomically (temp + rename). Preserve mode 0600
+# (the pairing code is bearer-auth until the supervisor's first
+# successful register call).
+TMP="$ROLE_CONFIG.new"
+cat > "$TMP" <<EOF
+ROLE=application
+CONTROL_PLANE_URL=$NEW_URL
+BOOTSTRAP_PAIRING_CODE=$NEW_CODE
+EOF
+chmod 0600 "$TMP"
+mv "$TMP" "$ROLE_CONFIG"
+
+# Mirror into .env so the supervisor compose entry's env_file picks
+# up the new values when docker-compose restarts the service.
+if [ -f "$ENV_FILE" ]; then
+    # Replace lines if present; otherwise append. Use a temp file
+    # so a crash mid-edit doesn't truncate .env.
+    ENV_TMP="$ENV_FILE.new"
+    awk -v url="$NEW_URL" -v code="$NEW_CODE" '
+        BEGIN { url_seen=0; code_seen=0 }
+        /^CONTROL_PLANE_URL=/ { print "CONTROL_PLANE_URL=" url; url_seen=1; next }
+        /^BOOTSTRAP_PAIRING_CODE=/ { print "BOOTSTRAP_PAIRING_CODE=" code; code_seen=1; next }
+        { print }
+        END {
+            if (!url_seen) print "CONTROL_PLANE_URL=" url
+            if (!code_seen) print "BOOTSTRAP_PAIRING_CODE=" code
+        }
+    ' "$ENV_FILE" > "$ENV_TMP"
+    chmod 0600 "$ENV_TMP"
+    mv "$ENV_TMP" "$ENV_FILE"
+fi
+
+# Identity reset (--reset) — wipe the supervisor's persisted
+# keypair, cached appliance_id, and session token so the next boot
+# generates fresh material against the new control plane.
+if [ "$RESET_IDENTITY" -eq 1 ]; then
+    PERSIST_DIR=/var/persist/spatium-supervisor
+    if [ -d "$PERSIST_DIR" ]; then
+        # Keep the directory so the bind-mount stays valid; wipe
+        # its contents.
+        find "$PERSIST_DIR" -mindepth 1 -delete \
+            && echo "spatium-pair: wiped $PERSIST_DIR"
+    fi
+fi
+
+# Bounce the supervisor container so it re-reads the env + role-
+# config on its next boot. The compose project name is fixed by the
+# appliance's docker-compose at /etc/spatiumddi/docker-compose.yml.
+COMPOSE_FILE=/etc/spatiumddi/docker-compose.yml
+if [ -f "$COMPOSE_FILE" ] && command -v docker-compose >/dev/null 2>&1; then
+    echo "spatium-pair: restarting spatium-supervisor container…"
+    ( cd "$(dirname "$COMPOSE_FILE")" \
+      && docker-compose -f "$COMPOSE_FILE" up -d --force-recreate spatium-supervisor \
+      ) || echo "spatium-pair: WARN compose restart failed; reboot to apply"
+fi
+
+cat <<EOF
+
+spatium-pair: done.
+
+  Control plane: $NEW_URL
+  Pairing code:  (claimed by the supervisor)
+
+Watch the supervisor's identity pickup with:
+  docker logs -f spatium-supervisor
+
+On the control plane operator's side, the appliance should now appear
+in /appliance → Fleet as pending_approval. Ask them to click Approve
+to issue the cert; the supervisor switches from session-token auth
+to mTLS on the next poll.
+EOF

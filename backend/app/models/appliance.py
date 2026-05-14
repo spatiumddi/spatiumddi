@@ -515,3 +515,38 @@ class ApplianceCA(Base):
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )
     expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class ApplianceSlotImage(Base):
+    """Slot image (.raw.xz) uploaded by an operator for an air-gapped
+    appliance upgrade (#170 follow-up).
+
+    Bytes live on disk under ``/var/lib/spatiumddi/slot-images/{id}.raw.xz``;
+    this row carries metadata + SHA-256 verification + audit linkage.
+    The supervisor downloads via the internal authenticated URL
+    ``GET /api/v1/appliance/slot-images/{id}/raw.xz`` once an operator
+    schedules an upgrade pointing at this row.
+
+    SHA-256 is computed server-side on the uploaded byte stream + verified
+    against the operator-supplied value before the row commits — mismatches
+    raise 422 and the partial file is deleted from disk. The hash also acts
+    as a uniqueness anchor (UNIQUE index) so a duplicate upload short-
+    circuits to the existing row rather than wasting disk.
+    """
+
+    __tablename__ = "appliance_slot_image"
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    filename: Mapped[str] = mapped_column(String(255), nullable=False)
+    size_bytes: Mapped[int] = mapped_column(sa.BigInteger, nullable=False)
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    appliance_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    uploaded_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("user.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    uploaded_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)

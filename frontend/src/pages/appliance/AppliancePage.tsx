@@ -5,10 +5,8 @@ import {
   Clock,
   Container as ContainerIcon,
   Gauge,
-  KeyRound,
   Network,
   ScrollText,
-  Server,
   ShieldCheck,
   Stamp,
   Wrench,
@@ -19,12 +17,10 @@ import { useSessionState } from "@/lib/useSessionState";
 import { ApprovalsTab } from "./ApprovalsTab";
 import { CertificatesTab } from "./CertificatesTab";
 import { ContainersTab } from "./ContainersTab";
-import { FleetTab } from "./FleetTab";
 import { LogsTab } from "./LogsTab";
 import { MaintenanceTab } from "./MaintenanceTab";
 import { NetworkTab } from "./NetworkTab";
 import { NTPTab } from "./NTPTab";
-import { PairingTab } from "./PairingTab";
 import { ReleasesTab } from "./ReleasesTab";
 import { SNMPTab } from "./SNMPTab";
 
@@ -47,8 +43,6 @@ type Tab =
   | "tls"
   | "approvals"
   | "releases"
-  | "fleet"
-  | "pairing"
   | "snmp"
   | "ntp"
   | "containers"
@@ -144,26 +138,6 @@ const TABS: TabSpec[] = [
     icon: Clock,
     summary:
       "Configure chrony on every appliance host. Pool / unicast servers / mixed; optional NTP-server mode that opens UDP 123 inbound for isolated networks. Rendered chrony.conf ships through the ConfigBundle long-poll, validated host-side before activation, reloaded without a daemon restart.",
-  },
-  {
-    key: "fleet",
-    label: "OS Versions",
-    phase: "8f",
-    icon: Server,
-    summary:
-      "Manage the OS version on this appliance and every registered DNS + DHCP agent from one screen. The pinned self row at the top opens the full A/B slot detail (versions per slot, apply log, rollback) in a modal — same machinery the per-row Upgrade button uses for remote agents. Roll a release out to multiple agents at once via the checkbox column + 'Apply to selected'. Docker / k8s rows show copy-paste commands instead.",
-  },
-  {
-    // Issue #169 — short-lived pairing codes that replace hand-typed
-    // DNS_AGENT_KEY / DHCP_AGENT_KEY entry on the agent installer.
-    // Not selfOnly: a docker / k8s control plane still mints codes
-    // for its remote appliance agents.
-    key: "pairing",
-    label: "Pairing",
-    phase: "169",
-    icon: KeyRound,
-    summary:
-      "Mint short-lived single-use 8-digit codes that an agent installer swaps for the real bootstrap key. Operators no longer have to retype the 64-char hex key over IPMI / Proxmox consoles. Phase 1+2 (this tab) ships the mint + table; Phase 4 wires the installer wizard so the workflow is one-click on both ends.",
   },
   {
     key: "releases",
@@ -296,10 +270,6 @@ export function AppliancePage() {
           <ApprovalsTab />
         ) : effectiveTab === "releases" ? (
           <ReleasesTab applianceMode={isApplianceHost} />
-        ) : effectiveTab === "fleet" ? (
-          <FleetTab />
-        ) : effectiveTab === "pairing" ? (
-          <PairingTab />
         ) : effectiveTab === "snmp" ? (
           <SNMPTab />
         ) : effectiveTab === "ntp" ? (

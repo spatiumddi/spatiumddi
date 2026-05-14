@@ -88,6 +88,10 @@ services:
       # so archives survive container recycle. Mount path matches
       # the default ``LocalVolumeDestination`` config.
       - spatium_backups:/var/lib/spatiumddi/backups
+      # Slot-image upload storage (#170 follow-up). Air-gapped
+      # operators upload .raw.xz through the Fleet UI; the api
+      # streams them back authenticated for the supervisor.
+      - spatium_slot_images:/var/lib/spatiumddi/slot-images
     # Docker integration — uncomment alongside the matching
     # group_add. ``DOCKER_GID`` must match the gid of
     # ``/var/run/docker.sock`` on the host.
@@ -401,3 +405,4 @@ volumes:
   dhcp_kea_state_2:
   dhcp_kea_leases_2:
   spatium_backups:
+  spatium_slot_images:

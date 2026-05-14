@@ -120,6 +120,12 @@ services:
       # tokens; frontend nginx serves them as static files. Empty
       # outside an active Let's Encrypt flow (Phase 4b.4).
       - appliance_acme:/var/www/acme-challenge
+      # Slot-image upload storage (#170 follow-up). Air-gapped
+      # operators upload .raw.xz through the Fleet UI; the api
+      # streams them back authenticated under
+      # /api/v1/appliance/slot-images/{id}/raw.xz for the
+      # supervisor to download. Survives container recycle.
+      - spatium_slot_images:/var/lib/spatiumddi/slot-images
       # Phase 4c release manager — api drops trigger files into
       # /var/lib/spatiumddi/release-state/release-pending on the host
       # (sub-dir is chown'd to 1000:1000 by firstboot so the api's
@@ -482,6 +488,7 @@ volumes:
   dns_powerdns_lmdb:
   dhcp_kea_state:
   dhcp_kea_leases:
+  spatium_slot_images:
   # Phase 4b.2 — shared TLS cert volume. api writes active.{pem,key};
   # frontend mounts r/o for nginx. Survives container recycles so an
   # activated cert sticks across `docker-compose up -d --force-recreate`.

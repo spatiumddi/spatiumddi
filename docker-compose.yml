@@ -77,6 +77,13 @@ services:
     #   - spatium_backups:/var/lib/spatiumddi/backups
     # group_add:
     #   - "${DOCKER_GID:-999}"
+    volumes:
+      # Slot-image upload storage for air-gapped appliance upgrades
+      # (#170 follow-up). Holds the .raw.xz bytes the operator
+      # uploads through the Fleet UI. The api streams them back
+      # authenticated under /api/v1/appliance/slot-images/{id}/raw.xz
+      # for the supervisor to download.
+      - spatium_slot_images:/var/lib/spatiumddi/slot-images
     depends_on:
       postgres:
         condition: service_healthy
@@ -371,3 +378,10 @@ volumes:
   # on the api + worker services. Safe to leave commented for
   # installs using only remote destinations.
   # spatium_backups:
+  # Slot-image upload storage for air-gap appliance upgrades
+  # (#170 follow-up). Holds the .raw.xz bytes the operator uploads
+  # through the Fleet UI; served back authenticated under
+  # /api/v1/appliance/slot-images/{id}/raw.xz for the supervisor
+  # to download. Capacity: each image is ~800 MiB-1.2 GiB; the
+  # backend caps a single upload at 4 GiB.
+  spatium_slot_images:

@@ -1366,10 +1366,25 @@ class ApplianceUpgradeRequest(BaseModel):
     ``spatium-upgrade-slot apply``. Idempotent — the supervisor
     skips firing when the trigger already exists or installed
     matches desired.
+
+    Two source modes for the image:
+
+    * **External URL** — pass ``desired_slot_image_url`` directly.
+      Used when the appliance can reach github.com or a private
+      mirror. The supervisor downloads via the URL on the host.
+    * **Uploaded image** — pass ``slot_image_id`` (an
+      ``appliance_slot_image`` row id from the air-gap upload
+      endpoint). The control plane composes the authenticated
+      internal URL the supervisor pulls from. Air-gap-friendly.
+
+    Exactly one of the two must be supplied. The version label is
+    always required so the auto-clear logic can detect "installed
+    matches desired" without inspecting the binary.
     """
 
     desired_appliance_version: str = Field(min_length=1, max_length=64)
-    desired_slot_image_url: str = Field(min_length=1)
+    desired_slot_image_url: str | None = Field(default=None, min_length=1)
+    slot_image_id: uuid.UUID | None = Field(default=None)
 
 
 @router.post(
@@ -1381,6 +1396,7 @@ class ApplianceUpgradeRequest(BaseModel):
 async def schedule_appliance_upgrade(
     appliance_id: uuid.UUID,
     body: ApplianceUpgradeRequest,
+    request: Request,
     current_user: CurrentUser,
     db: DB,
 ) -> ApplianceRow:
@@ -1389,8 +1405,18 @@ async def schedule_appliance_upgrade(
     and fires the slot-upgrade trigger; the host runner downloads + dd's
     the raw.xz to the inactive slot + reboots into it. Per-row reboot is
     optional — operators who want to defer can clear desired_* via
-    ``/clear-upgrade`` before the supervisor's next heartbeat."""
+    ``/clear-upgrade`` before the supervisor's next heartbeat.
+
+    For air-gapped fleets, pass ``slot_image_id`` (an
+    ``appliance_slot_image`` row from the upload endpoint) instead of
+    ``desired_slot_image_url``. The control plane composes the
+    authenticated internal URL the supervisor pulls from."""
     _require_superadmin(current_user)
+    if (body.desired_slot_image_url is None) == (body.slot_image_id is None):
+        raise HTTPException(
+            status.HTTP_422_UNPROCESSABLE_ENTITY,
+            "Pass exactly one of desired_slot_image_url or slot_image_id.",
+        )
     row = await db.get(Appliance, appliance_id)
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
@@ -1409,8 +1435,39 @@ async def schedule_appliance_upgrade(
                 "for docker / k8s deployments."
             ),
         )
+
+    # Resolve slot_image_id → internal URL. We compose the URL
+    # relative to the request's host so the supervisor can reach it
+    # from the same network it reaches the control plane on; the
+    # request's base_url is the operator-facing scheme + host the
+    # frontend is already using.
+    from app.models.appliance import ApplianceSlotImage  # noqa: PLC0415
+
+    resolved_url: str
+    if body.slot_image_id is not None:
+        image = await db.get(ApplianceSlotImage, body.slot_image_id)
+        if image is None:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                f"Slot image {body.slot_image_id} not found.",
+            )
+        # ``request.base_url`` ends with ``/`` and carries the scheme
+        # + host the frontend reached us on (X-Forwarded-Host /
+        # X-Forwarded-Proto, when nginx is in front). The supervisor
+        # is the only thing that resolves this URL, so as long as the
+        # frontend host is reachable from the appliance subnet (which
+        # it must be — that's where the supervisor already
+        # heartbeats), this lines up.
+        resolved_url = (
+            f"{str(request.base_url).rstrip('/')}"
+            f"/api/v1/appliance/slot-images/{image.id}/raw.xz"
+        )
+    else:
+        assert body.desired_slot_image_url is not None
+        resolved_url = body.desired_slot_image_url
+
     row.desired_appliance_version = body.desired_appliance_version
-    row.desired_slot_image_url = body.desired_slot_image_url
+    row.desired_slot_image_url = resolved_url
     db.add(
         AuditLog(
             user_id=current_user.id,
@@ -1423,7 +1480,8 @@ async def schedule_appliance_upgrade(
             result="success",
             new_value={
                 "desired_appliance_version": body.desired_appliance_version,
-                "desired_slot_image_url": body.desired_slot_image_url,
+                "desired_slot_image_url": resolved_url,
+                "slot_image_id": (str(body.slot_image_id) if body.slot_image_id else None),
             },
         )
     )

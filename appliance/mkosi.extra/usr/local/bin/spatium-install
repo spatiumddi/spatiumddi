@@ -106,14 +106,10 @@ NET_PREFIX="24"
 NET_GATEWAY=""
 NET_DNS="1.1.1.1 1.0.0.1"
 TIMEZONE="UTC"
-# #170 Wave B2 — installer roles collapse from five (control /
-# control-only / dns-agent-bind9 / dns-agent-powerdns / dhcp-agent)
-# to three:
+# Installer roles (#170):
 #   full-stack    — Full SpatiumDDI stack: api + worker + beat + db
 #                   + redis + frontend + bundled BIND9 + Kea (AIO).
-#                   Replaces ``control``.
 #   frontend-core — Control plane only, no bundled service workers.
-#                   Replaces ``control-only``.
 #   application   — Supervisor only. Pairs with a remote control
 #                   plane via a pairing code and sits in
 #                   pending_approval until an admin clicks Approve

@@ -83,12 +83,14 @@ COPY . .
 # fresh volume when the path exists on the image; without these
 # mkdirs the api / worker hit EACCES on the first write attempt.
 #
-#   /var/lib/spatiumddi/backups  — issue #117 (backup archive volume)
-#   /var/lib/spatiumddi/certs    — issue #134 Phase 4b.2 (appliance TLS
-#                                  cert volume, shared with the frontend
-#                                  nginx container at /etc/nginx/certs)
+#   /var/lib/spatiumddi/backups      — issue #117 (backup archive volume)
+#   /var/lib/spatiumddi/certs        — issue #134 Phase 4b.2 (appliance TLS
+#                                      cert volume, shared with the frontend
+#                                      nginx container at /etc/nginx/certs)
+#   /var/lib/spatiumddi/slot-images  — #170 follow-up (air-gap appliance
+#                                      slot-image upload storage)
 RUN useradd --no-create-home --shell /bin/false app \
-    && mkdir -p /var/lib/spatiumddi/backups /var/lib/spatiumddi/certs \
+    && mkdir -p /var/lib/spatiumddi/backups /var/lib/spatiumddi/certs /var/lib/spatiumddi/slot-images \
     && chown -R app:app /app /var/lib/spatiumddi
 USER app
 

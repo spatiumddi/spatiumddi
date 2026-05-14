@@ -3,6 +3,8 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertCircle,
   CheckCircle2,
+  ChevronDown,
+  ChevronRight,
   HardDrive,
   KeyRound,
   Loader2,
@@ -19,16 +21,19 @@ import {
 
 import {
   applianceApprovalApi,
+  applianceSlotImagesApi,
   authApi,
   dhcpApi,
   dnsApi,
   type ApplianceRow,
   type ApplianceState,
+  type SlotImage,
   type SupervisorCapabilities,
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { cn } from "@/lib/utils";
+import { PairingTab } from "./PairingTab";
 
 /**
  * Appliance → Fleet tab (#170 Wave D1; supersedes Wave B3 "Approvals").
@@ -197,20 +202,13 @@ export function ApprovalsTab() {
         <div className="min-w-0 flex-1">
           <h2 className="text-base font-semibold">Appliance fleet</h2>
           <p className="mt-1 text-xs text-muted-foreground">
-            Supervisors that claimed a{" "}
-            <a
-              href="#"
-              onClick={(e) => e.preventDefault()}
-              className="underline decoration-dotted underline-offset-2"
-              title="Mint codes on the Pairing tab. The supervisor submits its Ed25519 pubkey at /api/v1/appliance/supervisor/register; the row appears here in pending_approval state."
-            >
-              pairing code
-            </a>{" "}
-            sit here until a superadmin clicks Approve. Approval signs an X.509
-            cert against the submitted pubkey using the control plane's internal
-            CA (lazy-bootstrapped on the first approve). The supervisor picks
-            the cert up on its next poll and switches from session-token auth to
-            mTLS.
+            One screen for the full Application appliance lifecycle — mint
+            pairing codes, approve / reject incoming supervisors, assign roles,
+            schedule OS upgrades + reboots, and re-key or delete approved
+            appliances. Supervisors submit their Ed25519 pubkey on{" "}
+            <code>/api/v1/appliance/supervisor/register</code> after claiming a
+            code; rows appear below in <code>pending_approval</code> until a
+            superadmin signs the cert with the control plane&apos;s internal CA.
           </p>
         </div>
         <div className="flex shrink-0 items-center gap-2">
@@ -227,6 +225,30 @@ export function ApprovalsTab() {
           </button>
         </div>
       </div>
+
+      {/* Folded sections (#170 follow-up): pairing-code management
+          + slot-image uploads (air-gap) sit above the appliance
+          table, collapsed by default so the fleet table is the
+          first thing operators see. */}
+      <CollapsibleSection
+        title="Pairing codes"
+        description="Mint codes that new Application appliances claim during install."
+        storageKey="fleet.pairing.expanded"
+      >
+        <PairingTab />
+      </CollapsibleSection>
+
+      <CollapsibleSection
+        title="Slot image uploads"
+        description="Air-gap support — upload .raw.xz slot images for offline appliance upgrades."
+        storageKey="fleet.slotImages.expanded"
+      >
+        <SlotImageManager />
+      </CollapsibleSection>
+
+      <h3 className="mt-4 mb-2 text-sm font-semibold">
+        Application appliances
+      </h3>
 
       {error ? (
         <div className="rounded-md border border-rose-500/40 bg-rose-500/10 p-3 text-sm text-rose-700 dark:text-rose-300">
@@ -1033,8 +1055,10 @@ function slotLabel(slot: string | null): string {
 
 function ApplianceOsUpgradeSection({ row }: { row: ApplianceRow }) {
   const qc = useQueryClient();
+  const [sourceKind, setSourceKind] = useState<"url" | "uploaded">("uploaded");
   const [tag, setTag] = useState("");
   const [imageUrl, setImageUrl] = useState("");
+  const [slotImageId, setSlotImageId] = useState<string>("");
   const [rebootConfirm, setRebootConfirm] = useState(false);
 
   const isApplianceHost =
@@ -1042,13 +1066,38 @@ function ApplianceOsUpgradeSection({ row }: { row: ApplianceRow }) {
   const trialBoot = row.is_trial_boot;
   const upgradeInFlight = row.desired_appliance_version !== null;
 
+  // Uploaded slot images — fetched only when the operator picks the
+  // ``uploaded`` source, so non-air-gapped flows skip the round trip.
+  const uploadedQuery = useQuery({
+    queryKey: ["appliance", "slot-images"],
+    queryFn: applianceSlotImagesApi.list,
+    staleTime: 30_000,
+    enabled: isApplianceHost,
+  });
+
+  // When the operator picks an uploaded image, auto-fill the version
+  // tag from the row's appliance_version. Saves them re-typing it +
+  // keeps the supervisor's auto-clear logic aligned with the bytes.
+  function pickUploadedImage(id: string) {
+    setSlotImageId(id);
+    const image = uploadedQuery.data?.find((i) => i.id === id);
+    if (image) setTag(image.appliance_version);
+  }
+
   const scheduleUpgrade = useMutation({
     mutationFn: () =>
-      applianceApprovalApi.scheduleUpgrade(row.id, tag.trim(), imageUrl.trim()),
+      applianceApprovalApi.scheduleUpgrade(
+        row.id,
+        tag.trim(),
+        sourceKind === "url"
+          ? { kind: "url", url: imageUrl.trim() }
+          : { kind: "uploaded", slot_image_id: slotImageId },
+      ),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["appliance", "approvals"] });
       setTag("");
       setImageUrl("");
+      setSlotImageId("");
     },
   });
   const clearUpgrade = useMutation({
@@ -1153,26 +1202,87 @@ function ApplianceOsUpgradeSection({ row }: { row: ApplianceRow }) {
         </div>
       ) : (
         <div className="mt-3 space-y-2">
-          <div className="flex flex-col gap-1.5 sm:flex-row">
-            <input
-              value={tag}
-              onChange={(e) => setTag(e.target.value)}
-              placeholder="target version (e.g. 2026.06.01-1)"
-              className="flex-1 rounded-md border bg-background px-2 py-1 text-xs"
-            />
-            <input
-              value={imageUrl}
-              onChange={(e) => setImageUrl(e.target.value)}
-              placeholder="slot raw.xz URL"
-              className="flex-[2] rounded-md border bg-background px-2 py-1 text-xs"
-            />
+          {/* Source picker — uploaded image (air-gap-friendly) vs
+              external URL (lab / direct internet appliances). */}
+          <div className="flex gap-1 text-xs">
+            <button
+              type="button"
+              onClick={() => setSourceKind("uploaded")}
+              className={cn(
+                "rounded-md border px-2 py-1",
+                sourceKind === "uploaded"
+                  ? "border-primary bg-primary/10"
+                  : "border-input bg-background text-muted-foreground hover:bg-muted",
+              )}
+            >
+              From uploaded image
+            </button>
+            <button
+              type="button"
+              onClick={() => setSourceKind("url")}
+              className={cn(
+                "rounded-md border px-2 py-1",
+                sourceKind === "url"
+                  ? "border-primary bg-primary/10"
+                  : "border-input bg-background text-muted-foreground hover:bg-muted",
+              )}
+            >
+              From external URL
+            </button>
           </div>
+          {sourceKind === "uploaded" ? (
+            <>
+              <select
+                value={slotImageId}
+                onChange={(e) => pickUploadedImage(e.target.value)}
+                className="w-full rounded-md border bg-background px-2 py-1 text-xs"
+              >
+                <option value="">(pick an uploaded image)</option>
+                {(uploadedQuery.data ?? []).map((img) => (
+                  <option key={img.id} value={img.id}>
+                    {img.filename} · v{img.appliance_version} ·{" "}
+                    {(img.size_bytes / (1024 * 1024)).toFixed(0)} MiB
+                  </option>
+                ))}
+              </select>
+              {uploadedQuery.data && uploadedQuery.data.length === 0 && (
+                <p className="text-[11px] text-muted-foreground">
+                  No slot images uploaded yet. Open the &ldquo;Slot image
+                  uploads&rdquo; section above to upload one.
+                </p>
+              )}
+              <input
+                value={tag}
+                onChange={(e) => setTag(e.target.value)}
+                placeholder="target version (auto-filled from the picked image)"
+                className="w-full rounded-md border bg-background px-2 py-1 text-xs"
+              />
+            </>
+          ) : (
+            <div className="flex flex-col gap-1.5 sm:flex-row">
+              <input
+                value={tag}
+                onChange={(e) => setTag(e.target.value)}
+                placeholder="target version (e.g. 2026.06.01-1)"
+                className="flex-1 rounded-md border bg-background px-2 py-1 text-xs"
+              />
+              <input
+                value={imageUrl}
+                onChange={(e) => setImageUrl(e.target.value)}
+                placeholder="slot raw.xz URL"
+                className="flex-[2] rounded-md border bg-background px-2 py-1 text-xs"
+              />
+            </div>
+          )}
           <div className="flex items-center gap-2">
             <button
               type="button"
               onClick={() => scheduleUpgrade.mutate()}
               disabled={
-                !tag.trim() || !imageUrl.trim() || scheduleUpgrade.isPending
+                !tag.trim() ||
+                scheduleUpgrade.isPending ||
+                (sourceKind === "url" && !imageUrl.trim()) ||
+                (sourceKind === "uploaded" && !slotImageId)
               }
               className="inline-flex items-center gap-1 rounded-md border border-primary bg-primary/10 px-3 py-1.5 text-xs disabled:cursor-not-allowed disabled:opacity-50"
             >
@@ -1247,6 +1357,247 @@ function ApplianceOsUpgradeSection({ row }: { row: ApplianceRow }) {
           onClose={() => setRebootConfirm(false)}
           requireCheckboxLabel={`I understand ${row.hostname} will go offline for ~30–60 s`}
         />
+      )}
+    </div>
+  );
+}
+
+// ── CollapsibleSection ──────────────────────────────────────────
+
+function CollapsibleSection({
+  title,
+  description,
+  storageKey,
+  children,
+}: {
+  title: string;
+  description: string;
+  storageKey: string;
+  children: React.ReactNode;
+}) {
+  // Persist expanded state in sessionStorage so the operator's
+  // pick survives a page refresh inside the same tab. Default
+  // collapsed so the Fleet table is what the operator sees first.
+  const [open, setOpen] = useState<boolean>(() => {
+    if (typeof window === "undefined") return false;
+    return window.sessionStorage.getItem(storageKey) === "1";
+  });
+  function toggle() {
+    setOpen((next) => {
+      const v = !next;
+      try {
+        window.sessionStorage.setItem(storageKey, v ? "1" : "0");
+      } catch {
+        // sessionStorage unavailable (private mode); state still
+        // toggles in-memory.
+      }
+      return v;
+    });
+  }
+  return (
+    <div className="mb-3 rounded-md border bg-card">
+      <button
+        type="button"
+        onClick={toggle}
+        className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm hover:bg-muted/40"
+      >
+        {open ? (
+          <ChevronDown className="h-3.5 w-3.5 text-muted-foreground" />
+        ) : (
+          <ChevronRight className="h-3.5 w-3.5 text-muted-foreground" />
+        )}
+        <span className="font-medium">{title}</span>
+        <span className="text-xs text-muted-foreground">— {description}</span>
+      </button>
+      {open && <div className="border-t p-3">{children}</div>}
+    </div>
+  );
+}
+
+// ── SlotImageManager (#170 follow-up) ───────────────────────────
+
+function SlotImageManager() {
+  const qc = useQueryClient();
+  const [file, setFile] = useState<File | null>(null);
+  const [sha256, setSha256] = useState("");
+  const [applianceVersion, setApplianceVersion] = useState("");
+  const [notes, setNotes] = useState("");
+  const [progress, setProgress] = useState<{
+    loaded: number;
+    total: number;
+  } | null>(null);
+
+  const imagesQuery = useQuery({
+    queryKey: ["appliance", "slot-images"],
+    queryFn: applianceSlotImagesApi.list,
+    staleTime: 30_000,
+  });
+
+  const upload = useMutation({
+    mutationFn: () =>
+      applianceSlotImagesApi.upload(
+        file!,
+        sha256.trim().toLowerCase(),
+        applianceVersion.trim(),
+        notes.trim() || undefined,
+        (loaded, total) => setProgress({ loaded, total }),
+      ),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["appliance", "slot-images"] });
+      setFile(null);
+      setSha256("");
+      setApplianceVersion("");
+      setNotes("");
+      setProgress(null);
+    },
+    onError: () => setProgress(null),
+  });
+
+  const remove = useMutation({
+    mutationFn: (id: string) => applianceSlotImagesApi.remove(id),
+    onSuccess: () =>
+      qc.invalidateQueries({ queryKey: ["appliance", "slot-images"] }),
+  });
+
+  return (
+    <div className="space-y-3 text-xs">
+      <p className="text-muted-foreground">
+        Air-gapped appliances can&apos;t reach the GitHub release page. Download
+        the <code>.raw.xz</code> + its <code>.sha256</code> sidecar to a
+        workstation, then upload here. The backend verifies the SHA-256 on the
+        received bytes; the appliance downloads through the control plane via an
+        authenticated internal URL when an OS upgrade is scheduled.
+      </p>
+
+      <div className="rounded-md border p-3">
+        <div className="grid gap-2 sm:grid-cols-2">
+          <div>
+            <label className="text-muted-foreground">.raw.xz file</label>
+            <input
+              type="file"
+              accept=".xz,.raw.xz,application/octet-stream"
+              onChange={(e) => setFile(e.target.files?.[0] ?? null)}
+              className="mt-1 block w-full text-xs"
+            />
+            {file && (
+              <p className="mt-1 text-[11px] text-muted-foreground">
+                {file.name} · {(file.size / (1024 * 1024)).toFixed(1)} MiB
+              </p>
+            )}
+          </div>
+          <div>
+            <label className="text-muted-foreground">Appliance version</label>
+            <input
+              value={applianceVersion}
+              onChange={(e) => setApplianceVersion(e.target.value)}
+              placeholder="e.g. 2026.06.01-1"
+              className="mt-1 w-full rounded-md border bg-background px-2 py-1"
+            />
+          </div>
+          <div className="sm:col-span-2">
+            <label className="text-muted-foreground">SHA-256 (hex)</label>
+            <input
+              value={sha256}
+              onChange={(e) => setSha256(e.target.value)}
+              placeholder="paste from the .sha256 sidecar (64 lowercase hex chars)"
+              className="mt-1 w-full rounded-md border bg-background px-2 py-1 font-mono"
+            />
+          </div>
+          <div className="sm:col-span-2">
+            <label className="text-muted-foreground">Notes (optional)</label>
+            <input
+              value={notes}
+              onChange={(e) => setNotes(e.target.value)}
+              placeholder="e.g. RC1 — verified by ops on 2026-06-01"
+              className="mt-1 w-full rounded-md border bg-background px-2 py-1"
+            />
+          </div>
+        </div>
+        <div className="mt-3 flex items-center gap-2">
+          <button
+            type="button"
+            onClick={() => upload.mutate()}
+            disabled={
+              !file ||
+              sha256.trim().length !== 64 ||
+              !applianceVersion.trim() ||
+              upload.isPending
+            }
+            className="inline-flex items-center gap-1 rounded-md border border-primary bg-primary/10 px-3 py-1.5 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {upload.isPending ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <Upload className="h-3.5 w-3.5" />
+            )}
+            Upload
+          </button>
+          {progress && progress.total > 0 && (
+            <span className="text-[11px] text-muted-foreground">
+              {((progress.loaded / progress.total) * 100).toFixed(0)}% ·{" "}
+              {(progress.loaded / (1024 * 1024)).toFixed(1)} /{" "}
+              {(progress.total / (1024 * 1024)).toFixed(1)} MiB
+            </span>
+          )}
+          {upload.error && (
+            <span className="text-rose-700 dark:text-rose-300">
+              {(upload.error as Error).message}
+            </span>
+          )}
+        </div>
+      </div>
+
+      {imagesQuery.isLoading ? (
+        <div className="flex items-center gap-2 text-muted-foreground">
+          <Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading…
+        </div>
+      ) : (imagesQuery.data ?? []).length === 0 ? (
+        <p className="text-muted-foreground">No uploaded slot images yet.</p>
+      ) : (
+        <table className="w-full">
+          <thead className="text-[10px] uppercase tracking-wide text-muted-foreground">
+            <tr>
+              <th className="px-2 py-1 text-left">Filename</th>
+              <th className="px-2 py-1 text-left">Version</th>
+              <th className="px-2 py-1 text-left">Size</th>
+              <th className="px-2 py-1 text-left">SHA-256</th>
+              <th className="px-2 py-1 text-left">Uploaded</th>
+              <th className="px-2 py-1 text-right"></th>
+            </tr>
+          </thead>
+          <tbody className="divide-y">
+            {(imagesQuery.data ?? []).map((img: SlotImage) => (
+              <tr key={img.id}>
+                <td className="px-2 py-1">
+                  <div className="font-medium">{img.filename}</div>
+                  {img.notes && (
+                    <div className="text-[11px] text-muted-foreground">
+                      {img.notes}
+                    </div>
+                  )}
+                </td>
+                <td className="px-2 py-1 font-mono">{img.appliance_version}</td>
+                <td className="px-2 py-1 font-mono">
+                  {(img.size_bytes / (1024 * 1024)).toFixed(0)} MiB
+                </td>
+                <td className="px-2 py-1 font-mono">
+                  {img.sha256.slice(0, 12)}…{img.sha256.slice(-6)}
+                </td>
+                <td className="px-2 py-1">{relativeTime(img.uploaded_at)}</td>
+                <td className="px-2 py-1 text-right">
+                  <button
+                    type="button"
+                    onClick={() => remove.mutate(img.id)}
+                    className="inline-flex items-center gap-1 rounded-md border bg-background px-2 py-0.5 hover:bg-muted"
+                  >
+                    <Trash2 className="h-3 w-3" />
+                    Delete
+                  </button>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
       )}
     </div>
   );
