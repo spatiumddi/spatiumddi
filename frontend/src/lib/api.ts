@@ -7230,6 +7230,28 @@ export const applianceApprovalApi = {
     api
       .put<ApplianceRow>(`/appliance/appliances/${id}/roles`, body)
       .then((r) => r.data),
+  // #170 Wave D1 — OS slot upgrade + reboot affordances on the
+  // Fleet drilldown. Appliance-only deployments; the API surfaces a
+  // 409 with a useful message on docker / k8s rows.
+  scheduleUpgrade: (
+    id: string,
+    desired_appliance_version: string,
+    desired_slot_image_url: string,
+  ) =>
+    api
+      .post<ApplianceRow>(`/appliance/appliances/${id}/upgrade`, {
+        desired_appliance_version,
+        desired_slot_image_url,
+      })
+      .then((r) => r.data),
+  clearUpgrade: (id: string) =>
+    api
+      .post<ApplianceRow>(`/appliance/appliances/${id}/clear-upgrade`)
+      .then((r) => r.data),
+  scheduleReboot: (id: string) =>
+    api
+      .post<ApplianceRow>(`/appliance/appliances/${id}/reboot`)
+      .then((r) => r.data),
 };
 
 // ── Appliance: container management (Phase 4d) ─────────────────────

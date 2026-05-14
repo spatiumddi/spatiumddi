@@ -6,6 +6,57 @@ SpatiumDDI can be shipped as a **self-contained OS appliance image** — a boota
 
 ---
 
+## Post-#170 architecture (2026-05-14)
+
+The architecture below was reshaped end-to-end by [issue #170](https://github.com/spatiumddi/spatiumddi/issues/170). Three threads converged:
+
+1. **The agent containers do far too much.** `dns-bind9` / `dns-powerdns` / `dhcp-kea` each used to carry their own copy of host-side concerns (slot-state reads, nftables drop-ins, reboot-pending watch, docker-socket-aware logic). Three implementations of the same logic.
+2. **The install-time role decision is too early.** Operators picked `dns-agent-bind9` / `dns-agent-powerdns` / `dhcp-agent` at the installer prompt, baked into role-config. Switching meant a reinstall.
+3. **No authoritative identity for agents.** A leaked PSK was the only thing standing between a real agent and an attacker registering a rogue one.
+
+The fix:
+
+- **A new `spatium-supervisor` container** runs on every Application appliance. It owns *all* host-side concerns: slot telemetry on heartbeat, slot-upgrade trigger writes, reboot trigger, nftables drop-in rendering, future docker-compose lifecycle on service containers. The DNS / DHCP service containers become pure service workers with no host bind mounts.
+- **One generic "Application" install role** replaces `dns-agent-bind9` / `dns-agent-powerdns` / `dhcp-agent`. The installer asks for a control-plane URL + an 8-digit pairing code. Roles are assigned post-approval from the **Fleet** tab on `/appliance`.
+- **The installer's role list collapses from 5 to 3**:
+  - **Full stack** (was `control`): control plane + bundled BIND9 + Kea (AIO).
+  - **Frontend / core** (was `control-only`): control plane only.
+  - **Application**: supervisor only; pairs against a remote control plane.
+- **Pairing codes** are kind-agnostic (no more `deployment_kind` field) with two flavours: ephemeral (single-use, short expiry) and persistent (multi-claim, optional max_claims, disable/enable, password-gated reveal).
+- **Ed25519 identity + mTLS**. The supervisor generates an Ed25519 keypair on first boot, submits the pubkey when claiming a pairing code, and gets an X.509 cert signed by the control plane's internal CA on admin approval. Cert lifetime is 90 days; the supervisor auto-renews. (The mTLS *verifier* middleware lands in a follow-up — the cert pipeline is in place; heartbeat + poll endpoints currently auth via session-token.)
+- **Per-role nftables firewall**. The supervisor renders `/etc/nftables.d/spatium-role.nft` every heartbeat with always-open management rules (tcp/22, icmp echo, loopback) + per-role service ports (udp+tcp/53 for DNS, udp/67-68 for DHCP) + an operator-pasted override fragment. `nft -c -f` dry-run before live-swap rejects syntax errors without putting the firewall in a half-rendered state.
+- **Baked-in container images**. Every container image needed for any install role is baked into the OS rootfs at release time at `/usr/lib/spatiumddi/images/*.tar.zst`. First boot loads them into the local docker daemon; subsequent boots never reach out to ghcr.io. Air-gapped installs are first-class.
+- **A/B slot upgrades and container upgrades are one unit**. A slot upgrade is also a container upgrade — operators can't get out of sync between OS and container versions.
+
+### Fleet management surface
+
+`/appliance` → **Fleet** tab is the primary management surface. Operators see every Application appliance with state (pending / approved), advertised capabilities, assigned roles, deployment kind, slot info, last-seen. A pending row pins at the top with Approve / Reject. A drilldown modal on each approved row carries:
+
+- Identity (hostname, full cert fingerprint, paired-at + paired-from-ip, last-seen).
+- **Role assignment** — pick a subset of `dns-bind9` / `dns-powerdns` / `dhcp` / `observer`. DNS engines are mutually exclusive; chips for capabilities the supervisor doesn't advertise dim with a tooltip. DNS / DHCP group dropdowns appear conditionally on the selection.
+- **Firewall preview + operator override** — live preview of the role-driven profile (idle / dns-only / dhcp-only / dns-and-dhcp), always-open + per-role port summary, raw-nft textarea for operator overrides.
+- **OS & lifecycle** — installed appliance version, running + durable-default slots (with trial-boot chip), last upgrade state, Schedule OS upgrade form, Cancel pending upgrade, Reboot host (with a double-confirm modal requiring an "I understand this will go offline" checkbox).
+- **Certificate** — serial, issued/expires timestamps. Re-key + Delete actions on the modal footer.
+
+### Operator Copilot tools (#170 Wave D2)
+
+Four MCP tools surface the fleet to the Operator Copilot (superadmin-gated):
+
+- `find_pending_appliances` — read-only list of pending pairings + advertised capabilities.
+- `find_appliance_fleet` — full state across the fleet with filters (state / role / tag key:value).
+- `propose_approve_appliance` — apply-gated write proposal. The operator clicks Apply in the chat drawer to actually sign the cert.
+- `propose_assign_role` — apply-gated write proposal for role + group assignment.
+
+### Superseded issues
+
+Closed by #170's landings:
+
+- The legacy `dns-agent-bind9` / `dns-agent-powerdns` / `dhcp-agent` installer roles + their per-service slot-state collectors are gone.
+- The PSK-based agent registration (`DNS_AGENT_KEY` / `SPATIUM_AGENT_KEY`) is the *legacy* path; new installs go through `/supervisor/register` + admin approval.
+- Pre-#170 pairing codes' `deployment_kind` field (per #169 wave 2) is dropped.
+
+---
+
 ## 1. Base OS Selection
 
 ### Decision (2026-05): Debian for the appliance, Alpine for containers

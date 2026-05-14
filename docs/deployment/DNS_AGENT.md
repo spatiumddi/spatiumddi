@@ -3,12 +3,55 @@
 > Design spec for how SpatiumDDI ships, enrolls, configures, and operates the
 > managed DNS service containers (BIND9) that sit on the data plane.
 >
-> **Status:** Design — no implementation yet. This document is the handoff
-> contract for Wave 2 implementation agents.
+> **Status:** Implemented — see post-#170 architecture note below.
 >
 > **Related:** `CLAUDE.md` (#5 config caching, #8 incremental DNS, #10 driver
 > abstraction, #11 multi-arch), `docs/features/DNS.md`,
 > `docs/drivers/DNS_DRIVERS.md`, `docs/OBSERVABILITY.md`.
+
+---
+
+## Post-#170 architecture (2026-05-14)
+
+The Application appliance role + `spatium-supervisor` from
+[#170](https://github.com/spatiumddi/spatiumddi/issues/170)
+reshape this document's scope. Read this first; the historical
+sections below describe the pre-#170 agent surface (still
+functional for in-field installs — they keep registering against
+`/dns/agents/register` with the long PSK).
+
+**What stays in the DNS service container**: the agent sidecar
+(`agent/dns/spatium_dns_agent/`) still owns every DNS-service-level
+call: `POST /dns/agents/register` (the *service* identity, distinct
+from the supervisor's appliance identity), the ConfigBundle long-poll
+(`GET /dns/agents/config`), DDNS lease events, per-zone serial
+reporting on `POST /dns/agents/zone-state`, BIND9 query-log shipping,
+and metrics push. None of those changed in #170 wave C.
+
+**What moved to the supervisor (#170 Wave C1)**: every
+appliance-host concern. Slot telemetry, slot-upgrade trigger writes,
+reboot trigger, SNMP / chrony reload triggers, deployment-kind
+detection. The DNS service container drops the four host bind mounts
+(`/etc/spatiumddi-host`, `/boot/efi-host`,
+`/var/lib/spatiumddi/release-state`, `/run/udev`); the supervisor
+mounts them instead and is the single producer of host-side state.
+
+**Service heartbeats** (`POST /dns/agents/heartbeat`) no longer
+carry the slot / deployment / upgrade-state block. The supervisor's
+new `POST /api/v1/appliance/supervisor/heartbeat` is the single
+producer of appliance-row telemetry now.
+
+**Installer wizard** for fresh installs uses the new **Application**
+role (one of three: Full stack / Frontend / core / Application).
+Operators no longer pick `dns-agent-bind9` / `dns-agent-powerdns` at
+the installer prompt; the control plane assigns roles after admin
+approval in the Fleet tab. The legacy `dns-agent-*` role names alias
+to `application` in firstboot so existing in-field appliances keep
+booting through a slot upgrade.
+
+The rest of this document — driver protocol, config layout, etc. —
+is unchanged and still authoritative for the service-container half
+of the split.
 
 ---
 

@@ -3,14 +3,17 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertCircle,
   CheckCircle2,
+  HardDrive,
   KeyRound,
   Loader2,
   Network,
+  Power,
   RefreshCw,
   ShieldAlert,
   ShieldCheck,
   ShieldQuestion,
   Trash2,
+  Upload,
   XCircle,
 } from "lucide-react";
 
@@ -28,7 +31,7 @@ import { ConfirmModal } from "@/components/ui/confirm-modal";
 import { cn } from "@/lib/utils";
 
 /**
- * Appliance → Approvals tab (#170 Wave B3).
+ * Appliance → Fleet tab (#170 Wave D1; supersedes Wave B3 "Approvals").
  *
  * Supervisors that claimed a pairing code show up here. Pending rows
  * pin at the top with Approve / Reject; approved rows render capability
@@ -192,7 +195,7 @@ export function ApprovalsTab() {
     <div className="mx-auto max-w-6xl">
       <div className="mb-4 flex items-start justify-between gap-4">
         <div className="min-w-0 flex-1">
-          <h2 className="text-base font-semibold">Appliance approvals</h2>
+          <h2 className="text-base font-semibold">Appliance fleet</h2>
           <p className="mt-1 text-xs text-muted-foreground">
             Supervisors that claimed a{" "}
             <a
@@ -651,6 +654,8 @@ function ApplianceDrilldownModal({
           <ApplianceRoleAssignmentSection row={row} />
         )}
 
+        {row.state === "approved" && <ApplianceOsUpgradeSection row={row} />}
+
         {row.state === "approved" && (
           <div>
             <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
@@ -1014,6 +1019,235 @@ function ApplianceRoleAssignmentSection({ row }: { row: ApplianceRow }) {
           </span>
         )}
       </div>
+    </div>
+  );
+}
+
+// ── OS upgrade + reboot section (#170 Wave D1) ────────────────────
+
+function slotLabel(slot: string | null): string {
+  if (slot === "slot_a") return "A";
+  if (slot === "slot_b") return "B";
+  return "—";
+}
+
+function ApplianceOsUpgradeSection({ row }: { row: ApplianceRow }) {
+  const qc = useQueryClient();
+  const [tag, setTag] = useState("");
+  const [imageUrl, setImageUrl] = useState("");
+  const [rebootConfirm, setRebootConfirm] = useState(false);
+
+  const isApplianceHost =
+    row.deployment_kind === "appliance" || row.deployment_kind === null;
+  const trialBoot = row.is_trial_boot;
+  const upgradeInFlight = row.desired_appliance_version !== null;
+
+  const scheduleUpgrade = useMutation({
+    mutationFn: () =>
+      applianceApprovalApi.scheduleUpgrade(row.id, tag.trim(), imageUrl.trim()),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["appliance", "approvals"] });
+      setTag("");
+      setImageUrl("");
+    },
+  });
+  const clearUpgrade = useMutation({
+    mutationFn: () => applianceApprovalApi.clearUpgrade(row.id),
+    onSuccess: () =>
+      qc.invalidateQueries({ queryKey: ["appliance", "approvals"] }),
+  });
+  const reboot = useMutation({
+    mutationFn: () => applianceApprovalApi.scheduleReboot(row.id),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["appliance", "approvals"] });
+      setRebootConfirm(false);
+    },
+  });
+
+  return (
+    <div>
+      <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+        OS &amp; lifecycle
+      </h3>
+      <dl className="mt-2 grid grid-cols-[max-content_1fr] gap-x-4 gap-y-1.5 text-xs">
+        <dt className="text-muted-foreground">Deployment</dt>
+        <dd>
+          <span className="rounded-full bg-muted px-1.5 py-0.5 font-mono text-[10px]">
+            {row.deployment_kind ?? "unknown"}
+          </span>
+        </dd>
+        <dt className="text-muted-foreground">Installed</dt>
+        <dd className="font-mono">{row.installed_appliance_version ?? "—"}</dd>
+        <dt className="text-muted-foreground">Slots</dt>
+        <dd>
+          <span className="font-mono">
+            running={slotLabel(row.current_slot)}
+          </span>
+          {" · "}
+          <span className="font-mono">
+            default={slotLabel(row.durable_default)}
+          </span>
+          {trialBoot && (
+            <span className="ml-2 rounded-full bg-amber-500/10 px-1.5 py-0.5 text-[10px] text-amber-700 dark:text-amber-300">
+              trial boot
+            </span>
+          )}
+        </dd>
+        <dt className="text-muted-foreground">Last upgrade</dt>
+        <dd>
+          {row.last_upgrade_state ? (
+            <span
+              className={cn(
+                "rounded-full px-1.5 py-0.5 font-mono text-[10px]",
+                row.last_upgrade_state === "done" ||
+                  row.last_upgrade_state === "ready"
+                  ? "bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
+                  : row.last_upgrade_state === "failed"
+                    ? "bg-rose-500/10 text-rose-700 dark:text-rose-300"
+                    : "bg-amber-500/10 text-amber-700 dark:text-amber-300",
+              )}
+            >
+              {row.last_upgrade_state}
+            </span>
+          ) : (
+            "—"
+          )}
+          {row.last_upgrade_state_at && (
+            <span className="ml-2 text-muted-foreground">
+              {new Date(row.last_upgrade_state_at).toLocaleString()}
+            </span>
+          )}
+        </dd>
+      </dl>
+
+      {!isApplianceHost ? (
+        <p className="mt-3 text-xs text-muted-foreground">
+          OS slot upgrades + host reboot are only available on the SpatiumDDI
+          appliance OS. Use the docker compose / helm upgrade flow for{" "}
+          <code>{row.deployment_kind}</code> deployments.
+        </p>
+      ) : upgradeInFlight ? (
+        <div className="mt-3 rounded-md border border-amber-500/40 bg-amber-500/5 p-3 text-xs">
+          <div className="flex items-center gap-2">
+            <Upload className="h-3.5 w-3.5 text-amber-700 dark:text-amber-300" />
+            <span className="font-medium">Upgrade pending</span>
+          </div>
+          <p className="mt-1 text-muted-foreground">
+            Target version <code>{row.desired_appliance_version}</code>.
+            Supervisor will fire the slot-upgrade trigger on its next heartbeat
+            (≤ 30 s).
+          </p>
+          <button
+            type="button"
+            onClick={() => clearUpgrade.mutate()}
+            disabled={clearUpgrade.isPending}
+            className="mt-2 inline-flex items-center gap-1 rounded-md border bg-background px-2 py-1 text-[11px] hover:bg-muted disabled:opacity-50"
+          >
+            {clearUpgrade.isPending ? (
+              <Loader2 className="h-3 w-3 animate-spin" />
+            ) : (
+              <XCircle className="h-3 w-3" />
+            )}
+            Cancel pending upgrade
+          </button>
+        </div>
+      ) : (
+        <div className="mt-3 space-y-2">
+          <div className="flex flex-col gap-1.5 sm:flex-row">
+            <input
+              value={tag}
+              onChange={(e) => setTag(e.target.value)}
+              placeholder="target version (e.g. 2026.06.01-1)"
+              className="flex-1 rounded-md border bg-background px-2 py-1 text-xs"
+            />
+            <input
+              value={imageUrl}
+              onChange={(e) => setImageUrl(e.target.value)}
+              placeholder="slot raw.xz URL"
+              className="flex-[2] rounded-md border bg-background px-2 py-1 text-xs"
+            />
+          </div>
+          <div className="flex items-center gap-2">
+            <button
+              type="button"
+              onClick={() => scheduleUpgrade.mutate()}
+              disabled={
+                !tag.trim() || !imageUrl.trim() || scheduleUpgrade.isPending
+              }
+              className="inline-flex items-center gap-1 rounded-md border border-primary bg-primary/10 px-3 py-1.5 text-xs disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {scheduleUpgrade.isPending ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <HardDrive className="h-3.5 w-3.5" />
+              )}
+              Schedule OS upgrade
+            </button>
+            {scheduleUpgrade.error && (
+              <span className="text-xs text-rose-700 dark:text-rose-300">
+                {(scheduleUpgrade.error as Error).message}
+              </span>
+            )}
+          </div>
+          <p className="text-[11px] text-muted-foreground">
+            Stamps <code>desired_appliance_version</code> on the appliance row.
+            The supervisor reads it on its next heartbeat + writes the
+            slot-upgrade trigger; the host runner dd&apos;s the image to the
+            inactive slot + reboots into it (auto-revert if{" "}
+            <code>/health/live</code> fails).
+          </p>
+        </div>
+      )}
+
+      {isApplianceHost && (
+        <div className="mt-3 flex items-center gap-2 border-t pt-3">
+          {row.reboot_requested ? (
+            <span className="rounded-full bg-amber-500/10 px-2 py-0.5 text-[11px] text-amber-700 dark:text-amber-300">
+              reboot queued
+            </span>
+          ) : null}
+          <button
+            type="button"
+            onClick={() => setRebootConfirm(true)}
+            disabled={row.reboot_requested}
+            className="inline-flex items-center gap-1 rounded-md border bg-background px-3 py-1.5 text-xs hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            <Power className="h-3.5 w-3.5" />
+            Reboot host
+          </button>
+          {reboot.error && (
+            <span className="text-xs text-rose-700 dark:text-rose-300">
+              {(reboot.error as Error).message}
+            </span>
+          )}
+        </div>
+      )}
+
+      {rebootConfirm && (
+        <ConfirmModal
+          open
+          title="Reboot appliance host?"
+          message={
+            <>
+              <p className="text-sm">
+                Reboot <strong>{row.hostname}</strong>? The supervisor will pick
+                this up on its next heartbeat (≤ 30 s) and the host will drop
+                offline for ~30–60 s while it restarts.
+              </p>
+              <p className="mt-2 text-xs text-muted-foreground">
+                Use sparingly. Service containers will be brought back up by the
+                supervisor on the next boot.
+              </p>
+            </>
+          }
+          confirmLabel="Reboot"
+          tone="destructive"
+          loading={reboot.isPending}
+          onConfirm={() => reboot.mutate()}
+          onClose={() => setRebootConfirm(false)}
+          requireCheckboxLabel={`I understand ${row.hostname} will go offline for ~30–60 s`}
+        />
+      )}
     </div>
   );
 }

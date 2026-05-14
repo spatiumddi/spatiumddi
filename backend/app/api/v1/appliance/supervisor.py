@@ -1352,3 +1352,181 @@ async def update_appliance_roles(
         user=current_user.username,
     )
     return _row_to_schema(row)
+
+
+# ── Admin: OS upgrade + reboot (#170 Wave D1) ────────────────────
+
+
+class ApplianceUpgradeRequest(BaseModel):
+    """Stamp the operator's target OS version on an appliance row.
+
+    The supervisor's heartbeat picks this up + writes the
+    slot-upgrade trigger on the host. The trigger file's presence
+    is the marker the host's systemd ``.path`` unit watches to fire
+    ``spatium-upgrade-slot apply``. Idempotent — the supervisor
+    skips firing when the trigger already exists or installed
+    matches desired.
+    """
+
+    desired_appliance_version: str = Field(min_length=1, max_length=64)
+    desired_slot_image_url: str = Field(min_length=1)
+
+
+@router.post(
+    "/appliances/{appliance_id}/upgrade",
+    response_model=ApplianceRow,
+    dependencies=[Depends(require_permission("admin", "appliance"))],
+    summary="Schedule an OS slot upgrade on an Application appliance",
+)
+async def schedule_appliance_upgrade(
+    appliance_id: uuid.UUID,
+    body: ApplianceUpgradeRequest,
+    current_user: CurrentUser,
+    db: DB,
+) -> ApplianceRow:
+    """Stamps ``desired_appliance_version`` + ``desired_slot_image_url``
+    on the appliance row. The supervisor's next heartbeat picks them up
+    and fires the slot-upgrade trigger; the host runner downloads + dd's
+    the raw.xz to the inactive slot + reboots into it. Per-row reboot is
+    optional — operators who want to defer can clear desired_* via
+    ``/clear-upgrade`` before the supervisor's next heartbeat."""
+    _require_superadmin(current_user)
+    row = await db.get(Appliance, appliance_id)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
+    if row.state != APPLIANCE_STATE_APPROVED:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"Cannot schedule upgrade on appliance in state {row.state!r}.",
+        )
+    if row.deployment_kind not in (None, "appliance"):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            (
+                f"Appliance reports deployment_kind={row.deployment_kind!r}; "
+                "OS slot upgrades are only available on the SpatiumDDI "
+                "appliance OS. Use the manual docker / helm upgrade flow "
+                "for docker / k8s deployments."
+            ),
+        )
+    row.desired_appliance_version = body.desired_appliance_version
+    row.desired_slot_image_url = body.desired_slot_image_url
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="appliance.upgrade_scheduled",
+            resource_type="appliance",
+            resource_id=str(row.id),
+            resource_display=row.hostname,
+            result="success",
+            new_value={
+                "desired_appliance_version": body.desired_appliance_version,
+                "desired_slot_image_url": body.desired_slot_image_url,
+            },
+        )
+    )
+    await db.commit()
+    logger.info(
+        "appliance_upgrade_scheduled",
+        appliance_id=str(row.id),
+        hostname=row.hostname,
+        desired_version=body.desired_appliance_version,
+        user=current_user.username,
+    )
+    return _row_to_schema(row)
+
+
+@router.post(
+    "/appliances/{appliance_id}/clear-upgrade",
+    response_model=ApplianceRow,
+    dependencies=[Depends(require_permission("admin", "appliance"))],
+    summary="Clear a pending OS upgrade stamp",
+)
+async def clear_appliance_upgrade(
+    appliance_id: uuid.UUID, current_user: CurrentUser, db: DB
+) -> ApplianceRow:
+    """Drops ``desired_appliance_version`` + ``desired_slot_image_url``.
+    Once the supervisor has already fired the trigger file the host
+    runner won't notice this — the slot apply is in flight. The clear
+    is most useful when an upgrade was scheduled by mistake and the
+    supervisor hasn't heartbeat-polled yet."""
+    _require_superadmin(current_user)
+    row = await db.get(Appliance, appliance_id)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
+    row.desired_appliance_version = None
+    row.desired_slot_image_url = None
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="appliance.upgrade_cleared",
+            resource_type="appliance",
+            resource_id=str(row.id),
+            resource_display=row.hostname,
+            result="success",
+        )
+    )
+    await db.commit()
+    return _row_to_schema(row)
+
+
+@router.post(
+    "/appliances/{appliance_id}/reboot",
+    response_model=ApplianceRow,
+    dependencies=[Depends(require_permission("admin", "appliance"))],
+    summary="Stamp a reboot request on an Application appliance",
+)
+async def schedule_appliance_reboot(
+    appliance_id: uuid.UUID, current_user: CurrentUser, db: DB
+) -> ApplianceRow:
+    """Stamps ``reboot_requested=True``. The supervisor's next
+    heartbeat returns this; the supervisor writes the host-side
+    ``reboot-pending`` trigger; the host runner ``systemctl reboot``s
+    after a 5s grace.
+
+    Strict appliance-only — docker / k8s deployments return 409 since
+    there's no host to reboot from the supervisor."""
+    _require_superadmin(current_user)
+    row = await db.get(Appliance, appliance_id)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
+    if row.state != APPLIANCE_STATE_APPROVED:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"Cannot reboot appliance in state {row.state!r}.",
+        )
+    if row.deployment_kind not in (None, "appliance"):
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            (
+                f"Appliance reports deployment_kind={row.deployment_kind!r}; "
+                "host-level reboot is only available on the SpatiumDDI "
+                "appliance OS."
+            ),
+        )
+    row.reboot_requested = True
+    row.reboot_requested_at = datetime.now(UTC)
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="appliance.reboot_scheduled",
+            resource_type="appliance",
+            resource_id=str(row.id),
+            resource_display=row.hostname,
+            result="success",
+        )
+    )
+    await db.commit()
+    logger.info(
+        "appliance_reboot_scheduled",
+        appliance_id=str(row.id),
+        hostname=row.hostname,
+        user=current_user.username,
+    )
+    return _row_to_schema(row)

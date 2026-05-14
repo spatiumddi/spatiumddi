@@ -83,15 +83,17 @@ interface TabSpec {
 // docker / k8s control planes happens at render time, not here.
 const TABS: TabSpec[] = [
   {
-    // Issue #170 Wave B3 — pending-approval queue + approved
-    // appliance management. Not selfOnly: a docker / k8s control
-    // plane still approves remote Application appliances.
+    // Issue #170 Wave D1 — Fleet tab (renamed from Approvals).
+    // Pending pairings pin at the top with Approve / Reject; approved
+    // rows expose role assignment, OS upgrade, reboot, re-key, and
+    // delete via the per-row drilldown. Not selfOnly: docker / k8s
+    // control planes still manage remote Application appliances here.
     key: "approvals",
-    label: "Approvals",
-    phase: "170-B3",
+    label: "Fleet",
+    phase: "170-D1",
     icon: Stamp,
     summary:
-      "Approve / reject supervisors that claimed a pairing code. Approval signs an X.509 cert against the supervisor's submitted Ed25519 pubkey using the control plane's internal CA (lazy-bootstrapped on first approve). Pending rows pin at the top; approved rows expose Re-key + Delete + capability detail in a drilldown modal.",
+      "Manage the Application appliance fleet — approve / reject pending pairings, assign roles + groups, schedule OS slot upgrades + reboots, re-key + delete. Pending rows pin at the top; approved rows open a per-appliance drilldown with capability detail + role assignment + firewall preview + OS upgrade controls.",
   },
   {
     key: "containers",
