@@ -3,7 +3,15 @@
 set -eu
 
 : "${CONTROL_PLANE_URL:?CONTROL_PLANE_URL is required}"
-: "${DNS_AGENT_KEY:?DNS_AGENT_KEY is required}"
+# Either ``DNS_AGENT_KEY`` (long hex PSK) or ``BOOTSTRAP_PAIRING_CODE``
+# (8-digit short-lived code from #169) must be present — the Python
+# resolver picks whichever is non-empty. We pre-check at the
+# entrypoint so a misconfigured container fails with a clear message
+# instead of crash-looping inside the Python supervisor.
+if [ -z "${DNS_AGENT_KEY:-}" ] && [ -z "${BOOTSTRAP_PAIRING_CODE:-}" ]; then
+    echo "entrypoint: one of DNS_AGENT_KEY or BOOTSTRAP_PAIRING_CODE must be set" >&2
+    exit 1
+fi
 
 # Ensure state dir is writable by the agent user. /var/log/named is
 # the rendered query-log destination; named runs unprivileged as
