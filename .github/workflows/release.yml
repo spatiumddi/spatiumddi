@@ -283,26 +283,33 @@ jobs:
   # same way ``make appliance && make appliance-iso`` does on a laptop,
   # then publishes the resulting hybrid USB/CD ISO as a release asset.
   #
-  # The ISO is the "slim" variant — no images baked into mkosi.extra/.
-  # spatiumddi-firstboot does ``docker compose pull`` from ghcr.io on
-  # first boot, which is why this job hangs off the image-build jobs
-  # in ``needs`` even though it doesn't actually consume their outputs:
-  # if any image build fails, the ISO would land on an appliance that
-  # then can't pull its services, so we'd rather not publish it.
+  # #170 Phase A4 — the ISO is now **fully baked**: every image the
+  # appliance can run is pulled from ghcr.io at the cut tag, saved as
+  # a zstd tarball under ``mkosi.extra/usr/local/share/spatiumddi/
+  # images/`` BEFORE mkosi runs, and ends up inside the rootfs.
+  # Firstboot ``docker load``s them and skips ``docker pull`` entirely
+  # — air-gap support out of the box, container-version drift from the
+  # OS slot becomes structurally impossible.
+  #
+  # The job therefore depends on every image-build job: we can't bake
+  # what hasn't been pushed yet.
   build-appliance-iso:
     name: Build appliance ISO
     runs-on: ubuntu-latest
-    # Only needs `meta` (for the version stamp). The container images
-    # are NOT baked into the ISO — firstboot pulls them from ghcr.io
-    # at first boot via the compose's ``image: ghcr.io/spatiumddi/…``
-    # references. So the ISO build can run in parallel with the five
-    # image builds; the only true cross-job dependency is the final
-    # ``release`` job that fans in on everyone to attach artefacts.
-    needs: meta
+    needs:
+      [
+        meta,
+        build-api,
+        build-frontend,
+        build-dns,
+        build-dns-powerdns,
+        build-dhcp,
+        build-supervisor,
+      ]
     permissions:
       contents: read
       packages: read
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
       - name: Log in to GHCR
@@ -329,6 +336,19 @@ jobs:
           } > appliance/mkosi.extra/etc/spatiumddi/appliance-release
           echo "→ Stamped appliance-release:"
           cat appliance/mkosi.extra/etc/spatiumddi/appliance-release
+      - name: Install zstd
+        run: sudo apt-get update && sudo apt-get install -y zstd
+      - name: Bake container images into rootfs overlay
+        env:
+          SPATIUMDDI_VERSION: ${{ needs.meta.outputs.version }}
+          BAKE_SOURCE: ghcr
+        run: |
+          set -euo pipefail
+          echo "→ Pulling every image at ${SPATIUMDDI_VERSION} + saving zstd tarballs"
+          chmod +x appliance/scripts/bake-images.sh
+          appliance/scripts/bake-images.sh
+          echo "→ Baked image set:"
+          ls -lh appliance/mkosi.extra/usr/local/share/spatiumddi/images/
       - name: Build raw image (mkosi)
         run: |
           set -euo pipefail

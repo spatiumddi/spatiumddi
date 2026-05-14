@@ -343,6 +343,31 @@ if [ -f "$BAKED_AT_FILE" ]; then
             echo "  → $(basename "$img")"
             zstd -dc "$img" | docker load
         done
+
+        # #170 Phase A4 — stamp the ``<image>:slot-baked`` alias on
+        # every SpatiumDDI image loaded above. The supervisor's
+        # air-gap-strict mode (Wave C polish) references images by
+        # this stable local tag so a compose template doesn't have to
+        # carry the CalVer version through env substitution. Reading
+        # the version from the bake's VERSION sidecar (which the bake
+        # script writes alongside BAKED_AT) avoids re-parsing the
+        # tarball filenames.
+        if [ -f "$IMAGES_DIR/VERSION" ]; then
+            baked_version=$(cat "$IMAGES_DIR/VERSION")
+            for image in \
+                ghcr.io/spatiumddi/spatiumddi-api \
+                ghcr.io/spatiumddi/spatiumddi-frontend \
+                ghcr.io/spatiumddi/spatium-supervisor \
+                ghcr.io/spatiumddi/dns-bind9 \
+                ghcr.io/spatiumddi/dns-powerdns \
+                ghcr.io/spatiumddi/dhcp-kea; do
+                if docker image inspect "${image}:${baked_version}" >/dev/null 2>&1; then
+                    docker tag "${image}:${baked_version}" "${image}:slot-baked" \
+                        2>/dev/null || true
+                fi
+            done
+        fi
+
         echo "$rootfs_baked_at" > "$LOADED_AT_FILE"
         BAKED=1
     fi

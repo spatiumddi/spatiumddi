@@ -326,7 +326,7 @@ pick_disk() {
     # back to the menu — used to fire much later from inside
     # do_install AFTER the operator had already filled out hostname /
     # admin user / network / timezone, which was wasted typing.
-    local MIN_BYTES=$((16 * 1024 * 1024 * 1024))
+    local MIN_BYTES=$((24 * 1024 * 1024 * 1024))
     while true; do
         TARGET_DISK=$(whiptail --backtitle "$BACKTITLE" --title "Target Disk" \
             --menu "Select the disk to install SpatiumDDI to.\nALL DATA on the chosen disk will be DESTROYED." \
@@ -338,9 +338,9 @@ pick_disk() {
             log "Picked target disk $TARGET_DISK ($((DISK_BYTES / 1024 / 1024 / 1024)) GiB)"
             break
         fi
-        log "Operator picked $TARGET_DISK ($((DISK_BYTES / 1024 / 1024 / 1024)) GiB) — below 16 GiB minimum; re-prompting"
+        log "Operator picked $TARGET_DISK ($((DISK_BYTES / 1024 / 1024 / 1024)) GiB) — below 24 GiB minimum; re-prompting"
         whiptail --backtitle "$BACKTITLE" --title "Disk too small" --msgbox \
-            "Target disk $TARGET_DISK is only $((DISK_BYTES / 1024 / 1024 / 1024)) GiB.\n\nSpatiumDDI's A/B atomic-upgrade layout needs at least 16 GiB:\n  ESP        512 MiB\n  root_A       4 GiB\n  root_B       4 GiB\n  var       remainder (≥7 GiB usable)\n\nPick a different disk, or Cancel out to attach a larger one." 16 70
+            "Target disk $TARGET_DISK is only $((DISK_BYTES / 1024 / 1024 / 1024)) GiB.\n\nSpatiumDDI's A/B atomic-upgrade layout needs at least 24 GiB:\n  ESP        512 MiB\n  root_A       8 GiB\n  root_B       8 GiB\n  var       remainder (≥7 GiB usable)\n\nThe slots are sized to carry the full container image set (issue #170 Wave A4) so the appliance works air-gapped without ghcr.io.\n\nPick a different disk, or Cancel out to attach a larger one." 18 76
     done
 }
 
@@ -507,19 +507,23 @@ do_install() {
     #
     #   p1  BIOS Boot     1 MiB     ef02   legacy chain-load (grub i386-pc)
     #   p2  ESP          512 MiB    ef00   FAT32, /boot/efi
-    #   p3  root_A         4 GiB    8304   active slot (this install lands here)
-    #   p4  root_B         4 GiB    8304   inactive slot (staging next image)
+    #   p3  root_A         8 GiB    8304   active slot (this install lands here)
+    #   p4  root_B         8 GiB    8304   inactive slot (staging next image)
     #   p5  var          rest       8300   /var, persisted across slot swaps
     #
-    # Slot sizing — current rootfs is ~1.8 GiB (Python, kernel, system
-    # packages, /etc baseline). 4 GiB gives ~2.2× headroom which covers
-    # the Phase 4-7 roadmap (additional daemons, expanded Python stack,
-    # future kernel upgrades). If we ever outgrow it, "spatium-upgrade-
-    # slot --grow" is a future affordance — easier to grow than shrink.
+    # Slot sizing — #170 Phase A4 bakes every container image into the
+    # rootfs (~800 MB-1.2 GB compressed depending on third-party
+    # versions); base Debian + Python + system packages is ~1.8 GiB.
+    # 8 GiB per slot gives ~2.7× headroom over the current ~3 GiB
+    # working set and accommodates Wave B+ growth (CA tooling, the
+    # supervisor's expanded toolset, future kernel upgrades).
+    # Previous 4 GiB slots predated baking and are too tight once
+    # the full container set lives on-rootfs.
     #
-    # Hard floor: 16 GiB target disk (= 1 MiB BBP + 512 MiB ESP + 2× 4
+    # Hard floor: 24 GiB target disk (= 1 MiB BBP + 512 MiB ESP + 2× 8
     # GiB slots + at least 7 GiB usable /var). Below that, postgres +
-    # docker volumes + audit log outgrow /var quickly.
+    # docker volumes + audit log outgrow /var quickly. Bumped from
+    # the pre-A4 16 GiB floor.
     local BBP ESP ROOT_A ROOT_B VAR
     BBP=$(partition_node 1)
     ESP=$(partition_node 2)
@@ -586,8 +590,8 @@ do_install() {
         #                                      partition discoverable.)
         sgdisk -n1:0:+1M    -t1:ef02 -c1:bios_boot \
                -n2:0:+512M  -t2:ef00 -c2:ESP \
-               -n3:0:+4G    -t3:8304 -c3:root_A \
-               -n4:0:+4G    -t4:8304 -c4:root_B \
+               -n3:0:+8G    -t3:8304 -c3:root_A \
+               -n4:0:+8G    -t4:8304 -c4:root_B \
                -n5:0:0      -t5:8310 -c5:var \
                "$TARGET_DISK"               >> "$INSTALL_LOG" 2>&1
         partprobe "$TARGET_DISK"            >> "$INSTALL_LOG" 2>&1 || true

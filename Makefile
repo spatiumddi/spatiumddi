@@ -2,7 +2,7 @@
         ci ci-backend-lint ci-frontend-lint ci-frontend-build screenshots \
         appliance appliance-builder appliance-iso appliance-clean \
         appliance-bake-images appliance-clean-baked-images appliance-dev-iso \
-        appliance-stamp-dev appliance-slot-image
+        appliance-baked-iso appliance-stamp-dev appliance-slot-image
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 COMPOSE        = docker compose
@@ -216,41 +216,41 @@ appliance-clean:
 	  rm -rf $(APPLIANCE_OUT) 2>/dev/null || sudo rm -rf $(APPLIANCE_OUT); \
 	fi
 
-# Bake the local ``spatiumddi-{api,frontend}:dev`` images into the
-# appliance overlay so the next ``make appliance`` ships them inside
-# the ISO. Avoids needing to push WIP images to ghcr.io during
-# iteration. See appliance/scripts/bake-images.sh for details.
+# Bake every container image into the appliance rootfs overlay so the
+# next ``make appliance`` ships them inside the ISO. See
+# appliance/scripts/bake-images.sh for what's covered + how source
+# selection (local :dev tags vs pulled :<calver> from ghcr) works.
+#
+# Source defaults to ``local`` (uses spatiumddi-*:dev) when
+# SPATIUMDDI_VERSION is empty/dev; the release workflow sets
+# SPATIUMDDI_VERSION=<calver> + BAKE_SOURCE=ghcr to pull the cut
+# tag from the just-published images.
 appliance-bake-images:
 	@bash $(APPLIANCE_DIR)/scripts/bake-images.sh
 
-# Convenience for the Phase 4 iteration loop — appliance-level changes
-# (installer, firstboot, console dashboard, partition layout, networking
-# stack, etc) where you want a bootable ISO without re-pushing api +
-# frontend images:
-#   1. Build the appliance raw image (without baking docker images in)
-#   2. Wrap as a hybrid USB/CD ISO
-# After this completes, copy the ISO to a NAS share / hypervisor library
-# and boot a VM from it. firstboot pulls api + frontend (and the DNS /
-# DHCP agent images) from ghcr.io on first boot, same as a real release.
-#
-# NOTE: this target used to depend on ``appliance-bake-images`` (which
-# tarballs the local ``spatiumddi-{api,frontend}:dev`` images into the
-# rootfs at /usr/local/share/spatiumddi/images/). That worked when the
-# rootfs was a single open-ended partition. Phase 8a-1 (#138) carved
-# the disk into ESP + root_A 4 GiB + root_B 4 GiB + var; the baked
-# image tarballs push the slot rootfs past the 4 GiB ceiling and the
-# slot build either fails or doesn't fit the partition. Operators
-# iterating on the api + frontend specifically should push WIP tags
-# to ghcr.io and pin SPATIUMDDI_VERSION in /etc/spatiumddi/.env on the
-# booted appliance, or call ``make appliance-bake-images`` directly and
-# then ``make appliance appliance-iso`` (accepting that the slot raw.xz
-# build will fail — useful for first-boot-only ISO testing).
+# Convenience for fast laptop iteration on appliance-level changes
+# (installer, firstboot, console dashboard, partition layout,
+# networking stack) where you don't want to wait on the docker-image
+# rebuild + bake cycle. Skips the bake — firstboot falls back to
+# ``docker compose pull`` from ghcr.io on first boot. NOT how releases
+# are cut (the release pipeline always bakes — #170 Phase A4).
 appliance-dev-iso: appliance-clean-baked-images appliance-stamp-dev appliance appliance-iso
 	@echo ""
 	@echo "✓ Dev-flavored appliance ISO ready at $(APPLIANCE_OUT)/spatiumddi-appliance_0.1.0.iso"
 	@echo "  All container images (api / frontend / DNS / DHCP agents) pull from"
 	@echo "  ghcr.io on first boot. Copy this ISO to your NAS / hypervisor library"
-	@echo "  and boot a VM from it."
+	@echo "  and boot a VM from it. Use 'make appliance-baked-iso' instead to"
+	@echo "  produce a self-contained (air-gap-ready) ISO."
+
+# Release-style local build — bakes every image at the local :dev tag
+# (run ``make build`` first to produce them) into the rootfs, then
+# builds the ISO + slot image. Mirrors what the release workflow
+# produces, just driven by your local :dev images instead of ghcr.io's
+# cut tag. ~1 GB larger than appliance-dev-iso.
+appliance-baked-iso: appliance-bake-images appliance appliance-iso appliance-slot-image
+	@echo ""
+	@echo "✓ Baked appliance ISO ready at $(APPLIANCE_OUT)/"
+	@echo "  All container images embedded. Air-gap-ready. First boot does no docker pull."
 
 # Wipe any tarballs that a previous ``appliance-bake-images`` left
 # under the mkosi.extra overlay. mkosi copies the overlay verbatim
