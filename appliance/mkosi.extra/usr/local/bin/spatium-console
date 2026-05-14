@@ -718,7 +718,78 @@ def render_services(role: str, ps_rows: list[dict]) -> Panel:
                  title_align="left")
 
 
-def render_agent_context(env: dict[str, str], role: str) -> Panel | None:
+# Per-agent-role docker volume names + container names — the path
+# under /var/lib/docker/volumes/ is the project-prefixed volume name;
+# compose project = ``spatiumddi`` on the appliance.
+_AGENT_VOLUME = {
+    "dns-agent-bind9":    "spatiumddi_dns_bind9_state",
+    "dns-agent-powerdns": "spatiumddi_dns_powerdns_state",
+    "dhcp-agent":         "spatiumddi_dhcp_kea_state",
+}
+_AGENT_CONTAINER = {
+    "dns-agent-bind9":    "dns-bind9",
+    "dns-agent-powerdns": "dns-powerdns",
+    "dhcp-agent":         "dhcp-kea",
+}
+
+
+def pairing_status(env: dict[str, str], role: str, ps_rows: list[dict]) -> tuple[str, str] | None:
+    """#169 Phase 4 — derive a (label, style) tuple for the console's
+    'Pairing' row, or ``None`` when the operator pasted the long
+    bootstrap key instead of a pairing code (nothing to show).
+
+    Reads three signals:
+
+    * ``BOOTSTRAP_PAIRING_CODE`` in .env — was a pairing code in play
+      at all? Empty → operator went the long-key route → return None.
+    * ``agent_token.jwt`` in the agent's docker volume — non-empty
+      means the agent has registered successfully. The pairing code
+      did its job; we're paired.
+    * ``bootstrap.key`` in the agent's docker volume — non-empty but
+      no JWT means the /pair call succeeded (resolver cached the
+      key) but the register call hasn't yet.
+    * Container state from ``docker ps`` — if the agent container has
+      exited non-zero with no cached key, the pairing-code exchange
+      itself failed (almost always 403 → dead / expired / claimed
+      code). Surface a clear "regenerate" hint.
+
+    Returns ``(label, rich-style)`` so the renderer can colour the row.
+    """
+    if role not in _AGENT_VOLUME:
+        return None
+    if not env.get("BOOTSTRAP_PAIRING_CODE"):
+        # Long-key route — pairing didn't apply, no row to surface.
+        return None
+
+    vol = _AGENT_VOLUME[role]
+    data_dir = Path(f"/var/lib/docker/volumes/{vol}/_data")
+    jwt = data_dir / "agent_token.jwt"
+    cached_key = data_dir / "bootstrap.key"
+
+    if jwt.exists() and jwt.stat().st_size > 0:
+        return ("Paired ✓", "bold green")
+    if cached_key.exists() and cached_key.stat().st_size > 0:
+        # Pair succeeded, register may still be in flight.
+        return ("Registering…", "bold yellow")
+
+    # No cached key yet. If the container is in an exited / errored
+    # state, the /pair call failed — surface the actionable hint.
+    container = _AGENT_CONTAINER[role]
+    for row in ps_rows:
+        if container_service_name(row) != container:
+            continue
+        state = (row.get("State") or "").lower()
+        status = (row.get("Status") or "").lower()
+        if "exited" in state or "dead" in state or "exited" in status:
+            return ("Pair failed — regenerate code on control plane", "bold red")
+        break
+
+    return ("Pairing in progress…", "bold yellow")
+
+
+def render_agent_context(
+    env: dict[str, str], role: str, ps_rows: list[dict]
+) -> Panel | None:
     """Render the small 'Control plane' panel agent roles show.
 
     Returns None for control / control-only — there's nothing to
@@ -736,9 +807,10 @@ def render_agent_context(env: dict[str, str], role: str) -> Panel | None:
     grid.add_row(Text("Group", style="dim"), Text(group))
     grid.add_row(Text("Hostname", style="dim"),
                  Text(env.get("APPLIANCE_HOSTNAME") or os.uname().nodename))
-    # Live registration / ETag would require talking to the local agent
-    # container's HTTP surface — deferred to v2 of this panel. Today the
-    # operator gets group + URL + container health (from Services).
+    pairing = pairing_status(env, role, ps_rows)
+    if pairing is not None:
+        label, style = pairing
+        grid.add_row(Text("Pairing", style="dim"), Text(label, style=style))
 
     return Panel(grid, box=SQUARE, border_style="cyan",
                  title="[bold]Agent[/bold]", title_align="left")
@@ -795,7 +867,12 @@ def render_frame(state: "DashboardState", mono_t: float) -> Layout:
     # 1 horizontal rule + 2 panel border. Detect slot presence and
     # size accordingly so we don't waste a row on non-appliance dev runs.
     HEADER_ROWS = 9 if slot_info() is not None else 8
-    AGENT_ROWS = 5    # 3 lines of content + 2 border
+    # Agent panel: 3 base rows (control plane / group / hostname) + 2
+    # border. #169 Phase 4 adds a "Pairing" row when the operator
+    # used a pairing code at install time — bump to 4 content rows
+    # whenever that signal is present.
+    has_pairing_row = pairing_status(state.env, state.role, state.ps_rows) is not None
+    AGENT_ROWS = (4 if has_pairing_row else 3) + 2
     SVC_ROWS = services_count + 2   # tight: just borders, no padding
     FOOTER_ROWS = 1   # single-line borderless strip
 
@@ -805,7 +882,7 @@ def render_frame(state: "DashboardState", mono_t: float) -> Layout:
         Layout(name="body", ratio=1),
         Layout(name="footer", size=FOOTER_ROWS),
     )
-    agent_panel = render_agent_context(state.env, state.role)
+    agent_panel = render_agent_context(state.env, state.role, state.ps_rows)
     if agent_panel is None:
         layout["body"].split_column(
             Layout(name="services", size=SVC_ROWS),

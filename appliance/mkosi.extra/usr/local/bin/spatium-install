@@ -120,6 +120,11 @@ ROLE="control"
 CONTROL_PLANE_URL=""
 DNS_AGENT_KEY=""
 DHCP_AGENT_KEY=""
+# Phase 4 of #169 — operator may paste a short pairing code instead
+# of the long agent key. firstboot writes whichever the operator
+# supplied into .env; the agent's bootstrap chain (Phase 3) resolves
+# code → key on first contact with the control plane.
+BOOTSTRAP_PAIRING_CODE=""
 # Agent group on the control plane this appliance joins. Auto-
 # created on first registration if it doesn't exist. Operators
 # managing multiple sites (us-east-dns / eu-prod-dhcp / lab-dns)
@@ -208,20 +213,62 @@ ask_agent_config() {
             is_dns=0
             ;;
     esac
-    local key_val
-    key_val=$(whiptail --backtitle "$BACKTITLE" --title "$key_label" \
-        --inputbox "Pre-shared $key_label for first-boot registration.\n\nReveal it on the control plane: Settings -> Security -> Agent bootstrap keys -> type your password -> Reveal keys.\n\nThe agent exchanges this key for a rotating JWT on first contact + caches the JWT under /var/lib/spatium-{dns,dhcp}-agent/ for subsequent runs." \
-        16 78 "" 3>&1 1>&2 2>&3) \
-        || on_cancel "agent key"
-    if [ -z "$key_val" ]; then
-        whiptail --msgbox "$key_label is required for agent installs." 8 60 || true
-        ask_agent_config
-        return
-    fi
-    if [ "$is_dns" = 1 ]; then
-        DNS_AGENT_KEY="$key_val"
+
+    # Bootstrap-method radio (Phase 4 of #169). Pairing code is the
+    # default — 8 digits operators can type without typos over an
+    # IPMI / serial console where copy-paste is unreliable. The long
+    # hex key is the fallback for re-installs, air-gapped sites where
+    # the operator has the key saved out of band, or cases where a
+    # pairing code generated earlier expired before install reached
+    # this step.
+    local bootstrap_method
+    bootstrap_method=$(whiptail --backtitle "$BACKTITLE" --title "Bootstrap method" \
+        --radiolist "Pick how this agent authenticates on first contact with the control plane.\n\nPairing code: ask the control plane operator to click 'New pairing code' on /appliance -> Pairing — they give you the 8 digits. Single-use, 15-minute default expiry.\n\nBootstrap key: paste the long ${key_label,,} (64-char hex). Reveal it on the control plane under Settings -> Security -> Agent bootstrap keys (requires a password re-confirm). Use this for re-installs, air-gapped sites with a saved key, or cases where the code expired." \
+        18 80 2 \
+        "code" "Pairing code (8-digit, recommended)" ON \
+        "key"  "Bootstrap key (long hex, advanced)"  OFF \
+        3>&1 1>&2 2>&3) \
+        || on_cancel "bootstrap method"
+    log "Bootstrap method: $bootstrap_method"
+
+    if [ "$bootstrap_method" = "code" ]; then
+        local code_val
+        while true; do
+            code_val=$(whiptail --backtitle "$BACKTITLE" --title "Pairing code" \
+                --inputbox "Enter the 8-digit pairing code from the control plane.\n\nGenerate one at https://<control-plane>/appliance -> Pairing -> 'New pairing code'. Codes expire after the duration set at generation time (default 15 min) and are single-use, so generate fresh if this one has been sitting around." \
+                14 78 "" 3>&1 1>&2 2>&3) \
+                || on_cancel "pairing code"
+            code_val=$(echo "$code_val" | tr -d '[:space:]')
+            if [ -z "$code_val" ]; then
+                whiptail --msgbox "Pairing code is required for this method." 8 60 || true
+                continue
+            fi
+            # Validate: exactly 8 decimal digits. Catch typos before
+            # firstboot tries to redeem the code and fails with a
+            # generic 403 (which we'd then surface on the console).
+            if ! [[ "$code_val" =~ ^[0-9]{8}$ ]]; then
+                whiptail --msgbox "Pairing code must be exactly 8 decimal digits.\n\nGot: $code_val" 10 60 || true
+                continue
+            fi
+            break
+        done
+        BOOTSTRAP_PAIRING_CODE="$code_val"
     else
-        DHCP_AGENT_KEY="$key_val"
+        local key_val
+        key_val=$(whiptail --backtitle "$BACKTITLE" --title "$key_label" \
+            --inputbox "Pre-shared $key_label for first-boot registration.\n\nReveal it on the control plane: Settings -> Security -> Agent bootstrap keys -> type your password -> Reveal keys.\n\nThe agent exchanges this key for a rotating JWT on first contact + caches the JWT under /var/lib/spatium-{dns,dhcp}-agent/ for subsequent runs." \
+            16 78 "" 3>&1 1>&2 2>&3) \
+            || on_cancel "agent key"
+        if [ -z "$key_val" ]; then
+            whiptail --msgbox "$key_label is required when 'Bootstrap key' is selected. Re-running the prompt." 9 64 || true
+            ask_agent_config
+            return
+        fi
+        if [ "$is_dns" = 1 ]; then
+            DNS_AGENT_KEY="$key_val"
+        else
+            DHCP_AGENT_KEY="$key_val"
+        fi
     fi
 
     # Per-role default group name. powerdns uses a separate default
@@ -727,11 +774,12 @@ ROLE=$ROLE
 CONTROL_PLANE_URL=$CONTROL_PLANE_URL
 DNS_AGENT_KEY=$DNS_AGENT_KEY
 DHCP_AGENT_KEY=$DHCP_AGENT_KEY
+BOOTSTRAP_PAIRING_CODE=$BOOTSTRAP_PAIRING_CODE
 AGENT_GROUP=$AGENT_GROUP
 EOF
-        # Operator-supplied agent key is sensitive even before
-        # firstboot transcribes it into .env — restrict the
-        # role-config file to root.
+        # Operator-supplied agent key / pairing code are sensitive
+        # even before firstboot transcribes them into .env —
+        # restrict the role-config file to root.
         chmod 0600 "$MOUNT/etc/spatiumddi/role-config"
         cat > "$MOUNT/etc/hosts" <<EOF
 127.0.0.1 localhost
