@@ -3,8 +3,6 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertCircle,
   CheckCircle2,
-  ChevronDown,
-  ChevronRight,
   HardDrive,
   KeyRound,
   Loader2,
@@ -32,6 +30,7 @@ import {
 } from "@/lib/api";
 import { Modal } from "@/components/ui/modal";
 import { ConfirmModal } from "@/components/ui/confirm-modal";
+import { useSessionState } from "@/lib/useSessionState";
 import { cn } from "@/lib/utils";
 import { PairingTab } from "./PairingTab";
 
@@ -132,6 +131,15 @@ export function ApprovalsTab() {
     enabled: isSuperadmin,
   });
 
+  // #170 follow-up — left-sidebar nav mirroring SettingsPage's
+  // shape. Three sections: the appliance fleet table, pairing-code
+  // management, and air-gap slot-image uploads. ``useSessionState``
+  // persists the operator's pick so a refresh inside the same tab
+  // lands them back on the same section.
+  const [view, setView] = useSessionState<
+    "appliances" | "pairing" | "slot-images"
+  >("appliance.fleet.section", "appliances");
+
   const [drilldown, setDrilldown] = useState<ApplianceRow | null>(null);
   const [rejectTarget, setRejectTarget] = useState<ApplianceRow | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<ApplianceRow | null>(null);
@@ -196,123 +204,218 @@ export function ApprovalsTab() {
     );
   }
 
+  const navItems: {
+    key: "appliances" | "pairing" | "slot-images";
+    label: string;
+    summary: string;
+    badge?: string | number;
+  }[] = [
+    {
+      key: "appliances",
+      label: "Appliances",
+      summary: "Approve / manage paired supervisors.",
+      badge: pending.length > 0 ? pending.length : undefined,
+    },
+    {
+      key: "pairing",
+      label: "Pairing codes",
+      summary: "Mint codes for new appliances.",
+    },
+    {
+      key: "slot-images",
+      label: "Slot images",
+      summary: "Air-gap .raw.xz upload + browse.",
+    },
+  ];
+
   return (
-    <div className="mx-auto max-w-6xl">
-      <div className="mb-4 flex items-start justify-between gap-4">
-        <div className="min-w-0 flex-1">
-          <h2 className="text-base font-semibold">Appliance fleet</h2>
-          <p className="mt-1 text-xs text-muted-foreground">
-            One screen for the full Application appliance lifecycle — mint
-            pairing codes, approve / reject incoming supervisors, assign roles,
-            schedule OS upgrades + reboots, and re-key or delete approved
-            appliances. Supervisors submit their Ed25519 pubkey on{" "}
-            <code>/api/v1/appliance/supervisor/register</code> after claiming a
-            code; rows appear below in <code>pending_approval</code> until a
-            superadmin signs the cert with the control plane&apos;s internal CA.
+    <div className="-m-6 flex h-[calc(100%+3rem)] overflow-hidden">
+      {/* ── Sidebar ── */}
+      <aside className="w-56 flex-shrink-0 overflow-y-auto border-r bg-card">
+        <div className="border-b px-4 py-3">
+          <h1 className="text-sm font-semibold">Appliance fleet</h1>
+          <p className="text-xs text-muted-foreground">
+            Lifecycle for Application appliances.
           </p>
         </div>
-        <div className="flex shrink-0 items-center gap-2">
-          <button
-            type="button"
-            onClick={() => refetch()}
-            disabled={isFetching}
-            className="inline-flex items-center gap-1.5 rounded-md border bg-background px-3 py-1.5 text-sm hover:bg-muted disabled:opacity-50"
-          >
-            <RefreshCw
-              className={cn("h-3.5 w-3.5", isFetching && "animate-spin")}
-            />
-            Refresh
-          </button>
-        </div>
-      </div>
+        <nav className="p-2">
+          {navItems.map((item) => (
+            <button
+              key={item.key}
+              type="button"
+              onClick={() => setView(item.key)}
+              className={cn(
+                "block w-full rounded-md px-3 py-2 text-left text-sm hover:bg-accent",
+                view === item.key && "bg-accent font-medium",
+              )}
+            >
+              <span className="flex items-center justify-between gap-2">
+                <span>{item.label}</span>
+                {item.badge !== undefined && (
+                  <span className="rounded-full bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 dark:text-amber-300">
+                    {item.badge}
+                  </span>
+                )}
+              </span>
+              <span className="mt-0.5 block text-[11px] text-muted-foreground">
+                {item.summary}
+              </span>
+            </button>
+          ))}
+        </nav>
+      </aside>
 
-      {/* Folded sections (#170 follow-up): pairing-code management
-          + slot-image uploads (air-gap) sit above the appliance
-          table, collapsed by default so the fleet table is the
-          first thing operators see. */}
-      <CollapsibleSection
-        title="Pairing codes"
-        description="Mint codes that new Application appliances claim during install."
-        storageKey="fleet.pairing.expanded"
-      >
-        <PairingTab />
-      </CollapsibleSection>
+      {/* ── Main pane ── */}
+      <main className="flex-1 overflow-y-auto">
+        <div className="mx-auto max-w-5xl p-6">
+          {view === "pairing" && (
+            <div>
+              <h2 className="mb-1 text-base font-semibold">Pairing codes</h2>
+              <p className="mb-4 text-xs text-muted-foreground">
+                Mint 8-digit codes that a new supervisor appliance swaps for a
+                pending-approval registration on{" "}
+                <code>/api/v1/appliance/supervisor/register</code>. Ephemeral
+                codes are single-use with a short expiry; persistent codes admit
+                many appliances and can be re-revealed.
+              </p>
+              <PairingTab />
+            </div>
+          )}
 
-      <CollapsibleSection
-        title="Slot image uploads"
-        description="Air-gap support — upload .raw.xz slot images for offline appliance upgrades."
-        storageKey="fleet.slotImages.expanded"
-      >
-        <SlotImageManager />
-      </CollapsibleSection>
+          {view === "slot-images" && (
+            <div>
+              <h2 className="mb-1 text-base font-semibold">Slot images</h2>
+              <p className="mb-4 text-xs text-muted-foreground">
+                Air-gap support — upload <code>.raw.xz</code> slot images for
+                offline appliance upgrades. The supervisor downloads through the
+                control plane via an authenticated internal URL once an OS
+                upgrade points at the uploaded row.
+              </p>
+              <SlotImageManager />
+            </div>
+          )}
 
-      <h3 className="mt-4 mb-2 text-sm font-semibold">
-        Application appliances
-      </h3>
+          {view === "appliances" && (
+            <>
+              <div className="mb-4 flex items-start justify-between gap-4">
+                <div className="min-w-0 flex-1">
+                  <h2 className="text-base font-semibold">
+                    Application appliances
+                  </h2>
+                  <p className="mt-1 text-xs text-muted-foreground">
+                    Supervisors that claimed a pairing code sit here until a
+                    superadmin clicks Approve. Approval signs an X.509 cert
+                    against the submitted Ed25519 pubkey using the control
+                    plane&apos;s internal CA (lazy-bootstrapped on the first
+                    approve). The supervisor picks the cert up on its next poll
+                    and switches from session-token auth to mTLS.
+                  </p>
+                </div>
+                <div className="flex shrink-0 items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() => refetch()}
+                    disabled={isFetching}
+                    className="inline-flex items-center gap-1.5 rounded-md border bg-background px-3 py-1.5 text-sm hover:bg-muted disabled:opacity-50"
+                  >
+                    <RefreshCw
+                      className={cn(
+                        "h-3.5 w-3.5",
+                        isFetching && "animate-spin",
+                      )}
+                    />
+                    Refresh
+                  </button>
+                </div>
+              </div>
 
-      {error ? (
-        <div className="rounded-md border border-rose-500/40 bg-rose-500/10 p-3 text-sm text-rose-700 dark:text-rose-300">
-          Failed to load appliances: {(error as Error).message}
+              {error ? (
+                <div className="rounded-md border border-rose-500/40 bg-rose-500/10 p-3 text-sm text-rose-700 dark:text-rose-300">
+                  Failed to load appliances: {(error as Error).message}
+                </div>
+              ) : isLoading ? (
+                <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading
+                  appliances…
+                </div>
+              ) : rows.length === 0 ? (
+                <div className="rounded-md border border-dashed bg-card p-8 text-center text-sm text-muted-foreground">
+                  No appliances have paired yet. Open the{" "}
+                  <button
+                    type="button"
+                    onClick={() => setView("pairing")}
+                    className="underline decoration-dotted underline-offset-2 hover:text-foreground"
+                  >
+                    Pairing codes
+                  </button>{" "}
+                  section to mint one, then install an Application appliance
+                  against it — the row appears here once the supervisor claims
+                  the code.
+                </div>
+              ) : (
+                <div className="overflow-hidden rounded-md border bg-card">
+                  <table className="w-full text-sm">
+                    <thead className="bg-muted/40 text-xs uppercase tracking-wide text-muted-foreground">
+                      <tr>
+                        <th className="px-3 py-2 text-left font-medium">
+                          Hostname
+                        </th>
+                        <th className="px-3 py-2 text-left font-medium">
+                          State
+                        </th>
+                        <th className="px-3 py-2 text-left font-medium">
+                          Capabilities
+                        </th>
+                        <th className="px-3 py-2 text-left font-medium">
+                          Fingerprint
+                        </th>
+                        <th className="px-3 py-2 text-left font-medium">
+                          Paired
+                        </th>
+                        <th className="px-3 py-2 text-left font-medium">
+                          Last seen
+                        </th>
+                        <th className="px-3 py-2 text-right font-medium">
+                          Actions
+                        </th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y">
+                      {pending.map((row) => (
+                        <ApplianceTableRow
+                          key={row.id}
+                          row={row}
+                          highlight
+                          busy={
+                            approve.isPending && approve.variables === row.id
+                          }
+                          onOpen={() => setDrilldown(row)}
+                          onApprove={() => approve.mutate(row.id)}
+                          onReject={() => setRejectTarget(row)}
+                          onRekey={() => setRekeyTarget(row)}
+                          onDelete={() => setDeleteTarget(row)}
+                        />
+                      ))}
+                      {others.map((row) => (
+                        <ApplianceTableRow
+                          key={row.id}
+                          row={row}
+                          busy={rekey.isPending && rekey.variables === row.id}
+                          onOpen={() => setDrilldown(row)}
+                          onApprove={() => approve.mutate(row.id)}
+                          onReject={() => setRejectTarget(row)}
+                          onRekey={() => setRekeyTarget(row)}
+                          onDelete={() => setDeleteTarget(row)}
+                        />
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </>
+          )}
         </div>
-      ) : isLoading ? (
-        <div className="flex items-center gap-2 text-sm text-muted-foreground">
-          <Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading appliances…
-        </div>
-      ) : rows.length === 0 ? (
-        <div className="rounded-md border border-dashed bg-card p-8 text-center text-sm text-muted-foreground">
-          No appliances have paired yet. Mint a pairing code on the Pairing tab
-          and install an Application appliance against it — the row appears here
-          once the supervisor claims the code.
-        </div>
-      ) : (
-        <div className="overflow-hidden rounded-md border bg-card">
-          <table className="w-full text-sm">
-            <thead className="bg-muted/40 text-xs uppercase tracking-wide text-muted-foreground">
-              <tr>
-                <th className="px-3 py-2 text-left font-medium">Hostname</th>
-                <th className="px-3 py-2 text-left font-medium">State</th>
-                <th className="px-3 py-2 text-left font-medium">
-                  Capabilities
-                </th>
-                <th className="px-3 py-2 text-left font-medium">Fingerprint</th>
-                <th className="px-3 py-2 text-left font-medium">Paired</th>
-                <th className="px-3 py-2 text-left font-medium">Last seen</th>
-                <th className="px-3 py-2 text-right font-medium">Actions</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y">
-              {/* Pending pinned at the top — operators come to this tab to
-                  action the queue first, then check status of approved
-                  rows. Same visual sort as the existing FleetTab. */}
-              {pending.map((row) => (
-                <ApplianceTableRow
-                  key={row.id}
-                  row={row}
-                  highlight
-                  busy={approve.isPending && approve.variables === row.id}
-                  onOpen={() => setDrilldown(row)}
-                  onApprove={() => approve.mutate(row.id)}
-                  onReject={() => setRejectTarget(row)}
-                  onRekey={() => setRekeyTarget(row)}
-                  onDelete={() => setDeleteTarget(row)}
-                />
-              ))}
-              {others.map((row) => (
-                <ApplianceTableRow
-                  key={row.id}
-                  row={row}
-                  busy={rekey.isPending && rekey.variables === row.id}
-                  onOpen={() => setDrilldown(row)}
-                  onApprove={() => approve.mutate(row.id)}
-                  onReject={() => setRejectTarget(row)}
-                  onRekey={() => setRekeyTarget(row)}
-                  onDelete={() => setDeleteTarget(row)}
-                />
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
+      </main>
 
       {drilldown && (
         <ApplianceDrilldownModal
@@ -1358,58 +1461,6 @@ function ApplianceOsUpgradeSection({ row }: { row: ApplianceRow }) {
           requireCheckboxLabel={`I understand ${row.hostname} will go offline for ~30–60 s`}
         />
       )}
-    </div>
-  );
-}
-
-// ── CollapsibleSection ──────────────────────────────────────────
-
-function CollapsibleSection({
-  title,
-  description,
-  storageKey,
-  children,
-}: {
-  title: string;
-  description: string;
-  storageKey: string;
-  children: React.ReactNode;
-}) {
-  // Persist expanded state in sessionStorage so the operator's
-  // pick survives a page refresh inside the same tab. Default
-  // collapsed so the Fleet table is what the operator sees first.
-  const [open, setOpen] = useState<boolean>(() => {
-    if (typeof window === "undefined") return false;
-    return window.sessionStorage.getItem(storageKey) === "1";
-  });
-  function toggle() {
-    setOpen((next) => {
-      const v = !next;
-      try {
-        window.sessionStorage.setItem(storageKey, v ? "1" : "0");
-      } catch {
-        // sessionStorage unavailable (private mode); state still
-        // toggles in-memory.
-      }
-      return v;
-    });
-  }
-  return (
-    <div className="mb-3 rounded-md border bg-card">
-      <button
-        type="button"
-        onClick={toggle}
-        className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm hover:bg-muted/40"
-      >
-        {open ? (
-          <ChevronDown className="h-3.5 w-3.5 text-muted-foreground" />
-        ) : (
-          <ChevronRight className="h-3.5 w-3.5 text-muted-foreground" />
-        )}
-        <span className="font-medium">{title}</span>
-        <span className="text-xs text-muted-foreground">— {description}</span>
-      </button>
-      {open && <div className="border-t p-3">{children}</div>}
     </div>
   );
 }
