@@ -262,9 +262,7 @@ def sign_supervisor_cert(
             # cryptography can parse. We just generated this CA above
             # with rsa.generate_private_key, so we know the type — the
             # cast keeps mypy happy without runtime cost.
-            x509.AuthorityKeyIdentifier.from_issuer_public_key(
-                ca_private.public_key()
-            ),
+            x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_private.public_key()),
             critical=False,
         )
         .sign(ca_private, hashes.SHA256())

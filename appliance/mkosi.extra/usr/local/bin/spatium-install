@@ -106,31 +106,29 @@ NET_PREFIX="24"
 NET_GATEWAY=""
 NET_DNS="1.1.1.1 1.0.0.1"
 TIMEZONE="UTC"
-# Role-split appliance (Phase 6, issue #134). One of:
-#   control     — full SpatiumDDI stack (api + worker + beat + db
-#                 + redis + frontend + bundled DNS/DHCP agents).
-#   dns-agent   — BIND9 agent only; needs to register with a
-#                 remote control plane via CONTROL_PLANE_URL +
-#                 DNS_AGENT_KEY. Minimal HTTPS landing page.
-#   dhcp-agent  — Kea agent only; same shape as dns-agent but with
-#                 DHCP_AGENT_KEY.
+# #170 Wave B2 — installer roles collapse from five (control /
+# control-only / dns-agent-bind9 / dns-agent-powerdns / dhcp-agent)
+# to three:
+#   full-stack    — Full SpatiumDDI stack: api + worker + beat + db
+#                   + redis + frontend + bundled BIND9 + Kea (AIO).
+#                   Replaces ``control``.
+#   frontend-core — Control plane only, no bundled service workers.
+#                   Replaces ``control-only``.
+#   application   — Supervisor only. Pairs with a remote control
+#                   plane via a pairing code and sits in
+#                   pending_approval until an admin clicks Approve
+#                   in the fleet UI. The control plane assigns the
+#                   role(s) + group(s) after approval — operators
+#                   no longer pick DNS / DHCP / engine at install
+#                   time. Replaces the three per-service agent roles.
 # Every role still creates an OS admin account so the operator can
 # SSH in and manage the appliance, irrespective of which web UI runs.
-ROLE="control"
+ROLE="full-stack"
 CONTROL_PLANE_URL=""
-DNS_AGENT_KEY=""
-DHCP_AGENT_KEY=""
-# Phase 4 of #169 — operator may paste a short pairing code instead
-# of the long agent key. firstboot writes whichever the operator
-# supplied into .env; the agent's bootstrap chain (Phase 3) resolves
-# code → key on first contact with the control plane.
+# Pairing code claimed by the supervisor on first boot. 8 decimal
+# digits — single-use ephemeral or persistent depending on what the
+# control-plane admin minted. Only meaningful when ROLE=application.
 BOOTSTRAP_PAIRING_CODE=""
-# Agent group on the control plane this appliance joins. Auto-
-# created on first registration if it doesn't exist. Operators
-# managing multiple sites (us-east-dns / eu-prod-dhcp / lab-dns)
-# pick a group name at install time; the value drives which
-# zones / scopes get pushed to this agent.
-AGENT_GROUP=""
 
 # ── Prompts ───────────────────────────────────────────────────────────────────
 
@@ -140,7 +138,7 @@ welcome() {
         --msgbox "Welcome to the SpatiumDDI Appliance Installer.\n\n\
 This installer will ERASE a target disk and install SpatiumDDI to it.\n\n\
 You'll be asked for:\n\
-  - Role (full control plane, or DNS / DHCP agent)\n\
+  - Role (Full stack / Frontend-core / Application)\n\
   - Target disk\n\
   - Hostname\n\
   - Admin OS user + password (for SSH access)\n\
@@ -153,142 +151,77 @@ Press OK to begin, or Cancel to drop to a shell." 18 70 \
 ask_role() {
     log "Step: ask_role"
     # whiptail --radiolist returns the selected tag on stdout. The third
-    # column is the initial-selection flag (ON for control, OFF for the
-    # others). Five roles:
-    #   control              — control plane + bundled BIND9 + Kea
-    #                          (single-box AIO; default).
-    #   control-only         — control plane only, no bundled agents.
-    #                          Agent keys are still generated so the
-    #                          operator can register external agents
-    #                          via the Settings reveal UI.
-    #   dns-agent-bind9      — BIND9 agent only; needs a remote control
-    #                          plane.
-    #   dns-agent-powerdns   — PowerDNS agent only; needs a remote
-    #                          control plane. Group features differ
-    #                          (DNSSEC sign/unsign, ALIAS, LUA, catalog
-    #                          zones gate on the powerdns driver).
-    #   dhcp-agent           — Kea agent only; needs a remote control
-    #                          plane.
+    # column is the initial-selection flag (ON for full-stack, OFF for
+    # the others). Three roles (#170 Wave B2):
+    #   full-stack    — control plane + bundled BIND9 + Kea
+    #                   (single-box AIO; default).
+    #   frontend-core — control plane only. Pairs with remote
+    #                   Application appliances via the fleet UI.
+    #   application   — supervisor only. Submits an Ed25519 pubkey
+    #                   against a pairing code, sits in pending until
+    #                   an admin clicks Approve; the control plane
+    #                   then assigns role(s) + group(s) and the
+    #                   supervisor pulls the matching service
+    #                   containers on its next poll.
     ROLE=$(whiptail --backtitle "$BACKTITLE" --title "Appliance role" \
-        --radiolist "What role does this appliance play?\n\nAll-in-one runs everything on one box (default — good for labs / small sites). Control-plane-only suits distributed deployments where DNS and DHCP live closer to the clients they serve as separate agent appliances.\n\nDNS-agent (BIND9) is the universal default. DNS-agent (PowerDNS) is the alternative engine — group features like DNSSEC sign/unsign + ALIAS + LUA + catalog zones gate on every server in a group running powerdns." \
-        24 80 5 \
-        "control"             "Control plane + bundled BIND9 + Kea (all-in-one)" ON \
-        "control-only"        "Control plane only (no bundled agents)"           OFF \
-        "dns-agent-bind9"     "DNS agent — BIND9 + agent process"                OFF \
-        "dns-agent-powerdns"  "DNS agent — PowerDNS + agent process"             OFF \
-        "dhcp-agent"          "DHCP agent — Kea + agent process"                 OFF \
+        --radiolist "What role does this appliance play?\n\nFull stack runs everything on one box (default — good for labs / small sites). Frontend / core runs just the control plane — pair Application appliances against it from the fleet UI for distributed deployments.\n\nApplication is the generic agent role: the supervisor pairs with a remote control plane, sits in pending approval, and is assigned its role(s) (DNS-BIND9 / DNS-PowerDNS / DHCP / multi-role) by an admin in the fleet UI. No DNS or DHCP pre-pick at install time." \
+        22 82 3 \
+        "full-stack"    "Full stack — control plane + BIND9 + Kea (AIO)" ON \
+        "frontend-core" "Frontend / core — control plane only"          OFF \
+        "application"   "Application — supervisor only (pairs remote)"  OFF \
         3>&1 1>&2 2>&3) \
         || on_cancel "role selection"
     log "Selected role: $ROLE"
 }
 
-ask_agent_config() {
-    # Only fires for agent roles (dns-agent / dhcp-agent). The control
-    # and control-only roles ARE the control plane — they don't need
-    # to be told where one is.
-    case "$ROLE" in
-        control|control-only) return 0 ;;
-    esac
-    log "Step: ask_agent_config (role=$ROLE)"
+ask_application_config() {
+    # Only fires for the Application role. The full-stack and
+    # frontend-core roles ARE control planes — they don't need to be
+    # told where one is.
+    if [ "$ROLE" != "application" ]; then
+        return 0
+    fi
+    log "Step: ask_application_config"
 
     CONTROL_PLANE_URL=$(whiptail --backtitle "$BACKTITLE" \
         --title "Control plane URL" \
-        --inputbox "Where does this agent register?\n\nFormat: https://<control-plane-host>/  — the URL of the SpatiumDDI control plane this agent connects to. The agent posts heartbeats + long-polls /config from here.\n\nUse https:// in production; http:// is acceptable for lab installs but the agent key crosses the wire in clear." \
-        14 72 "https://" 3>&1 1>&2 2>&3) \
+        --inputbox "Where does this Application appliance register?\n\nFormat: https://<control-plane-host>/  — the URL of the SpatiumDDI control plane this supervisor pairs against. The supervisor submits its Ed25519 pubkey here, sits in pending until an admin clicks Approve, then receives a control-plane-CA-signed identity cert.\n\nUse https:// in production; http:// is acceptable for lab installs." \
+        16 76 "https://" 3>&1 1>&2 2>&3) \
         || on_cancel "control-plane URL"
     if [ -z "$CONTROL_PLANE_URL" ] || [ "$CONTROL_PLANE_URL" = "https://" ]; then
-        whiptail --msgbox "Control-plane URL is required for agent installs." 8 60 || true
-        ask_agent_config
+        whiptail --msgbox "Control-plane URL is required for an Application install." 8 60 || true
+        ask_application_config
         return
     fi
 
-    local key_label is_dns
-    case "$ROLE" in
-        dns-agent-bind9|dns-agent-powerdns)
-            key_label="DNS agent key"
-            is_dns=1
-            ;;
-        dhcp-agent)
-            key_label="DHCP agent key"
-            is_dns=0
-            ;;
-    esac
-
-    # Bootstrap-method radio (Phase 4 of #169). Pairing code is the
-    # default — 8 digits operators can type without typos over an
-    # IPMI / serial console where copy-paste is unreliable. The long
-    # hex key is the fallback for re-installs, air-gapped sites where
-    # the operator has the key saved out of band, or cases where a
-    # pairing code generated earlier expired before install reached
-    # this step.
-    local bootstrap_method
-    bootstrap_method=$(whiptail --backtitle "$BACKTITLE" --title "Bootstrap method" \
-        --radiolist "Pick how this agent authenticates on first contact with the control plane.\n\nPairing code: ask the control plane operator to click 'New pairing code' on /appliance -> Pairing — they give you the 8 digits. Single-use, 15-minute default expiry.\n\nBootstrap key: paste the long ${key_label,,} (64-char hex). Reveal it on the control plane under Settings -> Security -> Agent bootstrap keys (requires a password re-confirm). Use this for re-installs, air-gapped sites with a saved key, or cases where the code expired." \
-        18 80 2 \
-        "code" "Pairing code (8-digit, recommended)" ON \
-        "key"  "Bootstrap key (long hex, advanced)"  OFF \
-        3>&1 1>&2 2>&3) \
-        || on_cancel "bootstrap method"
-    log "Bootstrap method: $bootstrap_method"
-
-    if [ "$bootstrap_method" = "code" ]; then
-        local code_val
-        while true; do
-            code_val=$(whiptail --backtitle "$BACKTITLE" --title "Pairing code" \
-                --inputbox "Enter the 8-digit pairing code from the control plane.\n\nGenerate one at https://<control-plane>/appliance -> Pairing -> 'New pairing code'. Codes expire after the duration set at generation time (default 15 min) and are single-use, so generate fresh if this one has been sitting around." \
-                14 78 "" 3>&1 1>&2 2>&3) \
-                || on_cancel "pairing code"
-            code_val=$(echo "$code_val" | tr -d '[:space:]')
-            if [ -z "$code_val" ]; then
-                whiptail --msgbox "Pairing code is required for this method." 8 60 || true
-                continue
-            fi
-            # Validate: exactly 8 decimal digits. Catch typos before
-            # firstboot tries to redeem the code and fails with a
-            # generic 403 (which we'd then surface on the console).
-            if ! [[ "$code_val" =~ ^[0-9]{8}$ ]]; then
-                whiptail --msgbox "Pairing code must be exactly 8 decimal digits.\n\nGot: $code_val" 10 60 || true
-                continue
-            fi
-            break
-        done
-        BOOTSTRAP_PAIRING_CODE="$code_val"
-    else
-        local key_val
-        key_val=$(whiptail --backtitle "$BACKTITLE" --title "$key_label" \
-            --inputbox "Pre-shared $key_label for first-boot registration.\n\nReveal it on the control plane: Settings -> Security -> Agent bootstrap keys -> type your password -> Reveal keys.\n\nThe agent exchanges this key for a rotating JWT on first contact + caches the JWT under /var/lib/spatium-{dns,dhcp}-agent/ for subsequent runs." \
-            16 78 "" 3>&1 1>&2 2>&3) \
-            || on_cancel "agent key"
-        if [ -z "$key_val" ]; then
-            whiptail --msgbox "$key_label is required when 'Bootstrap key' is selected. Re-running the prompt." 9 64 || true
-            ask_agent_config
-            return
+    # Pairing code only — Application appliances never paste a long
+    # bootstrap key. The supervisor generates its own Ed25519 keypair
+    # on first boot and submits the pubkey against the code; the
+    # control plane stores it and waits for admin approval. The 8-digit
+    # code is the only thing the operator types over an IPMI / serial
+    # console.
+    local code_val
+    while true; do
+        code_val=$(whiptail --backtitle "$BACKTITLE" --title "Pairing code" \
+            --inputbox "Enter the 8-digit pairing code from the control plane.\n\nMint one at https://<control-plane>/appliance → Pairing → 'New pairing code'. Single-use ephemeral codes expire after 15 min by default; persistent codes (multi-claim) stay valid until disabled or revoked.\n\nAfter the supervisor claims the code, the appliance sits in pending — ask the control plane admin to click Approve in the fleet UI to issue the identity cert and assign a role." \
+            18 78 "" 3>&1 1>&2 2>&3) \
+            || on_cancel "pairing code"
+        code_val=$(echo "$code_val" | tr -d '[:space:]')
+        if [ -z "$code_val" ]; then
+            whiptail --msgbox "Pairing code is required for an Application install." 8 60 || true
+            continue
         fi
-        if [ "$is_dns" = 1 ]; then
-            DNS_AGENT_KEY="$key_val"
-        else
-            DHCP_AGENT_KEY="$key_val"
+        # Validate: exactly 8 decimal digits. Catch typos before
+        # firstboot tries to redeem the code and fails with a
+        # generic 403 (which we'd then surface on the console).
+        if ! [[ "$code_val" =~ ^[0-9]{8}$ ]]; then
+            whiptail --msgbox "Pairing code must be exactly 8 decimal digits.\n\nGot: $code_val" 10 60 || true
+            continue
         fi
-    fi
-
-    # Per-role default group name. powerdns uses a separate default
-    # because group-level features gate on every server in a group
-    # running the same driver (mixing bind9 + powerdns in one group
-    # is invalid).
-    local default_group
-    case "$ROLE" in
-        dns-agent-powerdns) default_group="default-powerdns" ;;
-        *)                  default_group="default" ;;
-    esac
-    AGENT_GROUP=$(whiptail --backtitle "$BACKTITLE" --title "Agent group" \
-        --inputbox "Which group on the control plane should this agent join?\n\nEnter an existing group's name to register this agent into it. Type a new name to have the control plane auto-create the group on first registration.\n\nMultiple agents in the same group serve the same zones / scopes (DNS) or share lease state (DHCP HA pair). Leave the default for single-site deployments; pick a descriptive name for multi-site / multi-tenant ('us-east-dns', 'lab-dhcp', 'site-toronto')." \
-        16 76 "$default_group" 3>&1 1>&2 2>&3) \
-        || on_cancel "agent group"
-    AGENT_GROUP=$(echo "$AGENT_GROUP" | tr -d '[:space:]')
-    if [ -z "$AGENT_GROUP" ]; then
-        AGENT_GROUP="$default_group"
-    fi
-    log "Agent group: $AGENT_GROUP"
+        break
+    done
+    BOOTSTRAP_PAIRING_CODE="$code_val"
+    log "Application paired against $CONTROL_PLANE_URL with an 8-digit pairing code"
 }
 
 pick_disk() {
@@ -454,21 +387,21 @@ confirm() {
     log "Step: confirm"
     local role_label
     case "$ROLE" in
-        control)             role_label="Control plane + BIND9 + Kea (all-in-one)" ;;
-        control-only)        role_label="Control plane only (no bundled agents)" ;;
-        dns-agent-bind9)     role_label="DNS agent (BIND9)" ;;
-        dns-agent-powerdns)  role_label="DNS agent (PowerDNS)" ;;
-        dhcp-agent)          role_label="DHCP agent (Kea)" ;;
-        *)                   role_label="$ROLE" ;;
+        full-stack)    role_label="Full stack — control plane + BIND9 + Kea (AIO)" ;;
+        frontend-core) role_label="Frontend / core — control plane only" ;;
+        application)   role_label="Application — supervisor only (pairs remote)" ;;
+        *)             role_label="$ROLE" ;;
     esac
     local s
     s="Role:        $role_label\n"
-    case "$ROLE" in
-        dns-agent-bind9|dns-agent-powerdns|dhcp-agent)
-            s+="Control URL: $CONTROL_PLANE_URL\n"
-            s+="Agent group: $AGENT_GROUP\n"
-            ;;
-    esac
+    if [ "$ROLE" = "application" ]; then
+        s+="Control URL: $CONTROL_PLANE_URL\n"
+        # Mask the code in the confirmation screen — the IPMI / serial
+        # console operator already typed it; no need to flash all 8
+        # digits back at them. ●●●●●●●● is enough confirmation that
+        # something landed.
+        s+="Pair code:   ●●●●●●●●\n"
+    fi
     s+="Target disk: $TARGET_DISK\n"
     s+="Hostname:    $HOSTNAME\n"
     s+="OS user:     $ADMIN_USER\n"
@@ -776,14 +709,10 @@ EOF
         cat > "$MOUNT/etc/spatiumddi/role-config" <<EOF
 ROLE=$ROLE
 CONTROL_PLANE_URL=$CONTROL_PLANE_URL
-DNS_AGENT_KEY=$DNS_AGENT_KEY
-DHCP_AGENT_KEY=$DHCP_AGENT_KEY
 BOOTSTRAP_PAIRING_CODE=$BOOTSTRAP_PAIRING_CODE
-AGENT_GROUP=$AGENT_GROUP
 EOF
-        # Operator-supplied agent key / pairing code are sensitive
-        # even before firstboot transcribes them into .env —
-        # restrict the role-config file to root.
+        # The pairing code is sensitive even before firstboot
+        # transcribes it into .env — restrict role-config to root.
         chmod 0600 "$MOUNT/etc/spatiumddi/role-config"
         cat > "$MOUNT/etc/hosts" <<EOF
 127.0.0.1 localhost
@@ -1272,7 +1201,7 @@ main() {
     ask_user_password
     ask_network
     ask_timezone
-    ask_agent_config
+    ask_application_config
     confirm
     do_install
 }

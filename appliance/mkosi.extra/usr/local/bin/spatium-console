@@ -14,9 +14,10 @@
 #
 # Role-awareness reads APPLIANCE_ROLE from /etc/spatiumddi/.env —
 # the same value spatiumddi-firstboot writes after the installer
-# wizard picked a role (control / control-only / dns-agent-bind9 /
-# dns-agent-powerdns / dhcp-agent). Each role gets a different
-# Services pane.
+# wizard picked a role. Post-#170-B2 roles: full-stack / frontend-core
+# / application. Pre-B2 roles (control / control-only / dns-agent-* /
+# dhcp-agent) are still recognised for in-field appliances installed
+# off an A4-era ISO. Each role gets a different Services pane.
 
 from __future__ import annotations
 
@@ -57,6 +58,13 @@ APPLIANCE_RELEASE = Path("/etc/spatiumddi/appliance-release")
 
 
 ROLE_LABELS = {
+    # #170 Wave B2 — post-rename roles.
+    "full-stack": "Full stack — control plane + BIND9 + Kea (AIO)",
+    "frontend-core": "Frontend / core — control plane only",
+    "application": "Application — supervisor (pairs remote)",
+    # Pre-B2 legacy labels, kept so an in-field appliance running an
+    # A4-era role-config still gets a friendly header even before
+    # firstboot reruns and rewrites APPLIANCE_ROLE.
     "control": "Control plane + BIND9 + Kea (all-in-one)",
     "control-only": "Control plane only",
     "dns-agent-bind9": "DNS agent (BIND9)",
@@ -70,6 +78,20 @@ ROLE_LABELS = {
 # expected set so a missing-from-`docker ps` service shows up as
 # `(not running)` instead of being silently absent.
 ROLE_SERVICES = {
+    "full-stack": [
+        "postgres", "redis", "migrate", "api", "worker", "beat",
+        "frontend", "dns-bind9", "dhcp-kea",
+    ],
+    "frontend-core": [
+        "postgres", "redis", "migrate", "api", "worker", "beat", "frontend",
+    ],
+    # Application = supervisor + the agent-landing static page. The
+    # service container (dns-bind9 / dns-powerdns / dhcp-kea) starts
+    # only after admin approval + role assignment in the fleet UI
+    # (Wave C); until then the supervisor is the only spatiumddi-
+    # owned container on the box.
+    "application": ["spatium-supervisor", "agent-landing"],
+    # Legacy pre-B2 service sets.
     "control": [
         "postgres", "redis", "migrate", "api", "worker", "beat",
         "frontend", "dns-bind9", "dhcp-kea",
@@ -117,8 +139,8 @@ def read_env(path: Path = ENV_FILE) -> dict[str, str]:
 
 
 def role_from_env(env: dict[str, str]) -> str:
-    raw = (env.get("APPLIANCE_ROLE") or "control").strip()
-    return raw if raw in ROLE_LABELS else "control"
+    raw = (env.get("APPLIANCE_ROLE") or "full-stack").strip()
+    return raw if raw in ROLE_LABELS else "full-stack"
 
 
 def role_label(role: str) -> str:
@@ -734,27 +756,44 @@ _AGENT_CONTAINER = {
 
 
 def pairing_status(env: dict[str, str], role: str, ps_rows: list[dict]) -> tuple[str, str] | None:
-    """#169 Phase 4 — derive a (label, style) tuple for the console's
-    'Pairing' row, or ``None`` when the operator pasted the long
-    bootstrap key instead of a pairing code (nothing to show).
+    """#169 Phase 4 + #170 Wave B2 — derive a (label, style) tuple for
+    the console's 'Identity' row, or ``None`` when the role doesn't
+    pair against a remote control plane.
 
-    Reads three signals:
+    Two sources by role:
 
-    * ``BOOTSTRAP_PAIRING_CODE`` in .env — was a pairing code in play
-      at all? Empty → operator went the long-key route → return None.
-    * ``agent_token.jwt`` in the agent's docker volume — non-empty
-      means the agent has registered successfully. The pairing code
-      did its job; we're paired.
-    * ``bootstrap.key`` in the agent's docker volume — non-empty but
-      no JWT means the /pair call succeeded (resolver cached the
-      key) but the register call hasn't yet.
-    * Container state from ``docker ps`` — if the agent container has
-      exited non-zero with no cached key, the pairing-code exchange
-      itself failed (almost always 403 → dead / expired / claimed
-      code). Surface a clear "regenerate" hint.
+    * **application** (#170 B2) — read the supervisor's identity dir
+      under ``/var/persist/spatium-supervisor/identity/``. The
+      ``appliance_id`` file is created when the supervisor's claim
+      succeeds; ``tls/cert.pem`` (written by the supervisor's poll
+      loop in Wave C once admin approves) marks the approved state.
+    * **legacy DNS / DHCP agents** (pre-B2 in-field installs) — read
+      the agent's docker volume for ``agent_token.jwt`` /
+      ``bootstrap.key`` exactly as #169 Phase 4 did.
 
     Returns ``(label, rich-style)`` so the renderer can colour the row.
     """
+    if role == "application":
+        identity_dir = Path("/var/persist/spatium-supervisor/identity")
+        appliance_id_file = identity_dir / "appliance_id"
+        cert_file = Path("/var/persist/spatium-supervisor/tls/cert.pem")
+        if cert_file.exists() and cert_file.stat().st_size > 0:
+            return ("Approved ✓", "bold green")
+        if appliance_id_file.exists() and appliance_id_file.stat().st_size > 0:
+            return ("Awaiting approval", "bold yellow")
+        # No appliance_id yet — supervisor either hasn't claimed the
+        # code or the claim failed. Surface container exit as the
+        # actionable hint.
+        for row in ps_rows:
+            if container_service_name(row) != "spatium-supervisor":
+                continue
+            state = (row.get("State") or "").lower()
+            status = (row.get("Status") or "").lower()
+            if "exited" in state or "dead" in state or "exited" in status:
+                return ("Pair failed — regenerate code on control plane", "bold red")
+            break
+        return ("Bootstrapping…", "bold yellow")
+
     if role not in _AGENT_VOLUME:
         return None
     if not env.get("BOOTSTRAP_PAIRING_CODE"):
@@ -772,8 +811,8 @@ def pairing_status(env: dict[str, str], role: str, ps_rows: list[dict]) -> tuple
         # Pair succeeded, register may still be in flight.
         return ("Registering…", "bold yellow")
 
-    # No cached key yet. If the container is in an exited / errored
-    # state, the /pair call failed — surface the actionable hint.
+    # No cached key yet. If the agent container has exited non-zero,
+    # the /pair call failed — surface the actionable hint.
     container = _AGENT_CONTAINER[role]
     for row in ps_rows:
         if container_service_name(row) != container:
@@ -790,27 +829,39 @@ def pairing_status(env: dict[str, str], role: str, ps_rows: list[dict]) -> tuple
 def render_agent_context(
     env: dict[str, str], role: str, ps_rows: list[dict]
 ) -> Panel | None:
-    """Render the small 'Control plane' panel agent roles show.
+    """Render the small 'Control plane' panel agent / application roles
+    show.
 
-    Returns None for control / control-only — there's nothing to
-    surface there beyond what Services already shows.
+    Returns None for full-stack / frontend-core (and their pre-B2
+    aliases control / control-only) — there's nothing to surface there
+    beyond what Services already shows.
     """
-    if role in ("control", "control-only"):
+    if role in ("full-stack", "frontend-core", "control", "control-only"):
         return None
     url = env.get("CONTROL_PLANE_URL") or "(not configured)"
-    group = env.get("AGENT_GROUP") or "default"
 
     grid = Table.grid(padding=(0, 2), expand=True)
     grid.add_column(width=14, no_wrap=True)
     grid.add_column(no_wrap=False)
     grid.add_row(Text("Control plane", style="dim"), Text(url, style="bold"))
-    grid.add_row(Text("Group", style="dim"), Text(group))
+    # AGENT_GROUP is only meaningful for legacy DNS / DHCP agent roles
+    # — Application appliances get their group assigned by the control
+    # plane after admin approval, not at install time.
+    if role != "application":
+        group = env.get("AGENT_GROUP") or "default"
+        grid.add_row(Text("Group", style="dim"), Text(group))
     grid.add_row(Text("Hostname", style="dim"),
                  Text(env.get("APPLIANCE_HOSTNAME") or os.uname().nodename))
     pairing = pairing_status(env, role, ps_rows)
     if pairing is not None:
         label, style = pairing
-        grid.add_row(Text("Pairing", style="dim"), Text(label, style=style))
+        # #170 B2 names the row "Identity" for Application appliances
+        # since the pairing claim is the first step in a multi-stage
+        # identity lifecycle (claim → pending approval → approved with
+        # cert). Legacy DNS / DHCP rows stay "Pairing" — they don't
+        # have the cert-issuance stage.
+        row_label = "Identity" if role == "application" else "Pairing"
+        grid.add_row(Text(row_label, style="dim"), Text(label, style=style))
 
     return Panel(grid, box=SQUARE, border_style="cyan",
                  title="[bold]Agent[/bold]", title_align="left")
