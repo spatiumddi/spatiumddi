@@ -447,6 +447,33 @@ class Appliance(Base):
         DateTime(timezone=True), nullable=True
     )
 
+    # Role assignment — #170 Wave C2. Operator picks a subset of
+    # ``dns-bind9`` / ``dns-powerdns`` / ``dhcp`` / ``observer`` /
+    # ``custom``. Mutually-exclusive pairs (one DNS engine per box)
+    # enforced at the role-assignment endpoint, not via a CHECK
+    # constraint (operator intent should be a one-line API error,
+    # not a Postgres exception).
+    assigned_roles: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, default=list, server_default=sa.text("'[]'::jsonb")
+    )
+    assigned_dns_group_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dns_server_group.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    assigned_dhcp_group_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        ForeignKey("dhcp_server_group.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    # Operator-defined free-form key:value (string) pairs for fleet
+    # targeting. ``{"site": "prod-east", "tier": "edge"}``. No
+    # semantic interpretation; consumed by future fleet-UI filters +
+    # MCP `tags_match` query arg.
+    tags: Mapped[dict[str, str]] = mapped_column(
+        JSONB, nullable=False, default=dict, server_default=sa.text("'{}'::jsonb")
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

@@ -33,7 +33,6 @@ the supervisor.
 
 from __future__ import annotations
 
-import time
 import uuid
 from typing import Any
 
@@ -43,6 +42,15 @@ import structlog
 from . import appliance_state
 from .config import SupervisorConfig
 from .identity import Identity
+from .role_orchestrator import compute_target_env, render_env_file
+
+
+# #170 Wave C2 — role-driven compose env file. Written under the
+# supervisor's state-dir so it survives slot swaps; the operator's
+# baked compose file references it via ``--env-file`` (Wave C3
+# subprocess piece). C2 ships only the env render; C3 wires the
+# actual ``docker compose up -d`` invocation.
+_ROLE_ENV_FILENAME = "role-compose.env"
 
 
 def _capabilities_payload() -> dict[str, Any]:
@@ -159,7 +167,34 @@ def heartbeat_once(
         if appliance_state.maybe_fire_reboot(True):
             log.info("supervisor.heartbeat.reboot_trigger_fired")
 
-    # Identity unused in C1's payload but kept on the signature so
+    # #170 Wave C2 — render the role-driven compose env. C3 will
+    # consume this via ``docker compose --env-file`` to actually
+    # bring services up/down; for now we just write the file so the
+    # operator can inspect what the supervisor would do next.
+    role_assignment = body_out.get("role_assignment") or {}
+    target = compute_target_env(role_assignment)
+    env_path = cfg.state_dir / _ROLE_ENV_FILENAME
+    try:
+        env_path.parent.mkdir(parents=True, exist_ok=True)
+        rendered = render_env_file(target)
+        # Atomic write — partial files would confuse C3's compose
+        # subprocess if the supervisor crashed mid-write.
+        tmp = env_path.with_suffix(".tmp")
+        tmp.write_text(rendered, encoding="utf-8")
+        tmp.replace(env_path)
+        log.info(
+            "supervisor.heartbeat.role_env_rendered",
+            profiles=target.profiles,
+            env_path=str(env_path),
+        )
+    except OSError as exc:
+        log.warning(
+            "supervisor.heartbeat.role_env_write_failed",
+            error=str(exc),
+            env_path=str(env_path),
+        )
+
+    # Identity unused in C2's payload but kept on the signature so
     # C2's mTLS upgrade doesn't need to thread it back in. Silence
     # the linter without adding a runtime cost.
     _ = identity

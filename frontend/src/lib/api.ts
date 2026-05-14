@@ -5094,6 +5094,12 @@ export interface DHCPServerGroup {
   // mode is the HA mode when the group has ≥ 2 Kea members:
   //   "hot-standby" | "load-balancing" | "standalone".
   mode: string;
+  // #170 Wave C2 — supervisor-side container networking mode.
+  // "host" = container shares host netns for L2 broadcasts (default).
+  // "bridged" = container listens on host UDP/67 only (relayed
+  // unicast deployments). Surfaces in the role-assignment UI on
+  // the Approvals tab so the operator knows what they're picking.
+  network_mode?: string;
   heartbeat_delay_ms: number;
   max_response_delay_ms: number;
   max_ack_delay_ms: number;
@@ -7182,7 +7188,19 @@ export interface ApplianceRow {
   desired_slot_image_url: string | null;
   reboot_requested: boolean;
   reboot_requested_at: string | null;
+  // #170 Wave C2 — role assignment + free-form tags.
+  assigned_roles: string[];
+  assigned_dns_group_id: string | null;
+  assigned_dhcp_group_id: string | null;
+  tags: Record<string, string>;
   created_at: string;
+}
+
+export interface ApplianceRolesUpdate {
+  roles?: string[];
+  dns_group_id?: string | null;
+  dhcp_group_id?: string | null;
+  tags?: Record<string, string>;
 }
 
 export const applianceApprovalApi = {
@@ -7203,6 +7221,10 @@ export const applianceApprovalApi = {
   rekey: (id: string) =>
     api
       .post<ApplianceRow>(`/appliance/appliances/${id}/rekey`)
+      .then((r) => r.data),
+  updateRoles: (id: string, body: ApplianceRolesUpdate) =>
+    api
+      .put<ApplianceRow>(`/appliance/appliances/${id}/roles`, body)
       .then((r) => r.data),
 };
 

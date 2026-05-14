@@ -17,6 +17,8 @@ import {
 import {
   applianceApprovalApi,
   authApi,
+  dhcpApi,
+  dnsApi,
   type ApplianceRow,
   type ApplianceState,
   type SupervisorCapabilities,
@@ -646,6 +648,10 @@ function ApplianceDrilldownModal({
         </div>
 
         {row.state === "approved" && (
+          <ApplianceRoleAssignmentSection row={row} />
+        )}
+
+        {row.state === "approved" && (
           <div>
             <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
               Certificate
@@ -759,3 +765,181 @@ function FactRow({
 // per-row inline edits (notes / tags) without making the import
 // disappear on a UI shape revisit.
 void inputCls;
+
+// ── Role assignment section (#170 Wave C2) ────────────────────────
+
+const ROLE_OPTIONS: { value: string; label: string; capKey?: string }[] = [
+  {
+    value: "dns-bind9",
+    label: "DNS · BIND9",
+    capKey: "can_run_dns_bind9",
+  },
+  {
+    value: "dns-powerdns",
+    label: "DNS · PowerDNS",
+    capKey: "can_run_dns_powerdns",
+  },
+  { value: "dhcp", label: "DHCP", capKey: "can_run_dhcp" },
+  { value: "observer", label: "Observer", capKey: "can_run_observer" },
+];
+
+function ApplianceRoleAssignmentSection({ row }: { row: ApplianceRow }) {
+  const qc = useQueryClient();
+  const caps = row.capabilities ?? {};
+  const initialRoles = new Set(row.assigned_roles ?? []);
+  const [roles, setRoles] = useState<Set<string>>(initialRoles);
+  const [dnsGroupId, setDnsGroupId] = useState<string | null>(
+    row.assigned_dns_group_id ?? null,
+  );
+  const [dhcpGroupId, setDhcpGroupId] = useState<string | null>(
+    row.assigned_dhcp_group_id ?? null,
+  );
+
+  const dnsGroupsQuery = useQuery({
+    queryKey: ["dns", "groups"],
+    queryFn: dnsApi.listGroups,
+    staleTime: 60_000,
+  });
+  const dhcpGroupsQuery = useQuery({
+    queryKey: ["dhcp", "groups"],
+    queryFn: dhcpApi.listGroups,
+    staleTime: 60_000,
+  });
+
+  const save = useMutation({
+    mutationFn: () =>
+      applianceApprovalApi.updateRoles(row.id, {
+        roles: Array.from(roles),
+        dns_group_id: dnsGroupId,
+        dhcp_group_id: dhcpGroupId,
+      }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["appliance", "approvals"] });
+    },
+  });
+
+  function toggleRole(role: string) {
+    setRoles((current) => {
+      const next = new Set(current);
+      if (next.has(role)) {
+        next.delete(role);
+      } else {
+        // Mutually-exclusive DNS engines — selecting one clears the
+        // other so the operator can't submit an invalid combo.
+        if (role === "dns-bind9") next.delete("dns-powerdns");
+        if (role === "dns-powerdns") next.delete("dns-bind9");
+        next.add(role);
+      }
+      return next;
+    });
+  }
+
+  const dnsRoleActive = roles.has("dns-bind9") || roles.has("dns-powerdns");
+  const dhcpRoleActive = roles.has("dhcp");
+  const dirty =
+    JSON.stringify(Array.from(roles).sort()) !==
+      JSON.stringify([...initialRoles].sort()) ||
+    dnsGroupId !== (row.assigned_dns_group_id ?? null) ||
+    dhcpGroupId !== (row.assigned_dhcp_group_id ?? null);
+
+  return (
+    <div>
+      <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+        Role assignment
+      </h3>
+      <p className="mt-1 text-xs text-muted-foreground">
+        Pick a subset of roles the supervisor brings up. DNS engines are
+        mutually exclusive — one per appliance. The supervisor reads this on its
+        next heartbeat (≤ 30s) and starts / stops the matching service
+        containers.
+      </p>
+      <div className="mt-2 flex flex-wrap gap-2">
+        {ROLE_OPTIONS.map((opt) => {
+          const cap = opt.capKey
+            ? (caps[opt.capKey as keyof SupervisorCapabilities] as
+                | boolean
+                | undefined)
+            : true;
+          const disabled = !cap;
+          const active = roles.has(opt.value);
+          return (
+            <button
+              key={opt.value}
+              type="button"
+              disabled={disabled}
+              onClick={() => toggleRole(opt.value)}
+              title={
+                disabled
+                  ? `Supervisor doesn't advertise ${opt.capKey}=true; cannot assign.`
+                  : undefined
+              }
+              className={cn(
+                "rounded-md border px-2 py-1 text-xs",
+                active
+                  ? "border-primary bg-primary/10 text-foreground"
+                  : "border-input bg-background text-muted-foreground hover:bg-muted",
+                disabled && "cursor-not-allowed opacity-40",
+              )}
+            >
+              {opt.label}
+            </button>
+          );
+        })}
+      </div>
+
+      {dnsRoleActive && (
+        <div className="mt-3">
+          <label className="text-xs text-muted-foreground">DNS group</label>
+          <select
+            value={dnsGroupId ?? ""}
+            onChange={(e) => setDnsGroupId(e.target.value || null)}
+            className="mt-1 w-full rounded-md border bg-background px-2 py-1 text-xs"
+          >
+            <option value="">(unassigned)</option>
+            {dnsGroupsQuery.data?.map((g) => (
+              <option key={g.id} value={g.id}>
+                {g.name}
+              </option>
+            ))}
+          </select>
+        </div>
+      )}
+      {dhcpRoleActive && (
+        <div className="mt-3">
+          <label className="text-xs text-muted-foreground">DHCP group</label>
+          <select
+            value={dhcpGroupId ?? ""}
+            onChange={(e) => setDhcpGroupId(e.target.value || null)}
+            className="mt-1 w-full rounded-md border bg-background px-2 py-1 text-xs"
+          >
+            <option value="">(unassigned)</option>
+            {dhcpGroupsQuery.data?.map((g) => (
+              <option key={g.id} value={g.id}>
+                {g.name} ({g.network_mode ?? "host"})
+              </option>
+            ))}
+          </select>
+        </div>
+      )}
+
+      <div className="mt-3 flex items-center gap-2">
+        <button
+          type="button"
+          disabled={!dirty || save.isPending}
+          onClick={() => save.mutate()}
+          className="inline-flex items-center gap-1 rounded-md border border-primary bg-primary/10 px-3 py-1.5 text-xs text-foreground disabled:cursor-not-allowed disabled:opacity-50"
+        >
+          {save.isPending ? (
+            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+          ) : null}
+          Save role assignment
+        </button>
+        {save.error && (
+          <span className="text-xs text-rose-700 dark:text-rose-300">
+            {(save.error as Error).message}
+          </span>
+        )}
+      </div>
+    </div>
+  );
+}

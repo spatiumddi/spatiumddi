@@ -602,6 +602,27 @@ class SupervisorHeartbeatRequest(BaseModel):
     ntp_sync_state: Literal["synchronized", "unsynchronized", "unknown"] | None = None
 
 
+class SupervisorRoleAssignment(BaseModel):
+    """Per-role config block the supervisor needs to bring up a
+    service container (#170 Wave C2).
+
+    DNS / DHCP groups carry an ``agent_key`` so the service container
+    can register against the existing ``/dns/agents/register`` /
+    ``/dhcp/agents/register`` endpoints. The key is the group-level
+    bootstrap key the operator already revealed for that group; the
+    supervisor passes it into the service container's env without
+    operator action.
+    """
+
+    roles: list[str] = Field(default_factory=list)
+    dns_group_id: uuid.UUID | None = None
+    dns_group_name: str | None = None
+    dns_engine: str | None = None  # bind9 / powerdns
+    dhcp_group_id: uuid.UUID | None = None
+    dhcp_group_name: str | None = None
+    dhcp_network_mode: str | None = None  # host / bridged
+
+
 class SupervisorHeartbeatResponse(BaseModel):
     """Operator-driven desired state returned to the supervisor.
 
@@ -616,6 +637,11 @@ class SupervisorHeartbeatResponse(BaseModel):
     desired_appliance_version: str | None = None
     desired_slot_image_url: str | None = None
     reboot_requested: bool = False
+    # #170 Wave C2 — assigned roles + group config. The supervisor
+    # uses this to bring up dns-bind9 / dns-powerdns / dhcp-kea
+    # service containers via docker compose. Empty roles list = idle
+    # (approved but no service running).
+    role_assignment: SupervisorRoleAssignment = Field(default_factory=SupervisorRoleAssignment)
 
 
 @router.post(
@@ -729,12 +755,60 @@ async def supervisor_heartbeat(
 
     await db.commit()
 
+    # Resolve assigned role config so the supervisor can bring up
+    # service containers. DNS / DHCP group lookups are best-effort —
+    # if the operator deleted a group out from under an approved
+    # appliance, the supervisor sees the role with a null group_id
+    # and skips bringing the service container up (the empty role
+    # set is itself the idle marker).
+    role_assignment = await _build_role_assignment(db, row)
+
     return SupervisorHeartbeatResponse(
         appliance_id=row.id,
         state=row.state,  # type: ignore[arg-type]
         desired_appliance_version=row.desired_appliance_version,
         desired_slot_image_url=row.desired_slot_image_url,
         reboot_requested=row.reboot_requested,
+        role_assignment=role_assignment,
+    )
+
+
+async def _build_role_assignment(db: DB, row: Appliance) -> SupervisorRoleAssignment:
+    """Resolve the assigned roles + group identities for a supervisor
+    heartbeat response. Best-effort — a missing group falls through
+    as a null group_id; the supervisor treats that as "skip this
+    role" (idle on the affected service)."""
+    from app.models.dhcp import DHCPServerGroup
+    from app.models.dns import DNSServerGroup
+
+    dns_engine: str | None = None
+    if "dns-bind9" in row.assigned_roles:
+        dns_engine = "bind9"
+    elif "dns-powerdns" in row.assigned_roles:
+        dns_engine = "powerdns"
+
+    dns_group_name: str | None = None
+    if row.assigned_dns_group_id is not None:
+        dns_group = await db.get(DNSServerGroup, row.assigned_dns_group_id)
+        if dns_group is not None:
+            dns_group_name = dns_group.name
+
+    dhcp_group_name: str | None = None
+    dhcp_network_mode: str | None = None
+    if row.assigned_dhcp_group_id is not None:
+        dhcp_group = await db.get(DHCPServerGroup, row.assigned_dhcp_group_id)
+        if dhcp_group is not None:
+            dhcp_group_name = dhcp_group.name
+            dhcp_network_mode = dhcp_group.network_mode
+
+    return SupervisorRoleAssignment(
+        roles=list(row.assigned_roles or []),
+        dns_group_id=row.assigned_dns_group_id,
+        dns_group_name=dns_group_name,
+        dns_engine=dns_engine,
+        dhcp_group_id=row.assigned_dhcp_group_id,
+        dhcp_group_name=dhcp_group_name,
+        dhcp_network_mode=dhcp_network_mode,
     )
 
 
@@ -775,6 +849,11 @@ class ApplianceRow(BaseModel):
     desired_slot_image_url: str | None
     reboot_requested: bool
     reboot_requested_at: datetime | None
+    # #170 Wave C2 — role assignment + free-form tags.
+    assigned_roles: list[str]
+    assigned_dns_group_id: uuid.UUID | None
+    assigned_dhcp_group_id: uuid.UUID | None
+    tags: dict[str, str]
     created_at: datetime
 
 
@@ -821,6 +900,10 @@ def _row_to_schema(row: Appliance) -> ApplianceRow:
         desired_slot_image_url=row.desired_slot_image_url,
         reboot_requested=row.reboot_requested,
         reboot_requested_at=row.reboot_requested_at,
+        assigned_roles=list(row.assigned_roles or []),
+        assigned_dns_group_id=row.assigned_dns_group_id,
+        assigned_dhcp_group_id=row.assigned_dhcp_group_id,
+        tags=dict(row.tags or {}),
         created_at=row.created_at,
     )
 
@@ -1080,6 +1163,173 @@ async def rekey_appliance(
         hostname=row.hostname,
         new_cert_serial=serial_hex,
         previous_cert_serial=previous_serial,
+        user=current_user.username,
+    )
+    return _row_to_schema(row)
+
+
+# ── Admin: role assignment + tags (#170 Wave C2) ──────────────────
+
+
+_VALID_ROLES = {"dns-bind9", "dns-powerdns", "dhcp", "observer", "custom"}
+_DNS_ROLES = {"dns-bind9", "dns-powerdns"}
+
+
+class ApplianceRolesUpdate(BaseModel):
+    """Operator-driven role + group + tag assignment payload.
+
+    Each field is optional — operator can update a subset without
+    blanking the others. ``roles=[]`` is the explicit "idle" signal
+    (approved but running nothing); ``roles=None`` (omitted) leaves
+    the current role list intact.
+    """
+
+    roles: list[str] | None = Field(
+        default=None,
+        description=(
+            "Subset of dns-bind9 / dns-powerdns / dhcp / observer / "
+            "custom. dns-bind9 and dns-powerdns are mutually exclusive."
+        ),
+    )
+    dns_group_id: uuid.UUID | None = None
+    dhcp_group_id: uuid.UUID | None = None
+    tags: dict[str, str] | None = None
+
+
+@router.put(
+    "/appliances/{appliance_id}/roles",
+    response_model=ApplianceRow,
+    dependencies=[Depends(require_permission("admin", "appliance"))],
+    summary="Assign roles + groups + tags (superadmin)",
+)
+async def update_appliance_roles(
+    appliance_id: uuid.UUID,
+    body: ApplianceRolesUpdate,
+    current_user: CurrentUser,
+    db: DB,
+) -> ApplianceRow:
+    """Validate + persist a role assignment. Refuses to assign a role
+    the supervisor doesn't advertise the capability for (BIND9 needs
+    ``can_run_dns_bind9``, PowerDNS needs ``can_run_dns_powerdns``,
+    DHCP needs ``can_run_dhcp``). Refuses the dns-bind9 + dns-powerdns
+    combo (one engine per box). 422 on validation failure.
+
+    The supervisor's next heartbeat picks up the change via
+    ``role_assignment`` in the response. Service-container lifecycle
+    (load image + start / stop / restart) lives on the supervisor —
+    this endpoint just records intent.
+    """
+    _require_superadmin(current_user)
+
+    row = await db.get(Appliance, appliance_id)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
+    if row.state != APPLIANCE_STATE_APPROVED:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"Cannot assign roles to appliance in state {row.state!r}; approve it first.",
+        )
+
+    if body.roles is not None:
+        # Reject unknown role tokens explicitly so a typo on the API
+        # surface doesn't silently roll through the JSONB column.
+        for r in body.roles:
+            if r not in _VALID_ROLES:
+                raise HTTPException(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    f"Unknown role {r!r}. Valid: {sorted(_VALID_ROLES)}.",
+                )
+        # Mutually-exclusive DNS engines.
+        dns_engines = _DNS_ROLES.intersection(body.roles)
+        if len(dns_engines) > 1:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "dns-bind9 and dns-powerdns are mutually exclusive — one engine per appliance.",
+            )
+        # Capability gate. Each requested role must be backed by the
+        # supervisor's advertised cap. Skips for ``observer`` / ``custom``
+        # which don't have a single-flag capability today.
+        caps = row.capabilities or {}
+        for r in body.roles:
+            cap_key = {
+                "dns-bind9": "can_run_dns_bind9",
+                "dns-powerdns": "can_run_dns_powerdns",
+                "dhcp": "can_run_dhcp",
+                "observer": "can_run_observer",
+            }.get(r)
+            if cap_key is not None and not caps.get(cap_key, False):
+                raise HTTPException(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    (
+                        f"Appliance {row.hostname!r} doesn't advertise "
+                        f"capability {cap_key}=true; cannot assign role {r!r}."
+                    ),
+                )
+        row.assigned_roles = list(body.roles)
+
+    if body.dns_group_id is not None:
+        # Best-effort existence check — wrong group_id → 422.
+        from app.models.dns import DNSServerGroup
+
+        dns_group = await db.get(DNSServerGroup, body.dns_group_id)
+        if dns_group is None:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                f"DNS server group {body.dns_group_id} not found.",
+            )
+        row.assigned_dns_group_id = dns_group.id
+    if body.dhcp_group_id is not None:
+        from app.models.dhcp import DHCPServerGroup
+
+        dhcp_group = await db.get(DHCPServerGroup, body.dhcp_group_id)
+        if dhcp_group is None:
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                f"DHCP server group {body.dhcp_group_id} not found.",
+            )
+        row.assigned_dhcp_group_id = dhcp_group.id
+
+    if body.tags is not None:
+        # Coerce every value to string — JSONB will accept anything
+        # but the public contract is "string : string" for fleet
+        # filters / MCP `tags_match`. Reject non-string values up-front
+        # so the operator sees the issue at submit time.
+        for k, v in body.tags.items():
+            if not isinstance(v, str):
+                raise HTTPException(
+                    status.HTTP_422_UNPROCESSABLE_ENTITY,
+                    f"Tag {k!r} must be a string; got {type(v).__name__}.",
+                )
+        row.tags = dict(body.tags)
+
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="appliance.role_assigned",
+            resource_type="appliance",
+            resource_id=str(row.id),
+            resource_display=row.hostname,
+            result="success",
+            new_value={
+                "roles": list(row.assigned_roles or []),
+                "dns_group_id": (
+                    str(row.assigned_dns_group_id) if row.assigned_dns_group_id else None
+                ),
+                "dhcp_group_id": (
+                    str(row.assigned_dhcp_group_id) if row.assigned_dhcp_group_id else None
+                ),
+                "tags": dict(row.tags or {}),
+            },
+        )
+    )
+    await db.commit()
+    logger.info(
+        "appliance_roles_assigned",
+        appliance_id=str(row.id),
+        hostname=row.hostname,
+        roles=list(row.assigned_roles or []),
         user=current_user.username,
     )
     return _row_to_schema(row)
