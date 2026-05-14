@@ -152,6 +152,18 @@ d /var/persist/etc       0755 root root - -
 d /var/persist/etc-work  0755 root root - -
 EOF
 
+# #170 Wave A1 — supervisor identity dir. Bind-mounted into the
+# spatium-supervisor container at /var/lib/spatium-supervisor. Lives
+# on /var/persist so the Ed25519 keypair + control-plane-signed cert
+# (Wave A2) survive slot swaps verbatim. Mode 0755 root:root because
+# docker would auto-create it as root:root anyway; the supervisor
+# entrypoint chowns the dir contents to the in-container ``spatium``
+# uid on first start.
+cat > "$BUILDROOT/usr/lib/tmpfiles.d/spatium-supervisor.conf" <<'EOF'
+# #170 Wave A1 — supervisor identity directory. Survives slot swaps.
+d /var/persist/spatium-supervisor 0755 root root - -
+EOF
+
 # ── Hardening (subset of APPLIANCE.md §7 — full pass in Phase 1.x) ────────────
 # SSH: root login disabled, password login allowed.
 #

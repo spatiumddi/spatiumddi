@@ -97,6 +97,9 @@ frontend/src/
   hooks/                Incl. useSessionState (sessionStorage-backed useState)
 agent/dns/              Standalone DNS agent (Python) + BIND9 / PowerDNS container images
 agent/dhcp/             Standalone DHCP agent (Python) + Kea container image
+agent/supervisor/       Spatium supervisor (Python) + container image — host-side controller
+                        for the upcoming Application install role (#170 Wave A — scaffolding
+                        only, dormant on every existing install)
 k8s/base/               Core manifests (api, worker, frontend, migrate)
 k8s/{dns,dhcp}/         Per-service StatefulSets + services
 k8s/ha/                 CloudNativePG, Redis Sentinel, Patroni
