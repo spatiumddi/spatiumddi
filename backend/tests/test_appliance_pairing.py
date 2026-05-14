@@ -470,6 +470,38 @@ async def test_consume_validates_code_shape(db_session: AsyncSession, client: As
 # ── MCP tool ────────────────────────────────────────────────────────
 
 
+# ── Webhook event mapping (#169 Phase 5) ───────────────────────────
+
+
+def test_event_mapping_translates_pairing_audit_actions() -> None:
+    """Pairing-code audit rows must map to clean typed event names —
+    external webhook subscribers wire on these. ``consume_denied`` is
+    deliberately NOT mapped (high-frequency noise on brute-force
+    scans; operators wanting it should read the audit log)."""
+    from app.services.event_publisher import _audit_to_event_type
+
+    assert (
+        _audit_to_event_type("appliance.pairing_code_created", "pairing_code")
+        == "appliance.pairing_code.created"
+    )
+    assert (
+        _audit_to_event_type("appliance.pairing_code_claimed", "pairing_code")
+        == "appliance.pairing_code.claimed"
+    )
+    assert (
+        _audit_to_event_type("appliance.pairing_code_revoked", "pairing_code")
+        == "appliance.pairing_code.revoked"
+    )
+    # ``consume_denied`` is intentionally not in the map.
+    assert (
+        _audit_to_event_type("appliance.pairing_code_consume_denied", "pairing_code")
+        is None
+    )
+
+
+# ── MCP tool ────────────────────────────────────────────────────────
+
+
 @pytest.mark.asyncio
 async def test_mcp_find_pairing_codes_refuses_non_superadmin(
     db_session: AsyncSession,

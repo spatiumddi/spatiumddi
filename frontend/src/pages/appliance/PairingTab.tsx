@@ -79,12 +79,20 @@ export function PairingTab() {
   });
   const isSuperadmin = me?.is_superadmin ?? false;
 
-  // Codes table refresh — 5 s poll while the tab is mounted picks up
-  // claims and expiries without the operator clicking Refresh.
+  // Codes table refresh. Adaptive polling — 2 s while at least one
+  // code is still in ``pending`` state (operator is actively watching
+  // for an agent to claim), 15 s when nothing's waiting (cheap idle
+  // tick for the rare 'claimed' / 'expired' / 'revoked' state changes
+  // that don't originate from this UI). Phase-5 polish over the
+  // previous flat 5 s tick.
   const { data, isLoading, isFetching, refetch } = useQuery({
     queryKey: ["appliance", "pairing-codes"],
     queryFn: () => appliancePairingApi.list({ include_terminal: true }),
-    refetchInterval: 5_000,
+    refetchInterval: (query) => {
+      const codes = query.state.data?.codes ?? [];
+      const hasPending = codes.some((c) => c.state === "pending");
+      return hasPending ? 2_000 : 15_000;
+    },
     enabled: isSuperadmin,
   });
 
