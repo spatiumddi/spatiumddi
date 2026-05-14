@@ -17,8 +17,11 @@ unchanged.
 Endpoints:
 
 * ``POST /api/v1/appliance/pairing-codes`` — superadmin creates a
-  code. Optional ``deployment_kind`` (``dns`` | ``dhcp``),
-  ``server_group_id``, ``expires_in_minutes``, ``note``.
+  code. Required ``deployment_kind`` (``dns`` | ``dhcp`` | ``both``),
+  optional ``server_group_id``, ``expires_in_minutes``, ``note``.
+  ``both`` provisions an agent that runs BIND9 + Kea simultaneously
+  and rejects ``server_group_id`` (per-service groups go through the
+  existing DNS / DHCP UI after registration).
 * ``GET  /api/v1/appliance/pairing-codes`` — superadmin lists every
   code (active + recent claimed/expired/revoked rows). The cleartext
   code is never re-displayed — only "last 2 digits" + state.
@@ -106,18 +109,24 @@ def _client_ip(request: Request) -> str | None:
 # ── Schemas ────────────────────────────────────────────────────────
 
 
-DeploymentKind = Literal["dns", "dhcp"]
+DeploymentKind = Literal["dns", "dhcp", "both"]
 
 
 class PairingCodeCreate(BaseModel):
     deployment_kind: DeploymentKind = Field(
-        description="Which agent kind this code provisions: 'dns' or 'dhcp'."
+        description=(
+            "Which agent kind this code provisions: 'dns', 'dhcp', or "
+            "'both' (BIND9 + Kea on the same appliance)."
+        )
     )
     server_group_id: uuid.UUID | None = Field(
         default=None,
         description=(
             "Optional pre-assignment to a DNS or DHCP server group. "
-            "Must match the deployment_kind."
+            "Must match the deployment_kind. Rejected when "
+            "deployment_kind='both' — combined agents configure their "
+            "per-service groups through the existing DNS / DHCP UI "
+            "after registration."
         ),
     )
     expires_in_minutes: int = Field(
@@ -194,11 +203,19 @@ class PairConsumeRequest(BaseModel):
 
 
 class PairConsumeResponse(BaseModel):
-    """Returned on successful pair. The agent persists ``bootstrap_key``
-    to its existing on-disk config (same path it would write a pasted
-    key) and continues with the existing bootstrap → JWT flow."""
+    """Returned on successful pair. The agent persists each key in
+    ``bootstrap_keys`` to its existing on-disk config (same path it
+    would write a pasted key) and continues with the existing
+    bootstrap → JWT flow for each service it's running.
 
-    bootstrap_key: str
+    ``bootstrap_keys`` is a map ``{kind: key}``:
+
+    * ``deployment_kind='dns'``  → ``{"dns": <DNS_AGENT_KEY>}``
+    * ``deployment_kind='dhcp'`` → ``{"dhcp": <DHCP_AGENT_KEY>}``
+    * ``deployment_kind='both'`` → both keys are present.
+    """
+
+    bootstrap_keys: dict[str, str]
     deployment_kind: DeploymentKind
     server_group_id: uuid.UUID | None
 
@@ -233,12 +250,38 @@ async def _resolve_group_name(db: DB, kind: str, group_id: uuid.UUID | None) -> 
     return None
 
 
-def _bootstrap_key_for(kind: str) -> str | None:
+def _bootstrap_keys_for(kind: str) -> dict[str, str] | None:
+    """Resolve the bootstrap key(s) the consume endpoint should return
+    for a given deployment_kind. Returns None when ANY required key is
+    unset — the caller turns that into a 409 / 503.
+
+    For ``kind='both'`` BOTH keys must be present; a half-configured
+    control plane (only DNS key set, no DHCP key) can't satisfy a
+    combined-agent pairing, so we refuse rather than handing back a
+    partial response that the agent would later trip over.
+    """
+    dns_key = settings.dns_agent_key or None
+    dhcp_key = settings.dhcp_agent_key or None
     if kind == "dns":
-        return settings.dns_agent_key or None
+        return {"dns": dns_key} if dns_key else None
     if kind == "dhcp":
-        return settings.dhcp_agent_key or None
+        return {"dhcp": dhcp_key} if dhcp_key else None
+    if kind == "both":
+        if dns_key and dhcp_key:
+            return {"dns": dns_key, "dhcp": dhcp_key}
+        return None
     return None
+
+
+def _missing_keys_label(kind: str) -> str:
+    """Operator-facing string of which ``*_AGENT_KEY`` env vars are
+    missing for the given kind. Used in the 409 body of create."""
+    needs = []
+    if kind in ("dns", "both") and not settings.dns_agent_key:
+        needs.append("DNS_AGENT_KEY")
+    if kind in ("dhcp", "both") and not settings.dhcp_agent_key:
+        needs.append("DHCP_AGENT_KEY")
+    return " + ".join(needs) if needs else ""
 
 
 def _require_superadmin(user: CurrentUser) -> None:
@@ -270,6 +313,19 @@ async def create_pairing_code(
     # of the right kind. Reject early with a clear 422 rather than
     # silently issuing a code that can't be redeemed.
     if body.server_group_id is not None:
+        if body.deployment_kind == "both":
+            # Combined agents would need TWO group IDs (one DNS, one
+            # DHCP). One column can't carry that without ambiguity, so
+            # we reject pre-assignment for ``both`` and let the operator
+            # configure per-service groups through the existing UI
+            # after the agent registers. #170 is the natural place to
+            # extend two-group pre-assignment.
+            raise HTTPException(
+                status.HTTP_422_UNPROCESSABLE_ENTITY,
+                "server_group_id is not supported for deployment_kind='both'. "
+                "Configure the agent's per-service groups through the DNS / "
+                "DHCP UI after it registers.",
+            )
         group_exists: bool
         if body.deployment_kind == "dns":
             dns_grp = await db.get(DNSServerGroup, body.server_group_id)
@@ -286,10 +342,12 @@ async def create_pairing_code(
     # Refuse if the corresponding bootstrap key isn't configured —
     # otherwise the code would be unredeemable at consume time, which
     # is worse UX than a clear "configure the env var first" message.
-    if not _bootstrap_key_for(body.deployment_kind):
+    # For kind='both' BOTH keys must be present.
+    if _bootstrap_keys_for(body.deployment_kind) is None:
+        missing = _missing_keys_label(body.deployment_kind)
         raise HTTPException(
             status.HTTP_409_CONFLICT,
-            f"No {body.deployment_kind.upper()}_AGENT_KEY configured on the control plane. "
+            f"No {missing} configured on the control plane. "
             "Set it in /etc/spatiumddi/.env and restart the api before issuing codes.",
         )
 
@@ -535,13 +593,15 @@ async def consume_pairing_code(
             "Ask your platform admin to generate a new code.",
         )
 
-    # Sanity: the bootstrap key must be configured server-side. We
+    # Sanity: the bootstrap key(s) must be configured server-side. We
     # already check this at create time, but the env var could have
     # been blanked between then and now. Treat as 503 — server-side
-    # operational issue, not the caller's fault.
+    # operational issue, not the caller's fault. For kind='both' this
+    # also catches the case where one of the two required keys was
+    # cleared between create and consume.
     assert row is not None  # narrow for type checker — failure_reason path returned above
-    bootstrap_key = _bootstrap_key_for(row.deployment_kind)
-    if not bootstrap_key:
+    bootstrap_keys = _bootstrap_keys_for(row.deployment_kind)
+    if bootstrap_keys is None:
         logger.error(
             "pairing_code_consume_no_bootstrap_key",
             id=str(row.id),
@@ -591,7 +651,7 @@ async def consume_pairing_code(
     )
 
     return PairConsumeResponse(
-        bootstrap_key=bootstrap_key,
+        bootstrap_keys=bootstrap_keys,
         deployment_kind=row.deployment_kind,  # type: ignore[arg-type]
         server_group_id=row.server_group_id,
     )

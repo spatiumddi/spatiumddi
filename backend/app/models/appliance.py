@@ -134,12 +134,15 @@ class ApplianceCertificate(Base):
     csr_subject: Mapped[dict[str, Any] | None] = mapped_column(JSONB, nullable=True)
 
 
-# Deployment kinds a pairing code may target. ``"agent"`` is reserved
-# for the future generic-agent role (#170) and isn't accepted at the
-# API layer today.
+# Deployment kinds a pairing code may target. ``"both"`` provisions an
+# agent appliance that runs BIND9 + Kea simultaneously (one box, both
+# services) — the consume endpoint returns both bootstrap keys in that
+# case. The fully generic ``"agent"`` role (post-join role assignment
+# from the control plane) is #170.
 PAIRING_KIND_DNS = "dns"
 PAIRING_KIND_DHCP = "dhcp"
-PAIRING_KINDS = (PAIRING_KIND_DNS, PAIRING_KIND_DHCP)
+PAIRING_KIND_BOTH = "both"
+PAIRING_KINDS = (PAIRING_KIND_DNS, PAIRING_KIND_DHCP, PAIRING_KIND_BOTH)
 
 
 class PairingCode(Base):

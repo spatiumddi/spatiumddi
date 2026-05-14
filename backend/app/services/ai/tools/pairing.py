@@ -61,9 +61,12 @@ def _state_for(
 
 
 class FindPairingCodesArgs(BaseModel):
-    deployment_kind: Literal["dns", "dhcp"] | None = Field(
+    deployment_kind: Literal["dns", "dhcp", "both"] | None = Field(
         default=None,
-        description="Filter by agent kind: 'dns' or 'dhcp'. Omit for both.",
+        description=(
+            "Filter by agent kind: 'dns', 'dhcp', or 'both' (combined "
+            "BIND9 + Kea). Omit to return every kind."
+        ),
     )
     state: Literal["pending", "claimed", "expired", "revoked"] | None = Field(
         default=None,
@@ -80,13 +83,14 @@ class FindPairingCodesArgs(BaseModel):
     description=(
         "List appliance pairing codes (superadmin only). Each row "
         "carries the last two digits of the code, deployment_kind "
-        "(dns / dhcp), state (pending / claimed / expired / revoked), "
-        "pre-assigned server_group_id (nullable), expires_at, and — "
-        "for claimed rows — the claiming agent's IP + hostname. Use "
-        "to answer 'any active pairing codes?', 'who claimed code "
-        "ending in 47?', or 'how many codes have expired without "
-        "being claimed today?'. Defaults to the 25 most recent rows "
-        "across every state; filter with deployment_kind + state."
+        "(dns / dhcp / both), state (pending / claimed / expired / "
+        "revoked), pre-assigned server_group_id (nullable; always "
+        "null for kind='both'), expires_at, and — for claimed rows "
+        "— the claiming agent's IP + hostname. Use to answer 'any "
+        "active pairing codes?', 'who claimed code ending in 47?', "
+        "or 'how many codes have expired without being claimed "
+        "today?'. Defaults to the 25 most recent rows across every "
+        "state; filter with deployment_kind + state."
     ),
     args_model=FindPairingCodesArgs,
     category="admin",

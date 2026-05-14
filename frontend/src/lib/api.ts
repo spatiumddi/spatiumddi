@@ -7036,6 +7036,65 @@ export const applianceFleetApi = {
       .then((r) => r.data),
 };
 
+// ── Appliance: pairing codes (issue #169) ──────────────────────────
+// Short-lived 8-digit codes the agent installer swaps for the real
+// DNS_AGENT_KEY / DHCP_AGENT_KEY bootstrap key. The cleartext code is
+// returned exactly once in the create response — the list endpoint
+// only ever surfaces the last two digits.
+// ``both`` mints a single code that hands back both DNS + DHCP
+// bootstrap keys on consume — for an appliance running BIND9 + Kea
+// simultaneously.
+export type PairingDeploymentKind = "dns" | "dhcp" | "both";
+export type PairingCodeState = "pending" | "claimed" | "expired" | "revoked";
+
+export interface PairingCodeCreate {
+  deployment_kind: PairingDeploymentKind;
+  server_group_id?: string | null;
+  expires_in_minutes?: number;
+  note?: string | null;
+}
+
+export interface PairingCodeCreated {
+  id: string;
+  // 8-digit cleartext code. Shown once on create + never persisted.
+  code: string;
+  deployment_kind: PairingDeploymentKind;
+  server_group_id: string | null;
+  note: string | null;
+  expires_at: string;
+  created_at: string;
+}
+
+export interface PairingCodeRow {
+  id: string;
+  code_last_two: string;
+  deployment_kind: PairingDeploymentKind;
+  server_group_id: string | null;
+  server_group_name: string | null;
+  note: string | null;
+  state: PairingCodeState;
+  expires_at: string;
+  used_at: string | null;
+  used_by_ip: string | null;
+  used_by_hostname: string | null;
+  revoked_at: string | null;
+  created_at: string;
+  created_by_user_id: string | null;
+}
+
+export const appliancePairingApi = {
+  list: (params: { include_terminal?: boolean } = {}) =>
+    api
+      .get<{ codes: PairingCodeRow[] }>("/appliance/pairing-codes", { params })
+      .then((r) => r.data),
+  create: (body: PairingCodeCreate) =>
+    api
+      .post<PairingCodeCreated>("/appliance/pairing-codes", body)
+      .then((r) => r.data),
+  revoke: (id: string) =>
+    api.delete<void>(`/appliance/pairing-codes/${id}`).then((r) => r.data),
+};
+
 // ── Appliance: container management (Phase 4d) ─────────────────────
 export interface ApplianceContainer {
   name: string;

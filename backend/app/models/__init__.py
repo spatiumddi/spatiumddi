@@ -2,6 +2,7 @@ from app.models.acme import ACMEAccount
 from app.models.ai import AIChatMessage, AIChatSession, AIProvider
 from app.models.alerts import AlertEvent, AlertRule
 from app.models.appliance import (
+    PAIRING_KIND_BOTH,
     PAIRING_KIND_DHCP,
     PAIRING_KIND_DNS,
     PAIRING_KINDS,
@@ -110,6 +111,7 @@ __all__ = [
     "PairingCode",
     "PAIRING_KIND_DNS",
     "PAIRING_KIND_DHCP",
+    "PAIRING_KIND_BOTH",
     "PAIRING_KINDS",
     "ASN",
     "ASNRpkiRoa",

@@ -168,6 +168,87 @@ async def test_create_pairing_code_rejects_unknown_deployment_kind(
     assert resp.status_code == 422
 
 
+# ── kind='both' (DNS + DHCP on one agent) ──────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_create_both_returns_combined_bootstrap_keys(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    """``kind='both'`` mints one code that hands back both bootstrap
+    keys on consume — operator runs BIND9 + Kea on the same box."""
+    _, token = await _make_user(db_session, superadmin=True, username="pcboth")
+    await db_session.commit()
+    headers = {"Authorization": f"Bearer {token}"}
+
+    create = await client.post(
+        "/api/v1/appliance/pairing-codes",
+        headers=headers,
+        json={"deployment_kind": "both"},
+    )
+    assert create.status_code == 201, create.text
+    assert create.json()["deployment_kind"] == "both"
+    code = create.json()["code"]
+
+    resp = await client.post(
+        "/api/v1/appliance/pair",
+        json={"code": code, "hostname": "combined-1"},
+    )
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["deployment_kind"] == "both"
+    assert body["bootstrap_keys"] == {
+        "dns": "dns-test-key-aaaaaaaa",
+        "dhcp": "dhcp-test-key-bbbbbbbb",
+    }
+
+
+@pytest.mark.asyncio
+async def test_create_both_refuses_when_only_one_key_is_set(
+    db_session: AsyncSession,
+    client: AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A half-configured control plane (only DNS key set) can't satisfy
+    a combined-agent pairing. Refuse at create time with a 409 that
+    names the missing env var."""
+    monkeypatch.setattr(settings, "dhcp_agent_key", "", raising=False)
+    _, token = await _make_user(db_session, superadmin=True, username="pcbothhalf")
+    await db_session.commit()
+    headers = {"Authorization": f"Bearer {token}"}
+
+    resp = await client.post(
+        "/api/v1/appliance/pairing-codes",
+        headers=headers,
+        json={"deployment_kind": "both"},
+    )
+    assert resp.status_code == 409
+    assert "DHCP_AGENT_KEY" in resp.text
+
+
+@pytest.mark.asyncio
+async def test_create_both_rejects_server_group_id(
+    db_session: AsyncSession, client: AsyncClient
+) -> None:
+    """``server_group_id`` for ``kind='both'`` would have to disambiguate
+    between DNS and DHCP groups — we refuse rather than pretend."""
+    _, token = await _make_user(db_session, superadmin=True, username="pcbothgrp")
+    await db_session.commit()
+    headers = {"Authorization": f"Bearer {token}"}
+
+    resp = await client.post(
+        "/api/v1/appliance/pairing-codes",
+        headers=headers,
+        json={
+            "deployment_kind": "both",
+            # Any UUID will do — the validator rejects before lookup.
+            "server_group_id": "00000000-0000-0000-0000-000000000000",
+        },
+    )
+    assert resp.status_code == 422
+    assert "both" in resp.text.lower()
+
+
 # ── List + Revoke ───────────────────────────────────────────────────
 
 
@@ -278,7 +359,7 @@ async def test_consume_happy_path_returns_bootstrap_key(
     )
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert body["bootstrap_key"] == "dns-test-key-aaaaaaaa"
+    assert body["bootstrap_keys"] == {"dns": "dns-test-key-aaaaaaaa"}
     assert body["deployment_kind"] == "dns"
     assert body["server_group_id"] is None
 
