@@ -1,0 +1,761 @@
+import { useMemo, useState } from "react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import {
+  AlertCircle,
+  CheckCircle2,
+  KeyRound,
+  Loader2,
+  Network,
+  RefreshCw,
+  ShieldAlert,
+  ShieldCheck,
+  ShieldQuestion,
+  Trash2,
+  XCircle,
+} from "lucide-react";
+
+import {
+  applianceApprovalApi,
+  authApi,
+  type ApplianceRow,
+  type ApplianceState,
+  type SupervisorCapabilities,
+} from "@/lib/api";
+import { Modal } from "@/components/ui/modal";
+import { ConfirmModal } from "@/components/ui/confirm-modal";
+import { cn } from "@/lib/utils";
+
+/**
+ * Appliance → Approvals tab (#170 Wave B3).
+ *
+ * Supervisors that claimed a pairing code show up here. Pending rows
+ * pin at the top with Approve / Reject; approved rows render capability
+ * chips + cert metadata + Re-key / Delete actions. Clicking any row
+ * opens the drilldown modal carrying the full capabilities block,
+ * cert serial, fingerprint, and audit metadata.
+ *
+ * Adaptive polling — 2 s while at least one pending row exists (so a
+ * fresh supervisor registration appears within seconds of the operator
+ * paging the admin to approve), 15 s otherwise.
+ */
+
+const inputCls =
+  "rounded-md border bg-background px-3 py-1.5 text-sm disabled:opacity-60";
+
+function stateBadge(state: ApplianceState): {
+  label: string;
+  className: string;
+  Icon: typeof ShieldCheck;
+} {
+  if (state === "approved") {
+    return {
+      label: "approved",
+      className:
+        "bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 border-emerald-500/30",
+      Icon: ShieldCheck,
+    };
+  }
+  if (state === "rejected") {
+    return {
+      label: "rejected",
+      className:
+        "bg-rose-500/10 text-rose-700 dark:text-rose-400 border-rose-500/30",
+      Icon: ShieldAlert,
+    };
+  }
+  return {
+    label: "pending",
+    className:
+      "bg-amber-500/10 text-amber-700 dark:text-amber-400 border-amber-500/40",
+    Icon: ShieldQuestion,
+  };
+}
+
+function relativeTime(iso: string | null): string {
+  if (!iso) return "—";
+  const ms = Date.now() - new Date(iso).getTime();
+  if (ms < 60_000) return "<1m ago";
+  if (ms < 3_600_000) return `${Math.floor(ms / 60_000)}m ago`;
+  if (ms < 86_400_000) return `${Math.floor(ms / 3_600_000)}h ago`;
+  return `${Math.floor(ms / 86_400_000)}d ago`;
+}
+
+function shortFingerprint(fp: string | null | undefined): string {
+  if (!fp) return "—";
+  return fp.length > 16 ? `${fp.slice(0, 8)}…${fp.slice(-6)}` : fp;
+}
+
+// Compact capability chips for the row. Each chip lights up only when
+// the supervisor advertised that capability. has_baked_images is shown
+// as a separate badge because operationally it's a deployment-mode
+// signal (air-gap-ready) rather than a service capability.
+function capabilityChips(caps: SupervisorCapabilities): {
+  key: string;
+  label: string;
+}[] {
+  const out: { key: string; label: string }[] = [];
+  if (caps.can_run_dns_bind9) out.push({ key: "bind9", label: "BIND9" });
+  if (caps.can_run_dns_powerdns)
+    out.push({ key: "powerdns", label: "PowerDNS" });
+  if (caps.can_run_dhcp) out.push({ key: "dhcp", label: "DHCP" });
+  if (caps.can_run_observer) out.push({ key: "observer", label: "Observer" });
+  return out;
+}
+
+export function ApprovalsTab() {
+  const qc = useQueryClient();
+  const { data: me } = useQuery({
+    queryKey: ["me"],
+    queryFn: authApi.me,
+    staleTime: 60_000,
+  });
+  const isSuperadmin = me?.is_superadmin ?? false;
+
+  const { data, isLoading, isFetching, refetch, error } = useQuery({
+    queryKey: ["appliance", "approvals"],
+    queryFn: applianceApprovalApi.list,
+    refetchInterval: (query) => {
+      const rows = query.state.data ?? [];
+      const hasPending = rows.some((r) => r.state === "pending_approval");
+      return hasPending ? 2_000 : 15_000;
+    },
+    enabled: isSuperadmin,
+  });
+
+  const [drilldown, setDrilldown] = useState<ApplianceRow | null>(null);
+  const [rejectTarget, setRejectTarget] = useState<ApplianceRow | null>(null);
+  const [deleteTarget, setDeleteTarget] = useState<ApplianceRow | null>(null);
+  const [rekeyTarget, setRekeyTarget] = useState<ApplianceRow | null>(null);
+
+  const approve = useMutation({
+    mutationFn: (id: string) => applianceApprovalApi.approve(id),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["appliance", "approvals"] });
+    },
+  });
+  const reject = useMutation({
+    mutationFn: (id: string) => applianceApprovalApi.reject(id),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["appliance", "approvals"] });
+      setRejectTarget(null);
+    },
+  });
+  const remove = useMutation({
+    mutationFn: (id: string) => applianceApprovalApi.remove(id),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["appliance", "approvals"] });
+      setDeleteTarget(null);
+      setDrilldown(null);
+    },
+  });
+  const rekey = useMutation({
+    mutationFn: (id: string) => applianceApprovalApi.rekey(id),
+    onSuccess: (row) => {
+      qc.invalidateQueries({ queryKey: ["appliance", "approvals"] });
+      setRekeyTarget(null);
+      // Refresh the drilldown view if it's open on this row so the
+      // operator sees the new serial + expiry immediately.
+      if (drilldown && drilldown.id === row.id) setDrilldown(row);
+    },
+  });
+
+  const rows = useMemo(() => data ?? [], [data]);
+  const pending = rows.filter((r) => r.state === "pending_approval");
+  const others = rows.filter((r) => r.state !== "pending_approval");
+
+  if (!isSuperadmin) {
+    return (
+      <div className="mx-auto max-w-4xl">
+        <div className="rounded-md border border-amber-500/40 bg-amber-500/10 p-4 text-sm">
+          <div className="flex items-start gap-2">
+            <AlertCircle className="mt-0.5 h-4 w-4 flex-shrink-0 text-amber-700 dark:text-amber-400" />
+            <div>
+              <p className="font-medium text-amber-700 dark:text-amber-400">
+                Superadmin only
+              </p>
+              <p className="mt-1 text-muted-foreground">
+                Approving an appliance signs an X.509 cert against the
+                supervisor's submitted Ed25519 pubkey. Only superadmin accounts
+                can approve / reject / re-key. Ask your platform admin if a
+                fleet appliance is waiting on approval.
+              </p>
+            </div>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="mx-auto max-w-6xl">
+      <div className="mb-4 flex items-start justify-between gap-4">
+        <div className="min-w-0 flex-1">
+          <h2 className="text-base font-semibold">Appliance approvals</h2>
+          <p className="mt-1 text-xs text-muted-foreground">
+            Supervisors that claimed a{" "}
+            <a
+              href="#"
+              onClick={(e) => e.preventDefault()}
+              className="underline decoration-dotted underline-offset-2"
+              title="Mint codes on the Pairing tab. The supervisor submits its Ed25519 pubkey at /api/v1/appliance/supervisor/register; the row appears here in pending_approval state."
+            >
+              pairing code
+            </a>{" "}
+            sit here until a superadmin clicks Approve. Approval signs an X.509
+            cert against the submitted pubkey using the control plane's internal
+            CA (lazy-bootstrapped on the first approve). The supervisor picks
+            the cert up on its next poll and switches from session-token auth to
+            mTLS.
+          </p>
+        </div>
+        <div className="flex shrink-0 items-center gap-2">
+          <button
+            type="button"
+            onClick={() => refetch()}
+            disabled={isFetching}
+            className="inline-flex items-center gap-1.5 rounded-md border bg-background px-3 py-1.5 text-sm hover:bg-muted disabled:opacity-50"
+          >
+            <RefreshCw
+              className={cn("h-3.5 w-3.5", isFetching && "animate-spin")}
+            />
+            Refresh
+          </button>
+        </div>
+      </div>
+
+      {error ? (
+        <div className="rounded-md border border-rose-500/40 bg-rose-500/10 p-3 text-sm text-rose-700 dark:text-rose-300">
+          Failed to load appliances: {(error as Error).message}
+        </div>
+      ) : isLoading ? (
+        <div className="flex items-center gap-2 text-sm text-muted-foreground">
+          <Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading appliances…
+        </div>
+      ) : rows.length === 0 ? (
+        <div className="rounded-md border border-dashed bg-card p-8 text-center text-sm text-muted-foreground">
+          No appliances have paired yet. Mint a pairing code on the Pairing tab
+          and install an Application appliance against it — the row appears here
+          once the supervisor claims the code.
+        </div>
+      ) : (
+        <div className="overflow-hidden rounded-md border bg-card">
+          <table className="w-full text-sm">
+            <thead className="bg-muted/40 text-xs uppercase tracking-wide text-muted-foreground">
+              <tr>
+                <th className="px-3 py-2 text-left font-medium">Hostname</th>
+                <th className="px-3 py-2 text-left font-medium">State</th>
+                <th className="px-3 py-2 text-left font-medium">
+                  Capabilities
+                </th>
+                <th className="px-3 py-2 text-left font-medium">Fingerprint</th>
+                <th className="px-3 py-2 text-left font-medium">Paired</th>
+                <th className="px-3 py-2 text-left font-medium">Last seen</th>
+                <th className="px-3 py-2 text-right font-medium">Actions</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y">
+              {/* Pending pinned at the top — operators come to this tab to
+                  action the queue first, then check status of approved
+                  rows. Same visual sort as the existing FleetTab. */}
+              {pending.map((row) => (
+                <ApplianceTableRow
+                  key={row.id}
+                  row={row}
+                  highlight
+                  busy={approve.isPending && approve.variables === row.id}
+                  onOpen={() => setDrilldown(row)}
+                  onApprove={() => approve.mutate(row.id)}
+                  onReject={() => setRejectTarget(row)}
+                  onRekey={() => setRekeyTarget(row)}
+                  onDelete={() => setDeleteTarget(row)}
+                />
+              ))}
+              {others.map((row) => (
+                <ApplianceTableRow
+                  key={row.id}
+                  row={row}
+                  busy={rekey.isPending && rekey.variables === row.id}
+                  onOpen={() => setDrilldown(row)}
+                  onApprove={() => approve.mutate(row.id)}
+                  onReject={() => setRejectTarget(row)}
+                  onRekey={() => setRekeyTarget(row)}
+                  onDelete={() => setDeleteTarget(row)}
+                />
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {drilldown && (
+        <ApplianceDrilldownModal
+          row={drilldown}
+          onClose={() => setDrilldown(null)}
+          onApprove={() => approve.mutate(drilldown.id)}
+          approving={approve.isPending}
+          onReject={() => setRejectTarget(drilldown)}
+          onRekey={() => setRekeyTarget(drilldown)}
+          onDelete={() => setDeleteTarget(drilldown)}
+        />
+      )}
+
+      {rejectTarget && (
+        <ConfirmModal
+          open
+          title="Reject appliance?"
+          message={
+            <>
+              <p className="text-sm">
+                Reject <strong>{rejectTarget.hostname}</strong>? The row is
+                deleted; the supervisor's next poll returns 403 and it falls
+                back to bootstrapping. To re-pair, mint a fresh pairing code and
+                re-install or re-trigger the supervisor.
+              </p>
+              <p className="mt-2 text-xs text-muted-foreground">
+                Fingerprint:{" "}
+                <code className="text-foreground">
+                  {shortFingerprint(rejectTarget.public_key_fingerprint)}
+                </code>
+              </p>
+            </>
+          }
+          confirmLabel="Reject"
+          tone="destructive"
+          loading={reject.isPending}
+          onConfirm={() => reject.mutate(rejectTarget.id)}
+          onClose={() => setRejectTarget(null)}
+        />
+      )}
+
+      {deleteTarget && (
+        <ConfirmModal
+          open
+          title="Delete appliance?"
+          message={
+            <>
+              <p className="text-sm">
+                Permanently remove <strong>{deleteTarget.hostname}</strong> from
+                the fleet. The supervisor's mTLS calls will fail (cert chain
+                still valid but no matching DB row); the supervisor falls back
+                to bootstrapping and needs a fresh pairing code to re-join.
+              </p>
+              <p className="mt-2 text-xs text-muted-foreground">
+                Cert serial:{" "}
+                <code className="text-foreground">
+                  {deleteTarget.cert_serial ?? "—"}
+                </code>
+              </p>
+            </>
+          }
+          confirmLabel="Delete"
+          tone="destructive"
+          loading={remove.isPending}
+          onConfirm={() => remove.mutate(deleteTarget.id)}
+          onClose={() => setDeleteTarget(null)}
+        />
+      )}
+
+      {rekeyTarget && (
+        <ConfirmModal
+          open
+          title="Re-key appliance?"
+          message={
+            <>
+              <p className="text-sm">
+                Issue a fresh cert against the supervisor's existing pubkey on{" "}
+                <strong>{rekeyTarget.hostname}</strong>. The current cert
+                remains technically valid in the CA's eye until it expires (CRL
+                work lands in a later wave); the supervisor picks up the new
+                cert on its next poll.
+              </p>
+              <p className="mt-2 text-xs text-muted-foreground">
+                Use this for the routine 60-day renewal or after suspected
+                compromise.
+              </p>
+              <p className="mt-2 text-xs text-muted-foreground">
+                Current serial:{" "}
+                <code className="text-foreground">
+                  {rekeyTarget.cert_serial ?? "—"}
+                </code>
+              </p>
+            </>
+          }
+          confirmLabel="Re-key"
+          loading={rekey.isPending}
+          onConfirm={() => rekey.mutate(rekeyTarget.id)}
+          onClose={() => setRekeyTarget(null)}
+        />
+      )}
+    </div>
+  );
+}
+
+function ApplianceTableRow({
+  row,
+  highlight,
+  busy,
+  onOpen,
+  onApprove,
+  onReject,
+  onRekey,
+  onDelete,
+}: {
+  row: ApplianceRow;
+  highlight?: boolean;
+  busy?: boolean;
+  onOpen: () => void;
+  onApprove: () => void;
+  onReject: () => void;
+  onRekey: () => void;
+  onDelete: () => void;
+}) {
+  const badge = stateBadge(row.state);
+  const Icon = badge.Icon;
+  const caps = capabilityChips(row.capabilities);
+
+  return (
+    <tr
+      className={cn(
+        "cursor-pointer hover:bg-muted/30",
+        highlight && "bg-amber-500/5",
+      )}
+      onClick={onOpen}
+    >
+      <td className="px-3 py-2">
+        <div className="font-medium">{row.hostname}</div>
+        {row.supervisor_version && (
+          <div className="text-xs text-muted-foreground">
+            supervisor {row.supervisor_version}
+          </div>
+        )}
+      </td>
+      <td className="px-3 py-2">
+        <span
+          className={cn(
+            "inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-xs",
+            badge.className,
+          )}
+        >
+          <Icon className="h-3 w-3" /> {badge.label}
+        </span>
+      </td>
+      <td className="px-3 py-2">
+        <div className="flex flex-wrap gap-1">
+          {caps.length === 0 ? (
+            <span className="text-xs text-muted-foreground">—</span>
+          ) : (
+            caps.map((c) => (
+              <span
+                key={c.key}
+                className="rounded-full bg-muted px-1.5 py-0.5 font-mono text-[10px]"
+              >
+                {c.label}
+              </span>
+            ))
+          )}
+          {row.capabilities.has_baked_images && (
+            <span
+              className="rounded-full bg-sky-500/10 px-1.5 py-0.5 font-mono text-[10px] text-sky-700 dark:text-sky-300"
+              title="Supervisor reports baked container images on the rootfs — air-gap-ready."
+            >
+              baked
+            </span>
+          )}
+        </div>
+      </td>
+      <td className="px-3 py-2 font-mono text-xs">
+        {shortFingerprint(row.public_key_fingerprint)}
+      </td>
+      <td className="px-3 py-2 text-xs text-muted-foreground">
+        {relativeTime(row.paired_at)}
+        {row.paired_from_ip && (
+          <div className="font-mono">{row.paired_from_ip}</div>
+        )}
+      </td>
+      <td className="px-3 py-2 text-xs text-muted-foreground">
+        {relativeTime(row.last_seen_at)}
+      </td>
+      <td className="px-3 py-2 text-right" onClick={(e) => e.stopPropagation()}>
+        <div className="inline-flex items-center gap-1">
+          {row.state === "pending_approval" && (
+            <>
+              <button
+                type="button"
+                onClick={onApprove}
+                disabled={busy}
+                className="inline-flex items-center gap-1 rounded-md border border-emerald-500/40 bg-emerald-500/10 px-2 py-1 text-xs text-emerald-700 hover:bg-emerald-500/20 disabled:opacity-50 dark:text-emerald-300"
+                title="Approve + sign the supervisor's cert"
+              >
+                {busy ? (
+                  <Loader2 className="h-3 w-3 animate-spin" />
+                ) : (
+                  <CheckCircle2 className="h-3 w-3" />
+                )}
+                Approve
+              </button>
+              <button
+                type="button"
+                onClick={onReject}
+                className="inline-flex items-center gap-1 rounded-md border border-rose-500/40 bg-rose-500/10 px-2 py-1 text-xs text-rose-700 hover:bg-rose-500/20 dark:text-rose-300"
+                title="Reject — deletes the row, supervisor falls back to bootstrapping"
+              >
+                <XCircle className="h-3 w-3" />
+                Reject
+              </button>
+            </>
+          )}
+          {row.state === "approved" && (
+            <>
+              <button
+                type="button"
+                onClick={onRekey}
+                className="inline-flex items-center gap-1 rounded-md border bg-background px-2 py-1 text-xs hover:bg-muted"
+                title="Issue a fresh cert against the same pubkey"
+              >
+                <KeyRound className="h-3 w-3" />
+                Re-key
+              </button>
+              <button
+                type="button"
+                onClick={onDelete}
+                className="inline-flex items-center gap-1 rounded-md border bg-background px-2 py-1 text-xs hover:bg-muted"
+                title="Permanently remove from the fleet"
+              >
+                <Trash2 className="h-3 w-3" />
+                Delete
+              </button>
+            </>
+          )}
+        </div>
+      </td>
+    </tr>
+  );
+}
+
+function ApplianceDrilldownModal({
+  row,
+  onClose,
+  onApprove,
+  approving,
+  onReject,
+  onRekey,
+  onDelete,
+}: {
+  row: ApplianceRow;
+  onClose: () => void;
+  onApprove: () => void;
+  approving: boolean;
+  onReject: () => void;
+  onRekey: () => void;
+  onDelete: () => void;
+}) {
+  const caps = row.capabilities ?? {};
+  const badge = stateBadge(row.state);
+  const Icon = badge.Icon;
+
+  return (
+    <Modal title={`Appliance · ${row.hostname}`} onClose={onClose} wide>
+      <div className="space-y-4 text-sm">
+        <div className="flex flex-wrap items-center gap-2">
+          <span
+            className={cn(
+              "inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-xs",
+              badge.className,
+            )}
+          >
+            <Icon className="h-3 w-3" /> {badge.label}
+          </span>
+          {row.supervisor_version && (
+            <span className="rounded-md bg-muted px-1.5 py-0.5 font-mono text-xs">
+              supervisor {row.supervisor_version}
+            </span>
+          )}
+          {caps.has_baked_images && (
+            <span className="rounded-md bg-sky-500/10 px-1.5 py-0.5 font-mono text-xs text-sky-700 dark:text-sky-300">
+              baked images
+              {caps.baked_images_version
+                ? ` · ${caps.baked_images_version}`
+                : ""}
+            </span>
+          )}
+        </div>
+
+        <div>
+          <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+            Capabilities
+          </h3>
+          <div className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-2">
+            <CapRow label="DNS — BIND9" on={!!caps.can_run_dns_bind9} />
+            <CapRow label="DNS — PowerDNS" on={!!caps.can_run_dns_powerdns} />
+            <CapRow label="DHCP" on={!!caps.can_run_dhcp} />
+            <CapRow label="Observer" on={!!caps.can_run_observer} />
+          </div>
+          <dl className="mt-3 grid grid-cols-2 gap-x-4 gap-y-1.5 text-xs">
+            <FactRow label="CPUs" value={caps.cpu_count} />
+            <FactRow
+              label="Memory"
+              value={
+                typeof caps.memory_mb === "number"
+                  ? `${(caps.memory_mb / 1024).toFixed(1)} GiB`
+                  : undefined
+              }
+            />
+            <FactRow label="Storage" value={caps.storage_type} />
+            <FactRow
+              label="Host NICs"
+              value={
+                Array.isArray(caps.host_nics)
+                  ? caps.host_nics.join(", ")
+                  : undefined
+              }
+              icon={Network}
+            />
+          </dl>
+        </div>
+
+        <div>
+          <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+            Identity
+          </h3>
+          <dl className="mt-2 grid grid-cols-[max-content_1fr] gap-x-4 gap-y-1.5 text-xs">
+            <dt className="text-muted-foreground">Appliance id</dt>
+            <dd className="break-all font-mono">{row.id}</dd>
+            <dt className="text-muted-foreground">Pubkey fingerprint</dt>
+            <dd className="break-all font-mono">
+              {row.public_key_fingerprint}
+            </dd>
+            <dt className="text-muted-foreground">Paired</dt>
+            <dd>
+              {row.paired_at ? new Date(row.paired_at).toLocaleString() : "—"}
+              {row.paired_from_ip ? ` · from ${row.paired_from_ip}` : ""}
+            </dd>
+            <dt className="text-muted-foreground">Last seen</dt>
+            <dd>
+              {row.last_seen_at
+                ? new Date(row.last_seen_at).toLocaleString()
+                : "—"}
+              {row.last_seen_ip ? ` · ${row.last_seen_ip}` : ""}
+            </dd>
+            {row.approved_at && (
+              <>
+                <dt className="text-muted-foreground">Approved</dt>
+                <dd>{new Date(row.approved_at).toLocaleString()}</dd>
+              </>
+            )}
+          </dl>
+        </div>
+
+        {row.state === "approved" && (
+          <div>
+            <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+              Certificate
+            </h3>
+            <dl className="mt-2 grid grid-cols-[max-content_1fr] gap-x-4 gap-y-1.5 text-xs">
+              <dt className="text-muted-foreground">Serial</dt>
+              <dd className="break-all font-mono">{row.cert_serial ?? "—"}</dd>
+              <dt className="text-muted-foreground">Issued</dt>
+              <dd>
+                {row.cert_issued_at
+                  ? new Date(row.cert_issued_at).toLocaleString()
+                  : "—"}
+              </dd>
+              <dt className="text-muted-foreground">Expires</dt>
+              <dd>
+                {row.cert_expires_at
+                  ? new Date(row.cert_expires_at).toLocaleString()
+                  : "—"}
+              </dd>
+            </dl>
+          </div>
+        )}
+
+        <div className="flex flex-wrap justify-end gap-2 border-t pt-3">
+          {row.state === "pending_approval" ? (
+            <>
+              <button
+                type="button"
+                onClick={onReject}
+                className="inline-flex items-center gap-1 rounded-md border border-rose-500/40 bg-rose-500/10 px-3 py-1.5 text-xs text-rose-700 hover:bg-rose-500/20 dark:text-rose-300"
+              >
+                <XCircle className="h-3.5 w-3.5" />
+                Reject
+              </button>
+              <button
+                type="button"
+                onClick={onApprove}
+                disabled={approving}
+                className="inline-flex items-center gap-1 rounded-md border border-emerald-500/40 bg-emerald-500/10 px-3 py-1.5 text-xs text-emerald-700 hover:bg-emerald-500/20 disabled:opacity-50 dark:text-emerald-300"
+              >
+                {approving ? (
+                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                ) : (
+                  <CheckCircle2 className="h-3.5 w-3.5" />
+                )}
+                Approve + sign cert
+              </button>
+            </>
+          ) : (
+            <>
+              <button
+                type="button"
+                onClick={onDelete}
+                className="inline-flex items-center gap-1 rounded-md border bg-background px-3 py-1.5 text-xs hover:bg-muted"
+              >
+                <Trash2 className="h-3.5 w-3.5" />
+                Delete
+              </button>
+              <button
+                type="button"
+                onClick={onRekey}
+                className="inline-flex items-center gap-1 rounded-md border bg-background px-3 py-1.5 text-xs hover:bg-muted"
+              >
+                <KeyRound className="h-3.5 w-3.5" />
+                Re-key
+              </button>
+            </>
+          )}
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
+function CapRow({ label, on }: { label: string; on: boolean }) {
+  return (
+    <div className="flex items-center gap-2 rounded-md border bg-background px-2 py-1.5 text-xs">
+      <span
+        className={cn(
+          "inline-block h-1.5 w-1.5 rounded-full",
+          on ? "bg-emerald-500" : "bg-muted-foreground/30",
+        )}
+      />
+      <span className={cn(!on && "text-muted-foreground")}>{label}</span>
+    </div>
+  );
+}
+
+function FactRow({
+  label,
+  value,
+  icon: IconComp,
+}: {
+  label: string;
+  value: string | number | undefined | null;
+  icon?: typeof Network;
+}) {
+  if (value === undefined || value === null || value === "") return null;
+  return (
+    <>
+      <dt className="flex items-center gap-1 text-muted-foreground">
+        {IconComp ? <IconComp className="h-3 w-3" /> : null}
+        {label}
+      </dt>
+      <dd className="break-all">{value}</dd>
+    </>
+  );
+}
+
+// Silence unused-vars on the input class export — kept for future
+// per-row inline edits (notes / tags) without making the import
+// disappear on a UI shape revisit.
+void inputCls;

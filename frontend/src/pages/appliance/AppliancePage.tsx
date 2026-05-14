@@ -10,11 +10,13 @@ import {
   ScrollText,
   Server,
   ShieldCheck,
+  Stamp,
   Wrench,
 } from "lucide-react";
 
 import { applianceApi } from "@/lib/api";
 import { useSessionState } from "@/lib/useSessionState";
+import { ApprovalsTab } from "./ApprovalsTab";
 import { CertificatesTab } from "./CertificatesTab";
 import { ContainersTab } from "./ContainersTab";
 import { FleetTab } from "./FleetTab";
@@ -43,6 +45,7 @@ import { SNMPTab } from "./SNMPTab";
  */
 type Tab =
   | "tls"
+  | "approvals"
   | "releases"
   | "fleet"
   | "pairing"
@@ -79,6 +82,17 @@ interface TabSpec {
 // includes selfOnly tabs in the same sort order — hiding them on
 // docker / k8s control planes happens at render time, not here.
 const TABS: TabSpec[] = [
+  {
+    // Issue #170 Wave B3 — pending-approval queue + approved
+    // appliance management. Not selfOnly: a docker / k8s control
+    // plane still approves remote Application appliances.
+    key: "approvals",
+    label: "Approvals",
+    phase: "170-B3",
+    icon: Stamp,
+    summary:
+      "Approve / reject supervisors that claimed a pairing code. Approval signs an X.509 cert against the supervisor's submitted Ed25519 pubkey using the control plane's internal CA (lazy-bootstrapped on first approve). Pending rows pin at the top; approved rows expose Re-key + Delete + capability detail in a drilldown modal.",
+  },
   {
     key: "containers",
     label: "Containers",
@@ -276,6 +290,8 @@ export function AppliancePage() {
       <div className="flex-1 overflow-auto bg-background p-6">
         {effectiveTab === "tls" ? (
           <CertificatesTab />
+        ) : effectiveTab === "approvals" ? (
+          <ApprovalsTab />
         ) : effectiveTab === "releases" ? (
           <ReleasesTab applianceMode={isApplianceHost} />
         ) : effectiveTab === "fleet" ? (

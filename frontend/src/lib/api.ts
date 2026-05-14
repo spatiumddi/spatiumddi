@@ -7123,6 +7123,72 @@ export const appliancePairingApi = {
       .then((r) => r.data),
 };
 
+// ── Appliance: approval workflow (#170 Wave B1 backend, B3 UI) ─────
+// Supervisors land here after claiming a pairing code via
+// /api/v1/appliance/supervisor/register. They sit in
+// pending_approval until an admin clicks Approve — the control
+// plane's internal CA signs an X.509 cert against the supervisor's
+// submitted Ed25519 pubkey + the supervisor picks the cert up on its
+// next /supervisor/poll. Reject = delete the row + the supervisor
+// falls back to bootstrapping.
+export type ApplianceState = "pending_approval" | "approved" | "rejected";
+
+export interface SupervisorCapabilities {
+  can_run_dns_bind9?: boolean;
+  can_run_dns_powerdns?: boolean;
+  can_run_dhcp?: boolean;
+  can_run_observer?: boolean;
+  has_baked_images?: boolean;
+  baked_images_version?: string;
+  supervisor_version?: string;
+  cpu_count?: number;
+  memory_mb?: number;
+  storage_type?: string;
+  host_nics?: string[];
+  [k: string]: unknown;
+}
+
+export interface ApplianceRow {
+  id: string;
+  hostname: string;
+  state: ApplianceState;
+  public_key_fingerprint: string;
+  supervisor_version: string | null;
+  capabilities: SupervisorCapabilities;
+  paired_at: string;
+  paired_from_ip: string | null;
+  last_seen_at: string | null;
+  last_seen_ip: string | null;
+  approved_at: string | null;
+  approved_by_user_id: string | null;
+  rejected_at: string | null;
+  cert_serial: string | null;
+  cert_issued_at: string | null;
+  cert_expires_at: string | null;
+  created_at: string;
+}
+
+export const applianceApprovalApi = {
+  list: () =>
+    api
+      .get<{ appliances: ApplianceRow[] }>("/appliance/appliances")
+      .then((r) => r.data.appliances),
+  get: (id: string) =>
+    api.get<ApplianceRow>(`/appliance/appliances/${id}`).then((r) => r.data),
+  approve: (id: string) =>
+    api
+      .post<ApplianceRow>(`/appliance/appliances/${id}/approve`)
+      .then((r) => r.data),
+  reject: (id: string) =>
+    api.post<void>(`/appliance/appliances/${id}/reject`).then((r) => r.data),
+  remove: (id: string) =>
+    api.delete<void>(`/appliance/appliances/${id}`).then((r) => r.data),
+  rekey: (id: string) =>
+    api
+      .post<ApplianceRow>(`/appliance/appliances/${id}/rekey`)
+      .then((r) => r.data),
+};
+
 // ── Appliance: container management (Phase 4d) ─────────────────────
 export interface ApplianceContainer {
   name: string;
