@@ -7165,6 +7165,23 @@ export interface ApplianceRow {
   cert_serial: string | null;
   cert_issued_at: string | null;
   cert_expires_at: string | null;
+  // #170 Wave C1 — slot telemetry surfaced from the supervisor's
+  // heartbeat. Pre-C1 (Wave A4-era) Application appliances never
+  // run the supervisor heartbeat path, so these stay null on those
+  // rows.
+  deployment_kind: string | null;
+  installed_appliance_version: string | null;
+  current_slot: string | null;
+  durable_default: string | null;
+  is_trial_boot: boolean;
+  last_upgrade_state: string | null;
+  last_upgrade_state_at: string | null;
+  snmpd_running: boolean | null;
+  ntp_sync_state: string | null;
+  desired_appliance_version: string | null;
+  desired_slot_image_url: string | null;
+  reboot_requested: boolean;
+  reboot_requested_at: string | null;
   created_at: string;
 }
 

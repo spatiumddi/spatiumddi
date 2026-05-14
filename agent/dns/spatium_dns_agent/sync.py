@@ -45,62 +45,15 @@ class SyncLoop:
                 self.driver.apply_config(bundle)
                 self._current_structural_etag = bundle.get("structural_etag")
                 log.info("dns_agent_bootstrap_from_cache", etag=etag)
-                # Phase 8f-4 — re-evaluate the cached bundle's
-                # ``fleet_upgrade`` block at startup. The poll-loop
-                # path below only calls maybe_fire_fleet_upgrade on
-                # 200 responses; without this, an agent restart while
-                # a desired_appliance_version is already stamped on
-                # the control plane goes straight to 304-forever (the
-                # cached etag matches the current bundle, so no 200
-                # ever arrives) and the trigger file never gets
-                # written. Idempotent: maybe_fire_fleet_upgrade skips
-                # when the trigger already exists or installed equals
-                # desired.
-                fleet = bundle.get("fleet_upgrade") or {}
-                if fleet.get("desired_appliance_version"):
-                    from .slot_state import maybe_fire_fleet_upgrade
-
-                    if maybe_fire_fleet_upgrade(
-                        fleet.get("desired_appliance_version"),
-                        fleet.get("desired_slot_image_url"),
-                    ):
-                        log.info(
-                            "fleet_upgrade_triggered_from_cache",
-                            desired_version=fleet.get("desired_appliance_version"),
-                        )
-                # Phase 8f-8 — same cache-driven evaluation for the
-                # operator-triggered reboot field. Without this an
-                # agent restart while reboot_requested=True is cached
-                # would 304-forever and the reboot would never fire.
-                if fleet.get("reboot_requested"):
-                    from .slot_state import maybe_fire_reboot
-
-                    if maybe_fire_reboot(True):
-                        log.info("fleet_reboot_triggered_from_cache")
-                # Issue #153 — same cache-driven evaluation for the
-                # SNMP config block. ``maybe_fire_snmp_reload`` is
-                # itself idempotent (compares the bundle's config_hash
-                # to the on-disk sidecar) so this call is safe even
-                # when the prior run already applied the same config.
-                snmp_block = bundle.get("snmp_settings")
-                if snmp_block:
-                    from .slot_state import maybe_fire_snmp_reload
-
-                    if maybe_fire_snmp_reload(snmp_block):
-                        log.info(
-                            "snmp_reload_triggered_from_cache",
-                            config_hash=snmp_block.get("config_hash"),
-                        )
-                # Issue #154 — same shape for NTP / chrony.
-                ntp_block = bundle.get("ntp_settings")
-                if ntp_block:
-                    from .slot_state import maybe_fire_ntp_reload
-
-                    if maybe_fire_ntp_reload(ntp_block):
-                        log.info(
-                            "ntp_reload_triggered_from_cache",
-                            config_hash=ntp_block.get("config_hash"),
-                        )
+                # #170 Wave C1 — fleet-upgrade / reboot / SNMP / NTP
+                # trigger-file writes moved to the supervisor's
+                # heartbeat loop. The DNS service container drops its
+                # host bind mounts (``/etc/spatiumddi-host``,
+                # ``/boot/efi-host``, ``/var/lib/spatiumddi-host/
+                # release-state``, ``/run/udev``) in C1 so it can no
+                # longer write the trigger surface anyway; the
+                # supervisor's appliance-state module is the single
+                # producer.
                 # Push the rendered tree once at bootstrap so operators
                 # get a Config-tab snapshot the moment the agent comes
                 # up — without this, the snapshot only lands on the
@@ -172,54 +125,14 @@ class SyncLoop:
         # Atomic-swap cache always (cache is the source of truth for restarts)
         save_config(self.cfg.state_dir, bundle, etag)
 
-        # Phase 8f-4 — fleet upgrade trigger. The control plane stamps
-        # desired_appliance_version on the server row via the Fleet
-        # view; the bundle's ``fleet_upgrade`` block carries it down
-        # here. If the desired version doesn't match what's installed
-        # AND we're on an appliance AND no trigger is already pending,
-        # write the slot-upgrade trigger file. The host-side
-        # spatiumddi-slot-upgrade.path unit picks it up (same path as
-        # the manual /appliance OS Image card).
-        fleet = bundle.get("fleet_upgrade") or {}
-        if fleet.get("desired_appliance_version"):
-            from .slot_state import maybe_fire_fleet_upgrade
-            fired = maybe_fire_fleet_upgrade(
-                fleet.get("desired_appliance_version"),
-                fleet.get("desired_slot_image_url"),
-            )
-            if fired:
-                log.info(
-                    "fleet_upgrade_triggered",
-                    desired_version=fleet.get("desired_appliance_version"),
-                )
-        # Phase 8f-8 — operator-triggered reboot. Writes the
-        # reboot-pending trigger the host runner watches. Strict
-        # appliance-only gate is inside maybe_fire_reboot itself.
-        if fleet.get("reboot_requested"):
-            from .slot_state import maybe_fire_reboot
-            if maybe_fire_reboot(True):
-                log.info("fleet_reboot_triggered")
-        # Issue #153 — SNMP config rollout. Same pattern: agent reads
-        # the rendered snmpd.conf body + content hash from the bundle,
-        # fires the snmp-config-pending trigger when the hash differs
-        # from what's been applied on this host.
-        snmp_block = bundle.get("snmp_settings")
-        if snmp_block:
-            from .slot_state import maybe_fire_snmp_reload
-            if maybe_fire_snmp_reload(snmp_block):
-                log.info(
-                    "snmp_reload_triggered",
-                    config_hash=snmp_block.get("config_hash"),
-                )
-        # Issue #154 — NTP / chrony config rollout. Identical shape.
-        ntp_block = bundle.get("ntp_settings")
-        if ntp_block:
-            from .slot_state import maybe_fire_ntp_reload
-            if maybe_fire_ntp_reload(ntp_block):
-                log.info(
-                    "ntp_reload_triggered",
-                    config_hash=ntp_block.get("config_hash"),
-                )
+        # #170 Wave C1 — fleet-upgrade / reboot / SNMP / NTP trigger
+        # writes moved to the supervisor's heartbeat loop. The
+        # ConfigBundle's ``fleet_upgrade`` / ``snmp_settings`` /
+        # ``ntp_settings`` blocks are still emitted by the control
+        # plane (the bundle shape is stable; pre-C1 agents in the
+        # field still consume them) but the C1+ DNS service container
+        # ignores them — the supervisor's appliance_state module is
+        # the only producer of appliance-host trigger files now.
 
         # Re-render + reload daemon ONLY when structural fingerprint changes.
         # Record CRUD bumps the full etag but not structural_etag, so the

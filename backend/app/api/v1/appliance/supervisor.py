@@ -570,6 +570,174 @@ async def supervisor_poll(
     )
 
 
+# ── /supervisor/heartbeat ─────────────────────────────────────────
+
+
+class SupervisorHeartbeatRequest(BaseModel):
+    """Periodic heartbeat from the supervisor (#170 Wave C1).
+
+    Carries the appliance-host telemetry block the service agents used
+    to ship on their own per-row heartbeats in #138 Phase 8f-2. The
+    supervisor is now the single source of truth for appliance-host
+    state — service agents drop their host bind mounts in C1.
+
+    Auth model is interim: session-token gated for now (same shape as
+    /supervisor/poll). Wave C2/D will require mTLS once the verifier
+    middleware lands, and the session_token field becomes optional
+    (mTLS subject CN = appliance_id is the auth principal). Both
+    paths persist the same fields.
+    """
+
+    appliance_id: uuid.UUID
+    session_token: str | None = None
+    capabilities: SupervisorCapabilities | None = None
+    deployment_kind: Literal["appliance", "docker", "k8s", "unknown"] | None = None
+    installed_appliance_version: str | None = None
+    current_slot: Literal["slot_a", "slot_b"] | None = None
+    durable_default: Literal["slot_a", "slot_b"] | None = None
+    is_trial_boot: bool | None = None
+    last_upgrade_state: Literal["ready", "in-flight", "done", "failed"] | None = None
+    last_upgrade_state_at: datetime | None = None
+    snmpd_running: bool | None = None
+    ntp_sync_state: Literal["synchronized", "unsynchronized", "unknown"] | None = None
+
+
+class SupervisorHeartbeatResponse(BaseModel):
+    """Operator-driven desired state returned to the supervisor.
+
+    The supervisor compares each field to its local state + fires the
+    matching trigger file on the appliance host. Idempotent — same
+    desired_version returning across heartbeats produces one trigger
+    write, not many (the trigger file's presence is the marker).
+    """
+
+    appliance_id: uuid.UUID
+    state: Literal["pending_approval", "approved", "rejected"]
+    desired_appliance_version: str | None = None
+    desired_slot_image_url: str | None = None
+    reboot_requested: bool = False
+
+
+@router.post(
+    "/supervisor/heartbeat",
+    response_model=SupervisorHeartbeatResponse,
+    summary="Supervisor heartbeat — appliance-host telemetry + desired state",
+)
+async def supervisor_heartbeat(
+    body: SupervisorHeartbeatRequest,
+    request: Request,
+    db: DB,
+) -> SupervisorHeartbeatResponse:
+    """Persist supervisor-reported appliance-host state + return the
+    operator's desired state for the supervisor to act on.
+
+    Auth: session-token interim (per the SupervisorHeartbeatRequest
+    docstring); after Wave C2/D this endpoint will be mTLS-gated and
+    session_token becomes optional.
+
+    On success:
+    * Updates last_seen_at / last_seen_ip.
+    * Overwrites the slot-telemetry columns when the supervisor
+      reports non-None values (None leaves the column alone so a
+      partial heartbeat doesn't blank fields the supervisor isn't
+      currently sourcing).
+    * Auto-clears ``desired_appliance_version`` once
+      ``installed_appliance_version`` matches it AND the upgrade
+      state is ``done`` or ``ready`` — the upgrade has landed and
+      the operator's target is no longer load-bearing.
+    * Auto-clears ``reboot_requested`` 15 s after the stamp on the
+      assumption that the supervisor's heartbeat proves it survived
+      the reboot. Same auto-heal shape as the legacy
+      ``dns_server.reboot_requested`` / ``dhcp_server.reboot_requested``
+      flags in Phase 8f-8.
+    """
+    if not await _module_enabled(db):
+        await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Not found.")
+
+    row = await db.get(Appliance, body.appliance_id)
+    valid = row is not None and (
+        # Approved appliances no longer carry a session_token (B1
+        # clears it on approve). Until mTLS lands they auth by the
+        # same token re-presented from the supervisor's local cache
+        # — but we'll accept any heartbeat from an approved row in
+        # this interim window since the alternative is "no heartbeat
+        # path until C2". B2's role lock-down narrows this back.
+        row.state == APPLIANCE_STATE_APPROVED
+        or (
+            body.session_token is not None
+            and verify_session_token(body.session_token, row.session_token_hash)
+        )
+    )
+    if not valid:
+        await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid appliance or session.")
+
+    assert row is not None
+
+    row.last_seen_at = datetime.now(UTC)
+    row.last_seen_ip = _client_ip(request)
+    if body.capabilities is not None:
+        row.capabilities = body.capabilities.model_dump()
+
+    # Slot telemetry — only overwrite when the supervisor sent a non-
+    # None value. Lets the supervisor send partial heartbeats (e.g.
+    # NTP sidecar unreadable this tick) without blanking columns it
+    # doesn't currently know about.
+    if body.deployment_kind is not None:
+        row.deployment_kind = body.deployment_kind
+    if body.installed_appliance_version is not None:
+        row.installed_appliance_version = body.installed_appliance_version
+    if body.current_slot is not None:
+        row.current_slot = body.current_slot
+    if body.durable_default is not None:
+        row.durable_default = body.durable_default
+    if body.is_trial_boot is not None:
+        row.is_trial_boot = body.is_trial_boot
+    if body.last_upgrade_state is not None:
+        row.last_upgrade_state = body.last_upgrade_state
+    if body.last_upgrade_state_at is not None:
+        row.last_upgrade_state_at = body.last_upgrade_state_at
+    if body.snmpd_running is not None:
+        row.snmpd_running = body.snmpd_running
+    if body.ntp_sync_state is not None:
+        row.ntp_sync_state = body.ntp_sync_state
+
+    # Auto-clear desired_appliance_version once installed matches +
+    # the upgrade landed cleanly. Same shape as #138 Phase 8f-4's
+    # legacy dns_server / dhcp_server auto-clear.
+    if (
+        row.desired_appliance_version is not None
+        and row.installed_appliance_version == row.desired_appliance_version
+        and row.last_upgrade_state in (None, "done", "ready")
+    ):
+        row.desired_appliance_version = None
+        row.desired_slot_image_url = None
+
+    # Auto-clear reboot_requested 15 s after the stamp — by that
+    # point the heartbeat is itself proof the reboot landed (or that
+    # the reboot trigger has been written + the host runner is about
+    # to fire). Reduces the chance of a stale flag stalling the
+    # operator's next reboot request.
+    if (
+        row.reboot_requested
+        and row.reboot_requested_at is not None
+        and (datetime.now(UTC) - row.reboot_requested_at).total_seconds() >= 15
+    ):
+        row.reboot_requested = False
+        row.reboot_requested_at = None
+
+    await db.commit()
+
+    return SupervisorHeartbeatResponse(
+        appliance_id=row.id,
+        state=row.state,  # type: ignore[arg-type]
+        desired_appliance_version=row.desired_appliance_version,
+        desired_slot_image_url=row.desired_slot_image_url,
+        reboot_requested=row.reboot_requested,
+    )
+
+
 # ── Admin: approve / reject / delete / re-key ─────────────────────
 
 
@@ -593,6 +761,20 @@ class ApplianceRow(BaseModel):
     cert_serial: str | None
     cert_issued_at: datetime | None
     cert_expires_at: datetime | None
+    # #170 Wave C1 — slot telemetry surfaced from the appliance row.
+    deployment_kind: str | None
+    installed_appliance_version: str | None
+    current_slot: str | None
+    durable_default: str | None
+    is_trial_boot: bool
+    last_upgrade_state: str | None
+    last_upgrade_state_at: datetime | None
+    snmpd_running: bool | None
+    ntp_sync_state: str | None
+    desired_appliance_version: str | None
+    desired_slot_image_url: str | None
+    reboot_requested: bool
+    reboot_requested_at: datetime | None
     created_at: datetime
 
 
@@ -626,6 +808,19 @@ def _row_to_schema(row: Appliance) -> ApplianceRow:
         cert_serial=row.cert_serial,
         cert_issued_at=row.cert_issued_at,
         cert_expires_at=row.cert_expires_at,
+        deployment_kind=row.deployment_kind,
+        installed_appliance_version=row.installed_appliance_version,
+        current_slot=row.current_slot,
+        durable_default=row.durable_default,
+        is_trial_boot=row.is_trial_boot,
+        last_upgrade_state=row.last_upgrade_state,
+        last_upgrade_state_at=row.last_upgrade_state_at,
+        snmpd_running=row.snmpd_running,
+        ntp_sync_state=row.ntp_sync_state,
+        desired_appliance_version=row.desired_appliance_version,
+        desired_slot_image_url=row.desired_slot_image_url,
+        reboot_requested=row.reboot_requested,
+        reboot_requested_at=row.reboot_requested_at,
         created_at=row.created_at,
     )
 

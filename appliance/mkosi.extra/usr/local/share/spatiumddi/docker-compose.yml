@@ -296,20 +296,11 @@ services:
     volumes:
       - dns_bind9_state:/var/lib/spatium-dns-agent
       - dns_bind9_cache:/var/cache/bind
-      # Phase 8f-2 — agent reports its slot + deployment state on every
-      # heartbeat so the control plane's Fleet view can drive fleet
-      # upgrades. Read-only mounts of the appliance host's role/release
-      # stamps + grubenv + slot-upgrade .state sidecar. Same mount
-      # convention the api container uses (``…-host`` suffix). On
-      # docker / k8s deploys these host paths don't exist; the agent's
-      # slot_state.py silently falls through to None values.
-      # ``/run/udev`` is needed for ``lsblk`` to see PARTLABEL/UUID
-      # (without it the slot-state collector reports current_slot=None
-      # because lsblk can't map root=UUID= to root_a / root_b).
-      - /etc/spatiumddi:/etc/spatiumddi-host:ro
-      - /boot/efi:/boot/efi-host:ro
-      - /var/lib/spatiumddi/release-state:/var/lib/spatiumddi-host/release-state:rw
-      - /run/udev:/run/udev:ro
+      # #170 Wave C1 — host bind mounts (``/etc/spatiumddi-host``,
+      # ``/boot/efi-host``, ``/var/lib/spatiumddi-host/release-state``,
+      # ``/run/udev``) moved to the supervisor. Service containers no
+      # longer collect appliance-host state; the supervisor's
+      # heartbeat is the single producer.
     # No depends_on: api — on agent-mode appliances the api isn't in
     # this compose, and the agent already retries forever on bootstrap
     # 401/404 (it caches a JWT after the first success).
@@ -347,11 +338,8 @@ services:
     volumes:
       - dns_powerdns_state:/var/lib/spatium-dns-agent
       - dns_powerdns_lmdb:/var/lib/powerdns
-      # Phase 8f-2 — see dns-bind9 above for the mount rationale.
-      - /etc/spatiumddi:/etc/spatiumddi-host:ro
-      - /boot/efi:/boot/efi-host:ro
-      - /var/lib/spatiumddi/release-state:/var/lib/spatiumddi-host/release-state:rw
-      - /run/udev:/run/udev:ro
+      # #170 Wave C1 — host bind mounts moved to the supervisor.
+      # See dns-bind9 above for rationale.
 
   # ── DHCP (Kea) — default profile ────────────────────────────────────────────
   # Host networking is required for DHCP broadcast (DDI appliance
@@ -385,11 +373,8 @@ services:
     volumes:
       - dhcp_kea_state:/var/lib/spatium-dhcp-agent
       - dhcp_kea_leases:/var/lib/kea
-      # Phase 8f-2 — see dns-bind9 above for the mount rationale.
-      - /etc/spatiumddi:/etc/spatiumddi-host:ro
-      - /boot/efi:/boot/efi-host:ro
-      - /var/lib/spatiumddi/release-state:/var/lib/spatiumddi-host/release-state:rw
-      - /run/udev:/run/udev:ro
+      # #170 Wave C1 — host bind mounts moved to the supervisor.
+      # See dns-bind9 above for rationale.
     # No depends_on: api — agent retries until the control plane is
     # reachable; on agent-mode installs the api isn't even in this
     # compose.
@@ -444,6 +429,16 @@ services:
       # Read-write because the supervisor rewrites the file on every
       # role change.
       - /etc/nftables.d:/etc/nftables.d:rw
+      # #170 Wave C1 — appliance-host telemetry + trigger-file writes
+      # moved here from the DNS / DHCP service containers. The
+      # supervisor is now the single producer of slot-upgrade-pending
+      # / reboot-pending / snmp-config-pending / ntp-config-pending
+      # triggers, and the single consumer of role-config + grubenv +
+      # the .state sidecar the host runners maintain.
+      - /etc/spatiumddi:/etc/spatiumddi-host:ro
+      - /boot/efi:/boot/efi-host:ro
+      - /var/lib/spatiumddi/release-state:/var/lib/spatiumddi-host/release-state:rw
+      - /run/udev:/run/udev:ro
     group_add:
       - "${DOCKER_GID:-999}"
     # Wave C+ needs CAP_NET_ADMIN to apply nftables rulesets. The

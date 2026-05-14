@@ -51,6 +51,11 @@ PRIVATE_KEY_FILENAME = "identity.key"
 PUBLIC_KEY_FILENAME = "identity.pub.der"
 FINGERPRINT_FILENAME = "identity.pub.sha256"
 APPLIANCE_ID_FILENAME = "appliance_id"
+# Cleartext session token cached after /supervisor/register so the
+# supervisor's /poll + /heartbeat calls authenticate across a
+# restart between register and approval. Cleared once mTLS lands
+# (Wave C2/D) — the cert is the identity from then on.
+SESSION_TOKEN_FILENAME = "session_token"
 
 
 @dataclass(frozen=True)
@@ -174,4 +179,35 @@ def clear_appliance_id(state_dir: Path) -> None:
     returns 404 for our /supervisor/poll — meaning the operator
     rejected/deleted us; we re-bootstrap from a fresh pairing code."""
     path = _identity_dir(state_dir) / APPLIANCE_ID_FILENAME
+    path.unlink(missing_ok=True)
+
+
+def load_session_token(state_dir: Path) -> str | None:
+    """Return the cleartext session token cached after register, or
+    None when no token has been persisted (fresh install, or already
+    cleared post-mTLS)."""
+    path = _identity_dir(state_dir) / SESSION_TOKEN_FILENAME
+    if not path.exists():
+        return None
+    try:
+        return path.read_text().strip() or None
+    except OSError:
+        return None
+
+
+def save_session_token(state_dir: Path, token: str) -> None:
+    """Persist the session token returned by /supervisor/register.
+    Mode 0600 — the cleartext token is a bearer secret until mTLS
+    takes over."""
+    path = _identity_dir(state_dir) / SESSION_TOKEN_FILENAME
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(token + "\n")
+    tmp.chmod(0o600)
+    tmp.replace(path)
+
+
+def clear_session_token(state_dir: Path) -> None:
+    """Drop the cached session token. Called once the supervisor
+    switches to mTLS (cert issuance via the future poll loop)."""
+    path = _identity_dir(state_dir) / SESSION_TOKEN_FILENAME
     path.unlink(missing_ok=True)

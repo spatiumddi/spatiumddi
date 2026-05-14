@@ -1,19 +1,31 @@
-"""Phase 8f-2 — slot state + deployment introspection for the heartbeat.
+"""Appliance-host telemetry + trigger-file writers for the supervisor.
 
-The DNS / DHCP agents both report a small ``slot_state`` block on
-every heartbeat so the control plane can populate the Fleet view
-(Phase 8f-5). Same module shape for both agents so the fields stay
-in sync — see ``agent/dhcp/spatium_dhcp_agent/slot_state.py`` for
-the DHCP twin.
+Ported from the DNS / DHCP agents in #170 Wave C1 — appliance-host
+state used to be collected independently by each service agent (DNS
++ DHCP each shipped their own copy of slot_state.py). The supervisor
+now owns this surface; service agents drop the host bind mounts and
+let the supervisor's heartbeat carry the appliance row's telemetry +
+fire the trigger files.
 
-The agent reads from host paths via read-only bind mounts the
-appliance docker-compose drops in (``/etc/spatiumddi-host`` for
-role + version stamps, ``/boot/efi-host/grub/grubenv`` for slot
-status). On non-appliance deploys (plain docker-compose, k8s) the
-mounts don't exist, every read returns None, and the heartbeat
-just carries ``deployment_kind`` — the control plane treats absent
-values as "no slot state to track" and the Fleet view shows the
-row as docker / k8s / unknown without an Upgrade button.
+Module responsibilities:
+
+* **Read** appliance-host state — deployment kind, slot UUID match,
+  grubenv durable default, installed appliance version, last
+  upgrade state from the .state sidecar, snmpd + chrony sync status.
+* **Write** appliance-host trigger files — slot-upgrade pending,
+  reboot pending, snmpd reload, chrony reload. Host-side systemd
+  ``.path`` units (``spatiumddi-slot-upgrade.path`` /
+  ``spatiumddi-reboot-agent.path`` / ``spatiumddi-snmp-reload.path``
+  / ``spatiumddi-chrony-reload.path``) notice the writes and fire
+  the runner scripts.
+
+Reads happen through host bind mounts the supervisor compose entry
+keeps (``/etc/spatiumddi-host`` for role + version, ``/boot/efi-host``
+for grubenv, ``/var/lib/spatiumddi-host/release-state`` for the
+trigger surface, ``/run/udev`` for slot-UUID lookup). On non-
+appliance hosts (dev compose, k8s) the mounts don't exist; every
+read returns ``None`` and every trigger-file write is short-
+circuited by ``detect_deployment_kind()``'s appliance gate.
 """
 
 from __future__ import annotations

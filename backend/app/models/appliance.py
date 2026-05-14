@@ -21,6 +21,7 @@ import uuid
 from datetime import datetime
 from typing import Any
 
+import sqlalchemy as sa
 from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, LargeBinary, String, Text, func
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
@@ -411,6 +412,39 @@ class Appliance(Base):
     rejected_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     rejected_by_user_id: Mapped[uuid.UUID | None] = mapped_column(
         UUID(as_uuid=True), ForeignKey("user.id", ondelete="SET NULL"), nullable=True
+    )
+
+    # Slot telemetry — #170 Wave C1 moves this off dns_server /
+    # dhcp_server (the per-service agents used to report it
+    # independently in #138 Phase 8f-2). The supervisor's heartbeat
+    # is now the single producer; the fleet UI reads these columns
+    # to drive the Upgrade affordance, slot chips, and reboot button.
+    deployment_kind: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    installed_appliance_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    current_slot: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    durable_default: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    is_trial_boot: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa.text("false")
+    )
+    last_upgrade_state: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    last_upgrade_state_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    snmpd_running: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    ntp_sync_state: Mapped[str | None] = mapped_column(String(16), nullable=True)
+
+    # Operator-driven desired state. Set via the fleet UI / API;
+    # supervisor's heartbeat poll picks them up + writes the matching
+    # trigger files on the appliance host. Heartbeat handler auto-
+    # clears once installed catches up (upgrade) or a fresh heartbeat
+    # arrives post-reboot.
+    desired_appliance_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    desired_slot_image_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    reboot_requested: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sa.text("false")
+    )
+    reboot_requested_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
     )
 
     created_at: Mapped[datetime] = mapped_column(

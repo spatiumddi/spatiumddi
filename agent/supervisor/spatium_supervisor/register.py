@@ -38,6 +38,12 @@ class RegisterResult:
     appliance_id: str
     state: str
     public_key_fingerprint: str
+    # Cleartext session token returned by B1's register endpoint.
+    # Re-presented on every /supervisor/poll + /supervisor/heartbeat
+    # call until approval lands the mTLS switch (Wave C2/D). Stored
+    # on disk under ``{state_dir}/identity/session_token`` so a
+    # supervisor restart between register + approve still authenticates.
+    session_token: str
 
 
 class RegisterFatal(Exception):
@@ -100,6 +106,7 @@ def register(
                 appliance_id=body["appliance_id"],
                 state=body["state"],
                 public_key_fingerprint=body["public_key_fingerprint"],
+                session_token=body["session_token"],
             )
         if resp.status_code == 404:
             # Feature flag disabled on the control plane — wait for
