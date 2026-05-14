@@ -474,6 +474,14 @@ class Appliance(Base):
         JSONB, nullable=False, default=dict, server_default=sa.text("'{}'::jsonb")
     )
 
+    # #170 Wave C3 — free-form nftables fragment the supervisor
+    # renders **after** the role-driven block in
+    # /etc/nftables.d/spatium-role.nft. Empty / NULL → role-driven
+    # rules only. Operator typo-rejected via ``nft -c -f`` dry-run
+    # on the supervisor before live-swap; rejection never opens or
+    # closes the firewall mid-render.
+    firewall_extra: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

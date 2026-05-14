@@ -621,6 +621,10 @@ class SupervisorRoleAssignment(BaseModel):
     dhcp_group_id: uuid.UUID | None = None
     dhcp_group_name: str | None = None
     dhcp_network_mode: str | None = None  # host / bridged
+    # #170 Wave C3 — operator-pasted nft fragment rendered after the
+    # role-driven mgmt + per-role blocks. NULL / empty → role-driven
+    # rules only.
+    firewall_extra: str | None = None
 
 
 class SupervisorHeartbeatResponse(BaseModel):
@@ -809,6 +813,7 @@ async def _build_role_assignment(db: DB, row: Appliance) -> SupervisorRoleAssign
         dhcp_group_id=row.assigned_dhcp_group_id,
         dhcp_group_name=dhcp_group_name,
         dhcp_network_mode=dhcp_network_mode,
+        firewall_extra=row.firewall_extra,
     )
 
 
@@ -854,6 +859,8 @@ class ApplianceRow(BaseModel):
     assigned_dns_group_id: uuid.UUID | None
     assigned_dhcp_group_id: uuid.UUID | None
     tags: dict[str, str]
+    # #170 Wave C3 — operator-pasted nft fragment.
+    firewall_extra: str | None
     created_at: datetime
 
 
@@ -904,6 +911,7 @@ def _row_to_schema(row: Appliance) -> ApplianceRow:
         assigned_dns_group_id=row.assigned_dns_group_id,
         assigned_dhcp_group_id=row.assigned_dhcp_group_id,
         tags=dict(row.tags or {}),
+        firewall_extra=row.firewall_extra,
         created_at=row.created_at,
     )
 
@@ -1194,6 +1202,12 @@ class ApplianceRolesUpdate(BaseModel):
     dns_group_id: uuid.UUID | None = None
     dhcp_group_id: uuid.UUID | None = None
     tags: dict[str, str] | None = None
+    # #170 Wave C3 — operator-pasted nft fragment. ``None`` leaves the
+    # current value alone; ``""`` clears it; any other string replaces
+    # it. The supervisor runs ``nft -c -f`` against the rendered
+    # drop-in before live-swap, so a syntactically invalid value
+    # rejects supervisor-side rather than at this endpoint.
+    firewall_extra: str | None = None
 
 
 @router.put(
@@ -1301,6 +1315,11 @@ async def update_appliance_roles(
                     f"Tag {k!r} must be a string; got {type(v).__name__}.",
                 )
         row.tags = dict(body.tags)
+    if body.firewall_extra is not None:
+        # Empty string is meaningful — operator clearing the extra
+        # block. The supervisor renders an empty fragment then; the
+        # role-driven mgmt + per-role rules still ship.
+        row.firewall_extra = body.firewall_extra if body.firewall_extra else None
 
     db.add(
         AuditLog(

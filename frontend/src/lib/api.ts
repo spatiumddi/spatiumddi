@@ -7193,6 +7193,9 @@ export interface ApplianceRow {
   assigned_dns_group_id: string | null;
   assigned_dhcp_group_id: string | null;
   tags: Record<string, string>;
+  // #170 Wave C3 — operator-pasted nft fragment rendered after the
+  // role-driven mgmt + per-role blocks.
+  firewall_extra: string | null;
   created_at: string;
 }
 
@@ -7201,6 +7204,7 @@ export interface ApplianceRolesUpdate {
   dns_group_id?: string | null;
   dhcp_group_id?: string | null;
   tags?: Record<string, string>;
+  firewall_extra?: string | null;
 }
 
 export const applianceApprovalApi = {

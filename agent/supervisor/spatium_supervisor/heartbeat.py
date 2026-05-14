@@ -33,7 +33,9 @@ the supervisor.
 
 from __future__ import annotations
 
+import subprocess
 import uuid
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -41,6 +43,7 @@ import structlog
 
 from . import appliance_state
 from .config import SupervisorConfig
+from .firewall_renderer import FirewallProfile, render_drop_in
 from .identity import Identity
 from .role_orchestrator import compute_target_env, render_env_file
 
@@ -51,6 +54,18 @@ from .role_orchestrator import compute_target_env, render_env_file
 # subprocess piece). C2 ships only the env render; C3 wires the
 # actual ``docker compose up -d`` invocation.
 _ROLE_ENV_FILENAME = "role-compose.env"
+
+# #170 Wave C3 — nftables drop-in path. Lives under /etc/nftables.d
+# (bind-mounted rw on the supervisor compose entry). The host's
+# master /etc/nftables.conf includes everything in that dir under
+# the inet filter table's input chain. Strict appliance-only —
+# skipped on dev / docker / k8s deployments via the same
+# detect_deployment_kind() gate the trigger-file writers use.
+_NFT_DROPIN_PATH = Path("/etc/nftables.d/spatium-role.nft")
+# Per-profile "last applied" sidecar so we don't re-run ``nft -f``
+# every heartbeat when nothing has changed. Lives in the same dir
+# as the drop-in so a host-side audit / backup picks it up too.
+_NFT_LAST_PROFILE_PATH = Path("/etc/nftables.d/spatium-role.profile")
 
 
 def _capabilities_payload() -> dict[str, Any]:
@@ -92,6 +107,100 @@ def _supervisor_version() -> str:
     from . import __version__
 
     return __version__
+
+
+def _maybe_apply_firewall(
+    role_assignment: dict[str, Any] | None,
+    log: structlog.stdlib.BoundLogger,
+) -> None:
+    """Render + atomically swap the supervisor's nftables drop-in.
+
+    Strict appliance-only gate (mirrors the trigger-file writers in
+    ``appliance_state.py``): on docker / k8s / unknown deployments
+    the /etc/nftables.d bind mount may not exist + nft itself may
+    not be installed, so we no-op silently.
+
+    Three short-circuit signals:
+
+    1. ``detect_deployment_kind() != "appliance"`` → log + bail.
+    2. Last-applied profile sidecar matches the freshly-rendered
+       profile body → no-op (most heartbeats land here).
+    3. ``nft -c -f <tmp>`` dry-run fails → log loud + leave the
+       live drop-in untouched. The operator's invalid extra
+       fragment can't put the firewall into a half-rendered state.
+
+    Atomic-rename on success so a crash mid-write doesn't truncate
+    the live file. ``nft -f`` after the rename reloads the master
+    /etc/nftables.conf and picks up the new drop-in.
+    """
+    if appliance_state.detect_deployment_kind() != "appliance":
+        return
+
+    profile: FirewallProfile = render_drop_in(role_assignment)
+    body = profile.body
+
+    # Short-circuit on unchanged body. We compare the live drop-in
+    # file directly rather than caching in-memory because a host-
+    # side intervention (operator manually edited the file) should
+    # cause us to re-apply on the next heartbeat, restoring the
+    # canonical state.
+    try:
+        current_body = _NFT_DROPIN_PATH.read_text(encoding="utf-8")
+    except OSError:
+        current_body = ""
+    if current_body == body:
+        return
+
+    try:
+        _NFT_DROPIN_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = _NFT_DROPIN_PATH.with_suffix(".new")
+        tmp.write_text(body, encoding="utf-8")
+        # Dry-run validate before swap. nft's -c flag means
+        # check-only; -f reads from the file. Returns 0 on parse
+        # success, non-zero with the parse error on stderr.
+        result = subprocess.run(
+            ["nft", "-c", "-f", str(tmp)],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode != 0:
+            log.warning(
+                "supervisor.firewall.dry_run_failed",
+                profile=profile.name,
+                stderr=result.stderr.strip()[:300],
+            )
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            return
+        tmp.replace(_NFT_DROPIN_PATH)
+        # Reload nftables so the master conf picks up the new
+        # drop-in. ``nft -f /etc/nftables.conf`` is the documented
+        # reload path; it's idempotent + atomic on the kernel side
+        # (the netlink commit either lands fully or not at all).
+        reload_result = subprocess.run(
+            ["nft", "-f", "/etc/nftables.conf"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if reload_result.returncode != 0:
+            log.warning(
+                "supervisor.firewall.reload_failed",
+                profile=profile.name,
+                stderr=reload_result.stderr.strip()[:300],
+            )
+            return
+        _NFT_LAST_PROFILE_PATH.write_text(profile.name + "\n", encoding="utf-8")
+        log.info(
+            "supervisor.firewall.applied",
+            profile=profile.name,
+            roles=role_assignment.get("roles") if role_assignment else [],
+        )
+    except (OSError, subprocess.TimeoutExpired, FileNotFoundError) as exc:
+        log.warning("supervisor.firewall.apply_failed", error=str(exc))
 
 
 def heartbeat_once(
@@ -172,6 +281,14 @@ def heartbeat_once(
     # bring services up/down; for now we just write the file so the
     # operator can inspect what the supervisor would do next.
     role_assignment = body_out.get("role_assignment") or {}
+
+    # #170 Wave C3 — render + apply the nftables drop-in *before*
+    # the compose env so the firewall lands before the matching
+    # service container would start (when C3's compose subprocess
+    # lands). Even today, no-op on docker / k8s deployments via the
+    # appliance gate inside _maybe_apply_firewall.
+    _maybe_apply_firewall(role_assignment, log)
+
     target = compute_target_env(role_assignment)
     env_path = cfg.state_dir / _ROLE_ENV_FILENAME
     try:

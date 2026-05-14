@@ -794,6 +794,12 @@ function ApplianceRoleAssignmentSection({ row }: { row: ApplianceRow }) {
   const [dhcpGroupId, setDhcpGroupId] = useState<string | null>(
     row.assigned_dhcp_group_id ?? null,
   );
+  // #170 Wave C3 — operator-pasted nft fragment. Empty string clears
+  // it server-side (the model column flips to NULL); the supervisor's
+  // renderer skips the override block when nothing is set.
+  const [firewallExtra, setFirewallExtra] = useState<string>(
+    row.firewall_extra ?? "",
+  );
 
   const dnsGroupsQuery = useQuery({
     queryKey: ["dns", "groups"],
@@ -812,6 +818,7 @@ function ApplianceRoleAssignmentSection({ row }: { row: ApplianceRow }) {
         roles: Array.from(roles),
         dns_group_id: dnsGroupId,
         dhcp_group_id: dhcpGroupId,
+        firewall_extra: firewallExtra,
       }),
     onSuccess: () => {
       qc.invalidateQueries({ queryKey: ["appliance", "approvals"] });
@@ -840,7 +847,27 @@ function ApplianceRoleAssignmentSection({ row }: { row: ApplianceRow }) {
     JSON.stringify(Array.from(roles).sort()) !==
       JSON.stringify([...initialRoles].sort()) ||
     dnsGroupId !== (row.assigned_dns_group_id ?? null) ||
-    dhcpGroupId !== (row.assigned_dhcp_group_id ?? null);
+    dhcpGroupId !== (row.assigned_dhcp_group_id ?? null) ||
+    firewallExtra !== (row.firewall_extra ?? "");
+
+  // Live preview of the role-derived firewall profile name + opened
+  // service ports. Mirrors the supervisor's firewall_renderer.py
+  // logic so operators see what will actually land on the host.
+  const firewallProfile = (() => {
+    const hasDns = roles.has("dns-bind9") || roles.has("dns-powerdns");
+    const hasDhcp = roles.has("dhcp");
+    if (hasDns && hasDhcp) return "dns-and-dhcp";
+    if (hasDns) return "dns-only";
+    if (hasDhcp) return "dhcp-only";
+    return "idle";
+  })();
+  const firewallOpenPorts: string[] = [];
+  if (roles.has("dns-bind9") || roles.has("dns-powerdns")) {
+    firewallOpenPorts.push("UDP/53", "TCP/53");
+  }
+  if (roles.has("dhcp")) {
+    firewallOpenPorts.push("UDP/67", "UDP/68");
+  }
 
   return (
     <div>
@@ -921,6 +948,53 @@ function ApplianceRoleAssignmentSection({ row }: { row: ApplianceRow }) {
           </select>
         </div>
       )}
+
+      {/* #170 Wave C3 — firewall preview + operator-override textarea.
+          The preview mirrors the supervisor's firewall_renderer.py
+          output for the currently-selected roles so the operator can
+          tell what nft drop-in will land before saving. */}
+      <div className="mt-4 rounded-md border bg-muted/30 p-3">
+        <div className="flex items-center justify-between">
+          <div className="text-xs font-medium">Firewall profile</div>
+          <span className="rounded-full bg-muted px-2 py-0.5 font-mono text-[10px]">
+            {firewallProfile}
+          </span>
+        </div>
+        <p className="mt-1 text-[11px] text-muted-foreground">
+          Always open: <code>tcp/22</code> · <code>icmp echo</code> · loopback.
+          {firewallOpenPorts.length > 0 ? (
+            <>
+              {" "}
+              Per-role:{" "}
+              {firewallOpenPorts.map((p, i) => (
+                <span key={p}>
+                  {i > 0 ? " · " : ""}
+                  <code>{p}</code>
+                </span>
+              ))}
+              .
+            </>
+          ) : (
+            " No per-role ports (idle)."
+          )}
+        </p>
+        <label className="mt-3 block text-xs text-muted-foreground">
+          Operator override (raw nft fragment)
+        </label>
+        <textarea
+          value={firewallExtra}
+          onChange={(e) => setFirewallExtra(e.target.value)}
+          placeholder={`# e.g. allow SNMP from monitoring subnet\n# udp dport 161 ip saddr 10.0.0.0/24 accept`}
+          rows={4}
+          className="mt-1 w-full rounded-md border bg-background px-2 py-1 font-mono text-[11px]"
+        />
+        <p className="mt-1 text-[11px] text-muted-foreground">
+          Appended verbatim after the role-driven block. Supervisor runs{" "}
+          <code>nft -c -f</code> dry-run before live-swap — a syntactically
+          invalid value is rejected on the host without leaving the firewall
+          half-rendered.
+        </p>
+      </div>
 
       <div className="mt-3 flex items-center gap-2">
         <button
