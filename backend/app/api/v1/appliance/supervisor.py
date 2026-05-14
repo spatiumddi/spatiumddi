@@ -605,6 +605,11 @@ class SupervisorHeartbeatRequest(BaseModel):
     # are the ``users`` string from ``ss -p`` (process name / pid).
     # None / omitted = supervisor didn't run the probe this tick.
     port_conflicts: dict[str, str] | None = None
+    # #170 Wave D follow-up — outcome of the supervisor's last
+    # compose-lifecycle apply (``idle`` / ``ready`` / ``failed``).
+    # None on the first heartbeat / before any role assignment.
+    role_switch_state: Literal["idle", "ready", "failed"] | None = None
+    role_switch_reason: str | None = None
 
 
 class SupervisorRoleAssignment(BaseModel):
@@ -646,6 +651,17 @@ class SupervisorHeartbeatResponse(BaseModel):
     desired_appliance_version: str | None = None
     desired_slot_image_url: str | None = None
     reboot_requested: bool = False
+    # #170 Wave D follow-up — supervisor's signed cert + CA chain.
+    # Populated when the appliance has been approved + the supervisor
+    # hasn't picked them up yet. The supervisor saves them to
+    # /var/persist/spatium-supervisor/tls/ + switches its next
+    # heartbeat to cert auth (X-Appliance-Cert + X-Appliance-Signature
+    # + X-Appliance-Timestamp). Same fields the legacy /supervisor/poll
+    # response carried; in-lining them here lets the supervisor stop
+    # polling separately.
+    cert_pem: str | None = None
+    ca_chain_pem: str | None = None
+    cert_expires_at: datetime | None = None
     # #170 Wave C2 — assigned roles + group config. The supervisor
     # uses this to bring up dns-bind9 / dns-powerdns / dhcp-kea
     # service containers via docker compose. Empty roles list = idle
@@ -690,23 +706,52 @@ async def supervisor_heartbeat(
         await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Not found.")
 
-    row = await db.get(Appliance, body.appliance_id)
-    valid = row is not None and (
-        # Approved appliances no longer carry a session_token (B1
-        # clears it on approve). Until mTLS lands they auth by the
-        # same token re-presented from the supervisor's local cache
-        # — but we'll accept any heartbeat from an approved row in
-        # this interim window since the alternative is "no heartbeat
-        # path until C2". B2's role lock-down narrows this back.
-        row.state == APPLIANCE_STATE_APPROVED
-        or (
-            body.session_token is not None
-            and verify_session_token(body.session_token, row.session_token_hash)
-        )
+    # #170 Wave D follow-up — cert auth takes precedence when the
+    # supervisor presents X-Appliance-Cert + X-Appliance-Signature +
+    # X-Appliance-Timestamp headers. The session-token path remains
+    # as the fallback for pending_approval rows (which don't have a
+    # cert yet).
+    from app.services.appliance.cert_auth import (  # noqa: PLC0415
+        CertAuthFailed,
+        authenticate_cert,
     )
-    if not valid:
+
+    cert_principal = None
+    try:
+        cert_principal = await authenticate_cert(request, db)
+    except CertAuthFailed as exc:
         await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid appliance or session.")
+        logger.warning(
+            "supervisor_heartbeat_cert_auth_failed",
+            appliance_id=str(body.appliance_id),
+            reason=exc.reason,
+        )
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid appliance client cert.")
+
+    if cert_principal is not None:
+        # Cert subject CN must match the body's appliance_id (defence-
+        # in-depth: a supervisor with cert for A can't post telemetry
+        # claiming to be B).
+        if cert_principal.appliance.id != body.appliance_id:
+            await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                "Cert subject mismatch.",
+            )
+        row = cert_principal.appliance
+    else:
+        # Session-token fallback for pending_approval rows.
+        row = await db.get(Appliance, body.appliance_id)
+        valid = row is not None and (
+            row.state == APPLIANCE_STATE_APPROVED
+            or (
+                body.session_token is not None
+                and verify_session_token(body.session_token, row.session_token_hash)
+            )
+        )
+        if not valid:
+            await asyncio.sleep(_CONSUME_FAILURE_DELAY_S)
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid appliance or session.")
 
     assert row is not None
 
@@ -742,6 +787,15 @@ async def supervisor_heartbeat(
         # truth. Empty dict explicitly clears prior conflicts; the
         # operator-visible banner stops showing on the next render.
         row.port_conflicts = dict(body.port_conflicts)
+    if body.role_switch_state is not None:
+        row.role_switch_state = body.role_switch_state
+        # ``reason`` is paired with the state — clear it on idle /
+        # ready (the prior failure is moot) so the Fleet UI doesn't
+        # carry stale red text once the operator fixes the cause.
+        if body.role_switch_state == "failed":
+            row.role_switch_reason = body.role_switch_reason
+        else:
+            row.role_switch_reason = None
 
     # Auto-clear desired_appliance_version once installed matches +
     # the upgrade landed cleanly. Same shape as #138 Phase 8f-4's
@@ -777,12 +831,26 @@ async def supervisor_heartbeat(
     # set is itself the idle marker).
     role_assignment = await _build_role_assignment(db, row)
 
+    # #170 Wave D follow-up — include cert + CA chain so the
+    # supervisor picks them up on the heartbeat right after approval
+    # + switches to cert auth on subsequent calls. Always emit them
+    # for approved rows (idempotent on the supervisor side — re-saving
+    # the same bytes is a no-op); pending_approval rows have NULL
+    # cert_pem so the field stays None.
+    ca_chain_pem: str | None = None
+    if row.cert_pem is not None:
+        ca = await ensure_ca(db)
+        ca_chain_pem = ca.cert_pem
+
     return SupervisorHeartbeatResponse(
         appliance_id=row.id,
         state=row.state,  # type: ignore[arg-type]
         desired_appliance_version=row.desired_appliance_version,
         desired_slot_image_url=row.desired_slot_image_url,
         reboot_requested=row.reboot_requested,
+        cert_pem=row.cert_pem,
+        ca_chain_pem=ca_chain_pem,
+        cert_expires_at=row.cert_expires_at,
         role_assignment=role_assignment,
     )
 
@@ -873,6 +941,10 @@ class ApplianceRow(BaseModel):
     firewall_extra: str | None
     # #170 Phase E2 — supervisor-reported host-side port conflicts.
     port_conflicts: dict[str, str]
+    # #170 Wave D follow-up — outcome of the supervisor's last
+    # compose-lifecycle apply.
+    role_switch_state: str | None
+    role_switch_reason: str | None
     created_at: datetime
 
 
@@ -925,6 +997,8 @@ def _row_to_schema(row: Appliance) -> ApplianceRow:
         tags=dict(row.tags or {}),
         firewall_extra=row.firewall_extra,
         port_conflicts=dict(row.port_conflicts or {}),
+        role_switch_state=row.role_switch_state,
+        role_switch_reason=row.role_switch_reason,
         created_at=row.created_at,
     )
 

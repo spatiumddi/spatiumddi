@@ -7201,6 +7201,11 @@ export interface ApplianceRow {
   // ``udp_67``); values are the ss ``users`` string (pid+name when
   // available, else local-address fallback).
   port_conflicts: Record<string, string>;
+  // #170 Wave D follow-up — outcome of the supervisor's last
+  // docker-compose lifecycle apply. ``idle`` / ``ready`` / ``failed``
+  // or null on the first heartbeat / before any role assignment.
+  role_switch_state: string | null;
+  role_switch_reason: string | null;
   created_at: string;
 }
 

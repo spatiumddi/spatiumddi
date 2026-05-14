@@ -494,6 +494,14 @@ class Appliance(Base):
         server_default=sa.text("'{}'::jsonb"),
     )
 
+    # #170 Wave D follow-up — outcome of the supervisor's last
+    # docker-compose apply against the assigned roles. ``idle`` /
+    # ``ready`` / ``failed``. ``role_switch_reason`` carries the
+    # first stderr line on failures so the Fleet UI can render it
+    # in the red banner.
+    role_switch_state: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    role_switch_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), nullable=False
     )

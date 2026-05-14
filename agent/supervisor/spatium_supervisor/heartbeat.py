@@ -42,6 +42,7 @@ import httpx
 import structlog
 
 from . import appliance_state
+from .cert_auth import build_auth_headers, load_cert, save_cert
 from .config import SupervisorConfig
 from .firewall_renderer import FirewallProfile, render_drop_in
 from .identity import Identity
@@ -50,6 +51,7 @@ from .role_orchestrator import (
     probe_port_conflicts,
     render_env_file,
 )
+from .service_lifecycle import apply_role_assignment
 
 
 # #170 Wave C2 — role-driven compose env file. Written under the
@@ -226,16 +228,47 @@ def heartbeat_once(
         "session_token": session_token,
         "capabilities": _capabilities_payload(),
         **state,
-        # #170 Phase E2 — probe UDP/67 every tick. Empty dict
-        # explicitly clears any prior conflict server-side; ``None``
-        # would skip the overwrite, which isn't what we want if the
-        # conflict went away. The probe is cheap (``ss -uln``) so
+        # #170 Phase E2 — probe UDP+TCP/53 + UDP/67 every tick. Empty
+        # dict explicitly clears any prior conflict server-side;
+        # ``None`` would skip the overwrite, which isn't what we want
+        # if the conflict went away. The probe is cheap (``ss``) so
         # running it every heartbeat is fine.
         "port_conflicts": probe_port_conflicts(),
     }
-    url = cfg.control_plane_url.rstrip("/") + "/api/v1/appliance/supervisor/heartbeat"
+    # #170 Wave D follow-up — surface the outcome of the previous
+    # heartbeat's compose-lifecycle apply. Empty / None on the first
+    # heartbeat or before any role assignment has been issued.
+    last_lifecycle_state, last_lifecycle_reason = _read_lifecycle_state(cfg.state_dir)
+    if last_lifecycle_state is not None:
+        body["role_switch_state"] = last_lifecycle_state
+        if last_lifecycle_reason is not None:
+            body["role_switch_reason"] = last_lifecycle_reason
+    url_path = "/api/v1/appliance/supervisor/heartbeat"
+    url = cfg.control_plane_url.rstrip("/") + url_path
+
+    # #170 Wave D follow-up — cert auth supersedes session-token
+    # auth once the cert is on disk. Build the headers + sign with
+    # the supervisor's Ed25519 private key; the backend's
+    # cert_auth.py middleware validates the chain + signature + the
+    # timestamp skew. When no cert yet (pre-approval), fall through
+    # to the session_token body field — same shape as today.
+    cached_cert = load_cert(cfg.state_dir)
+    headers: dict[str, str] = {}
+    if cached_cert is not None:
+        try:
+            headers = build_auth_headers(
+                "POST", url_path, cached_cert, identity.private_key, appliance_id
+            )
+            # Once we have a cert the session token shouldn't ride
+            # along — keeps the wire payload clean + makes server-
+            # side cert-only enforcement straightforward when it
+            # lands.
+            body.pop("session_token", None)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("supervisor.heartbeat.cert_auth_skipped", error=str(exc))
+
     try:
-        resp = client.post(url, json=body, timeout=10.0)
+        resp = client.post(url, json=body, headers=headers, timeout=10.0)
     except httpx.HTTPError as exc:
         log.warning("supervisor.heartbeat.failed", error=str(exc))
         return
@@ -272,6 +305,23 @@ def heartbeat_once(
         log.warning("supervisor.heartbeat.bad_json")
         return
 
+    # #170 Wave D follow-up — pick up cert + CA chain on the first
+    # heartbeat after approval. Subsequent heartbeats include the
+    # same bytes; ``save_cert`` is content-addressed so re-saving
+    # the same body is a disk no-op.
+    cert_pem = body_out.get("cert_pem")
+    ca_chain_pem = body_out.get("ca_chain_pem")
+    if cert_pem and ca_chain_pem:
+        try:
+            save_cert(cfg.state_dir, cert_pem, ca_chain_pem)
+            if cached_cert is None:
+                log.info(
+                    "supervisor.heartbeat.cert_received",
+                    cert_expires_at=body_out.get("cert_expires_at"),
+                )
+        except OSError as exc:
+            log.warning("supervisor.heartbeat.cert_save_failed", error=str(exc))
+
     desired_version = body_out.get("desired_appliance_version")
     desired_url = body_out.get("desired_slot_image_url")
     reboot_requested = bool(body_out.get("reboot_requested"))
@@ -301,11 +351,12 @@ def heartbeat_once(
 
     target = compute_target_env(role_assignment)
     env_path = cfg.state_dir / _ROLE_ENV_FILENAME
+    env_write_failed = False
     try:
         env_path.parent.mkdir(parents=True, exist_ok=True)
         rendered = render_env_file(target)
-        # Atomic write — partial files would confuse C3's compose
-        # subprocess if the supervisor crashed mid-write.
+        # Atomic write — partial files would confuse the compose
+        # subprocess below if the supervisor crashed mid-write.
         tmp = env_path.with_suffix(".tmp")
         tmp.write_text(rendered, encoding="utf-8")
         tmp.replace(env_path)
@@ -315,13 +366,68 @@ def heartbeat_once(
             env_path=str(env_path),
         )
     except OSError as exc:
+        env_write_failed = True
         log.warning(
             "supervisor.heartbeat.role_env_write_failed",
             error=str(exc),
             env_path=str(env_path),
         )
 
+    # #170 Wave D follow-up — actually run ``docker compose`` against
+    # the freshly-written env file so the assigned service container
+    # comes up (or comes down on de-assignment). Best-effort — on
+    # failure we log + carry the failure state up to the control
+    # plane in the next heartbeat's ``role_switch_state``.
+    if not env_write_failed and appliance_state.detect_deployment_kind() == "appliance":
+        lifecycle = apply_role_assignment(target.profiles, env_path)
+        log.info(
+            "supervisor.heartbeat.lifecycle_applied",
+            state=lifecycle.state,
+            reason=lifecycle.reason,
+            started=list(lifecycle.started),
+            stopped=list(lifecycle.stopped),
+        )
+        # The state + reason are returned on the NEXT heartbeat (not
+        # this one — we've already POSTed). Cache them on disk so a
+        # supervisor restart doesn't lose them.
+        _persist_lifecycle_state(cfg.state_dir, lifecycle.state, lifecycle.reason)
+
     # Identity unused in C2's payload but kept on the signature so
     # C2's mTLS upgrade doesn't need to thread it back in. Silence
     # the linter without adding a runtime cost.
     _ = identity
+
+
+_LIFECYCLE_STATE_FILE = "role-switch-state"
+
+
+def _persist_lifecycle_state(
+    state_dir: Path, state: str, reason: str | None
+) -> None:
+    """Write the most recent compose-lifecycle outcome to disk so the
+    NEXT heartbeat reports it (this one has already left)."""
+    path = state_dir / _LIFECYCLE_STATE_FILE
+    payload = state
+    if reason:
+        payload += "\n" + reason
+    try:
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(payload, encoding="utf-8")
+        tmp.replace(path)
+    except OSError:
+        pass
+
+
+def _read_lifecycle_state(state_dir: Path) -> tuple[str | None, str | None]:
+    """Read the last persisted lifecycle outcome. Returns
+    ``(state, reason)`` — both ``None`` when no prior pass."""
+    path = state_dir / _LIFECYCLE_STATE_FILE
+    if not path.exists():
+        return None, None
+    try:
+        body = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None, None
+    state = body[0].strip() if body else None
+    reason = "\n".join(body[1:]).strip() or None if len(body) > 1 else None
+    return state, reason

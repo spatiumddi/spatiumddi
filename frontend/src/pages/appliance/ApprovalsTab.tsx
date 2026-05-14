@@ -1086,6 +1086,11 @@ function ApplianceRoleAssignmentSection({ row }: { row: ApplianceRow }) {
           chosen role would bind. */}
       <PortConflictBanner row={row} roles={roles} />
 
+      {/* #170 Wave D follow-up — outcome of the supervisor's last
+          docker-compose apply. Red banner with stderr-first-line on
+          failure. Green-tinted chip on ready. */}
+      <RoleSwitchStateBanner row={row} />
+
       {/* #170 Wave C3 — firewall preview + operator-override textarea.
           The preview mirrors the supervisor's firewall_renderer.py
           output for the currently-selected roles so the operator can
@@ -1726,6 +1731,49 @@ function PortConflictBanner({
               </li>
             ))}
           </ul>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ── RoleSwitchStateBanner (#170 Wave D follow-up) ───────────────
+
+function RoleSwitchStateBanner({ row }: { row: ApplianceRow }) {
+  const state = row.role_switch_state;
+  // Null / idle = nothing to surface (operator hasn't assigned a
+  // role yet, or the supervisor cleared the state). ``ready`` is the
+  // happy path — a soft green chip; we don't need to shout.
+  if (!state || state === "idle") return null;
+  if (state === "ready") {
+    return (
+      <div className="mt-3 inline-flex items-center gap-2 rounded-full bg-emerald-500/10 px-3 py-1 text-xs text-emerald-700 dark:text-emerald-300">
+        <CheckCircle2 className="h-3.5 w-3.5" />
+        Service containers up — supervisor reports{" "}
+        <code className="font-mono">role_switch_state=ready</code>.
+      </div>
+    );
+  }
+  // ``failed`` — operator needs to know what broke.
+  return (
+    <div className="mt-3 rounded-md border border-rose-500/40 bg-rose-500/10 p-3 text-xs">
+      <div className="flex items-start gap-2">
+        <AlertCircle className="mt-0.5 h-4 w-4 flex-shrink-0 text-rose-700 dark:text-rose-300" />
+        <div>
+          <p className="font-medium text-rose-700 dark:text-rose-300">
+            Service lifecycle apply failed
+          </p>
+          <p className="mt-1 text-muted-foreground">
+            The supervisor's <code>docker compose</code> against the assigned
+            role(s) returned a non-zero exit. The previous container state
+            remains; SSH into the appliance to triage, or fix the underlying
+            cause + the next heartbeat will retry automatically.
+          </p>
+          {row.role_switch_reason && (
+            <p className="mt-2 font-mono text-[11px] text-foreground">
+              {row.role_switch_reason}
+            </p>
+          )}
         </div>
       </div>
     </div>
