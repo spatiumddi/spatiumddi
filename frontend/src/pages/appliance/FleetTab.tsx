@@ -74,6 +74,17 @@ function stateBadge(state: ApplianceState): {
       Icon: ShieldAlert,
     };
   }
+  if (state === "revoked") {
+    // Issue #170 Wave E follow-up — soft-deleted. Visually distinct
+    // from ``rejected`` (which is an admin saying "I don't want this
+    // pairing") via the amber palette; rejected stays rose.
+    return {
+      label: "revoked",
+      className:
+        "bg-amber-500/10 text-amber-700 dark:text-amber-400 border-amber-500/30",
+      Icon: ShieldAlert,
+    };
+  }
   return {
     label: "pending",
     className:
@@ -261,6 +272,45 @@ export function FleetTab() {
       // Refresh the drilldown view if it's open on this row so the
       // operator sees the new serial + expiry immediately.
       if (drilldown && drilldown.id === row.id) setDrilldown(row);
+    },
+  });
+  // Issue #170 Wave E follow-up — re-authorize a revoked appliance.
+  // No password gate (low-risk: just flipping back to approved); the
+  // supervisor's three-strike detector self-clears on the next 200.
+  // The operator may still need to re-fire role assignment to bring
+  // services back up since the revoke teardown ran a ``compose stop``.
+  const reauthorize = useMutation({
+    mutationFn: (id: string) => applianceApprovalApi.reauthorize(id),
+    onSuccess: (row) => {
+      qc.invalidateQueries({ queryKey: ["appliance", "fleet"] });
+      if (drilldown && drilldown.id === row.id) setDrilldown(row);
+    },
+  });
+  const [permanentDeleteTarget, setPermanentDeleteTarget] =
+    useState<ApplianceRow | null>(null);
+  const [permanentDeletePwError, setPermanentDeletePwError] = useState<
+    string | null
+  >(null);
+  const permanentDelete = useMutation({
+    mutationFn: ({ id, password }: { id: string; password: string }) =>
+      applianceApprovalApi.permanentDelete(id, password),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["appliance", "fleet"] });
+      setPermanentDeleteTarget(null);
+      setDrilldown(null);
+      setPermanentDeletePwError(null);
+    },
+    onError: (err: unknown) => {
+      const e = err as {
+        response?: { status?: number; data?: { detail?: string } };
+      };
+      if (e?.response?.status === 403) {
+        setPermanentDeletePwError(
+          e.response.data?.detail || "Current password incorrect.",
+        );
+      } else {
+        setPermanentDeletePwError("Permanent delete failed. Try again.");
+      }
     },
   });
 
@@ -547,6 +597,10 @@ export function FleetTab() {
                           onReject={() => setRejectTarget(row)}
                           onRekey={() => setRekeyTarget(row)}
                           onDelete={() => setDeleteTarget(row)}
+                          onReauthorize={() => reauthorize.mutate(row.id)}
+                          onPermanentDelete={() =>
+                            setPermanentDeleteTarget(row)
+                          }
                         />
                       ))}
                       {others.map((row) => (
@@ -559,6 +613,10 @@ export function FleetTab() {
                           onReject={() => setRejectTarget(row)}
                           onRekey={() => setRekeyTarget(row)}
                           onDelete={() => setDeleteTarget(row)}
+                          onReauthorize={() => reauthorize.mutate(row.id)}
+                          onPermanentDelete={() =>
+                            setPermanentDeleteTarget(row)
+                          }
                         />
                       ))}
                     </tbody>
@@ -618,10 +676,20 @@ export function FleetTab() {
           message={
             <>
               <p className="text-sm">
-                Permanently remove <strong>{deleteTarget.hostname}</strong> from
-                the fleet. The supervisor's mTLS calls will fail (cert chain
-                still valid but no matching DB row); the supervisor falls back
-                to bootstrapping and needs a fresh pairing code to re-join.
+                Soft-delete <strong>{deleteTarget.hostname}</strong>. The row
+                flips to{" "}
+                <span className="rounded bg-amber-500/15 px-1 font-medium text-amber-700 dark:text-amber-400">
+                  revoked
+                </span>{" "}
+                — heartbeats start returning 403, the supervisor's three-strike
+                detector tears down its DNS / DHCP service containers within ~3
+                min, and the chip on the appliance console flips to red.
+              </p>
+              <p className="mt-2 text-sm">
+                The row stays for <strong>30 days</strong> by default — long
+                enough for an operator to <em>Re-authorize</em> if they hit
+                Delete by mistake. <em>Permanently delete</em> from the per-row
+                drilldown ends the row immediately.
               </p>
               <p className="mt-2 text-xs text-muted-foreground">
                 Cert serial:{" "}
@@ -631,10 +699,10 @@ export function FleetTab() {
               </p>
             </>
           }
-          confirmLabel="Delete"
+          confirmLabel="Soft-delete"
           tone="destructive"
           loading={remove.isPending}
-          requireCheckboxLabel={`I understand this permanently removes ${deleteTarget.hostname} and breaks its mTLS chain to the control plane.`}
+          requireCheckboxLabel={`I understand ${deleteTarget.hostname} will stop heartbeating successfully and its service containers will tear down within ~3 minutes.`}
           requirePassword
           passwordError={deletePwError}
           onConfirm={(password) =>
@@ -643,6 +711,47 @@ export function FleetTab() {
           onClose={() => {
             setDeleteTarget(null);
             setDeletePwError(null);
+          }}
+        />
+      )}
+
+      {permanentDeleteTarget && (
+        <ConfirmModal
+          open
+          title="Permanently delete appliance?"
+          message={
+            <>
+              <p className="text-sm">
+                Hard DELETE the{" "}
+                <strong>{permanentDeleteTarget.hostname}</strong> row from the
+                database. <strong>This cannot be undone.</strong> The
+                supervisor's mTLS calls will fail; the supervisor's cached
+                identity will be orphaned until the operator re-pairs against a
+                fresh pairing code.
+              </p>
+              <p className="mt-2 text-xs text-muted-foreground">
+                Cert serial:{" "}
+                <code className="text-foreground">
+                  {permanentDeleteTarget.cert_serial ?? "—"}
+                </code>
+              </p>
+            </>
+          }
+          confirmLabel="Permanently delete"
+          tone="destructive"
+          loading={permanentDelete.isPending}
+          requireCheckboxLabel={`I understand this permanently removes ${permanentDeleteTarget.hostname} and cannot be reversed.`}
+          requirePassword
+          passwordError={permanentDeletePwError}
+          onConfirm={(password) =>
+            permanentDelete.mutate({
+              id: permanentDeleteTarget.id,
+              password: password ?? "",
+            })
+          }
+          onClose={() => {
+            setPermanentDeleteTarget(null);
+            setPermanentDeletePwError(null);
           }}
         />
       )}
@@ -729,6 +838,8 @@ function ApplianceTableRow({
   onReject,
   onRekey,
   onDelete,
+  onReauthorize,
+  onPermanentDelete,
 }: {
   row: ApplianceRow;
   highlight?: boolean;
@@ -738,6 +849,8 @@ function ApplianceTableRow({
   onReject: () => void;
   onRekey: () => void;
   onDelete: () => void;
+  onReauthorize: () => void;
+  onPermanentDelete: () => void;
 }) {
   const badge = stateBadge(row.state);
   const Icon = badge.Icon;
@@ -852,10 +965,32 @@ function ApplianceTableRow({
                 type="button"
                 onClick={onDelete}
                 className="inline-flex items-center gap-1 rounded-md border bg-background px-2 py-1 text-xs hover:bg-muted"
-                title="Permanently remove from the fleet"
+                title="Soft-delete (revoked state) — keeps the row for re-auth / permanent removal"
               >
                 <Trash2 className="h-3 w-3" />
                 Delete
+              </button>
+            </>
+          )}
+          {row.state === "revoked" && (
+            <>
+              <button
+                type="button"
+                onClick={onReauthorize}
+                className="inline-flex items-center gap-1 rounded-md border border-emerald-500/40 bg-emerald-500/10 px-2 py-1 text-xs text-emerald-700 hover:bg-emerald-500/20 dark:text-emerald-300"
+                title="Re-authorize — flip back to approved; supervisor resumes on next heartbeat"
+              >
+                <CheckCircle2 className="h-3 w-3" />
+                Re-authorize
+              </button>
+              <button
+                type="button"
+                onClick={onPermanentDelete}
+                className="inline-flex items-center gap-1 rounded-md border border-rose-500/40 bg-rose-500/10 px-2 py-1 text-xs text-rose-700 hover:bg-rose-500/20 dark:text-rose-300"
+                title="Permanently delete this row — cannot be undone"
+              >
+                <Trash2 className="h-3 w-3" />
+                Permanently delete
               </button>
             </>
           )}

@@ -26,6 +26,7 @@ celery_app = Celery(
         "app.tasks.prune_metrics",
         "app.tasks.prune_multicast_memberships",
         "app.tasks.prune_pairing_codes",
+        "app.tasks.prune_revoked_appliances",
         "app.tasks.trash_purge",
         "app.tasks.ipam_reservation_sweep",
         "app.tasks.dhcp_lease_history_prune",
@@ -376,6 +377,15 @@ celery_app.conf.update(
         "pairing-codes-prune": {
             "task": "app.tasks.prune_pairing_codes.prune_pairing_codes",
             "schedule": schedule(run_every=1800.0),
+        },
+        # Hourly sweep of soft-deleted appliance rows past the
+        # ``platform_settings.appliance_revoked_retention_days``
+        # window (#170 Wave E follow-up). Hourly is plenty — the
+        # retention default is 30 days; an hour of imprecision on
+        # when the row finally drops is invisible to operators.
+        "appliances-prune-revoked": {
+            "task": "app.tasks.prune_revoked_appliances.prune_revoked_appliances",
+            "schedule": schedule(run_every=3600.0),
         },
         # Every 60 s, fire any backup target whose ``next_run_at``
         # is now in the past (issue #117 Phase 1b). The sweep + the

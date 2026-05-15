@@ -299,10 +299,17 @@ class PairingClaim(Base):
 APPLIANCE_STATE_PENDING_APPROVAL = "pending_approval"
 APPLIANCE_STATE_APPROVED = "approved"
 APPLIANCE_STATE_REJECTED = "rejected"
+# #170 Wave E follow-up — soft-delete state. Heartbeats from a
+# ``revoked`` row return 403, which trips the supervisor's three-
+# strike revocation detector and tears down its service containers.
+# Admin can Re-authorize (back to ``approved``) or Permanently
+# delete (hard DELETE).
+APPLIANCE_STATE_REVOKED = "revoked"
 APPLIANCE_STATES = (
     APPLIANCE_STATE_PENDING_APPROVAL,
     APPLIANCE_STATE_APPROVED,
     APPLIANCE_STATE_REJECTED,
+    APPLIANCE_STATE_REVOKED,
 )
 
 
@@ -380,6 +387,12 @@ class Appliance(Base):
     state: Mapped[str] = mapped_column(
         String(32), nullable=False, default=APPLIANCE_STATE_PENDING_APPROVAL
     )
+    # #170 Wave E follow-up — soft-delete timestamp. Set when an
+    # operator hits the Fleet UI's Delete button; the row stays so
+    # an admin can Re-authorize (clear ``revoked_at`` + state back
+    # to ``approved``). A retention cron hard-deletes after
+    # ``platform_settings.appliance_revoked_retention_days``.
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     # Updated by Wave A2+'s supervisor heartbeat path. Stays NULL
     # until the supervisor's first post-register check-in.

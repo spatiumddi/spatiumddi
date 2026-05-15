@@ -59,6 +59,7 @@ from app.core.permissions import require_permission
 from app.models.appliance import (
     APPLIANCE_STATE_APPROVED,
     APPLIANCE_STATE_PENDING_APPROVAL,
+    APPLIANCE_STATE_REVOKED,
     Appliance,
     PairingClaim,
     PairingCode,
@@ -778,6 +779,17 @@ async def supervisor_heartbeat(
             raise HTTPException(status.HTTP_403_FORBIDDEN, "Invalid appliance or session.")
 
     assert row is not None
+    # Issue #170 Wave E follow-up — reject heartbeats from soft-deleted
+    # appliances even when the cert chain still validates. The
+    # supervisor's three-strike detector turns the 403 into local
+    # ``revoked`` state + tears down service containers. Keeps the
+    # cert-auth path simple (still trust the cert) while honouring
+    # the operator's soft-delete intent at the API boundary.
+    if row.state == APPLIANCE_STATE_REVOKED:
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Appliance has been revoked. Re-authorize on the Fleet page to restore.",
+        )
 
     row.last_seen_at = datetime.now(UTC)
     row.last_seen_ip = _client_ip(request)
@@ -954,7 +966,7 @@ class ApplianceRow(BaseModel):
 
     id: uuid.UUID
     hostname: str
-    state: Literal["pending_approval", "approved", "rejected"]
+    state: Literal["pending_approval", "approved", "rejected", "revoked"]
     public_key_fingerprint: str
     supervisor_version: str | None
     capabilities: dict
@@ -1001,6 +1013,9 @@ class ApplianceRow(BaseModel):
     # ``dhcp-kea``); values carry ``{role, status, since,
     # container_id}``.
     role_health: dict[str, dict[str, Any]]
+    # #170 Wave E follow-up — soft-delete timestamp. Non-null on
+    # ``state=revoked`` rows; cleared by re-authorize.
+    revoked_at: datetime | None = None
     created_at: datetime
 
 
@@ -1056,6 +1071,7 @@ def _row_to_schema(row: Appliance) -> ApplianceRow:
         role_switch_state=row.role_switch_state,
         role_switch_reason=row.role_switch_reason,
         role_health=dict(row.role_health or {}),
+        revoked_at=row.revoked_at,
         created_at=row.created_at,
     )
 
@@ -1219,33 +1235,40 @@ class DeleteApplianceRequest(BaseModel):
 
 @router.delete(
     "/appliances/{appliance_id}",
-    status_code=status.HTTP_204_NO_CONTENT,
+    response_model=ApplianceRow,
     dependencies=[Depends(require_permission("admin", "appliance"))],
-    summary="Delete an approved appliance (superadmin + password re-auth)",
+    summary="Soft-delete an appliance (superadmin + password re-auth)",
 )
 async def delete_appliance(
     appliance_id: uuid.UUID,
     body: DeleteApplianceRequest,
     current_user: CurrentUser,
     db: DB,
-) -> None:
-    """Permanently remove an approved appliance from the fleet. The
-    supervisor's next mTLS call will fail (cert chain still valid but
-    no matching DB row); supervisor falls back to bootstrapping +
-    needs a fresh pairing code to re-join.
+) -> ApplianceRow:
+    """Soft-delete an appliance (#170 Wave E follow-up).
 
-    Requires the operator's current password in the request body —
-    a UI mis-click can't drop a fleet row even with the per-row
-    Delete button + checkbox guard, the password check is the final
-    safety valve. ``verify_password`` is constant-time; we leak no
-    timing on the result through the 403."""
+    The row stays — ``state`` flips to ``revoked`` + ``revoked_at``
+    stamped — so heartbeats from that appliance return 403, the
+    supervisor's revocation detector trips, and its DNS/DHCP service
+    containers tear down. An admin can later either
+    ``POST /appliances/{id}/reauthorize`` (flip back to ``approved``
+    + clear ``revoked_at``) or
+    ``POST /appliances/{id}/permanent-delete`` (real DELETE).
+
+    A Celery beat sweep eventually hard-deletes rows whose
+    ``revoked_at`` is older than
+    ``platform_settings.appliance_revoked_retention_days`` (default
+    30, ``0`` disables auto-purge).
+
+    Requires the operator's current password — UI mis-click guard
+    even with the per-row Delete button + checkbox.
+    """
     from app.core.security import verify_password  # noqa: PLC0415
 
     _require_superadmin(current_user)
     if not current_user.hashed_password or not verify_password(
         body.password, current_user.hashed_password
     ):
-        # Audit the failed attempt so a brute-force shows up.
         db.add(
             AuditLog(
                 user_id=current_user.id,
@@ -1266,17 +1289,148 @@ async def delete_appliance(
     row = await db.get(Appliance, appliance_id)
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
+    state_at_delete = row.state
+    row.state = APPLIANCE_STATE_REVOKED
+    row.revoked_at = datetime.now(UTC)
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="appliance.soft_deleted",
+            resource_type="appliance",
+            resource_id=str(appliance_id),
+            resource_display=row.hostname,
+            result="success",
+            new_value={
+                "state_at_delete": state_at_delete,
+                "revoked_at": row.revoked_at.isoformat(),
+            },
+        )
+    )
+    await db.commit()
+    await db.refresh(row)
+    logger.info(
+        "appliance_soft_deleted",
+        appliance_id=str(appliance_id),
+        hostname=row.hostname,
+        user=current_user.username,
+    )
+    return _row_to_schema(row)
+
+
+@router.post(
+    "/appliances/{appliance_id}/reauthorize",
+    response_model=ApplianceRow,
+    dependencies=[Depends(require_permission("admin", "appliance"))],
+    summary="Re-authorize a revoked appliance (superadmin)",
+)
+async def reauthorize_appliance(
+    appliance_id: uuid.UUID,
+    current_user: CurrentUser,
+    db: DB,
+) -> ApplianceRow:
+    """Lift a soft-delete: clear ``revoked_at`` and put the appliance
+    back in ``approved``. The supervisor's three-strike detector will
+    self-clear on the next 200 heartbeat — but bringing service
+    containers BACK up requires the operator to re-fire the role
+    assignment (the supervisor's revoke-teardown ran a ``compose stop``;
+    a fresh role-assignment apply re-runs ``up -d``).
+    """
+    _require_superadmin(current_user)
+    row = await db.get(Appliance, appliance_id)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
+    if row.state != APPLIANCE_STATE_REVOKED:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"Appliance is in state {row.state!r}; only revoked rows can be re-authorized.",
+        )
+    row.state = APPLIANCE_STATE_APPROVED
+    row.revoked_at = None
+    db.add(
+        AuditLog(
+            user_id=current_user.id,
+            user_display_name=current_user.display_name,
+            auth_source=current_user.auth_source,
+            action="appliance.reauthorized",
+            resource_type="appliance",
+            resource_id=str(appliance_id),
+            resource_display=row.hostname,
+            result="success",
+        )
+    )
+    await db.commit()
+    await db.refresh(row)
+    logger.info(
+        "appliance_reauthorized",
+        appliance_id=str(appliance_id),
+        hostname=row.hostname,
+        user=current_user.username,
+    )
+    return _row_to_schema(row)
+
+
+@router.post(
+    "/appliances/{appliance_id}/permanent-delete",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=[Depends(require_permission("admin", "appliance"))],
+    summary="Permanently delete an appliance row (superadmin + password)",
+)
+async def permanent_delete_appliance(
+    appliance_id: uuid.UUID,
+    body: DeleteApplianceRequest,
+    current_user: CurrentUser,
+    db: DB,
+) -> None:
+    """Hard DELETE the appliance row. Same password gate as the soft
+    delete + an explicit state check: the row must already be
+    ``revoked`` (operator went through soft-delete first). This is
+    the recovery path for after-the-fact "yes I'm sure" + the action
+    invoked by the retention sweep when ``revoked_at`` is older than
+    the retention window.
+    """
+    from app.core.security import verify_password  # noqa: PLC0415
+
+    _require_superadmin(current_user)
+    if not current_user.hashed_password or not verify_password(
+        body.password, current_user.hashed_password
+    ):
+        db.add(
+            AuditLog(
+                user_id=current_user.id,
+                user_display_name=current_user.display_name,
+                auth_source=current_user.auth_source,
+                action="appliance.permanent_delete_denied",
+                resource_type="appliance",
+                resource_id=str(appliance_id),
+                result="denied",
+                error_message="bad_password",
+            )
+        )
+        await db.commit()
+        raise HTTPException(
+            status.HTTP_403_FORBIDDEN,
+            "Current password incorrect.",
+        )
+    row = await db.get(Appliance, appliance_id)
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Appliance not found.")
+    if row.state != APPLIANCE_STATE_REVOKED:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "Permanent delete is only allowed on revoked appliances; soft-delete first.",
+        )
     hostname = row.hostname
     fingerprint = row.public_key_fingerprint
     cert_serial = row.cert_serial
-    state_at_delete = row.state
     await db.delete(row)
     db.add(
         AuditLog(
             user_id=current_user.id,
             user_display_name=current_user.display_name,
             auth_source=current_user.auth_source,
-            action="appliance.deleted",
+            action="appliance.permanently_deleted",
             resource_type="appliance",
             resource_id=str(appliance_id),
             resource_display=hostname,
@@ -1284,13 +1438,12 @@ async def delete_appliance(
             new_value={
                 "fingerprint": fingerprint,
                 "cert_serial": cert_serial,
-                "state_at_delete": state_at_delete,
             },
         )
     )
     await db.commit()
     logger.info(
-        "appliance_deleted",
+        "appliance_permanently_deleted",
         appliance_id=str(appliance_id),
         hostname=hostname,
         user=current_user.username,

@@ -7235,7 +7235,15 @@ export const appliancePairingApi = {
 // submitted Ed25519 pubkey + the supervisor picks the cert up on its
 // next /supervisor/poll. Reject = delete the row + the supervisor
 // falls back to bootstrapping.
-export type ApplianceState = "pending_approval" | "approved" | "rejected";
+export type ApplianceState =
+  | "pending_approval"
+  | "approved"
+  | "rejected"
+  // Issue #170 Wave E follow-up — soft-deleted. Heartbeats return
+  // 403, the supervisor flips to local revoked + tears down its
+  // service containers. Admin can Re-authorize (back to ``approved``)
+  // or Permanently delete (hard DELETE).
+  | "revoked";
 
 export interface SupervisorCapabilities {
   can_run_dns_bind9?: boolean;
@@ -7318,6 +7326,9 @@ export interface ApplianceRow {
       container_id: string | null;
     }
   >;
+  // Issue #170 Wave E follow-up — soft-delete timestamp. Non-null on
+  // ``state=revoked`` rows; cleared by re-authorize.
+  revoked_at: string | null;
   created_at: string;
 }
 
@@ -7342,10 +7353,24 @@ export const applianceApprovalApi = {
       .then((r) => r.data),
   reject: (id: string) =>
     api.post<void>(`/appliance/appliances/${id}/reject`).then((r) => r.data),
+  // Issue #170 Wave E follow-up — soft-delete. Row flips to
+  // ``state=revoked`` + ``revoked_at`` stamped; heartbeats return 403,
+  // supervisor tears down its service containers, but the row stays
+  // for an admin to either Re-authorize or Permanently delete.
   remove: (id: string, password: string) =>
     api
-      .delete<void>(`/appliance/appliances/${id}`, {
+      .delete<ApplianceRow>(`/appliance/appliances/${id}`, {
         data: { password },
+      })
+      .then((r) => r.data),
+  reauthorize: (id: string) =>
+    api
+      .post<ApplianceRow>(`/appliance/appliances/${id}/reauthorize`)
+      .then((r) => r.data),
+  permanentDelete: (id: string, password: string) =>
+    api
+      .post<void>(`/appliance/appliances/${id}/permanent-delete`, {
+        password,
       })
       .then((r) => r.data),
   rekey: (id: string) =>
