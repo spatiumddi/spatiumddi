@@ -663,7 +663,12 @@ def render_header(state: "DashboardState", mono_t: float) -> Panel:
 
 
 def render_services(role: str, ps_rows: list[dict]) -> Panel:
-    expected = ROLE_SERVICES.get(role, ROLE_SERVICES["control"])
+    # ``dict.get(k, default)`` evaluates ``default`` eagerly. The
+    # previous ``ROLE_SERVICES["control"]`` fallback was an orphan
+    # from the pre-#170 5-role world and raised ``KeyError`` on every
+    # render — *before* ``get`` could return a hit on a valid role
+    # — so the dashboard crash-looped on every appliance.
+    expected = ROLE_SERVICES.get(role, ROLE_SERVICES["full-stack"])
     # Index ps by compose-service name.
     by_service: dict[str, dict] = {}
     for r in ps_rows:
@@ -1220,7 +1225,7 @@ def main() -> int:
     signal.signal(signal.SIGHUP, signal.SIG_IGN)
 
     env = read_env() if not args.dev else {
-        "APPLIANCE_ROLE": "control",
+        "APPLIANCE_ROLE": "full-stack",
         "APPLIANCE_HOSTNAME": "ddi-dev-01",
         "APPLIANCE_VERSION": "0.1.0-dev",
         "SPATIUMDDI_VERSION": "dev",
