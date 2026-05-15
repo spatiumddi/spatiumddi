@@ -436,6 +436,243 @@ async def test_rfc1918_supernet_auto_created(db_session: AsyncSession) -> None:
 
 
 @pytest.mark.asyncio
+async def test_match_by_cidr_reuses_operator_subnet(
+    db_session: AsyncSession,
+) -> None:
+    """Issue #177: a pre-existing operator subnet at the exact CIDR
+    that Proxmox would otherwise auto-create must be reused — not
+    duplicated. The operator's name / description / block linkage are
+    preserved, ownership stays NULL, and addresses still mirror into
+    the reused subnet.
+    """
+    space = await _make_space(db_session)
+    parent = await _make_block(db_session, space, "10.0.0.0/8")
+    node = await _make_node(db_session, space)
+    # Operator pre-creates 10.1.40.0/24 with their own naming.
+    operator_sub = Subnet(
+        space_id=space.id,
+        block_id=parent.id,
+        network="10.1.40.0/24",
+        name="lab-vlan40",
+        description="manually curated",
+        gateway="10.1.40.1",
+        total_ips=254,
+    )
+    db_session.add(operator_sub)
+    await db_session.commit()
+
+    # Proxmox advertises VLAN40 as an SDN VNet at the same CIDR; PVE's
+    # host has a vmbr0 on 192.168.0.0/24 that's unrelated.
+    vm = _ProxmoxGuest(
+        node="pve01",
+        vmid=100,
+        name="vm-100",
+        kind="qemu",
+        status="running",
+        agent_enabled=True,
+        nics=[
+            _ProxmoxNicDef(
+                slot="net0",
+                mac="BC:24:11:E8:4A:3F",
+                bridge="VLAN40",
+                vlan_tag=None,
+                static_cidr=None,
+            )
+        ],
+        runtime_ips_by_mac={"bc:24:11:e8:4a:3f": ["10.1.40.50"]},
+    )
+    fake = _FakeClient(
+        networks={
+            "pve01": [
+                _ProxmoxNetworkIface(
+                    node="pve01",
+                    iface="vmbr0",
+                    iface_type="bridge",
+                    cidr="192.168.0.10/24",
+                    active=True,
+                )
+            ]
+        },
+        sdn_subnets=[
+            _ProxmoxSDNSubnet(
+                vnet="VLAN40",
+                zone="dc1",
+                cidr="10.1.40.0/24",
+                gateway="10.1.40.1",
+                snat=False,
+                alias=None,
+            )
+        ],
+        qemu={"pve01": [vm]},
+    )
+    with _patch_client(fake):
+        summary = await reconcile_node(db_session, node)
+
+    assert summary.ok, summary.error
+    assert summary.subnets_matched == 1
+
+    # Exactly one subnet at 10.1.40.0/24 — no duplicate.
+    rows = (
+        (
+            await db_session.execute(
+                select(Subnet).where(Subnet.space_id == space.id, Subnet.network == "10.1.40.0/24")
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(rows) == 1
+    only = rows[0]
+    # Operator's row untouched: ownership stays NULL, name + description
+    # + gateway + block linkage preserved.
+    assert only.id == operator_sub.id
+    assert only.proxmox_node_id is None
+    assert only.name == "lab-vlan40"
+    assert only.description == "manually curated"
+    assert str(only.gateway) == "10.1.40.1"
+    assert only.block_id == parent.id
+
+    # The VM's IP still lands in the reused subnet.
+    ip = (
+        await db_session.execute(
+            select(IPAddress).where(
+                IPAddress.proxmox_node_id == node.id,
+                IPAddress.status == "proxmox-vm",
+            )
+        )
+    ).scalar_one()
+    assert str(ip.address) == "10.1.40.50"
+    assert ip.subnet_id == operator_sub.id
+
+
+@pytest.mark.asyncio
+async def test_match_by_cidr_is_idempotent(
+    db_session: AsyncSession,
+) -> None:
+    """Two consecutive reconciles against an operator subnet match
+    must report ``subnets_matched=1`` each time and never create the
+    duplicate row, even though the first pass left the operator
+    subnet unowned (so the node-owned query still returns nothing
+    on pass two).
+    """
+    space = await _make_space(db_session)
+    parent = await _make_block(db_session, space, "10.0.0.0/8")
+    node = await _make_node(db_session, space)
+    operator_sub = Subnet(
+        space_id=space.id,
+        block_id=parent.id,
+        network="10.1.40.0/24",
+        name="lab-vlan40",
+        total_ips=254,
+    )
+    db_session.add(operator_sub)
+    await db_session.commit()
+
+    fake = _FakeClient(
+        sdn_subnets=[
+            _ProxmoxSDNSubnet(
+                vnet="VLAN40",
+                zone="dc1",
+                cidr="10.1.40.0/24",
+                gateway=None,
+                snat=False,
+                alias=None,
+            )
+        ],
+    )
+    with _patch_client(fake):
+        first = await reconcile_node(db_session, node)
+    with _patch_client(fake):
+        second = await reconcile_node(db_session, node)
+
+    assert first.ok and second.ok
+    assert first.subnets_matched == 1
+    assert second.subnets_matched == 1
+    assert first.subnets_created == 0
+    assert second.subnets_created == 0
+
+    rows = (
+        (
+            await db_session.execute(
+                select(Subnet).where(Subnet.space_id == space.id, Subnet.network == "10.1.40.0/24")
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_match_by_cidr_skips_foreign_integration_subnet(
+    db_session: AsyncSession,
+) -> None:
+    """A subnet owned by a different integration (e.g. Kubernetes
+    pod CIDR) at the desired CIDR must NOT be duplicated. A warning
+    surfaces in ``summary.warnings`` so the operator can resolve the
+    overlap deliberately.
+    """
+    from app.models.kubernetes import KubernetesCluster  # noqa: PLC0415
+
+    space = await _make_space(db_session)
+    block = await _make_block(db_session, space, "10.0.0.0/8")
+    node = await _make_node(db_session, space)
+    # Stand up a fake k8s cluster + a pod-CIDR subnet at 10.1.40.0/24.
+    cluster = KubernetesCluster(
+        name="k8s-test",
+        api_server_url="https://k8s.example.test",
+        ipam_space_id=space.id,
+        token_encrypted=b"",
+    )
+    db_session.add(cluster)
+    await db_session.flush()
+    foreign_sub = Subnet(
+        space_id=space.id,
+        block_id=block.id,
+        network="10.1.40.0/24",
+        name="pod-cidr",
+        total_ips=254,
+        kubernetes_cluster_id=cluster.id,
+        kubernetes_semantics=True,
+    )
+    db_session.add(foreign_sub)
+    await db_session.commit()
+
+    fake = _FakeClient(
+        sdn_subnets=[
+            _ProxmoxSDNSubnet(
+                vnet="VLAN40",
+                zone="dc1",
+                cidr="10.1.40.0/24",
+                gateway=None,
+                snat=False,
+                alias=None,
+            )
+        ],
+    )
+    with _patch_client(fake):
+        summary = await reconcile_node(db_session, node)
+
+    assert summary.ok
+    assert summary.subnets_created == 0
+    assert summary.subnets_matched == 0
+    assert any("another integration" in w for w in summary.warnings)
+
+    # Exactly one subnet at the CIDR — the original foreign one.
+    rows = (
+        (
+            await db_session.execute(
+                select(Subnet).where(Subnet.space_id == space.id, Subnet.network == "10.1.40.0/24")
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(rows) == 1
+    assert rows[0].kubernetes_cluster_id == cluster.id
+
+
+@pytest.mark.asyncio
 async def test_vm_nic_with_runtime_ip_creates_proxmox_vm_row(
     db_session: AsyncSession,
 ) -> None:
