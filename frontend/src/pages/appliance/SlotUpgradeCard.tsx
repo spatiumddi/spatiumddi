@@ -346,7 +346,7 @@ export function SlotUpgradeCard() {
           <>
             <label className="text-xs font-medium">
               <div className="flex items-center justify-between gap-2">
-                <span>Slot image URL or local path</span>
+                <span>Upgrade image URL or local path</span>
                 <button
                   type="button"
                   className="text-xs font-normal text-muted-foreground underline-offset-2 hover:underline"
@@ -479,7 +479,7 @@ export function SlotUpgradeCard() {
         message={
           <div className="space-y-2">
             <p>
-              This streams the slot image into{" "}
+              This streams the upgrade image into{" "}
               <code className="rounded bg-muted px-1 font-mono">
                 {inactiveSlot ?? "—"}
               </code>{" "}

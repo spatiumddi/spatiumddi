@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertCircle,
+  Ban,
   CheckCircle2,
   HardDrive,
   KeyRound,
@@ -371,7 +372,7 @@ export function FleetTab() {
         },
         {
           key: "slot-images",
-          label: "Slot images",
+          label: "Upgrade images",
           summary: "Air-gap .raw.xz upload + browse.",
         },
       ],
@@ -456,9 +457,9 @@ export function FleetTab() {
 
           {view === "slot-images" && (
             <div>
-              <h2 className="mb-1 text-base font-semibold">Slot images</h2>
+              <h2 className="mb-1 text-base font-semibold">Upgrade images</h2>
               <p className="mb-4 text-xs text-muted-foreground">
-                Air-gap support — upload <code>.raw.xz</code> slot images for
+                Air-gap support — upload <code>.raw.xz</code> upgrade images for
                 offline appliance upgrades. The supervisor downloads through the
                 control plane via an authenticated internal URL once an OS
                 upgrade points at the uploaded row.
@@ -672,12 +673,12 @@ export function FleetTab() {
       {deleteTarget && (
         <ConfirmModal
           open
-          title="Delete appliance?"
+          title="Revoke appliance?"
           message={
             <>
               <p className="text-sm">
-                Soft-delete <strong>{deleteTarget.hostname}</strong>. The row
-                flips to{" "}
+                Revoke <strong>{deleteTarget.hostname}</strong>. The row flips
+                to{" "}
                 <span className="rounded bg-amber-500/15 px-1 font-medium text-amber-700 dark:text-amber-400">
                   revoked
                 </span>{" "}
@@ -687,9 +688,9 @@ export function FleetTab() {
               </p>
               <p className="mt-2 text-sm">
                 The row stays for <strong>30 days</strong> by default — long
-                enough for an operator to <em>Re-authorize</em> if they hit
-                Delete by mistake. <em>Permanently delete</em> from the per-row
-                drilldown ends the row immediately.
+                enough for an operator to <em>Re-authorize</em> if they revoked
+                by mistake. The <em>Delete</em> button appears on revoked rows
+                for permanent removal.
               </p>
               <p className="mt-2 text-xs text-muted-foreground">
                 Cert serial:{" "}
@@ -699,7 +700,7 @@ export function FleetTab() {
               </p>
             </>
           }
-          confirmLabel="Soft-delete"
+          confirmLabel="Revoke"
           tone="destructive"
           loading={remove.isPending}
           requireCheckboxLabel={`I understand ${deleteTarget.hostname} will stop heartbeating successfully and its service containers will tear down within ~3 minutes.`}
@@ -718,7 +719,7 @@ export function FleetTab() {
       {permanentDeleteTarget && (
         <ConfirmModal
           open
-          title="Permanently delete appliance?"
+          title="Delete appliance?"
           message={
             <>
               <p className="text-sm">
@@ -737,7 +738,7 @@ export function FleetTab() {
               </p>
             </>
           }
-          confirmLabel="Permanently delete"
+          confirmLabel="Delete"
           tone="destructive"
           loading={permanentDelete.isPending}
           requireCheckboxLabel={`I understand this permanently removes ${permanentDeleteTarget.hostname} and cannot be reversed.`}
@@ -964,11 +965,11 @@ function ApplianceTableRow({
               <button
                 type="button"
                 onClick={onDelete}
-                className="inline-flex items-center gap-1 rounded-md border bg-background px-2 py-1 text-xs hover:bg-muted"
-                title="Soft-delete (revoked state) — keeps the row for re-auth / permanent removal"
+                className="inline-flex items-center gap-1 rounded-md border border-amber-500/40 bg-amber-500/10 px-2 py-1 text-xs text-amber-700 hover:bg-amber-500/20 dark:text-amber-400"
+                title="Revoke — flip to revoked state, supervisor tears down service containers. Re-authorize on the same row to recover."
               >
-                <Trash2 className="h-3 w-3" />
-                Delete
+                <Ban className="h-3 w-3" />
+                Revoke
               </button>
             </>
           )}
@@ -990,7 +991,7 @@ function ApplianceTableRow({
                 title="Permanently delete this row — cannot be undone"
               >
                 <Trash2 className="h-3 w-3" />
-                Permanently delete
+                Delete
               </button>
             </>
           )}
@@ -1868,8 +1869,8 @@ function ApplianceOsUpgradeSection({ row }: { row: ApplianceRow }) {
               </select>
               {uploadedQuery.data && uploadedQuery.data.length === 0 && (
                 <p className="text-[11px] text-muted-foreground">
-                  No slot images uploaded yet. Open the &ldquo;Slot image
-                  uploads&rdquo; section above to upload one.
+                  No upgrade images uploaded yet. Open the &ldquo;Upgrade
+                  images&rdquo; section above to upload one.
                 </p>
               )}
               <input
@@ -2127,7 +2128,7 @@ function SlotImageManager() {
           <Loader2 className="h-3.5 w-3.5 animate-spin" /> Loading…
         </div>
       ) : (imagesQuery.data ?? []).length === 0 ? (
-        <p className="text-muted-foreground">No uploaded slot images yet.</p>
+        <p className="text-muted-foreground">No uploaded upgrade images yet.</p>
       ) : (
         <table className="w-full">
           <thead className="text-[10px] uppercase tracking-wide text-muted-foreground">
@@ -2178,7 +2179,7 @@ function SlotImageManager() {
       {deleteTarget && (
         <ConfirmModal
           open
-          title="Delete slot image?"
+          title="Delete upgrade image?"
           message={
             <>
               <p className="text-sm">
