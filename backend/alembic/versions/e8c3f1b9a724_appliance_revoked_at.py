@@ -39,6 +39,17 @@ def upgrade() -> None:
             nullable=True,
         ),
     )
+    # Existing ``appliance_state_chk`` from a4f9c2e8b316 pinned state
+    # to ``{pending_approval, approved, rejected}`` — adding ``revoked``
+    # without updating the constraint causes the soft-delete UPDATE to
+    # fail with a CheckViolationError. Drop + recreate with the wider
+    # value set so the soft-delete flow lands cleanly.
+    op.drop_constraint("appliance_state_chk", "appliance", type_="check")
+    op.create_check_constraint(
+        "appliance_state_chk",
+        "appliance",
+        "state IN ('pending_approval', 'approved', 'rejected', 'revoked')",
+    )
     op.add_column(
         "platform_settings",
         sa.Column(
@@ -52,4 +63,10 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     op.drop_column("platform_settings", "appliance_revoked_retention_days")
+    op.drop_constraint("appliance_state_chk", "appliance", type_="check")
+    op.create_check_constraint(
+        "appliance_state_chk",
+        "appliance",
+        "state IN ('pending_approval', 'approved', 'rejected')",
+    )
     op.drop_column("appliance", "revoked_at")
