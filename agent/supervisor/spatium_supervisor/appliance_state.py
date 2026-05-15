@@ -322,9 +322,7 @@ def maybe_fire_reboot(reboot_requested: bool) -> bool:
         # One-line marker — the host runner doesn't actually need any
         # payload, just the path-changed event. Stamp + UTC time so
         # the operator can debug from /var/log/spatiumddi if needed.
-        tmp.write_text(
-            datetime.utcnow().isoformat() + "Z\n", encoding="utf-8"
-        )
+        tmp.write_text(datetime.utcnow().isoformat() + "Z\n", encoding="utf-8")
         tmp.replace(_REBOOT_TRIGGER_FILE)
         return True
     except OSError:

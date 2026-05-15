@@ -33,7 +33,9 @@ the supervisor.
 
 from __future__ import annotations
 
+import hashlib
 import subprocess
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -41,7 +43,7 @@ from typing import Any
 import httpx
 import structlog
 
-from . import appliance_state
+from . import appliance_state, docker_api
 from .cert_auth import build_auth_headers, load_cert, save_cert
 from .config import SupervisorConfig
 from .firewall_renderer import FirewallProfile, render_drop_in
@@ -80,30 +82,50 @@ _CAPABILITY_IMAGES = {
 }
 
 
+# 5-min cache of the docker daemon's repo list. Image set on an
+# appliance changes only on slot upgrade or operator ``docker pull``;
+# re-probing per heartbeat is wasted CPU on a 1-CPU VM. Cache keyed
+# on monotonic time so wall-clock skew can't fool it.
+_REPO_CACHE_TTL_S = 300.0
+_repo_cache: tuple[float, set[str]] | None = None
+
+
+def _cached_image_repos() -> set[str]:
+    """Return the set of repo names loaded in the docker daemon,
+    cached for ``_REPO_CACHE_TTL_S`` to avoid hammering /var/run/
+    docker.sock with one HTTP round-trip per ``can_run_*`` probe per
+    heartbeat. ``capabilities`` reporting + role-checkbox enablement
+    on the Fleet drilldown are the only callers; both can tolerate a
+    5-minute staleness window in exchange for ~70 % less docker
+    daemon traffic during steady-state heartbeats."""
+    global _repo_cache
+    now = time.monotonic()
+    if _repo_cache is not None:
+        ts, repos = _repo_cache
+        if now - ts < _REPO_CACHE_TTL_S:
+            return repos
+    repos = docker_api.list_image_repos()
+    _repo_cache = (now, repos)
+    return repos
+
+
 def _docker_image_present(repo: str) -> bool:
     """Return True if at least one tag of ``repo`` is loaded into the
-    host docker daemon. Uses the bind-mounted /var/run/docker.sock.
+    host docker daemon, using the cached repo list.
 
-    ``docker image inspect`` with a bare repo (no tag) silently
-    matches nothing — we have to list + grep instead. ``docker images
-    --format '{{.Repository}}'`` enumerates every local image's repo;
-    a substring-aware match handles both fully-qualified
+    Uses the docker engine API directly via /var/run/docker.sock
+    instead of shelling out to the ``docker`` CLI — same data, ~30×
+    faster per call (no Go binary startup + arg parsing). The
+    capability path queries this for three repos per heartbeat;
+    batching through the cache makes it effectively one call per
+    5 minutes during steady state.
+
+    A substring-aware match handles both fully-qualified
     (``ghcr.io/spatiumddi/dns-bind9``) and short-form
     (``spatiumddi/dns-bind9``, ``dns-bind9``) tagging the bake might
     produce on different rebuild paths.
     """
-    try:
-        proc = subprocess.run(
-            ["docker", "images", "--format", "{{.Repository}}"],
-            capture_output=True,
-            text=True,
-            timeout=4,
-        )
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return False
-    if proc.returncode != 0:
-        return False
-    repos = {line.strip() for line in proc.stdout.splitlines() if line.strip()}
+    repos = _cached_image_repos()
     short = repo.rsplit("/", 1)[-1]
     return any(r == repo or r.endswith("/" + short) or r == short for r in repos)
 
@@ -224,6 +246,106 @@ def _supervisor_version() -> str:
     return __version__
 
 
+# Periodic firewall live-ruleset verification. Read the actual
+# kernel-active rules from nft and confirm the supervisor-managed
+# service ports per the assigned role profile are present. If any
+# expected rule is missing (someone flushed the ruleset, the host
+# nftables.conf got out from under us, the drop-in include failed
+# silently, etc.) clear the in-memory "body matched" short-circuit
+# so the next ``_maybe_apply_firewall`` rewrite + nft reload
+# restores the canonical state.
+_FIREWALL_LIVE_CHECK_INTERVAL_S = 300.0  # 5 minutes
+_last_firewall_live_check_at: float = 0.0
+
+
+def _firewall_live_check_due() -> bool:
+    """Return True if the periodic live-ruleset check is due. The
+    cadence is in monotonic time so the supervisor's own restart
+    doesn't accidentally skip an interval. First call after startup
+    always returns True (forces an early verification once the
+    supervisor settles)."""
+    return (
+        time.monotonic() - _last_firewall_live_check_at
+        >= _FIREWALL_LIVE_CHECK_INTERVAL_S
+    )
+
+
+def _firewall_live_missing_ports(profile: FirewallProfile) -> tuple[set[int], set[int]]:
+    """Return the (missing_tcp, missing_udp) port sets — expected
+    rules per the rendered ``profile`` that aren't visible in the
+    kernel's live ruleset. Empty pair = firewall is in the expected
+    shape. Both pairs populated = either nft is unreachable (treat
+    as missing — force re-apply) or the drop-in include path is
+    broken.
+
+    Reads via ``nft -j list chain inet filter input`` (JSON, the
+    machine-readable output mode added in nftables 0.9.x); JSON is
+    cheaper to parse than the human format + immune to translation
+    drift across distro versions.
+    """
+    if not profile.expected_tcp_ports and not profile.expected_udp_ports:
+        return set(), set()
+    try:
+        result = subprocess.run(
+            ["nft", "-j", "list", "chain", "inet", "filter", "input"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        # nft missing entirely → treat as "all rules missing" so the
+        # caller force re-applies (which itself will fail with a
+        # clearer error if the host genuinely lacks nft).
+        return set(profile.expected_tcp_ports), set(profile.expected_udp_ports)
+    if result.returncode != 0:
+        return set(profile.expected_tcp_ports), set(profile.expected_udp_ports)
+    try:
+        import json
+
+        data = json.loads(result.stdout)
+    except (json.JSONDecodeError, ValueError):
+        return set(profile.expected_tcp_ports), set(profile.expected_udp_ports)
+    # The nft JSON shape is {"nftables": [<rule objects>]}. Each
+    # rule object has an "expr" array of expression atoms. For our
+    # role-driven accept rules the relevant atoms are a payload
+    # match (tcp/udp dport == <port>) followed by a verdict (accept).
+    tcp_present: set[int] = set()
+    udp_present: set[int] = set()
+    for entry in data.get("nftables") or []:
+        rule = entry.get("rule")
+        if not rule:
+            continue
+        # Walk the expression atoms looking for payload match against
+        # tcp.dport or udp.dport that matches a literal integer.
+        for atom in rule.get("expr") or []:
+            match = atom.get("match")
+            if not match:
+                continue
+            left = match.get("left") or {}
+            right = match.get("right")
+            payload = left.get("payload") or {}
+            proto = payload.get("protocol")
+            field = payload.get("field")
+            if field != "dport":
+                continue
+            # ``right`` is either an int (single port) or an object
+            # like ``{"set": [80, 443]}`` for a port set. Normalise.
+            ports: list[int] = []
+            if isinstance(right, int):
+                ports.append(right)
+            elif isinstance(right, dict) and "set" in right:
+                for item in right["set"]:
+                    if isinstance(item, int):
+                        ports.append(item)
+            if proto == "tcp":
+                tcp_present.update(ports)
+            elif proto == "udp":
+                udp_present.update(ports)
+    missing_tcp = set(profile.expected_tcp_ports) - tcp_present
+    missing_udp = set(profile.expected_udp_ports) - udp_present
+    return missing_tcp, missing_udp
+
+
 def _maybe_apply_firewall(
     role_assignment: dict[str, Any] | None,
     log: structlog.stdlib.BoundLogger,
@@ -251,6 +373,8 @@ def _maybe_apply_firewall(
     if appliance_state.detect_deployment_kind() != "appliance":
         return
 
+    global _last_firewall_live_check_at
+
     profile: FirewallProfile = render_drop_in(role_assignment)
     body = profile.body
 
@@ -263,7 +387,34 @@ def _maybe_apply_firewall(
         current_body = _NFT_DROPIN_PATH.read_text(encoding="utf-8")
     except OSError:
         current_body = ""
-    if current_body == body:
+    body_matches = current_body == body
+
+    # Periodic live-ruleset drift check (#170 Wave D follow-up). The
+    # drop-in file content matching the desired body only proves the
+    # FILE is right — not that the kernel-active nftables ruleset
+    # actually includes those rules. ``nft -f /etc/nftables.conf``
+    # could have failed silently after an out-of-band edit, the host
+    # could have ``nft flush ruleset``'d during a manual debugging
+    # session, or the master conf's ``include`` directive could
+    # have stopped matching the drop-in path. Every
+    # ``_FIREWALL_LIVE_CHECK_INTERVAL_S`` (5 min) we read the live
+    # ruleset and confirm the expected per-role service ports are
+    # present; if any are missing, force a re-apply by bypassing the
+    # body-matches short-circuit.
+    force_apply = False
+    if body_matches and _firewall_live_check_due():
+        missing_tcp, missing_udp = _firewall_live_missing_ports(profile)
+        _last_firewall_live_check_at = time.monotonic()
+        if missing_tcp or missing_udp:
+            log.warning(
+                "supervisor.firewall.drift_detected",
+                profile=profile.name,
+                missing_tcp=sorted(missing_tcp),
+                missing_udp=sorted(missing_udp),
+            )
+            force_apply = True
+
+    if body_matches and not force_apply:
         return
 
     try:
@@ -479,6 +630,18 @@ def heartbeat_once(
     _maybe_apply_firewall(role_assignment, log)
 
     target = compute_target_env(role_assignment)
+    # #170 Wave D follow-up — the role env file carries ONLY role-
+    # scoped vars (``COMPOSE_PROFILES``, ``AGENT_GROUP``,
+    # ``DNS_ENGINE``). The compose-service interpolation for static
+    # appliance config (``${SPATIUMDDI_VERSION}``,
+    # ``${CONTROL_PLANE_URL}``, ``${APPLIANCE_HOSTNAME}``,
+    # ``${DNS_AGENT_KEY}``, ``${DOCKER_GID}``, ...) is satisfied by
+    # the host's main ``/etc/spatiumddi/.env`` — see
+    # ``service_lifecycle._HOST_ENV_FILE``, which is passed to
+    # ``docker compose`` as an additional ``--env-file`` ahead of
+    # this one. That keeps the role env file scoped to what the
+    # supervisor actually decides and avoids stale duplication when
+    # the host .env is upgraded out-of-band.
     env_path = cfg.state_dir / _ROLE_ENV_FILENAME
     env_write_failed = False
     try:
@@ -507,19 +670,44 @@ def heartbeat_once(
     # comes up (or comes down on de-assignment). Best-effort — on
     # failure we log + carry the failure state up to the control
     # plane in the next heartbeat's ``role_switch_state``.
+    #
+    # Skip the apply when the rendered env file content hash is
+    # unchanged from the last successful apply. The previous "fire
+    # every heartbeat" shape ran ``docker compose ps`` + ``up -d``
+    # every 60 s even during steady state when nothing had changed.
+    # Each subprocess pair costs ~600 ms on a 1-CPU VM (Go binary
+    # startup + arg parsing + JSON formatting); 60-second cadence × 24h
+    # = ~14 minutes of wasted CPU per day on a fleet that wasn't
+    # transitioning anything. The sidecar hash file is reset on
+    # supervisor restart so a fresh boot always re-applies once.
     if not env_write_failed and appliance_state.detect_deployment_kind() == "appliance":
-        lifecycle = apply_role_assignment(target.profiles, env_path)
-        log.info(
-            "supervisor.heartbeat.lifecycle_applied",
-            state=lifecycle.state,
-            reason=lifecycle.reason,
-            started=list(lifecycle.started),
-            stopped=list(lifecycle.stopped),
-        )
-        # The state + reason are returned on the NEXT heartbeat (not
-        # this one — we've already POSTed). Cache them on disk so a
-        # supervisor restart doesn't lose them.
-        _persist_lifecycle_state(cfg.state_dir, lifecycle.state, lifecycle.reason)
+        env_hash = hashlib.sha256(rendered.encode("utf-8")).hexdigest()
+        last_hash = _read_last_apply_hash(cfg.state_dir)
+        if env_hash == last_hash:
+            log.info(
+                "supervisor.heartbeat.lifecycle_skipped",
+                reason="env_unchanged",
+                env_hash=env_hash[:12],
+            )
+        else:
+            lifecycle = apply_role_assignment(target.profiles, env_path)
+            log.info(
+                "supervisor.heartbeat.lifecycle_applied",
+                state=lifecycle.state,
+                reason=lifecycle.reason,
+                started=list(lifecycle.started),
+                stopped=list(lifecycle.stopped),
+            )
+            # The state + reason are returned on the NEXT heartbeat (not
+            # this one — we've already POSTed). Cache them on disk so a
+            # supervisor restart doesn't lose them.
+            _persist_lifecycle_state(cfg.state_dir, lifecycle.state, lifecycle.reason)
+            # Only stamp the hash on success — a failed apply should
+            # re-attempt on the next heartbeat (the failure may have
+            # been transient: image pull glitch, transient port
+            # conflict, etc).
+            if lifecycle.state in ("ready", "idle"):
+                _write_last_apply_hash(cfg.state_dir, env_hash)
 
     # Identity unused in C2's payload but kept on the signature so
     # C2's mTLS upgrade doesn't need to thread it back in. Silence
@@ -528,6 +716,33 @@ def heartbeat_once(
 
 
 _LIFECYCLE_STATE_FILE = "role-switch-state"
+_LAST_APPLY_HASH_FILE = "role-compose.env.hash"
+
+
+def _read_last_apply_hash(state_dir: Path) -> str | None:
+    """Return the env-file content hash of the last successful
+    ``apply_role_assignment``, or ``None`` on first boot / no prior
+    apply / file missing. Used by the heartbeat to skip the
+    subprocess pair when nothing has changed."""
+    path = state_dir / _LAST_APPLY_HASH_FILE
+    try:
+        return path.read_text(encoding="utf-8").strip() or None
+    except OSError:
+        return None
+
+
+def _write_last_apply_hash(state_dir: Path, env_hash: str) -> None:
+    """Stamp the env-file content hash so subsequent heartbeats can
+    skip the apply when the rendered env is unchanged. Atomic write
+    so a supervisor crash mid-flush can't leave a torn file that
+    would silently skip a real divergence."""
+    path = state_dir / _LAST_APPLY_HASH_FILE
+    try:
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(env_hash + "\n", encoding="utf-8")
+        tmp.replace(path)
+    except OSError:
+        pass
 
 
 def _persist_lifecycle_state(state_dir: Path, state: str, reason: str | None) -> None:

@@ -44,7 +44,6 @@ from cryptography.hazmat.primitives.serialization import (
     load_pem_private_key,
 )
 
-
 # File names — kept module-level so tests can reference them without
 # duplicating literals.
 PRIVATE_KEY_FILENAME = "identity.key"

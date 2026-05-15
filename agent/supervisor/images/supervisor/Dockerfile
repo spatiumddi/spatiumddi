@@ -20,12 +20,18 @@ FROM alpine:3.22 AS runtime
 # docker daemon via the bind-mounted ``/var/run/docker.sock``. It's
 # baked in now so the Wave-A image is the same shape it'll be in
 # Wave C — no surprise rebuilds when role-assignment lands.
+# ``docker-cli-compose`` is a SEPARATE Alpine package (the
+# docker-cli package ships only the CLI binary, NOT the compose
+# plugin). The supervisor's service_lifecycle.py shells out to
+# ``docker compose -f ... up -d`` to start role-aligned service
+# containers, so without the plugin every role-assignment apply
+# bombs with ``docker: unknown command: docker compose``.
 # ``nftables`` likewise — the supervisor renders nft drop-ins under
 # ``/etc/nftables.d/`` and exec()s ``nft -f`` to apply.
 RUN apk add --no-cache \
       tini su-exec \
       python3 py3-pip \
-      docker-cli \
+      docker-cli docker-cli-compose \
       nftables libcap \
       ca-certificates tzdata \
  && addgroup -S spatium \

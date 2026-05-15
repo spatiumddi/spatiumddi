@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertCircle,
@@ -151,8 +151,13 @@ export function ApprovalsTab() {
 
   const approve = useMutation({
     mutationFn: (id: string) => applianceApprovalApi.approve(id),
-    onSuccess: () => {
+    onSuccess: (row) => {
       qc.invalidateQueries({ queryKey: ["appliance", "approvals"] });
+      // Refresh the open drilldown with the updated row so the
+      // operator sees ``approved`` state + cert serial + role
+      // assignment section immediately, instead of staring at a
+      // still-pending modal with no feedback.
+      if (drilldown && drilldown.id === row.id) setDrilldown(row);
     },
   });
   const reject = useMutation({
@@ -245,6 +250,11 @@ export function ApprovalsTab() {
       badge: pending.length > 0 ? pending.length : undefined,
     },
     {
+      key: "ntp",
+      label: "NTP",
+      summary: "Fleet-wide chrony config.",
+    },
+    {
       key: "pairing",
       label: "Pairing codes",
       summary: "Mint codes for new appliances.",
@@ -253,11 +263,6 @@ export function ApprovalsTab() {
       key: "slot-images",
       label: "Slot images",
       summary: "Air-gap .raw.xz upload + browse.",
-    },
-    {
-      key: "ntp",
-      label: "NTP",
-      summary: "Fleet-wide chrony config.",
     },
     {
       key: "snmp",
@@ -492,6 +497,7 @@ export function ApprovalsTab() {
           onReject={() => setRejectTarget(drilldown)}
           onRekey={() => setRekeyTarget(drilldown)}
           onDelete={() => setDeleteTarget(drilldown)}
+          onRowUpdated={(next) => setDrilldown(next)}
         />
       )}
 
@@ -744,6 +750,7 @@ function ApplianceDrilldownModal({
   onReject,
   onRekey,
   onDelete,
+  onRowUpdated,
 }: {
   row: ApplianceRow;
   onClose: () => void;
@@ -752,6 +759,7 @@ function ApplianceDrilldownModal({
   onReject: () => void;
   onRekey: () => void;
   onDelete: () => void;
+  onRowUpdated: (next: ApplianceRow) => void;
 }) {
   const caps = row.capabilities ?? {};
   const badge = stateBadge(row.state);
@@ -850,7 +858,7 @@ function ApplianceDrilldownModal({
         </div>
 
         {row.state === "approved" && (
-          <ApplianceRoleAssignmentSection row={row} />
+          <ApplianceRoleAssignmentSection row={row} onSaved={onRowUpdated} />
         )}
 
         {row.state === "approved" && <ApplianceOsUpgradeSection row={row} />}
@@ -987,11 +995,18 @@ const ROLE_OPTIONS: { value: string; label: string; capKey?: string }[] = [
   { value: "observer", label: "Observer", capKey: "can_run_observer" },
 ];
 
-function ApplianceRoleAssignmentSection({ row }: { row: ApplianceRow }) {
+function ApplianceRoleAssignmentSection({
+  row,
+  onSaved,
+}: {
+  row: ApplianceRow;
+  onSaved: (next: ApplianceRow) => void;
+}) {
   const qc = useQueryClient();
   const caps = row.capabilities ?? {};
-  const initialRoles = new Set(row.assigned_roles ?? []);
-  const [roles, setRoles] = useState<Set<string>>(initialRoles);
+  const [roles, setRoles] = useState<Set<string>>(
+    () => new Set(row.assigned_roles ?? []),
+  );
   const [dnsGroupId, setDnsGroupId] = useState<string | null>(
     row.assigned_dns_group_id ?? null,
   );
@@ -1004,6 +1019,26 @@ function ApplianceRoleAssignmentSection({ row }: { row: ApplianceRow }) {
   const [firewallExtra, setFirewallExtra] = useState<string>(
     row.firewall_extra ?? "",
   );
+  // Transient ``✓ Saved`` indicator next to the Save button. Cleared
+  // after 2.5 s so the affirmative feedback doesn't linger forever.
+  const [savedAt, setSavedAt] = useState<number | null>(null);
+  useEffect(() => {
+    if (savedAt === null) return;
+    const t = setTimeout(() => setSavedAt(null), 2500);
+    return () => clearTimeout(t);
+  }, [savedAt]);
+  // When the parent feeds us a refreshed row (after approve / save /
+  // re-key) re-baseline the form state so ``dirty`` reads correctly.
+  // Using JSON-stringified role list as the effect dep keeps Set
+  // identity changes from causing infinite re-renders.
+  const rolesKey = (row.assigned_roles ?? []).slice().sort().join(",");
+  useEffect(() => {
+    setRoles(new Set(row.assigned_roles ?? []));
+    setDnsGroupId(row.assigned_dns_group_id ?? null);
+    setDhcpGroupId(row.assigned_dhcp_group_id ?? null);
+    setFirewallExtra(row.firewall_extra ?? "");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [row.id, rolesKey, row.assigned_dns_group_id, row.assigned_dhcp_group_id, row.firewall_extra]);
 
   const dnsGroupsQuery = useQuery({
     queryKey: ["dns", "groups"],
@@ -1024,8 +1059,10 @@ function ApplianceRoleAssignmentSection({ row }: { row: ApplianceRow }) {
         dhcp_group_id: dhcpGroupId,
         firewall_extra: firewallExtra,
       }),
-    onSuccess: () => {
+    onSuccess: (updated) => {
       qc.invalidateQueries({ queryKey: ["appliance", "approvals"] });
+      setSavedAt(Date.now());
+      onSaved(updated);
     },
   });
 
@@ -1047,9 +1084,14 @@ function ApplianceRoleAssignmentSection({ row }: { row: ApplianceRow }) {
 
   const dnsRoleActive = roles.has("dns-bind9") || roles.has("dns-powerdns");
   const dhcpRoleActive = roles.has("dhcp");
+  // ``dirty`` compares the live form state against the latest
+  // server-side row (the row prop refreshes after save), not the
+  // snapshot taken at first mount — otherwise the Save button would
+  // stay enabled after a successful save until the operator closes
+  // the modal.
   const dirty =
     JSON.stringify(Array.from(roles).sort()) !==
-      JSON.stringify([...initialRoles].sort()) ||
+      JSON.stringify((row.assigned_roles ?? []).slice().sort()) ||
     dnsGroupId !== (row.assigned_dns_group_id ?? null) ||
     dhcpGroupId !== (row.assigned_dhcp_group_id ?? null) ||
     firewallExtra !== (row.firewall_extra ?? "");
@@ -1224,6 +1266,12 @@ function ApplianceRoleAssignmentSection({ row }: { row: ApplianceRow }) {
           ) : null}
           Save role assignment
         </button>
+        {savedAt !== null && !save.isPending && (
+          <span className="inline-flex items-center gap-1 text-xs text-emerald-700 dark:text-emerald-300">
+            <CheckCircle2 className="h-3.5 w-3.5" />
+            Saved
+          </span>
+        )}
         {save.error && (
           <span className="text-xs text-rose-700 dark:text-rose-300">
             {(save.error as Error).message}

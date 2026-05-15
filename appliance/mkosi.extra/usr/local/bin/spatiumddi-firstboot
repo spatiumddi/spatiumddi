@@ -207,7 +207,18 @@ APPLIANCE_HOSTNAME=${APPLIANCE_HOSTNAME_VAL}
 APPLIANCE_HOST_IPS=${APPLIANCE_HOST_IPS_VAL}
 DOCKER_GID=${DOCKER_GID_VAL}
 EOF
-    chmod 600 "$ENV_FILE"
+    # #170 Wave D follow-up — mode 644 (not 600) so the
+    # spatium-supervisor's unprivileged container user (uid 100, gid 101)
+    # can read it through the ``/etc/spatiumddi:/etc/spatiumddi-host:ro``
+    # bind mount. ``service_lifecycle.py`` passes the host .env as an
+    # additional ``--env-file`` to ``docker compose`` so service
+    # containers' ``${SPATIUMDDI_VERSION}`` / ``${CONTROL_PLANE_URL}`` /
+    # ``${DOCKER_GID}`` / ``${DNS_AGENT_KEY}`` interpolation resolves.
+    # The file's AIO-mode secrets (POSTGRES_PASSWORD / SECRET_KEY /
+    # CREDENTIAL_ENCRYPTION_KEY) are reachable from the postgres data
+    # dir + api container env regardless, so 600 → 644 is a negligible
+    # security delta on a single-tenant appliance.
+    chmod 644 "$ENV_FILE"
 
     # #170 Wave B2 — for Application installs, render the agent
     # landing page from the template into /var/lib/spatiumddi/

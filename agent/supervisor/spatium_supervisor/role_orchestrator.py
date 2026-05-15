@@ -36,7 +36,6 @@ import subprocess
 from dataclasses import dataclass
 from typing import Any
 
-
 # Roles the supervisor knows how to start a service container for.
 # ``observer`` + ``custom`` are reserved (no compose profile yet);
 # the supervisor recognises them on heartbeat but does nothing.
@@ -84,15 +83,23 @@ def compute_target_env(role_assignment: dict[str, Any] | None) -> TargetEnv:
     # DNS group config — only populated when a DNS role is assigned.
     dns_group_name = role_assignment.get("dns_group_name")
     dns_engine = role_assignment.get("dns_engine")
+    # #170 Wave D follow-up — control-plane-provided bootstrap PSK so
+    # the bind9 / powerdns service container can register against
+    # /api/v1/dns/agents/register without operator-side .env edits.
+    # ``None`` when the control plane hasn't configured the key.
+    dns_agent_key = role_assignment.get("dns_agent_key")
     if any(r in roles for r in ("dns-bind9", "dns-powerdns")):
         if dns_group_name:
             env_lines.append(f"AGENT_GROUP={dns_group_name}")
         if dns_engine:
             env_lines.append(f"DNS_ENGINE={dns_engine}")
+        if dns_agent_key:
+            env_lines.append(f"DNS_AGENT_KEY={dns_agent_key}")
 
     # DHCP group config.
     dhcp_group_name = role_assignment.get("dhcp_group_name")
     dhcp_network_mode = role_assignment.get("dhcp_network_mode") or "host"
+    dhcp_agent_key = role_assignment.get("dhcp_agent_key")
     if "dhcp" in roles:
         if dhcp_group_name:
             # AGENT_GROUP is overloaded — DNS + DHCP can't be in the
@@ -104,6 +111,8 @@ def compute_target_env(role_assignment: dict[str, Any] | None) -> TargetEnv:
             # docker-compose's env-file parser).
             env_lines.append(f"DHCP_AGENT_GROUP={dhcp_group_name}")
         env_lines.append(f"DHCP_NETWORK_MODE={dhcp_network_mode}")
+        if dhcp_agent_key:
+            env_lines.append(f"DHCP_AGENT_KEY={dhcp_agent_key}")
 
     return TargetEnv(env_lines=env_lines, profiles=profiles)
 

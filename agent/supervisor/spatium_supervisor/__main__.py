@@ -48,9 +48,7 @@ def _build_http_client(skip_tls_verify: bool) -> httpx.Client:
     return httpx.Client(verify=not skip_tls_verify)
 
 
-def _maybe_register(
-    cfg: SupervisorConfig, log: structlog.stdlib.BoundLogger
-) -> None:
+def _maybe_register(cfg: SupervisorConfig, log: structlog.stdlib.BoundLogger) -> None:
     """Run identity generation + register-if-needed in one shot. Logs
     its own status; never raises into the caller (the main loop
     falls back to idle on any failure)."""

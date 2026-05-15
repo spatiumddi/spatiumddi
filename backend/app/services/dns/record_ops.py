@@ -115,15 +115,32 @@ async def enqueue_record_op(
     record: dict[str, Any],
     target_serial: int | None = None,
 ) -> DNSRecordOp | None:
-    """Queue a record operation against the primary for this zone.
+    """Queue a record operation against every applicable server in
+    the zone's group.
 
-    * Agent-based primaries (BIND9): write a ``pending`` row; the agent
-      picks it up on its next long-poll and applies via loopback nsupdate.
-    * Agentless primaries (Windows DNS): apply immediately via the driver
-      from the control plane; the row lands as ``applied`` or ``failed``.
+    Driver semantics:
 
-    Returns the created op, or None if no primary is configured (the caller
-    should surface a "no primary" warning to the user in that case).
+    * **Agentless** (Windows DNS): exactly one server in the group
+      writes — the one marked ``is_primary=True``. Apply immediately
+      via the driver from the control plane; the row lands as
+      ``applied`` or ``failed``.
+    * **Agent-based** (BIND9 / PowerDNS): every enabled, agent-based
+      server in the group runs an independent authoritative copy of
+      the zone (each renders ``type master`` in its named.conf). A
+      record change therefore needs to land on *every* server, not
+      just the one with ``is_primary=True``. Enqueue one
+      ``pending`` op row per server; each agent picks up its own row
+      on its next long-poll and applies via loopback nsupdate.
+      Pre-#170 the queue only went to the primary, which silently
+      broke any multi-server (or supervised-appliance) group — the
+      secondaries' on-disk zone files stayed frozen at the bundle
+      they received on initial register.
+
+    Returns the op for the primary server (or ``None`` if no primary
+    + agent-based path didn't run either). Callers that need to ack
+    every server's apply outcome should query ``DNSRecordOp`` directly
+    by ``server_id``; the singular return preserves the prior
+    contract for the typed-event audit path.
     """
     primary = await resolve_primary_server(db, zone)
     if primary is None:
@@ -163,17 +180,46 @@ async def enqueue_record_op(
     if is_agentless(primary.driver):
         return await _apply_agentless(db, primary, zone, op, record, target_serial)
 
-    op_row = DNSRecordOp(
-        server_id=primary.id,
-        zone_name=zone.name,
-        op=op,
-        record=record,
-        target_serial=target_serial,
-        state="pending",
+    # Fan out to every enabled, agent-based server in the group. The
+    # query mirrors ``resolve_primary_server`` minus the is_primary
+    # filter; agentless servers are excluded because their write path
+    # is single-server immediate-apply.
+    agent_rows = (
+        (
+            await db.execute(
+                select(DNSServer)
+                .where(
+                    DNSServer.group_id == zone.group_id,
+                    DNSServer.is_enabled.is_(True),
+                )
+                .order_by(DNSServer.is_primary.desc(), DNSServer.created_at)
+            )
+        )
+        .scalars()
+        .all()
     )
-    db.add(op_row)
+    agent_servers = [s for s in agent_rows if not is_agentless(s.driver)]
+    if not agent_servers:
+        # Shouldn't happen — primary is agent-based, so at least one
+        # row exists. Belt-and-braces in case the primary was just
+        # toggled agentless mid-flight.
+        return None
+
+    primary_op: DNSRecordOp | None = None
+    for srv in agent_servers:
+        row = DNSRecordOp(
+            server_id=srv.id,
+            zone_name=zone.name,
+            op=op,
+            record=record,
+            target_serial=target_serial,
+            state="pending",
+        )
+        db.add(row)
+        if srv.id == primary.id:
+            primary_op = row
     await db.flush()
-    return op_row
+    return primary_op
 
 
 async def enqueue_record_ops_batch(
@@ -220,7 +266,9 @@ async def enqueue_record_ops_batch(
     if not is_agentless(primary.driver):
         # Agent-based: DB rows only; agent will batch at poll time.
         return [
-            await enqueue_record_op(db, zone, o["op"], o["record"], o.get("target_serial"))
+            await enqueue_record_op(
+                db, zone, o["op"], o["record"], o.get("target_serial")
+            )
             for o in ops
         ]
 
@@ -320,7 +368,9 @@ async def _apply_agentless_batch(
     return list(op_rows)
 
 
-async def ack_op(db: AsyncSession, op_id: str, result: str, message: str | None = None) -> None:
+async def ack_op(
+    db: AsyncSession, op_id: str, result: str, message: str | None = None
+) -> None:
     """Mark an op applied (ok) or failed."""
     from datetime import UTC, datetime
 

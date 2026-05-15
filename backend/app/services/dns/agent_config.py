@@ -95,7 +95,9 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
     opts = opts_res.scalar_one_or_none()
 
     # Views
-    views_res = await db.execute(select(DNSView).where(DNSView.group_id == server.group_id))
+    views_res = await db.execute(
+        select(DNSView).where(DNSView.group_id == server.group_id)
+    )
     views = views_res.scalars().all()
 
     # ACLs
@@ -107,7 +109,9 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
     acls = acls_res.scalars().all()
 
     # Zones (+ records for primary only)
-    zones_res = await db.execute(select(DNSZone).where(DNSZone.group_id == server.group_id))
+    zones_res = await db.execute(
+        select(DNSZone).where(DNSZone.group_id == server.group_id)
+    )
     zones = zones_res.scalars().all()
 
     zone_payload: list[dict[str, Any]] = []
@@ -140,34 +144,43 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
         ]
         zone_payload.append(zp)
 
-    # Pending record ops — only for primary. Mark in_flight on dispatch so
-    # the same op doesn't get re-shipped on every long-poll cycle until the
-    # agent's next heartbeat acks it. Failure ack resets to pending (with
-    # attempt++); after 5 failures it becomes "failed" and stays out.
+    # Pending record ops — every agent-based server in the group
+    # gets its own queue (one op row per server per record change,
+    # see ``record_ops.enqueue_record_op``). The is_primary gate
+    # here was a pre-#170 carryover from the
+    # "primary writes, secondaries AXFR" assumption that doesn't
+    # match the per-server-authoritative shape every supervised
+    # appliance uses today; with the gate in place a secondary's
+    # ops sat in ``state=pending`` forever, never shipped, and the
+    # secondary's bind9 stayed at whatever record set it picked up
+    # from the bundle's ``zone.records`` field at initial cold boot.
+    # Mark in_flight on dispatch so the same op doesn't re-ship on
+    # every long-poll cycle until the agent's next heartbeat acks
+    # it. Failure ack resets to pending (with attempt++); after 5
+    # failures it becomes "failed" and stays out.
     pending_ops: list[dict[str, Any]] = []
-    if server.is_primary:
-        op_res = await db.execute(
-            select(DNSRecordOp)
-            .where(
-                DNSRecordOp.server_id == server.id,
-                DNSRecordOp.state == "pending",
-            )
-            .order_by(DNSRecordOp.created_at)
+    op_res = await db.execute(
+        select(DNSRecordOp)
+        .where(
+            DNSRecordOp.server_id == server.id,
+            DNSRecordOp.state == "pending",
         )
-        ops_to_dispatch = list(op_res.scalars().all())
-        for op in ops_to_dispatch:
-            pending_ops.append(
-                {
-                    "op_id": str(op.id),
-                    "zone_name": op.zone_name,
-                    "op": op.op,
-                    "record": op.record,
-                    "target_serial": op.target_serial,
-                }
-            )
-            op.state = "in_flight"
-        if ops_to_dispatch:
-            await db.flush()
+        .order_by(DNSRecordOp.created_at)
+    )
+    ops_to_dispatch = list(op_res.scalars().all())
+    for op in ops_to_dispatch:
+        pending_ops.append(
+            {
+                "op_id": str(op.id),
+                "zone_name": op.zone_name,
+                "op": op.op,
+                "record": op.record,
+                "target_serial": op.target_serial,
+            }
+        )
+        op.state = "in_flight"
+    if ops_to_dispatch:
+        await db.flush()
 
     # Group-level TSIG key for RFC 2136 dynamic updates
     grp = await db.get(DNSServerGroup, server.group_id)
@@ -186,7 +199,11 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
     # auto-generated single key on DNSServerGroup. Both kinds end up in
     # the same `key { … };` block via the named.conf template.
     op_keys = (
-        (await db.execute(select(DNSTSIGKey).where(DNSTSIGKey.group_id == server.group_id)))
+        (
+            await db.execute(
+                select(DNSTSIGKey).where(DNSTSIGKey.group_id == server.group_id)
+            )
+        )
         .scalars()
         .all()
     )
@@ -204,18 +221,28 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
         "forwarders": getattr(opts, "forwarders", []) if opts else [],
         "forward_policy": getattr(opts, "forward_policy", "first") if opts else "first",
         "recursion_enabled": getattr(opts, "recursion_enabled", True) if opts else True,
-        "dnssec_validation": getattr(opts, "dnssec_validation", "auto") if opts else "auto",
+        "dnssec_validation": (
+            getattr(opts, "dnssec_validation", "auto") if opts else "auto"
+        ),
         "allow_query": getattr(opts, "allow_query", ["any"]) if opts else ["any"],
-        "allow_transfer": getattr(opts, "allow_transfer", ["none"]) if opts else ["none"],
+        "allow_transfer": (
+            getattr(opts, "allow_transfer", ["none"]) if opts else ["none"]
+        ),
         # Query logging — surfaced to BIND9's named.conf via template
         # render and to PowerDNS's pdns.conf via the agent's
         # ``_render_conf``. Keep ``query_log_enabled`` in the
         # structural fingerprint so toggling it in the UI reliably
         # triggers a daemon reload.
-        "query_log_enabled": bool(getattr(opts, "query_log_enabled", False)) if opts else False,
+        "query_log_enabled": (
+            bool(getattr(opts, "query_log_enabled", False)) if opts else False
+        ),
     }
     views_block = [
-        {"id": str(v.id), "name": v.name, "match_clients": getattr(v, "match_clients", [])}
+        {
+            "id": str(v.id),
+            "name": v.name,
+            "match_clients": getattr(v, "match_clients", []),
+        }
         for v in views
     ]
     acls_block = [{"id": str(a.id), "name": a.name} for a in acls]
@@ -257,7 +284,9 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
             # Members are every primary zone in the group. Forward / stub
             # zones don't belong in a catalog (they're lookups, not
             # served data); secondaries are the consumer's responsibility.
-            member_names = sorted(z.name for z in zones if z.zone_type in ("primary", "master"))
+            member_names = sorted(
+                z.name for z in zones if z.zone_type in ("primary", "master")
+            )
             if server.id == producer.id:
                 catalog_block = {
                     "mode": "producer",
@@ -331,7 +360,12 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
     ntp_block: dict[str, Any] = (
         ntp_bundle(settings_row)
         if settings_row is not None
-        else {"enabled": False, "allow_clients": False, "config_hash": "", "chrony_conf": ""}
+        else {
+            "enabled": False,
+            "allow_clients": False,
+            "config_hash": "",
+            "chrony_conf": "",
+        }
     )
 
     bundle_body: dict[str, Any] = {
@@ -360,7 +394,9 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
         "views": views_block,
         "acls": acls_block,
         "tsig_keys": tsig_keys,
-        "zones_structural": [{k: v for k, v in z.items() if k != "records"} for z in zone_payload],
+        "zones_structural": [
+            {k: v for k, v in z.items() if k != "records"} for z in zone_payload
+        ],
         # Blocklists affect named.conf (response-policy block) + RPZ zone
         # files, so a change MUST trigger a daemon reload.
         "blocklists": blocklists_payload,
