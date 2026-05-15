@@ -63,6 +63,25 @@ frontend:
   service:
     type: ClusterIP
     port: 80
+  # Issue #176: the frontend nginx proxies ``/api/`` to the api Service
+  # using a runtime-substituted upstream. The Docker image defaults to
+  # ``api:8000`` (the Compose service name) which doesn't resolve on
+  # Kubernetes. By default we point at this release's api Service —
+  # ``{{ fullname }}-api`` — and inherit the api port from
+  # ``api.service.port``. Override if the api lives in a different
+  # Service / namespace (``my-api.shared-ns.svc.cluster.local``) or on
+  # a non-standard port.
+  apiUpstream:
+    host: ""    # default: "{{ fullname }}-api"
+    port: 0     # default: .Values.api.service.port (8000)
+  # Optional explicit DNS resolver(s) for the frontend nginx. Leave
+  # empty to auto-detect from /etc/resolv.conf at container start
+  # (``NGINX_ENTRYPOINT_LOCAL_RESOLVERS=1`` is set in the image), which
+  # works on every standard Kubernetes cluster — Pods get cluster DNS
+  # injected automatically. Set explicitly only if your cluster has a
+  # custom DNS topology (e.g. ``10.96.0.10`` for a pinned CoreDNS IP,
+  # or ``"1.1.1.1 8.8.8.8"`` for upstream-only resolution).
+  nginxLocalResolvers: ""
   resources:
     requests: { cpu: 50m, memory: 64Mi }
     limits:   { cpu: 200m, memory: 128Mi }

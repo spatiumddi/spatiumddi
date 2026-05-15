@@ -1,14 +1,42 @@
+# Rendered at container start by the official nginx image's
+# ``20-envsubst-on-templates.sh`` entrypoint drop-in (envsubst-style
+# variable substitution from /etc/nginx/templates/*.template to
+# /etc/nginx/conf.d/). Only the three variables below get substituted
+# — nginx's own ``$host`` / ``$remote_addr`` / etc are safe because the
+# entrypoint restricts envsubst to explicitly-named env vars.
+#
+# Issue #176: the previous baked-in ``api:8000`` upstream + ``127.0.0.11``
+# resolver assumed Docker Compose's embedded DNS and broke the moment
+# anyone deployed this image on Kubernetes (where the API Service is
+# ``{release}-api`` and cluster DNS lives on 10.96.x.x via CoreDNS, not
+# 127.0.0.11). The three knobs:
+#
+#   * API_UPSTREAM_HOST     — DNS name of the api Service. Defaults to
+#                             ``api`` (Compose). Helm chart overrides
+#                             to ``{{ fullname }}-api``.
+#   * API_UPSTREAM_PORT     — TCP port the api listens on. Defaults to
+#                             ``8000`` everywhere.
+#   * NGINX_LOCAL_RESOLVERS — Space-separated nameserver list for the
+#                             ``resolver`` directive. Auto-populated
+#                             from /etc/resolv.conf by the official
+#                             ``15-local-resolvers.envsh`` script when
+#                             NGINX_ENTRYPOINT_LOCAL_RESOLVERS=1 (set
+#                             in the Dockerfile). Operators can pin a
+#                             specific IP by setting this env var
+#                             explicitly.
+
 server {
     listen 80;
     server_name _;
     root /usr/share/nginx/html;
     index index.html;
 
-    # Use Docker's embedded DNS so upstream re-resolves when the api
-    # container is recreated. Without this, nginx caches the api IP
-    # at startup and starts returning 502s the moment `docker compose
-    # up -d --force-recreate api` hands out a new one.
-    resolver 127.0.0.11 valid=10s ipv6=off;
+    # Re-resolve the upstream periodically so a container / Pod restart
+    # that hands out a new IP doesn't strand nginx on the old one. The
+    # nameserver list comes from /etc/resolv.conf at container start —
+    # 127.0.0.11 under Docker Compose, the kube-dns Service IP under
+    # Kubernetes, host /etc/resolv.conf under ``--network=host``.
+    resolver ${NGINX_LOCAL_RESOLVERS} valid=10s ipv6=off;
 
     # Nginx-local healthcheck — answers without hitting any upstream,
     # so the frontend container's health reflects just nginx itself.
@@ -31,7 +59,7 @@ server {
     # Must come before the broader /api/ location since nginx picks
     # the most specific prefix match.
     location /api/v1/ai/chat {
-        set $api_upstream http://api:8000;
+        set $api_upstream http://${API_UPSTREAM_HOST}:${API_UPSTREAM_PORT};
         proxy_pass            $api_upstream;
         proxy_set_header      Host $host;
         proxy_set_header      X-Real-IP $remote_addr;
@@ -65,7 +93,7 @@ server {
     # Must come before the broader /api/ location since nginx
     # picks the most specific prefix match.
     location /api/v1/backup/ {
-        set $api_upstream http://api:8000;
+        set $api_upstream http://${API_UPSTREAM_HOST}:${API_UPSTREAM_PORT};
         proxy_pass               $api_upstream;
         proxy_set_header         Host $host;
         proxy_set_header         X-Real-IP $remote_addr;
@@ -80,10 +108,10 @@ server {
     }
 
     # Proxy API calls to the backend. Using a variable for proxy_pass
-    # forces nginx to re-resolve ``api`` on each request via the
+    # forces nginx to re-resolve the upstream on each request via the
     # resolver above (instead of binding at config-load time).
     location /api/ {
-        set $api_upstream http://api:8000;
+        set $api_upstream http://${API_UPSTREAM_HOST}:${API_UPSTREAM_PORT};
         proxy_pass         $api_upstream;
         proxy_set_header   Host $host;
         proxy_set_header   X-Real-IP $remote_addr;
@@ -96,7 +124,7 @@ server {
 
     # Proxy health and metrics endpoints to api for admin probes.
     location ~ ^/(health|metrics) {
-        set $api_upstream http://api:8000;
+        set $api_upstream http://${API_UPSTREAM_HOST}:${API_UPSTREAM_PORT};
         proxy_pass $api_upstream;
         proxy_set_header Host $host;
     }

@@ -1,0 +1,28 @@
+#!/bin/sh
+# Override of the upstream nginx image's
+# /docker-entrypoint.d/15-local-resolvers.envsh — spatiumddi #176.
+#
+# The upstream script always overwrites ``NGINX_LOCAL_RESOLVERS`` from
+# /etc/resolv.conf when ``NGINX_ENTRYPOINT_LOCAL_RESOLVERS`` is set,
+# which makes it impossible to pin a specific resolver via env var at
+# deploy time. This replacement respects an operator-supplied value
+# and falls back to auto-detection only when none is provided.
+
+set -eu
+
+# Operator override wins — pinned resolver IPs (e.g. ``10.96.0.10`` for
+# a fixed CoreDNS Service IP) or upstream-only resolution
+# (``1.1.1.1 8.8.8.8``) pass through unchanged.
+if [ -n "${NGINX_LOCAL_RESOLVERS:-}" ]; then
+    return 0
+fi
+
+# Default: auto-detect from /etc/resolv.conf at container start. This
+# covers Docker Compose (Docker injects ``127.0.0.11``), every standard
+# Kubernetes cluster (kubelet injects the cluster DNS Service IP), and
+# ``--network=host`` (host /etc/resolv.conf passes through). The awk
+# picks up every ``nameserver`` line and bracket-wraps any IPv6
+# addresses so nginx's resolver directive parses them cleanly.
+NGINX_LOCAL_RESOLVERS=$(awk 'BEGIN{ORS=" "} $1=="nameserver" {if ($2 ~ ":") {print "["$2"]"} else {print $2}}' /etc/resolv.conf)
+NGINX_LOCAL_RESOLVERS="${NGINX_LOCAL_RESOLVERS% }"
+export NGINX_LOCAL_RESOLVERS
