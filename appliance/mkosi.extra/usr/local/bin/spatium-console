@@ -95,6 +95,101 @@ ROLE_SERVICES = {
 # permanent ``(not running)`` row for every unassigned role.
 SUPERVISOR_DYNAMIC_SERVICES = ("dns-bind9", "dns-powerdns", "dhcp-kea")
 
+# Supervisor's role-compose.env on the host (the dashboard reads it
+# read-only to discover the watchdog-expected services so a
+# missing-but-expected container renders as "(not running)" instead
+# of silently absent). The supervisor writes this file atomically on
+# every heartbeat that returns a role_assignment.
+_SUPERVISOR_ROLE_ENV = Path("/var/persist/spatium-supervisor/role-compose.env")
+
+# Compose profile → compose service name. Mirrors the supervisor's
+# own ``watchdog._PROFILE_TO_SERVICE`` map — keep them in sync.
+_PROFILE_TO_SERVICE_DASH: dict[str, str] = {
+    "dns-bind9": "dns-bind9",
+    "dns-powerdns": "dns-powerdns",
+    "dhcp": "dhcp-kea",
+}
+
+
+# External supervisor watchdog (#170 Wave E) — host-side bash
+# script + systemd timer that restarts the supervisor container when
+# its main loop wedges (different signal from the
+# in-process watchdog which only watches the supervisor-managed
+# service containers). The supervisor writes ``last-loop-at`` at the
+# top of every heartbeat-loop iteration; the host timer checks that
+# mtime every 2 min and force-restarts the container if it's
+# >5 min stale. Surface a one-line status so the operator at the
+# physical console can see at a glance whether the loop is ticking.
+_SUPERVISOR_LIVENESS_FILE = Path("/var/persist/spatium-supervisor/last-loop-at")
+_SUPERVISOR_WATCHDOG_ALERT = Path(
+    "/var/lib/spatiumddi/release-state/supervisor-watchdog-alert"
+)
+
+
+def supervisor_watchdog_status() -> tuple[str, str] | None:
+    """Return a ``(label, rich-style)`` tuple summarising the
+    external watchdog state, or ``None`` when nothing useful to show
+    (non-application role, or supervisor never started).
+
+    Three outcomes:
+
+    * ``Loop ticking · N s ago`` (green) — liveness file fresh.
+    * ``Loop stale · N s ago`` (yellow) — liveness file older than
+      the heartbeat interval; the host timer will restart on its
+      next fire.
+    * ``Restart cap hit`` (red) — alert trigger file present; the
+      external watchdog gave up after MAX_RESTARTS_PER_WINDOW.
+    """
+    # Alert trigger trumps the staleness check — operator needs to
+    # see the bad-news state regardless of what the liveness file
+    # currently says.
+    if _SUPERVISOR_WATCHDOG_ALERT.exists():
+        return ("Restart cap hit — manual intervention required", "bold red")
+    if not _SUPERVISOR_LIVENESS_FILE.exists():
+        return None
+    try:
+        mtime = _SUPERVISOR_LIVENESS_FILE.stat().st_mtime
+    except OSError:
+        return None
+    age = int(time.time() - mtime)
+    if age < 0:
+        age = 0
+    # The host-side script's STALE_THRESHOLD_S is 300 s; use the
+    # same threshold here so the chip flips colour at the same
+    # moment the host watchdog decides to act.
+    if age >= 300:
+        return (f"Loop stale · {age}s ago", "bold yellow")
+    return (f"Loop ticking · {age}s ago", "bold green")
+
+
+def watchdog_expected_services() -> list[str]:
+    """Read the supervisor's role-compose.env to discover which
+    service containers the watchdog expects to be running.
+
+    Returns ``[]`` on missing file, empty COMPOSE_PROFILES, or any
+    read error. Used by ``render_frame`` to union the
+    watchdog-expected set into the dashboard's Services panel so a
+    crashed / removed container surfaces as "(not running)" rather
+    than disappearing entirely.
+    """
+    if not _SUPERVISOR_ROLE_ENV.exists():
+        return []
+    try:
+        for line in _SUPERVISOR_ROLE_ENV.read_text(encoding="utf-8").splitlines():
+            if line.startswith("COMPOSE_PROFILES="):
+                val = line.split("=", 1)[1].strip()
+                if not val:
+                    return []
+                services: list[str] = []
+                for p in val.split(","):
+                    svc = _PROFILE_TO_SERVICE_DASH.get(p.strip())
+                    if svc is not None:
+                        services.append(svc)
+                return services
+    except OSError:
+        pass
+    return []
+
 # journalctl units the live-log pane tails. Same set on every role —
 # operators want to see firstboot / release manager output regardless
 # of which containers ran. docker.service catches everything else
@@ -825,6 +920,21 @@ def render_header(state: "DashboardState", mono_t: float) -> Panel:
             agent_line.append("  ", style="dim")
             agent_line.append(label, style=pstyle)
 
+    # Line 3a-2 — External supervisor watchdog status (Wave E). Only
+    # renders on application appliances + only when we have a
+    # supervisor liveness file to read. The host-side timer keeps
+    # the supervisor process alive across deadlocks; surfacing the
+    # mtime delta here gives the physical-console operator the same
+    # signal the host watchdog acts on.
+    watchdog_line: Text | None = None
+    if role == "application":
+        wd_status = supervisor_watchdog_status()
+        if wd_status is not None:
+            label, wstyle = wd_status
+            watchdog_line = Text()
+            watchdog_line.append("Watchdog ", style="dim")
+            watchdog_line.append(label, style=wstyle)
+
     # Line 3b — Phase 8c A/B slot indicator. Only renders on the
     # appliance (where slot detection succeeds). On dev/non-appliance
     # boxes detect_slot_info() returns None and we skip the line.
@@ -884,6 +994,8 @@ def render_header(state: "DashboardState", mono_t: float) -> Panel:
     body_parts: list = [line1, line2, line3]
     if agent_line is not None:
         body_parts.append(agent_line)
+    if watchdog_line is not None:
+        body_parts.append(watchdog_line)
     if slot_line is not None:
         body_parts.append(slot_line)
     body_parts += [rule, vitals]
@@ -914,9 +1026,18 @@ def render_services(role: str, ps_rows: list[dict]) -> Panel:
     # right now stay off the list — otherwise every Application
     # appliance would carry permanent ``(not running)`` rows for
     # roles it was never assigned.
+    #
+    # #170 Wave E watchdog tie-in: also union services the supervisor
+    # *expects* to be running (per role-compose.env) but that aren't
+    # in docker ps. Those render as ``(not running)`` so a crashed /
+    # removed container is visible from the console without
+    # SSH-ing in. ``watchdog_expected_services`` reads the env file
+    # the supervisor maintains; an absent file (idle appliance, no
+    # role assigned yet) returns ``[]``.
     if role == "application":
+        watchdog_expected = set(watchdog_expected_services())
         for svc in SUPERVISOR_DYNAMIC_SERVICES:
-            if svc in by_service and svc not in expected:
+            if (svc in by_service or svc in watchdog_expected) and svc not in expected:
                 expected.append(svc)
 
     tbl = Table.grid(padding=(0, 1), expand=True)
@@ -1057,26 +1178,36 @@ def render_frame(state: "DashboardState", mono_t: float) -> Layout:
     # many rows. Each panel claims exactly content + 2 border rows;
     # footer is a borderless 1-row strip.
     services_count = len(ROLE_SERVICES.get(state.role, []))
-    # #170 Wave D follow-up — render_services unions any
-    # supervisor-spawned service container (dns-bind9 / dns-powerdns /
-    # dhcp-kea) on Application appliances; mirror that here so the
-    # Services panel is tall enough to show every row without
-    # truncation when a role gets assigned at runtime.
+    # #170 Wave D + Wave E — render_services unions any supervisor-
+    # spawned service container (dns-bind9 / dns-powerdns / dhcp-kea)
+    # that's either currently in docker ps OR that the supervisor's
+    # watchdog expects to be running (per role-compose.env). Mirror
+    # that here so the Services panel is tall enough to show every
+    # row without truncation, including any missing/expected entries.
     if state.role == "application":
         ps_index = {container_service_name(r) for r in state.ps_rows}
+        watchdog_expected = set(watchdog_expected_services())
         for svc in SUPERVISOR_DYNAMIC_SERVICES:
-            if svc in ps_index:
+            if svc in ps_index or svc in watchdog_expected:
                 services_count += 1
     # Header layout: 4 base content lines (host+role / IPs / Build /
-    # vitals+disks) + 1 horizontal rule + 2 panel border. ``Slot``
-    # line + ``Agent`` line each add a row when present.
+    # vitals+disks) + 1 horizontal rule + 2 panel border. ``Slot``,
+    # ``Agent``, and ``Watchdog`` lines each add a row when present.
     # Pre-#170 fold this carried a separate Agent panel; collapsing
     # its 2-3 rows into one inline header line saves ~4 visual rows.
     # Vitals + Disk were merged into one row in the same pass (the
     # bind-mount dedupe + docker-overlay skip keeps disk entries to 2-3
     # which fit alongside Up/CPU/RAM/Load on any 80+ col TTY).
     has_agent_line = state.role == "application"
-    HEADER_ROWS = 7 + (1 if slot_info() is not None else 0) + (1 if has_agent_line else 0)
+    has_watchdog_line = (
+        state.role == "application" and supervisor_watchdog_status() is not None
+    )
+    HEADER_ROWS = (
+        7
+        + (1 if slot_info() is not None else 0)
+        + (1 if has_agent_line else 0)
+        + (1 if has_watchdog_line else 0)
+    )
     SVC_ROWS = services_count + 2   # tight: just borders, no padding
     FOOTER_ROWS = 1   # single-line borderless strip
 

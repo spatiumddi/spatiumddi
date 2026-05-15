@@ -40,7 +40,7 @@ import hashlib
 import hmac
 import uuid
 from datetime import UTC, datetime
-from typing import Literal
+from typing import Any, Literal
 
 import structlog
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
@@ -616,6 +616,16 @@ class SupervisorHeartbeatRequest(BaseModel):
     # None on the first heartbeat / before any role assignment.
     role_switch_state: Literal["idle", "ready", "failed"] | None = None
     role_switch_reason: str | None = None
+    # #170 Wave E — service-container watchdog. Free-form dict keyed
+    # by compose service name (``dns-bind9`` / ``dns-powerdns`` /
+    # ``dhcp-kea``); each value carries ``{role, status, since,
+    # container_id}`` where status ∈ {healthy, missing, unhealthy,
+    # starting}. The supervisor probes every 5 min and ships the
+    # cached verdict on every heartbeat; the Fleet drilldown surfaces
+    # the per-service status alongside the role-assignment block.
+    # None / omitted = supervisor didn't run the watchdog this tick
+    # (typical on docker / k8s deployments or before the first probe).
+    role_health: dict[str, dict[str, Any]] | None = None
 
 
 class SupervisorRoleAssignment(BaseModel):
@@ -820,6 +830,13 @@ async def supervisor_heartbeat(
             row.role_switch_reason = body.role_switch_reason
         else:
             row.role_switch_reason = None
+    if body.role_health is not None:
+        # #170 Wave E — supervisor's per-service watchdog verdict.
+        # Overwrite verbatim every tick: empty dict clears stale
+        # entries when the operator removes a role, and the
+        # supervisor's ``since`` timestamp is the canonical "first
+        # observed in this status" anchor across heartbeats.
+        row.role_health = dict(body.role_health)
 
     # Auto-clear desired_appliance_version once installed matches +
     # the upgrade landed cleanly. Same shape as #138 Phase 8f-4's
@@ -990,6 +1007,12 @@ class ApplianceRow(BaseModel):
     # compose-lifecycle apply.
     role_switch_state: str | None
     role_switch_reason: str | None
+    # #170 Wave E — service-container watchdog. Per-service health
+    # the supervisor reports every 5 min via heartbeat. Keys are
+    # compose service names (``dns-bind9`` / ``dns-powerdns`` /
+    # ``dhcp-kea``); values carry ``{role, status, since,
+    # container_id}``.
+    role_health: dict[str, dict[str, Any]]
     created_at: datetime
 
 
@@ -1044,6 +1067,7 @@ def _row_to_schema(row: Appliance) -> ApplianceRow:
         port_conflicts=dict(row.port_conflicts or {}),
         role_switch_state=row.role_switch_state,
         role_switch_reason=row.role_switch_reason,
+        role_health=dict(row.role_health or {}),
         created_at=row.created_at,
     )
 

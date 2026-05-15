@@ -56,8 +56,23 @@ _HOST_ENV_FILE = Path("/etc/spatiumddi-host/.env")
 
 # Every service the supervisor can start. Names match the
 # ``services:`` keys in the appliance compose. The active subset
-# = intersection of this list + the operator's role assignment.
+# = intersection of this list + the operator's role assignment
+# (after profile→service mapping below).
 SUPERVISED_SERVICES = ("dns-bind9", "dns-powerdns", "dhcp-kea")
+
+# Compose profile → compose service name. ``COMPOSE_PROFILES`` (and
+# the ``profiles`` list ``apply_role_assignment`` receives from
+# ``compute_target_env``) carries profile values, which match
+# service names for DNS but NOT for DHCP — its profile is ``dhcp``
+# while its service is ``dhcp-kea``. Without the mapping the
+# desired-set intersection drops DHCP silently and ``up -d`` never
+# brings the kea container up. Mirrors ``watchdog._PROFILE_TO_SERVICE``;
+# keep them in sync.
+_PROFILE_TO_SERVICE: dict[str, str] = {
+    "dns-bind9": "dns-bind9",
+    "dns-powerdns": "dns-powerdns",
+    "dhcp": "dhcp-kea",
+}
 
 
 @dataclass(frozen=True)
@@ -154,7 +169,16 @@ def apply_role_assignment(
     if not available:
         return LifecycleResult(state="idle", reason=reason)
 
-    desired = [p for p in profiles if p in SUPERVISED_SERVICES]
+    # Map each profile to its compose service name, drop anything
+    # outside SUPERVISED_SERVICES (observer / custom roles have no
+    # service container). Without this mapping ``up -d <profile>``
+    # silently no-ops for DHCP because the compose service is
+    # ``dhcp-kea`` while the profile is just ``dhcp``.
+    desired: list[str] = []
+    for p in profiles:
+        svc = _PROFILE_TO_SERVICE.get(p)
+        if svc is not None and svc in SUPERVISED_SERVICES:
+            desired.append(svc)
     running = _running_supervised_services(compose_file)
     to_stop = [s for s in running if s not in desired]
     to_start = desired  # ``up -d`` is idempotent — pass the full target set

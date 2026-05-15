@@ -53,6 +53,7 @@ from .role_orchestrator import (
     probe_port_conflicts,
     render_env_file,
 )
+from . import watchdog
 from .service_lifecycle import apply_role_assignment
 
 # #170 Wave C2 — role-driven compose env file. Written under the
@@ -244,6 +245,25 @@ def _supervisor_version() -> str:
     from . import __version__
 
     return __version__
+
+
+# #170 Wave E — periodic service-container watchdog. Heartbeat
+# carries the watchdog's last verdict to the control plane (one
+# entry per assigned compose service). Watchdog itself fires every
+# ``_WATCHDOG_INTERVAL_S`` (5 min by default) — same shape as the
+# firewall drift check below: a short throttled run shared across
+# multiple heartbeats so the watchdog signal is fresh without
+# spamming the docker daemon every minute.
+_WATCHDOG_INTERVAL_S = 300.0  # 5 minutes
+_last_watchdog_at: float = 0.0
+_cached_role_health: dict[str, Any] = {}
+
+
+def _watchdog_check_due() -> bool:
+    """First call always returns True (forces a probe within the
+    first watchdog cadence after startup); subsequent calls gate on
+    monotonic elapsed."""
+    return time.monotonic() - _last_watchdog_at >= _WATCHDOG_INTERVAL_S
 
 
 # Periodic firewall live-ruleset verification. Read the actual
@@ -523,6 +543,26 @@ def heartbeat_once(
         body["role_switch_state"] = last_lifecycle_state
         if last_lifecycle_reason is not None:
             body["role_switch_reason"] = last_lifecycle_reason
+
+    # #170 Wave E — service-container watchdog. Every
+    # ``_WATCHDOG_INTERVAL_S`` we snapshot the running containers and
+    # diff against the supervisor's persisted role assignment; the
+    # result rides on every heartbeat (cached between watchdog runs so
+    # the Fleet UI doesn't see the field flicker between probes). On
+    # the appliance only — docker/k8s deployments don't run this
+    # lifecycle path, so the watchdog has nothing to watch.
+    global _last_watchdog_at, _cached_role_health
+    if appliance_state.detect_deployment_kind() == "appliance":
+        if _watchdog_check_due():
+            try:
+                env_file = cfg.state_dir / _ROLE_ENV_FILENAME
+                _cached_role_health = watchdog.check_health(env_file)
+                _last_watchdog_at = time.monotonic()
+            except Exception as exc:  # noqa: BLE001
+                # Never let a watchdog crash kill the heartbeat path.
+                log.warning("supervisor.watchdog.crashed", error=str(exc))
+        if _cached_role_health:
+            body["role_health"] = _cached_role_health
     url_path = "/api/v1/appliance/supervisor/heartbeat"
     url = cfg.control_plane_url.rstrip("/") + url_path
 
@@ -702,6 +742,12 @@ def heartbeat_once(
             # this one — we've already POSTed). Cache them on disk so a
             # supervisor restart doesn't lose them.
             _persist_lifecycle_state(cfg.state_dir, lifecycle.state, lifecycle.reason)
+            # The runtime set just changed (or attempted to) — invalidate
+            # the watchdog cache so the next heartbeat re-probes
+            # immediately rather than rendering 5-min-stale health.
+            # ``_last_watchdog_at`` is already declared global at the
+            # top of this function (one declaration per scope rule).
+            _last_watchdog_at = 0.0
             # Only stamp the hash on success — a failed apply should
             # re-attempt on the next heartbeat (the failure may have
             # been transient: image pull glitch, transient port

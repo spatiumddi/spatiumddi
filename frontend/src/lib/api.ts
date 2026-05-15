@@ -7206,6 +7206,20 @@ export interface ApplianceRow {
   // or null on the first heartbeat / before any role assignment.
   role_switch_state: string | null;
   role_switch_reason: string | null;
+  // #170 Wave E — supervisor's service-container watchdog. Free-form
+  // map keyed by compose service name (``dns-bind9`` / ``dns-powerdns``
+  // / ``dhcp-kea``); each value carries the per-service health verdict.
+  // Empty when the supervisor hasn't run a watchdog probe yet or the
+  // appliance is idle (no roles assigned).
+  role_health: Record<
+    string,
+    {
+      role: string;
+      status: "healthy" | "missing" | "unhealthy" | "starting";
+      since: string;
+      container_id: string | null;
+    }
+  >;
   created_at: string;
 }
 

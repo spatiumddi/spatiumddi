@@ -113,7 +113,58 @@ function capabilityChips(caps: SupervisorCapabilities): {
   return out;
 }
 
-export function ApprovalsTab() {
+// Service chips rendered in the appliance-list Services column.
+// Distinct from ``capabilityChips``: capabilities = what the supervisor
+// CAN run (image is loaded), services = what the supervisor IS running
+// (operator assigned the role + the compose lifecycle reports it healthy).
+// Colour follows ``role_switch_state``: ``ready`` → green, ``failed`` →
+// rose, anything else (``idle`` / null / pre-first-apply) → amber.
+// ``observer`` always renders neutral because there's no service
+// container behind it — the supervisor IS the observer.
+function serviceChips(row: ApplianceRow): {
+  key: string;
+  label: string;
+  status: "ready" | "failed" | "pending" | "neutral";
+}[] {
+  const roles = row.assigned_roles ?? [];
+  if (roles.length === 0) return [];
+  const lifecycle = row.role_switch_state;
+  const serviceStatus: "ready" | "failed" | "pending" =
+    lifecycle === "ready"
+      ? "ready"
+      : lifecycle === "failed"
+        ? "failed"
+        : "pending";
+  const out: { key: string; label: string; status: "ready" | "failed" | "pending" | "neutral" }[] = [];
+  if (roles.includes("dns-bind9"))
+    out.push({ key: "dns-bind9", label: "DNS · BIND9", status: serviceStatus });
+  if (roles.includes("dns-powerdns"))
+    out.push({
+      key: "dns-powerdns",
+      label: "DNS · PowerDNS",
+      status: serviceStatus,
+    });
+  if (roles.includes("dhcp"))
+    out.push({ key: "dhcp", label: "DHCP", status: serviceStatus });
+  if (roles.includes("observer"))
+    out.push({ key: "observer", label: "Observer", status: "neutral" });
+  return out;
+}
+
+const SERVICE_CHIP_STYLES: Record<
+  "ready" | "failed" | "pending" | "neutral",
+  string
+> = {
+  ready:
+    "bg-emerald-500/15 text-emerald-700 border-emerald-500/40 dark:text-emerald-300",
+  failed:
+    "bg-rose-500/15 text-rose-700 border-rose-500/40 dark:text-rose-300",
+  pending:
+    "bg-amber-500/15 text-amber-700 border-amber-500/40 dark:text-amber-300",
+  neutral: "bg-muted text-muted-foreground border-border",
+};
+
+export function FleetTab() {
   const qc = useQueryClient();
   const { data: me } = useQuery({
     queryKey: ["me"],
@@ -123,7 +174,7 @@ export function ApprovalsTab() {
   const isSuperadmin = me?.is_superadmin ?? false;
 
   const { data, isLoading, isFetching, refetch, error } = useQuery({
-    queryKey: ["appliance", "approvals"],
+    queryKey: ["appliance", "fleet"],
     queryFn: applianceApprovalApi.list,
     refetchInterval: (query) => {
       const rows = query.state.data ?? [];
@@ -152,7 +203,7 @@ export function ApprovalsTab() {
   const approve = useMutation({
     mutationFn: (id: string) => applianceApprovalApi.approve(id),
     onSuccess: (row) => {
-      qc.invalidateQueries({ queryKey: ["appliance", "approvals"] });
+      qc.invalidateQueries({ queryKey: ["appliance", "fleet"] });
       // Refresh the open drilldown with the updated row so the
       // operator sees ``approved`` state + cert serial + role
       // assignment section immediately, instead of staring at a
@@ -163,7 +214,7 @@ export function ApprovalsTab() {
   const reject = useMutation({
     mutationFn: (id: string) => applianceApprovalApi.reject(id),
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["appliance", "approvals"] });
+      qc.invalidateQueries({ queryKey: ["appliance", "fleet"] });
       setRejectTarget(null);
     },
   });
@@ -178,7 +229,7 @@ export function ApprovalsTab() {
     mutationFn: ({ id, password }: { id: string; password: string }) =>
       applianceApprovalApi.remove(id, password),
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["appliance", "approvals"] });
+      qc.invalidateQueries({ queryKey: ["appliance", "fleet"] });
       setDeleteTarget(null);
       setDrilldown(null);
       setDeletePwError(null);
@@ -202,7 +253,7 @@ export function ApprovalsTab() {
   const rekey = useMutation({
     mutationFn: (id: string) => applianceApprovalApi.rekey(id),
     onSuccess: (row) => {
-      qc.invalidateQueries({ queryKey: ["appliance", "approvals"] });
+      qc.invalidateQueries({ queryKey: ["appliance", "fleet"] });
       setRekeyTarget(null);
       // Refresh the drilldown view if it's open on this row so the
       // operator sees the new serial + expiry immediately.
@@ -237,37 +288,55 @@ export function ApprovalsTab() {
     );
   }
 
-  const navItems: {
+  // Two sections — Infrastructure (appliance lifecycle: approve / pair /
+  // upgrade) and Services (fleet-wide host-OS subsystems that ride the
+  // supervisor's ConfigBundle long-poll). Items inside a section stay
+  // alphabetical; sections are deliberately ordered (Infrastructure
+  // first because it's the more frequently-used). Future Wave-E
+  // host-OS surfaces (#155-#166 — APT proxy, syslog forwarder, SSH
+  // authorized_keys, etc.) drop into Services without restructuring.
+  type NavItem = {
     key: "appliances" | "pairing" | "slot-images" | "ntp" | "snmp";
     label: string;
     summary: string;
     badge?: string | number;
-  }[] = [
+  };
+  const navGroups: { heading: string; items: NavItem[] }[] = [
     {
-      key: "appliances",
-      label: "Appliances",
-      summary: "Approve / manage paired supervisors.",
-      badge: pending.length > 0 ? pending.length : undefined,
+      heading: "Infrastructure",
+      items: [
+        {
+          key: "appliances",
+          label: "Appliances",
+          summary: "Approve / manage paired supervisors.",
+          badge: pending.length > 0 ? pending.length : undefined,
+        },
+        {
+          key: "pairing",
+          label: "Pairing codes",
+          summary: "Mint codes for new appliances.",
+        },
+        {
+          key: "slot-images",
+          label: "Slot images",
+          summary: "Air-gap .raw.xz upload + browse.",
+        },
+      ],
     },
     {
-      key: "ntp",
-      label: "NTP",
-      summary: "Fleet-wide chrony config.",
-    },
-    {
-      key: "pairing",
-      label: "Pairing codes",
-      summary: "Mint codes for new appliances.",
-    },
-    {
-      key: "slot-images",
-      label: "Slot images",
-      summary: "Air-gap .raw.xz upload + browse.",
-    },
-    {
-      key: "snmp",
-      label: "SNMP",
-      summary: "Fleet-wide snmpd config.",
+      heading: "Services",
+      items: [
+        {
+          key: "ntp",
+          label: "NTP",
+          summary: "Fleet-wide chrony config.",
+        },
+        {
+          key: "snmp",
+          label: "SNMP",
+          summary: "Fleet-wide snmpd config.",
+        },
+      ],
     },
   ];
 
@@ -282,28 +351,35 @@ export function ApprovalsTab() {
           </p>
         </div>
         <nav className="p-2">
-          {navItems.map((item) => (
-            <button
-              key={item.key}
-              type="button"
-              onClick={() => setView(item.key)}
-              className={cn(
-                "block w-full rounded-md px-3 py-2 text-left text-sm hover:bg-accent",
-                view === item.key && "bg-accent font-medium",
-              )}
-            >
-              <span className="flex items-center justify-between gap-2">
-                <span>{item.label}</span>
-                {item.badge !== undefined && (
-                  <span className="rounded-full bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 dark:text-amber-300">
-                    {item.badge}
+          {navGroups.map((group, gi) => (
+            <div key={group.heading} className={cn(gi > 0 && "mt-3")}>
+              <div className="px-3 pb-1 pt-1 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground/70">
+                {group.heading}
+              </div>
+              {group.items.map((item) => (
+                <button
+                  key={item.key}
+                  type="button"
+                  onClick={() => setView(item.key)}
+                  className={cn(
+                    "block w-full rounded-md px-3 py-2 text-left text-sm hover:bg-accent",
+                    view === item.key && "bg-accent font-medium",
+                  )}
+                >
+                  <span className="flex items-center justify-between gap-2">
+                    <span>{item.label}</span>
+                    {item.badge !== undefined && (
+                      <span className="rounded-full bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 dark:text-amber-300">
+                        {item.badge}
+                      </span>
+                    )}
                   </span>
-                )}
-              </span>
-              <span className="mt-0.5 block text-[11px] text-muted-foreground">
-                {item.summary}
-              </span>
-            </button>
+                  <span className="mt-0.5 block text-[11px] text-muted-foreground">
+                    {item.summary}
+                  </span>
+                </button>
+              ))}
+            </div>
           ))}
         </nav>
       </aside>
@@ -433,6 +509,9 @@ export function ApprovalsTab() {
                         </th>
                         <th className="px-3 py-2 text-left font-medium">
                           State
+                        </th>
+                        <th className="px-3 py-2 text-left font-medium">
+                          Services
                         </th>
                         <th className="px-3 py-2 text-left font-medium">
                           Capabilities
@@ -600,6 +679,44 @@ export function ApprovalsTab() {
   );
 }
 
+// Compact "what's actually running on this appliance" cell rendered
+// in the Appliances list. Empty assigned_roles → ``—``; non-empty
+// renders one chip per role with colour driven by the supervisor's
+// last ``role_switch_state`` heartbeat.
+function ServiceChipList({ row }: { row: ApplianceRow }) {
+  const services = serviceChips(row);
+  if (services.length === 0) {
+    return <span className="text-xs text-muted-foreground">—</span>;
+  }
+  return (
+    <div className="flex flex-wrap gap-1">
+      {services.map((s) => (
+        <span
+          key={s.key}
+          className={cn(
+            "inline-flex items-center gap-1 rounded-full border px-1.5 py-0.5 text-[10px] font-medium",
+            SERVICE_CHIP_STYLES[s.status],
+          )}
+          title={
+            s.status === "ready"
+              ? `Assigned + healthy (supervisor reports role_switch_state=ready)`
+              : s.status === "failed"
+                ? `Assigned, supervisor lifecycle apply failed — inspect drilldown`
+                : s.status === "pending"
+                  ? `Assigned, supervisor hasn't reported ready yet`
+                  : `Assigned (no service container — supervisor is the runtime)`
+          }
+        >
+          {s.status === "ready" && <CheckCircle2 className="h-2.5 w-2.5" />}
+          {s.status === "failed" && <AlertCircle className="h-2.5 w-2.5" />}
+          {s.status === "pending" && <Loader2 className="h-2.5 w-2.5" />}
+          {s.label}
+        </span>
+      ))}
+    </div>
+  );
+}
+
 function ApplianceTableRow({
   row,
   highlight,
@@ -648,6 +765,9 @@ function ApplianceTableRow({
         >
           <Icon className="h-3 w-3" /> {badge.label}
         </span>
+      </td>
+      <td className="px-3 py-2">
+        <ServiceChipList row={row} />
       </td>
       <td className="px-3 py-2">
         <div className="flex flex-wrap gap-1">
@@ -861,6 +981,11 @@ function ApplianceDrilldownModal({
           <ApplianceRoleAssignmentSection row={row} onSaved={onRowUpdated} />
         )}
 
+        {row.state === "approved" &&
+          Object.keys(row.role_health ?? {}).length > 0 && (
+            <ApplianceRoleHealthSection row={row} />
+          )}
+
         {row.state === "approved" && <ApplianceOsUpgradeSection row={row} />}
 
         {row.state === "approved" && (
@@ -995,6 +1120,122 @@ const ROLE_OPTIONS: { value: string; label: string; capKey?: string }[] = [
   { value: "observer", label: "Observer", capKey: "can_run_observer" },
 ];
 
+// ── Service-container watchdog section (#170 Wave E) ───────────
+//
+// Renders the supervisor's per-service health verdict (refreshed
+// every 5 min on the appliance). Each entry carries status +
+// ``since`` (when the supervisor first observed this status) +
+// container_id, so a regression like "dhcp-kea unhealthy for 12 m"
+// surfaces without SSH'ing in.
+
+function formatRelativeSince(iso: string): string {
+  const since = new Date(iso).getTime();
+  if (!Number.isFinite(since)) return iso;
+  const seconds = Math.max(0, Math.round((Date.now() - since) / 1000));
+  if (seconds < 60) return `${seconds}s ago`;
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return `${minutes}m ago`;
+  const hours = Math.round(minutes / 60);
+  if (hours < 24) return `${hours}h ago`;
+  return `${Math.round(hours / 24)}d ago`;
+}
+
+const WATCHDOG_STATUS_STYLES: Record<
+  "healthy" | "missing" | "unhealthy" | "starting",
+  { className: string; label: string; Icon: typeof CheckCircle2 }
+> = {
+  healthy: {
+    className:
+      "bg-emerald-500/15 text-emerald-700 border-emerald-500/40 dark:text-emerald-300",
+    label: "healthy",
+    Icon: CheckCircle2,
+  },
+  missing: {
+    className:
+      "bg-rose-500/15 text-rose-700 border-rose-500/40 dark:text-rose-300",
+    label: "missing",
+    Icon: AlertCircle,
+  },
+  unhealthy: {
+    className:
+      "bg-rose-500/15 text-rose-700 border-rose-500/40 dark:text-rose-300",
+    label: "unhealthy",
+    Icon: AlertCircle,
+  },
+  starting: {
+    className:
+      "bg-amber-500/15 text-amber-700 border-amber-500/40 dark:text-amber-300",
+    label: "starting",
+    Icon: Loader2,
+  },
+};
+
+function ApplianceRoleHealthSection({ row }: { row: ApplianceRow }) {
+  const entries = Object.entries(row.role_health ?? {});
+  // Show services in a stable order — alphabetical by service name.
+  entries.sort(([a], [b]) => a.localeCompare(b));
+  return (
+    <div className="border-t pt-4">
+      <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+        Service health
+      </h3>
+      <p className="mt-1 text-xs text-muted-foreground">
+        Supervisor watchdog snapshot — refreshed every 5 min. ``missing`` /
+        ``unhealthy`` for more than one cadence means the auto-heal kicker
+        didn&apos;t bring the container back; SSH in and check{" "}
+        <code>docker logs &lt;service&gt;</code>.
+      </p>
+      <div className="mt-2 overflow-hidden rounded-md border">
+        <table className="w-full text-xs">
+          <thead className="bg-muted/40 text-[10px] uppercase tracking-wide text-muted-foreground">
+            <tr>
+              <th className="px-3 py-1.5 text-left font-medium">Service</th>
+              <th className="px-3 py-1.5 text-left font-medium">Role</th>
+              <th className="px-3 py-1.5 text-left font-medium">Status</th>
+              <th className="px-3 py-1.5 text-left font-medium">Since</th>
+              <th className="px-3 py-1.5 text-left font-medium">Container</th>
+            </tr>
+          </thead>
+          <tbody className="divide-y">
+            {entries.map(([svc, h]) => {
+              const style =
+                WATCHDOG_STATUS_STYLES[h.status] ??
+                WATCHDOG_STATUS_STYLES.unhealthy;
+              const Icon = style.Icon;
+              return (
+                <tr key={svc}>
+                  <td className="px-3 py-1.5 font-mono">{svc}</td>
+                  <td className="px-3 py-1.5">{h.role}</td>
+                  <td className="px-3 py-1.5">
+                    <span
+                      className={cn(
+                        "inline-flex items-center gap-1 rounded-full border px-1.5 py-0.5 text-[10px] font-medium",
+                        style.className,
+                      )}
+                    >
+                      <Icon className="h-2.5 w-2.5" />
+                      {style.label}
+                    </span>
+                  </td>
+                  <td
+                    className="px-3 py-1.5 text-muted-foreground"
+                    title={h.since}
+                  >
+                    {formatRelativeSince(h.since)}
+                  </td>
+                  <td className="px-3 py-1.5 font-mono text-muted-foreground">
+                    {h.container_id ?? "—"}
+                  </td>
+                </tr>
+              );
+            })}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  );
+}
+
 function ApplianceRoleAssignmentSection({
   row,
   onSaved,
@@ -1060,7 +1301,7 @@ function ApplianceRoleAssignmentSection({
         firewall_extra: firewallExtra,
       }),
     onSuccess: (updated) => {
-      qc.invalidateQueries({ queryKey: ["appliance", "approvals"] });
+      qc.invalidateQueries({ queryKey: ["appliance", "fleet"] });
       setSavedAt(Date.now());
       onSaved(updated);
     },
@@ -1331,7 +1572,7 @@ function ApplianceOsUpgradeSection({ row }: { row: ApplianceRow }) {
           : { kind: "uploaded", slot_image_id: slotImageId },
       ),
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["appliance", "approvals"] });
+      qc.invalidateQueries({ queryKey: ["appliance", "fleet"] });
       setTag("");
       setImageUrl("");
       setSlotImageId("");
@@ -1340,12 +1581,12 @@ function ApplianceOsUpgradeSection({ row }: { row: ApplianceRow }) {
   const clearUpgrade = useMutation({
     mutationFn: () => applianceApprovalApi.clearUpgrade(row.id),
     onSuccess: () =>
-      qc.invalidateQueries({ queryKey: ["appliance", "approvals"] }),
+      qc.invalidateQueries({ queryKey: ["appliance", "fleet"] }),
   });
   const reboot = useMutation({
     mutationFn: () => applianceApprovalApi.scheduleReboot(row.id),
     onSuccess: () => {
-      qc.invalidateQueries({ queryKey: ["appliance", "approvals"] });
+      qc.invalidateQueries({ queryKey: ["appliance", "fleet"] });
       setRebootConfirm(false);
     },
   });
@@ -1611,6 +1852,10 @@ function SlotImageManager() {
     loaded: number;
     total: number;
   } | null>(null);
+  // Slot images are heavy (typically ~700 MiB raw.xz) and a misclick
+  // wipes the only on-server copy of an air-gap-cached release — gate
+  // the delete behind a typed-confirm modal.
+  const [deleteTarget, setDeleteTarget] = useState<SlotImage | null>(null);
 
   const imagesQuery = useQuery({
     queryKey: ["appliance", "slot-images"],
@@ -1640,8 +1885,10 @@ function SlotImageManager() {
 
   const remove = useMutation({
     mutationFn: (id: string) => applianceSlotImagesApi.remove(id),
-    onSuccess: () =>
-      qc.invalidateQueries({ queryKey: ["appliance", "slot-images"] }),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["appliance", "slot-images"] });
+      setDeleteTarget(null);
+    },
   });
 
   return (
@@ -1772,7 +2019,7 @@ function SlotImageManager() {
                 <td className="px-2 py-1 text-right">
                   <button
                     type="button"
-                    onClick={() => remove.mutate(img.id)}
+                    onClick={() => setDeleteTarget(img)}
                     className="inline-flex items-center gap-1 rounded-md border bg-background px-2 py-0.5 hover:bg-muted"
                   >
                     <Trash2 className="h-3 w-3" />
@@ -1783,6 +2030,42 @@ function SlotImageManager() {
             ))}
           </tbody>
         </table>
+      )}
+
+      {deleteTarget && (
+        <ConfirmModal
+          open
+          title="Delete slot image?"
+          message={
+            <>
+              <p className="text-sm">
+                Delete the uploaded <code>.raw.xz</code> for{" "}
+                <strong>{deleteTarget.appliance_version}</strong>? The on-server
+                copy is removed and any in-flight slot upgrade pointing at it
+                will fail with a 404 on the next fetch. Re-uploading is
+                operator-effort — typically a few hundred MiB.
+              </p>
+              {deleteTarget.notes && (
+                <p className="mt-2 text-xs text-muted-foreground">
+                  Notes:{" "}
+                  <span className="text-foreground">{deleteTarget.notes}</span>
+                </p>
+              )}
+              <p className="mt-2 text-xs text-muted-foreground">
+                SHA-256:{" "}
+                <code className="text-foreground">
+                  {deleteTarget.sha256.slice(0, 12)}…
+                  {deleteTarget.sha256.slice(-6)}
+                </code>
+              </p>
+            </>
+          }
+          confirmLabel="Delete"
+          tone="destructive"
+          loading={remove.isPending}
+          onConfirm={() => remove.mutate(deleteTarget.id)}
+          onClose={() => setDeleteTarget(null)}
+        />
       )}
     </div>
   );

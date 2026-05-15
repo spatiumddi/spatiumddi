@@ -12,7 +12,7 @@ import {
 
 import { applianceApi } from "@/lib/api";
 import { useSessionState } from "@/lib/useSessionState";
-import { ApprovalsTab } from "./ApprovalsTab";
+import { FleetTab } from "./FleetTab";
 import { CertificatesTab } from "./CertificatesTab";
 import { ContainersTab } from "./ContainersTab";
 import { LogsTab } from "./LogsTab";
@@ -37,7 +37,7 @@ import { ReleasesTab } from "./ReleasesTab";
  */
 type Tab =
   | "tls"
-  | "approvals"
+  | "fleet"
   | "releases"
   | "containers"
   | "logs"
@@ -76,7 +76,7 @@ const TABS: TabSpec[] = [
     // rows expose role assignment, OS upgrade, reboot, re-key, and
     // delete via the per-row drilldown. Not selfOnly: docker / k8s
     // control planes still manage remote Application appliances here.
-    key: "approvals",
+    key: "fleet",
     label: "Fleet",
     phase: "170-D1",
     icon: Stamp,
@@ -232,8 +232,8 @@ export function AppliancePage() {
       <div className="flex-1 overflow-auto bg-background p-6">
         {effectiveTab === "tls" ? (
           <CertificatesTab />
-        ) : effectiveTab === "approvals" ? (
-          <ApprovalsTab />
+        ) : effectiveTab === "fleet" ? (
+          <FleetTab />
         ) : effectiveTab === "releases" ? (
           <ReleasesTab applianceMode={isApplianceHost} />
         ) : effectiveTab === "containers" ? (

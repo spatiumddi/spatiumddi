@@ -207,14 +207,14 @@ Three channels:
 
 **Agent-local.** The control-plane BIND9 driver does **not** connect to `named` directly. Instead:
 
-1. Control plane computes the record delta and writes `pending_record_ops` rows.
-2. The agent pulls them via config long-poll.
-3. The agent invokes `nsupdate` (or the 0.0.1:8081`) **against its own daemon over loopback**.
+1. Control plane computes the record delta and writes one `pending_record_ops` row **per enabled agent-based server in the zone's group** (per-server queue keyed on `server_id`). Pre-2026.05.14-1 the queue only went to the `is_primary=True` server, which silently broke multi-server (and supervised-appliance) groups — secondaries' on-disk zone files stayed frozen at the bundle they received on initial register. Under #170 every DNS agent renders the zone as `type master` (independent authoritative copy) so record CRUD has to land on every one.
+2. Each agent pulls its own queued ops via config long-poll (the bundle ships `pending_record_ops` for any agent-based server regardless of `is_primary`; the `is_primary` flag now only matters for the agentless / Windows-DNS path where exactly one server writes).
+3. The agent invokes `nsupdate` **against its own daemon over loopback**.
 4. The agent ACKs success/failure per-op on the next heartbeat.
 
 Rationale: loopback `nsupdate` is simpler, never traverses the network as a TSIG-sensitive payload, and makes the agent the single enforcer of the local daemon state. The TSIG key lives only on the container.
 
-The control-plane `DNSDriverBase` implementations become **thin**: they translate the DB model into a canonical `AgentConfigBundle` + `RecordOp` list. They do not speak `nsupdate via RFC 2136 directly.
+The control-plane `DNSDriverBase` implementations become **thin**: they translate the DB model into a canonical `AgentConfigBundle` + `RecordOp` list. They do not speak `nsupdate` via RFC 2136 directly.
 
 ### Local disk cache (non-negotiable #5)
 

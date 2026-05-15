@@ -161,7 +161,22 @@ def main() -> int:
         "true",
         "yes",
     )
+    # #170 Wave E — external watchdog liveness anchor. The host-side
+    # ``spatiumddi-supervisor-watchdog.timer`` reads this file's
+    # mtime every 2 min and force-restarts the supervisor container
+    # if the loop hasn't ticked in >5 min. Stamped at the TOP of
+    # every iteration (not just after a successful heartbeat) so a
+    # transient control-plane outage doesn't trigger an unnecessary
+    # restart — the loop is alive even when ``heartbeat_once`` fails.
+    # ``touch`` semantics: open + close to update mtime; cheap on a
+    # 1-CPU VM and a stuck loop simply stops doing it.
+    liveness_path = cfg.state_dir / "last-loop-at"
+
     while not stop:
+        try:
+            liveness_path.touch()
+        except OSError as exc:
+            log.warning("supervisor.liveness.touch_failed", error=str(exc))
         appliance_id = load_appliance_id(cfg.state_dir)
         if appliance_id is not None and cfg.control_plane_url:
             session_token = load_session_token(cfg.state_dir)
