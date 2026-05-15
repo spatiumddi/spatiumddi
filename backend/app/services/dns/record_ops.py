@@ -266,9 +266,7 @@ async def enqueue_record_ops_batch(
     if not is_agentless(primary.driver):
         # Agent-based: DB rows only; agent will batch at poll time.
         return [
-            await enqueue_record_op(
-                db, zone, o["op"], o["record"], o.get("target_serial")
-            )
+            await enqueue_record_op(db, zone, o["op"], o["record"], o.get("target_serial"))
             for o in ops
         ]
 
@@ -368,9 +366,7 @@ async def _apply_agentless_batch(
     return list(op_rows)
 
 
-async def ack_op(
-    db: AsyncSession, op_id: str, result: str, message: str | None = None
-) -> None:
+async def ack_op(db: AsyncSession, op_id: str, result: str, message: str | None = None) -> None:
     """Mark an op applied (ok) or failed."""
     from datetime import UTC, datetime
 

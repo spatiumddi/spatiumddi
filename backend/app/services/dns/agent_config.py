@@ -95,9 +95,7 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
     opts = opts_res.scalar_one_or_none()
 
     # Views
-    views_res = await db.execute(
-        select(DNSView).where(DNSView.group_id == server.group_id)
-    )
+    views_res = await db.execute(select(DNSView).where(DNSView.group_id == server.group_id))
     views = views_res.scalars().all()
 
     # ACLs
@@ -109,9 +107,7 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
     acls = acls_res.scalars().all()
 
     # Zones (+ records for primary only)
-    zones_res = await db.execute(
-        select(DNSZone).where(DNSZone.group_id == server.group_id)
-    )
+    zones_res = await db.execute(select(DNSZone).where(DNSZone.group_id == server.group_id))
     zones = zones_res.scalars().all()
 
     zone_payload: list[dict[str, Any]] = []
@@ -199,11 +195,7 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
     # auto-generated single key on DNSServerGroup. Both kinds end up in
     # the same `key { … };` block via the named.conf template.
     op_keys = (
-        (
-            await db.execute(
-                select(DNSTSIGKey).where(DNSTSIGKey.group_id == server.group_id)
-            )
-        )
+        (await db.execute(select(DNSTSIGKey).where(DNSTSIGKey.group_id == server.group_id)))
         .scalars()
         .all()
     )
@@ -221,21 +213,15 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
         "forwarders": getattr(opts, "forwarders", []) if opts else [],
         "forward_policy": getattr(opts, "forward_policy", "first") if opts else "first",
         "recursion_enabled": getattr(opts, "recursion_enabled", True) if opts else True,
-        "dnssec_validation": (
-            getattr(opts, "dnssec_validation", "auto") if opts else "auto"
-        ),
+        "dnssec_validation": (getattr(opts, "dnssec_validation", "auto") if opts else "auto"),
         "allow_query": getattr(opts, "allow_query", ["any"]) if opts else ["any"],
-        "allow_transfer": (
-            getattr(opts, "allow_transfer", ["none"]) if opts else ["none"]
-        ),
+        "allow_transfer": (getattr(opts, "allow_transfer", ["none"]) if opts else ["none"]),
         # Query logging — surfaced to BIND9's named.conf via template
         # render and to PowerDNS's pdns.conf via the agent's
         # ``_render_conf``. Keep ``query_log_enabled`` in the
         # structural fingerprint so toggling it in the UI reliably
         # triggers a daemon reload.
-        "query_log_enabled": (
-            bool(getattr(opts, "query_log_enabled", False)) if opts else False
-        ),
+        "query_log_enabled": (bool(getattr(opts, "query_log_enabled", False)) if opts else False),
     }
     views_block = [
         {
@@ -284,9 +270,7 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
             # Members are every primary zone in the group. Forward / stub
             # zones don't belong in a catalog (they're lookups, not
             # served data); secondaries are the consumer's responsibility.
-            member_names = sorted(
-                z.name for z in zones if z.zone_type in ("primary", "master")
-            )
+            member_names = sorted(z.name for z in zones if z.zone_type in ("primary", "master"))
             if server.id == producer.id:
                 catalog_block = {
                     "mode": "producer",
@@ -394,9 +378,7 @@ async def build_config_bundle(db: AsyncSession, server: DNSServer) -> ConfigBund
         "views": views_block,
         "acls": acls_block,
         "tsig_keys": tsig_keys,
-        "zones_structural": [
-            {k: v for k, v in z.items() if k != "records"} for z in zone_payload
-        ],
+        "zones_structural": [{k: v for k, v in z.items() if k != "records"} for z in zone_payload],
         # Blocklists affect named.conf (response-policy block) + RPZ zone
         # files, so a change MUST trigger a daemon reload.
         "blocklists": blocklists_payload,
