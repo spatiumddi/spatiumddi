@@ -99,6 +99,11 @@ class ReconcileSummary:
     subnets_created: int = 0
     subnets_updated: int = 0
     subnets_deleted: int = 0
+    # Issue #177: counted when a pre-existing operator-owned subnet at
+    # an exact-CIDR match was reused instead of creating a duplicate.
+    # Surfaces in the per-run audit blob so operators can see when their
+    # own rows took the path Proxmox would otherwise have created.
+    subnets_matched: int = 0
     addresses_created: int = 0
     addresses_updated: int = 0
     addresses_deleted: int = 0
@@ -506,8 +511,38 @@ async def _apply_blocks_and_subnets(
         existing_networks[supernet] = parent
         summary.blocks_created += 1
 
-    res = await db.execute(select(Subnet).where(Subnet.proxmox_node_id == node.id))
-    current_subnets = {str(s.network): s for s in res.scalars().all()}
+    # Issue #177: match by CIDR across the whole space. Loading only
+    # ``proxmox_node_id == node.id`` rows meant a manually-created or
+    # different-integration subnet at the same CIDR was invisible to
+    # us, and we'd spawn a duplicate ``vnet:<name>`` twin on every
+    # reconcile. We now classify every subnet in the space into:
+    #   * node-owned       — drives the update + delete paths below
+    #   * operator-owned   — reused as-is (no claim, no overwrite) so
+    #                        the operator's curated row survives untouched
+    #   * foreign          — owned by another integration; we warn and
+    #                        skip without creating a duplicate
+    all_subnet_rows = (
+        (await db.execute(select(Subnet).where(Subnet.space_id == node.ipam_space_id)))
+        .scalars()
+        .all()
+    )
+    current_subnets: dict[str, Subnet] = {}
+    operator_subnets: dict[str, Subnet] = {}
+    foreign_subnets: dict[str, Subnet] = {}
+    for s in all_subnet_rows:
+        net_key = str(s.network)
+        if s.proxmox_node_id == node.id:
+            current_subnets[net_key] = s
+        elif (
+            s.proxmox_node_id is None
+            and s.kubernetes_cluster_id is None
+            and s.docker_host_id is None
+            and s.tailscale_tenant_id is None
+            and s.unifi_controller_id is None
+        ):
+            operator_subnets[net_key] = s
+        else:
+            foreign_subnets[net_key] = s
 
     desired_map = {d.network: d for d in desired_subnets}
     used_wrapper_cidrs: set[str] = set()
@@ -537,6 +572,25 @@ async def _apply_blocks_and_subnets(
         summary.subnets_deleted += 1
 
     for net_str, d in desired_map.items():
+        # Issue #177: an operator subnet at this exact CIDR wins. We
+        # reuse it without claiming ownership or rewriting any of its
+        # fields — operator-curated rows survive reconciles untouched.
+        # IP addresses still mirror into it via ``_find_subnet_for_ip``
+        # in the addresses apply pass.
+        if net_str in operator_subnets:
+            summary.subnets_matched += 1
+            continue
+
+        # Another integration (Kubernetes / Docker / Tailscale / UniFi)
+        # already owns this CIDR. We don't duplicate it and we don't
+        # try to wrest it away — the operator should resolve the
+        # cross-integration overlap deliberately.
+        if net_str in foreign_subnets:
+            summary.warnings.append(
+                f"subnet {net_str} already exists, owned by another integration; not creating duplicate"
+            )
+            continue
+
         parent_block = _find_enclosing_operator_block(blocks, d.network, node.id)
 
         if parent_block is None:
@@ -1079,6 +1133,7 @@ async def reconcile_node(db: AsyncSession, node: ProxmoxNode) -> ReconcileSummar
                     "created": summary.subnets_created,
                     "updated": summary.subnets_updated,
                     "deleted": summary.subnets_deleted,
+                    "matched": summary.subnets_matched,
                 },
                 "addresses": {
                     "created": summary.addresses_created,

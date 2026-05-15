@@ -113,6 +113,7 @@ async def _run_one(node_id: str) -> dict[str, Any]:
                 "subnets_created": summary.subnets_created,
                 "subnets_updated": summary.subnets_updated,
                 "subnets_deleted": summary.subnets_deleted,
+                "subnets_matched": summary.subnets_matched,
                 "addresses_created": summary.addresses_created,
                 "addresses_updated": summary.addresses_updated,
                 "addresses_deleted": summary.addresses_deleted,
