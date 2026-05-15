@@ -47,6 +47,7 @@ import { TagFilterChips } from "@/components/TagFilterChips";
 import { AskAIButton } from "@/components/copilot/AskAIButton";
 import { CreateServerGroupModal } from "./CreateServerGroupModal";
 import { CreateServerModal } from "./CreateServerModal";
+import { ServerDetailModal } from "./ServerDetailModal";
 import { CreateScopeModal } from "./CreateScopeModal";
 import { CreateClientClassModal } from "./CreateClientClassModal";
 import { CreateOptionTemplateModal } from "./CreateOptionTemplateModal";
@@ -2066,6 +2067,11 @@ export function DHCPPage() {
   const [addServerFor, setAddServerFor] = useState<string | null>(null);
   const [editServer, setEditServer] = useState<DHCPServer | null>(null);
   const [delServer, setDelServer] = useState<DHCPServer | null>(null);
+  // Issue #181: clicking a server from the GroupServersList opens the
+  // ServerDetailModal as a quick read-only inspector. The full
+  // standalone ServerDetailView is still reachable via the sidebar tree
+  // and from the modal's "Open full view" button.
+  const [modalServer, setModalServer] = useState<DHCPServer | null>(null);
   const urlRestored = useRef(false);
 
   // Pull cached group + server lists (populated by the sidebar query) so we
@@ -2200,13 +2206,10 @@ export function DHCPPage() {
             onEdit={() => setEditGroup(selection.group)}
             onDelete={() => setDelGroup(selection.group)}
             onAddServer={() => setAddServerFor(selection.group.id)}
-            onSelectServer={(s) =>
-              setSelection({
-                type: "server",
-                group: selection.group,
-                server: s,
-              })
-            }
+            // Issue #181: open the read-only modal instead of
+            // navigating to the full standalone server view. Mirrors
+            // the DNS Servers tab UX.
+            onSelectServer={(s) => setModalServer(s)}
           />
         )}
         {selection?.type === "server" && effectiveServer && (
@@ -2261,6 +2264,12 @@ export function DHCPPage() {
           onConfirm={() => deleteServerMut.mutate(delServer.id)}
           onClose={() => setDelServer(null)}
           isPending={deleteServerMut.isPending}
+        />
+      )}
+      {modalServer && (
+        <ServerDetailModal
+          server={modalServer}
+          onClose={() => setModalServer(null)}
         />
       )}
     </div>

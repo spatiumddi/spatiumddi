@@ -5365,6 +5365,49 @@ export interface PhoneProfileUpdate {
   tags?: Record<string, unknown>;
 }
 
+// ── DHCP ServerDetailModal payloads (issue #181) ────────────────────────────
+// Mirrors the DNS side's per-server detail interfaces. The shapes match
+// the DNS equivalents close enough that the modal's tab components feel
+// identical to a DNS-familiar operator.
+export interface DHCPPendingOpEntry {
+  op_id: string;
+  op_type: string;
+  status: string;
+  attempts: number;
+  error_msg: string | null;
+  created_at: string;
+  acked_at: string | null;
+}
+
+export interface DHCPPendingOpsResponse {
+  server_id: string;
+  counts: Record<string, number>;
+  items: DHCPPendingOpEntry[];
+}
+
+export interface DHCPServerEventEntry {
+  id: string;
+  timestamp: string;
+  user_display_name: string;
+  action: string;
+  resource_type: string;
+  resource_display: string;
+  result: string;
+}
+
+export interface DHCPServerEventsResponse {
+  server_id: string;
+  items: DHCPServerEventEntry[];
+}
+
+export interface DHCPRenderedConfigResponse {
+  server_id: string;
+  driver: string;
+  etag: string;
+  rendered_at: string;
+  config: string;
+}
+
 export const dhcpApi = {
   listGroups: () =>
     api.get<DHCPServerGroup[]>("/dhcp/server-groups").then((r) => r.data),
@@ -5419,6 +5462,26 @@ export const dhcpApi = {
   getLeases: (id: string, params?: { limit?: number }) =>
     api
       .get<DHCPLease[]>(`/dhcp/servers/${id}/leases`, { params })
+      .then((r) => r.data),
+
+  // Per-server detail (powers the DHCP ServerDetailModal — issue #181)
+  getServerPendingOps: (serverId: string, limit = 50) =>
+    api
+      .get<DHCPPendingOpsResponse>(
+        `/dhcp/servers/${serverId}/pending-ops?limit=${limit}`,
+      )
+      .then((r) => r.data),
+  getServerRecentEvents: (serverId: string, limit = 50) =>
+    api
+      .get<DHCPServerEventsResponse>(
+        `/dhcp/servers/${serverId}/recent-events?limit=${limit}`,
+      )
+      .then((r) => r.data),
+  getServerRenderedConfig: (serverId: string) =>
+    api
+      .get<DHCPRenderedConfigResponse>(
+        `/dhcp/servers/${serverId}/rendered-config`,
+      )
       .then((r) => r.data),
 
   listScopesBySubnet: (subnetId: string, params?: { tag?: string[] }) =>
