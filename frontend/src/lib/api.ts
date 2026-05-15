@@ -3874,6 +3874,12 @@ export interface DNSServer {
   last_config_etag: string | null;
   pending_approval: boolean;
   is_primary: boolean;
+  /** Per-server maintenance mode (issue #182). When true the control
+   * plane skips shipping pending DNSRecordOp rows + suppresses the
+   * heartbeat-stale alert; the UI renders an amber Maintenance chip. */
+  maintenance_mode: boolean;
+  maintenance_started_at: string | null;
+  maintenance_reason: string | null;
   created_at: string;
   modified_at: string;
 }
@@ -4222,6 +4228,17 @@ export const dnsApi = {
       .then((r) => r.data),
   deleteServer: (groupId: string, serverId: string) =>
     api.delete(`/dns/groups/${groupId}/servers/${serverId}`),
+  // Issue #182: per-server maintenance mode.
+  pauseServer: (groupId: string, serverId: string, reason?: string) =>
+    api
+      .post<DNSServer>(`/dns/groups/${groupId}/servers/${serverId}/pause`, {
+        reason: reason ?? null,
+      })
+      .then((r) => r.data),
+  resumeServer: (groupId: string, serverId: string) =>
+    api
+      .post<DNSServer>(`/dns/groups/${groupId}/servers/${serverId}/resume`)
+      .then((r) => r.data),
 
   testWindowsCredentials: (body: {
     host: string;
@@ -5167,6 +5184,12 @@ export interface DHCPServer {
   is_agentless: boolean;
   // Driver only supports reads — UI hides config-push actions.
   is_read_only: boolean;
+  // Per-server maintenance mode (issue #182). When true the control
+  // plane skips shipping pending DHCPConfigOp rows + suppresses the
+  // heartbeat-stale alert; the UI renders an amber Maintenance chip.
+  maintenance_mode: boolean;
+  maintenance_started_at: string | null;
+  maintenance_reason: string | null;
   created_at: string;
   modified_at: string;
 }
@@ -5459,6 +5482,18 @@ export const dhcpApi = {
       .then((r) => r.data),
   approveServer: (id: string) =>
     api.post<DHCPServer>(`/dhcp/servers/${id}/approve`).then((r) => r.data),
+  // Issue #182: per-server maintenance mode. ``reason`` is optional but
+  // strongly encouraged so the audit trail captures *why* a server
+  // went offline. ``resumeServer`` takes no body — that path is
+  // single-purpose.
+  pauseServer: (id: string, reason?: string) =>
+    api
+      .post<DHCPServer>(`/dhcp/servers/${id}/pause`, {
+        reason: reason ?? null,
+      })
+      .then((r) => r.data),
+  resumeServer: (id: string) =>
+    api.post<DHCPServer>(`/dhcp/servers/${id}/resume`).then((r) => r.data),
   getLeases: (id: string, params?: { limit?: number }) =>
     api
       .get<DHCPLease[]>(`/dhcp/servers/${id}/leases`, { params })

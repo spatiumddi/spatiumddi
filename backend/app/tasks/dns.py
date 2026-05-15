@@ -144,12 +144,17 @@ async def _dns_agent_stale_sweep_async() -> dict[str, int]:
     try:
         async with session_factory() as db:
             cutoff = datetime.now(UTC) - timedelta(seconds=AGENT_STALE_AFTER_SECONDS)
+            # Issue #182: paused servers are deliberately offline —
+            # don't trip the heartbeat-stale state transition for them.
+            # The Maintenance chip in the UI is the operator-meaningful
+            # indicator while they're paused.
             res = await db.execute(
                 update(DNSServer)
                 .where(
                     DNSServer.status == "active",
                     DNSServer.last_seen_at.isnot(None),
                     DNSServer.last_seen_at < cutoff,
+                    DNSServer.maintenance_mode.is_(False),
                 )
                 .values(status="unreachable")
                 .returning(DNSServer.id)

@@ -583,6 +583,18 @@ function GroupServersList({
                     HA: {s.ha_state}
                   </span>
                 )}
+                {s.maintenance_mode && (
+                  <span
+                    className="rounded-full bg-amber-500/15 px-2 py-0.5 text-[11px] font-medium text-amber-700 dark:text-amber-400"
+                    title={
+                      s.maintenance_reason
+                        ? `Paused: ${s.maintenance_reason}`
+                        : "In operator-set maintenance mode"
+                    }
+                  >
+                    Maintenance
+                  </span>
+                )}
                 <span className="ml-auto text-xs text-muted-foreground">
                   {label}
                 </span>

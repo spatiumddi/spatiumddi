@@ -3307,6 +3307,18 @@ function ServersTab({ group }: { group: DNSServerGroup }) {
                   <span className="inline-flex items-center rounded border px-1.5 py-0.5 text-xs">
                     {s.driver}
                   </span>
+                  {s.maintenance_mode && (
+                    <span
+                      className="inline-flex items-center rounded bg-amber-500/15 px-1.5 py-0.5 text-[11px] font-medium text-amber-700 dark:text-amber-400"
+                      title={
+                        s.maintenance_reason
+                          ? `Paused: ${s.maintenance_reason}`
+                          : "In operator-set maintenance mode"
+                      }
+                    >
+                      Maintenance
+                    </span>
+                  )}
                 </div>
                 <p className="text-xs text-muted-foreground">
                   {s.host}:{s.port}

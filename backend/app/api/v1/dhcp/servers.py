@@ -133,6 +133,10 @@ class ServerResponse(BaseModel):
     # ``status-get`` poll. Null for standalone servers (group size < 2).
     ha_state: str | None = None
     ha_last_heartbeat_at: datetime | None = None
+    # Per-server maintenance mode (issue #182).
+    maintenance_mode: bool = False
+    maintenance_started_at: datetime | None = None
+    maintenance_reason: str | None = None
     created_at: datetime
     modified_at: datetime
 
@@ -171,6 +175,9 @@ class ServerResponse(BaseModel):
             ha_peer_url=s.ha_peer_url or "",
             ha_state=s.ha_state,
             ha_last_heartbeat_at=s.ha_last_heartbeat_at,
+            maintenance_mode=s.maintenance_mode,
+            maintenance_started_at=s.maintenance_started_at,
+            maintenance_reason=s.maintenance_reason,
             created_at=s.created_at,
             modified_at=s.modified_at,
         )
@@ -614,6 +621,103 @@ async def approve_server(server_id: uuid.UUID, db: DB, user: SuperAdmin) -> Serv
         db,
         user=user,
         action="dhcp.server.approve",
+        resource_type="dhcp_server",
+        resource_id=str(s.id),
+        resource_display=s.name,
+    )
+    await db.commit()
+    await db.refresh(s)
+    return ServerResponse.from_model(s)
+
+
+# ── Maintenance mode (issue #182) ────────────────────────────────────
+
+
+class MaintenancePauseRequest(BaseModel):
+    """Body for ``POST /dhcp/servers/{id}/pause`` — reason is optional but
+    strongly encouraged so the audit trail explains *why* an operator
+    took a server offline."""
+
+    reason: str | None = None
+
+
+@router.post("/{server_id}/pause", response_model=ServerResponse)
+async def pause_server(
+    server_id: uuid.UUID,
+    body: MaintenancePauseRequest,
+    db: DB,
+    user: SuperAdmin,
+) -> ServerResponse:
+    """Mark this DHCP server as in operator-set maintenance mode.
+
+    Effects of the flag:
+      * pending DHCPConfigOp rows aren't shipped to the agent
+      * heartbeat-stale alerts auto-resolve and won't re-fire
+      * HA peer accounting treats the server as expected-but-quiet
+    The container itself isn't stopped from this endpoint; appliance
+    deployments use the supervisor to act on the flag (planned), and
+    docker / k8s operators stop the container however they normally
+    would. The point is to silence the noise about it.
+    """
+    s = await db.get(DHCPServer, server_id)
+    if s is None:
+        raise HTTPException(status_code=404, detail="Server not found")
+    # Idempotent — re-pausing an already-paused server just refreshes
+    # the reason (operator may have figured out *why* mid-window and
+    # wants the audit trail updated). started_at stays anchored on the
+    # original transition so the UI's "Paused 2h ago" doesn't reset.
+    was_paused = s.maintenance_mode
+    s.maintenance_mode = True
+    if not was_paused:
+        s.maintenance_started_at = datetime.now(UTC)
+    if body.reason is not None:
+        s.maintenance_reason = body.reason.strip() or None
+    write_audit(
+        db,
+        user=user,
+        action=(
+            "dhcp.server.maintenance_entered"
+            if not was_paused
+            else "dhcp.server.maintenance_updated"
+        ),
+        resource_type="dhcp_server",
+        resource_id=str(s.id),
+        resource_display=s.name,
+        new_value={"reason": s.maintenance_reason},
+    )
+    await db.commit()
+    await db.refresh(s)
+    return ServerResponse.from_model(s)
+
+
+@router.post("/{server_id}/resume", response_model=ServerResponse)
+async def resume_server(
+    server_id: uuid.UUID,
+    db: DB,
+    user: SuperAdmin,
+) -> ServerResponse:
+    """Exit maintenance mode — pending ops resume shipping, alerts
+    fire normally, HA accounting treats the server as live again.
+
+    Operator is expected to have already started the container if
+    they stopped it themselves; we don't dispatch a start command
+    from here (it'd be too easy to surprise someone whose container
+    is intentionally still down).
+    """
+    s = await db.get(DHCPServer, server_id)
+    if s is None:
+        raise HTTPException(status_code=404, detail="Server not found")
+    if not s.maintenance_mode:
+        # Idempotent — already running normally. Return current state
+        # without writing an audit row.
+        return ServerResponse.from_model(s)
+    s.maintenance_mode = False
+    s.maintenance_started_at = None
+    s.maintenance_reason = None
+    write_audit(
+        db,
+        user=user,
+        action="dhcp.server.maintenance_exited",
         resource_type="dhcp_server",
         resource_id=str(s.id),
         resource_display=s.name,

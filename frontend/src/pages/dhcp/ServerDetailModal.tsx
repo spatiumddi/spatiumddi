@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { useQuery } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Activity,
   Copy,
@@ -7,11 +7,14 @@ import {
   FileText,
   History,
   Loader2,
+  Pause,
+  Play,
   RefreshCw,
   ScrollText,
   Server,
 } from "lucide-react";
 import { Modal } from "@/components/ui/modal";
+import { PauseServerModal } from "@/components/ui/pause-server-modal";
 import {
   dhcpApi,
   logsApi,
@@ -51,7 +54,24 @@ export function ServerDetailModal({
   onClose: () => void;
 }) {
   const [tab, setTab] = useState<Tab>("overview");
+  const [showPauseModal, setShowPauseModal] = useState(false);
+  const qc = useQueryClient();
   const isReadOnly = READ_ONLY_DRIVERS.has(server.driver);
+
+  // Issue #182: pause/resume mutations. Invalidate the server-list
+  // query on success so the Maintenance chip on the group's Servers
+  // table refreshes alongside the modal.
+  const pauseMut = useMutation({
+    mutationFn: (reason: string) => dhcpApi.pauseServer(server.id, reason),
+    onSuccess: () => {
+      qc.invalidateQueries({ queryKey: ["dhcp-servers"] });
+      setShowPauseModal(false);
+    },
+  });
+  const resumeMut = useMutation({
+    mutationFn: () => dhcpApi.resumeServer(server.id),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["dhcp-servers"] }),
+  });
 
   return (
     <Modal title={server.name} onClose={onClose} wide>
@@ -69,7 +89,50 @@ export function ServerDetailModal({
               HA: {server.ha_state}
             </span>
           )}
+          {server.maintenance_mode && (
+            <span
+              className="rounded bg-amber-500/15 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 dark:text-amber-400"
+              title={
+                server.maintenance_reason
+                  ? `Paused: ${server.maintenance_reason}`
+                  : "In operator-set maintenance mode"
+              }
+            >
+              Maintenance · {fmtRelative(server.maintenance_started_at)}
+            </span>
+          )}
+          <div className="ml-auto">
+            {server.maintenance_mode ? (
+              <button
+                type="button"
+                onClick={() => resumeMut.mutate()}
+                disabled={resumeMut.isPending}
+                className="inline-flex items-center gap-1 rounded border border-emerald-600/40 bg-emerald-500/10 px-2 py-1 text-[11px] font-medium text-emerald-700 hover:bg-emerald-500/20 disabled:opacity-50 dark:text-emerald-400"
+              >
+                <Play className="h-3 w-3" />
+                {resumeMut.isPending ? "Resuming…" : "Resume"}
+              </button>
+            ) : (
+              <button
+                type="button"
+                onClick={() => setShowPauseModal(true)}
+                className="inline-flex items-center gap-1 rounded border border-amber-600/40 bg-amber-500/10 px-2 py-1 text-[11px] font-medium text-amber-700 hover:bg-amber-500/20 dark:text-amber-400"
+              >
+                <Pause className="h-3 w-3" />
+                Pause
+              </button>
+            )}
+          </div>
         </div>
+        {showPauseModal && (
+          <PauseServerModal
+            serverName={server.name}
+            serverKind="DHCP"
+            isPending={pauseMut.isPending}
+            onConfirm={(reason) => pauseMut.mutate(reason)}
+            onCancel={() => setShowPauseModal(false)}
+          />
+        )}
         <div className="flex flex-wrap gap-1 border-b">
           <TabButton
             active={tab === "overview"}
