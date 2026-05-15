@@ -135,7 +135,11 @@ function serviceChips(row: ApplianceRow): {
       : lifecycle === "failed"
         ? "failed"
         : "pending";
-  const out: { key: string; label: string; status: "ready" | "failed" | "pending" | "neutral" }[] = [];
+  const out: {
+    key: string;
+    label: string;
+    status: "ready" | "failed" | "pending" | "neutral";
+  }[] = [];
   if (roles.includes("dns-bind9"))
     out.push({ key: "dns-bind9", label: "DNS · BIND9", status: serviceStatus });
   if (roles.includes("dns-powerdns"))
@@ -157,8 +161,7 @@ const SERVICE_CHIP_STYLES: Record<
 > = {
   ready:
     "bg-emerald-500/15 text-emerald-700 border-emerald-500/40 dark:text-emerald-300",
-  failed:
-    "bg-rose-500/15 text-rose-700 border-rose-500/40 dark:text-rose-300",
+  failed: "bg-rose-500/15 text-rose-700 border-rose-500/40 dark:text-rose-300",
   pending:
     "bg-amber-500/15 text-amber-700 border-amber-500/40 dark:text-amber-300",
   neutral: "bg-muted text-muted-foreground border-border",
@@ -1279,7 +1282,13 @@ function ApplianceRoleAssignmentSection({
     setDhcpGroupId(row.assigned_dhcp_group_id ?? null);
     setFirewallExtra(row.firewall_extra ?? "");
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [row.id, rolesKey, row.assigned_dns_group_id, row.assigned_dhcp_group_id, row.firewall_extra]);
+  }, [
+    row.id,
+    rolesKey,
+    row.assigned_dns_group_id,
+    row.assigned_dhcp_group_id,
+    row.firewall_extra,
+  ]);
 
   const dnsGroupsQuery = useQuery({
     queryKey: ["dns", "groups"],
@@ -1580,8 +1589,7 @@ function ApplianceOsUpgradeSection({ row }: { row: ApplianceRow }) {
   });
   const clearUpgrade = useMutation({
     mutationFn: () => applianceApprovalApi.clearUpgrade(row.id),
-    onSuccess: () =>
-      qc.invalidateQueries({ queryKey: ["appliance", "fleet"] }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ["appliance", "fleet"] }),
   });
   const reboot = useMutation({
     mutationFn: () => applianceApprovalApi.scheduleReboot(row.id),
