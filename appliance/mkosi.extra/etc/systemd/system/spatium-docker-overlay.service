@@ -26,7 +26,6 @@ ConditionPathExists=/usr/lib/spatiumddi/docker-overlay.img
 DefaultDependencies=no
 After=local-fs.target var.mount
 Before=docker.service
-RequiredBy=docker.service
 
 [Service]
 Type=oneshot
@@ -35,4 +34,11 @@ ExecStart=/usr/local/bin/spatium-docker-overlay mount
 ExecStop=/usr/local/bin/spatium-docker-overlay umount
 
 [Install]
+# ``RequiredBy=`` belongs in [Install], not [Unit] — systemd silently
+# ignores it in [Unit] (see dmesg "Unknown key 'RequiredBy' in section
+# [Unit]"), which left docker.service with no hard dependency on this
+# unit. At enable time, ``RequiredBy=docker.service`` writes a symlink
+# under ``/etc/systemd/system/docker.service.requires/`` that pulls
+# this unit in whenever docker.service starts.
 WantedBy=multi-user.target
+RequiredBy=docker.service

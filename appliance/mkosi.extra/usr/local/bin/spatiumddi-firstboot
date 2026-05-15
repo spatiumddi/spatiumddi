@@ -43,8 +43,26 @@ fi
 gen_hex()    { openssl rand -hex "${1:-32}"; }
 gen_fernet() { openssl rand 32 | base64 | tr -d '\n' | tr '+/' '-_'; }
 
-# Read optional release pin dropped by cloud-init.
+# Resolve which image tag the appliance should run. Three sources, in
+# priority order (lowest first; each overrides the prior):
+#
+#   1. Hardcoded "latest" default — used by clean ISOs that pull from
+#      ghcr on first boot.
+#   2. ``/usr/lib/spatiumddi/docker-overlay.version`` — sidecar
+#      written by appliance/scripts/bake-images.sh recording what
+#      SPATIUMDDI_VERSION the baked docker overlay was built against.
+#      For local-build ISOs this is "dev"; for release ISOs it's the
+#      CalVer tag (e.g. "2026.05.14-1"). Without this fall-through,
+#      compose's ``image: ghcr.io/.../:${SPATIUMDDI_VERSION}`` resolves
+#      to ``:latest`` and pulls the latest *published* image set from
+#      ghcr — defeating the entire bake and silently running the wrong
+#      software.
+#   3. ``/etc/spatiumddi/release`` — operator override (e.g. set via
+#      cloud-init) to pin to a specific older / pre-release version.
 SPATIUMDDI_VERSION="latest"
+if [ -f /usr/lib/spatiumddi/docker-overlay.version ]; then
+    SPATIUMDDI_VERSION="$(cat /usr/lib/spatiumddi/docker-overlay.version)"
+fi
 if [ -f /etc/spatiumddi/release ]; then
     # shellcheck disable=SC1091
     . /etc/spatiumddi/release
